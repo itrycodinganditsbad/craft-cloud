@@ -4,8 +4,14 @@ mod common;
 
 use std::sync::atomic::Ordering;
 
-use common::{Server, machine, machine_with, path, settle};
+use common::{SaveDuringWrite, Server, machine, machine_on, machine_with, path, settle};
 use craft_cloud_sync::{Fs, MemFs};
+
+const CONFLICT_STAMP: &str = "(conflict, desktop, 2026-10-11 14-03)";
+
+fn conflict_copies(m: &common::Machine) -> Vec<String> {
+    files(m).into_iter().map(|(p, _)| p).filter(|p| p.contains("(conflict")).collect()
+}
 
 fn write(m: &mut common::Machine, p: &str, data: &[u8]) {
     m.fs_mut().write(&path(p), data, false, 0).unwrap();
@@ -292,4 +298,144 @@ async fn a_file_that_cant_be_read_is_skipped_and_never_overwritten() {
     for want in [&b"laptop edit"[..], b"desktop edit", b"half written", b"fine"] {
         assert!(all.iter().any(|(_, d)| d == want), "{all:?}");
     }
+}
+
+#[tokio::test]
+async fn a_save_during_a_download_is_kept() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine_on(&server, &ana, "desktop", SaveDuringWrite::default(), 50, |_| {}).await;
+    write(&mut a, "doc.txt", b"v1");
+    a.sync_once().await.unwrap();
+    b.sync_once().await.unwrap();
+    write(&mut a, "doc.txt", b"v2 from laptop");
+    a.sync_once().await.unwrap();
+    // The desktop's app saves the file while the laptop's version is downloading.
+    b.fs_mut().save = Some((path("doc.txt"), b"desktop save".to_vec()));
+    let report = b.sync_once().await.unwrap();
+    assert!(report.downloaded.is_empty(), "{report:?}");
+    assert_eq!(b.fs().inner.read(&path("doc.txt")).unwrap(), b"desktop save");
+    // The next passes treat it as an edit on both sides: both copies survive.
+    for _ in 0..4 {
+        a.sync_once().await.unwrap();
+        b.sync_once().await.unwrap();
+    }
+    let here: Vec<(String, Vec<u8>)> = b.fs().inner.files().into_iter().map(|(p, d)| (p.to_string(), d)).collect();
+    assert_eq!(here, files(&a));
+    assert_eq!(here, vec![(format!("doc {CONFLICT_STAMP}.txt"), b"desktop save".to_vec()), ("doc.txt".to_owned(), b"v2 from laptop".to_vec())]);
+}
+
+#[tokio::test]
+async fn a_reconcile_cut_short_still_keeps_newer_local_files() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    write(&mut a, "a.txt", b"v1");
+    a.sync_once().await.unwrap();
+    write(&mut a, "a.txt", b"v2 newer than the backup");
+    server.meta.reset_epoch(ana.space).await.unwrap();
+    // The reconcile pass fails part way through applying the server's tree.
+    a.transport().faults.every.store(3, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    a.transport().faults.every.store(0, Ordering::Relaxed);
+    a.sync_once().await.unwrap();
+    assert_eq!(files(&a), vec![("a.txt".to_owned(), b"v2 newer than the backup".to_vec())]);
+    let mut b = machine(&server, &ana, "desktop").await;
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&b), vec![("a.txt".to_owned(), b"v2 newer than the backup".to_vec())]);
+}
+
+#[tokio::test]
+async fn os_metadata_in_a_remotely_deleted_folder_goes_with_it() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("x")).unwrap();
+    write(&mut a, "x/f.txt", b"one");
+    settle(&mut [&mut a, &mut b], 5).await;
+    write(&mut b, "x/.DS_Store", b"finder junk");
+    a.fs_mut().remove_file(&path("x/f.txt")).unwrap();
+    a.fs_mut().remove_dir(&path("x")).unwrap();
+    a.sync_once().await.unwrap();
+    settle(&mut [&mut b, &mut a], 5).await;
+    assert!(b.fs().dirs().is_empty() && files(&b).is_empty(), "{:?}", b.fs().files());
+    assert!(a.fs().dirs().is_empty());
+}
+
+#[tokio::test]
+async fn an_office_lock_file_keeps_a_remotely_deleted_folder_local() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("x")).unwrap();
+    write(&mut a, "x/f.txt", b"one");
+    settle(&mut [&mut a, &mut b], 5).await;
+    // Word holds a document open on the desktop; its lock file sits in the folder.
+    write(&mut b, "x/~$doc.docx", b"owner");
+    a.fs_mut().remove_file(&path("x/f.txt")).unwrap();
+    a.fs_mut().remove_dir(&path("x")).unwrap();
+    a.sync_once().await.unwrap();
+    settle(&mut [&mut b, &mut a], 5).await;
+    assert_eq!(files(&b), vec![("x/~$doc.docx".to_owned(), b"owner".to_vec())]);
+    // The server doesn't get the folder back.
+    assert!(a.fs().dirs().is_empty(), "{:?}", a.fs().dirs());
+    let mut c = machine(&server, &ana, "studio").await;
+    c.sync_once().await.unwrap();
+    assert!(c.fs().dirs().is_empty(), "{:?}", c.fs().dirs());
+}
+
+#[tokio::test]
+async fn a_lost_commit_reply_makes_no_conflict_copy() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    write(&mut a, "doc.txt", b"v1");
+    a.sync_once().await.unwrap();
+    write(&mut a, "doc.txt", b"v2");
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    let report = a.sync_once().await.unwrap();
+    assert!(report.conflict_copies.is_empty() && report.uploaded.is_empty(), "{report:?}");
+    assert_eq!(files(&a), vec![("doc.txt".to_owned(), b"v2".to_vec())]);
+    let mut b = machine(&server, &ana, "desktop").await;
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&b), vec![("doc.txt".to_owned(), b"v2".to_vec())]);
+    assert!(conflict_copies(&a).is_empty());
+}
+
+#[tokio::test]
+async fn a_refusal_naming_no_operation_fails_the_pass() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    write(&mut a, "doc.txt", b"v1");
+    a.transport().faults.bad_conflict_index.store(true, Ordering::Relaxed);
+    let pass = tokio::time::timeout(std::time::Duration::from_secs(10), a.sync_once()).await;
+    assert!(matches!(pass, Ok(Err(_))), "{pass:?}");
+    a.transport().faults.bad_conflict_index.store(false, Ordering::Relaxed);
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.uploaded, vec![path("doc.txt")]);
+}
+
+#[tokio::test]
+async fn a_tracked_folder_deleted_on_the_server_leaves_no_empty_conflict_copy() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("x")).unwrap();
+    settle(&mut [&mut a, &mut b], 5).await;
+    write(&mut b, "x/Thumbs.db", b"explorer junk");
+    // The laptop replaces the folder with a file of the same name.
+    a.fs_mut().remove_dir(&path("x")).unwrap();
+    write(&mut a, "x", b"now a file");
+    settle(&mut [&mut a], 5).await;
+    let report = b.sync_once().await.unwrap();
+    assert!(report.conflict_copies.is_empty(), "{report:?}");
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert!(b.fs().dirs().is_empty(), "{:?}", b.fs().dirs());
+    assert_eq!(files(&b), vec![("x".to_owned(), b"now a file".to_vec())]);
 }

@@ -6,7 +6,7 @@ use std::io;
 use bytes::Bytes;
 use craft_cloud_chunker::{FASTCDC_V1, chunk_reader};
 use craft_cloud_proto::limits::MAX_BATCH_OPS;
-use craft_cloud_proto::{ChunkId, ChunkRef, ChunkerParamsId, Epoch, FileHash, FileState, Manifest, NewVersion, NodeId, Op, VersionId};
+use craft_cloud_proto::{ChunkId, ChunkRef, ChunkerParamsId, Conflict, Epoch, FileHash, FileState, Manifest, NewVersion, NodeId, Op, VersionId};
 
 use crate::fs::{FileMeta, Fs, FsKind};
 use crate::path::RelPath;
@@ -139,7 +139,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             dir_ops.push((to.depth(), DirOp::Move(*id, from, to)));
         }
         for (path, kind) in &new_paths {
-            if let FsKind::Dir { id: local_id } = kind {
+            // A new folder holding only ignored files (one the server deleted, kept here for a lock file) stays local.
+            if let FsKind::Dir { id: local_id } = kind
+                && !self.holds_only_ignored(path)?
+            {
                 dir_ops.push((path.depth(), DirOp::New(path, *local_id)));
             }
         }
@@ -182,9 +185,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 Op::Move { node: *id, from_parent, from_name, parent, name: name.clone() },
                 Effect::Move { id: *id, parent, name: name.clone(), from: from.clone(), to: to.clone() },
             ));
-            if let BaseKind::File { size, mtime_ms, .. } = entry.kind
-                && (meta.size != size || meta.mtime_ms != mtime_ms)
-            {
+            if !self.file_matches(&entry, to, meta)? {
                 modified.push((*id, to.clone(), *meta));
             }
         }
@@ -312,6 +313,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                         break;
                     }
                     Err(TransportError::Rejected(conflicts)) => {
+                        // A conflict naming an operation the batch doesn't have is the server's mistake: ignored.
+                        let conflicts: Vec<Conflict> = conflicts.into_iter().filter(|c| c.op < batch.len()).collect();
                         // An edit to a file the server deleted wins, but the server needs its current version
                         // as `expected` (it may have been edited elsewhere before the delete, which the change
                         // feed only reports as the final tombstone). Retry those Updates once with it.
@@ -361,8 +364,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                             index += 1;
                             keep
                         });
+                        // Nothing to drop or fix: resubmitting would be refused the same way forever.
                         if refused.is_empty() && fixable.is_empty() {
-                            break;
+                            return Err(SyncError::Corrupt("the server refused a batch without naming an operation in it".into()));
                         }
                     }
                     Err(e) => return Err(e.into()),

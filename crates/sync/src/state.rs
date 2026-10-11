@@ -20,6 +20,10 @@ pub struct State {
     pub remote: BTreeMap<NodeId, RemoteNode>,
     /// Nodes both sides agree on, with what the local copy looked like when they agreed.
     pub base: BTreeMap<NodeId, BaseEntry>,
+    /// The base was forgotten for a new epoch and no pass has applied the server's tree since: passes
+    /// reconcile (never replacing local files) until one does.
+    #[serde(default)]
+    pub reconcile_pending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

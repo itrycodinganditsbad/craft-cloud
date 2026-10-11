@@ -3,17 +3,20 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{self, Read};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use craft_cloud_meta::{Meta, MetaError, Role, UserRecord};
 use craft_cloud_proto::api::{CommitResponse, SpaceResponse};
-use craft_cloud_proto::{ChangeSet, ChunkId, ConflictStamp, DeviceId, FileHash, Manifest, ManifestId, Op, PageCursor, SpaceId};
+use craft_cloud_proto::{
+    ChangeSet, ChunkId, Conflict, ConflictKind, ConflictStamp, DeviceId, FileHash, Manifest, ManifestId, Op, PageCursor, SpaceId,
+};
 use craft_cloud_store::memory::MemoryBackend;
 use craft_cloud_store::{BlobKey, Store};
-use craft_cloud_sync::{Config, Engine, MemFs, RelPath, Report, State, Transport, TransportError};
+use craft_cloud_sync::{Config, Engine, FileMeta, Fs, FsEntry, FsKind, MemFs, RelPath, Report, State, Transport, TransportError};
 
 pub struct Server {
     pub meta: Meta,
@@ -55,6 +58,10 @@ impl Server {
 pub struct Faults {
     /// Fail one call in this many (0 = never).
     pub every: AtomicU64,
+    /// Make the next commit apply on the server but report failure, as if its reply was lost.
+    pub lose_commit_reply: AtomicBool,
+    /// Make every commit come back refused, naming an operation the batch doesn't have.
+    pub bad_conflict_index: AtomicBool,
     calls: AtomicU64,
 }
 
@@ -153,7 +160,13 @@ impl Transport for Local {
 
     async fn commit(&self, ops: &[Op]) -> Result<CommitResponse, TransportError> {
         self.faults.check()?;
+        if self.faults.bad_conflict_index.load(Ordering::Relaxed) {
+            return Err(TransportError::Rejected(vec![Conflict { op: ops.len() + 5, kind: ConflictKind::NoSuchNode }]));
+        }
         let out = self.meta.commit(self.space, self.device, ops, self.now()).await.map_err(meta_err)?;
+        if self.faults.lose_commit_reply.swap(false, Ordering::Relaxed) {
+            return Err(TransportError::Unavailable("reply lost".into()));
+        }
         Ok(CommitResponse { seq: out.seq, epoch: out.epoch })
     }
 }
@@ -173,6 +186,18 @@ pub async fn machine_with(server: &Server, user: &UserRecord, name: &str, fs: Me
 
 /// Like [`machine_with`], with a chance to change the engine's settings.
 pub async fn machine_config(server: &Server, user: &UserRecord, name: &str, fs: MemFs, page: u32, tweak: impl FnOnce(&mut Config)) -> Machine {
+    machine_on(server, user, name, fs, page, tweak).await
+}
+
+/// A machine on any filesystem.
+pub async fn machine_on<F: Fs>(
+    server: &Server,
+    user: &UserRecord,
+    name: &str,
+    fs: F,
+    page: u32,
+    tweak: impl FnOnce(&mut Config),
+) -> Engine<F, Local> {
     let token = *blake3::hash(format!("{name}-{}", DeviceId::generate()).as_bytes()).as_bytes();
     let device = server.meta.create_device(user.id, name, &token, 0).await.unwrap();
     let transport = Local {
@@ -207,4 +232,56 @@ pub async fn settle(machines: &mut [&mut Machine], max_rounds: usize) {
 
 pub fn path(s: &str) -> RelPath {
     craft_cloud_sync::rel(s)
+}
+
+/// A [`MemFs`] where a program saves a file while the engine is writing a download to the same path: the
+/// save lands when the engine starts writing (after it checked the path, before its write lands).
+#[derive(Default)]
+pub struct SaveDuringWrite {
+    pub inner: MemFs,
+    /// The path and the content the program saves, once.
+    pub save: Option<(RelPath, Vec<u8>)>,
+}
+
+impl Fs for SaveDuringWrite {
+    type Writer = <MemFs as Fs>::Writer;
+
+    fn now_ms(&self) -> i64 {
+        self.inner.now_ms()
+    }
+    fn list(&self, dir: &RelPath) -> io::Result<Vec<FsEntry>> {
+        self.inner.list(dir)
+    }
+    fn stat(&self, path: &RelPath) -> io::Result<Option<FsKind>> {
+        self.inner.stat(path)
+    }
+    fn open(&self, path: &RelPath) -> io::Result<Box<dyn Read + Send + '_>> {
+        self.inner.open(path)
+    }
+    fn read_at(&self, path: &RelPath, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        self.inner.read_at(path, offset, len)
+    }
+    fn begin_write(&mut self, path: &RelPath) -> io::Result<Self::Writer> {
+        if self.save.as_ref().is_some_and(|(p, _)| p == path)
+            && let Some((p, data)) = self.save.take()
+        {
+            self.inner.write(&p, &data, false, 0)?;
+        }
+        self.inner.begin_write(path)
+    }
+    fn finish_write(&mut self, path: &RelPath, writer: Self::Writer, exec: bool, mtime_ms: i64) -> io::Result<FileMeta> {
+        self.inner.finish_write(path, writer, exec, mtime_ms)
+    }
+    fn mkdir(&mut self, path: &RelPath) -> io::Result<()> {
+        self.inner.mkdir(path)
+    }
+    fn remove_file(&mut self, path: &RelPath) -> io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir(&mut self, path: &RelPath) -> io::Result<()> {
+        self.inner.remove_dir(path)
+    }
+    fn rename(&mut self, from: &RelPath, to: &RelPath) -> io::Result<()> {
+        self.inner.rename(from, to)
+    }
 }

@@ -63,11 +63,26 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         let mut new_entry = BaseEntry { parent: remote.parent, name: remote.name.clone(), kind: entry.kind.clone() };
         match local {
             Local::Unchanged | Local::Modified if new_version && local == Local::Modified => {
+                // The same content on both sides (our own commit whose reply was lost, or the same edit made on
+                // two machines): no conflict, just agree on the server's version.
+                if let Some(file) = &remote.file
+                    && let Some((meta, hash)) = self.same_content(file, &bpath).await?
+                {
+                    if moved {
+                        self.relocate(&bpath, &rpath, report)?;
+                    }
+                    new_entry.kind = self.base_file(file, meta, hash);
+                    self.state.base.insert(id, new_entry);
+                    return Ok(());
+                }
                 // Both changed: keep ours as a conflict copy, take theirs.
                 self.move_aside(&bpath, report)?;
                 self.ensure_free(&rpath, report)?;
-                if let Some(file) = &remote.file {
-                    let (meta, hash) = self.download(file, &rpath, report).await?;
+                // Saved here meanwhile: the base keeps the old version at the server's place, so the next pass
+                // sees an edit on both sides again (and the conflict copy goes up as a new file).
+                if let Some(file) = &remote.file
+                    && let Some((meta, hash)) = self.download(file, &rpath, report).await?
+                {
                     new_entry.kind = self.base_file(file, meta, hash);
                 }
             }
@@ -75,8 +90,12 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 if moved {
                     self.relocate(&bpath, &rpath, report)?;
                 }
-                if new_version && let Some(file) = &remote.file {
-                    let (meta, hash) = self.download(file, &rpath, report).await?;
+                // Saved here meanwhile: the base keeps the old version (at its new place, where the file is), so
+                // the next pass sees an edit on both sides.
+                if new_version
+                    && let Some(file) = &remote.file
+                    && let Some((meta, hash)) = self.download(file, &rpath, report).await?
+                {
                     new_entry.kind = self.base_file(file, meta, hash);
                 }
             }
@@ -128,8 +147,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         // Edited there, deleted here: the edit wins.
         if let Some(file) = &remote.file {
             self.ensure_free(&rpath, report)?;
-            let (meta, hash) = self.download(file, &rpath, report).await?;
-            new_entry.kind = self.base_file(file, meta, hash);
+            // Saved here meanwhile: the old version stays in the base, so the next pass sees an edit on both sides.
+            if let Some((meta, hash)) = self.download(file, &rpath, report).await? {
+                new_entry.kind = self.base_file(file, meta, hash);
+            }
         }
         self.state.base.insert(id, new_entry);
         Ok(())
@@ -177,6 +198,14 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             (BaseKind::File { .. }, Local::Unchanged) if self.really_unchanged(&entry, path)? => {
                 self.fs.remove_file(path).map_err(|e| io_err(path, e))?;
                 report.removed_locally.push(path.clone());
+            }
+            // An empty folder (or one with only OS metadata files) goes, as when the server deletes it.
+            (BaseKind::Dir { .. }, Local::Unchanged) => {
+                if self.remove_dir_if_bare(path)? {
+                    report.removed_locally.push(path.clone());
+                } else {
+                    self.move_aside(path, report)?;
+                }
             }
             _ => {
                 self.move_aside(path, report)?;
@@ -306,7 +335,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 BaseKind::Dir { local_id: Self::dir_id(self.stat(&rpath)?) }
             }
             (Some(file), None) => {
-                let (meta, hash) = self.download(file, &rpath, report).await?;
+                // Saved here meanwhile: not taken this pass; the next one meets the file as a local copy.
+                let Some((meta, hash)) = self.download(file, &rpath, report).await? else { return Ok(()) };
                 self.base_file(file, meta, hash)
             }
             (Some(file), Some(FsKind::File(meta))) => {
@@ -329,13 +359,15 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     }
                 } else {
                     self.move_aside(&rpath, report)?;
-                    let (meta, hash) = self.download(file, &rpath, report).await?;
+                    // Saved here meanwhile: not taken this pass; the next one meets the file as a local copy.
+                    let Some((meta, hash)) = self.download(file, &rpath, report).await? else { return Ok(()) };
                     self.base_file(file, meta, hash)
                 }
             }
             (Some(file), Some(_)) => {
                 self.move_aside(&rpath, report)?;
-                let (meta, hash) = self.download(file, &rpath, report).await?;
+                // Saved here meanwhile: not taken this pass; the next one meets the file as a local copy.
+                let Some((meta, hash)) = self.download(file, &rpath, report).await? else { return Ok(()) };
                 self.base_file(file, meta, hash)
             }
         };
@@ -362,15 +394,17 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     report.removed_locally.push(bpath);
                 }
                 BaseKind::Dir { .. } => {
-                    // Only an empty folder goes; one with new local files stays, and the push brings it back.
-                    let empty = self.fs.list(&bpath).map_err(|e| io_err(&bpath, e))?.iter().all(|e| self.config.ignored(&e.name));
-                    if empty {
-                        self.fs.remove_dir(&bpath).map_err(|e| io_err(&bpath, e))?;
+                    // Only an empty folder goes (with any OS metadata files in it); one with new local files
+                    // stays, and the push brings it back.
+                    let only_ignored = self.fs.list(&bpath).map_err(|e| io_err(&bpath, e))?.iter().all(|e| self.config.ignored(&e.name));
+                    if only_ignored && self.remove_dir_if_bare(&bpath)? {
                         self.state.base.remove(&id);
                         report.removed_locally.push(bpath);
                     } else if !self.state.base.values().any(|e| e.parent == Some(id)) {
                         // Only new files inside: forget the folder, and the push creates it afresh. (One that
                         // still holds an edited tracked file stays; that file's upload brings the folder back.)
+                        // Only ignored files inside (an open document's lock file): it stays here, forgotten, and
+                        // the push leaves it alone.
                         self.state.base.remove(&id);
                     }
                 }

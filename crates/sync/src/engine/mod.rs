@@ -34,6 +34,9 @@ mod push;
 
 /// Names that never sync (matched against the raw name): exact names, `prefix*` and `*suffix`.
 pub const DEFAULT_IGNORES: &[&str] = &[".craft-cloud", ".DS_Store", "Thumbs.db", "desktop.ini", "~$*", "*.tmp", "*.part", ".~lock.*"];
+/// Ignored files the OS drops into folders by itself. They go along with a folder the server deleted; other
+/// ignored files (an open document's lock file, say) keep the folder here.
+const OS_METADATA: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
 /// Most chunk IDs asked about in one missing-chunk query.
 const MISSING_QUERY_IDS: usize = 10_000;
 
@@ -232,8 +235,12 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// caller can save it and simply run another pass later.
     pub async fn sync_once(&mut self) -> Result<Report, SyncError> {
         let mut report = Report::default();
-        let mode = self.pull().await?;
+        let mode = match self.pull().await? {
+            Mode::Normal if self.state.reconcile_pending => Mode::Reconcile,
+            mode => mode,
+        };
         self.apply_remote(mode, &mut report).await?;
+        self.state.reconcile_pending = false;
         self.push(&mut report).await?;
         self.approved_deletes = false;
         Ok(report)
@@ -281,6 +288,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     fn forget_base(&mut self) -> Result<Mode, SyncError> {
         let root = self.state.root.ok_or_else(|| SyncError::Corrupt("no root".into()))?;
         self.state.base.retain(|id, _| *id == root);
+        self.state.reconcile_pending = true;
         Ok(Mode::Reconcile)
     }
 
@@ -421,6 +429,46 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         }
     }
 
+    /// Removes the folder `dir` if it is empty or holds only OS metadata files (removed with it). Returns
+    /// whether it went.
+    fn remove_dir_if_bare(&mut self, dir: &RelPath) -> Result<bool, SyncError> {
+        let mut junk = Vec::new();
+        for entry in self.fs.list(dir).map_err(|e| io_err(dir, e))? {
+            let os_file = matches!(entry.kind, FsKind::File(_)) && self.config.ignored(&entry.name) && OS_METADATA.contains(&entry.name.as_str());
+            match Name::new(&entry.name) {
+                Ok(name) if os_file => junk.push(dir.join(&name)),
+                _ => return Ok(false),
+            }
+        }
+        for file in &junk {
+            self.fs.remove_file(file).map_err(|e| io_err(file, e))?;
+        }
+        self.fs.remove_dir(dir).map_err(|e| io_err(dir, e))?;
+        Ok(true)
+    }
+
+    /// Whether the folder `dir` holds something, but nothing that syncs: only ignored names, and folders like
+    /// that. The push doesn't create such a folder on the server.
+    fn holds_only_ignored(&self, dir: &RelPath) -> Result<bool, SyncError> {
+        if dir.depth() > MAX_TREE_DEPTH {
+            return Ok(false);
+        }
+        let entries = self.fs.list(dir).map_err(|e| io_err(dir, e))?;
+        if entries.is_empty() {
+            return Ok(false);
+        }
+        for entry in entries {
+            if self.config.ignored(&entry.name) {
+                continue;
+            }
+            let (FsKind::Dir { .. }, Ok(name)) = (entry.kind, Name::new(&entry.name)) else { return Ok(false) };
+            if !self.holds_only_ignored(&dir.join(&name))? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// A free conflict-copy path next to `path`.
     fn conflict_path(&self, path: &RelPath, is_dir: bool) -> Result<RelPath, SyncError> {
         let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
@@ -464,7 +512,12 @@ impl<F: Fs, T: Transport> Engine<F, T> {
 
     /// Downloads a file version and writes it to `path` atomically, chunk by chunk, after checking every chunk
     /// and the whole-file hash. A damaged download is abandoned and `path` stays as it was.
-    async fn download(&mut self, file: &FileState, path: &RelPath, report: &mut Report) -> Result<(FileMeta, FileHash), SyncError> {
+    ///
+    /// The caller has just checked what is at `path` (the verified file, or nothing). If that changed while the
+    /// download ran (an app saved the file), the download is abandoned and `None` returned: the base stays as it
+    /// was, so the next pass sees a local change and takes the conflict path.
+    async fn download(&mut self, file: &FileState, path: &RelPath, report: &mut Report) -> Result<Option<(FileMeta, FileHash)>, SyncError> {
+        let checked = self.stat(path)?;
         let manifest = self.fetch_manifest(&file.manifest).await?;
         let mut writer = self.fs.begin_write(path).map_err(|e| io_err(path, e))?;
         let mut hasher = blake3::Hasher::new();
@@ -479,9 +532,24 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         if *hasher.finalize().as_bytes() != *manifest.file_hash().as_bytes() {
             return Err(SyncError::Corrupt(format!("{path} doesn't match its file hash")));
         }
+        // Not an atomic compare-and-replace (that needs the `Fs` trait's help), but it closes the window the
+        // network round trips opened.
+        if self.stat(path)? != checked {
+            report.skipped.push((path.to_string(), "changed here while the server's version downloaded; tried again next pass".into()));
+            return Ok(None);
+        }
         let meta = self.fs.finish_write(path, writer, file.exec, file.mtime_ms).map_err(|e| io_err(path, e))?;
         report.downloaded.push(path.clone());
-        Ok((meta, *manifest.file_hash()))
+        Ok(Some((meta, *manifest.file_hash())))
+    }
+
+    /// The local file at `path`, if it holds exactly the content of the server's version `file`. The file is
+    /// stat'ed before it is hashed, so a save during the hash shows up as a change next pass.
+    async fn same_content(&self, file: &FileState, path: &RelPath) -> Result<Option<(FileMeta, FileHash)>, SyncError> {
+        let manifest = self.fetch_manifest(&file.manifest).await?;
+        let Some(FsKind::File(meta)) = self.stat(path)? else { return Ok(None) };
+        let hash = *manifest.file_hash();
+        Ok((meta.size == manifest.size() && self.content_hash(path) == Some(hash)).then_some((meta, hash)))
     }
 
     fn base_file(&self, file: &FileState, meta: FileMeta, hash: FileHash) -> BaseKind {
