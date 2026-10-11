@@ -101,6 +101,7 @@ on_every_backend!(
     creating_or_moving_into_a_deleted_folder_brings_it_back,
     names_can_be_juggled_within_one_batch,
     a_failed_restore_walk_is_not_repeated_for_every_operation,
+    big_manifests_are_checked_in_batches,
 );
 
 // ---- helpers ----
@@ -659,6 +660,47 @@ async fn a_failed_restore_walk_is_not_repeated_for_every_operation(meta: &Meta) 
     assert_eq!(refused.len(), 1000);
     assert!(refused.iter().all(|(_, kind)| *kind == ConflictKind::NameTaken { existing: taker }));
     assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+}
+
+/// A manifest of `count` distinct chunks (1 byte each), and the chunk IDs in order.
+fn big_manifest(count: u32) -> (Manifest, Vec<ChunkId>) {
+    let ids: Vec<ChunkId> = (0..count)
+        .map(|i| ChunkId::from_bytes(*blake3::hash(&[b"big-", uuid::Uuid::now_v7().as_bytes().as_slice(), &i.to_le_bytes()].concat()).as_bytes()))
+        .collect();
+    let chunks = ids.iter().map(|id| ChunkRef { id: *id, len: 1 }).collect();
+    let m = Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), u64::from(count), FileHash::from_bytes([2; 32]), chunks).unwrap();
+    (m, ids)
+}
+
+async fn big_manifests_are_checked_in_batches(meta: &Meta) {
+    let u = user(meta, "ana").await;
+
+    // 100,000 chunks, all uploaded first: the manifest is accepted quickly.
+    let (m, ids) = big_manifest(100_000);
+    let setup = std::time::Instant::now();
+    let uploads: Vec<(ChunkId, u64)> = ids.iter().map(|id| (*id, 2)).collect();
+    meta.add_chunks(u.space, &uploads, NOW).await.unwrap();
+    eprintln!("uploading 100000 chunks: {:?}", setup.elapsed());
+    let started = std::time::Instant::now();
+    meta.add_manifest(u.space, &m, 100, NOW).await.unwrap();
+    let took = started.elapsed();
+    eprintln!("add_manifest with 100000 present chunks: {took:?}");
+    assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
+    assert!(meta.has_manifest(u.space, &m.id()).await.unwrap());
+
+    // 50,000 chunks, none uploaded: all reported, in order.
+    let (m, ids) = big_manifest(50_000);
+    let started = std::time::Instant::now();
+    match meta.add_manifest(u.space, &m, 100, NOW).await {
+        Err(MetaError::MissingChunks(missing)) => assert_eq!(missing, ids),
+        other => panic!("expected MissingChunks, got {other:?}"),
+    }
+    let took = started.elapsed();
+    eprintln!("add_manifest with 50000 missing chunks: {took:?}");
+    assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
+    let started = std::time::Instant::now();
+    assert_eq!(meta.missing_chunks(u.space, &ids).await.unwrap(), ids);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }
 
 // ---- plain tests ----
