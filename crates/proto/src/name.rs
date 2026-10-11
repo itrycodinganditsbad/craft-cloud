@@ -48,6 +48,12 @@ pub struct Name(String);
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FoldKey(String);
 
+impl FoldKey {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl Name {
     /// Normalises `raw` to NFC and validates it.
     pub fn new(raw: &str) -> Result<Self, NameError> {

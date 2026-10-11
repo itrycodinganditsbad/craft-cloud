@@ -1,0 +1,25 @@
+[package]
+name = "craft-cloud-store"
+description = "Craft Cloud blob storage for chunks and manifests: local disk, S3-compatible, or memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+craft-cloud-proto.workspace = true
+object_store.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

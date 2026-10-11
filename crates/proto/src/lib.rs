@@ -9,9 +9,11 @@ pub mod ids;
 pub mod limits;
 pub mod manifest;
 pub mod name;
+pub mod ops;
 
 pub use conflict::{ConflictStamp, conflict_name};
 pub use hash::{ChunkId, FileHash, HexIdError, ManifestId};
 pub use ids::{DeviceId, Epoch, NodeId, SpaceId, VersionId};
 pub use manifest::{ChunkRef, ChunkerParamsId, Manifest, ManifestError};
 pub use name::{FoldKey, Name, NameError, UNICODE_VERSION};
+pub use ops::{ChangeSet, Conflict, ConflictKind, FileState, NewVersion, NodeKind, NodeState, Op, PageCursor};

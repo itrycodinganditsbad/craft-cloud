@@ -1,0 +1,23 @@
+[package]
+name = "craft-cloud-meta"
+description = "Craft Cloud server metadata: users, devices, spaces, nodes, versions and batch commits, on SQLite or Postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+craft-cloud-proto.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

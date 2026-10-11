@@ -64,8 +64,8 @@ Units, one job each:
 |---|---|---|---|
 | `craft-cloud-proto` | crate | API types, manifests, opaque chunk IDs, path and name rules, protocol version, errors | nothing in the workspace |
 | `craft-cloud-chunker` | crate | Content-defined chunking (FastCDC, versioned parameters) + BLAKE3; pure, no I/O | nothing in the workspace |
-| `craft-cloud-store` | crate | `ChunkStore` trait with local-disk and S3-compatible implementations (both via `object_store`) | proto |
-| `craft-cloud-meta` | crate | `MetaStore` trait: nodes, versions, change log, users, devices, GC generations; SQLite and Postgres implementations (sqlx) | proto |
+| `craft-cloud-store` | crate | `Store` (checks size, hash and format byte) over a `Backend` trait: local disk (own atomic writer), S3-compatible (`object_store`), memory (tests) | proto |
+| `craft-cloud-meta` | crate | `Meta`: users, devices, spaces, nodes, versions, per-space blobs, the batch commit, the change feed; one set of queries on SQLite or Postgres (sqlx `Any`) | proto |
 | `craft-cloud-server` | app | HTTP API, auth, retention, GC, admin CLI | proto, store, meta |
 | `craft-cloud-sync` | crate | The sync engine: scan, diff, upload, download, conflicts. Talks to the disk only through an `Fs` trait and to the server only through a `Transport` trait, so it can run inside a simulation | proto, chunker |
 | `craft-cloud-agent` | app | Background process per user: watcher, state DB, real `Fs`/`Transport`, local control API, CLI | sync |
@@ -100,14 +100,19 @@ can point into the synced folder, and saves are atomic.
   the context `craft-cloud 2026-10-11 fastcdc-v1 gear table`, masks on the top hash bits (21 before the
   average, 19 after), min 256 KiB, avg 1 MiB, max 4 MiB, normalisation level 1. Every version records its parameter set. Changing parameters means a new
   name, never an edit, so old versions stay readable and dedup within a parameter set stays intact.
-- **Change log**: every operation in a space gets the next sequence number. The server keeps the log for a
-  configurable window (default 90 days); asking for changes older than that returns `resync_required`,
-  and the client does a full listing.
+- **Change feed**: every commit gives the space its next sequence number, and every node it touches records
+  that number (`changed_seq`). Deleted nodes stay as tombstones, so "what changed since N" is one indexed
+  query that reports deletions too, with no separate log to grow. When tombstones are purged (M4), the space's
+  `oldest_seq` moves up; asking for changes older than that, or newer than the current sequence (the server
+  was restored), returns `resync_required` and the client does a full listing.
+- **Depth**: folders nest at most 256 levels below the root. A mkdir, or a folder move into a parent, deeper
+  than that is refused (`too_deep`); files may sit in the deepest folder. (A moved folder's own subtree isn't
+  measured, so it can end up deeper; operations below 256 levels are then refused.) Ancestor checks and
+  restore walks are one bounded recursive query each, so the cost of an operation doesn't grow with the tree.
 - **Names** are NFC-normalised. The server rejects anything that can't exist on every supported OS:
   `/`, `\`, NUL, `<>:"|?*`, control characters, trailing dot or space, Windows reserved names (`CON`, `NUL`,
   `COM1`…), over 255 UTF-8 bytes. **Uniqueness inside a directory is by Unicode full case folding + NFC**,
-  so `Foo.psd` and `foo.psd` can't both exist (they couldn't on Windows or macOS anyway). Fold keys are computed with a pinned Unicode version, stored with
-  it, and recomputed by the server after an upgrade that changes it.
+  so `Foo.psd` and `foo.psd` can't both exist (they couldn't on Windows or macOS anyway).
 
 ## Filesystem semantics
 
@@ -221,29 +226,34 @@ agent's own `.craft-cloud/` folder. A `.craftignore` file adds patterns.
 - **Version negotiation**: `GET /api/info` returns the server's protocol version range, chunker parameter
   sets and limits. The agent checks it at login and on every start, and refuses with a clear message if
   there's no overlap.
-- **Metadata: SQLite or Postgres**, chosen in the config. Both sit behind the `MetaStore` trait and run the
+- **Metadata: SQLite or Postgres**, chosen in the config. Both run the same queries (sqlx `Any` driver) and the
   same test suite. sqlx (MIT/Apache) with **one migration directory per backend**; no query relies on one
   dialect's quirks without a test on both.
-  - SQLite (default, solo and small studios): WAL mode, `busy_timeout` set, **one writer task** that every
-    write goes through; reads use a small pool.
-  - Postgres (bigger studios, or when the admin already runs one): a normal pool; commit runs in one
-    transaction that locks the affected node rows (`SELECT … FOR UPDATE`) so compare-and-swap holds under
-    concurrency; serialization failures are retried.
+  - SQLite (default, solo and small studios): WAL mode, `busy_timeout` set, **one write transaction at a
+    time** (a single async lock around every write, `BEGIN IMMEDIATE`); reads use a small pool.
+  - Postgres (bigger studios, or when the admin already runs one): a normal pool; a commit runs in one
+    transaction that first locks its space's row (`SELECT … FOR UPDATE`), so commits to one space run one at
+    a time and compare-and-swap holds under concurrency. Tree and change-feed reads use one
+    `REPEATABLE READ` snapshot.
   - Chunk I/O never happens inside a DB transaction, on either backend.
-- **Chunks: local disk or S3-compatible**, chosen in the config, both through `object_store` (Apache-2.0).
-  - Disk: `chunks/ab/cd/<id>`, written temp + fsync + rename.
+- **Chunks: local disk or S3-compatible**, chosen in the config.
+  - Disk (own writer): `chunks/ab/cd/<id>`, written temp + fsync + rename + directory fsync, including any
+    shard directory the write created.
+  - S3 through `object_store` (Apache-2.0).
   - S3 (AWS, MinIO, Garage, Backblaze B2, Cloudflare R2…): one object per chunk, `<prefix>/ab/cd/<id>`. A PUT
     is atomic, so there's no temp step. Credentials come from the config file or the standard environment
     variables, never from clients.
   - Every chunk is verified on write and on read, on both.
 - **Dedup without leaking**: chunks are stored once on disk, but `chunks/missing` answers per space, and
   **quota counts logical bytes per space**. Neither reveals whether someone else has the same data.
-- **Commit checks its chunks**: inside the commit transaction, every referenced manifest and every chunk it lists
-  must be present and referenced-or-protected for this space (GC treats manifests like chunks); otherwise the commit fails with `missing_chunks` and the list, and
-  the agent uploads them again. GC and commit share a **generation counter**: GC marks with generation G and
+- **Uploads and commits check what they reference**: a manifest upload is refused with the list of missing
+  chunks unless every chunk it lists is already in the space; a commit refuses a version whose manifest isn't
+  in the space (`missing_manifest` conflict). Both checks run inside the write transaction (GC treats
+  manifests like chunks), and the agent uploads what's missing and retries. GC and commit share a **generation counter**: GC marks with generation G and
   only sweeps chunks unreferenced at G and not touched by any upload or commit since, so a commit can't
   race a sweep.
-- **Accounts**: `admin` and `member` roles. Passwords Argon2id. Login rate-limited per client address and
+- **Accounts**: usernames are unique ignoring ASCII case (stored lowercase), so `Ana` and `ana` are one account.
+  `admin` and `member` roles. Passwords Argon2id. Login rate-limited per client address and
   per account.
 - **Devices**: the agent logs in once with username and password and gets a 256-bit device token, stored
   only as a hash. The device list shows name, created and **last used**. Revoke from the admin CLI or from
@@ -271,8 +281,8 @@ API sketch (`/api/v1`, JSON except chunk bodies; every response carries `epoch`)
 |---|---|
 | `GET /info` | protocol versions, chunker parameter sets, limits (no auth) |
 | `POST /auth/login` | username + password + device name → device token |
-| `GET /tree` | full listing for a first sync or a reconcile |
-| `GET /changes?since=N&wait=30` | changes after N, long-poll; `resync_required` if N is too old |
+| `GET /tree?after=…&limit=…` | full listing for a first sync or a reconcile, in pages (cursor = changed seq + node ID) |
+| `GET /changes?since=N&after=…&limit=…&wait=30` | changes after N, in pages, long-poll; `resync_required` if N is too old |
 | `POST /chunks/missing` | which of these chunk IDs this space lacks |
 | `PUT /chunks/{id}` / `GET /chunks/{id}` | one chunk, max 4 MiB, checked by the server |
 | `PUT /manifests/{id}` / `GET /manifests/{id}` | one manifest (binary); the server checks the ID, the limits and that every chunk is present |
@@ -330,8 +340,9 @@ API sketch (`/api/v1`, JSON except chunk bodies; every response carries `epoch`)
   uniqueness matches expectations for tricky cases (`ß`/`SS`, Turkish dotted I, combining accents).
 - **Server**: integration tests against an in-process server, **run once per backend combination**
   (SQLite + disk always; Postgres and S3 in CI through service containers, locally when
-  `CRAFT_CLOUD_TEST_PG` / `CRAFT_CLOUD_TEST_S3` are set). MinIO is AGPL, so it is only an external test
-  service, never linked or copied. Cases: auth, quota, batch commit
+  `CRAFT_CLOUD_TEST_PG` / `CRAFT_CLOUD_TEST_S3_*` are set; CI sets `CRAFT_CLOUD_REQUIRE_BACKENDS` so a
+  missing backend fails instead of skipping). The S3 test server is SeaweedFS (Apache-2.0), run as a
+  container, never linked. Cases: auth, quota, batch commit
   atomicity, `missing_chunks`, GC never removes a referenced or protected chunk while commits run,
   thinning, `backup` + `restore` gives the same state with a new epoch, `resync_required`.
 - **Deterministic simulation** of the sync engine: several agents and the server in one process with a
@@ -353,7 +364,7 @@ API sketch (`/api/v1`, JSON except chunk bodies; every response carries `epoch`)
 | # | Milestone | Status |
 |---|---|---|
 | M0 | Repo, conventions, CI | DONE (2026-10-11) |
-| M1 | `proto` + `chunker` (names, IDs, `fastcdc-v1` with golden vectors) | TODO |
+| M1 | `proto` + `chunker` (names, IDs, `fastcdc-v1` with golden vectors) | DONE (2026-10-11, PR #1) |
 | M2 | Server core: info, auth, devices, chunks, batch commit, changes, tree, epoch; SQLite + Postgres, disk + S3 | TODO |
 | M3 | Sync engine on `Fs`/`Transport` + simulation harness + agent CLI; two machines sync a folder | TODO |
 | M4 | History, restore, trash, thinning, GC, admin CLI, backup/restore | TODO |
