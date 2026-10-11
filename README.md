@@ -22,11 +22,19 @@ printf '%s\n' 'choose a password' | ./target/release/craft-cloud-server init --d
 
 The server speaks plain HTTP on `127.0.0.1:8080`. To reach it from other machines, put a TLS reverse proxy
 (Caddy, nginx, Traefik …) in front, set `listen` to the proxy-facing address, `behind_proxy = true`, and the
-proxy's address in `trusted_proxies`. The proxy must also set request header and body timeouts: the server relies on it to cut off slow clients.
+proxy's address in `trusted_proxies` (edit these in `config.toml`; `init` writes `trusted_proxies = []`). The proxy must also set request header and body timeouts: the server relies on it to cut off slow clients.
 For a non-loopback `--listen`, `init` takes `--behind-proxy` alongside it, for example
 `init --dir ./cc-data --admin you --listen 0.0.0.0:8080 --behind-proxy`; `trusted_proxies` must then list the proxy's address.
 For Postgres or S3, edit `[database]` and `[storage]` in `config.toml`.
-More accounts: `printf '%s\n' 'their password' | craft-cloud-server user add --config cc-data/config.toml name`.
+More accounts: `printf '%s\n' 'their password' | craft-cloud-server user --config cc-data/config.toml add name`
+(`--config` may come before or after `add`).
+
+### Restoring a backup
+
+After restoring the database and blob storage from a backup, run
+`craft-cloud-server reset-epoch --config cc-data/config.toml --all`. Every space then starts a new epoch, so
+each synced device reconciles with the restored state instead of trusting its own change counter.
+(`reset-epoch --config … name` resets one user's space.)
 
 ## Planned
 

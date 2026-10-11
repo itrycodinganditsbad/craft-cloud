@@ -37,6 +37,34 @@ async fn init_then_manage_users_devices_and_epochs() {
     assert_eq!(cli(&["device", "--config", c, "list", "bob"], "").await.unwrap(), "");
     assert!(cli(&["reset-epoch", "--config", c, "bob"], "").await.unwrap().starts_with("new epoch "));
     assert!(matches!(cli(&["reset-epoch", "--config", c, "nobody"], "").await, Err(CliError::Usage(_))));
+
+    // --config may also follow the action.
+    assert!(cli(&["user", "add", "--config", c, "dora"], "dora password 1\n").await.unwrap().contains("added dora (member)"));
+    assert_eq!(cli(&["device", "list", "--config", c, "dora"], "").await.unwrap(), "");
+    assert!(matches!(cli(&["user", "add", "erin"], "erin password 1\n").await, Err(CliError::Usage(m)) if m.contains("--config")));
+}
+
+#[tokio::test]
+async fn reset_epoch_all_resets_every_space() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config_path = dir.join("config.toml");
+    let c = config_path.to_str().unwrap();
+    cli(&["user", "--config", c, "add", "bob"], "bob password 1\n").await.unwrap();
+
+    let (meta, _) = craft_cloud_server::cli::open(&Config::load(&config_path).unwrap()).await.unwrap();
+    let spaces = meta.all_spaces().await.unwrap();
+    assert_eq!(spaces.len(), 2);
+    let mut before = Vec::new();
+    for space in &spaces {
+        before.push(meta.space_info(*space).await.unwrap().epoch);
+    }
+    let out = cli(&["reset-epoch", "--config", c, "--all"], "").await.unwrap();
+    assert!(out.contains("reset 2 space(s)"), "{out}");
+    for (space, old) in spaces.iter().zip(before) {
+        assert_ne!(meta.space_info(*space).await.unwrap().epoch, old);
+    }
 }
 
 #[tokio::test]
@@ -84,6 +112,26 @@ async fn init_makes_owner_only_files() {
     cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
     assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
     assert_eq!(std::fs::metadata(dir.join("config.toml")).unwrap().permissions().mode() & 0o777, 0o600);
+    let mode = |name: &str| std::fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode("meta.db"), 0o600);
+    for name in ["meta.db-wal", "meta.db-shm"] {
+        if dir.join(name).exists() {
+            assert_eq!(mode(name), 0o600, "{name}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn init_restricts_an_existing_empty_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(std::fs::metadata(dir.join("meta.db")).unwrap().permissions().mode() & 0o777, 0o600);
 }
 
 /// Kills the server process when the test ends, even if it panics.

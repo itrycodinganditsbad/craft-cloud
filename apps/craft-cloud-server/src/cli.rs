@@ -47,23 +47,31 @@ pub enum Command {
     },
     /// Manage accounts.
     User {
-        #[arg(long)]
-        config: PathBuf,
+        /// Path to config.toml. May come before or after the action.
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
         #[command(subcommand)]
         action: UserAction,
     },
     /// Manage a user's devices.
     Device {
-        #[arg(long)]
-        config: PathBuf,
+        /// Path to config.toml. May come before or after the action.
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
         #[command(subcommand)]
         action: DeviceAction,
     },
-    /// Start a new epoch for a user's space. Run after restoring the server from a backup.
+    /// Start a new epoch for a user's space (or every space with --all). Run after restoring the server from a backup.
+    #[command(group(clap::ArgGroup::new("target").required(true).multiple(false).args(["username", "all"])))]
     ResetEpoch {
+        /// Path to config.toml. May come before or after the action.
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+        /// The user whose space to reset.
+        username: Option<String>,
+        /// Reset every space on the server.
         #[arg(long)]
-        config: PathBuf,
-        username: String,
+        all: bool,
     },
 }
 
@@ -110,6 +118,11 @@ pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
     Ok((meta, store))
 }
 
+/// `--config` is global, which clap can't also make required, so it is checked here.
+fn config_path(config: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    config.ok_or_else(|| CliError::Usage("--config <path to config.toml> is required".into()))
+}
+
 const USERNAME_RULE: &str = "usernames are 1-64 letters, digits, '.', '_' or '-'";
 
 /// Reads one line, at most 1100 bytes: the 1024-byte password limit plus a line ending. Longer input is
@@ -135,7 +148,7 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
         Command::Init { dir, admin, listen, behind_proxy } => init(&dir, &admin, &listen, behind_proxy, input, out).await,
         Command::Serve { .. } => Err(CliError::Usage("serve is run by main".into())),
         Command::User { config, action } => {
-            let (meta, _) = open(&Config::load(&config)?).await?;
+            let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
             match action {
                 UserAction::Add { username, admin } => {
                     let password = read_password(input)?;
@@ -155,7 +168,7 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
             Ok(())
         }
         Command::Device { config, action } => {
-            let (meta, _) = open(&Config::load(&config)?).await?;
+            let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
             match action {
                 DeviceAction::List { username } => {
                     let user = user_id(&meta, &username).await?;
@@ -171,11 +184,21 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
             }
             Ok(())
         }
-        Command::ResetEpoch { config, username } => {
-            let (meta, _) = open(&Config::load(&config)?).await?;
-            let user = user_id(&meta, &username).await?;
-            let epoch = meta.reset_epoch(user.space).await?;
-            writeln!(out, "new epoch {epoch} for {}", user.username)?;
+        Command::ResetEpoch { config, username, all } => {
+            let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
+            if all {
+                let spaces = meta.all_spaces().await?;
+                for space in &spaces {
+                    let epoch = meta.reset_epoch(*space).await?;
+                    writeln!(out, "new epoch {epoch} for space {space}")?;
+                }
+                writeln!(out, "reset {} space(s)", spaces.len())?;
+            } else {
+                let username = username.ok_or_else(|| CliError::Usage("give a username, or --all".into()))?;
+                let user = user_id(&meta, &username).await?;
+                let epoch = meta.reset_epoch(user.space).await?;
+                writeln!(out, "new epoch {epoch} for {}", user.username)?;
+            }
             Ok(())
         }
     }
@@ -221,12 +244,33 @@ async fn create_files(dir: &Path, config_text: &str, config: &Config, admin: &st
     write_config(&dir.join("config.toml"), config_text)?;
     let (meta, _) = open(config).await?;
     meta.create_user(admin, hash, Role::Admin, now_ms()).await?;
+    for name in ["meta.db", "meta.db-wal", "meta.db-shm"] {
+        let path = dir.join(name);
+        if path.exists() {
+            restrict(&path, 0o600)?;
+        }
+    }
+    Ok(())
+}
+
+/// Sets the file mode on Unix; other platforms have no equivalent here.
+#[cfg(unix)]
+fn restrict(path: &Path, mode: u32) -> Result<(), CliError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path, _mode: u32) -> Result<(), CliError> {
     Ok(())
 }
 
 /// Creates the directory (owner-only on Unix). Missing parents are created with the default mode.
 fn create_data_dir(dir: &Path) -> Result<(), CliError> {
     if dir.exists() {
+        // An empty directory the admin made keeps whatever mode they gave it; the data inside is private.
+        restrict(dir, 0o700)?;
         return Ok(());
     }
     if let Some(parent) = dir.parent() {
@@ -341,5 +385,40 @@ mod tests {
     fn the_cli_parses() {
         let cli = Cli::try_parse_from(["craft-cloud-server", "user", "--config", "c.toml", "add", "ana", "--admin"]).unwrap();
         assert!(matches!(cli.command, Command::User { action: UserAction::Add { admin: true, .. }, .. }));
+    }
+
+    #[test]
+    fn config_goes_before_or_after_the_action() {
+        for args in [
+            ["craft-cloud-server", "user", "--config", "c.toml", "add", "ana"],
+            ["craft-cloud-server", "user", "add", "--config", "c.toml", "ana"],
+            ["craft-cloud-server", "user", "add", "ana", "--config", "c.toml"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(
+                matches!(&cli.command, Command::User { config, action: UserAction::Add { username, .. } } if config.as_deref() == Some(Path::new("c.toml")) && username == "ana")
+            );
+        }
+        for args in [
+            ["craft-cloud-server", "device", "--config", "c.toml", "list", "ana"],
+            ["craft-cloud-server", "device", "list", "--config", "c.toml", "ana"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(&cli.command, Command::Device { config, .. } if config.as_deref() == Some(Path::new("c.toml"))));
+        }
+        for args in
+            [["craft-cloud-server", "reset-epoch", "--config", "c.toml", "ana"], ["craft-cloud-server", "reset-epoch", "ana", "--config", "c.toml"]]
+        {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(&cli.command, Command::ResetEpoch { config, .. } if config.as_deref() == Some(Path::new("c.toml"))));
+        }
+    }
+
+    #[test]
+    fn reset_epoch_takes_a_username_or_all_but_not_both_or_neither() {
+        assert!(Cli::try_parse_from(["craft-cloud-server", "reset-epoch", "--config", "c.toml", "--all"]).is_ok());
+        assert!(Cli::try_parse_from(["craft-cloud-server", "reset-epoch", "--config", "c.toml", "ana"]).is_ok());
+        assert!(Cli::try_parse_from(["craft-cloud-server", "reset-epoch", "--config", "c.toml"]).is_err());
+        assert!(Cli::try_parse_from(["craft-cloud-server", "reset-epoch", "--config", "c.toml", "ana", "--all"]).is_err());
     }
 }

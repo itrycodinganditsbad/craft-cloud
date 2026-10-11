@@ -4,17 +4,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router, middleware};
-use craft_cloud_meta::DeviceAuth;
+use craft_cloud_meta::{DeviceAuth, valid_username};
 use craft_cloud_proto::api::{
     CommitRequest, CommitResponse, DeviceInfo, InfoResponse, LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse,
-    PROTOCOL_MAX, PROTOCOL_MIN,
+    PROTOCOL_MAX, PROTOCOL_MIN, SpaceResponse, codes,
 };
 use craft_cloud_proto::limits::{MAX_BATCH_JSON_BYTES, MAX_BATCH_OPS, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_PAGE_NODES};
 use craft_cloud_proto::{ChangeSet, ChunkId, DeviceId, Manifest, ManifestId, NodeId, PageCursor};
@@ -33,6 +33,8 @@ const LOGINS_PER_USER: u32 = 10;
 const LOGINS_PER_IP: u32 = 30;
 /// Longest change-feed long-poll.
 const MAX_WAIT_SECS: u64 = 60;
+/// `Retry-After` for a refused long-poll.
+const WAITERS_RETRY_SECS: u32 = 5;
 /// Small JSON bodies (login and missing-chunk queries).
 const SMALL_JSON_BYTES: usize = 1024 * 1024;
 
@@ -44,13 +46,28 @@ pub fn router(state: Shared) -> Router {
         .route("/devices/{id}", delete(revoke_device))
         .route("/chunks/missing", post(missing_chunks).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
         .route("/chunks/{id}", put(put_chunk).get(get_chunk).layer(DefaultBodyLimit::max(MAX_CHUNK_BYTES as usize)))
-        .route("/manifests/{id}", put(put_manifest).get(get_manifest).layer(DefaultBodyLimit::max(MAX_MANIFEST_BYTES)))
+        .route("/manifests/{id}", put(put_manifest).get(get_manifest))
         .route("/commit", post(commit).layer(DefaultBodyLimit::max(MAX_BATCH_JSON_BYTES)))
+        .route("/space", get(space))
         .route("/tree", get(tree))
         .route("/changes", get(changes))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_device));
     let public = Router::new().route("/info", get(info)).route("/auth/login", post(login).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)));
-    Router::new().nest("/api/v1", public.merge(signed_in)).with_state(state)
+    Router::new()
+        .nest("/api/v1", public.merge(signed_in))
+        // Version 1 isn't known yet when a client first asks what the server speaks.
+        .route("/api/info", get(info))
+        .fallback(no_such_endpoint)
+        .method_not_allowed_fallback(wrong_method)
+        .with_state(state)
+}
+
+async fn no_such_endpoint() -> ApiError {
+    ApiError::not_found("endpoint")
+}
+
+async fn wrong_method() -> ApiError {
+    ApiError::new(StatusCode::METHOD_NOT_ALLOWED, codes::INVALID, "method not allowed")
 }
 
 async fn info() -> Json<InfoResponse> {
@@ -65,11 +82,6 @@ async fn info() -> Json<InfoResponse> {
         max_page_nodes: MAX_PAGE_NODES,
         max_missing_ids: MAX_MISSING_IDS as u32,
     })
-}
-
-/// Usernames are 1-64 ASCII letters, digits, `.`, `_` and `-`; checked before any rate limiting or hashing.
-fn valid_username(name: &str) -> bool {
-    (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 async fn login(
@@ -89,7 +101,7 @@ async fn login(
     let ip = client_ip(peer, &headers, &state.trusted_proxies);
     let username = req.username.to_ascii_lowercase();
     if !state.logins.allow(&ip_key(ip), LOGINS_PER_IP, now) || !state.logins.allow(&format!("user:{username}"), LOGINS_PER_USER, now) {
-        return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "too many sign-in attempts; wait a few minutes"));
+        return Err(ApiError::rate_limited("too many sign-in attempts; wait a few minutes", None));
     }
     if req.password.len() > crate::auth::MAX_PASSWORD_BYTES {
         return Err(ApiError::invalid("passwords are at most 1024 bytes"));
@@ -102,12 +114,17 @@ async fn login(
         ApiError::internal()
     })?;
     let (Some(user), true) = (user, ok) else {
-        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", "wrong username or password"));
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED, "wrong username or password"));
     };
     let (token, token_hash) = new_token()?;
     let device = state.meta.create_device(user.id, &req.device_name, &token_hash, now_ms()).await?;
     tracing::info!(user = %user.username, %device, "device signed in");
     Ok(Json(LoginResponse { device, token }))
+}
+
+async fn space(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>) -> Result<Json<SpaceResponse>, ApiError> {
+    let info = state.meta.space_info(auth.space).await?;
+    Ok(Json(SpaceResponse { space: auth.space, root: info.root, epoch: info.epoch, seq: info.seq, username: auth.username }))
 }
 
 async fn list_devices(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>) -> Result<Json<Vec<DeviceInfo>>, ApiError> {
@@ -204,19 +221,36 @@ async fn get_chunk(
     Ok(octets(stored_blob(&state, BlobKey::chunk(&id)).await?))
 }
 
+async fn manifest_permit(state: &AppState) -> Result<tokio::sync::SemaphorePermit<'_>, ApiError> {
+    state.manifest_uploads.acquire().await.map_err(|e| {
+        tracing::error!(error = %e, "manifest semaphore closed");
+        ApiError::internal()
+    })
+}
+
+/// A body that failed to arrive: too long, or the connection broke.
+fn body_error(e: axum::Error) -> ApiError {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+    while let Some(err) = source {
+        if err.to_string().contains("length limit exceeded") {
+            return ApiError::too_large(format!("the body is over the limit of {MAX_MANIFEST_BYTES} bytes"));
+        }
+        source = err.source();
+    }
+    ApiError::invalid("the request body couldn't be read")
+}
+
 async fn put_manifest(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
     id: Result<Path<String>, PathRejection>,
-    body: Result<Bytes, BytesRejection>,
+    body: Body,
 ) -> Result<StatusCode, ApiError> {
     let Path(id) = id?;
-    let body = body?;
-    // Decoding and checking a big manifest is real work: only a few at a time, server-wide.
-    let _permit = state.manifest_uploads.acquire().await.map_err(|e| {
-        tracing::error!(error = %e, "manifest upload semaphore closed");
-        ApiError::internal()
-    })?;
+    // Big manifests are real work to buffer, decode and check: only a few at a time, server-wide. The permit
+    // is taken before the body is read, so the waiting requests hold no buffered bytes.
+    let _permit = manifest_permit(&state).await?;
+    let body = axum::body::to_bytes(body, MAX_MANIFEST_BYTES).await.map_err(body_error)?;
     let id = parse_manifest_id(&id)?;
     let manifest = Manifest::decode(&body).map_err(|e| ApiError::invalid(format!("bad manifest: {e}")))?;
     if manifest.id() != id {
@@ -249,6 +283,7 @@ async fn get_manifest(
 ) -> Result<Response, ApiError> {
     let Path(id) = id?;
     let id = parse_manifest_id(&id)?;
+    let _permit = manifest_permit(&state).await?;
     if !state.meta.has_manifest(auth.space, &id).await? {
         return Err(ApiError::not_found("manifest"));
     }
@@ -261,8 +296,19 @@ async fn commit(
     req: Result<Json<CommitRequest>, JsonRejection>,
 ) -> Result<Json<CommitResponse>, ApiError> {
     let Json(req) = req?;
-    let outcome = state.meta.commit(auth.space, auth.device, &req.ops, now_ms()).await?;
-    state.notifier.publish(auth.space, outcome.seq);
+    // Commit and publish run in their own task: a client that disconnects mid-request drops this handler,
+    // and the publish must not be skipped for a commit that went through.
+    let task_state = state.clone();
+    let outcome = tokio::spawn(async move {
+        let outcome = task_state.meta.commit(auth.space, auth.device, &req.ops, now_ms()).await?;
+        task_state.notifier.publish(auth.space, outcome.seq);
+        Ok::<_, ApiError>(outcome)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "commit task failed");
+        ApiError::internal()
+    })??;
     Ok(Json(CommitResponse { seq: outcome.seq, epoch: outcome.epoch }))
 }
 
@@ -303,8 +349,8 @@ struct ChangesQuery {
 }
 
 /// Changes after `since`. With `wait` (seconds, up to 60) and nothing new yet, the request is held open until
-/// a commit lands or the time runs out. `wait` is ignored when a paging cursor is given, and when the space
-/// already has `MAX_WAITERS_PER_SPACE` requests waiting.
+/// a commit lands, the time runs out or the server shuts down. `wait` is ignored when a paging cursor is
+/// given. When the space already has `MAX_WAITERS_PER_SPACE` requests waiting, the answer is 429.
 async fn changes(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
@@ -312,13 +358,23 @@ async fn changes(
 ) -> Result<Json<ChangeSet>, ApiError> {
     let Query(q) = q?;
     let cursor = cursor(q.after_seq, q.after_node)?;
-    let slot = if q.wait > 0 && cursor.is_none() { state.notifier.begin_wait(auth.space) } else { None };
+    let slot = if q.wait > 0 && cursor.is_none() {
+        let slot = state.notifier.begin_wait(auth.space);
+        Some(slot.ok_or_else(|| ApiError::rate_limited("too many waiting requests for this space", Some(WAITERS_RETRY_SECS)))?)
+    } else {
+        None
+    };
     if slot.is_some() {
         // Subscribe before reading the sequence number, so a commit in between still wakes us.
         let mut updates = state.notifier.subscribe(auth.space);
+        let mut stopping = state.notifier.shutdown_signal();
         if state.meta.space_info(auth.space).await?.seq == q.since {
             let deadline = Duration::from_secs(q.wait.min(MAX_WAIT_SECS));
-            let _ = tokio::time::timeout(deadline, updates.wait_for(|seq| *seq > q.since)).await;
+            // Whichever comes first: a commit, the deadline, or the server shutting down.
+            tokio::select! {
+                _ = tokio::time::timeout(deadline, updates.wait_for(|seq| *seq > q.since)) => {}
+                _ = stopping.wait_for(|stop| *stop) => {}
+            }
         }
     }
     Ok(Json(state.meta.changes(auth.space, q.since, cursor, q.limit.unwrap_or(MAX_PAGE_NODES)).await?))

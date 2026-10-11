@@ -139,6 +139,12 @@ impl Meta {
         Ok(ChangeSet { epoch: info.epoch, seq: info.seq, nodes, next })
     }
 
+    /// Every space on the server, in ID order.
+    pub async fn all_spaces(&self) -> Result<Vec<SpaceId>, MetaError> {
+        let rows = sqlx::query("SELECT id FROM spaces ORDER BY id").fetch_all(&self.pool).await?;
+        rows.iter().map(|row| Ok(SpaceId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("id")?)?))).collect()
+    }
+
     /// Starts a new epoch for the space: run after restoring the server from a backup, so every agent
     /// reconciles instead of trusting its change counter.
     pub async fn reset_epoch(&self, space: SpaceId) -> Result<Epoch, MetaError> {

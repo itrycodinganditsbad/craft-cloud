@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use craft_cloud_meta::{Meta, Role};
-use craft_cloud_proto::api::{CommitResponse, DeviceInfo, EPOCH_HEADER, ErrorBody, InfoResponse, LoginResponse, MissingResponse};
+use craft_cloud_proto::api::{CommitResponse, DeviceInfo, EPOCH_HEADER, ErrorBody, InfoResponse, LoginResponse, MissingResponse, SpaceResponse};
 use craft_cloud_proto::{
     ChangeSet, ChunkId, ChunkRef, ChunkerParamsId, FileHash, Manifest, ManifestId, Name, NewVersion, NodeId, NodeKind, Op, VersionId,
 };
@@ -21,9 +21,18 @@ struct Server {
     base: String,
     meta: Meta,
     client: Client,
-    _shutdown: tokio::sync::oneshot::Sender<()>,
+    shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     _dirs: Vec<tempfile::TempDir>,
     _pg: Option<PgGuard>,
+}
+
+impl Server {
+    /// Asks the server to shut down, as SIGTERM would.
+    fn stop(&self) {
+        if let Some(tx) = self.shutdown.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+    }
 }
 
 struct PgGuard {
@@ -55,7 +64,7 @@ async fn start(meta: Meta, store: Store, dirs: Vec<tempfile::TempDir>, pg: Optio
     tokio::spawn(craft_cloud_server::serve(state, listener, async move {
         let _ = rx.await;
     }));
-    Server { base, meta, client: Client::new(), _shutdown: tx, _dirs: dirs, _pg: pg }
+    Server { base, meta, client: Client::new(), shutdown: std::sync::Mutex::new(Some(tx)), _dirs: dirs, _pg: pg }
 }
 
 async fn sqlite_disk() -> Server {
@@ -122,6 +131,9 @@ on_every_backend!(
     one_request_cant_list_unbounded_missing_chunks,
     long_polls_are_capped_per_space,
     odd_usernames_and_device_names_are_refused,
+    shutting_down_ends_long_polls,
+    the_space_endpoint_and_unversioned_info,
+    oversized_manifests_are_refused,
 );
 
 // ---- helpers ----
@@ -523,6 +535,18 @@ async fn every_rejection_is_a_json_error(s: &Server) {
     assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
     let (status, body) = error(s.client.delete(format!("{}/devices/not-an-id", s.base)).bearer_auth(&token).send().await.unwrap()).await;
     assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+
+    // Unknown routes and wrong methods are JSON too.
+    let root_url = s.base.trim_end_matches("/api/v1");
+    let (status, body) = error(s.client.get(format!("{}/nope", s.base)).send().await.unwrap()).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+    assert_eq!(body.message, "no such endpoint");
+    let (status, body) = error(s.client.post(format!("{}/info", s.base)).send().await.unwrap()).await;
+    assert_eq!((status, body.error.as_str(), body.message.as_str()), (StatusCode::METHOD_NOT_ALLOWED, "invalid", "method not allowed"));
+    let (status, body) = error(s.client.get(format!("{root_url}/api/v2/info")).send().await.unwrap()).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+    let (status, body) = error(s.client.post(format!("{}/tree", s.base)).bearer_auth(&token).send().await.unwrap()).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::METHOD_NOT_ALLOWED, "invalid"));
 }
 
 async fn one_request_cant_list_unbounded_missing_chunks(s: &Server) {
@@ -548,10 +572,12 @@ async fn long_polls_are_capped_per_space(s: &Server) {
         .collect();
     tokio::time::sleep(Duration::from_millis(700)).await;
     let t = Instant::now();
-    let seventeenth: ChangeSet =
-        s.client.get(format!("{}/changes?since=0&wait=10", s.base)).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
+    let seventeenth = s.client.get(format!("{}/changes?since=0&wait=10", s.base)).bearer_auth(&token).send().await.unwrap();
     assert!(t.elapsed() < Duration::from_secs(2), "the 17th wait should not have waited");
-    assert!(seventeenth.nodes.is_empty());
+    assert_eq!(seventeenth.headers().get("retry-after").unwrap(), "5");
+    let (status, body) = error(seventeenth).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+    assert_eq!(body.message, "too many waiting requests for this space");
     // Wake the sixteen.
     assert_eq!(
         commit(s, &token, &[Op::Mkdir { node: NodeId::generate(), parent: r, name: Name::new("wake").unwrap() }]).await.status(),
@@ -577,4 +603,50 @@ async fn odd_usernames_and_device_names_are_refused(s: &Server) {
         assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "{user:?} {device:?}");
     }
     login(s, "ana").await;
+}
+
+async fn shutting_down_ends_long_polls(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let (client, url) = (s.client.clone(), format!("{}/changes?since=0&wait=30", s.base));
+    let poll = tokio::spawn(async move { client.get(url).bearer_auth(token).send().await.unwrap().json::<ChangeSet>().await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let t = Instant::now();
+    s.stop();
+    let answer = tokio::time::timeout(Duration::from_secs(3), poll).await.expect("the long-poll should answer at once").unwrap();
+    assert!(answer.nodes.is_empty());
+    assert!(t.elapsed() < Duration::from_secs(3));
+}
+
+async fn the_space_endpoint_and_unversioned_info(s: &Server) {
+    add_user(s, "Ana").await;
+    let token = login(s, "ana").await;
+    let res = s.client.get(format!("{}/space", s.base)).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let space: SpaceResponse = res.json().await.unwrap();
+    assert_eq!(space.username, "ana");
+    assert_eq!(space.root, root(s, &token).await);
+    let tree: ChangeSet = s.client.get(format!("{}/tree", s.base)).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
+    assert_eq!((space.epoch, space.seq), (tree.epoch, tree.seq));
+    assert_eq!(s.client.get(format!("{}/space", s.base)).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    let versioned: InfoResponse = s.client.get(format!("{}/info", s.base)).send().await.unwrap().json().await.unwrap();
+    let unversioned: InfoResponse =
+        s.client.get(format!("{}/api/info", s.base.trim_end_matches("/api/v1"))).send().await.unwrap().json().await.unwrap();
+    assert_eq!(versioned, unversioned);
+}
+
+async fn oversized_manifests_are_refused(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let data = b"some data".to_vec();
+    let id = manifest_for(&data).id();
+    let big = vec![0u8; craft_cloud_proto::limits::MAX_MANIFEST_BYTES + 1];
+    let res = s.client.put(format!("{}/manifests/{id}", s.base)).bearer_auth(&token).body(big).send().await.unwrap();
+    let (status, body) = error(res).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::PAYLOAD_TOO_LARGE, "too_large"));
+    // Reading manifests still works (and shares the same permits).
+    let stored = upload(s, &token, &data).await;
+    let got = s.client.get(format!("{}/manifests/{stored}", s.base)).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(got.status(), StatusCode::OK);
 }

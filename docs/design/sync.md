@@ -284,20 +284,37 @@ agent's own `.craft-cloud/` folder. A `.craftignore` file adds patterns.
 API (`/api/v1`, JSON except chunk and manifest bodies; every signed-in response carries the space's epoch in
 the `craft-epoch` header, and commits/tree/changes carry it in the body too). Errors are
 `{error, message, conflicts?, missing?}` with stable codes (`conflict` 409, `missing_chunks` 409,
-`resync_required` 410, `unauthorized` 401, `rate_limited` 429, `invalid` 400, `not_found` 404, `too_large` 413):
+`resync_required` 410, `unauthorized` 401, `rate_limited` 429, `invalid` 400, `not_found` 404, `too_large` 413,
+`username_taken` 409, `internal` 500; the codes are constants in `craft-cloud-proto::api::codes`). Unknown routes and
+methods answer `not_found` / `invalid` (405) the same way:
 
 | Call | Purpose |
 |---|---|
-| `GET /info` | protocol versions, chunker parameter sets, limits (no auth) |
+| `GET /info` (also unversioned at `/api/info`) | protocol versions, chunker parameter sets, limits (no auth); a client probes `/api/info` first |
+| `GET /space` | the signed-in user's space: space ID, root node ID, epoch, current seq, username |
 | `POST /auth/login` | username + password + device name → device ID + token (shown once); 10 tries per account and 30 per address per 5 minutes; a wrong password and an unknown user look the same |
 | `GET /tree?after_seq=…&after_node=…&limit=…` | full listing for a first sync or a reconcile, in pages of up to 5,000 (cursor = changed seq + node ID) |
 | `GET /changes?since=N&after_seq=…&after_node=…&limit=…&wait=30` | changes after N, in pages, long-poll up to 60 s; `resync_required` if N is too old or ahead of the server |
 | `POST /chunks/missing` | which of these chunk IDs (up to 10,000) this space lacks |
 | `PUT /chunks/{id}` / `GET /chunks/{id}` | one chunk, max 4 MiB, checked by the server; you can only download chunks your space uploaded |
 | `PUT /manifests/{id}` / `GET /manifests/{id}` | one manifest (binary); the server checks the ID, the limits and that every chunk is present |
-| `POST /commit` | batch of version/mkdir/move/delete operations, one transaction; `409` with details on conflict, `missing_chunks` with a list |
+| `POST /commit` | batch of version/mkdir/move/delete operations, one transaction; `409 conflict` listing every conflicting operation (a version whose manifest isn't uploaded is a `missing_manifest` conflict) |
 | `GET /nodes/{id}/history` / `POST /nodes/{id}/restore` | list versions / make an old one current (M4) |
 | `GET /devices`, `DELETE /devices/{id}` | your devices |
+
+**Client contract** (what the sync agent relies on):
+
+- Probe `GET /api/info` and refuse to sync when the protocol ranges don't overlap.
+- The epoch in a response **body** (`commit`, `tree`, `changes`) wins over the `craft-epoch` header; the header is
+  read when the request starts and can be older after a long-poll.
+- Page a listing by following `next` (`after_seq` + `after_node`) until it is absent, then resume the change feed
+  from the `seq` of the **first** page.
+- Node and version IDs are made by the client, so a commit retried after a timeout is safe: `node_exists` /
+  `version_exists` conflicts for exactly the retried operations mean the first attempt applied.
+- A long-poll refused because 16 are already waiting on the space answers `429 rate_limited` with `Retry-After`;
+  wait that long before polling again.
+- Unknown JSON fields are ignored in both directions, so later protocol versions can add fields.
+- After an admin restores a backup they run `craft-cloud-server reset-epoch --all`; agents then reconcile.
 
 ## Agent and launcher API
 
@@ -374,7 +391,7 @@ the `craft-epoch` header, and commits/tree/changes carry it in the body too). Er
 |---|---|---|
 | M0 | Repo, conventions, CI | DONE (2026-10-11) |
 | M1 | `proto` + `chunker` (names, IDs, `fastcdc-v1` with golden vectors) | DONE (2026-10-11, PR #1) |
-| M2 | Server core: info, auth, devices, chunks, batch commit, changes, tree, epoch; SQLite + Postgres, disk + S3 | IN PROGRESS (M2a storage done 2026-10-11; M2b server next) |
+| M2 | Server core: info, auth, devices, chunks, batch commit, changes, tree, epoch; SQLite + Postgres, disk + S3 | DONE (2026-10-11; M2a storage, M2b server) |
 | M3 | Sync engine on `Fs`/`Transport` + simulation harness + agent CLI; two machines sync a folder | TODO |
 | M4 | History, restore, trash, thinning, GC, admin CLI, backup/restore | TODO |
 | M5 | Selective sync, large-media polish, ignore rules | TODO |

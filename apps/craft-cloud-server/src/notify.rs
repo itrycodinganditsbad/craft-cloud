@@ -9,10 +9,16 @@ use tokio::sync::watch;
 /// Most long-polls one space may have waiting at once.
 pub const MAX_WAITERS_PER_SPACE: usize = 16;
 
-#[derive(Default)]
 pub struct Notifier {
     spaces: Mutex<HashMap<SpaceId, watch::Sender<u64>>>,
     waiters: Mutex<HashMap<SpaceId, usize>>,
+    shutdown: watch::Sender<bool>,
+}
+
+impl Default for Notifier {
+    fn default() -> Self {
+        Self { spaces: Mutex::default(), waiters: Mutex::default(), shutdown: watch::channel(false).0 }
+    }
 }
 
 /// One waiting long-poll; frees its slot when dropped.
@@ -43,6 +49,17 @@ impl Notifier {
         }
         *count += 1;
         Some(WaitGuard { notifier: self, space })
+    }
+
+    /// Tells every waiting long-poll (now and later) to answer at once. The server calls this when it starts
+    /// shutting down, so a graceful shutdown doesn't wait out the long-polls.
+    pub fn begin_shutdown(&self) {
+        self.shutdown.send_replace(true);
+    }
+
+    /// A receiver whose value turns `true` once [`Notifier::begin_shutdown`] has been called.
+    pub fn shutdown_signal(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
     }
 
     /// A receiver that sees every later `publish` for the space. A new space starts at sequence 0.
@@ -91,6 +108,16 @@ mod tests {
         assert!(notifier.begin_wait(b).is_some());
         drop(guards);
         assert!(notifier.begin_wait(a).is_some());
+    }
+
+    #[tokio::test]
+    async fn shutdown_reaches_late_and_early_listeners() {
+        let notifier = Notifier::default();
+        let mut early = notifier.shutdown_signal();
+        assert!(!*early.borrow());
+        notifier.begin_shutdown();
+        early.wait_for(|stop| *stop).await.unwrap();
+        notifier.shutdown_signal().wait_for(|stop| *stop).await.unwrap();
     }
 
     #[test]

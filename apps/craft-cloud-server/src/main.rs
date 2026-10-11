@@ -43,11 +43,15 @@ async fn run_server(config_path: &std::path::Path) -> Result<(), String> {
     serve(state, listener, shutdown).await.map_err(|e| e.to_string())
 }
 
-/// Resolves on Ctrl-C, or on SIGTERM (what service managers send) on Unix. If SIGTERM can't be watched,
-/// Ctrl-C alone still stops the server.
+/// Resolves on Ctrl-C, or on SIGTERM (what service managers send) on Unix. A service has no console, so
+/// Ctrl-C can't always be watched; that is not a reason to stop: the server then waits for SIGTERM alone
+/// (or forever, where there is no SIGTERM).
 async fn wait_for_stop_signal() {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("can't watch for Ctrl-C: {e}");
+            std::future::pending::<()>().await;
+        }
     };
     #[cfg(unix)]
     {
