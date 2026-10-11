@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
+use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -17,7 +18,7 @@ use craft_cloud_proto::api::{
 };
 use craft_cloud_proto::limits::{MAX_BATCH_JSON_BYTES, MAX_BATCH_OPS, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_PAGE_NODES};
 use craft_cloud_proto::{ChangeSet, ChunkId, DeviceId, Manifest, ManifestId, NodeId, PageCursor};
-use craft_cloud_store::BlobKey;
+use craft_cloud_store::{BlobKey, StoreError};
 use serde::Deserialize;
 
 use crate::auth::{new_token, require_device, verify_password};
@@ -32,7 +33,7 @@ const LOGINS_PER_USER: u32 = 10;
 const LOGINS_PER_IP: u32 = 30;
 /// Longest change-feed long-poll.
 const MAX_WAIT_SECS: u64 = 60;
-/// Small JSON bodies (login, missing-chunk queries, device names).
+/// Small JSON bodies (login and missing-chunk queries).
 const SMALL_JSON_BYTES: usize = 1024 * 1024;
 
 type Shared = Arc<AppState>;
@@ -66,14 +67,23 @@ async fn info() -> Json<InfoResponse> {
     })
 }
 
+/// Usernames are 1-64 ASCII letters, digits, `.`, `_` and `-`; checked before any rate limiting or hashing.
+fn valid_username(name: &str) -> bool {
+    (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 async fn login(
     State(state): State<Shared>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(req): Json<LoginRequest>,
+    req: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Result<Json<LoginResponse>, ApiError> {
-    if req.username.len() > 64 {
-        return Err(ApiError::invalid("usernames are at most 64 characters"));
+    let Json(req) = req?;
+    if !valid_username(&req.username) {
+        return Err(ApiError::invalid("usernames are 1-64 letters, digits, '.', '_' or '-'"));
+    }
+    if req.device_name.is_empty() || req.device_name.len() > 128 || req.device_name.chars().any(char::is_control) {
+        return Err(ApiError::invalid("device names are 1-128 bytes without control characters"));
     }
     let now = Instant::now();
     let ip = client_ip(peer, &headers, &state.trusted_proxies);
@@ -87,7 +97,10 @@ async fn login(
     let user = state.meta.user_by_name(&username).await?;
     let hash = user.as_ref().map_or(state.dummy_hash.as_str(), |u| u.password_hash.as_str()).to_owned();
     let password = req.password.clone();
-    let ok = tokio::task::spawn_blocking(move || verify_password(&password, &hash)).await.map_err(|_| ApiError::internal())?;
+    let ok = tokio::task::spawn_blocking(move || verify_password(&password, &hash)).await.map_err(|e| {
+        tracing::error!(error = %e, "password check task failed");
+        ApiError::internal()
+    })?;
     let (Some(user), true) = (user, ok) else {
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", "wrong username or password"));
     };
@@ -117,8 +130,9 @@ async fn list_devices(State(state): State<Shared>, Extension(auth): Extension<De
 async fn revoke_device(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
-    Path(id): Path<DeviceId>,
+    id: Result<Path<DeviceId>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
+    let Path(id) = id?;
     state.meta.revoke_device(auth.user, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -126,8 +140,9 @@ async fn revoke_device(
 async fn missing_chunks(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
-    Json(req): Json<MissingRequest>,
+    req: Result<Json<MissingRequest>, JsonRejection>,
 ) -> Result<Json<MissingResponse>, ApiError> {
+    let Json(req) = req?;
     if req.ids.len() > MAX_MISSING_IDS {
         return Err(ApiError::invalid(format!("ask about at most {MAX_MISSING_IDS} chunks at once")));
     }
@@ -146,12 +161,25 @@ fn octets(bytes: Bytes) -> Response {
     ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
 }
 
+/// Reads a blob the database says this space has. A missing blob then is lost data, not a client mistake.
+async fn stored_blob(state: &AppState, key: BlobKey) -> Result<Bytes, ApiError> {
+    match state.store.get(key).await {
+        Err(StoreError::NotFound(k)) => {
+            tracing::error!(blob = ?k, "a stored blob is missing from the blob store");
+            Err(ApiError::internal())
+        }
+        other => Ok(other?),
+    }
+}
+
 async fn put_chunk(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
-    Path(id): Path<String>,
-    body: Bytes,
+    id: Result<Path<String>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<StatusCode, ApiError> {
+    let Path(id) = id?;
+    let body = body?;
     let id = parse_chunk_id(&id)?;
     if body.is_empty() {
         return Err(ApiError::invalid("a chunk can't be empty"));
@@ -162,21 +190,33 @@ async fn put_chunk(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn get_chunk(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>, Path(id): Path<String>) -> Result<Response, ApiError> {
+async fn get_chunk(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    id: Result<Path<String>, PathRejection>,
+) -> Result<Response, ApiError> {
+    let Path(id) = id?;
     let id = parse_chunk_id(&id)?;
     // Only chunks this space uploaded; another space's chunk is "not found", not "forbidden".
     if !state.meta.missing_chunks(auth.space, &[id]).await?.is_empty() {
         return Err(ApiError::not_found("chunk"));
     }
-    Ok(octets(state.store.get(BlobKey::chunk(&id)).await?))
+    Ok(octets(stored_blob(&state, BlobKey::chunk(&id)).await?))
 }
 
 async fn put_manifest(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
-    Path(id): Path<String>,
-    body: Bytes,
+    id: Result<Path<String>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<StatusCode, ApiError> {
+    let Path(id) = id?;
+    let body = body?;
+    // Decoding and checking a big manifest is real work: only a few at a time, server-wide.
+    let _permit = state.manifest_uploads.acquire().await.map_err(|e| {
+        tracing::error!(error = %e, "manifest upload semaphore closed");
+        ApiError::internal()
+    })?;
     let id = parse_manifest_id(&id)?;
     let manifest = Manifest::decode(&body).map_err(|e| ApiError::invalid(format!("bad manifest: {e}")))?;
     if manifest.id() != id {
@@ -186,31 +226,52 @@ async fn put_manifest(
         return Err(ApiError::invalid(format!("unknown chunker parameter set {}", manifest.chunker().as_str())));
     }
     let ids: Vec<ChunkId> = manifest.chunks().iter().map(|c| c.id).collect();
-    let missing = state.meta.missing_chunks(auth.space, &ids).await?;
+    let mut missing = state.meta.missing_chunks(auth.space, &ids).await?;
     if !missing.is_empty() {
-        return Err(ApiError::missing_chunks(missing));
+        let total = missing.len();
+        missing.truncate(MAX_MISSING_IDS);
+        let listed = missing.len();
+        let mut err = ApiError::missing_chunks(missing);
+        if total > listed {
+            err.message = format!("{total} chunk(s) must be uploaded first; the first {listed} are listed");
+        }
+        return Err(err);
     }
     state.store.put(BlobKey::manifest(&id), &body).await?;
     state.meta.add_manifest(auth.space, &manifest, body.len() as u64 + 1, now_ms()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn get_manifest(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>, Path(id): Path<String>) -> Result<Response, ApiError> {
+async fn get_manifest(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    id: Result<Path<String>, PathRejection>,
+) -> Result<Response, ApiError> {
+    let Path(id) = id?;
     let id = parse_manifest_id(&id)?;
     if !state.meta.has_manifest(auth.space, &id).await? {
         return Err(ApiError::not_found("manifest"));
     }
-    Ok(octets(state.store.get(BlobKey::manifest(&id)).await?))
+    Ok(octets(stored_blob(&state, BlobKey::manifest(&id)).await?))
 }
 
 async fn commit(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
-    Json(req): Json<CommitRequest>,
+    req: Result<Json<CommitRequest>, JsonRejection>,
 ) -> Result<Json<CommitResponse>, ApiError> {
+    let Json(req) = req?;
     let outcome = state.meta.commit(auth.space, auth.device, &req.ops, now_ms()).await?;
     state.notifier.publish(auth.space, outcome.seq);
     Ok(Json(CommitResponse { seq: outcome.seq, epoch: outcome.epoch }))
+}
+
+fn cursor(after_seq: Option<u64>, after_node: Option<NodeId>) -> Result<Option<PageCursor>, ApiError> {
+    match (after_seq, after_node) {
+        (Some(seq), Some(node)) => Ok(Some(PageCursor { seq, node })),
+        (None, None) => Ok(None),
+        _ => Err(ApiError::invalid("after_seq and after_node go together")),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,42 +281,39 @@ struct PageQuery {
     limit: Option<u32>,
 }
 
-impl PageQuery {
-    fn cursor(&self) -> Result<Option<PageCursor>, ApiError> {
-        match (self.after_seq, self.after_node) {
-            (Some(seq), Some(node)) => Ok(Some(PageCursor { seq, node })),
-            (None, None) => Ok(None),
-            _ => Err(ApiError::invalid("after_seq and after_node go together")),
-        }
-    }
-
-    fn limit(&self) -> u32 {
-        self.limit.unwrap_or(MAX_PAGE_NODES)
-    }
+async fn tree(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    q: Result<Query<PageQuery>, QueryRejection>,
+) -> Result<Json<ChangeSet>, ApiError> {
+    let Query(q) = q?;
+    Ok(Json(state.meta.tree(auth.space, cursor(q.after_seq, q.after_node)?, q.limit.unwrap_or(MAX_PAGE_NODES)).await?))
 }
 
-async fn tree(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>, Query(q): Query<PageQuery>) -> Result<Json<ChangeSet>, ApiError> {
-    Ok(Json(state.meta.tree(auth.space, q.cursor()?, q.limit()).await?))
-}
-
+// The paging fields are written out here rather than flattened from `PageQuery`: serde's `flatten` buffers
+// values as strings, so numbers in a query string would never parse.
 #[derive(Debug, Deserialize)]
 struct ChangesQuery {
     since: u64,
-    #[serde(flatten)]
-    page: PageQuery,
+    after_seq: Option<u64>,
+    after_node: Option<NodeId>,
+    limit: Option<u32>,
     #[serde(default)]
     wait: u64,
 }
 
 /// Changes after `since`. With `wait` (seconds, up to 60) and nothing new yet, the request is held open until
-/// a commit lands or the time runs out.
+/// a commit lands or the time runs out. `wait` is ignored when a paging cursor is given, and when the space
+/// already has `MAX_WAITERS_PER_SPACE` requests waiting.
 async fn changes(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
-    Query(q): Query<ChangesQuery>,
+    q: Result<Query<ChangesQuery>, QueryRejection>,
 ) -> Result<Json<ChangeSet>, ApiError> {
-    let cursor = q.page.cursor()?;
-    if q.wait > 0 && cursor.is_none() {
+    let Query(q) = q?;
+    let cursor = cursor(q.after_seq, q.after_node)?;
+    let slot = if q.wait > 0 && cursor.is_none() { state.notifier.begin_wait(auth.space) } else { None };
+    if slot.is_some() {
         // Subscribe before reading the sequence number, so a commit in between still wakes us.
         let mut updates = state.notifier.subscribe(auth.space);
         if state.meta.space_info(auth.space).await?.seq == q.since {
@@ -263,5 +321,5 @@ async fn changes(
             let _ = tokio::time::timeout(deadline, updates.wait_for(|seq| *seq > q.since)).await;
         }
     }
-    Ok(Json(state.meta.changes(auth.space, q.since, cursor, q.page.limit()).await?))
+    Ok(Json(state.meta.changes(auth.space, q.since, cursor, q.limit.unwrap_or(MAX_PAGE_NODES)).await?))
 }

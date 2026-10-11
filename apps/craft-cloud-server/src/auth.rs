@@ -47,7 +47,10 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
 /// A new device token and the hash to store for it.
 pub fn new_token() -> Result<(String, [u8; 32]), ApiError> {
     let mut raw = [0u8; 32];
-    getrandom::fill(&mut raw).map_err(|_| ApiError::internal())?;
+    getrandom::fill(&mut raw).map_err(|e| {
+        tracing::error!(error = %e, "the system random source failed");
+        ApiError::internal()
+    })?;
     let token = URL_SAFE_NO_PAD.encode(raw);
     let hash = token_hash(&token);
     Ok((token, hash))

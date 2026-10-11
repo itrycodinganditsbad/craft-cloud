@@ -117,6 +117,11 @@ on_every_backend!(
     the_change_feed_waits_for_new_commits,
     a_client_ahead_of_the_server_must_resync,
     overlong_usernames_are_refused_before_rate_limiting,
+    the_change_feed_pages,
+    every_rejection_is_a_json_error,
+    one_request_cant_list_unbounded_missing_chunks,
+    long_polls_are_capped_per_space,
+    odd_usernames_and_device_names_are_refused,
 );
 
 // ---- helpers ----
@@ -381,7 +386,8 @@ async fn bad_uploads_are_refused(s: &Server) {
     assert_eq!(bad_id.status(), StatusCode::BAD_REQUEST);
     let big = vec![7u8; 4 * 1024 * 1024 + 1];
     let too_big = s.client.put(format!("{}/chunks/{}", s.base, chunk_id(&big))).bearer_auth(&token).body(big).send().await.unwrap();
-    assert_eq!(too_big.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let (status, body) = error(too_big).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::PAYLOAD_TOO_LARGE, "too_large"));
 
     // A manifest under someone else's ID, and one cut with an unknown chunker.
     let data = b"some data".to_vec();
@@ -461,5 +467,114 @@ async fn overlong_usernames_are_refused_before_rate_limiting(s: &Server) {
         assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
     }
     // The refused attempts didn't use up this client's allowance.
+    login(s, "ana").await;
+}
+
+async fn the_change_feed_pages(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let r = root(s, &token).await;
+    // The root exists from sequence 0, so `changes?since=0` lists only what was made after it.
+    let mut made = Vec::new();
+    for i in 0..5 {
+        let node = NodeId::generate();
+        made.push(node);
+        let res = commit(s, &token, &[Op::Mkdir { node, parent: r, name: Name::new(&format!("dir {i}")).unwrap() }]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+    let mut seen = Vec::new();
+    let mut url = format!("{}/changes?since=0&limit=2", s.base);
+    for _ in 0..10 {
+        let res = s.client.get(&url).bearer_auth(&token).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let page: ChangeSet = res.json().await.unwrap();
+        assert!(page.nodes.len() <= 2);
+        seen.extend(page.nodes.iter().map(|n| n.id));
+        match page.next {
+            Some(next) => url = format!("{}/changes?since=0&limit=2&after_seq={}&after_node={}", s.base, next.seq, next.node),
+            None => break,
+        }
+    }
+    seen.sort_by_key(ToString::to_string);
+    made.sort_by_key(ToString::to_string);
+    assert_eq!(seen, made);
+}
+
+async fn every_rejection_is_a_json_error(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let bad = s
+        .client
+        .post(format!("{}/commit", s.base))
+        .bearer_auth(&token)
+        .header("content-type", "application/json")
+        .body("{nope")
+        .send()
+        .await
+        .unwrap();
+    let (status, body) = error(bad).await;
+    assert!(status.is_client_error() && body.error == "invalid", "{status} {}", body.error);
+    let wrong_type = s.client.post(format!("{}/commit", s.base)).bearer_auth(&token).body("x").send().await.unwrap();
+    assert_eq!(error(wrong_type).await.1.error, "invalid");
+    let bad = s.client.post(format!("{}/commit", s.base)).bearer_auth(&token).json(&json!({ "ops": [{ "op": "explode" }] })).send().await.unwrap();
+    let (status, body) = error(bad).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNPROCESSABLE_ENTITY, "invalid"));
+    let (status, body) = error(s.client.get(format!("{}/changes", s.base)).bearer_auth(&token).send().await.unwrap()).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+    let (status, body) = error(s.client.delete(format!("{}/devices/not-an-id", s.base)).bearer_auth(&token).send().await.unwrap()).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+}
+
+async fn one_request_cant_list_unbounded_missing_chunks(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let chunks: Vec<ChunkRef> = (0u32..10_001).map(|i| ChunkRef { id: chunk_id(&i.to_le_bytes()), len: 4 }).collect();
+    let m = Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), 4 * 10_001, FileHash::from_bytes([1; 32]), chunks).unwrap();
+    let (status, body) = error(put_manifest(s, &token, &m).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::CONFLICT, "missing_chunks"));
+    assert_eq!(body.missing.unwrap().len(), 10_000);
+    assert!(body.message.contains("10001"), "{}", body.message);
+}
+
+async fn long_polls_are_capped_per_space(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let r = root(s, &token).await;
+    let waiting: Vec<_> = (0..16)
+        .map(|_| {
+            let (client, url, token) = (s.client.clone(), format!("{}/changes?since=0&wait=10", s.base), token.clone());
+            tokio::spawn(async move { client.get(url).bearer_auth(token).send().await.unwrap().json::<ChangeSet>().await.unwrap() })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let t = Instant::now();
+    let seventeenth: ChangeSet =
+        s.client.get(format!("{}/changes?since=0&wait=10", s.base)).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
+    assert!(t.elapsed() < Duration::from_secs(2), "the 17th wait should not have waited");
+    assert!(seventeenth.nodes.is_empty());
+    // Wake the sixteen.
+    assert_eq!(
+        commit(s, &token, &[Op::Mkdir { node: NodeId::generate(), parent: r, name: Name::new("wake").unwrap() }]).await.status(),
+        StatusCode::OK
+    );
+    for w in waiting {
+        let woke = tokio::time::timeout(Duration::from_secs(5), w).await.unwrap().unwrap();
+        assert_eq!(woke.nodes.len(), 1);
+    }
+}
+
+async fn odd_usernames_and_device_names_are_refused(s: &Server) {
+    add_user(s, "ana").await;
+    for (user, device) in [("a na", "x"), ("ana/../x", "x"), ("", "x"), ("ana", ""), ("ana", "bad\u{7}name"), ("ana", "n".repeat(129).as_str())] {
+        let res = s
+            .client
+            .post(format!("{}/auth/login", s.base))
+            .json(&json!({ "username": user, "password": PASSWORD, "device_name": device }))
+            .send()
+            .await
+            .unwrap();
+        let (status, body) = error(res).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "{user:?} {device:?}");
+    }
     login(s, "ana").await;
 }

@@ -2,6 +2,7 @@
 //! never sent to the client.
 
 use axum::Json;
+use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use craft_cloud_meta::MetaError;
@@ -80,6 +81,36 @@ impl From<StoreError> for ApiError {
                 Self::internal()
             }
         }
+    }
+}
+
+/// Anything axum refuses before a handler runs becomes the same JSON body as every other error.
+fn rejected(status: StatusCode, message: String) -> ApiError {
+    let code = if status == StatusCode::PAYLOAD_TOO_LARGE { "too_large" } else { "invalid" };
+    ApiError::new(status, code, message)
+}
+
+impl From<JsonRejection> for ApiError {
+    fn from(e: JsonRejection) -> Self {
+        rejected(e.status(), e.body_text())
+    }
+}
+
+impl From<QueryRejection> for ApiError {
+    fn from(e: QueryRejection) -> Self {
+        rejected(e.status(), e.body_text())
+    }
+}
+
+impl From<PathRejection> for ApiError {
+    fn from(e: PathRejection) -> Self {
+        rejected(e.status(), e.body_text())
+    }
+}
+
+impl From<BytesRejection> for ApiError {
+    fn from(e: BytesRejection) -> Self {
+        rejected(e.status(), e.body_text())
     }
 }
 

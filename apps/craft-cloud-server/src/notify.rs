@@ -6,12 +6,45 @@ use std::sync::Mutex;
 use craft_cloud_proto::SpaceId;
 use tokio::sync::watch;
 
+/// Most long-polls one space may have waiting at once.
+pub const MAX_WAITERS_PER_SPACE: usize = 16;
+
 #[derive(Default)]
 pub struct Notifier {
     spaces: Mutex<HashMap<SpaceId, watch::Sender<u64>>>,
+    waiters: Mutex<HashMap<SpaceId, usize>>,
+}
+
+/// One waiting long-poll; frees its slot when dropped.
+pub struct WaitGuard<'a> {
+    notifier: &'a Notifier,
+    space: SpaceId,
+}
+
+impl Drop for WaitGuard<'_> {
+    fn drop(&mut self) {
+        let mut waiters = self.notifier.waiters.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = waiters.get_mut(&self.space) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                waiters.remove(&self.space);
+            }
+        }
+    }
 }
 
 impl Notifier {
+    /// Takes one of the space's waiting slots, or `None` when `MAX_WAITERS_PER_SPACE` are already taken.
+    pub fn begin_wait(&self, space: SpaceId) -> Option<WaitGuard<'_>> {
+        let mut waiters = self.waiters.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = waiters.entry(space).or_insert(0);
+        if *count >= MAX_WAITERS_PER_SPACE {
+            return None;
+        }
+        *count += 1;
+        Some(WaitGuard { notifier: self, space })
+    }
+
     /// A receiver that sees every later `publish` for the space. A new space starts at sequence 0.
     pub fn subscribe(&self, space: SpaceId) -> watch::Receiver<u64> {
         let mut spaces = self.spaces.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -46,6 +79,18 @@ mod tests {
         notifier.publish(space, 5);
         rx.changed().await.unwrap();
         assert_eq!(*rx.borrow_and_update(), 5);
+    }
+
+    #[test]
+    fn waiters_are_counted_per_space_and_released_on_drop() {
+        let notifier = Notifier::default();
+        let (a, b) = (SpaceId::generate(), SpaceId::generate());
+        let guards: Vec<_> = (0..MAX_WAITERS_PER_SPACE).map(|_| notifier.begin_wait(a).unwrap()).collect();
+        assert!(notifier.begin_wait(a).is_none());
+        // Another space has its own allowance.
+        assert!(notifier.begin_wait(b).is_some());
+        drop(guards);
+        assert!(notifier.begin_wait(a).is_some());
     }
 
     #[test]
