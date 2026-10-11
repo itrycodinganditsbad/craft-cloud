@@ -220,8 +220,12 @@ agent's own `.craft-cloud/` folder. A `.craftignore` file adds patterns.
 
 - One binary, `craft-cloud-server` (axum, tokio, rustls). Linux x86_64 and aarch64 binaries, a Docker image,
   an example systemd unit.
-- **TLS**: either give it a certificate (rustls), or run plain HTTP behind a reverse proxy. Plain HTTP binds
-  to loopback only unless `--behind-proxy` is set. `trusted_proxies` (a list of addresses) decides whose
+- **TLS**: either give it a certificate (rustls; arrives with packaging in M6), or run plain HTTP behind a
+  reverse proxy (M2b). Plain HTTP binds to loopback only unless `behind_proxy = true` is set in the config.
+  The proxy is also what protects against slow clients: it must set request header and body timeouts (the
+  server itself has none until built-in TLS arrives). The server bounds per-user load itself: at most 4
+  manifest uploads at once, at most 16 waiting change-feed requests per space, and missing-chunk lists of at
+  most 10,000 IDs. `trusted_proxies` (a list of addresses) decides whose
   `X-Forwarded-For` is believed; without it the peer address is used.
 - **Version negotiation**: `GET /api/info` returns the server's protocol version range, chunker parameter
   sets and limits. The agent checks it at login and on every start, and refuses with a clear message if
@@ -254,10 +258,12 @@ agent's own `.craft-cloud/` folder. A `.craftignore` file adds patterns.
   race a sweep.
 - **Accounts**: usernames are unique ignoring ASCII case (stored lowercase), so `Ana` and `ana` are one account.
   `admin` and `member` roles. Passwords Argon2id. Login rate-limited per client address and
-  per account.
+  per account. Passwords are 8 to 1024
+  bytes; admin CLI commands read them from standard input, never from arguments.
 - **Devices**: the agent logs in once with username and password and gets a 256-bit device token, stored
   only as a hash. The device list shows name, created and **last used**. Revoke from the admin CLI or from
-  your own device list.
+  your own device list. `last used` is
+  written at most once a minute per device.
 - **Setup**: `craft-cloud-server init` writes the config, creates the data directory and the first admin.
   Solo use is that one admin account and nothing more.
 - **Quotas**: optional per user, in logical bytes. A commit over quota is refused whole.
@@ -275,19 +281,22 @@ agent's own `.craft-cloud/` folder. A `.craftignore` file adds patterns.
   chunk), `backup <dir>`, `restore <dir>`, `reset-epoch`.
 - No web UI in v1. No telemetry, no update check.
 
-API sketch (`/api/v1`, JSON except chunk bodies; every response carries `epoch`):
+API (`/api/v1`, JSON except chunk and manifest bodies; every signed-in response carries the space's epoch in
+the `craft-epoch` header, and commits/tree/changes carry it in the body too). Errors are
+`{error, message, conflicts?, missing?}` with stable codes (`conflict` 409, `missing_chunks` 409,
+`resync_required` 410, `unauthorized` 401, `rate_limited` 429, `invalid` 400, `not_found` 404, `too_large` 413):
 
 | Call | Purpose |
 |---|---|
 | `GET /info` | protocol versions, chunker parameter sets, limits (no auth) |
-| `POST /auth/login` | username + password + device name → device token |
-| `GET /tree?after=…&limit=…` | full listing for a first sync or a reconcile, in pages (cursor = changed seq + node ID) |
-| `GET /changes?since=N&after=…&limit=…&wait=30` | changes after N, in pages, long-poll; `resync_required` if N is too old |
-| `POST /chunks/missing` | which of these chunk IDs this space lacks |
-| `PUT /chunks/{id}` / `GET /chunks/{id}` | one chunk, max 4 MiB, checked by the server |
+| `POST /auth/login` | username + password + device name → device ID + token (shown once); 10 tries per account and 30 per address per 5 minutes; a wrong password and an unknown user look the same |
+| `GET /tree?after_seq=…&after_node=…&limit=…` | full listing for a first sync or a reconcile, in pages of up to 5,000 (cursor = changed seq + node ID) |
+| `GET /changes?since=N&after_seq=…&after_node=…&limit=…&wait=30` | changes after N, in pages, long-poll up to 60 s; `resync_required` if N is too old or ahead of the server |
+| `POST /chunks/missing` | which of these chunk IDs (up to 10,000) this space lacks |
+| `PUT /chunks/{id}` / `GET /chunks/{id}` | one chunk, max 4 MiB, checked by the server; you can only download chunks your space uploaded |
 | `PUT /manifests/{id}` / `GET /manifests/{id}` | one manifest (binary); the server checks the ID, the limits and that every chunk is present |
 | `POST /commit` | batch of version/mkdir/move/delete operations, one transaction; `409` with details on conflict, `missing_chunks` with a list |
-| `GET /nodes/{id}/history` / `POST /nodes/{id}/restore` | list versions / make an old one current |
+| `GET /nodes/{id}/history` / `POST /nodes/{id}/restore` | list versions / make an old one current (M4) |
 | `GET /devices`, `DELETE /devices/{id}` | your devices |
 
 ## Agent and launcher API
@@ -365,11 +374,11 @@ API sketch (`/api/v1`, JSON except chunk bodies; every response carries `epoch`)
 |---|---|---|
 | M0 | Repo, conventions, CI | DONE (2026-10-11) |
 | M1 | `proto` + `chunker` (names, IDs, `fastcdc-v1` with golden vectors) | DONE (2026-10-11, PR #1) |
-| M2 | Server core: info, auth, devices, chunks, batch commit, changes, tree, epoch; SQLite + Postgres, disk + S3 | TODO |
+| M2 | Server core: info, auth, devices, chunks, batch commit, changes, tree, epoch; SQLite + Postgres, disk + S3 | IN PROGRESS (M2a storage done 2026-10-11; M2b server next) |
 | M3 | Sync engine on `Fs`/`Transport` + simulation harness + agent CLI; two machines sync a folder | TODO |
 | M4 | History, restore, trash, thinning, GC, admin CLI, backup/restore | TODO |
 | M5 | Selective sync, large-media polish, ignore rules | TODO |
-| M6 | Packaging: binaries, Docker, systemd, self-hosting guide | TODO |
+| M6 | Packaging: binaries, Docker, systemd, built-in TLS, self-hosting guide | TODO |
 | M7 | Local control API + launcher integration PR | TODO |
 
 ## Out of scope for Phase 1
