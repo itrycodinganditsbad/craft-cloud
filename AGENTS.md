@@ -1,0 +1,116 @@
+# AGENTS.md: guide for AI agents and contributors
+
+Craft Cloud is a **self-hosted** sync and storage server for the **Craft App Suite** (PhotoCraft,
+LightCraft, FilmCraft, DesignCraft, VectorCraft, PdfCraft, EffectCraft, WordCraft, DeckCraft,
+GridCraft, CADCraft, SoundCraft). People run it on their own machine, NAS or VPS; there is no
+hosted service, no account with us, and nothing phones home. Your files, settings and asset
+libraries follow you across machines, and (later) can be shared with a team.
+
+It is written in **Rust only**. Siblings with the same conventions: `../craft-launcher`,
+`../photocraft`, `../vectorcraft`, `../filmcraft` and the other Craft apps. Standards shared across
+the Craft apps live in `craftrules` (read its `README.md` and `AGENTS.md` when you have it checked
+out). Contribute reusable learnings there, never code: repos don't share code.
+
+## Naming
+
+The product name is **Craft Cloud** in user-facing text. Machine names are lowercase:
+`craft-cloud-*` crates and binaries. This repository is not an ArtCraft Team project: never use the
+ArtCraft name, logo or marks in the product, its icon, its binaries or its docs, beyond saying in
+plain text that it is built for the Craft App Suite. Every Craft app's `docs/brand/LICENSE-brand.txt`
+explains why.
+
+## 1. Workspace map
+
+The design lives in `docs/design/`. Crates are added here as they land.
+
+```text
+crates/     libraries (protocol types, chunking, storage, the sync engine)
+apps/       binaries (the server, the sync agent)
+xtask/      cargo xtask ci | version
+docs/       design documents and the self-hosting guide
+```
+
+## 2. Clean room
+
+Craft Cloud reimplements the *idea* of desktop cloud sync. It is not compatible with, and never
+talks to, any vendor's cloud.
+
+- Behaviour comes from public documentation, published papers (for example the FastCDC paper for
+  content-defined chunking) and black-box use of products with synthetic test files and throwaway
+  accounts. Never capture real personal data, account details or someone else's files.
+- **Never reverse engineer a vendor's private sync protocol or API** (Adobe Creative Cloud, Dropbox,
+  OneDrive, Google Drive, iCloud). No packet captures of their clients, no decompiling their apps, no
+  copying their wire formats. Our protocol is our own and documented in `docs/design/`.
+- Never copy, port or paraphrase code from GPL, AGPL or LGPL projects (Nextcloud, ownCloud,
+  Seafile, and similar). Don't read their source while working on the matching feature here.
+  MPL-2.0 code (Syncthing) is not copied either.
+- Dependencies must be permissively licensed (MIT, Apache-2.0, BSD, ISC, Zlib, Unicode, CC0).
+  Adding one means checking its license and every transitive license.
+- Never copy vendor icons, artwork, UI text or documentation wording. Feature names are fine.
+
+## 3. Golden rules
+
+### Never crash (outranks feature work)
+
+A bad request, a truncated upload, a corrupt chunk, a full disk or a broken config file must
+produce an error the user or admin can act on, never a panic. A crashed server is a whole studio
+that can't save. Shared standard: `craftrules/standards/never-crash.md`.
+
+- **Non-test code never panics.** No `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!` or
+  `unimplemented!`. Return the crate's error type and propagate with `?`.
+- Every production crate root (`lib.rs`, each binary's `main.rs`, and `xtask`) carries
+  `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]`.
+- **No `unsafe`.** The workspace sets `unsafe_code = "forbid"`.
+- **Everything from the network is hostile**, including requests from signed-in users. Use `get()`
+  instead of indexing, checked arithmetic for sizes and offsets, and cap request bodies, chunk
+  sizes, JSON sizes, path lengths and list lengths.
+
+### Never lose data
+
+- Nothing a user uploaded is deleted except by an explicit user action or the admin's retention
+  policy. Garbage collection only removes chunks that no version references, and is tested for it.
+- Every chunk is verified against its hash when written and when read. A mismatch is an error, never
+  silently served.
+- Writes are atomic: write to a temporary file, flush, then rename. A crash at any point leaves the
+  old state or the new state, never a mix.
+- A sync conflict keeps both copies. The client never overwrites a local change it hasn't uploaded.
+
+### Security
+
+- Passwords are hashed with Argon2id. Access tokens are random, stored only as hashes, and can be
+  revoked per device.
+- Never log passwords, tokens, file contents or file names at info level or above.
+- Every request is checked against the signed-in user's permissions on the server; never trust a
+  path, ID or flag from the client to decide access.
+- Paths from clients are normalised and confined; `..`, absolute paths, drive letters, NUL bytes and
+  reserved Windows names are rejected.
+- No telemetry, analytics or update checks that send anything about the user or their server.
+
+### Other rules
+
+1. **Tests are the gate.** Protocol, chunking, storage and sync logic get unit tests. The sync
+   engine gets tests for conflicts, interrupted transfers and offline edits.
+2. **Assets need attribution.** Every bundled non-code asset gets a row in `ATTRIBUTION.md` (path,
+   title, author, source, license) in the same change.
+3. When fetching anything, use a generic `Craft-Cloud/<version>` User-Agent and never put a
+   person's name, email or other personal details in requests.
+
+## 4. Before you finish a task
+
+```sh
+cargo xtask ci              # fmt --check, clippy -D warnings, test
+```
+
+Or piecemeal: `cargo test -p <crate>`, `cargo clippy -p <crate> --all-targets -- -D warnings`.
+
+## 5. Versions
+
+The version lives only in `[workspace.package] version` in the root `Cargo.toml`
+(`cargo xtask version`, `cargo xtask version set X.Y.Z[-pre]`).
+
+## 6. Parallel agents
+
+- Use your own target dir (`CARGO_TARGET_DIR=target/agent-<name>`) and edit only the files you own.
+- Keep every `Cargo.toml` valid at all times: the `crates/*` and `apps/*` globs mean one broken
+  manifest breaks everyone's build. Write manifests to a temp file and `mv` them into place.
+- If someone else's in-progress edit breaks the build, wait and retry; don't fix their files.

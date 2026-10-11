@@ -1,0 +1,12 @@
+*~
+plan/
+plans/
+/target
+target/
+/dist
+/temp
+# local server data from dev runs
+/data
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
