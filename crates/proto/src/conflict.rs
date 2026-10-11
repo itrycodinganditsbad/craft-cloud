@@ -1,7 +1,7 @@
 //! Conflict copy names: `name (conflict, <device>, 2026-10-11 14-03).ext`.
 
 use crate::limits::MAX_NAME_BYTES;
-use crate::name::{Name, NameError};
+use crate::name::{FORBIDDEN, Name, NameError};
 use unicode_normalization::UnicodeNormalization;
 
 /// Longest device label kept in a conflict name, in bytes.
@@ -17,28 +17,43 @@ pub struct ConflictStamp {
     pub minute: u8,
 }
 
+/// Longest extension kept after the suffix, in bytes after the dot.
+const MAX_EXT_BYTES: usize = 16;
+
 /// The name for a conflict copy of `original`.
 ///
-/// Files keep their extension (the part after the last dot, unless that dot starts the name); directories
-/// have none. `counter` is 1 for the first conflict copy in a minute and 2, 3 … for more, which adds `, 2`.
-/// The device label is cleaned to the name rules and capped at 64 bytes. If the result would pass
-/// 255 bytes, the original stem is shortened at a character boundary; the extension and the suffix never
-/// are. Fails only when the extension plus the suffix leave no room for the stem (an extension of roughly
-/// 200 bytes or more).
+/// A file keeps its extension after the suffix: the part after the last dot, when that dot does not start
+/// the name and the part is at most 16 bytes with no space in it. Anything else (directories, dotfiles,
+/// `Re. notes from the review`) has no extension and gets the suffix at the end. `counter` is 1 for the
+/// first conflict copy in a minute and 2, 3 … for more, which adds `, 2`; 0 behaves like 1. The device
+/// label is cleaned to the name rules and capped at 64 bytes. If the result would pass 255 bytes, the
+/// original stem is shortened at a character boundary; the extension and the suffix never are.
+///
+/// Never fails for a valid [`Name`]: when the extension and the suffix would leave no room for the stem,
+/// the extension is dropped and the whole name is the stem. The `Result` stays for API stability.
 pub fn conflict_name(original: &Name, is_dir: bool, device: &str, stamp: ConflictStamp, counter: u32) -> Result<Name, NameError> {
     let full = original.as_str();
-    let (stem, ext) = match full.rfind('.') {
-        Some(dot) if !is_dir && dot > 0 => full.split_at(dot),
-        _ => (full, ""),
-    };
     let ConflictStamp { year, month, day, hour, minute } = stamp;
     let repeat = if counter > 1 { format!(", {counter}") } else { String::new() };
     let suffix = format!(" (conflict, {}, {year:04}-{month:02}-{day:02} {hour:02}-{minute:02}{repeat})", clean_device(device));
-    let budget = MAX_NAME_BYTES.checked_sub(suffix.len()).and_then(|b| b.checked_sub(ext.len()));
-    let Some(budget) = budget else {
-        return Err(NameError::TooLong { len: suffix.len().saturating_add(ext.len()) });
+    let (stem, ext) = split_extension(full, is_dir);
+    // At least one byte of stem must fit beside the extension and the suffix; otherwise there is no extension.
+    let (stem, ext, budget) = match MAX_NAME_BYTES.checked_sub(suffix.len()).and_then(|b| b.checked_sub(ext.len())) {
+        Some(budget) if budget >= 1 => (stem, ext, budget),
+        _ => (full, "", MAX_NAME_BYTES.saturating_sub(suffix.len())),
     };
     Name::new(&format!("{}{suffix}{ext}", truncate(stem, budget)))
+}
+
+/// Splits `full` into stem and extension (the extension includes its dot); see [`conflict_name`].
+fn split_extension(full: &str, is_dir: bool) -> (&str, &str) {
+    match full.rfind('.') {
+        Some(dot) if !is_dir && dot > 0 => {
+            let (stem, ext) = full.split_at(dot);
+            if ext.len() <= MAX_EXT_BYTES.saturating_add(1) && !ext.contains(' ') { (stem, ext) } else { (full, "") }
+        }
+        _ => (full, ""),
+    }
 }
 
 /// The device label with everything a name can't hold (and the separators `(`, `)` and `,`) replaced by `_`.
@@ -47,7 +62,7 @@ fn clean_device(device: &str) -> String {
         .nfc()
         .collect::<String>()
         .chars()
-        .map(|ch| if ch.is_control() || matches!(ch, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*' | '(' | ')' | ',') { '_' } else { ch })
+        .map(|ch| if ch.is_control() || FORBIDDEN.contains(&ch) || matches!(ch, '(' | ')' | ',') { '_' } else { ch })
         .collect();
     let trimmed = truncate(cleaned.trim_matches(|c| c == ' ' || c == '.'), MAX_DEVICE_BYTES).trim_end_matches([' ', '.']);
     if trimmed.is_empty() { "device".to_owned() } else { trimmed.to_owned() }
@@ -111,11 +126,52 @@ mod tests {
         assert!(out.starts_with("日日日"));
     }
 
+    fn check_fits(original: &str, device: &str) -> String {
+        let out = conflict_name(&Name::new(original).unwrap(), false, device, STAMP, 1).unwrap();
+        let out = out.as_str().to_owned();
+        assert!(out.len() <= MAX_NAME_BYTES, "{}", out.len());
+        assert!(out.contains(&format!(" (conflict, {device}, ")), "{out}");
+        out
+    }
+
     #[test]
-    fn an_absurd_extension_is_an_error_not_a_panic() {
-        let original = format!("a.{}", "x".repeat(240));
-        let err = conflict_name(&Name::new(&original).unwrap(), false, "pc", STAMP, 1).unwrap_err();
-        assert!(matches!(err, NameError::TooLong { .. }));
+    fn a_long_tail_after_an_early_dot_is_not_an_extension() {
+        let original = format!("Re. notes from the review of the quarterly budget, {}", "and then some more words, ".repeat(8));
+        let original = &original[..249.min(original.len())];
+        assert_eq!(original.len(), 249);
+        let out = check_fits(original.trim_end(), "laptop");
+        assert!(out.ends_with(')'), "{out}");
+    }
+
+    #[test]
+    fn a_long_name_with_an_early_dot_and_a_long_device_fits() {
+        let original = format!("2026.10.11 {}", "打ち合わせ議事録".repeat(8));
+        let original = Name::new(&original).unwrap();
+        assert!(original.as_str().len() > 150);
+        let device = "d".repeat(70);
+        let out = conflict_name(&original, false, &device, STAMP, 1).unwrap();
+        assert!(out.as_str().len() <= MAX_NAME_BYTES);
+        assert!(out.as_str().contains(" (conflict, "));
+    }
+
+    #[test]
+    fn a_255_byte_name_with_a_16_byte_extension_keeps_it() {
+        let original = format!("{}.{}", "a".repeat(255 - 17), "e".repeat(16));
+        let out = check_fits(&original, "laptop");
+        assert!(out.ends_with(&format!(").{}", "e".repeat(16))), "{out}");
+    }
+
+    #[test]
+    fn a_long_extension_is_dropped_instead_of_failing() {
+        let out = check_fits(&format!("a.{}", "x".repeat(240)), "pc");
+        assert!(out.ends_with(')'), "{out}");
+        let out = check_fits(&format!("a.{}", "x".repeat(17)), "pc");
+        assert!(out.ends_with(')'), "{out}");
+    }
+
+    #[test]
+    fn counter_zero_behaves_like_one() {
+        assert_eq!(conflict("a.txt", false, "pc", 0), conflict("a.txt", false, "pc", 1));
     }
 
     #[test]

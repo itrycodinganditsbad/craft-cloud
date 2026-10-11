@@ -10,7 +10,7 @@ use unicode_normalization::UnicodeNormalization;
 use crate::limits::MAX_NAME_BYTES;
 
 /// Characters Windows forbids in names (besides control characters, which are rejected separately).
-const FORBIDDEN: [char; 9] = ['/', '\\', '<', '>', ':', '"', '|', '?', '*'];
+pub(crate) const FORBIDDEN: [char; 9] = ['/', '\\', '<', '>', ':', '"', '|', '?', '*'];
 
 /// The sync agent keeps its own state in `.craft-cloud/` in the sync root; no node may take that name.
 const AGENT_DIR: &str = ".craft-cloud";
