@@ -578,6 +578,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-cloud-sync"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes",
+ "craft-cloud-chunker",
+ "craft-cloud-meta",
+ "craft-cloud-proto",
+ "craft-cloud-store",
+ "serde",
+ "sqlx",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "crc"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
