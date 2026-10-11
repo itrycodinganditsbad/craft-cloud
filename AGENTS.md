@@ -38,9 +38,8 @@ talks to, any vendor's cloud.
 - Behaviour comes from public documentation, published papers (for example the FastCDC paper for
   content-defined chunking) and black-box use of products with synthetic test files and throwaway
   accounts. Never capture real personal data, account details or someone else's files.
-- **Never reverse engineer a vendor's private sync protocol or API** (Adobe Creative Cloud, Dropbox,
-  OneDrive, Google Drive, iCloud). No packet captures of their clients, no decompiling their apps, no
-  copying their wire formats. Our protocol is our own and documented in `docs/design/`.
+- **Never reverse engineer another sync service's private protocol or API.** No packet captures of
+  their clients, no decompiling their apps, no copying their wire formats. Our protocol is our own and documented in `docs/design/`.
 - Never copy, port or paraphrase code from GPL, AGPL or LGPL projects (Nextcloud, ownCloud,
   Seafile, and similar). Don't read their source while working on the matching feature here.
   MPL-2.0 code (Syncthing) is not copied either.
