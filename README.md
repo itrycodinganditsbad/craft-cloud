@@ -8,7 +8,7 @@ for one person with a laptop and a desktop, and for a small studio with many acc
 
 There is no hosted service and no account with anyone but you. Nothing phones home.
 
-> **Status: design.** There is no working code yet. The design is in [`docs/design/`](docs/design/).
+> **Status: early development.** The design is in [`docs/design/sync.md`](docs/design/sync.md).
 
 ## Planned
 
