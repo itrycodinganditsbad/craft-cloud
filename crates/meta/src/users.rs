@@ -73,11 +73,13 @@ pub struct DeviceAuth {
     pub user: UserId,
     pub role: Role,
     pub space: SpaceId,
+    /// The owner's username, in lowercase.
+    pub username: String,
 }
 
 /// Usernames: 1–64 bytes of ASCII letters, digits, `.`, `_`, `-`. They are stored in lowercase, so names that differ
 /// only in ASCII case are the same name.
-fn valid_username(name: &str) -> bool {
+pub fn valid_username(name: &str) -> bool {
     (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
@@ -184,7 +186,7 @@ impl Meta {
     /// The device holding this token hash, if any and not revoked.
     pub async fn device_by_token(&self, token_hash: &[u8; 32]) -> Result<Option<DeviceAuth>, MetaError> {
         let row = sqlx::query(
-            "SELECT d.id, d.user_id, u.role, s.id AS space FROM devices d JOIN users u ON u.id = d.user_id JOIN spaces s ON s.owner = u.id \
+            "SELECT d.id, d.user_id, u.role, u.username, s.id AS space FROM devices d JOIN users u ON u.id = d.user_id JOIN spaces s ON s.owner = u.id \
              WHERE d.token_hash = $1 AND d.revoked = 0",
         )
         .bind(token_hash.to_vec())
@@ -196,6 +198,7 @@ impl Meta {
             user: UserId(uuid_from(&row.try_get::<Vec<u8>, _>("user_id")?)?),
             role: Role::parse(&row.try_get::<String, _>("role")?)?,
             space: SpaceId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("space")?)?),
+            username: row.try_get("username")?,
         }))
     }
 

@@ -77,5 +77,5 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Test storage and metadata on every backend
-        run: cargo test -p craft-cloud-store -p craft-cloud-meta --locked
+      - name: Test storage, metadata and the server on every backend
+        run: cargo test -p craft-cloud-store -p craft-cloud-meta -p craft-cloud-server --locked

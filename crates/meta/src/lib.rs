@@ -24,7 +24,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 pub use blobs::BlobKind;
 pub use commit::CommitOutcome;
 pub use tree::SpaceInfo;
-pub use users::{DeviceAuth, DeviceRecord, Role, UserId, UserRecord};
+pub use users::{DeviceAuth, DeviceRecord, Role, UserId, UserRecord, valid_username};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetaError {

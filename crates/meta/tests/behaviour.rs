@@ -105,6 +105,7 @@ on_every_backend!(
     big_manifests_are_checked_in_batches,
     the_tree_and_the_feed_come_in_pages,
     usernames_are_unique_ignoring_ascii_case,
+    all_spaces_lists_every_users_space,
 );
 
 // ---- helpers ----
@@ -174,6 +175,7 @@ async fn users_and_devices(meta: &Meta) {
     let dev = meta.create_device(ana.id, "studio pc", &token, NOW).await.unwrap();
     let auth = meta.device_by_token(&token).await.unwrap().unwrap();
     assert_eq!((auth.device, auth.user, auth.space, auth.role), (dev, ana.id, ana.space, Role::Member));
+    assert_eq!(auth.username, "ana");
     assert_eq!(meta.device_by_token(&[8u8; 32]).await.unwrap(), None);
 
     meta.touch_device(dev, NOW + 5).await.unwrap();
@@ -485,6 +487,14 @@ async fn the_change_feed_and_epochs(meta: &Meta) {
     let tree = full_tree(meta, u.space).await;
     let NodeKind::File(state) = &find(&tree.nodes, file).kind else { panic!("not a file") };
     assert_eq!(state.epoch, new_epoch);
+}
+
+async fn all_spaces_lists_every_users_space(meta: &Meta) {
+    assert!(meta.all_spaces().await.unwrap().is_empty());
+    let (ana, bob) = (user(meta, "ana").await, user(meta, "bob").await);
+    let mut expected = vec![ana.space, bob.space];
+    expected.sort_by_key(|s| *s.as_uuid());
+    assert_eq!(meta.all_spaces().await.unwrap(), expected);
 }
 
 async fn concurrent_commits_on_one_file_let_exactly_one_win(meta: &Meta) {

@@ -1,0 +1,37 @@
+[package]
+name = "craft-cloud-server"
+description = "The Craft Cloud server: HTTP API, accounts and devices, uploads, batch commits, change feed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+argon2.workspace = true
+axum.workspace = true
+base64.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+clap.workspace = true
+craft-cloud-meta.workspace = true
+craft-cloud-proto.workspace = true
+craft-cloud-store.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tempfile.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
