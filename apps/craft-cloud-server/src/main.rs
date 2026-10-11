@@ -37,8 +37,34 @@ async fn run_server(config_path: &std::path::Path) -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(config.listen).await.map_err(|e| format!("can't listen on {}: {e}", config.listen))?;
     tracing::info!(listen = %config.listen, behind_proxy = config.behind_proxy, "Craft Cloud server running");
     let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+        wait_for_stop_signal().await;
         tracing::info!("shutting down");
     };
     serve(state, listener, shutdown).await.map_err(|e| e.to_string())
+}
+
+/// Resolves on Ctrl-C, or on SIGTERM (what service managers send) on Unix. If SIGTERM can't be watched,
+/// Ctrl-C alone still stops the server.
+async fn wait_for_stop_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!("can't watch for SIGTERM, only Ctrl-C will stop the server: {e}");
+                ctrl_c.await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c.await;
 }

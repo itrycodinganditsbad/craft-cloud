@@ -77,7 +77,7 @@ pub struct DeviceAuth {
 
 /// Usernames: 1–64 bytes of ASCII letters, digits, `.`, `_`, `-`. They are stored in lowercase, so names that differ
 /// only in ASCII case are the same name.
-fn valid_username(name: &str) -> bool {
+pub fn valid_username(name: &str) -> bool {
     (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 

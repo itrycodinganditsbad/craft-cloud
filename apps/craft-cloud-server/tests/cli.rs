@@ -1,7 +1,7 @@
 //! The admin command line, called in-process, and the real binary started with `init` + `serve`.
 
 use std::io::Cursor;
-use std::process::{Command as Process, Stdio};
+use std::process::{Child, Command as Process, Stdio};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -39,6 +39,63 @@ async fn init_then_manage_users_devices_and_epochs() {
     assert!(matches!(cli(&["reset-epoch", "--config", c, "nobody"], "").await, Err(CliError::Usage(_))));
 }
 
+#[tokio::test]
+async fn init_validates_first_and_leaves_nothing_behind_on_failure() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    let dir_s = dir.to_str().unwrap();
+
+    assert!(matches!(cli(&["init", "--dir", dir_s, "--admin", "bad name"], "admin password 1\n").await, Err(CliError::Usage(_))));
+    assert!(!dir.exists());
+
+    // Bad passwords are refused before anything is created.
+    assert!(matches!(cli(&["init", "--dir", dir_s, "--admin", "ana"], "").await, Err(CliError::Usage(m)) if m.contains("no password")));
+    assert!(matches!(cli(&["init", "--dir", dir_s, "--admin", "ana"], "\n").await, Err(CliError::Usage(_))));
+    let long = format!("{}\n", "a".repeat(2000));
+    assert!(matches!(cli(&["init", "--dir", dir_s, "--admin", "ana"], &long).await, Err(CliError::Usage(_))));
+    assert!(!dir.exists());
+
+    // A valid name in the same place succeeds.
+    cli(&["init", "--dir", dir_s, "--admin", "ana"], "admin password 1\n").await.unwrap();
+    assert!(dir.join("config.toml").exists());
+}
+
+#[tokio::test]
+async fn init_needs_behind_proxy_for_a_public_address() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    let dir_s = dir.to_str().unwrap();
+
+    let refused = cli(&["init", "--dir", dir_s, "--admin", "ana", "--listen", "0.0.0.0:8080"], "admin password 1\n").await;
+    assert!(matches!(refused, Err(CliError::Usage(ref m)) if m.contains("--behind-proxy")), "{refused:?}");
+    assert!(!dir.exists());
+
+    cli(&["init", "--dir", dir_s, "--admin", "ana", "--listen", "0.0.0.0:8080", "--behind-proxy"], "admin password 1\n").await.unwrap();
+    let config = Config::load(&dir.join("config.toml")).unwrap();
+    assert!(config.behind_proxy);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn init_makes_owner_only_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(std::fs::metadata(dir.join("config.toml")).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+/// Kills the server process when the test ends, even if it panics.
+struct Server(Child);
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn the_binary_serves_what_init_created() {
     let parent = tempfile::tempdir().unwrap();
@@ -56,26 +113,25 @@ fn the_binary_serves_what_init_created() {
     init.stdin.take().unwrap().write_all(b"admin password 1\n").unwrap();
     assert!(init.wait().unwrap().success());
 
-    let mut server = Process::new(exe).args(["serve", "--config", dir.join("config.toml").to_str().unwrap()]).stderr(Stdio::null()).spawn().unwrap();
+    let server =
+        Server(Process::new(exe).args(["serve", "--config", dir.join("config.toml").to_str().unwrap()]).stderr(Stdio::null()).spawn().unwrap());
     let deadline = Instant::now() + Duration::from_secs(20);
     let body = loop {
         match std::net::TcpStream::connect(("127.0.0.1", port)) {
             Ok(mut conn) => {
                 use std::io::Read;
+                conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                conn.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
                 conn.write_all(b"GET /api/v1/info HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
                 let mut text = String::new();
                 conn.read_to_string(&mut text).unwrap();
                 break text;
             }
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
-            Err(e) => {
-                let _ = server.kill();
-                panic!("server never listened: {e}");
-            }
+            Err(e) => panic!("server never listened: {e}"),
         }
     };
-    let _ = server.kill();
-    let _ = server.wait();
+    drop(server);
     assert!(body.starts_with("HTTP/1.1 200"), "{body}");
     assert!(body.contains("\"chunker_params\":[\"fastcdc-v1\"]"), "{body}");
 }
