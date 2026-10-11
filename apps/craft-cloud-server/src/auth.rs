@@ -34,7 +34,9 @@ pub fn hash_password(password: &str) -> Result<String, ApiError> {
     Argon2::default().hash_password(password.as_bytes()).map(|h| h.to_string()).map_err(|_| ApiError::internal())
 }
 
-/// Constant work whether or not the hash parses, so a missing user can't be told apart by timing.
+/// Checks a password against a stored hash. For an unknown user the caller verifies against
+/// `AppState::dummy_hash` instead, so both cases take the same time. An unparseable stored hash returns
+/// false at once.
 pub fn verify_password(password: &str, hash: &str) -> bool {
     match PasswordHash::new(hash) {
         Ok(parsed) => Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok(),
@@ -62,15 +64,16 @@ fn bearer(request: &Request) -> Option<&str> {
 }
 
 /// Signs the request in from its device token, puts the device in the request extensions, and adds the
-/// space's epoch to the answer.
+/// space's epoch to the answer. The epoch is read before the handler runs, so a failed read stops the
+/// request before anything has happened.
 pub async fn require_device(State(state): State<Arc<AppState>>, mut request: Request, next: Next) -> Result<Response, ApiError> {
     let token = bearer(&request).ok_or_else(ApiError::unauthorized)?;
     let device = state.meta.device_by_token(&token_hash(token)).await?.ok_or_else(ApiError::unauthorized)?;
     state.touch(device.device, now_ms()).await;
     let space = device.space;
+    let epoch = state.meta.space_info(space).await?.epoch;
     request.extensions_mut().insert(device);
     let mut response = next.run(request).await;
-    let epoch = state.meta.space_info(space).await?.epoch;
     if let Ok(value) = HeaderValue::from_str(&epoch.to_string()) {
         response.headers_mut().insert(EPOCH_HEADER, value);
     }

@@ -27,8 +27,10 @@ use serde::Deserialize;
 pub enum ConfigError {
     #[error("can't read {path}: {source}")]
     Read { path: PathBuf, source: std::io::Error },
+    /// The TOML parser's message and line number. The parser's own text quotes the offending line, which
+    /// can hold a secret, so it is not used.
     #[error("invalid config: {0}")]
-    Parse(#[from] toml::de::Error),
+    Parse(String),
     #[error("listen = {0} is not a loopback address. Craft Cloud speaks plain HTTP; put it behind a TLS reverse proxy and set behind_proxy = true")]
     NotLoopback(SocketAddr),
     #[error("storage.{0} is missing (set it in the config or the {1} environment variable)")]
@@ -47,10 +49,29 @@ pub struct Config {
     pub storage: StorageConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub url: String,
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig").field("url", &redact_url(&self.url)).finish()
+    }
+}
+
+/// The URL with its user name and password replaced by `<redacted>`. The scheme, host, port and path stay.
+/// Everything up to the last `@` is treated as credentials, so a password containing `@` or `/` still
+/// doesn't show. A URL without `@` is returned as is.
+pub fn redact_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else { return url.to_owned() };
+    let authority_start = scheme_end + 3;
+    let rest = &url[authority_start..];
+    match rest.rfind('@') {
+        Some(at) => format!("{}<redacted>{}", &url[..authority_start], &rest[at..]),
+        None => url.to_owned(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -98,11 +119,22 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let config: Config = toml::from_str(text)?;
+        let config: Config = toml::from_str(text).map_err(|e| ConfigError::Parse(describe_toml_error(text, &e)))?;
         if !config.behind_proxy && !config.listen.ip().is_loopback() {
             return Err(ConfigError::NotLoopback(config.listen));
         }
         Ok(config)
+    }
+}
+
+/// The parser's message with a line number, without the source text.
+fn describe_toml_error(text: &str, e: &toml::de::Error) -> String {
+    match e.span() {
+        Some(span) => {
+            let line = text.get(..span.start).unwrap_or("").matches('\n').count() + 1;
+            format!("{} (line {line})", e.message())
+        }
+        None => e.message().to_owned(),
     }
 }
 
@@ -176,7 +208,7 @@ path = "/tmp/blobs"
         let text = r#"
 listen = "[::1]:9000"
 [database]
-url = "postgres://cc@localhost/cc"
+url = "postgres://cc:topsecret@db/cc"
 [storage]
 kind = "s3"
 bucket = "blobs"
@@ -184,8 +216,34 @@ access_key_id = "AKIA"
 secret_access_key = "very-secret-value"
 "#;
         let c = Config::parse(text).unwrap();
-        assert!(!format!("{c:?}").contains("very-secret-value"));
+        let shown = format!("{c:?}");
+        assert!(!shown.contains("very-secret-value"));
+        assert!(!shown.contains("topsecret"));
+        assert!(shown.contains("postgres://<redacted>@db/cc"));
         let s3 = c.storage.s3().unwrap().unwrap();
         assert_eq!((s3.bucket.as_str(), s3.region.as_str(), s3.secret_access_key.as_str()), ("blobs", "us-east-1", "very-secret-value"));
+    }
+
+    #[test]
+    fn urls_without_credentials_print_as_they_are() {
+        assert_eq!(redact_url("sqlite:/var/lib/meta.db"), "sqlite:/var/lib/meta.db");
+        assert_eq!(redact_url("postgres://db:5432/cc"), "postgres://db:5432/cc");
+    }
+
+    #[test]
+    fn a_syntax_error_does_not_echo_the_secret_line() {
+        let text = r#"
+listen = "127.0.0.1:9000"
+[database]
+url = "sqlite:/tmp/meta.db"
+[storage]
+kind = "s3"
+bucket = "blobs"
+secret_access_key = "very-secret-value
+"#;
+        let err = Config::parse(text).unwrap_err();
+        let shown = err.to_string();
+        assert!(!shown.contains("very-secret-value"), "{shown}");
+        assert!(shown.contains("line"), "{shown}");
     }
 }
