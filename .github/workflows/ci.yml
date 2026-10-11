@@ -46,6 +46,7 @@ jobs:
   backends:
     name: Postgres and S3 backends
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17-alpine
@@ -69,6 +70,7 @@ jobs:
         run: |
           docker run -d --name s3 -p 8333:8333 chrislusf/seaweedfs:4.48 server -s3
           for i in $(seq 1 60); do curl -sf -o /dev/null http://127.0.0.1:8333/ && break; sleep 2; done
+          curl -sf -o /dev/null http://127.0.0.1:8333/ || { echo "SeaweedFS did not start"; docker logs s3; exit 1; }
           curl -sf -X PUT http://127.0.0.1:8333/cc-test
 
       - uses: dtolnay/rust-toolchain@stable
