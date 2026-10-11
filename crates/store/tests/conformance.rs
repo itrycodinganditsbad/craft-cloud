@@ -102,6 +102,34 @@ async fn damaged_objects_are_errors_not_data() {
 }
 
 #[tokio::test]
+async fn disk_puts_into_new_shard_directories_survive() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("fresh");
+    // Two chunks whose first shard bytes differ, so they land in different directories that don't exist yet.
+    let first_data = b"shard one".to_vec();
+    let first_key = chunk_key(&first_data);
+    let mut n = 0u32;
+    let (second_data, second_key) = loop {
+        let data = format!("shard two {n}").into_bytes();
+        let key = chunk_key(&data);
+        if key.path().split('/').nth(1) != first_key.path().split('/').nth(1) {
+            break (data, key);
+        }
+        n += 1;
+    };
+
+    let store = Store::new(DiskBackend::new(&root).unwrap());
+    store.put(first_key, &first_data).await.unwrap();
+    store.put(second_key, &second_data).await.unwrap();
+    drop(store);
+
+    // A fresh backend and store on the same root read both back.
+    let reopened = Store::new(DiskBackend::new(&root).unwrap());
+    assert_eq!(reopened.get(first_key).await.unwrap(), Bytes::from(first_data));
+    assert_eq!(reopened.get(second_key).await.unwrap(), Bytes::from(second_data));
+}
+
+#[tokio::test]
 async fn disk_writes_leave_no_temporary_files() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::new(DiskBackend::new(dir.path()).unwrap());

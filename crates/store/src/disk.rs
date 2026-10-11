@@ -1,7 +1,9 @@
 //! Local-disk backend: one file per object under a root directory.
 //!
 //! Writes go to a temporary file in the target directory, are flushed to disk, then renamed over the
-//! target, and (on Unix) the directory is flushed too. A crash leaves the old object or the new one.
+//! target, and (on Unix) the directory is flushed too. Directories created for a write are flushed into
+//! their parents as well, so a crash can't lose the entry that points at a new shard directory.
+//! A crash leaves the old object or the new one.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -30,6 +32,8 @@ impl DiskBackend {
 
 fn write_atomic(target: &Path, data: &[u8]) -> io::Result<()> {
     let dir = target.parent().ok_or_else(|| io::Error::other("object path has no directory"))?;
+    // Directories this write will create, deepest first. Their entries in the parents must be flushed too.
+    let created: Vec<&Path> = dir.ancestors().take_while(|p| !p.as_os_str().is_empty() && !p.exists()).collect();
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(".tmp-{}", uuid::Uuid::now_v7()));
     let result = (|| {
@@ -38,7 +42,13 @@ fn write_atomic(target: &Path, data: &[u8]) -> io::Result<()> {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp, target)?;
-        sync_dir(dir)
+        sync_dir(dir)?;
+        for created_dir in &created {
+            if let Some(parent) = created_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+                sync_dir(parent)?;
+            }
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
