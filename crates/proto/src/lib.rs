@@ -3,6 +3,7 @@
 //! Pure: no I/O. The only clock read is in the `generate()` constructors of the ID types (UUIDv7).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod api;
 pub mod conflict;
 pub mod hash;
 pub mod ids;
