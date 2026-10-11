@@ -10,7 +10,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod cdc;
-// mod stream;
+mod stream;
 
 pub use cdc::{Chunker, FASTCDC_V1, Params, ParamsError};
-// pub use stream::{Chunk, ChunkInfo, Summary, chunk_reader};
+pub use stream::{Chunk, ChunkInfo, Summary, chunk_reader};
