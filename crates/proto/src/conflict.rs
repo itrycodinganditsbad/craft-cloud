@@ -2,6 +2,7 @@
 
 use crate::limits::MAX_NAME_BYTES;
 use crate::name::{Name, NameError};
+use unicode_normalization::UnicodeNormalization;
 
 /// Longest device label kept in a conflict name, in bytes.
 const MAX_DEVICE_BYTES: usize = 64;
@@ -22,7 +23,8 @@ pub struct ConflictStamp {
 /// have none. `counter` is 1 for the first conflict copy in a minute and 2, 3 … for more, which adds `, 2`.
 /// The device label is cleaned to the name rules and capped at 64 bytes. If the result would pass
 /// 255 bytes, the original stem is shortened at a character boundary; the extension and the suffix never
-/// are. Fails only when even an empty stem is too long (an extension of 200+ bytes).
+/// are. Fails only when the extension plus the suffix leave no room for the stem (an extension of roughly
+/// 200 bytes or more).
 pub fn conflict_name(original: &Name, is_dir: bool, device: &str, stamp: ConflictStamp, counter: u32) -> Result<Name, NameError> {
     let full = original.as_str();
     let (stem, ext) = match full.rfind('.') {
@@ -42,6 +44,8 @@ pub fn conflict_name(original: &Name, is_dir: bool, device: &str, stamp: Conflic
 /// The device label with everything a name can't hold (and the separators `(`, `)` and `,`) replaced by `_`.
 fn clean_device(device: &str) -> String {
     let cleaned: String = device
+        .nfc()
+        .collect::<String>()
         .chars()
         .map(|ch| if ch.is_control() || matches!(ch, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*' | '(' | ')' | ',') { '_' } else { ch })
         .collect();
@@ -112,5 +116,15 @@ mod tests {
         let original = format!("a.{}", "x".repeat(240));
         let err = conflict_name(&Name::new(&original).unwrap(), false, "pc", STAMP, 1).unwrap_err();
         assert!(matches!(err, NameError::TooLong { .. }));
+    }
+
+    #[test]
+    fn nfc_expanding_device_labels_still_fit() {
+        let original = format!("{}.psd", "日".repeat(82));
+        let out = conflict_name(&Name::new(&original).unwrap(), false, &"\u{958}".repeat(30), STAMP, 1).unwrap();
+        let out = out.as_str();
+        assert!(out.len() <= MAX_NAME_BYTES, "{}", out.len());
+        assert!(out.ends_with(".psd"), "{out}");
+        assert!(out.contains(" (conflict, "), "{out}");
     }
 }
