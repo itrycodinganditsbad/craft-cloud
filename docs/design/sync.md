@@ -106,7 +106,8 @@ can point into the synced folder, and saves are atomic.
 - **Names** are NFC-normalised. The server rejects anything that can't exist on every supported OS:
   `/`, `\`, NUL, `<>:"|?*`, control characters, trailing dot or space, Windows reserved names (`CON`, `NUL`,
   `COM1`…), over 255 UTF-8 bytes. **Uniqueness inside a directory is by Unicode full case folding + NFC**,
-  so `Foo.psd` and `foo.psd` can't both exist (they couldn't on Windows or macOS anyway).
+  so `Foo.psd` and `foo.psd` can't both exist (they couldn't on Windows or macOS anyway). Fold keys are computed with a pinned Unicode version, stored with
+  it, and recomputed by the server after an upgrade that changes it.
 
 ## Filesystem semantics
 

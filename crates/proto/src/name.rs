@@ -12,6 +12,11 @@ use crate::limits::MAX_NAME_BYTES;
 /// Characters Windows forbids in names (besides control characters, which are rejected separately).
 pub(crate) const FORBIDDEN: [char; 9] = ['/', '\\', '<', '>', ':', '"', '|', '?', '*'];
 
+/// The Unicode version behind [`Name`]'s NFC form and [`FoldKey`]. Both are only stable within one Unicode
+/// version: anything that stores fold keys must store this version with them and recompute the keys when it
+/// changes. The two Unicode dependencies are pinned to exact versions so it only changes on purpose.
+pub const UNICODE_VERSION: (u8, u8, u8) = unicode_normalization::UNICODE_VERSION;
+
 /// The sync agent keeps its own state in `.craft-cloud/` in the sync root; no node may take that name.
 const AGENT_DIR: &str = ".craft-cloud";
 
@@ -193,6 +198,12 @@ mod tests {
         assert!(same("cafe\u{301}.txt", "CAFÉ.TXT"));
         assert!(same("Σίσυφος", "ΣΊΣΥΦΟΣ"));
         assert!(!same("a.psd", "b.psd"));
+    }
+
+    #[test]
+    fn the_unicode_version_is_pinned() {
+        // A dependency bump that changes this changes stored fold keys: update it deliberately.
+        assert_eq!(UNICODE_VERSION, (17, 0, 0));
     }
 
     #[test]
