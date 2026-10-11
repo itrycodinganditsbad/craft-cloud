@@ -100,6 +100,7 @@ on_every_backend!(
     folders_nest_at_most_max_tree_depth,
     creating_or_moving_into_a_deleted_folder_brings_it_back,
     names_can_be_juggled_within_one_batch,
+    a_failed_restore_walk_is_not_repeated_for_every_operation,
 );
 
 // ---- helpers ----
@@ -626,6 +627,38 @@ async fn names_can_be_juggled_within_one_batch(meta: &Meta) {
     let tree = meta.tree(u.space).await.unwrap();
     assert_eq!(find(&tree.nodes, c).name, Some(name("a")));
     assert!(tree.nodes.iter().all(|n| n.id != b));
+}
+
+async fn a_failed_restore_walk_is_not_repeated_for_every_operation(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    let m = manifest(meta, &u, 1).await;
+    let mut parent = r;
+    let mut chain = Vec::new();
+    let mut ops = Vec::new();
+    for i in 0..200 {
+        let node = NodeId::generate();
+        ops.push(Op::Mkdir { node, parent, name: name(&format!("d{i}")) });
+        chain.push((node, parent, name(&format!("d{i}"))));
+        parent = node;
+    }
+    meta.commit(u.space, dev, &ops, NOW).await.unwrap();
+    let deepest = parent;
+    let deletes: Vec<Op> = chain.iter().rev().map(|(node, _, _)| Op::Delete { node: *node, expected: None }).collect();
+    meta.commit(u.space, dev, &deletes, NOW).await.unwrap();
+    let taker = NodeId::generate();
+    meta.commit(u.space, dev, &[Op::Mkdir { node: taker, parent: r, name: name("d0") }], NOW).await.unwrap();
+
+    let creates: Vec<Op> =
+        (0..1000).map(|i| Op::Create { node: NodeId::generate(), parent: deepest, name: name(&format!("f{i}")), version: version(m) }).collect();
+    let started = std::time::Instant::now();
+    let refused = conflicts(meta.commit(u.space, dev, &creates, NOW).await);
+    let took = started.elapsed();
+    eprintln!("1000 refused creates into a 200-deep deleted chain: {took:?}");
+    assert_eq!(refused.len(), 1000);
+    assert!(refused.iter().all(|(_, kind)| *kind == ConflictKind::NameTaken { existing: taker }));
+    assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
 }
 
 // ---- plain tests ----

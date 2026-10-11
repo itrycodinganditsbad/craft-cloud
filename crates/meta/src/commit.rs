@@ -11,6 +11,8 @@
 //! parent directories too; names collide by case fold; a directory can't move into itself; only empty
 //! directories are deleted; the root can't be moved or deleted.
 
+use std::collections::HashMap;
+
 use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_TREE_DEPTH};
 use craft_cloud_proto::{Conflict, ConflictKind, DeviceId, Epoch, Name, NewVersion, NodeId, Op, SpaceId, VersionId};
 use sqlx::Row;
@@ -43,6 +45,17 @@ struct Ctx<'a> {
     epoch: Epoch,
     device: DeviceId,
     now_ms: i64,
+    /// Deleted nodes whose restore was refused in this commit, and why. Cleared whenever an operation could
+    /// free a name or change the tree under them.
+    failed_restores: HashMap<NodeId, ConflictKind>,
+}
+
+/// One row of an ancestor walk.
+struct Ancestor {
+    id: NodeId,
+    parent: Option<NodeId>,
+    name: String,
+    deleted: bool,
 }
 
 type Outcome = Result<(), ConflictKind>;
@@ -100,6 +113,9 @@ impl Ctx<'_> {
     }
 
     async fn set_deleted(&mut self, id: NodeId, deleted: bool) -> Result<(), MetaError> {
+        if deleted {
+            self.failed_restores.clear();
+        }
         sqlx::query("UPDATE nodes SET deleted = $1, changed_seq = $2 WHERE space_id = $3 AND id = $4")
             .bind(i64::from(deleted))
             .bind(self.seq)
@@ -120,27 +136,39 @@ impl Ctx<'_> {
         self.restore(dir, row).await
     }
 
-    /// Brings a deleted node and its deleted ancestors back (iteratively, root-most first).
+    /// Brings a deleted node and its deleted ancestors back (root-most first), using one query for the whole
+    /// chain. A chain that cannot come back is remembered for the rest of the commit, so later operations that
+    /// need the same node answer at once instead of walking again.
     async fn restore(&mut self, id: NodeId, row: NodeRow) -> Result<Outcome, MetaError> {
-        let mut chain = Vec::new();
-        let (mut current, mut current_row) = (id, row);
-        while current_row.deleted {
-            if chain.len() > MAX_TREE_DEPTH {
-                return Ok(Err(ConflictKind::TooDeep));
-            }
-            let Some(parent) = current_row.parent else { break };
-            chain.push((current, parent, current_row.name.clone()));
-            let Some(parent_row) = self.node(parent).await? else { return Err(MetaError::Corrupt("a node's parent is missing")) };
-            (current, current_row) = (parent, parent_row);
+        if !row.deleted {
+            return Ok(Ok(()));
         }
-        for (node, parent, name) in chain.into_iter().rev() {
-            let name = Name::new(&name).map_err(|_| MetaError::Corrupt("a stored name is invalid"))?;
+        if let Some(kind) = self.failed_restores.get(&id) {
+            return Ok(Err(kind.clone()));
+        }
+        let up = self.ancestors(id).await?;
+        let prefix: Vec<&Ancestor> = up.iter().take_while(|a| a.deleted).collect();
+        if prefix.len() == up.len() && up.last().is_some_and(|a| a.parent.is_some()) {
+            // The walk hit its bound before reaching a live node.
+            return Ok(Err(self.remember_failure(&prefix, ConflictKind::TooDeep)));
+        }
+        for (index, a) in prefix.iter().enumerate().rev() {
+            let parent = a.parent.ok_or(MetaError::Corrupt("a deleted node has no parent"))?;
+            let name = Name::new(&a.name).map_err(|_| MetaError::Corrupt("a stored name is invalid"))?;
             if let Some(existing) = self.live_child(parent, &name).await? {
-                return Ok(Err(ConflictKind::NameTaken { existing }));
+                // This node and everything below it in the chain stay deleted.
+                return Ok(Err(self.remember_failure(&prefix[..=index], ConflictKind::NameTaken { existing })));
             }
-            self.set_deleted(node, false).await?;
+            self.set_deleted(a.id, false).await?;
         }
         Ok(Ok(()))
+    }
+
+    fn remember_failure(&mut self, nodes: &[&Ancestor], kind: ConflictKind) -> ConflictKind {
+        for a in nodes {
+            self.failed_restores.insert(a.id, kind.clone());
+        }
+        kind
     }
 
     /// Records a new version, refusing a reused version ID or a manifest this space hasn't uploaded.
@@ -252,6 +280,8 @@ impl Ctx<'_> {
                 Ok(Ok(()))
             }
             Op::Move { node, from_parent, from_name, parent, name } => {
+                // A move can free a name or change an ancestor chain.
+                self.failed_restores.clear();
                 let Some(row) = self.node(*node).await? else { return Ok(Err(ConflictKind::NoSuchNode)) };
                 let Some(current_parent) = row.parent else { return Ok(Err(ConflictKind::Root)) };
                 if row.deleted {
@@ -308,16 +338,16 @@ impl Ctx<'_> {
             }
         }
     }
-    /// `node` and its ancestors, nearest first, as (id, parent) pairs; stops after `MAX_TREE_DEPTH + 2` rows, so
-    /// a walk that did not reach the root (last parent is `Some`) is too deep.
-    async fn ancestors(&mut self, node: NodeId) -> Result<Vec<(NodeId, Option<NodeId>)>, MetaError> {
+    /// `node` and its ancestors, nearest first; stops after `MAX_TREE_DEPTH + 2` rows, so a walk that did not
+    /// reach the root (last parent is `Some`) is too deep.
+    async fn ancestors(&mut self, node: NodeId) -> Result<Vec<Ancestor>, MetaError> {
         let bound = i64::try_from(MAX_TREE_DEPTH + 1).map_err(|_| MetaError::Corrupt("depth limit out of range"))?;
         let rows = sqlx::query(
-            "WITH RECURSIVE up(id, parent, depth) AS (\
-                 SELECT id, parent, 0 FROM nodes WHERE space_id = $1 AND id = $2 \
+            "WITH RECURSIVE up(id, parent, name, deleted, depth) AS (\
+                 SELECT id, parent, name, deleted, 0 FROM nodes WHERE space_id = $1 AND id = $2 \
                  UNION ALL \
-                 SELECT n.id, n.parent, up.depth + 1 FROM nodes n JOIN up ON n.space_id = $1 AND n.id = up.parent WHERE up.depth < $3 \
-             ) SELECT id, parent FROM up ORDER BY depth",
+                 SELECT n.id, n.parent, n.name, n.deleted, up.depth + 1 FROM nodes n JOIN up ON n.space_id = $1 AND n.id = up.parent WHERE up.depth < $3 \
+             ) SELECT id, parent, name, deleted FROM up ORDER BY depth",
         )
         .bind(self.space())
         .bind(uuid_bytes(node.as_uuid()))
@@ -328,7 +358,12 @@ impl Ctx<'_> {
             .map(|row| {
                 let id = NodeId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("id")?)?);
                 let parent: Option<Vec<u8>> = row.try_get("parent")?;
-                Ok((id, parent.as_deref().map(uuid_from).transpose()?.map(NodeId::from_uuid)))
+                Ok(Ancestor {
+                    id,
+                    parent: parent.as_deref().map(uuid_from).transpose()?.map(NodeId::from_uuid),
+                    name: row.try_get("name")?,
+                    deleted: flag(row, "deleted")?,
+                })
             })
             .collect()
     }
@@ -338,11 +373,11 @@ impl Ctx<'_> {
     async fn check_placement(&mut self, parent: NodeId, moving: Option<NodeId>) -> Result<Outcome, MetaError> {
         let chain = self.ancestors(parent).await?;
         if let Some(dir) = moving
-            && chain.iter().any(|(id, _)| *id == dir)
+            && chain.iter().any(|a| a.id == dir)
         {
             return Ok(Err(ConflictKind::Cycle));
         }
-        let reached_root = chain.last().is_some_and(|(_, up)| up.is_none());
+        let reached_root = chain.last().is_some_and(|a| a.parent.is_none());
         // `parent` sits at depth `chain.len() - 1`; its child one deeper.
         if !reached_root || chain.len() > MAX_TREE_DEPTH {
             return Ok(Err(ConflictKind::TooDeep));
@@ -361,7 +396,7 @@ impl Meta {
         // On Postgres this row lock makes commits to one space run one at a time.
         let info = space_info(&mut w.tx, space, self.dialect == Dialect::Postgres).await?;
         let seq = info.seq.checked_add(1).ok_or(MetaError::Corrupt("sequence overflow"))?;
-        let mut ctx = Ctx { conn: &mut w.tx, space, seq: to_i64(seq)?, epoch: info.epoch, device, now_ms };
+        let mut ctx = Ctx { conn: &mut w.tx, space, seq: to_i64(seq)?, epoch: info.epoch, device, now_ms, failed_restores: HashMap::new() };
         let mut conflicts = Vec::new();
         for (index, op) in ops.iter().enumerate() {
             if let Err(kind) = ctx.apply(op).await? {
