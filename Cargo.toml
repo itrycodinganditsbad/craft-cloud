@@ -6,7 +6,7 @@ members = ["crates/*", "apps/*", "xtask"]
 version = "0.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.90"
+rust-version = "1.94"
 repository = "https://github.com/itrycodinganditsbad/craft-cloud"
 
 [workspace.lints.rust]
@@ -19,6 +19,14 @@ todo = "warn"
 [workspace.dependencies]
 craft-cloud-proto = { path = "crates/proto" }
 craft-cloud-chunker = { path = "crates/chunker" }
+craft-cloud-store = { path = "crates/store" }
+craft-cloud-meta = { path = "crates/meta" }
+async-trait = "0.1.89"
+bytes = "1.10"
+object_store = { version = "0.14.2", default-features = false, features = ["aws", "ring"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "any", "sqlite", "postgres"] }
+tempfile = "3.20"
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "fs", "sync"] }
 blake3 = "1.8.7"
 caseless = "=0.2.2"
 proptest = "1.12"
