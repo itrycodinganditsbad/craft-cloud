@@ -199,13 +199,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 self.fs.remove_file(path).map_err(|e| io_err(path, e))?;
                 report.removed_locally.push(path.clone());
             }
-            // An empty folder (or one with only OS metadata files) goes, as when the server deletes it.
-            (BaseKind::Dir { .. }, Local::Unchanged) => {
-                if self.remove_dir_if_bare(path)? {
-                    report.removed_locally.push(path.clone());
-                } else {
-                    self.move_aside(path, report)?;
-                }
+            // An empty folder (or one with only OS metadata files) goes, as when the server deletes it; the guard
+            // removes it. Any other folder is moved aside below.
+            (BaseKind::Dir { .. }, Local::Unchanged) if self.remove_dir_if_bare(path)? => {
+                report.removed_locally.push(path.clone());
             }
             _ => {
                 self.move_aside(path, report)?;
