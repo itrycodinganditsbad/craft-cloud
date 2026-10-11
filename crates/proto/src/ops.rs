@@ -74,6 +74,8 @@ pub enum ConflictKind {
     },
     /// The move would put a directory inside itself.
     Cycle,
+    /// The result would nest folders deeper than the limit.
+    TooDeep,
     /// The directory still has children.
     NotEmpty,
     /// The root directory can't be moved or deleted.
@@ -162,6 +164,14 @@ mod tests {
         let json = serde_json::to_value(&c).unwrap();
         assert_eq!(json["op"], 3);
         assert_eq!(json["kind"], "name_taken");
+        assert_eq!(serde_json::from_value::<Conflict>(json).unwrap(), c);
+    }
+
+    #[test]
+    fn too_deep_conflict_round_trips() {
+        let c = Conflict { op: 0, kind: ConflictKind::TooDeep };
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(json["kind"], "too_deep");
         assert_eq!(serde_json::from_value::<Conflict>(json).unwrap(), c);
     }
 

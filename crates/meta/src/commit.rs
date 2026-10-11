@@ -11,7 +11,7 @@
 //! parent directories too; names collide by case fold; a directory can't move into itself; only empty
 //! directories are deleted; the root can't be moved or deleted.
 
-use craft_cloud_proto::limits::MAX_BATCH_OPS;
+use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_TREE_DEPTH};
 use craft_cloud_proto::{Conflict, ConflictKind, DeviceId, Epoch, Name, NewVersion, NodeId, Op, SpaceId, VersionId};
 use sqlx::Row;
 
@@ -19,9 +19,6 @@ use crate::blobs::manifest_file_size;
 use crate::codec::{flag, to_i64, uuid_bytes, uuid_from};
 use crate::tree::space_info;
 use crate::{Dialect, Meta, MetaError};
-
-/// Deepest directory nesting walked when checking for cycles; deeper trees are refused as cycles.
-const MAX_DEPTH: usize = 4096;
 
 /// A successful commit: the space's new sequence number and its epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,8 +125,8 @@ impl Ctx<'_> {
         let mut chain = Vec::new();
         let (mut current, mut current_row) = (id, row);
         while current_row.deleted {
-            if chain.len() >= MAX_DEPTH {
-                return Ok(Err(ConflictKind::Cycle));
+            if chain.len() > MAX_TREE_DEPTH {
+                return Ok(Err(ConflictKind::TooDeep));
             }
             let Some(parent) = current_row.parent else { break };
             chain.push((current, parent, current_row.name.clone()));
@@ -194,11 +191,15 @@ impl Ctx<'_> {
     }
 
     /// Checks a new node can be created as `name` in `parent`.
-    async fn check_new(&mut self, node: NodeId, parent: NodeId, name: &Name) -> Result<Outcome, MetaError> {
+    async fn check_new(&mut self, node: NodeId, parent: NodeId, name: &Name, is_dir: bool) -> Result<Outcome, MetaError> {
         if self.node(node).await?.is_some() {
             return Ok(Err(ConflictKind::NodeExists));
         }
         if let Err(kind) = self.ensure_live_dir(parent).await? {
+            return Ok(Err(kind));
+        }
+        // Only folders count towards the nesting limit; files may sit in the deepest folder.
+        if is_dir && let Err(kind) = self.check_placement(parent, None).await? {
             return Ok(Err(kind));
         }
         if let Some(existing) = self.live_child(parent, name).await? {
@@ -210,14 +211,14 @@ impl Ctx<'_> {
     async fn apply(&mut self, op: &Op) -> Result<Outcome, MetaError> {
         match op {
             Op::Mkdir { node, parent, name } => {
-                if let Err(kind) = self.check_new(*node, *parent, name).await? {
+                if let Err(kind) = self.check_new(*node, *parent, name, true).await? {
                     return Ok(Err(kind));
                 }
                 self.insert_node(*node, *parent, name, true, None).await?;
                 Ok(Ok(()))
             }
             Op::Create { node, parent, name, version } => {
-                if let Err(kind) = self.check_new(*node, *parent, name).await? {
+                if let Err(kind) = self.check_new(*node, *parent, name, false).await? {
                     return Ok(Err(kind));
                 }
                 if let Err(kind) = self.insert_version(*node, None, version).await? {
@@ -263,8 +264,10 @@ impl Ctx<'_> {
                 if let Err(kind) = self.ensure_live_dir(*parent).await? {
                     return Ok(Err(kind));
                 }
-                if row.is_dir && self.is_inside(*parent, *node).await? {
-                    return Ok(Err(ConflictKind::Cycle));
+                if row.is_dir
+                    && let Err(kind) = self.check_placement(*parent, Some(*node)).await?
+                {
+                    return Ok(Err(kind));
                 }
                 if let Some(existing) = self.live_child(*parent, name).await?
                     && existing != *node
@@ -305,19 +308,46 @@ impl Ctx<'_> {
             }
         }
     }
+    /// `node` and its ancestors, nearest first, as (id, parent) pairs; stops after `MAX_TREE_DEPTH + 2` rows, so
+    /// a walk that did not reach the root (last parent is `Some`) is too deep.
+    async fn ancestors(&mut self, node: NodeId) -> Result<Vec<(NodeId, Option<NodeId>)>, MetaError> {
+        let bound = i64::try_from(MAX_TREE_DEPTH + 1).map_err(|_| MetaError::Corrupt("depth limit out of range"))?;
+        let rows = sqlx::query(
+            "WITH RECURSIVE up(id, parent, depth) AS (\
+                 SELECT id, parent, 0 FROM nodes WHERE space_id = $1 AND id = $2 \
+                 UNION ALL \
+                 SELECT n.id, n.parent, up.depth + 1 FROM nodes n JOIN up ON n.space_id = $1 AND n.id = up.parent WHERE up.depth < $3 \
+             ) SELECT id, parent FROM up ORDER BY depth",
+        )
+        .bind(self.space())
+        .bind(uuid_bytes(node.as_uuid()))
+        .bind(bound)
+        .fetch_all(&mut *self.conn)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let id = NodeId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("id")?)?);
+                let parent: Option<Vec<u8>> = row.try_get("parent")?;
+                Ok((id, parent.as_deref().map(uuid_from).transpose()?.map(NodeId::from_uuid)))
+            })
+            .collect()
+    }
 
-    /// Whether `dir` is `ancestor` or lies somewhere below it.
-    async fn is_inside(&mut self, dir: NodeId, ancestor: NodeId) -> Result<bool, MetaError> {
-        let mut current = Some(dir);
-        for _ in 0..MAX_DEPTH {
-            let Some(id) = current else { return Ok(false) };
-            if id == ancestor {
-                return Ok(true);
-            }
-            current = self.node(id).await?.and_then(|row| row.parent);
+    /// Checks that something may sit directly inside `parent`: a moved directory (`moving`) must not be
+    /// `parent` or one of its ancestors, and the folder must not nest deeper than `MAX_TREE_DEPTH`.
+    async fn check_placement(&mut self, parent: NodeId, moving: Option<NodeId>) -> Result<Outcome, MetaError> {
+        let chain = self.ancestors(parent).await?;
+        if let Some(dir) = moving
+            && chain.iter().any(|(id, _)| *id == dir)
+        {
+            return Ok(Err(ConflictKind::Cycle));
         }
-        // Absurdly deep: refuse rather than loop.
-        Ok(true)
+        let reached_root = chain.last().is_some_and(|(_, up)| up.is_none());
+        // `parent` sits at depth `chain.len() - 1`; its child one deeper.
+        if !reached_root || chain.len() > MAX_TREE_DEPTH {
+            return Ok(Err(ConflictKind::TooDeep));
+        }
+        Ok(Ok(()))
     }
 }
 

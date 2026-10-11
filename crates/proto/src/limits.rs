@@ -18,3 +18,5 @@ pub const MAX_NAME_BYTES: usize = 255;
 pub const MAX_BATCH_OPS: usize = 1000;
 /// Largest commit batch body, in bytes of JSON.
 pub const MAX_BATCH_JSON_BYTES: usize = 1024 * 1024;
+/// Deepest allowed folder nesting (the root is depth 0). Deeper creates and moves are refused with TooDeep.
+pub const MAX_TREE_DEPTH: usize = 256;

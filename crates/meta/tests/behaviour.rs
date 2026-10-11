@@ -97,6 +97,9 @@ on_every_backend!(
     the_change_feed_and_epochs,
     concurrent_commits_on_one_file_let_exactly_one_win,
     batch_size_is_limited,
+    folders_nest_at_most_max_tree_depth,
+    creating_or_moving_into_a_deleted_folder_brings_it_back,
+    names_can_be_juggled_within_one_batch,
 );
 
 // ---- helpers ----
@@ -508,6 +511,121 @@ async fn batch_size_is_limited(meta: &Meta) {
     assert!(matches!(meta.commit(u.space, dev, &ops, NOW).await, Err(MetaError::Invalid(_))));
     meta.commit(u.space, dev, &ops[..1000], NOW).await.unwrap();
     assert_eq!(meta.tree(u.space).await.unwrap().nodes.len(), 1001);
+}
+
+async fn folders_nest_at_most_max_tree_depth(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    let m = manifest(meta, &u, 1).await;
+    let mut parent = r;
+    let mut chain = Vec::new();
+    let mut ops = Vec::new();
+    for i in 0..craft_cloud_proto::limits::MAX_TREE_DEPTH {
+        let node = NodeId::generate();
+        ops.push(Op::Mkdir { node, parent, name: name(&format!("d{i}")) });
+        chain.push(node);
+        parent = node;
+        if ops.len() == 1000 {
+            meta.commit(u.space, dev, &ops, NOW).await.unwrap();
+            ops.clear();
+        }
+    }
+    if !ops.is_empty() {
+        meta.commit(u.space, dev, &ops, NOW).await.unwrap();
+    }
+    let deepest = parent;
+    let too_deep = meta.commit(u.space, dev, &[Op::Mkdir { node: NodeId::generate(), parent: deepest, name: name("x") }], NOW).await;
+    assert_eq!(conflicts(too_deep), vec![(0, ConflictKind::TooDeep)]);
+
+    // A file at the deepest level is fine, and a file can be moved there.
+    let f = NodeId::generate();
+    meta.commit(u.space, dev, &[Op::Create { node: f, parent: r, name: name("f"), version: version(m) }], NOW).await.unwrap();
+    meta.commit(u.space, dev, &[Op::Move { node: f, from_parent: r, from_name: name("f"), parent: deepest, name: name("f") }], NOW).await.unwrap();
+
+    let top = NodeId::generate();
+    meta.commit(u.space, dev, &[Op::Mkdir { node: top, parent: r, name: name("top") }], NOW).await.unwrap();
+    let moved =
+        meta.commit(u.space, dev, &[Op::Move { node: top, from_parent: r, from_name: name("top"), parent: deepest, name: name("top") }], NOW).await;
+    assert_eq!(conflicts(moved), vec![(0, ConflictKind::TooDeep)]);
+}
+
+async fn creating_or_moving_into_a_deleted_folder_brings_it_back(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    let m = manifest(meta, &u, 1).await;
+    let (d1, d2, f) = (NodeId::generate(), NodeId::generate(), NodeId::generate());
+    meta.commit(
+        u.space,
+        dev,
+        &[
+            Op::Mkdir { node: d1, parent: r, name: name("one") },
+            Op::Mkdir { node: d2, parent: r, name: name("two") },
+            Op::Create { node: f, parent: r, name: name("f"), version: version(m) },
+        ],
+        NOW,
+    )
+    .await
+    .unwrap();
+    meta.commit(u.space, dev, &[Op::Delete { node: d1, expected: None }, Op::Delete { node: d2, expected: None }], NOW).await.unwrap();
+
+    let created = NodeId::generate();
+    meta.commit(u.space, dev, &[Op::Create { node: created, parent: d1, name: name("new"), version: version(m) }], NOW).await.unwrap();
+    meta.commit(u.space, dev, &[Op::Move { node: f, from_parent: r, from_name: name("f"), parent: d2, name: name("f") }], NOW).await.unwrap();
+    let tree = meta.tree(u.space).await.unwrap();
+    assert!(!find(&tree.nodes, d1).deleted && !find(&tree.nodes, d2).deleted);
+    assert_eq!(find(&tree.nodes, created).parent, Some(d1));
+    assert_eq!(find(&tree.nodes, f).parent, Some(d2));
+}
+
+async fn names_can_be_juggled_within_one_batch(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    let m = manifest(meta, &u, 1).await;
+    let (a, b) = (NodeId::generate(), NodeId::generate());
+    let (va, vb) = (version(m), version(m));
+    meta.commit(
+        u.space,
+        dev,
+        &[
+            Op::Create { node: a, parent: r, name: name("a"), version: va.clone() },
+            Op::Create { node: b, parent: r, name: name("b"), version: vb.clone() },
+        ],
+        NOW,
+    )
+    .await
+    .unwrap();
+    meta.commit(
+        u.space,
+        dev,
+        &[
+            Op::Move { node: a, from_parent: r, from_name: name("a"), parent: r, name: name("tmp") },
+            Op::Move { node: b, from_parent: r, from_name: name("b"), parent: r, name: name("a") },
+            Op::Move { node: a, from_parent: r, from_name: name("tmp"), parent: r, name: name("b") },
+        ],
+        NOW,
+    )
+    .await
+    .unwrap();
+    let tree = meta.tree(u.space).await.unwrap();
+    assert_eq!(find(&tree.nodes, a).name, Some(name("b")));
+    assert_eq!(find(&tree.nodes, b).name, Some(name("a")));
+
+    // Delete then re-create under the same name, in one batch.
+    let c = NodeId::generate();
+    meta.commit(
+        u.space,
+        dev,
+        &[Op::Delete { node: b, expected: Some(vb.id) }, Op::Create { node: c, parent: r, name: name("a"), version: version(m) }],
+        NOW,
+    )
+    .await
+    .unwrap();
+    let tree = meta.tree(u.space).await.unwrap();
+    assert_eq!(find(&tree.nodes, c).name, Some(name("a")));
+    assert!(tree.nodes.iter().all(|n| n.id != b));
 }
 
 // ---- plain tests ----
