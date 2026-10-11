@@ -4,6 +4,7 @@
 //! `CRAFT_CLOUD_TEST_PG` into a failure instead of a skip.
 
 use craft_cloud_meta::{Meta, MetaError, Role, UserRecord};
+use craft_cloud_proto::limits::MAX_PAGE_NODES;
 use craft_cloud_proto::{
     ChunkId, ChunkRef, ChunkerParamsId, ConflictKind, DeviceId, FileHash, Manifest, ManifestId, Name, NewVersion, NodeId, NodeKind, NodeState, Op,
     VersionId,
@@ -102,6 +103,7 @@ on_every_backend!(
     names_can_be_juggled_within_one_batch,
     a_failed_restore_walk_is_not_repeated_for_every_operation,
     big_manifests_are_checked_in_batches,
+    the_tree_and_the_feed_come_in_pages,
 );
 
 // ---- helpers ----
@@ -138,6 +140,10 @@ async fn manifest(meta: &Meta, u: &UserRecord, len: u32) -> ManifestId {
 
 fn version(manifest: ManifestId) -> NewVersion {
     NewVersion { id: VersionId::generate(), manifest, mtime_ms: NOW, exec: false }
+}
+
+async fn full_tree(meta: &Meta, space: craft_cloud_proto::SpaceId) -> craft_cloud_proto::ChangeSet {
+    meta.tree(space, None, MAX_PAGE_NODES).await.unwrap()
 }
 
 fn find(nodes: &[NodeState], id: NodeId) -> &NodeState {
@@ -183,7 +189,7 @@ async fn users_and_devices(meta: &Meta) {
 
 async fn a_new_space_has_only_its_root(meta: &Meta) {
     let u = user(meta, "ana").await;
-    let tree = meta.tree(u.space).await.unwrap();
+    let tree = full_tree(meta, u.space).await;
     assert_eq!(tree.seq, 0);
     assert_eq!(tree.nodes.len(), 1);
     let r = &tree.nodes[0];
@@ -242,7 +248,7 @@ async fn an_offline_batch_creates_a_folder_and_files_in_it(meta: &Meta) {
     ];
     let out = meta.commit(u.space, dev, &ops, NOW).await.unwrap();
     assert_eq!(out.seq, 1);
-    let tree = meta.tree(u.space).await.unwrap();
+    let tree = full_tree(meta, u.space).await;
     assert_eq!((tree.seq, tree.nodes.len()), (1, 4));
     let file = find(&tree.nodes, a);
     assert_eq!((file.parent, file.name.clone()), (Some(shots), Some(name("010.psd"))));
@@ -263,7 +269,7 @@ async fn updates_need_the_current_version(meta: &Meta) {
     // A second device still thinks v1 is current.
     let stale = meta.commit(u.space, dev, &[Op::Update { node: file, expected: v1.id, version: version(m1) }], NOW).await;
     assert_eq!(conflicts(stale), vec![(0, ConflictKind::VersionMismatch { current: Some(v2.id) })]);
-    let tree = meta.tree(u.space).await.unwrap();
+    let tree = full_tree(meta, u.space).await;
     let NodeKind::File(state) = &find(&tree.nodes, file).kind else { panic!("not a file") };
     assert_eq!((state.version, state.size), (v2.id, 2));
 }
@@ -305,7 +311,7 @@ async fn a_refused_batch_lists_every_conflict_and_changes_nothing(meta: &Meta) {
         Op::Update { node: NodeId::generate(), expected: VersionId::generate(), version: version(m) },
     ];
     assert_eq!(conflicts(meta.commit(u.space, dev, &ops, NOW).await), vec![(1, ConflictKind::NoSuchParent), (2, ConflictKind::NoSuchNode)]);
-    let tree = meta.tree(u.space).await.unwrap();
+    let tree = full_tree(meta, u.space).await;
     assert_eq!((tree.seq, tree.nodes.len()), (0, 1));
 }
 
@@ -331,7 +337,7 @@ async fn moves_and_renames(meta: &Meta) {
     // Case-only rename and a move into a folder.
     meta.commit(u.space, dev, &[Op::Move { node: f, from_parent: r, from_name: name("f.txt"), parent: r, name: name("F.txt") }], NOW).await.unwrap();
     meta.commit(u.space, dev, &[Op::Move { node: f, from_parent: r, from_name: name("F.txt"), parent: b, name: name("F.txt") }], NOW).await.unwrap();
-    let tree = meta.tree(u.space).await.unwrap();
+    let tree = full_tree(meta, u.space).await;
     assert_eq!((find(&tree.nodes, f).parent, find(&tree.nodes, f).name.clone()), (Some(b), Some(name("F.txt"))));
 
     // A move from a stale location.
@@ -370,8 +376,8 @@ async fn deletes(meta: &Meta) {
 
     let out =
         meta.commit(u.space, dev, &[Op::Delete { node: file, expected: Some(v.id) }, Op::Delete { node: dir, expected: None }], NOW).await.unwrap();
-    assert_eq!(meta.tree(u.space).await.unwrap().nodes.len(), 1);
-    let feed = meta.changes(u.space, out.seq - 1).await.unwrap();
+    assert_eq!(full_tree(meta, u.space).await.nodes.len(), 1);
+    let feed = meta.changes(u.space, out.seq - 1, None, MAX_PAGE_NODES).await.unwrap();
     assert!(feed.nodes.iter().all(|n| n.deleted) && feed.nodes.len() == 2);
     // Deleting what is already deleted is not a conflict.
     meta.commit(u.space, dev, &[Op::Delete { node: file, expected: Some(v.id) }], NOW).await.unwrap();
@@ -406,7 +412,7 @@ async fn an_edit_brings_back_a_deleted_file_and_its_folders(meta: &Meta) {
     .unwrap();
     // ...another, offline, edited the file. The edit wins.
     meta.commit(u.space, dev, &[Op::Update { node: file, expected: v1.id, version: version(m) }], NOW).await.unwrap();
-    let tree = meta.tree(u.space).await.unwrap();
+    let tree = full_tree(meta, u.space).await;
     assert_eq!(tree.nodes.len(), 4);
     assert!(!find(&tree.nodes, outer).deleted && !find(&tree.nodes, inner).deleted && !find(&tree.nodes, file).deleted);
 }
@@ -463,19 +469,19 @@ async fn the_change_feed_and_epochs(meta: &Meta) {
     let (a, b) = (NodeId::generate(), NodeId::generate());
     meta.commit(u.space, dev, &[Op::Mkdir { node: a, parent: r, name: name("a") }], NOW).await.unwrap();
     let second = meta.commit(u.space, dev, &[Op::Mkdir { node: b, parent: r, name: name("b") }], NOW).await.unwrap();
-    let feed = meta.changes(u.space, 1).await.unwrap();
+    let feed = meta.changes(u.space, 1, None, MAX_PAGE_NODES).await.unwrap();
     assert_eq!((feed.seq, feed.nodes.iter().map(|n| n.id).collect::<Vec<_>>()), (2, vec![b]));
-    assert!(meta.changes(u.space, 2).await.unwrap().nodes.is_empty());
+    assert!(meta.changes(u.space, 2, None, MAX_PAGE_NODES).await.unwrap().nodes.is_empty());
     // A client that is ahead of the server (the server was restored) must resync.
-    assert!(matches!(meta.changes(u.space, 3).await, Err(MetaError::ResyncRequired)));
+    assert!(matches!(meta.changes(u.space, 3, None, MAX_PAGE_NODES).await, Err(MetaError::ResyncRequired)));
 
     let new_epoch = meta.reset_epoch(u.space).await.unwrap();
     assert_ne!(new_epoch, second.epoch);
-    assert_eq!(meta.changes(u.space, 0).await.unwrap().epoch, new_epoch);
+    assert_eq!(meta.changes(u.space, 0, None, MAX_PAGE_NODES).await.unwrap().epoch, new_epoch);
     let m = manifest(meta, &u, 1).await;
     let file = NodeId::generate();
     meta.commit(u.space, dev, &[Op::Create { node: file, parent: r, name: name("f"), version: version(m) }], NOW).await.unwrap();
-    let tree = meta.tree(u.space).await.unwrap();
+    let tree = full_tree(meta, u.space).await;
     let NodeKind::File(state) = &find(&tree.nodes, file).kind else { panic!("not a file") };
     assert_eq!(state.epoch, new_epoch);
 }
@@ -512,7 +518,7 @@ async fn batch_size_is_limited(meta: &Meta) {
     let ops: Vec<Op> = (0..1001).map(|i| Op::Mkdir { node: NodeId::generate(), parent: r, name: name(&format!("d{i}")) }).collect();
     assert!(matches!(meta.commit(u.space, dev, &ops, NOW).await, Err(MetaError::Invalid(_))));
     meta.commit(u.space, dev, &ops[..1000], NOW).await.unwrap();
-    assert_eq!(meta.tree(u.space).await.unwrap().nodes.len(), 1001);
+    assert_eq!(full_tree(meta, u.space).await.nodes.len(), 1001);
 }
 
 async fn folders_nest_at_most_max_tree_depth(meta: &Meta) {
@@ -575,7 +581,7 @@ async fn creating_or_moving_into_a_deleted_folder_brings_it_back(meta: &Meta) {
     let created = NodeId::generate();
     meta.commit(u.space, dev, &[Op::Create { node: created, parent: d1, name: name("new"), version: version(m) }], NOW).await.unwrap();
     meta.commit(u.space, dev, &[Op::Move { node: f, from_parent: r, from_name: name("f"), parent: d2, name: name("f") }], NOW).await.unwrap();
-    let tree = meta.tree(u.space).await.unwrap();
+    let tree = full_tree(meta, u.space).await;
     assert!(!find(&tree.nodes, d1).deleted && !find(&tree.nodes, d2).deleted);
     assert_eq!(find(&tree.nodes, created).parent, Some(d1));
     assert_eq!(find(&tree.nodes, f).parent, Some(d2));
@@ -611,7 +617,7 @@ async fn names_can_be_juggled_within_one_batch(meta: &Meta) {
     )
     .await
     .unwrap();
-    let tree = meta.tree(u.space).await.unwrap();
+    let tree = full_tree(meta, u.space).await;
     assert_eq!(find(&tree.nodes, a).name, Some(name("b")));
     assert_eq!(find(&tree.nodes, b).name, Some(name("a")));
 
@@ -625,7 +631,7 @@ async fn names_can_be_juggled_within_one_batch(meta: &Meta) {
     )
     .await
     .unwrap();
-    let tree = meta.tree(u.space).await.unwrap();
+    let tree = full_tree(meta, u.space).await;
     assert_eq!(find(&tree.nodes, c).name, Some(name("a")));
     assert!(tree.nodes.iter().all(|n| n.id != b));
 }
@@ -701,6 +707,64 @@ async fn big_manifests_are_checked_in_batches(meta: &Meta) {
     let started = std::time::Instant::now();
     assert_eq!(meta.missing_chunks(u.space, &ids).await.unwrap(), ids);
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
+async fn the_tree_and_the_feed_come_in_pages(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    // 25 nodes over several commits, so the pages cross sequence numbers.
+    for batch in 0..5 {
+        let ops: Vec<Op> = (0..5).map(|i| Op::Mkdir { node: NodeId::generate(), parent: r, name: name(&format!("d{batch}-{i}")) }).collect();
+        meta.commit(u.space, dev, &ops, NOW).await.unwrap();
+    }
+
+    let mut seen = Vec::new();
+    let mut pages = 0;
+    let mut after = None;
+    let first_seq = meta.space_info(u.space).await.unwrap().seq;
+    loop {
+        let page = meta.tree(u.space, after, 7).await.unwrap();
+        assert_eq!(page.seq, first_seq);
+        assert!(page.nodes.len() <= 7);
+        seen.extend(page.nodes.iter().map(|n| n.id));
+        pages += 1;
+        match page.next {
+            Some(next) => {
+                assert_eq!(page.nodes.len(), 7);
+                after = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(pages, 4);
+    assert_eq!(seen.len(), 26);
+    assert_eq!(seen.iter().collect::<std::collections::HashSet<_>>().len(), 26);
+    assert!(seen.contains(&r));
+
+    let mut seen = Vec::new();
+    let (mut pages, mut after) = (0, None);
+    loop {
+        let page = meta.changes(u.space, 0, after, 7).await.unwrap();
+        seen.extend(page.nodes.iter().map(|n| n.id));
+        pages += 1;
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(pages, 4);
+    assert_eq!(seen.len(), 25);
+    assert_eq!(seen.iter().collect::<std::collections::HashSet<_>>().len(), 25);
+    // Resuming from a later sequence number pages only what changed after it.
+    let later = meta.changes(u.space, 3, None, 10).await.unwrap();
+    assert_eq!(later.nodes.len(), 10);
+    assert!(later.next.is_none());
+
+    for bad in [0, MAX_PAGE_NODES + 1] {
+        assert!(matches!(meta.tree(u.space, None, bad).await, Err(MetaError::Invalid(_))));
+        assert!(matches!(meta.changes(u.space, 0, None, bad).await, Err(MetaError::Invalid(_))));
+    }
 }
 
 // ---- plain tests ----

@@ -125,6 +125,14 @@ pub struct NodeState {
     pub kind: NodeKind,
 }
 
+/// Where the next page of a listing starts: just after the node with this change sequence number and ID
+/// (listings are ordered by `(seq, node)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageCursor {
+    pub seq: u64,
+    pub node: NodeId,
+}
+
 /// Nodes changed after some sequence number (or every live node, for a full listing), with the space's
 /// epoch and the sequence number to ask from next time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +140,8 @@ pub struct ChangeSet {
     pub epoch: Epoch,
     pub seq: u64,
     pub nodes: Vec<NodeState>,
+    /// Set when more nodes follow; pass it as `after` to get the next page.
+    pub next: Option<PageCursor>,
 }
 
 #[cfg(test)]
@@ -181,6 +191,53 @@ mod tests {
         let json = serde_json::to_value(&dir).unwrap();
         assert_eq!(json["type"], "dir");
         assert_eq!(serde_json::from_value::<NodeState>(json).unwrap(), dir);
+    }
+
+    #[test]
+    fn change_sets_round_trip_with_a_cursor() {
+        let set = ChangeSet {
+            epoch: Epoch::from_uuid(Uuid::from_u128(7)),
+            seq: 12,
+            nodes: vec![NodeState { id: node(1), parent: None, name: None, deleted: false, kind: NodeKind::Dir }],
+            next: Some(PageCursor { seq: 11, node: node(4) }),
+        };
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["next"]["seq"], 11);
+        assert_eq!(serde_json::from_value::<ChangeSet>(json).unwrap(), set);
+        let last = ChangeSet { next: None, ..set };
+        assert_eq!(serde_json::from_value::<ChangeSet>(serde_json::to_value(&last).unwrap()).unwrap(), last);
+    }
+
+    #[test]
+    fn file_node_states_round_trip() {
+        let file = NodeState {
+            id: node(2),
+            parent: Some(node(1)),
+            name: Some(Name::new("a.txt").unwrap()),
+            deleted: true,
+            kind: NodeKind::File(FileState {
+                version: VersionId::from_uuid(Uuid::from_u128(3)),
+                manifest: ManifestId::from_bytes([5; 32]),
+                size: 10,
+                mtime_ms: -5,
+                exec: true,
+                device: DeviceId::from_uuid(Uuid::from_u128(4)),
+                epoch: Epoch::from_uuid(Uuid::from_u128(6)),
+            }),
+        };
+        let json = serde_json::to_value(&file).unwrap();
+        assert_eq!(json["type"], "file");
+        assert_eq!(json["size"], 10);
+        assert_eq!(serde_json::from_value::<NodeState>(json).unwrap(), file);
+    }
+
+    #[test]
+    fn conflicts_with_missing_details_round_trip() {
+        for kind in [ConflictKind::Moved { parent: None, name: None }, ConflictKind::VersionMismatch { current: None }] {
+            let c = Conflict { op: 1, kind };
+            let json = serde_json::to_value(&c).unwrap();
+            assert_eq!(serde_json::from_value::<Conflict>(json).unwrap(), c);
+        }
     }
 
     #[test]

@@ -3,22 +3,18 @@
 //! Every node records the sequence number of the commit that last changed it (`changed_seq`), and deleted
 //! nodes stay as tombstones, so "what changed since N" is one indexed query and reports deletions too.
 
-use craft_cloud_proto::{ChangeSet, DeviceId, Epoch, FileState, ManifestId, Name, NodeId, NodeKind, NodeState, SpaceId, VersionId};
+use craft_cloud_proto::limits::MAX_PAGE_NODES;
+use craft_cloud_proto::{ChangeSet, DeviceId, Epoch, FileState, ManifestId, Name, NodeId, NodeKind, NodeState, PageCursor, SpaceId, VersionId};
 use sqlx::Row;
 use sqlx::any::AnyRow;
 
-use crate::codec::{flag, hash_from, to_u64, uuid_bytes, uuid_from};
+use crate::codec::{flag, hash_from, to_i64, to_u64, uuid_bytes, uuid_from};
 use crate::{Meta, MetaError};
 
-/// Node columns plus its current version (if a file). The two queries differ only in their filter.
-const TREE_SQL: &str = "SELECT n.id, n.parent, n.name, n.is_dir, n.deleted, v.id AS v_id, v.manifest AS v_manifest, v.size AS v_size, \
+/// Node columns plus its current version (if a file).
+const NODE_SELECT: &str = "SELECT n.id, n.parent, n.name, n.is_dir, n.deleted, n.changed_seq, v.id AS v_id, v.manifest AS v_manifest, v.size AS v_size, \
      v.mtime_ms AS v_mtime, v.exec AS v_exec, v.device AS v_device, v.epoch AS v_epoch \
-     FROM nodes n LEFT JOIN versions v ON v.space_id = n.space_id AND v.id = n.version \
-     WHERE n.space_id = $1 AND n.deleted = 0 ORDER BY n.changed_seq, n.id";
-const CHANGES_SQL: &str = "SELECT n.id, n.parent, n.name, n.is_dir, n.deleted, v.id AS v_id, v.manifest AS v_manifest, v.size AS v_size, \
-     v.mtime_ms AS v_mtime, v.exec AS v_exec, v.device AS v_device, v.epoch AS v_epoch \
-     FROM nodes n LEFT JOIN versions v ON v.space_id = n.space_id AND v.id = n.version \
-     WHERE n.space_id = $1 AND n.changed_seq > $2 ORDER BY n.changed_seq, n.id";
+     FROM nodes n LEFT JOIN versions v ON v.space_id = n.space_id AND v.id = n.version";
 
 /// A space's epoch, current sequence number and root directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,30 +84,59 @@ impl Meta {
         space_info(&mut conn, space, false).await
     }
 
-    /// Every live node, root included, parents before children is not guaranteed (sort by depth on the
-    /// client). Read in one transaction, so the listing and its `seq` agree.
-    pub async fn tree(&self, space: SpaceId) -> Result<ChangeSet, MetaError> {
-        let mut tx = self.read_snapshot().await?;
-        let info = space_info(&mut tx, space, false).await?;
-        let rows = sqlx::query(TREE_SQL).bind(uuid_bytes(space.as_uuid())).fetch_all(&mut *tx).await?;
-        let nodes = rows.iter().map(node_state).collect::<Result<_, _>>()?;
-        tx.commit().await?;
-        Ok(ChangeSet { epoch: info.epoch, seq: info.seq, nodes })
+    /// One page of the live nodes, root included, ordered by `(changed seq, id)`; parents before children is
+    /// not guaranteed (sort by depth on the client). `after` is the previous page's `next`. Each call reads one
+    /// snapshot, so a page and its `seq` agree; a client resumes the change feed from the `seq` of the FIRST
+    /// page of a listing, and then applies the feed on top of what it listed.
+    pub async fn tree(&self, space: SpaceId, after: Option<PageCursor>, limit: u32) -> Result<ChangeSet, MetaError> {
+        self.page(space, None, after, limit).await
     }
 
-    /// Nodes changed after `since`, deletions included. `ResyncRequired` when `since` is older than the
-    /// oldest change still known, or newer than the space's current sequence (the server was restored).
-    pub async fn changes(&self, space: SpaceId, since: u64) -> Result<ChangeSet, MetaError> {
+    /// One page of the nodes changed after `since`, deletions included, ordered like [`Meta::tree`].
+    /// `ResyncRequired` when `since` is older than the oldest change still known, or newer than the space's
+    /// current sequence (the server was restored). A client resumes from the `seq` of the first page.
+    pub async fn changes(&self, space: SpaceId, since: u64, after: Option<PageCursor>, limit: u32) -> Result<ChangeSet, MetaError> {
+        self.page(space, Some(since), after, limit).await
+    }
+
+    async fn page(&self, space: SpaceId, since: Option<u64>, after: Option<PageCursor>, limit: u32) -> Result<ChangeSet, MetaError> {
+        if limit == 0 || limit > MAX_PAGE_NODES {
+            return Err(MetaError::Invalid("a page has 1 to 5000 nodes"));
+        }
         let mut tx = self.read_snapshot().await?;
         let info = space_info(&mut tx, space, false).await?;
-        if since < info.oldest_seq || since > info.seq {
-            return Err(MetaError::ResyncRequired);
-        }
-        let since = i64::try_from(since).map_err(|_| MetaError::ResyncRequired)?;
-        let rows = sqlx::query(CHANGES_SQL).bind(uuid_bytes(space.as_uuid())).bind(since).fetch_all(&mut *tx).await?;
-        let nodes = rows.iter().map(node_state).collect::<Result<_, _>>()?;
+        let since = match since {
+            Some(since) if since < info.oldest_seq || since > info.seq => return Err(MetaError::ResyncRequired),
+            Some(since) => to_i64(since)?,
+            None => -1,
+        };
+        let (cursor_seq, cursor_node) = match after {
+            Some(cursor) => (to_i64(cursor.seq)?, uuid_bytes(cursor.node.as_uuid())),
+            None => (-1, vec![0u8; 16]),
+        };
+        // Fetch one row more than asked for, to learn whether another page follows.
+        let sql = format!(
+            "{NODE_SELECT} WHERE n.space_id = $1 AND n.changed_seq > $2 AND (n.changed_seq > $3 OR (n.changed_seq = $3 AND n.id > $4)){} \
+             ORDER BY n.changed_seq, n.id LIMIT $5",
+            if since < 0 { " AND n.deleted = 0" } else { "" }
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(uuid_bytes(space.as_uuid()))
+            .bind(since)
+            .bind(cursor_seq)
+            .bind(cursor_node)
+            .bind(i64::from(limit) + 1)
+            .fetch_all(&mut *tx)
+            .await?;
         tx.commit().await?;
-        Ok(ChangeSet { epoch: info.epoch, seq: info.seq, nodes })
+        let more = rows.len() > usize::try_from(limit).map_err(|_| MetaError::Invalid("limit too large"))?;
+        let kept = if more { rows.len() - 1 } else { rows.len() };
+        let nodes = rows.iter().take(kept).map(node_state).collect::<Result<Vec<_>, _>>()?;
+        let next = match (more, kept.checked_sub(1).and_then(|i| rows.get(i)), nodes.last()) {
+            (true, Some(row), Some(last)) => Some(PageCursor { seq: to_u64(row.try_get("changed_seq")?)?, node: last.id }),
+            _ => None,
+        };
+        Ok(ChangeSet { epoch: info.epoch, seq: info.seq, nodes, next })
     }
 
     /// Starts a new epoch for the space: run after restoring the server from a backup, so every agent
