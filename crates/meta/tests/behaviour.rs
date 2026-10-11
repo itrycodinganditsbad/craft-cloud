@@ -41,7 +41,9 @@ async fn sqlite() -> Db {
     Db { meta: Meta::open(&url).await.unwrap(), _guard: Guard::Sqlite(dir) }
 }
 
-async fn postgres() -> Option<Db> {
+/// A fresh, empty Postgres database: its URL, and the guard that drops it. The guard exists before the
+/// caller opens the database, so the database is dropped even when opening it fails.
+async fn postgres_database() -> Option<(String, Guard)> {
     let Ok(admin_url) = std::env::var("CRAFT_CLOUD_TEST_PG") else {
         assert!(std::env::var_os("CRAFT_CLOUD_REQUIRE_BACKENDS").is_none(), "CRAFT_CLOUD_REQUIRE_BACKENDS is set but CRAFT_CLOUD_TEST_PG is not");
         return None;
@@ -51,8 +53,13 @@ async fn postgres() -> Option<Db> {
     let mut conn = sqlx::PgConnection::connect(&admin_url).await.unwrap();
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&mut conn).await.unwrap();
     let (base, _) = admin_url.rsplit_once('/').unwrap();
-    let meta = Meta::open(&format!("{base}/{name}")).await.unwrap();
-    Some(Db { meta, _guard: Guard::Postgres { admin_url, name } })
+    let url = format!("{base}/{name}");
+    Some((url, Guard::Postgres { admin_url, name }))
+}
+
+async fn postgres() -> Option<Db> {
+    let (url, guard) = postgres_database().await?;
+    Some(Db { meta: Meta::open(&url).await.unwrap(), _guard: guard })
 }
 
 macro_rules! on_every_backend {
@@ -69,7 +76,12 @@ macro_rules! on_every_backend {
     };
 }
 
-on_every_backend!(users_and_devices, a_new_space_has_only_its_root, manifests_need_their_chunks_and_are_per_space,);
+on_every_backend!(
+    users_and_devices,
+    a_new_space_has_only_its_root,
+    manifests_need_their_chunks_and_are_per_space,
+    concurrent_signups_with_one_name_give_username_taken,
+);
 
 // ---- helpers ----
 
@@ -141,4 +153,64 @@ async fn manifests_need_their_chunks_and_are_per_space(meta: &Meta) {
     meta.add_manifest(ana.space, &m, 77, NOW).await.unwrap();
     assert!(meta.has_manifest(ana.space, &m.id()).await.unwrap());
     assert!(!meta.has_manifest(bob.space, &m.id()).await.unwrap());
+}
+
+async fn concurrent_signups_with_one_name_give_username_taken(meta: &Meta) {
+    let tasks: Vec<_> = (0..6)
+        .map(|_| {
+            let meta = meta.clone();
+            tokio::spawn(async move { meta.create_user("ana", "x", Role::Member, NOW).await })
+        })
+        .collect();
+    let mut created = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(_) => created += 1,
+            Err(MetaError::UsernameTaken) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+    assert_eq!(created, 1);
+}
+
+// ---- plain tests ----
+
+#[tokio::test]
+async fn in_memory_sqlite_works() {
+    let meta = Meta::open("sqlite::memory:").await.unwrap();
+    let ana = user(&meta, "ana").await;
+    assert_eq!(meta.user_by_name("ana").await.unwrap(), Some(ana));
+}
+
+#[tokio::test]
+async fn reopening_a_migrated_database_is_fine() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}", dir.path().join("meta.db").display());
+    let ana = {
+        let meta = Meta::open(&url).await.unwrap();
+        user(&meta, "ana").await
+    };
+    let meta = Meta::open(&url).await.unwrap();
+    assert_eq!(meta.user_by_name("ana").await.unwrap(), Some(ana));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_opens_migrate_once_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    let opens: Vec<_> = (0..4)
+        .map(|_| {
+            let url = url.clone();
+            tokio::spawn(async move { Meta::open(&url).await })
+        })
+        .collect();
+    for open in opens {
+        open.await.unwrap().unwrap();
+    }
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+    let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
+    assert_eq!(versions, 1);
 }

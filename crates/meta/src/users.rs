@@ -89,7 +89,13 @@ impl Meta {
             .bind(role.as_str())
             .bind(now_ms)
             .execute(&mut *w.tx)
-            .await?;
+            .await
+            // Two signups racing for one name can both pass the check above; the unique index turns the loser's
+            // insert into a unique violation, which is the same answer as the check.
+            .map_err(|e| match e {
+                sqlx::Error::Database(ref db) if db.is_unique_violation() => MetaError::UsernameTaken,
+                other => MetaError::Db(other),
+            })?;
         sqlx::query("INSERT INTO spaces (id, owner, epoch, seq, oldest_seq, root) VALUES ($1, $2, $3, 0, 0, $4)")
             .bind(uuid_bytes(space.as_uuid()))
             .bind(uuid_bytes(&user.0))

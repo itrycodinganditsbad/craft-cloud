@@ -73,6 +73,16 @@ fn node_state(row: &AnyRow) -> Result<NodeState, MetaError> {
 }
 
 impl Meta {
+    /// Starts a read transaction that sees one consistent snapshot. On Postgres the isolation level has to be
+    /// set as the transaction's first statement. SQLite read transactions are already snapshots.
+    async fn read_snapshot(&self) -> Result<sqlx::Transaction<'static, sqlx::Any>, MetaError> {
+        let mut tx = self.pool.begin().await?;
+        if self.dialect == crate::Dialect::Postgres {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY").execute(&mut *tx).await?;
+        }
+        Ok(tx)
+    }
+
     pub async fn space_info(&self, space: SpaceId) -> Result<SpaceInfo, MetaError> {
         let mut conn = self.pool.acquire().await?;
         space_info(&mut conn, space, false).await
@@ -81,7 +91,7 @@ impl Meta {
     /// Every live node, root included, parents before children is not guaranteed (sort by depth on the
     /// client). Read in one transaction, so the listing and its `seq` agree.
     pub async fn tree(&self, space: SpaceId) -> Result<ChangeSet, MetaError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.read_snapshot().await?;
         let info = space_info(&mut tx, space, false).await?;
         let rows = sqlx::query(TREE_SQL).bind(uuid_bytes(space.as_uuid())).fetch_all(&mut *tx).await?;
         let nodes = rows.iter().map(node_state).collect::<Result<_, _>>()?;
@@ -92,7 +102,7 @@ impl Meta {
     /// Nodes changed after `since`, deletions included. `ResyncRequired` when `since` is older than the
     /// oldest change still known, or newer than the space's current sequence (the server was restored).
     pub async fn changes(&self, space: SpaceId, since: u64) -> Result<ChangeSet, MetaError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.read_snapshot().await?;
         let info = space_info(&mut tx, space, false).await?;
         if since < info.oldest_seq || since > info.seq {
             return Err(MetaError::ResyncRequired);

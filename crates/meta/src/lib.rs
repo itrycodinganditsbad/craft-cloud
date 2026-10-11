@@ -81,8 +81,12 @@ impl Meta {
         };
         let options = AnyConnectOptions::from_str(&url)?.disable_statement_logging();
         let pool_options = match dialect {
-            // An in-memory SQLite database exists once per connection: keep exactly one.
-            Dialect::Sqlite if url.contains(":memory:") => AnyPoolOptions::new().max_connections(1),
+            // An in-memory SQLite database exists only as long as its one connection. sqlx closes idle and old
+            // connections by default, and a closed one takes the database with it: the next query would open
+            // a fresh, empty database. So keep exactly one connection, and never retire it.
+            Dialect::Sqlite if url.contains(":memory:") => {
+                AnyPoolOptions::new().max_connections(1).min_connections(1).idle_timeout(None).max_lifetime(None)
+            }
             Dialect::Sqlite => AnyPoolOptions::new().max_connections(8),
             Dialect::Postgres => AnyPoolOptions::new().max_connections(16),
         };
