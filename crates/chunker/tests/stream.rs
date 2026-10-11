@@ -113,6 +113,18 @@ fn an_insert_in_the_middle_only_changes_nearby_chunks() {
     assert!(new <= 3, "{new} of {} chunks changed", after.chunks.len());
 }
 
+#[test]
+fn a_delete_in_the_middle_only_changes_nearby_chunks() {
+    let c = Chunker::new(SMALL).unwrap();
+    let data = noise(200_000, 11);
+    let mut edited = data.clone();
+    edited.drain(100_000..100_019);
+    let before: std::collections::HashSet<[u8; 32]> = chunk_all(&c, &data).chunks.iter().map(|ch| ch.hash).collect();
+    let after = chunk_all(&c, &edited);
+    let new = after.chunks.iter().filter(|ch| !before.contains(&ch.hash)).count();
+    assert!(new <= 3, "{new} of {} chunks changed", after.chunks.len());
+}
+
 proptest! {
     #[test]
     fn any_input_is_cut_within_limits_and_reassembles(data in proptest::collection::vec(any::<u8>(), 0..6000), step in 1usize..2000) {

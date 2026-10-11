@@ -240,6 +240,16 @@ mod tests {
     }
 
     #[test]
+    fn the_largest_manifest_encodes_to_max_manifest_bytes() {
+        let name = ChunkerParamsId::new(&"a".repeat(32)).unwrap();
+        let count = MAX_CHUNKS_PER_MANIFEST as usize;
+        let chunks = vec![chunk(1, 256 * 1024); count];
+        let size = 256 * 1024 * u64::from(MAX_CHUNKS_PER_MANIFEST);
+        let bytes = Manifest::new(name, size, FileHash::from_bytes([0; 32]), chunks).unwrap().encode();
+        assert_eq!(bytes.len(), crate::limits::MAX_MANIFEST_BYTES);
+    }
+
+    #[test]
     fn decode_rejects_damage() {
         let bytes = sample().encode();
         assert_eq!(Manifest::decode(&bytes[..bytes.len() - 1]), Err(ManifestError::Truncated));
