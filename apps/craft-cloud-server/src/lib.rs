@@ -2,6 +2,7 @@
 //! (`craft-cloud-store`), plus the admin command line.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod api;
 pub mod auth;
 pub mod config;
 pub mod error;
@@ -9,4 +10,15 @@ pub mod notify;
 pub mod ratelimit;
 pub mod state;
 
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use tokio::net::TcpListener;
+
 pub use state::AppState;
+
+/// Serves the API on `listener` until `shutdown` resolves.
+pub async fn serve(state: AppState, listener: TcpListener, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> std::io::Result<()> {
+    let app = api::router(Arc::new(state));
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown).await
+}
