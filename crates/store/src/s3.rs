@@ -10,7 +10,7 @@ use object_store::{ObjectStoreExt, PutPayload};
 use crate::{Backend, StoreError};
 
 /// Where and how to reach the bucket. Credentials come from the server's config, never from clients.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S3Config {
     pub bucket: String,
     /// Key prefix inside the bucket, e.g. `craft-cloud`; empty for the bucket root.
@@ -22,6 +22,20 @@ pub struct S3Config {
     pub secret_access_key: String,
     /// Allow `http://` endpoints (local MinIO). Off for anything reachable from the internet.
     pub allow_http: bool,
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("allow_http", &self.allow_http)
+            .finish()
+    }
 }
 
 pub struct S3Backend {
@@ -73,5 +87,26 @@ impl Backend for S3Backend {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(backend_error(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::S3Config;
+
+    #[test]
+    fn debug_output_hides_the_secret_key() {
+        let config = S3Config {
+            bucket: "b".into(),
+            prefix: String::new(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            access_key_id: "AKIDEXAMPLE".into(),
+            secret_access_key: "super-secret-value".into(),
+            allow_http: false,
+        };
+        let shown = format!("{config:?}");
+        assert!(!shown.contains("super-secret-value"), "{shown}");
+        assert!(shown.contains("<redacted>") && shown.contains("AKIDEXAMPLE"));
     }
 }

@@ -770,6 +770,15 @@ async fn the_tree_and_the_feed_come_in_pages(meta: &Meta) {
 // ---- plain tests ----
 
 #[tokio::test]
+async fn user_records_do_not_print_their_password_hash() {
+    let meta = Meta::open("sqlite::memory:").await.unwrap();
+    let ana = meta.create_user("ana", "$argon2id$secret-hash", Role::Member, NOW).await.unwrap();
+    let shown = format!("{ana:?}");
+    assert!(!shown.contains("secret-hash"), "{shown}");
+    assert!(shown.contains("<redacted>") && shown.contains("ana"));
+}
+
+#[tokio::test]
 async fn in_memory_sqlite_works() {
     let meta = Meta::open("sqlite::memory:").await.unwrap();
     let ana = user(&meta, "ana").await;

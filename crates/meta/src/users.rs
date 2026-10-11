@@ -36,13 +36,25 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UserRecord {
     pub id: UserId,
     pub username: String,
     pub password_hash: String,
     pub role: Role,
     pub space: SpaceId,
+}
+
+impl std::fmt::Debug for UserRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserRecord")
+            .field("id", &self.id)
+            .field("username", &self.username)
+            .field("password_hash", &"<redacted>")
+            .field("role", &self.role)
+            .field("space", &self.space)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
