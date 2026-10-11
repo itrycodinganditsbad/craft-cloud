@@ -5,8 +5,9 @@
 //! stores the same data: they upload it again, and the server just doesn't keep a second copy.
 
 use craft_cloud_proto::{ChunkId, Manifest, ManifestId, SpaceId};
+use sqlx::Row;
 
-use crate::codec::{to_i64, uuid_bytes};
+use crate::codec::{to_i64, to_u64, uuid_bytes};
 use crate::{Meta, MetaError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +61,22 @@ async fn record(
     Ok(())
 }
 
+/// The file size recorded for a manifest this space has, if it has it.
+pub(crate) async fn manifest_file_size(tx: &mut sqlx::AnyConnection, space: SpaceId, id: &ManifestId) -> Result<Option<u64>, MetaError> {
+    let row = sqlx::query("SELECT b.file_size FROM space_blobs sb JOIN blobs b ON b.kind = sb.kind AND b.id = sb.id WHERE sb.space_id = $1 AND sb.kind = $2 AND sb.id = $3")
+        .bind(uuid_bytes(space.as_uuid()))
+        .bind(BlobKind::Manifest.code())
+        .bind(id.as_bytes().to_vec())
+        .fetch_optional(&mut *tx)
+        .await?;
+    match row {
+        None => Ok(None),
+        Some(row) => {
+            let size: Option<i64> = row.try_get("file_size")?;
+            Ok(Some(to_u64(size.ok_or(MetaError::Corrupt("a manifest has no file size"))?)?))
+        }
+    }
+}
 impl Meta {
     /// Of `ids`, the chunks this space doesn't have yet, in the order given (duplicates once).
     pub async fn missing_chunks(&self, space: SpaceId, ids: &[ChunkId]) -> Result<Vec<ChunkId>, MetaError> {

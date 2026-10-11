@@ -8,7 +8,7 @@
 
 mod blobs;
 mod codec;
-// mod commit;
+mod commit;
 mod schema;
 mod tree;
 mod users;
@@ -22,7 +22,7 @@ use sqlx::{AnyPool, ConnectOptions};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub use blobs::BlobKind;
-// pub use commit::CommitOutcome;
+pub use commit::CommitOutcome;
 pub use tree::SpaceInfo;
 pub use users::{DeviceAuth, DeviceRecord, Role, UserId, UserRecord};
 
