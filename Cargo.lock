@@ -152,6 +152,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-cloud-chunker"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "craft-cloud-proto"
 version = "0.0.1"
 dependencies = [

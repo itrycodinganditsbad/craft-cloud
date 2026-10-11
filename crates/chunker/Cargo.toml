@@ -1,0 +1,18 @@
+[package]
+name = "craft-cloud-chunker"
+description = "Content-defined chunking (FastCDC) with fixed, named parameters and BLAKE3 hashes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+blake3.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
