@@ -104,7 +104,13 @@ impl Meta {
             Dialect::Sqlite => Some(self.write_lock.clone().lock_owned().await),
             Dialect::Postgres => None,
         };
-        Ok(WriteTx { tx: self.pool.begin().await?, _guard: guard })
+        // SQLite: take the write lock up front, so a transaction never starts as a reader and then fails to
+        // upgrade ("database is locked") when another connection has written in between.
+        let tx = match self.dialect {
+            Dialect::Sqlite => self.pool.begin_with("BEGIN IMMEDIATE").await?,
+            Dialect::Postgres => self.pool.begin().await?,
+        };
+        Ok(WriteTx { tx, _guard: guard })
     }
 }
 
