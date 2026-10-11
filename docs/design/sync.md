@@ -100,14 +100,18 @@ can point into the synced folder, and saves are atomic.
   the context `craft-cloud 2026-10-11 fastcdc-v1 gear table`, masks on the top hash bits (21 before the
   average, 19 after), min 256 KiB, avg 1 MiB, max 4 MiB, normalisation level 1. Every version records its parameter set. Changing parameters means a new
   name, never an edit, so old versions stay readable and dedup within a parameter set stays intact.
-- **Change log**: every operation in a space gets the next sequence number. The server keeps the log for a
-  configurable window (default 90 days); asking for changes older than that returns `resync_required`,
-  and the client does a full listing.
+- **Change feed**: every commit gives the space its next sequence number, and every node it touches records
+  that number (`changed_seq`). Deleted nodes stay as tombstones, so "what changed since N" is one indexed
+  query that reports deletions too, with no separate log to grow. When tombstones are purged (M4), the space's
+  `oldest_seq` moves up; asking for changes older than that, or newer than the current sequence (the server
+  was restored), returns `resync_required` and the client does a full listing.
+- **Depth**: folders nest at most 256 levels below the root. A mkdir or folder move deeper than that is refused
+  (`too_deep`); files may sit in the deepest folder. Ancestor checks are one bounded recursive query, so the
+  cost of an operation doesn't grow with the tree.
 - **Names** are NFC-normalised. The server rejects anything that can't exist on every supported OS:
   `/`, `\`, NUL, `<>:"|?*`, control characters, trailing dot or space, Windows reserved names (`CON`, `NUL`,
   `COM1`…), over 255 UTF-8 bytes. **Uniqueness inside a directory is by Unicode full case folding + NFC**,
-  so `Foo.psd` and `foo.psd` can't both exist (they couldn't on Windows or macOS anyway). Fold keys are computed with a pinned Unicode version, stored with
-  it, and recomputed by the server after an upgrade that changes it.
+  so `Foo.psd` and `foo.psd` can't both exist (they couldn't on Windows or macOS anyway).
 
 ## Filesystem semantics
 
@@ -224,10 +228,11 @@ agent's own `.craft-cloud/` folder. A `.craftignore` file adds patterns.
 - **Metadata: SQLite or Postgres**, chosen in the config. Both sit behind the `MetaStore` trait and run the
   same test suite. sqlx (MIT/Apache) with **one migration directory per backend**; no query relies on one
   dialect's quirks without a test on both.
-  - SQLite (default, solo and small studios): WAL mode, `busy_timeout` set, **one writer task** that every
-    write goes through; reads use a small pool.
-  - Postgres (bigger studios, or when the admin already runs one): a normal pool; commit runs in one
-    transaction that locks the affected node rows (`SELECT … FOR UPDATE`) so compare-and-swap holds under
+  - SQLite (default, solo and small studios): WAL mode, `busy_timeout` set, **one write transaction at a
+    time** (a single async lock around every write); reads use a small pool.
+  - Postgres (bigger studios, or when the admin already runs one): a normal pool; a commit runs in one
+    transaction that first locks its space's row (`SELECT … FOR UPDATE`), so commits to one space run one at
+    a time and compare-and-swap holds under
     concurrency; serialization failures are retried.
   - Chunk I/O never happens inside a DB transaction, on either backend.
 - **Chunks: local disk or S3-compatible**, chosen in the config, both through `object_store` (Apache-2.0).
@@ -330,8 +335,9 @@ API sketch (`/api/v1`, JSON except chunk bodies; every response carries `epoch`)
   uniqueness matches expectations for tricky cases (`ß`/`SS`, Turkish dotted I, combining accents).
 - **Server**: integration tests against an in-process server, **run once per backend combination**
   (SQLite + disk always; Postgres and S3 in CI through service containers, locally when
-  `CRAFT_CLOUD_TEST_PG` / `CRAFT_CLOUD_TEST_S3` are set). MinIO is AGPL, so it is only an external test
-  service, never linked or copied. Cases: auth, quota, batch commit
+  `CRAFT_CLOUD_TEST_PG` / `CRAFT_CLOUD_TEST_S3_*` are set; CI sets `CRAFT_CLOUD_REQUIRE_BACKENDS` so a
+  missing backend fails instead of skipping). The S3 test server is SeaweedFS (Apache-2.0), run as a
+  container, never linked. Cases: auth, quota, batch commit
   atomicity, `missing_chunks`, GC never removes a referenced or protected chunk while commits run,
   thinning, `backup` + `restore` gives the same state with a new epoch, `resync_required`.
 - **Deterministic simulation** of the sync engine: several agents and the server in one process with a
@@ -353,7 +359,7 @@ API sketch (`/api/v1`, JSON except chunk bodies; every response carries `epoch`)
 | # | Milestone | Status |
 |---|---|---|
 | M0 | Repo, conventions, CI | DONE (2026-10-11) |
-| M1 | `proto` + `chunker` (names, IDs, `fastcdc-v1` with golden vectors) | TODO |
+| M1 | `proto` + `chunker` (names, IDs, `fastcdc-v1` with golden vectors) | DONE (2026-10-11, PR #1) |
 | M2 | Server core: info, auth, devices, chunks, batch commit, changes, tree, epoch; SQLite + Postgres, disk + S3 | TODO |
 | M3 | Sync engine on `Fs`/`Transport` + simulation harness + agent CLI; two machines sync a folder | TODO |
 | M4 | History, restore, trash, thinning, GC, admin CLI, backup/restore | TODO |
