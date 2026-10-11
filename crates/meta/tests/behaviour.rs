@@ -104,6 +104,7 @@ on_every_backend!(
     a_failed_restore_walk_is_not_repeated_for_every_operation,
     big_manifests_are_checked_in_batches,
     the_tree_and_the_feed_come_in_pages,
+    usernames_are_unique_ignoring_ascii_case,
 );
 
 // ---- helpers ----
@@ -765,6 +766,14 @@ async fn the_tree_and_the_feed_come_in_pages(meta: &Meta) {
         assert!(matches!(meta.tree(u.space, None, bad).await, Err(MetaError::Invalid(_))));
         assert!(matches!(meta.changes(u.space, 0, None, bad).await, Err(MetaError::Invalid(_))));
     }
+}
+
+async fn usernames_are_unique_ignoring_ascii_case(meta: &Meta) {
+    let ana = user(meta, "Ana").await;
+    assert_eq!(ana.username, "ana");
+    assert!(matches!(meta.create_user("ana", "x", Role::Member, NOW).await, Err(MetaError::UsernameTaken)));
+    assert!(matches!(meta.create_user("ANA", "x", Role::Member, NOW).await, Err(MetaError::UsernameTaken)));
+    assert_eq!(meta.user_by_name("ANA").await.unwrap(), Some(ana));
 }
 
 // ---- plain tests ----

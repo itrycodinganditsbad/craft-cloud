@@ -75,7 +75,8 @@ pub struct DeviceAuth {
     pub space: SpaceId,
 }
 
-/// Usernames: 1–64 bytes of ASCII letters, digits, `.`, `_`, `-`; compared exactly.
+/// Usernames: 1–64 bytes of ASCII letters, digits, `.`, `_`, `-`. They are stored in lowercase, so names that differ
+/// only in ASCII case are the same name.
 fn valid_username(name: &str) -> bool {
     (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
@@ -86,6 +87,8 @@ impl Meta {
         if !valid_username(username) {
             return Err(MetaError::Invalid("usernames are 1-64 letters, digits, '.', '_' or '-'"));
         }
+        let username = username.to_ascii_lowercase();
+        let username = username.as_str();
         let user = UserId(Uuid::now_v7());
         let space = SpaceId::generate();
         let root = NodeId::generate();
@@ -128,10 +131,11 @@ impl Meta {
     }
 
     pub async fn user_by_name(&self, username: &str) -> Result<Option<UserRecord>, MetaError> {
+        let username = username.to_ascii_lowercase();
         let row = sqlx::query(
             "SELECT u.id, u.username, u.password_hash, u.role, s.id AS space FROM users u JOIN spaces s ON s.owner = u.id WHERE u.username = $1",
         )
-        .bind(username)
+        .bind(username.as_str())
         .fetch_optional(&self.pool)
         .await?;
         let Some(row) = row else { return Ok(None) };
