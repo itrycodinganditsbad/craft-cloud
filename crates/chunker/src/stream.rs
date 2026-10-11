@@ -32,7 +32,7 @@ pub struct Summary {
 
 /// Reads `reader` to the end, cutting it with `chunker` and calling `on_chunk` for every chunk in order.
 ///
-/// Holds at most two maximum-size chunks in memory. The boundaries are the same however the reader
+/// Holds at most one maximum-size chunk (`max` bytes) in memory. The boundaries are the same however the reader
 /// splits its reads (short reads and `Interrupted` are handled). Stops at the first error from the reader
 /// or the callback.
 pub fn chunk_reader<R, E, F>(chunker: &Chunker, mut reader: R, mut on_chunk: F) -> Result<Summary, E>
@@ -42,7 +42,7 @@ where
     F: FnMut(Chunk<'_>) -> Result<(), E>,
 {
     let max = chunker.params().max;
-    let mut buf: Vec<u8> = Vec::with_capacity(max.saturating_mul(2));
+    let mut buf: Vec<u8> = Vec::with_capacity(max);
     let mut file_hasher = blake3::Hasher::new();
     let mut chunks = Vec::new();
     let mut offset: u64 = 0;
@@ -68,27 +68,27 @@ where
 }
 
 /// Reads until `buf` holds `want` bytes or the reader ends. Returns whether it ended.
+///
+/// The spare area is zeroed once per call, not once per `read`; `buf` is cut back to the bytes actually read
+/// on every exit.
 fn fill<R: Read>(reader: &mut R, buf: &mut Vec<u8>, want: usize) -> io::Result<bool> {
-    while buf.len() < want {
-        let old = buf.len();
-        buf.resize(want, 0);
-        let Some(spare) = buf.get_mut(old..) else {
-            buf.truncate(old);
-            return Err(io::Error::other("chunk buffer"));
+    let mut filled = buf.len();
+    if filled >= want {
+        return Ok(false);
+    }
+    buf.resize(want, 0);
+    let result = loop {
+        let Some(spare) = buf.get_mut(filled..).filter(|spare| !spare.is_empty()) else {
+            break Ok(false);
         };
         let spare_len = spare.len();
         match reader.read(spare) {
-            Ok(0) => {
-                buf.truncate(old);
-                return Ok(true);
-            }
-            Ok(n) => buf.truncate(old.saturating_add(n.min(spare_len))),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => buf.truncate(old),
-            Err(e) => {
-                buf.truncate(old);
-                return Err(e);
-            }
+            Ok(0) => break Ok(true),
+            Ok(n) => filled = filled.saturating_add(n.min(spare_len)),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => break Err(e),
         }
-    }
-    Ok(false)
+    };
+    buf.truncate(filled);
+    result
 }
