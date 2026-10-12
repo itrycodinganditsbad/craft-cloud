@@ -825,6 +825,34 @@ async fn the_same_rename_and_edit_on_both_sides_makes_no_conflict_copy() {
     }
 }
 
+/// The laptop deletes `a.txt`, renames `b.txt` to `a.txt` and edits it. The desktop deleted `b.txt` and saved the
+/// same final text over its `a.txt`. The server's edit wins over the local delete, and finds its content already
+/// in the old `a.txt` (a node the server deleted): that file is adopted, not kept as a copy.
+#[tokio::test]
+async fn an_edit_that_wins_adopts_a_deleted_occupant_holding_its_content() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "a.txt", b"old a");
+    write(&mut a, "b.txt", b"old b");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().remove_file(&path("a.txt")).unwrap();
+    a.sync_once().await.unwrap();
+    a.fs_mut().rename(&path("b.txt"), &path("a.txt")).unwrap();
+    a.sync_once().await.unwrap();
+    write(&mut a, "a.txt", b"final");
+    a.sync_once().await.unwrap();
+    b.fs_mut().remove_file(&path("b.txt")).unwrap();
+    write(&mut b, "a.txt", b"final");
+    let report = b.sync_once().await.unwrap();
+    assert!(report.conflict_copies.is_empty() && report.downloaded.is_empty(), "{report:?}");
+    settle(&mut [&mut a, &mut b], 5).await;
+    for m in [&a, &b] {
+        assert_eq!(files(m), vec![("a.txt".to_owned(), b"final".to_vec())]);
+    }
+}
+
 /// A clip replaced by a link, then its folder renamed: the link moved with the folder, so the clip is still not
 /// gone. The folder's move goes up, the clip's node stays, and once the clip is real again it syncs where it is.
 #[tokio::test]
