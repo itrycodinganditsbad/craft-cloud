@@ -600,6 +600,12 @@ async fn the_token_is_never_synced() {
     let refused = cli::login(&a.data, &login_args(&server, &inside, "pc"), PASSWORD, &mut Vec::new()).await.unwrap_err();
     assert!(matches!(refused, AgentError::DataInFolder { .. }), "{refused:?}");
     assert_eq!(a.data.load_account().unwrap(), None);
+    // A `..` after a folder that doesn't exist yet, stepping back into the data folder.
+    let data_name = a.data.path().file_name().unwrap();
+    let sneaky = parent.join("not-made-yet").join("..").join(data_name).join("Craft Cloud");
+    let refused = cli::login(&a.data, &login_args(&server, &sneaky, "pc"), PASSWORD, &mut Vec::new()).await.unwrap_err();
+    assert!(matches!(refused, AgentError::DataInFolder { .. }), "{refused:?}");
+    assert_eq!(a.data.load_account().unwrap(), None);
 
     // An account edited by hand into such a layout stops the pass before anything is read.
     let b = Agent::signed_in(&server, "desktop").await;
@@ -838,37 +844,6 @@ async fn status_lists_the_skipped_files() {
     assert!(status.contains("skipped:") && status.contains("Footage"), "{status}");
 }
 
-/// A landing a crash cut short that can't be put right yet fails the pass (exit 1, retried), naming the file,
-/// instead of letting a scan take the moved file for a new one and the missing one for deleted. Once it can be put
-/// right, the next pass does that first and syncs as usual.
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_landing_that_cant_be_put_right_fails_the_pass_until_it_can() {
-    use std::os::unix::fs::PermissionsExt;
-    let server = server().await;
-    let a = Agent::signed_in(&server, "desktop").await;
-    a.write("Locked/a.txt", "the user's");
-    assert_eq!(a.sync().await, Exit::Done);
-    // A crash right after the file was moved aside, in a folder that may not be written now.
-    std::fs::rename(a.path("Locked/a.txt"), a.path("Locked/a.txt.1.cc-aside")).unwrap();
-    let record = r#"{"target":"Locked/a.txt","aside":"a.txt.1.cc-aside",
-        "expected":{"size":10,"mtime_ms":0,"exec":false,"id":null},"incoming":{"size":3,"mtime_ms":0,"exec":false,"id":null}}"#;
-    std::fs::create_dir_all(a.path(".craft-cloud/tmp")).unwrap();
-    std::fs::write(a.path(".craft-cloud/tmp/0123.landing"), record).unwrap();
-    std::fs::set_permissions(a.path("Locked"), std::fs::Permissions::from_mode(0o555)).unwrap();
-    if std::fs::write(a.path("Locked/probe"), "").is_ok() {
-        // Permissions don't hold for this user (root): nothing to show here.
-        return;
-    }
-    let failed = a.try_sync(false).await.unwrap_err();
-    assert_eq!(failed.exit(), Exit::Failed);
-    assert!(failed.to_string().contains("Locked/a.txt"), "{failed}");
-    std::fs::set_permissions(a.path("Locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(a.sync().await, Exit::Done);
-    assert_eq!(a.files(), ["Locked/a.txt"]);
-    assert_eq!(a.read("Locked/a.txt").as_deref(), Some("the user's"));
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_damaged_state_file_stops_the_agent() {
     let server = server().await;
@@ -879,4 +854,43 @@ async fn a_damaged_state_file_stops_the_agent() {
     assert!(matches!(stopped, AgentError::Account(_)), "{stopped:?}");
     assert_eq!(stopped.exit(), Exit::NeedsYou);
     assert!(stopped.to_string().contains("move it away"), "{stopped}");
+}
+
+/// A file that can't be replaced when the server's edit arrives (on Windows: an app holds it open; here: its folder
+/// may not be written): the pass skips it as in use and keeps the download, and a later pass lands the kept file.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_download_that_cant_land_is_kept_and_lands_later() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = server().await;
+    let a = Agent::signed_in(&server, "laptop").await;
+    let b = Agent::signed_in(&server, "desktop").await;
+    a.write("docs/notes.txt", "v1");
+    assert_eq!(a.sync().await, Exit::Done);
+    assert_eq!(b.sync().await, Exit::Done);
+    a.write("docs/notes.txt", "v2, from the laptop");
+    assert_eq!(a.sync().await, Exit::Done);
+
+    let folder = b.path("docs");
+    let set_mode = |mode: u32| std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(mode)).unwrap();
+    set_mode(0o555);
+    if std::fs::write(folder.join("probe"), b"").is_ok() {
+        // Permissions don't hold for this user (root): nothing to show here.
+        set_mode(0o755);
+        return;
+    }
+    let kept = || {
+        std::fs::read_dir(b.path(".craft-cloud/tmp")).unwrap().filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "kept")).count()
+    };
+    let (exit, summary) = b.try_sync(false).await.unwrap();
+    assert_eq!(exit, Exit::Done);
+    assert!(summary.skipped.iter().any(|(p, why)| p == "docs/notes.txt" && why.contains("no permission") && why.contains("kept")), "{summary:?}");
+    assert_eq!(b.read("docs/notes.txt").as_deref(), Some("v1"));
+    assert_eq!(kept(), 1);
+    set_mode(0o755);
+    let (_, summary) = b.try_sync(false).await.unwrap();
+    assert_eq!(summary.downloaded, 1, "{summary:?}");
+    assert_eq!(b.read("docs/notes.txt").as_deref(), Some("v2, from the laptop"));
+    assert_eq!(kept(), 0);
+    assert_eq!(b.files(), a.files());
 }
