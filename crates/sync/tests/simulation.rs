@@ -123,6 +123,20 @@ fn is_case_clash(reason: &str) -> bool {
 /// was made with. An edit of the copy (or a later copy at the same path) is checked again.
 type Exempt = (usize, RelPath, FileHash);
 
+/// The path a conflict copy was made from: `a (conflict, m0, 2026-10-11 14-03).txt` → `a.txt` in the same folder
+/// (the last conflict mark, for a copy of a copy). `None` for a name that isn't a conflict copy.
+fn original_of(copy: &RelPath) -> Option<RelPath> {
+    let (parent, name) = (copy.parent()?, copy.file_name()?.as_str());
+    let start = name.rfind(" (conflict, ")?;
+    let end = start + name.get(start..)?.find(')')? + 1;
+    Some(rel(&format!("{parent}/{}{}", name.get(..start)?, name.get(end..)?)))
+}
+
+/// The files on `m` that can't be read now (another program holds them locked).
+fn unreadable(m: &Machine) -> BTreeSet<RelPath> {
+    files_of(m).into_iter().filter(|p| m.fs().read(p).is_err()).collect()
+}
+
 /// After a user's rename of `from` to `to`, exempt copies at or below `from` are found at `to` (on every machine,
 /// once it syncs), with the same content.
 fn follow_rename(exempt: &mut BTreeSet<Exempt>, from: &RelPath, to: &RelPath) {
@@ -257,8 +271,14 @@ async fn run(seed: u64, steps: usize) {
     // answer (nothing is lost), so exactly those copies (by machine, path and the content they were made with) are
     // exempt from the needless-copy check below; every other check still holds, for every file. Keyed by content
     // too, so a later copy at the same path, or an edit of the copy, is checked again.
+    //
+    // Copies made while the original couldn't be read (another program held it locked) are exempt the same way:
+    // a file that can't be read never counts as unchanged, so a new server version of it always keeps the local
+    // file as a copy. That copy only holds the same content as the new version when the server got the same
+    // content twice, which takes a crash (a recovering machine uploads a file whose new version the crashed pass
+    // had already committed, as an Update), and it may land on any machine where the file is locked then.
     let mut recovering: Vec<u32> = vec![0; ms.len()];
-    let mut after_crash: BTreeSet<Exempt> = BTreeSet::new();
+    let mut exempt: BTreeSet<Exempt> = BTreeSet::new();
     // Contents a recovering machine uploaded as new files: files it no longer recognised as tracked (the crash lost
     // that bookkeeping) go up as new nodes, so the server holds the same content twice, and another machine may
     // later keep a copy of one in the other's way. Copies of exactly that content are exempt too, and only content
@@ -296,13 +316,19 @@ async fn run(seed: u64, steps: usize) {
                 m.approve_deletes();
             }
             let before = files_of(m);
+            let locked_before = unreadable(m);
             let tracked_before = m.state().base_index();
             let r = m.sync_once().await;
             if std::env::var("SIM_TRACE").is_ok() {
                 eprintln!("TRACE step {step} m{i} sync: {r:?}\n  files {}\n  dirs {:?}", listing(m), m.fs().dirs());
             }
+            let was_recovering = recovering.get(i).is_some_and(|left| *left > 0);
+            for (p, hash) in new_copies(&before, m) {
+                if was_recovering || original_of(&p).is_some_and(|o| locked_before.contains(&o)) {
+                    exempt.insert((i, p, hash));
+                }
+            }
             if let Some(left) = recovering.get_mut(i).filter(|left| **left > 0) {
-                after_crash.extend(new_copies(&before, m).into_iter().map(|(p, hash)| (i, p, hash)));
                 if let Ok(report) = &r {
                     let left_behind = at_crash.get(i).cloned().unwrap_or_default();
                     reuploaded.extend(new_uploads(report, &tracked_before, m).into_iter().filter(|h| left_behind.contains(h)));
@@ -351,7 +377,7 @@ async fn run(seed: u64, steps: usize) {
                 }
             }
         } else {
-            act(&mut rng, m, &mut destroyed, &mut after_crash);
+            act(&mut rng, m, &mut destroyed, &mut exempt);
             if std::env::var("SIM_TRACE").is_ok() {
                 eprintln!("TRACE step {step} m{i} act\n  files {}\n  dirs {:?}", listing(m), m.fs().dirs());
             }
@@ -375,7 +401,7 @@ async fn run(seed: u64, steps: usize) {
             let tracked_before = m.state().base_index();
             let report = m.sync_once().await.unwrap_or_else(|e| panic!("seed {seed}: {e}"));
             if let Some(left) = recovering.get_mut(i).filter(|left| **left > 0) {
-                after_crash.extend(new_copies(&before, m).into_iter().map(|(p, hash)| (i, p, hash)));
+                exempt.extend(new_copies(&before, m).into_iter().map(|(p, hash)| (i, p, hash)));
                 let left_behind = at_crash.get(i).cloned().unwrap_or_default();
                 reuploaded.extend(new_uploads(&report, &tracked_before, m).into_iter().filter(|h| left_behind.contains(h)));
                 *left = if settled(&report) { 0 } else { *left - 1 };
@@ -429,23 +455,19 @@ async fn run(seed: u64, steps: usize) {
     for (i, m) in ms.iter().enumerate() {
         let all = m.fs().files();
         for (p, data) in &all {
-            let (Some(parent), Some(name)) = (p.parent(), p.file_name().map(|n| n.as_str())) else { continue };
-            let Some(start) = name.rfind(" (conflict, ") else { continue };
+            let (Some(name), Some(original)) = (p.file_name().map(|n| n.as_str()), original_of(p)) else { continue };
             let hash = FileHash::from_bytes(*blake3::hash(data).as_bytes());
-            // A copy a recovering machine made (its device name is in the copy's name) at this very path, still
-            // holding the content it was made with.
-            if (0..ms.len()).any(|j| name.contains(&format!("(conflict, m{j},")) && after_crash.contains(&(j, p.clone(), hash))) {
+            // An exempt copy (its device name is in the copy's name) at this very path, still holding the content
+            // it was made with.
+            if (0..ms.len()).any(|j| name.contains(&format!("(conflict, m{j},")) && exempt.contains(&(j, p.clone(), hash))) {
                 continue;
             }
             if reuploaded.contains(&hash) {
                 continue;
             }
-            let Some(end) = name.get(start..).and_then(|rest| rest.find(')')).map(|e| start + e + 1) else { continue };
-            let original = format!("{}{}", name.get(..start).unwrap_or(""), name.get(end..).unwrap_or(""));
-            if NAMES.iter().filter(|n| n.eq_ignore_ascii_case(&original)).count() > 1 {
+            if original.file_name().is_some_and(|o| NAMES.iter().filter(|n| n.eq_ignore_ascii_case(o.as_str())).count() > 1) {
                 continue;
             }
-            let original = rel(&format!("{parent}/{original}"));
             assert!(all.get(&original) != Some(data), "seed {seed}: machine {i} has a conflict copy {p} of unchanged {original}");
         }
     }
