@@ -10,6 +10,9 @@
 //!   so the rename is atomic), is flushed to disk, gets the replaced file's permissions (Unix), its modification
 //!   time and executable bit, and is then renamed over the target. Any error, or a writer dropped without
 //!   [`Fs::finish_write`], removes the temporary file.
+//! - **In-flight downloads are private (Unix).** `.craft-cloud/` and `tmp/` are created with mode 0700 when the
+//!   agent makes them, so other users can't read a partly downloaded file. (Folders that already exist keep their
+//!   mode.) Windows folders get the default ACL of the synced folder.
 //! - **Renames never replace.** On Linux and macOS the OS's no-replace rename (`renameat2(RENAME_NOREPLACE)`,
 //!   `renameatx_np(RENAME_EXCL)`) does it atomically. Elsewhere (Windows), and on filesystems that refuse the
 //!   flag, the target is checked right before a plain rename: a file another program creates at the target in
@@ -287,6 +290,18 @@ fn set_mode(_file: &File, _replaced: Option<&Metadata>, _exec: bool) -> io::Resu
     Ok(())
 }
 
+/// Makes the folder `dir`, owner-only (0700) on Unix, so a download in flight can't be read by other users. A folder
+/// that already exists keeps its mode.
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
 /// A new temporary file. Unix gives it the usual `0666 & !umask` mode, like any file an app creates.
 fn create_temp(dir: &Path) -> io::Result<(File, PathBuf)> {
     let mut options = OpenOptions::new();
@@ -354,7 +369,7 @@ impl DiskFs {
             match Self::lstat(&dir)? {
                 Some(md) if md.file_type().is_dir() => {}
                 Some(_) => return Err(io::Error::other(format!("{} is not a real folder (a link?); nothing is written through it", dir.display()))),
-                None if create => fs::create_dir(&dir)?,
+                None if create => create_private_dir(&dir)?,
                 None => return Ok(None),
             }
         }

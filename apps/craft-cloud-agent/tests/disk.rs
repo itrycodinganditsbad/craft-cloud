@@ -254,3 +254,16 @@ fn a_root_that_is_a_link_is_a_folder() {
     // A missing root is nothing, not an error.
     assert_eq!(DiskFs::new(holder.path().join("gone")).stat(&rel("")).unwrap(), None);
 }
+
+#[cfg(unix)]
+#[test]
+fn the_agent_folders_a_download_lands_in_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut fs = DiskFs::new(dir.path());
+    let mut writer = fs.begin_write(&rel("a")).unwrap();
+    writer.write_all(b"partial").unwrap();
+    for path in [dir.path().join(".craft-cloud"), fs.tmp_dir()] {
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700, "{}", path.display());
+    }
+}
