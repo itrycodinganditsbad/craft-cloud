@@ -218,10 +218,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         }
         // Deletes, files first then folders deepest first, unless the guard holds them back.
         let synced_files = self.state.base.values().filter(|e| matches!(e.kind, BaseKind::File { .. })).count();
-        let n = missing_files.len();
-        let too_many =
-            n > self.config.mass_delete_files || (n >= self.config.mass_delete_floor && n * 100 > synced_files * self.config.mass_delete_percent);
-        if too_many && !self.approved_deletes {
+        if self.config.too_many_deletes(missing_files.len(), synced_files) && !self.approved_deletes {
             report.pending_deletes.extend(missing_files.iter().map(|(_, p)| p.clone()));
         } else {
             for (id, path) in &missing_files {

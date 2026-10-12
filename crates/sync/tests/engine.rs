@@ -135,8 +135,42 @@ async fn mass_deletes_wait_for_approval() {
     a.approve_deletes();
     let report = a.sync_once().await.unwrap();
     assert_eq!(report.removed_remotely.len(), 20);
+    // The desktop asks too before it removes them.
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(b.fs().files().len(), 21);
+    b.approve_deletes();
     settle(&mut [&mut a, &mut b], 5).await;
     assert_eq!(files(&b), vec![("keep.txt".to_owned(), b"k".to_vec())]);
+}
+
+#[tokio::test]
+async fn mass_deletes_from_the_server_wait_for_approval_here_too() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    for i in 0..30 {
+        write(&mut a, &format!("f{i}.txt"), format!("file {i}").as_bytes());
+    }
+    settle(&mut [&mut a, &mut b], 5).await;
+    for i in 0..30 {
+        a.fs_mut().remove_file(&path(&format!("f{i}.txt"))).unwrap();
+    }
+    a.approve_deletes();
+    assert_eq!(a.sync_once().await.unwrap().removed_remotely.len(), 30);
+    // The desktop holds the removals back and asks; nothing goes back up meanwhile.
+    for _ in 0..2 {
+        let report = b.sync_once().await.unwrap();
+        assert!(report.removed_locally.is_empty() && report.uploaded.is_empty(), "{report:?}");
+        assert_eq!(report.pending_local_deletes.len(), 30);
+        assert!(report.pending_deletes.is_empty());
+    }
+    assert_eq!(b.fs().files().len(), 30);
+    b.approve_deletes();
+    let report = b.sync_once().await.unwrap();
+    assert_eq!(report.removed_locally.len(), 30);
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert!(files(&b).is_empty() && files(&a).is_empty());
 }
 
 #[tokio::test]

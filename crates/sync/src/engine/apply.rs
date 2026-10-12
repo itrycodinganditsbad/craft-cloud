@@ -41,7 +41,29 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             .map(|(id, e)| (matches!(e.kind, BaseKind::Dir { .. }), self.state.base_path(*id).map_or(0, |p| p.depth()), *id))
             .collect();
         gone.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        // The mass-delete guard, this direction: too many tracked files to remove here wait for approval. They
+        // stay on disk and in the base, unchanged, so nothing goes back up; their folders stay with them.
+        let removable: Vec<(NodeId, RelPath)> = gone
+            .iter()
+            .filter(|(is_dir, _, _)| !is_dir)
+            .filter_map(|(_, _, id)| {
+                let path = self.state.base_path(*id)?;
+                let local = self.local_state(self.state.base.get(id)?, &path).ok()?;
+                (local == Local::Unchanged).then_some((*id, path))
+            })
+            .collect();
+        let synced_files = self.state.base.values().filter(|e| matches!(e.kind, BaseKind::File { .. })).count();
+        let mut held: BTreeSet<NodeId> = BTreeSet::new();
+        if self.config.too_many_deletes(removable.len(), synced_files) && !self.approved_deletes {
+            for (id, path) in removable {
+                held.insert(id);
+                report.pending_local_deletes.push(path);
+            }
+        }
         for (_, _, id) in gone {
+            if held.contains(&id) {
+                continue;
+            }
             let result = self.apply_deleted(id, report);
             per_node(result, report)?;
         }

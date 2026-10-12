@@ -98,6 +98,11 @@ impl Config {
         }
     }
 
+    /// Whether deleting `n` files out of `synced` in one pass (either direction) needs approval.
+    fn too_many_deletes(&self, n: usize, synced: usize) -> bool {
+        n > self.mass_delete_files || (n >= self.mass_delete_floor && n.saturating_mul(100) > synced.saturating_mul(self.mass_delete_percent))
+    }
+
     fn ignored(&self, name: &str) -> bool {
         self.ignore.iter().any(|pattern| {
             if let Some(prefix) = pattern.strip_suffix('*') {
@@ -124,8 +129,11 @@ pub struct Report {
     pub conflict_copies: Vec<RelPath>,
     /// Local entries that can't sync, with the reason.
     pub skipped: Vec<(String, String)>,
-    /// Deletions held back by the mass-delete guard until [`Engine::approve_deletes`].
+    /// Deletions on the server held back by the mass-delete guard until [`Engine::approve_deletes`].
     pub pending_deletes: Vec<RelPath>,
+    /// Files the server deleted whose removal here the mass-delete guard holds back until
+    /// [`Engine::approve_deletes`]. They stay on disk and tracked.
+    pub pending_local_deletes: Vec<RelPath>,
     /// Operations the server refused this pass; they are retried next pass.
     pub refused: Vec<Conflict>,
 }

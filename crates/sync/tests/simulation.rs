@@ -240,7 +240,7 @@ async fn run(seed: u64, steps: usize) {
         for (i, m) in ms.iter_mut().enumerate() {
             m.approve_deletes();
             let report = m.sync_once().await.unwrap_or_else(|e| panic!("seed {seed}: {e}"));
-            changed |= report.changed() || !report.pending_deletes.is_empty();
+            changed |= report.changed() || !report.pending_deletes.is_empty() || !report.pending_local_deletes.is_empty();
             if let Some(s) = skipped.get_mut(i) {
                 *s = report.skipped.iter().filter(|(_, why)| is_case_clash(why)).map(|(p, _)| rel(p)).collect();
             }
