@@ -4,7 +4,7 @@ mod common;
 
 use std::sync::atomic::Ordering;
 
-use common::{SaveDuringWrite, Server, machine, machine_on, machine_with, path, settle};
+use common::{SaveDuring, SaveOn, Server, machine, machine_on, machine_with, path, settle};
 use craft_cloud_sync::{Fs, MemFs};
 
 const CONFLICT_STAMP: &str = "(conflict, desktop, 2026-10-11 14-03)";
@@ -300,30 +300,44 @@ async fn a_file_that_cant_be_read_is_skipped_and_never_overwritten() {
     }
 }
 
-#[tokio::test]
-async fn a_save_during_a_download_is_kept() {
+/// The desktop's app saves `doc.txt` at the moment `on` while the laptop's new version comes in. The save is
+/// never overwritten: both edits end up on both machines, the desktop's as a conflict copy.
+async fn a_save_while_a_download_comes_in_is_kept(on: SaveOn) {
     let server = Server::new().await;
     let ana = server.user("ana").await;
     let mut a = machine(&server, &ana, "laptop").await;
-    let mut b = machine_on(&server, &ana, "desktop", SaveDuringWrite::default(), 50, |_| {}).await;
+    let mut b = machine_on(&server, &ana, "desktop", SaveDuring::default(), 50, |_| {}).await;
     write(&mut a, "doc.txt", b"v1");
     a.sync_once().await.unwrap();
     b.sync_once().await.unwrap();
     write(&mut a, "doc.txt", b"v2 from laptop");
     a.sync_once().await.unwrap();
-    // The desktop's app saves the file while the laptop's version is downloading.
-    b.fs_mut().save = Some((path("doc.txt"), b"desktop save".to_vec()));
-    let report = b.sync_once().await.unwrap();
-    assert!(report.downloaded.is_empty(), "{report:?}");
-    assert_eq!(b.fs().inner.read(&path("doc.txt")).unwrap(), b"desktop save");
-    // The next passes treat it as an edit on both sides: both copies survive.
+    b.fs().arm(path("doc.txt"), b"desktop save", on);
+    b.sync_once().await.unwrap();
+    assert!(b.fs().fired(), "{on:?}: the save should have happened during the pass");
+    assert!(b.fs().files().values().any(|d| d == b"desktop save"), "{on:?}: {:?}", b.fs().files());
     for _ in 0..4 {
         a.sync_once().await.unwrap();
         b.sync_once().await.unwrap();
     }
-    let here: Vec<(String, Vec<u8>)> = b.fs().inner.files().into_iter().map(|(p, d)| (p.to_string(), d)).collect();
-    assert_eq!(here, files(&a));
-    assert_eq!(here, vec![(format!("doc {CONFLICT_STAMP}.txt"), b"desktop save".to_vec()), ("doc.txt".to_owned(), b"v2 from laptop".to_vec())]);
+    let here: Vec<(String, Vec<u8>)> = b.fs().files().into_iter().map(|(p, d)| (p.to_string(), d)).collect();
+    assert_eq!(here, files(&a), "{on:?}");
+    let want = vec![(format!("doc {CONFLICT_STAMP}.txt"), b"desktop save".to_vec()), ("doc.txt".to_owned(), b"v2 from laptop".to_vec())];
+    assert_eq!(here, want, "{on:?}");
+}
+
+#[tokio::test]
+async fn a_save_during_a_download_is_kept() {
+    a_save_while_a_download_comes_in_is_kept(SaveOn::BeginWrite).await;
+}
+
+#[tokio::test]
+async fn a_save_while_the_file_is_verified_is_kept() {
+    // The engine reads the file up to three times before it decides it may replace it (the quick check's
+    // hash, then the full verification); a save landing during any of those reads must survive.
+    for n in 1..=3 {
+        a_save_while_a_download_comes_in_is_kept(SaveOn::Open(n)).await;
+    }
 }
 
 #[tokio::test]

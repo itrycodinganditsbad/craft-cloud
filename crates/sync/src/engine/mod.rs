@@ -513,11 +513,18 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// Downloads a file version and writes it to `path` atomically, chunk by chunk, after checking every chunk
     /// and the whole-file hash. A damaged download is abandoned and `path` stays as it was.
     ///
-    /// The caller has just checked what is at `path` (the verified file, or nothing). If that changed while the
-    /// download ran (an app saved the file), the download is abandoned and `None` returned: the base stays as it
-    /// was, so the next pass sees a local change and takes the conflict path.
-    async fn download(&mut self, file: &FileState, path: &RelPath, report: &mut Report) -> Result<Option<(FileMeta, FileHash)>, SyncError> {
-        let checked = self.stat(path)?;
+    /// `expected` is what the caller found at `path` before it decided the download may replace it: the file as
+    /// stat'ed *before* it was verified, or `None` for a path that must be empty. If `path` differs from that when
+    /// the download is ready to land (an app saved the file while it was hashed or while the download ran), the
+    /// download is abandoned and `None` returned: the base keeps the old version, so the next pass sees a local
+    /// change and takes the conflict path.
+    async fn download(
+        &mut self,
+        file: &FileState,
+        path: &RelPath,
+        expected: Option<FsKind>,
+        report: &mut Report,
+    ) -> Result<Option<(FileMeta, FileHash)>, SyncError> {
         let manifest = self.fetch_manifest(&file.manifest).await?;
         let mut writer = self.fs.begin_write(path).map_err(|e| io_err(path, e))?;
         let mut hasher = blake3::Hasher::new();
@@ -533,8 +540,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             return Err(SyncError::Corrupt(format!("{path} doesn't match its file hash")));
         }
         // Not an atomic compare-and-replace (that needs the `Fs` trait's help), but it closes the window the
-        // network round trips opened.
-        if self.stat(path)? != checked {
+        // verification and the network round trips opened.
+        if self.stat(path)? != expected {
             report.skipped.push((path.to_string(), "changed here while the server's version downloaded; tried again next pass".into()));
             return Ok(None);
         }

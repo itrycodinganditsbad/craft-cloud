@@ -234,54 +234,103 @@ pub fn path(s: &str) -> RelPath {
     craft_cloud_sync::rel(s)
 }
 
-/// A [`MemFs`] where a program saves a file while the engine is writing a download to the same path: the
-/// save lands when the engine starts writing (after it checked the path, before its write lands).
-#[derive(Default)]
-pub struct SaveDuringWrite {
-    pub inner: MemFs,
-    /// The path and the content the program saves, once.
-    pub save: Option<(RelPath, Vec<u8>)>,
+/// When the program in [`SaveDuring`] saves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveOn {
+    /// When the engine starts writing a download to the path (after it checked the path, before its write lands).
+    BeginWrite,
+    /// While the engine reads the path for the n-th time (1-based): that read still sees the content from before
+    /// the save, as a hash that was already under way when the save landed would.
+    Open(usize),
 }
 
-impl Fs for SaveDuringWrite {
+/// A [`MemFs`] where a program saves a file at an awkward moment for the engine.
+#[derive(Default)]
+pub struct SaveDuring {
+    inner: Mutex<MemFs>,
+    save: Mutex<Option<(RelPath, Vec<u8>, SaveOn)>>,
+}
+
+impl SaveDuring {
+    /// Arms one save of `data` to `path`.
+    pub fn arm(&self, path: RelPath, data: &[u8], on: SaveOn) {
+        *self.save.lock().unwrap() = Some((path, data.to_vec(), on));
+    }
+
+    /// Whether the armed save has happened.
+    pub fn fired(&self) -> bool {
+        self.save.lock().unwrap().is_none()
+    }
+
+    pub fn files(&self) -> std::collections::BTreeMap<RelPath, Vec<u8>> {
+        self.inner.lock().unwrap().files()
+    }
+
+    pub fn write(&self, path: &RelPath, data: &[u8]) {
+        self.inner.lock().unwrap().write(path, data, false, 0).unwrap();
+    }
+
+    /// Lands the armed save if `now` is its moment.
+    fn maybe_save(&self, inner: &mut MemFs, path: &RelPath, now: SaveOn) -> io::Result<()> {
+        let mut save = self.save.lock().unwrap();
+        let Some((p, data, on)) = save.as_mut() else { return Ok(()) };
+        if p != path {
+            return Ok(());
+        }
+        match (*on, now) {
+            (SaveOn::BeginWrite, SaveOn::BeginWrite) => {}
+            (SaveOn::Open(n), SaveOn::Open(_)) if n > 1 => {
+                *on = SaveOn::Open(n - 1);
+                return Ok(());
+            }
+            (SaveOn::Open(_), SaveOn::Open(_)) => {}
+            _ => return Ok(()),
+        }
+        inner.write(p, data, false, 0)?;
+        *save = None;
+        Ok(())
+    }
+}
+
+impl Fs for SaveDuring {
     type Writer = <MemFs as Fs>::Writer;
 
     fn now_ms(&self) -> i64 {
-        self.inner.now_ms()
+        self.inner.lock().unwrap().now_ms()
     }
     fn list(&self, dir: &RelPath) -> io::Result<Vec<FsEntry>> {
-        self.inner.list(dir)
+        self.inner.lock().unwrap().list(dir)
     }
     fn stat(&self, path: &RelPath) -> io::Result<Option<FsKind>> {
-        self.inner.stat(path)
+        self.inner.lock().unwrap().stat(path)
     }
     fn open(&self, path: &RelPath) -> io::Result<Box<dyn Read + Send + '_>> {
-        self.inner.open(path)
+        let mut inner = self.inner.lock().unwrap();
+        let data = inner.read(path)?;
+        self.maybe_save(&mut inner, path, SaveOn::Open(1))?;
+        Ok(Box::new(io::Cursor::new(data)))
     }
     fn read_at(&self, path: &RelPath, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        self.inner.read_at(path, offset, len)
+        self.inner.lock().unwrap().read_at(path, offset, len)
     }
     fn begin_write(&mut self, path: &RelPath) -> io::Result<Self::Writer> {
-        if self.save.as_ref().is_some_and(|(p, _)| p == path)
-            && let Some((p, data)) = self.save.take()
-        {
-            self.inner.write(&p, &data, false, 0)?;
-        }
-        self.inner.begin_write(path)
+        let mut inner = self.inner.lock().unwrap();
+        self.maybe_save(&mut inner, path, SaveOn::BeginWrite)?;
+        inner.begin_write(path)
     }
     fn finish_write(&mut self, path: &RelPath, writer: Self::Writer, exec: bool, mtime_ms: i64) -> io::Result<FileMeta> {
-        self.inner.finish_write(path, writer, exec, mtime_ms)
+        self.inner.lock().unwrap().finish_write(path, writer, exec, mtime_ms)
     }
     fn mkdir(&mut self, path: &RelPath) -> io::Result<()> {
-        self.inner.mkdir(path)
+        self.inner.lock().unwrap().mkdir(path)
     }
     fn remove_file(&mut self, path: &RelPath) -> io::Result<()> {
-        self.inner.remove_file(path)
+        self.inner.lock().unwrap().remove_file(path)
     }
     fn remove_dir(&mut self, path: &RelPath) -> io::Result<()> {
-        self.inner.remove_dir(path)
+        self.inner.lock().unwrap().remove_dir(path)
     }
     fn rename(&mut self, from: &RelPath, to: &RelPath) -> io::Result<()> {
-        self.inner.rename(from, to)
+        self.inner.lock().unwrap().rename(from, to)
     }
 }

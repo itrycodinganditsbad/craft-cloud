@@ -56,6 +56,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             return Ok(());
         }
         let Some(bpath) = base_path else { return self.apply_missing(id, entry, remote, rpath, new_version, report).await };
+        // What the file looked like before it was verified: a download may only replace exactly that (a save
+        // that lands while the file is hashed changes it).
+        let checked = self.stat(&bpath)?;
         let mut local = self.local_state(&entry, &bpath)?;
         if local == Local::Unchanged && new_version && !self.really_unchanged(&entry, &bpath)? {
             local = Local::Modified;
@@ -81,7 +84,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 // Saved here meanwhile: the base keeps the old version at the server's place, so the next pass
                 // sees an edit on both sides again (and the conflict copy goes up as a new file).
                 if let Some(file) = &remote.file
-                    && let Some((meta, hash)) = self.download(file, &rpath, report).await?
+                    && let Some((meta, hash)) = self.download(file, &rpath, None, report).await?
                 {
                     new_entry.kind = self.base_file(file, meta, hash);
                 }
@@ -91,10 +94,11 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     self.relocate(&bpath, &rpath, report)?;
                 }
                 // Saved here meanwhile: the base keeps the old version (at its new place, where the file is), so
-                // the next pass sees an edit on both sides.
+                // the next pass sees an edit on both sides. A rename keeps the file's ID and time, so the checked
+                // state still describes it after a relocate.
                 if new_version
                     && let Some(file) = &remote.file
-                    && let Some((meta, hash)) = self.download(file, &rpath, report).await?
+                    && let Some((meta, hash)) = self.download(file, &rpath, checked, report).await?
                 {
                     new_entry.kind = self.base_file(file, meta, hash);
                 }
@@ -148,7 +152,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         if let Some(file) = &remote.file {
             self.ensure_free(&rpath, report)?;
             // Saved here meanwhile: the old version stays in the base, so the next pass sees an edit on both sides.
-            if let Some((meta, hash)) = self.download(file, &rpath, report).await? {
+            if let Some((meta, hash)) = self.download(file, &rpath, None, report).await? {
                 new_entry.kind = self.base_file(file, meta, hash);
             }
         }
@@ -333,7 +337,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             }
             (Some(file), None) => {
                 // Saved here meanwhile: not taken this pass; the next one meets the file as a local copy.
-                let Some((meta, hash)) = self.download(file, &rpath, report).await? else { return Ok(()) };
+                let Some((meta, hash)) = self.download(file, &rpath, None, report).await? else { return Ok(()) };
                 self.base_file(file, meta, hash)
             }
             (Some(file), Some(FsKind::File(meta))) => {
@@ -357,14 +361,14 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 } else {
                     self.move_aside(&rpath, report)?;
                     // Saved here meanwhile: not taken this pass; the next one meets the file as a local copy.
-                    let Some((meta, hash)) = self.download(file, &rpath, report).await? else { return Ok(()) };
+                    let Some((meta, hash)) = self.download(file, &rpath, None, report).await? else { return Ok(()) };
                     self.base_file(file, meta, hash)
                 }
             }
             (Some(file), Some(_)) => {
                 self.move_aside(&rpath, report)?;
                 // Saved here meanwhile: not taken this pass; the next one meets the file as a local copy.
-                let Some((meta, hash)) = self.download(file, &rpath, report).await? else { return Ok(()) };
+                let Some((meta, hash)) = self.download(file, &rpath, None, report).await? else { return Ok(()) };
                 self.base_file(file, meta, hash)
             }
         };
