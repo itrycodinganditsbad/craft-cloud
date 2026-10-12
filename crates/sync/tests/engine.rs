@@ -1025,3 +1025,94 @@ async fn a_touched_file_the_server_deleted_makes_way_for_a_case_twin() {
     // The same content under the new name (copied, then the original deleted): still no copy of the old file.
     a_touched_file_the_server_deleted_makes_way("a.txt", "A.TXT", b"old").await;
 }
+
+/// The laptop deletes `notes` and renames another file to that name. On the desktop the old `notes` couldn't be
+/// removed at first (an app held it open), so it is still there, unchanged, when the server's rename lands on
+/// its name: it goes, like any unchanged file the server deleted, instead of coming back as a conflict copy.
+#[tokio::test]
+async fn a_server_rename_onto_a_deleted_unchanged_file_removes_it() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "notes", b"old notes");
+    write(&mut a, "b.txt", b"other");
+    settle(&mut [&mut a, &mut b], 5).await;
+    b.fs_mut().hold(&path("notes"));
+    a.fs_mut().remove_file(&path("notes")).unwrap();
+    a.sync_once().await.unwrap();
+    let report = b.sync_once().await.unwrap();
+    assert!(report.removed_locally.is_empty(), "{report:?}");
+    a.fs_mut().rename(&path("b.txt"), &path("notes")).unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().unlock_all();
+    let report = b.sync_once().await.unwrap();
+    assert!(report.conflict_copies.is_empty(), "{report:?}");
+    assert_eq!(report.removed_locally, vec![path("notes")]);
+    assert_eq!(report.moved_locally, vec![(path("b.txt"), path("notes"))]);
+    settle(&mut [&mut a, &mut b], 5).await;
+    for m in [&a, &b] {
+        assert_eq!(files(m), vec![("notes".to_owned(), b"other".to_vec())]);
+    }
+}
+
+/// The same with a case twin: the server renames a file to `NOTES` while the desktop still has the deleted,
+/// unchanged `notes`.
+#[tokio::test]
+async fn a_server_rename_onto_a_case_twin_of_a_deleted_unchanged_file_removes_it() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "notes", b"old notes");
+    write(&mut a, "b.txt", b"other");
+    settle(&mut [&mut a, &mut b], 5).await;
+    b.fs_mut().hold(&path("notes"));
+    a.fs_mut().remove_file(&path("notes")).unwrap();
+    a.sync_once().await.unwrap();
+    b.sync_once().await.unwrap();
+    a.fs_mut().rename(&path("b.txt"), &path("NOTES")).unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().unlock_all();
+    let report = b.sync_once().await.unwrap();
+    assert!(report.conflict_copies.is_empty(), "{report:?}");
+    assert_eq!(report.removed_locally, vec![path("notes")]);
+    settle(&mut [&mut a, &mut b], 5).await;
+    for m in [&a, &b] {
+        assert_eq!(files(m), vec![("NOTES".to_owned(), b"other".to_vec())]);
+    }
+}
+
+/// The server renames a file onto the name of a folder it deleted, which the desktop couldn't remove yet (it
+/// couldn't be listed). The empty folder goes; one with new files in it is moved aside, never removed.
+#[tokio::test]
+async fn a_server_rename_onto_a_deleted_folder_removes_it_only_if_bare() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("old")).unwrap();
+    a.fs_mut().mkdir(&path("kept")).unwrap();
+    write(&mut a, "b.txt", b"other");
+    write(&mut a, "c.txt", b"more");
+    settle(&mut [&mut a, &mut b], 5).await;
+    b.fs_mut().hold(&path("old"));
+    b.fs_mut().hold(&path("kept"));
+    a.fs_mut().remove_dir(&path("old")).unwrap();
+    a.fs_mut().remove_dir(&path("kept")).unwrap();
+    a.sync_once().await.unwrap();
+    b.sync_once().await.unwrap();
+    a.fs_mut().rename(&path("b.txt"), &path("old")).unwrap();
+    a.fs_mut().rename(&path("c.txt"), &path("kept")).unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().unlock_all();
+    write(&mut b, "kept/new.txt", b"made here");
+    let report = b.sync_once().await.unwrap();
+    assert_eq!(report.removed_locally, vec![path("old")], "{report:?}");
+    assert_eq!(report.conflict_copies.len(), 1, "{report:?}");
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&a), files(&b));
+    assert_eq!(read(&b, "old"), b"other");
+    assert_eq!(read(&b, "kept"), b"more");
+    assert!(files(&b).iter().any(|(p, d)| p.ends_with("/new.txt") && d == b"made here"), "{:?}", files(&b));
+}

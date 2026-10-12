@@ -256,6 +256,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     && let Some((meta, hash)) = self.same_content(file, &bpath).await?
                 {
                     if moved {
+                        self.settle_occupants(id, &rpath, Some(&bpath), report).await?;
                         self.relocate(&bpath, &rpath, report)?;
                     }
                     new_entry.kind = self.base_file(file, meta, hash);
@@ -263,6 +264,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     return Ok(());
                 }
                 // Both changed: keep ours as a conflict copy, take theirs.
+                self.settle_occupants(id, &rpath, Some(&bpath), report).await?;
                 self.move_aside(&bpath, report)?;
                 self.ensure_free(&rpath, report)?;
                 // Saved here meanwhile: the base keeps the old version at the server's place, so the next pass
@@ -275,6 +277,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             }
             Local::Unchanged | Local::Modified => {
                 if moved {
+                    self.settle_occupants(id, &rpath, Some(&bpath), report).await?;
                     self.relocate(&bpath, &rpath, report)?;
                     // Recorded at once, so a download that fails below doesn't leave the base pointing where the
                     // file no longer is.
@@ -317,6 +320,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 && let Some(lid) = local_id
                 && let Some(found) = self.find_local(lid)?
             {
+                self.settle_occupants(id, &rpath, Some(&found), report).await?;
                 self.relocate(&found, &rpath, report)?;
             } else if moved
                 && let BaseKind::Dir { .. } = entry.kind
@@ -345,6 +349,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             let checked = self.stat(&found)?;
             if self.really_unchanged(&entry, &found)? {
                 if moved {
+                    self.settle_occupants(id, &rpath, Some(&found), report).await?;
                     self.relocate(&found, &rpath, report)?;
                     self.state.base.insert(id, new_entry.clone());
                 }
@@ -355,11 +360,13 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             } else if let Some((meta, hash)) = self.same_content(file, &found).await? {
                 // The same edit on both sides: no conflict.
                 if moved {
+                    self.settle_occupants(id, &rpath, Some(&found), report).await?;
                     self.relocate(&found, &rpath, report)?;
                 }
                 new_entry.kind = self.base_file(file, meta, hash);
             } else {
                 // Edited on both sides: ours stays next to where the user put it, as a conflict copy.
+                self.settle_occupants(id, &target, Some(&found), report).await?;
                 self.move_aside(&found, report)?;
                 self.ensure_free(&target, report)?;
                 if let Some((meta, hash)) = self.download(file, &target, None, report).await? {
@@ -370,6 +377,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             return Ok(());
         }
         // Edited there, deleted here: the edit wins.
+        self.settle_occupants(id, &rpath, None, report).await?;
         self.ensure_free(&rpath, report)?;
         // Saved here meanwhile: the old version stays in the base, so the next pass sees an edit on both sides.
         if let Some((meta, hash)) = self.download(file, &rpath, None, report).await? {
@@ -452,6 +460,28 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             }
         }
         self.state.base.remove(&other);
+        Ok(())
+    }
+
+    /// Before the tracked node `id` takes `to` (a rename of its local copy at `from`, or a download), settles any
+    /// other tracked node that holds `to` or a case twin of it (see [`Engine::release_tracked`]): one the server
+    /// deleted that is unchanged here goes, instead of being moved aside as a copy by the rename or the download.
+    /// The path the node is renamed from (or a folder holding it) is never an occupant: it is the node itself.
+    /// Checked first, as the rest of the change: nothing is settled if taking `to` would act on a link.
+    async fn settle_occupants(&mut self, id: NodeId, to: &RelPath, from: Option<&RelPath>, report: &mut Report) -> Result<(), SyncError> {
+        self.refuse_link_toward(to)?;
+        if let Some(from) = from {
+            self.no_link(from)?;
+        }
+        let holds_source = |occupant: &RelPath| from.is_some_and(|f| f.starts_with(occupant));
+        if let Some(twin) = self.case_twin(to)?
+            && !holds_source(&twin)
+        {
+            self.release_tracked(&twin, id, None, report).await?;
+        }
+        if !holds_source(to) {
+            self.release_tracked(to, id, None, report).await?;
+        }
         Ok(())
     }
 
