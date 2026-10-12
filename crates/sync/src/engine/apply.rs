@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use craft_cloud_proto::limits::MAX_TREE_DEPTH;
-use craft_cloud_proto::{FileState, Name, NodeId};
+use craft_cloud_proto::{FileState, FoldKey, Name, NodeId};
 
 use crate::fs::{Fs, FsKind};
 use crate::path::RelPath;
@@ -448,6 +448,13 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         if local == Local::Missing {
             return Ok(());
         }
+        // A tracked folder holding a tracked file or folder that turned into a link isn't moved aside or let go:
+        // the node behind the link would lose its place. The newcomer waits until it is a real file or folder again.
+        if matches!(entry.kind, BaseKind::Dir { .. })
+            && let Some(link) = self.tracked_link_inside(path)?
+        {
+            return Err(io_err(&link, std::io::Error::other(OTHER_REASON)));
+        }
         if self.state.remote.contains_key(&other) {
             self.move_aside(path, report)?;
             return Ok(());
@@ -499,6 +506,33 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             self.release_tracked(to, id, None, report).await?;
         }
         Ok(())
+    }
+
+    /// A link or special file inside the folder `dir` (at any depth) whose name, ignoring case, is where the base
+    /// has a tracked node: a tracked file or folder that turned into a link.
+    fn tracked_link_inside(&self, dir: &RelPath) -> Result<Option<RelPath>, SyncError> {
+        let tracked: BTreeSet<(RelPath, FoldKey)> = self
+            .state
+            .base_index()
+            .into_keys()
+            .filter(|p| p.starts_with(dir) && p != dir)
+            .filter_map(|p| Some((p.parent()?, p.file_name()?.fold_key())))
+            .collect();
+        if tracked.is_empty() {
+            return Ok(None);
+        }
+        let mut queue = vec![dir.clone()];
+        while let Some(folder) = queue.pop() {
+            for entry in self.fs.list(&folder).map_err(|e| io_err(&folder, e))? {
+                let Ok(name) = Name::new(&entry.name) else { continue };
+                match entry.kind {
+                    FsKind::Other if tracked.contains(&(folder.clone(), name.fold_key())) => return Ok(Some(folder.join(&name))),
+                    FsKind::Dir { .. } if folder.depth() < MAX_TREE_DEPTH => queue.push(folder.join(&name)),
+                    _ => {}
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Moves `from` to `to`, moving aside anything at `to`. When one path contains the other (the target is
@@ -740,6 +774,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             return Ok(());
         };
         match self.local_state(&entry, &bpath)? {
+            // A folder that still holds a tracked node stays tracked until that node is settled: a node whose own
+            // change waits (it turned into a link in this folder, which the user moved) keeps its place through it.
+            // The push sends nothing for a node the server deleted.
+            Local::Missing if matches!(entry.kind, BaseKind::Dir { .. }) && self.state.base.values().any(|e| e.parent == Some(id)) => {}
             Local::Missing => {
                 self.state.base.remove(&id);
             }

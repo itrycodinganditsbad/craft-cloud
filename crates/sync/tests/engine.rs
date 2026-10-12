@@ -892,6 +892,65 @@ async fn a_server_rename_of_a_file_that_became_a_link_in_a_renamed_folder_waits(
     assert_eq!(read(&a, "Clips/c9.mov"), b"clip");
 }
 
+/// As above, but the other machine also moves the clip out and deletes the folder. The deleted folder stays
+/// tracked here while the clip in it waits, so the clip still isn't taken for deleted, and nothing is sent for the
+/// folder the server no longer has.
+#[tokio::test]
+async fn a_link_in_a_renamed_folder_the_server_deleted_keeps_its_node() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    b.fs_mut().rename(&path("Footage/c0.mov"), &path("c0.mov")).unwrap();
+    for i in 1..3 {
+        b.fs_mut().remove_file(&path(&format!("Footage/c{i}.mov"))).unwrap();
+    }
+    b.fs_mut().remove_dir(&path("Footage")).unwrap();
+    b.sync_once().await.unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty() && report.refused.is_empty(), "{report:?}");
+    }
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "c0.mov"), b"clip");
+    a.fs_mut().remove_file(&path("Clips/c0.mov")).unwrap();
+    // Back with a new file ID, where the user's folder is: it goes up from there.
+    write(&mut a, "Clips/c0.mov", b"clip");
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&a), files(&b));
+    assert_eq!(read(&b, "Clips/c0.mov"), b"clip");
+}
+
+/// The other machine replaces the folder with a new one of the same name and moves the clip into it. The old
+/// folder here holds the clip as a link, so it isn't moved aside for the new one: the new folder waits until the
+/// clip is real again, and nothing is deleted meanwhile.
+#[tokio::test]
+async fn a_folder_holding_a_tracked_link_isnt_moved_aside_for_a_newcomer() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    b.fs_mut().mkdir(&path("Tmp")).unwrap();
+    b.fs_mut().rename(&path("Footage/c0.mov"), &path("Tmp/c0.mov")).unwrap();
+    for i in 1..3 {
+        b.fs_mut().remove_file(&path(&format!("Footage/c{i}.mov"))).unwrap();
+    }
+    b.fs_mut().remove_dir(&path("Footage")).unwrap();
+    b.sync_once().await.unwrap();
+    b.fs_mut().rename(&path("Tmp"), &path("Footage")).unwrap();
+    b.sync_once().await.unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty() && report.conflict_copies.is_empty(), "{report:?}");
+        assert_eq!(a.fs().stat(&path("Footage/c0.mov")).unwrap(), Some(craft_cloud_sync::FsKind::Other));
+    }
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "Footage/c0.mov"), b"clip");
+    // The clip comes back (a new file to this disk); nothing is lost.
+    a.fs_mut().remove_file(&path("Footage/c0.mov")).unwrap();
+    write(&mut a, "Footage/c0.mov", b"clip");
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&a), files(&b));
+    assert!(files(&a).iter().any(|(p, d)| p.contains("c0") && d == b"clip"), "{:?}", files(&a));
+}
+
 /// A folder that came back from another drive (a link replaced with the real folder again) has a new file ID.
 /// A later rename of it is still a move, so a link inside it isn't taken for deleted either.
 #[tokio::test]

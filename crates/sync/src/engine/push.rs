@@ -36,7 +36,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         let mut dir_moves: Vec<(NodeId, RelPath, RelPath)> = Vec::new();
         for (path, id) in &index {
             let Some(BaseEntry { kind: BaseKind::Dir { local_id: Some(lid) }, .. }) = self.state.base.get(id) else { continue };
-            if *id == root || matches!(local.get(path), Some(FsKind::Dir { .. })) {
+            // A folder the server deleted (still tracked here while a node in it waits) can't be moved there.
+            if *id == root || matches!(local.get(path), Some(FsKind::Dir { .. })) || !self.state.remote.contains_key(id) {
                 continue;
             }
             if let Some(to) = untracked_dirs.get(lid)
@@ -164,6 +165,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         };
         missing_files.retain(|(id, path)| !hidden(&expected(path)) && !behind_moved_link(*id));
         missing_dirs.retain(|(id, path)| !hidden(&expected(path)) && !behind_moved_link(*id));
+        // A node the server already deleted (still tracked here while something waits for it) needs no delete.
+        missing_files.retain(|(id, _)| self.state.remote.contains_key(id));
+        missing_dirs.retain(|(id, _)| self.state.remote.contains_key(id));
         let moved_targets: BTreeSet<RelPath> =
             file_moves.iter().map(|(_, _, to, _)| to.clone()).chain(dir_moves.iter().map(|(_, _, to)| to.clone())).collect();
 
