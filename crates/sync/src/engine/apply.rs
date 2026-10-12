@@ -350,6 +350,16 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             return Ok(());
         }
         let Some(file) = &remote.file else { return Ok(()) };
+        // Already at the server's place with the server's content, untracked: adopted, before a file found by local
+        // ID moves there. A pass that crashed before saving its state may have taken a new file for this one (an
+        // atomic save looks the same), uploaded it and moved it here; the file the ID still finds is then the
+        // user's own, and stays untracked (it goes up as a new file) instead of being replaced.
+        if !self.state.base_index().contains_key(&rpath) && self.same_content(file, &rpath).await?.is_some() {
+            self.settle_occupants(id, &rpath, None, Some(file), report).await?;
+            if self.adopt_in_place(id, &rpath, file, &mut new_entry, report).await? {
+                return Ok(());
+            }
+        }
         // Edited there, moved here: the file (found by local ID, or through a folder the user moved) takes the
         // server's version. If the server moved it too, the server's move stands; otherwise it stays where the
         // user put it and the push sends the user's move.
@@ -391,14 +401,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         self.settle_occupants(id, &rpath, None, Some(file), report).await?;
         // Already at the server's place with the server's content, untracked (the same move and edit made on both
         // sides, or put there again after a pass that crashed before saving its state): adopted, not copied.
-        if !self.state.base_index().contains_key(&rpath)
-            && let Some((meta, hash)) = self.same_content(file, &rpath).await?
-        {
-            if let Some(twin) = self.case_twin(&rpath)? {
-                self.move_aside(&twin, report)?;
-            }
-            new_entry.kind = self.base_file(file, meta, hash);
-            self.state.base.insert(id, new_entry);
+        if self.adopt_in_place(id, &rpath, file, &mut new_entry, report).await? {
             return Ok(());
         }
         self.ensure_free(&rpath, report)?;
@@ -408,6 +411,28 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         }
         self.state.base.insert(id, new_entry);
         Ok(())
+    }
+
+    /// If an untracked file at `rpath` holds exactly the server's version `file`, the node `id` adopts it (any case
+    /// twin is moved aside) and true is returned. Occupants are settled by the caller first.
+    async fn adopt_in_place(
+        &mut self,
+        id: NodeId,
+        rpath: &RelPath,
+        file: &FileState,
+        new_entry: &mut BaseEntry,
+        report: &mut Report,
+    ) -> Result<bool, SyncError> {
+        if self.state.base_index().contains_key(rpath) {
+            return Ok(false);
+        }
+        let Some((meta, hash)) = self.same_content(file, rpath).await? else { return Ok(false) };
+        if let Some(twin) = self.case_twin(rpath)? {
+            self.move_aside(&twin, report)?;
+        }
+        new_entry.kind = self.base_file(file, meta, hash);
+        self.state.base.insert(id, new_entry.clone());
+        Ok(true)
     }
 
     /// Makes sure nothing untracked sits at `path` (moving it aside) and that its parent exists.

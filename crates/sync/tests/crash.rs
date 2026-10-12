@@ -39,6 +39,42 @@ async fn a_newcomer_a_crashed_pass_already_downloaded_is_adopted() {
     assert_eq!(a.fs().files(), b.fs().files());
 }
 
+/// B renamed a file here while A renamed it on the server, then B made a new file at the old name. B's pass takes
+/// the new file for the tracked one (an atomic save looks the same; the renamed file is held open, so the scan
+/// can't settle it), moves it where the server has it and uploads it as the next version, then crashes before it
+/// saves the state. The restarted engine finds the renamed file by its ID: it must not move it over the server's
+/// place and replace it with the version already there. That version is adopted; the renamed file stays and goes
+/// up as a new file.
+#[tokio::test]
+async fn a_file_found_by_id_after_a_crash_isnt_replaced_by_the_version_already_in_place() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "notes", b"the user's file");
+    settle(&mut [&mut a, &mut b], 5).await;
+
+    a.fs_mut().rename(&path("notes"), &path("a.txt")).unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().rename(&path("notes"), &path("b.txt")).unwrap();
+    write(&mut b, "notes", b"a new file");
+    b.fs_mut().lock(&path("b.txt"));
+    b.fs_mut().hold(&path("b.txt"));
+    let saved = b.state().clone();
+    let crashed = b.sync_once().await.unwrap();
+    assert_eq!(crashed.moved_locally, vec![(path("notes"), path("a.txt"))], "{crashed:?}");
+    let mut b = restart(&b, saved, |_| {});
+    b.fs_mut().unlock_all();
+
+    let report = b.sync_once().await.unwrap();
+    assert!(report.conflict_copies.is_empty(), "{report:?}");
+    assert_eq!(b.fs().read(&path("b.txt")).unwrap(), b"the user's file");
+    assert_eq!(b.fs().read(&path("a.txt")).unwrap(), b"a new file");
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(a.fs().files(), b.fs().files());
+    assert_eq!(a.fs().files().len(), 2);
+}
+
 /// A crashed pass moved a file where the server had moved it; later the server deleted it, and a newcomer that
 /// clashes by case took the file's old name. The restarted engine finds the file by its ID and sends the move
 /// again, which the server refuses (the node is gone). That must not repeat forever: the node is forgotten and
