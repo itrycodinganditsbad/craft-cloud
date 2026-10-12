@@ -10,7 +10,9 @@
 //! `sync --approve-deletes` after checking the list); **3** stopped, needs you: a safety stop (the folder is
 //! missing, its marker is missing or names another space, another agent is running) or an account-level problem
 //! where trying again never helps (the device was revoked or signed out, `state.json` belongs to another
-//! account, the server speaks another protocol or chunker, a file was written by a newer agent).
+//! account, the server speaks another protocol or chunker or answers something this agent can't read (no proxy
+//! sits in between, so that is a real client/server mismatch), `account.json` or `state.json` is damaged or was
+//! written by a newer agent: move the file away or update).
 //!
 //! A crash or kill during `login`, after the server created the device and before the account was saved, can
 //! leave a device registered that nothing here uses; an admin can revoke it (`craft-cloud-server device ...`).
@@ -38,7 +40,7 @@ use crate::root::{self, RootError, RootMarker};
     after_help = "Exit codes: 0 done; 1 failed, try again (offline, server error, wrong password, bad command line); \
                   2 deletions wait for `sync --approve-deletes`; \
                   3 stopped, needs you (folder or its marker missing, another space, another agent running, \
-                  device revoked, state of another account, server protocol mismatch, files from a newer agent)."
+                  device revoked, state of another account, server protocol mismatch, damaged or newer account/state files)."
 )]
 pub struct Cli {
     /// Where the agent keeps its sign-in and sync state. Default: $CRAFT_CLOUD_AGENT_DIR, else the per-user data
@@ -128,7 +130,7 @@ impl AgentError {
             | AgentError::Revoked
             | AgentError::OtherAccountState(_)
             | AgentError::Server(TransportError::Protocol(_))
-            | AgentError::Account(AccountError::Newer { .. }) => Exit::NeedsYou,
+            | AgentError::Account(AccountError::Newer { .. } | AccountError::Damaged { .. }) => Exit::NeedsYou,
             _ => Exit::Failed,
         }
     }
@@ -610,6 +612,8 @@ mod tests {
         assert_eq!(AgentError::Server(TransportError::Protocol("x".into())).exit(), Exit::NeedsYou);
         let newer = AccountError::Newer { path: PathBuf::from("s"), found: 2, supported: 1 };
         assert_eq!(AgentError::Account(newer).exit(), Exit::NeedsYou);
+        let damaged = AccountError::Damaged { path: PathBuf::from("s"), message: "x".into() };
+        assert_eq!(AgentError::Account(damaged).exit(), Exit::NeedsYou);
         assert_eq!(AgentError::Server(TransportError::NotFound).exit(), Exit::Failed);
         assert_eq!(AgentError::WrongPassword.exit(), Exit::Failed);
         assert_eq!(AgentError::NotSignedIn.exit(), Exit::Failed);

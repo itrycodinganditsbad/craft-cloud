@@ -765,3 +765,15 @@ async fn status_lists_the_skipped_files() {
     let status = String::from_utf8(out).unwrap();
     assert!(status.contains("skipped:") && status.contains("Footage"), "{status}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_damaged_state_file_stops_the_agent() {
+    let server = server().await;
+    let a = Agent::signed_in(&server, "desktop").await;
+    a.sync().await;
+    std::fs::write(a.data.path().join("state.json"), "{not json").unwrap();
+    let stopped = a.try_sync(false).await.unwrap_err();
+    assert!(matches!(stopped, AgentError::Account(_)), "{stopped:?}");
+    assert_eq!(stopped.exit(), Exit::NeedsYou);
+    assert!(stopped.to_string().contains("move it away"), "{stopped}");
+}
