@@ -104,9 +104,14 @@ fn new_uploads(report: &Report, tracked_before: &BTreeMap<RelPath, craft_cloud_p
         .collect()
 }
 
-/// The conflict copies that appeared on `m` since `before` (its files then).
-fn new_copies(before: &[RelPath], m: &Machine) -> Vec<RelPath> {
-    files_of(m).into_iter().filter(|p| !before.contains(p)).filter(|p| p.file_name().is_some_and(|n| n.as_str().contains(" (conflict, "))).collect()
+/// The conflict copies that appeared on `m` since `before` (its files then), with their contents.
+fn new_copies(before: &[RelPath], m: &Machine) -> Vec<(RelPath, FileHash)> {
+    m.fs()
+        .files()
+        .into_iter()
+        .filter(|(p, _)| !before.contains(p) && p.file_name().is_some_and(|n| n.as_str().contains(" (conflict, ")))
+        .map(|(p, d)| (p, FileHash::from_bytes(*blake3::hash(&d).as_bytes())))
+        .collect()
 }
 
 /// The engine's skip reason for a name that clashes by case with one it syncs (`Engine::scan`).
@@ -114,20 +119,24 @@ fn is_case_clash(reason: &str) -> bool {
     reason.starts_with("the name clashes with ") && reason.ends_with(" when case is ignored")
 }
 
+/// A conflict copy exempt from the needless-copy check: the machine that made it, where it is, and the content it
+/// was made with. An edit of the copy (or a later copy at the same path) is checked again.
+type Exempt = (usize, RelPath, FileHash);
+
 /// After a user's rename of `from` to `to`, exempt copies at or below `from` are found at `to` (on every machine,
-/// once it syncs).
-fn follow_rename(exempt: &mut BTreeSet<(usize, RelPath)>, from: &RelPath, to: &RelPath) {
-    let moved: Vec<(usize, RelPath)> = exempt.iter().filter(|(_, p)| p.starts_with(from)).cloned().collect();
-    for (j, p) in moved {
+/// once it syncs), with the same content.
+fn follow_rename(exempt: &mut BTreeSet<Exempt>, from: &RelPath, to: &RelPath) {
+    let moved: Vec<Exempt> = exempt.iter().filter(|(_, p, _)| p.starts_with(from)).cloned().collect();
+    for (j, p, hash) in moved {
         let mut names = to.names().to_vec();
         names.extend_from_slice(&p.names()[from.depth()..]);
-        exempt.insert((j, RelPath::from_names(names)));
+        exempt.insert((j, RelPath::from_names(names), hash));
     }
 }
 
 /// One random user action on a machine's folder. Failures (target exists, parent missing) are ignored, like a
 /// user's failed click. `exempt` follows the user's renames.
-fn act(rng: &mut Rng, m: &mut Machine, destroyed: &mut BTreeSet<FileHash>, exempt: &mut BTreeSet<(usize, RelPath)>) {
+fn act(rng: &mut Rng, m: &mut Machine, destroyed: &mut BTreeSet<FileHash>, exempt: &mut BTreeSet<Exempt>) {
     // The content at `p`, read straight from memory: a locked file is still overwritten or deleted by its user.
     // It counts as destroyed only once the user's write or delete went through.
     let old = |m: &Machine, p: &RelPath| m.fs().files().get(p).map(|d| FileHash::from_bytes(*blake3::hash(d).as_bytes()));
@@ -245,10 +254,11 @@ async fn run(seed: u64, steps: usize) {
     // finishes with nothing left for later. Conflict copies it makes meanwhile may hold content that is already at
     // the original name: the crashed pass downloaded or moved files and lost the bookkeeping, and when the user
     // then locked, moved or edited them the engine can't tell its own work from the user's. A copy is the safe
-    // answer (nothing is lost), so exactly those copies (by machine and path) are exempt from the needless-copy
-    // check below; every other check still holds, for every file.
+    // answer (nothing is lost), so exactly those copies (by machine, path and the content they were made with) are
+    // exempt from the needless-copy check below; every other check still holds, for every file. Keyed by content
+    // too, so a later copy at the same path, or an edit of the copy, is checked again.
     let mut recovering: Vec<u32> = vec![0; ms.len()];
-    let mut after_crash: BTreeSet<(usize, RelPath)> = BTreeSet::new();
+    let mut after_crash: BTreeSet<Exempt> = BTreeSet::new();
     // Contents a recovering machine uploaded as new files: files it no longer recognised as tracked (the crash lost
     // that bookkeeping) go up as new nodes, so the server holds the same content twice, and another machine may
     // later keep a copy of one in the other's way. Copies of exactly that content are exempt too, and only content
@@ -292,7 +302,7 @@ async fn run(seed: u64, steps: usize) {
                 eprintln!("TRACE step {step} m{i} sync: {r:?}\n  files {}\n  dirs {:?}", listing(m), m.fs().dirs());
             }
             if let Some(left) = recovering.get_mut(i).filter(|left| **left > 0) {
-                after_crash.extend(new_copies(&before, m).into_iter().map(|p| (i, p)));
+                after_crash.extend(new_copies(&before, m).into_iter().map(|(p, hash)| (i, p, hash)));
                 if let Ok(report) = &r {
                     let left_behind = at_crash.get(i).cloned().unwrap_or_default();
                     reuploaded.extend(new_uploads(report, &tracked_before, m).into_iter().filter(|h| left_behind.contains(h)));
@@ -365,7 +375,7 @@ async fn run(seed: u64, steps: usize) {
             let tracked_before = m.state().base_index();
             let report = m.sync_once().await.unwrap_or_else(|e| panic!("seed {seed}: {e}"));
             if let Some(left) = recovering.get_mut(i).filter(|left| **left > 0) {
-                after_crash.extend(new_copies(&before, m).into_iter().map(|p| (i, p)));
+                after_crash.extend(new_copies(&before, m).into_iter().map(|(p, hash)| (i, p, hash)));
                 let left_behind = at_crash.get(i).cloned().unwrap_or_default();
                 reuploaded.extend(new_uploads(&report, &tracked_before, m).into_iter().filter(|h| left_behind.contains(h)));
                 *left = if settled(&report) { 0 } else { *left - 1 };
@@ -421,11 +431,13 @@ async fn run(seed: u64, steps: usize) {
         for (p, data) in &all {
             let (Some(parent), Some(name)) = (p.parent(), p.file_name().map(|n| n.as_str())) else { continue };
             let Some(start) = name.rfind(" (conflict, ") else { continue };
-            // A copy a recovering machine made (its device name is in the copy's name) at this very path.
-            if (0..ms.len()).any(|j| name.contains(&format!("(conflict, m{j},")) && after_crash.contains(&(j, p.clone()))) {
+            let hash = FileHash::from_bytes(*blake3::hash(data).as_bytes());
+            // A copy a recovering machine made (its device name is in the copy's name) at this very path, still
+            // holding the content it was made with.
+            if (0..ms.len()).any(|j| name.contains(&format!("(conflict, m{j},")) && after_crash.contains(&(j, p.clone(), hash))) {
                 continue;
             }
-            if reuploaded.contains(&FileHash::from_bytes(*blake3::hash(data).as_bytes())) {
+            if reuploaded.contains(&hash) {
                 continue;
             }
             let Some(end) = name.get(start..).and_then(|rest| rest.find(')')).map(|e| start + e + 1) else { continue };
