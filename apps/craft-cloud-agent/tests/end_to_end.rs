@@ -616,3 +616,36 @@ async fn the_transport_maps_server_answers() {
     let nowhere = HttpTransport::new(ServerUrl::parse("http://127.0.0.1:9").unwrap(), &account.token).unwrap();
     assert!(matches!(nowhere.space().await, Err(TransportError::Unavailable(_))));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_pass_keeps_the_deletes_the_user_was_shown() {
+    let server = server().await;
+    let a = Agent::signed_in(&server, "desktop").await;
+    for i in 0..12 {
+        a.write(&format!("f{i:02}.txt"), "x");
+    }
+    a.sync().await;
+    for i in 0..12 {
+        std::fs::remove_file(a.path(&format!("f{i:02}.txt"))).unwrap();
+    }
+    let (exit, shown) = a.try_sync(false).await.unwrap();
+    assert_eq!((exit, shown.pending_deletes.len()), (Exit::NeedsApproval, 12));
+
+    // The server is unreachable for the next pass, which was meant to approve.
+    let good = a.data.load_account().unwrap().unwrap();
+    let bad = craft_cloud_agent::account::Account { server: ServerUrl::parse("http://127.0.0.1:9").unwrap(), ..good.clone() };
+    a.data.save_account(&bad).unwrap();
+    let failed = a.try_sync(true).await.unwrap_err();
+    assert!(matches!(failed, AgentError::Offline(_)), "{failed:?}");
+    assert_eq!(failed.exit(), Exit::Failed);
+    let mut out = Vec::new();
+    cli::status(&a.data, &mut out).unwrap();
+    let status = String::from_utf8(out).unwrap();
+    assert!(status.contains("failed") && status.contains("waiting for approval") && status.contains("delete on the server: f00.txt"), "{status}");
+    assert!(!status.contains("in sync: nothing to do"), "{status}");
+
+    // Back online: approving releases exactly the deletes that were shown.
+    a.data.save_account(&good).unwrap();
+    let (exit, summary) = a.try_sync(true).await.unwrap();
+    assert_eq!((exit, summary.removed_remotely), (Exit::Done, 12), "{summary:?}");
+}

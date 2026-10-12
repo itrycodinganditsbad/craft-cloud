@@ -398,9 +398,10 @@ pub async fn sync(data: &DataDir, approve_deletes: bool, out: &mut impl Write) -
     let transport = HttpTransport::new(account.server.clone(), &account.token)?;
     let config = Config::new(account.device_name.clone(), account.device);
     let mut engine = Engine::new(fs, transport, std::mem::take(&mut saved.state), config, conflict_stamp)?;
+    let previous = saved.last_pass.as_ref().and_then(|l| l.summary.clone());
     if approve_deletes {
         // Exactly the deletions the user saw listed; new ones wait and are listed again.
-        let shown = saved.last_pass.as_ref().and_then(|l| l.summary.as_ref()).map(|s| s.pending_nodes.clone()).unwrap_or_default();
+        let shown = previous.as_ref().map(|s| s.pending_nodes.clone()).unwrap_or_default();
         if shown.is_empty() {
             say!(out, "nothing was waiting for approval")?;
         }
@@ -414,7 +415,9 @@ pub async fn sync(data: &DataDir, approve_deletes: bool, out: &mut impl Write) -
             let summary = PassSummary::from_report(report);
             (if summary.needs_approval() { Outcome::NeedsApproval } else { Outcome::Done }, Some(summary))
         }
-        Err(e) => (Outcome::Failed(failure_message(e)), None),
+        // A failed pass keeps the deletions the pass before it listed: the user was shown them, and a retry
+        // after a network blip must still release exactly those.
+        Err(e) => (Outcome::Failed(failure_message(e)), previous.map(|s| s.pending_only()).filter(PassSummary::needs_approval)),
     };
     saved.last_pass = Some(LastPass { finished_ms: now_ms(), outcome, summary: summary.clone() });
     data.save_state(&saved)?;
@@ -464,6 +467,11 @@ fn print_summary(out: &mut impl Write, s: &PassSummary) -> Result<(), AgentError
             say!(out, "  {path}: {why}")?;
         }
     }
+    print_waiting(out, s)
+}
+
+/// The deletions waiting for approval, if any.
+fn print_waiting(out: &mut impl Write, s: &PassSummary) -> Result<(), AgentError> {
     if s.needs_approval() {
         say!(out, "waiting for approval (check the list, then run `craft-cloud-agent sync --approve-deletes`):")?;
         for path in &s.pending_deletes {
@@ -499,7 +507,12 @@ pub fn status(data: &DataDir, out: &mut impl Write) -> Result<(), AgentError> {
             };
             say!(out, "last pass: {} ({how})", show_time(last.finished_ms))?;
             if let Some(summary) = &last.summary {
-                print_summary(out, summary)?;
+                // After a failed pass the summary is only the kept list of waiting deletions.
+                if matches!(last.outcome, Outcome::Failed(_)) {
+                    print_waiting(out, summary)?;
+                } else {
+                    print_summary(out, summary)?;
+                }
             }
         }
     }

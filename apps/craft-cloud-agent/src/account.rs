@@ -122,6 +122,17 @@ impl PassSummary {
         }
     }
 
+    /// Only the deletions waiting for approval (paths and nodes): what a failed pass keeps from the pass before
+    /// it, because the user was shown those lists and `--approve-deletes` still means exactly them.
+    pub fn pending_only(&self) -> Self {
+        Self {
+            pending_deletes: self.pending_deletes.clone(),
+            pending_local_deletes: self.pending_local_deletes.clone(),
+            pending_nodes: self.pending_nodes.clone(),
+            ..Self::default()
+        }
+    }
+
     pub fn needs_approval(&self) -> bool {
         !self.pending_deletes.is_empty() || !self.pending_local_deletes.is_empty()
     }
