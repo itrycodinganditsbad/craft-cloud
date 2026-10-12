@@ -93,6 +93,27 @@ async fn both_edited_keeps_both_copies() {
     assert_eq!(read(&a, "doc (conflict, desktop, 2026-10-11 14-03).txt"), b"from desktop");
 }
 
+/// Saving a file again with the same bytes gives it a new time and file ID, but it isn't an edit: a remote edit
+/// simply replaces it, with no conflict copy (edits are decided by content, as deletes are).
+#[tokio::test]
+async fn a_file_saved_again_unchanged_takes_a_remote_edit_without_a_conflict() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "notes.txt", b"base");
+    settle(&mut [&mut a, &mut b], 5).await;
+    write(&mut b, "notes.txt", b"base");
+    write(&mut a, "notes.txt", b"edited on the laptop");
+    a.sync_once().await.unwrap();
+    let report = b.sync_once().await.unwrap();
+    assert!(report.conflict_copies.is_empty(), "{report:?}");
+    assert_eq!(report.downloaded, vec![path("notes.txt")]);
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&b), vec![("notes.txt".to_owned(), b"edited on the laptop".to_vec())]);
+    assert_eq!(files(&a), files(&b));
+}
+
 #[tokio::test]
 async fn an_edit_wins_over_a_delete() {
     let server = Server::new().await;

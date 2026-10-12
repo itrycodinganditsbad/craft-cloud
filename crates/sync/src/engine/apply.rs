@@ -247,6 +247,12 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         if local == Local::Unchanged && new_version && !self.really_unchanged(&entry, &bpath)? {
             local = Local::Modified;
         }
+        // An edit is decided by content, as a delete is: a file that only got a new time or file ID (saved again
+        // with the same bytes, put back from a copy) isn't edited here, so the server's version simply replaces it.
+        // `checked` was stat'ed before the hash, so a save while it runs still stops the download.
+        if local == Local::Modified && new_version && self.holds_base_content(&entry, &bpath) {
+            local = Local::Unchanged;
+        }
         let mut new_entry = BaseEntry { parent: remote.parent, name: remote.name.clone(), kind: entry.kind.clone() };
         match local {
             Local::Unchanged | Local::Modified if new_version && local == Local::Modified => {
@@ -351,7 +357,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             let target = if moved { rpath.clone() } else { found.clone() };
             // What the file looked like before it was verified: a download may only replace exactly that.
             let checked = self.stat(&found)?;
-            if self.really_unchanged(&entry, &found)? {
+            // Unchanged by content (see `apply_changed`): a new time or file ID alone isn't an edit.
+            if self.really_unchanged(&entry, &found)? || self.holds_base_content(&entry, &found) {
                 if moved {
                     self.settle_occupants(id, &rpath, Some(&found), None, report).await?;
                     self.relocate(&found, &rpath, report)?;
