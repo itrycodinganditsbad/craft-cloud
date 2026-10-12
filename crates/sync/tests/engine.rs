@@ -749,6 +749,27 @@ async fn an_approval_releases_only_the_deletes_it_names() {
 }
 
 #[tokio::test]
+async fn approvals_given_before_a_pass_add_up() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    for i in 0..30 {
+        write(&mut a, &format!("f{i:02}.txt"), format!("file {i}").as_bytes());
+    }
+    a.sync_once().await.unwrap();
+    for i in 0..12 {
+        a.fs_mut().remove_file(&path(&format!("f{i:02}.txt"))).unwrap();
+    }
+    let shown = a.sync_once().await.unwrap();
+    assert_eq!(shown.pending_nodes.len(), 12);
+    let (first, second) = shown.pending_nodes.split_at(5);
+    a.approve_deletes_of(first.to_vec());
+    a.approve_deletes_of(second.to_vec());
+    let report = a.sync_once().await.unwrap();
+    assert_eq!((report.removed_remotely.len(), report.pending_deletes.len()), (12, 0), "{report:?}");
+}
+
+#[tokio::test]
 async fn a_tracked_folder_or_file_that_became_a_link_is_never_deleted() {
     // Footage moved to another drive with a link left in its place; notes.txt replaced by a link too. Neither is
     // gone: nothing is deleted on the server or on the other machine.

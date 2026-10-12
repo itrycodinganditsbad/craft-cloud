@@ -21,7 +21,7 @@ use std::io::{self, Write};
 use craft_cloud_chunker::{Chunker, FASTCDC_V1};
 use craft_cloud_proto::limits::MAX_TREE_DEPTH;
 use craft_cloud_proto::{
-    Conflict, ConflictStamp, DeviceId, Epoch, FileHash, FileState, Manifest, ManifestId, Name, NewVersion, NodeId, PageCursor, conflict_name,
+    Conflict, ConflictStamp, DeviceId, Epoch, FileHash, FileState, FoldKey, Manifest, ManifestId, Name, NewVersion, NodeId, PageCursor, conflict_name,
 };
 
 use crate::fs::{FileMeta, Fs, FsKind};
@@ -281,9 +281,14 @@ impl<F: Fs, T: Transport> Engine<F, T> {
 
     /// Lets the next pass carry out exactly these held-back deletions (both directions), as listed in an earlier
     /// report's [`Report::pending_nodes`]. Deletions of other nodes still wait for approval if the guard holds
-    /// them.
+    /// them. Adds to an approval given since the last pass (several calls approve all the nodes they name; after
+    /// [`Engine::approve_deletes`] everything stays approved).
     pub fn approve_deletes_of(&mut self, nodes: impl IntoIterator<Item = NodeId>) {
-        self.approval = Approval::Only(nodes.into_iter().collect());
+        match &mut self.approval {
+            Approval::All => {}
+            Approval::Only(ids) => ids.extend(nodes),
+            Approval::None => self.approval = Approval::Only(nodes.into_iter().collect()),
+        }
     }
 
     /// One full pass. On error the state stays consistent (the base only records what happened), so the
@@ -399,6 +404,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// missing. Only a sync root that can't be listed fails the scan.
     fn scan(&self, report: &mut Report) -> Result<(BTreeMap<RelPath, FsKind>, Vec<RelPath>), SyncError> {
         let tracked = self.state.base_index();
+        // Tracked paths by folder and folded name, built when the first link turns up.
+        let mut tracked_by_fold: Option<HashMap<(RelPath, FoldKey), RelPath>> = None;
         let mut out = BTreeMap::new();
         let mut unknown = Vec::new();
         let mut queue = vec![RelPath::root()];
@@ -436,10 +443,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                         // another drive with a link left behind), or whose name this computer now spells
                         // differently, isn't gone: its node and everything tracked below it are unknown this pass,
                         // so nothing is deleted on the server.
-                        let key = name.fold_key();
-                        if let Some(was) =
-                            tracked.keys().find(|p| p.parent().as_ref() == Some(&dir) && p.file_name().is_some_and(|n| n.fold_key() == key))
-                        {
+                        let by_fold = tracked_by_fold.get_or_insert_with(|| {
+                            tracked.keys().filter_map(|p| Some(((p.parent()?, p.file_name()?.fold_key()), p.clone()))).collect()
+                        });
+                        if let Some(was) = by_fold.get(&(dir.clone(), name.fold_key())) {
                             unknown.push(was.clone());
                         }
                     }
