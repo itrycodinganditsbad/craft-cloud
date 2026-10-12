@@ -7,6 +7,7 @@ use craft_cloud_sync::conformance as c;
 #[test]
 fn writes_are_atomic_and_give_a_new_identity() {
     c::writes_are_atomic_and_give_a_new_identity(&mut MemFs::new(), true);
+    c::writes_are_atomic_and_give_a_new_identity(&mut MemFs::new().without_exec_bit(), false);
 }
 
 #[test]

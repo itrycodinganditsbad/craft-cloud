@@ -49,6 +49,11 @@ pub trait Fs: Send {
     /// The filesystem's clock, in the same unit as file modification times (milliseconds since the Unix
     /// epoch on real disks). Used for the racy-timestamp rule.
     fn now_ms(&self) -> i64;
+    /// Whether files here have an executable bit (Unix-like systems). Where they don't (Windows), every file reads
+    /// as not executable, so an upload keeps the bit the base recorded instead of clearing it.
+    fn has_exec_bit(&self) -> bool {
+        true
+    }
     /// The entries of a directory.
     fn list(&self, dir: &RelPath) -> io::Result<Vec<FsEntry>>;
     /// What is at `path`, if anything.
@@ -104,6 +109,8 @@ pub struct MemFs {
     locked: BTreeSet<RelPath>,
     held: BTreeSet<RelPath>,
     death: Option<Arc<Death>>,
+    /// False to act like Windows: no file is executable (see [`MemFs::without_exec_bit`]).
+    exec_bit: bool,
 }
 
 /// A machine that dies partway through a pass (see [`MemFs::die_after`]).
@@ -119,7 +126,7 @@ impl Default for MemFs {
     fn default() -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert(RelPath::root(), MemNode::Dir { id: 1 });
-        Self { nodes, clock: 1_000, next_id: 2, locked: BTreeSet::new(), held: BTreeSet::new(), death: None }
+        Self { nodes, clock: 1_000, next_id: 2, locked: BTreeSet::new(), held: BTreeSet::new(), death: None, exec_bit: true }
     }
 }
 
@@ -134,6 +141,17 @@ fn exists(path: &RelPath) -> io::Error {
 impl MemFs {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A filesystem without an executable bit, like Windows: files are written and read as not executable.
+    pub fn without_exec_bit(mut self) -> Self {
+        self.exec_bit = false;
+        for node in self.nodes.values_mut() {
+            if let MemNode::File { meta, .. } = node {
+                meta.exec = false;
+            }
+        }
+        self
     }
 
     fn tick(&mut self) -> i64 {
@@ -277,6 +295,10 @@ impl Fs for MemFs {
         self.clock
     }
 
+    fn has_exec_bit(&self) -> bool {
+        self.exec_bit
+    }
+
     fn list(&self, dir: &RelPath) -> io::Result<Vec<FsEntry>> {
         self.alive()?;
         self.require_dir(dir)?;
@@ -339,7 +361,7 @@ impl Fs for MemFs {
         // An atomic replace (temp file + rename) gives the file a new identity.
         let id = self.new_id();
         let mtime_ms = mtime_ms.max(self.tick());
-        let meta = FileMeta { size: writer.len() as u64, mtime_ms, exec, id: Some(id) };
+        let meta = FileMeta { size: writer.len() as u64, mtime_ms, exec: exec && self.exec_bit, id: Some(id) };
         self.nodes.insert(path.clone(), MemNode::File { data: writer, meta });
         Ok(meta)
     }

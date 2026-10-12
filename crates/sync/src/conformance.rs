@@ -14,8 +14,9 @@ pub const T0: i64 = 1_700_000_000_000;
 
 /// Writes land atomically: nothing shows until `finish_write`, an abandoned write leaves the old content, and a
 /// replace is a new file (a new ID, as temp + rename gives). `exec_bit` says whether the filesystem keeps the
-/// executable bit (not on Windows).
+/// executable bit (not on Windows), as [`Fs::has_exec_bit`] says too.
 pub fn writes_are_atomic_and_give_a_new_identity<F: Fs>(fs: &mut F, exec_bit: bool) {
+    assert_eq!(fs.has_exec_bit(), exec_bit);
     let first = fs.write(&rel("a.txt"), b"one", false, T0).unwrap();
     let mut w = fs.begin_write(&rel("a.txt")).unwrap();
     w.write_all(b"half").unwrap();

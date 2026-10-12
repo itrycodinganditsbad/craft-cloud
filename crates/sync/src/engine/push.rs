@@ -256,8 +256,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         }
         // Edits.
         for (id, path, _) in &modified {
-            let Some(BaseEntry { kind: BaseKind::File { version: expected, .. }, .. }) = self.state.base.get(id).cloned() else { continue };
-            let Some((version, size, meta, hash)) = self.upload(path, report).await? else { continue };
+            let Some(BaseEntry { kind: BaseKind::File { version: expected, exec, .. }, .. }) = self.state.base.get(id).cloned() else { continue };
+            let Some((version, size, meta, hash)) = self.upload(path, exec, report).await? else { continue };
             ops.push((Op::Update { node: *id, expected, version: version.clone() }, Effect::Update { id: *id, version, size, meta, hash }));
         }
         // New files.
@@ -266,7 +266,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 continue;
             }
             let (Some(name), Some(parent)) = (path.file_name().cloned(), parent_id(path, &new_ids)) else { continue };
-            let Some((version, size, meta, hash)) = self.upload(path, report).await? else { continue };
+            let Some((version, size, meta, hash)) = self.upload(path, false, report).await? else { continue };
             let id = NodeId::generate();
             ops.push((
                 Op::Create { node: id, parent, name: name.clone(), version: version.clone() },
@@ -302,7 +302,16 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// Uploads a file's content: chunks it as a stream, asks which chunks the server lacks, and sends those,
     /// read back by range and checked against their IDs. `None` when the file can't be uploaded this pass:
     /// it changed while being read (tried again next pass) or it can't be read at all (reported as skipped).
-    async fn upload(&mut self, path: &RelPath, report: &mut Report) -> Result<Option<(NewVersion, u64, FileMeta, FileHash)>, SyncError> {
+    ///
+    /// The version is executable as the file is here, or, on a filesystem without an executable bit (Windows), as
+    /// `base_exec` says (the base's bit for an edit, false for a new file): an edit there never clears the bit a
+    /// Unix machine gave the file.
+    async fn upload(
+        &mut self,
+        path: &RelPath,
+        base_exec: bool,
+        report: &mut Report,
+    ) -> Result<Option<(NewVersion, u64, FileMeta, FileHash)>, SyncError> {
         let Some(FsKind::File(before)) = self.stat(path)? else { return Ok(None) };
         let mut pieces: Vec<(ChunkId, u64, usize)> = Vec::new();
         let chunked = self.fs.open(path).and_then(|reader| {
@@ -354,7 +363,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             Manifest::new(params, summary.size, FileHash::from_bytes(summary.file_hash), refs).map_err(|e| SyncError::Corrupt(e.to_string()))?;
         self.transport.put_manifest(&manifest.id(), Bytes::from(manifest.encode())).await?;
         report.uploaded.push(path.clone());
-        let version = NewVersion { id: VersionId::generate(), manifest: manifest.id(), mtime_ms: before.mtime_ms, exec: before.exec };
+        let exec = if self.fs.has_exec_bit() { before.exec } else { base_exec };
+        let version = NewVersion { id: VersionId::generate(), manifest: manifest.id(), mtime_ms: before.mtime_ms, exec };
         Ok(Some((version, summary.size, before, FileHash::from_bytes(summary.file_hash))))
     }
 

@@ -484,6 +484,11 @@ impl Fs for DiskFs {
         millis(SystemTime::now())
     }
 
+    /// Only Unix-like systems have one; elsewhere (Windows) every file reads as not executable.
+    fn has_exec_bit(&self) -> bool {
+        cfg!(unix)
+    }
+
     fn list(&self, dir: &RelPath) -> io::Result<Vec<FsEntry>> {
         let full = self.require(dir)?;
         if !dir.is_root() && !Self::lstat(&full)?.is_some_and(|md| md.file_type().is_dir()) {

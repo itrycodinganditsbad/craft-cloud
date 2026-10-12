@@ -114,6 +114,25 @@ async fn a_file_saved_again_unchanged_takes_a_remote_edit_without_a_conflict() {
     assert_eq!(files(&a), files(&b));
 }
 
+/// Windows has no executable bit: an edit made there keeps the bit a Unix machine gave the file, and a new file
+/// from there isn't executable.
+#[tokio::test]
+async fn an_edit_on_windows_keeps_the_exec_bit() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut unix = machine(&server, &ana, "laptop").await;
+    let mut windows = machine_with(&server, &ana, "desktop", MemFs::new().without_exec_bit(), 50).await;
+    unix.fs_mut().write(&path("run.sh"), b"echo one", true, 0).unwrap();
+    settle(&mut [&mut unix, &mut windows], 5).await;
+    write(&mut windows, "run.sh", b"echo two");
+    write(&mut windows, "new.sh", b"echo new");
+    settle(&mut [&mut windows, &mut unix], 5).await;
+    assert_eq!(read(&unix, "run.sh"), b"echo two");
+    let exec = |p: &str| matches!(unix.fs().stat(&path(p)).unwrap(), Some(craft_cloud_sync::FsKind::File(m)) if m.exec);
+    assert!(exec("run.sh"), "the edit from Windows cleared the exec bit");
+    assert!(!exec("new.sh"));
+}
+
 #[tokio::test]
 async fn an_edit_wins_over_a_delete() {
     let server = Server::new().await;
