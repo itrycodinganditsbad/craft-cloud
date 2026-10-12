@@ -442,7 +442,7 @@ pub async fn login(data: &DataDir, args: &LoginArgs, password: &str, out: &mut i
         let space = craft_cloud_sync::Transport::space(&transport).await?;
         let marker = RootMarker { space: space.space, root: space.root };
         if existing_marker.is_some_and(|m| m != marker) {
-            return Err(RootError::OtherSpace(folder.clone()).into());
+            return Err(RootError::SetUpForOtherSpace(folder.clone()).into());
         }
         std::fs::create_dir_all(&folder).map_err(io_at(&folder))?;
         let _folder_lock = hold_folder(&folder)?;

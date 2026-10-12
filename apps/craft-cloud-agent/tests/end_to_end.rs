@@ -787,8 +787,10 @@ async fn a_failed_login_setup_revokes_the_new_device() {
     root::write(&a.folder, &marker).unwrap();
     let args = LoginArgs { adopt: true, ..login_args(&server, &a.folder, "pc") };
     let refused = cli::login(&a.data, &args, PASSWORD, &mut Vec::new()).await.unwrap_err();
-    assert!(matches!(refused, AgentError::Root(RootError::OtherSpace(_))), "{refused:?}");
+    assert!(matches!(refused, AgentError::Root(RootError::SetUpForOtherSpace(_))), "{refused:?}");
     assert_eq!(refused.exit(), Exit::NeedsYou);
+    let message = refused.to_string();
+    assert!(message.contains(".craft-cloud") && message.contains("another folder"), "{message}");
     assert_eq!(a.data.load_account().unwrap(), None);
     let user = server.meta.user_by_name("ana").await.unwrap().unwrap();
     let devices = server.meta.list_devices(user.id).await.unwrap();

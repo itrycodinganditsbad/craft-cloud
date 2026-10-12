@@ -35,6 +35,14 @@ pub enum RootError {
     MarkerMissing(PathBuf),
     #[error("{0} is set up for another Craft Cloud space; nothing was synced")]
     OtherSpace(PathBuf),
+    /// At login: the folder already has a marker for another space.
+    #[error(
+        "{} is already set up for another Craft Cloud space; nothing was set up. If that space no longer syncs here, \
+         remove {} (only the agent's folder: your files stay), or choose another folder",
+        .0.display(),
+        .0.join(AGENT_DIR).display()
+    )]
+    SetUpForOtherSpace(PathBuf),
     #[error("{path}: the marker is damaged ({message}); nothing was synced")]
     Damaged { path: PathBuf, message: String },
     #[error("{path}: {source}")]
