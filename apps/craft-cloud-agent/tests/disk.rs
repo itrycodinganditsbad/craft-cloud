@@ -113,6 +113,29 @@ fn a_crash_right_after_the_exchange_never_loses_what_came_out() {
     }
 }
 
+/// Two saves around a landing by exchange (Linux, macOS): one between the engine's check and the exchange, one
+/// between the look at what came out and the exchange back. The newest save ends up at the user's name, the older
+/// one next to it, and the download doesn't land.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[test]
+fn a_second_save_during_the_exchange_back_stays_at_the_name() {
+    use craft_cloud_sync::LandError;
+    let (dir, fs) = disk();
+    let mut fs = fs.saving_before_exchange_back();
+    let old = fs.write(&rel("a.txt"), b"the user's", false, T0).unwrap();
+    let checked = craft_cloud_sync::FileMeta { mtime_ms: old.mtime_ms - 1_000, ..old };
+    let mut w = fs.begin_write(&rel("a.txt")).unwrap();
+    w.write_all(b"download").unwrap();
+    let Err(LandError::Changed(_)) = fs.finish_write(&rel("a.txt"), w, false, T0, Some(checked)) else { panic!("landed") };
+    assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"a newer save");
+    let mut left: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    left.sort();
+    assert_eq!(left.len(), 3, "{left:?}");
+    let aside = left.iter().find(|n| n.ends_with(".cc-aside")).expect("the older save is next to it");
+    assert_eq!(std::fs::read(dir.path().join(aside)).unwrap(), b"the user's");
+    assert_eq!(temps(&fs), 0);
+}
+
 /// Windows: an app holds the file open without letting it be deleted or renamed (no `FILE_SHARE_DELETE`). The
 /// download can't replace it: it comes back as in use by another program, is kept, and lands once the app lets go.
 #[cfg(windows)]

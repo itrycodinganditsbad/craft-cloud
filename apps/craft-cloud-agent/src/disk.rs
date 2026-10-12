@@ -113,6 +113,8 @@ struct Hooks {
     plain_moves: bool,
     /// A landing by exchange stops right after the exchange, as a crash would ([`DiskFs::stopping_after_exchange`]).
     stop_after_exchange: bool,
+    /// An app saves over the target again right before the exchange back ([`DiskFs::saving_before_exchange_back`]).
+    save_before_exchange_back: bool,
 }
 
 /// What a landing record in [`TMP_DIR`] holds: the target, the name its file was moved to, and what both files
@@ -645,6 +647,14 @@ impl DiskFs {
         self
     }
 
+    /// Plays an app that saves over the target (writes "a newer save" and renames it into place) right before a
+    /// landing by exchange exchanges back: for tests of a second save in that instant.
+    #[doc(hidden)]
+    pub fn saving_before_exchange_back(mut self) -> Self {
+        self.hooks.save_before_exchange_back = true;
+        self
+    }
+
     /// Moves `from` to `to` for a landing in steps, never replacing anything (see [`DiskFs::plain_moves`]).
     fn move_for_landing(&self, from: &Path, to: &Path) -> io::Result<Moved> {
         if self.hooks.plain_moves { check_then_rename(from, to).map(|()| Moved::Plain) } else { move_no_replace(from, to) }
@@ -846,15 +856,25 @@ impl DiskFs {
             return Ok(incoming);
         }
         // Something else (an app saved in between): exchanged back, and the download comes back.
+        if self.hooks.save_before_exchange_back {
+            let newer = parent.join(".cc-test-save");
+            fs::write(&newer, b"a newer save")?;
+            fs::rename(&newer, full)?;
+        }
         match exchange(&writer.temp, full) {
-            // The swap file holds the download again, unless an app replaced the target between the look and the
-            // exchange back: then it holds that save, which is moved next to the target (never kept or landed as the
-            // server's version), and the download is gone.
+            // The swap file holds the download again.
             Ok(true) if kind_at(&writer.temp).ok().flatten() == Some(FsKind::File(incoming)) => {
                 self.unswap(&mut writer, &record_path);
                 Err(LandError::Changed(writer))
             }
+            // An app saved over the target again between the look and the exchange back. Its save replaced the
+            // download, so the swap file now holds that newest save and the target the older one. The newest save
+            // belongs at the user's name (it is what the app and the user see as current), so the two are exchanged
+            // once more; the older save, back in the swap file, goes next to the target as `.cc-aside`, where the scan
+            // uploads it. No save is lost, and the download is gone (it is downloaded again). If that exchange fails,
+            // the newest save is the one that goes next to the target: still nothing lost.
             Ok(true) => {
+                let _ = exchange(&writer.temp, full);
                 rescue(&mut writer, full, parent);
                 forget();
                 Err(LandError::Changed(writer))
