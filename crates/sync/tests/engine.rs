@@ -578,6 +578,39 @@ async fn a_file_that_cant_be_removed_doesnt_stop_the_rest() {
     assert_eq!(files(&a), files(&b));
 }
 
+/// A file marked read-only here (Windows) is the user saying "don't change this": the server's delete never removes
+/// it. The node is skipped with that reason and waits, nothing goes back up, and once the mark is cleared the delete
+/// lands.
+#[tokio::test]
+async fn a_read_only_file_is_never_removed_and_the_delete_waits() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "final.doc", b"signed off");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().remove_file(&path("final.doc")).unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().set_read_only(&path("final.doc"), true);
+    let report = b.sync_once().await.unwrap();
+    let why = report.skipped.iter().find(|(p, _)| p == "final.doc").map(|(_, why)| why.clone()).unwrap_or_default();
+    assert!(why.starts_with("read-only here, not removed"), "{report:?}");
+    assert_eq!(read(&b, "final.doc"), b"signed off");
+    // Still read-only: nothing comes back to the server, and the delete keeps waiting.
+    for _ in 0..2 {
+        let report = b.sync_once().await.unwrap();
+        assert!(report.uploaded.is_empty() && report.removed_locally.is_empty(), "{report:?}");
+        assert!(report.skipped.iter().any(|(p, _)| p == "final.doc"), "{report:?}");
+    }
+    a.sync_once().await.unwrap();
+    assert!(files(&a).is_empty(), "{:?}", files(&a));
+    b.fs_mut().set_read_only(&path("final.doc"), false);
+    let report = b.sync_once().await.unwrap();
+    assert_eq!(report.removed_locally, vec![path("final.doc")]);
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert!(files(&b).is_empty());
+}
+
 #[tokio::test]
 async fn a_rename_here_and_an_edit_there_meet_in_one_file() {
     let server = Server::new().await;

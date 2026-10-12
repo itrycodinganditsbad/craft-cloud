@@ -75,6 +75,12 @@ fn kept_key(id: NodeId, file: &FileState) -> String {
 fn per_node(result: Result<(), SyncError>, report: &mut Report) -> Result<bool, SyncError> {
     match result {
         Ok(()) => Ok(false),
+        // A file marked read-only here is the user saying "don't change this": the server's delete waits (the base
+        // keeps the node) until the mark is cleared.
+        Err(SyncError::Io { path, source }) if crate::fs::is_read_only(&source) => {
+            report.skipped.push((path, format!("{source}; waits until it is no longer read-only")));
+            Ok(true)
+        }
         Err(SyncError::Io { path, source }) => {
             report.skipped.push((path, format!("{source}; tried again next pass")));
             Ok(true)

@@ -220,6 +220,29 @@ fn a_read_only_file_is_never_replaced_and_the_kept_download_lands_later() {
     assert_eq!(temps(&fs), 0);
 }
 
+/// Windows: a read-only file is never removed either. The removal fails with the error the engine turns into a
+/// skip ("read-only here, not removed"), the file and its attribute stay, and once the attribute is cleared it goes.
+#[cfg(windows)]
+#[test]
+fn a_read_only_file_is_never_removed() {
+    let (dir, mut fs) = disk();
+    fs.write(&rel("final.doc"), b"signed off", false, T0).unwrap();
+    let path = dir.path().join("final.doc");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&path, perms.clone()).unwrap();
+    let e = fs.remove_file(&rel("final.doc")).unwrap_err();
+    assert!(craft_cloud_sync::is_read_only(&e), "{e}");
+    assert_eq!(e.to_string(), "read-only here, not removed");
+    assert_eq!(std::fs::read(&path).unwrap(), b"signed off");
+    assert!(std::fs::metadata(&path).unwrap().permissions().readonly(), "the attribute stays");
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&path, perms).unwrap();
+    fs.remove_file(&rel("final.doc")).unwrap();
+    assert!(!path.exists());
+}
+
 /// A kept download that changed on disk since it was kept is hashed again when taken back, and dropped.
 #[test]
 fn a_kept_download_that_changed_on_disk_is_dropped() {

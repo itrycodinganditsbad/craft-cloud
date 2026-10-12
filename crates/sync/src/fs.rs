@@ -81,6 +81,30 @@ impl<W> From<LandError<W>> for io::Error {
     }
 }
 
+/// Why [`Fs::remove_file`] refused a file: it is marked read-only here (the Windows attribute), which is the user
+/// saying "don't change this". The engine skips the node with this reason and keeps its base, so the delete waits
+/// until the mark is cleared. Make one with [`read_only_error`], tell one with [`is_read_only`].
+#[derive(Debug)]
+pub struct ReadOnly;
+
+impl std::fmt::Display for ReadOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("read-only here, not removed")
+    }
+}
+
+impl std::error::Error for ReadOnly {}
+
+/// The error [`Fs::remove_file`] gives for a file marked read-only here (see [`ReadOnly`]).
+pub fn read_only_error() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, ReadOnly)
+}
+
+/// Whether `e` is [`read_only_error`]'s.
+pub fn is_read_only(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<ReadOnly>())
+}
+
 pub trait Fs: Send {
     /// A file being written by [`Fs::begin_write`]. Dropping it without [`Fs::finish_write`] abandons the write
     /// and leaves the target untouched.
@@ -172,6 +196,7 @@ pub trait Fs: Send {
         self.finish_write(path, w, exec, mtime_ms, expected).map_err(io::Error::from)
     }
     fn mkdir(&mut self, path: &RelPath) -> io::Result<()>;
+    /// Removes a file. A file marked read-only here (Windows) is never removed: [`read_only_error`].
     fn remove_file(&mut self, path: &RelPath) -> io::Result<()>;
     /// Removes an empty directory; fails if it has entries.
     fn remove_dir(&mut self, path: &RelPath) -> io::Result<()>;
@@ -200,6 +225,8 @@ pub struct MemFs {
     next_id: u64,
     locked: BTreeSet<RelPath>,
     held: BTreeSet<RelPath>,
+    /// Files marked read-only, like the Windows attribute (see [`MemFs::set_read_only`]).
+    read_only: BTreeSet<RelPath>,
     death: Option<Arc<Death>>,
     /// False to act like Windows: no file is executable (see [`MemFs::without_exec_bit`]).
     exec_bit: bool,
@@ -243,6 +270,7 @@ impl Default for MemFs {
             next_id: 2,
             locked: BTreeSet::new(),
             held: BTreeSet::new(),
+            read_only: BTreeSet::new(),
             death: None,
             exec_bit: true,
             swap: true,
@@ -384,6 +412,17 @@ impl MemFs {
 
     pub fn release(&mut self, path: &RelPath) {
         self.held.remove(path);
+    }
+
+    /// Marks the file at `path` read-only (`true`) or clears the mark, like the Windows attribute: a read-only file is
+    /// never removed ([`read_only_error`]) or replaced ([`LandError::InUse`], "read-only here, not replaced"). It can
+    /// still be read and renamed (the mark goes with it).
+    pub fn set_read_only(&mut self, path: &RelPath, read_only: bool) {
+        if read_only {
+            self.read_only.insert(path.clone());
+        } else {
+            self.read_only.remove(path);
+        }
     }
 
     /// Lets every locked and held path go.
@@ -536,6 +575,9 @@ impl Fs for MemFs {
         if self.held.contains(path) {
             return Err(LandError::InUse(writer, io::Error::new(io::ErrorKind::PermissionDenied, "in use by another program")));
         }
+        if self.read_only.contains(path) {
+            return Err(LandError::InUse(writer, io::Error::new(io::ErrorKind::PermissionDenied, "read-only here, not replaced")));
+        }
         if self.swap {
             // One exchange, and the file that came out is the expected one: it goes.
             self.nodes.insert(path.clone(), MemNode::File { data: writer, meta });
@@ -620,6 +662,7 @@ impl Fs for MemFs {
         self.change()?;
         self.check_held(path)?;
         match self.nodes.get(path) {
+            Some(MemNode::File { .. }) if self.read_only.contains(path) => Err(read_only_error()),
             Some(MemNode::File { .. } | MemNode::Other) => {
                 self.nodes.remove(path);
                 Ok(())
@@ -654,6 +697,14 @@ impl Fs for MemFs {
         }
         self.require_parent(to)?;
         self.move_node(from, to);
+        // Read-only marks go with the files.
+        let marked: Vec<RelPath> = self.read_only.iter().filter(|p| p.starts_with(from)).cloned().collect();
+        for old in marked {
+            self.read_only.remove(&old);
+            let mut names = to.names().to_vec();
+            names.extend_from_slice(old.names().get(from.depth()..).unwrap_or_default());
+            self.read_only.insert(RelPath::from_names(names));
+        }
         Ok(())
     }
 }

@@ -1396,6 +1396,9 @@ impl Fs for DiskFs {
         let full = self.require(path)?;
         match Self::lstat(&full)? {
             Some(md) if md.file_type().is_dir() => Err(io::Error::other(format!("{path}: is a directory"))),
+            // Windows: a read-only file is the user saying "don't change this", and is never removed (Rust's removal
+            // would clear the attribute and go ahead). On Unix the folder's write permission decides, as usual.
+            Some(md) if cfg!(windows) && md.file_type().is_file() && md.permissions().readonly() => Err(craft_cloud_sync::read_only_error()),
             Some(_) => fs::remove_file(&full),
             None => Err(not_found(path)),
         }
