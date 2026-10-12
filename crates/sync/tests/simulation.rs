@@ -494,6 +494,10 @@ async fn run(seed: u64, steps: usize) {
                 }
                 *left = match &r {
                     _ if crash => *left,
+                    // What the crash left behind a link the user made meanwhile (a file the crashed pass downloaded
+                    // into a folder that is a link now) is out of the engine's sight: it redoes that bookkeeping once
+                    // the link is real again, so a pass with the link in place doesn't count.
+                    Ok(_) if link_seen => *left,
                     Ok(report) if settled(report) => 0,
                     Ok(_) => *left - 1,
                     // A pass that failed partway hasn't redone the bookkeeping yet; it doesn't count.
