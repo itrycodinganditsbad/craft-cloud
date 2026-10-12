@@ -349,6 +349,11 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         let mut queue = vec![RelPath::root()];
         while let Some(dir) = queue.pop() {
             for entry in self.fs.list(&dir).map_err(|e| io_err(&dir, e))? {
+                // Ignored names are out of sync's sight, as in the scan: a file renamed to one (an app's
+                // temp name mid-save) isn't the tracked file moved, and push couldn't send that move.
+                if self.config.ignored(&entry.name) {
+                    continue;
+                }
                 let Ok(name) = Name::new(&entry.name) else { continue };
                 let path = dir.join(&name);
                 match entry.kind {

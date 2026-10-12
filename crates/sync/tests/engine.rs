@@ -667,3 +667,21 @@ async fn a_folder_that_cant_be_listed_is_never_deleted_on_the_server() {
     assert_eq!(files(&a), files(&b));
     assert_eq!(a.fs().dirs(), b.fs().dirs());
 }
+
+#[tokio::test]
+async fn a_file_renamed_to_an_ignored_name_doesnt_take_the_remote_edit() {
+    // Word renames the document to a `~WRL….tmp` name mid-save. That file is out of sync's sight, so it
+    // must not count as the tracked file moved: the remote edit lands at the old name and stays on the server.
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "doc.txt", b"v1");
+    settle(&mut [&mut a, &mut b], 5).await;
+    b.fs_mut().rename(&path("doc.txt"), &path("doc.tmp")).unwrap();
+    write(&mut a, "doc.txt", b"v2 laptop");
+    settle(&mut [&mut a, &mut b], 8).await;
+    assert_eq!(read(&a, "doc.txt"), b"v2 laptop");
+    assert_eq!(read(&b, "doc.txt"), b"v2 laptop");
+    assert_eq!(read(&b, "doc.tmp"), b"v1");
+}
