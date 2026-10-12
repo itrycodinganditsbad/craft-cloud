@@ -13,7 +13,7 @@ pub mod state;
 pub mod transport;
 
 pub use engine::{Config, DEFAULT_IGNORES, Engine, OTHER_REASON, Report, SyncError};
-pub use fs::{FileMeta, Fs, FsEntry, FsKind, MemFs, rel};
+pub use fs::{FileMeta, Fs, FsEntry, FsKind, LandError, MemFs, rel};
 pub use path::RelPath;
 pub use state::{BaseEntry, BaseKind, RemoteNode, State};
 pub use transport::{Transport, TransportError};

@@ -24,7 +24,7 @@ use craft_cloud_proto::{
     Conflict, ConflictStamp, DeviceId, Epoch, FileHash, FileState, FoldKey, Manifest, ManifestId, Name, NewVersion, NodeId, PageCursor, conflict_name,
 };
 
-use crate::fs::{FileMeta, Fs, FsKind};
+use crate::fs::{FileMeta, Fs, FsKind, LandError};
 use crate::path::RelPath;
 use crate::state::{BaseEntry, BaseKind, RemoteNode, State};
 use crate::transport::{Transport, TransportError};
@@ -51,10 +51,22 @@ pub enum SyncError {
     Io { path: String, source: io::Error },
     #[error("{0}")]
     Corrupt(String),
+    /// The state couldn't be saved at a checkpoint (see [`Engine::on_checkpoint`]); the pass stops there.
+    #[error("can't save the sync state: {0}")]
+    Checkpoint(io::Error),
 }
+
+/// Saves the engine's state during a pass (see [`Engine::on_checkpoint`]).
+pub type Checkpoint = Box<dyn FnMut(&State) -> io::Result<()> + Send + Sync>;
 
 fn io_err(path: &RelPath, source: io::Error) -> SyncError {
     SyncError::Io { path: path.to_string(), source }
+}
+
+/// The key a download of `file`, a version of node `id`, is kept under ([`Fs::keep`]): node, version and manifest,
+/// so a kept file is only ever landed as exactly that version.
+fn kept_key(id: NodeId, file: &FileState) -> String {
+    format!("{id}.{}.{}", file.version, file.manifest)
 }
 
 /// A filesystem error while handling one node (a file an app holds open, a folder that can't be listed)
@@ -253,6 +265,7 @@ pub struct Engine<F: Fs, T: Transport> {
     approval: Approval,
     /// Counts the engine's own changes to the folder, so per-pass caches of what is where can tell they are stale.
     fs_changes: u64,
+    checkpoint: Option<Checkpoint>,
 }
 
 /// Which deletions the mass-delete guard lets through this pass.
@@ -285,7 +298,23 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         stamp: impl Fn() -> ConflictStamp + Send + Sync + 'static,
     ) -> Result<Self, SyncError> {
         let chunker = Chunker::new(FASTCDC_V1).map_err(|e| SyncError::Corrupt(e.to_string()))?;
-        Ok(Self { fs, transport, state, chunker, config, stamp: Box::new(stamp), approval: Approval::None, fs_changes: 0 })
+        Ok(Self { fs, transport, state, chunker, config, stamp: Box::new(stamp), approval: Approval::None, fs_changes: 0, checkpoint: None })
+    }
+
+    /// Saves the state at safe points during a pass, so a crash loses less than the whole pass: once the server's
+    /// changes are applied here, before a commit that deletes files (recording them in [`State::sent_deletes`]),
+    /// and after every commit is recorded. The state is consistent at each of them, as it is when a pass fails. An
+    /// error from `save` stops the pass ([`SyncError::Checkpoint`]); before a commit that means it isn't sent.
+    /// The caller still saves the state after the pass.
+    pub fn on_checkpoint(&mut self, save: impl FnMut(&State) -> io::Result<()> + Send + Sync + 'static) {
+        self.checkpoint = Some(Box::new(save));
+    }
+
+    fn checkpoint(&mut self) -> Result<(), SyncError> {
+        match &mut self.checkpoint {
+            Some(save) => save(&self.state).map_err(SyncError::Checkpoint),
+            None => Ok(()),
+        }
     }
 
     pub fn state(&self) -> &State {
@@ -325,12 +354,18 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// caller can save it and simply run another pass later.
     pub async fn sync_once(&mut self) -> Result<Report, SyncError> {
         let mut report = Report::default();
+        // A landing a crash cut short is put right before anything looks at the folder.
+        if let Err(e) = self.fs.recover() {
+            report.skipped.push((".craft-cloud/tmp".into(), format!("an interrupted download couldn't be put right ({e}); tried again next pass")));
+        }
         let mode = match self.pull().await? {
             Mode::Normal if self.state.reconcile_pending => Mode::Reconcile,
             mode => mode,
         };
         self.apply_remote(mode, &mut report).await?;
         self.state.reconcile_pending = false;
+        self.discard_stale_downloads();
+        self.checkpoint()?;
         self.push(&mut report).await?;
         self.approval = Approval::None;
         Ok(report)
@@ -459,16 +494,18 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     report.skipped.push((shown, "the name can't exist on every system Craft Cloud supports".into()));
                     continue;
                 };
+                // A link hides what is tracked at its name even when a case twin wins the name (in a folder the user
+                // renamed, neither name is tracked yet): the tracked file behind it is never taken for deleted.
+                if entry.kind == FsKind::Other {
+                    links.insert((dir.clone(), name.fold_key()));
+                }
                 if let Some(first) = seen.insert(name.fold_key(), name.clone()) {
                     report.skipped.push((shown, format!("the name clashes with {first} when case is ignored")));
                     continue;
                 }
                 let path = dir.join(&name);
                 match entry.kind {
-                    FsKind::Other => {
-                        report.skipped.push((shown, OTHER_REASON.into()));
-                        links.insert((dir.clone(), name.fold_key()));
-                    }
+                    FsKind::Other => report.skipped.push((shown, OTHER_REASON.into())),
                     FsKind::Dir { .. } if path.depth() > MAX_TREE_DEPTH => {
                         report.skipped.push((shown, "folders nest too deep".into()));
                         unknown.push(path);
@@ -582,16 +619,18 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         Ok(true)
     }
 
-    /// A free conflict-copy path next to `path`.
+    /// A free conflict-copy path next to `path`: nothing is there, and no tracked node has it as its place (one the
+    /// user moved away, say), so settling that node later never acts on the copy.
     fn conflict_path(&self, path: &RelPath, is_dir: bool) -> Result<RelPath, SyncError> {
         let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
             return Err(SyncError::Corrupt("the root has no conflict copy".into()));
         };
         let stamp = (self.stamp)();
+        let tracked = self.state.base_index();
         for counter in 1..=1000 {
             let candidate = conflict_name(name, is_dir, &self.config.device_name, stamp, counter).map_err(|e| SyncError::Corrupt(e.to_string()))?;
             let target = parent.join(&candidate);
-            if self.stat(&target)?.is_none() {
+            if !tracked.contains_key(&target) && self.stat(&target)?.is_none() {
                 return Ok(target);
             }
         }
@@ -666,16 +705,19 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         Ok(manifest)
     }
 
-    /// Downloads a file version and writes it to `path` atomically, chunk by chunk, after checking every chunk
-    /// and the whole-file hash. A damaged download is abandoned and `path` stays as it was.
+    /// Downloads a version of the file node `id` and writes it to `path` atomically, chunk by chunk, after checking
+    /// every chunk and the whole-file hash. A damaged download is abandoned and `path` stays as it was.
     ///
     /// `expected` is what the caller found at `path` before it decided the download may replace it: the file as
-    /// stat'ed *before* it was verified, or `None` for a path that must be empty. If `path` differs from that when
-    /// the download is ready to land (an app saved the file while it was hashed or while the download ran), the
-    /// download is abandoned and `None` returned: the base keeps the old version, so the next pass sees a local
-    /// change and takes the conflict path.
+    /// stat'ed *before* it was verified, or `None` for a path that must be empty. The download lands only on exactly
+    /// that, in one step ([`Fs::finish_write`]): if an app saved the file while it was hashed or while the download
+    /// ran, `None` is returned and the base keeps the old version, so the next pass sees a local change and takes the
+    /// conflict path. If a program holds the file open so it can't be replaced, the node is skipped this pass (a
+    /// filesystem error on it). Either way the download is kept ([`Fs::keep`]), and a later landing of the same
+    /// version takes it instead of downloading again, as long as that version is current.
     async fn download(
         &mut self,
+        id: NodeId,
         file: &FileState,
         path: &RelPath,
         expected: Option<FsKind>,
@@ -683,30 +725,86 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     ) -> Result<Option<(FileMeta, FileHash)>, SyncError> {
         let manifest = self.fetch_manifest(&file.manifest).await?;
         self.no_link(path)?;
-        let mut writer = self.fs.begin_write(path).map_err(|e| io_err(path, e))?;
-        let mut hasher = blake3::Hasher::new();
-        for chunk in manifest.chunks() {
-            let bytes = self.transport.get_chunk(&chunk.id).await?;
-            if *blake3::hash(&bytes).as_bytes() != *chunk.id.as_bytes() || bytes.len() as u64 != u64::from(chunk.len) {
-                return Err(SyncError::Corrupt(format!("chunk {} of {path} is damaged", chunk.id)));
-            }
-            hasher.update(&bytes);
-            writer.write_all(&bytes).map_err(|e| io_err(path, e))?;
-        }
-        if *hasher.finalize().as_bytes() != *manifest.file_hash().as_bytes() {
-            return Err(SyncError::Corrupt(format!("{path} doesn't match its file hash")));
-        }
-        // Not an atomic compare-and-replace (that needs the `Fs` trait's help), but it closes the window the
-        // verification and the network round trips opened.
-        if self.stat(path)? != expected {
+        let changed = |report: &mut Report| {
             report.skipped.push((path.to_string(), "changed here while the server's version downloaded; tried again next pass".into()));
-            return Ok(None);
-        }
+        };
+        let expected = match expected {
+            None => None,
+            Some(FsKind::File(meta)) => Some(meta),
+            // Something that isn't a file can't be replaced by one.
+            Some(_) => {
+                changed(report);
+                return Ok(None);
+            }
+        };
+        let key = kept_key(id, file);
+        // A kept download of this very version lands without downloading again, once its content is hashed again
+        // against the version's file hash; one that changed on disk, or can't be taken back, is downloaded again.
+        let writer = match self.fs.take_kept(&key, manifest.file_hash()) {
+            Ok(Some(writer)) => writer,
+            Ok(None) | Err(_) => {
+                let mut writer = self.fs.begin_write(path).map_err(|e| io_err(path, e))?;
+                let mut hasher = blake3::Hasher::new();
+                for chunk in manifest.chunks() {
+                    let bytes = self.transport.get_chunk(&chunk.id).await?;
+                    if *blake3::hash(&bytes).as_bytes() != *chunk.id.as_bytes() || bytes.len() as u64 != u64::from(chunk.len) {
+                        return Err(SyncError::Corrupt(format!("chunk {} of {path} is damaged", chunk.id)));
+                    }
+                    hasher.update(&bytes);
+                    writer.write_all(&bytes).map_err(|e| io_err(path, e))?;
+                }
+                if *hasher.finalize().as_bytes() != *manifest.file_hash().as_bytes() {
+                    return Err(SyncError::Corrupt(format!("{path} doesn't match its file hash")));
+                }
+                writer
+            }
+        };
         self.no_link(path)?;
-        let meta = self.fs.finish_write(path, writer, file.exec, file.mtime_ms).map_err(|e| io_err(path, e))?;
+        let landed = self.fs.finish_write(path, writer, file.exec, file.mtime_ms, expected);
+        // A landing in steps changes the folder even when it doesn't land.
         self.fs_changes += 1;
-        report.downloaded.push(path.clone());
-        Ok(Some((meta, *manifest.file_hash())))
+        match landed {
+            Ok(meta) => {
+                report.downloaded.push(path.clone());
+                Ok(Some((meta, *manifest.file_hash())))
+            }
+            Err(LandError::Changed(writer)) => {
+                // Kept for the next pass, which lands it next to the user's file (a conflict copy) or on it.
+                let _ = self.fs.keep(writer, &key);
+                changed(report);
+                Ok(None)
+            }
+            Err(LandError::InUse(writer, why)) => {
+                // The server's version is downloaded and kept here; it lands once the file can be replaced.
+                let kept = self.fs.keep(writer, &key).is_ok();
+                let what = if kept { "the server's version is downloaded and kept, and lands once it can" } else { "not replaced" };
+                Err(io_err(path, io::Error::new(why.kind(), format!("{why}; {what}"))))
+            }
+            Err(LandError::Io(e)) => Err(io_err(path, e)),
+        }
+    }
+
+    /// Drops kept downloads ([`Fs::keep`]) of versions that are no longer current, or already here.
+    fn discard_stale_downloads(&mut self) {
+        let Ok(keys) = self.fs.kept() else { return };
+        if keys.is_empty() {
+            return;
+        }
+        let wanted: HashSet<String> = self
+            .state
+            .remote
+            .iter()
+            .filter_map(|(id, r)| {
+                let file = r.file.as_ref()?;
+                let here = matches!(self.state.base.get(id).map(|e| &e.kind), Some(BaseKind::File { version, .. }) if *version == file.version);
+                (!here).then(|| kept_key(*id, file))
+            })
+            .collect();
+        for key in keys {
+            if !wanted.contains(&key) {
+                let _ = self.fs.discard_kept(&key);
+            }
+        }
     }
 
     /// The local file at `path`, if it holds exactly the content of the server's version `file`. The file is
@@ -734,6 +832,17 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// Whether a local file ID belongs to any tracked file.
     fn tracks_local_file(&self, local_id: Option<u64>) -> bool {
         local_id.is_some_and(|lid| self.state.base.values().any(|e| matches!(e.kind, BaseKind::File { local_id: Some(l), .. } if l == lid)))
+    }
+
+    /// Whether a tracked file the server still has, other than `except` (the node adopting), owns local ID `local_id`:
+    /// such a file is that node's (the user moved it), never adopted by another node. One the server deleted is let
+    /// go this pass anyway.
+    fn live_node_owns(&self, local_id: Option<u64>, except: NodeId) -> bool {
+        local_id.is_some_and(|lid| {
+            self.state.base.iter().any(|(id, e)| {
+                *id != except && self.state.remote.contains_key(id) && matches!(e.kind, BaseKind::File { local_id: Some(l), .. } if l == lid)
+            })
+        })
     }
 
     /// Whether another tracked file (not `except`) has local ID `local_id`.

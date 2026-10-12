@@ -15,6 +15,25 @@ use super::{Engine, Local, Mode, OTHER_REASON, Report, SyncError, io_err, per_no
 impl<F: Fs, T: Transport> Engine<F, T> {
     pub(super) async fn apply_remote(&mut self, mode: Mode, report: &mut Report) -> Result<(), SyncError> {
         let root = self.state.root.ok_or_else(|| SyncError::Corrupt("no root".into()))?;
+        // Files this machine deleted on the server in a commit whose answer it never recorded: if the delete went
+        // through (the node is gone, or back at another version because an edit elsewhere won over the delete), it is
+        // its own (see `State::sent_deletes`). Those nodes are let go before anything else, so nothing here removes,
+        // replaces or moves aside what is at their places now: that goes up as new files, and a node brought back
+        // arrives as a new one at its own place.
+        let own: Vec<NodeId> = self
+            .state
+            .sent_deletes
+            .iter()
+            .filter(|(id, deleted)| {
+                let went_through = self.state.remote.get(id).is_none_or(|r| r.file.as_ref().is_none_or(|f| f.version != **deleted));
+                went_through && matches!(self.state.base.get(id).map(|e| &e.kind), Some(BaseKind::File { .. }))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in own {
+            self.state.base.remove(&id);
+        }
+        self.state.sent_deletes.clear();
         // Changed or new remote nodes, parents first.
         let mut work: Vec<(usize, NodeId)> =
             self.state.remote.keys().filter(|id| **id != root).filter_map(|id| Some((self.state.remote_path(*id)?.depth(), *id))).collect();
@@ -129,11 +148,11 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     }
 
     /// Whether applying the server's state of `id` would change anything here: a new node, or a tracked one the
-    /// server moved or gave a new version.
+    /// server moved or gave new content (a new version with the agreed manifest and exec bit only gets recorded).
     fn changes_here(&self, id: NodeId) -> bool {
         let (Some(entry), Some(remote)) = (self.state.base.get(&id), self.state.remote.get(&id)) else { return true };
         let new_version = match (&entry.kind, &remote.file) {
-            (BaseKind::File { version, .. }, Some(f)) => *version != f.version,
+            (BaseKind::File { manifest, exec, .. }, Some(f)) => *manifest != f.manifest || *exec != f.exec,
             _ => false,
         };
         new_version || self.state.base_path(id) != self.state.remote_path(id)
@@ -224,17 +243,32 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     }
 
     async fn apply_changed(&mut self, id: NodeId, report: &mut Report) -> Result<(), SyncError> {
-        let (Some(entry), Some(remote)) = (self.state.base.get(&id).cloned(), self.state.remote.get(&id).cloned()) else { return Ok(()) };
+        let (Some(mut entry), Some(remote)) = (self.state.base.get(&id).cloned(), self.state.remote.get(&id).cloned()) else { return Ok(()) };
         let Some(rpath) = self.state.remote_path(id) else { return Ok(()) };
         // No base path: the folder it was tracked in was let go this pass (moved aside as a conflict copy, say).
         // It is then looked up by local ID, like a node moved on both sides.
         let base_path = self.state.base_path(id);
-        let new_version = match (&entry.kind, &remote.file) {
+        let mut new_version = match (&entry.kind, &remote.file) {
             (BaseKind::File { version, .. }, Some(f)) => *version != f.version,
             (BaseKind::Dir { .. }, None) => false,
             // A node can't change kind; treat it as damaged state and leave it.
             _ => return Ok(()),
         };
+        // Same content is no change: a version with the manifest and executable bit both sides agreed on (a file
+        // saved again unchanged elsewhere) is recorded without touching the local file, so nothing is downloaded or
+        // compared, and a file that can't be read here doesn't become a conflict copy. A move that came with it is
+        // applied as any other.
+        if new_version
+            && let (BaseKind::File { version, manifest, exec, .. }, Some(f)) = (&mut entry.kind, &remote.file)
+            && *manifest == f.manifest
+            && *exec == f.exec
+        {
+            *version = f.version;
+            if let Some(base) = self.state.base.get_mut(&id) {
+                base.kind = entry.kind.clone();
+            }
+            new_version = false;
+        }
         let moved = base_path.as_ref() != Some(&rpath);
         if !moved && !new_version {
             return Ok(());
@@ -276,7 +310,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 // Saved here meanwhile: the base keeps the old version at the server's place, so the next pass
                 // sees an edit on both sides again (and the conflict copy goes up as a new file).
                 if let Some(file) = &remote.file
-                    && let Some((meta, hash)) = self.download(file, &rpath, None, report).await?
+                    && let Some((meta, hash)) = self.download(id, file, &rpath, None, report).await?
                 {
                     new_entry.kind = self.base_file(file, meta, hash);
                 }
@@ -294,7 +328,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 // state still describes it after a relocate.
                 if new_version
                     && let Some(file) = &remote.file
-                    && let Some((meta, hash)) = self.download(file, &rpath, checked, report).await?
+                    && let Some((meta, hash)) = self.download(id, file, &rpath, checked, report).await?
                 {
                     new_entry.kind = self.base_file(file, meta, hash);
                 }
@@ -375,7 +409,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     self.state.base.insert(id, new_entry.clone());
                 }
                 // A rename keeps the file's ID and time, so the checked state still describes it.
-                if let Some((meta, hash)) = self.download(file, &target, checked, report).await? {
+                if let Some((meta, hash)) = self.download(id, file, &target, checked, report).await? {
                     new_entry.kind = self.base_file(file, meta, hash);
                 }
             } else if let Some((meta, hash)) = self.same_content(file, &found).await? {
@@ -390,7 +424,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 self.settle_occupants(id, &target, Some(&found), None, report).await?;
                 self.move_aside(&found, report)?;
                 self.ensure_free(&target, report)?;
-                if let Some((meta, hash)) = self.download(file, &target, None, report).await? {
+                if let Some((meta, hash)) = self.download(id, file, &target, None, report).await? {
                     new_entry.kind = self.base_file(file, meta, hash);
                 }
             }
@@ -406,7 +440,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         }
         self.ensure_free(&rpath, report)?;
         // Saved here meanwhile: the old version stays in the base, so the next pass sees an edit on both sides.
-        if let Some((meta, hash)) = self.download(file, &rpath, None, report).await? {
+        if let Some((meta, hash)) = self.download(id, file, &rpath, None, report).await? {
             new_entry.kind = self.base_file(file, meta, hash);
         }
         self.state.base.insert(id, new_entry);
@@ -414,7 +448,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     }
 
     /// If an untracked file at `rpath` holds exactly the server's version `file`, the node `id` adopts it (any case
-    /// twin is moved aside) and true is returned. Occupants are settled by the caller first.
+    /// twin is moved aside) and true is returned. Occupants are settled by the caller first. A file whose local ID
+    /// belongs to a tracked node the server still has (one the user moved there) is that node's, never adopted: two nodes never share
+    /// one file.
     async fn adopt_in_place(
         &mut self,
         id: NodeId,
@@ -427,6 +463,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             return Ok(false);
         }
         let Some((meta, hash)) = self.same_content(file, rpath).await? else { return Ok(false) };
+        if self.live_node_owns(meta.id, id) {
+            return Ok(false);
+        }
         if let Some(twin) = self.case_twin(rpath)? {
             self.move_aside(&twin, report)?;
         }
@@ -768,13 +807,14 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             }
             (Some(file), None) => {
                 // Saved here meanwhile: not taken this pass; the next one meets the file as a local copy.
-                let Some((meta, hash)) = self.download(file, &rpath, None, report).await? else { return Ok(()) };
+                let Some((meta, hash)) = self.download(id, file, &rpath, None, report).await? else { return Ok(()) };
                 self.base_file(file, meta, hash)
             }
             (Some(file), Some(FsKind::File(meta))) => {
                 let manifest = self.fetch_manifest(&file.manifest).await?;
-                if self.content_hash(&rpath) == Some(*manifest.file_hash()) {
-                    // Same content already here: adopt it.
+                if self.content_hash(&rpath) == Some(*manifest.file_hash()) && !self.live_node_owns(meta.id, id) {
+                    // Same content already here: adopt it (unless it is a tracked file the user moved here: two nodes
+                    // never share one file).
                     self.base_file(file, meta, *manifest.file_hash())
                 } else if mode == Mode::Reconcile && Some(file.epoch) != self.state.epoch {
                     // After a restore, a file the server only knows from before keeps our newer copy:
@@ -792,14 +832,14 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 } else {
                     self.move_aside(&rpath, report)?;
                     // Saved here meanwhile: not taken this pass; the next one meets the file as a local copy.
-                    let Some((meta, hash)) = self.download(file, &rpath, None, report).await? else { return Ok(()) };
+                    let Some((meta, hash)) = self.download(id, file, &rpath, None, report).await? else { return Ok(()) };
                     self.base_file(file, meta, hash)
                 }
             }
             (Some(file), Some(_)) => {
                 self.move_aside(&rpath, report)?;
                 // Saved here meanwhile: not taken this pass; the next one meets the file as a local copy.
-                let Some((meta, hash)) = self.download(file, &rpath, None, report).await? else { return Ok(()) };
+                let Some((meta, hash)) = self.download(id, file, &rpath, None, report).await? else { return Ok(()) };
                 self.base_file(file, meta, hash)
             }
         };

@@ -11,6 +11,77 @@ fn writes_are_atomic_and_give_a_new_identity() {
 }
 
 #[test]
+fn writes_land_only_on_what_was_checked() {
+    c::writes_land_only_on_what_was_checked(&mut MemFs::new());
+    c::writes_land_only_on_what_was_checked(&mut MemFs::new().without_swap());
+}
+
+#[test]
+fn kept_writes_land_later() {
+    c::kept_writes_land_later(&mut MemFs::new());
+}
+
+/// A held file ([`MemFs::hold`]) can't be replaced: the write comes back as in use and lands once it is let go.
+#[test]
+fn a_held_file_is_in_use_for_a_landing() {
+    use std::io::Write;
+
+    use craft_cloud_sync::{Fs, LandError, rel};
+    for mut fs in [MemFs::new(), MemFs::new().without_swap()] {
+        let meta = fs.write(&rel("open.doc"), b"old", false, 0).unwrap();
+        fs.hold(&rel("open.doc"));
+        let mut w = fs.begin_write(&rel("open.doc")).unwrap();
+        w.write_all(b"new").unwrap();
+        let Err(LandError::InUse(w, _)) = fs.finish_write(&rel("open.doc"), w, false, 0, Some(meta)) else { panic!("replaced a held file") };
+        assert_eq!(fs.files().len(), 1);
+        assert_eq!(fs.read(&rel("open.doc")).unwrap(), b"old");
+        fs.release(&rel("open.doc"));
+        fs.finish_write(&rel("open.doc"), w, false, 0, Some(meta)).unwrap();
+        assert_eq!(fs.read(&rel("open.doc")).unwrap(), b"new");
+    }
+}
+
+/// A landing in steps that a dying machine cuts short leaves the old file or the new one, never neither: the next
+/// pass's [`Fs::recover`] puts the moved file back, or removes it once the new one is in place. If something took
+/// the free name meanwhile, the moved file stays as it is, next to it.
+#[test]
+fn a_landing_in_steps_cut_short_is_put_right() {
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use craft_cloud_sync::{Fs, rel};
+    for n in 0..5 {
+        let mut fs = MemFs::new().without_swap();
+        let meta = fs.write(&rel("a.txt"), b"old", false, 0).unwrap();
+        fs.die_after(n, Arc::new(AtomicBool::new(false)));
+        let mut w = fs.begin_write(&rel("a.txt")).unwrap();
+        w.write_all(b"new").unwrap();
+        let landed = fs.finish_write(&rel("a.txt"), w, false, 0, Some(meta)).is_ok();
+        fs.revive();
+        fs.recover().unwrap();
+        let files = fs.files();
+        assert_eq!(files.len(), 1, "after {n} steps: {files:?}");
+        let expected: &[u8] = if n >= 2 { b"new" } else { b"old" };
+        assert_eq!(files.get(&rel("a.txt")).map(Vec::as_slice), Some(expected), "after {n} steps");
+        assert_eq!(landed, n >= 3);
+    }
+    // The old file moved aside, then the machine died, then a user saved at the free name.
+    let mut fs = MemFs::new().without_swap();
+    let meta = fs.write(&rel("a.txt"), b"old", false, 0).unwrap();
+    fs.die_after(1, Arc::new(AtomicBool::new(false)));
+    let mut w = fs.begin_write(&rel("a.txt")).unwrap();
+    w.write_all(b"new").unwrap();
+    assert!(fs.finish_write(&rel("a.txt"), w, false, 0, Some(meta)).is_err());
+    fs.revive();
+    fs.write(&rel("a.txt"), b"the user's", false, 0).unwrap();
+    fs.recover().unwrap();
+    let mut contents: Vec<Vec<u8>> = fs.files().into_values().collect();
+    contents.sort();
+    assert_eq!(contents, [b"old".to_vec(), b"the user's".to_vec()]);
+}
+
+#[test]
 fn ranges_stop_at_the_end_of_the_file() {
     c::ranges_stop_at_the_end_of_the_file(&mut MemFs::new());
 }

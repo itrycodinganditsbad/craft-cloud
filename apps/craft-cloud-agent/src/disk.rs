@@ -6,18 +6,35 @@
 //!   between them is still followed; closing that needs `openat`-style calls and comes with the watcher.)
 //! - **The root itself may be a link.** A synced folder that is a symlink or junction (the user's choice) is
 //!   followed and is a folder; links *inside* it are still [`FsKind::Other`].
-//! - **Writes are atomic.** New content goes to a temporary file in `<root>/.craft-cloud/tmp/` (same volume,
-//!   so the rename is atomic), is flushed to disk, gets the replaced file's permissions (Unix), its modification
-//!   time and executable bit, and is then renamed over the target. Any error, or a writer dropped without
-//!   [`Fs::finish_write`], removes the temporary file.
+//! - **Writes are atomic, and land only on what was checked.** New content goes to a temporary file in
+//!   `<root>/.craft-cloud/tmp/` (same volume, so renames are atomic), is flushed to disk, gets the replaced file's
+//!   permissions (Unix), its modification time and executable bit, and then lands at the target only if the target
+//!   holds what the engine checked ([`Fs::finish_write`]): nothing (a no-replace rename), or exactly the file it
+//!   verified. On Linux and macOS the two files are exchanged in one step (`renameat2(RENAME_EXCHANGE)`,
+//!   `renameatx_np(RENAME_SWAP)`) and the one that came out is compared with what was expected; anything else is
+//!   exchanged back. On Windows, and on filesystems without an exchange, the landing takes steps: the file there is
+//!   moved to `<name>.<random>.cc-aside` next to it (never replacing anything), checked, the download renamed into
+//!   the free name, and the moved file removed, with a record in the temporary folder written first. A crash between
+//!   the steps leaves both files on disk, never neither; the next pass's [`Fs::recover`] puts the moved file back if
+//!   nothing took its place, removes it if the landing was complete but for that, and otherwise leaves it as a file
+//!   the scan sees and syncs (it may be someone's save, so nothing removes `.cc-aside` files blindly). Any error, or a
+//!   writer dropped without landing, removes the temporary file.
+//! - **Downloads that can't land are kept.** A target another program holds open (Windows) or that may not be
+//!   replaced is [`LandError::InUse`]; the engine keeps the download in the temporary folder (`<key>.kept`, see
+//!   [`Fs::keep`]) and lands it on a later pass without downloading again. [`DiskFs::clean_tmp`] removes only
+//!   interrupted writes (`.part`), never kept downloads or landing records.
 //! - **In-flight downloads are private (Unix).** `.craft-cloud/` and `tmp/` are created with mode 0700 when the
 //!   agent makes them, so other users can't read a partly downloaded file. (Folders that already exist keep their
 //!   mode.) Windows folders get the default ACL of the synced folder.
 //! - **Renames never replace.** On Linux and macOS the OS's no-replace rename (`renameat2(RENAME_NOREPLACE)`,
-//!   `renameatx_np(RENAME_EXCL)`) does it atomically. Elsewhere (Windows), and on filesystems that refuse the
-//!   flag, the target is checked right before a plain rename: a file another program creates at the target in
-//!   that instant is replaced. The window is a few microseconds and needs a program racing the agent for a
-//!   name the agent just checked.
+//!   `renameatx_np(RENAME_EXCL)`) does it atomically. On Windows a file is renamed as a new hard link (which fails
+//!   if the name is taken, atomically on NTFS) and the removal of the old name, after checking the file may be
+//!   deleted. An app that opens it without delete-sharing right between the check and the removal leaves the file
+//!   with both names; a landing then keeps its record and the next pass's recovery removes the extra name. Folders,
+//!   read-only files, files on filesystems without hard links (FAT/exFAT), and filesystems that refuse the flag
+//!   elsewhere fall back to a check right before a plain rename: a file another program creates at the target in
+//!   that instant is replaced. The window is a few microseconds and needs a program racing the agent for a name the
+//!   agent just checked.
 //! - **Hashing never blocks an app (Windows).** Files are opened for reading with every share flag, so an app
 //!   can still save, rename or delete them while the agent reads.
 //! - **File IDs** come from the `file-id` crate (inode and device on Unix, NTFS file ID and volume serial on
@@ -29,8 +46,9 @@
 //!   "crosses devices" (EXDEV; temporary files live on the root's volume), so those entries are skipped with that
 //!   reason every pass and nothing is lost. FAT/exFAT have no stable file IDs (Linux derives them from the
 //!   entry's position, so a rename changes them): a move there is seen as a delete and a new file (the content
-//!   goes up again; history keeps the old node), and files are hashed more often. Windows read-only files can't
-//!   be replaced by a rename: a remote edit to one fails and is retried, the local file is never overwritten.
+//!   goes up again; history keeps the old node), and files are hashed more often. Windows read-only files are
+//!   never replaced (the user's "don't change this"): a remote edit to one is skipped with "read-only here, not
+//!   replaced", the download is kept like one for a file in use, and it lands once the attribute is cleared.
 //! - **The root lists only with its marker.** Listing the root fails unless `.craft-cloud/root.json` is there as
 //!   a regular file, so a folder emptied or unmounted in the middle of a pass fails the pass instead of looking
 //!   like everything was deleted.
@@ -40,9 +58,10 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use craft_cloud_proto::Name;
-use craft_cloud_sync::{FileMeta, Fs, FsEntry, FsKind, RelPath};
+use craft_cloud_proto::{FileHash, Name};
+use craft_cloud_sync::{FileMeta, Fs, FsEntry, FsKind, LandError, RelPath};
 use file_id::FileId;
+use serde::{Deserialize, Serialize};
 
 /// The agent's own folder inside the sync root. The engine never syncs it.
 pub const AGENT_DIR: &str = ".craft-cloud";
@@ -50,6 +69,15 @@ pub const AGENT_DIR: &str = ".craft-cloud";
 const TMP_DIR: &str = "tmp";
 /// Extension of temporary files (also ignored by the engine).
 const TMP_EXT: &str = "part";
+/// Extension of a kept download in [`TMP_DIR`]: a write that couldn't land, kept for a later pass ([`Fs::keep`]).
+const KEPT_EXT: &str = "kept";
+/// Extension of a landing record in [`TMP_DIR`]: a landing in steps under way ([`Fs::recover`]).
+const LANDING_EXT: &str = "landing";
+/// The last part of the name a file gets while a download lands over it in steps: `<name>.<random>.cc-aside`,
+/// next to it.
+const ASIDE_SUFFIX: &str = "cc-aside";
+/// Longest key a kept download may have (it is part of a file name).
+const MAX_KEY_LEN: usize = 200;
 /// Largest buffer `read_at` allocates up front; longer reads grow as data arrives.
 const MAX_READ_PREALLOC: usize = 4 * 1024 * 1024;
 
@@ -57,6 +85,44 @@ const MAX_READ_PREALLOC: usize = 4 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct DiskFs {
     root: PathBuf,
+    /// Whether a download may land with the system's exchange of two files (see [`DiskFs::without_swap`]).
+    swap: bool,
+    /// Makes putting a moved file back fail, for tests of that path (see [`DiskFs::failing_put_backs`]).
+    fail_put_backs: bool,
+}
+
+/// What a landing record in [`TMP_DIR`] holds: the target, the name its file was moved to, and what both files
+/// look like (see [`Fs::recover`]).
+#[derive(Debug, Serialize, Deserialize)]
+struct LandingRecord {
+    /// The target, `/`-separated below the root.
+    target: String,
+    /// The moved file's name, in the target's folder.
+    aside: String,
+    /// The file that was at the target.
+    expected: RecordedMeta,
+    /// The file that lands there.
+    incoming: RecordedMeta,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct RecordedMeta {
+    size: u64,
+    mtime_ms: i64,
+    exec: bool,
+    id: Option<u64>,
+}
+
+impl From<FileMeta> for RecordedMeta {
+    fn from(m: FileMeta) -> Self {
+        Self { size: m.size, mtime_ms: m.mtime_ms, exec: m.exec, id: m.id }
+    }
+}
+
+impl From<RecordedMeta> for FileMeta {
+    fn from(m: RecordedMeta) -> Self {
+        Self { size: m.size, mtime_ms: m.mtime_ms, exec: m.exec, id: m.id }
+    }
 }
 
 /// A file being written: a temporary file in `<root>/.craft-cloud/tmp/`. Dropping it before
@@ -270,7 +336,135 @@ fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(from)?.file_type().is_file() {
+        return link_rename(from, to);
+    }
     check_then_rename(from, to)
+}
+
+/// Renames a file without ever replacing: a new hard link at `to` (refused, atomically, if anything is there),
+/// then the old name removed. The file keeps its ID and times. If the old name can't be removed (an app holds the
+/// file open without letting it be deleted), the new link goes again and the error is returned. If an app opens the
+/// file that way between the delete-access check below and the removal, neither name can go and the file keeps both;
+/// a landing then keeps its record, and the next pass's recovery removes the extra name once it can. Filesystems without
+/// hard links (FAT, exFAT) fall back to [`check_then_rename`], and so does a case-only respelling of one entry.
+#[cfg_attr(any(target_os = "linux", target_os = "android", target_vendor = "apple"), allow(dead_code))]
+fn link_rename(from: &Path, to: &Path) -> io::Result<()> {
+    // A read-only file is renamed the old way: removing its old name would clear the read-only attribute, which the
+    // new name shares (Rust removes a read-only file on Windows by clearing it). Landings never replace one at all
+    // (see `Fs::finish_write` below).
+    if fs::symlink_metadata(from)?.permissions().readonly() {
+        return check_then_rename(from, to);
+    }
+    // Windows: a file an app holds open without letting it be deleted can still get a new hard link, but then
+    // neither name can be removed again. Asking for delete access first fails the same way the removal would, before
+    // anything is done. The handle is open only for that instant, with every share flag, so it only gets in the way
+    // of a program opening the file in that same instant without sharing it.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // DELETE; FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
+        drop(OpenOptions::new().access_mode(0x0001_0000).share_mode(0x1 | 0x2 | 0x4).open(from)?);
+    }
+    match fs::hard_link(from, to) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && same_entry(from, to) => return fs::rename(from, to),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
+        // ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED (Windows): no hard links on this filesystem.
+        Err(e) if e.kind() == io::ErrorKind::Unsupported || (cfg!(windows) && matches!(e.raw_os_error(), Some(1 | 50))) => {
+            return check_then_rename(from, to);
+        }
+        Err(e) => return Err(e),
+    }
+    if let Err(e) = fs::remove_file(from) {
+        let _ = fs::remove_file(to);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Exchanges the entries at `a` and `b` in one step (`renameat2(RENAME_EXCHANGE)` on Linux, `renameatx_np` with
+/// `RENAME_SWAP` on macOS; rustix maps its `EXCHANGE` flag to each). `Ok(false)` when the system or the filesystem
+/// can't (the caller lands in steps instead).
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn exchange(a: &Path, b: &Path) -> io::Result<bool> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    use rustix::io::Errno;
+    match renameat_with(CWD, a, CWD, b, RenameFlags::EXCHANGE) {
+        Ok(()) => Ok(true),
+        Err(e) if [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP].contains(&e) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Windows has no exchange of two files without `unsafe` calls: downloads land in steps there.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn exchange(_a: &Path, _b: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
+/// Whether a rename failed because the file is in use or may not be replaced: a sharing or lock violation on
+/// Windows (an app holds the file open), or permission denied anywhere.
+fn in_use(e: &io::Error) -> bool {
+    // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION.
+    e.kind() == io::ErrorKind::PermissionDenied || (cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33)))
+}
+
+/// What [`in_use`] means, in words: on Windows a sharing or lock violation is "in use by another program"; permission
+/// denied (a folder or file that may not be written, on Unix) is "can't be replaced here (no permission)".
+fn in_use_reason(e: &io::Error) -> io::Error {
+    let why = if cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33)) {
+        "in use by another program"
+    } else {
+        "can't be replaced here (no permission)"
+    };
+    io::Error::new(io::ErrorKind::PermissionDenied, why)
+}
+
+/// `n` random bytes as hex.
+fn random_hex(n: usize) -> io::Result<String> {
+    let mut random = vec![0u8; n];
+    getrandom::fill(&mut random).map_err(|e| io::Error::other(format!("the system random source failed: {e}")))?;
+    Ok(random.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The name a file at `name` is moved to while a download lands over it in steps: `<name>.<random>.cc-aside`, with
+/// `name` shortened (at a character boundary) so the whole stays within 255 bytes.
+fn aside_name(name: &str) -> io::Result<String> {
+    let suffix = format!(".{}.{ASIDE_SUFFIX}", random_hex(6)?);
+    let mut keep = name.len().min(255usize.saturating_sub(suffix.len()));
+    while !name.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    Ok(format!("{}{suffix}", name.get(..keep).unwrap_or_default()))
+}
+
+/// Saves what the writer's temporary path holds when it is someone's file, not the download: moved next to the
+/// target `full` under a `.cc-aside` name (the scan syncs it), or if that fails renamed `.rescued` in the temporary
+/// folder (nothing cleans that up). The writer is left pointing nowhere, so it is neither removed, kept nor landed.
+/// Returns where the file is.
+fn rescue(writer: &mut DiskWriter, full: &Path, parent: &Path) -> PathBuf {
+    writer.armed = false;
+    let temp = std::mem::take(&mut writer.temp);
+    match full.file_name().and_then(|n| n.to_str()).map(aside_name) {
+        Some(Ok(name)) if rename_no_replace(&temp, &parent.join(&name)).is_ok() => parent.join(name),
+        _ => {
+            let rescued = temp.with_extension("rescued");
+            match fs::rename(&temp, &rescued) {
+                Ok(()) => rescued,
+                Err(_) => temp,
+            }
+        }
+    }
+}
+
+/// What is at `full` (not following links), as the engine sees it.
+fn kind_at(full: &Path) -> io::Result<Option<FsKind>> {
+    match fs::symlink_metadata(full) {
+        Ok(md) => Ok(Some(kind_of(&md, full))),
+        Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Makes a rename in `dir` durable (Unix; Windows has no directory flush). Best effort: the data itself was
@@ -299,9 +493,9 @@ fn set_mode(file: &File, replaced: Option<&Metadata>, exec: bool) -> io::Result<
     file.set_permissions(fs::Permissions::from_mode(mode))
 }
 
-/// Windows: the new file gets the folder's default ACL, like any file an app saves with temp + rename. The
-/// read-only attribute isn't copied: a read-only file can't be replaced by a rename, so its download fails and
-/// is retried (the user's read-only file is never overwritten).
+/// Windows: the new file gets the folder's default ACL, like any file an app saves with temp + rename. There is
+/// no read-only attribute to carry over: a read-only file is never replaced at all (`finish_write` refuses it
+/// before the first step, and the download is kept until the attribute is cleared).
 #[cfg(not(unix))]
 fn set_mode(_file: &File, _replaced: Option<&Metadata>, _exec: bool) -> io::Result<()> {
     Ok(())
@@ -346,7 +540,159 @@ fn create_temp(dir: &Path) -> io::Result<(File, PathBuf)> {
 impl DiskFs {
     /// The folder at `root`. Nothing is checked or created until the engine asks.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self { root: root.into(), swap: true, fail_put_backs: false }
+    }
+
+    /// Lands downloads in steps, the way Windows and filesystems without an exchange do, even where the system can
+    /// exchange two files: for tests of that path.
+    pub fn without_swap(mut self) -> Self {
+        self.swap = false;
+        self
+    }
+
+    /// Makes every put-back of a file moved aside during a landing in steps fail, as a disk error would: for tests
+    /// that the landing record then stays for [`Fs::recover`].
+    #[doc(hidden)]
+    pub fn failing_put_backs(mut self) -> Self {
+        self.fail_put_backs = true;
+        self
+    }
+
+    /// Moves the file moved aside back to `full` and says whether the landing record can go: when it is back, or when
+    /// something took its place (the moved file then stays as a file the scan sees; recovery would leave it too).
+    /// Otherwise the record stays, and the next pass's [`Fs::recover`] puts it back.
+    fn put_back(&self, aside: &Path, full: &Path) -> bool {
+        let moved = if self.fail_put_backs { Err(io::Error::other("put-backs fail (test)")) } else { rename_no_replace(aside, full) };
+        if moved.is_ok() {
+            return true;
+        }
+        match (kind_at(aside).ok().flatten(), kind_at(full).ok().flatten()) {
+            // One file under both names (a rename through a hard link whose old name couldn't be removed): the record
+            // stays, and recovery removes the extra name.
+            (Some(FsKind::File(a)), Some(FsKind::File(t))) if a.id.is_some() && a.id == t.id => false,
+            (_, there) => there.is_some(),
+        }
+    }
+
+    /// Where the write kept under `key` lives. Keys are the engine's (node, version and manifest IDs): anything
+    /// else that could leave the folder or clash with a name the folder uses is refused.
+    fn kept_path(&self, key: &str) -> io::Result<PathBuf> {
+        let fine = !key.is_empty() && key.len() <= MAX_KEY_LEN && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+        if !fine || key.starts_with('.') {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a key for a kept download"));
+        }
+        Ok(self.tmp_dir().join(format!("{key}.{KEPT_EXT}")))
+    }
+
+    /// Lands `temp` (the prepared download, `incoming`) at `full`, where the file `expected` is, in steps: the file
+    /// there moves to a name next to it (never replacing anything), is checked, the download moves into the free
+    /// name, and the moved file is removed. A record in the temporary folder, written first, lets
+    /// [`Fs::recover`] finish or undo a landing a crash cut short. A failure after the first step puts the moved
+    /// file back where nothing took its place.
+    fn land_in_steps(
+        &self,
+        path: &RelPath,
+        full: &Path,
+        mut writer: DiskWriter,
+        expected: FileMeta,
+        incoming: FileMeta,
+    ) -> Result<FileMeta, LandError<DiskWriter>> {
+        let (Some(parent), Some(name)) = (full.parent(), full.file_name().and_then(|n| n.to_str())) else {
+            return Err(LandError::Io(io::Error::other(format!("{path}: not a file name"))));
+        };
+        let aside_name = aside_name(name)?;
+        let aside = parent.join(&aside_name);
+        let tmp = self.real_tmp(true)?.ok_or_else(|| io::Error::other("no temporary folder"))?;
+        let record_path = tmp.join(format!("{}.{LANDING_EXT}", random_hex(12)?));
+        let record = LandingRecord { target: path.to_string(), aside: aside_name, expected: expected.into(), incoming: incoming.into() };
+        let json = serde_json::to_vec(&record).map_err(|e| io::Error::other(e.to_string()))?;
+        crate::account::write_atomic(&record_path, &json, true)?;
+        let forget = |record_path: &Path| {
+            let _ = fs::remove_file(record_path);
+        };
+        // 1. The file there moves aside. If that failed halfway (a rename through a hard link that couldn't remove
+        // the old name), the file has both names and the record stays, so recovery removes the extra one.
+        if let Err(e) = rename_no_replace(full, &aside) {
+            if kind_at(&aside).ok().flatten().is_none() {
+                forget(&record_path);
+            }
+            return Err(match e.kind() {
+                io::ErrorKind::NotFound => LandError::Changed(writer),
+                _ if in_use(&e) => LandError::InUse(writer, in_use_reason(&e)),
+                _ => LandError::Io(e),
+            });
+        }
+        // 2. It is the file the engine checked, or it goes back.
+        let moved = kind_at(&aside).ok().flatten();
+        if moved != Some(FsKind::File(expected)) {
+            // If something took the free name meanwhile, the moved file stays next to it (the scan sees it).
+            if self.put_back(&aside, full) {
+                forget(&record_path);
+            }
+            return Err(LandError::Changed(writer));
+        }
+        // 3. The download takes the free name.
+        if let Err(e) = rename_no_replace(&writer.temp, full) {
+            if self.put_back(&aside, full) {
+                forget(&record_path);
+            }
+            return Err(match e.kind() {
+                io::ErrorKind::AlreadyExists => LandError::Changed(writer),
+                _ if in_use(&e) => LandError::InUse(writer, in_use_reason(&e)),
+                _ => LandError::Io(e),
+            });
+        }
+        writer.armed = false;
+        sync_dir(parent);
+        // 4. The moved file goes. If it can't, the record stays and the next pass's recovery tries again.
+        if fs::remove_file(&aside).is_ok() {
+            forget(&record_path);
+        }
+        Ok(incoming)
+    }
+
+    /// Finishes or undoes the landing a record describes (see [`Fs::recover`]). The record goes once that is done,
+    /// or once there is nothing left to do.
+    /// Errors name the record's target, or the record in `.craft-cloud/tmp` when it can't be read.
+    fn recover_landing(&self, record_path: &Path) -> io::Result<()> {
+        let shown = format!("{AGENT_DIR}/{TMP_DIR}/{}", record_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
+        let named = |what: &str, e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"));
+        let record: LandingRecord = fs::read(record_path)
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())))
+            .map_err(|e| named(&shown, e))?;
+        self.apply_landing(&record).map_err(|e| named(&record.target, e))?;
+        fs::remove_file(record_path).map_err(|e| named(&shown, e))
+    }
+
+    /// Puts right what the landing `record` describes; see [`DiskFs::recover_landing`].
+    fn apply_landing(&self, record: &LandingRecord) -> io::Result<()> {
+        let target = craft_cloud_sync::rel(&record.target);
+        if target.to_string() != record.target || target.is_root() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "a landing record names no file in the folder"));
+        }
+        let aside_name = Name::new(&record.aside).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let aside = target.parent().unwrap_or_default().join(&aside_name);
+        // A folder above that is gone or a link: nothing of this landing can be reached any more.
+        if let (Some(full), Some(aside_full)) = (self.checked(&target)?, self.checked(&aside)?) {
+            match (kind_at(&aside_full)?, kind_at(&full)?) {
+                // Moved aside, and nothing took its place: it goes back.
+                (Some(FsKind::File(_)), None) => rename_no_replace(&aside_full, &full)?,
+                // One file under both names (a rename through a hard link that couldn't remove the old name): the extra
+                // name goes; nothing is lost.
+                (Some(FsKind::File(moved)), Some(FsKind::File(there))) if moved.id.is_some() && moved.id == there.id => {
+                    fs::remove_file(&aside_full)?;
+                }
+                // The landing was done but for removing the moved file.
+                (Some(FsKind::File(moved)), Some(FsKind::File(there)))
+                    if moved == FileMeta::from(record.expected) && there == FileMeta::from(record.incoming) =>
+                {
+                    fs::remove_file(&aside_full)?;
+                }
+                // Gone already, or something else is going on: the moved file stays, and the scan sees it.
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -560,22 +906,166 @@ impl Fs for DiskFs {
         Ok(DiskWriter { file: Some(file), temp, armed: true })
     }
 
-    fn finish_write(&mut self, path: &RelPath, mut writer: DiskWriter, exec: bool, mtime_ms: i64) -> io::Result<FileMeta> {
+    /// Lands the download only on what the engine checked:
+    ///
+    /// - **Nothing expected**: the OS's no-replace rename (see the module docs).
+    /// - **A file expected, Linux and macOS**: the download and the file there are exchanged in one step; the file
+    ///   that came out is compared with what was expected. The expected one is removed; anything else (an app saved
+    ///   in between) is exchanged back, and the download comes back as [`LandError::Changed`].
+    /// - **Windows, and filesystems without an exchange**: in steps (see [`DiskFs::land_in_steps`]); a crash between
+    ///   them leaves both files on disk, never neither, and the next pass's [`Fs::recover`] puts them right.
+    ///
+    /// A file another program holds open (Windows), or that may not be replaced, is [`LandError::InUse`].
+    ///
+    /// Known limit: once the file that came out of the exchange (or was moved aside) matched, the download is in
+    /// place and its stat is returned; an app that renames a save over the target in the instant before the old file
+    /// is removed isn't seen here. Nothing is lost: the save is at the target, and the next pass sees a file that
+    /// differs from what was recorded (an edit) and handles it as one.
+    fn finish_write(
+        &mut self,
+        path: &RelPath,
+        mut writer: DiskWriter,
+        exec: bool,
+        mtime_ms: i64,
+        expected: Option<FileMeta>,
+    ) -> Result<FileMeta, LandError<DiskWriter>> {
         let full = self.file_target(path)?;
-        let file = writer.file.take().ok_or_else(|| io::Error::other("the write already finished"))?;
+        // Windows: a read-only file is the user saying "don't change this". It is never replaced: the download is kept,
+        // like one for a file in use, and lands once the attribute is cleared. Checked before the first step.
+        if cfg!(windows) && expected.is_some() && Self::lstat(&full)?.is_some_and(|md| md.file_type().is_file() && md.permissions().readonly()) {
+            return Err(LandError::InUse(writer, io::Error::new(io::ErrorKind::PermissionDenied, "read-only here, not replaced")));
+        }
+        // A write kept from an earlier pass is closed: it is opened again to set its time and mode.
+        let file = match writer.file.take() {
+            Some(file) => file,
+            None => OpenOptions::new().write(true).open(&writer.temp)?,
+        };
         set_mode(&file, Self::lstat(&full)?.as_ref(), exec)?;
         file.set_modified(system_time(mtime_ms)?)?;
         file.sync_all()?;
         let md = file.metadata()?;
         // The ID is read before the rename (Windows reads it by path); a rename on one volume keeps it.
-        let meta = file_meta(&md, &writer.temp);
+        let incoming = file_meta(&md, &writer.temp);
         drop(file);
-        fs::rename(&writer.temp, &full)?;
-        writer.armed = false;
-        if let Some(parent) = full.parent() {
-            sync_dir(parent);
+        let parent = full.parent().map(Path::to_owned).unwrap_or_else(|| self.root.clone());
+        let Some(expected) = expected else {
+            return match rename_no_replace(&writer.temp, &full) {
+                Ok(()) => {
+                    writer.armed = false;
+                    sync_dir(&parent);
+                    Ok(incoming)
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(LandError::Changed(writer)),
+                Err(e) if in_use(&e) => Err(LandError::InUse(writer, in_use_reason(&e))),
+                Err(e) => Err(LandError::Io(e)),
+            };
+        };
+        if !self.swap {
+            return self.land_in_steps(path, &full, writer, expected, incoming);
         }
-        Ok(meta)
+        match exchange(&writer.temp, &full) {
+            Ok(true) => {}
+            Ok(false) => return self.land_in_steps(path, &full, writer, expected, incoming),
+            // Nothing at the target any more.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(LandError::Changed(writer)),
+            Err(e) if in_use(&e) => return Err(LandError::InUse(writer, in_use_reason(&e))),
+            Err(e) => return Err(LandError::Io(e)),
+        }
+        // The temporary path now holds what was at the target.
+        if kind_at(&writer.temp).ok().flatten() == Some(FsKind::File(expected)) {
+            // The file the engine checked: it goes (if it can't, `clean_tmp` removes it before the next pass).
+            writer.armed = false;
+            let _ = fs::remove_file(&writer.temp);
+            sync_dir(&parent);
+            return Ok(incoming);
+        }
+        // Something else (an app saved in between): exchanged back, and the download comes back.
+        match exchange(&writer.temp, &full) {
+            // The temporary path holds the download again, unless an app replaced the target between the look and the
+            // exchange back: then it holds that save, which is moved next to the target (never kept or landed as the
+            // server's version), and the download is gone.
+            Ok(true) if kind_at(&writer.temp).ok().flatten() == Some(FsKind::File(incoming)) => Err(LandError::Changed(writer)),
+            Ok(true) => {
+                rescue(&mut writer, &full, &parent);
+                Err(LandError::Changed(writer))
+            }
+            // Can't happen short of the disk failing between two calls: the other file is never removed.
+            Ok(false) | Err(_) => {
+                let rescued = rescue(&mut writer, &full, &parent);
+                let name = rescued.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let place = if rescued.parent() == Some(parent.as_path()) {
+                    format!("it is next to it as {name}")
+                } else {
+                    format!("it is in {AGENT_DIR}/{TMP_DIR} as {name}, which nothing cleans up: move it back yourself")
+                };
+                Err(LandError::Io(io::Error::other(format!(
+                    "{path}: the download landed over a file saved meanwhile and couldn't be undone; {place}"
+                ))))
+            }
+        }
+    }
+
+    fn keep(&mut self, mut writer: DiskWriter, key: &str) -> io::Result<()> {
+        let kept = self.kept_path(key)?;
+        drop(writer.file.take());
+        // Replaces an older copy kept under the same key (the same version).
+        fs::rename(&writer.temp, &kept)?;
+        writer.armed = false;
+        Ok(())
+    }
+
+    fn take_kept(&mut self, key: &str, hash: &FileHash) -> io::Result<Option<DiskWriter>> {
+        let kept = self.kept_path(key)?;
+        match Self::lstat(&kept)? {
+            Some(md) if md.file_type().is_file() => {
+                // Back to a temporary name: no longer kept, and cleaned up like any write if the agent stops now.
+                let temp = self.tmp_dir().join(format!("{}.{TMP_EXT}", random_hex(12)?));
+                fs::rename(&kept, &temp)?;
+                let writer = DiskWriter { file: None, temp, armed: true };
+                // Hashed again: a kept file that changed on disk is dropped (with the writer), never landed.
+                let mut hasher = blake3::Hasher::new();
+                io::copy(&mut open_read(&writer.temp)?, &mut hasher)?;
+                Ok((hasher.finalize().as_bytes() == hash.as_bytes()).then_some(writer))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn kept(&self) -> io::Result<Vec<String>> {
+        let Some(tmp) = self.real_tmp(false)? else { return Ok(Vec::new()) };
+        let mut keys = Vec::new();
+        for entry in fs::read_dir(tmp)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == KEPT_EXT)
+                && let Some(key) = path.file_stem().and_then(|s| s.to_str())
+            {
+                keys.push(key.to_owned());
+            }
+        }
+        Ok(keys)
+    }
+
+    fn discard_kept(&mut self, key: &str) -> io::Result<()> {
+        match fs::remove_file(self.kept_path(key)?) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// Goes through the landing records in the temporary folder (see [`DiskFs::land_in_steps`]). A record that
+    /// can't be read or acted on stays for the next pass; the first error is returned once all were tried.
+    fn recover(&mut self) -> io::Result<()> {
+        let Some(tmp) = self.real_tmp(false)? else { return Ok(()) };
+        let mut first_error = None;
+        for entry in fs::read_dir(tmp)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == LANDING_EXT)
+                && let Err(e) = self.recover_landing(&path)
+            {
+                first_error.get_or_insert(e);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn mkdir(&mut self, path: &RelPath) -> io::Result<()> {
@@ -674,6 +1164,125 @@ mod tests {
         }
         check_then_rename(&a, &dir.path().join("c")).unwrap();
         assert_eq!(fs::read(dir.path().join("c")).unwrap(), b"a");
+    }
+
+    /// Linux and macOS exchange two files in one step; that is what downloads land with there.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn the_system_exchanges_two_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        assert!(exchange(&a, &b).unwrap(), "no exchange on this filesystem");
+        assert_eq!((fs::read(&a).unwrap(), fs::read(&b).unwrap()), (b"b".to_vec(), b"a".to_vec()));
+        assert_eq!(exchange(&a, &dir.path().join("gone")).unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    /// The rename Windows uses for files: a new hard link, then the old name goes. It never replaces, and the file
+    /// keeps its ID.
+    #[test]
+    fn a_rename_through_a_hard_link_never_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) = (dir.path().join("a"), dir.path().join("b"), dir.path().join("c"));
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        assert_eq!(link_rename(&a, &b).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!((fs::read(&a).unwrap(), fs::read(&b).unwrap()), (b"a".to_vec(), b"b".to_vec()));
+        let id = |p: &Path| local_id(&fs::symlink_metadata(p).unwrap(), p);
+        let before = id(&a);
+        link_rename(&a, &c).unwrap();
+        assert!(!a.exists());
+        assert_eq!(fs::read(&c).unwrap(), b"a");
+        assert_eq!(id(&c), before);
+    }
+
+    #[test]
+    fn aside_names_stay_within_255_bytes() {
+        let short = aside_name("notes.txt").unwrap();
+        assert!(short.starts_with("notes.txt.") && short.ends_with(".cc-aside"), "{short}");
+        let long = aside_name(&"é".repeat(127)).unwrap();
+        assert!(long.len() <= 255 && long.ends_with(".cc-aside"), "{}", long.len());
+    }
+
+    /// A folder as the agent sets it up, a target file, and the file moved aside from it.
+    fn landing_setup() -> (tempfile::TempDir, DiskFs, FileMeta) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(AGENT_DIR)).unwrap();
+        fs::write(dir.path().join(AGENT_DIR).join(crate::root::MARKER_FILE), b"{}").unwrap();
+        let mut disk = DiskFs::new(dir.path());
+        let old = disk.write(&craft_cloud_sync::rel("a.txt"), b"old", false, 1_700_000_000_000).unwrap();
+        fs::rename(dir.path().join("a.txt"), dir.path().join("a.txt.1.cc-aside")).unwrap();
+        (dir, disk, old)
+    }
+
+    fn record(disk: &DiskFs, expected: FileMeta, incoming: FileMeta) {
+        let record = LandingRecord { target: "a.txt".into(), aside: "a.txt.1.cc-aside".into(), expected: expected.into(), incoming: incoming.into() };
+        fs::write(disk.tmp_dir().join("r.landing"), serde_json::to_vec(&record).unwrap()).unwrap();
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> =
+            fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).filter(|n| n != AGENT_DIR).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_landing_cut_short_after_moving_aside_is_undone() {
+        let (dir, mut disk, old) = landing_setup();
+        record(&disk, old, old);
+        disk.recover().unwrap();
+        assert_eq!(names(dir.path()), ["a.txt"]);
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"old");
+        assert!(!disk.tmp_dir().join("r.landing").exists());
+    }
+
+    #[test]
+    fn a_landing_cut_short_before_the_removal_is_finished() {
+        let (dir, mut disk, old) = landing_setup();
+        let new = disk.write(&craft_cloud_sync::rel("a.txt"), b"new", false, 1_700_000_000_000).unwrap();
+        record(&disk, old, new);
+        disk.recover().unwrap();
+        assert_eq!(names(dir.path()), ["a.txt"]);
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_moved_file_whose_place_was_taken_stays() {
+        let (dir, mut disk, old) = landing_setup();
+        // The download's record says one file, but a user saved another there after the crash.
+        let new = FileMeta { size: 3, mtime_ms: 1, exec: false, id: Some(1) };
+        fs::write(dir.path().join("a.txt"), b"the user's").unwrap();
+        record(&disk, old, new);
+        disk.recover().unwrap();
+        assert_eq!(names(dir.path()), ["a.txt", "a.txt.1.cc-aside"]);
+        assert_eq!(fs::read(dir.path().join("a.txt.1.cc-aside")).unwrap(), b"old");
+        assert!(!disk.tmp_dir().join("r.landing").exists());
+    }
+
+    /// A rename through a hard link that couldn't remove the old name left one file under both names: recovery
+    /// removes the extra name, and the file stays.
+    #[test]
+    fn a_file_left_with_two_names_loses_the_extra_one() {
+        let (dir, mut disk, old) = landing_setup();
+        fs::hard_link(dir.path().join("a.txt.1.cc-aside"), dir.path().join("a.txt")).unwrap();
+        let incoming = FileMeta { size: 3, mtime_ms: 1, exec: false, id: Some(1) };
+        record(&disk, old, incoming);
+        disk.recover().unwrap();
+        assert_eq!(names(dir.path()), ["a.txt"]);
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"old");
+        assert!(!disk.tmp_dir().join("r.landing").exists());
+    }
+
+    #[test]
+    fn a_damaged_landing_record_stays_and_touches_nothing() {
+        let (dir, mut disk, _) = landing_setup();
+        fs::write(disk.tmp_dir().join("r.landing"), b"not json").unwrap();
+        let e = disk.recover().unwrap_err().to_string();
+        assert!(e.starts_with(".craft-cloud/tmp/r.landing: "), "{e}");
+        assert_eq!(names(dir.path()), ["a.txt.1.cc-aside"]);
+        assert!(disk.tmp_dir().join("r.landing").exists());
     }
 
     #[test]

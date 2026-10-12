@@ -2,7 +2,8 @@
 //! (create, edit, delete, rename, move files and folders, hold files locked or open, make folders unlistable,
 //! replace a tracked file or folder with a link and later put it back), sync at random moments, sometimes with
 //! the connection failing mid-pass, sometimes approving held-back deletes (all of them, or some of the ones the
-//! last pass listed), and sometimes crash during a pass and restart from the state saved after the pass before.
+//! last pass listed), and sometimes crash during a pass and restart from the state saved last (after the pass before,
+//! or at a checkpoint of the crashed pass).
 //! Then every link is put back, everyone syncs until nothing changes, and we check:
 //!
 //! 1. **Convergence**: every machine ends with exactly the same files and folders.
@@ -26,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use common::{Machine, Server, machine_config, restart};
+use common::{Machine, Server, machine_config, restart, save_checkpoints};
 use craft_cloud_proto::{FileHash, Name, NodeId};
 use craft_cloud_sync::{BaseKind, Fs, FsKind, MemFs, RelPath, Report, State, rel};
 
@@ -161,6 +162,9 @@ struct Linked {
     /// The nodes the machine tracked there when the link was made: it must never delete them on the server
     /// while the link is there.
     nodes: BTreeSet<NodeId>,
+    /// Tracked folders the engine made again while the link was there (missing before a pass, there after it,
+    /// whether the pass finished or not; nobody acts during a pass): see the delete check in `run`.
+    remade: BTreeSet<RelPath>,
 }
 
 /// Replaces a tracked file or folder on `m` with a link, keeping what it held.
@@ -178,7 +182,7 @@ fn make_link(rng: &mut Rng, m: &mut Machine) -> Option<Linked> {
     if std::env::var("SIM_TRACE").is_ok() {
         eprintln!("TRACE link {at}");
     }
-    Some(Linked { was_dir, dirs, files, nodes })
+    Some(Linked { was_dir, dirs, files, nodes, remade: BTreeSet::new() })
 }
 
 /// Whether the tracked node `id` is itself at its base path `p` on disk: the folder or file there has the node's
@@ -372,14 +376,21 @@ async fn run(seed: u64, steps: usize) {
     // turn the window off to exercise the size-and-time fast path (and the replaced-file check).
     let racy = if seed.is_multiple_of(2) { 2_000 } else { 0 };
     let mut ms = Vec::new();
-    for name in ["m0", "m1", "m2"] {
-        ms.push(machine_config(&server, &ana, name, MemFs::new(), 50, |c| c.racy_window_ms = racy).await);
+    // What each machine's agent saved last: after its last pass, or at a checkpoint during the pass it is in (a
+    // crash restarts from it).
+    let mut saved: Vec<Arc<Mutex<State>>> = Vec::new();
+    // m0 lands downloads with one exchange (Linux, macOS), m1 in steps (Windows: the old file moved aside, the new
+    // one put in place, the old one removed; a crash can fall between them), m2 one way or the other by seed. Files
+    // a program holds open (`MemFs::hold`) can't be replaced either way: the download is kept for a later pass.
+    for (name, swap) in [("m0", true), ("m1", false), ("m2", seed % 4 < 2)] {
+        let fs = if swap { MemFs::new() } else { MemFs::new().without_swap() };
+        let mut m = machine_config(&server, &ana, name, fs, 50, |c| c.racy_window_ms = racy).await;
+        saved.push(save_checkpoints(&mut m));
+        ms.push(m);
     }
     let mut rng = Rng::new(seed);
     let mut seen: BTreeSet<FileHash> = BTreeSet::new();
     let mut destroyed: BTreeSet<FileHash> = BTreeSet::new();
-    // What each machine's agent saved after its last pass (a crash restarts from it).
-    let mut saved: Vec<State> = vec![State::default(); ms.len()];
     // A machine is recovering from a crash for at most RECOVERY_PASSES passes after its restart, less if a pass
     // finishes with nothing left for later. Conflict copies it makes meanwhile may hold content that is already at
     // the original name: the crashed pass downloaded or moved files and lost the bookkeeping, and when the user
@@ -410,14 +421,19 @@ async fn run(seed: u64, steps: usize) {
         let Some(m) = ms.get_mut(i) else { continue };
         if rng.below(3) == 0 {
             seen.extend(hashes_of(m));
-            // A crash: the agent dies during this pass, before it saves the state. A third of the time the pass is cut
-            // short at a random server call, a third of the time the machine dies after a few filesystem changes
-            // (between two steps of the pass), otherwise the pass runs to the end. It restarts from the state saved
-            // after its previous pass, with its folder and the server as the crashed pass left them.
+            // A crash: the agent dies during this pass, before it saves the state at its end. A quarter of the time the
+            // pass is cut short at a random server call, a quarter of the time the machine dies after a few filesystem
+            // changes (between two steps of the pass), a quarter of the time it dies right after a commit applied on
+            // the server, before the answer arrives (between the commit and the checkpoint that records it), otherwise
+            // the pass runs to the end. It restarts from the state saved last (at the pass's last checkpoint, or after
+            // the pass before), with its folder and the server as the crashed pass left them.
             // `SIM_NO_CRASH=1` runs the same history with the crashed passes kept (no restart), to tell crash bugs apart.
             let crash_roll = rng.below(8) == 0;
             let crash = crash_roll && std::env::var("SIM_NO_CRASH").is_err();
-            let how = if crash_roll { rng.below(3) } else { usize::MAX };
+            let how = if crash_roll { rng.below(4) } else { usize::MAX };
+            if how == 3 {
+                m.transport().faults.die_on_commit.store(1 + rng.below(2) as u64, Ordering::Relaxed);
+            }
             let every = if how == 0 {
                 2 + rng.below(12) as u64
             } else if rng.below(4) == 0 {
@@ -451,6 +467,10 @@ async fn run(seed: u64, steps: usize) {
             if std::env::var("SIM_TRACE").is_ok() {
                 eprintln!("TRACE step {step} m{i} sync: {r:?}\n  files {}\n  dirs {:?}", listing(m), m.fs().dirs());
             }
+            // Tracked folders this pass made again (finished or not: a failed pass leaves them too).
+            if let Some(Some(linked)) = links.get_mut(i) {
+                linked.remade.extend(gone_before.iter().filter(|p| matches!(m.fs().stat(p), Ok(Some(FsKind::Dir { .. })))).cloned());
+            }
             if let Ok(report) = &r {
                 if let Some(listed) = last_pending.get_mut(i) {
                     listed.clone_from(&report.pending_nodes);
@@ -459,15 +479,17 @@ async fn run(seed: u64, steps: usize) {
                 // the link (with a folder holding it) into a folder that can't be listed: the engine can't see it,
                 // and a tracked folder moved there looks deleted (a known gap, see the design's engine rules). Or
                 // unless the user renamed a folder above the link while the server put something new in it: the
-                // engine makes the folder again at its old place for that (a folder it tracked before the pass and
-                // that was missing from disk then; it is the tracked folder there, path first), so the renamed one is a new folder to it and the link in it isn't the tracked file (also
-                // a known gap: the file goes up as a new one once it is real again, and history keeps the old one).
+                // engine makes the folder again at its old place for that (a folder it tracked and that was missing
+                // from disk before a pass, this one or an earlier one that may have failed partway; it is the tracked
+                // folder there, path first), so the renamed one is a new folder to it and the link in it isn't the
+                // tracked file (also a known gap: the file goes up as a new one once it is real again, and history
+                // keeps the old one).
                 if let Some(Some(linked)) = links.get(i)
                     && link_seen
                 {
                     for gone in &report.removed_remotely {
                         let node = tracked_before.get(gone);
-                        let remade_above = report.created_dirs.iter().any(|d| gone.starts_with(d) && d != gone && gone_before.contains(d));
+                        let remade_above = linked.remade.iter().any(|d| gone.starts_with(d) && d != gone);
                         assert!(
                             remade_above || !node.is_some_and(|id| linked.nodes.contains(id)),
                             "seed {seed} step {step}: m{i} deleted {gone} on the server, which it tracks behind a link"
@@ -504,15 +526,30 @@ async fn run(seed: u64, steps: usize) {
                     Err(_) => *left,
                 };
             }
+            // Without a restart (`SIM_NO_CRASH`), a machine that "died" right after a commit applied runs on with the
+            // commit's answer lost: the engine doesn't know the commit applied, so it has the same bookkeeping to redo
+            // as after a crash, and is recovering the same way.
+            if !crash && how == 3 && m.transport().faults.dead.load(Ordering::Relaxed) {
+                if let Some(left_behind) = at_crash.get_mut(i) {
+                    *left_behind = hashes_of(m);
+                }
+                if let Some(left) = recovering.get_mut(i) {
+                    *left = RECOVERY_PASSES;
+                }
+            }
             m.transport().faults.every.store(0, Ordering::Relaxed);
+            m.transport().faults.die_on_commit.store(0, Ordering::Relaxed);
             m.fs_mut().revive();
             m.transport().faults.dead.store(false, Ordering::Relaxed);
             if crash {
                 if let Some(left_behind) = at_crash.get_mut(i) {
                     *left_behind = hashes_of(m);
                 }
-                let state = saved.get(i).cloned().unwrap_or_default();
-                let fresh = restart(m, state, |c| c.racy_window_ms = racy);
+                let state = saved.get(i).map(|s| s.lock().unwrap().clone()).unwrap_or_default();
+                let mut fresh = restart(m, state, |c| c.racy_window_ms = racy);
+                if let Some(s) = saved.get_mut(i) {
+                    *s = save_checkpoints(&mut fresh);
+                }
                 *m = fresh;
                 if let Some(left) = recovering.get_mut(i) {
                     *left = RECOVERY_PASSES;
@@ -523,8 +560,8 @@ async fn run(seed: u64, steps: usize) {
                 continue;
             }
             // The agent saves the state after every pass, finished or not.
-            if let Some(s) = saved.get_mut(i) {
-                *s = m.state().clone();
+            if let Some(s) = saved.get(i) {
+                *s.lock().unwrap() = m.state().clone();
             }
             // After a finished pass every node the machine tracks has a place in its folder. A node skipped for a
             // filesystem error may wait one more pass for it (its folder was moved aside, say, and it couldn't be

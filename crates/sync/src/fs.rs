@@ -9,7 +9,7 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use craft_cloud_proto::Name;
+use craft_cloud_proto::{FileHash, Name};
 
 use crate::path::RelPath;
 
@@ -41,6 +41,46 @@ pub struct FsEntry {
     pub kind: FsKind,
 }
 
+/// Why [`Fs::finish_write`] didn't land a write. The target is as it was before the call, whatever happened.
+pub enum LandError<W> {
+    /// The target isn't what the caller expected: something is at a path that had to be empty, or the file there
+    /// isn't the one the caller checked (an app saved it meanwhile). The written content comes back, so it can be
+    /// kept ([`Fs::keep`]).
+    Changed(W),
+    /// The target is in use: a program holds it open and the system won't let it be replaced or moved (a sharing
+    /// violation on Windows), or replacing it isn't permitted. The written content comes back, with the reason in words
+    /// ("in use by another program", "can't be replaced here (no permission)").
+    InUse(W, io::Error),
+    /// Any other failure; the written content is gone.
+    Io(io::Error),
+}
+
+impl<W> std::fmt::Debug for LandError<W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LandError::Changed(_) => f.write_str("Changed"),
+            LandError::InUse(_, e) => f.debug_tuple("InUse").field(e).finish(),
+            LandError::Io(e) => f.debug_tuple("Io").field(e).finish(),
+        }
+    }
+}
+
+impl<W> From<io::Error> for LandError<W> {
+    fn from(e: io::Error) -> Self {
+        LandError::Io(e)
+    }
+}
+
+impl<W> From<LandError<W>> for io::Error {
+    fn from(e: LandError<W>) -> Self {
+        match e {
+            LandError::Changed(_) => io::Error::new(io::ErrorKind::AlreadyExists, "the target changed meanwhile"),
+            LandError::InUse(_, e) => e,
+            LandError::Io(e) => e,
+        }
+    }
+}
+
 pub trait Fs: Send {
     /// A file being written by [`Fs::begin_write`]. Dropping it without [`Fs::finish_write`] abandons the write
     /// and leaves the target untouched.
@@ -64,20 +104,72 @@ pub trait Fs: Send {
     fn read_at(&self, path: &RelPath, offset: u64, len: usize) -> io::Result<Vec<u8>>;
     /// Starts writing new content for `path`. Nothing is visible at `path` until [`Fs::finish_write`].
     fn begin_write(&mut self, path: &RelPath) -> io::Result<Self::Writer>;
-    /// Puts the written content at `path` atomically (a reader sees the old content or the new, never a
-    /// mix), replacing any file there, with the given executable bit and modification time.
-    fn finish_write(&mut self, path: &RelPath, writer: Self::Writer, exec: bool, mtime_ms: i64) -> io::Result<FileMeta>;
+    /// Puts the written content at `path` atomically (a reader sees the old content or the new, never a mix), with
+    /// the given executable bit and modification time, **only if `path` holds what the caller checked**: nothing
+    /// when `expected` is `None`, otherwise a file whose [`FileMeta`] (size, time, exec bit, ID) is exactly
+    /// `expected`. The comparison and the replace are one step as far as the platform allows (an exchange of the
+    /// two files, then a look at the one that came out, put back if it isn't the expected one), so an app's save
+    /// between the caller's check and the landing is never overwritten: [`LandError::Changed`] instead.
+    fn finish_write(
+        &mut self,
+        path: &RelPath,
+        writer: Self::Writer,
+        exec: bool,
+        mtime_ms: i64,
+        expected: Option<FileMeta>,
+    ) -> Result<FileMeta, LandError<Self::Writer>>;
+    /// Keeps a finished write that didn't land ([`LandError::Changed`] or [`LandError::InUse`]) under `key`, so a
+    /// later pass can land it without writing it again ([`Fs::take_kept`]). Replaces anything kept under `key`.
+    /// A filesystem that can't keep writes drops it (the default).
+    fn keep(&mut self, writer: Self::Writer, key: &str) -> io::Result<()> {
+        drop(writer);
+        let _ = key;
+        Ok(())
+    }
+    /// Takes back the write kept under `key`, if any, and only if its content still hashes to `hash` (BLAKE3, the
+    /// whole file): a kept file that changed on disk is dropped instead, and the caller writes it again. Either way it
+    /// is no longer kept.
+    fn take_kept(&mut self, key: &str, hash: &FileHash) -> io::Result<Option<Self::Writer>> {
+        let _ = (key, hash);
+        Ok(None)
+    }
+    /// The keys of every kept write.
+    fn kept(&self) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// Drops the write kept under `key`, if any.
+    fn discard_kept(&mut self, key: &str) -> io::Result<()> {
+        let _ = key;
+        Ok(())
+    }
+    /// Finishes or undoes landings a crash cut short, where a landing takes more than one step (no exchange on this
+    /// platform): a file moved aside is put back where nothing took its place, or removed when the landing was
+    /// complete but for that. Anything else is left where it is, as a file the next scan sees. The engine calls it
+    /// at the start of every pass.
+    ///
+    /// Known limit: a crash after the download took the name but before the moved file was removed, followed by the
+    /// user deleting the download before the next pass, puts the old file back (the user's delete of a file they
+    /// may never have seen is undone; nothing is lost).
+    fn recover(&mut self) -> io::Result<()> {
+        Ok(())
+    }
     /// Reads a whole file (for tests and small files).
     fn read(&self, path: &RelPath) -> io::Result<Vec<u8>> {
         let mut buf = Vec::new();
         self.open(path)?.read_to_end(&mut buf)?;
         Ok(buf)
     }
-    /// Creates or replaces a file atomically with `data`.
+    /// Creates or replaces a file atomically with `data`, whatever file is at `path` now (for tests and tools: the
+    /// engine always says what it expects).
     fn write(&mut self, path: &RelPath, data: &[u8], exec: bool, mtime_ms: i64) -> io::Result<FileMeta> {
+        let expected = match self.stat(path)? {
+            Some(FsKind::File(meta)) => Some(meta),
+            None => None,
+            Some(_) => return Err(io::Error::other(format!("{path}: not a regular file"))),
+        };
         let mut w = self.begin_write(path)?;
         w.write_all(data)?;
-        self.finish_write(path, w, exec, mtime_ms)
+        self.finish_write(path, w, exec, mtime_ms, expected).map_err(io::Error::from)
     }
     fn mkdir(&mut self, path: &RelPath) -> io::Result<()>;
     fn remove_file(&mut self, path: &RelPath) -> io::Result<()>;
@@ -111,6 +203,25 @@ pub struct MemFs {
     death: Option<Arc<Death>>,
     /// False to act like Windows: no file is executable (see [`MemFs::without_exec_bit`]).
     exec_bit: bool,
+    /// False to land writes the way Windows does, in steps, instead of with one exchange (see
+    /// [`MemFs::without_swap`]).
+    swap: bool,
+    /// Writes kept for a later pass, by key ([`Fs::keep`]).
+    kept: BTreeMap<String, Vec<u8>>,
+    /// Landings in steps that haven't finished (a machine died between two steps), for [`Fs::recover`].
+    asides: Vec<Aside>,
+}
+
+/// A landing in steps under way: the file that was at `target` is at `aside` until the download is in place and
+/// the moved file removed.
+#[derive(Debug, Clone)]
+struct Aside {
+    target: RelPath,
+    aside: RelPath,
+    /// The file that was at `target`, as the caller expected it.
+    expected: FileMeta,
+    /// The file that lands at `target`.
+    incoming: FileMeta,
 }
 
 /// A machine that dies partway through a pass (see [`MemFs::die_after`]).
@@ -126,7 +237,18 @@ impl Default for MemFs {
     fn default() -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert(RelPath::root(), MemNode::Dir { id: 1 });
-        Self { nodes, clock: 1_000, next_id: 2, locked: BTreeSet::new(), held: BTreeSet::new(), death: None, exec_bit: true }
+        Self {
+            nodes,
+            clock: 1_000,
+            next_id: 2,
+            locked: BTreeSet::new(),
+            held: BTreeSet::new(),
+            death: None,
+            exec_bit: true,
+            swap: true,
+            kept: BTreeMap::new(),
+            asides: Vec::new(),
+        }
     }
 }
 
@@ -152,6 +274,36 @@ impl MemFs {
             }
         }
         self
+    }
+
+    /// A filesystem that lands a write over an existing file in steps, like Windows (and disks without an exchange):
+    /// the file there is moved to a name next to it, checked, the new content is put in place, and the moved file
+    /// removed. Each step is a change of its own, so a machine that dies ([`MemFs::die_after`]) can stop between
+    /// them; [`Fs::recover`] then puts things right. By default a write lands with one exchange (Linux, macOS).
+    pub fn without_swap(mut self) -> Self {
+        self.swap = false;
+        self
+    }
+
+    /// Moves the node at `from` (and anything below it) to `to`, which must be free.
+    fn move_node(&mut self, from: &RelPath, to: &RelPath) {
+        let mut moving = self.below(from);
+        moving.push(from.clone());
+        for old in moving {
+            if let Some(node) = self.nodes.remove(&old) {
+                let suffix = &old.names()[from.depth()..];
+                let mut names = to.names().to_vec();
+                names.extend_from_slice(suffix);
+                self.nodes.insert(RelPath::from_names(names), node);
+            }
+        }
+    }
+
+    fn file_meta(&self, path: &RelPath) -> Option<FileMeta> {
+        match self.nodes.get(path) {
+            Some(MemNode::File { meta, .. }) => Some(*meta),
+            _ => None,
+        }
     }
 
     fn tick(&mut self) -> i64 {
@@ -351,19 +503,106 @@ impl Fs for MemFs {
         Ok(Vec::new())
     }
 
-    fn finish_write(&mut self, path: &RelPath, writer: Self::Writer, exec: bool, mtime_ms: i64) -> io::Result<FileMeta> {
+    /// A held path ([`MemFs::hold`]) is in use: a write over the file there fails with [`LandError::InUse`], as a
+    /// rename onto a file an app holds open does on Windows.
+    fn finish_write(
+        &mut self,
+        path: &RelPath,
+        writer: Self::Writer,
+        exec: bool,
+        mtime_ms: i64,
+        expected: Option<FileMeta>,
+    ) -> Result<FileMeta, LandError<Self::Writer>> {
         self.change()?;
         self.require_parent(path)?;
-        self.check_held(path)?;
         if let Some(MemNode::Dir { .. }) = self.nodes.get(path) {
-            return Err(io::Error::other(format!("{path}: is a directory")));
+            return Err(LandError::Io(io::Error::other(format!("{path}: is a directory"))));
         }
         // An atomic replace (temp file + rename) gives the file a new identity.
         let id = self.new_id();
         let mtime_ms = mtime_ms.max(self.tick());
         let meta = FileMeta { size: writer.len() as u64, mtime_ms, exec: exec && self.exec_bit, id: Some(id) };
+        let Some(expected) = expected else {
+            // A rename that never replaces: one step.
+            if self.nodes.contains_key(path) {
+                return Err(LandError::Changed(writer));
+            }
+            self.nodes.insert(path.clone(), MemNode::File { data: writer, meta });
+            return Ok(meta);
+        };
+        if self.file_meta(path) != Some(expected) {
+            return Err(LandError::Changed(writer));
+        }
+        if self.held.contains(path) {
+            return Err(LandError::InUse(writer, io::Error::new(io::ErrorKind::PermissionDenied, "in use by another program")));
+        }
+        if self.swap {
+            // One exchange, and the file that came out is the expected one: it goes.
+            self.nodes.insert(path.clone(), MemNode::File { data: writer, meta });
+            return Ok(meta);
+        }
+        // In steps. First (the change spent above) the file there moves to a name next to it, written down so a
+        // crash between the steps can be put right.
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(LandError::Io(io::Error::other("the root is a folder")));
+        };
+        let aside = Name::new(&format!("{name}.{id}.cc-aside")).map(|n| parent.join(&n)).map_err(|e| io::Error::other(e.to_string()))?;
+        if self.nodes.contains_key(&aside) {
+            return Err(LandError::Io(exists(&aside)));
+        }
+        self.move_node(path, &aside);
+        self.asides.push(Aside { target: path.clone(), aside: aside.clone(), expected, incoming: meta });
+        // Then the new content takes the free name (nothing can take it in between here)…
+        self.change()?;
         self.nodes.insert(path.clone(), MemNode::File { data: writer, meta });
+        // …and the moved file goes.
+        self.change()?;
+        self.nodes.remove(&aside);
+        self.asides.retain(|a| a.aside != aside);
         Ok(meta)
+    }
+
+    fn keep(&mut self, writer: Self::Writer, key: &str) -> io::Result<()> {
+        self.alive()?;
+        self.kept.insert(key.to_owned(), writer);
+        Ok(())
+    }
+
+    fn take_kept(&mut self, key: &str, hash: &FileHash) -> io::Result<Option<Self::Writer>> {
+        self.alive()?;
+        Ok(self.kept.remove(key).filter(|data| blake3::hash(data).as_bytes() == hash.as_bytes()))
+    }
+
+    fn kept(&self) -> io::Result<Vec<String>> {
+        self.alive()?;
+        Ok(self.kept.keys().cloned().collect())
+    }
+
+    fn discard_kept(&mut self, key: &str) -> io::Result<()> {
+        self.alive()?;
+        self.kept.remove(key);
+        Ok(())
+    }
+
+    fn recover(&mut self) -> io::Result<()> {
+        while let Some(record) = self.asides.first().cloned() {
+            match (self.file_meta(&record.aside), self.nodes.contains_key(&record.target)) {
+                // Moved aside, nothing took its place: it goes back.
+                (Some(_), false) => {
+                    self.change()?;
+                    self.move_node(&record.aside, &record.target);
+                }
+                // The landing was done but for removing the file it replaced.
+                (Some(moved), true) if moved == record.expected && self.file_meta(&record.target) == Some(record.incoming) => {
+                    self.change()?;
+                    self.nodes.remove(&record.aside);
+                }
+                // Gone already, or something else is going on: the moved file stays as it is, and the scan sees it.
+                _ => {}
+            }
+            self.asides.remove(0);
+        }
+        Ok(())
     }
 
     fn mkdir(&mut self, path: &RelPath) -> io::Result<()> {
@@ -414,16 +653,7 @@ impl Fs for MemFs {
             return Err(io::Error::other("can't move a directory into itself"));
         }
         self.require_parent(to)?;
-        let mut moving = self.below(from);
-        moving.push(from.clone());
-        for old in moving {
-            if let Some(node) = self.nodes.remove(&old) {
-                let suffix = &old.names()[from.depth()..];
-                let mut names = to.names().to_vec();
-                names.extend_from_slice(suffix);
-                self.nodes.insert(RelPath::from_names(names), node);
-            }
-        }
+        self.move_node(from, to);
         Ok(())
     }
 }

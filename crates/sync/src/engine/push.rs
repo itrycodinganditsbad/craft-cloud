@@ -101,9 +101,12 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             })
             .collect();
         // A tracked folder found at its place is that folder (path first). When its recorded local ID is gone from
-        // the folder (it was put back from another drive, or made again), it takes the ID it has now, so a later
-        // rename of it is sent as a move and a link in it is still found through it. Not while any folder can't be
-        // listed (the old ID may be in there), and never an ID another tracked folder has.
+        // the folder (it was put back from another drive, or made again), or is on a folder at an untracked place with
+        // no link in it (the user renamed it and made a new one under the old name: the renamed one goes up as a new
+        // folder), it takes the ID it has now, so a later rename of it is sent as a move and a link in it is still
+        // found through it. A renamed folder holding a link keeps the ID: the link that went with it is found through
+        // it. Not while any folder can't be listed (the old ID may be in there), and never an ID another tracked
+        // folder has.
         let refreshed: Vec<(NodeId, Option<u64>)> = index
             .iter()
             .filter_map(|(path, id)| match (&self.state.base.get(id)?.kind, local.get(&expected(path))?) {
@@ -111,7 +114,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     if *id != root
                         && unknown.is_empty()
                         && here.is_some()
-                        && local_id.is_none_or(|old| !dir_at.contains_key(&old))
+                        && local_id.is_none_or(|old| {
+                            dir_at.get(&old).is_none_or(|at| !index.contains_key(at) && !unseen.links.iter().any(|(d, _)| d.starts_with(at)))
+                        })
                         && !self.owns_local_dir(*here, *id) =>
                 {
                     Some((*id, *here))
@@ -381,12 +386,33 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     break;
                 }
                 let only_ops: Vec<Op> = batch.iter().map(|(op, _)| op.clone()).collect();
+                // The files this batch deletes are written down before it goes: if the answer never arrives (a crash,
+                // a cut connection), the next pass knows those deletes are its own (see `State::sent_deletes`).
+                let deletes: Vec<(NodeId, VersionId)> = only_ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        Op::Delete { node, expected: Some(version) } => Some((*node, *version)),
+                        _ => None,
+                    })
+                    .collect();
+                if !deletes.is_empty() {
+                    self.state.sent_deletes.extend(deletes.iter().copied());
+                    self.checkpoint()?;
+                }
                 let result = self.transport.commit(&only_ops).await;
+                // Applied or refused as a whole, the batch's deletes are no longer in doubt; any other answer leaves
+                // them written down.
+                if matches!(result, Ok(_) | Err(TransportError::Rejected(_))) {
+                    for (node, _) in &deletes {
+                        self.state.sent_deletes.remove(node);
+                    }
+                }
                 match result {
                     Ok(_) => {
                         for (_, effect) in batch.drain(..) {
                             self.record(effect, report);
                         }
+                        self.checkpoint()?;
                         break;
                     }
                     Err(TransportError::Rejected(conflicts)) => {
