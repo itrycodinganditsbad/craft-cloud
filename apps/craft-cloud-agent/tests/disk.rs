@@ -73,6 +73,46 @@ fn a_failed_put_back_is_finished_by_recovery() {
     assert_eq!(temps(&fs), 0);
 }
 
+/// A crash right after the exchange (Linux, macOS) leaves what was at the target in the temporary folder. Cleaning
+/// up interrupted writes never removes it; recovery removes it when it is the file the engine checked, and when it
+/// is anything else (an app saved between the check and the exchange) moves it next to the target, where the scan
+/// sees it. Nothing is lost either way.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[test]
+fn a_crash_right_after_the_exchange_never_loses_what_came_out() {
+    let names = |p: &std::path::Path| -> Vec<String> {
+        let mut n: Vec<String> = std::fs::read_dir(p).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        n.sort();
+        n
+    };
+    for app_saved in [false, true] {
+        let (dir, fs) = disk();
+        let mut fs = fs.stopping_after_exchange();
+        let old = fs.write(&rel("a.txt"), b"the user's", false, T0).unwrap();
+        // What the engine checked: the file there, or (an app saved meanwhile) an older one.
+        let checked = if app_saved { craft_cloud_sync::FileMeta { mtime_ms: old.mtime_ms - 1_000, ..old } } else { old };
+        let mut w = fs.begin_write(&rel("a.txt")).unwrap();
+        w.write_all(b"download").unwrap();
+        assert!(fs.finish_write(&rel("a.txt"), w, false, T0, Some(checked)).is_err(), "stops after the exchange");
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"download");
+
+        // The next run: interrupted writes are cleaned up, then recovery.
+        let mut fs = DiskFs::new(dir.path());
+        assert_eq!(fs.clean_tmp().unwrap(), 0, "the file that came out isn't an interrupted write");
+        fs.recover().unwrap();
+        assert_eq!(temps(&fs), 0, "app saved: {app_saved}");
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"download");
+        let left = names(dir.path());
+        if app_saved {
+            assert_eq!(left.len(), 3, "{left:?}");
+            let aside = left.iter().find(|n| n.ends_with(".cc-aside")).expect("the save is next to the target");
+            assert_eq!(std::fs::read(dir.path().join(aside)).unwrap(), b"the user's");
+        } else {
+            assert_eq!(left, [".craft-cloud", "a.txt"]);
+        }
+    }
+}
+
 /// Windows: an app holds the file open without letting it be deleted or renamed (no `FILE_SHARE_DELETE`). The
 /// download can't replace it: it comes back as in use by another program, is kept, and lands once the app lets go.
 #[cfg(windows)]

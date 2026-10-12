@@ -12,7 +12,10 @@
 //!   holds what the engine checked ([`Fs::finish_write`]): nothing (a no-replace rename), or exactly the file it
 //!   verified. On Linux and macOS the two files are exchanged in one step (`renameat2(RENAME_EXCHANGE)`,
 //!   `renameatx_np(RENAME_SWAP)`) and the one that came out is compared with what was expected; anything else is
-//!   exchanged back. On Windows, and on filesystems without an exchange, the landing takes steps: the file there is
+//!   exchanged back. The download first moves to a `.swap` name `clean_tmp` never removes, with a record next to it,
+//!   so a crash right after the exchange can't let the file that came out (perhaps an app's save) be cleaned up:
+//!   [`Fs::recover`] removes it only if it is the download or the checked file, and otherwise moves it next to the
+//!   target as `.cc-aside`. On Windows, and on filesystems without an exchange, the landing takes steps: the file there is
 //!   moved to `<name>.<random>.cc-aside` next to it (never replacing anything), checked, the download renamed into
 //!   the free name, and the moved file removed, with a record in the temporary folder written first. A crash between
 //!   the steps leaves both files on disk, never neither; the next pass's [`Fs::recover`] puts the moved file back if
@@ -22,7 +25,7 @@
 //! - **Downloads that can't land are kept.** A target another program holds open (Windows) or that may not be
 //!   replaced is [`LandError::InUse`]; the engine keeps the download in the temporary folder (`<key>.kept`, see
 //!   [`Fs::keep`]) and lands it on a later pass without downloading again. [`DiskFs::clean_tmp`] removes only
-//!   interrupted writes (`.part`), never kept downloads or landing records.
+//!   interrupted writes (`.part`), never kept downloads, swap files or landing records.
 //! - **In-flight downloads are private (Unix).** `.craft-cloud/` and `tmp/` are created with mode 0700 when the
 //!   agent makes them, so other users can't read a partly downloaded file. (Folders that already exist keep their
 //!   mode.) Windows folders get the default ACL of the synced folder.
@@ -75,6 +78,12 @@ const TMP_EXT: &str = "part";
 const KEPT_EXT: &str = "kept";
 /// Extension of a landing record in [`TMP_DIR`]: a landing in steps under way ([`Fs::recover`]).
 const LANDING_EXT: &str = "landing";
+/// Extension of a download about to be exchanged with the file at its target, in [`TMP_DIR`]. After the exchange
+/// it holds what was at the target, which may be an app's save, so [`DiskFs::clean_tmp`] never removes it; a
+/// record next to it ([`SWAP_RECORD_EXT`]) lets [`Fs::recover`] decide.
+const SWAP_EXT: &str = "swap";
+/// Extension of the record that goes with a [`SWAP_EXT`] file (same stem): the target and both files' stats.
+const SWAP_RECORD_EXT: &str = "swapping";
 /// The last part of the name a file gets while a download lands over it in steps: `<name>.<random>.cc-aside`,
 /// next to it.
 const ASIDE_SUFFIX: &str = "cc-aside";
@@ -102,6 +111,8 @@ struct Hooks {
     fail_landings: bool,
     /// Landings in steps move files with a plain rename ([`DiskFs::plain_moves`]).
     plain_moves: bool,
+    /// A landing by exchange stops right after the exchange, as a crash would ([`DiskFs::stopping_after_exchange`]).
+    stop_after_exchange: bool,
 }
 
 /// What a landing record in [`TMP_DIR`] holds: the target, the name its file was moved to, and what both files
@@ -121,6 +132,19 @@ struct LandingRecord {
     /// from before it existed) recovery compares size, time and executable bit only.
     #[serde(default)]
     ids_kept: bool,
+}
+
+/// What a swap record in [`TMP_DIR`] holds: an exchange of a download with the file at `target` is under way, and
+/// the swap file next to the record is the download (before the exchange, or after one back) or what was at the
+/// target (after it). See [`DiskFs::land_by_exchange`].
+#[derive(Debug, Serialize, Deserialize)]
+struct SwapRecord {
+    /// The target, `/`-separated below the root.
+    target: String,
+    /// The file the engine checked at the target.
+    expected: RecordedMeta,
+    /// The download.
+    incoming: RecordedMeta,
 }
 
 impl LandingRecord {
@@ -448,6 +472,9 @@ fn exchange(a: &Path, b: &Path) -> io::Result<bool> {
     }
 }
 
+/// Whether this system can exchange two files in one step (some filesystems still can't: [`exchange`] says so).
+const HAS_EXCHANGE: bool = cfg!(any(target_os = "linux", target_os = "android", target_vendor = "apple"));
+
 /// Windows has no exchange of two files without `unsafe` calls: downloads land in steps there.
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 fn exchange(_a: &Path, _b: &Path) -> io::Result<bool> {
@@ -610,6 +637,14 @@ impl DiskFs {
         self
     }
 
+    /// Makes a landing by exchange stop right after the exchange and leave everything as it is, as a crash there
+    /// would: for tests of [`Fs::recover`].
+    #[doc(hidden)]
+    pub fn stopping_after_exchange(mut self) -> Self {
+        self.hooks.stop_after_exchange = true;
+        self
+    }
+
     /// Moves `from` to `to` for a landing in steps, never replacing anything (see [`DiskFs::plain_moves`]).
     fn move_for_landing(&self, from: &Path, to: &Path) -> io::Result<Moved> {
         if self.hooks.plain_moves { check_then_rename(from, to).map(|()| Moved::Plain) } else { move_no_replace(from, to) }
@@ -746,6 +781,160 @@ impl DiskFs {
         Ok(incoming)
     }
 
+    /// Lands the download at `full`, where the file `expected` is, with one exchange (Linux, macOS): the two are
+    /// exchanged, the file that came out is compared with `expected`, and anything else is exchanged back.
+    ///
+    /// After the exchange the download's temporary path holds what was at the target, which may be an app's save. So
+    /// before it, the download moves to a `.swap` name [`DiskFs::clean_tmp`] never removes, with a record of the
+    /// target and both stats written first. A crash at any point leaves that file for [`Fs::recover`], which removes
+    /// it only if it is the download or the file the engine checked (or that file is back at the target), and
+    /// otherwise moves it next to the target as a `.cc-aside` file the scan sees.
+    fn land_by_exchange(
+        &self,
+        path: &RelPath,
+        full: &Path,
+        parent: &Path,
+        mut writer: DiskWriter,
+        expected: FileMeta,
+        incoming: FileMeta,
+    ) -> Result<FileMeta, LandError<DiskWriter>> {
+        let tmp = self.real_tmp(true)?.ok_or_else(|| io::Error::other("no temporary folder"))?;
+        let stem = random_hex(12)?;
+        let record_path = tmp.join(format!("{stem}.{SWAP_RECORD_EXT}"));
+        let swap = tmp.join(format!("{stem}.{SWAP_EXT}"));
+        let record = SwapRecord { target: path.to_string(), expected: expected.into(), incoming: incoming.into() };
+        let json = serde_json::to_vec(&record).map_err(|e| io::Error::other(e.to_string()))?;
+        crate::account::write_atomic(&record_path, &json, true)?;
+        let forget = || {
+            let _ = fs::remove_file(&record_path);
+        };
+        // A rename in the temporary folder keeps the download's ID and time: the record still describes it.
+        if let Err(e) = fs::rename(&writer.temp, &swap) {
+            forget();
+            return Err(LandError::Io(e));
+        }
+        writer.temp = swap;
+        match exchange(&writer.temp, full) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.unswap(&mut writer, &record_path);
+                return self.land_in_steps(path, full, writer, expected, incoming);
+            }
+            Err(e) => {
+                self.unswap(&mut writer, &record_path);
+                return Err(match e.kind() {
+                    // Nothing at the target any more.
+                    io::ErrorKind::NotFound => LandError::Changed(writer),
+                    _ if in_use(&e) => LandError::InUse(writer, in_use_reason(&e)),
+                    _ => LandError::Io(e),
+                });
+            }
+        }
+        if self.hooks.stop_after_exchange {
+            writer.armed = false;
+            return Err(LandError::Io(io::Error::other("stopped after the exchange (test)")));
+        }
+        // The swap file now holds what was at the target.
+        if kind_at(&writer.temp).ok().flatten() == Some(FsKind::File(expected)) {
+            // The file the engine checked: it goes, then the record. If it can't go, the record stays, and recovery
+            // removes it (it is still the checked file).
+            writer.armed = false;
+            if fs::remove_file(&writer.temp).is_ok() {
+                forget();
+            }
+            sync_dir(parent);
+            return Ok(incoming);
+        }
+        // Something else (an app saved in between): exchanged back, and the download comes back.
+        match exchange(&writer.temp, full) {
+            // The swap file holds the download again, unless an app replaced the target between the look and the
+            // exchange back: then it holds that save, which is moved next to the target (never kept or landed as the
+            // server's version), and the download is gone.
+            Ok(true) if kind_at(&writer.temp).ok().flatten() == Some(FsKind::File(incoming)) => {
+                self.unswap(&mut writer, &record_path);
+                Err(LandError::Changed(writer))
+            }
+            Ok(true) => {
+                rescue(&mut writer, full, parent);
+                forget();
+                Err(LandError::Changed(writer))
+            }
+            // Can't happen short of the disk failing between two calls: the other file is never removed.
+            Ok(false) | Err(_) => {
+                let rescued = rescue(&mut writer, full, parent);
+                forget();
+                let name = rescued.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let place = if rescued.parent() == Some(parent) {
+                    format!("it is next to it as {name}")
+                } else {
+                    format!("it is in {AGENT_DIR}/{TMP_DIR} as {name}, which nothing cleans up: move it back yourself")
+                };
+                Err(LandError::Io(io::Error::other(format!(
+                    "{path}: the download landed over a file saved meanwhile and couldn't be undone; {place}"
+                ))))
+            }
+        }
+    }
+
+    /// Moves the download in a swap file back to a temporary name (kept, landed or cleaned up like any write), then
+    /// removes its swap record. If the move fails, the record stays and recovery removes the swap file, which is the
+    /// download.
+    fn unswap(&self, writer: &mut DiskWriter, record_path: &Path) {
+        let Ok(stem) = random_hex(12) else { return };
+        let temp = self.tmp_dir().join(format!("{stem}.{TMP_EXT}"));
+        if fs::rename(&writer.temp, &temp).is_ok() {
+            writer.temp = temp;
+            let _ = fs::remove_file(record_path);
+        }
+    }
+
+    /// Puts right the exchange a swap record describes (see [`DiskFs::land_by_exchange`]). The record goes once that
+    /// is done. Errors name the record's target, or the record in `.craft-cloud/tmp` when it can't be read.
+    fn recover_swap(&self, record_path: &Path) -> io::Result<()> {
+        let shown = format!("{AGENT_DIR}/{TMP_DIR}/{}", record_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
+        let named = |what: &str, e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"));
+        let record: SwapRecord = fs::read(record_path)
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())))
+            .map_err(|e| named(&shown, e))?;
+        self.apply_swap(&record, &record_path.with_extension(SWAP_EXT)).map_err(|e| named(&record.target, e))?;
+        fs::remove_file(record_path).map_err(|e| named(&shown, e))
+    }
+
+    /// See [`DiskFs::recover_swap`].
+    fn apply_swap(&self, record: &SwapRecord, swap: &Path) -> io::Result<()> {
+        let Some(found) = kind_at(swap)? else { return Ok(()) };
+        let target = craft_cloud_sync::rel(&record.target);
+        if target.to_string() != record.target || target.is_root() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "a swap record names no file in the folder"));
+        }
+        let full = self.checked(&target)?;
+        let at_target = match &full {
+            Some(full) => kind_at(full)?,
+            None => None,
+        };
+        let (expected, incoming) = (FsKind::File(record.expected.into()), FsKind::File(record.incoming.into()));
+        // The download (the exchange never happened, or was undone), the file the engine checked (the landing was
+        // done but for removing it), or the checked file is back at the target (so this one is ours): it goes.
+        if found == incoming || found == expected || at_target == Some(expected) {
+            return fs::remove_file(swap);
+        }
+        // Anything else is what the exchange took out of the target: an app's save. It goes next to the target, where
+        // the scan sees it; if the target's folder is gone, it stays in the temporary folder under a name nothing
+        // cleans up, and the error says where.
+        if let Some(full) = full
+            && let (Some(parent), Some(name)) = (full.parent(), full.file_name().and_then(|n| n.to_str()))
+            && self.is_folder(&target.parent().unwrap_or_default())?
+        {
+            return rename_no_replace(swap, &parent.join(aside_name(name)?));
+        }
+        let rescued = swap.with_extension("rescued");
+        fs::rename(swap, &rescued)?;
+        let name = rescued.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        Err(io::Error::other(format!(
+            "its folder is gone; the file an interrupted download took out of it is in {AGENT_DIR}/{TMP_DIR} as {name}, which nothing cleans up: move it back yourself"
+        )))
+    }
+
     /// Finishes or undoes the landing a record describes (see [`Fs::recover`]). The record goes once that is done,
     /// or once there is nothing left to do.
     /// Errors name the record's target, or the record in `.craft-cloud/tmp` when it can't be read.
@@ -806,8 +995,9 @@ impl DiskFs {
         self.root.join(AGENT_DIR).join(TMP_DIR)
     }
 
-    /// Removes temporary files a crashed pass left behind. Call it before a pass, while no other pass runs on
-    /// this folder. Returns how many it removed.
+    /// Removes temporary files a crashed pass left behind (`.part`: interrupted writes). Kept downloads, landing and
+    /// swap records, and swap files (which may hold an app's save) are [`Fs::recover`]'s. Call it before a pass, while
+    /// no other pass runs on this folder. Returns how many it removed.
     pub fn clean_tmp(&self) -> io::Result<usize> {
         let Some(tmp) = self.real_tmp(false)? else { return Ok(0) };
         let entries = fs::read_dir(tmp)?;
@@ -1008,7 +1198,8 @@ impl Fs for DiskFs {
     /// - **Nothing expected**: the OS's no-replace rename (see the module docs).
     /// - **A file expected, Linux and macOS**: the download and the file there are exchanged in one step; the file
     ///   that came out is compared with what was expected. The expected one is removed; anything else (an app saved
-    ///   in between) is exchanged back, and the download comes back as [`LandError::Changed`].
+    ///   in between) is exchanged back, and the download comes back as [`LandError::Changed`]. A crash in between is
+    ///   put right by [`Fs::recover`] (see [`DiskFs::land_by_exchange`]).
     /// - **Windows, and filesystems without an exchange**: in steps (see [`DiskFs::land_in_steps`]); a crash between
     ///   them leaves both files on disk, never neither, and the next pass's [`Fs::recover`] puts them right.
     ///
@@ -1057,49 +1248,10 @@ impl Fs for DiskFs {
                 Err(e) => Err(LandError::Io(e)),
             };
         };
-        if !self.swap {
+        if !self.swap || !HAS_EXCHANGE {
             return self.land_in_steps(path, &full, writer, expected, incoming);
         }
-        match exchange(&writer.temp, &full) {
-            Ok(true) => {}
-            Ok(false) => return self.land_in_steps(path, &full, writer, expected, incoming),
-            // Nothing at the target any more.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(LandError::Changed(writer)),
-            Err(e) if in_use(&e) => return Err(LandError::InUse(writer, in_use_reason(&e))),
-            Err(e) => return Err(LandError::Io(e)),
-        }
-        // The temporary path now holds what was at the target.
-        if kind_at(&writer.temp).ok().flatten() == Some(FsKind::File(expected)) {
-            // The file the engine checked: it goes (if it can't, `clean_tmp` removes it before the next pass).
-            writer.armed = false;
-            let _ = fs::remove_file(&writer.temp);
-            sync_dir(&parent);
-            return Ok(incoming);
-        }
-        // Something else (an app saved in between): exchanged back, and the download comes back.
-        match exchange(&writer.temp, &full) {
-            // The temporary path holds the download again, unless an app replaced the target between the look and the
-            // exchange back: then it holds that save, which is moved next to the target (never kept or landed as the
-            // server's version), and the download is gone.
-            Ok(true) if kind_at(&writer.temp).ok().flatten() == Some(FsKind::File(incoming)) => Err(LandError::Changed(writer)),
-            Ok(true) => {
-                rescue(&mut writer, &full, &parent);
-                Err(LandError::Changed(writer))
-            }
-            // Can't happen short of the disk failing between two calls: the other file is never removed.
-            Ok(false) | Err(_) => {
-                let rescued = rescue(&mut writer, &full, &parent);
-                let name = rescued.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let place = if rescued.parent() == Some(parent.as_path()) {
-                    format!("it is next to it as {name}")
-                } else {
-                    format!("it is in {AGENT_DIR}/{TMP_DIR} as {name}, which nothing cleans up: move it back yourself")
-                };
-                Err(LandError::Io(io::Error::other(format!(
-                    "{path}: the download landed over a file saved meanwhile and couldn't be undone; {place}"
-                ))))
-            }
-        }
+        self.land_by_exchange(path, &full, &parent, writer, expected, incoming)
     }
 
     fn keep(&mut self, mut writer: DiskWriter, key: &str) -> io::Result<()> {
@@ -1149,16 +1301,20 @@ impl Fs for DiskFs {
         }
     }
 
-    /// Goes through the landing records in the temporary folder (see [`DiskFs::land_in_steps`]). A record that
-    /// can't be read or acted on stays for the next pass; the first error is returned once all were tried.
+    /// Goes through the landing and swap records in the temporary folder (see [`DiskFs::land_in_steps`] and
+    /// [`DiskFs::land_by_exchange`]). A record that can't be read or acted on stays for the next pass; the first error
+    /// is returned once all were tried.
     fn recover(&mut self) -> io::Result<()> {
         let Some(tmp) = self.real_tmp(false)? else { return Ok(()) };
         let mut first_error = None;
         for entry in fs::read_dir(tmp)? {
             let path = entry?.path();
-            if path.extension().is_some_and(|ext| ext == LANDING_EXT)
-                && let Err(e) = self.recover_landing(&path)
-            {
+            let result = match path.extension() {
+                Some(ext) if ext == LANDING_EXT => self.recover_landing(&path),
+                Some(ext) if ext == SWAP_RECORD_EXT => self.recover_swap(&path),
+                _ => Ok(()),
+            };
+            if let Err(e) = result {
                 first_error.get_or_insert(e);
             }
         }
