@@ -838,6 +838,37 @@ async fn status_lists_the_skipped_files() {
     assert!(status.contains("skipped:") && status.contains("Footage"), "{status}");
 }
 
+/// A landing a crash cut short that can't be put right yet fails the pass (exit 1, retried), naming the file,
+/// instead of letting a scan take the moved file for a new one and the missing one for deleted. Once it can be put
+/// right, the next pass does that first and syncs as usual.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_landing_that_cant_be_put_right_fails_the_pass_until_it_can() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = server().await;
+    let a = Agent::signed_in(&server, "desktop").await;
+    a.write("Locked/a.txt", "the user's");
+    assert_eq!(a.sync().await, Exit::Done);
+    // A crash right after the file was moved aside, in a folder that may not be written now.
+    std::fs::rename(a.path("Locked/a.txt"), a.path("Locked/a.txt.1.cc-aside")).unwrap();
+    let record = r#"{"target":"Locked/a.txt","aside":"a.txt.1.cc-aside",
+        "expected":{"size":10,"mtime_ms":0,"exec":false,"id":null},"incoming":{"size":3,"mtime_ms":0,"exec":false,"id":null}}"#;
+    std::fs::create_dir_all(a.path(".craft-cloud/tmp")).unwrap();
+    std::fs::write(a.path(".craft-cloud/tmp/0123.landing"), record).unwrap();
+    std::fs::set_permissions(a.path("Locked"), std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(a.path("Locked/probe"), "").is_ok() {
+        // Permissions don't hold for this user (root): nothing to show here.
+        return;
+    }
+    let failed = a.try_sync(false).await.unwrap_err();
+    assert_eq!(failed.exit(), Exit::Failed);
+    assert!(failed.to_string().contains("Locked/a.txt"), "{failed}");
+    std::fs::set_permissions(a.path("Locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(a.sync().await, Exit::Done);
+    assert_eq!(a.files(), ["Locked/a.txt"]);
+    assert_eq!(a.read("Locked/a.txt").as_deref(), Some("the user's"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_damaged_state_file_stops_the_agent() {
     let server = server().await;

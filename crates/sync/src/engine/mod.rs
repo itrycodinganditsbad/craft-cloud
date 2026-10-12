@@ -354,10 +354,13 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// caller can save it and simply run another pass later.
     pub async fn sync_once(&mut self) -> Result<Report, SyncError> {
         let mut report = Report::default();
-        // A landing a crash cut short is put right before anything looks at the folder.
-        if let Err(e) = self.fs.recover() {
-            report.skipped.push((".craft-cloud/tmp".into(), format!("an interrupted download couldn't be put right ({e}); tried again next pass")));
-        }
+        // A landing a crash cut short is put right before anything looks at the folder. Until it is, the pass fails
+        // (a filesystem error, so it is retried): a scan could take the moved file for a new one or the target for
+        // deleted. The error names the landing's target.
+        self.fs.recover().map_err(|e| SyncError::Io {
+            path: "an interrupted download".into(),
+            source: io::Error::new(e.kind(), format!("couldn't be put right ({e}); tried again next pass")),
+        })?;
         let mode = match self.pull().await? {
             Mode::Normal if self.state.reconcile_pending => Mode::Reconcile,
             mode => mode,
