@@ -200,6 +200,10 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
     let data = DataDir::resolve(cli.data_dir)?;
     match cli.command {
         Command::Login(args) => {
+            // Before reading the password: signed in already means there is nothing to type it for.
+            if let Some(account) = data.load_account()? {
+                return Err(already_signed_in(&account));
+            }
             let password = read_password(input)?;
             login(&data, &args, &password, out).await?;
             Ok(Exit::Done)
@@ -288,24 +292,25 @@ fn default_folder() -> Result<PathBuf, AgentError> {
     home.map(|h| h.join("Craft Cloud")).ok_or_else(|| AgentError::Usage("can't find your home folder; pass --folder".into()))
 }
 
-/// Takes the lock at `path` for as long as the result lives, printing a warning if the filesystem can't lock.
-fn hold(path: &Path, out: &mut impl Write) -> Result<Lock, AgentError> {
+/// Takes the lock at `path` for as long as the result lives, printing a warning (to standard error, so it never
+/// mixes into the output a script reads) if the filesystem can't lock.
+fn hold(path: &Path) -> Result<Lock, AgentError> {
     let (held, warning) = lock::acquire(path)?;
     if let Some(warning) = warning {
-        say!(out, "{warning}")?;
+        eprintln!("{warning}");
     }
     Ok(held)
 }
 
 /// Takes the data folder's lock (creating the data folder).
-fn hold_data(data: &DataDir, out: &mut impl Write) -> Result<Lock, AgentError> {
+fn hold_data(data: &DataDir) -> Result<Lock, AgentError> {
     data.create()?;
-    hold(&data.path().join(DATA_LOCK), out)
+    hold(&data.path().join(DATA_LOCK))
 }
 
 /// Takes the synced folder's lock, in its `.craft-cloud/` folder (created owner-only if missing; a link there is
 /// refused, never followed).
-fn hold_folder(folder: &Path, out: &mut impl Write) -> Result<Lock, AgentError> {
+fn hold_folder(folder: &Path) -> Result<Lock, AgentError> {
     let dir = folder.join(AGENT_DIR);
     match std::fs::symlink_metadata(&dir) {
         Ok(md) if md.file_type().is_dir() => {}
@@ -313,7 +318,7 @@ fn hold_folder(folder: &Path, out: &mut impl Write) -> Result<Lock, AgentError> 
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_private_dir(&dir).map_err(io_at(&dir))?,
         Err(e) => return Err(io_at(&dir)(e)),
     }
-    hold(&dir.join(FOLDER_LOCK), out)
+    hold(&dir.join(FOLDER_LOCK))
 }
 
 /// Whether `folder` holds anything besides the agent's own folder.
@@ -327,17 +332,21 @@ fn has_files(folder: &Path) -> Result<bool, AgentError> {
     Ok(false)
 }
 
+fn already_signed_in(account: &Account) -> AgentError {
+    AgentError::Usage(format!(
+        "already signed in as {} on {} for {}; run `craft-cloud-agent logout` first",
+        account.username,
+        account.server,
+        account.folder.display()
+    ))
+}
+
 /// Signs in, creates a device and sets up the folder with its marker. Any failure after the device was
 /// created revokes it again (best effort) and leaves no account behind.
 pub async fn login(data: &DataDir, args: &LoginArgs, password: &str, out: &mut impl Write) -> Result<Account, AgentError> {
-    let _data_lock = hold_data(data, out)?;
+    let _data_lock = hold_data(data)?;
     if let Some(account) = data.load_account()? {
-        return Err(AgentError::Usage(format!(
-            "already signed in as {} on {} for {}; run `craft-cloud-agent logout` first",
-            account.username,
-            account.server,
-            account.folder.display()
-        )));
+        return Err(already_signed_in(&account));
     }
     let server = ServerUrl::parse(&args.url).map_err(|e| AgentError::Usage(e.to_string()))?;
     let folder = match &args.folder {
@@ -375,7 +384,7 @@ pub async fn login(data: &DataDir, args: &LoginArgs, password: &str, out: &mut i
             return Err(RootError::OtherSpace(folder.clone()).into());
         }
         std::fs::create_dir_all(&folder).map_err(io_at(&folder))?;
-        let _folder_lock = hold_folder(&folder, &mut *out)?;
+        let _folder_lock = hold_folder(&folder)?;
         root::write(&folder, &marker)?;
         let account = Account {
             schema: ACCOUNT_SCHEMA,
@@ -407,10 +416,10 @@ pub async fn login(data: &DataDir, args: &LoginArgs, password: &str, out: &mut i
 /// Runs one sync pass and saves the state, whether the pass finished or not. Returns the exit code and what
 /// the pass did.
 pub async fn sync(data: &DataDir, approve_deletes: bool, out: &mut impl Write) -> Result<(Exit, PassSummary), AgentError> {
-    let _data_lock = hold_data(data, out)?;
+    let _data_lock = hold_data(data)?;
     let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
     root::check(&account.folder, &RootMarker { space: account.space, root: account.root })?;
-    let _folder_lock = hold_folder(&account.folder, out)?;
+    let _folder_lock = hold_folder(&account.folder)?;
     let mut saved = data.load_state()?;
     if saved.state.space.is_some_and(|s| s != account.space) {
         return Err(AgentError::OtherAccountState(data.path().join(crate::account::STATE_FILE)));
@@ -547,7 +556,7 @@ pub fn status(data: &DataDir, out: &mut impl Write) -> Result<(), AgentError> {
 /// With `local`, the server isn't asked: the account and state are forgotten here only, and the device stays
 /// valid on the server until an admin revokes it (`craft-cloud-server device revoke`).
 pub async fn logout(data: &DataDir, local: bool, out: &mut impl Write) -> Result<(), AgentError> {
-    let _data_lock = hold_data(data, out)?;
+    let _data_lock = hold_data(data)?;
     let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
     if !local {
         let transport = HttpTransport::new(account.server.clone(), &account.token)?;

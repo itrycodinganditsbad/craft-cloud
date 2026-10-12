@@ -679,3 +679,89 @@ async fn the_state_of_another_account_stops_the_agent() {
     assert_eq!(stopped.exit(), Exit::NeedsYou);
     assert!(stopped.to_string().contains("belongs to another account"), "{stopped}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn login_notices_an_existing_account_before_asking_for_the_password() {
+    use clap::Parser;
+    let server = server().await;
+    let a = Agent::signed_in(&server, "desktop").await;
+    let data = a.data.path().to_str().unwrap().to_owned();
+    let cli = cli::Cli::try_parse_from(["craft-cloud-agent", "login", &server.url, "--user", "ana", "--data-dir", &data]).unwrap();
+    // Nothing on standard input: a missing password would be the error if it were read first.
+    let refused = cli::run(cli, &mut "".as_bytes(), &mut Vec::new()).await.unwrap_err();
+    assert!(matches!(refused, AgentError::Usage(ref m) if m.contains("already signed in")), "{refused:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adopting_a_folder_turns_a_differing_file_into_a_conflict_copy() {
+    let server = server().await;
+    let a = Agent::signed_in(&server, "desktop").await;
+    a.write("notes.txt", "server copy");
+    a.sync().await;
+
+    let b = Agent::new();
+    std::fs::create_dir_all(&b.folder).unwrap();
+    std::fs::write(b.folder.join("notes.txt"), "my own, different text").unwrap();
+    let args = LoginArgs { adopt: true, ..login_args(&server, &b.folder, "laptop") };
+    cli::login(&b.data, &args, PASSWORD, &mut Vec::new()).await.unwrap();
+    let (_, summary) = b.try_sync(false).await.unwrap();
+    assert_eq!(summary.conflict_copies.len(), 1, "{summary:?}");
+    let copy = &summary.conflict_copies[0];
+    assert_eq!(b.read("notes.txt").as_deref(), Some("server copy"));
+    assert_eq!(b.read(copy).as_deref(), Some("my own, different text"), "both versions are kept");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_login_setup_revokes_the_new_device() {
+    let server = server().await;
+    let a = Agent::new();
+    std::fs::create_dir_all(&a.folder).unwrap();
+    // The folder is already set up for some other space.
+    let marker = root::RootMarker { space: craft_cloud_proto::SpaceId::generate(), root: craft_cloud_proto::NodeId::generate() };
+    root::write(&a.folder, &marker).unwrap();
+    let args = LoginArgs { adopt: true, ..login_args(&server, &a.folder, "pc") };
+    let refused = cli::login(&a.data, &args, PASSWORD, &mut Vec::new()).await.unwrap_err();
+    assert!(matches!(refused, AgentError::Root(RootError::OtherSpace(_))), "{refused:?}");
+    assert_eq!(refused.exit(), Exit::NeedsYou);
+    assert_eq!(a.data.load_account().unwrap(), None);
+    let user = server.meta.user_by_name("ana").await.unwrap().unwrap();
+    let devices = server.meta.list_devices(user.id).await.unwrap();
+    assert_eq!(devices.len(), 1, "the device was created, then revoked");
+    assert!(devices.iter().all(|d| d.revoked), "{devices:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_lists_the_waiting_deletes() {
+    let server = server().await;
+    let a = Agent::signed_in(&server, "desktop").await;
+    for i in 0..12 {
+        a.write(&format!("f{i:02}.txt"), "x");
+    }
+    a.sync().await;
+    for i in 0..12 {
+        std::fs::remove_file(a.path(&format!("f{i:02}.txt"))).unwrap();
+    }
+    assert_eq!(a.sync().await, Exit::NeedsApproval);
+    let mut out = Vec::new();
+    cli::status(&a.data, &mut out).unwrap();
+    let status = String::from_utf8(out).unwrap();
+    assert!(status.contains("deletions wait for approval") && status.contains("delete on the server: f07.txt"), "{status}");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_lists_the_skipped_files() {
+    let server = server().await;
+    let a = Agent::signed_in(&server, "desktop").await;
+    a.write("Footage/c0.mov", "clip");
+    a.write("other.txt", "x");
+    a.sync().await;
+    let drive = tempfile::tempdir().unwrap();
+    std::fs::rename(a.path("Footage"), drive.path().join("Footage")).unwrap();
+    std::os::unix::fs::symlink(drive.path().join("Footage"), a.path("Footage")).unwrap();
+    a.sync().await;
+    let mut out = Vec::new();
+    cli::status(&a.data, &mut out).unwrap();
+    let status = String::from_utf8(out).unwrap();
+    assert!(status.contains("skipped:") && status.contains("Footage"), "{status}");
+}
