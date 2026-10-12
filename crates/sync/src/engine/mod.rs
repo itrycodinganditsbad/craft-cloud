@@ -154,10 +154,9 @@ impl Report {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    /// The base is trusted.
+    /// The base is trusted. On a first sync it is empty, so a local file at a path the server has is a
+    /// conflict copy unless it holds the same content.
     Normal,
-    /// First sync of this folder: the base is empty; differing files at the same path become conflict copies.
-    Join,
     /// The server was restored (new epoch): the base can't be trusted; never replace local files.
     Reconcile,
 }
@@ -279,7 +278,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             self.state.root = Some(space.root);
             self.state.base.clear();
             self.state.base.insert(space.root, BaseEntry { parent: None, name: None, kind: BaseKind::Dir { local_id: None } });
-            return Ok(Mode::Join);
+            return Ok(Mode::Normal);
         }
         match self.read_changes().await {
             Ok((epoch, seq, nodes)) if Some(epoch) == self.state.epoch => {
