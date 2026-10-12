@@ -19,7 +19,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use crate::account::{ACCOUNT_SCHEMA, Account, AccountError, DataDir, LastPass, Outcome, PassSummary, STATE_SCHEMA};
-use crate::disk::{AGENT_DIR, DiskFs};
+use crate::disk::{AGENT_DIR, DiskFs, create_private_dir};
 use crate::http::{self, DeviceToken, HttpTransport, ServerUrl};
 use crate::lock::{self, DATA_LOCK, FOLDER_LOCK, Lock, LockError};
 use crate::root::{self, RootError, RootMarker};
@@ -284,10 +284,16 @@ fn hold_data(data: &DataDir, out: &mut impl Write) -> Result<Lock, AgentError> {
     hold(&data.path().join(DATA_LOCK), out)
 }
 
-/// Takes the synced folder's lock, in its `.craft-cloud/` folder (created if missing).
+/// Takes the synced folder's lock, in its `.craft-cloud/` folder (created owner-only if missing; a link there is
+/// refused, never followed).
 fn hold_folder(folder: &Path, out: &mut impl Write) -> Result<Lock, AgentError> {
     let dir = folder.join(AGENT_DIR);
-    std::fs::create_dir_all(&dir).map_err(io_at(&dir))?;
+    match std::fs::symlink_metadata(&dir) {
+        Ok(md) if md.file_type().is_dir() => {}
+        Ok(_) => return Err(RootError::Damaged { path: dir, message: "not a real folder (a link?)".into() }.into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_private_dir(&dir).map_err(io_at(&dir))?,
+        Err(e) => return Err(io_at(&dir)(e)),
+    }
     hold(&dir.join(FOLDER_LOCK), out)
 }
 

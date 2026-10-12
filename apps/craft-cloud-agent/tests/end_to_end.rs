@@ -649,3 +649,16 @@ async fn a_failed_pass_keeps_the_deletes_the_user_was_shown() {
     let (exit, summary) = a.try_sync(true).await.unwrap();
     assert_eq!((exit, summary.removed_remotely), (Exit::Done, 12), "{summary:?}");
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn login_makes_the_agent_folder_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = server().await;
+    let a = Agent::signed_in(&server, "desktop").await;
+    let mode = |rel: &str| std::fs::metadata(a.path(rel)).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(".craft-cloud"), 0o700);
+    // A sync leaves it so.
+    a.sync().await;
+    assert_eq!(mode(".craft-cloud"), 0o700);
+}
