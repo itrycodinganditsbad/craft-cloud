@@ -13,12 +13,14 @@ use crate::path::RelPath;
 use crate::state::{BaseEntry, BaseKind, RemoteNode};
 use crate::transport::{Transport, TransportError};
 
-use super::{Effect, Engine, MISSING_QUERY_IDS, Report, SyncError};
+use super::{Effect, Engine, MISSING_QUERY_IDS, Report, SyncError, per_node};
 
 impl<F: Fs, T: Transport> Engine<F, T> {
     pub(super) async fn push(&mut self, report: &mut Report) -> Result<(), SyncError> {
         let root = self.state.root.ok_or_else(|| SyncError::Corrupt("no root".into()))?;
-        let local = self.scan(report)?;
+        let (local, unknown) = self.scan(report)?;
+        // Inside a folder that couldn't be listed nothing is known, so nothing tracked there is missing.
+        let hidden = |path: &RelPath| unknown.iter().any(|u| path.starts_with(u));
         let index = self.state.base_index();
         // Folders that moved: a missing base folder whose local ID turns up at an untracked path.
         let untracked_dirs: HashMap<u64, RelPath> = local
@@ -107,6 +109,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 None => true,
             }
         });
+        missing_files.retain(|(_, path)| !hidden(&expected(path)));
+        missing_dirs.retain(|(_, path)| !hidden(&expected(path)));
         let moved_targets: BTreeSet<RelPath> =
             file_moves.iter().map(|(_, _, to, _)| to.clone()).chain(dir_moves.iter().map(|(_, _, to)| to.clone())).collect();
 
@@ -114,7 +118,11 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         let mut new_paths: Vec<(&RelPath, &FsKind)> = local
             .iter()
             .filter(|(p, _)| {
-                !expected_index.contains_key(*p) && !moved_targets.contains(*p) && !moved_targets.iter().any(|t| p.starts_with(t) && *p != t)
+                !expected_index.contains_key(*p)
+                    && !moved_targets.contains(*p)
+                    && !moved_targets.iter().any(|t| p.starts_with(t) && *p != t)
+                    // A new folder that can't be listed waits until it can.
+                    && !unknown.contains(*p)
             })
             .collect();
         new_paths.sort_by_key(|(p, _)| p.depth());
@@ -336,7 +344,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                                 && self.stat(to)?.is_some()
                             {
                                 let to = to.clone();
-                                self.move_aside(&to, report)?;
+                                let result = self.move_aside(&to, report).map(|_| ());
+                                per_node(result, report)?;
                             }
                         }
                         let refused: BTreeSet<usize> = conflicts.iter().map(|c| c.op).filter(|i| !fixable.contains_key(i)).collect();

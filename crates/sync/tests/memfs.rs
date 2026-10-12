@@ -73,3 +73,23 @@ fn locked_files_cant_be_read_but_still_list() {
     fs.unlock(&rel("busy.mov"));
     assert_eq!(fs.read(&rel("busy.mov")).unwrap(), b"frames");
 }
+
+#[test]
+fn held_paths_cant_be_removed_renamed_replaced_or_listed() {
+    let mut fs = MemFs::new();
+    fs.mkdir(&rel("d")).unwrap();
+    fs.write(&rel("open.doc"), b"text", false, 0).unwrap();
+    fs.hold(&rel("open.doc"));
+    fs.hold(&rel("d"));
+    assert_eq!(fs.remove_file(&rel("open.doc")).unwrap_err().kind(), ErrorKind::PermissionDenied);
+    assert_eq!(fs.rename(&rel("open.doc"), &rel("moved.doc")).unwrap_err().kind(), ErrorKind::PermissionDenied);
+    assert_eq!(fs.write(&rel("open.doc"), b"new", false, 0).unwrap_err().kind(), ErrorKind::PermissionDenied);
+    assert_eq!(fs.list(&rel("d")).unwrap_err().kind(), ErrorKind::PermissionDenied);
+    assert_eq!(fs.remove_dir(&rel("d")).unwrap_err().kind(), ErrorKind::PermissionDenied);
+    // Reading still works.
+    assert_eq!(fs.read(&rel("open.doc")).unwrap(), b"text");
+    fs.release(&rel("open.doc"));
+    fs.remove_file(&rel("open.doc")).unwrap();
+    fs.unlock_all();
+    fs.remove_dir(&rel("d")).unwrap();
+}

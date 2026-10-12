@@ -1,5 +1,6 @@
 //! Deterministic simulation: three machines share one account and do random things to their folders
-//! (create, edit, delete, rename, move files and folders, hold files locked), sync at random moments, sometimes with the
+//! (create, edit, delete, rename, move files and folders, hold files locked or open, make folders unlistable),
+//! sync at random moments, sometimes with the
 //! connection failing mid-pass. Then everyone syncs until nothing changes, and we check:
 //!
 //! 1. **Convergence**: every machine ends with exactly the same files and folders.
@@ -12,7 +13,8 @@
 //! It also checks after every finished pass that each node a machine tracks still has a place in its folder.
 //!
 //! Each seed is reproducible: `SIM_SEED=17 cargo test -p craft-cloud-sync --test simulation`. By default 40
-//! seeds run; `SIM_SEEDS=1000 SIM_FIRST=2000` runs seeds 2000 to 2999 (use `--release`).
+//! seeds run; `SIM_SEEDS=1000 SIM_FIRST=2000` runs seeds 2000 to 2999 (use `--release`). `SIM_TRACE=1` prints
+//! every pass's report and each machine's folder after every step.
 
 mod common;
 
@@ -130,12 +132,34 @@ fn act(rng: &mut Rng, m: &mut Machine, destroyed: &mut BTreeSet<FileHash>) {
             }
         }
         8 => {
-            // Another program holds a file open (or lets it go).
-            if let Some(f) = rng.pick(&files).cloned() {
-                if rng.below(2) == 0 {
-                    m.fs_mut().lock(&f);
-                } else {
-                    m.fs_mut().unlock(&f);
+            // Another program holds a file locked against reading, or open so it can't be removed, renamed or
+            // replaced; or a folder can't be listed (or any of that ends).
+            match rng.below(4) {
+                0 | 1 => {
+                    if let Some(f) = rng.pick(&files).cloned() {
+                        if rng.below(2) == 0 {
+                            m.fs_mut().lock(&f);
+                        } else {
+                            m.fs_mut().unlock(&f);
+                        }
+                    }
+                }
+                2 => {
+                    let mut paths = files.clone();
+                    paths.extend(dirs.iter().cloned());
+                    if let Some(p) = rng.pick(&paths).cloned() {
+                        if std::env::var("SIM_TRACE").is_ok() {
+                            eprintln!("TRACE hold {p}");
+                        }
+                        m.fs_mut().hold(&p);
+                    }
+                }
+                _ => {
+                    let mut paths = files.clone();
+                    paths.extend(dirs.iter().cloned());
+                    if let Some(p) = rng.pick(&paths).cloned() {
+                        m.fs_mut().release(&p);
+                    }
                 }
             }
         }
@@ -172,9 +196,14 @@ async fn run(seed: u64, steps: usize) {
                 m.approve_deletes();
             }
             let r = m.sync_once().await;
+            if std::env::var("SIM_TRACE").is_ok() {
+                eprintln!("TRACE step {step} m{i} sync: {r:?}\n  files {:?}\n  dirs {:?}", m.fs().files().keys().collect::<Vec<_>>(), m.fs().dirs());
+            }
             m.transport().faults.every.store(0, Ordering::Relaxed);
-            // After a finished pass every node the machine tracks has a place in its folder.
-            if r.is_ok() {
+            // After a finished pass every node the machine tracks has a place in its folder. A node skipped for a
+            // filesystem error may wait one more pass for it (its folder was moved aside, say, and it couldn't be
+            // looked up), so passes that skipped one aren't checked.
+            if r.as_ref().is_ok_and(|r| !r.skipped.iter().any(|(_, why)| why.ends_with("tried again next pass"))) {
                 let st = m.state();
                 for (id, b) in &st.base {
                     assert!(
@@ -186,6 +215,9 @@ async fn run(seed: u64, steps: usize) {
             }
         } else {
             act(&mut rng, m, &mut destroyed);
+            if std::env::var("SIM_TRACE").is_ok() {
+                eprintln!("TRACE step {step} m{i} act\n  files {:?}\n  dirs {:?}", m.fs().files().keys().collect::<Vec<_>>(), m.fs().dirs());
+            }
         }
     }
 

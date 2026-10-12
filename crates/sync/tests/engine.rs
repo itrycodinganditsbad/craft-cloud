@@ -453,3 +453,62 @@ async fn a_tracked_folder_deleted_on_the_server_leaves_no_empty_conflict_copy() 
     assert!(b.fs().dirs().is_empty(), "{:?}", b.fs().dirs());
     assert_eq!(files(&b), vec![("x".to_owned(), b"now a file".to_vec())]);
 }
+
+#[tokio::test]
+async fn a_file_that_cant_be_removed_doesnt_stop_the_rest() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "x.txt", b"x");
+    settle(&mut [&mut a, &mut b], 5).await;
+    // The laptop deletes x.txt while an app on the desktop holds it open (Windows can't remove it).
+    a.fs_mut().remove_file(&path("x.txt")).unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().hold(&path("x.txt"));
+    write(&mut b, "new.txt", b"new work");
+    let report = b.sync_once().await.unwrap();
+    assert!(report.skipped.iter().any(|(p, _)| p == "x.txt"), "{report:?}");
+    assert_eq!(report.uploaded, vec![path("new.txt")]);
+    a.sync_once().await.unwrap();
+    assert_eq!(files(&a), vec![("new.txt".to_owned(), b"new work".to_vec())]);
+    // Still held: nothing comes back to the server, and the next pass tries again.
+    let report = b.sync_once().await.unwrap();
+    assert!(!report.changed(), "{report:?}");
+    b.fs_mut().release(&path("x.txt"));
+    let report = b.sync_once().await.unwrap();
+    assert_eq!(report.removed_locally, vec![path("x.txt")]);
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&a), files(&b));
+}
+
+#[tokio::test]
+async fn a_folder_that_cant_be_listed_is_never_deleted_on_the_server() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("private")).unwrap();
+    a.fs_mut().mkdir(&path("private/deep")).unwrap();
+    write(&mut a, "private/p.txt", b"p");
+    write(&mut a, "private/deep/q.txt", b"q");
+    settle(&mut [&mut a, &mut b], 5).await;
+    b.fs_mut().hold(&path("private"));
+    b.fs_mut().mkdir(&path("secret")).unwrap();
+    b.fs_mut().hold(&path("secret"));
+    write(&mut b, "new.txt", b"new work");
+    for _ in 0..3 {
+        let report = b.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty() && report.pending_deletes.is_empty(), "{report:?}");
+        assert!(report.skipped.iter().any(|(p, _)| p == "private"), "{report:?}");
+    }
+    settle(&mut [&mut a], 5).await;
+    assert_eq!(files(&a).len(), 3, "{:?}", files(&a));
+    assert!(a.fs().files().contains_key(&path("new.txt")));
+    // The folder that can't be listed isn't created on the server until it can be.
+    assert_eq!(a.fs().dirs(), vec![path("private"), path("private/deep")]);
+    b.fs_mut().unlock_all();
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&a), files(&b));
+    assert_eq!(a.fs().dirs(), b.fs().dirs());
+}

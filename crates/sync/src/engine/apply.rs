@@ -1,5 +1,7 @@
 //! Applying the server's changes to the folder.
 
+use std::collections::BTreeSet;
+
 use craft_cloud_proto::limits::MAX_TREE_DEPTH;
 use craft_cloud_proto::{Name, NodeId};
 
@@ -8,7 +10,7 @@ use crate::path::RelPath;
 use crate::state::{BaseEntry, BaseKind, RemoteNode};
 use crate::transport::Transport;
 
-use super::{Engine, Local, Mode, Report, SyncError, io_err};
+use super::{Engine, Local, Mode, Report, SyncError, io_err, per_node};
 
 impl<F: Fs, T: Transport> Engine<F, T> {
     pub(super) async fn apply_remote(&mut self, mode: Mode, report: &mut Report) -> Result<(), SyncError> {
@@ -17,11 +19,17 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         let mut work: Vec<(usize, NodeId)> =
             self.state.remote.keys().filter(|id| **id != root).filter_map(|id| Some((self.state.remote_path(*id)?.depth(), *id))).collect();
         work.sort();
+        // Nodes skipped this pass for a filesystem error; everything under one waits for it too.
+        let mut skipped: BTreeSet<NodeId> = BTreeSet::new();
         for (_, id) in work {
-            if self.state.base.contains_key(&id) {
-                self.apply_changed(id, report).await?;
-            } else {
-                self.apply_new(id, mode, report).await?;
+            if self.state.remote.get(&id).and_then(|r| r.parent).is_some_and(|p| skipped.contains(&p)) {
+                skipped.insert(id);
+                continue;
+            }
+            let result =
+                if self.state.base.contains_key(&id) { self.apply_changed(id, report).await } else { self.apply_new(id, mode, report).await };
+            if per_node(result, report)? {
+                skipped.insert(id);
             }
         }
         // Nodes the server deleted: files first, then folders deepest first.
@@ -34,7 +42,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             .collect();
         gone.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
         for (_, _, id) in gone {
-            self.apply_deleted(id, report)?;
+            let result = self.apply_deleted(id, report);
+            per_node(result, report)?;
         }
         Ok(())
     }

@@ -93,13 +93,14 @@ pub struct MemFs {
     clock: i64,
     next_id: u64,
     locked: BTreeSet<RelPath>,
+    held: BTreeSet<RelPath>,
 }
 
 impl Default for MemFs {
     fn default() -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert(RelPath::root(), MemNode::Dir { id: 1 });
-        Self { nodes, clock: 1_000, next_id: 2, locked: BTreeSet::new() }
+        Self { nodes, clock: 1_000, next_id: 2, locked: BTreeSet::new(), held: BTreeSet::new() }
     }
 }
 
@@ -150,8 +151,28 @@ impl MemFs {
         self.locked.remove(path);
     }
 
+    /// Makes removing, renaming or replacing `path` fail with "permission denied", like a file an app holds
+    /// open on Windows, and listing it fail, like a folder this user may not read. Reading is unaffected
+    /// (see [`MemFs::lock`]).
+    pub fn hold(&mut self, path: &RelPath) {
+        self.held.insert(path.clone());
+    }
+
+    pub fn release(&mut self, path: &RelPath) {
+        self.held.remove(path);
+    }
+
+    /// Lets every locked and held path go.
     pub fn unlock_all(&mut self) {
         self.locked.clear();
+        self.held.clear();
+    }
+
+    fn check_held(&self, path: &RelPath) -> io::Result<()> {
+        if self.held.contains(path) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{path}: in use")));
+        }
+        Ok(())
     }
 
     fn data(&self, path: &RelPath) -> io::Result<&[u8]> {
@@ -190,6 +211,7 @@ impl Fs for MemFs {
 
     fn list(&self, dir: &RelPath) -> io::Result<Vec<FsEntry>> {
         self.require_dir(dir)?;
+        self.check_held(dir)?;
         let depth = dir.depth() + 1;
         Ok(self
             .nodes
@@ -234,6 +256,7 @@ impl Fs for MemFs {
 
     fn finish_write(&mut self, path: &RelPath, writer: Self::Writer, exec: bool, mtime_ms: i64) -> io::Result<FileMeta> {
         self.require_parent(path)?;
+        self.check_held(path)?;
         if let Some(MemNode::Dir { .. }) = self.nodes.get(path) {
             return Err(io::Error::other(format!("{path}: is a directory")));
         }
@@ -256,6 +279,7 @@ impl Fs for MemFs {
     }
 
     fn remove_file(&mut self, path: &RelPath) -> io::Result<()> {
+        self.check_held(path)?;
         match self.nodes.get(path) {
             Some(MemNode::File { .. }) => {
                 self.nodes.remove(path);
@@ -268,6 +292,7 @@ impl Fs for MemFs {
 
     fn remove_dir(&mut self, path: &RelPath) -> io::Result<()> {
         self.require_dir(path)?;
+        self.check_held(path)?;
         if path.is_root() || !self.below(path).is_empty() {
             return Err(io::Error::other(format!("{path}: not empty")));
         }
@@ -279,6 +304,7 @@ impl Fs for MemFs {
         if !self.nodes.contains_key(from) || from.is_root() {
             return Err(not_found(from));
         }
+        self.check_held(from)?;
         if self.nodes.contains_key(to) {
             return Err(exists(to));
         }

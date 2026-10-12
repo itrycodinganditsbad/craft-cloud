@@ -54,6 +54,20 @@ fn io_err(path: &RelPath, source: io::Error) -> SyncError {
     SyncError::Io { path: path.to_string(), source }
 }
 
+/// A filesystem error while handling one node (a file an app holds open, a folder that can't be listed)
+/// skips that node this pass, with the reason in the report; its base stays as it was, so the next pass
+/// tries again. Any other error ends the pass. Returns whether the node was skipped.
+fn per_node(result: Result<(), SyncError>, report: &mut Report) -> Result<bool, SyncError> {
+    match result {
+        Ok(()) => Ok(false),
+        Err(SyncError::Io { path, source }) => {
+            report.skipped.push((path, format!("{source}; tried again next pass")));
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Shown in conflict copy names.
@@ -337,12 +351,25 @@ impl<F: Fs, T: Transport> Engine<F, T> {
 
     /// The folder as a map from path to entry, without ignored, invalid, clashing or special entries.
     /// When two names in a folder clash by case, the tracked one wins and the other is skipped.
-    fn scan(&self, report: &mut Report) -> Result<BTreeMap<RelPath, FsKind>, SyncError> {
+    ///
+    /// Also returns the folders whose contents are unknown this pass: ones that can't be listed (or vanished
+    /// while the scan ran). Nothing tracked inside them counts as missing. Only a sync root that can't be
+    /// listed fails the scan.
+    fn scan(&self, report: &mut Report) -> Result<(BTreeMap<RelPath, FsKind>, Vec<RelPath>), SyncError> {
         let tracked = self.state.base_index();
         let mut out = BTreeMap::new();
+        let mut unknown = Vec::new();
         let mut queue = vec![RelPath::root()];
         while let Some(dir) = queue.pop() {
-            let mut entries = self.fs.list(&dir).map_err(|e| io_err(&dir, e))?;
+            let mut entries = match self.fs.list(&dir) {
+                Ok(entries) => entries,
+                Err(e) if dir.is_root() => return Err(io_err(&dir, e)),
+                Err(e) => {
+                    report.skipped.push((dir.to_string(), format!("can't be listed: {e}; tried again next pass")));
+                    unknown.push(dir);
+                    continue;
+                }
+            };
             let is_tracked = |raw: &str| Name::new(raw).is_ok_and(|n| tracked.contains_key(&dir.join(&n)));
             entries.sort_by(|a, b| is_tracked(&b.name).cmp(&is_tracked(&a.name)).then_with(|| a.name.cmp(&b.name)));
             let mut seen = HashMap::new();
@@ -373,7 +400,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 }
             }
         }
-        Ok(out)
+        Ok((out, unknown))
     }
 
     fn stat(&self, path: &RelPath) -> Result<Option<FsKind>, SyncError> {
@@ -453,7 +480,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         if dir.depth() > MAX_TREE_DEPTH {
             return Ok(false);
         }
-        let entries = self.fs.list(dir).map_err(|e| io_err(dir, e))?;
+        // A folder that can't be listed may hold something that syncs.
+        let Ok(entries) = self.fs.list(dir) else { return Ok(false) };
         if entries.is_empty() {
             return Ok(false);
         }
