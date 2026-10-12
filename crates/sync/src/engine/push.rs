@@ -91,6 +91,39 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             }
         }
 
+        // Every folder by its local ID.
+        let dir_at: HashMap<u64, RelPath> = local
+            .iter()
+            .filter_map(|(p, k)| match k {
+                FsKind::Dir { id: Some(i) } => Some((*i, p.clone())),
+                _ => None,
+            })
+            .collect();
+        // A tracked folder found at its place is that folder (path first). When its recorded local ID is gone from
+        // the folder (it was put back from another drive, or made again), it takes the ID it has now, so a later
+        // rename of it is sent as a move and a link in it is still found through it. Not while any folder can't be
+        // listed (the old ID may be in there), and never an ID another tracked folder has.
+        let refreshed: Vec<(NodeId, Option<u64>)> = index
+            .iter()
+            .filter_map(|(path, id)| match (&self.state.base.get(id)?.kind, local.get(&expected(path))?) {
+                (BaseKind::Dir { local_id }, FsKind::Dir { id: here })
+                    if *id != root
+                        && unknown.is_empty()
+                        && here.is_some()
+                        && local_id.is_none_or(|old| !dir_at.contains_key(&old))
+                        && !self.owns_local_dir(*here, *id) =>
+                {
+                    Some((*id, *here))
+                }
+                _ => None,
+            })
+            .collect();
+        for (id, here) in refreshed {
+            if let Some(BaseEntry { kind: BaseKind::Dir { local_id }, .. }) = self.state.base.get_mut(&id) {
+                *local_id = here;
+            }
+        }
+
         // File moves: a missing base file whose local ID turns up at an untracked path.
         let untracked_files: HashMap<u64, (RelPath, FileMeta)> = local
             .iter()
@@ -113,13 +146,6 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         });
         // A folder above a missing node that the user moved is found by its local ID even where a new folder took
         // its old name (so it isn't a folder move here): a link the node turned into moved with it.
-        let dir_at: HashMap<u64, &RelPath> = local
-            .iter()
-            .filter_map(|(p, k)| match k {
-                FsKind::Dir { id: Some(i) } => Some((*i, p)),
-                _ => None,
-            })
-            .collect();
         let behind_moved_link = |id: NodeId| -> bool {
             let mut below = Vec::new();
             let mut current = id;
@@ -129,7 +155,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 current = *parent;
                 if let Some(BaseEntry { kind: BaseKind::Dir { local_id: Some(lid) }, .. }) = self.state.base.get(&current)
                     && let Some(now) = dir_at.get(lid)
-                    && hidden(&below.iter().rev().fold((*now).clone(), |p, n| p.join(n)))
+                    && hidden(&below.iter().rev().fold(now.clone(), |p, n| p.join(n)))
                 {
                     return true;
                 }

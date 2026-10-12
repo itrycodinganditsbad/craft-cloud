@@ -892,6 +892,28 @@ async fn a_server_rename_of_a_file_that_became_a_link_in_a_renamed_folder_waits(
     assert_eq!(read(&a, "Clips/c9.mov"), b"clip");
 }
 
+/// A folder that came back from another drive (a link replaced with the real folder again) has a new file ID.
+/// A later rename of it is still a move, so a link inside it isn't taken for deleted either.
+#[tokio::test]
+async fn a_folder_put_back_from_another_drive_is_still_moved_as_one() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.removed_remotely.is_empty() && report.pending_deletes.is_empty(), "{report:?}");
+    assert_eq!(report.moved_remotely, vec![(path("Footage"), path("Clips"))]);
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "Clips/c0.mov"), b"clip");
+}
+
 /// Two machines with a folder of three clips, a notes file and padding (so the mass-delete guard doesn't hide a
 /// wrong delete).
 async fn linked_setup() -> (Server, common::Machine, common::Machine) {
