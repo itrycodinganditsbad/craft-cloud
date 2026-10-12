@@ -15,7 +15,8 @@
 //! - **Answers map onto [`TransportError`]** by the server's error codes first ([`codes`]), then by status:
 //!   a refused batch with its conflicts, missing chunks and `resync_required` by code; 401 is `Unauthorized`,
 //!   404 `NotFound`; 408, 429, 5xx, connection failures and timeouts are `Unavailable` (try again later);
-//!   anything else, and any answer that doesn't parse, is `Protocol`.
+//!   anything else, and any answer that doesn't parse, is `Protocol` (another 4xx says "the server or a proxy
+//!   refused the request (HTTP <code>)": a reverse proxy in front of the server may be the one refusing).
 //! - **The device token** travels only in the `Authorization` header (marked sensitive) and never appears in
 //!   `Debug` output or error messages. Redirects are not followed, so it never goes anywhere else.
 
@@ -224,7 +225,7 @@ fn error_for(status: StatusCode, body: Option<ErrorBody>) -> TransportError {
         StatusCode::NOT_FOUND => TransportError::NotFound,
         StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS => TransportError::Unavailable(format!("the server is busy: {message}")),
         s if s.is_server_error() => TransportError::Unavailable(format!("{status}: {message}")),
-        _ => TransportError::Protocol(format!("the server refused the request ({status}): {message}")),
+        _ => TransportError::Protocol(format!("the server or a proxy refused the request (HTTP {}): {message}", status.as_u16())),
     }
 }
 
@@ -455,6 +456,9 @@ mod tests {
         assert!(matches!(error_for(StatusCode::BAD_GATEWAY, None), TransportError::Unavailable(_)));
         assert!(matches!(error_for(StatusCode::INTERNAL_SERVER_ERROR, Some(body(codes::INTERNAL))), TransportError::Unavailable(_)));
         assert!(matches!(error_for(StatusCode::BAD_REQUEST, Some(body(codes::INVALID))), TransportError::Protocol(_)));
+        // A proxy in front of the server may be the one refusing (a body size limit, say): the message says so.
+        let refused = error_for(StatusCode::PAYLOAD_TOO_LARGE, None).to_string();
+        assert!(refused.contains("the server or a proxy refused") && refused.contains("(HTTP 413)"), "{refused}");
         // A conflict code without its list is not a refused batch the engine could act on.
         assert!(matches!(error_for(StatusCode::CONFLICT, Some(body(codes::CONFLICT))), TransportError::Protocol(_)));
         // An unknown code falls back to the status.

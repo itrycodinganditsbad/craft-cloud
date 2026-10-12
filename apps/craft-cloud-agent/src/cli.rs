@@ -9,11 +9,11 @@
 //! again next time); **2** a sync pass finished but the mass-delete guard holds deletions back (run
 //! `sync --approve-deletes` after checking the list); **3** stopped, needs you: a safety stop (the folder is
 //! missing, its marker is missing or names another space, the data folder and the synced folder lie inside one
-//! another, another agent is running) or an account-level problem
-//! where trying again never helps (the device was revoked or signed out, `state.json` belongs to another
-//! account, the server speaks another protocol or chunker or answers something this agent can't read (no proxy
-//! sits in between, so that is a real client/server mismatch), `account.json` or `state.json` is damaged or was
-//! written by a newer agent: move the file away or update).
+//! another, another agent is running) or an account-level problem where trying again never helps (the device was
+//! revoked or signed out, `state.json` belongs to another account, the server speaks another protocol or chunker,
+//! answers something this agent can't read, or it or a reverse proxy in front of it refuses a request with
+//! another 4xx status, `account.json` or `state.json` is damaged or was written by a newer agent: move the file
+//! away or update).
 //!
 //! A crash or kill during `login`, after the server created the device and before the account was saved, can
 //! leave a device registered that nothing here uses; an admin can revoke it (`craft-cloud-server device ...`).
@@ -42,7 +42,8 @@ use crate::root::{self, RootError, RootMarker};
                   2 deletions wait for `sync --approve-deletes`; \
                   3 stopped, needs you (folder or its marker missing, another space, data folder and synced folder \
                   inside one another, another agent running, \
-                  device revoked, state of another account, server protocol mismatch, damaged or newer account/state files)."
+                  device revoked, state of another account, server protocol mismatch or a request the server or a proxy \
+                  refused, damaged or newer account/state files)."
 )]
 pub struct Cli {
     /// Where the agent keeps its sign-in and sync state. Default: $CRAFT_CLOUD_AGENT_DIR, else the per-user data
