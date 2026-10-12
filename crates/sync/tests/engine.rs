@@ -989,3 +989,39 @@ async fn a_remote_rename_of_a_file_that_became_a_link_deletes_nothing() {
     b.sync_once().await.unwrap();
     assert_eq!(read(&b, "notes2.txt"), b"notes");
 }
+
+/// The laptop deletes `name` and creates a new file at `newcomer`; the desktop only touched its copy of `name`
+/// (the same bytes written again: a new time and file ID). Deleting is decided by content, so the old file goes
+/// when the newcomer takes its name (or a case twin of it), as it would for a plain delete: no conflict copy.
+async fn a_touched_file_the_server_deleted_makes_way(name: &str, newcomer: &str, content: &[u8]) {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, name, b"old");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().remove_file(&path(name)).unwrap();
+    a.sync_once().await.unwrap();
+    write(&mut a, newcomer, content);
+    a.sync_once().await.unwrap();
+    write(&mut b, name, b"old");
+    let report = b.sync_once().await.unwrap();
+    assert!(report.conflict_copies.is_empty(), "{report:?}");
+    assert_eq!(report.removed_locally, vec![path(name)]);
+    settle(&mut [&mut a, &mut b], 5).await;
+    for m in [&a, &b] {
+        assert_eq!(files(m), vec![(newcomer.to_owned(), content.to_vec())]);
+    }
+}
+
+#[tokio::test]
+async fn a_touched_file_the_server_deleted_makes_way_for_a_newcomer() {
+    a_touched_file_the_server_deleted_makes_way("a.txt", "a.txt", b"brand new").await;
+}
+
+#[tokio::test]
+async fn a_touched_file_the_server_deleted_makes_way_for_a_case_twin() {
+    a_touched_file_the_server_deleted_makes_way("a.txt", "A.TXT", b"brand new").await;
+    // The same content under the new name (copied, then the original deleted): still no copy of the old file.
+    a_touched_file_the_server_deleted_makes_way("a.txt", "A.TXT", b"old").await;
+}

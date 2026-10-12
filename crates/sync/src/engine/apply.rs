@@ -402,9 +402,12 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// If another tracked node (not `newcomer`) still occupies `path`, settle its claim before the newcomer
     /// takes the path: deleted on the server and unchanged here → removed; deleted there but edited here →
     /// kept as a conflict copy (uploaded as a new file); still alive elsewhere on the server → moved aside
-    /// (its own move puts it in place later). A file the server deleted that already holds the newcomer's content
-    /// (`incoming`; a pass that crashed before saving its state downloaded it) is let go and left in place, so the
-    /// newcomer adopts it instead of making a copy.
+    /// (its own move puts it in place later). "Unchanged" is decided by content, as for a plain delete: a file
+    /// that only got a new time or file ID goes. A file the server deleted that already holds the newcomer's
+    /// content (`incoming`; a pass that crashed before saving its state downloaded it) is let go and left in
+    /// place, so the newcomer adopts it instead of making a copy. Only a newcomer that adopts what it finds at
+    /// `path` passes `incoming`: anything left in place at a path that is renamed or written onto would be moved
+    /// aside right after, a needless copy of content the base already agreed on.
     async fn release_tracked(
         &mut self,
         path: &RelPath,
@@ -433,6 +436,12 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             (BaseKind::File { .. }, Local::Modified)
                 if let Some(file) = incoming
                     && self.same_content(file, path).await?.is_some() => {}
+            // Only touched here (a new time or file ID, the same content): deleting is decided by content, so it
+            // goes as it would for a plain delete.
+            (BaseKind::File { .. }, Local::Modified) if self.holds_base_content(&entry, path) => {
+                self.remove_file_here(path)?;
+                report.removed_locally.push(path.clone());
+            }
             // An empty folder (or one with only OS metadata files) goes, as when the server deletes it; the guard
             // removes it. Any other folder is moved aside below.
             (BaseKind::Dir { .. }, Local::Unchanged) if self.remove_dir_if_bare(path)? => {
@@ -592,6 +601,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         // New content inside a folder deleted here brings the folder back (a create wins over a delete).
         self.make_dirs(&parent_path, report)?;
         if let Some(twin) = self.case_twin(&rpath)? {
+            // No `incoming`: the twin is never adopted (it has another name), it is moved aside below if it stays.
             self.release_tracked(&twin, id, None, report).await?;
             if self.stat(&twin)?.is_some() {
                 self.move_aside(&twin, report)?;
