@@ -5,7 +5,7 @@ mod common;
 use std::sync::atomic::Ordering;
 
 use common::{SaveDuring, SaveOn, Server, machine, machine_on, machine_with, path, settle};
-use craft_cloud_sync::{Fs, MemFs};
+use craft_cloud_sync::{Fs, MemFs, Transport};
 
 const CONFLICT_STAMP: &str = "(conflict, desktop, 2026-10-11 14-03)";
 
@@ -480,6 +480,82 @@ async fn a_file_that_cant_be_removed_doesnt_stop_the_rest() {
     assert_eq!(report.removed_locally, vec![path("x.txt")]);
     settle(&mut [&mut a, &mut b], 5).await;
     assert_eq!(files(&a), files(&b));
+}
+
+#[tokio::test]
+async fn a_rename_here_and_an_edit_there_meet_in_one_file() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "doc.txt", b"v1");
+    settle(&mut [&mut a, &mut b], 5).await;
+    b.fs_mut().rename(&path("doc.txt"), &path("renamed.txt")).unwrap();
+    write(&mut a, "doc.txt", b"v2 laptop");
+    a.sync_once().await.unwrap();
+    settle(&mut [&mut b, &mut a], 8).await;
+    for m in [&a, &b] {
+        assert_eq!(files(m), vec![("renamed.txt".to_owned(), b"v2 laptop".to_vec())]);
+    }
+    assert_eq!(b.state().remote.len(), 2, "the root and one file: {:?}", b.state().remote);
+}
+
+#[tokio::test]
+async fn a_folder_moved_here_and_an_edit_inside_it_there_meet() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("Shots")).unwrap();
+    for i in 0..5 {
+        write(&mut a, &format!("Shots/s{i}.psd"), format!("shot {i}").as_bytes());
+    }
+    settle(&mut [&mut a, &mut b], 5).await;
+    // The desktop files the folder away; the laptop edits one shot meanwhile.
+    b.fs_mut().mkdir(&path("Archive")).unwrap();
+    b.fs_mut().rename(&path("Shots"), &path("Archive/Shots")).unwrap();
+    write(&mut a, "Shots/s0.psd", b"shot 0 edited");
+    a.sync_once().await.unwrap();
+    let report = b.sync_once().await.unwrap();
+    assert!(report.removed_remotely.is_empty() && report.pending_deletes.is_empty(), "{report:?}");
+    assert!(report.conflict_copies.is_empty(), "{report:?}");
+    settle(&mut [&mut b, &mut a], 8).await;
+    let mut expected: Vec<(String, Vec<u8>)> = (1..5).map(|i| (format!("Archive/Shots/s{i}.psd"), format!("shot {i}").into_bytes())).collect();
+    expected.insert(0, ("Archive/Shots/s0.psd".to_owned(), b"shot 0 edited".to_vec()));
+    for m in [&a, &b] {
+        assert_eq!(files(m), expected);
+        assert_eq!(m.fs().dirs(), vec![path("Archive"), path("Archive/Shots")]);
+    }
+    // The root, two folders and five shots: nothing was duplicated.
+    assert_eq!(b.state().remote.len(), 8);
+}
+
+#[tokio::test]
+async fn a_download_cut_short_after_a_move_makes_no_conflict_copy() {
+    // The pass fails at its k-th server call, somewhere after the move was applied.
+    for k in 1..8u64 {
+        let server = Server::new().await;
+        let ana = server.user("ana").await;
+        let mut a = machine(&server, &ana, "laptop").await;
+        let mut b = machine(&server, &ana, "desktop").await;
+        write(&mut a, "doc.txt", b"v1");
+        settle(&mut [&mut a, &mut b], 5).await;
+        write(&mut a, "doc.txt", b"v2 laptop");
+        a.sync_once().await.unwrap();
+        a.fs_mut().rename(&path("doc.txt"), &path("renamed.txt")).unwrap();
+        a.sync_once().await.unwrap();
+        let faults = b.transport().faults.clone();
+        faults.every.store(20, Ordering::Relaxed);
+        while b.transport().space().await.is_ok() {}
+        for _ in 0..(20 - k) {
+            b.transport().space().await.unwrap();
+        }
+        let _ = b.sync_once().await;
+        faults.every.store(0, Ordering::Relaxed);
+        settle(&mut [&mut b, &mut a], 8).await;
+        assert!(conflict_copies(&b).is_empty(), "k={k}: {:?}", files(&b));
+        assert_eq!(files(&b), vec![("renamed.txt".to_owned(), b"v2 laptop".to_vec())], "k={k}");
+    }
 }
 
 #[tokio::test]

@@ -67,6 +67,11 @@ fn files_of(m: &Machine) -> Vec<RelPath> {
     m.fs().files().into_keys().collect()
 }
 
+/// Every file with the start of its content hash, for `SIM_TRACE`.
+fn listing(m: &Machine) -> String {
+    m.fs().files().iter().map(|(p, d)| format!("{p}={}", blake3::hash(d).to_hex().get(..6).unwrap_or(""))).collect::<Vec<_>>().join(" ")
+}
+
 fn hashes_of(m: &Machine) -> BTreeSet<FileHash> {
     m.fs().files().values().map(|d| FileHash::from_bytes(*blake3::hash(d).as_bytes())).collect()
 }
@@ -197,7 +202,7 @@ async fn run(seed: u64, steps: usize) {
             }
             let r = m.sync_once().await;
             if std::env::var("SIM_TRACE").is_ok() {
-                eprintln!("TRACE step {step} m{i} sync: {r:?}\n  files {:?}\n  dirs {:?}", m.fs().files().keys().collect::<Vec<_>>(), m.fs().dirs());
+                eprintln!("TRACE step {step} m{i} sync: {r:?}\n  files {}\n  dirs {:?}", listing(m), m.fs().dirs());
             }
             m.transport().faults.every.store(0, Ordering::Relaxed);
             // After a finished pass every node the machine tracks has a place in its folder. A node skipped for a
@@ -216,7 +221,7 @@ async fn run(seed: u64, steps: usize) {
         } else {
             act(&mut rng, m, &mut destroyed);
             if std::env::var("SIM_TRACE").is_ok() {
-                eprintln!("TRACE step {step} m{i} act\n  files {:?}\n  dirs {:?}", m.fs().files().keys().collect::<Vec<_>>(), m.fs().dirs());
+                eprintln!("TRACE step {step} m{i} act\n  files {}\n  dirs {:?}", listing(m), m.fs().dirs());
             }
         }
     }
@@ -272,6 +277,25 @@ async fn run(seed: u64, steps: usize) {
         let ref_dirs: Vec<RelPath> =
             reference_dirs.iter().filter(|d| !skipped.first().is_some_and(|s0| s0.iter().any(|s| d.starts_with(s)))).cloned().collect();
         assert_eq!(dirs, ref_dirs, "seed {seed}: machine {i} has different folders");
+    }
+    // A conflict copy only keeps content that differs from what is at its original name: one holding the same
+    // content is a needless copy (an unchanged file the engine mistook for an edit). Random contents never
+    // repeat by chance, and a rename never replaces a file, so the same content twice comes from the engine.
+    // Names with a case twin are left out: a tracked file moved aside for an incoming case twin is a legitimate
+    // copy of content another machine may still hold under the old name.
+    for (i, m) in ms.iter().enumerate() {
+        let all = m.fs().files();
+        for (p, data) in &all {
+            let (Some(parent), Some(name)) = (p.parent(), p.file_name().map(|n| n.as_str())) else { continue };
+            let Some(start) = name.rfind(" (conflict, ") else { continue };
+            let Some(end) = name.get(start..).and_then(|rest| rest.find(')')).map(|e| start + e + 1) else { continue };
+            let original = format!("{}{}", name.get(..start).unwrap_or(""), name.get(end..).unwrap_or(""));
+            if NAMES.iter().filter(|n| n.eq_ignore_ascii_case(&original)).count() > 1 {
+                continue;
+            }
+            let original = rel(&format!("{parent}/{original}"));
+            assert!(all.get(&original) != Some(data), "seed {seed}: machine {i} has a conflict copy {p} of unchanged {original}");
+        }
     }
     let mut on_disk: BTreeSet<FileHash> = BTreeSet::new();
     for m in &ms {

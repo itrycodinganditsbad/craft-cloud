@@ -101,6 +101,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             Local::Unchanged | Local::Modified => {
                 if moved {
                     self.relocate(&bpath, &rpath, report)?;
+                    // Recorded at once, so a download that fails below doesn't leave the base pointing where the
+                    // file no longer is.
+                    self.state.base.insert(id, new_entry.clone());
                 }
                 // Saved here meanwhile: the base keeps the old version (at its new place, where the file is), so
                 // the next pass sees an edit on both sides. A rename keeps the file's ID and time, so the checked
@@ -157,13 +160,45 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             self.state.base.insert(id, new_entry);
             return Ok(());
         }
-        // Edited there, deleted here: the edit wins.
-        if let Some(file) = &remote.file {
-            self.ensure_free(&rpath, report)?;
-            // Saved here meanwhile: the old version stays in the base, so the next pass sees an edit on both sides.
-            if let Some((meta, hash)) = self.download(file, &rpath, None, report).await? {
+        let Some(file) = &remote.file else { return Ok(()) };
+        // Edited there, moved here: the file (found by local ID, or through a folder the user moved) takes the
+        // server's version. If the server moved it too, the server's move stands; otherwise it stays where the
+        // user put it and the push sends the user's move.
+        if let Some(found) = self.locate(id)? {
+            let target = if moved { rpath.clone() } else { found.clone() };
+            // What the file looked like before it was verified: a download may only replace exactly that.
+            let checked = self.stat(&found)?;
+            if self.really_unchanged(&entry, &found)? {
+                if moved {
+                    self.relocate(&found, &rpath, report)?;
+                    self.state.base.insert(id, new_entry.clone());
+                }
+                // A rename keeps the file's ID and time, so the checked state still describes it.
+                if let Some((meta, hash)) = self.download(file, &target, checked, report).await? {
+                    new_entry.kind = self.base_file(file, meta, hash);
+                }
+            } else if let Some((meta, hash)) = self.same_content(file, &found).await? {
+                // The same edit on both sides: no conflict.
+                if moved {
+                    self.relocate(&found, &rpath, report)?;
+                }
                 new_entry.kind = self.base_file(file, meta, hash);
+            } else {
+                // Edited on both sides: ours stays next to where the user put it, as a conflict copy.
+                self.move_aside(&found, report)?;
+                self.ensure_free(&target, report)?;
+                if let Some((meta, hash)) = self.download(file, &target, None, report).await? {
+                    new_entry.kind = self.base_file(file, meta, hash);
+                }
             }
+            self.state.base.insert(id, new_entry);
+            return Ok(());
+        }
+        // Edited there, deleted here: the edit wins.
+        self.ensure_free(&rpath, report)?;
+        // Saved here meanwhile: the old version stays in the base, so the next pass sees an edit on both sides.
+        if let Some((meta, hash)) = self.download(file, &rpath, None, report).await? {
+            new_entry.kind = self.base_file(file, meta, hash);
         }
         self.state.base.insert(id, new_entry);
         Ok(())
@@ -248,6 +283,43 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         self.fs.rename(&source, to).map_err(|e| io_err(&source, e))?;
         report.moved_locally.push((from.clone(), to.clone()));
         Ok(())
+    }
+
+    /// Where the tracked node `id` is now, if it isn't at its base path: found by its own local ID or, failing
+    /// that (a file an atomic save replaced, a platform without file IDs), through the nearest folder above it
+    /// that is found by its local ID, plus the rest of the node's path. A path another tracked node holds
+    /// belongs to that node (path first, then file ID), so it doesn't count.
+    fn locate(&self, id: NodeId) -> Result<Option<RelPath>, SyncError> {
+        let Some(node) = self.state.base.get(&id) else { return Ok(None) };
+        let is_dir = matches!(node.kind, BaseKind::Dir { .. });
+        let index = self.state.base_index();
+        let mut below: Vec<Name> = Vec::new();
+        let mut current = id;
+        for _ in 0..=MAX_TREE_DEPTH {
+            if Some(current) == self.state.root {
+                return Ok(None);
+            }
+            let Some(entry) = self.state.base.get(&current) else { return Ok(None) };
+            let local_id = match entry.kind {
+                BaseKind::Dir { local_id } | BaseKind::File { local_id, .. } => local_id,
+            };
+            if let Some(lid) = local_id
+                && let Some(found) = self.find_local(lid)?
+            {
+                let path = below.iter().rev().fold(found, |p, n| p.join(n));
+                let fits = match self.stat(&path)? {
+                    Some(FsKind::Dir { .. }) => is_dir,
+                    Some(FsKind::File(_)) => !is_dir,
+                    _ => false,
+                };
+                let taken = index.get(&path).is_some_and(|other| *other != id);
+                return Ok((fits && !taken).then_some(path));
+            }
+            let (Some(name), Some(parent)) = (entry.name.clone(), entry.parent) else { return Ok(None) };
+            below.push(name);
+            current = parent;
+        }
+        Ok(None)
     }
 
     /// Where the file or folder with local ID `local_id` is now, if anywhere in the folder.
