@@ -20,8 +20,10 @@
 //!   the free name, and the moved file removed, with a record in the temporary folder written first. A crash between
 //!   the steps leaves both files on disk, never neither; the next pass's [`Fs::recover`] puts the moved file back if
 //!   nothing took its place, removes it if the landing was complete but for that, and otherwise leaves it as a file
-//!   the scan sees and syncs (it may be someone's save, so nothing removes `.cc-aside` files blindly). Any error, or a
-//!   writer dropped without landing, removes the temporary file.
+//!   the scan sees and syncs (it may be someone's save, so nothing removes `.cc-aside` files blindly). While a
+//!   landing's record is pending (a step failed and recovery hasn't finished it), its moved file is left out of
+//!   listings, so the scan never uploads it. Any error, or a writer dropped without landing, removes the temporary
+//!   file.
 //! - **Downloads that can't land are kept.** A target another program holds open (Windows) or that may not be
 //!   replaced is [`LandError::InUse`]; the engine keeps the download in the temporary folder (`<key>.kept`, see
 //!   [`Fs::keep`]) and lands it on a later pass without downloading again. [`DiskFs::clean_tmp`] removes only
@@ -58,6 +60,7 @@
 //!   a regular file, so a folder emptied or unmounted in the middle of a pass fails the pass instead of looking
 //!   like everything was deleted.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -98,6 +101,10 @@ pub struct DiskFs {
     root: PathBuf,
     /// Whether a download may land with the system's exchange of two files (see [`DiskFs::without_swap`]).
     swap: bool,
+    /// Files moved aside by a landing in steps whose record is still pending (full paths): listings leave them out,
+    /// so the scan never uploads them (recovery puts them back or removes them). Set when a landing leaves its
+    /// record, and by [`Fs::recover`] from the records it couldn't finish.
+    pending_asides: BTreeSet<PathBuf>,
     /// Faults and detours for tests of paths a real disk rarely takes.
     hooks: Hooks,
 }
@@ -109,6 +116,8 @@ struct Hooks {
     fail_put_backs: bool,
     /// Moving the download into place during a landing in steps fails ([`DiskFs::failing_landings`]).
     fail_landings: bool,
+    /// Removing the moved file at the end of a landing in steps fails ([`DiskFs::failing_aside_removals`]).
+    fail_aside_removals: bool,
     /// Landings in steps move files with a plain rename ([`DiskFs::plain_moves`]).
     plain_moves: bool,
     /// A landing by exchange stops right after the exchange, as a crash would ([`DiskFs::stopping_after_exchange`]).
@@ -620,7 +629,15 @@ fn create_temp(dir: &Path) -> io::Result<(File, PathBuf)> {
 impl DiskFs {
     /// The folder at `root`. Nothing is checked or created until the engine asks.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), swap: true, hooks: Hooks::default() }
+        Self { root: root.into(), swap: true, pending_asides: BTreeSet::new(), hooks: Hooks::default() }
+    }
+
+    /// Makes removing the moved file at the end of a landing in steps fail, as a disk error would: for tests that
+    /// the record then stays and the moved file isn't listed.
+    #[doc(hidden)]
+    pub fn failing_aside_removals(mut self) -> Self {
+        self.hooks.fail_aside_removals = true;
+        self
     }
 
     /// Moves files during a landing in steps with a plain rename, as on FAT and exFAT (no hard links), even where a
@@ -708,7 +725,7 @@ impl DiskFs {
     /// [`Fs::recover`] finish or undo a landing a crash cut short. A failure after the first step puts the moved
     /// file back where nothing took its place.
     fn land_in_steps(
-        &self,
+        &mut self,
         path: &RelPath,
         full: &Path,
         mut writer: DiskWriter,
@@ -741,6 +758,8 @@ impl DiskFs {
             Err(e) => {
                 if kind_at(&aside).ok().flatten().is_none() {
                     forget(&record_path);
+                } else {
+                    self.pending_asides.insert(aside);
                 }
                 return Err(match e.kind() {
                     io::ErrorKind::NotFound => LandError::Changed(writer),
@@ -755,6 +774,8 @@ impl DiskFs {
             // If something took the free name meanwhile, the moved file stays next to it (the scan sees it).
             if self.put_back(&aside, full) {
                 forget(&record_path);
+            } else {
+                self.pending_asides.insert(aside);
             }
             return Err(LandError::Changed(writer));
         }
@@ -766,6 +787,8 @@ impl DiskFs {
             Err(e) => {
                 if self.put_back(&aside, full) {
                     forget(&record_path);
+                } else {
+                    self.pending_asides.insert(aside);
                 }
                 return Err(match e.kind() {
                     io::ErrorKind::AlreadyExists => LandError::Changed(writer),
@@ -784,9 +807,13 @@ impl DiskFs {
                 let _ = crate::account::write_atomic(&record_path, &json, true);
             }
         }
-        // 4. The moved file goes. If it can't, the record stays and the next pass's recovery tries again.
-        if fs::remove_file(&aside).is_ok() {
+        // 4. The moved file goes. If it can't, the record stays and the next pass's recovery tries again; until then
+        // listings leave the moved file out, so the scan doesn't upload the old content as a new file.
+        let removal = if self.hooks.fail_aside_removals { Err(io::Error::other("removals fail (test)")) } else { fs::remove_file(&aside) };
+        if removal.is_ok() {
             forget(&record_path);
+        } else {
+            self.pending_asides.insert(aside);
         }
         Ok(incoming)
     }
@@ -800,7 +827,7 @@ impl DiskFs {
     /// it only if it is the download or the file the engine checked (or that file is back at the target), and
     /// otherwise moves it next to the target as a `.cc-aside` file the scan sees.
     fn land_by_exchange(
-        &self,
+        &mut self,
         path: &RelPath,
         full: &Path,
         parent: &Path,
@@ -966,6 +993,13 @@ impl DiskFs {
             .map_err(|e| named(&shown, e))?;
         self.apply_landing(&record).map_err(|e| named(&record.target, e))?;
         fs::remove_file(record_path).map_err(|e| named(&shown, e))
+    }
+
+    /// The full path of the file moved aside that the landing record at `record_path` names, if it can be read.
+    fn aside_of(&self, record_path: &Path) -> Option<PathBuf> {
+        let record: LandingRecord = serde_json::from_slice(&fs::read(record_path).ok()?).ok()?;
+        let aside = craft_cloud_sync::rel(&record.target).parent()?.join(&Name::new(&record.aside).ok()?);
+        Some(self.full(&aside))
     }
 
     /// Puts right what the landing `record` describes; see [`DiskFs::recover_landing`].
@@ -1161,6 +1195,10 @@ impl Fs for DiskFs {
         for entry in fs::read_dir(&full)? {
             let entry = entry?;
             let path = entry.path();
+            // A file a landing in steps moved aside, whose landing isn't finished: recovery's, never synced.
+            if self.pending_asides.contains(&path) {
+                continue;
+            }
             let (name, readable) = match entry.file_name().into_string() {
                 Ok(name) => {
                     let ok = name_round_trips(&name);
@@ -1325,12 +1363,18 @@ impl Fs for DiskFs {
     /// [`DiskFs::land_by_exchange`]). A record that can't be read or acted on stays for the next pass; the first error
     /// is returned once all were tried.
     fn recover(&mut self) -> io::Result<()> {
+        self.pending_asides.clear();
         let Some(tmp) = self.real_tmp(false)? else { return Ok(()) };
         let mut first_error = None;
         for entry in fs::read_dir(tmp)? {
             let path = entry?.path();
             let result = match path.extension() {
-                Some(ext) if ext == LANDING_EXT => self.recover_landing(&path),
+                Some(ext) if ext == LANDING_EXT => self.recover_landing(&path).inspect_err(|_| {
+                    // Still pending: its moved file stays out of listings.
+                    if let Some(aside) = self.aside_of(&path) {
+                        self.pending_asides.insert(aside);
+                    }
+                }),
                 Some(ext) if ext == SWAP_RECORD_EXT => self.recover_swap(&path),
                 _ => Ok(()),
             };

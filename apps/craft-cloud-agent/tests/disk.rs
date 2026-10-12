@@ -73,6 +73,30 @@ fn a_failed_put_back_is_finished_by_recovery() {
     assert_eq!(temps(&fs), 0);
 }
 
+/// A landing in steps whose last step fails (the moved file can't be removed) keeps its record, and until recovery
+/// finishes it the moved file isn't listed, so the scan never uploads the old content as a new file.
+#[test]
+fn a_moved_file_whose_removal_failed_isnt_listed_until_recovery() {
+    let (dir, fs) = disk();
+    let mut fs = fs.without_swap().failing_aside_removals();
+    let old = fs.write(&rel("a.txt"), b"old", false, T0).unwrap();
+    let mut w = fs.begin_write(&rel("a.txt")).unwrap();
+    w.write_all(b"new").unwrap();
+    fs.finish_write(&rel("a.txt"), w, false, T0, Some(old)).unwrap();
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3, "the moved file is still on disk");
+    let listed = |fs: &DiskFs| -> Vec<String> {
+        let mut n: Vec<String> = fs.list(&rel("")).unwrap().into_iter().map(|e| e.name).collect();
+        n.sort();
+        n
+    };
+    assert_eq!(listed(&fs), [".craft-cloud", "a.txt"]);
+    fs.recover().unwrap();
+    assert_eq!(listed(&fs), [".craft-cloud", "a.txt"]);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2, "recovery removed it");
+    assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"new");
+    assert_eq!(temps(&fs), 0);
+}
+
 /// A crash right after the exchange (Linux, macOS) leaves what was at the target in the temporary folder. Cleaning
 /// up interrupted writes never removes it; recovery removes it when it is the file the engine checked, and when it
 /// is anything else (an app saved between the check and the exchange) moves it next to the target, where the scan
