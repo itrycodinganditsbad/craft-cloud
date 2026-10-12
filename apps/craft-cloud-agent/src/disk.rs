@@ -125,6 +125,10 @@ struct Hooks {
     stop_after_exchange: bool,
     /// An app saves over the target again right before the exchange back ([`DiskFs::saving_before_exchange_back`]).
     save_before_exchange_back: bool,
+    /// The look at what an exchange back brought out fails ([`DiskFs::failing_looks_after_exchange_back`]).
+    fail_looks: bool,
+    /// Moving a save the exchange took out next to the target fails ([`DiskFs::failing_rescues`]).
+    fail_rescues: bool,
 }
 
 /// What a landing record in [`TMP_DIR`] holds: the target, the name its file was moved to, and what both files
@@ -530,21 +534,16 @@ fn aside_name(name: &str) -> io::Result<String> {
 }
 
 /// Saves what the writer's temporary path holds when it is someone's file, not the download: moved next to the
-/// target `full` under a `.cc-aside` name (the scan syncs it), or if that fails renamed `.rescued` in the temporary
-/// folder (nothing cleans that up). The writer is left pointing nowhere, so it is neither removed, kept nor landed.
-/// Returns where the file is.
-fn rescue(writer: &mut DiskWriter, full: &Path, parent: &Path) -> PathBuf {
+/// target `full` under a `.cc-aside` name (the scan syncs it): `Ok` with that path. If that fails (or `fail`, a test
+/// hook), the file stays where it is, a swap file whose record the caller keeps, so the next pass's recovery moves it
+/// next to the target: `Err` with its path. The writer is left pointing nowhere, so it is neither removed, kept nor
+/// landed.
+fn rescue(writer: &mut DiskWriter, full: &Path, parent: &Path, fail: bool) -> Result<PathBuf, PathBuf> {
     writer.armed = false;
     let temp = std::mem::take(&mut writer.temp);
     match full.file_name().and_then(|n| n.to_str()).map(aside_name) {
-        Some(Ok(name)) if rename_no_replace(&temp, &parent.join(&name)).is_ok() => parent.join(name),
-        _ => {
-            let rescued = temp.with_extension("rescued");
-            match fs::rename(&temp, &rescued) {
-                Ok(()) => rescued,
-                Err(_) => temp,
-            }
-        }
+        Some(Ok(name)) if !fail && rename_no_replace(&temp, &parent.join(&name)).is_ok() => Ok(parent.join(name)),
+        _ => Err(temp),
     }
 }
 
@@ -670,6 +669,22 @@ impl DiskFs {
     #[doc(hidden)]
     pub fn saving_before_exchange_back(mut self) -> Self {
         self.hooks.save_before_exchange_back = true;
+        self
+    }
+
+    /// Makes the look at what a landing by exchange's exchange back brought out fail, as a disk error would: for tests
+    /// that the swap record then stays for [`Fs::recover`].
+    #[doc(hidden)]
+    pub fn failing_looks_after_exchange_back(mut self) -> Self {
+        self.hooks.fail_looks = true;
+        self
+    }
+
+    /// Makes moving a save that a landing by exchange took out of the target next to it fail, as a disk error would:
+    /// for tests that the swap record then stays for [`Fs::recover`].
+    #[doc(hidden)]
+    pub fn failing_rescues(mut self) -> Self {
+        self.hooks.fail_rescues = true;
         self
     }
 
@@ -889,9 +904,35 @@ impl DiskFs {
             fs::write(&newer, b"a newer save")?;
             fs::rename(&newer, full)?;
         }
-        match exchange(&writer.temp, full) {
+        let stranded = |swap: &Path| {
+            let name = swap.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            format!("it is in {AGENT_DIR}/{TMP_DIR} as {name}, and the next pass moves it next to the file")
+        };
+        let back = exchange(&writer.temp, full);
+        // What the swap file holds after the exchange back. A look that fails decides nothing: the node is skipped, and
+        // the record stays, so the next pass's recovery removes the swap file if it is the download, or moves it next
+        // to the target if it is a save.
+        let came_back = match back {
+            Ok(true) if self.hooks.fail_looks => Err(io::Error::other("looks fail (test)")),
+            Ok(true) => kind_at(&writer.temp),
+            _ => Ok(None),
+        };
+        let came_back = match came_back {
+            Ok(kind) => kind,
+            Err(e) => {
+                writer.armed = false;
+                let name = writer.temp.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                return Err(LandError::Io(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{path}: can't look at what an exchange back brought out ({e}); it stays in {AGENT_DIR}/{TMP_DIR} as {name} until the next pass puts it right"
+                    ),
+                )));
+            }
+        };
+        match back {
             // The swap file holds the download again.
-            Ok(true) if kind_at(&writer.temp).ok().flatten() == Some(FsKind::File(incoming)) => {
+            Ok(true) if came_back == Some(FsKind::File(incoming)) => {
                 self.unswap(&mut writer, &record_path);
                 Err(LandError::Changed(writer))
             }
@@ -901,21 +942,31 @@ impl DiskFs {
             // once more; the older save, back in the swap file, goes next to the target as `.cc-aside`, where the scan
             // uploads it. No save is lost, and the download is gone (it is downloaded again). If that exchange fails,
             // the newest save is the one that goes next to the target: still nothing lost.
+            // The record goes only once the older save is next to the target; if it couldn't be moved there, it stays
+            // as the swap file with its record, and the next pass's recovery moves it.
             Ok(true) => {
                 let _ = exchange(&writer.temp, full);
-                rescue(&mut writer, full, parent);
-                forget();
-                Err(LandError::Changed(writer))
+                match rescue(&mut writer, full, parent, self.hooks.fail_rescues) {
+                    Ok(_) => {
+                        forget();
+                        Err(LandError::Changed(writer))
+                    }
+                    Err(swap) => Err(LandError::Io(io::Error::other(format!(
+                        "{path}: an app saved it twice while the server's version landed; the older save couldn't be moved next to it: {}",
+                        stranded(&swap)
+                    )))),
+                }
             }
-            // Can't happen short of the disk failing between two calls: the other file is never removed.
+            // Can't happen short of the disk failing between two calls: the other file is never removed. As above, the
+            // record goes only once the save is next to the target.
             Ok(false) | Err(_) => {
-                let rescued = rescue(&mut writer, full, parent);
-                forget();
-                let name = rescued.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let place = if rescued.parent() == Some(parent) {
-                    format!("it is next to it as {name}")
-                } else {
-                    format!("it is in {AGENT_DIR}/{TMP_DIR} as {name}, which nothing cleans up: move it back yourself")
+                let place = match rescue(&mut writer, full, parent, self.hooks.fail_rescues) {
+                    Ok(aside) => {
+                        forget();
+                        let name = aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        format!("it is next to it as {name}")
+                    }
+                    Err(swap) => stranded(&swap),
                 };
                 Err(LandError::Io(io::Error::other(format!(
                     "{path}: the download landed over a file saved meanwhile and couldn't be undone; {place}"

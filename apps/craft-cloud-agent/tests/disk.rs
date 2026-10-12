@@ -164,6 +164,56 @@ fn a_second_save_during_the_exchange_back_stays_at_the_name() {
     assert_eq!(temps(&fs), 0);
 }
 
+/// The same two saves, but the older one can't be moved next to the target: it stays in the temporary folder with
+/// its swap record (the error says where), and the next pass's recovery moves it next to the target.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[test]
+fn a_save_that_cant_be_moved_aside_keeps_its_record_for_recovery() {
+    use craft_cloud_sync::LandError;
+    let (dir, fs) = disk();
+    let mut fs = fs.saving_before_exchange_back().failing_rescues();
+    let old = fs.write(&rel("a.txt"), b"the user's", false, T0).unwrap();
+    let checked = craft_cloud_sync::FileMeta { mtime_ms: old.mtime_ms - 1_000, ..old };
+    let mut w = fs.begin_write(&rel("a.txt")).unwrap();
+    w.write_all(b"download").unwrap();
+    let Err(LandError::Io(e)) = fs.finish_write(&rel("a.txt"), w, false, T0, Some(checked)) else { panic!("not an error") };
+    assert!(e.to_string().contains(".craft-cloud/tmp") && e.to_string().contains(".swap"), "{e}");
+    assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"a newer save");
+    assert_eq!(temps(&fs), 2, "the swap file and its record stay");
+    let mut fs = DiskFs::new(dir.path());
+    fs.recover().unwrap();
+    assert_eq!(temps(&fs), 0);
+    let mut left: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    left.sort();
+    assert_eq!(left.len(), 3, "{left:?}");
+    let aside = left.iter().find(|n| n.ends_with(".cc-aside")).expect("the older save is next to it");
+    assert_eq!(std::fs::read(dir.path().join(aside)).unwrap(), b"the user's");
+    assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"a newer save");
+}
+
+/// A look at what the exchange back brought out that fails decides nothing: the node is skipped with an error, the
+/// swap record stays, and the next pass's recovery finds the download there and removes it.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[test]
+fn a_failed_look_after_the_exchange_back_keeps_the_record() {
+    use craft_cloud_sync::LandError;
+    let (dir, fs) = disk();
+    let mut fs = fs.failing_looks_after_exchange_back();
+    let old = fs.write(&rel("a.txt"), b"the user's", false, T0).unwrap();
+    let checked = craft_cloud_sync::FileMeta { mtime_ms: old.mtime_ms - 1_000, ..old };
+    let mut w = fs.begin_write(&rel("a.txt")).unwrap();
+    w.write_all(b"download").unwrap();
+    let Err(LandError::Io(e)) = fs.finish_write(&rel("a.txt"), w, false, T0, Some(checked)) else { panic!("not an error") };
+    assert!(e.to_string().contains("can't look"), "{e}");
+    assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"the user's");
+    assert_eq!(temps(&fs), 2, "the swap file and its record stay");
+    let mut fs = DiskFs::new(dir.path());
+    fs.recover().unwrap();
+    assert_eq!(temps(&fs), 0);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2, "only the file and .craft-cloud");
+    assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"the user's");
+}
+
 /// Windows: an app holds the file open without letting it be deleted or renamed (no `FILE_SHARE_DELETE`). The
 /// download can't replace it: it comes back as in use by another program, is kept, and lands once the app lets go.
 #[cfg(windows)]
