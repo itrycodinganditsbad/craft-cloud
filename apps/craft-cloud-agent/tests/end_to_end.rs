@@ -612,6 +612,44 @@ async fn the_token_is_never_synced() {
     assert_eq!(stopped.exit(), Exit::NeedsYou);
 }
 
+/// A loopback server that answers every request with `/api/info` of a server speaking only protocol 99.
+fn newer_server() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"protocol_min":99,"protocol_max":99,"chunker_params":["fastcdc-v1"],"max_chunk_bytes":4194304,
+                "max_manifest_bytes":1048576,"max_batch_ops":1000,"max_batch_json_bytes":1048576,"max_page_nodes":1000,"max_missing_ids":10000}"#;
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    url
+}
+
+/// The server is asked what it speaks before every pass, not only at login: one updated since then stops the agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_pass_checks_what_the_server_speaks() {
+    let server = server().await;
+    let a = Agent::signed_in(&server, "desktop").await;
+    a.write("notes.txt", "kept");
+    let mut account = a.data.load_account().unwrap().unwrap();
+    account.server = ServerUrl::parse(&newer_server()).unwrap();
+    a.data.save_account(&account).unwrap();
+    let stopped = a.try_sync(false).await.unwrap_err();
+    assert!(matches!(stopped, AgentError::Server(TransportError::Protocol(_))), "{stopped:?}");
+    assert_eq!(stopped.exit(), Exit::NeedsYou);
+    assert!(stopped.to_string().contains("protocol 99-99"), "{stopped}");
+    let saved = a.data.load_state().unwrap();
+    assert!(
+        matches!(saved.last_pass.map(|l| l.outcome), Some(craft_cloud_agent::account::Outcome::Failed(ref m)) if m.contains("protocol")),
+        "the stop is saved for `status`"
+    );
+    assert_eq!(a.read("notes.txt").as_deref(), Some("kept"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_shows_the_last_pass_but_never_the_token() {
     let server = server().await;

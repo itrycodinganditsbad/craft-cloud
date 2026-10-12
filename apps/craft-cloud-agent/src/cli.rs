@@ -497,7 +497,16 @@ pub async fn sync(data: &DataDir, approve_deletes: bool, out: &mut impl Write) -
         }
         engine.approve_deletes_of(shown);
     }
-    let result = engine.sync_once().await;
+    // The server is asked what it speaks before every pass (it may have been updated since the last one); a
+    // mismatch fails the pass like any other server answer, so it is saved and shown by `status`.
+    let compatible = match http::info(&account.server).await {
+        Ok(info) => http::check_compatible(&info),
+        Err(e) => Err(e),
+    };
+    let result = match compatible {
+        Ok(()) => engine.sync_once().await,
+        Err(e) => Err(SyncError::Transport(e)),
+    };
     saved.schema = STATE_SCHEMA;
     saved.state = engine.state().clone();
     let (outcome, summary) = match &result {
