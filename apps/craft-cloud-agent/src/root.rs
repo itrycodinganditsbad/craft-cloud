@@ -12,7 +12,7 @@ use craft_cloud_proto::{NodeId, SpaceId};
 use serde::{Deserialize, Serialize};
 
 use crate::account::write_atomic;
-use crate::disk::AGENT_DIR;
+use crate::disk::{AGENT_DIR, create_private_dir};
 
 pub const MARKER_FILE: &str = "root.json";
 /// A marker is a few dozen bytes; anything much bigger is not ours.
@@ -49,6 +49,14 @@ pub fn marker_path(folder: &Path) -> PathBuf {
 pub fn read(folder: &Path) -> Result<Option<RootMarker>, RootError> {
     let path = marker_path(folder);
     let io_err = |source| RootError::Io { path: path.clone(), source };
+    // `.craft-cloud/` must be a real folder: a link is never followed to a marker somewhere else.
+    let agent = folder.join(AGENT_DIR);
+    match fs::symlink_metadata(&agent) {
+        Ok(md) if md.file_type().is_dir() => {}
+        Ok(_) => return Err(RootError::Damaged { path: agent, message: "not a real folder (a link?)".into() }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(RootError::Io { path: agent, source: e }),
+    }
     let md = match fs::symlink_metadata(&path) {
         Ok(md) => md,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -64,7 +72,16 @@ pub fn read(folder: &Path) -> Result<Option<RootMarker>, RootError> {
 /// Writes the marker (creating `.craft-cloud/`).
 pub fn write(folder: &Path, marker: &RootMarker) -> Result<(), RootError> {
     let dir = folder.join(AGENT_DIR);
-    fs::create_dir_all(&dir).map_err(|source| RootError::Io { path: dir.clone(), source })?;
+    let io_err = |source| RootError::Io { path: dir.clone(), source };
+    match fs::symlink_metadata(&dir) {
+        Ok(md) if md.file_type().is_dir() => {}
+        Ok(_) => return Err(RootError::Damaged { path: dir, message: "not a real folder (a link?); nothing was written through it".into() }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(folder).map_err(io_err)?;
+            create_private_dir(&dir).map_err(io_err)?;
+        }
+        Err(e) => return Err(io_err(e)),
+    }
     let path = marker_path(folder);
     let json = serde_json::to_vec_pretty(marker).map_err(|e| RootError::Damaged { path: path.clone(), message: e.to_string() })?;
     write_atomic(&path, &json, false).map_err(|source| RootError::Io { path, source })
@@ -99,5 +116,22 @@ mod tests {
         assert!(matches!(check(&dir.path().join("gone"), &marker), Err(RootError::FolderMissing(_))));
         fs::write(marker_path(dir.path()), b"{").unwrap();
         assert!(matches!(check(dir.path(), &marker), Err(RootError::Damaged { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_agent_folder_is_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let marker = RootMarker { space: SpaceId::generate(), root: NodeId::generate() };
+        // A real marker, but in a folder the link points to.
+        write(elsewhere.path(), &marker).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join(AGENT_DIR), dir.path().join(AGENT_DIR)).unwrap();
+        assert!(matches!(read(dir.path()), Err(RootError::Damaged { .. })));
+        assert!(matches!(check(dir.path(), &marker), Err(RootError::Damaged { .. })));
+        // Nothing is written through it.
+        let other = RootMarker { space: SpaceId::generate(), ..marker };
+        assert!(matches!(write(dir.path(), &other), Err(RootError::Damaged { .. })));
+        assert_eq!(read(elsewhere.path()).unwrap(), Some(marker));
     }
 }

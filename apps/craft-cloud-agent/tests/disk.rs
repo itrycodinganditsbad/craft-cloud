@@ -267,3 +267,16 @@ fn the_agent_folders_a_download_lands_in_are_private() {
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700, "{}", path.display());
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn a_linked_agent_folder_does_not_count_as_the_marker() {
+    let (real, _) = disk();
+    let dir = tempfile::tempdir().unwrap();
+    // The link leads to a folder with a real marker in it.
+    std::os::unix::fs::symlink(real.path().join(".craft-cloud"), dir.path().join(".craft-cloud")).unwrap();
+    let mut fs = DiskFs::new(dir.path());
+    assert!(fs.list(&rel("")).is_err());
+    assert!(fs.write(&rel("a"), b"a", false, T0).is_err(), "nothing is written through the link");
+    assert_eq!(std::fs::read_dir(real.path().join(".craft-cloud")).unwrap().count(), 1);
+}

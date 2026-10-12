@@ -292,7 +292,7 @@ fn set_mode(_file: &File, _replaced: Option<&Metadata>, _exec: bool) -> io::Resu
 
 /// Makes the folder `dir`, owner-only (0700) on Unix, so a download in flight can't be read by other users. A folder
 /// that already exists keeps its mode.
-fn create_private_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -472,7 +472,9 @@ impl Fs for DiskFs {
         }
         // The root is listed only while its marker is there: a folder that is emptied or unmounted during a pass
         // fails the pass instead of reading as "everything was deleted".
-        if dir.is_root() && !Self::lstat(&self.marker())?.is_some_and(|md| md.file_type().is_file()) {
+        // `.craft-cloud/` itself must be a real folder: a link there is never followed to a marker somewhere else.
+        let agent_ok = Self::lstat(&self.root.join(AGENT_DIR))?.is_some_and(|md| md.file_type().is_dir());
+        if dir.is_root() && !(agent_ok && Self::lstat(&self.marker())?.is_some_and(|md| md.file_type().is_file())) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "the folder's marker (.craft-cloud/root.json) is gone: the folder was emptied, replaced or unmounted",
