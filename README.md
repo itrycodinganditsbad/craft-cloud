@@ -8,7 +8,8 @@ for one person with a laptop and a desktop, and for a small studio with many acc
 
 There is no hosted service and no account with anyone but you. Nothing phones home.
 
-> **Status: early development.** The server runs; the sync agent is next. The design is in
+> **Status: early development.** The server runs and the sync engine passes its simulation; the agent
+> binary is next. The design is in
 > [`docs/design/sync.md`](docs/design/sync.md).
 
 ## Running the server

@@ -29,6 +29,7 @@ crates/
   chunker   craft-cloud-chunker   FastCDC `fastcdc-v1` + BLAKE3, frozen by golden vectors
   store     craft-cloud-store     blob store: disk, S3, memory; checks every blob in and out
   meta      craft-cloud-meta      metadata on SQLite or Postgres; the batch commit; the change feed
+  sync      craft-cloud-sync      the sync engine over `Fs`/`Transport` traits; `MemFs`; scenario tests and the simulation
 apps/
   craft-cloud-server              HTTP API (`/api/v1`), auth, admin CLI (`init`, `serve`, `user`, `device`, `reset-epoch`)
 xtask/                            cargo xtask ci | version
@@ -36,7 +37,8 @@ docs/                             design documents and the self-hosting guide
 ```
 
 Layering: `proto` and `chunker` depend on nothing else in the workspace. `store` and `meta` depend on `proto`.
-The server depends on all three; nothing depends on the server.
+The server depends on all three; nothing depends on the server. `sync` depends on `proto` and `chunker`
+(its tests also use `meta` and `store` as an in-process server).
 
 Backend tests (Postgres, S3) skip unless their environment variables are set; see `.github/workflows/ci.yml`
 for the variables and the test containers. Set `CRAFT_CLOUD_REQUIRE_BACKENDS=1` to make a skip a failure.
