@@ -32,13 +32,15 @@ crates/
   sync      craft-cloud-sync      the sync engine over `Fs`/`Transport` traits; `MemFs`; scenario tests and the simulation
 apps/
   craft-cloud-server              HTTP API (`/api/v1`), auth, admin CLI (`init`, `serve`, `user`, `device`, `reset-epoch`)
+  craft-cloud-agent               the sync agent: real disk `Fs`, HTTP `Transport`, saved account and state, root marker, CLI (`login`, `sync`, `status`, `logout`)
 xtask/                            cargo xtask ci | version
 docs/                             design documents and the self-hosting guide
 ```
 
 Layering: `proto` and `chunker` depend on nothing else in the workspace. `store` and `meta` depend on `proto`.
-The server depends on all three; nothing depends on the server. `sync` depends on `proto` and `chunker`
-(its tests also use `meta` and `store` as an in-process server).
+The server depends on all three; nothing depends on the server outside tests. `sync` depends on `proto` and `chunker`
+(its tests also use `meta` and `store` as an in-process server). The agent depends on `proto` and `sync`; its
+tests also run the server on a loopback port.
 
 Backend tests (Postgres, S3) skip unless their environment variables are set; see `.github/workflows/ci.yml`
 for the variables and the test containers. Set `CRAFT_CLOUD_REQUIRE_BACKENDS=1` to make a skip a failure.
@@ -56,7 +58,7 @@ talks to, any vendor's cloud.
 - Never copy, port or paraphrase code from GPL, AGPL or LGPL projects (Nextcloud, ownCloud,
   Seafile, and similar). Don't read their source while working on the matching feature here.
   MPL-2.0 code (Syncthing) is not copied either.
-- Dependencies must be permissively licensed (MIT, Apache-2.0, BSD, ISC, Zlib, Unicode, CC0).
+- Dependencies must be permissively licensed (MIT, Apache-2.0, BSD, ISC, Zlib, Unicode, CC0, CDLA-Permissive-2.0 (data only, e.g. root certificates)).
   Adding one means checking its license and every transitive license.
 - Never copy vendor icons, artwork, UI text or documentation wording. Feature names are fine.
 

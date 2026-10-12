@@ -9,8 +9,8 @@ history. It works for one person with a laptop and a desktop, and for a small st
 
 There is no hosted service and no account with anyone but you. Nothing phones home.
 
-> **Status: early development.** The server and the sync engine work. The agent that
-> syncs a real folder on your machine is next, so Craft Cloud can't sync your files yet. See
+> **Status: early development.** The server, the sync engine and a first agent work: two machines can
+> sync a folder by running `craft-cloud-agent sync`. Automatic syncing in the background is next. See
 > [Where things stand](#where-things-stand). The full design is in [`docs/design/sync.md`](docs/design/sync.md).
 
 ## What it will do
@@ -64,7 +64,7 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
 | `craft-cloud-meta` | Metadata on SQLite or Postgres: users, devices, the tree, versions, the batch commit, the change feed | done |
 | `craft-cloud-server` | The HTTP API (`/api/v1`), authentication, rate limits and the admin CLI | done |
 | `craft-cloud-sync` | The sync engine: compares the folder with the server, uploads, downloads, resolves conflicts | done |
-| `craft-cloud-agent` | The background process on each machine | next |
+| `craft-cloud-agent` | The agent on each machine: real disk, HTTPS transport, saved state, root marker, command line (`login`, `sync`, `status`, `logout`) | first cut done; runs by hand |
 
 ## Where things stand
 
@@ -74,7 +74,8 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
 | M1 | Protocol types and the chunker | done |
 | M2 | The server: login, devices, chunk upload, batch commit, change feed, backup epochs; SQLite or Postgres, disk or S3 | done |
 | M3a | The sync engine and its simulation | done |
-| M3b | The agent: syncs a real folder on disk, talks to the server over HTTPS, keeps its state, watches for changes, has a CLI. Two machines sync one folder. | next |
+| M3b1 | The agent, first cut: syncs a real folder over HTTPS when you run `craft-cloud-agent sync`; two machines sync one folder | done |
+| M3b2 | The agent on its own: watches the folder, waits for files to settle, retries with backoff | next |
 | M4 | History, restore, trash, cleanup of old versions, garbage collection, server backup and restore | planned |
 | M5 | Selective sync, large-media polish, `.craftignore` | planned |
 | M6 | Packaging: release binaries, Docker image, systemd unit, built-in TLS, a self-hosting guide | planned |

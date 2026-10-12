@@ -150,6 +150,8 @@ an empty folder as "delete everything".
   the node at that path**, whatever its file ID. That is what an atomic save looks like (write temp, rename
   over the original; or original → backup, temp → original, delete backup), and it must not break history.
   Intermediate states inside the stability window are never committed.
+  A tracked folder at its place whose recorded local ID is gone takes the ID it has now (not while a folder
+  can't be listed), so a later rename of it is a move.
 - **Local moves**: only when the target path did *not* exist before does the agent match by file ID (inode /
   NTFS file ID) plus size and mtime, and send a move of the existing node instead of a delete and a new file.
 
@@ -245,8 +247,11 @@ changes locally, then pushes local changes. These rules came out of the simulati
 - **A tracked node that lost its place** (its folder was moved aside this pass) is looked up by local ID the
   same way. If it isn't found, it counts as deleted here, and its base follows the server's location so the
   push can send the delete.
-- **Tracked occupants**: before a node takes a path another tracked node holds, that one is settled first
-  (removed if it was deleted on the server and is unchanged here, otherwise moved aside).
+- **Tracked occupants**: before a node takes a path another tracked node holds (a new node, a server move, a
+  download), that one is settled first: removed if it was deleted on the server and holds the content both
+  sides agreed on (decided by content, as for a delete), otherwise moved aside. A tracked folder that holds a
+  tracked file or folder that turned into a link is never settled; the newcomer waits. Settling isn't held
+  back by the mass-delete guard: nothing is lost, every removed version is in the server's history.
 - **Folder adoption**: an untracked local folder at the server's move target is adopted, unless another
   tracked folder owns its ID.
 - **Edit wins over delete.** An Update of a node the server deleted is retried once with the server's current
@@ -267,6 +272,7 @@ changes locally, then pushes local changes. These rules came out of the simulati
 - **Same content is no conflict**: a file changed on both sides whose local content equals the server's new
   version (a lost commit reply, the same edit on two machines) takes the server's version, with no conflict
   copy.
+  It also covers an untracked file with the server's content already at the server's place: it is adopted.
 - **Deleted folders and ignored files**: a folder the server deleted is removed together with any OS
   metadata files in it (`.DS_Store`, `Thumbs.db`, `desktop.ini`). If it holds other ignored files (`~$*`,
   `*.tmp`, `*.part`, `.~lock.*`, which may belong to an open document), it stays on disk, forgotten. A
@@ -299,11 +305,38 @@ changes locally, then pushes local changes. These rules came out of the simulati
   goes back up, and the report lists them as pending local deletes. Approval releases both directions.
 - **A first sync cut short starts over**: the space is recorded only after the first full listing succeeds,
   so a failed listing doesn't turn the next pass into a reconcile.
+- **The engine never acts on a link.** It never renames, removes, or writes onto or through a symlink,
+  junction or special file, whatever the reason: a server change, a conflict copy, a case twin, or making a
+  folder. A change that would have to (to the linked path, anything below it, or a name that clashes with it)
+  is skipped with a reason and waits. Server deletes below a link wait too. A tracked file or folder that
+  turned into a link (or a name this computer can't use) is never treated as deleted, and once it is a real
+  file or folder again, the waiting changes apply like any others.
+  Such a node is also found through a folder above it that the user moved (by local ID). A folder the
+  server deleted that still holds one stays tracked until it is settled, and the push sends nothing for a
+  node the server no longer has.
+- **Multi-step changes check first.** A change that takes more than one step (a rename through a temporary
+  name, a conflict copy and then the server's version) checks everything it will need before the first
+  step. If any step would act on a link, nothing is done and the change waits.
+- **Deleting is decided by content.** A local file the server deleted is removed if it holds exactly the
+  content both sides agreed on, even if its time or file ID changed. Only different content counts as an
+  edit, and an edit wins over the delete.
+  A folder at a deleted folder's path that another tracked folder owns (by local ID) isn't the deleted one.
+- **Approval covers what was shown.** A mass-delete approval releases exactly the deletions that were listed
+  (both directions). Deletions that appear afterwards wait for their own approval. Approvals given before a pass
+  add up.
+- **Crash recovery.** After a crash, the next passes redo the lost bookkeeping. Content already on both sides
+  is adopted where the engine can tell. Where it can't (a file the crashed pass touched and the user then
+  locked, moved or edited), it keeps a conflict copy; a delete the crashed pass had applied can also come
+  back. Nothing is lost. The simulation crashes machines at random calls and between filesystem steps.
 - **Known gaps, for the agent milestone (M3b)**: a tracked folder the user moves into a folder the scan can't
   list looks deleted, so the push deletes it on the server (its files go up again as new ones once the folder
   can be listed; history keeps the old versions). While any folder can't be listed, a node that has to be
   found by local ID waits. After a node is skipped partway (moved aside, then its download failed), the push
-  can send the move aside as a user move, so the server node takes the conflict name.
+  can send the move aside as a user move, so the server node takes the conflict name. If the user renames a
+  folder holding a link while the server adds something to that folder, the engine makes the folder again at
+  its old place and the node behind the link is deleted on the server; the file goes up as new once it is
+  real again, and history keeps the old version. A new server version identical to the base (same manifest
+  and exec bit) still counts as a change (M3b2: take it without touching the file).
 
 ## Server
 
@@ -429,6 +462,72 @@ methods answer `not_found` / `invalid` (405) the same way:
 - **App contract** (separate small PRs per app, later): an option for where settings and libraries live,
   and saves that write a temp file and rename it.
 
+### The agent, first cut (M3b1)
+
+M3b is split like M3: **M3b1** is an agent you run by hand, **M3b2** makes it run on its own (watcher,
+stability window, daemon loop with backoff, simulated network). M3b1 is done when two machines sync one
+folder through a real server by running `craft-cloud-agent sync`.
+
+- **`apps/craft-cloud-agent`**, a library plus a thin `main.rs`, like the server. Modules: `disk` (the real
+  `Fs`), `http` (the HTTP `Transport`), `account` (sign-in and saved state), `root` (the root marker), `cli`.
+- **Real `Fs`** over a root directory:
+  - File IDs from the `file-id` crate (inode on Unix, NTFS file ID on Windows), folded to a `u64`.
+  - Writes go to `<root>/.craft-cloud/tmp/`, are flushed to disk, get their mtime and exec bit, then are
+    renamed over the target. Hashing opens files with every share flag on Windows, so it never blocks an
+    app's save, rename or delete.
+  - `rename` never replaces: the OS's no-replace rename where one exists without `unsafe` in this repo,
+    otherwise a check right before the rename, with the race documented.
+  - Symlinks and other special files are `Other` and never followed. `.craft-cloud/` is ignored by the
+    engine already.
+  - The same conformance tests run against `MemFs` and the real `Fs`, on Ubuntu and Windows in CI.
+- **HTTP `Transport`**: reqwest with rustls, device token as `Authorization: Bearer`. HTTPS is required,
+  except to a loopback address. Server answers map onto `TransportError` (refused batch with its
+  conflicts, missing chunks, `resync_required`, 401, 5xx and network errors as `Unavailable`). Bodies and
+  lists are capped as on the server.
+- **Saved state**, per synced folder, in the user data dir:
+  - `account.json`: server URL, user, device ID, device name and the folder. Written owner-only.
+  - The device token sits in the same owner-only file. An OS keychain can come later.
+  - `state.json`: the engine's `State` with a schema version, written atomically (temp, flush, rename)
+    after every pass, failed or not.
+  - One document, not a table per node: the engine works on the whole state in memory anyway. A
+    per-node store comes when measurements ask for it (the spec's SQLite state DB is deferred).
+  - A crash loses at most one pass of bookkeeping and never data. The next passes redo it (see "Crash
+    recovery" in the engine rules).
+- **Root marker** `.craft-cloud/root.json` (`{space, root}`): written when a folder is first set up. Every
+  later run checks it first and stops with a clear message if it's missing or names another space.
+- **CLI**:
+  - `login <url> --user <name> [--folder <path>] [--device-name <name>]`, with the password read from
+    stdin. It creates the device and sets up the folder and its marker. The folder must be empty or new,
+    or `--adopt` must be passed to sync an existing one.
+  - `sync [--approve-deletes]`: one pass, printed as a short report. Exit codes tell apart done, needs
+    approval, and failed.
+  - `status`: account, folder, last pass, pending deletes, skipped files.
+  - `logout`: revokes the device on the server and removes the saved account. Local files stay.
+- **One agent at a time**: the agent holds an OS file lock on its data folder and on
+  `<folder>/.craft-cloud/lock` while it works; a second one stops with exit code 3. A filesystem without
+  locks gets a warning.
+- **The root lists only while its marker is there**, so a folder emptied or unmounted mid-pass fails the pass.
+- **Permissions**: a downloaded file keeps the permissions of the file it replaces (Unix); only the executable
+  bit syncs.
+- **Exit codes**: 0 done, 1 failed (try again), 2 deletions wait for approval, 3 stopped for safety (needs you).
+- **`logout --local`** forgets the account without the server; the device stays valid until an admin revokes
+  it.
+- **Not in M3b1, planned for M3b2**: blocking disk I/O moved off the async runtime; closing the link race
+  with `openat`-style walking; an atomic compare-and-replace when a download lands, with "rename blocked on
+  Windows, keep the temp file and retry". Documented limits: a volume mounted inside the folder, FAT/exFAT
+  file IDs that change on rename (moves become delete + new), Windows read-only files (skipped), and
+  `--data-dir` outside the user profile isn't owner-only on Windows.
+- **Dependencies**: no `dirs`/`directories` (they pull in an MPL-2.0 helper); the data dir comes from
+  environment variables (`%LOCALAPPDATA%`, `~/Library/Application Support`, `$XDG_DATA_HOME`).
+- **Conflict copy times** use the machine's local time. If the local offset can't be read safely, UTC is
+  used and marked with `Z` (`2026-10-11 14-03Z`), read with `jiff`.
+- **Tests**:
+  - The real-`Fs` conformance suite.
+  - End-to-end: two agents with temp folders against the real server on a loopback port, through the
+    CLI's own functions: first sync, edits both ways, a conflict, a move, mass-delete approval, a missing
+    root marker stopping the pass, and a server restore (epoch reset).
+  - The simulation's crash action.
+
 ## Errors
 
 - **Transient** (network down, timeouts, `5xx`, server restarting): retry with exponential backoff and
@@ -466,8 +565,10 @@ methods answer `not_found` / `invalid` (405) the same way:
   program, and failed passes. After each
   run: every machine converges, no file content the engine saw is lost (unless a user overwrote or deleted
   it), and after every finished pass each tracked node still has a place. A failing seed replays exactly.
-  Half the seeds turn the racy window off to exercise the size-and-time fast path. M3a passes seeds 0–3999.
-  Crashes, server restores, unplugged roots and a simulated network (`turmoil`, MIT) come with the agent.
+  Half the seeds turn the racy window off to exercise the size-and-time fast path. Machines also crash at
+  random calls and between filesystem steps and restart from their last saved state. Seeds run in parallel
+  (`SIM_JOBS`) against an in-memory test server; seeds 0–3999 take under a minute. A simulated network
+  (`turmoil`, MIT) comes with M3b2.
 - **Scripted scenarios** on top, as readable regression tests: concurrent edit → conflict copy; offline edits
   on both sides; upload cut halfway then resumed; delete versus edit; folder move during an upload; epoch
   change with a newer local file and with another device already reconciled; mass delete paused; Windows
@@ -485,7 +586,8 @@ methods answer `not_found` / `invalid` (405) the same way:
 | M1 | `proto` + `chunker` (names, IDs, `fastcdc-v1` with golden vectors) | DONE (2026-10-11, PR #1) |
 | M2 | Server core: info, auth, devices, chunks, batch commit, changes, tree, epoch; SQLite + Postgres, disk + S3 | DONE (2026-10-11; M2a storage, M2b server) |
 | M3a | Sync engine on `Fs`/`Transport` + simulation harness | DONE (2026-10-12) |
-| M3b | Agent binary: real `Fs`, HTTP transport, state DB, watcher, root marker, CLI; two machines sync a folder | TODO |
+| M3b1 | Agent, first cut: real `Fs`, HTTP transport, saved state, root marker, CLI; two machines sync a folder by hand | IN PROGRESS (design) |
+| M3b2 | Agent on its own: watcher, stability window, daemon loop with backoff, simulated network | TODO |
 | M4 | History, restore, trash, thinning, GC, admin CLI, backup/restore | TODO |
 | M5 | Selective sync, large-media polish, ignore rules | TODO |
 | M6 | Packaging: binaries, Docker, systemd, built-in TLS, self-hosting guide | TODO |
