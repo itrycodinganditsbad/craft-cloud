@@ -277,6 +277,27 @@ changes locally, then pushes local changes. These rules came out of the simulati
   isn't created on the server. An empty new folder still is.
 - **Moved files are checked like any other**: the edit check of a moved file uses the racy and replaced-file
   rules.
+- **Filesystem errors are per node.** A filesystem error while applying one remote change (a file an app holds
+  open, a folder that can't be listed, a rename or write that fails) skips that node with a reason in the
+  report. Its base stays as it was, so the next pass tries again, and every node below it in the server's tree
+  waits for it. Only a sync root that can't be listed, and server errors, fail the pass.
+- **Folders with unknown contents**: a folder the scan can't list (or that vanished during the scan), or one
+  nested deeper than the tree allows, hides its contents. Nothing tracked inside it counts as missing, so the
+  push never deletes it on the server. A new folder that can't be listed isn't created on the server until it
+  can be.
+- **Edited there, moved here**: a tracked file missing from its base path while the server has a new version
+  is looked up by local ID, or through the nearest folder above it that is found by local ID (a file an atomic
+  save replaced). A path another tracked node holds doesn't count. Unchanged: it takes the server's version
+  where it is, or where the server moved it if the server moved it too, and the push sends the local move.
+  Same content as the server's: adopted. Edited: it becomes a conflict copy next to where the user put it, and
+  the server's version lands at the same place. Not found: it was deleted here, and the edit wins.
+- **A relocate is recorded at once**: the base follows a file moved to the server's place before its download
+  starts, so a download that fails doesn't make the next pass take the unchanged file for a conflict.
+- **The mass-delete guard covers both directions**: when the server's deletes would remove more tracked files
+  here than the thresholds allow, all of them wait for approval. They stay on disk and in the base, so nothing
+  goes back up, and the report lists them as pending local deletes. Approval releases both directions.
+- **A first sync cut short starts over**: the space is recorded only after the first full listing succeeds,
+  so a failed listing doesn't turn the next pass into a reconcile.
 
 ## Server
 
