@@ -33,3 +33,16 @@ fn status_with_an_empty_data_dir_says_not_signed_in() {
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("not signed in"));
 }
+
+/// A stop that needs the user exits 3 from the real binary, with the reason on standard error.
+#[test]
+fn a_damaged_account_file_exits_3() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("account.json"), "{not json").unwrap();
+    for command in ["sync", "status"] {
+        let out = agent(&[command], dir.path());
+        assert_eq!(out.status.code(), Some(3), "{command}: {out:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("account.json") && err.contains("move it away"), "{command}: {err}");
+    }
+}
