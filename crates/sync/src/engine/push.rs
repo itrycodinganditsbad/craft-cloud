@@ -5,7 +5,7 @@ use std::io;
 
 use bytes::Bytes;
 use craft_cloud_chunker::{FASTCDC_V1, chunk_reader};
-use craft_cloud_proto::limits::MAX_BATCH_OPS;
+use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_TREE_DEPTH};
 use craft_cloud_proto::{ChunkId, ChunkRef, ChunkerParamsId, Conflict, Epoch, FileHash, FileState, Manifest, NewVersion, NodeId, Op, VersionId};
 
 use crate::fs::{FileMeta, Fs, FsKind};
@@ -111,8 +111,33 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 None => true,
             }
         });
-        missing_files.retain(|(_, path)| !hidden(&expected(path)));
-        missing_dirs.retain(|(_, path)| !hidden(&expected(path)));
+        // A folder above a missing node that the user moved is found by its local ID even where a new folder took
+        // its old name (so it isn't a folder move here): a link the node turned into moved with it.
+        let dir_at: HashMap<u64, &RelPath> = local
+            .iter()
+            .filter_map(|(p, k)| match k {
+                FsKind::Dir { id: Some(i) } => Some((*i, p)),
+                _ => None,
+            })
+            .collect();
+        let behind_moved_link = |id: NodeId| -> bool {
+            let mut below = Vec::new();
+            let mut current = id;
+            for _ in 0..=MAX_TREE_DEPTH {
+                let Some(BaseEntry { name: Some(name), parent: Some(parent), .. }) = self.state.base.get(&current) else { return false };
+                below.push(name.clone());
+                current = *parent;
+                if let Some(BaseEntry { kind: BaseKind::Dir { local_id: Some(lid) }, .. }) = self.state.base.get(&current)
+                    && let Some(now) = dir_at.get(lid)
+                    && hidden(&below.iter().rev().fold((*now).clone(), |p, n| p.join(n)))
+                {
+                    return true;
+                }
+            }
+            false
+        };
+        missing_files.retain(|(id, path)| !hidden(&expected(path)) && !behind_moved_link(*id));
+        missing_dirs.retain(|(id, path)| !hidden(&expected(path)) && !behind_moved_link(*id));
         let moved_targets: BTreeSet<RelPath> =
             file_moves.iter().map(|(_, _, to, _)| to.clone()).chain(dir_moves.iter().map(|(_, _, to)| to.clone())).collect();
 

@@ -847,6 +847,28 @@ async fn a_file_that_became_a_link_in_a_folder_the_user_renamed_is_never_deleted
     assert_eq!(files(&a), files(&b));
 }
 
+/// The same, but a new folder then takes the renamed folder's old name. The folder found by its file ID still
+/// tells where the link went, so the clip isn't deleted while it is a link.
+#[tokio::test]
+async fn a_file_that_became_a_link_in_a_folder_moved_away_is_never_deleted() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty() && report.pending_deletes.is_empty(), "{report:?}");
+    }
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "Footage/c0.mov"), b"clip");
+    // Once the clip is back it goes up where it is, and nothing is lost.
+    a.fs_mut().remove_file(&path("Clips/c0.mov")).unwrap();
+    write(&mut a, "Clips/c0.mov", b"clip");
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&a), files(&b));
+    assert_eq!(read(&b, "Clips/c0.mov"), b"clip");
+}
+
 /// Two machines with a folder of three clips, a notes file and padding (so the mass-delete guard doesn't hide a
 /// wrong delete).
 async fn linked_setup() -> (Server, common::Machine, common::Machine) {
