@@ -179,7 +179,8 @@ everything stays in history. Conflict copies are named `name (conflict, <device>
 - **Move versus move** of the same node: the server's move stands; the local one is redone if it still makes
   sense, otherwise reported.
 - **Delete versus edit**: the edit wins and the node comes back. **If its parent directories were deleted,
-  the whole parent chain is restored** with them.
+  the whole parent chain is restored** with them. If the chain can't come back where it was (a live node
+  took a folder's old name), the edit is uploaded as a new file in a newly created folder instead.
 - **Move or create into a deleted directory**: same rule, the directory chain is restored and the node lands
   where the user put it.
 - The device part of a conflict name is cleaned with the name rules. If the name passes 255 bytes, the
@@ -215,6 +216,94 @@ engine; a settings conflict is a normal conflict copy and the app decides what t
 
 **Ignored by default**: `.DS_Store`, `Thumbs.db`, `desktop.ini`, `~$*`, `*.tmp`, `*.part`, `.~lock.*`, the
 agent's own `.craft-cloud/` folder. A `.craftignore` file adds patterns.
+
+### Engine rules
+
+The engine (`craft-cloud-sync`) is pure logic over an `Fs` and a `Transport` trait. It keeps a **remote
+mirror** (the server tree as last seen) and a **base** (what both sides agreed on, per node: place, version,
+size, mtime, local file ID, content hash, and when it was recorded). One pass pulls changes, applies remote
+changes locally, then pushes local changes. These rules came out of the simulation; each one fixed a seed.
+
+- **Content is checked before anything is overwritten or deleted.** Size and mtime are only a quick filter.
+  Before a remote change replaces or removes a local file, the file is hashed against the base hash. A file
+  that can't be read (another program holds it locked) never counts as unchanged.
+- **Content streams.** The `Fs` trait opens files for reading, reads ranges, and writes through a temporary
+  writer that lands atomically. Uploads chunk the file as a stream, then read back only the chunks the server
+  lacks, each checked against its ID (a mismatch means the file changed: retried next pass). Downloads check
+  every chunk and the whole-file hash before the file lands. No file is ever held whole in memory.
+- **Unreadable files are skipped** with a reason in the report and retried next pass.
+- **Racy and replaced files are hashed.** When size and mtime match the base but the file's ID changed
+  (replaced), or its mtime is within `racy_window_ms` (default 2 s) of when the base was recorded, the
+  content is hashed to decide whether it changed.
+- **Case twins**: a local name that differs from an incoming one only by case or normalisation is moved aside
+  before a write, mkdir or rename, so it's never overwritten. During a scan, the tracked name wins and the
+  newcomer is skipped with a reason.
+- **Moves name the server's location**: a Move op's source is where the remote mirror has the node.
+- **Moved on both sides**: the server's move stands. The local copy is found by local file ID and moved to the
+  server's place, hopping through a conflict name when one path contains the other or the rename is
+  case-only. Folder moves and new folders are ordered by target depth.
+- **A tracked node that lost its place** (its folder was moved aside this pass) is looked up by local ID the
+  same way. If it isn't found, it counts as deleted here, and its base follows the server's location so the
+  push can send the delete.
+- **Tracked occupants**: before a node takes a path another tracked node holds, that one is settled first
+  (removed if it was deleted on the server and is unchanged here, otherwise moved aside).
+- **Folder adoption**: an untracked local folder at the server's move target is adopted, unless another
+  tracked folder owns its ID.
+- **Edit wins over delete.** An Update of a node the server deleted is retried once with the server's current
+  version. If the node still can't come back (its folder's old name is taken now, say), the engine forgets the
+  node and its dead folders, and the next pass uploads the file as a new one.
+- **Deleted folder with new local files**: the engine forgets it and the push creates it again. A deleted
+  folder that still holds an edited tracked file stays, and that file's upload restores it.
+- **Refused ops** are dropped from the batch and the rest resubmitted. A Move refused with NameTaken moves the
+  local target aside. A refusal that names no operation in the batch fails the pass instead of looping.
+- **Edit wins and parents**: new content arriving in a folder deleted here recreates the folder.
+- **Downloads land only on what was checked**: the local file is stat'ed before it is verified, and the
+  download lands only if the path still matches that stat (or is still empty, when it was cleared for the
+  download). If an app saved in between, the download is abandoned, the base keeps the old version, and the
+  next pass sees an edit on both sides. This narrows the window; the agent's real `Fs` closes it with an
+  atomic compare-and-replace (M3b).
+- **A reconcile cut short stays a reconcile**: after an epoch change the state remembers that a reconcile is
+  pending until a pass has applied the server's tree, so no later pass trusts the cleared base.
+- **Same content is no conflict**: a file changed on both sides whose local content equals the server's new
+  version (a lost commit reply, the same edit on two machines) takes the server's version, with no conflict
+  copy.
+- **Deleted folders and ignored files**: a folder the server deleted is removed together with any OS
+  metadata files in it (`.DS_Store`, `Thumbs.db`, `desktop.ini`). If it holds other ignored files (`~$*`,
+  `*.tmp`, `*.part`, `.~lock.*`, which may belong to an open document), it stays on disk, forgotten. A
+  tracked folder the server deleted that stands in a newcomer's way is removed the same way if bare, moved
+  aside otherwise. Known gap: once the ignored files go, the empty folder is created on the server again
+  (a "deleted remotely, kept locally" marker comes with the agent's state DB).
+- **Folders holding only ignored files don't sync**: a new local folder whose whole subtree is ignored names
+  isn't created on the server. An empty new folder still is.
+- **Moved files are checked like any other**: the edit check of a moved file uses the racy and replaced-file
+  rules.
+- **Filesystem errors are per node.** A filesystem error while applying one remote change (a file an app holds
+  open, a folder that can't be listed, a rename or write that fails) skips that node with a reason in the
+  report. Its base stays as it was, so the next pass tries again, and every node below it in the server's tree
+  waits for it. Only a sync root that can't be listed, and server errors, fail the pass.
+- **Folders with unknown contents**: a folder the scan can't list (or that vanished during the scan), or one
+  nested deeper than the tree allows, hides its contents. Nothing tracked inside it counts as missing, so the
+  push never deletes it on the server. A new folder that can't be listed isn't created on the server until it
+  can be.
+- **Edited there, moved here**: a tracked file missing from its base path while the server has a new version
+  is looked up by local ID, or through the nearest folder above it that is found by local ID (a file an atomic
+  save replaced). A path another tracked node holds doesn't count. Unchanged: it takes the server's version
+  where it is, or where the server moved it if the server moved it too, and the push sends the local move.
+  Same content as the server's: adopted. Edited: it becomes a conflict copy next to where the user put it, and
+  the server's version lands at the same place. Not found: it was deleted here, and the edit wins.
+  Ignored names don't count: a file renamed to one (an app's temp name mid-save) isn't the tracked file moved.
+- **A relocate is recorded at once**: the base follows a file moved to the server's place before its download
+  starts, so a download that fails doesn't make the next pass take the unchanged file for a conflict.
+- **The mass-delete guard covers both directions**: when the server's deletes would remove more tracked files
+  here than the thresholds allow, all of them wait for approval. They stay on disk and in the base, so nothing
+  goes back up, and the report lists them as pending local deletes. Approval releases both directions.
+- **A first sync cut short starts over**: the space is recorded only after the first full listing succeeds,
+  so a failed listing doesn't turn the next pass into a reconcile.
+- **Known gaps, for the agent milestone (M3b)**: a tracked folder the user moves into a folder the scan can't
+  list looks deleted, so the push deletes it on the server (its files go up again as new ones once the folder
+  can be listed; history keeps the old versions). While any folder can't be listed, a node that has to be
+  found by local ID waits. After a node is skipped partway (moved aside, then its download failed), the push
+  can send the move aside as a user move, so the server node takes the conflict name.
 
 ## Server
 
@@ -371,11 +460,14 @@ methods answer `not_found` / `invalid` (405) the same way:
   container, never linked. Cases: auth, quota, batch commit
   atomicity, `missing_chunks`, GC never removes a referenced or protected chunk while commits run,
   thinning, `backup` + `restore` gives the same state with a new epoch, `resync_required`.
-- **Deterministic simulation** of the sync engine: several agents and the server in one process with a
-  simulated clock, network and filesystem (`turmoil`, MIT, for the network; an in-memory `Fs` for disks).
-  Random seeds drive edits, moves, deletes, disconnects, crashes, server restores and unplugged roots. After
-  each run, check against a simple reference model: no version lost, every machine converges, nothing
-  deleted that the user didn't delete. A failing seed replays exactly.
+- **Deterministic simulation** of the sync engine: several agents and the server in one process, with an
+  in-memory `Fs` per machine and an in-process transport over the real metadata and blob stores that can
+  fail calls on a schedule. Random seeds drive edits, moves, renames, deletes, files held locked by another
+  program, and failed passes. After each
+  run: every machine converges, no file content the engine saw is lost (unless a user overwrote or deleted
+  it), and after every finished pass each tracked node still has a place. A failing seed replays exactly.
+  Half the seeds turn the racy window off to exercise the size-and-time fast path. M3a passes seeds 0–3999.
+  Crashes, server restores, unplugged roots and a simulated network (`turmoil`, MIT) come with the agent.
 - **Scripted scenarios** on top, as readable regression tests: concurrent edit → conflict copy; offline edits
   on both sides; upload cut halfway then resumed; delete versus edit; folder move during an upload; epoch
   change with a newer local file and with another device already reconciled; mass delete paused; Windows
@@ -392,7 +484,8 @@ methods answer `not_found` / `invalid` (405) the same way:
 | M0 | Repo, conventions, CI | DONE (2026-10-11) |
 | M1 | `proto` + `chunker` (names, IDs, `fastcdc-v1` with golden vectors) | DONE (2026-10-11, PR #1) |
 | M2 | Server core: info, auth, devices, chunks, batch commit, changes, tree, epoch; SQLite + Postgres, disk + S3 | DONE (2026-10-11; M2a storage, M2b server) |
-| M3 | Sync engine on `Fs`/`Transport` + simulation harness + agent CLI; two machines sync a folder | TODO |
+| M3a | Sync engine on `Fs`/`Transport` + simulation harness | DONE (2026-10-12) |
+| M3b | Agent binary: real `Fs`, HTTP transport, state DB, watcher, root marker, CLI; two machines sync a folder | TODO |
 | M4 | History, restore, trash, thinning, GC, admin CLI, backup/restore | TODO |
 | M5 | Selective sync, large-media polish, ignore rules | TODO |
 | M6 | Packaging: binaries, Docker, systemd, built-in TLS, self-hosting guide | TODO |
