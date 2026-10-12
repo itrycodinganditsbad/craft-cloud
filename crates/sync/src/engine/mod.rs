@@ -15,13 +15,13 @@
 //!
 //! Nothing local is ever deleted unless the base says the server deleted exactly what is on disk.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
 
 use craft_cloud_chunker::{Chunker, FASTCDC_V1};
 use craft_cloud_proto::limits::MAX_TREE_DEPTH;
 use craft_cloud_proto::{
-    Conflict, ConflictStamp, DeviceId, Epoch, FileHash, FileState, Manifest, ManifestId, Name, NewVersion, NodeId, PageCursor, conflict_name,
+    Conflict, ConflictStamp, DeviceId, Epoch, FileHash, FileState, FoldKey, Manifest, ManifestId, Name, NewVersion, NodeId, PageCursor, conflict_name,
 };
 
 use crate::fs::{FileMeta, Fs, FsKind};
@@ -37,6 +37,9 @@ pub const DEFAULT_IGNORES: &[&str] = &[".craft-cloud", ".DS_Store", "Thumbs.db",
 /// Ignored files the OS drops into folders by itself. They go along with a folder the server deleted; other
 /// ignored files (an open document's lock file, say) keep the folder here.
 const OS_METADATA: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
+/// Why an entry that is neither a regular file nor a folder (or whose name the filesystem layer can't use) is
+/// skipped.
+pub const OTHER_REASON: &str = "a link, a special file, or a name this computer can't sync";
 /// Most chunk IDs asked about in one missing-chunk query.
 const MISSING_QUERY_IDS: usize = 10_000;
 
@@ -134,6 +137,8 @@ pub struct Report {
     /// Files the server deleted whose removal here the mass-delete guard holds back until
     /// [`Engine::approve_deletes`]. They stay on disk and tracked.
     pub pending_local_deletes: Vec<RelPath>,
+    /// The nodes behind `pending_deletes` and `pending_local_deletes`, for [`Engine::approve_deletes_of`].
+    pub pending_nodes: Vec<NodeId>,
     /// Operations the server refused this pass; they are retried next pass.
     pub refused: Vec<Conflict>,
 }
@@ -166,6 +171,36 @@ enum Local {
     Unchanged,
     Modified,
     Missing,
+}
+
+/// What a scan couldn't see into this pass. Nothing tracked there counts as missing, so the push never deletes it
+/// on the server.
+struct Unseen {
+    /// Folders whose contents are unknown: ones that can't be listed (or vanished while the scan ran) and ones
+    /// nested deeper than the tree allows. A new folder among them isn't created on the server until it can be.
+    unknown: Vec<RelPath>,
+    /// Links and special files, by folder and folded name. A tracked file or folder that turned into one (a folder
+    /// moved to another drive with a link left behind), or whose name this computer now spells differently, isn't
+    /// gone, and neither is anything tracked below it.
+    links: HashSet<(RelPath, FoldKey)>,
+}
+
+impl Unseen {
+    /// Whether `path` (where a tracked node is expected now, after the folder moves the scan found) is in a folder
+    /// whose contents are unknown, or is a link or below one.
+    fn hides(&self, path: &RelPath) -> bool {
+        if self.unknown.iter().any(|u| path.starts_with(u)) {
+            return true;
+        }
+        let mut prefix = RelPath::root();
+        for name in path.names() {
+            if self.links.contains(&(prefix.clone(), name.fold_key())) {
+                return true;
+            }
+            prefix = prefix.join(name);
+        }
+        false
+    }
 }
 
 /// What to record when an operation commits.
@@ -215,7 +250,29 @@ pub struct Engine<F: Fs, T: Transport> {
     chunker: Chunker,
     config: Config,
     stamp: Box<dyn Fn() -> ConflictStamp + Send + Sync>,
-    approved_deletes: bool,
+    approval: Approval,
+    /// Counts the engine's own changes to the folder, so per-pass caches of what is where can tell they are stale.
+    fs_changes: u64,
+}
+
+/// Which deletions the mass-delete guard lets through this pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Approval {
+    #[default]
+    None,
+    All,
+    /// Exactly these nodes (the ones a user saw listed); any others still wait.
+    Only(BTreeSet<NodeId>),
+}
+
+impl Approval {
+    fn covers(&self, id: NodeId) -> bool {
+        match self {
+            Approval::None => false,
+            Approval::All => true,
+            Approval::Only(ids) => ids.contains(&id),
+        }
+    }
 }
 
 impl<F: Fs, T: Transport> Engine<F, T> {
@@ -228,7 +285,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         stamp: impl Fn() -> ConflictStamp + Send + Sync + 'static,
     ) -> Result<Self, SyncError> {
         let chunker = Chunker::new(FASTCDC_V1).map_err(|e| SyncError::Corrupt(e.to_string()))?;
-        Ok(Self { fs, transport, state, chunker, config, stamp: Box::new(stamp), approved_deletes: false })
+        Ok(Self { fs, transport, state, chunker, config, stamp: Box::new(stamp), approval: Approval::None, fs_changes: 0 })
     }
 
     pub fn state(&self) -> &State {
@@ -249,7 +306,19 @@ impl<F: Fs, T: Transport> Engine<F, T> {
 
     /// Lets the next pass carry out deletions the mass-delete guard held back.
     pub fn approve_deletes(&mut self) {
-        self.approved_deletes = true;
+        self.approval = Approval::All;
+    }
+
+    /// Lets the next pass carry out exactly these held-back deletions (both directions), as listed in an earlier
+    /// report's [`Report::pending_nodes`]. Deletions of other nodes still wait for approval if the guard holds
+    /// them. Adds to an approval given since the last pass (several calls approve all the nodes they name; after
+    /// [`Engine::approve_deletes`] everything stays approved).
+    pub fn approve_deletes_of(&mut self, nodes: impl IntoIterator<Item = NodeId>) {
+        match &mut self.approval {
+            Approval::All => {}
+            Approval::Only(ids) => ids.extend(nodes),
+            Approval::None => self.approval = Approval::Only(nodes.into_iter().collect()),
+        }
     }
 
     /// One full pass. On error the state stays consistent (the base only records what happened), so the
@@ -263,7 +332,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         self.apply_remote(mode, &mut report).await?;
         self.state.reconcile_pending = false;
         self.push(&mut report).await?;
-        self.approved_deletes = false;
+        self.approval = Approval::None;
         Ok(report)
     }
 
@@ -360,13 +429,13 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// The folder as a map from path to entry, without ignored, invalid, clashing or special entries.
     /// When two names in a folder clash by case, the tracked one wins and the other is skipped.
     ///
-    /// Also returns the folders whose contents are unknown this pass: ones that can't be listed (or vanished
-    /// while the scan ran) and ones nested deeper than the tree allows. Nothing tracked inside them counts as
-    /// missing. Only a sync root that can't be listed fails the scan.
-    fn scan(&self, report: &mut Report) -> Result<(BTreeMap<RelPath, FsKind>, Vec<RelPath>), SyncError> {
+    /// Also returns what the scan couldn't see into (see [`Unseen`]). Only a sync root that can't be listed fails
+    /// the scan.
+    fn scan(&self, report: &mut Report) -> Result<(BTreeMap<RelPath, FsKind>, Unseen), SyncError> {
         let tracked = self.state.base_index();
         let mut out = BTreeMap::new();
         let mut unknown = Vec::new();
+        let mut links = HashSet::new();
         let mut queue = vec![RelPath::root()];
         while let Some(dir) = queue.pop() {
             let mut entries = match self.fs.list(&dir) {
@@ -396,7 +465,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 }
                 let path = dir.join(&name);
                 match entry.kind {
-                    FsKind::Other => report.skipped.push((shown, "not a regular file or folder".into())),
+                    FsKind::Other => {
+                        report.skipped.push((shown, OTHER_REASON.into()));
+                        links.insert((dir.clone(), name.fold_key()));
+                    }
                     FsKind::Dir { .. } if path.depth() > MAX_TREE_DEPTH => {
                         report.skipped.push((shown, "folders nest too deep".into()));
                         unknown.push(path);
@@ -411,7 +483,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 }
             }
         }
-        Ok((out, unknown))
+        Ok((out, Unseen { unknown, links }))
     }
 
     fn stat(&self, path: &RelPath) -> Result<Option<FsKind>, SyncError> {
@@ -479,9 +551,11 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             }
         }
         for file in &junk {
-            self.fs.remove_file(file).map_err(|e| io_err(file, e))?;
+            self.remove_file_here(file)?;
         }
+        self.no_link(dir)?;
         self.fs.remove_dir(dir).map_err(|e| io_err(dir, e))?;
+        self.fs_changes += 1;
         Ok(true)
     }
 
@@ -524,11 +598,54 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         Err(SyncError::Corrupt(format!("no free conflict name for {path}")))
     }
 
+    /// The engine never renames, removes or writes onto or through a link: every change it makes to the folder
+    /// first checks that neither the path nor any folder above it is a link or special file here. If one is, the
+    /// change fails as a filesystem error on that node, so the node is skipped this pass (with the link reason)
+    /// and waits, and the link stays exactly as it is.
+    pub(super) fn no_link(&self, path: &RelPath) -> Result<(), SyncError> {
+        let mut prefix = RelPath::root();
+        for name in path.names() {
+            prefix = prefix.join(name);
+            match self.stat(&prefix)? {
+                Some(FsKind::Other) => return Err(io_err(&prefix, io::Error::other(OTHER_REASON))),
+                Some(FsKind::Dir { .. }) => {}
+                // A file or nothing: there is nothing further down to go through.
+                _ => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Renames, never onto or through a link (see [`Engine::no_link`]).
+    fn rename_here(&mut self, from: &RelPath, to: &RelPath) -> Result<(), SyncError> {
+        self.no_link(from)?;
+        self.no_link(to)?;
+        self.fs.rename(from, to).map_err(|e| io_err(from, e))?;
+        self.fs_changes += 1;
+        Ok(())
+    }
+
+    /// Removes a file, never a link or through one.
+    fn remove_file_here(&mut self, path: &RelPath) -> Result<(), SyncError> {
+        self.no_link(path)?;
+        self.fs.remove_file(path).map_err(|e| io_err(path, e))?;
+        self.fs_changes += 1;
+        Ok(())
+    }
+
+    /// Makes a folder, never through a link.
+    fn mkdir_here(&mut self, path: &RelPath) -> Result<(), SyncError> {
+        self.no_link(path)?;
+        self.fs.mkdir(path).map_err(|e| io_err(path, e))?;
+        self.fs_changes += 1;
+        Ok(())
+    }
+
     /// Moves whatever is at `path` to a conflict copy name; returns the new path.
     fn move_aside(&mut self, path: &RelPath, report: &mut Report) -> Result<RelPath, SyncError> {
         let is_dir = matches!(self.stat(path)?, Some(FsKind::Dir { .. }));
         let target = self.conflict_path(path, is_dir)?;
-        self.fs.rename(path, &target).map_err(|e| io_err(path, e))?;
+        self.rename_here(path, &target)?;
         // A tracked file the server deleted, moved aside: it is an untracked copy now (uploaded as new).
         if let Some(other) = self.state.base_index().get(path).copied()
             && !self.state.remote.contains_key(&other)
@@ -565,6 +682,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         report: &mut Report,
     ) -> Result<Option<(FileMeta, FileHash)>, SyncError> {
         let manifest = self.fetch_manifest(&file.manifest).await?;
+        self.no_link(path)?;
         let mut writer = self.fs.begin_write(path).map_err(|e| io_err(path, e))?;
         let mut hasher = blake3::Hasher::new();
         for chunk in manifest.chunks() {
@@ -584,7 +702,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             report.skipped.push((path.to_string(), "changed here while the server's version downloaded; tried again next pass".into()));
             return Ok(None);
         }
+        self.no_link(path)?;
         let meta = self.fs.finish_write(path, writer, file.exec, file.mtime_ms).map_err(|e| io_err(path, e))?;
+        self.fs_changes += 1;
         report.downloaded.push(path.clone());
         Ok(Some((meta, *manifest.file_hash())))
     }

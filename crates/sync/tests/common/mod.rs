@@ -18,19 +18,19 @@ use craft_cloud_store::memory::MemoryBackend;
 use craft_cloud_store::{BlobKey, Store};
 use craft_cloud_sync::{Config, Engine, FileMeta, Fs, FsEntry, FsKind, MemFs, RelPath, Report, State, Transport, TransportError};
 
+/// The server's metadata in an in-memory SQLite database (tests only: the rules are the same as on disk, and
+/// nothing waits for the disk), blobs in memory.
 pub struct Server {
     pub meta: Meta,
     pub store: Store,
-    _dir: tempfile::TempDir,
-    db_path: std::path::PathBuf,
+    /// The manifest of every version a commit stored, recorded as commits succeed.
+    committed: Arc<Mutex<BTreeSet<ManifestId>>>,
 }
 
 impl Server {
     pub async fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("meta.db");
-        let meta = Meta::open(&format!("sqlite:{}", db_path.display())).await.unwrap();
-        Self { meta, store: Store::new(MemoryBackend::new()), _dir: dir, db_path }
+        let meta = Meta::open("sqlite::memory:").await.unwrap();
+        Self { meta, store: Store::new(MemoryBackend::new()), committed: Arc::default() }
     }
 
     pub async fn user(&self, name: &str) -> UserRecord {
@@ -38,14 +38,16 @@ impl Server {
     }
 
     /// The whole-file hash of every version the server ever stored, for "nothing was lost" checks.
+    ///
+    /// These are the versions of the commits the transport saw succeed (recorded when `Meta::commit` returns
+    /// Ok, before a reply is lost on purpose; refused commits store nothing, a batch applies all or none), not a
+    /// read of the server's versions table: `craft-cloud-meta` has no history listing yet. So this trusts the
+    /// metadata store to keep every version it accepted (its own tests cover that). The check is about the
+    /// engine: content it saw must stay on a disk or in a version the server accepted.
     pub async fn history_hashes(&self) -> BTreeSet<FileHash> {
-        use sqlx::{Connection, Row};
-        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite:{}", self.db_path.display())).await.unwrap();
-        let rows = sqlx::query("SELECT DISTINCT manifest FROM versions").fetch_all(&mut conn).await.unwrap();
+        let ids: Vec<ManifestId> = self.committed.lock().unwrap().iter().copied().collect();
         let mut out = BTreeSet::new();
-        for row in rows {
-            let bytes: Vec<u8> = row.get("manifest");
-            let id = ManifestId::from_bytes(<[u8; 32]>::try_from(bytes.as_slice()).unwrap());
+        for id in ids {
             let manifest = Manifest::decode(&self.store.get(BlobKey::manifest(&id)).await.unwrap()).unwrap();
             out.insert(*manifest.file_hash());
         }
@@ -62,19 +64,27 @@ pub struct Faults {
     pub lose_commit_reply: AtomicBool,
     /// Make every commit come back refused, naming an operation the batch doesn't have.
     pub bad_conflict_index: AtomicBool,
+    /// The machine died (see `MemFs::die_after`): every call fails.
+    pub dead: Arc<AtomicBool>,
     calls: AtomicU64,
 }
 
 impl Faults {
     fn check(&self) -> Result<(), TransportError> {
+        if self.dead.load(Ordering::Relaxed) {
+            return Err(TransportError::Unavailable("the machine died".into()));
+        }
         let every = self.every.load(Ordering::Relaxed);
         let n = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         if every > 0 && n.is_multiple_of(every) { Err(TransportError::Unavailable("injected failure".into())) } else { Ok(()) }
     }
 }
 
-/// The server's API rules, in-process.
+/// The server's API rules, in-process. A clone is the same device talking to the same server.
+#[derive(Clone)]
 pub struct Local {
+    /// The device's name, for a restarted engine's settings.
+    name: String,
     meta: Meta,
     store: Store,
     space: SpaceId,
@@ -83,6 +93,7 @@ pub struct Local {
     page: u32,
     pub faults: Arc<Faults>,
     clock: Arc<Mutex<i64>>,
+    committed: Arc<Mutex<BTreeSet<ManifestId>>>,
 }
 
 fn meta_err(e: MetaError) -> TransportError {
@@ -163,7 +174,19 @@ impl Transport for Local {
         if self.faults.bad_conflict_index.load(Ordering::Relaxed) {
             return Err(TransportError::Rejected(vec![Conflict { op: ops.len() + 5, kind: ConflictKind::NoSuchNode }]));
         }
-        let out = self.meta.commit(self.space, self.device, ops, self.now()).await.map_err(meta_err)?;
+        let out = self.meta.commit(self.space, self.device, ops, self.now()).await.map_err(meta_err);
+        if let (Err(TransportError::Rejected(conflicts)), Ok(_)) = (&out, std::env::var("SIM_TRACE")) {
+            eprintln!("TRACE {} refused {conflicts:?} of {ops:?}", self.name);
+        }
+        let out = out?;
+        // Every version this commit stored stays in the server's history.
+        let mut committed = self.committed.lock().unwrap();
+        for op in ops {
+            if let Op::Create { version, .. } | Op::Update { version, .. } = op {
+                committed.insert(version.manifest);
+            }
+        }
+        drop(committed);
         if self.faults.lose_commit_reply.swap(false, Ordering::Relaxed) {
             return Err(TransportError::Unavailable("reply lost".into()));
         }
@@ -171,7 +194,7 @@ impl Transport for Local {
     }
 }
 
-pub const STAMP: ConflictStamp = ConflictStamp { year: 2026, month: 10, day: 11, hour: 14, minute: 3 };
+pub const STAMP: ConflictStamp = ConflictStamp { year: 2026, month: 10, day: 11, hour: 14, minute: 3, utc: false };
 
 pub type Machine = Engine<MemFs, Local>;
 
@@ -201,6 +224,7 @@ pub async fn machine_on<F: Fs>(
     let token = *blake3::hash(format!("{name}-{}", DeviceId::generate()).as_bytes()).as_bytes();
     let device = server.meta.create_device(user.id, name, &token, 0).await.unwrap();
     let transport = Local {
+        name: name.to_owned(),
         meta: server.meta.clone(),
         store: server.store.clone(),
         space: user.space,
@@ -209,10 +233,23 @@ pub async fn machine_on<F: Fs>(
         page,
         faults: Arc::new(Faults::default()),
         clock: Arc::new(Mutex::new(1_760_000_000_000)),
+        committed: server.committed.clone(),
     };
     let mut config = Config::new(name, device);
     tweak(&mut config);
     Engine::new(fs, transport, State::default(), config, || STAMP).unwrap()
+}
+
+/// The same machine after a crash and a restart: its folder and device as they are, a fresh engine that starts
+/// from `state` (what the agent saved last), with the settings `tweak` gives.
+pub fn restart(m: &Machine, state: State, tweak: impl FnOnce(&mut Config)) -> Machine {
+    let transport = m.transport().clone();
+    transport.faults.dead.store(false, Ordering::Relaxed);
+    let mut fs = m.fs().clone();
+    fs.revive();
+    let mut config = Config::new(transport.name.clone(), transport.device);
+    tweak(&mut config);
+    Engine::new(fs, transport, state, config, || STAMP).unwrap()
 }
 
 /// Syncs the machines in turn until a whole round changes nothing. Panics after `max_rounds`.

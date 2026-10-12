@@ -23,13 +23,17 @@ craft-cloud-store = { path = "crates/store" }
 craft-cloud-meta = { path = "crates/meta" }
 craft-cloud-server = { path = "apps/craft-cloud-server" }
 craft-cloud-sync = { path = "crates/sync" }
+craft-cloud-agent = { path = "apps/craft-cloud-agent" }
 argon2 = "0.6"
 async-trait = "0.1.89"
 axum = "0.8.9"
 base64 = "0.23"
 clap = { version = "4.6", features = ["derive"] }
 getrandom = "0.4"
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+file-id = "0.2.3"
+jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
+rustix = { version = "1.1.5", default-features = false, features = ["std", "fs"] }
 toml = "1.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

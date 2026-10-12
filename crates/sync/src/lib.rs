@@ -4,13 +4,15 @@
 //! agent supplies a real disk and HTTP; tests and the simulation supply [`MemFs`] and an in-process server.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+#[cfg(feature = "test-support")]
+pub mod conformance;
 pub mod engine;
 pub mod fs;
 pub mod path;
 pub mod state;
 pub mod transport;
 
-pub use engine::{Config, DEFAULT_IGNORES, Engine, Report, SyncError};
+pub use engine::{Config, DEFAULT_IGNORES, Engine, OTHER_REASON, Report, SyncError};
 pub use fs::{FileMeta, Fs, FsEntry, FsKind, MemFs, rel};
 pub use path::RelPath;
 pub use state::{BaseEntry, BaseKind, RemoteNode, State};

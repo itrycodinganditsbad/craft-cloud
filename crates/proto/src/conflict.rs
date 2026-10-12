@@ -7,7 +7,8 @@ use unicode_normalization::UnicodeNormalization;
 /// Longest device label kept in a conflict name, in bytes.
 const MAX_DEVICE_BYTES: usize = 64;
 
-/// The minute a conflict was found, in the user's local time. The caller reads the clock.
+/// The minute a conflict was found, in the user's local time. The caller reads the clock. When the local
+/// offset can't be read, the caller gives UTC and sets `utc`, which marks the time with `Z` (`14-03Z`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConflictStamp {
     pub year: u16,
@@ -15,6 +16,7 @@ pub struct ConflictStamp {
     pub day: u8,
     pub hour: u8,
     pub minute: u8,
+    pub utc: bool,
 }
 
 /// Longest extension kept after the suffix, in bytes after the dot.
@@ -33,9 +35,10 @@ const MAX_EXT_BYTES: usize = 16;
 /// the extension is dropped and the whole name is the stem. The `Result` stays for API stability.
 pub fn conflict_name(original: &Name, is_dir: bool, device: &str, stamp: ConflictStamp, counter: u32) -> Result<Name, NameError> {
     let full = original.as_str();
-    let ConflictStamp { year, month, day, hour, minute } = stamp;
+    let ConflictStamp { year, month, day, hour, minute, utc } = stamp;
     let repeat = if counter > 1 { format!(", {counter}") } else { String::new() };
-    let suffix = format!(" (conflict, {}, {year:04}-{month:02}-{day:02} {hour:02}-{minute:02}{repeat})", clean_device(device));
+    let zone = if utc { "Z" } else { "" };
+    let suffix = format!(" (conflict, {}, {year:04}-{month:02}-{day:02} {hour:02}-{minute:02}{zone}{repeat})", clean_device(device));
     let (stem, ext) = split_extension(full, is_dir);
     // At least one byte of stem must fit beside the extension and the suffix; otherwise there is no extension.
     let (stem, ext, budget) = match MAX_NAME_BYTES.checked_sub(suffix.len()).and_then(|b| b.checked_sub(ext.len())) {
@@ -84,7 +87,7 @@ fn truncate(s: &str, max: usize) -> &str {
 mod tests {
     use super::*;
 
-    const STAMP: ConflictStamp = ConflictStamp { year: 2026, month: 10, day: 11, hour: 14, minute: 3 };
+    const STAMP: ConflictStamp = ConflictStamp { year: 2026, month: 10, day: 11, hour: 14, minute: 3, utc: false };
 
     fn conflict(name: &str, is_dir: bool, device: &str, counter: u32) -> String {
         conflict_name(&Name::new(name).unwrap(), is_dir, device, STAMP, counter).unwrap().as_str().to_owned()
@@ -101,6 +104,13 @@ mod tests {
         assert_eq!(conflict(".gitignore", false, "pc", 1), ".gitignore (conflict, pc, 2026-10-11 14-03)");
         assert_eq!(conflict("Makefile", false, "pc", 1), "Makefile (conflict, pc, 2026-10-11 14-03)");
         assert_eq!(conflict("Shots.v2", true, "pc", 1), "Shots.v2 (conflict, pc, 2026-10-11 14-03)");
+    }
+
+    #[test]
+    fn utc_times_are_marked() {
+        let stamp = ConflictStamp { utc: true, ..STAMP };
+        let out = conflict_name(&Name::new("a.txt").unwrap(), false, "pc", stamp, 2).unwrap();
+        assert_eq!(out.as_str(), "a (conflict, pc, 2026-10-11 14-03Z, 2).txt");
     }
 
     #[test]

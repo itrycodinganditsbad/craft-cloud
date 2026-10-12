@@ -5,7 +5,7 @@ use std::io;
 
 use bytes::Bytes;
 use craft_cloud_chunker::{FASTCDC_V1, chunk_reader};
-use craft_cloud_proto::limits::MAX_BATCH_OPS;
+use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_TREE_DEPTH};
 use craft_cloud_proto::{ChunkId, ChunkRef, ChunkerParamsId, Conflict, Epoch, FileHash, FileState, Manifest, NewVersion, NodeId, Op, VersionId};
 
 use crate::fs::{FileMeta, Fs, FsKind};
@@ -18,9 +18,11 @@ use super::{Effect, Engine, MISSING_QUERY_IDS, Report, SyncError, per_node};
 impl<F: Fs, T: Transport> Engine<F, T> {
     pub(super) async fn push(&mut self, report: &mut Report) -> Result<(), SyncError> {
         let root = self.state.root.ok_or_else(|| SyncError::Corrupt("no root".into()))?;
-        let (local, unknown) = self.scan(report)?;
-        // Inside a folder that couldn't be listed nothing is known, so nothing tracked there is missing.
-        let hidden = |path: &RelPath| unknown.iter().any(|u| path.starts_with(u));
+        let (local, unseen) = self.scan(report)?;
+        // Inside a folder that couldn't be listed, or at or below a link, nothing is known, so nothing tracked there
+        // is missing. Judged where the node is expected now: a link moves with a folder the user renamed.
+        let hidden = |path: &RelPath| unseen.hides(path);
+        let unknown = &unseen.unknown;
         let index = self.state.base_index();
         // Folders that moved: a missing base folder whose local ID turns up at an untracked path.
         let untracked_dirs: HashMap<u64, RelPath> = local
@@ -34,7 +36,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         let mut dir_moves: Vec<(NodeId, RelPath, RelPath)> = Vec::new();
         for (path, id) in &index {
             let Some(BaseEntry { kind: BaseKind::Dir { local_id: Some(lid) }, .. }) = self.state.base.get(id) else { continue };
-            if *id == root || matches!(local.get(path), Some(FsKind::Dir { .. })) {
+            // A folder the server deleted (still tracked here while a node in it waits) can't be moved there.
+            if *id == root || matches!(local.get(path), Some(FsKind::Dir { .. })) || !self.state.remote.contains_key(id) {
                 continue;
             }
             if let Some(to) = untracked_dirs.get(lid)
@@ -89,6 +92,39 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             }
         }
 
+        // Every folder by its local ID.
+        let dir_at: HashMap<u64, RelPath> = local
+            .iter()
+            .filter_map(|(p, k)| match k {
+                FsKind::Dir { id: Some(i) } => Some((*i, p.clone())),
+                _ => None,
+            })
+            .collect();
+        // A tracked folder found at its place is that folder (path first). When its recorded local ID is gone from
+        // the folder (it was put back from another drive, or made again), it takes the ID it has now, so a later
+        // rename of it is sent as a move and a link in it is still found through it. Not while any folder can't be
+        // listed (the old ID may be in there), and never an ID another tracked folder has.
+        let refreshed: Vec<(NodeId, Option<u64>)> = index
+            .iter()
+            .filter_map(|(path, id)| match (&self.state.base.get(id)?.kind, local.get(&expected(path))?) {
+                (BaseKind::Dir { local_id }, FsKind::Dir { id: here })
+                    if *id != root
+                        && unknown.is_empty()
+                        && here.is_some()
+                        && local_id.is_none_or(|old| !dir_at.contains_key(&old))
+                        && !self.owns_local_dir(*here, *id) =>
+                {
+                    Some((*id, *here))
+                }
+                _ => None,
+            })
+            .collect();
+        for (id, here) in refreshed {
+            if let Some(BaseEntry { kind: BaseKind::Dir { local_id }, .. }) = self.state.base.get_mut(&id) {
+                *local_id = here;
+            }
+        }
+
         // File moves: a missing base file whose local ID turns up at an untracked path.
         let untracked_files: HashMap<u64, (RelPath, FileMeta)> = local
             .iter()
@@ -109,8 +145,29 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 None => true,
             }
         });
-        missing_files.retain(|(_, path)| !hidden(&expected(path)));
-        missing_dirs.retain(|(_, path)| !hidden(&expected(path)));
+        // A folder above a missing node that the user moved is found by its local ID even where a new folder took
+        // its old name (so it isn't a folder move here): a link the node turned into moved with it.
+        let behind_moved_link = |id: NodeId| -> bool {
+            let mut below = Vec::new();
+            let mut current = id;
+            for _ in 0..=MAX_TREE_DEPTH {
+                let Some(BaseEntry { name: Some(name), parent: Some(parent), .. }) = self.state.base.get(&current) else { return false };
+                below.push(name.clone());
+                current = *parent;
+                if let Some(BaseEntry { kind: BaseKind::Dir { local_id: Some(lid) }, .. }) = self.state.base.get(&current)
+                    && let Some(now) = dir_at.get(lid)
+                    && hidden(&below.iter().rev().fold(now.clone(), |p, n| p.join(n)))
+                {
+                    return true;
+                }
+            }
+            false
+        };
+        missing_files.retain(|(id, path)| !hidden(&expected(path)) && !behind_moved_link(*id));
+        missing_dirs.retain(|(id, path)| !hidden(&expected(path)) && !behind_moved_link(*id));
+        // A node the server already deleted (still tracked here while something waits for it) needs no delete.
+        missing_files.retain(|(id, _)| self.state.remote.contains_key(id));
+        missing_dirs.retain(|(id, _)| self.state.remote.contains_key(id));
         let moved_targets: BTreeSet<RelPath> =
             file_moves.iter().map(|(_, _, to, _)| to.clone()).chain(dir_moves.iter().map(|(_, _, to)| to.clone())).collect();
 
@@ -199,8 +256,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         }
         // Edits.
         for (id, path, _) in &modified {
-            let Some(BaseEntry { kind: BaseKind::File { version: expected, .. }, .. }) = self.state.base.get(id).cloned() else { continue };
-            let Some((version, size, meta, hash)) = self.upload(path, report).await? else { continue };
+            let Some(BaseEntry { kind: BaseKind::File { version: expected, exec, .. }, .. }) = self.state.base.get(id).cloned() else { continue };
+            let Some((version, size, meta, hash)) = self.upload(path, exec, report).await? else { continue };
             ops.push((Op::Update { node: *id, expected, version: version.clone() }, Effect::Update { id: *id, version, size, meta, hash }));
         }
         // New files.
@@ -209,7 +266,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 continue;
             }
             let (Some(name), Some(parent)) = (path.file_name().cloned(), parent_id(path, &new_ids)) else { continue };
-            let Some((version, size, meta, hash)) = self.upload(path, report).await? else { continue };
+            let Some((version, size, meta, hash)) = self.upload(path, false, report).await? else { continue };
             let id = NodeId::generate();
             ops.push((
                 Op::Create { node: id, parent, name: name.clone(), version: version.clone() },
@@ -218,14 +275,19 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         }
         // Deletes, files first then folders deepest first, unless the guard holds them back.
         let synced_files = self.state.base.values().filter(|e| matches!(e.kind, BaseKind::File { .. })).count();
-        if self.config.too_many_deletes(missing_files.len(), synced_files) && !self.approved_deletes {
-            report.pending_deletes.extend(missing_files.iter().map(|(_, p)| p.clone()));
-        } else {
-            for (id, path) in &missing_files {
-                if let Some(BaseEntry { kind: BaseKind::File { version, .. }, .. }) = self.state.base.get(id) {
-                    ops.push((Op::Delete { node: *id, expected: Some(*version) }, Effect::Delete { id: *id, path: path.clone() }));
-                }
+        // Above the guard's thresholds only approved deletions go; the rest (and the folders) wait.
+        let guarded = self.config.too_many_deletes(missing_files.len(), synced_files);
+        let (going, waiting): (Vec<_>, Vec<_>) = missing_files.iter().partition(|(id, _)| !guarded || self.approval.covers(*id));
+        for (id, path) in &waiting {
+            report.pending_deletes.push(path.clone());
+            report.pending_nodes.push(*id);
+        }
+        for (id, path) in going {
+            if let Some(BaseEntry { kind: BaseKind::File { version, .. }, .. }) = self.state.base.get(id) {
+                ops.push((Op::Delete { node: *id, expected: Some(*version) }, Effect::Delete { id: *id, path: path.clone() }));
             }
+        }
+        if waiting.is_empty() {
             missing_dirs.sort_by_key(|(_, p)| std::cmp::Reverse(p.depth()));
             for (id, path) in &missing_dirs {
                 ops.push((Op::Delete { node: *id, expected: None }, Effect::Delete { id: *id, path: path.clone() }));
@@ -240,7 +302,16 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// Uploads a file's content: chunks it as a stream, asks which chunks the server lacks, and sends those,
     /// read back by range and checked against their IDs. `None` when the file can't be uploaded this pass:
     /// it changed while being read (tried again next pass) or it can't be read at all (reported as skipped).
-    async fn upload(&mut self, path: &RelPath, report: &mut Report) -> Result<Option<(NewVersion, u64, FileMeta, FileHash)>, SyncError> {
+    ///
+    /// The version is executable as the file is here, or, on a filesystem without an executable bit (Windows), as
+    /// `base_exec` says (the base's bit for an edit, false for a new file): an edit there never clears the bit a
+    /// Unix machine gave the file.
+    async fn upload(
+        &mut self,
+        path: &RelPath,
+        base_exec: bool,
+        report: &mut Report,
+    ) -> Result<Option<(NewVersion, u64, FileMeta, FileHash)>, SyncError> {
         let Some(FsKind::File(before)) = self.stat(path)? else { return Ok(None) };
         let mut pieces: Vec<(ChunkId, u64, usize)> = Vec::new();
         let chunked = self.fs.open(path).and_then(|reader| {
@@ -292,7 +363,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             Manifest::new(params, summary.size, FileHash::from_bytes(summary.file_hash), refs).map_err(|e| SyncError::Corrupt(e.to_string()))?;
         self.transport.put_manifest(&manifest.id(), Bytes::from(manifest.encode())).await?;
         report.uploaded.push(path.clone());
-        let version = NewVersion { id: VersionId::generate(), manifest: manifest.id(), mtime_ms: before.mtime_ms, exec: before.exec };
+        let exec = if self.fs.has_exec_bit() { before.exec } else { base_exec };
+        let version = NewVersion { id: VersionId::generate(), manifest: manifest.id(), mtime_ms: before.mtime_ms, exec };
         Ok(Some((version, summary.size, before, FileHash::from_bytes(summary.file_hash))))
     }
 
@@ -347,10 +419,20 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                         }
                         let refused: BTreeSet<usize> = conflicts.iter().map(|c| c.op).filter(|i| !fixable.contains_key(i)).collect();
                         // An edit to a file the server deleted that still can't go up (its folder can't come back
-                        // where it was, say): forget the node, and the next pass uploads the file as a new one.
+                        // where it was, say), or a move of such a file (which can never apply): forget the node, and
+                        // the next pass uploads the file as a new one.
                         let mut forgot = false;
                         for i in &refused {
-                            if let Some((Op::Update { node, .. }, _)) = batch.get(*i)
+                            let node = match batch.get(*i) {
+                                Some((Op::Update { node, .. }, _)) => Some(node),
+                                Some((Op::Move { node, .. }, _))
+                                    if matches!(self.state.base.get(node).map(|e| &e.kind), Some(BaseKind::File { .. })) =>
+                                {
+                                    Some(node)
+                                }
+                                _ => None,
+                            };
+                            if let Some(node) = node
                                 && !self.state.remote.contains_key(node)
                             {
                                 self.state.base.remove(node);

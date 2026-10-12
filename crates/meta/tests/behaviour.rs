@@ -709,7 +709,11 @@ async fn big_manifests_are_checked_in_batches(meta: &Meta) {
     let (m, ids) = big_manifest(50_000);
     let started = std::time::Instant::now();
     match meta.add_manifest(u.space, &m, 100, NOW).await {
-        Err(MetaError::MissingChunks(missing)) => assert_eq!(missing, ids),
+        Err(MetaError::MissingChunks(missing)) => {
+            // Listed up to the API's limit, in order.
+            assert_eq!(missing.len(), craft_cloud_proto::api::MAX_MISSING_IDS);
+            assert_eq!(missing, ids[..craft_cloud_proto::api::MAX_MISSING_IDS]);
+        }
         other => panic!("expected MissingChunks, got {other:?}"),
     }
     let took = started.elapsed();

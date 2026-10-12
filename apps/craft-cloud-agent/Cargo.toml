@@ -1,0 +1,37 @@
+[package]
+name = "craft-cloud-agent"
+description = "The Craft Cloud sync agent: keeps a folder on this computer in step with a Craft Cloud server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+clap.workspace = true
+craft-cloud-proto.workspace = true
+craft-cloud-sync.workspace = true
+file-id.workspace = true
+getrandom.workspace = true
+jiff.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
+rustix.workspace = true
+
+[dev-dependencies]
+craft-cloud-meta.workspace = true
+craft-cloud-server.workspace = true
+craft-cloud-store.workspace = true
+craft-cloud-sync = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
