@@ -162,6 +162,28 @@ mod tests {
         assert_eq!(serde_json::from_value::<Op>(json).unwrap(), op);
     }
 
+    /// Clients split commits by operation count only, so the largest batch they can send must fit the server's
+    /// body limit: `MAX_BATCH_OPS` of the largest operation (a move naming two longest names; names need no JSON
+    /// escapes, since `"`, `\` and control characters are refused), with the largest numbers, as compact JSON.
+    #[test]
+    fn a_full_batch_of_the_largest_ops_fits_the_body_limit() {
+        use crate::api::CommitRequest;
+        use crate::limits::{MAX_BATCH_JSON_BYTES, MAX_BATCH_OPS, MAX_NAME_BYTES};
+        // JSON carries a name's UTF-8 bytes as they are, so any longest name is as long as JSON.
+        let name = Name::new(&"x".repeat(MAX_NAME_BYTES)).unwrap();
+        let mv = Op::Move { node: node(u128::MAX), from_parent: node(u128::MAX), from_name: name.clone(), parent: node(u128::MAX), name: name.clone() };
+        let version = NewVersion {
+            id: VersionId::from_uuid(Uuid::from_u128(u128::MAX)),
+            manifest: crate::ManifestId::from_bytes([0xff; 32]),
+            mtime_ms: i64::MIN,
+            exec: false,
+        };
+        let create = Op::Create { node: node(u128::MAX), parent: node(u128::MAX), name, version };
+        let largest = [mv, create].into_iter().max_by_key(|op| serde_json::to_vec(op).unwrap().len()).unwrap();
+        let body = serde_json::to_vec(&CommitRequest { ops: vec![largest; MAX_BATCH_OPS] }).unwrap();
+        assert!(body.len() <= MAX_BATCH_JSON_BYTES, "{} bytes", body.len());
+    }
+
     #[test]
     fn invalid_names_in_ops_are_rejected_on_the_way_in() {
         let json = serde_json::json!({ "op": "mkdir", "node": node(1), "parent": node(2), "name": "a/b" });
