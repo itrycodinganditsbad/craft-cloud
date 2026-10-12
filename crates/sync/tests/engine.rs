@@ -800,6 +800,31 @@ async fn a_tracked_folder_or_file_that_became_a_link_is_never_deleted() {
     assert!(report.removed_remotely.is_empty(), "{report:?}");
 }
 
+/// Both machines rename a file and save the same new content into it (the same edit made twice; the save makes
+/// a new file, so the desktop can't match it to the old one by file ID). The desktop finds the server's version
+/// already where the server has it: it is adopted, with no conflict copy.
+#[tokio::test]
+async fn the_same_rename_and_edit_on_both_sides_makes_no_conflict_copy() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "a.txt", b"draft");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().rename(&path("a.txt"), &path("final.txt")).unwrap();
+    a.sync_once().await.unwrap();
+    write(&mut a, "final.txt", b"final text");
+    a.sync_once().await.unwrap();
+    b.fs_mut().remove_file(&path("a.txt")).unwrap();
+    write(&mut b, "final.txt", b"final text");
+    let report = b.sync_once().await.unwrap();
+    assert!(report.conflict_copies.is_empty() && report.downloaded.is_empty(), "{report:?}");
+    settle(&mut [&mut a, &mut b], 5).await;
+    for m in [&a, &b] {
+        assert_eq!(files(m), vec![("final.txt".to_owned(), b"final text".to_vec())]);
+    }
+}
+
 /// A clip replaced by a link, then its folder renamed: the link moved with the folder, so the clip is still not
 /// gone. The folder's move goes up, the clip's node stays, and once the clip is real again it syncs where it is.
 #[tokio::test]

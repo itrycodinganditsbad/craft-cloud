@@ -378,6 +378,18 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         }
         // Edited there, deleted here: the edit wins.
         self.settle_occupants(id, &rpath, None, report).await?;
+        // Already at the server's place with the server's content, untracked (the same move and edit made on both
+        // sides, or put there again after a pass that crashed before saving its state): adopted, not copied.
+        if !self.state.base_index().contains_key(&rpath)
+            && let Some((meta, hash)) = self.same_content(file, &rpath).await?
+        {
+            if let Some(twin) = self.case_twin(&rpath)? {
+                self.move_aside(&twin, report)?;
+            }
+            new_entry.kind = self.base_file(file, meta, hash);
+            self.state.base.insert(id, new_entry);
+            return Ok(());
+        }
         self.ensure_free(&rpath, report)?;
         // Saved here meanwhile: the old version stays in the base, so the next pass sees an edit on both sides.
         if let Some((meta, hash)) = self.download(file, &rpath, None, report).await? {
