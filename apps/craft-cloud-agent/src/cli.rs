@@ -12,8 +12,8 @@
 //! another, another agent is running) or an account-level problem where trying again never helps (the device was
 //! revoked or signed out, `state.json` belongs to another account, the server speaks another protocol or chunker,
 //! answers something this agent can't read, or it or a reverse proxy in front of it refuses a request with
-//! another 4xx status, `account.json` or `state.json` is damaged or was written by a newer agent: move the file
-//! away or update).
+//! another 4xx status, the server sent damaged data (a chunk or manifest that fails its hash), `account.json` or
+//! `state.json` is damaged or was written by a newer agent: move the file away or update).
 //!
 //! A crash or kill during `login`, after the server created the device and before the account was saved, can
 //! leave a device registered that nothing here uses; an admin can revoke it (`craft-cloud-server device ...`).
@@ -43,7 +43,7 @@ use crate::root::{self, RootError, RootMarker};
                   3 stopped, needs you (folder or its marker missing, another space, data folder and synced folder \
                   inside one another, another agent running, \
                   device revoked, state of another account, server protocol mismatch or a request the server or a proxy \
-                  refused, damaged or newer account/state files)."
+                  refused, damaged data from the server, damaged or newer account/state files)."
 )]
 pub struct Cli {
     /// Where the agent keeps its sign-in and sync state. Default: $CRAFT_CLOUD_AGENT_DIR, else the per-user data
@@ -124,8 +124,9 @@ impl Exit {
 impl AgentError {
     /// The exit code for this error: [`Exit::NeedsYou`] for a safety stop and for an account-level problem where
     /// trying again never helps (the device was revoked, `state.json` is another account's, the server speaks
-    /// another protocol or chunker, a file is from a newer agent); [`Exit::Failed`] for anything that may pass
-    /// by itself (offline, a server error, a timeout) or that the message fixes (a wrong password, a usage error).
+    /// another protocol or chunker, a file is from a newer agent, the server sent damaged data or the saved state
+    /// doesn't hold together); [`Exit::Failed`] for anything that may pass by itself (offline, a server error, a
+    /// timeout) or that the message fixes (a wrong password, a usage error).
     pub fn exit(&self) -> Exit {
         match self {
             AgentError::Root(_)
@@ -134,6 +135,7 @@ impl AgentError {
             | AgentError::Revoked
             | AgentError::OtherAccountState(_)
             | AgentError::Server(TransportError::Protocol(_))
+            | AgentError::Sync(SyncError::Corrupt(_))
             | AgentError::Account(AccountError::Newer { .. } | AccountError::Damaged { .. }) => Exit::NeedsYou,
             _ => Exit::Failed,
         }
@@ -681,6 +683,9 @@ mod tests {
         assert_eq!(AgentError::Account(newer).exit(), Exit::NeedsYou);
         let damaged = AccountError::Damaged { path: PathBuf::from("s"), message: "x".into() };
         assert_eq!(AgentError::Account(damaged).exit(), Exit::NeedsYou);
+        assert_eq!(AgentError::from(SyncError::Corrupt("chunk x of a.txt is damaged".into())).exit(), Exit::NeedsYou);
+        let io = SyncError::Io { path: "a.txt".into(), source: std::io::Error::other("x") };
+        assert_eq!(AgentError::from(io).exit(), Exit::Failed);
         assert_eq!(AgentError::Server(TransportError::NotFound).exit(), Exit::Failed);
         assert_eq!(AgentError::WrongPassword.exit(), Exit::Failed);
         assert_eq!(AgentError::NotSignedIn.exit(), Exit::Failed);
