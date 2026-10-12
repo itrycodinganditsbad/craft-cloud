@@ -18,9 +18,11 @@ use super::{Effect, Engine, MISSING_QUERY_IDS, Report, SyncError, per_node};
 impl<F: Fs, T: Transport> Engine<F, T> {
     pub(super) async fn push(&mut self, report: &mut Report) -> Result<(), SyncError> {
         let root = self.state.root.ok_or_else(|| SyncError::Corrupt("no root".into()))?;
-        let (local, unknown) = self.scan(report)?;
-        // Inside a folder that couldn't be listed nothing is known, so nothing tracked there is missing.
-        let hidden = |path: &RelPath| unknown.iter().any(|u| path.starts_with(u));
+        let (local, unseen) = self.scan(report)?;
+        // Inside a folder that couldn't be listed, or at or below a link, nothing is known, so nothing tracked there
+        // is missing. Judged where the node is expected now: a link moves with a folder the user renamed.
+        let hidden = |path: &RelPath| unseen.hides(path);
+        let unknown = &unseen.unknown;
         let index = self.state.base_index();
         // Folders that moved: a missing base folder whose local ID turns up at an untracked path.
         let untracked_dirs: HashMap<u64, RelPath> = local

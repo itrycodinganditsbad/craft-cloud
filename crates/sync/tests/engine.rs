@@ -800,6 +800,28 @@ async fn a_tracked_folder_or_file_that_became_a_link_is_never_deleted() {
     assert!(report.removed_remotely.is_empty(), "{report:?}");
 }
 
+/// A clip replaced by a link, then its folder renamed: the link moved with the folder, so the clip is still not
+/// gone. The folder's move goes up, the clip's node stays, and once the clip is real again it syncs where it is.
+#[tokio::test]
+async fn a_file_that_became_a_link_in_a_folder_the_user_renamed_is_never_deleted() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.removed_remotely.is_empty() && report.pending_deletes.is_empty(), "{report:?}");
+    assert_eq!(report.moved_remotely, vec![(path("Footage"), path("Clips"))]);
+    // The other machine renames, and deletes nothing.
+    let report = b.sync_once().await.unwrap();
+    assert!(report.removed_locally.is_empty(), "{report:?}");
+    assert_eq!(read(&b, "Clips/c0.mov"), b"clip");
+    // The clip comes back, edited meanwhile on the other drive.
+    a.fs_mut().remove_file(&path("Clips/c0.mov")).unwrap();
+    write(&mut a, "Clips/c0.mov", b"clip, graded");
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(read(&b, "Clips/c0.mov"), b"clip, graded");
+    assert_eq!(files(&a), files(&b));
+}
+
 /// Two machines with a folder of three clips, a notes file and padding (so the mass-delete guard doesn't hide a
 /// wrong delete).
 async fn linked_setup() -> (Server, common::Machine, common::Machine) {

@@ -15,7 +15,7 @@
 //!
 //! Nothing local is ever deleted unless the base says the server deleted exactly what is on disk.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
 
 use craft_cloud_chunker::{Chunker, FASTCDC_V1};
@@ -171,6 +171,36 @@ enum Local {
     Unchanged,
     Modified,
     Missing,
+}
+
+/// What a scan couldn't see into this pass. Nothing tracked there counts as missing, so the push never deletes it
+/// on the server.
+struct Unseen {
+    /// Folders whose contents are unknown: ones that can't be listed (or vanished while the scan ran) and ones
+    /// nested deeper than the tree allows. A new folder among them isn't created on the server until it can be.
+    unknown: Vec<RelPath>,
+    /// Links and special files, by folder and folded name. A tracked file or folder that turned into one (a folder
+    /// moved to another drive with a link left behind), or whose name this computer now spells differently, isn't
+    /// gone, and neither is anything tracked below it.
+    links: HashSet<(RelPath, FoldKey)>,
+}
+
+impl Unseen {
+    /// Whether `path` (where a tracked node is expected now, after the folder moves the scan found) is in a folder
+    /// whose contents are unknown, or is a link or below one.
+    fn hides(&self, path: &RelPath) -> bool {
+        if self.unknown.iter().any(|u| path.starts_with(u)) {
+            return true;
+        }
+        let mut prefix = RelPath::root();
+        for name in path.names() {
+            if self.links.contains(&(prefix.clone(), name.fold_key())) {
+                return true;
+            }
+            prefix = prefix.join(name);
+        }
+        false
+    }
 }
 
 /// What to record when an operation commits.
@@ -399,15 +429,13 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// The folder as a map from path to entry, without ignored, invalid, clashing or special entries.
     /// When two names in a folder clash by case, the tracked one wins and the other is skipped.
     ///
-    /// Also returns the folders whose contents are unknown this pass: ones that can't be listed (or vanished
-    /// while the scan ran) and ones nested deeper than the tree allows. Nothing tracked inside them counts as
-    /// missing. Only a sync root that can't be listed fails the scan.
-    fn scan(&self, report: &mut Report) -> Result<(BTreeMap<RelPath, FsKind>, Vec<RelPath>), SyncError> {
+    /// Also returns what the scan couldn't see into (see [`Unseen`]). Only a sync root that can't be listed fails
+    /// the scan.
+    fn scan(&self, report: &mut Report) -> Result<(BTreeMap<RelPath, FsKind>, Unseen), SyncError> {
         let tracked = self.state.base_index();
-        // Tracked paths by folder and folded name, built when the first link turns up.
-        let mut tracked_by_fold: Option<HashMap<(RelPath, FoldKey), RelPath>> = None;
         let mut out = BTreeMap::new();
         let mut unknown = Vec::new();
+        let mut links = HashSet::new();
         let mut queue = vec![RelPath::root()];
         while let Some(dir) = queue.pop() {
             let mut entries = match self.fs.list(&dir) {
@@ -439,16 +467,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 match entry.kind {
                     FsKind::Other => {
                         report.skipped.push((shown, OTHER_REASON.into()));
-                        // A tracked file or folder that turned into a link or a special file (a folder moved to
-                        // another drive with a link left behind), or whose name this computer now spells
-                        // differently, isn't gone: its node and everything tracked below it are unknown this pass,
-                        // so nothing is deleted on the server.
-                        let by_fold = tracked_by_fold.get_or_insert_with(|| {
-                            tracked.keys().filter_map(|p| Some(((p.parent()?, p.file_name()?.fold_key()), p.clone()))).collect()
-                        });
-                        if let Some(was) = by_fold.get(&(dir.clone(), name.fold_key())) {
-                            unknown.push(was.clone());
-                        }
+                        links.insert((dir.clone(), name.fold_key()));
                     }
                     FsKind::Dir { .. } if path.depth() > MAX_TREE_DEPTH => {
                         report.skipped.push((shown, "folders nest too deep".into()));
@@ -464,7 +483,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 }
             }
         }
-        Ok((out, unknown))
+        Ok((out, Unseen { unknown, links }))
     }
 
     fn stat(&self, path: &RelPath) -> Result<Option<FsKind>, SyncError> {
