@@ -5,6 +5,9 @@
 //! 1. **Convergence**: every machine ends with exactly the same files and folders.
 //! 2. **Nothing the engine saw is lost**: every file content that was on a disk when a pass started is still
 //!    on some disk or in the server's version history, unless a user overwrote or deleted it themselves.
+//! 3. **Nothing live is deleted**: stricter, every such content is still a file on some machine's disk (history
+//!    alone doesn't count), so a remote delete never wins over an edit.
+//! 4. **Nothing is stuck**: after settling, the only files left out of sync are case twins of a synced name.
 //!
 //! It also checks after every finished pass that each node a machine tracks still has a place in its folder.
 //!
@@ -66,15 +69,17 @@ fn hashes_of(m: &Machine) -> BTreeSet<FileHash> {
     m.fs().files().values().map(|d| FileHash::from_bytes(*blake3::hash(d).as_bytes())).collect()
 }
 
+/// The engine's skip reason for a name that clashes by case with one it syncs (`Engine::scan`).
+fn is_case_clash(reason: &str) -> bool {
+    reason.starts_with("the name clashes with ") && reason.ends_with(" when case is ignored")
+}
+
 /// One random user action on a machine's folder. Failures (target exists, parent missing) are ignored,
 /// like a user's failed click.
 fn act(rng: &mut Rng, m: &mut Machine, destroyed: &mut BTreeSet<FileHash>) {
-    let mut destroy = |m: &Machine, p: &RelPath| {
-        // Straight from memory: a locked file is still overwritten or deleted by its user.
-        if let Some(old) = m.fs().files().get(p) {
-            destroyed.insert(FileHash::from_bytes(*blake3::hash(old).as_bytes()));
-        }
-    };
+    // The content at `p`, read straight from memory: a locked file is still overwritten or deleted by its user.
+    // It counts as destroyed only once the user's write or delete went through.
+    let old = |m: &Machine, p: &RelPath| m.fs().files().get(p).map(|d| FileHash::from_bytes(*blake3::hash(d).as_bytes()));
     let dirs: Vec<RelPath> = m.fs().dirs();
     let files = files_of(m);
     match rng.below(10) {
@@ -84,27 +89,34 @@ fn act(rng: &mut Rng, m: &mut Machine, destroyed: &mut BTreeSet<FileHash>) {
             let target = rel(&format!("{dir}/{name}"));
             let data = rng.bytes();
             if !matches!(m.fs().stat(&target), Ok(Some(FsKind::Dir { .. }))) {
-                destroy(m, &target);
-                let _ = m.fs_mut().write(&target, &data, false, 0);
+                let before = old(m, &target);
+                if m.fs_mut().write(&target, &data, false, 0).is_ok() {
+                    destroyed.extend(before);
+                }
             }
         }
         2 | 3 => {
             if let Some(f) = rng.pick(&files).cloned() {
                 let data = rng.bytes();
-                destroy(m, &f);
-                let _ = m.fs_mut().write(&f, &data, false, 0);
+                let before = old(m, &f);
+                if m.fs_mut().write(&f, &data, false, 0).is_ok() {
+                    destroyed.extend(before);
+                }
             }
         }
         4 => {
             if let Some(f) = rng.pick(&files).cloned() {
-                destroy(m, &f);
-                let _ = m.fs_mut().remove_file(&f);
+                let before = old(m, &f);
+                if m.fs_mut().remove_file(&f).is_ok() {
+                    destroyed.extend(before);
+                }
             }
         }
         5 => {
             if let Some(f) = rng.pick(&files).cloned() {
                 let dir = if rng.below(2) == 0 { RelPath::root() } else { rel(rng.pick(DIRS).copied().unwrap_or("y")) };
                 let name = rng.pick(NAMES).copied().unwrap_or("b.txt");
+                // A rename never replaces anything (it fails when the target exists), so it destroys nothing.
                 let _ = m.fs_mut().rename(&f, &rel(&format!("{dir}/{name}")));
             }
         }
@@ -185,6 +197,7 @@ async fn run(seed: u64, steps: usize) {
     }
     let mut quiet = false;
     let mut skipped: Vec<BTreeSet<RelPath>> = vec![BTreeSet::new(); ms.len()];
+    let mut last_skips: BTreeMap<usize, Vec<(String, String)>> = BTreeMap::new();
     for _ in 0..40 {
         let mut changed = false;
         for (i, m) in ms.iter_mut().enumerate() {
@@ -192,8 +205,9 @@ async fn run(seed: u64, steps: usize) {
             let report = m.sync_once().await.unwrap_or_else(|e| panic!("seed {seed}: {e}"));
             changed |= report.changed() || !report.pending_deletes.is_empty();
             if let Some(s) = skipped.get_mut(i) {
-                *s = report.skipped.iter().map(|(p, _)| rel(p)).collect();
+                *s = report.skipped.iter().filter(|(_, why)| is_case_clash(why)).map(|(p, _)| rel(p)).collect();
             }
+            last_skips.insert(i, report.skipped.clone());
         }
         if !changed {
             quiet = true;
@@ -202,7 +216,15 @@ async fn run(seed: u64, steps: usize) {
     }
     assert!(quiet, "seed {seed}: the machines never settled");
 
-    // Files the engine refused to sync (with a reported reason, e.g. a name that clashes by case) stay local.
+    // The only skip that may remain once everything settled (no locks, deletes approved) is a name that
+    // clashes by case with a synced one; it legitimately stays local. Anything else is a stuck file.
+    for (i, skips) in &last_skips {
+        for (path, reason) in skips {
+            assert!(is_case_clash(reason), "seed {seed}: machine {i} still skips {path} after settling: {reason}");
+        }
+    }
+
+    // Case twins the engine refused to sync stay local (no other skip is left, checked above).
     let synced = |i: usize, m: &Machine| -> BTreeMap<RelPath, Vec<u8>> {
         let skip = skipped.get(i).cloned().unwrap_or_default();
         m.fs().files().into_iter().filter(|(p, _)| !skip.iter().any(|s| p.starts_with(s))).collect()
@@ -219,12 +241,19 @@ async fn run(seed: u64, steps: usize) {
             reference_dirs.iter().filter(|d| !skipped.first().is_some_and(|s0| s0.iter().any(|s| d.starts_with(s)))).cloned().collect();
         assert_eq!(dirs, ref_dirs, "seed {seed}: machine {i} has different folders");
     }
-    let mut kept: BTreeSet<FileHash> = server.history_hashes().await;
+    let mut on_disk: BTreeSet<FileHash> = BTreeSet::new();
     for m in &ms {
-        kept.extend(hashes_of(m));
+        on_disk.extend(hashes_of(m));
     }
+    let mut kept: BTreeSet<FileHash> = server.history_hashes().await;
+    kept.extend(on_disk.iter().copied());
     let lost: Vec<&FileHash> = seen.difference(&kept).filter(|h| !destroyed.contains(*h)).collect();
     assert!(lost.is_empty(), "seed {seed}: file versions the engine saw were lost: {lost:?}");
+    // Stricter: the server's history keeps every uploaded version, so the check above can't see an engine
+    // that uploads an edit and then lets a remote delete remove it everywhere. Content no user overwrote or
+    // deleted must still be a file on some machine (conflict copies and case twins are files too).
+    let gone: Vec<&FileHash> = seen.difference(&on_disk).filter(|h| !destroyed.contains(*h)).collect();
+    assert!(gone.is_empty(), "seed {seed}: file contents no user overwrote or deleted are on no machine: {gone:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
