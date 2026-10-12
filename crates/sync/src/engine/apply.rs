@@ -333,6 +333,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             } else if !moved {
                 // Deleted here: the push sends the delete.
                 return Ok(());
+            } else if let Some(link) = self.link_in_place_of(id)? {
+                // It turned into a link, and the user moved its folder (the link went with it): it isn't gone,
+                // and the server's move waits until it is a real file or folder again.
+                return Err(io_err(&link, std::io::Error::other(OTHER_REASON)));
             }
             // Otherwise it was deleted here too, and the push sends the delete; the base follows the server's
             // location so it stays reachable if its old parent goes away.
@@ -557,6 +561,31 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             let (Some(name), Some(parent)) = (entry.name.clone(), entry.parent) else { return Ok(None) };
             below.push(name);
             current = parent;
+        }
+        Ok(None)
+    }
+
+    /// The link or special file the tracked node `id` turned into, if any, found like [`Engine::locate`] does
+    /// through the nearest folder above it that is found by its local ID (the user moved that folder, and the link
+    /// went with it). Its own place is checked before a change is applied (see `link_on_the_way`).
+    fn link_in_place_of(&self, id: NodeId) -> Result<Option<RelPath>, SyncError> {
+        let mut below: Vec<Name> = Vec::new();
+        let mut current = id;
+        for _ in 0..=MAX_TREE_DEPTH {
+            let Some(BaseEntry { name: Some(name), parent: Some(parent), .. }) = self.state.base.get(&current) else { return Ok(None) };
+            below.push(name.clone());
+            current = *parent;
+            let Some(BaseEntry { kind: BaseKind::Dir { local_id: Some(lid) }, .. }) = self.state.base.get(&current) else { continue };
+            let Some(mut path) = self.find_local(*lid)? else { continue };
+            for name in below.iter().rev() {
+                path = path.join(name);
+                match self.stat(&path)? {
+                    Some(FsKind::Other) => return Ok(Some(path)),
+                    Some(FsKind::Dir { .. }) => {}
+                    _ => return Ok(None),
+                }
+            }
+            return Ok(None);
         }
         Ok(None)
     }

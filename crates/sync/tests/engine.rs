@@ -869,6 +869,29 @@ async fn a_file_that_became_a_link_in_a_folder_moved_away_is_never_deleted() {
     assert_eq!(read(&b, "Clips/c0.mov"), b"clip");
 }
 
+/// A clip replaced by a link, its folder renamed here, and the clip renamed on the other machine: the server's
+/// rename can't find the clip by its file ID (it is a link), but it is in the renamed folder, so it isn't taken
+/// for deleted. The rename waits until the clip is real again.
+#[tokio::test]
+async fn a_server_rename_of_a_file_that_became_a_link_in_a_renamed_folder_waits() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    b.fs_mut().rename(&path("Footage/c0.mov"), &path("Footage/c9.mov")).unwrap();
+    b.sync_once().await.unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty() && report.pending_deletes.is_empty(), "{report:?}");
+    }
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "Clips/c9.mov"), b"clip");
+    a.fs_mut().remove_file(&path("Clips/c0.mov")).unwrap();
+    write(&mut a, "Clips/c0.mov", b"clip");
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&a), files(&b));
+    assert_eq!(read(&a, "Clips/c9.mov"), b"clip");
+}
+
 /// Two machines with a folder of three clips, a notes file and padding (so the mass-delete guard doesn't hide a
 /// wrong delete).
 async fn linked_setup() -> (Server, common::Machine, common::Machine) {
