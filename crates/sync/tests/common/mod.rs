@@ -38,6 +38,12 @@ impl Server {
     }
 
     /// The whole-file hash of every version the server ever stored, for "nothing was lost" checks.
+    ///
+    /// These are the versions of the commits the transport saw succeed (recorded when `Meta::commit` returns
+    /// Ok, before a reply is lost on purpose; refused commits store nothing, a batch applies all or none), not a
+    /// read of the server's versions table: `craft-cloud-meta` has no history listing yet. So this trusts the
+    /// metadata store to keep every version it accepted (its own tests cover that). The check is about the
+    /// engine: content it saw must stay on a disk or in a version the server accepted.
     pub async fn history_hashes(&self) -> BTreeSet<FileHash> {
         let ids: Vec<ManifestId> = self.committed.lock().unwrap().iter().copied().collect();
         let mut out = BTreeSet::new();
