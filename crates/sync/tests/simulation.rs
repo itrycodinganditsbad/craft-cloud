@@ -445,6 +445,8 @@ async fn run(seed: u64, steps: usize) {
             let locked_before = unreadable(m);
             let link_seen = find_link(m).is_some();
             let tracked_before = m.state().base_index();
+            // Tracked paths with nothing on disk before the pass (a folder the user renamed away, say).
+            let gone_before: BTreeSet<RelPath> = tracked_before.keys().filter(|p| matches!(m.fs().stat(p), Ok(None))).cloned().collect();
             let r = m.sync_once().await;
             if std::env::var("SIM_TRACE").is_ok() {
                 eprintln!("TRACE step {step} m{i} sync: {r:?}\n  files {}\n  dirs {:?}", listing(m), m.fs().dirs());
@@ -457,15 +459,15 @@ async fn run(seed: u64, steps: usize) {
                 // the link (with a folder holding it) into a folder that can't be listed: the engine can't see it,
                 // and a tracked folder moved there looks deleted (a known gap, see the design's engine rules). Or
                 // unless the user renamed a folder above the link while the server put something new in it: the
-                // engine makes the folder again at its old place for that (it is the tracked folder there, path
-                // first), so the renamed one is a new folder to it and the link in it isn't the tracked file (also
+                // engine makes the folder again at its old place for that (a folder it tracked before the pass and
+                // that was missing from disk then; it is the tracked folder there, path first), so the renamed one is a new folder to it and the link in it isn't the tracked file (also
                 // a known gap: the file goes up as a new one once it is real again, and history keeps the old one).
                 if let Some(Some(linked)) = links.get(i)
                     && link_seen
                 {
                     for gone in &report.removed_remotely {
                         let node = tracked_before.get(gone);
-                        let remade_above = report.created_dirs.iter().any(|d| gone.starts_with(d) && d != gone);
+                        let remade_above = report.created_dirs.iter().any(|d| gone.starts_with(d) && d != gone && gone_before.contains(d));
                         assert!(
                             remade_above || !node.is_some_and(|id| linked.nodes.contains(id)),
                             "seed {seed} step {step}: m{i} deleted {gone} on the server, which it tracks behind a link"
