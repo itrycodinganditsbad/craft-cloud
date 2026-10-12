@@ -529,6 +529,14 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 }
             }
         }
+        // The target of a landing that hasn't finished (its file is moved aside until recovery puts it back) is
+        // unknown too: the tracked file there is never taken for deleted.
+        for path in self.fs.unsettled() {
+            if !out.contains_key(&path) {
+                report.skipped.push((path.to_string(), "an interrupted download is put right first; tried again next pass".into()));
+            }
+            unknown.push(path);
+        }
         Ok((out, Unseen { unknown, links }))
     }
 

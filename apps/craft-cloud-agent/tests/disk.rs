@@ -66,8 +66,12 @@ fn a_failed_put_back_is_finished_by_recovery() {
     let left = names(dir.path());
     assert!(!left.contains(&"a.txt".to_owned()) && left.iter().any(|n| n.ends_with(".cc-aside")), "{left:?}");
     assert!(names(&fs.tmp_dir()).iter().any(|n| n.ends_with(".landing")), "the record stays");
+    // Until recovery: the moved file isn't listed, and the empty target is unsettled (never taken for deleted).
+    assert_eq!(fs.list(&rel("")).unwrap().into_iter().map(|e| e.name).collect::<Vec<_>>(), [".craft-cloud"]);
+    assert_eq!(fs.unsettled(), [rel("a.txt")]);
     let mut fs = DiskFs::new(dir.path());
     fs.recover().unwrap();
+    assert!(fs.unsettled().is_empty());
     assert_eq!(names(dir.path()), [".craft-cloud", "a.txt"]);
     assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"the user's");
     assert_eq!(temps(&fs), 0);

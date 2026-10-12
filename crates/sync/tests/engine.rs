@@ -578,6 +578,39 @@ async fn a_file_that_cant_be_removed_doesnt_stop_the_rest() {
     assert_eq!(files(&a), files(&b));
 }
 
+/// A landing in steps fails after moving the old file aside, and putting it back fails too: the file's name is
+/// empty until the next pass's recovery. That pass's scan counts the name as unknown, so no delete goes to the
+/// server; after recovery the file is back, the server's edit lands, and nothing was deleted anywhere.
+#[tokio::test]
+async fn a_failed_put_back_never_sends_a_delete() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine_with(&server, &ana, "desktop", MemFs::new().without_swap(), 50).await;
+    write(&mut a, "notes", b"v1");
+    write(&mut a, "other", b"o");
+    settle(&mut [&mut a, &mut b], 5).await;
+    write(&mut a, "notes", b"v2");
+    a.sync_once().await.unwrap();
+
+    b.fs_mut().failing_landings(true);
+    let report = b.sync_once().await.unwrap();
+    assert!(report.skipped.iter().any(|(p, _)| p == "notes"), "{report:?}");
+    assert!(b.fs().stat(&path("notes")).unwrap().is_none(), "the name is empty until recovery");
+    // The push sends nothing for it: no delete (not even one the server would refuse), no move, no upload.
+    assert!(report.removed_remotely.is_empty() && report.refused.is_empty() && report.pending_deletes.is_empty(), "{report:?}");
+    assert!(report.moved_remotely.is_empty() && report.uploaded.is_empty() && report.conflict_copies.is_empty(), "{report:?}");
+    // Nothing was deleted or moved on the server.
+    a.sync_once().await.unwrap();
+    assert_eq!(files(&a), vec![("notes".to_owned(), b"v2".to_vec()), ("other".to_owned(), b"o".to_vec())]);
+
+    b.fs_mut().failing_landings(false);
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(read(&b, "notes"), b"v2");
+    assert_eq!(files(&a), files(&b));
+    assert_eq!(files(&b).len(), 2, "{:?}", files(&b));
+}
+
 /// A file marked read-only here (Windows) is the user saying "don't change this": the server's delete never removes
 /// it. The node is skipped with that reason and waits, nothing goes back up, and once the mark is cleared the delete
 /// lands.

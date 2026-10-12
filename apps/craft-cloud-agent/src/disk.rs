@@ -60,7 +60,7 @@
 //!   a regular file, so a folder emptied or unmounted in the middle of a pass fails the pass instead of looking
 //!   like everything was deleted.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -101,10 +101,11 @@ pub struct DiskFs {
     root: PathBuf,
     /// Whether a download may land with the system's exchange of two files (see [`DiskFs::without_swap`]).
     swap: bool,
-    /// Files moved aside by a landing in steps whose record is still pending (full paths): listings leave them out,
-    /// so the scan never uploads them (recovery puts them back or removes them). Set when a landing leaves its
-    /// record, and by [`Fs::recover`] from the records it couldn't finish.
-    pending_asides: BTreeSet<PathBuf>,
+    /// Files moved aside by a landing in steps whose record is still pending (full paths), with the landing's target:
+    /// listings leave the moved files out, so the scan never uploads them (recovery puts them back or removes them),
+    /// and the targets are [`Fs::unsettled`], so a target left empty is never taken for deleted. Set when a landing
+    /// leaves its record, and by [`Fs::recover`] from the records it couldn't finish.
+    pending_asides: BTreeMap<PathBuf, RelPath>,
     /// Faults and detours for tests of paths a real disk rarely takes.
     hooks: Hooks,
 }
@@ -629,7 +630,7 @@ fn create_temp(dir: &Path) -> io::Result<(File, PathBuf)> {
 impl DiskFs {
     /// The folder at `root`. Nothing is checked or created until the engine asks.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), swap: true, pending_asides: BTreeSet::new(), hooks: Hooks::default() }
+        Self { root: root.into(), swap: true, pending_asides: BTreeMap::new(), hooks: Hooks::default() }
     }
 
     /// Makes removing the moved file at the end of a landing in steps fail, as a disk error would: for tests that
@@ -759,7 +760,7 @@ impl DiskFs {
                 if kind_at(&aside).ok().flatten().is_none() {
                     forget(&record_path);
                 } else {
-                    self.pending_asides.insert(aside);
+                    self.pending_asides.insert(aside, path.clone());
                 }
                 return Err(match e.kind() {
                     io::ErrorKind::NotFound => LandError::Changed(writer),
@@ -775,7 +776,7 @@ impl DiskFs {
             if self.put_back(&aside, full) {
                 forget(&record_path);
             } else {
-                self.pending_asides.insert(aside);
+                self.pending_asides.insert(aside, path.clone());
             }
             return Err(LandError::Changed(writer));
         }
@@ -788,7 +789,7 @@ impl DiskFs {
                 if self.put_back(&aside, full) {
                     forget(&record_path);
                 } else {
-                    self.pending_asides.insert(aside);
+                    self.pending_asides.insert(aside, path.clone());
                 }
                 return Err(match e.kind() {
                     io::ErrorKind::AlreadyExists => LandError::Changed(writer),
@@ -813,7 +814,7 @@ impl DiskFs {
         if removal.is_ok() {
             forget(&record_path);
         } else {
-            self.pending_asides.insert(aside);
+            self.pending_asides.insert(aside, path.clone());
         }
         Ok(incoming)
     }
@@ -995,11 +996,16 @@ impl DiskFs {
         fs::remove_file(record_path).map_err(|e| named(&shown, e))
     }
 
-    /// The full path of the file moved aside that the landing record at `record_path` names, if it can be read.
-    fn aside_of(&self, record_path: &Path) -> Option<PathBuf> {
+    /// The full path of the file moved aside that the landing record at `record_path` names, and the landing's
+    /// target, if the record can be read.
+    fn aside_of(&self, record_path: &Path) -> Option<(PathBuf, RelPath)> {
         let record: LandingRecord = serde_json::from_slice(&fs::read(record_path).ok()?).ok()?;
-        let aside = craft_cloud_sync::rel(&record.target).parent()?.join(&Name::new(&record.aside).ok()?);
-        Some(self.full(&aside))
+        let target = craft_cloud_sync::rel(&record.target);
+        if target.to_string() != record.target || target.is_root() {
+            return None;
+        }
+        let aside = target.parent()?.join(&Name::new(&record.aside).ok()?);
+        Some((self.full(&aside), target))
     }
 
     /// Puts right what the landing `record` describes; see [`DiskFs::recover_landing`].
@@ -1196,7 +1202,7 @@ impl Fs for DiskFs {
             let entry = entry?;
             let path = entry.path();
             // A file a landing in steps moved aside, whose landing isn't finished: recovery's, never synced.
-            if self.pending_asides.contains(&path) {
+            if self.pending_asides.contains_key(&path) {
                 continue;
             }
             let (name, readable) = match entry.file_name().into_string() {
@@ -1359,6 +1365,10 @@ impl Fs for DiskFs {
         }
     }
 
+    fn unsettled(&self) -> Vec<RelPath> {
+        self.pending_asides.values().cloned().collect()
+    }
+
     /// Goes through the landing and swap records in the temporary folder (see [`DiskFs::land_in_steps`] and
     /// [`DiskFs::land_by_exchange`]). A record that can't be read or acted on stays for the next pass; the first error
     /// is returned once all were tried.
@@ -1370,9 +1380,9 @@ impl Fs for DiskFs {
             let path = entry?.path();
             let result = match path.extension() {
                 Some(ext) if ext == LANDING_EXT => self.recover_landing(&path).inspect_err(|_| {
-                    // Still pending: its moved file stays out of listings.
-                    if let Some(aside) = self.aside_of(&path) {
-                        self.pending_asides.insert(aside);
+                    // Still pending: its moved file stays out of listings, and its target is unsettled.
+                    if let Some((aside, target)) = self.aside_of(&path) {
+                        self.pending_asides.insert(aside, target);
                     }
                 }),
                 Some(ext) if ext == SWAP_RECORD_EXT => self.recover_swap(&path),

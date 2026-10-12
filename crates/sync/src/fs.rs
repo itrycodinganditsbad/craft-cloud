@@ -177,6 +177,13 @@ pub trait Fs: Send {
     fn recover(&mut self) -> io::Result<()> {
         Ok(())
     }
+    /// Paths whose content is unknown right now: the targets of landings in steps that haven't finished (a step
+    /// failed and putting the moved file back failed too, so [`Fs::recover`] finishes it on the next pass). The scan
+    /// treats them like a folder it can't list: a tracked file there is never taken for deleted. The moved files
+    /// themselves are left out of listings.
+    fn unsettled(&self) -> Vec<RelPath> {
+        Vec::new()
+    }
     /// Reads a whole file (for tests and small files).
     fn read(&self, path: &RelPath) -> io::Result<Vec<u8>> {
         let mut buf = Vec::new();
@@ -237,6 +244,9 @@ pub struct MemFs {
     kept: BTreeMap<String, Vec<u8>>,
     /// Landings in steps that haven't finished (a machine died between two steps), for [`Fs::recover`].
     asides: Vec<Aside>,
+    /// Landings in steps fail after moving the file there aside, and putting it back fails too (see
+    /// [`MemFs::failing_landings`]).
+    fail_landings: bool,
 }
 
 /// A landing in steps under way: the file that was at `target` is at `aside` until the download is in place and
@@ -276,6 +286,7 @@ impl Default for MemFs {
             swap: true,
             kept: BTreeMap::new(),
             asides: Vec::new(),
+            fail_landings: false,
         }
     }
 }
@@ -425,6 +436,13 @@ impl MemFs {
         }
     }
 
+    /// While `on`, a landing in steps ([`MemFs::without_swap`]) fails right after moving the file there aside, and
+    /// putting it back fails too, as two disk errors would: the target stays empty and the landing pending until
+    /// [`Fs::recover`] puts the moved file back.
+    pub fn failing_landings(&mut self, on: bool) {
+        self.fail_landings = on;
+    }
+
     /// Lets every locked and held path go.
     pub fn unlock_all(&mut self) {
         self.locked.clear();
@@ -499,6 +517,8 @@ impl Fs for MemFs {
             .nodes
             .iter()
             .filter(|(p, _)| p.depth() == depth && p.starts_with(dir))
+            // A file moved aside by a landing that hasn't finished is recovery's, never synced.
+            .filter(|(p, _)| !self.asides.iter().any(|a| &a.aside == *p))
             .filter_map(|(p, n)| {
                 let name = p.file_name()?.as_str().to_owned();
                 let kind = match n {
@@ -594,6 +614,9 @@ impl Fs for MemFs {
         }
         self.move_node(path, &aside);
         self.asides.push(Aside { target: path.clone(), aside: aside.clone(), expected, incoming: meta });
+        if self.fail_landings {
+            return Err(LandError::Io(io::Error::other(format!("{path}: the landing failed and the file couldn't be put back (test)"))));
+        }
         // Then the new content takes the free name (nothing can take it in between here)…
         self.change()?;
         self.nodes.insert(path.clone(), MemNode::File { data: writer, meta });
@@ -645,6 +668,10 @@ impl Fs for MemFs {
             self.asides.remove(0);
         }
         Ok(())
+    }
+
+    fn unsettled(&self) -> Vec<RelPath> {
+        self.asides.iter().map(|a| a.target.clone()).collect()
     }
 
     fn mkdir(&mut self, path: &RelPath) -> io::Result<()> {
