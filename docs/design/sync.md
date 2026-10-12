@@ -479,11 +479,15 @@ folder through a real server by running `craft-cloud-agent sync`.
     otherwise a check right before the rename, with the race documented.
   - Symlinks and other special files are `Other` and never followed. `.craft-cloud/` is ignored by the
     engine already.
+  - The sync folder itself may be a link (it is the user's choice) and is followed; links inside it are
+    `Other`. `.craft-cloud/` and its `tmp/` are created owner-only, and a linked `.craft-cloud/` is refused.
   - The same conformance tests run against `MemFs` and the real `Fs`, on Ubuntu and Windows in CI.
 - **HTTP `Transport`**: reqwest with rustls, device token as `Authorization: Bearer`. HTTPS is required,
   except to a loopback address. Server answers map onto `TransportError` (refused batch with its
   conflicts, missing chunks, `resync_required`, 401, 5xx and network errors as `Unavailable`). Bodies and
   lists are capped as on the server.
+  The client ignores proxy settings (`HTTP_PROXY` and friends), so plain HTTP to a loopback server never
+  leaves the machine; HTTPS proxy support can come later.
 - **Saved state**, per synced folder, in the user data dir:
   - `account.json`: server URL, user, device ID, device name and the folder. Written owner-only.
   - The device token sits in the same owner-only file. An OS keychain can come later.
@@ -499,8 +503,8 @@ folder through a real server by running `craft-cloud-agent sync`.
   - `login <url> --user <name> [--folder <path>] [--device-name <name>]`, with the password read from
     stdin. It creates the device and sets up the folder and its marker. The folder must be empty or new,
     or `--adopt` must be passed to sync an existing one.
-  - `sync [--approve-deletes]`: one pass, printed as a short report. Exit codes tell apart done, needs
-    approval, and failed.
+  - `sync [--approve-deletes]`: one pass, printed as a short report. Exit codes tell apart done, failed,
+    needs approval, and needs you.
   - `status`: account, folder, last pass, pending deletes, skipped files.
   - `logout`: revokes the device on the server and removes the saved account. Local files stay.
 - **One agent at a time**: the agent holds an OS file lock on its data folder and on
@@ -509,7 +513,10 @@ folder through a real server by running `craft-cloud-agent sync`.
 - **The root lists only while its marker is there**, so a folder emptied or unmounted mid-pass fails the pass.
 - **Permissions**: a downloaded file keeps the permissions of the file it replaces (Unix); only the executable
   bit syncs.
-- **Exit codes**: 0 done, 1 failed (try again), 2 deletions wait for approval, 3 stopped for safety (needs you).
+- **Exit codes**: 0 done; 1 failed, try again (offline, server busy); 2 deletions wait for approval; 3 needs
+  you: a safety stop (folder or marker missing, another agent running) or an account problem retrying won't
+  fix (device revoked, saved files damaged or from a newer agent, server protocol mismatch). A mistyped
+  command exits 1.
 - **`logout --local`** forgets the account without the server; the device stays valid until an admin revokes
   it.
 - **Not in M3b1, planned for M3b2**: blocking disk I/O moved off the async runtime; closing the link race
@@ -586,7 +593,7 @@ folder through a real server by running `craft-cloud-agent sync`.
 | M1 | `proto` + `chunker` (names, IDs, `fastcdc-v1` with golden vectors) | DONE (2026-10-11, PR #1) |
 | M2 | Server core: info, auth, devices, chunks, batch commit, changes, tree, epoch; SQLite + Postgres, disk + S3 | DONE (2026-10-11; M2a storage, M2b server) |
 | M3a | Sync engine on `Fs`/`Transport` + simulation harness | DONE (2026-10-12) |
-| M3b1 | Agent, first cut: real `Fs`, HTTP transport, saved state, root marker, CLI; two machines sync a folder by hand | IN PROGRESS (design) |
+| M3b1 | Agent, first cut: real `Fs`, HTTP transport, saved state, root marker, CLI; two machines sync a folder by hand | DONE (2026-10-12) |
 | M3b2 | Agent on its own: watcher, stability window, daemon loop with backoff, simulated network | TODO |
 | M4 | History, restore, trash, thinning, GC, admin CLI, backup/restore | TODO |
 | M5 | Selective sync, large-media polish, ignore rules | TODO |
