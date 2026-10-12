@@ -361,8 +361,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// When two names in a folder clash by case, the tracked one wins and the other is skipped.
     ///
     /// Also returns the folders whose contents are unknown this pass: ones that can't be listed (or vanished
-    /// while the scan ran). Nothing tracked inside them counts as missing. Only a sync root that can't be
-    /// listed fails the scan.
+    /// while the scan ran) and ones nested deeper than the tree allows. Nothing tracked inside them counts as
+    /// missing. Only a sync root that can't be listed fails the scan.
     fn scan(&self, report: &mut Report) -> Result<(BTreeMap<RelPath, FsKind>, Vec<RelPath>), SyncError> {
         let tracked = self.state.base_index();
         let mut out = BTreeMap::new();
@@ -397,7 +397,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 let path = dir.join(&name);
                 match entry.kind {
                     FsKind::Other => report.skipped.push((shown, "not a regular file or folder".into())),
-                    FsKind::Dir { .. } if path.depth() > MAX_TREE_DEPTH => report.skipped.push((shown, "folders nest too deep".into())),
+                    FsKind::Dir { .. } if path.depth() > MAX_TREE_DEPTH => {
+                        report.skipped.push((shown, "folders nest too deep".into()));
+                        unknown.push(path);
+                    }
                     FsKind::Dir { .. } => {
                         queue.push(path.clone());
                         out.insert(path, entry.kind);

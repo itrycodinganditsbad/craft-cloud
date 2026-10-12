@@ -593,6 +593,29 @@ async fn a_download_cut_short_after_a_move_makes_no_conflict_copy() {
 }
 
 #[tokio::test]
+async fn files_moved_deeper_than_the_tree_allows_are_never_deleted_on_the_server() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("keep")).unwrap();
+    a.fs_mut().mkdir(&path("keep/inner")).unwrap();
+    write(&mut a, "keep/inner/f.txt", b"deep");
+    settle(&mut [&mut a, &mut b], 5).await;
+    // The desktop files `keep` at depth 256, the deepest allowed, so `keep/inner` ends up too deep.
+    let mut deep = String::new();
+    for _ in 0..craft_cloud_proto::limits::MAX_TREE_DEPTH - 1 {
+        deep.push_str("d/");
+        b.fs_mut().mkdir(&path(&deep)).unwrap();
+    }
+    b.fs_mut().rename(&path("keep"), &path(&format!("{deep}keep"))).unwrap();
+    let report = b.sync_once().await.unwrap();
+    assert!(report.removed_remotely.is_empty() && report.pending_deletes.is_empty(), "{report:?}");
+    a.sync_once().await.unwrap();
+    assert_eq!(a.fs().files().into_values().collect::<Vec<_>>(), vec![b"deep".to_vec()]);
+}
+
+#[tokio::test]
 async fn a_folder_that_cant_be_listed_is_never_deleted_on_the_server() {
     let server = Server::new().await;
     let ana = server.user("ana").await;
