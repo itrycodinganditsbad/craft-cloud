@@ -8,7 +8,8 @@
 //! timeout, a wrong password or a usage error; the message says what; a failed pass is saved and simply runs
 //! again next time); **2** a sync pass finished but the mass-delete guard holds deletions back (run
 //! `sync --approve-deletes` after checking the list); **3** stopped, needs you: a safety stop (the folder is
-//! missing, its marker is missing or names another space, another agent is running) or an account-level problem
+//! missing, its marker is missing or names another space, the data folder and the synced folder lie inside one
+//! another, another agent is running) or an account-level problem
 //! where trying again never helps (the device was revoked or signed out, `state.json` belongs to another
 //! account, the server speaks another protocol or chunker or answers something this agent can't read (no proxy
 //! sits in between, so that is a real client/server mismatch), `account.json` or `state.json` is damaged or was
@@ -39,7 +40,8 @@ use crate::root::{self, RootError, RootMarker};
     about = "Keeps a folder on this computer in step with a Craft Cloud server",
     after_help = "Exit codes: 0 done; 1 failed, try again (offline, server error, wrong password, bad command line); \
                   2 deletions wait for `sync --approve-deletes`; \
-                  3 stopped, needs you (folder or its marker missing, another space, another agent running, \
+                  3 stopped, needs you (folder or its marker missing, another space, data folder and synced folder \
+                  inside one another, another agent running, \
                   device revoked, state of another account, server protocol mismatch, damaged or newer account/state files)."
 )]
 pub struct Cli {
@@ -126,6 +128,7 @@ impl AgentError {
     pub fn exit(&self) -> Exit {
         match self {
             AgentError::Root(_)
+            | AgentError::DataInFolder { .. }
             | AgentError::Lock(LockError::Busy(_) | LockError::NotAFile(_))
             | AgentError::Revoked
             | AgentError::OtherAccountState(_)
@@ -169,6 +172,14 @@ pub enum AgentError {
     Root(#[from] RootError),
     #[error(transparent)]
     Lock(#[from] LockError),
+    #[error(
+        "the agent's data folder {} and the synced folder {} lie inside one another, so the sign-in token would be \
+         synced; nothing was synced. Choose a synced folder outside the data folder (or a --data-dir outside the \
+         synced folder)",
+        .data.display(),
+        .folder.display()
+    )]
+    DataInFolder { data: PathBuf, folder: PathBuf },
     #[error("{path}: {source}")]
     Io { path: PathBuf, source: std::io::Error },
 }
@@ -334,6 +345,50 @@ fn has_files(folder: &Path) -> Result<bool, AgentError> {
     Ok(false)
 }
 
+/// `path` as the OS resolves it: its deepest existing folder made canonical (links followed, `..` resolved),
+/// plus the part that doesn't exist yet.
+fn resolved(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    let mut rest = Vec::new();
+    let mut current = absolute.as_path();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(current) {
+            return rest.iter().rev().fold(real, |p, name| p.join(name));
+        }
+        match (current.parent(), current.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                current = parent;
+            }
+            _ => return absolute,
+        }
+    }
+}
+
+/// Whether one of the two paths lies inside the other (or they are the same), as the OS resolves them. Names are
+/// compared ignoring case on Windows and macOS, whose filesystems usually do.
+fn nested(a: &Path, b: &Path) -> bool {
+    let fold = |p: &Path| -> Vec<String> {
+        p.components()
+            .map(|c| {
+                let s = c.as_os_str().to_string_lossy();
+                if cfg!(any(windows, target_vendor = "apple")) { s.to_lowercase() } else { s.into_owned() }
+            })
+            .collect()
+    };
+    let (a, b) = (fold(&resolved(a)), fold(&resolved(b)));
+    a.starts_with(&b) || b.starts_with(&a)
+}
+
+/// Refuses a synced folder and a data folder that lie inside one another: the data folder holds the device token,
+/// which would then be synced (or the synced folder would sync the agent's own state).
+fn check_apart(data: &DataDir, folder: &Path) -> Result<(), AgentError> {
+    if nested(data.path(), folder) {
+        return Err(AgentError::DataInFolder { data: resolved(data.path()), folder: resolved(folder) });
+    }
+    Ok(())
+}
+
 fn already_signed_in(account: &Account) -> AgentError {
     AgentError::Usage(format!(
         "already signed in as {} on {} for {}; run `craft-cloud-agent logout` first",
@@ -355,6 +410,7 @@ pub async fn login(data: &DataDir, args: &LoginArgs, password: &str, out: &mut i
         Some(folder) => std::path::absolute(folder).map_err(io_at(folder))?,
         None => default_folder()?,
     };
+    check_apart(data, &folder)?;
     if folder.exists() {
         if !folder.is_dir() {
             return Err(AgentError::Usage(format!("{} is not a folder", folder.display())));
@@ -420,6 +476,7 @@ pub async fn login(data: &DataDir, args: &LoginArgs, password: &str, out: &mut i
 pub async fn sync(data: &DataDir, approve_deletes: bool, out: &mut impl Write) -> Result<(Exit, PassSummary), AgentError> {
     let _data_lock = hold_data(data)?;
     let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
+    check_apart(data, &account.folder)?;
     root::check(&account.folder, &RootMarker { space: account.space, root: account.root })?;
     let _folder_lock = hold_folder(&account.folder)?;
     let mut saved = data.load_state()?;
@@ -618,6 +675,25 @@ mod tests {
         assert_eq!(AgentError::WrongPassword.exit(), Exit::Failed);
         assert_eq!(AgentError::NotSignedIn.exit(), Exit::Failed);
         assert_eq!(AgentError::Offline("x".into()).exit(), Exit::Failed);
+    }
+
+    #[test]
+    fn nesting_is_seen_through_links_and_missing_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        assert!(nested(&data, dir.path()));
+        assert!(nested(dir.path(), &data.join("not/made/yet")));
+        assert!(nested(&data, &data));
+        assert!(!nested(&data, &dir.path().join("Craft Cloud")));
+        assert!(!nested(&data, &dir.path().join("data2")), "a shared name prefix isn't nesting");
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+            assert!(nested(&data, &link), "a link to the data folder's parent");
+            assert!(nested(&link.join("data").join("sub"), &data));
+        }
     }
 
     #[test]

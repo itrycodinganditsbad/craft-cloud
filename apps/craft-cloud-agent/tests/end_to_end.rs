@@ -584,6 +584,34 @@ async fn login_refuses_what_it_should() {
     assert!(matches!(again, Err(AgentError::Usage(ref m)) if m.contains("logout")), "{again:?}");
 }
 
+/// The data folder holds the device token: it must never sit inside the synced folder, nor the reverse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_token_is_never_synced() {
+    let server = server().await;
+    let a = Agent::new();
+    // The synced folder would hold the data folder.
+    let parent = a.data.path().parent().unwrap().to_owned();
+    let refused = cli::login(&a.data, &login_args(&server, &parent, "pc"), PASSWORD, &mut Vec::new()).await.unwrap_err();
+    assert!(matches!(refused, AgentError::DataInFolder { .. }), "{refused:?}");
+    assert_eq!(refused.exit(), Exit::NeedsYou);
+    assert!(refused.to_string().contains("token"), "{refused}");
+    // The synced folder inside the data folder, not made yet, through a `..`.
+    let inside = a.data.path().join("x").join("..").join("Craft Cloud");
+    let refused = cli::login(&a.data, &login_args(&server, &inside, "pc"), PASSWORD, &mut Vec::new()).await.unwrap_err();
+    assert!(matches!(refused, AgentError::DataInFolder { .. }), "{refused:?}");
+    assert_eq!(a.data.load_account().unwrap(), None);
+
+    // An account edited by hand into such a layout stops the pass before anything is read.
+    let b = Agent::signed_in(&server, "desktop").await;
+    b.sync().await;
+    let mut account = b.data.load_account().unwrap().unwrap();
+    account.folder = b.data.path().parent().unwrap().to_owned();
+    b.data.save_account(&account).unwrap();
+    let stopped = b.try_sync(false).await.unwrap_err();
+    assert!(matches!(stopped, AgentError::DataInFolder { .. }), "{stopped:?}");
+    assert_eq!(stopped.exit(), Exit::NeedsYou);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_shows_the_last_pass_but_never_the_token() {
     let server = server().await;
