@@ -206,22 +206,39 @@ fn name_round_trips(raw: &str) -> bool {
     cfg!(target_vendor = "apple") || Name::new(raw).map_or(true, |name| name.as_str() == raw)
 }
 
-/// Whether `a` and `b` are the same file or folder (a case-only rename on a case-insensitive filesystem).
+/// Whether `a` and `b` are one entry under two spellings (a case-only rename on a case-insensitive filesystem).
 ///
-/// Only a respelling counts: the same folder and names equal ignoring case. Two hard links to one file (`a` and
-/// `b`) share an ID but are two entries, and renaming one onto the other must fail, not do nothing.
+/// Only a respelling counts: the same folder, names that differ but are equal ignoring case, the same file ID, and
+/// a listing of the folder that shows only one of the two spellings. Two hard links to one file (`a` and `b`, or
+/// even `b` and `B` on a case-sensitive disk) share an ID but are two entries, and renaming one onto the other
+/// must fail, not do nothing.
 fn same_entry(a: &Path, b: &Path) -> bool {
     let lower = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_lowercase());
-    if a.parent() != b.parent() || lower(a).is_none() || lower(a) != lower(b) {
+    let (Some(name_a), Some(name_b)) = (a.file_name(), b.file_name()) else { return false };
+    if a.parent() != b.parent() || name_a == name_b || lower(a) != lower(b) {
         return false;
     }
-    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+    let same_id = match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
         (Ok(ma), Ok(mb)) => {
             let (ia, ib) = (local_id(&ma, a), local_id(&mb, b));
             ia.is_some() && ia == ib
         }
         _ => false,
+    };
+    if !same_id {
+        return false;
     }
+    // One entry shows up under one spelling only.
+    let Some(parent) = a.parent() else { return false };
+    let Ok(entries) = fs::read_dir(parent) else { return false };
+    let mut shown = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name == name_a || name == name_b {
+            shown += 1;
+        }
+    }
+    shown == 1
 }
 
 /// Renames when nothing is at `to`: a check right before a plain rename. Something created at `to` between the
@@ -633,13 +650,21 @@ mod tests {
         assert_eq!(check_then_rename(&a, &d).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&b).unwrap(), b"b");
         // The same entry under another spelling (a case-only rename on a case-insensitive disk) is no clash.
-        assert!(same_entry(&a, &a));
+        assert!(!same_entry(&a, &a), "the same spelling is not a respelling");
         assert!(same_entry(&a, &dir.path().join("A")) == dir.path().join("A").exists(), "a respelling, where the disk folds case");
         assert!(!same_entry(&a, &b));
         // Hard links share an ID but are two entries.
         fs::hard_link(&b, dir.path().join("b2")).unwrap();
         assert!(!same_entry(&b, &dir.path().join("b2")));
         assert_eq!(check_then_rename(&b, &dir.path().join("b2")).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        // `b`/`B` hard links: two entries wherever the disk tells them apart.
+        let upper = dir.path().join("B");
+        if !upper.exists() {
+            fs::hard_link(&b, &upper).unwrap();
+            assert!(!same_entry(&b, &upper), "two listed spellings are two entries");
+            assert_eq!(check_then_rename(&b, &upper).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read(&b).unwrap(), b"b");
+        }
         check_then_rename(&a, &dir.path().join("c")).unwrap();
         assert_eq!(fs::read(dir.path().join("c")).unwrap(), b"a");
     }
