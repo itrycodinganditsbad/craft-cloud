@@ -4,10 +4,16 @@
 //! The password is read from standard input (one line), so it never appears in the process list or shell
 //! history: `printf '%s\n' "$PASSWORD" | craft-cloud-agent login https://cloud.example.com --user ana`.
 //!
-//! Exit codes ([`Exit`], also in `--help`): **0** done; **1** failed, try again (the message says what; a failed
-//! pass is saved and simply runs again next time); **2** a sync pass finished but the mass-delete guard holds
-//! deletions back (run `sync --approve-deletes` after checking the list); **3** a safety stop that needs you: the
-//! folder is missing, its marker is missing or names another space, or another agent is running.
+//! Exit codes ([`Exit`], also in `--help`): **0** done; **1** failed, try again (offline, a server error, a
+//! timeout, a wrong password or a usage error; the message says what; a failed pass is saved and simply runs
+//! again next time); **2** a sync pass finished but the mass-delete guard holds deletions back (run
+//! `sync --approve-deletes` after checking the list); **3** stopped, needs you: a safety stop (the folder is
+//! missing, its marker is missing or names another space, another agent is running) or an account-level problem
+//! where trying again never helps (the device was revoked or signed out, `state.json` belongs to another
+//! account, the server speaks another protocol or chunker, a file was written by a newer agent).
+//!
+//! A crash or kill during `login`, after the server created the device and before the account was saved, can
+//! leave a device registered that nothing here uses; an admin can revoke it (`craft-cloud-server device ...`).
 
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
@@ -29,8 +35,10 @@ use crate::root::{self, RootError, RootMarker};
     name = "craft-cloud-agent",
     version,
     about = "Keeps a folder on this computer in step with a Craft Cloud server",
-    after_help = "Exit codes: 0 done; 1 failed, try again; 2 deletions wait for `sync --approve-deletes`; \
-                  3 stopped for safety, needs you (folder or its marker missing, another space, another agent running)."
+    after_help = "Exit codes: 0 done; 1 failed, try again (offline, server error, wrong password, bad command line); \
+                  2 deletions wait for `sync --approve-deletes`; \
+                  3 stopped, needs you (folder or its marker missing, another space, another agent running, \
+                  device revoked, state of another account, server protocol mismatch, files from a newer agent)."
 )]
 pub struct Cli {
     /// Where the agent keeps its sign-in and sync state. Default: $CRAFT_CLOUD_AGENT_DIR, else the per-user data
@@ -92,7 +100,8 @@ pub enum Exit {
     Failed,
     /// 2: the pass finished, but deletions wait for `sync --approve-deletes`.
     NeedsApproval,
-    /// 3: a safety stop; nothing was synced and trying again won't help until someone looks.
+    /// 3: stopped, needs you: a safety stop, or an account-level problem; trying again won't help until
+    /// someone looks.
     NeedsYou,
 }
 
@@ -108,10 +117,18 @@ impl Exit {
 }
 
 impl AgentError {
-    /// The exit code for this error: a safety stop is [`Exit::NeedsYou`], anything else [`Exit::Failed`].
+    /// The exit code for this error: [`Exit::NeedsYou`] for a safety stop and for an account-level problem where
+    /// trying again never helps (the device was revoked, `state.json` is another account's, the server speaks
+    /// another protocol or chunker, a file is from a newer agent); [`Exit::Failed`] for anything that may pass
+    /// by itself (offline, a server error, a timeout) or that the message fixes (a wrong password, a usage error).
     pub fn exit(&self) -> Exit {
         match self {
-            AgentError::Root(_) | AgentError::Lock(LockError::Busy(_) | LockError::NotAFile(_)) => Exit::NeedsYou,
+            AgentError::Root(_)
+            | AgentError::Lock(LockError::Busy(_) | LockError::NotAFile(_))
+            | AgentError::Revoked
+            | AgentError::OtherAccountState(_)
+            | AgentError::Server(TransportError::Protocol(_))
+            | AgentError::Account(AccountError::Newer { .. }) => Exit::NeedsYou,
             _ => Exit::Failed,
         }
     }
@@ -130,6 +147,8 @@ pub enum AgentError {
          Run `craft-cloud-agent logout`, then `login` again."
     )]
     Revoked,
+    #[error("{} belongs to another account; move it away to start this folder over", .0.display())]
+    OtherAccountState(PathBuf),
     #[error("can't reach the server ({0}); nothing is lost, run the command again later")]
     Offline(String),
     #[error(
@@ -394,10 +413,7 @@ pub async fn sync(data: &DataDir, approve_deletes: bool, out: &mut impl Write) -
     let _folder_lock = hold_folder(&account.folder, out)?;
     let mut saved = data.load_state()?;
     if saved.state.space.is_some_and(|s| s != account.space) {
-        return Err(AgentError::Usage(format!(
-            "{} belongs to another account; move it away to start this folder over",
-            data.path().join(crate::account::STATE_FILE).display()
-        )));
+        return Err(AgentError::OtherAccountState(data.path().join(crate::account::STATE_FILE)));
     }
     let fs = DiskFs::new(&account.folder);
     fs.clean_tmp().map_err(io_at(&fs.tmp_dir()))?;
@@ -580,6 +596,13 @@ mod tests {
         assert_eq!(Exit::NeedsYou.code(), 3);
         assert_eq!(AgentError::Root(RootError::MarkerMissing(PathBuf::from("f"))).exit(), Exit::NeedsYou);
         assert_eq!(AgentError::Lock(LockError::Busy(PathBuf::from("l"))).exit(), Exit::NeedsYou);
+        assert_eq!(AgentError::Revoked.exit(), Exit::NeedsYou);
+        assert_eq!(AgentError::OtherAccountState(PathBuf::from("s")).exit(), Exit::NeedsYou);
+        assert_eq!(AgentError::Server(TransportError::Protocol("x".into())).exit(), Exit::NeedsYou);
+        let newer = AccountError::Newer { path: PathBuf::from("s"), found: 2, supported: 1 };
+        assert_eq!(AgentError::Account(newer).exit(), Exit::NeedsYou);
+        assert_eq!(AgentError::Server(TransportError::NotFound).exit(), Exit::Failed);
+        assert_eq!(AgentError::WrongPassword.exit(), Exit::Failed);
         assert_eq!(AgentError::NotSignedIn.exit(), Exit::Failed);
         assert_eq!(AgentError::Offline("x".into()).exit(), Exit::Failed);
     }

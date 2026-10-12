@@ -553,7 +553,10 @@ async fn a_device_revoked_by_the_admin_stops_syncing() {
     let account = a.data.load_account().unwrap().unwrap();
     let user = server.meta.user_by_name("ana").await.unwrap().unwrap();
     server.meta.revoke_device(user.id, account.device).await.unwrap();
-    assert!(matches!(a.try_sync(false).await, Err(AgentError::Revoked)));
+    let revoked = a.try_sync(false).await.unwrap_err();
+    assert!(matches!(revoked, AgentError::Revoked), "{revoked:?}");
+    assert_eq!(revoked.exit(), Exit::NeedsYou);
+    assert_eq!(revoked.exit().code(), 3);
     let mut out = Vec::new();
     cli::status(&a.data, &mut out).unwrap();
     let status = String::from_utf8(out).unwrap();
@@ -661,4 +664,18 @@ async fn login_makes_the_agent_folder_owner_only() {
     // A sync leaves it so.
     a.sync().await;
     assert_eq!(mode(".craft-cloud"), 0o700);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_state_of_another_account_stops_the_agent() {
+    let server = server().await;
+    let a = Agent::signed_in(&server, "desktop").await;
+    a.sync().await;
+    let mut saved = a.data.load_state().unwrap();
+    saved.state.space = Some(craft_cloud_proto::SpaceId::generate());
+    a.data.save_state(&saved).unwrap();
+    let stopped = a.try_sync(false).await.unwrap_err();
+    assert!(matches!(stopped, AgentError::OtherAccountState(_)), "{stopped:?}");
+    assert_eq!(stopped.exit(), Exit::NeedsYou);
+    assert!(stopped.to_string().contains("belongs to another account"), "{stopped}");
 }
