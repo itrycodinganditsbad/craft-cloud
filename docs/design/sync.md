@@ -120,7 +120,7 @@ can point into the synced folder, and saves are atomic.
 |---|---|
 | Symlinks, junctions | Not synced. Listed once as "skipped: link". Never followed. |
 | Empty directories | Synced (they are nodes). |
-| Executable bit | Synced on Unix-like systems; ignored on Windows. No other permissions. |
+| Executable bit | Synced on Unix-like systems. Windows has none: an edit made there keeps the bit the file had, and a new file from Windows isn't executable. No other permissions. |
 | Extended attributes, ACLs, resource forks | Not synced. |
 | macOS bundles (`.app`, `.fcpbundle`-style directory packages) | Treated as normal directories. Changes inside one go up in a single batch commit, so other machines never see half a bundle. |
 | Hard links | Each path syncs as its own file. |
@@ -321,13 +321,17 @@ changes locally, then pushes local changes. These rules came out of the simulati
   content both sides agreed on, even if its time or file ID changed. Only different content counts as an
   edit, and an edit wins over the delete.
   A folder at a deleted folder's path that another tracked folder owns (by local ID) isn't the deleted one.
+- **Edits are decided by content too.** A file that only got a new time or file ID (saved again with the same
+  bytes, put back from a copy) isn't an edit, so a new server version simply replaces it, with no conflict copy.
 - **Approval covers what was shown.** A mass-delete approval releases exactly the deletions that were listed
   (both directions). Deletions that appear afterwards wait for their own approval. Approvals given before a pass
   add up.
 - **Crash recovery.** After a crash, the next passes redo the lost bookkeeping. Content already on both sides
   is adopted where the engine can tell. Where it can't (a file the crashed pass touched and the user then
   locked, moved or edited), it keeps a conflict copy; a delete the crashed pass had applied can also come
-  back. Nothing is lost. The simulation crashes machines at random calls and between filesystem steps.
+  back. Nothing is lost. The simulation crashes machines at random calls and between filesystem steps. After a crash, an untracked file already at the server's place
+  with the server's content is adopted before a file found by its local ID moves there; the file found by ID
+  stays where it is and goes up as a new file.
 - **Known gaps, for the agent milestone (M3b)**: a tracked folder the user moves into a folder the scan can't
   list looks deleted, so the push deletes it on the server (its files go up again as new ones once the folder
   can be listed; history keeps the old versions). While any folder can't be listed, a node that has to be
@@ -336,7 +340,10 @@ changes locally, then pushes local changes. These rules came out of the simulati
   folder holding a link while the server adds something to that folder, the engine makes the folder again at
   its old place and the node behind the link is deleted on the server; the file goes up as new once it is
   real again, and history keeps the old version. A new server version identical to the base (same manifest
-  and exec bit) still counts as a change (M3b2: take it without touching the file).
+  and exec bit) still counts as a change (M3b2: take it without touching the file). Found by the simulation beyond seed 32000,
+  all leaving the content in the server's history, none losing it: a tracked file behind a link whose name
+  clashes by case with an untracked file can be deleted on the server after its folder is renamed; after some
+  crashes, a file the crashed pass touched can end up only in history. These are the first M3b2 items.
 
 ## Server
 
@@ -507,6 +514,11 @@ folder through a real server by running `craft-cloud-agent sync`.
     needs approval, and needs you.
   - `status`: account, folder, last pass, pending deletes, skipped files.
   - `logout`: revokes the device on the server and removes the saved account. Local files stay.
+- **The data folder and the synced folder never nest**: the data folder holds the device token, so `login`
+  refuses a synced folder that contains it or lies inside it (compared as the OS resolves them, links followed),
+  and `sync` stops with exit code 3.
+- **Every pass checks the server**: `/api/info` at login and before every sync pass; a server that no longer
+  speaks the agent's protocol or chunker fails the pass with exit code 3.
 - **One agent at a time**: the agent holds an OS file lock on its data folder and on
   `<folder>/.craft-cloud/lock` while it works; a second one stops with exit code 3. A filesystem without
   locks gets a warning.
@@ -515,8 +527,9 @@ folder through a real server by running `craft-cloud-agent sync`.
   bit syncs.
 - **Exit codes**: 0 done; 1 failed, try again (offline, server busy); 2 deletions wait for approval; 3 needs
   you: a safety stop (folder or marker missing, another agent running) or an account problem retrying won't
-  fix (device revoked, saved files damaged or from a newer agent, server protocol mismatch). A mistyped
-  command exits 1.
+  fix (device revoked, saved files damaged or from a newer agent, server protocol mismatch, damaged data
+  from the server, the server or a proxy refusing a request with another 4xx, the data and synced folders
+  nested). A mistyped command exits 1.
 - **`logout --local`** forgets the account without the server; the device stays valid until an admin revokes
   it.
 - **Not in M3b1, planned for M3b2**: blocking disk I/O moved off the async runtime; closing the link race
