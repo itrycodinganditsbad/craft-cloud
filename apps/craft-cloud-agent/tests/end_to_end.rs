@@ -623,7 +623,11 @@ fn newer_server() -> String {
             let _ = stream.read(&mut buf);
             let body = r#"{"protocol_min":99,"protocol_max":99,"chunker_params":["fastcdc-v1"],"max_chunk_bytes":4194304,
                 "max_manifest_bytes":1048576,"max_batch_ops":1000,"max_batch_json_bytes":1048576,"max_page_nodes":1000,"max_missing_ids":10000}"#;
-            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
         }
     });
     url

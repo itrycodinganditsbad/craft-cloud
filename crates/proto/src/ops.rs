@@ -171,7 +171,8 @@ mod tests {
         use crate::limits::{MAX_BATCH_JSON_BYTES, MAX_BATCH_OPS, MAX_NAME_BYTES};
         // JSON carries a name's UTF-8 bytes as they are, so any longest name is as long as JSON.
         let name = Name::new(&"x".repeat(MAX_NAME_BYTES)).unwrap();
-        let mv = Op::Move { node: node(u128::MAX), from_parent: node(u128::MAX), from_name: name.clone(), parent: node(u128::MAX), name: name.clone() };
+        let mv =
+            Op::Move { node: node(u128::MAX), from_parent: node(u128::MAX), from_name: name.clone(), parent: node(u128::MAX), name: name.clone() };
         let version = NewVersion {
             id: VersionId::from_uuid(Uuid::from_u128(u128::MAX)),
             manifest: crate::ManifestId::from_bytes([0xff; 32]),
