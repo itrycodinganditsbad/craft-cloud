@@ -46,7 +46,9 @@
 //!   "crosses devices" (EXDEV; temporary files live on the root's volume), so those entries are skipped with that
 //!   reason every pass and nothing is lost. FAT/exFAT have no stable file IDs (Linux derives them from the
 //!   entry's position, so a rename changes them): a move there is seen as a delete and a new file (the content
-//!   goes up again; history keeps the old node), and files are hashed more often. Windows read-only files are
+//!   goes up again; history keeps the old node), and files are hashed more often. A landing in steps compares the
+//!   file with its ID right before moving it aside, and after a plain rename (no hard link) only its size, time and
+//!   executable bit; recovery does the same. Windows read-only files are
 //!   never replaced (the user's "don't change this"): a remote edit to one is skipped with "read-only here, not
 //!   replaced", the download is kept like one for a file in use, and it lands once the attribute is cleared.
 //! - **The root lists only with its marker.** Listing the root fails unless `.craft-cloud/root.json` is there as
@@ -87,8 +89,19 @@ pub struct DiskFs {
     root: PathBuf,
     /// Whether a download may land with the system's exchange of two files (see [`DiskFs::without_swap`]).
     swap: bool,
-    /// Makes putting a moved file back fail, for tests of that path (see [`DiskFs::failing_put_backs`]).
+    /// Faults and detours for tests of paths a real disk rarely takes.
+    hooks: Hooks,
+}
+
+/// Test hooks (see the `#[doc(hidden)]` builders on [`DiskFs`]). All off outside tests.
+#[derive(Debug, Clone, Copy, Default)]
+struct Hooks {
+    /// Putting a moved file back fails ([`DiskFs::failing_put_backs`]).
     fail_put_backs: bool,
+    /// Moving the download into place during a landing in steps fails ([`DiskFs::failing_landings`]).
+    fail_landings: bool,
+    /// Landings in steps move files with a plain rename ([`DiskFs::plain_moves`]).
+    plain_moves: bool,
 }
 
 /// What a landing record in [`TMP_DIR`] holds: the target, the name its file was moved to, and what both files
@@ -103,6 +116,18 @@ struct LandingRecord {
     expected: RecordedMeta,
     /// The file that lands there.
     incoming: RecordedMeta,
+    /// Whether both moves went through a hard link, so both files kept their IDs and recovery compares them too
+    /// (see [`same_file_after_move`]). Written down after the download took the name; until then (and in records
+    /// from before it existed) recovery compares size, time and executable bit only.
+    #[serde(default)]
+    ids_kept: bool,
+}
+
+impl LandingRecord {
+    /// How the files of this landing moved, as far as recovery can count on.
+    fn moved(&self) -> Moved {
+        if self.ids_kept { Moved::Link } else { Moved::Plain }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -320,26 +345,52 @@ fn check_then_rename(from: &Path, to: &Path) -> io::Result<()> {
 
 /// Renames without ever replacing: the OS's atomic no-replace rename, or [`check_then_rename`] on filesystems
 /// that refuse the flag.
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    move_no_replace(from, to).map(|_| ())
+}
+
+/// How a file was moved, which decides what a look at it afterwards can compare (see [`same_file_after_move`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Moved {
+    /// Through a new hard link and the removal of the old name (Windows, NTFS): the file keeps its ID.
+    Link,
+    /// A rename. FAT and exFAT have no file IDs of their own: Windows and Linux derive one from the directory entry,
+    /// so a renamed file may come out with another ID.
+    Plain,
+}
+
+/// Whether `found`, the file at a path a file was just moved to, is `expected`, the file that was moved: size, time and
+/// executable bit always, and the file ID only when the move kept it ([`Moved::Link`]). The ID was compared right
+/// before the move, so a plain rename can't let another file with the same size and time slip through unless it
+/// replaced the moved one in between.
+fn same_file_after_move(found: FileMeta, expected: FileMeta, moved: Moved) -> bool {
+    match moved {
+        Moved::Link => found == expected,
+        Moved::Plain => found.size == expected.size && found.mtime_ms == expected.mtime_ms && found.exec == expected.exec,
+    }
+}
+
+/// [`rename_no_replace`], saying how the entry moved.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn move_no_replace(from: &Path, to: &Path) -> io::Result<Moved> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
     use rustix::io::Errno;
     match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(Moved::Plain),
         // The filesystem or kernel doesn't support the flag (EINVAL on Linux, ENOTSUP on macOS).
-        Err(e) if [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP].contains(&e) => check_then_rename(from, to),
+        Err(e) if [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP].contains(&e) => check_then_rename(from, to).map(|()| Moved::Plain),
         // A case-only rename on a case-insensitive filesystem: the "existing" target is the source itself.
-        Err(e) if e == Errno::EXIST && same_entry(from, to) => fs::rename(from, to),
+        Err(e) if e == Errno::EXIST && same_entry(from, to) => fs::rename(from, to).map(|()| Moved::Plain),
         Err(e) => Err(e.into()),
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+fn move_no_replace(from: &Path, to: &Path) -> io::Result<Moved> {
     if fs::symlink_metadata(from)?.file_type().is_file() {
         return link_rename(from, to);
     }
-    check_then_rename(from, to)
+    check_then_rename(from, to).map(|()| Moved::Plain)
 }
 
 /// Renames a file without ever replacing: a new hard link at `to` (refused, atomically, if anything is there),
@@ -349,12 +400,12 @@ fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
 /// a landing then keeps its record, and the next pass's recovery removes the extra name once it can. Filesystems without
 /// hard links (FAT, exFAT) fall back to [`check_then_rename`], and so does a case-only respelling of one entry.
 #[cfg_attr(any(target_os = "linux", target_os = "android", target_vendor = "apple"), allow(dead_code))]
-fn link_rename(from: &Path, to: &Path) -> io::Result<()> {
+fn link_rename(from: &Path, to: &Path) -> io::Result<Moved> {
     // A read-only file is renamed the old way: removing its old name would clear the read-only attribute, which the
     // new name shares (Rust removes a read-only file on Windows by clearing it). Landings never replace one at all
     // (see `Fs::finish_write` below).
     if fs::symlink_metadata(from)?.permissions().readonly() {
-        return check_then_rename(from, to);
+        return check_then_rename(from, to).map(|()| Moved::Plain);
     }
     // Windows: a file an app holds open without letting it be deleted can still get a new hard link, but then
     // neither name can be removed again. Asking for delete access first fails the same way the removal would, before
@@ -368,11 +419,11 @@ fn link_rename(from: &Path, to: &Path) -> io::Result<()> {
     }
     match fs::hard_link(from, to) {
         Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && same_entry(from, to) => return fs::rename(from, to),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && same_entry(from, to) => return fs::rename(from, to).map(|()| Moved::Plain),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
         // ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED (Windows): no hard links on this filesystem.
         Err(e) if e.kind() == io::ErrorKind::Unsupported || (cfg!(windows) && matches!(e.raw_os_error(), Some(1 | 50))) => {
-            return check_then_rename(from, to);
+            return check_then_rename(from, to).map(|()| Moved::Plain);
         }
         Err(e) => return Err(e),
     }
@@ -380,7 +431,7 @@ fn link_rename(from: &Path, to: &Path) -> io::Result<()> {
         let _ = fs::remove_file(to);
         return Err(e);
     }
-    Ok(())
+    Ok(Moved::Link)
 }
 
 /// Exchanges the entries at `a` and `b` in one step (`renameat2(RENAME_EXCHANGE)` on Linux, `renameatx_np` with
@@ -540,7 +591,28 @@ fn create_temp(dir: &Path) -> io::Result<(File, PathBuf)> {
 impl DiskFs {
     /// The folder at `root`. Nothing is checked or created until the engine asks.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), swap: true, fail_put_backs: false }
+        Self { root: root.into(), swap: true, hooks: Hooks::default() }
+    }
+
+    /// Moves files during a landing in steps with a plain rename, as on FAT and exFAT (no hard links), even where a
+    /// hard link would do: for tests of that path on any system.
+    #[doc(hidden)]
+    pub fn plain_moves(mut self) -> Self {
+        self.hooks.plain_moves = true;
+        self
+    }
+
+    /// Makes moving the download into place during a landing in steps fail, as a disk error would: for tests of what
+    /// happens after the file there was moved aside.
+    #[doc(hidden)]
+    pub fn failing_landings(mut self) -> Self {
+        self.hooks.fail_landings = true;
+        self
+    }
+
+    /// Moves `from` to `to` for a landing in steps, never replacing anything (see [`DiskFs::plain_moves`]).
+    fn move_for_landing(&self, from: &Path, to: &Path) -> io::Result<Moved> {
+        if self.hooks.plain_moves { check_then_rename(from, to).map(|()| Moved::Plain) } else { move_no_replace(from, to) }
     }
 
     /// Lands downloads in steps, the way Windows and filesystems without an exchange do, even where the system can
@@ -554,7 +626,7 @@ impl DiskFs {
     /// that the landing record then stays for [`Fs::recover`].
     #[doc(hidden)]
     pub fn failing_put_backs(mut self) -> Self {
-        self.fail_put_backs = true;
+        self.hooks.fail_put_backs = true;
         self
     }
 
@@ -562,7 +634,7 @@ impl DiskFs {
     /// something took its place (the moved file then stays as a file the scan sees; recovery would leave it too).
     /// Otherwise the record stays, and the next pass's [`Fs::recover`] puts it back.
     fn put_back(&self, aside: &Path, full: &Path) -> bool {
-        let moved = if self.fail_put_backs { Err(io::Error::other("put-backs fail (test)")) } else { rename_no_replace(aside, full) };
+        let moved = if self.hooks.fail_put_backs { Err(io::Error::other("put-backs fail (test)")) } else { rename_no_replace(aside, full) };
         if moved.is_ok() {
             return true;
         }
@@ -585,8 +657,9 @@ impl DiskFs {
     }
 
     /// Lands `temp` (the prepared download, `incoming`) at `full`, where the file `expected` is, in steps: the file
-    /// there moves to a name next to it (never replacing anything), is checked, the download moves into the free
-    /// name, and the moved file is removed. A record in the temporary folder, written first, lets
+    /// there is compared with `expected` (ID included), moves to a name next to it (never replacing anything), is
+    /// checked again (the ID only if the move went through a hard link, which keeps it: FAT and exFAT give a renamed
+    /// file a new one), the download moves into the free name, and the moved file is removed. A record in the temporary folder, written first, lets
     /// [`Fs::recover`] finish or undo a landing a crash cut short. A failure after the first step puts the moved
     /// file back where nothing took its place.
     fn land_in_steps(
@@ -600,11 +673,17 @@ impl DiskFs {
         let (Some(parent), Some(name)) = (full.parent(), full.file_name().and_then(|n| n.to_str())) else {
             return Err(LandError::Io(io::Error::other(format!("{path}: not a file name"))));
         };
+        // 0. The file there is the one the engine checked, ID included: after a plain rename (FAT, exFAT) the moved
+        // file's ID may differ, so this is the last look that can tell an app's save with the same size and time.
+        if kind_at(full)? != Some(FsKind::File(expected)) {
+            return Err(LandError::Changed(writer));
+        }
         let aside_name = aside_name(name)?;
         let aside = parent.join(&aside_name);
         let tmp = self.real_tmp(true)?.ok_or_else(|| io::Error::other("no temporary folder"))?;
         let record_path = tmp.join(format!("{}.{LANDING_EXT}", random_hex(12)?));
-        let record = LandingRecord { target: path.to_string(), aside: aside_name, expected: expected.into(), incoming: incoming.into() };
+        let mut record =
+            LandingRecord { target: path.to_string(), aside: aside_name, expected: expected.into(), incoming: incoming.into(), ids_kept: false };
         let json = serde_json::to_vec(&record).map_err(|e| io::Error::other(e.to_string()))?;
         crate::account::write_atomic(&record_path, &json, true)?;
         let forget = |record_path: &Path| {
@@ -612,19 +691,22 @@ impl DiskFs {
         };
         // 1. The file there moves aside. If that failed halfway (a rename through a hard link that couldn't remove
         // the old name), the file has both names and the record stays, so recovery removes the extra one.
-        if let Err(e) = rename_no_replace(full, &aside) {
-            if kind_at(&aside).ok().flatten().is_none() {
-                forget(&record_path);
+        let moved_by = match self.move_for_landing(full, &aside) {
+            Ok(moved_by) => moved_by,
+            Err(e) => {
+                if kind_at(&aside).ok().flatten().is_none() {
+                    forget(&record_path);
+                }
+                return Err(match e.kind() {
+                    io::ErrorKind::NotFound => LandError::Changed(writer),
+                    _ if in_use(&e) => LandError::InUse(writer, in_use_reason(&e)),
+                    _ => LandError::Io(e),
+                });
             }
-            return Err(match e.kind() {
-                io::ErrorKind::NotFound => LandError::Changed(writer),
-                _ if in_use(&e) => LandError::InUse(writer, in_use_reason(&e)),
-                _ => LandError::Io(e),
-            });
-        }
-        // 2. It is the file the engine checked, or it goes back.
+        };
+        // 2. It is the file the engine checked, or it goes back. The ID counts only if the move kept it.
         let moved = kind_at(&aside).ok().flatten();
-        if moved != Some(FsKind::File(expected)) {
+        if !matches!(moved, Some(FsKind::File(found)) if same_file_after_move(found, expected, moved_by)) {
             // If something took the free name meanwhile, the moved file stays next to it (the scan sees it).
             if self.put_back(&aside, full) {
                 forget(&record_path);
@@ -632,18 +714,31 @@ impl DiskFs {
             return Err(LandError::Changed(writer));
         }
         // 3. The download takes the free name.
-        if let Err(e) = rename_no_replace(&writer.temp, full) {
-            if self.put_back(&aside, full) {
-                forget(&record_path);
+        let landing =
+            if self.hooks.fail_landings { Err(io::Error::other("landings fail (test)")) } else { self.move_for_landing(&writer.temp, full) };
+        let landed_by = match landing {
+            Ok(landed_by) => landed_by,
+            Err(e) => {
+                if self.put_back(&aside, full) {
+                    forget(&record_path);
+                }
+                return Err(match e.kind() {
+                    io::ErrorKind::AlreadyExists => LandError::Changed(writer),
+                    _ if in_use(&e) => LandError::InUse(writer, in_use_reason(&e)),
+                    _ => LandError::Io(e),
+                });
             }
-            return Err(match e.kind() {
-                io::ErrorKind::AlreadyExists => LandError::Changed(writer),
-                _ if in_use(&e) => LandError::InUse(writer, in_use_reason(&e)),
-                _ => LandError::Io(e),
-            });
-        }
+        };
         writer.armed = false;
         sync_dir(parent);
+        // Both files kept their IDs (hard links): written down so recovery compares the IDs too. If this fails or a
+        // crash comes first, recovery compares without them, as for a plain rename.
+        if moved_by == Moved::Link && landed_by == Moved::Link {
+            record.ids_kept = true;
+            if let Ok(json) = serde_json::to_vec(&record) {
+                let _ = crate::account::write_atomic(&record_path, &json, true);
+            }
+        }
         // 4. The moved file goes. If it can't, the record stays and the next pass's recovery tries again.
         if fs::remove_file(&aside).is_ok() {
             forget(&record_path);
@@ -682,9 +777,11 @@ impl DiskFs {
                 (Some(FsKind::File(moved)), Some(FsKind::File(there))) if moved.id.is_some() && moved.id == there.id => {
                     fs::remove_file(&aside_full)?;
                 }
-                // The landing was done but for removing the moved file.
+                // The landing was done but for removing the moved file. The IDs count only if both moves kept them
+                // (hard links); a plain rename on FAT or exFAT gives both files new ones.
                 (Some(FsKind::File(moved)), Some(FsKind::File(there)))
-                    if moved == FileMeta::from(record.expected) && there == FileMeta::from(record.incoming) =>
+                    if same_file_after_move(moved, record.expected.into(), record.moved())
+                        && same_file_after_move(there, record.incoming.into(), record.moved()) =>
                 {
                     fs::remove_file(&aside_full)?;
                 }
@@ -1191,7 +1288,7 @@ mod tests {
         assert_eq!((fs::read(&a).unwrap(), fs::read(&b).unwrap()), (b"a".to_vec(), b"b".to_vec()));
         let id = |p: &Path| local_id(&fs::symlink_metadata(p).unwrap(), p);
         let before = id(&a);
-        link_rename(&a, &c).unwrap();
+        assert_eq!(link_rename(&a, &c).unwrap(), Moved::Link);
         assert!(!a.exists());
         assert_eq!(fs::read(&c).unwrap(), b"a");
         assert_eq!(id(&c), before);
@@ -1217,7 +1314,17 @@ mod tests {
     }
 
     fn record(disk: &DiskFs, expected: FileMeta, incoming: FileMeta) {
-        let record = LandingRecord { target: "a.txt".into(), aside: "a.txt.1.cc-aside".into(), expected: expected.into(), incoming: incoming.into() };
+        record_with(disk, expected, incoming, false);
+    }
+
+    fn record_with(disk: &DiskFs, expected: FileMeta, incoming: FileMeta, ids_kept: bool) {
+        let record = LandingRecord {
+            target: "a.txt".into(),
+            aside: "a.txt.1.cc-aside".into(),
+            expected: expected.into(),
+            incoming: incoming.into(),
+            ids_kept,
+        };
         fs::write(disk.tmp_dir().join("r.landing"), serde_json::to_vec(&record).unwrap()).unwrap();
     }
 
@@ -1246,6 +1353,60 @@ mod tests {
         disk.recover().unwrap();
         assert_eq!(names(dir.path()), ["a.txt"]);
         assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"new");
+    }
+
+    /// After a plain rename (FAT, exFAT) a file may come out with another ID; after a move through a hard link it
+    /// never does. The look after the move compares the ID only in the second case.
+    #[test]
+    fn the_look_after_a_move_compares_the_id_only_if_the_move_kept_it() {
+        let expected = FileMeta { size: 3, mtime_ms: 1_700_000_000_000, exec: false, id: Some(7) };
+        let renumbered = FileMeta { id: Some(8), ..expected };
+        assert!(same_file_after_move(expected, expected, Moved::Link));
+        assert!(same_file_after_move(expected, expected, Moved::Plain));
+        assert!(!same_file_after_move(renumbered, expected, Moved::Link), "a hard link keeps the ID: another one is another file");
+        assert!(same_file_after_move(renumbered, expected, Moved::Plain), "a plain rename may renumber the file");
+        for other in [FileMeta { size: 4, ..expected }, FileMeta { mtime_ms: 1, ..expected }, FileMeta { exec: true, ..expected }] {
+            assert!(!same_file_after_move(other, expected, Moved::Plain), "{other:?}");
+            assert!(!same_file_after_move(other, expected, Moved::Link), "{other:?}");
+        }
+    }
+
+    /// The forced plain rename lands like the system's own way, and still never lands on a file that changed.
+    #[test]
+    fn a_landing_in_steps_with_plain_renames_lands_only_on_what_was_checked() {
+        let (dir, disk, old) = landing_setup();
+        fs::rename(dir.path().join("a.txt.1.cc-aside"), dir.path().join("a.txt")).unwrap();
+        let mut disk = disk.without_swap().plain_moves();
+        let path = craft_cloud_sync::rel("a.txt");
+        // An app's save with the same size and time but another ID: refused before anything moves.
+        let other_id = FileMeta { id: old.id.map(|id| id ^ 1), ..old };
+        let mut w = disk.begin_write(&path).unwrap();
+        w.write_all(b"new").unwrap();
+        let Err(LandError::Changed(w)) = disk.finish_write(&path, w, false, 1_700_000_000_000, Some(other_id)) else { panic!("landed") };
+        drop(w);
+        assert_eq!(names(dir.path()), ["a.txt"]);
+        let mut w = disk.begin_write(&path).unwrap();
+        w.write_all(b"new").unwrap();
+        disk.finish_write(&path, w, false, 1_700_000_000_000, Some(old)).unwrap();
+        assert_eq!(names(dir.path()), ["a.txt"]);
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"new");
+        assert_eq!(fs::read_dir(disk.tmp_dir()).unwrap().count(), 0);
+    }
+
+    /// Recovery after plain renames (FAT, exFAT): both files may have new IDs, and the landing is still finished.
+    /// After hard links the IDs must match.
+    #[test]
+    fn recovery_compares_ids_only_when_the_moves_kept_them() {
+        for ids_kept in [false, true] {
+            let (dir, mut disk, old) = landing_setup();
+            let new = disk.write(&craft_cloud_sync::rel("a.txt"), b"new", false, 1_700_000_000_000).unwrap();
+            let renumber = |m: FileMeta| FileMeta { id: m.id.map(|id| id ^ 1), ..m };
+            record_with(&disk, renumber(old), renumber(new), ids_kept);
+            disk.recover().unwrap();
+            let want: &[&str] = if ids_kept { &["a.txt", "a.txt.1.cc-aside"] } else { &["a.txt"] };
+            assert_eq!(names(dir.path()), want, "ids kept: {ids_kept}");
+            assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"new");
+        }
     }
 
     #[test]

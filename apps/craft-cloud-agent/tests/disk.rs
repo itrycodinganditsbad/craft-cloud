@@ -46,20 +46,18 @@ fn kept_writes_land_later() {
     assert_eq!(temps(&fs), 0);
 }
 
-/// A landing in steps whose put-back fails (the file moved aside isn't the expected one, and moving it back hits a
-/// disk error) keeps its landing record, and the next pass's recovery puts the file back. Runs on every platform,
-/// so Windows CI covers the steps it always uses.
+/// A landing in steps whose put-back fails (the download can't move into place after the file there was moved
+/// aside, and moving that one back hits a disk error too) keeps its landing record, and the next pass's recovery
+/// puts the file back. Runs on every platform, so Windows CI covers the steps it always uses.
 #[test]
 fn a_failed_put_back_is_finished_by_recovery() {
     use craft_cloud_sync::LandError;
     let (dir, fs) = disk();
-    let mut fs = fs.without_swap().failing_put_backs();
+    let mut fs = fs.without_swap().failing_landings().failing_put_backs();
     let old = fs.write(&rel("a.txt"), b"the user's", false, T0).unwrap();
-    let stale = craft_cloud_sync::FileMeta { mtime_ms: old.mtime_ms - 1_000, ..old };
     let mut w = fs.begin_write(&rel("a.txt")).unwrap();
     w.write_all(b"download").unwrap();
-    let Err(LandError::Changed(w)) = fs.finish_write(&rel("a.txt"), w, false, T0, Some(stale)) else { panic!("landed on another file") };
-    drop(w);
+    let Err(LandError::Io(_)) = fs.finish_write(&rel("a.txt"), w, false, T0, Some(old)) else { panic!("landed") };
     let names = |p: &std::path::Path| -> Vec<String> {
         let mut n: Vec<String> = std::fs::read_dir(p).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         n.sort();
