@@ -951,6 +951,54 @@ async fn a_folder_holding_a_tracked_link_isnt_moved_aside_for_a_newcomer() {
     assert!(files(&a).iter().any(|(p, d)| p.contains("c0") && d == b"clip"), "{:?}", files(&a));
 }
 
+/// The laptop renames a folder; the desktop deletes it and makes a new empty folder of the same name. The laptop
+/// makes the new folder for the server's change: it isn't the deleted one, so it isn't removed, and the new
+/// folder stays on the server.
+#[tokio::test]
+async fn a_new_folder_at_a_deleted_folders_name_is_not_taken_for_it() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    for i in 0..3 {
+        b.fs_mut().remove_file(&path(&format!("Footage/c{i}.mov"))).unwrap();
+    }
+    b.fs_mut().remove_dir(&path("Footage")).unwrap();
+    b.sync_once().await.unwrap();
+    b.fs_mut().mkdir(&path("Footage")).unwrap();
+    b.sync_once().await.unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(!report.removed_remotely.contains(&path("Footage")), "{report:?}");
+    settle(&mut [&mut a, &mut b], 6).await;
+    for m in [&a, &b] {
+        assert!(m.fs().dirs().contains(&path("Footage")), "{:?}", m.fs().dirs());
+    }
+    assert_eq!(files(&a), files(&b));
+}
+
+/// The same with a clip in the renamed folder that turned into a link, which the desktop moved out: neither the
+/// new folder nor the clip is deleted on the server while the link stays.
+#[tokio::test]
+async fn a_new_folder_at_a_kept_deleted_folders_name_deletes_nothing() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    b.fs_mut().rename(&path("Footage/c0.mov"), &path("c0.mov")).unwrap();
+    for i in 1..3 {
+        b.fs_mut().remove_file(&path(&format!("Footage/c{i}.mov"))).unwrap();
+    }
+    b.fs_mut().remove_dir(&path("Footage")).unwrap();
+    b.sync_once().await.unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().mkdir(&path("Footage")).unwrap();
+    b.sync_once().await.unwrap();
+    for _ in 0..4 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty(), "{report:?}");
+        b.sync_once().await.unwrap();
+    }
+    assert!(b.fs().dirs().contains(&path("Footage")), "{:?}", b.fs().dirs());
+    assert_eq!(read(&b, "c0.mov"), b"clip");
+}
+
 /// A folder that came back from another drive (a link replaced with the real folder again) has a new file ID.
 /// A later rename of it is still a move, so a link inside it isn't taken for deleted either.
 #[tokio::test]

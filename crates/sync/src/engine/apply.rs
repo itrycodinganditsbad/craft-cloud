@@ -773,7 +773,16 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             self.state.base.remove(&id);
             return Ok(());
         };
-        match self.local_state(&entry, &bpath)? {
+        let mut local = self.local_state(&entry, &bpath)?;
+        // A folder at the path that another tracked folder owns (a new folder the server made at this name, made
+        // here this pass) isn't this one: this one is gone here.
+        if matches!(entry.kind, BaseKind::Dir { .. })
+            && let Some(FsKind::Dir { id: here }) = self.stat(&bpath)?
+            && self.owns_local_dir(here, id)
+        {
+            local = Local::Missing;
+        }
+        match local {
             // A folder that still holds a tracked node stays tracked until that node is settled: a node whose own
             // change waits (it turned into a link in this folder, which the user moved) keeps its place through it.
             // The push sends nothing for a node the server deleted.
