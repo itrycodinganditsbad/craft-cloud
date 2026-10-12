@@ -4,6 +4,8 @@
 //!   server on the same machine needs no certificate. `localhost` is pinned to `127.0.0.1` and `::1` (never
 //!   looked up), so a hosts file or resolver can't send plain HTTP elsewhere. TLS is rustls with the platform's
 //!   certificate store.
+//! - **No proxies**: `HTTP_PROXY`, `ALL_PROXY` and friends are ignored, so nothing meant for this machine (or
+//!   the token) is handed to a proxy. Proxy support for HTTPS may come later.
 //! - **Everything from the network is capped** before it is buffered: a chunk at [`MAX_CHUNK_BYTES`], a
 //!   manifest at [`MAX_MANIFEST_BYTES`], a tree or change-feed page at [`MAX_PAGE_JSON_BYTES`] and every other
 //!   answer (including error bodies) at [`MAX_SMALL_JSON_BYTES`]. Lists are checked against the API's limits.
@@ -150,7 +152,9 @@ fn is_loopback(url: &Url) -> bool {
 const LOCALHOST: [SocketAddr; 2] = [SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)];
 
 fn client(server: &ServerUrl) -> Result<Client, TransportError> {
-    let mut builder = Client::builder();
+    // No proxy: `HTTP_PROXY`/`ALL_PROXY` would carry the plain-HTTP loopback requests (token, password) off the
+    // machine. Proxy support for HTTPS comes later, if asked for.
+    let mut builder = Client::builder().no_proxy();
     if server.0.host_str() == Some("localhost") {
         builder = builder.resolve_to_addrs("localhost", &LOCALHOST);
     }
