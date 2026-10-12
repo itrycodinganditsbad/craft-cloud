@@ -5,7 +5,7 @@
 //!
 //! The locks are the OS's advisory file locks (`flock` on Unix, `LockFileEx` on Windows), released when the
 //! process ends, even by a crash, so a stale lock never blocks the next run. A filesystem that doesn't support
-//! locking (some network shares) can't be protected this way: the command goes ahead with a printed warning.
+//! locking (some network shares; NFS without `lockd` answers `ENOLCK` or `EOPNOTSUPP`) can't be protected this way: the command goes ahead with a printed warning.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
@@ -53,7 +53,7 @@ pub fn acquire(path: &Path) -> Result<(Lock, Option<String>), LockError> {
     match file.try_lock() {
         Ok(()) => Ok((Lock { _file: Some(file) }, None)),
         Err(TryLockError::WouldBlock) => Err(LockError::Busy(path.to_owned())),
-        Err(TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => Ok((
+        Err(TryLockError::Error(e)) if cannot_lock(&e) => Ok((
             Lock { _file: None },
             Some(format!(
                 "warning: {} can't be locked on this filesystem; make sure no other craft-cloud-agent runs at the same time",
@@ -64,9 +64,43 @@ pub fn acquire(path: &Path) -> Result<(Lock, Option<String>), LockError> {
     }
 }
 
+/// Whether `e` says this filesystem can't lock at all (as opposed to the lock being held): `Unsupported`, and on
+/// Unix the raw `ENOLCK` and `EOPNOTSUPP`/`ENOTSUP` that NFS without a lock daemon (`lockd`) and some FUSE or
+/// network mounts answer with.
+fn cannot_lock(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    if let Some(code) = e.raw_os_error() {
+        use rustix::io::Errno;
+        let found = Errno::from_raw_os_error(code);
+        return [Errno::NOLCK, Errno::OPNOTSUPP, Errno::NOTSUP].contains(&found);
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filesystems_that_cannot_lock_are_told_from_a_lock_that_is_held() {
+        assert!(cannot_lock(&io::Error::from(io::ErrorKind::Unsupported)));
+        assert!(!cannot_lock(&io::Error::from(io::ErrorKind::PermissionDenied)));
+        assert!(!cannot_lock(&io::Error::other("x")));
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        {
+            use rustix::io::Errno;
+            for errno in [Errno::NOLCK, Errno::OPNOTSUPP, Errno::NOTSUP] {
+                assert!(cannot_lock(&io::Error::from_raw_os_error(errno.raw_os_error())), "{errno}");
+            }
+            // EACCES/EAGAIN-style answers are real failures or a held lock, not "can't lock here".
+            for errno in [Errno::ACCESS, Errno::AGAIN, Errno::BADF, Errno::IO] {
+                assert!(!cannot_lock(&io::Error::from_raw_os_error(errno.raw_os_error())), "{errno}");
+            }
+        }
+    }
 
     #[test]
     fn a_second_holder_is_refused_until_the_first_lets_go() {
