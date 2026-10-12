@@ -232,3 +232,25 @@ fn the_root_lists_only_while_its_marker_is_there() {
     std::fs::create_dir(dir.path().join(".craft-cloud/root.json")).unwrap();
     assert!(fs.list(&rel("")).is_err(), "a folder in the marker's place doesn't count");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_root_that_is_a_link_is_a_folder() {
+    let (real, _) = disk();
+    let holder = tempfile::tempdir().unwrap();
+    let link = holder.path().join("synced");
+    std::os::unix::fs::symlink(real.path(), &link).unwrap();
+    let mut fs = DiskFs::new(&link);
+    assert!(matches!(fs.stat(&rel("")).unwrap(), Some(FsKind::Dir { .. })));
+    fs.write(&rel("a"), b"a", false, T0).unwrap();
+    fs.write(&rel("B"), b"b", false, T0).unwrap();
+    let listed = fs.list(&rel("")).unwrap();
+    assert!(matches!(listed.iter().find(|e| e.name == "a").unwrap().kind, FsKind::File(_)));
+    // Top-level names have a real parent for the engine's twin checks (`case_twin`, `linked_twin`).
+    assert!(matches!(fs.stat(&rel("a").parent().unwrap()).unwrap(), Some(FsKind::Dir { .. })));
+    // Links inside the root stay links.
+    std::os::unix::fs::symlink(real.path(), real.path().join("inner")).unwrap();
+    assert_eq!(fs.stat(&rel("inner")).unwrap(), Some(FsKind::Other));
+    // A missing root is nothing, not an error.
+    assert_eq!(DiskFs::new(holder.path().join("gone")).stat(&rel("")).unwrap(), None);
+}

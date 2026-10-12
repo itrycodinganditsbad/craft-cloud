@@ -4,6 +4,8 @@
 //!   operation checks that the folders above its path are real folders, so a folder the user replaced with a
 //!   link is not walked into. (The check and the operation are separate system calls, so a link swapped in
 //!   between them is still followed; closing that needs `openat`-style calls and comes with the watcher.)
+//! - **The root itself may be a link.** A synced folder that is a symlink or junction (the user's choice) is
+//!   followed and is a folder; links *inside* it are still [`FsKind::Other`].
 //! - **Writes are atomic.** New content goes to a temporary file in `<root>/.craft-cloud/tmp/` (same volume,
 //!   so the rename is atomic), is flushed to disk, gets the replaced file's permissions (Unix), its modification
 //!   time and executable bit, and is then renamed over the target. Any error, or a writer dropped without
@@ -402,6 +404,18 @@ impl DiskFs {
         }
     }
 
+    /// Whether `path` is a real folder: the root counts when it is a folder or a link to one (the user's choice).
+    fn is_folder(&self, path: &RelPath) -> io::Result<bool> {
+        if path.is_root() {
+            return match fs::metadata(&self.root) {
+                Ok(md) => Ok(md.is_dir()),
+                Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => Ok(false),
+                Err(e) => Err(e),
+            };
+        }
+        Ok(Self::lstat(&self.full(path))?.is_some_and(|md| md.file_type().is_dir()))
+    }
+
     /// The full path of a regular file at `path` (not a link, folder or device).
     fn regular_file(&self, path: &RelPath) -> io::Result<PathBuf> {
         let full = self.require(path)?;
@@ -419,9 +433,8 @@ impl DiskFs {
         }
         let full = self.require(path)?;
         let parent = path.parent().unwrap_or_default();
-        match Self::lstat(&self.full(&parent))? {
-            Some(md) if md.file_type().is_dir() => {}
-            _ => return Err(io::Error::new(io::ErrorKind::NotFound, format!("{parent}: no such folder"))),
+        if !self.is_folder(&parent)? {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("{parent}: no such folder")));
         }
         if Self::lstat(&full)?.is_some_and(|md| md.file_type().is_dir()) {
             return Err(io::Error::other(format!("{path}: is a directory")));
@@ -474,6 +487,15 @@ impl Fs for DiskFs {
     }
 
     fn stat(&self, path: &RelPath) -> io::Result<Option<FsKind>> {
+        if path.is_root() {
+            // The root is the user's choice: a link or junction there is followed, and it is a folder.
+            return match fs::metadata(&self.root) {
+                Ok(md) if md.is_dir() => Ok(Some(FsKind::Dir { id: local_id(&md, &self.root) })),
+                Ok(_) => Ok(Some(FsKind::Other)),
+                Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => Ok(None),
+                Err(e) => Err(e),
+            };
+        }
         let Some(full) = self.checked(path)? else { return Ok(None) };
         Ok(Self::lstat(&full)?.map(|md| kind_of(&md, &full)))
     }
@@ -556,7 +578,7 @@ impl Fs for DiskFs {
             return Err(not_found(from));
         }
         let parent = to.parent().unwrap_or_default();
-        if !Self::lstat(&self.full(&parent))?.is_some_and(|md| md.file_type().is_dir()) {
+        if !self.is_folder(&parent)? {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("{parent}: no such folder")));
         }
         rename_no_replace(&source, &target)
