@@ -6,6 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use craft_cloud_proto::Name;
 
@@ -82,8 +84,15 @@ pub trait Fs: Send {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MemNode {
-    File { data: Vec<u8>, meta: FileMeta },
-    Dir { id: u64 },
+    File {
+        data: Vec<u8>,
+        meta: FileMeta,
+    },
+    Dir {
+        id: u64,
+    },
+    /// A symlink, junction or special file: listed, never read or followed.
+    Other,
 }
 
 /// A filesystem in memory. Every write gets a later mtime; every new file or directory a new ID.
@@ -94,13 +103,23 @@ pub struct MemFs {
     next_id: u64,
     locked: BTreeSet<RelPath>,
     held: BTreeSet<RelPath>,
+    death: Option<Arc<Death>>,
+}
+
+/// A machine that dies partway through a pass (see [`MemFs::die_after`]).
+#[derive(Debug)]
+struct Death {
+    /// Changes still allowed before the machine dies.
+    remaining: AtomicU64,
+    /// Set when it died; shared with whatever else dies with it (the network).
+    dead: Arc<AtomicBool>,
 }
 
 impl Default for MemFs {
     fn default() -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert(RelPath::root(), MemNode::Dir { id: 1 });
-        Self { nodes, clock: 1_000, next_id: 2, locked: BTreeSet::new(), held: BTreeSet::new() }
+        Self { nodes, clock: 1_000, next_id: 2, locked: BTreeSet::new(), held: BTreeSet::new(), death: None }
     }
 }
 
@@ -130,7 +149,7 @@ impl MemFs {
     fn require_dir(&self, path: &RelPath) -> io::Result<()> {
         match self.nodes.get(path) {
             Some(MemNode::Dir { .. }) => Ok(()),
-            Some(MemNode::File { .. }) => Err(io::Error::other(format!("{path}: not a directory"))),
+            Some(MemNode::File { .. } | MemNode::Other) => Err(io::Error::other(format!("{path}: not a directory"))),
             None => Err(not_found(path)),
         }
     }
@@ -140,6 +159,41 @@ impl MemFs {
             Some(parent) => self.require_dir(&parent),
             None => Err(io::Error::other("the root has no parent")),
         }
+    }
+
+    /// Makes the machine die after `changes` more changes (writes landing, folders made, removals, renames): every
+    /// filesystem call after that fails, and `dead` is set, so a transport that watches it fails too. For crash
+    /// tests: the engine is cut off between two filesystem steps. [`MemFs::revive`] ends it.
+    pub fn die_after(&mut self, changes: u64, dead: Arc<AtomicBool>) {
+        self.death = Some(Arc::new(Death { remaining: AtomicU64::new(changes), dead }));
+    }
+
+    /// Brings a machine [`MemFs::die_after`] killed back (its folder as it was when it died).
+    pub fn revive(&mut self) {
+        self.death = None;
+    }
+
+    fn alive(&self) -> io::Result<()> {
+        match &self.death {
+            Some(d) if d.dead.load(Ordering::Relaxed) => Err(io::Error::other("the machine died")),
+            _ => Ok(()),
+        }
+    }
+
+    /// Spends one change; the machine dies instead when none is left.
+    fn change(&self) -> io::Result<()> {
+        self.alive()?;
+        if let Some(d) = &self.death {
+            // One engine drives a filesystem at a time, so a load and a store are enough.
+            match d.remaining.load(Ordering::Relaxed).checked_sub(1) {
+                Some(left) => d.remaining.store(left, Ordering::Relaxed),
+                None => {
+                    d.dead.store(true, Ordering::Relaxed);
+                    return Err(io::Error::other("the machine died"));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Makes reading `path` fail with "permission denied", like a file another program holds locked.
@@ -182,8 +236,22 @@ impl MemFs {
         match self.nodes.get(path) {
             Some(MemNode::File { data, .. }) => Ok(data),
             Some(MemNode::Dir { .. }) => Err(io::Error::other(format!("{path}: is a directory"))),
+            Some(MemNode::Other) => Err(io::Error::other(format!("{path}: not a regular file"))),
             None => Err(not_found(path)),
         }
+    }
+
+    /// Puts a symlink (or another special file) at `path`, like a user who replaced a file or folder with a link.
+    /// It lists and stats as [`FsKind::Other`] and is never read or followed; whatever was at `path` goes.
+    pub fn make_link(&mut self, path: &RelPath) -> io::Result<()> {
+        self.require_parent(path)?;
+        let mut gone = self.below(path);
+        gone.push(path.clone());
+        for p in gone {
+            self.nodes.remove(&p);
+        }
+        self.nodes.insert(path.clone(), MemNode::Other);
+        Ok(())
     }
 
     /// Every file with its content, for comparing machines in tests.
@@ -210,6 +278,7 @@ impl Fs for MemFs {
     }
 
     fn list(&self, dir: &RelPath) -> io::Result<Vec<FsEntry>> {
+        self.alive()?;
         self.require_dir(dir)?;
         self.check_held(dir)?;
         let depth = dir.depth() + 1;
@@ -222,6 +291,7 @@ impl Fs for MemFs {
                 let kind = match n {
                     MemNode::File { meta, .. } => FsKind::File(*meta),
                     MemNode::Dir { id } => FsKind::Dir { id: Some(*id) },
+                    MemNode::Other => FsKind::Other,
                 };
                 Some(FsEntry { name, kind })
             })
@@ -229,17 +299,21 @@ impl Fs for MemFs {
     }
 
     fn stat(&self, path: &RelPath) -> io::Result<Option<FsKind>> {
+        self.alive()?;
         Ok(self.nodes.get(path).map(|n| match n {
             MemNode::File { meta, .. } => FsKind::File(*meta),
             MemNode::Dir { id } => FsKind::Dir { id: Some(*id) },
+            MemNode::Other => FsKind::Other,
         }))
     }
 
     fn open(&self, path: &RelPath) -> io::Result<Box<dyn Read + Send + '_>> {
+        self.alive()?;
         Ok(Box::new(self.data(path)?))
     }
 
     fn read_at(&self, path: &RelPath, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        self.alive()?;
         let data = self.data(path)?;
         let start = usize::try_from(offset).map_or(data.len(), |o| o.min(data.len()));
         let end = start.saturating_add(len).min(data.len());
@@ -247,6 +321,7 @@ impl Fs for MemFs {
     }
 
     fn begin_write(&mut self, path: &RelPath) -> io::Result<Self::Writer> {
+        self.alive()?;
         self.require_parent(path)?;
         if let Some(MemNode::Dir { .. }) = self.nodes.get(path) {
             return Err(io::Error::other(format!("{path}: is a directory")));
@@ -255,6 +330,7 @@ impl Fs for MemFs {
     }
 
     fn finish_write(&mut self, path: &RelPath, writer: Self::Writer, exec: bool, mtime_ms: i64) -> io::Result<FileMeta> {
+        self.change()?;
         self.require_parent(path)?;
         self.check_held(path)?;
         if let Some(MemNode::Dir { .. }) = self.nodes.get(path) {
@@ -269,6 +345,7 @@ impl Fs for MemFs {
     }
 
     fn mkdir(&mut self, path: &RelPath) -> io::Result<()> {
+        self.change()?;
         self.require_parent(path)?;
         if self.nodes.contains_key(path) {
             return Err(exists(path));
@@ -279,9 +356,10 @@ impl Fs for MemFs {
     }
 
     fn remove_file(&mut self, path: &RelPath) -> io::Result<()> {
+        self.change()?;
         self.check_held(path)?;
         match self.nodes.get(path) {
-            Some(MemNode::File { .. }) => {
+            Some(MemNode::File { .. } | MemNode::Other) => {
                 self.nodes.remove(path);
                 Ok(())
             }
@@ -291,6 +369,7 @@ impl Fs for MemFs {
     }
 
     fn remove_dir(&mut self, path: &RelPath) -> io::Result<()> {
+        self.change()?;
         self.require_dir(path)?;
         self.check_held(path)?;
         if path.is_root() || !self.below(path).is_empty() {
@@ -301,6 +380,7 @@ impl Fs for MemFs {
     }
 
     fn rename(&mut self, from: &RelPath, to: &RelPath) -> io::Result<()> {
+        self.change()?;
         if !self.nodes.contains_key(from) || from.is_root() {
             return Err(not_found(from));
         }

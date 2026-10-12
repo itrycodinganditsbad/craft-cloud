@@ -1,7 +1,8 @@
 //! Deterministic simulation: three machines share one account and do random things to their folders
 //! (create, edit, delete, rename, move files and folders, hold files locked or open, make folders unlistable),
 //! sync at random moments, sometimes with the
-//! connection failing mid-pass. Then everyone syncs until nothing changes, and we check:
+//! connection failing mid-pass, and sometimes crash during a pass and restart from the state saved after the
+//! pass before. Then everyone syncs until nothing changes, and we check:
 //!
 //! 1. **Convergence**: every machine ends with exactly the same files and folders.
 //! 2. **Nothing the engine saw is lost**: every file content that was on a disk when a pass started is still
@@ -13,17 +14,19 @@
 //! It also checks after every finished pass that each node a machine tracks still has a place in its folder.
 //!
 //! Each seed is reproducible: `SIM_SEED=17 cargo test -p craft-cloud-sync --test simulation`. By default 40
-//! seeds run; `SIM_SEEDS=1000 SIM_FIRST=2000` runs seeds 2000 to 2999 (use `--release`). `SIM_TRACE=1` prints
-//! every pass's report and each machine's folder after every step.
+//! seeds run; `SIM_SEEDS=1000 SIM_FIRST=2000` runs seeds 2000 to 2999 (use `--release`). Seeds run in parallel on
+//! `SIM_JOBS` workers (default: the machine's parallelism, at most 8). `SIM_TRACE=1` prints every pass's report
+//! and each machine's folder after every step.
 
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use common::{Machine, Server, machine_config};
+use common::{Machine, Server, machine_config, restart};
 use craft_cloud_proto::FileHash;
-use craft_cloud_sync::{Fs, FsKind, MemFs, RelPath, rel};
+use craft_cloud_sync::{Fs, FsKind, MemFs, RelPath, Report, State, rel};
 
 /// xorshift64*: tiny, deterministic, good enough to pick actions.
 struct Rng(u64);
@@ -76,14 +79,55 @@ fn hashes_of(m: &Machine) -> BTreeSet<FileHash> {
     m.fs().files().values().map(|d| FileHash::from_bytes(*blake3::hash(d).as_bytes())).collect()
 }
 
+/// Whether a pass left nothing for later: no refused operation, no node skipped for a filesystem error. A machine
+/// recovering from a crash has redone what the crash lost once it finishes such a pass.
+fn settled(report: &Report) -> bool {
+    report.refused.is_empty() && !report.skipped.iter().any(|(_, why)| why.ends_with("tried again next pass"))
+}
+
+/// How many finished passes after a restart a machine may still be redoing what the crash lost (passes that fail
+/// partway don't count: they haven't redone it yet). The first finished pass applies the server's tree and redoes
+/// the lost bookkeeping; a refused operation is resubmitted on the next pass, and a node skipped for a filesystem
+/// error (a held file) is retried on the one after, so three finished passes cover a crash's own consequences.
+/// Copies made later are the engine's ordinary decisions and are checked.
+const RECOVERY_PASSES: u32 = 3;
+
+/// The contents of the files a pass uploaded as new (at paths the machine didn't track before the pass).
+fn new_uploads(report: &Report, tracked_before: &BTreeMap<RelPath, craft_cloud_proto::NodeId>, m: &Machine) -> Vec<FileHash> {
+    let files = m.fs().files();
+    report
+        .uploaded
+        .iter()
+        .filter(|p| !tracked_before.contains_key(*p))
+        .filter_map(|p| files.get(p))
+        .map(|d| FileHash::from_bytes(*blake3::hash(d).as_bytes()))
+        .collect()
+}
+
+/// The conflict copies that appeared on `m` since `before` (its files then).
+fn new_copies(before: &[RelPath], m: &Machine) -> Vec<RelPath> {
+    files_of(m).into_iter().filter(|p| !before.contains(p)).filter(|p| p.file_name().is_some_and(|n| n.as_str().contains(" (conflict, "))).collect()
+}
+
 /// The engine's skip reason for a name that clashes by case with one it syncs (`Engine::scan`).
 fn is_case_clash(reason: &str) -> bool {
     reason.starts_with("the name clashes with ") && reason.ends_with(" when case is ignored")
 }
 
-/// One random user action on a machine's folder. Failures (target exists, parent missing) are ignored,
-/// like a user's failed click.
-fn act(rng: &mut Rng, m: &mut Machine, destroyed: &mut BTreeSet<FileHash>) {
+/// After a user's rename of `from` to `to`, exempt copies at or below `from` are found at `to` (on every machine,
+/// once it syncs).
+fn follow_rename(exempt: &mut BTreeSet<(usize, RelPath)>, from: &RelPath, to: &RelPath) {
+    let moved: Vec<(usize, RelPath)> = exempt.iter().filter(|(_, p)| p.starts_with(from)).cloned().collect();
+    for (j, p) in moved {
+        let mut names = to.names().to_vec();
+        names.extend_from_slice(&p.names()[from.depth()..]);
+        exempt.insert((j, RelPath::from_names(names)));
+    }
+}
+
+/// One random user action on a machine's folder. Failures (target exists, parent missing) are ignored, like a
+/// user's failed click. `exempt` follows the user's renames.
+fn act(rng: &mut Rng, m: &mut Machine, destroyed: &mut BTreeSet<FileHash>, exempt: &mut BTreeSet<(usize, RelPath)>) {
     // The content at `p`, read straight from memory: a locked file is still overwritten or deleted by its user.
     // It counts as destroyed only once the user's write or delete went through.
     let old = |m: &Machine, p: &RelPath| m.fs().files().get(p).map(|d| FileHash::from_bytes(*blake3::hash(d).as_bytes()));
@@ -124,7 +168,10 @@ fn act(rng: &mut Rng, m: &mut Machine, destroyed: &mut BTreeSet<FileHash>) {
                 let dir = if rng.below(2) == 0 { RelPath::root() } else { rel(rng.pick(DIRS).copied().unwrap_or("y")) };
                 let name = rng.pick(NAMES).copied().unwrap_or("b.txt");
                 // A rename never replaces anything (it fails when the target exists), so it destroys nothing.
-                let _ = m.fs_mut().rename(&f, &rel(&format!("{dir}/{name}")));
+                let to = rel(&format!("{dir}/{name}"));
+                if m.fs_mut().rename(&f, &to).is_ok() {
+                    follow_rename(exempt, &f, &to);
+                }
             }
         }
         6 => {
@@ -170,7 +217,10 @@ fn act(rng: &mut Rng, m: &mut Machine, destroyed: &mut BTreeSet<FileHash>) {
         }
         _ => {
             if let (Some(d), Some(to)) = (rng.pick(&dirs).cloned(), rng.pick(DIRS).copied()) {
-                let _ = m.fs_mut().rename(&d, &rel(to));
+                let to = rel(to);
+                if m.fs_mut().rename(&d, &to).is_ok() {
+                    follow_rename(exempt, &d, &to);
+                }
             }
         }
     }
@@ -189,22 +239,94 @@ async fn run(seed: u64, steps: usize) {
     let mut rng = Rng::new(seed);
     let mut seen: BTreeSet<FileHash> = BTreeSet::new();
     let mut destroyed: BTreeSet<FileHash> = BTreeSet::new();
+    // What each machine's agent saved after its last pass (a crash restarts from it).
+    let mut saved: Vec<State> = vec![State::default(); ms.len()];
+    // A machine is recovering from a crash for at most RECOVERY_PASSES passes after its restart, less if a pass
+    // finishes with nothing left for later. Conflict copies it makes meanwhile may hold content that is already at
+    // the original name: the crashed pass downloaded or moved files and lost the bookkeeping, and when the user
+    // then locked, moved or edited them the engine can't tell its own work from the user's. A copy is the safe
+    // answer (nothing is lost), so exactly those copies (by machine and path) are exempt from the needless-copy
+    // check below; every other check still holds, for every file.
+    let mut recovering: Vec<u32> = vec![0; ms.len()];
+    let mut after_crash: BTreeSet<(usize, RelPath)> = BTreeSet::new();
+    // Contents a recovering machine uploaded as new files: files it no longer recognised as tracked (the crash lost
+    // that bookkeeping) go up as new nodes, so the server holds the same content twice, and another machine may
+    // later keep a copy of one in the other's way. Copies of exactly that content are exempt too, and only content
+    // that was already on that machine's disk when it crashed (what the crash left behind, not anything new).
+    let mut reuploaded: BTreeSet<FileHash> = BTreeSet::new();
+    let mut at_crash: Vec<BTreeSet<FileHash>> = vec![BTreeSet::new(); ms.len()];
 
     for step in 0..steps {
         let i = rng.below(ms.len());
         let Some(m) = ms.get_mut(i) else { continue };
         if rng.below(3) == 0 {
             seen.extend(hashes_of(m));
-            let every = if rng.below(4) == 0 { 2 + rng.below(6) as u64 } else { 0 };
+            // A crash: the agent dies during this pass, before it saves the state. A third of the time the pass is cut
+            // short at a random server call, a third of the time the machine dies after a few filesystem changes
+            // (between two steps of the pass), otherwise the pass runs to the end. It restarts from the state saved
+            // after its previous pass, with its folder and the server as the crashed pass left them.
+            // `SIM_NO_CRASH=1` runs the same history with the crashed passes kept (no restart), to tell crash bugs apart.
+            let crash_roll = rng.below(8) == 0;
+            let crash = crash_roll && std::env::var("SIM_NO_CRASH").is_err();
+            let how = if crash_roll { rng.below(3) } else { usize::MAX };
+            let every = if how == 0 {
+                2 + rng.below(12) as u64
+            } else if rng.below(4) == 0 {
+                2 + rng.below(6) as u64
+            } else {
+                0
+            };
             m.transport().faults.every.store(every, Ordering::Relaxed);
+            if how == 1 {
+                let dead = m.transport().faults.dead.clone();
+                let changes = rng.below(8) as u64;
+                m.fs_mut().die_after(changes, dead);
+            }
             if rng.below(2) == 0 {
                 m.approve_deletes();
             }
+            let before = files_of(m);
+            let tracked_before = m.state().base_index();
             let r = m.sync_once().await;
             if std::env::var("SIM_TRACE").is_ok() {
                 eprintln!("TRACE step {step} m{i} sync: {r:?}\n  files {}\n  dirs {:?}", listing(m), m.fs().dirs());
             }
+            if let Some(left) = recovering.get_mut(i).filter(|left| **left > 0) {
+                after_crash.extend(new_copies(&before, m).into_iter().map(|p| (i, p)));
+                if let Ok(report) = &r {
+                    let left_behind = at_crash.get(i).cloned().unwrap_or_default();
+                    reuploaded.extend(new_uploads(report, &tracked_before, m).into_iter().filter(|h| left_behind.contains(h)));
+                }
+                *left = match &r {
+                    _ if crash => *left,
+                    Ok(report) if settled(report) => 0,
+                    Ok(_) => *left - 1,
+                    // A pass that failed partway hasn't redone the bookkeeping yet; it doesn't count.
+                    Err(_) => *left,
+                };
+            }
             m.transport().faults.every.store(0, Ordering::Relaxed);
+            m.fs_mut().revive();
+            m.transport().faults.dead.store(false, Ordering::Relaxed);
+            if crash {
+                if let Some(left_behind) = at_crash.get_mut(i) {
+                    *left_behind = hashes_of(m);
+                }
+                let state = saved.get(i).cloned().unwrap_or_default();
+                let fresh = restart(m, state, |c| c.racy_window_ms = racy);
+                *m = fresh;
+                if let Some(left) = recovering.get_mut(i) {
+                    *left = RECOVERY_PASSES;
+                }
+                if std::env::var("SIM_TRACE").is_ok() {
+                    eprintln!("TRACE step {step} m{i} crashed and restarted from its last saved state");
+                }
+                continue;
+            }
+            // The agent saves the state after every pass, finished or not.
+            if let Some(s) = saved.get_mut(i) {
+                *s = m.state().clone();
+            }
             // After a finished pass every node the machine tracks has a place in its folder. A node skipped for a
             // filesystem error may wait one more pass for it (its folder was moved aside, say, and it couldn't be
             // looked up), so passes that skipped one aren't checked.
@@ -219,7 +341,7 @@ async fn run(seed: u64, steps: usize) {
                 }
             }
         } else {
-            act(&mut rng, m, &mut destroyed);
+            act(&mut rng, m, &mut destroyed, &mut after_crash);
             if std::env::var("SIM_TRACE").is_ok() {
                 eprintln!("TRACE step {step} m{i} act\n  files {}\n  dirs {:?}", listing(m), m.fs().dirs());
             }
@@ -239,7 +361,18 @@ async fn run(seed: u64, steps: usize) {
         let mut changed = false;
         for (i, m) in ms.iter_mut().enumerate() {
             m.approve_deletes();
+            let before = files_of(m);
+            let tracked_before = m.state().base_index();
             let report = m.sync_once().await.unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            if let Some(left) = recovering.get_mut(i).filter(|left| **left > 0) {
+                after_crash.extend(new_copies(&before, m).into_iter().map(|p| (i, p)));
+                let left_behind = at_crash.get(i).cloned().unwrap_or_default();
+                reuploaded.extend(new_uploads(&report, &tracked_before, m).into_iter().filter(|h| left_behind.contains(h)));
+                *left = if settled(&report) { 0 } else { *left - 1 };
+            }
+            if std::env::var("SIM_TRACE").is_ok() {
+                eprintln!("TRACE settle m{i} sync: {report:?}\n  files {}\n  dirs {:?}", listing(m), m.fs().dirs());
+            }
             changed |= report.changed() || !report.pending_deletes.is_empty() || !report.pending_local_deletes.is_empty();
             if let Some(s) = skipped.get_mut(i) {
                 *s = report.skipped.iter().filter(|(_, why)| is_case_clash(why)).map(|(p, _)| rel(p)).collect();
@@ -288,6 +421,13 @@ async fn run(seed: u64, steps: usize) {
         for (p, data) in &all {
             let (Some(parent), Some(name)) = (p.parent(), p.file_name().map(|n| n.as_str())) else { continue };
             let Some(start) = name.rfind(" (conflict, ") else { continue };
+            // A copy a recovering machine made (its device name is in the copy's name) at this very path.
+            if (0..ms.len()).any(|j| name.contains(&format!("(conflict, m{j},")) && after_crash.contains(&(j, p.clone()))) {
+                continue;
+            }
+            if reuploaded.contains(&FileHash::from_bytes(*blake3::hash(data).as_bytes())) {
+                continue;
+            }
             let Some(end) = name.get(start..).and_then(|rest| rest.find(')')).map(|e| start + e + 1) else { continue };
             let original = format!("{}{}", name.get(..start).unwrap_or(""), name.get(end..).unwrap_or(""));
             if NAMES.iter().filter(|n| n.eq_ignore_ascii_case(&original)).count() > 1 {
@@ -312,15 +452,67 @@ async fn run(seed: u64, steps: usize) {
     assert!(gone.is_empty(), "seed {seed}: file contents no user overwrote or deleted are on no machine: {gone:?}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn random_histories_converge_without_losing_data() {
+fn runtime(threads: usize) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread().worker_threads(threads).enable_all().build().unwrap()
+}
+
+/// The text a panicking seed left.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(text) => *text,
+        Err(payload) => payload.downcast::<&str>().map_or_else(|_| "a seed panicked".to_owned(), |text| (*text).to_owned()),
+    }
+}
+
+/// Seeds run in parallel: `SIM_JOBS` workers (default: the machine's parallelism, at most 8) take seeds from a
+/// shared counter. Each seed is independent (its own server and machines) and deterministic, so the order doesn't
+/// matter. On failure the lowest failing seed is reported with its own message; `SIM_SEED=<n>` replays it alone.
+/// Once a seed fails, no higher seed is started.
+#[test]
+fn random_histories_converge_without_losing_data() {
     if let Ok(seed) = std::env::var("SIM_SEED") {
-        run(seed.parse().unwrap(), 120).await;
+        runtime(2).block_on(run(seed.parse().unwrap(), 120));
         return;
     }
     let seeds: u64 = std::env::var("SIM_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
     let first: u64 = std::env::var("SIM_FIRST").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    for seed in first..first + seeds {
-        run(seed, 120).await;
+    let jobs: usize = std::env::var("SIM_JOBS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().min(8)))
+        .max(1);
+    let end = first + seeds;
+    let next = Arc::new(AtomicU64::new(first));
+    let lowest_failure = Arc::new(AtomicU64::new(u64::MAX));
+    let failures: Arc<Mutex<Vec<(u64, String)>>> = Arc::default();
+    runtime(jobs).block_on(async {
+        let workers: Vec<_> = (0..jobs)
+            .map(|_| {
+                let (next, lowest_failure, failures) = (next.clone(), lowest_failure.clone(), failures.clone());
+                tokio::spawn(async move {
+                    loop {
+                        let seed = next.fetch_add(1, Ordering::Relaxed);
+                        if seed >= end || seed > lowest_failure.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if let Err(e) = tokio::spawn(run(seed, 120)).await {
+                            let message = if e.is_panic() { panic_message(e.into_panic()) } else { format!("seed {seed}: {e}") };
+                            lowest_failure.fetch_min(seed, Ordering::Relaxed);
+                            failures.lock().unwrap().push((seed, message));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.await.unwrap();
+        }
+    });
+    let mut failures = std::mem::take(&mut *failures.lock().unwrap());
+    failures.sort();
+    if let Some((_, message)) = failures.first() {
+        let others: Vec<String> = failures.iter().skip(1).map(|(seed, _)| seed.to_string()).collect();
+        let also = if others.is_empty() { String::new() } else { format!("\n(seeds {} failed too)", others.join(", ")) };
+        panic!("{message}{also}");
     }
 }

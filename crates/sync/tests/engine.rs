@@ -685,3 +685,307 @@ async fn a_file_renamed_to_an_ignored_name_doesnt_take_the_remote_edit() {
     assert_eq!(read(&b, "doc.txt"), b"v2 laptop");
     assert_eq!(read(&b, "doc.tmp"), b"v1");
 }
+
+#[tokio::test]
+async fn a_file_moved_aside_for_a_newcomer_is_not_sent_as_a_user_move() {
+    // The server moved a.txt into x and a new a.txt took its old name. Here x is held open, so the move can't
+    // happen; the newcomer still needs the name, so the tracked file is moved aside. That rename is the engine's,
+    // not the user's: it must not go up as a move (the server's node would leave x for a conflict name).
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("x")).unwrap();
+    write(&mut a, "a.txt", b"moved into x");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().rename(&path("a.txt"), &path("x/a.txt")).unwrap();
+    a.sync_once().await.unwrap();
+    write(&mut a, "a.txt", b"a newcomer");
+    a.sync_once().await.unwrap();
+    b.fs_mut().hold(&path("x"));
+    let report = b.sync_once().await.unwrap();
+    assert!(report.moved_remotely.is_empty(), "{report:?}");
+    b.fs_mut().unlock_all();
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&a), files(&b));
+    assert_eq!(read(&b, "x/a.txt"), b"moved into x");
+    assert_eq!(read(&b, "a.txt"), b"a newcomer");
+    assert!(conflict_copies(&b).is_empty(), "{:?}", files(&b));
+}
+
+#[tokio::test]
+async fn an_approval_releases_only_the_deletes_it_names() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    for i in 0..30 {
+        write(&mut a, &format!("f{i:02}.txt"), format!("file {i}").as_bytes());
+    }
+    settle(&mut [&mut a, &mut b], 5).await;
+    for i in 0..12 {
+        a.fs_mut().remove_file(&path(&format!("f{i:02}.txt"))).unwrap();
+    }
+    let shown = a.sync_once().await.unwrap();
+    assert_eq!((shown.pending_deletes.len(), shown.pending_nodes.len()), (12, 12));
+    // More vanish before the user approves what they saw: only the 12 shown go.
+    for i in 12..24 {
+        a.fs_mut().remove_file(&path(&format!("f{i:02}.txt"))).unwrap();
+    }
+    a.approve_deletes_of(shown.pending_nodes.clone());
+    let report = a.sync_once().await.unwrap();
+    assert_eq!((report.removed_remotely.len(), report.pending_deletes.len()), (12, 12), "{report:?}");
+    assert!(report.pending_nodes.iter().all(|id| !shown.pending_nodes.contains(id)));
+
+    // The same on the receiving side: the desktop shows 12 to remove, the laptop then lets 12 more go.
+    let shown = b.sync_once().await.unwrap();
+    assert_eq!(shown.pending_local_deletes.len(), 12, "{shown:?}");
+    a.approve_deletes();
+    a.sync_once().await.unwrap();
+    b.approve_deletes_of(shown.pending_nodes.clone());
+    let report = b.sync_once().await.unwrap();
+    assert_eq!((report.removed_locally.len(), report.pending_local_deletes.len()), (12, 12), "{report:?}");
+    assert_eq!(b.fs().files().len(), 18);
+}
+
+#[tokio::test]
+async fn a_tracked_folder_or_file_that_became_a_link_is_never_deleted() {
+    // Footage moved to another drive with a link left in its place; notes.txt replaced by a link too. Neither is
+    // gone: nothing is deleted on the server or on the other machine.
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    write(&mut a, "notes.txt", b"notes");
+    write(&mut a, "other.txt", b"other");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.fs_mut().make_link(&path("notes.txt")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.removed_remotely.is_empty() && report.pending_deletes.is_empty(), "{report:?}");
+    for name in ["Footage", "notes.txt"] {
+        assert!(report.skipped.iter().any(|(p, why)| p == name && why == craft_cloud_sync::OTHER_REASON), "{report:?}");
+    }
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&b).len(), 5, "{:?}", files(&b));
+    // A case-changed spelling counts too (names are compared ignoring case).
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().make_link(&path("FOOTAGE")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.removed_remotely.is_empty(), "{report:?}");
+}
+
+/// Two machines with a folder of three clips, a notes file and padding (so the mass-delete guard doesn't hide a
+/// wrong delete).
+async fn linked_setup() -> (Server, common::Machine, common::Machine) {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    write(&mut a, "notes.txt", b"notes");
+    for i in 0..20 {
+        write(&mut a, &format!("pad{i}.txt"), b"pad");
+    }
+    settle(&mut [&mut a, &mut b], 5).await;
+    (server, a, b)
+}
+
+/// The link is still there, untouched, and no conflict copy was made of it.
+fn link_untouched(m: &common::Machine, p: &str) {
+    assert_eq!(m.fs().stat(&path(p)).unwrap(), Some(craft_cloud_sync::FsKind::Other), "{p} is still the link");
+    assert!(conflict_copies(m).is_empty(), "{:?}", files(m));
+    assert!(m.fs().dirs().is_empty(), "no real folder was made in the link's place: {:?}", m.fs().dirs());
+}
+
+#[tokio::test]
+async fn a_remote_edit_inside_a_folder_that_became_a_link_waits() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    write(&mut b, "Footage/c0.mov", b"clip v2");
+    write(&mut b, "Footage/new.mov", b"a new clip");
+    b.sync_once().await.unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty() && report.pending_deletes.is_empty(), "{report:?}");
+        assert!(report.skipped.iter().any(|(p, _)| p == "Footage"), "{report:?}");
+    }
+    link_untouched(&a, "Footage");
+    b.sync_once().await.unwrap();
+    assert_eq!(files(&b).iter().filter(|(p, _)| p.starts_with("Footage/")).count(), 4, "{:?}", files(&b));
+}
+
+#[tokio::test]
+async fn a_remote_edit_of_a_file_that_became_a_link_waits() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("notes.txt")).unwrap();
+    write(&mut b, "notes.txt", b"notes v2");
+    b.sync_once().await.unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.downloaded.is_empty() && report.moved_locally.is_empty(), "{report:?}");
+    assert_eq!(a.fs().stat(&path("notes.txt")).unwrap(), Some(craft_cloud_sync::FsKind::Other));
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "notes.txt"), b"notes v2");
+    // Once it is a real file again, the server's version is checked against it like any other.
+    a.fs_mut().remove_file(&path("notes.txt")).unwrap();
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(read(&a, "notes.txt"), b"notes v2");
+}
+
+#[tokio::test]
+async fn a_remote_rename_of_a_folder_that_became_a_link_deletes_nothing() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    b.fs_mut().rename(&path("Footage"), &path("Footage2")).unwrap();
+    b.sync_once().await.unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty() && report.pending_deletes.is_empty(), "{report:?}");
+    }
+    link_untouched(&a, "Footage");
+    b.sync_once().await.unwrap();
+    assert_eq!(files(&b).iter().filter(|(p, _)| p.starts_with("Footage2/")).count(), 3, "{:?}", files(&b));
+}
+
+#[tokio::test]
+async fn a_newcomer_whose_name_is_a_case_twin_of_a_linked_folder_waits() {
+    // The server renamed Footage to Archive and made a new FOOTAGE; here Footage is a link. The newcomer would
+    // need the link moved aside as a case twin: it waits instead, and nothing of Archive is deleted.
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    b.fs_mut().rename(&path("Footage"), &path("Archive")).unwrap();
+    b.sync_once().await.unwrap();
+    b.fs_mut().mkdir(&path("FOOTAGE")).unwrap();
+    write(&mut b, "FOOTAGE/new.txt", b"new");
+    b.sync_once().await.unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty() && report.pending_deletes.is_empty(), "{report:?}");
+    }
+    link_untouched(&a, "Footage");
+    b.sync_once().await.unwrap();
+    assert_eq!(files(&b).iter().filter(|(p, _)| p.starts_with("Archive/")).count(), 3, "{:?}", files(&b));
+}
+
+#[tokio::test]
+async fn a_rename_onto_a_case_twin_of_a_linked_file_waits() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("notes.txt")).unwrap();
+    b.fs_mut().rename(&path("notes.txt"), &path("old-notes.txt")).unwrap();
+    b.sync_once().await.unwrap();
+    b.fs_mut().rename(&path("pad1.txt"), &path("NOTES.txt")).unwrap();
+    b.sync_once().await.unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty(), "{report:?}");
+    }
+    assert_eq!(a.fs().stat(&path("notes.txt")).unwrap(), Some(craft_cloud_sync::FsKind::Other));
+    assert!(conflict_copies(&a).is_empty(), "{:?}", files(&a));
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "old-notes.txt"), b"notes");
+    assert_eq!(read(&b, "NOTES.txt"), b"pad");
+}
+
+#[tokio::test]
+async fn a_folder_the_server_needs_is_never_made_over_a_linked_case_twin() {
+    // `x` was deleted here and `X` is now a link; the server adds a file in `x`. Bringing `x` back would need the
+    // link moved aside as a case twin: the file waits instead.
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().mkdir(&path("x")).unwrap();
+    write(&mut a, "x/f.txt", b"f");
+    settle(&mut [&mut a, &mut b], 5).await;
+    write(&mut b, "x/new.txt", b"new");
+    b.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("x/f.txt")).unwrap();
+    a.fs_mut().remove_dir(&path("x")).unwrap();
+    a.fs_mut().make_link(&path("X")).unwrap();
+    a.sync_once().await.unwrap();
+    assert_eq!(a.fs().stat(&path("X")).unwrap(), Some(craft_cloud_sync::FsKind::Other), "the link is untouched");
+    assert!(conflict_copies(&a).is_empty(), "{:?}", files(&a));
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "x/new.txt"), b"new");
+}
+
+#[tokio::test]
+async fn a_case_only_rename_next_to_a_linked_case_twin_waits_in_one_piece() {
+    // The server renames notes.txt to Notes.txt; here an untracked link NOTES.TXT sits next to it. The rename
+    // would have to move the link aside, so it waits, and the file is never left at a temporary name.
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("NOTES.TXT")).unwrap();
+    b.fs_mut().rename(&path("notes.txt"), &path("Notes.txt")).unwrap();
+    b.sync_once().await.unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.moved_remotely.is_empty() && report.removed_remotely.is_empty(), "{report:?}");
+    }
+    assert_eq!(a.fs().stat(&path("NOTES.TXT")).unwrap(), Some(craft_cloud_sync::FsKind::Other));
+    assert_eq!(read(&a, "notes.txt"), b"notes");
+    assert!(conflict_copies(&a).is_empty(), "{:?}", files(&a));
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "Notes.txt"), b"notes");
+    // Once the link is gone, the rename lands.
+    a.fs_mut().remove_file(&path("NOTES.TXT")).unwrap();
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(read(&a, "Notes.txt"), b"notes");
+    assert_eq!(files(&a), files(&b));
+}
+
+#[tokio::test]
+async fn a_file_that_only_got_a_new_time_is_removed_by_a_delete() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    // Same content, new time: not an edit.
+    a.fs_mut().write(&path("notes.txt"), b"notes", false, 999_999).unwrap();
+    b.fs_mut().remove_file(&path("notes.txt")).unwrap();
+    b.sync_once().await.unwrap();
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert!(!files(&a).iter().any(|(p, _)| p == "notes.txt"), "{:?}", files(&a));
+    assert!(!files(&b).iter().any(|(p, _)| p == "notes.txt"), "{:?}", files(&b));
+    // Different content is an edit, and the edit wins.
+    write(&mut a, "pad3.txt", b"pad, edited");
+    b.fs_mut().remove_file(&path("pad3.txt")).unwrap();
+    b.sync_once().await.unwrap();
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(read(&b, "pad3.txt"), b"pad, edited");
+}
+
+#[tokio::test]
+async fn a_delete_under_a_linked_folder_lands_once_the_folder_is_real_again() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    b.fs_mut().remove_file(&path("Footage/c0.mov")).unwrap();
+    b.sync_once().await.unwrap();
+    a.sync_once().await.unwrap();
+    // The real folder comes back with its old contents (the drive is mounted again, say).
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    settle(&mut [&mut a, &mut b], 5).await;
+    for m in [&a, &b] {
+        let names: Vec<String> = files(m).into_iter().map(|(p, _)| p).filter(|p| p.starts_with("Footage/")).collect();
+        assert_eq!(names, ["Footage/c1.mov", "Footage/c2.mov"], "the deleted clip doesn't come back");
+    }
+}
+
+#[tokio::test]
+async fn a_remote_rename_of_a_file_that_became_a_link_deletes_nothing() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("notes.txt")).unwrap();
+    b.fs_mut().rename(&path("notes.txt"), &path("notes2.txt")).unwrap();
+    b.sync_once().await.unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty(), "{report:?}");
+    }
+    assert_eq!(a.fs().stat(&path("notes.txt")).unwrap(), Some(craft_cloud_sync::FsKind::Other));
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "notes2.txt"), b"notes");
+}

@@ -218,14 +218,19 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         }
         // Deletes, files first then folders deepest first, unless the guard holds them back.
         let synced_files = self.state.base.values().filter(|e| matches!(e.kind, BaseKind::File { .. })).count();
-        if self.config.too_many_deletes(missing_files.len(), synced_files) && !self.approved_deletes {
-            report.pending_deletes.extend(missing_files.iter().map(|(_, p)| p.clone()));
-        } else {
-            for (id, path) in &missing_files {
-                if let Some(BaseEntry { kind: BaseKind::File { version, .. }, .. }) = self.state.base.get(id) {
-                    ops.push((Op::Delete { node: *id, expected: Some(*version) }, Effect::Delete { id: *id, path: path.clone() }));
-                }
+        // Above the guard's thresholds only approved deletions go; the rest (and the folders) wait.
+        let guarded = self.config.too_many_deletes(missing_files.len(), synced_files);
+        let (going, waiting): (Vec<_>, Vec<_>) = missing_files.iter().partition(|(id, _)| !guarded || self.approval.covers(*id));
+        for (id, path) in &waiting {
+            report.pending_deletes.push(path.clone());
+            report.pending_nodes.push(*id);
+        }
+        for (id, path) in going {
+            if let Some(BaseEntry { kind: BaseKind::File { version, .. }, .. }) = self.state.base.get(id) {
+                ops.push((Op::Delete { node: *id, expected: Some(*version) }, Effect::Delete { id: *id, path: path.clone() }));
             }
+        }
+        if waiting.is_empty() {
             missing_dirs.sort_by_key(|(_, p)| std::cmp::Reverse(p.depth()));
             for (id, path) in &missing_dirs {
                 ops.push((Op::Delete { node: *id, expected: None }, Effect::Delete { id: *id, path: path.clone() }));
@@ -347,10 +352,20 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                         }
                         let refused: BTreeSet<usize> = conflicts.iter().map(|c| c.op).filter(|i| !fixable.contains_key(i)).collect();
                         // An edit to a file the server deleted that still can't go up (its folder can't come back
-                        // where it was, say): forget the node, and the next pass uploads the file as a new one.
+                        // where it was, say), or a move of such a file (which can never apply): forget the node, and
+                        // the next pass uploads the file as a new one.
                         let mut forgot = false;
                         for i in &refused {
-                            if let Some((Op::Update { node, .. }, _)) = batch.get(*i)
+                            let node = match batch.get(*i) {
+                                Some((Op::Update { node, .. }, _)) => Some(node),
+                                Some((Op::Move { node, .. }, _))
+                                    if matches!(self.state.base.get(node).map(|e| &e.kind), Some(BaseKind::File { .. })) =>
+                                {
+                                    Some(node)
+                                }
+                                _ => None,
+                            };
+                            if let Some(node) = node
                                 && !self.state.remote.contains_key(node)
                             {
                                 self.state.base.remove(node);

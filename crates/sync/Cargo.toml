@@ -16,8 +16,12 @@ craft-cloud-proto.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
+[features]
+# The `conformance` module: behaviours every `Fs` must have, as reusable test functions.
+test-support = []
+
 [dev-dependencies]
-sqlx.workspace = true
+craft-cloud-sync = { path = ".", features = ["test-support"] }
 tempfile.workspace = true
 craft-cloud-meta.workspace = true
 craft-cloud-store.workspace = true

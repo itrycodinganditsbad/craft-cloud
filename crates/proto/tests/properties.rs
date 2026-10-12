@@ -50,11 +50,12 @@ proptest! {
         device in any::<String>(),
         counter in any::<u32>(),
         is_dir: bool,
+        utc: bool,
         year in 0u16..=9999,
         (month, day, hour, minute) in (any::<u8>(), any::<u8>(), any::<u8>(), any::<u8>()),
     ) {
         if let Ok(original) = Name::new(&raw) {
-            let stamp = ConflictStamp { year, month, day, hour, minute };
+            let stamp = ConflictStamp { year, month, day, hour, minute, utc };
             let result = conflict_name(&original, is_dir, &device, stamp, counter);
             prop_assert!(result.is_ok(), "{:?}", result);
             let name = result.unwrap();
