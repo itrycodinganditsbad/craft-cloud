@@ -291,6 +291,7 @@ changes locally, then pushes local changes. These rules came out of the simulati
   where it is, or where the server moved it if the server moved it too, and the push sends the local move.
   Same content as the server's: adopted. Edited: it becomes a conflict copy next to where the user put it, and
   the server's version lands at the same place. Not found: it was deleted here, and the edit wins.
+  Ignored names don't count: a file renamed to one (an app's temp name mid-save) isn't the tracked file moved.
 - **A relocate is recorded at once**: the base follows a file moved to the server's place before its download
   starts, so a download that fails doesn't make the next pass take the unchanged file for a conflict.
 - **The mass-delete guard covers both directions**: when the server's deletes would remove more tracked files
@@ -298,6 +299,11 @@ changes locally, then pushes local changes. These rules came out of the simulati
   goes back up, and the report lists them as pending local deletes. Approval releases both directions.
 - **A first sync cut short starts over**: the space is recorded only after the first full listing succeeds,
   so a failed listing doesn't turn the next pass into a reconcile.
+- **Known gaps, for the agent milestone (M3b)**: a tracked folder the user moves into a folder the scan can't
+  list looks deleted, so the push deletes it on the server (its files go up again as new ones once the folder
+  can be listed; history keeps the old versions). While any folder can't be listed, a node that has to be
+  found by local ID waits. After a node is skipped partway (moved aside, then its download failed), the push
+  can send the move aside as a user move, so the server node takes the conflict name.
 
 ## Server
 
@@ -478,7 +484,7 @@ methods answer `not_found` / `invalid` (405) the same way:
 | M0 | Repo, conventions, CI | DONE (2026-10-11) |
 | M1 | `proto` + `chunker` (names, IDs, `fastcdc-v1` with golden vectors) | DONE (2026-10-11, PR #1) |
 | M2 | Server core: info, auth, devices, chunks, batch commit, changes, tree, epoch; SQLite + Postgres, disk + S3 | DONE (2026-10-11; M2a storage, M2b server) |
-| M3a | Sync engine on `Fs`/`Transport` + simulation harness | IN PROGRESS (engine verified, plan next) |
+| M3a | Sync engine on `Fs`/`Transport` + simulation harness | DONE (2026-10-12) |
 | M3b | Agent binary: real `Fs`, HTTP transport, state DB, watcher, root marker, CLI; two machines sync a folder | TODO |
 | M4 | History, restore, trash, thinning, GC, admin CLI, backup/restore | TODO |
 | M5 | Selective sync, large-media polish, ignore rules | TODO |
