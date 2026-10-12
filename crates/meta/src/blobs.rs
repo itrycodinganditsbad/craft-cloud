@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 
+use craft_cloud_proto::api::MAX_MISSING_IDS;
 use craft_cloud_proto::{ChunkId, Manifest, ManifestId, SpaceId};
 use sqlx::Row;
 
@@ -143,12 +144,15 @@ impl Meta {
     }
 
     /// Records that `space` uploaded the manifest. Every chunk it lists must already be in the space;
-    /// otherwise nothing is recorded and the missing chunks are returned.
+    /// otherwise nothing is recorded and the missing chunks are returned (the first `MAX_MISSING_IDS` of them).
     pub async fn add_manifest(&self, space: SpaceId, manifest: &Manifest, stored_size: u64, now_ms: i64) -> Result<(), MetaError> {
         let mut w = self.begin_write().await?;
         let raw: Vec<[u8; 32]> = manifest.chunks().iter().map(|c| *c.id.as_bytes()).collect();
-        let missing: Vec<ChunkId> = missing_in_space(&mut w.tx, space, BlobKind::Chunk, &raw).await?.into_iter().map(ChunkId::from_bytes).collect();
+        let mut missing: Vec<ChunkId> =
+            missing_in_space(&mut w.tx, space, BlobKind::Chunk, &raw).await?.into_iter().map(ChunkId::from_bytes).collect();
         if !missing.is_empty() {
+            // As the server's own check does: at most `MAX_MISSING_IDS` are listed; the client asks again for the rest.
+            missing.truncate(MAX_MISSING_IDS);
             return Err(MetaError::MissingChunks(missing));
         }
         record(&mut w.tx, space, BlobKind::Manifest, manifest.id().as_bytes(), to_i64(stored_size)?, Some(to_i64(manifest.size())?), now_ms).await?;
