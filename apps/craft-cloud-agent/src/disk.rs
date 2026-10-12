@@ -310,13 +310,15 @@ fn set_mode(_file: &File, _replaced: Option<&Metadata>, _exec: bool) -> io::Resu
 /// Makes the folder `dir`, owner-only (0700) on Unix, so a download in flight can't be read by other users. A folder
 /// that already exists keeps its mode.
 pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
+        fs::DirBuilder::new().mode(0o700).create(dir)
     }
-    builder.create(dir)
+    #[cfg(not(unix))]
+    {
+        fs::DirBuilder::new().create(dir)
+    }
 }
 
 /// A new temporary file. Unix gives it the usual `0666 & !umask` mode, like any file an app creates.
