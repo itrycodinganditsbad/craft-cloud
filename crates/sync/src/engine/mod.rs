@@ -273,11 +273,12 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     async fn pull(&mut self) -> Result<Mode, SyncError> {
         if self.state.space.is_none() {
             let space = self.transport.space().await?;
+            // The space is recorded only once the tree is in: a first sync cut short starts over as a first sync.
+            self.relist().await?;
             self.state.space = Some(space.space);
             self.state.root = Some(space.root);
             self.state.base.clear();
             self.state.base.insert(space.root, BaseEntry { parent: None, name: None, kind: BaseKind::Dir { local_id: None } });
-            self.relist().await?;
             return Ok(Mode::Join);
         }
         match self.read_changes().await {

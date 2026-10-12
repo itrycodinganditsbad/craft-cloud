@@ -174,6 +174,28 @@ async fn mass_deletes_from_the_server_wait_for_approval_here_too() {
 }
 
 #[tokio::test]
+async fn a_first_sync_cut_short_starts_over_as_a_first_sync() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "doc.txt", b"from the laptop");
+    a.sync_once().await.unwrap();
+    write(&mut b, "doc.txt", b"from the desktop");
+    // The first call (the space) goes through, the listing fails.
+    b.transport().faults.every.store(2, Ordering::Relaxed);
+    assert!(b.sync_once().await.is_err());
+    b.transport().faults.every.store(0, Ordering::Relaxed);
+    assert!(b.state().space.is_none());
+    b.sync_once().await.unwrap();
+    assert!(!b.state().reconcile_pending);
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(read(&b, "doc.txt"), b"from the laptop");
+    assert_eq!(conflict_copies(&b).len(), 1);
+    assert_eq!(files(&a), files(&b));
+}
+
+#[tokio::test]
 async fn joining_with_existing_files_never_overwrites_them() {
     let server = Server::new().await;
     let ana = server.user("ana").await;
