@@ -1,8 +1,9 @@
 //! Deterministic simulation: three machines share one account and do random things to their folders
-//! (create, edit, delete, rename, move files and folders, hold files locked or open, make folders unlistable),
-//! sync at random moments, sometimes with the
-//! connection failing mid-pass, and sometimes crash during a pass and restart from the state saved after the
-//! pass before. Then everyone syncs until nothing changes, and we check:
+//! (create, edit, delete, rename, move files and folders, hold files locked or open, make folders unlistable,
+//! replace a tracked file or folder with a link and later put it back), sync at random moments, sometimes with
+//! the connection failing mid-pass, sometimes approving held-back deletes (all of them, or some of the ones the
+//! last pass listed), and sometimes crash during a pass and restart from the state saved after the pass before.
+//! Then every link is put back, everyone syncs until nothing changes, and we check:
 //!
 //! 1. **Convergence**: every machine ends with exactly the same files and folders.
 //! 2. **Nothing the engine saw is lost**: every file content that was on a disk when a pass started is still
@@ -11,7 +12,8 @@
 //!    alone doesn't count), so a remote delete never wins over an edit.
 //! 4. **Nothing is stuck**: after settling, the only files left out of sync are case twins of a synced name.
 //!
-//! It also checks after every finished pass that each node a machine tracks still has a place in its folder.
+//! It also checks after every finished pass that each node a machine tracks still has a place in its folder, and
+//! that a machine never deletes on the server a node it tracked behind a link it has.
 //!
 //! Each seed is reproducible: `SIM_SEED=17 cargo test -p craft-cloud-sync --test simulation`. By default 40
 //! seeds run; `SIM_SEEDS=1000 SIM_FIRST=2000` runs seeds 2000 to 2999 (use `--release`). Seeds run in parallel on
@@ -25,8 +27,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::{Machine, Server, machine_config, restart};
-use craft_cloud_proto::FileHash;
-use craft_cloud_sync::{Fs, FsKind, MemFs, RelPath, Report, State, rel};
+use craft_cloud_proto::{FileHash, Name, NodeId};
+use craft_cloud_sync::{BaseKind, Fs, FsKind, MemFs, RelPath, Report, State, rel};
 
 /// xorshift64*: tiny, deterministic, good enough to pick actions.
 struct Rng(u64);
@@ -148,21 +150,123 @@ fn follow_rename(exempt: &mut BTreeSet<Exempt>, from: &RelPath, to: &RelPath) {
     }
 }
 
+/// A tracked file or folder a user replaced with a link (moved to another drive with a link left behind, say),
+/// and what it held, to put back later. A machine has at most one at a time, so the link is the only one in its
+/// folder wherever it ends up (a folder above it may be renamed or moved aside).
+struct Linked {
+    was_dir: bool,
+    /// The folders and files it held, by their names below it (a file itself: one file with no names).
+    dirs: Vec<Vec<Name>>,
+    files: Vec<(Vec<Name>, Vec<u8>)>,
+    /// The nodes the machine tracked there when the link was made: it must never delete them on the server
+    /// while the link is there.
+    nodes: BTreeSet<NodeId>,
+}
+
+/// Replaces a tracked file or folder on `m` with a link, keeping what it held.
+fn make_link(rng: &mut Rng, m: &mut Machine) -> Option<Linked> {
+    let index = m.state().base_index();
+    let candidates: Vec<RelPath> =
+        index.keys().filter(|p| !p.is_root() && matches!(m.fs().stat(p), Ok(Some(FsKind::File(_) | FsKind::Dir { .. })))).cloned().collect();
+    let at = rng.pick(&candidates)?.clone();
+    let below = |p: &RelPath| p.names().get(at.depth()..).map(<[Name]>::to_vec).unwrap_or_default();
+    let was_dir = matches!(m.fs().stat(&at), Ok(Some(FsKind::Dir { .. })));
+    let dirs = m.fs().dirs().into_iter().filter(|d| d.starts_with(&at) && *d != at).map(|d| below(&d)).collect();
+    let files = m.fs().files().into_iter().filter(|(p, _)| p.starts_with(&at)).map(|(p, d)| (below(&p), d)).collect();
+    let nodes = index.iter().filter(|(p, id)| p.starts_with(&at) && on_disk_here(m, id, p)).map(|(_, id)| *id).collect();
+    m.fs_mut().make_link(&at).ok()?;
+    if std::env::var("SIM_TRACE").is_ok() {
+        eprintln!("TRACE link {at}");
+    }
+    Some(Linked { was_dir, dirs, files, nodes })
+}
+
+/// Whether the tracked node `id` is itself at its base path `p` on disk: the folder or file there has the node's
+/// local ID. A node the user already moved (found by its ID elsewhere) or deleted isn't behind a link made at its
+/// old place later, even if something new took that place first. (A file a user's save replaced at its path is
+/// left out too: the check is a little weaker, never wrong.)
+fn on_disk_here(m: &Machine, id: &NodeId, p: &RelPath) -> bool {
+    match (m.state().base.get(id).map(|e| &e.kind), m.fs().stat(p)) {
+        (Some(BaseKind::Dir { local_id }), Ok(Some(FsKind::Dir { id: here }))) => local_id.is_none() || *local_id == here,
+        (Some(BaseKind::File { local_id, .. }), Ok(Some(FsKind::File(meta)))) => local_id.is_none() || *local_id == meta.id,
+        _ => false,
+    }
+}
+
+/// Whether `path` is a link on `m`, or below one.
+fn behind_link(m: &Machine, path: &RelPath) -> bool {
+    let mut prefix = RelPath::root();
+    path.names().iter().any(|name| {
+        prefix = prefix.join(name);
+        matches!(m.fs().stat(&prefix), Ok(Some(FsKind::Other)))
+    })
+}
+
+/// Where the machine's link is now: the only link or special file in its folder.
+fn find_link(m: &Machine) -> Option<RelPath> {
+    let mut queue = vec![RelPath::root()];
+    while let Some(dir) = queue.pop() {
+        // A folder that can't be listed now is looked into another time.
+        let Ok(entries) = m.fs().list(&dir) else { continue };
+        for entry in entries {
+            let Ok(name) = Name::new(&entry.name) else { continue };
+            match entry.kind {
+                FsKind::Other => return Some(dir.join(&name)),
+                FsKind::Dir { .. } => queue.push(dir.join(&name)),
+                FsKind::File(_) => {}
+            }
+        }
+    }
+    None
+}
+
+/// Puts back what a link replaced, wherever the link is now (the drive is mounted again). Returns whether it did:
+/// a link an app holds open stays for now.
+fn restore_link(m: &mut Machine, linked: &Linked) -> bool {
+    let Some(at) = find_link(m) else { return false };
+    if m.fs_mut().remove_file(&at).is_err() {
+        return false;
+    }
+    let under = |names: &[Name]| RelPath::from_names(at.names().iter().chain(names).cloned().collect());
+    // What comes back is new on this disk: no program has it open or locked (MemFs keeps holds and locks by path,
+    // and some may be left from files that were at these paths before).
+    for p in linked.dirs.iter().chain(linked.files.iter().map(|(f, _)| f)).map(|names| under(names)) {
+        m.fs_mut().release(&p);
+        m.fs_mut().unlock(&p);
+    }
+    if linked.was_dir {
+        m.fs_mut().mkdir(&at).unwrap_or_else(|e| panic!("putting back {at}: {e}"));
+    }
+    let mut dirs = linked.dirs.clone();
+    dirs.sort_by_key(Vec::len);
+    for d in &dirs {
+        m.fs_mut().mkdir(&under(d)).unwrap_or_else(|e| panic!("putting back {at}: {e}"));
+    }
+    for (f, data) in &linked.files {
+        m.fs_mut().write(&under(f), data, false, 0).unwrap_or_else(|e| panic!("putting back {at}: {e}"));
+    }
+    if std::env::var("SIM_TRACE").is_ok() {
+        eprintln!("TRACE put back {at}");
+    }
+    true
+}
+
 /// One random user action on a machine's folder. Failures (target exists, parent missing) are ignored, like a
-/// user's failed click. `exempt` follows the user's renames.
-fn act(rng: &mut Rng, m: &mut Machine, destroyed: &mut BTreeSet<FileHash>, exempt: &mut BTreeSet<Exempt>) {
+/// user's failed click. `exempt` follows the user's renames; `link` is the machine's link, if it has one.
+fn act(rng: &mut Rng, m: &mut Machine, destroyed: &mut BTreeSet<FileHash>, exempt: &mut BTreeSet<Exempt>, link: &mut Option<Linked>) {
     // The content at `p`, read straight from memory: a locked file is still overwritten or deleted by its user.
     // It counts as destroyed only once the user's write or delete went through.
     let old = |m: &Machine, p: &RelPath| m.fs().files().get(p).map(|d| FileHash::from_bytes(*blake3::hash(d).as_bytes()));
     let dirs: Vec<RelPath> = m.fs().dirs();
     let files = files_of(m);
-    match rng.below(10) {
+    match rng.below(11) {
         0 | 1 => {
             let dir = if rng.below(3) == 0 { RelPath::root() } else { rel(rng.pick(DIRS).copied().unwrap_or("x")) };
             let name = rng.pick(NAMES).copied().unwrap_or("a.txt");
             let target = rel(&format!("{dir}/{name}"));
             let data = rng.bytes();
-            if !matches!(m.fs().stat(&target), Ok(Some(FsKind::Dir { .. }))) {
+            // Saving onto a link would write through it, to the other drive: not something this folder sees.
+            if !matches!(m.fs().stat(&target), Ok(Some(FsKind::Dir { .. } | FsKind::Other))) {
                 let before = old(m, &target);
                 if m.fs_mut().write(&target, &data, false, 0).is_ok() {
                     destroyed.extend(before);
@@ -238,6 +342,18 @@ fn act(rng: &mut Rng, m: &mut Machine, destroyed: &mut BTreeSet<FileHash>, exemp
                 }
             }
         }
+        10 => {
+            // A tracked file or folder is replaced with a link, or the link is replaced with what it held again.
+            match link.take() {
+                Some(linked) if rng.below(2) == 0 => {
+                    if !restore_link(m, &linked) {
+                        *link = Some(linked);
+                    }
+                }
+                Some(linked) => *link = Some(linked),
+                None => *link = make_link(rng, m),
+            }
+        }
         _ => {
             if let (Some(d), Some(to)) = (rng.pick(&dirs).cloned(), rng.pick(DIRS).copied()) {
                 let to = rel(to);
@@ -285,6 +401,9 @@ async fn run(seed: u64, steps: usize) {
     // that was already on that machine's disk when it crashed (what the crash left behind, not anything new).
     let mut reuploaded: BTreeSet<FileHash> = BTreeSet::new();
     let mut at_crash: Vec<BTreeSet<FileHash>> = vec![BTreeSet::new(); ms.len()];
+    // Each machine's link, if it has one, and the held-back deletes its last finished pass listed.
+    let mut links: Vec<Option<Linked>> = (0..ms.len()).map(|_| None).collect();
+    let mut last_pending: Vec<Vec<NodeId>> = vec![Vec::new(); ms.len()];
 
     for step in 0..steps {
         let i = rng.below(ms.len());
@@ -312,15 +431,53 @@ async fn run(seed: u64, steps: usize) {
                 let changes = rng.below(8) as u64;
                 m.fs_mut().die_after(changes, dead);
             }
-            if rng.below(2) == 0 {
-                m.approve_deletes();
+            // Held-back deletes are approved now and then: all of them, or some of the ones the last pass listed.
+            match rng.below(4) {
+                0 | 1 => m.approve_deletes(),
+                2 => {
+                    let listed = last_pending.get(i).cloned().unwrap_or_default();
+                    let some: Vec<NodeId> = listed.into_iter().filter(|_| rng.below(2) == 0).collect();
+                    m.approve_deletes_of(some);
+                }
+                _ => {}
             }
             let before = files_of(m);
             let locked_before = unreadable(m);
+            let link_seen = find_link(m).is_some();
             let tracked_before = m.state().base_index();
             let r = m.sync_once().await;
             if std::env::var("SIM_TRACE").is_ok() {
                 eprintln!("TRACE step {step} m{i} sync: {r:?}\n  files {}\n  dirs {:?}", listing(m), m.fs().dirs());
+            }
+            if let Ok(report) = &r {
+                if let Some(listed) = last_pending.get_mut(i) {
+                    listed.clone_from(&report.pending_nodes);
+                }
+                // Nothing tracked behind this machine's link is deleted on the server by it. Unless the user moved
+                // the link (with a folder holding it) into a folder that can't be listed: the engine can't see it,
+                // and a tracked folder moved there looks deleted (a known gap, see the design's engine rules). Or
+                // unless the user renamed a folder above the link while the server put something new in it: the
+                // engine makes the folder again at its old place for that (it is the tracked folder there, path
+                // first), so the renamed one is a new folder to it and the link in it isn't the tracked file (also
+                // a known gap: the file goes up as a new one once it is real again, and history keeps the old one).
+                if let Some(Some(linked)) = links.get(i)
+                    && link_seen
+                {
+                    for gone in &report.removed_remotely {
+                        let node = tracked_before.get(gone);
+                        let remade_above = report.created_dirs.iter().any(|d| gone.starts_with(d) && d != gone);
+                        assert!(
+                            remade_above || !node.is_some_and(|id| linked.nodes.contains(id)),
+                            "seed {seed} step {step}: m{i} deleted {gone} on the server, which it tracks behind a link"
+                        );
+                    }
+                }
+                // A node that is a real file or folder in its place again (the server's edit downloaded after the
+                // link moved away with its folder, say) no longer stands behind the link.
+                if let Some(Some(linked)) = links.get_mut(i) {
+                    let st = m.state();
+                    linked.nodes.retain(|id| !st.base_path(*id).is_some_and(|p| on_disk_here(m, id, &p)));
+                }
             }
             let was_recovering = recovering.get(i).is_some_and(|left| *left > 0);
             for (p, hash) in new_copies(&before, m) {
@@ -365,29 +522,36 @@ async fn run(seed: u64, steps: usize) {
             }
             // After a finished pass every node the machine tracks has a place in its folder. A node skipped for a
             // filesystem error may wait one more pass for it (its folder was moved aside, say, and it couldn't be
-            // looked up), so passes that skipped one aren't checked.
+            // looked up), so passes that skipped one aren't checked. A node whose place on the server is behind a link
+            // here waits for as long as the link is there, so it may lose its place meanwhile (its old folder was
+            // settled for a newcomer, say); it is looked up once the link is gone.
             if r.as_ref().is_ok_and(|r| !r.skipped.iter().any(|(_, why)| why.ends_with("tried again next pass"))) {
                 let st = m.state();
                 for (id, b) in &st.base {
                     assert!(
-                        st.base_path(*id).is_some(),
+                        st.base_path(*id).is_some() || st.remote_path(*id).is_some_and(|p| behind_link(m, &p)),
                         "seed {seed} step {step}: m{i} tracks {id} ({:?}) under a folder it no longer tracks",
                         b.name
                     );
                 }
             }
         } else {
-            act(&mut rng, m, &mut destroyed, &mut exempt);
+            let mut no_link = None;
+            let link = links.get_mut(i).unwrap_or(&mut no_link);
+            act(&mut rng, m, &mut destroyed, &mut exempt, link);
             if std::env::var("SIM_TRACE").is_ok() {
                 eprintln!("TRACE step {step} m{i} act\n  files {}\n  dirs {:?}", listing(m), m.fs().dirs());
             }
         }
     }
 
-    // Everyone syncs until a whole round changes nothing (deletes approved and files let go, as eventually
-    // they are).
-    for m in &mut ms {
+    // Everyone syncs until a whole round changes nothing (deletes approved, files let go and links replaced with
+    // what they held, as eventually they are).
+    for (i, m) in ms.iter_mut().enumerate() {
         m.fs_mut().unlock_all();
+        if let Some(linked) = links.get_mut(i).and_then(Option::take) {
+            assert!(restore_link(m, &linked), "seed {seed}: m{i}'s link is gone");
+        }
         seen.extend(hashes_of(m));
     }
     let mut quiet = false;
