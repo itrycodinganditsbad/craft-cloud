@@ -43,6 +43,8 @@ pub enum AccountError {
     Io { path: PathBuf, source: io::Error },
     #[error("{path} is damaged ({message}); move it away to start over")]
     Damaged { path: PathBuf, message: String },
+    #[error("the folder path {0} isn't valid UTF-8, so it can't be saved in the account; pick a folder whose path is plain text")]
+    FolderNotUtf8(PathBuf),
     #[error("{path} was written by a newer Craft Cloud agent (format {found}; this one reads up to {supported}); update this agent")]
     Newer { path: PathBuf, found: u32, supported: u32 },
 }
@@ -195,6 +197,9 @@ impl DataDir {
     }
 
     pub fn save_account(&self, account: &Account) -> Result<(), AccountError> {
+        if account.folder.to_str().is_none() {
+            return Err(AccountError::FolderNotUtf8(account.folder.clone()));
+        }
         self.create()?;
         save(&self.file(ACCOUNT_FILE), account)
     }
@@ -350,6 +355,20 @@ mod tests {
         saved.last_pass = Some(LastPass { finished_ms: 7, outcome: Outcome::Failed("x".into()), summary: None });
         data.save_state(&saved).unwrap();
         assert_eq!(data.load_state().unwrap(), saved);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_path_that_is_not_utf8_gets_a_clear_error() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path());
+        let mut account = account(dir.path());
+        account.folder = PathBuf::from(std::ffi::OsStr::from_bytes(b"/bad\xff"));
+        let err = data.save_account(&account).unwrap_err();
+        assert!(matches!(err, AccountError::FolderNotUtf8(_)));
+        assert!(err.to_string().contains("valid UTF-8"), "{err}");
+        assert!(data.load_account().unwrap().is_none(), "nothing was written");
     }
 
     #[test]
