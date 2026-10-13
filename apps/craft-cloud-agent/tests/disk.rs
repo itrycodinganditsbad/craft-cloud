@@ -102,9 +102,9 @@ fn a_moved_file_whose_removal_failed_isnt_listed_until_recovery() {
 }
 
 /// A crash right after the exchange (Linux, macOS) leaves what was at the target in the temporary folder. Cleaning
-/// up interrupted writes never removes it; recovery removes it when it is the file the engine checked, and when it
-/// is anything else (an app saved between the check and the exchange) moves it next to the target, where the scan
-/// sees it. Nothing is lost either way.
+/// up interrupted writes never removes it; recovery removes it when it is the file the engine checked (the download
+/// stays), and when it is anything else (an app saved between the check and the exchange) exchanges it back, so the
+/// save is at the user's name again and the download goes. Nothing is lost either way, and no copy appears.
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 #[test]
 fn a_crash_right_after_the_exchange_never_loses_what_came_out() {
@@ -129,15 +129,9 @@ fn a_crash_right_after_the_exchange_never_loses_what_came_out() {
         assert_eq!(fs.clean_tmp().unwrap(), 0, "the file that came out isn't an interrupted write");
         fs.recover().unwrap();
         assert_eq!(temps(&fs), 0, "app saved: {app_saved}");
-        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"download");
-        let left = names(dir.path());
-        if app_saved {
-            assert_eq!(left.len(), 3, "{left:?}");
-            let aside = left.iter().find(|n| n.ends_with(".cc-aside")).expect("the save is next to the target");
-            assert_eq!(std::fs::read(dir.path().join(aside)).unwrap(), b"the user's");
-        } else {
-            assert_eq!(left, [".craft-cloud", "a.txt"]);
-        }
+        let want: &[u8] = if app_saved { b"the user's" } else { b"download" };
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), want, "app saved: {app_saved}");
+        assert_eq!(names(dir.path()), [".craft-cloud", "a.txt"], "app saved: {app_saved}");
     }
 }
 

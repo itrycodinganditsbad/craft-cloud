@@ -14,8 +14,9 @@
 //!   `renameatx_np(RENAME_SWAP)`) and the one that came out is compared with what was expected; anything else is
 //!   exchanged back. The download first moves to a `.swap` name `clean_tmp` never removes, with a record next to it,
 //!   so a crash right after the exchange can't let the file that came out (perhaps an app's save) be cleaned up:
-//!   [`Fs::recover`] removes it only if it is the download or the checked file, and otherwise moves it next to the
-//!   target as `.cc-aside`. On Windows, and on filesystems without an exchange, the landing takes steps: the file there is
+//!   [`Fs::recover`] removes it only if it is the download or the checked file; a save while the download is still
+//!   at the target is exchanged back (the save keeps the user's name, the download goes), and anything else moves
+//!   next to the target as `.cc-aside`. On Windows, and on filesystems without an exchange, the landing takes steps: the file there is
 //!   moved to `<name>.<random>.cc-aside` next to it (never replacing anything), checked, the download renamed into
 //!   the free name, and the moved file removed, with a record in the temporary folder written first. A crash between
 //!   the steps leaves both files on disk, never neither; the next pass's [`Fs::recover`] puts the moved file back if
@@ -860,8 +861,9 @@ impl DiskFs {
     /// After the exchange the download's temporary path holds what was at the target, which may be an app's save. So
     /// before it, the download moves to a `.swap` name [`DiskFs::clean_tmp`] never removes, with a record of the
     /// target and both stats written first. A crash at any point leaves that file for [`Fs::recover`], which removes
-    /// it only if it is the download or the file the engine checked (or that file is back at the target), and
-    /// otherwise moves it next to the target as a `.cc-aside` file the scan sees.
+    /// it only if it is the download or the file the engine checked (or that file is back at the target). A save it
+    /// holds goes back to the target by an exchange while the download is still there (the download then goes);
+    /// otherwise it moves next to the target as a `.cc-aside` file the scan sees.
     fn land_by_exchange(
         &mut self,
         path: &RelPath,
@@ -1037,9 +1039,23 @@ impl DiskFs {
         if found == incoming || found == expected || at_target == Some(expected) {
             return fs::remove_file(swap);
         }
-        // Anything else is what the exchange took out of the target: an app's save. It goes next to the target, where
-        // the scan sees it; if the target's folder is gone, it stays in the temporary folder under a name nothing
-        // cleans up, and the error says where.
+        // Anything else is what the exchange took out of the target: an app's save. While the download is still at the
+        // target, the two are exchanged back, so the save is at the user's name again (as if the download never came)
+        // and the swap file holds the download, which goes. If an app saved over the target once more in that instant,
+        // the swap file holds that newest save instead: exchanged once more, so the newest save stays at the name and
+        // the older one goes next to it, as below.
+        if let Some(full) = &full
+            && at_target == Some(incoming)
+            && matches!(exchange(swap, full), Ok(true))
+        {
+            if kind_at(swap)? == Some(incoming) {
+                return fs::remove_file(swap);
+            }
+            let _ = exchange(swap, full);
+        }
+        // Otherwise (the target holds something else now, or the system can't exchange) the save goes next to the
+        // target, where the scan sees it; if the target's folder is gone, it stays in the temporary folder under a name
+        // nothing cleans up, and the error says where.
         if let Some(full) = full
             && let (Some(parent), Some(name)) = (full.parent(), full.file_name().and_then(|n| n.to_str()))
             && self.is_folder(&target.parent().unwrap_or_default())?
