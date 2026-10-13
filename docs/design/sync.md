@@ -608,6 +608,15 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
     is renamed into place; if the check fails, the occupant is put back. A landing record lets the next run
     finish or undo the steps after a crash: both files stay on disk, never neither.
   - A read-only file (Windows) is never replaced: "read-only here, not replaced", and the download is kept.
+    It is never removed by a server delete either ("read-only here, not removed"); the delete waits until
+    the attribute is cleared.
+  - The file ID is compared before the first step; after the move it counts only when the move kept it (a
+    hard link), since FAT/exFAT give a renamed file a new ID.
+  - The exchange runs from a `.swap` temp file with its own record, which cleanup never deletes: after a
+    crash, recovery removes it only if it is the download or the checked file, and otherwise moves it next
+    to the target. If an app saved twice during the swap back, the newest save stays at the name.
+  - While a landing record is pending, its target counts as unknown to the scan (never deleted on the server)
+    and its `.cc-aside` file isn't listed; a record recovery can't settle fails the pass.
   - The engine's `Fs::finish_write` takes the expected occupant (`None`: the path must be empty).
 - **Windows "rename blocked"** (an app holds the target open): the downloaded temp file is kept, the node is
   skipped with "in use, retried", and the next pass lands the kept file if its server version is still current,
