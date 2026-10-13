@@ -22,7 +22,9 @@ const PASSWORD: &str = "correct horse battery";
 struct Server {
     url: String,
     meta: Meta,
-    /// Chunks the server has read from its store (each chunk download reads one).
+    /// Chunks the server has read from its store (each chunk download reads one). Only the Unix-only
+    /// kept-download test reads it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     chunk_reads: Arc<AtomicUsize>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
     _dirs: Vec<tempfile::TempDir>,
