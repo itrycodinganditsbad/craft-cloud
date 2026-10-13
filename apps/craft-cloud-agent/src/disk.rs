@@ -20,10 +20,11 @@
 //!   moved to `<name>.<random>.cc-aside` next to it (never replacing anything), checked, the download renamed into
 //!   the free name, and the moved file removed, with a record in the temporary folder written first. A crash between
 //!   the steps leaves both files on disk, never neither; the next pass's [`Fs::recover`] puts the moved file back if
-//!   nothing took its place, removes it if the landing was complete but for that, and otherwise leaves it as a file
-//!   the scan sees and syncs (it may be someone's save, so nothing removes `.cc-aside` files blindly). If the user
+//!   nothing took its place, removes it if the landing was complete but for that, and otherwise (its name taken by
+//!   something else, perhaps someone's save) moves it next to that under a conflict name, never replacing anything,
+//!   so the scan syncs it as a copy (nothing removes `.cc-aside` files blindly, and none is left behind). If the user
 //!   moved the folder before recovery ran, the moved file is found there by the folder's ID (recorded too) and handled
-//!   the same way under its own name, with a conflict name instead of `.cc-aside` when that name is taken. While a
+//!   the same way under its own name. While a
 //!   landing's record is pending (a step failed and recovery hasn't finished it), its moved file is left out of
 //!   listings, so the scan never uploads it. Any error, or a writer dropped without landing, removes the temporary
 //!   file.
@@ -1157,10 +1158,10 @@ impl DiskFs {
             (Some(full), Some(aside_full)) if kind_at(&aside_full)?.is_some() => Some((full, aside_full)),
             _ => None,
         };
-        let (full, aside_full, moved_with_folder) = match at_place {
-            Some((full, aside_full)) => (full, aside_full, false),
+        let (full, aside_full) = match at_place {
+            Some(places) => places,
             None => match self.moved_folder(record)? {
-                Some(dir) => (dir.join(&target_name), dir.join(aside_name.as_str()), true),
+                Some(dir) => (dir.join(&target_name), dir.join(aside_name.as_str())),
                 None => return Ok(()),
             },
         };
@@ -1180,10 +1181,11 @@ impl DiskFs {
             {
                 fs::remove_file(&aside_full)?;
             }
-            // In a folder the user moved, with its name taken by something else: a conflict name next to it (never
-            // replacing anything), so the scan sees a copy, not the tracked file renamed to its `.cc-aside` name.
-            (Some(FsKind::File(_)), Some(_)) if moved_with_folder => self.to_conflict_name(&aside_full, &full)?,
-            // Gone already, or something else is going on: the moved file stays, and the scan sees it.
+            // Its name taken by something other than the download (a save after the crash, say), where it was or in a
+            // folder the user moved: a conflict name next to it (never replacing anything), so the scan sees a copy,
+            // not the tracked file renamed to its `.cc-aside` name.
+            (Some(FsKind::File(_)), Some(_)) => self.to_conflict_name(&aside_full, &full)?,
+            // Gone already, or not a file any more: nothing to do.
             _ => {}
         }
         Ok(())
@@ -1963,31 +1965,45 @@ mod tests {
     }
 
     /// Recovery after plain renames (FAT, exFAT): both files may have new IDs, and the landing is still finished.
-    /// After hard links the IDs must match.
+    /// After hard links the IDs must match; files that don't are someone else's, and the moved one becomes a conflict
+    /// copy next to the target.
     #[test]
     fn recovery_compares_ids_only_when_the_moves_kept_them() {
         for ids_kept in [false, true] {
-            let (dir, mut disk, old) = landing_setup();
+            let (dir, disk, old) = landing_setup();
+            let mut disk = disk.with_device_name("desk");
             let new = disk.write(&craft_cloud_sync::rel("a.txt"), b"new", false, 1_700_000_000_000).unwrap();
             let renumber = |m: FileMeta| FileMeta { id: m.id.map(|id| id ^ 1), ..m };
             record_with(&disk, renumber(old), renumber(new), ids_kept);
             disk.recover().unwrap();
-            let want: &[&str] = if ids_kept { &["a.txt", "a.txt.1.cc-aside"] } else { &["a.txt"] };
-            assert_eq!(names(dir.path()), want, "ids kept: {ids_kept}");
+            let left = names(dir.path());
+            if ids_kept {
+                assert_eq!(left.len(), 2, "{left:?}");
+                assert!(left[0].starts_with("a (conflict, desk, ") && left[1] == "a.txt", "{left:?}");
+                assert_eq!(fs::read(dir.path().join(&left[0])).unwrap(), b"old");
+            } else {
+                assert_eq!(left, ["a.txt"]);
+            }
             assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"new");
         }
     }
 
+    /// The download's record says one file, but a user saved another there after the crash: the save stays, and the
+    /// moved file goes back next to it under a conflict name (never `.cc-aside`, which the scan would take for the
+    /// tracked file's new name).
     #[test]
-    fn a_moved_file_whose_place_was_taken_stays() {
-        let (dir, mut disk, old) = landing_setup();
-        // The download's record says one file, but a user saved another there after the crash.
+    fn a_moved_file_whose_place_was_taken_gets_a_conflict_name() {
+        let (dir, disk, old) = landing_setup();
+        let mut disk = disk.with_device_name("desk");
         let new = FileMeta { size: 3, mtime_ms: 1, exec: false, id: Some(1) };
         fs::write(dir.path().join("a.txt"), b"the user's").unwrap();
         record(&disk, old, new);
         disk.recover().unwrap();
-        assert_eq!(names(dir.path()), ["a.txt", "a.txt.1.cc-aside"]);
-        assert_eq!(fs::read(dir.path().join("a.txt.1.cc-aside")).unwrap(), b"old");
+        let left = names(dir.path());
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"the user's");
+        let copy = left.iter().find(|n| n.starts_with("a (conflict, desk, ") && n.ends_with(".txt")).expect("a conflict copy");
+        assert_eq!(fs::read(dir.path().join(copy)).unwrap(), b"old");
         assert!(!disk.tmp_dir().join("r.landing").exists());
     }
 
