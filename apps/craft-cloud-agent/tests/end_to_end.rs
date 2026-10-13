@@ -2,6 +2,8 @@
 //! through the command line's own functions (`cli::login`, `cli::sync`, …), as a user would run them.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use craft_cloud_agent::account::DataDir;
 use craft_cloud_agent::cli::{self, AgentError, Exit, LoginArgs};
@@ -11,8 +13,8 @@ use craft_cloud_meta::{Meta, Role};
 use craft_cloud_proto::ChunkId;
 use craft_cloud_server::AppState;
 use craft_cloud_server::auth::hash_password;
-use craft_cloud_store::Store;
 use craft_cloud_store::disk::DiskBackend;
+use craft_cloud_store::{Backend, Store, StoreError};
 use craft_cloud_sync::{Transport, TransportError};
 
 const PASSWORD: &str = "correct horse battery";
@@ -20,15 +22,42 @@ const PASSWORD: &str = "correct horse battery";
 struct Server {
     url: String,
     meta: Meta,
+    /// Chunks the server has read from its store (each chunk download reads one).
+    chunk_reads: Arc<AtomicUsize>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
     _dirs: Vec<tempfile::TempDir>,
+}
+
+/// The server's disk store, counting the chunks read from it.
+struct CountingBackend {
+    inner: DiskBackend,
+    chunk_reads: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Backend for CountingBackend {
+    async fn put_raw(&self, path: &str, data: bytes::Bytes) -> Result<(), StoreError> {
+        self.inner.put_raw(path, data).await
+    }
+
+    async fn get_raw(&self, path: &str) -> Result<Option<bytes::Bytes>, StoreError> {
+        if path.starts_with("chunks/") {
+            self.chunk_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.get_raw(path).await
+    }
+
+    async fn delete_raw(&self, path: &str) -> Result<(), StoreError> {
+        self.inner.delete_raw(path).await
+    }
 }
 
 async fn server() -> Server {
     let db = tempfile::tempdir().unwrap();
     let blobs = tempfile::tempdir().unwrap();
     let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
-    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let chunk_reads = Arc::new(AtomicUsize::new(0));
+    let store = Store::new(CountingBackend { inner: DiskBackend::new(blobs.path()).unwrap(), chunk_reads: chunk_reads.clone() });
     let state = AppState::new(meta.clone(), store, vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -37,7 +66,7 @@ async fn server() -> Server {
         let _ = rx.await;
     }));
     meta.create_user("ana", &hash_password(PASSWORD).unwrap(), Role::Member, 0).await.unwrap();
-    Server { url, meta, _shutdown: tx, _dirs: vec![db, blobs] }
+    Server { url, meta, chunk_reads, _shutdown: tx, _dirs: vec![db, blobs] }
 }
 
 struct Agent {
@@ -883,11 +912,22 @@ async fn a_damaged_state_file_stops_the_agent() {
 }
 
 /// A file that can't be replaced when the server's edit arrives (on Windows: an app holds it open; here: its folder
-/// may not be written): the pass skips it as in use and keeps the download, and a later pass lands the kept file.
+/// may not be written): the pass skips it as in use and keeps the download, a pass while it is still blocked leaves
+/// the kept file alone, and a later pass lands the kept file. The server's store counts the chunks it reads, which
+/// shows the kept file landed without a download.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_download_that_cant_land_is_kept_and_lands_later() {
     use std::os::unix::fs::PermissionsExt;
+
+    /// Gives the folder its mode back however the test ends, so the temporary folder can be removed.
+    struct Writable(PathBuf);
+    impl Drop for Writable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
     let server = server().await;
     let a = Agent::signed_in(&server, "laptop").await;
     let b = Agent::signed_in(&server, "desktop").await;
@@ -899,24 +939,35 @@ async fn a_download_that_cant_land_is_kept_and_lands_later() {
 
     let folder = b.path("docs");
     let set_mode = |mode: u32| std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(mode)).unwrap();
+    let _writable = Writable(folder.clone());
     set_mode(0o555);
     if std::fs::write(folder.join("probe"), b"").is_ok() {
-        // Permissions don't hold for this user (root): nothing to show here.
-        set_mode(0o755);
+        eprintln!("skipped: folder permissions don't hold for this user (root), so nothing here can't be replaced");
         return;
     }
     let kept = || {
         std::fs::read_dir(b.path(".craft-cloud/tmp")).unwrap().filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "kept")).count()
     };
+    let chunk_reads = || server.chunk_reads.load(Ordering::Relaxed);
+    let before = chunk_reads();
     let (exit, summary) = b.try_sync(false).await.unwrap();
     assert_eq!(exit, Exit::Done);
     assert!(summary.skipped.iter().any(|(p, why)| p == "docs/notes.txt" && why.contains("no permission") && why.contains("kept")), "{summary:?}");
     assert_eq!(b.read("docs/notes.txt").as_deref(), Some("v1"));
     assert_eq!(kept(), 1);
+    let downloaded = chunk_reads();
+    assert!(downloaded > before, "the first pass downloads");
+
+    // Still blocked: skipped again, with the kept file left as it is.
+    let (_, summary) = b.try_sync(false).await.unwrap();
+    assert!(summary.skipped.iter().any(|(p, why)| p == "docs/notes.txt" && why.contains("kept")), "{summary:?}");
+    assert_eq!(kept(), 1);
+
     set_mode(0o755);
     let (_, summary) = b.try_sync(false).await.unwrap();
     assert_eq!(summary.downloaded, 1, "{summary:?}");
     assert_eq!(b.read("docs/notes.txt").as_deref(), Some("v2, from the laptop"));
     assert_eq!(kept(), 0);
+    assert_eq!(chunk_reads(), downloaded, "the kept file landed without a download");
     assert_eq!(b.files(), a.files());
 }
