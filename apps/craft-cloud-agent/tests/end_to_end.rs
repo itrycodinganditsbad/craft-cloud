@@ -899,6 +899,29 @@ async fn a_damaged_landing_record_is_set_aside_and_listed() {
     assert!(!String::from_utf8(out).unwrap().contains("needs you"));
 }
 
+/// A file an interrupted download took out of the folder and couldn't put back (`.rescued`) is listed by `status`
+/// until the user moves it away; passes never remove it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_lists_a_rescued_file_until_it_is_gone() {
+    let server = server().await;
+    let a = Agent::signed_in(&server, "desktop").await;
+    assert_eq!(a.sync().await, Exit::Done);
+    std::fs::create_dir_all(a.path(".craft-cloud/tmp")).unwrap();
+    let rescued = ".craft-cloud/tmp/ab12.rescued";
+    std::fs::write(a.path(rescued), b"a save").unwrap();
+    assert_eq!(a.sync().await, Exit::Done);
+    let status = |a: &Agent| {
+        let mut out = Vec::new();
+        cli::status(&a.data, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    };
+    let shown = status(&a);
+    assert!(shown.contains("needs you:") && shown.contains(rescued) && shown.contains("move it back yourself"), "{shown}");
+    assert_eq!(std::fs::read(a.path(rescued)).unwrap(), b"a save");
+    std::fs::remove_file(a.path(rescued)).unwrap();
+    assert!(!status(&a).contains("needs you"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_damaged_state_file_stops_the_agent() {
     let server = server().await;

@@ -445,6 +445,35 @@ fn leftover_temporary_files_are_cleaned() {
     assert_eq!(temps(&fs), 0);
 }
 
+/// The agent's own small files are written atomically too (`.<name>.<random>.tmp`, then a rename): a crash in between
+/// leaves that temporary name, which cleanup removes, in `.craft-cloud/` and its `tmp/`, for exactly the files the
+/// agent writes there. Anything else with a similar name stays.
+#[test]
+fn interrupted_atomic_writes_of_the_agents_files_are_cleaned() {
+    let (dir, fs) = disk();
+    std::fs::create_dir(fs.tmp_dir()).unwrap();
+    let agent = dir.path().join(".craft-cloud");
+    let stray = [
+        agent.join(".root.json.0123456789abcdef.tmp"),
+        fs.tmp_dir().join(".ab12.landing.0123456789abcdef.tmp"),
+        fs.tmp_dir().join(".ab12.swapping.fedcba9876543210.tmp"),
+    ];
+    let kept = [
+        agent.join(".notes.txt.0123456789abcdef.tmp"),
+        agent.join(".root.json.tmp"),
+        fs.tmp_dir().join(".ab12.kept.0123456789abcdef.tmp"),
+        fs.tmp_dir().join("ab12.landing.bad"),
+        fs.tmp_dir().join("ab12.rescued"),
+        dir.path().join(".root.json.0123456789abcdef.tmp"),
+    ];
+    for path in stray.iter().chain(&kept) {
+        std::fs::write(path, b"").unwrap();
+    }
+    assert_eq!(fs.clean_tmp().unwrap(), 3);
+    assert!(stray.iter().all(|p| !p.exists()));
+    assert!(kept.iter().all(|p| p.exists()));
+}
+
 #[test]
 fn the_agent_folder_is_listed_but_never_holds_a_synced_name() {
     let (_dir, mut fs) = disk();

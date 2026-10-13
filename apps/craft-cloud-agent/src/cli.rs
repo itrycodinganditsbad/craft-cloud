@@ -483,6 +483,8 @@ pub async fn login(data: &DataDir, args: &LoginArgs, password: &str, out: &mut i
 /// the pass did.
 pub async fn sync(data: &DataDir, approve_deletes: bool, out: &mut impl Write) -> Result<(Exit, PassSummary), AgentError> {
     let _data_lock = hold_data(data)?;
+    // Temporary files a crash left while `account.json` or `state.json` was written.
+    data.clean_tmp()?;
     let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
     check_apart(data, &account.folder)?;
     root::check(&account.folder, &RootMarker { space: account.space, root: account.root })?;

@@ -31,7 +31,9 @@
 //!   replaced is [`LandError::InUse`]; the engine keeps the download in the temporary folder (`<key>.kept`, see
 //!   [`Fs::keep`]) and lands it on a later pass without downloading again; while a quick look says the target still
 //!   can't be replaced ([`Fs::replace_blocked`]), the kept file isn't touched at all. [`DiskFs::clean_tmp`] removes only
-//!   interrupted writes (`.part`), never kept downloads, swap files or landing records.
+//!   interrupted writes (`.part`) and the agent's own interrupted atomic writes (`.<name>.<random>.tmp`), never kept
+//!   downloads, swap files, landing records, records set aside (`.bad`) or rescued files (`.rescued`); the last two
+//!   are listed in every pass's report and by `status` until the user deals with them ([`DiskFs::needs_you`]).
 //! - **In-flight downloads are private (Unix).** `.craft-cloud/` and `tmp/` are created with mode 0700 when the
 //!   agent makes them, so other users can't read a partly downloaded file. (Folders that already exist keep their
 //!   mode.) Windows folders get the default ACL of the synced folder.
@@ -1293,13 +1295,24 @@ impl DiskFs {
         Ok(out)
     }
 
-    /// Removes temporary files a crashed pass left behind (`.part`: interrupted writes). Kept downloads, landing and
-    /// swap records, and swap files (which may hold an app's save) are [`Fs::recover`]'s. Call it before a pass, while
-    /// no other pass runs on this folder. Returns how many it removed.
+    /// Removes temporary files a crashed pass left behind: interrupted writes (`.part`), and the temporary names of
+    /// the agent's own small files written atomically (`.root.json.<random>.tmp` in `.craft-cloud/`,
+    /// `.<record>.<random>.tmp` for landing and swap records in its `tmp/`; exactly that pattern, nothing else). Kept
+    /// downloads, landing and swap records, swap files (which may hold an app's save), records set aside (`.bad`) and
+    /// rescued files are never removed. Call it before a pass, while no other pass runs on this folder. Returns how
+    /// many it removed.
     pub fn clean_tmp(&self) -> io::Result<usize> {
-        let Some(tmp) = self.real_tmp(false)? else { return Ok(0) };
-        let entries = fs::read_dir(tmp)?;
+        // Checks that `.craft-cloud/` (and `tmp/`, if there) are real folders: nothing is deleted through a link.
+        let tmp = self.real_tmp(false)?;
+        let agent = self.root.join(AGENT_DIR);
         let mut removed = 0;
+        if Self::lstat(&agent)?.is_some_and(|md| md.file_type().is_dir()) {
+            removed += crate::account::remove_atomic_temps(&agent, |of| of == crate::root::MARKER_FILE)?;
+        }
+        let Some(tmp) = tmp else { return Ok(removed) };
+        let record = |of: &str| Path::new(of).extension().is_some_and(|ext| ext == LANDING_EXT || ext == SWAP_RECORD_EXT);
+        removed += crate::account::remove_atomic_temps(&tmp, record)?;
+        let entries = fs::read_dir(tmp)?;
         for entry in entries {
             let entry = entry?;
             let is_temp = entry.path().extension().is_some_and(|ext| ext == TMP_EXT);
