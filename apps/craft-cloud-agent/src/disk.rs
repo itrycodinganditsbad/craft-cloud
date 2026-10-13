@@ -1030,13 +1030,14 @@ impl DiskFs {
 
     /// Sets aside a record recovery can't read (or that names no file in the folder), so passes go on: renamed to
     /// `<record>.bad`, never cleaned up, and listed by [`DiskFs::needs_you`] until the user removes it. A swap record's
-    /// swap file (which may hold an app's save) becomes `<stem>.rescued`, listed the same way.
+    /// swap file (which may hold an app's save) becomes `<stem>.rescued`, listed the same way; if that rename fails,
+    /// the `.swap` file stays, and is listed as a swap file without a record.
     fn set_aside(record_path: &Path) -> io::Result<()> {
         let name = record_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         fs::rename(record_path, record_path.with_file_name(format!("{name}.{BAD_EXT}")))?;
         let swap = record_path.with_extension(SWAP_EXT);
-        if record_path.extension().is_some_and(|ext| ext == SWAP_RECORD_EXT) && Self::lstat(&swap)?.is_some() {
-            fs::rename(&swap, swap.with_extension(RESCUED_EXT))?;
+        if record_path.extension().is_some_and(|ext| ext == SWAP_RECORD_EXT) && Self::lstat(&swap).ok().flatten().is_some() {
+            let _ = fs::rename(&swap, swap.with_extension(RESCUED_EXT));
         }
         Ok(())
     }
@@ -1286,6 +1287,13 @@ impl DiskFs {
                     ));
                 }
                 Some(ext) if ext == RESCUED_EXT => out.push((
+                    shown,
+                    "a file an interrupted download took out of the folder (it may be a save) and couldn't put back: move it back yourself"
+                        .to_owned(),
+                )),
+                // A swap file whose record is gone (set aside as `.bad`, but the swap file couldn't be renamed): nothing
+                // will put it right, so it is the user's too.
+                Some(ext) if ext == SWAP_EXT && Self::lstat(&path.with_extension(SWAP_RECORD_EXT)).ok().flatten().is_none() => out.push((
                     shown,
                     "a file an interrupted download took out of the folder (it may be a save) and couldn't put back: move it back yourself"
                         .to_owned(),
@@ -2063,6 +2071,28 @@ mod tests {
         let listed: Vec<String> = disk.notices().into_iter().map(|(path, _)| path).collect();
         assert_eq!(listed, [".craft-cloud/tmp/s.rescued", ".craft-cloud/tmp/s.swapping.bad"]);
         assert_eq!(disk.clean_tmp().unwrap(), 0, "never cleaned up");
+    }
+
+    /// The swap file of a damaged swap record can't be renamed to `.rescued` (here: a folder with that name is in the
+    /// way): the record is still set aside, the pass goes on, and the swap file, now without a record, is listed.
+    #[test]
+    fn a_swap_file_that_cant_be_rescued_is_listed_too() {
+        let (_dir, mut disk, _) = landing_setup();
+        fs::write(disk.tmp_dir().join("s.swapping"), b"{").unwrap();
+        fs::write(disk.tmp_dir().join("s.swap"), b"a save").unwrap();
+        fs::create_dir(disk.tmp_dir().join("s.rescued")).unwrap();
+        fs::write(disk.tmp_dir().join("s.rescued").join("x"), b"").unwrap();
+        disk.recover().unwrap();
+        assert_eq!(fs::read(disk.tmp_dir().join("s.swap")).unwrap(), b"a save");
+        let listed: Vec<String> = disk.notices().into_iter().map(|(path, _)| path).collect();
+        assert!(
+            listed.contains(&".craft-cloud/tmp/s.swap".to_owned()) && listed.contains(&".craft-cloud/tmp/s.swapping.bad".to_owned()),
+            "{listed:?}"
+        );
+        // A swap file with its record is recovery's, not listed.
+        fs::write(disk.tmp_dir().join("t.swap"), b"x").unwrap();
+        fs::write(disk.tmp_dir().join("t.swapping"), b"").unwrap();
+        assert!(!disk.needs_you().unwrap().iter().any(|(p, _)| p.ends_with("t.swap")));
     }
 
     #[test]
