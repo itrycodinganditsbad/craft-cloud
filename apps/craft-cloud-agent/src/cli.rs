@@ -610,6 +610,15 @@ pub fn status(data: &DataDir, out: &mut impl Write) -> Result<(), AgentError> {
     if let Err(e) = root::check(&account.folder, &RootMarker { space: account.space, root: account.root }) {
         say!(out, "folder problem: {e}")?;
     }
+    // What recovery of interrupted downloads left for the user, until it is gone.
+    if let Ok(left) = DiskFs::new(&account.folder).needs_you()
+        && !left.is_empty()
+    {
+        say!(out, "needs you:")?;
+        for (path, what) in left {
+            say!(out, "  {path}: {what}")?;
+        }
+    }
     let saved = data.load_state()?;
     match &saved.last_pass {
         None => say!(out, "last pass: never synced")?,

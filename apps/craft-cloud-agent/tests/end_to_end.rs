@@ -844,6 +844,32 @@ async fn status_lists_the_skipped_files() {
     assert!(status.contains("skipped:") && status.contains("Footage"), "{status}");
 }
 
+/// A record of an interrupted download that can't be read doesn't fail every pass: it is set aside as `.bad`, and
+/// the pass report and `status` say what to check and what to remove, until it is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_damaged_landing_record_is_set_aside_and_listed() {
+    let server = server().await;
+    let a = Agent::signed_in(&server, "desktop").await;
+    a.write("notes.txt", "x");
+    assert_eq!(a.sync().await, Exit::Done);
+    std::fs::create_dir_all(a.path(".craft-cloud/tmp")).unwrap();
+    std::fs::write(a.path(".craft-cloud/tmp/r.landing"), br#"{"target":"notes.txt""#).unwrap();
+    let (exit, summary) = a.try_sync(false).await.unwrap();
+    assert_eq!(exit, Exit::Done);
+    let bad = ".craft-cloud/tmp/r.landing.bad";
+    assert!(summary.skipped.iter().any(|(p, why)| p == bad && why.contains(&format!("then remove {bad}"))), "{summary:?}");
+    let mut out = Vec::new();
+    cli::status(&a.data, &mut out).unwrap();
+    let status = String::from_utf8(out).unwrap();
+    assert!(status.contains("needs you:") && status.contains(bad), "{status}");
+    std::fs::remove_file(a.path(bad)).unwrap();
+    let (_, summary) = a.try_sync(false).await.unwrap();
+    assert!(summary.skipped.is_empty(), "{summary:?}");
+    let mut out = Vec::new();
+    cli::status(&a.data, &mut out).unwrap();
+    assert!(!String::from_utf8(out).unwrap().contains("needs you"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_damaged_state_file_stops_the_agent() {
     let server = server().await;

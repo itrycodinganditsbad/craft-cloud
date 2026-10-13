@@ -178,6 +178,12 @@ pub trait Fs: Send {
     fn recover(&mut self) -> io::Result<()> {
         Ok(())
     }
+    /// What the last [`Fs::recover`] left for the user, as (what, what to do) pairs: a record of an interrupted landing
+    /// it couldn't read and set aside, a file it couldn't put back. The engine adds them to every pass's
+    /// [`Report::skipped`](crate::Report::skipped) until the user deals with them.
+    fn notices(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
     /// Paths whose content is unknown right now: the targets of landings in steps that haven't finished (a step
     /// failed and putting the moved file back failed too, so [`Fs::recover`] finishes it on the next pass). The scan
     /// treats them like a folder it can't list: a tracked file there is never taken for deleted. The moved files

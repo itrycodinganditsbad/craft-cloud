@@ -367,6 +367,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             path: "an interrupted download".into(),
             source: io::Error::new(e.kind(), format!("couldn't be put right ({e}); tried again next pass")),
         })?;
+        // What recovery set aside for the user (a record it can't read, a file it couldn't put back).
+        report.skipped.extend(self.fs.notices());
         let mode = match self.pull().await? {
             Mode::Normal if self.state.reconcile_pending => Mode::Reconcile,
             mode => mode,

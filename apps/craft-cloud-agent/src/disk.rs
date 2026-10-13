@@ -90,6 +90,12 @@ const LANDING_EXT: &str = "landing";
 const SWAP_EXT: &str = "swap";
 /// Extension of the record that goes with a [`SWAP_EXT`] file (same stem): the target and both files' stats.
 const SWAP_RECORD_EXT: &str = "swapping";
+/// Appended to a landing or swap record recovery can't read (`<record>.bad`): set aside so passes go on, never
+/// cleaned up, and listed in every pass's report and by `status` until the user removes it ([`DiskFs::needs_you`]).
+const BAD_EXT: &str = "bad";
+/// Extension of a file an interrupted landing by exchange took out of the folder and recovery couldn't put back
+/// (its folder is gone, or its record can't be read): never cleaned up, listed until the user moves it.
+const RESCUED_EXT: &str = "rescued";
 /// The last part of the name a file gets while a download lands over it in steps: `<name>.<random>.cc-aside`,
 /// next to it.
 const ASIDE_SUFFIX: &str = "cc-aside";
@@ -111,6 +117,8 @@ pub struct DiskFs {
     pending_asides: BTreeMap<PathBuf, RelPath>,
     /// This device's name, for the conflict-copy names recovery gives (see [`DiskFs::with_device_name`]).
     device_name: String,
+    /// What the last [`Fs::recover`] found that needs the user ([`DiskFs::needs_you`]), for [`Fs::notices`].
+    notices: Vec<(String, String)>,
     /// Faults and detours for tests of paths a real disk rarely takes.
     hooks: Hooks,
 }
@@ -638,7 +646,14 @@ fn create_temp(dir: &Path) -> io::Result<(File, PathBuf)> {
 impl DiskFs {
     /// The folder at `root`. Nothing is checked or created until the engine asks.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), swap: true, pending_asides: BTreeMap::new(), device_name: "this computer".into(), hooks: Hooks::default() }
+        Self {
+            root: root.into(),
+            swap: true,
+            pending_asides: BTreeMap::new(),
+            device_name: "this computer".into(),
+            notices: Vec::new(),
+            hooks: Hooks::default(),
+        }
     }
 
     /// Names conflict copies that recovery makes after this device (as the engine names its own).
@@ -1009,14 +1024,40 @@ impl DiskFs {
         }
     }
 
+    /// Sets aside a record recovery can't read (or that names no file in the folder), so passes go on: renamed to
+    /// `<record>.bad`, never cleaned up, and listed by [`DiskFs::needs_you`] until the user removes it. A swap record's
+    /// swap file (which may hold an app's save) becomes `<stem>.rescued`, listed the same way.
+    fn set_aside(record_path: &Path) -> io::Result<()> {
+        let name = record_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        fs::rename(record_path, record_path.with_file_name(format!("{name}.{BAD_EXT}")))?;
+        let swap = record_path.with_extension(SWAP_EXT);
+        if record_path.extension().is_some_and(|ext| ext == SWAP_RECORD_EXT) && Self::lstat(&swap)?.is_some() {
+            fs::rename(&swap, swap.with_extension(RESCUED_EXT))?;
+        }
+        Ok(())
+    }
+
+    /// The record at `record_path`, or `None` when it can't be read or isn't one.
+    fn read_record<T: serde::de::DeserializeOwned>(record_path: &Path) -> Option<T> {
+        serde_json::from_slice(&fs::read(record_path).ok()?).ok()
+    }
+
+    /// Whether `target` (from a record) names a file in the folder.
+    fn names_a_file(target: &str) -> bool {
+        let rel = craft_cloud_sync::rel(target);
+        rel.to_string() == target && !rel.is_root()
+    }
+
     /// Puts right the exchange a swap record describes (see [`DiskFs::land_by_exchange`]). The record goes once that
-    /// is done. Errors name the record's target, or the record in `.craft-cloud/tmp` when it can't be read.
+    /// is done. A record that can't be read is set aside ([`DiskFs::set_aside`]). Errors name the record's target,
+    /// or the record in `.craft-cloud/tmp` when it can't be set aside.
     fn recover_swap(&self, record_path: &Path) -> io::Result<()> {
         let shown = format!("{AGENT_DIR}/{TMP_DIR}/{}", record_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
         let named = |what: &str, e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"));
-        let record: SwapRecord = fs::read(record_path)
-            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())))
-            .map_err(|e| named(&shown, e))?;
+        let record = match Self::read_record::<SwapRecord>(record_path) {
+            Some(record) if Self::names_a_file(&record.target) => record,
+            _ => return Self::set_aside(record_path).map_err(|e| named(&shown, e)),
+        };
         self.apply_swap(&record, &record_path.with_extension(SWAP_EXT)).map_err(|e| named(&record.target, e))?;
         fs::remove_file(record_path).map_err(|e| named(&shown, e))
     }
@@ -1062,7 +1103,7 @@ impl DiskFs {
         {
             return rename_no_replace(swap, &parent.join(aside_name(name)?));
         }
-        let rescued = swap.with_extension("rescued");
+        let rescued = swap.with_extension(RESCUED_EXT);
         fs::rename(swap, &rescued)?;
         let name = rescued.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         Err(io::Error::other(format!(
@@ -1071,14 +1112,15 @@ impl DiskFs {
     }
 
     /// Finishes or undoes the landing a record describes (see [`Fs::recover`]). The record goes once that is done,
-    /// or once there is nothing left to do.
-    /// Errors name the record's target, or the record in `.craft-cloud/tmp` when it can't be read.
+    /// or once there is nothing left to do. A record that can't be read is set aside ([`DiskFs::set_aside`]).
+    /// Errors name the record's target, or the record in `.craft-cloud/tmp` when it can't be set aside.
     fn recover_landing(&self, record_path: &Path) -> io::Result<()> {
         let shown = format!("{AGENT_DIR}/{TMP_DIR}/{}", record_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
         let named = |what: &str, e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"));
-        let record: LandingRecord = fs::read(record_path)
-            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())))
-            .map_err(|e| named(&shown, e))?;
+        let record = match Self::read_record::<LandingRecord>(record_path) {
+            Some(record) if Self::names_a_file(&record.target) && Name::new(&record.aside).is_ok() => record,
+            _ => return Self::set_aside(record_path).map_err(|e| named(&shown, e)),
+        };
         self.apply_landing(&record).map_err(|e| named(&record.target, e))?;
         fs::remove_file(record_path).map_err(|e| named(&shown, e))
     }
@@ -1210,6 +1252,44 @@ impl DiskFs {
     /// Where temporary files go.
     pub fn tmp_dir(&self) -> PathBuf {
         self.root.join(AGENT_DIR).join(TMP_DIR)
+    }
+
+    /// What recovery left in the temporary folder for the user, as (file, what to do) pairs: records it couldn't
+    /// read (`<record>.bad`) and files an interrupted download took out of the folder that it couldn't put back
+    /// (`.rescued`). Nothing removes them; they are listed in every pass's report and by `status` until the user does.
+    pub fn needs_you(&self) -> io::Result<Vec<(String, String)>> {
+        let Some(tmp) = self.real_tmp(false)? else { return Ok(Vec::new()) };
+        let mut out = Vec::new();
+        for entry in fs::read_dir(tmp)? {
+            let path = entry?.path();
+            let shown = format!("{AGENT_DIR}/{TMP_DIR}/{}", path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
+            match path.extension() {
+                Some(ext) if ext == BAD_EXT => {
+                    // The target, if that much of the record is readable.
+                    let target = fs::read(&path)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .and_then(|v| v.get("target")?.as_str().map(str::to_owned))
+                        .filter(|t| !t.is_empty());
+                    let check = match target {
+                        Some(target) => format!("check the files next to {target}"),
+                        None => "check the folder for files whose names end in .cc-aside".to_owned(),
+                    };
+                    out.push((
+                        shown.clone(),
+                        format!("a record of an interrupted download can't be read and was set aside; {check}, then remove {shown}"),
+                    ));
+                }
+                Some(ext) if ext == RESCUED_EXT => out.push((
+                    shown,
+                    "a file an interrupted download took out of the folder (it may be a save) and couldn't put back: move it back yourself"
+                        .to_owned(),
+                )),
+                _ => {}
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     /// Removes temporary files a crashed pass left behind (`.part`: interrupted writes). Kept downloads, landing and
@@ -1527,14 +1607,16 @@ impl Fs for DiskFs {
     }
 
     /// Goes through the landing and swap records in the temporary folder (see [`DiskFs::land_in_steps`] and
-    /// [`DiskFs::land_by_exchange`]). A record that can't be read or acted on stays for the next pass; the first error
-    /// is returned once all were tried.
+    /// [`DiskFs::land_by_exchange`]). A record that can't be read is set aside as `<record>.bad` and listed in
+    /// [`Fs::notices`] (see [`DiskFs::needs_you`]); one that can't be acted on stays for the next pass, and the first
+    /// error is returned once all were tried.
     fn recover(&mut self) -> io::Result<()> {
         self.pending_asides.clear();
+        self.notices.clear();
         let Some(tmp) = self.real_tmp(false)? else { return Ok(()) };
         let mut first_error = None;
-        for entry in fs::read_dir(tmp)? {
-            let path = entry?.path();
+        let paths = fs::read_dir(tmp)?.map(|entry| entry.map(|e| e.path())).collect::<io::Result<Vec<_>>>()?;
+        for path in paths {
             let result = match path.extension() {
                 Some(ext) if ext == LANDING_EXT => self.recover_landing(&path).inspect_err(|_| {
                     // Still pending: its moved file stays out of listings, and its target is unsettled.
@@ -1549,7 +1631,12 @@ impl Fs for DiskFs {
                 first_error.get_or_insert(e);
             }
         }
+        self.notices = self.needs_you().unwrap_or_default();
         first_error.map_or(Ok(()), Err)
+    }
+
+    fn notices(&self) -> Vec<(String, String)> {
+        self.notices.clone()
     }
 
     fn mkdir(&mut self, path: &RelPath) -> io::Result<()> {
@@ -1871,14 +1958,48 @@ mod tests {
         assert!(!disk.tmp_dir().join("r.landing").exists());
     }
 
+    /// A record recovery can't read would fail every pass: it is set aside as `<record>.bad` instead, touching
+    /// nothing, and listed (with the target, if that much can be read) until the user removes it.
     #[test]
-    fn a_damaged_landing_record_stays_and_touches_nothing() {
-        let (dir, mut disk, _) = landing_setup();
-        fs::write(disk.tmp_dir().join("r.landing"), b"not json").unwrap();
-        let e = disk.recover().unwrap_err().to_string();
-        assert!(e.starts_with(".craft-cloud/tmp/r.landing: "), "{e}");
-        assert_eq!(names(dir.path()), ["a.txt.1.cc-aside"]);
-        assert!(disk.tmp_dir().join("r.landing").exists());
+    fn a_damaged_landing_record_is_set_aside_and_touches_nothing() {
+        for (content, check) in [
+            (&b"not json"[..], "check the folder for files whose names end in .cc-aside"),
+            (&br#"{"target":"a.txt","aside":7}"#[..], "check the files next to a.txt"),
+            (&br#"{"target":"../a.txt","aside":"x","expected":{"size":1,"mtime_ms":1,"exec":false,"id":null},"incoming":{"size":1,"mtime_ms":1,"exec":false,"id":null}}"#[..], "check the files next to ../a.txt"),
+        ] {
+            let (dir, mut disk, _) = landing_setup();
+            fs::write(disk.tmp_dir().join("r.landing"), content).unwrap();
+            disk.recover().unwrap();
+            assert_eq!(names(dir.path()), ["a.txt.1.cc-aside"]);
+            assert!(!disk.tmp_dir().join("r.landing").exists());
+            assert!(disk.tmp_dir().join("r.landing.bad").exists());
+            let want = (
+                ".craft-cloud/tmp/r.landing.bad".to_owned(),
+                format!("a record of an interrupted download can't be read and was set aside; {check}, then remove .craft-cloud/tmp/r.landing.bad"),
+            );
+            assert_eq!(disk.notices(), std::slice::from_ref(&want));
+            assert_eq!(disk.needs_you().unwrap(), [want]);
+            // Later passes go on, and still list it until it is gone.
+            disk.recover().unwrap();
+            assert_eq!(disk.notices().len(), 1);
+            fs::remove_file(disk.tmp_dir().join("r.landing.bad")).unwrap();
+            disk.recover().unwrap();
+            assert!(disk.notices().is_empty());
+        }
+    }
+
+    /// A damaged swap record: set aside the same way, and its swap file (perhaps an app's save) is kept as `.rescued`
+    /// and listed too.
+    #[test]
+    fn a_damaged_swap_record_is_set_aside_and_its_file_kept() {
+        let (_dir, mut disk, _) = landing_setup();
+        fs::write(disk.tmp_dir().join("s.swapping"), b"{").unwrap();
+        fs::write(disk.tmp_dir().join("s.swap"), b"a save").unwrap();
+        disk.recover().unwrap();
+        assert_eq!(fs::read(disk.tmp_dir().join("s.rescued")).unwrap(), b"a save");
+        let listed: Vec<String> = disk.notices().into_iter().map(|(path, _)| path).collect();
+        assert_eq!(listed, [".craft-cloud/tmp/s.rescued", ".craft-cloud/tmp/s.swapping.bad"]);
+        assert_eq!(disk.clean_tmp().unwrap(), 0, "never cleaned up");
     }
 
     #[test]
