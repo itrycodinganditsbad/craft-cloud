@@ -178,9 +178,10 @@ pub trait Fs: Send {
     }
     /// Finishes or undoes landings a crash cut short, where a landing takes more than one step (no exchange on this
     /// platform): a file moved aside is put back where nothing took its place, or removed when the landing was
-    /// complete but for that. Anything else is left where it is, as a file the next scan sees. A moved file whose
-    /// folder the user moved meanwhile is found there (by the folder's ID) and handled the same way under its own
-    /// name; if that name is taken, it gets a conflict name. The engine calls it at the start of every pass.
+    /// complete but for that. If its name is taken by anything but the download, it gets a conflict name next to it
+    /// (never replacing anything), which the next scan sees as a copy. A moved file whose folder the user moved
+    /// meanwhile is found there (by the folder's ID) and handled the same way under its own name. The engine calls it
+    /// at the start of every pass.
     ///
     /// Known limit: a crash after the download took the name but before the moved file was removed, followed by the
     /// user deleting the download before the next pass, puts the old file back (the user's delete of a file they
@@ -715,15 +716,12 @@ impl Fs for MemFs {
         Ok(())
     }
 
-    /// Like the agent's disk: a moved file whose folder the user moved since is found in that folder by the folder's
-    /// ID, and handled there under its own name; if that name is taken by anything but the download, it gets a
-    /// conflict name instead (never a `.cc-aside` name the scan would take for the tracked file's new place).
+    /// Like the agent's disk: a moved file whose name is taken by anything but the download gets a conflict name
+    /// instead (never a `.cc-aside` name the scan would take for the tracked file's new place), and one whose folder
+    /// the user moved since is found in that folder by the folder's ID and handled there under its own name.
     fn recover(&mut self) -> io::Result<()> {
         while let Some(record) = self.asides.first().cloned() {
-            let (target, aside, moved_with_folder) = match self.relocated(&record) {
-                Some((target, aside)) => (target, aside, true),
-                None => (record.target.clone(), record.aside.clone(), false),
-            };
+            let (target, aside) = self.relocated(&record).unwrap_or_else(|| (record.target.clone(), record.aside.clone()));
             match (self.file_meta(&aside), self.nodes.contains_key(&target)) {
                 // Moved aside, nothing took its place: it goes back.
                 (Some(_), false) => {
@@ -735,14 +733,14 @@ impl Fs for MemFs {
                     self.change()?;
                     self.nodes.remove(&aside);
                 }
-                // In a folder the user moved, with its name taken: a conflict name next to it.
-                (Some(_), true) if moved_with_folder => {
+                // Its name taken by something other than the download: a conflict name next to it.
+                (Some(_), true) => {
                     if let Some(copy) = self.free_conflict_name(&target) {
                         self.change()?;
                         self.move_node(&aside, &copy);
                     }
                 }
-                // Gone already, or something else is going on: the moved file stays as it is, and the scan sees it.
+                // Gone already: nothing to do.
                 _ => {}
             }
             self.asides.remove(0);
