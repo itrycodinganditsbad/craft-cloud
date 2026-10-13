@@ -1600,8 +1600,12 @@ async fn a_download_onto_a_file_in_use_is_kept_and_lands_later() {
         b.fs_mut().hold(&path("notes"));
         write(&mut a, "notes", b"v2");
         a.sync_once().await.unwrap();
-        for _ in 0..2 {
+        let takes = b.fs().kept_takes();
+        for pass in 0..2 {
             let report = b.sync_once().await.unwrap();
+            // The first pass downloads and keeps; the next one asks whether the file can be replaced before it takes the
+            // kept file back, and skips without moving or hashing it.
+            assert_eq!(b.fs().kept_takes(), takes + 1, "pass {pass}");
             assert!(report.downloaded.is_empty() && report.conflict_copies.is_empty(), "{report:?}");
             assert!(
                 report.skipped.iter().any(|(p, why)| p == "notes" && why.contains("in use") && why.ends_with("tried again next pass")),

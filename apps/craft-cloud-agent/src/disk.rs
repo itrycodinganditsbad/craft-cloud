@@ -29,7 +29,8 @@
 //!   file.
 //! - **Downloads that can't land are kept.** A target another program holds open (Windows) or that may not be
 //!   replaced is [`LandError::InUse`]; the engine keeps the download in the temporary folder (`<key>.kept`, see
-//!   [`Fs::keep`]) and lands it on a later pass without downloading again. [`DiskFs::clean_tmp`] removes only
+//!   [`Fs::keep`]) and lands it on a later pass without downloading again; while a quick look says the target still
+//!   can't be replaced ([`Fs::replace_blocked`]), the kept file isn't touched at all. [`DiskFs::clean_tmp`] removes only
 //!   interrupted writes (`.part`), never kept downloads, swap files or landing records.
 //! - **In-flight downloads are private (Unix).** `.craft-cloud/` and `tmp/` are created with mode 0700 when the
 //!   agent makes them, so other users can't read a partly downloaded file. (Folders that already exist keep their
@@ -1579,6 +1580,39 @@ impl Fs for DiskFs {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Windows: a read-only file, or one an app holds open without letting it be deleted (asking for delete access,
+    /// with every share flag, fails the way moving it would). Linux and macOS: a folder this user may not write.
+    /// Anything the look can't tell is left to the landing.
+    fn replace_blocked(&self, path: &RelPath) -> Option<String> {
+        let full = self.checked(path).ok()??;
+        let md = Self::lstat(&full).ok()??;
+        if !md.file_type().is_file() {
+            return None;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            if md.permissions().readonly() {
+                return Some("read-only here, not replaced".into());
+            }
+            // DELETE; FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
+            if let Err(e) = OpenOptions::new().access_mode(0x0001_0000).share_mode(0x1 | 0x2 | 0x4).open(&full)
+                && matches!(e.raw_os_error(), Some(32 | 33))
+            {
+                return Some("in use by another program".into());
+            }
+        }
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        {
+            use rustix::fs::{Access, access};
+            let parent = full.parent()?;
+            if access(parent, Access::WRITE_OK | Access::EXEC_OK).is_err_and(|e| e == rustix::io::Errno::ACCESS) {
+                return Some("can't be replaced here (no permission)".into());
+            }
+        }
+        None
     }
 
     fn kept(&self) -> io::Result<Vec<String>> {

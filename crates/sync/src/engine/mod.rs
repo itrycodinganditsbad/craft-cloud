@@ -40,6 +40,8 @@ const OS_METADATA: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
 /// Why an entry that is neither a regular file nor a folder (or whose name the filesystem layer can't use) is
 /// skipped.
 pub const OTHER_REASON: &str = "a link, a special file, or a name this computer can't sync";
+/// What the report says about a download kept because the file it replaces is in use or may not be replaced.
+const KEPT_WAITS: &str = "the server's version is downloaded and kept, and lands once it can";
 /// Most chunk IDs asked about in one missing-chunk query.
 const MISSING_QUERY_IDS: usize = 10_000;
 
@@ -742,6 +744,15 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         expected: Option<FsKind>,
         report: &mut Report,
     ) -> Result<Option<(FileMeta, FileHash)>, SyncError> {
+        let key = kept_key(id, file);
+        // A download of this version is kept already, and the file it would replace still can't be replaced: skipped
+        // as cheaply as possible (no manifest, no move or hash of the kept file), until it can.
+        if matches!(expected, Some(FsKind::File(_)))
+            && let Some(why) = self.fs.replace_blocked(path)
+            && self.fs.kept().is_ok_and(|keys| keys.contains(&key))
+        {
+            return Err(io_err(path, io::Error::new(io::ErrorKind::PermissionDenied, format!("{why}; {KEPT_WAITS}"))));
+        }
         let manifest = self.fetch_manifest(&file.manifest).await?;
         self.no_link(path)?;
         let changed = |report: &mut Report| {
@@ -756,7 +767,6 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 return Ok(None);
             }
         };
-        let key = kept_key(id, file);
         // A kept download of this very version lands without downloading again, once its content is hashed again
         // against the version's file hash; one that changed on disk, or can't be taken back, is downloaded again.
         let writer = match self.fs.take_kept(&key, manifest.file_hash()) {
@@ -796,7 +806,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             Err(LandError::InUse(writer, why)) => {
                 // The server's version is downloaded and kept here; it lands once the file can be replaced.
                 let kept = self.fs.keep(writer, &key).is_ok();
-                let what = if kept { "the server's version is downloaded and kept, and lands once it can" } else { "not replaced" };
+                let what = if kept { KEPT_WAITS } else { "not replaced" };
                 Err(io_err(path, io::Error::new(why.kind(), format!("{why}; {what}"))))
             }
             Err(LandError::Io(e)) => Err(io_err(path, e)),

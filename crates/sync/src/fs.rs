@@ -157,6 +157,16 @@ pub trait Fs: Send {
         let _ = (key, hash);
         Ok(None)
     }
+    /// Why the file at `path` can't be replaced right now, as far as a quick look tells (without reading it): "read-only
+    /// here, not replaced" for a file marked read-only (Windows), "in use by another program" for one an app holds
+    /// open so it can't be replaced, "can't be replaced here (no permission)" for a folder that may not be written.
+    /// `None` when nothing stands in the way, or the look can't tell (the landing then finds out). The engine asks
+    /// before it takes a kept download back ([`Fs::take_kept`]), so a file that stays blocked costs no move and no
+    /// hash of the kept file every pass.
+    fn replace_blocked(&self, path: &RelPath) -> Option<String> {
+        let _ = path;
+        None
+    }
     /// The keys of every kept write.
     fn kept(&self) -> io::Result<Vec<String>> {
         Ok(Vec::new())
@@ -249,6 +259,8 @@ pub struct MemFs {
     swap: bool,
     /// Writes kept for a later pass, by key ([`Fs::keep`]).
     kept: BTreeMap<String, Vec<u8>>,
+    /// How many times a kept write was asked for ([`MemFs::kept_takes`]).
+    kept_takes: u64,
     /// Landings in steps that haven't finished (a machine died between two steps), for [`Fs::recover`].
     asides: Vec<Aside>,
     /// Landings in steps fail after moving the file there aside, and putting it back fails too (see
@@ -294,6 +306,7 @@ impl Default for MemFs {
             exec_bit: true,
             swap: true,
             kept: BTreeMap::new(),
+            kept_takes: 0,
             asides: Vec::new(),
             fail_landings: false,
         }
@@ -450,6 +463,12 @@ impl MemFs {
     /// [`Fs::recover`] puts the moved file back.
     pub fn failing_landings(&mut self, on: bool) {
         self.fail_landings = on;
+    }
+
+    /// How many times the engine asked for a kept write back ([`Fs::take_kept`]), found or not: for tests that a file
+    /// that stays blocked doesn't cost a take (and a hash) every pass.
+    pub fn kept_takes(&self) -> u64 {
+        self.kept_takes
     }
 
     /// Lets every locked and held path go.
@@ -670,7 +689,19 @@ impl Fs for MemFs {
 
     fn take_kept(&mut self, key: &str, hash: &FileHash) -> io::Result<Option<Self::Writer>> {
         self.alive()?;
+        self.kept_takes += 1;
         Ok(self.kept.remove(key).filter(|data| blake3::hash(data).as_bytes() == hash.as_bytes()))
+    }
+
+    /// A held file ([`MemFs::hold`]) is in use, a read-only one ([`MemFs::set_read_only`]) read-only.
+    fn replace_blocked(&self, path: &RelPath) -> Option<String> {
+        if self.held.contains(path) {
+            Some("in use by another program".into())
+        } else if self.read_only.contains(path) {
+            Some("read-only here, not replaced".into())
+        } else {
+            None
+        }
     }
 
     fn kept(&self) -> io::Result<Vec<String>> {

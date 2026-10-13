@@ -354,7 +354,11 @@ fn a_file_that_cant_be_replaced_is_in_use() {
         assert_eq!(std::fs::read(folder.join("a.txt")).unwrap(), b"old");
         assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 1, "nothing moved aside is left");
         fs.keep(w, "k").unwrap();
+        // A quick look says so too, so the engine doesn't take the kept file back while it can't land.
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        assert_eq!(fs.replace_blocked(&rel("locked/a.txt")).as_deref(), Some("can't be replaced here (no permission)"));
         std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(fs.replace_blocked(&rel("locked/a.txt")), None);
         let w = fs.take_kept("k", &craft_cloud_proto::FileHash::from_bytes(*blake3::hash(b"new").as_bytes())).unwrap().unwrap();
         fs.finish_write(&rel("locked/a.txt"), w, false, T0, Some(old)).unwrap();
         assert_eq!(std::fs::read(folder.join("a.txt")).unwrap(), b"new");
