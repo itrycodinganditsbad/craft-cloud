@@ -381,7 +381,11 @@ changes locally, then pushes local changes. These rules came out of the simulati
   can send the move aside as a user move, so the server node takes the conflict name. If the user renames a
   folder holding a link while the server adds something to that folder, the engine makes the folder again at
   its old place and the node behind the link is deleted on the server; the file goes up as new once it is
-  real again, and history keeps the old version.
+  real again, and history keeps the old version. Seed 112337 (found in the M3b2a
+  review, both modes): a folder that was a link and became a real folder again, then a pass that failed before
+  recording its new ID, then a link made inside it and the folder moved: the next pass takes the move for a
+  delete plus a new folder and deletes the node behind the inner link on the server (history keeps it). First
+  M3b2b item.
 
 ## Server
 

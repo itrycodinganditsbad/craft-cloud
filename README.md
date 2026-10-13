@@ -100,7 +100,8 @@ The rules it follows, among others:
 - A file another program holds open is skipped and retried later; on Windows the download is kept and
   lands once the file is free. A read-only file is never replaced or removed.
 - Links (symlinks, junctions) are never followed, moved or written through, and a synced file or folder
-  that became a link is never treated as deleted.
+  that became a link is not treated as deleted. One rare sequence (a folder turned into a link and back,
+  a failed pass, then a move) is a known gap being fixed next; the server's history keeps the file.
 - When an edit and a delete meet, the edit wins. Whether a file was edited is decided by its content, so a
   file saved again with the same bytes is not an edit.
 - A conflict copy is only made when the content really differs.
