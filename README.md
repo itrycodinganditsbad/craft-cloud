@@ -49,8 +49,9 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
 - **The server** stores file contents as chunks, either on local disk or in any S3-compatible object
   store. It keeps the metadata (users, devices, the file tree, versions and a change feed) in SQLite or
   Postgres. Every change arrives as one batch commit, which is applied completely or not at all.
-- **The agent** (coming next) runs on each machine. It watches the synced folder, uploads what changed,
-  applies what other machines changed, and keeps its own small state database.
+- **The agent** runs on each machine. It uploads what changed in the synced folder, applies what other
+  machines changed, and keeps its own small state file. Today you run it by hand
+  (`craft-cloud-agent sync`); watching the folder and syncing in the background comes next.
 - **The launcher** will be the user interface: sign-in, sync status, history and restore, the conflict
   list. It talks to the agent over a documented local API and doesn't link any Craft Cloud code.
 
@@ -75,13 +76,14 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
 | M2 | The server: login, devices, chunk upload, batch commit, change feed, backup epochs; SQLite or Postgres, disk or S3 | done |
 | M3a | The sync engine and its simulation | done |
 | M3b1 | The agent, first cut: syncs a real folder over HTTPS when you run `craft-cloud-agent sync`; two machines sync one folder | done |
-| M3b2 | The agent on its own: watches the folder, waits for files to settle, retries with backoff | next |
+| M3b2a | Hardening: downloads land atomically and never over a save you just made, crash recovery, files held open or read-only on Windows | done |
+| M3b2b | The agent on its own: watches the folder, waits for files to settle, retries with backoff | next |
 | M4 | History, restore, trash, cleanup of old versions, garbage collection, server backup and restore | planned |
 | M5 | Selective sync, large-media polish, `.craftignore` | planned |
 | M6 | Packaging: release binaries, Docker image, systemd unit, built-in TLS, a self-hosting guide | planned |
 | M7 | The local control API and launcher integration | planned |
 
-### The sync engine (M3a)
+### The sync engine
 
 The engine is the part that decides what to upload, download, move aside or delete. It's the code most
 likely to lose data, so it's built and tested on its own. It only reaches the disk through an `Fs` trait
@@ -92,11 +94,18 @@ The rules it follows, among others:
 
 - A local file is never overwritten or deleted unless its content has just been checked against the last
   synced version. Size and modification time alone are not enough.
-- Before a download replaces a file, the file is checked again. If the user saved it in the meantime, the
-  download waits and the two versions are handled as a conflict.
-- A file another program holds locked is skipped and retried later. A remote change never overwrites it.
-- When an edit and a delete meet, the edit wins.
+- A download lands atomically on exactly what was checked. On Linux and macOS it swaps places with the
+  file and swaps back if the file changed in between; on Windows the file is moved aside first, checked,
+  and put back if needed. A save you make while a download arrives is never overwritten.
+- A file another program holds open is skipped and retried later; on Windows the download is kept and
+  lands once the file is free. A read-only file is never replaced or removed.
+- Links (symlinks, junctions) are never followed, moved or written through, and a synced file or folder
+  that became a link is never treated as deleted.
+- When an edit and a delete meet, the edit wins. Whether a file was edited is decided by its content, so a
+  file saved again with the same bytes is not an edit.
 - A conflict copy is only made when the content really differs.
+- A crash at any point costs at most some bookkeeping, never a file: the state is saved at safe points
+  during a pass, and an interrupted download is finished or undone on the next run.
 - No file is ever held in memory as a whole. Uploads and downloads stream chunk by chunk, and every chunk
   is checked against its hash.
 
@@ -104,10 +113,12 @@ How it's tested:
 
 - Scenario tests cover each rule.
 - A deterministic simulation runs three machines that share one account. They create, edit, rename, move
-  and delete files and folders at random, hold files locked, and sync at random moments while the
-  connection fails mid-pass. At the end every machine must have the same files, and every file version a
-  user didn't overwrite or delete must still exist on some disk.
-- The simulation passes 4,000 seeds. A failing seed can be replayed exactly:
+  and delete files and folders at random, hold files locked, replace files with links, and sync at random
+  moments while the connection fails mid-pass and machines crash, also between two steps on disk. At the
+  end every machine must have the same files, and every file version a user didn't overwrite or delete
+  must still exist on some disk.
+- Seeds run in parallel: 64,000 seeds pass with and without crashes in about ten minutes, and reviews ran
+  more than 100,000. A failing seed can be replayed exactly:
   `SIM_SEED=17 cargo test -p craft-cloud-sync --test simulation`.
 
 ## Running the server
@@ -145,6 +156,27 @@ After restoring the database and the chunk storage from a backup, run
 `craft-cloud-server reset-epoch --config cc-data/config.toml --all`. Every account then starts a new epoch,
 so each synced machine reconciles with the restored state instead of trusting its own change counter.
 `reset-epoch --config … name` resets one account.
+
+## Syncing a folder
+
+With a server running, sign in on each machine and sync:
+
+```sh
+cargo build --release -p craft-cloud-agent
+# The password is read from stdin. The folder is created if it doesn't exist.
+printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https://cloud.example.org --user you --folder ~/'Craft Cloud'
+./target/release/craft-cloud-agent sync      # one pass
+./target/release/craft-cloud-agent status    # account, folder, last pass, anything waiting
+```
+
+- To sync a folder that already has files, add `--adopt` to `login`.
+- `sync` exits 0 when done; 1 when it failed and can simply run again (offline, server busy); 2 when
+  deletions wait for approval (`sync --approve-deletes` releases exactly the ones it listed); 3 when it
+  needs you (the folder or its `.craft-cloud` marker is missing, another agent is running, the device was
+  signed out, and so on). The message says what to do.
+- HTTPS is required, except to a server on the same machine. Proxy settings are ignored for now.
+- `logout` signs the device out on the server and forgets the account here; your files stay. Use
+  `logout --local` if the server is gone.
 
 ## Building and testing
 

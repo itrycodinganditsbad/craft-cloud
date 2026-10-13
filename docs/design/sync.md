@@ -193,8 +193,8 @@ everything stays in history. Conflict copies are named `name (conflict, <device>
 the rest, assemble in a temp file on the same volume, check `file_hash`, rename into place.
 - **Reused local chunks are re-hashed when read.** The source file may have changed since the state DB saw it.
 - **Never overwrite a local file with unsynced edits**: that's a conflict.
-- **Rename blocked on Windows** (an app has the file open): keep the assembled temp file, show "in use, retried"
-  for <file>, and land the kept file on a later pass if its version is still current, without downloading again.
+- **Rename blocked on Windows** (an app has the file open): keep the assembled temp file, skip the file with "in use by
+  another program; the server's version is downloaded and kept, and lands once it can; tried again next pass", and land the kept file on a later pass if its version is still current, without downloading again.
   The old file stays usable until then.
 
 **Epoch change**: if a response carries a different epoch from the one in the state DB, the agent does a
@@ -275,7 +275,10 @@ changes locally, then pushes local changes. These rules came out of the simulati
 - **A landing in steps survives a crash**: the moved file's name and both files' stats are recorded in the
   agent's temporary folder first. A crash between the steps leaves both files on disk, never neither; before the
   next pass the moved file goes back if nothing took its place, or goes if the download is in place, and is
-  otherwise left as a file the scan syncs (it may be a save; nothing removes such files blindly).
+  otherwise (its name taken by something other than the download, perhaps a save made after the crash) goes next
+  to it under a conflict name, never replacing anything, so the scan syncs it as a copy and never as the tracked
+  file renamed to a `.cc-aside` name; nothing removes such files blindly. If the user moved the folder before the
+  next pass, the moved file is found there by the folder's ID (also recorded) and handled the same way.
 - **Rename blocked**: a file a program holds open (Windows), or that may not be replaced, keeps the download
   in the temporary folder, keyed by node, version and manifest; the node is skipped with the reason ("in use by
   another program" for a sharing violation on Windows, "read-only here, not replaced" for a Windows read-only file,
@@ -295,7 +298,9 @@ changes locally, then pushes local changes. These rules came out of the simulati
   (the server holds that content on two nodes); accepted.
 - **Same content is no change**: a new server version whose manifest and exec bit equal the base's (a file saved
   again unchanged elsewhere) is recorded without touching the local file: no download, no hash, and no conflict
-  copy even for a file that can't be read here. A move that comes with it applies as usual.
+  copy even for a file that can't be read here. A move that comes with it applies as usual. Accepted: a lost
+  reply to a delete the server refused (another machine had saved the file again unchanged) is taken as "went
+  through"; the next pass brings the file back. The delete is undone, nothing is lost.
 - **Deleted folders and ignored files**: a folder the server deleted is removed together with any OS
   metadata files in it (`.DS_Store`, `Thumbs.db`, `desktop.ini`). If it holds other ignored files (`~$*`,
   `*.tmp`, `*.part`, `.~lock.*`, which may belong to an open document), it stays on disk, forgotten. A
@@ -606,21 +611,31 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
   - Windows and filesystems without a swap: the occupant is first renamed to a `.cc-aside` name next to it
     (never replacing anything; on NTFS through a hard link, which can't replace), checked, then the download
     is renamed into place; if the check fails, the occupant is put back. A landing record lets the next run
-    finish or undo the steps after a crash: both files stay on disk, never neither.
+    finish or undo the steps after a crash: both files stay on disk, never neither. If the target's name was
+    taken meanwhile, the moved file comes back under a conflict name next to it.
   - A read-only file (Windows) is never replaced: "read-only here, not replaced", and the download is kept.
     It is never removed by a server delete either ("read-only here, not removed"); the delete waits until
     the attribute is cleared.
   - The file ID is compared before the first step; after the move it counts only when the move kept it (a
     hard link), since FAT/exFAT give a renamed file a new ID.
   - The exchange runs from a `.swap` temp file with its own record, which cleanup never deletes: after a
-    crash, recovery removes it only if it is the download or the checked file, and otherwise moves it next
-    to the target. If an app saved twice during the swap back, the newest save stays at the name.
+    crash, recovery removes it if it is the download or the checked file. If it is a save the exchange took
+    out while the download is still at the target, the two are exchanged back (the save keeps the user's
+    name, the download goes and is fetched again); anything else moves next to the target as `.cc-aside`. If an app saved twice during the swap back, the newest save stays at the name.
   - While a landing record is pending, its target counts as unknown to the scan (never deleted on the server)
-    and its `.cc-aside` file isn't listed; a record recovery can't settle fails the pass.
+    and its `.cc-aside` file isn't listed; a record recovery can't act on yet fails the pass
+    (tried again next pass); a record it can't read is set aside as `<record>.bad` (a swap record's file as
+    `.rescued`), and every pass's report and `status` say "check the files next to <target>, then remove
+    <record>.bad" until the user does.
   - The engine's `Fs::finish_write` takes the expected occupant (`None`: the path must be empty).
 - **Windows "rename blocked"** (an app holds the target open): the downloaded temp file is kept, the node is
-  skipped with "in use, retried", and the next pass lands the kept file if its server version is still current,
-  without downloading again. A kept file is hashed again before it lands.
+  skipped with "in use by another program; the server's version is downloaded and kept, and lands once it can;
+  tried again next pass" (or "read-only here, not replaced; …"), and a later pass lands the kept file if its
+  server version is still current, without downloading again. While the file stays blocked the kept file isn't
+  touched; it is hashed again before it lands.
+- **Cleanup** also removes the temporary names an interrupted atomic write of the agent's own files leaves
+  (`.<name>.<random>.tmp`: `root.json` and records in `.craft-cloud/`, `account.json` and `state.json` in the
+  data folder; nothing else). A `.rescued` file is listed by `status` until it is gone.
 - **State checkpoints**: the state is saved at safe points during a pass (after each commit), and the deletes a
   pass sent are remembered with the version they expected, so a crash right after a commit can't make the next
   pass undo or repeat it wrongly.
