@@ -723,7 +723,7 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
 | M2 | Server core: info, auth, devices, chunks, batch commit, changes, tree, epoch; SQLite + Postgres, disk + S3 | DONE (2026-10-11; M2a storage, M2b server) |
 | M3a | Sync engine on `Fs`/`Transport` + simulation harness | DONE (2026-10-12) |
 | M3b1 | Agent, first cut: real `Fs`, HTTP transport, saved state, root marker, CLI; two machines sync a folder by hand | DONE (2026-10-12) |
-| M3b2a | Hardening: the known gaps, same content = no change, atomic download landing, Windows rename-blocked retry | IN PROGRESS (prototype verified, plan next) |
+| M3b2a | Hardening: the known gaps, same content = no change, atomic download landing, Windows rename-blocked retry | DONE (2026-10-13) |
 | M3b2b | Agent on its own: `run` loop, watcher, long-poll, stability window, backoff, status file, simulated network | TODO |
 | M4 | History, restore, trash, thinning, GC, admin CLI, backup/restore | TODO |
 | M5 | Selective sync, large-media polish, ignore rules | TODO |
