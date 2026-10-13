@@ -20,7 +20,9 @@
 //!   the free name, and the moved file removed, with a record in the temporary folder written first. A crash between
 //!   the steps leaves both files on disk, never neither; the next pass's [`Fs::recover`] puts the moved file back if
 //!   nothing took its place, removes it if the landing was complete but for that, and otherwise leaves it as a file
-//!   the scan sees and syncs (it may be someone's save, so nothing removes `.cc-aside` files blindly). While a
+//!   the scan sees and syncs (it may be someone's save, so nothing removes `.cc-aside` files blindly). If the user
+//!   moved the folder before recovery ran, the moved file is found there by the folder's ID (recorded too) and handled
+//!   the same way under its own name, with a conflict name instead of `.cc-aside` when that name is taken. While a
 //!   landing's record is pending (a step failed and recovery hasn't finished it), its moved file is left out of
 //!   listings, so the scan never uploads it. Any error, or a writer dropped without landing, removes the temporary
 //!   file.
@@ -106,6 +108,8 @@ pub struct DiskFs {
     /// and the targets are [`Fs::unsettled`], so a target left empty is never taken for deleted. Set when a landing
     /// leaves its record, and by [`Fs::recover`] from the records it couldn't finish.
     pending_asides: BTreeMap<PathBuf, RelPath>,
+    /// This device's name, for the conflict-copy names recovery gives (see [`DiskFs::with_device_name`]).
+    device_name: String,
     /// Faults and detours for tests of paths a real disk rarely takes.
     hooks: Hooks,
 }
@@ -148,6 +152,10 @@ struct LandingRecord {
     /// from before it existed) recovery compares size, time and executable bit only.
     #[serde(default)]
     ids_kept: bool,
+    /// The ID of the folder both files are in, so recovery finds the moved file after the user moved that folder
+    /// (see [`DiskFs::apply_landing`]). `None` in records from before it existed.
+    #[serde(default)]
+    folder_id: Option<u64>,
 }
 
 /// What a swap record in [`TMP_DIR`] holds: an exchange of a download with the file at `target` is under way, and
@@ -629,7 +637,13 @@ fn create_temp(dir: &Path) -> io::Result<(File, PathBuf)> {
 impl DiskFs {
     /// The folder at `root`. Nothing is checked or created until the engine asks.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), swap: true, pending_asides: BTreeMap::new(), hooks: Hooks::default() }
+        Self { root: root.into(), swap: true, pending_asides: BTreeMap::new(), device_name: "this computer".into(), hooks: Hooks::default() }
+    }
+
+    /// Names conflict copies that recovery makes after this device (as the engine names its own).
+    pub fn with_device_name(mut self, name: impl Into<String>) -> Self {
+        self.device_name = name.into();
+        self
     }
 
     /// Makes removing the moved file at the end of a landing in steps fail, as a disk error would: for tests that
@@ -760,8 +774,14 @@ impl DiskFs {
         let aside = parent.join(&aside_name);
         let tmp = self.real_tmp(true)?.ok_or_else(|| io::Error::other("no temporary folder"))?;
         let record_path = tmp.join(format!("{}.{LANDING_EXT}", random_hex(12)?));
-        let mut record =
-            LandingRecord { target: path.to_string(), aside: aside_name, expected: expected.into(), incoming: incoming.into(), ids_kept: false };
+        let mut record = LandingRecord {
+            target: path.to_string(),
+            aside: aside_name,
+            expected: expected.into(),
+            incoming: incoming.into(),
+            ids_kept: false,
+            folder_id: self.folder_id(parent),
+        };
         let json = serde_json::to_vec(&record).map_err(|e| io::Error::other(e.to_string()))?;
         crate::account::write_atomic(&record_path, &json, true)?;
         let forget = |record_path: &Path| {
@@ -1066,30 +1086,100 @@ impl DiskFs {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "a landing record names no file in the folder"));
         }
         let aside_name = Name::new(&record.aside).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let target_name = target.file_name().map(|n| n.as_str().to_owned()).unwrap_or_default();
         let aside = target.parent().unwrap_or_default().join(&aside_name);
-        // A folder above that is gone or a link: nothing of this landing can be reached any more.
-        if let (Some(full), Some(aside_full)) = (self.checked(&target)?, self.checked(&aside)?) {
-            match (kind_at(&aside_full)?, kind_at(&full)?) {
-                // Moved aside, and nothing took its place: it goes back.
-                (Some(FsKind::File(_)), None) => rename_no_replace(&aside_full, &full)?,
-                // One file under both names (a rename through a hard link that couldn't remove the old name): the extra
-                // name goes; nothing is lost.
-                (Some(FsKind::File(moved)), Some(FsKind::File(there))) if moved.id.is_some() && moved.id == there.id => {
-                    fs::remove_file(&aside_full)?;
-                }
-                // The landing was done but for removing the moved file. The IDs count only if both moves kept them
-                // (hard links); a plain rename on FAT or exFAT gives both files new ones.
-                (Some(FsKind::File(moved)), Some(FsKind::File(there)))
-                    if same_file_after_move(moved, record.expected.into(), record.moved())
-                        && same_file_after_move(there, record.incoming.into(), record.moved()) =>
-                {
-                    fs::remove_file(&aside_full)?;
-                }
-                // Gone already, or something else is going on: the moved file stays, and the scan sees it.
-                _ => {}
+        // Where the moved file is: at its recorded place, or, when the user moved its folder before this ran, in the
+        // folder that has the recorded folder ID (or, failing that, next to the one file with its random name that
+        // still looks like the moved file). A folder above that is gone or a link, and no moved folder found: nothing
+        // of this landing can be reached any more.
+        let at_place = match (self.checked(&target)?, self.checked(&aside)?) {
+            (Some(full), Some(aside_full)) if kind_at(&aside_full)?.is_some() => Some((full, aside_full)),
+            _ => None,
+        };
+        let (full, aside_full, moved_with_folder) = match at_place {
+            Some((full, aside_full)) => (full, aside_full, false),
+            None => match self.moved_folder(record)? {
+                Some(dir) => (dir.join(&target_name), dir.join(aside_name.as_str()), true),
+                None => return Ok(()),
+            },
+        };
+        match (kind_at(&aside_full)?, kind_at(&full)?) {
+            // Moved aside, and nothing took its place: it goes back.
+            (Some(FsKind::File(_)), None) => rename_no_replace(&aside_full, &full)?,
+            // One file under both names (a rename through a hard link that couldn't remove the old name): the extra
+            // name goes; nothing is lost.
+            (Some(FsKind::File(moved)), Some(FsKind::File(there))) if moved.id.is_some() && moved.id == there.id => {
+                fs::remove_file(&aside_full)?;
             }
+            // The landing was done but for removing the moved file. The IDs count only if both moves kept them
+            // (hard links); a plain rename on FAT or exFAT gives both files new ones.
+            (Some(FsKind::File(moved)), Some(FsKind::File(there)))
+                if same_file_after_move(moved, record.expected.into(), record.moved())
+                    && same_file_after_move(there, record.incoming.into(), record.moved()) =>
+            {
+                fs::remove_file(&aside_full)?;
+            }
+            // In a folder the user moved, with its name taken by something else: a conflict name next to it (never
+            // replacing anything), so the scan sees a copy, not the tracked file renamed to its `.cc-aside` name.
+            (Some(FsKind::File(_)), Some(_)) if moved_with_folder => self.to_conflict_name(&aside_full, &full)?,
+            // Gone already, or something else is going on: the moved file stays, and the scan sees it.
+            _ => {}
         }
         Ok(())
+    }
+
+    /// The folder a landing's moved file is in now, when the user moved the landing's folder (see
+    /// [`DiskFs::apply_landing`]): the one with the record's folder ID that holds a file with the moved file's name,
+    /// else the first that holds one which still looks like the moved file (size, time, executable bit). Walks the
+    /// folder (never through links, never into `.craft-cloud`); only recovery does this, and only for a moved file
+    /// that isn't where its record says.
+    fn moved_folder(&self, record: &LandingRecord) -> io::Result<Option<PathBuf>> {
+        let mut by_look = None;
+        let mut queue = vec![(self.root.clone(), 0usize)];
+        while let Some((dir, depth)) = queue.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                if dir == self.root && entry.file_name() == AGENT_DIR {
+                    continue;
+                }
+                let path = entry.path();
+                let Ok(md) = fs::symlink_metadata(&path) else { continue };
+                if md.file_type().is_dir() && depth < craft_cloud_proto::limits::MAX_TREE_DEPTH {
+                    queue.push((path, depth + 1));
+                } else if md.file_type().is_file() && entry.file_name().to_str() == Some(record.aside.as_str()) {
+                    if record.folder_id.is_some() && self.folder_id(&dir) == record.folder_id {
+                        return Ok(Some(dir));
+                    }
+                    if by_look.is_none() && same_file_after_move(file_meta(&md, &path), record.expected.into(), Moved::Plain) {
+                        by_look = Some(dir.clone());
+                    }
+                }
+            }
+        }
+        Ok(by_look)
+    }
+
+    /// The ID of the folder at `dir` (the root may be a link: followed).
+    fn folder_id(&self, dir: &Path) -> Option<u64> {
+        let md = if dir == self.root { fs::metadata(dir) } else { fs::symlink_metadata(dir) }.ok()?;
+        md.file_type().is_dir().then(|| local_id(&md, dir)).flatten()
+    }
+
+    /// Moves `from` to a free conflict-copy name next to `like` (the name it would have had), never replacing.
+    fn to_conflict_name(&self, from: &Path, like: &Path) -> io::Result<()> {
+        let (Some(parent), Some(name)) = (like.parent(), like.file_name().and_then(|n| n.to_str()).and_then(|n| Name::new(n).ok())) else {
+            return Err(io::Error::other("no conflict name for a file without a name"));
+        };
+        let stamp = crate::cli::conflict_stamp();
+        for counter in 1..=1000 {
+            let copy =
+                craft_cloud_proto::conflict_name(&name, false, &self.device_name, stamp, counter).map_err(|e| io::Error::other(e.to_string()))?;
+            match rename_no_replace(from, &parent.join(copy.as_str())) {
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                other => return other,
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::AlreadyExists, "no free conflict name"))
     }
 
     pub fn root(&self) -> &Path {
@@ -1608,8 +1698,53 @@ mod tests {
             expected: expected.into(),
             incoming: incoming.into(),
             ids_kept,
+            folder_id: None,
         };
         fs::write(disk.tmp_dir().join("r.landing"), serde_json::to_vec(&record).unwrap()).unwrap();
+    }
+
+    /// A crash right after `dir/a.txt` moved aside, then the user renamed `dir` to `dir2` (and, with `clash`, saved a
+    /// new `dir2/a.txt`): recovery finds the moved file by its folder's ID (or, in a record without one, by its name
+    /// and look) and puts it back under its own name there, or under a conflict name when that is taken. Never left
+    /// as `.cc-aside`, which the scan would take for the tracked file's new name.
+    #[test]
+    fn a_file_moved_aside_in_a_folder_the_user_renamed_goes_back_under_its_name() {
+        for (clash, with_id) in [(false, true), (true, true), (false, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::create_dir(dir.path().join(AGENT_DIR)).unwrap();
+            fs::write(dir.path().join(AGENT_DIR).join(crate::root::MARKER_FILE), b"{}").unwrap();
+            let mut disk = DiskFs::new(dir.path()).with_device_name("desk");
+            disk.mkdir(&craft_cloud_sync::rel("dir")).unwrap();
+            let old = disk.write(&craft_cloud_sync::rel("dir/a.txt"), b"old", false, 1_700_000_000_000).unwrap();
+            let incoming = FileMeta { size: 3, mtime_ms: 1, exec: false, id: Some(1) };
+            fs::rename(dir.path().join("dir/a.txt"), dir.path().join("dir/a.txt.1.cc-aside")).unwrap();
+            let record = LandingRecord {
+                target: "dir/a.txt".into(),
+                aside: "a.txt.1.cc-aside".into(),
+                expected: old.into(),
+                incoming: incoming.into(),
+                ids_kept: false,
+                folder_id: if with_id { disk.folder_id(&dir.path().join("dir")) } else { None },
+            };
+            assert!(!with_id || record.folder_id.is_some());
+            fs::write(disk.tmp_dir().join("r.landing"), serde_json::to_vec(&record).unwrap()).unwrap();
+            fs::rename(dir.path().join("dir"), dir.path().join("dir2")).unwrap();
+            if clash {
+                fs::write(dir.path().join("dir2/a.txt"), b"new here").unwrap();
+            }
+            disk.recover().unwrap();
+            let left = names(&dir.path().join("dir2"));
+            assert!(!disk.tmp_dir().join("r.landing").exists());
+            if clash {
+                assert_eq!(fs::read(dir.path().join("dir2/a.txt")).unwrap(), b"new here");
+                assert_eq!(left.len(), 2, "{left:?}");
+                let copy = left.iter().find(|n| n.starts_with("a (conflict, desk, ")).expect("a conflict copy");
+                assert_eq!(fs::read(dir.path().join("dir2").join(copy)).unwrap(), b"old");
+            } else {
+                assert_eq!(left, ["a.txt"], "with an ID: {with_id}");
+                assert_eq!(fs::read(dir.path().join("dir2/a.txt")).unwrap(), b"old");
+            }
+        }
     }
 
     fn names(dir: &Path) -> Vec<String> {

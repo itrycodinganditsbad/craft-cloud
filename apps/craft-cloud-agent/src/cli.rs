@@ -491,7 +491,7 @@ pub async fn sync(data: &DataDir, approve_deletes: bool, out: &mut impl Write) -
     if saved.state.space.is_some_and(|s| s != account.space) {
         return Err(AgentError::OtherAccountState(data.path().join(crate::account::STATE_FILE)));
     }
-    let fs = DiskFs::new(&account.folder);
+    let fs = DiskFs::new(&account.folder).with_device_name(account.device_name.clone());
     fs.clean_tmp().map_err(io_at(&fs.tmp_dir()))?;
     let transport = HttpTransport::new(account.server.clone(), &account.token)?;
     let config = Config::new(account.device_name.clone(), account.device);

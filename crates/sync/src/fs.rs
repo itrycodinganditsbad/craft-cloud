@@ -9,7 +9,7 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use craft_cloud_proto::{FileHash, Name};
+use craft_cloud_proto::{ConflictStamp, FileHash, Name, conflict_name};
 
 use crate::path::RelPath;
 
@@ -168,8 +168,9 @@ pub trait Fs: Send {
     }
     /// Finishes or undoes landings a crash cut short, where a landing takes more than one step (no exchange on this
     /// platform): a file moved aside is put back where nothing took its place, or removed when the landing was
-    /// complete but for that. Anything else is left where it is, as a file the next scan sees. The engine calls it
-    /// at the start of every pass.
+    /// complete but for that. Anything else is left where it is, as a file the next scan sees. A moved file whose
+    /// folder the user moved meanwhile is found there (by the folder's ID) and handled the same way under its own
+    /// name; if that name is taken, it gets a conflict name. The engine calls it at the start of every pass.
     ///
     /// Known limit: a crash after the download took the name but before the moved file was removed, followed by the
     /// user deleting the download before the next pass, puts the old file back (the user's delete of a file they
@@ -259,6 +260,8 @@ struct Aside {
     expected: FileMeta,
     /// The file that lands at `target`.
     incoming: FileMeta,
+    /// The ID of the folder both are in, so recovery finds them after the user moved that folder.
+    folder: Option<u64>,
 }
 
 /// A machine that dies partway through a pass (see [`MemFs::die_after`]).
@@ -495,6 +498,28 @@ impl MemFs {
     fn below(&self, dir: &RelPath) -> Vec<RelPath> {
         self.nodes.keys().filter(|p| p.starts_with(dir) && *p != dir).cloned().collect()
     }
+
+    /// Where a landing's target and moved file are now, if the moved file isn't at its recorded place but in the
+    /// folder that had the landing's folder ID (the user moved that folder before recovery ran).
+    fn relocated(&self, record: &Aside) -> Option<(RelPath, RelPath)> {
+        if self.nodes.contains_key(&record.aside) {
+            return None;
+        }
+        let folder = record.folder?;
+        let dir = self.nodes.iter().find_map(|(p, n)| matches!(n, MemNode::Dir { id } if *id == folder).then(|| p.clone()))?;
+        let (target, aside) = (dir.join(record.target.file_name()?), dir.join(record.aside.file_name()?));
+        self.file_meta(&aside).is_some().then_some((target, aside))
+    }
+
+    /// A free conflict-copy name next to `path`.
+    fn free_conflict_name(&self, path: &RelPath) -> Option<RelPath> {
+        let (parent, name) = (path.parent()?, path.file_name()?);
+        let stamp = ConflictStamp { year: 2000, month: 1, day: 1, hour: 0, minute: 0, utc: true };
+        (1..=1000)
+            .filter_map(|n| conflict_name(name, false, "this computer", stamp, n).ok())
+            .map(|n| parent.join(&n))
+            .find(|p| !self.nodes.contains_key(p))
+    }
 }
 
 impl Fs for MemFs {
@@ -612,8 +637,12 @@ impl Fs for MemFs {
         if self.nodes.contains_key(&aside) {
             return Err(LandError::Io(exists(&aside)));
         }
+        let folder = match self.nodes.get(&parent) {
+            Some(MemNode::Dir { id }) => Some(*id),
+            _ => None,
+        };
         self.move_node(path, &aside);
-        self.asides.push(Aside { target: path.clone(), aside: aside.clone(), expected, incoming: meta });
+        self.asides.push(Aside { target: path.clone(), aside: aside.clone(), expected, incoming: meta, folder });
         if self.fail_landings {
             return Err(LandError::Io(io::Error::other(format!("{path}: the landing failed and the file couldn't be put back (test)"))));
         }
@@ -649,18 +678,32 @@ impl Fs for MemFs {
         Ok(())
     }
 
+    /// Like the agent's disk: a moved file whose folder the user moved since is found in that folder by the folder's
+    /// ID, and handled there under its own name; if that name is taken by anything but the download, it gets a
+    /// conflict name instead (never a `.cc-aside` name the scan would take for the tracked file's new place).
     fn recover(&mut self) -> io::Result<()> {
         while let Some(record) = self.asides.first().cloned() {
-            match (self.file_meta(&record.aside), self.nodes.contains_key(&record.target)) {
+            let (target, aside, moved_with_folder) = match self.relocated(&record) {
+                Some((target, aside)) => (target, aside, true),
+                None => (record.target.clone(), record.aside.clone(), false),
+            };
+            match (self.file_meta(&aside), self.nodes.contains_key(&target)) {
                 // Moved aside, nothing took its place: it goes back.
                 (Some(_), false) => {
                     self.change()?;
-                    self.move_node(&record.aside, &record.target);
+                    self.move_node(&aside, &target);
                 }
                 // The landing was done but for removing the file it replaced.
-                (Some(moved), true) if moved == record.expected && self.file_meta(&record.target) == Some(record.incoming) => {
+                (Some(moved), true) if moved == record.expected && self.file_meta(&target) == Some(record.incoming) => {
                     self.change()?;
-                    self.nodes.remove(&record.aside);
+                    self.nodes.remove(&aside);
+                }
+                // In a folder the user moved, with its name taken: a conflict name next to it.
+                (Some(_), true) if moved_with_folder => {
+                    if let Some(copy) = self.free_conflict_name(&target) {
+                        self.change()?;
+                        self.move_node(&aside, &copy);
+                    }
                 }
                 // Gone already, or something else is going on: the moved file stays as it is, and the scan sees it.
                 _ => {}

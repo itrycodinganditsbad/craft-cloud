@@ -261,3 +261,48 @@ async fn a_landing_cut_short_between_its_steps_is_put_right() {
         assert_eq!(b.fs().files().len(), 1, "after {steps} steps: {:?}", b.fs().files().keys().collect::<Vec<_>>());
     }
 }
+
+/// The desktop dies right after moving `dir/notes` aside for a download (a landing in steps), and the user renames
+/// `dir` to `dir2` before the agent runs again. Recovery finds the moved file by its folder's ID and puts it back
+/// under its own name there, so the server sees a folder move, never the file renamed to its `.cc-aside` name; the
+/// edit then arrives at `dir2/notes`. With `dir2/notes` taken meanwhile (`clash`), the moved file gets a conflict
+/// name instead, and the user's new file stays.
+#[tokio::test]
+async fn a_folder_renamed_after_a_crash_mid_landing_gets_its_file_back_under_its_name() {
+    for clash in [false, true] {
+        let server = Server::new().await;
+        let ana = server.user("ana").await;
+        let mut a = machine(&server, &ana, "laptop").await;
+        let mut b = machine_with(&server, &ana, "desktop", MemFs::new().without_swap(), 50).await;
+        b.fs_mut().mkdir(&path("dir")).unwrap();
+        write(&mut b, "dir/notes", b"v1");
+        settle(&mut [&mut a, &mut b], 5).await;
+        write(&mut a, "dir/notes", b"v2");
+        a.sync_once().await.unwrap();
+
+        let saved = save_checkpoints(&mut b);
+        let dead = b.transport().faults.dead.clone();
+        b.fs_mut().die_after(1, dead);
+        let _ = b.sync_once().await;
+        let state = saved.lock().unwrap().clone();
+        let mut b = restart(&b, state, |_| {});
+        let names: Vec<String> = b.fs().files().into_keys().map(|p| p.to_string()).collect();
+        assert!(names.len() == 1 && names[0].ends_with(".cc-aside"), "cut after moving aside: {names:?}");
+        b.fs_mut().rename(&path("dir"), &path("dir2")).unwrap();
+        if clash {
+            write(&mut b, "dir2/notes", b"new here");
+        }
+        settle(&mut [&mut a, &mut b], 5).await;
+        assert_eq!(a.fs().files(), b.fs().files(), "clash: {clash}");
+        let names: Vec<String> = b.fs().files().into_keys().map(|p| p.to_string()).collect();
+        assert!(names.iter().all(|n| !n.contains("cc-aside")), "clash: {clash}: {names:?}");
+        if clash {
+            assert_eq!(names.len(), 2, "{names:?}");
+            assert_eq!(b.fs().read(&path("dir2/notes")).unwrap(), b"new here");
+            assert!(names.iter().any(|n| n.starts_with("dir2/notes (conflict")), "{names:?}");
+        } else {
+            assert_eq!(names, ["dir2/notes"]);
+            assert_eq!(b.fs().read(&path("dir2/notes")).unwrap(), b"v2");
+        }
+    }
+}
