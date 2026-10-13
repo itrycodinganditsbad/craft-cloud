@@ -24,6 +24,15 @@ pub struct State {
     /// reconcile (never replacing local files) until one does.
     #[serde(default)]
     pub reconcile_pending: bool,
+    /// Files this machine asked the server to delete in a commit whose answer it never recorded (it crashed, or the
+    /// connection broke, after sending it), with the version each delete expected. When the server's tree then
+    /// lacks one, or has it at another version (another machine's edit brought it back after the delete), the delete
+    /// went through and is this machine's own, not one from elsewhere: the push sent it because the file was missing
+    /// here, so whatever is at its path now isn't that file. The node is let go and nothing local is removed or
+    /// replaced for it (a node brought back arrives as a new one at its own place). Cleared once a pass has applied
+    /// the server's changes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sent_deletes: BTreeMap<NodeId, VersionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

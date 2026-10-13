@@ -19,7 +19,7 @@
 //! leave a device registered that nothing here uses; an admin can revoke it (`craft-cloud-server device ...`).
 
 use std::io::{BufRead, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use craft_cloud_proto::ConflictStamp;
@@ -27,7 +27,7 @@ use craft_cloud_sync::{Config, Engine, SyncError, TransportError};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
-use crate::account::{ACCOUNT_SCHEMA, Account, AccountError, DataDir, LastPass, Outcome, PassSummary, STATE_SCHEMA};
+use crate::account::{ACCOUNT_SCHEMA, Account, AccountError, DataDir, LastPass, Outcome, PassSummary, STATE_SCHEMA, SavedState};
 use crate::disk::{AGENT_DIR, DiskFs, create_private_dir};
 use crate::http::{self, DeviceToken, HttpTransport, ServerUrl};
 use crate::lock::{self, DATA_LOCK, FOLDER_LOCK, Lock, LockError};
@@ -348,24 +348,29 @@ fn has_files(folder: &Path) -> Result<bool, AgentError> {
     Ok(false)
 }
 
-/// `path` as the OS resolves it: its deepest existing folder made canonical (links followed, `..` resolved),
-/// plus the part that doesn't exist yet.
+/// `path` as the OS resolves it, walked one name at a time: every prefix that exists is made canonical (links
+/// followed, `..` resolved), a name that doesn't exist yet is appended as it is, `.` is dropped and `..` steps back
+/// to the parent by name. That is exactly what the OS does, also for a `..` in the part that doesn't exist yet
+/// (`new/../data` once `new` is made) and for one that climbs above the existing part: what came before it is
+/// either canonical, so it holds no links, or a folder still to be made. So nothing is refused here; the nesting
+/// check sees the folder the OS will use.
 fn resolved(path: &Path) -> PathBuf {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
-    let mut rest = Vec::new();
-    let mut current = absolute.as_path();
-    loop {
-        if let Ok(real) = std::fs::canonicalize(current) {
-            return rest.iter().rev().fold(real, |p, name| p.join(name));
-        }
-        match (current.parent(), current.file_name()) {
-            (Some(parent), Some(name)) => {
-                rest.push(name.to_owned());
-                current = parent;
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                out.pop();
+                continue;
             }
-            _ => return absolute,
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => out.push(component.as_os_str()),
+        }
+        if let Ok(real) = std::fs::canonicalize(&out) {
+            out = real;
         }
     }
+    out
 }
 
 /// Whether one of the two paths lies inside the other (or they are the same), as the OS resolves them. Names are
@@ -478,6 +483,8 @@ pub async fn login(data: &DataDir, args: &LoginArgs, password: &str, out: &mut i
 /// the pass did.
 pub async fn sync(data: &DataDir, approve_deletes: bool, out: &mut impl Write) -> Result<(Exit, PassSummary), AgentError> {
     let _data_lock = hold_data(data)?;
+    // Temporary files a crash left while `account.json` or `state.json` was written.
+    data.clean_tmp()?;
     let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
     check_apart(data, &account.folder)?;
     root::check(&account.folder, &RootMarker { space: account.space, root: account.root })?;
@@ -486,11 +493,18 @@ pub async fn sync(data: &DataDir, approve_deletes: bool, out: &mut impl Write) -
     if saved.state.space.is_some_and(|s| s != account.space) {
         return Err(AgentError::OtherAccountState(data.path().join(crate::account::STATE_FILE)));
     }
-    let fs = DiskFs::new(&account.folder);
+    let fs = DiskFs::new(&account.folder).with_device_name(account.device_name.clone());
     fs.clean_tmp().map_err(io_at(&fs.tmp_dir()))?;
     let transport = HttpTransport::new(account.server.clone(), &account.token)?;
     let config = Config::new(account.device_name.clone(), account.device);
     let mut engine = Engine::new(fs, transport, std::mem::take(&mut saved.state), config, conflict_stamp)?;
+    // `state.json` is also written at the pass's checkpoints, so a crash or a kill loses at most what the pass did
+    // since the last one (the last pass's outcome stays as it was until this one ends).
+    let (checkpoint_data, last_pass) = (data.clone(), saved.last_pass.clone());
+    engine.on_checkpoint(move |state| {
+        let saved = SavedState { schema: STATE_SCHEMA, state: state.clone(), last_pass: last_pass.clone() };
+        checkpoint_data.save_state(&saved).map_err(|e| std::io::Error::other(e.to_string()))
+    });
     let previous = saved.last_pass.as_ref().and_then(|l| l.summary.clone());
     if approve_deletes {
         // Exactly the deletions the user saw listed; new ones wait and are listed again.
@@ -598,6 +612,15 @@ pub fn status(data: &DataDir, out: &mut impl Write) -> Result<(), AgentError> {
     if let Err(e) = root::check(&account.folder, &RootMarker { space: account.space, root: account.root }) {
         say!(out, "folder problem: {e}")?;
     }
+    // What recovery of interrupted downloads left for the user, until it is gone.
+    if let Ok(left) = DiskFs::new(&account.folder).needs_you()
+        && !left.is_empty()
+    {
+        say!(out, "needs you:")?;
+        for (path, what) in left {
+            say!(out, "  {path}: {what}")?;
+        }
+    }
     let saved = data.load_state()?;
     match &saved.last_pass {
         None => say!(out, "last pass: never synced")?,
@@ -702,12 +725,20 @@ mod tests {
         assert!(nested(&data, &data));
         assert!(!nested(&data, &dir.path().join("Craft Cloud")));
         assert!(!nested(&data, &dir.path().join("data2")), "a shared name prefix isn't nesting");
+        // `..` in the part that doesn't exist yet steps back out of a folder still to be made, as the OS will.
+        assert!(nested(&data, &dir.path().join("new/../data/sub")));
+        assert!(nested(&data, &dir.path().join("new/./more/../../data")));
+        let top = dir.path().file_name().unwrap();
+        assert!(nested(&data, &dir.path().join("new/../..").join(top).join("data")), "climbing above the existing part");
+        assert!(!nested(&data, &dir.path().join("new/../elsewhere")));
+        assert!(!nested(&data, &dir.path().join("data/../elsewhere/sub")));
         #[cfg(unix)]
         {
             let link = dir.path().join("link");
             std::os::unix::fs::symlink(dir.path(), &link).unwrap();
             assert!(nested(&data, &link), "a link to the data folder's parent");
             assert!(nested(&link.join("data").join("sub"), &data));
+            assert!(nested(&link.join("new/../data/sub"), &data), "a link before a `..` in the missing part");
         }
     }
 

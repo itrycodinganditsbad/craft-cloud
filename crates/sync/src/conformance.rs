@@ -7,7 +7,9 @@
 
 use std::io::{ErrorKind, Write};
 
-use crate::fs::{Fs, FsKind, MemFs, rel};
+use craft_cloud_proto::FileHash;
+
+use crate::fs::{Fs, FsKind, LandError, MemFs, rel};
 
 /// A modification time far from both the Unix epoch and now, so every filesystem can store it.
 pub const T0: i64 = 1_700_000_000_000;
@@ -30,6 +32,71 @@ pub fn writes_are_atomic_and_give_a_new_identity<F: Fs>(fs: &mut F, exec_bit: bo
     assert_eq!(second.size, 3);
     assert_eq!(fs.stat(&rel("a.txt")).unwrap(), Some(FsKind::File(second)));
     assert_eq!(fs.read(&rel("a.txt")).unwrap(), b"two");
+}
+
+/// A write lands only on what the caller expects: on nothing when it expects nothing, on exactly the file it
+/// checked otherwise. Anything else is [`LandError::Changed`], the target stays as it is and the written content
+/// comes back, ready to land later.
+pub fn writes_land_only_on_what_was_checked<F: Fs>(fs: &mut F) {
+    let checked = fs.write(&rel("a.txt"), b"one", false, T0).unwrap();
+    // Something is there, but nothing was expected.
+    let mut w = fs.begin_write(&rel("a.txt")).unwrap();
+    w.write_all(b"theirs").unwrap();
+    let Err(LandError::Changed(w)) = fs.finish_write(&rel("a.txt"), w, false, T0, None) else { panic!("landed on an unexpected file") };
+    assert_eq!(fs.read(&rel("a.txt")).unwrap(), b"one");
+    // The file was saved again since it was checked.
+    let saved = fs.write(&rel("a.txt"), b"saved by an app", false, T0 + 1_000).unwrap();
+    let Err(LandError::Changed(w)) = fs.finish_write(&rel("a.txt"), w, false, T0, Some(checked)) else { panic!("landed on a changed file") };
+    assert_eq!(fs.read(&rel("a.txt")).unwrap(), b"saved by an app");
+    // Gone since it was checked.
+    fs.remove_file(&rel("a.txt")).unwrap();
+    let Err(LandError::Changed(w)) = fs.finish_write(&rel("a.txt"), w, false, T0, Some(saved)) else { panic!("landed where the file went") };
+    assert_eq!(fs.stat(&rel("a.txt")).unwrap(), None);
+    // Exactly what was checked: it lands, as a new file.
+    let now = fs.write(&rel("a.txt"), b"two", false, T0).unwrap();
+    let landed = fs.finish_write(&rel("a.txt"), w, true, T0 + 2_000, Some(now)).unwrap();
+    assert_ne!(landed.id, now.id);
+    assert_eq!(fs.read(&rel("a.txt")).unwrap(), b"theirs");
+    assert_eq!(fs.stat(&rel("a.txt")).unwrap(), Some(FsKind::File(landed)));
+    // Expecting nothing where nothing is.
+    let mut w = fs.begin_write(&rel("b.txt")).unwrap();
+    w.write_all(b"new").unwrap();
+    fs.finish_write(&rel("b.txt"), w, false, T0, None).unwrap();
+    assert_eq!(fs.read(&rel("b.txt")).unwrap(), b"new");
+    // Nothing else is left behind (a moved-aside file, say).
+    let mut names: Vec<String> = fs.list(&rel("")).unwrap().into_iter().map(|e| e.name).filter(|n| n != ".craft-cloud").collect();
+    names.sort();
+    assert_eq!(names, ["a.txt", "b.txt"]);
+}
+
+/// A write that didn't land can be kept under a key and landed later without writing it again, while its content has
+/// the expected hash; kept writes are listed and can be dropped.
+pub fn kept_writes_land_later<F: Fs>(fs: &mut F) {
+    let there = fs.write(&rel("a.txt"), b"one", false, T0).unwrap();
+    let mut w = fs.begin_write(&rel("a.txt")).unwrap();
+    w.write_all(b"kept").unwrap();
+    let Err(LandError::Changed(w)) = fs.finish_write(&rel("a.txt"), w, false, T0, None) else { panic!("landed on an unexpected file") };
+    fs.keep(w, "node.version.manifest").unwrap();
+    assert_eq!(fs.kept().unwrap(), ["node.version.manifest"]);
+    let hash = |data: &[u8]| FileHash::from_bytes(*blake3::hash(data).as_bytes());
+    assert!(fs.take_kept("other", &hash(b"kept")).unwrap().is_none());
+    let w = fs.take_kept("node.version.manifest", &hash(b"kept")).unwrap().unwrap();
+    assert!(fs.kept().unwrap().is_empty(), "taken back, no longer kept");
+    fs.finish_write(&rel("a.txt"), w, false, T0, Some(there)).unwrap();
+    assert_eq!(fs.read(&rel("a.txt")).unwrap(), b"kept");
+    let mut w = fs.begin_write(&rel("b.txt")).unwrap();
+    w.write_all(b"dropped").unwrap();
+    fs.keep(w, "k").unwrap();
+    fs.discard_kept("k").unwrap();
+    assert!(fs.kept().unwrap().is_empty() && fs.take_kept("k", &hash(b"dropped")).unwrap().is_none());
+    assert_eq!(fs.stat(&rel("b.txt")).unwrap(), None);
+    // Kept, but its content isn't what was expected (it changed on disk): dropped, never landed.
+    let mut w = fs.begin_write(&rel("b.txt")).unwrap();
+    w.write_all(b"kept too").unwrap();
+    fs.keep(w, "k").unwrap();
+    assert!(fs.take_kept("k", &hash(b"something else")).unwrap().is_none());
+    assert!(fs.kept().unwrap().is_empty(), "a mismatch is dropped");
+    assert_eq!(fs.stat(&rel("b.txt")).unwrap(), None);
 }
 
 /// `read_at` returns fewer bytes only at the end of the file, and nothing past it.

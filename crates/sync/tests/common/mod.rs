@@ -16,7 +16,7 @@ use craft_cloud_proto::{
 };
 use craft_cloud_store::memory::MemoryBackend;
 use craft_cloud_store::{BlobKey, Store};
-use craft_cloud_sync::{Config, Engine, FileMeta, Fs, FsEntry, FsKind, MemFs, RelPath, Report, State, Transport, TransportError};
+use craft_cloud_sync::{Config, Engine, FileMeta, Fs, FsEntry, FsKind, LandError, MemFs, RelPath, Report, State, Transport, TransportError};
 
 /// The server's metadata in an in-memory SQLite database (tests only: the rules are the same as on disk, and
 /// nothing waits for the disk), blobs in memory.
@@ -66,6 +66,11 @@ pub struct Faults {
     pub bad_conflict_index: AtomicBool,
     /// The machine died (see `MemFs::die_after`): every call fails.
     pub dead: Arc<AtomicBool>,
+    /// The machine dies right after the n-th commit from now applies on the server, before its answer arrives
+    /// (0 = never): that commit's reply is lost, and every call after it fails.
+    pub die_on_commit: AtomicU64,
+    /// How many chunks this device downloaded (counted, not a fault).
+    pub chunk_downloads: AtomicU64,
     calls: AtomicU64,
 }
 
@@ -145,6 +150,7 @@ impl Transport for Local {
 
     async fn get_chunk(&self, id: &ChunkId) -> Result<Bytes, TransportError> {
         self.faults.check()?;
+        self.faults.chunk_downloads.fetch_add(1, Ordering::Relaxed);
         if !self.meta.missing_chunks(self.space, &[*id]).await.map_err(meta_err)?.is_empty() {
             return Err(TransportError::NotFound);
         }
@@ -189,6 +195,15 @@ impl Transport for Local {
         drop(committed);
         if self.faults.lose_commit_reply.swap(false, Ordering::Relaxed) {
             return Err(TransportError::Unavailable("reply lost".into()));
+        }
+        match self.faults.die_on_commit.load(Ordering::Relaxed) {
+            0 => {}
+            1 => {
+                self.faults.die_on_commit.store(0, Ordering::Relaxed);
+                self.faults.dead.store(true, Ordering::Relaxed);
+                return Err(TransportError::Unavailable("the machine died".into()));
+            }
+            n => self.faults.die_on_commit.store(n - 1, Ordering::Relaxed),
         }
         Ok(CommitResponse { seq: out.seq, epoch: out.epoch })
     }
@@ -250,6 +265,18 @@ pub fn restart(m: &Machine, state: State, tweak: impl FnOnce(&mut Config)) -> Ma
     let mut config = Config::new(transport.name.clone(), transport.device);
     tweak(&mut config);
     Engine::new(fs, transport, state, config, || STAMP).unwrap()
+}
+
+/// Makes the machine save its state at every checkpoint of a pass into the returned slot, as the agent saves
+/// `state.json` (starting with the state it has now). A crash restarts from what the slot holds.
+pub fn save_checkpoints(m: &mut Machine) -> Arc<Mutex<State>> {
+    let slot = Arc::new(Mutex::new(m.state().clone()));
+    let saving = slot.clone();
+    m.on_checkpoint(move |state| {
+        *saving.lock().unwrap() = state.clone();
+        Ok(())
+    });
+    slot
 }
 
 /// Syncs the machines in turn until a whole round changes nothing. Panics after `max_rounds`.
@@ -355,8 +382,30 @@ impl Fs for SaveDuring {
         self.maybe_save(&mut inner, path, SaveOn::BeginWrite)?;
         inner.begin_write(path)
     }
-    fn finish_write(&mut self, path: &RelPath, writer: Self::Writer, exec: bool, mtime_ms: i64) -> io::Result<FileMeta> {
-        self.inner.lock().unwrap().finish_write(path, writer, exec, mtime_ms)
+    fn finish_write(
+        &mut self,
+        path: &RelPath,
+        writer: Self::Writer,
+        exec: bool,
+        mtime_ms: i64,
+        expected: Option<FileMeta>,
+    ) -> Result<FileMeta, LandError<Self::Writer>> {
+        self.inner.lock().unwrap().finish_write(path, writer, exec, mtime_ms, expected)
+    }
+    fn keep(&mut self, writer: Self::Writer, key: &str) -> io::Result<()> {
+        self.inner.lock().unwrap().keep(writer, key)
+    }
+    fn take_kept(&mut self, key: &str, hash: &craft_cloud_proto::FileHash) -> io::Result<Option<Self::Writer>> {
+        self.inner.lock().unwrap().take_kept(key, hash)
+    }
+    fn kept(&self) -> io::Result<Vec<String>> {
+        self.inner.lock().unwrap().kept()
+    }
+    fn discard_kept(&mut self, key: &str) -> io::Result<()> {
+        self.inner.lock().unwrap().discard_kept(key)
+    }
+    fn recover(&mut self) -> io::Result<()> {
+        self.inner.lock().unwrap().recover()
     }
     fn mkdir(&mut self, path: &RelPath) -> io::Result<()> {
         self.inner.lock().unwrap().mkdir(path)

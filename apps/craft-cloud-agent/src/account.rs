@@ -232,6 +232,13 @@ impl DataDir {
     pub fn remove_state(&self) -> Result<(), AccountError> {
         remove(&self.file(STATE_FILE))
     }
+
+    /// Removes the temporary files a crash left while `account.json` or `state.json` was written
+    /// (`.state.json.<random>.tmp`), and nothing else. Call it while holding the data folder's lock. Returns how many
+    /// it removed.
+    pub fn clean_tmp(&self) -> Result<usize, AccountError> {
+        remove_atomic_temps(&self.0, |of| of == ACCOUNT_FILE || of == STATE_FILE).map_err(io_at(&self.0))
+    }
 }
 
 /// The OS's per-user data folder plus `craft-cloud-agent`: `%LOCALAPPDATA%` on Windows (machine-local: the
@@ -275,6 +282,34 @@ fn remove(path: &Path) -> Result<(), AccountError> {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io_at(path)(e)),
         _ => Ok(()),
     }
+}
+
+/// The file a temporary name of [`write_atomic`] is for: `Some("state.json")` for exactly
+/// `.state.json.<16 lowercase hex digits>.tmp`, `None` for any other name.
+pub(crate) fn atomic_temp_of(name: &str) -> Option<&str> {
+    let (of, hex) = name.strip_prefix('.')?.strip_suffix(".tmp")?.rsplit_once('.')?;
+    let random = hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    (random && !of.is_empty()).then_some(of)
+}
+
+/// Removes the temporary files a [`write_atomic`] cut short by a crash left in `dir` (regular files only, and only for
+/// files `ours` accepts by name). Returns how many it removed; a missing `dir` has none.
+pub(crate) fn remove_atomic_temps(dir: &Path, ours: impl Fn(&str) -> bool) -> io::Result<usize> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let stray = entry.file_name().to_str().and_then(atomic_temp_of).is_some_and(&ours);
+        if stray && entry.file_type().is_ok_and(|t| t.is_file()) {
+            fs::remove_file(entry.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 /// Writes `bytes` to `path` atomically: a temporary file next to it, flushed, then renamed over it. `private`
@@ -351,6 +386,36 @@ mod tests {
         assert_eq!(data.load_account().unwrap(), None);
         // No temporary files left behind.
         assert_eq!(fs::read_dir(data.path()).unwrap().count(), 0);
+    }
+
+    /// Only the exact temporary names `write_atomic` uses, for the data folder's own two files, are cleaned up.
+    #[test]
+    fn interrupted_atomic_writes_are_cleaned_and_nothing_else() {
+        assert_eq!(atomic_temp_of(".state.json.0123456789abcdef.tmp"), Some("state.json"));
+        for other in [
+            "state.json.0123456789abcdef.tmp",
+            ".state.json.0123456789abcde.tmp",
+            ".state.json.0123456789ABCDEF.tmp",
+            ".state.json.tmp",
+            "..0123456789abcdef.tmp",
+            ".x.0123456789abcdef.part",
+        ] {
+            assert_eq!(atomic_temp_of(other), None, "{other}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path().join("data"));
+        assert_eq!(data.clean_tmp().unwrap(), 0, "no data folder yet");
+        data.save_state(&SavedState { schema: STATE_SCHEMA, ..SavedState::default() }).unwrap();
+        let keep = [".notes.json.0123456789abcdef.tmp", ".state.json.tmp", "mine.tmp"];
+        for name in [".state.json.0123456789abcdef.tmp", ".account.json.fedcba9876543210.tmp"].iter().chain(&keep) {
+            fs::write(data.path().join(name), b"").unwrap();
+        }
+        assert_eq!(data.clean_tmp().unwrap(), 2);
+        let mut left: Vec<String> = fs::read_dir(data.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        let mut want: Vec<String> = keep.iter().map(|s| (*s).to_owned()).chain([STATE_FILE.to_owned()]).collect();
+        want.sort();
+        assert_eq!(left, want);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use craft_cloud_proto::Name;
+use craft_cloud_proto::{ConflictStamp, FileHash, Name, conflict_name};
 
 use crate::path::RelPath;
 
@@ -41,6 +41,70 @@ pub struct FsEntry {
     pub kind: FsKind,
 }
 
+/// Why [`Fs::finish_write`] didn't land a write. The target is as it was before the call, whatever happened.
+pub enum LandError<W> {
+    /// The target isn't what the caller expected: something is at a path that had to be empty, or the file there
+    /// isn't the one the caller checked (an app saved it meanwhile). The written content comes back, so it can be
+    /// kept ([`Fs::keep`]).
+    Changed(W),
+    /// The target is in use: a program holds it open and the system won't let it be replaced or moved (a sharing
+    /// violation on Windows), or replacing it isn't permitted. The written content comes back, with the reason in words
+    /// ("in use by another program", "can't be replaced here (no permission)").
+    InUse(W, io::Error),
+    /// Any other failure; the written content is gone.
+    Io(io::Error),
+}
+
+impl<W> std::fmt::Debug for LandError<W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LandError::Changed(_) => f.write_str("Changed"),
+            LandError::InUse(_, e) => f.debug_tuple("InUse").field(e).finish(),
+            LandError::Io(e) => f.debug_tuple("Io").field(e).finish(),
+        }
+    }
+}
+
+impl<W> From<io::Error> for LandError<W> {
+    fn from(e: io::Error) -> Self {
+        LandError::Io(e)
+    }
+}
+
+impl<W> From<LandError<W>> for io::Error {
+    fn from(e: LandError<W>) -> Self {
+        match e {
+            LandError::Changed(_) => io::Error::new(io::ErrorKind::AlreadyExists, "the target changed meanwhile"),
+            LandError::InUse(_, e) => e,
+            LandError::Io(e) => e,
+        }
+    }
+}
+
+/// Why [`Fs::remove_file`] refused a file: it is marked read-only here (the Windows attribute), which is the user
+/// saying "don't change this". The engine skips the node with this reason and keeps its base, so the delete waits
+/// until the mark is cleared. Make one with [`read_only_error`], tell one with [`is_read_only`].
+#[derive(Debug)]
+pub struct ReadOnly;
+
+impl std::fmt::Display for ReadOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("read-only here, not removed")
+    }
+}
+
+impl std::error::Error for ReadOnly {}
+
+/// The error [`Fs::remove_file`] gives for a file marked read-only here (see [`ReadOnly`]).
+pub fn read_only_error() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, ReadOnly)
+}
+
+/// Whether `e` is [`read_only_error`]'s.
+pub fn is_read_only(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<ReadOnly>())
+}
+
 pub trait Fs: Send {
     /// A file being written by [`Fs::begin_write`]. Dropping it without [`Fs::finish_write`] abandons the write
     /// and leaves the target untouched.
@@ -64,22 +128,100 @@ pub trait Fs: Send {
     fn read_at(&self, path: &RelPath, offset: u64, len: usize) -> io::Result<Vec<u8>>;
     /// Starts writing new content for `path`. Nothing is visible at `path` until [`Fs::finish_write`].
     fn begin_write(&mut self, path: &RelPath) -> io::Result<Self::Writer>;
-    /// Puts the written content at `path` atomically (a reader sees the old content or the new, never a
-    /// mix), replacing any file there, with the given executable bit and modification time.
-    fn finish_write(&mut self, path: &RelPath, writer: Self::Writer, exec: bool, mtime_ms: i64) -> io::Result<FileMeta>;
+    /// Puts the written content at `path` atomically (a reader sees the old content or the new, never a mix), with
+    /// the given executable bit and modification time, **only if `path` holds what the caller checked**: nothing
+    /// when `expected` is `None`, otherwise a file whose [`FileMeta`] (size, time, exec bit, ID) is exactly
+    /// `expected`. The comparison and the replace are one step as far as the platform allows (an exchange of the
+    /// two files, then a look at the one that came out, put back if it isn't the expected one), so an app's save
+    /// between the caller's check and the landing is never overwritten: [`LandError::Changed`] instead.
+    fn finish_write(
+        &mut self,
+        path: &RelPath,
+        writer: Self::Writer,
+        exec: bool,
+        mtime_ms: i64,
+        expected: Option<FileMeta>,
+    ) -> Result<FileMeta, LandError<Self::Writer>>;
+    /// Keeps a finished write that didn't land ([`LandError::Changed`] or [`LandError::InUse`]) under `key`, so a
+    /// later pass can land it without writing it again ([`Fs::take_kept`]). Replaces anything kept under `key`.
+    /// A filesystem that can't keep writes drops it (the default).
+    fn keep(&mut self, writer: Self::Writer, key: &str) -> io::Result<()> {
+        drop(writer);
+        let _ = key;
+        Ok(())
+    }
+    /// Takes back the write kept under `key`, if any, and only if its content still hashes to `hash` (BLAKE3, the
+    /// whole file): a kept file that changed on disk is dropped instead, and the caller writes it again. Either way it
+    /// is no longer kept.
+    fn take_kept(&mut self, key: &str, hash: &FileHash) -> io::Result<Option<Self::Writer>> {
+        let _ = (key, hash);
+        Ok(None)
+    }
+    /// Why the file at `path` can't be replaced right now, as far as a quick look tells (without reading it): "read-only
+    /// here, not replaced" for a file marked read-only (Windows), "in use by another program" for one an app holds
+    /// open so it can't be replaced, "can't be replaced here (no permission)" for a folder that may not be written.
+    /// `None` when nothing stands in the way, or the look can't tell (the landing then finds out). The engine asks
+    /// before it takes a kept download back ([`Fs::take_kept`]), so a file that stays blocked costs no move and no
+    /// hash of the kept file every pass.
+    fn replace_blocked(&self, path: &RelPath) -> Option<String> {
+        let _ = path;
+        None
+    }
+    /// The keys of every kept write.
+    fn kept(&self) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// Drops the write kept under `key`, if any.
+    fn discard_kept(&mut self, key: &str) -> io::Result<()> {
+        let _ = key;
+        Ok(())
+    }
+    /// Finishes or undoes landings a crash cut short, where a landing takes more than one step (no exchange on this
+    /// platform): a file moved aside is put back where nothing took its place, or removed when the landing was
+    /// complete but for that. If its name is taken by anything but the download, it gets a conflict name next to it
+    /// (never replacing anything), which the next scan sees as a copy. A moved file whose folder the user moved
+    /// meanwhile is found there (by the folder's ID) and handled the same way under its own name. The engine calls it
+    /// at the start of every pass.
+    ///
+    /// Known limit: a crash after the download took the name but before the moved file was removed, followed by the
+    /// user deleting the download before the next pass, puts the old file back (the user's delete of a file they
+    /// may never have seen is undone; nothing is lost).
+    fn recover(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    /// What the last [`Fs::recover`] left for the user, as (what, what to do) pairs: a record of an interrupted landing
+    /// it couldn't read and set aside, a file it couldn't put back. The engine adds them to every pass's
+    /// [`Report::skipped`](crate::Report::skipped) until the user deals with them.
+    fn notices(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    /// Paths whose content is unknown right now: the targets of landings in steps that haven't finished (a step
+    /// failed and putting the moved file back failed too, so [`Fs::recover`] finishes it on the next pass). The scan
+    /// treats them like a folder it can't list: a tracked file there is never taken for deleted. The moved files
+    /// themselves are left out of listings.
+    fn unsettled(&self) -> Vec<RelPath> {
+        Vec::new()
+    }
     /// Reads a whole file (for tests and small files).
     fn read(&self, path: &RelPath) -> io::Result<Vec<u8>> {
         let mut buf = Vec::new();
         self.open(path)?.read_to_end(&mut buf)?;
         Ok(buf)
     }
-    /// Creates or replaces a file atomically with `data`.
+    /// Creates or replaces a file atomically with `data`, whatever file is at `path` now (for tests and tools: the
+    /// engine always says what it expects).
     fn write(&mut self, path: &RelPath, data: &[u8], exec: bool, mtime_ms: i64) -> io::Result<FileMeta> {
+        let expected = match self.stat(path)? {
+            Some(FsKind::File(meta)) => Some(meta),
+            None => None,
+            Some(_) => return Err(io::Error::other(format!("{path}: not a regular file"))),
+        };
         let mut w = self.begin_write(path)?;
         w.write_all(data)?;
-        self.finish_write(path, w, exec, mtime_ms)
+        self.finish_write(path, w, exec, mtime_ms, expected).map_err(io::Error::from)
     }
     fn mkdir(&mut self, path: &RelPath) -> io::Result<()>;
+    /// Removes a file. A file marked read-only here (Windows) is never removed: [`read_only_error`].
     fn remove_file(&mut self, path: &RelPath) -> io::Result<()>;
     /// Removes an empty directory; fails if it has entries.
     fn remove_dir(&mut self, path: &RelPath) -> io::Result<()>;
@@ -108,9 +250,37 @@ pub struct MemFs {
     next_id: u64,
     locked: BTreeSet<RelPath>,
     held: BTreeSet<RelPath>,
+    /// Files marked read-only, like the Windows attribute (see [`MemFs::set_read_only`]).
+    read_only: BTreeSet<RelPath>,
     death: Option<Arc<Death>>,
     /// False to act like Windows: no file is executable (see [`MemFs::without_exec_bit`]).
     exec_bit: bool,
+    /// False to land writes the way Windows does, in steps, instead of with one exchange (see
+    /// [`MemFs::without_swap`]).
+    swap: bool,
+    /// Writes kept for a later pass, by key ([`Fs::keep`]).
+    kept: BTreeMap<String, Vec<u8>>,
+    /// How many times a kept write was asked for ([`MemFs::kept_takes`]).
+    kept_takes: u64,
+    /// Landings in steps that haven't finished (a machine died between two steps), for [`Fs::recover`].
+    asides: Vec<Aside>,
+    /// Landings in steps fail after moving the file there aside, and putting it back fails too (see
+    /// [`MemFs::failing_landings`]).
+    fail_landings: bool,
+}
+
+/// A landing in steps under way: the file that was at `target` is at `aside` until the download is in place and
+/// the moved file removed.
+#[derive(Debug, Clone)]
+struct Aside {
+    target: RelPath,
+    aside: RelPath,
+    /// The file that was at `target`, as the caller expected it.
+    expected: FileMeta,
+    /// The file that lands at `target`.
+    incoming: FileMeta,
+    /// The ID of the folder both are in, so recovery finds them after the user moved that folder.
+    folder: Option<u64>,
 }
 
 /// A machine that dies partway through a pass (see [`MemFs::die_after`]).
@@ -126,7 +296,21 @@ impl Default for MemFs {
     fn default() -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert(RelPath::root(), MemNode::Dir { id: 1 });
-        Self { nodes, clock: 1_000, next_id: 2, locked: BTreeSet::new(), held: BTreeSet::new(), death: None, exec_bit: true }
+        Self {
+            nodes,
+            clock: 1_000,
+            next_id: 2,
+            locked: BTreeSet::new(),
+            held: BTreeSet::new(),
+            read_only: BTreeSet::new(),
+            death: None,
+            exec_bit: true,
+            swap: true,
+            kept: BTreeMap::new(),
+            kept_takes: 0,
+            asides: Vec::new(),
+            fail_landings: false,
+        }
     }
 }
 
@@ -152,6 +336,36 @@ impl MemFs {
             }
         }
         self
+    }
+
+    /// A filesystem that lands a write over an existing file in steps, like Windows (and disks without an exchange):
+    /// the file there is moved to a name next to it, checked, the new content is put in place, and the moved file
+    /// removed. Each step is a change of its own, so a machine that dies ([`MemFs::die_after`]) can stop between
+    /// them; [`Fs::recover`] then puts things right. By default a write lands with one exchange (Linux, macOS).
+    pub fn without_swap(mut self) -> Self {
+        self.swap = false;
+        self
+    }
+
+    /// Moves the node at `from` (and anything below it) to `to`, which must be free.
+    fn move_node(&mut self, from: &RelPath, to: &RelPath) {
+        let mut moving = self.below(from);
+        moving.push(from.clone());
+        for old in moving {
+            if let Some(node) = self.nodes.remove(&old) {
+                let suffix = &old.names()[from.depth()..];
+                let mut names = to.names().to_vec();
+                names.extend_from_slice(suffix);
+                self.nodes.insert(RelPath::from_names(names), node);
+            }
+        }
+    }
+
+    fn file_meta(&self, path: &RelPath) -> Option<FileMeta> {
+        match self.nodes.get(path) {
+            Some(MemNode::File { meta, .. }) => Some(*meta),
+            _ => None,
+        }
     }
 
     fn tick(&mut self) -> i64 {
@@ -234,6 +448,30 @@ impl MemFs {
         self.held.remove(path);
     }
 
+    /// Marks the file at `path` read-only (`true`) or clears the mark, like the Windows attribute: a read-only file is
+    /// never removed ([`read_only_error`]) or replaced ([`LandError::InUse`], "read-only here, not replaced"). It can
+    /// still be read and renamed (the mark goes with it).
+    pub fn set_read_only(&mut self, path: &RelPath, read_only: bool) {
+        if read_only {
+            self.read_only.insert(path.clone());
+        } else {
+            self.read_only.remove(path);
+        }
+    }
+
+    /// While `on`, a landing in steps ([`MemFs::without_swap`]) fails right after moving the file there aside, and
+    /// putting it back fails too, as two disk errors would: the target stays empty and the landing pending until
+    /// [`Fs::recover`] puts the moved file back.
+    pub fn failing_landings(&mut self, on: bool) {
+        self.fail_landings = on;
+    }
+
+    /// How many times the engine asked for a kept write back ([`Fs::take_kept`]), found or not: for tests that a file
+    /// that stays blocked doesn't cost a take (and a hash) every pass.
+    pub fn kept_takes(&self) -> u64 {
+        self.kept_takes
+    }
+
     /// Lets every locked and held path go.
     pub fn unlock_all(&mut self) {
         self.locked.clear();
@@ -286,6 +524,28 @@ impl MemFs {
     fn below(&self, dir: &RelPath) -> Vec<RelPath> {
         self.nodes.keys().filter(|p| p.starts_with(dir) && *p != dir).cloned().collect()
     }
+
+    /// Where a landing's target and moved file are now, if the moved file isn't at its recorded place but in the
+    /// folder that had the landing's folder ID (the user moved that folder before recovery ran).
+    fn relocated(&self, record: &Aside) -> Option<(RelPath, RelPath)> {
+        if self.nodes.contains_key(&record.aside) {
+            return None;
+        }
+        let folder = record.folder?;
+        let dir = self.nodes.iter().find_map(|(p, n)| matches!(n, MemNode::Dir { id } if *id == folder).then(|| p.clone()))?;
+        let (target, aside) = (dir.join(record.target.file_name()?), dir.join(record.aside.file_name()?));
+        self.file_meta(&aside).is_some().then_some((target, aside))
+    }
+
+    /// A free conflict-copy name next to `path`.
+    fn free_conflict_name(&self, path: &RelPath) -> Option<RelPath> {
+        let (parent, name) = (path.parent()?, path.file_name()?);
+        let stamp = ConflictStamp { year: 2000, month: 1, day: 1, hour: 0, minute: 0, utc: true };
+        (1..=1000)
+            .filter_map(|n| conflict_name(name, false, "this computer", stamp, n).ok())
+            .map(|n| parent.join(&n))
+            .find(|p| !self.nodes.contains_key(p))
+    }
 }
 
 impl Fs for MemFs {
@@ -308,6 +568,8 @@ impl Fs for MemFs {
             .nodes
             .iter()
             .filter(|(p, _)| p.depth() == depth && p.starts_with(dir))
+            // A file moved aside by a landing that hasn't finished is recovery's, never synced.
+            .filter(|(p, _)| !self.asides.iter().any(|a| &a.aside == *p))
             .filter_map(|(p, n)| {
                 let name = p.file_name()?.as_str().to_owned();
                 let kind = match n {
@@ -351,19 +613,143 @@ impl Fs for MemFs {
         Ok(Vec::new())
     }
 
-    fn finish_write(&mut self, path: &RelPath, writer: Self::Writer, exec: bool, mtime_ms: i64) -> io::Result<FileMeta> {
+    /// A held path ([`MemFs::hold`]) is in use: a write over the file there fails with [`LandError::InUse`], as a
+    /// rename onto a file an app holds open does on Windows.
+    fn finish_write(
+        &mut self,
+        path: &RelPath,
+        writer: Self::Writer,
+        exec: bool,
+        mtime_ms: i64,
+        expected: Option<FileMeta>,
+    ) -> Result<FileMeta, LandError<Self::Writer>> {
         self.change()?;
         self.require_parent(path)?;
-        self.check_held(path)?;
         if let Some(MemNode::Dir { .. }) = self.nodes.get(path) {
-            return Err(io::Error::other(format!("{path}: is a directory")));
+            return Err(LandError::Io(io::Error::other(format!("{path}: is a directory"))));
         }
         // An atomic replace (temp file + rename) gives the file a new identity.
         let id = self.new_id();
         let mtime_ms = mtime_ms.max(self.tick());
         let meta = FileMeta { size: writer.len() as u64, mtime_ms, exec: exec && self.exec_bit, id: Some(id) };
+        let Some(expected) = expected else {
+            // A rename that never replaces: one step.
+            if self.nodes.contains_key(path) {
+                return Err(LandError::Changed(writer));
+            }
+            self.nodes.insert(path.clone(), MemNode::File { data: writer, meta });
+            return Ok(meta);
+        };
+        if self.file_meta(path) != Some(expected) {
+            return Err(LandError::Changed(writer));
+        }
+        if self.held.contains(path) {
+            return Err(LandError::InUse(writer, io::Error::new(io::ErrorKind::PermissionDenied, "in use by another program")));
+        }
+        if self.read_only.contains(path) {
+            return Err(LandError::InUse(writer, io::Error::new(io::ErrorKind::PermissionDenied, "read-only here, not replaced")));
+        }
+        if self.swap {
+            // One exchange, and the file that came out is the expected one: it goes.
+            self.nodes.insert(path.clone(), MemNode::File { data: writer, meta });
+            return Ok(meta);
+        }
+        // In steps. First (the change spent above) the file there moves to a name next to it, written down so a
+        // crash between the steps can be put right.
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(LandError::Io(io::Error::other("the root is a folder")));
+        };
+        let aside = Name::new(&format!("{name}.{id}.cc-aside")).map(|n| parent.join(&n)).map_err(|e| io::Error::other(e.to_string()))?;
+        if self.nodes.contains_key(&aside) {
+            return Err(LandError::Io(exists(&aside)));
+        }
+        let folder = match self.nodes.get(&parent) {
+            Some(MemNode::Dir { id }) => Some(*id),
+            _ => None,
+        };
+        self.move_node(path, &aside);
+        self.asides.push(Aside { target: path.clone(), aside: aside.clone(), expected, incoming: meta, folder });
+        if self.fail_landings {
+            return Err(LandError::Io(io::Error::other(format!("{path}: the landing failed and the file couldn't be put back (test)"))));
+        }
+        // Then the new content takes the free name (nothing can take it in between here)…
+        self.change()?;
         self.nodes.insert(path.clone(), MemNode::File { data: writer, meta });
+        // …and the moved file goes.
+        self.change()?;
+        self.nodes.remove(&aside);
+        self.asides.retain(|a| a.aside != aside);
         Ok(meta)
+    }
+
+    fn keep(&mut self, writer: Self::Writer, key: &str) -> io::Result<()> {
+        self.alive()?;
+        self.kept.insert(key.to_owned(), writer);
+        Ok(())
+    }
+
+    fn take_kept(&mut self, key: &str, hash: &FileHash) -> io::Result<Option<Self::Writer>> {
+        self.alive()?;
+        self.kept_takes += 1;
+        Ok(self.kept.remove(key).filter(|data| blake3::hash(data).as_bytes() == hash.as_bytes()))
+    }
+
+    /// A held file ([`MemFs::hold`]) is in use, a read-only one ([`MemFs::set_read_only`]) read-only.
+    fn replace_blocked(&self, path: &RelPath) -> Option<String> {
+        if self.held.contains(path) {
+            Some("in use by another program".into())
+        } else if self.read_only.contains(path) {
+            Some("read-only here, not replaced".into())
+        } else {
+            None
+        }
+    }
+
+    fn kept(&self) -> io::Result<Vec<String>> {
+        self.alive()?;
+        Ok(self.kept.keys().cloned().collect())
+    }
+
+    fn discard_kept(&mut self, key: &str) -> io::Result<()> {
+        self.alive()?;
+        self.kept.remove(key);
+        Ok(())
+    }
+
+    /// Like the agent's disk: a moved file whose name is taken by anything but the download gets a conflict name
+    /// instead (never a `.cc-aside` name the scan would take for the tracked file's new place), and one whose folder
+    /// the user moved since is found in that folder by the folder's ID and handled there under its own name.
+    fn recover(&mut self) -> io::Result<()> {
+        while let Some(record) = self.asides.first().cloned() {
+            let (target, aside) = self.relocated(&record).unwrap_or_else(|| (record.target.clone(), record.aside.clone()));
+            match (self.file_meta(&aside), self.nodes.contains_key(&target)) {
+                // Moved aside, nothing took its place: it goes back.
+                (Some(_), false) => {
+                    self.change()?;
+                    self.move_node(&aside, &target);
+                }
+                // The landing was done but for removing the file it replaced.
+                (Some(moved), true) if moved == record.expected && self.file_meta(&target) == Some(record.incoming) => {
+                    self.change()?;
+                    self.nodes.remove(&aside);
+                }
+                // Its name taken by something other than the download: a conflict name next to it.
+                (Some(_), true) => {
+                    if let Some(copy) = self.free_conflict_name(&target) {
+                        self.change()?;
+                        self.move_node(&aside, &copy);
+                    }
+                }
+                // Gone already: nothing to do.
+                _ => {}
+            }
+            self.asides.remove(0);
+        }
+        Ok(())
+    }
+
+    fn unsettled(&self) -> Vec<RelPath> {
+        self.asides.iter().map(|a| a.target.clone()).collect()
     }
 
     fn mkdir(&mut self, path: &RelPath) -> io::Result<()> {
@@ -381,6 +767,7 @@ impl Fs for MemFs {
         self.change()?;
         self.check_held(path)?;
         match self.nodes.get(path) {
+            Some(MemNode::File { .. }) if self.read_only.contains(path) => Err(read_only_error()),
             Some(MemNode::File { .. } | MemNode::Other) => {
                 self.nodes.remove(path);
                 Ok(())
@@ -414,15 +801,14 @@ impl Fs for MemFs {
             return Err(io::Error::other("can't move a directory into itself"));
         }
         self.require_parent(to)?;
-        let mut moving = self.below(from);
-        moving.push(from.clone());
-        for old in moving {
-            if let Some(node) = self.nodes.remove(&old) {
-                let suffix = &old.names()[from.depth()..];
-                let mut names = to.names().to_vec();
-                names.extend_from_slice(suffix);
-                self.nodes.insert(RelPath::from_names(names), node);
-            }
+        self.move_node(from, to);
+        // Read-only marks go with the files.
+        let marked: Vec<RelPath> = self.read_only.iter().filter(|p| p.starts_with(from)).cloned().collect();
+        for old in marked {
+            self.read_only.remove(&old);
+            let mut names = to.names().to_vec();
+            names.extend_from_slice(old.names().get(from.depth()..).unwrap_or_default());
+            self.read_only.insert(RelPath::from_names(names));
         }
         Ok(())
     }

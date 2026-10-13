@@ -578,6 +578,72 @@ async fn a_file_that_cant_be_removed_doesnt_stop_the_rest() {
     assert_eq!(files(&a), files(&b));
 }
 
+/// A landing in steps fails after moving the old file aside, and putting it back fails too: the file's name is
+/// empty until the next pass's recovery. That pass's scan counts the name as unknown, so no delete goes to the
+/// server; after recovery the file is back, the server's edit lands, and nothing was deleted anywhere.
+#[tokio::test]
+async fn a_failed_put_back_never_sends_a_delete() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine_with(&server, &ana, "desktop", MemFs::new().without_swap(), 50).await;
+    write(&mut a, "notes", b"v1");
+    write(&mut a, "other", b"o");
+    settle(&mut [&mut a, &mut b], 5).await;
+    write(&mut a, "notes", b"v2");
+    a.sync_once().await.unwrap();
+
+    b.fs_mut().failing_landings(true);
+    let report = b.sync_once().await.unwrap();
+    assert!(report.skipped.iter().any(|(p, _)| p == "notes"), "{report:?}");
+    assert!(b.fs().stat(&path("notes")).unwrap().is_none(), "the name is empty until recovery");
+    // The push sends nothing for it: no delete (not even one the server would refuse), no move, no upload.
+    assert!(report.removed_remotely.is_empty() && report.refused.is_empty() && report.pending_deletes.is_empty(), "{report:?}");
+    assert!(report.moved_remotely.is_empty() && report.uploaded.is_empty() && report.conflict_copies.is_empty(), "{report:?}");
+    // Nothing was deleted or moved on the server.
+    a.sync_once().await.unwrap();
+    assert_eq!(files(&a), vec![("notes".to_owned(), b"v2".to_vec()), ("other".to_owned(), b"o".to_vec())]);
+
+    b.fs_mut().failing_landings(false);
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(read(&b, "notes"), b"v2");
+    assert_eq!(files(&a), files(&b));
+    assert_eq!(files(&b).len(), 2, "{:?}", files(&b));
+}
+
+/// A file marked read-only here (Windows) is the user saying "don't change this": the server's delete never removes
+/// it. The node is skipped with that reason and waits, nothing goes back up, and once the mark is cleared the delete
+/// lands.
+#[tokio::test]
+async fn a_read_only_file_is_never_removed_and_the_delete_waits() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "final.doc", b"signed off");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().remove_file(&path("final.doc")).unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().set_read_only(&path("final.doc"), true);
+    let report = b.sync_once().await.unwrap();
+    let why = report.skipped.iter().find(|(p, _)| p == "final.doc").map(|(_, why)| why.clone()).unwrap_or_default();
+    assert!(why.starts_with("read-only here, not removed"), "{report:?}");
+    assert_eq!(read(&b, "final.doc"), b"signed off");
+    // Still read-only: nothing comes back to the server, and the delete keeps waiting.
+    for _ in 0..2 {
+        let report = b.sync_once().await.unwrap();
+        assert!(report.uploaded.is_empty() && report.removed_locally.is_empty(), "{report:?}");
+        assert!(report.skipped.iter().any(|(p, _)| p == "final.doc"), "{report:?}");
+    }
+    a.sync_once().await.unwrap();
+    assert!(files(&a).is_empty(), "{:?}", files(&a));
+    b.fs_mut().set_read_only(&path("final.doc"), false);
+    let report = b.sync_once().await.unwrap();
+    assert_eq!(report.removed_locally, vec![path("final.doc")]);
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert!(files(&b).is_empty());
+}
+
 #[tokio::test]
 async fn a_rename_here_and_an_edit_there_meet_in_one_file() {
     let server = Server::new().await;
@@ -1425,4 +1491,176 @@ async fn a_server_rename_onto_a_deleted_folder_removes_it_only_if_bare() {
     assert_eq!(read(&b, "old"), b"other");
     assert_eq!(read(&b, "kept"), b"more");
     assert!(files(&b).iter().any(|(p, d)| p.ends_with("/new.txt") && d == b"made here"), "{:?}", files(&b));
+}
+
+/// A clip replaced by a link, next to an untracked file whose name differs only by case, then the folder renamed
+/// (seed 45982). In the renamed folder neither name is tracked, so the case twin wins the name and the link is
+/// skipped as a clash, but it is still a link: the clip behind it is never deleted on the server.
+#[tokio::test]
+async fn a_link_skipped_as_a_case_clash_still_hides_its_tracked_file() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    write(&mut a, "Footage/C0.MOV", b"an untracked twin");
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    for _ in 0..2 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty() && report.pending_deletes.is_empty(), "{report:?}");
+    }
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "Clips/c0.mov"), b"clip");
+}
+
+/// The laptop gives a.txt b.txt's content and renames it to c.txt (or replaces it with a new c.txt holding that
+/// content); the desktop deletes a.txt and renames b.txt to c.txt. The file at c.txt holds the server's content,
+/// but it is the tracked b.txt (its file ID says so), so the server's node doesn't adopt it: two nodes never share
+/// one file, and b.txt isn't deleted on the server.
+async fn a_tracked_file_is_never_adopted_by_another_node(new_node: bool) {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "a.txt", b"one");
+    write(&mut a, "b.txt", b"two");
+    settle(&mut [&mut a, &mut b], 5).await;
+    if new_node {
+        a.fs_mut().remove_file(&path("a.txt")).unwrap();
+        write(&mut a, "c.txt", b"two");
+    } else {
+        write(&mut a, "a.txt", b"two");
+        a.sync_once().await.unwrap();
+        a.fs_mut().rename(&path("a.txt"), &path("c.txt")).unwrap();
+    }
+    a.sync_once().await.unwrap();
+    b.fs_mut().remove_file(&path("a.txt")).unwrap();
+    b.fs_mut().rename(&path("b.txt"), &path("c.txt")).unwrap();
+    let report = b.sync_once().await.unwrap();
+    assert!(report.removed_remotely.is_empty(), "{report:?}");
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&a), files(&b));
+    assert_eq!(files(&b).iter().filter(|(_, d)| d == b"two").count(), 2, "{:?}", files(&b));
+}
+
+#[tokio::test]
+async fn a_tracked_file_is_never_adopted_by_a_moved_node() {
+    a_tracked_file_is_never_adopted_by_another_node(false).await;
+}
+
+#[tokio::test]
+async fn a_tracked_file_is_never_adopted_by_a_new_node() {
+    a_tracked_file_is_never_adopted_by_another_node(true).await;
+}
+
+/// The laptop saves notes again with the same bytes, which goes up as a new version with the same manifest. The
+/// desktop has notes open and locked: the new version is recorded without touching the file (nothing to download,
+/// nothing to compare, no conflict copy), and a real edit later lands as usual. A rename that comes with such a
+/// version is still applied.
+#[tokio::test]
+async fn a_new_version_with_the_same_content_is_no_change() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "notes", b"same");
+    write(&mut a, "other", b"other");
+    settle(&mut [&mut a, &mut b], 5).await;
+    write(&mut a, "notes", b"same");
+    write(&mut a, "other", b"other");
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.uploaded.len(), 2, "{report:?}");
+    a.fs_mut().rename(&path("other"), &path("renamed")).unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().lock(&path("notes"));
+    let report = b.sync_once().await.unwrap();
+    assert!(report.downloaded.is_empty() && report.conflict_copies.is_empty(), "{report:?}");
+    assert_eq!(report.moved_locally, vec![(path("other"), path("renamed"))]);
+    assert!(!b.sync_once().await.unwrap().changed());
+    b.fs_mut().unlock_all();
+    write(&mut a, "notes", b"edited");
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&a), files(&b));
+    assert_eq!(read(&b, "notes"), b"edited");
+    assert!(conflict_copies(&b).is_empty());
+}
+
+/// Rename blocked (Windows): an app holds the desktop's notes open, so the laptop's edit can't replace it. The
+/// download is kept and the node skipped as in use; later passes land the kept file once it is let go, without
+/// downloading it again. A kept download whose version is no longer current is dropped. Both ways of landing: one
+/// exchange, and in steps.
+#[tokio::test]
+async fn a_download_onto_a_file_in_use_is_kept_and_lands_later() {
+    for swap in [true, false] {
+        let server = Server::new().await;
+        let ana = server.user("ana").await;
+        let mut a = machine(&server, &ana, "laptop").await;
+        let fs = if swap { MemFs::new() } else { MemFs::new().without_swap() };
+        let mut b = machine_with(&server, &ana, "desktop", fs, 50).await;
+        write(&mut a, "notes", b"v1");
+        settle(&mut [&mut a, &mut b], 5).await;
+
+        b.fs_mut().hold(&path("notes"));
+        write(&mut a, "notes", b"v2");
+        a.sync_once().await.unwrap();
+        let takes = b.fs().kept_takes();
+        for pass in 0..2 {
+            let report = b.sync_once().await.unwrap();
+            // The first pass downloads and keeps; the next one asks whether the file can be replaced before it takes the
+            // kept file back, and skips without moving or hashing it.
+            assert_eq!(b.fs().kept_takes(), takes + 1, "pass {pass}");
+            assert!(report.downloaded.is_empty() && report.conflict_copies.is_empty(), "{report:?}");
+            assert!(
+                report.skipped.iter().any(|(p, why)| p == "notes" && why.contains("in use") && why.ends_with("tried again next pass")),
+                "{report:?}"
+            );
+            assert_eq!(read(&b, "notes"), b"v1");
+            assert_eq!(b.fs().kept().unwrap().len(), 1);
+        }
+        let fetched = b.transport().faults.chunk_downloads.load(Ordering::Relaxed);
+        b.fs_mut().release(&path("notes"));
+        let report = b.sync_once().await.unwrap();
+        assert_eq!(report.downloaded, vec![path("notes")], "{report:?}");
+        assert_eq!(read(&b, "notes"), b"v2");
+        assert_eq!(b.transport().faults.chunk_downloads.load(Ordering::Relaxed), fetched, "the kept download landed");
+        assert!(b.fs().kept().unwrap().is_empty());
+
+        // Kept, then overtaken by a newer version: that one is downloaded, the kept one dropped.
+        b.fs_mut().hold(&path("notes"));
+        write(&mut a, "notes", b"v3");
+        a.sync_once().await.unwrap();
+        b.sync_once().await.unwrap();
+        write(&mut a, "notes", b"v4");
+        a.sync_once().await.unwrap();
+        b.fs_mut().release(&path("notes"));
+        let report = b.sync_once().await.unwrap();
+        assert_eq!(report.downloaded, vec![path("notes")], "{report:?}");
+        assert_eq!(read(&b, "notes"), b"v4");
+        assert!(b.fs().kept().unwrap().is_empty());
+        settle(&mut [&mut a, &mut b], 5).await;
+        assert_eq!(files(&a), files(&b));
+        assert!(conflict_copies(&b).is_empty());
+    }
+}
+
+/// The user renames a tracked folder and makes a new one under the old name (seed 10402). Path first: the new
+/// folder is the tracked one, the renamed one goes up as new. The tracked folder takes the new folder's ID even
+/// though its old ID is still in the folder (on the renamed one), so a later rename of it is sent as a move, not
+/// as a delete and a new folder.
+#[tokio::test]
+async fn a_folder_made_again_under_a_tracked_name_takes_its_new_id() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("x")).unwrap();
+    write(&mut a, "pad.txt", b"pad");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().rename(&path("x"), &path("old")).unwrap();
+    a.fs_mut().mkdir(&path("x")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.created_dirs, vec![path("old")], "{report:?}");
+    a.fs_mut().rename(&path("x"), &path("renamed")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.moved_remotely, vec![(path("x"), path("renamed"))], "{report:?}");
+    assert!(report.removed_remotely.is_empty(), "{report:?}");
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(b.fs().dirs(), vec![path("old"), path("renamed")]);
 }
