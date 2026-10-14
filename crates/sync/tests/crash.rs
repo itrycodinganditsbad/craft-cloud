@@ -165,6 +165,35 @@ async fn a_delete_the_crashed_pass_sent_doesnt_remove_the_file_after_a_restart()
     }
 }
 
+/// Seed 112337's no-pass order, with a crash: the laptop's folder `y` was a link, is a real folder again holding a
+/// link `a.txt`, and is renamed to `x` before any pass saw it. The pass holds the delete of `y/a.txt` behind
+/// `x/a.txt` (a link new since the last finished push, with the node's name) and creates `x` on the server, then dies
+/// right after that commit applies, before the answer. The hold was saved before the commit went, and the push never
+/// finished, so the restarted engine still counts the link as new: the node behind it still isn't deleted.
+#[tokio::test]
+async fn a_held_delete_survives_a_crash_after_the_commit_that_tracks_the_links_folder() {
+    let (_server, mut a, mut b) = clip_setup().await;
+    a.fs_mut().make_link(&path("y")).unwrap();
+    a.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("y")).unwrap();
+    a.fs_mut().mkdir(&path("y")).unwrap();
+    a.fs_mut().make_link(&path("y/a.txt")).unwrap();
+    a.fs_mut().rename(&path("y"), &path("x")).unwrap();
+
+    let saved = save_checkpoints(&mut a);
+    a.transport().faults.die_on_commit.store(1, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    let state = saved.lock().unwrap().clone();
+    let mut a = restart(&a, state, |_| {});
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("y/a.txt")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("y/a.txt"), vec![path("x/a.txt")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(b.fs().read(&path("y/a.txt")).unwrap(), b"clip", "the desktop keeps it");
+    }
+}
+
 /// Seed 59494. The desktop deletes A.TXT and dies right after that commit applies. The laptop had edited it, so its
 /// edit wins and brings the node back at a new version. Meanwhile the desktop's user puts the old file back. The
 /// restarted desktop must not take the brought-back node for the one it tracks (its delete went through): the node

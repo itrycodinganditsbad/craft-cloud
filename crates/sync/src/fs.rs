@@ -167,6 +167,16 @@ pub trait Fs: Send {
         let _ = path;
         None
     }
+    /// Whether the file at `path`, which the engine found changed (`meta` is what it saw), may still be being written:
+    /// its size and time haven't stayed the same across two looks far enough apart, or (Windows) a program still has it
+    /// open for writing. The engine asks only about files that differ from what both sides agreed on, before it
+    /// uploads one or keeps it as a conflict copy; such a file is skipped ("still changing") and looked at again
+    /// later, and it is never taken for deleted or overwritten meanwhile. `false` (the default) trusts every file
+    /// at once, as a one-off `sync` run by hand does.
+    fn still_changing(&self, path: &RelPath, meta: &FileMeta) -> bool {
+        let _ = (path, meta);
+        false
+    }
     /// The keys of every kept write.
     fn kept(&self) -> io::Result<Vec<String>> {
         Ok(Vec::new())
@@ -250,6 +260,8 @@ pub struct MemFs {
     next_id: u64,
     locked: BTreeSet<RelPath>,
     held: BTreeSet<RelPath>,
+    /// Files an app is still writing (see [`MemFs::set_changing`]).
+    changing: BTreeSet<RelPath>,
     /// Files marked read-only, like the Windows attribute (see [`MemFs::set_read_only`]).
     read_only: BTreeSet<RelPath>,
     death: Option<Arc<Death>>,
@@ -267,6 +279,8 @@ pub struct MemFs {
     /// Landings in steps fail after moving the file there aside, and putting it back fails too (see
     /// [`MemFs::failing_landings`]).
     fail_landings: bool,
+    /// How many times the folder's root was listed ([`MemFs::root_lists`]); shared by clones.
+    root_lists: Arc<AtomicU64>,
 }
 
 /// A landing in steps under way: the file that was at `target` is at `aside` until the download is in place and
@@ -302,6 +316,7 @@ impl Default for MemFs {
             next_id: 2,
             locked: BTreeSet::new(),
             held: BTreeSet::new(),
+            changing: BTreeSet::new(),
             read_only: BTreeSet::new(),
             death: None,
             exec_bit: true,
@@ -310,6 +325,7 @@ impl Default for MemFs {
             kept_takes: 0,
             asides: Vec::new(),
             fail_landings: false,
+            root_lists: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -357,6 +373,20 @@ impl MemFs {
                 let mut names = to.names().to_vec();
                 names.extend_from_slice(suffix);
                 self.nodes.insert(RelPath::from_names(names), node);
+            }
+        }
+    }
+
+    /// Read-only marks go with moved files, and so do "still being written" ones (the writer's handle follows the
+    /// file it has open), whoever moves them: the engine's renames and [`Fs::recover`] alike.
+    fn carry_marks(&mut self, from: &RelPath, to: &RelPath) {
+        for marks in [&mut self.read_only, &mut self.changing] {
+            let marked: Vec<RelPath> = marks.iter().filter(|p| p.starts_with(from)).cloned().collect();
+            for old in marked {
+                marks.remove(&old);
+                let mut names = to.names().to_vec();
+                names.extend_from_slice(old.names().get(from.depth()..).unwrap_or_default());
+                marks.insert(RelPath::from_names(names));
             }
         }
     }
@@ -466,16 +496,37 @@ impl MemFs {
         self.fail_landings = on;
     }
 
+    /// How many times the folder's root was listed: about once per scan of the whole folder.
+    pub fn root_lists(&self) -> u64 {
+        self.root_lists.load(Ordering::Relaxed)
+    }
+
     /// How many times the engine asked for a kept write back ([`Fs::take_kept`]), found or not: for tests that a file
     /// that stays blocked doesn't cost a take (and a hash) every pass.
     pub fn kept_takes(&self) -> u64 {
         self.kept_takes
     }
 
-    /// Lets every locked and held path go.
+    /// Marks the file at `path` as one an app is still writing (`true`), or done (`false`): while marked, the engine
+    /// finds it still changing ([`Fs::still_changing`]) whenever it asks.
+    pub fn set_changing(&mut self, path: &RelPath, changing: bool) {
+        if changing {
+            self.changing.insert(path.clone());
+        } else {
+            self.changing.remove(path);
+        }
+    }
+
+    /// The files marked as still being written ([`MemFs::set_changing`]).
+    pub fn changing(&self) -> &BTreeSet<RelPath> {
+        &self.changing
+    }
+
+    /// Lets every locked and held path go, and ends every write still under way.
     pub fn unlock_all(&mut self) {
         self.locked.clear();
         self.held.clear();
+        self.changing.clear();
     }
 
     fn check_held(&self, path: &RelPath) -> io::Result<()> {
@@ -563,6 +614,9 @@ impl Fs for MemFs {
         self.alive()?;
         self.require_dir(dir)?;
         self.check_held(dir)?;
+        if dir.is_root() {
+            self.root_lists.fetch_add(1, Ordering::Relaxed);
+        }
         let depth = dir.depth() + 1;
         Ok(self
             .nodes
@@ -694,6 +748,12 @@ impl Fs for MemFs {
         Ok(self.kept.remove(key).filter(|data| blake3::hash(data).as_bytes() == hash.as_bytes()))
     }
 
+    /// A file marked with [`MemFs::set_changing`].
+    fn still_changing(&self, path: &RelPath, meta: &FileMeta) -> bool {
+        let _ = meta;
+        self.changing.contains(path)
+    }
+
     /// A held file ([`MemFs::hold`]) is in use, a read-only one ([`MemFs::set_read_only`]) read-only.
     fn replace_blocked(&self, path: &RelPath) -> Option<String> {
         if self.held.contains(path) {
@@ -727,6 +787,7 @@ impl Fs for MemFs {
                 (Some(_), false) => {
                     self.change()?;
                     self.move_node(&aside, &target);
+                    self.carry_marks(&aside, &target);
                 }
                 // The landing was done but for removing the file it replaced.
                 (Some(moved), true) if moved == record.expected && self.file_meta(&target) == Some(record.incoming) => {
@@ -738,6 +799,7 @@ impl Fs for MemFs {
                     if let Some(copy) = self.free_conflict_name(&target) {
                         self.change()?;
                         self.move_node(&aside, &copy);
+                        self.carry_marks(&aside, &copy);
                     }
                 }
                 // Gone already: nothing to do.
@@ -802,14 +864,7 @@ impl Fs for MemFs {
         }
         self.require_parent(to)?;
         self.move_node(from, to);
-        // Read-only marks go with the files.
-        let marked: Vec<RelPath> = self.read_only.iter().filter(|p| p.starts_with(from)).cloned().collect();
-        for old in marked {
-            self.read_only.remove(&old);
-            let mut names = to.names().to_vec();
-            names.extend_from_slice(old.names().get(from.depth()..).unwrap_or_default());
-            self.read_only.insert(RelPath::from_names(names));
-        }
+        self.carry_marks(from, to);
         Ok(())
     }
 }

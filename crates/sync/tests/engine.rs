@@ -1155,6 +1155,926 @@ async fn a_folder_put_back_from_another_drive_is_still_moved_as_one() {
     assert_eq!(read(&b, "Clips/c0.mov"), b"clip");
 }
 
+/// Seed 112337: a folder that was a link is a real folder again (a new local ID), and the first pass after that fails
+/// (offline). The user then makes a link inside it and moves the folder. The failed pass already recorded the
+/// folder's new ID, so the move is sent as a move, and the node behind the inner link isn't deleted on the server.
+#[tokio::test]
+async fn a_folder_put_back_records_its_new_id_even_in_a_failed_pass() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    a.transport().faults.every.store(1, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err(), "the server is offline");
+    a.transport().faults.every.store(0, Ordering::Relaxed);
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.removed_remotely.is_empty() && report.pending_deletes.is_empty(), "{report:?}");
+    assert_eq!(report.moved_remotely, vec![(path("Footage"), path("Clips"))]);
+    assert!(report.created_dirs.is_empty(), "{report:?}");
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "Clips/c0.mov"), b"clip");
+}
+
+/// Seed 112337's other order (finding 6 of the second review): the same, with no pass at all between the folder put
+/// back and the move. Nothing local tells the moved folder apart from a new one (it and its files have new local
+/// IDs), so the move goes up as a delete plus a new folder. But the delete of the node behind the inner link is held:
+/// a link that appeared since the last finished push carries its name. It waits, with a
+/// reason, for as long as the link is there, and so does its folder; once the link is a real file again (here it goes
+/// up as a new file), the held delete goes. Nothing is lost, and nothing behind the link is ever deleted.
+#[tokio::test]
+async fn a_moved_folder_put_back_with_no_pass_between_holds_the_delete_behind_its_link() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(
+            !report.removed_remotely.contains(&path("Footage/c0.mov")) && !report.removed_remotely.contains(&path("Footage")),
+            "the node behind the link and its folder stay: {report:?}"
+        );
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+    // The link is a real file again: it goes up as a new file, and the held delete goes.
+    a.fs_mut().remove_file(&path("Clips/c0.mov")).unwrap();
+    write(&mut a, "Clips/c0.mov", b"clip");
+    settle(&mut [&mut a, &mut b], 6).await;
+    assert_eq!(read(&b, "Clips/c0.mov"), b"clip");
+    assert!(!b.fs().dirs().contains(&path("Footage")), "{:?}", b.fs().dirs());
+    assert_eq!(files(&a), files(&b));
+}
+
+/// Seed 112337's no-pass order, up to its first pass: the delete of `Footage/c0.mov` is held behind `Clips/c0.mov`.
+async fn held_setup() -> (Server, common::Machine, common::Machine) {
+    let (server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "Footage/c0.mov"), b"clip");
+    (server, a, b)
+}
+
+/// Seed 804 (fix round 4): the folder put back is moved, with no pass in between, onto the place of a tracked folder
+/// the user just deleted. The folder there now is that tracked folder to the engine (path first; it takes the new
+/// local ID), but the link in it is new since the last finished push and carries the node's name: held.
+#[tokio::test]
+async fn a_folder_put_back_and_moved_onto_a_deleted_tracked_folder_holds_the_delete() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().mkdir(&path("Old")).unwrap();
+    write(&mut a, "Old/o.txt", b"old");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().remove_file(&path("Old/o.txt")).unwrap();
+    a.fs_mut().remove_dir(&path("Old")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Old")).unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Old/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+}
+
+/// Seeds 13116, 19051 and 35808 (fix round 4): the folder put back is moved, and the user makes a new folder at its
+/// old name, all before any pass. The old place isn't empty (the engine takes the new folder for the old one, path
+/// first), but the link is new and carries the node's name, so the delete is held.
+#[tokio::test]
+async fn a_folder_put_back_and_moved_then_made_again_holds_the_delete() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    write(&mut a, "Footage/new.txt", b"new");
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+    assert_eq!(read(&b, "Footage/new.txt"), b"new");
+}
+
+/// The same, moved onto a name another machine just made a folder at: this machine's pull takes the moved folder for
+/// that new server folder (it adopts the folder already there) before the push looks, so the link in it is held too.
+#[tokio::test]
+async fn a_folder_put_back_and_moved_onto_a_new_server_folder_holds_the_delete() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().mkdir(&path("Clips")).unwrap();
+    write(&mut b, "Clips/b.txt", b"from the desktop");
+    b.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+    assert_eq!(read(&a, "Clips/b.txt"), b"from the desktop");
+}
+
+/// The same, moved onto the name another machine's server move just took: the user here deleted the folder the
+/// server moved, so this machine's pull takes the moved folder for it (a folder sits where the server moved it)
+/// before the push looks, and the link in it is held too.
+#[tokio::test]
+async fn a_folder_put_back_and_moved_onto_a_server_moves_target_holds_the_delete() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().mkdir(&path("Other")).unwrap();
+    write(&mut a, "Other/o.txt", b"other");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().rename(&path("Other"), &path("Clips")).unwrap();
+    b.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("Other/o.txt")).unwrap();
+    a.fs_mut().remove_dir(&path("Other")).unwrap();
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+}
+
+/// Seed 110570 (fix round 5): the folder put back is moved into another tracked folder, and that folder is then
+/// renamed onto the put-back folder's old place, all before any pass. However the engine takes the folders at
+/// `Footage` and `Footage/Sub`, the link there is new and carries the node's name, so the delete is held.
+#[tokio::test]
+async fn a_folder_put_back_and_moved_into_a_folder_renamed_onto_its_place_holds_the_delete() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().mkdir(&path("Other")).unwrap();
+    write(&mut a, "Other/o.txt", b"other");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Other/Sub")).unwrap();
+    a.fs_mut().rename(&path("Other"), &path("Footage")).unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Footage/Sub/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+    assert_eq!(read(&b, "Footage/o.txt"), b"other", "the renamed folder went up as a move");
+}
+
+/// Review 6, P1: seed 13116's gesture (the folder put back, a link made in it, the folder moved, a new folder made at
+/// its old name) while an unrelated tracked folder can't be listed. The link is new since the last finished push and
+/// carries the missing node's name, so the delete is held, whatever the folders around it look like.
+#[tokio::test]
+async fn a_folder_made_again_while_another_cant_be_listed_holds_the_delete() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().mkdir(&path("Locked")).unwrap();
+    write(&mut a, "Locked/l.txt", b"locked");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.sync_once().await.unwrap();
+    a.fs_mut().hold(&path("Locked"));
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    write(&mut a, "Footage/new.txt", b"new");
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+}
+
+/// Review 6, P2: seed 804's gesture (the folder put back, a link made in it, the folder moved onto the place of a
+/// tracked folder the user just deleted) while an unrelated tracked folder can't be listed: held.
+#[tokio::test]
+async fn a_folder_moved_onto_a_deleted_one_while_another_cant_be_listed_holds_the_delete() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().mkdir(&path("Old")).unwrap();
+    write(&mut a, "Old/o.txt", b"old");
+    a.fs_mut().mkdir(&path("Locked")).unwrap();
+    write(&mut a, "Locked/l.txt", b"locked");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.sync_once().await.unwrap();
+    a.fs_mut().hold(&path("Locked"));
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().remove_file(&path("Old/o.txt")).unwrap();
+    a.fs_mut().remove_dir(&path("Old")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Old")).unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Old/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+}
+
+/// Review 6, P4: another machine moves the node itself out of the folder that became a link here, and only then does
+/// this machine's user put the folder back, make the node a link and move the folder. The pull lets the missing
+/// node's base follow the server's move, but the hold judges it by where this machine last had it
+/// (`Footage/c0.mov`): the new link `Clips/c0.mov` carries its name, so the delete is held and the desktop keeps
+/// the file its user moved.
+#[tokio::test]
+async fn a_server_move_of_the_node_before_the_gesture_is_seen_holds_the_delete() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().rename(&path("Footage/c0.mov"), &path("c0.mov")).unwrap();
+    b.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("c0.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("c0.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "c0.mov"), b"clip", "the desktop keeps what its user moved");
+    }
+}
+
+/// The same when the other machine also renames the node: the server's name (`c0-desktop.mov`) isn't on the link, but
+/// the name this machine last had it under is, and the hold judges it by that.
+#[tokio::test]
+async fn a_server_rename_of_the_node_before_the_gesture_is_seen_holds_the_delete() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().rename(&path("Footage/c0.mov"), &path("c0-desktop.mov")).unwrap();
+    b.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("c0-desktop.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("c0-desktop.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "c0-desktop.mov"), b"clip", "the desktop keeps what its user renamed");
+    }
+}
+
+/// A hold whose node another machine renamed, and whose link's folder is then renamed too: the node's names no
+/// longer include the link's (this machine's record of where it last had the node ends with a finished push), but
+/// the hold follows its link by the link's own name to the path no finished push saw.
+#[tokio::test]
+async fn a_hold_follows_its_link_after_the_node_was_renamed_elsewhere() {
+    let (_server, mut a, mut b) = held_setup().await;
+    b.fs_mut().rename(&path("Footage/c0.mov"), &path("Footage/c0-desktop.mov")).unwrap();
+    b.sync_once().await.unwrap();
+    for _ in 0..2 {
+        let report = a.sync_once().await.unwrap();
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0-desktop.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+    }
+    b.sync_once().await.unwrap();
+    b.fs_mut().rename(&path("Clips"), &path("Clips3")).unwrap();
+    b.sync_once().await.unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("Footage/c0-desktop.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0-desktop.mov"), vec![path("Clips3/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0-desktop.mov"), b"clip", "the desktop keeps it");
+    }
+}
+
+/// Review 6, finding 4: another machine renames a file onto a name where this machine, which deleted that file, has a
+/// file of its own. Both are kept, as when the file is still here: this machine's file is moved aside as a conflict
+/// copy (it goes up as a new file), and the renamed file lands at its name. Before, this machine's file went up as the
+/// renamed file's next version, with no copy anywhere.
+#[tokio::test]
+async fn a_server_move_onto_a_file_of_this_machines_own_keeps_both() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().remove_file(&path("notes.txt")).unwrap();
+    write(&mut a, "report.txt", b"mine, from the laptop");
+    b.fs_mut().rename(&path("notes.txt"), &path("report.txt")).unwrap();
+    b.sync_once().await.unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.conflict_copies.len(), 1, "{report:?}");
+    assert!(report.removed_remotely.is_empty(), "{report:?}");
+    settle(&mut [&mut a, &mut b], 6).await;
+    for m in [&a, &b] {
+        assert_eq!(read(m, "report.txt"), b"notes");
+        let copies = conflict_copies(m);
+        assert_eq!(copies.len(), 1, "{:?}", files(m));
+        assert_eq!(read(m, &copies[0]), b"mine, from the laptop");
+    }
+    assert_eq!(files(&a), files(&b));
+}
+
+/// A link that was already there at the last finished push never holds a delete. The user's `Footage` lives on
+/// another drive behind a permanent link; a later real delete of `ProjectB/Footage/x.mov` (whose path has a folder
+/// named `Footage`) goes on the first pass.
+#[tokio::test]
+async fn a_link_that_was_already_there_never_holds_a_later_delete() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().mkdir(&path("ProjectB")).unwrap();
+    a.fs_mut().mkdir(&path("ProjectB/Footage")).unwrap();
+    write(&mut a, "ProjectB/Footage/x.mov", b"x");
+    write(&mut a, "ProjectB/Footage/y.mov", b"y");
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().remove_file(&path("ProjectB/Footage/x.mov")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.held_deletes.is_empty(), "{report:?}");
+    assert_eq!(report.removed_remotely, vec![path("ProjectB/Footage/x.mov")], "{report:?}");
+    b.sync_once().await.unwrap();
+    assert!(b.fs().read(&path("ProjectB/Footage/x.mov")).is_err(), "the user's delete reached the desktop");
+    assert_eq!(read(&b, "ProjectB/Footage/y.mov"), b"y");
+}
+
+/// While a delete is held behind a link, the user makes an unrelated new folder at the old folder's name. The
+/// folder is found at its path again, but the link still stands where the hold recorded it: the node behind it
+/// isn't deleted. Once the user removes the link, the node is judged afresh: it is missing, so its delete goes.
+#[tokio::test]
+async fn a_new_folder_at_the_old_place_doesnt_release_a_held_delete() {
+    let (_server, mut a, mut b) = held_setup().await;
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    write(&mut a, "Footage/other.txt", b"other");
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+    assert_eq!(read(&b, "Footage/other.txt"), b"other");
+    a.fs_mut().remove_file(&path("Clips/c0.mov")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.held_deletes.is_empty(), "{report:?}");
+    assert!(report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&a), files(&b));
+}
+
+/// While a delete is held behind a link, another machine moves the held file out of its folder on the server. The
+/// hold is by node, so it follows: the moved file isn't deleted on the server (the folder it left is).
+#[tokio::test]
+async fn a_server_move_of_the_held_node_doesnt_release_its_hold() {
+    let (_server, mut a, mut b) = held_setup().await;
+    b.fs_mut().rename(&path("Footage/c0.mov"), &path("c0-moved.mov")).unwrap();
+    b.sync_once().await.unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("c0-moved.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("c0-moved.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "c0-moved.mov"), b"clip", "the desktop keeps what its user moved");
+    }
+}
+
+/// Seed 95497 (fix round 5): while a delete is held behind a link, another machine moves the held file onto a name
+/// where this machine has a file of its own (one an app is still writing, so it hasn't gone up). Since fix round 6 a
+/// server move onto a file of this machine's own moves that file aside and lands the node, so here the move waits
+/// for the file to settle, and the hold stays where the node was; when the user then moves the file away, the move
+/// is taken (the node is still missing here), and the node behind the link isn't deleted on the server.
+#[tokio::test]
+async fn a_held_node_moved_onto_a_file_of_this_machine_keeps_its_hold() {
+    let (_server, mut a, mut b) = held_setup().await;
+    write(&mut a, "c0-moved.mov", b"mine, still being written");
+    a.fs_mut().set_changing(&path("c0-moved.mov"), true);
+    b.fs_mut().rename(&path("Footage/c0.mov"), &path("c0-moved.mov")).unwrap();
+    b.sync_once().await.unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(still_changing(&report, "c0-moved.mov"), "{report:?}");
+    assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+    assert_eq!(read(&a, "c0-moved.mov"), b"mine, still being written");
+    a.fs_mut().rename(&path("c0-moved.mov"), &path("mine.mov")).unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("c0-moved.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("c0-moved.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "c0-moved.mov"), b"clip", "the desktop keeps what its user moved");
+    }
+}
+
+/// The seed-95497 rule, reached through a folder: while a delete is held behind a link, another machine renames the
+/// held file's folder onto a name where this machine has a folder of its own holding a file under the held file's
+/// name. The pull takes that folder for the moved one (folders hold no content of their own), so the file is at the
+/// held node's place; it isn't the node (another local ID, other content), so the hold stays, the file waits, and
+/// when the user moves it away the node behind the link still isn't deleted on the server.
+#[tokio::test]
+async fn a_held_nodes_folder_moved_onto_a_folder_of_this_machine_keeps_its_hold() {
+    let (_server, mut a, mut b) = held_setup().await;
+    a.fs_mut().mkdir(&path("F2")).unwrap();
+    write(&mut a, "F2/c0.mov", b"mine");
+    b.fs_mut().rename(&path("Footage"), &path("F2")).unwrap();
+    b.sync_once().await.unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.held_deletes, vec![(path("F2/c0.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+    assert!(!report.uploaded.contains(&path("F2/c0.mov")), "{report:?}");
+    a.fs_mut().rename(&path("F2/c0.mov"), &path("mine.mov")).unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("F2/c0.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("F2/c0.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "F2/c0.mov"), b"clip", "the desktop keeps it");
+    }
+    assert_eq!(read(&b, "mine.mov"), b"mine");
+}
+
+/// While a delete is held behind a link, another machine renames the link's folder. This machine's pull moves the
+/// folder (with the link) here: the link now stands at a path the last finished push saw no link at, under the same
+/// name, so the hold follows it there and the node behind the link isn't deleted on the server.
+#[tokio::test]
+async fn a_server_rename_of_the_links_folder_keeps_the_hold() {
+    let (_server, mut a, mut b) = held_setup().await;
+    b.fs_mut().rename(&path("Clips"), &path("Clips3")).unwrap();
+    b.sync_once().await.unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Clips3/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+    assert_eq!(a.fs().stat(&path("Clips3/c0.mov")).unwrap(), Some(craft_cloud_sync::FsKind::Other));
+}
+
+/// While a delete is held behind a link, the user makes a new folder at the node's old place (a pass sees it), then
+/// puts the link's folder back from another drive under a new name. Nothing stands where the hold saw its link, but
+/// a link with its name stands at a path the last finished push saw no link at: the hold moves there, and the node
+/// behind it isn't deleted on the server.
+#[tokio::test]
+async fn a_links_folder_put_back_under_a_new_name_keeps_the_hold() {
+    let (_server, mut a, mut b) = held_setup().await;
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    write(&mut a, "Footage/new.txt", b"new");
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+    a.sync_once().await.unwrap();
+    for f in ["Clips/c0.mov", "Clips/c1.mov", "Clips/c2.mov"] {
+        a.fs_mut().remove_file(&path(f)).unwrap();
+    }
+    a.fs_mut().remove_dir(&path("Clips")).unwrap();
+    a.fs_mut().mkdir(&path("Clips2")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Clips2/c{i}.mov"), b"clip");
+    }
+    a.fs_mut().make_link(&path("Clips2/c0.mov")).unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Clips2/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+    // The user removes the link: the node is judged afresh, and its delete goes.
+    a.fs_mut().remove_file(&path("Clips2/c0.mov")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.held_deletes.is_empty(), "{report:?}");
+    assert!(report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+}
+
+/// The same with a hold an older agent saved: its record loads as the link's path alone (the agent's
+/// `a_held_delete_saved_by_an_older_agent_is_kept` covers the formats), and its state has no record of the links
+/// the last finished push saw, so every link counts as new. The hold still finds the link in the renamed folder.
+#[tokio::test]
+async fn a_server_rename_of_the_links_folder_keeps_a_hold_an_older_agent_saved() {
+    let (_server, a, mut b) = held_setup().await;
+    let mut state = a.state().clone();
+    for link in state.held_deletes.values_mut() {
+        *link = craft_cloud_sync::HeldLink::at(link.first().unwrap().clone());
+    }
+    state.known_links.clear();
+    let mut a = common::restart(&a, state, |_| {});
+    b.fs_mut().rename(&path("Clips"), &path("Clips3")).unwrap();
+    b.sync_once().await.unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Clips3/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+}
+
+/// The same when this machine dies right after the pull renamed the link's folder, before any state that records
+/// the rename is saved (here: the pass runs, and the machine restarts from the state saved before it). The restarted
+/// engine finds the folder already at its new place, so it never renames anything: the hold finds its link by name at
+/// the new path, which no finished push saw.
+#[tokio::test]
+async fn a_server_rename_of_the_links_folder_lost_in_a_crash_keeps_the_hold() {
+    let (_server, mut a, mut b) = held_setup().await;
+    b.fs_mut().rename(&path("Clips"), &path("Clips3")).unwrap();
+    b.sync_once().await.unwrap();
+    let state = a.state().clone();
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.moved_locally, vec![(path("Clips"), path("Clips3"))], "{report:?}");
+    let mut a = common::restart(&a, state, |_| {});
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Clips3/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+}
+
+/// The same when this machine's engine moves the link's folder aside: another machine deleted it and made a new
+/// folder under its name, so the new folder's place is cleared here first (the old one holds the link, so it isn't
+/// removed). The hold follows the folder.
+#[tokio::test]
+async fn a_links_folder_moved_aside_keeps_the_hold() {
+    let (_server, mut a, mut b) = held_setup().await;
+    b.fs_mut().remove_file(&path("Clips/c1.mov")).unwrap();
+    b.fs_mut().remove_file(&path("Clips/c2.mov")).unwrap();
+    b.fs_mut().remove_dir(&path("Clips")).unwrap();
+    b.sync_once().await.unwrap();
+    b.fs_mut().mkdir(&path("Clips")).unwrap();
+    write(&mut b, "Clips/new.txt", b"new");
+    b.sync_once().await.unwrap();
+    let mut aside = Vec::new();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        aside.extend(report.conflict_copies.iter().cloned());
+        assert!(!report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+        let [(node, links)] = report.held_deletes.as_slice() else { panic!("one hold: {report:?}") };
+        let [link] = links.as_slice() else { panic!("one link: {report:?}") };
+        assert_eq!(node, &path("Footage/c0.mov"));
+        assert_eq!(a.fs().stat(link).unwrap(), Some(craft_cloud_sync::FsKind::Other), "{report:?}");
+        assert!(link.names()[0].as_str().starts_with("Clips (conflict"), "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert!(aside[0].names()[0].as_str().starts_with("Clips (conflict"), "{aside:?}");
+}
+
+/// A held node that turns up here again (another machine edited it, and it was downloaded into a folder made again
+/// for it) is no longer held: the link has been shown not to be it. A later real delete of the file goes.
+#[tokio::test]
+async fn a_held_node_found_again_is_released() {
+    let (_server, mut a, mut b) = held_setup().await;
+    write(&mut b, "Footage/c0.mov", b"edited on desktop");
+    b.sync_once().await.unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(read(&a, "Footage/c0.mov"), b"edited on desktop");
+    assert!(report.held_deletes.is_empty(), "{report:?}");
+    assert!(a.state().held_deletes.is_empty(), "{:?}", a.state().held_deletes);
+    write(&mut a, "Footage/c0.mov", b"edited on laptop");
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.uploaded, vec![path("Footage/c0.mov")], "{report:?}");
+    a.fs_mut().remove_file(&path("Footage/c0.mov")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.held_deletes.is_empty(), "{report:?}");
+    assert!(report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+    b.sync_once().await.unwrap();
+    assert!(b.fs().read(&path("Footage/c0.mov")).is_err(), "the user's delete reached the desktop");
+    assert_eq!(a.fs().stat(&path("Clips/c0.mov")).unwrap(), Some(craft_cloud_sync::FsKind::Other), "the link is untouched");
+}
+
+/// Renaming the link itself (not a folder above it) counts as removing it: the node is judged afresh, and being
+/// missing, it is deleted on the server (history keeps it), as for a tracked file that became a link at its place.
+#[tokio::test]
+async fn renaming_the_link_itself_releases_its_hold() {
+    let (_server, mut a, mut b) = held_setup().await;
+    a.fs_mut().rename(&path("Clips/c0.mov"), &path("Clips/c0-renamed.mov")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.held_deletes.is_empty(), "{report:?}");
+    assert!(report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+    b.sync_once().await.unwrap();
+    assert!(b.fs().read(&path("Footage/c0.mov")).is_err());
+}
+
+/// A held node put back at its place by the user (its folder made again, the file copied back in) is found again
+/// too: the hold goes, and nothing is deleted.
+#[tokio::test]
+async fn a_held_node_put_back_is_released() {
+    let (_server, mut a, mut b) = held_setup().await;
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    write(&mut a, "Footage/c0.mov", b"clip");
+    let report = a.sync_once().await.unwrap();
+    assert!(report.held_deletes.is_empty() && report.removed_remotely.is_empty(), "{report:?}");
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "Footage/c0.mov"), b"clip");
+}
+
+/// Review 7, finding 1: two new links carry the node's name in the same window (seed 112337's gesture, plus an
+/// unrelated `A/c0.mov` moved to another drive). The hold keeps both: once a finished push has seen them, removing
+/// the unrelated one leaves the hold on the real one, and the node isn't deleted while `Clips/c0.mov` stands. It ends
+/// when none of them is left.
+#[tokio::test]
+async fn a_hold_keeps_every_candidate_link_while_any_stands() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().mkdir(&path("A")).unwrap();
+    write(&mut a, "A/c0.mov", b"another clip");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Footage/c{i}.mov"), b"clip");
+    }
+    a.fs_mut().make_link(&path("Footage/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    // Same window: the user also moves A/c0.mov to the other drive, leaving a link.
+    a.fs_mut().make_link(&path("A/c0.mov")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    // The report names every link (review 8, finding 1): the user decides on all of them, not on the first.
+    assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("A/c0.mov"), path("Clips/c0.mov")])], "{report:?}");
+    b.sync_once().await.unwrap();
+    // Later the user removes the unrelated link: the real one still stands.
+    a.fs_mut().remove_file(&path("A/c0.mov")).unwrap();
+    for _ in 0..2 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("Footage/c0.mov")), "deleted while Clips/c0.mov stands: {report:?}");
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Clips/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+    // The last candidate goes: the node is judged afresh and, being missing, deleted (history keeps it).
+    a.fs_mut().remove_file(&path("Clips/c0.mov")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.held_deletes.is_empty(), "{report:?}");
+    assert!(report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+}
+
+/// Review 7, finding 2: a wrong hold behind a new permanent link. In one window the user moves `ProjectA/Renders`
+/// to another drive (a link that stays) and really deletes `ProjectB/Renders/old.exr`; the delete is held, because
+/// "Renders" is a folder on its path. It stays held on every pass, also after approving everything the guard holds
+/// back (that names no hold). An approval that names the held node lets its delete go; nothing else is deleted.
+#[tokio::test]
+async fn an_approval_naming_a_held_delete_lets_it_go() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    for d in ["ProjectA", "ProjectA/Renders", "ProjectB", "ProjectB/Renders"] {
+        a.fs_mut().mkdir(&path(d)).unwrap();
+    }
+    write(&mut a, "ProjectA/Renders/r.exr", b"r");
+    write(&mut a, "ProjectB/Renders/old.exr", b"old");
+    write(&mut a, "ProjectB/Renders/keep.exr", b"keep");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().make_link(&path("ProjectA/Renders")).unwrap();
+    a.fs_mut().remove_file(&path("ProjectB/Renders/old.exr")).unwrap();
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        a.approve_deletes();
+        let report = a.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty(), "{report:?}");
+        assert_eq!(report.held_deletes, vec![(path("ProjectB/Renders/old.exr"), vec![path("ProjectA/Renders")])], "{report:?}");
+        assert_eq!(report.held_nodes.len(), 1, "{report:?}");
+        held = report.held_nodes.clone();
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "ProjectB/Renders/old.exr"), b"old");
+    }
+    // An approval naming another node releases nothing.
+    a.approve_deletes_of([craft_cloud_proto::NodeId::generate()]);
+    let report = a.sync_once().await.unwrap();
+    assert!(report.removed_remotely.is_empty() && report.held_nodes == held, "{report:?}");
+    a.approve_deletes_of(held.clone());
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.removed_remotely, vec![path("ProjectB/Renders/old.exr")], "{report:?}");
+    assert_eq!(report.removed_nodes, held, "{report:?}");
+    assert!(report.held_deletes.is_empty() && a.state().held_deletes.is_empty(), "{report:?}");
+    b.sync_once().await.unwrap();
+    assert!(b.fs().read(&path("ProjectB/Renders/old.exr")).is_err(), "the user's delete reached the desktop");
+    assert_eq!(read(&b, "ProjectB/Renders/keep.exr"), b"keep");
+    assert_eq!(read(&b, "ProjectA/Renders/r.exr"), b"r", "the link's folder isn't deleted");
+    assert_eq!(a.fs().stat(&path("ProjectA/Renders")).unwrap(), Some(craft_cloud_sync::FsKind::Other), "the link is untouched");
+    let report = a.sync_once().await.unwrap();
+    assert!(report.removed_remotely.is_empty() && report.held_deletes.is_empty(), "{report:?}");
+}
+
+/// Known gap (review 7, finding 5), pinned: a link a finished push saw while the node was still behind another link
+/// is known, so it holds nothing later. `Footage` is a link; the user copies the folder back as `Clips` while that
+/// link stands and makes `Clips/c0.mov` a link; a pass runs (the tracked `Footage/*` is hidden, so nothing is
+/// missing, and `Clips/c0.mov` becomes known). Removing the old `Footage` link then deletes `Footage/c0.mov` on the
+/// server while `Clips/c0.mov` stands (history keeps it). If this starts holding the delete, the gap is closed:
+/// update Known gaps.
+#[tokio::test]
+async fn known_gap_a_link_seen_while_the_node_was_behind_another_link_holds_nothing() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().make_link(&path("Footage")).unwrap();
+    a.sync_once().await.unwrap();
+    a.fs_mut().mkdir(&path("Clips")).unwrap();
+    for i in 0..3 {
+        write(&mut a, &format!("Clips/c{i}.mov"), b"clip");
+    }
+    a.fs_mut().make_link(&path("Clips/c0.mov")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.removed_remotely.is_empty() && report.held_deletes.is_empty(), "{report:?}");
+    a.fs_mut().remove_file(&path("Footage")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.held_deletes.is_empty(), "{report:?}");
+    assert!(report.removed_remotely.contains(&path("Footage/c0.mov")), "{report:?}");
+    b.sync_once().await.unwrap();
+    assert!(b.fs().read(&path("Footage/c0.mov")).is_err(), "{:?}", files(&b));
+}
+
+/// Known gap (review 7, finding 3), pinned: for a node that isn't held, a file of this machine's own still being
+/// written at the place another machine moved the node to doesn't make the delete wait. The laptop deletes
+/// `notes.txt` and is still writing its own `report.txt`; the desktop renames `notes.txt` to `report.txt`. The
+/// server move waits (the file is never moved aside while it changes), but the push still sends the laptop's delete:
+/// the delete wins, as when the target is free. Nothing is lost (history keeps the desktop's version). Once the file
+/// settles it goes up as a new file. Which of the delete and the move should win here is a follow-up (one rule for
+/// both the occupied and the free target).
+#[tokio::test]
+async fn known_gap_a_server_move_onto_a_file_still_being_written_loses_to_the_delete() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().remove_file(&path("notes.txt")).unwrap();
+    write(&mut a, "report.txt", b"mine, still being written");
+    a.fs_mut().set_changing(&path("report.txt"), true);
+    b.fs_mut().rename(&path("notes.txt"), &path("report.txt")).unwrap();
+    b.sync_once().await.unwrap();
+    let report = a.sync_once().await.unwrap();
+    // The base stays where this machine had it (the move waited), so the delete is listed there.
+    assert_eq!(report.removed_remotely, vec![path("notes.txt")], "{report:?}");
+    assert!(still_changing(&report, "report.txt"), "{report:?}");
+    a.fs_mut().set_changing(&path("report.txt"), false);
+    settle(&mut [&mut a, &mut b], 6).await;
+    for m in [&a, &b] {
+        assert_eq!(read(m, "report.txt"), b"mine, still being written");
+        assert!(conflict_copies(m).is_empty(), "{:?}", files(m));
+        assert!(m.fs().read(&path("notes.txt")).is_err());
+    }
+}
+
+/// The same with a link of this machine's own at the place (one with another name, so it holds nothing): the server
+/// move waits, and the push still sends the delete.
+#[tokio::test]
+async fn known_gap_a_server_move_onto_a_link_loses_to_the_delete() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().remove_file(&path("notes.txt")).unwrap();
+    a.fs_mut().make_link(&path("report.txt")).unwrap();
+    b.fs_mut().rename(&path("notes.txt"), &path("report.txt")).unwrap();
+    b.sync_once().await.unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.removed_remotely, vec![path("notes.txt")], "{report:?}");
+    b.sync_once().await.unwrap();
+    assert!(b.fs().read(&path("report.txt")).is_err() && b.fs().read(&path("notes.txt")).is_err(), "{:?}", files(&b));
+    assert_eq!(a.fs().stat(&path("report.txt")).unwrap(), Some(craft_cloud_sync::FsKind::Other), "the link is untouched");
+    assert!(conflict_copies(&a).is_empty(), "{:?}", files(&a));
+}
+
+/// Known gap (review 7, finding 4), pinned: a server rename of a folder this machine deleted, onto a folder of its
+/// own, makes that folder the moved one, and a file of its own in it under a tracked file's name goes up as that
+/// file's next version (no conflict copy; history keeps the desktop's clip). The laptop deletes `Footage` and makes
+/// its own `F2/c0.mov`; the desktop renames `Footage` to `F2`.
+#[tokio::test]
+async fn known_gap_a_server_folder_rename_onto_an_own_folder_takes_its_file_as_the_next_version() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    for i in 0..3 {
+        a.fs_mut().remove_file(&path(&format!("Footage/c{i}.mov"))).unwrap();
+    }
+    a.fs_mut().remove_dir(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("F2")).unwrap();
+    write(&mut a, "F2/c0.mov", b"mine");
+    b.fs_mut().rename(&path("Footage"), &path("F2")).unwrap();
+    b.sync_once().await.unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.uploaded.contains(&path("F2/c0.mov")) && report.conflict_copies.is_empty(), "{report:?}");
+    settle(&mut [&mut a, &mut b], 6).await;
+    for m in [&a, &b] {
+        assert_eq!(read(m, "F2/c0.mov"), b"mine");
+        assert!(conflict_copies(m).is_empty(), "{:?}", files(m));
+    }
+}
+
+/// Finding 1's other road: the hold sits on the real link, the user renames its folder, and in the same window an
+/// unrelated link with the same name appears at a smaller path. The hold follows to both, so removing the unrelated
+/// one later doesn't end it.
+#[tokio::test]
+async fn a_hold_follows_to_every_link_with_its_name() {
+    let (_server, mut a, mut b) = held_setup().await;
+    a.fs_mut().mkdir(&path("B")).unwrap();
+    a.fs_mut().make_link(&path("B/c0.mov")).unwrap();
+    a.fs_mut().rename(&path("Clips"), &path("Clips2")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("B/c0.mov"), path("Clips2/c0.mov")])], "{report:?}");
+    b.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("B/c0.mov")).unwrap();
+    for _ in 0..2 {
+        let report = a.sync_once().await.unwrap();
+        assert!(!report.removed_remotely.contains(&path("Footage/c0.mov")), "deleted while Clips2/c0.mov stands: {report:?}");
+        assert_eq!(report.held_deletes, vec![(path("Footage/c0.mov"), vec![path("Clips2/c0.mov")])], "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/c0.mov"), b"clip", "the desktop keeps it");
+    }
+}
+
+/// A real delete of a folder while a link with the same name as a file in it sits in another tracked folder: the
+/// link was there at the last finished push, so it can't be the folder's file moved with it, and the delete goes.
+#[tokio::test]
+async fn a_same_named_link_in_a_tracked_folder_doesnt_hold_a_delete() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().mkdir(&path("Other")).unwrap();
+    write(&mut a, "Other/keep.txt", b"keep");
+    a.fs_mut().make_link(&path("Other/c0.mov")).unwrap();
+    settle(&mut [&mut a, &mut b], 5).await;
+    for i in 0..3 {
+        a.fs_mut().remove_file(&path(&format!("Footage/c{i}.mov"))).unwrap();
+    }
+    a.fs_mut().remove_dir(&path("Footage")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.held_deletes.is_empty(), "{report:?}");
+    assert!(report.removed_remotely.contains(&path("Footage/c0.mov")) && report.removed_remotely.contains(&path("Footage")), "{report:?}");
+    b.sync_once().await.unwrap();
+    assert!(!files(&b).iter().any(|(p, _)| p.starts_with("Footage")), "{:?}", files(&b));
+}
+
+/// A new folder ID the start of a pass can't take (here a renamed folder holding a link keeps its ID, and a new
+/// folder took its old name) costs one look, not a second full scan on every pass until it is resolved.
+#[tokio::test]
+async fn a_declined_folder_id_doesnt_cost_a_scan_every_pass() {
+    let (_server, mut a, mut b) = linked_setup().await;
+    a.fs_mut().rename(&path("Footage"), &path("Clips")).unwrap();
+    a.fs_mut().make_link(&path("Clips/c0.mov")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    for _ in 0..3 {
+        a.sync_once().await.unwrap();
+    }
+    b.sync_once().await.unwrap();
+    let per_pass = |m: &common::Machine| m.fs().root_lists();
+    let (a0, b0) = (per_pass(&a), per_pass(&b));
+    let report = a.sync_once().await.unwrap();
+    assert!(report.removed_remotely.is_empty(), "{report:?}");
+    b.sync_once().await.unwrap();
+    assert_eq!(per_pass(&a) - a0, per_pass(&b) - b0, "a pass here lists the folder as often as on a machine with nothing to learn");
+}
+
 /// Two machines with a folder of three clips, a notes file and padding (so the mass-delete guard doesn't hide a
 /// wrong delete).
 async fn linked_setup() -> (Server, common::Machine, common::Machine) {
@@ -1663,4 +2583,197 @@ async fn a_folder_made_again_under_a_tracked_name_takes_its_new_id() {
     assert!(report.removed_remotely.is_empty(), "{report:?}");
     settle(&mut [&mut a, &mut b], 5).await;
     assert_eq!(b.fs().dirs(), vec![path("old"), path("renamed")]);
+}
+
+fn still_changing(report: &craft_cloud_sync::Report, p: &str) -> bool {
+    report.skipped.iter().any(|(at, why)| at == p && why.starts_with(craft_cloud_sync::STILL_CHANGING))
+}
+
+/// A new file and an edit an app is still writing wait ("still changing"): nothing goes up, nothing is deleted on
+/// the server, and once they settle they sync like any other change.
+#[tokio::test]
+async fn files_still_being_written_wait_until_they_settle() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "edit.txt", b"one");
+    settle(&mut [&mut a, &mut b], 5).await;
+    write(&mut a, "edit.txt", b"two, half written");
+    write(&mut a, "render.mov", b"frame 1");
+    a.fs_mut().set_changing(&path("edit.txt"), true);
+    a.fs_mut().set_changing(&path("render.mov"), true);
+    for _ in 0..2 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.uploaded.is_empty() && report.removed_remotely.is_empty(), "{report:?}");
+        assert!(still_changing(&report, "edit.txt") && still_changing(&report, "render.mov"), "{report:?}");
+    }
+    b.sync_once().await.unwrap();
+    assert_eq!(files(&b), vec![("edit.txt".to_owned(), b"one".to_vec())]);
+    a.fs_mut().set_changing(&path("edit.txt"), false);
+    a.fs_mut().set_changing(&path("render.mov"), false);
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.uploaded.len(), 2, "{report:?}");
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&a), files(&b));
+}
+
+/// A file edited here that an app is still writing is neither moved aside as a conflict copy nor replaced when the
+/// server has a new version: it waits, and the conflict is handled as usual once it settles.
+#[tokio::test]
+async fn a_server_edit_waits_for_a_file_still_being_written() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "doc.txt", b"base");
+    write(&mut a, "new.txt", b"mine, half written");
+    a.fs_mut().set_changing(&path("new.txt"), true);
+    settle(&mut [&mut b], 1).await;
+    a.sync_once().await.unwrap();
+    b.sync_once().await.unwrap();
+    write(&mut b, "doc.txt", b"from desktop");
+    write(&mut b, "new.txt", b"theirs");
+    b.sync_once().await.unwrap();
+    write(&mut a, "doc.txt", b"from laptop, half written");
+    a.fs_mut().set_changing(&path("doc.txt"), true);
+    let report = a.sync_once().await.unwrap();
+    assert!(report.conflict_copies.is_empty() && report.downloaded.is_empty(), "{report:?}");
+    assert!(still_changing(&report, "doc.txt") && still_changing(&report, "new.txt"), "{report:?}");
+    assert_eq!(read(&a, "doc.txt"), b"from laptop, half written");
+    assert_eq!(read(&a, "new.txt"), b"mine, half written");
+    a.fs_mut().set_changing(&path("doc.txt"), false);
+    a.fs_mut().set_changing(&path("new.txt"), false);
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&a), files(&b));
+    assert_eq!(read(&a, "doc.txt"), b"from desktop");
+    assert_eq!(conflict_copies(&a).len(), 2, "{:?}", files(&a));
+}
+
+/// A newcomer from the server whose place holds a file an app is still writing, as a case twin or where its folder
+/// must go, waits before anything is made or moved aside (seed 44450: the newcomer was skipped only after its folders
+/// were made and its case twin moved aside). Once the file settles, the usual conflict handling runs.
+#[tokio::test]
+async fn a_newcomer_waits_before_moving_aside_a_file_still_being_written() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "A.TXT", b"mine, half written");
+    write(&mut a, "d", b"a file named like a folder, half written");
+    a.fs_mut().set_changing(&path("A.TXT"), true);
+    a.fs_mut().set_changing(&path("d"), true);
+    write(&mut b, "a.txt", b"theirs");
+    b.fs_mut().mkdir(&path("d")).unwrap();
+    write(&mut b, "d/x.txt", b"inside");
+    b.sync_once().await.unwrap();
+    for _ in 0..2 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.conflict_copies.is_empty() && report.created_dirs.is_empty() && report.downloaded.is_empty(), "{report:?}");
+        assert!(still_changing(&report, "A.TXT") && still_changing(&report, "d"), "{report:?}");
+        assert_eq!(read(&a, "A.TXT"), b"mine, half written");
+        assert_eq!(read(&a, "d"), b"a file named like a folder, half written");
+    }
+    a.fs_mut().set_changing(&path("A.TXT"), false);
+    a.fs_mut().set_changing(&path("d"), false);
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&a), files(&b));
+    assert_eq!(read(&a, "d/x.txt"), b"inside");
+}
+
+/// A server move (a rename on the desktop) onto a name whose case twin here is untracked and still being written
+/// waits, before its first step: the twin is neither moved aside nor touched (the check in `settle_occupants`). Once
+/// it settles, the move applies, and the twin is kept as a conflict copy.
+#[tokio::test]
+async fn a_server_move_waits_for_a_case_twin_still_being_written() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "a.txt", b"shared");
+    settle(&mut [&mut a, &mut b], 5).await;
+    write(&mut a, "B.TXT", b"mine, half written");
+    a.fs_mut().set_changing(&path("B.TXT"), true);
+    b.fs_mut().rename(&path("a.txt"), &path("b.txt")).unwrap();
+    b.sync_once().await.unwrap();
+    for _ in 0..2 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.conflict_copies.is_empty() && report.moved_locally.is_empty(), "{report:?}");
+        assert!(still_changing(&report, "B.TXT"), "{report:?}");
+        assert_eq!(read(&a, "B.TXT"), b"mine, half written");
+        assert_eq!(read(&a, "a.txt"), b"shared");
+    }
+    a.fs_mut().set_changing(&path("B.TXT"), false);
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(read(&a, "b.txt"), b"shared");
+    assert!(files(&a).iter().any(|(p, d)| p.contains("(conflict") && d == b"mine, half written"), "{:?}", files(&a));
+    assert_eq!(files(&a), files(&b));
+}
+
+/// A file renamed and edited here that an app is still writing, found by its local ID when the server has a new
+/// version of it, waits: it is neither moved aside as a conflict copy nor replaced. Once it settles, both versions
+/// are kept as usual.
+#[tokio::test]
+async fn a_moved_file_still_being_written_waits_for_a_server_edit() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("d")).unwrap();
+    write(&mut a, "d/doc.txt", b"base");
+    settle(&mut [&mut a, &mut b], 5).await;
+    write(&mut b, "d/doc.txt", b"from desktop");
+    b.sync_once().await.unwrap();
+    // The folder is found by its local ID, and the file through it.
+    a.fs_mut().rename(&path("d"), &path("e")).unwrap();
+    write(&mut a, "e/doc.txt", b"from laptop, half written");
+    a.fs_mut().set_changing(&path("e/doc.txt"), true);
+    for _ in 0..2 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.conflict_copies.is_empty() && report.downloaded.is_empty(), "{report:?}");
+        assert!(still_changing(&report, "e/doc.txt"), "{report:?}");
+        assert_eq!(read(&a, "e/doc.txt"), b"from laptop, half written");
+    }
+    a.fs_mut().set_changing(&path("e/doc.txt"), false);
+    settle(&mut [&mut a, &mut b], 5).await;
+    assert_eq!(files(&a), files(&b));
+    let contents: Vec<Vec<u8>> = files(&a).into_iter().map(|(_, d)| d).collect();
+    assert!(contents.contains(&b"from desktop".to_vec()) && contents.contains(&b"from laptop, half written".to_vec()), "{:?}", files(&a));
+}
+
+/// A delete the server refuses (the file was edited and moved there, and that change waits here behind a link) keeps
+/// the folder the file is tracked in: the folder's delete is dropped with it, so no node is left tracked under a
+/// folder the server no longer has (seed 44450).
+#[tokio::test]
+async fn a_refused_delete_keeps_its_folder() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("x")).unwrap();
+    a.fs_mut().mkdir(&path("f")).unwrap();
+    write(&mut a, "x/keep.txt", b"keep");
+    write(&mut a, "f/c.psd", b"layers");
+    for i in 0..20 {
+        write(&mut a, &format!("pad{i}.txt"), b"pad");
+    }
+    settle(&mut [&mut a, &mut b], 5).await;
+    write(&mut b, "f/c.psd", b"layers, edited");
+    b.sync_once().await.unwrap();
+    b.fs_mut().rename(&path("f/c.psd"), &path("x/c.psd")).unwrap();
+    let report = b.sync_once().await.unwrap();
+    assert_eq!(report.moved_remotely.len(), 1, "{report:?}");
+    a.fs_mut().make_link(&path("x")).unwrap();
+    a.fs_mut().remove_file(&path("f/c.psd")).unwrap();
+    a.fs_mut().remove_dir(&path("f")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    assert!(report.removed_remotely.is_empty(), "{report:?}");
+    let state = a.state();
+    for (id, entry) in &state.base {
+        if let Some(parent) = entry.parent {
+            assert!(state.base.contains_key(&parent), "{id} ({:?}) is tracked under a folder that isn't: {report:?}", entry.name);
+        }
+    }
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "x/c.psd"), b"layers, edited");
 }
