@@ -19,6 +19,11 @@
 //!   refused the request (HTTP <code>)": a reverse proxy in front of the server may be the one refusing).
 //! - **The device token** travels only in the `Authorization` header (marked sensitive) and never appears in
 //!   `Debug` output or error messages. Redirects are not followed, so it never goes anywhere else.
+//!
+//! The requests are built and the answers read here, over a [`Connection`] that only carries one request and its
+//! answer: [`Reqwest`] in the agent (the TLS, proxy, redirect, connect and read-timeout rules above are its own),
+//! a simulated network in the tests (`tests/network/`), which so runs this module's requests, error mapping,
+//! body caps and long-poll over partitions and lost answers ([`info_over`] and [`login_over`] too).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -32,8 +37,8 @@ use craft_cloud_proto::api::{
 use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_PAGE_NODES};
 use craft_cloud_proto::{ChangeSet, ChunkId, DeviceId, ManifestId, Op, PageCursor};
 use craft_cloud_sync::{Transport, TransportError};
-use reqwest::header::{AUTHORIZATION, HeaderValue};
-use reqwest::{Client, Method, RequestBuilder, Response, StatusCode, Url};
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT};
+use reqwest::{Client, Method, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -50,7 +55,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const BASE_TIMEOUT_SECS: u64 = 60;
 const SECS_PER_MIB: u64 = 15;
 /// What the agent sends as its User-Agent: generic, nothing about the user or the machine.
-const USER_AGENT: &str = concat!("Craft-Cloud/", env!("CARGO_PKG_VERSION"));
+const AGENT: &str = concat!("Craft-Cloud/", env!("CARGO_PKG_VERSION"));
 
 /// A device token. Its `Debug` output is redacted; it is written only to the owner-only account file.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,21 +157,102 @@ fn is_loopback(url: &Url) -> bool {
 /// `localhost` always means this machine: these addresses, whatever a resolver says (port 0: the URL's port).
 const LOCALHOST: [SocketAddr; 2] = [SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)];
 
-fn client(server: &ServerUrl) -> Result<Client, TransportError> {
-    // No proxy: `HTTP_PROXY`/`ALL_PROXY` would carry the plain-HTTP loopback requests (token, password) off the
-    // machine. Proxy support for HTTPS comes later, if asked for.
-    let mut builder = Client::builder().no_proxy();
-    if server.0.host_str() == Some("localhost") {
-        builder = builder.resolve_to_addrs("localhost", &LOCALHOST);
+/// One request as this module builds it, for a [`Connection`] to carry. Its `Debug` output names the method, the
+/// URL, the headers' names and the body's length, never a header's value or the body (a sign-in's body holds the
+/// password).
+#[derive(Clone)]
+pub struct Request {
+    /// The HTTP method.
+    pub method: Method,
+    /// The endpoint, with its query.
+    pub url: Url,
+    /// Every header the request carries (the token's is marked sensitive).
+    pub headers: HeaderMap,
+    /// The body (JSON or a chunk's or manifest's bytes), if the request has one.
+    pub body: Option<Bytes>,
+    /// The whole request, from connecting to the answer's last byte, must take no longer.
+    pub timeout: Duration,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("url", &self.url.as_str())
+            .field("headers", &self.headers.keys().map(|k| k.as_str()).collect::<Vec<_>>())
+            .field("body_bytes", &self.body.as_ref().map(Bytes::len))
+            .field("timeout", &self.timeout)
+            .finish()
     }
-    builder
-        .user_agent(USER_AGENT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .https_only(!server.is_loopback())
-        .build()
-        .map_err(|e| TransportError::Protocol(format!("can't set up HTTPS: {e}")))
+}
+
+/// An answer's status and headers; its body is read piece by piece, so it is capped before it is buffered.
+pub struct Answer {
+    /// The HTTP status.
+    pub status: StatusCode,
+    /// The answer's headers (`Content-Length`, `Retry-After`, the space's epoch).
+    pub headers: HeaderMap,
+    /// The body, as it arrives.
+    pub body: Box<dyn AnswerBody>,
+}
+
+/// The body of an [`Answer`], as it arrives.
+#[async_trait]
+pub trait AnswerBody: Send {
+    /// The next piece, or `None` after the last one. A connection that breaks or times out meanwhile is
+    /// `Unavailable`.
+    async fn next(&mut self) -> Result<Option<Bytes>, TransportError>;
+}
+
+/// Carries one [`Request`] to the server and brings its [`Answer`] back: everything below HTTP's meaning. A request
+/// that can't be sent, or whose answer doesn't come within its timeout, is `Unavailable`.
+#[async_trait]
+pub trait Connection: Send + Sync {
+    async fn send(&self, request: Request) -> Result<Answer, TransportError>;
+}
+
+/// The agent's [`Connection`]: reqwest, with the TLS, proxy, redirect and timeout rules in the module docs.
+#[derive(Debug, Clone)]
+pub struct Reqwest(Client);
+
+impl Reqwest {
+    pub fn new(server: &ServerUrl) -> Result<Self, TransportError> {
+        // No proxy: `HTTP_PROXY`/`ALL_PROXY` would carry the plain-HTTP loopback requests (token, password) off the
+        // machine. Proxy support for HTTPS comes later, if asked for.
+        let mut builder = Client::builder().no_proxy();
+        if server.0.host_str() == Some("localhost") {
+            builder = builder.resolve_to_addrs("localhost", &LOCALHOST);
+        }
+        let client = builder
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .https_only(!server.is_loopback())
+            .build()
+            .map_err(|e| TransportError::Protocol(format!("can't set up HTTPS: {e}")))?;
+        Ok(Self(client))
+    }
+}
+
+#[async_trait]
+impl Connection for Reqwest {
+    async fn send(&self, request: Request) -> Result<Answer, TransportError> {
+        let mut req = self.0.request(request.method, request.url).headers(request.headers).timeout(request.timeout);
+        if let Some(body) = request.body {
+            req = req.body(body);
+        }
+        let resp = req.send().await.map_err(network)?;
+        Ok(Answer { status: resp.status(), headers: resp.headers().clone(), body: Box::new(ReqwestBody(resp)) })
+    }
+}
+
+struct ReqwestBody(reqwest::Response);
+
+#[async_trait]
+impl AnswerBody for ReqwestBody {
+    async fn next(&mut self) -> Result<Option<Bytes>, TransportError> {
+        self.0.chunk().await.map_err(network)
+    }
 }
 
 /// The whole-request timeout for a body of up to `bytes` bytes either way.
@@ -180,6 +266,33 @@ fn network(e: reqwest::Error) -> TransportError {
     if e.is_decode() { TransportError::Protocol(format!("the answer couldn't be read: {e}")) } else { TransportError::Unavailable(e.to_string()) }
 }
 
+/// A request to `url` with the headers every request carries: the User-Agent and, when signed in, the token.
+fn request(method: Method, url: Url, auth: Option<&HeaderValue>, max_body: usize) -> Request {
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static(AGENT));
+    if let Some(auth) = auth {
+        headers.insert(AUTHORIZATION, auth.clone());
+    }
+    Request { method, url, headers, body: None, timeout: timeout_for(max_body) }
+}
+
+impl Request {
+    /// The request with `body` as its JSON body.
+    fn json<T: Serialize>(mut self, body: &T) -> Result<Self, TransportError> {
+        let bytes = serde_json::to_vec(body).map_err(|e| TransportError::Protocol(format!("the request can't be written: {e}")))?;
+        self.headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        self.body = Some(Bytes::from(bytes));
+        Ok(self)
+    }
+
+    /// The request with `data` as its binary body.
+    fn octets(mut self, data: Bytes) -> Self {
+        self.headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+        self.body = Some(data);
+        self
+    }
+}
+
 /// A server message cut to a sane length, without control characters.
 fn clean(message: &str) -> String {
     let mut out: String = message.chars().filter(|c| !c.is_control()).take(MAX_MESSAGE_CHARS).collect();
@@ -190,14 +303,14 @@ fn clean(message: &str) -> String {
 }
 
 /// Reads a body of at most `max` bytes; a longer one is a protocol error and is not buffered.
-async fn body_capped(mut resp: Response, max: usize) -> Result<Bytes, TransportError> {
+async fn body_capped(mut resp: Answer, max: usize) -> Result<Bytes, TransportError> {
     let too_long = || TransportError::Protocol(format!("the server's answer is over the limit of {max} bytes"));
-    let declared = resp.content_length();
+    let declared = resp.headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok());
     if declared.is_some_and(|len| len > max as u64) {
         return Err(too_long());
     }
     let mut buf = BytesMut::with_capacity(declared.map_or(0, |len| usize::try_from(len).unwrap_or(max).min(max)));
-    while let Some(piece) = resp.chunk().await.map_err(network)? {
+    while let Some(piece) = resp.body.next().await? {
         if buf.len().saturating_add(piece.len()) > max {
             return Err(too_long());
         }
@@ -230,8 +343,8 @@ fn error_for(status: StatusCode, body: Option<ErrorBody>) -> TransportError {
 }
 
 /// The answer if it succeeded, else its error.
-async fn checked(resp: Response) -> Result<Response, TransportError> {
-    let status = resp.status();
+async fn checked(resp: Answer) -> Result<Answer, TransportError> {
+    let status = resp.status;
     if status.is_success() {
         return Ok(resp);
     }
@@ -239,19 +352,20 @@ async fn checked(resp: Response) -> Result<Response, TransportError> {
     Err(error_for(status, body))
 }
 
-async fn json<T: DeserializeOwned>(resp: Response, max: usize) -> Result<T, TransportError> {
+async fn json<T: DeserializeOwned>(resp: Answer, max: usize) -> Result<T, TransportError> {
     let bytes = body_capped(checked(resp).await?, max).await?;
     serde_json::from_slice(&bytes).map_err(|e| TransportError::Protocol(format!("the server's answer doesn't parse: {e}")))
 }
 
-async fn send(req: RequestBuilder) -> Result<Response, TransportError> {
-    req.send().await.map_err(network)
-}
-
 /// What the server speaks. No sign-in needed.
 pub async fn info(server: &ServerUrl) -> Result<InfoResponse, TransportError> {
-    let req = client(server)?.get(server.endpoint("info")).timeout(timeout_for(0));
-    json(send(req).await?, MAX_SMALL_JSON_BYTES).await
+    info_over(&Reqwest::new(server)?, server).await
+}
+
+/// [`info`] over another connection (a simulated network, in tests).
+pub async fn info_over<C: Connection>(connection: &C, server: &ServerUrl) -> Result<InfoResponse, TransportError> {
+    let req = request(Method::GET, server.endpoint("info"), None, 0);
+    json(connection.send(req).await?, MAX_SMALL_JSON_BYTES).await
 }
 
 /// Checks that the server speaks a protocol version and chunker this agent does.
@@ -270,9 +384,20 @@ pub fn check_compatible(info: &InfoResponse) -> Result<(), TransportError> {
 
 /// Signs in and creates a device. `Unauthorized` means a wrong username or password.
 pub async fn login(server: &ServerUrl, username: &str, password: &str, device_name: &str) -> Result<LoginResponse, TransportError> {
+    login_over(&Reqwest::new(server)?, server, username, password, device_name).await
+}
+
+/// [`login`] over another connection (a simulated network, in tests).
+pub async fn login_over<C: Connection>(
+    connection: &C,
+    server: &ServerUrl,
+    username: &str,
+    password: &str,
+    device_name: &str,
+) -> Result<LoginResponse, TransportError> {
     let body = LoginRequest { username: username.to_owned(), password: password.to_owned(), device_name: device_name.to_owned() };
-    let req = client(server)?.post(server.endpoint("auth/login")).json(&body).timeout(timeout_for(0));
-    json(send(req).await?, MAX_SMALL_JSON_BYTES).await
+    let req = request(Method::POST, server.endpoint("auth/login"), None, 0).json(&body)?;
+    json(connection.send(req).await?, MAX_SMALL_JSON_BYTES).await
 }
 
 /// Longest `Retry-After` the long-poll honours; a bigger one is cut to this.
@@ -290,31 +415,42 @@ pub enum PollError {
     Failed(TransportError),
 }
 
-/// The server API for one signed-in device.
+/// The server API for one signed-in device, over a [`Connection`] (by default the agent's own, [`Reqwest`]).
 #[derive(Debug, Clone)]
-pub struct HttpTransport {
-    client: Client,
+pub struct HttpTransport<C = Reqwest> {
+    connection: C,
     server: ServerUrl,
     auth: HeaderValue,
 }
 
 impl HttpTransport {
     pub fn new(server: ServerUrl, token: &DeviceToken) -> Result<Self, TransportError> {
+        Self::over(Reqwest::new(&server)?, server, token)
+    }
+}
+
+impl<C: Connection> HttpTransport<C> {
+    /// The API over another connection (a simulated network, in tests). `server` names the endpoints.
+    pub fn over(connection: C, server: ServerUrl, token: &DeviceToken) -> Result<Self, TransportError> {
         let mut auth = HeaderValue::from_str(&format!("Bearer {}", token.0))
             .map_err(|_| TransportError::Protocol("the saved device token is damaged; sign in again".into()))?;
         auth.set_sensitive(true);
-        Ok(Self { client: client(&server)?, server, auth })
+        Ok(Self { connection, server, auth })
     }
 
     pub fn server(&self) -> &ServerUrl {
         &self.server
     }
 
-    fn request(&self, method: Method, path: &str, max_body: usize) -> RequestBuilder {
-        self.client.request(method, self.server.endpoint(path)).header(AUTHORIZATION, self.auth.clone()).timeout(timeout_for(max_body))
+    fn request(&self, method: Method, path: &str, max_body: usize) -> Request {
+        request(method, self.server.endpoint(path), Some(&self.auth), max_body)
     }
 
-    fn page_request(&self, path: &str, since: Option<u64>, after: Option<PageCursor>) -> RequestBuilder {
+    async fn send(&self, req: Request) -> Result<Answer, TransportError> {
+        self.connection.send(req).await
+    }
+
+    fn page_request(&self, path: &str, since: Option<u64>, after: Option<PageCursor>) -> Request {
         let mut url = self.server.endpoint(path);
         {
             let mut query = url.query_pairs_mut();
@@ -326,19 +462,19 @@ impl HttpTransport {
                 query.append_pair("after_node", &after.node.to_string());
             }
         }
-        self.client.get(url).header(AUTHORIZATION, self.auth.clone()).timeout(timeout_for(MAX_PAGE_JSON_BYTES))
+        request(Method::GET, url, Some(&self.auth), MAX_PAGE_JSON_BYTES)
     }
 
-    async fn page(&self, req: RequestBuilder) -> Result<ChangeSet, TransportError> {
-        let page: ChangeSet = json(send(req).await?, MAX_PAGE_JSON_BYTES).await?;
+    async fn page(&self, req: Request) -> Result<ChangeSet, TransportError> {
+        let page: ChangeSet = json(self.send(req).await?, MAX_PAGE_JSON_BYTES).await?;
         if page.nodes.len() > MAX_PAGE_NODES as usize {
             return Err(TransportError::Protocol(format!("a page of {} nodes is over the limit of {MAX_PAGE_NODES}", page.nodes.len())));
         }
         Ok(page)
     }
 
-    async fn no_content(&self, req: RequestBuilder) -> Result<(), TransportError> {
-        checked(send(req).await?).await?;
+    async fn no_content(&self, req: Request) -> Result<(), TransportError> {
+        checked(self.send(req).await?).await?;
         Ok(())
     }
 
@@ -349,12 +485,13 @@ impl HttpTransport {
         let mut url = self.server.endpoint("changes");
         url.query_pairs_mut().append_pair("since", &since.to_string()).append_pair("limit", "1").append_pair("wait", &wait.as_secs().to_string());
         // The server answers within `wait`; the whole-request cap leaves room for a slow answer on top.
-        let req = self.client.get(url).header(AUTHORIZATION, self.auth.clone()).timeout(wait.saturating_add(timeout_for(MAX_SMALL_JSON_BYTES)));
-        let resp = send(req).await.map_err(PollError::Failed)?;
-        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+        let mut req = request(Method::GET, url, Some(&self.auth), MAX_SMALL_JSON_BYTES);
+        req.timeout = wait.saturating_add(req.timeout);
+        let resp = self.send(req).await.map_err(PollError::Failed)?;
+        if resp.status == StatusCode::TOO_MANY_REQUESTS {
             let after = resp
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
+                .headers
+                .get(RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .map(|secs| Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS)));
@@ -374,9 +511,9 @@ impl HttpTransport {
 }
 
 #[async_trait]
-impl Transport for HttpTransport {
+impl<C: Connection> Transport for HttpTransport<C> {
     async fn space(&self) -> Result<SpaceResponse, TransportError> {
-        json(send(self.request(Method::GET, "space", 0)).await?, MAX_SMALL_JSON_BYTES).await
+        json(self.send(self.request(Method::GET, "space", 0)).await?, MAX_SMALL_JSON_BYTES).await
     }
 
     async fn tree(&self, after: Option<PageCursor>) -> Result<ChangeSet, TransportError> {
@@ -390,8 +527,8 @@ impl Transport for HttpTransport {
     async fn missing_chunks(&self, ids: &[ChunkId]) -> Result<Vec<ChunkId>, TransportError> {
         let mut missing = Vec::new();
         for batch in ids.chunks(MAX_MISSING_IDS) {
-            let req = self.request(Method::POST, "chunks/missing", MAX_SMALL_JSON_BYTES).json(&MissingRequest { ids: batch.to_vec() });
-            let answer: MissingResponse = json(send(req).await?, MAX_SMALL_JSON_BYTES).await?;
+            let req = self.request(Method::POST, "chunks/missing", MAX_SMALL_JSON_BYTES).json(&MissingRequest { ids: batch.to_vec() })?;
+            let answer: MissingResponse = json(self.send(req).await?, MAX_SMALL_JSON_BYTES).await?;
             if answer.missing.len() > batch.len() {
                 return Err(TransportError::Protocol("the server named more missing chunks than were asked about".into()));
             }
@@ -401,34 +538,28 @@ impl Transport for HttpTransport {
     }
 
     async fn put_chunk(&self, id: &ChunkId, data: Bytes) -> Result<(), TransportError> {
-        let req = self
-            .request(Method::PUT, &format!("chunks/{id}"), data.len())
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(data);
+        let req = self.request(Method::PUT, &format!("chunks/{id}"), data.len()).octets(data);
         self.no_content(req).await
     }
 
     async fn get_chunk(&self, id: &ChunkId) -> Result<Bytes, TransportError> {
-        let resp = checked(send(self.request(Method::GET, &format!("chunks/{id}"), MAX_CHUNK_BYTES as usize)).await?).await?;
+        let resp = checked(self.send(self.request(Method::GET, &format!("chunks/{id}"), MAX_CHUNK_BYTES as usize)).await?).await?;
         body_capped(resp, MAX_CHUNK_BYTES as usize).await
     }
 
     async fn put_manifest(&self, id: &ManifestId, data: Bytes) -> Result<(), TransportError> {
-        let req = self
-            .request(Method::PUT, &format!("manifests/{id}"), data.len())
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(data);
+        let req = self.request(Method::PUT, &format!("manifests/{id}"), data.len()).octets(data);
         self.no_content(req).await
     }
 
     async fn get_manifest(&self, id: &ManifestId) -> Result<Bytes, TransportError> {
-        let resp = checked(send(self.request(Method::GET, &format!("manifests/{id}"), MAX_MANIFEST_BYTES)).await?).await?;
+        let resp = checked(self.send(self.request(Method::GET, &format!("manifests/{id}"), MAX_MANIFEST_BYTES)).await?).await?;
         body_capped(resp, MAX_MANIFEST_BYTES).await
     }
 
     async fn commit(&self, ops: &[Op]) -> Result<CommitResponse, TransportError> {
-        let req = self.request(Method::POST, "commit", MAX_SMALL_JSON_BYTES).json(&CommitRequest { ops: ops.to_vec() });
-        json(send(req).await?, MAX_SMALL_JSON_BYTES).await
+        let req = self.request(Method::POST, "commit", MAX_SMALL_JSON_BYTES).json(&CommitRequest { ops: ops.to_vec() })?;
+        json(self.send(req).await?, MAX_SMALL_JSON_BYTES).await
     }
 }
 
@@ -476,6 +607,23 @@ mod tests {
         assert!(!format!("{token:?}").contains("secret"));
         let transport = HttpTransport::new(ServerUrl::parse("http://127.0.0.1:1").unwrap(), &token).unwrap();
         assert!(!format!("{transport:?}").contains("secret-token"));
+    }
+
+    /// Review finding 7: a request's `Debug` output (one `{:?}` in a log line or an error) never shows its body or a
+    /// header's value: a sign-in's body holds the password, the `Authorization` header the token.
+    #[test]
+    fn requests_keep_bodies_and_tokens_out_of_debug_output() {
+        let server = ServerUrl::parse("http://127.0.0.1:1").unwrap();
+        let body = LoginRequest { username: "ana".into(), password: "correct horse battery".into(), device_name: "laptop".into() };
+        let login = request(Method::POST, server.endpoint("auth/login"), None, 0).json(&body).unwrap();
+        let shown = format!("{login:?}");
+        assert!(!shown.contains("correct horse") && !shown.contains("ana"), "{shown}");
+        assert!(shown.contains("POST") && shown.contains("/api/v1/auth/login") && shown.contains("content-type"), "{shown}");
+        let token = DeviceToken::new("secret-token".into());
+        let transport = HttpTransport::new(server, &token).unwrap();
+        let signed_in = transport.request(Method::GET, "space", 0);
+        let shown = format!("{signed_in:?}");
+        assert!(!shown.contains("secret-token") && shown.contains("authorization"), "{shown}");
     }
 
     fn body(code: &str) -> ErrorBody {

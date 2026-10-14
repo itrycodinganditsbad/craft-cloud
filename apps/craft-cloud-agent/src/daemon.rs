@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::account::{Approval, DataDir, LastPass, LoopState, LoopStatus, PassSummary, STATUS_SCHEMA};
 use crate::cli::{AgentError, Exit, Session, hold_data, now_ms, print_summary};
-use crate::http::{HttpTransport, PollError};
+use crate::http::{Connection, HttpTransport, PollError};
 use crate::lock::Lock;
 use crate::schedule::{Ms, Next, PassEnd, Phase, Recheck, Scheduler, Timing};
 use crate::settle::Stability;
@@ -243,14 +243,30 @@ fn random() -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-/// The long-poll: waits for the server's change feed to move past what the passes read, and tells the loop. Errors
-/// back off exponentially (with jitter, from `poll_retry_first` up to `poll_retry_max`); a `429` waits for the
-/// server's `Retry-After`. After a change it polls on from the server's new position, so it never asks twice for
-/// the same change.
-async fn long_poll(transport: HttpTransport, mut since: watch::Receiver<Option<u64>>, events: mpsc::UnboundedSender<Event>, options: RunOptions) {
+/// What the long-poll tells the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Polled {
+    /// The server's change feed moved, or can't continue (a pass sorts it out).
+    Changed,
+    /// An answer came after failed polls: the server is back.
+    Back,
+}
+
+/// The long-poll: waits for the server's change feed to move past what the passes read (`since`, `None` until a
+/// first sync), and tells the loop (`tell`, which returns `false` once the loop is gone). Errors back off
+/// exponentially (with jitter from `random`, from `poll_retry_first` up to `poll_retry_max`); a `429` waits for the
+/// server's `Retry-After`. After a change it polls on from the server's new position, so it never asks twice for the
+/// same change. It keeps time on tokio's clock, so a simulated network's tests run it on simulated time.
+pub async fn long_poll<C: Connection>(
+    transport: HttpTransport<C>,
+    mut since: watch::Receiver<Option<u64>>,
+    tell: impl Fn(Polled) -> bool,
+    options: RunOptions,
+    mut random: impl FnMut() -> u64,
+) {
     let mut known: Option<u64> = None;
     let mut failures: u32 = 0;
-    let mut last_start: Option<Instant> = None;
+    let mut last_start: Option<tokio::time::Instant> = None;
     loop {
         // Never two polls closer together than the minimum spacing, whatever the server answers.
         if let Some(last) = last_start {
@@ -272,35 +288,35 @@ async fn long_poll(transport: HttpTransport, mut since: watch::Receiver<Option<u
                 continue;
             }
         };
-        last_start = Some(Instant::now());
+        last_start = Some(tokio::time::Instant::now());
         let pause = match transport.wait_for_changes(from, options.poll_wait).await {
             Ok(seq) => {
-                if failures > 0 && events.send(Event::ServerBack).is_err() {
+                if failures > 0 && !tell(Polled::Back) {
                     return;
                 }
                 failures = 0;
                 if seq != from {
                     known = Some(seq);
-                    if events.send(Event::Remote).is_err() {
+                    if !tell(Polled::Changed) {
                         return;
                     }
                 }
                 None
             }
             // Spread out, so agents the server turned away together don't all come back at once.
-            Err(PollError::Busy(after)) => Some(jittered(after.unwrap_or(options.poll_busy))),
+            Err(PollError::Busy(after)) => Some(jittered(after.unwrap_or(options.poll_busy), random())),
             Err(PollError::Resync) => {
                 // A pass reads the feed afresh; until it has, polling again would only get the same answer.
                 known = None;
-                if events.send(Event::Remote).is_err() {
+                if !tell(Polled::Changed) {
                     return;
                 }
                 failures = failures.saturating_add(1);
-                Some(poll_backoff(&options, failures))
+                Some(poll_backoff(&options, failures, random()))
             }
             Err(PollError::Failed(_)) => {
                 failures = failures.saturating_add(1);
-                Some(poll_backoff(&options, failures))
+                Some(poll_backoff(&options, failures, random()))
             }
         };
         if let Some(pause) = pause {
@@ -309,19 +325,19 @@ async fn long_poll(transport: HttpTransport, mut since: watch::Receiver<Option<u
     }
 }
 
-/// `delay` plus a random part of up to half of it.
-fn jittered(delay: Duration) -> Duration {
+/// `delay` plus a part of up to half of it, chosen by the random number `r`.
+fn jittered(delay: Duration, r: u64) -> Duration {
     let half = u64::try_from((delay / 2).as_nanos()).unwrap_or(u64::MAX);
-    delay.saturating_add(Duration::from_nanos(random() % half.saturating_add(1)))
+    delay.saturating_add(Duration::from_nanos(r % half.saturating_add(1)))
 }
 
 /// The delay after the `failures`-th failed long-poll in a row: doubled each time from `poll_retry_first`, capped at
-/// `poll_retry_max`, the second half of it random.
-fn poll_backoff(options: &RunOptions, failures: u32) -> Duration {
+/// `poll_retry_max`, the second half of it chosen by the random number `r`.
+fn poll_backoff(options: &RunOptions, failures: u32, r: u64) -> Duration {
     let first = options.poll_retry_first.max(Duration::from_millis(1));
     let full = first.saturating_mul(1u32.checked_shl(failures.saturating_sub(1).min(20)).unwrap_or(u32::MAX)).min(options.poll_retry_max);
     let half = full / 2;
-    let jitter = Duration::from_nanos(random() % u64::try_from(half.as_nanos()).unwrap_or(u64::MAX).saturating_add(1));
+    let jitter = Duration::from_nanos(r % u64::try_from(half.as_nanos()).unwrap_or(u64::MAX).saturating_add(1));
     full.saturating_sub(half).saturating_add(jitter)
 }
 
@@ -439,7 +455,16 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
     let since = data.load_state().ok().and_then(|saved| saved.state.space.map(|_| saved.state.seq));
     let (since_tx, since_rx) = watch::channel::<Option<u64>>(since);
     let transport = HttpTransport::new(account.server.clone(), &account.token)?;
-    let poll = tokio::spawn(long_poll(transport, since_rx, events_tx.clone(), options));
+    let polled = events_tx.clone();
+    let tell = move |p: Polled| {
+        polled
+            .send(match p {
+                Polled::Changed => Event::Remote,
+                Polled::Back => Event::ServerBack,
+            })
+            .is_ok()
+    };
+    let poll = tokio::spawn(long_poll(transport, since_rx, tell, options, random));
 
     let start = Instant::now();
     let mut status = Status {
@@ -940,17 +965,17 @@ mod tests {
     #[test]
     fn a_busy_server_is_waited_for_with_jitter() {
         for _ in 0..100 {
-            let delay = jittered(Duration::from_secs(10));
+            let delay = jittered(Duration::from_secs(10), random());
             assert!(delay >= Duration::from_secs(10) && delay <= Duration::from_secs(15), "{delay:?}");
         }
-        assert_eq!(jittered(Duration::ZERO), Duration::ZERO);
+        assert_eq!(jittered(Duration::ZERO, random()), Duration::ZERO);
     }
 
     #[test]
     fn the_long_poll_backs_off_up_to_its_cap() {
         let options = RunOptions::default();
         for failures in 1..30 {
-            let delay = poll_backoff(&options, failures);
+            let delay = poll_backoff(&options, failures, random());
             let full = Duration::from_secs(2).saturating_mul(1 << (failures - 1).min(20)).min(Duration::from_secs(300));
             assert!(delay >= full / 2 && delay <= full, "{failures}: {delay:?}");
         }

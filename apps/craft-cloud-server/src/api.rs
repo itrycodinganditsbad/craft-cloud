@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection};
@@ -24,7 +24,7 @@ use serde::Deserialize;
 use crate::auth::{new_token, require_device, verify_password};
 use crate::error::ApiError;
 use crate::ratelimit::{client_ip, ip_key};
-use crate::state::{AppState, now_ms};
+use crate::state::AppState;
 
 /// Chunker parameter sets the server accepts.
 pub const CHUNKER_PARAMS: &[&str] = &["fastcdc-v1"];
@@ -97,7 +97,8 @@ async fn login(
     if req.device_name.is_empty() || req.device_name.len() > 128 || req.device_name.chars().any(char::is_control) {
         return Err(ApiError::invalid("device names are 1-128 bytes without control characters"));
     }
-    let now = Instant::now();
+    // tokio's clock: the system's monotonic clock in the server, the simulated one in a simulation.
+    let now = tokio::time::Instant::now().into_std();
     let ip = client_ip(peer, &headers, &state.trusted_proxies);
     let username = req.username.to_ascii_lowercase();
     if !state.logins.allow(&ip_key(ip), LOGINS_PER_IP, now) || !state.logins.allow(&format!("user:{username}"), LOGINS_PER_USER, now) {
@@ -117,7 +118,7 @@ async fn login(
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED, "wrong username or password"));
     };
     let (token, token_hash) = new_token()?;
-    let device = state.meta.create_device(user.id, &req.device_name, &token_hash, now_ms()).await?;
+    let device = state.meta.create_device(user.id, &req.device_name, &token_hash, state.now_ms()).await?;
     tracing::info!(user = %user.username, %device, "device signed in");
     Ok(Json(LoginResponse { device, token }))
 }
@@ -203,7 +204,7 @@ async fn put_chunk(
     }
     // Bytes first, record second: the database never points at a blob that isn't stored.
     state.store.put(BlobKey::chunk(&id), &body).await?;
-    state.meta.add_chunk(auth.space, &id, body.len() as u64 + 1, now_ms()).await?;
+    state.meta.add_chunk(auth.space, &id, body.len() as u64 + 1, state.now_ms()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -272,7 +273,7 @@ async fn put_manifest(
         return Err(err);
     }
     state.store.put(BlobKey::manifest(&id), &body).await?;
-    state.meta.add_manifest(auth.space, &manifest, body.len() as u64 + 1, now_ms()).await?;
+    state.meta.add_manifest(auth.space, &manifest, body.len() as u64 + 1, state.now_ms()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -300,7 +301,7 @@ async fn commit(
     // and the publish must not be skipped for a commit that went through.
     let task_state = state.clone();
     let outcome = tokio::spawn(async move {
-        let outcome = task_state.meta.commit(auth.space, auth.device, &req.ops, now_ms()).await?;
+        let outcome = task_state.meta.commit(auth.space, auth.device, &req.ops, task_state.now_ms()).await?;
         task_state.notifier.publish(auth.space, outcome.seq);
         Ok::<_, ApiError>(outcome)
     })

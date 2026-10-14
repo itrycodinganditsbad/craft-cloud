@@ -44,6 +44,13 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 tempfile = "3.20"
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "fs", "sync", "net", "time", "signal", "io-std", "io-util"] }
 blake3 = "1.8.7"
+# The agent's network simulation (tests only): turmoil's simulated network, and a plain hyper client and server on it.
+turmoil = "0.7.2"
+hyper = { version = "1.12", default-features = false }
+hyper-util = { version = "0.1.21", default-features = false }
+http-body = "1.0"
+http-body-util = "0.1.5"
+tower-service = "0.3.3"
 caseless = "=0.2.2"
 proptest = "1.12"
 serde = { version = "1", features = ["derive"] }

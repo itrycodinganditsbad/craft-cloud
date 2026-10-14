@@ -274,6 +274,13 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             return Ok(());
         }
         let Some(bpath) = base_path else { return self.apply_missing(id, entry, remote, rpath, new_version, report).await };
+        // A folder the pull moves keeps where this machine had it until a push finishes, as a missing node does (see
+        // `State::left_from`): the folder found at its place may be a new one that took the name, while the user
+        // moved the real one away with a node inside it that is now a link. That link carries names from here, and
+        // a hold must match them (seed 9807 of the network simulation).
+        if moved && matches!(entry.kind, BaseKind::Dir { .. }) {
+            self.state.left_from.entry(id).or_insert_with(|| bpath.clone());
+        }
         // What the file looked like before it was verified: a download may only replace exactly that (a save
         // that lands while the file is hashed changes it).
         let checked = self.stat(&bpath)?;

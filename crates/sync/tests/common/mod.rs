@@ -1,6 +1,9 @@
 //! Test harness: an in-process server (the real metadata and blob stores, no HTTP) and machines that
-//! sync against it. Each test binary uses only some of it.
+//! sync against it, and what the random-history simulations share ([`sim`]). Each test binary uses only some of
+//! it; the agent's network simulation uses it too.
 #![allow(dead_code)]
+
+pub mod sim;
 
 use std::collections::BTreeSet;
 use std::io::{self, Read};
@@ -19,7 +22,8 @@ use craft_cloud_store::{BlobKey, Store};
 use craft_cloud_sync::{Config, Engine, FileMeta, Fs, FsEntry, FsKind, LandError, MemFs, RelPath, Report, State, Transport, TransportError};
 
 /// The server's metadata in an in-memory SQLite database (tests only: the rules are the same as on disk, and
-/// nothing waits for the disk), blobs in memory.
+/// nothing waits for the disk), blobs in memory. A clone is the same server.
+#[derive(Clone)]
 pub struct Server {
     pub meta: Meta,
     pub store: Store,
@@ -52,6 +56,20 @@ impl Server {
             out.insert(*manifest.file_hash());
         }
         out
+    }
+
+    /// Records the versions a commit the server applied stored, for [`Server::history_hashes`].
+    pub fn record_commit(&self, ops: &[Op]) {
+        record_commit(&self.committed, ops);
+    }
+}
+
+fn record_commit(committed: &Mutex<BTreeSet<ManifestId>>, ops: &[Op]) {
+    let mut committed = committed.lock().unwrap();
+    for op in ops {
+        if let Op::Create { version, .. } | Op::Update { version, .. } = op {
+            committed.insert(version.manifest);
+        }
     }
 }
 
@@ -186,13 +204,7 @@ impl Transport for Local {
         }
         let out = out?;
         // Every version this commit stored stays in the server's history.
-        let mut committed = self.committed.lock().unwrap();
-        for op in ops {
-            if let Op::Create { version, .. } | Op::Update { version, .. } = op {
-                committed.insert(version.manifest);
-            }
-        }
-        drop(committed);
+        record_commit(&self.committed, ops);
         if self.faults.lose_commit_reply.swap(false, Ordering::Relaxed) {
             return Err(TransportError::Unavailable("reply lost".into()));
         }
@@ -211,7 +223,8 @@ impl Transport for Local {
 
 pub const STAMP: ConflictStamp = ConflictStamp { year: 2026, month: 10, day: 11, hour: 14, minute: 3, utc: false };
 
-pub type Machine = Engine<MemFs, Local>;
+/// A simulated machine: a folder in memory and a way to the server (in process by default).
+pub type Machine<T = Local> = Engine<MemFs, T>;
 
 /// A machine signed in as `user`, with an empty folder and a fresh state.
 pub async fn machine(server: &Server, user: &UserRecord, name: &str) -> Machine {
