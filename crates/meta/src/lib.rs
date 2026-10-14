@@ -98,6 +98,15 @@ impl Meta {
         Ok(Self { pool, dialect, write_lock: Arc::new(Mutex::new(())) })
     }
 
+    /// Whether a database connection is in use (a query under way, or a connection on its way back to the pool).
+    /// A simulation on a simulated clock (`turmoil`) keeps time still while it is, since SQLite answers from a
+    /// thread of its own, outside the simulation: otherwise how far simulated time got before an answer would depend
+    /// on the real machine's speed, and a seed wouldn't replay exactly.
+    #[cfg(feature = "test-support")]
+    pub fn busy(&self) -> bool {
+        self.pool.num_idle() < self.pool.size() as usize
+    }
+
     /// Starts a write transaction. On SQLite it also holds the write lock until commit or drop.
     async fn begin_write(&self) -> Result<WriteTx, MetaError> {
         let guard = match self.dialect {

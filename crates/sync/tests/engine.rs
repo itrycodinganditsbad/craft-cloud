@@ -1003,6 +1003,113 @@ async fn a_file_that_became_a_link_in_a_folder_moved_away_is_never_deleted() {
     assert_eq!(read(&b, "Clips/c0.mov"), b"clip");
 }
 
+/// Seed 9807 of the network simulation: the folder `Footage/Day1` became a link and the user renamed `Footage` to
+/// `Shots`, then made new `Footage/Day1` folders under the old names; meanwhile the other machine made the same rename
+/// and moved `Day1` out to `Archive`. Path first, the new folders are the tracked ones here: the pull moves them to
+/// the server's places (the renamed folder holding the link is moved aside for them), and `Day1`'s clip isn't in the
+/// new `Day1`. The link carries the name `Day1` from where this machine had the clip before the pull, so the clip's
+/// delete is held behind it, and once the link is a real folder again nothing is lost.
+#[tokio::test]
+async fn a_link_in_a_folder_renamed_on_both_sides_while_new_folders_took_its_names_holds_the_delete() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage/Day1")).unwrap();
+    write(&mut a, "Footage/Day1/c0.mov", b"clip");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().make_link(&path("Footage/Day1")).unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().rename(&path("Footage"), &path("Shots")).unwrap();
+    b.sync_once().await.unwrap();
+    b.fs_mut().rename(&path("Shots/Day1"), &path("Archive")).unwrap();
+    b.sync_once().await.unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Shots")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage/Day1")).unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty(), "the clip behind the link stays: {report:?}");
+        assert_eq!(report.held_deletes.len(), 1, "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Archive/c0.mov"), b"clip", "the desktop keeps it");
+    }
+    // The drive is back: the link is a real folder again, and its clip goes up as a new file.
+    let link = a.fs().files().keys().find(|p| p.to_string().ends_with("/c0.mov")).cloned();
+    assert!(link.is_none(), "the clip is behind the link here: {:?}", a.fs().files());
+    let at = a.fs().dirs().into_iter().find(|d| d.to_string().starts_with("Shots (conflict")).expect("the renamed folder, moved aside");
+    let link = at.join(&craft_cloud_proto::Name::new("Day1").unwrap());
+    a.fs_mut().remove_file(&link).unwrap();
+    a.fs_mut().mkdir(&link).unwrap();
+    write(&mut a, &format!("{link}/c0.mov"), b"clip");
+    settle(&mut [&mut a, &mut b], 6).await;
+    assert_eq!(files(&a), files(&b));
+    assert_eq!(read(&b, &format!("{link}/c0.mov")), b"clip");
+}
+
+/// The smallest shape of seed 9807: no rename on the other side above the folder. `Footage/Day1` became a link here;
+/// the user renamed `Footage` to `Shots` and made new `Footage` and `Footage/Day1` folders, while the other machine
+/// only renamed `Day1` to `Day2`. The pull moves the new `Day1` to `Day2` (path first, it is the tracked one), so the
+/// link carries the name `Day1` from where this machine had the folder before the pull, and the clip's delete is held.
+#[tokio::test]
+async fn a_link_whose_folder_the_other_machine_renamed_while_a_new_folder_took_its_name_holds_the_delete() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage/Day1")).unwrap();
+    write(&mut a, "Footage/Day1/c0.mov", b"clip");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().make_link(&path("Footage/Day1")).unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().rename(&path("Footage/Day1"), &path("Footage/Day2")).unwrap();
+    b.sync_once().await.unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Shots")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage/Day1")).unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty(), "the clip behind the link stays: {report:?}");
+        assert!(!report.held_deletes.is_empty(), "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Footage/Day2/c0.mov"), b"clip", "the desktop keeps it");
+    }
+}
+
+/// Seed 9807's shape with the folder above deleted on the other side: it moved `Day1` out to `Archive` and deleted
+/// `Footage`. The link here still carries the name `Day1` from where this machine had the folder, so the clip's
+/// delete is held, on the server and on the other machine.
+#[tokio::test]
+async fn a_link_whose_folder_the_other_machine_moved_out_of_a_deleted_parent_holds_the_delete() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage/Day1")).unwrap();
+    write(&mut a, "Footage/Day1/c0.mov", b"clip");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().make_link(&path("Footage/Day1")).unwrap();
+    a.sync_once().await.unwrap();
+    b.fs_mut().rename(&path("Footage/Day1"), &path("Archive")).unwrap();
+    b.fs_mut().remove_dir(&path("Footage")).unwrap();
+    b.sync_once().await.unwrap();
+    b.approve_deletes();
+    b.sync_once().await.unwrap();
+    a.fs_mut().rename(&path("Footage"), &path("Shots")).unwrap();
+    a.fs_mut().mkdir(&path("Footage")).unwrap();
+    a.fs_mut().mkdir(&path("Footage/Day1")).unwrap();
+    for _ in 0..3 {
+        let report = a.sync_once().await.unwrap();
+        assert!(report.removed_remotely.is_empty(), "the clip behind the link stays: {report:?}");
+        assert!(!report.held_deletes.is_empty(), "{report:?}");
+        b.sync_once().await.unwrap();
+        assert_eq!(read(&b, "Archive/c0.mov"), b"clip", "the desktop keeps it");
+    }
+}
+
 /// A clip replaced by a link, its folder renamed here, and the clip renamed on the other machine: the server's
 /// rename can't find the clip by its file ID (it is a link), but it is in the renamed folder, so it isn't taken
 /// for deleted. The rename waits until the clip is real again.

@@ -18,7 +18,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use craft_cloud_proto::api::EPOCH_HEADER;
 
 use crate::error::ApiError;
-use crate::state::{AppState, now_ms};
+use crate::state::AppState;
 
 /// Passwords are 8 to 1024 bytes (the cap keeps hashing cheap to refuse).
 pub const MIN_PASSWORD_BYTES: usize = 8;
@@ -72,7 +72,7 @@ fn bearer(request: &Request) -> Option<&str> {
 pub async fn require_device(State(state): State<Arc<AppState>>, mut request: Request, next: Next) -> Result<Response, ApiError> {
     let token = bearer(&request).ok_or_else(ApiError::unauthorized)?;
     let device = state.meta.device_by_token(&token_hash(token)).await?.ok_or_else(ApiError::unauthorized)?;
-    state.touch(device.device, now_ms()).await;
+    state.touch(device.device, state.now_ms()).await;
     let space = device.space;
     let epoch = state.meta.space_info(space).await?.epoch;
     request.extensions_mut().insert(device);

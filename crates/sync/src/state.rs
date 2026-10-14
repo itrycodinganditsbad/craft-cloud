@@ -46,9 +46,10 @@ pub struct State {
     /// checkpoint after its last commit, so a pass that fails or crashes leaves the links it saw new to the next one.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub known_links: BTreeSet<RelPath>,
-    /// Tracked nodes missing here whose base the pull let follow a server move since the last finished push, with the
-    /// path this machine last had them at. A hold matches names on that path (another machine may have moved the node
-    /// while this machine's user was moving its folder). Cleared by a finished push.
+    /// Tracked nodes missing here whose base the pull let follow a server move since the last finished push, and
+    /// folders the pull moved here (the one found at the place may be a new folder that took the name), with the path
+    /// this machine last had them at. A hold matches names on that path (another machine may have moved the node or a
+    /// folder above it while this machine's user was moving its folder). Cleared by a finished push.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub left_from: BTreeMap<NodeId, RelPath>,
 }

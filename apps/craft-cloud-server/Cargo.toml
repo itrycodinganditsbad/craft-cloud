@@ -7,6 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# Test seams (`AppState::with_clock`); never on in a shipped binary.
+test-support = []
+
 [dependencies]
 argon2.workspace = true
 axum.workspace = true

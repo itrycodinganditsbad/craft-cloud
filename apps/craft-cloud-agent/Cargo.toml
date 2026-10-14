@@ -28,11 +28,19 @@ tokio.workspace = true
 rustix.workspace = true
 
 [dev-dependencies]
-craft-cloud-meta.workspace = true
-craft-cloud-server.workspace = true
+axum.workspace = true
+craft-cloud-chunker.workspace = true
+craft-cloud-meta = { workspace = true, features = ["test-support"] }
+craft-cloud-server = { workspace = true, features = ["test-support"] }
 craft-cloud-store.workspace = true
 craft-cloud-sync = { workspace = true, features = ["test-support"] }
+http-body.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 tempfile.workspace = true
+tower-service.workspace = true
+turmoil.workspace = true
 
 [lints]
 workspace = true
