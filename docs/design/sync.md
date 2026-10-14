@@ -135,8 +135,9 @@ an empty folder as "delete everything".
 
 **Detect a local change**
 - The watcher plus a full rescan every 10 minutes as a safety net.
-- A file counts as **stable** when size and mtime are unchanged across two checks at least 5 s apart and, on
-  Windows, it opens with an exclusive share mode (a sharing violation means a writer still has it open).
+- A file counts as **stable** when size and mtime are unchanged for 2 s (across two checks, or by its mtime at
+  the first, where file times can be trusted) and, on Windows, it opens while denying other writers (a sharing
+  violation means a writer still has it open). See M3b2b below.
   A render that writes for 20 minutes is simply not stable for 20 minutes.
 - **After hashing, stat again.** If size or mtime moved during chunking, throw the result away and retry
   later.
@@ -152,7 +153,8 @@ an empty folder as "delete everything".
   Intermediate states inside the stability window are never committed.
   A tracked folder at its place whose recorded local ID is gone, or is on a folder at an untracked place with no
   link in it (renamed, with a new folder made under the old name), takes the ID it has now (not while a folder
-  can't be listed), so a later rename of it is a move.
+  can't be listed), so a later rename of it is a move. This is learnt at the start of every pass, before anything
+  can fail, so a pass that fails (offline, a download cut off) still records it.
 - **Local moves**: only when the target path did *not* exist before does the agent match by file ID (inode /
   NTFS file ID) plus size and mtime, and send a move of the existing node instead of a delete and a new file.
 
@@ -235,6 +237,22 @@ changes locally, then pushes local changes. These rules came out of the simulati
   writer that lands atomically. Uploads chunk the file as a stream, then read back only the chunks the server
   lacks, each checked against its ID (a mismatch means the file changed: retried next pass). Downloads check
   every chunk and the whole-file hash before the file lands. No file is ever held whole in memory.
+- **Files still being written wait**: before a changed file goes up, or is kept as a conflict copy for a server
+  version, the engine asks the `Fs` whether it may still be changing (`Fs::still_changing`; the agent's loop
+  answers with the stability window, a one-off `sync` trusts every file). Such a file is skipped with "still
+  changing": its base stays as it was, so it is never taken for deleted and no server version replaces it; it is
+  looked at again later. A server change that would move aside a file that differs from the base and may still
+  be changing (in the change's place, as a case twin of it, or where a folder above it must go) waits too. Like
+  the link checks, this is decided before the change's first step, so a change that waits never starts halfway
+  (seed 44450). Not covered: files inside a folder that a change moves aside (a case twin folder, an untracked
+  folder in the way), and a file whose own move the server refuses because the name is taken. On Unix the
+  writer's handle follows the renamed file; on Windows the rename fails while a writer has it open, and the node
+  is retried next pass. Nothing is lost either way. The simulation keeps random files "still being written" for
+  a while, on the machine whose pass is next too, and checks that none of them goes up, is moved or is replaced
+  by that pass.
+- **A refused delete keeps its folders**: when the server refuses a file's delete (it was edited there), the
+  deletes of the folders above it are dropped from the commit, in its batch and the later ones. The node stays
+  tracked, so its folders do too (seed 44450).
 - **Unreadable files are skipped** with a reason in the report and retried next pass.
 - **Racy and replaced files are hashed.** When size and mtime match the base but the file's ID changed
   (replaced), or its mtime is within `racy_window_ms` (default 2 s) of when the base was recorded, the
@@ -381,11 +399,87 @@ changes locally, then pushes local changes. These rules came out of the simulati
   can send the move aside as a user move, so the server node takes the conflict name. If the user renames a
   folder holding a link while the server adds something to that folder, the engine makes the folder again at
   its old place and the node behind the link is deleted on the server; the file goes up as new once it is
-  real again, and history keeps the old version. Seed 112337 (found in the M3b2a
-  review, both modes): a folder that was a link and became a real folder again, then a pass that failed before
-  recording its new ID, then a link made inside it and the folder moved: the next pass takes the move for a
-  delete plus a new folder and deletes the node behind the inner link on the server (history keeps it). First
-  M3b2b item.
+  real again, and history keeps the old version. A tracked folder that became a link, is a real folder again
+  and is moved before any pass looks at it as a real folder (a one-off `sync` run only afterwards, or the agent
+  not running meanwhile; the loop's debounce narrows it) goes up as a delete plus a new folder: nothing local
+  tells it apart from a new one, since it and the files in it all have new local IDs, so its files are uploaded
+  as new nodes (the same content; history keeps the old versions). A node behind a link inside it isn't
+  deleted while that link stands (below). When a pass, even a failed one, sees the folder in its place first,
+  its ID is learnt (below) and the move is a move (seed 112337). The hold below misses a link made or renamed
+  under another name in the same window (`Footage` moved away and replaced by a link `Footage (external)`;
+  renaming a link counts as removing it), one standing at exactly the path where a link stood at the last
+  finished push, and one a finished push already saw while the node was still behind another link (the folder
+  copied back as `Clips` while its old link `Footage` stood, a link made in it, a pass, then the old link
+  removed: the node is deleted on the server; history keeps it). A server rename of a folder this machine
+  deleted, onto the name of a folder of this machine's own, makes that folder the moved one (folders hold no
+  content); a file of its own in it under a tracked file's name then goes up as that file's next version (no
+  conflict copy; history keeps the old one), unless the file's delete is held (below). It is fixed together
+  with the follow-up on a server move onto a file of this machine's own (below).
+- **Deletes behind a link are held**:
+  - *Rule.* A link or special file is *new* when the last finished push saw none at its path. When a tracked
+    node is missing (not at its place, not found by local ID, not behind a link, still on the server) and a new
+    link's name, ignoring case, is the node's name or the name of a folder on its path where this machine last
+    had it, that link may be the node, moved with its folder, and the node's server delete is held. A link that
+    was there at the last finished push never holds anything.
+  - *What is kept.* The link paths each finished push saw, replaced in the checkpoint after its last commit (a
+    pass that fails or crashes leaves them as they were). Where this machine last had a missing node whose
+    place the pull moved to follow another machine's move, until a push finishes. Each hold, by node ID with
+    the paths of every new link that matched (an unrelated link with the same name may appear in the same
+    window as the real one), saved before the pass commits anything. No folder identity goes into the rule.
+  - *While it lasts.* The folders above the node wait with it. Every pass's summary, `status` and
+    `status.json` list it with the paths of all its links. It lasts while any of its links stands where the
+    hold last saw it (or can't be seen, or a folder can't be listed), or a link with that one's name stands at
+    a path the last finished push saw no link at (the link's folder moved; every such path), and while the node
+    isn't found here. A file at a held node's place with another local ID and other content isn't the node: it
+    doesn't end the hold, and it waits while the hold stands.
+  - *How it ends.* Every one of its links goes (removed, replaced by the real file, which goes up as a new file,
+    or renamed itself), or the node is found here again (downloaded, put back, found moved by its local ID): the
+    next pass judges it afresh by the usual rules (missing, it is deleted on the server, still under the
+    mass-delete guard). A hold on a node the server deleted, or that this machine no longer tracks, is dropped.
+    Holds an older agent saved load as one link's path and keep holding; its state has no record of known
+    links, so every link counts as new once. The user can also approve the delete (below).
+  - *Approval.* Every list of held deletes (a pass's summary, `status`) comes with a set of its own, apart from
+    the mass-delete guard's (a hash of their nodes, paths and links), and says how to release it.
+    `sync --approve-deletes=<set>` naming that set lets exactly those deletes go on the next pass; a running
+    loop looks for such an approval while anything is held (every 30 s, or every 2 s while the guard's set
+    waits too). The bare
+    `--approve-deletes`, an approval of the guard's set, and a hold made after the approval never release a
+    hold: it ends by approval only when the user names it. The bare flag says so, with the set to name, rather
+    than "nothing was waiting". `run` lists the held deletes when their set changes (and says when the last one
+    ends), not after every pass.
+  - Holding never loses anything. A wrong hold (a link that appeared in the same window as an unrelated delete,
+    sharing a name with its path) keeps one delete waiting, listed with its links, until its links go, the node
+    turns up, or the user approves its set.
+  - *Examples* (each a scenario test): a folder that was a link is put back from another drive, a link is made
+    inside it and the folder is renamed, with no pass between (seed 112337's no-pass order); the same, moved
+    onto the place of a tracked folder the user just deleted (seed 804 of fix round 4) or onto a name another
+    machine just made or moved a folder to; then a new folder made at the old name (seeds 13116, 19051, 35808)
+    or another tracked folder renamed onto it (seed 110570); the same while an unrelated folder can't be listed;
+    another machine moving or renaming the node first (seed 804 of fix round 6). Once held, a new folder at the
+    old place, another machine moving the node or renaming the link's folder (seed 3660), the engine moving that
+    folder aside, or the user putting it back under a new name don't end it, and neither does removing an
+    unrelated link with the same name that appeared in the same window, or that the hold followed to when the
+    link's folder was renamed. Not held: a permanent `Footage` link, and a later delete of
+    `ProjectB/Footage/x.mov`; a same-named link that was already there in another folder.
+- **A server move onto a file of this machine's own keeps both**: when another machine moves a node this
+  machine is missing (its user deleted or moved it away) onto a name where this machine has a file of its own
+  (no tracked node's, by place or by local ID, and not the node's content), that file is moved aside as a
+  conflict copy (it goes up as a new file) and the node lands at its name, as if it had still been here. The
+  file is never taken for the node's next version. A link on the way, or a file there still being written,
+  makes the server move wait (the file is never moved aside while it changes); for a node that isn't held, the
+  push still sends this machine's delete, as when the target is free (history keeps the node; the file goes up
+  as a new one once it settles). Which should win when a file of this machine's own is at the target, the
+  delete or the server move, is a follow-up: one rule for the occupied and the free target, which also decides
+  the folder case in Known gaps.
+- **Folder IDs are learnt before anything can fail**: at the start of every pass, a tracked folder at its place
+  under a local ID it didn't record (a link that became a real folder again, a folder put back from another
+  drive) takes that ID, by the same rule as the push. A pass that then fails still leaves it in the state, so a
+  later move of the folder is sent as a move, and a node behind a link inside it is never deleted on the server
+  (seed 112337: a link that became a real folder, a pass that failed, then a link made inside it and the folder
+  moved). The folder is scanned for this only when a quick look at the tracked folders finds a new ID that the
+  last such scan didn't decline (a folder that can't be listed, a renamed folder holding a link, an ID another
+  tracked folder has): a decline costs one scan, not one on every pass, and the push's own refresh takes the ID
+  once it can be taken.
 
 ## Server
 
@@ -554,9 +648,11 @@ folder through a real server by running `craft-cloud-agent sync`.
   - `login <url> --user <name> [--folder <path>] [--device-name <name>]`, with the password read from
     stdin. It creates the device and sets up the folder and its marker. The folder must be empty or new,
     or `--adopt` must be passed to sync an existing one.
-  - `sync [--approve-deletes]`: one pass, printed as a short report. Exit codes tell apart done, failed,
+  - `sync [--approve-deletes[=<set>]]`: one pass, printed as a short report. Exit codes tell apart done, failed,
     needs approval, and needs you.
-  - `status`: account, folder, last pass, pending deletes, skipped files.
+  - `status`: account, folder, last pass, pending deletes, skipped files (since M3b2b1 also whether `run` runs and
+    what it does).
+  - `run` (M3b2b1): the agent on its own; see M3b2b.
   - `logout`: revokes the device on the server and removes the saved account. Local files stay.
 - **The data folder and the synced folder never nest**: the data folder holds the device token, so `login`
   refuses a synced folder that contains it or lies inside it (compared as the OS resolves them, links followed),
@@ -598,7 +694,7 @@ folder through a real server by running `craft-cloud-agent sync`.
 
 ### Hardening and the agent on its own (M3b2)
 
-M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** makes the agent run by itself.
+M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** makes the agent run by itself. M3b2b is split again: **M3b2b1** is everything below except the simulated network, which is **M3b2b2**.
 
 **M3b2a: hardening**
 - **The known gaps first**, each pinned by its simulation seed and a scenario test: a tracked link shadowed by a
@@ -649,20 +745,115 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
   an adversary swapping folders for links mid-operation, and Windows has no safe equivalent; documented.
 
 **M3b2b: the agent on its own**
-- `craft-cloud-agent run`: a foreground loop (the OS autostart entry comes with packaging). Sync passes run on
-  a dedicated thread with its own current-thread runtime, so the blocking disk work never stalls the network.
+- **Seed 112337 first**: folder IDs are learnt at the start of every pass, before anything can fail (see the engine
+  rules).
+- `craft-cloud-agent run`: a foreground loop (the OS autostart entry comes with packaging). It holds the data
+  folder's lock for its whole life and the folder's lock while the folder is there. Sync passes run on a
+  dedicated thread with its own current-thread runtime, so the blocking disk work never stalls the network; the
+  loop's control, the watcher's events and the long-poll run on the main runtime. Ctrl-C (and SIGTERM on Unix):
+  no new pass starts, a running one finishes, the status is written, exit 0; a second Ctrl-C ends at once with
+  exit 1: the status is written and the process ends without waiting for the running pass or a pending request
+  (the pass is cut short; its checkpoints make that safe, as after a crash).
 - **Triggers**: a file watcher (`notify`, CC0) on the folder, the server's long-poll `GET /changes?wait=30`,
-  and a full rescan every 10 minutes as a safety net. Events are collected and a pass runs when things settle.
-- **Stability**: a changed file syncs only when size and mtime are unchanged across two looks at least 5 s
-  apart and, on Windows, it opens with an exclusive share mode for a moment (a sharing violation means a writer
-  still has it open). Unstable files are skipped with "still changing" and picked up by the next trigger.
-- **Backoff**: transient failures retry with exponential backoff and jitter, capped at 5 minutes; account-level
-  and safety stops pause the loop and say why (`status` shows it); the mass-delete guard waits for
-  `craft-cloud-agent sync --approve-deletes` (run from another terminal; the loop picks the approval up).
-- **Status file**: the loop writes its state (idle, syncing, offline retrying, paused + reason, last pass) next
-  to `state.json` for `status` to read. The local control API stays M7.
-- **Simulated network**: `turmoil` (MIT) runs agents and the server over a simulated network with partitions,
-  delays and dropped connections, on top of the existing in-process simulation.
+  and a full pass every 10 minutes as a safety net. Every pass scans the whole folder; the triggers only decide
+  when. Events under `.craft-cloud/` and reads are ignored. A watcher error, dropped events, or a watcher that
+  stops by itself run a pass at once, and the watcher is made afresh (at most once a minute). Every start of a
+  watcher but the loop's first (after it failed or stopped, when a pause ends) is followed by a full pass after
+  the usual 1.5 s debounce, since events between the last pass and the start were lost (at once after a time
+  unwatched); the Windows re-creation below comes right before a pass, which is its pass. A watcher that can't start (on Linux, more folders than
+  `fs.inotify.max_user_watches` allows) is said once, in the output and in `status` ("not watching the
+  folder"); a full pass then runs every minute, and the watcher is tried again after a minute, doubling up to 10
+  minutes. Known gap: on Windows, `notify` 8 neither reports nor survives an overflow of
+  `ReadDirectoryChangesW`'s buffer (a bulk copy of thousands of files): the events are dropped silently, or the
+  folder stops being watched. Once a watcher has run for 10 minutes, the loop makes it afresh just before the
+  next pass (when idle, the safety-net pass), and that pass, which also finds what was dropped, stands in for the
+  restart's own: an idle loop still scans once per 10 minutes. Such changes can wait up to 10 minutes. `notify` 9 reports the overflow (a
+  rescan); moving to it once it is stable is the follow-up.
+  Folder events are collected and a pass runs once the folder has been quiet for 1.5 s, but no later than 10 s
+  after the first event, so a folder that never goes quiet still syncs. A change on the server runs a pass at
+  once. The long-poll asks for one node only (it only needs to know whether to run a pass), polls on from the
+  server's new position, and backs off on errors (2 s doubling to 5 minutes, with jitter) and on `429` (the
+  server's `Retry-After`, at most 5 minutes, plus up to half again at random), and two polls start at least 1 s
+  apart whatever the server answers: never a hot loop. The agent's own writes wake it once more at most;
+  that pass finds nothing to do, and an idle loop settles.
+- **Stability**: a changed file syncs only when its size and mtime have been unchanged for 2 s: across two looks
+  at least 2 s apart, or already at the first look when its mtime is at least 2 s old (a file written a while
+  ago syncs on the first pass that sees it). A time in the future by the local clock never counts as old, and the
+  shortcut is off where file times can't be trusted, which is told once per session from the folder's
+  filesystem: on Linux and macOS a network share (NFS, SMB, AFP, WebDAV and the like, whose times come from the
+  server's clock and may lag ours), FAT and exFAT (coarse times), and FUSE and 9P mounts (on macOS by type name,
+  so a macFUSE mount made with `-o local` counts too); there a file always needs two looks. Elsewhere, and on Windows (where the probe below stands in), a writer that paused for longer
+  than the window looks settled too; the re-stat after hashing still keeps a file that changed while it was read
+  from going up. On Windows it must also open while denying other writers (a sharing violation means a writer
+  still has it open; readers don't stand in the way). The probe opens the file itself, never a link put in its
+  place (`FILE_FLAG_OPEN_REPARSE_POINT`), and for that moment an app opening the file for writing gets a
+  sharing violation. The engine asks the `Fs` (`still_changing`) only about files that differ from the base,
+  before an upload, before keeping one as a conflict copy and before a server change moves one aside (see the
+  engine rule "Files still being written wait" for what that covers); an unstable file is skipped with "still
+  changing" and keeps its base (never taken for deleted, never overwritten). The loop runs a pass again when the
+  earliest look is due, not only on the next event: 2 s after the first look, then doubling for a file found
+  changed again (or still open for writing), up to 5 minutes, and starting over once it settles. The watcher's
+  events for a file that is waiting don't run passes, so a file that never settles (a log, a database held
+  open) costs a pass every few minutes, not one every few seconds. Instead each event sets a cheap look (one
+  stat, no pass) for when the file has been quiet for a quarter of its current delay (at most 30 s) since its
+  last event; on Linux a writer closing the file after writing sets it for at once. A file written all the time
+  keeps pushing that look back, so it costs nothing. A look that finds the file unchanged for 2 s (by the same
+  rule as above), or gone, runs a pass, which syncs it; one that finds it changed looks again 2 s later. So a long
+  export that ends syncs within about 30 s of its last write (a few seconds on Linux), not only when its
+  backed-off look is due (up to 5 minutes). Only files still waiting are remembered, however many changed at
+  once; a finished pass forgets those it didn't ask about. A one-off `sync` trusts every file at once (the
+  re-stat after hashing still guards it). Folder events still run a pass after a 1.5 s debounce.
+- **Backoff**: a pass that failed for a reason that may pass by itself (exit code 1: offline, a server error)
+  is retried after 2 s doubling up to 5 minutes, the second half of each delay random; a pass that finishes
+  resets it. The long-poll getting an answer again (the server is back) runs the pending retry at once (if it
+  fails again, the next delay goes on growing); a change on the server, a watcher error or an approval waits for
+  the retry like everything else. Account-level problems and safety stops (exit code 3) pause the loop and say
+  why (`status` shows it). A folder or marker that is missing (a drive not mounted yet), data and synced folders
+  inside one another, or another agent on the folder are looked at again every minute, and the loop goes on by
+  itself once they are put right; a server that speaks another protocol or refuses requests every 10 minutes
+  (an update fixes it); a revoked device, damaged or newer saved files, another account's state and damaged
+  data from the server never fix themselves, so the loop stays paused until it is stopped.
+- **Approval while the loop runs**: the mass-delete guard holds the deletions back and the rest goes on syncing.
+  The waiting deletions form a set with a short identifier (a hash of its nodes and paths), printed with the
+  list (in `run`'s output too). `status` shows the list and its set, and notes the set as shown (`shown.json` in
+  the data folder). `craft-cloud-agent sync --approve-deletes` from another terminal finds the loop holding the
+  locks and approves the set the loop's last pass listed only if it is the set `status` showed: it writes
+  `approval.json`, naming the set and its deletions. If the set changed since (a pass found more deletions) or
+  was never shown, nothing is approved: the command lists the new set, notes it as shown, and exits with code
+  2, so the user checks it and runs the command again. `sync --approve-deletes=<set>` names the set instead (as
+  the loop's output or `status` printed it; every list says "check the list, then run `craft-cloud-agent sync
+  --approve-deletes=<set>`"): it approves that set if it is the one waiting, whatever `status` showed, and
+  otherwise lists the waiting set, notes it as shown, approves nothing and exits with code 2. A one-off `sync`
+  with no loop does the same against its last pass's list (a wrong set runs no pass). An empty set
+  (`--approve-deletes=`, a script's unset variable) is a usage error, never the bare flag. The loop looks for an
+  approval every 2 s while deletions wait (every 30 s while only deletes held behind a link wait: a hold pauses
+  nothing and may stand for days) and takes it (renaming it away first, so a newer approval lands as a
+  new file). It releases the deletions only if the approval names the set that waits now, and then exactly
+  those: any deletion that came since still waits and is listed again. An approval naming another set, or one
+  found when nothing waits (after any finished pass), is discarded with a message, never kept for later.
+  Approvals cover what was shown. Deletes held behind a link form a set of their own, released only by an
+  approval naming it (see the hold). A plain `sync` while the loop runs stops with exit code 3 ("another
+  craft-cloud-agent is running").
+- **Status file**: `status.json` next to `state.json`, written atomically when what it says changes and every
+  15 s as a heartbeat. Its times don't count as a change (they are converted afresh at every wake-up and jitter
+  by a millisecond; a new next try or next check only comes with a pass, and "syncing" is written in between),
+  so a loop that is retrying while the watcher wakes it hundreds of times a second still writes it every 15 s.
+  It holds the state (idle, syncing, offline retrying with the next try, paused with the reason and the next
+  check, stopping, stopped), whether deletions wait for approval (the mass-delete guard), apart from it whether
+  deletes are held behind a link (`held`: a hold pauses nothing and never counts as waiting for approval), the
+  pid, the start, the last pass and its summary (with the deletes held behind a link, each with the paths of all
+  its links, kept after a failed pass). Every
+  time in it (the heartbeat, the next try, the next check) is the wall clock's at the moment it is
+  written; the loop schedules on a monotonic clock, which stands still while the machine sleeps, so only
+  durations from now are carried over. `status` reads it: the loop runs if it hasn't written "stopped" and its
+  heartbeat is at most three beats (and 5 s) old (it doesn't take the lock to find out: that could make a loop
+  starting at that moment stop). It works the same with no loop. Cleanup removes the interrupted atomic writes
+  of `status.json`, `approval.json` and `shown.json` like the others', but only those at least a minute old
+  (`status` and `sync --approve-deletes` write without the lock while a loop holds it), and the loop cleans
+  once, at its start, never while it may be writing its own. If the watcher can't start, the status says so
+  (see Triggers). The local control API stays M7.
+- **Simulated network** (M3b2b2): `turmoil` (MIT) runs agents and the server over a simulated network with
+  partitions, delays and dropped connections, on top of the existing in-process simulation.
 
 ## Errors
 
@@ -672,7 +863,16 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
   that file is skipped and listed with the reason; everything else keeps syncing.
 - **Account-level** (token revoked, server gone, quota full, protocol mismatch): pause syncing, say so
   clearly, never delete local files because of it.
-- **Safety stops** (root marker missing, mass-delete guard): pause and ask. Never resolved automatically.
+- **Safety stops**: a missing root marker pauses and asks. The mass-delete guard and a delete held behind a link
+  hold back only those deletes and ask; everything else keeps syncing. The mass-delete guard is only ever
+  resolved by the user's approval; a hold ends when its links go, the node is found here again, or the user
+  approves its set. A missing folder or marker (a drive not mounted yet) pauses the `run` loop,
+  which looks again every minute and resumes by itself once both are back, as they were: the marker must still
+  name this account's space and root, so a different folder mounted in its place is never synced. While paused,
+  the loop releases the folder's lock (the data folder's lock stays held): the folder may be gone, and a lock
+  file can't be held in it. That is safe because every pass first takes the folder's lock again, checks the
+  marker and the folders, and another agent that took the lock meanwhile makes the loop pause again ("another
+  agent on the folder"). A one-off `sync` stops with exit code 3 and never resolves anything by itself.
 - **Local disk full**: stop downloads, keep uploads going, tell the user.
 - **Corrupt chunk on the server** (`verify` or a read finds a mismatch): the server marks it bad and returns
   an error; any agent that still has those bytes re-uploads them (repair). `verify` reports files that can't
@@ -724,11 +924,41 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
 | M3a | Sync engine on `Fs`/`Transport` + simulation harness | DONE (2026-10-12) |
 | M3b1 | Agent, first cut: real `Fs`, HTTP transport, saved state, root marker, CLI; two machines sync a folder by hand | DONE (2026-10-12) |
 | M3b2a | Hardening: the known gaps, same content = no change, atomic download landing, Windows rename-blocked retry | DONE (2026-10-13) |
-| M3b2b | Agent on its own: `run` loop, watcher, long-poll, stability window, backoff, status file, simulated network | TODO |
+| M3b2b1 | Agent on its own: seed 112337, `run` loop, watcher, long-poll, stability window, backoff, status file | TODO |
+| M3b2b2 | Simulated network (`turmoil`): partitions, delays, dropped connections | TODO |
 | M4 | History, restore, trash, thinning, GC, admin CLI, backup/restore | TODO |
 | M5 | Selective sync, large-media polish, ignore rules | TODO |
 | M6 | Packaging: binaries, Docker, systemd, built-in TLS, self-hosting guide | TODO |
 | M7 | Local control API + launcher integration PR | TODO |
+
+### M3b2b follow-ups
+
+From the final review of the M3b2b1 prototype (review 8), less what its last fix round did:
+
+- **Delete vs. server move onto a file of this machine's own**: one rule for the occupied and the free target
+  (the review recommends "the delete wins"). It then decides the folder case in Known gaps
+  (`known_gap_a_server_folder_rename_onto_an_own_folder_…`).
+- **Hidden-node guard** (Known gaps' third miss, `known_gap_a_link_seen_while_the_node_was_behind_another_link_…`):
+  don't make links known while a tracked node is hidden behind a link. Weigh it against longer wrong holds.
+- **Ancestor-name false holds**: count an ancestor-name match only while that folder isn't at its place, or
+  accept them now that an approval releases a hold.
+- **Approval pace for holds**: the loop looks every 30 s while only holds wait, so a release can take that
+  long. Looking every 2 s for a minute after `status` or a pass showed a held set would make it prompt.
+- **Errors**: the section's own review (still marked TODO).
+- **Carried**:
+  - folder-ID reuse (now only relevant to moves);
+  - filesystems without folder IDs;
+  - macOS and Windows CI, including the Windows watcher renewal driven past 10 minutes and the reparse-point
+    probe;
+  - `notify` 9 for the Windows overflow;
+  - event-scoped scans for huge folders;
+  - the simulation's one-shot list failure ("vanished during the scan");
+  - recording the commit's `seq` to save the long-poll's extra wake;
+  - turmoil (M3b2b2).
+- **Simplification on main**: no state older than M3b2a exists there, so the prototype's older hold records
+  (fix rounds 3–6), `fresh_dirs` and the one-link form of a saved summary's held deletes needn't be replayed.
+  Upgrading from M3b2a only needs "no `known_links`: every link new once" and "no `held_nodes` in a saved
+  summary: no held set".
 
 ## Out of scope for Phase 1
 

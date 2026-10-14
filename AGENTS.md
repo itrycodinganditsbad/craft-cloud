@@ -32,7 +32,7 @@ crates/
   sync      craft-cloud-sync      the sync engine over `Fs`/`Transport` traits; `MemFs`; scenario tests and the simulation
 apps/
   craft-cloud-server              HTTP API (`/api/v1`), auth, admin CLI (`init`, `serve`, `user`, `device`, `reset-epoch`)
-  craft-cloud-agent               the sync agent: real disk `Fs`, HTTP `Transport`, saved account and state, root marker, CLI (`login`, `sync`, `status`, `logout`)
+  craft-cloud-agent               the sync agent: real disk `Fs`, HTTP `Transport`, saved account and state, root marker, CLI (`login`, `run`, `sync`, `status`, `logout`), the `run` loop
 xtask/                            cargo xtask ci | version
 docs/                             design documents and the self-hosting guide
 ```
