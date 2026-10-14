@@ -290,6 +290,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         let mut new_entry = BaseEntry { parent: remote.parent, name: remote.name.clone(), kind: entry.kind.clone() };
         match local {
             Local::Unchanged | Local::Modified if new_version && local == Local::Modified => {
+                // A file an app may still be writing is left alone until it settles.
+                self.wait_if_changing(&bpath)?;
                 // The same content on both sides (our own commit whose reply was lost, or the same edit made on
                 // two machines): no conflict, just agree on the server's version.
                 if let Some(file) = &remote.file
@@ -378,8 +380,30 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 // and the server's move waits until it is a real file or folder again.
                 return Err(io_err(&link, std::io::Error::other(OTHER_REASON)));
             }
+            // A file of this machine's own (untracked, other content) where the server moved the node is never taken
+            // for the node, which would make it the node's next version with no copy anywhere. Both are kept, as when
+            // the node is still here: that file is moved aside as a conflict copy (it goes up as a new file) and the
+            // node lands at its name (review 6, finding 4). Checked first, as any change: a link on the way or a file
+            // still being written there makes the node wait.
+            if let (BaseKind::File { .. }, Some(file)) = (&entry.kind, &remote.file)
+                && let Some(occupant) = self.own_file_toward(id, &rpath)?
+                && !self.holds_base_content(&entry, &occupant)
+            {
+                self.settle_occupants(id, &rpath, None, None, report).await?;
+                self.ensure_free(&rpath, report)?;
+                if let Some((meta, hash)) = self.download(id, file, &rpath, None, report).await? {
+                    new_entry.kind = self.base_file(file, meta, hash);
+                }
+                self.state.base.insert(id, new_entry);
+                return Ok(());
+            }
             // Otherwise it was deleted here too, and the push sends the delete; the base follows the server's
-            // location so it stays reachable if its old parent goes away.
+            // location so it stays reachable if its old parent goes away. Where this machine last had it is kept
+            // until a push finishes: a link made from it here (with its folder moved) carries names from that path,
+            // not the server's (see `State::left_from`).
+            if let Some(was) = self.state.base_path(id) {
+                self.state.left_from.entry(id).or_insert(was);
+            }
             self.state.base.insert(id, new_entry);
             return Ok(());
         }
@@ -412,6 +436,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 if let Some((meta, hash)) = self.download(id, file, &target, checked, report).await? {
                     new_entry.kind = self.base_file(file, meta, hash);
                 }
+            } else if let Err(e) = self.wait_if_changing(&found) {
+                // Edited here and maybe still being written: left alone until it settles.
+                return Err(e);
             } else if let Some((meta, hash)) = self.same_content(file, &found).await? {
                 // The same edit on both sides: no conflict.
                 if moved {
@@ -445,6 +472,21 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         }
         self.state.base.insert(id, new_entry);
         Ok(())
+    }
+
+    /// A file at `path` (or its case twin) that no tracked node has: not at its place, and not by local ID (a tracked
+    /// file the user moved there is that node's). `id` is the node about to take `path`.
+    fn own_file_toward(&self, id: NodeId, path: &RelPath) -> Result<Option<RelPath>, SyncError> {
+        let index = self.state.base_index();
+        for at in [Some(path.clone()), self.case_twin(path)?].into_iter().flatten() {
+            if let Some(FsKind::File(meta)) = self.stat(&at)?
+                && !index.contains_key(&at)
+                && !self.owns_local_file(meta.id, id)
+            {
+                return Ok(Some(at));
+            }
+        }
+        Ok(None)
     }
 
     /// If an untracked file at `rpath` holds exactly the server's version `file`, the node `id` adopts it (any case
@@ -575,6 +617,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         if let Some(from) = from {
             self.no_link(from)?;
         }
+        self.refuse_changing_toward(to, from)?;
         let holds_source = |occupant: &RelPath| from.is_some_and(|f| f.starts_with(occupant));
         if let Some(twin) = self.case_twin(to)?
             && !holds_source(&twin)
@@ -583,6 +626,52 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         }
         if !holds_source(to) {
             self.release_tracked(to, id, incoming, report).await?;
+        }
+        Ok(())
+    }
+
+    /// Fails as a filesystem error on the node ("still changing"; it is skipped and tried again next pass) if taking
+    /// `to` would move aside a file an app may still be writing ([`Fs::still_changing`]): a file where a folder
+    /// above `to` must go (or its case twin, where that folder is missing), the file at `to`, or its case twin.
+    /// Checked before the first step of a change, as the link checks are, so a change that waits never starts. The
+    /// node's own copy at `from` (or a folder holding it) is never in the way: it is the node itself. Folders in the
+    /// way are not looked into.
+    fn refuse_changing_toward(&self, to: &RelPath, from: Option<&RelPath>) -> Result<(), SyncError> {
+        let holds_source = |p: &RelPath| from.is_some_and(|f| f.starts_with(p));
+        let depth = to.depth();
+        let mut prefix = RelPath::root();
+        for name in to.names() {
+            prefix = prefix.join(name);
+            let last = prefix.depth() == depth;
+            let here = self.stat(&prefix)?;
+            // A missing folder is made after its case twin is moved aside; the target's twin always is.
+            if (last || here.is_none())
+                && let Some(twin) = self.case_twin(&prefix)?
+                && !holds_source(&twin)
+            {
+                self.wait_if_changing_in_way(&twin)?;
+            }
+            match here {
+                Some(FsKind::Dir { .. }) if !last => {}
+                Some(FsKind::File(_)) if !holds_source(&prefix) => return self.wait_if_changing_in_way(&prefix),
+                _ => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Engine::wait_if_changing`] for a file a change would move aside, asked only if it differs from the base by
+    /// size or time (or isn't tracked): an unchanged tracked file isn't being written.
+    fn wait_if_changing_in_way(&self, path: &RelPath) -> Result<(), SyncError> {
+        let Some(FsKind::File(meta)) = self.stat(path)? else { return Ok(()) };
+        let unchanged = self
+            .state
+            .base_index()
+            .get(path)
+            .and_then(|id| self.state.base.get(id))
+            .is_some_and(|e| matches!(e.kind, BaseKind::File { size, mtime_ms, .. } if size == meta.size && mtime_ms == meta.mtime_ms));
+        if !unchanged && self.fs.still_changing(path, &meta) {
+            return Err(io_err(path, std::io::Error::other(super::STILL_CHANGING)));
         }
         Ok(())
     }
@@ -782,6 +871,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         let Some(remote) = self.state.remote.get(&id).cloned() else { return Ok(()) };
         let Some(rpath) = self.state.remote_path(id) else { return Ok(()) };
         let Some(parent_path) = rpath.parent() else { return Ok(()) };
+        // A file an app may still be writing isn't moved aside for the newcomer (in its place, as a case twin, or
+        // where a folder above it goes): the newcomer waits, decided before anything here is made or moved.
+        self.refuse_changing_toward(&rpath, None)?;
         // New content inside a folder deleted here brings the folder back (a create wins over a delete).
         self.make_dirs(&parent_path, report)?;
         if let Some(twin) = self.case_twin(&rpath)? {
@@ -830,6 +922,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                         seen_ms: self.fs.now_ms(),
                     }
                 } else {
+                    // (A file an app may still be writing was refused above, before anything was made.)
                     self.move_aside(&rpath, report)?;
                     // Saved here meanwhile: not taken this pass; the next one meets the file as a local copy.
                     let Some((meta, hash)) = self.download(id, file, &rpath, None, report).await? else { return Ok(()) };

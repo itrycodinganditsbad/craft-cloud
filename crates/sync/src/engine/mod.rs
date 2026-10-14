@@ -40,6 +40,9 @@ const OS_METADATA: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
 /// Why an entry that is neither a regular file nor a folder (or whose name the filesystem layer can't use) is
 /// skipped.
 pub const OTHER_REASON: &str = "a link, a special file, or a name this computer can't sync";
+/// Why a changed file that may still be being written ([`Fs::still_changing`]) is skipped. Every skip for it starts
+/// with these words, so a caller can tell that a pass should look again once the file had time to settle.
+pub const STILL_CHANGING: &str = "still changing";
 /// What the report says about a download kept because the file it replaces is in use or may not be replaced.
 const KEPT_WAITS: &str = "the server's version is downloaded and kept, and lands once it can";
 /// Most chunk IDs asked about in one missing-chunk query.
@@ -146,6 +149,9 @@ pub struct Report {
     pub uploaded: Vec<RelPath>,
     pub removed_locally: Vec<RelPath>,
     pub removed_remotely: Vec<RelPath>,
+    /// The nodes behind `removed_remotely`, in the same order. A path there is where the node was when its delete
+    /// went (after this pass's pull let it follow a server move), so a check of what was deleted goes by node.
+    pub removed_nodes: Vec<NodeId>,
     pub moved_locally: Vec<(RelPath, RelPath)>,
     pub moved_remotely: Vec<(RelPath, RelPath)>,
     pub created_dirs: Vec<RelPath>,
@@ -159,6 +165,13 @@ pub struct Report {
     pub pending_local_deletes: Vec<RelPath>,
     /// The nodes behind `pending_deletes` and `pending_local_deletes`, for [`Engine::approve_deletes_of`].
     pub pending_nodes: Vec<NodeId>,
+    /// Server deletes held behind a link after this pass (see [`State::held_deletes`]): the node's path and the
+    /// paths of all its links, in order. Each is held until all its links are gone (the user removes, renames or
+    /// replaces them), the node is found here, or the user approves its delete by naming it.
+    pub held_deletes: Vec<(RelPath, Vec<RelPath>)>,
+    /// The nodes behind `held_deletes`, in the same order: naming one in [`Engine::approve_deletes_of`] lets its
+    /// delete go.
+    pub held_nodes: Vec<NodeId>,
     /// Operations the server refused this pass; they are retried next pass.
     pub refused: Vec<Conflict>,
 }
@@ -203,6 +216,8 @@ struct Unseen {
     /// moved to another drive with a link left behind), or whose name this computer now spells differently, isn't
     /// gone, and neither is anything tracked below it.
     links: HashSet<(RelPath, FoldKey)>,
+    /// The same links and special files by path, as the scan saw them (see [`State::known_links`]).
+    link_paths: BTreeSet<RelPath>,
 }
 
 impl Unseen {
@@ -271,9 +286,14 @@ pub struct Engine<F: Fs, T: Transport> {
     config: Config,
     stamp: Box<dyn Fn() -> ConflictStamp + Send + Sync>,
     approval: Approval,
+    /// Held deletes the user approved by naming their nodes (see [`Engine::approve_deletes_of`]): the next pass
+    /// releases these holds and lets the deletes go.
+    release: BTreeSet<NodeId>,
     /// Counts the engine's own changes to the folder, so per-pass caches of what is where can tell they are stale.
     fs_changes: u64,
     checkpoint: Option<Checkpoint>,
+    /// The new folder IDs the last look at the start of a pass found but didn't take (see [`Engine::learn_dir_ids`]).
+    declined_dir_ids: BTreeSet<(NodeId, u64)>,
 }
 
 /// Which deletions the mass-delete guard lets through this pass.
@@ -306,7 +326,19 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         stamp: impl Fn() -> ConflictStamp + Send + Sync + 'static,
     ) -> Result<Self, SyncError> {
         let chunker = Chunker::new(FASTCDC_V1).map_err(|e| SyncError::Corrupt(e.to_string()))?;
-        Ok(Self { fs, transport, state, chunker, config, stamp: Box::new(stamp), approval: Approval::None, fs_changes: 0, checkpoint: None })
+        Ok(Self {
+            fs,
+            transport,
+            state,
+            chunker,
+            config,
+            stamp: Box::new(stamp),
+            approval: Approval::None,
+            release: BTreeSet::new(),
+            fs_changes: 0,
+            checkpoint: None,
+            declined_dir_ids: BTreeSet::new(),
+        })
     }
 
     /// Saves the state at safe points during a pass, so a crash loses less than the whole pass: once the server's
@@ -350,7 +382,13 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// report's [`Report::pending_nodes`]. Deletions of other nodes still wait for approval if the guard holds
     /// them. Adds to an approval given since the last pass (several calls approve all the nodes they name; after
     /// [`Engine::approve_deletes`] everything stays approved).
+    ///
+    /// A node named here whose delete is held behind a link right now (see [`State::held_deletes`] and
+    /// [`Report::held_nodes`]) is released: the next pass sends its delete. Only naming it does that;
+    /// [`Engine::approve_deletes`] never releases a hold, and neither does naming a node that is held only later.
     pub fn approve_deletes_of(&mut self, nodes: impl IntoIterator<Item = NodeId>) {
+        let nodes: Vec<NodeId> = nodes.into_iter().collect();
+        self.release.extend(nodes.iter().filter(|id| self.state.held_deletes.contains_key(*id)));
         match &mut self.approval {
             Approval::All => {}
             Approval::Only(ids) => ids.extend(nodes),
@@ -371,6 +409,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         })?;
         // What recovery set aside for the user (a record it can't read, a file it couldn't put back).
         report.skipped.extend(self.fs.notices());
+        // Before anything can fail (an offline server, a download), so a pass that fails still leaves it behind.
+        self.learn_dir_ids()?;
         let mode = match self.pull().await? {
             Mode::Normal if self.state.reconcile_pending => Mode::Reconcile,
             mode => mode,
@@ -381,6 +421,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         self.checkpoint()?;
         self.push(&mut report).await?;
         self.approval = Approval::None;
+        self.release.clear();
         Ok(report)
     }
 
@@ -484,6 +525,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         let mut out = BTreeMap::new();
         let mut unknown = Vec::new();
         let mut links = HashSet::new();
+        let mut link_paths = BTreeSet::new();
         let mut queue = vec![RelPath::root()];
         while let Some(dir) = queue.pop() {
             let mut entries = match self.fs.list(&dir) {
@@ -511,6 +553,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 // renamed, neither name is tracked yet): the tracked file behind it is never taken for deleted.
                 if entry.kind == FsKind::Other {
                     links.insert((dir.clone(), name.fold_key()));
+                    link_paths.insert(dir.join(&name));
                 }
                 if let Some(first) = seen.insert(name.fold_key(), name.clone()) {
                     report.skipped.push((shown, format!("the name clashes with {first} when case is ignored")));
@@ -541,7 +584,116 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             }
             unknown.push(path);
         }
-        Ok((out, Unseen { unknown, links }))
+        Ok((out, Unseen { unknown, links, link_paths }))
+    }
+
+    /// Every folder of a scan by its local ID.
+    fn dirs_by_id(local: &BTreeMap<RelPath, FsKind>) -> HashMap<u64, RelPath> {
+        local
+            .iter()
+            .filter_map(|(p, k)| match k {
+                FsKind::Dir { id: Some(i) } => Some((*i, p.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A tracked folder found at its place is that folder (path first). When its recorded local ID is gone from the
+    /// folder (it was put back from another drive, or made again), or is on a folder at an untracked place with no
+    /// link in it (the user renamed it and made a new one under the old name: the renamed one goes up as a new
+    /// folder), it takes the ID it has now, so a later rename of it is sent as a move and a link in it is still found
+    /// through it. A renamed folder holding a link keeps the ID: the link that went with it is found through it. Not
+    /// while any folder can't be listed (the old ID may be in there), and never an ID another tracked folder has.
+    ///
+    /// `index` is the base by path, `local` and `unseen` a scan, and `expected` where a base path is now after the
+    /// folder moves the scan found.
+    fn refresh_dir_ids(
+        &mut self,
+        index: &BTreeMap<RelPath, NodeId>,
+        local: &BTreeMap<RelPath, FsKind>,
+        unseen: &Unseen,
+        expected: &dyn Fn(&RelPath) -> RelPath,
+    ) {
+        if !unseen.unknown.is_empty() {
+            return;
+        }
+        let root = self.state.root;
+        let dir_at = Self::dirs_by_id(local);
+        let refreshed: Vec<(NodeId, Option<u64>)> = index
+            .iter()
+            .filter_map(|(path, id)| match (&self.state.base.get(id)?.kind, local.get(&expected(path))?) {
+                (BaseKind::Dir { local_id }, FsKind::Dir { id: here })
+                    if Some(*id) != root
+                        && here.is_some()
+                        && *local_id != *here
+                        && local_id.is_none_or(|old| {
+                            dir_at.get(&old).is_none_or(|at| !index.contains_key(at) && !unseen.links.iter().any(|(d, _)| d.starts_with(at)))
+                        })
+                        && !self.owns_local_dir(*here, *id) =>
+                {
+                    Some((*id, *here))
+                }
+                _ => None,
+            })
+            .collect();
+        for (id, here) in refreshed {
+            if let Some(BaseEntry { kind: BaseKind::Dir { local_id }, .. }) = self.state.base.get_mut(&id) {
+                *local_id = here;
+            }
+        }
+    }
+
+    /// Folder IDs are learnt at the start of every pass, before anything can fail: a tracked folder at its place
+    /// under a new local ID (a link that became a real folder again, a folder put back from another drive) takes it
+    /// as the push would ([`Engine::refresh_dir_ids`]). Otherwise a pass that fails first (offline, a download that
+    /// breaks off) leaves the old ID behind, and if the user then moves the folder, the next pass can't find it by
+    /// ID: the move looks like a delete plus a new folder, and a node behind a link inside it would be deleted on the
+    /// server (seed 112337). The whole folder is scanned only when a quick look at every tracked folder's place finds
+    /// one with an ID it didn't record, and not when it finds only IDs the last such scan declined (a folder that
+    /// couldn't be listed, a renamed folder holding a link, an ID another tracked folder has): those would cost a
+    /// second full scan on every pass until resolved, and the push's own refresh takes them once they can be taken.
+    fn learn_dir_ids(&mut self) -> Result<(), SyncError> {
+        let Some(root) = self.state.root else { return Ok(()) };
+        let stale: BTreeSet<(NodeId, u64)> = self
+            .state
+            .base
+            .iter()
+            .filter_map(|(id, entry)| {
+                let BaseKind::Dir { local_id } = entry.kind else { return None };
+                if *id == root {
+                    return None;
+                }
+                match self.fs.stat(&self.state.base_path(*id)?) {
+                    Ok(Some(FsKind::Dir { id: Some(here) })) if Some(here) != local_id => Some((*id, here)),
+                    _ => None,
+                }
+            })
+            .collect();
+        if stale.is_subset(&self.declined_dir_ids) {
+            self.declined_dir_ids = stale;
+            return Ok(());
+        }
+        // The push's scan reports what it skips; this one is only a look.
+        let (local, unseen) = self.scan(&mut Report::default())?;
+        let index = self.state.base_index();
+        self.refresh_dir_ids(&index, &local, &unseen, &|p| p.clone());
+        self.declined_dir_ids = stale
+            .into_iter()
+            .filter(
+                |(id, here)| matches!(self.state.base.get(id), Some(BaseEntry { kind: BaseKind::Dir { local_id }, .. }) if *local_id != Some(*here)),
+            )
+            .collect();
+        Ok(())
+    }
+
+    /// Fails as a filesystem error on the node (it is skipped and tried again next pass) if the file at `path` may
+    /// still be being written ([`Fs::still_changing`]): it is never moved aside as a conflict copy, or replaced, while
+    /// an app may be writing it. Asked only about a file that differs from the base.
+    fn wait_if_changing(&self, path: &RelPath) -> Result<(), SyncError> {
+        match self.stat(path)? {
+            Some(FsKind::File(meta)) if self.fs.still_changing(path, &meta) => Err(io_err(path, io::Error::other(STILL_CHANGING))),
+            _ => Ok(()),
+        }
     }
 
     fn stat(&self, path: &RelPath) -> Result<Option<FsKind>, SyncError> {

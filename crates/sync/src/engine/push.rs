@@ -1,24 +1,26 @@
 //! Turning the folder's changes into uploads and batch commits.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 
 use bytes::Bytes;
 use craft_cloud_chunker::{FASTCDC_V1, chunk_reader};
 use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_TREE_DEPTH};
-use craft_cloud_proto::{ChunkId, ChunkRef, ChunkerParamsId, Conflict, Epoch, FileHash, FileState, Manifest, NewVersion, NodeId, Op, VersionId};
+use craft_cloud_proto::{
+    ChunkId, ChunkRef, ChunkerParamsId, Conflict, Epoch, FileHash, FileState, FoldKey, Manifest, Name, NewVersion, NodeId, Op, VersionId,
+};
 
 use crate::fs::{FileMeta, Fs, FsKind};
 use crate::path::RelPath;
-use crate::state::{BaseEntry, BaseKind, RemoteNode};
+use crate::state::{BaseEntry, BaseKind, HeldLink, RemoteNode};
 use crate::transport::{Transport, TransportError};
 
-use super::{Effect, Engine, MISSING_QUERY_IDS, Report, SyncError, per_node};
+use super::{Effect, Engine, MISSING_QUERY_IDS, Report, STILL_CHANGING, SyncError, per_node};
 
 impl<F: Fs, T: Transport> Engine<F, T> {
     pub(super) async fn push(&mut self, report: &mut Report) -> Result<(), SyncError> {
         let root = self.state.root.ok_or_else(|| SyncError::Corrupt("no root".into()))?;
-        let (local, unseen) = self.scan(report)?;
+        let (local, mut unseen) = self.scan(report)?;
         // Inside a folder that couldn't be listed, or at or below a link, nothing is known, so nothing tracked there
         // is missing. Judged where the node is expected now: a link moves with a folder the user renamed.
         let hidden = |path: &RelPath| unseen.hides(path);
@@ -77,9 +79,17 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     // Another tracked file is here now; this one moved (or was moved aside).
                     missing_files.push((*id, path.clone()));
                 }
-                (BaseKind::File { .. }, Some(FsKind::File(m))) => {
+                (BaseKind::File { local_id, hash, .. }, Some(FsKind::File(m))) => {
                     if !self.file_matches(entry, &now, m)? {
-                        modified.push((*id, now, *m));
+                        if m.id != *local_id && self.state.held_deletes.contains_key(id) && self.content_hash(&now) != Some(*hash) {
+                            // A held node's place holds another file (another local ID, other content): not the node.
+                            // Another machine may have moved the node's folder onto a folder of this machine's own (seed
+                            // 95497 of fix round 5 moved the node itself; such a move now moves the file aside, see
+                            // `apply_missing`). It stays missing, so the hold stands while its link does; that file waits.
+                            missing_files.push((*id, path.clone()));
+                        } else {
+                            modified.push((*id, now, *m));
+                        }
                     }
                 }
                 (BaseKind::File { .. }, _) => missing_files.push((*id, path.clone())),
@@ -93,42 +103,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         }
 
         // Every folder by its local ID.
-        let dir_at: HashMap<u64, RelPath> = local
-            .iter()
-            .filter_map(|(p, k)| match k {
-                FsKind::Dir { id: Some(i) } => Some((*i, p.clone())),
-                _ => None,
-            })
-            .collect();
-        // A tracked folder found at its place is that folder (path first). When its recorded local ID is gone from
-        // the folder (it was put back from another drive, or made again), or is on a folder at an untracked place with
-        // no link in it (the user renamed it and made a new one under the old name: the renamed one goes up as a new
-        // folder), it takes the ID it has now, so a later rename of it is sent as a move and a link in it is still
-        // found through it. A renamed folder holding a link keeps the ID: the link that went with it is found through
-        // it. Not while any folder can't be listed (the old ID may be in there), and never an ID another tracked
-        // folder has.
-        let refreshed: Vec<(NodeId, Option<u64>)> = index
-            .iter()
-            .filter_map(|(path, id)| match (&self.state.base.get(id)?.kind, local.get(&expected(path))?) {
-                (BaseKind::Dir { local_id }, FsKind::Dir { id: here })
-                    if *id != root
-                        && unknown.is_empty()
-                        && here.is_some()
-                        && local_id.is_none_or(|old| {
-                            dir_at.get(&old).is_none_or(|at| !index.contains_key(at) && !unseen.links.iter().any(|(d, _)| d.starts_with(at)))
-                        })
-                        && !self.owns_local_dir(*here, *id) =>
-                {
-                    Some((*id, *here))
-                }
-                _ => None,
-            })
-            .collect();
-        for (id, here) in refreshed {
-            if let Some(BaseEntry { kind: BaseKind::Dir { local_id }, .. }) = self.state.base.get_mut(&id) {
-                *local_id = here;
-            }
-        }
+        let dir_at = Self::dirs_by_id(&local);
+        self.refresh_dir_ids(&index, &local, &unseen, &expected);
 
         // File moves: a missing base file whose local ID turns up at an untracked path.
         let untracked_files: HashMap<u64, (RelPath, FileMeta)> = local
@@ -150,6 +126,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 None => true,
             }
         });
+        // Every node not found here: at its place, moved by its local ID, or in a folder that moved. A hold on any
+        // other node is dropped: that node turned up again, so the link isn't it.
+        let not_found: HashSet<NodeId> = missing_files.iter().chain(&missing_dirs).map(|(id, _)| *id).collect();
         // A folder above a missing node that the user moved is found by its local ID even where a new folder took
         // its old name (so it isn't a folder move here): a link the node turned into moved with it.
         let behind_moved_link = |id: NodeId| -> bool {
@@ -173,6 +152,122 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         // A node the server already deleted (still tracked here while something waits for it) needs no delete.
         missing_files.retain(|(id, _)| self.state.remote.contains_key(id));
         missing_dirs.retain(|(id, _)| self.state.remote.contains_key(id));
+        // Deletes held behind a link (seed 112337's no-pass order). A link or special file at a path where the last
+        // finished push saw none appeared since. If it carries a name from a missing node's last local path (the
+        // node's own name or a folder's on its path, where this machine last had it: before any server move the pull
+        // let it follow, see `State::left_from`), it may be that node, moved with its folder: a folder put back from
+        // another drive and moved before any pass saw it has a new local ID, so nothing tells the move apart from a
+        // delete plus a new folder. The node's delete is then held by node ID with the paths of every such link (an
+        // unrelated one with the same name may appear in the same window; `State::held_deletes`), saved before this
+        // pass commits anything. No folder identity goes into this, so no
+        // folder gesture can make such a link look old (a new folder at the old place, another folder renamed onto
+        // it, a deleted folder's place taken, a folder that can't be listed, a server move). A link that was there at
+        // the last finished push never holds anything.
+        //
+        // A hold lasts while any of its links stands where the hold last saw it (or can't be seen, or the scan
+        // couldn't see everything), or a link with that one's name stands at a path the last finished push saw no
+        // link at (the link's folder moved: the user's rename, another machine's rename pulled here, the engine moving
+        // it aside, put back under a new name; every such path), and while the node isn't found here again. Once none
+        // is left (the user removed each link, renamed the link itself, or made it a real file again, which goes up
+        // as a new one) the node is judged afresh. The folders above a held node wait with it. A hold on a node the
+        // server no longer has, or this machine no longer tracks, is dropped: there is nothing left to delete. A hold
+        // the user released by naming its node in an approval is dropped too, and isn't made again this pass: its
+        // delete goes.
+        let mut holds = std::mem::take(&mut self.state.held_deletes);
+        // A hold with no link (only from a hand-edited or damaged state; the agent drops those at load with a line) is
+        // never kept: it would hold the delete without ever being shown.
+        holds.retain(|id, link| {
+            !link.paths.is_empty()
+                && self.state.base.contains_key(id)
+                && self.state.remote.contains_key(id)
+                && not_found.contains(id)
+                && !self.release.contains(id)
+        });
+        // The links that appeared since the last finished push, by folded name (paths in order). Only needed while
+        // something is missing or held: a synced project with thousands of links costs nothing on an ordinary pass.
+        let mut new_links: HashMap<FoldKey, Vec<&RelPath>> = HashMap::new();
+        if !(missing_files.is_empty() && missing_dirs.is_empty() && holds.is_empty()) {
+            for link in unseen.link_paths.iter().filter(|p| !self.state.known_links.contains(*p)) {
+                if let Some(name) = link.file_name() {
+                    new_links.entry(name.fold_key()).or_default().push(link);
+                }
+            }
+        }
+        let blind = !unseen.unknown.is_empty();
+        holds.retain(|_, link| {
+            if blind {
+                return true;
+            }
+            // Each candidate stands where it was, or follows by name to every new link (none: it is gone).
+            link.paths = std::mem::take(&mut link.paths)
+                .into_iter()
+                .flat_map(|path| {
+                    if unseen.hides(&path) {
+                        return vec![path];
+                    }
+                    path.file_name()
+                        .and_then(|n| new_links.get(&n.fold_key()))
+                        .map(|moved| moved.iter().map(|p| (*p).clone()).collect())
+                        .unwrap_or_default()
+                })
+                .collect();
+            !link.paths.is_empty()
+        });
+        // The folded names on a node's path: in the base, and where this machine last had it or a folder above it
+        // before the pull let it follow a server move.
+        let names_of = |id: NodeId| -> HashSet<FoldKey> {
+            let mut keys = HashSet::new();
+            let mut current = id;
+            for _ in 0..=MAX_TREE_DEPTH {
+                if let Some(was) = self.state.left_from.get(&current) {
+                    keys.extend(was.names().iter().map(Name::fold_key));
+                }
+                let Some(BaseEntry { name: Some(name), parent: Some(parent), .. }) = self.state.base.get(&current) else { break };
+                keys.insert(name.fold_key());
+                current = *parent;
+            }
+            keys
+        };
+        // Every candidate: an unrelated link with the same name may appear in the same window as the real one.
+        let held = |id: NodeId| -> Option<HeldLink> {
+            if new_links.is_empty() {
+                return None;
+            }
+            let paths: BTreeSet<RelPath> = names_of(id).iter().filter_map(|k| new_links.get(k)).flatten().map(|p| (*p).clone()).collect();
+            (!paths.is_empty()).then_some(HeldLink { paths })
+        };
+        // Every held path and every folder above one, so the folders that wait with them are found by a lookup (not
+        // by comparing every missing folder with every hold).
+        let mut kept_by_link: HashSet<RelPath> = HashSet::new();
+        let mut new_holds = false;
+        for list in [&mut missing_files, &mut missing_dirs] {
+            list.retain(|(id, path)| {
+                if !holds.contains_key(id) {
+                    if self.release.contains(id) {
+                        return true;
+                    }
+                    let Some(link) = held(*id) else { return true };
+                    holds.insert(*id, link);
+                    new_holds = true;
+                }
+                // The path and its folders up to the root; a folder already in the set has its own above it.
+                let mut at = Some(path.clone());
+                while let Some(p) = at {
+                    at = p.parent();
+                    if !kept_by_link.insert(p) {
+                        break;
+                    }
+                }
+                false
+            });
+        }
+        missing_dirs.retain(|(_, path)| !kept_by_link.contains(path));
+        self.state.held_deletes = holds;
+        // A new hold is saved before any commit of this pass (the link stays new until the push finishes, so a crash
+        // before that would find it again; saving it first doesn't depend on that).
+        if new_holds {
+            self.checkpoint()?;
+        }
         let moved_targets: BTreeSet<RelPath> =
             file_moves.iter().map(|(_, _, to, _)| to.clone()).chain(dir_moves.iter().map(|(_, _, to)| to.clone())).collect();
 
@@ -259,15 +354,22 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 modified.push((*id, to.clone(), *meta));
             }
         }
-        // Edits.
-        for (id, path, _) in &modified {
+        // Edits. One that may still be being written waits (the base keeps the old version, so it isn't lost or
+        // overwritten meanwhile) and is looked at again later.
+        for (id, path, meta) in &modified {
+            if self.fs.still_changing(path, meta) {
+                report.skipped.push((path.to_string(), format!("{STILL_CHANGING}; synced once it stops")));
+                continue;
+            }
             let Some(BaseEntry { kind: BaseKind::File { version: expected, exec, .. }, .. }) = self.state.base.get(id).cloned() else { continue };
             let Some((version, size, meta, hash)) = self.upload(path, exec, report).await? else { continue };
             ops.push((Op::Update { node: *id, expected, version: version.clone() }, Effect::Update { id: *id, version, size, meta, hash }));
         }
         // New files.
         for (path, kind) in &new_paths {
-            if !matches!(kind, FsKind::File(_)) {
+            let FsKind::File(meta) = kind else { continue };
+            if self.fs.still_changing(path, meta) {
+                report.skipped.push((path.to_string(), format!("{STILL_CHANGING}; synced once it stops")));
                 continue;
             }
             let (Some(name), Some(parent)) = (path.file_name().cloned(), parent_id(path, &new_ids)) else { continue };
@@ -299,7 +401,20 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             }
         }
 
-        self.commit_all(ops, report).await
+        let seen_links = std::mem::take(&mut unseen.link_paths);
+        self.commit_all(ops, report, seen_links).await?;
+        // Every hold, where the node is now, for the pass summary and `status`.
+        let held: Vec<(NodeId, RelPath, Vec<RelPath>)> = self
+            .state
+            .held_deletes
+            .iter()
+            .filter_map(|(id, link)| Some((*id, self.state.base_path(*id)?, link.paths.iter().cloned().collect())))
+            .collect();
+        for (id, node, links) in held {
+            report.held_nodes.push(id);
+            report.held_deletes.push((node, links));
+        }
+        Ok(())
     }
 
     /// Uploads a file's chunks and manifest. `None` when the file changed while being read (it is retried
@@ -373,9 +488,22 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         Ok(Some((version, summary.size, before, FileHash::from_bytes(summary.file_hash))))
     }
 
+    /// A push finished: the links it saw (`links`) are known from now on, since anything a new one could be is held
+    /// by now, and no node's last local place needs remembering (see `State::known_links`, `State::left_from`).
+    /// Returns whether that changed the state.
+    fn finish_push(&mut self, links: BTreeSet<RelPath>) -> bool {
+        let changed = self.state.known_links != links || !self.state.left_from.is_empty();
+        self.state.known_links = links;
+        self.state.left_from.clear();
+        changed
+    }
+
     /// Commits operations in batches. A refused batch is retried without its refused operations (their
-    /// dependants are usually refused with them); refused operations are tried again next pass.
-    async fn commit_all(&mut self, ops: Vec<(Op, Effect)>, report: &mut Report) -> Result<(), SyncError> {
+    /// dependants are usually refused with them); refused operations are tried again next pass. Once the last batch
+    /// is answered the push has finished: `links` (what its scan saw) are recorded in the checkpoint after that
+    /// commit, or in one of their own when there was nothing to commit.
+    async fn commit_all(&mut self, ops: Vec<(Op, Effect)>, report: &mut Report, links: BTreeSet<RelPath>) -> Result<(), SyncError> {
+        let mut finished = Some(links);
         let mut queue: std::collections::VecDeque<(Op, Effect)> = ops.into();
         let mut retried: BTreeSet<NodeId> = BTreeSet::new();
         while !queue.is_empty() {
@@ -412,6 +540,11 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                         for (_, effect) in batch.drain(..) {
                             self.record(effect, report);
                         }
+                        if queue.is_empty()
+                            && let Some(links) = finished.take()
+                        {
+                            self.finish_push(links);
+                        }
                         self.checkpoint()?;
                         break;
                     }
@@ -443,7 +576,26 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                                 per_node(result, report)?;
                             }
                         }
-                        let refused: BTreeSet<usize> = conflicts.iter().map(|c| c.op).filter(|i| !fixable.contains_key(i)).collect();
+                        let mut refused: BTreeSet<usize> = conflicts.iter().map(|c| c.op).filter(|i| !fixable.contains_key(i)).collect();
+                        // A refused delete keeps its node tracked, so the folders above it stay too: their deletes
+                        // are dropped with it (in this batch and later ones), or the node would be left tracked
+                        // under a folder the server no longer has. They go once the node is settled.
+                        let mut kept_dirs: BTreeSet<NodeId> = BTreeSet::new();
+                        for i in &refused {
+                            if let Some((Op::Delete { node, .. }, _)) = batch.get(*i) {
+                                let mut current = self.state.base.get(node).and_then(|e| e.parent);
+                                for _ in 0..=MAX_TREE_DEPTH {
+                                    let Some(parent) = current else { break };
+                                    if !kept_dirs.insert(parent) {
+                                        break;
+                                    }
+                                    current = self.state.base.get(&parent).and_then(|e| e.parent);
+                                }
+                            }
+                        }
+                        let keeps = |op: &Op| matches!(op, Op::Delete { node, expected: None } if kept_dirs.contains(node));
+                        refused.extend(batch.iter().enumerate().filter(|(_, (op, _))| keeps(op)).map(|(i, _)| i));
+                        queue.retain(|(op, _)| !keeps(op));
                         // An edit to a file the server deleted that still can't go up (its folder can't come back
                         // where it was, say), or a move of such a file (which can never apply): forget the node, and
                         // the next pass uploads the file as a new one.
@@ -486,6 +638,11 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     Err(e) => return Err(e.into()),
                 }
             }
+        }
+        if let Some(links) = finished.take()
+            && self.finish_push(links)
+        {
+            self.checkpoint()?;
         }
         Ok(())
     }
@@ -567,6 +724,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 self.state.remote.remove(&id);
                 self.state.base.remove(&id);
                 report.removed_remotely.push(path);
+                report.removed_nodes.push(id);
             }
         }
     }

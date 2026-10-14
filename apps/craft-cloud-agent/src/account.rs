@@ -7,8 +7,11 @@
 //!   keep it in the profile. An OS keychain can come later.
 //! - `state.json`: `{ "schema": 1, "state": <the engine's State>, "last_pass": … }`, written after every pass,
 //!   failed or not. One document, not a table per node: the engine works on the whole state in memory anyway.
+//! - `status.json`: what the `run` loop is doing ([`LoopStatus`]), for `status`; `shown.json`: the set of waiting
+//!   deletions `status` last listed ([`Shown`]); `approval.json`: deletions
+//!   `sync --approve-deletes` approved while the loop held the locks ([`Approval`]), taken by the loop.
 //!
-//! Both are written atomically (temporary file, flush, rename), so a crash leaves the old file or the new one.
+//! All are written atomically (temporary file, flush, rename), so a crash leaves the old file or the new one.
 //! A crash loses at most one pass of bookkeeping, which the next pass redoes. A file written by a newer agent
 //! (a higher `schema`) is refused, never half-read.
 
@@ -26,6 +29,21 @@ use crate::http::{DeviceToken, ServerUrl};
 
 pub const ACCOUNT_FILE: &str = "account.json";
 pub const STATE_FILE: &str = "state.json";
+/// What the `run` loop is doing ([`LoopStatus`]), next to `state.json`.
+pub const STATUS_FILE: &str = "status.json";
+/// An approval handed to the running loop ([`Approval`]).
+pub const APPROVAL_FILE: &str = "approval.json";
+/// The deletions `status` last listed for approval while the loop waited ([`Shown`]).
+pub const SHOWN_FILE: &str = "shown.json";
+/// The format of `shown.json` this agent writes and the newest it reads.
+pub const SHOWN_SCHEMA: u32 = 1;
+/// Temporary files of the data folder younger than this are left alone by [`DataDir::clean_tmp`]: another process
+/// (`status`, `sync --approve-deletes`) may be writing one right now.
+pub const TEMP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+/// The format of `status.json` this agent writes and the newest it reads.
+pub const STATUS_SCHEMA: u32 = 1;
+/// The format of `approval.json` this agent writes and the newest it reads.
+pub const APPROVAL_SCHEMA: u32 = 2;
 /// The format of `account.json` this agent writes and the newest it reads.
 pub const ACCOUNT_SCHEMA: u32 = 1;
 /// The format of `state.json` this agent writes and the newest it reads.
@@ -100,6 +118,14 @@ pub struct PassSummary {
     pub pending_local_deletes: Vec<String>,
     /// The nodes behind both pending lists: `sync --approve-deletes` releases exactly these.
     pub pending_nodes: Vec<NodeId>,
+    /// Server deletes held behind a link: the node's path and the paths of all its links. Each is held until the
+    /// user removes or replaces its links (see the engine's `State::held_deletes`), or approves the held set by
+    /// naming it (`sync --approve-deletes=<set>`, [`PassSummary::held_set`]). A summary an older agent saved has one
+    /// link per hold (a string) and loads as a one-element list.
+    #[serde(deserialize_with = "held_deletes_any_form")]
+    pub held_deletes: Vec<(String, Vec<String>)>,
+    /// The nodes behind `held_deletes`, in the same order (none in a summary an older agent saved).
+    pub held_nodes: Vec<NodeId>,
 }
 
 impl PassSummary {
@@ -119,16 +145,25 @@ impl PassSummary {
             pending_deletes: paths(&report.pending_deletes),
             pending_local_deletes: paths(&report.pending_local_deletes),
             pending_nodes: report.pending_nodes.clone(),
+            held_deletes: report
+                .held_deletes
+                .iter()
+                .map(|(path, links)| (path.to_string(), links.iter().map(ToString::to_string).collect()))
+                .collect(),
+            held_nodes: report.held_nodes.clone(),
         }
     }
 
-    /// Only the deletions waiting for approval (paths and nodes): what a failed pass keeps from the pass before
-    /// it, because the user was shown those lists and `--approve-deletes` still means exactly them.
+    /// Only the deletions waiting for approval (paths and nodes) and the held ones: what a failed pass keeps from
+    /// the pass before it, because the user was shown those lists and `--approve-deletes` still means exactly them
+    /// (and a failed pass releases no hold).
     pub fn pending_only(&self) -> Self {
         Self {
             pending_deletes: self.pending_deletes.clone(),
             pending_local_deletes: self.pending_local_deletes.clone(),
             pending_nodes: self.pending_nodes.clone(),
+            held_deletes: self.held_deletes.clone(),
+            held_nodes: self.held_nodes.clone(),
             ..Self::default()
         }
     }
@@ -136,6 +171,83 @@ impl PassSummary {
     pub fn needs_approval(&self) -> bool {
         !self.pending_deletes.is_empty() || !self.pending_local_deletes.is_empty()
     }
+
+    /// Whether anything can be approved: deletions the mass-delete guard holds back, or deletes held behind a link
+    /// (released only by naming their set).
+    pub fn approvable(&self) -> bool {
+        self.needs_approval() || self.held_set().is_some()
+    }
+
+    /// A short identifier of exactly the set of deletes held behind a link (their nodes, paths and every one of
+    /// their links), apart from [`PassSummary::pending_set`]: `sync --approve-deletes=<set>` naming it lets those
+    /// deletes go. A set computed over fewer links than a hold has is another set, so it can't release it. The bare
+    /// `--approve-deletes` never does: a hold is released only when the user names it. `None` when nothing is held
+    /// (or an older agent saved the summary without the nodes).
+    pub fn held_set(&self) -> Option<String> {
+        if self.held_nodes.is_empty() || self.held_nodes.len() != self.held_deletes.len() {
+            return None;
+        }
+        let mut items: Vec<String> = self
+            .held_nodes
+            .iter()
+            .zip(&self.held_deletes)
+            .map(|(node, (path, links))| {
+                let mut links = links.clone();
+                links.sort();
+                format!("{node}\0{path}\0{}", links.join("\0"))
+            })
+            .collect();
+        items.sort();
+        let mut hasher = blake3::Hasher::new();
+        for item in items {
+            hasher.update(b"held\0");
+            hasher.update(item.as_bytes());
+            hasher.update(&[0]);
+        }
+        Some(hasher.finalize().to_hex().get(..12).unwrap_or_default().to_owned())
+    }
+
+    /// A short identifier of exactly the set of deletions waiting for approval (its nodes and paths, in any order),
+    /// so an approval can name the set the user saw. `None` when nothing waits.
+    pub fn pending_set(&self) -> Option<String> {
+        if !self.needs_approval() {
+            return None;
+        }
+        let mut nodes: Vec<String> = self.pending_nodes.iter().map(ToString::to_string).collect();
+        nodes.sort();
+        let mut there = self.pending_deletes.clone();
+        there.sort();
+        let mut here = self.pending_local_deletes.clone();
+        here.sort();
+        let mut hasher = blake3::Hasher::new();
+        for (kind, list) in [("node", &nodes), ("server", &there), ("here", &here)] {
+            for item in list {
+                hasher.update(kind.as_bytes());
+                hasher.update(&[0]);
+                hasher.update(item.as_bytes());
+                hasher.update(&[0]);
+            }
+        }
+        Some(hasher.finalize().to_hex().get(..12).unwrap_or_default().to_owned())
+    }
+}
+
+/// `PassSummary::held_deletes` in either form: every link of a hold (now), or the one link an older agent saved.
+fn held_deletes_any_form<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<(String, Vec<String>)>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Links {
+        All(Vec<String>),
+        One(String),
+    }
+    let held: Vec<(String, Links)> = Deserialize::deserialize(de)?;
+    Ok(held
+        .into_iter()
+        .map(|(path, links)| match links {
+            Links::All(all) => (path, all),
+            Links::One(one) => (path, vec![one]),
+        })
+        .collect())
 }
 
 /// The last pass: when it ended, how, and (if it finished) what it did.
@@ -155,6 +267,87 @@ pub struct SavedState {
     pub state: State,
     #[serde(default)]
     pub last_pass: Option<LastPass>,
+}
+
+/// `status.json`: what the `run` loop is doing, written atomically on every change and as a heartbeat, for `status`
+/// to read (the loop holds the locks, so `status` can't ask it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopStatus {
+    pub schema: u32,
+    /// The loop's process.
+    pub pid: u32,
+    /// When it started, milliseconds since the Unix epoch.
+    pub started_ms: i64,
+    /// When it last wrote this file.
+    pub heartbeat_ms: i64,
+    /// How often it writes this file while running, so a reader can tell a stale one (the loop was killed).
+    pub heartbeat_every_ms: u64,
+    pub state: LoopState,
+    /// Deletions the mass-delete guard held back wait for `sync --approve-deletes` (the last pass listed them).
+    /// Nothing else syncs any slower meanwhile.
+    #[serde(default)]
+    pub waiting_for_approval: bool,
+    /// Deletes are held behind a link (the last pass listed them): released when their links go, or by
+    /// `sync --approve-deletes=<set>` naming their set. A hold pauses nothing and may stand for days; it never sets
+    /// `waiting_for_approval`.
+    #[serde(default)]
+    pub held: bool,
+    /// The last pass the loop ran: when, how it ended and what it did.
+    #[serde(default)]
+    pub last_pass: Option<LastPass>,
+    /// Why the folder isn't watched, while it isn't (the watcher couldn't start): changes there are then found by
+    /// a full pass every minute.
+    #[serde(default)]
+    pub not_watching: Option<String>,
+}
+
+impl LoopStatus {
+    /// Whether the loop that wrote this is running, as of `now_ms`: it hasn't said it stopped, and its heartbeat is
+    /// fresh (at most three beats and a few seconds old; a killed loop stops writing it).
+    pub fn running(&self, now_ms: i64) -> bool {
+        let stale_after = i64::try_from(self.heartbeat_every_ms.saturating_mul(3)).unwrap_or(i64::MAX).saturating_add(5_000);
+        self.state != LoopState::Stopped && now_ms.saturating_sub(self.heartbeat_ms) <= stale_after
+    }
+}
+
+/// The `run` loop's state in `status.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum LoopState {
+    /// Waiting for something to sync.
+    Idle,
+    /// A pass is running.
+    Syncing,
+    /// The last pass failed for a reason that may pass by itself; the next try is at `next_try_ms`.
+    Retrying { next_try_ms: i64, message: String },
+    /// Stopped until the user does something; looked at again by itself at `next_check_ms`, if set.
+    Paused { reason: String, next_check_ms: Option<i64> },
+    /// Stopping after the running pass.
+    Stopping,
+    /// The loop ended.
+    Stopped,
+}
+
+/// `approval.json`: the waiting deletions `sync --approve-deletes` approved while the loop held the locks, as the set
+/// `status` showed ([`PassSummary::pending_set`]). The loop takes it and releases exactly these, and only if they are
+/// still the set that waits; otherwise it discards it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Approval {
+    pub schema: u32,
+    /// The set's identifier (an approval from an older agent has none, and matches no set).
+    #[serde(default)]
+    pub set: String,
+    pub nodes: Vec<NodeId>,
+    pub given_ms: i64,
+}
+
+/// `shown.json`: the waiting deletions `status` last listed while the loop held the locks, so
+/// `sync --approve-deletes` approves exactly what was shown (and refuses a set that changed since).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Shown {
+    pub schema: u32,
+    pub set: String,
+    pub shown_ms: i64,
 }
 
 /// Just the format number, read before the rest so a newer file is refused cleanly.
@@ -233,11 +426,55 @@ impl DataDir {
         remove(&self.file(STATE_FILE))
     }
 
-    /// Removes the temporary files a crash left while `account.json` or `state.json` was written
-    /// (`.state.json.<random>.tmp`), and nothing else. Call it while holding the data folder's lock. Returns how many
-    /// it removed.
+    /// Removes the temporary files a crash left while `account.json`, `state.json`, `status.json`, `approval.json` or
+    /// `shown.json` was written (`.state.json.<random>.tmp`), and nothing else. Call it while holding the data
+    /// folder's lock. Only those at least [`TEMP_MIN_AGE`] old go: `status` and `sync --approve-deletes` write files
+    /// here without the lock (while a loop holds it), and one may be writing right now. Returns how many it removed.
     pub fn clean_tmp(&self) -> Result<usize, AccountError> {
-        remove_atomic_temps(&self.0, |of| of == ACCOUNT_FILE || of == STATE_FILE).map_err(io_at(&self.0))
+        remove_atomic_temps(&self.0, |of| [ACCOUNT_FILE, STATE_FILE, STATUS_FILE, APPROVAL_FILE, SHOWN_FILE].contains(&of), TEMP_MIN_AGE)
+            .map_err(io_at(&self.0))
+    }
+
+    /// What the `run` loop last wrote about itself, if it ever ran here.
+    pub fn load_status(&self) -> Result<Option<LoopStatus>, AccountError> {
+        load(&self.file(STATUS_FILE), STATUS_SCHEMA)
+    }
+
+    /// Writes the `run` loop's status (atomically, owner-only).
+    pub fn save_status(&self, status: &LoopStatus) -> Result<(), AccountError> {
+        save(&self.file(STATUS_FILE), status)
+    }
+
+    /// Hands an approval of the waiting set `set` (its deletions `nodes`) to the running loop, in place of any it
+    /// hasn't taken yet: an approval names one set, the one shown.
+    pub fn give_approval(&self, set: &str, nodes: &[NodeId], now_ms: i64) -> Result<(), AccountError> {
+        save(&self.file(APPROVAL_FILE), &Approval { schema: APPROVAL_SCHEMA, set: set.to_owned(), nodes: nodes.to_vec(), given_ms: now_ms })
+    }
+
+    /// Remembers that `status` listed the waiting set `set`.
+    pub fn save_shown(&self, set: &str, now_ms: i64) -> Result<(), AccountError> {
+        save(&self.file(SHOWN_FILE), &Shown { schema: SHOWN_SCHEMA, set: set.to_owned(), shown_ms: now_ms })
+    }
+
+    /// The waiting set `status` last listed, if any.
+    pub fn load_shown(&self) -> Result<Option<Shown>, AccountError> {
+        load(&self.file(SHOWN_FILE), SHOWN_SCHEMA)
+    }
+
+    /// Takes the approval `sync --approve-deletes` left for the running loop, if any. It is first renamed to a
+    /// temporary name, so an approval given while this one is read lands as a new file and is taken next time; a
+    /// damaged one is removed and reported.
+    pub fn take_approval(&self) -> Result<Option<Approval>, AccountError> {
+        let path = self.file(APPROVAL_FILE);
+        let taken = self.file(&format!(".{APPROVAL_FILE}.{}.tmp", random_hex().map_err(io_at(&self.0))?));
+        match fs::rename(&path, &taken) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_at(&path)(e)),
+        }
+        let approval = load::<Approval>(&taken, APPROVAL_SCHEMA);
+        remove(&taken)?;
+        approval
     }
 }
 
@@ -294,7 +531,7 @@ pub(crate) fn atomic_temp_of(name: &str) -> Option<&str> {
 
 /// Removes the temporary files a [`write_atomic`] cut short by a crash left in `dir` (regular files only, and only for
 /// files `ours` accepts by name). Returns how many it removed; a missing `dir` has none.
-pub(crate) fn remove_atomic_temps(dir: &Path, ours: impl Fn(&str) -> bool) -> io::Result<usize> {
+pub(crate) fn remove_atomic_temps(dir: &Path, ours: impl Fn(&str) -> bool, min_age: std::time::Duration) -> io::Result<usize> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
@@ -304,7 +541,10 @@ pub(crate) fn remove_atomic_temps(dir: &Path, ours: impl Fn(&str) -> bool) -> io
     for entry in entries {
         let entry = entry?;
         let stray = entry.file_name().to_str().and_then(atomic_temp_of).is_some_and(&ours);
-        if stray && entry.file_type().is_ok_and(|t| t.is_file()) {
+        // A young one may be a write under way (another process writing it now), unless any age will do.
+        let old_enough =
+            || min_age.is_zero() || entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age >= min_age);
+        if stray && entry.file_type().is_ok_and(|t| t.is_file()) && old_enough() {
             fs::remove_file(entry.path())?;
             removed += 1;
         }
@@ -312,15 +552,19 @@ pub(crate) fn remove_atomic_temps(dir: &Path, ours: impl Fn(&str) -> bool) -> io
     Ok(removed)
 }
 
+/// 16 random lowercase hex digits, the random part of [`write_atomic`]'s temporary names.
+fn random_hex() -> io::Result<String> {
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(|e| io::Error::other(format!("the system random source failed: {e}")))?;
+    Ok(random.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Writes `bytes` to `path` atomically: a temporary file next to it, flushed, then renamed over it. `private`
 /// makes the file owner-only on Unix (mode 0600 from creation, so it is never readable by others).
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| io::Error::other("no parent folder"))?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let mut random = [0u8; 8];
-    getrandom::fill(&mut random).map_err(|e| io::Error::other(format!("the system random source failed: {e}")))?;
-    let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
-    let temp = dir.join(format!(".{name}.{suffix}.tmp"));
+    let temp = dir.join(format!(".{name}.{}.tmp", random_hex()?));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -406,16 +650,94 @@ mod tests {
         let data = DataDir::new(dir.path().join("data"));
         assert_eq!(data.clean_tmp().unwrap(), 0, "no data folder yet");
         data.save_state(&SavedState { schema: STATE_SCHEMA, ..SavedState::default() }).unwrap();
-        let keep = [".notes.json.0123456789abcdef.tmp", ".state.json.tmp", "mine.tmp"];
-        for name in [".state.json.0123456789abcdef.tmp", ".account.json.fedcba9876543210.tmp"].iter().chain(&keep) {
-            fs::write(data.path().join(name), b"").unwrap();
+        // A write under way right now (`status` or `sync --approve-deletes` from another terminal) is young: kept.
+        let keep = [".notes.json.0123456789abcdef.tmp", ".state.json.tmp", "mine.tmp", ".approval.json.00000000000000ff.tmp"];
+        let a_while_ago = std::time::SystemTime::now() - TEMP_MIN_AGE - std::time::Duration::from_secs(1);
+        for name in [
+            ".state.json.0123456789abcdef.tmp",
+            ".account.json.fedcba9876543210.tmp",
+            ".status.json.0123456789abcdef.tmp",
+            ".approval.json.0123456789abcdef.tmp",
+            ".shown.json.0123456789abcdef.tmp",
+        ]
+        .iter()
+        .chain(&keep)
+        {
+            let path = data.path().join(name);
+            fs::write(&path, b"").unwrap();
+            if !name.contains("00000000000000ff") {
+                fs::File::options().write(true).open(&path).unwrap().set_modified(a_while_ago).unwrap();
+            }
         }
-        assert_eq!(data.clean_tmp().unwrap(), 2);
+        assert_eq!(data.clean_tmp().unwrap(), 5);
         let mut left: Vec<String> = fs::read_dir(data.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         left.sort();
         let mut want: Vec<String> = keep.iter().map(|s| (*s).to_owned()).chain([STATE_FILE.to_owned()]).collect();
         want.sort();
         assert_eq!(left, want);
+    }
+
+    #[test]
+    fn the_loop_status_round_trips_and_goes_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path());
+        assert_eq!(data.load_status().unwrap(), None);
+        let status = LoopStatus {
+            schema: STATUS_SCHEMA,
+            pid: 7,
+            started_ms: 1_000,
+            heartbeat_ms: 100_000,
+            heartbeat_every_ms: 15_000,
+            state: LoopState::Retrying { next_try_ms: 104_000, message: "offline".into() },
+            waiting_for_approval: true,
+            held: true,
+            last_pass: Some(LastPass { finished_ms: 99_000, outcome: Outcome::Failed("offline".into()), summary: None }),
+            not_watching: Some("too many folders to watch".into()),
+        };
+        data.save_status(&status).unwrap();
+        assert_eq!(data.load_status().unwrap(), Some(status.clone()));
+        assert!(status.running(100_000 + 50_000), "three beats and five seconds");
+        assert!(!status.running(100_000 + 50_001), "a killed loop's heartbeat goes stale");
+        assert!(!LoopStatus { state: LoopState::Stopped, ..status }.running(100_000), "a loop that said it stopped");
+    }
+
+    #[test]
+    fn an_approval_names_one_set_and_is_taken_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path());
+        assert_eq!(data.take_approval().unwrap(), None);
+        let (a, b) = (NodeId::generate(), NodeId::generate());
+        data.give_approval("set-1", &[a], 1).unwrap();
+        data.give_approval("set-2", &[a, b], 2).unwrap();
+        let taken = data.take_approval().unwrap().unwrap();
+        assert_eq!((taken.set.as_str(), taken.nodes, taken.given_ms), ("set-2", vec![a, b], 2), "the last one given");
+        assert_eq!(data.take_approval().unwrap(), None, "taken once");
+        assert_eq!(fs::read_dir(data.path()).unwrap().count(), 0, "nothing left behind");
+        fs::write(dir.path().join(APPROVAL_FILE), "{damaged").unwrap();
+        assert!(matches!(data.take_approval(), Err(AccountError::Damaged { .. })));
+        assert_eq!(data.take_approval().unwrap(), None, "a damaged one is removed");
+    }
+
+    #[test]
+    fn a_pending_set_is_named_by_exactly_its_deletions() {
+        let (a, b) = (NodeId::generate(), NodeId::generate());
+        let summary = |nodes: Vec<NodeId>, paths: &[&str]| PassSummary {
+            pending_deletes: paths.iter().map(|p| (*p).to_owned()).collect(),
+            pending_nodes: nodes,
+            ..PassSummary::default()
+        };
+        assert_eq!(PassSummary::default().pending_set(), None);
+        let one = summary(vec![a, b], &["x.txt", "y.txt"]).pending_set().unwrap();
+        assert_eq!(summary(vec![b, a], &["y.txt", "x.txt"]).pending_set().unwrap(), one, "order doesn't matter");
+        assert_ne!(summary(vec![a], &["x.txt"]).pending_set().unwrap(), one);
+        assert_ne!(summary(vec![a, b, NodeId::generate()], &["x.txt", "y.txt", "z.txt"]).pending_set().unwrap(), one);
+        let here = PassSummary { pending_local_deletes: vec!["x.txt".into(), "y.txt".into()], pending_nodes: vec![a, b], ..PassSummary::default() };
+        assert_ne!(here.pending_set().unwrap(), one, "a delete here isn't one on the server");
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path());
+        assert_eq!(data.load_shown().unwrap(), None);
+        data.save_shown(&one, 5).unwrap();
+        assert_eq!(data.load_shown().unwrap().map(|s| s.set), Some(one));
     }
 
     #[test]
@@ -429,6 +751,36 @@ mod tests {
         saved.state.seq = 42;
         saved.state.space = Some(SpaceId::generate());
         saved.last_pass = Some(LastPass { finished_ms: 7, outcome: Outcome::Failed("x".into()), summary: None });
+        data.save_state(&saved).unwrap();
+        assert_eq!(data.load_state().unwrap(), saved);
+    }
+
+    /// Held deletes an older agent saved are still read, as the link's path, and keep holding: fix round 3 wrote the
+    /// bare path, fix rounds 4 and 5 a map with the link's folder ID and name as well (and `fresh_dirs`, no longer
+    /// kept). The current record (every candidate link) and the links the last finished push saw round-trip.
+    #[test]
+    fn a_held_delete_saved_by_an_older_agent_is_kept() {
+        use craft_cloud_sync::{HeldLink, RelPath};
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path());
+        let (bare, mapped) = (NodeId::generate(), NodeId::generate());
+        let name = |s: &str| craft_cloud_proto::Name::new(s).unwrap();
+        let link = RelPath::from_names(vec![name("Clips"), name("c0.mov")]);
+        let other = RelPath::from_names(vec![name("Clips"), name("c1.mov")]);
+        let mut state = serde_json::to_value(State::default()).unwrap();
+        state["held_deletes"] = serde_json::json!({
+            bare.to_string(): ["Clips", "c0.mov"],
+            mapped.to_string(): { "dir": 7, "name": "c1.mov", "path": ["Clips", "c1.mov"] },
+        });
+        state["fresh_dirs"] = serde_json::json!([NodeId::generate().to_string()]);
+        fs::write(dir.path().join(STATE_FILE), serde_json::json!({ "schema": 1, "state": state }).to_string()).unwrap();
+        let mut saved = data.load_state().unwrap();
+        assert_eq!(saved.state.held_deletes.get(&bare), Some(&HeldLink::at(link.clone())));
+        assert_eq!(saved.state.held_deletes.get(&mapped), Some(&HeldLink::at(other)));
+        assert!(saved.state.known_links.is_empty(), "an older agent recorded none: every link counts as new once");
+        saved.state.known_links.insert(link.clone());
+        let both = HeldLink { paths: [link, RelPath::from_names(vec![name("A"), name("c0.mov")])].into() };
+        saved.state.held_deletes.insert(NodeId::generate(), both);
         data.save_state(&saved).unwrap();
         assert_eq!(data.load_state().unwrap(), saved);
     }

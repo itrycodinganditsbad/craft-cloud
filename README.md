@@ -9,8 +9,8 @@ history. It works for one person with a laptop and a desktop, and for a small st
 
 There is no hosted service and no account with anyone but you. Nothing phones home.
 
-> **Status: early development.** The server, the sync engine and a first agent work: two machines can
-> sync a folder by running `craft-cloud-agent sync`. Automatic syncing in the background is next. See
+> **Status: early development.** The server, the sync engine and the agent work: two machines keep a
+> folder in step with `craft-cloud-agent run` (or one pass at a time with `sync`). See
 > [Where things stand](#where-things-stand). The full design is in [`docs/design/sync.md`](docs/design/sync.md).
 
 ## What it will do
@@ -50,8 +50,8 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
   store. It keeps the metadata (users, devices, the file tree, versions and a change feed) in SQLite or
   Postgres. Every change arrives as one batch commit, which is applied completely or not at all.
 - **The agent** runs on each machine. It uploads what changed in the synced folder, applies what other
-  machines changed, and keeps its own small state file. Today you run it by hand
-  (`craft-cloud-agent sync`); watching the folder and syncing in the background comes next.
+  machines changed, and keeps its own small state file. `craft-cloud-agent run` keeps the folder in step
+  on its own (it watches the folder and the server); `craft-cloud-agent sync` runs one pass by hand.
 - **The launcher** will be the user interface: sign-in, sync status, history and restore, the conflict
   list. It talks to the agent over a documented local API and doesn't link any Craft Cloud code.
 
@@ -65,7 +65,7 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
 | `craft-cloud-meta` | Metadata on SQLite or Postgres: users, devices, the tree, versions, the batch commit, the change feed | done |
 | `craft-cloud-server` | The HTTP API (`/api/v1`), authentication, rate limits and the admin CLI | done |
 | `craft-cloud-sync` | The sync engine: compares the folder with the server, uploads, downloads, resolves conflicts | done |
-| `craft-cloud-agent` | The agent on each machine: real disk, HTTPS transport, saved state, root marker, command line (`login`, `sync`, `status`, `logout`) | first cut done; runs by hand |
+| `craft-cloud-agent` | The agent on each machine: real disk, HTTPS transport, saved state, root marker, command line (`login`, `run`, `sync`, `status`, `logout`) | runs on its own |
 
 ## Where things stand
 
@@ -77,7 +77,8 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
 | M3a | The sync engine and its simulation | done |
 | M3b1 | The agent, first cut: syncs a real folder over HTTPS when you run `craft-cloud-agent sync`; two machines sync one folder | done |
 | M3b2a | Hardening: downloads land atomically and never over a save you just made, crash recovery, files held open or read-only on Windows | done |
-| M3b2b | The agent on its own: watches the folder, waits for files to settle, retries with backoff | next |
+| M3b2b1 | The agent on its own: `run` watches the folder and the server, waits for files to settle, retries with backoff | done |
+| M3b2b2 | A simulated network (partitions, delays, dropped connections) in the simulation | next |
 | M4 | History, restore, trash, cleanup of old versions, garbage collection, server backup and restore | planned |
 | M5 | Selective sync, large-media polish, `.craftignore` | planned |
 | M6 | Packaging: release binaries, Docker image, systemd unit, built-in TLS, a self-hosting guide | planned |
@@ -166,10 +167,30 @@ With a server running, sign in on each machine and sync:
 cargo build --release -p craft-cloud-agent
 # The password is read from stdin. The folder is created if it doesn't exist.
 printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https://cloud.example.org --user you --folder ~/'Craft Cloud'
-./target/release/craft-cloud-agent sync      # one pass
-./target/release/craft-cloud-agent status    # account, folder, last pass, anything waiting
+./target/release/craft-cloud-agent run       # keep it in step until Ctrl-C
+./target/release/craft-cloud-agent status    # account, folder, whether `run` runs and what it does, last pass
+./target/release/craft-cloud-agent sync      # or: one pass by hand
 ```
 
+- `run` syncs whenever something changes in the folder (it watches it) or on the server (it waits on the
+  server's change feed), and at least every 10 minutes. A file that is still being written (its size or
+  time changed within the last 2 seconds, or on Windows a program still has it open for writing) waits
+  until it settles; a file that keeps changing (a log, a database held open) is looked at less and less
+  often, at least every 5 minutes. When the server can't be reached it tries again with growing pauses, up to 5 minutes.
+  If something needs you (the folder or its marker is missing, the device was signed out) it pauses and
+  `status` says why; a missing folder or marker is looked at again every minute, and syncing goes on by
+  itself once it is back. Ctrl-C lets a running pass finish and stops; a second Ctrl-C stops at once.
+- While `run` runs, `sync --approve-deletes` from another terminal hands the approval to it: exactly the
+  deletions `status` listed. If more came since, it lists them instead, approves nothing and exits 2; check
+  the list and run it again. Every list of waiting deletions comes with its set (`set 3f9a…`), also in
+  `run`'s output: `sync --approve-deletes=<set>` approves exactly that set if it is the one waiting, without
+  `status` first, and otherwise shows the waiting set, approves nothing and exits 2. A plain `sync` says the
+  agent is already running.
+- A delete held back because a link appeared that may be the file, moved with its folder ("held while … is a
+  link", or "held while any of … is a link" when several links appeared with that name), comes with a set of
+  its own. If you really deleted the file and none of the links listed is it, `sync --approve-deletes=<set>`
+  with that set lets the delete go; nothing else (the bare flag included) releases it.
+- Start `run` from your desktop's autostart for now; installers that do it for you come with packaging.
 - To sync a folder that already has files, add `--adopt` to `login`.
 - `sync` exits 0 when done; 1 when it failed and can simply run again (offline, server busy); 2 when
   deletions wait for approval (`sync --approve-deletes` releases exactly the ones it listed); 3 when it

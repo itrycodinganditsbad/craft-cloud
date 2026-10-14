@@ -1,4 +1,4 @@
-//! The `craft-cloud-agent` command line: `login`, `sync`, `status`, `logout`. Each command is a library
+//! The `craft-cloud-agent` command line: `login`, `run`, `sync`, `status`, `logout`. Each command is a library
 //! function too, so tests drive exactly what a user runs.
 //!
 //! The password is read from standard input (one line), so it never appears in the process list or shell
@@ -15,6 +15,9 @@
 //! another 4xx status, the server sent damaged data (a chunk or manifest that fails its hash), `account.json` or
 //! `state.json` is damaged or was written by a newer agent: move the file away or update).
 //!
+//! `run` handles these itself while it runs (it retries, waits for approval or pauses; see [`crate::daemon`]) and
+//! exits 0 when stopped, 1 when stopped twice (at once) and 3 when it can't start (another agent is running).
+//!
 //! A crash or kill during `login`, after the server created the device and before the account was saved, can
 //! leave a device registered that nothing here uses; an admin can revoke it (`craft-cloud-server device ...`).
 
@@ -22,16 +25,17 @@ use std::io::{BufRead, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use craft_cloud_proto::ConflictStamp;
+use craft_cloud_proto::{ConflictStamp, NodeId};
 use craft_cloud_sync::{Config, Engine, SyncError, TransportError};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
-use crate::account::{ACCOUNT_SCHEMA, Account, AccountError, DataDir, LastPass, Outcome, PassSummary, STATE_SCHEMA, SavedState};
+use crate::account::{ACCOUNT_SCHEMA, Account, AccountError, DataDir, LastPass, LoopState, Outcome, PassSummary, STATE_SCHEMA, SavedState};
 use crate::disk::{AGENT_DIR, DiskFs, create_private_dir};
 use crate::http::{self, DeviceToken, HttpTransport, ServerUrl};
 use crate::lock::{self, DATA_LOCK, FOLDER_LOCK, Lock, LockError};
 use crate::root::{self, RootError, RootMarker};
+use crate::settle::Stability;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -63,11 +67,14 @@ pub enum Command {
     /// Run one sync pass and print what it did.
     Sync {
         /// Carry out the deletions the last pass listed as waiting for approval (exactly those; any new ones
-        /// still wait).
-        #[arg(long)]
-        approve_deletes: bool,
+        /// still wait). With `=<set>` (the set the list was printed with): only if that set is the one waiting.
+        #[arg(long, value_name = "SET", num_args = 0..=1, require_equals = true, value_parser = set_name)]
+        approve_deletes: Option<Option<String>>,
     },
-    /// Show the account, the folder and the last pass.
+    /// Keep the folder in sync until stopped (Ctrl-C): sync whenever something changes here or on the server, and
+    /// at least every 10 minutes. Ctrl-C lets a running pass finish; a second Ctrl-C stops at once.
+    Run,
+    /// Show the account, the folder, whether `run` is running and what it does, and the last pass.
     Status,
     /// Sign this device out on the server and forget the account here. The files stay.
     Logout {
@@ -224,7 +231,14 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
             login(&data, &args, &password, out).await?;
             Ok(Exit::Done)
         }
-        Command::Sync { approve_deletes } => Ok(sync(&data, approve_deletes, out).await?.0),
+        Command::Sync { approve_deletes } => Ok(sync(&data, Approve::from_flag(approve_deletes), out).await?.0),
+        Command::Run => {
+            let (stop, stops) = tokio::sync::mpsc::unbounded_channel();
+            let signals = tokio::spawn(forward_stop_signals(stop));
+            let exit = crate::daemon::run_loop(&data, crate::daemon::RunOptions::default(), stops, out).await;
+            signals.abort();
+            exit
+        }
         Command::Status => {
             status(&data, out)?;
             Ok(Exit::Done)
@@ -232,6 +246,42 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
         Command::Logout { local } => {
             logout(&data, local, out).await?;
             Ok(Exit::Done)
+        }
+    }
+}
+
+/// Sends one message to `stop` for every Ctrl-C (and, on Unix, SIGTERM) until the loop is gone. If the signals can't be
+/// listened for, the loop runs until the process is killed (its checkpoints keep that safe).
+async fn forward_stop_signals(stop: tokio::sync::mpsc::UnboundedSender<()>) {
+    #[cfg(unix)]
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    let mut ctrl_c_works = true;
+    loop {
+        #[cfg(unix)]
+        let terminated = async {
+            // A stream that ended (no signal driver any more) never fires again.
+            let got = match term.as_mut() {
+                Some(term) => term.recv().await,
+                None => None,
+            };
+            if got.is_none() {
+                std::future::pending::<()>().await;
+            }
+        };
+        #[cfg(not(unix))]
+        let terminated = std::future::pending::<()>();
+        tokio::select! {
+            ctrl_c = tokio::signal::ctrl_c(), if ctrl_c_works => {
+                // Ctrl-C can't be listened for: SIGTERM alone (or nothing) stops the loop.
+                if ctrl_c.is_err() {
+                    ctrl_c_works = false;
+                    continue;
+                }
+            }
+            _ = terminated => {}
+        }
+        if stop.send(()).is_err() {
+            return;
         }
     }
 }
@@ -282,7 +332,7 @@ fn show_time(ms: i64) -> String {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     Timestamp::now().as_millisecond()
 }
 
@@ -319,7 +369,7 @@ fn hold(path: &Path) -> Result<Lock, AgentError> {
 }
 
 /// Takes the data folder's lock (creating the data folder).
-fn hold_data(data: &DataDir) -> Result<Lock, AgentError> {
+pub(crate) fn hold_data(data: &DataDir) -> Result<Lock, AgentError> {
     data.create()?;
     hold(&data.path().join(DATA_LOCK))
 }
@@ -479,68 +529,313 @@ pub async fn login(data: &DataDir, args: &LoginArgs, password: &str, out: &mut i
     Ok(account)
 }
 
+/// What `sync --approve-deletes` approves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Approve {
+    /// Nothing (no flag).
+    Nothing,
+    /// The bare flag: the set the last pass listed (while a loop runs: if `status` showed it).
+    Listed,
+    /// `--approve-deletes=<set>`: that set, if it is the one waiting.
+    Set(String),
+}
+
+/// The value of `--approve-deletes=<set>`. An empty one is a usage error, not the bare flag: a script running
+/// `--approve-deletes=$SET` with `$SET` unset must not approve whatever `status` showed.
+fn set_name(value: &str) -> Result<String, String> {
+    let set = value.trim();
+    if set.is_empty() {
+        return Err("the set is empty: give the set the list was printed with, or leave out `=` to approve the list `status` showed".into());
+    }
+    Ok(set.to_ascii_lowercase())
+}
+
+impl Approve {
+    /// From the command line's `--approve-deletes[=<set>]`: absent, the bare flag, or a set.
+    pub fn from_flag(flag: Option<Option<String>>) -> Self {
+        match flag {
+            None => Self::Nothing,
+            Some(None) => Self::Listed,
+            Some(Some(set)) => Self::Set(set.trim().to_ascii_lowercase()),
+        }
+    }
+
+    fn any(&self) -> bool {
+        *self != Self::Nothing
+    }
+}
+
+impl From<bool> for Approve {
+    fn from(approve: bool) -> Self {
+        if approve { Self::Listed } else { Self::Nothing }
+    }
+}
+
+/// `--approve-deletes=<set>` named a set that isn't the one waiting: the waiting one is shown (and noted as shown),
+/// and nothing is approved (exit code 2).
+fn wrong_set(data: &DataDir, named: &str, waiting: &PassSummary, out: &mut impl Write) -> Result<(Exit, PassSummary), AgentError> {
+    print_waiting(out, waiting)?;
+    if let Some(set) = waiting.pending_set() {
+        data.save_shown(&set, now_ms())?;
+    }
+    say!(out, "nothing approved: set {named} isn't a set waiting now; check the list above, then approve its set")?;
+    Ok((if waiting.needs_approval() { Exit::NeedsApproval } else { Exit::Done }, waiting.clone()))
+}
+
 /// Runs one sync pass and saves the state, whether the pass finished or not. Returns the exit code and what
 /// the pass did.
-pub async fn sync(data: &DataDir, approve_deletes: bool, out: &mut impl Write) -> Result<(Exit, PassSummary), AgentError> {
-    let _data_lock = hold_data(data)?;
-    // Temporary files a crash left while `account.json` or `state.json` was written.
-    data.clean_tmp()?;
-    let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
-    check_apart(data, &account.folder)?;
-    root::check(&account.folder, &RootMarker { space: account.space, root: account.root })?;
-    let _folder_lock = hold_folder(&account.folder)?;
-    let mut saved = data.load_state()?;
-    if saved.state.space.is_some_and(|s| s != account.space) {
-        return Err(AgentError::OtherAccountState(data.path().join(crate::account::STATE_FILE)));
-    }
-    let fs = DiskFs::new(&account.folder).with_device_name(account.device_name.clone());
-    fs.clean_tmp().map_err(io_at(&fs.tmp_dir()))?;
-    let transport = HttpTransport::new(account.server.clone(), &account.token)?;
-    let config = Config::new(account.device_name.clone(), account.device);
-    let mut engine = Engine::new(fs, transport, std::mem::take(&mut saved.state), config, conflict_stamp)?;
-    // `state.json` is also written at the pass's checkpoints, so a crash or a kill loses at most what the pass did
-    // since the last one (the last pass's outcome stays as it was until this one ends).
-    let (checkpoint_data, last_pass) = (data.clone(), saved.last_pass.clone());
-    engine.on_checkpoint(move |state| {
-        let saved = SavedState { schema: STATE_SCHEMA, state: state.clone(), last_pass: last_pass.clone() };
-        checkpoint_data.save_state(&saved).map_err(|e| std::io::Error::other(e.to_string()))
-    });
-    let previous = saved.last_pass.as_ref().and_then(|l| l.summary.clone());
-    if approve_deletes {
+///
+/// While a `run` loop holds the locks, `--approve-deletes` hands the approval to it instead (see
+/// [`approve_for_loop`]); without the flag the pass stops with exit code 3, as with any other agent running.
+/// `--approve-deletes=<set>` approves only if `set` is the set waiting; otherwise nothing runs, the waiting set is
+/// shown and the exit code is 2.
+pub async fn sync(data: &DataDir, approve: impl Into<Approve>, out: &mut impl Write) -> Result<(Exit, PassSummary), AgentError> {
+    let approve_deletes: Approve = approve.into();
+    let _data_lock = match hold_data(data) {
+        Err(AgentError::Lock(LockError::Busy(path))) if approve_deletes.any() => {
+            return approve_for_loop(data, &approve_deletes, out)?.ok_or(AgentError::Lock(LockError::Busy(path)));
+        }
+        other => other?,
+    };
+    let mut session = Session::open(data, None, true)?;
+    let previous = session.last_summary();
+    let approve = match &approve_deletes {
+        Approve::Nothing => Vec::new(),
         // Exactly the deletions the user saw listed; new ones wait and are listed again.
-        let shown = previous.as_ref().map(|s| s.pending_nodes.clone()).unwrap_or_default();
-        if shown.is_empty() {
-            say!(out, "nothing was waiting for approval")?;
+        Approve::Listed => {
+            let shown = previous.as_ref().map(|s| s.pending_nodes.clone()).unwrap_or_default();
+            let held = previous.as_ref().and_then(PassSummary::held_set);
+            if let Some(set) = &held {
+                say!(out, "{}", held_not_released(set))?;
+            }
+            if shown.is_empty() && held.is_none() {
+                say!(out, "nothing was waiting for approval")?;
+            }
+            shown
         }
-        engine.approve_deletes_of(shown);
-    }
-    // The server is asked what it speaks before every pass (it may have been updated since the last one); a
-    // mismatch fails the pass like any other server answer, so it is saved and shown by `status`.
-    let compatible = match http::info(&account.server).await {
-        Ok(info) => http::check_compatible(&info),
-        Err(e) => Err(e),
-    };
-    let result = match compatible {
-        Ok(()) => engine.sync_once().await,
-        Err(e) => Err(SyncError::Transport(e)),
-    };
-    saved.schema = STATE_SCHEMA;
-    saved.state = engine.state().clone();
-    let (outcome, summary) = match &result {
-        Ok(report) => {
-            let summary = PassSummary::from_report(report);
-            (if summary.needs_approval() { Outcome::NeedsApproval } else { Outcome::Done }, Some(summary))
+        Approve::Set(named) => {
+            let waiting = previous.as_ref().map(PassSummary::pending_only).unwrap_or_default();
+            // The set of deletes held behind a link: named, they go.
+            if waiting.held_set().as_ref() == Some(named) {
+                say!(out, "releasing the deletes held behind a link (set {named})")?;
+                waiting.held_nodes
+            } else if waiting.pending_set().as_ref() == Some(named) {
+                waiting.pending_nodes
+            } else if waiting.approvable() {
+                return wrong_set(data, named, &waiting, out);
+            } else {
+                say!(out, "nothing was waiting for approval")?;
+                return Ok((Exit::Done, waiting));
+            }
         }
-        // A failed pass keeps the deletions the pass before it listed: the user was shown them, and a retry
-        // after a network blip must still release exactly those.
-        Err(e) => (Outcome::Failed(failure_message(e)), previous.map(|s| s.pending_only()).filter(PassSummary::needs_approval)),
     };
-    saved.last_pass = Some(LastPass { finished_ms: now_ms(), outcome, summary: summary.clone() });
-    data.save_state(&saved)?;
-    result?;
-    let summary = summary.unwrap_or_default();
+    let summary = session.pass(approve).await?;
     print_summary(out, &summary)?;
     Ok((if summary.needs_approval() { Exit::NeedsApproval } else { Exit::Done }, summary))
+}
+
+/// `sync --approve-deletes` while a `run` loop holds the locks. The set of deletions the loop's last pass listed
+/// (from `state.json`) is approved only if it is exactly the set `status` last showed (`shown.json`, by its
+/// identifier): then it goes to `approval.json`, naming that set, and the loop releases exactly those deletions if
+/// they are still the ones that wait. If the set changed since `status` showed it (a pass found more, say), or
+/// `status` never showed it, nothing is approved: the new list is shown (and remembered as shown) and the exit code
+/// is 2, so the user checks it and runs the command again. The rule of the one-off approval: what was shown,
+/// nothing else. With `--approve-deletes=<set>` the user names the set (as the loop printed it, say), so it is
+/// approved if it is the set waiting, whatever `status` showed; another set is refused the same way. Naming the set
+/// of deletes held behind a link ([`PassSummary::held_set`]) hands those to the loop the same way; nothing else
+/// releases a hold. `None` when no running loop is recorded (another one-off `sync` holds the locks).
+fn approve_for_loop(data: &DataDir, approve: &Approve, out: &mut impl Write) -> Result<Option<(Exit, PassSummary)>, AgentError> {
+    if !data.load_status()?.is_some_and(|s| s.running(now_ms())) {
+        return Ok(None);
+    }
+    let waiting = data.load_state()?.last_pass.and_then(|l| l.summary).map(|s| s.pending_only()).unwrap_or_default();
+    // The set of deletes held behind a link goes only when named.
+    if let Approve::Set(named) = approve
+        && waiting.held_set().as_ref() == Some(named)
+    {
+        data.give_approval(named, &waiting.held_nodes, now_ms())?;
+        say!(
+            out,
+            "the running agent will delete these on the server, held behind a link until now (set {named}; it looks for \
+             this within half a minute):"
+        )?;
+        for (path, links) in &waiting.held_deletes {
+            say!(out, "  delete on the server: {} (held while any of {} is a link)", path, links.join(", "))?;
+        }
+        return Ok(Some((Exit::Done, waiting)));
+    }
+    // The bare flag never releases a hold: say how to, rather than "nothing was waiting".
+    let held = waiting.held_set().filter(|_| *approve == Approve::Listed);
+    if let Some(set) = &held {
+        say!(out, "{}", held_not_released(set))?;
+    }
+    let Some(set) = waiting.pending_set() else {
+        if let Approve::Set(named) = approve
+            && waiting.approvable()
+        {
+            return wrong_set(data, named, &waiting, out).map(Some);
+        }
+        if held.is_none() {
+            say!(out, "nothing was waiting for approval")?;
+        }
+        return Ok(Some((Exit::Done, waiting)));
+    };
+    if let Approve::Set(named) = approve {
+        if *named != set {
+            return wrong_set(data, named, &waiting, out).map(Some);
+        }
+    } else if data.load_shown()?.is_none_or(|shown| shown.set != set) {
+        print_waiting(out, &waiting)?;
+        data.save_shown(&set, now_ms())?;
+        say!(out, "nothing approved: these deletions changed since `status` listed them (or it didn't); check them, then run this again")?;
+        return Ok(Some((Exit::NeedsApproval, waiting)));
+    }
+    data.give_approval(&set, &waiting.pending_nodes, now_ms())?;
+    say!(out, "the running agent will carry out these deletions (set {set}):")?;
+    for path in &waiting.pending_deletes {
+        say!(out, "  delete on the server: {path}")?;
+    }
+    for path in &waiting.pending_local_deletes {
+        say!(out, "  delete here: {path}")?;
+    }
+    Ok(Some((Exit::Done, waiting)))
+}
+
+/// A signed-in folder ready for passes: its account, the engine on the real disk and the HTTP API, and the folder's
+/// lock. The caller holds the data folder's lock for as long as the session lives. One-off `sync` opens one for one
+/// pass; the `run` loop keeps one for many (so the stability window's looks carry over between passes).
+pub struct Session {
+    data: DataDir,
+    account: Account,
+    engine: Engine<DiskFs, HttpTransport>,
+    /// The last pass's outcome, also written with every checkpoint (so it is shared with the checkpoint closure).
+    last_pass: std::sync::Arc<std::sync::Mutex<Option<LastPass>>>,
+    _folder_lock: Lock,
+    /// The stability window's looks, shared with the `run` loop (`None`: a one-off `sync` trusts every file).
+    stability: Option<Stability>,
+    /// When the earliest look at a file still changing is due, after the last pass (if it finished).
+    recheck_in: Option<std::time::Duration>,
+}
+
+impl Session {
+    /// Opens the folder the account syncs: cleans up interrupted writes, checks the account, the folders and the
+    /// marker, takes the folder's lock and loads the state. `stability`: the window a changed file must settle for
+    /// before it syncs, and its looks (`None`: trusted at once). `clean_data`: clean up the data folder's interrupted
+    /// writes first.
+    pub fn open(data: &DataDir, stability: Option<Stability>, clean_data: bool) -> Result<Self, AgentError> {
+        // Temporary files a crash left while one of the data folder's own files was written. The `run` loop cleans
+        // them once, at its start (`clean_data` false here), never while it may be writing its own.
+        if clean_data {
+            data.clean_tmp()?;
+        }
+        let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
+        check_apart(data, &account.folder)?;
+        root::check(&account.folder, &RootMarker { space: account.space, root: account.root })?;
+        let folder_lock = hold_folder(&account.folder)?;
+        let mut saved = data.load_state()?;
+        if saved.state.space.is_some_and(|s| s != account.space) {
+            return Err(AgentError::OtherAccountState(data.path().join(crate::account::STATE_FILE)));
+        }
+        for node in drop_holds_without_links(&mut saved.state) {
+            eprintln!("a held delete saved without any link was dropped (node {node}; state.json was edited or damaged)");
+        }
+        let mut fs = DiskFs::new(&account.folder).with_device_name(account.device_name.clone());
+        if let Some(stability) = stability.clone() {
+            fs = fs.with_stability(stability);
+        }
+        fs.clean_tmp().map_err(io_at(&fs.tmp_dir()))?;
+        let transport = HttpTransport::new(account.server.clone(), &account.token)?;
+        let config = Config::new(account.device_name.clone(), account.device);
+        let mut engine = Engine::new(fs, transport, std::mem::take(&mut saved.state), config, conflict_stamp)?;
+        // `state.json` is also written at the pass's checkpoints, so a crash or a kill loses at most what the pass did
+        // since the last one (the last pass's outcome stays as it was until this one ends).
+        let last_pass = std::sync::Arc::new(std::sync::Mutex::new(saved.last_pass));
+        let (checkpoint_data, checkpoint_last) = (data.clone(), last_pass.clone());
+        engine.on_checkpoint(move |state| {
+            let last_pass = checkpoint_last.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            let saved = SavedState { schema: STATE_SCHEMA, state: state.clone(), last_pass };
+            checkpoint_data.save_state(&saved).map_err(|e| std::io::Error::other(e.to_string()))
+        });
+        Ok(Self { data: data.clone(), account, engine, last_pass, _folder_lock: folder_lock, stability, recheck_in: None })
+    }
+
+    pub fn account(&self) -> &Account {
+        &self.account
+    }
+
+    /// The engine's state (its `seq` is where the change feed was read to).
+    pub fn state(&self) -> &craft_cloud_sync::State {
+        self.engine.state()
+    }
+
+    /// The last pass's outcome, as saved in `state.json`.
+    pub fn last_pass(&self) -> Option<LastPass> {
+        self.last_pass.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// After a finished pass with a stability window: how long until the earliest look at a file still changing.
+    pub fn recheck_in(&self) -> Option<std::time::Duration> {
+        self.recheck_in
+    }
+
+    fn last_summary(&self) -> Option<PassSummary> {
+        self.last_pass().and_then(|l| l.summary)
+    }
+
+    /// One pass, with `approve` released from the mass-delete guard (deletions a user saw listed), then the state is
+    /// saved, whether the pass finished or not. The folder and its marker are checked first: the folder may have
+    /// gone since the session opened (a drive unmounted while the loop runs).
+    pub async fn pass(&mut self, approve: Vec<NodeId>) -> Result<PassSummary, AgentError> {
+        check_apart(&self.data, &self.account.folder)?;
+        root::check(&self.account.folder, &RootMarker { space: self.account.space, root: self.account.root })?;
+        if !approve.is_empty() {
+            self.engine.approve_deletes_of(approve);
+        }
+        let previous = self.last_summary();
+        // The server is asked what it speaks before every pass (it may have been updated since the last one); a
+        // mismatch fails the pass like any other server answer, so it is saved and shown by `status`.
+        let compatible = match http::info(&self.account.server).await {
+            Ok(info) => http::check_compatible(&info),
+            Err(e) => Err(e),
+        };
+        let started = self.stability.as_ref().map(Stability::now);
+        let result = match compatible {
+            Ok(()) => self.engine.sync_once().await,
+            Err(e) => Err(SyncError::Transport(e)),
+        };
+        // A finished pass asked about every changed file: when the earliest one still changing is looked at again.
+        self.recheck_in = match (&result, &self.stability, started) {
+            (Ok(_), Some(stability), Some(started)) => stability.pass_finished(started),
+            _ => None,
+        };
+        let (outcome, summary) = match &result {
+            Ok(report) => {
+                let summary = PassSummary::from_report(report);
+                (if summary.needs_approval() { Outcome::NeedsApproval } else { Outcome::Done }, Some(summary))
+            }
+            // A failed pass keeps the deletions the pass before it listed: the user was shown them, and a retry
+            // after a network blip must still release exactly those.
+            Err(e) => {
+                (Outcome::Failed(failure_message(e)), previous.map(|s| s.pending_only()).filter(|s| s.needs_approval() || !s.held_deletes.is_empty()))
+            }
+        };
+        let last = LastPass { finished_ms: now_ms(), outcome, summary: summary.clone() };
+        *self.last_pass.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(last.clone());
+        let saved = SavedState { schema: STATE_SCHEMA, state: self.engine.state().clone(), last_pass: Some(last) };
+        self.data.save_state(&saved)?;
+        result?;
+        Ok(summary.unwrap_or_default())
+    }
+}
+
+/// Drops the held deletes saved with no link (only a hand-edited or damaged `state.json` has them): such a hold
+/// would never be listed, so the user couldn't see or release it. Returns their nodes, to be said.
+fn drop_holds_without_links(state: &mut craft_cloud_sync::State) -> Vec<NodeId> {
+    let empty: Vec<NodeId> = state.held_deletes.iter().filter(|(_, link)| link.paths.is_empty()).map(|(id, _)| *id).collect();
+    for id in &empty {
+        state.held_deletes.remove(id);
+    }
+    empty
 }
 
 /// The message a failed pass is remembered with: what [`AgentError`] would say.
@@ -553,7 +848,7 @@ fn failure_message(e: &SyncError) -> String {
     }
 }
 
-fn print_summary(out: &mut impl Write, s: &PassSummary) -> Result<(), AgentError> {
+pub(crate) fn print_summary(out: &mut impl Write, s: &PassSummary) -> Result<(), AgentError> {
     let counts = [
         (s.downloaded, "downloaded"),
         (s.uploaded, "uploaded"),
@@ -586,10 +881,45 @@ fn print_summary(out: &mut impl Write, s: &PassSummary) -> Result<(), AgentError
     print_waiting(out, s)
 }
 
-/// The deletions waiting for approval, if any.
+/// What the bare `--approve-deletes` says while deletes are held behind a link: it doesn't release them.
+fn held_not_released(set: &str) -> String {
+    format!(
+        "deletes held behind a link are released only by naming their set: check their links (`craft-cloud-agent \
+         status`), then run `craft-cloud-agent sync --approve-deletes={set}`"
+    )
+}
+
+/// One held delete and every one of its links: the user releases it only after checking all of them.
+fn held_line(path: &str, links: &[String]) -> String {
+    match links {
+        [one] => format!("{path}: held while {one} is a link"),
+        _ => format!("{path}: held while any of {} is a link", links.join(", ")),
+    }
+}
+
+/// The deletions waiting for approval, and the ones held behind a link, if any.
 fn print_waiting(out: &mut impl Write, s: &PassSummary) -> Result<(), AgentError> {
+    if !s.held_deletes.is_empty() {
+        say!(
+            out,
+            "held, not deleted on the server: it isn't here, and a link or special file that appeared with its name (or \
+             a folder's on its path) may be it, moved with its folder (remove or replace the link and the next pass \
+             decides again):"
+        )?;
+        for (path, links) in &s.held_deletes {
+            say!(out, "  {}", held_line(path, links))?;
+        }
+        if let Some(set) = s.held_set() {
+            say!(
+                out,
+                "if you did delete these, and none of their links is the file, release them with `craft-cloud-agent \
+                 sync --approve-deletes={set}`"
+            )?;
+        }
+    }
     if s.needs_approval() {
-        say!(out, "waiting for approval (check the list, then run `craft-cloud-agent sync --approve-deletes`):")?;
+        let set = s.pending_set().unwrap_or_default();
+        say!(out, "waiting for approval, set {set} (check the list, then run `craft-cloud-agent sync --approve-deletes={set}`):")?;
         for path in &s.pending_deletes {
             say!(out, "  delete on the server: {path}")?;
         }
@@ -621,6 +951,18 @@ pub fn status(data: &DataDir, out: &mut impl Write) -> Result<(), AgentError> {
             say!(out, "  {path}: {what}")?;
         }
     }
+    // Whether `run` is running here, from what it last wrote (it holds the locks, so it can't be asked).
+    match data.load_status() {
+        Ok(Some(loop_status)) if loop_status.running(now_ms()) => {
+            say!(out, "agent: running (pid {}), {}", loop_status.pid, describe_loop(&loop_status.state))?;
+            if let Some(why) = &loop_status.not_watching {
+                say!(out, "  not watching the folder ({why}): changes there are found by a full pass every minute")?;
+            }
+        }
+        Ok(Some(loop_status)) => say!(out, "agent: not running (last seen {})", show_time(loop_status.heartbeat_ms))?,
+        Ok(None) => say!(out, "agent: not running (`craft-cloud-agent run` keeps the folder in sync)")?,
+        Err(e) => say!(out, "agent: can't tell whether it runs: {e}")?,
+    }
     let saved = data.load_state()?;
     match &saved.last_pass {
         None => say!(out, "last pass: never synced")?,
@@ -638,10 +980,31 @@ pub fn status(data: &DataDir, out: &mut impl Write) -> Result<(), AgentError> {
                 } else {
                     print_summary(out, summary)?;
                 }
+                // `sync --approve-deletes` approves exactly the set shown here, and nothing that came since.
+                if let Some(set) = summary.pending_set()
+                    && let Err(e) = data.save_shown(&set, now_ms())
+                {
+                    say!(out, "(can't note that this list was shown: {e}; `sync --approve-deletes` will show it again)")?;
+                }
             }
         }
     }
     Ok(())
+}
+
+/// What the running loop is doing, in words.
+fn describe_loop(state: &LoopState) -> String {
+    match state {
+        LoopState::Idle => "idle, waiting for changes".into(),
+        LoopState::Syncing => "syncing".into(),
+        LoopState::Retrying { next_try_ms, message } => format!("offline, retrying at {}: {message}", show_time(*next_try_ms)),
+        LoopState::Paused { reason, next_check_ms: Some(at) } => format!("paused: {reason} (looked at again at {})", show_time(*at)),
+        LoopState::Paused { reason, next_check_ms: None } => {
+            format!("paused: {reason} (stop it with Ctrl-C, put this right, then start `craft-cloud-agent run` again)")
+        }
+        LoopState::Stopping => "stopping after the running pass".into(),
+        LoopState::Stopped => "stopped".into(),
+    }
 }
 
 /// Revokes this device on the server and forgets the account and state here. The folder and its files stay.
@@ -682,12 +1045,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_held_delete_is_shown_with_its_link_and_its_own_set() {
+        let held = vec![("Footage/c0.mov".into(), vec!["Clips/c0.mov".into()])];
+        let s = PassSummary { held_deletes: held.clone(), held_nodes: vec![NodeId::generate()], ..PassSummary::default() };
+        let mut out = Vec::new();
+        print_summary(&mut out, &s).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("held, not deleted on the server") && text.contains("  Footage/c0.mov: held while Clips/c0.mov is a link"), "{text}");
+        let set = s.held_set().unwrap();
+        assert!(text.contains(&format!("craft-cloud-agent sync --approve-deletes={set}")), "{text}");
+        assert_eq!(s.pending_only(), s, "a failed pass keeps them in the status");
+        assert!(s.pending_set().is_none() && !s.needs_approval() && s.approvable(), "the guard's set doesn't cover a held delete");
+        // Another node, or a summary an older agent saved without the nodes: another set, or none.
+        assert_ne!(PassSummary { held_nodes: vec![NodeId::generate()], ..s.clone() }.held_set(), Some(set));
+        assert_eq!(PassSummary { held_deletes: held, ..PassSummary::default() }.held_set(), None);
+    }
+
+    /// Review 8, info: a hold saved with no link (`{"paths": []}`, from a damaged state) is dropped at load, never
+    /// kept as a hold nobody can see.
+    #[test]
+    fn a_hold_saved_without_a_link_is_dropped() {
+        let (empty, kept) = (NodeId::generate(), NodeId::generate());
+        let mut state = craft_cloud_sync::State::default();
+        state.held_deletes.insert(empty, serde_json::from_value(serde_json::json!({ "paths": [] })).unwrap());
+        let link = craft_cloud_sync::HeldLink::at(serde_json::from_value(serde_json::json!(["Clips", "c0.mov"])).unwrap());
+        state.held_deletes.insert(kept, link);
+        assert_eq!(drop_holds_without_links(&mut state), vec![empty]);
+        assert_eq!(state.held_deletes.keys().copied().collect::<Vec<_>>(), vec![kept]);
+    }
+
+    /// Review 8, finding 1: a hold with several links lists every one of them, and its set covers them all. A set
+    /// computed over one of them (what the agent showed before) is another set, so it can't release the hold.
+    #[test]
+    fn a_hold_lists_every_link_and_its_set_covers_them_all() {
+        let node = NodeId::generate();
+        let both = PassSummary {
+            held_deletes: vec![("Footage/c0.mov".into(), vec!["A/c0.mov".into(), "Clips/c0.mov".into()])],
+            held_nodes: vec![node],
+            ..PassSummary::default()
+        };
+        let mut out = Vec::new();
+        print_summary(&mut out, &both).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("  Footage/c0.mov: held while any of A/c0.mov, Clips/c0.mov is a link"), "{text}");
+        let one = PassSummary { held_deletes: vec![("Footage/c0.mov".into(), vec!["A/c0.mov".into()])], ..both.clone() };
+        assert_ne!(one.held_set(), both.held_set(), "a set over one link isn't the hold's set");
+        let swapped = PassSummary { held_deletes: vec![("Footage/c0.mov".into(), vec!["Clips/c0.mov".into(), "A/c0.mov".into()])], ..both.clone() };
+        assert_eq!(swapped.held_set(), both.held_set(), "the order of the links doesn't matter");
+        // A summary an older agent saved: one link per hold, as a string.
+        let json = serde_json::json!({ "held_deletes": [["Footage/c0.mov", "A/c0.mov"]], "held_nodes": [node] });
+        let old: PassSummary = serde_json::from_value(json).unwrap();
+        assert_eq!(old, one);
+        assert_eq!(serde_json::from_value::<PassSummary>(serde_json::to_value(&both).unwrap()).unwrap(), both, "round trip");
+    }
+
+    #[test]
     fn the_cli_parses() {
         let cli = Cli::try_parse_from(["craft-cloud-agent", "login", "https://c.example", "--user", "ana", "--adopt", "--data-dir", "d"]).unwrap();
         assert_eq!(cli.data_dir.as_deref(), Some(Path::new("d")));
         assert!(matches!(cli.command, Command::Login(LoginArgs { adopt: true, ref user, .. }) if user == "ana"));
         let cli = Cli::try_parse_from(["craft-cloud-agent", "sync", "--approve-deletes"]).unwrap();
-        assert!(matches!(cli.command, Command::Sync { approve_deletes: true }));
+        let Command::Sync { approve_deletes } = cli.command else { panic!("{:?}", cli.command) };
+        assert_eq!(Approve::from_flag(approve_deletes), Approve::Listed);
+        let cli = Cli::try_parse_from(["craft-cloud-agent", "sync", "--approve-deletes=3F9A0b1c2d3e"]).unwrap();
+        let Command::Sync { approve_deletes } = cli.command else { panic!("{:?}", cli.command) };
+        assert_eq!(Approve::from_flag(approve_deletes), Approve::Set("3f9a0b1c2d3e".into()));
+        let cli = Cli::try_parse_from(["craft-cloud-agent", "sync"]).unwrap();
+        let Command::Sync { approve_deletes } = cli.command else { panic!("{:?}", cli.command) };
+        assert_eq!(Approve::from_flag(approve_deletes), Approve::Nothing);
+        for empty in ["--approve-deletes=", "--approve-deletes= "] {
+            let e = Cli::try_parse_from(["craft-cloud-agent", "sync", empty]).unwrap_err();
+            assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation, "{empty:?} is a usage error: {e}");
+        }
         assert!(Cli::try_parse_from(["craft-cloud-agent", "login", "https://c.example"]).is_err(), "--user is required");
     }
 

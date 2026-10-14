@@ -1,7 +1,7 @@
 //! What the engine remembers between passes: the server's tree as of a sequence number (the remote
 //! mirror), and what this machine and the server last agreed on (the base).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use craft_cloud_proto::{Epoch, FileHash, FileState, ManifestId, Name, NodeId, NodeKind, NodeState, SpaceId, VersionId};
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,66 @@ pub struct State {
     /// the server's changes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sent_deletes: BTreeMap<NodeId, VersionId>,
+    /// Server deletes held behind a link: tracked nodes missing here while a link or special file that appeared
+    /// since the last finished push carries a name from the node's last local path, so it may be the node, moved with
+    /// its folder (seed 112337's no-pass order; see the push). Each is held for as long as any of its links stands
+    /// (where the hold last saw it, or anywhere under its name at a path the last finished push didn't see a link at:
+    /// its folder moved) and the node isn't found here again, and is judged afresh once either changes. Saved before the pass
+    /// commits anything, so a crash can't lose it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub held_deletes: BTreeMap<NodeId, HeldLink>,
+    /// Every link and special file the last finished push saw, by path. A link at any other path appeared since, and
+    /// only such a link can hold a delete (see `held_deletes`). Replaced only once a push has finished, in the
+    /// checkpoint after its last commit, so a pass that fails or crashes leaves the links it saw new to the next one.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub known_links: BTreeSet<RelPath>,
+    /// Tracked nodes missing here whose base the pull let follow a server move since the last finished push, with the
+    /// path this machine last had them at. A hold matches names on that path (another machine may have moved the node
+    /// while this machine's user was moving its folder). Cleared by a finished push.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub left_from: BTreeMap<NodeId, RelPath>,
+}
+
+/// The links or special files holding a delete: every new link that carried a name from the node's path when the
+/// hold was made (several may: the real one and unrelated ones with the same name), each where the hold last saw it.
+/// The hold lasts while any of them stands. One that is gone follows by name to every path the last finished push
+/// didn't see a link at (its folder renamed or moved here, put back under a new name, or moved aside by the engine);
+/// renaming the link itself counts as removing it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "HeldLinkRecord")]
+pub struct HeldLink {
+    pub paths: BTreeSet<RelPath>,
+}
+
+impl HeldLink {
+    pub fn at(path: RelPath) -> Self {
+        Self { paths: BTreeSet::from([path]) }
+    }
+
+    /// The first of its links, by path (the one a report names).
+    pub fn first(&self) -> Option<&RelPath> {
+        self.paths.first()
+    }
+}
+
+/// A saved hold: every candidate link's path (now); one link's path in a map (fix rounds 4–6; rounds 4–5 also wrote
+/// the link's folder ID and name, no longer needed and ignored); or the bare path (fix round 3). Every form loads
+/// and keeps holding.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HeldLinkRecord {
+    Links { paths: BTreeSet<RelPath> },
+    Link { path: RelPath },
+    Path(RelPath),
+}
+
+impl From<HeldLinkRecord> for HeldLink {
+    fn from(record: HeldLinkRecord) -> Self {
+        match record {
+            HeldLinkRecord::Links { paths } => Self { paths },
+            HeldLinkRecord::Link { path } | HeldLinkRecord::Path(path) => Self::at(path),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

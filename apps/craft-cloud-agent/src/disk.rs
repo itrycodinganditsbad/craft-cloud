@@ -78,6 +78,8 @@ use craft_cloud_sync::{FileMeta, Fs, FsEntry, FsKind, LandError, RelPath};
 use file_id::FileId;
 use serde::{Deserialize, Serialize};
 
+use crate::settle::Stability;
+
 /// The agent's own folder inside the sync root. The engine never syncs it.
 pub const AGENT_DIR: &str = ".craft-cloud";
 /// Temporary files, inside [`AGENT_DIR`].
@@ -125,6 +127,27 @@ pub struct DiskFs {
     notices: Vec<(String, String)>,
     /// Faults and detours for tests of paths a real disk rarely takes.
     hooks: Hooks,
+    /// The stability window, when files must settle before they sync (see [`DiskFs::with_stability`]): when the
+    /// engine asks whether a changed file is still changing ([`Fs::still_changing`]), its size and time are looked
+    /// at ([`crate::settle`]), and (Windows) it must open while denying other writers. Shared between clones.
+    stability: Option<Stability>,
+}
+
+/// Whether a program still has the file at `full` open for writing (Windows): opening it for reading while denying
+/// other writers fails with a sharing violation then (readers don't stand in the way). The handle is closed at once.
+/// A link put in the file's place since it was stat'ed is opened itself, never followed. While the handle is open
+/// (a moment), an app opening the file for writing gets a sharing violation itself.
+#[cfg(windows)]
+fn open_for_writing(full: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_SHARE_READ only; FILE_FLAG_OPEN_REPARSE_POINT; ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33).
+    OpenOptions::new().read(true).share_mode(0x1).custom_flags(0x0020_0000).open(full).is_err_and(|e| matches!(e.raw_os_error(), Some(32 | 33)))
+}
+
+/// Elsewhere a writer can't be told from the outside; the size-and-time window alone decides.
+#[cfg(not(windows))]
+fn open_for_writing(_full: &Path) -> bool {
+    false
 }
 
 /// Test hooks (see the `#[doc(hidden)]` builders on [`DiskFs`]). All off outside tests.
@@ -310,6 +333,83 @@ fn millis(time: SystemTime) -> i64 {
         Ok(after) => i64::try_from(after.as_millis()).unwrap_or(i64::MAX),
         Err(before) => i64::try_from(before.duration().as_millis()).map_or(i64::MIN, |ms| -ms),
     }
+}
+
+/// The size and time of the file at `path` in `folder`, as a pass would see them; `None` when there is no file there
+/// (gone, a folder, a link). Only the `run` loop's cheap look at a file still settling uses it, to decide when a pass
+/// runs: a folder above it that is a link is followed here, but the pass itself never does.
+pub fn quick_stat(folder: &Path, path: &RelPath) -> Option<(u64, i64)> {
+    let mut full = folder.to_owned();
+    for name in path.names() {
+        full.push(name.as_str());
+    }
+    let md = std::fs::symlink_metadata(&full).ok()?;
+    md.file_type().is_file().then(|| (md.len(), md.modified().map_or(0, millis)))
+}
+
+/// Whether the folder's file times can be trusted to say a file was written a while ago (the stability window's
+/// shortcut, see [`crate::settle`]): not on a network share, where the times come from the server's clock (which may
+/// lag ours), and not on FAT or exFAT (coarse times) or a FUSE or 9P mount (any of those, as WSL's `/mnt/c`). Asked
+/// once per session, of the folder itself (a mount inside it isn't looked at). Where it can't be told (Windows: the
+/// sharing probe stands in for it), the times are trusted, and the re-stat after hashing still guards an upload.
+pub fn mtime_trusted(folder: &Path) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        match rustix::fs::statfs(folder) {
+            #[allow(clippy::unnecessary_cast)]
+            Ok(st) => !untrusted_fs_magic((st.f_type as i64) & 0xFFFF_FFFF),
+            Err(_) => true,
+        }
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        match rustix::fs::statfs(folder) {
+            Ok(st) => {
+                // MNT_LOCAL: not a network filesystem.
+                let local = st.f_flags & 0x0000_1000 != 0;
+                let name: String = st.f_fstypename.iter().take_while(|c| **c != 0).map(|c| char::from(*c as u8)).collect();
+                local && !untrusted_mac_fs(&name)
+            }
+            Err(_) => true,
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        let _ = folder;
+        true
+    }
+}
+
+/// macOS filesystem type names (`f_fstypename`) whose times aren't to be trusted for the stability shortcut even on a
+/// mount that says it is local (`MNT_LOCAL`): FAT and exFAT (coarse times), and FUSE (macFUSE, OSXFUSE and the like:
+/// a FUSE mount made with `-o local` claims to be local, but its times are whatever the filesystem behind it says).
+#[cfg(any(target_vendor = "apple", test))]
+fn untrusted_mac_fs(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(name.as_str(), "msdos" | "exfat") || name.contains("fuse")
+}
+
+/// Linux `statfs` magic numbers of filesystems whose times aren't to be trusted for the stability shortcut: network
+/// filesystems (NFS, SMB/CIFS, Ceph, AFS, Coda, NCP, VirtualBox shares), FAT and exFAT, FUSE and 9P.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn untrusted_fs_magic(magic: i64) -> bool {
+    matches!(
+        magic,
+        0x6969 // NFS
+            | 0x517B // SMB
+            | 0xFF53_4D42 // CIFS
+            | 0xFE53_4D42 // SMB2
+            | 0x00C3_6400 // Ceph
+            | 0x5346_414F // AFS
+            | 0x6B41_4653 // kAFS
+            | 0x7375_7245 // Coda
+            | 0x564C // NCP
+            | 0x786F_4256 // VirtualBox shared folder
+            | 0x4D44 // FAT
+            | 0x2011_BAB0 // exFAT
+            | 0x6573_5546 // FUSE
+            | 0x0102_1997 // 9P (WSL's drives, VM shares)
+    )
 }
 
 fn system_time(ms: i64) -> io::Result<SystemTime> {
@@ -657,6 +757,7 @@ impl DiskFs {
             device_name: "this computer".into(),
             notices: Vec::new(),
             hooks: Hooks::default(),
+            stability: None,
         }
     }
 
@@ -664,6 +765,22 @@ impl DiskFs {
     pub fn with_device_name(mut self, name: impl Into<String>) -> Self {
         self.device_name = name.into();
         self
+    }
+
+    /// Makes a changed file sync only once it has settled: its size and time unchanged for the window (across two
+    /// looks, or by its own time at the first) and, on Windows, no program holding it open for writing (see
+    /// [`crate::settle`] and [`Fs::still_changing`]). The `run` loop uses this (2 s), sharing `stability` to schedule
+    /// the next look; without it (a one-off `sync`) every file is trusted at once, and only the re-stat after hashing
+    /// guards an upload.
+    pub fn with_stability(mut self, stability: Stability) -> Self {
+        stability.trust_mtime(mtime_trusted(&self.root));
+        self.stability = Some(stability);
+        self
+    }
+
+    /// [`DiskFs::with_stability`] with a window of its own.
+    pub fn with_stability_window(self, window: Duration) -> Self {
+        self.with_stability(Stability::new(window))
     }
 
     /// Makes removing the moved file at the end of a landing in steps fail, as a disk error would: for tests that
@@ -1317,11 +1434,11 @@ impl DiskFs {
         let agent = self.root.join(AGENT_DIR);
         let mut removed = 0;
         if Self::lstat(&agent)?.is_some_and(|md| md.file_type().is_dir()) {
-            removed += crate::account::remove_atomic_temps(&agent, |of| of == crate::root::MARKER_FILE)?;
+            removed += crate::account::remove_atomic_temps(&agent, |of| of == crate::root::MARKER_FILE, Duration::ZERO)?;
         }
         let Some(tmp) = tmp else { return Ok(removed) };
         let record = |of: &str| Path::new(of).extension().is_some_and(|ext| ext == LANDING_EXT || ext == SWAP_RECORD_EXT);
-        removed += crate::account::remove_atomic_temps(&tmp, record)?;
+        removed += crate::account::remove_atomic_temps(&tmp, record, Duration::ZERO)?;
         let entries = fs::read_dir(tmp)?;
         for entry in entries {
             let entry = entry?;
@@ -1605,6 +1722,23 @@ impl Fs for DiskFs {
         }
     }
 
+    /// With a stability window ([`DiskFs::with_stability`]): whether the file hasn't kept its size and time for the
+    /// window yet, or (Windows) a program still has it open for writing.
+    fn still_changing(&self, path: &RelPath, meta: &FileMeta) -> bool {
+        let Some(stability) = &self.stability else { return false };
+        let now = stability.now();
+        let mut settling = stability.lock();
+        if !settling.look(path, meta.size, meta.mtime_ms, now, millis(SystemTime::now())) {
+            return true;
+        }
+        if open_for_writing(&self.full(path)) {
+            settling.held_open(path, meta.size, meta.mtime_ms, now);
+            return true;
+        }
+        settling.settled(path);
+        false
+    }
+
     /// Windows: a read-only file, or one an app holds open without letting it be deleted (asking for delete access,
     /// with every share flag, fails the way moving it would). Linux and macOS: a folder this user may not write.
     /// Anything the look can't tell is left to the landing.
@@ -1755,6 +1889,65 @@ mod tests {
     fn times_round_trip_through_system_time() {
         for ms in [0, 1, 1_700_000_000_123, -5_000] {
             assert_eq!(millis(system_time(ms).unwrap()), ms);
+        }
+    }
+
+    #[test]
+    fn a_changed_file_settles_after_two_looks_a_window_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("render.mov"), b"frame 1").unwrap();
+        let path = craft_cloud_sync::rel("render.mov");
+        let meta = |disk: &DiskFs| match disk.stat(&path).unwrap() {
+            Some(FsKind::File(meta)) => meta,
+            other => panic!("{other:?}"),
+        };
+        assert!(!DiskFs::new(dir.path()).still_changing(&path, &meta(&DiskFs::new(dir.path()))), "no window: trusted at once");
+        let window = Duration::from_millis(300);
+        let disk = DiskFs::new(dir.path()).with_stability_window(window);
+        let first = meta(&disk);
+        assert!(disk.still_changing(&path, &first), "the first look");
+        assert!(disk.still_changing(&path, &first), "a second look too soon");
+        std::thread::sleep(window);
+        assert!(!disk.still_changing(&path, &first), "unchanged a window later");
+        // Written again: a new first look.
+        fs::write(dir.path().join("render.mov"), b"frame 1, frame 2").unwrap();
+        let second = meta(&disk);
+        assert!(disk.still_changing(&path, &second));
+        std::thread::sleep(window);
+        // Changed again since the last look, just now: the window starts over.
+        let third = FileMeta { size: second.size + 1, mtime_ms: millis(SystemTime::now()), ..second };
+        assert!(disk.still_changing(&path, &third));
+        assert!(disk.clone().still_changing(&path, &third), "clones share the looks");
+    }
+
+    #[test]
+    fn a_file_written_a_while_ago_settles_at_the_first_look() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = dir.path().join("old.psd");
+        fs::write(&full, b"layers").unwrap();
+        File::options().write(true).open(&full).unwrap().set_modified(SystemTime::now() - Duration::from_secs(3_600)).unwrap();
+        let path = craft_cloud_sync::rel("old.psd");
+        let disk = DiskFs::new(dir.path()).with_stability_window(Duration::from_secs(2));
+        let Some(FsKind::File(meta)) = disk.stat(&path).unwrap() else { panic!("a file") };
+        // A temporary folder on a share or FAT (an unusual TMPDIR) doesn't trust its times: two looks there.
+        assert_eq!(!disk.still_changing(&path, &meta), mtime_trusted(dir.path()), "its time is older than the window");
+    }
+
+    #[test]
+    fn shares_and_fat_dont_trust_their_times() {
+        for untrusted in [0x6969, 0xFF53_4D42, 0x4D44, 0x2011_BAB0, 0x6573_5546, 0x0102_1997] {
+            assert!(untrusted_fs_magic(untrusted), "{untrusted:#x}");
+        }
+        // ext4, btrfs, xfs, tmpfs, overlayfs.
+        for trusted in [0xEF53, 0x9123_683E, 0x5846_5342, 0x0102_1994, 0x794C_7630] {
+            assert!(!untrusted_fs_magic(trusted), "{trusted:#x}");
+        }
+        // macOS, by type name: a FUSE mount is untrusted even when it says it is local (`-o local`).
+        for untrusted in ["msdos", "exfat", "macfuse", "osxfuse", "osxfusefs", "fusefs"] {
+            assert!(untrusted_mac_fs(untrusted), "{untrusted}");
+        }
+        for trusted in ["apfs", "hfs"] {
+            assert!(!untrusted_mac_fs(trusted), "{trusted}");
         }
     }
 

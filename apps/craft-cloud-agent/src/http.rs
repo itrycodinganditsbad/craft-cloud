@@ -275,6 +275,21 @@ pub async fn login(server: &ServerUrl, username: &str, password: &str, device_na
     json(send(req).await?, MAX_SMALL_JSON_BYTES).await
 }
 
+/// Longest `Retry-After` the long-poll honours; a bigger one is cut to this.
+const MAX_RETRY_AFTER_SECS: u64 = 300;
+
+/// Why a long-poll ([`HttpTransport::wait_for_changes`]) brought no sequence number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollError {
+    /// Too many requests wait on this space (429): poll again after this long (the server's `Retry-After`).
+    Busy(Option<Duration>),
+    /// The feed can't continue from `since` (the server was restored or the agent's position is too old): a pass
+    /// sorts it out.
+    Resync,
+    /// Anything else (offline, a server error, an answer that doesn't parse).
+    Failed(TransportError),
+}
+
 /// The server API for one signed-in device.
 #[derive(Debug, Clone)]
 pub struct HttpTransport {
@@ -325,6 +340,31 @@ impl HttpTransport {
     async fn no_content(&self, req: RequestBuilder) -> Result<(), TransportError> {
         checked(send(req).await?).await?;
         Ok(())
+    }
+
+    /// Waits up to `wait` (the server holds at most 60 s) for the change feed to move past `since`, for the `run`
+    /// loop; separate from the engine's paging, and only one node is asked for, since the loop only wants to know
+    /// whether to run a pass. Returns the server's sequence number (equal to `since` when nothing changed).
+    pub async fn wait_for_changes(&self, since: u64, wait: Duration) -> Result<u64, PollError> {
+        let mut url = self.server.endpoint("changes");
+        url.query_pairs_mut().append_pair("since", &since.to_string()).append_pair("limit", "1").append_pair("wait", &wait.as_secs().to_string());
+        // The server answers within `wait`; the whole-request cap leaves room for a slow answer on top.
+        let req = self.client.get(url).header(AUTHORIZATION, self.auth.clone()).timeout(wait.saturating_add(timeout_for(MAX_SMALL_JSON_BYTES)));
+        let resp = send(req).await.map_err(PollError::Failed)?;
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            let after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|secs| Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS)));
+            return Err(PollError::Busy(after));
+        }
+        match json::<ChangeSet>(resp, MAX_SMALL_JSON_BYTES).await {
+            Ok(page) => Ok(page.seq),
+            Err(TransportError::ResyncRequired) => Err(PollError::Resync),
+            Err(e) => Err(PollError::Failed(e)),
+        }
     }
 
     /// Revokes a device of this account (this one, to sign out).
