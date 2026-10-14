@@ -871,7 +871,8 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
   gives it. Passes of different machines run at the same time, while links are cut (both ways or one way, so
   requests or answers are lost), held and released, messages take up to 400 ms, the server loses answers after
   applying the request (commits, uploads) or cuts them halfway (feed and tree pages, chunks), and pages are
-  small. A commit whose answer was lost relaxes no check. A seed replays exactly to the simulated millisecond,
+  small. A commit whose answer was lost relaxes no check (except the being-written check's "downloaded"
+  exemption, see Check failed passes in the follow-ups). A seed replays exactly to the simulated millisecond,
   on any thread: SQLite answers from a thread of its own, so the server's database work takes no simulated
   time, and the server's clock (what requests record, when a device's last use is written) is the simulated
   one. Scenario tests pin each fault alone: a commit whose answer was lost is found on the server next pass
@@ -962,7 +963,7 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
 | M3b1 | Agent, first cut: real `Fs`, HTTP transport, saved state, root marker, CLI; two machines sync a folder by hand | DONE (2026-10-12) |
 | M3b2a | Hardening: the known gaps, same content = no change, atomic download landing, Windows rename-blocked retry | DONE (2026-10-13) |
 | M3b2b1 | Agent on its own: seed 112337, `run` loop, watcher, long-poll, stability window, backoff, status file | DONE (2026-10-14) |
-| M3b2b2 | Simulated network (`turmoil`): partitions, delays, dropped connections | TODO |
+| M3b2b2 | Simulated network (`turmoil`): partitions, delays, dropped connections | DONE (2026-10-15) |
 | M4 | History, restore, trash, thinning, GC, admin CLI, backup/restore | TODO |
 | M5 | Selective sync, large-media polish, ignore rules | TODO |
 | M6 | Packaging: binaries, Docker, systemd, built-in TLS, self-hosting guide | TODO |
@@ -970,7 +971,7 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
 
 ### M3b2b follow-ups
 
-From the final review of the M3b2b1 prototype (review 8), less what its last fix round did:
+From the final reviews of the M3b2b1 and M3b2b2 prototypes, less what their fix rounds did:
 
 - **Delete vs. server move onto a file of this machine's own**: one rule for the occupied and the free target
   (the review recommends "the delete wins"). It then decides the folder case in Known gaps
@@ -1013,6 +1014,10 @@ From the final review of the M3b2b1 prototype (review 8), less what its last fix
   they can be removed. Upgrading from M3b2a only needs "no `known_links`: every link new once" and "no
   `held_nodes` in a saved summary: no held set". In the same change, drop the code comments that cite the
   prototype's review and fix rounds.
+- **Network simulation tidying** (from M3b2b2's final review): `hold_time` spins (`std::hint::spin_loop` or
+  `yield_now`) instead of a 20 µs sleep if Windows CI turns out slow (a sleep there lasts at least about a
+  millisecond); the harness's server clock fails loudly outside a simulation instead of reading the start time;
+  AGENTS.md names the `test-support` seams (`Meta::busy`, `AppState::with_clock`) next to the turmoil note.
 
 ## Out of scope for Phase 1
 
