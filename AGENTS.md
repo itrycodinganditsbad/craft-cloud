@@ -32,7 +32,8 @@ crates/
   sync      craft-cloud-sync      the sync engine over `Fs`/`Transport` traits; `MemFs`; scenario tests and the simulation
 apps/
   craft-cloud-server              HTTP API (`/api/v1`), auth, admin CLI (`init`, `serve`, `user`, `device`, `reset-epoch`)
-  craft-cloud-agent               the sync agent: real disk `Fs`, HTTP `Transport`, saved account and state, root marker, CLI (`login`, `run`, `sync`, `status`, `logout`), the `run` loop
+  craft-cloud-agent               the sync agent: real disk `Fs`, HTTP `Transport` over a `Connection`, saved account and state, root marker, CLI (`login`, `run`, `sync`, `status`, `logout`), the `run` loop
+    tests/network/                the simulation over a simulated network (turmoil): `main.rs` histories and scenarios, `harness.rs` server and agent hosts
 xtask/                            cargo xtask ci | version
 docs/                             design documents and the self-hosting guide
 ```
@@ -40,7 +41,10 @@ docs/                             design documents and the self-hosting guide
 Layering: `proto` and `chunker` depend on nothing else in the workspace. `store` and `meta` depend on `proto`.
 The server depends on all three; nothing depends on the server outside tests. `sync` depends on `proto` and `chunker`
 (its tests also use `meta` and `store` as an in-process server). The agent depends on `proto` and `sync`; its
-tests also run the server on a loopback port.
+tests also run the server on a loopback port, and `tests/network/` runs the server's router and agents over
+`turmoil` (a dev-dependency: the shipped binaries never link it). That test target includes sync's test harness
+(`crates/sync/tests/common/`) by `#[path]`, so the agent's dev-dependencies mirror sync's test ones, and a change
+there can break the agent's tests: run both (`cargo xtask ci` does).
 
 Backend tests (Postgres, S3) skip unless their environment variables are set; see `.github/workflows/ci.yml`
 for the variables and the test containers. Set `CRAFT_CLOUD_REQUIRE_BACKENDS=1` to make a skip a failure.

@@ -415,6 +415,12 @@ changes locally, then pushes local changes. These rules came out of the simulati
   content); a file of its own in it under a tracked file's name then goes up as that file's next version (no
   conflict copy; history keeps the old one), unless the file's delete is held (below). It is fixed together
   with the follow-up on a server move onto a file of this machine's own (below).
+- **A lost commit answer and a rename**: a commit whose answer was lost (a cut connection, a crash right after it
+  applied) is found again next pass by place and content. If the user meanwhile renamed or moved a file that
+  commit created, the next pass downloads the server's file at its old name, and the renamed one goes up as a new
+  file once it stops changing: the rename becomes a copy (same content, both names on every machine) until the
+  user removes one. Nothing is lost (seed 710 of the network simulation). Edits are not affected: an update whose
+  answer was lost leaves the node tracked, so a renamed file is found by local ID. The follow-up is below.
 - **Deletes behind a link are held**:
   - *Rule.* A link or special file is *new* when the last finished push saw none at its path. When a tracked
     node is missing (not at its place, not found by local ID, not behind a link, still on the server) and a new
@@ -423,7 +429,10 @@ changes locally, then pushes local changes. These rules came out of the simulati
     was there at the last finished push never holds anything.
   - *What is kept.* The link paths each finished push saw, replaced in the checkpoint after its last commit (a
     pass that fails or crashes leaves them as they were). Where this machine last had a missing node whose
-    place the pull moved to follow another machine's move, until a push finishes. Each hold, by node ID with
+    place the pull moved to follow another machine's move, and every folder the pull moved from its tracked place
+    here (the folder found at its place may be a new one that took the name, while the user moved the real one
+    away with the link in it; seed 9807 of the network simulation, which also needs no rename above the folder on
+    the other side, nor a parent that still exists), until a push finishes. Each hold, by node ID with
     the paths of every new link that matched (an unrelated link with the same name may appear in the same
     window as the real one), saved before the pass commits anything. No folder identity goes into the rule.
   - *While it lasts.* The folders above the node wait with it. Every pass's summary, `status` and
@@ -852,8 +861,33 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
   (`status` and `sync --approve-deletes` write without the lock while a loop holds it), and the loop cleans
   once, at its start, never while it may be writing its own. If the watcher can't start, the status says so
   (see Triggers). The local control API stays M7.
-- **Simulated network** (M3b2b2): `turmoil` (MIT) runs agents and the server over a simulated network with
-  partitions, delays and dropped connections, on top of the existing in-process simulation.
+- **Simulated network** (M3b2b2): `turmoil` (MIT, a dev-dependency: the shipped binaries don't link it) runs
+  three agents and the real server (its router; SQLite and blobs in memory) on hosts of their own, over a
+  simulated network, on top of the in-process simulation's actions and checks (`apps/craft-cloud-agent/tests/
+  network/`). The agents' requests go through the agent's own HTTP code: `HttpTransport` builds the requests
+  and reads the answers (error mapping, body caps, `429`/`Retry-After`, the long-poll; `info` and the sign-in
+  too) over a `Connection` that only carries them, reqwest in the agent and a hyper client on turmoil's TCP in
+  the simulation; the server side is the same router served by hyper, with the client's address as `serve`
+  gives it. Passes of different machines run at the same time, while links are cut (both ways or one way, so
+  requests or answers are lost), held and released, messages take up to 400 ms, the server loses answers after
+  applying the request (commits, uploads) or cuts them halfway (feed and tree pages, chunks), and pages are
+  small. A commit whose answer was lost relaxes no check. A seed replays exactly to the simulated millisecond,
+  on any thread: SQLite answers from a thread of its own, so the server's database work takes no simulated
+  time, and the server's clock (what requests record, when a device's last use is written) is the simulated
+  one. Scenario tests pin each fault alone: a commit whose answer was lost is found on the server next pass
+  (client IDs: no second node, no conflict copy, nothing sent again), an upload of several chunks whose first
+  chunk's answer was lost sends each other chunk once and that one not again, a cut feed page fails the pass as
+  offline, a long-poll cut off by a partition ends at its timeout (the wait plus the cap for a small answer:
+  120 s), and a server whose long-poll slots are all taken answers `429` with `Retry-After`, which the loop's
+  long-poll waits out. The `run` loop's scheduler and long-poll also run on simulated time (passes inline, the
+  user's writes handed in for the watcher): a server change reaches it within seconds, a ten-minute partition
+  backs passes and polls off, the heal runs the pending retry on the long-poll's first answer, and an idle loop
+  polls every 30 s. That test copies the loop's event handling rather than running `run_loop`, so it can drift
+  from it. Not simulated: reqwest's own connection handling (its pool, TLS, the connect and read timeouts; the
+  simulation keeps the whole-request timeout and opens a connection per request), the server's `serve`
+  (graceful shutdown), the pass thread, the watcher and the status file, server restarts, and machine crashes
+  (the in-process simulation crashes machines). turmoil refuses a new connection across a partition at once;
+  only connections already open stall until their timeout.
 
 ## Errors
 
@@ -903,8 +937,11 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
   it), and after every finished pass each tracked node still has a place. A failing seed replays exactly.
   Half the seeds turn the racy window off to exercise the size-and-time fast path. Machines also crash at
   random calls and between filesystem steps and restart from their last saved state. Seeds run in parallel
-  (`SIM_JOBS`) against an in-memory test server; seeds 0–3999 take under a minute. A simulated network
-  (`turmoil`, MIT) comes with M3b2.
+  (`SIM_JOBS`) against an in-memory test server; seeds 0–3999 take under a minute. The same actions and
+  checks also run over a simulated network (`turmoil`, MIT; `--test network` in the agent, the same `SIM_*`
+  knobs): the real server and agents' HTTP code, with partitions, held links, latency, lost and cut answers and
+  machines syncing at the same time (see M3b2b2). Seeds 0–999 take about 35 s in `--release`; a seed replays
+  exactly, on any thread, which a test checks on 20 seeds.
 - **Scripted scenarios** on top, as readable regression tests: concurrent edit → conflict copy; offline edits
   on both sides; upload cut halfway then resumed; delete versus edit; folder move during an upload; epoch
   change with a newer local file and with another device already reconciled; mass delete paused; Windows
@@ -941,7 +978,19 @@ From the final review of the M3b2b1 prototype (review 8), less what its last fix
 - **Hidden-node guard** (Known gaps' third miss, `known_gap_a_link_seen_while_the_node_was_behind_another_link_…`):
   don't make links known while a tracked node is hidden behind a link. Weigh it against longer wrong holds.
 - **Ancestor-name false holds**: count an ancestor-name match only while that folder isn't at its place, or
-  accept them now that an approval releases a hold.
+  accept them now that an approval releases a hold. Since seed 9807 a folder the pull moved keeps its old path
+  until a push finishes, which adds a false hold of its own: another machine renamed `Old` to `New`, and this
+  machine deleted `Old/f.txt` and made an unrelated new link `Links/Old` before its pull; the delete is held
+  behind `Links/Old` until the link goes or the user approves (safe side). The candidate narrower rule: keep the
+  old path only for folders the pull moved whose ID here was taken afresh by path (a new folder that took the
+  name); `Old` kept its ID. It needs that set kept across failed pushes.
+- **Lost commit answers by ID** (from M3b2b2, Known gaps): save the commit's new nodes with the local IDs of their
+  files in the checkpoint before sending it, and on the next pass match a server node the base lacks to its file
+  by local ID, so a rename after a lost answer stays a rename.
+- **Check failed passes** (from M3b2b2): what a failed pass got onto the server (lost answer, crash) is checked
+  against the files being written when it started: in process, the in-memory server's versions after the pass; over
+  the network, the harness's per-host commit log. Then the simulation's "downloaded" exemption in the
+  being-written check goes.
 - **Approval pace for holds**: the loop looks every 30 s while only holds wait, so a release can take that
   long. Looking every 2 s for a minute after `status` or a pass showed a held set would make it prompt.
 - **Errors**: the section hasn't had its own review yet.
@@ -954,7 +1003,11 @@ From the final review of the M3b2b1 prototype (review 8), less what its last fix
   - event-scoped scans for huge folders;
   - the simulation's one-shot list failure ("vanished during the scan");
   - recording the commit's `seq` to save the long-poll's extra wake;
-  - turmoil (M3b2b2).
+  - from M3b2b2: a server restart in the network simulation (it needs the stores on disk: dropping the
+    in-memory database's only connection loses it), crashes over the network, the `run` loop's own code (its
+    event loop split from the pass thread, the watcher and the status file, so the simulation drives it rather
+    than a copy), and a shared dev-only simulation crate instead of the agent's tests including sync's harness
+    by path.
 - **Simplification on main**: no state older than M3b2a exists there, yet the replay brought in the
   prototype's older hold records (fix rounds 3–6) and the one-link form of a saved summary's held deletes:
   they can be removed. Upgrading from M3b2a only needs "no `known_links`: every link new once" and "no
