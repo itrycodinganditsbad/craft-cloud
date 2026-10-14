@@ -924,7 +924,7 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
 | M3a | Sync engine on `Fs`/`Transport` + simulation harness | DONE (2026-10-12) |
 | M3b1 | Agent, first cut: real `Fs`, HTTP transport, saved state, root marker, CLI; two machines sync a folder by hand | DONE (2026-10-12) |
 | M3b2a | Hardening: the known gaps, same content = no change, atomic download landing, Windows rename-blocked retry | DONE (2026-10-13) |
-| M3b2b1 | Agent on its own: seed 112337, `run` loop, watcher, long-poll, stability window, backoff, status file | TODO |
+| M3b2b1 | Agent on its own: seed 112337, `run` loop, watcher, long-poll, stability window, backoff, status file | DONE (2026-10-14) |
 | M3b2b2 | Simulated network (`turmoil`): partitions, delays, dropped connections | TODO |
 | M4 | History, restore, trash, thinning, GC, admin CLI, backup/restore | TODO |
 | M5 | Selective sync, large-media polish, ignore rules | TODO |
@@ -944,7 +944,7 @@ From the final review of the M3b2b1 prototype (review 8), less what its last fix
   accept them now that an approval releases a hold.
 - **Approval pace for holds**: the loop looks every 30 s while only holds wait, so a release can take that
   long. Looking every 2 s for a minute after `status` or a pass showed a held set would make it prompt.
-- **Errors**: the section's own review (still marked TODO).
+- **Errors**: the section hasn't had its own review yet.
 - **Carried**:
   - folder-ID reuse (now only relevant to moves);
   - filesystems without folder IDs;
@@ -955,10 +955,11 @@ From the final review of the M3b2b1 prototype (review 8), less what its last fix
   - the simulation's one-shot list failure ("vanished during the scan");
   - recording the commit's `seq` to save the long-poll's extra wake;
   - turmoil (M3b2b2).
-- **Simplification on main**: no state older than M3b2a exists there, so the prototype's older hold records
-  (fix rounds 3–6), `fresh_dirs` and the one-link form of a saved summary's held deletes needn't be replayed.
-  Upgrading from M3b2a only needs "no `known_links`: every link new once" and "no `held_nodes` in a saved
-  summary: no held set".
+- **Simplification on main**: no state older than M3b2a exists there, yet the replay brought in the
+  prototype's older hold records (fix rounds 3–6) and the one-link form of a saved summary's held deletes:
+  they can be removed. Upgrading from M3b2a only needs "no `known_links`: every link new once" and "no
+  `held_nodes` in a saved summary: no held set". In the same change, drop the code comments that cite the
+  prototype's review and fix rounds.
 
 ## Out of scope for Phase 1
 
