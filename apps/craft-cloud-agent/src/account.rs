@@ -390,12 +390,15 @@ impl DataDir {
         if let Some(parent) = self.0.parent() {
             fs::create_dir_all(parent).map_err(io_at(parent))?;
         }
-        let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = fs::DirBuilder::new();
             builder.mode(0o700);
-        }
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = fs::DirBuilder::new();
         match builder.create(&self.0) {
             // Made meanwhile (by another agent starting at the same moment): there is nothing more to do.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && self.0.is_dir() => Ok(()),

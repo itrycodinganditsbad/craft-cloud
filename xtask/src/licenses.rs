@@ -17,6 +17,8 @@ const EXCEPTIONS: &[&str] = &["LLVM-exception"];
 pub fn run() -> Result<(), String> {
     let mut cmd = crate::cargo();
     cmd.args(["tree", "--workspace", "--locked", "--target", "all", "-e", "normal,build,dev", "--prefix", "none", "--format", "{p}|{l}"]);
+    // CI sets `CARGO_TERM_COLOR=always`, which would colour the `(*)` marker of repeated crates.
+    cmd.args(["--color", "never"]);
     let output = cmd.output().map_err(|e| format!("cargo tree: failed to spawn: {e}"))?;
     if !output.status.success() {
         return Err(format!("cargo tree: exited with {}: {}", output.status, String::from_utf8_lossy(&output.stderr).trim()));
