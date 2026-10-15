@@ -39,6 +39,7 @@ http-body-util.workspace = true
 hyper = { workspace = true, features = ["client", "server", "http1"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 tempfile.workspace = true
+tokio-rustls.workspace = true
 tower-service.workspace = true
 turmoil.workspace = true
 

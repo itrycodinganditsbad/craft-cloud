@@ -21,8 +21,8 @@ use sqlx::any::{AnyConnectOptions, AnyPoolOptions};
 use sqlx::{AnyPool, ConnectOptions};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-pub use blobs::BlobKind;
 pub use commit::CommitOutcome;
+pub use craft_cloud_proto::BlobKind;
 pub use tree::SpaceInfo;
 pub use users::{DeviceAuth, DeviceRecord, Role, UserId, UserRecord, valid_username};
 
@@ -42,11 +42,18 @@ pub enum MetaError {
     MissingChunks(Vec<ChunkId>),
     #[error("the change feed no longer reaches that far back; list the whole tree")]
     ResyncRequired,
+    /// A blob would take the space over its stored-bytes cap ([`Meta::with_stored_bytes_cap`]); nothing was
+    /// recorded. `used` is what the space stores without it.
+    #[error("the account's storage on the server is full: {used} of {limit} bytes used")]
+    QuotaExceeded { used: u64, limit: u64 },
     #[error("invalid input: {0}")]
     Invalid(&'static str),
     #[error("stored data is damaged: {0}")]
     Corrupt(&'static str),
 }
+
+/// How long a SQLite connection waits for a lock another connection or program holds before giving up.
+pub const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dialect {
@@ -61,6 +68,8 @@ pub struct Meta {
     dialect: Dialect,
     /// Serialises write transactions on SQLite. Unused on Postgres.
     write_lock: Arc<Mutex<()>>,
+    /// The most bytes one space may store ([`Meta::with_stored_bytes_cap`]); `None`: no cap.
+    stored_cap: Option<u64>,
 }
 
 impl Meta {
@@ -90,12 +99,31 @@ impl Meta {
             Dialect::Sqlite => AnyPoolOptions::new().max_connections(8),
             Dialect::Postgres => AnyPoolOptions::new().max_connections(16),
         };
+        // SQLite: a connection that finds the database locked (by another program: a backup, the admin CLI) waits
+        // up to this long for it rather than failing at once. Said here rather than left to sqlx's default.
+        let pool_options = match dialect {
+            Dialect::Sqlite => pool_options.after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA busy_timeout = {}", SQLITE_BUSY_TIMEOUT.as_millis()))).execute(conn).await?;
+                    Ok(())
+                })
+            }),
+            Dialect::Postgres => pool_options,
+        };
         let pool = pool_options.connect_with(options).await?;
         if dialect == Dialect::Sqlite && !url.contains(":memory:") {
             sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
         }
         schema::migrate(&pool, dialect).await?;
-        Ok(Self { pool, dialect, write_lock: Arc::new(Mutex::new(())) })
+        Ok(Self { pool, dialect, write_lock: Arc::new(Mutex::new(())), stored_cap: None })
+    }
+
+    /// The store with a cap on the bytes one space (one user's) stores: the stored size of every chunk and manifest
+    /// it has, each counted once however many files use it. Recording a blob that would go over it is refused with
+    /// [`MetaError::QuotaExceeded`]. `None` (the default): no cap. The cap belongs to this handle and its clones.
+    pub fn with_stored_bytes_cap(mut self, cap: Option<u64>) -> Self {
+        self.stored_cap = cap;
+        self
     }
 
     /// Whether a database connection is in use (a query under way, or a connection on its way back to the pool).

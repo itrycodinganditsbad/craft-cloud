@@ -6,7 +6,7 @@ use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection, Que
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use craft_cloud_meta::MetaError;
-use craft_cloud_proto::api::{ErrorBody, codes};
+use craft_cloud_proto::api::{ErrorBody, QuotaUse, codes};
 use craft_cloud_proto::{ChunkId, Conflict};
 use craft_cloud_store::StoreError;
 
@@ -17,13 +17,23 @@ pub struct ApiError {
     pub message: String,
     pub conflicts: Option<Vec<Conflict>>,
     pub missing: Option<Vec<ChunkId>>,
+    /// Boxed: rare, and every handler's `Result` carries this type.
+    pub quota: Option<Box<QuotaUse>>,
     /// Seconds for the `Retry-After` header.
     pub retry_after: Option<u32>,
 }
 
 impl ApiError {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into(), conflicts: None, missing: None, retry_after: None }
+        Self { status, code, message: message.into(), conflicts: None, missing: None, quota: None, retry_after: None }
+    }
+
+    /// `507 quota_exceeded`: the account would store more than the server lets it.
+    pub fn quota_exceeded(used: u64, limit: u64) -> Self {
+        let message = format!("the account's storage on the server is full: {used} of {limit} bytes used");
+        let mut e = Self::new(StatusCode::INSUFFICIENT_STORAGE, codes::QUOTA_EXCEEDED, message);
+        e.quota = Some(Box::new(QuotaUse { used, limit }));
+        e
     }
 
     pub fn invalid(message: impl Into<String>) -> Self {
@@ -73,6 +83,7 @@ impl From<MetaError> for ApiError {
             MetaError::Invalid(message) => Self::invalid(message),
             MetaError::NotFound(what) => Self::not_found(what),
             MetaError::UsernameTaken => Self::new(StatusCode::CONFLICT, codes::USERNAME_TAKEN, "the username is taken"),
+            MetaError::QuotaExceeded { used, limit } => Self::quota_exceeded(used, limit),
             MetaError::Db(_) | MetaError::Corrupt(_) | MetaError::UnsupportedUrl => {
                 tracing::error!(error = %e, "metadata error");
                 Self::internal()
@@ -127,7 +138,13 @@ impl From<BytesRejection> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = ErrorBody { error: self.code.to_owned(), message: self.message, conflicts: self.conflicts, missing: self.missing };
+        let body = ErrorBody {
+            error: self.code.to_owned(),
+            message: self.message,
+            conflicts: self.conflicts,
+            missing: self.missing,
+            quota: self.quota.map(|q| *q),
+        };
         let mut response = (self.status, Json(body)).into_response();
         if let Some(secs) = self.retry_after {
             response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(secs));

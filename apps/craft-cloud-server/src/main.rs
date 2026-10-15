@@ -29,8 +29,10 @@ async fn main() -> ExitCode {
 
 async fn run_server(config_path: &std::path::Path) -> Result<(), String> {
     let config = Config::load(config_path).map_err(|e| e.to_string())?;
-    if config.behind_proxy && config.trusted_proxies.is_empty() {
-        tracing::warn!("behind_proxy is set but trusted_proxies is empty: every client will share the proxy's address for sign-in rate limits");
+    // `Config::load` refuses `behind_proxy` without `trusted_proxies` unless `ignore_forwarded_for` says it is meant,
+    // and refuses `ignore_forwarded_for` anywhere else.
+    if config.ignore_forwarded_for {
+        tracing::warn!("ignore_forwarded_for is set: every client shares one address for sign-in rate limits");
     }
     let (meta, store) = open(&config).await.map_err(|e| e.to_string())?;
     let state = AppState::new(meta, store, config.trusted_proxies.clone()).map_err(|e| e.message)?;

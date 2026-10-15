@@ -123,14 +123,27 @@ pub mod codes {
     pub const INVALID: &str = "invalid";
     pub const NOT_FOUND: &str = "not_found";
     pub const TOO_LARGE: &str = "too_large";
+    /// A request body took longer to arrive than the server allows for it (HTTP 408); send it again.
+    pub const TIMEOUT: &str = "timeout";
     pub const USERNAME_TAKEN: &str = "username_taken";
+    /// A chunk or manifest would take the account over the bytes the server lets it store (HTTP 507); `quota` says
+    /// how much it stores and may store.
+    pub const QUOTA_EXCEEDED: &str = "quota_exceeded";
     pub const INTERNAL: &str = "internal";
 }
 
+/// How much an account stores on the server and may store, in bytes, with `quota_exceeded`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaUse {
+    pub used: u64,
+    pub limit: u64,
+}
+
 /// Every error answer. `error` is a stable code, one of [`codes`]; `message` is for people. `conflicts` is
-/// set for `conflict`, `missing` for `missing_chunks`. Clients ignore codes and JSON fields they don't know
-/// (the server may add more later), so match on the codes you handle and treat the rest by HTTP status.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// set for `conflict`, `missing` for `missing_chunks`, `quota` for `quota_exceeded`. Clients ignore codes and JSON
+/// fields they don't know (the server may add more later), so match on the codes you handle and treat the rest by
+/// HTTP status.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub error: String,
     pub message: String,
@@ -138,6 +151,8 @@ pub struct ErrorBody {
     pub conflicts: Option<Vec<Conflict>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missing: Option<Vec<ChunkId>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<QuotaUse>,
 }
 
 /// Response header carrying the space's epoch on every signed-in request.
@@ -157,9 +172,22 @@ mod tests {
 
     #[test]
     fn error_bodies_omit_empty_extras() {
-        let body = ErrorBody { error: "not_found".into(), message: "no such chunk".into(), conflicts: None, missing: None };
+        let body = ErrorBody { error: "not_found".into(), message: "no such chunk".into(), ..ErrorBody::default() };
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json, serde_json::json!({ "error": "not_found", "message": "no such chunk" }));
+        assert_eq!(serde_json::from_value::<ErrorBody>(json).unwrap(), body);
+    }
+
+    #[test]
+    fn a_quota_answer_says_how_much_is_used() {
+        let body = ErrorBody {
+            error: codes::QUOTA_EXCEEDED.into(),
+            message: "m".into(),
+            quota: Some(QuotaUse { used: 9, limit: 10 }),
+            ..ErrorBody::default()
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["quota"], serde_json::json!({ "used": 9, "limit": 10 }));
         assert_eq!(serde_json::from_value::<ErrorBody>(json).unwrap(), body);
     }
 

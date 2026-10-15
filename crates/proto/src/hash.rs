@@ -115,6 +115,14 @@ hash32!(
     ManifestId
 );
 
+/// What a stored blob is: a chunk ([`ChunkId`]) or a manifest ([`ManifestId`]). The blob store keeps the two in
+/// separate namespaces, and the metadata records which of each a space has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlobKind {
+    Chunk,
+    Manifest,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

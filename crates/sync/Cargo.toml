@@ -25,6 +25,7 @@ craft-cloud-sync = { path = ".", features = ["test-support"] }
 tempfile.workspace = true
 craft-cloud-meta.workspace = true
 craft-cloud-store.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

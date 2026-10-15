@@ -3,7 +3,9 @@
 //! ```toml
 //! listen = "127.0.0.1:8080"
 //! behind_proxy = false          # true when a TLS reverse proxy forwards to this address
-//! trusted_proxies = []          # proxies whose X-Forwarded-For is believed
+//! trusted_proxies = []          # proxies whose X-Forwarded-For is believed; needed with behind_proxy
+//! # ignore_forwarded_for = true # behind a proxy without naming it: every client then counts as the proxy
+//! # stored_bytes_per_user = 2_000_000_000_000   # cap on what one account stores, in bytes (unset: no cap)
 //!
 //! [database]
 //! url = "sqlite:/var/lib/craft-cloud/meta.db"   # or postgres://user:pass@host/db
@@ -20,6 +22,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+use craft_cloud_proto::limits::MAX_CHUNK_BYTES;
 use craft_cloud_store::s3::S3Config;
 use serde::Deserialize;
 
@@ -33,6 +36,22 @@ pub enum ConfigError {
     Parse(String),
     #[error("listen = {0} is not a loopback address. Craft Cloud speaks plain HTTP; put it behind a TLS reverse proxy and set behind_proxy = true")]
     NotLoopback(SocketAddr),
+    #[error(
+        "behind_proxy = true needs the proxy's address in trusted_proxies: without it every client shares the proxy's \
+         address, so a few wrong passwords lock everyone out of signing in. If that is really meant, set \
+         ignore_forwarded_for = true"
+    )]
+    NoTrustedProxies,
+    #[error(
+        "ignore_forwarded_for = true only goes with behind_proxy = true and an empty trusted_proxies: with trusted \
+         proxies their X-Forwarded-For is believed, and without a proxy there is nothing to ignore. Remove one of them"
+    )]
+    IgnoreForwardedForMisplaced,
+    #[error(
+        "stored_bytes_per_user = {0} is less than one chunk ({1} bytes): not even one maximal chunk would fit, and the \
+         agent could not tell a full account from a file that is too big. Raise it, or remove it for no cap"
+    )]
+    StoredBytesCapTooSmall(u64, u32),
     #[error("storage.{0} is missing (set it in the config or the {1} environment variable)")]
     MissingS3Credential(&'static str, &'static str),
 }
@@ -45,6 +64,16 @@ pub struct Config {
     pub behind_proxy: bool,
     #[serde(default)]
     pub trusted_proxies: Vec<IpAddr>,
+    /// Lets `behind_proxy = true` run with no `trusted_proxies`: the server then believes no `X-Forwarded-For`, so
+    /// every client has the proxy's address and shares one budget of sign-in attempts. Refused with a non-empty
+    /// `trusted_proxies` or without `behind_proxy`, where it would mean nothing.
+    #[serde(default)]
+    pub ignore_forwarded_for: bool,
+    /// The most bytes one account may store: the stored size of every chunk and manifest it uploaded, each counted
+    /// once. An upload that would go over it is refused (`507 quota_exceeded`); the agent skips that file. Unset (the
+    /// default): no cap. This is not yet the per-user quota on files' logical size (that comes with history).
+    #[serde(default)]
+    pub stored_bytes_per_user: Option<u64>,
     pub database: DatabaseConfig,
     pub storage: StorageConfig,
 }
@@ -123,6 +152,20 @@ impl Config {
         if !config.behind_proxy && !config.listen.ip().is_loopback() {
             return Err(ConfigError::NotLoopback(config.listen));
         }
+        if config.behind_proxy && config.trusted_proxies.is_empty() && !config.ignore_forwarded_for {
+            return Err(ConfigError::NoTrustedProxies);
+        }
+        // A setting whose name says more than it does is refused rather than half-honoured.
+        if config.ignore_forwarded_for && (!config.behind_proxy || !config.trusted_proxies.is_empty()) {
+            return Err(ConfigError::IgnoreForwardedForMisplaced);
+        }
+        // The agent counts less than one chunk of room as a full account (it pauses instead of skipping the file),
+        // so a cap under that would make every refusal account-level.
+        if let Some(cap) = config.stored_bytes_per_user
+            && cap < u64::from(MAX_CHUNK_BYTES)
+        {
+            return Err(ConfigError::StoredBytesCapTooSmall(cap, MAX_CHUNK_BYTES));
+        }
         Ok(config)
     }
 }
@@ -196,6 +239,38 @@ path = "/tmp/blobs"
         let proxied = format!("behind_proxy = true\ntrusted_proxies = [\"10.0.0.1\"]\n{public}");
         let c = Config::parse(&proxied).unwrap();
         assert_eq!(c.trusted_proxies, vec!["10.0.0.1".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn the_stored_bytes_cap_is_off_unless_set() {
+        assert_eq!(Config::parse(DISK).unwrap().stored_bytes_per_user, None);
+        let capped = format!("stored_bytes_per_user = 2_000_000_000_000\n{DISK}");
+        assert_eq!(Config::parse(&capped).unwrap().stored_bytes_per_user, Some(2_000_000_000_000));
+        assert!(matches!(Config::parse(&format!("stored_bytes_per_user = -1\n{DISK}")), Err(ConfigError::Parse(_))));
+        // Under one chunk the agent would count every refusal as a full account: refused at load.
+        assert!(matches!(Config::parse(&format!("stored_bytes_per_user = 4194303\n{DISK}")), Err(ConfigError::StoredBytesCapTooSmall(4_194_303, _))));
+        assert_eq!(Config::parse(&format!("stored_bytes_per_user = 4194304\n{DISK}")).unwrap().stored_bytes_per_user, Some(4_194_304));
+    }
+
+    #[test]
+    fn behind_a_proxy_the_proxy_must_be_named_or_ignoring_it_said_out_loud() {
+        let unnamed = format!("behind_proxy = true\n{DISK}");
+        assert!(matches!(Config::parse(&unnamed), Err(ConfigError::NoTrustedProxies)));
+        let said = format!("behind_proxy = true\nignore_forwarded_for = true\n{DISK}");
+        let c = Config::parse(&said).unwrap();
+        assert!(c.behind_proxy && c.ignore_forwarded_for && c.trusted_proxies.is_empty());
+        // Without a proxy there is nothing to name.
+        assert!(!Config::parse(DISK).unwrap().ignore_forwarded_for);
+    }
+
+    #[test]
+    fn ignore_forwarded_for_is_refused_where_it_would_not_do_what_it_says() {
+        // Named proxies' X-Forwarded-For is believed, so the flag would ignore nothing.
+        let named = format!("behind_proxy = true\nignore_forwarded_for = true\ntrusted_proxies = [\"10.0.0.1\"]\n{DISK}");
+        assert!(matches!(Config::parse(&named), Err(ConfigError::IgnoreForwardedForMisplaced)));
+        // Without a proxy there is nothing to ignore.
+        let no_proxy = format!("ignore_forwarded_for = true\n{DISK}");
+        assert!(matches!(Config::parse(&no_proxy), Err(ConfigError::IgnoreForwardedForMisplaced)));
     }
 
     #[test]
