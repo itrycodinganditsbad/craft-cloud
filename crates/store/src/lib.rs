@@ -16,32 +16,26 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+pub use craft_cloud_proto::BlobKind;
 use craft_cloud_proto::limits::{MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES};
 use craft_cloud_proto::{ChunkId, ManifestId};
 
 /// Format byte for plain, uncompressed, unencrypted blobs.
 const FORMAT_PLAIN: u8 = 0;
 
-/// What a blob is. Chunks and manifests live in separate namespaces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BlobKind {
-    Chunk,
-    Manifest,
+/// The folder (or key prefix) a kind of blob lives under: chunks and manifests live in separate namespaces.
+fn dir(kind: BlobKind) -> &'static str {
+    match kind {
+        BlobKind::Chunk => "chunks",
+        BlobKind::Manifest => "manifests",
+    }
 }
 
-impl BlobKind {
-    fn dir(self) -> &'static str {
-        match self {
-            BlobKind::Chunk => "chunks",
-            BlobKind::Manifest => "manifests",
-        }
-    }
-
-    fn max_len(self) -> usize {
-        match self {
-            BlobKind::Chunk => usize::try_from(MAX_CHUNK_BYTES).unwrap_or(usize::MAX),
-            BlobKind::Manifest => MAX_MANIFEST_BYTES,
-        }
+/// The largest blob of a kind.
+fn max_len(kind: BlobKind) -> usize {
+    match kind {
+        BlobKind::Chunk => usize::try_from(MAX_CHUNK_BYTES).unwrap_or(usize::MAX),
+        BlobKind::Manifest => MAX_MANIFEST_BYTES,
     }
 }
 
@@ -66,7 +60,7 @@ impl BlobKey {
         let hex: String = self.id.iter().map(|b| format!("{b:02x}")).collect();
         let (a, rest) = hex.split_at(2);
         let (b, _) = rest.split_at(2);
-        format!("{}/{a}/{b}/{hex}", self.kind.dir())
+        format!("{}/{a}/{b}/{hex}", dir(self.kind))
     }
 }
 
@@ -117,7 +111,7 @@ impl Store {
     /// Stores `data` under `key` after checking its size and hash. Storing a blob that is already there
     /// succeeds and changes nothing.
     pub async fn put(&self, key: BlobKey, data: &[u8]) -> Result<(), StoreError> {
-        let max = key.kind.max_len();
+        let max = max_len(key.kind);
         if data.len() > max {
             return Err(StoreError::TooLarge { key, len: data.len(), max });
         }
@@ -140,7 +134,7 @@ impl Store {
             return Err(StoreError::Corrupt { key, reason: "unknown format byte" });
         }
         let data = object.slice(1..);
-        if data.len() > key.kind.max_len() {
+        if data.len() > max_len(key.kind) {
             return Err(StoreError::Corrupt { key, reason: "larger than the limit" });
         }
         if *blake3::hash(&data).as_bytes() != key.id {

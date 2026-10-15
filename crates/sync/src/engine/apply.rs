@@ -218,20 +218,12 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         if !matches!(self.stat(&parent)?, Some(FsKind::Dir { .. })) {
             return Ok(None);
         }
-        let key = name.fold_key();
         // A folder that can't be listed hides no twin from this check: whatever then acts on it lists it too, and
         // fails on this node.
-        let Ok(entries) = self.fs.list(&parent) else { return Ok(None) };
-        for entry in entries {
-            if entry.kind == FsKind::Other
-                && let Ok(other) = Name::new(&entry.name)
-                && other != *name
-                && other.fold_key() == key
-            {
-                return Ok(Some(parent.join(&other)));
-            }
-        }
-        Ok(None)
+        let twin = self.twins_in(&parent, |twins| {
+            twins.get(&name.fold_key()).and_then(|names| names.iter().find(|(other, link)| **link && *other != name).map(|(other, _)| other.clone()))
+        });
+        Ok(twin.ok().flatten().map(|other| parent.join(&other)))
     }
 
     /// Fails as a filesystem error on the node (it is skipped and waits) if taking `to` would act on a link.
@@ -264,9 +256,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             && *exec == f.exec
         {
             *version = f.version;
-            if let Some(base) = self.state.base.get_mut(&id) {
-                base.kind = entry.kind.clone();
-            }
+            let kind = entry.kind.clone();
+            self.state.base.update(&id, |base| base.kind = kind);
             new_version = false;
         }
         let moved = base_path.as_ref() != Some(&rpath);
@@ -419,7 +410,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         // ID moves there. A pass that crashed before saving its state may have taken a new file for this one (an
         // atomic save looks the same), uploaded it and moved it here; the file the ID still finds is then the
         // user's own, and stays untracked (it goes up as a new file) instead of being replaced.
-        if !self.state.base_index().contains_key(&rpath) && self.same_content(file, &rpath).await?.is_some() {
+        if !self.state.base_has_path(&rpath) && self.same_content(file, &rpath).await?.is_some() {
             self.settle_occupants(id, &rpath, None, Some(file), report).await?;
             if self.adopt_in_place(id, &rpath, file, &mut new_entry, report).await? {
                 return Ok(());
@@ -484,10 +475,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// A file at `path` (or its case twin) that no tracked node has: not at its place, and not by local ID (a tracked
     /// file the user moved there is that node's). `id` is the node about to take `path`.
     fn own_file_toward(&self, id: NodeId, path: &RelPath) -> Result<Option<RelPath>, SyncError> {
-        let index = self.state.base_index();
         for at in [Some(path.clone()), self.case_twin(path)?].into_iter().flatten() {
             if let Some(FsKind::File(meta)) = self.stat(&at)?
-                && !index.contains_key(&at)
+                && !self.state.base_has_path(&at)
                 && !self.owns_local_file(meta.id, id)
             {
                 return Ok(Some(at));
@@ -508,7 +498,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         new_entry: &mut BaseEntry,
         report: &mut Report,
     ) -> Result<bool, SyncError> {
-        if self.state.base_index().contains_key(rpath) {
+        if self.state.base_has_path(rpath) {
             return Ok(false);
         }
         let Some((meta, hash)) = self.same_content(file, rpath).await? else { return Ok(false) };
@@ -531,16 +521,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         if !matches!(self.stat(&parent)?, Some(FsKind::Dir { .. })) {
             return Ok(None);
         }
-        let key = name.fold_key();
-        for entry in self.fs.list(&parent).map_err(|e| io_err(&parent, e))? {
-            if let Ok(other) = Name::new(&entry.name)
-                && other != *name
-                && other.fold_key() == key
-            {
-                return Ok(Some(parent.join(&other)));
-            }
-        }
-        Ok(None)
+        let twin = self
+            .twins_in(&parent, |twins| twins.get(&name.fold_key()).and_then(|names| names.keys().find(|other| *other != name).cloned()))
+            .map_err(|e| io_err(&parent, e))?;
+        Ok(twin.map(|other| parent.join(&other)))
     }
 
     /// If another tracked node (not `newcomer`) still occupies `path`, settle its claim before the newcomer
@@ -559,7 +543,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         incoming: Option<&FileState>,
         report: &mut Report,
     ) -> Result<(), SyncError> {
-        let Some(other) = self.state.base_index().get(path).copied() else { return Ok(()) };
+        let Some(other) = self.state.base_at(path) else { return Ok(()) };
         if other == newcomer || Some(other) == self.state.root {
             return Ok(());
         }
@@ -673,9 +657,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         let Some(FsKind::File(meta)) = self.stat(path)? else { return Ok(()) };
         let unchanged = self
             .state
-            .base_index()
-            .get(path)
-            .and_then(|id| self.state.base.get(id))
+            .base_at(path)
+            .and_then(|id| self.state.base.get(&id))
             .is_some_and(|e| matches!(e.kind, BaseKind::File { size, mtime_ms, .. } if size == meta.size && mtime_ms == meta.mtime_ms));
         if !unchanged && self.fs.still_changing(path, &meta) {
             return Err(io_err(path, std::io::Error::other(super::STILL_CHANGING)));
@@ -686,13 +669,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// A link or special file inside the folder `dir` (at any depth) whose name, ignoring case, is where the base
     /// has a tracked node: a tracked file or folder that turned into a link.
     fn tracked_link_inside(&self, dir: &RelPath) -> Result<Option<RelPath>, SyncError> {
-        let tracked: BTreeSet<(RelPath, FoldKey)> = self
-            .state
-            .base_index()
-            .into_keys()
-            .filter(|p| p.starts_with(dir) && p != dir)
-            .filter_map(|p| Some((p.parent()?, p.file_name()?.fold_key())))
-            .collect();
+        let tracked: BTreeSet<(RelPath, FoldKey)> =
+            self.state.base_paths_below(dir).into_iter().filter_map(|p| Some((p.parent()?, p.file_name()?.fold_key()))).collect();
         if tracked.is_empty() {
             return Ok(None);
         }
@@ -744,7 +722,6 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     fn locate(&self, id: NodeId) -> Result<Option<RelPath>, SyncError> {
         let Some(node) = self.state.base.get(&id) else { return Ok(None) };
         let is_dir = matches!(node.kind, BaseKind::Dir { .. });
-        let index = self.state.base_index();
         let mut below: Vec<Name> = Vec::new();
         let mut current = id;
         for _ in 0..=MAX_TREE_DEPTH {
@@ -764,7 +741,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     Some(FsKind::File(_)) => !is_dir,
                     _ => false,
                 };
-                let taken = index.get(&path).is_some_and(|other| *other != id);
+                let taken = self.state.base_at(&path).is_some_and(|other| other != id);
                 return Ok((fits && !taken).then_some(path));
             }
             let (Some(name), Some(parent)) = (entry.name.clone(), entry.parent) else { return Ok(None) };
@@ -848,10 +825,12 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             report.created_dirs.push(current.clone());
             // If a tracked folder lived here, it is this folder again: remember its new local ID.
             let new_id = Self::dir_id(self.stat(&current)?);
-            if let Some(node) = self.state.base_index().get(&current).copied()
-                && let Some(BaseEntry { kind: BaseKind::Dir { local_id }, .. }) = self.state.base.get_mut(&node)
-            {
-                *local_id = new_id;
+            if let Some(node) = self.state.base_at(&current) {
+                self.state.base.update(&node, |entry| {
+                    if let BaseKind::Dir { local_id } = &mut entry.kind {
+                        *local_id = new_id;
+                    }
+                });
             }
         }
         Ok(())
@@ -966,7 +945,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             // A folder that still holds a tracked node stays tracked until that node is settled: a node whose own
             // change waits (it turned into a link in this folder, which the user moved) keeps its place through it.
             // The push sends nothing for a node the server deleted.
-            Local::Missing if matches!(entry.kind, BaseKind::Dir { .. }) && self.state.base.values().any(|e| e.parent == Some(id)) => {}
+            Local::Missing if matches!(entry.kind, BaseKind::Dir { .. }) && self.state.base.has_children(&id) => {}
             Local::Missing => {
                 self.state.base.remove(&id);
             }
@@ -985,7 +964,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     if only_ignored && self.remove_dir_if_bare(&bpath)? {
                         self.state.base.remove(&id);
                         report.removed_locally.push(bpath);
-                    } else if !self.state.base.values().any(|e| e.parent == Some(id)) {
+                    } else if !self.state.base.has_children(&id) {
                         // Only new files inside: forget the folder, and the push creates it afresh. (One that
                         // still holds an edited tracked file stays; that file's upload brings the folder back.)
                         // Only ignored files inside (an open document's lock file): it stays here, forgotten, and

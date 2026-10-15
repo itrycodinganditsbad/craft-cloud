@@ -559,16 +559,21 @@ fn info_and_sign_in_go_over_the_network_and_the_server_keeps_simulated_time() {
                 meta.list_devices(bo.id).await.unwrap().into_iter().next().unwrap()
             }
         };
+        // The server records a device's use after answering (off the request's path): a moment of simulated time
+        // lets it, since simulated time stands still while the database works.
+        tokio::time::sleep(s(1)).await;
         // Taken before the read: the read goes to the database's own thread, which simulated time doesn't hold.
         let at = now();
         let first = device().await;
-        assert!((at - 1_000..=at).contains(&first.created_ms), "created at {} by a clock at {at}", first.created_ms);
-        assert!((at - 1_000..=at).contains(&first.last_used_ms), "used at {} by a clock at {at}", first.last_used_ms);
+        assert!((at - 2_000..=at).contains(&first.created_ms), "created at {} by a clock at {at}", first.created_ms);
+        assert!((at - 2_000..=at).contains(&first.last_used_ms), "used at {} by a clock at {at}", first.last_used_ms);
         tokio::time::sleep(s(30)).await;
         transport.space().await.unwrap();
+        tokio::time::sleep(s(1)).await;
         assert_eq!(device().await.last_used_ms, first.last_used_ms, "written at most once a minute");
         tokio::time::sleep(s(40)).await;
         transport.space().await.unwrap();
+        tokio::time::sleep(s(1)).await;
         let later = device().await.last_used_ms;
         assert!(later >= first.last_used_ms + 70_000 && later <= now(), "a minute of simulated time later: {later}");
     });

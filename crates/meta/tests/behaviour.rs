@@ -3,7 +3,7 @@
 //! test creates and drops its own database. CI sets `CRAFT_CLOUD_REQUIRE_BACKENDS`, which turns a missing
 //! `CRAFT_CLOUD_TEST_PG` into a failure instead of a skip.
 
-use craft_cloud_meta::{Meta, MetaError, Role, UserRecord};
+use craft_cloud_meta::{BlobKind, Meta, MetaError, Role, UserRecord};
 use craft_cloud_proto::limits::MAX_PAGE_NODES;
 use craft_cloud_proto::{
     ChunkId, ChunkRef, ChunkerParamsId, ConflictKind, DeviceId, FileHash, Manifest, ManifestId, Name, NewVersion, NodeId, NodeKind, NodeState, Op,
@@ -84,6 +84,8 @@ on_every_backend!(
     users_and_devices,
     a_new_space_has_only_its_root,
     manifests_need_their_chunks_and_are_per_space,
+    stored_bytes_are_counted_once_per_space_and_capped,
+    concurrent_chunk_batches_charge_a_shared_chunk_once,
     concurrent_signups_with_one_name_give_username_taken,
     an_offline_batch_creates_a_folder_and_files_in_it,
     updates_need_the_current_version,
@@ -218,6 +220,74 @@ async fn manifests_need_their_chunks_and_are_per_space(meta: &Meta) {
     meta.add_manifest(ana.space, &m, 77, NOW).await.unwrap();
     assert!(meta.has_manifest(ana.space, &m.id()).await.unwrap());
     assert!(!meta.has_manifest(bob.space, &m.id()).await.unwrap());
+}
+
+fn random_chunk() -> ChunkId {
+    ChunkId::from_bytes(*blake3::hash(uuid::Uuid::now_v7().as_bytes()).as_bytes())
+}
+
+async fn stored_bytes_are_counted_once_per_space_and_capped(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let bob = user(meta, "bob").await;
+    let capped = meta.clone().with_stored_bytes_cap(Some(100));
+    let (c1, c2, c3) = (random_chunk(), random_chunk(), random_chunk());
+    capped.add_chunk(ana.space, &c1, 60, NOW).await.unwrap();
+    // Again: nothing new to count.
+    capped.add_chunk(ana.space, &c1, 60, NOW).await.unwrap();
+    assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), 60);
+
+    // Over the cap: refused, and nothing recorded.
+    let over = capped.add_chunk(ana.space, &c2, 50, NOW).await;
+    assert!(matches!(over, Err(MetaError::QuotaExceeded { used: 60, limit: 100 })), "{over:?}");
+    assert_eq!(meta.missing_chunks(ana.space, &[c2]).await.unwrap(), vec![c2]);
+    assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), 60);
+    // The look before storing says the same, and lets through what the space has or what fits.
+    assert!(matches!(capped.check_room(ana.space, BlobKind::Chunk, c2.as_bytes(), 50).await, Err(MetaError::QuotaExceeded { .. })));
+    capped.check_room(ana.space, BlobKind::Chunk, c1.as_bytes(), 60).await.unwrap();
+    capped.check_room(ana.space, BlobKind::Chunk, c3.as_bytes(), 40).await.unwrap();
+    // Without a cap there is nothing to check.
+    meta.check_room(ana.space, BlobKind::Chunk, c2.as_bytes(), u64::MAX).await.unwrap();
+
+    // Each space counts its own; a blob another space stored first counts at the size it is stored as.
+    capped.add_chunk(bob.space, &c2, 50, NOW).await.unwrap();
+    capped.add_chunks(bob.space, &[(c3, 30), (c3, 30)], NOW).await.unwrap();
+    assert_eq!(meta.stored_bytes(bob.space).await.unwrap(), 80);
+    let over = capped.add_chunks(bob.space, &[(c1, 60)], NOW).await;
+    assert!(matches!(over, Err(MetaError::QuotaExceeded { used: 80, limit: 100 })), "{over:?}");
+    meta.add_chunk(bob.space, &c1, 999, NOW).await.unwrap();
+    assert_eq!(meta.stored_bytes(bob.space).await.unwrap(), 140, "c1 counts as Ana stored it");
+
+    // Manifests count too.
+    let m = Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), 5, FileHash::from_bytes([0; 32]), vec![ChunkRef { id: c1, len: 5 }]).unwrap();
+    capped.add_manifest(ana.space, &m, 30, NOW).await.unwrap();
+    assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), 90);
+    let m2 = Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), 6, FileHash::from_bytes([1; 32]), vec![ChunkRef { id: c1, len: 6 }]).unwrap();
+    assert!(matches!(capped.add_manifest(ana.space, &m2, 30, NOW).await, Err(MetaError::QuotaExceeded { used: 90, limit: 100 })));
+    assert!(!meta.has_manifest(ana.space, &m2.id()).await.unwrap());
+}
+
+/// Review finding 3 of M3c: two batches racing with an overlapping chunk charge it once (on Postgres both used to
+/// see it as new before inserting). SQLite runs one write at a time, so there it pins the result.
+async fn concurrent_chunk_batches_charge_a_shared_chunk_once(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let shared: Vec<(ChunkId, u64)> = (0..50).map(|_| (random_chunk(), 10)).collect();
+    let tasks: Vec<_> = (0..4)
+        .map(|_| {
+            let (meta, mut batch) = (meta.clone(), shared.clone());
+            // Each batch has the shared chunks and one of its own, in another order.
+            batch.reverse();
+            batch.push((random_chunk(), 1));
+            tokio::spawn(async move { meta.add_chunks(ana.space, &batch, NOW).await })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), 50 * 10 + 4);
+    // Again, with duplicates in one batch: nothing new.
+    let again: Vec<(ChunkId, u64)> = shared.iter().chain(&shared).copied().collect();
+    meta.add_chunks(ana.space, &again, NOW).await.unwrap();
+    assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), 50 * 10 + 4);
 }
 
 async fn concurrent_signups_with_one_name_give_username_taken(meta: &Meta) {
@@ -820,6 +890,47 @@ async fn reopening_a_migrated_database_is_fine() {
     assert_eq!(meta.user_by_name("ana").await.unwrap(), Some(ana));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_waits_for_a_lock_another_program_holds() {
+    use sqlx::Connection;
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}", dir.path().join("meta.db").display());
+    let meta = Meta::open(&url).await.unwrap();
+    let ana = user(&meta, "ana").await;
+    let mut other = sqlx::SqliteConnection::connect(&url).await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut other).await.unwrap();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        sqlx::query("ROLLBACK").execute(&mut other).await.unwrap();
+    });
+    // Waits (up to `SQLITE_BUSY_TIMEOUT`) instead of failing with "database is locked".
+    meta.add_chunk(ana.space, &random_chunk(), 10, NOW).await.unwrap();
+    release.await.unwrap();
+    assert!(craft_cloud_meta::SQLITE_BUSY_TIMEOUT >= std::time::Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn upgrading_counts_what_each_space_already_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}", dir.path().join("meta.db").display());
+    let ana = {
+        let meta = Meta::open(&url).await.unwrap();
+        let ana = user(&meta, "ana").await;
+        meta.add_chunk(ana.space, &random_chunk(), 60, NOW).await.unwrap();
+        meta.add_chunk(ana.space, &random_chunk(), 40, NOW).await.unwrap();
+        ana
+    };
+    {
+        // The database as it was before stored bytes were counted.
+        use sqlx::Connection;
+        let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        sqlx::query("ALTER TABLE spaces DROP COLUMN stored_bytes").execute(&mut conn).await.unwrap();
+        sqlx::query("DELETE FROM schema_version WHERE version = 2").execute(&mut conn).await.unwrap();
+    }
+    let meta = Meta::open(&url).await.unwrap();
+    assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), 100);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_opens_migrate_once_on_postgres() {
     let Some((url, _guard)) = postgres_database().await else {
@@ -838,5 +949,5 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 1);
+    assert_eq!(versions, 2);
 }

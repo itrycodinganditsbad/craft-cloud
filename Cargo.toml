@@ -51,6 +51,8 @@ hyper-util = { version = "0.1.21", default-features = false }
 http-body = "1.0"
 http-body-util = "0.1.5"
 tower-service = "0.3.3"
+# The agent's TLS test (tests only): a TLS listener with a test certificate. rustls comes with it, as reqwest uses it.
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
 caseless = "=0.2.2"
 proptest = "1.12"
 serde = { version = "1", features = ["derive"] }

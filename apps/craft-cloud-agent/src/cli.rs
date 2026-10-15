@@ -131,9 +131,10 @@ impl Exit {
 impl AgentError {
     /// The exit code for this error: [`Exit::NeedsYou`] for a safety stop and for an account-level problem where
     /// trying again never helps (the device was revoked, `state.json` is another account's, the server speaks
-    /// another protocol or chunker, a file is from a newer agent, the server sent damaged data or the saved state
-    /// doesn't hold together); [`Exit::Failed`] for anything that may pass by itself (offline, a server error, a
-    /// timeout) or that the message fixes (a wrong password, a usage error).
+    /// another protocol or chunker, the account's storage on the server is full, a file is from a newer agent, the
+    /// server sent damaged data or the saved state doesn't hold together); [`Exit::Failed`] for anything that may
+    /// pass by itself (offline, a server error, a timeout) or that the message fixes (a wrong password, a usage
+    /// error).
     pub fn exit(&self) -> Exit {
         match self {
             AgentError::Root(_)
@@ -141,7 +142,7 @@ impl AgentError {
             | AgentError::Lock(LockError::Busy(_) | LockError::NotAFile(_))
             | AgentError::Revoked
             | AgentError::OtherAccountState(_)
-            | AgentError::Server(TransportError::Protocol(_))
+            | AgentError::Server(TransportError::Protocol(_) | TransportError::QuotaExceeded { .. })
             | AgentError::Sync(SyncError::Corrupt(_))
             | AgentError::Account(AccountError::Newer { .. } | AccountError::Damaged { .. }) => Exit::NeedsYou,
             _ => Exit::Failed,
@@ -1142,6 +1143,48 @@ mod tests {
         assert_eq!(AgentError::WrongPassword.exit(), Exit::Failed);
         assert_eq!(AgentError::NotSignedIn.exit(), Exit::Failed);
         assert_eq!(AgentError::Offline("x".into()).exit(), Exit::Failed);
+    }
+
+    /// Every error a pass can end with, and how the agent ends for it: only damaged data and what a person must
+    /// fix stop with "needs you"; a per-file problem never gets here (the engine skips that file and goes on).
+    #[test]
+    fn every_error_a_pass_ends_with_has_its_exit() {
+        use craft_cloud_proto::ChunkId;
+        let cases: Vec<(SyncError, Exit)> = vec![
+            (SyncError::Transport(TransportError::Rejected(Vec::new())), Exit::Failed),
+            // A manifest refused twice for missing chunks (the engine already sent them once): try again later.
+            (SyncError::Transport(TransportError::MissingChunks(vec![ChunkId::from_bytes([1; 32])])), Exit::Failed),
+            (SyncError::Transport(TransportError::ResyncRequired), Exit::Failed),
+            (SyncError::Transport(TransportError::NotFound), Exit::Failed),
+            (SyncError::Transport(TransportError::Unauthorized), Exit::NeedsYou),
+            (SyncError::Transport(TransportError::Unavailable("offline".into())), Exit::Failed),
+            (SyncError::Transport(TransportError::Protocol("a refusal naming no operation".into())), Exit::NeedsYou),
+            // Only with no room left at all: a file that doesn't fit while others still may is skipped instead.
+            (SyncError::Transport(TransportError::QuotaExceeded { used: 10, limit: 10 }), Exit::NeedsYou),
+            (SyncError::Io { path: "an interrupted download".into(), source: std::io::Error::other("x") }, Exit::Failed),
+            (SyncError::Corrupt("chunk x of a.txt is damaged".into()), Exit::NeedsYou),
+            (SyncError::Checkpoint(std::io::Error::other("disk full")), Exit::Failed),
+        ];
+        for (error, exit) in cases {
+            // Exhaustive on purpose: a new variant must be placed in the list above.
+            match &error {
+                SyncError::Transport(
+                    TransportError::Rejected(_)
+                    | TransportError::MissingChunks(_)
+                    | TransportError::ResyncRequired
+                    | TransportError::NotFound
+                    | TransportError::Unauthorized
+                    | TransportError::Unavailable(_)
+                    | TransportError::Protocol(_)
+                    | TransportError::QuotaExceeded { .. },
+                )
+                | SyncError::Io { .. }
+                | SyncError::Corrupt(_)
+                | SyncError::Checkpoint(_) => {}
+            }
+            let shown = error.to_string();
+            assert_eq!(AgentError::from(error).exit(), exit, "{shown}");
+        }
     }
 
     #[test]

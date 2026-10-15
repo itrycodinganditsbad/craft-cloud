@@ -78,6 +78,7 @@ use craft_cloud_sync::{FileMeta, Fs, FsEntry, FsKind, LandError, RelPath};
 use file_id::FileId;
 use serde::{Deserialize, Serialize};
 
+use crate::account::random_hex;
 use crate::settle::Stability;
 
 /// The agent's own folder inside the sync root. The engine never syncs it.
@@ -634,13 +635,6 @@ fn in_use_reason(e: &io::Error) -> io::Error {
         "can't be replaced here (no permission)"
     };
     io::Error::new(io::ErrorKind::PermissionDenied, why)
-}
-
-/// `n` random bytes as hex.
-fn random_hex(n: usize) -> io::Result<String> {
-    let mut random = vec![0u8; n];
-    getrandom::fill(&mut random).map_err(|e| io::Error::other(format!("the system random source failed: {e}")))?;
-    Ok(random.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The name a file at `name` is moved to while a download lands over it in steps: `<name>.<random>.cc-aside`, with

@@ -291,6 +291,22 @@ async fn ignored_and_unsyncable_names_stay_local() {
 }
 
 #[tokio::test]
+async fn ignore_patterns_ignore_case_as_the_os_does() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "real.txt", b"r");
+    for junk in ["RENDER.TMP", "Clip.Part", "~$Report.docx", "THUMBS.DB", "Desktop.ini", ".~LOCK.notes.odt#"] {
+        write(&mut a, junk, b"junk");
+    }
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.uploaded, vec![path("real.txt")]);
+    b.sync_once().await.unwrap();
+    assert_eq!(files(&b), vec![("real.txt".to_owned(), b"r".to_vec())]);
+}
+
+#[tokio::test]
 async fn a_failed_pass_loses_nothing_and_the_next_one_finishes() {
     let server = Server::new().await;
     let ana = server.user("ana").await;
@@ -524,7 +540,8 @@ async fn a_refusal_naming_no_operation_fails_the_pass() {
     write(&mut a, "doc.txt", b"v1");
     a.transport().faults.bad_conflict_index.store(true, Ordering::Relaxed);
     let pass = tokio::time::timeout(std::time::Duration::from_secs(10), a.sync_once()).await;
-    assert!(matches!(pass, Ok(Err(_))), "{pass:?}");
+    // The server speaking out of turn, not damaged data.
+    assert!(matches!(pass, Ok(Err(craft_cloud_sync::SyncError::Transport(craft_cloud_sync::TransportError::Protocol(_))))), "{pass:?}");
     a.transport().faults.bad_conflict_index.store(false, Ordering::Relaxed);
     let report = a.sync_once().await.unwrap();
     assert_eq!(report.uploaded, vec![path("doc.txt")]);
@@ -2883,4 +2900,227 @@ async fn a_refused_delete_keeps_its_folder() {
     }
     b.sync_once().await.unwrap();
     assert_eq!(read(&b, "x/c.psd"), b"layers, edited");
+}
+
+// ---- per-file problems never stop the rest (review H2, M4, M1) ----
+
+#[tokio::test]
+async fn a_file_over_the_size_limit_is_skipped_and_everything_else_syncs() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    // A small limit stands in for the protocol's 256 GiB.
+    let mut a = common::machine_config(&server, &ana, "laptop", MemFs::new(), 50, |c| c.max_file_bytes = 10).await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "capture.mov", b"twenty bytes of film");
+    write(&mut a, "notes.txt", b"small");
+    for _ in 0..2 {
+        let report = a.sync_once().await.unwrap();
+        let why = report.skipped.iter().find(|(p, _)| p == "capture.mov").map(|(_, why)| why.as_str());
+        assert!(why.is_some_and(|w| w.starts_with("too big to sync: 20 bytes")), "{report:?}");
+        assert!(!report.uploaded.contains(&path("capture.mov")), "{report:?}");
+    }
+    b.sync_once().await.unwrap();
+    assert_eq!(files(&b), vec![("notes.txt".to_owned(), b"small".to_vec())]);
+    // Edited down to size, it goes up like any other file.
+    write(&mut a, "capture.mov", b"short");
+    assert!(a.sync_once().await.unwrap().uploaded.contains(&path("capture.mov")));
+}
+
+#[tokio::test]
+async fn no_free_conflict_name_skips_only_that_file() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "doc.txt", b"v1");
+    settle(&mut [&mut a, &mut b], 5).await;
+    // Every conflict-copy name this minute is taken on the desktop.
+    let name = craft_cloud_proto::Name::new("doc.txt").unwrap();
+    for counter in 1..=1000 {
+        let copy = craft_cloud_proto::conflict_name(&name, false, "desktop", common::STAMP, counter).unwrap();
+        write(&mut b, copy.as_str(), b"old copy");
+    }
+    write(&mut a, "doc.txt", b"v2 from the laptop");
+    a.sync_once().await.unwrap();
+    write(&mut b, "doc.txt", b"v2 from the desktop");
+    write(&mut b, "other.txt", b"other");
+    let report = b.sync_once().await.unwrap();
+    let why = report.skipped.iter().find(|(p, _)| p == "doc.txt").map(|(_, why)| why.as_str());
+    assert!(why.is_some_and(|w| w.contains("no free conflict-copy name")), "{:?}", report.skipped.last());
+    assert!(report.uploaded.contains(&path("other.txt")), "everything else keeps syncing");
+    assert_eq!(read(&b, "doc.txt"), b"v2 from the desktop", "the edit stays put");
+}
+
+#[tokio::test]
+async fn a_file_too_big_for_the_accounts_storage_is_skipped_and_the_rest_syncs() {
+    let mut server = Server::new().await;
+    server.meta = server.meta.clone().with_stored_bytes_cap(Some(400));
+    let ana = server.user("ana").await;
+    // 400 bytes of room count as room here (one chunk of 4 MiB is the floor otherwise).
+    let mut a = common::machine_config(&server, &ana, "laptop", MemFs::new(), 50, |c| c.quota_floor = 100).await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "big.bin", &[7u8; 1000]);
+    write(&mut a, "big2.bin", &[8u8; 1000]);
+    write(&mut a, "small.txt", b"small");
+    a.fs_mut().mkdir(&path("Folder")).unwrap();
+    let report = a.sync_once().await.unwrap();
+    for big in ["big.bin", "big2.bin"] {
+        let why = report.skipped.iter().find(|(p, _)| p == big).map(|(_, why)| why.as_str());
+        assert!(why.is_some_and(|w| w.starts_with("too big for the account's storage on the server (0 of 400 bytes used)")), "{report:?}");
+    }
+    assert_eq!(a.fs().reads_of(&path("big2.bin")), 0, "a file bigger than the room the first refusal showed is never read");
+    assert_eq!(report.uploaded, vec![path("small.txt")]);
+    b.sync_once().await.unwrap();
+    assert_eq!(files(&b), vec![("small.txt".to_owned(), b"small".to_vec())]);
+    assert_eq!(b.fs().dirs(), vec![path("Folder")], "everything else syncs");
+}
+
+#[tokio::test]
+async fn an_edit_that_fits_by_dedup_is_uploaded_after_a_refused_edit() {
+    let free = Server::new().await;
+    let ana = free.user("ana").await;
+    let mut a = machine(&free, &ana, "laptop").await;
+    write(&mut a, "a-refused.bin", &[1u8; 1000]);
+    write(&mut a, "b-synced.bin", &[2u8; 1000]);
+    a.sync_once().await.unwrap();
+    // 400 bytes of room are left.
+    let capped = free.meta.clone().with_stored_bytes_cap(Some(free.meta.stored_bytes(ana.space).await.unwrap() + 400));
+    let mut a = common::on_meta(&a, capped, |c| c.quota_floor = 100);
+    // The first edit needs more room than there is and is refused. The second file is bigger than the room, but
+    // its new content is a copy of what the server stores already: only a manifest goes up.
+    write(&mut a, "a-refused.bin", &[3u8; 1000]);
+    write(&mut a, "b-synced.bin", &[1u8; 1000]);
+    let reads = a.fs().reads_of(&path("b-synced.bin"));
+    let report = a.sync_once().await.unwrap();
+    assert!(a.fs().reads_of(&path("b-synced.bin")) > reads, "the edit is read: it can fit against its own base");
+    assert_eq!(report.uploaded, vec![path("b-synced.bin")], "{report:?}");
+    let why = report.skipped.iter().find(|(p, _)| p == "a-refused.bin").map(|(_, why)| why.as_str());
+    assert!(why.is_some_and(|w| w.starts_with("too big for the account's storage")), "{report:?}");
+}
+
+#[tokio::test]
+async fn an_account_with_no_room_left_stops_the_pass() {
+    // What one small file stores, measured on a server without a cap.
+    let free = Server::new().await;
+    let ana = free.user("ana").await;
+    let mut a = machine(&free, &ana, "laptop").await;
+    write(&mut a, "small.txt", b"small");
+    a.sync_once().await.unwrap();
+    let one_file = free.meta.stored_bytes(ana.space).await.unwrap();
+
+    // A cap of exactly that: the next file finds no room at all.
+    let mut server = Server::new().await;
+    server.meta = server.meta.clone().with_stored_bytes_cap(Some(one_file));
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    write(&mut a, "small.txt", b"small");
+    a.sync_once().await.unwrap();
+    write(&mut a, "more.txt", b"more");
+    let full = a.sync_once().await;
+    assert!(
+        matches!(&full, Err(craft_cloud_sync::SyncError::Transport(craft_cloud_sync::TransportError::QuotaExceeded { used, limit })) if used == limit),
+        "{full:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_nearly_full_account_counts_as_full() {
+    // 400 bytes of room left: less than one chunk, so the account counts as full and the pass stops, instead of
+    // every new file being read and refused on every pass.
+    let mut server = Server::new().await;
+    server.meta = server.meta.clone().with_stored_bytes_cap(Some(400));
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    write(&mut a, "big.bin", &[7u8; 1000]);
+    let full = a.sync_once().await;
+    assert!(
+        matches!(&full, Err(craft_cloud_sync::SyncError::Transport(craft_cloud_sync::TransportError::QuotaExceeded { used: 0, limit: 400 }))),
+        "{full:?}"
+    );
+}
+
+#[tokio::test]
+async fn chunks_the_server_lost_are_sent_again_once() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "photo.raw", b"raw sensor data");
+    // The one chunk is answered as stored and lost: the manifest is refused for it.
+    a.transport().faults.lose_chunks.store(1, Ordering::Relaxed);
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.uploaded, vec![path("photo.raw")]);
+    assert_eq!(a.transport().faults.chunk_uploads.load(Ordering::Relaxed), 2, "exactly the missing chunk went again, once");
+    b.sync_once().await.unwrap();
+    assert_eq!(read(&b, "photo.raw"), b"raw sensor data");
+}
+
+#[tokio::test]
+async fn chunks_lost_twice_fail_the_pass_for_a_later_try() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    write(&mut a, "photo.raw", b"raw sensor data");
+    a.transport().faults.lose_chunks.store(2, Ordering::Relaxed);
+    let failed = a.sync_once().await;
+    assert!(matches!(failed, Err(craft_cloud_sync::SyncError::Transport(craft_cloud_sync::TransportError::MissingChunks(_)))), "{failed:?}");
+    assert_eq!(a.transport().faults.chunk_uploads.load(Ordering::Relaxed), 2, "one retry, no more");
+    // The next pass (the run loop's backoff) gets it up.
+    assert_eq!(a.sync_once().await.unwrap().uploaded, vec![path("photo.raw")]);
+}
+
+// ---- what a pass costs (review M2) ----
+
+/// A second machine's first sync of 5,000 files in 10 folders, then a pass with nothing to do. Counted in what grew
+/// with the square of the folder's size before (the base's path index built from scratch per node, a folder listed
+/// per file for the twin checks), not in time, which depends on the machine: each folder is listed a few times a
+/// pass, and the index is built once.
+#[tokio::test]
+async fn a_pass_costs_about_the_size_of_the_folder_not_its_square() {
+    use craft_cloud_proto::{ChunkId, ChunkRef, ChunkerParamsId, FileHash, Manifest, Name, NewVersion, NodeId, Op, VersionId};
+    use craft_cloud_store::BlobKey;
+    const FOLDERS: usize = 10;
+    const PER_FOLDER: usize = 500;
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    // The library goes straight into the server (one content for every file), which is quicker than an upload.
+    let data = b"x";
+    let chunk = ChunkId::from_bytes(*blake3::hash(data).as_bytes());
+    let manifest =
+        Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), 1, FileHash::from_bytes(*chunk.as_bytes()), vec![ChunkRef { id: chunk, len: 1 }])
+            .unwrap();
+    server.store.put(BlobKey::chunk(&chunk), data).await.unwrap();
+    server.meta.add_chunk(ana.space, &chunk, 2, 0).await.unwrap();
+    server.store.put(BlobKey::manifest(&manifest.id()), &manifest.encode()).await.unwrap();
+    server.meta.add_manifest(ana.space, &manifest, 100, 0).await.unwrap();
+    let device = server.meta.create_device(ana.id, "seed", &[7; 32], 0).await.unwrap();
+    let root = server.meta.space_info(ana.space).await.unwrap().root;
+    for f in 0..FOLDERS {
+        let folder = NodeId::generate();
+        let mut ops = vec![Op::Mkdir { node: folder, parent: root, name: Name::new(&format!("f{f}")).unwrap() }];
+        for i in 0..PER_FOLDER {
+            let version = NewVersion { id: VersionId::generate(), manifest: manifest.id(), mtime_ms: 1, exec: false };
+            ops.push(Op::Create { node: NodeId::generate(), parent: folder, name: Name::new(&format!("{i}.txt")).unwrap(), version });
+            if ops.len() == 1000 {
+                server.meta.commit(ana.space, device, &std::mem::take(&mut ops), 0).await.unwrap();
+            }
+        }
+        if !ops.is_empty() {
+            server.meta.commit(ana.space, device, &ops, 0).await.unwrap();
+        }
+    }
+
+    let mut b = machine_with(&server, &ana, "desktop", MemFs::new(), 5000).await;
+    let report = b.sync_once().await.unwrap();
+    assert_eq!(report.downloaded.len(), FOLDERS * PER_FOLDER);
+    let (lists, builds) = (b.fs().lists(), b.state().base.path_builds());
+    // Twin checks list each folder once (the root as well), and the push's scan lists them again.
+    assert!(lists <= 3 * (FOLDERS as u64 + 1), "{lists} listings for {FOLDERS} folders");
+    assert!(builds <= 2, "the path index was built {builds} times");
+
+    let report = b.sync_once().await.unwrap();
+    assert!(!report.changed(), "{report:?}");
+    let lists = b.fs().lists() - lists;
+    assert!(lists <= 2 * (FOLDERS as u64 + 1), "{lists} listings for {FOLDERS} folders");
+    assert!(b.state().base.path_builds() <= builds, "a pass with nothing to do builds no index");
 }

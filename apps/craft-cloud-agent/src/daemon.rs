@@ -109,13 +109,14 @@ fn pass_end(result: &Result<PassSummary, AgentError>, recheck_in: Option<Duratio
 
 /// Which pauses look again by themselves: a folder or marker that is missing (a drive not mounted yet), folders
 /// that lie inside one another, or another agent on the folder can be put right at any moment and checking is
-/// harmless, so every minute; a server that speaks another protocol or refuses requests is fixed by an update, so
-/// every ten minutes; a revoked device, damaged or newer saved files, another account's state and damaged data from
-/// the server never fix themselves, so the loop waits until it is stopped.
+/// harmless, so every minute; a server that speaks another protocol or refuses requests is fixed by an update, and an
+/// account whose storage on the server is full by the admin allowing more, so every ten minutes; a revoked device,
+/// damaged or newer saved files, another account's state and damaged data from the server never fix themselves, so
+/// the loop waits until it is stopped.
 fn recheck_for(e: &AgentError) -> Recheck {
     match e {
         AgentError::Root(_) | AgentError::DataInFolder { .. } | AgentError::Lock(_) => Recheck::Soon,
-        AgentError::Server(craft_cloud_sync::TransportError::Protocol(_)) => Recheck::Slowly,
+        AgentError::Server(craft_cloud_sync::TransportError::Protocol(_) | craft_cloud_sync::TransportError::QuotaExceeded { .. }) => Recheck::Slowly,
         _ => Recheck::Never,
     }
 }
@@ -749,6 +750,9 @@ mod tests {
         assert!(matches!(pass_end(&Err(missing), None), PassEnd::NeedsYou { recheck: Recheck::Soon, .. }));
         let protocol = AgentError::Server(TransportError::Protocol("x".into()));
         assert!(matches!(pass_end(&Err(protocol), None), PassEnd::NeedsYou { recheck: Recheck::Slowly, .. }));
+        // A full account: the admin may allow more at any time.
+        let full = AgentError::Server(TransportError::QuotaExceeded { used: 10, limit: 10 });
+        assert!(matches!(pass_end(&Err(full), None), PassEnd::NeedsYou { recheck: Recheck::Slowly, .. }));
         assert!(matches!(pass_end(&Err(AgentError::Revoked), None), PassEnd::NeedsYou { recheck: Recheck::Never, .. }));
     }
 

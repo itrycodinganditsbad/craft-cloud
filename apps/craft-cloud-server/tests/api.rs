@@ -11,6 +11,7 @@ use craft_cloud_proto::{
 };
 use craft_cloud_server::AppState;
 use craft_cloud_server::auth::hash_password;
+use craft_cloud_server::state::Limits;
 use craft_cloud_store::Store;
 use craft_cloud_store::disk::DiskBackend;
 use craft_cloud_store::s3::{S3Backend, S3Config};
@@ -21,6 +22,8 @@ struct Server {
     base: String,
     meta: Meta,
     client: Client,
+    /// The server's password-check slots, so a test can keep them busy.
+    password_checks: std::sync::Arc<tokio::sync::Semaphore>,
     shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     _dirs: Vec<tempfile::TempDir>,
     _pg: Option<PgGuard>,
@@ -57,22 +60,32 @@ impl Drop for PgGuard {
 }
 
 async fn start(meta: Meta, store: Store, dirs: Vec<tempfile::TempDir>, pg: Option<PgGuard>) -> Server {
-    let state = AppState::new(meta.clone(), store, vec![]).unwrap();
+    start_with(meta, store, dirs, pg, Limits::default()).await
+}
+
+async fn start_with(meta: Meta, store: Store, dirs: Vec<tempfile::TempDir>, pg: Option<PgGuard>, limits: Limits) -> Server {
+    let state = AppState::new(meta.clone(), store, vec![]).unwrap().with_limits(limits);
+    let password_checks = state.password_checks.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/api/v1", listener.local_addr().unwrap());
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(craft_cloud_server::serve(state, listener, async move {
         let _ = rx.await;
     }));
-    Server { base, meta, client: Client::new(), shutdown: std::sync::Mutex::new(Some(tx)), _dirs: dirs, _pg: pg }
+    Server { base, meta, client: Client::new(), password_checks, shutdown: std::sync::Mutex::new(Some(tx)), _dirs: dirs, _pg: pg }
 }
 
 async fn sqlite_disk() -> Server {
+    sqlite_disk_with(Limits::default()).await
+}
+
+/// SQLite and disk, with other [`Limits`].
+async fn sqlite_disk_with(limits: Limits) -> Server {
     let db = tempfile::tempdir().unwrap();
     let blobs = tempfile::tempdir().unwrap();
     let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
     let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
-    start(meta, store, vec![db, blobs], None).await
+    start_with(meta, store, vec![db, blobs], None, limits).await
 }
 
 async fn postgres_s3() -> Option<Server> {
@@ -645,8 +658,166 @@ async fn oversized_manifests_are_refused(s: &Server) {
     let res = s.client.put(format!("{}/manifests/{id}", s.base)).bearer_auth(&token).body(big).send().await.unwrap();
     let (status, body) = error(res).await;
     assert_eq!((status, body.error.as_str()), (StatusCode::PAYLOAD_TOO_LARGE, "too_large"));
-    // Reading manifests still works (and shares the same permits).
+    // Reading manifests still works.
     let stored = upload(s, &token, &data).await;
     let got = s.client.get(format!("{}/manifests/{stored}", s.base)).bearer_auth(&token).send().await.unwrap();
     assert_eq!(got.status(), StatusCode::OK);
+}
+
+// ---- load limits (the same on every backend, so SQLite + disk only) ----
+
+/// Starts a `PUT` to `path` (under `/api/v1`) whose body never finishes: the headers promise 1,000 bytes and three
+/// arrive. The connection stays open until the server answers or closes it.
+async fn stalled_put(s: &Server, token: &str, path: &str) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let addr = s.base.trim_start_matches("http://").trim_end_matches("/api/v1").to_owned();
+    let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let head = format!("PUT /api/v1{path} HTTP/1.1\r\nhost: {addr}\r\nauthorization: Bearer {token}\r\ncontent-length: 1000\r\n\r\nabc");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream
+}
+
+/// The status line of the answer on a raw connection.
+async fn status_line(stream: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut answer = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !answer.windows(2).any(|w| w == b"\r\n") {
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(n > 0, "the server closed the connection without an answer");
+        answer.extend_from_slice(&buf[..n]);
+    }
+    let text = String::from_utf8_lossy(&answer);
+    text.lines().next().unwrap().to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_json_body_that_never_finishes_is_cut_off_by_the_server() {
+    use tokio::io::AsyncWriteExt;
+    let limits = Limits { body_time_base: Duration::from_secs(1), body_time_per_mib: Duration::ZERO, ..Limits::default() };
+    let s = sqlite_disk_with(limits).await;
+    let addr = s.base.trim_start_matches("http://").trim_end_matches("/api/v1").to_owned();
+    let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let head =
+        format!("POST /api/v1/auth/login HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n{{\"username\"");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    // The proxy in front may have no body timeout: the server answers by itself once the body's time is up.
+    let line = tokio::time::timeout(Duration::from_secs(20), status_line(&mut stream)).await.expect("no answer to a stalled sign-in body");
+    assert!(line.starts_with("HTTP/1.1 408"), "{line}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_upload_holds_up_only_its_own_user() {
+    // Bob's requests get half the time Ana's bodies have: enough for two SQLite writes on a slow CI disk, and still
+    // over before Ana's slots would free up, so Bob going through shows he never waited for them.
+    let limits = Limits { body_time_base: Duration::from_secs(10), body_time_per_mib: Duration::ZERO, ..Limits::default() };
+    let s = sqlite_disk_with(limits).await;
+    add_user(&s, "ana").await;
+    add_user(&s, "bob").await;
+    let ana = login(&s, "ana").await;
+    let bob = login(&s, "bob").await;
+    let earlier = upload(&s, &bob, b"bob's earlier file").await;
+
+    // Ana's device sends manifest and chunk bodies that never finish: more manifests than the server once allowed in
+    // flight for everyone together.
+    let mut stalled = Vec::new();
+    for _ in 0..5 {
+        stalled.push(stalled_put(&s, &ana, &format!("/manifests/{}", manifest_for(b"ana's file").id())).await);
+    }
+    stalled.push(stalled_put(&s, &ana, &format!("/chunks/{}", chunk_id(b"ana's file"))).await);
+    // Let the server take them in before Bob starts.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Bob uploads and downloads as if nothing happened.
+    let quick = Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+    let data = b"bob's new file";
+    let put = quick.put(format!("{}/chunks/{}", s.base, chunk_id(data))).bearer_auth(&bob).body(data.to_vec()).send().await.unwrap();
+    assert_eq!(put.status(), StatusCode::NO_CONTENT);
+    let m = manifest_for(data);
+    let put = quick.put(format!("{}/manifests/{}", s.base, m.id())).bearer_auth(&bob).body(m.encode()).send().await.unwrap();
+    assert_eq!(put.status(), StatusCode::NO_CONTENT);
+    let got = quick.get(format!("{}/manifests/{earlier}", s.base)).bearer_auth(&bob).send().await.unwrap();
+    assert_eq!(got.status(), StatusCode::OK);
+
+    // Ana's stalled bodies run out of time, and her device can upload again.
+    for mut stream in stalled {
+        let line = tokio::time::timeout(Duration::from_secs(30), status_line(&mut stream)).await.unwrap();
+        assert!(line.starts_with("HTTP/1.1 408"), "{line}");
+    }
+    upload(&s, &ana, b"ana's file").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_never_waits_to_record_its_devices_use() {
+    use sqlx::Connection;
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}", db.path().join("meta.db").display());
+    let meta = Meta::open(&url).await.unwrap();
+    let s = start(meta, Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![db, blobs], None).await;
+    add_user(&s, "ana").await;
+    let ana = login(&s, "ana").await;
+    // Another program holds the database's write lock (a backup, say): writes wait for it, reads don't.
+    let mut other = sqlx::SqliteConnection::connect(&url).await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut other).await.unwrap();
+    // The device's first use is due to be written, yet the answer comes at once.
+    let quick = Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+    let started = Instant::now();
+    let res = quick.get(format!("{}/space", s.base)).bearer_auth(&ana).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    sqlx::query("ROLLBACK").execute(&mut other).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uploads_over_the_stored_bytes_cap_are_refused_with_the_numbers() {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap().with_stored_bytes_cap(Some(50));
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let s = start(meta, store, vec![db], None).await;
+    add_user(&s, "ana").await;
+    let ana = login(&s, "ana").await;
+    assert_eq!(put_chunk(&s, &ana, &[1u8; 30]).await, StatusCode::NO_CONTENT);
+    let res = s.client.put(format!("{}/chunks/{}", s.base, chunk_id(&[2u8; 30]))).bearer_auth(&ana).body(vec![2u8; 30]).send().await.unwrap();
+    let (status, body) = error(res).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::INSUFFICIENT_STORAGE, "quota_exceeded"));
+    assert_eq!(body.quota, Some(craft_cloud_proto::api::QuotaUse { used: 31, limit: 50 }));
+    // The refused bytes were never stored: only the first chunk is on disk.
+    let stored = walk(blobs.path());
+    assert_eq!(stored, 1, "{stored} blobs on disk");
+    // A chunk the space has already costs nothing again.
+    assert_eq!(put_chunk(&s, &ana, &[1u8; 30]).await, StatusCode::NO_CONTENT);
+}
+
+/// How many files are under `dir`.
+fn walk(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).map(|p| if p.is_dir() { walk(&p) } else { 1 }).sum()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_ins_beyond_the_password_check_slots_are_told_to_come_back() {
+    let s = sqlite_disk_with(Limits { password_checks: 1, ..Limits::default() }).await;
+    add_user(&s, "ana").await;
+    // One slot: a sign-in that follows a finished one finds it free again (the permit is given back).
+    login(&s, "ana").await;
+    login(&s, "ana").await;
+    // Every slot busy (a flood): each sign-in is told to come back in a second, more times than the account's
+    // window of attempts allows…
+    let busy = s.password_checks.clone().try_acquire_owned().unwrap();
+    for _ in 0..12 {
+        let res = s
+            .client
+            .post(format!("{}/auth/login", s.base))
+            .json(&json!({ "username": "ana", "password": PASSWORD, "device_name": "x" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.headers().get("retry-after").and_then(|v| v.to_str().ok()), Some("1"));
+        let (status, body) = error(res).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+    }
+    // …and none of those answers cost an attempt: once a slot is free, the device signs in.
+    drop(busy);
+    login(&s, "ana").await;
 }

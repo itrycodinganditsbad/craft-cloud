@@ -4,14 +4,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::{Body, Bytes};
-use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, State};
+use axum::body::Bytes;
+use axum::extract::rejection::{PathRejection, QueryRejection};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, FromRequest, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router, middleware};
-use craft_cloud_meta::{DeviceAuth, valid_username};
+use craft_cloud_meta::{BlobKind, DeviceAuth, valid_username};
 use craft_cloud_proto::api::{
     CommitRequest, CommitResponse, DeviceInfo, InfoResponse, LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse,
     PROTOCOL_MAX, PROTOCOL_MIN, SpaceResponse, codes,
@@ -37,6 +37,8 @@ const MAX_WAIT_SECS: u64 = 60;
 const WAITERS_RETRY_SECS: u32 = 5;
 /// Small JSON bodies (login and missing-chunk queries).
 const SMALL_JSON_BYTES: usize = 1024 * 1024;
+/// `Retry-After` for a sign-in refused because every password check slot is busy.
+const PASSWORD_RETRY_SECS: u32 = 1;
 
 type Shared = Arc<AppState>;
 
@@ -46,7 +48,7 @@ pub fn router(state: Shared) -> Router {
         .route("/devices/{id}", delete(revoke_device))
         .route("/chunks/missing", post(missing_chunks).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
         .route("/chunks/{id}", put(put_chunk).get(get_chunk).layer(DefaultBodyLimit::max(MAX_CHUNK_BYTES as usize)))
-        .route("/manifests/{id}", put(put_manifest).get(get_manifest))
+        .route("/manifests/{id}", put(put_manifest).get(get_manifest).layer(DefaultBodyLimit::max(MAX_MANIFEST_BYTES)))
         .route("/commit", post(commit).layer(DefaultBodyLimit::max(MAX_BATCH_JSON_BYTES)))
         .route("/space", get(space))
         .route("/tree", get(tree))
@@ -88,9 +90,9 @@ async fn login(
     State(state): State<Shared>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    req: Result<Json<LoginRequest>, JsonRejection>,
+    request: Request,
 ) -> Result<Json<LoginResponse>, ApiError> {
-    let Json(req) = req?;
+    let req: LoginRequest = read_json(&state, request, SMALL_JSON_BYTES).await?;
     if !valid_username(&req.username) {
         return Err(ApiError::invalid("usernames are 1-64 letters, digits, '.', '_' or '-'"));
     }
@@ -101,6 +103,17 @@ async fn login(
     let now = tokio::time::Instant::now().into_std();
     let ip = client_ip(peer, &headers, &state.trusted_proxies);
     let username = req.username.to_ascii_lowercase();
+    // Each check costs 19 MiB and real CPU time: only a few run at once, server-wide. A sign-in that finds them
+    // all busy is told to come back, rather than queued (a flood would otherwise queue without end). The permit is
+    // taken before the attempt is counted, so an answer that never checked the password costs the client nothing
+    // (a flood can't use up a legitimate device's attempts); a sign-in the window then refuses holds it only for
+    // that look. The slot is also held across the user lookup, so a slow database gives busy answers instead of a
+    // queue. The permit goes into the check, so it is held until the check is done even if the client goes away.
+    let permit = state
+        .password_checks
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::rate_limited("the server is busy checking other sign-ins; try again in a moment", Some(PASSWORD_RETRY_SECS)))?;
     if !state.logins.allow(&ip_key(ip), LOGINS_PER_IP, now) || !state.logins.allow(&format!("user:{username}"), LOGINS_PER_USER, now) {
         return Err(ApiError::rate_limited("too many sign-in attempts; wait a few minutes", None));
     }
@@ -110,7 +123,12 @@ async fn login(
     let user = state.meta.user_by_name(&username).await?;
     let hash = user.as_ref().map_or(state.dummy_hash.as_str(), |u| u.password_hash.as_str()).to_owned();
     let password = req.password.clone();
-    let ok = tokio::task::spawn_blocking(move || verify_password(&password, &hash)).await.map_err(|e| {
+    let ok = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_password(&password, &hash)
+    })
+    .await
+    .map_err(|e| {
         tracing::error!(error = %e, "password check task failed");
         ApiError::internal()
     })?;
@@ -119,7 +137,9 @@ async fn login(
     };
     let (token, token_hash) = new_token()?;
     let device = state.meta.create_device(user.id, &req.device_name, &token_hash, state.now_ms()).await?;
-    tracing::info!(user = %user.username, %device, "device signed in");
+    // The username is the only personal identifier the server could log here: kept to debug.
+    tracing::debug!(user = %user.username, "sign-in");
+    tracing::info!(%device, "device signed in");
     Ok(Json(LoginResponse { device, token }))
 }
 
@@ -158,9 +178,9 @@ async fn revoke_device(
 async fn missing_chunks(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
-    req: Result<Json<MissingRequest>, JsonRejection>,
+    request: Request,
 ) -> Result<Json<MissingResponse>, ApiError> {
-    let Json(req) = req?;
+    let req: MissingRequest = read_json(&state, request, SMALL_JSON_BYTES).await?;
     if req.ids.len() > MAX_MISSING_IDS {
         return Err(ApiError::invalid(format!("ask about at most {MAX_MISSING_IDS} chunks at once")));
     }
@@ -190,18 +210,47 @@ async fn stored_blob(state: &AppState, key: BlobKey) -> Result<Bytes, ApiError> 
     }
 }
 
+/// Reads a chunk or manifest body: at most the route's limit (`max_bytes`, set with [`DefaultBodyLimit`]: more
+/// is `413 too_large`), within [`Limits::body_time`](crate::state::Limits::body_time) (longer is `408 timeout`).
+/// The caller holds one of the user's body slots ([`AppState::bodies`]) meanwhile.
+async fn read_body(state: &AppState, request: Request, max_bytes: usize) -> Result<Bytes, ApiError> {
+    match tokio::time::timeout(state.limits.body_time(max_bytes), Bytes::from_request(request, &())).await {
+        Ok(body) => Ok(body?),
+        Err(_) => Err(body_too_slow()),
+    }
+}
+
+/// Reads a JSON body (sign-in, missing-chunk query, commit) under the same deadline as [`read_body`], so a body that
+/// trickles in is cut off by the server itself rather than left to a proxy's body timeout. Rejections (no JSON
+/// content type, bad JSON, over the route's [`DefaultBodyLimit`]) are answered as before. No slot is held: a JSON
+/// body costs one connection and at most `max_bytes`.
+async fn read_json<T: serde::de::DeserializeOwned>(state: &AppState, request: Request, max_bytes: usize) -> Result<T, ApiError> {
+    match tokio::time::timeout(state.limits.body_time(max_bytes), Json::<T>::from_request(request, &())).await {
+        Ok(json) => Ok(json?.0),
+        Err(_) => Err(body_too_slow()),
+    }
+}
+
+fn body_too_slow() -> ApiError {
+    ApiError::new(StatusCode::REQUEST_TIMEOUT, codes::TIMEOUT, "the request body took too long to arrive")
+}
+
 async fn put_chunk(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
     id: Result<Path<String>, PathRejection>,
-    body: Result<Bytes, BytesRejection>,
+    request: Request,
 ) -> Result<StatusCode, ApiError> {
     let Path(id) = id?;
-    let body = body?;
     let id = parse_chunk_id(&id)?;
+    // Held until the chunk is stored: the user's buffered bodies are bounded.
+    let _body = state.bodies.acquire(auth.user).await?;
+    let body = read_body(&state, request, MAX_CHUNK_BYTES as usize).await?;
     if body.is_empty() {
         return Err(ApiError::invalid("a chunk can't be empty"));
     }
+    // A space at its cap doesn't get to store bytes it would then be refused for.
+    state.meta.check_room(auth.space, BlobKind::Chunk, id.as_bytes(), body.len() as u64 + 1).await?;
     // Bytes first, record second: the database never points at a blob that isn't stored.
     state.store.put(BlobKey::chunk(&id), &body).await?;
     state.meta.add_chunk(auth.space, &id, body.len() as u64 + 1, state.now_ms()).await?;
@@ -222,37 +271,20 @@ async fn get_chunk(
     Ok(octets(stored_blob(&state, BlobKey::chunk(&id)).await?))
 }
 
-async fn manifest_permit(state: &AppState) -> Result<tokio::sync::SemaphorePermit<'_>, ApiError> {
-    state.manifest_uploads.acquire().await.map_err(|e| {
-        tracing::error!(error = %e, "manifest semaphore closed");
-        ApiError::internal()
-    })
-}
-
-/// A body that failed to arrive: too long, or the connection broke.
-fn body_error(e: axum::Error) -> ApiError {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&e);
-    while let Some(err) = source {
-        if err.to_string().contains("length limit exceeded") {
-            return ApiError::too_large(format!("the body is over the limit of {MAX_MANIFEST_BYTES} bytes"));
-        }
-        source = err.source();
-    }
-    ApiError::invalid("the request body couldn't be read")
-}
-
 async fn put_manifest(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
     id: Result<Path<String>, PathRejection>,
-    body: Body,
+    request: Request,
 ) -> Result<StatusCode, ApiError> {
     let Path(id) = id?;
-    // Big manifests are real work to buffer, decode and check: only a few at a time, server-wide. The permit
-    // is taken before the body is read, so the waiting requests hold no buffered bytes.
-    let _permit = manifest_permit(&state).await?;
-    let body = axum::body::to_bytes(body, MAX_MANIFEST_BYTES).await.map_err(body_error)?;
     let id = parse_manifest_id(&id)?;
+    // A body slot while the body arrives and until the manifest is stored, so the user's buffered bodies are
+    // bounded; then, with the body in, one of the user's manifest slots for the real work (decoding and checking a
+    // big manifest). A body that is slow to arrive holds only its own user's body slot, and only until its time is up.
+    let _body = state.bodies.acquire(auth.user).await?;
+    let body = read_body(&state, request, MAX_MANIFEST_BYTES).await?;
+    let _work = state.manifests.acquire(auth.user).await?;
     let manifest = Manifest::decode(&body).map_err(|e| ApiError::invalid(format!("bad manifest: {e}")))?;
     if manifest.id() != id {
         return Err(ApiError::invalid("the manifest doesn't match its ID"));
@@ -272,6 +304,7 @@ async fn put_manifest(
         }
         return Err(err);
     }
+    state.meta.check_room(auth.space, BlobKind::Manifest, id.as_bytes(), body.len() as u64 + 1).await?;
     state.store.put(BlobKey::manifest(&id), &body).await?;
     state.meta.add_manifest(auth.space, &manifest, body.len() as u64 + 1, state.now_ms()).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -284,19 +317,15 @@ async fn get_manifest(
 ) -> Result<Response, ApiError> {
     let Path(id) = id?;
     let id = parse_manifest_id(&id)?;
-    let _permit = manifest_permit(&state).await?;
+    // No permit: one indexed query and one blob read. (Uploads' slots are per user and never block this.)
     if !state.meta.has_manifest(auth.space, &id).await? {
         return Err(ApiError::not_found("manifest"));
     }
     Ok(octets(stored_blob(&state, BlobKey::manifest(&id)).await?))
 }
 
-async fn commit(
-    State(state): State<Shared>,
-    Extension(auth): Extension<DeviceAuth>,
-    req: Result<Json<CommitRequest>, JsonRejection>,
-) -> Result<Json<CommitResponse>, ApiError> {
-    let Json(req) = req?;
+async fn commit(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>, request: Request) -> Result<Json<CommitResponse>, ApiError> {
+    let req: CommitRequest = read_json(&state, request, MAX_BATCH_JSON_BYTES).await?;
     // Commit and publish run in their own task: a client that disconnects mid-request drops this handler,
     // and the publish must not be skipped for a commit that went through.
     let task_state = state.clone();

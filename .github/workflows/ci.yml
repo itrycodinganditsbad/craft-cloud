@@ -37,6 +37,11 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
+      # Every dependency's licence, for every target, against the allow-list in AGENTS.md.
+      - name: Licences
+        if: runner.os == 'Linux'
+        run: cargo xtask licenses
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

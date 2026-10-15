@@ -2,7 +2,7 @@
 //! appear in the process list or shell history: `printf '%s\n' "$PASSWORD" | craft-cloud-server user add …`.
 
 use std::io::{BufRead, Read, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -36,9 +36,12 @@ pub enum Command {
         /// Address to listen on. Anything but loopback needs `--behind-proxy`.
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: String,
-        /// Set when a TLS reverse proxy forwards to the listen address.
+        /// Set when a TLS reverse proxy forwards to the listen address. Needs `--trusted-proxy`.
         #[arg(long)]
         behind_proxy: bool,
+        /// The reverse proxy's address, whose `X-Forwarded-For` is believed (repeat for several proxies).
+        #[arg(long = "trusted-proxy")]
+        trusted_proxies: Vec<IpAddr>,
     },
     /// Run the server.
     Serve {
@@ -109,7 +112,7 @@ pub enum CliError {
 
 /// Opens the database and blob storage a config names.
 pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
-    let meta = Meta::open(&config.database.url).await?;
+    let meta = Meta::open(&config.database.url).await?.with_stored_bytes_cap(config.stored_bytes_per_user);
     let store = match (&config.storage, config.storage.s3()?) {
         (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
         (StorageConfig::Disk { path }, None) => Store::new(DiskBackend::new(path)?),
@@ -145,7 +148,9 @@ async fn user_id(meta: &Meta, username: &str) -> Result<craft_cloud_meta::UserRe
 /// Runs every command except `serve` (which `main` runs, since it never returns).
 pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Write) -> Result<(), CliError> {
     match command {
-        Command::Init { dir, admin, listen, behind_proxy } => init(&dir, &admin, &listen, behind_proxy, input, out).await,
+        Command::Init { dir, admin, listen, behind_proxy, trusted_proxies } => {
+            init(&dir, &admin, &listen, (behind_proxy, &trusted_proxies), input, out).await
+        }
         Command::Serve { .. } => Err(CliError::Usage("serve is run by main".into())),
         Command::User { config, action } => {
             let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
@@ -206,7 +211,16 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
 
 /// Creates a data directory. Every check that needs no disk access runs first, so a refused `init` leaves
 /// nothing behind. Once the first file is made, any failure removes what this call made.
-async fn init(dir: &Path, admin: &str, listen: &str, behind_proxy: bool, input: &mut impl BufRead, out: &mut impl Write) -> Result<(), CliError> {
+/// `proxy` is `--behind-proxy` and the `--trusted-proxy` addresses.
+async fn init(
+    dir: &Path,
+    admin: &str,
+    listen: &str,
+    proxy: (bool, &[IpAddr]),
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let (behind_proxy, trusted_proxies) = proxy;
     if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
         return Err(CliError::Usage(format!("{} is not empty", dir.display())));
     }
@@ -221,8 +235,10 @@ async fn init(dir: &Path, admin: &str, listen: &str, behind_proxy: bool, input: 
     let dir = std::path::absolute(dir)?;
     let db = without_verbatim_prefix(&dir.join("meta.db").display().to_string()).to_owned();
     let blobs = without_verbatim_prefix(&dir.join("blobs").display().to_string()).to_owned();
+    let trusted: Vec<String> = trusted_proxies.iter().map(|ip| format!("\"{ip}\"")).collect();
     let config_text = format!(
-        "listen = \"{listen}\"\nbehind_proxy = {behind_proxy}\ntrusted_proxies = []\n\n[database]\nurl = {}\n\n[storage]\nkind = \"disk\"\npath = {}\n",
+        "listen = \"{listen}\"\nbehind_proxy = {behind_proxy}\ntrusted_proxies = [{}]\n\n[database]\nurl = {}\n\n[storage]\nkind = \"disk\"\npath = {}\n",
+        trusted.join(", "),
         toml_string(&format!("sqlite:{db}")),
         toml_string(&blobs),
     );

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use craft_cloud_server::cli::{Cli, CliError, run};
-use craft_cloud_server::config::Config;
+use craft_cloud_server::config::{Config, ConfigError};
 
 async fn cli(args: &[&str], stdin: &str) -> Result<String, CliError> {
     let parsed = Cli::try_parse_from(std::iter::once("craft-cloud-server").chain(args.iter().copied())).unwrap();
@@ -98,9 +98,16 @@ async fn init_needs_behind_proxy_for_a_public_address() {
     assert!(matches!(refused, Err(CliError::Usage(ref m)) if m.contains("--behind-proxy")), "{refused:?}");
     assert!(!dir.exists());
 
-    cli(&["init", "--dir", dir_s, "--admin", "ana", "--listen", "0.0.0.0:8080", "--behind-proxy"], "admin password 1\n").await.unwrap();
+    // Behind a proxy, the proxy must be named: otherwise every client would share its address.
+    let unnamed = cli(&["init", "--dir", dir_s, "--admin", "ana", "--listen", "0.0.0.0:8080", "--behind-proxy"], "admin password 1\n").await;
+    assert!(matches!(unnamed, Err(CliError::Config(ConfigError::NoTrustedProxies))), "{unnamed:?}");
+    assert!(!dir.exists());
+
+    let args = ["init", "--dir", dir_s, "--admin", "ana", "--listen", "0.0.0.0:8080", "--behind-proxy", "--trusted-proxy", "10.0.0.1"];
+    cli(&args, "admin password 1\n").await.unwrap();
     let config = Config::load(&dir.join("config.toml")).unwrap();
     assert!(config.behind_proxy);
+    assert_eq!(config.trusted_proxies, vec!["10.0.0.1".parse::<std::net::IpAddr>().unwrap()]);
 }
 
 #[cfg(unix)]

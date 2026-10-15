@@ -535,6 +535,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tower-service",
  "turmoil",
 ]
@@ -630,6 +631,7 @@ dependencies = [
  "craft-cloud-store",
  "craft-cloud-sync",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
