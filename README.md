@@ -79,8 +79,8 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
 | M3b2a | Hardening: downloads land atomically and never over a save you just made, crash recovery, files held open or read-only on Windows | done |
 | M3b2b1 | The agent on its own: `run` watches the folder and the server, waits for files to settle, retries with backoff | done |
 | M3b2b2 | A simulated network (partitions, delays, dropped connections) in the simulation | done |
-| M3c | Fixes from a full review: per-account upload limits and storage cap, big libraries sync in linear time, a file too big is skipped instead of stopping the agent | next |
-| M4 | History, restore, trash, cleanup of old versions, garbage collection, per-user quotas, server backup and restore | planned |
+| M3c | Fixes from a full review: per-account upload limits and storage cap, big libraries sync in linear time, a file too big is skipped instead of stopping the agent | done |
+| M4 | History, restore, trash, cleanup of old versions, garbage collection, per-user quotas, server backup and restore | next |
 | M5 | Selective sync, large-media polish, `.craftignore` | planned |
 | M6 | Packaging: release binaries, Docker image, systemd unit, built-in TLS, a self-hosting guide | planned |
 | M7 | The local control API and launcher integration | planned |
@@ -130,7 +130,7 @@ How it's tested:
 
 ## Running the server
 
-The server is usable today, although there is no agent to sync with yet.
+Set up the server first; the agent (below) syncs folders with it.
 
 ```sh
 cargo build --release -p craft-cloud-server

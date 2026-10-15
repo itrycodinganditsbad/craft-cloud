@@ -580,7 +580,8 @@ changes locally, then pushes local changes. These rules came out of the simulati
   Solo use is that one admin account and nothing more.
 - **Stored-bytes cap** (M3c): `stored_bytes_per_user` in the config, off by default and refused at load when
   under one chunk (4 MiB), caps what one account
-  stores: the stored size of every chunk and manifest it uploaded, each counted once. Uploads are unaccounted
+  stores: the stored size of every chunk and manifest it uploaded, each counted once (an account is one space,
+  so per user and per space are the same until sharing exists). Uploads are unaccounted
   otherwise and nothing frees space before GC, so on a server shared with people the admin doesn't fully trust,
   this is what keeps one account from filling the disk for everyone. An upload that would go over it is refused
   before its bytes are stored (`507 quota_exceeded`, with `quota: {used, limit}`); the agent skips that file and
@@ -1031,7 +1032,7 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
 | M3b2a | Hardening: the known gaps, same content = no change, atomic download landing, Windows rename-blocked retry | DONE (2026-10-13) |
 | M3b2b1 | Agent on its own: seed 112337, `run` loop, watcher, long-poll, stability window, backoff, status file | DONE (2026-10-14) |
 | M3b2b2 | Simulated network (`turmoil`): partitions, delays, dropped connections | DONE (2026-10-15) |
-| M3c | Fixes from the full repo review | TODO |
+| M3c | Fixes from the full repo review | DONE (2026-10-15) |
 | M4 | History, restore, trash, thinning, GC (including the chunks of uploads the stored-bytes cap refused), logical quotas, admin CLI (`user remove\|quota`, `gc`, `verify`), backup/restore | TODO |
 | M5 | Selective sync, large-media polish (a few chunks in flight at once), ignore rules | TODO |
 | M6 | Packaging: binaries, Docker, systemd, built-in TLS, self-hosting guide | TODO |
@@ -1089,7 +1090,7 @@ From the final reviews of the M3b2b1 and M3b2b2 prototypes, less what their fix 
 
 ### M3c follow-ups
 
-From the review of the M3c prototype, less what its fix round did:
+From the reviews of M3c, less what their fix rounds did:
 
 - **Room in `GET /space`**: the space answer carries `quota: {used, limit}`, so the agent knows the room at the
   start of every pass and never reads a file that can't fit (today it learns the room from the first refusal of
@@ -1107,7 +1108,8 @@ From the review of the M3c prototype, less what its fix round did:
 - **Certificate errors ask for a person**: a refused server certificate is `Unavailable` today (retried
   forever, "Offline"); with the built-in TLS work (M6) it becomes needs-you with the reason.
 - **A case-insensitive `MemFs`**: a mode that folds names like Windows and macOS, so the case-twin checks and the
-  listing cache run here, not only on Windows CI.
+  listing cache run here, not only on Windows CI. The twin-listing cache is keyed by the engine's spelling of a
+  folder; key or test it by folded path there.
 - **Parallel commits of two users to different spaces** (the original review's I2): Postgres runs them at once,
   SQLite one at a time; a test of both, CI-only.
 - **Tests that pin rather than discriminate**: `a_write_waits_for_a_lock_another_program_holds` passes without the
@@ -1116,9 +1118,14 @@ From the review of the M3c prototype, less what its fix round did:
 - **Parallel chunk transfers** (M5): a few chunks in flight at once behind a knob that defaults to one, keeping
   both simulations deterministic.
 - **Limits in the config**: the body deadlines and per-user slots are constants in `Limits`; the config file
-  gets them with M6, with a server-side header timeout once built-in TLS lands.
+  gets them with M6, with a server-side header timeout once built-in TLS lands, and a deadline around the
+  blob-store write while a body slot is held (today a stalled store holds that user's slots for as long as the
+  store's own timeout; other users are not affected).
 - **Per-pass O(N) work**: `find_local`'s whole-tree walk and `scan()`'s sort comparator (`sort_by_cached_key`),
-  after a measurement on a real 50,000-file tree.
+  after a measurement on a real 50,000-file tree; `Base::update` clones the entry and relinks the indexes on every
+  change.
+- **`add_chunks` charges once per batch**, after the last part (today once per 500-chunk part, inside one
+  transaction: on Postgres two multi-part batches of one space could deadlock; no caller sends one).
 - `init` prints the `stored_bytes_per_user` hint for shared servers.
 
 ## Out of scope for Phase 1
