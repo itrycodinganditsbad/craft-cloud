@@ -34,7 +34,7 @@ apps/
   craft-cloud-server              HTTP API (`/api/v1`), auth, admin CLI (`init`, `serve`, `user`, `device`, `reset-epoch`)
   craft-cloud-agent               the sync agent: real disk `Fs`, HTTP `Transport` over a `Connection`, saved account and state, root marker, CLI (`login`, `run`, `sync`, `status`, `logout`), the `run` loop
     tests/network/                the simulation over a simulated network (turmoil): `main.rs` histories and scenarios, `harness.rs` server and agent hosts
-xtask/                            cargo xtask ci | version
+xtask/                            cargo xtask ci | licenses | version
 docs/                             design documents and the self-hosting guide
 ```
 
@@ -63,7 +63,9 @@ talks to, any vendor's cloud.
   Seafile, and similar). Don't read their source while working on the matching feature here.
   MPL-2.0 code (Syncthing) is not copied either.
 - Dependencies must be permissively licensed (MIT, Apache-2.0, BSD, ISC, Zlib, Unicode, CC0, CDLA-Permissive-2.0 (data only, e.g. root certificates)).
-  Adding one means checking its license and every transitive license.
+  Adding one means checking its license and every transitive license. `cargo xtask licenses` (part of
+  `cargo xtask ci` and CI) checks every crate in the build against this list; a data-only licence is allowed
+  only for the crates named in `xtask/src/licenses.rs`.
 - Never copy vendor icons, artwork, UI text or documentation wording. Feature names are fine.
 
 ## 3. Golden rules
@@ -116,7 +118,7 @@ that can't save. Shared standard: `craftrules/standards/never-crash.md`.
 ## 4. Before you finish a task
 
 ```sh
-cargo xtask ci              # fmt --check, clippy -D warnings, test
+cargo xtask ci              # fmt --check, licenses, clippy -D warnings, test
 ```
 
 Or piecemeal: `cargo test -p <crate>`, `cargo clippy -p <crate> --all-targets -- -D warnings`.

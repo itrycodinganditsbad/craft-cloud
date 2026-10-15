@@ -3,6 +3,7 @@
 //! Pure Rust (std only). External tools (`cargo`) are invoked through `std::process::Command`.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod licenses;
 mod version;
 
 use std::path::{Path, PathBuf};
@@ -12,7 +13,8 @@ const USAGE: &str = "\
 usage: cargo xtask <command>
 
 commands:
-  ci              fmt --check, clippy -D warnings, test (stops at first failure)
+  ci              fmt --check, licenses, clippy -D warnings, test (stops at first failure)
+  licenses        check every dependency's licence against the allow-list in AGENTS.md
   version [set X.Y.Z[-pre]]
                   print the workspace version, or set it (Cargo.toml + Cargo.lock)
 ";
@@ -22,6 +24,7 @@ fn main() -> ExitCode {
     let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
     let result = match args.first().map(String::as_str) {
         Some("ci") => cmd_ci(),
+        Some("licenses") => licenses::run(),
         Some("version") => version::run(&root(), &rest),
         Some("-h" | "--help" | "help") | None => {
             print!("{USAGE}");
@@ -66,6 +69,7 @@ fn cmd_ci() -> Result<(), String> {
     type Step = (&'static str, Box<dyn Fn() -> Result<(), String>>);
     let steps: Vec<Step> = vec![
         ("fmt", Box::new(|| cargo_step(&["fmt", "--all", "--", "--check"]))),
+        ("licenses", Box::new(licenses::run)),
         ("clippy", Box::new(|| cargo_step(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))),
         ("test", Box::new(|| cargo_step(&["test", "--workspace"]))),
     ];

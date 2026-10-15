@@ -112,7 +112,10 @@ can point into the synced folder, and saves are atomic.
 - **Names** are NFC-normalised. The server rejects anything that can't exist on every supported OS:
   `/`, `\`, NUL, `<>:"|?*`, control characters, trailing dot or space, Windows reserved names (`CON`, `NUL`,
   `COM1`…), over 255 UTF-8 bytes. **Uniqueness inside a directory is by Unicode full case folding + NFC**,
-  so `Foo.psd` and `foo.psd` can't both exist (they couldn't on Windows or macOS anyway).
+  so `Foo.psd` and `foo.psd` can't both exist (they couldn't on Windows or macOS anyway). On Linux and Windows a
+  local name that isn't NFC (a folder copied from a Mac) is another file than its NFC spelling, so it is skipped
+  with its own reason ("isn't in the composed Unicode form (NFC) …; renaming it here fixes that"), never taken for
+  a link; renaming it for the user is not done.
 
 ## Filesystem semantics
 
@@ -160,8 +163,12 @@ an empty folder as "delete everything".
 
 **Upload**
 1. Chunk and hash (streaming; never the whole file in memory).
-2. `POST /chunks/missing` with the chunk IDs; upload the missing ones in parallel over HTTP/2. Each chunk is
-   its own request, so a cut connection resumes from the next missing chunk. Then `PUT /manifests/{id}`.
+2. `POST /chunks/missing` with the chunk IDs; upload the missing ones, one at a time. Each chunk is its own
+   request, so a cut connection resumes from the next missing chunk. Then `PUT /manifests/{id}`. Downloads fetch
+   chunks one at a time too. A few at a time would help on fast links with long round trips, and is left for
+   M5's large-media work (decided in M3c): concurrent requests make the simulations' injected failures depend on
+   which request finishes first, so a seed would no longer replay exactly unless the harnesses order them, and
+   the agent speaks HTTP/1.1 (each concurrent request is a connection of its own).
 3. `POST /commit` with **one or many** operations (new version, create directory, move, delete), each with
    its expected current version. The batch is one transaction: all apply or none. A project folder or a
    bundle appears on other machines in one piece.
@@ -221,7 +228,9 @@ device, folders over a size threshold (default 5 GB) start cloud-only and the us
 engine; a settings conflict is a normal conflict copy and the app decides what to read.
 
 **Ignored by default**: `.DS_Store`, `Thumbs.db`, `desktop.ini`, `~$*`, `*.tmp`, `*.part`, `.~lock.*`, the
-agent's own `.craft-cloud/` folder. A `.craftignore` file adds patterns.
+agent's own `.craft-cloud/` folder. Patterns ignore ASCII case (`RENDER.TMP` is ignored too, as Windows and macOS
+see one name; only ASCII letters fold, so a pattern never matches more than it says). A `.craftignore` file adds
+patterns.
 
 ### Engine rules
 
@@ -261,6 +270,14 @@ changes locally, then pushes local changes. These rules came out of the simulati
   before a write, mkdir or rename, so it's never overwritten. During a scan, the tracked name wins and the
   newcomer is skipped with a reason. A link skipped that way still hides what is tracked at its name (in a
   folder the user renamed neither name is tracked yet, so a case twin can win the name).
+- **A pass costs about the size of the folder** (M3c): the base keeps its indexes (each node's path and the
+  nodes at each path, each folder's children, tracked files and folders by local ID) up to date as it changes,
+  so a change moves only the paths below the changed node and nothing is rebuilt per node. The twin checks list a
+  folder once a pass and keep that listing up to date with the engine's own changes; what an app does to the
+  folder meanwhile isn't in it, which is safe because those checks only plan a change: the filesystem refuses one
+  that meets something unexpected (a write lands only on what the engine checked, a rename never replaces), and
+  the node waits for the next pass. A test pins it: a first sync of 5,000 files in 10 folders lists each folder
+  about twice and builds the path index once.
 - **Moves name the server's location**: a Move op's source is where the remote mirror has the node.
 - **Moved on both sides**: the server's move stands. The local copy is found by local file ID and moved to the
   server's place, hopping through a conflict name when one path contains the other or the rename is
@@ -414,7 +431,11 @@ changes locally, then pushes local changes. These rules came out of the simulati
   deleted, onto the name of a folder of this machine's own, makes that folder the moved one (folders hold no
   content); a file of its own in it under a tracked file's name then goes up as that file's next version (no
   conflict copy; history keeps the old one), unless the file's delete is held (below). It is fixed together
-  with the follow-up on a server move onto a file of this machine's own (below).
+  with the follow-up on a server move onto a file of this machine's own (below). With the stored-bytes cap on, a
+  new file bigger than the room left is skipped unread after a refusal earlier in the pass, even if it is a copy of
+  something already stored and would fit by dedup; it goes up once the room grows or on a pass that meets no
+  refusal before it (edits are not affected: they are skipped only when they could not fit against their own
+  base).
 - **A lost commit answer and a rename**: a commit whose answer was lost (a cut connection, a crash right after it
   applied) is found again next pass by place and content. If the user meanwhile renamed or moved a file that
   commit created, the next pass downloads the server's file at its old name, and the renamed one goes up as a new
@@ -496,18 +517,29 @@ changes locally, then pushes local changes. These rules came out of the simulati
   an example systemd unit.
 - **TLS**: either give it a certificate (rustls; arrives with packaging in M6), or run plain HTTP behind a
   reverse proxy (M2b). Plain HTTP binds to loopback only unless `behind_proxy = true` is set in the config.
-  The proxy is also what protects against slow clients: it must set request header and body timeouts (the
-  server itself has none until built-in TLS arrives). The server bounds per-user load itself: at most 4
-  manifest uploads at once, at most 16 waiting change-feed requests per space, and missing-chunk lists of at
-  most 10,000 IDs. `trusted_proxies` (a list of addresses) decides whose
-  `X-Forwarded-For` is believed; without it the peer address is used.
+  The proxy should set a request header timeout (the server has none for headers until built-in TLS arrives).
+  The server bounds load itself, per user, so a slow or greedy client only ever slows its own account: every
+  request body (chunk, manifest, and the JSON of sign-in, missing-chunk queries and commits) must arrive within
+  60 s plus 30 s per MiB the route allows (3 minutes for a chunk, 90 s for a JSON body, about 20 minutes for the
+  largest manifest; `408 timeout` after that), at most 8 such bodies per user are received at once (more
+  wait their turn before their bodies are read), at most 4 manifests per user are decoded and checked at once
+  (taken once the body is in; reading a manifest takes none), at most 16 change-feed requests wait per space, and
+  missing-chunk lists hold at most 10,000 IDs. Password checks (Argon2id) run at most 4 at a time server-wide; a
+  sign-in that finds them all busy is answered `429 rate_limited` with `Retry-After: 1`, and that answer doesn't
+  count against its sign-in attempts (the slot is taken before the attempt is counted, and held across the user
+  lookup, so a slow database gives busy answers rather than a queue). `trusted_proxies` (a
+  list of addresses) decides whose `X-Forwarded-For` is believed; without it the peer address is used. With
+  `behind_proxy = true` the server refuses to start without `trusted_proxies` (every client would share the
+  proxy's address, so a few wrong passwords would lock the whole studio out of signing in) unless
+  `ignore_forwarded_for = true` says that is meant; that setting is refused anywhere else (with `trusted_proxies`,
+  whose `X-Forwarded-For` would still be believed, or without `behind_proxy`).
 - **Version negotiation**: `GET /api/info` returns the server's protocol version range, chunker parameter
   sets and limits. The agent checks it at login and on every start, and refuses with a clear message if
   there's no overlap.
 - **Metadata: SQLite or Postgres**, chosen in the config. Both run the same queries (sqlx `Any` driver) and the
   same test suite. sqlx (MIT/Apache) with **one migration directory per backend**; no query relies on one
   dialect's quirks without a test on both.
-  - SQLite (default, solo and small studios): WAL mode, `busy_timeout` set, **one write transaction at a
+  - SQLite (default, solo and small studios): WAL mode, `busy_timeout` 5 s, **one write transaction at a
     time** (a single async lock around every write, `BEGIN IMMEDIATE`); reads use a small pool.
   - Postgres (bigger studios, or when the admin already runs one): a normal pool; a commit runs in one
     transaction that first locks its space's row (`SELECT … FOR UPDATE`), so commits to one space run one at
@@ -522,12 +554,16 @@ changes locally, then pushes local changes. These rules came out of the simulati
     is atomic, so there's no temp step. Credentials come from the config file or the standard environment
     variables, never from clients.
   - Every chunk is verified on write and on read, on both.
-- **Dedup without leaking**: chunks are stored once on disk, but `chunks/missing` answers per space, and
-  **quota counts logical bytes per space**. Neither reveals whether someone else has the same data.
+- **Dedup without leaking**: chunks are stored once on disk, but `chunks/missing` answers per space, and the
+  stored-bytes cap counts every blob a space has at its stored size, even when another space stored the same bytes
+  first (the logical-bytes quota counts per space too). Neither reveals whether someone else has the same data.
 - **Uploads and commits check what they reference**: a manifest upload is refused with the list of missing
   chunks unless every chunk it lists is already in the space; a commit refuses a version whose manifest isn't
-  in the space (`missing_manifest` conflict). Both checks run inside the write transaction (GC treats
-  manifests like chunks), and the agent uploads what's missing and retries. GC and commit share a **generation counter**: GC marks with generation G and
+  in the space (`missing_manifest` conflict). The commit's check runs inside its write transaction (GC treats
+  manifests like chunks); the manifest's chunk check runs just before its write transaction (for a manifest of a
+  million chunks it is thousands of queries, which would hold every other write back on SQLite), and the
+  generation counter below covers the gap once GC exists (an upload touches what it references). A manifest refused for missing chunks makes the agent send exactly the chunks named,
+  once, and the manifest once more; a second refusal fails the pass, which is tried again later. GC and commit share a **generation counter**: GC marks with generation G and
   only sweeps chunks unreferenced at G and not touched by any upload or commit since, so a commit can't
   race a sweep.
 - **Accounts**: usernames are unique ignoring ASCII case (stored lowercase), so `Ana` and `ana` are one account.
@@ -537,28 +573,48 @@ changes locally, then pushes local changes. These rules came out of the simulati
 - **Devices**: the agent logs in once with username and password and gets a 256-bit device token, stored
   only as a hash. The device list shows name, created and **last used**. Revoke from the admin CLI or from
   your own device list. `last used` is
-  written at most once a minute per device.
+  written at most once a minute per device, after the request is answered (it never waits for the write lock).
+  Sign-in limits and that once-a-minute rule live in the server process: two server processes on one Postgres
+  database (not a supported setup) would each count their own, so twice the sign-in attempts and twice the writes.
 - **Setup**: `craft-cloud-server init` writes the config, creates the data directory and the first admin.
   Solo use is that one admin account and nothing more.
-- **Quotas**: optional per user, in logical bytes. A commit over quota is refused whole.
-- **Retention by thinning**: keep every version from the last 24 h, then one per hour for 7 days, then one
+- **Stored-bytes cap** (M3c): `stored_bytes_per_user` in the config, off by default and refused at load when
+  under one chunk (4 MiB), caps what one account
+  stores: the stored size of every chunk and manifest it uploaded, each counted once. Uploads are unaccounted
+  otherwise and nothing frees space before GC, so on a server shared with people the admin doesn't fully trust,
+  this is what keeps one account from filling the disk for everyone. An upload that would go over it is refused
+  before its bytes are stored (`507 quota_exceeded`, with `quota: {used, limit}`); the agent skips that file and
+  lists it ("too big for the account's storage on the server"), and everything else keeps syncing; after such a
+  refusal, a later file in the same pass is skipped the same way before it is read when it could not fit even
+  if all of its previous version's content were reused (size over the room plus the previous size; a new file has
+  none). So a file bigger than the room is read at most once per pass, while files within a chunk's bookkeeping of
+  the room may still be read and refused. Nearly full counts as full: an account with less than one chunk (4 MiB)
+  of room left pauses the agent (account-level, looked at again every ten minutes), so a full account isn't read
+  through on every pass. The
+  chunks a refused file stored before the refusal stay stored and counted until GC (M4) removes them. Off by default: a
+  self-hosted server's accounts are usually the admin's own people, and a cap that refused a big library on its
+  first upload would surprise more than it protects.
+- **Quotas** (M4): optional per user, in logical bytes. A commit over quota is refused whole.
+- **Retention by thinning** (M4): keep every version from the last 24 h, then one per hour for 7 days, then one
   per day for 30 days; the current version is always kept. Deleted nodes sit in a trash under the same
   rule. All three windows are config.
-- **Garbage collection**: daily, mark and sweep with the generation rule above.
-- **Backup**: `craft-cloud-server backup <dir>` pauses GC, snapshots the metadata (SQLite online backup, or
+- **Garbage collection** (M4): daily, mark and sweep with the generation rule above. It also frees what a file
+  refused by the stored-bytes cap stored before the refusal, which until then counts against the account.
+- **Backup** (M4): `craft-cloud-server backup <dir>` pauses GC, snapshots the metadata (SQLite online backup, or
   `pg_dump` in one snapshot transaction for Postgres), then copies chunks (immutable, so anything copied
   after the snapshot is a superset), then resumes GC. With S3, `--metadata-only` skips the chunk copy for
   admins who back up the bucket themselves (bucket versioning or replication); GC must stay paused until
   that bucket backup is done, or the admin keeps the bucket's own deleted-object retention longer than the
   GC grace. **Restore** sets a new epoch for every space.
-- **Admin CLI**: `user add|remove|reset-password|quota`, `device list|revoke`, `gc`, `verify` (re-hash every
-  chunk), `backup <dir>`, `restore <dir>`, `reset-epoch`.
+- **Admin CLI**: `init`, `serve`, `user add|reset-password`, `device list|revoke` and `reset-epoch` exist; `user
+  remove|quota`, `gc`, `verify` (re-hash every chunk), `backup <dir>` and `restore <dir>` come with M4.
 - No web UI in v1. No telemetry, no update check.
 
 API (`/api/v1`, JSON except chunk and manifest bodies; every signed-in response carries the space's epoch in
 the `craft-epoch` header, and commits/tree/changes carry it in the body too). Errors are
-`{error, message, conflicts?, missing?}` with stable codes (`conflict` 409, `missing_chunks` 409,
+`{error, message, conflicts?, missing?, quota?}` with stable codes (`conflict` 409, `missing_chunks` 409,
 `resync_required` 410, `unauthorized` 401, `rate_limited` 429, `invalid` 400, `not_found` 404, `too_large` 413,
+`timeout` 408, `quota_exceeded` 507,
 `username_taken` 409, `internal` 500; the codes are constants in `craft-cloud-proto::api::codes`). Unknown routes and
 methods answer `not_found` / `invalid` (405) the same way:
 
@@ -894,10 +950,15 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
 
 - **Transient** (network down, timeouts, `5xx`, server restarting): retry with exponential backoff and
   jitter, capped at 5 minutes. Status shows "Offline, retrying"; local work carries on.
-- **Per-file permanent** (name rejected, case collision, too big for quota, permission denied, file locked):
-  that file is skipped and listed with the reason; everything else keeps syncing.
-- **Account-level** (token revoked, server gone, quota full, protocol mismatch): pause syncing, say so
-  clearly, never delete local files because of it.
+- **Per-file permanent** (name rejected, case collision, over the protocol's limits of 256 GiB or 2^20 chunks,
+  too big for quota, permission denied, file locked): that file is skipped and listed with the reason, every pass
+  until it changes; everything else keeps syncing. A file over the size limit is skipped before it is read. A
+  file whose conflict copy finds every one of its 1,000 names for that minute taken is skipped the same way and
+  tried again next pass. Only damaged data from the server (a chunk or manifest that fails its hash, a state
+  that doesn't hold together) and a server that answers outside the protocol stop the pass and ask for a person
+  (`sync` exits 3).
+- **Account-level** (token revoked, server gone, stored-bytes cap full or less than one chunk of it left,
+  protocol mismatch): pause syncing, say so clearly, never delete local files because of it.
 - **Safety stops**: a missing root marker pauses and asks. The mass-delete guard and a delete held behind a link
   hold back only those deletes and ask; everything else keeps syncing. The mass-delete guard is only ever
   resolved by the user's approval; a hold ends when its links go, the node is found here again, or the user
@@ -950,6 +1011,12 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
   one batch with client IDs; two devices create the same name offline; move cycle; edit inside a remotely
   deleted folder restores the parent chain; a batch over the cap; an app saving while the agent hashes
   (Windows) never fails.
+- **HTTPS**: an agent test serves a self-signed test certificate over TLS (`tokio-rustls`, a dev-dependency):
+  the agent's own connection refuses it, and reaches the same listener when told to trust only that
+  certificate (`Reqwest::trusting_only`, a seam the agent never uses itself).
+- **Licences**: `cargo xtask licenses` (in `cargo xtask ci` and CI) reads `cargo tree` for every target and
+  every kind of dependency and refuses a crate whose licence expression doesn't allow it under the permissive
+  licences `AGENTS.md` lists (CDLA-Permissive-2.0 only for the root-certificate crates). No tool beyond cargo.
 - CI on Ubuntu and Windows (repo `ci.yml`); macOS in release builds, as in the other Craft repos.
 
 ## Milestones
@@ -964,8 +1031,9 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
 | M3b2a | Hardening: the known gaps, same content = no change, atomic download landing, Windows rename-blocked retry | DONE (2026-10-13) |
 | M3b2b1 | Agent on its own: seed 112337, `run` loop, watcher, long-poll, stability window, backoff, status file | DONE (2026-10-14) |
 | M3b2b2 | Simulated network (`turmoil`): partitions, delays, dropped connections | DONE (2026-10-15) |
-| M4 | History, restore, trash, thinning, GC, admin CLI, backup/restore | TODO |
-| M5 | Selective sync, large-media polish, ignore rules | TODO |
+| M3c | Fixes from the full repo review | TODO |
+| M4 | History, restore, trash, thinning, GC (including the chunks of uploads the stored-bytes cap refused), logical quotas, admin CLI (`user remove\|quota`, `gc`, `verify`), backup/restore | TODO |
+| M5 | Selective sync, large-media polish (a few chunks in flight at once), ignore rules | TODO |
 | M6 | Packaging: binaries, Docker, systemd, built-in TLS, self-hosting guide | TODO |
 | M7 | Local control API + launcher integration PR | TODO |
 
@@ -1019,12 +1087,46 @@ From the final reviews of the M3b2b1 and M3b2b2 prototypes, less what their fix 
   millisecond); the harness's server clock fails loudly outside a simulation instead of reading the start time;
   AGENTS.md names the `test-support` seams (`Meta::busy`, `AppState::with_clock`) next to the turmoil note.
 
+### M3c follow-ups
+
+From the review of the M3c prototype, less what its fix round did:
+
+- **Room in `GET /space`**: the space answer carries `quota: {used, limit}`, so the agent knows the room at the
+  start of every pass and never reads a file that can't fit (today it learns the room from the first refusal of
+  a pass). Additive to the protocol. It bounds reads of new files, not of edits or copies that fit by dedup;
+  only chunking tells those.
+- **Capped simulation mode** (before M4, when GC meets the cap): a seed-chosen stored-bytes cap (every 8th seed,
+  a few files' worth) on a cap the harness can lift (`Meta`'s cap is per handle and its clones, so it needs a
+  shared cell or a `set_stored_bytes_cap` the transports see). During the random phase `Err(QuotaExceeded)` is a
+  legitimate end of a pass (today `settle_and_check` panics on any error) and quota skips are not "stuck"; after
+  each pass `stored_bytes(space) <= cap`; then the cap is lifted and the existing oracle runs unchanged
+  (convergence, nothing lost, nothing live deleted, nothing stuck). Lifting the cap keeps the oracle exact
+  instead of teaching it which files were allowed to stay behind.
+- **Round-robin over refused files**, if the copy-of-a-synced-file gap (Known gaps) turns out to matter: files
+  refused since the room last grew are processed last, one read per pass, so every file gets a turn.
+- **Certificate errors ask for a person**: a refused server certificate is `Unavailable` today (retried
+  forever, "Offline"); with the built-in TLS work (M6) it becomes needs-you with the reason.
+- **A case-insensitive `MemFs`**: a mode that folds names like Windows and macOS, so the case-twin checks and the
+  listing cache run here, not only on Windows CI.
+- **Parallel commits of two users to different spaces** (the original review's I2): Postgres runs them at once,
+  SQLite one at a time; a test of both, CI-only.
+- **Tests that pin rather than discriminate**: `a_write_waits_for_a_lock_another_program_holds` passes without the
+  explicit `busy_timeout` too (sqlx's default is the same); a test that sets a short timeout and sees it fail would
+  tell the two apart. (The password-check test now uses one slot and shows it is given back.)
+- **Parallel chunk transfers** (M5): a few chunks in flight at once behind a knob that defaults to one, keeping
+  both simulations deterministic.
+- **Limits in the config**: the body deadlines and per-user slots are constants in `Limits`; the config file
+  gets them with M6, with a server-side header timeout once built-in TLS lands.
+- **Per-pass O(N) work**: `find_local`'s whole-tree walk and `scan()`'s sort comparator (`sort_by_cached_key`),
+  after a measurement on a real 50,000-file tree.
+- `init` prints the `stored_bytes_per_user` hint for shared servers.
+
 ## Out of scope for Phase 1
 
 Hosted service; collaboration and sharing; locking; web UI; mobile; virtual files and on-demand download;
 end-to-end encryption (not built, but chunk IDs are opaque and stored chunks have a format byte so it can
-come later); per-chunk compression (same format byte); a packed small-chunk upload endpoint (HTTP/2 parallel
-requests until measurements say otherwise); compatibility with any other sync service.
+come later); per-chunk compression (same format byte); a packed small-chunk upload endpoint (one request per
+chunk until measurements say otherwise); compatibility with any other sync service.
 
 ## Open questions
 

@@ -79,7 +79,8 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
 | M3b2a | Hardening: downloads land atomically and never over a save you just made, crash recovery, files held open or read-only on Windows | done |
 | M3b2b1 | The agent on its own: `run` watches the folder and the server, waits for files to settle, retries with backoff | done |
 | M3b2b2 | A simulated network (partitions, delays, dropped connections) in the simulation | done |
-| M4 | History, restore, trash, cleanup of old versions, garbage collection, server backup and restore | next |
+| M3c | Fixes from a full review: per-account upload limits and storage cap, big libraries sync in linear time, a file too big is skipped instead of stopping the agent | next |
+| M4 | History, restore, trash, cleanup of old versions, garbage collection, per-user quotas, server backup and restore | planned |
 | M5 | Selective sync, large-media polish, `.craftignore` | planned |
 | M6 | Packaging: release binaries, Docker image, systemd unit, built-in TLS, a self-hosting guide | planned |
 | M7 | The local control API and launcher integration | planned |
@@ -142,16 +143,25 @@ The server speaks plain HTTP on `127.0.0.1:8080`. To reach it from other machine
 (Caddy, nginx, Traefik …) in front of it:
 
 1. Set `listen` to the proxy-facing address, and set `behind_proxy = true`.
-2. Put the proxy's address in `trusted_proxies`. Edit these in `config.toml`; `init` writes
-   `trusted_proxies = []`.
-3. Make the proxy set request header and body timeouts. The server relies on the proxy to cut off slow
-   clients.
+2. Put the proxy's address in `trusted_proxies`. The server refuses to start behind a proxy without it,
+   since every client would then share the proxy's address and a few wrong passwords would lock everyone
+   out of signing in. If that is really what you want, set `ignore_forwarded_for = true` instead (and leave
+   `trusted_proxies` empty: the server refuses both together).
+3. Make the proxy set a request header timeout. The server cuts off request bodies that are too slow to
+   arrive itself, and limits each account's uploads, so one slow device only slows its own account.
 
-For a non-loopback `--listen`, `init` also needs `--behind-proxy`, for example
-`init --dir ./cc-data --admin you --listen 0.0.0.0:8080 --behind-proxy`. `trusted_proxies` must then list
-the proxy's address.
+For a non-loopback `--listen`, `init` also needs `--behind-proxy` and the proxy's address, for example
+`init --dir ./cc-data --admin you --listen 0.0.0.0:8080 --behind-proxy --trusted-proxy 10.0.0.2`.
 
 For Postgres or S3, edit `[database]` and `[storage]` in `config.toml`.
+
+To cap what one account may store, set `stored_bytes_per_user` (in bytes; there is no cap by default) in
+`config.toml`. It counts every chunk and manifest an account uploaded once, and nothing frees space until
+garbage collection arrives, including what a refused file stored before it was refused. A file that would go
+over it is skipped by the agent, which says so; the rest of the folder keeps syncing. Nearly full counts as
+full: with less than 4 MiB (one chunk) left, the agent pauses and says the account's storage is full.
+A cap under 4 MiB is refused when the server starts, since not even one chunk would fit. Per-user quotas on
+file sizes come later, with history.
 
 To add accounts: `printf '%s\n' 'their password' | craft-cloud-server user --config cc-data/config.toml add name`.
 `--config` can come before or after `add`.
@@ -207,7 +217,7 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
 ## Building and testing
 
 ```sh
-cargo xtask ci        # rustfmt, clippy, and every test
+cargo xtask ci        # rustfmt, dependency licences, clippy, and every test
 ```
 
 The Postgres and S3 tests run when their environment variables are set (see `.github/workflows/ci.yml`);
