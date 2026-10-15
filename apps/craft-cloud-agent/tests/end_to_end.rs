@@ -467,7 +467,8 @@ async fn a_tracked_file_renamed_to_another_normalisation_is_never_deleted() {
     std::fs::rename(a.path("caf\u{e9}.txt"), a.path("cafe\u{301}.txt")).unwrap();
     let (_, summary) = a.try_sync(false).await.unwrap();
     assert_eq!(summary.removed_remotely, 0, "{summary:?}");
-    assert!(summary.skipped.iter().any(|(p, _)| p == "cafe\u{301}.txt"), "{summary:?}");
+    // Said as a name to fix, not as a link.
+    assert!(summary.skipped.iter().any(|(p, why)| p == "cafe\u{301}.txt" && why == craft_cloud_sync::NOT_NFC_REASON), "{summary:?}");
     b.sync().await;
     assert_eq!(b.read("caf\u{e9}.txt").as_deref(), Some("precious"));
 }
@@ -995,4 +996,80 @@ async fn a_download_that_cant_land_is_kept_and_lands_later() {
     assert_eq!(kept(), 0);
     assert_eq!(chunk_reads(), downloaded, "the kept file landed without a download");
     assert_eq!(b.files(), a.files());
+}
+
+// ---- HTTPS (review L6) ----
+
+/// A self-signed certificate for `localhost` and `127.0.0.1` and its key (PKCS #8), made for this test only
+/// (`tests/tls/`, see ATTRIBUTION.md). Valid until 2126.
+const TEST_CERT: &[u8] = include_bytes!("tls/localhost.cert.der");
+const TEST_KEY: &[u8] = include_bytes!("tls/localhost.key.der");
+
+/// A TLS listener on a loopback port with the test certificate, answering every request with `answer` (a whole
+/// HTTP/1.1 answer). Returns the port.
+async fn tls_listener(answer: Vec<u8>) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::rustls;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![CertificateDer::from(TEST_CERT.to_vec())], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(TEST_KEY.to_vec())))
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let (acceptor, answer) = (acceptor.clone(), answer.clone());
+            tokio::spawn(async move {
+                // A client that refuses the certificate ends the handshake: nothing to answer.
+                let Ok(mut tls) = acceptor.accept(tcp).await else { return };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tls.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = tls.write_all(&answer).await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn https_refuses_an_untrusted_certificate_and_works_with_a_trusted_one() {
+    use craft_cloud_agent::http::{Reqwest, info_over};
+    let info = craft_cloud_proto::api::InfoResponse {
+        protocol_min: 1,
+        protocol_max: 1,
+        chunker_params: vec!["fastcdc-v1".into()],
+        max_chunk_bytes: 4 * 1024 * 1024,
+        max_manifest_bytes: 1024,
+        max_batch_ops: 1000,
+        max_batch_json_bytes: 1024 * 1024,
+        max_page_nodes: 5000,
+        max_missing_ids: 10_000,
+    };
+    let body = serde_json::to_vec(&info).unwrap();
+    let mut answer =
+        format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).into_bytes();
+    answer.extend_from_slice(&body);
+    let port = tls_listener(answer).await;
+    let url = ServerUrl::parse(&format!("https://localhost:{port}")).unwrap();
+
+    // The agent's own connection checks the certificate against this computer's trust store, which doesn't have it.
+    let refused = info_over(&Reqwest::new(&url).unwrap(), &url).await;
+    assert!(matches!(refused, Err(TransportError::Unavailable(_))), "a self-signed certificate was accepted: {refused:?}");
+
+    // Trusting the test certificate, the same request to the same listener goes through TLS and comes back: the
+    // refusal above was the certificate's.
+    let trusting = Reqwest::trusting_only(&url, &[TEST_CERT]).unwrap();
+    assert_eq!(info_over(&trusting, &url).await.unwrap(), info);
 }

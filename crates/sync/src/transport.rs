@@ -14,6 +14,11 @@ pub enum TransportError {
     /// A manifest lists chunks the space doesn't have.
     #[error("{} chunk(s) missing", .0.len())]
     MissingChunks(Vec<ChunkId>),
+    /// A chunk or manifest would take the account over what the server lets it store; nothing was stored. `used` is
+    /// what it stores now, `limit` what it may. The engine skips the file while room is left and stops the pass once
+    /// less than a chunk's worth is ([`Config::quota_floor`](crate::Config::quota_floor)).
+    #[error("the account's storage on the server is full or nearly ({used} of {limit} bytes used); the admin can allow more")]
+    QuotaExceeded { used: u64, limit: u64 },
     /// The change feed can't continue from our sequence number; list the whole tree.
     #[error("the change feed needs a full listing")]
     ResyncRequired,

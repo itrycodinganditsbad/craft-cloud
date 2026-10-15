@@ -381,19 +381,26 @@ impl DataDir {
         self.0.join(name)
     }
 
-    /// Creates the data folder (owner-only on Unix) if it doesn't exist.
+    /// Creates the data folder (owner-only on Unix) if it doesn't exist. Folders above it that are missing (a fresh
+    /// `~/.local/share`, say) are made as any program would make them; only the data folder itself is owner-only.
     pub fn create(&self) -> Result<(), AccountError> {
         if self.0.is_dir() {
             return Ok(());
         }
+        if let Some(parent) = self.0.parent() {
+            fs::create_dir_all(parent).map_err(io_at(parent))?;
+        }
         let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
-        builder.create(&self.0).map_err(io_at(&self.0))
+        match builder.create(&self.0) {
+            // Made meanwhile (by another agent starting at the same moment): there is nothing more to do.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && self.0.is_dir() => Ok(()),
+            other => other.map_err(io_at(&self.0)),
+        }
     }
 
     pub fn load_account(&self) -> Result<Option<Account>, AccountError> {
@@ -466,7 +473,7 @@ impl DataDir {
     /// damaged one is removed and reported.
     pub fn take_approval(&self) -> Result<Option<Approval>, AccountError> {
         let path = self.file(APPROVAL_FILE);
-        let taken = self.file(&format!(".{APPROVAL_FILE}.{}.tmp", random_hex().map_err(io_at(&self.0))?));
+        let taken = self.file(&format!(".{APPROVAL_FILE}.{}.tmp", random_hex(8).map_err(io_at(&self.0))?));
         match fs::rename(&path, &taken) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -552,9 +559,9 @@ pub(crate) fn remove_atomic_temps(dir: &Path, ours: impl Fn(&str) -> bool, min_a
     Ok(removed)
 }
 
-/// 16 random lowercase hex digits, the random part of [`write_atomic`]'s temporary names.
-fn random_hex() -> io::Result<String> {
-    let mut random = [0u8; 8];
+/// `n` random bytes as lowercase hex: the random part of temporary names (here and on the synced disk).
+pub(crate) fn random_hex(n: usize) -> io::Result<String> {
+    let mut random = vec![0u8; n];
     getrandom::fill(&mut random).map_err(|e| io::Error::other(format!("the system random source failed: {e}")))?;
     Ok(random.iter().map(|b| format!("{b:02x}")).collect())
 }
@@ -564,7 +571,7 @@ fn random_hex() -> io::Result<String> {
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| io::Error::other("no parent folder"))?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let temp = dir.join(format!(".{name}.{}.tmp", random_hex()?));
+    let temp = dir.join(format!(".{name}.{}.tmp", random_hex(8)?));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -630,6 +637,22 @@ mod tests {
         assert_eq!(data.load_account().unwrap(), None);
         // No temporary files left behind.
         assert_eq!(fs::read_dir(data.path()).unwrap().count(), 0);
+    }
+
+    /// Only the data folder is owner-only: missing folders above it are made as any program makes them.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_data_folder_itself_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path().join("share/craft-cloud"));
+        data.create().unwrap();
+        data.create().unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir.path().join("share/craft-cloud")), 0o700);
+        // As any program makes a folder (whatever the user's umask says).
+        fs::create_dir(dir.path().join("plain")).unwrap();
+        assert_eq!(mode(&dir.path().join("share")), mode(&dir.path().join("plain")), "a missing parent isn't made owner-only");
     }
 
     /// Only the exact temporary names `write_atomic` uses, for the data folder's own two files, are cleaned up.

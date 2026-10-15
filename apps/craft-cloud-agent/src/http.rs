@@ -13,7 +13,8 @@
 //!   per MiB of the largest body the request may carry (a 4 MiB chunk gets 2 minutes: that still works at
 //!   ~35 KB/s). A stalled connection fails after a minute either way.
 //! - **Answers map onto [`TransportError`]** by the server's error codes first ([`codes`]), then by status:
-//!   a refused batch with its conflicts, missing chunks and `resync_required` by code; 401 is `Unauthorized`,
+//!   a refused batch with its conflicts, missing chunks, `resync_required` and `quota_exceeded` (with how much the
+//!   account stores and may store) by code; 401 is `Unauthorized`,
 //!   404 `NotFound`; 408, 429, 5xx, connection failures and timeouts are `Unavailable` (try again later);
 //!   anything else, and any answer that doesn't parse, is `Protocol` (another 4xx says "the server or a proxy
 //!   refused the request (HTTP <code>)": a reverse proxy in front of the server may be the one refusing).
@@ -217,11 +218,29 @@ pub struct Reqwest(Client);
 
 impl Reqwest {
     pub fn new(server: &ServerUrl) -> Result<Self, TransportError> {
+        Self::build(server, None)
+    }
+
+    /// [`Reqwest::new`], except that HTTPS trusts only `roots` (DER certificates), not the platform's certificate
+    /// store: for tests of the TLS path against a server with a test certificate. The agent itself never calls it.
+    pub fn trusting_only(server: &ServerUrl, roots: &[&[u8]]) -> Result<Self, TransportError> {
+        let certs = roots
+            .iter()
+            .map(|der| reqwest::Certificate::from_der(der))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| TransportError::Protocol(format!("a trusted certificate can't be read: {e}")))?;
+        Self::build(server, Some(certs))
+    }
+
+    fn build(server: &ServerUrl, only: Option<Vec<reqwest::Certificate>>) -> Result<Self, TransportError> {
         // No proxy: `HTTP_PROXY`/`ALL_PROXY` would carry the plain-HTTP loopback requests (token, password) off the
         // machine. Proxy support for HTTPS comes later, if asked for.
         let mut builder = Client::builder().no_proxy();
         if server.0.host_str() == Some("localhost") {
             builder = builder.resolve_to_addrs("localhost", &LOCALHOST);
+        }
+        if let Some(roots) = only {
+            builder = builder.tls_certs_only(roots);
         }
         let client = builder
             .connect_timeout(CONNECT_TIMEOUT)
@@ -331,6 +350,9 @@ fn error_for(status: StatusCode, body: Option<ErrorBody>) -> TransportError {
             return TransportError::MissingChunks(missing.clone());
         }
         (Some(codes::RESYNC_REQUIRED), _) => return TransportError::ResyncRequired,
+        (Some(codes::QUOTA_EXCEEDED), Some(ErrorBody { quota: Some(quota), .. })) => {
+            return TransportError::QuotaExceeded { used: quota.used, limit: quota.limit };
+        }
         _ => {}
     }
     match status {
@@ -627,7 +649,7 @@ mod tests {
     }
 
     fn body(code: &str) -> ErrorBody {
-        ErrorBody { error: code.into(), message: "m".into(), conflicts: None, missing: None }
+        ErrorBody { error: code.into(), message: "m".into(), ..ErrorBody::default() }
     }
 
     #[test]
@@ -638,6 +660,10 @@ mod tests {
         let missing = ErrorBody { missing: Some(vec![ChunkId::from_bytes([1; 32])]), ..body(codes::MISSING_CHUNKS) };
         assert_eq!(error_for(StatusCode::CONFLICT, Some(missing)), TransportError::MissingChunks(vec![ChunkId::from_bytes([1; 32])]));
         assert_eq!(error_for(StatusCode::GONE, Some(body(codes::RESYNC_REQUIRED))), TransportError::ResyncRequired);
+        let full = ErrorBody { quota: Some(craft_cloud_proto::api::QuotaUse { used: 9, limit: 10 }), ..body(codes::QUOTA_EXCEEDED) };
+        assert_eq!(error_for(StatusCode::INSUFFICIENT_STORAGE, Some(full)), TransportError::QuotaExceeded { used: 9, limit: 10 });
+        // Without the numbers it is only a server error: tried again later.
+        assert!(matches!(error_for(StatusCode::INSUFFICIENT_STORAGE, Some(body(codes::QUOTA_EXCEEDED))), TransportError::Unavailable(_)));
         assert_eq!(error_for(StatusCode::UNAUTHORIZED, Some(body(codes::UNAUTHORIZED))), TransportError::Unauthorized);
         assert_eq!(error_for(StatusCode::NOT_FOUND, None), TransportError::NotFound);
         assert!(matches!(error_for(StatusCode::TOO_MANY_REQUESTS, Some(body(codes::RATE_LIMITED))), TransportError::Unavailable(_)));

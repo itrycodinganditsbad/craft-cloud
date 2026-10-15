@@ -89,6 +89,11 @@ pub struct Faults {
     pub die_on_commit: AtomicU64,
     /// How many chunks this device downloaded (counted, not a fault).
     pub chunk_downloads: AtomicU64,
+    /// How many chunks this device uploaded (counted, not a fault).
+    pub chunk_uploads: AtomicU64,
+    /// The next this many chunk uploads are answered as stored but never stored, as by a proxy that answered for
+    /// the server and lost them.
+    pub lose_chunks: AtomicU64,
     calls: AtomicU64,
 }
 
@@ -124,6 +129,7 @@ fn meta_err(e: MetaError) -> TransportError {
         MetaError::Rejected(c) => TransportError::Rejected(c),
         MetaError::MissingChunks(m) => TransportError::MissingChunks(m),
         MetaError::ResyncRequired => TransportError::ResyncRequired,
+        MetaError::QuotaExceeded { used, limit } => TransportError::QuotaExceeded { used, limit },
         MetaError::NotFound(_) => TransportError::NotFound,
         other => TransportError::Protocol(other.to_string()),
     }
@@ -162,6 +168,12 @@ impl Transport for Local {
 
     async fn put_chunk(&self, id: &ChunkId, data: Bytes) -> Result<(), TransportError> {
         self.faults.check()?;
+        self.faults.chunk_uploads.fetch_add(1, Ordering::Relaxed);
+        // One engine drives a transport at a time, so a load and a store are enough.
+        if let Some(left) = self.faults.lose_chunks.load(Ordering::Relaxed).checked_sub(1) {
+            self.faults.lose_chunks.store(left, Ordering::Relaxed);
+            return Ok(());
+        }
         self.store.put(BlobKey::chunk(id), &data).await.map_err(|e| TransportError::Protocol(e.to_string()))?;
         self.meta.add_chunk(self.space, id, data.len() as u64 + 1, self.now()).await.map_err(meta_err)
     }
@@ -278,6 +290,16 @@ pub fn restart(m: &Machine, state: State, tweak: impl FnOnce(&mut Config)) -> Ma
     let mut config = Config::new(transport.name.clone(), transport.device);
     tweak(&mut config);
     Engine::new(fs, transport, state, config, || STAMP).unwrap()
+}
+
+/// The same machine, its folder and state as they are, talking to a server whose metadata handle is `meta` (for
+/// a cap set after the first files went up: a handle's cap is its own).
+pub fn on_meta(m: &Machine, meta: Meta, tweak: impl FnOnce(&mut Config)) -> Machine {
+    let mut transport = m.transport().clone();
+    transport.meta = meta;
+    let mut config = Config::new(transport.name.clone(), transport.device);
+    tweak(&mut config);
+    Engine::new(m.fs().clone(), transport, m.state().clone(), config, || STAMP).unwrap()
 }
 
 /// Makes the machine save its state at every checkpoint of a pass into the returned slot, as the agent saves

@@ -17,9 +17,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
+use std::sync::{Mutex, PoisonError};
 
 use craft_cloud_chunker::{Chunker, FASTCDC_V1};
-use craft_cloud_proto::limits::MAX_TREE_DEPTH;
+use craft_cloud_proto::limits::{MAX_CHUNK_BYTES, MAX_FILE_BYTES, MAX_TREE_DEPTH};
 use craft_cloud_proto::{
     Conflict, ConflictStamp, DeviceId, Epoch, FileHash, FileState, FoldKey, Manifest, ManifestId, Name, NewVersion, NodeId, PageCursor, conflict_name,
 };
@@ -32,7 +33,7 @@ use crate::transport::{Transport, TransportError};
 mod apply;
 mod push;
 
-/// Names that never sync (matched against the raw name): exact names, `prefix*` and `*suffix`.
+/// Names that never sync (matched against the raw name, ignoring ASCII case): exact names, `prefix*` and `*suffix`.
 pub const DEFAULT_IGNORES: &[&str] = &[".craft-cloud", ".DS_Store", "Thumbs.db", "desktop.ini", "~$*", "*.tmp", "*.part", ".~lock.*"];
 /// Ignored files the OS drops into folders by itself. They go along with a folder the server deleted; other
 /// ignored files (an open document's lock file, say) keep the folder here.
@@ -40,6 +41,10 @@ const OS_METADATA: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
 /// Why an entry that is neither a regular file nor a folder (or whose name the filesystem layer can't use) is
 /// skipped.
 pub const OTHER_REASON: &str = "a link, a special file, or a name this computer can't sync";
+/// Why an entry whose name isn't in Unicode's composed form (NFC, which Craft Cloud syncs) is skipped where the
+/// filesystem keeps the two forms apart (Linux, Windows): a folder copied from a Mac often has such names.
+pub const NOT_NFC_REASON: &str =
+    "the name isn't in the composed Unicode form (NFC) Craft Cloud syncs, as a copy from a Mac can leave it; renaming it here fixes that";
 /// Why a changed file that may still be being written ([`Fs::still_changing`]) is skipped. Every skip for it starts
 /// with these words, so a caller can tell that a pass should look again once the file had time to settle.
 pub const STILL_CHANGING: &str = "still changing";
@@ -47,6 +52,8 @@ pub const STILL_CHANGING: &str = "still changing";
 const KEPT_WAITS: &str = "the server's version is downloaded and kept, and lands once it can";
 /// Most chunk IDs asked about in one missing-chunk query.
 const MISSING_QUERY_IDS: usize = 10_000;
+/// Conflict-copy names tried for one name in one minute (`… 2)`, `… 3)`, …).
+const MAX_CONFLICT_COUNTER: u32 = 1000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -109,6 +116,14 @@ pub struct Config {
     /// A file whose modification time is this close to when it was recorded (or later) can't be trusted by
     /// size and time alone, and is hashed. Covers coarse timestamps (FAT: 2 s).
     pub racy_window_ms: i64,
+    /// Larger files are skipped (listed with the reason) before they are read: the protocol's limit,
+    /// [`MAX_FILE_BYTES`](craft_cloud_proto::limits::MAX_FILE_BYTES). Tests lower it.
+    pub max_file_bytes: u64,
+    /// An account with less room than this left under the server's stored-bytes cap counts as full: the refusal
+    /// ends the pass and the agent pauses, instead of chunking every new file again only to have it refused. One
+    /// chunk, [`MAX_CHUNK_BYTES`](craft_cloud_proto::limits::MAX_CHUNK_BYTES): with less room than that, no file
+    /// of consequence fits. Tests lower it.
+    pub quota_floor: u64,
 }
 
 impl Config {
@@ -121,6 +136,8 @@ impl Config {
             mass_delete_floor: 10,
             ignore: DEFAULT_IGNORES.iter().map(|s| (*s).to_owned()).collect(),
             racy_window_ms: 2_000,
+            max_file_bytes: MAX_FILE_BYTES,
+            quota_floor: u64::from(MAX_CHUNK_BYTES),
         }
     }
 
@@ -129,14 +146,17 @@ impl Config {
         n > self.mass_delete_files || (n >= self.mass_delete_floor && n.saturating_mul(100) > synced.saturating_mul(self.mass_delete_percent))
     }
 
+    /// Whether `name` matches an ignore pattern, ignoring ASCII case: Windows and macOS treat `RENDER.TMP` and
+    /// `render.tmp` as one name, and apps write either. Only ASCII letters fold (the default patterns are ASCII, and
+    /// a fold that is predictable byte for byte never makes a pattern match more than it says).
     fn ignored(&self, name: &str) -> bool {
         self.ignore.iter().any(|pattern| {
             if let Some(prefix) = pattern.strip_suffix('*') {
-                name.starts_with(prefix)
+                name.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
             } else if let Some(suffix) = pattern.strip_prefix('*') {
-                name.ends_with(suffix)
+                name.len().checked_sub(suffix.len()).and_then(|start| name.get(start..)).is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
             } else {
-                name == pattern
+                name.eq_ignore_ascii_case(pattern)
             }
         })
     }
@@ -238,6 +258,31 @@ impl Unseen {
     }
 }
 
+/// A folder's names by folded name, each with whether it is a link or special file: what the twin checks need of a
+/// listing (see [`Engine::twins_in`]).
+type Twins = HashMap<FoldKey, BTreeMap<Name, bool>>;
+
+/// What one of the engine's own changes did at a path (see [`Engine::saw_change`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    /// A file or folder is there now, under the name asked for.
+    Made,
+    /// What was there is gone.
+    Gone,
+    /// The change failed: what is there is unknown.
+    Unknown,
+}
+
+impl Seen {
+    fn made_if<T, E>(result: &Result<T, E>) -> Self {
+        if result.is_ok() { Seen::Made } else { Seen::Unknown }
+    }
+
+    fn gone_if<T, E>(result: &Result<T, E>) -> Self {
+        if result.is_ok() { Seen::Gone } else { Seen::Unknown }
+    }
+}
+
 /// What to record when an operation commits.
 #[derive(Debug, Clone)]
 enum Effect {
@@ -291,9 +336,16 @@ pub struct Engine<F: Fs, T: Transport> {
     release: BTreeSet<NodeId>,
     /// Counts the engine's own changes to the folder, so per-pass caches of what is where can tell they are stale.
     fs_changes: u64,
+    /// Folders' names for the twin checks, listed once a pass and kept up to date with the engine's own changes
+    /// (see [`Engine::twins_in`]). Behind a lock because the checks only read the engine.
+    listings: Mutex<BTreeMap<RelPath, Twins>>,
     checkpoint: Option<Checkpoint>,
     /// The new folder IDs the last look at the start of a pass found but didn't take (see [`Engine::learn_dir_ids`]).
     declined_dir_ids: BTreeSet<(NodeId, u64)>,
+    /// The account's storage on the server as the last refusal this pass gave it (`used`, `limit`): a later file
+    /// bigger than the room left is skipped before it is read (see [`Engine::upload`]). Forgotten at the start of
+    /// every pass, since the admin may have raised the cap or the room may have grown.
+    quota: Option<(u64, u64)>,
 }
 
 /// Which deletions the mass-delete guard lets through this pass.
@@ -336,8 +388,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             approval: Approval::None,
             release: BTreeSet::new(),
             fs_changes: 0,
+            listings: Mutex::new(BTreeMap::new()),
             checkpoint: None,
             declined_dir_ids: BTreeSet::new(),
+            quota: None,
         })
     }
 
@@ -400,6 +454,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// caller can save it and simply run another pass later.
     pub async fn sync_once(&mut self) -> Result<Report, SyncError> {
         let mut report = Report::default();
+        // Anything may have changed in the folder since the last pass.
+        self.listings.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
+        self.quota = None;
         // A landing a crash cut short is put right before anything looks at the folder. Until it is, the pass fails
         // (a filesystem error, so it is retried): a scan could take the moved file for a new one or the target for
         // deleted. The error names the landing's target.
@@ -521,7 +578,6 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// Also returns what the scan couldn't see into (see [`Unseen`]). Only a sync root that can't be listed fails
     /// the scan.
     fn scan(&self, report: &mut Report) -> Result<(BTreeMap<RelPath, FsKind>, Unseen), SyncError> {
-        let tracked = self.state.base_index();
         let mut out = BTreeMap::new();
         let mut unknown = Vec::new();
         let mut links = HashSet::new();
@@ -537,7 +593,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     continue;
                 }
             };
-            let is_tracked = |raw: &str| Name::new(raw).is_ok_and(|n| tracked.contains_key(&dir.join(&n)));
+            let is_tracked = |raw: &str| Name::new(raw).is_ok_and(|n| self.state.base_has_path(&dir.join(&n)));
             entries.sort_by(|a, b| is_tracked(&b.name).cmp(&is_tracked(&a.name)).then_with(|| a.name.cmp(&b.name)));
             let mut seen = HashMap::new();
             for entry in entries {
@@ -561,6 +617,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 }
                 let path = dir.join(&name);
                 match entry.kind {
+                    // A name that isn't NFC is one the filesystem layer can't use as it stands (on Linux and Windows
+                    // that spelling is another file): said as such, not as a link.
+                    FsKind::Other if name.as_str() != entry.name => report.skipped.push((shown, NOT_NFC_REASON.into())),
                     FsKind::Other => report.skipped.push((shown, OTHER_REASON.into())),
                     FsKind::Dir { .. } if path.depth() > MAX_TREE_DEPTH => {
                         report.skipped.push((shown, "folders nest too deep".into()));
@@ -637,9 +696,11 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             })
             .collect();
         for (id, here) in refreshed {
-            if let Some(BaseEntry { kind: BaseKind::Dir { local_id }, .. }) = self.state.base.get_mut(&id) {
-                *local_id = here;
-            }
+            self.state.base.update(&id, |entry| {
+                if let BaseKind::Dir { local_id } = &mut entry.kind {
+                    *local_id = here;
+                }
+            });
         }
     }
 
@@ -754,7 +815,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     fn remove_dir_if_bare(&mut self, dir: &RelPath) -> Result<bool, SyncError> {
         let mut junk = Vec::new();
         for entry in self.fs.list(dir).map_err(|e| io_err(dir, e))? {
-            let os_file = matches!(entry.kind, FsKind::File(_)) && self.config.ignored(&entry.name) && OS_METADATA.contains(&entry.name.as_str());
+            let os_file = matches!(entry.kind, FsKind::File(_))
+                && self.config.ignored(&entry.name)
+                && OS_METADATA.iter().any(|junk| junk.eq_ignore_ascii_case(&entry.name));
             match Name::new(&entry.name) {
                 Ok(name) if os_file => junk.push(dir.join(&name)),
                 _ => return Ok(false),
@@ -764,7 +827,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             self.remove_file_here(file)?;
         }
         self.no_link(dir)?;
-        self.fs.remove_dir(dir).map_err(|e| io_err(dir, e))?;
+        let removed = self.fs.remove_dir(dir);
+        self.saw_change(dir, Seen::gone_if(&removed));
+        removed.map_err(|e| io_err(dir, e))?;
         self.fs_changes += 1;
         Ok(true)
     }
@@ -794,20 +859,24 @@ impl<F: Fs, T: Transport> Engine<F, T> {
 
     /// A free conflict-copy path next to `path`: nothing is there, and no tracked node has it as its place (one the
     /// user moved away, say), so settling that node later never acts on the copy.
+    ///
+    /// Finding none (every one of the 1,000 names for this minute is taken, or the name can't be made) is a problem
+    /// of that one node, not damaged data: a filesystem error on it, so it is skipped and tried again next pass (a
+    /// minute later the names are new) while everything else keeps syncing.
     fn conflict_path(&self, path: &RelPath, is_dir: bool) -> Result<RelPath, SyncError> {
         let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
             return Err(SyncError::Corrupt("the root has no conflict copy".into()));
         };
         let stamp = (self.stamp)();
-        let tracked = self.state.base_index();
-        for counter in 1..=1000 {
-            let candidate = conflict_name(name, is_dir, &self.config.device_name, stamp, counter).map_err(|e| SyncError::Corrupt(e.to_string()))?;
+        for counter in 1..=MAX_CONFLICT_COUNTER {
+            let candidate =
+                conflict_name(name, is_dir, &self.config.device_name, stamp, counter).map_err(|e| io_err(path, io::Error::other(e.to_string())))?;
             let target = parent.join(&candidate);
-            if !tracked.contains_key(&target) && self.stat(&target)?.is_none() {
+            if !self.state.base_has_path(&target) && self.stat(&target)?.is_none() {
                 return Ok(target);
             }
         }
-        Err(SyncError::Corrupt(format!("no free conflict name for {path}")))
+        Err(io_err(path, io::Error::other("no free conflict-copy name this minute")))
     }
 
     /// The engine never renames, removes or writes onto or through a link: every change it makes to the folder
@@ -832,7 +901,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     fn rename_here(&mut self, from: &RelPath, to: &RelPath) -> Result<(), SyncError> {
         self.no_link(from)?;
         self.no_link(to)?;
-        self.fs.rename(from, to).map_err(|e| io_err(from, e))?;
+        let renamed = self.fs.rename(from, to);
+        self.saw_change(from, Seen::gone_if(&renamed));
+        self.saw_change(to, Seen::made_if(&renamed));
+        renamed.map_err(|e| io_err(from, e))?;
         self.fs_changes += 1;
         Ok(())
     }
@@ -840,7 +912,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// Removes a file, never a link or through one.
     fn remove_file_here(&mut self, path: &RelPath) -> Result<(), SyncError> {
         self.no_link(path)?;
-        self.fs.remove_file(path).map_err(|e| io_err(path, e))?;
+        let removed = self.fs.remove_file(path);
+        self.saw_change(path, Seen::gone_if(&removed));
+        removed.map_err(|e| io_err(path, e))?;
         self.fs_changes += 1;
         Ok(())
     }
@@ -848,9 +922,67 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// Makes a folder, never through a link.
     fn mkdir_here(&mut self, path: &RelPath) -> Result<(), SyncError> {
         self.no_link(path)?;
-        self.fs.mkdir(path).map_err(|e| io_err(path, e))?;
+        let made = self.fs.mkdir(path);
+        self.saw_change(path, Seen::made_if(&made));
+        made.map_err(|e| io_err(path, e))?;
         self.fs_changes += 1;
         Ok(())
+    }
+
+    /// The names in the folder `dir`, by folded name, for the twin checks ([`Engine::case_twin`] and
+    /// [`Engine::linked_twin`]): listed once a pass, then kept up to date with the engine's own changes
+    /// ([`Engine::saw_change`]), so a first sync of a folder with thousands of files lists it once, not once per file.
+    /// What an app does to the folder during the pass isn't in it; that is safe because the twin checks only plan a
+    /// change: the filesystem refuses one that meets something unexpected (a write lands only where the caller said
+    /// what is there, a rename never replaces), and the node waits for the next pass.
+    fn twins_in<R>(&self, dir: &RelPath, read: impl FnOnce(&Twins) -> R) -> io::Result<R> {
+        let mut listings = self.listings.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(twins) = listings.get(dir) {
+            return Ok(read(twins));
+        }
+        let mut twins = Twins::new();
+        for entry in self.fs.list(dir)? {
+            if let Ok(name) = Name::new(&entry.name) {
+                // Two spellings of one name (NFC and not, on Linux): a link if either is one.
+                *twins.entry(name.fold_key()).or_default().entry(name).or_default() |= entry.kind == FsKind::Other;
+            }
+        }
+        Ok(read(listings.entry(dir.clone()).or_insert(twins)))
+    }
+
+    /// The engine changed what is at `path`: the listing kept for its folder ([`Engine::twins_in`]) follows, and
+    /// listings of `path` and anything below it are dropped (listed afresh when needed). The engine only ever makes
+    /// files and folders, and under exactly the name it asked for, unless a case twin was there: then (and when the
+    /// change failed, so what is there is unknown) the folder's listing is dropped too.
+    fn saw_change(&mut self, path: &RelPath, seen: Seen) {
+        let listings = self.listings.get_mut().unwrap_or_else(PoisonError::into_inner);
+        // `path` and everything below it sort together, right where `path` would be.
+        let below: Vec<RelPath> = listings.range(path.clone()..).map(|(dir, _)| dir).take_while(|dir| dir.starts_with(path)).cloned().collect();
+        for dir in below {
+            listings.remove(&dir);
+        }
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { return };
+        let Some(twins) = listings.get_mut(&parent) else { return };
+        let key = name.fold_key();
+        let names = twins.entry(key.clone()).or_default();
+        let unclear = match seen {
+            Seen::Made => {
+                // Another spelling of the name that was there (and may be a link) stays as it was.
+                names.entry(name.clone()).or_default();
+                names.len() > 1
+            }
+            Seen::Gone => {
+                names.remove(name);
+                !names.is_empty()
+            }
+            Seen::Unknown => true,
+        };
+        let empty = names.is_empty();
+        if unclear {
+            listings.remove(&parent);
+        } else if empty {
+            twins.remove(&key);
+        }
     }
 
     /// Moves whatever is at `path` to a conflict copy name; returns the new path.
@@ -859,7 +991,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         let target = self.conflict_path(path, is_dir)?;
         self.rename_here(path, &target)?;
         // A tracked file the server deleted, moved aside: it is an untracked copy now (uploaded as new).
-        if let Some(other) = self.state.base_index().get(path).copied()
+        if let Some(other) = self.state.base_at(path)
             && !self.state.remote.contains_key(&other)
             && matches!(self.state.base.get(&other).map(|e| &e.kind), Some(BaseKind::File { .. }))
         {
@@ -944,6 +1076,12 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         let landed = self.fs.finish_write(path, writer, file.exec, file.mtime_ms, expected);
         // A landing in steps changes the folder even when it doesn't land.
         self.fs_changes += 1;
+        match &landed {
+            Ok(_) => self.saw_change(path, Seen::Made),
+            // The target is as it was.
+            Err(LandError::Changed(_) | LandError::InUse(..)) => {}
+            Err(LandError::Io(_)) => self.saw_change(path, Seen::Unknown),
+        }
         match landed {
             Ok(meta) => {
                 report.downloaded.push(path.clone());
@@ -1012,32 +1150,24 @@ impl<F: Fs, T: Transport> Engine<F, T> {
 
     /// Whether a local file ID belongs to any tracked file.
     fn tracks_local_file(&self, local_id: Option<u64>) -> bool {
-        local_id.is_some_and(|lid| self.state.base.values().any(|e| matches!(e.kind, BaseKind::File { local_id: Some(l), .. } if l == lid)))
+        local_id.is_some_and(|lid| self.state.base.files_with_local_id(lid).next().is_some())
     }
 
     /// Whether a tracked file the server still has, other than `except` (the node adopting), owns local ID `local_id`:
     /// such a file is that node's (the user moved it), never adopted by another node. One the server deleted is let
     /// go this pass anyway.
     fn live_node_owns(&self, local_id: Option<u64>, except: NodeId) -> bool {
-        local_id.is_some_and(|lid| {
-            self.state.base.iter().any(|(id, e)| {
-                *id != except && self.state.remote.contains_key(id) && matches!(e.kind, BaseKind::File { local_id: Some(l), .. } if l == lid)
-            })
-        })
+        local_id.is_some_and(|lid| self.state.base.files_with_local_id(lid).any(|id| id != except && self.state.remote.contains_key(&id)))
     }
 
     /// Whether another tracked file (not `except`) has local ID `local_id`.
     fn owns_local_file(&self, local_id: Option<u64>, except: NodeId) -> bool {
-        local_id.is_some_and(|lid| {
-            self.state.base.iter().any(|(id, e)| *id != except && matches!(e.kind, BaseKind::File { local_id: Some(l), .. } if l == lid))
-        })
+        local_id.is_some_and(|lid| self.state.base.files_with_local_id(lid).any(|id| id != except))
     }
 
     /// Whether another tracked folder (not `except`) has local ID `local_id`.
     fn owns_local_dir(&self, local_id: Option<u64>, except: NodeId) -> bool {
-        local_id.is_some_and(|lid| {
-            self.state.base.iter().any(|(id, e)| *id != except && matches!(e.kind, BaseKind::Dir { local_id: Some(l) } if l == lid))
-        })
+        local_id.is_some_and(|lid| self.state.base.dirs_with_local_id(lid).any(|id| id != except))
     }
 
     fn dir_id(kind: Option<FsKind>) -> Option<u64> {

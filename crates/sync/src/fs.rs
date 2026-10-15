@@ -6,8 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use craft_cloud_proto::{ConflictStamp, FileHash, Name, conflict_name};
 
@@ -281,6 +281,10 @@ pub struct MemFs {
     fail_landings: bool,
     /// How many times the folder's root was listed ([`MemFs::root_lists`]); shared by clones.
     root_lists: Arc<AtomicU64>,
+    /// How many times any folder was listed ([`MemFs::lists`]); shared by clones.
+    lists: Arc<AtomicU64>,
+    /// How many times each file was opened or read from ([`MemFs::reads_of`]); shared by clones.
+    reads: Arc<Mutex<BTreeMap<RelPath, u64>>>,
 }
 
 /// A landing in steps under way: the file that was at `target` is at `aside` until the download is in place and
@@ -326,6 +330,8 @@ impl Default for MemFs {
             asides: Vec::new(),
             fail_landings: false,
             root_lists: Arc::new(AtomicU64::new(0)),
+            lists: Arc::new(AtomicU64::new(0)),
+            reads: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -501,6 +507,17 @@ impl MemFs {
         self.root_lists.load(Ordering::Relaxed)
     }
 
+    /// How many times any folder was listed: for tests that pin what a pass costs.
+    pub fn lists(&self) -> u64 {
+        self.lists.load(Ordering::Relaxed)
+    }
+
+    /// How many times the file at `path` was opened or read from (asked to, found or not): for tests that a file is
+    /// skipped without being read.
+    pub fn reads_of(&self, path: &RelPath) -> u64 {
+        self.reads.lock().unwrap_or_else(PoisonError::into_inner).get(path).copied().unwrap_or(0)
+    }
+
     /// How many times the engine asked for a kept write back ([`Fs::take_kept`]), found or not: for tests that a file
     /// that stays blocked doesn't cost a take (and a hash) every pass.
     pub fn kept_takes(&self) -> u64 {
@@ -537,6 +554,7 @@ impl MemFs {
     }
 
     fn data(&self, path: &RelPath) -> io::Result<&[u8]> {
+        *self.reads.lock().unwrap_or_else(PoisonError::into_inner).entry(path.clone()).or_default() += 1;
         if self.locked.contains(path) {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{path}: locked")));
         }
@@ -573,7 +591,8 @@ impl MemFs {
 
     /// Paths of everything below `dir` (not `dir` itself).
     fn below(&self, dir: &RelPath) -> Vec<RelPath> {
-        self.nodes.keys().filter(|p| p.starts_with(dir) && *p != dir).cloned().collect()
+        // Everything below `dir` sorts right after it.
+        self.nodes.range(dir.clone()..).map(|(p, _)| p).take_while(|p| p.starts_with(dir)).filter(|p| *p != dir).cloned().collect()
     }
 
     /// Where a landing's target and moved file are now, if the moved file isn't at its recorded place but in the
@@ -617,11 +636,14 @@ impl Fs for MemFs {
         if dir.is_root() {
             self.root_lists.fetch_add(1, Ordering::Relaxed);
         }
+        self.lists.fetch_add(1, Ordering::Relaxed);
         let depth = dir.depth() + 1;
+        // Everything below `dir` sorts right after it.
         Ok(self
             .nodes
-            .iter()
-            .filter(|(p, _)| p.depth() == depth && p.starts_with(dir))
+            .range(dir.clone()..)
+            .take_while(|(p, _)| p.starts_with(dir))
+            .filter(|(p, _)| p.depth() == depth)
             // A file moved aside by a landing that hasn't finished is recovery's, never synced.
             .filter(|(p, _)| !self.asides.iter().any(|a| &a.aside == *p))
             .filter_map(|(p, n)| {

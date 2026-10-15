@@ -17,6 +17,11 @@ use crate::transport::{Transport, TransportError};
 
 use super::{Effect, Engine, MISSING_QUERY_IDS, Report, STILL_CHANGING, SyncError, per_node};
 
+/// Why a file of `size` bytes is skipped when files may be at most `limit` bytes.
+fn too_big(size: u64, limit: u64) -> String {
+    format!("too big to sync: {size} bytes, and files can be at most {limit} bytes")
+}
+
 impl<F: Fs, T: Transport> Engine<F, T> {
     pub(super) async fn push(&mut self, report: &mut Report) -> Result<(), SyncError> {
         let root = self.state.root.ok_or_else(|| SyncError::Corrupt("no root".into()))?;
@@ -361,8 +366,11 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 report.skipped.push((path.to_string(), format!("{STILL_CHANGING}; synced once it stops")));
                 continue;
             }
-            let Some(BaseEntry { kind: BaseKind::File { version: expected, exec, .. }, .. }) = self.state.base.get(id).cloned() else { continue };
-            let Some((version, size, meta, hash)) = self.upload(path, exec, report).await? else { continue };
+            let Some(BaseEntry { kind: BaseKind::File { version: expected, exec, size: base_size, .. }, .. }) = self.state.base.get(id).cloned()
+            else {
+                continue;
+            };
+            let Some((version, size, meta, hash)) = self.upload(path, exec, base_size, report).await? else { continue };
             ops.push((Op::Update { node: *id, expected, version: version.clone() }, Effect::Update { id: *id, version, size, meta, hash }));
         }
         // New files.
@@ -373,7 +381,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 continue;
             }
             let (Some(name), Some(parent)) = (path.file_name().cloned(), parent_id(path, &new_ids)) else { continue };
-            let Some((version, size, meta, hash)) = self.upload(path, false, report).await? else { continue };
+            let Some((version, size, meta, hash)) = self.upload(path, false, 0, report).await? else { continue };
             let id = NodeId::generate();
             ops.push((
                 Op::Create { node: id, parent, name: name.clone(), version: version.clone() },
@@ -417,22 +425,70 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         Ok(())
     }
 
-    /// Uploads a file's chunks and manifest. `None` when the file changed while being read (it is retried
-    /// next pass).
     /// Uploads a file's content: chunks it as a stream, asks which chunks the server lacks, and sends those,
     /// read back by range and checked against their IDs. `None` when the file can't be uploaded this pass:
-    /// it changed while being read (tried again next pass) or it can't be read at all (reported as skipped).
+    /// it changed while being read (tried again next pass), it can't be read at all, or it is over the protocol's
+    /// limits (both reported as skipped, with the reason, every pass until it changes; everything else keeps
+    /// syncing).
     ///
     /// The version is executable as the file is here, or, on a filesystem without an executable bit (Windows), as
     /// `base_exec` says (the base's bit for an edit, false for a new file): an edit there never clears the bit a
     /// Unix machine gave the file.
+    ///
+    /// A file the server refuses because the account would store more than it may is skipped too, while the account
+    /// has room left for at least [`Config::quota_floor`](super::Config::quota_floor) bytes (smaller files may still
+    /// fit). With less room than that, the refusal ends the pass: the account counts as full, and the agent pauses
+    /// and says so. After a refusal, a later file this pass is skipped before it is read when it could not fit even
+    /// if all of its base version's content were reused (`size > room + base_size`; `base_size` is 0 for a new
+    /// file). So a nearly full account does not have its backlog read on every pass: a file bigger than the room is
+    /// read at most once per pass, and files within a chunk's bookkeeping of the room (the server counts a stored
+    /// chunk one byte over its size, and the manifest) may still be read and refused. An edit that fits against its
+    /// own base is always read. The one gap: a new file bigger than the room whose chunks are all stored already
+    /// (a copy of a synced file) is skipped too; it goes up once the room grows or on a pass that meets no refusal
+    /// before it.
+    ///
+    /// The chunks a refused file stored before the refusal stay stored and counted until garbage collection (M4)
+    /// removes what no version references.
     async fn upload(
+        &mut self,
+        path: &RelPath,
+        base_exec: bool,
+        base_size: u64,
+        report: &mut Report,
+    ) -> Result<Option<(NewVersion, u64, FileMeta, FileHash)>, SyncError> {
+        let skip = |used: u64, limit: u64| {
+            format!("too big for the account's storage on the server ({used} of {limit} bytes used); the admin can allow more")
+        };
+        if let Some((used, limit)) = self.quota
+            && let Some(FsKind::File(meta)) = self.stat(path)?
+            && meta.size > limit.saturating_sub(used).saturating_add(base_size)
+        {
+            report.skipped.push((path.to_string(), skip(used, limit)));
+            return Ok(None);
+        }
+        match self.upload_content(path, base_exec, report).await {
+            Err(SyncError::Transport(TransportError::QuotaExceeded { used, limit })) if limit.saturating_sub(used) >= self.config.quota_floor => {
+                self.quota = Some((used, limit));
+                report.skipped.push((path.to_string(), skip(used, limit)));
+                Ok(None)
+            }
+            other => other,
+        }
+    }
+
+    /// [`Engine::upload`], but for the quota.
+    async fn upload_content(
         &mut self,
         path: &RelPath,
         base_exec: bool,
         report: &mut Report,
     ) -> Result<Option<(NewVersion, u64, FileMeta, FileHash)>, SyncError> {
         let Some(FsKind::File(before)) = self.stat(path)? else { return Ok(None) };
+        // Too big to go up: said before a byte is read.
+        if before.size > self.config.max_file_bytes {
+            report.skipped.push((path.to_string(), too_big(before.size, self.config.max_file_bytes)));
+            return Ok(None);
+        }
         let mut pieces: Vec<(ChunkId, u64, usize)> = Vec::new();
         let chunked = self.fs.open(path).and_then(|reader| {
             chunk_reader::<_, io::Error, _>(&self.chunker, reader, |chunk| {
@@ -462,30 +518,65 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             missing.extend(self.transport.missing_chunks(batch).await?);
         }
         for (id, offset, len) in &pieces {
-            if missing.remove(id) {
-                let data = match self.fs.read_at(path, *offset, *len) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        report.skipped.push((path.to_string(), format!("can't be read: {e}")));
-                        return Ok(None);
-                    }
-                };
-                // The file changed since it was chunked: try again next pass.
-                if data.len() != *len || *blake3::hash(&data).as_bytes() != *id.as_bytes() {
-                    return Ok(None);
-                }
-                self.transport.put_chunk(id, Bytes::from(data)).await?;
+            if missing.remove(id) && !self.send_chunk(path, id, *offset, *len, report).await? {
+                return Ok(None);
             }
         }
         let refs = summary.chunks.iter().map(|c| ChunkRef { id: ChunkId::from_bytes(c.hash), len: c.len }).collect();
         let params = ChunkerParamsId::new(FASTCDC_V1.name).map_err(|e| SyncError::Corrupt(e.to_string()))?;
-        let manifest =
-            Manifest::new(params, summary.size, FileHash::from_bytes(summary.file_hash), refs).map_err(|e| SyncError::Corrupt(e.to_string()))?;
-        self.transport.put_manifest(&manifest.id(), Bytes::from(manifest.encode())).await?;
+        // A file over the protocol's limits (too big, too many chunks) is the file's problem, not damaged data: it
+        // is skipped with the reason, and everything else keeps syncing.
+        let manifest = match Manifest::new(params, summary.size, FileHash::from_bytes(summary.file_hash), refs) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                report.skipped.push((path.to_string(), format!("can't be synced: {e}")));
+                return Ok(None);
+            }
+        };
+        let encoded = Bytes::from(manifest.encode());
+        match self.transport.put_manifest(&manifest.id(), encoded.clone()).await {
+            // The server lacks chunks it took (a proxy answered for it and lost them, say): exactly those go up once,
+            // and the manifest once more. A second refusal fails the pass, which is tried again later. The server lists
+            // at most `MAX_MISSING_IDS` of them, so a proxy that lost more converges over several passes.
+            Err(TransportError::MissingChunks(lost)) => {
+                let at: HashMap<ChunkId, (u64, usize)> = pieces.iter().map(|(id, offset, len)| (*id, (*offset, *len))).collect();
+                let mut sent = BTreeSet::new();
+                for id in lost {
+                    let Some((offset, len)) = at.get(&id) else {
+                        return Err(TransportError::Protocol(format!("the server asked for chunk {id}, which the manifest doesn't list")).into());
+                    };
+                    if sent.insert(id) && !self.send_chunk(path, &id, *offset, *len, report).await? {
+                        return Ok(None);
+                    }
+                }
+                self.transport.put_manifest(&manifest.id(), encoded).await?;
+            }
+            other => other?,
+        }
         report.uploaded.push(path.clone());
         let exec = if self.fs.has_exec_bit() { before.exec } else { base_exec };
         let version = NewVersion { id: VersionId::generate(), manifest: manifest.id(), mtime_ms: before.mtime_ms, exec };
         Ok(Some((version, summary.size, before, FileHash::from_bytes(summary.file_hash))))
+    }
+
+    /// Sends the chunk `id` of the file at `path` (`len` bytes at `offset`), read back and checked against its ID.
+    /// False when it can't be sent this pass: the file can't be read (reported as skipped), or it changed since it
+    /// was chunked (tried again next pass).
+    ///
+    /// Takes `&mut self` like the rest of a pass: its future then needs only `Engine: Send`, never `Sync`.
+    async fn send_chunk(&mut self, path: &RelPath, id: &ChunkId, offset: u64, len: usize, report: &mut Report) -> Result<bool, SyncError> {
+        let data = match self.fs.read_at(path, offset, len) {
+            Ok(data) => data,
+            Err(e) => {
+                report.skipped.push((path.to_string(), format!("can't be read: {e}")));
+                return Ok(false);
+            }
+        };
+        if data.len() != len || *blake3::hash(&data).as_bytes() != *id.as_bytes() {
+            return Ok(false);
+        }
+        self.transport.put_chunk(id, Bytes::from(data)).await?;
+        Ok(true)
     }
 
     /// A push finished: the links it saw (`links`) are known from now on, since anything a new one could be is held
@@ -631,8 +722,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                             keep
                         });
                         // Nothing to drop or fix: resubmitting would be refused the same way forever.
+                        // That is the server speaking out of turn (not damaged data): a protocol error.
                         if refused.is_empty() && fixable.is_empty() {
-                            return Err(SyncError::Corrupt("the server refused a batch without naming an operation in it".into()));
+                            return Err(TransportError::Protocol("the server refused a batch without naming an operation in it".into()).into());
                         }
                     }
                     Err(e) => return Err(e.into()),
@@ -705,19 +797,17 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     r.file = Some(file.clone());
                 }
                 let kind = self.base_file(&file, meta, hash);
-                if let Some(b) = self.state.base.get_mut(&id) {
-                    b.kind = kind;
-                }
+                self.state.base.update(&id, |b| b.kind = kind);
             }
             Effect::Move { id, parent, name, from, to } => {
                 if let Some(r) = self.state.remote.get_mut(&id) {
                     r.parent = Some(parent);
                     r.name = Some(name.clone());
                 }
-                if let Some(b) = self.state.base.get_mut(&id) {
+                self.state.base.update(&id, |b| {
                     b.parent = Some(parent);
                     b.name = Some(name);
-                }
+                });
                 report.moved_remotely.push((from, to));
             }
             Effect::Delete { id, path } => {
