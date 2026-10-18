@@ -9,6 +9,7 @@ pub mod api;
 pub mod conflict;
 pub mod hash;
 pub mod ids;
+pub mod join;
 pub mod limits;
 pub mod live;
 pub mod local;

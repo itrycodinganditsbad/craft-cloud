@@ -1,5 +1,6 @@
 //! Property tests: hostile input never panics, and what is accepted stays valid.
 
+use craft_cloud_proto::join::JoinString;
 use craft_cloud_proto::limits::MAX_CHUNKS_PER_MANIFEST;
 use craft_cloud_proto::{ChunkId, ChunkRef, ChunkerParamsId, ConflictStamp, FileHash, HexIdError, Manifest, ManifestError, Name, conflict_name};
 use proptest::prelude::*;
@@ -169,5 +170,15 @@ proptest! {
         let raw = format!("é{s}");
         prop_assert_eq!(raw.len(), 64);
         prop_assert_eq!(ChunkId::from_hex(&raw), Err(HexIdError::NotLowercaseHex { index: 0 }));
+    }
+
+    #[test]
+    fn any_join_string_is_parsed_without_panicking(raw in any::<String>(), shaped in "(https?://)?[a-zA-Z0-9.:/\\[\\] -]{0,40}/[0-9A-Za-z -]{0,24}/?") {
+        for text in [raw, shaped] {
+            if let Ok(join) = JoinString::parse(&text) {
+                prop_assert_eq!(JoinString::parse(&join.join()), Ok(join.clone()));
+                prop_assert_eq!(JoinString::parse(&join.link()), Ok(join));
+            }
+        }
     }
 }

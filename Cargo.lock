@@ -653,6 +653,7 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "caseless",
+ "getrandom 0.4.3",
  "postcard",
  "proptest",
  "serde",
