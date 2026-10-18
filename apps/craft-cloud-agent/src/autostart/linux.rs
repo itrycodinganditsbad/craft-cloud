@@ -176,7 +176,7 @@ mod tests {
     use super::*;
 
     fn launch(exe: &str) -> Launch {
-        Launch { exe: PathBuf::from(exe), data_dir: None }
+        Launch { exe: PathBuf::from(exe), log: None }
     }
 
     /// Every character systemd or the desktop spec treats specially comes out as itself once read back.
@@ -186,9 +186,6 @@ mod tests {
         assert_eq!(desktop_quoted(r#"/a b/c"d\e%f$g`h"#), r#""/a b/c\\"d\\\\e%%f\\$g\\`h""#);
         let line = unit(&launch("/opt/x/agent")).unwrap();
         assert!(line.contains("ExecStart=\"/opt/x/agent\" \"run\"\n"), "{line}");
-        let with_dir = Launch { exe: "/opt/x/agent".into(), data_dir: Some("/data/my agent".into()) };
-        assert!(unit(&with_dir).unwrap().contains(r#"ExecStart="/opt/x/agent" "run" "--data-dir" "/data/my agent""#));
-        assert!(desktop_entry(&with_dir).unwrap().contains(r#"Exec="/opt/x/agent" "run" "--data-dir" "/data/my agent""#));
         assert!(matches!(unit(&launch("/opt/x\nExecStart=/bin/evil")), Err(AutostartError::BadPath(_))), "no line breaks");
     }
 }

@@ -8,9 +8,10 @@
 //!   runs systemd, else `~/.config/autostart/craft-cloud-agent.desktop`. A unit of that name made by hand is adopted:
 //!   rewritten with this agent's path.
 //!
-//! Every entry runs `<agent> run`, with `--data-dir` when the agent's data folder isn't the default one (the login
-//! session doesn't have the shell's `CRAFT_CLOUD_AGENT_DIR`). Paths are quoted and escaped for each format, spaces and
-//! non-ASCII names included. Registering twice writes one entry; removing one that isn't there is fine.
+//! There is one entry per user, and it belongs to the agent with the default data folder ([`Roots::owns`]): it runs
+//! `<agent> run`. An agent with a data folder of its own (`CRAFT_CLOUD_AGENT_DIR`, `--data-dir`) never registers,
+//! replaces or removes it. Paths are quoted and escaped for each format, spaces and non-ASCII names included.
+//! Registering twice writes one entry; removing one that isn't there is fine.
 //!
 //! Where things go is a [`Roots`]: the home folder, the registry key and how commands run, so tests write into
 //! temporary places and record the commands instead of running them.
@@ -72,6 +73,8 @@ pub struct Roots {
     pub run_key: String,
     /// How `systemctl` runs (Linux).
     pub runner: Arc<dyn Runner>,
+    /// The default data folder: the entry belongs to the agent that uses it, and to no other.
+    pub default_data: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Roots {
@@ -87,26 +90,31 @@ impl Roots {
     /// This user's: the home folder from `HOME` (`USERPROFILE` on Windows), [`RUN_KEY`], commands run for real.
     pub fn for_user() -> Result<Self, AutostartError> {
         let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).filter(|p| p.is_absolute());
-        Ok(Self { home: home.ok_or(AutostartError::NoHome)?, run_key: RUN_KEY.to_owned(), runner: Arc::new(System) })
+        let default_data = craft_cloud_proto::local::default_data_dir(|name| std::env::var_os(name));
+        Ok(Self { home: home.ok_or(AutostartError::NoHome)?, run_key: RUN_KEY.to_owned(), runner: Arc::new(System), default_data })
+    }
+
+    /// Whether the entry belongs to an agent with data folder `data`: only to the one with the default data folder.
+    /// An agent run with `CRAFT_CLOUD_AGENT_DIR` or `--data-dir` elsewhere (a spare folder, a test) never registers,
+    /// replaces or removes it.
+    pub fn owns(&self, data: &Path) -> bool {
+        self.default_data.as_deref().is_some_and(|default| default == data)
     }
 }
 
-/// What the entry starts: `exe run`, with `--data-dir data_dir` if set.
+/// What the entry starts: `exe run`, with the default data folder (the only agent with an entry).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
     pub exe: PathBuf,
-    pub data_dir: Option<PathBuf>,
+    /// Where the service manager writes what the agent prints, where it keeps it itself (macOS: `run.log` in the
+    /// data folder). Windows' background build writes its own `run.log`; systemd keeps a journal.
+    pub log: Option<PathBuf>,
 }
 
 impl Launch {
-    /// The arguments after the program, as text: `run` and maybe `--data-dir <dir>`.
+    /// The arguments after the program, as text.
     pub(crate) fn args(&self) -> Result<Vec<String>, AutostartError> {
-        let mut args = vec!["run".to_owned()];
-        if let Some(dir) = &self.data_dir {
-            args.push("--data-dir".to_owned());
-            args.push(text(dir)?);
-        }
-        Ok(args)
+        Ok(vec!["run".to_owned()])
     }
 
     /// The program, as text.
@@ -123,14 +131,21 @@ pub(crate) fn text(path: &Path) -> Result<String, AutostartError> {
     }
 }
 
-/// The entry for this agent: its own program (on Windows the background build next to it), with the data folder
-/// `data` if that isn't the default one.
+/// The entry for this agent, whose data folder is `data` (the default one: see [`Roots::owns`]): its own program
+/// (on Windows the background build next to it), logging to `run.log` there.
 pub fn this_agent(data: &Path) -> Result<Launch, AutostartError> {
     let exe = std::env::current_exe().map_err(io_at(Path::new("this program")))?;
     let exe = if cfg!(windows) { windows::background_build(&exe)? } else { exe };
-    let default = craft_cloud_proto::local::default_data_dir(|name| std::env::var_os(name));
-    let data_dir = (default.as_deref() != Some(data)).then(|| data.to_owned());
-    Ok(Launch { exe, data_dir })
+    Ok(Launch { exe, log: Some(data.join(crate::runlog::LOG_FILE)) })
+}
+
+/// Why an agent with data folder `data` leaves the entry alone ([`Roots::owns`] is false).
+pub fn not_ours(data: &Path) -> String {
+    format!(
+        "this agent uses its own data folder ({}): only the agent with the default data folder starts at login, so its \
+         entry is left as it is",
+        data.display()
+    )
 }
 
 /// Registers `launch` to start at login, replacing an earlier entry of the agent's.

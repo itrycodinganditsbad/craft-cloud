@@ -81,7 +81,7 @@ mod tests {
     #[test]
     fn xml_special_characters_are_escaped() {
         assert_eq!(xml_escaped(r#"/A & B/<c>/"d"/'e'"#), "/A &amp; B/&lt;c&gt;/&quot;d&quot;/&apos;e&apos;");
-        let launch = Launch { exe: "/Apps/R&D <x>/agent".into(), data_dir: None };
+        let launch = Launch { exe: "/Apps/R&D <x>/agent".into(), log: None };
         assert!(plist(&launch).unwrap().contains("<string>/Apps/R&amp;D &lt;x&gt;/agent</string>"));
     }
 }

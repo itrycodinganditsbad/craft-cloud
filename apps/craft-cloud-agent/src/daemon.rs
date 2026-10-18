@@ -505,7 +505,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
         say(out, &format!("start at login can't be set from here: {e}"));
         None
     });
-    let control = Control::new(commands_tx).with_autostart(autostart_roots);
+    let control = Control::new(commands_tx).with_autostart(autostart_roots, data.path());
     control.refresh_autostart().await;
     let api = LocalApi::start(data, control.clone()).await?;
     say(out, &format!("craft-cloud-agent: local API on 127.0.0.1:{} (for apps and the launcher)", api.port()));

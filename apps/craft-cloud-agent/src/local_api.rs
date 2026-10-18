@@ -67,20 +67,28 @@ struct Shared {
 pub struct Control {
     shared: Arc<Mutex<Shared>>,
     commands: mpsc::Sender<Command>,
-    /// Where the start-at-login entry goes (`None`: `autostart` is refused).
+    /// Where the start-at-login entry goes (`None`: `autostart` is refused, with `autostart_refusal`).
     autostart: Option<Roots>,
+    autostart_refusal: String,
 }
 
 impl Control {
     /// A control for a loop that receives its commands from `commands`' other end.
     pub fn new(commands: mpsc::Sender<Command>) -> Self {
         let shared = Shared { account: None, run_state: RunState::SignedOut, online: false, hub: None, autostart: None };
-        Self { shared: Arc::new(Mutex::new(shared)), commands, autostart: None }
+        let autostart_refusal = "this agent doesn't handle starting at login here".to_owned();
+        Self { shared: Arc::new(Mutex::new(shared)), commands, autostart: None, autostart_refusal }
     }
 
-    /// The control with the start-at-login entry at `roots` (`None`: not handled).
-    pub fn with_autostart(mut self, roots: Option<Roots>) -> Self {
-        self.autostart = roots;
+    /// The control with the start-at-login entry at `roots`, for the agent with data folder `data`. The entry is
+    /// handled only by the agent it belongs to ([`Roots::owns`]); for any other, or with no roots, `autostart` is
+    /// refused and the status says nothing about it.
+    pub fn with_autostart(mut self, roots: Option<Roots>, data: &std::path::Path) -> Self {
+        match roots {
+            Some(roots) if roots.owns(data) => self.autostart = Some(roots),
+            Some(_) => self.autostart_refusal = autostart::not_ours(data),
+            None => {}
+        }
         self
     }
 
@@ -434,7 +442,7 @@ async fn set_autostart(State(state): State<Api>, body: Result<Json<AutostartRequ
     let roots = state
         .control
         .autostart_roots()
-        .ok_or_else(|| LocalError::new(StatusCode::NOT_IMPLEMENTED, codes::AUTOSTART_FAILED, "this agent doesn't handle starting at login here"))?;
+        .ok_or_else(|| LocalError::new(StatusCode::CONFLICT, codes::AUTOSTART_FAILED, state.control.autostart_refusal.clone()))?;
     let data = state.data.clone();
     let done = tokio::task::spawn_blocking(move || if on { set_on(&roots, &data) } else { autostart::unregister(&roots) }).await;
     state.control.refresh_autostart().await;

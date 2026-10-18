@@ -23,7 +23,7 @@ impl Runner for Recorder {
 
 fn roots(home: &Path, systemd: bool) -> (Roots, Arc<Recorder>) {
     let recorder = Arc::new(Recorder { systemd, calls: Mutex::new(Vec::new()) });
-    (Roots { home: home.to_owned(), run_key: String::new(), runner: recorder.clone() }, recorder)
+    (Roots { home: home.to_owned(), run_key: String::new(), runner: recorder.clone(), default_data: None }, recorder)
 }
 
 /// A golden file, with line endings as written (a checkout may have turned them into CRLF).
@@ -33,7 +33,7 @@ fn golden(name: &str) -> String {
 }
 
 fn launch(exe: &str) -> Launch {
-    Launch { exe: PathBuf::from(exe), data_dir: None }
+    Launch { exe: PathBuf::from(exe), log: None }
 }
 
 #[test]
@@ -45,8 +45,18 @@ fn each_os_gets_its_entry_with_the_path_quoted() {
     assert_eq!(macos::plist(&mac).unwrap(), golden("ch.craftcloud.agent.plist"));
     let win = launch(r"C:\Users\Zoë\AppData\Local\Programs\Craft Cloud\craft-cloud-agent-bg.exe");
     assert_eq!(windows::run_value(&win).unwrap(), golden("windows-run-value.txt").trim_end());
-    let with_dir = Launch { data_dir: Some(PathBuf::from(r"C:\Data\Zoë's agent")), ..win };
-    assert!(windows::run_value(&with_dir).unwrap().ends_with(r#"-bg.exe" run --data-dir "C:\Data\Zoë's agent""#));
+}
+
+/// The entry belongs to the agent with the default data folder only.
+#[test]
+fn the_entry_belongs_to_the_default_data_folder() {
+    let home = tempfile::tempdir().unwrap();
+    let mut roots = roots(home.path(), false).0;
+    roots.default_data = Some(PathBuf::from("/home/zoë/.local/share/craft-cloud-agent"));
+    assert!(roots.owns(Path::new("/home/zoë/.local/share/craft-cloud-agent")));
+    assert!(!roots.owns(Path::new("/home/zoë/spare")));
+    roots.default_data = None;
+    assert!(!roots.owns(Path::new("/home/zoë/.local/share/craft-cloud-agent")), "no default: nobody's");
 }
 
 #[test]

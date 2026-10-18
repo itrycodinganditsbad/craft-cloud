@@ -182,18 +182,66 @@ impl craft_cloud_agent::autostart::Runner for NoSystemd {
     }
 }
 
-/// Start at login is turned on through the local API (in a temporary home, and on Windows a throwaway registry key),
-/// the status says so, and signing out turns it off again.
+/// Test roots in `dir` (a temporary home, and on Windows a throwaway registry key, deleted with the guard), with
+/// `default_data` as the default data folder.
+fn test_roots(dir: &Path, default_data: &Path) -> (&'static craft_cloud_agent::autostart::Roots, RegistryKey) {
+    let key = format!(r"Software\Craft Cloud Test\{}", uuid::Uuid::now_v7());
+    let roots = craft_cloud_agent::autostart::Roots {
+        home: dir.join("home"),
+        run_key: key.clone(),
+        runner: std::sync::Arc::new(NoSystemd),
+        default_data: Some(default_data.to_owned()),
+    };
+    (Box::leak(Box::new(roots)), RegistryKey(key))
+}
+
+/// Deletes a test's throwaway registry key (Windows).
+struct RegistryKey(#[allow(dead_code)] String);
+
+impl Drop for RegistryKey {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        let _ = windows_registry::CURRENT_USER.remove_tree(&self.0);
+    }
+}
+
+/// An agent with its own data folder (not the default one) never touches the start-at-login entry, which belongs to
+/// the agent with the default data folder: it says nothing about it, refuses to set it, and signing out leaves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_with_its_own_data_folder_leaves_start_at_login_alone() {
+    use craft_cloud_agent::autostart::{Launch, Target, is_registered, register};
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("spare"));
+    let folder: PathBuf = dir.path().join("Spare folder");
+    let (roots, _key) = test_roots(dir.path(), &dir.path().join("default data"));
+    // The main agent's entry.
+    let main = Launch { exe: dir.path().join("craft-cloud-agent-bg.exe"), log: None };
+    register(roots, &main).unwrap();
+    let running = Running::start_with(&data, RunOptions { autostart: Target::At(roots), ..quick() });
+    let api = api_file(data.path()).await;
+    assert_eq!(status(&api).autostart, None, "not this agent's to tell");
+    let (code, body) = call(&api, "POST", "/v1/login", &login_body(&server, &folder, PASSWORD, false));
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = call(&api, "POST", "/v1/autostart", r#"{"on":true}"#);
+    assert_eq!(error_code(&body), codes::AUTOSTART_FAILED, "{code} {body}");
+    assert!(body.contains("default data folder"), "{body}");
+    let (code, body) = call(&api, "POST", "/v1/logout", "{}");
+    assert_eq!(code, 200, "{body}");
+    assert!(is_registered(roots).unwrap(), "the main agent's entry stays");
+    let _ = running.stop().await;
+}
+
+/// Start at login is turned on through the local API by the agent with the default data folder (in temporary
+/// places), the status says so, and signing out turns it off again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn autostart_is_turned_on_through_the_local_api_and_off_at_sign_out() {
-    use craft_cloud_agent::autostart::{Roots, Target, is_registered};
+    use craft_cloud_agent::autostart::{Target, is_registered};
     let server = server().await;
     let dir = tempfile::tempdir().unwrap();
     let data = DataDir::new(dir.path().join("data"));
     let folder: PathBuf = dir.path().join("Craft Cloud");
-    let key = format!(r"Software\Craft Cloud Test\{}", uuid::Uuid::now_v7());
-    let roots: &'static Roots =
-        Box::leak(Box::new(Roots { home: dir.path().join("home"), run_key: key.clone(), runner: std::sync::Arc::new(NoSystemd) }));
+    let (roots, _key) = test_roots(dir.path(), data.path());
     let running = Running::start_with(&data, RunOptions { autostart: Target::At(roots), ..quick() });
     let api = api_file(data.path()).await;
     assert_eq!(status(&api).autostart, Some(false));
@@ -211,14 +259,17 @@ async fn autostart_is_turned_on_through_the_local_api_and_off_at_sign_out() {
     assert_eq!(code, 200, "{body}");
     assert_eq!(serde_json::from_str::<Status>(&body).unwrap().autostart, Some(true));
     assert!(is_registered(roots).unwrap());
-    // The data folder isn't the default one, so the entry names it.
+    // It runs the agent as it is, with the default data folder; on macOS launchd writes its output to run.log there.
     let entry = if cfg!(target_vendor = "apple") {
         craft_cloud_agent::autostart::macos::plist_file(roots)
     } else {
         craft_cloud_agent::autostart::linux::desktop_file(roots)
     };
     let written = std::fs::read_to_string(entry).unwrap();
-    assert!(written.contains("--data-dir") && written.contains(&data.path().display().to_string()), "{written}");
+    assert!(!written.contains("--data-dir"), "{written}");
+    if cfg!(target_vendor = "apple") {
+        assert!(written.contains(&data.path().join("run.log").display().to_string()), "{written}");
+    }
 
     let (code, body) = call(&api, "POST", "/v1/logout", "{}");
     assert_eq!(code, 200, "{body}");

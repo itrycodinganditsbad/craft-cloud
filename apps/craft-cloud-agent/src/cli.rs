@@ -380,7 +380,9 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
             match logout(&data, local, out).await {
                 // Signed out here: the agent no longer starts at login (a running agent does this itself).
                 Ok(()) => {
-                    let off = crate::autostart::Roots::for_user().and_then(|roots| crate::autostart::unregister(&roots));
+                    // Only the agent with the default data folder has the entry; another leaves it alone.
+                    let off = crate::autostart::Roots::for_user()
+                        .and_then(|roots| if roots.owns(data.path()) { crate::autostart::unregister(&roots) } else { Ok(()) });
                     if let Err(e) = off {
                         say!(out, "the start-at-login entry couldn't be removed ({e}); `craft-cloud-agent autostart off` tries again")?;
                     }
@@ -422,7 +424,10 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
                 }
             }
             // The join stands whatever happens here; a failure is said.
+            // An agent with a data folder of its own has no start-at-login entry: `--autostart` is passed over then.
+            let ours = crate::autostart::Roots::for_user().is_ok_and(|roots| roots.owns(data.path()));
             if args.autostart
+                && ours
                 && let Err(e) = set_autostart(&data, true, out).await
             {
                 say!(out, "joined, but this computer won't start syncing by itself after a restart: {e}")?;
@@ -486,6 +491,9 @@ async fn set_autostart(data: &DataDir, on: bool, out: &mut impl Write) -> Result
         }
         Err(AgentError::Local(craft_cloud_app::Error::NotRunning(_))) => {
             let roots = crate::autostart::Roots::for_user().map_err(autostart_error)?;
+            if !roots.owns(data.path()) {
+                return Err(AgentError::Usage(crate::autostart::not_ours(data.path())));
+            }
             let data = data.path().to_owned();
             tokio::task::spawn_blocking(move || if on { crate::local_api::set_on(&roots, &data) } else { crate::autostart::unregister(&roots) })
                 .await

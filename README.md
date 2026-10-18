@@ -245,7 +245,9 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
   console window, which writes to `run.log` in the agent's data folder (rotated at 10 MiB); on macOS
   `~/Library/LaunchAgents/ch.craftcloud.agent.plist`; on Linux the systemd user unit `craft-cloud-agent.service`
   (a unit of that name made by hand is taken over), or `~/.config/autostart/craft-cloud-agent.desktop` without
-  systemd. `status` through the agent's local API says whether it is on.
+  systemd. `status` through the agent's local API says whether it is on. The entry belongs to the agent with the
+  default data folder: one run with `--data-dir` or `CRAFT_CLOUD_AGENT_DIR` elsewhere (a spare folder) never sets,
+  replaces or removes it.
 - To sync a folder that already has files, add `--adopt` to `login`.
 - `sync` exits 0 when done; 1 when it failed and can simply run again (offline, server busy); 2 when
   deletions wait for approval (`sync --approve-deletes` releases exactly the ones it listed); 3 when it

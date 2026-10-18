@@ -29,7 +29,9 @@ per app connection for live sessions. `run` serves it while signed out too. Call
 - `POST /v1/quit` → status: the agent finishes the pass under way and exits (the answer goes out first);
 - `POST /v1/autostart {on}` → status: the agent registers or removes its own start-at-login entry (the Windows `Run`
   value for the background build, a macOS launch agent, a systemd user unit or an XDG autostart entry), and
-  `status.autostart` says whether it is on (absent where the agent doesn't handle it). Signing out turns it off;
+  `status.autostart` says whether it is on (absent where the agent doesn't handle it). Signing out turns it off. The
+  entry belongs to the agent with the default data folder only; an agent with a data folder of its own is refused
+  (`autostart_failed`), reports nothing and leaves the entry alone when it signs out;
 - `GET /v1/status` → `{api, signed_in, account, server, folder, machine, online, run_state, autostart?}`;
 - `GET /v1/recents` (WebSocket: subscribe per app, add an entry `{path, title?, saved}`, receive the list on change);
 - later: `open` (a path → its live document, created by import when absent; returns the state and then a stream
