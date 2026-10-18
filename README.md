@@ -181,6 +181,16 @@ file sizes come later, with history.
 To add accounts: `printf '%s\n' 'their password' | craft-cloud-server user --config cc-data/config.toml add name`.
 `--config` can come before or after `add`.
 
+Or invite someone, with no password to hand over: `craft-cloud-server user --config cc-data/config.toml invite name`
+prints a join string (`cloud.example.org/ABCD-EFGH-JKMN-PQRS`) and its link, good once for 7 days, to enter on their
+first computer (`craft-cloud-agent join …`). It makes the account if there is none; they choose its password when
+they join. For an account that exists, the invite just adds a computer, without its password. Set
+`public_url = "https://cloud.example.org"` (the address computers reach the server at) at the top of `config.toml`
+to have the whole join string printed; without it, `invite` prints the code and you put the address in front. A new
+invite replaces the old one, and `user invite --revoke name` ends it. Every later computer joins with a code from one
+that is signed in (`craft-cloud-agent add-computer`, below). Codes that don't work are refused alike (wrong,
+expired or used), and an address that tries ten in a minute is held off for the rest of it.
+
 ### Restoring a backup
 
 With the server stopped, restore the database and the chunk storage from the backup, then run

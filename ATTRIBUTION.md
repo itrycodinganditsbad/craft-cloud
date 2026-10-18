@@ -9,3 +9,4 @@ next to them.
 | Path | Title | Author | Source | License |
 |---|---|---|---|---|
 | `apps/craft-cloud-agent/tests/tls/localhost.cert.der`, `localhost.key.der` | Self-signed test certificate for `localhost` and its key (tests only, never trusted outside the TLS test) | Craft Cloud contributors | Made with `openssl req -x509` for this repository | MIT OR Apache-2.0 |
+| `apps/craft-cloud-agent/tests/autostart/*` | Expected start-at-login entries per OS (golden files for the autostart tests) | Craft Cloud contributors | Written for this repository | MIT OR Apache-2.0 |

@@ -578,6 +578,29 @@ changes locally, then pushes local changes. These rules came out of the simulati
   database (not a supported setup) would each count their own, so twice the sign-in attempts and twice the writes.
 - **Setup**: `craft-cloud-server init` writes the config, creates the data directory and the first admin.
   Solo use is that one admin account and nothing more.
+- **Join codes**: a machine can also get its device token with a code instead of a password. Codes are Crockford
+  base32 (`0-9` and letters without I, L, O, U; on input case is ignored, O reads as 0, I and L as 1, dashes and spaces
+  are dropped), shown in groups of four (`K7M4-Q9TX`), and stored only as their BLAKE3 hash (migration 0004:
+  `invites (user_id, code_hash, expires_ms)` and `pairings (id, user_id, device_id, code_hash, expires_ms, used_by)`;
+  expired rows are deleted on the next write to their table). What a person types is the server plus the code,
+  `cloud.example.com/K7M4-Q9TX` (`https://` assumed), or the link `https://cloud.example.com/join/K7M4-Q9TX`.
+  - An **add-a-computer code** (pairing) comes from a signed-in device: 8 characters (40 bits), 10 minutes, one use,
+    one open per device (a new one replaces it). It dies with its device: revoking or signing out that device
+    deletes it. The device polls it: waiting, used (with the new device's name) or expired.
+  - An **invite** comes from the admin (`user invite <name>`): 16 characters (80 bits), 7 days, one use, one per
+    account (a new one replaces it; `user invite --revoke` ends it). If the account doesn't exist it is created
+    with no password (`password_hash = ''`, which no password matches); redeeming the invite then needs a new
+    password, set in the transaction that creates the device. For an account with a password, nothing is asked.
+  - **Redeeming** (`POST /join`) is one transaction: a conditional `DELETE … RETURNING` of the invite or
+    `UPDATE … WHERE used_by IS NULL … RETURNING` of the pairing, then the new device, so of two redeems of one code
+    at the same moment one gets the device and the other `invalid_code`, on SQLite and Postgres. A wrong, expired,
+    used or malformed code, or a pairing whose device has signed out, is the same `404 invalid_code`, never saying
+    which. Failed redeems are limited to 10 a minute per client address (behind trusted proxies as sign-ins are),
+    then `429 rate_limited`, even for a code that works; a success, `password_required` and `weak_password` (only
+    answered for a real, unused invite) don't count. With that limit, 40 bits and 10 minutes, a guess succeeds with
+    odds below one in 10⁹.
+  - `GET /join/{code}` (outside `/api`) is the plain page a link opens in a browser: the same text whatever the
+    code, which it never looks up.
 - **Stored-bytes cap** (M3c): `stored_bytes_per_user` in the config, off by default and refused at load when
   under one chunk (4 MiB), caps what one account
   stores: the stored size of every chunk and manifest it uploaded, each counted once (an account is one space,
@@ -607,8 +630,10 @@ changes locally, then pushes local changes. These rules came out of the simulati
   admins who back up the bucket themselves (bucket versioning or replication); GC must stay paused until
   that bucket backup is done, or the admin keeps the bucket's own deleted-object retention longer than the
   GC grace. **Restore** sets a new epoch for every space.
-- **Admin CLI**: `init`, `serve`, `user add|reset-password`, `device list|revoke` and `reset-epoch` exist; `user
-  remove|quota`, `gc`, `verify` (re-hash every chunk), `backup <dir>` and `restore <dir>` come with M4.
+- **Admin CLI**: `init`, `serve`, `user add|reset-password|invite [--revoke]`, `device list|revoke` and `reset-epoch`
+  exist; `user remove|quota`, `gc`, `verify` (re-hash every chunk), `backup <dir>` and `restore <dir>` come with M4.
+  `user invite` prints the join string and link when `public_url` is in the config, else the code and how to finish
+  it; it logs that an invite was made (the username at debug only, never the code).
 - No web UI in v1. No telemetry, no update check.
 
 API (`/api/v1`, JSON except chunk and manifest bodies; every signed-in response carries the space's epoch in
@@ -616,7 +641,7 @@ the `craft-epoch` header, and commits/tree/changes carry it in the body too). Er
 `{error, message, conflicts?, missing?, quota?}` with stable codes (`conflict` 409, `missing_chunks` 409,
 `resync_required` 410, `unauthorized` 401, `rate_limited` 429, `invalid` 400, `not_found` 404, `too_large` 413,
 `timeout` 408, `quota_exceeded` 507,
-`username_taken` 409, `internal` 500; the codes are constants in `craft-cloud-proto::api::codes`). Unknown routes and
+`username_taken` 409, `invalid_code` 404, `password_required` 400, `weak_password` 400, `internal` 500; the codes are constants in `craft-cloud-proto::api::codes`). Unknown routes and
 methods answer `not_found` / `invalid` (405) the same way:
 
 | Call | Purpose |
@@ -632,6 +657,9 @@ methods answer `not_found` / `invalid` (405) the same way:
 | `POST /commit` | batch of version/mkdir/move/delete operations, one transaction; `409 conflict` listing every conflicting operation (a version whose manifest isn't uploaded is a `missing_manifest` conflict) |
 | `GET /nodes/{id}/history` / `POST /nodes/{id}/restore` | list versions / make an old one current (M4) |
 | `GET /devices`, `DELETE /devices/{id}` | your devices |
+| `POST /pairings` | a new add-a-computer code from this device → `{id, code, expires_ms}` (the code shown once, normalised) |
+| `GET /pairings/{id}`, `DELETE /pairings/{id}` | one of your pairings: `{state: waiting\|used\|expired, device_name?}` / cancel it (204) |
+| `POST /join` | code + device name (+ password for an invite to a new account) → device ID + token, as a sign-in (no auth); `invalid_code`, `password_required`, `weak_password`, `rate_limited` |
 
 **Client contract** (what the sync agent relies on):
 
