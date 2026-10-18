@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use craft_cloud_meta::{Meta, Role, valid_username};
 use craft_cloud_proto::DeviceId;
+use craft_cloud_proto::join::{Code, INVITE_CHARS, INVITE_TTL_MS, JoinString};
 use craft_cloud_store::Store;
 use craft_cloud_store::disk::DiskBackend;
 use craft_cloud_store::s3::S3Backend;
@@ -103,6 +104,15 @@ pub enum UserAction {
     },
     /// Set a new password, read from standard input.
     ResetPassword { username: String },
+    /// Print an invite code for an account, good once for 7 days, to join a computer with in Craft Cloud. Creates the
+    /// account (without a password, chosen when the invite is redeemed) if there is none, and replaces its earlier
+    /// invite.
+    Invite {
+        username: String,
+        /// Revoke the account's invite instead.
+        #[arg(long)]
+        revoke: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -168,8 +178,16 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
         }
         Command::Serve { .. } => Err(CliError::Usage("serve is run by main".into())),
         Command::User { config, action } => {
-            let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
+            let config = Config::load(&config_path(config)?)?;
+            let (meta, _) = open(&config).await?;
             match action {
+                UserAction::Invite { username, revoke: true } => {
+                    if !meta.revoke_invite(&username).await? {
+                        return Err(CliError::Usage(format!("{username} has no open invite")));
+                    }
+                    writeln!(out, "revoked the invite for {}", username.to_ascii_lowercase())?;
+                }
+                UserAction::Invite { username, revoke: false } => invite(&meta, &config, &username, out).await?,
                 UserAction::Add { username, admin } => {
                     let password = read_password(input)?;
                     let role = if admin { Role::Admin } else { Role::Member };
@@ -231,6 +249,39 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
             Ok(())
         }
     }
+}
+
+/// `user invite`: makes the invite and prints how to use it. The code is printed only here, never logged.
+async fn invite(meta: &Meta, config: &Config, username: &str, out: &mut impl Write) -> Result<(), CliError> {
+    let code = Code::generate(INVITE_CHARS).map_err(|e| CliError::Usage(format!("the system random source failed: {e}")))?;
+    let made = meta.create_invite(username, &code.hash(), now_ms(), INVITE_TTL_MS).await?;
+    // The username is the only personal identifier here: kept to debug, as a sign-in's is.
+    tracing::debug!(user = %username.to_ascii_lowercase(), "invite created for");
+    tracing::info!("invite created");
+    let username = username.to_ascii_lowercase();
+    if made.new_account {
+        writeln!(out, "Invite for {username}, a new account: a password is chosen when the invite is used.")?;
+    } else {
+        writeln!(out, "Invite for {username}: it adds a computer to the account, without asking for its password.")?;
+    }
+    match &config.public_url {
+        Some(server) => {
+            let join = JoinString::new(server.clone(), code);
+            writeln!(out, "Join string: {}", join.join())?;
+            writeln!(out, "Link: {}", join.link())?;
+            writeln!(out, "Enter it in Craft Cloud on the new computer. It works once, for 7 days.")?;
+        }
+        None => {
+            writeln!(out, "Code: {}", code.display())?;
+            writeln!(
+                out,
+                "Put the server's address in front of it, like cloud.example.com/{}, and enter that in Craft Cloud on the new \
+                 computer. It works once, for 7 days. Set public_url in config.toml to have the whole join string printed.",
+                code.display()
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Creates a data directory. Every check that needs no disk access runs first, so a refused `init` leaves

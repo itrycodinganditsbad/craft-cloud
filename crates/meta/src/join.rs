@@ -25,7 +25,8 @@ use crate::{Meta, MetaError, Role, UserId, valid_username};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InviteFor {
     pub user: UserId,
-    /// The invite created the account (with no password, set when the invite is redeemed).
+    /// The account is new: an invite created it (this one or an earlier one) and it has no password yet, so the
+    /// invite is redeemed with a new password.
     pub new_account: bool,
 }
 
@@ -47,9 +48,9 @@ impl Meta {
         let expires_ms = now_ms.checked_add(ttl_ms).ok_or(MetaError::Invalid("the invite's lifetime is too long"))?;
         let mut w = self.begin_write().await?;
         sqlx::query("DELETE FROM invites WHERE expires_ms <= $1").bind(now_ms).execute(&mut *w.tx).await?;
-        let found = sqlx::query("SELECT id FROM users WHERE username = $1").bind(username.as_str()).fetch_optional(&mut *w.tx).await?;
+        let found = sqlx::query("SELECT id, password_hash FROM users WHERE username = $1").bind(username.as_str()).fetch_optional(&mut *w.tx).await?;
         let (user, new_account) = match found {
-            Some(row) => (UserId(uuid_from(&row.try_get::<Vec<u8>, _>("id")?)?), false),
+            Some(row) => (UserId(uuid_from(&row.try_get::<Vec<u8>, _>("id")?)?), row.try_get::<String, _>("password_hash")?.is_empty()),
             None => {
                 let ids = (UserId(Uuid::now_v7()), SpaceId::generate(), NodeId::generate());
                 (insert_user(&mut w.tx, &username, "", Role::Member, now_ms, ids).await?.id, true)

@@ -1116,7 +1116,7 @@ async fn a_replaced_invite_s_old_code_fails(meta: &Meta) {
     assert!(made.new_account);
     let second = code(INVITE_CHARS);
     let again = meta.create_invite("ana", &second.hash(), NOW + 1, INVITE_TTL_MS).await.unwrap();
-    assert_eq!(again, InviteFor { user: made.user, new_account: false }, "the same account, found by its lowercase name");
+    assert_eq!(again, InviteFor { user: made.user, new_account: true }, "the same account, found by its lowercase name, still new");
     assert!(matches!(meta.redeem(&first.hash(), "pc", &token(), Some("$argon2id$x"), NOW + 2).await, Err(MetaError::InvalidCode)));
     meta.redeem(&second.hash(), "pc", &token(), Some("$argon2id$x"), NOW + 2).await.unwrap();
     assert!(matches!(meta.create_invite("bad name", &code(INVITE_CHARS).hash(), NOW, INVITE_TTL_MS).await, Err(MetaError::Invalid(_))));
