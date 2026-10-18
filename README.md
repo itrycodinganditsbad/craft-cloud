@@ -3,21 +3,30 @@
 Self-hosted sync and storage for the Craft App Suite (PhotoCraft, LightCraft, FilmCraft, DesignCraft,
 VectorCraft, PdfCraft, EffectCraft, WordCraft, DeckCraft, GridCraft, CADCraft, SoundCraft), in pure Rust.
 
-You run the server on your own computer, NAS or VPS. A folder on each of your machines then stays in sync
-through it: project files, app settings, brushes, fonts, presets and other asset libraries, with version
-history. It works for one person with a laptop and a desktop, and for a small studio with many accounts.
+You run the server on your own computer, NAS or VPS. Sign in once on each machine, and every Craft app
+knows your account: a document you create on one machine shows up in that app's recent files on the
+others, and a document open on two machines shows each edit on the other as you type. Underneath, a
+folder on each machine stays in sync with version history, so the files themselves (projects, settings,
+brushes, fonts, presets) are on every machine too. It works for one person with a laptop and a desktop,
+and for a small studio with many accounts.
 
 There is no hosted service and no account with anyone but you. Nothing phones home.
 
-> **Status: early development.** The server, the sync engine and the agent work: two machines keep a
-> folder in step with `craft-cloud-agent run` (or one pass at a time with `sync`). See
-> [Where things stand](#where-things-stand). The full design is in [`docs/design/sync.md`](docs/design/sync.md).
+> **Status: early development.** File sync works: the server, the sync engine and the agent keep a
+> folder in step across machines. Sign-in, shared recent files and live documents are being built now.
+> See [Where things stand](#where-things-stand). The designs are in [`docs/design/`](docs/design/).
 
 ## What it will do
 
-- **One synced folder per machine.** The Craft apps keep saving plain files to disk, as they do today. A
-  small background agent watches the folder and syncs it with your server. No app needs a plugin, and
-  everything keeps working offline.
+- **One sign-in, every app.** You sign in once in the launcher; every Craft app on that machine then uses
+  your account. Apps never see your password.
+- **Recent files follow you.** Create or open a document on one machine, and it is in that app's recent
+  files on your other machines right away.
+- **Live documents.** An edit on one machine appears in the same open document on the others as you type,
+  without reopening it. Edits made offline merge when the machine is back.
+- **Still plain files.** The Craft apps keep saving normal files (`.docx`, `.xlsx`, …) into the synced
+  folder, so other tools, backups and machines without the apps still see real files. Everything keeps
+  working offline.
 - **Big files sync quickly.** Files are split into content-defined chunks (FastCDC, about 1 MiB on
   average). When you change part of a 20 GB video project, only the chunks that changed are uploaded.
   Identical chunks are stored once, and an interrupted upload resumes where it stopped.
@@ -52,8 +61,8 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
 - **The agent** runs on each machine. It uploads what changed in the synced folder, applies what other
   machines changed, and keeps its own small state file. `craft-cloud-agent run` keeps the folder in step
   on its own (it watches the folder and the server); `craft-cloud-agent sync` runs one pass by hand.
-- **The launcher** will be the user interface: sign-in, sync status, history and restore, the conflict
-  list. It talks to the agent over a documented local API and doesn't link any Craft Cloud code.
+- **The launcher** will be where you sign in and see sync status, history and conflicts. It and the Craft
+  apps talk only to the agent on their machine, over a local API, never to the server directly.
 
 ### The workspace
 
@@ -69,21 +78,14 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
 
 ## Where things stand
 
-| Milestone | What | State |
-|---|---|---|
-| M0 | Repository, conventions, CI on Ubuntu and Windows | done |
-| M1 | Protocol types and the chunker | done |
-| M2 | The server: login, devices, chunk upload, batch commit, change feed, backup epochs; SQLite or Postgres, disk or S3 | done |
-| M3a | The sync engine and its simulation | done |
-| M3b1 | The agent, first cut: syncs a real folder over HTTPS when you run `craft-cloud-agent sync`; two machines sync one folder | done |
-| M3b2a | Hardening: downloads land atomically and never over a save you just made, crash recovery, files held open or read-only on Windows | done |
-| M3b2b1 | The agent on its own: `run` watches the folder and the server, waits for files to settle, retries with backoff | done |
-| M3b2b2 | A simulated network (partitions, delays, dropped connections) in the simulation | done |
-| M3c | Fixes from a full review: per-account upload limits and storage cap, big libraries sync in linear time, a file too big is skipped instead of stopping the agent | done |
-| M4 | History, restore, trash, cleanup of old versions, garbage collection, per-user quotas, server backup and restore | next |
-| M5 | Selective sync, large-media polish, `.craftignore` | planned |
-| M6 | Packaging: release binaries, Docker image, systemd unit, built-in TLS, a self-hosting guide | planned |
-| M7 | The local control API and launcher integration | planned |
+| What | State |
+|---|---|
+| File sync: the server (SQLite or Postgres, disk or S3), the sync engine, and the agent keeping a folder in step on Linux and Windows | works |
+| Sign-in in the launcher and recent files shared across machines | in progress |
+| Live documents: open documents update as you type on another machine | next |
+| WordCraft live, then the other Craft apps one by one | planned |
+| History, restore, trash, quotas, server backup | planned |
+| Release binaries, Docker image, built-in TLS, a self-hosting guide; selective sync | later |
 
 ### The sync engine
 
