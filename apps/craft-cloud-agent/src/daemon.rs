@@ -173,6 +173,10 @@ fn pass_thread(data: DataDir, stability: Stability, requests: std::sync::mpsc::R
     }
 }
 
+/// The longest the loop waits for the live hub to take a pause or resume (the hub gives up closing its connection
+/// after [`crate::live::hub::CLOSE_TIMEOUT`]).
+const HUB_ANSWER: Duration = Duration::from_secs(10);
+
 /// What the loop says when syncing is paused by the user.
 const PAUSED: &str = "paused: nothing syncs until `craft-cloud-agent resume` (recents still work on this computer)";
 
@@ -811,7 +815,8 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                             }
                             watching.watcher = None;
                             if let Some(hub) = &hub {
-                                let _ = hub.handle().set_paused(true).await;
+                                // Bounded: a hub that doesn't answer never holds up the loop (its stop, quit, beats).
+                                let _ = tokio::time::timeout(HUB_ANSWER, hub.handle().set_paused(true)).await;
                             }
                             if pass_running {
                                 paused_unsaved = true;
@@ -834,7 +839,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                             }
                             poll = Some(start_poll());
                             if let Some(hub) = &hub {
-                                let _ = hub.handle().set_paused(false).await;
+                                let _ = tokio::time::timeout(HUB_ANSWER, hub.handle().set_paused(false)).await;
                             }
                             // What changed meanwhile is found by a full pass now.
                             scheduler.urgent_change();

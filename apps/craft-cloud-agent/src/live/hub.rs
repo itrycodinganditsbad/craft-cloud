@@ -362,7 +362,7 @@ async fn run(
         tokio::select! {
             _ = &mut stop => {
                 if let Some(mut socket) = state.socket.take() {
-                    let _ = socket.close(None).await;
+                    close_within(&mut socket, CLOSE_TIMEOUT).await;
                 }
                 return;
             }
@@ -374,7 +374,7 @@ async fn run(
                             task.abort();
                         }
                         if let Some(mut socket) = state.socket.take() {
-                            let _ = socket.close(None).await;
+                            close_within(&mut socket, CLOSE_TIMEOUT).await;
                         }
                         state.replica.disconnected();
                         // Offline before the caller hears it, so the status it reads next says so.
@@ -423,7 +423,7 @@ async fn run(
                     }
                     Err(e) => {
                         if let Some(mut socket) = state.socket.take() {
-                            let _ = socket.close(None).await;
+                            close_within(&mut socket, CLOSE_TIMEOUT).await;
                         }
                         state.drop_socket();
                         state.back_off(None);
@@ -450,5 +450,49 @@ async fn run(
             () = tokio::time::sleep_until(retry_at), if !up && dialing.is_none() && !state.paused => {}
         }
         state.settle();
+    }
+}
+
+/// How long closing the live connection may take before it is simply dropped.
+pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Closes the live connection, waiting at most `limit`: on a half-open connection with a full send buffer (a laptop
+/// that just changed networks) the close frame may never go out, and the hub must not hang on it. The connection is
+/// dropped by the caller either way.
+pub async fn close_within<S: futures_util::Sink<Message> + Unpin>(socket: &mut S, limit: Duration) {
+    let _ = tokio::time::timeout(limit, socket.close()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A connection whose close never completes.
+    struct Stuck;
+
+    impl futures_util::Sink<Message> for Stuck {
+        type Error = std::io::Error;
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn a_close_that_never_completes_is_given_up_on() {
+        let started = std::time::Instant::now();
+        let closed = tokio::time::timeout(Duration::from_secs(3), close_within(&mut Stuck, Duration::from_millis(200))).await;
+        assert!(closed.is_ok(), "the close hung");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
