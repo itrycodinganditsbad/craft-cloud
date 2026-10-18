@@ -67,6 +67,31 @@ async fn reset_epoch_all_resets_every_space() {
     }
 }
 
+/// `live reset-doc` empties a full recents document, which takes appends again.
+#[tokio::test]
+async fn live_reset_doc_empties_a_full_document() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config_path = dir.join("config.toml");
+    let c = config_path.to_str().unwrap();
+    let (meta, _) = craft_cloud_server::cli::open(&Config::load(&config_path).unwrap()).await.unwrap();
+    let meta = meta.with_live_doc_cap(10);
+    let ana = meta.user_by_name("ana").await.unwrap().unwrap();
+    let device = meta.create_device(ana.id, "pc", &[3; 32], 0).await.unwrap();
+    let app = craft_cloud_proto::live::AppName::new("wordcraft").unwrap();
+    let doc = craft_cloud_proto::live::recents_doc(ana.space, &app);
+    meta.create_live_doc(ana.space, doc, "recents:wordcraft", None, 0).await.unwrap();
+    meta.append_live_update(ana.space, doc, device, 1, &[1; 20], 0).await.unwrap();
+    assert!(meta.append_live_update(ana.space, doc, device, 2, &[2], 0).await.is_err(), "full");
+    let out = cli(&["live", "--config", c, "reset-doc", "ana", "wordcraft"], "").await.unwrap();
+    assert!(out.contains("emptied the wordcraft recents of ana"), "{out}");
+    assert_eq!(meta.live_doc(ana.space, doc).await.unwrap().unwrap().head, 0);
+    assert_eq!(meta.append_live_update(ana.space, doc, device, 2, &[2], 0).await.unwrap(), 1, "open again");
+    assert!(cli(&["live", "--config", c, "reset-doc", "ana", "Bad App"], "").await.is_err());
+    assert!(matches!(cli(&["live", "--config", c, "reset-doc", "nobody", "wordcraft"], "").await, Err(CliError::Usage(_))));
+}
+
 #[tokio::test]
 async fn init_validates_first_and_leaves_nothing_behind_on_failure() {
     let parent = tempfile::tempdir().unwrap();

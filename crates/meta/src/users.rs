@@ -86,14 +86,36 @@ pub fn valid_username(name: &str) -> bool {
 impl Meta {
     /// Creates a user with their own space and its root directory.
     pub async fn create_user(&self, username: &str, password_hash: &str, role: Role, now_ms: i64) -> Result<UserRecord, MetaError> {
+        self.create_user_as(username, password_hash, role, now_ms, (UserId(Uuid::now_v7()), SpaceId::generate(), NodeId::generate())).await
+    }
+
+    /// [`Meta::create_user`] with the user's, space's and root's IDs given, so a simulation's seed replays exactly (the
+    /// IDs of an app's recents documents derive from the space). A test seam (the `test-support` feature).
+    #[cfg(feature = "test-support")]
+    pub async fn create_user_with_ids(
+        &self,
+        username: &str,
+        password_hash: &str,
+        role: Role,
+        now_ms: i64,
+        ids: (UserId, SpaceId, NodeId),
+    ) -> Result<UserRecord, MetaError> {
+        self.create_user_as(username, password_hash, role, now_ms, ids).await
+    }
+
+    async fn create_user_as(
+        &self,
+        username: &str,
+        password_hash: &str,
+        role: Role,
+        now_ms: i64,
+        (user, space, root): (UserId, SpaceId, NodeId),
+    ) -> Result<UserRecord, MetaError> {
         if !valid_username(username) {
             return Err(MetaError::Invalid("usernames are 1-64 letters, digits, '.', '_' or '-'"));
         }
         let username = username.to_ascii_lowercase();
         let username = username.as_str();
-        let user = UserId(Uuid::now_v7());
-        let space = SpaceId::generate();
-        let root = NodeId::generate();
         let mut w = self.begin_write().await?;
         let taken = sqlx::query("SELECT 1 FROM users WHERE username = $1").bind(username).fetch_optional(&mut *w.tx).await?;
         if taken.is_some() {
@@ -225,6 +247,14 @@ impl Meta {
                 })
             })
             .collect()
+    }
+
+    /// Whether `device` exists and isn't revoked (a long-lived connection asks again now and then: the admin CLI may
+    /// have revoked it from another process).
+    pub async fn device_active(&self, device: DeviceId) -> Result<bool, MetaError> {
+        let row =
+            sqlx::query("SELECT 1 FROM devices WHERE id = $1 AND revoked = 0").bind(uuid_bytes(device.as_uuid())).fetch_optional(&self.pool).await?;
+        Ok(row.is_some())
     }
 
     /// Revokes one of `user`'s devices. Revoking another user's device is `NotFound`.

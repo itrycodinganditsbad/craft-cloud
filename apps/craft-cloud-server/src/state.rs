@@ -12,6 +12,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::auth::hash_password;
 use crate::error::ApiError;
+use crate::live::LiveHub;
 use crate::notify::Notifier;
 use crate::ratelimit::Limiter;
 
@@ -32,6 +33,10 @@ pub struct Limits {
     /// route allows. A body that takes longer is answered `408` and its slot goes to the next request.
     pub body_time_base: Duration,
     pub body_time_per_mib: Duration,
+    /// Live frames (updates, creates, subscribes) one connection may send at once…
+    pub live_burst: u32,
+    /// …refilled at this many per second; over it the answer is `rate_limited`.
+    pub live_per_sec: u32,
 }
 
 impl Default for Limits {
@@ -42,6 +47,8 @@ impl Default for Limits {
             password_checks: 4,
             body_time_base: Duration::from_secs(60),
             body_time_per_mib: Duration::from_secs(30),
+            live_burst: crate::live::UPDATE_BURST,
+            live_per_sec: crate::live::UPDATES_PER_SEC,
         }
     }
 }
@@ -89,6 +96,8 @@ pub struct AppState {
     pub trusted_proxies: Vec<IpAddr>,
     pub logins: Limiter,
     pub notifier: Notifier,
+    /// The live service's connections and subscriptions ([`crate::live`]).
+    pub live: LiveHub,
     pub limits: Limits,
     /// Chunk and manifest bodies being received, per user ([`Limits::bodies_per_user`]).
     pub bodies: PerUser,
@@ -112,6 +121,7 @@ impl AppState {
             trusted_proxies,
             logins: Limiter::new(Duration::from_secs(300)),
             notifier: Notifier::default(),
+            live: LiveHub::default(),
             bodies: PerUser::new(limits.bodies_per_user),
             manifests: PerUser::new(limits.manifests_per_user),
             password_checks: Arc::new(Semaphore::new(limits.password_checks)),

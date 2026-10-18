@@ -5,12 +5,17 @@
 use std::time::{Duration, Instant};
 
 use craft_cloud_meta::{Meta, Role};
+use craft_cloud_proto::DocId;
 use craft_cloud_proto::api::{CommitResponse, DeviceInfo, EPOCH_HEADER, ErrorBody, InfoResponse, LoginResponse, MissingResponse, SpaceResponse};
+use craft_cloud_proto::live::{
+    AppName, ClientFrame, DocKind, LIVE_PROTOCOL_MAX, LIVE_PROTOCOL_MIN, MAX_SUBSCRIPTIONS, PROTOCOL_MISMATCH, ServerFrame, recents_doc,
+};
 use craft_cloud_proto::{
     ChangeSet, ChunkId, ChunkRef, ChunkerParamsId, FileHash, Manifest, ManifestId, Name, NewVersion, NodeId, NodeKind, Op, VersionId,
 };
 use craft_cloud_server::AppState;
 use craft_cloud_server::auth::hash_password;
+use craft_cloud_server::live;
 use craft_cloud_server::state::Limits;
 use craft_cloud_store::Store;
 use craft_cloud_store::disk::DiskBackend;
@@ -147,6 +152,13 @@ on_every_backend!(
     shutting_down_ends_long_polls,
     the_space_endpoint_and_unversioned_info,
     oversized_manifests_are_refused,
+    live_needs_a_device_token,
+    live_hello_checks_the_version,
+    live_documents_of_another_account_are_not_found,
+    live_updates_are_durable_before_the_ack,
+    live_updates_fan_out_to_the_accounts_other_devices,
+    live_catch_up_after_a_gap,
+    live_a_revoked_device_is_cut_off,
 );
 
 // ---- helpers ----
@@ -820,4 +832,285 @@ async fn sign_ins_beyond_the_password_check_slots_are_told_to_come_back() {
     // …and none of those answers cost an attempt: once a slot is free, the device signs in.
     drop(busy);
     login(&s, "ana").await;
+}
+
+// ---- the live service ----
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Opens `/api/v1/live` with `token` (if any): the socket, or the HTTP status it was refused with.
+async fn open_live(s: &Server, token: Option<&str>) -> Result<Ws, StatusCode> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = format!("{}/live", s.base.replacen("http://", "ws://", 1)).into_client_request().unwrap();
+    if let Some(token) = token {
+        request.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+    }
+    match tokio_tungstenite::connect_async(request).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => Err(StatusCode::from_u16(response.status().as_u16()).unwrap()),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+async fn live_send(ws: &mut Ws, frame: ClientFrame) {
+    use futures_util::SinkExt;
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(frame.encode().unwrap().into())).await.unwrap();
+}
+
+/// The next frame from the server; `None` once the connection is closed.
+async fn live_next(ws: &mut Ws) -> Option<ServerFrame> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), ws.next()).await.expect("the server answers within 10 s") {
+            Some(Ok(Message::Binary(bytes))) => return Some(ServerFrame::decode(&bytes).unwrap()),
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+            Some(Ok(Message::Close(_)) | Err(_)) | None => return None,
+            Some(Ok(other)) => panic!("unexpected message {other:?}"),
+        }
+    }
+}
+
+/// Nothing arrives for a moment.
+async fn live_quiet(ws: &mut Ws) {
+    use futures_util::StreamExt;
+    if let Ok(Some(Ok(message))) = tokio::time::timeout(Duration::from_millis(300), ws.next()).await {
+        panic!("expected nothing, got {message:?}");
+    }
+}
+
+/// A connection past `hello`.
+async fn live_ready(s: &Server, token: &str) -> Ws {
+    let mut ws = open_live(s, Some(token)).await.unwrap();
+    live_send(&mut ws, ClientFrame::Hello { min: LIVE_PROTOCOL_MIN, max: LIVE_PROTOCOL_MAX }).await;
+    let epoch = space_of(s, token).await.epoch;
+    assert_eq!(live_next(&mut ws).await, Some(ServerFrame::Welcome { protocol: LIVE_PROTOCOL_MAX, epoch }), "with the space's epoch");
+    ws
+}
+
+async fn space_of(s: &Server, token: &str) -> SpaceResponse {
+    s.client.get(format!("{}/space", s.base)).bearer_auth(token).send().await.unwrap().json().await.unwrap()
+}
+
+/// Makes and subscribes to `app`'s recents document (after `after`); returns its ID, with the catch-up's frames.
+async fn live_recents(s: &Server, ws: &mut Ws, token: &str, app: &str, after: u64) -> (DocId, Vec<ServerFrame>) {
+    let app = AppName::new(app).unwrap();
+    let doc = recents_doc(space_of(s, token).await.space, &app);
+    live_send(ws, ClientFrame::Create { doc, kind: DocKind::Recents { app } }).await;
+    assert_eq!(live_next(ws).await, Some(ServerFrame::Created { doc }));
+    (doc, live_subscribe(ws, doc, after).await)
+}
+
+/// Subscribes and reads the catch-up up to and with `subscribed`.
+async fn live_subscribe(ws: &mut Ws, doc: DocId, after: u64) -> Vec<ServerFrame> {
+    live_send(ws, ClientFrame::Subscribe { doc, after, at: None }).await;
+    let mut frames = Vec::new();
+    loop {
+        let frame = live_next(ws).await.expect("the catch-up");
+        let done = matches!(frame, ServerFrame::Subscribed { .. } | ServerFrame::Error { .. });
+        frames.push(frame);
+        if done {
+            return frames;
+        }
+    }
+}
+
+fn error_code(frame: Option<ServerFrame>) -> String {
+    match frame {
+        Some(ServerFrame::Error { code, .. }) => code,
+        other => panic!("expected an error, got {other:?}"),
+    }
+}
+
+async fn live_needs_a_device_token(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    assert_eq!(open_live(s, None).await.err(), Some(StatusCode::UNAUTHORIZED));
+    assert_eq!(open_live(s, Some(&"x".repeat(43))).await.err(), Some(StatusCode::UNAUTHORIZED));
+    // Signed in, but not a WebSocket: refused with the API's JSON error.
+    let (status, body) = error(s.client.get(format!("{}/live", s.base)).bearer_auth(&token).send().await.unwrap()).await;
+    assert!(status.is_client_error() && body.error == "invalid", "{status} {body:?}");
+    // A device holds a few connections at most.
+    let mut held = Vec::new();
+    for _ in 0..live::MAX_CONNECTIONS_PER_DEVICE {
+        held.push(open_live(s, Some(&token)).await.unwrap());
+    }
+    assert_eq!(open_live(s, Some(&token)).await.err(), Some(StatusCode::TOO_MANY_REQUESTS));
+    drop(held);
+}
+
+async fn live_hello_checks_the_version(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let mut ws = open_live(s, Some(&token)).await.unwrap();
+    live_send(&mut ws, ClientFrame::Hello { min: LIVE_PROTOCOL_MAX + 1, max: LIVE_PROTOCOL_MAX + 5 }).await;
+    assert_eq!(error_code(live_next(&mut ws).await), PROTOCOL_MISMATCH);
+    assert_eq!(live_next(&mut ws).await, None, "closed after the mismatch");
+    // Anything before `hello` is refused, and the connection ends.
+    let mut ws = open_live(s, Some(&token)).await.unwrap();
+    live_send(&mut ws, ClientFrame::Subscribe { doc: DocId::generate(), after: 0, at: None }).await;
+    assert_eq!(error_code(live_next(&mut ws).await), "invalid");
+    assert_eq!(live_next(&mut ws).await, None);
+}
+
+async fn live_documents_of_another_account_are_not_found(s: &Server) {
+    add_user(s, "ana").await;
+    add_user(s, "bob").await;
+    let (ana, bob) = (login(s, "ana").await, login(s, "bob").await);
+    let mut a = live_ready(s, &ana).await;
+    let (doc, _) = live_recents(s, &mut a, &ana, "wordcraft", 0).await;
+    live_send(&mut a, ClientFrame::Update { doc, client_seq: 1, bytes: b"ana's".to_vec() }).await;
+    assert!(matches!(live_next(&mut a).await, Some(ServerFrame::Ack { seq: 1, .. })));
+
+    let mut b = live_ready(s, &bob).await;
+    // Ana's document and one that doesn't exist get the same answer.
+    let theirs = live_subscribe(&mut b, doc, 0).await;
+    let nobodys = live_subscribe(&mut b, DocId::generate(), 0).await;
+    let strip = |frames: Vec<ServerFrame>| match frames.as_slice() {
+        [ServerFrame::Error { code, message, .. }] => (code.clone(), message.clone()),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(strip(theirs), strip(nobodys));
+    assert_eq!(strip(live_subscribe(&mut b, doc, 0).await).0, "not_found");
+    // Nor can Bob write to it, or make it in his space under its ID.
+    live_send(&mut b, ClientFrame::Update { doc, client_seq: 1, bytes: b"bob's".to_vec() }).await;
+    assert_eq!(error_code(live_next(&mut b).await), "not_found");
+    let kind = DocKind::Recents { app: AppName::new("wordcraft").unwrap() };
+    live_send(&mut b, ClientFrame::Create { doc, kind }).await;
+    assert_eq!(error_code(live_next(&mut b).await), "invalid");
+    // Bob's own recents document is another one, and empty.
+    let (bobs, frames) = live_recents(s, &mut b, &bob, "wordcraft", 0).await;
+    assert_ne!(bobs, doc);
+    assert_eq!(frames, vec![ServerFrame::Subscribed { doc: bobs, head: 0 }]);
+    let ana_space = space_of(s, &ana).await.space;
+    assert_eq!(s.meta.live_updates(ana_space, doc, 0, 10).await.unwrap().len(), 1, "Ana's log is untouched");
+}
+
+async fn live_updates_are_durable_before_the_ack(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let space = space_of(s, &token).await.space;
+    let mut ws = live_ready(s, &token).await;
+    let (doc, _) = live_recents(s, &mut ws, &token, "wordcraft", 0).await;
+    for (client_seq, bytes) in [(1, &b"first"[..]), (2, &b"second"[..])] {
+        live_send(&mut ws, ClientFrame::Update { doc, client_seq, bytes: bytes.to_vec() }).await;
+        let Some(ServerFrame::Ack { seq, client_seq: acked, .. }) = live_next(&mut ws).await else { panic!("an ack") };
+        assert_eq!((acked, seq), (client_seq, client_seq));
+        // By the time the ack arrives the update is in the database (committed: another connection reads it).
+        let stored = s.meta.live_updates(space, doc, seq - 1, 1).await.unwrap();
+        assert_eq!(stored.first().map(|u| u.bytes.as_slice()), Some(bytes));
+    }
+    // Sent again after a lost ack: acked with its first number, stored once.
+    live_send(&mut ws, ClientFrame::Update { doc, client_seq: 1, bytes: b"first".to_vec() }).await;
+    assert!(matches!(live_next(&mut ws).await, Some(ServerFrame::Ack { client_seq: 1, seq: 1, .. })));
+    assert_eq!(s.meta.live_doc(space, doc).await.unwrap().unwrap().head, 2);
+    // Its own updates don't come back to the device that sent them.
+    live_quiet(&mut ws).await;
+    // An update to a document it didn't subscribe to is refused.
+    live_send(&mut ws, ClientFrame::Unsubscribe { doc }).await;
+    live_send(&mut ws, ClientFrame::Update { doc, client_seq: 3, bytes: b"third".to_vec() }).await;
+    assert_eq!(error_code(live_next(&mut ws).await), "not_found");
+}
+
+async fn live_updates_fan_out_to_the_accounts_other_devices(s: &Server) {
+    add_user(s, "ana").await;
+    add_user(s, "bob").await;
+    let (pc, laptop, bob) = (login(s, "ana").await, login(s, "ana").await, login(s, "bob").await);
+    let (mut a, mut b, mut c) = (live_ready(s, &pc).await, live_ready(s, &laptop).await, live_ready(s, &bob).await);
+    let (doc, _) = live_recents(s, &mut a, &pc, "wordcraft", 0).await;
+    let (same, _) = live_recents(s, &mut b, &laptop, "wordcraft", 0).await;
+    assert_eq!(doc, same, "one recents document per app per account");
+    live_recents(s, &mut c, &bob, "wordcraft", 0).await;
+    live_send(&mut a, ClientFrame::Update { doc, client_seq: 7, bytes: b"opened doc1".to_vec() }).await;
+    assert_eq!(live_next(&mut a).await, Some(ServerFrame::Ack { doc, client_seq: 7, seq: 1 }));
+    let Some(ServerFrame::Update { doc: got, seq, bytes, device }) = live_next(&mut b).await else { panic!("the laptop gets it") };
+    assert_eq!((got, seq, bytes.as_slice()), (doc, 1, &b"opened doc1"[..]));
+    let devices: Vec<DeviceInfo> = s.client.get(format!("{}/devices", s.base)).bearer_auth(&pc).send().await.unwrap().json().await.unwrap();
+    assert_eq!(Some(device), devices.iter().find(|d| d.current).map(|d| d.id), "it names the device that sent it");
+    live_quiet(&mut c).await;
+    live_quiet(&mut a).await;
+}
+
+async fn live_catch_up_after_a_gap(s: &Server) {
+    add_user(s, "ana").await;
+    let (pc, laptop) = (login(s, "ana").await, login(s, "ana").await);
+    let mut a = live_ready(s, &pc).await;
+    let (doc, _) = live_recents(s, &mut a, &pc, "wordcraft", 0).await;
+    let mut b = live_ready(s, &laptop).await;
+    live_recents(s, &mut b, &laptop, "wordcraft", 0).await;
+    live_send(&mut a, ClientFrame::Update { doc, client_seq: 1, bytes: vec![1] }).await;
+    live_next(&mut a).await;
+    assert!(matches!(live_next(&mut b).await, Some(ServerFrame::Update { seq: 1, .. })));
+    // The laptop goes away; three more updates come meanwhile.
+    drop(b);
+    for i in 2..=4u8 {
+        live_send(&mut a, ClientFrame::Update { doc, client_seq: u64::from(i), bytes: vec![i] }).await;
+        live_next(&mut a).await;
+    }
+    // Back, it says it holds everything up to 1: exactly the three it lacks, in order, then the end of the catch-up.
+    let mut b = live_ready(s, &laptop).await;
+    let frames = live_subscribe(&mut b, doc, 1).await;
+    let seqs: Vec<(u64, Vec<u8>)> = frames
+        .iter()
+        .filter_map(|f| match f {
+            ServerFrame::Update { seq, bytes, .. } => Some((*seq, bytes.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(seqs, vec![(2, vec![2]), (3, vec![3]), (4, vec![4])]);
+    assert_eq!(frames.last(), Some(&ServerFrame::Subscribed { doc, head: 4 }));
+    // The catch-up includes the device's own updates (it may have lost them): the PC, from scratch, gets all four.
+    let mut fresh = live_ready(s, &pc).await;
+    let all = live_subscribe(&mut fresh, doc, 0).await;
+    assert_eq!(all.iter().filter(|f| matches!(f, ServerFrame::Update { .. })).count(), 4);
+    // An agent that holds more than the server (restored from a backup) is told where the log ends.
+    let ahead = live_subscribe(&mut b, doc, 10).await;
+    assert_eq!(ahead, vec![ServerFrame::Subscribed { doc, head: 4 }]);
+    // After the catch-up, new updates follow live.
+    live_send(&mut a, ClientFrame::Update { doc, client_seq: 5, bytes: vec![5] }).await;
+    assert!(matches!(live_next(&mut b).await, Some(ServerFrame::Update { seq: 5, .. })));
+}
+
+/// A device revoked through the API loses its live connection at once.
+async fn live_a_revoked_device_is_cut_off(s: &Server) {
+    add_user(s, "ana").await;
+    let (pc, laptop) = (login(s, "ana").await, login(s, "ana").await);
+    let mut ws = live_ready(s, &pc).await;
+    live_recents(s, &mut ws, &pc, "wordcraft", 0).await;
+    let devices: Vec<DeviceInfo> = s.client.get(format!("{}/devices", s.base)).bearer_auth(&pc).send().await.unwrap().json().await.unwrap();
+    let pc_id = devices.iter().find(|d| d.current).unwrap().id;
+    let res = s.client.delete(format!("{}/devices/{pc_id}", s.base)).bearer_auth(&laptop).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(error_code(live_next(&mut ws).await), "unauthorized");
+    assert_eq!(live_next(&mut ws).await, None, "closed");
+    assert_eq!(open_live(s, Some(&pc)).await.err(), Some(StatusCode::UNAUTHORIZED));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_subscriptions_are_capped_per_device() {
+    // A budget big enough for 2 × 257 frames at once: the cap, not the budget, is what this checks.
+    let s = &sqlite_disk_with(Limits { live_burst: 10_000, ..Limits::default() }).await;
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let space = space_of(s, &token).await.space;
+    let mut ws = live_ready(s, &token).await;
+    for i in 0..=MAX_SUBSCRIPTIONS {
+        let app = AppName::new(&format!("app{i}")).unwrap();
+        let doc = recents_doc(space, &app);
+        live_send(&mut ws, ClientFrame::Create { doc, kind: DocKind::Recents { app } }).await;
+        assert_eq!(live_next(&mut ws).await, Some(ServerFrame::Created { doc }));
+        let frames = live_subscribe(&mut ws, doc, 0).await;
+        if i < MAX_SUBSCRIPTIONS {
+            assert_eq!(frames, vec![ServerFrame::Subscribed { doc, head: 0 }]);
+        } else {
+            assert_eq!(error_code(frames.into_iter().next()), "rate_limited", "the 257th");
+        }
+    }
+    // Across the device's connections, too; one given up frees a place.
+    let mut other = live_ready(s, &token).await;
+    let doc = recents_doc(space, &AppName::new(&format!("app{MAX_SUBSCRIPTIONS}")).unwrap());
+    assert_eq!(error_code(live_subscribe(&mut other, doc, 0).await.into_iter().next()), "rate_limited");
+    live_send(&mut ws, ClientFrame::Unsubscribe { doc: recents_doc(space, &AppName::new("app0").unwrap()) }).await;
+    live_quiet(&mut ws).await;
+    assert_eq!(live_subscribe(&mut other, doc, 0).await, vec![ServerFrame::Subscribed { doc, head: 0 }]);
 }

@@ -84,6 +84,7 @@ impl From<MetaError> for ApiError {
             MetaError::NotFound(what) => Self::not_found(what),
             MetaError::UsernameTaken => Self::new(StatusCode::CONFLICT, codes::USERNAME_TAKEN, "the username is taken"),
             MetaError::QuotaExceeded { used, limit } => Self::quota_exceeded(used, limit),
+            MetaError::DocFull { .. } => Self::new(StatusCode::INSUFFICIENT_STORAGE, codes::QUOTA_EXCEEDED, e.to_string()),
             MetaError::Db(_) | MetaError::Corrupt(_) | MetaError::UnsupportedUrl => {
                 tracing::error!(error = %e, "metadata error");
                 Self::internal()

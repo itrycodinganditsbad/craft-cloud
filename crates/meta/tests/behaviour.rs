@@ -108,6 +108,10 @@ on_every_backend!(
     the_tree_and_the_feed_come_in_pages,
     usernames_are_unique_ignoring_ascii_case,
     all_spaces_lists_every_users_space,
+    live_documents_number_their_updates_per_space,
+    concurrent_live_appends_get_one_number_each,
+    live_pages_stop_at_their_byte_limit,
+    a_live_document_is_capped_by_bytes,
 );
 
 // ---- helpers ----
@@ -567,6 +571,121 @@ async fn all_spaces_lists_every_users_space(meta: &Meta) {
     assert_eq!(meta.all_spaces().await.unwrap(), expected);
 }
 
+async fn live_documents_number_their_updates_per_space(meta: &Meta) {
+    use craft_cloud_proto::DocId;
+    let (ana, bob) = (user(meta, "ana").await, user(meta, "bob").await);
+    let (pc, laptop) = (device(meta, &ana).await, device(meta, &ana).await);
+    let doc = DocId::generate();
+    let made = meta.create_live_doc(ana.space, doc, "recents:wordcraft", None, NOW).await.unwrap();
+    assert_eq!((made.head, made.kind.as_str(), made.node), (0, "recents:wordcraft", None));
+    // Made again (another machine, offline): the same document.
+    assert_eq!(meta.create_live_doc(ana.space, doc, "recents:wordcraft", None, NOW + 5).await.unwrap(), made);
+    assert!(matches!(meta.create_live_doc(ana.space, doc, "recents:gridcraft", None, NOW).await, Err(MetaError::Invalid(_))));
+    // Another space doesn't see it, and may have a document with the same ID of its own.
+    assert_eq!(meta.live_doc(bob.space, doc).await.unwrap(), None);
+    let bob_dev = device(meta, &bob).await;
+    assert!(matches!(meta.append_live_update(bob.space, doc, bob_dev, 1, b"x", NOW).await, Err(MetaError::NotFound(_))));
+    assert!(meta.live_updates(bob.space, doc, 0, 10).await.unwrap().is_empty());
+
+    assert_eq!(meta.append_live_update(ana.space, doc, pc, 1, b"one", NOW).await.unwrap(), 1);
+    assert_eq!(meta.append_live_update(ana.space, doc, laptop, 1, b"two", NOW).await.unwrap(), 2, "another device's client_seq 1");
+    // Sent again after a lost ack: the first number, stored once.
+    assert_eq!(meta.append_live_update(ana.space, doc, pc, 1, b"one", NOW).await.unwrap(), 1);
+    // The same client_seq with other bytes (a device that lost its state and counts from 1 again) is a new update.
+    assert_eq!(meta.append_live_update(ana.space, doc, pc, 1, b"three", NOW).await.unwrap(), 3);
+    assert_eq!(meta.live_doc(ana.space, doc).await.unwrap().unwrap().head, 3);
+    let all = meta.live_updates(ana.space, doc, 0, 10).await.unwrap();
+    let seen: Vec<(u64, &[u8], DeviceId)> = all.iter().map(|u| (u.seq, u.bytes.as_slice(), u.device)).collect();
+    assert_eq!(seen, vec![(1, &b"one"[..], pc), (2, &b"two"[..], laptop), (3, &b"three"[..], pc)]);
+    let page = meta.live_updates(ana.space, doc, 1, 1).await.unwrap();
+    assert_eq!(page.iter().map(|u| u.seq).collect::<Vec<_>>(), vec![2]);
+    assert!(meta.live_updates(ana.space, doc, 3, 10).await.unwrap().is_empty());
+    assert!(matches!(meta.append_live_update(ana.space, DocId::generate(), pc, 9, b"x", NOW).await, Err(MetaError::NotFound(_))));
+    assert!(matches!(meta.append_live_update(ana.space, doc, pc, u64::MAX, b"x", NOW).await, Err(MetaError::Invalid(_))));
+}
+
+/// A catch-up page is bounded by bytes, not only by a count (64 updates of 1 MiB would be 64 MiB at once).
+async fn live_pages_stop_at_their_byte_limit(meta: &Meta) {
+    use craft_cloud_proto::DocId;
+    let ana = user(meta, "ana").await;
+    let dev = device(meta, &ana).await;
+    let doc = DocId::generate();
+    meta.create_live_doc(ana.space, doc, "recents:wordcraft", None, NOW).await.unwrap();
+    for i in 1..=6u64 {
+        meta.append_live_update(ana.space, doc, dev, i, &vec![u8::try_from(i).unwrap(); 1000], NOW).await.unwrap();
+    }
+    let seqs = |(page, more): (Vec<craft_cloud_meta::LiveUpdate>, bool)| (page.iter().map(|u| u.seq).collect::<Vec<_>>(), more);
+    assert_eq!(seqs(meta.live_page(ana.space, doc, 0, 2500, 100).await.unwrap()), (vec![1, 2], true), "2 KB fit, the third doesn't");
+    assert_eq!(seqs(meta.live_page(ana.space, doc, 2, 10, 100).await.unwrap()), (vec![3], true), "at least one, however big");
+    assert_eq!(seqs(meta.live_page(ana.space, doc, 3, 1_000_000, 2).await.unwrap()), (vec![4, 5], true), "and at most so many");
+    assert_eq!(seqs(meta.live_page(ana.space, doc, 3, 1_000_000, 10).await.unwrap()), (vec![4, 5, 6], false), "the end");
+    assert_eq!(seqs(meta.live_page(ana.space, doc, 6, 1_000_000, 10).await.unwrap()), (vec![], false));
+    assert_eq!(meta.live_page(ana.space, doc, 0, 1500, 10).await.unwrap().0[0].bytes, vec![1u8; 1000]);
+    assert!(meta.device_active(dev).await.unwrap());
+    meta.revoke_device(ana.id, dev).await.unwrap();
+    assert!(!meta.device_active(dev).await.unwrap(), "revoked");
+}
+
+/// A document's log is capped by bytes, one way: the update that crosses the cap is
+/// stored, and from then on every append is refused, so no smaller later update is stored past a refused one it
+/// depends on. A repeat of an update already stored is still acked; the admin's reset empties the log.
+async fn a_live_document_is_capped_by_bytes(meta: &Meta) {
+    use craft_cloud_proto::DocId;
+    assert_eq!(craft_cloud_meta::MAX_LIVE_DOC_BYTES, 16 * 1024 * 1024);
+    let meta = meta.clone().with_live_doc_cap(2500);
+    let ana = user(&meta, "ana").await;
+    let dev = device(&meta, &ana).await;
+    let (doc, other) = (DocId::generate(), DocId::generate());
+    for d in [doc, other] {
+        meta.create_live_doc(ana.space, d, "recents:wordcraft", None, NOW).await.unwrap();
+    }
+    for i in 1..=3u64 {
+        meta.append_live_update(ana.space, doc, dev, i, &[1; 1000], NOW).await.unwrap();
+    }
+    assert_eq!(meta.live_doc(ana.space, doc).await.unwrap().unwrap().bytes, 3000, "the third crossed the cap and is stored");
+    let full = meta.append_live_update(ana.space, doc, dev, 4, &[2; 10], NOW).await;
+    assert!(matches!(full, Err(MetaError::DocFull { used: 3000, limit: 2500 })), "{full:?}");
+    assert_eq!(meta.live_doc(ana.space, doc).await.unwrap().unwrap().head, 3, "nothing stored, however small");
+    assert_eq!(meta.append_live_update(ana.space, doc, dev, 2, &[1; 1000], NOW).await.unwrap(), 2, "a repeat is acked");
+    assert_eq!(meta.append_live_update(ana.space, other, dev, 1, &[3; 2000], NOW).await.unwrap(), 1, "per document");
+    let (epoch, live) = (meta.space_info(ana.space).await.unwrap().epoch, meta.live_epoch(ana.space).await.unwrap());
+    assert_eq!(live, epoch, "no reset yet: the live epoch is the space's");
+    meta.reset_live_doc(ana.space, doc).await.unwrap();
+    let reset = meta.live_doc(ana.space, doc).await.unwrap().unwrap();
+    assert_eq!((reset.head, reset.bytes), (0, 0));
+    assert_eq!(meta.space_info(ana.space).await.unwrap().epoch, epoch, "the file sync's epoch is untouched");
+    let after = meta.live_epoch(ana.space).await.unwrap();
+    assert_ne!(after, live, "a new live generation no agent can miss");
+    meta.reset_live_doc(ana.space, doc).await.unwrap();
+    assert_ne!(meta.live_epoch(ana.space).await.unwrap(), after, "and again");
+    assert!(meta.live_updates(ana.space, doc, 0, 10).await.unwrap().is_empty());
+    assert_eq!(meta.append_live_update(ana.space, doc, dev, 4, &[2; 10], NOW).await.unwrap(), 1, "open again");
+    assert!(matches!(meta.reset_live_doc(ana.space, DocId::generate()).await, Err(MetaError::NotFound(_))));
+}
+
+async fn concurrent_live_appends_get_one_number_each(meta: &Meta) {
+    use craft_cloud_proto::DocId;
+    let ana = user(meta, "ana").await;
+    let dev = device(meta, &ana).await;
+    let doc = DocId::generate();
+    meta.create_live_doc(ana.space, doc, "recents:wordcraft", None, NOW).await.unwrap();
+    let tasks: Vec<_> = (0..16u64)
+        .map(|i| {
+            let meta = meta.clone();
+            // Every update twice, as a device that sends again after a lost ack.
+            tokio::spawn(async move { meta.append_live_update(ana.space, doc, dev, i % 8, &[u8::try_from(i % 8).unwrap()], NOW).await.unwrap() })
+        })
+        .collect();
+    let mut seqs = Vec::new();
+    for task in tasks {
+        seqs.push(task.await.unwrap());
+    }
+    seqs.sort_unstable();
+    seqs.dedup();
+    assert_eq!(seqs, (1..=8).collect::<Vec<_>>(), "each update stored once, numbered without gaps");
+    assert_eq!(meta.live_doc(ana.space, doc).await.unwrap().unwrap().head, 8);
+}
+
 async fn concurrent_commits_on_one_file_let_exactly_one_win(meta: &Meta) {
     let u = user(meta, "ana").await;
     let dev = device(meta, &u).await;
@@ -925,7 +1044,11 @@ async fn upgrading_counts_what_each_space_already_stores() {
         use sqlx::Connection;
         let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
         sqlx::query("ALTER TABLE spaces DROP COLUMN stored_bytes").execute(&mut conn).await.unwrap();
-        sqlx::query("DELETE FROM schema_version WHERE version = 2").execute(&mut conn).await.unwrap();
+        // And before live documents.
+        sqlx::query("DROP TABLE live_updates").execute(&mut conn).await.unwrap();
+        sqlx::query("DROP TABLE live_docs").execute(&mut conn).await.unwrap();
+        sqlx::query("DROP TABLE live_spaces").execute(&mut conn).await.unwrap();
+        sqlx::query("DELETE FROM schema_version WHERE version >= 2").execute(&mut conn).await.unwrap();
     }
     let meta = Meta::open(&url).await.unwrap();
     assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), 100);
@@ -949,5 +1072,5 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 2);
+    assert_eq!(versions, 3);
 }
