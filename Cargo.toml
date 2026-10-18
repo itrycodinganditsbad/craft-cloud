@@ -86,6 +86,12 @@ egui_kittest = "0.36"
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "wayland"] }
 # The app's add-a-computer QR code (Nayuki's QR Code generator, MIT).
 qrcodegen = "1.8"
+# The app's tray icon on Windows and macOS (tauri's tray-icon and its menus, muda; MIT OR Apache-2.0).
+tray-icon = { version = "0.25", default-features = false }
+# The app's tray icon on Linux: a StatusNotifierItem and its menu over the session D-Bus, in pure Rust (zbus, MIT).
+zbus = { version = "5.12", default-features = false, features = ["async-io", "blocking-api"] }
+# Decoding the app's own icons (PNG) for the tray and the window.
+png = "0.18"
 # Windows only: the agent's start-at-login entry under `HKCU\…\Run`. Microsoft's windows-rs crate (MIT OR Apache-2.0);
 # its dependencies (windows-link, windows-result, windows-strings) are in the build already.
 windows-registry = "0.6.1"

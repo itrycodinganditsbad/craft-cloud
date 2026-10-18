@@ -10,7 +10,7 @@ use craft_cloud_desktop::agent::ClientAgent;
 use craft_cloud_desktop::app::{App, System};
 use craft_cloud_desktop::model::{Event, Model};
 use craft_cloud_desktop::single_instance::{self, Instance};
-use craft_cloud_desktop::ui;
+use craft_cloud_desktop::{tray, ui};
 
 fn main() -> ExitCode {
     let hidden = std::env::args_os().skip(1).any(|arg| arg == "--hidden");
@@ -45,23 +45,31 @@ fn main() -> ExitCode {
         }
     }
 
-    let mut model = Model::new(craft_cloud_desktop::join_defaults(), false, craft_cloud_desktop::agent_log());
-    model.window_visible = !hidden;
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(ui::TITLE)
-            .with_inner_size(ui::WINDOW_SIZE)
-            .with_min_inner_size([360.0, 420.0])
-            .with_visible(!hidden),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(ui::TITLE)
+        .with_app_id("craft-cloud")
+        .with_inner_size(ui::WINDOW_SIZE)
+        .with_min_inner_size([360.0, 420.0])
+        .with_visible(!hidden);
+    if let Ok((width, height, rgba)) = tray::rgba(tray::APP_ICON) {
+        viewport = viewport.with_icon(egui::IconData { rgba, width, height });
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     let started = eframe::run_native(
         ui::TITLE,
         options,
         Box::new(move |cc| {
             let _ = window.set(cc.egui_ctx.clone());
+            // The tray is made on this (the event loop's) thread, as Windows and macOS need.
+            let wake_ctx = cc.egui_ctx.clone();
+            let clicks = tray::Clicks { to: outside_tx.clone(), wake: Arc::new(move || wake_ctx.request_repaint()) };
+            let tray = tray::start(clicks);
+            let mut model = Model::new(craft_cloud_desktop::join_defaults(), tray.is_some(), craft_cloud_desktop::agent_log());
+            // Started hidden with no tray to live in (an entry left over from a desktop that had one): shown after all.
+            model.window_visible = !hidden || tray.is_none();
             let agent = Arc::new(ClientAgent::new(None));
-            let app = App::new(&cc.egui_ctx, agent, craft_cloud_desktop::start_agent::starter(), model, (outside_tx, outside_rx), Box::new(System));
+            let host = Box::new(System { tray });
+            let app = App::new(&cc.egui_ctx, agent, craft_cloud_desktop::start_agent::starter(), model, (outside_tx, outside_rx), host);
             Ok(Box::new(app))
         }),
     );

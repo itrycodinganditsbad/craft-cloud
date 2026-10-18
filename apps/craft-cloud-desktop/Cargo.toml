@@ -29,6 +29,18 @@ egui.workspace = true
 rfd = { workspace = true }
 # The add-a-computer link as a QR code.
 qrcodegen.workspace = true
+# The app's icons (`assets/`, drawn by `cargo xtask icons`), decoded for the tray and the window.
+png.workspace = true
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+tray-icon.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The app's start-at-login value under `HKCU\…\Run`.
+windows-registry.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
 
 [dev-dependencies]
 # The window's snapshots: kittest renders on wgpu (a CPU adapter where there is one); they are compared here with

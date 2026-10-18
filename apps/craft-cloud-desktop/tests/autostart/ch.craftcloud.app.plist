@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Written by the Craft Cloud app; signing out removes it. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ch.craftcloud.app</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/zoë/Applications/Craft Cloud.app/Contents/MacOS/craft-cloud</string>
+        <string>--hidden</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

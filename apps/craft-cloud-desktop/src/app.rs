@@ -133,10 +133,21 @@ impl eframe::App for App {
     }
 }
 
-/// The OS's side, for real.
-pub struct System;
+/// The OS's side, for real: the tray icon (where there is one), the opener, the folder picker, the app's own start
+/// at login.
+pub struct System {
+    pub tray: Option<Box<dyn crate::tray::Tray>>,
+}
 
 impl Host for System {
+    fn frame(&mut self, model: &Model) -> Vec<Event> {
+        if let Some(tray) = &mut self.tray {
+            let paused = model.status.as_ref().is_some_and(|s| s.run_state == craft_cloud_app::RunState::PausedByUser);
+            tray.show(crate::tray::state_of(model.status.as_ref()), paused);
+        }
+        Vec::new()
+    }
+
     fn open_folder(&self, folder: &str) {
         let opener = if cfg!(windows) {
             "explorer"
@@ -159,8 +170,8 @@ impl Host for System {
         }
     }
 
-    fn set_autostart(&self, _on: bool) -> Result<(), String> {
-        Ok(())
+    fn set_autostart(&self, on: bool) -> Result<(), String> {
+        crate::autostart::set_for_this_app(on)
     }
 
     fn pick_folder(&self, start: String, answer: Sender<Event>, wake: Arc<dyn Fn() + Send + Sync>) {

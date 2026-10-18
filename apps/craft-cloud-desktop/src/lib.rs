@@ -7,13 +7,16 @@
 //! - [`start_agent`]: starting the agent from this app's folder.
 //! - [`single_instance`]: one app per user; a second start brings the first window forward.
 //! - [`ui`]: the window, a view of the model; [`app`]: the app on eframe.
+//! - [`tray`]: the tray icon where there is one; [`autostart`]: the app's own start-at-login entry.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod agent;
 pub mod app;
+pub mod autostart;
 pub mod model;
 pub mod single_instance;
 pub mod start_agent;
+pub mod tray;
 pub mod ui;
 
 /// Milliseconds since the Unix epoch now (0 if the clock is before it).
