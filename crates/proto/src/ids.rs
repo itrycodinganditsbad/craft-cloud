@@ -66,6 +66,12 @@ uuid_id!(
     /// epoch reconciles instead of trusting its change counter.
     Epoch
 );
+uuid_id!(
+    /// A live document (see [`crate::live`]). Keyed by `(space, doc)` on the server, like nodes, so an ID never
+    /// reaches into another space. An app's recents document has an ID derived from the space and the app
+    /// ([`crate::live::recents_doc`]), so every machine finds the same one without asking.
+    DocId
+);
 
 #[cfg(test)]
 mod tests {

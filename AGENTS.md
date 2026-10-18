@@ -21,7 +21,8 @@ explains why.
 
 ## 1. Workspace map
 
-The design lives in `docs/design/sync.md`.
+The design lives in `docs/design/sync.md`; the live protocols (the server's live endpoint, the agent's local API) in
+`docs/design/live.md`.
 
 ```text
 crates/
@@ -30,17 +31,20 @@ crates/
   store     craft-cloud-store     blob store: disk, S3, memory; checks every blob in and out
   meta      craft-cloud-meta      metadata on SQLite or Postgres; the batch commit; the change feed
   sync      craft-cloud-sync      the sync engine over `Fs`/`Transport` traits; `MemFs`; scenario tests and the simulation
+  app       craft-cloud-app       what apps and the launcher link: a blocking client of the agent's local API (status, sign-in, recents)
 apps/
-  craft-cloud-server              HTTP API (`/api/v1`), auth, admin CLI (`init`, `serve`, `user`, `device`, `reset-epoch`)
-  craft-cloud-agent               the sync agent: real disk `Fs`, HTTP `Transport` over a `Connection`, saved account and state, root marker, CLI (`login`, `run`, `sync`, `status`, `logout`), the `run` loop
+  craft-cloud-server              HTTP API (`/api/v1`), the live service (`/api/v1/live`, `live.rs`), auth, admin CLI (`init`, `serve`, `user`, `device`, `reset-epoch`)
+  craft-cloud-agent               the sync agent: real disk `Fs`, HTTP `Transport` over a `Connection`, saved account and state, root marker, CLI (`login`, `run`, `sync`, `status`, `logout`, `recents`), the `run` loop, the local API (`local_api.rs`), the live hub (`live/`: recents document, replica, store, link, hub)
     tests/network/                the simulation over a simulated network (turmoil): `main.rs` histories and scenarios, `harness.rs` server and agent hosts
+    tests/recents_sim.rs          the recents convergence simulation: replicas against the server's live sessions
 xtask/                            cargo xtask ci | licenses | version
 docs/                             design documents and the self-hosting guide
 ```
 
 Layering: `proto` and `chunker` depend on nothing else in the workspace. `store` and `meta` depend on `proto`.
 The server depends on all three; nothing depends on the server outside tests. `sync` depends on `proto` and `chunker`
-(its tests also use `meta` and `store` as an in-process server). The agent depends on `proto` and `sync`; its
+(its tests also use `meta` and `store` as an in-process server). `app` depends on `proto` only and has no async
+runtime. The agent depends on `proto`, `sync` and `app` (its `recents` commands are clients like an app); its
 tests also run the server on a loopback port, and `tests/network/` runs the server's router and agents over
 `turmoil` (a dev-dependency: the shipped binaries never link it). That test target includes sync's test harness
 (`crates/sync/tests/common/`) by `#[path]`, so the agent's dev-dependencies mirror sync's test ones, and a change
@@ -63,6 +67,9 @@ talks to, any vendor's cloud.
   Seafile, and similar). Don't read their source while working on the matching feature here.
   MPL-2.0 code (Syncthing) is not copied either.
 - Dependencies must be permissively licensed (MIT, Apache-2.0, BSD, ISC, Zlib, Unicode, CC0, CDLA-Permissive-2.0 (data only, e.g. root certificates)).
+  Named exceptions, for what Loro (the live documents' CRDT) needs and for no other crate: MPL-2.0 for `im`,
+  `bitmaps` and `sized-chunks`, used as published and never modified or copied from; BSL-1.0 (the Boost licence)
+  for `xxhash-rust`.
   Adding one means checking its license and every transitive license. `cargo xtask licenses` (part of
   `cargo xtask ci` and CI) checks every crate in the build against this list; a data-only licence is allowed
   only for the crates named in `xtask/src/licenses.rs`.

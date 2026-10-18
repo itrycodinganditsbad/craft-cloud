@@ -1,6 +1,6 @@
 [package]
 name = "craft-cloud-proto"
-description = "Craft Cloud protocol types: names, IDs, chunk IDs and file manifests"
+description = "Craft Cloud protocol types: names, IDs, chunk IDs, file manifests, the live protocol and the agent's local API"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 blake3.workspace = true
 caseless.workspace = true
+postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 unicode-normalization.workspace = true
