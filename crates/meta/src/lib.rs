@@ -1,6 +1,6 @@
 //! Server metadata for Craft Cloud: users, devices, spaces, the node tree, versions, which blobs each space
-//! may use, the batch commit that changes it all, and live documents with their update logs. SQLite or Postgres,
-//! with the same behaviour.
+//! may use, the batch commit that changes it all, live documents with their update logs, and join codes (invites and
+//! add-a-computer pairings). SQLite or Postgres, with the same behaviour.
 //!
 //! Every write goes through one transaction. On SQLite, writes are serialised by a single lock (SQLite has
 //! one writer anyway, and this avoids "database is locked" retries); on Postgres, a commit locks its space's
@@ -10,6 +10,7 @@
 mod blobs;
 mod codec;
 mod commit;
+mod join;
 mod live;
 mod schema;
 mod tree;
@@ -25,6 +26,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub use commit::CommitOutcome;
 pub use craft_cloud_proto::BlobKind;
+pub use join::{InviteFor, Redeemed};
 pub use live::{LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE, MAX_LIVE_DOCS_PER_SPACE, MAX_LIVE_PAGE};
 pub use tree::SpaceInfo;
 pub use users::{DeviceAuth, DeviceRecord, Role, UserId, UserRecord, valid_username};
@@ -61,6 +63,12 @@ pub enum MetaError {
     /// nothing was stored.
     #[error("the account has {limit} live documents on the server, the most it may have")]
     TooManyDocRows { limit: u64 },
+    /// A join code that is wrong, expired or used, never saying which.
+    #[error("this code doesn't work any more")]
+    InvalidCode,
+    /// An invite to an account without a password was redeemed without a new one; nothing was changed.
+    #[error("this invite needs a new password for the account")]
+    PasswordRequired,
     #[error("invalid input: {0}")]
     Invalid(&'static str),
     #[error("stored data is damaged: {0}")]

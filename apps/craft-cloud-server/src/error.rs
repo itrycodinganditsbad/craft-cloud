@@ -58,6 +58,17 @@ impl ApiError {
         Self::new(StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED, "sign in again: the device token is missing, unknown or revoked")
     }
 
+    /// `404 invalid_code`: the one answer for a join code that is wrong, expired, used or malformed, so it never says
+    /// which.
+    pub fn invalid_code() -> Self {
+        Self::new(StatusCode::NOT_FOUND, codes::INVALID_CODE, "This code doesn't work any more. Make a new one on a signed-in computer.")
+    }
+
+    /// `400 password_required`: an invite to an account without a password needs a new one.
+    pub fn password_required() -> Self {
+        Self::new(StatusCode::BAD_REQUEST, codes::PASSWORD_REQUIRED, "this invite is for a new account: choose a password for it")
+    }
+
     pub fn internal() -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, codes::INTERNAL, "the server hit an internal error; the admin can find details in its log")
     }
@@ -82,6 +93,8 @@ impl From<MetaError> for ApiError {
             MetaError::ResyncRequired => Self::new(StatusCode::GONE, codes::RESYNC_REQUIRED, "list the whole tree again"),
             MetaError::Invalid(message) => Self::invalid(message),
             MetaError::NotFound(what) => Self::not_found(what),
+            MetaError::InvalidCode => Self::invalid_code(),
+            MetaError::PasswordRequired => Self::password_required(),
             MetaError::UsernameTaken => Self::new(StatusCode::CONFLICT, codes::USERNAME_TAKEN, "the username is taken"),
             MetaError::QuotaExceeded { used, limit } => Self::quota_exceeded(used, limit),
             MetaError::DocFull { .. } | MetaError::TooManyDocs { .. } | MetaError::TooManyDocRows { .. } => {

@@ -9,11 +9,13 @@ const SQLITE: &[&str] = &[
     include_str!("../migrations/sqlite/0001_init.sql"),
     include_str!("../migrations/sqlite/0002_stored_bytes.sql"),
     include_str!("../migrations/sqlite/0003_live.sql"),
+    include_str!("../migrations/sqlite/0004_join.sql"),
 ];
 const POSTGRES: &[&str] = &[
     include_str!("../migrations/postgres/0001_init.sql"),
     include_str!("../migrations/postgres/0002_stored_bytes.sql"),
     include_str!("../migrations/postgres/0003_live.sql"),
+    include_str!("../migrations/postgres/0004_join.sql"),
 ];
 
 /// Arbitrary fixed key for the Postgres advisory lock that serialises migrations between servers sharing one

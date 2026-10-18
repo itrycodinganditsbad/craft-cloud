@@ -1,6 +1,7 @@
 //! Users, their spaces, and devices.
 //!
-//! Passwords are hashed by the caller (Argon2id, in the server); this module only stores the hash string.
+//! Passwords are hashed by the caller (Argon2id, in the server); this module only stores the hash string. An account
+//! an invite created has an empty one until the invite is redeemed: no password matches it, since it is no hash.
 //! Device tokens are random 256-bit values; only their hash is stored, and a device is found by that hash.
 
 use craft_cloud_proto::{DeviceId, Epoch, NodeId, SpaceId};
@@ -115,43 +116,14 @@ impl Meta {
             return Err(MetaError::Invalid("usernames are 1-64 letters, digits, '.', '_' or '-'"));
         }
         let username = username.to_ascii_lowercase();
-        let username = username.as_str();
         let mut w = self.begin_write().await?;
-        let taken = sqlx::query("SELECT 1 FROM users WHERE username = $1").bind(username).fetch_optional(&mut *w.tx).await?;
+        let taken = sqlx::query("SELECT 1 FROM users WHERE username = $1").bind(username.as_str()).fetch_optional(&mut *w.tx).await?;
         if taken.is_some() {
             return Err(MetaError::UsernameTaken);
         }
-        sqlx::query("INSERT INTO users (id, username, password_hash, role, created_ms) VALUES ($1, $2, $3, $4, $5)")
-            .bind(uuid_bytes(&user.0))
-            .bind(username)
-            .bind(password_hash)
-            .bind(role.as_str())
-            .bind(now_ms)
-            .execute(&mut *w.tx)
-            .await
-            // Two signups racing for one name can both pass the check above; the unique index turns the loser's
-            // insert into a unique violation, which is the same answer as the check.
-            .map_err(|e| match e {
-                sqlx::Error::Database(ref db) if db.is_unique_violation() => MetaError::UsernameTaken,
-                other => MetaError::Db(other),
-            })?;
-        sqlx::query("INSERT INTO spaces (id, owner, epoch, seq, oldest_seq, root) VALUES ($1, $2, $3, 0, 0, $4)")
-            .bind(uuid_bytes(space.as_uuid()))
-            .bind(uuid_bytes(&user.0))
-            .bind(uuid_bytes(Epoch::generate().as_uuid()))
-            .bind(uuid_bytes(root.as_uuid()))
-            .execute(&mut *w.tx)
-            .await?;
-        sqlx::query(
-            "INSERT INTO nodes (space_id, id, parent, name, fold_key, is_dir, version, deleted, changed_seq) \
-             VALUES ($1, $2, NULL, '', '', 1, NULL, 0, 0)",
-        )
-        .bind(uuid_bytes(space.as_uuid()))
-        .bind(uuid_bytes(root.as_uuid()))
-        .execute(&mut *w.tx)
-        .await?;
+        let record = insert_user(&mut w.tx, &username, password_hash, role, now_ms, (user, space, root)).await?;
         w.commit().await?;
-        Ok(UserRecord { id: user, username: username.to_owned(), password_hash: password_hash.to_owned(), role, space })
+        Ok(record)
     }
 
     pub async fn user_by_name(&self, username: &str) -> Result<Option<UserRecord>, MetaError> {
@@ -188,19 +160,10 @@ impl Meta {
 
     /// Registers a device for `user` under the hash of its token.
     pub async fn create_device(&self, user: UserId, name: &str, token_hash: &[u8; 32], now_ms: i64) -> Result<DeviceId, MetaError> {
-        if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
-            return Err(MetaError::Invalid("device names are 1-128 bytes without control characters"));
-        }
+        check_device_name(name)?;
         let device = DeviceId::generate();
         let mut w = self.begin_write().await?;
-        sqlx::query("INSERT INTO devices (id, user_id, name, token_hash, created_ms, last_used_ms, revoked) VALUES ($1, $2, $3, $4, $5, $5, 0)")
-            .bind(uuid_bytes(device.as_uuid()))
-            .bind(uuid_bytes(&user.0))
-            .bind(name)
-            .bind(token_hash.to_vec())
-            .bind(now_ms)
-            .execute(&mut *w.tx)
-            .await?;
+        insert_device(&mut w.tx, device, user, name, token_hash, now_ms).await?;
         w.commit().await?;
         Ok(device)
     }
@@ -257,7 +220,8 @@ impl Meta {
         Ok(row.is_some())
     }
 
-    /// Revokes one of `user`'s devices. Revoking another user's device is `NotFound`.
+    /// Revokes one of `user`'s devices, and deletes the pairing it made, if any (its add-a-computer code dies with
+    /// it). Revoking another user's device is `NotFound`.
     pub async fn revoke_device(&self, user: UserId, device: DeviceId) -> Result<(), MetaError> {
         let mut w = self.begin_write().await?;
         let done = sqlx::query("UPDATE devices SET revoked = 1 WHERE id = $1 AND user_id = $2")
@@ -268,6 +232,77 @@ impl Meta {
         if done.rows_affected() == 0 {
             return Err(MetaError::NotFound("device"));
         }
+        sqlx::query("DELETE FROM pairings WHERE device_id = $1").bind(uuid_bytes(device.as_uuid())).execute(&mut *w.tx).await?;
         w.commit().await
     }
+}
+
+/// The device name rule: 1–128 bytes without control characters.
+pub(crate) fn check_device_name(name: &str) -> Result<(), MetaError> {
+    if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+        return Err(MetaError::Invalid("device names are 1-128 bytes without control characters"));
+    }
+    Ok(())
+}
+
+/// Inserts a user (`username` already checked and in lowercase) with their space and its root directory, in `tx`.
+/// A name taken meanwhile is `UsernameTaken`.
+pub(crate) async fn insert_user(
+    tx: &mut sqlx::Transaction<'static, sqlx::Any>,
+    username: &str,
+    password_hash: &str,
+    role: Role,
+    now_ms: i64,
+    (user, space, root): (UserId, SpaceId, NodeId),
+) -> Result<UserRecord, MetaError> {
+    sqlx::query("INSERT INTO users (id, username, password_hash, role, created_ms) VALUES ($1, $2, $3, $4, $5)")
+        .bind(uuid_bytes(&user.0))
+        .bind(username)
+        .bind(password_hash)
+        .bind(role.as_str())
+        .bind(now_ms)
+        .execute(&mut **tx)
+        .await
+        // Two signups racing for one name can both pass a check before this; the unique index turns the loser's
+        // insert into a unique violation, which is the same answer as the check.
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref db) if db.is_unique_violation() => MetaError::UsernameTaken,
+            other => MetaError::Db(other),
+        })?;
+    sqlx::query("INSERT INTO spaces (id, owner, epoch, seq, oldest_seq, root) VALUES ($1, $2, $3, 0, 0, $4)")
+        .bind(uuid_bytes(space.as_uuid()))
+        .bind(uuid_bytes(&user.0))
+        .bind(uuid_bytes(Epoch::generate().as_uuid()))
+        .bind(uuid_bytes(root.as_uuid()))
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO nodes (space_id, id, parent, name, fold_key, is_dir, version, deleted, changed_seq) \
+         VALUES ($1, $2, NULL, '', '', 1, NULL, 0, 0)",
+    )
+    .bind(uuid_bytes(space.as_uuid()))
+    .bind(uuid_bytes(root.as_uuid()))
+    .execute(&mut **tx)
+    .await?;
+    Ok(UserRecord { id: user, username: username.to_owned(), password_hash: password_hash.to_owned(), role, space })
+}
+
+/// Inserts a device (its name already checked) in `tx`.
+pub(crate) async fn insert_device(
+    tx: &mut sqlx::Transaction<'static, sqlx::Any>,
+    device: DeviceId,
+    user: UserId,
+    name: &str,
+    token_hash: &[u8; 32],
+    now_ms: i64,
+) -> Result<(), MetaError> {
+    sqlx::query("INSERT INTO devices (id, user_id, name, token_hash, created_ms, last_used_ms, revoked) VALUES ($1, $2, $3, $4, $5, $5, 0)")
+        .bind(uuid_bytes(device.as_uuid()))
+        .bind(uuid_bytes(&user.0))
+        .bind(name)
+        .bind(token_hash.to_vec())
+        .bind(now_ms)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
