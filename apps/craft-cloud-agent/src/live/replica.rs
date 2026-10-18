@@ -1071,6 +1071,19 @@ impl<S: DocStore> Replica<S> {
                 doc.start_over();
                 Ok(subscribe(id, doc, epoch))
             }
+            // A create refused because the account is at its live-document limit (the server's cap): tried again after a
+            // growing pause, and the recents stay here until then. The link stays up for the other lists.
+            (codes::QUOTA_EXCEEDED, Some((_, doc)), None) => {
+                let pause = doc.retry.map_or(1, |(_, pause)| pause.max(1));
+                doc.sub = Sub::No;
+                doc.retry = Some((pause, pause));
+                let line = format!(
+                    "the account has as many live documents as the server allows; the recents of {} stay on this machine ({message})",
+                    doc.app
+                );
+                doc.say(&mut self.notes, line);
+                Ok(Vec::new())
+            }
             // A create or subscribe refused for a moment (the budget, the device's cap), or a subscribe to a document
             // whose create was refused, or one repeated during a catch-up: tried again after a growing pause.
             (codes::RATE_LIMITED | codes::NOT_FOUND | codes::INVALID, Some((_, doc)), None) => {
@@ -1604,6 +1617,29 @@ mod tests {
         r.on_frame(welcome(1)).unwrap();
         let frames = r.on_frame(ServerFrame::Subscribed { doc, head: 0 }).unwrap();
         assert_eq!(frames.len(), 2, "both go again: {frames:?}");
+    }
+
+    /// A create refused at the account's live-document limit pauses that one list and says so; the link stays up and
+    /// the other lists carry on.
+    #[test]
+    fn a_refused_create_at_the_document_limit_pauses_without_dropping_the_link() {
+        let space = SpaceId::generate();
+        let doc = recents_doc(space, &app());
+        let other_app = AppName::new("sheetcraft").unwrap();
+        let other = recents_doc(space, &other_app);
+        let mut r = Replica::open(MemStore::default(), space, peers()).unwrap();
+        r.follow(&app());
+        r.follow(&other_app);
+        r.connected();
+        r.on_frame(welcome(1)).unwrap();
+        r.on_frame(ServerFrame::Subscribed { doc: other, head: 0 }).unwrap();
+        let refused = r.on_frame(ServerFrame::error("quota_exceeded", "too many live documents", Some(doc), None));
+        assert!(refused.is_ok(), "the link stays up: {refused:?}");
+        assert!(refused.unwrap().is_empty());
+        assert!(r.docs[&doc].sub == Sub::No, "the refused list is not subscribed");
+        assert!(r.docs[&doc].retry.is_some(), "a try again is paused");
+        assert!(r.docs[&other].sub == Sub::Live, "the other list is unaffected");
+        assert!(r.take_notes().iter().any(|n| n.contains("recents of wordcraft")), "the user is told");
     }
 
     /// Loro failing on an update may leave the document half-changed: it is read back from its file, the update is
