@@ -12,6 +12,10 @@
 //! - **Stop**: the first stop request (Ctrl-C, or SIGTERM on Unix) starts no new pass, lets a running one finish,
 //!   writes the status and ends with exit code 0. A second one ends at once with exit code 1 (the pass is cut
 //!   short; its checkpoints keep that safe, as after a crash).
+//! - **Pause** (the local API's `pause` and `resume`): no new pass starts (one under way finishes), and the
+//!   long-poll, the folder watcher and the live connection hold; the local API and apps' recents keep working (adds
+//!   reach the server after resume). It is kept in `state.json`, so a paused agent starts paused. Resuming runs a full
+//!   pass at once. **Quit** (the local API's `quit`) is a first stop request.
 //! - **Status**: `status.json` in the data folder ([`LoopStatus`]) is written on every change of state and as a
 //!   heartbeat, so `status` can tell whether the loop runs and what it is doing.
 //! - **Approval**: while deletions wait, the loop looks for `approval.json` (written by `sync --approve-deletes`
@@ -30,7 +34,7 @@ use tokio::sync::{mpsc, watch};
 use craft_cloud_proto::local::RunState;
 
 use crate::account::{Approval, DataDir, LastPass, LoopState, LoopStatus, PassSummary, STATUS_SCHEMA};
-use crate::cli::{AgentError, Exit, LoginArgs, Session, hold_data, now_ms, print_summary};
+use crate::cli::{AgentError, Exit, JoinArgs, LoginArgs, Session, hold_data, now_ms, print_summary};
 use crate::http::{Connection, HttpTransport, PollError};
 use crate::live::{Hub, HubConfig};
 use crate::local_api::{Command, Control, LocalApi};
@@ -58,6 +62,9 @@ pub struct RunOptions {
     /// Tests: the folder watcher fails to start, as it does when the system's watch limit is reached.
     #[doc(hidden)]
     pub fail_watch: bool,
+    /// Where the local API's `autostart` puts the agent's start-at-login entry (and a sign-out removes it from):
+    /// this user's, or nowhere / a temporary place in tests, which must not touch the machine's own.
+    pub autostart: crate::autostart::Target,
 }
 
 impl Default for RunOptions {
@@ -71,6 +78,7 @@ impl Default for RunOptions {
             poll_min_spacing: Duration::from_secs(1),
             poll_busy: Duration::from_secs(5),
             fail_watch: false,
+            autostart: crate::autostart::Target::User,
         }
     }
 }
@@ -162,6 +170,29 @@ fn pass_thread(data: DataDir, stability: Stability, requests: std::sync::mpsc::R
         if events.send(Event::Pass(Box::new(PassDone { result, last_pass, seq, recheck_in }))).is_err() {
             return;
         }
+    }
+}
+
+/// The longest the loop waits for the live hub to take a pause or resume (the hub gives up closing its connection
+/// after [`crate::live::hub::CLOSE_TIMEOUT`]).
+const HUB_ANSWER: Duration = Duration::from_secs(10);
+
+/// What the loop says when syncing is paused by the user.
+const PAUSED: &str = "paused: nothing syncs until `craft-cloud-agent resume` (recents still work on this computer)";
+
+/// Writes whether syncing is paused into `state.json` ([`crate::account::SavedState::paused`]), so it holds after a
+/// restart. Only while no pass runs: a pass writes the file too. A failure is said; the pause holds all the same
+/// until the agent stops.
+fn remember_paused(data: &DataDir, paused: bool, out: &mut impl Write) {
+    let saved = data.load_state().and_then(|mut saved| {
+        if saved.paused == paused {
+            return Ok(());
+        }
+        saved.paused = paused;
+        data.save_state(&saved)
+    });
+    if let Err(e) = saved {
+        let _ = writeln!(out, "can't remember the pause for the next start: {e}");
     }
 }
 
@@ -375,6 +406,7 @@ fn run_state(state: &LoopState) -> RunState {
         LoopState::Paused { reason, .. } => RunState::Paused { reason: reason.clone() },
         LoopState::Stopping | LoopState::Stopped => RunState::Stopping,
         LoopState::SignedOut => RunState::SignedOut,
+        LoopState::PausedByUser => RunState::PausedByUser,
     }
 }
 
@@ -473,7 +505,12 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
     };
     // The local API serves from the start, signed in or not; it is stopped (and its file removed) when the loop ends.
     let (commands_tx, mut commands) = mpsc::channel::<Command>(8);
-    let control = Control::new(commands_tx);
+    let autostart_roots = options.autostart.roots().unwrap_or_else(|e| {
+        say(out, &format!("start at login can't be set from here: {e}"));
+        None
+    });
+    let control = Control::new(commands_tx).with_autostart(autostart_roots, data.path());
+    control.refresh_autostart().await;
     let api = LocalApi::start(data, control.clone()).await?;
     say(out, &format!("craft-cloud-agent: local API on 127.0.0.1:{} (for apps and the launcher)", api.port()));
     let mut status = Status {
@@ -510,6 +547,11 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             }
         };
         control.set_account(Some(&account));
+        // Paused by the user (kept in `state.json`): no pass, long-poll, watcher or live connection until resumed.
+        let mut user_paused = data.load_state().is_ok_and(|saved| saved.paused);
+        // A pause or resume came while a pass ran: `state.json` is written once it is done (the pass writes it too).
+        let mut paused_unsaved = false;
+        let mut pass_running = false;
         // The live hub (recents) runs while signed in, online or not. One that can't open its documents leaves recents
         // off; the folder syncs all the same.
         let hub_config = HubConfig {
@@ -519,7 +561,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             token: account.token.clone(),
             machine: account.device_name.clone(),
         };
-        let hub = match Hub::start(hub_config, control.clone()) {
+        let hub = match Hub::start(hub_config, control.clone(), user_paused) {
             Ok(hub) => Some(hub),
             Err(e) => {
                 say(out, &format!("recents are off: their documents can't be opened ({e})"));
@@ -542,16 +584,21 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
         let since = data.load_state().ok().and_then(|saved| saved.state.space.map(|_| saved.state.seq));
         let (since_tx, since_rx) = watch::channel::<Option<u64>>(since);
         let transport = HttpTransport::new(account.server.clone(), &account.token)?;
-        let polled = events_tx.clone();
-        let tell = move |p: Polled| {
-            polled
-                .send(match p {
-                    Polled::Changed => Event::Remote,
-                    Polled::Back => Event::ServerBack,
-                })
-                .is_ok()
+        let poll_events = events_tx.clone();
+        // The long-poll runs while not paused (it is started again on resume).
+        let start_poll = move || {
+            let polled = poll_events.clone();
+            let tell = move |p: Polled| {
+                polled
+                    .send(match p {
+                        Polled::Changed => Event::Remote,
+                        Polled::Back => Event::ServerBack,
+                    })
+                    .is_ok()
+            };
+            tokio::spawn(long_poll(transport.clone(), since_rx.clone(), tell, options, random))
         };
-        let poll = tokio::spawn(long_poll(transport, since_rx, tell, options, random));
+        let mut poll = (!user_paused).then(&start_poll);
 
         let mut scheduler = Scheduler::new(options.timing, status.now(), random);
         let mut watching = Watching::default();
@@ -561,6 +608,9 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
         let mut last_held: Option<String> = None;
         let mut commands_open = true;
         say(out, &format!("craft-cloud-agent: syncing {} with {} (Ctrl-C stops)", account.folder.display(), account.server));
+        if user_paused {
+            say(out, PAUSED);
+        }
 
         let end = loop {
             let now = status.now();
@@ -568,7 +618,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             // and after a folder that was missing came back (not while the loop is paused: the folder may be gone). One
             // that can't start is said once and tried again later, less and less often; meanwhile a full pass runs every
             // minute, and the long-poll still syncs the server's changes.
-            let paused = matches!(scheduler.phase(), Phase::Paused { .. });
+            let paused = matches!(scheduler.phase(), Phase::Paused { .. }) || user_paused;
             if watching.watcher.is_none() && !scheduler.is_stopping() && !paused && now >= watching.next_try {
                 let (wtx, wrx) = mpsc::unbounded_channel();
                 let started = if options.fail_watch {
@@ -605,8 +655,12 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             if take_due_peeks(&account.folder, &stability) {
                 scheduler.local_change(now);
             }
-            status.write(status.state(scheduler.phase()), scheduler.waiting_for_approval(), false);
-            let until = match scheduler.next(now) {
+            // Paused by the user: no pass starts (one under way finishes), until resumed or stopped.
+            let held = user_paused && !scheduler.is_stopping();
+            let state = if held { LoopState::PausedByUser } else { status.state(scheduler.phase()) };
+            status.write(state, scheduler.waiting_for_approval(), false);
+            let next = if held { Next::Wait(None) } else { scheduler.next(now) };
+            let until = match next {
                 Next::Exit => break End::Exit(Exit::Done),
                 Next::RunPass => {
                     // Windows: the watcher is made afresh with this pass (see `Watching::renew_before_pass`); the loop
@@ -621,6 +675,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                     if requests.send(std::mem::take(&mut approved)).is_err() {
                         break End::Exit(Exit::Failed);
                     }
+                    pass_running = true;
                     status.write(LoopState::Syncing, scheduler.waiting_for_approval(), true);
                     continue;
                 }
@@ -681,6 +736,10 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                     Some(Event::Remote) => scheduler.urgent_change(),
                     Some(Event::ServerBack) => scheduler.server_back(),
                     Some(Event::Pass(done)) => {
+                        pass_running = false;
+                        if std::mem::take(&mut paused_unsaved) {
+                            remember_paused(data, user_paused, out);
+                        }
                         let end = pass_end(&done.result, done.recheck_in);
                         if let Some(seq) = done.seq {
                             let _ = since_tx.send(Some(seq));
@@ -734,7 +793,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                     None => stop_open = false,
                 },
                 command = commands.recv(), if commands_open => match command {
-                    Some(Command::Login(_, reply)) => {
+                    Some(Command::Login(_, reply) | Command::Join(_, reply)) => {
                         let _ = reply.send(Err(crate::cli::already_signed_in(&account)));
                     }
                     // Signed out on the server first (an unreachable server changes nothing, and syncing goes on); then
@@ -748,12 +807,61 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                             }
                         }
                     }
+                    Some(Command::Pause(reply)) => {
+                        if !user_paused {
+                            user_paused = true;
+                            if let Some(poll) = poll.take() {
+                                poll.abort();
+                            }
+                            watching.watcher = None;
+                            if let Some(hub) = &hub {
+                                // Bounded: a hub that doesn't answer never holds up the loop (its stop, quit, beats).
+                                let _ = tokio::time::timeout(HUB_ANSWER, hub.handle().set_paused(true)).await;
+                            }
+                            if pass_running {
+                                paused_unsaved = true;
+                            } else {
+                                remember_paused(data, true, out);
+                            }
+                            say(out, PAUSED);
+                        }
+                        // Paused before the caller hears it, so the status it reads next says so.
+                        status.write(LoopState::PausedByUser, scheduler.waiting_for_approval(), true);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Some(Command::Resume(reply)) => {
+                        if user_paused {
+                            user_paused = false;
+                            if pass_running {
+                                paused_unsaved = true;
+                            } else {
+                                remember_paused(data, false, out);
+                            }
+                            poll = Some(start_poll());
+                            if let Some(hub) = &hub {
+                                let _ = tokio::time::timeout(HUB_ANSWER, hub.handle().set_paused(false)).await;
+                            }
+                            // What changed meanwhile is found by a full pass now.
+                            scheduler.urgent_change();
+                            say(out, "resumed: syncing again");
+                        }
+                        status.write(status.state(scheduler.phase()), scheduler.waiting_for_approval(), true);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Some(Command::Quit(reply)) => {
+                        say(out, "quitting after the running pass");
+                        scheduler.stop();
+                        watching.watcher = None;
+                        let _ = reply.send(Ok(()));
+                    }
                     None => commands_open = false,
                 },
                 () = sleep => {}
             }
         };
-        poll.abort();
+        if let Some(poll) = poll.take() {
+            poll.abort();
+        }
         drop(watching);
         drop(requests);
         // Recents stop with the account: their followers are told, and what they were given is on disk.
@@ -773,6 +881,15 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                 // A running pass finishes first (its thread then ends and lets go of the folder).
                 let _ = tokio::task::spawn_blocking(move || pass.join()).await;
                 let forgotten = crate::cli::forget_account(data);
+                // Signed out, the agent no longer starts at login.
+                if let Some(roots) = control.autostart_roots() {
+                    match tokio::task::spawn_blocking(move || crate::autostart::unregister(&roots)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => say(out, &format!("the start-at-login entry couldn't be removed: {e}")),
+                        Err(e) => say(out, &format!("the start-at-login entry couldn't be removed: {e}")),
+                    }
+                    control.refresh_autostart().await;
+                }
                 match &forgotten {
                     Ok(()) => say(out, &format!("signed out of {}; the files in {} stay", account.server, account.folder.display())),
                     // The device is revoked on the server already: the account here is dead, and is never used again
@@ -788,7 +905,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             }
         }
     };
-    drop(api);
+    api.stop().await;
     drop(data_lock);
     say(out, "stopped");
     Ok(exit)
@@ -835,22 +952,30 @@ async fn wait_for_sign_in(
                         adopt: request.adopt,
                     };
                     let result = crate::cli::login_locked(data, &args, &request.password).await;
-                    let signed_in = match &result {
-                        Ok(account) => {
-                            let _ = writeln!(out, "signed in as {} on {} (device \"{}\")", account.username, account.server, account.device_name);
-                            // Signed in before the caller hears it, so the status it reads next says so.
-                            control.set_account(Some(account));
-                            true
-                        }
-                        Err(_) => false,
-                    };
-                    let _ = reply.send(result.map(|_| ()));
-                    if signed_in {
+                    if signed_in(result, "signed in", control, reply, out) {
                         return SignedOut::SignedIn;
                     }
                 }
-                Some(Command::Logout(_, reply)) => {
+                Some(Command::Join(request, reply)) => {
+                    let args = JoinArgs {
+                        join: request.join.clone(),
+                        folder: request.folder.as_ref().map(std::path::PathBuf::from),
+                        device_name: request.device_name.clone(),
+                        adopt: request.adopt,
+                        // The caller asks for it with `POST /v1/autostart` once joined.
+                        autostart: false,
+                    };
+                    let result = crate::cli::join_locked(data, &args, request.password.as_deref()).await;
+                    if signed_in(result, "joined", control, reply, out) {
+                        return SignedOut::SignedIn;
+                    }
+                }
+                Some(Command::Logout(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
                     let _ = reply.send(Err(AgentError::NotSignedIn));
+                }
+                Some(Command::Quit(reply)) => {
+                    let _ = reply.send(Ok(()));
+                    return SignedOut::Stop;
                 }
                 None => commands_open = false,
             },
@@ -861,6 +986,27 @@ async fn wait_for_sign_in(
             () = tokio::time::sleep(wake) => {}
         }
     }
+}
+
+/// Hands a sign-in's or join's outcome to the caller: `true` once signed in (as which account is said, and the local
+/// API's status says so before the caller hears it).
+fn signed_in(
+    result: Result<crate::account::Account, AgentError>,
+    how: &str,
+    control: &Control,
+    reply: tokio::sync::oneshot::Sender<Result<(), AgentError>>,
+    out: &mut impl Write,
+) -> bool {
+    let done = match &result {
+        Ok(account) => {
+            let _ = writeln!(out, "{how} as {} on {} (device \"{}\")", account.username, account.server, account.device_name);
+            control.set_account(Some(account));
+            true
+        }
+        Err(_) => false,
+    };
+    let _ = reply.send(result.map(|_| ()));
+    done
 }
 
 /// Whether a watcher event runs a pass: it does unless every path in it is a file waiting to settle (an event without

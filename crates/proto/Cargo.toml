@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 blake3.workspace = true
 caseless.workspace = true
+getrandom.workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true

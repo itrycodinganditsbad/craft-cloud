@@ -12,13 +12,34 @@ dir, exact `Host: 127.0.0.1:<port>`, any `Origin` refused, token only in `Author
 per app connection for live sessions. `run` serves it while signed out too. Calls:
 - `POST /v1/login {server, user, password, folder?, device_name?, adopt?}` / `POST /v1/logout {local}` (the launcher's;
   the password goes from the launcher to the agent, never to an app or a file);
-- `GET /v1/status` → `{api, signed_in, account, server, folder, machine, online, run_state}`;
+- `POST /v1/join {join, folder?, device_name?, adopt, password?}` → status: parses the join string
+  (`cloud.example.com/K7M4-Q9TX` or the link `https://cloud.example.com/join/K7M4-Q9TX`), checks what it can before
+  the code is spent (the folder, the device name, the server's `/info`), redeems it and signs in as `login` does.
+  Refused while signed in. A setup that fails after the code is spent (the folder is set up for another space)
+  revokes the new device and says to make a new code. `password` only for an invite to a new account, which is
+  answered `password_required` without it;
+- `POST /v1/pairings` → `{id, join, link, expires_ms}` (a new add-a-computer code, replacing this device's open
+  one), `GET /v1/pairings/{id}` → `{state: waiting|used|expired, device_name?}`, `DELETE /v1/pairings/{id}` → 204;
+- `GET /v1/devices` → the account's devices (`current` marks this one); `DELETE /v1/devices/{id}` revokes another one
+  and answers the list after (this one is refused with `cannot_remove_self`: that is `logout`);
+- `POST /v1/pause` / `POST /v1/resume` → status: while paused no sync pass starts (one under way finishes), and the
+  long-poll, the folder watcher and the live connection hold; the local API and the apps' recents keep working (adds
+  reach the server after resume). Kept in `state.json`, so a paused agent starts paused; `run_state` is
+  `paused_by_user`, apart from `paused`, which needs someone;
+- `POST /v1/quit` → status: the agent finishes the pass under way and exits (the answer goes out first);
+- `POST /v1/autostart {on}` → status: the agent registers or removes its own start-at-login entry (the Windows `Run`
+  value for the background build, a macOS launch agent, a systemd user unit or an XDG autostart entry), and
+  `status.autostart` says whether it is on (absent where the agent doesn't handle it). Signing out turns it off. The
+  entry belongs to the agent with the default data folder only; an agent with a data folder of its own is refused
+  (`autostart_failed`), reports nothing and leaves the entry alone when it signs out;
+- `GET /v1/status` → `{api, signed_in, account, server, folder, machine, online, run_state, autostart?}`;
 - `GET /v1/recents` (WebSocket: subscribe per app, add an entry `{path, title?, saved}`, receive the list on change);
 - later: `open` (a path → its live document, created by import when absent; returns the state and then a stream
   of remote updates and presence), `update` (the app's local changes), `presence`, `close`.
 
 Errors use stable codes (`forbidden`, `wrong_password`, `already_signed_in`, `not_signed_in`, `offline`,
-`needs_you`). Each request is answered before the next is read; a client that doesn't take a message within 10 s is
+`needs_you`, and for joining `invalid_code`, `password_required`, `weak_password`, `untrusted_certificate`,
+`cannot_remove_self`, `autostart_failed`). Every call has the same `Host`, `Origin` and token checks. Each request is answered before the next is read; a client that doesn't take a message within 10 s is
 disconnected, and the crate reconnects.
 
 **Server live endpoint** (agent ↔ server): `GET /api/v1/live` upgraded to a WebSocket, signed in with the device

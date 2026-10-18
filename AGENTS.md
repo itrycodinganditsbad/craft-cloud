@@ -26,15 +26,15 @@ The design lives in `docs/design/sync.md`; the live protocols (the server's live
 
 ```text
 crates/
-  proto     craft-cloud-proto     wire types: names, IDs, hashes, manifests, commit ops, API bodies, limits
+  proto     craft-cloud-proto     wire types: names, IDs, hashes, manifests, commit ops, API bodies, limits, join codes and join strings (`join.rs`)
   chunker   craft-cloud-chunker   FastCDC `fastcdc-v1` + BLAKE3, frozen by golden vectors
   store     craft-cloud-store     blob store: disk, S3, memory; checks every blob in and out
-  meta      craft-cloud-meta      metadata on SQLite or Postgres; the batch commit; the change feed
+  meta      craft-cloud-meta      metadata on SQLite or Postgres; the batch commit; the change feed; invites and pairings (`join.rs`)
   sync      craft-cloud-sync      the sync engine over `Fs`/`Transport` traits; `MemFs`; scenario tests and the simulation
-  app       craft-cloud-app       what apps and the launcher link: a blocking client of the agent's local API (status, sign-in, recents)
+  app       craft-cloud-app       what apps and the launcher link: a blocking client of the agent's local API (status, sign-in, joining, computers, pause, autostart, recents)
 apps/
-  craft-cloud-server              HTTP API (`/api/v1`), the live service (`/api/v1/live`, `live.rs`), auth, admin CLI (`init`, `serve`, `user`, `device`, `reset-epoch`)
-  craft-cloud-agent               the sync agent: real disk `Fs`, HTTP `Transport` over a `Connection`, saved account and state, root marker, CLI (`login`, `run`, `sync`, `status`, `logout`, `recents`), the `run` loop, the local API (`local_api.rs`), the live hub (`live/`: recents document, replica, store, link, hub)
+  craft-cloud-server              HTTP API (`/api/v1`), the live service (`/api/v1/live`, `live.rs`), join codes (`join.rs`: pairings, join, the `/join/{code}` page), auth, admin CLI (`init`, `serve`, `user` with `invite`, `device`, `reset-epoch`, `live`)
+  craft-cloud-agent               the sync agent: real disk `Fs`, HTTP `Transport` over a `Connection`, saved account and state, root marker, CLI (`login`, `join`, `run`, `sync`, `status`, `logout`, `recents`, `add-computer`, `devices`, `pause`, `resume`, `quit`, `autostart`), the `run` loop, the local API (`local_api.rs`), the live hub (`live/`: recents document, replica, store, link, hub), start at login (`autostart/`: Windows, macOS, Linux), the background build (`src/bin/bg.rs`, logging to `runlog.rs`)
     tests/network/                the simulation over a simulated network (turmoil): `main.rs` histories and scenarios, `harness.rs` server and agent hosts
     tests/recents_sim.rs          the recents convergence simulation: replicas against the server's live sessions
 xtask/                            cargo xtask ci | licenses | version

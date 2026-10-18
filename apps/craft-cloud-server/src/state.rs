@@ -95,6 +95,8 @@ pub struct AppState {
     pub store: Store,
     pub trusted_proxies: Vec<IpAddr>,
     pub logins: Limiter,
+    /// Failed join-code redeems per client address, in one-minute windows ([`crate::join`]).
+    pub joins: Limiter,
     pub notifier: Notifier,
     /// The live service's connections and subscriptions ([`crate::live`]).
     pub live: LiveHub,
@@ -120,6 +122,7 @@ impl AppState {
             store,
             trusted_proxies,
             logins: Limiter::new(Duration::from_secs(300)),
+            joins: Limiter::new(Duration::from_secs(60)),
             notifier: Notifier::default(),
             live: LiveHub::default(),
             bodies: PerUser::new(limits.bodies_per_user),

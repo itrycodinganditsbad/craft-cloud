@@ -13,6 +13,8 @@ use crate::Error;
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// A quick call's answer (status) must come within this: the agent answers it from memory.
 pub(crate) const QUICK_TIMEOUT: Duration = Duration::from_secs(2);
+/// What the agent's loop answers itself (pause, resume, quit, autostart): quick, but it may be finishing something.
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// A sign-in or sign-out waits for the server (an Argon2 check, the first steps, a revoke): only these get this long.
 pub(crate) const SLOW_TIMEOUT: Duration = Duration::from_secs(90);
 /// Most bytes of an answer's head.

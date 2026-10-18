@@ -1,4 +1,4 @@
-//! Login rate limiting and the client address behind trusted proxies.
+//! Login and join rate limiting, and the client address behind trusted proxies.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -51,6 +51,18 @@ impl Limiter {
         }
         entry.1 = entry.1.saturating_add(1);
         entry.1 <= max
+    }
+
+    /// Gives back one attempt [`Limiter::allow`] counted for `key` in its current window: for a caller that counts
+    /// only failures, but must count every attempt up front so that attempts made at the same moment are held to the
+    /// limit too.
+    pub fn refund(&self, key: &str, now: Instant) {
+        let mut windows = self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = windows.entries.get_mut(key)
+            && now.saturating_duration_since(entry.0) < self.period
+        {
+            entry.1 = entry.1.saturating_sub(1);
+        }
     }
 }
 
@@ -105,6 +117,20 @@ mod tests {
         assert!(!limiter.allow("user:ana", 3, t0));
         assert!(limiter.allow("user:bob", 3, t0));
         assert!(limiter.allow("user:ana", 3, t0 + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn a_refund_gives_back_one_attempt_of_the_current_window() {
+        let limiter = Limiter::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        assert!(limiter.allow("ip:a", 2, t0));
+        assert!(limiter.allow("ip:a", 2, t0));
+        limiter.refund("ip:a", t0);
+        assert!(limiter.allow("ip:a", 2, t0), "the refunded attempt");
+        assert!(!limiter.allow("ip:a", 2, t0));
+        limiter.refund("ip:unknown", t0);
+        limiter.refund("ip:a", t0 + Duration::from_secs(61));
+        assert!(limiter.allow("ip:a", 2, t0 + Duration::from_secs(61)), "a new window starts afresh anyway");
     }
 
     #[test]

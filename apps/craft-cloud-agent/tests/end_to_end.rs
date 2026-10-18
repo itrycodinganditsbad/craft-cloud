@@ -1073,3 +1073,31 @@ async fn https_refuses_an_untrusted_certificate_and_works_with_a_trusted_one() {
     let trusting = Reqwest::trusting_only(&url, &[TEST_CERT]).unwrap();
     assert_eq!(info_over(&trusting, &url).await.unwrap(), info);
 }
+
+/// A join to a server whose certificate this computer doesn't trust says so (and how to fix it), and one to a server
+/// that can't be reached names the address tried; neither creates anything here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_that_cant_reach_the_server_says_why_and_creates_nothing() {
+    use craft_cloud_agent::cli::JoinArgs;
+    use craft_cloud_agent::local_api::LocalError;
+    use craft_cloud_proto::local::codes;
+    let port = tls_listener(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder = dir.path().join("Craft Cloud");
+    let args = |join: String| JoinArgs { join, folder: Some(folder.clone()), device_name: Some("pc".into()), adopt: false, autostart: false };
+
+    let untrusted = cli::join(&data, &args(format!("https://localhost:{port}/K7M4-Q9TX")), None, &mut Vec::new()).await.unwrap_err();
+    assert!(matches!(untrusted, AgentError::UntrustedCertificate { ref host } if host == "localhost"), "{untrusted:?}");
+    let message = untrusted.to_string();
+    assert!(message.contains("This computer doesn't trust localhost's certificate") && message.contains("root certificate"), "{message}");
+    assert_eq!(LocalError::from(untrusted).code, codes::UNTRUSTED_CERTIFICATE);
+
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let unreachable = cli::join(&data, &args(format!("http://127.0.0.1:{closed}/K7M4-Q9TX")), None, &mut Vec::new()).await.unwrap_err();
+    assert!(unreachable.to_string().contains(&format!("127.0.0.1:{closed}")), "{unreachable}");
+    assert_eq!(LocalError::from(unreachable).code, codes::OFFLINE);
+
+    assert!(data.load_account().unwrap().is_none());
+    assert!(!folder.exists(), "nothing made here");
+}

@@ -8,10 +8,14 @@
 //!   `127.0.0.1:<port>`; any request with an `Origin` header is refused (a browser always sends one with a
 //!   WebSocket); the token is accepted only as `Authorization: Bearer <token>`, never from the query string; it is
 //!   never logged.
-//! - **Calls** (JSON): `GET /v1/status` → [`Status`]; `POST /v1/login` ([`LoginRequest`]) → [`Status`];
-//!   `POST /v1/logout` ([`LogoutRequest`]) → [`Status`]; `GET /v1/recents`, upgraded to a WebSocket of JSON text
-//!   messages: [`RecentsRequest`] in, [`RecentsEvent`] out. Errors are the HTTP API's
-//!   [`ErrorBody`](crate::api::ErrorBody) with its codes.
+//! - **Calls** (JSON, all at [`paths`]): `GET /v1/status` → [`Status`]; `POST /v1/login` ([`LoginRequest`]) →
+//!   [`Status`]; `POST /v1/join` ([`JoinRequest`]) → [`Status`]; `POST /v1/logout` ([`LogoutRequest`]) → [`Status`];
+//!   `POST /v1/pairings` → [`PairingInfo`], `GET /v1/pairings/{id}` → [`PairingStatus`](crate::api::PairingStatus),
+//!   `DELETE /v1/pairings/{id}` → 204; `GET /v1/devices` → a list of [`DeviceInfo`](crate::api::DeviceInfo),
+//!   `DELETE /v1/devices/{id}` → the list after; `POST /v1/pause`, `/v1/resume` and `/v1/quit` → [`Status`];
+//!   `POST /v1/autostart` ([`AutostartRequest`]) → [`Status`]; `GET /v1/recents`, upgraded to a WebSocket of JSON
+//!   text messages: [`RecentsRequest`] in, [`RecentsEvent`] out. Errors are the HTTP API's
+//!   [`ErrorBody`](crate::api::ErrorBody) with its codes and [`codes`].
 //! - **Versions**: [`Status::api`] is the local API version the agent speaks; a client refuses one outside
 //!   [`LOCAL_API_MIN`]..=[`LOCAL_API_MAX`] when it connects.
 
@@ -62,6 +66,19 @@ pub mod codes {
     pub const OFFLINE: &str = "offline";
     /// The agent stopped for something only a person can put right (the message says what).
     pub const NEEDS_YOU: &str = "needs_you";
+    /// `join`: the code is wrong, expired or used (never which); make a new one.
+    pub const INVALID_CODE: &str = crate::api::codes::INVALID_CODE;
+    /// `join`: an invite to a new account needs a password; send the join again with one.
+    pub const PASSWORD_REQUIRED: &str = crate::api::codes::PASSWORD_REQUIRED;
+    /// `join`: the new password breaks the server's rules (the message says which).
+    pub const WEAK_PASSWORD: &str = crate::api::codes::WEAK_PASSWORD;
+    /// `DELETE /v1/devices/{id}` for this computer: sign out instead.
+    pub const CANNOT_REMOVE_SELF: &str = "cannot_remove_self";
+    /// This computer doesn't trust the server's certificate (the message says how to install the server's root).
+    pub const UNTRUSTED_CERTIFICATE: &str = "untrusted_certificate";
+    /// `autostart`: the start-at-login entry couldn't be written or removed (the message says why), or this agent
+    /// doesn't handle it here. Whatever else was asked (a join) stands.
+    pub const AUTOSTART_FAILED: &str = "autostart_failed";
 }
 
 /// The paths of the local API.
@@ -70,6 +87,21 @@ pub mod paths {
     pub const LOGIN: &str = "/v1/login";
     pub const LOGOUT: &str = "/v1/logout";
     pub const RECENTS: &str = "/v1/recents";
+    /// `POST`: join with a join string ([`super::JoinRequest`]) → [`super::Status`].
+    pub const JOIN: &str = "/v1/join";
+    /// `POST`: a new add-a-computer code → [`super::PairingInfo`]; `GET`/`DELETE` `/v1/pairings/{id}`: its state, or
+    /// cancel it.
+    pub const PAIRINGS: &str = "/v1/pairings";
+    /// `GET`: the account's computers; `DELETE /v1/devices/{id}`: remove one (never this one).
+    pub const DEVICES: &str = "/v1/devices";
+    /// `POST`: hold syncing (kept across restarts) → [`super::Status`].
+    pub const PAUSE: &str = "/v1/pause";
+    /// `POST`: sync again after a pause → [`super::Status`].
+    pub const RESUME: &str = "/v1/resume";
+    /// `POST`: finish the pass under way and exit → [`super::Status`] (as the agent stops).
+    pub const QUIT: &str = "/v1/quit";
+    /// `POST` ([`super::AutostartRequest`]): start, or don't start, the agent at login → [`super::Status`].
+    pub const AUTOSTART: &str = "/v1/autostart";
 }
 
 /// The agent's data folder: `$CRAFT_CLOUD_AGENT_DIR` if set, else [`default_data_dir`]. `env` reads an environment
@@ -123,6 +155,10 @@ pub enum RunState {
     Retrying { message: String },
     /// Stopped until someone puts something right.
     Paused { reason: String },
+    /// Paused by the user (`POST /v1/pause`), until `POST /v1/resume`, also after a restart: no sync passes and no
+    /// live connection; the local API and apps' recents on this machine keep working. Not a problem to put right,
+    /// unlike [`RunState::Paused`].
+    PausedByUser,
     /// The agent is stopping.
     Stopping,
 }
@@ -148,6 +184,10 @@ pub struct Status {
     /// Whether the agent reaches the server right now (its live connection is up).
     pub online: bool,
     pub run_state: RunState,
+    /// Whether the agent starts by itself at login on this computer; `None` where the agent can't tell or doesn't
+    /// support it (an older agent says nothing).
+    #[serde(default)]
+    pub autostart: Option<bool>,
 }
 
 /// `POST /v1/login`: what `craft-cloud-agent login` asks for. The password goes to the agent and from there to the
@@ -179,6 +219,66 @@ impl std::fmt::Debug for LoginRequest {
             .field("adopt", &self.adopt)
             .finish()
     }
+}
+
+/// `POST /v1/join`: join a Craft Cloud with a join string (an invite or an add-a-computer code), then sync as
+/// `/v1/login` does. The join string and the password go to the agent and from there to the server only; its
+/// `Debug` output hides both.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinRequest {
+    /// As typed or pasted: `cloud.example.com/K7M4-Q9TX`, or the link `https://cloud.example.com/join/K7M4-Q9TX`
+    /// (see [`crate::join::JoinString`]).
+    pub join: String,
+    /// The folder to sync (absolute). Default: "Craft Cloud" in the home folder.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// This computer's name in the device list. Default: the computer's name.
+    #[serde(default)]
+    pub device_name: Option<String>,
+    /// Sync a folder that already has files in it.
+    #[serde(default)]
+    pub adopt: bool,
+    /// The new account's password, for an invite that needs one (answered `password_required` without it).
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for JoinRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinRequest")
+            .field("join", &"<redacted>")
+            .field("folder", &self.folder)
+            .field("device_name", &self.device_name)
+            .field("adopt", &self.adopt)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// `POST /v1/pairings`: a new add-a-computer code of this account, to enter on the computer being added. It
+/// replaces this computer's earlier one. Its `Debug` output hides the code.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingInfo {
+    /// For `GET` and `DELETE /v1/pairings/{id}`.
+    pub id: uuid::Uuid,
+    /// The join string to show: `cloud.example.com/K7M4-Q9TX`.
+    pub join: String,
+    /// The link form, for a QR code: `https://cloud.example.com/join/K7M4-Q9TX`.
+    pub link: String,
+    /// When it stops working, milliseconds since the Unix epoch, by the server's clock.
+    pub expires_ms: i64,
+}
+
+impl std::fmt::Debug for PairingInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairingInfo").field("id", &self.id).field("join", &"<redacted>").field("expires_ms", &self.expires_ms).finish()
+    }
+}
+
+/// `POST /v1/autostart`: start the agent by itself at login on this computer (`on`), or don't any more.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutostartRequest {
+    pub on: bool,
 }
 
 /// `POST /v1/logout`.
@@ -323,6 +423,24 @@ mod tests {
             adopt: false,
         };
         assert!(!format!("{login:?}").contains("hunter2-secret"));
+        let join = JoinRequest {
+            join: "cloud.example.com/K7M4-Q9TX".into(),
+            folder: None,
+            device_name: None,
+            adopt: false,
+            password: Some("hunter2-secret".into()),
+        };
+        let shown = format!("{join:?}");
+        assert!(!shown.contains("K7M4") && !shown.contains("hunter2-secret"), "{shown}");
+        let pairing = PairingInfo {
+            id: uuid::Uuid::nil(),
+            join: "cloud.example.com/K7M4-Q9TX".into(),
+            link: "https://cloud.example.com/join/K7M4-Q9TX".into(),
+            expires_ms: 1,
+        };
+        assert!(!format!("{pairing:?}").contains("K7M4"));
+        let minimal: JoinRequest = serde_json::from_value(serde_json::json!({ "join": "x/y" })).unwrap();
+        assert!(!minimal.adopt && minimal.password.is_none());
     }
 
     #[test]
@@ -342,10 +460,18 @@ mod tests {
             machine: None,
             online: false,
             run_state: RunState::SignedOut,
+            autostart: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["run_state"], serde_json::json!({ "kind": "signed_out" }));
         assert_eq!(serde_json::from_value::<Status>(json).unwrap(), status);
+        let paused = serde_json::to_value(RunState::PausedByUser).unwrap();
+        assert_eq!(paused, serde_json::json!({ "kind": "paused_by_user" }));
+        let older: Status = serde_json::from_value(serde_json::json!({
+            "api": 1, "signed_in": false, "online": false, "run_state": { "kind": "signed_out" }
+        }))
+        .unwrap();
+        assert_eq!(older.autostart, None, "an older agent says nothing about autostart");
         let login: LoginRequest = serde_json::from_value(serde_json::json!({ "server": "s", "user": "u", "password": "p", "extra": 1 })).unwrap();
         assert!(!login.adopt && login.folder.is_none(), "missing optional fields default; unknown ones are ignored");
     }

@@ -78,6 +78,9 @@ serde_json = "1"
 thiserror = "2"
 unicode-normalization = "=0.1.25"
 uuid = { version = "1.28", features = ["v7", "serde"] }
+# Windows only: the agent's start-at-login entry under `HKCU\…\Run`. Microsoft's windows-rs crate (MIT OR Apache-2.0);
+# its dependencies (windows-link, windows-result, windows-strings) are in the build already.
+windows-registry = "0.6.1"
 
 [profile.dev.package."*"]
 opt-level = 2

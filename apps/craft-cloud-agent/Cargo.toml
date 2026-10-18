@@ -35,9 +35,22 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
 rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-registry.workspace = true
+
+# The background build: the same agent without a console window on Windows (built everywhere, shipped on Windows).
+[[bin]]
+name = "craft-cloud-agent-bg"
+path = "src/bin/bg.rs"
+
+[[bin]]
+name = "craft-cloud-agent"
+path = "src/main.rs"
 
 [dev-dependencies]
 craft-cloud-chunker.workspace = true

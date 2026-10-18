@@ -181,6 +181,16 @@ file sizes come later, with history.
 To add accounts: `printf '%s\n' 'their password' | craft-cloud-server user --config cc-data/config.toml add name`.
 `--config` can come before or after `add`.
 
+Or invite someone, with no password to hand over: `craft-cloud-server user --config cc-data/config.toml invite name`
+prints a join string (`cloud.example.org/ABCD-EFGH-JKMN-PQRS`) and its link, good once for 7 days, to enter on their
+first computer (`craft-cloud-agent join …`). It makes the account if there is none; they choose its password when
+they join. For an account that exists, the invite just adds a computer, without its password. Set
+`public_url = "https://cloud.example.org"` (the address computers reach the server at) at the top of `config.toml`
+to have the whole join string printed; without it, `invite` prints the code and you put the address in front. A new
+invite replaces the old one, and `user invite --revoke name` ends it. Every later computer joins with a code from one
+that is signed in (`craft-cloud-agent add-computer`, below). Codes that don't work are refused alike (wrong,
+expired or used), and an address that tries ten in a minute is held off for the rest of it.
+
 ### Restoring a backup
 
 With the server stopped, restore the database and the chunk storage from the backup, then run
@@ -229,7 +239,15 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
   link", or "held while any of … is a link" when several links appeared with that name), comes with a set of
   its own. If you really deleted the file and none of the links listed is it, `sync --approve-deletes=<set>`
   with that set lets the delete go; nothing else (the bare flag included) releases it.
-- Start `run` from your desktop's autostart for now; installers that do it for you come with packaging.
+- `craft-cloud-agent autostart on` makes the agent start by itself at every login (`join --autostart` does it
+  when joining; `autostart off` and signing out undo it): on Windows a `Craft Cloud` value under
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` that runs `craft-cloud-agent-bg.exe run`, the build without a
+  console window, which writes to `run.log` in the agent's data folder (rotated at 10 MiB); on macOS
+  `~/Library/LaunchAgents/ch.craftcloud.agent.plist`; on Linux the systemd user unit `craft-cloud-agent.service`
+  (a unit of that name made by hand is taken over), or `~/.config/autostart/craft-cloud-agent.desktop` without
+  systemd. `status` through the agent's local API says whether it is on. The entry belongs to the agent with the
+  default data folder: one run with `--data-dir` or `CRAFT_CLOUD_AGENT_DIR` elsewhere (a spare folder) never sets,
+  replaces or removes it.
 - To sync a folder that already has files, add `--adopt` to `login`.
 - `sync` exits 0 when done; 1 when it failed and can simply run again (offline, server busy); 2 when
   deletions wait for approval (`sync --approve-deletes` releases exactly the ones it listed); 3 when it
@@ -241,6 +259,15 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
 - `run` also starts without an account: it waits for a sign-in from the launcher (or `login`), then syncs.
   While `run` runs, `login` and `logout` go through it (it holds the data folder), and a sign-out stops
   syncing and keeps the files.
+- Instead of a password, a machine can join with a code. On a machine that is signed in and running,
+  `craft-cloud-agent add-computer` prints a join string (`cloud.example.org/K7M4-Q9TX`, good once for 10 minutes)
+  and waits; on the new machine, `craft-cloud-agent join cloud.example.org/K7M4-Q9TX` (with `--folder`, `--name`
+  and `--adopt` as for `login`) signs it in. An admin's invite (`user invite`, below) works the same way; for a new
+  account, `join` asks for its password twice on standard input. A code that doesn't work says so, without saying
+  why: make a new one.
+- Through the running agent: `pause` and `resume` syncing (a pause holds across restarts; recents keep working),
+  `quit` the agent, and `devices` to list the account's machines (`devices remove <id>` takes one out; to take this
+  machine out, use `logout`).
 - Recent files, per app, shared by every machine of the account (through the running agent, as an app
   sees them):
 

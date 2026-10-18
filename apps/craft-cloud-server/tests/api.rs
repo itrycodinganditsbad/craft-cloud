@@ -6,7 +6,11 @@ use std::time::{Duration, Instant};
 
 use craft_cloud_meta::{Meta, Role};
 use craft_cloud_proto::DocId;
-use craft_cloud_proto::api::{CommitResponse, DeviceInfo, EPOCH_HEADER, ErrorBody, InfoResponse, LoginResponse, MissingResponse, SpaceResponse};
+use craft_cloud_proto::api::{
+    CommitResponse, DeviceInfo, EPOCH_HEADER, ErrorBody, InfoResponse, LoginResponse, MissingResponse, PairingCreated, PairingState, PairingStatus,
+    SpaceResponse,
+};
+use craft_cloud_proto::join::{Code, INVITE_CHARS, INVITE_TTL_MS, PAIRING_CHARS, PAIRING_TTL_MS};
 use craft_cloud_proto::live::{
     AppName, ClientFrame, DocKind, LIVE_PROTOCOL_MAX, LIVE_PROTOCOL_MIN, MAX_SUBSCRIPTIONS, PROTOCOL_MISMATCH, ServerFrame, recents_doc,
 };
@@ -70,6 +74,16 @@ async fn start(meta: Meta, store: Store, dirs: Vec<tempfile::TempDir>, pg: Optio
 
 async fn start_with(meta: Meta, store: Store, dirs: Vec<tempfile::TempDir>, pg: Option<PgGuard>, limits: Limits) -> Server {
     let state = AppState::new(meta.clone(), store, vec![]).unwrap().with_limits(limits);
+    start_state(state, meta, dirs, pg).await
+}
+
+/// A server that believes `X-Forwarded-For` from `trusted` (SQLite and disk).
+async fn start_trusting(meta: Meta, store: Store, dirs: Vec<tempfile::TempDir>, trusted: Vec<std::net::IpAddr>) -> Server {
+    let state = AppState::new(meta.clone(), store, trusted).unwrap();
+    start_state(state, meta, dirs, None).await
+}
+
+async fn start_state(state: AppState, meta: Meta, dirs: Vec<tempfile::TempDir>, pg: Option<PgGuard>) -> Server {
     let password_checks = state.password_checks.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/api/v1", listener.local_addr().unwrap());
@@ -159,6 +173,14 @@ on_every_backend!(
     live_updates_fan_out_to_the_accounts_other_devices,
     live_catch_up_after_a_gap,
     live_a_revoked_device_is_cut_off,
+    pairings_are_made_polled_and_cancelled,
+    a_pairing_code_signs_a_new_computer_in,
+    wrong_expired_and_used_codes_get_the_same_answer,
+    a_pairing_dies_when_its_maker_signs_out,
+    successful_joins_are_not_counted,
+    an_invite_to_a_new_account_sets_its_password,
+    an_invite_to_an_account_with_a_password_asks_none,
+    the_join_page_never_looks_at_the_code,
 );
 
 // ---- helpers ----
@@ -674,6 +696,238 @@ async fn oversized_manifests_are_refused(s: &Server) {
     let stored = upload(s, &token, &data).await;
     let got = s.client.get(format!("{}/manifests/{stored}", s.base)).bearer_auth(&token).send().await.unwrap();
     assert_eq!(got.status(), StatusCode::OK);
+}
+
+// ---- join codes ----
+
+async fn new_pairing(s: &Server, token: &str) -> PairingCreated {
+    let res = s.client.post(format!("{}/pairings", s.base)).bearer_auth(token).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    res.json().await.unwrap()
+}
+
+async fn pairing_status(s: &Server, token: &str, id: uuid::Uuid) -> reqwest::Response {
+    s.client.get(format!("{}/pairings/{id}", s.base)).bearer_auth(token).send().await.unwrap()
+}
+
+async fn join(s: &Server, code: &str, device_name: &str, password: Option<&str>) -> reqwest::Response {
+    join_from(s, code, device_name, password, None).await
+}
+
+/// A join from `from` (an `X-Forwarded-For` address, believed when the server trusts this machine as a proxy).
+async fn join_from(s: &Server, code: &str, device_name: &str, password: Option<&str>, from: Option<&str>) -> reqwest::Response {
+    let mut body = json!({ "code": code, "device_name": device_name });
+    if let Some(password) = password {
+        body["password"] = json!(password);
+    }
+    let mut req = s.client.post(format!("{}/join", s.base)).json(&body);
+    if let Some(from) = from {
+        req = req.header("x-forwarded-for", from);
+    }
+    req.send().await.unwrap()
+}
+
+async fn joined(res: reqwest::Response) -> LoginResponse {
+    assert_eq!(res.status(), StatusCode::OK);
+    res.json().await.unwrap()
+}
+
+/// The device a token belongs to.
+async fn current_device(s: &Server, token: &str) -> craft_cloud_proto::DeviceId {
+    let devices: Vec<DeviceInfo> = s.client.get(format!("{}/devices", s.base)).bearer_auth(token).send().await.unwrap().json().await.unwrap();
+    devices.iter().find(|d| d.current).unwrap().id
+}
+
+async fn pairings_are_made_polled_and_cancelled(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let before = craft_cloud_server::state::now_ms();
+    let made = new_pairing(s, &token).await;
+    assert!(Code::parse(&made.code, PAIRING_CHARS).is_some_and(|c| c.as_str() == made.code), "normalised: {}", made.code);
+    assert!((before + PAIRING_TTL_MS..=craft_cloud_server::state::now_ms() + PAIRING_TTL_MS).contains(&made.expires_ms));
+    let status: PairingStatus = pairing_status(s, &token, made.id).await.json().await.unwrap();
+    assert_eq!(status, PairingStatus { state: PairingState::Waiting, device_name: None });
+    assert_eq!(s.client.post(format!("{}/pairings", s.base)).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    add_user(s, "bob").await;
+    let bob = login(s, "bob").await;
+    assert_eq!(error(pairing_status(s, &bob, made.id).await).await.0, StatusCode::NOT_FOUND, "another account's pairing");
+    assert_eq!(error(pairing_status(s, &token, uuid::Uuid::now_v7()).await).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(error(s.client.get(format!("{}/pairings/nope", s.base)).bearer_auth(&token).send().await.unwrap()).await.0, StatusCode::BAD_REQUEST);
+
+    let cancel = s.client.delete(format!("{}/pairings/{}", s.base, made.id)).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(cancel.status(), StatusCode::NO_CONTENT);
+    assert_eq!(pairing_status(s, &token, made.id).await.status(), StatusCode::NOT_FOUND);
+    let (status, body) = error(join(s, &made.code, "lptp1", None).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "invalid_code"));
+}
+
+async fn a_pairing_code_signs_a_new_computer_in(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let made = new_pairing(s, &token).await;
+    // As typed: lower case, grouped, with an O for a 0.
+    let typed = Code::parse(&made.code, PAIRING_CHARS).unwrap().display().to_lowercase().replace('0', "o");
+    let new = joined(join(s, &typed, "lptp1", None).await).await;
+    let space: SpaceResponse = s.client.get(format!("{}/space", s.base)).bearer_auth(&new.token).send().await.unwrap().json().await.unwrap();
+    assert_eq!(space.username, "ana");
+    assert_eq!(current_device(s, &new.token).await, new.device);
+    let status: PairingStatus = pairing_status(s, &token, made.id).await.json().await.unwrap();
+    assert_eq!(status, PairingStatus { state: PairingState::Used, device_name: Some("lptp1".into()) });
+}
+
+async fn wrong_expired_and_used_codes_get_the_same_answer(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let used = new_pairing(s, &token).await;
+    joined(join(s, &used.code, "lptp1", None).await).await;
+    // An expired code: one made eleven minutes ago, by the time the server reads.
+    let other = login(s, "ana").await;
+    let ana = s.meta.user_by_name("ana").await.unwrap().unwrap();
+    let expired = Code::generate(PAIRING_CHARS).unwrap();
+    let made_ms = craft_cloud_server::state::now_ms() - PAIRING_TTL_MS - 60_000;
+    s.meta.create_pairing(ana.id, current_device(s, &other).await, &expired.hash(), made_ms).await.unwrap();
+    let wrong = Code::generate(PAIRING_CHARS).unwrap();
+    let mut answers = Vec::new();
+    for code in [wrong.as_str(), expired.as_str(), used.code.as_str(), "K7M4-Q9T", "not a code at all", ""] {
+        let res = join(s, code, "beast", None).await;
+        assert_eq!(res.headers().get("content-type").unwrap(), "application/json");
+        answers.push((res.status(), res.text().await.unwrap()));
+    }
+    assert_eq!(answers[0].0, StatusCode::NOT_FOUND);
+    assert!(answers[0].1.contains("\"invalid_code\"") && answers[0].1.contains("Make a new one on a signed-in computer"), "{}", answers[0].1);
+    assert!(answers.iter().all(|a| *a == answers[0]), "{answers:?}");
+    assert_eq!(s.meta.list_devices(ana.id).await.unwrap().len(), 3);
+}
+
+async fn a_pairing_dies_when_its_maker_signs_out(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let made = new_pairing(s, &token).await;
+    let id = current_device(s, &token).await;
+    // Signing out revokes the device.
+    assert_eq!(s.client.delete(format!("{}/devices/{id}", s.base)).bearer_auth(&token).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    let (status, body) = error(join(s, &made.code, "lptp1", None).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "invalid_code"));
+}
+
+async fn successful_joins_are_not_counted(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    for i in 0..12 {
+        let made = new_pairing(s, &token).await;
+        joined(join(s, &made.code, &format!("pc{i}"), None).await).await;
+    }
+}
+
+async fn an_invite_to_a_new_account_sets_its_password(s: &Server) {
+    let invite = Code::generate(INVITE_CHARS).unwrap();
+    s.meta.create_invite("cleo", &invite.hash(), craft_cloud_server::state::now_ms(), INVITE_TTL_MS).await.unwrap();
+    // No password can sign the new account in yet.
+    let res = s
+        .client
+        .post(format!("{}/auth/login", s.base))
+        .json(&json!({ "username": "cleo", "password": "", "device_name": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let (status, body) = error(join(s, &invite.display(), "pc", None).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "password_required"));
+    let (status, body) = error(join(s, &invite.display(), "pc", Some("short")).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "weak_password"));
+    assert!(body.message.contains('8'), "{}", body.message);
+    let cleo = s.meta.user_by_name("cleo").await.unwrap().unwrap();
+    assert!(s.meta.list_devices(cleo.id).await.unwrap().is_empty(), "nothing created yet");
+
+    let new = joined(join(s, &invite.display(), "pc", Some(PASSWORD)).await).await;
+    assert_eq!(current_device(s, &new.token).await, new.device);
+    login(s, "cleo").await;
+    let (status, body) = error(join(s, &invite.display(), "pc", Some(PASSWORD)).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "invalid_code"), "used");
+}
+
+async fn an_invite_to_an_account_with_a_password_asks_none(s: &Server) {
+    add_user(s, "ana").await;
+    let invite = Code::generate(INVITE_CHARS).unwrap();
+    s.meta.create_invite("ana", &invite.hash(), craft_cloud_server::state::now_ms(), INVITE_TTL_MS).await.unwrap();
+    let new = joined(join(s, invite.as_str(), "lost laptop", None).await).await;
+    assert_eq!(current_device(s, &new.token).await, new.device);
+    login(s, "ana").await;
+}
+
+async fn the_join_page_never_looks_at_the_code(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let made = new_pairing(s, &token).await;
+    let root = s.base.trim_end_matches("/api/v1");
+    let mut pages = Vec::new();
+    for code in [made.code.as_str(), "K7M4-Q9TX", "garbage%20here"] {
+        let res = s.client.get(format!("{root}/join/{code}")).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers().get("content-type").unwrap().to_str().unwrap().starts_with("text/plain"));
+        pages.push(res.text().await.unwrap());
+    }
+    assert!(pages[0].contains("Open Craft Cloud on the computer you are adding and enter this code there."), "{}", pages[0]);
+    assert!(pages.iter().all(|p| *p == pages[0]));
+    joined(join(s, &made.code, "lptp1", None).await).await;
+}
+
+/// Failed joins count per client address (behind a trusted proxy, its `X-Forwarded-For`): ten in a minute, then even
+/// the right code is refused from there, while another address still joins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_joins_are_limited_per_address() {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let s = start_trusting(meta, store, vec![db, blobs], vec!["127.0.0.1".parse().unwrap()]).await;
+    add_user(&s, "ana").await;
+    let token = login(&s, "ana").await;
+    let made = new_pairing(&s, &token).await;
+    let wrong = Code::generate(PAIRING_CHARS).unwrap();
+    for _ in 0..10 {
+        let (status, body) = error(join_from(&s, wrong.as_str(), "pc", None, Some("203.0.113.9")).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "invalid_code"));
+    }
+    let (status, body) = error(join_from(&s, &made.code, "pc", None, Some("203.0.113.9")).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+    joined(join_from(&s, &made.code, "pc", None, Some("198.51.100.7")).await).await;
+}
+
+/// Wrong codes sent all at once from one address get no more tries than sent one by one: of 40 in flight together,
+/// at most 10 reach the database, and the rest are `rate_limited`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_failed_joins_are_limited_too() {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let s = std::sync::Arc::new(start_trusting(meta, store, vec![db, blobs], vec!["127.0.0.1".parse().unwrap()]).await);
+    let tries: Vec<_> = (0..40)
+        .map(|_| {
+            let s = s.clone();
+            tokio::spawn(async move {
+                let wrong = Code::generate(PAIRING_CHARS).unwrap();
+                error(join_from(&s, wrong.as_str(), "pc", None, Some("203.0.113.9")).await).await.1.error
+            })
+        })
+        .collect();
+    let mut answers = Vec::new();
+    for t in tries {
+        answers.push(t.await.unwrap());
+    }
+    let tried = answers.iter().filter(|a| *a == "invalid_code").count();
+    let limited = answers.iter().filter(|a| *a == "rate_limited").count();
+    assert_eq!(tried + limited, 40, "{answers:?}");
+    assert!(tried <= 10, "{tried} wrong codes reached the database");
+    // A success gives its try back: the address isn't held off by its own joins.
+    add_user(&s, "ana").await;
+    let token = login(&s, "ana").await;
+    for i in 0..12 {
+        let made = new_pairing(&s, &token).await;
+        joined(join_from(&s, &made.code, &format!("pc{i}"), None, Some("198.51.100.7")).await).await;
+    }
 }
 
 // ---- load limits (the same on every backend, so SQLite + disk only) ----

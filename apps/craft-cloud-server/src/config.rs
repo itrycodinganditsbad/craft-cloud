@@ -6,6 +6,7 @@
 //! trusted_proxies = []          # proxies whose X-Forwarded-For is believed; needed with behind_proxy
 //! # ignore_forwarded_for = true # behind a proxy without naming it: every client then counts as the proxy
 //! # stored_bytes_per_user = 2_000_000_000_000   # cap on what one account stores, in bytes (unset: no cap)
+//! # public_url = "https://cloud.example.com"    # where computers reach the server; `user invite` prints it
 //!
 //! [database]
 //! url = "sqlite:/var/lib/craft-cloud/meta.db"   # or postgres://user:pass@host/db
@@ -22,6 +23,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+use craft_cloud_proto::join::{Code, JoinString, PAIRING_CHARS};
 use craft_cloud_proto::limits::MAX_CHUNK_BYTES;
 use craft_cloud_store::s3::S3Config;
 use serde::Deserialize;
@@ -52,6 +54,8 @@ pub enum ConfigError {
          agent could not tell a full account from a file that is too big. Raise it, or remove it for no cap"
     )]
     StoredBytesCapTooSmall(u64, u32),
+    #[error("public_url = {0:?} is not a server address like https://cloud.example.com (a host, an optional port and path, no query)")]
+    PublicUrl(String),
     #[error("storage.{0} is missing (set it in the config or the {1} environment variable)")]
     MissingS3Credential(&'static str, &'static str),
 }
@@ -74,6 +78,11 @@ pub struct Config {
     /// default): no cap. This is not yet the per-user quota on files' logical size (that comes with history).
     #[serde(default)]
     pub stored_bytes_per_user: Option<u64>,
+    /// The address computers reach the server at, `https://host[:port][/prefix]` (the reverse proxy's). `user invite`
+    /// puts it in front of the code it prints. Normalised when the config is read: the host in lower case, no
+    /// trailing slash. Unset: `user invite` prints the bare code and says to put the address in front.
+    #[serde(default)]
+    pub public_url: Option<String>,
     pub database: DatabaseConfig,
     pub storage: StorageConfig,
 }
@@ -166,8 +175,24 @@ impl Config {
         {
             return Err(ConfigError::StoredBytesCapTooSmall(cap, MAX_CHUNK_BYTES));
         }
+        let mut config = config;
+        if let Some(url) = &config.public_url {
+            config.public_url = Some(public_url(url)?);
+        }
         Ok(config)
     }
+}
+
+/// `public_url` checked and normalised as a join string's server part (so what `user invite` prints parses back).
+fn public_url(url: &str) -> Result<String, ConfigError> {
+    let url = url.trim();
+    let refused = || ConfigError::PublicUrl(url.to_owned());
+    if !url.to_ascii_lowercase().starts_with("https://") && !url.to_ascii_lowercase().starts_with("http://") {
+        return Err(refused());
+    }
+    let probe = Code::parse("00000000", PAIRING_CHARS).ok_or_else(refused)?;
+    let parsed = JoinString::parse(&format!("{}/{}", url.trim_end_matches('/'), probe.as_str())).map_err(|_| refused())?;
+    Ok(parsed.server)
 }
 
 /// The parser's message with a line number, without the source text.
@@ -230,6 +255,17 @@ path = "/tmp/blobs"
         assert!(!c.behind_proxy && c.trusted_proxies.is_empty());
         assert_eq!(c.storage, StorageConfig::Disk { path: "/tmp/blobs".into() });
         assert_eq!(c.storage.s3().unwrap(), None);
+        assert_eq!(c.public_url, None);
+    }
+
+    #[test]
+    fn the_public_url_is_normalised_or_refused() {
+        let with = |url: &str| Config::parse(&format!("public_url = {url:?}\n{DISK}"));
+        assert_eq!(with("https://Cloud.Example.com/").unwrap().public_url.as_deref(), Some("https://cloud.example.com"));
+        assert_eq!(with(" https://example.org:8443/cloud ").unwrap().public_url.as_deref(), Some("https://example.org:8443/cloud"));
+        for bad in ["cloud.example.com", "ftp://x", "https://", "https://a b", "https://x/?q=1", "https://ana@x"] {
+            assert!(matches!(with(bad), Err(ConfigError::PublicUrl(_))), "{bad}");
+        }
     }
 
     #[test]

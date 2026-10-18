@@ -3,7 +3,9 @@
 //! test creates and drops its own database. CI sets `CRAFT_CLOUD_REQUIRE_BACKENDS`, which turns a missing
 //! `CRAFT_CLOUD_TEST_PG` into a failure instead of a skip.
 
-use craft_cloud_meta::{BlobKind, Meta, MetaError, Role, UserRecord};
+use craft_cloud_meta::{BlobKind, InviteFor, Meta, MetaError, Redeemed, Role, UserRecord};
+use craft_cloud_proto::api::PairingState;
+use craft_cloud_proto::join::{Code, INVITE_CHARS, INVITE_TTL_MS, PAIRING_CHARS, PAIRING_TTL_MS};
 use craft_cloud_proto::limits::MAX_PAGE_NODES;
 use craft_cloud_proto::{
     ChunkId, ChunkRef, ChunkerParamsId, ConflictKind, DeviceId, FileHash, Manifest, ManifestId, Name, NewVersion, NodeId, NodeKind, NodeState, Op,
@@ -115,6 +117,17 @@ on_every_backend!(
     a_live_document_is_capped_by_bytes,
     live_documents_holding_updates_are_capped,
     live_document_rows_are_capped,
+    a_pairing_code_works_once,
+    an_expired_code_is_refused,
+    a_replaced_invite_s_old_code_fails,
+    a_revoked_invite_fails,
+    a_pairing_is_waiting_then_used_then_expired,
+    a_device_has_one_open_pairing,
+    another_users_pairing_is_invisible,
+    a_pairing_dies_with_its_revoked_creator,
+    concurrent_redeems_of_one_code_give_one_device,
+    an_invite_to_an_account_with_a_password_needs_none,
+    an_invite_to_a_new_account_needs_a_password,
 );
 
 // ---- helpers ----
@@ -1046,7 +1059,219 @@ async fn usernames_are_unique_ignoring_ascii_case(meta: &Meta) {
     assert_eq!(meta.user_by_name("ANA").await.unwrap(), Some(ana));
 }
 
+// ---- join codes ----
+
+fn code(chars: usize) -> Code {
+    Code::generate(chars).unwrap()
+}
+
+fn token() -> [u8; 32] {
+    *blake3::hash(uuid::Uuid::now_v7().as_bytes()).as_bytes()
+}
+
+async fn redeem(meta: &Meta, code: &Code, name: &str, now: i64) -> Result<Redeemed, MetaError> {
+    meta.redeem(&code.hash(), name, &token(), None, now).await
+}
+
+/// A signed-in device of a new account with a password, and a pairing it made.
+async fn paired(meta: &Meta, username: &str) -> (UserRecord, DeviceId, Code, uuid::Uuid) {
+    let u = user(meta, username).await;
+    let maker = device(meta, &u).await;
+    let pairing = code(PAIRING_CHARS);
+    let id = meta.create_pairing(u.id, maker, &pairing.hash(), NOW).await.unwrap();
+    (u, maker, pairing, id)
+}
+
+async fn a_pairing_code_works_once(meta: &Meta) {
+    let (ana, _, pairing, _) = paired(meta, "ana").await;
+    let token = token();
+    let joined = meta.redeem(&pairing.hash(), "lptp1", &token, None, NOW + 1).await.unwrap();
+    assert_eq!(joined.user, ana.id);
+    let auth = meta.device_by_token(&token).await.unwrap().unwrap();
+    assert_eq!((auth.device, auth.user, auth.space), (joined.device, ana.id, ana.space));
+    assert!(matches!(redeem(meta, &pairing, "again", NOW + 2).await, Err(MetaError::InvalidCode)));
+    assert!(matches!(redeem(meta, &code(PAIRING_CHARS), "wrong", NOW + 2).await, Err(MetaError::InvalidCode)));
+    assert_eq!(meta.list_devices(ana.id).await.unwrap().len(), 2);
+
+    let invite = code(INVITE_CHARS);
+    meta.create_invite("ana", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    redeem(meta, &invite, "beast", NOW + 3).await.unwrap();
+    assert!(matches!(redeem(meta, &invite, "beast", NOW + 4).await, Err(MetaError::InvalidCode)));
+    assert_eq!(meta.list_devices(ana.id).await.unwrap().len(), 3);
+}
+
+async fn an_expired_code_is_refused(meta: &Meta) {
+    let (ana, _, pairing, _) = paired(meta, "ana").await;
+    assert!(matches!(redeem(meta, &pairing, "late", NOW + PAIRING_TTL_MS).await, Err(MetaError::InvalidCode)));
+    let invite = code(INVITE_CHARS);
+    meta.create_invite("ana", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    assert!(matches!(redeem(meta, &invite, "late", NOW + INVITE_TTL_MS).await, Err(MetaError::InvalidCode)));
+    assert_eq!(meta.list_devices(ana.id).await.unwrap().len(), 1, "only the pairing's maker");
+    redeem(meta, &invite, "in time", NOW + INVITE_TTL_MS - 1).await.unwrap();
+}
+
+async fn a_replaced_invite_s_old_code_fails(meta: &Meta) {
+    let first = code(INVITE_CHARS);
+    let made = meta.create_invite("Ana", &first.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    assert!(made.new_account);
+    let second = code(INVITE_CHARS);
+    let again = meta.create_invite("ana", &second.hash(), NOW + 1, INVITE_TTL_MS).await.unwrap();
+    assert_eq!(again, InviteFor { user: made.user, new_account: true }, "the same account, found by its lowercase name, still new");
+    assert!(matches!(meta.redeem(&first.hash(), "pc", &token(), Some("$argon2id$x"), NOW + 2).await, Err(MetaError::InvalidCode)));
+    meta.redeem(&second.hash(), "pc", &token(), Some("$argon2id$x"), NOW + 2).await.unwrap();
+    assert!(matches!(meta.create_invite("bad name", &code(INVITE_CHARS).hash(), NOW, INVITE_TTL_MS).await, Err(MetaError::Invalid(_))));
+}
+
+async fn a_revoked_invite_fails(meta: &Meta) {
+    let invite = code(INVITE_CHARS);
+    meta.create_invite("ana", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    assert!(meta.revoke_invite("ANA").await.unwrap());
+    assert!(!meta.revoke_invite("ana").await.unwrap(), "nothing left to revoke");
+    assert!(!meta.revoke_invite("nobody").await.unwrap());
+    assert!(matches!(meta.redeem(&invite.hash(), "pc", &token(), Some("$argon2id$x"), NOW + 1).await, Err(MetaError::InvalidCode)));
+    assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 1).await.unwrap(), None);
+}
+
+async fn a_pairing_is_waiting_then_used_then_expired(meta: &Meta) {
+    let (ana, maker, pairing, id) = paired(meta, "ana").await;
+    assert_eq!(meta.pairing_status(ana.id, id, NOW + 1).await.unwrap(), Some((PairingState::Waiting, None)));
+    redeem(meta, &pairing, "lptp1", NOW + 2).await.unwrap();
+    assert_eq!(meta.pairing_status(ana.id, id, NOW + 3).await.unwrap(), Some((PairingState::Used, Some("lptp1".to_owned()))));
+    assert_eq!(
+        meta.pairing_status(ana.id, id, NOW + PAIRING_TTL_MS + 1).await.unwrap(),
+        Some((PairingState::Used, Some("lptp1".to_owned()))),
+        "a used pairing stays used"
+    );
+
+    let unused = meta.create_pairing(ana.id, maker, &code(PAIRING_CHARS).hash(), NOW + 10).await.unwrap();
+    assert_eq!(meta.pairing_status(ana.id, unused, NOW + 10 + PAIRING_TTL_MS - 1).await.unwrap(), Some((PairingState::Waiting, None)));
+    assert_eq!(meta.pairing_status(ana.id, unused, NOW + 10 + PAIRING_TTL_MS).await.unwrap(), Some((PairingState::Expired, None)));
+    meta.delete_pairing(ana.id, unused).await.unwrap();
+    assert_eq!(meta.pairing_status(ana.id, unused, NOW + 11).await.unwrap(), None);
+    meta.delete_pairing(ana.id, unused).await.unwrap();
+
+    // Expired rows go at the next write to the table.
+    let other = device(meta, &ana).await;
+    let old = meta.create_pairing(ana.id, other, &code(PAIRING_CHARS).hash(), NOW).await.unwrap();
+    meta.create_pairing(ana.id, maker, &code(PAIRING_CHARS).hash(), NOW + PAIRING_TTL_MS + 1).await.unwrap();
+    assert_eq!(meta.pairing_status(ana.id, old, NOW + PAIRING_TTL_MS + 1).await.unwrap(), None);
+}
+
+async fn a_device_has_one_open_pairing(meta: &Meta) {
+    let (ana, maker, first, first_id) = paired(meta, "ana").await;
+    let second = code(PAIRING_CHARS);
+    let second_id = meta.create_pairing(ana.id, maker, &second.hash(), NOW + 1).await.unwrap();
+    assert_ne!(first_id, second_id);
+    assert_eq!(meta.pairing_status(ana.id, first_id, NOW + 2).await.unwrap(), None);
+    assert!(matches!(redeem(meta, &first, "pc", NOW + 2).await, Err(MetaError::InvalidCode)));
+    redeem(meta, &second, "pc", NOW + 2).await.unwrap();
+    let bob = user(meta, "bob").await;
+    assert!(
+        matches!(meta.create_pairing(bob.id, maker, &code(PAIRING_CHARS).hash(), NOW).await, Err(MetaError::NotFound(_))),
+        "a pairing only for the account's own device"
+    );
+}
+
+async fn another_users_pairing_is_invisible(meta: &Meta) {
+    let (ana, _, _, id) = paired(meta, "ana").await;
+    let bob = user(meta, "bob").await;
+    assert_eq!(meta.pairing_status(bob.id, id, NOW + 1).await.unwrap(), None);
+    meta.delete_pairing(bob.id, id).await.unwrap();
+    assert_eq!(meta.pairing_status(ana.id, id, NOW + 1).await.unwrap(), Some((PairingState::Waiting, None)), "bob can't cancel it");
+}
+
+async fn a_pairing_dies_with_its_revoked_creator(meta: &Meta) {
+    let (ana, maker, pairing, id) = paired(meta, "ana").await;
+    meta.revoke_device(ana.id, maker).await.unwrap();
+    assert_eq!(meta.pairing_status(ana.id, id, NOW + 1).await.unwrap(), None);
+    assert!(matches!(redeem(meta, &pairing, "pc", NOW + 1).await, Err(MetaError::InvalidCode)));
+    assert_eq!(meta.list_devices(ana.id).await.unwrap().len(), 1);
+    let fresh = device(meta, &ana).await;
+    assert!(matches!(meta.create_pairing(ana.id, maker, &code(PAIRING_CHARS).hash(), NOW).await, Err(MetaError::NotFound(_))), "revoked");
+    meta.create_pairing(ana.id, fresh, &code(PAIRING_CHARS).hash(), NOW).await.unwrap();
+}
+
+async fn concurrent_redeems_of_one_code_give_one_device(meta: &Meta) {
+    let (ana, _, pairing, _) = paired(meta, "ana").await;
+    let invite = code(INVITE_CHARS);
+    meta.create_invite("bob", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    for (code, password) in [(pairing, None), (invite, Some("$argon2id$bob"))] {
+        let tasks: Vec<_> = (0..6)
+            .map(|i| {
+                let (meta, hash) = (meta.clone(), code.hash());
+                tokio::spawn(async move { meta.redeem(&hash, &format!("pc{i}"), &token(), password, NOW + 1).await })
+            })
+            .collect();
+        let mut joined = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => joined += 1,
+                Err(MetaError::InvalidCode) => {}
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert_eq!(joined, 1);
+    }
+    assert_eq!(meta.list_devices(ana.id).await.unwrap().len(), 2);
+    let bob = meta.user_by_name("bob").await.unwrap().unwrap();
+    assert_eq!(meta.list_devices(bob.id).await.unwrap().len(), 1);
+}
+
+async fn an_invite_to_an_account_with_a_password_needs_none(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let invite = code(INVITE_CHARS);
+    assert_eq!(meta.create_invite("ana", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap(), InviteFor { user: ana.id, new_account: false });
+    assert_eq!(meta.invite_needs_password(&invite.hash(), NOW).await.unwrap(), Some(false));
+    let joined = meta.redeem(&invite.hash(), "pc", &token(), Some("$argon2id$ignored"), NOW).await.unwrap();
+    assert_eq!(joined.user, ana.id);
+    assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, ana.password_hash, "the password stays");
+}
+
+async fn an_invite_to_a_new_account_needs_a_password(meta: &Meta) {
+    let invite = code(INVITE_CHARS);
+    let made = meta.create_invite("ana", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    assert!(made.new_account);
+    let ana = meta.user_by_name("ana").await.unwrap().unwrap();
+    assert_eq!((ana.password_hash.as_str(), ana.role), ("", Role::Member), "no password until the invite is redeemed");
+    assert_eq!(meta.invite_needs_password(&invite.hash(), NOW).await.unwrap(), Some(true));
+    assert_eq!(meta.invite_needs_password(&code(INVITE_CHARS).hash(), NOW).await.unwrap(), None);
+    assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + INVITE_TTL_MS).await.unwrap(), None, "expired");
+
+    assert!(matches!(redeem(meta, &invite, "pc", NOW).await, Err(MetaError::PasswordRequired)));
+    assert!(meta.list_devices(ana.id).await.unwrap().is_empty(), "nothing changed");
+    assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "");
+    assert_eq!(meta.invite_needs_password(&invite.hash(), NOW).await.unwrap(), Some(true), "the code still works");
+
+    let joined = meta.redeem(&invite.hash(), "pc", &token(), Some("$argon2id$new"), NOW).await.unwrap();
+    assert_eq!(joined.user, ana.id);
+    assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$new");
+    assert_eq!(meta.list_devices(ana.id).await.unwrap().len(), 1);
+    assert!(meta.create_invite("ana", &code(INVITE_CHARS).hash(), NOW, INVITE_TTL_MS).await.is_ok_and(|i| !i.new_account));
+}
+
 // ---- plain tests ----
+
+/// Neither table holds a code in plaintext: the database's files (with the write-ahead log) hold its hash and never
+/// the code, in any of the forms it is shown or sent in.
+#[tokio::test]
+async fn only_the_hash_of_a_code_is_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}", dir.path().join("meta.db").display());
+    let meta = Meta::open(&url).await.unwrap();
+    let (_, _, pairing, _) = paired(&meta, "ana").await;
+    let invite = code(INVITE_CHARS);
+    meta.create_invite("bob", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    drop(meta);
+    let mut bytes = Vec::new();
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        bytes.extend(std::fs::read(entry.unwrap().path()).unwrap());
+    }
+    let holds = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    for code in [&pairing, &invite] {
+        assert!(holds(&code.hash()), "the hash is there");
+        assert!(!holds(code.as_str().as_bytes()) && !holds(code.display().as_bytes()));
+    }
+}
 
 #[tokio::test]
 async fn user_records_do_not_print_their_password_hash() {
@@ -1115,6 +1340,9 @@ async fn upgrading_counts_what_each_space_already_stores() {
         sqlx::query("DROP TABLE live_updates").execute(&mut conn).await.unwrap();
         sqlx::query("DROP TABLE live_docs").execute(&mut conn).await.unwrap();
         sqlx::query("DROP TABLE live_spaces").execute(&mut conn).await.unwrap();
+        // And before join codes.
+        sqlx::query("DROP TABLE pairings").execute(&mut conn).await.unwrap();
+        sqlx::query("DROP TABLE invites").execute(&mut conn).await.unwrap();
         sqlx::query("DELETE FROM schema_version WHERE version >= 2").execute(&mut conn).await.unwrap();
     }
     let meta = Meta::open(&url).await.unwrap();
@@ -1139,5 +1367,5 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 3);
+    assert_eq!(versions, 4);
 }

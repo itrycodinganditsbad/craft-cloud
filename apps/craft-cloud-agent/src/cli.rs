@@ -1,4 +1,5 @@
-//! The `craft-cloud-agent` command line: `login`, `run`, `sync`, `status`, `logout`. Each command is a library
+//! The `craft-cloud-agent` command line: `login` or `join`, `run`, `sync`, `status`, `logout`, and through the running
+//! agent `recents`, `add-computer`, `devices`, `pause`, `resume`, `quit` and `autostart`. Each command is a library
 //! function too, so tests drive exactly what a user runs.
 //!
 //! The password is read from standard input (one line), so it never appears in the process list or shell
@@ -32,10 +33,12 @@ use jiff::tz::TimeZone;
 
 use crate::account::{ACCOUNT_SCHEMA, Account, AccountError, DataDir, LastPass, LoopState, Outcome, PassSummary, STATE_SCHEMA, SavedState};
 use crate::disk::{AGENT_DIR, DiskFs, create_private_dir};
-use crate::http::{self, DeviceToken, HttpTransport, ServerUrl};
+use crate::http::{self, DeviceToken, HttpTransport, JoinError, ReachError, ServerUrl};
 use crate::lock::{self, DATA_LOCK, FOLDER_LOCK, Lock, LockError};
 use crate::root::{self, RootError, RootMarker};
 use crate::settle::Stability;
+use craft_cloud_proto::api::LoginResponse;
+use craft_cloud_proto::join::JoinString;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -85,6 +88,41 @@ pub enum Command {
     },
     /// Show an app's recent files (shared by every machine of the account), or add one, through the running agent.
     Recents(RecentsArgs),
+    /// Join a Craft Cloud with a join string: an invite from the server's admin, or a code from a signed-in computer
+    /// (`add-computer` there). An invite for a new account asks for its password, twice, on standard input.
+    Join(JoinArgs),
+    /// Add another computer to this account: prints a join string to enter on it, and waits until it joined (the code
+    /// works once, for 10 minutes; Ctrl-C cancels it). Through the running agent.
+    AddComputer,
+    /// Pause syncing until `resume`, also across restarts (apps' recents keep working). Through the running agent.
+    Pause,
+    /// Sync again after `pause`. Through the running agent.
+    Resume,
+    /// Stop the running agent after the pass under way. It starts again at the next login if autostart is on.
+    Quit,
+    /// List the account's computers, or remove one. Through the running agent.
+    Devices {
+        #[command(subcommand)]
+        action: Option<DevicesAction>,
+    },
+    /// Start the agent by itself at login on this computer (`on`), or not any more (`off`). Signing out turns it off.
+    Autostart {
+        #[arg(value_enum)]
+        state: OnOff,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OnOff {
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DevicesAction {
+    /// Remove a computer from the account (its ID from `devices`): it can't sync any more; its files stay. To remove
+    /// this computer, sign out instead.
+    Remove { id: craft_cloud_proto::DeviceId },
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -130,6 +168,26 @@ pub struct LoginArgs {
     pub adopt: bool,
 }
 
+#[derive(Debug, Clone, clap::Args)]
+pub struct JoinArgs {
+    /// The join string: from the server's admin (an invite) or from a signed-in computer (add a computer), e.g.
+    /// cloud.example.com/K7M4-Q9TX or the link https://cloud.example.com/join/K7M4-Q9TX.
+    pub join: String,
+    /// The folder to sync. Default: "Craft Cloud" in your home folder.
+    #[arg(long)]
+    pub folder: Option<PathBuf>,
+    /// This computer's name in the device list and in conflict copy names. Default: the computer's name.
+    #[arg(long, alias = "name")]
+    pub device_name: Option<String>,
+    /// Sync a folder that already has files in it. Files that differ from the server's become conflict
+    /// copies; nothing is deleted.
+    #[arg(long)]
+    pub adopt: bool,
+    /// Once joined, start the agent by itself at every login on this computer (as `autostart on`).
+    #[arg(long)]
+    pub autostart: bool,
+}
+
 /// How a command ended, as the process exit code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -172,6 +230,7 @@ impl AgentError {
             | AgentError::Server(TransportError::Protocol(_) | TransportError::QuotaExceeded { .. })
             | AgentError::Sync(SyncError::Corrupt(_))
             | AgentError::Account(AccountError::Newer { .. } | AccountError::Damaged { .. }) => Exit::NeedsYou,
+            AgentError::JoinSetup(inner) => inner.exit(),
             _ => Exit::Failed,
         }
     }
@@ -223,6 +282,32 @@ pub enum AgentError {
     /// A call to the running agent's local API failed.
     #[error("{0}")]
     Local(craft_cloud_app::Error),
+    /// `join`: the code is wrong, expired or used; the server never says which.
+    #[error("This code doesn't work any more. Make a new one on a signed-in computer.")]
+    InvalidCode,
+    /// `join`: an invite to a new account, without a password for it.
+    #[error("this invite is for a new account: choose a password for it")]
+    PasswordRequired,
+    /// `join`: the new password breaks the server's rules (its message).
+    #[error("{0}")]
+    WeakPassword(String),
+    /// `join`: too many codes that didn't work from this address (the server's message).
+    #[error("{0}")]
+    TooManyTries(String),
+    #[error(
+        "This computer doesn't trust {host}'s certificate. If the server has a certificate authority of its own \
+         (step-ca, say), install that authority's root certificate on this computer, then try again."
+    )]
+    UntrustedCertificate { host: String },
+    /// `join`: the server can't be reached; nothing was created.
+    #[error("can't reach {server} ({message}); nothing was created. Check the address and that this computer is online, then try again")]
+    Unreachable { server: String, message: String },
+    /// `join`: the code was spent, but setting up this computer failed afterwards; the new device was removed again.
+    #[error("{0}. This code is used up now: make a new one on a signed-in computer, then join again")]
+    JoinSetup(Box<AgentError>),
+    /// Removing the computer the request comes from.
+    #[error("this is the computer you are using: to take it out of your cloud, sign out instead")]
+    CannotRemoveSelf,
 }
 
 impl From<TransportError> for AgentError {
@@ -293,6 +378,15 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
         }
         Command::Logout { local } => {
             match logout(&data, local, out).await {
+                // Signed out here: the agent no longer starts at login (a running agent does this itself).
+                Ok(()) => {
+                    // Only the agent with the default data folder has the entry; another leaves it alone.
+                    let off = crate::autostart::Roots::for_user()
+                        .and_then(|roots| if roots.owns(data.path()) { crate::autostart::unregister(&roots) } else { Ok(()) });
+                    if let Err(e) = off {
+                        say!(out, "the start-at-login entry couldn't be removed ({e}); `craft-cloud-agent autostart off` tries again")?;
+                    }
+                }
                 Err(AgentError::Lock(LockError::Busy(path))) => {
                     let data_path = data.path().to_owned();
                     let status = blocking(move || craft_cloud_app::Client::connect_in(&data_path)?.logout(local)).await.map_err(|e| match e {
@@ -308,7 +402,246 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
             Ok(Exit::Done)
         }
         Command::Recents(args) => recents(&data, args, out).await,
+        Command::Join(args) => {
+            if let Some(account) = data.load_account()? {
+                return Err(already_signed_in(&account));
+            }
+            let mut password: Option<String> = None;
+            loop {
+                let joined = match join(&data, &args, password.as_deref(), out).await {
+                    // `run` holds the data folder: it joins, through its local API.
+                    Err(AgentError::Lock(LockError::Busy(path))) => {
+                        join_through_agent(&data, &args, password.clone(), out).await.map_err(|e| match e {
+                            AgentError::Local(craft_cloud_app::Error::NotRunning(_)) => AgentError::Lock(LockError::Busy(path)),
+                            other => other,
+                        })
+                    }
+                    other => other.map(|_| ()),
+                };
+                match joined {
+                    Err(AgentError::PasswordRequired) if password.is_none() => password = Some(new_password(input, out)?),
+                    other => break other?,
+                }
+            }
+            // The join stands whatever happens here; a failure is said.
+            // An agent with a data folder of its own has no start-at-login entry: `--autostart` is passed over then.
+            let ours = crate::autostart::Roots::for_user().is_ok_and(|roots| roots.owns(data.path()));
+            if args.autostart
+                && ours
+                && let Err(e) = set_autostart(&data, true, out).await
+            {
+                say!(out, "joined, but this computer won't start syncing by itself after a restart: {e}")?;
+                say!(out, "run `craft-cloud-agent autostart on` to try again")?;
+            }
+            Ok(Exit::Done)
+        }
+        Command::Autostart { state } => {
+            set_autostart(&data, state == OnOff::On, out).await?;
+            Ok(Exit::Done)
+        }
+        Command::AddComputer => {
+            let stop = async {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            add_computer(&data, PAIRING_POLL, stop, out).await
+        }
+        Command::Pause => {
+            let client = running_agent(&data).await?;
+            blocking(move || client.pause()).await.map_err(local_error)?;
+            say!(out, "paused: nothing syncs until `craft-cloud-agent resume` (recents still work on this computer)")?;
+            Ok(Exit::Done)
+        }
+        Command::Resume => {
+            let client = running_agent(&data).await?;
+            blocking(move || client.resume()).await.map_err(local_error)?;
+            say!(out, "syncing again")?;
+            Ok(Exit::Done)
+        }
+        Command::Quit => {
+            let client = running_agent(&data).await?;
+            blocking(move || client.quit()).await.map_err(local_error)?;
+            say!(out, "the agent stops after the pass under way")?;
+            Ok(Exit::Done)
+        }
+        Command::Devices { action } => {
+            let client = running_agent(&data).await?;
+            let list = match action {
+                None => blocking(move || client.devices()).await.map_err(local_error)?,
+                Some(DevicesAction::Remove { id }) => {
+                    let list = blocking(move || client.remove_device(id)).await.map_err(local_error)?;
+                    say!(out, "removed {id}; it can't sync any more (its files stay there)")?;
+                    list
+                }
+            };
+            print_devices(out, &list)?;
+            Ok(Exit::Done)
+        }
     }
+}
+
+/// `autostart on|off`: through the running agent if one runs (it handles its own entry), else here, for this agent.
+async fn set_autostart(data: &DataDir, on: bool, out: &mut impl Write) -> Result<(), AgentError> {
+    let data_path = data.path().to_owned();
+    let running = blocking(move || craft_cloud_app::Client::connect_in(&data_path)).await;
+    match running {
+        Ok(client) => {
+            blocking(move || client.set_autostart(on)).await.map_err(local_error)?;
+        }
+        Err(AgentError::Local(craft_cloud_app::Error::NotRunning(_))) => {
+            let roots = crate::autostart::Roots::for_user().map_err(autostart_error)?;
+            if !roots.owns(data.path()) {
+                return Err(AgentError::Usage(crate::autostart::not_ours(data.path())));
+            }
+            let data = data.path().to_owned();
+            tokio::task::spawn_blocking(move || if on { crate::local_api::set_on(&roots, &data) } else { crate::autostart::unregister(&roots) })
+                .await
+                .map_err(|e| AgentError::Usage(format!("start at login: {e}")))?
+                .map_err(autostart_error)?;
+        }
+        Err(e) => return Err(e),
+    }
+    if on {
+        say!(out, "this computer starts syncing by itself at every login")
+    } else {
+        say!(out, "this computer no longer starts syncing by itself at login")
+    }
+}
+
+fn autostart_error(e: crate::autostart::AutostartError) -> AgentError {
+    AgentError::Usage(format!("start at login: {e}"))
+}
+
+/// How often `add-computer` asks whether the code was used.
+const PAIRING_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The running agent's local API, or a usage error saying to start it.
+async fn running_agent(data: &DataDir) -> Result<craft_cloud_app::Client, AgentError> {
+    let data_path = data.path().to_owned();
+    blocking(move || craft_cloud_app::Client::connect_in(&data_path)).await.map_err(|e| match e {
+        AgentError::Local(craft_cloud_app::Error::NotRunning(why)) => {
+            AgentError::Usage(format!("the agent isn't running ({why}); start `craft-cloud-agent run` first"))
+        }
+        other => other,
+    })
+}
+
+/// A new account's password for an invite: typed twice (one line each, on standard input), the two the same.
+fn new_password(input: &mut impl BufRead, out: &mut impl Write) -> Result<String, AgentError> {
+    say!(out, "This invite is for a new account. Choose its password (8 characters or more), then type it again:")?;
+    out.flush().map_err(io_at(Path::new("standard output")))?;
+    let first = read_password(input)?;
+    let again = read_password(input)?;
+    if first != again {
+        return Err(AgentError::Usage("the two passwords differ; nothing was changed, run `join` again".into()));
+    }
+    Ok(first)
+}
+
+/// `join` while `run` runs: the running agent joins.
+async fn join_through_agent(data: &DataDir, args: &JoinArgs, password: Option<String>, out: &mut impl Write) -> Result<(), AgentError> {
+    let folder = args.folder.as_ref().map(|f| std::path::absolute(f).map_err(io_at(f))).transpose()?;
+    let request = craft_cloud_app::JoinRequest {
+        join: args.join.clone(),
+        folder: folder.map(|f| f.display().to_string()),
+        device_name: args.device_name.clone(),
+        adopt: args.adopt,
+        password,
+    };
+    let data_path = data.path().to_owned();
+    let status = blocking(move || craft_cloud_app::Client::connect_in(&data_path)?.join(&request)).await.map_err(local_error)?;
+    say!(
+        out,
+        "joined as {} on {} (through the running agent, which syncs {} now)",
+        status.account.unwrap_or_default(),
+        status.server.unwrap_or_default(),
+        status.folder.unwrap_or_default()
+    )
+}
+
+/// `add-computer`: a new add-a-computer code through the running agent, printed as a join string, then asked about
+/// every `every` until it is used or expires. `stop` (Ctrl-C) cancels it.
+pub async fn add_computer(
+    data: &DataDir,
+    every: std::time::Duration,
+    stop: impl std::future::Future<Output = ()>,
+    out: &mut impl Write,
+) -> Result<Exit, AgentError> {
+    use craft_cloud_app::PairingState;
+    let client = running_agent(data).await?;
+    let c = client.clone();
+    let pairing = blocking(move || c.pairing()).await.map_err(local_error)?;
+    say!(out, "On the other computer, open Craft Cloud and enter: {}", pairing.join)?;
+    say!(out, "(or open {} there). The code works once, for 10 minutes; Ctrl-C cancels it.", pairing.link)?;
+    out.flush().map_err(io_at(Path::new("standard output")))?;
+    let id = pairing.id;
+    tokio::pin!(stop);
+    loop {
+        tokio::select! {
+            () = &mut stop => {
+                let c = client.clone();
+                let cancelled = blocking(move || c.cancel_pairing(id)).await;
+                say!(out, "{}", if cancelled.is_ok() { "cancelled: the code doesn't work any more" } else { "stopped waiting (the code works until it expires)" })?;
+                return Ok(Exit::Failed);
+            }
+            () = tokio::time::sleep(every) => {}
+        }
+        let c = client.clone();
+        match blocking(move || c.pairing_state(id)).await {
+            Ok(status) if status.state == PairingState::Used => {
+                say!(out, "{} joined", status.device_name.as_deref().unwrap_or("a computer"))?;
+                return Ok(Exit::Done);
+            }
+            Ok(status) if status.state == PairingState::Expired => break,
+            Ok(_) => {}
+            Err(AgentError::Local(craft_cloud_app::Error::Refused { code, .. })) if code == craft_cloud_proto::api::codes::NOT_FOUND => break,
+            Err(e) => return Err(local_error(e)),
+        }
+    }
+    say!(out, "The code expired")?;
+    Ok(Exit::Failed)
+}
+
+fn print_devices(out: &mut impl Write, devices: &[craft_cloud_app::DeviceInfo]) -> Result<(), AgentError> {
+    say!(out, "computers of this account:")?;
+    for d in devices {
+        let note = match (d.current, d.revoked) {
+            (true, _) => "  (this computer)",
+            (false, true) => "  (removed)",
+            (false, false) => "",
+        };
+        say!(out, "  {}  {}  last seen {}{note}", d.id, d.name, show_time(d.last_used_ms))?;
+    }
+    Ok(())
+}
+
+/// The agent's `main`, for both builds (the console one and the background one): parses `args` (the program's name
+/// first), runs the command, and writes an error to `err`. Returns the exit code, and whether the command was `run`
+/// (after a second stop the caller ends the process at once rather than wait for a pass to finish).
+pub async fn main(args: Vec<std::ffi::OsString>, input: &mut impl BufRead, out: &mut impl Write, err: &mut impl Write) -> (Exit, bool) {
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(e) => {
+            // A usage error is a plain failure (1), never the "deletions wait" code 2 that clap's own exit uses;
+            // `--help` and `--version` are not errors.
+            let failed = e.use_stderr();
+            let text = e.render().to_string();
+            let _ = if failed { write!(err, "{text}") } else { write!(out, "{text}") };
+            return (if failed { Exit::Failed } else { Exit::Done }, false);
+        }
+    };
+    let looping = matches!(cli.command, Command::Run);
+    let exit = match run(cli, input, out).await {
+        Ok(exit) => exit,
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}");
+            e.exit()
+        }
+    };
+    let _ = out.flush();
+    let _ = err.flush();
+    (exit, looping)
 }
 
 /// Runs a blocking call of `craft-cloud-app` off the runtime.
@@ -327,6 +660,9 @@ fn local_error(e: AgentError) -> AgentError {
             codes::WRONG_PASSWORD => AgentError::WrongPassword,
             codes::NOT_SIGNED_IN => AgentError::NotSignedIn,
             codes::OFFLINE => AgentError::Offline(message),
+            codes::INVALID_CODE => AgentError::InvalidCode,
+            codes::PASSWORD_REQUIRED => AgentError::PasswordRequired,
+            codes::CANNOT_REMOVE_SELF => AgentError::CannotRemoveSelf,
             _ => AgentError::Usage(message),
         },
         other => other,
@@ -696,7 +1032,63 @@ pub(crate) async fn login_locked(data: &DataDir, args: &LoginArgs, password: &st
         return Err(already_signed_in(&account));
     }
     let server = ServerUrl::parse(&args.url).map_err(|e| AgentError::Usage(e.to_string()))?;
-    let folder = match &args.folder {
+    let prepared = prepare(data, args.folder.as_deref(), args.device_name.as_deref(), args.adopt)?;
+    ask_server(&server, |_, message| AgentError::Offline(message)).await?;
+    let signed_in = match http::login(&server, &args.user, password, &prepared.device_name).await {
+        Err(TransportError::Unauthorized) => return Err(AgentError::WrongPassword),
+        other => other?,
+    };
+    set_up(data, &server, signed_in, prepared).await
+}
+
+/// Joins with a join string (an invite or an add-a-computer code), creates a device and sets up the folder, as
+/// [`login`] does. Everything that can be checked here is checked before the code is spent (the folder, the device
+/// name, what the server speaks); a failure after it (the folder is set up for another space) removes the new device
+/// again, and says the code is used up. `password`: the new account's, for an invite that needs one.
+pub async fn join(data: &DataDir, args: &JoinArgs, password: Option<&str>, out: &mut impl Write) -> Result<Account, AgentError> {
+    let _data_lock = hold_data(data)?;
+    let account = join_locked(data, args, password).await?;
+    say!(out, "joined as {} on {} (device \"{}\")", account.username, account.server, account.device_name)?;
+    say!(out, "syncing {}; run `craft-cloud-agent run` to keep it in sync", account.folder.display())?;
+    Ok(account)
+}
+
+/// [`join`] for a caller that holds the data folder's lock already: the `run` loop, joining for the local API.
+/// Prints nothing.
+pub(crate) async fn join_locked(data: &DataDir, args: &JoinArgs, password: Option<&str>) -> Result<Account, AgentError> {
+    if let Some(account) = data.load_account()? {
+        return Err(already_signed_in(&account));
+    }
+    let join = JoinString::parse(&args.join).map_err(|e| AgentError::Usage(e.to_string()))?;
+    let server = ServerUrl::parse(&join.server).map_err(|e| AgentError::Usage(e.to_string()))?;
+    let prepared = prepare(data, args.folder.as_deref(), args.device_name.as_deref(), args.adopt)?;
+    let unreachable = |server: &ServerUrl, message| AgentError::Unreachable { server: server.to_string(), message };
+    ask_server(&server, unreachable).await?;
+    let signed_in = match http::join(&server, join.code.as_str(), &prepared.device_name, password).await {
+        Ok(signed_in) => signed_in,
+        Err(JoinError::InvalidCode) => return Err(AgentError::InvalidCode),
+        Err(JoinError::PasswordRequired) => return Err(AgentError::PasswordRequired),
+        Err(JoinError::WeakPassword(message)) => return Err(AgentError::WeakPassword(message)),
+        Err(JoinError::RateLimited(message)) => return Err(AgentError::TooManyTries(message)),
+        Err(JoinError::Transport(TransportError::Unavailable(message))) => return Err(unreachable(&server, message)),
+        Err(JoinError::Transport(e)) => return Err(e.into()),
+    };
+    set_up(data, &server, signed_in, prepared).await.map_err(|e| AgentError::JoinSetup(Box::new(e)))
+}
+
+/// What a sign-in or join checked before anything is created on the server.
+struct Prepared {
+    /// The folder to sync, absolute.
+    folder: PathBuf,
+    /// The root marker already in it, if any.
+    existing_marker: Option<RootMarker>,
+    device_name: String,
+}
+
+/// The checks of a sign-in or join that need no server: the folder (not inside the data folder, a folder if it exists,
+/// with files only with `adopt`), its marker if it has one, and the device name.
+fn prepare(data: &DataDir, folder: Option<&Path>, device_name: Option<&str>, adopt: bool) -> Result<Prepared, AgentError> {
+    let folder = match folder {
         Some(folder) => std::path::absolute(folder).map_err(io_at(folder))?,
         None => default_folder()?,
     };
@@ -705,7 +1097,7 @@ pub(crate) async fn login_locked(data: &DataDir, args: &LoginArgs, password: &st
         if !folder.is_dir() {
             return Err(AgentError::Usage(format!("{} is not a folder", folder.display())));
         }
-        if !args.adopt && has_files(&folder)? {
+        if !adopt && has_files(&folder)? {
             return Err(AgentError::Usage(format!(
                 "{} already has files in it; pass --adopt to sync them (files that differ from the server's become conflict copies; nothing is deleted)",
                 folder.display()
@@ -713,16 +1105,28 @@ pub(crate) async fn login_locked(data: &DataDir, args: &LoginArgs, password: &st
         }
     }
     let existing_marker = root::read(&folder)?;
-    let device_name = args.device_name.clone().unwrap_or_else(default_device_name);
+    let device_name = device_name.map_or_else(default_device_name, str::to_owned);
     if !valid_device_name(&device_name) {
         return Err(AgentError::Usage("device names are 1-128 bytes without control characters".into()));
     }
+    Ok(Prepared { folder, existing_marker, device_name })
+}
 
-    http::check_compatible(&http::info(&server).await?)?;
-    let signed_in = match http::login(&server, &args.user, password, &device_name).await {
-        Err(TransportError::Unauthorized) => return Err(AgentError::WrongPassword),
-        other => other?,
-    };
+/// Asks the server what it speaks and checks this agent speaks it too. A certificate this computer doesn't trust is
+/// [`AgentError::UntrustedCertificate`]; a server that can't be reached is what `unreachable` makes of the message.
+async fn ask_server(server: &ServerUrl, unreachable: impl FnOnce(&ServerUrl, String) -> AgentError) -> Result<(), AgentError> {
+    match http::reach(server).await {
+        Ok(info) => Ok(http::check_compatible(&info)?),
+        Err(ReachError::UntrustedCertificate) => Err(AgentError::UntrustedCertificate { host: server.host() }),
+        Err(ReachError::Transport(TransportError::Unavailable(message))) => Err(unreachable(server, message)),
+        Err(ReachError::Transport(e)) => Err(e.into()),
+    }
+}
+
+/// Sets up the folder for the device the server just created (its marker, the saved account). Any failure revokes
+/// the device again (best effort) and leaves no account behind.
+async fn set_up(data: &DataDir, server: &ServerUrl, signed_in: LoginResponse, prepared: Prepared) -> Result<Account, AgentError> {
+    let Prepared { folder, existing_marker, device_name } = prepared;
     let token = DeviceToken::new(signed_in.token);
     let transport = HttpTransport::new(server.clone(), &token)?;
     let setup = async {
@@ -982,7 +1386,7 @@ impl Session {
         let (checkpoint_data, checkpoint_last) = (data.clone(), last_pass.clone());
         engine.on_checkpoint(move |state| {
             let last_pass = checkpoint_last.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-            let saved = SavedState { schema: STATE_SCHEMA, state: state.clone(), last_pass };
+            let saved = SavedState { schema: STATE_SCHEMA, state: state.clone(), last_pass, paused: false };
             checkpoint_data.save_state(&saved).map_err(|e| std::io::Error::other(e.to_string()))
         });
         Ok(Self { data: data.clone(), account, engine, last_pass, _folder_lock: folder_lock, stability, recheck_in: None })
@@ -1050,7 +1454,7 @@ impl Session {
         };
         let last = LastPass { finished_ms: now_ms(), outcome, summary: summary.clone() };
         *self.last_pass.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(last.clone());
-        let saved = SavedState { schema: STATE_SCHEMA, state: self.engine.state().clone(), last_pass: Some(last) };
+        let saved = SavedState { schema: STATE_SCHEMA, state: self.engine.state().clone(), last_pass: Some(last), paused: false };
         self.data.save_state(&saved)?;
         result?;
         Ok(summary.unwrap_or_default())
@@ -1239,6 +1643,7 @@ fn describe_loop(state: &LoopState) -> String {
         LoopState::Stopping => "stopping after the running pass".into(),
         LoopState::Stopped => "stopped".into(),
         LoopState::SignedOut => "not signed in, waiting for a sign-in".into(),
+        LoopState::PausedByUser => "paused (`craft-cloud-agent resume` syncs again)".into(),
     }
 }
 
@@ -1365,6 +1770,42 @@ mod tests {
             assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation, "{empty:?} is a usage error: {e}");
         }
         assert!(Cli::try_parse_from(["craft-cloud-agent", "login", "https://c.example"]).is_err(), "--user is required");
+    }
+
+    #[test]
+    fn the_join_and_computer_commands_parse() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("craft-cloud-agent").chain(args.iter().copied())).map(|c| c.command);
+        let join = parse(&["join", "c.example/K7M4-Q9TX", "--folder", "f", "--name", "lptp1", "--adopt"]).unwrap();
+        let Command::Join(args) = join else { panic!("{join:?}") };
+        assert_eq!(args.join, "c.example/K7M4-Q9TX");
+        assert_eq!((args.folder.as_deref(), args.device_name.as_deref(), args.adopt), (Some(Path::new("f")), Some("lptp1"), true));
+        let Command::Join(args) = parse(&["join", "c.example/K7M4-Q9TX", "--device-name", "pc", "--autostart"]).unwrap() else { panic!() };
+        assert_eq!((args.device_name.as_deref(), args.adopt, args.autostart), (Some("pc"), false, true));
+        assert!(matches!(parse(&["autostart", "on"]).unwrap(), Command::Autostart { state: OnOff::On }));
+        assert!(matches!(parse(&["autostart", "off"]).unwrap(), Command::Autostart { state: OnOff::Off }));
+        assert!(parse(&["autostart"]).is_err() && parse(&["autostart", "maybe"]).is_err());
+        assert!(parse(&["join"]).is_err(), "the join string is required");
+        assert!(matches!(parse(&["add-computer"]).unwrap(), Command::AddComputer));
+        assert!(matches!(parse(&["pause"]).unwrap(), Command::Pause));
+        assert!(matches!(parse(&["resume"]).unwrap(), Command::Resume));
+        assert!(matches!(parse(&["quit"]).unwrap(), Command::Quit));
+        assert!(matches!(parse(&["devices"]).unwrap(), Command::Devices { action: None }));
+        let id = craft_cloud_proto::DeviceId::generate();
+        let removed = parse(&["devices", "remove", &id.to_string()]).unwrap();
+        assert!(matches!(removed, Command::Devices { action: Some(DevicesAction::Remove { id: got }) } if got == id), "{removed:?}");
+        assert!(parse(&["devices", "remove", "not-an-id"]).is_err());
+    }
+
+    /// A new account's password is asked twice; two that differ, or none, are refused.
+    #[test]
+    fn a_new_password_is_typed_twice() {
+        let mut out = Vec::new();
+        assert_eq!(new_password(&mut "a new password\na new password\n".as_bytes(), &mut out).unwrap(), "a new password");
+        assert!(String::from_utf8(out).unwrap().contains("new account"));
+        assert!(
+            matches!(new_password(&mut "a new password\nanother one\n".as_bytes(), &mut Vec::new()), Err(AgentError::Usage(m)) if m.contains("differ"))
+        );
+        assert!(new_password(&mut "".as_bytes(), &mut Vec::new()).is_err());
     }
 
     #[test]

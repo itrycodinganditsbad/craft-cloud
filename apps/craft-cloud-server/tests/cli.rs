@@ -5,6 +5,7 @@ use std::process::{Child, Command as Process, Stdio};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use craft_cloud_proto::join::{Code, INVITE_CHARS, JoinString};
 use craft_cloud_server::cli::{Cli, CliError, run};
 use craft_cloud_server::config::{Config, ConfigError};
 
@@ -90,6 +91,49 @@ async fn live_reset_doc_empties_a_full_document() {
     assert_eq!(meta.append_live_update(ana.space, doc, device, 2, &[2], 0).await.unwrap(), 1, "open again");
     assert!(cli(&["live", "--config", c, "reset-doc", "ana", "Bad App"], "").await.is_err());
     assert!(matches!(cli(&["live", "--config", c, "reset-doc", "nobody", "wordcraft"], "").await, Err(CliError::Usage(_))));
+}
+
+/// `user invite` prints a join string and link to paste on the new computer (with `public_url` set), or the code
+/// and how to finish it (without); a new one replaces the old; `--revoke` ends it.
+#[tokio::test]
+async fn user_invite_prints_a_join_string_and_revoke_ends_it() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config_path = dir.join("config.toml");
+    let c = config_path.to_str().unwrap();
+
+    let out = cli(&["user", "--config", c, "invite", "cleo"], "").await.unwrap();
+    assert!(out.contains("public_url"), "{out}");
+    let code_line = out.lines().find_map(|l| l.strip_prefix("Code: ")).unwrap_or_else(|| panic!("{out}"));
+    let bare = Code::parse(code_line, INVITE_CHARS).unwrap();
+
+    // Top-level keys go before the first table.
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(&config_path, format!("public_url = \"https://Cloud.Example.com/\"\n{text}")).unwrap();
+    let out = cli(&["user", "invite", "--config", c, "cleo"], "").await.unwrap();
+    let join = out.lines().find_map(|l| l.strip_prefix("Join string: ")).unwrap_or_else(|| panic!("{out}"));
+    let link = out.lines().find_map(|l| l.strip_prefix("Link: ")).unwrap_or_else(|| panic!("{out}"));
+    let parsed = JoinString::parse(join).unwrap();
+    assert_eq!(parsed.server, "https://cloud.example.com");
+    assert_eq!(JoinString::parse(link).unwrap(), parsed);
+    assert!(link.starts_with("https://cloud.example.com/join/"), "{link}");
+    assert!(out.contains("new account"), "{out}");
+
+    let (meta, _) = craft_cloud_server::cli::open(&Config::load(&config_path).unwrap()).await.unwrap();
+    let now = craft_cloud_server::state::now_ms();
+    assert_eq!(meta.invite_needs_password(&parsed.code.hash(), now).await.unwrap(), Some(true));
+    assert_eq!(meta.invite_needs_password(&bare.hash(), now).await.unwrap(), None, "replaced");
+    let ana = cli(&["user", "--config", c, "invite", "ana"], "").await.unwrap();
+    assert!(!ana.contains("new account"), "{ana}");
+
+    assert!(cli(&["user", "--config", c, "invite", "--revoke", "cleo"], "").await.unwrap().contains("revoked"));
+    assert_eq!(meta.invite_needs_password(&parsed.code.hash(), now).await.unwrap(), None);
+    assert!(matches!(cli(&["user", "--config", c, "invite", "--revoke", "cleo"], "").await, Err(CliError::Usage(_))), "nothing to revoke");
+    assert!(matches!(cli(&["user", "--config", c, "invite", "bad name"], "").await, Err(CliError::Meta(_) | CliError::Usage(_))));
+
+    std::fs::write(&config_path, format!("public_url = \"ftp://x\"\n{text}")).unwrap();
+    assert!(matches!(Config::load(&config_path), Err(ConfigError::PublicUrl(_))));
 }
 
 #[tokio::test]

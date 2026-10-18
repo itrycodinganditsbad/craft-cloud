@@ -2,6 +2,7 @@
 //! Batch commits use [`crate::Op`], [`crate::Conflict`] and [`crate::ChangeSet`] from `ops`.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::hash::ChunkId;
 use crate::ids::{DeviceId, Epoch, NodeId, SpaceId};
@@ -74,6 +75,66 @@ impl std::fmt::Debug for LoginResponse {
     }
 }
 
+/// `POST /api/v1/pairings` (device auth): a new add-a-computer code for the signed-in account, which replaces the
+/// device's open one. `code` is shown once, normalised (no dashes); the server keeps only its hash. Its `Debug`
+/// output hides the code.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingCreated {
+    pub id: Uuid,
+    pub code: String,
+    /// When the code stops working, milliseconds since the Unix epoch, by the server's clock.
+    pub expires_ms: i64,
+}
+
+impl std::fmt::Debug for PairingCreated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairingCreated").field("id", &self.id).field("code", &"<redacted>").field("expires_ms", &self.expires_ms).finish()
+    }
+}
+
+/// Where an add-a-computer code stands, in [`PairingStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingState {
+    /// Not used yet, and still good.
+    Waiting,
+    /// A computer joined with it; [`PairingStatus::device_name`] names it.
+    Used,
+    /// Its time ran out unused.
+    Expired,
+}
+
+/// `GET /api/v1/pairings/{id}` (device auth, the account's own pairings only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingStatus {
+    pub state: PairingState,
+    /// The device that joined, once `used`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+}
+
+/// `POST /api/v1/join` (no auth): redeem an invite or an add-a-computer code (normalised or as typed) for a new
+/// device; answered with a [`LoginResponse`]. `password` is required, and only taken, for an invite to an account
+/// that has none yet. Its `Debug` output hides the code and the password.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinRequest {
+    pub code: String,
+    /// Shown in the device list, e.g. the computer's name.
+    pub device_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for JoinRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinRequest")
+            .field("code", &"<redacted>")
+            .field("device_name", &self.device_name)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// One of the signed-in user's devices.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -129,6 +190,12 @@ pub mod codes {
     /// A chunk or manifest would take the account over the bytes the server lets it store (HTTP 507); `quota` says
     /// how much it stores and may store.
     pub const QUOTA_EXCEEDED: &str = "quota_exceeded";
+    /// `join`: the code is wrong, expired or used (never which).
+    pub const INVALID_CODE: &str = "invalid_code";
+    /// `join`: an invite to an account without a password needs one; send it again with `password`.
+    pub const PASSWORD_REQUIRED: &str = "password_required";
+    /// `join`: the new password breaks the server's rules (the message says which).
+    pub const WEAK_PASSWORD: &str = "weak_password";
     pub const INTERNAL: &str = "internal";
 }
 
@@ -168,6 +235,25 @@ mod tests {
         assert!(!format!("{req:?}").contains("hunter2-secret"));
         let res = LoginResponse { device: DeviceId::generate(), token: "tok-secret".into() };
         assert!(!format!("{res:?}").contains("tok-secret"));
+        let join = JoinRequest { code: "K7M4Q9TX".into(), device_name: "pc".into(), password: Some("hunter2-secret".into()) };
+        let shown = format!("{join:?}");
+        assert!(!shown.contains("K7M4Q9TX") && !shown.contains("hunter2-secret"), "{shown}");
+        let created = PairingCreated { id: Uuid::nil(), code: "K7M4Q9TX".into(), expires_ms: 1 };
+        assert!(!format!("{created:?}").contains("K7M4Q9TX"));
+    }
+
+    #[test]
+    fn join_bodies_have_a_plain_json_form() {
+        let status = PairingStatus { state: PairingState::Used, device_name: Some("lptp1".into()) };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json, serde_json::json!({ "state": "used", "device_name": "lptp1" }));
+        let waiting: PairingStatus = serde_json::from_value(serde_json::json!({ "state": "waiting" })).unwrap();
+        assert_eq!(waiting, PairingStatus { state: PairingState::Waiting, device_name: None });
+        let join: JoinRequest = serde_json::from_value(serde_json::json!({ "code": "c", "device_name": "d" })).unwrap();
+        assert_eq!(join.password, None);
+        assert_eq!(codes::INVALID_CODE, "invalid_code");
+        assert_eq!(codes::PASSWORD_REQUIRED, "password_required");
+        assert_eq!(codes::WEAK_PASSWORD, "weak_password");
     }
 
     #[test]

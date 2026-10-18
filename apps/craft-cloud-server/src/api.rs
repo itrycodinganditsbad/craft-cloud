@@ -1,5 +1,6 @@
-//! The HTTP API, under `/api/v1`. Everything but `info` and `auth/login` needs a device token. `GET /live` becomes the
-//! live service's WebSocket ([`crate::live`]).
+//! The HTTP API, under `/api/v1`. Everything but `info`, `auth/login` and `join` needs a device token. `GET /live`
+//! becomes the live service's WebSocket ([`crate::live`]); join codes (`pairings`, `join`, and the `/join/{code}` page
+//! outside the API) are in [`crate::join`].
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,6 +25,7 @@ use serde::Deserialize;
 
 use crate::auth::{new_token, require_device, verify_password};
 use crate::error::ApiError;
+use crate::join;
 use crate::ratelimit::{client_ip, ip_key};
 use crate::state::AppState;
 
@@ -36,10 +38,10 @@ const LOGINS_PER_IP: u32 = 30;
 const MAX_WAIT_SECS: u64 = 60;
 /// `Retry-After` for a refused long-poll.
 const WAITERS_RETRY_SECS: u32 = 5;
-/// Small JSON bodies (login and missing-chunk queries).
-const SMALL_JSON_BYTES: usize = 1024 * 1024;
+/// Small JSON bodies (login, join and missing-chunk queries).
+pub(crate) const SMALL_JSON_BYTES: usize = 1024 * 1024;
 /// `Retry-After` for a sign-in refused because every password check slot is busy.
-const PASSWORD_RETRY_SECS: u32 = 1;
+pub(crate) const PASSWORD_RETRY_SECS: u32 = 1;
 
 type Shared = Arc<AppState>;
 
@@ -47,6 +49,8 @@ pub fn router(state: Shared) -> Router {
     let signed_in = Router::new()
         .route("/devices", get(list_devices))
         .route("/devices/{id}", delete(revoke_device))
+        .route("/pairings", post(join::create_pairing))
+        .route("/pairings/{id}", get(join::pairing_status).delete(join::delete_pairing))
         .route("/chunks/missing", post(missing_chunks).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
         .route("/chunks/{id}", put(put_chunk).get(get_chunk).layer(DefaultBodyLimit::max(MAX_CHUNK_BYTES as usize)))
         .route("/manifests/{id}", put(put_manifest).get(get_manifest).layer(DefaultBodyLimit::max(MAX_MANIFEST_BYTES)))
@@ -56,11 +60,16 @@ pub fn router(state: Shared) -> Router {
         .route("/changes", get(changes))
         .route("/live", get(crate::live::connect))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_device));
-    let public = Router::new().route("/info", get(info)).route("/auth/login", post(login).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)));
+    let public = Router::new()
+        .route("/info", get(info))
+        .route("/auth/login", post(login).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
+        .route("/join", post(join::join).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)));
     Router::new()
         .nest("/api/v1", public.merge(signed_in))
         // Version 1 isn't known yet when a client first asks what the server speaks.
         .route("/api/info", get(info))
+        // A join link opened in a browser.
+        .route("/join/{code}", get(join::join_page))
         .fallback(no_such_endpoint)
         .method_not_allowed_fallback(wrong_method)
         .with_state(state)
@@ -98,9 +107,7 @@ async fn login(
     if !valid_username(&req.username) {
         return Err(ApiError::invalid("usernames are 1-64 letters, digits, '.', '_' or '-'"));
     }
-    if req.device_name.is_empty() || req.device_name.len() > 128 || req.device_name.chars().any(char::is_control) {
-        return Err(ApiError::invalid("device names are 1-128 bytes without control characters"));
-    }
+    check_device_name(&req.device_name)?;
     // tokio's clock: the system's monotonic clock in the server, the simulated one in a simulation.
     let now = tokio::time::Instant::now().into_std();
     let ip = client_ip(peer, &headers, &state.trusted_proxies);
@@ -143,6 +150,15 @@ async fn login(
     tracing::debug!(user = %user.username, "sign-in");
     tracing::info!(%device, "device signed in");
     Ok(Json(LoginResponse { device, token }))
+}
+
+/// The device-name rule of sign-ins and joins, checked before anything is counted: 1-128 bytes without control
+/// characters.
+pub(crate) fn check_device_name(name: &str) -> Result<(), ApiError> {
+    if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+        return Err(ApiError::invalid("device names are 1-128 bytes without control characters"));
+    }
+    Ok(())
 }
 
 async fn space(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>) -> Result<Json<SpaceResponse>, ApiError> {
@@ -228,7 +244,7 @@ async fn read_body(state: &AppState, request: Request, max_bytes: usize) -> Resu
 /// trickles in is cut off by the server itself rather than left to a proxy's body timeout. Rejections (no JSON
 /// content type, bad JSON, over the route's [`DefaultBodyLimit`]) are answered as before. No slot is held: a JSON
 /// body costs one connection and at most `max_bytes`.
-async fn read_json<T: serde::de::DeserializeOwned>(state: &AppState, request: Request, max_bytes: usize) -> Result<T, ApiError> {
+pub(crate) async fn read_json<T: serde::de::DeserializeOwned>(state: &AppState, request: Request, max_bytes: usize) -> Result<T, ApiError> {
     match tokio::time::timeout(state.limits.body_time(max_bytes), Json::<T>::from_request(request, &())).await {
         Ok(json) => Ok(json?.0),
         Err(_) => Err(body_too_slow()),
