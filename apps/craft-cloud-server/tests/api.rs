@@ -1089,7 +1089,12 @@ async fn live_a_revoked_device_is_cut_off(s: &Server) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_subscriptions_are_capped_per_device() {
     // A budget big enough for 2 × 257 frames at once: the cap, not the budget, is what this checks.
-    let s = &sqlite_disk_with(Limits { live_burst: 10_000, ..Limits::default() }).await;
+    // One document per subscription, so the space's cap on documents is raised past the subscription cap.
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap().with_live_docs_cap(MAX_SUBSCRIPTIONS as u64 + 1);
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let s = &start_with(meta, store, vec![db, blobs], None, Limits { live_burst: 10_000, ..Limits::default() }).await;
     add_user(s, "ana").await;
     let token = login(s, "ana").await;
     let space = space_of(s, &token).await.space;

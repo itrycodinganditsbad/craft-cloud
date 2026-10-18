@@ -43,6 +43,12 @@ pub struct LiveUpdate {
 /// real fix.
 pub const MAX_LIVE_DOC_BYTES: u64 = 16 * 1024 * 1024;
 
+/// The most live documents one space may have. The app name is client-chosen, so without a cap an account could make
+/// documents without end, each holding up to [`MAX_LIVE_DOC_BYTES`]. A create over it is refused with
+/// [`MetaError::TooManyDocs`]; re-creating an existing document is never refused. On Postgres the count is read
+/// without a lock, so concurrent creates can overshoot it by a few; that soft cap is accepted.
+pub const MAX_LIVE_DOCS_PER_SPACE: u64 = 64;
+
 /// Most updates [`Meta::live_updates`] returns at once.
 pub const MAX_LIVE_PAGE: u32 = 1000;
 
@@ -66,24 +72,41 @@ impl Meta {
         if kind.is_empty() || kind.len() > 64 {
             return Err(MetaError::Invalid("a document kind is 1-64 bytes"));
         }
+        let (space_key, id_key) = (uuid_bytes(space.as_uuid()), uuid_bytes(id.as_uuid()));
+        // Insert first: on Postgres, begin_write takes no lock, so a select-then-insert would race another device's
+        // create of the same document into a primary-key violation. A conflict does nothing, and the row is read back.
         let mut w = self.begin_write().await?;
-        let found = sqlx::query("SELECT kind, node, created_ms, head_seq, bytes FROM live_docs WHERE space_id = $1 AND id = $2")
-            .bind(uuid_bytes(space.as_uuid()))
-            .bind(uuid_bytes(id.as_uuid()))
-            .fetch_optional(&mut *w.tx)
-            .await?;
-        if let Some(row) = found {
+        let inserted = sqlx::query(
+            "INSERT INTO live_docs (space_id, id, kind, node, created_ms, head_seq) VALUES ($1, $2, $3, $4, $5, 0) \
+             ON CONFLICT (space_id, id) DO NOTHING",
+        )
+        .bind(space_key.clone())
+        .bind(id_key.clone())
+        .bind(kind)
+        .bind(node.map(|n| uuid_bytes(n.as_uuid())))
+        .bind(now_ms)
+        .execute(&mut *w.tx)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            let row = sqlx::query("SELECT kind, node, created_ms, head_seq, bytes FROM live_docs WHERE space_id = $1 AND id = $2")
+                .bind(space_key)
+                .bind(id_key)
+                .fetch_one(&mut *w.tx)
+                .await?;
             let doc = doc_from(&row, id)?;
             return if doc.kind == kind { Ok(doc) } else { Err(MetaError::Invalid("the document exists with another kind")) };
         }
-        sqlx::query("INSERT INTO live_docs (space_id, id, kind, node, created_ms, head_seq) VALUES ($1, $2, $3, $4, $5, 0)")
-            .bind(uuid_bytes(space.as_uuid()))
-            .bind(uuid_bytes(id.as_uuid()))
-            .bind(kind)
-            .bind(node.map(|n| uuid_bytes(n.as_uuid())))
-            .bind(now_ms)
-            .execute(&mut *w.tx)
-            .await?;
+        // A new document: the space may not go over its cap. Counted with this one; over the cap, the transaction
+        // (and the insert) is dropped uncommitted.
+        let count = sqlx::query("SELECT COUNT(*) AS n FROM live_docs WHERE space_id = $1")
+            .bind(space_key)
+            .fetch_one(&mut *w.tx)
+            .await?
+            .try_get::<i64, _>("n")?;
+        if to_u64(count)? > self.live_docs_cap {
+            return Err(MetaError::TooManyDocs { limit: self.live_docs_cap });
+        }
         w.commit().await?;
         Ok(LiveDoc { id, kind: kind.to_owned(), node, created_ms: now_ms, head: 0, bytes: 0 })
     }

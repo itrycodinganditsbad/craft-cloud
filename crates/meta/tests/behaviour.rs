@@ -110,8 +110,10 @@ on_every_backend!(
     all_spaces_lists_every_users_space,
     live_documents_number_their_updates_per_space,
     concurrent_live_appends_get_one_number_each,
+    concurrent_live_creates_make_one_document,
     live_pages_stop_at_their_byte_limit,
     a_live_document_is_capped_by_bytes,
+    live_docs_per_space_are_capped,
 );
 
 // ---- helpers ----
@@ -684,6 +686,45 @@ async fn concurrent_live_appends_get_one_number_each(meta: &Meta) {
     seqs.dedup();
     assert_eq!(seqs, (1..=8).collect::<Vec<_>>(), "each update stored once, numbered without gaps");
     assert_eq!(meta.live_doc(ana.space, doc).await.unwrap().unwrap().head, 8);
+}
+
+async fn concurrent_live_creates_make_one_document(meta: &Meta) {
+    use craft_cloud_proto::DocId;
+    let ana = user(meta, "ana").await;
+    let doc = DocId::generate();
+    // Each create carries its own time, so the document's created_ms shows which create stored it.
+    let tasks: Vec<_> = (0..8i64)
+        .map(|i| {
+            let meta = meta.clone();
+            tokio::spawn(async move { meta.create_live_doc(ana.space, doc, "recents:wordcraft", None, NOW + i).await })
+        })
+        .collect();
+    let mut created = Vec::new();
+    for task in tasks {
+        created.push(task.await.unwrap().expect("a create of an existing document is not an error"));
+    }
+    assert!(created.iter().all(|d| d.created_ms == created[0].created_ms), "every create returns the one document");
+    assert_eq!(meta.live_doc(ana.space, doc).await.unwrap().unwrap().created_ms, created[0].created_ms);
+    assert!(matches!(meta.create_live_doc(ana.space, doc, "recents:other", None, NOW).await, Err(MetaError::Invalid(_))));
+}
+
+async fn live_docs_per_space_are_capped(meta: &Meta) {
+    use craft_cloud_proto::DocId;
+    let ana = user(meta, "ana").await;
+    let bo = user(meta, "bo").await;
+    let docs: Vec<DocId> = (0..64).map(|_| DocId::generate()).collect();
+    for doc in &docs {
+        meta.create_live_doc(ana.space, *doc, "recents:wordcraft", None, NOW).await.unwrap();
+    }
+    let extra = DocId::generate();
+    assert!(matches!(meta.create_live_doc(ana.space, extra, "recents:wordcraft", None, NOW).await, Err(MetaError::TooManyDocs { limit: 64 })));
+    assert!(meta.live_doc(ana.space, extra).await.unwrap().is_none(), "the refused document was not stored");
+    assert_eq!(
+        meta.create_live_doc(ana.space, docs[0], "recents:wordcraft", None, NOW).await.unwrap().id,
+        docs[0],
+        "re-creating one of them still works"
+    );
+    meta.create_live_doc(bo.space, extra, "recents:wordcraft", None, NOW).await.unwrap();
 }
 
 async fn concurrent_commits_on_one_file_let_exactly_one_win(meta: &Meta) {
