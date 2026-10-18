@@ -1,5 +1,6 @@
 //! Server metadata for Craft Cloud: users, devices, spaces, the node tree, versions, which blobs each space
-//! may use, and the batch commit that changes it all. SQLite or Postgres, with the same behaviour.
+//! may use, the batch commit that changes it all, and live documents with their update logs. SQLite or Postgres,
+//! with the same behaviour.
 //!
 //! Every write goes through one transaction. On SQLite, writes are serialised by a single lock (SQLite has
 //! one writer anyway, and this avoids "database is locked" retries); on Postgres, a commit locks its space's
@@ -9,6 +10,7 @@
 mod blobs;
 mod codec;
 mod commit;
+mod live;
 mod schema;
 mod tree;
 mod users;
@@ -23,6 +25,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub use commit::CommitOutcome;
 pub use craft_cloud_proto::BlobKind;
+pub use live::{LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE, MAX_LIVE_DOCS_PER_SPACE, MAX_LIVE_PAGE};
 pub use tree::SpaceInfo;
 pub use users::{DeviceAuth, DeviceRecord, Role, UserId, UserRecord, valid_username};
 
@@ -46,6 +49,18 @@ pub enum MetaError {
     /// recorded. `used` is what the space stores without it.
     #[error("the account's storage on the server is full: {used} of {limit} bytes used")]
     QuotaExceeded { used: u64, limit: u64 },
+    /// An update would take a live document's log over its cap ([`Meta::with_live_doc_cap`]); nothing was stored.
+    /// `used` is what the log holds.
+    #[error("this live document is full on the server: its log holds {used} of {limit} bytes")]
+    DocFull { used: u64, limit: u64 },
+    /// The first update to a live document would take its space over the most documents holding updates it may have
+    /// ([`MAX_LIVE_DOCS_PER_SPACE`]); nothing was stored.
+    #[error("the account has {limit} live documents holding updates on the server, the most it may have")]
+    TooManyDocs { limit: u64 },
+    /// A new live document would take its space over the most rows it may have ([`MAX_LIVE_DOC_ROWS_PER_SPACE`]);
+    /// nothing was stored.
+    #[error("the account has {limit} live documents on the server, the most it may have")]
+    TooManyDocRows { limit: u64 },
     #[error("invalid input: {0}")]
     Invalid(&'static str),
     #[error("stored data is damaged: {0}")]
@@ -70,6 +85,12 @@ pub struct Meta {
     write_lock: Arc<Mutex<()>>,
     /// The most bytes one space may store ([`Meta::with_stored_bytes_cap`]); `None`: no cap.
     stored_cap: Option<u64>,
+    /// The most bytes of updates one live document's log may hold ([`Meta::with_live_doc_cap`]).
+    live_doc_cap: u64,
+    /// The most live documents holding updates one space may have ([`Meta::with_live_docs_cap`]).
+    live_docs_cap: u64,
+    /// The most live document rows one space may have ([`Meta::with_live_doc_rows_cap`]).
+    live_doc_rows_cap: u64,
 }
 
 impl Meta {
@@ -115,7 +136,38 @@ impl Meta {
             sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
         }
         schema::migrate(&pool, dialect).await?;
-        Ok(Self { pool, dialect, write_lock: Arc::new(Mutex::new(())), stored_cap: None })
+        Ok(Self {
+            pool,
+            dialect,
+            write_lock: Arc::new(Mutex::new(())),
+            stored_cap: None,
+            live_doc_cap: MAX_LIVE_DOC_BYTES,
+            live_docs_cap: MAX_LIVE_DOCS_PER_SPACE,
+            live_doc_rows_cap: MAX_LIVE_DOC_ROWS_PER_SPACE,
+        })
+    }
+
+    /// The store with another cap on the bytes of updates one live document's log may hold (the default is
+    /// [`MAX_LIVE_DOC_BYTES`]); an append over it is refused with [`MetaError::DocFull`]. For tests.
+    pub fn with_live_doc_cap(mut self, cap: u64) -> Self {
+        self.live_doc_cap = cap;
+        self
+    }
+
+    /// The store with another cap on the number of live documents holding updates one space may have (the default is
+    /// [`MAX_LIVE_DOCS_PER_SPACE`]); the first update to one over it is refused with [`MetaError::TooManyDocs`]. For
+    /// tests.
+    pub fn with_live_docs_cap(mut self, cap: u64) -> Self {
+        self.live_docs_cap = cap;
+        self
+    }
+
+    /// The store with another cap on the number of live documents (rows, held updates or not) one space may have (the
+    /// default is [`MAX_LIVE_DOC_ROWS_PER_SPACE`]); a create over it is refused with [`MetaError::TooManyDocRows`].
+    /// For tests.
+    pub fn with_live_doc_rows_cap(mut self, cap: u64) -> Self {
+        self.live_doc_rows_cap = cap;
+        self
     }
 
     /// The store with a cap on the bytes one space (one user's) stores: the stored size of every chunk and manifest

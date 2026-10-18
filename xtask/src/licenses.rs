@@ -11,6 +11,15 @@ const ALLOWED: &[&str] = &["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", 
 /// certificates)").
 const DATA_ONLY: &[(&str, &[&str])] = &[("CDLA-Permissive-2.0", &["webpki-root-certs", "webpki-roots"])];
 
+/// MPL-2.0 (file-level copyleft) is allowed only for these crates, which Loro (the live documents' CRDT) depends on and
+/// which are used as published, never modified or copied from (`AGENTS.md`). `MPL-2.0+` is the old SPDX form they
+/// carry. Any other crate under MPL-2.0 is refused.
+const MPL_UNMODIFIED: &[&str] = &["im", "bitmaps", "sized-chunks"];
+const MPL_IDS: &[&str] = &["MPL-2.0", "MPL-2.0+"];
+
+/// BSL-1.0 (the Boost licence, permissive) is allowed only for this crate, which Loro depends on (`AGENTS.md`).
+const BSL_CRATES: &[&str] = &["xxhash-rust"];
+
 /// Licence exceptions that only add permissions (`Apache-2.0 WITH LLVM-exception`).
 const EXCEPTIONS: &[&str] = &["LLVM-exception"];
 
@@ -119,7 +128,10 @@ impl<'a> Parser<'a> {
                 }
             }
             Some(id) if !matches!(id, ")" | "AND" | "OR" | "WITH") => {
-                let ok = ALLOWED.contains(&id) || DATA_ONLY.iter().any(|(data, crates)| *data == id && crates.contains(&self.name));
+                let ok = ALLOWED.contains(&id)
+                    || DATA_ONLY.iter().any(|(data, crates)| *data == id && crates.contains(&self.name))
+                    || (MPL_IDS.contains(&id) && MPL_UNMODIFIED.contains(&self.name))
+                    || (id == "BSL-1.0" && BSL_CRATES.contains(&self.name));
                 if self.peek() == Some("WITH") {
                     self.next();
                     let exception = self.next().ok_or("`WITH` names no exception")?;
@@ -153,8 +165,19 @@ mod tests {
         ] {
             assert_eq!(permitted("some-crate", ok), Ok(true), "{ok}");
         }
-        for refused in ["", "GPL-3.0-only", "MIT AND GPL-2.0", "MPL-2.0", "Unlicense", "Apache-2.0 WITH Some-exception", "BSL-1.0"] {
+        for refused in ["", "GPL-3.0-only", "MIT AND GPL-2.0", "MPL-2.0", "MPL-2.0+", "Unlicense", "Apache-2.0 WITH Some-exception", "BSL-1.0"] {
             assert_eq!(permitted("some-crate", refused), Ok(false), "{refused}");
+        }
+        // BSL-1.0 (the Boost licence) only for the crate Loro needs.
+        assert_eq!(permitted("xxhash-rust", "BSL-1.0"), Ok(true));
+        assert_eq!(permitted("xxhash-rust2", "BSL-1.0"), Ok(false));
+        // MPL-2.0 only for the crates Loro needs, used unmodified, and for no other.
+        for name in ["im", "bitmaps", "sized-chunks"] {
+            assert_eq!(permitted(name, "MPL-2.0+"), Ok(true), "{name}");
+            assert_eq!(permitted(name, "MPL-2.0"), Ok(true), "{name}");
+        }
+        for name in ["im-rc", "loro", "some-crate", "sized-chunks2"] {
+            assert_eq!(permitted(name, "MPL-2.0"), Ok(false), "{name}");
         }
         // Data licences only for the crates that are data.
         assert_eq!(permitted("webpki-root-certs", "CDLA-Permissive-2.0"), Ok(true));

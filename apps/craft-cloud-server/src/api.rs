@@ -1,4 +1,5 @@
-//! The HTTP API, under `/api/v1`. Everything but `info` and `auth/login` needs a device token.
+//! The HTTP API, under `/api/v1`. Everything but `info` and `auth/login` needs a device token. `GET /live` becomes the
+//! live service's WebSocket ([`crate::live`]).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -53,6 +54,7 @@ pub fn router(state: Shared) -> Router {
         .route("/space", get(space))
         .route("/tree", get(tree))
         .route("/changes", get(changes))
+        .route("/live", get(crate::live::connect))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_device));
     let public = Router::new().route("/info", get(info)).route("/auth/login", post(login).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)));
     Router::new()
@@ -172,6 +174,8 @@ async fn revoke_device(
 ) -> Result<StatusCode, ApiError> {
     let Path(id) = id?;
     state.meta.revoke_device(auth.user, id).await?;
+    // Its live connections end now, not at their next request.
+    state.live.revoke(id);
     Ok(StatusCode::NO_CONTENT)
 }
 

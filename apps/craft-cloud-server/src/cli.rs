@@ -76,6 +76,21 @@ pub enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Manage live documents.
+    Live {
+        /// Path to config.toml. May come before or after the action.
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: LiveAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LiveAction {
+    /// Empty a user's recents document of an app (one that is full: `quota_exceeded`). Every machine then sends its
+    /// whole document up again, so nothing any machine holds is lost.
+    ResetDoc { username: String, app: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -204,6 +219,15 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                 let epoch = meta.reset_epoch(user.space).await?;
                 writeln!(out, "new epoch {epoch} for {}", user.username)?;
             }
+            Ok(())
+        }
+        Command::Live { config, action: LiveAction::ResetDoc { username, app } } => {
+            let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
+            let user = user_id(&meta, &username).await?;
+            let app = craft_cloud_proto::live::AppName::new(&app).map_err(|e| CliError::Usage(e.to_string()))?;
+            let doc = craft_cloud_proto::live::recents_doc(user.space, &app);
+            meta.reset_live_doc(user.space, doc).await?;
+            writeln!(out, "emptied the {app} recents of {}; every machine sends its own again when it next connects", user.username)?;
             Ok(())
         }
     }

@@ -3,8 +3,8 @@
 //! - `account.json`: the server, user, device, device name, synced folder and the device token. Written
 //!   owner-only: mode 0600 on Unix (the data folder itself is 0700). Windows has no mode bits; the default data
 //!   folder is in the user's profile (`%LOCALAPPDATA%`), which only that user (and administrators) can read. A
-//!   `--data-dir` outside the profile on Windows gets that folder's ACL, which may let others read the token:
-//!   keep it in the profile. An OS keychain can come later.
+//!   `--data-dir` outside the profile on Windows is refused, since it would get that folder's ACL, which may let
+//!   others read the token. An OS keychain can come later.
 //! - `state.json`: `{ "schema": 1, "state": <the engine's State>, "last_pass": … }`, written after every pass,
 //!   failed or not. One document, not a table per node: the engine works on the whole state in memory anyway.
 //! - `status.json`: what the `run` loop is doing ([`LoopStatus`]), for `status`; `shown.json`: the set of waiting
@@ -15,7 +15,6 @@
 //! A crash loses at most one pass of bookkeeping, which the next pass redoes. A file written by a newer agent
 //! (a higher `schema`) is refused, never half-read.
 
-use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -40,8 +39,8 @@ pub const SHOWN_SCHEMA: u32 = 1;
 /// Temporary files of the data folder younger than this are left alone by [`DataDir::clean_tmp`]: another process
 /// (`status`, `sync --approve-deletes`) may be writing one right now.
 pub const TEMP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(60);
-/// The format of `status.json` this agent writes and the newest it reads.
-pub const STATUS_SCHEMA: u32 = 1;
+/// The format of `status.json` this agent writes and the newest it reads. Format 2 added the `signed_out` state.
+pub const STATUS_SCHEMA: u32 = 2;
 /// The format of `approval.json` this agent writes and the newest it reads.
 pub const APPROVAL_SCHEMA: u32 = 2;
 /// The format of `account.json` this agent writes and the newest it reads.
@@ -49,9 +48,10 @@ pub const ACCOUNT_SCHEMA: u32 = 1;
 /// The format of `state.json` this agent writes and the newest it reads.
 pub const STATE_SCHEMA: u32 = 1;
 /// The environment variable that overrides the data folder (the `--data-dir` flag wins over it).
-pub const DATA_DIR_ENV: &str = "CRAFT_CLOUD_AGENT_DIR";
-/// The data folder's name inside the OS's per-user data folder.
-const APP_DIR: &str = "craft-cloud-agent";
+pub use craft_cloud_proto::local::DATA_DIR_ENV;
+/// The OS's per-user data folder plus `craft-cloud-agent`; shared with `craft-cloud-app`, which finds the running
+/// agent the same way.
+pub use craft_cloud_proto::local::default_data_dir;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AccountError {
@@ -326,6 +326,8 @@ pub enum LoopState {
     Stopping,
     /// The loop ended.
     Stopped,
+    /// Running, but not signed in: waiting for a sign-in through the local API (format 2).
+    SignedOut,
 }
 
 /// `approval.json`: the waiting deletions `sync --approve-deletes` approved while the loop held the locks, as the set
@@ -367,10 +369,7 @@ impl DataDir {
 
     /// `--data-dir` if given, else `$CRAFT_CLOUD_AGENT_DIR`, else the OS's per-user data folder.
     pub fn resolve(flag: Option<PathBuf>) -> Result<Self, AccountError> {
-        flag.or_else(|| std::env::var_os(DATA_DIR_ENV).filter(|v| !v.is_empty()).map(PathBuf::from))
-            .or_else(|| default_data_dir(|name| std::env::var_os(name)))
-            .map(Self)
-            .ok_or(AccountError::NoDataDir)
+        flag.or_else(|| craft_cloud_proto::local::data_dir(|name| std::env::var_os(name))).map(Self).ok_or(AccountError::NoDataDir)
     }
 
     pub fn path(&self) -> &Path {
@@ -486,22 +485,6 @@ impl DataDir {
         remove(&taken)?;
         approval
     }
-}
-
-/// The OS's per-user data folder plus `craft-cloud-agent`: `%LOCALAPPDATA%` on Windows (machine-local: the
-/// state describes this machine's disk, so it must not roam), `~/Library/Application Support` on macOS,
-/// `$XDG_DATA_HOME` or `~/.local/share` elsewhere. `env` reads an environment variable. Written out rather than
-/// taken from a crate: the usual ones depend on an MPL-licensed helper.
-pub fn default_data_dir(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    let absolute = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
-    let base = if cfg!(windows) {
-        absolute("LOCALAPPDATA")
-    } else if cfg!(target_vendor = "apple") {
-        absolute("HOME").map(|home| home.join("Library").join("Application Support"))
-    } else {
-        absolute("XDG_DATA_HOME").or_else(|| absolute("HOME").map(|home| home.join(".local").join("share")))
-    };
-    base.map(|b| b.join(APP_DIR))
 }
 
 fn load<T: DeserializeOwned>(path: &Path, supported: u32) -> Result<Option<T>, AccountError> {
@@ -851,6 +834,7 @@ mod tests {
 
     #[test]
     fn the_default_data_dir_follows_the_platform() {
+        use std::ffi::OsString;
         let env = |name: &str| match name {
             "HOME" => Some(OsString::from("/home/ana")),
             "XDG_DATA_HOME" => Some(OsString::from("relative/ignored")),
@@ -858,7 +842,7 @@ mod tests {
             _ => None,
         };
         let dir = default_data_dir(env).unwrap();
-        assert!(dir.ends_with(APP_DIR));
+        assert!(dir.ends_with("craft-cloud-agent"));
         if cfg!(windows) {
             assert!(dir.starts_with(r"C:\Users\ana\AppData\Local"));
         } else if cfg!(target_vendor = "apple") {

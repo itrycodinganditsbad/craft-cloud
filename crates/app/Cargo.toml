@@ -1,0 +1,22 @@
+[package]
+name = "craft-cloud-app"
+description = "What Craft apps and the launcher link to reach the Craft Cloud agent on this machine: account status, sign-in, recents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+craft-cloud-proto.workspace = true
+httparse.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tungstenite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

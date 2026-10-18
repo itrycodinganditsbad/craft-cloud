@@ -12,6 +12,8 @@ pub mod cli;
 pub mod daemon;
 pub mod disk;
 pub mod http;
+pub mod live;
+pub mod local_api;
 pub mod lock;
 pub mod root;
 pub mod schedule;
