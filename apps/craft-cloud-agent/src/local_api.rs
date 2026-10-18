@@ -8,8 +8,9 @@
 //! cross-origin request and every WebSocket), and the token is taken only from `Authorization: Bearer`, never from
 //! the query string; it is compared in constant time and never logged or printed.
 //!
-//! Sign-in and sign-out are the `run` loop's to carry out (it holds the data folder's lock): a call hands them over as
-//! a [`Command`] and waits for the answer. Status is read from [`Control`], which the loop keeps up to date.
+//! Sign-in and sign-out, pause, resume and quit are the `run` loop's to carry out (it holds the data folder's lock): a
+//! call hands them over as a [`Command`] and waits for the answer. Status is read from [`Control`], which the loop
+//! keeps up to date.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -36,6 +37,11 @@ use crate::cli::{AgentError, Exit};
 pub enum Command {
     Login(LoginRequest, oneshot::Sender<Result<(), AgentError>>),
     Logout(LogoutRequest, oneshot::Sender<Result<(), AgentError>>),
+    /// Hold syncing and the live connection until [`Command::Resume`], also after a restart.
+    Pause(oneshot::Sender<Result<(), AgentError>>),
+    Resume(oneshot::Sender<Result<(), AgentError>>),
+    /// Finish the pass under way and stop the agent. Answered at once.
+    Quit(oneshot::Sender<Result<(), AgentError>>),
 }
 
 /// What [`Status`] reports, kept up to date by the `run` loop.
@@ -110,6 +116,7 @@ impl Control {
             machine: s.account.as_ref().map(|a| a.device_name.clone()),
             online: s.online,
             run_state: s.run_state.clone(),
+            autostart: None,
         })
     }
 }
@@ -169,6 +176,7 @@ pub struct LocalApi {
     port: u16,
     file: PathBuf,
     task: tokio::task::JoinHandle<()>,
+    shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl LocalApi {
@@ -182,8 +190,12 @@ impl LocalApi {
         let token = random_hex(32).map_err(io)?;
         let state = Arc::new(ApiState { port, token: token.clone(), control });
         let app = router(state);
+        let (shutdown, shutting_down) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
+            let stop = async move {
+                let _ = shutting_down.await;
+            };
+            if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(stop).await {
                 eprintln!("the local API stopped: {e}");
             }
         });
@@ -193,13 +205,26 @@ impl LocalApi {
             task.abort();
             return Err(io(e));
         }
-        Ok(Self { port, file, task })
+        Ok(Self { port, file, task, shutdown: Some(shutdown) })
     }
 
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    /// Stops the server, letting the answers under way go out first (the one to `quit` among them), for at most
+    /// [`STOP_GRACE`], and removes `local-api.json`.
+    pub async fn stop(mut self) {
+        let _ = std::fs::remove_file(&self.file);
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let _ = tokio::time::timeout(STOP_GRACE, &mut self.task).await;
+    }
 }
+
+/// How long [`LocalApi::stop`] waits for the answers under way.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Drop for LocalApi {
     fn drop(&mut self) {
@@ -216,6 +241,9 @@ fn router(state: Api) -> Router {
         .route(paths::LOGIN, post(login))
         .route(paths::LOGOUT, post(logout))
         .route(paths::RECENTS, get(crate::live::recents_socket))
+        .route(paths::PAUSE, post(pause))
+        .route(paths::RESUME, post(resume))
+        .route(paths::QUIT, post(quit))
         .fallback(|| async { LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such call") })
         .layer(DefaultBodyLimit::max(MAX_LOCAL_JSON_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
@@ -270,6 +298,18 @@ async fn login(State(state): State<Api>, body: Result<Json<LoginRequest>, JsonRe
 async fn logout(State(state): State<Api>, body: Result<Json<LogoutRequest>, JsonRejection>) -> Result<Json<Status>, LocalError> {
     let Json(request) = body?;
     ask(&state, |reply| Command::Logout(request, reply)).await
+}
+
+async fn pause(State(state): State<Api>) -> Result<Json<Status>, LocalError> {
+    ask(&state, Command::Pause).await
+}
+
+async fn resume(State(state): State<Api>) -> Result<Json<Status>, LocalError> {
+    ask(&state, Command::Resume).await
+}
+
+async fn quit(State(state): State<Api>) -> Result<Json<Status>, LocalError> {
+    ask(&state, Command::Quit).await
 }
 
 #[cfg(test)]

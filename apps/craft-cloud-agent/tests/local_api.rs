@@ -82,6 +82,11 @@ impl Running {
         Self { stop, thread: Some(thread) }
     }
 
+    /// The loop's thread, to wait for its end without asking it to stop.
+    fn thread_handle(mut self) -> std::thread::JoinHandle<(Result<Exit, AgentError>, String)> {
+        self.thread.take().unwrap()
+    }
+
     async fn stop(mut self) -> (Result<Exit, AgentError>, String) {
         let _ = self.stop.send(());
         let thread = self.thread.take().unwrap();
@@ -91,8 +96,11 @@ impl Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
-        let _ = self.stop.send(());
+        // A loop whose thread was handed out ends by itself (quit): it isn't stopped here.
+        if self.thread.is_some() {
+            let _ = self.stop.send(());
+            let _ = self.stop.send(());
+        }
     }
 }
 
@@ -141,6 +149,17 @@ fn error_code(body: &str) -> String {
     serde_json::from_str::<ErrorBody>(body).unwrap().error
 }
 
+/// Every call of the local API, with a path that names something where it needs one.
+const ROUTES: &[(&str, &str)] = &[
+    ("GET", "/v1/status"),
+    ("POST", "/v1/login"),
+    ("POST", "/v1/logout"),
+    ("GET", "/v1/recents"),
+    ("POST", "/v1/pause"),
+    ("POST", "/v1/resume"),
+    ("POST", "/v1/quit"),
+];
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_local_api_answers_only_local_programs_with_the_token() {
     let dir = tempfile::tempdir().unwrap();
@@ -184,6 +203,24 @@ async fn the_local_api_answers_only_local_programs_with_the_token() {
     for auth in [format!("Bearer {wrong}"), format!("Bearer {token}x"), token.clone(), format!("Basic {token}"), "Bearer ".into()] {
         let (code, _) = refused(format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {auth}"));
         assert_eq!(code, 401, "Authorization: {auth}");
+    }
+    // Every call has the same checks: a wrong Host, an Origin, the token in the query, or a missing or wrong one is
+    // refused before the call does anything.
+    for (method, path) in ROUTES {
+        let wrong_host = format!("{method} {path} HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: Bearer {token}");
+        let origin = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: null\r\nAuthorization: Bearer {token}");
+        let in_query = format!("{method} {path}?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}");
+        let missing = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}");
+        let wrong_token = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {wrong}");
+        for (head, want) in [(wrong_host, 403), (origin, 403), (in_query, 401), (missing, 401), (wrong_token, 401)] {
+            let (code, body) = raw(port, &format!("{head}\r\nContent-Type: application/json"), "{}");
+            assert_eq!(code, want, "{method} {path}: {head:?}: {body}");
+        }
+    }
+    // Signed out: nothing to pause or resume.
+    for path in ["/v1/pause", "/v1/resume"] {
+        let (code, body) = call(&api, "POST", path, "");
+        assert_eq!((code, error_code(&body).as_str()), (409, codes::NOT_SIGNED_IN), "{path}");
     }
     // A sign-in with a bad token never reaches the loop.
     let login = r#"{"server":"http://127.0.0.1:1","user":"ana","password":"x"}"#;
@@ -323,4 +360,129 @@ async fn run_starts_signed_out_and_signs_in_and_out_through_the_local_api() {
     assert_eq!(exit.unwrap(), Exit::Done, "{out}");
     assert!(out.contains("signed in as ana") && out.contains("signed out of"), "{out}");
     assert!(!out.contains(PASSWORD), "{out}");
+}
+
+/// Signs `run` in through its local API and waits until it is idle.
+async fn signed_in(server: &Server, data: &DataDir, folder: &Path) -> (Running, LocalApiFile) {
+    let running = Running::start(data);
+    let api = api_file(data.path()).await;
+    let (code, body) = call(&api, "POST", "/v1/login", &login_body(server, folder, PASSWORD, false));
+    assert_eq!(code, 200, "{body}");
+    eventually("signed in and idle", || status(&api).run_state == RunState::Idle).await;
+    (running, api)
+}
+
+async fn reaches_the_server(server: &Server, name: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    while !server_has(server, name).await {
+        assert!(Instant::now() < deadline, "{name} reaches the server");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Paused, nothing syncs and the status says so (not as a pause that needs someone); it stays paused after `run`
+/// starts again, until it is resumed. Quit then ends `run` cleanly, and its `local-api.json` with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pause_holds_syncing_across_a_restart_until_resume() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder: PathBuf = dir.path().join("Craft Cloud");
+    let (running, api) = signed_in(&server, &data, &folder).await;
+    std::fs::write(folder.join("before.txt"), "synced").unwrap();
+    reaches_the_server(&server, "before.txt").await;
+
+    let (code, body) = call(&api, "POST", "/v1/pause", "");
+    assert_eq!(code, 200, "{body}");
+    let paused: Status = serde_json::from_str(&body).unwrap();
+    assert_eq!(paused.run_state, RunState::PausedByUser);
+    assert!(!paused.online, "the live link holds too");
+    let (code, _) = call(&api, "POST", "/v1/pause", "");
+    assert_eq!(code, 200, "pausing twice is fine");
+    std::fs::write(folder.join("paused.txt"), "waits").unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!server_has(&server, "paused.txt").await, "nothing syncs while paused");
+    assert_eq!(status(&api).run_state, RunState::PausedByUser);
+    eventually("status.json says paused", || data.load_status().unwrap().is_some_and(|s| s.state == LoopState::PausedByUser)).await;
+    let mut shown = Vec::new();
+    cli::status(&data, &mut shown).unwrap();
+    assert!(String::from_utf8(shown).unwrap().contains("paused"));
+
+    let (exit, out) = running.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    assert!(data.load_state().unwrap().paused, "kept in state.json");
+    let running = Running::start(&data);
+    let api = api_file(data.path()).await;
+    eventually("paused again after the restart", || status(&api).run_state == RunState::PausedByUser).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(!server_has(&server, "paused.txt").await, "still nothing syncs");
+
+    let (code, body) = call(&api, "POST", "/v1/resume", "");
+    assert_eq!(code, 200, "{body}");
+    assert_ne!(serde_json::from_str::<Status>(&body).unwrap().run_state, RunState::PausedByUser);
+    reaches_the_server(&server, "paused.txt").await;
+    eventually("idle and online", || {
+        let s = status(&api);
+        s.online && s.run_state == RunState::Idle
+    })
+    .await;
+    assert!(!data.load_state().unwrap().paused);
+
+    let (code, body) = call(&api, "POST", "/v1/quit", "");
+    assert_eq!(code, 200, "{body}");
+    let thread = { running }.thread_handle();
+    let (exit, out) = tokio::task::spawn_blocking(move || thread.join().unwrap()).await.unwrap();
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    assert!(!data.path().join(LOCAL_API_FILE).exists(), "gone with the agent");
+}
+
+/// Quit while signed out ends `run` too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quit_ends_a_signed_out_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let running = Running::start(&data);
+    let api = api_file(data.path()).await;
+    let (code, body) = call(&api, "POST", "/v1/quit", "");
+    assert_eq!(code, 200, "{body}");
+    let thread = { running }.thread_handle();
+    let (exit, out) = tokio::task::spawn_blocking(move || thread.join().unwrap()).await.unwrap();
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    assert!(!data.path().join(LOCAL_API_FILE).exists());
+}
+
+/// Apps' recents keep working while paused: an add is kept on this machine and reaches the server after resume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recents_added_while_paused_reach_the_server_after_resume() {
+    use craft_cloud_proto::live::{AppName, recents_doc};
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder: PathBuf = dir.path().join("Craft Cloud");
+    let (running, api) = signed_in(&server, &data, &folder).await;
+    eventually("online", || status(&api).online).await;
+    let (code, _) = call(&api, "POST", "/v1/pause", "");
+    assert_eq!(code, 200);
+    let dir_path = data.path().to_owned();
+    let added = tokio::task::spawn_blocking(move || {
+        let client = craft_cloud_app::Client::connect_in(&dir_path).unwrap();
+        client.add_recent("wordcraft", craft_cloud_app::NewRecent { path: "Letters/paused.docx".into(), title: None, saved: true }).unwrap();
+        client.recents("wordcraft").unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(added.len(), 1, "the list here has it at once");
+    let ana = server.meta.user_by_name("ana").await.unwrap().unwrap();
+    let doc = recents_doc(ana.space, &AppName::new("wordcraft").unwrap());
+    let on_server = || async { server.meta.live_doc(ana.space, doc).await.unwrap().is_some_and(|d| d.head > 0) };
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(!on_server().await, "not sent while paused");
+    let (code, _) = call(&api, "POST", "/v1/resume", "");
+    assert_eq!(code, 200);
+    let deadline = Instant::now() + PATIENCE;
+    while !on_server().await {
+        assert!(Instant::now() < deadline, "the entry reaches the server after resume");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = running.stop().await;
 }

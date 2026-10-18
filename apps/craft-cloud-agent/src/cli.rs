@@ -982,7 +982,7 @@ impl Session {
         let (checkpoint_data, checkpoint_last) = (data.clone(), last_pass.clone());
         engine.on_checkpoint(move |state| {
             let last_pass = checkpoint_last.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-            let saved = SavedState { schema: STATE_SCHEMA, state: state.clone(), last_pass };
+            let saved = SavedState { schema: STATE_SCHEMA, state: state.clone(), last_pass, paused: false };
             checkpoint_data.save_state(&saved).map_err(|e| std::io::Error::other(e.to_string()))
         });
         Ok(Self { data: data.clone(), account, engine, last_pass, _folder_lock: folder_lock, stability, recheck_in: None })
@@ -1050,7 +1050,7 @@ impl Session {
         };
         let last = LastPass { finished_ms: now_ms(), outcome, summary: summary.clone() };
         *self.last_pass.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(last.clone());
-        let saved = SavedState { schema: STATE_SCHEMA, state: self.engine.state().clone(), last_pass: Some(last) };
+        let saved = SavedState { schema: STATE_SCHEMA, state: self.engine.state().clone(), last_pass: Some(last), paused: false };
         self.data.save_state(&saved)?;
         result?;
         Ok(summary.unwrap_or_default())
@@ -1239,6 +1239,7 @@ fn describe_loop(state: &LoopState) -> String {
         LoopState::Stopping => "stopping after the running pass".into(),
         LoopState::Stopped => "stopped".into(),
         LoopState::SignedOut => "not signed in, waiting for a sign-in".into(),
+        LoopState::PausedByUser => "paused (`craft-cloud-agent resume` syncs again)".into(),
     }
 }
 

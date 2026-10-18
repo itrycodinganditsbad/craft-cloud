@@ -1,7 +1,8 @@
 //! The live hub's task: owns the account's [`Replica`], answers the local API's recents calls, and keeps the live
 //! connection to the server up while the agent is signed in (connecting again with backoff, from 1 s doubling to 5
 //! minutes with jitter; every 10 minutes for a server that speaks another live protocol). Offline it keeps working:
-//! adds are kept on disk and reach the server once the connection is back.
+//! adds are kept on disk and reach the server once the connection is back. While syncing is paused the connection is
+//! held the same way (closed, and not dialed until resumed).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -51,8 +52,17 @@ pub struct Listing {
 }
 
 enum Request {
-    Follow { app: AppName, reply: oneshot::Sender<Result<watch::Receiver<Listing>, HubError>> },
-    Add { app: AppName, entry: NewRecent, reply: oneshot::Sender<Result<RecentEntry, HubError>> },
+    Follow {
+        app: AppName,
+        reply: oneshot::Sender<Result<watch::Receiver<Listing>, HubError>>,
+    },
+    Add {
+        app: AppName,
+        entry: NewRecent,
+        reply: oneshot::Sender<Result<RecentEntry, HubError>>,
+    },
+    /// Hold the live connection (closed, and not dialed) or let it run again; answered once done.
+    Pause(bool, oneshot::Sender<()>),
 }
 
 /// How the local API reaches the hub. Cheap to clone.
@@ -75,6 +85,14 @@ impl HubHandle {
         self.tx.send(Request::Add { app, entry, reply }).await.map_err(|_| HubError::Gone)?;
         rx.await.map_err(|_| HubError::Gone)?
     }
+
+    /// Holds the live connection while syncing is paused (`true`): it is closed and not dialed again until `false`.
+    /// Follows and adds keep working meanwhile; adds reach the server once it runs again.
+    pub async fn set_paused(&self, paused: bool) -> Result<(), HubError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(Request::Pause(paused, reply)).await.map_err(|_| HubError::Gone)?;
+        rx.await.map_err(|_| HubError::Gone)
+    }
 }
 
 /// The running hub; dropping it stops it (what it was told is on disk already). It runs on a thread of its own with
@@ -86,14 +104,17 @@ pub struct Hub {
 }
 
 impl Hub {
-    /// Opens the account's documents and starts the hub. `control` hears whether the live connection is up.
-    pub fn start(config: HubConfig, control: Control) -> std::io::Result<Self> {
+    /// Opens the account's documents and starts the hub, with its live connection held if `paused` (see
+    /// [`HubHandle::set_paused`]). `control` hears whether the live connection is up.
+    pub fn start(config: HubConfig, control: Control, paused: bool) -> std::io::Result<Self> {
         let dir = config.data.path().join("live").join(config.space.to_string());
         let replica = Replica::open(DiskStore::open(&dir)?, config.space, super::replica::random_peers())?;
         let (tx, rx) = mpsc::channel(64);
         let (stop, stopped) = oneshot::channel();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        std::thread::Builder::new().name("craft-cloud-live".into()).spawn(move || runtime.block_on(run(config, replica, rx, control, stopped)))?;
+        std::thread::Builder::new()
+            .name("craft-cloud-live".into())
+            .spawn(move || runtime.block_on(run(config, replica, rx, control, stopped, paused)))?;
         Ok(Self { handle: HubHandle { tx }, stop: Some(stop) })
     }
 
@@ -175,6 +196,8 @@ struct State {
     /// When to dial again, and the backoff that grows with every connection lost (reset once welcomed).
     retry_at: Instant,
     delay: Duration,
+    /// Syncing is paused: no connection is dialed (see [`HubHandle::set_paused`]).
+    paused: bool,
 }
 
 impl State {
@@ -258,6 +281,8 @@ impl State {
 
     async fn handle(&mut self, request: Request) {
         match request {
+            // The run loop's to handle (it owns the dialing).
+            Request::Pause(..) => {}
             Request::Follow { app, reply } => {
                 if !self.lists.contains_key(&app) && self.lists.len() >= MAX_SUBSCRIPTIONS {
                     let _ = reply.send(Err(HubError::Invalid(format!("the agent follows at most {MAX_SUBSCRIPTIONS} apps' recents"))));
@@ -308,17 +333,28 @@ async fn run(
     mut requests: mpsc::Receiver<Request>,
     control: Control,
     mut stop: oneshot::Receiver<()>,
+    paused: bool,
 ) {
     let lookup = NodeLookup { data: config.data.clone(), seen: None, state: None };
-    let mut state =
-        State { config, replica, lookup, lists: BTreeMap::new(), socket: None, control, said: None, retry_at: Instant::now(), delay: RETRY_FIRST };
+    let mut state = State {
+        config,
+        replica,
+        lookup,
+        lists: BTreeMap::new(),
+        socket: None,
+        control,
+        said: None,
+        retry_at: Instant::now(),
+        delay: RETRY_FIRST,
+        paused,
+    };
     state.settle();
     let mut dialing: Option<tokio::task::JoinHandle<Result<LiveSocket, DialError>>> = None;
     let mut last_heard = Instant::now();
     let mut ping = tokio::time::interval(PING_EVERY);
     let mut resend = tokio::time::interval(RESEND_EVERY);
     loop {
-        if state.socket.is_none() && dialing.is_none() && Instant::now() >= state.retry_at {
+        if state.socket.is_none() && dialing.is_none() && !state.paused && Instant::now() >= state.retry_at {
             let (server, token) = (state.config.server.clone(), state.config.token.clone());
             dialing = Some(tokio::spawn(async move { dial(&server, &token).await }));
         }
@@ -331,6 +367,25 @@ async fn run(
                 return;
             }
             request = requests.recv() => match request {
+                Some(Request::Pause(paused, done)) => {
+                    state.paused = paused;
+                    if paused {
+                        if let Some(task) = dialing.take() {
+                            task.abort();
+                        }
+                        if let Some(mut socket) = state.socket.take() {
+                            let _ = socket.close(None).await;
+                        }
+                        state.replica.disconnected();
+                        // Offline before the caller hears it, so the status it reads next says so.
+                        state.control.set_online(false);
+                    } else {
+                        // Dialed at once: nothing was wrong with the connection.
+                        state.retry_at = Instant::now();
+                        state.delay = RETRY_FIRST;
+                    }
+                    let _ = done.send(());
+                }
                 Some(request) => state.handle(request).await,
                 None => return,
             },
@@ -392,7 +447,7 @@ async fn run(
                 let frames = state.replica.resend();
                 state.send(frames).await;
             }
-            () = tokio::time::sleep_until(retry_at), if !up && dialing.is_none() => {}
+            () = tokio::time::sleep_until(retry_at), if !up && dialing.is_none() && !state.paused => {}
         }
         state.settle();
     }

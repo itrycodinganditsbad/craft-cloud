@@ -70,6 +70,21 @@ pub mod paths {
     pub const LOGIN: &str = "/v1/login";
     pub const LOGOUT: &str = "/v1/logout";
     pub const RECENTS: &str = "/v1/recents";
+    /// `POST`: join with a join string ([`super::JoinRequest`]) → [`super::Status`].
+    pub const JOIN: &str = "/v1/join";
+    /// `POST`: a new add-a-computer code → [`super::PairingInfo`]; `GET`/`DELETE` `/v1/pairings/{id}`: its state, or
+    /// cancel it.
+    pub const PAIRINGS: &str = "/v1/pairings";
+    /// `GET`: the account's computers; `DELETE /v1/devices/{id}`: remove one (never this one).
+    pub const DEVICES: &str = "/v1/devices";
+    /// `POST`: hold syncing (kept across restarts) → [`super::Status`].
+    pub const PAUSE: &str = "/v1/pause";
+    /// `POST`: sync again after a pause → [`super::Status`].
+    pub const RESUME: &str = "/v1/resume";
+    /// `POST`: finish the pass under way and exit → [`super::Status`] (as the agent stops).
+    pub const QUIT: &str = "/v1/quit";
+    /// `POST` ([`super::AutostartRequest`]): start, or don't start, the agent at login → [`super::Status`].
+    pub const AUTOSTART: &str = "/v1/autostart";
 }
 
 /// The agent's data folder: `$CRAFT_CLOUD_AGENT_DIR` if set, else [`default_data_dir`]. `env` reads an environment
@@ -123,6 +138,10 @@ pub enum RunState {
     Retrying { message: String },
     /// Stopped until someone puts something right.
     Paused { reason: String },
+    /// Paused by the user (`POST /v1/pause`), until `POST /v1/resume`, also after a restart: no sync passes and no
+    /// live connection; the local API and apps' recents on this machine keep working. Not a problem to put right,
+    /// unlike [`RunState::Paused`].
+    PausedByUser,
     /// The agent is stopping.
     Stopping,
 }
@@ -148,6 +167,10 @@ pub struct Status {
     /// Whether the agent reaches the server right now (its live connection is up).
     pub online: bool,
     pub run_state: RunState,
+    /// Whether the agent starts by itself at login on this computer; `None` where the agent can't tell or doesn't
+    /// support it (an older agent says nothing).
+    #[serde(default)]
+    pub autostart: Option<bool>,
 }
 
 /// `POST /v1/login`: what `craft-cloud-agent login` asks for. The password goes to the agent and from there to the
@@ -342,10 +365,18 @@ mod tests {
             machine: None,
             online: false,
             run_state: RunState::SignedOut,
+            autostart: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["run_state"], serde_json::json!({ "kind": "signed_out" }));
         assert_eq!(serde_json::from_value::<Status>(json).unwrap(), status);
+        let paused = serde_json::to_value(RunState::PausedByUser).unwrap();
+        assert_eq!(paused, serde_json::json!({ "kind": "paused_by_user" }));
+        let older: Status = serde_json::from_value(serde_json::json!({
+            "api": 1, "signed_in": false, "online": false, "run_state": { "kind": "signed_out" }
+        }))
+        .unwrap();
+        assert_eq!(older.autostart, None, "an older agent says nothing about autostart");
         let login: LoginRequest = serde_json::from_value(serde_json::json!({ "server": "s", "user": "u", "password": "p", "extra": 1 })).unwrap();
         assert!(!login.adopt && login.folder.is_none(), "missing optional fields default; unknown ones are ignored");
     }

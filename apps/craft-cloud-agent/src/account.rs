@@ -39,8 +39,9 @@ pub const SHOWN_SCHEMA: u32 = 1;
 /// Temporary files of the data folder younger than this are left alone by [`DataDir::clean_tmp`]: another process
 /// (`status`, `sync --approve-deletes`) may be writing one right now.
 pub const TEMP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(60);
-/// The format of `status.json` this agent writes and the newest it reads. Format 2 added the `signed_out` state.
-pub const STATUS_SCHEMA: u32 = 2;
+/// The format of `status.json` this agent writes and the newest it reads. Format 2 added the `signed_out` state,
+/// format 3 `paused_by_user`.
+pub const STATUS_SCHEMA: u32 = 3;
 /// The format of `approval.json` this agent writes and the newest it reads.
 pub const APPROVAL_SCHEMA: u32 = 2;
 /// The format of `account.json` this agent writes and the newest it reads.
@@ -267,6 +268,10 @@ pub struct SavedState {
     pub state: State,
     #[serde(default)]
     pub last_pass: Option<LastPass>,
+    /// Syncing is paused by the user (the local API's `pause`) until resumed, also after a restart. Written by the
+    /// `run` loop only while no pass runs (a pass writes `false`: passes run only when not paused).
+    #[serde(default)]
+    pub paused: bool,
 }
 
 /// `status.json`: what the `run` loop is doing, written atomically on every change and as a heartbeat, for `status`
@@ -328,6 +333,8 @@ pub enum LoopState {
     Stopped,
     /// Running, but not signed in: waiting for a sign-in through the local API (format 2).
     SignedOut,
+    /// Signed in, with syncing paused by the user until resumed (format 3).
+    PausedByUser,
 }
 
 /// `approval.json`: the waiting deletions `sync --approve-deletes` approved while the loop held the locks, as the set
