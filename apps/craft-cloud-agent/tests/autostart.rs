@@ -32,6 +32,14 @@ fn golden(name: &str) -> String {
     std::fs::read_to_string(path).unwrap().replace("\r\n", "\n")
 }
 
+/// The macOS agent, with launchd writing its output to `run.log` in the default data folder.
+fn mac_launch() -> Launch {
+    Launch {
+        exe: PathBuf::from("/Users/zoë/Library/Application Support/Craft Cloud & Co/craft-cloud-agent"),
+        log: Some(PathBuf::from("/Users/zoë/Library/Application Support/craft-cloud-agent/run.log")),
+    }
+}
+
 fn launch(exe: &str) -> Launch {
     Launch { exe: PathBuf::from(exe), log: None }
 }
@@ -41,7 +49,7 @@ fn each_os_gets_its_entry_with_the_path_quoted() {
     let unix = launch("/home/zoë/My Apps/craft-cloud-agent");
     assert_eq!(linux::unit(&unix).unwrap(), golden("craft-cloud-agent.service"));
     assert_eq!(linux::desktop_entry(&unix).unwrap(), golden("craft-cloud-agent.desktop"));
-    let mac = launch("/Users/zoë/Library/Application Support/Craft Cloud & Co/craft-cloud-agent");
+    let mac = mac_launch();
     assert_eq!(macos::plist(&mac).unwrap(), golden("ch.craftcloud.agent.plist"));
     let win = launch(r"C:\Users\Zoë\AppData\Local\Programs\Craft Cloud\craft-cloud-agent-bg.exe");
     assert_eq!(windows::run_value(&win).unwrap(), golden("windows-run-value.txt").trim_end());
@@ -119,7 +127,7 @@ fn without_systemd_an_xdg_autostart_entry_is_written() {
 fn a_launch_agent_is_written_once_and_removed() {
     let home = tempfile::tempdir().unwrap();
     let (roots, _) = roots(home.path(), false);
-    let agent = launch("/Users/zoë/Library/Application Support/Craft Cloud & Co/craft-cloud-agent");
+    let agent = mac_launch();
     assert!(!macos::is_registered(&roots).unwrap());
     macos::register(&roots, &agent).unwrap();
     macos::register(&roots, &agent).unwrap();

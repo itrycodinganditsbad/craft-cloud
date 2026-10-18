@@ -10,6 +10,10 @@
         <string>/Users/zoë/Library/Application Support/Craft Cloud &amp; Co/craft-cloud-agent</string>
         <string>run</string>
     </array>
+    <key>StandardOutPath</key>
+    <string>/Users/zoë/Library/Application Support/craft-cloud-agent/run.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/zoë/Library/Application Support/craft-cloud-agent/run.log</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

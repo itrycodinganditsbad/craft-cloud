@@ -1,6 +1,7 @@
 //! macOS: a launch agent, `~/Library/LaunchAgents/ch.craftcloud.agent.plist`. launchd starts it at login
-//! (`RunAtLoad`) and again after a crash, but not after a clean quit (`KeepAlive` with `SuccessfulExit` false). The
-//! file is written by [`plist`], a pure function, so its format is tested on every OS.
+//! (`RunAtLoad`) and again after a crash, but not after a clean quit (`KeepAlive` with `SuccessfulExit` false). What
+//! the agent prints goes to `run.log` in its data folder (`StandardOutPath`, `StandardErrorPath`; launchd appends and
+//! doesn't rotate). The file is written by [`plist`], a pure function, so its format is tested on every OS.
 
 use std::path::PathBuf;
 
@@ -34,6 +35,14 @@ pub fn plist(launch: &Launch) -> Result<String, AutostartError> {
     for arg in launch.args()? {
         arguments.push_str(&format!("        <string>{}</string>\n", xml_escaped(&arg)));
     }
+    // launchd keeps nothing the agent prints unless told where: `run.log` in the data folder, both streams.
+    let mut log = String::new();
+    if let Some(path) = &launch.log {
+        let path = xml_escaped(&super::text(path)?);
+        for key in ["StandardOutPath", "StandardErrorPath"] {
+            log.push_str(&format!("    <key>{key}</key>\n    <string>{path}</string>\n"));
+        }
+    }
     Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -46,6 +55,7 @@ pub fn plist(launch: &Launch) -> Result<String, AutostartError> {
          \x20   <array>\n\
          {arguments}\
          \x20   </array>\n\
+         {log}\
          \x20   <key>RunAtLoad</key>\n\
          \x20   <true/>\n\
          \x20   <key>KeepAlive</key>\n\
