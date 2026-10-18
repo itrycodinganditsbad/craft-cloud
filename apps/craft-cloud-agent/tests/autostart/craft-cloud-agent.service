@@ -1,0 +1,10 @@
+# Written by Craft Cloud (`craft-cloud-agent autostart on`); `autostart off` removes it.
+[Unit]
+Description=Craft Cloud agent: keeps the synced folder in step with the server
+
+[Service]
+ExecStart="/home/zoë/My Apps/craft-cloud-agent" "run"
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

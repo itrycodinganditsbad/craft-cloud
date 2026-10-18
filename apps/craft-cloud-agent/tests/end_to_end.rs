@@ -1085,7 +1085,7 @@ async fn a_join_that_cant_reach_the_server_says_why_and_creates_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let data = DataDir::new(dir.path().join("data"));
     let folder = dir.path().join("Craft Cloud");
-    let args = |join: String| JoinArgs { join, folder: Some(folder.clone()), device_name: Some("pc".into()), adopt: false };
+    let args = |join: String| JoinArgs { join, folder: Some(folder.clone()), device_name: Some("pc".into()), adopt: false, autostart: false };
 
     let untrusted = cli::join(&data, &args(format!("https://localhost:{port}/K7M4-Q9TX")), None, &mut Vec::new()).await.unwrap_err();
     assert!(matches!(untrusted, AgentError::UntrustedCertificate { ref host } if host == "localhost"), "{untrusted:?}");

@@ -1,0 +1,9 @@
+# Written by Craft Cloud (`craft-cloud-agent autostart on`); `autostart off` removes it.
+[Desktop Entry]
+Type=Application
+Name=Craft Cloud agent
+Comment=Keeps the synced folder in step with the server
+Exec="/home/zoë/My Apps/craft-cloud-agent" "run"
+NoDisplay=true
+Terminal=false
+X-GNOME-Autostart-enabled=true

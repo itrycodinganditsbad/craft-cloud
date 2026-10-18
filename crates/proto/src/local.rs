@@ -76,6 +76,9 @@ pub mod codes {
     pub const CANNOT_REMOVE_SELF: &str = "cannot_remove_self";
     /// This computer doesn't trust the server's certificate (the message says how to install the server's root).
     pub const UNTRUSTED_CERTIFICATE: &str = "untrusted_certificate";
+    /// `autostart`: the start-at-login entry couldn't be written or removed (the message says why), or this agent
+    /// doesn't handle it here. Whatever else was asked (a join) stands.
+    pub const AUTOSTART_FAILED: &str = "autostart_failed";
 }
 
 /// The paths of the local API.

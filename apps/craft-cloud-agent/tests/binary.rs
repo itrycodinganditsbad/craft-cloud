@@ -135,6 +135,21 @@ async fn add_computer_then_join_on_a_second_machine() {
     assert!(String::from_utf8_lossy(&status.stdout).contains("signed in as ana"), "{status:?}");
 }
 
+/// The background build runs the same commands, and writes what they say to `run.log` in the data folder.
+#[test]
+fn the_background_build_writes_to_its_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let out = Command::new(env!("CARGO_BIN_EXE_craft-cloud-agent-bg")).arg("status").env("CRAFT_CLOUD_AGENT_DIR", &data).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stdout.is_empty(), "nothing on the console");
+    let log = std::fs::read_to_string(data.join("run.log")).unwrap();
+    assert!(log.contains("not signed in"), "{log}");
+    let failed = Command::new(env!("CARGO_BIN_EXE_craft-cloud-agent-bg")).arg("sync").env("CRAFT_CLOUD_AGENT_DIR", &data).output().unwrap();
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(std::fs::read_to_string(data.join("run.log")).unwrap().contains("error: not signed in"), "errors go there too");
+}
+
 /// A stop that needs the user exits 3 from the real binary, with the reason on standard error.
 #[test]
 fn a_damaged_account_file_exits_3() {

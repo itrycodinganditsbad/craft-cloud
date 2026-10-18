@@ -60,6 +60,8 @@ fn quick() -> RunOptions {
         poll_min_spacing: Duration::from_millis(100),
         poll_busy: Duration::from_millis(200),
         fail_watch: false,
+        // Never this machine's own start-at-login entry.
+        autostart: craft_cloud_agent::autostart::Target::Off,
     }
 }
 
@@ -71,12 +73,16 @@ struct Running {
 
 impl Running {
     fn start(data: &DataDir) -> Self {
+        Self::start_with(data, quick())
+    }
+
+    fn start_with(data: &DataDir, options: RunOptions) -> Self {
         let (stop, stops) = mpsc::unbounded_channel();
         let data = data.clone();
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             let mut out = Vec::new();
-            let exit = runtime.block_on(run_loop(&data, quick(), stops, &mut out));
+            let exit = runtime.block_on(run_loop(&data, options, stops, &mut out));
             (exit, String::from_utf8_lossy(&out).into_owned())
         });
         Self { stop, thread: Some(thread) }
@@ -164,7 +170,62 @@ const ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/v1/pairings/0192f0c4-0000-7000-8000-000000000000"),
     ("GET", "/v1/devices"),
     ("DELETE", "/v1/devices/0192f0c4-0000-7000-8000-000000000000"),
+    ("POST", "/v1/autostart"),
 ];
+
+/// A user session without systemd: Linux's entry is the XDG autostart file.
+struct NoSystemd;
+
+impl craft_cloud_agent::autostart::Runner for NoSystemd {
+    fn run(&self, _program: &str, _args: &[&str]) -> std::io::Result<bool> {
+        Ok(false)
+    }
+}
+
+/// Start at login is turned on through the local API (in a temporary home, and on Windows a throwaway registry key),
+/// the status says so, and signing out turns it off again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn autostart_is_turned_on_through_the_local_api_and_off_at_sign_out() {
+    use craft_cloud_agent::autostart::{Roots, Target, is_registered};
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder: PathBuf = dir.path().join("Craft Cloud");
+    let key = format!(r"Software\Craft Cloud Test\{}", uuid::Uuid::now_v7());
+    let roots: &'static Roots =
+        Box::leak(Box::new(Roots { home: dir.path().join("home"), run_key: key.clone(), runner: std::sync::Arc::new(NoSystemd) }));
+    let running = Running::start_with(&data, RunOptions { autostart: Target::At(roots), ..quick() });
+    let api = api_file(data.path()).await;
+    assert_eq!(status(&api).autostart, Some(false));
+    let (code, body) = call(&api, "POST", "/v1/login", &login_body(&server, &folder, PASSWORD, false));
+    assert_eq!(code, 200, "{body}");
+
+    let (code, body) = call(&api, "POST", "/v1/autostart", r#"{"on":true}"#);
+    if cfg!(windows) {
+        // The test binary has no background build next to it: refused, and saying why.
+        assert_eq!((code, error_code(&body).as_str()), (500, codes::AUTOSTART_FAILED), "{body}");
+        assert!(body.contains("craft-cloud-agent-bg.exe"), "{body}");
+        let _ = running.stop().await;
+        return;
+    }
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Status>(&body).unwrap().autostart, Some(true));
+    assert!(is_registered(roots).unwrap());
+    // The data folder isn't the default one, so the entry names it.
+    let entry = if cfg!(target_vendor = "apple") {
+        craft_cloud_agent::autostart::macos::plist_file(roots)
+    } else {
+        craft_cloud_agent::autostart::linux::desktop_file(roots)
+    };
+    let written = std::fs::read_to_string(entry).unwrap();
+    assert!(written.contains("--data-dir") && written.contains(&data.path().display().to_string()), "{written}");
+
+    let (code, body) = call(&api, "POST", "/v1/logout", "{}");
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Status>(&body).unwrap().autostart, Some(false), "signing out turns it off");
+    assert!(!is_registered(roots).unwrap());
+    let _ = running.stop().await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_local_api_answers_only_local_programs_with_the_token() {

@@ -62,6 +62,9 @@ pub struct RunOptions {
     /// Tests: the folder watcher fails to start, as it does when the system's watch limit is reached.
     #[doc(hidden)]
     pub fail_watch: bool,
+    /// Where the local API's `autostart` puts the agent's start-at-login entry (and a sign-out removes it from):
+    /// this user's, or nowhere / a temporary place in tests, which must not touch the machine's own.
+    pub autostart: crate::autostart::Target,
 }
 
 impl Default for RunOptions {
@@ -75,6 +78,7 @@ impl Default for RunOptions {
             poll_min_spacing: Duration::from_secs(1),
             poll_busy: Duration::from_secs(5),
             fail_watch: false,
+            autostart: crate::autostart::Target::User,
         }
     }
 }
@@ -497,7 +501,12 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
     };
     // The local API serves from the start, signed in or not; it is stopped (and its file removed) when the loop ends.
     let (commands_tx, mut commands) = mpsc::channel::<Command>(8);
-    let control = Control::new(commands_tx);
+    let autostart_roots = options.autostart.roots().unwrap_or_else(|e| {
+        say(out, &format!("start at login can't be set from here: {e}"));
+        None
+    });
+    let control = Control::new(commands_tx).with_autostart(autostart_roots);
+    control.refresh_autostart().await;
     let api = LocalApi::start(data, control.clone()).await?;
     say(out, &format!("craft-cloud-agent: local API on 127.0.0.1:{} (for apps and the launcher)", api.port()));
     let mut status = Status {
@@ -867,6 +876,15 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                 // A running pass finishes first (its thread then ends and lets go of the folder).
                 let _ = tokio::task::spawn_blocking(move || pass.join()).await;
                 let forgotten = crate::cli::forget_account(data);
+                // Signed out, the agent no longer starts at login.
+                if let Some(roots) = control.autostart_roots() {
+                    match tokio::task::spawn_blocking(move || crate::autostart::unregister(&roots)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => say(out, &format!("the start-at-login entry couldn't be removed: {e}")),
+                        Err(e) => say(out, &format!("the start-at-login entry couldn't be removed: {e}")),
+                    }
+                    control.refresh_autostart().await;
+                }
                 match &forgotten {
                     Ok(()) => say(out, &format!("signed out of {}; the files in {} stay", account.server, account.folder.display())),
                     // The device is revoked on the server already: the account here is dead, and is never used again
@@ -939,6 +957,8 @@ async fn wait_for_sign_in(
                         folder: request.folder.as_ref().map(std::path::PathBuf::from),
                         device_name: request.device_name.clone(),
                         adopt: request.adopt,
+                        // The caller asks for it with `POST /v1/autostart` once joined.
+                        autostart: false,
                     };
                     let result = crate::cli::join_locked(data, &args, request.password.as_deref()).await;
                     if signed_in(result, "joined", control, reply, out) {

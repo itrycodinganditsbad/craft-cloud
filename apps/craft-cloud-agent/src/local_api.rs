@@ -28,12 +28,13 @@ use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::{DeviceInfo, ErrorBody, PairingStatus, codes as api_codes};
 use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
 use craft_cloud_proto::local::{
-    JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES, PairingInfo,
-    RunState, Status, codes, paths,
+    AutostartRequest, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES,
+    PairingInfo, RunState, Status, codes, paths,
 };
 use tokio::sync::{mpsc, oneshot};
 
 use crate::account::{Account, DataDir, random_hex, write_atomic};
+use crate::autostart::{self, Roots};
 use crate::cli::{AgentError, Exit};
 use crate::http::HttpTransport;
 
@@ -57,6 +58,8 @@ struct Shared {
     online: bool,
     /// The live hub, while signed in.
     hub: Option<crate::live::HubHandle>,
+    /// Whether the agent starts at login, as last looked at (`None`: not known, or not handled here).
+    autostart: Option<bool>,
 }
 
 /// The loop's side of the local API: the status it reports, and the commands it receives. Cheap to clone.
@@ -64,12 +67,36 @@ struct Shared {
 pub struct Control {
     shared: Arc<Mutex<Shared>>,
     commands: mpsc::Sender<Command>,
+    /// Where the start-at-login entry goes (`None`: `autostart` is refused).
+    autostart: Option<Roots>,
 }
 
 impl Control {
     /// A control for a loop that receives its commands from `commands`' other end.
     pub fn new(commands: mpsc::Sender<Command>) -> Self {
-        Self { shared: Arc::new(Mutex::new(Shared { account: None, run_state: RunState::SignedOut, online: false, hub: None })), commands }
+        let shared = Shared { account: None, run_state: RunState::SignedOut, online: false, hub: None, autostart: None };
+        Self { shared: Arc::new(Mutex::new(shared)), commands, autostart: None }
+    }
+
+    /// The control with the start-at-login entry at `roots` (`None`: not handled).
+    pub fn with_autostart(mut self, roots: Option<Roots>) -> Self {
+        self.autostart = roots;
+        self
+    }
+
+    /// Where the start-at-login entry goes, if it is handled here.
+    pub fn autostart_roots(&self) -> Option<Roots> {
+        self.autostart.clone()
+    }
+
+    /// Looks again whether the agent starts at login (off the async threads: on Linux it asks `systemctl`), for
+    /// [`Status::autostart`].
+    pub async fn refresh_autostart(&self) {
+        let registered = match self.autostart.clone() {
+            Some(roots) => tokio::task::spawn_blocking(move || autostart::is_registered(&roots).ok()).await.ok().flatten(),
+            None => None,
+        };
+        self.with(|s| s.autostart = registered);
     }
 
     fn with<T>(&self, f: impl FnOnce(&mut Shared) -> T) -> T {
@@ -121,7 +148,7 @@ impl Control {
             machine: s.account.as_ref().map(|a| a.device_name.clone()),
             online: s.online,
             run_state: s.run_state.clone(),
-            autostart: None,
+            autostart: s.autostart,
         })
     }
 }
@@ -187,6 +214,8 @@ pub struct ApiState {
     port: u16,
     token: String,
     pub control: Control,
+    /// The agent's data folder (a start-at-login entry names it when it isn't the default one).
+    data: PathBuf,
 }
 
 /// The running local API. Dropping it stops the server and removes `local-api.json`.
@@ -206,7 +235,7 @@ impl LocalApi {
         let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await.map_err(io)?;
         let port = listener.local_addr().map_err(io)?.port();
         let token = random_hex(32).map_err(io)?;
-        let state = Arc::new(ApiState { port, token: token.clone(), control });
+        let state = Arc::new(ApiState { port, token: token.clone(), control, data: data.path().to_owned() });
         let app = router(state);
         let (shutdown, shutting_down) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
@@ -264,6 +293,7 @@ fn router(state: Api) -> Router {
         .route(&format!("{}/{{id}}", paths::PAIRINGS), get(pairing_status).delete(delete_pairing))
         .route(paths::DEVICES, get(devices))
         .route(&format!("{}/{{id}}", paths::DEVICES), delete(remove_device))
+        .route(paths::AUTOSTART, post(set_autostart))
         .route(paths::PAUSE, post(pause))
         .route(paths::RESUME, post(resume))
         .route(paths::QUIT, post(quit))
@@ -396,6 +426,28 @@ async fn remove_device(State(state): State<Api>, id: Result<Path<DeviceId>, Path
         other => AgentError::from(other).into(),
     })?;
     Ok(Json(transport.devices().await.map_err(AgentError::from)?))
+}
+
+/// Registers this agent to start at login, or removes the entry; the status after says which.
+async fn set_autostart(State(state): State<Api>, body: Result<Json<AutostartRequest>, JsonRejection>) -> Result<Json<Status>, LocalError> {
+    let Json(AutostartRequest { on }) = body?;
+    let roots = state
+        .control
+        .autostart_roots()
+        .ok_or_else(|| LocalError::new(StatusCode::NOT_IMPLEMENTED, codes::AUTOSTART_FAILED, "this agent doesn't handle starting at login here"))?;
+    let data = state.data.clone();
+    let done = tokio::task::spawn_blocking(move || if on { set_on(&roots, &data) } else { autostart::unregister(&roots) }).await;
+    state.control.refresh_autostart().await;
+    match done {
+        Ok(Ok(())) => Ok(Json(state.control.status())),
+        Ok(Err(e)) => Err(LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, codes::AUTOSTART_FAILED, e.to_string())),
+        Err(e) => Err(LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, codes::AUTOSTART_FAILED, e.to_string())),
+    }
+}
+
+/// Registers this agent, with the data folder `data`, to start at login at `roots`.
+pub fn set_on(roots: &Roots, data: &std::path::Path) -> Result<(), autostart::AutostartError> {
+    autostart::register(roots, &autostart::this_agent(data)?)
 }
 
 async fn pause(State(state): State<Api>) -> Result<Json<Status>, LocalError> {

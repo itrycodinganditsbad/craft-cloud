@@ -1,4 +1,5 @@
-//! The `craft-cloud-agent` command line: `login`, `run`, `sync`, `status`, `logout`. Each command is a library
+//! The `craft-cloud-agent` command line: `login` or `join`, `run`, `sync`, `status`, `logout`, and through the running
+//! agent `recents`, `add-computer`, `devices`, `pause`, `resume`, `quit` and `autostart`. Each command is a library
 //! function too, so tests drive exactly what a user runs.
 //!
 //! The password is read from standard input (one line), so it never appears in the process list or shell
@@ -104,6 +105,17 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<DevicesAction>,
     },
+    /// Start the agent by itself at login on this computer (`on`), or not any more (`off`). Signing out turns it off.
+    Autostart {
+        #[arg(value_enum)]
+        state: OnOff,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OnOff {
+    On,
+    Off,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -171,6 +183,9 @@ pub struct JoinArgs {
     /// copies; nothing is deleted.
     #[arg(long)]
     pub adopt: bool,
+    /// Once joined, start the agent by itself at every login on this computer (as `autostart on`).
+    #[arg(long)]
+    pub autostart: bool,
 }
 
 /// How a command ended, as the process exit code.
@@ -363,6 +378,13 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
         }
         Command::Logout { local } => {
             match logout(&data, local, out).await {
+                // Signed out here: the agent no longer starts at login (a running agent does this itself).
+                Ok(()) => {
+                    let off = crate::autostart::Roots::for_user().and_then(|roots| crate::autostart::unregister(&roots));
+                    if let Err(e) = off {
+                        say!(out, "the start-at-login entry couldn't be removed ({e}); `craft-cloud-agent autostart off` tries again")?;
+                    }
+                }
                 Err(AgentError::Lock(LockError::Busy(path))) => {
                     let data_path = data.path().to_owned();
                     let status = blocking(move || craft_cloud_app::Client::connect_in(&data_path)?.logout(local)).await.map_err(|e| match e {
@@ -399,6 +421,17 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
                     other => break other?,
                 }
             }
+            // The join stands whatever happens here; a failure is said.
+            if args.autostart
+                && let Err(e) = set_autostart(&data, true, out).await
+            {
+                say!(out, "joined, but this computer won't start syncing by itself after a restart: {e}")?;
+                say!(out, "run `craft-cloud-agent autostart on` to try again")?;
+            }
+            Ok(Exit::Done)
+        }
+        Command::Autostart { state } => {
+            set_autostart(&data, state == OnOff::On, out).await?;
             Ok(Exit::Done)
         }
         Command::AddComputer => {
@@ -441,6 +474,35 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
             Ok(Exit::Done)
         }
     }
+}
+
+/// `autostart on|off`: through the running agent if one runs (it handles its own entry), else here, for this agent.
+async fn set_autostart(data: &DataDir, on: bool, out: &mut impl Write) -> Result<(), AgentError> {
+    let data_path = data.path().to_owned();
+    let running = blocking(move || craft_cloud_app::Client::connect_in(&data_path)).await;
+    match running {
+        Ok(client) => {
+            blocking(move || client.set_autostart(on)).await.map_err(local_error)?;
+        }
+        Err(AgentError::Local(craft_cloud_app::Error::NotRunning(_))) => {
+            let roots = crate::autostart::Roots::for_user().map_err(autostart_error)?;
+            let data = data.path().to_owned();
+            tokio::task::spawn_blocking(move || if on { crate::local_api::set_on(&roots, &data) } else { crate::autostart::unregister(&roots) })
+                .await
+                .map_err(|e| AgentError::Usage(format!("start at login: {e}")))?
+                .map_err(autostart_error)?;
+        }
+        Err(e) => return Err(e),
+    }
+    if on {
+        say!(out, "this computer starts syncing by itself at every login")
+    } else {
+        say!(out, "this computer no longer starts syncing by itself at login")
+    }
+}
+
+fn autostart_error(e: crate::autostart::AutostartError) -> AgentError {
+    AgentError::Usage(format!("start at login: {e}"))
 }
 
 /// How often `add-computer` asks whether the code was used.
@@ -544,6 +606,34 @@ fn print_devices(out: &mut impl Write, devices: &[craft_cloud_app::DeviceInfo]) 
         say!(out, "  {}  {}  last seen {}{note}", d.id, d.name, show_time(d.last_used_ms))?;
     }
     Ok(())
+}
+
+/// The agent's `main`, for both builds (the console one and the background one): parses `args` (the program's name
+/// first), runs the command, and writes an error to `err`. Returns the exit code, and whether the command was `run`
+/// (after a second stop the caller ends the process at once rather than wait for a pass to finish).
+pub async fn main(args: Vec<std::ffi::OsString>, input: &mut impl BufRead, out: &mut impl Write, err: &mut impl Write) -> (Exit, bool) {
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(e) => {
+            // A usage error is a plain failure (1), never the "deletions wait" code 2 that clap's own exit uses;
+            // `--help` and `--version` are not errors.
+            let failed = e.use_stderr();
+            let text = e.render().to_string();
+            let _ = if failed { write!(err, "{text}") } else { write!(out, "{text}") };
+            return (if failed { Exit::Failed } else { Exit::Done }, false);
+        }
+    };
+    let looping = matches!(cli.command, Command::Run);
+    let exit = match run(cli, input, out).await {
+        Ok(exit) => exit,
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}");
+            e.exit()
+        }
+    };
+    let _ = out.flush();
+    let _ = err.flush();
+    (exit, looping)
 }
 
 /// Runs a blocking call of `craft-cloud-app` off the runtime.
@@ -1681,8 +1771,11 @@ mod tests {
         let Command::Join(args) = join else { panic!("{join:?}") };
         assert_eq!(args.join, "c.example/K7M4-Q9TX");
         assert_eq!((args.folder.as_deref(), args.device_name.as_deref(), args.adopt), (Some(Path::new("f")), Some("lptp1"), true));
-        let Command::Join(args) = parse(&["join", "c.example/K7M4-Q9TX", "--device-name", "pc"]).unwrap() else { panic!() };
-        assert_eq!((args.device_name.as_deref(), args.adopt), (Some("pc"), false));
+        let Command::Join(args) = parse(&["join", "c.example/K7M4-Q9TX", "--device-name", "pc", "--autostart"]).unwrap() else { panic!() };
+        assert_eq!((args.device_name.as_deref(), args.adopt, args.autostart), (Some("pc"), false, true));
+        assert!(matches!(parse(&["autostart", "on"]).unwrap(), Command::Autostart { state: OnOff::On }));
+        assert!(matches!(parse(&["autostart", "off"]).unwrap(), Command::Autostart { state: OnOff::Off }));
+        assert!(parse(&["autostart"]).is_err() && parse(&["autostart", "maybe"]).is_err());
         assert!(parse(&["join"]).is_err(), "the join string is required");
         assert!(matches!(parse(&["add-computer"]).unwrap(), Command::AddComputer));
         assert!(matches!(parse(&["pause"]).unwrap(), Command::Pause));
