@@ -2,7 +2,11 @@
 //!
 //! - **Locks**: the data folder's lock is taken first and held for the loop's whole life; the folder's lock is held
 //!   by the open session ([`Session`]) on the pass thread, also for as long as the loop runs (it is taken again
-//!   when a missing folder comes back). A second agent stops with exit code 3.
+//!   when a missing folder comes back). A second agent for the same data folder stops at once (`run` exits 0 with a
+//!   note: see [`crate::cli::ran`]).
+//! - **Needs you at start**: a damaged or newer `account.json`, or a damaged token, doesn't end the loop (a start at
+//!   login would only start it again): it waits with the local API up and its status `Paused` with the reason, until
+//!   a sign-out forgets the account or it is stopped.
 //! - **Threads**: passes run on a dedicated thread with its own current-thread tokio runtime, so the blocking disk
 //!   work of a pass never stalls the loop. The loop's control, the folder watcher's events and the server's
 //!   long-poll run on the caller's runtime.
@@ -33,7 +37,7 @@ use tokio::sync::{mpsc, watch};
 
 use craft_cloud_proto::local::RunState;
 
-use crate::account::{Approval, DataDir, LastPass, LoopState, LoopStatus, PassSummary, STATUS_SCHEMA};
+use crate::account::{Approval, DataDir, LastPass, LoopState, LoopStatus, Outcome, PassSummary, STATUS_SCHEMA};
 use crate::cli::{AgentError, Exit, JoinArgs, LoginArgs, Session, hold_data, now_ms, print_summary};
 use crate::http::{Connection, HttpTransport, PollError};
 use crate::live::{Hub, HubConfig};
@@ -424,6 +428,8 @@ struct Status {
     not_watching: Option<String>,
     /// Deletes are held behind a link (as of the last pass that finished).
     held: bool,
+    /// When the last pass that didn't fail finished (this run's, or the saved state's before it), for the local API.
+    last_synced_ms: Option<i64>,
     /// The local API's view of the loop, told every state written (`None` in tests of the file alone).
     control: Option<Control>,
 }
@@ -434,6 +440,7 @@ impl Status {
         self.last_pass = None;
         self.not_watching = None;
         self.held = false;
+        self.last_synced_ms = None;
     }
     fn now(&self) -> Ms {
         u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -461,8 +468,14 @@ impl Status {
     /// watcher event, so comparing them would write (and flush) the file on every other event while it retries.
     /// A failed write is reported once per failure and tried again next time; it never stops the loop.
     fn write(&mut self, state: LoopState, waiting_for_approval: bool, force: bool) {
+        if let Some(pass) = &self.last_pass
+            && !matches!(pass.outcome, Outcome::Failed(_))
+        {
+            self.last_synced_ms = Some(pass.finished_ms);
+        }
         if let Some(control) = &self.control {
             control.set_run_state(run_state(&state));
+            control.set_last_sync(self.last_synced_ms);
         }
         let now = self.now();
         let status = LoopStatus {
@@ -485,7 +498,7 @@ impl Status {
         self.next_beat = now.saturating_add(u64::try_from(self.heartbeat.as_millis()).unwrap_or(u64::MAX));
         match self.data.save_status(&status) {
             Ok(()) => self.last_written = Some(status),
-            Err(e) => eprintln!("can't write the status file: {e}"),
+            Err(e) => crate::runlog::note(format_args!("can't write the status file: {e}")),
         }
     }
 }
@@ -512,7 +525,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
     let control = Control::new(commands_tx).with_autostart(autostart_roots, data.path());
     control.refresh_autostart().await;
     let api = LocalApi::start(data, control.clone()).await?;
-    say(out, &format!("craft-cloud-agent: local API on 127.0.0.1:{} (for apps and the launcher)", api.port()));
+    say(out, &format!("craft-cloud-agent: local API on 127.0.0.1:{} (for the Craft Cloud app and the other Craft apps)", api.port()));
     let mut status = Status {
         data: data.clone(),
         start: Instant::now(),
@@ -523,6 +536,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
         last_pass: None,
         not_watching: None,
         held: false,
+        last_synced_ms: None,
         control: Some(control.clone()),
     };
     let mut stops = 0;
@@ -530,11 +544,43 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
     // A sign-out revoked the device but couldn't remove the account file: the dead account is never used again.
     let mut ignore_saved = false;
     let exit = 'signed_in: loop {
-        let saved = if ignore_saved { None } else { data.load_account()? };
-        let Some(account) = saved else {
+        // Something only a person can put right (a damaged or newer `account.json`, a damaged token) keeps the loop
+        // waiting with the local API up, so the app can show it, rather than ending it (a start at login would only
+        // start it again).
+        let saved = if ignore_saved { Ok(None) } else { data.load_account().map_err(AgentError::from) };
+        let saved = match saved {
+            Ok(saved) => saved,
+            Err(e) if e.exit() == Exit::NeedsYou => {
+                match wait_needing_you(data, &e.to_string(), &mut status, &mut commands, &mut stop, &mut stop_open, out).await {
+                    Stuck::Forgotten => continue 'signed_in,
+                    Stuck::Stop => {
+                        status.write(LoopState::Stopped, false, true);
+                        break 'signed_in Exit::Done;
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        let transport = match saved.as_ref().map(|account| HttpTransport::new(account.server.clone(), &account.token)).transpose() {
+            Ok(transport) => transport,
+            Err(e) => {
+                let e = AgentError::from(e);
+                if e.exit() != Exit::NeedsYou {
+                    return Err(e);
+                }
+                match wait_needing_you(data, &e.to_string(), &mut status, &mut commands, &mut stop, &mut stop_open, out).await {
+                    Stuck::Forgotten => continue 'signed_in,
+                    Stuck::Stop => {
+                        status.write(LoopState::Stopped, false, true);
+                        break 'signed_in Exit::Done;
+                    }
+                }
+            }
+        };
+        let (Some(account), Some(transport)) = (saved, transport) else {
             control.set_account(None);
             status.forget_passes();
-            say(out, "not signed in: waiting for a sign-in (`craft-cloud-agent login`, or the launcher)");
+            say(out, &format!("not signed in: waiting for a sign-in ({})", crate::cli::SIGN_IN_HINT));
             match wait_for_sign_in(data, &control, &mut status, &mut commands, &mut stop, &mut stop_open, out).await {
                 SignedOut::SignedIn => {
                     ignore_saved = false;
@@ -547,6 +593,12 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             }
         };
         control.set_account(Some(&account));
+        status.last_synced_ms = data
+            .load_state()
+            .ok()
+            .and_then(|saved| saved.last_pass)
+            .filter(|pass| !matches!(pass.outcome, Outcome::Failed(_)))
+            .map(|pass| pass.finished_ms);
         // Paused by the user (kept in `state.json`): no pass, long-poll, watcher or live connection until resumed.
         let mut user_paused = data.load_state().is_ok_and(|saved| saved.paused);
         // A pause or resume came while a pass ran: `state.json` is written once it is done (the pass writes it too).
@@ -583,7 +635,6 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
         // Where the saved state read the change feed to, once a first sync is done.
         let since = data.load_state().ok().and_then(|saved| saved.state.space.map(|_| saved.state.seq));
         let (since_tx, since_rx) = watch::channel::<Option<u64>>(since);
-        let transport = HttpTransport::new(account.server.clone(), &account.token)?;
         let poll_events = events_tx.clone();
         // The long-poll runs while not paused (it is started again on resume).
         let start_poll = move || {
@@ -745,6 +796,8 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                             let _ = since_tx.send(Some(seq));
                         }
                         status.last_pass = done.last_pass;
+                        // The app shows "removed from your cloud" for this one, so it is told apart from other stops.
+                        control.set_removed(matches!(done.result, Err(AgentError::Revoked)));
                         match &done.result {
                             Ok(summary) => {
                                 last_message = None;
@@ -924,6 +977,67 @@ enum End {
 enum SignedOut {
     SignedIn,
     Stop,
+}
+
+/// How a wait for someone to put a problem right ended.
+enum Stuck {
+    /// Signed out: the account is forgotten, and the loop starts over (signed out).
+    Forgotten,
+    Stop,
+}
+
+/// A problem only a person can put right, found as the loop started (`reason`): the loop waits with the local API up
+/// and its status saying so (`Paused`, signed out), keeping its heartbeat. Everything asked is refused with the reason,
+/// but a sign-out, which forgets the account here (the files stay; the server can't be asked, the account being
+/// unreadable or its token damaged), and a stop or quit.
+async fn wait_needing_you(
+    data: &DataDir,
+    reason: &str,
+    status: &mut Status,
+    commands: &mut mpsc::Receiver<Command>,
+    stop: &mut mpsc::UnboundedReceiver<()>,
+    stop_open: &mut bool,
+    out: &mut impl Write,
+) -> Stuck {
+    if let Some(control) = &status.control {
+        control.set_account(None);
+    }
+    status.forget_passes();
+    let _ = writeln!(out, "{reason}");
+    let _ = writeln!(out, "waiting until that is put right (or a sign-out forgets the account here)");
+    let _ = out.flush();
+    let mut commands_open = true;
+    loop {
+        status.write(LoopState::Paused { reason: reason.to_owned(), next_check_ms: None }, false, false);
+        let wake = Duration::from_millis(status.next_beat.saturating_sub(status.now()));
+        tokio::select! {
+            command = commands.recv(), if commands_open => match command {
+                Some(Command::Logout(_, reply)) => match crate::cli::forget_account(data) {
+                    Ok(()) => {
+                        let _ = writeln!(out, "signed out: the account here is forgotten (the files stay)");
+                        let _ = reply.send(Ok(()));
+                        return Stuck::Forgotten;
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                },
+                Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
+                    let _ = reply.send(Err(AgentError::NeedsYou(reason.to_owned())));
+                }
+                Some(Command::Quit(reply)) => {
+                    let _ = reply.send(Ok(()));
+                    return Stuck::Stop;
+                }
+                None => commands_open = false,
+            },
+            signal = stop.recv(), if *stop_open => match signal {
+                Some(()) => return Stuck::Stop,
+                None => *stop_open = false,
+            },
+            () = tokio::time::sleep(wake) => {}
+        }
+    }
 }
 
 /// Signed out: the loop keeps its status heartbeat and waits for a sign-in through the local API, or a stop (the first
@@ -1138,6 +1252,7 @@ mod tests {
             last_pass: None,
             not_watching: None,
             held: false,
+            last_synced_ms: None,
             control: None,
         };
         let next_try = status.now() + 60_000;
@@ -1167,6 +1282,7 @@ mod tests {
             last_pass: None,
             not_watching: None,
             held: false,
+            last_synced_ms: None,
             control: None,
         };
         let at = now_ms() + 60_000;

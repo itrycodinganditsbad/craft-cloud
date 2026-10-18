@@ -241,11 +241,12 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
   with that set lets the delete go; nothing else (the bare flag included) releases it.
 - `craft-cloud-agent autostart on` makes the agent start by itself at every login (`join --autostart` does it
   when joining; `autostart off` and signing out undo it): on Windows a `Craft Cloud` value under
-  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` that runs `craft-cloud-agent-bg.exe run`, the build without a
-  console window, which writes to `run.log` in the agent's data folder (rotated at 10 MiB); on macOS
-  `~/Library/LaunchAgents/ch.craftcloud.agent.plist`; on Linux the systemd user unit `craft-cloud-agent.service`
-  (a unit of that name made by hand is taken over), or `~/.config/autostart/craft-cloud-agent.desktop` without
-  systemd. `status` through the agent's local API says whether it is on. The entry belongs to the agent with the
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` that runs `craft-cloud-agent-bg.exe run --log`, the build
+  without a console window; on macOS `~/Library/LaunchAgents/ch.craftcloud.agent.plist`; on Linux the systemd user
+  unit `craft-cloud-agent.service` (a unit of that name made by hand is taken over), or
+  `~/.config/autostart/craft-cloud-agent.desktop` without systemd. Each runs `run --log`, which writes what the agent
+  says to `run.log` in its data folder (rotated at 10 MiB). After a crash it is started again (after 30 s), but not
+  after a clean quit, and on Linux not after exit code 3. `status` through the agent's local API says whether it is on. The entry belongs to the agent with the
   default data folder: one run with `--data-dir` or `CRAFT_CLOUD_AGENT_DIR` elsewhere (a spare folder) never sets,
   replaces or removes it.
 - To sync a folder that already has files, add `--adopt` to `login`.
@@ -256,7 +257,10 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
 - HTTPS is required, except to a server on the same machine. Proxy settings are ignored for now.
 - `logout` signs the device out on the server and forgets the account here; your files stay. Use
   `logout --local` if the server is gone.
-- `run` also starts without an account: it waits for a sign-in from the launcher (or `login`), then syncs.
+- `run` also starts without an account: it waits for a sign-in from the Craft Cloud app (or `join`, `login`),
+  then syncs. A second `run` for the same data folder says another agent runs and exits 0. A damaged account file
+  found as `run` starts keeps it waiting (its status says what is wrong) until it is put right or a sign-out
+  forgets it.
   While `run` runs, `login` and `logout` go through it (it holds the data folder), and a sign-out stops
   syncing and keeps the files.
 - Instead of a password, a machine can join with a code. On a machine that is signed in and running,

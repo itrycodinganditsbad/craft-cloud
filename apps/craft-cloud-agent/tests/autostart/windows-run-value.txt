@@ -1,1 +1,1 @@
-"C:\Users\Zoë\AppData\Local\Programs\Craft Cloud\craft-cloud-agent-bg.exe" run
+"C:\Users\Zoë\AppData\Local\Programs\Craft Cloud\craft-cloud-agent-bg.exe" run --log

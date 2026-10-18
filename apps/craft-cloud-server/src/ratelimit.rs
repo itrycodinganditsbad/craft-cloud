@@ -35,6 +35,12 @@ impl Limiter {
     /// Counts one attempt for `key`; false once `max` attempts were made in the current window, or when
     /// the key is new and the limiter is full.
     pub fn allow(&self, key: &str, max: u32, now: Instant) -> bool {
+        self.count(key, max, now).is_some()
+    }
+
+    /// [`Limiter::allow`] for a caller that may give the attempt back: the window it was counted in, for
+    /// [`Limiter::refund`], or `None` when it is refused.
+    pub fn count(&self, key: &str, max: u32, now: Instant) -> Option<Counted> {
         let mut windows = self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let sweep_due = windows.last_sweep.is_none_or(|last| now.saturating_duration_since(last) >= self.period);
         if sweep_due {
@@ -43,28 +49,33 @@ impl Limiter {
             windows.last_sweep = Some(now);
         }
         if !windows.entries.contains_key(key) && windows.entries.len() >= self.capacity {
-            return false;
+            return None;
         }
         let entry = windows.entries.entry(key.to_owned()).or_insert((now, 0));
         if now.saturating_duration_since(entry.0) >= self.period {
             *entry = (now, 0);
         }
         entry.1 = entry.1.saturating_add(1);
-        entry.1 <= max
+        (entry.1 <= max).then_some(Counted(entry.0))
     }
 
-    /// Gives back one attempt [`Limiter::allow`] counted for `key` in its current window: for a caller that counts
-    /// only failures, but must count every attempt up front so that attempts made at the same moment are held to the
-    /// limit too.
-    pub fn refund(&self, key: &str, now: Instant) {
+    /// Gives back one attempt [`Limiter::count`] counted for `key`, if the window it was counted in is still the
+    /// current one: for a caller that counts only failures, but must count every attempt up front so that attempts
+    /// made at the same moment are held to the limit too. A later window (one that started while the attempt ran)
+    /// keeps its count, so a refund never gives a window an extra attempt.
+    pub fn refund(&self, key: &str, counted: Counted) {
         let mut windows = self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(entry) = windows.entries.get_mut(key)
-            && now.saturating_duration_since(entry.0) < self.period
+            && entry.0 == counted.0
         {
             entry.1 = entry.1.saturating_sub(1);
         }
     }
 }
+
+/// The window an attempt was counted in (when it started), from [`Limiter::count`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Counted(Instant);
 
 /// The rate-limit key for a client address: the IPv4 address, or for IPv6 the first 64 bits (a home or
 /// office network usually owns a whole /64, so one client can't dodge the limit by changing addresses).
@@ -123,14 +134,28 @@ mod tests {
     fn a_refund_gives_back_one_attempt_of_the_current_window() {
         let limiter = Limiter::new(Duration::from_secs(60));
         let t0 = Instant::now();
+        let first = limiter.count("ip:a", 2, t0).unwrap();
         assert!(limiter.allow("ip:a", 2, t0));
-        assert!(limiter.allow("ip:a", 2, t0));
-        limiter.refund("ip:a", t0);
+        limiter.refund("ip:a", first);
         assert!(limiter.allow("ip:a", 2, t0), "the refunded attempt");
-        assert!(!limiter.allow("ip:a", 2, t0));
-        limiter.refund("ip:unknown", t0);
-        limiter.refund("ip:a", t0 + Duration::from_secs(61));
+        assert!(limiter.count("ip:a", 2, t0).is_none());
+        limiter.refund("ip:unknown", first);
         assert!(limiter.allow("ip:a", 2, t0 + Duration::from_secs(61)), "a new window starts afresh anyway");
+    }
+
+    /// An attempt counted near the end of a window whose redeem finishes in the next one: its refund would give the
+    /// new window one try more than the limit.
+    #[test]
+    fn a_refund_never_crosses_into_a_later_window() {
+        let limiter = Limiter::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        assert!(limiter.allow("ip:a", 2, t0));
+        let slow = limiter.count("ip:a", 2, t0 + Duration::from_secs(59)).unwrap();
+        let t1 = t0 + Duration::from_secs(61);
+        assert!(limiter.allow("ip:a", 2, t1));
+        assert!(limiter.allow("ip:a", 2, t1));
+        limiter.refund("ip:a", slow);
+        assert!(!limiter.allow("ip:a", 2, t1), "the old window's refund gave the new one an extra try");
     }
 
     #[test]

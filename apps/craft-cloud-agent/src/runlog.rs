@@ -1,6 +1,11 @@
-//! `run.log`: where the background build (`craft-cloud-agent-bg`, which has no console) writes what the agent says.
-//! It is kept under [`MAX_LOG_BYTES`]: past that, it becomes `run.log.1` (replacing an older one) and a new `run.log`
-//! starts, so at most twice that is kept.
+//! `run.log`: where the agent writes what it says when it has no console to say it on: the background build
+//! (`craft-cloud-agent-bg`, every command) and `run --log` (what every start-at-login entry runs). It is kept under
+//! [`MAX_LOG_BYTES`]: past that, it becomes `run.log.1` (replacing an older one) and a new `run.log` starts, so at most
+//! twice that is kept.
+//!
+//! One log takes everything: the command's output and errors (the [`RunLog`] is handed to it as both), and the notes
+//! parts of the agent make on their own ([`note`]: a lock that can't be held, the live link's state, a status file
+//! that can't be written), which go to standard error while no log is [`install`]ed.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -11,6 +16,38 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub const LOG_FILE: &str = "run.log";
 /// The size at which the log moves to `run.log.1`: 10 MiB.
 pub const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+
+/// The process's log, once one is installed.
+static INSTALLED: Mutex<Option<RunLog>> = Mutex::new(None);
+
+/// Makes `log` the place [`note`] writes to, for the rest of the process.
+pub fn install(log: RunLog) {
+    *INSTALLED.lock().unwrap_or_else(PoisonError::into_inner) = Some(log);
+}
+
+/// Says `line` (one line, without its line break) in the installed log, or on standard error without one. A failed
+/// write is dropped: a note never stops the agent.
+pub fn note(line: std::fmt::Arguments<'_>) {
+    let log = INSTALLED.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    match log {
+        Some(mut log) => {
+            let _ = writeln!(log, "{line}");
+            let _ = log.flush();
+        }
+        None => {
+            let _ = writeln!(std::io::stderr(), "{line}");
+        }
+    }
+}
+
+/// Opens `run.log` in the data folder `data` (creating the folder) and installs it ([`install`]); `None` if it can't
+/// be opened (the agent then runs without one, its output going nowhere).
+pub fn open_in(data: &crate::account::DataDir) -> Option<RunLog> {
+    data.create().ok()?;
+    let log = RunLog::open(&data.path().join(LOG_FILE), MAX_LOG_BYTES).ok()?;
+    install(log.clone());
+    Some(log)
+}
 
 /// An appending log file that rotates at a size. Cheap to clone: clones write to the same file, a write at a time.
 #[derive(Clone)]
@@ -110,6 +147,16 @@ mod tests {
         log.write_all(b"fresh\n").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh\n");
         assert_eq!(std::fs::metadata(RunLog::rotated(&path)).unwrap().len(), 150);
+    }
+
+    /// What used to go straight to standard error (`eprintln!`) goes to the installed log once there is one.
+    #[test]
+    fn notes_go_to_the_installed_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LOG_FILE);
+        install(RunLog::open(&path, 1000).unwrap());
+        note(format_args!("a note for the log"));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("a note for the log\n"));
     }
 
     #[test]

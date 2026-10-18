@@ -214,7 +214,7 @@ async fn a_folder_with_files_needs_adopt() {
     std::fs::write(b.folder.join("notes.txt"), "server copy").unwrap();
     std::fs::write(b.folder.join("mine.txt"), "only here").unwrap();
     let refused = cli::login(&b.data, &login_args(&server, &b.folder, "laptop"), PASSWORD, &mut Vec::new()).await;
-    assert!(matches!(refused, Err(AgentError::Usage(ref m)) if m.contains("--adopt")), "{refused:?}");
+    assert!(matches!(refused, Err(ref e @ AgentError::FolderHasFiles(_)) if e.to_string().contains("--adopt")), "{refused:?}");
     assert_eq!(b.data.load_account().unwrap(), None);
     let args = LoginArgs { adopt: true, ..login_args(&server, &b.folder, "laptop") };
     cli::login(&b.data, &args, PASSWORD, &mut Vec::new()).await.unwrap();

@@ -3,8 +3,10 @@
 Description=Craft Cloud agent: keeps the synced folder in step with the server
 
 [Service]
-ExecStart="/home/zoë/My Apps/craft-cloud-agent" "run"
+ExecStart="/home/zoë/My Apps/craft-cloud-agent" "run" "--log"
 Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=3
 
 [Install]
 WantedBy=default.target

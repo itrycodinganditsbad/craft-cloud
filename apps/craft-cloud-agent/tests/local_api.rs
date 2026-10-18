@@ -259,7 +259,8 @@ async fn autostart_is_turned_on_through_the_local_api_and_off_at_sign_out() {
     assert_eq!(code, 200, "{body}");
     assert_eq!(serde_json::from_str::<Status>(&body).unwrap().autostart, Some(true));
     assert!(is_registered(roots).unwrap());
-    // It runs the agent as it is, with the default data folder; on macOS launchd writes its output to run.log there.
+    // It runs the agent as it is, with the default data folder, writing its own run.log there; on macOS what launchd
+    // catches goes to launchd.log next to it.
     let entry = if cfg!(target_vendor = "apple") {
         craft_cloud_agent::autostart::macos::plist_file(roots)
     } else {
@@ -267,8 +268,9 @@ async fn autostart_is_turned_on_through_the_local_api_and_off_at_sign_out() {
     };
     let written = std::fs::read_to_string(entry).unwrap();
     assert!(!written.contains("--data-dir"), "{written}");
+    assert!(written.contains("--log"), "{written}");
     if cfg!(target_vendor = "apple") {
-        assert!(written.contains(&data.path().join("run.log").display().to_string()), "{written}");
+        assert!(written.contains(&data.path().join("launchd.log").display().to_string()), "{written}");
     }
 
     let (code, body) = call(&api, "POST", "/v1/logout", "{}");
@@ -569,6 +571,35 @@ async fn quit_ends_a_signed_out_agent() {
     assert!(!data.path().join(LOCAL_API_FILE).exists());
 }
 
+/// Something only a person can put right, found as `run` starts (here a damaged `account.json`): the agent stays up,
+/// serving the local API, and its status says what is wrong (`Paused`), so the app can show it; started at login, it
+/// isn't restarted over and over. Signing out forgets the damaged account, and the agent waits for a sign-in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_problem_found_at_start_keeps_the_agent_up_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    std::fs::create_dir_all(data.path()).unwrap();
+    std::fs::write(data.path().join("account.json"), "{not json").unwrap();
+    let running = Running::start(&data);
+    let api = api_file(data.path()).await;
+    let now = status(&api);
+    assert!(!now.signed_in, "{now:?}");
+    let RunState::Paused { reason } = &now.run_state else { panic!("{now:?}") };
+    assert!(reason.contains("account.json"), "{reason}");
+    // Nothing else can be done until it is put right.
+    let (code, body) = call(&api, "POST", "/v1/join", r#"{"join":"c.example/K7M4-Q9TX"}"#);
+    assert_eq!((code, error_code(&body).as_str()), (409, codes::NEEDS_YOU), "{body}");
+    let (code, body) = call(&api, "POST", "/v1/pause", "");
+    assert_eq!((code, error_code(&body).as_str()), (409, codes::NEEDS_YOU), "{body}");
+    // Signing out forgets it.
+    let (code, body) = call(&api, "POST", "/v1/logout", r#"{"local":true}"#);
+    assert_eq!(code, 200, "{body}");
+    assert!(!data.path().join("account.json").exists());
+    eventually("it waits for a sign-in", || status(&api).run_state == RunState::SignedOut).await;
+    let (exit, out) = running.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+}
+
 /// Apps' recents keep working while paused: an add is kept on this machine and reaches the server after resume.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recents_added_while_paused_reach_the_server_after_resume() {
@@ -709,6 +740,7 @@ async fn a_second_computer_joins_with_a_code_from_the_first() {
     assert_eq!(code, 200, "{body}");
     let left: Vec<DeviceInfo> = serde_json::from_str(&body).unwrap();
     assert!(left.iter().any(|d| d.id == other.id && d.revoked), "{left:?}");
+    assert!(!status(&b.api).removed);
     // B finds out at its next request.
     std::fs::write(b.folder.join("from-b.txt"), "made on B").unwrap();
     eventually(
@@ -716,6 +748,7 @@ async fn a_second_computer_joins_with_a_code_from_the_first() {
         || matches!(status(&b.api).run_state, RunState::Paused { ref reason } if reason.contains("no longer accepts")),
     )
     .await;
+    assert!(status(&b.api).removed, "told apart from other stops, for the app");
     b.stop().await;
     let _ = running.stop().await;
 }
@@ -736,7 +769,7 @@ async fn local_problems_found_before_the_code_is_spent_leave_it_usable() {
     std::fs::create_dir_all(&b.folder).unwrap();
     std::fs::write(b.folder.join("mine.txt"), "already here").unwrap();
     let (code, body) = b.join(&pairing.join, false, None);
-    assert_eq!(code, 400, "{body}");
+    assert_eq!((code, error_code(&body).as_str()), (400, codes::FOLDER_HAS_FILES), "{body}");
     assert!(body.contains("adopt") || body.contains("files in it"), "{body}");
     assert_eq!(pairing_status(&a, pairing.id).state, PairingState::Waiting, "the code is still good");
     // Garbage never reaches the server.

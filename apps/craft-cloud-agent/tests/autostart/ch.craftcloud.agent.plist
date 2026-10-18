@@ -9,11 +9,12 @@
     <array>
         <string>/Users/zoë/Library/Application Support/Craft Cloud &amp; Co/craft-cloud-agent</string>
         <string>run</string>
+        <string>--log</string>
     </array>
     <key>StandardOutPath</key>
-    <string>/Users/zoë/Library/Application Support/craft-cloud-agent/run.log</string>
+    <string>/Users/zoë/Library/Application Support/craft-cloud-agent/launchd.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/zoë/Library/Application Support/craft-cloud-agent/run.log</string>
+    <string>/Users/zoë/Library/Application Support/craft-cloud-agent/launchd.log</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -21,5 +22,7 @@
         <key>SuccessfulExit</key>
         <false/>
     </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
 </dict>
 </plist>

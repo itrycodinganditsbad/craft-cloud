@@ -60,6 +60,10 @@ struct Shared {
     hub: Option<crate::live::HubHandle>,
     /// Whether the agent starts at login, as last looked at (`None`: not known, or not handled here).
     autostart: Option<bool>,
+    /// When the last pass that didn't fail finished, while signed in.
+    last_sync_ms: Option<i64>,
+    /// The last pass found this device refused by the server.
+    removed: bool,
 }
 
 /// The loop's side of the local API: the status it reports, and the commands it receives. Cheap to clone.
@@ -75,7 +79,8 @@ pub struct Control {
 impl Control {
     /// A control for a loop that receives its commands from `commands`' other end.
     pub fn new(commands: mpsc::Sender<Command>) -> Self {
-        let shared = Shared { account: None, run_state: RunState::SignedOut, online: false, hub: None, autostart: None };
+        let shared =
+            Shared { account: None, run_state: RunState::SignedOut, online: false, hub: None, autostart: None, last_sync_ms: None, removed: false };
         let autostart_refusal = "this agent doesn't handle starting at login here".to_owned();
         Self { shared: Arc::new(Mutex::new(shared)), commands, autostart: None, autostart_refusal }
     }
@@ -118,12 +123,24 @@ impl Control {
             if account.is_none() {
                 s.run_state = RunState::SignedOut;
                 s.online = false;
+                s.last_sync_ms = None;
+                s.removed = false;
             }
         });
     }
 
+    /// Whether the server refused this device at the last pass (it was removed from the account).
+    pub fn set_removed(&self, removed: bool) {
+        self.with(|s| s.removed = removed);
+    }
+
     pub fn set_run_state(&self, state: RunState) {
         self.with(|s| s.run_state = state);
+    }
+
+    /// When the last pass that didn't fail finished.
+    pub fn set_last_sync(&self, at_ms: Option<i64>) {
+        self.with(|s| s.last_sync_ms = at_ms);
     }
 
     /// Whether the agent reaches the server right now (the live hub's connection is up).
@@ -157,6 +174,8 @@ impl Control {
             online: s.online,
             run_state: s.run_state.clone(),
             autostart: s.autostart,
+            last_sync_ms: s.last_sync_ms,
+            removed: s.account.is_some() && s.removed,
         })
     }
 }
@@ -198,6 +217,7 @@ impl From<AgentError> for LocalError {
             AgentError::UntrustedCertificate { .. } => (StatusCode::SERVICE_UNAVAILABLE, codes::UNTRUSTED_CERTIFICATE),
             AgentError::Unreachable { .. } => (StatusCode::SERVICE_UNAVAILABLE, codes::OFFLINE),
             AgentError::CannotRemoveSelf => (StatusCode::CONFLICT, codes::CANNOT_REMOVE_SELF),
+            AgentError::FolderHasFiles(_) => (StatusCode::BAD_REQUEST, codes::FOLDER_HAS_FILES),
             AgentError::Server(craft_cloud_sync::TransportError::NotFound) => (StatusCode::NOT_FOUND, api_codes::NOT_FOUND),
             AgentError::NotSignedIn => (StatusCode::CONFLICT, codes::NOT_SIGNED_IN),
             AgentError::Offline(_) | AgentError::LogoutOffline(_) => (StatusCode::SERVICE_UNAVAILABLE, codes::OFFLINE),
@@ -251,7 +271,7 @@ impl LocalApi {
                 let _ = shutting_down.await;
             };
             if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(stop).await {
-                eprintln!("the local API stopped: {e}");
+                crate::runlog::note(format_args!("the local API stopped: {e}"));
             }
         });
         let record = LocalApiFile { schema: LOCAL_API_SCHEMA, port, token, pid: std::process::id() };
@@ -496,6 +516,8 @@ mod tests {
         assert_eq!(code(AgentError::PasswordRequired), codes::PASSWORD_REQUIRED);
         assert_eq!(code(AgentError::WeakPassword("x".into())), codes::WEAK_PASSWORD);
         assert_eq!(code(AgentError::CannotRemoveSelf), codes::CANNOT_REMOVE_SELF);
+        assert_eq!(code(AgentError::FolderHasFiles(PathBuf::from("f"))), codes::FOLDER_HAS_FILES);
+        assert_eq!(code(AgentError::NeedsYou("account.json is damaged".into())), codes::NEEDS_YOU);
         assert_eq!(code(AgentError::UntrustedCertificate { host: "h".into() }), codes::UNTRUSTED_CERTIFICATE);
         assert_eq!(code(AgentError::Unreachable { server: "s".into(), message: "m".into() }), codes::OFFLINE);
         let after = LocalError::from(AgentError::JoinSetup(Box::new(AgentError::Revoked)));
