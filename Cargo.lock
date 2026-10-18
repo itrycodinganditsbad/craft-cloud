@@ -637,6 +637,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-cloud-desktop"
+version = "0.0.1"
+dependencies = [
+ "craft-cloud-app",
+ "craft-cloud-proto",
+ "getrandom 0.4.3",
+ "tempfile",
+]
+
+[[package]]
 name = "craft-cloud-meta"
 version = "0.0.1"
 dependencies = [
