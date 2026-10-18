@@ -236,6 +236,10 @@ pub enum Event {
     /// "Join again" after this computer was removed, or "Sign out" under a problem with the account here: forgets the
     /// account on this computer (the files stay).
     ForgetAccount,
+    /// The folder's "Change…".
+    ChangeFolder,
+    /// The folder picker's answer (`None`: cancelled).
+    FolderPicked(Option<String>),
     /// Show the window (a second start, the tray's Open).
     Show,
     /// The window's close button.
@@ -263,6 +267,8 @@ pub enum Effect {
     Pause,
     Resume,
     QuitAgent,
+    /// Ask for a folder with the OS's folder picker, starting at this one ([`Event::FolderPicked`]).
+    PickFolder(String),
     /// Open the synced folder in the file manager.
     OpenFolder(String),
     /// End the app (the agent keeps running unless [`Effect::QuitAgent`] came first).
@@ -514,6 +520,18 @@ impl Model {
                 }
                 self.busy = Some(Busy::SigningOut);
                 vec![Effect::Logout { local: true }]
+            }
+            Event::ChangeFolder => match &self.screen {
+                Screen::Join(form) => vec![Effect::PickFolder(form.folder.clone())],
+                _ => Vec::new(),
+            },
+            Event::FolderPicked(picked) => {
+                if let (Screen::Join(form), Some(folder)) = (&mut self.screen, picked) {
+                    form.folder = folder;
+                    form.ask_adopt = false;
+                    form.error = None;
+                }
+                Vec::new()
             }
             Event::Show => {
                 self.window_visible = true;
@@ -799,7 +817,7 @@ fn sentence(text: &str) -> String {
 }
 
 /// The first sentence of `text`, for a problem's one line.
-fn first_sentence(text: &str) -> String {
+pub fn first_sentence(text: &str) -> String {
     let end = text.find(". ").map_or(text.len(), |at| at + 1);
     sentence(text.get(..end).unwrap_or(text).trim())
 }
@@ -960,6 +978,18 @@ pub(crate) mod tests {
         assert!(!form(&mut m).ask_adopt);
         form(&mut m).adopt_for = Some("/elsewhere".into());
         assert!(!join_request(&m.update(Event::SubmitJoin)).adopt);
+    }
+
+    #[test]
+    fn change_picks_a_folder_with_the_os_picker() {
+        let mut m = on_join_form();
+        assert_eq!(m.update(Event::ChangeFolder), vec![Effect::PickFolder(defaults().folder)]);
+        m.update(Event::FolderPicked(None));
+        assert_eq!(form(&mut m).folder, defaults().folder, "cancelled");
+        form(&mut m).ask_adopt = true;
+        m.update(Event::FolderPicked(Some("/media/ana/Cloud".into())));
+        assert_eq!(form(&mut m).folder, "/media/ana/Cloud");
+        assert!(!form(&mut m).ask_adopt, "another folder: asked about again if it has files");
     }
 
     /// An invite to a new account: a password, twice, that must match; the server's `weak_password` message is

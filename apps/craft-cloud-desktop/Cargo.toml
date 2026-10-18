@@ -22,8 +22,19 @@ craft-cloud-app.workspace = true
 craft-cloud-proto.workspace = true
 # The single-instance channel's token.
 getrandom.workspace = true
+# The window: egui on eframe (wgpu; Wayland and X11 on Linux), as the launcher has it.
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11"] }
+egui.workspace = true
+# The folder's "Change…": the OS's own folder picker (the XDG portal on Linux, no GTK).
+rfd = { workspace = true }
+# The add-a-computer link as a QR code.
+qrcodegen.workspace = true
 
 [dev-dependencies]
+# The window's snapshots: kittest renders on wgpu (a CPU adapter where there is one); they are compared here with
+# `image`, not with kittest's own `snapshot` feature, which brings an MPL-2.0 crate.
+egui_kittest = { workspace = true, features = ["wgpu"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 tempfile.workspace = true
 
 [lints]

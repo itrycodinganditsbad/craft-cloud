@@ -67,9 +67,10 @@ talks to, any vendor's cloud.
   Seafile, and similar). Don't read their source while working on the matching feature here.
   MPL-2.0 code (Syncthing) is not copied either.
 - Dependencies must be permissively licensed (MIT, Apache-2.0, BSD, ISC, Zlib, Unicode, CC0, CDLA-Permissive-2.0 (data only, e.g. root certificates)).
-  Named exceptions, for what Loro (the live documents' CRDT) needs and for no other crate: MPL-2.0 for `im`,
-  `bitmaps` and `sized-chunks`, used as published and never modified or copied from; BSL-1.0 (the Boost licence)
-  for `xxhash-rust`.
+  Named exceptions, for no other crate: for what Loro (the live documents' CRDT) needs, MPL-2.0 for `im`, `bitmaps`
+  and `sized-chunks`, used as published and never modified or copied from, and BSL-1.0 (the Boost licence) for
+  `xxhash-rust`; for the Craft Cloud app's window (eframe), BSL-1.0 for `clipboard-win` and `error-code` (the
+  Windows clipboard), and OFL-1.1 and the Ubuntu Font Licence (data only) for the fonts in `epaint_default_fonts`.
   Adding one means checking its license and every transitive license. `cargo xtask licenses` (part of
   `cargo xtask ci` and CI) checks every crate in the build against this list; a data-only licence is allowed
   only for the crates named in `xtask/src/licenses.rs`.

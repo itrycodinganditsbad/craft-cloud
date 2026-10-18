@@ -78,6 +78,14 @@ serde_json = "1"
 thiserror = "2"
 unicode-normalization = "=0.1.25"
 uuid = { version = "1.28", features = ["v7", "serde"] }
+# The Craft Cloud app's window: egui on eframe, as the other Craft apps have it; kittest drives it in tests.
+egui = "0.36"
+eframe = { version = "0.36", default-features = false }
+egui_kittest = "0.36"
+# The app's folder picker: the OS's native dialog (the XDG desktop portal on Linux, so no GTK), MIT.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "wayland"] }
+# The app's add-a-computer QR code (Nayuki's QR Code generator, MIT).
+qrcodegen = "1.8"
 # Windows only: the agent's start-at-login entry under `HKCU\…\Run`. Microsoft's windows-rs crate (MIT OR Apache-2.0);
 # its dependencies (windows-link, windows-result, windows-strings) are in the build already.
 windows-registry = "0.6.1"

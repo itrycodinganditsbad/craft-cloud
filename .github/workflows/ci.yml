@@ -28,6 +28,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The Craft Cloud app's window (egui on winit and wgpu) needs these headers on Linux, and its snapshot tests a
+      # CPU renderer (Mesa's lavapipe). Its tray and folder picker talk D-Bus in pure Rust: no GTK or libdbus.
+      - name: Install Linux system dependencies (egui/winit, lavapipe)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev mesa-vulkan-drivers
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt

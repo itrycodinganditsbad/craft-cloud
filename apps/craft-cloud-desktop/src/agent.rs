@@ -179,7 +179,7 @@ impl Link {
 
 /// Whether `effect` is a call of the agent.
 fn is_call(effect: &Effect) -> bool {
-    !matches!(effect, Effect::OpenFolder(_) | Effect::QuitApp | Effect::AppAutostart(_))
+    !matches!(effect, Effect::OpenFolder(_) | Effect::QuitApp | Effect::AppAutostart(_) | Effect::PickFolder(_))
 }
 
 /// Makes the call `effect` names, blocking, and gives its answer as the event the model expects.
@@ -207,7 +207,7 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
             let _ = agent.quit();
             Event::AgentQuit
         }
-        Effect::OpenFolder(_) | Effect::QuitApp | Effect::AppAutostart(_) => return None,
+        Effect::OpenFolder(_) | Effect::QuitApp | Effect::AppAutostart(_) | Effect::PickFolder(_) => return None,
     })
 }
 
