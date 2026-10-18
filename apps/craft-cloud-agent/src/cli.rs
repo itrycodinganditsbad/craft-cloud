@@ -425,10 +425,10 @@ async fn recents(data: &DataDir, args: RecentsArgs, out: &mut impl Write) -> Res
     Ok(Exit::Failed)
 }
 
-/// A path in the synced folder as the local API wants it: relative, `/`-separated. An absolute one must lie in the
-/// folder.
+/// A path in the synced folder as the local API wants it: relative, `/`-separated. An absolute one (or, on Windows, one
+/// with a root but no drive) must lie in the folder.
 fn relative_to_folder(path: &Path, folder: Option<&Path>) -> Result<String, AgentError> {
-    let relative = if path.is_absolute() {
+    let relative = if path.is_absolute() || path.has_root() {
         let folder = folder.ok_or(AgentError::NotSignedIn)?;
         let (path, folder) = (resolved(path), resolved(folder));
         path.strip_prefix(&folder)
