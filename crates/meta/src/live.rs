@@ -43,11 +43,18 @@ pub struct LiveUpdate {
 /// real fix.
 pub const MAX_LIVE_DOC_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The most live documents one space may have. The app name is client-chosen, so without a cap an account could make
-/// documents without end, each holding up to [`MAX_LIVE_DOC_BYTES`]. A create over it is refused with
-/// [`MetaError::TooManyDocs`]; re-creating an existing document is never refused. On Postgres the count is read
-/// without a lock, so concurrent creates can overshoot it by a few; that soft cap is accepted.
+/// The most live documents holding updates one space may have. The app name is client-chosen, so without a cap an
+/// account could fill documents without end, each up to [`MAX_LIVE_DOC_BYTES`]. The first update to one more is refused
+/// with [`MetaError::TooManyDocs`]; a document that holds updates already is never refused by it. On Postgres the count
+/// is read without a lock, so concurrent first updates to different documents can overshoot it by a few; that soft
+/// cap is accepted.
 pub const MAX_LIVE_DOCS_PER_SPACE: u64 = 64;
+
+/// The most live documents (rows, holding updates or not) one space may have. Following a list makes a document
+/// whether or not anything is ever written to it, and nothing deletes one, so creates are capped loosely. A create over
+/// it is refused with [`MetaError::TooManyDocRows`]; re-creating an existing document is never refused. On Postgres
+/// the count is read without a lock, so concurrent creates can overshoot it by a few; that soft cap is accepted.
+pub const MAX_LIVE_DOC_ROWS_PER_SPACE: u64 = 1024;
 
 /// Most updates [`Meta::live_updates`] returns at once.
 pub const MAX_LIVE_PAGE: u32 = 1000;
@@ -97,15 +104,15 @@ impl Meta {
             let doc = doc_from(&row, id)?;
             return if doc.kind == kind { Ok(doc) } else { Err(MetaError::Invalid("the document exists with another kind")) };
         }
-        // A new document: the space may not go over its cap. Counted with this one; over the cap, the transaction
-        // (and the insert) is dropped uncommitted.
+        // A new document: the space may not go over its cap on rows. Counted with this one; over the cap, the
+        // transaction (and the insert) is dropped uncommitted.
         let count = sqlx::query("SELECT COUNT(*) AS n FROM live_docs WHERE space_id = $1")
             .bind(space_key)
             .fetch_one(&mut *w.tx)
             .await?
             .try_get::<i64, _>("n")?;
-        if to_u64(count)? > self.live_docs_cap {
-            return Err(MetaError::TooManyDocs { limit: self.live_docs_cap });
+        if to_u64(count)? > self.live_doc_rows_cap {
+            return Err(MetaError::TooManyDocRows { limit: self.live_doc_rows_cap });
         }
         w.commit().await?;
         Ok(LiveDoc { id, kind: kind.to_owned(), node, created_ms: now_ms, head: 0, bytes: 0 })
@@ -225,6 +232,21 @@ impl Meta {
         if used >= self.live_doc_cap {
             w.tx.rollback().await?;
             return Err(MetaError::DocFull { used, limit: self.live_doc_cap });
+        }
+        // The first update to a document: the space may have only so many that hold updates. Counted after the row lock
+        // above, in the same transaction; over the cap, nothing is stored and the number goes back, as for a full
+        // document. A repeat was acked above, and a document that holds updates already is never refused here.
+        if used == 0 {
+            let holding = sqlx::query("SELECT COUNT(*) AS n FROM live_docs WHERE space_id = $1 AND id <> $2 AND bytes > 0")
+                .bind(space_key.clone())
+                .bind(doc_key.clone())
+                .fetch_one(&mut *w.tx)
+                .await?
+                .try_get::<i64, _>("n")?;
+            if to_u64(holding)? >= self.live_docs_cap {
+                w.tx.rollback().await?;
+                return Err(MetaError::TooManyDocs { limit: self.live_docs_cap });
+            }
         }
         sqlx::query("INSERT INTO live_updates (space_id, doc, seq, bytes, device, client_seq, created_ms) VALUES ($1, $2, $3, $4, $5, $6, $7)")
             .bind(space_key)

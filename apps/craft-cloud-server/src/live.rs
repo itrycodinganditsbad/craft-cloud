@@ -583,7 +583,10 @@ mod tests {
     }
 
     async fn session_capped(limits: crate::state::Limits, cap: u64) -> (Session, DocId, Meta, DeviceAuth) {
-        let meta = Meta::open("sqlite::memory:").await.unwrap().with_live_doc_cap(cap);
+        session_on(limits, Meta::open("sqlite::memory:").await.unwrap().with_live_doc_cap(cap)).await
+    }
+
+    async fn session_on(limits: crate::state::Limits, meta: Meta) -> (Session, DocId, Meta, DeviceAuth) {
         let user = meta.create_user("ana", "$argon2id$stub", Role::Member, 0).await.unwrap();
         meta.create_device(user.id, "pc", &[7; 32], 0).await.unwrap();
         let auth = meta.device_by_token(&[7; 32]).await.unwrap().unwrap();
@@ -674,6 +677,41 @@ mod tests {
         let [ServerFrame::Error { code, message, client_seq: Some(3), .. }] = full.frames.as_slice() else { panic!("{full:?}") };
         assert_eq!(code, "quota_exceeded");
         assert!(message.contains("full"), "{message}");
+    }
+
+    /// The first update to a document over the account's cap on documents holding updates is refused as
+    /// `quota_exceeded`, naming the document and the update (the shape the agent's full-document handling reads); the
+    /// documents that hold updates go on.
+    #[tokio::test]
+    async fn an_update_to_one_document_too_many_is_refused_naming_the_update() {
+        let meta = Meta::open("sqlite::memory:").await.unwrap().with_live_docs_cap(1);
+        let (mut s, first, ..) = session_on(crate::state::Limits::default(), meta).await;
+        let app = AppName::new("sheetcraft").unwrap();
+        let second = recents_doc(s.space, &app);
+        let made = s.handle(ClientFrame::Create { doc: second, kind: DocKind::Recents { app } }).await;
+        assert_eq!(made.frames, vec![ServerFrame::Created { doc: second }], "a create isn't capped by it");
+        for doc in [first, second] {
+            s.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
+        }
+        let ok = s.handle(ClientFrame::Update { doc: first, client_seq: 1, bytes: vec![1; 10] }).await;
+        assert!(matches!(ok.frames.as_slice(), [ServerFrame::Ack { client_seq: 1, seq: 1, .. }]), "{ok:?}");
+        let refused = s.handle(ClientFrame::Update { doc: second, client_seq: 1, bytes: vec![2; 10] }).await;
+        let [ServerFrame::Error { code, doc: Some(named), client_seq: Some(1), .. }] = refused.frames.as_slice() else { panic!("{refused:?}") };
+        assert_eq!((code.as_str(), *named), ("quota_exceeded", second));
+        let more = s.handle(ClientFrame::Update { doc: first, client_seq: 2, bytes: vec![1; 10] }).await;
+        assert!(matches!(more.frames.as_slice(), [ServerFrame::Ack { seq: 2, .. }]), "{more:?}");
+    }
+
+    /// A create over the account's cap on documents is refused as `quota_exceeded`, naming the document and no update.
+    #[tokio::test]
+    async fn a_create_over_the_row_cap_is_refused_naming_only_the_document() {
+        let meta = Meta::open("sqlite::memory:").await.unwrap().with_live_doc_rows_cap(1);
+        let (mut s, ..) = session_on(crate::state::Limits::default(), meta).await;
+        let app = AppName::new("sheetcraft").unwrap();
+        let second = recents_doc(s.space, &app);
+        let refused = s.handle(ClientFrame::Create { doc: second, kind: DocKind::Recents { app } }).await;
+        let [ServerFrame::Error { code, doc: Some(named), client_seq: None, .. }] = refused.frames.as_slice() else { panic!("{refused:?}") };
+        assert_eq!((code.as_str(), *named), ("quota_exceeded", second));
     }
 
     /// The admin's reset empties a full document's log; a connection that followed it ends at its next ping, so its

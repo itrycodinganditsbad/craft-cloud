@@ -201,6 +201,9 @@ struct Doc {
     strikes: u32,
     /// A refused create or subscribe: ticks until it is tried again, and the pause it had.
     retry: Option<(u32, u32)>,
+    /// The retry is after a refused create (the account's limit), which was said: the `not_found` that the subscribe
+    /// after it gets is not said again.
+    create_refused: bool,
     /// Changed since its file was last written.
     dirty: bool,
     /// What was said about this document's updates already.
@@ -244,6 +247,7 @@ impl Doc {
             sent: BTreeSet::new(),
             strikes: 0,
             retry: None,
+            create_refused: false,
             dirty: false,
             said: BTreeSet::new(),
         }
@@ -761,6 +765,7 @@ impl<S: DocStore> Replica<S> {
             doc.sub = Sub::No;
             doc.sent.clear();
             doc.retry = None;
+            doc.create_refused = false;
             doc.full = None;
             doc.stuck = false;
         }
@@ -990,6 +995,7 @@ impl<S: DocStore> Replica<S> {
                 }
                 doc.sub = Sub::Live;
                 doc.retry = None;
+                doc.create_refused = false;
                 let mut frames = send_pending(id, doc);
                 frames.extend(doc.push_next(id, &mut self.notes, &mut self.peers));
                 Ok(frames)
@@ -1061,7 +1067,7 @@ impl<S: DocStore> Replica<S> {
                     doc.full_pause = (doc.full_pause * 2).clamp(1, MAX_RETRY_TICKS);
                     doc.full = Some(doc.full_pause);
                 }
-                let line = format!("the recents of {} are full on the server ({message}); new ones stay on this machine", doc.app);
+                let line = format!("the server takes no more recents of {} for now ({message}); new ones stay on this machine", doc.app);
                 doc.say(&mut self.notes, line);
                 Ok(Vec::new())
             }
@@ -1077,6 +1083,7 @@ impl<S: DocStore> Replica<S> {
                 let pause = doc.retry.map_or(1, |(_, pause)| pause.max(1));
                 doc.sub = Sub::No;
                 doc.retry = Some((pause, pause));
+                doc.create_refused = true;
                 let line = format!(
                     "the account has as many live documents as the server allows; the recents of {} stay on this machine ({message})",
                     doc.app
@@ -1090,8 +1097,11 @@ impl<S: DocStore> Replica<S> {
                 let pause = doc.retry.map_or(1, |(_, pause)| pause.max(1));
                 doc.sub = Sub::No;
                 doc.retry = Some((pause, pause));
-                let line = format!("the server can't follow the recents of {} right now ({message}); trying again shortly", doc.app);
-                doc.say(&mut self.notes, line);
+                // After a refused create the subscribe comes back `not_found`: that was said already.
+                if !doc.create_refused {
+                    let line = format!("the server can't follow the recents of {} right now ({message}); trying again shortly", doc.app);
+                    doc.say(&mut self.notes, line);
+                }
                 Ok(Vec::new())
             }
             _ => Err(LinkError::Retry(format!("the server refused a live frame ({code}: {message})"))),
@@ -1640,6 +1650,11 @@ mod tests {
         assert!(r.docs[&doc].retry.is_some(), "a try again is paused");
         assert!(r.docs[&other].sub == Sub::Live, "the other list is unaffected");
         assert!(r.take_notes().iter().any(|n| n.contains("recents of wordcraft")), "the user is told");
+        // The subscribe after the refused create comes back not_found: still paused, and nothing more is said.
+        let again = r.on_frame(ServerFrame::error("not_found", "document not found", Some(doc), None));
+        assert!(again.is_ok_and(|f| f.is_empty()));
+        assert!(r.docs[&doc].retry.is_some(), "still paused");
+        assert!(r.take_notes().is_empty(), "no second note");
     }
 
     /// Loro failing on an update may leave the document half-changed: it is read back from its file, the update is

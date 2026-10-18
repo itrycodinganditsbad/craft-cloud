@@ -113,7 +113,8 @@ on_every_backend!(
     concurrent_live_creates_make_one_document,
     live_pages_stop_at_their_byte_limit,
     a_live_document_is_capped_by_bytes,
-    live_docs_per_space_are_capped,
+    live_documents_holding_updates_are_capped,
+    live_document_rows_are_capped,
 );
 
 // ---- helpers ----
@@ -708,16 +709,41 @@ async fn concurrent_live_creates_make_one_document(meta: &Meta) {
     assert!(matches!(meta.create_live_doc(ana.space, doc, "recents:other", None, NOW).await, Err(MetaError::Invalid(_))));
 }
 
-async fn live_docs_per_space_are_capped(meta: &Meta) {
+async fn live_documents_holding_updates_are_capped(meta: &Meta) {
     use craft_cloud_proto::DocId;
-    let ana = user(meta, "ana").await;
-    let bo = user(meta, "bo").await;
-    let docs: Vec<DocId> = (0..64).map(|_| DocId::generate()).collect();
+    let meta = meta.clone().with_live_docs_cap(2);
+    let ana = user(&meta, "ana").await;
+    let bo = user(&meta, "bo").await;
+    let (dev, bo_dev) = (device(&meta, &ana).await, device(&meta, &bo).await);
+    let docs: Vec<DocId> = (0..3).map(|_| DocId::generate()).collect();
+    for doc in &docs {
+        meta.create_live_doc(ana.space, *doc, "recents:wordcraft", None, NOW).await.unwrap();
+    }
+    assert_eq!(meta.append_live_update(ana.space, docs[0], dev, 1, b"one", NOW).await.unwrap(), 1);
+    assert_eq!(meta.append_live_update(ana.space, docs[1], dev, 1, b"two", NOW).await.unwrap(), 1);
+    assert!(matches!(meta.append_live_update(ana.space, docs[2], dev, 1, b"three", NOW).await, Err(MetaError::TooManyDocs { limit: 2 })));
+    let third = meta.live_doc(ana.space, docs[2]).await.unwrap().unwrap();
+    assert_eq!((third.head, third.bytes), (0, 0), "nothing was stored, and the number went back");
+    assert!(meta.live_updates(ana.space, docs[2], 0, 10).await.unwrap().is_empty());
+    assert_eq!(meta.append_live_update(ana.space, docs[0], dev, 2, b"more", NOW).await.unwrap(), 2, "a document that holds updates goes on");
+    assert_eq!(meta.append_live_update(ana.space, docs[0], dev, 1, b"one", NOW).await.unwrap(), 1, "a repeat is acked with its number");
+    // Another account has its own count.
+    let other = DocId::generate();
+    meta.create_live_doc(bo.space, other, "recents:wordcraft", None, NOW).await.unwrap();
+    assert_eq!(meta.append_live_update(bo.space, other, bo_dev, 1, b"x", NOW).await.unwrap(), 1);
+}
+
+async fn live_document_rows_are_capped(meta: &Meta) {
+    use craft_cloud_proto::DocId;
+    let meta = meta.clone().with_live_doc_rows_cap(3);
+    let ana = user(&meta, "ana").await;
+    let bo = user(&meta, "bo").await;
+    let docs: Vec<DocId> = (0..3).map(|_| DocId::generate()).collect();
     for doc in &docs {
         meta.create_live_doc(ana.space, *doc, "recents:wordcraft", None, NOW).await.unwrap();
     }
     let extra = DocId::generate();
-    assert!(matches!(meta.create_live_doc(ana.space, extra, "recents:wordcraft", None, NOW).await, Err(MetaError::TooManyDocs { limit: 64 })));
+    assert!(matches!(meta.create_live_doc(ana.space, extra, "recents:wordcraft", None, NOW).await, Err(MetaError::TooManyDocRows { limit: 3 })));
     assert!(meta.live_doc(ana.space, extra).await.unwrap().is_none(), "the refused document was not stored");
     assert_eq!(
         meta.create_live_doc(ana.space, docs[0], "recents:wordcraft", None, NOW).await.unwrap().id,
