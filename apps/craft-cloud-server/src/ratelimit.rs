@@ -53,13 +53,15 @@ impl Limiter {
         entry.1 <= max
     }
 
-    /// Whether `key` already made `max` attempts in its current window, without counting one (or the limiter is
-    /// full and `key` is new): a caller that counts only failures asks this first, and [`Limiter::allow`] after one.
-    pub fn full(&self, key: &str, max: u32, now: Instant) -> bool {
-        let windows = self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        match windows.entries.get(key) {
-            Some((start, count)) => now.saturating_duration_since(*start) < self.period && *count >= max,
-            None => windows.entries.len() >= self.capacity,
+    /// Gives back one attempt [`Limiter::allow`] counted for `key` in its current window: for a caller that counts
+    /// only failures, but must count every attempt up front so that attempts made at the same moment are held to the
+    /// limit too.
+    pub fn refund(&self, key: &str, now: Instant) {
+        let mut windows = self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = windows.entries.get_mut(key)
+            && now.saturating_duration_since(entry.0) < self.period
+        {
+            entry.1 = entry.1.saturating_sub(1);
         }
     }
 }
@@ -118,18 +120,17 @@ mod tests {
     }
 
     #[test]
-    fn full_looks_without_counting() {
-        let limiter = Limiter::with_capacity(Duration::from_secs(60), 2);
+    fn a_refund_gives_back_one_attempt_of_the_current_window() {
+        let limiter = Limiter::new(Duration::from_secs(60));
         let t0 = Instant::now();
-        assert!(!limiter.full("ip:a", 2, t0));
         assert!(limiter.allow("ip:a", 2, t0));
-        assert!(!limiter.full("ip:a", 2, t0), "one of two");
-        assert!(!limiter.full("ip:a", 2, t0), "looking didn't count");
         assert!(limiter.allow("ip:a", 2, t0));
-        assert!(limiter.full("ip:a", 2, t0));
-        assert!(!limiter.full("ip:a", 2, t0 + Duration::from_secs(60)), "a new window");
-        assert!(limiter.allow("ip:b", 2, t0));
-        assert!(limiter.full("ip:c", 2, t0), "a new key when the limiter is full");
+        limiter.refund("ip:a", t0);
+        assert!(limiter.allow("ip:a", 2, t0), "the refunded attempt");
+        assert!(!limiter.allow("ip:a", 2, t0));
+        limiter.refund("ip:unknown", t0);
+        limiter.refund("ip:a", t0 + Duration::from_secs(61));
+        assert!(limiter.allow("ip:a", 2, t0 + Duration::from_secs(61)), "a new window starts afresh anyway");
     }
 
     #[test]

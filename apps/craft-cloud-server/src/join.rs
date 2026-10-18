@@ -6,8 +6,9 @@
 //! - **Failed redeems are limited per client address** (behind trusted proxies, as sign-ins are): [`JOINS_PER_IP`]
 //!   in a minute, then `429 rate_limited`, even for a code that works. Only `invalid_code` counts. A successful
 //!   redeem doesn't, and neither does `password_required` or `weak_password`: they are only answered for a real,
-//!   unused invite, so they tell a guesser nothing a success wouldn't. A full window is checked before anything
-//!   else is looked at.
+//!   unused invite, so they tell a guesser nothing a success wouldn't. Every try is counted before the code is
+//!   looked at, and given back once it turns out not to be `invalid_code`, so tries sent at the same moment are held
+//!   to the limit as well.
 //! - **An invite to a new account** must carry a password (the server's password rules), hashed with Argon2id under
 //!   the same server-wide slots as sign-ins; it becomes the account's in the transaction that creates the device.
 //! - **Codes are never logged**, and neither are tokens or passwords; the database keeps only codes' hashes.
@@ -84,12 +85,14 @@ pub async fn join(
     // tokio's clock: the system's monotonic clock in the server, the simulated one in a simulation.
     let now = tokio::time::Instant::now().into_std();
     let key = ip_key(client_ip(peer, &headers, &state.trusted_proxies));
-    if state.joins.full(&key, JOINS_PER_IP, now) {
+    // Counted before the redeem, so tries made at the same moment are held to the limit too; given back unless the
+    // code didn't work.
+    if !state.joins.allow(&key, JOINS_PER_IP, now) {
         return Err(ApiError::rate_limited("too many tries with codes that don't work; wait a minute", None));
     }
     let result = redeem(&state, &req).await;
-    if result.as_ref().is_err_and(|e| e.code == codes::INVALID_CODE) {
-        state.joins.allow(&key, JOINS_PER_IP, now);
+    if !result.as_ref().is_err_and(|e| e.code == codes::INVALID_CODE) {
+        state.joins.refund(&key, now);
     }
     result.map(Json)
 }

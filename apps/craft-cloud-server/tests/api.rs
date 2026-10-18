@@ -895,6 +895,41 @@ async fn failed_joins_are_limited_per_address() {
     joined(join_from(&s, &made.code, "pc", None, Some("198.51.100.7")).await).await;
 }
 
+/// Wrong codes sent all at once from one address get no more tries than sent one by one: of 40 in flight together,
+/// at most 10 reach the database, and the rest are `rate_limited`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_failed_joins_are_limited_too() {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let s = std::sync::Arc::new(start_trusting(meta, store, vec![db, blobs], vec!["127.0.0.1".parse().unwrap()]).await);
+    let tries: Vec<_> = (0..40)
+        .map(|_| {
+            let s = s.clone();
+            tokio::spawn(async move {
+                let wrong = Code::generate(PAIRING_CHARS).unwrap();
+                error(join_from(&s, wrong.as_str(), "pc", None, Some("203.0.113.9")).await).await.1.error
+            })
+        })
+        .collect();
+    let mut answers = Vec::new();
+    for t in tries {
+        answers.push(t.await.unwrap());
+    }
+    let tried = answers.iter().filter(|a| *a == "invalid_code").count();
+    let limited = answers.iter().filter(|a| *a == "rate_limited").count();
+    assert_eq!(tried + limited, 40, "{answers:?}");
+    assert!(tried <= 10, "{tried} wrong codes reached the database");
+    // A success gives its try back: the address isn't held off by its own joins.
+    add_user(&s, "ana").await;
+    let token = login(&s, "ana").await;
+    for i in 0..12 {
+        let made = new_pairing(&s, &token).await;
+        joined(join_from(&s, &made.code, &format!("pc{i}"), None, Some("198.51.100.7")).await).await;
+    }
+}
+
 // ---- load limits (the same on every backend, so SQLite + disk only) ----
 
 /// Starts a `PUT` to `path` (under `/api/v1`) whose body never finishes: the headers promise 1,000 bytes and three
