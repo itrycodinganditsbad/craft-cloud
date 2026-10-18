@@ -67,7 +67,21 @@ impl DeviceToken {
     pub fn new(token: String) -> Self {
         Self(token)
     }
+
+    /// `Bearer <token>`, marked sensitive (so it is never shown in a header dump).
+    pub fn bearer(&self) -> Result<HeaderValue, TransportError> {
+        let mut auth = HeaderValue::from_str(&format!("Bearer {}", self.0))
+            .map_err(|_| TransportError::Protocol("the saved device token is damaged; sign in again".into()))?;
+        auth.set_sensitive(true);
+        Ok(auth)
+    }
 }
+
+/// What the agent sends as its User-Agent (generic: nothing about the user or the machine).
+pub const USER_AGENT_VALUE: &str = AGENT;
+
+/// `localhost` always means this machine (see [`ServerUrl`]): the addresses a plain-HTTP loopback server is reached at.
+pub const LOCALHOST_ADDRS: [SocketAddr; 2] = LOCALHOST;
 
 impl std::fmt::Debug for DeviceToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -116,6 +130,16 @@ impl ServerUrl {
     /// Whether the server is on this machine (plain HTTP is allowed then).
     pub fn is_loopback(&self) -> bool {
         is_loopback(&self.0)
+    }
+
+    /// The live service, `/api/v1/live`, as a WebSocket address: `wss://` for `https://`, `ws://` for a server on this
+    /// machine.
+    pub fn live_url(&self) -> Url {
+        let mut url = self.endpoint("live");
+        let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
+        // Switching between the special schemes keeps everything else.
+        let _ = url.set_scheme(scheme);
+        url
     }
 
     /// The API endpoint `/api/v1/<path>`.
@@ -454,10 +478,7 @@ impl HttpTransport {
 impl<C: Connection> HttpTransport<C> {
     /// The API over another connection (a simulated network, in tests). `server` names the endpoints.
     pub fn over(connection: C, server: ServerUrl, token: &DeviceToken) -> Result<Self, TransportError> {
-        let mut auth = HeaderValue::from_str(&format!("Bearer {}", token.0))
-            .map_err(|_| TransportError::Protocol("the saved device token is damaged; sign in again".into()))?;
-        auth.set_sensitive(true);
-        Ok(Self { connection, server, auth })
+        Ok(Self { connection, server, auth: token.bearer()? })
     }
 
     pub fn server(&self) -> &ServerUrl {
@@ -621,6 +642,8 @@ mod tests {
         assert_eq!(url.endpoint("chunks/missing").as_str(), "https://example.com/sync/api/v1/chunks/missing");
         let root = ServerUrl::parse("https://example.com").unwrap();
         assert_eq!(root.endpoint("space").as_str(), "https://example.com/api/v1/space");
+        assert_eq!(url.live_url().as_str(), "wss://example.com/sync/api/v1/live");
+        assert_eq!(ServerUrl::parse("http://127.0.0.1:9000").unwrap().live_url().as_str(), "ws://127.0.0.1:9000/api/v1/live");
     }
 
     #[test]

@@ -27,9 +27,13 @@ use std::time::{Duration, Instant};
 use craft_cloud_proto::NodeId;
 use tokio::sync::{mpsc, watch};
 
+use craft_cloud_proto::local::RunState;
+
 use crate::account::{Approval, DataDir, LastPass, LoopState, LoopStatus, PassSummary, STATUS_SCHEMA};
-use crate::cli::{AgentError, Exit, Session, hold_data, now_ms, print_summary};
+use crate::cli::{AgentError, Exit, LoginArgs, Session, hold_data, now_ms, print_summary};
 use crate::http::{Connection, HttpTransport, PollError};
+use crate::live::{Hub, HubConfig};
+use crate::local_api::{Command, Control, LocalApi};
 use crate::lock::Lock;
 use crate::schedule::{Ms, Next, PassEnd, Phase, Recheck, Scheduler, Timing};
 use crate::settle::Stability;
@@ -362,6 +366,18 @@ fn without_times(status: &LoopStatus) -> LoopStatus {
     LoopStatus { heartbeat_ms: 0, state, ..status.clone() }
 }
 
+/// The loop's state as the local API reports it.
+fn run_state(state: &LoopState) -> RunState {
+    match state {
+        LoopState::Idle => RunState::Idle,
+        LoopState::Syncing => RunState::Syncing,
+        LoopState::Retrying { message, .. } => RunState::Retrying { message: message.clone() },
+        LoopState::Paused { reason, .. } => RunState::Paused { reason: reason.clone() },
+        LoopState::Stopping | LoopState::Stopped => RunState::Stopping,
+        LoopState::SignedOut => RunState::SignedOut,
+    }
+}
+
 /// The loop's clock and its status file. Its own clock is monotonic (scheduling only); every time it writes is the
 /// wall clock's.
 struct Status {
@@ -376,9 +392,17 @@ struct Status {
     not_watching: Option<String>,
     /// Deletes are held behind a link (as of the last pass that finished).
     held: bool,
+    /// The local API's view of the loop, told every state written (`None` in tests of the file alone).
+    control: Option<Control>,
 }
 
 impl Status {
+    /// Signed out: nothing of the last account's passes is reported any more.
+    fn forget_passes(&mut self) {
+        self.last_pass = None;
+        self.not_watching = None;
+        self.held = false;
+    }
     fn now(&self) -> Ms {
         u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
@@ -405,6 +429,9 @@ impl Status {
     /// watcher event, so comparing them would write (and flush) the file on every other event while it retries.
     /// A failed write is reported once per failure and tried again next time; it never stops the loop.
     fn write(&mut self, state: LoopState, waiting_for_approval: bool, force: bool) {
+        if let Some(control) = &self.control {
+            control.set_run_state(run_state(&state));
+        }
         let now = self.now();
         let status = LoopStatus {
             schema: STATUS_SCHEMA,
@@ -440,37 +467,18 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
     // sessions opened later don't (see `Session::open`). Young ones are left alone: `status` and
     // `sync --approve-deletes` may be writing one from another terminal.
     data.clean_tmp()?;
-    let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
-    let roots = crate::watch::roots(&account.folder);
-    let (events_tx, mut events) = mpsc::unbounded_channel::<Event>();
-    let (requests, requests_rx) = std::sync::mpsc::channel::<Vec<NodeId>>();
-    let pass_events = events_tx.clone();
-    // The stability window's looks, shared: the disk asks, the loop leaves the watcher's events for waiting files alone.
-    let stability = Stability::new(options.timing.stability);
-    let (thread_data, thread_stability) = (data.clone(), stability.clone());
-    let pass = std::thread::Builder::new()
-        .name("craft-cloud-pass".into())
-        .spawn(move || pass_thread(thread_data, thread_stability, requests_rx, pass_events))
-        .map_err(|source| AgentError::Io { path: data.path().to_owned(), source })?;
-    // Where the saved state read the change feed to, once a first sync is done.
-    let since = data.load_state().ok().and_then(|saved| saved.state.space.map(|_| saved.state.seq));
-    let (since_tx, since_rx) = watch::channel::<Option<u64>>(since);
-    let transport = HttpTransport::new(account.server.clone(), &account.token)?;
-    let polled = events_tx.clone();
-    let tell = move |p: Polled| {
-        polled
-            .send(match p {
-                Polled::Changed => Event::Remote,
-                Polled::Back => Event::ServerBack,
-            })
-            .is_ok()
+    let say = |out: &mut dyn Write, line: &str| {
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
     };
-    let poll = tokio::spawn(long_poll(transport, since_rx, tell, options, random));
-
-    let start = Instant::now();
+    // The local API serves from the start, signed in or not; it is stopped (and its file removed) when the loop ends.
+    let (commands_tx, mut commands) = mpsc::channel::<Command>(8);
+    let control = Control::new(commands_tx);
+    let api = LocalApi::start(data, control.clone()).await?;
+    say(out, &format!("craft-cloud-agent: local API on 127.0.0.1:{} (for apps and the launcher)", api.port()));
     let mut status = Status {
         data: data.clone(),
-        start,
+        start: Instant::now(),
         started_ms: now_ms(),
         heartbeat: options.heartbeat,
         last_written: None,
@@ -478,201 +486,381 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
         last_pass: None,
         not_watching: None,
         held: false,
+        control: Some(control.clone()),
     };
-    let mut scheduler = Scheduler::new(options.timing, 0, random);
-    let mut watching = Watching::default();
-    let mut approved: Vec<NodeId> = Vec::new();
     let mut stops = 0;
     let mut stop_open = true;
-    let mut last_message: Option<String> = None;
-    // The set of deletes held behind a link the loop last listed (see `summary_to_show`).
-    let mut last_held: Option<String> = None;
-    let say = |out: &mut dyn Write, line: &str| {
-        let _ = writeln!(out, "{line}");
-        let _ = out.flush();
-    };
-    say(out, &format!("craft-cloud-agent: syncing {} with {} (Ctrl-C stops)", account.folder.display(), account.server));
-
-    let exit = loop {
-        let now = status.now();
-        // The watcher starts (again) whenever it isn't running and is due: at the start, after it failed or stopped,
-        // and after a folder that was missing came back (not while the loop is paused: the folder may be gone). One
-        // that can't start is said once and tried again later, less and less often; meanwhile a full pass runs every
-        // minute, and the long-poll still syncs the server's changes.
-        let paused = matches!(scheduler.phase(), Phase::Paused { .. });
-        if watching.watcher.is_none() && !scheduler.is_stopping() && !paused && now >= watching.next_try {
-            let (wtx, wrx) = mpsc::unbounded_channel();
-            let started = if options.fail_watch {
-                Err(notify::Error::generic("the watcher is switched off (test)"))
-            } else {
-                crate::watch::watch(&account.folder, wtx)
-            };
-            match started {
-                Ok(w) => {
-                    watching.watcher = Some(w);
-                    if watching.started_one(now, &mut scheduler) {
-                        say(out, "watching the folder again");
-                    }
-                    tokio::spawn(forward_watch_events(wrx, events_tx.clone(), watching.generation));
+    // A sign-out revoked the device but couldn't remove the account file: the dead account is never used again.
+    let mut ignore_saved = false;
+    let exit = 'signed_in: loop {
+        let saved = if ignore_saved { None } else { data.load_account()? };
+        let Some(account) = saved else {
+            control.set_account(None);
+            status.forget_passes();
+            say(out, "not signed in: waiting for a sign-in (`craft-cloud-agent login`, or the launcher)");
+            match wait_for_sign_in(data, &control, &mut status, &mut commands, &mut stop, &mut stop_open, out).await {
+                SignedOut::SignedIn => {
+                    ignore_saved = false;
+                    continue 'signed_in;
                 }
-                Err(e) => {
-                    watching.failures = watching.failures.saturating_add(1);
-                    let first = ms(options.timing.unwatched_periodic).max(1);
-                    let delay = first
-                        .checked_shl(watching.failures.saturating_sub(1).min(20))
-                        .unwrap_or(u64::MAX)
-                        .min(ms(options.timing.periodic).max(first));
-                    watching.next_try = now.saturating_add(delay);
-                    if watching.not_watching.is_none() {
-                        say(out, &format!("not watching the folder ({e}): changes there are found by a full pass every minute until it can"));
-                    }
-                    watching.not_watching = Some(e.to_string());
-                    scheduler.set_watching(false);
+                SignedOut::Stop => {
+                    status.write(LoopState::Stopped, false, true);
+                    break 'signed_in Exit::Done;
                 }
             }
-            status.not_watching = watching.not_watching.clone();
-        }
-        // A file still settling that went quiet after its events: a look at it that finds it settled runs a pass.
-        if take_due_peeks(&account.folder, &stability) {
-            scheduler.local_change(now);
-        }
-        status.write(status.state(scheduler.phase()), scheduler.waiting_for_approval(), false);
-        let until = match scheduler.next(now) {
-            Next::Exit => break Exit::Done,
-            Next::RunPass => {
-                // Windows: the watcher is made afresh with this pass (see `Watching::renew_before_pass`); the loop
-                // goes round once to start it, then runs this same pass.
-                if cfg!(windows) && !matches!(scheduler.phase(), Phase::Paused { .. }) && watching.renew_before_pass(now, ms(options.timing.periodic))
-                {
+        };
+        control.set_account(Some(&account));
+        // The live hub (recents) runs while signed in, online or not. One that can't open its documents leaves recents
+        // off; the folder syncs all the same.
+        let hub_config = HubConfig {
+            data: data.clone(),
+            space: account.space,
+            server: account.server.clone(),
+            token: account.token.clone(),
+            machine: account.device_name.clone(),
+        };
+        let hub = match Hub::start(hub_config, control.clone()) {
+            Ok(hub) => Some(hub),
+            Err(e) => {
+                say(out, &format!("recents are off: their documents can't be opened ({e})"));
+                None
+            }
+        };
+        control.set_hub(hub.as_ref().map(Hub::handle));
+        let roots = crate::watch::roots(&account.folder);
+        let (events_tx, mut events) = mpsc::unbounded_channel::<Event>();
+        let (requests, requests_rx) = std::sync::mpsc::channel::<Vec<NodeId>>();
+        let pass_events = events_tx.clone();
+        // The stability window's looks, shared: the disk asks, the loop leaves the watcher's events for waiting files alone.
+        let stability = Stability::new(options.timing.stability);
+        let (thread_data, thread_stability) = (data.clone(), stability.clone());
+        let pass = std::thread::Builder::new()
+            .name("craft-cloud-pass".into())
+            .spawn(move || pass_thread(thread_data, thread_stability, requests_rx, pass_events))
+            .map_err(|source| AgentError::Io { path: data.path().to_owned(), source })?;
+        // Where the saved state read the change feed to, once a first sync is done.
+        let since = data.load_state().ok().and_then(|saved| saved.state.space.map(|_| saved.state.seq));
+        let (since_tx, since_rx) = watch::channel::<Option<u64>>(since);
+        let transport = HttpTransport::new(account.server.clone(), &account.token)?;
+        let polled = events_tx.clone();
+        let tell = move |p: Polled| {
+            polled
+                .send(match p {
+                    Polled::Changed => Event::Remote,
+                    Polled::Back => Event::ServerBack,
+                })
+                .is_ok()
+        };
+        let poll = tokio::spawn(long_poll(transport, since_rx, tell, options, random));
+
+        let mut scheduler = Scheduler::new(options.timing, status.now(), random);
+        let mut watching = Watching::default();
+        let mut approved: Vec<NodeId> = Vec::new();
+        let mut last_message: Option<String> = None;
+        // The set of deletes held behind a link the loop last listed (see `summary_to_show`).
+        let mut last_held: Option<String> = None;
+        let mut commands_open = true;
+        say(out, &format!("craft-cloud-agent: syncing {} with {} (Ctrl-C stops)", account.folder.display(), account.server));
+
+        let end = loop {
+            let now = status.now();
+            // The watcher starts (again) whenever it isn't running and is due: at the start, after it failed or stopped,
+            // and after a folder that was missing came back (not while the loop is paused: the folder may be gone). One
+            // that can't start is said once and tried again later, less and less often; meanwhile a full pass runs every
+            // minute, and the long-poll still syncs the server's changes.
+            let paused = matches!(scheduler.phase(), Phase::Paused { .. });
+            if watching.watcher.is_none() && !scheduler.is_stopping() && !paused && now >= watching.next_try {
+                let (wtx, wrx) = mpsc::unbounded_channel();
+                let started = if options.fail_watch {
+                    Err(notify::Error::generic("the watcher is switched off (test)"))
+                } else {
+                    crate::watch::watch(&account.folder, wtx)
+                };
+                match started {
+                    Ok(w) => {
+                        watching.watcher = Some(w);
+                        if watching.started_one(now, &mut scheduler) {
+                            say(out, "watching the folder again");
+                        }
+                        tokio::spawn(forward_watch_events(wrx, events_tx.clone(), watching.generation));
+                    }
+                    Err(e) => {
+                        watching.failures = watching.failures.saturating_add(1);
+                        let first = ms(options.timing.unwatched_periodic).max(1);
+                        let delay = first
+                            .checked_shl(watching.failures.saturating_sub(1).min(20))
+                            .unwrap_or(u64::MAX)
+                            .min(ms(options.timing.periodic).max(first));
+                        watching.next_try = now.saturating_add(delay);
+                        if watching.not_watching.is_none() {
+                            say(out, &format!("not watching the folder ({e}): changes there are found by a full pass every minute until it can"));
+                        }
+                        watching.not_watching = Some(e.to_string());
+                        scheduler.set_watching(false);
+                    }
+                }
+                status.not_watching = watching.not_watching.clone();
+            }
+            // A file still settling that went quiet after its events: a look at it that finds it settled runs a pass.
+            if take_due_peeks(&account.folder, &stability) {
+                scheduler.local_change(now);
+            }
+            status.write(status.state(scheduler.phase()), scheduler.waiting_for_approval(), false);
+            let until = match scheduler.next(now) {
+                Next::Exit => break End::Exit(Exit::Done),
+                Next::RunPass => {
+                    // Windows: the watcher is made afresh with this pass (see `Watching::renew_before_pass`); the loop
+                    // goes round once to start it, then runs this same pass.
+                    if cfg!(windows)
+                        && !matches!(scheduler.phase(), Phase::Paused { .. })
+                        && watching.renew_before_pass(now, ms(options.timing.periodic))
+                    {
+                        continue;
+                    }
+                    scheduler.pass_started();
+                    if requests.send(std::mem::take(&mut approved)).is_err() {
+                        break End::Exit(Exit::Failed);
+                    }
+                    status.write(LoopState::Syncing, scheduler.waiting_for_approval(), true);
                     continue;
                 }
-                scheduler.pass_started();
-                if requests.send(std::mem::take(&mut approved)).is_err() {
-                    break Exit::Failed;
-                }
-                status.write(LoopState::Syncing, scheduler.waiting_for_approval(), true);
-                continue;
-            }
-            Next::CheckApproval => {
-                // Released only if it names the set that waits now; deletions that came since still wait (the engine
-                // releases exactly the approved nodes) and are listed again.
-                // The set of deletes held behind a link is its own set, released the same way.
-                let summary = status.last_pass.as_ref().and_then(|l| l.summary.as_ref());
-                let waiting = [summary.and_then(PassSummary::pending_set), summary.and_then(PassSummary::held_set)];
-                match data.take_approval() {
-                    Ok(Some(Approval { set, nodes, .. })) if waiting.contains(&Some(set.clone())) => {
-                        say(out, &format!("approval received for {} deletion(s)", nodes.len()));
-                        approved.extend(nodes);
-                        scheduler.urgent_change();
+                Next::CheckApproval => {
+                    // Released only if it names the set that waits now; deletions that came since still wait (the engine
+                    // releases exactly the approved nodes) and are listed again.
+                    // The set of deletes held behind a link is its own set, released the same way.
+                    let summary = status.last_pass.as_ref().and_then(|l| l.summary.as_ref());
+                    let waiting = [summary.and_then(PassSummary::pending_set), summary.and_then(PassSummary::held_set)];
+                    match data.take_approval() {
+                        Ok(Some(Approval { set, nodes, .. })) if waiting.contains(&Some(set.clone())) => {
+                            say(out, &format!("approval received for {} deletion(s)", nodes.len()));
+                            approved.extend(nodes);
+                            scheduler.urgent_change();
+                        }
+                        Ok(Some(_)) => say(out, DISCARDED),
+                        Ok(None) => {}
+                        Err(e) => say(out, &format!("the approval couldn't be read ({e}); run `craft-cloud-agent sync --approve-deletes` again")),
                     }
-                    Ok(Some(_)) => say(out, DISCARDED),
-                    Ok(None) => {}
-                    Err(e) => say(out, &format!("the approval couldn't be read ({e}); run `craft-cloud-agent sync --approve-deletes` again")),
+                    scheduler.approval_checked(now);
+                    continue;
                 }
-                scheduler.approval_checked(now);
-                continue;
-            }
-            Next::Wait(until) => until,
-        };
-        let watch_due = (watching.watcher.is_none() && !scheduler.is_stopping() && !paused).then_some(watching.next_try);
-        let peek_due = stability.next_peek_in().map(|d| now.saturating_add(ms(d)));
-        let wake =
-            until.unwrap_or(u64::MAX).min(status.next_beat).min(watch_due.unwrap_or(u64::MAX)).min(peek_due.unwrap_or(u64::MAX)).saturating_sub(now);
-        let sleep = tokio::time::sleep(Duration::from_millis(wake));
-        tokio::select! {
-            event = events.recv() => match event {
-                // A file still settling is looked at when its look is due (see `crate::settle`): its own writes
-                // don't run passes, or a file that never settles would keep the loop scanning every few seconds.
-                // Instead, it gets a cheap look of its own once it has been quiet for a while (below).
-                Some(Event::Watch(WatchEvent::Changed { paths, closed })) => {
-                    if counts_as_change(&roots, &stability, &paths, closed) {
-                        scheduler.local_change(status.now());
+                Next::Wait(until) => until,
+            };
+            let watch_due = (watching.watcher.is_none() && !scheduler.is_stopping() && !paused).then_some(watching.next_try);
+            let peek_due = stability.next_peek_in().map(|d| now.saturating_add(ms(d)));
+            let wake = until
+                .unwrap_or(u64::MAX)
+                .min(status.next_beat)
+                .min(watch_due.unwrap_or(u64::MAX))
+                .min(peek_due.unwrap_or(u64::MAX))
+                .saturating_sub(now);
+            let sleep = tokio::time::sleep(Duration::from_millis(wake));
+            tokio::select! {
+                event = events.recv() => match event {
+                    // A file still settling is looked at when its look is due (see `crate::settle`): its own writes
+                    // don't run passes, or a file that never settles would keep the loop scanning every few seconds.
+                    // Instead, it gets a cheap look of its own once it has been quiet for a while (below).
+                    Some(Event::Watch(WatchEvent::Changed { paths, closed })) => {
+                        if counts_as_change(&roots, &stability, &paths, closed) {
+                            scheduler.local_change(status.now());
+                        }
                     }
-                }
-                // A watcher that failed or dropped events: a full pass now, and the watcher is made afresh.
-                Some(Event::Watch(WatchEvent::Lost(why))) => {
-                    say(out, &format!("the folder watcher lost track ({why}): looking at the whole folder"));
-                    scheduler.urgent_change();
-                    watching.lost(status.now(), ms(options.timing.unwatched_periodic));
-                }
-                // The watcher stopped by itself (its thread ended): the same.
-                Some(Event::WatcherGone(generation)) => {
-                    if generation == watching.generation && watching.watcher.is_some() {
-                        say(out, "the folder watcher stopped: looking at the whole folder");
+                    // A watcher that failed or dropped events: a full pass now, and the watcher is made afresh.
+                    Some(Event::Watch(WatchEvent::Lost(why))) => {
+                        say(out, &format!("the folder watcher lost track ({why}): looking at the whole folder"));
                         scheduler.urgent_change();
                         watching.lost(status.now(), ms(options.timing.unwatched_periodic));
                     }
-                }
-                Some(Event::Remote) => scheduler.urgent_change(),
-                Some(Event::ServerBack) => scheduler.server_back(),
-                Some(Event::Pass(done)) => {
-                    let end = pass_end(&done.result, done.recheck_in);
-                    if let Some(seq) = done.seq {
-                        let _ = since_tx.send(Some(seq));
-                    }
-                    status.last_pass = done.last_pass;
-                    match &done.result {
-                        Ok(summary) => {
-                            last_message = None;
-                            let (shown, released) = summary_to_show(summary, &mut last_held);
-                            if let Some(shown) = shown {
-                                let _ = print_summary(out, &shown);
-                            }
-                            if released {
-                                say(out, "no delete is held behind a link any more");
-                            }
-                        }
-                        Err(e) => {
-                            let message = e.to_string();
-                            if last_message.as_ref() != Some(&message) {
-                                say(out, &message);
-                            }
-                            last_message = Some(message);
-                            // A folder that went away takes the watcher's watches with it.
-                            if matches!(end, PassEnd::NeedsYou { .. }) {
-                                watching.watcher = None;
-                            }
+                    // The watcher stopped by itself (its thread ended): the same.
+                    Some(Event::WatcherGone(generation)) => {
+                        if generation == watching.generation && watching.watcher.is_some() {
+                            say(out, "the folder watcher stopped: looking at the whole folder");
+                            scheduler.urgent_change();
+                            watching.lost(status.now(), ms(options.timing.unwatched_periodic));
                         }
                     }
-                    scheduler.pass_finished(status.now(), end);
-                    status.held = scheduler.holding();
-                    // An approval found while nothing waits (this pass, or one before, settled the deletions) is never
-                    // kept for later: it would release a set that may come up again weeks from now.
-                    if !scheduler.looks_for_approval() && matches!(data.take_approval(), Ok(Some(_))) {
-                        say(out, DISCARDED);
+                    Some(Event::Remote) => scheduler.urgent_change(),
+                    Some(Event::ServerBack) => scheduler.server_back(),
+                    Some(Event::Pass(done)) => {
+                        let end = pass_end(&done.result, done.recheck_in);
+                        if let Some(seq) = done.seq {
+                            let _ = since_tx.send(Some(seq));
+                        }
+                        status.last_pass = done.last_pass;
+                        match &done.result {
+                            Ok(summary) => {
+                                last_message = None;
+                                let (shown, released) = summary_to_show(summary, &mut last_held);
+                                if let Some(shown) = shown {
+                                    let _ = print_summary(out, &shown);
+                                }
+                                if released {
+                                    say(out, "no delete is held behind a link any more");
+                                }
+                            }
+                            Err(e) => {
+                                let message = e.to_string();
+                                if last_message.as_ref() != Some(&message) {
+                                    say(out, &message);
+                                }
+                                last_message = Some(message);
+                                // A folder that went away takes the watcher's watches with it.
+                                if matches!(end, PassEnd::NeedsYou { .. }) {
+                                    watching.watcher = None;
+                                }
+                            }
+                        }
+                        scheduler.pass_finished(status.now(), end);
+                        status.held = scheduler.holding();
+                        // An approval found while nothing waits (this pass, or one before, settled the deletions) is never
+                        // kept for later: it would release a set that may come up again weeks from now.
+                        if !scheduler.looks_for_approval() && matches!(data.take_approval(), Ok(Some(_))) {
+                            say(out, DISCARDED);
+                        }
+                    }
+                    // Everything that sends is still here while the loop runs.
+                    None => break End::Exit(Exit::Failed),
+                },
+                signal = stop.recv(), if stop_open => match signal {
+                    Some(()) => {
+                        stops += 1;
+                        if stops > 1 {
+                            say(out, "stopping at once");
+                            break End::Exit(Exit::Failed);
+                        }
+                        say(out, "stopping after the running pass (press Ctrl-C again to stop at once)");
+                        scheduler.stop();
+                        watching.watcher = None;
+                    }
+                    None => stop_open = false,
+                },
+                command = commands.recv(), if commands_open => match command {
+                    Some(Command::Login(_, reply)) => {
+                        let _ = reply.send(Err(crate::cli::already_signed_in(&account)));
+                    }
+                    // Signed out on the server first (an unreachable server changes nothing, and syncing goes on); then
+                    // syncing stops, below, and the account is forgotten. The files stay.
+                    Some(Command::Logout(request, reply)) => {
+                        let revoked = if request.local { Ok(()) } else { crate::cli::revoke_device(&account).await };
+                        match revoked {
+                            Ok(()) => break End::SignedOut(reply),
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                        }
+                    }
+                    None => commands_open = false,
+                },
+                () = sleep => {}
+            }
+        };
+        poll.abort();
+        drop(watching);
+        drop(requests);
+        // Recents stop with the account: their followers are told, and what they were given is on disk.
+        control.set_hub(None);
+        drop(hub);
+        match end {
+            End::Exit(exit) => {
+                status.write(LoopState::Stopped, scheduler.waiting_for_approval(), true);
+                // After a second stop the pass thread may still be running a pass; it ends with it (and releases the
+                // folder's lock). Otherwise it is waiting for a request and ends now.
+                if exit == Exit::Done {
+                    let _ = pass.join();
+                }
+                break 'signed_in exit;
+            }
+            End::SignedOut(reply) => {
+                // A running pass finishes first (its thread then ends and lets go of the folder).
+                let _ = tokio::task::spawn_blocking(move || pass.join()).await;
+                let forgotten = crate::cli::forget_account(data);
+                match &forgotten {
+                    Ok(()) => say(out, &format!("signed out of {}; the files in {} stay", account.server, account.folder.display())),
+                    // The device is revoked on the server already: the account here is dead, and is never used again
+                    // (signing in with its token would only fail). The user removes the file the error names.
+                    Err(e) => {
+                        say(out, &format!("signed out on the server, but the account here couldn't be forgotten: {e}"));
+                        ignore_saved = true;
                     }
                 }
-                // Everything that sends is still here while the loop runs.
-                None => break Exit::Failed,
-            },
-            signal = stop.recv(), if stop_open => match signal {
-                Some(()) => {
-                    stops += 1;
-                    if stops > 1 {
-                        say(out, "stopping at once");
-                        break Exit::Failed;
-                    }
-                    say(out, "stopping after the running pass (press Ctrl-C again to stop at once)");
-                    scheduler.stop();
-                    watching.watcher = None;
-                }
-                None => stop_open = false,
-            },
-            () = sleep => {}
+                // Signed out before the caller hears it, so the status it reads next says so.
+                control.set_account(None);
+                let _ = reply.send(forgotten);
+            }
         }
     };
-    poll.abort();
-    drop(watching);
-    status.write(LoopState::Stopped, scheduler.waiting_for_approval(), true);
-    drop(requests);
-    // After a second stop the pass thread may still be running a pass; it ends with it (and releases the folder's
-    // lock). Otherwise it is waiting for a request and ends now.
-    if exit == Exit::Done {
-        let _ = pass.join();
-    }
+    drop(api);
     drop(data_lock);
     say(out, "stopped");
     Ok(exit)
+}
+
+/// How a signed-in stretch of the loop ended.
+enum End {
+    /// The loop stops, with this exit code.
+    Exit(Exit),
+    /// Signed out through the local API (the device is revoked): the account is forgotten and the loop waits for a
+    /// sign-in. The reply goes out once it is done.
+    SignedOut(tokio::sync::oneshot::Sender<Result<(), AgentError>>),
+}
+
+/// How the wait for a sign-in ended.
+enum SignedOut {
+    SignedIn,
+    Stop,
+}
+
+/// Signed out: the loop keeps its status heartbeat and waits for a sign-in through the local API, or a stop (the first
+/// one stops: nothing is running).
+async fn wait_for_sign_in(
+    data: &DataDir,
+    control: &Control,
+    status: &mut Status,
+    commands: &mut mpsc::Receiver<Command>,
+    stop: &mut mpsc::UnboundedReceiver<()>,
+    stop_open: &mut bool,
+    out: &mut impl Write,
+) -> SignedOut {
+    let mut commands_open = true;
+    loop {
+        status.write(LoopState::SignedOut, false, false);
+        let wake = Duration::from_millis(status.next_beat.saturating_sub(status.now()));
+        tokio::select! {
+            command = commands.recv(), if commands_open => match command {
+                Some(Command::Login(request, reply)) => {
+                    let args = LoginArgs {
+                        url: request.server.clone(),
+                        user: request.user.clone(),
+                        folder: request.folder.as_ref().map(std::path::PathBuf::from),
+                        device_name: request.device_name.clone(),
+                        adopt: request.adopt,
+                    };
+                    let result = crate::cli::login_locked(data, &args, &request.password).await;
+                    let signed_in = match &result {
+                        Ok(account) => {
+                            let _ = writeln!(out, "signed in as {} on {} (device \"{}\")", account.username, account.server, account.device_name);
+                            // Signed in before the caller hears it, so the status it reads next says so.
+                            control.set_account(Some(account));
+                            true
+                        }
+                        Err(_) => false,
+                    };
+                    let _ = reply.send(result.map(|_| ()));
+                    if signed_in {
+                        return SignedOut::SignedIn;
+                    }
+                }
+                Some(Command::Logout(_, reply)) => {
+                    let _ = reply.send(Err(AgentError::NotSignedIn));
+                }
+                None => commands_open = false,
+            },
+            signal = stop.recv(), if *stop_open => match signal {
+                Some(()) => return SignedOut::Stop,
+                None => *stop_open = false,
+            },
+            () = tokio::time::sleep(wake) => {}
+        }
+    }
 }
 
 /// Whether a watcher event runs a pass: it does unless every path in it is a file waiting to settle (an event without
@@ -804,6 +992,7 @@ mod tests {
             last_pass: None,
             not_watching: None,
             held: false,
+            control: None,
         };
         let next_try = status.now() + 60_000;
         let state = status.state(Phase::Retrying { next_try, message: "offline".into() });
@@ -832,6 +1021,7 @@ mod tests {
             last_pass: None,
             not_watching: None,
             held: false,
+            control: None,
         };
         let at = now_ms() + 60_000;
         status.write(LoopState::Retrying { next_try_ms: at, message: "offline".into() }, false, false);

@@ -3124,3 +3124,32 @@ async fn a_pass_costs_about_the_size_of_the_folder_not_its_square() {
     assert!(lists <= 2 * (FOLDERS as u64 + 1), "{lists} listings for {FOLDERS} folders");
     assert!(b.state().base.path_builds() <= builds, "a pass with nothing to do builds no index");
 }
+
+/// Emptying a live document (`live reset-doc`) is a generation of the live service only: the file sync never sees it.
+/// A new space epoch here would make a machine that was offline while another edited and deleted files win with its
+/// stale copies.
+#[tokio::test]
+async fn a_live_reset_doc_leaves_the_file_sync_alone() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "a.txt", b"v1");
+    write(&mut a, "gone.txt", b"delete me");
+    settle(&mut [&mut a, &mut b], 5).await;
+    // B goes offline; A edits and deletes, and syncs.
+    write(&mut a, "a.txt", b"v2 from the laptop");
+    a.fs_mut().remove_file(&path("gone.txt")).unwrap();
+    a.sync_once().await.unwrap();
+    // The admin runs `live reset-doc` on the account's recents of an app.
+    let app = craft_cloud_proto::live::AppName::new("wordcraft").unwrap();
+    let doc = craft_cloud_proto::live::recents_doc(ana.space, &app);
+    server.meta.create_live_doc(ana.space, doc, "recents:wordcraft", None, 0).await.unwrap();
+    let epoch = server.meta.space_info(ana.space).await.unwrap().epoch;
+    server.meta.reset_live_doc(ana.space, doc).await.unwrap();
+    assert_eq!(server.meta.space_info(ana.space).await.unwrap().epoch, epoch, "the file sync's epoch is untouched");
+    settle(&mut [&mut b, &mut a], 5).await;
+    assert_eq!(read(&a, "a.txt"), b"v2 from the laptop", "A's acked edit was overwritten by B's stale copy");
+    assert!(!files(&a).iter().any(|(p, _)| p == "gone.txt"), "A's delete was undone");
+    assert_eq!(read(&b, "a.txt"), b"v2 from the laptop");
+}

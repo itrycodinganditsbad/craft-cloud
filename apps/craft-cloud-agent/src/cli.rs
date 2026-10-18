@@ -83,6 +83,33 @@ pub enum Command {
         #[arg(long)]
         local: bool,
     },
+    /// Show an app's recent files (shared by every machine of the account), or add one, through the running agent.
+    Recents(RecentsArgs),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct RecentsArgs {
+    /// The app, e.g. wordcraft.
+    pub app: String,
+    /// Keep showing the list, again after every change, until stopped (Ctrl-C).
+    #[arg(long)]
+    pub watch: bool,
+    #[command(subcommand)]
+    pub action: Option<RecentsAction>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum RecentsAction {
+    /// Add a file: its path in the synced folder (absolute, or relative to the folder).
+    Add {
+        path: PathBuf,
+        /// Shown in the list instead of the file's name.
+        #[arg(long)]
+        title: Option<String>,
+        /// It was saved (rather than only opened).
+        #[arg(long)]
+        saved: bool,
+    },
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -193,6 +220,9 @@ pub enum AgentError {
     DataInFolder { data: PathBuf, folder: PathBuf },
     #[error("{path}: {source}")]
     Io { path: PathBuf, source: std::io::Error },
+    /// A call to the running agent's local API failed.
+    #[error("{0}")]
+    Local(craft_cloud_app::Error),
 }
 
 impl From<TransportError> for AgentError {
@@ -218,6 +248,14 @@ fn io_at(path: &Path) -> impl FnOnce(std::io::Error) -> AgentError + '_ {
     move |source| AgentError::Io { path: path.to_owned(), source }
 }
 
+fn write_out(out: &mut impl Write, text: std::fmt::Arguments<'_>) -> Result<(), AgentError> {
+    out.write_fmt(text).map_err(io_at(Path::new("standard output")))
+}
+
+macro_rules! say {
+    ($out:expr, $($arg:tt)*) => { write_out($out, format_args!("{}\n", format_args!($($arg)*))) };
+}
+
 /// Runs a parsed command line. Errors are returned for the caller to print; the exit code is
 /// [`Exit::Failed`] for them.
 pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Result<Exit, AgentError> {
@@ -229,7 +267,16 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
                 return Err(already_signed_in(&account));
             }
             let password = read_password(input)?;
-            login(&data, &args, &password, out).await?;
+            match login(&data, &args, &password, out).await {
+                // `run` holds the data folder: it signs in, through its local API.
+                Err(AgentError::Lock(LockError::Busy(path))) => login_through_agent(&data, &args, password, out).await.map_err(|e| match e {
+                    AgentError::Local(craft_cloud_app::Error::NotRunning(_)) => AgentError::Lock(LockError::Busy(path)),
+                    other => other,
+                })?,
+                other => {
+                    other?;
+                }
+            }
             Ok(Exit::Done)
         }
         Command::Sync { approve_deletes } => Ok(sync(&data, Approve::from_flag(approve_deletes), out).await?.0),
@@ -245,10 +292,166 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
             Ok(Exit::Done)
         }
         Command::Logout { local } => {
-            logout(&data, local, out).await?;
+            match logout(&data, local, out).await {
+                Err(AgentError::Lock(LockError::Busy(path))) => {
+                    let data_path = data.path().to_owned();
+                    let status = blocking(move || craft_cloud_app::Client::connect_in(&data_path)?.logout(local)).await.map_err(|e| match e {
+                        AgentError::Local(craft_cloud_app::Error::NotRunning(_)) => AgentError::Lock(LockError::Busy(path)),
+                        other => local_error(other),
+                    })?;
+                    if !status.signed_in {
+                        say!(out, "signed out (through the running agent); the files stay")?;
+                    }
+                }
+                other => other?,
+            }
             Ok(Exit::Done)
         }
+        Command::Recents(args) => recents(&data, args, out).await,
     }
+}
+
+/// Runs a blocking call of `craft-cloud-app` off the runtime.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, craft_cloud_app::Error> + Send + 'static) -> Result<T, AgentError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| AgentError::Usage(format!("the call to the running agent failed: {e}")))?
+        .map_err(AgentError::Local)
+}
+
+/// The local API's refusals as the errors the CLI has for them.
+fn local_error(e: AgentError) -> AgentError {
+    use craft_cloud_proto::local::codes;
+    match e {
+        AgentError::Local(craft_cloud_app::Error::Refused { code, message }) => match code.as_str() {
+            codes::WRONG_PASSWORD => AgentError::WrongPassword,
+            codes::NOT_SIGNED_IN => AgentError::NotSignedIn,
+            codes::OFFLINE => AgentError::Offline(message),
+            _ => AgentError::Usage(message),
+        },
+        other => other,
+    }
+}
+
+/// `login` while `run` runs: the running agent signs in.
+async fn login_through_agent(data: &DataDir, args: &LoginArgs, password: String, out: &mut impl Write) -> Result<(), AgentError> {
+    let folder = args.folder.as_ref().map(|f| std::path::absolute(f).map_err(io_at(f))).transpose()?;
+    let request = craft_cloud_app::LoginRequest {
+        server: args.url.clone(),
+        user: args.user.clone(),
+        password,
+        folder: folder.map(|f| f.display().to_string()),
+        device_name: args.device_name.clone(),
+        adopt: args.adopt,
+    };
+    let data_path = data.path().to_owned();
+    let status = blocking(move || craft_cloud_app::Client::connect_in(&data_path)?.login(&request)).await.map_err(local_error)?;
+    say!(
+        out,
+        "signed in as {} on {} (through the running agent, which syncs {} now)",
+        status.account.unwrap_or_default(),
+        status.server.unwrap_or_default(),
+        status.folder.unwrap_or_default()
+    )
+}
+
+/// `recents <app> [add <path>] [--watch]`: a client of the running agent like an app.
+async fn recents(data: &DataDir, args: RecentsArgs, out: &mut impl Write) -> Result<Exit, AgentError> {
+    let data_path = data.path().to_owned();
+    let client = blocking(move || craft_cloud_app::Client::connect_in(&data_path)).await.map_err(|e| match e {
+        AgentError::Local(craft_cloud_app::Error::NotRunning(why)) => {
+            AgentError::Usage(format!("the agent isn't running ({why}); start `craft-cloud-agent run` first"))
+        }
+        other => other,
+    })?;
+    let app = args.app.clone();
+    if let Some(RecentsAction::Add { path, title, saved }) = args.action {
+        let status = {
+            let c = client.clone();
+            blocking(move || c.status()).await?
+        };
+        let path = relative_to_folder(&path, status.folder.as_deref().map(Path::new))?;
+        let (c, a) = (client.clone(), app.clone());
+        let entry = blocking(move || c.add_recent(&a, craft_cloud_app::NewRecent { path, title, saved })).await.map_err(local_error)?;
+        say!(
+            out,
+            "added to {app}'s recent files: {}{}",
+            entry.path,
+            if status.online { "" } else { " (offline: it reaches the other machines later)" }
+        )?;
+    }
+    if !args.watch {
+        let a = app.clone();
+        let entries = blocking(move || client.recents(&a)).await.map_err(local_error)?;
+        print_recents(out, &app, &entries)?;
+        return Ok(Exit::Done);
+    }
+    // Watching: the list now, then again after every change; while the agent is away (stopped, signed out) it says
+    // so and goes on once the agent is back. Until stopped (Ctrl-C).
+    let (lines, mut printed) = tokio::sync::mpsc::unbounded_channel::<craft_cloud_app::RecentsEvent>();
+    let a = app.clone();
+    let watching = tokio::task::spawn_blocking(move || -> Result<(), craft_cloud_app::Error> {
+        let watch = client.watch_recents(&a)?;
+        if lines.send(craft_cloud_app::RecentsEvent::Changed(watch.entries())).is_err() {
+            return Ok(());
+        }
+        while let Ok(event) = watch.events().recv() {
+            if lines.send(event).is_err() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    });
+    let mut first = true;
+    while let Some(event) = printed.recv().await {
+        match event {
+            craft_cloud_app::RecentsEvent::Changed(entries) => {
+                if !first {
+                    say!(out, "--")?;
+                }
+                first = false;
+                print_recents(out, &app, &entries)?;
+            }
+            craft_cloud_app::RecentsEvent::Unavailable(why) => say!(out, "Craft Cloud isn't available ({why}); still watching")?,
+            craft_cloud_app::RecentsEvent::Available => say!(out, "Craft Cloud is back")?,
+            craft_cloud_app::RecentsEvent::PushStopped(true) => {
+                say!(out, "this list is no longer sent up whole (see the agent's log); new entries still are")?;
+            }
+            craft_cloud_app::RecentsEvent::PushStopped(false) => {}
+        }
+        out.flush().map_err(io_at(Path::new("standard output")))?;
+    }
+    watching.await.map_err(|e| AgentError::Usage(format!("the watch failed: {e}")))?.map_err(|e| local_error(AgentError::Local(e)))?;
+    Ok(Exit::Failed)
+}
+
+/// A path in the synced folder as the local API wants it: relative, `/`-separated. An absolute one must lie in the
+/// folder.
+fn relative_to_folder(path: &Path, folder: Option<&Path>) -> Result<String, AgentError> {
+    let relative = if path.is_absolute() {
+        let folder = folder.ok_or(AgentError::NotSignedIn)?;
+        let (path, folder) = (resolved(path), resolved(folder));
+        path.strip_prefix(&folder)
+            .map(Path::to_owned)
+            .map_err(|_| AgentError::Usage(format!("{} isn't inside the synced folder {}", path.display(), folder.display())))?
+    } else {
+        path.to_owned()
+    };
+    let names: Vec<String> = relative.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    Ok(names.join("/"))
+}
+
+fn print_recents(out: &mut impl Write, app: &str, entries: &[craft_cloud_app::RecentEntry]) -> Result<(), AgentError> {
+    if entries.is_empty() {
+        return say!(out, "no recent files for {app}");
+    }
+    say!(out, "recent files for {app}, newest first:")?;
+    for entry in entries {
+        let saved = entry.saved_ms.map(|ms| format!(", saved {}", show_time(ms))).unwrap_or_default();
+        let title = if entry.path.ends_with(&entry.title) { String::new() } else { format!(" \"{}\"", entry.title) };
+        say!(out, "  {}  {}{title} (on {}{saved})", show_time(entry.opened_ms), entry.path, entry.machine)?;
+    }
+    Ok(())
 }
 
 /// Sends one message to `stop` for every Ctrl-C (and, on Unix, SIGTERM) until the loop is gone. If the signals can't be
@@ -296,14 +499,6 @@ pub fn read_password(input: &mut impl BufRead) -> Result<String, AgentError> {
         return Err(AgentError::Usage("no password on standard input".into()));
     }
     Ok(password)
-}
-
-fn write_out(out: &mut impl Write, text: std::fmt::Arguments<'_>) -> Result<(), AgentError> {
-    out.write_fmt(text).map_err(io_at(Path::new("standard output")))
-}
-
-macro_rules! say {
-    ($out:expr, $($arg:tt)*) => { write_out($out, format_args!("{}\n", format_args!($($arg)*))) };
 }
 
 /// The conflict-copy time: the machine's local time, or UTC marked `Z` when the local offset can't be read.
@@ -371,6 +566,11 @@ fn hold(path: &Path) -> Result<Lock, AgentError> {
 
 /// Takes the data folder's lock (creating the data folder).
 pub(crate) fn hold_data(data: &DataDir) -> Result<Lock, AgentError> {
+    // Every writer of the token files (`login`, `run`) takes this lock first.
+    if cfg!(windows) {
+        let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        check_private_place(data, local.as_deref())?;
+    }
     data.create()?;
     hold(&data.path().join(DATA_LOCK))
 }
@@ -427,16 +627,38 @@ fn resolved(path: &Path) -> PathBuf {
 /// Whether one of the two paths lies inside the other (or they are the same), as the OS resolves them. Names are
 /// compared ignoring case on Windows and macOS, whose filesystems usually do.
 fn nested(a: &Path, b: &Path) -> bool {
-    let fold = |p: &Path| -> Vec<String> {
-        p.components()
-            .map(|c| {
-                let s = c.as_os_str().to_string_lossy();
-                if cfg!(any(windows, target_vendor = "apple")) { s.to_lowercase() } else { s.into_owned() }
-            })
-            .collect()
-    };
-    let (a, b) = (fold(&resolved(a)), fold(&resolved(b)));
+    let (a, b) = (folded(&resolved(a)), folded(&resolved(b)));
     a.starts_with(&b) || b.starts_with(&a)
+}
+
+/// A path's names, ignoring case on Windows and macOS, whose filesystems usually do.
+fn folded(p: &Path) -> Vec<String> {
+    p.components()
+        .map(|c| {
+            let s = c.as_os_str().to_string_lossy();
+            if cfg!(any(windows, target_vendor = "apple")) { s.to_lowercase() } else { s.into_owned() }
+        })
+        .collect()
+}
+
+/// Whether `path` lies inside `base` (or is it), as the OS resolves both.
+fn lies_inside(path: &Path, base: &Path) -> bool {
+    folded(&resolved(path)).starts_with(&folded(&resolved(base)))
+}
+
+/// Windows: the data folder holds the device token (in `account.json`) and the local API's token, and gets the
+/// permissions of the folder it is in. Inside the user's `%LOCALAPPDATA%` only the user (and administrators) can read
+/// it; anywhere else other users may, so it is refused. (Setting an owner-only ACL ourselves would need `unsafe`
+/// calls or a crate that wraps them unchecked here.) Elsewhere the data folder itself is made owner-only (0700).
+fn check_private_place(data: &DataDir, local_app_data: Option<&Path>) -> Result<(), AgentError> {
+    match local_app_data {
+        Some(base) if base.is_absolute() && lies_inside(data.path(), base) => Ok(()),
+        _ => Err(AgentError::Usage(format!(
+            "the agent's data folder {} must be inside your %LOCALAPPDATA% on Windows: elsewhere other users of this computer \
+             may be able to read its sign-in token. Use the default, or a --data-dir (or CRAFT_CLOUD_AGENT_DIR) under %LOCALAPPDATA%",
+            data.path().display()
+        ))),
+    }
 }
 
 /// Refuses a synced folder and a data folder that lie inside one another: the data folder holds the device token,
@@ -448,7 +670,7 @@ fn check_apart(data: &DataDir, folder: &Path) -> Result<(), AgentError> {
     Ok(())
 }
 
-fn already_signed_in(account: &Account) -> AgentError {
+pub(crate) fn already_signed_in(account: &Account) -> AgentError {
     AgentError::Usage(format!(
         "already signed in as {} on {} for {}; run `craft-cloud-agent logout` first",
         account.username,
@@ -461,6 +683,15 @@ fn already_signed_in(account: &Account) -> AgentError {
 /// created revokes it again (best effort) and leaves no account behind.
 pub async fn login(data: &DataDir, args: &LoginArgs, password: &str, out: &mut impl Write) -> Result<Account, AgentError> {
     let _data_lock = hold_data(data)?;
+    let account = login_locked(data, args, password).await?;
+    say!(out, "signed in as {} on {} (device \"{}\")", account.username, account.server, account.device_name)?;
+    say!(out, "syncing {}; run `craft-cloud-agent sync` to sync it", account.folder.display())?;
+    Ok(account)
+}
+
+/// [`login`] for a caller that holds the data folder's lock already: the `run` loop, signing in for the local API.
+/// Prints nothing.
+pub(crate) async fn login_locked(data: &DataDir, args: &LoginArgs, password: &str) -> Result<Account, AgentError> {
     if let Some(account) = data.load_account()? {
         return Err(already_signed_in(&account));
     }
@@ -518,16 +749,13 @@ pub async fn login(data: &DataDir, args: &LoginArgs, password: &str, out: &mut i
         data.save_account(&account)?;
         Ok::<_, AgentError>(account)
     };
-    let account = match setup.await {
-        Ok(account) => account,
+    match setup.await {
+        Ok(account) => Ok(account),
         Err(e) => {
             let _ = transport.revoke(signed_in.device).await;
-            return Err(e);
+            Err(e)
         }
-    };
-    say!(out, "signed in as {} on {} (device \"{}\")", account.username, account.server, account.device_name)?;
-    say!(out, "syncing {}; run `craft-cloud-agent sync` to sync it", account.folder.display())?;
-    Ok(account)
+    }
 }
 
 /// What `sync --approve-deletes` approves.
@@ -935,6 +1163,11 @@ fn print_waiting(out: &mut impl Write, s: &PassSummary) -> Result<(), AgentError
 pub fn status(data: &DataDir, out: &mut impl Write) -> Result<(), AgentError> {
     let Some(account) = data.load_account()? else {
         say!(out, "not signed in")?;
+        if let Ok(Some(loop_status)) = data.load_status()
+            && loop_status.running(now_ms())
+        {
+            say!(out, "agent: running (pid {}), waiting for a sign-in (`craft-cloud-agent login`, or the launcher)", loop_status.pid)?;
+        }
         return Ok(());
     };
     say!(out, "signed in as {} on {}", account.username, account.server)?;
@@ -1005,6 +1238,7 @@ fn describe_loop(state: &LoopState) -> String {
         }
         LoopState::Stopping => "stopping after the running pass".into(),
         LoopState::Stopped => "stopped".into(),
+        LoopState::SignedOut => "not signed in, waiting for a sign-in".into(),
     }
 }
 
@@ -1017,15 +1251,9 @@ pub async fn logout(data: &DataDir, local: bool, out: &mut impl Write) -> Result
     let _data_lock = hold_data(data)?;
     let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
     if !local {
-        let transport = HttpTransport::new(account.server.clone(), &account.token)?;
-        match transport.revoke(account.device).await {
-            Ok(()) | Err(TransportError::Unauthorized | TransportError::NotFound) => {}
-            Err(TransportError::Unavailable(message)) => return Err(AgentError::LogoutOffline(message)),
-            Err(e) => return Err(e.into()),
-        }
+        revoke_device(&account).await?;
     }
-    data.remove_account()?;
-    data.remove_state()?;
+    forget_account(data)?;
     if local {
         say!(
             out,
@@ -1038,6 +1266,24 @@ pub async fn logout(data: &DataDir, local: bool, out: &mut impl Write) -> Result
         say!(out, "signed out of {}", account.server)?;
     }
     say!(out, "the files in {} stay", account.folder.display())?;
+    Ok(())
+}
+
+/// Revokes this device on the server, to sign out. A device the server already revoked (or doesn't know) counts as
+/// done; an unreachable server is [`AgentError::LogoutOffline`], and nothing is changed.
+pub(crate) async fn revoke_device(account: &Account) -> Result<(), AgentError> {
+    let transport = HttpTransport::new(account.server.clone(), &account.token)?;
+    match transport.revoke(account.device).await {
+        Ok(()) | Err(TransportError::Unauthorized | TransportError::NotFound) => Ok(()),
+        Err(TransportError::Unavailable(message)) => Err(AgentError::LogoutOffline(message)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Forgets the account and the sync state here (the files stay). The caller holds the data folder's lock.
+pub(crate) fn forget_account(data: &DataDir) -> Result<(), AgentError> {
+    data.remove_account()?;
+    data.remove_state()?;
     Ok(())
 }
 
@@ -1184,6 +1430,32 @@ mod tests {
             }
             let shown = error.to_string();
             assert_eq!(AgentError::from(error).exit(), exit, "{shown}");
+        }
+    }
+
+    #[test]
+    /// On Windows the data folder must lie inside `%LOCALAPPDATA%` (the rule itself is checked here on every
+    /// platform; `hold_data` applies it on Windows only).
+    fn a_data_folder_outside_the_private_place_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("AppData").join("Local");
+        std::fs::create_dir_all(&local).unwrap();
+        let inside = DataDir::new(local.join("craft-cloud-agent"));
+        assert!(check_private_place(&inside, Some(&local)).is_ok());
+        assert!(check_private_place(&DataDir::new(local.join("Temp/not-yet/made")), Some(&local)).is_ok(), "not made yet is fine");
+        for outside in [dir.path().join("Shared/agent"), dir.path().join("AppData/LocalX/agent"), local.join("../Roaming/agent")] {
+            let e = check_private_place(&DataDir::new(&outside), Some(&local)).unwrap_err();
+            assert!(e.to_string().contains("%LOCALAPPDATA%"), "{}: {e}", outside.display());
+        }
+        assert!(check_private_place(&inside, None).is_err(), "no %LOCALAPPDATA%: refused");
+        assert!(check_private_place(&inside, Some(Path::new("relative"))).is_err());
+        #[cfg(unix)]
+        {
+            // Through a link: as the OS resolves it.
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(dir.path().join("Shared"), &link).unwrap();
+            std::fs::create_dir_all(dir.path().join("Shared")).unwrap();
+            assert!(check_private_place(&DataDir::new(link.join("agent")), Some(&local)).is_err());
         }
     }
 
