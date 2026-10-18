@@ -58,9 +58,14 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
   device, 400 updates, creates and subscribes per connection refilled at 200/s; over them, `too_large` /
   `rate_limited` like the HTTP API.
 - Quota: once a document's log holds 16 MiB (about 30,000 recents adds), every later append is refused with
-  `quota_exceeded` (one-way: the update that crosses the cap is the last one stored). An account holds at most 64 live documents; creating one more is refused with `quota_exceeded` too, and the agent keeps that app's recents on the machine and tries again after a growing pause. The agent keeps every unacked
+  `quota_exceeded` (one-way: the update that crosses the cap is the last one stored). The agent keeps every unacked
   update, retries with a pause growing to about 64 s, and says the document is full.
   `craft-cloud-server live reset-doc <user> <app>` empties the log and raises the space's live generation in the same
   transaction, so every live connection ends at its next ping and every agent starts over and pushes what the log
-  lacks. The file sync's epoch is untouched, so it never sees a reset. Nothing a machine holds is lost. A document whose own history is
-  over the cap stays full until the log can be compacted, which is the real fix.
+  lacks. The file sync's epoch is untouched, so it never sees a reset. Nothing a machine holds is lost. A document
+  whose own history is over the cap stays full until the log can be compacted, which is the real fix.
+- Account caps: at most 64 of an account's live documents may hold updates; the first update to one more is refused
+  with `quota_exceeded`, and the agent handles it like a full document. Documents with no updates (made by following
+  a list) are at most 1,024 per account; a create over that is refused with `quota_exceeded`, and that list stays on
+  the machine and is tried again after a growing pause. A live document can't be deleted yet: `reset-doc` empties
+  one, but machines that hold its updates send them up again.

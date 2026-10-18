@@ -3,8 +3,8 @@
 //! - `account.json`: the server, user, device, device name, synced folder and the device token. Written
 //!   owner-only: mode 0600 on Unix (the data folder itself is 0700). Windows has no mode bits; the default data
 //!   folder is in the user's profile (`%LOCALAPPDATA%`), which only that user (and administrators) can read. A
-//!   `--data-dir` outside the profile on Windows gets that folder's ACL, which may let others read the token:
-//!   keep it in the profile. An OS keychain can come later.
+//!   `--data-dir` outside the profile on Windows is refused, since it would get that folder's ACL, which may let
+//!   others read the token. An OS keychain can come later.
 //! - `state.json`: `{ "schema": 1, "state": <the engine's State>, "last_pass": … }`, written after every pass,
 //!   failed or not. One document, not a table per node: the engine works on the whole state in memory anyway.
 //! - `status.json`: what the `run` loop is doing ([`LoopStatus`]), for `status`; `shown.json`: the set of waiting

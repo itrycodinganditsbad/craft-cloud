@@ -191,10 +191,12 @@ works: open live connections end at their next ping, within 30 s, and connect ag
 
 ### A full recents document
 
-An app's recents log holds at most 16 MiB of updates per account. An account holds at most 64 live documents, one per app today. Once it is full, machines keep their new recents
+An app's recents log holds at most 16 MiB of updates per account. Once it is full, machines keep their new recents
 locally and say so. `craft-cloud-server live --config cc-data/config.toml reset-doc name wordcraft` empties that log;
 every machine then sends up what the emptied log lacks, so nothing any machine holds is lost, and file syncing isn't
-affected. A document whose own history is over 16 MiB stays full until compacting the log is supported.
+affected. A document whose own history is over 16 MiB stays full until compacting the log is supported. An account
+may have 64 live documents holding updates and 1,024 in all (one per app today); past that, new ones stay on the
+machines. Live documents can't be deleted yet.
 
 ## Syncing a folder
 
