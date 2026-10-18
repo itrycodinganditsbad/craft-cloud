@@ -1,5 +1,8 @@
-//! The server's HTTP API (`/api/v1`) as the engine's [`Transport`], plus sign-in and device revocation.
+//! The server's HTTP API (`/api/v1`) as the engine's [`Transport`], plus sign-in, joining with a code ([`join`]),
+//! add-a-computer codes, and listing and revoking devices.
 //!
+//! - **An untrusted certificate** is told apart from other failures where a sign-in or join first reaches the
+//!   server ([`reach`]): rustls' certificate errors are looked for in reqwest's error chain.
 //! - **HTTPS only**, except to a loopback address (`127.0.0.0/8`, `::1`, `localhost`), where a test or a
 //!   server on the same machine needs no certificate. `localhost` is pinned to `127.0.0.1` and `::1` (never
 //!   looked up), so a hosts file or resolver can't send plain HTTP elsewhere. TLS is rustls with the platform's
@@ -32,22 +35,28 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use craft_cloud_proto::api::{
-    CommitRequest, CommitResponse, ErrorBody, InfoResponse, LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse,
-    PROTOCOL_MAX, PROTOCOL_MIN, SpaceResponse, codes,
+    CommitRequest, CommitResponse, DeviceInfo, ErrorBody, InfoResponse, JoinRequest, LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest,
+    MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, PairingCreated, PairingStatus, SpaceResponse, codes,
 };
 use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_PAGE_NODES};
+use craft_cloud_proto::local::MAX_MACHINE_BYTES;
 use craft_cloud_proto::{ChangeSet, ChunkId, DeviceId, ManifestId, Op, PageCursor};
 use craft_cloud_sync::{Transport, TransportError};
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT};
 use reqwest::{Client, Method, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Largest tree or change-feed page, in bytes of JSON: [`MAX_PAGE_NODES`] nodes of at most about 1.5 KiB each
 /// (a 255-byte name that JSON-escapes to twice that, IDs, hashes and numbers), with room to spare.
 pub const MAX_PAGE_JSON_BYTES: usize = 16 * 1024 * 1024;
 /// Largest other answer: a missing-chunk list of [`MAX_MISSING_IDS`] IDs is about 670 KiB.
 pub const MAX_SMALL_JSON_BYTES: usize = 2 * 1024 * 1024;
+/// Most devices of one account the agent reads from the server.
+pub const MAX_DEVICES: usize = 1000;
+/// Longest add-a-computer code the agent takes from the server, in bytes (they are 8 characters).
+const MAX_CODE_BYTES: usize = 64;
 /// Longest server message shown to the user, in characters.
 const MAX_MESSAGE_CHARS: usize = 300;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -125,6 +134,11 @@ impl ServerUrl {
 
     pub fn as_str(&self) -> &str {
         self.0.as_str().trim_end_matches('/')
+    }
+
+    /// The server's host name (or address), without the port: what its certificate names.
+    pub fn host(&self) -> String {
+        self.0.host_str().unwrap_or_default().to_owned()
     }
 
     /// Whether the server is on this machine (plain HTTP is allowed then).
@@ -277,16 +291,66 @@ impl Reqwest {
     }
 }
 
-#[async_trait]
-impl Connection for Reqwest {
-    async fn send(&self, request: Request) -> Result<Answer, TransportError> {
+impl Reqwest {
+    /// Sends `request`, keeping reqwest's own error (so its cause can be looked at).
+    async fn send_reqwest(&self, request: Request) -> Result<Answer, reqwest::Error> {
         let mut req = self.0.request(request.method, request.url).headers(request.headers).timeout(request.timeout);
         if let Some(body) = request.body {
             req = req.body(body);
         }
-        let resp = req.send().await.map_err(network)?;
+        let resp = req.send().await?;
         Ok(Answer { status: resp.status(), headers: resp.headers().clone(), body: Box::new(ReqwestBody(resp)) })
     }
+}
+
+#[async_trait]
+impl Connection for Reqwest {
+    async fn send(&self, request: Request) -> Result<Answer, TransportError> {
+        self.send_reqwest(request).await.map_err(network)
+    }
+}
+
+/// Whether `error` (or anything that caused it) is rustls refusing the server's certificate: one this computer's trust
+/// store doesn't vouch for (a server with its own certificate authority whose root isn't installed here, say).
+pub fn untrusted_certificate(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cause = Some(error);
+    while let Some(e) = cause {
+        if let Some(tls) = e.downcast_ref::<rustls::Error>()
+            && matches!(tls, rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented)
+        {
+            return true;
+        }
+        // An I/O error's own `source` skips the error it wraps.
+        if let Some(inner) = e.downcast_ref::<std::io::Error>().and_then(std::io::Error::get_ref)
+            && untrusted_certificate(inner)
+        {
+            return true;
+        }
+        cause = e.source();
+    }
+    false
+}
+
+/// Why [`reach`] couldn't ask the server what it speaks.
+#[derive(Debug, thiserror::Error)]
+pub enum ReachError {
+    /// The server's certificate isn't one this computer trusts.
+    #[error("the server's certificate isn't trusted on this computer")]
+    UntrustedCertificate,
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+}
+
+/// [`info`], telling an untrusted certificate apart from the other failures: what a sign-in or join asks first, so
+/// the user hears which.
+pub async fn reach(server: &ServerUrl) -> Result<InfoResponse, ReachError> {
+    let connection = Reqwest::new(server)?;
+    let req = request(Method::GET, server.endpoint("info"), None, 0);
+    let answer = connection
+        .send_reqwest(req)
+        .await
+        .map_err(|e| if untrusted_certificate(&e) { ReachError::UntrustedCertificate } else { ReachError::Transport(network(e)) })?;
+    Ok(json(answer, MAX_SMALL_JSON_BYTES).await?)
 }
 
 struct ReqwestBody(reqwest::Response);
@@ -446,6 +510,55 @@ pub async fn login_over<C: Connection>(
     json(connection.send(req).await?, MAX_SMALL_JSON_BYTES).await
 }
 
+/// Why a join ([`join`]) was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum JoinError {
+    /// The code is wrong, expired or used (the server never says which).
+    #[error("the code doesn't work")]
+    InvalidCode,
+    /// An invite to a new account: send it again with a password.
+    #[error("the invite needs a password for the new account")]
+    PasswordRequired,
+    /// The new password breaks the server's rules; the server's message says which.
+    #[error("{0}")]
+    WeakPassword(String),
+    /// Too many failed joins from this address; the server's message.
+    #[error("{0}")]
+    RateLimited(String),
+    #[error(transparent)]
+    Transport(TransportError),
+}
+
+/// Redeems a join code (normalised) for a new device named `device_name`; `password` for an invite to a new account.
+pub async fn join(server: &ServerUrl, code: &str, device_name: &str, password: Option<&str>) -> Result<LoginResponse, JoinError> {
+    join_over(&Reqwest::new(server).map_err(JoinError::Transport)?, server, code, device_name, password).await
+}
+
+/// [`join`] over another connection (a simulated network, in tests).
+pub async fn join_over<C: Connection>(
+    connection: &C,
+    server: &ServerUrl,
+    code: &str,
+    device_name: &str,
+    password: Option<&str>,
+) -> Result<LoginResponse, JoinError> {
+    let body = JoinRequest { code: code.to_owned(), device_name: device_name.to_owned(), password: password.map(str::to_owned) };
+    let req = request(Method::POST, server.endpoint("join"), None, 0).json(&body).map_err(JoinError::Transport)?;
+    let resp = connection.send(req).await.map_err(JoinError::Transport)?;
+    if resp.status.is_success() {
+        return json(resp, MAX_SMALL_JSON_BYTES).await.map_err(JoinError::Transport);
+    }
+    let status = resp.status;
+    let body = body_capped(resp, MAX_SMALL_JSON_BYTES).await.ok().and_then(|b| serde_json::from_slice::<ErrorBody>(&b).ok());
+    Err(match body.as_ref().map(|b| b.error.as_str()) {
+        Some(codes::INVALID_CODE) => JoinError::InvalidCode,
+        Some(codes::PASSWORD_REQUIRED) => JoinError::PasswordRequired,
+        Some(codes::WEAK_PASSWORD) => JoinError::WeakPassword(body.as_ref().map(|b| clean(&b.message)).unwrap_or_default()),
+        Some(codes::RATE_LIMITED) => JoinError::RateLimited(body.as_ref().map(|b| clean(&b.message)).unwrap_or_default()),
+        _ => JoinError::Transport(error_for(status, body)),
+    })
+}
+
 /// Longest `Retry-After` the long-poll honours; a bigger one is cut to this.
 const MAX_RETRY_AFTER_SECS: u64 = 300;
 
@@ -550,6 +663,38 @@ impl<C: Connection> HttpTransport<C> {
     /// Revokes a device of this account (this one, to sign out).
     pub async fn revoke(&self, device: DeviceId) -> Result<(), TransportError> {
         self.no_content(self.request(Method::DELETE, &format!("devices/{device}"), 0)).await
+    }
+
+    /// The account's devices, this one marked `current`.
+    pub async fn devices(&self) -> Result<Vec<DeviceInfo>, TransportError> {
+        let list: Vec<DeviceInfo> = json(self.send(self.request(Method::GET, "devices", MAX_SMALL_JSON_BYTES)).await?, MAX_SMALL_JSON_BYTES).await?;
+        if list.len() > MAX_DEVICES {
+            return Err(TransportError::Protocol(format!("the server listed {} devices, more than the {MAX_DEVICES} this agent reads", list.len())));
+        }
+        Ok(list)
+    }
+
+    /// A new add-a-computer code from this device (replacing its open one).
+    pub async fn create_pairing(&self) -> Result<PairingCreated, TransportError> {
+        let created: PairingCreated = json(self.send(self.request(Method::POST, "pairings", 0)).await?, MAX_SMALL_JSON_BYTES).await?;
+        if created.code.len() > MAX_CODE_BYTES {
+            return Err(TransportError::Protocol("the server sent an add-a-computer code that is too long".into()));
+        }
+        Ok(created)
+    }
+
+    /// Where one of the account's add-a-computer codes stands (`NotFound` once it is gone).
+    pub async fn pairing_status(&self, id: Uuid) -> Result<PairingStatus, TransportError> {
+        let status: PairingStatus = json(self.send(self.request(Method::GET, &format!("pairings/{id}"), 0)).await?, MAX_SMALL_JSON_BYTES).await?;
+        if status.device_name.as_ref().is_some_and(|name| name.len() > MAX_MACHINE_BYTES) {
+            return Err(TransportError::Protocol("the server named a device with a name that is too long".into()));
+        }
+        Ok(status)
+    }
+
+    /// Cancels one of the account's add-a-computer codes.
+    pub async fn delete_pairing(&self, id: Uuid) -> Result<(), TransportError> {
+        self.no_content(self.request(Method::DELETE, &format!("pairings/{id}"), 0)).await
     }
 }
 

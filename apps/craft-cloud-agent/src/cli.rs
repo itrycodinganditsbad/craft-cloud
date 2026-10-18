@@ -32,10 +32,12 @@ use jiff::tz::TimeZone;
 
 use crate::account::{ACCOUNT_SCHEMA, Account, AccountError, DataDir, LastPass, LoopState, Outcome, PassSummary, STATE_SCHEMA, SavedState};
 use crate::disk::{AGENT_DIR, DiskFs, create_private_dir};
-use crate::http::{self, DeviceToken, HttpTransport, ServerUrl};
+use crate::http::{self, DeviceToken, HttpTransport, JoinError, ReachError, ServerUrl};
 use crate::lock::{self, DATA_LOCK, FOLDER_LOCK, Lock, LockError};
 use crate::root::{self, RootError, RootMarker};
 use crate::settle::Stability;
+use craft_cloud_proto::api::LoginResponse;
+use craft_cloud_proto::join::JoinString;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -130,6 +132,23 @@ pub struct LoginArgs {
     pub adopt: bool,
 }
 
+#[derive(Debug, Clone, clap::Args)]
+pub struct JoinArgs {
+    /// The join string: from the server's admin (an invite) or from a signed-in computer (add a computer), e.g.
+    /// cloud.example.com/K7M4-Q9TX or the link https://cloud.example.com/join/K7M4-Q9TX.
+    pub join: String,
+    /// The folder to sync. Default: "Craft Cloud" in your home folder.
+    #[arg(long)]
+    pub folder: Option<PathBuf>,
+    /// This computer's name in the device list and in conflict copy names. Default: the computer's name.
+    #[arg(long, alias = "name")]
+    pub device_name: Option<String>,
+    /// Sync a folder that already has files in it. Files that differ from the server's become conflict
+    /// copies; nothing is deleted.
+    #[arg(long)]
+    pub adopt: bool,
+}
+
 /// How a command ended, as the process exit code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -172,6 +191,7 @@ impl AgentError {
             | AgentError::Server(TransportError::Protocol(_) | TransportError::QuotaExceeded { .. })
             | AgentError::Sync(SyncError::Corrupt(_))
             | AgentError::Account(AccountError::Newer { .. } | AccountError::Damaged { .. }) => Exit::NeedsYou,
+            AgentError::JoinSetup(inner) => inner.exit(),
             _ => Exit::Failed,
         }
     }
@@ -223,6 +243,32 @@ pub enum AgentError {
     /// A call to the running agent's local API failed.
     #[error("{0}")]
     Local(craft_cloud_app::Error),
+    /// `join`: the code is wrong, expired or used; the server never says which.
+    #[error("This code doesn't work any more. Make a new one on a signed-in computer.")]
+    InvalidCode,
+    /// `join`: an invite to a new account, without a password for it.
+    #[error("this invite is for a new account: choose a password for it")]
+    PasswordRequired,
+    /// `join`: the new password breaks the server's rules (its message).
+    #[error("{0}")]
+    WeakPassword(String),
+    /// `join`: too many codes that didn't work from this address (the server's message).
+    #[error("{0}")]
+    TooManyTries(String),
+    #[error(
+        "This computer doesn't trust {host}'s certificate. If the server has a certificate authority of its own \
+         (step-ca, say), install that authority's root certificate on this computer, then try again."
+    )]
+    UntrustedCertificate { host: String },
+    /// `join`: the server can't be reached; nothing was created.
+    #[error("can't reach {server} ({message}); nothing was created. Check the address and that this computer is online, then try again")]
+    Unreachable { server: String, message: String },
+    /// `join`: the code was spent, but setting up this computer failed afterwards; the new device was removed again.
+    #[error("{0}. This code is used up now: make a new one on a signed-in computer, then join again")]
+    JoinSetup(Box<AgentError>),
+    /// Removing the computer the request comes from.
+    #[error("this is the computer you are using: to take it out of your cloud, sign out instead")]
+    CannotRemoveSelf,
 }
 
 impl From<TransportError> for AgentError {
@@ -696,7 +742,63 @@ pub(crate) async fn login_locked(data: &DataDir, args: &LoginArgs, password: &st
         return Err(already_signed_in(&account));
     }
     let server = ServerUrl::parse(&args.url).map_err(|e| AgentError::Usage(e.to_string()))?;
-    let folder = match &args.folder {
+    let prepared = prepare(data, args.folder.as_deref(), args.device_name.as_deref(), args.adopt)?;
+    ask_server(&server, |_, message| AgentError::Offline(message)).await?;
+    let signed_in = match http::login(&server, &args.user, password, &prepared.device_name).await {
+        Err(TransportError::Unauthorized) => return Err(AgentError::WrongPassword),
+        other => other?,
+    };
+    set_up(data, &server, signed_in, prepared).await
+}
+
+/// Joins with a join string (an invite or an add-a-computer code), creates a device and sets up the folder, as
+/// [`login`] does. Everything that can be checked here is checked before the code is spent (the folder, the device
+/// name, what the server speaks); a failure after it (the folder is set up for another space) removes the new device
+/// again, and says the code is used up. `password`: the new account's, for an invite that needs one.
+pub async fn join(data: &DataDir, args: &JoinArgs, password: Option<&str>, out: &mut impl Write) -> Result<Account, AgentError> {
+    let _data_lock = hold_data(data)?;
+    let account = join_locked(data, args, password).await?;
+    say!(out, "joined as {} on {} (device \"{}\")", account.username, account.server, account.device_name)?;
+    say!(out, "syncing {}; run `craft-cloud-agent run` to keep it in sync", account.folder.display())?;
+    Ok(account)
+}
+
+/// [`join`] for a caller that holds the data folder's lock already: the `run` loop, joining for the local API.
+/// Prints nothing.
+pub(crate) async fn join_locked(data: &DataDir, args: &JoinArgs, password: Option<&str>) -> Result<Account, AgentError> {
+    if let Some(account) = data.load_account()? {
+        return Err(already_signed_in(&account));
+    }
+    let join = JoinString::parse(&args.join).map_err(|e| AgentError::Usage(e.to_string()))?;
+    let server = ServerUrl::parse(&join.server).map_err(|e| AgentError::Usage(e.to_string()))?;
+    let prepared = prepare(data, args.folder.as_deref(), args.device_name.as_deref(), args.adopt)?;
+    let unreachable = |server: &ServerUrl, message| AgentError::Unreachable { server: server.to_string(), message };
+    ask_server(&server, unreachable).await?;
+    let signed_in = match http::join(&server, join.code.as_str(), &prepared.device_name, password).await {
+        Ok(signed_in) => signed_in,
+        Err(JoinError::InvalidCode) => return Err(AgentError::InvalidCode),
+        Err(JoinError::PasswordRequired) => return Err(AgentError::PasswordRequired),
+        Err(JoinError::WeakPassword(message)) => return Err(AgentError::WeakPassword(message)),
+        Err(JoinError::RateLimited(message)) => return Err(AgentError::TooManyTries(message)),
+        Err(JoinError::Transport(TransportError::Unavailable(message))) => return Err(unreachable(&server, message)),
+        Err(JoinError::Transport(e)) => return Err(e.into()),
+    };
+    set_up(data, &server, signed_in, prepared).await.map_err(|e| AgentError::JoinSetup(Box::new(e)))
+}
+
+/// What a sign-in or join checked before anything is created on the server.
+struct Prepared {
+    /// The folder to sync, absolute.
+    folder: PathBuf,
+    /// The root marker already in it, if any.
+    existing_marker: Option<RootMarker>,
+    device_name: String,
+}
+
+/// The checks of a sign-in or join that need no server: the folder (not inside the data folder, a folder if it exists,
+/// with files only with `adopt`), its marker if it has one, and the device name.
+fn prepare(data: &DataDir, folder: Option<&Path>, device_name: Option<&str>, adopt: bool) -> Result<Prepared, AgentError> {
+    let folder = match folder {
         Some(folder) => std::path::absolute(folder).map_err(io_at(folder))?,
         None => default_folder()?,
     };
@@ -705,7 +807,7 @@ pub(crate) async fn login_locked(data: &DataDir, args: &LoginArgs, password: &st
         if !folder.is_dir() {
             return Err(AgentError::Usage(format!("{} is not a folder", folder.display())));
         }
-        if !args.adopt && has_files(&folder)? {
+        if !adopt && has_files(&folder)? {
             return Err(AgentError::Usage(format!(
                 "{} already has files in it; pass --adopt to sync them (files that differ from the server's become conflict copies; nothing is deleted)",
                 folder.display()
@@ -713,16 +815,28 @@ pub(crate) async fn login_locked(data: &DataDir, args: &LoginArgs, password: &st
         }
     }
     let existing_marker = root::read(&folder)?;
-    let device_name = args.device_name.clone().unwrap_or_else(default_device_name);
+    let device_name = device_name.map_or_else(default_device_name, str::to_owned);
     if !valid_device_name(&device_name) {
         return Err(AgentError::Usage("device names are 1-128 bytes without control characters".into()));
     }
+    Ok(Prepared { folder, existing_marker, device_name })
+}
 
-    http::check_compatible(&http::info(&server).await?)?;
-    let signed_in = match http::login(&server, &args.user, password, &device_name).await {
-        Err(TransportError::Unauthorized) => return Err(AgentError::WrongPassword),
-        other => other?,
-    };
+/// Asks the server what it speaks and checks this agent speaks it too. A certificate this computer doesn't trust is
+/// [`AgentError::UntrustedCertificate`]; a server that can't be reached is what `unreachable` makes of the message.
+async fn ask_server(server: &ServerUrl, unreachable: impl FnOnce(&ServerUrl, String) -> AgentError) -> Result<(), AgentError> {
+    match http::reach(server).await {
+        Ok(info) => Ok(http::check_compatible(&info)?),
+        Err(ReachError::UntrustedCertificate) => Err(AgentError::UntrustedCertificate { host: server.host() }),
+        Err(ReachError::Transport(TransportError::Unavailable(message))) => Err(unreachable(server, message)),
+        Err(ReachError::Transport(e)) => Err(e.into()),
+    }
+}
+
+/// Sets up the folder for the device the server just created (its marker, the saved account). Any failure revokes
+/// the device again (best effort) and leaves no account behind.
+async fn set_up(data: &DataDir, server: &ServerUrl, signed_in: LoginResponse, prepared: Prepared) -> Result<Account, AgentError> {
+    let Prepared { folder, existing_marker, device_name } = prepared;
     let token = DeviceToken::new(signed_in.token);
     let transport = HttpTransport::new(server.clone(), &token)?;
     let setup = async {

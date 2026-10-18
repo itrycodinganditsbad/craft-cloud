@@ -16,26 +16,31 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::rejection::{JsonRejection, PathRejection};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::{AUTHORIZATION, HOST, ORIGIN};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use craft_cloud_proto::api::{ErrorBody, codes as api_codes};
+use craft_cloud_proto::DeviceId;
+use craft_cloud_proto::api::{DeviceInfo, ErrorBody, PairingStatus, codes as api_codes};
+use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
 use craft_cloud_proto::local::{
-    LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES, RunState, Status, codes, paths,
+    JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES, PairingInfo,
+    RunState, Status, codes, paths,
 };
 use tokio::sync::{mpsc, oneshot};
 
 use crate::account::{Account, DataDir, random_hex, write_atomic};
 use crate::cli::{AgentError, Exit};
+use crate::http::HttpTransport;
 
 /// What the local API asks the `run` loop to do, with where to send the outcome.
 pub enum Command {
     Login(LoginRequest, oneshot::Sender<Result<(), AgentError>>),
+    Join(JoinRequest, oneshot::Sender<Result<(), AgentError>>),
     Logout(LogoutRequest, oneshot::Sender<Result<(), AgentError>>),
     /// Hold syncing and the live connection until [`Command::Resume`], also after a restart.
     Pause(oneshot::Sender<Result<(), AgentError>>),
@@ -144,8 +149,21 @@ impl IntoResponse for LocalError {
 impl From<AgentError> for LocalError {
     fn from(e: AgentError) -> Self {
         let message = e.to_string();
+        // A setup that failed after the code was spent answers as what failed, with the whole message.
+        if let AgentError::JoinSetup(inner) = e {
+            let inner = LocalError::from(*inner);
+            return Self::new(inner.status, inner.code, message);
+        }
         let (status, code) = match &e {
             AgentError::WrongPassword => (StatusCode::UNAUTHORIZED, codes::WRONG_PASSWORD),
+            AgentError::InvalidCode => (StatusCode::NOT_FOUND, codes::INVALID_CODE),
+            AgentError::PasswordRequired => (StatusCode::BAD_REQUEST, codes::PASSWORD_REQUIRED),
+            AgentError::WeakPassword(_) => (StatusCode::BAD_REQUEST, codes::WEAK_PASSWORD),
+            AgentError::TooManyTries(_) => (StatusCode::TOO_MANY_REQUESTS, api_codes::RATE_LIMITED),
+            AgentError::UntrustedCertificate { .. } => (StatusCode::SERVICE_UNAVAILABLE, codes::UNTRUSTED_CERTIFICATE),
+            AgentError::Unreachable { .. } => (StatusCode::SERVICE_UNAVAILABLE, codes::OFFLINE),
+            AgentError::CannotRemoveSelf => (StatusCode::CONFLICT, codes::CANNOT_REMOVE_SELF),
+            AgentError::Server(craft_cloud_sync::TransportError::NotFound) => (StatusCode::NOT_FOUND, api_codes::NOT_FOUND),
             AgentError::NotSignedIn => (StatusCode::CONFLICT, codes::NOT_SIGNED_IN),
             AgentError::Offline(_) | AgentError::LogoutOffline(_) => (StatusCode::SERVICE_UNAVAILABLE, codes::OFFLINE),
             AgentError::Usage(m) if m.starts_with("already signed in") => (StatusCode::CONFLICT, codes::ALREADY_SIGNED_IN),
@@ -241,6 +259,11 @@ fn router(state: Api) -> Router {
         .route(paths::LOGIN, post(login))
         .route(paths::LOGOUT, post(logout))
         .route(paths::RECENTS, get(crate::live::recents_socket))
+        .route(paths::JOIN, post(join))
+        .route(paths::PAIRINGS, post(create_pairing))
+        .route(&format!("{}/{{id}}", paths::PAIRINGS), get(pairing_status).delete(delete_pairing))
+        .route(paths::DEVICES, get(devices))
+        .route(&format!("{}/{{id}}", paths::DEVICES), delete(remove_device))
         .route(paths::PAUSE, post(pause))
         .route(paths::RESUME, post(resume))
         .route(paths::QUIT, post(quit))
@@ -300,6 +323,81 @@ async fn logout(State(state): State<Api>, body: Result<Json<LogoutRequest>, Json
     ask(&state, |reply| Command::Logout(request, reply)).await
 }
 
+async fn join(State(state): State<Api>, body: Result<Json<JoinRequest>, JsonRejection>) -> Result<Json<Status>, LocalError> {
+    let Json(request) = body?;
+    if request.join.len() > MAX_JOIN_BYTES {
+        return Err(LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "that is too long for a join string"));
+    }
+    ask(&state, |reply| Command::Join(request, reply)).await
+}
+
+/// The signed-in account's server API, for the calls the local API makes itself (they touch nothing here).
+fn server_api(state: &ApiState) -> Result<(Account, HttpTransport), LocalError> {
+    let account = state.control.account().ok_or(AgentError::NotSignedIn)?;
+    let transport = HttpTransport::new(account.server.clone(), &account.token).map_err(AgentError::from)?;
+    Ok((account, transport))
+}
+
+/// A path's ID, or `400 invalid`.
+fn path_id<T>(id: Result<Path<T>, PathRejection>) -> Result<T, LocalError> {
+    id.map(|Path(id)| id).map_err(|e| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, e.body_text()))
+}
+
+/// The server's `not_found` for an add-a-computer code: it is gone.
+fn pairing_gone(e: craft_cloud_sync::TransportError) -> LocalError {
+    match e {
+        craft_cloud_sync::TransportError::NotFound => LocalError::new(
+            StatusCode::NOT_FOUND,
+            api_codes::NOT_FOUND,
+            "that add-a-computer code is gone (used, cancelled, replaced by a newer one, or expired)",
+        ),
+        other => AgentError::from(other).into(),
+    }
+}
+
+async fn create_pairing(State(state): State<Api>) -> Result<Json<PairingInfo>, LocalError> {
+    let (account, transport) = server_api(&state)?;
+    let created = transport.create_pairing().await.map_err(AgentError::from)?;
+    let code = Code::parse(&created.code, PAIRING_CHARS).ok_or_else(|| {
+        AgentError::from(craft_cloud_sync::TransportError::Protocol("the server sent an add-a-computer code that doesn't read".into()))
+    })?;
+    let join = JoinString::new(account.server.as_str(), code);
+    Ok(Json(PairingInfo { id: created.id, join: join.join(), link: join.link(), expires_ms: created.expires_ms }))
+}
+
+async fn pairing_status(State(state): State<Api>, id: Result<Path<uuid::Uuid>, PathRejection>) -> Result<Json<PairingStatus>, LocalError> {
+    let id = path_id(id)?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.pairing_status(id).await.map_err(pairing_gone)?))
+}
+
+async fn delete_pairing(State(state): State<Api>, id: Result<Path<uuid::Uuid>, PathRejection>) -> Result<StatusCode, LocalError> {
+    let id = path_id(id)?;
+    let (_, transport) = server_api(&state)?;
+    transport.delete_pairing(id).await.map_err(pairing_gone)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn devices(State(state): State<Api>) -> Result<Json<Vec<DeviceInfo>>, LocalError> {
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.devices().await.map_err(AgentError::from)?))
+}
+
+/// Removes (revokes) another computer of the account; answered with the list as it is then. This computer can't be
+/// removed this way: that is signing out.
+async fn remove_device(State(state): State<Api>, id: Result<Path<DeviceId>, PathRejection>) -> Result<Json<Vec<DeviceInfo>>, LocalError> {
+    let id = path_id(id)?;
+    let (account, transport) = server_api(&state)?;
+    if id == account.device {
+        return Err(AgentError::CannotRemoveSelf.into());
+    }
+    transport.revoke(id).await.map_err(|e| match e {
+        craft_cloud_sync::TransportError::NotFound => LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such computer in this cloud"),
+        other => AgentError::from(other).into(),
+    })?;
+    Ok(Json(transport.devices().await.map_err(AgentError::from)?))
+}
+
 async fn pause(State(state): State<Api>) -> Result<Json<Status>, LocalError> {
     ask(&state, Command::Pause).await
 }
@@ -334,5 +432,14 @@ mod tests {
         assert_eq!(code(AgentError::Usage("already signed in as ana".into())), codes::ALREADY_SIGNED_IN);
         assert_eq!(code(AgentError::Usage("not a URL".into())), api_codes::INVALID);
         assert_eq!(code(AgentError::Revoked), codes::NEEDS_YOU);
+        assert_eq!(code(AgentError::InvalidCode), codes::INVALID_CODE);
+        assert_eq!(code(AgentError::PasswordRequired), codes::PASSWORD_REQUIRED);
+        assert_eq!(code(AgentError::WeakPassword("x".into())), codes::WEAK_PASSWORD);
+        assert_eq!(code(AgentError::CannotRemoveSelf), codes::CANNOT_REMOVE_SELF);
+        assert_eq!(code(AgentError::UntrustedCertificate { host: "h".into() }), codes::UNTRUSTED_CERTIFICATE);
+        assert_eq!(code(AgentError::Unreachable { server: "s".into(), message: "m".into() }), codes::OFFLINE);
+        let after = LocalError::from(AgentError::JoinSetup(Box::new(AgentError::Revoked)));
+        assert_eq!(after.code, codes::NEEDS_YOU, "as what failed");
+        assert!(after.message.contains("make a new one"), "{}", after.message);
     }
 }

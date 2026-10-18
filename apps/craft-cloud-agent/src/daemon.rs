@@ -34,7 +34,7 @@ use tokio::sync::{mpsc, watch};
 use craft_cloud_proto::local::RunState;
 
 use crate::account::{Approval, DataDir, LastPass, LoopState, LoopStatus, PassSummary, STATUS_SCHEMA};
-use crate::cli::{AgentError, Exit, LoginArgs, Session, hold_data, now_ms, print_summary};
+use crate::cli::{AgentError, Exit, JoinArgs, LoginArgs, Session, hold_data, now_ms, print_summary};
 use crate::http::{Connection, HttpTransport, PollError};
 use crate::live::{Hub, HubConfig};
 use crate::local_api::{Command, Control, LocalApi};
@@ -780,7 +780,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                     None => stop_open = false,
                 },
                 command = commands.recv(), if commands_open => match command {
-                    Some(Command::Login(_, reply)) => {
+                    Some(Command::Login(_, reply) | Command::Join(_, reply)) => {
                         let _ = reply.send(Err(crate::cli::already_signed_in(&account)));
                     }
                     // Signed out on the server first (an unreachable server changes nothing, and syncing goes on); then
@@ -929,17 +929,19 @@ async fn wait_for_sign_in(
                         adopt: request.adopt,
                     };
                     let result = crate::cli::login_locked(data, &args, &request.password).await;
-                    let signed_in = match &result {
-                        Ok(account) => {
-                            let _ = writeln!(out, "signed in as {} on {} (device \"{}\")", account.username, account.server, account.device_name);
-                            // Signed in before the caller hears it, so the status it reads next says so.
-                            control.set_account(Some(account));
-                            true
-                        }
-                        Err(_) => false,
+                    if signed_in(result, "signed in", control, reply, out) {
+                        return SignedOut::SignedIn;
+                    }
+                }
+                Some(Command::Join(request, reply)) => {
+                    let args = JoinArgs {
+                        join: request.join.clone(),
+                        folder: request.folder.as_ref().map(std::path::PathBuf::from),
+                        device_name: request.device_name.clone(),
+                        adopt: request.adopt,
                     };
-                    let _ = reply.send(result.map(|_| ()));
-                    if signed_in {
+                    let result = crate::cli::join_locked(data, &args, request.password.as_deref()).await;
+                    if signed_in(result, "joined", control, reply, out) {
                         return SignedOut::SignedIn;
                     }
                 }
@@ -959,6 +961,27 @@ async fn wait_for_sign_in(
             () = tokio::time::sleep(wake) => {}
         }
     }
+}
+
+/// Hands a sign-in's or join's outcome to the caller: `true` once signed in (as which account is said, and the local
+/// API's status says so before the caller hears it).
+fn signed_in(
+    result: Result<crate::account::Account, AgentError>,
+    how: &str,
+    control: &Control,
+    reply: tokio::sync::oneshot::Sender<Result<(), AgentError>>,
+    out: &mut impl Write,
+) -> bool {
+    let done = match &result {
+        Ok(account) => {
+            let _ = writeln!(out, "{how} as {} on {} (device \"{}\")", account.username, account.server, account.device_name);
+            control.set_account(Some(account));
+            true
+        }
+        Err(_) => false,
+    };
+    let _ = reply.send(result.map(|_| ()));
+    done
 }
 
 /// Whether a watcher event runs a pass: it does unless every path in it is a file waiting to settle (an event without

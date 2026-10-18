@@ -10,8 +10,8 @@ use craft_cloud_agent::cli::{self, AgentError, Exit};
 use craft_cloud_agent::daemon::{RunOptions, run_loop};
 use craft_cloud_agent::schedule::Timing;
 use craft_cloud_meta::{Meta, Role};
-use craft_cloud_proto::api::ErrorBody;
-use craft_cloud_proto::local::{LOCAL_API_FILE, LocalApiFile, LoginRequest, RunState, Status, codes};
+use craft_cloud_proto::api::{DeviceInfo, ErrorBody, PairingState, PairingStatus};
+use craft_cloud_proto::local::{JoinRequest, LOCAL_API_FILE, LocalApiFile, LoginRequest, PairingInfo, RunState, Status, codes};
 use craft_cloud_server::AppState;
 use craft_cloud_server::auth::hash_password;
 use craft_cloud_store::Store;
@@ -158,6 +158,12 @@ const ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/pause"),
     ("POST", "/v1/resume"),
     ("POST", "/v1/quit"),
+    ("POST", "/v1/join"),
+    ("POST", "/v1/pairings"),
+    ("GET", "/v1/pairings/0192f0c4-0000-7000-8000-000000000000"),
+    ("DELETE", "/v1/pairings/0192f0c4-0000-7000-8000-000000000000"),
+    ("GET", "/v1/devices"),
+    ("DELETE", "/v1/devices/0192f0c4-0000-7000-8000-000000000000"),
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -485,4 +491,188 @@ async fn recents_added_while_paused_reach_the_server_after_resume() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let _ = running.stop().await;
+}
+
+// ---- joining with a code ----
+
+/// A second machine: its own data folder and synced folder, `run` started and signed out.
+struct Machine {
+    data: DataDir,
+    folder: PathBuf,
+    running: Option<Running>,
+    api: LocalApiFile,
+    _dir: tempfile::TempDir,
+}
+
+impl Machine {
+    async fn signed_out() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path().join("data"));
+        let folder = dir.path().join("Craft Cloud");
+        let running = Running::start(&data);
+        let api = api_file(data.path()).await;
+        Self { data, folder, running: Some(running), api, _dir: dir }
+    }
+
+    fn join_body(&self, join: &str, adopt: bool, password: Option<&str>) -> String {
+        serde_json::to_string(&JoinRequest {
+            join: join.into(),
+            folder: Some(self.folder.display().to_string()),
+            device_name: Some("lptp1".into()),
+            adopt,
+            password: password.map(str::to_owned),
+        })
+        .unwrap()
+    }
+
+    fn join(&self, join: &str, adopt: bool, password: Option<&str>) -> (u16, String) {
+        call(&self.api, "POST", "/v1/join", &self.join_body(join, adopt, password))
+    }
+
+    async fn stop(mut self) {
+        if let Some(running) = self.running.take() {
+            let _ = running.stop().await;
+        }
+    }
+}
+
+fn new_pairing(api: &LocalApiFile) -> PairingInfo {
+    let (code, body) = call(api, "POST", "/v1/pairings", "");
+    assert_eq!(code, 200, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+fn pairing_status(api: &LocalApiFile, id: uuid::Uuid) -> PairingStatus {
+    let (code, body) = call(api, "GET", &format!("/v1/pairings/{id}"), "");
+    assert_eq!(code, 200, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+fn devices(api: &LocalApiFile) -> Vec<DeviceInfo> {
+    let (code, body) = call(api, "GET", "/v1/devices", "");
+    assert_eq!(code, 200, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+/// Machine A, signed in, makes an add-a-computer code; machine B joins with it through its local API and syncs; A
+/// sees who joined, lists both computers and removes B, which then shows that it was removed. A can't remove itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_computer_joins_with_a_code_from_the_first() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder: PathBuf = dir.path().join("Craft Cloud");
+    let (running, a) = signed_in(&server, &data, &folder).await;
+    std::fs::write(folder.join("from-a.txt"), "made on A").unwrap();
+    reaches_the_server(&server, "from-a.txt").await;
+
+    let pairing = new_pairing(&a);
+    let parsed = craft_cloud_proto::join::JoinString::parse(&pairing.join).unwrap();
+    assert_eq!(parsed.server, server.url);
+    assert_eq!(craft_cloud_proto::join::JoinString::parse(&pairing.link).unwrap(), parsed);
+    assert!(pairing.link.contains("/join/"), "{}", pairing.link);
+    assert_eq!(pairing_status(&a, pairing.id).state, PairingState::Waiting);
+
+    let b = Machine::signed_out().await;
+    let (code, body) = b.join(&format!(" {} ", pairing.join.to_lowercase()), false, None);
+    assert_eq!(code, 200, "{body}");
+    let joined: Status = serde_json::from_str(&body).unwrap();
+    assert!(joined.signed_in);
+    assert_eq!((joined.account.as_deref(), joined.machine.as_deref()), (Some("ana"), Some("lptp1")));
+    assert!(!body.contains(parsed.code.as_str()), "the code isn't echoed");
+    assert_eq!(pairing_status(&a, pairing.id), PairingStatus { state: PairingState::Used, device_name: Some("lptp1".into()) });
+    eventually("A's file reaches B", || b.folder.join("from-a.txt").exists()).await;
+    // Signed in, B can't join again.
+    let (code, body) = b.join(&pairing.join, false, None);
+    assert_eq!((code, error_code(&body).as_str()), (409, codes::ALREADY_SIGNED_IN), "{body}");
+
+    let both = devices(&a);
+    assert_eq!(both.len(), 2, "{both:?}");
+    let me = both.iter().find(|d| d.current).unwrap();
+    let other = both.iter().find(|d| !d.current).unwrap();
+    assert_eq!(other.name, "lptp1");
+    let (code, body) = call(&a, "DELETE", &format!("/v1/devices/{}", me.id), "");
+    assert_eq!((code, error_code(&body).as_str()), (409, codes::CANNOT_REMOVE_SELF), "{body}");
+    let (code, body) = call(&a, "DELETE", &format!("/v1/devices/{}", other.id), "");
+    assert_eq!(code, 200, "{body}");
+    let left: Vec<DeviceInfo> = serde_json::from_str(&body).unwrap();
+    assert!(left.iter().any(|d| d.id == other.id && d.revoked), "{left:?}");
+    // B finds out at its next request.
+    std::fs::write(b.folder.join("from-b.txt"), "made on B").unwrap();
+    eventually(
+        "B says it was removed",
+        || matches!(status(&b.api).run_state, RunState::Paused { ref reason } if reason.contains("no longer accepts")),
+    )
+    .await;
+    b.stop().await;
+    let _ = running.stop().await;
+}
+
+/// What can be checked before the code is spent is checked first: a folder with files and no `adopt` leaves the code
+/// usable. What can only fail after it (a marker for another space in the folder) removes the new device again and
+/// says to make a new code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_problems_found_before_the_code_is_spent_leave_it_usable() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder: PathBuf = dir.path().join("Craft Cloud");
+    let (running, a) = signed_in(&server, &data, &folder).await;
+    let b = Machine::signed_out().await;
+    let pairing = new_pairing(&a);
+
+    std::fs::create_dir_all(&b.folder).unwrap();
+    std::fs::write(b.folder.join("mine.txt"), "already here").unwrap();
+    let (code, body) = b.join(&pairing.join, false, None);
+    assert_eq!(code, 400, "{body}");
+    assert!(body.contains("adopt") || body.contains("files in it"), "{body}");
+    assert_eq!(pairing_status(&a, pairing.id).state, PairingState::Waiting, "the code is still good");
+    // Garbage never reaches the server.
+    for bad in ["cloud.example.com", "K7M4-Q9TX", "cloud.example.com/K7M4-Q9TU", ""] {
+        let (code, body) = b.join(bad, true, None);
+        assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{bad:?}: {body}");
+    }
+    // A code that doesn't work: the server's one answer.
+    let wrong = craft_cloud_proto::join::JoinString::new(server.url.clone(), craft_cloud_proto::join::Code::generate(8).unwrap());
+    let (code, body) = b.join(&wrong.join(), true, None);
+    assert_eq!((code, error_code(&body).as_str()), (404, codes::INVALID_CODE), "{body}");
+    assert!(body.contains("Make a new one on a signed-in computer"), "{body}");
+
+    // A marker for another space: only found once the new device knows its space.
+    let other = craft_cloud_agent::root::RootMarker { space: craft_cloud_proto::SpaceId::generate(), root: craft_cloud_proto::NodeId::generate() };
+    craft_cloud_agent::root::write(&b.folder, &other).unwrap();
+    let (code, body) = b.join(&pairing.join, true, None);
+    assert_ne!(code, 200, "{body}");
+    assert!(body.contains("make a new one"), "{body}");
+    assert!(b.data.load_account().unwrap().is_none());
+    let ana = server.meta.user_by_name("ana").await.unwrap().unwrap();
+    let list = server.meta.list_devices(ana.id).await.unwrap();
+    assert!(list.iter().any(|d| d.name == "lptp1" && d.revoked), "the new device is removed again: {list:?}");
+    assert!(!list.iter().any(|d| d.name == "lptp1" && !d.revoked));
+    assert_eq!(pairing_status(&a, pairing.id).state, PairingState::Used, "spent");
+    b.stop().await;
+    let _ = running.stop().await;
+}
+
+/// An invite to a new account: the agent passes `password_required` on as it is, and joins once a password comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invite_to_a_new_account_asks_for_a_password_through_the_agent() {
+    use craft_cloud_proto::join::{Code, INVITE_CHARS, INVITE_TTL_MS, JoinString};
+    let server = server().await;
+    let invite = Code::generate(INVITE_CHARS).unwrap();
+    let now = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()).unwrap();
+    server.meta.create_invite("cleo", &invite.hash(), now, INVITE_TTL_MS).await.unwrap();
+    let join = JoinString::new(server.url.clone(), invite).link();
+    let b = Machine::signed_out().await;
+    let (code, body) = b.join(&join, false, None);
+    assert_eq!((code, error_code(&body).as_str()), (400, codes::PASSWORD_REQUIRED), "{body}");
+    let (code, body) = b.join(&join, false, Some("short"));
+    assert_eq!((code, error_code(&body).as_str()), (400, codes::WEAK_PASSWORD), "{body}");
+    assert!(b.data.load_account().unwrap().is_none());
+    let (code, body) = b.join(&join, false, Some(PASSWORD));
+    assert_eq!(code, 200, "{body}");
+    assert!(!body.contains(PASSWORD));
+    let joined: Status = serde_json::from_str(&body).unwrap();
+    assert_eq!(joined.account.as_deref(), Some("cleo"));
+    b.stop().await;
 }
