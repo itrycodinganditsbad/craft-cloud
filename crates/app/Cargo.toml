@@ -1,6 +1,6 @@
 [package]
 name = "craft-cloud-app"
-description = "What Craft apps and the launcher link to reach the Craft Cloud agent on this machine: account status, sign-in, recents"
+description = "What Craft apps and the launcher link to reach the Craft Cloud agent on this machine: account status, sign-in, joining, recents"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,6 +14,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tungstenite.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

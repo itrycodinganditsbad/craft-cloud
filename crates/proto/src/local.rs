@@ -272,6 +272,12 @@ impl std::fmt::Debug for PairingInfo {
     }
 }
 
+/// `POST /v1/autostart`: start the agent by itself at login on this computer (`on`), or don't any more.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutostartRequest {
+    pub on: bool,
+}
+
 /// `POST /v1/logout`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogoutRequest {

@@ -241,6 +241,15 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
 - `run` also starts without an account: it waits for a sign-in from the launcher (or `login`), then syncs.
   While `run` runs, `login` and `logout` go through it (it holds the data folder), and a sign-out stops
   syncing and keeps the files.
+- Instead of a password, a machine can join with a code. On a machine that is signed in and running,
+  `craft-cloud-agent add-computer` prints a join string (`cloud.example.org/K7M4-Q9TX`, good once for 10 minutes)
+  and waits; on the new machine, `craft-cloud-agent join cloud.example.org/K7M4-Q9TX` (with `--folder`, `--name`
+  and `--adopt` as for `login`) signs it in. An admin's invite (`user invite`, below) works the same way; for a new
+  account, `join` asks for its password twice on standard input. A code that doesn't work says so, without saying
+  why: make a new one.
+- Through the running agent: `pause` and `resume` syncing (a pause holds across restarts; recents keep working),
+  `quit` the agent, and `devices` to list the account's machines (`devices remove <id>` takes one out; to take this
+  machine out, use `logout`).
 - Recent files, per app, shared by every machine of the account (through the running agent, as an app
   sees them):
 
