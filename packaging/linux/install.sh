@@ -99,7 +99,12 @@ start_after_exit() {
                 eval "set -- \"\$@\" \"--setenv=$name=\${$name}\""
             fi
         done
-        if ! { command -v systemd-run >/dev/null 2>&1 && systemd-run --user --quiet --collect --unit="craft-cloud-agent-run-$$" "$@" "$agent" run --log >/dev/null 2>&1; }; then
+        if command -v systemd-run >/dev/null 2>&1 && systemd-run --user --quiet --collect --unit="craft-cloud-agent-run-$$" "$@" "$agent" run --log >/dev/null 2>&1; then
+            :
+        elif [ -n "${INVOCATION_ID:-}" ]; then
+            # In a unit of its own (this waiter), whatever it starts ends with it: said in the journal instead.
+            echo "Craft Cloud: the agent couldn'"'"'t be started again; run '"'"'craft-cloud-agent run --log'"'"' or log in again" >&2
+        else
             nohup "$agent" run --log >/dev/null 2>&1 &
         fi
     '

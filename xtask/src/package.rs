@@ -325,8 +325,9 @@ mod tests {
             std::fs::write(bin.join("systemctl"), systemctl).unwrap();
             let systemd_run = format!(
                 "#!/bin/sh\nopts=\"\"\nunit=\"\"\nwhile [ \"${{1#--}}\" != \"$1\" ]; do\n  opts=\"$opts $1\"\n  case \"$1\" in --unit=*) unit=${{1#--unit=}} ;; esac\n  shift\ndone\n\
-                 [ -e \"{units}/$unit\" ] && exit 1\necho \"systemd-run$opts\" >> \"{calls}\"\ntouch \"{units}/$unit\"\n\
-                 (\"$@\"; rm -f \"{units}/$unit\") >/dev/null 2>&1 &\n",
+                 [ -e \"{units}/$unit\" ] && exit 1\ncase \"$unit\" in craft-cloud-agent-run-*) [ -e \"{units}/refuse-agent\" ] && exit 1 ;; esac\n\
+                 echo \"systemd-run$opts\" >> \"{calls}\"\ntouch \"{units}/$unit\"\n\
+                 (INVOCATION_ID=test \"$@\" 2>> \"{units}/journal\"; rm -f \"{units}/$unit\") >/dev/null &\n",
                 units = units.display(),
                 calls = calls.display()
             );
@@ -522,6 +523,29 @@ mod tests {
             assert!(!unit.exists(), "round {round}: the waiter has ended");
             up.agent_runs_again(120);
         }
+    }
+
+    /// The agent's own unit can't be made: the waiter, in a unit of its own, starts nothing that would die with it,
+    /// and says so in the journal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_waiter_that_cant_start_the_agents_unit_says_so() {
+        let up = Upgrade::new("refused", 1, 120).without_unit();
+        let lib = up.home.join(".local/lib/craft-cloud");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::copy(up.src.join("craft-cloud-agent"), lib.join("craft-cloud-agent")).unwrap();
+        let units = up.tmp.join("units");
+        std::fs::write(units.join("refuse-agent"), "").unwrap();
+        let out = up.install("2");
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        up.agent_ends();
+        let journal = units.join("journal");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !std::fs::read_to_string(&journal).unwrap_or_default().contains("couldn't be started again") {
+            assert!(std::time::Instant::now() < deadline, "nothing said: {:?}", up.calls());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(!up.calls().iter().any(|c| c.ends_with("run --log")), "{:?}", up.calls());
     }
 
     /// A unit doesn't get the installer's environment: the variables that pick the agent's folders are passed to the
