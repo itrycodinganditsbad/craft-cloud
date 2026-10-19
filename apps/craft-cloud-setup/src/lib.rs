@@ -10,8 +10,8 @@
 //!   `%LOCALAPPDATA%\Programs\craft-cloud` whose agent the `Run` value starts is moved: the new agent's
 //!   `autostart on` points the value at the new folder (read back to check); the old folder's files are left alone.
 //! - **Uninstall** ([`uninstall`]): closes the app and stops the agent as above (fine when it isn't running), removes their
-//!   `Run` values (`Craft Cloud`, `Craft Cloud tray`) where they start this install, the shortcut, the program folder
-//!   and the Uninstall key. The synced folder and the agent's data folder (the sign-in) stay.
+//!   `Run` values (`Craft Cloud`, `Craft Cloud tray`) where they start this install, the shortcut, the app's
+//!   single-instance files, the program folder and the Uninstall key. The synced folder and the agent's data folder (the sign-in) stay.
 //!
 //! The registry and everything that runs a program are behind [`Registry`] and [`Machine`], so the logic is tested
 //! against an in-memory registry and temporary folders on every OS, and against the real registry (under a throwaway
@@ -38,6 +38,8 @@ pub const AGENT_RUN_VALUE: &str = "Craft Cloud";
 pub const APP_RUN_VALUE: &str = "Craft Cloud tray";
 pub const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 pub const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\CraftCloud";
+/// The app's folder for its single-instance files, next to the agent's data folder.
+pub const APP_FILES_DIR: &str = "craft-cloud-app";
 /// The Start-menu shortcut's file.
 pub const SHORTCUT: &str = "Craft Cloud.lnk";
 
@@ -63,6 +65,8 @@ pub struct Places {
     pub uninstall_key: String,
     /// The agent's data folder, where a running agent's `local-api.json` names its pid, port and token.
     pub agent_data: PathBuf,
+    /// The app's single-instance files (`%LOCALAPPDATA%\craft-cloud-app`, next to the agent's data folder).
+    pub app_files: PathBuf,
     /// How long a file still held by a program that is ending is tried again for.
     pub patience: std::time::Duration,
 }
@@ -73,12 +77,15 @@ impl Places {
         let local = var("LOCALAPPDATA")?;
         // As the agent finds it: `CRAFT_CLOUD_AGENT_DIR`, else `%LOCALAPPDATA%\craft-cloud-agent`.
         let agent_data = var("CRAFT_CLOUD_AGENT_DIR").unwrap_or_else(|_| local.join("craft-cloud-agent"));
+        // As the app finds it: next to the agent's data folder.
+        let app_files = agent_data.parent().unwrap_or(&local).join(APP_FILES_DIR);
         Ok(Self {
             programs: local.join("Programs"),
             start_menu: var("APPDATA")?.join("Microsoft").join("Windows").join("Start Menu").join("Programs"),
             run_key: RUN_KEY.to_owned(),
             uninstall_key: UNINSTALL_KEY.to_owned(),
             agent_data,
+            app_files,
             patience: std::time::Duration::from_secs(10),
         })
     }
@@ -289,6 +296,9 @@ pub fn uninstall(places: &Places, registry: &dyn Registry, machine: &dyn Machine
     let shortcut = places.shortcut();
     if shortcut.exists() {
         std::fs::remove_file(&shortcut).map_err(io(&shortcut))?;
+    }
+    if places.app_files.exists() {
+        remove_patiently(&places.app_files, places.patience)?;
     }
     // The files before the "Apps & features" entry: if one can't go, the entry stays, to run it again.
     if dir.exists() {

@@ -87,6 +87,7 @@ fn user(keys: &str) -> User {
         run_key: format!(r"{keys}\Run"),
         uninstall_key: format!(r"{keys}\Uninstall\CraftCloud"),
         agent_data: data.clone(),
+        app_files: local.join(APP_FILES_DIR),
         patience: std::time::Duration::from_millis(300),
     };
     let synced = root.path().join("Craft Cloud");
@@ -216,10 +217,13 @@ fn uninstall_takes_everything_away_but_the_files_and_the_sign_in() {
     registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, &format!("\"{}\" run --log", dir.join(AGENT_BG_EXE).display())).unwrap();
     registry.set_string(&u.places.run_key, APP_RUN_VALUE, &format!("\"{}\" --hidden", dir.join(APP_EXE).display())).unwrap();
     registry.set_string(&u.places.run_key, "Something else", r#""C:\Other\other.exe""#).unwrap();
+    std::fs::create_dir_all(&u.places.app_files).unwrap();
+    std::fs::write(u.places.app_files.join("window.lock"), "").unwrap();
     machine.asked.lock().unwrap().clear();
 
     uninstall(&u.places, &registry, &machine, &u.setup).unwrap();
     assert_eq!(machine.asked(), ["close app", "stop agent"]);
+    assert!(!u.places.app_files.exists(), "the app's single-instance files go");
     assert_eq!(registry.get(&u.places.run_key, AGENT_RUN_VALUE), None);
     assert_eq!(registry.get(&u.places.run_key, APP_RUN_VALUE), None);
     assert!(registry.get(&u.places.run_key, "Something else").is_some(), "other programs' values stay");
