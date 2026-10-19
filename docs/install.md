@@ -12,7 +12,7 @@ The app comes with the agent, and installs for you alone: no admin rights, and n
   it from its context menu (Open) to tell macOS it's fine.
 - **Linux:** unpack `craft-cloud-<version>-linux-x86_64.tar.gz` and run `./install.sh` in it. It installs into
   `~/.local/lib/craft-cloud`, links `craft-cloud` and `craft-cloud-agent` into `~/.local/bin` and adds Craft
-  Cloud to the app menu. Running it again upgrades. `./uninstall.sh` removes it.
+  Cloud to the app menu (`--no-menu` leaves that out). Running it again upgrades. `./uninstall.sh` removes it.
 
 Uninstalling keeps your synced folder and the agent's data folder (the sign-in).
 

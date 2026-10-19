@@ -217,6 +217,21 @@ mod tests {
         assert!(said.contains("agent quit") && said.contains("agent autostart on"), "{said}");
         assert!(!said.contains("agent run"), "an agent that wasn't running isn't started: {said}");
 
+        // Again with --no-menu: the menu entry an earlier install made goes, the rest stays.
+        let again = Command::new("sh")
+            .arg(src.join("install.sh"))
+            .arg("--no-menu")
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(again.status.success(), "{again:?}");
+        assert!(!home.join(".local/share/applications/craft-cloud.desktop").exists(), "no menu entry");
+        assert!(lib.join("craft-cloud").is_file() && home.join(".local/share/icons/hicolor/256x256/apps/craft-cloud.png").is_file());
+        let wrong = Command::new("sh").arg(src.join("install.sh")).arg("--no-such").env_clear().env("HOME", &home).output().unwrap();
+        assert_eq!(wrong.status.code(), Some(2), "{wrong:?}");
+
         let app_files = home.join(".local/share/craft-cloud-app");
         std::fs::create_dir_all(&app_files).unwrap();
         std::fs::write(app_files.join("window.lock"), "").unwrap();

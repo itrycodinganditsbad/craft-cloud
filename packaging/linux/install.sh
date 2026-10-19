@@ -2,11 +2,23 @@
 # Installs Craft Cloud for this user, from the folder this script is in (the unpacked tarball):
 #   ~/.local/lib/craft-cloud/      craft-cloud (the app) and craft-cloud-agent
 #   ~/.local/bin/                  links to both
-#   ~/.local/share/applications/   craft-cloud.desktop (the app menu's entry)
+#   ~/.local/share/applications/   craft-cloud.desktop (the app menu's entry), unless --no-menu
 #   ~/.local/share/icons/          the icon
 # Run again to upgrade: an agent that runs is stopped first (it finishes the pass under way) and started again after,
 # and an agent that starts at login is pointed at the new copy. Nothing goes on the desktop. uninstall.sh removes it.
+# --no-menu leaves the app menu's entry out (and removes one an earlier install made).
 set -eu
+
+menu=1
+for arg in "$@"; do
+    case "$arg" in
+        --no-menu) menu=0 ;;
+        *)
+            echo "unknown option $arg: use --no-menu" >&2
+            exit 2
+            ;;
+    esac
+done
 
 here=$(cd "$(dirname "$0")" && pwd)
 lib="$HOME/.local/lib/craft-cloud"
@@ -49,7 +61,8 @@ for name in craft-cloud craft-cloud-agent; do
 done
 cp "$here/craft-cloud.png" "$icons/craft-cloud.png"
 
-cat >"$apps/craft-cloud.desktop" <<EOF
+if [ "$menu" = 1 ]; then
+    cat >"$apps/craft-cloud.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Craft Cloud
@@ -60,6 +73,9 @@ Terminal=false
 Categories=Network;FileTransfer;
 StartupWMClass=craft-cloud
 EOF
+else
+    rm -f "$apps/craft-cloud.desktop"
+fi
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$apps" >/dev/null 2>&1 || true
 fi
@@ -77,7 +93,11 @@ if [ "$was_running" = 1 ]; then
     fi
 fi
 
-echo "Craft Cloud is installed in $lib. Open it from the app menu, or run craft-cloud."
+if [ "$menu" = 1 ]; then
+    echo "Craft Cloud is installed in $lib. Open it from the app menu, or run craft-cloud."
+else
+    echo "Craft Cloud is installed in $lib. Run craft-cloud to open it."
+fi
 case ":$PATH:" in
     *":$bin:"*) ;;
     *) echo "($bin isn't on your PATH, so type $bin/craft-cloud to start it from a terminal.)" ;;
