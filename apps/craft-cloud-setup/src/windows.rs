@@ -106,11 +106,25 @@ fn agent_alive(pid: u32) -> Result<bool, String> {
     crate::tasklist_says(ran, pid)
 }
 
-/// Waits up to `within` for the agent `pid` to end; an error as soon as `tasklist` can't tell.
+/// [`agent_alive`], asked again a few times while `tasklist` can't tell (a hiccup).
+fn agent_alive_patiently(pid: u32) -> Result<bool, String> {
+    let mut tries = 0;
+    loop {
+        match agent_alive(pid) {
+            Err(_) if tries < 3 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            answer => return answer,
+        }
+    }
+}
+
+/// Waits up to `within` for the agent `pid` to end; an error when `tasklist` can't tell.
 fn ended(pid: u32, within: Duration) -> Result<bool, String> {
     let deadline = std::time::Instant::now() + within;
     loop {
-        if !agent_alive(pid)? {
+        if !agent_alive_patiently(pid)? {
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
@@ -125,17 +139,18 @@ fn ended(pid: u32, within: Duration) -> Result<bool, String> {
 fn running_agent(data: &Path) -> Result<Option<crate::AgentFile>, String> {
     let Ok(text) = std::fs::read_to_string(data.join("local-api.json")) else { return Ok(None) };
     let Some(file) = crate::agent_file(&text) else { return Ok(None) };
-    Ok(agent_alive(file.pid)?.then_some(file))
+    Ok(agent_alive_patiently(file.pid)?.then_some(file))
 }
 
 impl Machine for ThisMachine {
     fn stop_agent(&self, data: &Path) -> AgentStop {
-        let unknown = |e: String| AgentStop::StillRunning(format!("whether it runs can't be told: {e}"));
+        // Before anything is asked, not knowing whether it runs changes nothing; after, it may be stopping.
         let agent = match running_agent(data) {
             Ok(Some(agent)) => agent,
             Ok(None) => return AgentStop::NotRunning,
-            Err(e) => return unknown(e),
+            Err(e) => return AgentStop::StillRunning(format!("whether it runs can't be told: {e}")),
         };
+        let unknown = |e: String| AgentStop::Unknown(format!("tasklist can't tell: {e}"));
         // Asked first: it finishes the pass under way, for up to a minute.
         let _ = crate::ask_to_quit(&agent);
         match ended(agent.pid, Duration::from_secs(60)) {

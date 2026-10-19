@@ -124,6 +124,9 @@ pub enum AgentStop {
     Stopped,
     /// One runs, and couldn't be stopped (why).
     StillRunning(String),
+    /// One was asked to quit (or ended), and then whether it has ended couldn't be told (why): it may be stopped, so
+    /// it is started again.
+    Unknown(String),
 }
 
 /// Running programs.
@@ -222,6 +225,7 @@ pub fn install(
         AgentStop::NotRunning => false,
         AgentStop::Stopped => true,
         AgentStop::StillRunning(why) => return Err(still_running(&why)),
+        AgentStop::Unknown(why) => return Err(restarted_after(places, registry, machine, &unknown_stop(&why))),
     };
 
     // From here on the agent is stopped: if the install fails, the agent is started again, so this computer keeps
@@ -328,8 +332,10 @@ fn restarted_after(places: &Places, registry: &dyn Registry, machine: &dyn Machi
 pub fn uninstall(places: &Places, registry: &dyn Registry, machine: &dyn Machine, running: &Path) -> Result<(), String> {
     let dir = places.dir();
     machine.close_app();
-    if let AgentStop::StillRunning(why) = machine.stop_agent(&places.agent_data) {
-        return Err(still_running(&why));
+    match machine.stop_agent(&places.agent_data) {
+        AgentStop::NotRunning | AgentStop::Stopped => {}
+        AgentStop::StillRunning(why) => return Err(still_running(&why)),
+        AgentStop::Unknown(why) => return Err(restarted_after(places, registry, machine, &unknown_stop(&why))),
     }
     for value in [AGENT_RUN_VALUE, APP_RUN_VALUE] {
         if registry.get(&places.run_key, value).as_deref().is_some_and(|v| starts_from(v, &dir)) {
@@ -359,6 +365,14 @@ pub fn uninstall(places: &Places, registry: &dyn Registry, machine: &dyn Machine
         }
     }
     registry.remove_key(&places.uninstall_key)
+}
+
+/// What is said when the agent was asked to quit and then whether it ended couldn't be told: nothing else was changed
+/// (and it is started again).
+fn unknown_stop(why: &str) -> String {
+    format!(
+        "Craft Cloud's agent was asked to quit, but whether it has stopped can't be told ({why}). Nothing else was changed: try again in a minute"
+    )
 }
 
 /// What is said when the agent can't be stopped: nothing was changed.

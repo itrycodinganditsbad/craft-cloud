@@ -11,6 +11,8 @@ struct Recorder {
     running: Mutex<bool>,
     /// The agent doesn't stop, even when ended.
     stuck: bool,
+    /// The agent accepts the quit, then whether it has ended can't be told (tasklist fails).
+    unknowable: bool,
     /// Where `autostart on` writes the agent's Run value, as the agent does (for the program it was run as)…
     registry: Option<(Arc<MemoryRegistry>, String)>,
     /// …unless an old agent still running answered it and registered itself.
@@ -37,6 +39,9 @@ impl Machine for Recorder {
         self.note("stop agent".into());
         if self.stuck {
             AgentStop::StillRunning("process 4242 doesn't end".into())
+        } else if self.unknowable {
+            *self.running.lock().unwrap() = false;
+            AgentStop::Unknown("tasklist can't tell: tasklist failed".into())
         } else if std::mem::replace(&mut *self.running.lock().unwrap(), false) {
             AgentStop::Stopped
         } else {
@@ -187,6 +192,33 @@ fn an_install_that_fails_after_the_stop_starts_the_agent_again() {
     let e = install(&u.places, &registry, &machine, V2, &gone, &options(true)).unwrap_err();
     assert!(!e.contains("agent"), "{e}");
     assert_eq!(machine.asked(), ["close app", "stop agent"]);
+}
+
+/// The agent accepts the quit, then tasklist fails: the install and the uninstall stop with nothing else changed,
+/// and the agent (which may be stopping) is started again from the folder its start at login names.
+#[test]
+fn an_agent_asked_to_quit_whose_end_cant_be_told_is_started_again() {
+    let u = user("Test");
+    let registry = MemoryRegistry::default();
+    let old: &[(&str, &[u8])] = &[(APP_EXE, b"app v1"), (AGENT_EXE, b"agent v1"), (AGENT_BG_EXE, b"agent-bg v1")];
+    install(&u.places, &registry, &Recorder::default(), old, &u.setup, &options(true)).unwrap();
+    let value = format!("\"{}\" run --log", u.places.dir().join(AGENT_BG_EXE).display());
+    registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, &value).unwrap();
+    let before = registry.values.lock().unwrap().clone();
+
+    let machine = Recorder { unknowable: true, ..Recorder::default() };
+    *machine.running.lock().unwrap() = true;
+    let e = install(&u.places, &registry, &machine, V2, &u.setup, &options(true)).unwrap_err();
+    assert!(e.contains("can't be told") && e.ends_with("The agent was started again."), "{e}");
+    assert_eq!(machine.asked(), ["close app", "stop agent", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
+    assert_eq!(*registry.values.lock().unwrap(), before);
+    assert_eq!(std::fs::read(u.places.dir().join(AGENT_EXE)).unwrap(), b"agent v1", "the files are the old ones");
+
+    machine.asked.lock().unwrap().clear();
+    let e = uninstall(&u.places, &registry, &machine, &u.setup).unwrap_err();
+    assert!(e.ends_with("The agent was started again."), "{e}");
+    assert_eq!(machine.asked(), ["close app", "stop agent", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
+    assert_eq!(*registry.values.lock().unwrap(), before);
 }
 
 /// BEAST's install, made by hand in `Programs\craft-cloud`: its agent starts at login from there. The new agent takes
