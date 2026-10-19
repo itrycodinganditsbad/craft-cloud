@@ -35,6 +35,9 @@ use craft_cloud_store::Store;
 use craft_cloud_store::memory::MemoryBackend;
 use tokio::sync::broadcast;
 
+#[path = "docs_common/blobs.rs"]
+mod blobs;
+
 struct Rng(u64);
 
 impl Rng {
@@ -118,6 +121,10 @@ fn up_text(frame: &ClientFrame) -> String {
         ClientFrame::Subscribe { after, .. } => format!("subscribe after {after}"),
         ClientFrame::Unsubscribe { .. } => "unsubscribe".into(),
         ClientFrame::Update { client_seq, bytes, .. } => format!("update {client_seq} ({} bytes)", bytes.len()),
+        ClientFrame::Snapshot { upto, manifest, .. } => format!("snapshot upto {upto} (manifest {manifest})"),
+        ClientFrame::Presence { bytes, .. } => format!("presence ({} bytes)", bytes.len()),
+        ClientFrame::SubscribeLog { after, .. } => format!("subscribe the log after {after}"),
+        ClientFrame::CreateDocument { snapshot, .. } => format!("create a document (manifest {snapshot})"),
     }
 }
 
@@ -129,6 +136,10 @@ fn down_text(frame: &ServerFrame) -> String {
         ServerFrame::Subscribed { head, .. } => format!("subscribed head {head}"),
         ServerFrame::Ack { client_seq, seq, .. } => format!("ack {client_seq} as {seq}"),
         ServerFrame::Error { code, message, client_seq, .. } => format!("error {code} {client_seq:?}: {message}"),
+        ServerFrame::Compact { upto, .. } => format!("compact upto {upto}"),
+        ServerFrame::Snapshot { base, manifest, .. } => format!("snapshot base {base} (manifest {manifest})"),
+        ServerFrame::Presence { bytes, .. } => format!("presence ({} bytes)", bytes.len()),
+        ServerFrame::CreatedDocument { kept, .. } => format!("created, kept {kept}"),
     }
 }
 
@@ -308,6 +319,13 @@ impl Sim {
 
     /// Delivers the next frame from machine `m` to the server.
     async fn deliver_up(&mut self, m: usize) {
+        // A snapshot a frame names goes up before it, through the chunk API (as the hub sends it).
+        let api = blobs::ServerBlobs { state: self.state.clone(), space: self.space };
+        if let Some(replica) = self.machines[m].replica.as_mut() {
+            for up in replica.take_uploads() {
+                craft_cloud_agent::live::blobs::upload(&api, &up).await.unwrap();
+            }
+        }
         let Some(conn) = self.machines[m].conn.as_mut() else { return };
         let Some(frame) = conn.up.pop_front() else { return };
         let text = format!("m{m} -> server {}", up_text(&frame));
@@ -337,12 +355,20 @@ impl Sim {
     }
 
     /// Delivers the next frame from the server to machine `m`; `flush`: the machine writes what it learnt.
-    fn deliver_down(&mut self, m: usize, flush: bool) {
+    async fn deliver_down(&mut self, m: usize, flush: bool) {
+        let api = blobs::ServerBlobs { state: self.state.clone(), space: self.space };
         let machine = &mut self.machines[m];
         let (Some(conn), Some(replica)) = (machine.conn.as_mut(), machine.replica.as_mut()) else { return };
         let Some(frame) = conn.down.pop_front() else { return };
         let text = format!("server -> m{m} {}", down_text(&frame));
-        let result = replica.on_frame(frame);
+        let mut result = replica.on_frame(frame);
+        // A snapshot a catch-up starts with is downloaded and handed back (as the hub does).
+        if let Ok(frames) = result.as_mut() {
+            for (doc, manifest) in replica.take_fetches() {
+                let got = craft_cloud_agent::live::blobs::download(&api, &manifest).await.map_err(|e| e.to_string());
+                frames.extend(replica.on_snapshot(doc, manifest, got));
+            }
+        }
         if flush {
             replica.flush().unwrap();
         }
@@ -841,7 +867,7 @@ impl Sim {
                 self.deliver_old(m).await;
                 self.deliver_up(m).await;
                 self.pump(m).await;
-                self.deliver_down(m, true);
+                self.deliver_down(m, true).await;
                 if self.machines[m].conn.is_none() {
                     self.connect(m);
                 }
@@ -1115,7 +1141,7 @@ async fn run(seed: u64) -> Vec<String> {
             40..=54 => sim.pump(m).await,
             55..=79 => {
                 let flush = sim.rng.chance(80);
-                sim.deliver_down(m, flush);
+                sim.deliver_down(m, flush).await;
             }
             80..=86 => sim.connect(m),
             87..=90 => {

@@ -37,6 +37,14 @@ pub struct Limits {
     pub live_burst: u32,
     /// …refilled at this many per second; over it the answer is `rate_limited`.
     pub live_per_sec: u32,
+    /// A live document's log above its snapshot is compacted once it holds more than this many updates…
+    pub compact_updates: u64,
+    /// …or more than this many bytes.
+    pub compact_bytes: u64,
+    /// A device asked to compact that doesn't answer within this long is skipped, and another one asked later.
+    pub compact_timeout: Duration,
+    /// Presence messages one connection may send per document per second (more are dropped).
+    pub presence_per_sec: u32,
 }
 
 impl Default for Limits {
@@ -49,6 +57,10 @@ impl Default for Limits {
             body_time_per_mib: Duration::from_secs(30),
             live_burst: crate::live::UPDATE_BURST,
             live_per_sec: crate::live::UPDATES_PER_SEC,
+            compact_updates: craft_cloud_proto::live::COMPACT_UPDATES,
+            compact_bytes: craft_cloud_proto::live::COMPACT_BYTES,
+            compact_timeout: crate::live::COMPACT_TIMEOUT,
+            presence_per_sec: craft_cloud_proto::live::PRESENCE_PER_SEC,
         }
     }
 }

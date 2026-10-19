@@ -89,8 +89,9 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum LiveAction {
-    /// Empty a user's recents document of an app (one that is full: `quota_exceeded`). Every machine then sends its
-    /// whole document up again, so nothing any machine holds is lost.
+    /// Empty a user's recents document of an app (one that is full: `quota_exceeded`), or, given a document's ID
+    /// instead of an app, that live document of a file. Its log and its snapshot go; every machine then sends its whole
+    /// document up again, so nothing any machine holds is lost.
     ResetDoc { username: String, app: String },
 }
 
@@ -137,7 +138,8 @@ pub enum CliError {
 
 /// Opens the database and blob storage a config names.
 pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
-    let meta = Meta::open(&config.database.url).await?.with_stored_bytes_cap(config.stored_bytes_per_user);
+    let meta =
+        Meta::open(&config.database.url).await?.with_stored_bytes_cap(config.stored_bytes_per_user).with_live_bytes_cap(config.live_bytes_per_user);
     let store = match (&config.storage, config.storage.s3()?) {
         (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
         (StorageConfig::Disk { path }, None) => Store::new(DiskBackend::new(path)?),
@@ -242,6 +244,12 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
         Command::Live { config, action: LiveAction::ResetDoc { username, app } } => {
             let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
             let user = user_id(&meta, &username).await?;
+            if let Ok(id) = app.parse::<uuid::Uuid>() {
+                let doc = craft_cloud_proto::DocId::from_uuid(id);
+                meta.reset_live_doc(user.space, doc).await?;
+                writeln!(out, "emptied the live document {doc} of {}; every machine sends its own again when it next connects", user.username)?;
+                return Ok(());
+            }
             let app = craft_cloud_proto::live::AppName::new(&app).map_err(|e| CliError::Usage(e.to_string()))?;
             let doc = craft_cloud_proto::live::recents_doc(user.space, &app);
             meta.reset_live_doc(user.space, doc).await?;

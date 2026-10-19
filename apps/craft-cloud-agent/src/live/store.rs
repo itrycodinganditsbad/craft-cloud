@@ -22,7 +22,55 @@ pub trait DocStore: Send {
     fn set_aside(&mut self, name: &str) -> io::Result<String>;
     /// Deletes a document file (one that doesn't read at all, once set aside).
     fn remove(&mut self, name: &str) -> io::Result<()>;
+
+    // Documents of files: files of their own kind (an older agent, which reads only the files above, leaves them
+    // alone), each with a journal of the local updates made since it was last written.
+
+    // (By default a store has none, and takes none: one for recents only.)
+
+    /// The names of every document of a file there is (each read with [`DocStore::load_document`], one at a time).
+    fn document_names(&self) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// One document of a file, if there is one.
+    fn load_document(&self, _name: &str) -> io::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    /// Writes a document of a file whole, atomically and durably.
+    fn save_document(&mut self, _name: &str, _bytes: &[u8]) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    /// Appends `record` to the document's journal, durably, before this returns. On an error the journal is cut back
+    /// to where it was, as far as the store can (the caller cuts it back too, and writes the document whole).
+    fn append_journal(&mut self, _name: &str, _record: &[u8]) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    /// Cuts the document's journal to its first `len` bytes (what follows doesn't read, or was never kept), durably.
+    fn truncate_journal(&mut self, _name: &str, _len: usize) -> io::Result<()> {
+        Ok(())
+    }
+    /// The document's journal (empty if it has none).
+    fn load_journal(&self, _name: &str) -> io::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+    /// Empties the document's journal (its updates are in its file now).
+    fn clear_journal(&mut self, _name: &str) -> io::Result<()> {
+        Ok(())
+    }
+    /// [`DocStore::set_aside`], for a document of a file.
+    fn set_aside_document(&mut self, _name: &str) -> io::Result<String> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    /// [`DocStore::remove`], for a document of a file (and its journal).
+    fn remove_document(&mut self, _name: &str) -> io::Result<()> {
+        Ok(())
+    }
 }
+
+/// Documents of files end in this…
+const DOCUMENT_SUFFIX: &str = ".doc";
+/// …and their journals in this.
+const JOURNAL_SUFFIX: &str = ".journal";
 
 /// Most set-aside files kept per store.
 pub const MAX_SET_ASIDE: usize = 3;
@@ -41,8 +89,41 @@ impl DiskStore {
     pub fn open(dir: &Path) -> io::Result<Self> {
         make_private_dirs(dir)?;
         // (Interrupted writes of documents and of set-aside copies.)
-        remove_atomic_temps(dir, |of| of.ends_with(SUFFIX) || of.contains(ASIDE), std::time::Duration::ZERO)?;
+        remove_atomic_temps(dir, |of| of.ends_with(SUFFIX) || of.ends_with(DOCUMENT_SUFFIX) || of.contains(ASIDE), std::time::Duration::ZERO)?;
         Ok(Self { dir: dir.to_owned() })
+    }
+
+    fn set_aside_suffix(&mut self, name: &str, suffix: &str) -> io::Result<String> {
+        let bytes = std::fs::read(self.dir.join(format!("{name}{suffix}")))?;
+        // Unique: the time, then random bytes (two in one millisecond, or a clock gone back, don't collide). Written
+        // like a document (temporary file, fsync, rename, folder fsync).
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let to = self.dir.join(format!("{name}{suffix}{ASIDE}{stamp:013}-{count:08}-{}", crate::account::random_hex(4)?));
+        write_atomic(&to, &bytes, true)?;
+        // Oldest first: the name sorts by its time. Each kind of file keeps its own few.
+        let kind = format!("{suffix}{ASIDE}");
+        let mut aside: Vec<(String, PathBuf)> = std::fs::read_dir(&self.dir)?
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let file = e.file_name().to_str()?.to_owned();
+                let at = file.find(&kind)?;
+                Some((file[at..].to_owned(), e.path()))
+            })
+            .collect();
+        aside.sort();
+        let extra = aside.len().saturating_sub(MAX_SET_ASIDE);
+        for (_, path) in aside.into_iter().take(extra) {
+            std::fs::remove_file(path)?;
+        }
+        Ok(to.display().to_string())
+    }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        std::fs::File::open(&self.dir)?.sync_all()?;
+        Ok(())
     }
 }
 
@@ -78,29 +159,7 @@ impl DocStore for DiskStore {
     }
 
     fn set_aside(&mut self, name: &str) -> io::Result<String> {
-        let bytes = std::fs::read(self.dir.join(format!("{name}{SUFFIX}")))?;
-        // Unique: the time, then random bytes (two in one millisecond, or a clock gone back, don't collide). Written
-        // like a document (temporary file, fsync, rename, folder fsync).
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
-        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let to = self.dir.join(format!("{name}{SUFFIX}{ASIDE}{stamp:013}-{count:08}-{}", crate::account::random_hex(4)?));
-        write_atomic(&to, &bytes, true)?;
-        // Oldest first: the name sorts by its time.
-        let mut aside: Vec<(String, PathBuf)> = std::fs::read_dir(&self.dir)?
-            .filter_map(Result::ok)
-            .filter_map(|e| {
-                let file = e.file_name().to_str()?.to_owned();
-                let at = file.find(ASIDE)?;
-                Some((file[at..].to_owned(), e.path()))
-            })
-            .collect();
-        aside.sort();
-        let extra = aside.len().saturating_sub(MAX_SET_ASIDE);
-        for (_, path) in aside.into_iter().take(extra) {
-            std::fs::remove_file(path)?;
-        }
-        Ok(to.display().to_string())
+        self.set_aside_suffix(name, SUFFIX)
     }
 
     fn remove(&mut self, name: &str) -> io::Result<()> {
@@ -108,6 +167,93 @@ impl DocStore for DiskStore {
         #[cfg(unix)]
         std::fs::File::open(&self.dir)?.sync_all()?;
         Ok(())
+    }
+
+    fn document_names(&self) -> io::Result<Vec<String>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+            if let Some(doc) = name.strip_suffix(DOCUMENT_SUFFIX)
+                && !name.starts_with('.')
+                && entry.file_type()?.is_file()
+            {
+                out.push(doc.to_owned());
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    fn load_document(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        match std::fs::read(self.dir.join(format!("{name}{DOCUMENT_SUFFIX}"))) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn save_document(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        write_atomic(&self.dir.join(format!("{name}{DOCUMENT_SUFFIX}")), bytes, true)
+    }
+
+    fn append_journal(&mut self, name: &str, record: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        let path = self.dir.join(format!("{name}{JOURNAL_SUFFIX}"));
+        let new = !path.exists();
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let before = file.metadata()?.len();
+        if let Err(e) = file.write_all(record).and_then(|()| file.sync_data()) {
+            // Not kept: whatever part of it got there goes (a record cut off, or one whose flush failed, must not come
+            // back after a crash as a change the app was told wasn't kept, nor hide the records after it).
+            let _ = file.set_len(before).and_then(|()| file.sync_data());
+            return Err(e);
+        }
+        // A journal made just now: its name is durable too.
+        if new {
+            self.sync_dir()?;
+        }
+        Ok(())
+    }
+
+    fn truncate_journal(&mut self, name: &str, len: usize) -> io::Result<()> {
+        let path = self.dir.join(format!("{name}{JOURNAL_SUFFIX}"));
+        let file = match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if file.metadata()?.len() > len as u64 {
+            file.set_len(len as u64)?;
+            file.sync_data()?;
+        }
+        Ok(())
+    }
+
+    fn load_journal(&self, name: &str) -> io::Result<Vec<u8>> {
+        match std::fs::read(self.dir.join(format!("{name}{JOURNAL_SUFFIX}"))) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn clear_journal(&mut self, name: &str) -> io::Result<()> {
+        match std::fs::remove_file(self.dir.join(format!("{name}{JOURNAL_SUFFIX}"))) {
+            Ok(()) => self.sync_dir(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn set_aside_document(&mut self, name: &str) -> io::Result<String> {
+        self.set_aside_suffix(name, DOCUMENT_SUFFIX)
+    }
+
+    fn remove_document(&mut self, name: &str) -> io::Result<()> {
+        std::fs::remove_file(self.dir.join(format!("{name}{DOCUMENT_SUFFIX}")))?;
+        self.clear_journal(name)?;
+        self.sync_dir()
     }
 }
 
@@ -120,6 +266,49 @@ pub struct MemStore {
     files: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     aside: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     set_aside_count: Arc<std::sync::atomic::AtomicU64>,
+    documents: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    journals: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    /// How journal appends fail from now on ([`JournalFailure`] as a number; 0: they don't), for tests.
+    failing: Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// How a [`MemStore`]'s journal appends fail, for tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalFailure {
+    /// Nothing is written (a full disk).
+    Nothing,
+    /// Half the record is written, and stays (a store that couldn't cut it back).
+    Torn,
+    /// The whole record is written, and stays, but the flush fails.
+    Unflushed,
+}
+
+impl MemStore {
+    /// Makes every journal append fail (`true`, writing nothing) or work again: a full disk, for tests.
+    pub fn fail_journal(&self, fail: bool) {
+        self.fail_journal_as(fail.then_some(JournalFailure::Nothing));
+    }
+
+    /// Makes every journal append fail as `how`, or work again (`None`).
+    pub fn fail_journal_as(&self, how: Option<JournalFailure>) {
+        let n = match how {
+            None => 0,
+            Some(JournalFailure::Nothing) => 1,
+            Some(JournalFailure::Torn) => 2,
+            Some(JournalFailure::Unflushed) => 3,
+        };
+        self.failing.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The journals, by document (for tests that look inside).
+    pub fn journals(&self) -> BTreeMap<String, Vec<u8>> {
+        self.journals.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// The documents of files, by name (for tests that look inside).
+    pub fn documents(&self) -> BTreeMap<String, Vec<u8>> {
+        self.documents.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
 }
 
 impl MemStore {
@@ -155,11 +344,96 @@ impl DocStore for MemStore {
         self.files.lock().unwrap_or_else(PoisonError::into_inner).remove(name);
         Ok(())
     }
+
+    fn document_names(&self) -> io::Result<Vec<String>> {
+        Ok(self.documents().into_keys().collect())
+    }
+
+    fn load_document(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        Ok(self.documents.lock().unwrap_or_else(PoisonError::into_inner).get(name).cloned())
+    }
+
+    fn save_document(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        self.documents.lock().unwrap_or_else(PoisonError::into_inner).insert(name.to_owned(), bytes.to_vec());
+        Ok(())
+    }
+
+    fn append_journal(&mut self, name: &str, record: &[u8]) -> io::Result<()> {
+        let mut journals = self.journals.lock().unwrap_or_else(PoisonError::into_inner);
+        match self.failing.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => {}
+            1 => return Err(io::Error::other("the disk is full (test)")),
+            2 => {
+                journals.entry(name.to_owned()).or_default().extend_from_slice(record.get(..record.len() / 2).unwrap_or_default());
+                return Err(io::Error::other("the disk filled up mid-write (test)"));
+            }
+            _ => {
+                journals.entry(name.to_owned()).or_default().extend_from_slice(record);
+                return Err(io::Error::other("the flush failed (test)"));
+            }
+        }
+        journals.entry(name.to_owned()).or_default().extend_from_slice(record);
+        Ok(())
+    }
+
+    fn truncate_journal(&mut self, name: &str, len: usize) -> io::Result<()> {
+        if let Some(journal) = self.journals.lock().unwrap_or_else(PoisonError::into_inner).get_mut(name) {
+            journal.truncate(len);
+        }
+        Ok(())
+    }
+
+    fn load_journal(&self, name: &str) -> io::Result<Vec<u8>> {
+        Ok(self.journals.lock().unwrap_or_else(PoisonError::into_inner).get(name).cloned().unwrap_or_default())
+    }
+
+    fn clear_journal(&mut self, name: &str) -> io::Result<()> {
+        self.journals.lock().unwrap_or_else(PoisonError::into_inner).remove(name);
+        Ok(())
+    }
+
+    fn set_aside_document(&mut self, name: &str) -> io::Result<String> {
+        let bytes = self.load_document(name)?.ok_or_else(|| io::Error::other("no such file"))?;
+        let mut aside = self.aside.lock().unwrap_or_else(PoisonError::into_inner);
+        let n = self.set_aside_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let to = format!("{n:013}{ASIDE}{name}{DOCUMENT_SUFFIX}");
+        aside.insert(to.clone(), bytes);
+        while aside.len() > MAX_SET_ASIDE {
+            aside.pop_first();
+        }
+        Ok(to)
+    }
+
+    fn remove_document(&mut self, name: &str) -> io::Result<()> {
+        self.documents.lock().unwrap_or_else(PoisonError::into_inner).remove(name);
+        self.clear_journal(name)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recents files and documents of files each keep their own few set-aside copies: many of one kind never push out
+    /// the other's.
+    #[test]
+    fn recents_and_documents_keep_set_aside_copies_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DiskStore::open(dir.path()).unwrap();
+        store.save("recents", b"damaged list").unwrap();
+        store.save_document("doc", b"damaged document").unwrap();
+        store.set_aside("recents").unwrap();
+        for _ in 0..MAX_SET_ASIDE + 2 {
+            store.set_aside_document("doc").unwrap();
+        }
+        let aside: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().to_str().map(str::to_owned))
+            .filter(|n| n.contains(ASIDE))
+            .collect();
+        assert_eq!(aside.iter().filter(|n| n.contains(&format!("{SUFFIX}{ASIDE}"))).count(), 1, "the recents copy stays: {aside:?}");
+        assert_eq!(aside.iter().filter(|n| n.contains(&format!("{DOCUMENT_SUFFIX}{ASIDE}"))).count(), MAX_SET_ASIDE, "{aside:?}");
+    }
 
     /// Setting a file aside copies it (renaming would lose the document to a crash until the next load rebuilt it), the
     /// original stays until the caller writes over it, names are unique (not just by the millisecond), and only the

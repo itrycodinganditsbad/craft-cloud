@@ -33,6 +33,15 @@ full: with less than 4 MiB (one chunk) left, the agent pauses and says the accou
 A cap under 4 MiB is refused when the server starts, since not even one chunk would fit. Per-user quotas on
 file sizes come later, with history.
 
+Live documents have a cap of their own: `live_bytes_per_user` (in bytes; 1 GiB, `1_073_741_824`, by default) is
+the most one account's live documents (recent-file lists and documents of files) may hold together. It counts
+every update in their logs, including the ones a snapshot has replaced: those are kept until retention rules
+arrive, so the total only goes down when the admin resets a document (`live reset-doc`). An update that would go
+over it is refused; the agent keeps it on the machine and tries again later, and the app shows its changes as not
+yet on the server. Snapshots of live documents are uploads like files' content, so they count under
+`stored_bytes_per_user` instead. An account may also hold updates in at most 10,000 documents of files; the first
+change to one more is refused the same way.
+
 To add accounts: `printf '%s\n' 'their password' | craft-cloud-server user --config cc-data/config.toml add name`.
 `--config` can come before or after `add`.
 

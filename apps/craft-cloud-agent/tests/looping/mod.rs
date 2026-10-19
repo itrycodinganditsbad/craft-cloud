@@ -30,7 +30,48 @@ pub struct Gate {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// Copies `from` to `to`, each piece `delay` after it was read (in order: a piece never overtakes the one before).
+async fn delayed_copy(mut from: tokio::net::tcp::OwnedReadHalf, mut to: tokio::net::tcp::OwnedWriteHalf, delay: Duration) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (tx, mut rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+    let reader = tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Ok(n) = from.read(&mut buf).await {
+            if n == 0 || tx.send((Instant::now() + delay, buf[..n].to_vec())).is_err() {
+                return;
+            }
+        }
+    });
+    while let Some((at, piece)) = rx.recv().await {
+        tokio::time::sleep_until(at.into()).await;
+        if to.write_all(&piece).await.is_err() {
+            break;
+        }
+    }
+    reader.abort();
+}
+
 impl Gate {
+    /// A gate that delays every message by `delay` each way (a LAN's latency on loopback).
+    async fn delayed(to: SocketAddr, delay: Duration) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            while let Ok((inbound, _)) = listener.accept().await {
+                let _ = inbound.set_nodelay(true);
+                tokio::spawn(async move {
+                    let Ok(outbound) = tokio::net::TcpStream::connect(to).await else { return };
+                    let _ = outbound.set_nodelay(true);
+                    let (in_read, in_write) = inbound.into_split();
+                    let (out_read, out_write) = outbound.into_split();
+                    tokio::join!(delayed_copy(in_read, out_write, delay), delayed_copy(out_read, in_write, delay));
+                });
+            }
+        });
+        let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        Self { addr, up, generation: std::sync::Arc::default(), task }
+    }
+
     async fn new(to: SocketAddr) -> Self {
         use std::sync::atomic::Ordering;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -89,12 +130,29 @@ pub struct Server {
 
 impl Server {
     pub async fn new() -> Self {
+        Self::start(None, Default::default()).await
+    }
+
+    /// A server whose every message takes `delay` each way (a gate that can't go down).
+    pub async fn delayed(delay: Duration) -> Self {
+        Self::start(Some(delay), Default::default()).await
+    }
+
+    /// A server with other limits (a compaction asked for early, say).
+    pub async fn with_limits(limits: craft_cloud_server::state::Limits) -> Self {
+        Self::start(None, limits).await
+    }
+
+    async fn start(delay: Option<Duration>, limits: craft_cloud_server::state::Limits) -> Self {
         let (db, blobs) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
         meta.create_user("ana", &hash_password(PASSWORD).unwrap(), Role::Member, 0).await.unwrap();
-        let state = AppState::new(meta.clone(), Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![]).unwrap();
+        let state = AppState::new(meta.clone(), Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![]).unwrap().with_limits(limits);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let gate = Gate::new(listener.local_addr().unwrap()).await;
+        let gate = match delay {
+            Some(delay) => Gate::delayed(listener.local_addr().unwrap(), delay).await,
+            None => Gate::new(listener.local_addr().unwrap()).await,
+        };
         tokio::spawn(craft_cloud_server::serve(state, listener, std::future::pending()));
         Self { url: format!("http://{}", gate.addr), gate, meta, _dirs: (db, blobs) }
     }

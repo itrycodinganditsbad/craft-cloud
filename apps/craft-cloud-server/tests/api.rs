@@ -173,6 +173,7 @@ on_every_backend!(
     live_updates_fan_out_to_the_accounts_other_devices,
     live_catch_up_after_a_gap,
     live_a_revoked_device_is_cut_off,
+    live_documents_carry_snapshots_and_presence,
     pairings_are_made_polled_and_cancelled,
     a_pairing_code_signs_a_new_computer_in,
     wrong_expired_and_used_codes_get_the_same_answer,
@@ -237,6 +238,21 @@ async fn upload(s: &Server, token: &str, data: &[u8]) -> ManifestId {
     let m = manifest_for(data);
     assert_eq!(put_manifest(s, token, &m).await.status(), StatusCode::NO_CONTENT);
     m.id()
+}
+
+/// A file's content through the API: its manifest, then each chunk it names.
+async fn download(s: &Server, token: &str, id: &ManifestId) -> Vec<u8> {
+    let get = |path: String| async move {
+        let response = s.client.get(format!("{}/{path}", s.base)).bearer_auth(token).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        response.bytes().await.unwrap()
+    };
+    let manifest = Manifest::decode(&get(format!("manifests/{id}")).await).unwrap();
+    let mut out = Vec::new();
+    for chunk in manifest.chunks() {
+        out.extend_from_slice(&get(format!("chunks/{}", chunk.id)).await);
+    }
+    out
 }
 
 async fn commit(s: &Server, token: &str, ops: &[Op]) -> reqwest::Response {
@@ -1191,6 +1207,43 @@ async fn live_needs_a_device_token(s: &Server) {
     }
     assert_eq!(open_live(s, Some(&token)).await.err(), Some(StatusCode::TOO_MANY_REQUESTS));
     drop(held);
+}
+
+/// Over a real WebSocket: a document of a file made by import with a snapshot bigger than an update may be (uploaded
+/// through the chunk API, named by its manifest), kept once, named to another device catching up (which downloads it
+/// the same way), and presence relayed between them. No message is over an update and its envelope.
+async fn live_documents_carry_snapshots_and_presence(s: &Server) {
+    add_user(s, "ana").await;
+    let (pc_token, laptop_token) = (login(s, "ana").await, login(s, "ana").await);
+    let m = upload(s, &pc_token, b"the file's bytes").await;
+    let node = NodeId::generate();
+    let r = root(s, &pc_token).await;
+    assert_eq!(commit(s, &pc_token, &[create(node, r, "doc1.txt", m)]).await.status(), StatusCode::OK);
+    let doc = craft_cloud_proto::live::node_doc(space_of(s, &pc_token).await.space, node);
+    let mut pc = live_ready(s, &pc_token).await;
+    let mut laptop = live_ready(s, &laptop_token).await;
+    let snapshot: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let manifest = upload(s, &pc_token, &snapshot).await;
+    let app = AppName::new("wordcraft").unwrap();
+    live_send(&mut pc, ClientFrame::CreateDocument { doc, node, app: app.clone(), snapshot: manifest }).await;
+    assert_eq!(live_next(&mut pc).await, Some(ServerFrame::CreatedDocument { doc, kept: true }));
+    let other = upload(s, &laptop_token, &[1; 10]).await;
+    live_send(&mut laptop, ClientFrame::CreateDocument { doc, node, app, snapshot: other }).await;
+    assert_eq!(live_next(&mut laptop).await, Some(ServerFrame::CreatedDocument { doc, kept: false }));
+    let frames = live_subscribe(&mut laptop, doc, 0).await;
+    assert_eq!(frames, vec![ServerFrame::Snapshot { doc, base: 0, manifest }, ServerFrame::Subscribed { doc, head: 0 }]);
+    assert_eq!(download(s, &laptop_token, &manifest).await, snapshot, "the laptop gets the snapshot through the chunk API");
+    live_subscribe(&mut pc, doc, 0).await;
+    live_send(&mut pc, ClientFrame::Presence { doc, bytes: b"cursor at 7".to_vec() }).await;
+    assert_eq!(live_next(&mut laptop).await, Some(ServerFrame::Presence { doc, bytes: b"cursor at 7".to_vec() }));
+    live_quiet(&mut pc).await;
+    // A message over an update and its envelope ends the connection, before `hello` or after.
+    for mut ws in [laptop, open_live(s, Some(&pc_token)).await.unwrap()] {
+        use futures_util::SinkExt;
+        let big = vec![0u8; craft_cloud_proto::live::MAX_FRAME_BYTES + 1];
+        let _ = ws.send(tokio_tungstenite::tungstenite::Message::Binary(big.into())).await;
+        assert_eq!(live_next(&mut ws).await, None, "closed");
+    }
 }
 
 async fn live_hello_checks_the_version(s: &Server) {

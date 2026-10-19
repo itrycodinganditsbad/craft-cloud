@@ -65,16 +65,16 @@ async fn missing_in_space(conn: &mut sqlx::AnyConnection, space: SpaceId, kind: 
 }
 
 /// One blob to record: what it is, how many bytes it is stored as, and (for a manifest) the size of its file.
-struct Blob<'a> {
-    kind: BlobKind,
-    id: &'a [u8; 32],
-    stored_size: i64,
-    file_size: Option<i64>,
+pub(crate) struct Blob<'a> {
+    pub(crate) kind: BlobKind,
+    pub(crate) id: &'a [u8; 32],
+    pub(crate) stored_size: i64,
+    pub(crate) file_size: Option<i64>,
 }
 
 /// Records that `space` has the blob. The first time, its stored size is added to the space's stored bytes, and if
 /// that takes them over `cap`, nothing is recorded (the caller's transaction is dropped, which rolls it back).
-async fn record(tx: &mut sqlx::AnyConnection, space: SpaceId, blob: Blob<'_>, now_ms: i64, cap: Option<u64>) -> Result<(), MetaError> {
+pub(crate) async fn record(tx: &mut sqlx::AnyConnection, space: SpaceId, blob: Blob<'_>, now_ms: i64, cap: Option<u64>) -> Result<(), MetaError> {
     let Blob { kind, id, stored_size, file_size } = blob;
     sqlx::query("INSERT INTO blobs (kind, id, stored_size, file_size, created_ms) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING")
         .bind(kind.code())

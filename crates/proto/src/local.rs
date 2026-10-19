@@ -14,7 +14,8 @@
 //!   `DELETE /v1/pairings/{id}` → 204; `GET /v1/devices` → a list of [`DeviceInfo`](crate::api::DeviceInfo),
 //!   `DELETE /v1/devices/{id}` → the list after; `POST /v1/pause`, `/v1/resume` and `/v1/quit` → [`Status`];
 //!   `POST /v1/autostart` ([`AutostartRequest`]) → [`Status`]; `GET /v1/recents`, upgraded to a WebSocket of JSON
-//!   text messages: [`RecentsRequest`] in, [`RecentsEvent`] out. Errors are the HTTP API's
+//!   text messages: [`RecentsRequest`] in, [`RecentsEvent`] out; `GET /v1/docs`, upgraded to a WebSocket of live
+//!   documents ([`docs`]: [`DocsRequest`] and binary frames in, [`DocsEvent`] and binary frames out). Errors are the HTTP API's
 //!   [`ErrorBody`](crate::api::ErrorBody) with its codes and [`codes`].
 //! - **Versions**: [`Status::api`] is the local API version the agent speaks; a client refuses one outside
 //!   [`LOCAL_API_MIN`]..=[`LOCAL_API_MAX`] when it connects.
@@ -90,6 +91,8 @@ pub mod paths {
     pub const LOGIN: &str = "/v1/login";
     pub const LOGOUT: &str = "/v1/logout";
     pub const RECENTS: &str = "/v1/recents";
+    /// `GET`, upgraded to a WebSocket: live documents ([`super::docs`]).
+    pub const DOCS: &str = "/v1/docs";
     /// `POST`: join with a join string ([`super::JoinRequest`]) → [`super::Status`].
     pub const JOIN: &str = "/v1/join";
     /// `POST`: a new add-a-computer code → [`super::PairingInfo`]; `GET`/`DELETE` `/v1/pairings/{id}`: its state, or
@@ -365,6 +368,136 @@ pub enum RecentsEvent {
     },
 }
 
+/// The live documents WebSocket, `GET /v1/docs`: an app opens files of the synced folder as live documents.
+///
+/// Control messages are JSON text frames ([`DocsRequest`] in, [`DocsEvent`] out); document bytes are binary frames of
+/// `[u8 kind][u64 id, big-endian][bytes]` ([`encode_binary`], [`decode_binary`]), so nothing is base64. `id` is the
+/// number the app gave the document in its `open`; one connection may open many documents.
+///
+/// - `open {id, path, app}` → `opened {id, doc, state}` followed by the document's state (a binary [`STATE`] frame: a
+///   Loro snapshot, then any updates still waiting for their history as [`UPDATE`] frames), or `needs_import {id}`
+///   (the file has never been live: the app sends its content as a binary [`IMPORT`] frame, a Loro snapshot, and then
+///   gets `opened`), or `not_live {id, reason}` (the app saves the file as it always does).
+/// - A binary [`UPDATE`] from the app is its own change; it is answered `ack {id, seq}` once it is on the agent's disk
+///   (`seq` counts the app's updates of that document on this connection, from 1), or `error {id, seq, …}` when the
+///   agent refused it (it doesn't decode, or is over 1 MiB).
+/// - From the agent: remote changes as binary [`UPDATE`] frames and other machines' presence as [`PRESENCE`] frames;
+///   `status {doc, online, waiting, deleted}` when that changes.
+/// - A binary [`PRESENCE`] from the app is relayed to the document's other machines and apps (at most 4 KiB).
+/// - `close {doc}`: the app is done with it (the agent keeps it).
+///
+/// An app that doesn't read for 10 s is dropped; its documents stay with the agent.
+pub mod docs {
+    /// Binary frame kinds.
+    pub const STATE: u8 = 1;
+    pub const UPDATE: u8 = 2;
+    pub const PRESENCE: u8 = 3;
+    pub const IMPORT: u8 = 4;
+    /// The header of a binary frame: kind and id.
+    pub const HEADER_BYTES: usize = 9;
+    /// Largest binary frame (a state or an import: a snapshot), either way.
+    pub const MAX_BINARY_BYTES: usize = crate::live::MAX_SNAPSHOT_BYTES + HEADER_BYTES;
+
+    /// A binary frame.
+    pub fn encode_binary(kind: u8, id: u64, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len().saturating_add(HEADER_BYTES));
+        out.push(kind);
+        out.extend_from_slice(&id.to_be_bytes());
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    /// A binary frame's kind, id and bytes; `None` for one too short to have a header.
+    pub fn decode_binary(frame: &[u8]) -> Option<(u8, u64, &[u8])> {
+        let (&kind, rest) = frame.split_first()?;
+        let id = u64::from_be_bytes(rest.get(..8)?.try_into().ok()?);
+        Some((kind, id, rest.get(8..)?))
+    }
+}
+
+/// A control message from an app on the docs WebSocket ([`docs`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum DocsRequest {
+    /// Open the file at `path` (relative to the synced folder, `/`-separated, or absolute inside it) as a live document
+    /// for `app` (a lowercase app name), under the number `id` on this connection.
+    Open { id: u64, path: String, app: String },
+    /// The app is done with the document.
+    Close { doc: crate::ids::DocId },
+}
+
+/// How a document stands, as `opened` and `status` say it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocState {
+    /// The agent reaches the server and follows the document: edits go out as they are made.
+    pub online: bool,
+    /// Changes made on this machine the server hasn't acked yet.
+    pub waiting: u64,
+    /// The size of the binary state that follows `opened` (0 in `status`).
+    #[serde(default)]
+    pub bytes: u64,
+}
+
+/// Why a file opens as a plain file rather than a live document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotLiveReason {
+    /// It has never been live and the agent can't reach a server that has live documents.
+    Offline,
+    /// The file isn't uploaded yet (the agent started a sync pass for it; open it again later).
+    NotSynced,
+    /// The agent isn't signed in.
+    NotSignedIn,
+    /// The file, or its content as a document, is over the limit for live documents.
+    TooLarge,
+    /// The path isn't a file inside the synced folder.
+    NotInFolder,
+    /// The server's document was reset and its machines haven't sent it back yet: the file is what to open (it is
+    /// live again once one of them has).
+    Resetting,
+}
+
+/// A control message from the agent on the docs WebSocket ([`docs`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum DocsEvent {
+    /// The document is live: its state follows as a binary frame of `state.bytes` bytes.
+    Opened { id: u64, doc: crate::ids::DocId, state: DocState },
+    /// The file has never been live: send its content as a binary import frame.
+    NeedsImport { id: u64 },
+    /// The file opens as a plain file.
+    NotLive {
+        id: u64,
+        reason: NotLiveReason,
+        #[serde(default)]
+        message: Option<String>,
+    },
+    /// The app's update number `seq` of document `id` is on the agent's disk.
+    Ack { id: u64, seq: u64 },
+    /// How an open document stands, when that changes. `deleted`: its file was deleted on this or another machine
+    /// (the document still works; a later open of the same path is a new file and a new document). `stopped`: the
+    /// agent stopped following it until it restarts (Loro failed on it twice); changes made meanwhile are kept.
+    Status {
+        doc: crate::ids::DocId,
+        online: bool,
+        waiting: u64,
+        #[serde(default)]
+        deleted: bool,
+        #[serde(default)]
+        stopped: bool,
+    },
+    /// A request or a binary frame was refused (`id` and `seq` name it when they can). `code` is one of
+    /// [`crate::api::codes`] or [`codes`].
+    Error {
+        #[serde(default)]
+        id: Option<u64>,
+        #[serde(default)]
+        seq: Option<u64>,
+        code: String,
+        message: String,
+    },
+}
+
 /// `path` as a recent file's path: `/`-separated names relative to the synced folder, each a valid [`Name`]
 /// (NFC-normalised; no `.`, `..`, empty or reserved name, no drive letter), at most [`MAX_RECENT_PATH_BYTES`] and
 /// [`MAX_TREE_DEPTH`] names. `None` for anything else.
@@ -489,6 +622,23 @@ mod tests {
         assert!(!older.removed);
         let login: LoginRequest = serde_json::from_value(serde_json::json!({ "server": "s", "user": "u", "password": "p", "extra": 1 })).unwrap();
         assert!(!login.adopt && login.folder.is_none(), "missing optional fields default; unknown ones are ignored");
+    }
+
+    #[test]
+    fn docs_messages_have_a_plain_form() {
+        let frame = docs::encode_binary(docs::UPDATE, 0x0102_0304_0506_0708, b"abc");
+        assert_eq!(frame, vec![2, 1, 2, 3, 4, 5, 6, 7, 8, b'a', b'b', b'c']);
+        assert_eq!(docs::decode_binary(&frame), Some((docs::UPDATE, 0x0102_0304_0506_0708, &b"abc"[..])));
+        assert_eq!(docs::decode_binary(&frame[..9]), Some((docs::UPDATE, 0x0102_0304_0506_0708, &b""[..])));
+        assert_eq!(docs::decode_binary(&frame[..8]), None, "too short for a header");
+        assert_eq!(docs::decode_binary(&[]), None);
+        let open: DocsRequest = serde_json::from_value(serde_json::json!({ "type": "open", "id": 1, "path": "a.txt", "app": "wordcraft" })).unwrap();
+        assert_eq!(open, DocsRequest::Open { id: 1, path: "a.txt".into(), app: "wordcraft".into() });
+        let not_live = serde_json::to_value(DocsEvent::NotLive { id: 1, reason: NotLiveReason::NotSynced, message: None }).unwrap();
+        assert_eq!(not_live, serde_json::json!({ "type": "not_live", "id": 1, "reason": "not_synced", "message": null }));
+        let status: DocsEvent =
+            serde_json::from_value(serde_json::json!({ "type": "status", "doc": uuid::Uuid::nil(), "online": true, "waiting": 2 })).unwrap();
+        assert!(matches!(status, DocsEvent::Status { online: true, waiting: 2, deleted: false, .. }));
     }
 
     #[test]

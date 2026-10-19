@@ -7,7 +7,8 @@ all your machines, and the folder `~/Craft Cloud` stays in sync, with version hi
 There is no hosted service and no account with anyone but you. Nothing phones home.
 
 > **Status: early development.** File sync, shared recent files and the Craft Cloud app work. Live
-> documents (an edit shows on your other machines as you type) are next.
+> documents (an edit shows on your other machines as you type) work in the agent and the server; the apps take
+> them up next.
 
 - **Big files sync quickly.** Files are split into content-defined chunks, so a change to a 20 GB project
   uploads only what changed, and an interrupted upload resumes.

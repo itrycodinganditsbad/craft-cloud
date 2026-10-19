@@ -93,6 +93,41 @@ async fn live_reset_doc_empties_a_full_document() {
     assert!(matches!(cli(&["live", "--config", c, "reset-doc", "nobody", "wordcraft"], "").await, Err(CliError::Usage(_))));
 }
 
+/// `live reset-doc` takes a document's ID too (a document of a file has no app name to find it by), and drops its
+/// snapshot with its log.
+#[tokio::test]
+async fn live_reset_doc_takes_a_document_id_and_drops_its_snapshot() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config_path = dir.join("config.toml");
+    let c = config_path.to_str().unwrap();
+    let (meta, _) = craft_cloud_server::cli::open(&Config::load(&config_path).unwrap()).await.unwrap();
+    let ana = meta.user_by_name("ana").await.unwrap().unwrap();
+    let device = meta.create_device(ana.id, "pc", &[3; 32], 0).await.unwrap();
+    let doc = craft_cloud_proto::DocId::generate();
+    meta.create_live_doc(ana.space, doc, "recents:wordcraft", None, 0).await.unwrap();
+    meta.append_live_update(ana.space, doc, device, 1, &[1; 20], 0).await.unwrap();
+    // A snapshot as an agent uploads one: a chunk, and the manifest naming it.
+    let chunk = craft_cloud_proto::ChunkId::from_bytes([7; 32]);
+    meta.add_chunk(ana.space, &chunk, 31, 0).await.unwrap();
+    let manifest = craft_cloud_proto::Manifest::new(
+        craft_cloud_proto::ChunkerParamsId::new("fastcdc-v1").unwrap(),
+        30,
+        craft_cloud_proto::FileHash::from_bytes([7; 32]),
+        vec![craft_cloud_proto::ChunkRef { id: chunk, len: 30 }],
+    )
+    .unwrap();
+    meta.add_manifest(ana.space, &manifest, 100, 0).await.unwrap();
+    assert!(meta.compact_live_doc(ana.space, doc, 1, &manifest.id()).await.unwrap());
+    let out = cli(&["live", "--config", c, "reset-doc", "ana", &doc.to_string()], "").await.unwrap();
+    assert!(out.contains(&format!("emptied the live document {doc} of ana")), "{out}");
+    let reset = meta.live_doc(ana.space, doc).await.unwrap().unwrap();
+    assert_eq!((reset.head, reset.base, reset.has_snapshot), (0, 0, false));
+    let missing = craft_cloud_proto::DocId::generate().to_string();
+    assert!(cli(&["live", "--config", c, "reset-doc", "ana", &missing], "").await.is_err(), "no such document");
+}
+
 /// `user invite` prints a join string and link to paste on the new computer (with `public_url` set), or the code
 /// and how to finish it (without); a new one replaces the old; `--revoke` ends it.
 #[tokio::test]
