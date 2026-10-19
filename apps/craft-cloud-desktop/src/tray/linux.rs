@@ -241,10 +241,15 @@ pub fn start(clicks: Clicks) -> Result<Option<SniTray>, String> {
     }
 }
 
-/// Registers the item `name` with the watcher on `connection`'s bus.
+/// Registers the item `name` with the watcher on `connection`'s bus. A watcher that refuses it is said on stderr (the
+/// icon then doesn't show until the watcher comes back), as the app says its other troubles.
 fn register(connection: &Connection, name: &str) -> Result<(), String> {
-    let watcher = zbus::blocking::Proxy::new(connection, WATCHER, WATCHER_PATH, WATCHER).map_err(|e| e.to_string())?;
-    watcher.call::<_, _, ()>("RegisterStatusNotifierItem", &(name,)).map_err(|e| e.to_string())
+    let watcher = zbus::blocking::Proxy::new(connection, WATCHER, WATCHER_PATH, WATCHER).map_err(|e| e.to_string());
+    let registered = watcher.and_then(|w| w.call::<_, _, ()>("RegisterStatusNotifierItem", &(name,)).map_err(|e| e.to_string()));
+    if let Err(e) = &registered {
+        eprintln!("Craft Cloud: the tray didn't take the icon ({e}); it is offered again when the tray restarts");
+    }
+    registered
 }
 
 /// [`start`] on `connection` (tests use a bus of their own). The item is served whether or not a watcher is there:
@@ -468,6 +473,25 @@ mod tests {
         let interface = zbus::names::InterfaceName::try_from("org.kde.StatusNotifierItem").unwrap();
         let tip: (String, Vec<Pixmap>, String, String) = properties.get(interface, "ToolTip").unwrap().try_into().unwrap();
         assert_eq!((tip.2.as_str(), tip.3.as_str()), ("Craft Cloud", "Paused"));
+    }
+
+    /// A watcher that is there but refuses the item: the app goes on (the window is the way in) and the failure is an
+    /// error, which `register` says.
+    #[test]
+    fn a_watcher_that_refuses_the_item_is_an_error() {
+        let Some(bus) = Bus::for_test("a_watcher_that_refuses_the_item_is_an_error") else { return };
+        // The watcher's name, with no watcher at its path (it answers the call with an error).
+        let _refusing = zbus::blocking::connection::Builder::address(bus.address.as_str())
+            .unwrap()
+            .name(WATCHER)
+            .unwrap()
+            .serve_at("/elsewhere", Watcher(Arc::default()))
+            .unwrap()
+            .build()
+            .unwrap();
+        let connection = bus.connect();
+        let _tray = start_on(connection.clone(), clicks().0).unwrap();
+        assert!(register(&connection, "org.kde.StatusNotifierItem-1-1").is_err());
     }
 
     /// Without `dbus-daemon` the D-Bus tests are skipped, unless they are required.
