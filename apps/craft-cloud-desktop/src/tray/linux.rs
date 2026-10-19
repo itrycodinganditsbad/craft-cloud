@@ -309,7 +309,7 @@ impl Tray for SniTray {
 mod tests {
     use super::*;
     use crate::model::Event;
-    use std::io::BufRead;
+    use std::io::{BufRead, Write};
     use std::sync::{Arc, Mutex};
 
     /// A private session bus for one test: `dbus-daemon`, stopped when dropped. `None` where there is no `dbus-daemon`.
@@ -319,8 +319,24 @@ mod tests {
     }
 
     impl Bus {
-        fn start() -> Option<Self> {
-            let mut daemon = std::process::Command::new("dbus-daemon")
+        /// The bus for `test`, or `None` where there is no `dbus-daemon`: then the test is skipped, which is said
+        /// past the test harness's capture (so it shows in a passing run), and is a failure when
+        /// `CRAFT_CLOUD_REQUIRE_BACKENDS` is set (CI), as for the server's backends.
+        fn for_test(test: &str) -> Option<Self> {
+            Self::for_test_with("dbus-daemon", test, std::env::var_os("CRAFT_CLOUD_REQUIRE_BACKENDS").is_some())
+        }
+
+        fn for_test_with(program: &str, test: &str, required: bool) -> Option<Self> {
+            let bus = Self::start(program);
+            if bus.is_none() {
+                assert!(!required, "CRAFT_CLOUD_REQUIRE_BACKENDS is set but there is no {program} for {test}");
+                let _ = writeln!(std::io::stderr(), "SKIPPED {test}: no {program} here (CRAFT_CLOUD_REQUIRE_BACKENDS=1 makes this a failure)");
+            }
+            bus
+        }
+
+        fn start(program: &str) -> Option<Self> {
+            let mut daemon = std::process::Command::new(program)
                 .args(["--session", "--nofork", "--print-address=1"])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
@@ -385,10 +401,7 @@ mod tests {
     /// waits, registers as soon as one appears, and again after the watcher restarts (waybar restarted).
     #[test]
     fn the_item_registers_whenever_a_watcher_appears() {
-        let Some(bus) = Bus::start() else {
-            eprintln!("no dbus-daemon here: the D-Bus tray tests are skipped");
-            return;
-        };
+        let Some(bus) = Bus::for_test("the_item_registers_whenever_a_watcher_appears") else { return };
         let _tray = start_on(bus.connect(), clicks().0).unwrap();
         let name = format!("org.kde.StatusNotifierItem-{}-1", std::process::id());
         let registered = Arc::new(Mutex::new(Vec::new()));
@@ -404,10 +417,7 @@ mod tests {
     /// makes the menu read Resume.
     #[test]
     fn with_a_watcher_the_item_registers_and_its_menu_works() {
-        let Some(bus) = Bus::start() else {
-            eprintln!("no dbus-daemon here: the D-Bus tray tests are skipped");
-            return;
-        };
+        let Some(bus) = Bus::for_test("with_a_watcher_the_item_registers_and_its_menu_works") else { return };
         let registered = Arc::new(Mutex::new(Vec::new()));
         let _watcher = zbus::blocking::connection::Builder::address(bus.address.as_str())
             .unwrap()
@@ -458,6 +468,14 @@ mod tests {
         let interface = zbus::names::InterfaceName::try_from("org.kde.StatusNotifierItem").unwrap();
         let tip: (String, Vec<Pixmap>, String, String) = properties.get(interface, "ToolTip").unwrap().try_into().unwrap();
         assert_eq!((tip.2.as_str(), tip.3.as_str()), ("Craft Cloud", "Paused"));
+    }
+
+    /// Without `dbus-daemon` the D-Bus tests are skipped, unless they are required.
+    #[test]
+    fn a_missing_dbus_daemon_skips_unless_required() {
+        assert!(Bus::for_test_with("no-such-dbus-daemon", "this test", false).is_none());
+        let required = std::panic::catch_unwind(|| Bus::for_test_with("no-such-dbus-daemon", "this test", true));
+        assert!(required.is_err(), "required: a failure");
     }
 
     #[test]
