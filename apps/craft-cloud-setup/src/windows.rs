@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use crate::{APP_EXE, Machine, Registry};
+use crate::{APP_EXE, AgentStop, Machine, Registry};
 
 /// No console window for what the setup runs (`CREATE_NO_WINDOW`).
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -61,18 +61,50 @@ impl Registry for UserRegistry {
 /// This computer.
 pub struct ThisMachine;
 
-impl Machine for ThisMachine {
-    fn quit_agent(&self, agent: &Path) -> bool {
-        // `quit` answers while the agent runs (and while it finishes its pass); once nothing answers it is gone.
-        let mut was_running = false;
-        for _ in 0..60 {
-            match quiet(agent).arg("quit").status() {
-                Ok(status) if status.success() => was_running = true,
-                _ => break,
-            }
-            std::thread::sleep(Duration::from_millis(500));
+/// Whether the process `pid` runs and is an agent (`craft-cloud-agent*.exe`): a pid of an agent that has ended may
+/// already belong to another program, which is never touched.
+fn agent_alive(pid: u32) -> bool {
+    let Ok(out) = quiet(Path::new("tasklist")).args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]).stdout(Stdio::piped()).output() else {
+        return false;
+    };
+    crate::lists_agent(&String::from_utf8_lossy(&out.stdout), pid)
+}
+
+/// Waits up to `within` for the agent `pid` to end.
+fn ended(pid: u32, within: Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if !agent_alive(pid) {
+            return true;
         }
-        was_running
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// The agent running for the data folder `data`, as its `local-api.json` names it.
+fn running_agent(data: &Path) -> Option<crate::AgentFile> {
+    let text = std::fs::read_to_string(data.join("local-api.json")).ok()?;
+    crate::agent_file(&text).filter(|file| agent_alive(file.pid))
+}
+
+impl Machine for ThisMachine {
+    fn stop_agent(&self, data: &Path) -> AgentStop {
+        let Some(agent) = running_agent(data) else { return AgentStop::NotRunning };
+        // Asked first: it finishes the pass under way, for up to a minute.
+        let _ = crate::ask_to_quit(&agent);
+        if ended(agent.pid, Duration::from_secs(60)) {
+            return AgentStop::Stopped;
+        }
+        // Then ended: the agent's writes are atomic, so a stop at any point is safe (as after a crash).
+        let _ = quiet(Path::new("taskkill")).args(["/PID", &agent.pid.to_string(), "/F"]).status();
+        if ended(agent.pid, Duration::from_secs(10)) {
+            AgentStop::Stopped
+        } else {
+            AgentStop::StillRunning(format!("process {} doesn't end", agent.pid))
+        }
     }
 
     fn close_app(&self) {
@@ -84,13 +116,21 @@ impl Machine for ThisMachine {
         if status.success() { Ok(()) } else { Err(format!("`{} {}` failed ({status})", agent.display(), args.join(" "))) }
     }
 
-    fn start_agent(&self, agent_bg: &Path) -> Result<(), String> {
+    fn start_agent(&self, agent_bg: &Path, data: &Path) -> Result<(), String> {
         quiet(agent_bg)
             .args(["run", "--log"])
             .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
             .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("{}: {e}", agent_bg.display()))
+            .map_err(|e| format!("{}: {e}", agent_bg.display()))?;
+        // It answers once its local API is up (as the app waits for it).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if running_agent(data).is_some() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        Err("it didn't answer within 5 seconds".into())
     }
 
     fn shortcut(&self, lnk: &Path, target: &Path) -> Result<(), String> {

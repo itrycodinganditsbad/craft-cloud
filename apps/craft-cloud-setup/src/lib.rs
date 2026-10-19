@@ -2,13 +2,14 @@
 //! this user into `%LOCALAPPDATA%\Programs\Craft Cloud` (no admin rights), with an "Apps & features" entry and a
 //! Start-menu shortcut (unless `--no-start-menu`); `--uninstall` takes them away again.
 //!
-//! - **Install** ([`install`]): the app is closed and a running agent stopped first, through its own command line
-//!   (`quit`, which lets the pass under way finish), so their files can be replaced; then the files, the Uninstall key
+//! - **Install** ([`install`]): the app is closed and a running agent stopped first: asked to quit through its local
+//!   API (it finishes the pass under way), waited for up to a minute, then ended, and its process checked gone. An
+//!   agent that can't be stopped stops the install before anything is changed. Then the files, the Uninstall key
 //!   (`HKCU\…\Uninstall\CraftCloud`, its `UninstallString` calling this setup, copied into the program folder, with
-//!   `--uninstall`), and the shortcut. An agent that ran is started again. An older install in
+//!   `--uninstall`), and the shortcut. An agent that ran is started again (and waited for). An older install in
 //!   `%LOCALAPPDATA%\Programs\craft-cloud` whose agent the `Run` value starts is moved: the new agent's
-//!   `autostart on` points the value at the new folder; the old folder's files are left alone.
-//! - **Uninstall** ([`uninstall`]): stops the agent (`quit`; fine when it isn't running) and the app, removes their
+//!   `autostart on` points the value at the new folder (read back to check); the old folder's files are left alone.
+//! - **Uninstall** ([`uninstall`]): closes the app and stops the agent as above (fine when it isn't running), removes their
 //!   `Run` values (`Craft Cloud`, `Craft Cloud tray`) where they start this install, the shortcut, the program folder
 //!   and the Uninstall key. The synced folder and the agent's data folder (the sign-in) stay.
 //!
@@ -60,16 +61,22 @@ pub struct Places {
     /// The keys under `HKEY_CURRENT_USER`.
     pub run_key: String,
     pub uninstall_key: String,
+    /// The agent's data folder, where a running agent's `local-api.json` names its pid, port and token.
+    pub agent_data: PathBuf,
 }
 
 impl Places {
     pub fn for_user() -> Result<Self, String> {
         let var = |name: &str| std::env::var_os(name).map(PathBuf::from).filter(|p| p.is_absolute()).ok_or(format!("%{name}% isn't set"));
+        let local = var("LOCALAPPDATA")?;
+        // As the agent finds it: `CRAFT_CLOUD_AGENT_DIR`, else `%LOCALAPPDATA%\craft-cloud-agent`.
+        let agent_data = var("CRAFT_CLOUD_AGENT_DIR").unwrap_or_else(|_| local.join("craft-cloud-agent"));
         Ok(Self {
-            programs: var("LOCALAPPDATA")?.join("Programs"),
+            programs: local.join("Programs"),
             start_menu: var("APPDATA")?.join("Microsoft").join("Windows").join("Start Menu").join("Programs"),
             run_key: RUN_KEY.to_owned(),
             uninstall_key: UNINSTALL_KEY.to_owned(),
+            agent_data,
         })
     }
 
@@ -94,17 +101,30 @@ pub trait Registry {
     fn remove_key(&self, key: &str) -> Result<(), String>;
 }
 
+/// How stopping the agent went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentStop {
+    /// No agent was running.
+    NotRunning,
+    /// One was running, and its process has ended.
+    Stopped,
+    /// One runs, and couldn't be stopped (why).
+    StillRunning(String),
+}
+
 /// Running programs.
 pub trait Machine {
-    /// Stops the agent through `agent`'s command line (`quit`, again until no agent answers, for at most a while).
-    /// Whether one was running.
-    fn quit_agent(&self, agent: &Path) -> bool;
+    /// Stops the agent whose data folder is `data`: asks it to quit (it finishes the pass under way), waits up to a
+    /// minute for its process to end, then ends it (the agent is safe to stop at any point: its writes are atomic),
+    /// and checks it is gone.
+    fn stop_agent(&self, data: &Path) -> AgentStop;
     /// Closes the app (`craft-cloud.exe`) if it runs.
     fn close_app(&self);
     /// Runs `agent` with `args` (`autostart on`); whether it succeeded, or why not.
     fn run_agent(&self, agent: &Path, args: &[&str]) -> Result<(), String>;
-    /// Starts the background agent `agent_bg` (`run --log`), detached.
-    fn start_agent(&self, agent_bg: &Path) -> Result<(), String>;
+    /// Starts the background agent `agent_bg` (`run --log`), detached, and waits (a few seconds) for it to answer for
+    /// the data folder `data`.
+    fn start_agent(&self, agent_bg: &Path, data: &Path) -> Result<(), String>;
     /// Writes a shortcut at `lnk` to `target`.
     fn shortcut(&self, lnk: &Path, target: &Path) -> Result<(), String>;
     /// Removes the folder `dir` once this process has ended (it holds this setup's own exe).
@@ -183,9 +203,14 @@ pub fn install(
 
     // What runs is stopped first: an exe in use can't be replaced. The app goes before the agent (an open app's Try
     // again would start the old agent again in between); the agent finishes the pass under way.
+    // Only once the old agent's process is gone is anything changed: an agent still running would keep its exes
+    // locked and answer the new agent's `autostart on` itself (registering its own, old, program).
     machine.close_app();
-    let agent_cli = [dir.join(AGENT_EXE), old.join(AGENT_EXE)].into_iter().find(|p| p.is_file());
-    let agent_was_running = agent_cli.as_deref().is_some_and(|agent| machine.quit_agent(agent));
+    let agent_was_running = match machine.stop_agent(&places.agent_data) {
+        AgentStop::NotRunning => false,
+        AgentStop::Stopped => true,
+        AgentStop::StillRunning(why) => return Err(still_running(&why)),
+    };
 
     std::fs::create_dir_all(&dir).map_err(io(&dir))?;
     for (name, bytes) in payload {
@@ -198,11 +223,17 @@ pub fn install(
     }
 
     // The older install's agent starts at login: the new one takes that over (no agent runs now, so the new agent
-    // writes its own entry). The old files stay.
+    // writes its own entry). The old files stay. The value is read back: only a value that starts the new agent is a
+    // move.
     let mut moved_from = None;
     let run_value = registry.get(&places.run_key, AGENT_RUN_VALUE);
     if old.join(AGENT_EXE).is_file() && run_value.as_deref().is_some_and(|v| starts_from(v, &old)) {
-        match machine.run_agent(&dir.join(AGENT_EXE), &["autostart", "on"]) {
+        let moved =
+            machine.run_agent(&dir.join(AGENT_EXE), &["autostart", "on"]).and_then(|()| match registry.get(&places.run_key, AGENT_RUN_VALUE) {
+                Some(v) if starts_from(&v, &dir) => Ok(()),
+                other => Err(format!("the Run value is still {}", other.unwrap_or_else(|| "missing".into()))),
+            });
+        match moved {
             Ok(()) => moved_from = Some(old.clone()),
             Err(e) => warnings.push(format!("start at login still runs the old agent in {} ({e})", old.display())),
         }
@@ -233,7 +264,7 @@ pub fn install(
         std::fs::remove_file(&shortcut).map_err(io(&shortcut))?;
     }
 
-    if agent_was_running && let Err(e) = machine.start_agent(&dir.join(AGENT_BG_EXE)) {
+    if agent_was_running && let Err(e) = machine.start_agent(&dir.join(AGENT_BG_EXE), &places.agent_data) {
         warnings.push(format!("the agent couldn't be started again ({e}); it starts at the next login"));
     }
     Ok(Installed { dir, agent_was_running, moved_from, warnings })
@@ -244,9 +275,8 @@ pub fn install(
 pub fn uninstall(places: &Places, registry: &dyn Registry, machine: &dyn Machine, running: &Path) -> Result<(), String> {
     let dir = places.dir();
     machine.close_app();
-    let agent = dir.join(AGENT_EXE);
-    if agent.is_file() {
-        machine.quit_agent(&agent);
+    if let AgentStop::StillRunning(why) = machine.stop_agent(&places.agent_data) {
+        return Err(still_running(&why));
     }
     for value in [AGENT_RUN_VALUE, APP_RUN_VALUE] {
         if registry.get(&places.run_key, value).as_deref().is_some_and(|v| starts_from(v, &dir)) {
@@ -273,6 +303,65 @@ pub fn uninstall(places: &Places, registry: &dyn Registry, machine: &dyn Machine
     } else {
         std::fs::remove_dir_all(&dir).map_err(io(&dir))
     }
+}
+
+/// What is said when the agent can't be stopped: nothing was changed.
+fn still_running(why: &str) -> String {
+    format!("Craft Cloud's agent is still running and couldn't be stopped ({why}). Nothing was changed: try again in a minute.")
+}
+
+/// A running agent's `local-api.json`: its pid, and the port and token of its local API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentFile {
+    pub pid: u32,
+    pub port: u16,
+    pub token: String,
+}
+
+/// `text` (`local-api.json`, `{"schema":1,"port":…,"token":"…","pid":…}`) read for what the setup needs; `None` if it
+/// doesn't read. A token that isn't plain letters and digits is refused (it goes into a header).
+pub fn agent_file(text: &str) -> Option<AgentFile> {
+    fn field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+        let at = text.find(&format!("\"{name}\""))? + name.len() + 2;
+        let rest = text.get(at..)?.trim_start().strip_prefix(':')?.trim_start();
+        match rest.strip_prefix('"') {
+            Some(quoted) => quoted.get(..quoted.find('"')?),
+            None => rest.get(..rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len())),
+        }
+    }
+    let token = field(text, "token")?;
+    if token.is_empty() || !token.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(AgentFile { pid: field(text, "pid")?.parse().ok()?, port: field(text, "port")?.parse().ok()?, token: token.to_owned() })
+}
+
+/// Whether `tasklist /FO CSV /NH` output lists `pid` as an agent (`craft-cloud-agent*.exe`): a pid of an agent that
+/// has ended may belong to another program by now, which is never touched.
+pub fn lists_agent(csv: &str, pid: u32) -> bool {
+    csv.lines().any(|line| {
+        let mut columns = line.split("\",\"");
+        let image = columns.next().unwrap_or_default().trim_start_matches('"').to_lowercase();
+        image.starts_with("craft-cloud-agent") && columns.next() == Some(pid.to_string().as_str())
+    })
+}
+
+/// Asks the agent at `file`'s port to quit (`POST /v1/quit` on its local API, as an app does). Whether it said yes.
+pub fn ask_to_quit(file: &AgentFile) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], file.port));
+    let timeout = std::time::Duration::from_secs(5);
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout).map_err(|e| e.to_string())?;
+    stream.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+    let request = format!(
+        "POST /v1/quit HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        file.port, file.token
+    );
+    stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
+    let mut head = [0u8; 64];
+    let n = stream.read(&mut head).map_err(|e| e.to_string())?;
+    let line = String::from_utf8_lossy(head.get(..n).unwrap_or_default()).into_owned();
+    if line.starts_with("HTTP/1.1 200") { Ok(()) } else { Err(format!("it answered {}", line.lines().next().unwrap_or_default())) }
 }
 
 fn remove_path(path: &Path) -> Result<(), String> {

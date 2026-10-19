@@ -16,8 +16,8 @@ path = "src/lib.rs"
 name = "craft-cloud-setup"
 path = "src/main.rs"
 
-# Nothing of the workspace: the agent is stopped and moved through its own command line (`craft-cloud-agent quit`,
-# `autostart on`), not by linking it.
+# Nothing of the workspace: the agent is asked to quit through its local API (a few lines of HTTP) and moved through its
+# own command line (`autostart on`), not by linking it.
 [dependencies]
 
 [target.'cfg(windows)'.dependencies]

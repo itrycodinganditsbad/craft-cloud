@@ -55,7 +55,8 @@ tests also run the server on a loopback port, and `tests/network/` runs the serv
 there can break the agent's tests: run both (`cargo xtask ci` does). The app (`craft-cloud-desktop`) depends on
 `app` and `proto` only, never on the agent: it reaches the agent through the local API and starts its binary. The
 setup (`craft-cloud-setup`) depends on nothing in the workspace: it stops and moves the agent through the agent's own
-command line (`craft-cloud-agent quit`, `autostart on`).
+local API (`POST /v1/quit`, then its process is waited for and, after a minute, ended) and command line
+(`autostart on`).
 
 Backend tests (Postgres, S3) skip unless their environment variables are set; see `.github/workflows/ci.yml`
 for the variables and the test containers. Set `CRAFT_CLOUD_REQUIRE_BACKENDS=1` to make a skip a failure.

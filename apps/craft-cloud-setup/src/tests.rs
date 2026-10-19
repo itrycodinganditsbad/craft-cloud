@@ -1,7 +1,7 @@
 //! Install, upgrade, move and uninstall against temporary folders, a recording machine and an in-memory registry (on
 //! every OS), and the real registry under a throwaway key (on Windows).
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::*;
 
@@ -9,6 +9,12 @@ use super::*;
 #[derive(Default)]
 struct Recorder {
     running: Mutex<bool>,
+    /// The agent doesn't stop, even when ended.
+    stuck: bool,
+    /// Where `autostart on` writes the agent's Run value, as the agent does (for the program it was run as)…
+    registry: Option<(Arc<MemoryRegistry>, String)>,
+    /// …unless an old agent still running answered it and registered itself.
+    old_answers: bool,
     asked: Mutex<Vec<String>>,
 }
 
@@ -27,18 +33,28 @@ fn name(path: &Path) -> String {
 }
 
 impl Machine for Recorder {
-    fn quit_agent(&self, agent: &Path) -> bool {
-        self.note(format!("quit {}", name(agent)));
-        std::mem::replace(&mut *self.running.lock().unwrap(), false)
+    fn stop_agent(&self, _data: &Path) -> AgentStop {
+        self.note("stop agent".into());
+        if self.stuck {
+            AgentStop::StillRunning("process 4242 doesn't end".into())
+        } else if std::mem::replace(&mut *self.running.lock().unwrap(), false) {
+            AgentStop::Stopped
+        } else {
+            AgentStop::NotRunning
+        }
     }
     fn close_app(&self) {
         self.note("close app".into());
     }
     fn run_agent(&self, agent: &Path, args: &[&str]) -> Result<(), String> {
         self.note(format!("{} {}", name(agent), args.join(" ")));
+        if let (["autostart", "on"], Some((registry, key)), false) = (args, &self.registry, self.old_answers) {
+            let value = format!("\"{}\" run --log", agent.with_file_name(AGENT_BG_EXE).display());
+            registry.set_string(key, AGENT_RUN_VALUE, &value)?;
+        }
         Ok(())
     }
-    fn start_agent(&self, agent_bg: &Path) -> Result<(), String> {
+    fn start_agent(&self, agent_bg: &Path, _data: &Path) -> Result<(), String> {
         self.note(format!("start {}", name(agent_bg)));
         *self.running.lock().unwrap() = true;
         Ok(())
@@ -64,13 +80,14 @@ struct User {
 fn user(keys: &str) -> User {
     let root = tempfile::tempdir().unwrap();
     let local = root.path().join("AppData").join("Local");
+    let data = local.join("craft-cloud-agent");
     let places = Places {
         programs: local.join("Programs"),
         start_menu: root.path().join("Start Menu").join("Programs"),
         run_key: format!(r"{keys}\Run"),
         uninstall_key: format!(r"{keys}\Uninstall\CraftCloud"),
+        agent_data: data.clone(),
     };
-    let data = local.join("craft-cloud-agent");
     let synced = root.path().join("Craft Cloud");
     for dir in [&data, &synced] {
         std::fs::create_dir_all(dir).unwrap();
@@ -107,7 +124,7 @@ fn a_fresh_install_writes_the_files_the_entry_and_the_shortcut() {
     assert_eq!(registry.get(key, "Publisher"), None);
     assert_eq!(registry.get(key, "UninstallString"), Some(format!("\"{}\" --uninstall", dir.join(SETUP_EXE).display())));
     assert_eq!(std::fs::read_to_string(u.places.shortcut()).unwrap(), dir.join(APP_EXE).display().to_string());
-    assert_eq!(machine.asked(), ["close app"], "nothing to quit: no agent installed");
+    assert_eq!(machine.asked(), ["close app", "stop agent"], "no agent was running: none is started");
     // No leftovers of the replacing.
     assert!(!std::fs::read_dir(&dir).unwrap().any(|e| e.unwrap().path().extension().is_some_and(|x| x == "new")));
 }
@@ -133,7 +150,7 @@ fn an_upgrade_stops_the_agent_and_the_app_replaces_the_files_and_starts_the_agen
     let installed = install(&u.places, &registry, &machine, V2, &u.setup, &options(true)).unwrap();
     assert!(installed.agent_was_running);
     // The app first: an open app would start the old agent again (Try again) between the quit and its close.
-    assert_eq!(machine.asked(), ["close app", "quit Craft Cloud/craft-cloud-agent.exe", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
+    assert_eq!(machine.asked(), ["close app", "stop agent", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
     assert_eq!(std::fs::read(u.places.dir().join(AGENT_EXE)).unwrap(), b"agent v2");
     assert!(u.data.join("account.json").exists() && u.synced.join("notes.txt").exists());
 }
@@ -143,7 +160,8 @@ fn an_upgrade_stops_the_agent_and_the_app_replaces_the_files_and_starts_the_agen
 #[test]
 fn an_older_install_is_moved_over() {
     let u = user("Test");
-    let (registry, machine) = (MemoryRegistry::default(), Recorder::default());
+    let registry = Arc::new(MemoryRegistry::default());
+    let machine = Recorder { registry: Some((registry.clone(), u.places.run_key.clone())), ..Recorder::default() };
     let old = u.places.programs.join(OLD_DIR_NAME);
     std::fs::create_dir_all(&old).unwrap();
     std::fs::write(old.join(AGENT_EXE), "agent v0").unwrap();
@@ -151,19 +169,30 @@ fn an_older_install_is_moved_over() {
     let value = format!("\"{}\" run", old.join(AGENT_BG_EXE).display());
     registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, &value).unwrap();
     *machine.running.lock().unwrap() = true;
-    let installed = install(&u.places, &registry, &machine, V2, &u.setup, &options(true)).unwrap();
+    let installed = install(&u.places, &*registry, &machine, V2, &u.setup, &options(true)).unwrap();
     assert_eq!(installed.moved_from, Some(old.clone()));
+    assert!(installed.warnings.is_empty(), "{:?}", installed.warnings);
     assert_eq!(
         machine.asked(),
-        [
-            "close app",
-            "quit craft-cloud/craft-cloud-agent.exe",
-            "Craft Cloud/craft-cloud-agent.exe autostart on",
-            "start Craft Cloud/craft-cloud-agent-bg.exe"
-        ],
-        "stopped through the old agent, moved by the new one with no agent running, started from the new folder"
+        ["close app", "stop agent", "Craft Cloud/craft-cloud-agent.exe autostart on", "start Craft Cloud/craft-cloud-agent-bg.exe"],
+        "the old agent stopped, moved by the new one with no agent running, started from the new folder"
     );
+    let now = registry.get(&u.places.run_key, AGENT_RUN_VALUE).unwrap();
+    assert!(starts_from(&now, &u.places.dir()), "{now}");
     assert_eq!(std::fs::read(old.join(AGENT_EXE)).unwrap(), b"agent v0", "the old files are left alone");
+
+    // An `autostart on` that didn't land (an old agent answered it and registered itself) is no move: it is said.
+    let u = user("Test");
+    let registry = Arc::new(MemoryRegistry::default());
+    let machine = Recorder { registry: Some((registry.clone(), u.places.run_key.clone())), old_answers: true, ..Recorder::default() };
+    let old = u.places.programs.join(OLD_DIR_NAME);
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join(AGENT_EXE), "agent v0").unwrap();
+    let value = format!("\"{}\" run", old.join(AGENT_BG_EXE).display());
+    registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, &value).unwrap();
+    let installed = install(&u.places, &*registry, &machine, V2, &u.setup, &options(true)).unwrap();
+    assert_eq!(installed.moved_from, None);
+    assert!(installed.warnings.iter().any(|w| w.contains("still runs the old agent")), "{:?}", installed.warnings);
 
     // An old folder whose agent doesn't start at login is only left alone.
     let u = user("Test");
@@ -189,7 +218,7 @@ fn uninstall_takes_everything_away_but_the_files_and_the_sign_in() {
     machine.asked.lock().unwrap().clear();
 
     uninstall(&u.places, &registry, &machine, &u.setup).unwrap();
-    assert_eq!(machine.asked(), ["close app", "quit Craft Cloud/craft-cloud-agent.exe"]);
+    assert_eq!(machine.asked(), ["close app", "stop agent"]);
     assert_eq!(registry.get(&u.places.run_key, AGENT_RUN_VALUE), None);
     assert_eq!(registry.get(&u.places.run_key, APP_RUN_VALUE), None);
     assert!(registry.get(&u.places.run_key, "Something else").is_some(), "other programs' values stay");
@@ -207,6 +236,63 @@ fn uninstall_takes_everything_away_but_the_files_and_the_sign_in() {
     let left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
     assert_eq!(left, [SETUP_EXE]);
     assert_eq!(machine.asked().last().cloned(), Some(format!("remove after exit {}", dir.display())));
+}
+
+/// An agent that can't be stopped (asked, waited for, ended, still there): nothing is changed, on install and on
+/// uninstall, and it is said.
+#[test]
+fn an_agent_that_cant_be_stopped_changes_nothing() {
+    let u = user("Test");
+    let registry = MemoryRegistry::default();
+    let old: &[(&str, &[u8])] = &[(APP_EXE, b"app v1"), (AGENT_EXE, b"agent v1"), (AGENT_BG_EXE, b"agent-bg v1")];
+    install(&u.places, &registry, &Recorder::default(), old, &u.setup, &options(true)).unwrap();
+    let old_value = format!("\"{}\" run --log", u.places.dir().join(AGENT_BG_EXE).display());
+    registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, &old_value).unwrap();
+    let before = registry.values.lock().unwrap().clone();
+    let shortcut = std::fs::read(u.places.shortcut()).unwrap();
+
+    let stuck = Recorder { stuck: true, ..Recorder::default() };
+    let e = install(&u.places, &registry, &stuck, V2, &u.setup, &options(false)).unwrap_err();
+    assert!(e.contains("couldn't be stopped") && e.contains("Nothing was changed"), "{e}");
+    assert_eq!(stuck.asked(), ["close app", "stop agent"], "nothing after the stop");
+    assert_eq!(*registry.values.lock().unwrap(), before);
+    for (file, bytes) in old {
+        assert_eq!(std::fs::read(u.places.dir().join(file)).unwrap(), *bytes, "{file}");
+    }
+    assert_eq!(std::fs::read(u.places.shortcut()).unwrap(), shortcut);
+
+    let e = uninstall(&u.places, &registry, &stuck, &u.setup).unwrap_err();
+    assert!(e.contains("Nothing was changed"), "{e}");
+    assert_eq!(*registry.values.lock().unwrap(), before);
+    assert!(u.places.dir().join(AGENT_EXE).is_file() && u.places.shortcut().exists());
+}
+
+#[test]
+fn a_running_agents_file_is_read_and_it_is_asked_to_quit() {
+    let text = "{\n  \"schema\": 1,\n  \"port\": 51234,\n  \"token\": \"a1b2c3\",\n  \"pid\": 4242\n}";
+    assert_eq!(agent_file(text), Some(AgentFile { pid: 4242, port: 51234, token: "a1b2c3".into() }));
+    assert_eq!(agent_file("{\"port\":1,\"token\":\"a\\r\\nX: y\",\"pid\":2}"), None, "no header injection");
+    assert_eq!(agent_file("{\"port\":1,\"pid\":2}"), None);
+    let tasklist = "\"craft-cloud-agent-bg.exe\",\"4242\",\"Console\",\"1\",\"21,004 K\"\r\n";
+    assert!(lists_agent(tasklist, 4242));
+    assert!(!lists_agent(tasklist, 424));
+    assert!(!lists_agent("\"notepad.exe\",\"4242\",\"Console\",\"1\",\"9,000 K\"", 4242), "a reused pid is another program");
+    assert!(!lists_agent("INFO: No tasks are running which match the specified criteria.", 4242));
+
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let agent = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = vec![0u8; 1024];
+        let n = stream.read(&mut request).unwrap();
+        stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}").unwrap();
+        String::from_utf8_lossy(&request[..n]).into_owned()
+    });
+    ask_to_quit(&AgentFile { pid: 1, port, token: "a1b2c3".into() }).unwrap();
+    let request = agent.join().unwrap();
+    assert!(request.starts_with("POST /v1/quit HTTP/1.1\r\n"), "{request}");
+    assert!(request.contains(&format!("Host: 127.0.0.1:{port}\r\n")) && request.contains("Authorization: Bearer a1b2c3\r\n"), "{request}");
 }
 
 #[test]
