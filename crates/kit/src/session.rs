@@ -834,7 +834,10 @@ impl<D: LiveDocument> Session<D> {
         let start = self.doc.oplog_vv().get(&self.doc.peer_id()).copied().unwrap_or(0);
         let key = if self.grouping { self.group_key.unwrap_or(start) } else { start };
         self.local_change(&old, &Arc::new(file))?;
-        self.step_names.insert(key, REPLACE_WITH_FILE);
+        // Named only if it made a step (the file may be the live content already: then the next edit starts there).
+        if self.doc.oplog_vv().get(&self.doc.peer_id()).copied().unwrap_or(0) > start {
+            self.step_names.insert(key, REPLACE_WITH_FILE);
+        }
         self.status.changed_outside = false;
         Ok(())
     }

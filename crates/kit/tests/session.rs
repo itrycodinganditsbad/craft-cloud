@@ -642,6 +642,21 @@ fn bringing_the_file_in_is_one_named_undoable_change() {
     assert_eq!(b.step_name(false), Some(REPLACE_WITH_FILE), "redo names it too");
 }
 
+/// Bringing in a file whose content is the live content already makes no step, so it names none: the next ordinary
+/// edit's undo isn't called "Replace with the file's content".
+#[test]
+fn a_name_never_sticks_to_the_next_ordinary_edit() {
+    let hub = Hub::new();
+    let pc = hub.machine("pc").unwrap();
+    let mut a = open_with_bytes(&pc, "same.txt", Notes::new("same", &["one"]), b"imported");
+    let same = (**a.model()).clone();
+    a.replace_with_file(same).unwrap();
+    assert_eq!(a.step_name(true), None);
+    change(&mut a, |m| m.with_item(1, "an ordinary edit")).unwrap();
+    assert!(a.can_undo());
+    assert_eq!(a.step_name(true), None, "the edit's undo has no name");
+}
+
 /// An app's autosave: when dirty or the file is behind, a save (with a record when it can). True if it saved.
 fn autosave(s: &mut Session<App>, dirty: &mut bool, n: &mut usize) -> bool {
     if !(*dirty || s.file_behind()) {
