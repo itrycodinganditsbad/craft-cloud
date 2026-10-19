@@ -333,16 +333,62 @@ mod tests {
         assert_eq!(calls, expected, "quit until it stopped; the installed copy takes start at login over; then restarted");
     }
 
-    /// An agent still finishing its sync when the wait runs out: nothing is installed, and systemd is asked to start
-    /// the agent again (it has accepted the quit and stops after its pass; without this nothing would restart it).
+    /// Waits (up to 20 s) for the calls to end with `last`: the agent is started again in the background.
+    #[cfg(target_os = "linux")]
+    fn ends_with(up: &Upgrade, last: &str) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let calls = up.calls();
+            if calls.last().map(String::as_str) == Some(last) || std::time::Instant::now() > deadline {
+                return calls;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// An agent still finishing its sync when the wait runs out: nothing is installed, and once the agent has stopped
+    /// (it has accepted the quit; nothing else would restart it) systemd is asked to start it again. Starting it at
+    /// once would do nothing: the old one still runs.
     #[cfg(target_os = "linux")]
     #[test]
-    fn an_agent_that_doesnt_stop_in_time_is_started_again_and_nothing_changes() {
-        let up = Upgrade::new("timeout", 1_000);
+    fn an_agent_that_doesnt_stop_in_time_is_started_again_once_stopped_and_nothing_changes() {
+        let up = Upgrade::new("timeout", 4);
         let out = up.install("2");
         assert_eq!(out.status.code(), Some(1), "{out:?}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("nothing was changed. Try again"), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("nothing was changed, and it starts again once done"), "{out:?}");
         assert!(!up.home.join(".local/lib/craft-cloud").exists(), "nothing installed");
-        assert_eq!(up.calls().last().map(String::as_str), Some("systemctl --user start craft-cloud-agent.service"));
+        let src_agent = up.src.join("craft-cloud-agent").display().to_string();
+        let calls = ends_with(&up, "systemctl --user start craft-cloud-agent.service");
+        let quit = format!("{src_agent} quit");
+        let expected = [&quit, &quit, &quit, &quit, &quit, "systemctl --user start craft-cloud-agent.service"];
+        assert_eq!(calls, expected, "asked until it stopped (four answered), then started");
+    }
+
+    /// The same without a systemd unit: the agent is run again itself (here, with nothing installed or on PATH, the
+    /// package's copy).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn without_a_unit_an_agent_that_doesnt_stop_in_time_is_run_again_once_stopped() {
+        let up = Upgrade::new("timeout-nounit", 4);
+        std::fs::remove_file(up.home.join(".config/systemd/user/craft-cloud-agent.service")).unwrap();
+        let out = up.install("2");
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let src_agent = up.src.join("craft-cloud-agent").display().to_string();
+        let calls = ends_with(&up, &format!("{src_agent} run --log"));
+        assert_eq!(calls.len(), 6, "{calls:?}");
+        assert_eq!(calls.last(), Some(&format!("{src_agent} run --log")), "{calls:?}");
+    }
+
+    /// An upgrade without a unit: the new copy is run once the old agent has let go of its data folder.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn without_a_unit_an_upgrade_runs_the_new_copy() {
+        let up = Upgrade::new("upgrade-nounit", 1);
+        std::fs::remove_file(up.home.join(".config/systemd/user/craft-cloud-agent.service")).unwrap();
+        let out = up.install("60");
+        assert!(out.status.success(), "{out:?}");
+        let lib_agent = up.home.join(".local/lib/craft-cloud/craft-cloud-agent").display().to_string();
+        let calls = ends_with(&up, &format!("{lib_agent} run --log"));
+        assert_eq!(calls.last(), Some(&format!("{lib_agent} run --log")), "{calls:?}");
     }
 }

@@ -29,6 +29,29 @@ config="${XDG_CONFIG_HOME:-$HOME/.config}"
 unit="$config/systemd/user/craft-cloud-agent.service"
 entry="$config/autostart/craft-cloud-agent.desktop"
 
+# Starts the agent ($1) again once the one running has stopped: it stops answering, and lets go of its data folder a
+# moment later (an agent started before that finds it taken and exits). Through systemd when $2 is "systemd", else
+# `run --log`. In the background: the wait may be long.
+start_when_stopped() {
+    nohup sh -c '
+        n=0
+        while "$1" quit >/dev/null 2>&1 && [ "$n" -lt 86400 ]; do
+            n=$((n + 1))
+            sleep 1
+        done
+        sleep 3
+        if [ "$2" = systemd ]; then
+            systemctl --user start craft-cloud-agent.service
+        else
+            "$1" run --log
+        fi
+    ' sh "$1" "$2" >/dev/null 2>&1 &
+}
+
+has_unit() {
+    [ -f "$unit" ] && command -v systemctl >/dev/null 2>&1
+}
+
 # An agent that answers is asked to quit until none does: it finishes the sync under way first, which may take a
 # while for big files (at most CRAFT_CLOUD_INSTALL_WAIT seconds, 10 minutes by default). Nothing is changed before.
 wait_for="${CRAFT_CLOUD_INSTALL_WAIT:-600}"
@@ -41,11 +64,18 @@ while "$here/craft-cloud-agent" quit >/dev/null 2>&1; do
         echo "Waiting for the Craft Cloud agent to finish its sync…"
     fi
     if [ "$tries" -ge "$wait_for" ]; then
-        # It has accepted the quit and stops after its pass: started again, so this computer keeps syncing.
-        if [ -f "$unit" ] && command -v systemctl >/dev/null 2>&1; then
-            systemctl --user start craft-cloud-agent.service || true
+        # It has accepted the quit and stops after its pass: it is started again then, so this computer keeps
+        # syncing. The copy installed already, else the one on PATH, else this one.
+        if has_unit; then
+            start_when_stopped "$here/craft-cloud-agent" systemd
+        elif [ -x "$lib/craft-cloud-agent" ]; then
+            start_when_stopped "$lib/craft-cloud-agent" run
+        elif command -v craft-cloud-agent >/dev/null 2>&1; then
+            start_when_stopped "$(command -v craft-cloud-agent)" run
+        else
+            start_when_stopped "$here/craft-cloud-agent" run
         fi
-        echo "The Craft Cloud agent is still finishing its sync; nothing was changed. Try again in a while." >&2
+        echo "The Craft Cloud agent is still finishing its sync; nothing was changed, and it starts again once done. Try again in a while." >&2
         exit 1
     fi
     sleep 1
@@ -86,10 +116,10 @@ if [ -f "$unit" ] || [ -f "$entry" ]; then
 fi
 
 if [ "$was_running" = 1 ]; then
-    if [ -f "$unit" ] && command -v systemctl >/dev/null 2>&1; then
+    if has_unit; then
         systemctl --user restart craft-cloud-agent.service || true
     else
-        nohup "$lib/craft-cloud-agent" run --log >/dev/null 2>&1 &
+        start_when_stopped "$lib/craft-cloud-agent" run
     fi
 fi
 
