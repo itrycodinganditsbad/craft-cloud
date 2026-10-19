@@ -10,3 +10,5 @@ target/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+# a snapshot test's own render when it doesn't match
+*.new.png

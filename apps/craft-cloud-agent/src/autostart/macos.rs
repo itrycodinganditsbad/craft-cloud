@@ -1,7 +1,9 @@
 //! macOS: a launch agent, `~/Library/LaunchAgents/ch.craftcloud.agent.plist`. launchd starts it at login
-//! (`RunAtLoad`) and again after a crash, but not after a clean quit (`KeepAlive` with `SuccessfulExit` false). What
-//! the agent prints goes to `run.log` in its data folder (`StandardOutPath`, `StandardErrorPath`; launchd appends and
-//! doesn't rotate). The file is written by [`plist`], a pure function, so its format is tested on every OS.
+//! (`RunAtLoad`) and again after a crash, but not after a clean quit (`KeepAlive` with `SuccessfulExit` false), and
+//! never sooner than 30 s after the last start (`ThrottleInterval`). The agent writes its own `run.log` (`run --log`,
+//! rotated); what still reaches its standard output or error (a crash's message) goes to [`LAUNCHD_LOG`] in the data
+//! folder (`StandardOutPath`, `StandardErrorPath`; launchd appends and doesn't rotate, but next to nothing goes
+//! there). The file is written by [`plist`], a pure function, so its format is tested on every OS.
 
 use std::path::PathBuf;
 
@@ -9,6 +11,10 @@ use super::{AutostartError, Launch, Roots, remove_file, write_file};
 
 /// The launch agent's label, also its file's name.
 pub const LABEL: &str = "ch.craftcloud.agent";
+/// Where launchd writes what reaches the agent's own output, in the data folder.
+pub const LAUNCHD_LOG: &str = "launchd.log";
+/// The shortest time between two starts launchd makes, in seconds.
+pub const THROTTLE_SECS: u32 = 30;
 
 /// The launch agent's file.
 pub fn plist_file(roots: &Roots) -> PathBuf {
@@ -35,7 +41,7 @@ pub fn plist(launch: &Launch) -> Result<String, AutostartError> {
     for arg in launch.args()? {
         arguments.push_str(&format!("        <string>{}</string>\n", xml_escaped(&arg)));
     }
-    // launchd keeps nothing the agent prints unless told where: `run.log` in the data folder, both streams.
+    // launchd keeps nothing the process prints unless told where: `launchd.log` in the data folder, both streams.
     let mut log = String::new();
     if let Some(path) = &launch.log {
         let path = xml_escaped(&super::text(path)?);
@@ -63,6 +69,8 @@ pub fn plist(launch: &Launch) -> Result<String, AutostartError> {
          \x20       <key>SuccessfulExit</key>\n\
          \x20       <false/>\n\
          \x20   </dict>\n\
+         \x20   <key>ThrottleInterval</key>\n\
+         \x20   <integer>{THROTTLE_SECS}</integer>\n\
          </dict>\n\
          </plist>\n"
     ))

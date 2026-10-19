@@ -79,6 +79,9 @@ pub mod codes {
     /// `autostart`: the start-at-login entry couldn't be written or removed (the message says why), or this agent
     /// doesn't handle it here. Whatever else was asked (a join) stands.
     pub const AUTOSTART_FAILED: &str = "autostart_failed";
+    /// `join` or `login` without `adopt`: the folder already has files in it. Nothing was sent to the server, so the
+    /// code still works; ask whether to sync those files, and send it again with `adopt` if so.
+    pub const FOLDER_HAS_FILES: &str = "folder_has_files";
 }
 
 /// The paths of the local API.
@@ -188,6 +191,14 @@ pub struct Status {
     /// support it (an older agent says nothing).
     #[serde(default)]
     pub autostart: Option<bool>,
+    /// When the last sync pass that didn't fail finished (milliseconds since the Unix epoch), while signed in; `None`
+    /// before the first one (an older agent says nothing).
+    #[serde(default)]
+    pub last_sync_ms: Option<i64>,
+    /// The server refused this computer's device (it was removed from the account, on another computer or by an
+    /// admin): nothing syncs until it signs out and joins again. Its files stay.
+    #[serde(default)]
+    pub removed: bool,
 }
 
 /// `POST /v1/login`: what `craft-cloud-agent login` asks for. The password goes to the agent and from there to the
@@ -461,6 +472,8 @@ mod tests {
             online: false,
             run_state: RunState::SignedOut,
             autostart: None,
+            last_sync_ms: Some(1_790_000_000_000),
+            removed: false,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["run_state"], serde_json::json!({ "kind": "signed_out" }));
@@ -472,6 +485,8 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(older.autostart, None, "an older agent says nothing about autostart");
+        assert_eq!(older.last_sync_ms, None, "nor about the last sync");
+        assert!(!older.removed);
         let login: LoginRequest = serde_json::from_value(serde_json::json!({ "server": "s", "user": "u", "password": "p", "extra": 1 })).unwrap();
         assert!(!login.adopt && login.folder.is_none(), "missing optional fields default; unknown ones are ignored");
     }

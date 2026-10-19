@@ -1,8 +1,8 @@
 //! Linux: a systemd user unit when the session runs systemd, else an XDG autostart entry.
 //!
 //! - **systemd** is used when `~/.config/systemd/user` can be made and `systemctl --user show-environment` answers
-//!   (the user's own service manager runs). [`UNIT`] is written there (`Restart=on-failure`, so a crash restarts it and
-//!   a quit doesn't), then `systemctl --user daemon-reload` and `enable`. A unit of that name already there (one made by
+//!   (the user's own service manager runs). [`UNIT`] is written there (`Restart=on-failure` after 30 s, so a crash
+//!   restarts it and a quit doesn't, nor exit code 3: something only a person can put right), then `systemctl --user daemon-reload` and `enable`. A unit of that name already there (one made by
 //!   hand) is rewritten, never duplicated. The XDG entry is removed then, so the agent isn't started twice.
 //! - **Otherwise** [`DESKTOP`] goes into `~/.config/autostart`, which desktop sessions start at login.
 //!
@@ -96,6 +96,8 @@ pub fn unit(launch: &Launch) -> Result<String, AutostartError> {
          [Service]\n\
          ExecStart={}\n\
          Restart=on-failure\n\
+         RestartSec=30\n\
+         RestartPreventExitStatus=3\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
@@ -185,7 +187,7 @@ mod tests {
         assert_eq!(systemd_quoted(r#"/a b/c"d\e%f$g"#), r#""/a b/c\"d\\e%%f$$g""#);
         assert_eq!(desktop_quoted(r#"/a b/c"d\e%f$g`h"#), r#""/a b/c\\"d\\\\e%%f\\$g\\`h""#);
         let line = unit(&launch("/opt/x/agent")).unwrap();
-        assert!(line.contains("ExecStart=\"/opt/x/agent\" \"run\"\n"), "{line}");
+        assert!(line.contains("ExecStart=\"/opt/x/agent\" \"run\" \"--log\"\n"), "{line}");
         assert!(matches!(unit(&launch("/opt/x\nExecStart=/bin/evil")), Err(AutostartError::BadPath(_))), "no line breaks");
     }
 }

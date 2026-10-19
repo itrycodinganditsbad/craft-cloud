@@ -1,0 +1,37 @@
+[package]
+name = "craft-cloud-setup"
+description = "Craft Cloud's Windows setup: installs the app and the agent for this user (no admin rights), and uninstalls them"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+build = "build.rs"
+
+[lib]
+name = "craft_cloud_setup"
+path = "src/lib.rs"
+
+[[bin]]
+name = "craft-cloud-setup"
+path = "src/main.rs"
+
+# Nothing of the workspace: the agent is asked to quit through its local API (a few lines of HTTP) and moved through its
+# own command line (`autostart on`), not by linking it.
+[dependencies]
+
+[target.'cfg(windows)'.dependencies]
+# The finishing question ("Open Craft Cloud?") and errors, as Windows' own message box.
+rfd = { workspace = true }
+# The Uninstall key and the Run values under HKCU.
+windows-registry.workspace = true
+
+[build-dependencies]
+# The exe's icon and version resource (Windows targets only; MSVC's rc.exe).
+winresource.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

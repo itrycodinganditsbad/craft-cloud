@@ -1,15 +1,15 @@
 //! The agent's own start-at-login entry, so a machine syncs after every restart without anyone starting it.
 //!
 //! - **Windows** ([`windows`]): the value `Craft Cloud` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
-//!   running the background build `craft-cloud-agent-bg.exe run` (no console window; it logs to `run.log`).
+//!   running the background build `craft-cloud-agent-bg.exe run --log` (no console window).
 //! - **macOS** ([`macos`]): `~/Library/LaunchAgents/ch.craftcloud.agent.plist`, run at load and restarted after a
-//!   crash but not after a clean quit.
-//! - **Linux** ([`linux`]): a systemd user unit `craft-cloud-agent.service` (restarted on failure) when the session
-//!   runs systemd, else `~/.config/autostart/craft-cloud-agent.desktop`. A unit of that name made by hand is adopted:
-//!   rewritten with this agent's path.
+//!   crash (at most every 30 s) but not after a clean quit.
+//! - **Linux** ([`linux`]): a systemd user unit `craft-cloud-agent.service` (restarted on failure after 30 s, but not
+//!   after exit code 3) when the session runs systemd, else `~/.config/autostart/craft-cloud-agent.desktop`. A unit of
+//!   that name made by hand is adopted: rewritten with this agent's path.
 //!
 //! There is one entry per user, and it belongs to the agent with the default data folder ([`Roots::owns`]): it runs
-//! `<agent> run`. An agent with a data folder of its own (`CRAFT_CLOUD_AGENT_DIR`, `--data-dir`) never registers,
+//! `<agent> run --log`, which writes what it says to `run.log` in the data folder. An agent with a data folder of its own (`CRAFT_CLOUD_AGENT_DIR`, `--data-dir`) never registers,
 //! replaces or removes it. Paths are quoted and escaped for each format, spaces and non-ASCII names included.
 //! Registering twice writes one entry; removing one that isn't there is fine.
 //!
@@ -96,25 +96,44 @@ impl Roots {
 
     /// Whether the entry belongs to an agent with data folder `data`: only to the one with the default data folder.
     /// An agent run with `CRAFT_CLOUD_AGENT_DIR` or `--data-dir` elsewhere (a spare folder, a test) never registers,
-    /// replaces or removes it.
+    /// replaces or removes it. The two are compared as absolute paths with `.` and `..` taken out (without
+    /// following links), so `~/.local/share/x/../craft-cloud-agent` is the default folder too.
     pub fn owns(&self, data: &Path) -> bool {
-        self.default_data.as_deref().is_some_and(|default| default == data)
+        self.default_data.as_deref().is_some_and(|default| comparable(default) == comparable(data))
     }
 }
 
-/// What the entry starts: `exe run`, with the default data folder (the only agent with an entry).
+/// `path` made absolute (against the current folder), with `.` and `..` resolved by name.
+fn comparable(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    let mut out = PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// What the entry starts: `exe run --log`, with the default data folder (the only agent with an entry). The agent
+/// writes what it says to `run.log` in its data folder itself (rotated at 10 MiB: see [`crate::runlog`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
     pub exe: PathBuf,
-    /// Where the service manager writes what the agent prints, where it keeps it itself (macOS: `run.log` in the
-    /// data folder). Windows' background build writes its own `run.log`; systemd keeps a journal.
+    /// Where the service manager writes what reaches the process's own output despite `--log` (a crash's message),
+    /// where it keeps that itself (macOS: `launchd.log` in the data folder). Windows has no such output; systemd
+    /// keeps a journal.
     pub log: Option<PathBuf>,
 }
 
 impl Launch {
     /// The arguments after the program, as text.
     pub(crate) fn args(&self) -> Result<Vec<String>, AutostartError> {
-        Ok(vec!["run".to_owned()])
+        Ok(vec!["run".to_owned(), "--log".to_owned()])
     }
 
     /// The program, as text.
@@ -132,11 +151,12 @@ pub(crate) fn text(path: &Path) -> Result<String, AutostartError> {
 }
 
 /// The entry for this agent, whose data folder is `data` (the default one: see [`Roots::owns`]): its own program
-/// (on Windows the background build next to it), logging to `run.log` there.
+/// (on Windows the background build next to it), logging to `run.log` there; on macOS what launchd catches goes to
+/// `launchd.log` next to it.
 pub fn this_agent(data: &Path) -> Result<Launch, AutostartError> {
     let exe = std::env::current_exe().map_err(io_at(Path::new("this program")))?;
     let exe = if cfg!(windows) { windows::background_build(&exe)? } else { exe };
-    Ok(Launch { exe, log: Some(data.join(crate::runlog::LOG_FILE)) })
+    Ok(Launch { exe, log: Some(data.join(macos::LAUNCHD_LOG)) })
 }
 
 /// Why an agent with data folder `data` leaves the entry alone ([`Roots::owns`] is false).

@@ -315,6 +315,8 @@ mod tests {
             online: false,
             run_state: RunState::SignedOut,
             autostart: Some(signed_in),
+            last_sync_ms: None,
+            removed: false,
         }
     }
 

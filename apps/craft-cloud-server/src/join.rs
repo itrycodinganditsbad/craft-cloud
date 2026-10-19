@@ -87,12 +87,12 @@ pub async fn join(
     let key = ip_key(client_ip(peer, &headers, &state.trusted_proxies));
     // Counted before the redeem, so tries made at the same moment are held to the limit too; given back unless the
     // code didn't work.
-    if !state.joins.allow(&key, JOINS_PER_IP, now) {
+    let Some(counted) = state.joins.count(&key, JOINS_PER_IP, now) else {
         return Err(ApiError::rate_limited("too many tries with codes that don't work; wait a minute", None));
-    }
+    };
     let result = redeem(&state, &req).await;
     if !result.as_ref().is_err_and(|e| e.code == codes::INVALID_CODE) {
-        state.joins.refund(&key, now);
+        state.joins.refund(&key, counted);
     }
     result.map(Json)
 }

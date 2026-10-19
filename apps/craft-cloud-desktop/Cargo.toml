@@ -1,0 +1,57 @@
+[package]
+name = "craft-cloud-desktop"
+description = "Craft Cloud, the app: joins this computer to a Craft Cloud and shows its sync, in a window and the tray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "craft_cloud_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "craft-cloud"
+path = "src/main.rs"
+
+[dependencies]
+# The agent's local API (status, joining, computers, pause, quit, start at login), blocking, no async runtime.
+craft-cloud-app.workspace = true
+# Join strings, read as the agent reads them, so a typo is shown before anything is sent.
+craft-cloud-proto.workspace = true
+# The single-instance channel's token.
+getrandom.workspace = true
+# The window: egui on eframe (wgpu; Wayland and X11 on Linux), as the launcher has it.
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11"] }
+egui.workspace = true
+# The folder's "Change…": the OS's own folder picker (the XDG portal on Linux, no GTK).
+rfd = { workspace = true }
+# The add-a-computer link as a QR code.
+qrcodegen.workspace = true
+# The app's icons (`assets/`, drawn by `cargo xtask icons`), decoded for the tray and the window.
+png.workspace = true
+
+[build-dependencies]
+# The exe's icon and version resource (Windows targets only; MSVC's rc.exe).
+winresource.workspace = true
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+tray-icon.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The app's start-at-login value under `HKCU\…\Run`.
+windows-registry.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
+
+[dev-dependencies]
+# The window's snapshots: kittest renders on wgpu (a CPU adapter where there is one); they are compared here with
+# `image`, not with kittest's own `snapshot` feature, which brings an MPL-2.0 crate.
+egui_kittest = { workspace = true, features = ["wgpu"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

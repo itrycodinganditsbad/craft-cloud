@@ -1,0 +1,10 @@
+# Written by the Craft Cloud app; signing out removes it.
+[Desktop Entry]
+Type=Application
+Name=Craft Cloud
+Comment=Craft Cloud in the tray: your cloud's sync, on this computer
+Exec="/home/zoë/My Apps/craft-cloud" --tray
+Icon=craft-cloud
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

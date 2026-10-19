@@ -1,5 +1,5 @@
 //! Windows: the value [`VALUE`] under `HKEY_CURRENT_USER\<run key>` ([`super::RUN_KEY`]), which Windows runs at the
-//! user's login: the background build, `"<dir>\craft-cloud-agent-bg.exe" run`, so no console window opens. The value
+//! user's login: the background build, `"<dir>\craft-cloud-agent-bg.exe" run --log`, so no console window opens. The value
 //! is written by [`run_value`], a pure function, so its format is tested on every OS; the registry is only touched on
 //! Windows.
 

@@ -10,14 +10,16 @@
 random port, per-start token in an owner-only file `local-api.json {schema, port, token, pid}` in the agent's data
 dir, exact `Host: 127.0.0.1:<port>`, any `Origin` refused, token only in `Authorization: Bearer`), plus one WebSocket
 per app connection for live sessions. `run` serves it while signed out too. Calls:
-- `POST /v1/login {server, user, password, folder?, device_name?, adopt?}` / `POST /v1/logout {local}` (the launcher's;
-  the password goes from the launcher to the agent, never to an app or a file);
+- `POST /v1/login {server, user, password, folder?, device_name?, adopt?}` / `POST /v1/logout {local}` (a sign-in
+  with a password, as `craft-cloud-agent login` makes; the password goes to the agent, never to an app or a file;
+  the Craft Cloud app joins with a code instead, and signs out with `logout`);
 - `POST /v1/join {join, folder?, device_name?, adopt, password?}` → status: parses the join string
   (`cloud.example.com/K7M4-Q9TX` or the link `https://cloud.example.com/join/K7M4-Q9TX`), checks what it can before
   the code is spent (the folder, the device name, the server's `/info`), redeems it and signs in as `login` does.
   Refused while signed in. A setup that fails after the code is spent (the folder is set up for another space)
   revokes the new device and says to make a new code. `password` only for an invite to a new account, which is
-  answered `password_required` without it;
+  answered `password_required` without it. A folder with files in it, without `adopt`, is answered
+  `folder_has_files` before anything reaches the server (as `login` is), so the app can ask and send it again;
 - `POST /v1/pairings` → `{id, join, link, expires_ms}` (a new add-a-computer code, replacing this device's open
   one), `GET /v1/pairings/{id}` → `{state: waiting|used|expired, device_name?}`, `DELETE /v1/pairings/{id}` → 204;
 - `GET /v1/devices` → the account's devices (`current` marks this one); `DELETE /v1/devices/{id}` revokes another one
@@ -32,14 +34,19 @@ per app connection for live sessions. `run` serves it while signed out too. Call
   `status.autostart` says whether it is on (absent where the agent doesn't handle it). Signing out turns it off. The
   entry belongs to the agent with the default data folder only; an agent with a data folder of its own is refused
   (`autostart_failed`), reports nothing and leaves the entry alone when it signs out;
-- `GET /v1/status` → `{api, signed_in, account, server, folder, machine, online, run_state, autostart?}`;
+- `GET /v1/status` → `{api, signed_in, account, server, folder, machine, online, run_state, autostart?,
+  last_sync_ms?, removed}` (`last_sync_ms`: when the last pass that didn't fail finished; `removed`: the server
+  refused this device at the last pass, so it was removed from the account and must sign out and join again). Something only a person can put
+  right found as `run` starts (a damaged or newer `account.json`, a damaged token) keeps the agent up, signed out with
+  `run_state` `paused` and the reason; every call but `logout` (which forgets the account here) and `quit` is answered
+  `needs_you` until then;
 - `GET /v1/recents` (WebSocket: subscribe per app, add an entry `{path, title?, saved}`, receive the list on change);
 - later: `open` (a path → its live document, created by import when absent; returns the state and then a stream
   of remote updates and presence), `update` (the app's local changes), `presence`, `close`.
 
 Errors use stable codes (`forbidden`, `wrong_password`, `already_signed_in`, `not_signed_in`, `offline`,
 `needs_you`, and for joining `invalid_code`, `password_required`, `weak_password`, `untrusted_certificate`,
-`cannot_remove_self`, `autostart_failed`). Every call has the same `Host`, `Origin` and token checks. Each request is answered before the next is read; a client that doesn't take a message within 10 s is
+`cannot_remove_self`, `autostart_failed`, `folder_has_files`). Every call has the same `Host`, `Origin` and token checks. Each request is answered before the next is read; a client that doesn't take a message within 10 s is
 disconnected, and the crate reconnects.
 
 **Server live endpoint** (agent ↔ server): `GET /api/v1/live` upgraded to a WebSocket, signed in with the device

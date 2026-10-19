@@ -3,7 +3,9 @@
 //! Pure Rust (std only). External tools (`cargo`) are invoked through `std::process::Command`.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod icons;
 mod licenses;
+mod package;
 mod version;
 
 use std::path::{Path, PathBuf};
@@ -13,8 +15,11 @@ const USAGE: &str = "\
 usage: cargo xtask <command>
 
 commands:
-  ci              fmt --check, licenses, clippy -D warnings, test (stops at first failure)
+  ci              fmt --check, licenses, icons --check, clippy -D warnings, test (stops at first failure)
   licenses        check every dependency's licence against the allow-list in AGENTS.md
+  icons [--check] draw the Craft Cloud app's icons into apps/craft-cloud-desktop/assets (or check they are current)
+  package         release builds packed for this OS into <target>/package: the Windows setup, the macOS app
+                  (zipped) or the Linux tarball
   version [set X.Y.Z[-pre]]
                   print the workspace version, or set it (Cargo.toml + Cargo.lock)
 ";
@@ -25,6 +30,8 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("ci") => cmd_ci(),
         Some("licenses") => licenses::run(),
+        Some("icons") => icons::run(&root(), &rest),
+        Some("package") => package::run(&root()),
         Some("version") => version::run(&root(), &rest),
         Some("-h" | "--help" | "help") | None => {
             print!("{USAGE}");
@@ -70,6 +77,7 @@ fn cmd_ci() -> Result<(), String> {
     let steps: Vec<Step> = vec![
         ("fmt", Box::new(|| cargo_step(&["fmt", "--all", "--", "--check"]))),
         ("licenses", Box::new(licenses::run)),
+        ("icons", Box::new(|| icons::run(&root(), &["--check"]))),
         ("clippy", Box::new(|| cargo_step(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))),
         ("test", Box::new(|| cargo_step(&["test", "--workspace"]))),
     ];

@@ -8,8 +8,13 @@ use std::collections::BTreeMap;
 const ALLOWED: &[&str] = &["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0", "Unicode-DFS-2016", "CC0-1.0"];
 
 /// Licences allowed only for data, in exactly these crates (`AGENTS.md`: "CDLA-Permissive-2.0 (data only, e.g. root
-/// certificates)").
-const DATA_ONLY: &[(&str, &[&str])] = &[("CDLA-Permissive-2.0", &["webpki-root-certs", "webpki-roots"])];
+/// certificates)"; the fonts egui ships, which the Craft Cloud app shows its text in: OFL-1.1 and the Ubuntu Font
+/// Licence).
+const DATA_ONLY: &[(&str, &[&str])] = &[
+    ("CDLA-Permissive-2.0", &["webpki-root-certs", "webpki-roots"]),
+    ("OFL-1.1", &["epaint_default_fonts"]),
+    ("Ubuntu-font-1.0", &["epaint_default_fonts"]),
+];
 
 /// MPL-2.0 (file-level copyleft) is allowed only for these crates, which Loro (the live documents' CRDT) depends on and
 /// which are used as published, never modified or copied from (`AGENTS.md`). `MPL-2.0+` is the old SPDX form they
@@ -17,8 +22,10 @@ const DATA_ONLY: &[(&str, &[&str])] = &[("CDLA-Permissive-2.0", &["webpki-root-c
 const MPL_UNMODIFIED: &[&str] = &["im", "bitmaps", "sized-chunks"];
 const MPL_IDS: &[&str] = &["MPL-2.0", "MPL-2.0+"];
 
-/// BSL-1.0 (the Boost licence, permissive) is allowed only for this crate, which Loro depends on (`AGENTS.md`).
-const BSL_CRATES: &[&str] = &["xxhash-rust"];
+/// BSL-1.0 (the Boost licence, permissive) is allowed only for these crates (`AGENTS.md`): `xxhash-rust`, which Loro
+/// depends on, and `clipboard-win` and `error-code`, the Windows clipboard under eframe (the Craft Cloud app's window),
+/// which eframe always builds with.
+const BSL_CRATES: &[&str] = &["xxhash-rust", "clipboard-win", "error-code"];
 
 /// Licence exceptions that only add permissions (`Apache-2.0 WITH LLVM-exception`).
 const EXCEPTIONS: &[&str] = &["LLVM-exception"];
@@ -182,6 +189,9 @@ mod tests {
         // Data licences only for the crates that are data.
         assert_eq!(permitted("webpki-root-certs", "CDLA-Permissive-2.0"), Ok(true));
         assert_eq!(permitted("some-crate", "CDLA-Permissive-2.0"), Ok(false));
+        assert_eq!(permitted("epaint_default_fonts", "(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0"), Ok(true));
+        assert_eq!(permitted("some-crate", "(MIT OR Apache-2.0) AND OFL-1.1"), Ok(false));
+        assert_eq!(permitted("clipboard-win", "BSL-1.0"), Ok(true));
         for broken in ["MIT OR", "(MIT", "MIT)", "AND MIT", "MIT WITH"] {
             assert!(permitted("some-crate", broken).is_err(), "{broken}");
         }

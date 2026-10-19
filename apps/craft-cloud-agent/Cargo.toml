@@ -52,6 +52,10 @@ path = "src/bin/bg.rs"
 name = "craft-cloud-agent"
 path = "src/main.rs"
 
+[build-dependencies]
+# The exes' icon and version resource (Windows targets only; MSVC's rc.exe).
+winresource.workspace = true
+
 [dev-dependencies]
 craft-cloud-chunker.workspace = true
 craft-cloud-meta = { workspace = true, features = ["test-support"] }

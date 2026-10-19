@@ -209,7 +209,7 @@ impl State {
     /// Tells the user `line` once (not again until something else was said).
     fn say(&mut self, line: String) {
         if self.said.as_ref() != Some(&line) {
-            eprintln!("{line}");
+            crate::runlog::note(format_args!("{line}"));
             self.said = Some(line);
         }
     }

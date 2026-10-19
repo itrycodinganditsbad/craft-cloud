@@ -75,8 +75,14 @@ pub enum Command {
         approve_deletes: Option<Option<String>>,
     },
     /// Keep the folder in sync until stopped (Ctrl-C): sync whenever something changes here or on the server, and
-    /// at least every 10 minutes. Ctrl-C lets a running pass finish; a second Ctrl-C stops at once.
-    Run,
+    /// at least every 10 minutes. Ctrl-C lets a running pass finish; a second Ctrl-C stops at once. Exits 0 at once,
+    /// with a note, when another agent runs for the same data folder.
+    Run {
+        /// Write what it says to `run.log` in the data folder (rotated at 10 MiB), not to the console: what the
+        /// start-at-login entries run.
+        #[arg(long)]
+        log: bool,
+    },
     /// Show the account, the folder, whether `run` is running and what it does, and the last pass.
     Status,
     /// Sign this device out on the server and forget the account here. The files stay.
@@ -229,7 +235,8 @@ impl AgentError {
             | AgentError::OtherAccountState(_)
             | AgentError::Server(TransportError::Protocol(_) | TransportError::QuotaExceeded { .. })
             | AgentError::Sync(SyncError::Corrupt(_))
-            | AgentError::Account(AccountError::Newer { .. } | AccountError::Damaged { .. }) => Exit::NeedsYou,
+            | AgentError::Account(AccountError::Newer { .. } | AccountError::Damaged { .. })
+            | AgentError::NeedsYou(_) => Exit::NeedsYou,
             AgentError::JoinSetup(inner) => inner.exit(),
             _ => Exit::Failed,
         }
@@ -308,6 +315,16 @@ pub enum AgentError {
     /// Removing the computer the request comes from.
     #[error("this is the computer you are using: to take it out of your cloud, sign out instead")]
     CannotRemoveSelf,
+    /// `login` or `join` without `--adopt` for a folder with files in it; found before anything reaches the server.
+    #[error(
+        "{} already has files in it; pass --adopt to sync them (files that differ from the server's become conflict copies; nothing is deleted)",
+        .0.display()
+    )]
+    FolderHasFiles(PathBuf),
+    /// Something found as `run` started that only a person can put right (the message says what); the agent waits,
+    /// serving the local API, until it is.
+    #[error("{0}")]
+    NeedsYou(String),
 }
 
 impl From<TransportError> for AgentError {
@@ -365,12 +382,12 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
             Ok(Exit::Done)
         }
         Command::Sync { approve_deletes } => Ok(sync(&data, Approve::from_flag(approve_deletes), out).await?.0),
-        Command::Run => {
+        Command::Run { .. } => {
             let (stop, stops) = tokio::sync::mpsc::unbounded_channel();
             let signals = tokio::spawn(forward_stop_signals(stop));
             let exit = crate::daemon::run_loop(&data, crate::daemon::RunOptions::default(), stops, out).await;
             signals.abort();
-            exit
+            ran(exit, out)
         }
         Command::Status => {
             status(&data, out)?;
@@ -616,6 +633,31 @@ fn print_devices(out: &mut impl Write, devices: &[craft_cloud_app::DeviceInfo]) 
     Ok(())
 }
 
+/// How `run` ended, as the process exits: another agent holding the data folder is no failure (a start at login may
+/// race the app starting one), so it is said in one line and ends with 0, and no service manager restarts it.
+pub fn ran(result: Result<Exit, AgentError>, out: &mut impl Write) -> Result<Exit, AgentError> {
+    match result {
+        Err(AgentError::Lock(LockError::Busy(path))) => {
+            say!(out, "another craft-cloud-agent is already running for this data folder ({} is locked); this one exits", path.display())?;
+            Ok(Exit::Done)
+        }
+        other => other,
+    }
+}
+
+/// The log the command line `args` writes to: `run.log` in its data folder (opened and installed for
+/// [`crate::runlog::note`]) for `run --log`, or for every command when `always` (the background build, which has no
+/// console). `None` otherwise, or when it can't be opened: the output then goes where it would.
+pub fn log_for(args: &[std::ffi::OsString], always: bool) -> Option<crate::runlog::RunLog> {
+    let cli = Cli::try_parse_from(args).ok();
+    let wanted = always || cli.as_ref().is_some_and(|cli| matches!(cli.command, Command::Run { log: true }));
+    if !wanted {
+        return None;
+    }
+    let data = DataDir::resolve(cli.and_then(|cli| cli.data_dir)).ok()?;
+    crate::runlog::open_in(&data)
+}
+
 /// The agent's `main`, for both builds (the console one and the background one): parses `args` (the program's name
 /// first), runs the command, and writes an error to `err`. Returns the exit code, and whether the command was `run`
 /// (after a second stop the caller ends the process at once rather than wait for a pass to finish).
@@ -631,7 +673,7 @@ pub async fn main(args: Vec<std::ffi::OsString>, input: &mut impl BufRead, out: 
             return (if failed { Exit::Failed } else { Exit::Done }, false);
         }
     };
-    let looping = matches!(cli.command, Command::Run);
+    let looping = matches!(cli.command, Command::Run { .. });
     let exit = match run(cli, input, out).await {
         Ok(exit) => exit,
         Err(e) => {
@@ -890,12 +932,12 @@ fn default_folder() -> Result<PathBuf, AgentError> {
     home.map(|h| h.join("Craft Cloud")).ok_or_else(|| AgentError::Usage("can't find your home folder; pass --folder".into()))
 }
 
-/// Takes the lock at `path` for as long as the result lives, printing a warning (to standard error, so it never
-/// mixes into the output a script reads) if the filesystem can't lock.
+/// Takes the lock at `path` for as long as the result lives, noting a warning (on standard error, so it never mixes
+/// into the output a script reads, or in `run.log`) if the filesystem can't lock.
 fn hold(path: &Path) -> Result<Lock, AgentError> {
     let (held, warning) = lock::acquire(path)?;
     if let Some(warning) = warning {
-        eprintln!("{warning}");
+        crate::runlog::note(format_args!("{warning}"));
     }
     Ok(held)
 }
@@ -1098,10 +1140,7 @@ fn prepare(data: &DataDir, folder: Option<&Path>, device_name: Option<&str>, ado
             return Err(AgentError::Usage(format!("{} is not a folder", folder.display())));
         }
         if !adopt && has_files(&folder)? {
-            return Err(AgentError::Usage(format!(
-                "{} already has files in it; pass --adopt to sync them (files that differ from the server's become conflict copies; nothing is deleted)",
-                folder.display()
-            )));
+            return Err(AgentError::FolderHasFiles(folder));
         }
     }
     let existing_marker = root::read(&folder)?;
@@ -1370,7 +1409,7 @@ impl Session {
             return Err(AgentError::OtherAccountState(data.path().join(crate::account::STATE_FILE)));
         }
         for node in drop_holds_without_links(&mut saved.state) {
-            eprintln!("a held delete saved without any link was dropped (node {node}; state.json was edited or damaged)");
+            crate::runlog::note(format_args!("a held delete saved without any link was dropped (node {node}; state.json was edited or damaged)"));
         }
         let mut fs = DiskFs::new(&account.folder).with_device_name(account.device_name.clone());
         if let Some(stability) = stability.clone() {
@@ -1563,6 +1602,9 @@ fn print_waiting(out: &mut impl Write, s: &PassSummary) -> Result<(), AgentError
     Ok(())
 }
 
+/// How a signed-out agent is signed in, as `status` and `run` say it.
+pub const SIGN_IN_HINT: &str = "open the Craft Cloud app, or run `craft-cloud-agent join <join string>`";
+
 /// Prints the account, the folder and the last pass. Never prints the token.
 pub fn status(data: &DataDir, out: &mut impl Write) -> Result<(), AgentError> {
     let Some(account) = data.load_account()? else {
@@ -1570,7 +1612,7 @@ pub fn status(data: &DataDir, out: &mut impl Write) -> Result<(), AgentError> {
         if let Ok(Some(loop_status)) = data.load_status()
             && loop_status.running(now_ms())
         {
-            say!(out, "agent: running (pid {}), waiting for a sign-in (`craft-cloud-agent login`, or the launcher)", loop_status.pid)?;
+            say!(out, "agent: running (pid {}), waiting for a sign-in: {SIGN_IN_HINT}", loop_status.pid)?;
         }
         return Ok(());
     };

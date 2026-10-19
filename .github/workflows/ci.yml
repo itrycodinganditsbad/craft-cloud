@@ -22,10 +22,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The server targets Linux; the sync agent also runs on Windows and macOS.
-        os: [ubuntu-latest, windows-latest]
+        # The server targets Linux; the sync agent and the Craft Cloud app also run on Windows and macOS (whose
+        # start-at-login code only compiles there).
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+
+      # The Craft Cloud app's window (egui on winit and wgpu) needs these headers on Linux, and its snapshot tests a
+      # CPU renderer (Mesa's lavapipe). Its tray and folder picker talk D-Bus in pure Rust: no GTK or libdbus.
+      - name: Install Linux system dependencies (egui/winit, lavapipe)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev mesa-vulkan-drivers
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -47,6 +57,11 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+      # The app bundle is built only on macOS: CI checks it builds (unsigned, not published).
+      - name: Package (macOS app bundle)
+        if: runner.os == 'macOS'
+        run: cargo xtask package
 
   backends:
     name: Postgres and S3 backends

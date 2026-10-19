@@ -3,7 +3,7 @@
 Type=Application
 Name=Craft Cloud agent
 Comment=Keeps the synced folder in step with the server
-Exec="/home/zoë/My Apps/craft-cloud-agent" "run"
+Exec="/home/zoë/My Apps/craft-cloud-agent" "run" "--log"
 NoDisplay=true
 Terminal=false
 X-GNOME-Autostart-enabled=true

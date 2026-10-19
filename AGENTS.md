@@ -31,13 +31,17 @@ crates/
   store     craft-cloud-store     blob store: disk, S3, memory; checks every blob in and out
   meta      craft-cloud-meta      metadata on SQLite or Postgres; the batch commit; the change feed; invites and pairings (`join.rs`)
   sync      craft-cloud-sync      the sync engine over `Fs`/`Transport` traits; `MemFs`; scenario tests and the simulation
-  app       craft-cloud-app       what apps and the launcher link: a blocking client of the agent's local API (status, sign-in, joining, computers, pause, autostart, recents)
+  app       craft-cloud-app       what apps link: a blocking client of the agent's local API (status, sign-in, joining, computers, pause, autostart, recents)
 apps/
   craft-cloud-server              HTTP API (`/api/v1`), the live service (`/api/v1/live`, `live.rs`), join codes (`join.rs`: pairings, join, the `/join/{code}` page), auth, admin CLI (`init`, `serve`, `user` with `invite`, `device`, `reset-epoch`, `live`)
   craft-cloud-agent               the sync agent: real disk `Fs`, HTTP `Transport` over a `Connection`, saved account and state, root marker, CLI (`login`, `join`, `run`, `sync`, `status`, `logout`, `recents`, `add-computer`, `devices`, `pause`, `resume`, `quit`, `autostart`), the `run` loop, the local API (`local_api.rs`), the live hub (`live/`: recents document, replica, store, link, hub), start at login (`autostart/`: Windows, macOS, Linux), the background build (`src/bin/bg.rs`, logging to `runlog.rs`)
     tests/network/                the simulation over a simulated network (turmoil): `main.rs` histories and scenarios, `harness.rs` server and agent hosts
     tests/recents_sim.rs          the recents convergence simulation: replicas against the server's live sessions
-xtask/                            cargo xtask ci | licenses | version
+  craft-cloud-desktop             the Craft Cloud app (`craft-cloud`, eframe/egui): the pure model (`model.rs`), the agent behind a trait and calls on threads (`agent.rs`), starting the agent (`start_agent.rs`), one app per user (`single_instance.rs`), the window (`ui/`, `app.rs`), the tray (`tray/`: tray-icon in the window's process on Windows and macOS; on Linux a StatusNotifierItem over zbus in a process of its own, `craft-cloud --tray`, `tray/process.rs`, since Wayland can't hide a window), the app's own start at login (`autostart.rs`), its icons (`assets/`, drawn by `cargo xtask icons`)
+    tests/snapshots/              every screen as kittest draws it (`UPDATE_SNAPSHOTS=1` redraws them)
+  craft-cloud-setup               the Windows setup (`craft-cloud-setup.exe`): install, upgrade, move from a hand-made install, `--uninstall`; the exes built in by `cargo xtask package`
+packaging/linux/                  the Linux tarball's `install.sh` and `uninstall.sh` (into `~/.local`)
+xtask/                            cargo xtask ci | licenses | icons | package | version
 docs/                             design documents and the self-hosting guide
 ```
 
@@ -48,7 +52,11 @@ runtime. The agent depends on `proto`, `sync` and `app` (its `recents` commands 
 tests also run the server on a loopback port, and `tests/network/` runs the server's router and agents over
 `turmoil` (a dev-dependency: the shipped binaries never link it). That test target includes sync's test harness
 (`crates/sync/tests/common/`) by `#[path]`, so the agent's dev-dependencies mirror sync's test ones, and a change
-there can break the agent's tests: run both (`cargo xtask ci` does).
+there can break the agent's tests: run both (`cargo xtask ci` does). The app (`craft-cloud-desktop`) depends on
+`app` and `proto` only, never on the agent: it reaches the agent through the local API and starts its binary. The
+setup (`craft-cloud-setup`) depends on nothing in the workspace: it stops and moves the agent through the agent's own
+local API (`POST /v1/quit`, then its process is waited for and, after a minute, ended) and command line
+(`autostart on`).
 
 Backend tests (Postgres, S3) skip unless their environment variables are set; see `.github/workflows/ci.yml`
 for the variables and the test containers. Set `CRAFT_CLOUD_REQUIRE_BACKENDS=1` to make a skip a failure.
@@ -67,9 +75,10 @@ talks to, any vendor's cloud.
   Seafile, and similar). Don't read their source while working on the matching feature here.
   MPL-2.0 code (Syncthing) is not copied either.
 - Dependencies must be permissively licensed (MIT, Apache-2.0, BSD, ISC, Zlib, Unicode, CC0, CDLA-Permissive-2.0 (data only, e.g. root certificates)).
-  Named exceptions, for what Loro (the live documents' CRDT) needs and for no other crate: MPL-2.0 for `im`,
-  `bitmaps` and `sized-chunks`, used as published and never modified or copied from; BSL-1.0 (the Boost licence)
-  for `xxhash-rust`.
+  Named exceptions, for no other crate: for what Loro (the live documents' CRDT) needs, MPL-2.0 for `im`, `bitmaps`
+  and `sized-chunks`, used as published and never modified or copied from, and BSL-1.0 (the Boost licence) for
+  `xxhash-rust`; for the Craft Cloud app's window (eframe), BSL-1.0 for `clipboard-win` and `error-code` (the
+  Windows clipboard), and OFL-1.1 and the Ubuntu Font Licence (data only) for the fonts in `epaint_default_fonts`.
   Adding one means checking its license and every transitive license. `cargo xtask licenses` (part of
   `cargo xtask ci` and CI) checks every crate in the build against this list; a data-only licence is allowed
   only for the crates named in `xtask/src/licenses.rs`.

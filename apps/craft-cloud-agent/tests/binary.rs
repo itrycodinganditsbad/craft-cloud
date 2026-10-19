@@ -162,3 +162,79 @@ fn a_damaged_account_file_exits_3() {
         assert!(err.contains("account.json") && err.contains("move it away"), "{command}: {err}");
     }
 }
+
+/// Waits (up to 30 s) until the agent with data folder `data` answers on its local API.
+fn running_agent(data: &std::path::Path) -> craft_cloud_app::Client {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match craft_cloud_app::Client::connect_in(data) {
+            Ok(client) => return client,
+            Err(e) => assert!(std::time::Instant::now() < deadline, "the agent's local API comes up: {e}"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Waits (up to 30 s) for a child to end.
+fn ended(child: &mut Child) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            return status;
+        }
+        assert!(std::time::Instant::now() < deadline, "the agent ends");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// `run --log` (what every start-at-login entry runs) writes what it says to `run.log` in the data folder, the lines
+/// that went straight to standard error included, and nothing to the console. Signed out, it names the Craft Cloud app
+/// as the way to sign in.
+#[test]
+fn run_with_log_writes_to_run_log() {
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let mut child = Child(
+        Command::new(env!("CARGO_BIN_EXE_craft-cloud-agent"))
+            .args(["run", "--log"])
+            .env("CRAFT_CLOUD_AGENT_DIR", &data)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    running_agent(&data).quit().unwrap();
+    assert_eq!(ended(&mut child).code(), Some(0));
+    let mut console = String::new();
+    std::io::Read::read_to_string(&mut child.0.stdout.take().unwrap(), &mut console).unwrap();
+    std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut console).unwrap();
+    assert_eq!(console, "", "nothing on the console");
+    let log = std::fs::read_to_string(data.join("run.log")).unwrap();
+    assert!(log.contains("local API on 127.0.0.1:") && log.contains("stopped"), "{log}");
+    assert!(log.contains("open the Craft Cloud app") && !log.contains("launcher)"), "{log}");
+}
+
+/// A second `run` for a data folder another agent holds is no failure (start at login may start one while the app
+/// already did): it says so in one line and exits 0, so no service manager restarts it.
+#[test]
+fn a_second_run_exits_0_with_a_note() {
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let exe = env!("CARGO_BIN_EXE_craft-cloud-agent");
+    let mut first =
+        Child(Command::new(exe).arg("run").env("CRAFT_CLOUD_AGENT_DIR", &data).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let client = running_agent(&data);
+    let second = agent(&["run"], &data);
+    assert_eq!(second.status.code(), Some(0), "{second:?}");
+    let said = String::from_utf8_lossy(&second.stdout);
+    assert_eq!(said.lines().count(), 1, "{said}");
+    assert!(said.contains("already running"), "{said}");
+    // The status a signed-out agent's `status` shows names the app, not the launcher.
+    let status = agent(&["status"], &data);
+    let shown = String::from_utf8_lossy(&status.stdout);
+    assert!(shown.contains("open the Craft Cloud app") && !shown.contains("launcher"), "{shown}");
+    client.quit().unwrap();
+    assert_eq!(ended(&mut first).code(), Some(0));
+}

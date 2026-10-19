@@ -32,11 +32,11 @@ fn golden(name: &str) -> String {
     std::fs::read_to_string(path).unwrap().replace("\r\n", "\n")
 }
 
-/// The macOS agent, with launchd writing its output to `run.log` in the default data folder.
+/// The macOS agent, with launchd writing what it catches to `launchd.log` in the default data folder.
 fn mac_launch() -> Launch {
     Launch {
         exe: PathBuf::from("/Users/zoë/Library/Application Support/Craft Cloud & Co/craft-cloud-agent"),
-        log: Some(PathBuf::from("/Users/zoë/Library/Application Support/craft-cloud-agent/run.log")),
+        log: Some(PathBuf::from("/Users/zoë/Library/Application Support/craft-cloud-agent/launchd.log")),
     }
 }
 
@@ -63,6 +63,10 @@ fn the_entry_belongs_to_the_default_data_folder() {
     roots.default_data = Some(PathBuf::from("/home/zoë/.local/share/craft-cloud-agent"));
     assert!(roots.owns(Path::new("/home/zoë/.local/share/craft-cloud-agent")));
     assert!(!roots.owns(Path::new("/home/zoë/spare")));
+    // The same folder written another way.
+    assert!(roots.owns(Path::new("/home/zoë/.local/share/spare/../craft-cloud-agent")));
+    assert!(roots.owns(Path::new("/home/zoë/./.local/share/craft-cloud-agent/")));
+    assert!(!roots.owns(Path::new("/home/zoë/.local/share/craft-cloud-agent/../spare")));
     roots.default_data = None;
     assert!(!roots.owns(Path::new("/home/zoë/.local/share/craft-cloud-agent")), "no default: nobody's");
 }
