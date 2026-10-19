@@ -258,6 +258,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// A running agent for install.sh: a `sleep` of `lasts` seconds that isn't this test's child (so it never lingers
+    /// as a zombie), named in `local-api.json` in `data`. Its pid.
+    #[cfg(target_os = "linux")]
+    fn agent_process(data: &Path, lasts: u32) -> u32 {
+        let out = Command::new("sh").args(["-c", &format!("sleep {lasts} >/dev/null 2>&1 & echo $!")]).output().unwrap();
+        let pid = String::from_utf8_lossy(&out.stdout).trim().parse::<u32>().unwrap();
+        std::fs::write(data.join("local-api.json"), format!("{{\n  \"schema\": 1,\n  \"port\": 1,\n  \"token\": \"t\",\n  \"pid\": {pid}\n}}"))
+            .unwrap();
+        pid
+    }
+
     /// An unpacked tarball in a temporary home, with an agent stand-in that answers `quit` `quits` times (it runs,
     /// finishing a pass) and then no more, a `systemctl` stand-in, and the agent's systemd unit: lptp1's upgrade. The
     /// running agent's process is a `sleep` of `lasts` seconds (none for 0), named in `local-api.json`; every call
@@ -269,7 +280,7 @@ mod tests {
         src: PathBuf,
         calls: PathBuf,
         bin: PathBuf,
-        pid: Option<u32>,
+        pid: std::cell::Cell<Option<u32>>,
     }
 
     #[cfg(target_os = "linux")]
@@ -284,17 +295,7 @@ mod tests {
                 std::fs::create_dir_all(dir).unwrap();
             }
             // The agent's process: a `sleep` that isn't this test's child (so it never lingers as a zombie).
-            let pid = (lasts > 0).then(|| {
-                let out = Command::new("sh").args(["-c", &format!("sleep {lasts} >/dev/null 2>&1 & echo $!")]).output().unwrap();
-                String::from_utf8_lossy(&out.stdout).trim().parse::<u32>().unwrap()
-            });
-            if let Some(pid) = pid {
-                std::fs::write(
-                    data.join("local-api.json"),
-                    format!("{{\n  \"schema\": 1,\n  \"port\": 1,\n  \"token\": \"t\",\n  \"pid\": {pid}\n}}"),
-                )
-                .unwrap();
-            }
+            let pid = (lasts > 0).then(|| agent_process(&data, lasts));
             let pid_text = pid.map(|p| p.to_string()).unwrap_or_default();
             let note = format!("$(if [ -n \"{pid_text}\" ] && kill -0 {pid_text} 2>/dev/null; then echo ' [old agent running]'; fi)");
             let calls = tmp.join("calls.txt");
@@ -312,18 +313,21 @@ mod tests {
             std::fs::write(src.join("craft-cloud.png"), "png").unwrap();
             std::fs::write(src.join(LICENSES), "licences").unwrap();
             std::fs::copy(crate::root().join("packaging/linux/install.sh"), src.join("install.sh")).unwrap();
-            // systemd-run: one unit of a name at a time (`unit` marks it running); systemctl says so for is-active.
-            let unit = tmp.join("unit-running");
+            // systemd-run: one unit of a name at a time (a file in `units/` while it runs; it records its options);
+            // systemctl's is-active says whether a unit runs.
+            let units = tmp.join("units");
+            std::fs::create_dir_all(&units).unwrap();
             let systemctl = format!(
-                "#!/bin/sh\nif [ \"$3\" = is-active ]; then [ -e \"{unit}\" ]; exit; fi\necho \"systemctl $*{note}\" >> \"{calls}\"\n",
-                unit = unit.display(),
+                "#!/bin/sh\nif [ \"$3\" = is-active ]; then [ -e \"{units}/${{4%.service}}\" ]; exit; fi\necho \"systemctl $*{note}\" >> \"{calls}\"\n",
+                units = units.display(),
                 calls = calls.display()
             );
             std::fs::write(bin.join("systemctl"), systemctl).unwrap();
             let systemd_run = format!(
-                "#!/bin/sh\nopts=\"\"\nwhile [ \"${{1#--}}\" != \"$1\" ]; do opts=\"$opts $1\"; shift; done\n[ -e \"{unit}\" ] && exit 1\n\
-                 echo \"systemd-run$opts\" >> \"{calls}\"\ntouch \"{unit}\"\n(\"$@\"; rm -f \"{unit}\") >/dev/null 2>&1 &\n",
-                unit = unit.display(),
+                "#!/bin/sh\nopts=\"\"\nunit=\"\"\nwhile [ \"${{1#--}}\" != \"$1\" ]; do\n  opts=\"$opts $1\"\n  case \"$1\" in --unit=*) unit=${{1#--unit=}} ;; esac\n  shift\ndone\n\
+                 [ -e \"{units}/$unit\" ] && exit 1\necho \"systemd-run$opts\" >> \"{calls}\"\ntouch \"{units}/$unit\"\n\
+                 (\"$@\"; rm -f \"{units}/$unit\") >/dev/null 2>&1 &\n",
+                units = units.display(),
                 calls = calls.display()
             );
             std::fs::write(bin.join("systemd-run"), systemd_run).unwrap();
@@ -335,7 +339,7 @@ mod tests {
             let unit = home.join(".config/systemd/user/craft-cloud-agent.service");
             std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
             std::fs::write(&unit, "[Service]\nExecStart=/home/fabio/.local/bin/craft-cloud-agent run\n").unwrap();
-            Self { tmp, home, src, calls, bin, pid }
+            Self { tmp, home, src, calls, bin, pid: std::cell::Cell::new(pid) }
         }
 
         fn without_unit(self) -> Self {
@@ -344,14 +348,29 @@ mod tests {
         }
 
         fn install(&self, wait: &str) -> std::process::Output {
-            Command::new("sh")
-                .arg(self.src.join("install.sh"))
+            self.install_with(wait, &[])
+        }
+
+        /// install.sh, in a desktop session (a session bus), with `vars` set too.
+        fn install_with(&self, wait: &str, vars: &[(&str, &str)]) -> std::process::Output {
+            let mut sh = Command::new("sh");
+            sh.arg(self.src.join("install.sh"))
                 .env_clear()
                 .env("HOME", &self.home)
                 .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
-                .env("CRAFT_CLOUD_INSTALL_WAIT", wait)
-                .output()
-                .unwrap()
+                .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/test-session-bus")
+                .env("CRAFT_CLOUD_INSTALL_WAIT", wait);
+            for (name, value) in vars {
+                sh.env(name, value);
+            }
+            sh.output().unwrap()
+        }
+
+        /// A new agent runs (`lasts` seconds), busy with a pass: it answers one more `quit`.
+        fn agent_runs_again(&self, lasts: u32) {
+            let pid = agent_process(&self.home.join(".local/share/craft-cloud-agent"), lasts);
+            self.pid.set(Some(pid));
+            let _ = std::fs::remove_file(self.tmp.join("quits.txt"));
         }
 
         fn calls(&self) -> Vec<String> {
@@ -360,7 +379,7 @@ mod tests {
 
         /// The old agent's process ends (its pass is done).
         fn agent_ends(&self) {
-            if let Some(pid) = self.pid {
+            if let Some(pid) = self.pid.get() {
                 let _ = Command::new("kill").arg(pid.to_string()).status();
             }
         }
@@ -472,6 +491,61 @@ mod tests {
         let calls = up.calls();
         assert_eq!(calls.iter().filter(|c| c.starts_with("systemd-run")).count(), 1, "{calls:?}");
         assert_eq!(calls.iter().filter(|c| *c == start).count(), 1, "{calls:?}");
+    }
+
+    /// Without a unit, the waiter starts the agent in a unit of its own and ends: once the agent is up no waiter is
+    /// left, so a later install that gives up adds one again, and the agent is started again a second time.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn after_a_restart_without_a_unit_a_later_give_up_waits_again() {
+        let up = Upgrade::new("rerun", 1, 120).without_unit();
+        let lib = up.home.join(".local/lib/craft-cloud");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::copy(up.src.join("craft-cloud-agent"), lib.join("craft-cloud-agent")).unwrap();
+        let run = format!("{} run --log", up.lib_agent());
+        let waiter = "systemd-run --user --quiet --collect --unit=craft-cloud-agent-restart";
+        for round in 1..=2 {
+            let out = up.install("2");
+            assert_eq!(out.status.code(), Some(1), "round {round}: {out:?}");
+            up.agent_ends();
+            up.ends_with(&run);
+            let calls = up.calls();
+            assert_eq!(calls.iter().filter(|c| *c == waiter).count(), round, "a waiter each time: {calls:?}");
+            assert_eq!(calls.iter().filter(|c| **c == run).count(), round, "{calls:?}");
+            assert!(calls.iter().any(|c| c.starts_with("systemd-run --user --quiet --collect --unit=craft-cloud-agent-run-")), "{calls:?}");
+            // The waiter's unit is gone (the agent runs in its own).
+            let unit = up.tmp.join("units/craft-cloud-agent-restart");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while unit.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            assert!(!unit.exists(), "round {round}: the waiter has ended");
+            up.agent_runs_again(120);
+        }
+    }
+
+    /// A unit doesn't get the installer's environment: the variables that pick the agent's folders are passed to the
+    /// waiter's unit and the agent's, those that are set and no others.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_folder_variables_go_to_the_units() {
+        let up = Upgrade::new("setenv", 1, 120).without_unit();
+        let lib = up.home.join(".local/lib/craft-cloud");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::copy(up.src.join("craft-cloud-agent"), lib.join("craft-cloud-agent")).unwrap();
+        let data = up.home.join(".local/share/craft-cloud-agent").display().to_string();
+        let config = up.home.join("my config").display().to_string();
+        let out = up.install_with("2", &[("CRAFT_CLOUD_AGENT_DIR", &data), ("XDG_CONFIG_HOME", &config)]);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        up.agent_ends();
+        let calls = up.ends_with(&format!("{} run --log", up.lib_agent()));
+        let flags = format!(" --setenv=CRAFT_CLOUD_AGENT_DIR={data} --setenv=XDG_CONFIG_HOME={config}");
+        let units: Vec<&String> = calls.iter().filter(|c| c.starts_with("systemd-run")).collect();
+        assert_eq!(units.len(), 2, "the waiter's and the agent's: {calls:?}");
+        for unit in units {
+            assert!(unit.ends_with(&flags), "{unit}");
+            assert!(!unit.contains("XDG_DATA_HOME") && !unit.contains("XDG_STATE_HOME"), "only those set: {unit}");
+        }
     }
 
     /// Without systemd-run the waiter runs in the background of this shell (nohup).

@@ -45,41 +45,76 @@ has_unit() {
     [ -f "$unit" ] && command -v systemctl >/dev/null 2>&1
 }
 
-# Starts the agent again once the process $1 (or, with no pid known, the one whose local-api.json is in the data
-# folder) has ended and so let go of the data folder: an agent started before that finds the folder taken and exits.
-# Through systemd when $2 is "systemd", else `$3 run --log`. In the background: the wait may be long. Where the user
-# has systemd, the waiter is a unit of its own (systemd-run --user): it outlives this login session (logind's
-# KillUserProcesses), and its fixed name keeps it to one at a time; a second install that gives up finds it waiting.
+# The variables that pick the agent's folders, those that are set, as `"--setenv=NAME=${NAME}"` words for the
+# caller's `eval "set -- \"\$@\" $(env_flags)"`: a systemd unit doesn't get this shell's environment.
+env_flags() {
+    for name in CRAFT_CLOUD_AGENT_DIR XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME; do
+        if eval "[ -n \"\${$name+x}\" ]"; then
+            printf ' "--setenv=%s=${%s}"' "$name" "$name"
+        fi
+    done
+}
+
+# Whether the process $1 still runs and is still the one whose name (/proc/<pid>/comm) was $2: a pid of an agent that
+# has ended may be another program's by now.
+alive() {
+    kill -0 "$1" 2>/dev/null && { [ -z "$2" ] || [ "$(cat "/proc/$1/comm" 2>/dev/null)" = "$2" ]; }
+}
+
+# Starts the agent again once the process $1 (named $4; or, with no pid known, the one whose local-api.json is in the
+# data folder) has ended and so let go of the data folder: an agent started before that finds the folder taken and
+# exits. Through systemd when $2 is "systemd", else `$3 run --log`. In the background: the wait may be long.
+#
+# The waiter only waits: the agent it starts runs outside it (its own systemd unit, or detached), so the waiter is
+# gone once the agent is up. Where the user has systemd, the waiter is a unit of its own (systemd-run --user, with
+# the folder variables passed along): it outlives this login session for as long as the user's systemd runs (another
+# session, or lingering), and its fixed name keeps it to one at a time; a second install that gives up while it
+# waits finds it and adds none.
 start_after_exit() {
     waiter='
+        pid=$1 how=$2 agent=$3 data=$4 comm=$5
+        alive() {
+            kill -0 "$1" 2>/dev/null && { [ -z "$2" ] || [ "$(cat "/proc/$1/comm" 2>/dev/null)" = "$2" ]; }
+        }
         n=0
-        if [ -n "$1" ]; then
-            while kill -0 "$1" 2>/dev/null && [ "$n" -lt 86400 ]; do
+        if [ -n "$pid" ]; then
+            while alive "$pid" "$comm" && [ "$n" -lt 86400 ]; do
                 n=$((n + 1))
                 sleep 1
             done
         else
-            while [ -e "$4/local-api.json" ] && [ "$n" -lt 86400 ]; do
+            while [ -e "$data/local-api.json" ] && [ "$n" -lt 86400 ]; do
                 n=$((n + 1))
                 sleep 1
             done
             sleep 5
         fi
-        if [ "$2" = systemd ]; then
+        if [ "$how" = systemd ]; then
             systemctl --user start craft-cloud-agent.service
-        else
-            "$3" run --log
+            exit
+        fi
+        set --
+        for name in CRAFT_CLOUD_AGENT_DIR XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME; do
+            if eval "[ -n \"\${$name+x}\" ]"; then
+                eval "set -- \"\$@\" \"--setenv=$name=\${$name}\""
+            fi
+        done
+        if ! { command -v systemd-run >/dev/null 2>&1 && systemd-run --user --quiet --collect --unit="craft-cloud-agent-run-$$" "$@" "$agent" run --log >/dev/null 2>&1; }; then
+            nohup "$agent" run --log >/dev/null 2>&1 &
         fi
     '
+    w_pid=$1 w_how=$2 w_agent=$3 w_comm=$4
     if command -v systemd-run >/dev/null 2>&1; then
-        if systemd-run --user --quiet --collect --unit=craft-cloud-agent-restart /bin/sh -c "$waiter" sh "$1" "$2" "$3" "$data" >/dev/null 2>&1; then
+        set --
+        eval "set -- \"\$@\" $(env_flags)"
+        if systemd-run --user --quiet --collect --unit=craft-cloud-agent-restart "$@" /bin/sh -c "$waiter" sh "$w_pid" "$w_how" "$w_agent" "$data" "$w_comm" >/dev/null 2>&1; then
             return 0
         fi
         if command -v systemctl >/dev/null 2>&1 && systemctl --user --quiet is-active craft-cloud-agent-restart.service 2>/dev/null; then
             return 0
         fi
     fi
-    nohup sh -c "$waiter" sh "$1" "$2" "$3" "$data" >/dev/null 2>&1 &
+    nohup sh -c "$waiter" sh "$w_pid" "$w_how" "$w_agent" "$data" "$w_comm" >/dev/null 2>&1 &
 }
 
 # The agent that ran and was stopped is started again (once): this computer keeps syncing.
@@ -101,11 +136,11 @@ start_again() {
 give_up() {
     again=", and it starts again once done"
     if has_unit; then
-        start_after_exit "$pid" systemd ""
+        start_after_exit "$pid" systemd "" "$comm"
     elif [ -x "$lib/craft-cloud-agent" ]; then
-        start_after_exit "$pid" run "$lib/craft-cloud-agent"
+        start_after_exit "$pid" run "$lib/craft-cloud-agent" "$comm"
     elif command -v craft-cloud-agent >/dev/null 2>&1; then
-        start_after_exit "$pid" run "$(command -v craft-cloud-agent)"
+        start_after_exit "$pid" run "$(command -v craft-cloud-agent)" "$comm"
     else
         again=" (it stops once done; start it again with 'craft-cloud-agent run')"
     fi
@@ -122,9 +157,13 @@ stopped=0
 tries=0
 # Read before the quit: the agent removes the file as it stops.
 pid=$(agent_pid)
+comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
 while "$here/craft-cloud-agent" quit >/dev/null 2>&1; do
     was_running=1
-    [ -n "$pid" ] || pid=$(agent_pid)
+    if [ -z "$pid" ]; then
+        pid=$(agent_pid)
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+    fi
     tries=$((tries + 1))
     if [ "$tries" = 3 ]; then
         echo "Waiting for the Craft Cloud agent to finish its sync…"
@@ -136,7 +175,7 @@ while "$here/craft-cloud-agent" quit >/dev/null 2>&1; do
 done
 if [ "$was_running" = 1 ]; then
     if [ -n "$pid" ]; then
-        while kill -0 "$pid" 2>/dev/null; do
+        while alive "$pid" "$comm"; do
             tries=$((tries + 1))
             if [ "$tries" -ge "$wait_for" ]; then
                 give_up
