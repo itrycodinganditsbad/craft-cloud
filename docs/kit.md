@@ -157,8 +157,26 @@ its sync pass sees it; while the agent is away the session keeps the record and 
 adds it to the version it uploaded meanwhile (a server call of its own, appended once).
 
 The agent records it with the version it uploads, so two machines saving one live file never make a conflict copy:
-the save that includes the other's wins, or else the newer upload (the live document has both sides' edits, and the
-next save writes them all). A file edited outside Craft has no record: it gets a conflict copy as always, and the
+the save that includes the other's wins, or else the newer upload. The losing version is no conflict copy, but it
+stays in the server's history, and nothing of it is lost: the live document has both sides' edits.
+
+The live document is the truth and the file a copy of it, which may be late. To have it catch up on its own,
+autosave when the model is dirty **or** when `session.file_behind()` says the file lacks edits the live document has
+(another machine's, or this machine's after another machine's save won over this one's):
+
+```rust
+if autosave_due && (self.dirty || self.session.file_behind()) {
+    self.save(); // the order above
+}
+```
+
+The session knows the record of the file as it is on disk from the agent (it looks at the file of every open
+document each second), and from its own last save. `file_behind()` is false when no record of the file is known (an
+edit outside Craft is never written over by itself; an older agent), and when a save couldn't carry a record. Once
+every window's file has the live document's version, nobody saves again. When no app has the document open, nobody
+writes the file: it stays behind until the next open, which shows the live document and saves when it is behind.
+
+A file edited outside Craft has no record: it gets a conflict copy as always, and the
 kit says so on open (`status().changed_outside`), so the app can bring the file in as an ordinary local change
 (`local_change(model, file_model)`) or keep the live content. It is decided once, at the open, from the bytes the
 app read (`Session::open`'s `file_bytes`): the agent looks their hash up among this machine's records and the record

@@ -1,0 +1,238 @@
+//! Two machines with one live document open, both autosaving the way the kit says (when dirty, or when the file is
+//! behind the live document), against running agents and a real server: edits made at once on both, and saves made
+//! while the server is away, end with the file holding every edit on both machines, no conflict copy, and then no
+//! more saves (no loop).
+
+mod looping;
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use craft_cloud_kit::{Agent as KitAgent, ElemId, KitError, LiveDocument, Mappings, Open, RemotePatch, Session, TableSource, Value};
+use looping::{Agent, Server, eventually};
+
+/// The one column.
+const TEXT: ElemId = ElemId(1);
+
+/// A list of lines, a line per row.
+#[derive(Clone, Debug, PartialEq, Default)]
+struct Lines {
+    rows: Arc<Vec<(ElemId, String)>>,
+}
+
+impl Lines {
+    fn texts(&self) -> Vec<String> {
+        self.rows.iter().map(|(_, t)| t.clone()).collect()
+    }
+
+    fn with(&self, text: &str) -> Self {
+        let mut rows = (*self.rows).clone();
+        rows.push((ElemId::new(), text.to_owned()));
+        Self { rows: Arc::new(rows) }
+    }
+
+    fn to_file(&self) -> Vec<u8> {
+        self.texts().join("\n").into_bytes()
+    }
+
+    fn from_file(bytes: &[u8]) -> Self {
+        let text = String::from_utf8_lossy(bytes);
+        Self { rows: Arc::new(text.lines().filter(|l| !l.is_empty()).map(|l| (ElemId::new(), l.to_owned())).collect()) }
+    }
+}
+
+struct Rows<'a>(&'a Lines);
+
+impl TableSource for Rows<'_> {
+    fn key(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.0.rows) as usize)
+    }
+
+    fn rows(&self) -> Vec<ElemId> {
+        self.0.rows.iter().map(|(id, _)| *id).collect()
+    }
+
+    fn columns(&self) -> Vec<ElemId> {
+        vec![TEXT]
+    }
+
+    fn cell(&self, row: ElemId, column: ElemId) -> Option<Value> {
+        (column == TEXT).then(|| self.0.rows.iter().find(|(id, _)| *id == row).map(|(_, t)| Value::from(t.as_str()))).flatten()
+    }
+
+    fn cells(&self) -> Vec<(ElemId, ElemId, Value)> {
+        self.0.rows.iter().map(|(id, t)| (*id, TEXT, Value::from(t.as_str()))).collect()
+    }
+}
+
+struct LinesApp;
+
+impl LiveDocument for LinesApp {
+    type Doc = Lines;
+    const APP: &'static str = "lines";
+    const SCHEMA: u32 = 1;
+
+    fn mappings(doc: &Lines) -> Mappings<'_> {
+        Mappings::new().table("lines", Rows(doc))
+    }
+
+    fn apply_remote(old: &Arc<Lines>, patch: &RemotePatch<'_>) -> Result<Arc<Lines>, KitError> {
+        let Some(table) = patch.table("lines") else { return Ok(old.clone()) };
+        let rows =
+            table.rows().into_iter().map(|row| (row, table.cell(row, TEXT).and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default())).collect();
+        Ok(Arc::new(Lines { rows: Arc::new(rows) }))
+    }
+
+    fn normalise(_doc: &mut Lines) {}
+
+    fn refresh_derived(_doc: &mut Lines) {}
+}
+
+const FILE: &str = "n.lines";
+
+/// What the two windows share with the test.
+#[derive(Default)]
+struct Shared {
+    stop: AtomicBool,
+    saves: AtomicUsize,
+    /// When the last save was made, in ms since the test started.
+    last_save_ms: AtomicU64,
+    /// Windows done with their first half of edits, and with all.
+    half_done: AtomicUsize,
+    edits_done: AtomicUsize,
+    /// The second half may start (the server is away).
+    second_half: AtomicBool,
+}
+
+/// One window: opens the file live, adds `edits` lines (one every 40 ms), and autosaves (at most every 100 ms) when
+/// dirty or when the file is behind, in the kit's order (save point, record, then the write), until told to stop.
+/// Its model and whether its file was behind at the end.
+fn window(client: craft_cloud_app::Client, folder: PathBuf, name: &'static str, edits: usize, shared: Arc<Shared>, t0: Instant) -> (Lines, bool) {
+    let path = folder.join(FILE);
+    let bytes = std::fs::read(&path).unwrap();
+    let agent = KitAgent::from_fn(move || Ok(client.clone()));
+    let mut session = match Session::<LinesApp>::open(&agent, FILE, Arc::new(Lines::from_file(&bytes)), Some(&bytes)).unwrap() {
+        Open::Live(s) => *s,
+        Open::NotLive(why) => panic!("{name}: not live: {why:?}"),
+    };
+    let (mut made, mut dirty, mut next_edit, mut last_save) = (0, false, Instant::now(), Instant::now() - Duration::from_secs(1));
+    let tmp = folder.parent().unwrap().join(format!(".{name}.tmp"));
+    while !shared.stop.load(Ordering::SeqCst) {
+        session.poll();
+        let may = made < edits / 2 || (made < edits && shared.second_half.load(Ordering::SeqCst));
+        if may && Instant::now() >= next_edit {
+            let old = session.model().clone();
+            let new = Arc::new(old.with(&format!("{name} {made}")));
+            if session.local_change(&old, &new).is_ok() {
+                made += 1;
+                dirty = true;
+                if made == edits / 2 {
+                    shared.half_done.fetch_add(1, Ordering::SeqCst);
+                }
+                if made == edits {
+                    shared.edits_done.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            next_edit = Instant::now() + Duration::from_millis(40);
+        }
+        if (dirty || session.file_behind()) && last_save.elapsed() >= Duration::from_millis(100) {
+            let point = session.save_point().unwrap();
+            let bytes = point.model().to_file();
+            session.record(&point, &bytes);
+            std::fs::write(&tmp, &bytes).unwrap();
+            std::fs::rename(&tmp, &path).unwrap();
+            dirty = false;
+            last_save = Instant::now();
+            shared.saves.fetch_add(1, Ordering::SeqCst);
+            shared.last_save_ms.store(t0.elapsed().as_millis() as u64, Ordering::SeqCst);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let behind = session.file_behind();
+    (session.model().as_ref().clone(), behind)
+}
+
+/// Every file in `folder`, by name.
+fn files(folder: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(folder)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap()))
+        .collect();
+    out.sort();
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn both_machines_autosaving_end_with_every_edit_in_the_file_and_stop() {
+    let server = Server::new().await;
+    let (pc, laptop) = (Agent::signed_in(&server, "pc").await, Agent::signed_in(&server, "laptop").await);
+    let (run_pc, run_laptop) = (pc.run(), laptop.run());
+    let (on_pc, on_laptop) = (pc.client().await, laptop.client().await);
+    std::fs::create_dir_all(&pc.folder).unwrap();
+    std::fs::write(pc.folder.join(FILE), "start").unwrap();
+    let there = laptop.folder.join(FILE);
+    eventually("the file reached the laptop", move || there.exists().then_some(())).await;
+    let shared = Arc::new(Shared::default());
+    let t0 = Instant::now();
+    // The pc opens first (it imports the file), then the laptop.
+    let (s, folder, c) = (shared.clone(), pc.folder.clone(), on_pc.clone());
+    let first = std::thread::spawn(move || window(c, folder, "pc", 12, s, t0));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (s, folder, c) = (shared.clone(), laptop.folder.clone(), on_laptop.clone());
+    let second = std::thread::spawn(move || window(c, folder, "laptop", 12, s, t0));
+    // Halfway, the server goes away: both make the rest of their edits and save them; their saves go up once it is
+    // back, and the later upload wins without the other's last edits in it. Nothing is edited after that: only the
+    // file being behind makes the other window save again.
+    let s = shared.clone();
+    eventually("both windows made half their edits", move || (s.half_done.load(Ordering::SeqCst) == 2).then_some(())).await;
+    server.gate.down();
+    shared.second_half.store(true, Ordering::SeqCst);
+    let s = shared.clone();
+    eventually("both windows made their edits", move || (s.edits_done.load(Ordering::SeqCst) == 2).then_some(())).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    server.gate.up();
+    // Settled: both files have every line (the first, and 12 from each), alike, and no save for 3 s.
+    let (pc_folder, laptop_folder, s) = (pc.folder.clone(), laptop.folder.clone(), shared.clone());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (on_pc, on_laptop) = (files(&pc_folder), files(&laptop_folder));
+        let full = |f: &[(String, Vec<u8>)]| f.len() == 1 && Lines::from_file(&f[0].1).rows.len() == 25;
+        let quiet = t0.elapsed().as_millis() as u64 > s.last_save_ms.load(Ordering::SeqCst) + 3000;
+        if full(&on_pc) && on_pc == on_laptop && quiet {
+            break;
+        }
+        let show = |f: &[(String, Vec<u8>)]| f.iter().map(|(n, d)| format!("{n}: {}", String::from_utf8_lossy(d))).collect::<Vec<_>>();
+        assert!(
+            Instant::now() < deadline,
+            "never settled: pc {:?}, laptop {:?}, {} saves",
+            show(&on_pc),
+            show(&on_laptop),
+            s.saves.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Still quiet a while later: no save loop.
+    let saves = shared.saves.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(shared.saves.load(Ordering::SeqCst), saves, "no more saves once the file has everything");
+    shared.stop.store(true, Ordering::SeqCst);
+    let (model_pc, behind_pc) = tokio::task::spawn_blocking(move || first.join().unwrap()).await.unwrap();
+    let (model_laptop, behind_laptop) = tokio::task::spawn_blocking(move || second.join().unwrap()).await.unwrap();
+    assert!(!behind_pc && !behind_laptop);
+    let mut want = model_pc.texts();
+    want.sort();
+    let mut got = model_laptop.texts();
+    got.sort();
+    assert_eq!(want, got);
+    assert_eq!(want.len(), 25, "every edit: {want:?}");
+    let file = Lines::from_file(&files(&pc.folder)[0].1).texts();
+    assert_eq!(file, model_pc.texts(), "the file is the live document");
+    // Bounded: every save is an edit's, or one to catch up after another machine's save won.
+    assert!(saves <= 24 + 12, "{saves} saves");
+    run_pc.stop().await.0.unwrap();
+    run_laptop.stop().await.0.unwrap();
+}

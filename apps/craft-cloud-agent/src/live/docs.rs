@@ -217,6 +217,7 @@ async fn send_out(socket: &mut WebSocket, out: DocOut) -> bool {
         DocOut::Status { doc, online, waiting, deleted, stopped } => {
             send_json(socket, &DocsEvent::Status { doc, online, waiting, deleted, stopped }).await
         }
+        DocOut::File { doc, version } => send_json(socket, &DocsEvent::File { doc, version }).await,
     }
 }
 

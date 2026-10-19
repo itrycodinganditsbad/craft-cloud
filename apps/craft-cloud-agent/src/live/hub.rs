@@ -91,6 +91,8 @@ pub enum DocOut {
     Presence { id: u64, bytes: Arc<Vec<u8>> },
     /// How the document stands now.
     Status { doc: DocId, online: bool, waiting: u64, deleted: bool, stopped: bool },
+    /// The record of the document's file as it is on disk now (the live document's version it was saved from).
+    File { doc: DocId, version: Option<Vec<(u64, u32)>> },
 }
 
 /// What a docs connection asks the hub.
@@ -335,7 +337,21 @@ struct Docs {
     opens: HashMap<(ConnId, u64), (AppName, Option<u64>, Option<String>)>,
     /// The Loro peers lent to open documents.
     leases: Leases,
+    /// Each open document's file as last looked at: its length and modification time then, its content's hash, and
+    /// the record its apps were last told.
+    files: HashMap<DocId, FileSeen>,
 }
+
+/// A document's file as last looked at ([`State::tell_files`]).
+#[derive(Default)]
+struct FileSeen {
+    stamp: Option<(u64, std::time::SystemTime)>,
+    hash: Option<craft_cloud_proto::FileHash>,
+    told: Option<Option<Vec<(u64, u32)>>>,
+}
+
+/// How often the files of open documents are looked at (whether a save, here or synced from elsewhere, changed them).
+const FILES_LOOK_EVERY: Duration = Duration::from_secs(1);
 
 /// `text` cut to `max` bytes at a character boundary, without control characters.
 fn clean(text: &str, max: usize) -> String {
@@ -551,7 +567,12 @@ impl State {
         self.replica.set_open(doc, true);
         let (online, waiting_n) = self.replica.document_status(doc).unwrap_or((false, 0));
         let state = DocState { online, waiting: waiting_n, bytes: snapshot.len() as u64, updates: waiting.len() as u64 };
-        self.tell(conn, DocOut::Opened { id, doc, state, peer, changed_outside, snapshot, waiting })
+        let mut frames = self.tell(conn, DocOut::Opened { id, doc, state, peer, changed_outside, snapshot, waiting });
+        // The file's record, to this open now (and to the others if it changed).
+        let version = self.file_record(doc);
+        frames.extend(self.tell(conn, DocOut::File { doc, version }));
+        self.tell_files();
+        frames
     }
 
     /// Whether the file content `hash` (hex) an app read for `doc` was edited outside Craft (see
@@ -566,6 +587,68 @@ impl State {
         });
         let remote = state.remote.get(&node).and_then(|r| r.file.as_ref());
         super::saves::changed_outside(doc, hash, saved_here, base, remote)
+    }
+
+    /// Tells the apps of each open document the record of its file as it is on disk now, when that changed (after
+    /// an open, every [`FILES_LOOK_EVERY`]).
+    fn tell_files(&mut self) {
+        let open: Vec<DocId> = {
+            let mut docs: Vec<DocId> = self.docs.conns.values().flat_map(|c| c.handles.values().copied()).collect();
+            docs.sort_unstable();
+            docs.dedup();
+            docs
+        };
+        self.docs.files.retain(|doc, _| open.contains(doc));
+        for doc in open {
+            let version = self.file_record(doc);
+            let seen = self.docs.files.entry(doc).or_default();
+            if seen.told.as_ref() == Some(&version) {
+                continue;
+            }
+            seen.told = Some(version.clone());
+            let mut conns: Vec<ConnId> = self.handles_of(doc).into_iter().map(|(conn, _)| conn).collect();
+            conns.dedup();
+            for conn in conns {
+                let _ = self.tell(conn, DocOut::File { doc, version: version.clone() });
+            }
+        }
+    }
+
+    /// The record of `doc`'s file as it is on disk: a save this machine's apps made of that content, or the server's
+    /// version's record when the file is that version. None when no record is known (or the file can't be read).
+    fn file_record(&mut self, doc: DocId) -> Option<Vec<(u64, u32)>> {
+        let node = self.replica.document_node(doc)?;
+        let folder = self.config.folder.clone();
+        let state = self.lookup.state()?;
+        let rel = state.base_path(node)?;
+        let (base, remote) = match (&state.base.get(&node)?.kind, state.remote.get(&node).and_then(|r| r.file.as_ref())) {
+            (craft_cloud_sync::BaseKind::File { version, hash, .. }, remote) => ((*version, *hash), remote.cloned()),
+            _ => return None,
+        };
+        let path = rel.names().iter().fold(folder, |p, name| p.join(name.as_str()));
+        let meta = std::fs::metadata(&path).ok()?;
+        let stamp = Some((meta.len(), meta.modified().ok()?));
+        let seen = self.docs.files.entry(doc).or_default();
+        if seen.stamp != stamp || seen.hash.is_none() {
+            // Read again only when the file changed (an unchanged file of the agreed size is mostly the agreed
+            // content, but only reading it says so).
+            if meta.len() > MAX_SNAPSHOT_BYTES as u64 {
+                return None;
+            }
+            seen.hash = std::fs::read(&path).ok().map(|bytes| craft_cloud_proto::FileHash::from_bytes(*blake3::hash(&bytes).as_bytes()));
+            seen.stamp = stamp;
+        }
+        let hash = seen.hash?;
+        let hex: String = hash.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        if let Some(record) = self.saves.find(doc, &hex) {
+            return Some(record.version);
+        }
+        let (version, agreed) = base;
+        let remote = remote?;
+        if hash != agreed || remote.version != version {
+            return None;
+        }
+        remote.save.filter(|s| s.doc == doc).map(|s| s.version)
     }
 
     /// The Loro peer for open `id` on `conn` of `doc` (the one it has already, or the one it asked for again if free).
@@ -1004,6 +1087,7 @@ async fn run(
     let mut resend = tokio::time::interval(RESEND_EVERY);
     let mut look = tokio::time::interval(NODE_LOOK_EVERY);
     let mut write_documents = tokio::time::interval(DOCUMENTS_FLUSH_EVERY);
+    let mut look_files = tokio::time::interval(FILES_LOOK_EVERY);
     loop {
         if state.socket.is_none() && dialing.is_none() && !state.paused && Instant::now() >= state.retry_at {
             let (server, token) = (state.config.server.clone(), state.config.token.clone());
@@ -1115,6 +1199,9 @@ async fn run(
             _ = look.tick(), if !state.docs.lookups.is_empty() => {
                 let frames = state.look_again();
                 state.send(frames).await;
+            }
+            _ = look_files.tick(), if !state.docs.files.is_empty() || state.docs.conns.values().any(|c| !c.handles.is_empty()) => {
+                state.tell_files();
             }
             _ = write_documents.tick() => {
                 if let Err(e) = state.replica.flush_documents() {

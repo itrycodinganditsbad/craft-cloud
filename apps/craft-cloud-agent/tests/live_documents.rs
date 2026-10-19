@@ -434,14 +434,14 @@ mod raw {
         }
     }
 
-    /// The next control message, skipping binary ones and `status` events (which come whenever the document's state
-    /// changes, between any two answers).
+    /// The next control message, skipping binary ones and `status` and `file` events (which come whenever the
+    /// document's state or its file changes, between any two answers).
     pub async fn next_json(ws: &mut Ws) -> Option<serde_json::Value> {
         loop {
             match next(ws).await? {
                 Message::Text(text) => {
                     let value: serde_json::Value = serde_json::from_str(text.as_str()).ok()?;
-                    if value["type"] != "status" {
+                    if value["type"] != "status" && value["type"] != "file" {
                         return Some(value);
                     }
                 }

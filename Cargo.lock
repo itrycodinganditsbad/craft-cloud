@@ -1119,6 +1119,7 @@ dependencies = [
  "clap",
  "craft-cloud-app",
  "craft-cloud-chunker",
+ "craft-cloud-kit",
  "craft-cloud-meta",
  "craft-cloud-proto",
  "craft-cloud-server",

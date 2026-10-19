@@ -509,6 +509,83 @@ fn changed_outside_is_decided_at_the_open_by_the_records() {
     assert!(!edited.status().changed_outside);
 }
 
+/// An app's autosave: when dirty or the file is behind, a save (with a record when it can). True if it saved.
+fn autosave(s: &mut Session<App>, dirty: &mut bool, n: &mut usize) -> bool {
+    if !(*dirty || s.file_behind()) {
+        return false;
+    }
+    let Ok(point) = s.save_point() else { return false };
+    s.record(&point, format!("{:?}", point.model()).as_bytes());
+    *dirty = false;
+    *n += 1;
+    true
+}
+
+/// Two machines with the document open, both autosaving when dirty or when the file is behind: concurrent saves
+/// (the newer upload wins, the other's edits not in it) and a save made offline that goes up later over the other's
+/// both end with a file that has every edit, and then nobody saves again (no loop).
+#[test]
+fn the_file_catches_up_with_every_edit_and_saving_stops() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open::<App>(&pc, "f.txt", Notes::new("f", &[]));
+    let mut b = open::<App>(&laptop, "f.txt", Notes::default());
+    let (mut dirty_a, mut dirty_b, mut saves) = (false, false, 0usize);
+    let vv = |s: &Session<App>| {
+        let doc = loro::LoroDoc::new();
+        doc.import(&s.snapshot().unwrap()).unwrap();
+        let mut v: Vec<(u64, u32)> = doc.oplog_vv().iter().map(|(p, c)| (*p, *c as u32)).collect();
+        v.sort_unstable();
+        v
+    };
+    // Settles: both poll and autosave until the file has both documents' versions and nobody saved for a while.
+    let settle = |a: &mut Session<App>, b: &mut Session<App>, da: &mut bool, db: &mut bool, saves: &mut usize, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut quiet = 0;
+        while quiet < 60 {
+            a.poll();
+            b.poll();
+            let saved = autosave(a, da, saves) | autosave(b, db, saves);
+            quiet = if saved { 0 } else { quiet + 1 };
+            assert!(Instant::now() < deadline, "never settled: {what} ({saves} saves)");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    // Concurrent: both edit, then both save before either has the other's edit.
+    change(&mut a, |m| m.with_item(0, "from the pc")).unwrap();
+    change(&mut b, |m| m.with_item(0, "from the laptop")).unwrap();
+    autosave(&mut a, &mut true, &mut saves);
+    autosave(&mut b, &mut true, &mut saves);
+    let before = saves;
+    settle(&mut a, &mut b, &mut dirty_a, &mut dirty_b, &mut saves, "concurrent saves");
+    assert_eq!(a.model().items.len(), 2);
+    assert_eq!(hub.file("f.txt"), Some(vv(&a)), "the file has every edit");
+    assert_eq!(vv(&a), vv(&b));
+    assert!(saves - before <= 4, "{} saves to catch up", saves - before);
+    // Offline: the laptop edits and saves while the pc does too; the laptop's save goes up last, without the pc's edit.
+    laptop.set_online(false);
+    until(&mut [&mut b], "offline", |s| !s[0].status().online);
+    change(&mut b, |m| m.with_title("laptop, offline")).unwrap();
+    autosave(&mut b, &mut true, &mut saves);
+    change(&mut a, |m| m.with_item(0, "pc, meanwhile")).unwrap();
+    autosave(&mut a, &mut true, &mut saves);
+    until(&mut [&mut a], "the pc's save is the file", |s| hub.file("f.txt") == Some(vv(&s[0])));
+    laptop.set_online(true);
+    let before = saves;
+    settle(&mut a, &mut b, &mut dirty_a, &mut dirty_b, &mut saves, "a save from offline");
+    assert_eq!(*b.model().title, "laptop, offline");
+    assert_eq!(a.model().items.len(), 3);
+    assert_eq!(hub.file("f.txt"), Some(vv(&a)), "the file has every edit");
+    assert_eq!(vv(&a), vv(&b));
+    assert!(saves - before <= 4, "{} saves to catch up", saves - before);
+    // An edit outside Craft is never written over by itself.
+    hub.edit_outside("f.txt");
+    until(&mut [&mut a, &mut b], "heard", |s| s.iter().all(|s| !s.file_behind()));
+    let before = saves;
+    settle(&mut a, &mut b, &mut dirty_a, &mut dirty_b, &mut saves, "an outside edit");
+    assert_eq!(saves, before);
+}
+
 /// A save as an app makes it: the save point, then the record (before the file is written).
 fn save<D: craft_cloud_kit::LiveDocument>(s: &mut Session<D>, bytes: &[u8]) -> craft_cloud_kit::SaveRecord {
     let point = s.save_point().unwrap();

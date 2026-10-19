@@ -161,7 +161,7 @@ fn session(
                 say(format!("the connection to the agent ended: {why}"));
                 return Ok(Exit::Failed);
             }
-            Some(Event::Presence(_) | Event::Acked(_) | Event::Refused { .. }) | None => {}
+            Some(Event::Presence(_) | Event::Acked(_) | Event::Refused { .. } | Event::File(_)) | None => {}
         }
     }
 }

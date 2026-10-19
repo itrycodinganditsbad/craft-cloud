@@ -55,6 +55,9 @@ pub struct Demo {
     rename: String,
     cursor: Option<(usize, usize)>,
     dirty_since: Option<Instant>,
+    /// Since when the file has lacked edits the live document has (another machine's, or this one's after another
+    /// machine's save won over it): autosaved like a change made here.
+    behind_since: Option<Instant>,
     pub autosave: bool,
     /// The last message for the status line.
     pub message: String,
@@ -145,6 +148,7 @@ impl Demo {
             rename: String::new(),
             cursor: None,
             dirty_since: None,
+            behind_since: None,
             autosave: true,
             message,
             watch,
@@ -279,6 +283,7 @@ impl Demo {
             w.add_recent(&self.rel, true);
         }
         self.dirty_since = None;
+        self.behind_since = None;
         self.message = "saved".into();
     }
 
@@ -363,7 +368,14 @@ impl Demo {
         if redo {
             self.redo();
         }
-        if self.autosave && self.dirty_since.is_some_and(|at| at.elapsed() >= AUTOSAVE_AFTER) {
+        // Autosave when dirty or when the file is behind the live document, so the file catches up on its own.
+        if self.session().is_some_and(Session::file_behind) {
+            self.behind_since.get_or_insert_with(Instant::now);
+        } else {
+            self.behind_since = None;
+        }
+        let due = |since: Option<Instant>| since.is_some_and(|at| at.elapsed() >= AUTOSAVE_AFTER);
+        if self.autosave && (due(self.dirty_since) || due(self.behind_since)) {
             self.save();
         }
         if self.dirty_since.is_some() || self.is_live() {

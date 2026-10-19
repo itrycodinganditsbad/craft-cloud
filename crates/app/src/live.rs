@@ -84,6 +84,9 @@ pub enum Event {
     /// its file was deleted (the document still works; a later open of the path is a new file), and whether the agent
     /// stopped following it until it restarts (Loro failed on it twice; changes made meanwhile are kept).
     Status { online: bool, waiting: u64, deleted: bool, stopped: bool },
+    /// The document's file on this machine's disk now: the live document's version (peer, end counter) a Craft app
+    /// saved it from, or none when no save record is known for it (see `DocsEvent::File`).
+    File(Option<Vec<(u64, u32)>>),
     /// The connection to the agent ended.
     Closed(String),
 }
@@ -206,6 +209,12 @@ impl Shared {
                     let ids = lock(&self.numbers).get(&doc).cloned().unwrap_or_default();
                     for id in ids {
                         self.route(id, Event::Status { online, waiting, deleted, stopped });
+                    }
+                }
+                Ok(DocsEvent::File { doc, version }) => {
+                    let ids = lock(&self.numbers).get(&doc).cloned().unwrap_or_default();
+                    for id in ids {
+                        self.route(id, Event::File(version.clone()));
                     }
                 }
                 Ok(DocsEvent::Error { id: Some(id), seq: Some(seq), code, message }) => self.route(id, Event::Refused { seq, code, message }),

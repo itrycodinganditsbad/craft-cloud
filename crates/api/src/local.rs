@@ -705,6 +705,15 @@ pub enum DocsEvent {
         #[serde(default)]
         stopped: bool,
     },
+    /// The file of an open document, as it is on this machine's disk now: the version of the live document a Craft
+    /// app saved it from (the record of that save, this machine's or the server's version's), or none when no record
+    /// is known (edited outside Craft, not synced yet). Sent after `opened` and whenever it changes (the app saved,
+    /// the sync brought another machine's save). An app whose live document has edits the file lacks saves again.
+    File {
+        doc: crate::ids::DocId,
+        #[serde(default)]
+        version: Option<Vec<(u64, u32)>>,
+    },
     /// A request or a binary frame was refused (`id` and `seq` name it when they can). `code` is one of
     /// [`crate::api::codes`] or [`codes`].
     Error {

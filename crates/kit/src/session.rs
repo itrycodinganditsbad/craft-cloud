@@ -354,6 +354,8 @@ pub struct Session<D: LiveDocument> {
     resend_backoff: Duration,
     /// The last saves' records, told the agent again on every reconnect (it may have missed them; it keeps one once).
     records: VecDeque<SaveRecord>,
+    /// The record of the document's file as it is on disk: the agent's word, or this session's last save since.
+    file_version: Option<Vec<(u64, u32)>>,
 }
 
 impl<D: LiveDocument> std::fmt::Debug for Session<D> {
@@ -578,6 +580,7 @@ impl<D: LiveDocument> Session<D> {
             resend_at: Instant::now(),
             resend_backoff: FIRST_BACKOFF,
             records: VecDeque::new(),
+            file_version: None,
         };
         session.reindex_trees();
         session.check_schema();
@@ -970,6 +973,7 @@ impl<D: LiveDocument> Session<D> {
                     self.status.deleted = deleted;
                     self.status.stopped = stopped || self.refused.is_some() || self.status.replaced;
                 }
+                Event::File(version) => self.file_version = version,
                 Event::Closed(why) => closed = Some(why),
             }
         }
@@ -1285,25 +1289,48 @@ impl<D: LiveDocument> Session<D> {
     /// The order of a save: `save_point`, the bytes from [`SavePoint::model`], [`Session::record`] with them, and only
     /// then the write to disk (the agent has to know the content before its sync pass sees it).
     pub fn save_point(&self) -> Result<SavePoint<D>, KitError> {
-        let no = |why: &str| Err(KitError::NoRecord(why.to_owned()));
-        if self.status.read_only.is_some() {
-            return no("the document is a newer app's (read-only here)");
+        if let Some(why) = self.no_record() {
+            return Err(KitError::NoRecord(why.to_owned()));
         }
-        if self.outbox_bytes >= MAX_QUEUE_BYTES {
-            return no("too much waits for Craft Cloud (stalled)");
-        }
-        if self.status.stopped || self.refused.is_some() || self.status.replaced {
-            return no("the live document stopped here");
-        }
-        if self.model_stale {
-            return no("the model is behind the live document");
-        }
-        let mut version: Vec<(u64, u32)> = self.doc.oplog_vv().iter().map(|(p, c)| (*p, u32::try_from(*c).unwrap_or(0))).collect();
+        Ok(SavePoint { model: self.model.clone(), frontiers: self.doc.oplog_frontiers().encode(), version: self.version() })
+    }
+
+    /// The live document's version vector, sorted by peer.
+    fn version(&self) -> Vec<(u64, u32)> {
+        let mut version: Vec<(u64, u32)> = self.doc.oplog_vv().iter().map(|(p, c)| (*p, u32::try_from(*c).unwrap_or(u32::MAX))).collect();
         version.sort_unstable();
-        if version.len() > craft_cloud_api::local::MAX_SAVE_PEERS {
-            return no("too many machines and windows have edited the document");
+        version
+    }
+
+    /// Why a save now can't carry a record, if it can't.
+    fn no_record(&self) -> Option<&'static str> {
+        if self.status.read_only.is_some() {
+            Some("the document is a newer app's (read-only here)")
+        } else if self.outbox_bytes >= MAX_QUEUE_BYTES {
+            Some("too much waits for Craft Cloud (stalled)")
+        } else if self.status.stopped || self.refused.is_some() || self.status.replaced {
+            Some("the live document stopped here")
+        } else if self.model_stale {
+            Some("the model is behind the live document")
+        } else if self.doc.oplog_vv().len() > craft_cloud_api::local::MAX_SAVE_PEERS {
+            Some("too many machines and windows have edited the document")
+        } else {
+            None
         }
-        Ok(SavePoint { model: self.model.clone(), frontiers: self.doc.oplog_frontiers().encode(), version })
+    }
+
+    /// Whether the file on disk lacks edits the live document has: the record of the file as it is now (the agent's
+    /// word, or this session's last save) doesn't include the document's version. An app autosaves when it is dirty
+    /// or this says so, so the file catches up on its own with edits from other machines, and with its own edits
+    /// after another machine's save won over this one's. False when no record of the file is known (an edit outside
+    /// Craft is never written over by itself; not synced yet; an older agent), and when a save couldn't carry a record.
+    pub fn file_behind(&self) -> bool {
+        let Some(file) = &self.file_version else { return false };
+        if self.no_record().is_some() {
+            return false;
+        }
+        let includes = |peer: u64, end: u32| file.iter().any(|(p, e)| *p == peer && *e >= end);
+        self.version().into_iter().any(|(peer, end)| !includes(peer, end))
     }
 
     /// The app is about to write `bytes` (made from `point`'s model) to the document's file: tells the agent first
@@ -1314,6 +1341,8 @@ impl<D: LiveDocument> Session<D> {
         // The file is a Craft save from now on (nothing is written to the document: the record is the agent's).
         self.status.changed_outside = false;
         let record = SaveRecord { hash, frontiers: point.frontiers.clone(), version: point.version.clone() };
+        // The file is this save from now on (until the agent says otherwise: the sync brought another one).
+        self.file_version = Some(record.version.clone());
         self.records.push_back(record.clone());
         while self.records.len() > KEPT_RECORDS {
             self.records.pop_front();
