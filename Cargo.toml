@@ -92,10 +92,8 @@ tray-icon = { version = "0.25", default-features = false }
 zbus = { version = "5.12", default-features = false, features = ["async-io", "blocking-api"] }
 # Decoding the app's own icons (PNG) for the tray and the window.
 png = "0.18"
-# Windows packaging: the exes' icon and version resource (build scripts; MSVC's rc.exe), and the setup's Start-menu
-# shortcut (a .lnk written in pure Rust). Both MIT.
+# Windows packaging: the exes' icon and version resource (build scripts; MSVC's rc.exe). MIT.
 winresource = { version = "0.1.31", default-features = false }
-mslnk = "0.1.8"
 # Windows only: the agent's start-at-login entry under `HKCU\…\Run`. Microsoft's windows-rs crate (MIT OR Apache-2.0);
 # its dependencies (windows-link, windows-result, windows-strings) are in the build already.
 windows-registry = "0.6.1"

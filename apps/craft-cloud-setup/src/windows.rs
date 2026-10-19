@@ -134,12 +134,19 @@ impl Machine for ThisMachine {
     }
 
     fn shortcut(&self, lnk: &Path, target: &Path) -> Result<(), String> {
-        // mslnk reads the target's folder as text: one that isn't, isn't linked.
-        if target.to_str().is_none() || target.parent().is_none() {
-            return Err(format!("{} can't be linked", target.display()));
-        }
-        let link = mslnk::ShellLink::new(target).map_err(|e| format!("{e:?}"))?;
-        link.create_lnk(lnk).map_err(|e| format!("{e:?}"))
+        // Windows' own shortcut writer (WScript.Shell), through PowerShell. The paths go in as environment
+        // variables, so nothing in them is ever read as script.
+        let dir = target.parent().ok_or_else(|| format!("{} can't be linked", target.display()))?;
+        let script = "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:CRAFT_CLOUD_LNK); \
+                      $s.TargetPath = $env:CRAFT_CLOUD_TARGET; $s.WorkingDirectory = $env:CRAFT_CLOUD_DIR; $s.Save()";
+        let status = quiet(Path::new("powershell.exe"))
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+            .env("CRAFT_CLOUD_LNK", lnk)
+            .env("CRAFT_CLOUD_TARGET", target)
+            .env("CRAFT_CLOUD_DIR", dir)
+            .status()
+            .map_err(|e| format!("powershell: {e}"))?;
+        if status.success() && lnk.exists() { Ok(()) } else { Err(format!("the shortcut wasn't written ({status})")) }
     }
 
     fn remove_after_exit(&self, dir: &Path) -> Result<(), String> {

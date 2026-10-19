@@ -25,8 +25,6 @@ path = "src/main.rs"
 rfd = { workspace = true }
 # The Uninstall key and the Run values under HKCU.
 windows-registry.workspace = true
-# The Start-menu shortcut (.lnk), written in pure Rust.
-mslnk.workspace = true
 
 [build-dependencies]
 # The exe's icon and version resource (Windows targets only; MSVC's rc.exe).
