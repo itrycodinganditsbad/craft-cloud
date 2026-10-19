@@ -13,6 +13,11 @@ struct Recorder {
     stuck: bool,
     /// The agent accepts the quit, then whether it has ended can't be told (tasklist fails).
     unknowable: bool,
+    /// Moving a file or folder fails (one is still in use).
+    rename_fails: bool,
+    /// Only the move with this number (from 1) fails.
+    rename_fails_at: Option<usize>,
+    renames: Mutex<usize>,
     /// Where `autostart on` writes the agent's Run value, as the agent does (for the program it was run as)…
     registry: Option<(Arc<MemoryRegistry>, String)>,
     /// …unless an old agent still running answered it and registered itself.
@@ -70,6 +75,20 @@ impl Machine for Recorder {
     fn remove_after_exit(&self, dir: &Path) -> Result<(), String> {
         self.note(format!("remove after exit {}", dir.display()));
         Ok(())
+    }
+    fn process_runs(&self, _pid: u32) -> bool {
+        false
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<(), String> {
+        let number = {
+            let mut renames = self.renames.lock().unwrap();
+            *renames += 1;
+            *renames
+        };
+        if self.rename_fails || self.rename_fails_at == Some(number) {
+            return Err(format!("{} can't be moved (is it still running?)", from.display()));
+        }
+        std::fs::rename(from, to).map_err(|e| e.to_string())
     }
 }
 
@@ -196,6 +215,147 @@ fn an_install_that_fails_after_the_stop_starts_the_agent_again() {
     assert_eq!(machine.asked(), ["close app", "stop agent"]);
 }
 
+/// An uninstall that fails after the agent was stopped and its start at login removed (here the shortcut can't be
+/// removed): the Run values are put back and the agent is started again; without a running agent, only put back.
+#[test]
+fn an_uninstall_that_fails_after_the_stop_puts_the_agent_back() {
+    let u = user("Test");
+    let registry = MemoryRegistry::default();
+    install(&u.places, &registry, &Recorder::default(), V2, &u.setup, &options(false)).unwrap();
+    let value = format!("\"{}\" run --log", u.places.dir().join(AGENT_BG_EXE).display());
+    registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, &value).unwrap();
+    let before = registry.values.lock().unwrap().clone();
+    // A "shortcut" that is a folder with something in it: removing it fails.
+    std::fs::create_dir_all(u.places.shortcut().join("x")).unwrap();
+
+    let machine = Recorder::default();
+    *machine.running.lock().unwrap() = true;
+    let e = uninstall(&u.places, &registry, &machine, &u.setup).unwrap_err();
+    assert!(e.contains("The agent was started again.") && e.ends_with("Start at login was put back."), "{e}");
+    assert_eq!(machine.asked(), ["close app", "stop agent", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
+    assert_eq!(*registry.values.lock().unwrap(), before, "the Run value is back, the entry stays");
+
+    let machine = Recorder::default();
+    let e = uninstall(&u.places, &registry, &machine, &u.setup).unwrap_err();
+    assert!(e.ends_with("Start at login was put back.") && !e.contains("started again"), "{e}");
+    assert_eq!(machine.asked(), ["close app", "stop agent"]);
+    assert_eq!(*registry.values.lock().unwrap(), before);
+}
+
+/// The commonest failure: a file in the program folder is still held, so it can't be moved aside. Nothing in the
+/// folder has been touched: the Run values are put back and the agent started again. From "Apps & features" too.
+#[test]
+fn an_uninstall_with_a_file_still_held_leaves_the_folder_whole_and_puts_the_agent_back() {
+    let u = user("Test");
+    let registry = MemoryRegistry::default();
+    install(&u.places, &registry, &Recorder::default(), V2, &u.setup, &options(false)).unwrap();
+    let dir = u.places.dir();
+    let value = format!("\"{}\" run --log", dir.join(AGENT_BG_EXE).display());
+    registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, &value).unwrap();
+    let before = registry.values.lock().unwrap().clone();
+    for running in [u.setup.clone(), dir.join(SETUP_EXE)] {
+        let machine = Recorder { rename_fails: true, ..Recorder::default() };
+        *machine.running.lock().unwrap() = true;
+        let e = uninstall(&u.places, &registry, &machine, &running).unwrap_err();
+        assert!(e.contains("can't be moved") && e.contains("The agent was started again.") && e.ends_with("Start at login was put back."), "{e}");
+        assert_eq!(machine.asked(), ["close app", "stop agent", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
+        assert_eq!(*registry.values.lock().unwrap(), before);
+        for (file, bytes) in V2 {
+            assert_eq!(std::fs::read(dir.join(file)).unwrap(), *bytes, "{file} is in place");
+        }
+        let siblings: Vec<_> = std::fs::read_dir(&u.places.programs).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(siblings, [DIR_NAME], "nothing left aside");
+    }
+}
+
+/// From "Apps & features" (the setup runs from the folder) the files move one by one: the third can't, so the two
+/// moved come back, the Run values are put back and the agent is started again.
+#[test]
+fn a_move_that_fails_partway_puts_the_moved_files_back() {
+    let u = user("Test");
+    let registry = MemoryRegistry::default();
+    install(&u.places, &registry, &Recorder::default(), V2, &u.setup, &options(false)).unwrap();
+    let dir = u.places.dir();
+    let value = format!("\"{}\" run --log", dir.join(AGENT_BG_EXE).display());
+    registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, &value).unwrap();
+    let before = registry.values.lock().unwrap().clone();
+    let machine = Recorder { rename_fails_at: Some(3), ..Recorder::default() };
+    *machine.running.lock().unwrap() = true;
+    let e = uninstall(&u.places, &registry, &machine, &dir.join(SETUP_EXE)).unwrap_err();
+    assert!(e.contains("can't be moved") && !e.contains("couldn't be moved back") && e.ends_with("Start at login was put back."), "{e}");
+    assert_eq!(*machine.renames.lock().unwrap(), 5, "two moves, the failed third, two moves back");
+    assert_eq!(machine.asked(), ["close app", "stop agent", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
+    assert_eq!(*registry.values.lock().unwrap(), before);
+    for (file, bytes) in V2 {
+        assert_eq!(std::fs::read(dir.join(file)).unwrap(), *bytes, "{file} is back");
+    }
+    let siblings: Vec<_> = std::fs::read_dir(&u.places.programs).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(siblings, [DIR_NAME], "nothing left aside");
+
+    // Moves back that fail too: the two files left aside are named.
+    let e = uninstall(&u.places, &registry, &FailingBack(Recorder::default()), &dir.join(SETUP_EXE)).unwrap_err();
+    let (_, stranded) = e.split_once("; and ").unwrap();
+    assert_eq!(V2.iter().filter(|(file, _)| stranded.contains(file)).count(), 2, "{e}");
+    assert!(e.contains("the next run of the setup puts them back"), "{e}");
+}
+
+/// A machine whose third move fails, and every move after it.
+struct FailingBack(Recorder);
+
+impl Machine for FailingBack {
+    fn stop_agent(&self, data: &Path) -> AgentStop {
+        self.0.stop_agent(data)
+    }
+    fn close_app(&self) {}
+    fn run_agent(&self, agent: &Path, args: &[&str]) -> Result<(), String> {
+        self.0.run_agent(agent, args)
+    }
+    fn start_agent(&self, agent_bg: &Path, data: &Path) -> Result<(), String> {
+        self.0.start_agent(agent_bg, data)
+    }
+    fn shortcut(&self, lnk: &Path, target: &Path) -> Result<(), String> {
+        self.0.shortcut(lnk, target)
+    }
+    fn remove_after_exit(&self, dir: &Path) -> Result<(), String> {
+        self.0.remove_after_exit(dir)
+    }
+    fn process_runs(&self, _pid: u32) -> bool {
+        false
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<(), String> {
+        let mut renames = self.0.renames.lock().unwrap();
+        *renames += 1;
+        if *renames >= 3 {
+            return Err(format!("{} can't be moved", from.display()));
+        }
+        std::fs::rename(from, to).map_err(|e| e.to_string())
+    }
+}
+
+/// A folder an earlier uninstall left aside (its setup gone) holding the agent's exe the program folder lacks: the
+/// next install moves it back first and installs over it; the leftover is gone. An uninstall just deletes one.
+#[test]
+fn a_leftover_aside_folder_is_restored_by_install_and_removed_by_uninstall() {
+    let u = user("Test");
+    let registry = MemoryRegistry::default();
+    install(&u.places, &registry, &Recorder::default(), V2, &u.setup, &options(false)).unwrap();
+    let dir = u.places.dir();
+    let leftover = dir.with_file_name(format!("{DIR_NAME}.removing-4000000"));
+    std::fs::create_dir_all(&leftover).unwrap();
+    std::fs::rename(dir.join(AGENT_BG_EXE), leftover.join(AGENT_BG_EXE)).unwrap();
+    std::fs::write(leftover.join("notes.txt"), "kept by an older version").unwrap();
+    // The install's payload lacks notes.txt: only a file moved back can be there afterwards.
+    install(&u.places, &registry, &Recorder::default(), V2, &u.setup, &options(false)).unwrap();
+    assert!(!leftover.exists(), "the leftover is gone");
+    assert_eq!(std::fs::read(dir.join(AGENT_BG_EXE)).unwrap(), b"agent-bg v2");
+    assert!(dir.join("notes.txt").is_file(), "what the folder lacked was moved back");
+
+    std::fs::create_dir_all(&leftover).unwrap();
+    std::fs::write(leftover.join(AGENT_EXE), "old").unwrap();
+    uninstall(&u.places, &registry, &Recorder::default(), &u.setup).unwrap();
+    assert!(!leftover.exists() && !dir.exists());
+}
+
 /// The agent accepts the quit, then tasklist fails: the install and the uninstall stop with nothing else changed,
 /// and the agent (which may be stopping) is started again from the folder its start at login names.
 #[test]
@@ -221,6 +381,33 @@ fn an_agent_asked_to_quit_whose_end_cant_be_told_is_started_again() {
     assert!(e.ends_with("The agent was started again."), "{e}");
     assert_eq!(machine.asked(), ["close app", "stop agent", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
     assert_eq!(*registry.values.lock().unwrap(), before);
+}
+
+/// Start-at-login values that run another copy (here a development build in a cargo target folder, and an agent
+/// somewhere else) are pointed at the installed one; a value that isn't there stays away.
+#[test]
+fn start_at_login_is_pointed_at_the_installed_copy() {
+    let u = user("Test");
+    let registry = Arc::new(MemoryRegistry::default());
+    let dir = u.places.dir();
+    let dev_tray = r#""C:\Users\u\craft-cloud-target\release\craft-cloud.exe" --hidden"#;
+    let dev_agent = r#""C:\Users\u\craft-cloud-target\release\craft-cloud-agent-bg.exe" run --log"#;
+    registry.set_string(&u.places.run_key, APP_RUN_VALUE, dev_tray).unwrap();
+    registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, dev_agent).unwrap();
+    let machine = Recorder { registry: Some((registry.clone(), u.places.run_key.clone())), ..Recorder::default() };
+    let installed = install(&u.places, &*registry, &machine, V2, &u.setup, &options(false)).unwrap();
+    assert!(installed.warnings.is_empty(), "{:?}", installed.warnings);
+    assert_eq!(installed.moved_from, None, "not the older install");
+    assert_eq!(registry.get(&u.places.run_key, APP_RUN_VALUE), Some(format!("\"{}\" --hidden", dir.join(APP_EXE).display())));
+    assert!(registry.get(&u.places.run_key, AGENT_RUN_VALUE).is_some_and(|v| starts_from(&v, &dir)));
+    assert!(machine.asked().contains(&"Craft Cloud/craft-cloud-agent.exe autostart on".to_owned()));
+
+    // Already pointing here: left as it is, and the agent isn't asked. Not there: stays away.
+    let machine = Recorder { registry: Some((registry.clone(), u.places.run_key.clone())), ..Recorder::default() };
+    registry.remove_value(&u.places.run_key, APP_RUN_VALUE).unwrap();
+    install(&u.places, &*registry, &machine, V2, &u.setup, &options(false)).unwrap();
+    assert_eq!(registry.get(&u.places.run_key, APP_RUN_VALUE), None);
+    assert!(!machine.asked().iter().any(|a| a.contains("autostart")), "{:?}", machine.asked());
 }
 
 /// BEAST's install, made by hand in `Programs\craft-cloud`: its agent starts at login from there. The new agent takes
@@ -377,24 +564,23 @@ fn a_running_agents_file_is_read_and_it_is_asked_to_quit() {
     assert!(request.contains(&format!("Host: 127.0.0.1:{port}\r\n")) && request.contains("Authorization: Bearer a1b2c3\r\n"), "{request}");
 }
 
-/// Files that can't be removed (still held by a program that is ending): tried again for a while; if they still
-/// can't, the uninstall fails with the "Apps & features" entry still there, so it can be run again.
+/// Files moved aside that can't be deleted at once (here a read-only folder): the uninstall finishes, and the
+/// moved-aside folder goes once the setup has ended.
 #[cfg(unix)]
 #[test]
-fn files_that_cant_be_removed_leave_the_uninstall_entry() {
+fn files_moved_aside_that_cant_be_deleted_yet_go_after_the_setup() {
     use std::os::unix::fs::PermissionsExt;
     let u = user("Test");
     let registry = MemoryRegistry::default();
     install(&u.places, &registry, &Recorder::default(), V2, &u.setup, &options(false)).unwrap();
     let dir = u.places.dir();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let removed = uninstall(&u.places, &registry, &Recorder::default(), &u.setup);
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(removed.is_err());
-    assert_eq!(registry.get(&u.places.uninstall_key, "DisplayName").as_deref(), Some("Craft Cloud"), "removed last");
-    // Once they can be removed, running it again finishes.
-    uninstall(&u.places, &registry, &Recorder::default(), &u.setup).unwrap();
+    let machine = Recorder::default();
+    uninstall(&u.places, &registry, &machine, &u.setup).unwrap();
+    let aside = dir.with_file_name(format!("{DIR_NAME}.removing-{}", std::process::id()));
+    std::fs::set_permissions(&aside, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(!dir.exists() && registry.get(&u.places.uninstall_key, "DisplayName").is_none());
+    assert_eq!(machine.asked().last().cloned(), Some(format!("remove after exit {}", aside.display())));
 }
 
 /// A file that is held for a moment (a program ending) is removed once it is free.
@@ -548,5 +734,27 @@ fn the_program_folder_goes_once_the_setup_has_ended() {
         remover.wait().unwrap();
         assert!(!dir.exists(), "gone once it has ended (cmd: {with_cmd})");
         assert!(outside.join("keep.txt").exists(), "the link wasn't followed (cmd: {with_cmd})");
+    }
+}
+
+/// The `cmd` remover with a `tasklist` that can't run never takes the setup for ended: it waits, and the folder stays.
+#[cfg(windows)]
+#[test]
+fn the_cmd_remover_waits_while_tasklist_cant_tell() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("Craft Cloud");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(SETUP_EXE), "setup").unwrap();
+    // Three rounds of asking, a second's wait each, then it gives up (an hour in the real one).
+    let started = std::time::Instant::now();
+    let mut remover = crate::windows::remove_after_with_cmd_without_tasklist(3, std::process::id(), "craft-cloud-setup.exe", &dir).spawn().unwrap();
+    remover.wait().unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_secs(2), "it waited each round (a broken line ends at once): {:?}", started.elapsed());
+    assert!(dir.join(SETUP_EXE).exists(), "nothing was removed while it couldn't tell");
+    let mine = format!("craft-cloud-uninstall-{}-", std::process::id());
+    for file in std::fs::read_dir(std::env::temp_dir()).unwrap().filter_map(Result::ok) {
+        if file.file_name().to_string_lossy().starts_with(&mine) {
+            let _ = std::fs::remove_file(file.path());
+        }
     }
 }
