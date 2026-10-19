@@ -2,8 +2,8 @@
 //! this user into `%LOCALAPPDATA%\Programs\Craft Cloud` (no admin rights), with an "Apps & features" entry and a
 //! Start-menu shortcut (unless `--no-start-menu`); `--uninstall` takes them away again.
 //!
-//! - **Install** ([`install`]): a running agent is stopped first through its own command line (`quit`, which lets the
-//!   pass under way finish) and the app is closed, so their files can be replaced; then the files, the Uninstall key
+//! - **Install** ([`install`]): the app is closed and a running agent stopped first, through its own command line
+//!   (`quit`, which lets the pass under way finish), so their files can be replaced; then the files, the Uninstall key
 //!   (`HKCU\…\Uninstall\CraftCloud`, its `UninstallString` calling this setup, copied into the program folder, with
 //!   `--uninstall`), and the shortcut. An agent that ran is started again. An older install in
 //!   `%LOCALAPPDATA%\Programs\craft-cloud` whose agent the `Run` value starts is moved: the new agent's
@@ -181,10 +181,11 @@ pub fn install(
     let old = places.programs.join(OLD_DIR_NAME);
     let mut warnings = Vec::new();
 
-    // What runs is stopped first: an exe in use can't be replaced. The agent finishes the pass under way.
+    // What runs is stopped first: an exe in use can't be replaced. The app goes before the agent (an open app's Try
+    // again would start the old agent again in between); the agent finishes the pass under way.
+    machine.close_app();
     let agent_cli = [dir.join(AGENT_EXE), old.join(AGENT_EXE)].into_iter().find(|p| p.is_file());
     let agent_was_running = agent_cli.as_deref().is_some_and(|agent| machine.quit_agent(agent));
-    machine.close_app();
 
     std::fs::create_dir_all(&dir).map_err(io(&dir))?;
     for (name, bytes) in payload {
@@ -242,11 +243,11 @@ pub fn install(
 /// "Apps & features": then the folder goes once this process has ended).
 pub fn uninstall(places: &Places, registry: &dyn Registry, machine: &dyn Machine, running: &Path) -> Result<(), String> {
     let dir = places.dir();
+    machine.close_app();
     let agent = dir.join(AGENT_EXE);
     if agent.is_file() {
         machine.quit_agent(&agent);
     }
-    machine.close_app();
     for value in [AGENT_RUN_VALUE, APP_RUN_VALUE] {
         if registry.get(&places.run_key, value).as_deref().is_some_and(|v| starts_from(v, &dir)) {
             registry.remove_value(&places.run_key, value)?;

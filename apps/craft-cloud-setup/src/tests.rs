@@ -132,7 +132,8 @@ fn an_upgrade_stops_the_agent_and_the_app_replaces_the_files_and_starts_the_agen
     machine.asked.lock().unwrap().clear();
     let installed = install(&u.places, &registry, &machine, V2, &u.setup, &options(true)).unwrap();
     assert!(installed.agent_was_running);
-    assert_eq!(machine.asked(), ["quit Craft Cloud/craft-cloud-agent.exe", "close app", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
+    // The app first: an open app would start the old agent again (Try again) between the quit and its close.
+    assert_eq!(machine.asked(), ["close app", "quit Craft Cloud/craft-cloud-agent.exe", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
     assert_eq!(std::fs::read(u.places.dir().join(AGENT_EXE)).unwrap(), b"agent v2");
     assert!(u.data.join("account.json").exists() && u.synced.join("notes.txt").exists());
 }
@@ -155,8 +156,8 @@ fn an_older_install_is_moved_over() {
     assert_eq!(
         machine.asked(),
         [
-            "quit craft-cloud/craft-cloud-agent.exe",
             "close app",
+            "quit craft-cloud/craft-cloud-agent.exe",
             "Craft Cloud/craft-cloud-agent.exe autostart on",
             "start Craft Cloud/craft-cloud-agent-bg.exe"
         ],
@@ -188,7 +189,7 @@ fn uninstall_takes_everything_away_but_the_files_and_the_sign_in() {
     machine.asked.lock().unwrap().clear();
 
     uninstall(&u.places, &registry, &machine, &u.setup).unwrap();
-    assert_eq!(machine.asked(), ["quit Craft Cloud/craft-cloud-agent.exe", "close app"]);
+    assert_eq!(machine.asked(), ["close app", "quit Craft Cloud/craft-cloud-agent.exe"]);
     assert_eq!(registry.get(&u.places.run_key, AGENT_RUN_VALUE), None);
     assert_eq!(registry.get(&u.places.run_key, APP_RUN_VALUE), None);
     assert!(registry.get(&u.places.run_key, "Something else").is_some(), "other programs' values stay");
