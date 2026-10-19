@@ -1,7 +1,8 @@
 //! The tray on Linux: a StatusNotifierItem (`org.kde.StatusNotifierItem`) with its menu (`com.canonical.dbusmenu`) on
-//! the session D-Bus, through zbus (pure Rust: no GTK, no libdbus). It is made only when an
-//! `org.kde.StatusNotifierWatcher` owns its name on the bus (waybar's tray, KDE, GNOME with the AppIndicator extension):
-//! without one there is no tray, and the window is the way in.
+//! the session D-Bus, through zbus (pure Rust: no GTK, no libdbus), served by the tray process
+//! ([`super::process`]). It registers with an `org.kde.StatusNotifierWatcher` (waybar's tray, KDE, GNOME with the
+//! AppIndicator extension) whenever one appears on the bus, so a waybar that starts after it at login, or restarts,
+//! shows it; until then there is no icon, and the window is the way in.
 //!
 //! The item is served at `/StatusNotifierItem` under the name `org.kde.StatusNotifierItem-<pid>-1`, registered with the
 //! watcher, and its icon is sent as pixels (`IconPixmap`, ARGB). zbus answers calls on a thread of its own; clicks go to
@@ -235,16 +236,21 @@ pub fn watcher_present(connection: &Connection) -> bool {
 /// The tray on the session bus; `None` without a StatusNotifierWatcher there (or without a session bus).
 pub fn start(clicks: Clicks) -> Result<Option<SniTray>, String> {
     match Connection::session() {
-        Ok(connection) => start_on(connection, clicks),
+        Ok(connection) => start_on(connection, clicks).map(Some),
         Err(_) => Ok(None),
     }
 }
 
-/// [`start`] on `connection` (tests use a bus of their own).
-pub fn start_on(connection: Connection, clicks: Clicks) -> Result<Option<SniTray>, String> {
-    if !watcher_present(&connection) {
-        return Ok(None);
-    }
+/// Registers the item `name` with the watcher on `connection`'s bus.
+fn register(connection: &Connection, name: &str) -> Result<(), String> {
+    let watcher = zbus::blocking::Proxy::new(connection, WATCHER, WATCHER_PATH, WATCHER).map_err(|e| e.to_string())?;
+    watcher.call::<_, _, ()>("RegisterStatusNotifierItem", &(name,)).map_err(|e| e.to_string())
+}
+
+/// [`start`] on `connection` (tests use a bus of their own). The item is served whether or not a watcher is there:
+/// it registers now if one is, and again whenever one appears (`NameOwnerChanged` for the watcher's name: waybar
+/// starting after this at login, or restarting).
+pub fn start_on(connection: Connection, clicks: Clicks) -> Result<SniTray, String> {
     let e = |e: zbus::Error| e.to_string();
     {
         let server = connection.object_server();
@@ -253,11 +259,22 @@ pub fn start_on(connection: Connection, clicks: Clicks) -> Result<Option<SniTray
     }
     let name = format!("org.kde.StatusNotifierItem-{}-1", std::process::id());
     connection.request_name(name.as_str()).map_err(e)?;
-    {
-        let watcher = zbus::blocking::Proxy::new(&connection, WATCHER, WATCHER_PATH, WATCHER).map_err(e)?;
-        watcher.call::<_, _, ()>("RegisterStatusNotifierItem", &(name.as_str(),)).map_err(e)?;
+    // Subscribed before looking, so a watcher appearing in between isn't missed.
+    let dbus = zbus::blocking::fdo::DBusProxy::new(&connection).map_err(e)?;
+    let appearances = dbus.receive_name_owner_changed_with_args(&[(0, WATCHER)]).map_err(e)?;
+    if watcher_present(&connection) {
+        let _ = register(&connection, &name);
     }
-    Ok(Some(SniTray { connection, shown: None }))
+    let (watching, item) = (connection.clone(), name);
+    let _ = std::thread::Builder::new().name("craft-cloud-sni-watch".into()).spawn(move || {
+        for change in appearances {
+            let appeared = change.args().is_ok_and(|args| args.new_owner().is_some());
+            if appeared {
+                let _ = register(&watching, &item);
+            }
+        }
+    });
+    Ok(SniTray { connection, shown: None })
 }
 
 impl Tray for SniTray {
@@ -341,14 +358,46 @@ mod tests {
         (Clicks { to, wake: Arc::new(|| {}) }, rx)
     }
 
-    /// Review focus: no StatusNotifierWatcher (Hyprland without waybar's tray, GNOME without the extension): no tray.
+    /// Waits (up to 10 s) until `registered` holds `count` registrations.
+    fn registrations(registered: &Arc<Mutex<Vec<String>>>, count: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let now = registered.lock().unwrap().clone();
+            if now.len() >= count || std::time::Instant::now() >= deadline {
+                return now;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn watcher(bus: &Bus, registered: &Arc<Mutex<Vec<String>>>) -> Connection {
+        zbus::blocking::connection::Builder::address(bus.address.as_str())
+            .unwrap()
+            .name(WATCHER)
+            .unwrap()
+            .serve_at(WATCHER_PATH, Watcher(registered.clone()))
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    /// Review focus: no StatusNotifierWatcher yet (waybar starts after the app at login, or not at all): the item
+    /// waits, registers as soon as one appears, and again after the watcher restarts (waybar restarted).
     #[test]
-    fn without_a_watcher_there_is_no_tray() {
+    fn the_item_registers_whenever_a_watcher_appears() {
         let Some(bus) = Bus::start() else {
             eprintln!("no dbus-daemon here: the D-Bus tray tests are skipped");
             return;
         };
-        assert!(start_on(bus.connect(), clicks().0).unwrap().is_none());
+        let _tray = start_on(bus.connect(), clicks().0).unwrap();
+        let name = format!("org.kde.StatusNotifierItem-{}-1", std::process::id());
+        let registered = Arc::new(Mutex::new(Vec::new()));
+        let first = watcher(&bus, &registered);
+        assert_eq!(registrations(&registered, 1), std::slice::from_ref(&name), "registered once the watcher appeared");
+        drop(first);
+        let second = watcher(&bus, &registered);
+        assert_eq!(registrations(&registered, 2), [name.clone(), name], "and again after it restarted");
+        drop(second);
     }
 
     /// With a watcher: the item registers, serves its icon and menu, a click on Quit reaches the model, and pausing
@@ -369,7 +418,7 @@ mod tests {
             .build()
             .unwrap();
         let (clicks, events) = clicks();
-        let mut tray = start_on(bus.connect(), clicks).unwrap().expect("a tray");
+        let mut tray = start_on(bus.connect(), clicks).unwrap();
         let name = format!("org.kde.StatusNotifierItem-{}-1", std::process::id());
         assert_eq!(registered.lock().unwrap().as_slice(), std::slice::from_ref(&name));
 
