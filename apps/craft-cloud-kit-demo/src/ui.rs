@@ -389,7 +389,8 @@ impl Demo {
                 Some((_, _, UndoKind::None)) => (false, false),
                 None => (!self.undo.is_empty(), !self.redo.is_empty()),
             };
-            if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
+            let blocked = self.session().and_then(Session::undo_blocked).unwrap_or_default();
+            if ui.add_enabled(can_undo, egui::Button::new("Undo")).on_disabled_hover_text(blocked).clicked() {
                 self.undo();
             }
             if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() {

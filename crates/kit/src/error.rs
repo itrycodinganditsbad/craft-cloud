@@ -35,6 +35,10 @@ pub enum KitError {
     /// no local change is taken from it until the session has rebuilt it whole (it tries at each poll).
     #[error("model_stale: the model is behind the live document; wait for the session to rebuild it")]
     ModelStale,
+    /// The step changed more text than can be undone while others edit (Loro's undo of it would freeze the app). It
+    /// stays on the undo stack as a barrier.
+    #[error("too large to undo while others edit ({bytes} bytes of text)")]
+    UndoTooLarge { bytes: usize },
 }
 
 impl From<loro::LoroError> for KitError {

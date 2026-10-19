@@ -304,6 +304,7 @@ pub(crate) fn write(
     if old_end > p {
         w.spend(old_end - p)?;
         text.delete_utf8(p, old_end - p)?;
+        w.text_bytes = w.text_bytes.saturating_add(old_end - p);
     }
     let mut at = p;
     while at < new_end {
@@ -323,6 +324,7 @@ pub(crate) fn write(
         let piece = new_text.get(at..end).ok_or_else(|| KitError::Invalid("the text's edit isn't on character boundaries".into()))?;
         w.spend(piece.len())?;
         text.insert_utf8(at, piece)?;
+        w.text_bytes = w.text_bytes.saturating_add(piece.len());
         at = end;
     }
     // Character attributes.

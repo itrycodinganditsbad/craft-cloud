@@ -152,3 +152,51 @@ fn an_undo_during_a_gesture_waits_for_its_end() {
     assert_eq!(a.model().texts(), vec!["x", "mine"]);
     until(&mut [&mut a, &mut b], "the same on both", |s| s.iter().all(|s| *s.model().title == "remote" && s.model().texts() == ["x", "mine"]));
 }
+
+/// The story with `paste` added at its end, as one change (plain text: no runs to move).
+fn paste(s: &mut Session<TestApp>, paste: &str) {
+    change(s, |d| {
+        let mut n = Doc { story: Arc::new(RichText::plain(&format!("{}{paste}", d.story.text))), ..d.clone() };
+        <TestApp as craft_cloud_kit::LiveDocument>::refresh_derived(&mut n);
+        n
+    })
+    .unwrap();
+}
+
+/// A step that changed up to 64 KiB of text undoes and redoes quickly; one byte more, and the step is refused
+/// (quickly, never a frozen app) and stays as a barrier: nothing before it can be undone. A 1 MB paste likewise.
+#[test]
+fn a_step_too_big_to_undo_is_refused_and_a_barrier() {
+    use craft_cloud_kit::{KitError, MAX_UNDO_TEXT_BYTES};
+    use std::time::{Duration, Instant};
+    let hub = Hub::new();
+    let pc = hub.machine("pc").unwrap();
+    let mut a = open::<TestApp>(&pc, "big.kitdemo", Doc { story: Arc::new(RichText::plain("Start.")), ..Doc::empty() });
+    paste(&mut a, " small");
+    // At the limit: undone and redone, quickly.
+    paste(&mut a, &"x".repeat(MAX_UNDO_TEXT_BYTES));
+    assert!(a.can_undo() && a.undo_blocked().is_none());
+    let t = Instant::now();
+    assert!(a.undo().unwrap());
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(story(&a), "Start. small");
+    let t = Instant::now();
+    assert!(a.redo().unwrap());
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(story(&a).len(), "Start. small".len() + MAX_UNDO_TEXT_BYTES);
+    // One byte over: refused at once, and a barrier.
+    paste(&mut a, &"y".repeat(MAX_UNDO_TEXT_BYTES + 1));
+    assert!(!a.can_undo());
+    assert!(a.undo_blocked().unwrap_or_default().contains("too large to undo while others edit"));
+    for _ in 0..2 {
+        let t = Instant::now();
+        assert_eq!(a.undo(), Err(KitError::UndoTooLarge { bytes: MAX_UNDO_TEXT_BYTES + 1 }));
+        assert!(t.elapsed() < Duration::from_millis(200), "{:?}", t.elapsed());
+    }
+    assert_eq!(story(&a).len(), "Start. small".len() + 2 * MAX_UNDO_TEXT_BYTES + 1, "nothing undone");
+    // 1 MB.
+    paste(&mut a, &"z".repeat(1024 * 1024));
+    let t = Instant::now();
+    assert_eq!(a.undo(), Err(KitError::UndoTooLarge { bytes: 1024 * 1024 }));
+    assert!(t.elapsed() < Duration::from_millis(200), "{:?}", t.elapsed());
+}

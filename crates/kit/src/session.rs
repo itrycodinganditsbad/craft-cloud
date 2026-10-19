@@ -45,6 +45,9 @@ pub const PRESENCE_TTL: Duration = Duration::from_secs(10);
 const MAX_SAVES: usize = 32;
 /// Undo steps kept.
 const UNDO_STEPS: usize = 500;
+/// The most text (inserted and deleted, in bytes) one step may change and still be undone while live. Loro's undo of a
+/// run of text takes time growing with its square: about 35 ms at 64 KiB, 2.4 s at 512 KiB, 10 s at 1 MB.
+pub const MAX_UNDO_TEXT_BYTES: usize = 64 * 1024;
 
 /// The root map of the kit's own keys: `schema` (`{app, version}`).
 const ROOT: &str = "root";
@@ -305,6 +308,10 @@ pub struct Session<D: LiveDocument> {
     doc_id: Option<craft_cloud_api::DocId>,
     /// Undos (`true`) and redos asked for while remote changes were held: run once the gesture ends.
     deferred: Vec<bool>,
+    /// The text bytes of each undo step, by the counter it starts at (the undo manager's items carry that start).
+    step_sizes: HashMap<i32, usize>,
+    /// The start of the group of changes under way.
+    group_key: Option<i32>,
     /// A rebuild failed: the live document is ahead of the model, which takes no local change until a whole rebuild
     /// succeeds.
     model_stale: bool,
@@ -495,6 +502,12 @@ impl<D: LiveDocument> Session<D> {
         let mut undo = UndoManager::new(&doc);
         undo.add_exclude_origin_prefix(KIT_ORIGIN);
         undo.set_max_undo_steps(UNDO_STEPS);
+        // Each step carries where it starts, which names its size (`step_sizes`).
+        undo.set_on_push(Some(Box::new(|_, span, _| {
+            let mut meta = loro::UndoItemMeta::new();
+            meta.set_value(LoroValue::I64(i64::from(span.start)));
+            meta
+        })));
         let mut session = Self {
             doc,
             undo,
@@ -523,6 +536,8 @@ impl<D: LiveDocument> Session<D> {
             refused: None,
             doc_id: None,
             deferred: Vec::new(),
+            step_sizes: HashMap::new(),
+            group_key: None,
             model_stale: false,
             resend_at: Instant::now(),
             resend_backoff: FIRST_BACKOFF,
@@ -642,10 +657,15 @@ impl<D: LiveDocument> Session<D> {
         }
         let mut w = Writer::new(&self.doc, LOCAL_ORIGIN);
         let wrote = write_diff::<D>(&mut w, Some(old.as_ref()), new.as_ref(), &mut self.ctx);
+        let text_bytes = w.text_bytes;
         let finished = w.finish();
         if outer {
             self.undo.group_end();
         }
+        // The step's size, by where it starts (the undo manager's item names that start; a group's first change).
+        let start = before.get(&self.doc.peer_id()).copied().unwrap_or(0);
+        let key = if self.grouping { *self.group_key.get_or_insert(start) } else { start };
+        *self.step_sizes.entry(key).or_default() += text_bytes;
         let updates = match finished {
             Ok((updates, _)) => updates,
             Err(_) => {
@@ -689,6 +709,7 @@ impl<D: LiveDocument> Session<D> {
         }
         let _ = self.undo.group_start();
         self.grouping = true;
+        self.group_key = None;
         true
     }
 
@@ -696,15 +717,34 @@ impl<D: LiveDocument> Session<D> {
         if self.grouping {
             self.undo.group_end();
             self.grouping = false;
+            self.group_key = None;
         }
     }
 
+    /// Whether there is a step to undo now (a step too big to undo while live isn't one: see
+    /// [`Session::undo_blocked`]).
     pub fn can_undo(&self) -> bool {
-        self.status.read_only.is_none() && self.undo.can_undo()
+        self.status.read_only.is_none() && self.undo.can_undo() && self.too_big(true).is_none()
     }
 
     pub fn can_redo(&self) -> bool {
-        self.status.read_only.is_none() && self.undo.can_redo()
+        self.status.read_only.is_none() && self.undo.can_redo() && self.too_big(false).is_none()
+    }
+
+    /// When the next undo is of a step whose text changes are over [`MAX_UNDO_TEXT_BYTES`]: why it can't be undone
+    /// (for the undo menu). Such a step is a barrier: nothing before it can be undone either.
+    pub fn undo_blocked(&self) -> Option<String> {
+        self.too_big(true).map(|bytes| KitError::UndoTooLarge { bytes }.to_string())
+    }
+
+    /// The text bytes of the top undo (or redo) step, when over the limit.
+    fn too_big(&self, undo: bool) -> Option<usize> {
+        let meta = if undo { self.undo.top_undo_value() } else { self.undo.top_redo_value() };
+        let start = match meta? {
+            LoroValue::I64(start) => i32::try_from(start).ok()?,
+            _ => return None,
+        };
+        self.step_sizes.get(&start).copied().filter(|bytes| *bytes > MAX_UNDO_TEXT_BYTES)
     }
 
     /// Takes back this machine's last change (remote changes since stay). The model changes as after a remote change:
@@ -734,6 +774,18 @@ impl<D: LiveDocument> Session<D> {
             return Ok(false);
         }
         self.end_group();
+        // A step whose text is too big for Loro's undo while live (it takes time growing with the square of the text):
+        // refused, and it stays on the stack as a barrier.
+        if let Some(bytes) = self.too_big(undo) {
+            return Err(KitError::UndoTooLarge { bytes });
+        }
+        let size = {
+            let meta = if undo { self.undo.top_undo_value() } else { self.undo.top_redo_value() };
+            match meta {
+                Some(LoroValue::I64(start)) => i32::try_from(start).ok().and_then(|s| self.step_sizes.get(&s)).copied().unwrap_or(0),
+                _ => 0,
+            }
+        };
         // What came meanwhile first, so the step applies to the newest document.
         self.apply_incoming()?;
         let before = self.doc.oplog_vv();
@@ -742,6 +794,9 @@ impl<D: LiveDocument> Session<D> {
         let raw = std::mem::take(&mut lock(&self.collector).raw);
         lock(&self.collector).on = false;
         let done = done?;
+        // The step that takes this one back (on the other stack) starts where this undo's commit does: as big.
+        let start = before.get(&self.doc.peer_id()).copied().unwrap_or(0);
+        self.step_sizes.insert(start, size);
         let mut updates = Vec::new();
         export_since(&self.doc, &before, &mut updates)?;
         self.queue(updates);

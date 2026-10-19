@@ -31,11 +31,13 @@ pub struct Writer<'d> {
     from: VersionVector,
     out: Updates,
     commits: usize,
+    /// The text this change inserted and deleted, in bytes (what an undo of it would have Loro go through).
+    pub(crate) text_bytes: usize,
 }
 
 impl<'d> Writer<'d> {
     pub(crate) fn new(doc: &'d LoroDoc, origin: &'static str) -> Self {
-        Self { doc, origin, spent: 0, from: doc.oplog_vv(), out: Vec::new(), commits: 0 }
+        Self { doc, origin, spent: 0, from: doc.oplog_vv(), out: Vec::new(), commits: 0, text_bytes: 0 }
     }
 
     /// Room left in the open commit before it is cut.
