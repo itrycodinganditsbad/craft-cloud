@@ -90,6 +90,8 @@ struct Machine {
     conns: HashMap<u64, Conn>,
     /// The save records apps sent: document, content hash (hex), version.
     saves: Vec<(DocId, String, Version)>,
+    /// Codes the next updates are refused with ([`Fake::refuse_next`]).
+    refuse: VecDeque<String>,
 }
 
 /// A live document's version vector: `(peer, end counter)`.
@@ -143,6 +145,7 @@ impl Hub {
                     pending_blobs: Vec::new(),
                     conns: HashMap::new(),
                     saves: Vec::new(),
+                    refuse: VecDeque::new(),
                 },
             );
             id
@@ -342,6 +345,11 @@ impl Hub {
                 if body.is_empty() || body.len() > MAX_UPDATE_BYTES {
                     let message = format!("an update is 1 byte to {MAX_UPDATE_BYTES} bytes");
                     return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "too_large".into(), message });
+                }
+                // A refusal asked for ([`Fake::refuse_next`]): the update isn't kept.
+                if let Some(code) = m.refuse.pop_front() {
+                    let message = format!("refused as asked ({code})");
+                    return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code, message });
                 }
                 if let Some(d) = m.docs.get_mut(&doc) {
                     d.log.push((Origin::Conn(conn), body.to_vec()));
@@ -554,6 +562,14 @@ impl Fake {
             for (_, c) in m.conns.drain() {
                 let _ = c.stream.shutdown(Shutdown::Both);
             }
+        }
+    }
+
+    /// Refuses the next `count` updates any app of this machine sends with `code`, as the agent does: `internal` when
+    /// it can't write a change to disk (worth sending again), `invalid` when Loro doesn't take it (never).
+    pub fn refuse_next(&self, code: &str, count: usize) {
+        if let Some(m) = lock(&self.hub.inner).machines.get_mut(&self.id) {
+            m.refuse.extend(std::iter::repeat_n(code.to_owned(), count));
         }
     }
 

@@ -12,16 +12,13 @@ use crate::{KitError, Value};
 pub const SPLIT_BYTES: usize = 512 * 1024;
 /// What one operation adds to the estimate beside its payload (IDs, positions, keys).
 pub const OP_OVERHEAD: usize = 32;
-/// The agent's cap on one update.
-pub const MAX_UPDATE: usize = craft_cloud_api::limits::MAX_UPDATE_BYTES;
-
 /// The origin of the kit's commits of local changes (the undo manager records them).
 pub const LOCAL_ORIGIN: &str = "craft-cloud-kit:local";
 /// The origin of the kit's own repairs (a normalised merge, a save mark): never an undo step.
 pub const KIT_ORIGIN: &str = "craft-cloud-kit:kit";
 
 /// The updates one change made: the exports of its commits, in order, each at most [`SPLIT_BYTES`] (one operation
-/// over it alone, at most [`MAX_UPDATE`]).
+/// over it alone, at most the agent's 1 MiB cap: values and text pieces are capped below it).
 pub type Updates = Vec<Vec<u8>>;
 
 /// The write side of one change.
@@ -138,9 +135,9 @@ fn slice(doc: &LoroDoc, span: IdSpan, out: &mut Updates) -> Result<(), KitError>
     let bytes = doc.export(loro::ExportMode::updates_in_range(vec![span]))?;
     let (start, end) = (span.counter.start, span.counter.end);
     if bytes.len() <= SPLIT_BYTES || end - start <= 1 {
-        if bytes.len() > MAX_UPDATE {
-            return Err(KitError::TooLarge { what: "one operation", len: bytes.len(), max: MAX_UPDATE });
-        }
+        // (One operation over the cap can't happen: values and text pieces are capped before they are written. Were
+        // it to, it still goes: the commit is made, and the agent's refusal stops the session where the app sees it,
+        // rather than leaving a hole every later change depends on.)
         out.push(bytes);
         return Ok(());
     }

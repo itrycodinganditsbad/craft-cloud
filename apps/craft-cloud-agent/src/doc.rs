@@ -128,7 +128,7 @@ fn session(
             let left = until.saturating_duration_since(Instant::now());
             match document.recv_timeout(left) {
                 Some(Event::Acked(acked)) if acked == seq => break,
-                Some(Event::Refused { seq: refused, message }) if refused == seq => {
+                Some(Event::Refused { seq: refused, message, .. }) if refused == seq => {
                     return Err(usage(format!("the agent refused the change: {message}")));
                 }
                 Some(Event::Closed(why)) => return Err(usage(format!("the connection to the agent ended: {why}"))),

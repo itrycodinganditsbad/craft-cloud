@@ -243,6 +243,46 @@ fn blobs_go_through_the_agent_and_an_old_agent_says_so() {
     assert!(matches!(opened, Open::NotLive(_)));
 }
 
+/// A change the agent refuses for now (its disk) is never dropped: it and the changes after it go again, in order,
+/// and the other machine ends with all of them.
+#[test]
+fn a_change_refused_for_now_goes_again_in_order() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open::<App>(&pc, "f.txt", Notes::new("f", &[]));
+    let mut b = open::<App>(&laptop, "f.txt", Notes::default());
+    pc.refuse_next("internal", 2);
+    for i in 0..4 {
+        change(&mut a, |m| m.with_item(i, &format!("item {i}"))).unwrap();
+    }
+    until(&mut [&mut a, &mut b], "all four on the laptop", |s| s.get(1).is_some_and(|b| b.model().items.len() == 4));
+    until(&mut [&mut a, &mut b], "nothing left queued", |s| s.first().is_some_and(|a| a.status().queued == 0));
+    assert!(!a.status().stopped);
+    assert_eq!(b.model().texts(), (0..4).map(|i| format!("item {i}")).collect::<Vec<_>>());
+}
+
+/// A change the agent refuses for good (it doesn't decode) stops the session where the app sees it: nothing after it
+/// is sent into a hole, the model stays editable, and no change is silently stranded.
+#[test]
+fn a_change_refused_for_good_stops_the_session() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open::<App>(&pc, "g.txt", Notes::new("g", &[]));
+    let mut b = open::<App>(&laptop, "g.txt", Notes::default());
+    pc.refuse_next("invalid", 1);
+    change(&mut a, |m| m.with_item(0, "refused")).unwrap();
+    until(&mut [&mut a, &mut b], "stopped", |s| s.first().is_some_and(|a| a.status().stopped));
+    let error = a.status().error.clone().unwrap_or_default();
+    assert!(error.contains("invalid") && error.contains("save it to the file"), "{error}");
+    // Still editable; the change is kept (queued), never shown as sent.
+    change(&mut a, |m| m.with_item(1, "after")).unwrap();
+    assert_eq!(a.model().texts(), vec!["refused", "after"]);
+    assert_eq!(a.poll().status.queued, 2, "both kept, neither dropped");
+    std::thread::sleep(Duration::from_millis(100));
+    b.poll();
+    assert!(b.model().items.is_empty(), "nothing went out after the refusal");
+}
+
 /// A session opened off the UI thread can be handed to it.
 #[test]
 fn a_session_can_move_to_another_thread() {

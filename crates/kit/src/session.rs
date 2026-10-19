@@ -285,6 +285,12 @@ pub struct Session<D: LiveDocument> {
     waker: Option<Waker>,
     /// The hash of the file's bytes as the app read them at open (for [`Status::changed_outside`]), until saved.
     read_from: Option<[u8; 32]>,
+    /// The agent refused a change for good (it doesn't decode, it is over the cap): nothing more is sent, and the
+    /// session says it is stopped; the model stays editable, and saving to the file (without a record) keeps the work.
+    refused: Option<String>,
+    /// The agent refused a change for now (its disk): the queue goes again, in order, from this moment.
+    resend_at: Instant,
+    resend_backoff: Duration,
 }
 
 impl<D: LiveDocument> std::fmt::Debug for Session<D> {
@@ -494,6 +500,9 @@ impl<D: LiveDocument> Session<D> {
             presence_sent: None,
             waker: None,
             read_from: None,
+            refused: None,
+            resend_at: Instant::now(),
+            resend_backoff: FIRST_BACKOFF,
         };
         session.reindex_trees();
         session.check_schema();
@@ -724,9 +733,14 @@ impl<D: LiveDocument> Session<D> {
             }
         };
         self.keep_presence();
+        // What a refusal for now held back goes again once its pause is over.
+        if self.outbox.iter().any(|o| o.seq.is_none()) {
+            self.send_outbox();
+        }
         self.status.queued = self.outbox.len();
         self.status.queued_bytes = self.outbox_bytes;
         self.status.stalled = self.outbox_bytes >= MAX_QUEUE_BYTES;
+        self.status.stopped |= self.refused.is_some();
         Polled { changed, status: self.status.clone() }
     }
 
@@ -754,21 +768,33 @@ impl<D: LiveDocument> Session<D> {
                         && let Some(out) = self.outbox.remove(at)
                     {
                         self.outbox_bytes = self.outbox_bytes.saturating_sub(out.bytes.len());
+                        self.resend_backoff = FIRST_BACKOFF;
                     }
                 }
-                Event::Refused { seq, message } => {
-                    if let Some(at) = self.outbox.iter().position(|o| o.seq == Some(seq))
-                        && let Some(out) = self.outbox.remove(at)
-                    {
-                        self.outbox_bytes = self.outbox_bytes.saturating_sub(out.bytes.len());
+                Event::Refused { seq, code, message } => {
+                    // Never dropped: every later change depends on it.
+                    let Some(at) = self.outbox.iter().position(|o| o.seq == Some(seq)) else { continue };
+                    if code == "invalid" || code == "too_large" {
+                        // It can never be taken: nothing more goes out (what follows needs it), and the app hears
+                        // it is stopped. The model stays editable; saving the file (without a record) keeps the work.
+                        let why = format!("Craft Cloud can't take this document's changes ({code}: {message}); save it to the file");
+                        self.refused = Some(why.clone());
+                        self.status.error = Some(why);
+                    } else {
+                        // For now (the agent's disk): it and everything after it go again, in order, after a pause.
+                        for out in self.outbox.iter_mut().skip(at) {
+                            out.seq = None;
+                        }
+                        self.resend_at = Instant::now() + self.resend_backoff;
+                        self.resend_backoff = (self.resend_backoff * 2).min(MAX_BACKOFF);
+                        self.status.error = Some(format!("Craft Cloud couldn't keep a change yet ({code}: {message}); trying again"));
                     }
-                    self.status.error = Some(format!("Craft Cloud refused a change: {message}"));
                 }
                 Event::Status { online, waiting, deleted, stopped } => {
                     self.status.online = online;
                     self.status.waiting = waiting;
                     self.status.deleted = deleted;
-                    self.status.stopped = stopped;
+                    self.status.stopped = stopped || self.refused.is_some();
                 }
                 Event::Closed(why) => closed = Some(why),
             }
@@ -993,6 +1019,10 @@ impl<D: LiveDocument> Session<D> {
 
     fn send_outbox(&mut self) {
         let Some(link) = &self.link else { return };
+        // Refused for good: nothing after it can be taken. Refused for now: not before the pause is over.
+        if self.refused.is_some() || Instant::now() < self.resend_at {
+            return;
+        }
         let mut failed = None;
         for out in self.outbox.iter_mut().filter(|o| o.seq.is_none()) {
             match link.doc.send(&out.bytes) {

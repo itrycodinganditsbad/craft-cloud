@@ -76,9 +76,10 @@ pub enum Event {
     Presence(Vec<u8>),
     /// This app's change number `seq` ([`Document::send`]'s answer) is on the agent's disk.
     Acked(u64),
-    /// This app's change number `seq` was refused (it doesn't decode, or is over 1 MiB): the agent's copy doesn't have
-    /// it.
-    Refused { seq: u64, message: String },
+    /// This app's change number `seq` was refused: the agent's copy doesn't have it. `code` says whether sending it
+    /// again can help: `invalid` (it doesn't decode) and `too_large` (over 1 MiB) never will; anything else (`internal`:
+    /// the agent couldn't write it to disk) is worth sending again later.
+    Refused { seq: u64, code: String, message: String },
     /// How the document stands: `online` (edits go out as they are made), changes waiting for the server, and whether
     /// its file was deleted (the document still works; a later open of the path is a new file), and whether the agent
     /// stopped following it until it restarts (Loro failed on it twice; changes made meanwhile are kept).
@@ -182,7 +183,7 @@ impl Shared {
                         self.route(id, Event::Status { online, waiting, deleted, stopped });
                     }
                 }
-                Ok(DocsEvent::Error { id: Some(id), seq: Some(seq), message, .. }) => self.route(id, Event::Refused { seq, message }),
+                Ok(DocsEvent::Error { id: Some(id), seq: Some(seq), code, message }) => self.route(id, Event::Refused { seq, code, message }),
                 Ok(DocsEvent::Error { id: Some(id), seq: None, code, message }) => self.answer(id, Answer::Refused(Error::Refused { code, message })),
                 Ok(DocsEvent::Error { id: None, .. }) | Err(_) => {}
             },
