@@ -662,7 +662,8 @@ mod tests {
                 }
             }
         }));
-        let edits: Vec<Box<dyn Fn(&LoroText)>> = vec![
+        type Edit = Box<dyn Fn(&LoroText)>;
+        let edits: Vec<Edit> = vec![
             Box::new(|t| t.insert(3, "XY🙂").unwrap()),
             Box::new(|t| t.mark(2..9, "b", true).unwrap()),
             Box::new(|t| t.mark(10..11, "¶h", 1i64).unwrap()),
