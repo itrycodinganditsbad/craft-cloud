@@ -32,6 +32,10 @@ qrcodegen.workspace = true
 # The app's icons (`assets/`, drawn by `cargo xtask icons`), decoded for the tray and the window.
 png.workspace = true
 
+[build-dependencies]
+# The exe's icon and version resource (Windows targets only; MSVC's rc.exe).
+winresource.workspace = true
+
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tray-icon.workspace = true
 

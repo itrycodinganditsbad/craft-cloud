@@ -5,6 +5,7 @@
 
 mod icons;
 mod licenses;
+mod package;
 mod version;
 
 use std::path::{Path, PathBuf};
@@ -17,6 +18,8 @@ commands:
   ci              fmt --check, licenses, icons --check, clippy -D warnings, test (stops at first failure)
   licenses        check every dependency's licence against the allow-list in AGENTS.md
   icons [--check] draw the Craft Cloud app's icons into apps/craft-cloud-desktop/assets (or check they are current)
+  package         release builds packed for this OS into <target>/package: the Windows setup, the macOS app
+                  (zipped) or the Linux tarball
   version [set X.Y.Z[-pre]]
                   print the workspace version, or set it (Cargo.toml + Cargo.lock)
 ";
@@ -28,6 +31,7 @@ fn main() -> ExitCode {
         Some("ci") => cmd_ci(),
         Some("licenses") => licenses::run(),
         Some("icons") => icons::run(&root(), &rest),
+        Some("package") => package::run(&root()),
         Some("version") => version::run(&root(), &rest),
         Some("-h" | "--help" | "help") | None => {
             print!("{USAGE}");

@@ -58,6 +58,11 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      # The app bundle is built only on macOS: CI checks it builds (unsigned, not published).
+      - name: Package (macOS app bundle)
+        if: runner.os == 'macOS'
+        run: cargo xtask package
+
   backends:
     name: Postgres and S3 backends
     runs-on: ubuntu-latest
