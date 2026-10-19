@@ -10,8 +10,9 @@
 random port, per-start token in an owner-only file `local-api.json {schema, port, token, pid}` in the agent's data
 dir, exact `Host: 127.0.0.1:<port>`, any `Origin` refused, token only in `Authorization: Bearer`), plus one WebSocket
 per app connection for live sessions. `run` serves it while signed out too. Calls:
-- `POST /v1/login {server, user, password, folder?, device_name?, adopt?}` / `POST /v1/logout {local}` (the launcher's;
-  the password goes from the launcher to the agent, never to an app or a file);
+- `POST /v1/login {server, user, password, folder?, device_name?, adopt?}` / `POST /v1/logout {local}` (a sign-in
+  with a password, as `craft-cloud-agent login` makes; the password goes to the agent, never to an app or a file;
+  the Craft Cloud app joins with a code instead, and signs out with `logout`);
 - `POST /v1/join {join, folder?, device_name?, adopt, password?}` → status: parses the join string
   (`cloud.example.com/K7M4-Q9TX` or the link `https://cloud.example.com/join/K7M4-Q9TX`), checks what it can before
   the code is spent (the folder, the device name, the server's `/info`), redeems it and signs in as `login` does.

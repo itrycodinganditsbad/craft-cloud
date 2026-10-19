@@ -14,13 +14,14 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
 
 > **Status: early development.** File sync works: the server, the sync engine and the agent keep a
 > folder in step across machines. The agent shares each app's recent files across machines and serves the
-> local API apps use; sign-in in the launcher, recents in the apps and live documents are being built now.
+> local API apps use; the Craft Cloud app joins a computer with a code and shows its sync. Recents in the
+> apps and live documents are being built now.
 > See [Where things stand](#where-things-stand). The designs are in [`docs/design/`](docs/design/).
 
 ## What it will do
 
-- **One sign-in, every app.** You sign in once in the launcher; every Craft app on that machine then uses
-  your account. Apps never see your password.
+- **One sign-in, every app.** You join once in the Craft Cloud app, with a code; every Craft app on that
+  machine then uses your account, after every restart. Apps never see your password.
 - **Recent files follow you.** Create or open a document on one machine, and it is in that app's recent
   files on your other machines right away.
 - **Live documents.** An edit on one machine appears in the same open document on the others as you type,
@@ -48,7 +49,7 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
 ```
  ┌──────────────── each machine ─────────────────────┐        ┌──── self-hosted ──────────────┐
  │ Craft apps ──(plain files)──────────┐             │        │ craft-cloud-server            │
- │ Craft apps, launcher                ▼             │ HTTPS  │  ├─ auth (users, devices)     │
+ │ Craft Cloud app, Craft apps         ▼             │ HTTPS  │  ├─ auth (users, devices)     │
  │  └ craft-cloud-app ──local API──► craft-cloud-    │◄──────►│  ├─ metadata (SQLite or PG)   │
  │    (loopback, token)              agent ◄─watch─  │  WSS   │  ├─ chunks (disk or S3)       │
  │                                    ├ state        │◄──────►│  └─ live: documents and their │
@@ -67,13 +68,15 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
   machines changed, and keeps its own small state file. `craft-cloud-agent run` keeps the folder in step
   on its own (it watches the folder and the server); `craft-cloud-agent sync` runs one pass by hand. While
   it runs it also serves a **local API** on `127.0.0.1` (a random port and token per start, in an
-  owner-only `local-api.json`), so apps and the launcher can see the account's status, sign it in and out,
-  and share recent files; and its **live hub** keeps each app's recent files, works offline, and catches up
-  with the server's live service when it can.
-- **Apps and the launcher** link `craft-cloud-app`: a small blocking client of the local API. The launcher
-  signs the machine in; every app shows and adds recent files, which appear on the account's other
-  machines right away. Apps never talk to the server and hold no credentials.
-- **The launcher** will be where you sign in and see sync status, history and conflicts.
+  owner-only `local-api.json`), so the Craft Cloud app and the other apps can see the account's status, join
+  and sign out, and share recent files; and its **live hub** keeps each app's recent files, works offline,
+  and catches up with the server's live service when it can.
+- **The Craft Cloud app** (`craft-cloud`) is a window, and a tray icon where the desktop has a tray. It is
+  how a computer joins the cloud (with a code), shows the sync, adds another computer, lists and removes
+  computers, pauses and quits. It starts the agent when none runs, and never syncs itself.
+- **Apps** link `craft-cloud-app`: a small blocking client of the local API. Every app shows and adds recent
+  files, which appear on the account's other machines right away. Apps never talk to the server and hold no
+  credentials. The launcher lists Craft Cloud like any app.
 
 ### The workspace
 
@@ -86,15 +89,19 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
 | `craft-cloud-server` | The HTTP API (`/api/v1`), the live service (`/api/v1/live`), authentication, rate limits and the admin CLI | done |
 | `craft-cloud-sync` | The sync engine: compares the folder with the server, uploads, downloads, resolves conflicts | done |
 | `craft-cloud-agent` | The agent on each machine: real disk, HTTPS transport, saved state, root marker, the local API, the live hub (recents), command line (`login`, `run`, `sync`, `status`, `logout`, `recents`) | runs on its own |
-| `craft-cloud-app` | What apps and the launcher link: status, sign-in and sign-out, recent files, through the running agent | first cut |
+| `craft-cloud-app` | What apps link: status, sign-in and sign-out, joining, computers, pause, recent files, through the running agent | first cut |
+| `craft-cloud-desktop` | The Craft Cloud app, `craft-cloud`: the window and the tray icon, joining with a code, adding and removing computers, start at login | first cut |
+| `craft-cloud-setup` | The Windows setup (`craft-cloud-setup.exe`): a per-user install with an uninstaller | first cut |
 
 ## Where things stand
 
 | What | State |
 |---|---|
 | File sync: the server (SQLite or Postgres, disk or S3), the sync engine, and the agent keeping a folder in step on Linux and Windows | works |
-| Recent files shared across machines; the agent's local API for apps and the launcher (status, sign-in, recents) | works |
-| Sign-in in the launcher, recent files in the apps | in progress |
+| Recent files shared across machines; the agent's local API for apps (status, sign-in, recents) | works |
+| Joining with a code; the Craft Cloud app (window, tray, start at login) and its installers for Windows and Linux | works |
+| The app on macOS (an unsigned `Craft Cloud.app`) | built, not yet tried on a Mac |
+| Recent files in the apps | in progress |
 | Live documents: open documents update as you type on another machine | next |
 | WordCraft live, then the other Craft apps one by one | planned |
 | History, restore, trash, quotas, server backup | planned |
@@ -142,6 +149,33 @@ How it's tested:
   through the agent's own request code while links are cut, held and slowed, and the server loses or cuts
   answers after doing the work. Each seed replays exactly:
   `SIM_SEED=17 cargo test -p craft-cloud-agent --test network`.
+
+## Installing the Craft Cloud app
+
+The app comes with the agent, and installs for you alone: no admin rights, and nothing on the desktop.
+`cargo xtask package` builds the package for the system it runs on into `target/package/`.
+
+- **Windows:** run `craft-cloud-setup.exe`. It installs into `%LOCALAPPDATA%\Programs\Craft Cloud`, adds Craft
+  Cloud to the Start menu (`--no-start-menu` leaves that out) and to "Apps & features", which uninstalls it.
+  `--quiet` installs without asking anything. Running it again upgrades: the agent finishes what it is doing,
+  stops, and starts again with the new files. An earlier install made by hand in
+  `%LOCALAPPDATA%\Programs\craft-cloud` is taken over (its files are left alone).
+- **macOS:** unzip and move `Craft Cloud.app` to Applications. The build isn't signed, so the first time, open
+  it from its context menu (Open) to tell macOS it's fine.
+- **Linux:** unpack `craft-cloud-<version>-linux-x86_64.tar.gz` and run `./install.sh` in it. It installs into
+  `~/.local/lib/craft-cloud`, links `craft-cloud` and `craft-cloud-agent` into `~/.local/bin` and adds Craft
+  Cloud to the app menu. Running it again upgrades. `./uninstall.sh` removes it.
+
+Uninstalling keeps your synced folder and the agent's data folder (the sign-in).
+
+Open Craft Cloud and enter a join string: an invite from the server's admin (`craft-cloud-server user invite`),
+or a code from a computer that is signed in (Add a computer there). Then this computer starts syncing by itself
+at every login. A computer that was signed in before (with `login`) shows its account at once.
+
+The tray icon says whether everything is synced, syncing, offline, paused or needs you, and has Open, Open
+folder, Pause and Quit (which stops syncing until the next login). Closing the window leaves it in the tray. On
+Linux the tray needs a StatusNotifierItem host (waybar's tray, KDE, GNOME with the AppIndicator extension);
+without one, closing the window ends the app, and the agent keeps syncing.
 
 ## Running the server
 
@@ -287,8 +321,15 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
 ## Building and testing
 
 ```sh
-cargo xtask ci        # rustfmt, dependency licences, clippy, and every test
+cargo xtask ci        # rustfmt, dependency licences, the icons, clippy, and every test
+cargo xtask package   # the app's package for this system, in target/package/
+cargo xtask icons     # draw the app's icons again (after changing xtask/src/icons.rs)
 ```
+
+The app's window is tested with snapshots of every screen (`apps/craft-cloud-desktop/tests/snapshots/`), drawn
+on a CPU renderer where there is one (Mesa's lavapipe on Linux, WARP on Windows); after a deliberate change to a
+screen, `UPDATE_SNAPSHOTS=1 cargo test -p craft-cloud-desktop` draws them anew. On Linux the window needs the
+X11, Wayland and xkbcommon headers to build (see `.github/workflows/ci.yml`).
 
 The Postgres and S3 tests run when their environment variables are set (see `.github/workflows/ci.yml`);
 CI runs them against Postgres and SeaweedFS containers. A longer simulation run:

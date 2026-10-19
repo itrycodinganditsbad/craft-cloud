@@ -31,13 +31,17 @@ crates/
   store     craft-cloud-store     blob store: disk, S3, memory; checks every blob in and out
   meta      craft-cloud-meta      metadata on SQLite or Postgres; the batch commit; the change feed; invites and pairings (`join.rs`)
   sync      craft-cloud-sync      the sync engine over `Fs`/`Transport` traits; `MemFs`; scenario tests and the simulation
-  app       craft-cloud-app       what apps and the launcher link: a blocking client of the agent's local API (status, sign-in, joining, computers, pause, autostart, recents)
+  app       craft-cloud-app       what apps link: a blocking client of the agent's local API (status, sign-in, joining, computers, pause, autostart, recents)
 apps/
   craft-cloud-server              HTTP API (`/api/v1`), the live service (`/api/v1/live`, `live.rs`), join codes (`join.rs`: pairings, join, the `/join/{code}` page), auth, admin CLI (`init`, `serve`, `user` with `invite`, `device`, `reset-epoch`, `live`)
   craft-cloud-agent               the sync agent: real disk `Fs`, HTTP `Transport` over a `Connection`, saved account and state, root marker, CLI (`login`, `join`, `run`, `sync`, `status`, `logout`, `recents`, `add-computer`, `devices`, `pause`, `resume`, `quit`, `autostart`), the `run` loop, the local API (`local_api.rs`), the live hub (`live/`: recents document, replica, store, link, hub), start at login (`autostart/`: Windows, macOS, Linux), the background build (`src/bin/bg.rs`, logging to `runlog.rs`)
     tests/network/                the simulation over a simulated network (turmoil): `main.rs` histories and scenarios, `harness.rs` server and agent hosts
     tests/recents_sim.rs          the recents convergence simulation: replicas against the server's live sessions
-xtask/                            cargo xtask ci | licenses | version
+  craft-cloud-desktop             the Craft Cloud app (`craft-cloud`, eframe/egui): the pure model (`model.rs`), the agent behind a trait and calls on threads (`agent.rs`), starting the agent (`start_agent.rs`), one app per user (`single_instance.rs`), the window (`ui/`, `app.rs`), the tray (`tray/`: tray-icon on Windows and macOS, a StatusNotifierItem over zbus on Linux), the app's own start at login (`autostart.rs`), its icons (`assets/`, drawn by `cargo xtask icons`)
+    tests/snapshots/              every screen as kittest draws it (`UPDATE_SNAPSHOTS=1` redraws them)
+  craft-cloud-setup               the Windows setup (`craft-cloud-setup.exe`): install, upgrade, move from a hand-made install, `--uninstall`; the exes built in by `cargo xtask package`
+packaging/linux/                  the Linux tarball's `install.sh` and `uninstall.sh` (into `~/.local`)
+xtask/                            cargo xtask ci | licenses | icons | package | version
 docs/                             design documents and the self-hosting guide
 ```
 
@@ -48,7 +52,10 @@ runtime. The agent depends on `proto`, `sync` and `app` (its `recents` commands 
 tests also run the server on a loopback port, and `tests/network/` runs the server's router and agents over
 `turmoil` (a dev-dependency: the shipped binaries never link it). That test target includes sync's test harness
 (`crates/sync/tests/common/`) by `#[path]`, so the agent's dev-dependencies mirror sync's test ones, and a change
-there can break the agent's tests: run both (`cargo xtask ci` does).
+there can break the agent's tests: run both (`cargo xtask ci` does). The app (`craft-cloud-desktop`) depends on
+`app` and `proto` only, never on the agent: it reaches the agent through the local API and starts its binary. The
+setup (`craft-cloud-setup`) depends on nothing in the workspace: it stops and moves the agent through the agent's own
+command line (`craft-cloud-agent quit`, `autostart on`).
 
 Backend tests (Postgres, S3) skip unless their environment variables are set; see `.github/workflows/ci.yml`
 for the variables and the test containers. Set `CRAFT_CLOUD_REQUIRE_BACKENDS=1` to make a skip a failure.
