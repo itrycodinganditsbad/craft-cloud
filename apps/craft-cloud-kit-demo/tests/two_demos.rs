@@ -95,3 +95,57 @@ fn two_windows_edit_one_live_document() {
     let hash: String = craft_cloud_kit::MemoryBlobs::default().put(&written).unwrap().hash.iter().map(|b| format!("{b:02x}")).collect();
     until(&mut a, &mut b, "the save record at the agent", |_, _| pc.saves().iter().any(|(h, _)| *h == hash));
 }
+
+/// The demo's model at a newer layout: the document opens read-only in the demo.
+struct Newer;
+
+impl craft_cloud_kit::LiveDocument for Newer {
+    type Doc = model::DemoDoc;
+    const APP: &'static str = <model::DemoApp as craft_cloud_kit::LiveDocument>::APP;
+    const SCHEMA: u32 = <model::DemoApp as craft_cloud_kit::LiveDocument>::SCHEMA + 1;
+    fn mappings(doc: &model::DemoDoc) -> craft_cloud_kit::Mappings<'_> {
+        <model::DemoApp as craft_cloud_kit::LiveDocument>::mappings(doc)
+    }
+    fn apply_remote(old: &std::sync::Arc<model::DemoDoc>, patch: &craft_cloud_kit::RemotePatch<'_>) -> Result<std::sync::Arc<model::DemoDoc>, craft_cloud_kit::KitError> {
+        <model::DemoApp as craft_cloud_kit::LiveDocument>::apply_remote(old, patch)
+    }
+    fn normalise(doc: &mut model::DemoDoc) {
+        <model::DemoApp as craft_cloud_kit::LiveDocument>::normalise(doc);
+    }
+    fn refresh_derived(doc: &mut model::DemoDoc) {
+        <model::DemoApp as craft_cloud_kit::LiveDocument>::refresh_derived(doc);
+    }
+}
+
+/// "Bring it in" when the replace can't be made (here the document is a newer demo's, read-only): nothing is saved,
+/// the file keeps the outside edit, and the banner stays.
+#[test]
+fn bring_it_in_saves_nothing_when_the_replace_fails() {
+    let hub = Hub::new();
+    let pc = hub.machine("pc").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // A newer demo made the document live first, from other bytes.
+    let client = pc.client();
+    let newer = craft_cloud_kit::Session::<Newer>::open(
+        &Agent::from_fn(move || Ok(client.clone())),
+        "demo.kitdemo",
+        std::sync::Arc::new(model::DemoDoc::default()),
+        Some(b"the newer demo's file"),
+    )
+    .unwrap();
+    assert!(matches!(newer, craft_cloud_kit::Open::Live(_)));
+    // The file on disk was then edited outside Craft.
+    let edited = model::DemoDoc { story: std::sync::Arc::new(craft_cloud_kit::RichText::plain("written in an editor")), ..Default::default() };
+    let outside = model::to_file(&edited);
+    std::fs::write(dir.path().join("demo.kitdemo"), &outside).unwrap();
+    let mut a = window(demo(&pc, dir.path(), "pc"));
+    let mut b = window(demo(&pc, dir.path(), "pc again"));
+    until(&mut a, &mut b, "live, read-only, changed outside", |a, _| {
+        a.session().is_some_and(|s| s.status().read_only.is_some() && s.status().changed_outside)
+    });
+    a.state_mut().bring_in();
+    a.run_steps(1);
+    assert!(a.state().message.starts_with("not brought in"), "{}", a.state().message);
+    assert_eq!(std::fs::read(dir.path().join("demo.kitdemo")).unwrap(), outside, "nothing written over the outside edit");
+    assert!(a.state().session().is_some_and(|s| s.status().changed_outside), "the banner stays");
+}

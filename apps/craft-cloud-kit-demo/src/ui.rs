@@ -287,6 +287,23 @@ impl Demo {
         self.message = "saved".into();
     }
 
+    /// "Bring it in": the file's content (as read at open) replaces the live content, then the file is saved. When the
+    /// replace fails (stale, stalled, read-only), nothing is saved: the file keeps the outside edit, and the banner
+    /// stays to try again.
+    pub fn bring_in(&mut self) {
+        let file = (*self.read.0).clone();
+        let Mode::Live(session) = &mut self.mode else { return };
+        match session.replace_with_file(file) {
+            Ok(()) => self.model = session.model().clone(),
+            Err(e) => {
+                self.message = format!("not brought in: {e}");
+                return;
+            }
+        }
+        self.save();
+        self.outside_handled = true;
+    }
+
     /// The other machines' cursors in the story.
     pub fn cursors(&self) -> Vec<Cursor> {
         let Some(session) = self.session() else { return Vec::new() };
@@ -435,15 +452,7 @@ impl Demo {
                 if ui.button("Bring it in").clicked() {
                     // The user's choice: the file's content replaces the live content as one ordinary change, named
                     // "Replace with the file's content", then saved, so the file and the document agree again.
-                    let file = (*self.read.0).clone();
-                    if let Mode::Live(session) = &mut self.mode {
-                        match session.replace_with_file(file) {
-                            Ok(()) => self.model = session.model().clone(),
-                            Err(e) => self.message = e.to_string(),
-                        }
-                    }
-                    self.save();
-                    self.outside_handled = true;
+                    self.bring_in();
                 }
                 if ui.button("Keep the live document").clicked() {
                     // The next save writes the live content over the file.
