@@ -25,8 +25,9 @@ jobs:
       fail-fast: false
       matrix:
         # The server targets Linux; the sync agent and the Craft Cloud app also run on Windows and macOS (whose
-        # start-at-login code only compiles there).
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # start-at-login code only compiles there). Linux stays on 24.04: on 26.04 the window's snapshot tests crashed
+        # once in three runs (SIGSEGV under wgpu on lavapipe, Mesa 26).
+        os: [ubuntu-24.04, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
 
@@ -90,7 +91,7 @@ jobs:
 
   backends:
     name: Postgres and S3 backends
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
       postgres:
