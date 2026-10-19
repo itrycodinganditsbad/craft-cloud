@@ -383,6 +383,33 @@ fn an_agent_asked_to_quit_whose_end_cant_be_told_is_started_again() {
     assert_eq!(*registry.values.lock().unwrap(), before);
 }
 
+/// Start-at-login values that run another copy (here a development build in a cargo target folder, and an agent
+/// somewhere else) are pointed at the installed one; a value that isn't there stays away.
+#[test]
+fn start_at_login_is_pointed_at_the_installed_copy() {
+    let u = user("Test");
+    let registry = Arc::new(MemoryRegistry::default());
+    let dir = u.places.dir();
+    let dev_tray = r#""C:\Users\u\craft-cloud-target\release\craft-cloud.exe" --hidden"#;
+    let dev_agent = r#""C:\Users\u\craft-cloud-target\release\craft-cloud-agent-bg.exe" run --log"#;
+    registry.set_string(&u.places.run_key, APP_RUN_VALUE, dev_tray).unwrap();
+    registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, dev_agent).unwrap();
+    let machine = Recorder { registry: Some((registry.clone(), u.places.run_key.clone())), ..Recorder::default() };
+    let installed = install(&u.places, &*registry, &machine, V2, &u.setup, &options(false)).unwrap();
+    assert!(installed.warnings.is_empty(), "{:?}", installed.warnings);
+    assert_eq!(installed.moved_from, None, "not the older install");
+    assert_eq!(registry.get(&u.places.run_key, APP_RUN_VALUE), Some(format!("\"{}\" --hidden", dir.join(APP_EXE).display())));
+    assert!(registry.get(&u.places.run_key, AGENT_RUN_VALUE).is_some_and(|v| starts_from(&v, &dir)));
+    assert!(machine.asked().contains(&"Craft Cloud/craft-cloud-agent.exe autostart on".to_owned()));
+
+    // Already pointing here: left as it is, and the agent isn't asked. Not there: stays away.
+    let machine = Recorder { registry: Some((registry.clone(), u.places.run_key.clone())), ..Recorder::default() };
+    registry.remove_value(&u.places.run_key, APP_RUN_VALUE).unwrap();
+    install(&u.places, &*registry, &machine, V2, &u.setup, &options(false)).unwrap();
+    assert_eq!(registry.get(&u.places.run_key, APP_RUN_VALUE), None);
+    assert!(!machine.asked().iter().any(|a| a.contains("autostart")), "{:?}", machine.asked());
+}
+
 /// BEAST's install, made by hand in `Programs\craft-cloud`: its agent starts at login from there. The new agent takes
 /// start at login over; the old files stay.
 #[test]

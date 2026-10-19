@@ -6,7 +6,8 @@
 //!   API (it finishes the pass under way), waited for up to a minute, then ended, and its process checked gone. An
 //!   agent that can't be stopped stops the install before anything is changed. Then the files, the Uninstall key
 //!   (`HKCU\…\Uninstall\CraftCloud`, its `UninstallString` calling this setup, copied into the program folder, with
-//!   `--uninstall`), and the shortcut. An agent that ran is started again (and waited for), also when the install
+//!   `--uninstall`), and the shortcut. Start at login (the agent's and the tray's `Run` values, where there are any) is
+//!   pointed at this install, wherever it pointed before. An agent that ran is started again (and waited for), also when the install
 //!   fails after the stop. An older install in
 //!   `%LOCALAPPDATA%\Programs\craft-cloud` whose agent the `Run` value starts is moved: the new agent's
 //!   `autostart on` points the value at the new folder (read back to check); the old folder's files are left alone.
@@ -273,20 +274,29 @@ fn install_stopped(
         write_replacing(&setup_copy, &bytes)?;
     }
 
-    // The older install's agent starts at login: the new one takes that over (no agent runs now, so the new agent
-    // writes its own entry). The old files stay. The value is read back: only a value that starts the new agent is a
-    // move.
+    // Start at login runs this install from now on. The agent's value, wherever it points (the older install, or a
+    // build run from elsewhere): the new agent takes it over (no agent runs now, so it writes its own entry), and the
+    // value is read back; only one that starts the new agent counts. The app's tray value, which the app writes for
+    // whichever copy last ran: pointed at this one. A value that isn't there stays away (start at login was turned
+    // off). The older install's files stay.
     let mut moved_from = None;
-    let run_value = registry.get(&places.run_key, AGENT_RUN_VALUE);
-    if old.join(AGENT_EXE).is_file() && run_value.as_deref().is_some_and(|v| starts_from(v, &old)) {
+    if let Some(value) = registry.get(&places.run_key, AGENT_RUN_VALUE).filter(|v| !starts_from(v, &dir)) {
         let moved =
             machine.run_agent(&dir.join(AGENT_EXE), &["autostart", "on"]).and_then(|()| match registry.get(&places.run_key, AGENT_RUN_VALUE) {
                 Some(v) if starts_from(&v, &dir) => Ok(()),
                 other => Err(format!("the Run value is still {}", other.unwrap_or_else(|| "missing".into()))),
             });
         match moved {
-            Ok(()) => moved_from = Some(old.clone()),
-            Err(e) => warnings.push(format!("start at login still runs the old agent in {} ({e})", old.display())),
+            Ok(()) if starts_from(&value, &old) => moved_from = Some(old.clone()),
+            Ok(()) => {}
+            Err(e) if starts_from(&value, &old) => warnings.push(format!("start at login still runs the old agent in {} ({e})", old.display())),
+            Err(e) => warnings.push(format!("start at login still runs another agent ({value}): {e}")),
+        }
+    }
+    if registry.get(&places.run_key, APP_RUN_VALUE).is_some_and(|v| !starts_from(&v, &dir)) {
+        let tray = format!("\"{}\" --hidden", dir.join(APP_EXE).display());
+        if let Err(e) = registry.set_string(&places.run_key, APP_RUN_VALUE, &tray) {
+            warnings.push(format!("the tray still starts at login from another copy ({e})"));
         }
     }
 
