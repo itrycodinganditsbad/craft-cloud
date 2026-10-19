@@ -283,19 +283,24 @@ fn uninstall_takes_everything_away_but_the_files_and_the_sign_in() {
     registry.set_string(&u.places.run_key, "Something else", r#""C:\Other\other.exe""#).unwrap();
     std::fs::create_dir_all(&u.places.app_files).unwrap();
     std::fs::write(u.places.app_files.join("window.lock"), "").unwrap();
+    let old_loose = u.places.app_files.with_file_name("craft-cloud-tray.port");
+    std::fs::write(&old_loose, "").unwrap();
     machine.asked.lock().unwrap().clear();
 
     uninstall(&u.places, &registry, &machine, &u.setup).unwrap();
     assert_eq!(machine.asked(), ["close app", "stop agent"]);
-    assert!(!u.places.app_files.exists(), "the app's single-instance files go");
+    assert!(!u.places.app_files.exists() && !old_loose.exists(), "the app's single-instance files go, old names too");
     assert_eq!(registry.get(&u.places.run_key, AGENT_RUN_VALUE), None);
     assert_eq!(registry.get(&u.places.run_key, APP_RUN_VALUE), None);
     assert!(registry.get(&u.places.run_key, "Something else").is_some(), "other programs' values stay");
     assert_eq!(registry.get(&u.places.uninstall_key, "DisplayName"), None);
     assert!(!dir.exists() && !u.places.shortcut().exists());
     assert!(u.data.join("account.json").exists() && u.synced.join("notes.txt").exists());
-    // Again, with nothing there: fine.
+    // Again, with nothing there: fine. Something else in the app's folder stays, and so does the folder.
+    std::fs::create_dir_all(&u.places.app_files).unwrap();
+    std::fs::write(u.places.app_files.join("mine.txt"), "mine").unwrap();
     uninstall(&u.places, &registry, &machine, &u.setup).unwrap();
+    assert!(u.places.app_files.join("mine.txt").exists(), "only the app's own names are removed");
 
     // From "Apps & features": the setup in the folder runs; everything else goes now, the folder after it ends.
     install(&u.places, &registry, &machine, V2, &u.setup, &options(true)).unwrap();

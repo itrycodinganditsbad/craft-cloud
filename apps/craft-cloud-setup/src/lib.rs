@@ -346,9 +346,6 @@ pub fn uninstall(places: &Places, registry: &dyn Registry, machine: &dyn Machine
     if shortcut.exists() {
         std::fs::remove_file(&shortcut).map_err(io(&shortcut))?;
     }
-    if places.app_files.exists() {
-        remove_patiently(&places.app_files, places.patience)?;
-    }
     // The files before the "Apps & features" entry: if one can't go, the entry stays, to run it again.
     if dir.exists() {
         let running_inside = running.parent().is_some_and(|p| same_path(p, &dir));
@@ -364,7 +361,24 @@ pub fn uninstall(places: &Places, registry: &dyn Registry, machine: &dyn Machine
             remove_patiently(&dir, places.patience)?;
         }
     }
-    registry.remove_key(&places.uninstall_key)
+    registry.remove_key(&places.uninstall_key)?;
+    remove_app_files(&places.app_files);
+    Ok(())
+}
+
+/// The app's single-instance files in `app_files`, the folder itself once empty, and the loose ones older versions
+/// kept beside it. Only these names: anything else there stays. Last, and best effort: a file an app that couldn't be
+/// closed still holds stays, and is harmless.
+fn remove_app_files(app_files: &Path) {
+    for name in ["window.lock", "window.port", "window.port.tmp", "tray.lock", "tray.port", "tray.port.tmp"] {
+        let _ = std::fs::remove_file(app_files.join(name));
+    }
+    let _ = std::fs::remove_dir(app_files);
+    if let Some(parent) = app_files.parent() {
+        for old in ["craft-cloud-app.lock", "craft-cloud-app.port", "craft-cloud-tray.lock", "craft-cloud-tray.port"] {
+            let _ = std::fs::remove_file(parent.join(old));
+        }
+    }
 }
 
 /// What is said when the agent was asked to quit and then whether it ended couldn't be told: nothing else was changed

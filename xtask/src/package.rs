@@ -245,9 +245,11 @@ mod tests {
         let app_files = home.join(".local/share/craft-cloud-app");
         std::fs::create_dir_all(&app_files).unwrap();
         std::fs::write(app_files.join("window.lock"), "").unwrap();
+        let old_loose = home.join(".local/share/craft-cloud-tray.lock");
+        std::fs::write(&old_loose, "").unwrap();
         let removed = sh("uninstall.sh");
         assert!(removed.status.success(), "{removed:?}");
-        assert!(!app_files.exists(), "the app's single-instance files go");
+        assert!(!app_files.exists() && !old_loose.exists(), "the app's single-instance files go, old names too");
         assert!(!lib.exists() && !home.join(".local/bin/craft-cloud").exists());
         assert!(!home.join(".local/share/applications/craft-cloud.desktop").exists());
         assert!(!app_entry.exists(), "the app's own login entry goes");
