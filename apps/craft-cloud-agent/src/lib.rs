@@ -13,6 +13,7 @@ pub mod autostart;
 pub mod cli;
 pub mod daemon;
 pub mod disk;
+pub mod doc;
 pub mod http;
 pub mod live;
 pub mod local_api;

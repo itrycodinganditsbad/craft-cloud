@@ -323,6 +323,7 @@ fn router(state: Api) -> Router {
         .route(paths::LOGIN, post(login))
         .route(paths::LOGOUT, post(logout))
         .route(paths::RECENTS, get(crate::live::recents_socket))
+        .route(paths::DOCS, get(crate::live::docs::docs_socket))
         .route(paths::JOIN, post(join))
         .route(paths::PAIRINGS, post(create_pairing))
         .route(&format!("{}/{{id}}", paths::PAIRINGS), get(pairing_status).delete(delete_pairing))

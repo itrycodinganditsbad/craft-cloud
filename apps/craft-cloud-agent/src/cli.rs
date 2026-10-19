@@ -94,6 +94,9 @@ pub enum Command {
     },
     /// Show an app's recent files (shared by every machine of the account), or add one, through the running agent.
     Recents(RecentsArgs),
+    /// Open a file of the synced folder as a live plain-text document, through the running agent, like an app: print
+    /// its text, append to it, or print it again after every change. A test tool: it never writes the file.
+    Doc(DocArgs),
     /// Join a Craft Cloud with a join string: an invite from the server's admin, or a code from a signed-in computer
     /// (`add-computer` there). An invite for a new account asks for its password, twice, on standard input.
     Join(JoinArgs),
@@ -140,6 +143,18 @@ pub struct RecentsArgs {
     pub watch: bool,
     #[command(subcommand)]
     pub action: Option<RecentsAction>,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct DocArgs {
+    /// The file: its path in the synced folder (absolute, or relative to the folder). Plain text (UTF-8).
+    pub path: PathBuf,
+    /// Append this text to the document (on every machine that has it open).
+    #[arg(long)]
+    pub append: Option<String>,
+    /// Keep printing the text, again after every change, until stopped (Ctrl-C).
+    #[arg(long)]
+    pub watch: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -419,6 +434,7 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
             Ok(Exit::Done)
         }
         Command::Recents(args) => recents(&data, args, out).await,
+        Command::Doc(args) => crate::doc::doc(&data, args, out).await,
         Command::Join(args) => {
             if let Some(account) = data.load_account()? {
                 return Err(already_signed_in(&account));
@@ -687,7 +703,7 @@ pub async fn main(args: Vec<std::ffi::OsString>, input: &mut impl BufRead, out: 
 }
 
 /// Runs a blocking call of `craft-cloud-app` off the runtime.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, craft_cloud_app::Error> + Send + 'static) -> Result<T, AgentError> {
+pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, craft_cloud_app::Error> + Send + 'static) -> Result<T, AgentError> {
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| AgentError::Usage(format!("the call to the running agent failed: {e}")))?
@@ -695,7 +711,7 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, craft_cloud_a
 }
 
 /// The local API's refusals as the errors the CLI has for them.
-fn local_error(e: AgentError) -> AgentError {
+pub(crate) fn local_error(e: AgentError) -> AgentError {
     use craft_cloud_proto::local::codes;
     match e {
         AgentError::Local(craft_cloud_app::Error::Refused { code, message }) => match code.as_str() {
@@ -805,7 +821,7 @@ async fn recents(data: &DataDir, args: RecentsArgs, out: &mut impl Write) -> Res
 
 /// A path in the synced folder as the local API wants it: relative, `/`-separated. An absolute one (or, on Windows, one
 /// with a root but no drive) must lie in the folder.
-fn relative_to_folder(path: &Path, folder: Option<&Path>) -> Result<String, AgentError> {
+pub(crate) fn relative_to_folder(path: &Path, folder: Option<&Path>) -> Result<String, AgentError> {
     let relative = if path.is_absolute() || path.has_root() {
         let folder = folder.ok_or(AgentError::NotSignedIn)?;
         let (path, folder) = (resolved(path), resolved(folder));

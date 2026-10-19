@@ -1,7 +1,8 @@
 //! What Craft apps and the launcher link to reach the Craft Cloud agent on this machine (`craft-cloud-agent run`)
 //! through its local API: the account's status, signing in and out, joining with a code and adding computers (the
-//! Craft Cloud app's), pausing, quitting and start-at-login, and each app's recent files, shared by every machine of
-//! the account.
+//! Craft Cloud app's), pausing, quitting and start-at-login, each app's recent files, shared by every machine of the
+//! account, and live documents ([`live`]: files opened by path, their changes going to the other machines as they are
+//! made, at the level of Loro's bytes).
 //!
 //! Blocking, with no async runtime: an egui app calls it and gets changes on a channel ([`RecentsWatch::events`]),
 //! which it polls each frame.
@@ -12,7 +13,9 @@
 //! [`Client::set_autostart`] (a few seconds at most). **Off the UI thread**, since they wait for the server (up to
 //! 90 s): [`Client::login`], [`Client::join`], [`Client::logout`], and the add-a-computer and computer-list calls
 //! ([`Client::pairing`], [`Client::pairing_state`], [`Client::cancel_pairing`], [`Client::devices`],
-//! [`Client::remove_device`]).
+//! [`Client::remove_device`]), and opening a live document ([`live::Documents::open`], [`live::Importer::import`]: up
+//! to 30 s). A live document's own calls ([`live::Document::send`], [`live::Document::try_recv`]) don't wait for an
+//! answer.
 //!
 //! ```no_run
 //! # fn main() -> Result<(), craft_cloud_app::Error> {
@@ -42,6 +45,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod http;
+pub mod live;
 mod recents;
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -244,6 +248,13 @@ impl Client {
     /// its own, until the watch is dropped. `NotRunning` if no agent runs right now.
     pub fn watch_recents(&self, app: &str) -> Result<RecentsWatch, Error> {
         RecentsWatch::open(self, app, true)
+    }
+
+    /// A connection for live documents ([`live::Documents::open`]): files of the synced folder opened by path, their
+    /// changes going to and coming from the account's other machines as they are made. `NotRunning` if no agent runs
+    /// right now.
+    pub fn documents(&self) -> Result<live::Documents, Error> {
+        live::Documents::connect(self)
     }
 }
 
