@@ -619,8 +619,11 @@ fn the_cmd_remover_waits_while_tasklist_cant_tell() {
     let dir = root.path().join("Craft Cloud");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(SETUP_EXE), "setup").unwrap();
-    // Three rounds of asking, then it gives up (an hour in the real one).
+    // Three rounds of asking, a second's wait each, then it gives up (an hour in the real one).
+    let started = std::time::Instant::now();
     let mut remover = crate::windows::remove_after_with_cmd_without_tasklist(3, std::process::id(), "craft-cloud-setup.exe", &dir).spawn().unwrap();
     remover.wait().unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_secs(2), "it waited each round (a broken line ends at once): {:?}", started.elapsed());
     assert!(dir.join(SETUP_EXE).exists(), "nothing was removed while it couldn't tell");
+    let _ = std::fs::remove_file(std::env::temp_dir().join(format!("craft-cloud-uninstall-{}.txt", std::process::id())));
 }

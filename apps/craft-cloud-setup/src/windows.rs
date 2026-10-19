@@ -82,7 +82,9 @@ pub fn remove_after_with_cmd(pid: u32, image: &str, dir: &Path) -> Command {
 ///
 /// `tasklist`'s answer goes to a file first (`CRAFT_CLOUD_TASKS`, in the temporary folder), so a `tasklist` that
 /// fails (and writes nothing) is told apart from one that lists nothing: then cmd waits and asks again, rather than
-/// take the setup for ended. `find` and `ping` are named by their full paths: cmd looks in its working folder first.
+/// take the setup for ended. Only `find` decides: the wait after it ends in `ver`, which always succeeds, so a `ping`
+/// that fails isn't read as "ended" either. `find` and `ping` are named by their full paths: cmd looks in its working
+/// folder first.
 /// Each `if` is in parentheses of its own: cmd would take a following `& …` as part of it.
 fn remove_after_with_cmd_using(tasklist: &Path, rounds: u32, pid: u32, image: &str, dir: &Path) -> Command {
     let (find, ping) = (system_program("find.exe"), system_program("PING.EXE"));
@@ -90,7 +92,7 @@ fn remove_after_with_cmd_using(tasklist: &Path, rounds: u32, pid: u32, image: &s
     let remove = format!("for /l %j in (1,1,30) do @(if exist \"%CRAFT_CLOUD_DIR%\" ({RMDIR} & (if exist \"%CRAFT_CLOUD_DIR%\" ({wait}))))");
     let line = format!(
         "/d /c for /l %i in (1,1,{rounds}) do @((\"{tasklist}\" /FI \"PID eq {pid}\" /NH >\"%CRAFT_CLOUD_TASKS%\") \
-         && (\"{find}\" /i \"{image}\" \"%CRAFT_CLOUD_TASKS%\" >nul && {wait} || ({remove} & del \"%CRAFT_CLOUD_TASKS%\" & exit)) || {wait})",
+         && (\"{find}\" /i \"{image}\" \"%CRAFT_CLOUD_TASKS%\" >nul && ({wait} & ver >nul) || ({remove} & del \"%CRAFT_CLOUD_TASKS%\" & exit)) || {wait})",
         tasklist = tasklist.display(),
         find = find.display()
     );
