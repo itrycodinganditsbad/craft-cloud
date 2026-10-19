@@ -472,10 +472,10 @@ fn the_start_menu_shortcut_is_a_shell_link() {
     assert_eq!(bytes[..4], [0x4c, 0, 0, 0], "a shell link starts with its header size");
 }
 
-/// Waits (up to 30 s) for `done`; whether it came.
+/// Waits (up to 60 s) for `done`; whether it came.
 #[cfg(windows)]
 fn comes(done: impl Fn() -> bool) -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !done() {
         if std::time::Instant::now() > deadline {
             return false;
@@ -493,8 +493,8 @@ fn a_detached_start_keeps_none_of_the_setups_handles() {
     let dir = tempfile::tempdir().unwrap();
     let done = dir.path().join("done.txt");
     let cmd = std::env::var_os("ComSpec").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
-    // Twenty seconds of `ping`, then a file.
-    let args = format!("/d /c ping -n 21 127.0.0.1 >nul & echo done> \"{}\"", done.display());
+    // Forty seconds of `ping`, then a file.
+    let args = format!("/d /c ping -n 41 127.0.0.1 >nul & echo done> \"{}\"", done.display());
     let started = std::time::Instant::now();
     let out = crate::windows::start_detached(&cmd, &args, dir.path())
         .stdout(std::process::Stdio::piped())
@@ -502,8 +502,9 @@ fn a_detached_start_keeps_none_of_the_setups_handles() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
-    // PowerShell's own start may take seconds on a cold machine; the program runs twenty.
-    assert!(started.elapsed() < std::time::Duration::from_secs(15), "the pipe stayed open while the program ran: {:?}", started.elapsed());
+    // PowerShell's own start took 26 s once on a busy CI runner; the program runs forty, so a pipe held by it still
+    // fails clearly.
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "the pipe stayed open while the program ran: {:?}", started.elapsed());
     assert!(!done.exists(), "it runs on");
     assert!(comes(|| done.exists()), "and it was started");
 }
