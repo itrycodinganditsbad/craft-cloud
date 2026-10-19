@@ -24,6 +24,44 @@ async fn off<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_keystroke_reaches_the_other_machine_in_under_250_ms() {
+    assert_fast(&time_keystrokes(false).await);
+}
+
+/// The same while another program (a virus scanner, the search indexer, a backup tool) keeps opening the files the
+/// agents write now and then, `status.json` and the live documents' files, without sharing them for deletion: the
+/// agents' writes of them wait, or are left for later, and no keystroke waits for them.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keystroke_isnt_held_up_by_a_scanner_holding_the_files_written_now_and_then() {
+    assert_fast(&time_keystrokes(true).await);
+}
+
+/// Holds each agent's `status.json` and live document files (`<data>/live/<space>/*.doc` and `*.live`) open, sharing
+/// them for reading only, for 400 ms of every 450 ms until `stop` is set.
+#[cfg(windows)]
+fn scanner(data: Vec<std::path::PathBuf>, stop: Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::thread::spawn(move || {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut files: Vec<std::path::PathBuf> = data.iter().map(|d| d.join("status.json")).collect();
+            for space in data.iter().flat_map(|d| std::fs::read_dir(d.join("live")).into_iter().flatten().flatten()) {
+                for entry in std::fs::read_dir(space.path()).into_iter().flatten().flatten() {
+                    if entry.path().extension().is_some_and(|x| x == "doc" || x == "live") {
+                        files.push(entry.path());
+                    }
+                }
+            }
+            let held: Vec<std::fs::File> = files.iter().filter_map(|f| std::fs::OpenOptions::new().read(true).share_mode(1).open(f).ok()).collect();
+            std::thread::sleep(Duration::from_millis(400));
+            drop(held);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    })
+}
+
+/// Two agents, a file opened live on both, and [`KEYSTROKES`] keystrokes typed on the pc and timed to the laptop's
+/// app; with `scan`, a [`scanner`] holds the agents' files from just before the open on (Windows only).
+async fn time_keystrokes(scan: bool) -> Vec<Keystroke> {
     let server = Server::delayed(Duration::from_millis(2)).await;
     let (pc, laptop) = (Agent::signed_in(&server, "pc").await, Agent::signed_in(&server, "laptop").await);
     let (run_pc, run_laptop) = (pc.run(), laptop.run());
@@ -32,6 +70,11 @@ async fn a_keystroke_reaches_the_other_machine_in_under_250_ms() {
     std::fs::write(pc.folder.join("fast.txt"), "").unwrap();
     let file = laptop.folder.join("fast.txt");
     eventually("the file reached the laptop", move || file.exists().then_some(())).await;
+    let stop_scanning = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(windows)]
+    let scanning = scan.then(|| scanner(vec![pc.data.path().to_owned(), laptop.data.path().to_owned()], stop_scanning.clone()));
+    #[cfg(not(windows))]
+    let _ = scan;
     let c = on_pc.clone();
     let (docs_pc, doc_pc) = off(move || {
         let docs = c.documents().unwrap();
@@ -115,12 +158,22 @@ async fn a_keystroke_reaches_the_other_machine_in_under_250_ms() {
         typed
     })
     .await;
+    stop_scanning.store(true, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(windows)]
+    if let Some(scanning) = scanning {
+        scanning.join().unwrap();
+    }
     // The agents stop before anything is asserted: a failure doesn't remove their folders under them (which only adds
     // "couldn't be written to disk" lines to the output).
     drop((docs_pc, docs_laptop, pc_side, laptop_side));
     run_pc.stop().await.0.unwrap();
     run_laptop.stop().await.0.unwrap();
-    let latency = Latency::of(&typed);
+    typed
+}
+
+/// Holds the keystrokes' times to the bounds below, showing each keystroke in order.
+fn assert_fast(typed: &[Keystroke]) {
+    let latency = Latency::of(typed);
     // (Shown with the failure, or with `--nocapture`.)
     let in_order: String = typed.iter().enumerate().map(|(i, k)| format!("\n  {i:2} {k}")).collect();
     eprintln!("keystroke to remote apply: {latency}; in order:{in_order}");

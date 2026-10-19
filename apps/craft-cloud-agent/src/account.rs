@@ -565,6 +565,16 @@ pub(crate) fn random_hex(n: usize) -> io::Result<String> {
 /// Writes `bytes` to `path` atomically: a temporary file next to it, flushed, then renamed over it. `private`
 /// makes the file owner-only on Unix (mode 0600 from creation, so it is never readable by others).
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
+    write_atomic_as(path, bytes, private, true)
+}
+
+/// [`write_atomic`], except that another program holding `path` refuses it at once ([`is_busy`]) rather than being
+/// waited for: for a write that can as well be made later.
+pub(crate) fn write_atomic_unless_busy(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
+    write_atomic_as(path, bytes, private, false)
+}
+
+fn write_atomic_as(path: &Path, bytes: &[u8], private: bool, wait: bool) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| io::Error::other("no parent folder"))?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let temp = dir.join(format!(".{name}.{}.tmp", random_hex(8)?));
@@ -582,7 +592,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> io::Resu
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        replace(&temp, path)
+        if wait { replace(&temp, path) } else { fs::rename(&temp, path) }
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
@@ -601,6 +611,15 @@ fn replace(temp: &Path, path: &Path) -> io::Result<()> {
     retry_busy(|| fs::rename(temp, path))
 }
 
+/// Whether `e` is Windows refusing a file operation because another program holds the file (ERROR_ACCESS_DENIED or
+/// ERROR_SHARING_VIOLATION; [`retry_busy`] waits those out). Never elsewhere.
+pub(crate) fn is_busy(e: &io::Error) -> bool {
+    cfg!(windows) && e.raw_os_error().is_some_and(|code| BUSY.contains(&code))
+}
+
+/// ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION.
+const BUSY: [i32; 2] = [5, 32];
+
 /// Runs the file operation `op`. On Windows another program (a virus scanner, the search indexer, a backup tool)
 /// holding the file open without sharing it for what `op` does makes it fail with ERROR_ACCESS_DENIED or
 /// ERROR_SHARING_VIOLATION, usually for milliseconds: `op` is tried again for about a second and a half before
@@ -608,12 +627,10 @@ fn replace(temp: &Path, path: &Path) -> io::Result<()> {
 pub(crate) fn retry_busy<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     #[cfg(windows)]
     {
-        // ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION.
-        const BUSY: [i32; 2] = [5, 32];
         let mut wait = std::time::Duration::from_millis(5);
         for _ in 0..12 {
             match op() {
-                Err(e) if e.raw_os_error().is_some_and(|code| BUSY.contains(&code)) => {
+                Err(e) if is_busy(&e) => {
                     std::thread::sleep(wait);
                     wait = (wait * 2).min(std::time::Duration::from_millis(200));
                 }

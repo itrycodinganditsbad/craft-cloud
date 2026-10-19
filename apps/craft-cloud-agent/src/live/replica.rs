@@ -2741,19 +2741,30 @@ impl<S: DocStore> Replica<S> {
         for (id, doc) in &mut self.docs {
             let now = !doc.kind.is_document() || doc.urgent || doc.journal > MAX_JOURNAL_BYTES;
             if doc.dirty && doc.joined && now {
-                save(&mut self.store, space, *id, doc)?;
+                // (A document of a file held by another program is written at a later flush: see `Patience`.)
+                save_as(&mut self.store, space, *id, doc, Patience::Later)?;
             }
         }
         Ok(())
     }
 
-    /// Writes every document changed since it was last written, documents of files too (now and then, and when the
-    /// agent stops).
+    /// Writes every document changed since it was last written, documents of files too (when the agent stops: it
+    /// waits for another program holding a file).
     pub fn flush_documents(&mut self) -> std::io::Result<()> {
+        self.flush_documents_as(Patience::Wait)
+    }
+
+    /// [`Replica::flush_documents`] now and then: a document of a file another program holds is left for the next
+    /// time rather than waited for.
+    pub fn flush_documents_now_and_then(&mut self) -> std::io::Result<()> {
+        self.flush_documents_as(Patience::Later)
+    }
+
+    fn flush_documents_as(&mut self, patience: Patience) -> std::io::Result<()> {
         let space = self.space;
         for (id, doc) in &mut self.docs {
             if doc.dirty && doc.joined {
-                save(&mut self.store, space, *id, doc)?;
+                save_as(&mut self.store, space, *id, doc, patience)?;
             }
         }
         Ok(())
@@ -3005,7 +3016,24 @@ fn send_pending(id: DocId, doc: &mut Doc) -> Vec<ClientFrame> {
     frames
 }
 
+/// Whether a write of a document of a file waits for another program holding its files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Patience {
+    /// It does (something waits for this write: an app's change, a load, the agent stopping).
+    Wait,
+    /// It doesn't: the document stays dirty and is written at the next flush. For the writes the hub makes now and
+    /// then, which nothing waits for (a document's local updates are in its journal already); the hub's thread also
+    /// relays every keystroke, and a write waiting for a virus scanner held them all up.
+    Later,
+}
+
 fn save<S: DocStore>(store: &mut S, space: SpaceId, id: DocId, doc: &mut Doc) -> std::io::Result<()> {
+    save_as(store, space, id, doc, Patience::Wait)
+}
+
+/// [`save`], waiting for a holder of a document of a file's files or not (recents always wait: an add is answered
+/// once it is on disk).
+fn save_as<S: DocStore>(store: &mut S, space: SpaceId, id: DocId, doc: &mut Doc, patience: Patience) -> std::io::Result<()> {
     let snapshot = doc.body.copy().snapshot().map_err(std::io::Error::other)?;
     match &doc.kind {
         Kind::Recents(app) => {
@@ -3052,10 +3080,33 @@ fn save<S: DocStore>(store: &mut S, space: SpaceId, id: DocId, doc: &mut Doc) ->
             };
             let bytes = postcard::to_stdvec(&file).map_err(std::io::Error::other)?;
             let name = id.to_string();
-            store.save_document(&name, &bytes)?;
+            match patience {
+                Patience::Wait => store.save_document(&name, &bytes)?,
+                Patience::Later => match store.save_document_unless_busy(&name, &bytes) {
+                    Ok(()) => {}
+                    // Still dirty: written at the next of the documents' writes, not tried again after every frame
+                    // (its journal has its local updates meanwhile).
+                    Err(e) if crate::account::is_busy(&e) => {
+                        doc.urgent = false;
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                },
+            }
             // Its journal's updates are in the file now (a crash before this finds them there and skips them).
-            store.clear_journal(&name)?;
-            doc.journal = 0;
+            let cleared = match patience {
+                Patience::Wait => store.clear_journal(&name).map(|()| true),
+                // A journal held by another program stays as it is: its records are in the file now, and a load
+                // skips them (by their numbers); the next write empties it.
+                Patience::Later => match store.clear_journal_unless_busy(&name) {
+                    Ok(()) => Ok(true),
+                    Err(e) if crate::account::is_busy(&e) => Ok(false),
+                    Err(e) => Err(e),
+                },
+            }?;
+            if cleared {
+                doc.journal = 0;
+            }
         }
     }
     doc.dirty = false;

@@ -16,7 +16,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::account::{remove_atomic_temps, retire, retry_busy, write_atomic};
+use crate::account::{remove_atomic_temps, retire, retry_busy, write_atomic, write_atomic_unless_busy};
 
 /// A place for the documents of one account.
 pub trait DocStore: Send {
@@ -47,6 +47,15 @@ pub trait DocStore: Send {
     /// Writes a document of a file whole, atomically and durably.
     fn save_document(&mut self, _name: &str, _bytes: &[u8]) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    /// [`DocStore::save_document`], refused at once (on Windows) while another program holds the file, for a write
+    /// that can as well be made later (see [`crate::account::is_busy`]).
+    fn save_document_unless_busy(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        self.save_document(name, bytes)
+    }
+    /// [`DocStore::clear_journal`], refused at once (on Windows) while another program holds the journal.
+    fn clear_journal_unless_busy(&mut self, name: &str) -> io::Result<()> {
+        self.clear_journal(name)
     }
     /// Appends `record` to the document's journal, durably, before this returns. On an error the journal is cut back
     /// to where it was, as far as the store can (the caller cuts it back too, and writes the document whole).
@@ -210,6 +219,14 @@ impl DocStore for DiskStore {
         write_atomic(&self.dir.join(format!("{name}{DOCUMENT_SUFFIX}")), bytes, true)
     }
 
+    fn save_document_unless_busy(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        write_atomic_unless_busy(&self.dir.join(format!("{name}{DOCUMENT_SUFFIX}")), bytes, true)
+    }
+
+    fn clear_journal_unless_busy(&mut self, name: &str) -> io::Result<()> {
+        cut_as(&self.dir.join(format!("{name}{JOURNAL_SUFFIX}")), 0, false)
+    }
+
     fn append_journal(&mut self, name: &str, record: &[u8]) -> io::Result<()> {
         use std::io::Write;
         let path = self.dir.join(format!("{name}{JOURNAL_SUFFIX}"));
@@ -264,7 +281,13 @@ impl DocStore for DiskStore {
 /// Cuts the file at `path` to its first `len` bytes if it is longer, durably (a missing file is empty already). A
 /// holder that doesn't share it for writing is waited for.
 fn cut(path: &Path, len: u64) -> io::Result<()> {
-    let file = match retry_busy(|| std::fs::OpenOptions::new().write(true).open(path)) {
+    cut_as(path, len, true)
+}
+
+/// [`cut`]; without `wait`, a holder refuses it at once.
+fn cut_as(path: &Path, len: u64, wait: bool) -> io::Result<()> {
+    let open = || std::fs::OpenOptions::new().write(true).open(path);
+    let file = match if wait { retry_busy(open) } else { open() } {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
