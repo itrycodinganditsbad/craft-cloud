@@ -50,6 +50,8 @@ pub const NOT_NFC_REASON: &str =
 pub const STILL_CHANGING: &str = "still changing";
 /// Why a file both sides saved from its live document waits (see [`SaveRecords::includes`]).
 pub const SAVE_ORDER_WAITS: &str = "two Craft saves wait to learn which is newer";
+/// Why a file a Craft app is saving waits (see [`SaveRecords::pending`]).
+pub const SAVE_RECORD_WAITS: &str = "a Craft save waits for its record";
 /// What the report says about a download kept because the file it replaces is in use or may not be replaced.
 const KEPT_WAITS: &str = "the server's version is downloaded and kept, and lands once it can";
 /// Most chunk IDs asked about in one missing-chunk query.
@@ -383,6 +385,13 @@ pub trait SaveRecords: Send + Sync {
     /// Whether the live document as `a` names it (its frontiers) holds every operation `b`'s does; `None` while that
     /// can't be told (the operations aren't here yet).
     fn includes(&self, a: &craft_cloud_proto::SaveRecord, b: &craft_cloud_proto::SaveRecord) -> Option<bool>;
+    /// Whether an app announced a save of exactly content `hash` to `node`'s file whose record hasn't come yet (an app
+    /// tells the agent before it writes, and sends the record after the changes it covers). Such content is never
+    /// taken for an edit outside Craft: it isn't uploaded without its record, nor made a conflict copy, but waits.
+    fn pending(&self, node: NodeId, hash: &FileHash) -> bool {
+        let _ = (node, hash);
+        false
+    }
 }
 
 /// Which deletions the mass-delete guard lets through this pass.
@@ -446,6 +455,11 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// The save record of `node`'s content `hash`, if well formed.
     pub(crate) fn save_record(&self, node: NodeId, hash: &FileHash) -> Option<craft_cloud_proto::SaveRecord> {
         self.saves.as_ref()?.record(node, hash).filter(craft_cloud_proto::SaveRecord::is_valid)
+    }
+
+    /// Whether a Craft save of `node`'s content `hash` is on its way: announced, with no record yet.
+    pub(crate) fn save_pending(&self, node: NodeId, hash: &FileHash) -> bool {
+        self.save_record(node, hash).is_none() && self.saves.as_ref().is_some_and(|s| s.pending(node, hash))
     }
 
     /// Whether save `a` includes save `b`, as the agent can tell; `None` while it can't.

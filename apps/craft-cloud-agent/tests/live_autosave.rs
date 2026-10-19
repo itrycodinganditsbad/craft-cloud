@@ -94,6 +94,8 @@ impl LiveDocument for LinesApp {
 }
 
 const FILE: &str = "n.lines";
+/// How late every save record reaches each agent's save book.
+const RECORD_DELAY_MS: u64 = 1500;
 
 /// What the two windows share with the test.
 #[derive(Default)]
@@ -173,13 +175,27 @@ fn files(folder: &std::path::Path) -> Vec<(String, Vec<u8>)> {
 async fn both_machines_autosaving_end_with_every_edit_in_the_file_and_stop() {
     let server = Server::new().await;
     let (pc, laptop) = (Agent::signed_in(&server, "pc").await, Agent::signed_in(&server, "laptop").await);
-    let (run_pc, run_laptop) = (pc.run(), laptop.run());
+    // Slow agents: every save record reaches the save book late, after the app wrote its file (as under load).
+    let slow = || craft_cloud_agent::daemon::RunOptions { record_delay: Duration::from_millis(RECORD_DELAY_MS), ..looping::quick() };
+    let (run_pc, run_laptop) = (pc.run_with(slow()), laptop.run_with(slow()));
     let (on_pc, on_laptop) = (pc.client().await, laptop.client().await);
     std::fs::create_dir_all(&pc.folder).unwrap();
     std::fs::write(pc.folder.join(FILE), "start").unwrap();
     let there = laptop.folder.join(FILE);
     eventually("the file reached the laptop", move || there.exists().then_some(())).await;
     let shared = Arc::new(Shared::default());
+    // More load on demand: `CRAFT_CLOUD_TEST_LOAD=8` adds eight threads that keep the CPUs busy throughout.
+    let burners: usize = std::env::var("CRAFT_CLOUD_TEST_LOAD").ok().and_then(|n| n.parse().ok()).unwrap_or(0);
+    for _ in 0..burners {
+        let s = shared.clone();
+        std::thread::spawn(move || {
+            let mut x = 0u64;
+            while !s.stop.load(Ordering::Relaxed) {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                std::hint::black_box(x);
+            }
+        });
+    }
     let t0 = Instant::now();
     // The pc opens first (it imports the file), then the laptop.
     let (s, folder, c) = (shared.clone(), pc.folder.clone(), on_pc.clone());

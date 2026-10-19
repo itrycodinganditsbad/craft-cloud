@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use craft_cloud_proto::limits::MAX_TREE_DEPTH;
-use craft_cloud_proto::{FileState, FoldKey, Name, NodeId, SaveRecord};
+use craft_cloud_proto::{FileState, FoldKey, Name, NodeId};
 
 use crate::fs::{Fs, FsKind};
 use crate::path::RelPath;
@@ -1050,26 +1050,31 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// When the agent can't tell yet which save is newer, the file waits ([`LiveWinner::Wait`]); after
     /// `save_order_wait_ms` of that, `None` (a conflict copy). A winner is never guessed.
     fn live_winner(&mut self, id: NodeId, file: &FileState, at: &RelPath) -> Result<Option<(LiveWinner, Option<FsKind>)>, SyncError> {
+        let checked = self.stat(at)?;
+        let hash = self.content_hash(at);
+        // Our content is a Craft save whose record is on its way: never a conflict copy, it waits for the record.
+        if let Some(hash) = &hash
+            && self.save_pending(id, hash)
+        {
+            return Ok(self.wait(id).map(|w| (w, checked)));
+        }
         // A pair that isn't (or no longer is) two Craft saves starts no wait, and ends one under way.
-        let pair = self.save_pair(id, file, at)?;
-        let Some((theirs, ours, checked)) = pair else {
+        let ours = hash.and_then(|h| self.save_record(id, &h));
+        let pair = match (file.save.clone(), ours) {
+            (Some(theirs), Some(ours)) if theirs.doc == ours.doc => Some((theirs, ours)),
+            _ => None,
+        };
+        let Some((theirs, ours)) = pair else {
             self.unknown_since.remove(&id);
             return Ok(None);
         };
         let winner = match self.save_includes(&theirs, &ours) {
             Some(true) => LiveWinner::Server,
             Some(false) => LiveWinner::Here,
-            None => {
-                // The machine's clock while awake (`Instant`), so a sleep through the wait doesn't end it.
-                let now = std::time::Instant::now();
-                let since = *self.unknown_since.entry(id).or_insert(now);
-                if now.saturating_duration_since(since).as_millis() >= u128::try_from(self.config.save_order_wait_ms.max(0)).unwrap_or(0) {
-                    self.unknown_since.remove(&id);
-                    return Ok(None);
-                }
-                self.deferred.insert(id);
-                LiveWinner::Wait
-            }
+            None => match self.wait(id) {
+                Some(wait) => wait,
+                None => return Ok(None),
+            },
         };
         if !matches!(winner, LiveWinner::Wait) {
             self.unknown_since.remove(&id);
@@ -1077,15 +1082,18 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         Ok(Some((winner, checked)))
     }
 
-    /// The server's and this file's save records when both name one live document, with what the file looked like
-    /// before it was hashed.
-    #[allow(clippy::type_complexity)]
-    fn save_pair(&self, id: NodeId, file: &FileState, at: &RelPath) -> Result<Option<(SaveRecord, SaveRecord, Option<FsKind>)>, SyncError> {
-        let Some(theirs) = file.save.clone() else { return Ok(None) };
-        let checked = self.stat(at)?;
-        let Some(hash) = self.content_hash(at) else { return Ok(None) };
-        let Some(ours) = self.save_record(id, &hash) else { return Ok(None) };
-        Ok((ours.doc == theirs.doc).then_some((theirs, ours, checked)))
+    /// `id`'s file waits this pass ([`LiveWinner::Wait`]), unless it has waited `save_order_wait_ms` already: then
+    /// `None`, and it is handled as any two edits are (a conflict copy).
+    fn wait(&mut self, id: NodeId) -> Option<LiveWinner> {
+        // The machine's clock while awake (`Instant`), so a sleep through the wait doesn't end it.
+        let now = std::time::Instant::now();
+        let since = *self.unknown_since.entry(id).or_insert(now);
+        if now.saturating_duration_since(since).as_millis() >= u128::try_from(self.config.save_order_wait_ms.max(0)).unwrap_or(0) {
+            self.unknown_since.remove(&id);
+            return None;
+        }
+        self.deferred.insert(id);
+        Some(LiveWinner::Wait)
     }
 
     fn holds_base_content(&self, entry: &BaseEntry, at: &RelPath) -> bool {

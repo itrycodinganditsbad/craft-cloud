@@ -40,6 +40,12 @@ struct Entry {
 /// Adds from several app connections at once take turns.
 static WRITING: Mutex<()> = Mutex::new(());
 
+/// Saves announced (`saving`) whose records haven't come yet, by book file, then by document and content: since when.
+type Announced = HashMap<(DocId, String), Instant>;
+static ANNOUNCED: Mutex<BTreeMap<PathBuf, Announced>> = Mutex::new(BTreeMap::new());
+/// How long an announced save is waited for: as long as the sync waits to learn which of two saves is newer.
+pub const ANNOUNCED_FOR: Duration = Duration::from_secs(10 * 60);
+
 /// The books' caches, by file (shared by every [`SaveBook`] of one file in the process).
 type Cache = Arc<Mutex<Option<Read>>>;
 static CACHES: Mutex<BTreeMap<PathBuf, Cache>> = Mutex::new(BTreeMap::new());
@@ -135,6 +141,37 @@ impl SaveBook {
         map
     }
 
+    /// An app announced it is writing `doc`'s file with content `hash` (hex), its record to follow (kept in memory: an
+    /// app announces its saves again when it reconnects).
+    pub fn announce(&self, doc: DocId, hash: &str) {
+        if self.find(doc, hash).is_some() {
+            return;
+        }
+        let mut all = ANNOUNCED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        let mine = all.entry(self.path.clone()).or_default();
+        mine.retain(|_, since| now.duration_since(*since) < ANNOUNCED_FOR);
+        mine.entry((doc, hash.to_owned())).or_insert(now);
+    }
+
+    /// The announced save of `doc` with content `hash` won't have its record (its app closed the document first).
+    pub fn forget(&self, doc: DocId, hash: &str) {
+        if let Some(mine) = ANNOUNCED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(&self.path) {
+            mine.remove(&(doc, hash.to_owned()));
+        }
+    }
+
+    /// Whether a save of `doc` with content `hash` (hex) was announced and its record hasn't come yet (for at most
+    /// [`ANNOUNCED_FOR`]).
+    pub fn announced(&self, doc: DocId, hash: &str) -> bool {
+        ANNOUNCED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.path)
+            .and_then(|mine| mine.get(&(doc, hash.to_owned())))
+            .is_some_and(|since| since.elapsed() < ANNOUNCED_FOR)
+    }
+
     /// The record of `doc`'s save with content `hash` (hex), if an app on this machine saved exactly that.
     pub fn find(&self, doc: DocId, hash: &str) -> Option<SaveRecord> {
         self.by_key().get(&(doc, hash.to_owned())).map(|e| SaveRecord { doc, frontiers: e.frontiers.clone() })
@@ -156,6 +193,8 @@ impl SaveBook {
     /// hash or the frontiers don't look like a save's ([`SaveBook::check`]).
     pub fn add(&self, doc: DocId, hash: &str, frontiers: Vec<(u64, u32)>, at_ms: i64) -> Result<(), String> {
         Self::check(hash, &frontiers)?;
+        // Its record came: no longer on its way.
+        self.forget(doc, hash);
         let mut frontiers = frontiers;
         frontiers.sort_unstable();
         frontiers.dedup();
@@ -214,6 +253,10 @@ pub fn changed_outside(
 impl SaveRecords for SaveBook {
     fn record(&self, node: NodeId, hash: &FileHash) -> Option<SaveRecord> {
         self.find(node_doc(self.space, node), &hex(hash.as_bytes()))
+    }
+
+    fn pending(&self, node: NodeId, hash: &FileHash) -> bool {
+        self.announced(node_doc(self.space, node), &hex(hash.as_bytes()))
     }
 
     /// Asked of the live hub, which holds the document's operations; `None` when no hub runs, it doesn't answer in

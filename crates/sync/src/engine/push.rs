@@ -28,7 +28,7 @@ use crate::path::RelPath;
 use crate::state::{BaseEntry, BaseKind, HeldLink, RemoteNode};
 use crate::transport::{Transport, TransportError};
 
-use super::{Effect, Engine, MISSING_QUERY_IDS, Report, STILL_CHANGING, SyncError, per_node};
+use super::{Effect, Engine, MISSING_QUERY_IDS, Report, SAVE_RECORD_WAITS, STILL_CHANGING, SyncError, per_node};
 
 /// Why a file of `size` bytes is skipped when files may be at most `limit` bytes.
 fn too_big(size: u64, limit: u64) -> String {
@@ -388,6 +388,12 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 continue;
             };
             let Some((version, size, meta, hash)) = self.upload(path, exec, base_size, report).await? else { continue };
+            // Content a Craft app is saving whose record hasn't come: never sent without it (the other machines would
+            // take it for an edit outside Craft). The next pass, once the record is here, sends it with it.
+            if self.save_pending(*id, &hash) {
+                report.skipped.push((path.to_string(), format!("{SAVE_RECORD_WAITS}; tried again next pass")));
+                continue;
+            }
             // Content a Craft app saved from the file's live document carries its record.
             let version = NewVersion { save: self.save_record(*id, &hash), ..version };
             ops.push((Op::Update { node: *id, expected, version: version.clone() }, Effect::Update { id: *id, version, size, meta, hash }));

@@ -525,6 +525,14 @@ impl Document {
         self.shared.send_json(&DocsRequest::Saved { doc: self.head.doc, hash: hex(&hash), frontiers })
     }
 
+    /// Tells the agent, at once and before the file is written, that the app is writing the document's file with
+    /// content `hash`, and that its record ([`Document::saved`]) follows: until it comes, the agent's sync waits for it
+    /// rather than take the content for an edit outside Craft. An older agent answers `error`; nothing else changes.
+    pub fn saving(&self, hash: [u8; 32]) -> Result<(), Error> {
+        let hex = hash.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        self.shared.send_json(&DocsRequest::Saving { doc: self.head.doc, hash: hex })
+    }
+
     /// Sends this app's presence (at most 4 KiB, at most 20 a second; more are dropped).
     pub fn presence(&self, bytes: &[u8]) -> Result<(), Error> {
         self.shared.send_binary(PRESENCE, self.id, bytes)

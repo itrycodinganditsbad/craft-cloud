@@ -145,6 +145,11 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                     Some(hub) => hub.docs(DocsCall::Saved { conn: link.conn, doc, hash, frontiers }).await.map(|()| true).map_err(|_| End::Hub),
                     None => Ok(true),
                 },
+                // At once, before the app writes the file: the sync waits for that save's record.
+                DocsRequest::Saving { doc, hash } => match link.hub.clone() {
+                    Some(hub) => hub.docs(DocsCall::Saving { conn: link.conn, doc, hash }).await.map(|()| true).map_err(|_| End::Hub),
+                    None => Ok(true),
+                },
             }
         }
         Message::Binary(bytes) => {

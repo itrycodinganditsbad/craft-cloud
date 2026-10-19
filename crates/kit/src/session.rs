@@ -258,6 +258,8 @@ struct Kept {
     end: i32,
     /// Sent on the current connection.
     sent: bool,
+    /// Announced on the current connection (`saving`: at once, before the write and before the changes go).
+    announced: bool,
 }
 
 /// Another machine's (or app's) presence.
@@ -652,9 +654,10 @@ impl<D: LiveDocument> Session<D> {
         }
         self.outbox_bytes = self.outbox.iter().map(|o| o.bytes.len()).sum();
         // Saves made while the agent was away, and the last ones again (the agent keeps a record once): each after the
-        // changes it covers.
+        // changes it covers (announced at once).
         for kept in &mut self.records {
             kept.sent = false;
+            kept.announced = false;
         }
         self.link = Some(link);
         self.backoff = FIRST_BACKOFF;
@@ -1019,6 +1022,7 @@ impl<D: LiveDocument> Session<D> {
         }
         for kept in &mut self.records {
             kept.sent = false;
+            kept.announced = false;
         }
     }
 
@@ -1266,6 +1270,13 @@ impl<D: LiveDocument> Session<D> {
 
     fn send_outbox(&mut self) {
         let Some(link) = &self.link else { return };
+        // Saves on their way, announced at once (before the changes they cover, which may wait): the agent's sync then
+        // waits for their records rather than take the files for edits outside Craft.
+        for kept in self.records.iter_mut().filter(|k| !k.announced && !k.sent) {
+            if link.doc.saving(kept.record.hash).is_ok() {
+                kept.announced = true;
+            }
+        }
         // Refused for good: nothing after it can be taken. Refused for now: not before the pause is over.
         if self.refused.is_some() || Instant::now() < self.resend_at {
             return;
@@ -1410,7 +1421,7 @@ impl<D: LiveDocument> Session<D> {
         let record = SaveRecord { hash, frontiers: point.frontiers.clone() };
         // The file is this save from now on (until the agent says otherwise: the sync brought another one).
         self.file_version = Some(record.frontiers.clone());
-        self.records.push_back(Kept { record: record.clone(), end: point.end, sent: false });
+        self.records.push_back(Kept { record: record.clone(), end: point.end, sent: false, announced: false });
         while self.records.len() > KEPT_RECORDS {
             self.records.pop_front();
         }

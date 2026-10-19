@@ -45,6 +45,8 @@ pub struct HubConfig {
     pub machine: String,
     /// The synced folder (the paths apps open documents by are in it).
     pub folder: PathBuf,
+    /// Tests: how long every save record is held back before it is taken (a slow agent).
+    pub record_delay: Duration,
 }
 
 /// How long an open of a file that isn't uploaded yet waits for its node (a sync pass is started for it).
@@ -98,6 +100,12 @@ pub enum DocsCall {
         app: String,
         /// The hash (hex) of the file's bytes as the app read them.
         file_hash: Option<String>,
+    },
+    /// The app is about to write `doc`'s file with content `hash` (hex); its record follows.
+    Saving {
+        conn: ConnId,
+        doc: DocId,
+        hash: String,
     },
     /// The app is about to write `doc`'s file: content `hash` (hex), from the document at `frontiers`.
     Saved {
@@ -336,6 +344,8 @@ struct Docs {
     early: Vec<EarlyRecord>,
     /// Documents the sync asked about and this copy couldn't tell yet: a pass is asked for once operations come.
     asked: BTreeSet<DocId>,
+    /// Saves announced (`saving`) whose records haven't come, by connection: let go if it closes the document first.
+    announced: Vec<(ConnId, DocId, String)>,
 }
 
 /// A save record waiting for its operations ([`Docs::early`]).
@@ -344,6 +354,8 @@ struct EarlyRecord {
     doc: DocId,
     hash: String,
     frontiers: Vec<(u64, u32)>,
+    /// Not taken before then (tests: [`HubConfig::record_delay`]).
+    not_before: Instant,
 }
 
 /// A document's file as last looked at ([`State::tell_files`]).
@@ -666,10 +678,11 @@ impl State {
         if let Err(message) = super::saves::SaveBook::check(&hash, &frontiers) {
             return self.tell(conn, refusal(None, None, craft_cloud_proto::api::codes::INVALID, message));
         }
-        if self.replica.document_holds(doc, &frontiers) {
+        let not_before = Instant::now() + self.config.record_delay;
+        if self.config.record_delay.is_zero() && self.replica.document_holds(doc, &frontiers) {
             self.keep_record(doc, &hash, frontiers);
         } else {
-            self.docs.early.push(EarlyRecord { conn, doc, hash, frontiers });
+            self.docs.early.push(EarlyRecord { conn, doc, hash, frontiers, not_before });
         }
         Vec::new()
     }
@@ -679,6 +692,7 @@ impl State {
     /// failed shows by the agent's next word).
     fn keep_record(&mut self, doc: DocId, hash: &str, frontiers: Vec<(u64, u32)>) {
         let at = crate::cli::now_ms();
+        self.docs.announced.retain(|(_, d, h)| !(*d == doc && h == hash));
         if let Err(e) = self.saves.add(doc, hash, frontiers, at) {
             self.say(format!("a save record couldn't be kept: {e}"));
             return;
@@ -695,8 +709,9 @@ impl State {
             return;
         }
         let early = std::mem::take(&mut self.docs.early);
+        let now = Instant::now();
         for r in early {
-            if self.replica.document_holds(r.doc, &r.frontiers) {
+            if r.not_before <= now && self.replica.document_holds(r.doc, &r.frontiers) {
                 self.keep_record(r.doc, &r.hash, r.frontiers);
             } else {
                 self.docs.early.push(r);
@@ -847,6 +862,13 @@ impl State {
             }
             DocsCall::Open { conn, id, path, app, file_hash } => self.open(conn, id, &path, &app, file_hash),
             DocsCall::Saved { conn, doc, hash, frontiers } => self.saved(conn, doc, hash, frontiers),
+            DocsCall::Saving { conn, doc, hash } => {
+                if super::saves::SaveBook::check(&hash, &[]).is_ok() {
+                    self.saves.announce(doc, &hash);
+                    self.docs.announced.push((conn, doc, hash));
+                }
+                Vec::new()
+            }
             DocsCall::Import { conn, id, bytes } => {
                 let doc = self.docs.importer.iter().find(|(_, who)| **who == (conn, id)).map(|(doc, _)| *doc);
                 let Some(doc) = doc else {
@@ -916,8 +938,17 @@ impl State {
                         self.replica.set_open(doc, false);
                     }
                 }
-                // Closed before the changes its records cover came: those records are dropped.
+                // Closed before the changes its records cover came: those records are dropped, and its saves on their
+                // way with them (their content is then as any edit: the version has no record).
                 self.docs.early.retain(|r| !(r.conn == conn && r.doc == doc));
+                let saves = &self.saves;
+                self.docs.announced.retain(|(c, d, h)| {
+                    let closed = *c == conn && *d == doc;
+                    if closed {
+                        saves.forget(*d, h);
+                    }
+                    !closed
+                });
                 Vec::new()
             }
             DocsCall::Gone { conn } => self.gone(conn),

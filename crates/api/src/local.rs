@@ -507,6 +507,11 @@ pub enum DocsRequest {
     /// them, and is dropped if the app closes the document before), and records it with the file version it uploads
     /// for that content ([`SaveRecord`]).
     Saved { doc: crate::ids::DocId, hash: String, frontiers: Vec<(u64, u32)> },
+    /// The app is about to write the document's file with content `hash` (hex), and its record (`saved`) follows once
+    /// the changes it covers have gone: sent at once, before the write. Until the record comes (or the app closes the
+    /// document), the agent's sync takes that content for a Craft save on its way: it doesn't upload it without its
+    /// record, nor make a conflict copy of it, but waits (at most the save-order wait, 10 minutes).
+    Saving { doc: crate::ids::DocId, hash: String },
 }
 
 /// Most heads a save record's frontiers may have: the live document's concurrent tips, one or two in practice

@@ -157,8 +157,11 @@ app's), the session is stalled or stopped, or the model is behind the live docum
 then, and the file syncs as any file does.
 
 A record names the live document's frontiers (its heads, one or two operation IDs however many machines and sessions
-edited it), never a version vector. The session sends it on the same stream as its changes, after every change it
-covers; the agent keeps it once all those operations are in its copy (a record that comes first waits for them, and
+edited it), never a version vector. `record` first announces the save to the agent at once (its content's hash),
+before the write: until the record itself comes, the agent's sync takes that content for a Craft save on its way, and
+neither uploads it without its record nor makes a conflict copy of it, but waits (at most 10 minutes), however slow
+the agent, the sync or the network. The session sends the record on the same stream as its changes, after every
+change it covers; the agent keeps it once all those operations are in its copy (a record that comes first waits for them, and
 is dropped if the window closes before they come: that version then has no record, and its edits are in the file, so
 nothing is lost). The record goes before the write so the agent knows the content before its sync pass sees it; while
 the agent is away the session keeps the record and tells it once back, and the agent adds it to the version it

@@ -395,6 +395,8 @@ impl Hub {
                 m.file_pending.insert(path, frontiers);
                 sync(&mut inner);
             }
+            // (The fake's file sync is the records themselves: nothing waits for a save on its way.)
+            DocsRequest::Saving { .. } => {}
         }
     }
 

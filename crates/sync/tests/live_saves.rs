@@ -15,11 +15,15 @@ use craft_cloud_sync::{Fs, SaveRecords, Transport};
 /// vector, `(peer, end)`, and one includes another as vectors do (the agent asks its copy of the document; the tests
 /// need no Loro). With `unknown` set, nothing can be told.
 #[derive(Default, Clone)]
-struct Book(Arc<Mutex<HashMap<(NodeId, FileHash), SaveRecord>>>, Arc<std::sync::atomic::AtomicBool>);
+struct Book(Arc<Mutex<HashMap<(NodeId, FileHash), SaveRecord>>>, Arc<std::sync::atomic::AtomicBool>, Arc<Mutex<Vec<(NodeId, FileHash)>>>);
 
 impl SaveRecords for Book {
     fn record(&self, node: NodeId, hash: &FileHash) -> Option<SaveRecord> {
         self.0.lock().unwrap().get(&(node, *hash)).cloned()
+    }
+
+    fn pending(&self, node: NodeId, hash: &FileHash) -> bool {
+        self.2.lock().unwrap().contains(&(node, *hash))
     }
 
     fn includes(&self, a: &SaveRecord, b: &SaveRecord) -> Option<bool> {
@@ -31,6 +35,20 @@ impl SaveRecords for Book {
 }
 
 impl Book {
+    /// The app is saving `data` to `p` and wrote the file; its record hasn't reached the agent yet (announced only).
+    fn saving(&self, m: &mut Machine, p: &str, data: &[u8]) -> (NodeId, FileHash) {
+        m.fs_mut().write(&path(p), data, false, 0).unwrap();
+        let key = (node(m, p), FileHash::from_bytes(*blake3::hash(data).as_bytes()));
+        self.2.lock().unwrap().push(key);
+        key
+    }
+
+    /// The record of an announced save comes.
+    fn record_comes(&self, key: (NodeId, FileHash), doc: DocId, version: &[(u64, u32)]) {
+        self.2.lock().unwrap().retain(|k| *k != key);
+        self.0.lock().unwrap().insert(key, SaveRecord { doc, frontiers: version.to_vec() });
+    }
+
     /// The app saved `data` to `p` from the document at `version`.
     fn save(&self, m: &mut Machine, p: &str, data: &[u8], doc: DocId, version: &[(u64, u32)]) {
         m.fs_mut().write(&path(p), data, false, 0).unwrap();
@@ -276,4 +294,30 @@ async fn saves_whose_order_is_unknown_wait_then_are_a_conflict() {
         b.sync_once().await.unwrap();
     }
     assert_eq!(files(&c).len(), 2, "a conflict copy: {:?}", files(&c));
+}
+
+/// A Craft save whose record is slow to reach the agent (announced, the file written, the record late): it isn't
+/// uploaded without its record, and when the other machine's save comes meanwhile there is no conflict copy; both
+/// wait, and once the record is in, the saves resolve as any two Craft saves do. (Before: the save went up as an edit
+/// outside Craft, or met the other's as a conflict copy, the flake the busy-machine run showed.)
+#[tokio::test]
+async fn a_save_whose_record_is_late_waits_for_it_and_never_conflicts() {
+    let server = Server::new().await;
+    let (mut a, mut b, book_a, book_b, doc) = two(&server).await;
+    let late = book_a.saving(&mut a, "doc.kitdemo", b"laptop's save, record on its way");
+    a.sync_once().await.unwrap();
+    assert_eq!(server_file(&a).await.save, None, "nothing went up yet");
+    let up = server_file(&a).await;
+    // The desktop's save meanwhile.
+    book_b.save(&mut b, "doc.kitdemo", b"desktop's save", doc, &[(2, 3)]);
+    b.sync_once().await.unwrap();
+    rounds(&mut a, &mut b).await;
+    assert_eq!(files(&a), vec![("doc.kitdemo".to_owned(), b"laptop's save, record on its way".to_vec())], "waits, kept as it is");
+    assert_ne!(server_file(&a).await.version, up.version, "the desktop's went up");
+    // The record comes: the laptop's save includes the desktop's (it had its edits live), so it goes up over it.
+    book_a.record_comes(late, doc, &[(1, 6), (2, 3)]);
+    rounds(&mut a, &mut b).await;
+    let want = vec![("doc.kitdemo".to_owned(), b"laptop's save, record on its way".to_vec())];
+    assert_eq!((files(&a), files(&b)), (want.clone(), want), "no conflict copy");
+    assert_eq!(server_file(&a).await.save.map(|s| s.frontiers), Some(vec![(1, 6), (2, 3)]), "with its record");
 }

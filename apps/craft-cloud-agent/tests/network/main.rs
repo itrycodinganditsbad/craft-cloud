@@ -103,13 +103,20 @@ struct CraftSaves {
     books: Vec<CraftBook>,
     knows: Vec<Vec<u32>>,
     saves: u32,
+    /// Records on their way to their save books ([`Driver::deliver_late`]).
+    late: Vec<LateRecord>,
 }
 
 /// A machine's save records. Their frontiers stand for version vectors here, compared as vectors (the agent asks its
 /// copy of the document). The first time a pair is asked, the answer is "can't tell yet", as an agent that lacks the
 /// operations says: the files wait a pass.
+/// The third part: saves announced whose records are late (a slow agent), waited for by the sync.
 #[derive(Default, Clone)]
-struct CraftBook(Arc<Mutex<BTreeMap<(NodeId, FileHash), craft_cloud_proto::SaveRecord>>>, Arc<Mutex<BTreeSet<AskedPair>>>);
+struct CraftBook(
+    Arc<Mutex<BTreeMap<(NodeId, FileHash), craft_cloud_proto::SaveRecord>>>,
+    Arc<Mutex<BTreeSet<AskedPair>>>,
+    Arc<Mutex<BTreeSet<(NodeId, FileHash)>>>,
+);
 
 /// Two records' frontiers asked about.
 type AskedPair = (Vec<(u64, u32)>, Vec<(u64, u32)>);
@@ -125,9 +132,32 @@ impl craft_cloud_sync::SaveRecords for CraftBook {
         }
         Some(b.frontiers.iter().all(|(peer, end)| a.frontiers.iter().any(|(p, e)| p == peer && e >= end)))
     }
+
+    fn pending(&self, node: NodeId, hash: &FileHash) -> bool {
+        self.2.lock().unwrap().contains(&(node, *hash))
+    }
 }
 
+/// A save record on its way (machine, file and content, the record, steps until it reaches the save book).
+type LateRecord = (usize, (NodeId, FileHash), craft_cloud_proto::SaveRecord, usize);
+
 impl Driver {
+    /// Late save records arrive: those whose steps ran out, or all (`all`, before the network heals).
+    fn deliver_late(&mut self, all: bool) {
+        let c = &mut self.craft;
+        for late in std::mem::take(&mut c.late) {
+            let (i, key, record, left) = late;
+            if all || left <= 1 {
+                if let Some(book) = c.books.get(i) {
+                    book.2.lock().unwrap().remove(&key);
+                    book.0.lock().unwrap().insert(key, record);
+                }
+            } else {
+                c.late.push((i, key, record, left - 1));
+            }
+        }
+    }
+
     /// A Craft app on machine `i` saves [`LIVE_FILE`] (once the machine tracks it): its live document first takes
     /// another machine's edits now and then (live updates arriving), then gets one of its own, and the save records
     /// that version. The file's earlier content and this save's may both vanish (the live document holds them, and a
@@ -161,8 +191,15 @@ impl Driver {
         let hash = FileHash::from_bytes(*blake3::hash(&data).as_bytes());
         self.destroyed.extend(before);
         self.destroyed.insert(hash);
+        let record = craft_cloud_proto::SaveRecord { doc: c.doc, frontiers: version };
         if let Some(book) = c.books.get(i) {
-            book.0.lock().unwrap().insert((node, hash), craft_cloud_proto::SaveRecord { doc: c.doc, frontiers: version });
+            // Half the records are slow to reach the agent (announced at once, the record some steps later).
+            if c.rng.below(2) == 0 {
+                book.2.lock().unwrap().insert((node, hash));
+                c.late.push((i, (node, hash), record, 1 + c.rng.below(6)));
+            } else {
+                book.0.lock().unwrap().insert((node, hash), record);
+            }
         }
         self.net.event(format!("{} m{i} craft save {}", stamp(), c.saves));
     }
@@ -259,6 +296,7 @@ impl Driver {
             tokio::time::sleep(Duration::from_millis(moments.below(2_000) as u64)).await;
             let i = rng.below(MACHINES);
             self.join(i).await;
+            self.deliver_late(false);
             if self.craft.rng.below(4) == 0 {
                 self.craft_save(i);
             }
@@ -356,6 +394,7 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
         books,
         knows: vec![vec![0; MACHINES]; MACHINES],
         saves: 0,
+        late: Vec::new(),
     };
     net.event(format!("seed {seed}: pages of {page}, latency up to {latency} ms, stormy {stormy}, lose 1/{lose}, cut 1/{cut}"));
     let driving = net.clone();
@@ -385,6 +424,8 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
             craft,
         };
         driver.run(steps).await;
+        // Every late record arrives.
+        driver.deliver_late(true);
         // The network heals and the server's faults stop.
         calm.store(true, Ordering::Relaxed);
         for i in 0..MACHINES {
