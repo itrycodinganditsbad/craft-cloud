@@ -146,6 +146,11 @@ pub trait Machine {
     fn shortcut(&self, lnk: &Path, target: &Path) -> Result<(), String>;
     /// Removes the folder `dir` once this process has ended (it holds this setup's own exe).
     fn remove_after_exit(&self, dir: &Path) -> Result<(), String>;
+    /// Renames (moves) `from` to `to` in one step, which fails as a whole: on Windows a file a program holds open (or
+    /// a folder with one in it) can't be moved, so a failure leaves everything where it was. (A running exe can be.)
+    fn rename(&self, from: &Path, to: &Path) -> Result<(), String> {
+        std::fs::rename(from, to).map_err(|e| format!("{} can't be moved (is it still running?): {e}", from.display()))
+    }
 }
 
 /// How to install.
@@ -361,29 +366,55 @@ fn uninstall_stopped(
     if shortcut.exists() {
         std::fs::remove_file(&shortcut).map_err(io(&shortcut))?;
     }
-    // The files before the "Apps & features" entry: if one can't go, the entry stays, to run it again.
+    // The files before the "Apps & features" entry: if they can't go, the entry stays, to run it again.
     if dir.exists() {
-        let running_inside = running.parent().is_some_and(|p| same_path(p, &dir));
-        if running_inside {
-            for entry in std::fs::read_dir(&dir).map_err(io(&dir))? {
-                let path = entry.map_err(io(&dir))?.path();
-                if !same_path(&path, running) {
-                    remove_patiently(&path, places.patience)?;
-                }
-            }
-            machine.remove_after_exit(&dir)?;
-        } else {
-            remove_patiently(&dir, places.patience)?;
-        }
+        remove_program_folder(places, machine, running)?;
     }
     registry.remove_key(&places.uninstall_key)?;
     remove_app_files(&places.app_files);
     Ok(())
 }
 
+/// Removes the program folder. Its files are first moved aside, into `<folder>.removing-<pid>` next to it, each move
+/// one step that fails as a whole if a file is held open: if any can't be moved, those moved go back, and the folder
+/// is as it was (so the agent can be put back). Only then is anything deleted: the moved-aside folder (what can't be
+/// deleted yet, such as an exe still running, once this setup has ended), and the program folder itself (once this
+/// setup has ended, when this setup runs from it).
+fn remove_program_folder(places: &Places, machine: &dyn Machine, running: &Path) -> Result<(), String> {
+    let dir = places.dir();
+    let aside = dir.with_file_name(format!("{DIR_NAME}.removing-{}", std::process::id()));
+    let running_inside = running.parent().is_some_and(|p| same_path(p, &dir));
+    if running_inside {
+        // This setup's own exe can't move: everything else does, one by one, back again if one can't.
+        std::fs::create_dir_all(&aside).map_err(io(&aside))?;
+        let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for entry in std::fs::read_dir(&dir).map_err(io(&dir))? {
+            let path = entry.map_err(io(&dir))?.path();
+            if same_path(&path, running) {
+                continue;
+            }
+            let to = aside.join(path.file_name().unwrap_or_default());
+            if let Err(e) = machine.rename(&path, &to) {
+                for (from, to) in moved.iter().rev() {
+                    let _ = machine.rename(to.as_path(), from.as_path());
+                }
+                let _ = std::fs::remove_dir(&aside);
+                return Err(e);
+            }
+            moved.push((path, to));
+        }
+    } else {
+        machine.rename(&dir, &aside)?;
+    }
+    if remove_patiently(&aside, places.patience).is_err() {
+        machine.remove_after_exit(&aside)?;
+    }
+    if running_inside { machine.remove_after_exit(&dir) } else { Ok(()) }
+}
+
 /// The uninstall failed (`failure`) after the agent was stopped and maybe its start at login removed: while the
-/// agent's program is still there, its `Run` values are put back and, if it ran, it is started again, so this
-/// computer keeps syncing until the uninstall is run again. What is said.
+/// program folder is whole, its `Run` values are put back and, if it ran, it is started again, so this computer keeps
+/// syncing until the uninstall is run again. What is said.
 fn put_back(
     places: &Places,
     registry: &dyn Registry,
@@ -392,17 +423,17 @@ fn put_back(
     removed_values: &[(&'static str, String)],
     failure: &str,
 ) -> String {
-    if !places.dir().join(AGENT_BG_EXE).is_file() {
+    let dir = places.dir();
+    if ![APP_EXE, AGENT_EXE, AGENT_BG_EXE].iter().all(|file| dir.join(file).is_file()) {
         return format!("{failure}. Run the uninstall again to finish it.");
     }
-    for (name, value) in removed_values {
-        let _ = registry.set_string(&places.run_key, name, value);
-    }
-    if was_running {
-        format!("{} Start at login was put back.", restarted_after(places, registry, machine, failure))
-    } else {
-        format!("{failure}. Start at login was put back.")
-    }
+    let restored = removed_values.iter().all(|(name, value)| registry.set_string(&places.run_key, name, value).is_ok());
+    let told = match (removed_values.is_empty(), restored) {
+        (true, _) => String::new(),
+        (false, true) => " Start at login was put back.".to_owned(),
+        (false, false) => " Start at login couldn't all be put back: run the uninstall again, or the setup.".to_owned(),
+    };
+    if was_running { format!("{}{told}", restarted_after(places, registry, machine, failure)) } else { format!("{failure}.{told}") }
 }
 
 /// The app's single-instance files in `app_files`, the folder itself once empty, and the loose ones older versions
