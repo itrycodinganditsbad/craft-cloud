@@ -199,11 +199,20 @@ finish() {
     if [ "$stopped" = 1 ] && [ "$restarted" = 0 ]; then
         start_again
     fi
+    # The tray needs the desktop session's bus: from elsewhere (ssh), it is left to the next login, and said.
     case "$closed" in
-        *tray*) [ -x "$lib/craft-cloud" ] && nohup "$lib/craft-cloud" --tray >/dev/null 2>&1 & ;;
+        *tray*)
+            if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || [ -S "${XDG_RUNTIME_DIR:-/nonexistent}/bus" ]; then
+                [ -x "$lib/craft-cloud" ] && nohup "$lib/craft-cloud" --tray >/dev/null 2>&1 &
+            else
+                echo "The Craft Cloud tray was closed for the upgrade; run 'craft-cloud --tray' in your desktop session (or log in again) to get it back." >&2
+            fi
+            ;;
     esac
 }
 trap finish EXIT
+# Ctrl-C and the like end the script through `exit`, so the EXIT trap runs (dash doesn't run it on a signal).
+trap 'exit 130' INT TERM HUP
 
 # The app's window and tray process, an older version's too, are closed before the copy: an old tray would keep its
 # icon next to the new one's. A tray that ran is started again at the end.
