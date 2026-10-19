@@ -1799,6 +1799,28 @@ impl<S: DocStore> Replica<S> {
         self.docs.get(&id).filter(|d| d.kind.is_document())?.body.copy().includes(a, b)
     }
 
+    /// A document of a file whose saves are asked about: loaded from disk if it isn't, and followed again if it was
+    /// put aside, within the same caps as an open (the least recently used make room), so its copy can tell which of
+    /// two saves is newer once the server's operations are in. Frames to send.
+    pub fn consult_document(&mut self, id: DocId) -> Vec<ClientFrame> {
+        self.uses += 1;
+        let (up, epoch, uses) = (self.link == Link::Up, self.epoch, self.uses);
+        let documents = self.protocol >= LIVE_DOCUMENTS_PROTOCOL;
+        self.load(id);
+        let Some(doc) = self.docs.get_mut(&id).filter(|d| d.joined && d.kind.is_document()) else { return Vec::new() };
+        doc.last_used = uses;
+        let was_parked = std::mem::replace(&mut doc.parked, false);
+        let mut frames = self.unload();
+        if was_parked {
+            frames.extend(self.evict());
+        }
+        let Some(doc) = self.docs.get_mut(&id) else { return frames };
+        if up && documents && doc.sub == Sub::No && doc.retry.is_none() {
+            frames.extend(subscribe(id, doc, epoch));
+        }
+        frames
+    }
+
     /// Whether a document being joined waits for an app's import (the server doesn't have it).
     pub fn needs_import(&self, id: DocId) -> bool {
         self.docs.get(&id).is_some_and(|d| d.join == Some(Join::NeedsImport))

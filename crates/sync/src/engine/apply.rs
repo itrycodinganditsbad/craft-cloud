@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use craft_cloud_proto::limits::MAX_TREE_DEPTH;
-use craft_cloud_proto::{FileState, FoldKey, Name, NodeId};
+use craft_cloud_proto::{FileState, FoldKey, Name, NodeId, SaveRecord};
 
 use crate::fs::{Fs, FsKind};
 use crate::path::RelPath;
@@ -1050,20 +1050,20 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// When the agent can't tell yet which save is newer, the file waits ([`LiveWinner::Wait`]); after
     /// `save_order_wait_ms` of that, `None` (a conflict copy). A winner is never guessed.
     fn live_winner(&mut self, id: NodeId, file: &FileState, at: &RelPath) -> Result<Option<(LiveWinner, Option<FsKind>)>, SyncError> {
-        let Some(theirs) = file.save.as_ref() else { return Ok(None) };
-        let checked = self.stat(at)?;
-        let Some(hash) = self.content_hash(at) else { return Ok(None) };
-        let Some(ours) = self.save_record(id, &hash) else { return Ok(None) };
-        if ours.doc != theirs.doc {
+        // A pair that isn't (or no longer is) two Craft saves starts no wait, and ends one under way.
+        let pair = self.save_pair(id, file, at)?;
+        let Some((theirs, ours, checked)) = pair else {
+            self.unknown_since.remove(&id);
             return Ok(None);
-        }
-        let winner = match self.save_includes(theirs, &ours) {
+        };
+        let winner = match self.save_includes(&theirs, &ours) {
             Some(true) => LiveWinner::Server,
             Some(false) => LiveWinner::Here,
             None => {
-                let now = self.fs.now_ms();
+                // The machine's clock while awake (`Instant`), so a sleep through the wait doesn't end it.
+                let now = std::time::Instant::now();
                 let since = *self.unknown_since.entry(id).or_insert(now);
-                if now.saturating_sub(since) >= self.config.save_order_wait_ms {
+                if now.saturating_duration_since(since).as_millis() >= u128::try_from(self.config.save_order_wait_ms.max(0)).unwrap_or(0) {
                     self.unknown_since.remove(&id);
                     return Ok(None);
                 }
@@ -1075,6 +1075,17 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             self.unknown_since.remove(&id);
         }
         Ok(Some((winner, checked)))
+    }
+
+    /// The server's and this file's save records when both name one live document, with what the file looked like
+    /// before it was hashed.
+    #[allow(clippy::type_complexity)]
+    fn save_pair(&self, id: NodeId, file: &FileState, at: &RelPath) -> Result<Option<(SaveRecord, SaveRecord, Option<FsKind>)>, SyncError> {
+        let Some(theirs) = file.save.clone() else { return Ok(None) };
+        let checked = self.stat(at)?;
+        let Some(hash) = self.content_hash(at) else { return Ok(None) };
+        let Some(ours) = self.save_record(id, &hash) else { return Ok(None) };
+        Ok((ours.doc == theirs.doc).then_some((theirs, ours, checked)))
     }
 
     fn holds_base_content(&self, entry: &BaseEntry, at: &RelPath) -> bool {

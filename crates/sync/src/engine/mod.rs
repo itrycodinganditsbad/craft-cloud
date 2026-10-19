@@ -127,7 +127,9 @@ pub struct Config {
     /// of consequence fits. Tests lower it.
     pub quota_floor: u64,
     /// How long two Craft saves of one file may wait for the agent to learn which is newer ([`SaveRecords::includes`])
-    /// before they are a conflict copy, as any two edits are (10 minutes). Tests lower it.
+    /// before they are a conflict copy, as any two edits are (10 minutes, counted on a monotonic clock: on Linux and
+    /// macOS that is time awake, so a laptop that sleeps through it doesn't end it early; on Windows std's clock may
+    /// count sleep too). Tests lower it.
     pub save_order_wait_ms: i64,
 }
 
@@ -359,8 +361,9 @@ pub struct Engine<F: Fs, T: Transport> {
     /// Files both sides saved from their live document where it isn't known yet which save is newer: neither side is
     /// taken this pass (the push leaves them too). Cleared at the start of every pass.
     deferred: BTreeSet<NodeId>,
-    /// Since when (the filesystem clock, ms) each such file has waited, across passes.
-    unknown_since: HashMap<NodeId, i64>,
+    /// Since when each such file has waited, across passes (a monotonic clock: on Linux and macOS it stops while the
+    /// machine sleeps; on Windows it may not).
+    unknown_since: HashMap<NodeId, std::time::Instant>,
 }
 
 /// What Craft apps saved from live documents, as the agent learnt it from them (`craft_cloud_proto::SaveRecord`).

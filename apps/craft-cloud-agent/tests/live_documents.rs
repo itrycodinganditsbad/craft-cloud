@@ -175,6 +175,77 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Asks `agent`'s save book, as the sync does, whether the document at frontiers `a` holds `b`'s.
+async fn ask(agent: &Agent, doc: craft_cloud_proto::DocId, a: &[(u64, u32)], b: &[(u64, u32)]) -> Option<bool> {
+    use craft_cloud_sync::SaveRecords;
+    let data = agent.data.path().to_owned();
+    let space = agent.data.load_account().unwrap().unwrap().space;
+    let (a, b) = (craft_cloud_proto::SaveRecord { doc, frontiers: a.to_vec() }, craft_cloud_proto::SaveRecord { doc, frontiers: b.to_vec() });
+    off(move || craft_cloud_agent::live::saves::SaveBook::new(&data, space).includes(&a, &b)).await
+}
+
+/// The real save-order path (the save book asks the live hub, which asks its copy): a later save includes an earlier
+/// one and not the other way round, and operations it hasn't got can't be told. After the agent restarts with no
+/// window open, the document isn't loaded: the question loads it (and follows it again) and is answered from it,
+/// soon, not left unknown until the 10-minute fallback (the reviewer's probe answered unknown for good).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn save_order_questions_load_the_document_to_answer() {
+    let server = Server::new().await;
+    let pc = Agent::signed_in(&server, "pc").await;
+    let run_pc = pc.run();
+    let on_pc = pc.client().await;
+    std::fs::create_dir_all(&pc.folder).unwrap();
+    std::fs::write(pc.folder.join("o.txt"), "start").unwrap();
+    let c = on_pc.clone();
+    eventually("synced", move || {
+        let docs = c.documents().ok()?;
+        matches!(docs.open("o.txt", "wordcraft").ok()?, Opened::NeedsImport(_)).then_some(())
+    })
+    .await;
+    let c = on_pc.clone();
+    let (docs, app) = off(move || {
+        let docs = c.documents().unwrap();
+        let doc = open(&docs, "o.txt", "start");
+        (docs, AppDoc::new(doc, 61))
+    })
+    .await;
+    let doc = app.doc.id();
+    let acked = |app: &AppDoc, seq: u64| {
+        let (deadline, mut seen) = (std::time::Instant::now() + Duration::from_secs(10), false);
+        while !seen {
+            seen = app.pump().contains(&Event::Acked(seq));
+            assert!(std::time::Instant::now() < deadline, "acked");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let seq = app.append(" one");
+    acked(&app, seq);
+    let h1 = app.heads();
+    let mut last = 0;
+    for i in 0..5 {
+        last = app.append(&format!(" n{i}"));
+    }
+    acked(&app, last);
+    let h2 = app.heads();
+    assert_eq!(ask(&pc, doc, &h2, &h1).await, Some(true));
+    assert_eq!(ask(&pc, doc, &h1, &h2).await, Some(false));
+    assert_eq!(ask(&pc, doc, &h2, &[(999, 0)]).await, None, "operations it hasn't got");
+    drop((app, docs));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    run_pc.stop().await.0.unwrap();
+    let run_pc = pc.run();
+    let _on_pc = pc.client().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if ask(&pc, doc, &h2, &h1).await == Some(true) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never answered after the restart");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    run_pc.stop().await.0.unwrap();
+}
+
 /// A save record that comes before the changes it covers waits for them: kept once they are in the agent's copy,
 /// never before; one whose app closes the document before its changes come is dropped, and its changes arriving
 /// later on another connection don't bring it back.

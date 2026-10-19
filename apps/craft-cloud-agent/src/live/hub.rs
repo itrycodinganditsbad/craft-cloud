@@ -11,7 +11,7 @@
 //! many changes wait, whether its file was deleted) goes to its apps when it changes. Nothing the hub sends an app ever
 //! waits for the app: a connection whose queue is full is dropped.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -334,6 +334,8 @@ struct Docs {
     /// Save records that came before the changes they cover: kept once those are in this machine's copy, dropped when
     /// their connection closes the document first.
     early: Vec<EarlyRecord>,
+    /// Documents the sync asked about and this copy couldn't tell yet: a pass is asked for once operations come.
+    asked: BTreeSet<DocId>,
 }
 
 /// A save record waiting for its operations ([`Docs::early`]).
@@ -526,6 +528,10 @@ impl State {
                     }
                 }
                 DocEvent::Remote(doc, bytes) => {
+                    // The sync waits to learn which of two saves is newer: ask it to look again now.
+                    if self.docs.asked.remove(&doc) {
+                        self.control.request_pass();
+                    }
                     let bytes = Arc::new(bytes);
                     for (conn, id) in self.handles_of(doc) {
                         frames.extend(self.tell(conn, DocOut::Update { id, bytes: bytes.clone() }));
@@ -1193,8 +1199,20 @@ async fn run(
                 }
             }
             Some(order) = orders.recv() => {
-                let _ = order.reply.send(state.replica.document_includes(order.doc, &order.a, &order.b));
-                continue;
+                let mut answer = state.replica.document_includes(order.doc, &order.a, &order.b);
+                if answer.is_none() {
+                    // Not loaded, or put aside: loaded and followed (within the usual caps), asked again from what is
+                    // on disk, and once the server's operations come a pass is asked for, to ask again soon.
+                    let frames = state.replica.consult_document(order.doc);
+                    answer = state.replica.document_includes(order.doc, &order.a, &order.b);
+                    if answer.is_none() {
+                        state.docs.asked.insert(order.doc);
+                    }
+                    let _ = order.reply.send(answer);
+                    state.send(frames).await;
+                } else {
+                    let _ = order.reply.send(answer);
+                }
             }
             Some(done) = blob_rx.recv() => {
                 let frames = state.blob_done(done);

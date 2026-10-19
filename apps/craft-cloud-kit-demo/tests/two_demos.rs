@@ -106,7 +106,10 @@ impl craft_cloud_kit::LiveDocument for Newer {
     fn mappings(doc: &model::DemoDoc) -> craft_cloud_kit::Mappings<'_> {
         <model::DemoApp as craft_cloud_kit::LiveDocument>::mappings(doc)
     }
-    fn apply_remote(old: &std::sync::Arc<model::DemoDoc>, patch: &craft_cloud_kit::RemotePatch<'_>) -> Result<std::sync::Arc<model::DemoDoc>, craft_cloud_kit::KitError> {
+    fn apply_remote(
+        old: &std::sync::Arc<model::DemoDoc>,
+        patch: &craft_cloud_kit::RemotePatch<'_>,
+    ) -> Result<std::sync::Arc<model::DemoDoc>, craft_cloud_kit::KitError> {
         <model::DemoApp as craft_cloud_kit::LiveDocument>::apply_remote(old, patch)
     }
     fn normalise(doc: &mut model::DemoDoc) {
