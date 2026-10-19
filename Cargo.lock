@@ -1110,7 +1110,7 @@ dependencies = [
 
 [[package]]
 name = "craft-cloud-agent"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "craft-cloud-api"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "caseless",
  "proptest",
@@ -1168,7 +1168,7 @@ dependencies = [
 
 [[package]]
 name = "craft-cloud-app"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "craft-cloud-api",
  "httparse",
@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "craft-cloud-chunker"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "proptest",
@@ -1191,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "craft-cloud-desktop"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "craft-cloud-app",
  "craft-cloud-proto",
@@ -1212,7 +1212,7 @@ dependencies = [
 
 [[package]]
 name = "craft-cloud-egui"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "craft-cloud-app",
  "craft-cloud-kit",
@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "craft-cloud-kit"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "craft-cloud-api",
@@ -1235,7 +1235,7 @@ dependencies = [
 
 [[package]]
 name = "craft-cloud-kit-demo"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "craft-cloud-app",
  "craft-cloud-egui",
@@ -1250,7 +1250,7 @@ dependencies = [
 
 [[package]]
 name = "craft-cloud-meta"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "craft-cloud-proto",
@@ -1264,7 +1264,7 @@ dependencies = [
 
 [[package]]
 name = "craft-cloud-proto"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "craft-cloud-api",
@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "craft-cloud-server"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "axum",
@@ -1309,7 +1309,7 @@ dependencies = [
 
 [[package]]
 name = "craft-cloud-setup"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "rfd",
  "tempfile",
@@ -1319,7 +1319,7 @@ dependencies = [
 
 [[package]]
 name = "craft-cloud-store"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1334,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "craft-cloud-sync"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -7219,7 +7219,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.0.1"
+version = "0.1.0"
 
 [[package]]
 name = "xxhash-rust"

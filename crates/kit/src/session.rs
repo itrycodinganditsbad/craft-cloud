@@ -222,6 +222,8 @@ struct Raw {
     nodes: Vec<TreeID>,
     keys: Vec<String>,
     tree: bool,
+    /// A text's delta (the text root's own).
+    text: Option<Vec<loro::TextDelta>>,
 }
 
 #[derive(Default)]
@@ -787,6 +789,13 @@ impl<D: LiveDocument> Session<D> {
         }
     }
 
+    /// Tries to reach the agent again at the next poll, without waiting out the pause (the app learnt the agent is
+    /// back: Craft Cloud's status says so, say).
+    pub fn reconnect_now(&mut self) {
+        self.next_try = Instant::now();
+        self.backoff = FIRST_BACKOFF;
+    }
+
     /// Opens the document again off the UI thread, with a growing pause between tries.
     fn reconnect(&mut self) {
         if self.link.is_some() {
@@ -906,6 +915,11 @@ impl<D: LiveDocument> Session<D> {
                 }
                 Kind::Text => {
                     touched.texts.insert(key.to_owned());
+                    if let Some(delta) = r.text.clone()
+                        && suffix.is_empty()
+                    {
+                        touched.text_deltas.entry(key.to_owned()).or_default().push(delta);
+                    }
                 }
                 Kind::Table => {
                     let t = touched.tables.entry(key.to_owned()).or_insert_with(TableTouch::default);
@@ -944,8 +958,12 @@ impl<D: LiveDocument> Session<D> {
     /// Rebuilds the model from the touched parts, normalises it (writing back what that repaired), refreshes what is
     /// derived, and makes it the session's.
     fn rebuild(&mut self, touched: Touched) -> Result<(), KitError> {
-        let patch = RemotePatch { doc: &self.doc, touched: &touched, trees: &self.ctx.trees };
-        let raw = D::apply_remote(&self.model, &patch)?;
+        let raw = {
+            // The old parts, for the texts to be patched rather than read whole.
+            let old_parts = D::mappings(&self.model);
+            let patch = RemotePatch { doc: &self.doc, touched: &touched, trees: &self.ctx.trees, old: (!touched.all).then_some(&old_parts) };
+            D::apply_remote(&self.model, &patch)?
+        };
         let mut fixed = raw.clone();
         D::normalise(Arc::make_mut(&mut fixed));
         if self.status.read_only.is_none() {
@@ -1077,6 +1095,7 @@ fn collect(collector: &Mutex<Collector>, event: DiffEvent<'_>) {
                 raw.tree = true;
                 raw.nodes.extend(tree.diff.iter().map(|item| item.target));
             }
+            Diff::Text(delta) => raw.text = Some(delta.clone()),
             _ => {}
         }
         c.raw.push(raw);

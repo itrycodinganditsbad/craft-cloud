@@ -99,7 +99,7 @@ pub mod raw {
         /// The whole document read back through `D::apply_remote`, from `base`.
         pub fn read<D: LiveDocument>(&self, base: &std::sync::Arc<D::Doc>) -> Result<std::sync::Arc<D::Doc>, KitError> {
             let touched = Touched::everything();
-            let patch = RemotePatch { doc: &self.doc, touched: &touched, trees: &self.ctx.trees };
+            let patch = RemotePatch { doc: &self.doc, touched: &touched, trees: &self.ctx.trees, old: None };
             D::apply_remote(base, &patch)
         }
 

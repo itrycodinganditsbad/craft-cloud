@@ -309,6 +309,8 @@ pub struct Touched {
     pub(crate) all: bool,
     pub(crate) trees: BTreeMap<String, TreeTouch>,
     pub(crate) texts: BTreeSet<String>,
+    /// Loro's text deltas, by text, in the order they came (to patch the model's text rather than read it whole).
+    pub(crate) text_deltas: BTreeMap<String, Vec<Vec<loro::TextDelta>>>,
     pub(crate) tables: BTreeMap<String, TableTouch>,
     pub(crate) timelines: BTreeMap<String, TimelineTouch>,
     pub(crate) opaques: BTreeSet<String>,
@@ -338,6 +340,8 @@ pub struct RemotePatch<'a> {
     pub(crate) doc: &'a LoroDoc,
     pub(crate) touched: &'a Touched,
     pub(crate) trees: &'a HashMap<String, TreeIndex>,
+    /// The model's parts before the change (texts are patched from them).
+    pub(crate) old: Option<&'a Mappings<'a>>,
 }
 
 impl RemotePatch<'_> {
@@ -357,6 +361,15 @@ impl RemotePatch<'_> {
     pub fn text(&self, key: &str) -> Option<RichText> {
         if !self.touched.all && !self.touched.texts.contains(key) {
             return None;
+        }
+        // From the old text and Loro's deltas when it can (only what changed), else read whole.
+        if !self.touched.all
+            && let Some(Part::Text(old)) = self.old.and_then(|m| m.parts.iter().find(|(k, _)| *k == key)).map(|(_, p)| p)
+        {
+            let deltas = self.touched.text_deltas.get(key).map_or(&[][..], Vec::as_slice);
+            if let Some(patched) = crate::text::patch(self.doc, key, old.as_ref(), deltas) {
+                return Some(patched);
+            }
         }
         Some(crate::text::read(self.doc, key))
     }

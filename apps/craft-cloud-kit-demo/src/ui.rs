@@ -382,7 +382,7 @@ impl Demo {
                     ui.weak(format!("plain file: {why}"));
                 }
             }
-            ui.weak(format!("{} words", self.model.words));
+            ui.weak(format!("{} paragraphs", self.model.paragraphs));
             let live_undo = self.session().map(|s| (s.can_undo(), s.can_redo(), s.undo_kind()));
             let (can_undo, can_redo) = match live_undo {
                 Some((u, r, UndoKind::Live)) => (u, r),

@@ -27,13 +27,14 @@ pub type Layers = Arc<Vec<Arc<Layer>>>;
 pub struct DemoDoc {
     pub story: Arc<RichText>,
     pub layers: Layers,
-    /// Derived (never synced): the story's word count.
-    pub words: usize,
+    /// Derived (never synced): how many paragraphs the story has. (Counting words would scan the whole story after
+    /// every remote keystroke: about a millisecond for 1 MB. An app derives what it can cheaply, or incrementally.)
+    pub paragraphs: usize,
 }
 
 impl Default for DemoDoc {
     fn default() -> Self {
-        Self { story: Arc::new(RichText::plain("")), layers: Arc::new(Vec::new()), words: 0 }
+        Self { story: Arc::new(RichText::plain("")), layers: Arc::new(Vec::new()), paragraphs: 1 }
     }
 }
 
@@ -165,7 +166,7 @@ impl LiveDocument for DemoApp {
     }
 
     fn refresh_derived(doc: &mut DemoDoc) {
-        doc.words = doc.story.text.split_whitespace().count();
+        doc.paragraphs = doc.story.paragraphs.len();
     }
 }
 
@@ -515,7 +516,7 @@ pub fn from_file(bytes: &[u8]) -> Result<DemoDoc, String> {
     for [para, level] in file.story.headings {
         story = heading(&story, usize::try_from(para).unwrap_or(usize::MAX), Some(level));
     }
-    let mut doc = DemoDoc { story: Arc::new(story), layers: Arc::new(file.layers.into_iter().map(layer).collect::<Result<_, _>>()?), words: 0 };
+    let mut doc = DemoDoc { story: Arc::new(story), layers: Arc::new(file.layers.into_iter().map(layer).collect::<Result<_, _>>()?), paragraphs: 0 };
     DemoApp::refresh_derived(&mut doc);
     Ok(doc)
 }
@@ -553,7 +554,7 @@ mod tests {
         let roots = shift(&roots, c, -1);
         assert_eq!(flatten(&roots).iter().map(|(_, n)| n.id).collect::<Vec<_>>(), vec![a, c, b]);
         let story = heading(&format(&RichText::plain("Title\nbody"), 0..5, BOLD, Some(Value::Bool(true))), 0, Some(1));
-        let mut doc = DemoDoc { story: Arc::new(story), layers: Arc::new(rename(&roots, c, "renamed")), words: 0 };
+        let mut doc = DemoDoc { story: Arc::new(story), layers: Arc::new(rename(&roots, c, "renamed")), paragraphs: 0 };
         DemoApp::refresh_derived(&mut doc);
         let back = from_file(&to_file(&doc)).unwrap();
         assert_eq!(back, doc);
