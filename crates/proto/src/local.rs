@@ -472,13 +472,16 @@ pub enum DocsEvent {
     /// The app's update number `seq` of document `id` is on the agent's disk.
     Ack { id: u64, seq: u64 },
     /// How an open document stands, when that changes. `deleted`: its file was deleted on this or another machine
-    /// (the document still works; a later open of the same path is a new file and a new document).
+    /// (the document still works; a later open of the same path is a new file and a new document). `stopped`: the
+    /// agent stopped following it until it restarts (Loro failed on it twice); changes made meanwhile are kept.
     Status {
         doc: crate::ids::DocId,
         online: bool,
         waiting: u64,
         #[serde(default)]
         deleted: bool,
+        #[serde(default)]
+        stopped: bool,
     },
     /// A request or a binary frame was refused (`id` and `seq` name it when they can). `code` is one of
     /// [`crate::api::codes`] or [`codes`].

@@ -71,6 +71,17 @@ pub(crate) fn guarded<T>(f: impl FnOnce() -> Result<T, UpdateError>) -> Result<T
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(Err(UpdateError::Panicked))
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_ON: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// For tests on this thread: importing `bytes` (alone or in a batch) panics as Loro might.
+#[cfg(test)]
+pub(crate) fn fail_on(bytes: &[u8]) {
+    FAIL_ON.with(|fail| fail.borrow_mut().push(bytes.to_vec()));
+}
+
 /// A Loro peer ID this document may use (`u64::MAX` is reserved by Loro).
 fn usable_peer(peer: u64) -> u64 {
     if peer == u64::MAX { peer - 1 } else { peer }
@@ -124,6 +135,14 @@ impl LiveCopy {
         self.poisoned.set(true);
     }
 
+    /// For tests: updates that "make Loro fail" when imported, alone or in a batch ([`fail_on`]).
+    #[cfg(test)]
+    fn failing(updates: &[&[u8]]) {
+        if FAIL_ON.with(|fail| fail.borrow().iter().any(|f| updates.contains(&f.as_slice()))) {
+            panic!("a test's update that makes Loro fail");
+        }
+    }
+
     /// A stored document (a Loro snapshot), editing as `peer`. Of any size: the 1 MiB limit is on updates from the
     /// server, not on this machine's own document.
     pub fn load(snapshot: &[u8], peer: u64) -> Result<Self, UpdateError> {
@@ -145,7 +164,11 @@ impl LiveCopy {
 
     /// [`LiveCopy::import`] without the update limit: for a snapshot, or this machine's own stored document.
     pub fn import_any_size(&self, bytes: &[u8]) -> Result<Taken, UpdateError> {
-        let status = self.guard(|doc| doc.import(bytes).map_err(|e| UpdateError::Malformed(e.to_string())))?;
+        let status = self.guard(|doc| {
+            #[cfg(test)]
+            Self::failing(&[bytes]);
+            doc.import(bytes).map_err(|e| UpdateError::Malformed(e.to_string()))
+        })?;
         let needs: Vec<(u64, i32)> = status.pending.map(|p| p.iter().map(|(peer, (_, end))| (*peer, *end)).collect()).unwrap_or_default();
         let new = status.success.iter().any(|(_, (start, end))| start < end);
         Ok(if needs.is_empty() { Taken::Applied { new } } else { Taken::Waiting { needs } })
@@ -160,7 +183,11 @@ impl LiveCopy {
         }
         let before = self.version()?;
         // (A batch Loro refuses as a whole is taken one by one by the caller, which finds the one at fault.)
-        let _ = self.guard(|doc| doc.import_batch(updates).map_err(|e| UpdateError::Malformed(e.to_string())));
+        let _ = self.guard(|doc| {
+            #[cfg(test)]
+            Self::failing(&updates.iter().map(Vec::as_slice).collect::<Vec<_>>());
+            doc.import_batch(updates).map_err(|e| UpdateError::Malformed(e.to_string()))
+        });
         Ok(self.version()? != before)
     }
 

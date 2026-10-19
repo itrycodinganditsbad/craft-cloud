@@ -148,9 +148,10 @@ fn session(
                 say("--".into());
                 say(text(&mirror));
             }
-            Some(Event::Status { online, waiting, deleted }) => {
+            Some(Event::Status { online, waiting, deleted, stopped }) => {
                 let deleted = if deleted { "; its file was deleted" } else { "" };
-                say(format!("({}, {waiting} change(s) waiting{deleted})", if online { "online" } else { "offline" }));
+                let stopped = if stopped { "; the agent stopped following it until it restarts" } else { "" };
+                say(format!("({}, {waiting} change(s) waiting{deleted}{stopped})", if online { "online" } else { "offline" }));
             }
             Some(Event::Closed(why)) => {
                 say(format!("the connection to the agent ended: {why}"));

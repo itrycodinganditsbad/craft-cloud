@@ -77,8 +77,9 @@ pub enum Event {
     /// it.
     Refused { seq: u64, message: String },
     /// How the document stands: `online` (edits go out as they are made), changes waiting for the server, and whether
-    /// its file was deleted (the document still works; a later open of the path is a new file).
-    Status { online: bool, waiting: u64, deleted: bool },
+    /// its file was deleted (the document still works; a later open of the path is a new file), and whether the agent
+    /// stopped following it until it restarts (Loro failed on it twice; changes made meanwhile are kept).
+    Status { online: bool, waiting: u64, deleted: bool, stopped: bool },
     /// The connection to the agent ended.
     Closed(String),
 }
@@ -162,10 +163,10 @@ impl Shared {
                 Ok(DocsEvent::NeedsImport { id }) => self.answer(id, Answer::NeedsImport),
                 Ok(DocsEvent::NotLive { id, reason, .. }) => self.answer(id, Answer::NotLive(reason)),
                 Ok(DocsEvent::Ack { id, seq }) => self.route(id, Event::Acked(seq)),
-                Ok(DocsEvent::Status { doc, online, waiting, deleted }) => {
+                Ok(DocsEvent::Status { doc, online, waiting, deleted, stopped }) => {
                     let ids = lock(&self.numbers).get(&doc).cloned().unwrap_or_default();
                     for id in ids {
-                        self.route(id, Event::Status { online, waiting, deleted });
+                        self.route(id, Event::Status { online, waiting, deleted, stopped });
                     }
                 }
                 Ok(DocsEvent::Error { id: Some(id), seq: Some(seq), message, .. }) => self.route(id, Event::Refused { seq, message }),
@@ -499,12 +500,12 @@ mod tests {
         let Ok(Answer::Live { snapshot, .. }) = answer.try_recv() else { panic!("no answer") };
         assert_eq!(snapshot, b"abc");
         shared.on_message(Message::Binary(encode_binary(UPDATE, 4, b"u").into()));
-        let status = DocsEvent::Status { doc, online: false, waiting: 2, deleted: true };
+        let status = DocsEvent::Status { doc, online: false, waiting: 2, deleted: true, stopped: true };
         shared.on_message(Message::Text(serde_json::to_string(&status).unwrap().into()));
         shared.on_message(Message::Binary(vec![9, 1].into()));
         shared.on_message(Message::Text("not json".into()));
         assert_eq!(events.try_recv().unwrap(), Event::Update(b"u".to_vec()));
-        assert_eq!(events.try_recv().unwrap(), Event::Status { online: false, waiting: 2, deleted: true });
+        assert_eq!(events.try_recv().unwrap(), Event::Status { online: false, waiting: 2, deleted: true, stopped: true });
         assert!(events.try_recv().is_err(), "junk goes nowhere");
         shared.end("gone");
         assert_eq!(events.try_recv().unwrap(), Event::Closed("gone".into()));

@@ -195,7 +195,9 @@ async fn send_out(socket: &mut WebSocket, out: DocOut) -> bool {
         DocOut::Refused { id, seq, code, message } => send_json(socket, &DocsEvent::Error { id, seq, code: code.into(), message }).await,
         DocOut::Update { id, bytes } => send_binary(socket, UPDATE, id, &bytes).await,
         DocOut::Presence { id, bytes } => send_binary(socket, PRESENCE, id, &bytes).await,
-        DocOut::Status { doc, online, waiting, deleted } => send_json(socket, &DocsEvent::Status { doc, online, waiting, deleted }).await,
+        DocOut::Status { doc, online, waiting, deleted, stopped } => {
+            send_json(socket, &DocsEvent::Status { doc, online, waiting, deleted, stopped }).await
+        }
     }
 }
 

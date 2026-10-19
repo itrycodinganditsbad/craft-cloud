@@ -458,6 +458,8 @@ struct Doc {
     full_pause: u32,
     /// Past the cap on waiting updates: nothing is taken until the next connection.
     stuck: bool,
+    /// Loro failed on a second row of it in this run: not followed until the agent restarts ([`Replica::stopped`]).
+    stopped: bool,
     /// Loro failed outside an import (an export): the document is read back from its file.
     broken: bool,
     sub: Sub,
@@ -557,6 +559,7 @@ impl Doc {
             full: None,
             full_pause: 0,
             stuck: false,
+            stopped: false,
             broken: false,
             sub: Sub::No,
             sent: BTreeSet::new(),
@@ -1075,6 +1078,10 @@ impl Doc {
     /// `subscribe` from what the document has, without `create` (the server has it: on the same connection); a
     /// document whose server snapshot didn't read here follows the whole log instead.
     fn resubscribe(&mut self, id: DocId) -> Vec<ClientFrame> {
+        if self.stopped {
+            self.sub = Sub::No;
+            return Vec::new();
+        }
         self.sub = Sub::CatchingUp;
         if self.log_only {
             return vec![ClientFrame::SubscribeLog { doc: id, after: self.have.upto, at: self.at() }];
@@ -1201,6 +1208,12 @@ pub struct Replica<S: DocStore> {
     heals: BTreeMap<DocId, u32>,
     /// Apps whose push stopped ([`Replica::push_stopped`]).
     push_stopped: BTreeSet<AppName>,
+    /// Rows of each document Loro failed on in this run ([`Replica::recover_doc`]).
+    failures: BTreeMap<DocId, u32>,
+    /// Documents whose catch-ups are taken one row at a time in this run (Loro failed on a batch of them).
+    one_by_one: BTreeSet<DocId>,
+    /// Documents not followed for the rest of this run: Loro failed on a second row ([`Replica::is_stopped`]).
+    stopped: BTreeSet<DocId>,
     /// Documents let go of without dropping ([`Replica::forgotten`]).
     forgotten: usize,
     /// The live protocol `welcome` named (0 while the link isn't up).
@@ -1252,6 +1265,9 @@ impl<S: DocStore> Replica<S> {
             peers,
             heals: BTreeMap::new(),
             push_stopped: BTreeSet::new(),
+            failures: BTreeMap::new(),
+            one_by_one: BTreeSet::new(),
+            stopped: BTreeSet::new(),
             forgotten: 0,
             protocol: 0,
             events: Vec::new(),
@@ -1350,6 +1366,7 @@ impl<S: DocStore> Replica<S> {
         match reloaded {
             Some((_, mut doc)) => {
                 doc.dirty |= drop.is_some();
+                doc.stopped = self.stopped.contains(&id);
                 self.docs.insert(id, doc);
             }
             None => {
@@ -1361,6 +1378,9 @@ impl<S: DocStore> Replica<S> {
     /// Loro failed on update `seq` (`hash`) of `id`: the document is read back from its file (nothing half-changed
     /// stays), and caught up again from there, with that update counted as had and not imported.
     fn recover_doc(&mut self, id: DocId, kind: Kind, seq: u64, hash: [u8; 32]) -> Vec<ClientFrame> {
+        if self.failed_again(id) {
+            return self.stop(id, &kind, None);
+        }
         self.reload(id);
         let (up, epoch) = (self.link == Link::Up, self.epoch);
         let Some(doc) = doc_again(&mut self.docs, self.space, &mut self.peers, id, &kind) else { return Vec::new() };
@@ -1380,6 +1400,9 @@ impl<S: DocStore> Replica<S> {
     /// Loro failed on a waiting update of `id` imported again (`hash`): that one is dropped (the incoming update is
     /// not to blame, and comes again), and the document read back from its file and caught up from there.
     fn recover_waiting_doc(&mut self, id: DocId, kind: Kind, hash: [u8; 32]) -> Vec<ClientFrame> {
+        if self.failed_again(id) {
+            return self.stop(id, &kind, Some(hash));
+        }
         self.reload_without(id, Some(hash));
         let (up, epoch) = (self.link == Link::Up, self.epoch);
         let Some(doc) = doc_again(&mut self.docs, self.space, &mut self.peers, id, &kind) else { return Vec::new() };
@@ -1391,6 +1414,38 @@ impl<S: DocStore> Replica<S> {
         doc.say(&mut self.notes, line);
         if let Kind::Recents(app) = kind {
             self.changed.insert(app);
+        }
+        frames
+    }
+
+    /// Counts a row Loro failed on in `id`; whether it is the second in this run.
+    fn failed_again(&mut self, id: DocId) -> bool {
+        let failures = self.failures.entry(id).or_insert(0);
+        *failures += 1;
+        *failures >= MAX_HEALS
+    }
+
+    /// Loro failed on a second row of `id` in this run: read back from its file and not followed again until the agent
+    /// restarts (another catch-up would go round the same failures). Its local changes are kept (on disk, and sent
+    /// after the restart); its apps are told ([`Replica::is_stopped`]). `drop`: a waiting update to leave out.
+    fn stop(&mut self, id: DocId, kind: &Kind, drop: Option<[u8; 32]>) -> Vec<ClientFrame> {
+        self.stopped.insert(id);
+        self.reload_without(id, drop);
+        let mut frames = Vec::new();
+        let Some(doc) = doc_again(&mut self.docs, self.space, &mut self.peers, id, kind) else { return frames };
+        doc.stopped = true;
+        if doc.sub != Sub::No && self.link == Link::Up {
+            frames.push(ClientFrame::Unsubscribe { doc: id });
+        }
+        doc.sub = Sub::No;
+        doc.retry = None;
+        let line = doc.told(
+            |app| format!("Loro failed on the recents of {app} again; this machine stops following them until the agent restarts (what was added here is kept)"),
+            |id| format!("Loro failed on the live document {id} again; this machine stops following it until the agent restarts (the changes made here are kept)"),
+        );
+        doc.say(&mut self.notes, line);
+        if let Kind::Recents(app) = kind {
+            self.changed.insert(app.clone());
         }
         frames
     }
@@ -1677,6 +1732,11 @@ impl<S: DocStore> Replica<S> {
         frames
     }
 
+    /// Whether Loro failed on the document twice in this run: it isn't followed again until the agent restarts.
+    pub fn is_stopped(&self, id: DocId) -> bool {
+        self.stopped.contains(&id)
+    }
+
     /// Whether the link is up (welcomed).
     pub fn is_up(&self) -> bool {
         self.link == Link::Up
@@ -1930,16 +1990,30 @@ impl<S: DocStore> Replica<S> {
     }
 
     /// The updates a catch-up batched: imported into the copy at once, then each taken as it would have been (Loro
-    /// knows them then, so that is quick). Remote changes go to the apps as they came.
+    /// knows them then, so that is quick). Remote changes go to the apps as they came. The row Loro failed on before
+    /// is left out of the batch (it is skipped when taken). If Loro fails on the batch, the document is read back
+    /// from its file and the catch-up taken again one row at a time for the rest of the run, so the row at fault is
+    /// found and only it dropped ([`Replica::recover_doc`]).
     fn take_batch(&mut self, id: DocId) -> Vec<ClientFrame> {
+        let one_by_one = self.one_by_one.contains(&id);
         let Some(doc) = self.docs.get_mut(&id) else { return Vec::new() };
         let batch = std::mem::take(&mut doc.batch);
         doc.batched = 0;
         if batch.is_empty() {
             return Vec::new();
         }
-        let updates: Vec<Vec<u8>> = batch.iter().map(|(_, bytes)| bytes.clone()).collect();
-        let new = doc.body.copy().import_batch(&updates).unwrap_or(false);
+        let new = if one_by_one {
+            // (Each row's own import says what it brought.)
+            false
+        } else {
+            let updates: Vec<Vec<u8>> =
+                batch.iter().filter(|(seq, bytes)| doc.skip != Some((*seq, update_hash(bytes)))).map(|(_, bytes)| bytes.clone()).collect();
+            match doc.body.copy().import_batch(&updates) {
+                Ok(new) => new,
+                Err(UpdateError::Panicked) => return self.take_one_by_one(id),
+                Err(_) => false,
+            }
+        };
         let mut frames = Vec::new();
         for (seq, bytes) in batch {
             if new {
@@ -1948,6 +2022,17 @@ impl<S: DocStore> Replica<S> {
             frames.extend(self.on_update(id, seq, bytes));
         }
         frames
+    }
+
+    /// Loro failed on a catch-up's batch of `id`: read back from its file, and caught up again from there one row at a
+    /// time for the rest of the run.
+    fn take_one_by_one(&mut self, id: DocId) -> Vec<ClientFrame> {
+        let Some(kind) = self.docs.get(&id).map(|d| d.kind.clone()) else { return Vec::new() };
+        self.one_by_one.insert(id);
+        self.reload(id);
+        let (up, epoch) = (self.link == Link::Up, self.epoch);
+        let Some(doc) = doc_again(&mut self.docs, self.space, &mut self.peers, id, &kind) else { return Vec::new() };
+        if up { subscribe(id, doc, epoch) } else { Vec::new() }
     }
 
     /// An update of a document's log from the server.
@@ -1959,7 +2044,7 @@ impl<S: DocStore> Replica<S> {
             doc.dirty = true;
             return Vec::new();
         }
-        if seq <= doc.have.upto || doc.stuck {
+        if seq <= doc.have.upto || doc.stuck || doc.stopped {
             return Vec::new();
         }
         if seq > doc.have.upto.saturating_add(1) {
@@ -2539,6 +2624,10 @@ fn doc_again<'a>(docs: &'a mut BTreeMap<DocId, Doc>, space: SpaceId, peers: &mut
 /// number. A document that knew another epoch (the server was restored since) catches up from the start and goes up
 /// whole after the catch-up. Acks of numbers not reached are forgotten: their updates go again after `subscribed`.
 fn subscribe(id: DocId, doc: &mut Doc, epoch: Option<Epoch>) -> Vec<ClientFrame> {
+    if doc.stopped {
+        doc.sub = Sub::No;
+        return Vec::new();
+    }
     if let Some(epoch) = epoch
         && doc.epoch != Some(epoch)
     {
@@ -3084,6 +3173,97 @@ mod tests {
         r.on_frame(ServerFrame::Update { doc, seq: 3, bytes: u3, device: device() }).unwrap();
         assert_eq!(r.entries(&app()).len(), 2);
         assert_eq!(r.take_notes().len(), 1);
+    }
+
+    /// Serves `rows` (numbered from 1) to every `subscribe` in `frames` until none is asked for; the rounds it took.
+    fn serve_catch_ups(r: &mut Replica<MemStore>, doc: DocId, rows: &[Vec<u8>], mut frames: Vec<ClientFrame>) -> usize {
+        let mut rounds = 0;
+        while let Some(after) = frames.iter().find_map(|f| match f {
+            ClientFrame::Subscribe { after, .. } => Some(*after),
+            _ => None,
+        }) {
+            rounds += 1;
+            if rounds > 10 {
+                break;
+            }
+            frames = Vec::new();
+            for (i, row) in rows.iter().enumerate() {
+                let seq = i as u64 + 1;
+                if seq > after {
+                    frames.extend(r.on_frame(ServerFrame::Update { doc, seq, bytes: row.clone(), device: device() }).unwrap());
+                }
+            }
+            frames.extend(r.on_frame(ServerFrame::Subscribed { doc, head: rows.len() as u64 }).unwrap());
+        }
+        rounds
+    }
+
+    /// Loro fails on one row of a catch-up taken as a batch: the catch-up is taken again one row at a time, only that
+    /// row is dropped (and said), and the document ends live with every other row, in a few rounds.
+    #[test]
+    fn a_row_loro_fails_on_in_a_batch_is_found_and_only_it_dropped() {
+        let space = SpaceId::generate();
+        let node = NodeId::generate();
+        let w2 = ServerFrame::Welcome { protocol: 2, epoch: epoch(1) };
+        let importer = text_doc(40);
+        insert(&importer, 0, "import");
+        let import = importer.export(loro::ExportMode::Snapshot).unwrap();
+        let mut r = Replica::open(MemStore::default(), space, peers()).unwrap();
+        r.connected();
+        r.on_frame(w2.clone()).unwrap();
+        let (id, _, _) = r.open_document(node, &app());
+        r.on_frame(ServerFrame::Snapshot { doc: id, base: 0, bytes: import.clone() }).unwrap();
+        r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
+        r.flush_documents().unwrap();
+        // (Each row from a machine of its own: none needs another's operations.)
+        let rows: Vec<Vec<u8>> = (1..=5u64)
+            .map(|i| {
+                let d = text_doc(70 + i);
+                d.import(&import).unwrap();
+                insert(&d, 0, &format!("<{i}>"))
+            })
+            .collect();
+        crate::live::copy::fail_on(&rows[2]);
+        r.disconnected();
+        r.connected();
+        let frames = r.on_frame(w2).unwrap();
+        let rounds = serve_catch_ups(&mut r, id, &rows, frames);
+        assert!(rounds <= 4, "it goes round: {rounds} rounds; {}", r.describe_doc(id));
+        let text = {
+            let d = loro::LoroDoc::new();
+            d.import(&r.snapshot_of(id).unwrap()).unwrap();
+            d.get_text("text").to_string()
+        };
+        for i in [1, 2, 4, 5] {
+            assert!(text.contains(&format!("<{i}>")), "row {i} is in: {text:?}");
+        }
+        assert!(!text.contains("<3>"), "{text:?}");
+        assert!(r.take_notes().iter().any(|n| n.contains("made Loro fail")), "said");
+        assert_eq!(r.document_status(id), Some((true, 0)), "live: {}", r.describe_doc(id));
+    }
+
+    /// Loro fails on a second row in one run: the document stops catching up (no loop), and its apps are told.
+    #[test]
+    fn a_second_loro_failure_in_a_run_stops_the_document() {
+        let space = SpaceId::generate();
+        let doc = recents_doc(space, &app());
+        let mut r = live(space, MemStore::default());
+        r.flush().unwrap();
+        let other = Recents::new(77);
+        let rows: Vec<Vec<u8>> = (1..=5u8).map(|i| other.add([i; 16], &entry(&format!("{i}.txt"), i64::from(i))).unwrap()).collect();
+        crate::live::copy::fail_on(&rows[1]);
+        crate::live::copy::fail_on(&rows[3]);
+        r.disconnected();
+        r.connected();
+        let frames = r.on_frame(welcome(1)).unwrap();
+        let rounds = serve_catch_ups(&mut r, doc, &rows, frames);
+        assert!(rounds <= 5, "it goes round: {rounds} rounds; {}", r.describe(&app()));
+        assert!(r.is_stopped(doc), "{}", r.describe(&app()));
+        assert!(r.take_notes().iter().any(|n| n.contains("stops following")), "said");
+        assert!(r.resend().is_empty(), "nothing tried again in this run");
+        r.disconnected();
+        r.connected();
+        assert!(!r.on_frame(welcome(1)).unwrap().iter().any(|f| matches!(f, ClientFrame::Subscribe { .. })), "nor on the next connection");
     }
 
     /// Waiting updates are capped by bytes: past the cap the document says so and takes nothing more on this connection.

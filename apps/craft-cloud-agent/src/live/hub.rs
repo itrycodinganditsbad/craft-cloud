@@ -75,7 +75,7 @@ pub enum DocOut {
     /// Presence from another machine or app.
     Presence { id: u64, bytes: Arc<Vec<u8>> },
     /// How the document stands now.
-    Status { doc: DocId, online: bool, waiting: u64, deleted: bool },
+    Status { doc: DocId, online: bool, waiting: u64, deleted: bool, stopped: bool },
 }
 
 /// What a docs connection asks the hub.
@@ -311,7 +311,7 @@ struct Docs {
     /// The open asked for a document's import.
     importer: BTreeMap<DocId, (ConnId, u64)>,
     lookups: Vec<Lookup>,
-    told: BTreeMap<DocId, (bool, u64, bool)>,
+    told: BTreeMap<DocId, (bool, u64, bool, bool)>,
 }
 
 /// `text` cut to `max` bytes at a character boundary, without control characters.
@@ -602,7 +602,8 @@ impl State {
         for doc in open {
             let (online, waiting) = self.replica.document_status(doc).unwrap_or((false, 0));
             let deleted = self.replica.document_node(doc).is_some_and(|node| !self.lookup.has_file(node));
-            let now = (online, waiting, deleted);
+            let stopped = self.replica.is_stopped(doc);
+            let now = (online, waiting, deleted, stopped);
             if self.docs.told.get(&doc) == Some(&now) {
                 continue;
             }
@@ -610,7 +611,7 @@ impl State {
             let mut conns: Vec<ConnId> = self.handles_of(doc).into_iter().map(|(conn, _)| conn).collect();
             conns.dedup();
             for conn in conns {
-                let _ = self.tell(conn, DocOut::Status { doc, online, waiting, deleted });
+                let _ = self.tell(conn, DocOut::Status { doc, online, waiting, deleted, stopped });
             }
         }
     }
