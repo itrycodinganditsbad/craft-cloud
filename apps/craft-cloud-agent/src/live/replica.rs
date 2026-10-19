@@ -2137,42 +2137,51 @@ impl<S: DocStore> Replica<S> {
 
     /// `subscribed {doc, head}`: the end of a catch-up.
     fn on_subscribed(&mut self, id: DocId, head: u64) -> Vec<ClientFrame> {
-        {
-            {
-                let Some(doc) = self.docs.get_mut(&id) else { return Vec::new() };
-                if doc.stale {
-                    // The end of a catch-up given up on: the next one, from where it is.
-                    doc.stale = false;
-                    return doc.resubscribe(id);
-                }
-                if head < doc.have.upto {
-                    // The server has less than this machine read of it (restored without a new epoch): from the start,
-                    // so `have` names updates of this log, and then what the log lacks goes up.
-                    doc.from_snapshot = false;
-                    doc.start_over();
-                    return doc.resubscribe(id);
-                }
-                let again = doc.check_snapshot(id, &mut self.notes);
-                if !again.is_empty() {
-                    return again;
-                }
-                doc.sub = Sub::Live;
-                doc.retry = None;
-                doc.create_refused = false;
-                if matches!(doc.join, Some(Join::Probing | Join::Following)) {
-                    // The server has it, and this machine all of it: live here from now on.
-                    doc.join = None;
-                    // (Written with the next of the documents' writes: until then the server has all of it.)
-                    doc.joined = true;
-                    doc.dirty = true;
-                    self.events.push(DocEvent::Joined(id));
-                }
-                let mut frames = send_pending(id, doc);
-                frames.extend(doc.push_next(id, &mut self.notes, &mut self.peers));
-                frames.extend(doc.try_compact());
-                frames
-            }
+        let Some(doc) = self.docs.get_mut(&id) else { return Vec::new() };
+        if doc.stale {
+            // The end of a catch-up given up on: the next one, from where it is.
+            doc.stale = false;
+            return doc.resubscribe(id);
         }
+        if head < doc.have.upto {
+            // The server has less than this machine read of it (restored without a new epoch): from the start,
+            // so `have` names updates of this log, and then what the log lacks goes up.
+            doc.from_snapshot = false;
+            doc.start_over();
+            return doc.resubscribe(id);
+        }
+        let from_snapshot = doc.from_snapshot;
+        let again = doc.check_snapshot(id, &mut self.notes);
+        if !again.is_empty() {
+            return again;
+        }
+        if matches!(doc.join, Some(Join::Probing | Join::Following)) && head == 0 && !from_snapshot {
+            // The server has the document but nothing of it (no update, no snapshot): an admin reset it, and its
+            // machines haven't sent it back yet. An app here would get an empty document and might save it over its
+            // file: the file is what to open until then.
+            self.docs.remove(&id);
+            self.events.push(DocEvent::NotLive(
+                id,
+                NotLiveReason::Resetting,
+                "the server's live document was reset and isn't back yet; open the file as it is".into(),
+            ));
+            return vec![ClientFrame::Unsubscribe { doc: id }];
+        }
+        doc.sub = Sub::Live;
+        doc.retry = None;
+        doc.create_refused = false;
+        if matches!(doc.join, Some(Join::Probing | Join::Following)) {
+            // The server has it, and this machine all of it: live here from now on.
+            doc.join = None;
+            // (Written with the next of the documents' writes: until then the server has all of it.)
+            doc.joined = true;
+            doc.dirty = true;
+            self.events.push(DocEvent::Joined(id));
+        }
+        let mut frames = send_pending(id, doc);
+        frames.extend(doc.push_next(id, &mut self.notes, &mut self.peers));
+        frames.extend(doc.try_compact());
+        frames
     }
 
     /// `ack {doc, client_seq, seq}`: one of this machine's updates is in the log.
@@ -3297,6 +3306,32 @@ mod tests {
             assert!(text.contains("<kept>"), "{how:?}: an acked change is lost: {text:?}");
             assert!(!text.contains("<refused>"), "{how:?}: a refused change came back: {text:?}");
         }
+    }
+
+    /// A machine with no copy of a document the server has but holds nothing of (an empty log, no snapshot: an admin
+    /// reset it, and its machines haven't sent it back yet) doesn't serve it to an app as live: the file is what to
+    /// open, and the join is let go of.
+    #[test]
+    fn a_reset_document_isnt_served_empty_to_a_machine_without_a_copy() {
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let mut r = Replica::open(MemStore::default(), space, peers()).unwrap();
+        r.connected();
+        r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        let (id, opening, _) = r.open_document(node, &app());
+        assert_eq!(opening, Opening::Joining);
+        let frames = r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
+        let events = r.take_events();
+        assert!(events.iter().any(|e| matches!(e, DocEvent::NotLive(d, NotLiveReason::Resetting, _) if *d == id)), "{events:?}");
+        assert!(!r.has_document(id), "not live here");
+        assert!(frames.contains(&ClientFrame::Unsubscribe { doc: id }), "{frames:?}");
+        // Once a machine sent it back (rows, or an import's snapshot), it joins.
+        let (_, opening, _) = r.open_document(node, &app());
+        assert_eq!(opening, Opening::Joining);
+        let other = text_doc(60);
+        let row = insert(&other, 0, "back");
+        r.on_frame(ServerFrame::Update { doc: id, seq: 1, bytes: row, device: device() }).unwrap();
+        r.on_frame(ServerFrame::Subscribed { doc: id, head: 1 }).unwrap();
+        assert!(r.take_events().contains(&DocEvent::Joined(id)));
     }
 
     /// After a restore (a new epoch) a document goes up whole: what this machine's apps wrote is its own, so it goes

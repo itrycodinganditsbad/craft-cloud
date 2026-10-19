@@ -452,6 +452,9 @@ pub enum NotLiveReason {
     TooLarge,
     /// The path isn't a file inside the synced folder.
     NotInFolder,
+    /// The server's document was reset and its machines haven't sent it back yet: the file is what to open (it is
+    /// live again once one of them has).
+    Resetting,
 }
 
 /// A control message from the agent on the docs WebSocket ([`docs`]).

@@ -529,15 +529,23 @@ fn resets_and_restores_with_a_snapshot_lose_nothing() {
         }
         assert_eq!(w.text(a, doc), text);
         assert_eq!(w.text(b, doc), text);
-        // The admin's reset: the log and the snapshot (the import too) go; the machines push it all back.
-        w.meta.reset_live_doc(w.space, doc).await.unwrap();
+        // The admin's reset: the log and the snapshot (the import too) go; the machines push it all back. A machine
+        // without a copy that opens it before they have is told to open the file (never handed an empty document).
         for m in [a, b, c] {
             w.disconnect(m);
-            w.connect(m);
         }
-        w.settle().await;
+        w.meta.reset_live_doc(w.space, doc).await.unwrap();
         let d = w.machine().await;
         w.connect(d);
+        w.settle().await;
+        let (_, opening) = w.open(d, node);
+        assert_eq!(opening, Opening::Joining);
+        w.settle().await;
+        let events = w.events(d);
+        assert!(events.iter().any(|e| matches!(e, DocEvent::NotLive(_, NotLiveReason::Resetting, _))), "{events:?}");
+        for m in [a, b, c] {
+            w.connect(m);
+        }
         w.settle().await;
         joined(&mut w, d, node, "never asked").await;
         assert_eq!(w.text(d, doc), text, "after the reset");
