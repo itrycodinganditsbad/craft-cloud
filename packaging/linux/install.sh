@@ -45,6 +45,17 @@ has_unit() {
     [ -f "$unit" ] && command -v systemctl >/dev/null 2>&1
 }
 
+# Runs "$@" in the background holding none of this script's streams (stdin, stdout and stderr on /dev/null), in a
+# session of its own where setsid is there: whatever waits for this script's output (ssh, a pipe) isn't kept waiting
+# for the programs it starts.
+detach() {
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$@" </dev/null >/dev/null 2>&1 &
+    else
+        nohup "$@" </dev/null >/dev/null 2>&1 &
+    fi
+}
+
 # The variables that pick the agent's folders, those that are set, as `"--setenv=NAME=${NAME}"` words for the
 # caller's `eval "set -- \"\$@\" $(env_flags)"`: a systemd unit doesn't get this shell's environment.
 env_flags() {
@@ -104,8 +115,10 @@ start_after_exit() {
         elif [ -n "${INVOCATION_ID:-}" ]; then
             # In a unit of its own (this waiter), whatever it starts ends with it: said in the journal instead.
             echo "Craft Cloud: the agent couldn'"'"'t be started again; run '"'"'craft-cloud-agent run --log'"'"' or log in again" >&2
+        elif command -v setsid >/dev/null 2>&1; then
+            setsid "$agent" run --log </dev/null >/dev/null 2>&1 &
         else
-            nohup "$agent" run --log >/dev/null 2>&1 &
+            nohup "$agent" run --log </dev/null >/dev/null 2>&1 &
         fi
     '
     w_pid=$1 w_how=$2 w_agent=$3 w_comm=$4
@@ -119,7 +132,7 @@ start_after_exit() {
             return 0
         fi
     fi
-    nohup sh -c "$waiter" sh "$w_pid" "$w_how" "$w_agent" "$data" "$w_comm" >/dev/null 2>&1 &
+    detach sh -c "$waiter" sh "$w_pid" "$w_how" "$w_agent" "$data" "$w_comm"
 }
 
 # The agent that ran and was stopped is started again (once): this computer keeps syncing.
@@ -131,7 +144,7 @@ start_again() {
         systemctl --user stop craft-cloud-agent.service || true
         systemctl --user start craft-cloud-agent.service || true
     elif [ -x "$lib/craft-cloud-agent" ]; then
-        nohup "$lib/craft-cloud-agent" run --log >/dev/null 2>&1 &
+        detach "$lib/craft-cloud-agent" run --log
     fi
 }
 
@@ -208,7 +221,9 @@ finish() {
     case "$closed" in
         *tray*)
             if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || [ -S "${XDG_RUNTIME_DIR:-/nonexistent}/bus" ]; then
-                [ -x "$lib/craft-cloud" ] && nohup "$lib/craft-cloud" --tray >/dev/null 2>&1 &
+                if [ -x "$lib/craft-cloud" ]; then
+                    detach "$lib/craft-cloud" --tray
+                fi
             else
                 echo "The Craft Cloud tray was closed for the upgrade; run 'craft-cloud --tray' in your desktop session (or log in again) to get it back." >&2
             fi

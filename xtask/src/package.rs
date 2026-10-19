@@ -307,8 +307,13 @@ mod tests {
                 count = count.display()
             );
             std::fs::write(src.join("craft-cloud-agent"), agent).unwrap();
-            // The app: an (old) tray runs, which `--close` ends and says.
-            let app = format!("#!/bin/sh\necho \"$0 $*\" >> \"{}\"\n[ \"$1\" = --close ] && echo tray\nexit 0\n", calls.display());
+            // The app: an (old) tray runs, which `--close` ends and says; a tray started stays (its pid in tray.pid).
+            let app = format!(
+                "#!/bin/sh\necho \"$0 $*\" >> \"{calls}\"\n[ \"$1\" = --close ] && echo tray\n\
+                 if [ \"$1\" = --tray ]; then echo $$ > \"{tray}\"; exec sleep 60; fi\nexit 0\n",
+                calls = calls.display(),
+                tray = tmp.join("tray.pid").display()
+            );
             std::fs::write(src.join("craft-cloud"), app).unwrap();
             std::fs::write(src.join("craft-cloud.png"), "png").unwrap();
             std::fs::write(src.join(LICENSES), "licences").unwrap();
@@ -354,7 +359,12 @@ mod tests {
 
         /// install.sh, in a desktop session (a session bus), with `vars` set too.
         fn install_with(&self, wait: &str, vars: &[(&str, &str)]) -> std::process::Output {
-            let mut sh = Command::new("sh");
+            self.install_in("sh", wait, vars)
+        }
+
+        /// [`Self::install_with`] run by `shell` (`sh` is dash here; Arch's is bash).
+        fn install_in(&self, shell: &str, wait: &str, vars: &[(&str, &str)]) -> std::process::Output {
+            let mut sh = Command::new(shell);
             sh.arg(self.src.join("install.sh"))
                 .env_clear()
                 .env("HOME", &self.home)
@@ -393,6 +403,18 @@ mod tests {
             self.home.join(".local/lib/craft-cloud/craft-cloud-agent").display().to_string()
         }
 
+        /// Waits (up to 20 s) for the calls to include `call`.
+        fn has(&self, call: &str) -> Vec<String> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let calls = self.calls();
+                if calls.iter().any(|c| c == call) || std::time::Instant::now() > deadline {
+                    return calls;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+
         /// Waits (up to 20 s) for the calls to end with `last`: the agent is started again in the background.
         fn ends_with(&self, last: &str) -> Vec<String> {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -410,6 +432,9 @@ mod tests {
     impl Drop for Upgrade {
         fn drop(&mut self) {
             self.agent_ends();
+            if let Ok(pid) = std::fs::read_to_string(self.tmp.join("tray.pid")) {
+                let _ = Command::new("kill").arg(pid.trim()).status();
+            }
             let _ = std::fs::remove_dir_all(&self.tmp);
         }
     }
@@ -450,8 +475,9 @@ mod tests {
         let out = up.install("60");
         assert!(out.status.success(), "{out:?}");
         let run = format!("{} run --log", up.lib_agent());
-        let calls = up.ends_with(&run);
-        assert_eq!(calls.last(), Some(&run), "{calls:?}");
+        // The agent and the tray both start in the background: either may come last.
+        let calls = up.has(&run);
+        assert!(calls.contains(&run), "{calls:?}");
         assert!(calls.iter().filter(|c| c.ends_with("[old agent running]")).all(|c| c.ends_with("quit [old agent running]")), "{calls:?}");
     }
 
@@ -492,6 +518,28 @@ mod tests {
         let calls = up.calls();
         assert_eq!(calls.iter().filter(|c| c.starts_with("systemd-run")).count(), 1, "{calls:?}");
         assert_eq!(calls.iter().filter(|c| *c == start).count(), 1, "{calls:?}");
+    }
+
+    /// install.sh's output is a pipe (ssh, a script): it ends when the script does, though the tray it started still
+    /// runs. Nothing the script starts in the background holds its streams. Under bash too, which (unlike dash) keeps
+    /// a background `a && b &` list's subshell, and so its streams, for as long as `b` runs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_scripts_output_ends_with_it_while_the_tray_runs_on() {
+        for shell in ["sh", "bash"] {
+            let up = Upgrade::new(&format!("pipe-{shell}"), 1, 1);
+            let started = std::time::Instant::now();
+            let out = up.install_in(shell, "60", &[]);
+            assert!(out.status.success(), "{shell}: {out:?}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(20), "{shell}: the pipe stayed open: {:?}", started.elapsed());
+            let tray = up.tmp.join("tray.pid");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !tray.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let pid = std::fs::read_to_string(&tray).unwrap();
+            assert!(Command::new("kill").args(["-0", pid.trim()]).status().unwrap().success(), "{shell}: the tray still runs");
+        }
     }
 
     /// Without a unit, the waiter starts the agent in a unit of its own and ends: once the agent is up no waiter is
