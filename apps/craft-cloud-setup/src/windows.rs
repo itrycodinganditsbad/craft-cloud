@@ -72,18 +72,38 @@ pub fn remove_after(pid: u32, dir: &Path) -> Command {
 }
 
 /// [`remove_after`] without PowerShell: `cmd` alone asks `tasklist` every second whether the process `pid` (whose
-/// exe is `image`) still runs, for up to an hour, then removes the folder ([`RMDIR`], again a moment later if a file
-/// was still held). The `if` is in parentheses of its own: cmd would take a following `& exit` as part of it.
+/// exe is `image`) still runs, for up to an hour, then removes the folder ([`RMDIR`], tried again every second for
+/// half a minute while a file is still held).
 pub fn remove_after_with_cmd(pid: u32, image: &str, dir: &Path) -> Command {
-    let tasklist = system_program("tasklist.exe");
+    remove_after_with_cmd_using(&system_program("tasklist.exe"), 3600, pid, image, dir)
+}
+
+/// [`remove_after_with_cmd`] with `tasklist` at `tasklist`, asked `rounds` times at most.
+///
+/// `tasklist`'s answer goes to a file first (`CRAFT_CLOUD_TASKS`, in the temporary folder), so a `tasklist` that
+/// fails (and writes nothing) is told apart from one that lists nothing: then cmd waits and asks again, rather than
+/// take the setup for ended. `find` and `ping` are named by their full paths: cmd looks in its working folder first.
+/// Each `if` is in parentheses of its own: cmd would take a following `& …` as part of it.
+fn remove_after_with_cmd_using(tasklist: &Path, rounds: u32, pid: u32, image: &str, dir: &Path) -> Command {
+    let (find, ping) = (system_program("find.exe"), system_program("PING.EXE"));
+    let wait = format!("\"{}\" -n 2 127.0.0.1 >nul", ping.display());
+    let remove = format!("for /l %j in (1,1,30) do @(if exist \"%CRAFT_CLOUD_DIR%\" ({RMDIR} & (if exist \"%CRAFT_CLOUD_DIR%\" ({wait}))))");
     let line = format!(
-        "/d /c for /l %i in (1,1,3600) do @(\"{tasklist}\" /FI \"PID eq {pid}\" /NH | find /i \"{image}\" >nul && ping -n 2 127.0.0.1 >nul \
-         || ({RMDIR} & (if exist \"%CRAFT_CLOUD_DIR%\" (ping -n 2 127.0.0.1 >nul & {RMDIR})) & exit))",
-        tasklist = tasklist.display()
+        "/d /c for /l %i in (1,1,{rounds}) do @((\"{tasklist}\" /FI \"PID eq {pid}\" /NH >\"%CRAFT_CLOUD_TASKS%\") \
+         && (\"{find}\" /i \"{image}\" \"%CRAFT_CLOUD_TASKS%\" >nul && {wait} || ({remove} & del \"%CRAFT_CLOUD_TASKS%\" & exit)) || {wait})",
+        tasklist = tasklist.display(),
+        find = find.display()
     );
+    let tasks = std::env::temp_dir().join(format!("craft-cloud-uninstall-{pid}.txt"));
     let mut command = quiet(&system_program("cmd.exe"));
-    command.raw_arg(line).env("CRAFT_CLOUD_DIR", dir);
+    command.raw_arg(line).env("CRAFT_CLOUD_DIR", dir).env("CRAFT_CLOUD_TASKS", tasks);
     detached_from(command, dir)
+}
+
+/// For tests: [`remove_after_with_cmd_using`] with a `tasklist` that can't run, asked `rounds` times.
+#[cfg(test)]
+pub fn remove_after_with_cmd_without_tasklist(rounds: u32, pid: u32, image: &str, dir: &Path) -> Command {
+    remove_after_with_cmd_using(Path::new(r"C:\no-such-folder\tasklist.exe"), rounds, pid, image, dir)
 }
 
 /// In a process group of its own, and working in the folder above `dir` (a remover working inside it would hold it).

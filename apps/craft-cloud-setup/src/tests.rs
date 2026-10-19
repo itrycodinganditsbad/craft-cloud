@@ -550,3 +550,17 @@ fn the_program_folder_goes_once_the_setup_has_ended() {
         assert!(outside.join("keep.txt").exists(), "the link wasn't followed (cmd: {with_cmd})");
     }
 }
+
+/// The `cmd` remover with a `tasklist` that can't run never takes the setup for ended: it waits, and the folder stays.
+#[cfg(windows)]
+#[test]
+fn the_cmd_remover_waits_while_tasklist_cant_tell() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("Craft Cloud");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(SETUP_EXE), "setup").unwrap();
+    // Three rounds of asking, then it gives up (an hour in the real one).
+    let mut remover = crate::windows::remove_after_with_cmd_without_tasklist(3, std::process::id(), "craft-cloud-setup.exe", &dir).spawn().unwrap();
+    remover.wait().unwrap();
+    assert!(dir.join(SETUP_EXE).exists(), "nothing was removed while it couldn't tell");
+}
