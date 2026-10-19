@@ -5,5 +5,12 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[dependencies]
+# `cargo metadata`'s JSON, for the packages' licence notices.
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
