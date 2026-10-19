@@ -115,7 +115,7 @@ struct Shared {
     numbers: Mutex<HashMap<DocId, Vec<u64>>>,
     closed: AtomicBool,
     next_id: AtomicU64,
-    /// A clone of the stream: the reader waits on it, and dropping the connection shuts it down.
+    /// A clone of the stream: dropping the connection shuts it down (which wakes the reader).
     stream: TcpStream,
 }
 
@@ -202,29 +202,18 @@ impl Shared {
     }
 }
 
-/// The reader's thread: waits for data without holding the socket (so writes go at once), then reads every message
-/// there is.
-fn read_loop(shared: Arc<Shared>) {
-    let mut peek = [0u8; 1];
+/// The reader's thread, on a WebSocket of its own over the connection: every message as it comes (waking now and then
+/// to look whether to stop).
+fn read_loop(shared: Arc<Shared>, mut socket: WebSocket<TcpStream>) {
     loop {
         if shared.closed.load(Ordering::Relaxed) {
             return;
         }
-        match shared.stream.peek(&mut peek) {
-            Ok(0) => return shared.end("the agent closed the connection"),
-            Ok(_) => {}
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+        match socket.read() {
+            Ok(Message::Close(_)) => return shared.end("the agent closed the connection"),
+            Ok(message) => shared.on_message(message),
+            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
             Err(e) => return shared.end(&e.to_string()),
-        }
-        // Everything there is now (the socket reads time out at once once it is drained).
-        loop {
-            let read = lock(&shared.socket).read();
-            match read {
-                Ok(Message::Close(_)) => return shared.end("the agent closed the connection"),
-                Ok(message) => shared.on_message(message),
-                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
-                Err(e) => return shared.end(&e.to_string()),
-            }
         }
     }
 }
@@ -265,10 +254,16 @@ impl Documents {
             }
             Err(e) => return Err(Error::Io(e.to_string())),
         };
-        // Reads time out at once (the reader waits on the stream's clone instead); the clone wakes now and then.
-        socket.get_ref().set_read_timeout(Some(Duration::from_millis(1))).map_err(|e| Error::Io(e.to_string()))?;
-        let stream = socket.get_ref().try_clone().map_err(|e| Error::Io(e.to_string()))?;
-        stream.set_read_timeout(Some(IDLE_WAKE)).map_err(|e| Error::Io(e.to_string()))?;
+        // Two WebSockets over the one connection, a reader's and a writer's, so a write never waits for a read. (A
+        // read timeout is the socket's, not one handle's: the reader's wakes it now and then to look whether to
+        // stop.) The agent sends nothing before the app's first request, so the handshake left nothing unread; the
+        // reader never writes (the agent sends no pings), so writes never interleave.
+        let clone = |s: &TcpStream| s.try_clone().map_err(|e| Error::Io(e.to_string()));
+        let (read_side, write_side, stream) = (clone(socket.get_ref())?, clone(socket.get_ref())?, clone(socket.get_ref())?);
+        drop(socket);
+        read_side.set_read_timeout(Some(IDLE_WAKE)).map_err(|e| Error::Io(e.to_string()))?;
+        let reader_socket = WebSocket::from_raw_socket(read_side, tungstenite::protocol::Role::Client, Some(config));
+        let socket = WebSocket::from_raw_socket(write_side, tungstenite::protocol::Role::Client, Some(config));
         let shared = Arc::new(Shared {
             socket: Mutex::new(socket),
             routes: Mutex::new(HashMap::new()),
@@ -282,7 +277,7 @@ impl Documents {
         let reader_shared = shared.clone();
         let reader = std::thread::Builder::new()
             .name("craft-cloud-docs".into())
-            .spawn(move || read_loop(reader_shared))
+            .spawn(move || read_loop(reader_shared, reader_socket))
             .map_err(|e| Error::Io(e.to_string()))?;
         Ok(Self { shared, reader: Some(reader) })
     }

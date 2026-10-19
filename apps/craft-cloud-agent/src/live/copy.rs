@@ -151,6 +151,19 @@ impl LiveCopy {
         Ok(if needs.is_empty() { Taken::Applied { new } } else { Taken::Waiting { needs } })
     }
 
+    /// Imports many updates at once (a catch-up's), checked by Loro as one import would: much faster than one by one
+    /// on a big document. Whether it brought anything new. The caller still takes each update on its own after this
+    /// (which is then quick), for what each one did.
+    pub fn import_batch(&self, updates: &[Vec<u8>]) -> Result<bool, UpdateError> {
+        if updates.iter().any(|u| u.len() > MAX_UPDATE_BYTES) {
+            return Err(UpdateError::Invalid("over 1 MiB"));
+        }
+        let before = self.version()?;
+        // (A batch Loro refuses as a whole is taken one by one by the caller, which finds the one at fault.)
+        let _ = self.guard(|doc| doc.import_batch(updates).map_err(|e| UpdateError::Malformed(e.to_string())));
+        Ok(self.version()? != before)
+    }
+
     /// Whether the document has any operations (Loro drops the updates waiting in a document without any when a
     /// snapshot comes in: the caller imports them again).
     pub fn has_history(&self) -> bool {

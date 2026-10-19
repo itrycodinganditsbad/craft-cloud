@@ -105,6 +105,8 @@ const MAX_HEALS: u32 = 2;
 const DOCUMENT_FILE_FORMAT: u32 = 1;
 /// A document's journal is written into its file (and cleared) once it holds this many bytes, besides now and then.
 const MAX_JOURNAL_BYTES: usize = 4 * 1024 * 1024;
+/// A catch-up's updates are taken a batch at a time, at most this many bytes of them at once.
+const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 /// Every update of the log up to `upto` is in the document's file; `upto_hash` is the hash of the update at `upto`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -479,6 +481,13 @@ struct Doc {
     urgent: bool,
     /// The waiting update Loro just failed on, imported again ([`Doc::rewait`]).
     waiting_failed: Option<[u8; 32]>,
+    /// The catch-up under way started with the server's snapshot ([`Doc::check_snapshot`]).
+    from_snapshot: bool,
+    /// It has a file (written, or loaded from one).
+    on_disk: bool,
+    /// The catch-up's updates not taken yet ([`Replica::take_batch`]), and their bytes.
+    batch: Vec<(u64, Vec<u8>)>,
+    batched: usize,
 }
 
 impl Doc {
@@ -536,6 +545,10 @@ impl Doc {
             journal: 0,
             urgent: false,
             waiting_failed: None,
+            from_snapshot: false,
+            on_disk: false,
+            batch: Vec::new(),
+            batched: 0,
         }
     }
 
@@ -678,6 +691,7 @@ impl Doc {
             }
         }
         doc.push_wait = file.push_wait;
+        doc.on_disk = true;
         doc.derive_log();
         Ok(doc)
     }
@@ -763,6 +777,14 @@ impl Doc {
         }
         self.waiting.retain(|w| !self.body.copy().covers(&w.needs));
         self.on_server(bytes);
+        // One of this machine's own unacked updates, brought back by a catch-up (its ack was lost, or forgotten with
+        // the connection): the log has it, so it is had (its ack, if one comes, finds nothing). So the unacked updates
+        // are always ones the log doesn't hold up to what is had, which is what working out the log's version from the
+        // copy relies on ([`Doc::derive_log`]).
+        if let Some(i) = self.pending.iter().position(|p| p.bytes.len() == bytes.len() && p.bytes == bytes) {
+            let own = self.pending.remove(i);
+            self.sent.remove(&own.client_seq);
+        }
         // What the log holds, as far as this copy has it (an update that never applies isn't in it).
         self.log.note(seq, if in_log { spans_of(bytes).unwrap_or_default() } else { Vec::new() });
         self.advance(seq, hash);
@@ -939,6 +961,8 @@ impl Doc {
         self.forget_acks();
         // The log is learnt again from the start.
         self.log = LogVersion::anchored(0, Version::new());
+        self.batch.clear();
+        self.batched = 0;
         self.compact_ask = None;
         self.dirty = true;
         self.urgent = true;
@@ -992,8 +1016,31 @@ impl Doc {
             self.have = Have { upto: base, upto_hash: if base == self.have.upto { self.have.upto_hash } else { None } };
             self.log = LogVersion::anchored(base, version_of(bytes).unwrap_or_default());
         }
+        self.from_snapshot = true;
         self.dirty = true;
         Ok(())
+    }
+
+    /// The end of a catch-up that started with the server's snapshot, with updates still waiting for their history:
+    /// the snapshot may lack some of what the rows below its base held (a device made it wrong). The whole log is
+    /// read again from the start, with the import (`subscribe_log`, kept for this document from now on); Loro takes what
+    /// it has already as no news. Frames to send, if it does.
+    fn check_snapshot(&mut self, id: DocId, notes: &mut Vec<String>) -> Vec<ClientFrame> {
+        if !std::mem::take(&mut self.from_snapshot) || self.waiting.is_empty() || self.log_only {
+            return Vec::new();
+        }
+        let line = self.told(
+            |app| format!("updates of the recents of {app} wait for history the server's snapshot should hold; this machine reads the whole log"),
+            |id| format!("updates of the live document {id} wait for history the server's snapshot should hold; this machine reads the whole log"),
+        );
+        self.say(notes, line);
+        self.log_only = true;
+        self.have = Have::default();
+        self.log = LogVersion::anchored(0, Version::new());
+        self.compact_ask = None;
+        self.dirty = true;
+        self.urgent = true;
+        self.resubscribe(id)
     }
 
     fn at(&self) -> Option<[u8; 32]> {
@@ -1296,6 +1343,10 @@ impl<S: DocStore> Replica<S> {
             doc.creating = false;
             doc.compact_ask = None;
             doc.stale = false;
+            doc.from_snapshot = false;
+            // (The server sends them again with the next catch-up.)
+            doc.batch.clear();
+            doc.batched = 0;
         }
     }
 
@@ -1394,12 +1445,15 @@ impl<S: DocStore> Replica<S> {
         }
     }
 
-    /// A document of a file live here: its state for an app opening it, a Loro snapshot (its unsent updates are in
-    /// it), and the server's updates still waiting for their history (to import after it).
+    /// A document of a file live here: its state for an app opening it, a Loro snapshot, and the updates to import after
+    /// it: the server's still waiting for their history, and this machine's own not yet acked (in the snapshot already,
+    /// unless they wait for history too: after a restart, the server's updates they build on may not be on disk yet,
+    /// and Loro applies them only once those come again; the app's Loro does the same).
     pub fn document_state(&self, id: DocId) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
         let doc = self.docs.get(&id).filter(|d| d.joined && d.kind.is_document())?;
         let snapshot = doc.body.copy().snapshot().ok()?;
-        Some((snapshot, doc.waiting.iter().map(|w| w.bytes.clone()).collect()))
+        let after = doc.waiting.iter().map(|w| w.bytes.clone()).chain(doc.pending.iter().map(|p| p.bytes.clone())).collect();
+        Some((snapshot, after))
     }
 
     /// Whether a document being joined waits for an app's import (the server doesn't have it).
@@ -1445,6 +1499,12 @@ impl<S: DocStore> Replica<S> {
         };
         if bytes.is_empty() || bytes.len() > MAX_UPDATE_BYTES {
             return Err(LocalError::Invalid(format!("an update is 1 to {MAX_UPDATE_BYTES} bytes")));
+        }
+        // Its journal needs its file beside it (a journal alone isn't loaded): a document joined since it was last
+        // written is written first (as it is, before this update).
+        if !doc.on_disk {
+            let space = self.space;
+            save(&mut self.store, space, id, doc)?;
         }
         match doc.body.import(bytes) {
             Ok(_) => {}
@@ -1546,7 +1606,12 @@ impl<S: DocStore> Replica<S> {
 
     /// How `app`'s document stands, in words (for a simulation that wants to say why it waits).
     pub fn describe(&self, app: &AppName) -> String {
-        match self.docs.get(&self.doc_id(app)) {
+        self.describe_doc(self.doc_id(app))
+    }
+
+    /// [`Replica::describe`], of any document.
+    pub fn describe_doc(&self, id: DocId) -> String {
+        match self.docs.get(&id) {
             None => "no document".into(),
             Some(d) => format!(
                 "{:?}, upto {}, {} unacked ({} sent, {} push, acked {:?}), pushing {:?}, wait {:?}, full {:?}, stuck {}, retry {:?}",
@@ -1752,51 +1817,103 @@ impl<S: DocStore> Replica<S> {
             ServerFrame::Created { .. } => Ok(Vec::new()),
             ServerFrame::Update { doc: id, seq, bytes, .. } => {
                 let Some(doc) = self.docs.get_mut(&id) else { return Ok(Vec::new()) };
-                // The update at the base of a snapshot the catch-up started with: its hash names it in the next `at`.
-                if seq == doc.have.upto && seq > 0 && doc.have.upto_hash.is_none() {
-                    doc.have.upto_hash = Some(update_hash(&bytes));
-                    doc.dirty = true;
-                    return Ok(Vec::new());
+                // A catch-up of a document of a file is taken a batch at a time (one Loro import for many updates is
+                // far quicker on a big document): the updates wait here until `subscribed`, or a few MiB of them.
+                if doc.kind.is_document() && doc.sub == Sub::CatchingUp && !doc.stale {
+                    doc.batched = doc.batched.saturating_add(bytes.len());
+                    doc.batch.push((seq, bytes));
+                    return Ok(if doc.batched > MAX_BATCH_BYTES { self.take_batch(id) } else { Vec::new() });
                 }
-                if seq <= doc.have.upto || doc.stuck {
-                    return Ok(Vec::new());
-                }
-                if seq > doc.have.upto.saturating_add(1) {
-                    // A gap: a catch-up under way brings it; else the server's updates were lost on the way (an old
-                    // connection), and a catch-up from what it has brings them.
-                    return Ok(if doc.sub == Sub::Live { doc.resubscribe(id) } else { Vec::new() });
-                }
-                let mut changed = false;
-                let taken = doc.take(seq, &bytes, &mut self.notes, &mut changed);
-                let kind = doc.kind.clone();
-                let mut frames = if matches!(taken, Taken::Had) { doc.try_compact() } else { Vec::new() };
-                if changed {
-                    match &kind {
-                        Kind::Recents(app) => {
-                            self.changed.insert(app.clone());
-                        }
-                        Kind::Document { .. } => self.events.push(DocEvent::Remote(id, bytes.clone())),
-                    }
-                }
-                frames.extend(match taken {
-                    Taken::Had | Taken::Stuck => Vec::new(),
-                    Taken::Panicked => self.recover_doc(id, kind, seq, update_hash(&bytes)),
-                    Taken::WaitingPanicked(hash) => self.recover_waiting_doc(id, kind, hash),
-                });
-                Ok(frames)
+                Ok(self.on_update(id, seq, bytes))
             }
             ServerFrame::Subscribed { doc: id, head } => {
-                let Some(doc) = self.docs.get_mut(&id) else { return Ok(Vec::new()) };
+                let mut frames = self.take_batch(id);
+                frames.extend(self.on_subscribed(id, head));
+                Ok(frames)
+            }
+            ServerFrame::Ack { doc: id, client_seq, seq } => Ok(self.on_ack(id, client_seq, seq)),
+            other => self.on_other(other),
+        }
+    }
+
+    /// The updates a catch-up batched: imported into the copy at once, then each taken as it would have been (Loro
+    /// knows them then, so that is quick). Remote changes go to the apps as they came.
+    fn take_batch(&mut self, id: DocId) -> Vec<ClientFrame> {
+        let Some(doc) = self.docs.get_mut(&id) else { return Vec::new() };
+        let batch = std::mem::take(&mut doc.batch);
+        doc.batched = 0;
+        if batch.is_empty() {
+            return Vec::new();
+        }
+        let updates: Vec<Vec<u8>> = batch.iter().map(|(_, bytes)| bytes.clone()).collect();
+        let new = doc.body.copy().import_batch(&updates).unwrap_or(false);
+        let mut frames = Vec::new();
+        for (seq, bytes) in batch {
+            if new {
+                self.events.push(DocEvent::Remote(id, bytes.clone()));
+            }
+            frames.extend(self.on_update(id, seq, bytes));
+        }
+        frames
+    }
+
+    /// An update of a document's log from the server.
+    fn on_update(&mut self, id: DocId, seq: u64, bytes: Vec<u8>) -> Vec<ClientFrame> {
+        let Some(doc) = self.docs.get_mut(&id) else { return Vec::new() };
+        // The update at the base of a snapshot the catch-up started with: its hash names it in the next `at`.
+        if seq == doc.have.upto && seq > 0 && doc.have.upto_hash.is_none() {
+            doc.have.upto_hash = Some(update_hash(&bytes));
+            doc.dirty = true;
+            return Vec::new();
+        }
+        if seq <= doc.have.upto || doc.stuck {
+            return Vec::new();
+        }
+        if seq > doc.have.upto.saturating_add(1) {
+            // A gap: a catch-up under way brings it; else the server's updates were lost on the way (an old
+            // connection), and a catch-up from what it has brings them.
+            return if doc.sub == Sub::Live { doc.resubscribe(id) } else { Vec::new() };
+        }
+        let mut changed = false;
+        let taken = doc.take(seq, &bytes, &mut self.notes, &mut changed);
+        let kind = doc.kind.clone();
+        let mut frames = if matches!(taken, Taken::Had) { doc.try_compact() } else { Vec::new() };
+        if changed {
+            match &kind {
+                Kind::Recents(app) => {
+                    self.changed.insert(app.clone());
+                }
+                Kind::Document { .. } => self.events.push(DocEvent::Remote(id, bytes.clone())),
+            }
+        }
+        frames.extend(match taken {
+            Taken::Had | Taken::Stuck => Vec::new(),
+            Taken::Panicked => self.recover_doc(id, kind, seq, update_hash(&bytes)),
+            Taken::WaitingPanicked(hash) => self.recover_waiting_doc(id, kind, hash),
+        });
+        frames
+    }
+
+    /// `subscribed {doc, head}`: the end of a catch-up.
+    fn on_subscribed(&mut self, id: DocId, head: u64) -> Vec<ClientFrame> {
+        {
+            {
+                let Some(doc) = self.docs.get_mut(&id) else { return Vec::new() };
                 if doc.stale {
                     // The end of a catch-up given up on: the next one, from where it is.
                     doc.stale = false;
-                    return Ok(doc.resubscribe(id));
+                    return doc.resubscribe(id);
                 }
                 if head < doc.have.upto {
                     // The server has less than this machine read of it (restored without a new epoch): from the start,
                     // so `have` names updates of this log, and then what the log lacks goes up.
+                    doc.from_snapshot = false;
                     doc.start_over();
-                    return Ok(doc.resubscribe(id));
+                    return doc.resubscribe(id);
+                }
+                let again = doc.check_snapshot(id, &mut self.notes);
+                if !again.is_empty() {
+                    return again;
                 }
                 doc.sub = Sub::Live;
                 doc.retry = None;
@@ -1804,19 +1921,25 @@ impl<S: DocStore> Replica<S> {
                 if matches!(doc.join, Some(Join::Probing | Join::Following)) {
                     // The server has it, and this machine all of it: live here from now on.
                     doc.join = None;
+                    // (Written with the next of the documents' writes: until then the server has all of it.)
                     doc.joined = true;
                     doc.dirty = true;
-                    doc.urgent = true;
                     self.events.push(DocEvent::Joined(id));
                 }
                 let mut frames = send_pending(id, doc);
                 frames.extend(doc.push_next(id, &mut self.notes, &mut self.peers));
                 frames.extend(doc.try_compact());
-                Ok(frames)
+                frames
             }
-            ServerFrame::Ack { doc: id, client_seq, seq } => {
-                let Some(doc) = self.docs.get_mut(&id) else { return Ok(Vec::new()) };
-                let Some(i) = doc.pending.iter().position(|p| p.client_seq == client_seq) else { return Ok(Vec::new()) };
+        }
+    }
+
+    /// `ack {doc, client_seq, seq}`: one of this machine's updates is in the log.
+    fn on_ack(&mut self, id: DocId, client_seq: u64, seq: u64) -> Vec<ClientFrame> {
+        {
+            {
+                let Some(doc) = self.docs.get_mut(&id) else { return Vec::new() };
+                let Some(i) = doc.pending.iter().position(|p| p.client_seq == client_seq) else { return Vec::new() };
                 doc.strikes = 0;
                 doc.full_pause = 0;
                 doc.dirty = true;
@@ -1840,8 +1963,16 @@ impl<S: DocStore> Replica<S> {
                 }
                 let mut frames = if push { doc.push_next(id, &mut self.notes, &mut self.peers) } else { Vec::new() };
                 frames.extend(doc.try_compact());
-                Ok(frames)
+                frames
             }
+        }
+    }
+
+    /// The frames [`Replica::on_frame_inner`] doesn't take itself.
+    fn on_other(&mut self, frame: ServerFrame) -> Result<Vec<ClientFrame>, LinkError> {
+        match frame {
+            ServerFrame::Welcome { .. } | ServerFrame::Update { .. } | ServerFrame::Subscribed { .. } | ServerFrame::Ack { .. } => Ok(Vec::new()),
+            ServerFrame::Created { .. } => Ok(Vec::new()),
             ServerFrame::Error { code, message, doc, client_seq } => self.refused(&code, &message, doc, client_seq),
             ServerFrame::Compact { doc: id, upto } => {
                 let Some(doc) = self.docs.get_mut(&id) else { return Ok(Vec::new()) };
@@ -1967,7 +2098,6 @@ impl<S: DocStore> Replica<S> {
                 doc.log = LogVersion::anchored(0, version_of(&snapshot).unwrap_or_default());
                 doc.joined = true;
                 doc.dirty = true;
-                doc.urgent = true;
                 self.events.push(DocEvent::Joined(id));
                 // Followed from the start: the server sends this import back, then what others add.
                 doc.resubscribe(id)
@@ -2362,6 +2492,7 @@ fn save<S: DocStore>(store: &mut S, space: SpaceId, id: DocId, doc: &mut Doc) ->
     }
     doc.dirty = false;
     doc.urgent = false;
+    doc.on_disk = true;
     Ok(())
 }
 

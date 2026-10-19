@@ -5,7 +5,9 @@
 //! ([`account`]), guards the folder with a root marker ([`root`]) and runs it from the command line ([`cli`]): one
 //! pass at a time (`sync`), or on its own (`run`: [`daemon`], scheduled by [`schedule`], woken by [`watch`], with
 //! the stability window kept by [`settle`]). [`autostart`] registers it to start at login; the background build
-//! (`craft-cloud-agent-bg`, no console on Windows) logs to [`runlog`].
+//! (`craft-cloud-agent-bg`, no console on Windows) logs to [`runlog`]. While signed in, the live hub ([`live`]) keeps
+//! the account's live documents (apps' recents, and files opened live) in step with the server, and serves them to
+//! apps through the local API ([`local_api`]); [`doc`] is a plain-text client of it, as a test tool.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod account;

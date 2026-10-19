@@ -277,6 +277,11 @@ impl LocalApi {
             let stop = async move {
                 let _ = shutting_down.await;
             };
+            // No Nagle delay: a live document's update to an app goes out at once.
+            use axum::serve::ListenerExt;
+            let listener = listener.tap_io(|tcp| {
+                let _ = tcp.set_nodelay(true);
+            });
             if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(stop).await {
                 crate::runlog::note(format_args!("the local API stopped: {e}"));
             }

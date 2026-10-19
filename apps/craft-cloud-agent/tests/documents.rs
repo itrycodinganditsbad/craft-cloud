@@ -306,6 +306,48 @@ fn a_snapshot_another_machine_cant_read_is_skipped_for_the_whole_log() {
     });
 }
 
+/// Review: a snapshot that reads but lacks some of what the rows below its base held (a device made it wrong): a machine
+/// catching up from it finds updates waiting for that history, and reads the import and the whole log instead.
+#[test]
+fn a_snapshot_that_lacks_updates_is_caught_by_the_whole_log() {
+    rt().block_on(async {
+        let mut w = World::new(Limits { compact_updates: 3, ..Limits::default() }).await;
+        let a = w.machine().await;
+        w.connect(a);
+        w.settle().await;
+        let node = w.file().await;
+        let doc = joined(&mut w, a, node, "import").await;
+        let app = w.app_of(a, doc, 1501);
+        let token = [98u8; 32];
+        w.meta.create_device(w.user, "rogue", &token, 0).await.unwrap();
+        let auth = w.meta.device_by_token(&token).await.unwrap().unwrap();
+        let mut rogue = craft_cloud_server::live::Session::new(w.state.clone(), &auth);
+        rogue.handle(ClientFrame::Hello { min: 1, max: 2 }).await;
+        rogue.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
+        while rogue.has_work() {
+            rogue.pump().await.unwrap();
+        }
+        let mut asked = None;
+        for i in 1..=5u64 {
+            let u = app.append(&format!(" r{i}"));
+            let reply = rogue.handle(ClientFrame::Update { doc, client_seq: i, bytes: u }).await;
+            asked = asked.or(reply.frames.iter().find_map(|f| if let ServerFrame::Compact { upto, .. } = f { Some(*upto) } else { None }));
+        }
+        let upto = asked.expect("the rogue was asked");
+        // A snapshot of the import only: it reads, but holds none of the updates up to `upto`.
+        let wrong = App::new(1).with_text("import").snapshot();
+        rogue.handle(ClientFrame::Snapshot { doc, upto, bytes: wrong }).await;
+        let more = app.append(" after");
+        rogue.handle(ClientFrame::Update { doc, client_seq: 6, bytes: more }).await;
+        let b = w.machine().await;
+        w.connect(b);
+        w.settle().await;
+        joined(&mut w, b, node, "never asked").await;
+        assert!(w.machines[b].said.iter().any(|s| s.contains("reads the whole log")), "{:?}", w.machines[b].said);
+        assert_eq!(w.text(b, doc), "import r1 r2 r3 r4 r5 after");
+    });
+}
+
 /// A compaction answered by a device that is behind: it answers only once it holds every update up to `upto`.
 #[test]
 fn a_device_behind_answers_compaction_only_once_it_holds_the_updates() {

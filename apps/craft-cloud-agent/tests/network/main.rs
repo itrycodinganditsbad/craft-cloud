@@ -34,6 +34,7 @@
 #[path = "../../../../crates/sync/tests/common/mod.rs"]
 mod common;
 mod harness;
+mod live;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -327,6 +328,24 @@ fn a_seed_replays_exactly() {
     let second = traces_on_threads(&backwards, 60, 3);
     for seed in seeds {
         let (Some(a), Some(b)) = (first.get(&seed), second.get(&seed)) else { panic!("seed {seed} didn't run") };
+        assert!(a.len() > 8, "seed {seed}: too little happened: {a:?}");
+        assert_eq!(a, b, "seed {seed} didn't replay exactly");
+    }
+}
+
+/// Live documents over the same kind of network (`live.rs`): the documents simulation's random work, with the
+/// agents' replicas and the server's sessions talking WebSockets through partitions, held links and latency.
+#[test]
+fn live_documents_converge_over_a_flaky_network() {
+    for_each_seed(2, |seed| {
+        live::run_seed(seed);
+    });
+}
+
+#[test]
+fn a_live_seed_replays_exactly() {
+    for seed in 0..3 {
+        let (a, b) = (live::run_seed(seed), live::run_seed(seed));
         assert!(a.len() > 8, "seed {seed}: too little happened: {a:?}");
         assert_eq!(a, b, "seed {seed} didn't replay exactly");
     }

@@ -29,5 +29,11 @@ pub async fn serve(state: AppState, listener: TcpListener, shutdown: impl std::f
         shutdown.await;
         state.notifier.begin_shutdown();
     };
+    // No Nagle delay: a live update is a few dozen bytes, and must go out at once (a keystroke reaches the other
+    // machines in well under 250 ms).
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown).await
 }

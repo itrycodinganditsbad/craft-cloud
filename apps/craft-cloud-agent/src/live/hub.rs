@@ -353,7 +353,7 @@ struct State {
     replica: Replica<DiskStore>,
     lookup: NodeLookup,
     lists: BTreeMap<AppName, watch::Sender<Listing>>,
-    socket: Option<LiveSocket>,
+    socket: Option<Conn>,
     control: Control,
     said: Option<String>,
     /// When to dial again, and the backoff that grows with every connection lost (reset once welcomed).
@@ -710,7 +710,7 @@ impl State {
         }
         let Some(socket) = self.socket.as_mut() else { return true };
         for bytes in encoded {
-            if !matches!(tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Binary(bytes.into()))).await, Ok(Ok(()))) {
+            if !socket.send(Message::Binary(bytes.into())) {
                 self.drop_socket();
                 return false;
             }
@@ -831,10 +831,11 @@ async fn run(
             dialing = Some(tokio::spawn(async move { dial(&server, &token).await }));
         }
         let (up, retry_at) = (state.socket.is_some(), state.retry_at);
+        let writer_gone = state.socket.as_ref().map(|s| s.gone.clone());
         tokio::select! {
             _ = &mut stop => {
-                if let Some(mut socket) = state.socket.take() {
-                    close_within(&mut socket, CLOSE_TIMEOUT).await;
+                if let Some(socket) = state.socket.take() {
+                    socket.close().await;
                 }
                 if let Err(e) = state.replica.flush_documents() {
                     state.say(format!("the live documents couldn't be written to disk: {e}"));
@@ -848,8 +849,8 @@ async fn run(
                         if let Some(task) = dialing.take() {
                             task.abort();
                         }
-                        if let Some(mut socket) = state.socket.take() {
-                            close_within(&mut socket, CLOSE_TIMEOUT).await;
+                        if let Some(socket) = state.socket.take() {
+                            socket.close().await;
                         }
                         state.replica.disconnected();
                         // Offline before the caller hears it, so the status it reads next says so.
@@ -868,7 +869,7 @@ async fn run(
                 dialing = None;
                 match dialed {
                     Ok(Ok(socket)) => {
-                        state.socket = Some(socket);
+                        state.socket = Some(Conn::new(socket));
                         last_heard = Instant::now();
                         let hello = state.replica.connected();
                         state.send(hello).await;
@@ -880,7 +881,11 @@ async fn run(
                     Err(_) => state.back_off(None),
                 }
             }
-            message = async { match state.socket.as_mut() { Some(socket) => socket.next().await, None => std::future::pending().await } } => {
+            // The writer gave up (the server took nothing for the send timeout): the connection is gone.
+            () = async { match &writer_gone { Some(gone) => gone.notified().await, None => std::future::pending().await } } => {
+                state.drop_socket();
+            }
+            message = async { match state.socket.as_mut() { Some(socket) => socket.incoming.next().await, None => std::future::pending().await } } => {
                 last_heard = Instant::now();
                 let frame = match message {
                     Some(Ok(Message::Binary(bytes))) => ServerFrame::decode(&bytes).map_err(|e| LinkError::Retry(format!("a live frame doesn't decode: {e}"))),
@@ -897,8 +902,8 @@ async fn run(
                         state.send(frames).await;
                     }
                     Err(e) => {
-                        if let Some(mut socket) = state.socket.take() {
-                            close_within(&mut socket, CLOSE_TIMEOUT).await;
+                        if let Some(socket) = state.socket.take() {
+                            socket.close().await;
                         }
                         state.drop_socket();
                         state.back_off(None);
@@ -913,7 +918,7 @@ async fn run(
                 if last_heard.elapsed() > IDLE_TIMEOUT {
                     state.drop_socket();
                 } else if let Some(socket) = state.socket.as_mut()
-                    && !matches!(tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Ping(Vec::new().into()))).await, Ok(Ok(())))
+                    && !socket.send(Message::Ping(Vec::new().into()))
                 {
                     state.drop_socket();
                 }
@@ -940,6 +945,53 @@ async fn run(
 
 /// How long closing the live connection may take before it is simply dropped.
 pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The live connection: what comes in is read by the hub's loop, what goes out is written by a task of its own, so
+/// the hub keeps reading while a long send (many changes made offline, a push, a snapshot) waits for the server to
+/// read. (If both sides only wrote, each waiting for the other to read, the connection would stall until a send
+/// timeout ended it, again and again.) A writer that can't send within [`SEND_TIMEOUT`] ends, and with it the
+/// connection.
+struct Conn {
+    out: mpsc::UnboundedSender<Message>,
+    incoming: futures_util::stream::SplitStream<LiveSocket>,
+    writer: tokio::task::JoinHandle<()>,
+    /// Told when the writer gave up.
+    gone: Arc<tokio::sync::Notify>,
+}
+
+impl Conn {
+    fn new(socket: LiveSocket) -> Self {
+        let (mut sink, incoming) = socket.split();
+        let (out, mut queue) = mpsc::unbounded_channel::<Message>();
+        let gone = Arc::new(tokio::sync::Notify::new());
+        let tell = gone.clone();
+        let writer = tokio::spawn(async move {
+            while let Some(message) = queue.recv().await {
+                if !matches!(tokio::time::timeout(SEND_TIMEOUT, sink.send(message)).await, Ok(Ok(()))) {
+                    tell.notify_one();
+                    return;
+                }
+            }
+            close_within(&mut sink, CLOSE_TIMEOUT).await;
+        });
+        Self { out, incoming, writer, gone }
+    }
+
+    /// Queues a message; false when the writer is gone (the connection with it).
+    fn send(&self, message: Message) -> bool {
+        !self.writer.is_finished() && self.out.send(message).is_ok()
+    }
+
+    /// Closes the connection: what is queued goes first, then the close, all within [`CLOSE_TIMEOUT`].
+    async fn close(self) {
+        let Self { out, incoming, mut writer, .. } = self;
+        drop(out);
+        drop(incoming);
+        if tokio::time::timeout(CLOSE_TIMEOUT, &mut writer).await.is_err() {
+            writer.abort();
+        }
+    }
+}
 
 /// Closes the live connection, waiting at most `limit`: on a half-open connection with a full send buffer (a laptop
 /// that just changed networks) the close frame may never go out, and the hub must not hang on it. The connection is

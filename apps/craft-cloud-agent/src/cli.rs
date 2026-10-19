@@ -1,5 +1,5 @@
 //! The `craft-cloud-agent` command line: `login` or `join`, `run`, `sync`, `status`, `logout`, and through the running
-//! agent `recents`, `add-computer`, `devices`, `pause`, `resume`, `quit` and `autostart`. Each command is a library
+//! agent `recents`, `doc` ([`crate::doc`]), `add-computer`, `devices`, `pause`, `resume`, `quit` and `autostart`. Each command is a library
 //! function too, so tests drive exactly what a user runs.
 //!
 //! The password is read from standard input (one line), so it never appears in the process list or shell
