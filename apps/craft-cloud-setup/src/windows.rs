@@ -20,6 +20,27 @@ fn quiet(program: &Path) -> Command {
     command
 }
 
+/// PowerShell running `script`, quietly. What the script works on goes in as environment variables, so nothing in a
+/// path is ever read as script.
+fn powershell(script: &str) -> Command {
+    let mut command = quiet(Path::new("powershell.exe"));
+    command.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]);
+    command
+}
+
+/// Starts `program` with `args` (one command line, taken as it is) in `dir`, sharing nothing with this process:
+/// Windows' shell starts it (PowerShell's `Start-Process`), so it inherits none of this process's handles. Started
+/// straight from here, the agent would keep this setup's output (a pipe, when run from WSL or a script) open, and
+/// whatever waits for the setup to end would wait for the agent.
+pub fn start_detached(program: &Path, args: &str, dir: &Path) -> Command {
+    let mut command = powershell(
+        "Start-Process -FilePath $env:CRAFT_CLOUD_PROGRAM -ArgumentList $env:CRAFT_CLOUD_ARGS \
+         -WorkingDirectory $env:CRAFT_CLOUD_DIR -WindowStyle Hidden",
+    );
+    command.env("CRAFT_CLOUD_PROGRAM", program).env("CRAFT_CLOUD_ARGS", args).env("CRAFT_CLOUD_DIR", dir);
+    command
+}
+
 /// `HKEY_CURRENT_USER`.
 pub struct UserRegistry;
 
@@ -129,11 +150,11 @@ impl Machine for ThisMachine {
     }
 
     fn start_agent(&self, agent_bg: &Path, data: &Path) -> Result<(), String> {
-        quiet(agent_bg)
-            .args(["run", "--log"])
-            .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
-            .spawn()
-            .map_err(|e| format!("{}: {e}", agent_bg.display()))?;
+        let dir = agent_bg.parent().ok_or_else(|| format!("{} can't be started", agent_bg.display()))?;
+        let status = start_detached(agent_bg, "run --log", dir).status().map_err(|e| format!("powershell: {e}"))?;
+        if !status.success() {
+            return Err(format!("{} wasn't started ({status})", agent_bg.display()));
+        }
         // It answers once its local API is up (as the app waits for it).
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
@@ -149,15 +170,15 @@ impl Machine for ThisMachine {
         // Windows' own shortcut writer (WScript.Shell), through PowerShell. The paths go in as environment
         // variables, so nothing in them is ever read as script.
         let dir = target.parent().ok_or_else(|| format!("{} can't be linked", target.display()))?;
-        let script = "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:CRAFT_CLOUD_LNK); \
-                      $s.TargetPath = $env:CRAFT_CLOUD_TARGET; $s.WorkingDirectory = $env:CRAFT_CLOUD_DIR; $s.Save()";
-        let status = quiet(Path::new("powershell.exe"))
-            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
-            .env("CRAFT_CLOUD_LNK", lnk)
-            .env("CRAFT_CLOUD_TARGET", target)
-            .env("CRAFT_CLOUD_DIR", dir)
-            .status()
-            .map_err(|e| format!("powershell: {e}"))?;
+        let status = powershell(
+            "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:CRAFT_CLOUD_LNK); \
+             $s.TargetPath = $env:CRAFT_CLOUD_TARGET; $s.WorkingDirectory = $env:CRAFT_CLOUD_DIR; $s.Save()",
+        )
+        .env("CRAFT_CLOUD_LNK", lnk)
+        .env("CRAFT_CLOUD_TARGET", target)
+        .env("CRAFT_CLOUD_DIR", dir)
+        .status()
+        .map_err(|e| format!("powershell: {e}"))?;
         if status.success() && lnk.exists() { Ok(()) } else { Err(format!("the shortcut wasn't written ({status})")) }
     }
 

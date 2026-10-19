@@ -432,3 +432,38 @@ fn the_start_menu_shortcut_is_a_shell_link() {
     let bytes = std::fs::read(&lnk).unwrap();
     assert_eq!(bytes[..4], [0x4c, 0, 0, 0], "a shell link starts with its header size");
 }
+
+/// Waits (up to 30 s) for `done`; whether it came.
+#[cfg(windows)]
+fn comes(done: impl Fn() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !done() {
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    true
+}
+
+/// A program the setup starts (the agent) shares none of its handles: with the setup's output a pipe (as from WSL),
+/// the pipe ends with the start, not with the program, which runs on.
+#[cfg(windows)]
+#[test]
+fn a_detached_start_keeps_none_of_the_setups_handles() {
+    let dir = tempfile::tempdir().unwrap();
+    let done = dir.path().join("done.txt");
+    let cmd = std::env::var_os("ComSpec").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+    // Ten seconds of `ping`, then a file.
+    let args = format!("/d /c ping -n 11 127.0.0.1 >nul & echo done> \"{}\"", done.display());
+    let started = std::time::Instant::now();
+    let out = crate::windows::start_detached(&cmd, &args, dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(8), "the pipe stayed open while the program ran: {:?}", started.elapsed());
+    assert!(!done.exists(), "it runs on");
+    assert!(comes(|| done.exists()), "and it was started");
+}
