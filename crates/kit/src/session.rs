@@ -140,8 +140,12 @@ pub struct Status {
     pub stalled: bool,
     /// The file was deleted (the document still works).
     pub deleted: bool,
-    /// The agent stopped following the document until it restarts.
+    /// Nothing more goes out: the agent stopped following the document until it restarts, or refused a change for
+    /// good, or the document was replaced (the error says which). The model stays editable: save it to keep the work.
     pub stopped: bool,
+    /// `document_replaced`: when the session came back, its path was another document (renamed away while the agent
+    /// was down, another file in its place). It is never merged into it; save the model as a new file.
+    pub replaced: bool,
     /// The file on disk wasn't saved by a Craft app from this document (edited outside): the app may bring it in as a
     /// local change, or keep the live content.
     pub changed_outside: bool,
@@ -256,7 +260,16 @@ struct Link {
     doc: Document,
 }
 
-type Reopened = Result<(Documents, Document), String>;
+/// Why a reopen didn't attach.
+enum Reopen {
+    /// Not now (the agent isn't there, the file isn't live now): tried again after a pause.
+    Retry(String),
+    /// The path is another document now (renamed away while the agent was down, another file in its place): never
+    /// merged into or imported over.
+    Replaced(String),
+}
+
+type Reopened = Result<(Documents, Document), Reopen>;
 
 /// One open live document.
 pub struct Session<D: LiveDocument> {
@@ -288,6 +301,8 @@ pub struct Session<D: LiveDocument> {
     /// The agent refused a change for good (it doesn't decode, it is over the cap): nothing more is sent, and the
     /// session says it is stopped; the model stays editable, and saving to the file (without a record) keeps the work.
     refused: Option<String>,
+    /// The live document this session is of (a reopen must find the same one at its path).
+    doc_id: Option<craft_cloud_api::DocId>,
     /// Undos (`true`) and redos asked for while remote changes were held: run once the gesture ends.
     deferred: Vec<bool>,
     /// A rebuild failed: the live document is ahead of the model, which takes no local change until a whole rebuild
@@ -506,6 +521,7 @@ impl<D: LiveDocument> Session<D> {
             waker: None,
             read_from: None,
             refused: None,
+            doc_id: None,
             deferred: Vec::new(),
             model_stale: false,
             resend_at: Instant::now(),
@@ -544,6 +560,7 @@ impl<D: LiveDocument> Session<D> {
 
     fn attach(&mut self, link: Link) {
         let state = link.doc.opened_state();
+        self.doc_id.get_or_insert(link.doc.id());
         self.status.connected = true;
         self.status.online = state.online;
         self.status.waiting = state.waiting;
@@ -775,7 +792,7 @@ impl<D: LiveDocument> Session<D> {
         self.status.queued = self.outbox.len();
         self.status.queued_bytes = self.outbox_bytes;
         self.status.stalled = self.outbox_bytes >= MAX_QUEUE_BYTES;
-        self.status.stopped |= self.refused.is_some();
+        self.status.stopped |= self.refused.is_some() || self.status.replaced;
         Polled { changed, status: self.status.clone() }
     }
 
@@ -829,7 +846,7 @@ impl<D: LiveDocument> Session<D> {
                     self.status.online = online;
                     self.status.waiting = waiting;
                     self.status.deleted = deleted;
-                    self.status.stopped = stopped || self.refused.is_some();
+                    self.status.stopped = stopped || self.refused.is_some() || self.status.replaced;
                 }
                 Event::Closed(why) => closed = Some(why),
             }
@@ -859,7 +876,7 @@ impl<D: LiveDocument> Session<D> {
 
     /// Opens the document again off the UI thread, with a growing pause between tries.
     fn reconnect(&mut self) {
-        if self.link.is_some() {
+        if self.link.is_some() || self.status.replaced {
             return;
         }
         if let Some(rx) = &self.reopening {
@@ -873,11 +890,18 @@ impl<D: LiveDocument> Session<D> {
                         waker();
                     }
                 }
-                Ok(Err(why)) => {
+                Ok(Err(Reopen::Retry(why))) => {
                     self.reopening = None;
                     self.status.error = Some(why);
                     self.next_try = Instant::now() + self.backoff;
                     self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+                }
+                Ok(Err(Reopen::Replaced(why))) => {
+                    // Stopped for good: the model stays, editable, for the app to save elsewhere.
+                    self.reopening = None;
+                    self.status.replaced = true;
+                    self.status.stopped = true;
+                    self.status.error = Some(format!("document_replaced: {why}; save this document as a new file"));
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => self.reopening = None,
@@ -892,14 +916,20 @@ impl<D: LiveDocument> Session<D> {
         // The document as this machine has it, in case the agent lost it (it asks for an import then).
         let snapshot = self.doc.export(loro::ExportMode::Snapshot).unwrap_or_default();
         let waker = self.waker.clone();
+        let expected = self.doc_id;
         let spawned = std::thread::Builder::new().name("craft-cloud-kit-reopen".into()).spawn(move || {
             let result = (|| -> Reopened {
-                let client = agent.client().map_err(|e| e.to_string())?;
-                let docs = client.documents().map_err(|e| e.to_string())?;
-                match docs.open(&path, D::APP).map_err(|e| e.to_string())? {
-                    Opened::Live(doc) => Ok((docs, doc)),
-                    Opened::NeedsImport(importer) => importer.import(&snapshot).map(|doc| (docs, doc)).map_err(|e| e.to_string()),
-                    Opened::NotLive(reason) => Err(format!("the document can't be live now ({reason:?})")),
+                let retry = |e: craft_cloud_app::Error| Reopen::Retry(e.to_string());
+                let client = agent.client().map_err(retry)?;
+                let docs = client.documents().map_err(retry)?;
+                match docs.open(&path, D::APP).map_err(retry)? {
+                    // The same document, or none known yet (it was never attached).
+                    Opened::Live(doc) if expected.is_none_or(|id| id == doc.id()) => Ok((docs, doc)),
+                    Opened::Live(_) => Err(Reopen::Replaced(format!("{path} is another document now"))),
+                    // The path's file was never live: another file took its place. Nothing is imported over it.
+                    Opened::NeedsImport(_) if expected.is_some() => Err(Reopen::Replaced(format!("{path} is another file now"))),
+                    Opened::NeedsImport(importer) => importer.import(&snapshot).map(|doc| (docs, doc)).map_err(retry),
+                    Opened::NotLive(reason) => Err(Reopen::Retry(format!("the document can't be live now ({reason:?})"))),
                 }
             })();
             let _ = tx.send(result);

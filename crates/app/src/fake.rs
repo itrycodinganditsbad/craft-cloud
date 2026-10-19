@@ -165,6 +165,24 @@ impl Hub {
         Ok(Fake { hub: self.clone(), id, addr, token, stop })
     }
 
+    /// Another file takes `path`'s place (the old one renamed away while agents were down): with `Some(import)`, a
+    /// live document of its own (a new ID); with `None`, one that was never live. Every machine forgets its copy of
+    /// the old one there.
+    pub fn replace(&self, path: &str, import: Option<Vec<u8>>) {
+        let mut inner = lock(&self.inner);
+        match import {
+            Some(import) => {
+                inner.docs.insert(path.to_owned(), HubDoc { id: DocId::generate(), import, log: Vec::new() });
+            }
+            None => {
+                inner.docs.remove(path);
+            }
+        }
+        for m in inner.machines.values_mut() {
+            m.docs.retain(|_, d| d.path != path);
+        }
+    }
+
     /// How many updates the hub holds of the document at `path` (0 when it has none).
     pub fn updates(&self, path: &str) -> usize {
         lock(&self.inner).docs.get(path).map_or(0, |d| d.log.len())

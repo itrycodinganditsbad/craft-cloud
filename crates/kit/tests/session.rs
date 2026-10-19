@@ -360,6 +360,46 @@ fn a_model_behind_the_document_takes_no_local_change_until_rebuilt() {
     });
 }
 
+/// While the agent is down, another file takes the document's path (a live one, or one never live). Coming back,
+/// the session finds a different document there: it stops with `document_replaced`, keeps its model, and neither
+/// merges into the other document nor imports itself over the other file.
+#[test]
+fn a_path_that_is_another_document_now_is_never_merged_into() {
+    for live in [true, false] {
+        let hub = Hub::new();
+        let pc = hub.machine("pc").unwrap();
+        let mut a = open::<App>(&pc, "d.txt", Notes::new("mine", &["kept"]));
+        pc.restart();
+        until(&mut [&mut a], "down", |s| s.iter().all(|s| !s.status().connected));
+        let other = open_other();
+        hub.replace("d.txt", live.then_some(other));
+        pc.start();
+        a.reconnect_now();
+        until(&mut [&mut a], "replaced", |s| s.iter().all(|s| s.status().replaced));
+        let status = a.poll().status;
+        assert!(status.stopped && !status.connected);
+        assert!(status.error.unwrap_or_default().contains("document_replaced"));
+        assert_eq!(*a.model().title, "mine", "the model is kept");
+        change(&mut a, |m| m.with_title("still editable")).unwrap();
+        // The other file's document has nothing of this one.
+        assert_eq!(hub.updates("d.txt"), 0, "live {live}: nothing was sent into it");
+        let mut b = open::<App>(&pc, "d.txt", Notes::default());
+        assert_eq!(*b.model().title, if live { "other" } else { "" }, "live {live}");
+        b.poll();
+    }
+}
+
+/// A snapshot of another document (title "other").
+fn open_other() -> Vec<u8> {
+    let mut r = craft_cloud_kit::raw::Replica::default();
+    let mut schema = std::collections::HashMap::new();
+    schema.insert("app".to_owned(), loro::LoroValue::from("notes"));
+    schema.insert("version".to_owned(), loro::LoroValue::from(1i64));
+    r.doc.get_map("root").insert("schema", loro::LoroValue::from(schema)).unwrap();
+    r.write::<App>(None, &Notes::new("other", &[])).unwrap();
+    r.doc.export(loro::ExportMode::Snapshot).unwrap()
+}
+
 /// A session opened off the UI thread can be handed to it.
 #[test]
 fn a_session_can_move_to_another_thread() {
