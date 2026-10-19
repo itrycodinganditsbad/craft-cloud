@@ -315,6 +315,12 @@ fn a_running_agents_file_is_read_and_it_is_asked_to_quit() {
     assert!(!lists_agent(tasklist, 424));
     assert!(!lists_agent("\"notepad.exe\",\"4242\",\"Console\",\"1\",\"9,000 K\"", 4242), "a reused pid is another program");
     assert!(!lists_agent("INFO: No tasks are running which match the specified criteria.", 4242));
+    // Only an answer counts: a tasklist that can't run, fails or says nothing isn't an agent that has ended.
+    assert_eq!(tasklist_says(Ok((true, tasklist.into())), 4242), Ok(true));
+    assert_eq!(tasklist_says(Ok((true, "INFO: No tasks are running which match the specified criteria.\r\n".into())), 4242), Ok(false));
+    assert!(tasklist_says(Err("not found".into()), 4242).is_err());
+    assert!(tasklist_says(Ok((false, String::new())), 4242).is_err());
+    assert!(tasklist_says(Ok((true, " \r\n".into())), 4242).is_err());
 
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

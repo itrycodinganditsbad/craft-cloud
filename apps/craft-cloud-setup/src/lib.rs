@@ -399,6 +399,18 @@ pub fn lists_agent(csv: &str, pid: u32) -> bool {
     })
 }
 
+/// What a `tasklist /FI "PID eq <pid>" /FO CSV /NH` run says about the agent `pid`: whether it runs, or why that
+/// can't be told. Only an answer counts: `tasklist` that couldn't run, failed or said nothing (it always prints a
+/// row or a note that nothing matched) is never taken for an agent that has ended.
+pub fn tasklist_says(ran: Result<(bool, String), String>, pid: u32) -> Result<bool, String> {
+    match ran {
+        Err(e) => Err(format!("tasklist can't run: {e}")),
+        Ok((false, _)) => Err("tasklist failed".into()),
+        Ok((true, out)) if out.trim().is_empty() => Err("tasklist answered nothing".into()),
+        Ok((true, out)) => Ok(lists_agent(&out, pid)),
+    }
+}
+
 /// Asks the agent at `file`'s port to quit (`POST /v1/quit` on its local API, as an app does). Whether it said yes.
 pub fn ask_to_quit(file: &AgentFile) -> Result<(), String> {
     use std::io::{Read, Write};

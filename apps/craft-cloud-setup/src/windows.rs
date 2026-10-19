@@ -62,48 +62,60 @@ impl Registry for UserRegistry {
 pub struct ThisMachine;
 
 /// Whether the process `pid` runs and is an agent (`craft-cloud-agent*.exe`): a pid of an agent that has ended may
-/// already belong to another program, which is never touched.
-fn agent_alive(pid: u32) -> bool {
-    let Ok(out) = quiet(Path::new("tasklist")).args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]).stdout(Stdio::piped()).output() else {
-        return false;
-    };
-    crate::lists_agent(&String::from_utf8_lossy(&out.stdout), pid)
+/// already belong to another program, which is never touched. An error when `tasklist` can't tell.
+fn agent_alive(pid: u32) -> Result<bool, String> {
+    let ran = quiet(Path::new("tasklist"))
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .stdout(Stdio::piped())
+        .output()
+        .map(|out| (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned()))
+        .map_err(|e| e.to_string());
+    crate::tasklist_says(ran, pid)
 }
 
-/// Waits up to `within` for the agent `pid` to end.
-fn ended(pid: u32, within: Duration) -> bool {
+/// Waits up to `within` for the agent `pid` to end; an error as soon as `tasklist` can't tell.
+fn ended(pid: u32, within: Duration) -> Result<bool, String> {
     let deadline = std::time::Instant::now() + within;
     loop {
-        if !agent_alive(pid) {
-            return true;
+        if !agent_alive(pid)? {
+            return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
-            return false;
+            return Ok(false);
         }
         std::thread::sleep(Duration::from_millis(500));
     }
 }
 
-/// The agent running for the data folder `data`, as its `local-api.json` names it.
-fn running_agent(data: &Path) -> Option<crate::AgentFile> {
-    let text = std::fs::read_to_string(data.join("local-api.json")).ok()?;
-    crate::agent_file(&text).filter(|file| agent_alive(file.pid))
+/// The agent running for the data folder `data`, as its `local-api.json` names it; an error when whether it runs
+/// can't be told.
+fn running_agent(data: &Path) -> Result<Option<crate::AgentFile>, String> {
+    let Ok(text) = std::fs::read_to_string(data.join("local-api.json")) else { return Ok(None) };
+    let Some(file) = crate::agent_file(&text) else { return Ok(None) };
+    Ok(agent_alive(file.pid)?.then_some(file))
 }
 
 impl Machine for ThisMachine {
     fn stop_agent(&self, data: &Path) -> AgentStop {
-        let Some(agent) = running_agent(data) else { return AgentStop::NotRunning };
+        let unknown = |e: String| AgentStop::StillRunning(format!("whether it runs can't be told: {e}"));
+        let agent = match running_agent(data) {
+            Ok(Some(agent)) => agent,
+            Ok(None) => return AgentStop::NotRunning,
+            Err(e) => return unknown(e),
+        };
         // Asked first: it finishes the pass under way, for up to a minute.
         let _ = crate::ask_to_quit(&agent);
-        if ended(agent.pid, Duration::from_secs(60)) {
-            return AgentStop::Stopped;
+        match ended(agent.pid, Duration::from_secs(60)) {
+            Ok(true) => return AgentStop::Stopped,
+            Ok(false) => {}
+            Err(e) => return unknown(e),
         }
         // Then ended: the agent's writes are atomic, so a stop at any point is safe (as after a crash).
         let _ = quiet(Path::new("taskkill")).args(["/PID", &agent.pid.to_string(), "/F"]).status();
-        if ended(agent.pid, Duration::from_secs(10)) {
-            AgentStop::Stopped
-        } else {
-            AgentStop::StillRunning(format!("process {} doesn't end", agent.pid))
+        match ended(agent.pid, Duration::from_secs(10)) {
+            Ok(true) => AgentStop::Stopped,
+            Ok(false) => AgentStop::StillRunning(format!("process {} doesn't end", agent.pid)),
+            Err(e) => unknown(e),
         }
     }
 
@@ -125,7 +137,7 @@ impl Machine for ThisMachine {
         // It answers once its local API is up (as the app waits for it).
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            if running_agent(data).is_some() {
+            if matches!(running_agent(data), Ok(Some(_))) {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(200));
