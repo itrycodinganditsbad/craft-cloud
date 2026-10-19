@@ -10,6 +10,9 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIc
 
 use super::{Clicks, Item, Tray, TrayState};
 
+/// Whether a left click on the icon opens the window: on Windows; on macOS it shows the menu instead.
+pub const LEFT_CLICK_OPENS: bool = cfg!(not(target_os = "macos"));
+
 pub struct NativeTray {
     icon: TrayIcon,
     pause: MenuItem,
@@ -49,8 +52,11 @@ pub fn start(clicks: Clicks) -> Result<NativeTray, String> {
             }
         }));
     }
+    // On macOS a click shows the menu (as menu-bar items do), and only that.
     TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
-        if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
+        if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e
+            && LEFT_CLICK_OPENS
+        {
             clicks.send(Item::Open.event(false));
         }
     }));
@@ -68,5 +74,14 @@ impl Tray for NativeTray {
         }
         self.paused.store(paused, Ordering::SeqCst);
         self.pause.set_text(Item::Pause.label(paused));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// macOS shows the menu on a click (with_menu_on_left_click), so the click must not also open the window.
+    #[test]
+    fn a_left_click_opens_the_window_only_off_macos() {
+        assert_eq!(super::LEFT_CLICK_OPENS, !cfg!(target_os = "macos"));
     }
 }
