@@ -513,6 +513,18 @@ async fn check(sim: &mut Sim, seed: u64) {
     for token in &sim.taken {
         assert!(text.contains(token.as_str()) || keys.contains(token), "seed {seed}: the edit {token} was taken and is lost");
     }
+    // A machine that never had it joins now, from the server's last snapshot and the rows above it: the same
+    // document (a snapshot that left out a row below its base would show here).
+    let fresh = sim.w.machine().await;
+    sim.w.connect(fresh);
+    sim.w.settle().await;
+    let (_, opening) = sim.w.open(fresh, sim.node);
+    assert_eq!(opening, Opening::Joining, "seed {seed}");
+    sim.w.settle().await;
+    let joined = sim.w.events(fresh);
+    assert!(joined.contains(&DocEvent::Joined(doc)), "seed {seed}: the fresh machine didn't join: {joined:?}");
+    let late = sim.w.app_of(fresh, doc, 1).doc.get_deep_value();
+    assert_eq!(late, first, "seed {seed}: a machine joining at the end holds another document; the server: {}", sim.server_version(doc).await);
 }
 
 fn for_each_seed(default_seeds: u64, run: impl Fn(u64) + Sync) {

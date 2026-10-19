@@ -159,6 +159,21 @@ struct DocFile {
     push_wait: Option<u32>,
 }
 
+/// What a recents file holds beyond [`DocFile`], written after it (an older agent reads the file and ignores what
+/// follows; a file an older agent wrote has nothing after it).
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct DocFileMore {
+    /// [`Doc::dropped`].
+    dropped: Option<u64>,
+}
+
+/// A recents file: [`DocFile`], and [`DocFileMore`] when it has it.
+fn read_doc_file(bytes: &[u8]) -> postcard::Result<(DocFile, DocFileMore)> {
+    let (file, rest) = postcard::take_from_bytes::<DocFile>(bytes)?;
+    let more = if rest.is_empty() { DocFileMore::default() } else { postcard::from_bytes(rest).unwrap_or_default() };
+    Ok((file, more))
+}
+
 /// A document of a file's file (`<id>.doc`, beside its journal): what a recents file holds, and its node. A file of its
 /// own kind, so an older agent (which reads only recents files) leaves it alone.
 #[derive(Debug, Serialize, Deserialize)]
@@ -179,6 +194,8 @@ struct DocumentFile {
     push_wait: Option<u32>,
     /// Follow it with `subscribe_log` (the server's snapshot didn't read here).
     log_only: bool,
+    /// [`Doc::dropped`].
+    dropped: Option<u64>,
 }
 
 /// What a file of either kind holds, as [`Doc::from_parts`] reads it.
@@ -194,6 +211,7 @@ struct Parts {
     pushing: Option<Spans>,
     own_peers: Vec<u64>,
     push_wait: Option<u32>,
+    dropped: Option<u64>,
 }
 
 /// One record of a document's journal: a local update, on disk before the app is told it is kept.
@@ -445,13 +463,21 @@ struct Doc {
     sub: Sub,
     /// Unacked updates sent on this connection (by client_seq).
     sent: BTreeSet<u64>,
-    /// Own updates sent on this connection that a row of the log brought back before their ack (the same bytes, sent
-    /// again after a reconnect): the ack still comes, with the number of a second row that holds the same bytes and is
-    /// never sent to this machine, so it counts as had when it comes (by client_seq: the update's bytes).
+    /// The operations the server is known to hold up to `have`: every row taken (and own row acked) and the snapshot
+    /// a catch-up started with, since the document was loaded or its log learnt afresh. An unacked update all of whose
+    /// operations are in it is stored ([`Doc::settle_pending`]), whatever its ack does.
+    seen: Spans,
+    /// Own updates sent on this connection that the log turned out to hold before their ack (a row or the server's
+    /// snapshot brought their operations back): the ack still comes, numbering a row that holds them and is never sent
+    /// to this machine, so it counts as had when it comes (by client_seq: the update's bytes).
     taken_back: BTreeMap<u64, Vec<u8>>,
-    /// Such an update's ack above what is had (rows below it on their way): by the row's number, its bytes, counted
-    /// when the rows below it are here (as [`Pending::acked`]; this connection only, a catch-up sends the row).
+    /// Acks of own rows above what is had (rows below them on their way), whose updates left the unacked list: by the
+    /// row's number, its bytes, counted when the rows below it are here (as [`Pending::acked`]; this connection only,
+    /// a catch-up sends the rows themselves).
     back_acked: BTreeMap<u64, Vec<u8>>,
+    /// The lowest row of the log this machine dropped (Loro failed on it, or it can never apply): its copy lacks it,
+    /// so it never answers a `compact` at or above it (another device does). Kept in its file.
+    dropped: Option<u64>,
     /// `too_large` refusals since the last ack.
     strikes: u32,
     /// A refused create or subscribe: ticks until it is tried again, and the pause it had.
@@ -534,8 +560,10 @@ impl Doc {
             broken: false,
             sub: Sub::No,
             sent: BTreeSet::new(),
+            seen: Spans::new(),
             taken_back: BTreeMap::new(),
             back_acked: BTreeMap::new(),
+            dropped: None,
             strikes: 0,
             retry: None,
             create_refused: false,
@@ -575,44 +603,76 @@ impl Doc {
         }
     }
 
-    /// What the server's log holds of the document up to `have`, worked out from the copy: everything in it but its
-    /// own unsent updates, when those are each peer's last operations and nothing else is out of the log (nothing waits,
-    /// no push is under way). Unknown otherwise.
+    /// What the server's log holds of the document up to `have`, worked out from the copy: everything in it, when
+    /// nothing in it may be out of the log (no unacked update: one may or may not be stored, and its ack doesn't say
+    /// which; nothing waits; no push under way; no row dropped). Unknown otherwise, until those are gone.
     fn derive_log(&mut self) {
         self.log = LogVersion::unknown();
-        if !self.waiting.is_empty() || self.pushing.is_some() {
+        if !self.waiting.is_empty() || self.pushing.is_some() || !self.pending.is_empty() || self.dropped.is_some() {
             return;
         }
         let Ok(mut version) = self.body.copy().version() else { return };
-        let mut unsent = Spans::new();
-        for pending in &self.pending {
-            match spans_of(&pending.bytes) {
-                Some(ranges) => add_spans(&mut unsent, &ranges),
-                None => return,
-            }
-        }
-        for (peer, list) in unsent {
-            match (list.as_slice(), version.get(&peer).copied()) {
-                ([(start, end)], Some(reach)) if *end == reach => {
-                    version.insert(peer, *start);
-                }
-                _ => return,
-            }
-        }
         version.retain(|_, end| *end > 0);
         self.log = LogVersion::anchored(self.have.upto, version);
     }
 
+    /// Unacked updates whose operations the server is known to hold ([`Doc::seen`]) are stored: they leave the list
+    /// (and so count in a compaction, being in the log). An ack that came for one already is kept until the rows
+    /// below it are here; one still on its way is counted when it comes ([`Doc::taken_back`]).
+    fn settle_pending(&mut self) {
+        if self.seen.is_empty() || self.pending.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while let Some(p) = self.pending.get(i) {
+            let held = spans_of(&p.bytes).is_some_and(|ranges| !ranges.is_empty() && held_by(&self.seen, &ranges));
+            if !held {
+                i += 1;
+                continue;
+            }
+            let own = self.pending.remove(i);
+            let sent = self.sent.remove(&own.client_seq);
+            match own.acked {
+                Some(n) if n > self.have.upto => {
+                    self.back_acked.insert(n, own.bytes);
+                }
+                Some(_) => {}
+                None if sent => {
+                    self.taken_back.insert(own.client_seq, own.bytes);
+                }
+                None => {}
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// The server holds `ranges` (up to `have`).
+    fn saw(&mut self, ranges: &[(u64, i32, i32)]) {
+        add_spans(&mut self.seen, ranges);
+    }
+
+    /// The log is learnt afresh (from the start, or a snapshot that replaces what was known): nothing seen yet, nothing
+    /// dropped.
+    fn forget_seen(&mut self) {
+        self.seen = Spans::new();
+        self.dropped = None;
+    }
+
     /// The answer to the server's `compact`, once this machine holds every update up to `upto`: a snapshot of exactly
-    /// those, or nothing (something waits, a push is under way, or the version there isn't known; another device is
-    /// asked). The question is dropped either way once it can be answered.
+    /// those, or nothing (something waits, it dropped a row at or below `upto`, or the version there isn't known;
+    /// another device is asked). The question is dropped either way once it can be answered.
     fn try_compact(&mut self) -> Vec<ClientFrame> {
         let Some(upto) = self.compact_ask else { return Vec::new() };
         if self.sub != Sub::Live || self.have.upto < upto {
             return Vec::new();
         }
         self.compact_ask = None;
-        if !self.waiting.is_empty() || self.pushing.is_some() || self.stuck || !self.joined || self.is_broken() {
+        // (A push under way doesn't stop it: the log was learnt from the start then, and is noted from there.)
+        if !self.waiting.is_empty() || self.stuck || !self.joined || self.is_broken() {
+            return Vec::new();
+        }
+        // A row it dropped is below: its copy lacks that row, and a snapshot from it would too.
+        if self.dropped.is_some_and(|d| d <= upto) {
             return Vec::new();
         }
         if !self.log.is_known() && upto == self.have.upto {
@@ -638,8 +698,9 @@ impl Doc {
     /// the snapshot without it): a waiting one is dropped (the server has it, and a catch-up from the start brings it
     /// if it is ever needed), an unacked one stays unacked (it is sent, and its operations come back with the log).
     /// An error only when the snapshot itself doesn't read.
-    fn from_file(file: DocFile, peer: u64, notes: &mut Vec<String>) -> Result<Self, UpdateError> {
+    fn from_file(file: DocFile, more: DocFileMore, peer: u64, notes: &mut Vec<String>) -> Result<Self, UpdateError> {
         let parts = Parts {
+            dropped: more.dropped,
             id: file.doc,
             kind: Kind::Recents(file.app),
             have: file.have,
@@ -700,6 +761,7 @@ impl Doc {
             }
         }
         doc.push_wait = file.push_wait;
+        doc.dropped = file.dropped;
         doc.on_disk = true;
         doc.derive_log();
         Ok(doc)
@@ -733,6 +795,8 @@ impl Doc {
         }
         if self.skip == Some((seq, hash)) {
             self.skip = None;
+            self.drop_row(seq);
+            self.log.note(seq, Vec::new());
             self.advance(seq, hash);
             return Taken::Had;
         }
@@ -778,29 +842,36 @@ impl Doc {
             Err(e) => {
                 in_log = false;
                 let line = self.told(
-                    |app| format!("a recents update for {app} from the server can never apply and was skipped: {e}"),
-                    |id| format!("an update of the live document {id} from the server can never apply and was skipped: {e}"),
+                    |app| format!(
+                        "a recents update for {app} from the server can never apply and was skipped: {e}; this machine leaves compacting them to other devices"
+                    ),
+                    |id| format!(
+                        "an update of the live document {id} from the server can never apply and was skipped: {e}; this machine leaves compacting it to other devices"
+                    ),
                 );
                 self.say(notes, line);
+                self.drop_row(seq);
             }
         }
         self.waiting.retain(|w| !self.body.copy().covers(&w.needs));
         self.on_server(bytes);
-        // One of this machine's own unacked updates, brought back by a catch-up (its ack was lost, or forgotten with
-        // the connection): the log has it, so it is had (an ack still on its way, for the same bytes sent again, numbers
-        // a second row this machine is never sent: [`Doc::taken_back`] counts it when it comes). So the unacked updates
-        // are always ones the log doesn't hold up to what is had, which is what working out the log's version from the
-        // copy relies on ([`Doc::derive_log`]).
-        if let Some(i) = self.pending.iter().position(|p| p.bytes.len() == bytes.len() && p.bytes == bytes) {
-            let own = self.pending.remove(i);
-            if self.sent.remove(&own.client_seq) {
-                self.taken_back.insert(own.client_seq, own.bytes);
-            }
-        }
         // What the log holds, as far as this copy has it (an update that never applies isn't in it).
-        self.log.note(seq, if in_log { spans_of(bytes).unwrap_or_default() } else { Vec::new() });
+        let ranges = if in_log { spans_of(bytes).unwrap_or_default() } else { Vec::new() };
+        self.saw(&ranges);
+        self.log.note(seq, ranges);
+        // This machine's own unacked updates the log turns out to hold (its ack was lost, or forgotten with the
+        // connection, or another machine pushed the same operations) are stored.
+        self.settle_pending();
         self.advance(seq, hash);
         Taken::Had
+    }
+
+    /// Row `seq` isn't in this copy (Loro failed on it, or it can never apply; the note that says so says this too):
+    /// this machine leaves compacting the log past it to other devices.
+    fn drop_row(&mut self, seq: u64) {
+        self.dropped = Some(self.dropped.map_or(seq, |d| d.min(seq)));
+        self.dirty = true;
+        self.urgent = true;
     }
 
     /// After the copy's first history (perhaps a snapshot) Loro dropped what waited: it goes in again. `Err` with the
@@ -852,7 +923,9 @@ impl Doc {
                 break;
             };
             self.have = Have { upto: next, upto_hash: Some(update_hash(&bytes)) };
-            self.log.note(next, spans_of(&bytes).unwrap_or_default());
+            let ranges = spans_of(&bytes).unwrap_or_default();
+            self.saw(&ranges);
+            self.log.note(next, ranges);
         }
         // Own updates the catch-up brought back count as had too.
         let upto = self.have.upto;
@@ -982,6 +1055,7 @@ impl Doc {
         self.forget_acks();
         // The log is learnt again from the start.
         self.log = LogVersion::anchored(0, Version::new());
+        self.forget_seen();
         self.batch.clear();
         self.batched = 0;
         self.compact_ask = None;
@@ -1035,10 +1109,19 @@ impl Doc {
         }
         self.waiting.retain(|w| !self.body.copy().covers(&w.needs));
         self.on_server(bytes);
+        let version = version_of(bytes).unwrap_or_default();
         if base >= self.have.upto {
             self.have = Have { upto: base, upto_hash: if base == self.have.upto { self.have.upto_hash } else { None } };
-            self.log = LogVersion::anchored(base, version_of(bytes).unwrap_or_default());
+            self.log = LogVersion::anchored(base, version.clone());
+            // The rows it holds are in the copy now (Loro merged them), one this machine dropped too.
+            if self.dropped.is_some_and(|d| d <= base) {
+                self.dropped = None;
+            }
         }
+        // What the server holds up to its base: this machine's unacked updates in it are stored.
+        let ranges: Vec<(u64, i32, i32)> = version.iter().map(|(peer, end)| (*peer, 0, *end)).collect();
+        self.saw(&ranges);
+        self.settle_pending();
         self.from_snapshot = true;
         self.dirty = true;
         Ok(())
@@ -1060,6 +1143,7 @@ impl Doc {
         self.log_only = true;
         self.have = Have::default();
         self.log = LogVersion::anchored(0, Version::new());
+        self.forget_seen();
         self.compact_ask = None;
         self.dirty = true;
         self.urgent = true;
@@ -1146,12 +1230,12 @@ impl<S: DocStore> Replica<S> {
         let mut notes = Vec::new();
         let mut docs = BTreeMap::new();
         for (name, bytes) in files {
-            if let Some((id, doc)) = load_doc(&mut store, space, &name, &bytes, peers(), &mut notes) {
+            if let Some((id, doc)) = load_doc(&mut store, space, &name, &bytes, peers(), None, &mut notes) {
                 docs.insert(id, doc);
             }
         }
         for (name, bytes) in store.load_documents()? {
-            if let Some((id, mut doc)) = load_document(&mut store, space, &name, &bytes, peers(), &mut notes) {
+            if let Some((id, mut doc)) = load_document(&mut store, space, &name, &bytes, peers(), None, &mut notes) {
                 // Followed again when an app opens it, or now if it has something to send.
                 doc.parked = doc.pending.is_empty() && doc.pushing.is_none();
                 docs.insert(id, doc);
@@ -1257,26 +1341,10 @@ impl<S: DocStore> Replica<S> {
         let peer = (self.peers)();
         let document = self.store.load_document(&name).ok().flatten();
         let reloaded = match document {
-            Some(bytes) => {
-                let bytes = match (drop, postcard::from_bytes::<DocumentFile>(&bytes)) {
-                    (Some(hash), Ok(mut file)) => {
-                        file.waiting.retain(|w| w.hash != hash);
-                        postcard::to_stdvec(&file).unwrap_or(bytes)
-                    }
-                    _ => bytes,
-                };
-                load_document(&mut self.store, self.space, &name, &bytes, peer, &mut self.notes)
-            }
+            Some(bytes) => load_document(&mut self.store, self.space, &name, &bytes, peer, drop, &mut self.notes),
             None => {
                 let stored = self.store.load().ok().and_then(|files| files.get(&name).cloned());
-                let stored = stored.map(|bytes| match (drop, postcard::from_bytes::<DocFile>(&bytes)) {
-                    (Some(hash), Ok(mut file)) => {
-                        file.waiting.retain(|w| w.hash != hash);
-                        postcard::to_stdvec(&file).unwrap_or(bytes)
-                    }
-                    _ => bytes,
-                });
-                stored.and_then(|bytes| load_doc(&mut self.store, self.space, &name, &bytes, peer, &mut self.notes))
+                stored.and_then(|bytes| load_doc(&mut self.store, self.space, &name, &bytes, peer, drop, &mut self.notes))
             }
         };
         match reloaded {
@@ -1298,8 +1366,8 @@ impl<S: DocStore> Replica<S> {
         let Some(doc) = doc_again(&mut self.docs, self.space, &mut self.peers, id, &kind) else { return Vec::new() };
         doc.skip = Some((seq, hash));
         let line = doc.told(
-            |app| format!("a recents update for {app} from the server made Loro fail; it was skipped"),
-            |id| format!("an update of the live document {id} from the server made Loro fail; it was skipped"),
+            |app| format!("a recents update for {app} from the server made Loro fail; it was skipped, and this machine leaves compacting them to other devices"),
+            |id| format!("an update of the live document {id} from the server made Loro fail; it was skipped, and this machine leaves compacting it to other devices"),
         );
         let frames = if up { subscribe(id, doc, epoch) } else { Vec::new() };
         doc.say(&mut self.notes, line);
@@ -1961,52 +2029,49 @@ impl<S: DocStore> Replica<S> {
 
     /// `ack {doc, client_seq, seq}`: one of this machine's updates is in the log.
     fn on_ack(&mut self, id: DocId, client_seq: u64, seq: u64) -> Vec<ClientFrame> {
-        {
-            {
-                let Some(doc) = self.docs.get_mut(&id) else { return Vec::new() };
-                let i = match doc.pending.iter().position(|p| p.client_seq == client_seq) {
-                    Some(i) => i,
-                    // Brought back by a row before its ack: the acked row holds the same bytes, which the copy has, so
-                    // it counts as had like any ack (or waits for the rows below it, as any ack does).
-                    None => {
-                        if let Some(bytes) = doc.taken_back.remove(&client_seq) {
-                            if seq == doc.have.upto.saturating_add(1) {
-                                doc.log.note(seq, spans_of(&bytes).unwrap_or_default());
-                                doc.advance(seq, update_hash(&bytes));
-                            } else if seq > doc.have.upto {
-                                doc.back_acked.insert(seq, bytes);
-                            }
-                            return doc.try_compact();
-                        }
-                        return Vec::new();
-                    }
-                };
-                doc.strikes = 0;
-                doc.full_pause = 0;
-                doc.dirty = true;
-                let push = doc.pending.get(i).is_some_and(|p| p.push);
-                if let Some(bytes) = doc.pending.get(i).map(|p| p.bytes.clone()) {
-                    doc.on_server(&bytes);
-                }
-                if seq <= doc.have.upto {
-                    doc.pending.remove(i);
-                    doc.sent.remove(&client_seq);
-                } else if seq == doc.have.upto.saturating_add(1) {
-                    let own = doc.pending.remove(i);
-                    doc.sent.remove(&client_seq);
-                    doc.log.note(seq, spans_of(&own.bytes).unwrap_or_default());
-                    doc.advance(seq, update_hash(&own.bytes));
-                } else if let Some(pending) = doc.pending.get_mut(i) {
-                    // Others' updates below it are on their way: counted once they are here. (A push part counts as
-                    // sent: the next one is computed without it.)
-                    pending.acked = Some(seq);
-                    pending.push = false;
-                }
-                let mut frames = if push { doc.push_next(id, &mut self.notes, &mut self.peers) } else { Vec::new() };
-                frames.extend(doc.try_compact());
-                frames
+        let Some(doc) = self.docs.get_mut(&id) else { return Vec::new() };
+        let Some(i) = doc.pending.iter().position(|p| p.client_seq == client_seq) else {
+            // Stored already as far as this machine knew (the log held its operations before the ack came): the acked
+            // row holds them, and counts as had like any ack (or waits for the rows below it, as any ack does).
+            let Some(bytes) = doc.taken_back.remove(&client_seq) else { return Vec::new() };
+            if seq == doc.have.upto.saturating_add(1) {
+                let ranges = spans_of(&bytes).unwrap_or_default();
+                doc.saw(&ranges);
+                doc.log.note(seq, ranges);
+                doc.advance(seq, update_hash(&bytes));
+            } else if seq > doc.have.upto {
+                doc.back_acked.insert(seq, bytes);
             }
+            let mut frames = if doc.pushing.is_some() { doc.push_next(id, &mut self.notes, &mut self.peers) } else { Vec::new() };
+            frames.extend(doc.try_compact());
+            return frames;
+        };
+        doc.strikes = 0;
+        doc.full_pause = 0;
+        doc.dirty = true;
+        let push = doc.pending.get(i).is_some_and(|p| p.push);
+        if let Some(bytes) = doc.pending.get(i).map(|p| p.bytes.clone()) {
+            doc.on_server(&bytes);
         }
+        if seq <= doc.have.upto {
+            doc.pending.remove(i);
+            doc.sent.remove(&client_seq);
+        } else if seq == doc.have.upto.saturating_add(1) {
+            let own = doc.pending.remove(i);
+            doc.sent.remove(&client_seq);
+            let ranges = spans_of(&own.bytes).unwrap_or_default();
+            doc.saw(&ranges);
+            doc.log.note(seq, ranges);
+            doc.advance(seq, update_hash(&own.bytes));
+        } else if let Some(pending) = doc.pending.get_mut(i) {
+            // Others' updates below it are on their way: counted once they are here. (A push part counts as
+            // sent: the next one is computed without it.)
+            pending.acked = Some(seq);
+            pending.push = false;
+        }
+        let mut frames = if push { doc.push_next(id, &mut self.notes, &mut self.peers) } else { Vec::new() };
+        frames.extend(doc.try_compact());
+        frames
     }
 
     /// The frames [`Replica::on_frame_inner`] doesn't take itself.
@@ -2136,7 +2201,10 @@ impl<S: DocStore> Replica<S> {
             Ok(body) => {
                 doc.body = body;
                 doc.own_peers = vec![peer];
-                doc.log = LogVersion::anchored(0, version_of(&snapshot).unwrap_or_default());
+                let version = version_of(&snapshot).unwrap_or_default();
+                let ranges: Vec<(u64, i32, i32)> = version.iter().map(|(peer, end)| (*peer, 0, *end)).collect();
+                doc.saw(&ranges);
+                doc.log = LogVersion::anchored(0, version);
                 doc.joined = true;
                 doc.dirty = true;
                 self.events.push(DocEvent::Joined(id));
@@ -2302,16 +2370,28 @@ impl<S: DocStore> Replica<S> {
 /// The document a file holds (`None` for a file of another space, or one that doesn't read). A file that doesn't read
 /// is never deleted: it is set aside (renamed, kept). If its unacked updates can still be read (Loro fails on the
 /// snapshot), the document starts afresh from them and catches up from the start; they are kept and sent.
-fn load_doc<S: DocStore>(store: &mut S, space: SpaceId, name: &str, bytes: &[u8], peer: u64, notes: &mut Vec<String>) -> Option<(DocId, Doc)> {
+/// `drop`: a waiting update to leave out (Loro failed on it).
+fn load_doc<S: DocStore>(
+    store: &mut S,
+    space: SpaceId,
+    name: &str,
+    bytes: &[u8],
+    peer: u64,
+    drop: Option<[u8; 32]>,
+    notes: &mut Vec<String>,
+) -> Option<(DocId, Doc)> {
     let aside = |store: &mut S| match store.set_aside(name) {
         Ok(to) => (format!("a copy set aside as {to}"), true),
         Err(e) => (format!("no copy set aside ({e})"), false),
     };
-    match postcard::from_bytes::<DocFile>(bytes) {
-        Ok(file) if file.format <= DOC_FILE_FORMAT && file.space == space && file.doc == recents_doc(space, &file.app) => {
+    match read_doc_file(bytes) {
+        Ok((mut file, more)) if file.format <= DOC_FILE_FORMAT && file.space == space && file.doc == recents_doc(space, &file.app) => {
+            if let Some(hash) = drop {
+                file.waiting.retain(|w| w.hash != hash);
+            }
             let id = file.doc;
             let (app, pending, next) = (file.app.clone(), file.pending.clone(), file.next_client_seq);
-            match Doc::from_file(file, peer, notes) {
+            match Doc::from_file(file, more, peer, notes) {
                 Ok(doc) => Some((id, doc)),
                 Err(e) => {
                     // A copy aside first (durable), then the rebuilt document over the original: a crash between them
@@ -2352,14 +2432,25 @@ fn load_doc<S: DocStore>(store: &mut S, space: SpaceId, name: &str, bytes: &[u8]
 /// The document of a file a `.doc` file holds, with the local updates its journal has beyond it (`None` for a file of
 /// another space, or one that doesn't read at all, which is set aside and removed, as a recents file is). A file whose
 /// snapshot doesn't read starts afresh from its unsent updates, which are kept and sent, and catches up from the start.
-fn load_document<S: DocStore>(store: &mut S, space: SpaceId, name: &str, bytes: &[u8], peer: u64, notes: &mut Vec<String>) -> Option<(DocId, Doc)> {
+fn load_document<S: DocStore>(
+    store: &mut S,
+    space: SpaceId,
+    name: &str,
+    bytes: &[u8],
+    peer: u64,
+    drop: Option<[u8; 32]>,
+    notes: &mut Vec<String>,
+) -> Option<(DocId, Doc)> {
     let journal = store.load_journal(name).unwrap_or_default();
     let aside = |store: &mut S| match store.set_aside_document(name) {
         Ok(to) => (format!("a copy set aside as {to}"), true),
         Err(e) => (format!("no copy set aside ({e})"), false),
     };
     match postcard::from_bytes::<DocumentFile>(bytes) {
-        Ok(file) if file.format <= DOCUMENT_FILE_FORMAT && file.space == space && file.doc == node_doc(space, file.node) => {
+        Ok(mut file) if file.format <= DOCUMENT_FILE_FORMAT && file.space == space && file.doc == node_doc(space, file.node) => {
+            if let Some(hash) = drop {
+                file.waiting.retain(|w| w.hash != hash);
+            }
             let id = file.doc;
             let kind = Kind::Document { node: file.node, app: file.app.clone() };
             let (mut pending, mut next) = (file.pending, file.next_client_seq.max(1));
@@ -2384,6 +2475,7 @@ fn load_document<S: DocStore>(store: &mut S, space: SpaceId, name: &str, bytes: 
                 pushing: file.pushing,
                 own_peers: file.own_peers,
                 push_wait: file.push_wait,
+                dropped: file.dropped,
             };
             match Doc::from_parts(parts, peer, notes) {
                 Ok(mut doc) => {
@@ -2504,7 +2596,11 @@ fn save<S: DocStore>(store: &mut S, space: SpaceId, id: DocId, doc: &mut Doc) ->
                 own_peers: doc.own_peers.clone(),
                 push_wait: doc.push_wait,
             };
-            let bytes = postcard::to_stdvec(&file).map_err(std::io::Error::other)?;
+            let mut bytes = postcard::to_stdvec(&file).map_err(std::io::Error::other)?;
+            // (Nothing more to say: the file is as an older agent writes it.)
+            if doc.dropped.is_some() {
+                bytes.extend(postcard::to_stdvec(&DocFileMore { dropped: doc.dropped }).map_err(std::io::Error::other)?);
+            }
             store.save(&id.to_string(), &bytes)?;
         }
         Kind::Document { node, app } => {
@@ -2524,6 +2620,7 @@ fn save<S: DocStore>(store: &mut S, space: SpaceId, id: DocId, doc: &mut Doc) ->
                 own_peers: doc.own_peers.clone(),
                 push_wait: doc.push_wait,
                 log_only: doc.log_only,
+                dropped: doc.dropped,
             };
             let bytes = postcard::to_stdvec(&file).map_err(std::io::Error::other)?;
             let name = id.to_string();
@@ -3392,11 +3489,199 @@ mod tests {
         doc.body.import(&mine).unwrap();
         doc.pending.push(Pending { client_seq: 1, bytes: mine, acked: None, push: false });
         doc.derive_log();
+        assert!(!doc.log.is_known(), "an unacked update may or may not be stored: unknown");
+        // Once nothing is unacked, the log holds the whole copy (its own update came back as a row, or was acked).
+        doc.pending.clear();
+        doc.derive_log();
         let version = doc.log.at(3).unwrap();
         assert_eq!(version.get(&9), Some(&3));
-        assert_eq!(version.get(&1), None, "its own unsent update isn't in the log");
+        assert_eq!(version.get(&1), Some(&2));
+        doc.dropped = Some(2);
+        doc.derive_log();
+        assert!(!doc.log.is_known(), "a row was dropped: unknown");
+        doc.dropped = None;
         doc.waiting.push(Waiting { hash: [0; 32], needs: vec![(5, 1)], bytes: vec![1] });
         doc.derive_log();
         assert!(!doc.log.is_known(), "something waits: unknown");
+    }
+
+    fn text_doc(peer: u64) -> loro::LoroDoc {
+        let d = loro::LoroDoc::new();
+        d.set_peer_id(peer).unwrap();
+        d
+    }
+
+    fn insert(d: &loro::LoroDoc, at: usize, s: &str) -> Vec<u8> {
+        let vv = d.oplog_vv();
+        d.get_text("text").insert(at, s).unwrap();
+        d.commit();
+        d.export(loro::ExportMode::updates(&vv)).unwrap()
+    }
+
+    /// An own update the server stored (its ack lost), whose operations the server's snapshot holds on the next
+    /// catch-up: it is stored (not sent again, nothing waits), and a compaction after a restart has it, though another
+    /// machine's later rows don't build on it.
+    #[test]
+    fn an_update_a_snapshot_holds_is_stored_and_in_every_compaction() {
+        let store = MemStore::default();
+        let space = SpaceId::generate();
+        let node = NodeId::generate();
+        let w2 = ServerFrame::Welcome { protocol: 2, epoch: epoch(1) };
+        // The import (peer 40), this machine's app edit P (peer 50), another machine's concurrent edits (peer 60).
+        let importer = text_doc(40);
+        insert(&importer, 0, "import");
+        let import = importer.export(loro::ExportMode::Snapshot).unwrap();
+        let mine = text_doc(50);
+        mine.import(&import).unwrap();
+        let p = insert(&mine, 6, " P");
+        let other = text_doc(60);
+        other.import(&import).unwrap();
+        let o2 = insert(&other, 0, "O1 ");
+        let o3 = insert(&other, 0, "O2 ");
+        let server = text_doc(70);
+        for u in [&import, &p, &o2, &o3] {
+            server.import(u).unwrap();
+        }
+        let s3 = server.export(loro::ExportMode::Snapshot).unwrap();
+        // Joined from the import.
+        let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+        r.connected();
+        r.on_frame(w2.clone()).unwrap();
+        let (id, opening, _) = r.open_document(node, &app());
+        assert_eq!(opening, Opening::Joining);
+        r.on_frame(ServerFrame::Snapshot { doc: id, base: 0, bytes: import.clone() }).unwrap();
+        r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
+        assert!(r.has_document(id));
+        // P: sent, stored as row 1 by the server, its ack lost with the connection.
+        let frames = r.local_update(id, &p).unwrap();
+        assert!(matches!(frames.as_slice(), [ClientFrame::Update { client_seq: 1, .. }]), "{frames:?}");
+        r.disconnected();
+        // Rows 2, 3 from the other machine; compacted to base 3. The next catch-up starts from the snapshot.
+        r.connected();
+        r.on_frame(w2.clone()).unwrap();
+        r.on_frame(ServerFrame::Snapshot { doc: id, base: 3, bytes: s3 }).unwrap();
+        r.on_frame(ServerFrame::Update { doc: id, seq: 3, bytes: o3.clone(), device: device() }).unwrap();
+        let frames = r.on_frame(ServerFrame::Subscribed { doc: id, head: 3 }).unwrap();
+        assert!(!frames.iter().any(|f| matches!(f, ClientFrame::Update { .. })), "P is stored, not sent again: {frames:?}");
+        assert_eq!(r.document_status(id), Some((true, 0)), "nothing waits");
+        // The documents are written (every 2 s, or at stop) and the agent stops.
+        r.flush_documents().unwrap();
+        drop(r);
+        let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+        r.connected();
+        let mut frames = r.on_frame(w2.clone()).unwrap();
+        // (Nothing to send: followed again once an app opens it.)
+        let (_, opening, opened) = r.open_document(node, &app());
+        assert_eq!(opening, Opening::Live);
+        frames.extend(opened);
+        assert!(frames.iter().any(|f| matches!(f, ClientFrame::Subscribe { after: 3, .. })), "{frames:?}");
+        r.on_frame(ServerFrame::Subscribed { doc: id, head: 3 }).unwrap();
+        // A stray ack of P (from the old connection): no news.
+        r.on_frame(ServerFrame::Ack { doc: id, client_seq: 1, seq: 1 }).unwrap();
+        assert_eq!(r.document_status(id), Some((true, 0)));
+        // Rows 4, 5 from a laptop that was offline since before P (its edits don't build on P).
+        let laptop = text_doc(80);
+        laptop.import(&import).unwrap();
+        let l4 = insert(&laptop, 0, "L4 ");
+        let l5 = insert(&laptop, 0, "L5 ");
+        server.import(&l4).unwrap();
+        server.import(&l5).unwrap();
+        r.on_frame(ServerFrame::Update { doc: id, seq: 4, bytes: l4, device: device() }).unwrap();
+        r.on_frame(ServerFrame::Update { doc: id, seq: 5, bytes: l5, device: device() }).unwrap();
+        // Asked to compact at 5 (base 3: the server takes it).
+        let frames = r.on_frame(ServerFrame::Compact { doc: id, upto: 5 }).unwrap();
+        let bytes = frames
+            .iter()
+            .find_map(|f| if let ClientFrame::Snapshot { upto: 5, bytes, .. } = f { Some(bytes.clone()) } else { None })
+            .expect("answered");
+        let fresh = loro::LoroDoc::new();
+        fresh.import(&bytes).unwrap();
+        let text = fresh.get_text("text").to_string();
+        let all = server.get_text("text").to_string();
+        assert_eq!(text, all, "a fresh machine from the new snapshot has every row up to 5, P too");
+    }
+
+    /// A row this machine dropped (it can never apply here) is at or below the asked number: no snapshot (its copy
+    /// lacks the row), also after a restart (the file keeps it); one past the base of the server's next snapshot is
+    /// in the copy again (`dropped` clears when a snapshot's base passes it).
+    #[test]
+    fn a_machine_that_dropped_a_row_doesnt_compact_past_it() {
+        let store = MemStore::default();
+        let space = SpaceId::generate();
+        let node = NodeId::generate();
+        let w2 = ServerFrame::Welcome { protocol: 2, epoch: epoch(1) };
+        let importer = text_doc(40);
+        insert(&importer, 0, "import");
+        let import = importer.export(loro::ExportMode::Snapshot).unwrap();
+        let other = text_doc(60);
+        other.import(&import).unwrap();
+        let o1 = insert(&other, 0, "O1 ");
+        let o3 = insert(&other, 0, "O3 ");
+        let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+        r.connected();
+        r.on_frame(w2.clone()).unwrap();
+        let (id, _, _) = r.open_document(node, &app());
+        r.on_frame(ServerFrame::Snapshot { doc: id, base: 0, bytes: import.clone() }).unwrap();
+        r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
+        r.on_frame(ServerFrame::Update { doc: id, seq: 1, bytes: o1, device: device() }).unwrap();
+        // Row 2 never applies here.
+        r.on_frame(ServerFrame::Update { doc: id, seq: 2, bytes: vec![0xff; 40], device: device() }).unwrap();
+        r.on_frame(ServerFrame::Update { doc: id, seq: 3, bytes: o3, device: device() }).unwrap();
+        assert!(r.take_notes().iter().any(|n| n.contains("leaves compacting")), "said");
+        assert!(r.on_frame(ServerFrame::Compact { doc: id, upto: 3 }).unwrap().is_empty(), "no snapshot past a dropped row");
+        r.flush_documents().unwrap();
+        drop(r);
+        let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+        r.connected();
+        r.on_frame(w2.clone()).unwrap();
+        r.open_document(node, &app());
+        r.on_frame(ServerFrame::Subscribed { doc: id, head: 3 }).unwrap();
+        assert!(r.on_frame(ServerFrame::Compact { doc: id, upto: 3 }).unwrap().is_empty(), "nor after a restart");
+    }
+
+    /// A recents file says which row was dropped after what an older agent reads; one an older agent wrote reads too.
+    #[test]
+    fn a_recents_file_keeps_its_dropped_row_where_an_older_agent_looks_past_it() {
+        let space = SpaceId::generate();
+        let store = MemStore::default();
+        let mut r = live(space, store.clone());
+        r.add(&app(), [1; 16], entry("a.docx", 1)).unwrap();
+        let id = recents_doc(space, &app());
+        r.docs.get_mut(&id).unwrap().dropped = Some(7);
+        r.docs.get_mut(&id).unwrap().dirty = true;
+        r.flush().unwrap();
+        let bytes = store.load().unwrap().get(&id.to_string()).cloned().unwrap();
+        let older = postcard::from_bytes::<DocFile>(&bytes).unwrap();
+        assert_eq!(older.app, app(), "an older agent reads the file");
+        let (_, more) = read_doc_file(&bytes).unwrap();
+        assert_eq!(more.dropped, Some(7));
+        let plain = postcard::to_stdvec(&older).unwrap();
+        assert_eq!(read_doc_file(&plain).unwrap().1.dropped, None, "a file without it");
+        let r = Replica::open(store, space, peers()).unwrap();
+        assert_eq!(r.docs.get(&id).unwrap().dropped, Some(7));
+    }
+
+    /// An own update acked at a number above what is had, then a row with the same operations (another device pushed
+    /// them too) below it: the ack is kept until the rows below it are here, so what is had reaches the acked row and
+    /// the next own ack counts.
+    #[test]
+    fn an_early_ack_is_kept_when_a_row_below_it_holds_the_same_update() {
+        let space = SpaceId::generate();
+        let doc = recents_doc(space, &app());
+        let mut r = live(space, MemStore::default());
+        let frames = r.add(&app(), [1; 16], entry("a.docx", 1)).unwrap();
+        let ClientFrame::Update { client_seq, bytes, .. } = frames[0].clone() else { panic!("{frames:?}") };
+        // Acked as row 2: row 1 is on its way.
+        r.on_frame(ServerFrame::Ack { doc, client_seq, seq: 2 }).unwrap();
+        // Row 1 holds the same bytes (stored by another device).
+        r.on_frame(ServerFrame::Update { doc, seq: 1, bytes, device: device() }).unwrap();
+        // The next own update, acked as row 3.
+        let frames = r.add(&app(), [2; 16], entry("b.docx", 2)).unwrap();
+        let ClientFrame::Update { client_seq, .. } = frames[0].clone() else { panic!("{frames:?}") };
+        r.on_frame(ServerFrame::Ack { doc, client_seq, seq: 3 }).unwrap();
+        assert_eq!(r.waiting_for(&app()), 0, "row 2 is this machine's own (never sent to it live): {}", r.describe(&app()));
+        let other = Recents::new(77);
+        let u4 = other.add([5; 16], &entry("c.docx", 4)).unwrap();
+        assert!(r.on_frame(ServerFrame::Update { doc, seq: 4, bytes: u4, device: device() }).unwrap().is_empty(), "no gap at 3");
     }
 }
