@@ -226,4 +226,104 @@ mod tests {
         assert!(synced.join("notes.txt").exists() && data.join("account.json").exists(), "the files and the sign-in stay");
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    /// An unpacked tarball in a temporary home, with an agent stand-in that answers `quit` `quits` times (it runs,
+    /// finishing a pass) and then no more, a `systemctl` stand-in, and the agent's systemd unit: lptp1's upgrade.
+    #[cfg(target_os = "linux")]
+    struct Upgrade {
+        tmp: PathBuf,
+        home: PathBuf,
+        src: PathBuf,
+        calls: PathBuf,
+        bin: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Upgrade {
+        fn new(name: &str, quits: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = std::env::temp_dir().join(format!("craft-cloud-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            let (home, src, bin) = (tmp.join("home"), tmp.join("pkg"), tmp.join("fakebin"));
+            for dir in [&home, &src, &bin] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            let calls = tmp.join("calls.txt");
+            let count = tmp.join("quits.txt");
+            let agent = format!(
+                "#!/bin/sh\necho \"$0 $*\" >> \"{calls}\"\nif [ \"$1\" = quit ]; then\n  n=$(cat \"{count}\" 2>/dev/null || echo 0)\n  \
+                 n=$((n + 1)); echo $n > \"{count}\"\n  [ $n -le {quits} ] && exit 0\n  exit 1\nfi\nexit 0\n",
+                calls = calls.display(),
+                count = count.display()
+            );
+            std::fs::write(src.join("craft-cloud-agent"), agent).unwrap();
+            std::fs::write(src.join("craft-cloud"), "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::write(src.join("craft-cloud.png"), "png").unwrap();
+            std::fs::copy(crate::root().join("packaging/linux/install.sh"), src.join("install.sh")).unwrap();
+            std::fs::write(bin.join("systemctl"), format!("#!/bin/sh\necho \"systemctl $*\" >> \"{}\"\n", calls.display())).unwrap();
+            for file in [src.join("craft-cloud-agent"), src.join("craft-cloud"), src.join("install.sh"), bin.join("systemctl")] {
+                std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let unit = home.join(".config/systemd/user/craft-cloud-agent.service");
+            std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+            std::fs::write(&unit, "[Service]\nExecStart=/home/fabio/.local/bin/craft-cloud-agent run\n").unwrap();
+            Self { tmp, home, src, calls, bin }
+        }
+
+        fn install(&self, wait: &str) -> std::process::Output {
+            Command::new("sh")
+                .arg(self.src.join("install.sh"))
+                .env_clear()
+                .env("HOME", &self.home)
+                .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
+                .env("CRAFT_CLOUD_INSTALL_WAIT", wait)
+                .output()
+                .unwrap()
+        }
+
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.calls).unwrap_or_default().lines().map(str::to_owned).collect()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Upgrade {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.tmp);
+        }
+    }
+
+    /// The agent runs (it answers `quit` twice while it finishes its pass): it is waited for, the new copy is put in
+    /// place, its start at login pointed at the new copy, and systemd starts it again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_upgrade_waits_for_the_agent_then_restarts_it_under_systemd() {
+        let up = Upgrade::new("upgrade", 2);
+        let out = up.install("60");
+        assert!(out.status.success(), "{out:?}");
+        let lib_agent = up.home.join(".local/lib/craft-cloud/craft-cloud-agent").display().to_string();
+        let src_agent = up.src.join("craft-cloud-agent").display().to_string();
+        let calls = up.calls();
+        let expected = [
+            format!("{src_agent} quit"),
+            format!("{src_agent} quit"),
+            format!("{src_agent} quit"),
+            format!("{lib_agent} autostart on"),
+            "systemctl --user restart craft-cloud-agent.service".to_owned(),
+        ];
+        assert_eq!(calls, expected, "quit until it stopped; the installed copy takes start at login over; then restarted");
+    }
+
+    /// An agent still finishing its sync when the wait runs out: nothing is installed, and systemd is asked to start
+    /// the agent again (it has accepted the quit and stops after its pass; without this nothing would restart it).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_agent_that_doesnt_stop_in_time_is_started_again_and_nothing_changes() {
+        let up = Upgrade::new("timeout", 1_000);
+        let out = up.install("2");
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("nothing was changed. Try again"), "{out:?}");
+        assert!(!up.home.join(".local/lib/craft-cloud").exists(), "nothing installed");
+        assert_eq!(up.calls().last().map(String::as_str), Some("systemctl --user start craft-cloud-agent.service"));
+    }
 }

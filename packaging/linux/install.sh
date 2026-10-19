@@ -17,14 +17,23 @@ config="${XDG_CONFIG_HOME:-$HOME/.config}"
 unit="$config/systemd/user/craft-cloud-agent.service"
 entry="$config/autostart/craft-cloud-agent.desktop"
 
-# An agent that answers is asked to quit until none does (at most a minute).
+# An agent that answers is asked to quit until none does: it finishes the sync under way first, which may take a
+# while for big files (at most CRAFT_CLOUD_INSTALL_WAIT seconds, 10 minutes by default). Nothing is changed before.
+wait_for="${CRAFT_CLOUD_INSTALL_WAIT:-600}"
 was_running=0
 tries=0
 while "$here/craft-cloud-agent" quit >/dev/null 2>&1; do
     was_running=1
     tries=$((tries + 1))
-    if [ "$tries" -ge 60 ]; then
-        echo "The Craft Cloud agent doesn't stop; try again in a minute." >&2
+    if [ "$tries" = 3 ]; then
+        echo "Waiting for the Craft Cloud agent to finish its sync…"
+    fi
+    if [ "$tries" -ge "$wait_for" ]; then
+        # It has accepted the quit and stops after its pass: started again, so this computer keeps syncing.
+        if [ -f "$unit" ] && command -v systemctl >/dev/null 2>&1; then
+            systemctl --user start craft-cloud-agent.service || true
+        fi
+        echo "The Craft Cloud agent is still finishing its sync; nothing was changed. Try again in a while." >&2
         exit 1
     fi
     sleep 1
