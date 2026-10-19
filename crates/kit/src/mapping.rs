@@ -124,6 +124,100 @@ pub trait OpaqueSource {
     fn encode(&self) -> Result<Option<Vec<u8>>, KitError>;
 }
 
+// A borrowed source is a source: `Mappings::text("story", &doc.story)`.
+impl<T: TreeSource + ?Sized> TreeSource for &T {
+    fn key(&self) -> Option<usize> {
+        (**self).key()
+    }
+    fn roots(&self) -> Vec<ElemId> {
+        (**self).roots()
+    }
+    fn children(&self, id: ElemId) -> Vec<ElemId> {
+        (**self).children(id)
+    }
+    fn subtree_key(&self, id: ElemId) -> Option<usize> {
+        (**self).subtree_key(id)
+    }
+    fn write(&self, id: ElemId, props: &mut Props<'_, '_>) -> Result<(), KitError> {
+        (**self).write(id, props)
+    }
+}
+
+impl<T: TextSource + ?Sized> TextSource for &T {
+    fn key(&self) -> Option<usize> {
+        (**self).key()
+    }
+    fn text(&self) -> &str {
+        (**self).text()
+    }
+    fn runs(&self) -> Vec<(Range<usize>, Attrs)> {
+        (**self).runs()
+    }
+    fn paragraphs(&self) -> Vec<Attrs> {
+        (**self).paragraphs()
+    }
+}
+
+impl<T: TableSource + ?Sized> TableSource for &T {
+    fn key(&self) -> Option<usize> {
+        (**self).key()
+    }
+    fn rows(&self) -> Vec<ElemId> {
+        (**self).rows()
+    }
+    fn columns(&self) -> Vec<ElemId> {
+        (**self).columns()
+    }
+    fn cell(&self, row: ElemId, column: ElemId) -> Option<Value> {
+        (**self).cell(row, column)
+    }
+    fn cells(&self) -> Vec<(ElemId, ElemId, Value)> {
+        (**self).cells()
+    }
+    fn changed_cells(&self) -> Option<Vec<(ElemId, ElemId)>> {
+        (**self).changed_cells()
+    }
+}
+
+impl<T: TimelineSource + ?Sized> TimelineSource for &T {
+    fn key(&self) -> Option<usize> {
+        (**self).key()
+    }
+    fn tracks(&self) -> Vec<ElemId> {
+        (**self).tracks()
+    }
+    fn track_key(&self, track: ElemId) -> Option<usize> {
+        (**self).track_key(track)
+    }
+    fn write_track(&self, track: ElemId, props: &mut Props<'_, '_>) -> Result<(), KitError> {
+        (**self).write_track(track, props)
+    }
+    fn items(&self, track: ElemId) -> Vec<ElemId> {
+        (**self).items(track)
+    }
+    fn span(&self, item: ElemId) -> Option<Span> {
+        (**self).span(item)
+    }
+    fn item_key(&self, item: ElemId) -> Option<usize> {
+        (**self).item_key(item)
+    }
+    fn write_item(&self, item: ElemId, props: &mut Props<'_, '_>) -> Result<(), KitError> {
+        (**self).write_item(item, props)
+    }
+    fn keyframes(&self, item: ElemId) -> Vec<(ElemId, i64, Value)> {
+        (**self).keyframes(item)
+    }
+}
+
+impl<T: OpaqueSource + ?Sized> OpaqueSource for &T {
+    fn key(&self) -> Option<usize> {
+        (**self).key()
+    }
+    fn encode(&self) -> Result<Option<Vec<u8>>, KitError> {
+        (**self).encode()
+    }
+}
+
 /// One shared part of the model.
 pub(crate) enum Part<'a> {
     Tree(Box<dyn TreeSource + 'a>),
