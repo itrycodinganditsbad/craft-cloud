@@ -87,6 +87,27 @@ fn usable_peer(peer: u64) -> u64 {
     if peer == u64::MAX { peer - 1 } else { peer }
 }
 
+/// The most bytes of updates one of Loro's batch imports takes ([`LiveCopy::import_batch`]).
+const BATCH_GROUP_BYTES: usize = 16 * 1024;
+
+/// `updates` in consecutive groups of at most `max` bytes (an update bigger than that alone).
+fn groups(updates: &[Vec<u8>], max: usize) -> Vec<&[Vec<u8>]> {
+    let mut out = Vec::new();
+    let (mut start, mut size) = (0, 0usize);
+    for (i, u) in updates.iter().enumerate() {
+        if i > start && size.saturating_add(u.len()) > max {
+            out.extend(updates.get(start..i));
+            start = i;
+            size = 0;
+        }
+        size = size.saturating_add(u.len());
+    }
+    if start < updates.len() {
+        out.extend(updates.get(start..));
+    }
+    out
+}
+
 /// One live document's copy on this machine.
 pub struct LiveCopy {
     pub(crate) doc: LoroDoc,
@@ -186,7 +207,12 @@ impl LiveCopy {
         let _ = self.guard(|doc| {
             #[cfg(test)]
             Self::failing(&updates.iter().map(Vec::as_slice).collect::<Vec<_>>());
-            doc.import_batch(updates).map_err(|e| UpdateError::Malformed(e.to_string()))
+            // In groups of at most `BATCH_GROUP_BYTES`: Loro's batch import of much text at once takes time growing
+            // with its square (a 1 MB paste in pieces: seconds), while small groups keep the batch's speed.
+            for group in groups(updates, BATCH_GROUP_BYTES) {
+                doc.import_batch(group).map_err(|e| UpdateError::Malformed(e.to_string()))?;
+            }
+            Ok(())
         });
         Ok(self.version()? != before)
     }
@@ -470,6 +496,27 @@ mod tests {
         doc.get_text("text").insert(at, s).unwrap();
         doc.commit();
         doc.export(ExportMode::updates(&before)).unwrap()
+    }
+
+    /// A batch is imported in small groups: a 2.5 MB paste in pieces (which Loro's batch import takes minutes for in
+    /// one go) comes in at once, and the groups never pass the limit but for one big update alone.
+    #[test]
+    fn a_big_paste_in_a_batch_is_imported_in_small_groups() {
+        let sizes = [10usize, 20_000, 3, 9_000, 9_000, 1];
+        let updates: Vec<Vec<u8>> = sizes.iter().map(|n| vec![0; *n]).collect();
+        let g = groups(&updates, BATCH_GROUP_BYTES);
+        assert_eq!(g.iter().map(|g| g.len()).collect::<Vec<_>>(), vec![1, 1, 2, 2]);
+        assert!(groups(&[], BATCH_GROUP_BYTES).is_empty());
+        let other = LoroDoc::new();
+        other.set_peer_id(2).unwrap();
+        let pieces: Vec<Vec<u8>> = (0..5).map(|i| text_update(&other, i * 500 * 1024, &"p".repeat(500 * 1024))).collect();
+        let copy = LiveCopy::new(1);
+        let started = std::time::Instant::now();
+        assert!(copy.import_batch(&pieces).unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        let back = LoroDoc::new();
+        back.import(&copy.snapshot().unwrap()).unwrap();
+        assert_eq!(back.get_text("text").len_utf8(), 5 * 500 * 1024, "all of it");
     }
 
     /// An update Loro refuses leaves the copy as it was (Ruling: validation without a scratch copy).

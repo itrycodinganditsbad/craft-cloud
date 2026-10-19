@@ -215,6 +215,13 @@ pub fn implode(e: &Exploded) -> RichText {
     RichText { text, runs, paragraphs: e.paras.clone() }
 }
 
+/// Whether a story's runs are canonical (in order, none empty, adjacent ones different) and its paragraphs match its
+/// breaks: cheap, by runs.
+pub fn runs_canonical(t: &RichText) -> bool {
+    let ordered = t.runs.windows(2).all(|w| w[0].0.end <= w[1].0.start && !(w[0].0.end == w[1].0.start && w[0].1 == w[1].1));
+    ordered && t.runs.iter().all(|(r, a)| !a.is_empty() && r.start < r.end) && t.paragraphs.len() == t.text.matches('\n').count() + 1
+}
+
 /// The canonical form of a story (runs merged, none empty), as the app keeps it.
 pub fn canonical(t: &RichText) -> RichText {
     implode(&explode(t))
@@ -478,9 +485,8 @@ impl LiveDocument for TestApp {
             t.keys.retain(|_, k| items.contains_key(&k.item));
             doc.timeline = Arc::new(t);
         }
-        let story = canonical(&doc.story);
-        if story != *doc.story {
-            doc.story = Arc::new(story);
+        if !runs_canonical(&doc.story) {
+            doc.story = Arc::new(canonical(&doc.story));
         }
     }
 

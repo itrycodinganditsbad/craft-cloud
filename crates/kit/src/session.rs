@@ -840,21 +840,16 @@ impl<D: LiveDocument> Session<D> {
             return Ok(false);
         }
         let batch = std::mem::take(&mut self.incoming);
+        // One by one: Loro's batch import of much text takes time growing with its square, and one at a time also
+        // means only an update Loro refuses is lost (the agent checked them all already).
         lock(&self.collector).on = true;
-        let imported = self.doc.import_batch(&batch);
+        for bytes in &batch {
+            if let Err(e) = self.doc.import(bytes) {
+                self.status.error = Some(format!("a change from another machine doesn't read: {e}"));
+            }
+        }
         let raw = std::mem::take(&mut lock(&self.collector).raw);
         lock(&self.collector).on = false;
-        if let Err(e) = imported {
-            // A batch Loro refuses: one by one, so only the culprit is lost (the agent checked them already).
-            lock(&self.collector).on = true;
-            for bytes in &batch {
-                let _ = self.doc.import(bytes);
-            }
-            lock(&self.collector).on = false;
-            self.status.error = Some(format!("a change from another machine doesn't read: {e}"));
-        }
-        let mut raw = raw;
-        raw.extend(std::mem::take(&mut lock(&self.collector).raw));
         let touched = self.classify(raw);
         let was_read_only = self.status.read_only.clone();
         if touched.kit {
