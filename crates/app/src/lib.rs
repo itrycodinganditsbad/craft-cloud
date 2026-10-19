@@ -39,11 +39,17 @@
 //! when the agent stops or signs out it says so ([`RecentsEvent::Unavailable`]) and connects again by itself, with a
 //! growing pause, to whichever agent runs next ([`RecentsEvent::Available`]).
 //!
-//! Dependencies: `craft-cloud-proto` (the local API types; serde, uuid, blake3, postcard and Unicode tables), `serde_json`,
+//! Binary content kept out of live documents goes through [`blobs`] (the agent's `/v1/blobs`).
+//!
+//! With the `fake` feature (tests only), [`fake`] is an agent in this process: its documents and blobs live in memory,
+//! shared by every fake on one [`fake::Hub`], so two app instances can be tested together with no server.
+//!
+//! Dependencies: `craft-cloud-api` (the local API types; serde, uuid and Unicode tables, no postcard), `serde_json`,
 //! `thiserror`, `httparse`, and `tungstenite` without TLS (with `http`, `sha1`, `rand`, `data-encoding`, `utf-8`). No
 //! TLS: the agent is on this machine.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod blobs;
 mod http;
 pub mod live;
 mod recents;
@@ -52,12 +58,12 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use craft_cloud_proto::api::ErrorBody;
-use craft_cloud_proto::local::{AutostartRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_MIN, LocalApiFile, LogoutRequest, paths};
+use craft_cloud_api::api::ErrorAnswer;
+use craft_cloud_api::local::{AutostartRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_MIN, LocalApiFile, LogoutRequest, paths};
 
-pub use craft_cloud_proto::DeviceId;
-pub use craft_cloud_proto::api::{DeviceInfo, PairingState, PairingStatus};
-pub use craft_cloud_proto::local::{JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RunState, Status, codes};
+pub use craft_cloud_api::DeviceId;
+pub use craft_cloud_api::api::{DeviceInfo, PairingState, PairingStatus};
+pub use craft_cloud_api::local::{JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RunState, Status, codes};
 pub use recents::{RecentsEvent, RecentsWatch};
 pub use uuid::Uuid;
 
@@ -93,7 +99,7 @@ pub struct Client {
 impl Client {
     /// Finds the running agent: its data folder from `$CRAFT_CLOUD_AGENT_DIR` or the per-user data folder.
     pub fn connect() -> Result<Self, Error> {
-        let dir = craft_cloud_proto::local::data_dir(|name| std::env::var_os(name))
+        let dir = craft_cloud_api::local::data_dir(|name| std::env::var_os(name))
             .ok_or_else(|| Error::NotRunning("no user data folder to look in".into()))?;
         Self::connect_in(&dir)
     }
@@ -140,14 +146,19 @@ impl Client {
     /// The answer if it succeeded, else the agent's refusal.
     fn answer(&self, method: &str, path: &str, body: Option<Vec<u8>>, timeout: Duration) -> Result<http::Answer, Error> {
         let answer = http::request(self.addr, &self.token, method, path, body.as_deref(), timeout)?;
-        if (200..300).contains(&answer.status) {
-            Ok(answer)
-        } else {
-            match serde_json::from_slice::<ErrorBody>(&answer.body) {
-                Ok(body) => Err(Error::Refused { code: body.error, message: body.message }),
-                Err(_) => Err(Error::Protocol(format!("HTTP {}", answer.status))),
-            }
-        }
+        refusal(answer)
+    }
+
+    /// A call with a binary body and a binary answer of at most `max` bytes (blobs).
+    pub(crate) fn binary(&self, method: &str, path: &str, body: Option<&[u8]>, max: usize, timeout: Duration) -> Result<http::Answer, Error> {
+        let answer = http::request_with(self.addr, &self.token, method, path, body, "application/octet-stream", max, timeout)?;
+        refusal(answer)
+    }
+
+    /// A client of the agent at `addr` with `token` (a fake agent's, in tests), whose `local-api.json` is in `dir`.
+    #[cfg(feature = "fake")]
+    pub(crate) fn at(addr: SocketAddr, token: String, dir: PathBuf) -> Self {
+        Self { addr, token, dir }
     }
 
     /// Whether the agent is signed in, as whom, to which server, whether it is online and what it is doing. Quick
@@ -256,6 +267,23 @@ impl Client {
     pub fn documents(&self) -> Result<live::Documents, Error> {
         live::Documents::connect(self)
     }
+
+    /// The agent's blob store ([`blobs::Blobs`]): binary content kept out of live documents.
+    pub fn blobs(&self) -> blobs::Blobs {
+        blobs::Blobs::new(self.clone())
+    }
+}
+
+/// `answer` if it succeeded, else the agent's refusal (its code and message).
+fn refusal(answer: http::Answer) -> Result<http::Answer, Error> {
+    if (200..300).contains(&answer.status) {
+        Ok(answer)
+    } else {
+        match serde_json::from_slice::<ErrorAnswer>(&answer.body) {
+            Ok(body) => Err(Error::Refused { code: body.error, message: body.message }),
+            Err(_) => Err(Error::Protocol(format!("HTTP {}", answer.status))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -339,11 +367,11 @@ mod tests {
     #[test]
     fn each_call_sends_its_request_and_reads_its_answer() {
         let id = uuid::Uuid::now_v7();
-        let device = craft_cloud_proto::DeviceId::generate();
+        let device = craft_cloud_api::DeviceId::generate();
         let info = PairingInfo { id, join: "c.example/K7M4-Q9TX".into(), link: "https://c.example/join/K7M4-Q9TX".into(), expires_ms: 9 };
         let used = PairingStatus { state: PairingState::Used, device_name: Some("lptp1".into()) };
         let list = vec![DeviceInfo { id: device, name: "lptp1".into(), created_ms: 1, last_used_ms: 2, revoked: false, current: false }];
-        let refused = json(&ErrorBody { error: "password_required".into(), message: "choose a password".into(), ..ErrorBody::default() });
+        let refused = json(&ErrorAnswer { error: "password_required".into(), message: "choose a password".into() });
         let script = vec![
             (400, refused),
             (200, json(&status(true))),

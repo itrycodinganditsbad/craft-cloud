@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use craft_cloud_proto::api::ErrorBody;
-use craft_cloud_proto::local::{MAX_LOCAL_JSON_BYTES, NewRecent, RecentEntry, RecentsEvent as Wire, RecentsRequest, codes, paths};
+use craft_cloud_api::api::ErrorAnswer as ErrorBody;
+use craft_cloud_api::local::{MAX_LOCAL_JSON_BYTES, NewRecent, RecentEntry, RecentsEvent as Wire, RecentsRequest, codes, paths};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::HandshakeError;
 use tungstenite::protocol::WebSocketConfig;

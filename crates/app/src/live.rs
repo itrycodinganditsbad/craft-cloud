@@ -42,16 +42,16 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use craft_cloud_proto::DocId;
-use craft_cloud_proto::api::ErrorBody;
-use craft_cloud_proto::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, STATE, UPDATE, decode_binary, encode_binary};
-use craft_cloud_proto::local::{DocState, DocsEvent, DocsRequest, MAX_LOCAL_JSON_BYTES, paths};
+use craft_cloud_api::DocId;
+use craft_cloud_api::api::ErrorAnswer as ErrorBody;
+use craft_cloud_api::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, STATE, UPDATE, decode_binary, encode_binary};
+use craft_cloud_api::local::{DocState, DocsEvent, DocsRequest, MAX_LOCAL_JSON_BYTES, paths};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::HandshakeError;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 
-pub use craft_cloud_proto::local::NotLiveReason;
+pub use craft_cloud_api::local::NotLiveReason;
 
 use crate::http::CONNECT_TIMEOUT;
 use crate::{Client, Error};

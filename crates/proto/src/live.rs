@@ -67,17 +67,14 @@ pub const LIVE_PROTOCOL_MAX: u32 = 2;
 /// carries recents only.
 pub const LIVE_DOCUMENTS_PROTOCOL: u32 = 2;
 
-/// Largest update, in bytes.
-pub const MAX_UPDATE_BYTES: usize = 1024 * 1024;
+/// Largest update, in bytes; largest snapshot of a document (an import, or a compaction), in bytes (it travels through
+/// the chunk API, never in a frame); largest presence message (Loro's ephemeral state: a cursor, a selection, a machine
+/// name), in bytes. Apps see them too, so they live in `craft-cloud-api`.
+pub use craft_cloud_api::limits::{MAX_PRESENCE_BYTES, MAX_SNAPSHOT_BYTES, MAX_UPDATE_BYTES};
 /// Most documents one device may be subscribed to at once.
 pub const MAX_SUBSCRIPTIONS: usize = 256;
 /// Largest encoded frame: an update and its envelope (IDs, numbers, an error message).
 pub const MAX_FRAME_BYTES: usize = MAX_UPDATE_BYTES + 4096;
-/// Largest snapshot of a document (an import, or a compaction), in bytes (it travels through the chunk API, never in
-/// a frame).
-pub const MAX_SNAPSHOT_BYTES: usize = crate::limits::MAX_MANIFEST_BYTES;
-/// Largest presence message (Loro's ephemeral state: a cursor, a selection, a machine name), in bytes.
-pub const MAX_PRESENCE_BYTES: usize = 4096;
 /// Most presence messages one device may send a second for one document (more are dropped, never stored anyway).
 pub const PRESENCE_PER_SEC: u32 = 20;
 /// A document's log above its snapshot is compacted once it holds more than this many updates…

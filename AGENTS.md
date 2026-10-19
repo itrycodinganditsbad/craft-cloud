@@ -26,7 +26,8 @@ The design lives in `docs/design/sync.md`; the live protocols (the server's live
 
 ```text
 crates/
-  proto     craft-cloud-proto     wire types: names, IDs, hashes, manifests, commit ops, API bodies, limits, join codes and join strings (`join.rs`)
+  api       craft-cloud-api       what apps need of the protocol, with no postcard: IDs, names, limits, the agent's local API (`local.rs`, `/v1/blobs` too), error codes and the account's devices (`api.rs`)
+  proto     craft-cloud-proto     wire types: hashes, manifests, commit ops, API bodies, join codes and join strings (`join.rs`), the live protocol (`live.rs`); re-exports `craft-cloud-api` under the same paths
   chunker   craft-cloud-chunker   FastCDC `fastcdc-v1` + BLAKE3, frozen by golden vectors
   store     craft-cloud-store     blob store: disk, S3, memory; checks every blob in and out
   meta      craft-cloud-meta      metadata on SQLite or Postgres; the batch commit; the change feed; invites and pairings (`join.rs`); live documents' logs and snapshots (`live.rs`)
@@ -46,9 +47,11 @@ xtask/                            cargo xtask ci | licenses | icons | package | 
 docs/                             design documents and the self-hosting guide
 ```
 
-Layering: `proto` and `chunker` depend on nothing else in the workspace. `store` and `meta` depend on `proto`.
+Layering: `api` and `chunker` depend on nothing else in the workspace; `proto` depends on `api` only. What apps link
+(`app`, `kit`, `egui`) depends on `api`, never on `proto`, so it brings no crate a Craft app doesn't already lock but
+Loro's own (`cargo xtask suite-deps <the apps' Cargo.lock files>` checks). `store` and `meta` depend on `proto`.
 The server depends on all three; nothing depends on the server outside tests. `sync` depends on `proto` and `chunker`
-(its tests also use `meta` and `store` as an in-process server). `app` depends on `proto` only and has no async
+(its tests also use `meta` and `store` as an in-process server). `app` depends on `api` only and has no async
 runtime. The agent depends on `proto`, `sync` and `app` (its `recents` commands are clients like an app); its
 tests also run the server on a loopback port, and `tests/network/` runs the server's router and agents over
 `turmoil` (a dev-dependency: the shipped binaries never link it). That test target includes sync's test harness

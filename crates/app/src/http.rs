@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use craft_cloud_proto::local::MAX_LOCAL_JSON_BYTES;
+use craft_cloud_api::local::MAX_LOCAL_JSON_BYTES;
 
 use crate::Error;
 
@@ -30,19 +30,34 @@ pub(crate) struct Answer {
 /// Sends `method path` with the token and an optional JSON body to the agent at `addr`; the answer must come within
 /// `timeout`.
 pub(crate) fn request(addr: SocketAddr, token: &str, method: &str, path: &str, body: Option<&[u8]>, timeout: Duration) -> Result<Answer, Error> {
+    request_with(addr, token, method, path, body, "application/json", MAX_LOCAL_JSON_BYTES, timeout)
+}
+
+/// [`request`] with a body of `content_type` and an answer of at most `max` bytes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn request_with(
+    addr: SocketAddr,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    content_type: &str,
+    max: usize,
+    timeout: Duration,
+) -> Result<Answer, Error> {
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| Error::NotRunning(format!("can't reach it: {e}")))?;
     stream.set_read_timeout(Some(timeout)).map_err(io)?;
     stream.set_write_timeout(Some(timeout)).map_err(io)?;
     let body = body.unwrap_or_default();
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: {content_type}\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes()).map_err(io)?;
     stream.write_all(body).map_err(io)?;
     stream.flush().map_err(io)?;
-    read_answer(&mut stream)
+    read_answer_max(&mut stream, max)
 }
 
 fn io(e: std::io::Error) -> Error {
@@ -50,7 +65,13 @@ fn io(e: std::io::Error) -> Error {
 }
 
 /// Reads one answer (the connection closes after it).
+#[cfg(test)]
 pub(crate) fn read_answer(stream: &mut impl Read) -> Result<Answer, Error> {
+    read_answer_max(stream, MAX_LOCAL_JSON_BYTES)
+}
+
+/// Reads one answer of at most `max` bytes of body (the connection closes after it).
+pub(crate) fn read_answer_max(stream: &mut impl Read, max: usize) -> Result<Answer, Error> {
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     let (status, length, head_len) = loop {
@@ -80,7 +101,7 @@ pub(crate) fn read_answer(stream: &mut impl Read) -> Result<Answer, Error> {
             Err(e) => return Err(Error::Protocol(format!("the answer doesn't parse: {e}"))),
         }
     };
-    if length.is_some_and(|n| n > MAX_LOCAL_JSON_BYTES) {
+    if length.is_some_and(|n| n > max) {
         return Err(Error::Protocol("the answer is too long".into()));
     }
     let mut body = buf.split_off(head_len.min(buf.len()));
@@ -93,7 +114,7 @@ pub(crate) fn read_answer(stream: &mut impl Read) -> Result<Answer, Error> {
             break;
         }
         body.extend_from_slice(chunk.get(..n).unwrap_or_default());
-        if body.len() > MAX_LOCAL_JSON_BYTES {
+        if body.len() > max {
             return Err(Error::Protocol("the answer is too long".into()));
         }
     }

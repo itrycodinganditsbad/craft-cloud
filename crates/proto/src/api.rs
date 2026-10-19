@@ -8,6 +8,9 @@ use crate::hash::ChunkId;
 use crate::ids::{DeviceId, Epoch, NodeId, SpaceId};
 use crate::ops::{Conflict, Op};
 
+/// What apps see of these bodies lives in `craft-cloud-api` (no postcard), re-exported here.
+pub use craft_cloud_api::api::{DeviceInfo, ErrorAnswer, PairingState, PairingStatus, codes};
+
 /// Protocol versions this build speaks. A client and server must share at least one.
 pub const PROTOCOL_MIN: u32 = 1;
 pub const PROTOCOL_MAX: u32 = 1;
@@ -92,27 +95,6 @@ impl std::fmt::Debug for PairingCreated {
     }
 }
 
-/// Where an add-a-computer code stands, in [`PairingStatus`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PairingState {
-    /// Not used yet, and still good.
-    Waiting,
-    /// A computer joined with it; [`PairingStatus::device_name`] names it.
-    Used,
-    /// Its time ran out unused.
-    Expired,
-}
-
-/// `GET /api/v1/pairings/{id}` (device auth, the account's own pairings only).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PairingStatus {
-    pub state: PairingState,
-    /// The device that joined, once `used`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_name: Option<String>,
-}
-
 /// `POST /api/v1/join` (no auth): redeem an invite or an add-a-computer code (normalised or as typed) for a new
 /// device; answered with a [`LoginResponse`]. `password` is required, and only taken, for an invite to an account
 /// that has none yet. Its `Debug` output hides the code and the password.
@@ -133,18 +115,6 @@ impl std::fmt::Debug for JoinRequest {
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .finish()
     }
-}
-
-/// One of the signed-in user's devices.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceInfo {
-    pub id: DeviceId,
-    pub name: String,
-    pub created_ms: i64,
-    pub last_used_ms: i64,
-    pub revoked: bool,
-    /// The device making this request.
-    pub current: bool,
 }
 
 /// `POST /api/v1/chunks/missing` and its answer: which of `ids` this space doesn't have.
@@ -169,34 +139,6 @@ pub struct CommitRequest {
 pub struct CommitResponse {
     pub seq: u64,
     pub epoch: Epoch,
-}
-
-/// Stable error codes, the `error` field of [`ErrorBody`].
-pub mod codes {
-    /// A commit's operations clash with the current state; `conflicts` lists them.
-    pub const CONFLICT: &str = "conflict";
-    /// Chunks must be uploaded first; `missing` lists them.
-    pub const MISSING_CHUNKS: &str = "missing_chunks";
-    /// The client's change counter is stale or ahead of the server: list the whole tree again.
-    pub const RESYNC_REQUIRED: &str = "resync_required";
-    pub const UNAUTHORIZED: &str = "unauthorized";
-    pub const RATE_LIMITED: &str = "rate_limited";
-    pub const INVALID: &str = "invalid";
-    pub const NOT_FOUND: &str = "not_found";
-    pub const TOO_LARGE: &str = "too_large";
-    /// A request body took longer to arrive than the server allows for it (HTTP 408); send it again.
-    pub const TIMEOUT: &str = "timeout";
-    pub const USERNAME_TAKEN: &str = "username_taken";
-    /// A chunk or manifest would take the account over the bytes the server lets it store (HTTP 507); `quota` says
-    /// how much it stores and may store.
-    pub const QUOTA_EXCEEDED: &str = "quota_exceeded";
-    /// `join`: the code is wrong, expired or used (never which).
-    pub const INVALID_CODE: &str = "invalid_code";
-    /// `join`: an invite to an account without a password needs one; send it again with `password`.
-    pub const PASSWORD_REQUIRED: &str = "password_required";
-    /// `join`: the new password breaks the server's rules (the message says which).
-    pub const WEAK_PASSWORD: &str = "weak_password";
-    pub const INTERNAL: &str = "internal";
 }
 
 /// How much an account stores on the server and may store, in bytes, with `quota_exceeded`.

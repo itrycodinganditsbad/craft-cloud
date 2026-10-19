@@ -1154,10 +1154,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-cloud-api"
+version = "0.0.1"
+dependencies = [
+ "caseless",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "unicode-normalization",
+ "uuid",
+]
+
+[[package]]
 name = "craft-cloud-app"
 version = "0.0.1"
 dependencies = [
- "craft-cloud-proto",
+ "craft-cloud-api",
  "httparse",
  "serde",
  "serde_json",
@@ -1215,7 +1228,7 @@ name = "craft-cloud-proto"
 version = "0.0.1"
 dependencies = [
  "blake3",
- "caseless",
+ "craft-cloud-api",
  "getrandom 0.4.3",
  "postcard",
  "proptest",

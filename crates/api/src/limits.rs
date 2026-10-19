@@ -22,3 +22,14 @@ pub const MAX_BATCH_JSON_BYTES: usize = 1024 * 1024;
 pub const MAX_TREE_DEPTH: usize = 256;
 /// Most nodes one page of the tree or change feed may hold.
 pub const MAX_PAGE_NODES: u32 = 5000;
+
+/// Largest live update (a Loro update an app sends, or the server relays), in bytes.
+pub const MAX_UPDATE_BYTES: usize = 1024 * 1024;
+/// Largest snapshot of a live document (an import, or a compaction), in bytes (it travels through the chunk API, never
+/// in a frame).
+pub const MAX_SNAPSHOT_BYTES: usize = MAX_MANIFEST_BYTES;
+/// Largest presence message (Loro's ephemeral state, or an app's own: a cursor, a selection, a machine name), in bytes.
+pub const MAX_PRESENCE_BYTES: usize = 4096;
+/// Largest blob an app may put through the local API's `/v1/blobs` (binary content kept out of a live document), in
+/// bytes.
+pub const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;

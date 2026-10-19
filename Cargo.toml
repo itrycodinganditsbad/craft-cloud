@@ -17,6 +17,7 @@ dbg_macro = "warn"
 todo = "warn"
 
 [workspace.dependencies]
+craft-cloud-api = { path = "crates/api" }
 craft-cloud-proto = { path = "crates/proto" }
 craft-cloud-chunker = { path = "crates/chunker" }
 craft-cloud-store = { path = "crates/store" }

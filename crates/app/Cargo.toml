@@ -1,14 +1,18 @@
 [package]
 name = "craft-cloud-app"
-description = "What Craft apps and the launcher link to reach the Craft Cloud agent on this machine: account status, sign-in, joining, recents"
+description = "What Craft apps and the launcher link to reach the Craft Cloud agent on this machine: account status, sign-in, joining, recents, live documents and blobs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# `craft_cloud_app::fake`: an agent in the test's own process (documents and blobs in memory, on a shared hub).
+fake = []
+
 [dependencies]
-craft-cloud-proto.workspace = true
+craft-cloud-api.workspace = true
 httparse.workspace = true
 serde.workspace = true
 serde_json.workspace = true

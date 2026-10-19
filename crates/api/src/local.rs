@@ -15,8 +15,9 @@
 //!   `DELETE /v1/devices/{id}` → the list after; `POST /v1/pause`, `/v1/resume` and `/v1/quit` → [`Status`];
 //!   `POST /v1/autostart` ([`AutostartRequest`]) → [`Status`]; `GET /v1/recents`, upgraded to a WebSocket of JSON
 //!   text messages: [`RecentsRequest`] in, [`RecentsEvent`] out; `GET /v1/docs`, upgraded to a WebSocket of live
-//!   documents ([`docs`]: [`DocsRequest`] and binary frames in, [`DocsEvent`] and binary frames out). Errors are the HTTP API's
-//!   [`ErrorBody`](crate::api::ErrorBody) with its codes and [`codes`].
+//!   documents ([`docs`]: [`DocsRequest`] and binary frames in, [`DocsEvent`] and binary frames out); `PUT /v1/blobs`
+//!   and `GET /v1/blobs/{hash}`: binary content kept out of live documents ([`blobs`]). Errors are the HTTP API's error
+//!   body ([`ErrorAnswer`](crate::api::ErrorAnswer) reads its code and message) with its codes and [`codes`].
 //! - **Versions**: [`Status::api`] is the local API version the agent speaks; a client refuses one outside
 //!   [`LOCAL_API_MIN`]..=[`LOCAL_API_MAX`] when it connects.
 
@@ -52,7 +53,7 @@ pub const MAX_MACHINE_BYTES: usize = 128;
 /// Largest JSON body or WebSocket message of the local API, either way.
 pub const MAX_LOCAL_JSON_BYTES: usize = 1024 * 1024;
 
-/// Error codes of the local API (the `error` field of [`ErrorBody`](crate::api::ErrorBody)), beside the HTTP API's
+/// Error codes of the local API (the `error` field of [`ErrorAnswer`](crate::api::ErrorAnswer)), beside the HTTP API's
 /// `invalid`, `unauthorized` (the token), `not_found`, `too_large` and `internal`.
 pub mod codes {
     /// A `Host` that isn't `127.0.0.1:<port>`, or an `Origin` header: the request didn't come from a local program.
@@ -83,6 +84,11 @@ pub mod codes {
     /// `join` or `login` without `adopt`: the folder already has files in it. Nothing was sent to the server, so the
     /// code still works; ask whether to sync those files, and send it again with `adopt` if so.
     pub const FOLDER_HAS_FILES: &str = "folder_has_files";
+    /// `GET /v1/blobs/{hash}`: neither this machine nor the account's server has that blob.
+    pub const BLOB_NOT_FOUND: &str = "blob_not_found";
+    /// Never sent by an agent: what a client reports when the agent answers a call it doesn't know (`not_found` for
+    /// the call itself), as one from before that call answers it. Update Craft Cloud.
+    pub const AGENT_TOO_OLD: &str = "agent_too_old";
 }
 
 /// The paths of the local API.
@@ -108,6 +114,69 @@ pub mod paths {
     pub const QUIT: &str = "/v1/quit";
     /// `POST` ([`super::AutostartRequest`]): start, or don't start, the agent at login → [`super::Status`].
     pub const AUTOSTART: &str = "/v1/autostart";
+    /// `PUT`: a blob → [`super::blobs::Stored`]; `GET /v1/blobs/{hash}`: its bytes ([`super::blobs`]).
+    pub const BLOBS: &str = "/v1/blobs";
+}
+
+/// Binary content an app keeps out of a live document (images, audio, a font): `PUT /v1/blobs` with the bytes as the
+/// body (`application/octet-stream`, 1 byte to [`MAX_BLOB_BYTES`](crate::limits::MAX_BLOB_BYTES)) is answered with
+/// [`Stored`] once the blob is on the agent's disk; it goes up to the server as a file's content does (cut into
+/// chunks, then a manifest), at once when online and later otherwise. `GET /v1/blobs/{hash}` answers the bytes: from
+/// the agent's disk, or downloaded first when this machine doesn't have them yet (`offline` when it can't reach the
+/// server; [`codes::BLOB_NOT_FOUND`](super::codes::BLOB_NOT_FOUND) when the account has no such blob).
+///
+/// A blob is named by its content: `hash` is the BLAKE3 hash of the manifest the bytes cut into (with `fastcdc-v1`,
+/// as the file sync cuts content), so the same bytes have the same name on every machine. An agent from before blobs
+/// answers both calls with the local API's `not_found` for an unknown call; a client reads that as
+/// [`codes::AGENT_TOO_OLD`](super::codes::AGENT_TOO_OLD).
+pub mod blobs {
+    use serde::{Deserialize, Serialize};
+
+    /// The answer to a `PUT`: the blob's name and length.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Stored {
+        /// 64 lowercase hex digits.
+        #[serde(with = "hex32")]
+        pub hash: [u8; 32],
+        pub len: u64,
+    }
+
+    /// `hash` written as 64 lowercase hex digits, for the `GET` path.
+    pub fn hex(hash: &[u8; 32]) -> String {
+        hash.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// 64 lowercase hex digits as a hash; `None` for anything else.
+    pub fn parse_hex(text: &str) -> Option<[u8; 32]> {
+        let bytes = text.as_bytes();
+        if bytes.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (slot, pair) in out.iter_mut().zip(bytes.chunks(2)) {
+            let digit = |c: u8| match c {
+                b'0'..=b'9' => Some(c - b'0'),
+                b'a'..=b'f' => Some(c - b'a' + 10),
+                _ => None,
+            };
+            let (hi, lo) = (digit(*pair.first()?)?, digit(*pair.get(1)?)?);
+            *slot = (hi << 4) | lo;
+        }
+        Some(out)
+    }
+
+    mod hex32 {
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        pub fn serialize<S: Serializer>(hash: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&super::hex(hash))
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+            let text = String::deserialize(d)?;
+            super::parse_hex(&text).ok_or_else(|| serde::de::Error::custom("expected 64 lowercase hex digits"))
+        }
+    }
 }
 
 /// The agent's data folder: `$CRAFT_CLOUD_AGENT_DIR` if set, else [`default_data_dir`]. `env` reads an environment
@@ -241,7 +310,7 @@ impl std::fmt::Debug for LoginRequest {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRequest {
     /// As typed or pasted: `cloud.example.com/K7M4-Q9TX`, or the link `https://cloud.example.com/join/K7M4-Q9TX`
-    /// (see [`crate::join::JoinString`]).
+    /// (see `craft_cloud_proto::join::JoinString`).
     pub join: String,
     /// The folder to sync (absolute). Default: "Craft Cloud" in the home folder.
     #[serde(default)]
@@ -396,7 +465,7 @@ pub mod docs {
     /// The header of a binary frame: kind and id.
     pub const HEADER_BYTES: usize = 9;
     /// Largest binary frame (a state or an import: a snapshot), either way.
-    pub const MAX_BINARY_BYTES: usize = crate::live::MAX_SNAPSHOT_BYTES + HEADER_BYTES;
+    pub const MAX_BINARY_BYTES: usize = crate::limits::MAX_SNAPSHOT_BYTES + HEADER_BYTES;
 
     /// A binary frame.
     pub fn encode_binary(kind: u8, id: u64, bytes: &[u8]) -> Vec<u8> {
