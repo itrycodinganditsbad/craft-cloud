@@ -9,11 +9,11 @@ use craft_cloud_proto::limits::{MAX_BATCH_JSON_BYTES, MAX_BATCH_OPS, MAX_TREE_DE
 
 /// What an operation adds to a commit body, at most: a longest operation without a save record is at most 1/1000 of
 /// the body limit (`craft_cloud_proto::ops` tests that a full batch of them fits), and a record adds its document and
-/// under 48 bytes per entry of its version. Without records a batch is the full [`MAX_BATCH_OPS`].
+/// under 48 bytes per head of its frontiers. Without records a batch is the full [`MAX_BATCH_OPS`].
 fn op_weight(op: &Op) -> usize {
     let save = match op {
         Op::Create { version, .. } | Op::Update { version, .. } => {
-            version.save.as_ref().map_or(0, |s| s.version.len().saturating_mul(48).saturating_add(64))
+            version.save.as_ref().map_or(0, |s| s.frontiers.len().saturating_mul(48).saturating_add(64))
         }
         _ => 0,
     };
@@ -377,6 +377,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         for (id, path, meta) in &modified {
             if self.fs.still_changing(path, meta) {
                 report.skipped.push((path.to_string(), format!("{STILL_CHANGING}; synced once it stops")));
+                continue;
+            }
+            // Two Craft saves waiting to learn which is newer (see `SaveRecords::includes`): not sent over the other.
+            if self.deferred.contains(id) {
                 continue;
             }
             let Some(BaseEntry { kind: BaseKind::File { version: expected, exec, size: base_size, .. }, .. }) = self.state.base.get(id).cloned()

@@ -202,22 +202,21 @@ pub enum UndoKind {
     None,
 }
 
-/// What a save gives the agent: the content's hash and the live document's version it was made from.
+/// What a save gives the agent: the content's hash and the live document's frontiers (its heads, `(peer, counter)`
+/// operation IDs, sorted) it was made from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaveRecord {
     pub hash: [u8; 32],
-    /// Loro's frontiers, encoded.
-    pub frontiers: Vec<u8>,
-    /// The version vector (peer, end counter), so a version can be compared with another without Loro.
-    pub version: Vec<(u64, u32)>,
+    pub frontiers: Vec<(u64, u32)>,
 }
 
-/// What a save is made from ([`Session::save_point`]): the model to write, and the live document's version it
+/// What a save is made from ([`Session::save_point`]): the model to write, and the live document's frontiers it
 /// matches.
 pub struct SavePoint<D: LiveDocument> {
     model: Arc<D::Doc>,
-    frontiers: Vec<u8>,
-    version: Vec<(u64, u32)>,
+    frontiers: Vec<(u64, u32)>,
+    /// This session's counter then: the record goes to the agent after every change up to it.
+    end: i32,
 }
 
 impl<D: LiveDocument> SavePoint<D> {
@@ -226,26 +225,40 @@ impl<D: LiveDocument> SavePoint<D> {
         &self.model
     }
 
-    /// The live document's version vector (peer, end counter) the model matches.
-    pub fn version(&self) -> &[(u64, u32)] {
-        &self.version
+    /// The live document's frontiers (`(peer, counter)` heads, sorted) the model matches.
+    pub fn frontiers(&self) -> &[(u64, u32)] {
+        &self.frontiers
     }
 }
 
 impl<D: LiveDocument> Clone for SavePoint<D> {
     fn clone(&self) -> Self {
-        Self { model: self.model.clone(), frontiers: self.frontiers.clone(), version: self.version.clone() }
+        Self { model: self.model.clone(), frontiers: self.frontiers.clone(), end: self.end }
     }
 }
 
 impl<D: LiveDocument> std::fmt::Debug for SavePoint<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SavePoint").field("version", &self.version).finish_non_exhaustive()
+        f.debug_struct("SavePoint").field("frontiers", &self.frontiers).finish_non_exhaustive()
     }
 }
 
 /// How many save records a session keeps to tell the agent (again) when it is back.
 const KEPT_RECORDS: usize = 16;
+/// The name of the undo step [`Session::replace_with_file`] makes.
+pub const REPLACE_WITH_FILE: &str = "Replace with the file's content";
+/// At most one save that `file_behind` asks for per this long (a backstop against a loop between machines).
+pub const CATCH_UP_EVERY: Duration = Duration::from_secs(5);
+
+/// A save record kept for the agent: sent after every change it covers.
+#[derive(Debug, Clone)]
+struct Kept {
+    record: SaveRecord,
+    /// This session's counter at the save: every change up to it goes first.
+    end: i32,
+    /// Sent on the current connection.
+    sent: bool,
+}
 
 /// Another machine's (or app's) presence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,7 +312,7 @@ pub(crate) struct Ctx {
 }
 
 /// The connection to the agent: the document and its documents connection (kept alive). The document goes first, so
-/// the agent hears it closed (and lends its peer to the next open at once) before the connection ends.
+/// the agent hears it closed before the connection ends.
 struct Link {
     doc: Document,
     _docs: Documents,
@@ -320,8 +333,6 @@ type Reopened = Result<(Documents, Document), Reopen>;
 pub struct Session<D: LiveDocument> {
     doc: LoroDoc,
     undo: UndoManager,
-    /// The document's peer is the agent's, lent from its pool for this session.
-    leased: bool,
     model: Arc<D::Doc>,
     ctx: Ctx,
     layout: Vec<(&'static str, Kind)>,
@@ -360,10 +371,18 @@ pub struct Session<D: LiveDocument> {
     /// The agent refused a change for now (its disk): the queue goes again, in order, from this moment.
     resend_at: Instant,
     resend_backoff: Duration,
-    /// The last saves' records, told the agent again on every reconnect (it may have missed them; it keeps one once).
-    records: VecDeque<SaveRecord>,
-    /// The record of the document's file as it is on disk: the agent's word, or this session's last save since.
+    /// The last saves' records, told the agent again on every reconnect (it may have missed them; it keeps one once),
+    /// each after the changes it covers.
+    records: VecDeque<Kept>,
+    /// The record of the document's file as it is on disk (its frontiers): the agent's word, or this session's last
+    /// save since.
     file_version: Option<Vec<(u64, u32)>>,
+    /// When the last save that `file_behind` asked for was recorded ([`CATCH_UP_EVERY`]).
+    caught_up_at: Option<Instant>,
+    /// A local change (or undo) was made since the last save.
+    changed_since_save: bool,
+    /// The names of undo steps that have one ([`Session::replace_with_file`]), by the counter they start at.
+    step_names: HashMap<i32, &'static str>,
 }
 
 impl<D: LiveDocument> std::fmt::Debug for Session<D> {
@@ -483,7 +502,7 @@ impl<D: LiveDocument> Session<D> {
             Err(e) => return not_running(e),
         };
         let file_hash = file_bytes.map(|b| *blake3::hash(b).as_bytes());
-        let opened = match docs.open_with(path, D::APP, &OpenOptions { peer: None, file_hash }) {
+        let opened = match docs.open_with(path, D::APP, &OpenOptions { file_hash }) {
             Ok(o) => o,
             Err(craft_cloud_app::Error::Refused { code, message }) => return Err(KitError::Agent(format!("{code}: {message}"))),
             Err(e) => return not_running(e),
@@ -492,7 +511,7 @@ impl<D: LiveDocument> Session<D> {
             Opened::NotLive(reason) => return Ok(Open::NotLive(NotLive::Reason(reason))),
             Opened::Live(document) => (document, None),
             Opened::NeedsImport(importer) => {
-                let snapshot = Self::import_snapshot(&file, file_hash.as_ref(), importer.peer())?;
+                let snapshot = Self::import_snapshot(&file, file_hash.as_ref())?;
                 match importer.import(&snapshot) {
                     Ok(document) => (document, Some(snapshot)),
                     Err(craft_cloud_app::Error::Refused { code, .. }) if code == "not_live" => {
@@ -503,7 +522,7 @@ impl<D: LiveDocument> Session<D> {
             }
         };
         let ours = snapshot.as_deref().is_some_and(|s| s == document.state()) && document.state_updates().is_empty();
-        let mut session = Self::start(agent.clone(), path, file, (document.state(), document.state_updates()), ours, document.peer())?;
+        let mut session = Self::start(agent.clone(), path, file, (document.state(), document.state_updates()), ours)?;
         // Decided once, here: the agent knows every Craft save of the file (its records, the server's versions'); the
         // bytes the document was imported from are no edit either.
         session.status.changed_outside =
@@ -513,11 +532,8 @@ impl<D: LiveDocument> Session<D> {
     }
 
     /// The snapshot that makes `file` a live document: its schema, the hash of the bytes it was read from, its parts.
-    fn import_snapshot(file: &D::Doc, hash: Option<&[u8; 32]>, peer: Option<u64>) -> Result<Vec<u8>, KitError> {
+    fn import_snapshot(file: &D::Doc, hash: Option<&[u8; 32]>) -> Result<Vec<u8>, KitError> {
         let doc = new_doc();
-        if let Some(peer) = peer {
-            doc.set_peer_id(peer)?;
-        }
         let mut schema = HashMap::new();
         schema.insert("app".to_owned(), LoroValue::from(D::APP));
         schema.insert("version".to_owned(), LoroValue::from(i64::from(D::SCHEMA)));
@@ -534,20 +550,17 @@ impl<D: LiveDocument> Session<D> {
 
     /// A session over the document `state` (a snapshot), for `file` (kept as the model when `ours`: the state is the
     /// import just made from it).
-    fn start(agent: Agent, path: &str, file: Arc<D::Doc>, state: (&[u8], &[Vec<u8>]), ours: bool, peer: Option<u64>) -> Result<Self, KitError> {
+    fn start(agent: Agent, path: &str, file: Arc<D::Doc>, state: (&[u8], &[Vec<u8>]), ours: bool) -> Result<Self, KitError> {
         let layout = D::mappings(&file).layout()?;
+        // A fresh random Loro peer of its own: never one another session may have written with.
         let doc = new_doc();
         doc.import(state.0)?;
-        // The updates that are part of the state, before anything is written with the peer (it may have written some
-        // of them, in a window closed before).
+        // The updates that are part of the state.
         let mut unread = None;
         for update in state.1 {
             if let Err(e) = doc.import(update) {
                 unread = Some(format!("a change from another machine doesn't read: {e}"));
             }
-        }
-        if let Some(peer) = peer {
-            doc.set_peer_id(peer)?;
         }
         let collector = Arc::new(Mutex::new(Collector::default()));
         let c = collector.clone();
@@ -556,7 +569,6 @@ impl<D: LiveDocument> Session<D> {
         let mut session = Self {
             doc,
             undo,
-            leased: peer.is_some(),
             model: file,
             ctx: Ctx::default(),
             layout,
@@ -588,6 +600,9 @@ impl<D: LiveDocument> Session<D> {
             resend_backoff: FIRST_BACKOFF,
             records: VecDeque::new(),
             file_version: None,
+            caught_up_at: None,
+            changed_since_save: false,
+            step_names: HashMap::new(),
         };
         session.reindex_trees();
         session.check_schema();
@@ -623,7 +638,8 @@ impl<D: LiveDocument> Session<D> {
         if let Some(waker) = &self.waker {
             link.doc.set_waker(waker.clone());
         }
-        // What the agent's copy has of this peer's changes: the rest goes again.
+        // What the agent's copy has of this peer's changes: the rest goes again. (The peer is this session's alone,
+        // random and never handed out, so whatever the agent has under it is this session's.)
         let ours = self.doc.peer_id();
         let held = std::iter::once(link.doc.state())
             .chain(link.doc.state_updates().iter().map(Vec::as_slice))
@@ -635,42 +651,14 @@ impl<D: LiveDocument> Session<D> {
             out.seq = None;
         }
         self.outbox_bytes = self.outbox.iter().map(|o| o.bytes.len()).sum();
-        self.take_peer(link.doc.peer());
-        // Saves made while the agent was away (and the last ones again: the agent keeps a record once).
-        for r in &self.records {
-            let _ = link.doc.saved(r.hash, &r.frontiers, &r.version);
+        // Saves made while the agent was away, and the last ones again (the agent keeps a record once): each after the
+        // changes it covers.
+        for kept in &mut self.records {
+            kept.sent = false;
         }
         self.link = Some(link);
         self.backoff = FIRST_BACKOFF;
         self.send_outbox();
-    }
-
-    /// Takes the peer the agent lent on a reopen. It is the one asked for unless another window took it while the
-    /// agent was away (or the agent no longer lends one): then this session's changes from now on are written with the
-    /// new peer (its undo history starts again). Changes still waiting under the old peer can't go out then (the other
-    /// window writes the same IDs): the session stops, and the app saves the model to keep them.
-    fn take_peer(&mut self, wanted: Option<u64>) {
-        let ours = self.doc.peer_id();
-        if wanted == Some(ours) || (!self.leased && wanted.is_none()) {
-            return;
-        }
-        if !self.outbox.is_empty() {
-            let why = "peer_taken: another window has this document's place since Craft Cloud went away, and changes made here \
-                       meanwhile can't go out; save the document to keep them"
-                .to_owned();
-            self.refused = Some(why.clone());
-            self.status.error = Some(why);
-            return;
-        }
-        let peer = wanted.unwrap_or_else(|| LoroDoc::new().peer_id());
-        if let Err(e) = self.doc.set_peer_id(peer) {
-            self.status.error = Some(format!("the live document: {e}"));
-            return;
-        }
-        self.undo = new_undo(&self.doc);
-        self.step_sizes.clear();
-        self.group_key = None;
-        self.leased = wanted.is_some();
     }
 
     /// The model as it is now (after the last local change or applied remote one).
@@ -728,6 +716,7 @@ impl<D: LiveDocument> Session<D> {
             return Err(KitError::Stalled(self.outbox_bytes));
         }
         let before = self.doc.oplog_vv();
+        self.changed_since_save = true;
         let outer = !self.grouping;
         if outer {
             let _ = self.undo.group_start();
@@ -816,12 +805,38 @@ impl<D: LiveDocument> Session<D> {
 
     /// The text bytes of the top undo (or redo) step, when over the limit.
     fn too_big(&self, undo: bool) -> Option<usize> {
-        let meta = if undo { self.undo.top_undo_value() } else { self.undo.top_redo_value() };
-        let start = match meta? {
-            LoroValue::I64(start) => i32::try_from(start).ok()?,
-            _ => return None,
-        };
+        let start = self.top_start(undo)?;
         self.step_sizes.get(&start).copied().filter(|bytes| *bytes > MAX_UNDO_TEXT_BYTES)
+    }
+
+    /// Where the step at the top of the undo (or redo) stack starts.
+    fn top_start(&self, undo: bool) -> Option<i32> {
+        match if undo { self.undo.top_undo_value() } else { self.undo.top_redo_value() }? {
+            LoroValue::I64(start) => i32::try_from(start).ok(),
+            _ => None,
+        }
+    }
+
+    /// The name of the step undo (`true`) or redo would take back, if it has one (as "Replace with the file's
+    /// content", [`Session::replace_with_file`]): for the app's Undo and Redo labels.
+    pub fn step_name(&self, undo: bool) -> Option<&'static str> {
+        self.top_start(undo).and_then(|s| self.step_names.get(&s)).copied()
+    }
+
+    /// The user chose to bring the file's content in (the app showed [`Status::changed_outside`] and offered it; the
+    /// kit never does by itself): `file` (the app's model of the file as it read it) replaces the live content, as one
+    /// ordinary local change, one undo step named [`REPLACE_WITH_FILE`], that goes to every machine. It replaces the
+    /// live edits made since the file was written; undo brings them back.
+    pub fn replace_with_file(&mut self, file: D::Doc) -> Result<(), KitError> {
+        let mut file = file;
+        D::refresh_derived(&mut file);
+        let old = self.model.clone();
+        let start = self.doc.oplog_vv().get(&self.doc.peer_id()).copied().unwrap_or(0);
+        let key = if self.grouping { self.group_key.unwrap_or(start) } else { start };
+        self.local_change(&old, &Arc::new(file))?;
+        self.step_names.insert(key, REPLACE_WITH_FILE);
+        self.status.changed_outside = false;
+        Ok(())
     }
 
     /// Takes back this machine's last change (remote changes since stay). The model changes as after a remote change:
@@ -856,13 +871,9 @@ impl<D: LiveDocument> Session<D> {
         if let Some(bytes) = self.too_big(undo) {
             return Err(KitError::UndoTooLarge { bytes });
         }
-        let size = {
-            let meta = if undo { self.undo.top_undo_value() } else { self.undo.top_redo_value() };
-            match meta {
-                Some(LoroValue::I64(start)) => i32::try_from(start).ok().and_then(|s| self.step_sizes.get(&s)).copied().unwrap_or(0),
-                _ => 0,
-            }
-        };
+        let top = self.top_start(undo);
+        let size = top.and_then(|s| self.step_sizes.get(&s)).copied().unwrap_or(0);
+        let name = top.and_then(|s| self.step_names.get(&s)).copied();
         // What came meanwhile first, so the step applies to the newest document.
         self.apply_incoming()?;
         let before = self.doc.oplog_vv();
@@ -871,9 +882,14 @@ impl<D: LiveDocument> Session<D> {
         let raw = std::mem::take(&mut lock(&self.collector).raw);
         lock(&self.collector).on = false;
         let done = done?;
-        // The step that takes this one back (on the other stack) starts where this undo's commit does: as big.
+        self.changed_since_save |= done;
+        // The step that takes this one back (on the other stack) starts where this undo's commit does: as big, and
+        // with its name.
         let start = before.get(&self.doc.peer_id()).copied().unwrap_or(0);
         self.step_sizes.insert(start, size);
+        if let Some(name) = name {
+            self.step_names.insert(start, name);
+        }
         let mut updates = Vec::new();
         export_since(&self.doc, &before, &mut updates)?;
         self.queue(updates);
@@ -980,7 +996,7 @@ impl<D: LiveDocument> Session<D> {
                     self.status.deleted = deleted;
                     self.status.stopped = stopped || self.refused.is_some() || self.status.replaced;
                 }
-                Event::File(version) => self.file_version = version,
+                Event::File(frontiers) => self.file_version = frontiers,
                 Event::Closed(why) => closed = Some(why),
             }
         }
@@ -997,6 +1013,9 @@ impl<D: LiveDocument> Session<D> {
         self.next_try = Instant::now() + self.backoff;
         for out in &mut self.outbox {
             out.seq = None;
+        }
+        for kept in &mut self.records {
+            kept.sent = false;
         }
     }
 
@@ -1051,8 +1070,7 @@ impl<D: LiveDocument> Session<D> {
         let snapshot = self.doc.export(loro::ExportMode::Snapshot).unwrap_or_default();
         let waker = self.waker.clone();
         let expected = self.doc_id;
-        // The same peer again, if no other window took it meanwhile.
-        let options = OpenOptions { peer: Some(self.doc.peer_id()), file_hash: None };
+        let options = OpenOptions::default();
         let spawned = std::thread::Builder::new().name("craft-cloud-kit-reopen".into()).spawn(move || {
             let result = (|| -> Reopened {
                 let retry = |e: craft_cloud_app::Error| Reopen::Retry(e.to_string());
@@ -1063,7 +1081,9 @@ impl<D: LiveDocument> Session<D> {
                     Opened::Live(doc) if expected.is_none_or(|id| id == doc.id()) => Ok((docs, doc)),
                     Opened::Live(_) => Err(Reopen::Replaced(format!("{path} is another document now"))),
                     // The path's file was never live: another file took its place. Nothing is imported over it.
-                    Opened::NeedsImport(_) if expected.is_some() => Err(Reopen::Replaced(format!("{path} is another file now"))),
+                    Opened::NeedsImport(_) if expected.is_some() => {
+                        Err(Reopen::Replaced(format!("{path} is another file now, or Craft Cloud lost its copy of the document")))
+                    }
                     Opened::NeedsImport(importer) => importer.import(&snapshot).map(|doc| (docs, doc)).map_err(retry),
                     Opened::NotLive(reason) => Err(Reopen::Retry(format!("the document can't be live now ({reason:?})"))),
                 }
@@ -1185,9 +1205,13 @@ impl<D: LiveDocument> Session<D> {
     /// moved on and the model hasn't: the model is marked stale, local changes are refused ([`KitError::ModelStale`])
     /// so no diff is ever written from it, and each poll tries a whole rebuild until one succeeds.
     fn rebuild(&mut self, touched: Touched) -> Result<(), KitError> {
+        let whole = touched.all;
         match self.rebuild_parts(touched) {
             Ok(()) => {
-                self.model_stale = false;
+                // Only a whole rebuild catches the model up: a part rebuilt since leaves the failed one behind.
+                if whole {
+                    self.model_stale = false;
+                }
                 Ok(())
             }
             Err(e) => {
@@ -1201,6 +1225,7 @@ impl<D: LiveDocument> Session<D> {
     /// Rebuilds the model from the touched parts, normalises it (writing back what that repaired), refreshes what is
     /// derived, and makes it the session's.
     fn rebuild_parts(&mut self, touched: Touched) -> Result<(), KitError> {
+        let touched_all = touched.all;
         let raw = {
             // The old parts, for the texts to be patched rather than read whole.
             let old_parts = D::mappings(&self.model);
@@ -1209,7 +1234,9 @@ impl<D: LiveDocument> Session<D> {
         };
         let mut fixed = raw.clone();
         D::normalise(Arc::make_mut(&mut fixed));
-        if self.status.read_only.is_none() {
+        // A repair is written back only from a model that has the whole document: one still stale in a part not
+        // rebuilt would write that part's old state over the document (deleting what the other machine added).
+        if self.status.read_only.is_none() && (touched_all || !self.model_stale) {
             let mut w = Writer::new(&self.doc, KIT_ORIGIN);
             let wrote = write_diff::<D>(&mut w, Some(raw.as_ref()), fixed.as_ref(), &mut self.ctx);
             let (updates, _) = w.finish()?;
@@ -1247,6 +1274,19 @@ impl<D: LiveDocument> Session<D> {
                 Err(e) => {
                     failed = Some(e.to_string());
                     break;
+                }
+            }
+        }
+        // Save records, on the same stream after every change they cover (the agent keeps one once those are in).
+        if failed.is_none() {
+            let unsent_from = self.outbox.iter().filter(|o| o.seq.is_none()).map(|o| o.end).min();
+            for kept in self.records.iter_mut().filter(|k| !k.sent && unsent_from.is_none_or(|from| k.end < from)) {
+                match link.doc.saved(kept.record.hash, &kept.record.frontiers) {
+                    Ok(()) => kept.sent = true,
+                    Err(e) => {
+                        failed = Some(e.to_string());
+                        break;
+                    }
                 }
             }
         }
@@ -1288,7 +1328,7 @@ impl<D: LiveDocument> Session<D> {
         &self.peers
     }
 
-    /// Where a save starts: the model to write to the file and the live document's version it matches. Refused
+    /// Where a save starts: the model to write to the file and the live document's frontiers it matches. Refused
     /// ([`KitError::NoRecord`]) when a save now can't say what it holds: the document is read-only (a newer app's), the
     /// session is stalled or stopped, or the model is behind the live document (a remote change it couldn't take
     /// yet). The app then saves its own model without a record, as it would without Craft Cloud.
@@ -1299,14 +1339,15 @@ impl<D: LiveDocument> Session<D> {
         if let Some(why) = self.no_record() {
             return Err(KitError::NoRecord(why.to_owned()));
         }
-        Ok(SavePoint { model: self.model.clone(), frontiers: self.doc.oplog_frontiers().encode(), version: self.version() })
+        let end = self.doc.oplog_vv().get(&self.doc.peer_id()).copied().unwrap_or(0);
+        Ok(SavePoint { model: self.model.clone(), frontiers: self.frontiers(), end })
     }
 
-    /// The live document's version vector, sorted by peer.
-    fn version(&self) -> Vec<(u64, u32)> {
-        let mut version: Vec<(u64, u32)> = self.doc.oplog_vv().iter().map(|(p, c)| (*p, u32::try_from(*c).unwrap_or(u32::MAX))).collect();
-        version.sort_unstable();
-        version
+    /// The live document's frontiers (its heads), sorted.
+    fn frontiers(&self) -> Vec<(u64, u32)> {
+        let mut heads: Vec<(u64, u32)> = self.doc.oplog_frontiers().iter().map(|id| (id.peer, u32::try_from(id.counter).unwrap_or(0))).collect();
+        heads.sort_unstable();
+        heads
     }
 
     /// Why a save now can't carry a record, if it can't.
@@ -1319,45 +1360,58 @@ impl<D: LiveDocument> Session<D> {
             Some("the live document stopped here")
         } else if self.model_stale {
             Some("the model is behind the live document")
-        } else if self.doc.oplog_vv().len() > craft_cloud_api::local::MAX_SAVE_PEERS {
-            Some("too many machines and windows have edited the document")
         } else {
             None
         }
     }
 
-    /// Whether the file on disk lacks edits the live document has: the record of the file as it is now (the agent's
-    /// word, or this session's last save) doesn't include the document's version. An app autosaves when it is dirty
-    /// or this says so, so the file catches up on its own with edits from other machines, and with its own edits
-    /// after another machine's save won over this one's. False when no record of the file is known (an edit outside
-    /// Craft is never written over by itself; not synced yet; an older agent), and when a save couldn't carry a record.
-    pub fn file_behind(&self) -> bool {
+    /// Whether the live document is strictly ahead of the file's record: everything the file was saved from is in it,
+    /// and it has more.
+    fn ahead_of_file(&self) -> bool {
         let Some(file) = &self.file_version else { return false };
-        if self.no_record().is_some() {
-            return false;
-        }
-        let includes = |peer: u64, end: u32| file.iter().any(|(p, e)| *p == peer && *e >= end);
-        self.version().into_iter().any(|(peer, end)| !includes(peer, end))
+        let vv = self.doc.oplog_vv();
+        let held = file.iter().all(|(peer, counter)| i32::try_from(*counter).is_ok_and(|c| vv.includes_id(loro::ID::new(*peer, c))));
+        held && *file != self.frontiers()
     }
 
-    /// The app is about to write `bytes` (made from `point`'s model) to the document's file: tells the agent first
-    /// (or, while it is away, keeps the record and tells it once back; it is added to the file's version then), so the
-    /// version the agent uploads for that content carries the record. Call it before the write.
+    /// Whether the file on disk lacks edits the live document has: the record of the file as it is now (the agent's
+    /// word, or this session's last save) is included in the live document's version and isn't it. An app autosaves
+    /// when it is dirty or this says so, so the file catches up on its own with edits from other machines, and with
+    /// its own edits after another machine's save won over this one's.
+    ///
+    /// False when the file's record has anything this document lacks (saved concurrently elsewhere, ahead of it, or
+    /// unknown): this session is the one behind, and waits for the live updates; only the side that is ahead saves,
+    /// and a file ahead of the live document is never written over by itself. False too when no record of the file is
+    /// known (an edit outside Craft; not synced yet; an older agent), when a save couldn't carry a record, and for
+    /// [`CATCH_UP_EVERY`] after a save it asked for (a backstop: at most one such save in that time).
+    pub fn file_behind(&self) -> bool {
+        if self.no_record().is_some() || self.caught_up_at.is_some_and(|at| at.elapsed() < CATCH_UP_EVERY) {
+            return false;
+        }
+        self.ahead_of_file()
+    }
+
+    /// The app is about to write `bytes` (made from `point`'s model) to the document's file: tells the agent, on the
+    /// same stream after every change the save covers (while it is away, the record is kept and told once it is back;
+    /// it is added to the file's version then), so the version the agent uploads for that content carries the record.
+    /// Call it before the write.
     pub fn record(&mut self, point: &SavePoint<D>, bytes: &[u8]) -> SaveRecord {
         let hash = *blake3::hash(bytes).as_bytes();
         // The file is a Craft save from now on (nothing is written to the document: the record is the agent's).
         self.status.changed_outside = false;
-        let record = SaveRecord { hash, frontiers: point.frontiers.clone(), version: point.version.clone() };
+        if !self.changed_since_save && self.ahead_of_file() {
+            // A save only the file being behind called for (no edit here since the last): the next waits a while.
+            self.caught_up_at = Some(Instant::now());
+        }
+        self.changed_since_save = false;
+        let record = SaveRecord { hash, frontiers: point.frontiers.clone() };
         // The file is this save from now on (until the agent says otherwise: the sync brought another one).
-        self.file_version = Some(record.version.clone());
-        self.records.push_back(record.clone());
+        self.file_version = Some(record.frontiers.clone());
+        self.records.push_back(Kept { record: record.clone(), end: point.end, sent: false });
         while self.records.len() > KEPT_RECORDS {
             self.records.pop_front();
         }
-        if let Some(link) = &self.link {
-            // Not sent (the connection just broke): it goes on the reconnect, with the others kept.
-            let _ = link.doc.saved(record.hash, &record.frontiers, &record.version);
-        }
+        self.send_outbox();
         record
     }
 

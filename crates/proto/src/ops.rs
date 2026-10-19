@@ -10,7 +10,7 @@ use crate::hash::ManifestId;
 use crate::ids::{DeviceId, Epoch, NodeId, VersionId};
 use crate::name::Name;
 
-pub use craft_cloud_api::local::{MAX_SAVE_PEERS, SaveRecord};
+pub use craft_cloud_api::local::{MAX_SAVE_HEADS, SaveRecord};
 
 /// A new file version. Its size comes from the manifest, which must already be uploaded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,7 +283,7 @@ mod tests {
     /// A save record is appended: a version without one has the JSON it always had (an older peer reads it), one
     /// with it reads back, and an older peer's JSON (no field) reads as none.
     #[test]
-    fn save_records_are_appended_and_compare_by_version() {
+    fn save_records_are_appended() {
         let plain = NewVersion {
             id: VersionId::from_uuid(Uuid::from_u128(1)),
             manifest: ManifestId::from_bytes([1; 32]),
@@ -294,7 +294,7 @@ mod tests {
         let json = serde_json::to_value(&plain).unwrap();
         assert!(json.get("save").is_none(), "{json}");
         let doc = crate::DocId::from_uuid(Uuid::from_u128(9));
-        let saved = NewVersion { save: Some(SaveRecord { doc, version: vec![(1, 5), (2, 3)] }), ..plain.clone() };
+        let saved = NewVersion { save: Some(SaveRecord { doc, frontiers: vec![(1, 5), (2, 3)] }), ..plain.clone() };
         let json = serde_json::to_value(&saved).unwrap();
         assert_eq!(serde_json::from_value::<NewVersion>(json).unwrap(), saved);
         let older: NewVersion = serde_json::from_value(
@@ -327,11 +327,8 @@ mod tests {
         let json = serde_json::to_value(&state).unwrap();
         assert!(json.get("save").is_some());
         assert!(serde_json::from_value::<OlderFileState>(json).is_ok());
-        let a = SaveRecord { doc, version: vec![(1, 5), (2, 3)] };
-        let b = SaveRecord { doc, version: vec![(1, 4)] };
-        let c = SaveRecord { doc, version: vec![(1, 4), (3, 1)] };
-        assert!(a.includes(&b) && !b.includes(&a));
-        assert!(!a.includes(&c) && !c.includes(&a), "concurrent");
-        assert!(a.includes(&a));
+        // A record from before frontiers (a version vector) reads as no record.
+        let vector = serde_json::json!({ "doc": doc, "version": [[1, 5]] });
+        assert!(serde_json::from_value::<SaveRecord>(vector).is_err());
     }
 }

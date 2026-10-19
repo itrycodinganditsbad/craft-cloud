@@ -1788,6 +1788,17 @@ impl<S: DocStore> Replica<S> {
         Some((snapshot, after))
     }
 
+    /// Whether this machine's copy of a document of a file holds every operation `ids` names (a save's frontiers).
+    pub fn document_holds(&self, id: DocId, ids: &[(u64, u32)]) -> bool {
+        self.docs.get(&id).filter(|d| d.kind.is_document()).is_some_and(|d| d.body.copy().holds(ids))
+    }
+
+    /// Whether a document of a file, as frontiers `a` name it, holds every operation of frontiers `b`; `None` when this
+    /// machine's copy can't tell (it lacks their operations, or isn't loaded).
+    pub fn document_includes(&self, id: DocId, a: &[(u64, u32)], b: &[(u64, u32)]) -> Option<bool> {
+        self.docs.get(&id).filter(|d| d.kind.is_document())?.body.copy().includes(a, b)
+    }
+
     /// Whether a document being joined waits for an app's import (the server doesn't have it).
     pub fn needs_import(&self, id: DocId) -> bool {
         self.docs.get(&id).is_some_and(|d| d.join == Some(Join::NeedsImport))
@@ -1827,7 +1838,8 @@ impl<S: DocStore> Replica<S> {
     /// returns, and sent when the link is up. Returns the frames to send.
     pub fn local_update(&mut self, id: DocId, bytes: &[u8]) -> Result<Vec<ClientFrame>, LocalError> {
         let Some(doc) = self.docs.get_mut(&id).filter(|d| d.joined && d.kind.is_document()) else {
-            return Err(LocalError::Invalid("the document isn't open here".into()));
+            // (After a disk error the copy may be being read back: for now, worth sending again.)
+            return Err(LocalError::Io(std::io::Error::other("the document isn't open here (being read back from disk?)")));
         };
         if bytes.is_empty() || bytes.len() > MAX_UPDATE_BYTES {
             return Err(LocalError::Invalid(format!("an update is 1 to {MAX_UPDATE_BYTES} bytes")));

@@ -484,152 +484,54 @@ pub mod docs {
     }
 }
 
-/// How many Loro peers an agent hands out for one document and one app on its machine: a document open in that many
-/// windows (or sessions) of one app at once gets a peer each, and the peers are used again after a close or a crash.
-/// A document's version vector, and so a save record, has at most machines × apps × this many entries.
-pub const PEER_POOL: usize = 8;
-
-/// The agent's leases of Loro peers ([`PEER_POOL`]): per document and app, slot `i` is always the same peer (from
-/// the machine's and app's `base`), so a document's version vector grows by at most the pool per machine and app.
-///
-/// An open takes the peer it asks for again (`hint`) if that slot is free, else the first free one, else none. A close
-/// frees its slot at once; a connection that went without closing (a crash, the agent's restart, a lost connection)
-/// leaves its slots held for [`peers::LEASE_GRACE`], for the same app to come back to with its hint: a new window that
-/// took that peer meanwhile would write over what the old one hadn't sent yet.
-pub mod peers {
-    use std::collections::BTreeMap;
-    use std::time::{Duration, Instant};
-
-    use super::PEER_POOL;
-    use crate::ids::DocId;
-
-    /// How long a connection's peers stay held for it after it went without closing.
-    pub const LEASE_GRACE: Duration = Duration::from_secs(60);
-
-    /// Who holds a slot: a connection and its number for the document.
-    pub type Holder = (u64, u64);
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Slot {
-        Free,
-        Held(Holder),
-        /// Its connection went without closing: kept for its hint until then.
-        Kept(Instant),
-    }
-
-    /// Slot `slot`'s peer for `base`: the base's high bits and the slot, below 2⁶³.
-    pub fn peer_of(base: u64, slot: usize) -> u64 {
-        let pool = PEER_POOL as u64;
-        ((base >> 1) / pool * pool) + slot as u64 % pool
-    }
-
-    /// The leases of one agent.
-    #[derive(Debug, Clone, Default)]
-    pub struct Leases {
-        slots: BTreeMap<(DocId, String), (u64, [Slot; PEER_POOL])>,
-    }
-
-    impl Leases {
-        /// A peer for `holder`'s open of `doc` by `app` (whose machine-and-app base is `base`): the one it holds
-        /// already, or `hint`'s slot if free, or the first free slot; none when all are taken.
-        pub fn lease(&mut self, doc: DocId, app: &str, base: u64, holder: Holder, hint: Option<u64>, now: Instant) -> Option<u64> {
-            let (base, slots) = self.slots.entry((doc, app.to_owned())).or_insert((base, [Slot::Free; PEER_POOL]));
-            for slot in slots.iter_mut() {
-                if matches!(slot, Slot::Kept(until) if *until <= now) {
-                    *slot = Slot::Free;
-                }
-            }
-            if let Some(i) = slots.iter().position(|s| *s == Slot::Held(holder)) {
-                return Some(peer_of(*base, i));
-            }
-            let hinted = hint.and_then(|h| (0..PEER_POOL).find(|i| peer_of(*base, *i) == h));
-            let free = |s: &Slot| *s == Slot::Free;
-            let chosen = match hinted {
-                Some(i) if slots.get(i).is_some_and(|s| !matches!(s, Slot::Held(_))) => Some(i),
-                _ => slots.iter().position(free),
-            }?;
-            let slot = slots.get_mut(chosen)?;
-            *slot = Slot::Held(holder);
-            Some(peer_of(*base, chosen))
-        }
-
-        /// `holder` closed the document: its slot is free at once.
-        pub fn release(&mut self, holder: Holder) {
-            for (_, slots) in self.slots.values_mut() {
-                for slot in slots.iter_mut().filter(|s| **s == Slot::Held(holder)) {
-                    *slot = Slot::Free;
-                }
-            }
-            self.slots.retain(|_, (_, slots)| slots.iter().any(|s| *s != Slot::Free));
-        }
-
-        /// Connection `conn` went without closing: its slots are kept for their hints until [`LEASE_GRACE`] from now.
-        pub fn gone(&mut self, conn: u64, now: Instant) {
-            for (_, slots) in self.slots.values_mut() {
-                for slot in slots.iter_mut() {
-                    if matches!(slot, Slot::Held((c, _)) if *c == conn) {
-                        *slot = Slot::Kept(now + LEASE_GRACE);
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// A control message from an app on the docs WebSocket ([`docs`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum DocsRequest {
     /// Open the file at `path` (relative to the synced folder, `/`-separated, or absolute inside it) as a live document
-    /// for `app` (a lowercase app name), under the number `id` on this connection. `peer`: the Loro peer the app
-    /// used for this document before (reopening it after the connection went), which the agent gives it again if it
-    /// is free ([`PEER_POOL`]). `file_hash`: the BLAKE3 hash (hex) of the file's bytes as the app read them, for
-    /// `opened` to say whether a Craft app saved them ([`DocsEvent::Opened`]'s `changed_outside`).
+    /// for `app` (a lowercase app name), under the number `id` on this connection. `file_hash`: the BLAKE3 hash (hex)
+    /// of the file's bytes as the app read them, for `opened` to say whether a Craft app saved them
+    /// ([`DocsEvent::Opened`]'s `changed_outside`).
     Open {
         id: u64,
         path: String,
         app: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        peer: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         file_hash: Option<String>,
     },
     /// The app is done with the document.
     Close { doc: crate::ids::DocId },
-    /// The app saved the document's file: its content's BLAKE3 hash (hex) and the live document's version it was made
-    /// from (Loro's frontiers, hex, and the version vector as `[peer, end counter]` pairs). The agent records it with
-    /// the file version it uploads for that content ([`SaveRecord`]). An agent from before save records answers
-    /// `error` and saves nothing; the file syncs as any file does.
-    Saved { doc: crate::ids::DocId, hash: String, frontiers: String, version: Vec<(u64, u32)> },
+    /// The app is about to write the document's file: its content's BLAKE3 hash (hex) and the live document's
+    /// frontiers it was made from (Loro's heads, `[peer, counter]` operation IDs). Sent on the same stream after every
+    /// change it covers; the agent keeps it once all those operations are in its copy (one that comes first waits for
+    /// them, and is dropped if the app closes the document before), and records it with the file version it uploads
+    /// for that content ([`SaveRecord`]).
+    Saved { doc: crate::ids::DocId, hash: String, frontiers: Vec<(u64, u32)> },
 }
 
-/// Most entries a save record's version may have (peers that edited the live document). With peers from the agents'
-/// pools ([`PEER_POOL`]) that is 32 machines × apps; a record with more isn't kept. At most about 9 KiB of JSON.
-pub const MAX_SAVE_PEERS: usize = 256;
+/// Most heads a save record's frontiers may have: the live document's concurrent tips, one or two in practice
+/// (a record with more is a hostile one and isn't kept). At most about 9 KiB of JSON.
+pub const MAX_SAVE_HEADS: usize = 256;
 
 /// A file version a Craft app saved from a live document: what the version's content came from. Kept with the
 /// version on the server (an older server or agent ignores it), so the file sync can tell two Craft saves of one live
 /// document from an edit outside Craft.
+///
+/// It names the live document's frontiers when saved (its heads: the last operations, as `(peer, counter)`), never a
+/// version vector, so it stays small however many machines and sessions have edited the document. Whether one record
+/// includes another is answered by an agent that holds the document, from its copy (see the sync's `SaveRecords`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SaveRecord {
     /// The live document.
     pub doc: crate::ids::DocId,
-    /// The live document's version vector when saved: `(peer, end counter)`, sorted by peer.
-    pub version: Vec<(u64, u32)>,
+    /// The live document's frontiers when saved: `(peer, counter)` operation IDs, sorted.
+    pub frontiers: Vec<(u64, u32)>,
 }
 
 impl SaveRecord {
-    /// Whether this save's version includes everything `other`'s does.
-    pub fn includes(&self, other: &SaveRecord) -> bool {
-        let sorted = self.version.windows(2).all(|w| matches!(w, [a, b] if a.0 < b.0));
-        let end_of = |peer: u64| {
-            if sorted {
-                self.version.binary_search_by_key(&peer, |(p, _)| *p).ok().and_then(|i| self.version.get(i)).map(|(_, e)| *e)
-            } else {
-                self.version.iter().find(|(p, _)| *p == peer).map(|(_, e)| *e)
-            }
-        };
-        other.version.iter().all(|(peer, end)| end_of(*peer).is_some_and(|e| e >= *end))
+    /// Whether the record is well formed: at most [`MAX_SAVE_HEADS`] heads, sorted and distinct.
+    pub fn is_valid(&self) -> bool {
+        self.frontiers.len() <= MAX_SAVE_HEADS && self.frontiers.windows(2).all(|w| matches!(w, [a, b] if a < b))
     }
 }
 
@@ -672,26 +574,19 @@ pub enum NotLiveReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum DocsEvent {
-    /// The document is live: its state follows as a binary frame of `state.bytes` bytes. `peer`: the Loro peer the
-    /// app writes this document with while it has it open ([`PEER_POOL`]; none from an older agent, or when every one
-    /// is taken: the app picks a random one). `changed_outside`, for an open that named its `file_hash`: whether no
-    /// Craft app's save of this document (this machine's records, or the file version's on the server) has that
-    /// content: the file was edited outside Craft, and the app may offer to bring it in. None: the agent can't tell.
+    /// The document is live: its state follows as a binary frame of `state.bytes` bytes. `changed_outside`, for an
+    /// open that named its `file_hash`: whether no Craft app's save of this document (this machine's records, or the
+    /// file version's on the server) has that content: the file was edited outside Craft, and the app may offer to
+    /// bring it in. None: the agent can't tell. (Every app session writes with a fresh random Loro peer of its own.)
     Opened {
         id: u64,
         doc: crate::ids::DocId,
         state: DocState,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        peer: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         changed_outside: Option<bool>,
     },
-    /// The file has never been live: send its content as a binary import frame (written with `peer`, as `opened`'s).
-    NeedsImport {
-        id: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        peer: Option<u64>,
-    },
+    /// The file has never been live: send its content as a binary import frame.
+    NeedsImport { id: u64 },
     /// The file opens as a plain file.
     NotLive {
         id: u64,
@@ -713,14 +608,14 @@ pub enum DocsEvent {
         #[serde(default)]
         stopped: bool,
     },
-    /// The file of an open document, as it is on this machine's disk now: the version of the live document a Craft
-    /// app saved it from (the record of that save, this machine's or the server's version's), or none when no record
-    /// is known (edited outside Craft, not synced yet). Sent after `opened` and whenever it changes (the app saved,
-    /// the sync brought another machine's save). An app whose live document has edits the file lacks saves again.
+    /// The file of an open document, as it is on this machine's disk now: the live document's frontiers a Craft app
+    /// saved it from (the record of that save, this machine's or the server's version's), or none when no record is
+    /// known (edited outside Craft, not synced yet). Sent after `opened` and whenever it changes (the app saved, the
+    /// sync brought another machine's save). An app whose live document is strictly ahead of it saves again.
     File {
         doc: crate::ids::DocId,
         #[serde(default)]
-        version: Option<Vec<(u64, u32)>>,
+        frontiers: Option<Vec<(u64, u32)>>,
     },
     /// A request or a binary frame was refused (`id` and `seq` name it when they can). `code` is one of
     /// [`crate::api::codes`] or [`codes`].
@@ -753,57 +648,15 @@ pub fn recent_path(path: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Two opens at once get distinct peers; a close frees its peer for the next open; a connection gone without a
-    /// close keeps its peer for its hint until the grace is over, then anyone may have it; past the pool, none. Every
-    /// peer handed out is one of the pool's, whatever the opens and hints.
+    /// A save record names frontiers, sorted and distinct, at most [`MAX_SAVE_HEADS`] of them.
     #[test]
-    fn peers_are_leased_from_a_small_pool() {
-        use peers::{LEASE_GRACE, Leases, peer_of};
-        use std::time::{Duration, Instant};
-        let (doc, base, t0) = (crate::ids::DocId::generate(), 0xDEAD_BEEF_0123_4567u64, Instant::now());
-        let pool: Vec<u64> = (0..PEER_POOL).map(|i| peer_of(base, i)).collect();
-        assert!(pool.iter().all(|p| *p < 1 << 63));
-        let mut l = Leases::default();
-        let a = l.lease(doc, "wordcraft", base, (1, 1), None, t0).unwrap();
-        let b = l.lease(doc, "wordcraft", base, (2, 1), None, t0).unwrap();
-        assert_ne!(a, b);
-        assert_eq!(l.lease(doc, "wordcraft", base, (1, 1), None, t0), Some(a), "the same open, the same peer");
-        // Another document or app: its own pool, slot 0 again.
-        assert_eq!(l.lease(crate::ids::DocId::generate(), "wordcraft", base, (1, 2), None, t0), Some(a));
-        l.release((1, 1));
-        assert_eq!(l.lease(doc, "wordcraft", base, (3, 1), None, t0), Some(a), "a closed peer is used again");
-        // A crash: kept for the hint, not for a new open.
-        l.gone(3, t0);
-        let c = l.lease(doc, "wordcraft", base, (4, 1), None, t0).unwrap();
-        assert!(c != a && c != b);
-        assert_eq!(l.lease(doc, "wordcraft", base, (5, 1), Some(a), t0 + Duration::from_secs(1)), Some(a), "back with its hint");
-        l.gone(5, t0);
-        let late = t0 + LEASE_GRACE + Duration::from_secs(1);
-        assert_eq!(l.lease(doc, "wordcraft", base, (6, 1), None, late), Some(a), "after the grace, anyone's");
-        // A hint held by a live open isn't given twice.
-        let d = l.lease(doc, "wordcraft", base, (7, 1), Some(b), late).unwrap();
-        assert!(d != b && pool.contains(&d));
-        // Past the pool: none.
-        for i in 0..PEER_POOL as u64 {
-            let _ = l.lease(doc, "wordcraft", base, (100 + i, 1), Some(u64::MAX), late);
-        }
-        assert_eq!(l.lease(doc, "wordcraft", base, (200, 1), None, late), None);
-        // Whatever happened, only the pool's peers.
-        let mut seen = std::collections::BTreeSet::new();
-        for i in 0..PEER_POOL as u64 {
-            l.release((100 + i, 1));
-        }
-        for i in 0..50u64 {
-            if let Some(p) = l.lease(doc, "wordcraft", base, (300 + i, 1), Some(i), late) {
-                seen.insert(p);
-            }
-            if i % 3 == 0 {
-                l.release((300 + i, 1));
-            } else {
-                l.gone(300 + i, late);
-            }
-        }
-        assert!(seen.iter().all(|p| pool.contains(p)), "{seen:?}");
+    fn a_save_record_is_its_frontiers() {
+        let doc = crate::ids::DocId::generate();
+        assert!(SaveRecord { doc, frontiers: vec![(1, 5), (2, 0)] }.is_valid());
+        assert!(SaveRecord { doc, frontiers: Vec::new() }.is_valid(), "an empty document");
+        assert!(!SaveRecord { doc, frontiers: vec![(2, 0), (1, 5)] }.is_valid(), "unsorted");
+        assert!(!SaveRecord { doc, frontiers: vec![(1, 5), (1, 5)] }.is_valid(), "twice");
+        assert!(!SaveRecord { doc, frontiers: (0..=MAX_SAVE_HEADS as u64).map(|p| (p, 1)).collect() }.is_valid());
     }
 
     /// A list's event says when its push stopped; without the field (an older agent) it hasn't.
@@ -922,16 +775,11 @@ mod tests {
         assert_eq!(docs::decode_binary(&frame[..8]), None, "too short for a header");
         assert_eq!(docs::decode_binary(&[]), None);
         let open: DocsRequest = serde_json::from_value(serde_json::json!({ "type": "open", "id": 1, "path": "a.txt", "app": "wordcraft" })).unwrap();
-        assert_eq!(open, DocsRequest::Open { id: 1, path: "a.txt".into(), app: "wordcraft".into(), peer: None, file_hash: None });
-        let plain = serde_json::to_value(DocsEvent::Opened {
-            id: 1,
-            doc: crate::ids::DocId::generate(),
-            state: DocState::default(),
-            peer: None,
-            changed_outside: None,
-        })
-        .unwrap();
-        assert!(plain.get("peer").is_none() && plain.get("changed_outside").is_none(), "none: no field (as an older agent sends it)");
+        assert_eq!(open, DocsRequest::Open { id: 1, path: "a.txt".into(), app: "wordcraft".into(), file_hash: None });
+        let plain =
+            serde_json::to_value(DocsEvent::Opened { id: 1, doc: crate::ids::DocId::generate(), state: DocState::default(), changed_outside: None })
+                .unwrap();
+        assert!(plain.get("changed_outside").is_none(), "none: no field (as an older agent sends it)");
         let not_live = serde_json::to_value(DocsEvent::NotLive { id: 1, reason: NotLiveReason::NotSynced, message: None }).unwrap();
         assert_eq!(not_live, serde_json::json!({ "type": "not_live", "id": 1, "reason": "not_synced", "message": null }));
         let status: DocsEvent =

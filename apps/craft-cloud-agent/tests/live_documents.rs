@@ -43,6 +43,13 @@ impl AppDoc {
         self.loro.get_text("text").to_string()
     }
 
+    /// The document's heads, as a save record names them.
+    fn heads(&self) -> Vec<(u64, u32)> {
+        let mut heads: Vec<(u64, u32)> = self.loro.oplog_frontiers().iter().map(|id| (id.peer, id.counter as u32)).collect();
+        heads.sort_unstable();
+        heads
+    }
+
     /// Applies what came; the other events.
     fn pump(&self) -> Vec<Event> {
         let mut others = Vec::new();
@@ -149,53 +156,79 @@ async fn a_file_opened_on_one_machine_is_live_on_the_other() {
     run_laptop.stop().await.0.unwrap();
 }
 
-/// The agent lends each open a Loro peer from its pool: two opens at once get distinct ones (the import's is the
-/// first open's), a closed one's goes to the next open, and an open that asks for its peer again gets it while free.
+/// The records the agent's save book holds, by content hash (hex), as the sync reads them.
+fn book(data: &std::path::Path) -> Vec<(String, Vec<(u64, u32)>)> {
+    let Ok(spaces) = std::fs::read_dir(data.join("live")) else { return Vec::new() };
+    let mut out = Vec::new();
+    for space in spaces.flatten() {
+        let Ok(bytes) = std::fs::read(space.path().join("saves.json")) else { continue };
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap_or_default();
+        for e in entries {
+            let frontiers = serde_json::from_value(e["frontiers"].clone()).unwrap_or_default();
+            out.push((e["hash"].as_str().unwrap_or_default().to_owned(), frontiers));
+        }
+    }
+    out
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A save record that comes before the changes it covers waits for them: kept once they are in the agent's copy,
+/// never before; one whose app closes the document before its changes come is dropped, and its changes arriving
+/// later on another connection don't bring it back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn opens_get_peers_from_the_agents_pool() {
-    use craft_cloud_app::live::OpenOptions;
+async fn a_save_record_waits_for_the_changes_it_covers() {
     let server = Server::new().await;
     let pc = Agent::signed_in(&server, "pc").await;
     let run_pc = pc.run();
     let on_pc = pc.client().await;
     std::fs::create_dir_all(&pc.folder).unwrap();
-    std::fs::write(pc.folder.join("p.txt"), "pooled").unwrap();
+    std::fs::write(pc.folder.join("w.txt"), "waits").unwrap();
     let c = on_pc.clone();
     eventually("the file is synced", move || {
         let docs = c.documents().ok()?;
-        matches!(docs.open("p.txt", "wordcraft").ok()?, Opened::NeedsImport(_)).then_some(())
+        matches!(docs.open("w.txt", "wordcraft").ok()?, Opened::NeedsImport(_)).then_some(())
     })
     .await;
     let c = on_pc.clone();
-    let peers = off(move || {
+    let (docs, app) = off(move || {
         let docs = c.documents().unwrap();
-        let import_peer = match docs.open("p.txt", "wordcraft").unwrap() {
-            Opened::NeedsImport(importer) => importer.peer(),
-            _ => panic!("not asked for the import"),
-        };
-        drop(docs);
-        let (one, two) = (c.documents().unwrap(), c.documents().unwrap());
-        let a = open(&one, "p.txt", "pooled");
-        let b = open(&two, "p.txt", "pooled");
-        let (pa, pb) = (a.peer(), b.peer());
-        // A close frees its peer for the next open.
-        drop(b);
-        let next = open(&two, "p.txt", "pooled").peer();
-        // A new connection asking for a peer held by a live open gets another; one that is free, itself.
-        let three = c.documents().unwrap();
-        let taken = match three.open_with("p.txt", "wordcraft", &OpenOptions { peer: pa, ..OpenOptions::default() }).unwrap() {
-            Opened::Live(d) => d.peer(),
-            _ => panic!("not live"),
-        };
-        (import_peer, pa, pb, next, taken, a, one, two, three)
+        let doc = open(&docs, "w.txt", "waits");
+        (docs, AppDoc::new(doc, 51))
     })
     .await;
-    let (import_peer, pa, pb, next, taken, ..) = &peers;
-    assert!(import_peer.is_some() && pa.is_some() && pb.is_some());
-    assert_ne!(pa, pb, "two opens at once");
-    assert_eq!(next, pb, "a closed open's peer is the next one's");
-    assert!(taken.is_some() && taken != pa, "a peer held by a live open isn't lent twice");
-    drop(peers);
+    // A change made, its record sent first, the change after.
+    let t = app.loro.get_text("text");
+    let before = app.loro.oplog_vv();
+    t.insert(t.len_unicode(), " and saved").unwrap();
+    app.loro.commit();
+    let heads = app.heads();
+    app.doc.saved(*blake3::hash(b"first").as_bytes(), &heads).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let data = pc.data.path().to_owned();
+    assert!(!book(&data).iter().any(|(h, _)| *h == hex(blake3::hash(b"first").as_bytes())), "not before its change");
+    app.doc.send(&app.loro.export(ExportMode::updates(&before)).unwrap()).unwrap();
+    let (d, want) = (data.clone(), (hex(blake3::hash(b"first").as_bytes()), heads.clone()));
+    eventually("kept once its change is in", move || book(&d).contains(&want).then_some(())).await;
+    // Another, whose change never comes on its connection: the app closes the document first.
+    let before = app.loro.oplog_vv();
+    t.insert(t.len_unicode(), "!").unwrap();
+    app.loro.commit();
+    let update = app.loro.export(ExportMode::updates(&before)).unwrap();
+    app.doc.saved(*blake3::hash(b"second").as_bytes(), &app.heads()).unwrap();
+    drop((app, docs));
+    let c = on_pc.clone();
+    let _later = off(move || {
+        let docs = c.documents().unwrap();
+        let doc = open(&docs, "w.txt", "waits");
+        doc.send(&update).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        (docs, doc)
+    })
+    .await;
+    assert!(!book(&data).iter().any(|(h, _)| *h == hex(blake3::hash(b"second").as_bytes())), "dropped with its session");
     run_pc.stop().await.0.unwrap();
 }
 
@@ -695,7 +728,10 @@ async fn a_craft_save_goes_up_with_its_record() {
     })
     .await;
     let saved = b"start, then saved by the app".to_vec();
-    app.doc.saved(*blake3::hash(&saved).as_bytes(), &[1, 2, 3], &[(31, 4), (7, 2)]).unwrap();
+    // The app's change, then its record (after the change, on the same stream).
+    app.append(", then saved by the app");
+    let heads = app.heads();
+    app.doc.saved(*blake3::hash(&saved).as_bytes(), &heads).unwrap();
     // The agent writes the record down before the app writes the file (the app's call comes first).
     let book = pc.data.path().join("live");
     eventually("the record is kept", move || {
@@ -724,7 +760,7 @@ async fn a_craft_save_goes_up_with_its_record() {
     }
     let record = record.expect("the save went up with its record");
     assert_eq!(record.doc, app.doc.id());
-    assert_eq!(record.version, vec![(7, 2), (31, 4)]);
+    assert_eq!(record.frontiers, heads);
     // Another program edits it: no record.
     std::fs::write(pc.folder.join("story.txt"), "edited in a text editor").unwrap();
     let mut plain = false;
@@ -743,7 +779,7 @@ async fn a_craft_save_goes_up_with_its_record() {
     let (outside, ours) = off(move || {
         let docs = c.documents().unwrap();
         let ask = |bytes: &[u8]| {
-            let options = craft_cloud_app::live::OpenOptions { file_hash: Some(*blake3::hash(bytes).as_bytes()), ..Default::default() };
+            let options = craft_cloud_app::live::OpenOptions { file_hash: Some(*blake3::hash(bytes).as_bytes()) };
             match docs.open_with("story.txt", "wordcraft", &options).unwrap() {
                 Opened::Live(d) => d.changed_outside(),
                 _ => panic!("not live"),
@@ -768,7 +804,9 @@ async fn a_craft_save_goes_up_with_its_record() {
     }
     let up = up.expect("the save went up");
     assert_eq!(up.save, None);
-    app.doc.saved(*blake3::hash(&late).as_bytes(), &[1], &[(31, 9)]).unwrap();
+    app.append(" (later)");
+    let late_heads = app.heads();
+    app.doc.saved(*blake3::hash(&late).as_bytes(), &late_heads).unwrap();
     let mut added = None;
     for _ in 0..600 {
         if let Some(f) = current(server.meta.clone()).await
@@ -781,7 +819,7 @@ async fn a_craft_save_goes_up_with_its_record() {
     }
     let added = added.expect("the late record was added");
     assert_eq!(added.version, up.version, "to the version that went up");
-    assert_eq!(added.save.map(|s| s.version), Some(vec![(31, 9)]));
+    assert_eq!(added.save.map(|s| s.frontiers), Some(late_heads));
     drop((docs, app));
     run_pc.stop().await.0.unwrap();
 }

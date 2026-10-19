@@ -140,11 +140,11 @@ applies.
 Save and autosave work as before, in this order:
 
 ```rust
-// 1. Where the save starts: the model to write and the live document's version it matches.
+// 1. Where the save starts: the model to write and the live document's frontiers it matches.
 let point = self.session.save_point();
 // 2. The bytes, from that model (or, with no save point, from the app's own model: no record then).
 let bytes = to_file(point.as_ref().map_or(&self.model, |p| p.model()));
-// 3. The record (content hash and version) to the agent, before the file changes on disk.
+// 3. The record (content hash and frontiers) to the agent, before the file changes on disk.
 if let Ok(point) = &point {
     self.session.record(point, &bytes);
 }
@@ -154,17 +154,27 @@ write_atomic(&path, &bytes)?;
 
 `save_point()` refuses (`KitError::NoRecord`) when a record would be wrong: the document is read-only here (a newer
 app's), the session is stalled or stopped, or the model is behind the live document. The app saves its own model
-then, and the file syncs as any file does. The record goes before the write so the agent knows the content before
-its sync pass sees it; while the agent is away the session keeps the record and tells it once back, and the agent
-adds it to the version it uploaded meanwhile (a server call of its own, appended once).
+then, and the file syncs as any file does.
+
+A record names the live document's frontiers (its heads, one or two operation IDs however many machines and sessions
+edited it), never a version vector. The session sends it on the same stream as its changes, after every change it
+covers; the agent keeps it once all those operations are in its copy (a record that comes first waits for them, and
+is dropped if the window closes before they come: that version then has no record, and its edits are in the file, so
+nothing is lost). The record goes before the write so the agent knows the content before its sync pass sees it; while
+the agent is away the session keeps the record and tells it once back, and the agent adds it to the version it
+uploaded meanwhile (a server call of its own, appended once). Every session writes with a fresh random Loro peer of
+its own; nothing is ever written with a peer another session may have had.
 
 The agent records it with the version it uploads, so two machines saving one live file never make a conflict copy:
-the save that includes the other's wins, or else the newer upload. The losing version is no conflict copy, but it
-stays in the server's history, and nothing of it is lost: the live document has both sides' edits.
+the save that includes the other's wins, or else the newer upload. Which includes which the agent asks its own copy
+of the document; while it can't tell (it lacks the operations), neither side is taken and the next pass asks again,
+and after 10 minutes still unknown it is a conflict copy, as for any two edits. A winner is never guessed. The losing
+version is no conflict copy, but it stays in the server's history, and nothing of it is lost: the live document has
+both sides' edits.
 
 The live document is the truth and the file a copy of it, which may be late. To have it catch up on its own,
-autosave when the model is dirty **or** when `session.file_behind()` says the file lacks edits the live document has
-(another machine's, or this machine's after another machine's save won over this one's):
+autosave when the model is dirty **or** when `session.file_behind()` says the live document is strictly ahead of the
+file (another machine's edits came live, or this machine's after another machine's save won over this one's):
 
 ```rust
 if autosave_due && (self.dirty || self.session.file_behind()) {
@@ -173,17 +183,28 @@ if autosave_due && (self.dirty || self.session.file_behind()) {
 ```
 
 The session knows the record of the file as it is on disk from the agent (it looks at the file of every open
-document each second), and from its own last save. `file_behind()` is false when no record of the file is known (an
-edit outside Craft is never written over by itself; an older agent), and when a save couldn't carry a record. Once
-every window's file has the live document's version, nobody saves again. When no app has the document open, nobody
-writes the file: it stays behind until the next open, which shows the live document and saves when it is behind.
+document each second), and from its own last save. `file_behind()` is true only when everything the file was saved
+from is in the live document and the live document has more. When the file has anything this live document lacks
+(another machine's save that came by file sync before its live updates, a save made apart), it is false: this side
+waits for the live updates, so a file ahead of the live document is never written over by itself, and two machines
+whose live connection is down while files still sync never save back and forth. It is false too when no record of the
+file is known (an edit outside Craft; an older agent), when a save couldn't carry a record, and for 5 s after a save
+it asked for (a backstop). Once every window's file has the live document's frontiers, nobody saves again. When no
+app has the document open, nobody writes the file: it stays behind until the next open, which shows the live document
+and saves when it is ahead.
 
-A file edited outside Craft has no record: it gets a conflict copy as always, and the
-kit says so on open (`status().changed_outside`), so the app can bring the file in as an ordinary local change
-(`local_change(model, file_model)`) or keep the live content. It is decided once, at the open, from the bytes the
-app read (`Session::open`'s `file_bytes`): the agent looks their hash up among this machine's records and the record
-of the file's version on the server, so any Craft save, however many came after it, is never taken for an outside
-edit. Saving clears it.
+A file edited outside Craft has no record: it gets a conflict copy as always, and the kit says so on open
+(`status().changed_outside`). It is decided once, at the open, from the bytes the app read (`Session::open`'s
+`file_bytes`): the agent looks their hash up among this machine's records and the record of the file's version on the
+server, so any Craft save, however many came after it, is never taken for an outside edit. A Craft save made without
+a record (read-only, stopped, a record that never reached the agent) reads as changed outside too; its edits are in
+the file.
+
+Bringing the file in is the user's choice, never the kit's: the app shows `changed_outside` and offers it, and on a
+yes calls `session.replace_with_file(file_model)`. The file's content then replaces the live content as one ordinary
+change on every machine, one undo step named "Replace with the file's content" (`step_name`, for the Undo label). Say
+plainly in the prompt that it **replaces the live edits made since the file was written**, and that Undo brings them
+back. Saving clears `changed_outside`.
 
 ## Presence
 

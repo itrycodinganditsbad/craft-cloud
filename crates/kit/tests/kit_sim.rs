@@ -1,7 +1,8 @@
 //! The kit simulation: app sessions on three machines of one fake hub (two apps on the third), each making random
 //! edits of every shape (tree, rich text, table, timeline, opaque), undoing and redoing, saving, while machines go
-//! offline, drop their apps' connections and restart. Healed, every session ends with the same model, and every model
-//! is one the app could make (normalised).
+//! offline, drop their apps' connections and restart, and the live relay goes down while files still sync. Healed,
+//! every session ends with the same model, every model is one the app could make (normalised), and the file catches up
+//! with the autosave rule within a save per window.
 //!
 //! `SIM_SEEDS=5000 SIM_FIRST=0 cargo test --release -p craft-cloud-kit --test kit_sim` runs seeds 0 to 4999 on
 //! `SIM_JOBS` threads (default 4); `SIM_SEED=17` runs one. A seed's history is random but not replayed exactly: the
@@ -69,13 +70,16 @@ fn run_seed(seed: u64) {
                 fakes[m].start();
                 stopped[m] = false;
             }
+            // The live relay goes down (files still sync) or comes back.
+            22 => hub.set_live(rng.below(2) == 0),
             _ => std::thread::sleep(Duration::from_millis(rng.below(3) as u64)),
         }
         for s in &mut sessions {
             s.poll();
         }
     }
-    // Healed: every machine runs and is online, and every session tries at once.
+    // Healed: every machine runs and is online, the live relay is up, and every session tries at once.
+    hub.set_live(true);
     for f in &fakes {
         f.start();
         f.set_online(true);
@@ -106,8 +110,16 @@ fn run_seed(seed: u64) {
     if let Ok(point) = sessions[0].save_point() {
         sessions[0].record(&point, b"healed");
     }
+    let heads = |s: &Session<TestApp>| {
+        let doc = loro::LoroDoc::new();
+        doc.import(&s.snapshot().unwrap()).unwrap();
+        let mut v: Vec<(u64, u32)> = doc.oplog_frontiers().iter().map(|id| (id.peer, u32::try_from(id.counter).unwrap())).collect();
+        v.sort_unstable();
+        v
+    };
     let (mut saves, mut quiet) = (0usize, 0);
-    while quiet < 30 {
+    // (A save the file being behind asks for may wait out `CATCH_UP_EVERY` after the window's last one.)
+    while quiet < 30 || sessions.iter().any(|s| hub.file(PATH) != Some(heads(s))) {
         let mut saved = false;
         for s in &mut sessions {
             s.poll();
@@ -124,15 +136,8 @@ fn run_seed(seed: u64) {
         std::thread::sleep(Duration::from_millis(2));
     }
     assert!(saves <= sessions.len(), "seed {seed}: {saves} saves to catch up");
-    let version = |s: &Session<TestApp>| {
-        let doc = loro::LoroDoc::new();
-        doc.import(&s.snapshot().unwrap()).unwrap();
-        let mut v: Vec<(u64, u32)> = doc.oplog_vv().iter().map(|(p, c)| (*p, u32::try_from(*c).unwrap())).collect();
-        v.sort_unstable();
-        v
-    };
     for (i, s) in sessions.iter().enumerate() {
-        assert_eq!(hub.file(PATH), Some(version(s)), "seed {seed}: session {i}'s edits aren't all in the file");
+        assert_eq!(hub.file(PATH), Some(heads(s)), "seed {seed}: session {i}'s edits aren't all in the file");
     }
     for (i, s) in sessions.iter().enumerate() {
         if let Err(why) = valid(s.model()) {

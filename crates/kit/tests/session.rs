@@ -368,6 +368,100 @@ fn a_model_behind_the_document_takes_no_local_change_until_rebuilt() {
     });
 }
 
+/// The reviewer's probe: a title and layers; the layers fail to rebuild on the laptop.
+#[derive(Clone, Debug)]
+struct Two {
+    title: Arc<String>,
+    layers: Arc<Vec<(craft_cloud_kit::ElemId, String)>>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct TwoLayers<'a>(&'a Two);
+
+impl craft_cloud_kit::TreeSource for TwoLayers<'_> {
+    fn roots(&self) -> Vec<craft_cloud_kit::ElemId> {
+        self.0.layers.iter().map(|(id, _)| *id).collect()
+    }
+    fn children(&self, _: craft_cloud_kit::ElemId) -> Vec<craft_cloud_kit::ElemId> {
+        Vec::new()
+    }
+    fn write(&self, id: craft_cloud_kit::ElemId, props: &mut craft_cloud_kit::Props<'_, '_>) -> Result<(), KitError> {
+        if let Some((_, name)) = self.0.layers.iter().find(|(i, _)| *i == id) {
+            props.set("name", name.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+struct TwoApp;
+
+impl craft_cloud_kit::LiveDocument for TwoApp {
+    type Doc = Two;
+    const APP: &'static str = "two";
+    const SCHEMA: u32 = 1;
+    fn mappings(doc: &Two) -> craft_cloud_kit::Mappings<'_> {
+        craft_cloud_kit::Mappings::new()
+            .opaque("title", craft_cloud_kit::Opaque { value: Some(&*doc.title), key: Some(Arc::as_ptr(&doc.title) as usize) })
+            .tree("layers", TwoLayers(doc))
+    }
+    fn apply_remote(old: &Arc<Two>, patch: &craft_cloud_kit::RemotePatch<'_>) -> Result<Arc<Two>, KitError> {
+        let mut new = (**old).clone();
+        if let Some(title) = patch.opaque("title") {
+            new.title = Arc::new(String::from_utf8_lossy(&title.unwrap_or_default()).into_owned());
+        }
+        if let Some(tree) = patch.tree("layers") {
+            if old.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(KitError::App("this layer doesn't read".into()));
+            }
+            new.layers = Arc::new(tree.roots().into_iter().map(|id| (id, tree.props(id).and_then(|p| p.str("name")).unwrap_or_default())).collect());
+        }
+        Ok(Arc::new(new))
+    }
+    fn normalise(_: &mut Two) {}
+    fn refresh_derived(_: &mut Two) {}
+}
+
+/// A failed rebuild of one part, then another part's remote change rebuilt fine (the reviewer's probe): the model
+/// stays stale (only a whole rebuild clears it), so the laptop's change from it is refused and gives no save point,
+/// and the pc's new layer survives on every machine.
+#[test]
+fn a_part_rebuilt_later_leaves_the_model_stale() {
+    use std::sync::atomic::Ordering;
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let first = craft_cloud_kit::ElemId::new();
+    let two = |fail: bool| Two {
+        title: Arc::new("t".into()),
+        layers: Arc::new(vec![(first, "one".into())]),
+        fail: Arc::new(std::sync::atomic::AtomicBool::new(fail)),
+    };
+    let mut a = open::<TwoApp>(&pc, "two.txt", two(false));
+    let mut b = open::<TwoApp>(&laptop, "two.txt", two(false));
+    let fail = b.model().fail.clone();
+    fail.store(true, Ordering::Relaxed);
+    change(&mut a, |m| Two { layers: Arc::new(vec![(first, "one".into()), (craft_cloud_kit::ElemId::new(), "two".into())]), ..m.clone() }).unwrap();
+    until(&mut [&mut a, &mut b], "the laptop failed to take it", |s| s.get(1).is_some_and(|b| b.status().error.is_some()));
+    change(&mut a, |m| Two { title: Arc::new("from pc".into()), ..m.clone() }).unwrap();
+    until(&mut [&mut a, &mut b], "the title came", |s| s.get(1).is_some_and(|b| *b.model().title == "from pc"));
+    assert!(b.save_point().is_err(), "still stale");
+    let renamed = change(&mut b, |m| {
+        let mut layers = (*m.layers).clone();
+        layers[0].1 = "renamed".into();
+        Two { layers: Arc::new(layers), ..m.clone() }
+    });
+    assert_eq!(renamed, Err(KitError::ModelStale));
+    assert_eq!(b.status().queued, 0, "nothing written from the stale model");
+    fail.store(false, Ordering::Relaxed);
+    until(&mut [&mut a, &mut b], "rebuilt whole", |s| s.get(1).is_some_and(|b| b.model().layers.len() == 2));
+    for _ in 0..50 {
+        a.poll();
+        b.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let names = |s: &Session<TwoApp>| s.model().layers.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>();
+    assert_eq!((names(&a), names(&b)), (vec!["one".to_owned(), "two".to_owned()], vec!["one".to_owned(), "two".to_owned()]));
+}
+
 /// While the agent is down, another file takes the document's path (a live one, or one never live). Coming back,
 /// the session finds a different document there: it stops with `document_replaced`, keeps its model, and neither
 /// merges into the other document nor imports itself over the other file.
@@ -409,42 +503,46 @@ fn open_other() -> Vec<u8> {
 }
 
 /// A session opened off the UI thread can be handed to it.
-/// Peers come from the agent's small pool: two sessions of one app on one machine at once get distinct ones, a closed
-/// session's peer is the next one's, a reconnect keeps its peer, and after many sessions opened, edited and closed
-/// (and others on another machine) the document's version vector, so a save record, has only the pool's peers.
+/// Every session writes with a fresh peer of its own (the reviewer's reuse probe, with sessions): a window with
+/// changes unsent while the agent was away, and a new window opened after the agent came back that writes more, end
+/// with both windows' changes on every machine, and the first window's later edits too. And however many sessions
+/// have edited a document, a save record names one or two heads.
 #[test]
-fn peers_come_from_the_agents_pool_and_are_used_again() {
-    use craft_cloud_api::local::PEER_POOL;
+fn every_session_has_a_peer_of_its_own_and_no_change_is_lost() {
     let hub = Hub::new();
     let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
-    let mut a = open::<App>(&pc, "p.txt", Notes::new("p", &[]));
-    let mut b = open::<App>(&pc, "p.txt", Notes::default());
-    assert_ne!(a.peer(), b.peer(), "two windows at once");
-    let b_peer = b.peer();
-    change(&mut b, |m| m.with_item(0, "from b")).unwrap();
-    until(&mut [&mut a, &mut b], "acked", |s| s.iter().all(|s| s.status().queued == 0));
-    drop(b);
-    let mut c = open::<App>(&pc, "p.txt", Notes::default());
-    assert_eq!(c.peer(), b_peer, "a closed window's peer is the next one's");
-    // A reconnect asks for its peer again and gets it.
-    let a_peer = a.peer();
-    pc.drop_connections();
-    until(&mut [&mut a, &mut c], "back", |s| s.iter().all(|s| s.status().connected));
-    assert_eq!((a.peer(), c.peer()), (a_peer, b_peer));
-    drop(c);
-    for round in 0..30 {
+    let mut a = open::<App>(&pc, "x.txt", Notes::new("t", &["base"]));
+    until(&mut [&mut a], "acked", |s| s[0].status().queued == 0);
+    pc.restart();
+    until(&mut [&mut a], "the drop is seen", |s| !s[0].status().connected);
+    for i in 0..3 {
+        change(&mut a, |m| m.with_item(0, &format!("A{i}"))).unwrap();
+    }
+    pc.start();
+    // Another window, opened before the first is back (the first open after an agent restart), writes ten.
+    let mut c = open::<App>(&pc, "x.txt", Notes::default());
+    assert_ne!(c.peer(), a.peer());
+    for i in 0..10 {
+        change(&mut c, |m| m.with_item(0, &format!("C{i}"))).unwrap();
+    }
+    until(&mut [&mut c], "C's changes are in", |s| s[0].status().queued == 0);
+    let mut b = open::<App>(&laptop, "x.txt", Notes::default());
+    let all = |s: &Session<App>| {
+        (0..3).all(|i| s.model().texts().contains(&format!("A{i}"))) && (0..10).all(|i| s.model().texts().contains(&format!("C{i}")))
+    };
+    until(&mut [&mut a, &mut b, &mut c], "every change everywhere", |s| s.iter().all(|s| all(s) && s.status().queued == 0));
+    assert!(!a.status().stopped && a.status().error.is_none(), "{:?}", a.status());
+    change(&mut a, |m| m.with_item(0, "A-after")).unwrap();
+    until(&mut [&mut a, &mut b], "a's later edit too", |s| s[1].model().texts().contains(&"A-after".to_owned()));
+    for round in 0..20 {
         let fake = if round % 2 == 0 { &pc } else { &laptop };
-        let mut s = open::<App>(fake, "p.txt", Notes::default());
+        let mut s = open::<App>(fake, "x.txt", Notes::default());
         change(&mut s, |m| m.with_item(0, &format!("round {round}"))).unwrap();
         until(&mut [&mut s], "acked", |s| s.iter().all(|s| s.status().queued == 0));
     }
-    until(&mut [&mut a], "every round", |s| s[0].model().items.len() == 31);
-    change(&mut a, |m| m.with_title("last")).unwrap();
-    let doc = loro::LoroDoc::new();
-    doc.import(&a.snapshot().unwrap()).unwrap();
-    let peers = doc.oplog_vv().len();
-    assert!(peers <= 2 * PEER_POOL, "{peers} peers in the version vector");
-    assert!(peers <= 4, "a window open the whole time, and one at a time besides on each machine: {peers}");
+    until(&mut [&mut a], "every round", |s| s[0].model().texts().contains(&"round 19".to_owned()));
+    let point = a.save_point().unwrap();
+    assert!((1..=2).contains(&point.frontiers().len()), "{:?}", point.frontiers());
 }
 
 #[test]
@@ -471,7 +569,7 @@ fn saves_reach_the_agent_and_a_file_changed_outside_is_reported() {
     change(&mut a, |m| m.with_title("saved")).unwrap();
     let record = save(&mut a, b"as saved");
     assert_eq!(record.hash, *blake3::hash(b"as saved").as_bytes());
-    assert!(record.version.iter().any(|(p, _)| *p == a.peer()), "this session's edits are in it");
+    assert!(record.frontiers.iter().any(|(p, _)| *p == a.peer()), "this session's edit is its head");
     until(&mut [&mut a], "the agent has the record", |_| pc.saves().iter().any(|(h, _)| *h == craft_cloud_api::local::blobs::hex(&record.hash)));
     until(&mut [&mut a], "sent", |s| s.iter().all(|s| s.status().queued == 0));
     // (The save mark may come with the agent's first updates after the state: looked at again as they come.)
@@ -517,6 +615,33 @@ fn changed_outside_is_decided_at_the_open_by_the_records() {
     assert!(!edited.status().changed_outside);
 }
 
+/// "Bring it in" is the user's choice, never the kit's: the session only says the file changed outside. Taken, the
+/// file's content replaces the live content as one ordinary change, named "Replace with the file's content", that
+/// reaches the other machine; undo brings the live edits back, everywhere.
+#[test]
+fn bringing_the_file_in_is_one_named_undoable_change() {
+    use craft_cloud_kit::REPLACE_WITH_FILE;
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open_with_bytes(&pc, "in.txt", Notes::new("live", &["kept live"]), b"imported");
+    let mut b = open_with_bytes(&laptop, "in.txt", Notes::default(), b"edited in another program");
+    assert!(b.status().changed_outside);
+    until(&mut [&mut a, &mut b], "both live", |s| s.iter().all(|s| *s.model().title == "live"));
+    for _ in 0..20 {
+        b.poll();
+    }
+    assert_eq!(*b.model().title, "live", "nothing replaced by itself");
+    b.replace_with_file(Notes::new("from the file", &["the editor's line"])).unwrap();
+    assert!(!b.status().changed_outside);
+    assert_eq!(b.step_name(true), Some(REPLACE_WITH_FILE));
+    until(&mut [&mut a, &mut b], "replaced everywhere", |s| s.iter().all(|s| s.model().texts() == ["the editor's line"]));
+    assert!(b.undo().unwrap());
+    until(&mut [&mut a, &mut b], "the live edits back everywhere", |s| {
+        s.iter().all(|s| *s.model().title == "live" && s.model().texts() == ["kept live"])
+    });
+    assert_eq!(b.step_name(false), Some(REPLACE_WITH_FILE), "redo names it too");
+}
+
 /// An app's autosave: when dirty or the file is behind, a save (with a record when it can). True if it saved.
 fn autosave(s: &mut Session<App>, dirty: &mut bool, n: &mut usize) -> bool {
     if !(*dirty || s.file_behind()) {
@@ -539,18 +664,13 @@ fn the_file_catches_up_with_every_edit_and_saving_stops() {
     let mut a = open::<App>(&pc, "f.txt", Notes::new("f", &[]));
     let mut b = open::<App>(&laptop, "f.txt", Notes::default());
     let (mut dirty_a, mut dirty_b, mut saves) = (false, false, 0usize);
-    let vv = |s: &Session<App>| {
-        let doc = loro::LoroDoc::new();
-        doc.import(&s.snapshot().unwrap()).unwrap();
-        let mut v: Vec<(u64, u32)> = doc.oplog_vv().iter().map(|(p, c)| (*p, *c as u32)).collect();
-        v.sort_unstable();
-        v
-    };
+    let vv = |s: &Session<App>| s.save_point().unwrap().frontiers().to_vec();
     // Settles: both poll and autosave until the file has both documents' versions and nobody saved for a while.
+    // (A catch-up save may wait out the backstop, `CATCH_UP_EVERY`, after the last one.)
     let settle = |a: &mut Session<App>, b: &mut Session<App>, da: &mut bool, db: &mut bool, saves: &mut usize, what: &str| {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut quiet = 0;
-        while quiet < 60 {
+        while quiet < 60 || hub.file("f.txt").is_some_and(|f| f != vv(a) || vv(a) != vv(b)) {
             a.poll();
             b.poll();
             let saved = autosave(a, da, saves) | autosave(b, db, saves);
@@ -594,6 +714,77 @@ fn the_file_catches_up_with_every_edit_and_saving_stops() {
     assert_eq!(saves, before);
 }
 
+/// The live relay is down while the file sync goes on (the reviewer's probe): each machine saved its own edit, and
+/// each file record then has the other's edit, which its live document lacks. Neither is behind: each waits for the
+/// live updates, so nobody saves (was 566 saves in 3 s). Once live is back, only the side that is then ahead saves,
+/// once, and the file has both edits.
+#[test]
+fn with_live_down_and_files_syncing_nobody_saves_in_a_loop() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open::<App>(&pc, "l.txt", Notes::new("l", &[]));
+    let mut b = open::<App>(&laptop, "l.txt", Notes::default());
+    until(&mut [&mut a, &mut b], "acked", |s| s.iter().all(|s| s.status().queued == 0));
+    hub.set_live(false);
+    change(&mut a, |m| m.with_item(0, "pc")).unwrap();
+    change(&mut b, |m| m.with_item(0, "laptop")).unwrap();
+    let (mut da, mut db) = (true, true);
+    let (mut saves_a, mut saves_b) = (0usize, 0usize);
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(3) {
+        a.poll();
+        b.poll();
+        autosave(&mut a, &mut da, &mut saves_a);
+        autosave(&mut b, &mut db, &mut saves_b);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(saves_a <= 2 && saves_b <= 2, "{saves_a} and {saves_b} saves: the edit's, and at most one more each");
+    let before = saves_a + saves_b;
+    hub.set_live(true);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        a.poll();
+        b.poll();
+        autosave(&mut a, &mut da, &mut saves_a);
+        autosave(&mut b, &mut db, &mut saves_b);
+        let both = |s: &Session<App>| s.model().items.len() == 2;
+        if both(&a) && both(&b) && hub.file("l.txt").as_deref() == Some(a.save_point().unwrap().frontiers()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never caught up");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Both may be ahead of the file once they have each other's edit (the same content then): at most one each.
+    assert!(saves_a + saves_b - before <= 2, "{} saves once live was back", saves_a + saves_b - before);
+}
+
+/// A file ahead of the live document (another machine's save came by file sync, its live updates not yet) is never
+/// written over by itself: `file_behind` says no until the live document has everything the file has.
+#[test]
+fn a_file_ahead_of_the_live_document_is_never_written_over() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open::<App>(&pc, "ahead.txt", Notes::new("a", &[]));
+    let mut b = open::<App>(&laptop, "ahead.txt", Notes::default());
+    until(&mut [&mut a, &mut b], "acked", |s| s.iter().all(|s| s.status().queued == 0));
+    hub.set_live(false);
+    change(&mut a, |m| m.with_item(0, "only on the pc yet")).unwrap();
+    save(&mut a, b"the pc's save");
+    for _ in 0..50 {
+        a.poll();
+        b.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(hub.file("ahead.txt").is_some());
+    assert!(!b.file_behind(), "the file is ahead of the laptop's live document");
+    hub.set_live(true);
+    until(&mut [&mut a, &mut b], "the edit came live", |s| s[1].model().items.len() == 1);
+    assert!(!b.file_behind(), "now the same: nothing to save");
+    // An edit on the laptop makes it the one ahead.
+    change(&mut b, |m| m.with_item(0, "the laptop's")).unwrap();
+    assert!(b.file_behind());
+}
+
 /// A save as an app makes it: the save point, then the record (before the file is written).
 fn save<D: craft_cloud_kit::LiveDocument>(s: &mut Session<D>, bytes: &[u8]) -> craft_cloud_kit::SaveRecord {
     let point = s.save_point().unwrap();
@@ -619,7 +810,7 @@ fn a_save_point_is_refused_when_a_record_would_be_wrong() {
     let mut a = open::<App>(&pc, "q.txt", Notes::new("q", &[]));
     let point = a.save_point().unwrap();
     assert_eq!(**point.model(), **a.model());
-    assert!(point.version().iter().any(|(p, _)| *p == a.peer()));
+    assert!(!point.frontiers().is_empty(), "the import's head");
     pc.refuse_next("invalid", 1);
     change(&mut a, |m| m.with_title("refused")).unwrap();
     until(&mut [&mut a], "stopped", |s| s.iter().all(|s| s.status().stopped));
@@ -640,10 +831,10 @@ fn a_record_made_while_the_agent_is_away_goes_once_it_is_back() {
     until(&mut [&mut a], "the agent went", |s| s.iter().all(|s| !s.status().connected));
     change(&mut a, |m| m.with_title("offline")).unwrap();
     let record = save(&mut a, b"saved while the agent was away");
-    assert!(record.version.iter().any(|(p, _)| *p == a.peer()));
+    assert!(record.frontiers.iter().any(|(p, _)| *p == a.peer()));
     assert!(!pc.saves().iter().any(|(h, _)| *h == hex(b"saved while the agent was away")));
     pc.start();
     until(&mut [&mut a], "the record went once the agent was back", |_| {
-        pc.saves().iter().any(|(h, v)| *h == hex(b"saved while the agent was away") && *v == record.version)
+        pc.saves().iter().any(|(h, v)| *h == hex(b"saved while the agent was away") && *v == record.frontiers)
     });
 }

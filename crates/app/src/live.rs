@@ -84,8 +84,8 @@ pub enum Event {
     /// its file was deleted (the document still works; a later open of the path is a new file), and whether the agent
     /// stopped following it until it restarts (Loro failed on it twice; changes made meanwhile are kept).
     Status { online: bool, waiting: u64, deleted: bool, stopped: bool },
-    /// The document's file on this machine's disk now: the live document's version (peer, end counter) a Craft app
-    /// saved it from, or none when no save record is known for it (see `DocsEvent::File`).
+    /// The document's file on this machine's disk now: the live document's frontiers (`(peer, counter)` heads) a Craft
+    /// app saved it from, or none when no save record is known for it (see `DocsEvent::File`).
     File(Option<Vec<(u64, u32)>>),
     /// The connection to the agent ended.
     Closed(String),
@@ -105,9 +105,6 @@ pub enum Opened {
 /// What an app may tell the agent when it opens a file ([`Documents::open_with`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OpenOptions {
-    /// The Loro peer it wrote this document with before (opening it again after the connection went): the agent
-    /// gives it the same one if no other app has it now.
-    pub peer: Option<u64>,
     /// The BLAKE3 hash of the file's bytes as the app read them: [`Document::changed_outside`] says whether a Craft
     /// app saved them.
     pub file_hash: Option<[u8; 32]>,
@@ -118,7 +115,6 @@ pub struct OpenOptions {
 struct Head {
     doc: DocId,
     state: DocState,
-    peer: Option<u64>,
     changed_outside: Option<bool>,
 }
 
@@ -128,7 +124,7 @@ type Filling = (Head, Vec<u8>, Vec<Vec<u8>>);
 /// What the reader hands an open in progress.
 enum Answer {
     Live { head: Head, snapshot: Vec<u8>, updates: Vec<Vec<u8>> },
-    NeedsImport { peer: Option<u64> },
+    NeedsImport,
     NotLive(NotLiveReason),
     Refused(Error),
 }
@@ -199,10 +195,10 @@ impl Shared {
     fn on_message(&self, message: Message) {
         match message {
             Message::Text(text) => match serde_json::from_str::<DocsEvent>(text.as_str()) {
-                Ok(DocsEvent::Opened { id, doc, state, peer, changed_outside }) => {
-                    lock(&self.opening).insert(id, Head { doc, state, peer, changed_outside });
+                Ok(DocsEvent::Opened { id, doc, state, changed_outside }) => {
+                    lock(&self.opening).insert(id, Head { doc, state, changed_outside });
                 }
-                Ok(DocsEvent::NeedsImport { id, peer }) => self.answer(id, Answer::NeedsImport { peer }),
+                Ok(DocsEvent::NeedsImport { id }) => self.answer(id, Answer::NeedsImport),
                 Ok(DocsEvent::NotLive { id, reason, .. }) => self.answer(id, Answer::NotLive(reason)),
                 Ok(DocsEvent::Ack { id, seq }) => self.route(id, Event::Acked(seq)),
                 Ok(DocsEvent::Status { doc, online, waiting, deleted, stopped }) => {
@@ -211,10 +207,10 @@ impl Shared {
                         self.route(id, Event::Status { online, waiting, deleted, stopped });
                     }
                 }
-                Ok(DocsEvent::File { doc, version }) => {
+                Ok(DocsEvent::File { doc, frontiers }) => {
                     let ids = lock(&self.numbers).get(&doc).cloned().unwrap_or_default();
                     for id in ids {
-                        self.route(id, Event::File(version.clone()));
+                        self.route(id, Event::File(frontiers.clone()));
                     }
                 }
                 Ok(DocsEvent::Error { id: Some(id), seq: Some(seq), code, message }) => self.route(id, Event::Refused { seq, code, message }),
@@ -369,7 +365,7 @@ impl Documents {
         let (events_tx, events) = mpsc::channel();
         lock(&self.shared.routes).insert(id, events_tx);
         let file_hash = options.file_hash.map(|h| h.iter().map(|b| format!("{b:02x}")).collect());
-        let request = DocsRequest::Open { id, path: path.to_owned(), app: app.to_owned(), peer: options.peer, file_hash };
+        let request = DocsRequest::Open { id, path: path.to_owned(), app: app.to_owned(), file_hash };
         let answer = self.ask(id, || self.shared.send_json(&request));
         self.opened(id, answer, events)
     }
@@ -400,7 +396,7 @@ impl Documents {
             Ok(Answer::Live { head, snapshot, updates }) => {
                 Ok(Opened::Live(Document { id, head, snapshot, updates, events, shared: self.shared.clone(), seq: AtomicU64::new(0) }))
             }
-            Ok(Answer::NeedsImport { peer }) => Ok(Opened::NeedsImport(Importer { id, peer, events, shared: self.shared.clone() })),
+            Ok(Answer::NeedsImport) => Ok(Opened::NeedsImport(Importer { id, events, shared: self.shared.clone() })),
             Ok(Answer::NotLive(reason)) => {
                 forget();
                 Ok(Opened::NotLive(reason))
@@ -428,7 +424,6 @@ impl Drop for Documents {
 /// A file that has never been live, waiting for its content.
 pub struct Importer {
     id: u64,
-    peer: Option<u64>,
     events: Receiver<Event>,
     shared: Arc<Shared>,
 }
@@ -440,12 +435,6 @@ impl std::fmt::Debug for Importer {
 }
 
 impl Importer {
-    /// The Loro peer to write the import with (the one the document will have, [`Document::peer`]); none from an
-    /// older agent.
-    pub fn peer(&self) -> Option<u64> {
-        self.peer
-    }
-
     /// Sends the file's content (a Loro snapshot, at most the snapshot limit) and waits until it is live: this app's
     /// import, or another machine's that was there first (the [`Document::state`] is then that one). A file that can't
     /// be made live now opens as a plain file ([`Error::Refused`] with `not_live`).
@@ -464,7 +453,7 @@ impl Importer {
             Answer::NotLive(reason) => {
                 Err(Error::Refused { code: "not_live".into(), message: format!("the file opens as a plain file ({reason:?})") })
             }
-            Answer::NeedsImport { .. } => Err(Error::Protocol("asked for the import again".into())),
+            Answer::NeedsImport => Err(Error::Protocol("asked for the import again".into())),
             Answer::Refused(e) => Err(e),
         }
     }
@@ -510,12 +499,6 @@ impl Document {
         self.head.doc
     }
 
-    /// The Loro peer to write this document with while it is open here (the agent's, from its pool); none from an
-    /// older agent, or when the pool was taken: the app picks a random one then.
-    pub fn peer(&self) -> Option<u64> {
-        self.head.peer
-    }
-
     /// For an open that named the file's hash ([`OpenOptions::file_hash`]): whether no Craft app's save of this
     /// document has that content (the file was edited outside Craft). None: the agent can't tell (or is older).
     pub fn changed_outside(&self) -> Option<bool> {
@@ -530,14 +513,16 @@ impl Document {
         Ok(seq)
     }
 
-    /// Tells the agent the app saved the document's file: the content's BLAKE3 `hash`, and the live document's
-    /// version it was made from (Loro's encoded frontiers and its version vector). The agent records it with the file
-    /// version it uploads for that content. Doesn't wait for an answer.
-    pub fn saved(&self, hash: [u8; 32], frontiers: &[u8], version: &[(u64, u32)]) -> Result<(), Error> {
+    /// Tells the agent the app is about to write the document's file: the content's BLAKE3 `hash`, and the live
+    /// document's frontiers it was made from (`(peer, counter)` heads). Send it after every change it covers
+    /// ([`Document::send`]): the agent keeps it once those are in its copy, and records it with the file version it
+    /// uploads for that content. Doesn't wait for an answer.
+    pub fn saved(&self, hash: [u8; 32], frontiers: &[(u64, u32)]) -> Result<(), Error> {
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-        let mut version = version.to_vec();
-        version.sort_unstable();
-        self.shared.send_json(&DocsRequest::Saved { doc: self.head.doc, hash: hex(&hash), frontiers: hex(frontiers), version })
+        let mut frontiers = frontiers.to_vec();
+        frontiers.sort_unstable();
+        frontiers.dedup();
+        self.shared.send_json(&DocsRequest::Saved { doc: self.head.doc, hash: hex(&hash), frontiers })
     }
 
     /// Sends this app's presence (at most 4 KiB, at most 20 a second; more are dropped).
@@ -622,7 +607,6 @@ mod tests {
             id: 5,
             doc: DocId::generate(),
             state: DocState { online: true, waiting: 0, bytes: 1, updates: 2 },
-            peer: None,
             changed_outside: None,
         };
         shared.on_message(Message::Text(serde_json::to_string(&opened).unwrap().into()));
@@ -646,19 +630,14 @@ mod tests {
         let (events_tx, events) = mpsc::channel();
         lock(&shared.routes).insert(4, events_tx);
         let doc = DocId::generate();
-        let opened = DocsEvent::Opened {
-            id: 4,
-            doc,
-            state: DocState { online: true, waiting: 0, bytes: 3, updates: 0 },
-            peer: Some(9),
-            changed_outside: Some(true),
-        };
+        let opened =
+            DocsEvent::Opened { id: 4, doc, state: DocState { online: true, waiting: 0, bytes: 3, updates: 0 }, changed_outside: Some(true) };
         shared.on_message(Message::Text(serde_json::to_string(&opened).unwrap().into()));
         assert!(answer.try_recv().is_err(), "not before the state");
         shared.on_message(Message::Binary(encode_binary(STATE, 4, b"abc").into()));
         let Ok(Answer::Live { snapshot, head, .. }) = answer.try_recv() else { panic!("no answer") };
         assert_eq!(snapshot, b"abc");
-        assert_eq!((head.peer, head.changed_outside), (Some(9), Some(true)));
+        assert_eq!(head.changed_outside, Some(true));
         shared.on_message(Message::Binary(encode_binary(UPDATE, 4, b"u").into()));
         let status = DocsEvent::Status { doc, online: false, waiting: 2, deleted: true, stopped: true };
         shared.on_message(Message::Text(serde_json::to_string(&status).unwrap().into()));

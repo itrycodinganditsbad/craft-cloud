@@ -173,21 +173,28 @@ async fn a_late_save_record_is_appended_once(meta: &Meta) {
     let (node, v) = (NodeId::generate(), version(m));
     meta.commit(u.space, dev, &[Op::Create { node, parent, name: name("late.kitdemo"), version: v.clone() }], NOW).await.unwrap();
     let before = meta.space_info(u.space).await.unwrap().seq;
-    let record = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::DocId::generate(), version: vec![(1, 5)] };
+    let doc = craft_cloud_proto::live::node_doc(u.space, node);
+    let stranger = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::DocId::generate(), frontiers: vec![(1, 5)] };
+    assert!(matches!(meta.attach_save(u.space, node, v.id, &stranger).await, Err(MetaError::Invalid(_))), "another file's document");
+    let unsorted = craft_cloud_proto::SaveRecord { doc, frontiers: vec![(2, 1), (1, 5)] };
+    assert!(matches!(meta.attach_save(u.space, node, v.id, &unsorted).await, Err(MetaError::Invalid(_))));
+    let record = craft_cloud_proto::SaveRecord { doc, frontiers: vec![(1, 5)] };
     let added = meta.attach_save(u.space, node, v.id, &record).await.unwrap();
     assert_eq!(added.seq, before + 1);
     let feed = meta.changes(u.space, before, None, MAX_PAGE_NODES).await.unwrap();
     let NodeKind::File(f) = &find(&feed.nodes, node).kind else { panic!("a file") };
     assert_eq!((f.version, f.save.clone()), (v.id, Some(record.clone())), "in the feed again, with its record");
-    let other = craft_cloud_proto::SaveRecord { doc: record.doc, version: vec![(2, 1)] };
+    let other = craft_cloud_proto::SaveRecord { doc: record.doc, frontiers: vec![(2, 1)] };
     assert_eq!(meta.attach_save(u.space, node, v.id, &other).await.unwrap().seq, before + 1, "kept, nothing changed");
     assert_eq!(meta.attach_save(u.space, node, v.id, &record).await.unwrap().seq, before + 1);
     let tree = full_tree(meta, u.space).await;
     let NodeKind::File(f) = &find(&tree.nodes, node).kind else { panic!("a file") };
     assert_eq!(f.save, Some(record));
-    assert!(matches!(meta.attach_save(u.space, NodeId::generate(), v.id, &other).await, Err(MetaError::NotFound(_))));
+    let nowhere = NodeId::generate();
+    let theirs = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::live::node_doc(u.space, nowhere), frontiers: vec![(2, 1)] };
+    assert!(matches!(meta.attach_save(u.space, nowhere, v.id, &theirs).await, Err(MetaError::NotFound(_))));
     let too_many =
-        craft_cloud_proto::SaveRecord { doc: other.doc, version: (0..=craft_cloud_proto::ops::MAX_SAVE_PEERS as u64).map(|p| (p, 1)).collect() };
+        craft_cloud_proto::SaveRecord { doc: other.doc, frontiers: (0..=craft_cloud_proto::ops::MAX_SAVE_HEADS as u64).map(|p| (p, 1)).collect() };
     assert!(matches!(meta.attach_save(u.space, node, v.id, &too_many).await, Err(MetaError::Invalid(_))));
 }
 
@@ -202,7 +209,7 @@ async fn pages_of_save_records_stay_small(meta: &Meta) {
     let m = manifest(meta, &u, 4).await;
     let biggest = craft_cloud_proto::SaveRecord {
         doc: craft_cloud_proto::DocId::generate(),
-        version: (0..craft_cloud_proto::ops::MAX_SAVE_PEERS as u64).map(|p| (u64::MAX - p, u32::MAX)).collect(),
+        frontiers: (0..craft_cloud_proto::ops::MAX_SAVE_HEADS as u64).map(|p| (u64::MAX - 1000 + p, u32::MAX)).collect(),
     };
     let record_bytes = serde_json::to_string(&biggest).unwrap().len();
     assert!(record_bytes < 10 * 1024, "{record_bytes}");
@@ -312,12 +319,12 @@ async fn a_version_keeps_its_save_record(meta: &Meta) {
     let u = user(meta, "ana").await;
     let dev = meta.create_device(u.id, "pc", &[3u8; 32], NOW).await.unwrap();
     let parent = root(meta, &u).await;
-    let record = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::DocId::generate(), version: vec![(1, 5), (2, 3)] };
+    let record = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::DocId::generate(), frontiers: vec![(1, 5), (2, 3)] };
     let (saved, plain, huge) = (NodeId::generate(), NodeId::generate(), NodeId::generate());
     let op = |node: NodeId, name: &str, v: NewVersion| Op::Create { node, parent, name: craft_cloud_proto::Name::new(name).unwrap(), version: v };
     let m = manifest(meta, &u, 4).await;
     let too_many =
-        craft_cloud_proto::SaveRecord { doc: record.doc, version: (0..=craft_cloud_proto::ops::MAX_SAVE_PEERS as u64).map(|p| (p, 1)).collect() };
+        craft_cloud_proto::SaveRecord { doc: record.doc, frontiers: (0..=craft_cloud_proto::ops::MAX_SAVE_HEADS as u64).map(|p| (p, 1)).collect() };
     let ops = [
         op(saved, "a.kitdemo", NewVersion { save: Some(record.clone()), ..version(m) }),
         op(plain, "b.txt", version(m)),

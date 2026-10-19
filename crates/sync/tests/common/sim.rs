@@ -768,6 +768,8 @@ pub async fn settle_and_check<T: Transport>(seed: u64, server: &Server, ms: &mut
                 eprintln!("TRACE settle m{i} sync: {report:?}\n  files {}\n  dirs {:?}", listing(m), m.fs().dirs());
             }
             changed |= report.changed() || !report.pending_deletes.is_empty() || !report.pending_local_deletes.is_empty();
+            // Two Craft saves waiting to learn which is newer are asked about again next pass: not settled yet.
+            changed |= report.skipped.iter().any(|(_, why)| why.starts_with(craft_cloud_sync::SAVE_ORDER_WAITS));
             if let Some(s) = skipped.get_mut(i) {
                 *s = report.skipped.iter().filter(|(_, why)| is_case_clash(why)).map(|(p, _)| rel(p)).collect();
             }

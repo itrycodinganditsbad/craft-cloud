@@ -11,7 +11,8 @@
 //!
 //! [`Fake::restart`] drops every app connection and refuses new ones until [`Fake::start`] (an agent that stopped):
 //! what the machine held stays, as the agent's files do. [`Fake::too_old`] makes a machine answer the blob calls as an
-//! agent from before blobs (`not_found` for the call).
+//! agent from before blobs (`not_found` for the call). [`Hub::set_live`] holds live updates back between machines while
+//! saved files' records still go (a proxy that blocks WebSockets).
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -24,7 +25,6 @@ use craft_cloud_api::DocId;
 use craft_cloud_api::limits::{MAX_BLOB_BYTES, MAX_PRESENCE_BYTES, MAX_UPDATE_BYTES};
 use craft_cloud_api::local::blobs::{Stored, hex, parse_hex};
 use craft_cloud_api::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, STATE, UPDATE, decode_binary, encode_binary};
-use craft_cloud_api::local::peers::Leases;
 use craft_cloud_api::local::{DocState, DocsEvent, DocsRequest, LOCAL_API_MAX, MAX_LOCAL_JSON_BYTES, NotLiveReason, RunState, Status, paths};
 use tungstenite::protocol::{Role, WebSocketConfig};
 use tungstenite::{Message, WebSocket};
@@ -53,6 +53,8 @@ struct Inner {
     /// The record of each path's file on the server (as if every save were written and synced at once: the newest
     /// upload wins); `None` for one edited outside Craft ([`Hub::edit_outside`]).
     files: HashMap<String, Option<Version>>,
+    /// The live relay is down while the file sync goes on ([`Hub::set_live`]).
+    live_down: bool,
 }
 
 struct HubDoc {
@@ -92,29 +94,15 @@ struct Machine {
     blobs: HashMap<[u8; 32], Vec<u8>>,
     pending_blobs: Vec<[u8; 32]>,
     conns: HashMap<u64, Conn>,
-    /// The save records apps sent: document, content hash (hex), version.
+    /// The save records apps sent: document, content hash (hex), frontiers.
     saves: Vec<(DocId, String, Version)>,
     /// Codes the next updates are refused with ([`Fake::refuse_next`]).
     refuse: VecDeque<String>,
-    /// The Loro peers lent to open documents, as the agent lends them.
-    leases: Leases,
     /// Saves made here that haven't gone up yet (offline): each path's file record on this machine until they do.
     file_pending: HashMap<String, Version>,
 }
 
-impl Machine {
-    /// The peer for open `id` on `conn` of `doc`, as the agent hands it out.
-    fn lease(&mut self, conn: u64, id: u64, doc: DocId) -> Option<u64> {
-        let (app, hint, _) = self.conns.get(&conn)?.apps.get(&id)?.clone();
-        let mut key = self.name.as_bytes().to_vec();
-        key.push(0);
-        key.extend_from_slice(app.as_bytes());
-        let base = u64::from_le_bytes(fake_hash(&key).first_chunk::<8>().copied().unwrap_or_default());
-        self.leases.lease(doc, &app, base, (conn, id), hint, std::time::Instant::now())
-    }
-}
-
-/// A live document's version vector: `(peer, end counter)`.
+/// A live document's frontiers: `(peer, counter)` heads.
 type Version = Vec<(u64, u32)>;
 
 /// One app connection to the docs socket.
@@ -125,8 +113,8 @@ struct Conn {
     open: HashMap<u64, Opened>,
     /// A `needs_import` waiting for its import, by number: the path, and the document it will be.
     importing: HashMap<u64, (String, DocId)>,
-    /// Each open's app, the peer it asked for again and the hash (hex) of the file it read, by number.
-    apps: HashMap<u64, (String, Option<u64>, Option<String>)>,
+    /// The hash (hex) of the file each open read, by number.
+    apps: HashMap<u64, Option<String>>,
     told: HashMap<DocId, (bool, u64)>,
     /// The file record each document's apps were last told.
     told_file: HashMap<DocId, Option<Version>>,
@@ -170,7 +158,6 @@ impl Hub {
                     conns: HashMap::new(),
                     saves: Vec::new(),
                     refuse: VecDeque::new(),
-                    leases: Leases::default(),
                     file_pending: HashMap::new(),
                 },
             );
@@ -207,6 +194,14 @@ impl Hub {
         for m in inner.machines.values_mut() {
             m.docs.retain(|_, d| d.path != path);
         }
+    }
+
+    /// Whether live updates go between machines (`false`: a proxy that blocks WebSockets, the relay out) while the
+    /// file sync goes on (saved files' records still reach every machine).
+    pub fn set_live(&self, on: bool) {
+        let mut inner = lock(&self.inner);
+        inner.live_down = !on;
+        sync(&mut inner);
     }
 
     /// Another program writes `path`'s file (no save record): every machine's apps hear it has none.
@@ -374,38 +369,30 @@ impl Hub {
         let mut inner = lock(&self.inner);
         if let Some(m) = inner.machines.get_mut(&machine) {
             m.conns.remove(&conn);
-            // Gone without a close (a close came first otherwise): its peers are kept a while for it.
-            m.leases.gone(conn, std::time::Instant::now());
         }
     }
 
     fn on_request(&self, machine: usize, conn: u64, request: DocsRequest) {
         let mut inner = lock(&self.inner);
         match request {
-            DocsRequest::Open { id, path, app, peer, file_hash } => {
+            DocsRequest::Open { id, path, app: _, file_hash } => {
                 if let Some(c) = inner.machines.get_mut(&machine).and_then(|m| m.conns.get_mut(&conn)) {
-                    c.apps.insert(id, (app, peer, file_hash));
+                    c.apps.insert(id, file_hash);
                 }
                 open(&mut inner, machine, conn, id, &path);
             }
             DocsRequest::Close { doc } => {
-                if let Some(m) = inner.machines.get_mut(&machine) {
-                    let closed: Vec<u64> =
-                        m.conns.get(&conn).map(|c| c.open.iter().filter(|(_, o)| o.doc == doc).map(|(id, _)| *id).collect()).unwrap_or_default();
-                    for id in closed {
-                        m.leases.release((conn, id));
-                    }
-                    if let Some(c) = m.conns.get_mut(&conn) {
-                        c.open.retain(|_, o| o.doc != doc);
-                    }
+                if let Some(c) = inner.machines.get_mut(&machine).and_then(|m| m.conns.get_mut(&conn)) {
+                    c.open.retain(|_, o| o.doc != doc);
                 }
             }
-            DocsRequest::Saved { doc, hash, frontiers: _, version } => {
+            DocsRequest::Saved { doc, hash, frontiers } => {
                 let Some(m) = inner.machines.get_mut(&machine) else { return };
-                m.saves.push((doc, hash, version.clone()));
-                // The file is written and goes up at once (offline: once the machine is back).
+                m.saves.push((doc, hash, frontiers.clone()));
+                // The file is written and goes up at once (offline: once the machine is back). (The fake reads no
+                // Loro: the record comes after the changes it covers on the app's stream, which the copy took first.)
                 let Some(path) = m.docs.get(&doc).map(|d| d.path.clone()) else { return };
-                m.file_pending.insert(path, version);
+                m.file_pending.insert(path, frontiers);
                 sync(&mut inner);
             }
         }
@@ -495,19 +482,17 @@ fn open(inner: &mut Inner, machine: usize, conn: u64, id: u64, path: &str) {
             if let Some(c) = m.conns.get_mut(&conn) {
                 c.importing.insert(id, (path.to_owned(), new_id));
             }
-            let peer = m.lease(conn, id, new_id);
-            return tell(inner, machine, conn, &DocsEvent::NeedsImport { id, peer });
+            return tell(inner, machine, conn, &DocsEvent::NeedsImport { id });
         }
         (None, _) => return tell(inner, machine, conn, &DocsEvent::NotLive { id, reason: NotLiveReason::Offline, message: None }),
     };
     // Take what the hub has first (when online), so the state is as fresh as it can be.
     sync(inner);
     // Edited outside Craft unless some machine's app saved that content (the server's versions keep every record).
-    let file_hash = inner.machines.get(&machine).and_then(|m| m.conns.get(&conn)).and_then(|c| c.apps.get(&id)).and_then(|a| a.2.clone());
+    let file_hash = inner.machines.get(&machine).and_then(|m| m.conns.get(&conn)).and_then(|c| c.apps.get(&id)).and_then(Clone::clone);
     let changed_outside = file_hash.map(|h| !inner.machines.values().any(|m| m.saves.iter().any(|(d, saved, _)| *d == doc && *saved == h)));
     let Some(m) = inner.machines.get_mut(&machine) else { return };
     let online = m.online;
-    let peer = m.lease(conn, id, doc);
     let Some(d) = m.docs.get(&doc) else { return };
     let state = DocState { online, waiting: d.pending.len() as u64, bytes: d.import.len() as u64, updates: d.log.len() as u64 };
     let (import, log): (Vec<u8>, Vec<Vec<u8>>) = (d.import.clone(), d.log.iter().map(|(_, b)| b.clone()).collect());
@@ -515,7 +500,7 @@ fn open(inner: &mut Inner, machine: usize, conn: u64, id: u64, path: &str) {
     c.open.insert(id, Opened { doc, sent: log.len(), seq: 0 });
     c.told.insert(doc, (online, state.waiting));
     let mut w = lock(&c.writer);
-    let opened = DocsEvent::Opened { id, doc, state, peer, changed_outside };
+    let opened = DocsEvent::Opened { id, doc, state, changed_outside };
     if let Ok(text) = serde_json::to_string(&opened) {
         let _ = w.send(Message::Text(text.into()));
     }
@@ -538,6 +523,7 @@ fn tell(inner: &Inner, machine: usize, conn: u64, event: &DocsEvent) {
 
 /// Moves updates and blobs between the online machines and the hub, then sends every connection what it lacks.
 fn sync(inner: &mut Inner) {
+    let live_down = inner.live_down;
     let Inner { docs, blobs, machines, files, .. } = inner;
     // Up: every online machine's waiting updates, blobs and saved files.
     let mut ids: Vec<usize> = machines.keys().copied().collect();
@@ -557,6 +543,9 @@ fn sync(inner: &mut Inner) {
         }
         for d in m.docs.values_mut() {
             let Some(hub) = docs.get_mut(&d.path) else { continue };
+            if live_down {
+                continue;
+            }
             while let Some(at) = d.pending.pop_front() {
                 if let Some((_, bytes)) = d.log.get(at) {
                     hub.log.push((*mid, bytes.clone()));
@@ -572,6 +561,9 @@ fn sync(inner: &mut Inner) {
         }
         for d in m.docs.values_mut() {
             let Some(hub) = docs.get(&d.path) else { continue };
+            if live_down {
+                continue;
+            }
             for (from, bytes) in hub.log.iter().skip(d.hub_seen) {
                 if from != mid {
                     d.log.push((Origin::Remote, bytes.clone()));
@@ -609,7 +601,7 @@ fn sync(inner: &mut Inner) {
                 };
                 if c.told_file.get(&o.doc) != Some(&file) {
                     c.told_file.insert(o.doc, file.clone());
-                    if let Ok(text) = serde_json::to_string(&DocsEvent::File { doc: o.doc, version: file }) {
+                    if let Ok(text) = serde_json::to_string(&DocsEvent::File { doc: o.doc, frontiers: file }) {
                         let _ = w.send(Message::Text(text.into()));
                     }
                 }
@@ -696,7 +688,7 @@ impl Fake {
         }
     }
 
-    /// The save records this machine's apps sent: content hash (hex) and version, in order.
+    /// The save records this machine's apps sent: content hash (hex) and frontiers, in order.
     pub fn saves(&self) -> Vec<(String, Vec<(u64, u32)>)> {
         lock(&self.hub.inner).machines.get(&self.id).map(|m| m.saves.iter().map(|(_, h, v)| (h.clone(), v.clone())).collect()).unwrap_or_default()
     }

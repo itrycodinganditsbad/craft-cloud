@@ -11,13 +11,22 @@ use common::{Machine, Server, machine, path};
 use craft_cloud_proto::{DocId, FileHash, NodeId, SaveRecord};
 use craft_cloud_sync::{Fs, SaveRecords, Transport};
 
-/// What each machine's apps saved: (node, content hash) to record.
+/// What each machine's apps saved: (node, content hash) to record. Here a record's frontiers stand for a version
+/// vector, `(peer, end)`, and one includes another as vectors do (the agent asks its copy of the document; the tests
+/// need no Loro). With `unknown` set, nothing can be told.
 #[derive(Default, Clone)]
-struct Book(Arc<Mutex<HashMap<(NodeId, FileHash), SaveRecord>>>);
+struct Book(Arc<Mutex<HashMap<(NodeId, FileHash), SaveRecord>>>, Arc<std::sync::atomic::AtomicBool>);
 
 impl SaveRecords for Book {
     fn record(&self, node: NodeId, hash: &FileHash) -> Option<SaveRecord> {
         self.0.lock().unwrap().get(&(node, *hash)).cloned()
+    }
+
+    fn includes(&self, a: &SaveRecord, b: &SaveRecord) -> Option<bool> {
+        if self.1.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        Some(b.frontiers.iter().all(|(peer, end)| a.frontiers.iter().any(|(p, e)| p == peer && e >= end)))
     }
 }
 
@@ -26,7 +35,7 @@ impl Book {
     fn save(&self, m: &mut Machine, p: &str, data: &[u8], doc: DocId, version: &[(u64, u32)]) {
         m.fs_mut().write(&path(p), data, false, 0).unwrap();
         let node = node(m, p);
-        self.0.lock().unwrap().insert((node, FileHash::from_bytes(*blake3::hash(data).as_bytes())), SaveRecord { doc, version: version.to_vec() });
+        self.0.lock().unwrap().insert((node, FileHash::from_bytes(*blake3::hash(data).as_bytes())), SaveRecord { doc, frontiers: version.to_vec() });
     }
 }
 
@@ -49,7 +58,9 @@ async fn two(server: &Server) -> (Machine, Machine, Book, Book, DocId) {
     a.fs_mut().write(&path("doc.kitdemo"), b"v1", false, 0).unwrap();
     a.sync_once().await.unwrap();
     b.sync_once().await.unwrap();
-    (a, b, book_a, book_b, DocId::generate())
+    // The file's live document, as the agent names it.
+    let doc = craft_cloud_proto::live::node_doc(a.state().space.unwrap(), node(&a, "doc.kitdemo"));
+    (a, b, book_a, book_b, doc)
 }
 
 async fn rounds(a: &mut Machine, b: &mut Machine) {
@@ -93,7 +104,7 @@ async fn concurrent_saves_take_the_newer_upload_without_a_conflict_copy() {
         craft_cloud_proto::NodeKind::File(f) if !n.deleted => Some(f),
         _ => None,
     });
-    assert_eq!(file.and_then(|f| f.save), Some(SaveRecord { doc, version: vec![(1, 6)] }));
+    assert_eq!(file.and_then(|f| f.save), Some(SaveRecord { doc, frontiers: vec![(1, 6)] }));
 }
 
 /// Autosave on both machines, round after round: never a conflict copy, and both end on the same content.
@@ -163,7 +174,7 @@ async fn a_save_landing_while_the_server_wins_is_kept() {
         let laptop = b"laptop's save".to_vec();
         a.fs().write(&path("doc.kitdemo"), &laptop);
         let at = a.state().base.keys().copied().find(|id| a.state().base_path(*id).as_ref() == Some(&path("doc.kitdemo"))).unwrap();
-        book_a.0.lock().unwrap().insert((at, FileHash::from_bytes(*blake3::hash(&laptop).as_bytes())), SaveRecord { doc, version: vec![(1, 5)] });
+        book_a.0.lock().unwrap().insert((at, FileHash::from_bytes(*blake3::hash(&laptop).as_bytes())), SaveRecord { doc, frontiers: vec![(1, 5)] });
         book_b.save(&mut b, "doc.kitdemo", b"desktop's later save", doc, &[(1, 5), (2, 3)]);
         b.sync_once().await.unwrap();
         a.fs().arm(path("doc.kitdemo"), b"another program's save, meanwhile", SaveOn::Open(n));
@@ -210,7 +221,7 @@ async fn a_record_that_comes_late_is_added_to_its_version() {
     let up = server_file(&a).await;
     assert_eq!(up.save, None, "it went up without its record");
     // The record comes.
-    let record = SaveRecord { doc, version: vec![(1, 7)] };
+    let record = SaveRecord { doc, frontiers: vec![(1, 7)] };
     book_a.0.lock().unwrap().insert((node(&a, "doc.kitdemo"), FileHash::from_bytes(*blake3::hash(&saved).as_bytes())), record.clone());
     a.sync_once().await.unwrap();
     let late = server_file(&a).await;
@@ -219,11 +230,50 @@ async fn a_record_that_comes_late_is_added_to_its_version() {
     let on_b = b.state().remote.values().find_map(|n| n.file.clone()).unwrap();
     assert_eq!(on_b.save, Some(record.clone()), "the other machine learns it");
     // Appended only, and the same again changes nothing.
-    let other = SaveRecord { doc, version: vec![(9, 9)] };
+    let other = SaveRecord { doc, frontiers: vec![(9, 9)] };
     let seq = a.transport().space().await.unwrap().seq;
     a.transport().attach_save(node(&a, "doc.kitdemo"), up.version, &other).await.unwrap();
     a.transport().attach_save(node(&a, "doc.kitdemo"), up.version, &record).await.unwrap();
     assert_eq!(server_file(&a).await.save, Some(record));
     assert_eq!(a.transport().space().await.unwrap().seq, seq, "nothing changed");
     assert!(a.transport().attach_save(NodeId::generate(), up.version, &other).await.is_err(), "no such version there");
+}
+
+/// When the agent can't tell which of two Craft saves is newer, neither is taken: no conflict copy, nothing goes up
+/// over the other, and both files stay as they are; once it can tell, the newer wins as always. Past the wait, it is
+/// a conflict copy, as any two edits are (never a guessed winner).
+#[tokio::test]
+async fn saves_whose_order_is_unknown_wait_then_are_a_conflict() {
+    use std::sync::atomic::Ordering;
+    let server = Server::new().await;
+    let (mut a, mut b, book_a, book_b, doc) = two(&server).await;
+    book_a.1.store(true, Ordering::Relaxed);
+    book_b.1.store(true, Ordering::Relaxed);
+    book_a.save(&mut a, "doc.kitdemo", b"laptop's save", doc, &[(1, 5)]);
+    book_b.save(&mut b, "doc.kitdemo", b"desktop's later save", doc, &[(1, 5), (2, 3)]);
+    b.sync_once().await.unwrap();
+    rounds(&mut a, &mut b).await;
+    assert_eq!(files(&a), vec![("doc.kitdemo".to_owned(), b"laptop's save".to_vec())], "waits: kept as it is");
+    assert_eq!(files(&b), vec![("doc.kitdemo".to_owned(), b"desktop's later save".to_vec())]);
+    assert_eq!(server_file(&a).await.save.map(|s| s.frontiers), Some(vec![(1, 5), (2, 3)]), "nothing went up over it");
+    // Known now: the desktop's includes the laptop's.
+    book_a.1.store(false, Ordering::Relaxed);
+    rounds(&mut a, &mut b).await;
+    let want = vec![("doc.kitdemo".to_owned(), b"desktop's later save".to_vec())];
+    assert_eq!((files(&a), files(&b)), (want.clone(), want));
+    // Never known, on a machine that waits no longer: a conflict copy, as always.
+    let ana = server.meta.user_by_name("ana").await.unwrap().unwrap();
+    let mut c = common::machine_config(&server, &ana, "tablet", craft_cloud_sync::MemFs::new(), 50, |c| c.save_order_wait_ms = 0).await;
+    let book_c = Book::default();
+    c.set_save_records(Arc::new(book_c.clone()));
+    c.sync_once().await.unwrap();
+    book_c.1.store(true, Ordering::Relaxed);
+    book_c.save(&mut c, "doc.kitdemo", b"tablet's save", doc, &[(3, 1)]);
+    book_b.save(&mut b, "doc.kitdemo", b"desktop's next save", doc, &[(1, 5), (2, 4)]);
+    b.sync_once().await.unwrap();
+    for _ in 0..3 {
+        c.sync_once().await.unwrap();
+        b.sync_once().await.unwrap();
+    }
+    assert_eq!(files(&c).len(), 2, "a conflict copy: {:?}", files(&c));
 }

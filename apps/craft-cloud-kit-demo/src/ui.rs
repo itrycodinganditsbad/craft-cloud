@@ -406,10 +406,14 @@ impl Demo {
                 None => (!self.undo.is_empty(), !self.redo.is_empty()),
             };
             let blocked = self.session().and_then(Session::undo_blocked).unwrap_or_default();
-            if ui.add_enabled(can_undo, egui::Button::new("Undo")).on_disabled_hover_text(blocked).clicked() {
+            // A named step shows its name: "Undo Replace with the file's content".
+            let label = |what: &str, name: Option<&str>| name.map_or_else(|| what.to_owned(), |n| format!("{what} {n}"));
+            let (undo_label, redo_label) =
+                (label("Undo", self.session().and_then(|s| s.step_name(true))), label("Redo", self.session().and_then(|s| s.step_name(false))));
+            if ui.add_enabled(can_undo, egui::Button::new(undo_label)).on_disabled_hover_text(blocked).clicked() {
                 self.undo();
             }
-            if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() {
+            if ui.add_enabled(can_redo, egui::Button::new(redo_label)).clicked() {
                 self.redo();
             }
             if ui.button("Save").clicked() {
@@ -423,12 +427,21 @@ impl Demo {
         let outside = !self.outside_handled && self.session().is_some_and(|s| s.status().changed_outside);
         if outside {
             ui.horizontal(|ui| {
-                ui.colored_label(Color32::from_rgb(0xb0, 0x80, 0x10), "The file was changed outside Craft.");
+                ui.colored_label(
+                    Color32::from_rgb(0xb0, 0x80, 0x10),
+                    "The file was changed outside Craft. Bringing it in replaces the live edits made since the file was \
+                     written, on every machine (Undo brings them back).",
+                );
                 if ui.button("Bring it in").clicked() {
-                    // The file's content as an ordinary local change (the difference of the live model and the
-                    // file's), then saved, so the file and the document agree again.
+                    // The user's choice: the file's content replaces the live content as one ordinary change, named
+                    // "Replace with the file's content", then saved, so the file and the document agree again.
                     let file = (*self.read.0).clone();
-                    self.apply(file);
+                    if let Mode::Live(session) = &mut self.mode {
+                        match session.replace_with_file(file) {
+                            Ok(()) => self.model = session.model().clone(),
+                            Err(e) => self.message = e.to_string(),
+                        }
+                    }
                     self.save();
                     self.outside_handled = true;
                 }

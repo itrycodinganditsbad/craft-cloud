@@ -125,10 +125,8 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                 }
             };
             match request {
-                DocsRequest::Open { id, path, app, peer, file_hash } => match link.hub(api).await {
-                    Some(hub) => {
-                        hub.docs(DocsCall::Open { conn: link.conn, id, path, app, peer, file_hash }).await.map(|()| true).map_err(|_| End::Hub)
-                    }
+                DocsRequest::Open { id, path, app, file_hash } => match link.hub(api).await {
+                    Some(hub) => hub.docs(DocsCall::Open { conn: link.conn, id, path, app, file_hash }).await.map(|()| true).map_err(|_| End::Hub),
                     None => {
                         let event = DocsEvent::NotLive {
                             id,
@@ -142,23 +140,11 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                     Some(hub) => hub.docs(DocsCall::Close { conn: link.conn, doc }).await.map(|()| true).map_err(|_| End::Hub),
                     None => Ok(true),
                 },
-                DocsRequest::Saved { doc, hash, frontiers: _, version } => {
-                    let Some(account) = api.control.account() else { return Ok(true) };
-                    let book = crate::live::saves::SaveBook::new(api.data(), account.space);
-                    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
-                    let added = tokio::task::spawn_blocking(move || book.add(doc, &hash, version, at)).await.unwrap_or_else(|e| Err(e.to_string()));
-                    match added {
-                        Ok(()) => {
-                            // A record that comes after its file went up (saved while the agent was away) is added to
-                            // that version by the next pass.
-                            api.control.request_pass();
-                            Ok(true)
-                        }
-                        Err(message) => {
-                            Ok(send_json(socket, &DocsEvent::Error { id: None, seq: None, code: api_codes::INVALID.into(), message }).await)
-                        }
-                    }
-                }
+                // In order with the connection's changes: the hub keeps it once the changes it covers are in.
+                DocsRequest::Saved { doc, hash, frontiers } => match link.hub.clone() {
+                    Some(hub) => hub.docs(DocsCall::Saved { conn: link.conn, doc, hash, frontiers }).await.map(|()| true).map_err(|_| End::Hub),
+                    None => Ok(true),
+                },
             }
         }
         Message::Binary(bytes) => {
@@ -199,18 +185,16 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
 /// Sends one of the hub's messages to the app; false when the app is gone (or too slow).
 async fn send_out(socket: &mut WebSocket, out: DocOut) -> bool {
     match out {
-        DocOut::Opened { id, doc, state, peer, changed_outside, snapshot, waiting } => {
-            send_json(socket, &DocsEvent::Opened { id, doc, state, peer, changed_outside }).await
-                && send_binary(socket, STATE, id, &snapshot).await
-                && {
-                    let mut ok = true;
-                    for update in &waiting {
-                        ok = ok && send_binary(socket, UPDATE, id, update).await;
-                    }
-                    ok
+        DocOut::Opened { id, doc, state, changed_outside, snapshot, waiting } => {
+            send_json(socket, &DocsEvent::Opened { id, doc, state, changed_outside }).await && send_binary(socket, STATE, id, &snapshot).await && {
+                let mut ok = true;
+                for update in &waiting {
+                    ok = ok && send_binary(socket, UPDATE, id, update).await;
                 }
+                ok
+            }
         }
-        DocOut::NeedsImport { id, peer } => send_json(socket, &DocsEvent::NeedsImport { id, peer }).await,
+        DocOut::NeedsImport { id } => send_json(socket, &DocsEvent::NeedsImport { id }).await,
         DocOut::NotLive { id, reason, message } => send_json(socket, &DocsEvent::NotLive { id, reason, message: Some(message) }).await,
         DocOut::Ack { id, seq } => send_json(socket, &DocsEvent::Ack { id, seq }).await,
         DocOut::Refused { id, seq, code, message } => send_json(socket, &DocsEvent::Error { id, seq, code: code.into(), message }).await,
@@ -219,7 +203,7 @@ async fn send_out(socket: &mut WebSocket, out: DocOut) -> bool {
         DocOut::Status { doc, online, waiting, deleted, stopped } => {
             send_json(socket, &DocsEvent::Status { doc, online, waiting, deleted, stopped }).await
         }
-        DocOut::File { doc, version } => send_json(socket, &DocsEvent::File { doc, version }).await,
+        DocOut::File { doc, frontiers } => send_json(socket, &DocsEvent::File { doc, frontiers }).await,
     }
 }
 

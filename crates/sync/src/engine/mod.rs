@@ -48,6 +48,8 @@ pub const NOT_NFC_REASON: &str =
 /// Why a changed file that may still be being written ([`Fs::still_changing`]) is skipped. Every skip for it starts
 /// with these words, so a caller can tell that a pass should look again once the file had time to settle.
 pub const STILL_CHANGING: &str = "still changing";
+/// Why a file both sides saved from its live document waits (see [`SaveRecords::includes`]).
+pub const SAVE_ORDER_WAITS: &str = "two Craft saves wait to learn which is newer";
 /// What the report says about a download kept because the file it replaces is in use or may not be replaced.
 const KEPT_WAITS: &str = "the server's version is downloaded and kept, and lands once it can";
 /// Most chunk IDs asked about in one missing-chunk query.
@@ -124,6 +126,9 @@ pub struct Config {
     /// chunk, [`MAX_CHUNK_BYTES`](craft_cloud_proto::limits::MAX_CHUNK_BYTES): with less room than that, no file
     /// of consequence fits. Tests lower it.
     pub quota_floor: u64,
+    /// How long two Craft saves of one file may wait for the agent to learn which is newer ([`SaveRecords::includes`])
+    /// before they are a conflict copy, as any two edits are (10 minutes). Tests lower it.
+    pub save_order_wait_ms: i64,
 }
 
 impl Config {
@@ -138,6 +143,7 @@ impl Config {
             racy_window_ms: 2_000,
             max_file_bytes: MAX_FILE_BYTES,
             quota_floor: u64::from(MAX_CHUNK_BYTES),
+            save_order_wait_ms: 10 * 60 * 1000,
         }
     }
 
@@ -350,6 +356,11 @@ pub struct Engine<F: Fs, T: Transport> {
     saves: Option<std::sync::Arc<dyn SaveRecords>>,
     /// Versions a late save record was sent for this run (see [`Engine::attach_late_saves`]).
     attached: BTreeSet<(NodeId, craft_cloud_proto::VersionId)>,
+    /// Files both sides saved from their live document where it isn't known yet which save is newer: neither side is
+    /// taken this pass (the push leaves them too). Cleared at the start of every pass.
+    deferred: BTreeSet<NodeId>,
+    /// Since when (the filesystem clock, ms) each such file has waited, across passes.
+    unknown_since: HashMap<NodeId, i64>,
 }
 
 /// What Craft apps saved from live documents, as the agent learnt it from them (`craft_cloud_proto::SaveRecord`).
@@ -359,10 +370,16 @@ pub struct Engine<F: Fs, T: Transport> {
 ///   the same live document, there is no conflict copy: the live document holds both sides' edits. The server's
 ///   version wins if its record includes this one's (it was saved later, from a document with everything this one
 ///   had); otherwise this one goes up over it (it is the newer upload, and the next save writes everything anyway).
+/// - Whether one record includes another is the agent's to say, from its copy of the document ([`Self::includes`]).
+///   When it can't tell yet (it lacks the operations), the pair waits: neither side is taken this pass. Still unknown
+///   after [`Config::save_order_wait_ms`], it is a conflict copy as always. A winner is never guessed.
 /// - Without a record on either side (a file edited outside Craft), it is a conflict as always.
 pub trait SaveRecords: Send + Sync {
     /// The record of the save that wrote content `hash` to `node`'s file, if an app saved exactly that.
     fn record(&self, node: NodeId, hash: &FileHash) -> Option<craft_cloud_proto::SaveRecord>;
+    /// Whether the live document as `a` names it (its frontiers) holds every operation `b`'s does; `None` while that
+    /// can't be told (the operations aren't here yet).
+    fn includes(&self, a: &craft_cloud_proto::SaveRecord, b: &craft_cloud_proto::SaveRecord) -> Option<bool>;
 }
 
 /// Which deletions the mass-delete guard lets through this pass.
@@ -411,6 +428,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             quota: None,
             saves: None,
             attached: BTreeSet::new(),
+            deferred: BTreeSet::new(),
+            unknown_since: HashMap::new(),
         })
     }
 
@@ -421,9 +440,17 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         self.saves = Some(saves);
     }
 
-    /// The save record of `node`'s content `hash`, within the record limit.
+    /// The save record of `node`'s content `hash`, if well formed.
     pub(crate) fn save_record(&self, node: NodeId, hash: &FileHash) -> Option<craft_cloud_proto::SaveRecord> {
-        self.saves.as_ref()?.record(node, hash).filter(|r| r.version.len() <= craft_cloud_proto::ops::MAX_SAVE_PEERS)
+        self.saves.as_ref()?.record(node, hash).filter(craft_cloud_proto::SaveRecord::is_valid)
+    }
+
+    /// Whether save `a` includes save `b`, as the agent can tell; `None` while it can't.
+    pub(crate) fn save_includes(&self, a: &craft_cloud_proto::SaveRecord, b: &craft_cloud_proto::SaveRecord) -> Option<bool> {
+        if a == b {
+            return Some(true);
+        }
+        self.saves.as_ref()?.includes(a, b)
     }
 
     /// Saves the state at safe points during a pass, so a crash loses less than the whole pass: once the server's
@@ -488,6 +515,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         // Anything may have changed in the folder since the last pass.
         self.listings.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
         self.quota = None;
+        self.deferred.clear();
         // A landing a crash cut short is put right before anything looks at the folder. Until it is, the pass fails
         // (a filesystem error, so it is retried): a scan could take the moved file for a new one or the target for
         // deleted. The error names the landing's target.

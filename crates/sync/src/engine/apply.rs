@@ -18,6 +18,8 @@ enum LiveWinner {
     Server,
     /// Ours, uploaded over it.
     Here,
+    /// Not known yet which is newer: neither is taken this pass.
+    Wait,
 }
 
 impl<F: Fs, T: Transport> Engine<F, T> {
@@ -315,6 +317,11 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 if let Some(file) = &remote.file
                     && let Some((winner, checked)) = self.live_winner(id, file, &bpath)?
                 {
+                    if matches!(winner, LiveWinner::Wait) {
+                        // The base stays as it is, and the push leaves the file too: the next pass decides again.
+                        report.skipped.push((bpath.to_string(), format!("{}; tried again next pass", super::SAVE_ORDER_WAITS)));
+                        return Ok(());
+                    }
                     if moved {
                         self.settle_occupants(id, &rpath, Some(&bpath), None, report).await?;
                         self.relocate(&bpath, &rpath, report)?;
@@ -347,6 +354,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                                 seen_ms: self.fs.now_ms(),
                             };
                         }
+                        LiveWinner::Wait => {}
                     }
                     self.state.base.insert(id, new_entry);
                     return Ok(());
@@ -1038,7 +1046,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// live document; `None` when either lacks one (a conflict, as always).
     /// With what the file looked like before it was hashed: a download may only replace exactly that (a save that
     /// lands after the hash keeps the old base, and the next pass decides again, by its own record or as a conflict).
-    fn live_winner(&self, id: NodeId, file: &FileState, at: &RelPath) -> Result<Option<(LiveWinner, Option<FsKind>)>, SyncError> {
+    ///
+    /// When the agent can't tell yet which save is newer, the file waits ([`LiveWinner::Wait`]); after
+    /// `save_order_wait_ms` of that, `None` (a conflict copy). A winner is never guessed.
+    fn live_winner(&mut self, id: NodeId, file: &FileState, at: &RelPath) -> Result<Option<(LiveWinner, Option<FsKind>)>, SyncError> {
         let Some(theirs) = file.save.as_ref() else { return Ok(None) };
         let checked = self.stat(at)?;
         let Some(hash) = self.content_hash(at) else { return Ok(None) };
@@ -1046,7 +1057,24 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         if ours.doc != theirs.doc {
             return Ok(None);
         }
-        Ok(Some((if theirs.includes(&ours) { LiveWinner::Server } else { LiveWinner::Here }, checked)))
+        let winner = match self.save_includes(theirs, &ours) {
+            Some(true) => LiveWinner::Server,
+            Some(false) => LiveWinner::Here,
+            None => {
+                let now = self.fs.now_ms();
+                let since = *self.unknown_since.entry(id).or_insert(now);
+                if now.saturating_sub(since) >= self.config.save_order_wait_ms {
+                    self.unknown_since.remove(&id);
+                    return Ok(None);
+                }
+                self.deferred.insert(id);
+                LiveWinner::Wait
+            }
+        };
+        if !matches!(winner, LiveWinner::Wait) {
+            self.unknown_since.remove(&id);
+        }
+        Ok(Some((winner, checked)))
     }
 
     fn holds_base_content(&self, entry: &BaseEntry, at: &RelPath) -> bool {

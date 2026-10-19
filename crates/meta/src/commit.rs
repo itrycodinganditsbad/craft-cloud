@@ -180,9 +180,9 @@ impl Ctx<'_> {
         let Some(size) = manifest_file_size(self.conn, space, &v.manifest).await? else {
             return Ok(Err(ConflictKind::MissingManifest { manifest: v.manifest }));
         };
-        // The save record as the agent sent it (the server never reads what it means), within its peer limit.
+        // The save record as the agent sent it (the server never reads what it means), if well formed.
         let save = match &v.save {
-            Some(record) if record.version.len() <= craft_cloud_proto::ops::MAX_SAVE_PEERS => serde_json::to_string(record).ok(),
+            Some(record) if record.is_valid() => serde_json::to_string(record).ok(),
             _ => None,
         };
         sqlx::query(
@@ -422,8 +422,11 @@ impl Meta {
     /// record keeps it, and the same call again changes nothing. When it is added, the node is in the change feed
     /// again, so the other machines learn it. `NotFound` when `node` has no such version.
     pub async fn attach_save(&self, space: SpaceId, node: NodeId, version: VersionId, save: &SaveRecord) -> Result<CommitOutcome, MetaError> {
-        if save.version.len() > craft_cloud_proto::ops::MAX_SAVE_PEERS {
-            return Err(MetaError::Invalid("a save record has at most 256 peers"));
+        if !save.is_valid() {
+            return Err(MetaError::Invalid("a save record's frontiers are at most 256 heads, sorted and distinct"));
+        }
+        if save.doc != craft_cloud_proto::live::node_doc(space, node) {
+            return Err(MetaError::Invalid("a save record names the live document of its own file"));
         }
         let json = serde_json::to_string(save).map_err(|_| MetaError::Invalid("a save record that can't be written"))?;
         let mut w = self.begin_write().await?;

@@ -105,12 +105,25 @@ struct CraftSaves {
     saves: u32,
 }
 
+/// A machine's save records. Their frontiers stand for version vectors here, compared as vectors (the agent asks its
+/// copy of the document). The first time a pair is asked, the answer is "can't tell yet", as an agent that lacks the
+/// operations says: the files wait a pass.
 #[derive(Default, Clone)]
-struct CraftBook(Arc<Mutex<BTreeMap<(NodeId, FileHash), craft_cloud_proto::SaveRecord>>>);
+struct CraftBook(Arc<Mutex<BTreeMap<(NodeId, FileHash), craft_cloud_proto::SaveRecord>>>, Arc<Mutex<BTreeSet<AskedPair>>>);
+
+/// Two records' frontiers asked about.
+type AskedPair = (Vec<(u64, u32)>, Vec<(u64, u32)>);
 
 impl craft_cloud_sync::SaveRecords for CraftBook {
     fn record(&self, node: NodeId, hash: &FileHash) -> Option<craft_cloud_proto::SaveRecord> {
         self.0.lock().unwrap().get(&(node, *hash)).cloned()
+    }
+
+    fn includes(&self, a: &craft_cloud_proto::SaveRecord, b: &craft_cloud_proto::SaveRecord) -> Option<bool> {
+        if self.1.lock().unwrap().insert((a.frontiers.clone(), b.frontiers.clone())) {
+            return None;
+        }
+        Some(b.frontiers.iter().all(|(peer, end)| a.frontiers.iter().any(|(p, e)| p == peer && e >= end)))
     }
 }
 
@@ -149,7 +162,7 @@ impl Driver {
         self.destroyed.extend(before);
         self.destroyed.insert(hash);
         if let Some(book) = c.books.get(i) {
-            book.0.lock().unwrap().insert((node, hash), craft_cloud_proto::SaveRecord { doc: c.doc, version });
+            book.0.lock().unwrap().insert((node, hash), craft_cloud_proto::SaveRecord { doc: c.doc, frontiers: version });
         }
         self.net.event(format!("{} m{i} craft save {}", stamp(), c.saves));
     }
