@@ -306,7 +306,9 @@ mod tests {
                 count = count.display()
             );
             std::fs::write(src.join("craft-cloud-agent"), agent).unwrap();
-            std::fs::write(src.join("craft-cloud"), "#!/bin/sh\nexit 0\n").unwrap();
+            // The app: an (old) tray runs, which `--close` ends and says.
+            let app = format!("#!/bin/sh\necho \"$0 $*\" >> \"{}\"\n[ \"$1\" = --close ] && echo tray\nexit 0\n", calls.display());
+            std::fs::write(src.join("craft-cloud"), app).unwrap();
             std::fs::write(src.join("craft-cloud.png"), "png").unwrap();
             std::fs::write(src.join(LICENSES), "licences").unwrap();
             std::fs::copy(crate::root().join("packaging/linux/install.sh"), src.join("install.sh")).unwrap();
@@ -386,15 +388,22 @@ mod tests {
         let out = up.install("60");
         assert!(out.status.success(), "{out:?}");
         let quit = format!("{} quit [old agent running]", up.src_agent());
+        let tray = format!("{} --tray", up.home.join(".local/lib/craft-cloud/craft-cloud").display());
         let expected = [
             quit.clone(),
             quit.clone(),
             quit,
+            format!("{} --close", up.src.join("craft-cloud").display()),
             format!("{} autostart on", up.lib_agent()),
             "systemctl --user stop craft-cloud-agent.service".to_owned(),
             "systemctl --user start craft-cloud-agent.service".to_owned(),
+            tray.clone(),
         ];
-        assert_eq!(up.calls(), expected, "nothing after the quits until the old process had ended");
+        assert_eq!(
+            up.ends_with(&tray),
+            expected,
+            "nothing after the quits until the old process had ended; the old tray closed first, the new one started last"
+        );
     }
 
     /// The same without a systemd unit: the new copy is run once the old process has ended.

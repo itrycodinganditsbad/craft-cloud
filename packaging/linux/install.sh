@@ -139,8 +139,25 @@ if [ "$was_running" = 1 ]; then
     stopped=1
 fi
 
-# From here on the agent is stopped: whatever ends the script (a failed copy too) starts it again.
-trap 'if [ "$stopped" = 1 ] && [ "$restarted" = 0 ]; then start_again; fi' EXIT
+# From here on the agent is stopped and the app may be closed: whatever ends the script (a failed copy too) starts
+# them again, once.
+closed=""
+finished=0
+finish() {
+    [ "$finished" = 0 ] || return 0
+    finished=1
+    if [ "$stopped" = 1 ] && [ "$restarted" = 0 ]; then
+        start_again
+    fi
+    case "$closed" in
+        *tray*) [ -x "$lib/craft-cloud" ] && nohup "$lib/craft-cloud" --tray >/dev/null 2>&1 & ;;
+    esac
+}
+trap finish EXIT
+
+# The app's window and tray process, an older version's too, are closed before the copy: an old tray would keep its
+# icon next to the new one's. A tray that ran is started again at the end.
+closed=$("$here/craft-cloud" --close 2>/dev/null || true)
 
 mkdir -p "$lib" "$bin" "$apps" "$icons"
 for name in craft-cloud craft-cloud-agent; do
@@ -177,9 +194,7 @@ if [ -f "$unit" ] || [ -f "$entry" ]; then
     "$lib/craft-cloud-agent" autostart on >/dev/null || echo "Start at login still runs the old agent: run 'craft-cloud-agent autostart on'." >&2
 fi
 
-if [ "$stopped" = 1 ]; then
-    start_again
-fi
+finish
 
 if [ "$menu" = 1 ]; then
     echo "Craft Cloud is installed in $lib. Open it from the app menu, or run craft-cloud."
