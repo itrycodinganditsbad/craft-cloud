@@ -42,17 +42,42 @@
 //!   starts afresh from its unacked updates, which are kept and sent.
 //! - A newer agent's update is taken like any other: once the document says it is of a newer version, this agent only
 //!   stops adding to it (the design's rule: an older agent is read-only on a newer document), and says why.
+//!
+//! **Documents of files** (with a server on live protocol 2) work the same way, with what recents never needed:
+//!
+//! - **Joining**: a file opened for the first time here is followed from the start to see whether the server has its
+//!   document ([`Replica::open_document`]). If it does, the document is live once caught up; if not (`not_found`), the
+//!   app is asked for an import ([`DocEvent::NeedsImport`]), which goes up as `create` with its snapshot
+//!   ([`Replica::import_document`]); kept, it is the document; not kept (another machine's import was first), it is
+//!   dropped and the document caught up from the start. The app hears it is live only once that is settled
+//!   ([`DocEvent::Joined`]). A document that isn't joined yet is never written to disk, so a file that has never been
+//!   live never opens offline from an empty copy. A joined document whose server lost it (`not_found`) is made again
+//!   from this machine's copy.
+//! - **Local updates** ([`Replica::local_update`]) are imported into the copy with Loro's checked import (an update
+//!   Loro refuses leaves the copy as it was; one it fails on reads the document back from disk), appended to the
+//!   document's journal (durable) before the app is told, and sent. The document's file itself is written now and then
+//!   ([`Replica::flush_documents`]), not per keystroke; the journal is cleared after.
+//! - **Snapshots**: a catch-up from below the server's snapshot starts with it; one this agent can't read makes it
+//!   follow the whole log instead (`subscribe_log`). When the server asks to compact, the agent answers once it holds
+//!   every update up to `upto` and nothing waits, with a snapshot of exactly those updates ([`LogVersion`]), or not at
+//!   all (another device is asked).
+//! - **Presence** goes both ways as it is; remote updates and presence are handed to the apps ([`Replica::take_events`]).
+//! - **At most [`MAX_SUBSCRIPTIONS`] followed**: past that, the least recently used document no app has open and with
+//!   nothing to send is unfollowed (it stays on disk, and is followed again when opened). Documents loaded at start are
+//!   followed only if they have something to send.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use craft_cloud_proto::api::codes;
 use craft_cloud_proto::live::{
-    AppName, ClientFrame, DocKind, LIVE_PROTOCOL_MAX, LIVE_PROTOCOL_MIN, MAX_UPDATE_BYTES, PROTOCOL_MISMATCH, ServerFrame, recents_doc, update_hash,
+    AppName, ClientFrame, DocKind, LIVE_DOCUMENTS_PROTOCOL, LIVE_PROTOCOL_MAX, LIVE_PROTOCOL_MIN, MAX_SNAPSHOT_BYTES, MAX_SUBSCRIPTIONS,
+    MAX_UPDATE_BYTES, PROTOCOL_MISMATCH, ServerFrame, node_doc, recents_doc, update_hash,
 };
-use craft_cloud_proto::local::RecentEntry;
-use craft_cloud_proto::{DocId, Epoch, SpaceId};
+use craft_cloud_proto::local::{NotLiveReason, RecentEntry};
+use craft_cloud_proto::{DocId, Epoch, NodeId, SpaceId};
 use serde::{Deserialize, Serialize};
 
+use super::copy::{LiveCopy, LogVersion, Taken as CopyTaken, Version, version_of};
 use super::recents::{AddKey, Imported, Recents, Spans, UpdateError, add_spans, spans_of};
 use super::store::DocStore;
 
@@ -76,6 +101,10 @@ const PUSH_PATIENCE: u32 = 8;
 const MAX_OWN_PEERS: usize = 16;
 /// Heals of one document in a run after which its push stops (the same state fails the same way again).
 const MAX_HEALS: u32 = 2;
+/// The format of a document of a file's file (`.doc`).
+const DOCUMENT_FILE_FORMAT: u32 = 1;
+/// A document's journal is written into its file (and cleared) once it holds this many bytes, besides now and then.
+const MAX_JOURNAL_BYTES: usize = 4 * 1024 * 1024;
 
 /// Every update of the log up to `upto` is in the document's file; `upto_hash` is the hash of the update at `upto`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +157,222 @@ struct DocFile {
     push_wait: Option<u32>,
 }
 
+/// A document of a file's file (`<id>.doc`, beside its journal): what a recents file holds, and its node. A file of its
+/// own kind, so an older agent (which reads only recents files) leaves it alone.
+#[derive(Debug, Serialize, Deserialize)]
+struct DocumentFile {
+    format: u32,
+    space: SpaceId,
+    doc: DocId,
+    node: NodeId,
+    app: AppName,
+    have: Have,
+    next_client_seq: u64,
+    pending: Vec<Pending>,
+    snapshot: Vec<u8>,
+    waiting: Vec<Waiting>,
+    epoch: Option<Epoch>,
+    pushing: Option<Spans>,
+    own_peers: Vec<u64>,
+    push_wait: Option<u32>,
+    /// Follow it with `subscribe_log` (the server's snapshot didn't read here).
+    log_only: bool,
+}
+
+/// What a file of either kind holds, as [`Doc::from_parts`] reads it.
+struct Parts {
+    id: DocId,
+    kind: Kind,
+    have: Have,
+    next_client_seq: u64,
+    pending: Vec<Pending>,
+    snapshot: Vec<u8>,
+    waiting: Vec<Waiting>,
+    epoch: Option<Epoch>,
+    pushing: Option<Spans>,
+    own_peers: Vec<u64>,
+    push_wait: Option<u32>,
+}
+
+/// One record of a document's journal: a local update, on disk before the app is told it is kept.
+#[derive(Debug, Serialize, Deserialize)]
+struct JournalRecord {
+    client_seq: u64,
+    bytes: Vec<u8>,
+}
+
+/// A journal record as it is written: its length, the record, and the first 8 bytes of its BLAKE3 (a record cut off
+/// by a crash, never acked to the app, is where the journal ends).
+fn journal_record(record: &JournalRecord) -> std::io::Result<Vec<u8>> {
+    let body = postcard::to_stdvec(record).map_err(std::io::Error::other)?;
+    let len = u32::try_from(body.len()).map_err(|_| std::io::Error::other("a journal record over 4 GiB"))?;
+    let mut out = Vec::with_capacity(body.len() + 12);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(update_hash(&body).get(..8).unwrap_or_default());
+    Ok(out)
+}
+
+/// The records of a journal, up to the first that doesn't read.
+fn journal_records(mut bytes: &[u8]) -> Vec<JournalRecord> {
+    let mut out = Vec::new();
+    while bytes.len() >= 4 {
+        let Some(len) = bytes.get(..4).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(u32::from_le_bytes) else { break };
+        let len = len as usize;
+        let (Some(body), Some(check)) = (bytes.get(4..4 + len), bytes.get(4 + len..12 + len)) else { break };
+        if update_hash(body).get(..8) != Some(check) {
+            break;
+        }
+        match postcard::from_bytes::<JournalRecord>(body) {
+            Ok(record) => out.push(record),
+            Err(_) => break,
+        }
+        bytes = bytes.get(12 + len..).unwrap_or_default();
+    }
+    out
+}
+
+/// Which document it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Kind {
+    Recents(AppName),
+    Document { node: NodeId, app: AppName },
+}
+
+impl Kind {
+    fn app(&self) -> &AppName {
+        match self {
+            Kind::Recents(app) | Kind::Document { app, .. } => app,
+        }
+    }
+
+    fn is_document(&self) -> bool {
+        matches!(self, Kind::Document { .. })
+    }
+}
+
+/// A document's content: an app's recents list, or a document of a file (whose content nothing here reads).
+enum Body {
+    Recents(Recents),
+    Document(LiveCopy),
+}
+
+impl Body {
+    fn new(kind: &Kind, peer: u64) -> Self {
+        match kind {
+            Kind::Recents(_) => Body::Recents(Recents::new(peer)),
+            Kind::Document { .. } => Body::Document(LiveCopy::new(peer)),
+        }
+    }
+
+    fn load(kind: &Kind, snapshot: &[u8], peer: u64) -> Result<Self, UpdateError> {
+        Ok(match kind {
+            Kind::Recents(_) => Body::Recents(Recents::load(snapshot, peer)?),
+            Kind::Document { .. } => Body::Document(LiveCopy::load(snapshot, peer)?),
+        })
+    }
+
+    fn copy(&self) -> &LiveCopy {
+        match self {
+            Body::Recents(recents) => recents,
+            Body::Document(copy) => copy,
+        }
+    }
+
+    /// Imports an update; `changed`: the list changed (recents), or it brought something an app hasn't seen (a
+    /// document: it goes to the apps).
+    fn import(&self, bytes: &[u8]) -> Result<Imported, UpdateError> {
+        match self {
+            Body::Recents(recents) => recents.import(bytes),
+            Body::Document(copy) => copy.import(bytes).map(document_imported),
+        }
+    }
+
+    fn import_any_size(&self, bytes: &[u8]) -> Result<Imported, UpdateError> {
+        match self {
+            Body::Recents(recents) => recents.import_any_size(bytes),
+            Body::Document(copy) => copy.import_any_size(bytes).map(document_imported),
+        }
+    }
+
+    /// A recents document a newer agent wrote: its version.
+    fn newer(&self) -> Option<i64> {
+        match self {
+            Body::Recents(recents) => recents.newer(),
+            Body::Document(_) => None,
+        }
+    }
+
+    fn view(&self) -> Vec<RecentEntry> {
+        match self {
+            Body::Recents(recents) => recents.view(),
+            Body::Document(_) => Vec::new(),
+        }
+    }
+
+    /// Marks the document as one Loro failed in (for tests).
+    #[cfg(test)]
+    fn poison(&self) {
+        self.copy().poison();
+    }
+}
+
+fn document_imported(taken: CopyTaken) -> Imported {
+    match taken {
+        CopyTaken::Applied { new } => Imported::Applied { changed: new },
+        CopyTaken::Waiting { needs } => Imported::Waiting { needs, changed: true },
+    }
+}
+
+/// Where a document of a file that isn't live here yet stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Join {
+    /// Followed from the start, to see whether the server has it.
+    Probing,
+    /// The server doesn't have it: waiting for the app's import.
+    NeedsImport,
+    /// The import went up as `create`: waiting for `created`.
+    Creating(Vec<u8>),
+    /// Another machine's import was kept: caught up from the start.
+    Following,
+}
+
+/// What happened to a document of a file, for the apps that have it open (or wait to).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocEvent {
+    /// It is live here now (caught up, or made by this machine's import): the apps that wait for it get its state.
+    Joined(DocId),
+    /// The server doesn't have it: an app is to send its import.
+    NeedsImport(DocId),
+    /// It can't be made live now: the apps that wait open the file as a plain file.
+    NotLive(DocId, NotLiveReason, String),
+    /// Another machine's change, to apply as it is.
+    Remote(DocId, Vec<u8>),
+    /// Another machine's presence, as it sent it.
+    Presence(DocId, Vec<u8>),
+}
+
+/// Why a local update was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum LocalError {
+    /// The update isn't taken (Loro refused it, or it is over a limit): the document is as it was.
+    #[error("{0}")]
+    Invalid(String),
+    #[error("the document couldn't be written to disk: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// How opening a document of a file went ([`Replica::open_document`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Opening {
+    /// Live here: its state is ready ([`Replica::document_state`]).
+    Live,
+    /// Being joined: a [`DocEvent`] says how it ends.
+    Joining,
+    /// It has never been live here and the server can't be asked: a plain file for now.
+    NotLive(NotLiveReason, String),
+}
+
 /// Where a replica gets the Loro peer ID of each document it opens or makes: random in the agent (a fresh one per
 /// run, so a peer ID is never reused with a different history), from the seed in the simulation.
 pub type Peers = Box<dyn FnMut() -> u64 + Send>;
@@ -167,8 +412,9 @@ enum Taken {
 }
 
 struct Doc {
-    app: AppName,
-    recents: Recents,
+    id: DocId,
+    kind: Kind,
+    body: Body,
     have: Have,
     pending: Vec<Pending>,
     waiting: Vec<Waiting>,
@@ -208,17 +454,43 @@ struct Doc {
     dirty: bool,
     /// What was said about this document's updates already.
     said: BTreeSet<String>,
+    /// What the server's log holds of it, as a version per number: what a compaction's snapshot is made at.
+    log: LogVersion,
+    /// The server asked for a snapshot of the updates up to this: answered once they are all here.
+    compact_ask: Option<u64>,
+    /// Live here: it has a file and opens offline. Recents always are; a document of a file once joined.
+    joined: bool,
+    /// A document of a file being joined.
+    join: Option<Join>,
+    /// A joined document the server lost is being made again from this copy (`create` sent).
+    creating: bool,
+    /// Not followed (the device's cap on subscriptions): it stays on disk.
+    parked: bool,
+    /// When an app last opened it (a counter), and how many have it open now.
+    last_used: u64,
+    open: u32,
+    /// Followed with `subscribe_log`: the server's snapshot didn't read here.
+    log_only: bool,
+    /// The catch-up under way was given up on (its snapshot didn't read): its `subscribed` starts the next one.
+    stale: bool,
+    /// Bytes appended to its journal since its file was last written.
+    journal: usize,
+    /// Its file must be written at the next flush (not only now and then).
+    urgent: bool,
+    /// The waiting update Loro just failed on, imported again ([`Doc::rewait`]).
+    waiting_failed: Option<[u8; 32]>,
 }
 
 impl Doc {
-    fn empty(app: &AppName, peer: u64) -> Self {
-        Self::with(app.clone(), Recents::new(peer), Have::default(), Vec::new(), Vec::new(), 1, None, None)
+    fn empty(app: &AppName, peer: u64, id: DocId) -> Self {
+        Self::with(id, Kind::Recents(app.clone()), Body::Recents(Recents::new(peer)), Have::default(), Vec::new(), Vec::new(), 1, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn with(
-        app: AppName,
-        recents: Recents,
+        id: DocId,
+        kind: Kind,
+        body: Body,
         have: Have,
         pending: Vec<Pending>,
         waiting: Vec<Waiting>,
@@ -227,9 +499,10 @@ impl Doc {
         pushing: Option<Spans>,
     ) -> Self {
         Self {
-            app,
-            own_peers: vec![recents.peer()],
-            recents,
+            id,
+            own_peers: vec![body.copy().peer()],
+            kind,
+            body,
             have,
             pending,
             waiting,
@@ -250,6 +523,90 @@ impl Doc {
             create_refused: false,
             dirty: false,
             said: BTreeSet::new(),
+            log: LogVersion::unknown(),
+            compact_ask: None,
+            joined: true,
+            join: None,
+            creating: false,
+            parked: false,
+            last_used: 0,
+            open: 0,
+            log_only: false,
+            stale: false,
+            journal: 0,
+            urgent: false,
+            waiting_failed: None,
+        }
+    }
+
+    /// The app this document belongs to.
+    fn app(&self) -> &AppName {
+        self.kind.app()
+    }
+
+    /// The document as the user is told about it: `recents` names an app's recents (as every recents note always has),
+    /// `document` a document of a file.
+    fn told(&self, recents: impl FnOnce(&AppName) -> String, document: impl FnOnce(DocId) -> String) -> String {
+        match &self.kind {
+            Kind::Recents(app) => recents(app),
+            Kind::Document { .. } => document(self.id),
+        }
+    }
+
+    /// What the server's log holds of the document up to `have`, worked out from the copy: everything in it but its
+    /// own unsent updates, when those are each peer's last operations and nothing else is out of the log (nothing waits,
+    /// no push is under way). Unknown otherwise.
+    fn derive_log(&mut self) {
+        self.log = LogVersion::unknown();
+        if !self.waiting.is_empty() || self.pushing.is_some() {
+            return;
+        }
+        let Ok(mut version) = self.body.copy().version() else { return };
+        let mut unsent = Spans::new();
+        for pending in &self.pending {
+            match spans_of(&pending.bytes) {
+                Some(ranges) => add_spans(&mut unsent, &ranges),
+                None => return,
+            }
+        }
+        for (peer, list) in unsent {
+            match (list.as_slice(), version.get(&peer).copied()) {
+                ([(start, end)], Some(reach)) if *end == reach => {
+                    version.insert(peer, *start);
+                }
+                _ => return,
+            }
+        }
+        version.retain(|_, end| *end > 0);
+        self.log = LogVersion::anchored(self.have.upto, version);
+    }
+
+    /// The answer to the server's `compact`, once this machine holds every update up to `upto`: a snapshot of exactly
+    /// those, or nothing (something waits, a push is under way, or the version there isn't known; another device is
+    /// asked). The question is dropped either way once it can be answered.
+    fn try_compact(&mut self) -> Vec<ClientFrame> {
+        let Some(upto) = self.compact_ask else { return Vec::new() };
+        if self.sub != Sub::Live || self.have.upto < upto {
+            return Vec::new();
+        }
+        self.compact_ask = None;
+        if !self.waiting.is_empty() || self.pushing.is_some() || self.stuck || !self.joined || self.is_broken() {
+            return Vec::new();
+        }
+        if !self.log.is_known() && upto == self.have.upto {
+            self.derive_log();
+        }
+        let Some(version) = self.log.at(upto) else { return Vec::new() };
+        match self.body.copy().snapshot_at(&version) {
+            Ok(bytes) if !bytes.is_empty() && bytes.len() <= MAX_SNAPSHOT_BYTES => {
+                self.log.rebase(upto, version);
+                vec![ClientFrame::Snapshot { doc: self.id, upto, bytes }]
+            }
+            Err(UpdateError::Panicked) => {
+                self.broken = true;
+                Vec::new()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -259,57 +616,83 @@ impl Doc {
     /// the snapshot without it): a waiting one is dropped (the server has it, and a catch-up from the start brings it
     /// if it is ever needed), an unacked one stays unacked (it is sent, and its operations come back with the log).
     /// An error only when the snapshot itself doesn't read.
-    fn from_file(mut file: DocFile, peer: u64, notes: &mut Vec<String>) -> Result<Self, UpdateError> {
+    fn from_file(file: DocFile, peer: u64, notes: &mut Vec<String>) -> Result<Self, UpdateError> {
+        let parts = Parts {
+            id: file.doc,
+            kind: Kind::Recents(file.app),
+            have: file.have,
+            next_client_seq: file.next_client_seq,
+            pending: file.pending,
+            snapshot: file.snapshot,
+            waiting: file.waiting,
+            epoch: file.epoch,
+            pushing: file.pushing,
+            own_peers: file.own_peers,
+            push_wait: file.push_wait,
+        };
+        Self::from_parts(parts, peer, notes)
+    }
+
+    /// [`Doc::from_file`], for a file of either kind.
+    fn from_parts(mut file: Parts, peer: u64, notes: &mut Vec<String>) -> Result<Self, UpdateError> {
         let (mut bad_pending, mut bad_waiting) = (BTreeSet::new(), BTreeSet::new());
-        let recents = 'load: loop {
-            let recents = Recents::load(&file.snapshot, peer)?;
+        let body = 'load: loop {
+            let body = Body::load(&file.kind, &file.snapshot, peer)?;
             for (i, pending) in file.pending.iter().enumerate() {
-                if !bad_pending.contains(&i) && recents.import(&pending.bytes) == Err(UpdateError::Panicked) {
+                if !bad_pending.contains(&i) && body.import_any_size(&pending.bytes) == Err(UpdateError::Panicked) {
                     bad_pending.insert(i);
                     continue 'load;
                 }
             }
             for (i, waiting) in file.waiting.iter().enumerate() {
-                if !bad_waiting.contains(&i) && recents.import(&waiting.bytes) == Err(UpdateError::Panicked) {
+                if !bad_waiting.contains(&i) && body.import(&waiting.bytes) == Err(UpdateError::Panicked) {
                     bad_waiting.insert(i);
                     continue 'load;
                 }
             }
-            break recents;
+            break body;
         };
         if !bad_pending.is_empty() || !bad_waiting.is_empty() {
-            notes.push(format!(
-                "Loro failed on {} stored recents update(s) of {}; the waiting ones were dropped, the unsent ones are kept and sent",
-                bad_pending.len() + bad_waiting.len(),
-                file.app
-            ));
+            let count = bad_pending.len() + bad_waiting.len();
+            notes.push(match &file.kind {
+                Kind::Recents(app) => format!(
+                    "Loro failed on {count} stored recents update(s) of {app}; the waiting ones were dropped, the unsent ones are kept and sent"
+                ),
+                Kind::Document { .. } => format!(
+                    "Loro failed on {count} stored update(s) of the live document {}; the waiting ones were dropped, the unsent ones are kept and sent",
+                    file.id
+                ),
+            });
         }
         let mut i = 0;
         file.waiting.retain(|_| {
             i += 1;
             !bad_waiting.contains(&(i - 1))
         });
-        let mut doc = Self::with(file.app, recents, file.have, file.pending, file.waiting, file.next_client_seq.max(1), file.epoch, file.pushing);
-        doc.waiting.retain(|w| !doc.recents.covers(&w.needs));
+        let mut doc =
+            Self::with(file.id, file.kind, body, file.have, file.pending, file.waiting, file.next_client_seq.max(1), file.epoch, file.pushing);
+        doc.waiting.retain(|w| !doc.body.copy().covers(&w.needs));
         for peer in file.own_peers {
             if !doc.own_peers.contains(&peer) && doc.own_peers.len() < MAX_OWN_PEERS {
                 doc.own_peers.push(peer);
             }
         }
         doc.push_wait = file.push_wait;
+        doc.derive_log();
         Ok(doc)
     }
 
     /// A document whose file doesn't read (the snapshot is damaged, or Loro fails on it): started afresh from its
     /// unacked updates, which are kept and sent; it catches up from the start, so nothing the server has is missed.
-    fn from_pending(app: AppName, pending: Vec<Pending>, next_client_seq: u64, peer: u64) -> Self {
-        let recents = Recents::new(peer);
+    fn from_pending(id: DocId, kind: Kind, pending: Vec<Pending>, next_client_seq: u64, peer: u64) -> Self {
+        let body = Body::new(&kind, peer);
         for p in &pending {
-            let _ = recents.import(&p.bytes);
+            let _ = body.import_any_size(&p.bytes);
         }
         let pending = pending.into_iter().map(|p| Pending { acked: None, push: false, ..p }).collect();
-        let mut doc = Self::with(app, recents, Have::default(), pending, Vec::new(), next_client_seq.max(1), None, None);
+        let mut doc = Self::with(id, kind, body, Have::default(), pending, Vec::new(), next_client_seq.max(1), None, None);
         doc.dirty = true;
+        doc.urgent = true;
         doc
     }
 
@@ -330,24 +713,18 @@ impl Doc {
             self.advance(seq, hash);
             return Taken::Had;
         }
-        let had_history = self.recents.has_history();
-        match self.recents.import(bytes) {
+        let had_history = self.body.copy().has_history();
+        let mut in_log = true;
+        match self.body.import(bytes) {
             Ok(Imported::Applied { changed: list }) => {
                 *changed |= list;
-                if !had_history {
-                    // The first history, perhaps a snapshot: Loro dropped what waited; it goes in again.
-                    for waiting in &self.waiting {
-                        match self.recents.import(&waiting.bytes) {
-                            Ok(Imported::Applied { changed: list } | Imported::Waiting { changed: list, .. }) => *changed |= list,
-                            Err(UpdateError::Panicked) => return Taken::WaitingPanicked(waiting.hash),
-                            Err(_) => {}
-                        }
-                    }
+                if !had_history && self.rewait(changed).is_err() {
+                    return self.waiting_panicked();
                 }
-                if let Some(version) = self.recents.newer() {
+                if let Some(version) = self.body.newer() {
                     let line = format!(
                         "the recents of {} were written by a newer Craft Cloud agent (version {version}); they are shown, and this agent adds to them again once it is updated",
-                        self.app
+                        self.app()
                     );
                     self.say(notes, line);
                 }
@@ -358,10 +735,15 @@ impl Doc {
                     let held: usize = self.waiting.iter().map(|w| w.bytes.len()).sum();
                     if held.saturating_add(bytes.len()) > MAX_WAITING_BYTES {
                         self.stuck = true;
-                        let line = format!(
-                            "more than {} MiB of recents updates for {} wait for history that never came; this machine takes no more of them until it connects again",
-                            MAX_WAITING_BYTES >> 20,
-                            self.app
+                        let line = self.told(
+                            |app| format!(
+                                "more than {} MiB of recents updates for {app} wait for history that never came; this machine takes no more of them until it connects again",
+                                MAX_WAITING_BYTES >> 20
+                            ),
+                            |id| format!(
+                                "more than {} MiB of updates of the live document {id} wait for history that never came; this machine takes no more of them until it connects again",
+                                MAX_WAITING_BYTES >> 20
+                            ),
                         );
                         self.say(notes, line);
                         return Taken::Stuck;
@@ -371,14 +753,43 @@ impl Doc {
             }
             Err(UpdateError::Panicked) => return Taken::Panicked,
             Err(e) => {
-                let line = format!("a recents update for {} from the server can never apply and was skipped: {e}", self.app);
+                in_log = false;
+                let line = self.told(
+                    |app| format!("a recents update for {app} from the server can never apply and was skipped: {e}"),
+                    |id| format!("an update of the live document {id} from the server can never apply and was skipped: {e}"),
+                );
                 self.say(notes, line);
             }
         }
-        self.waiting.retain(|w| !self.recents.covers(&w.needs));
+        self.waiting.retain(|w| !self.body.copy().covers(&w.needs));
         self.on_server(bytes);
+        // What the log holds, as far as this copy has it (an update that never applies isn't in it).
+        self.log.note(seq, if in_log { spans_of(bytes).unwrap_or_default() } else { Vec::new() });
         self.advance(seq, hash);
         Taken::Had
+    }
+
+    /// After the copy's first history (perhaps a snapshot) Loro dropped what waited: it goes in again. `Err` with the
+    /// one Loro failed on (in [`Doc::waiting_failed`]).
+    fn rewait(&mut self, changed: &mut bool) -> Result<(), ()> {
+        for waiting in &self.waiting {
+            match self.body.import(&waiting.bytes) {
+                Ok(Imported::Applied { changed: list } | Imported::Waiting { changed: list, .. }) => *changed |= list,
+                Err(UpdateError::Panicked) => {
+                    self.waiting_failed = Some(waiting.hash);
+                    return Err(());
+                }
+                Err(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn waiting_panicked(&mut self) -> Taken {
+        match self.waiting_failed.take() {
+            Some(hash) => Taken::WaitingPanicked(hash),
+            None => Taken::Panicked,
+        }
     }
 
     /// `bytes` are in the log: while a push is under way, their operations needn't go up.
@@ -398,6 +809,7 @@ impl Doc {
             self.sent.remove(&own.client_seq);
             self.on_server(&own.bytes);
             self.have = Have { upto: self.have.upto.saturating_add(1), upto_hash: Some(update_hash(&own.bytes)) };
+            self.log.note(self.have.upto, spans_of(&own.bytes).unwrap_or_default());
         }
         // Own updates the catch-up brought back count as had too.
         let upto = self.have.upto;
@@ -412,7 +824,7 @@ impl Doc {
 
     /// Loro failed in this document (an import, export or read panicked): read back from its file, never dropped.
     fn is_broken(&self) -> bool {
-        self.broken || self.recents.is_poisoned()
+        self.broken || self.body.copy().is_poisoned()
     }
 
     /// Tells the user `line`, once per document.
@@ -438,7 +850,7 @@ impl Doc {
             return Vec::new();
         }
         let Some(has) = &self.pushing else { return Vec::new() };
-        let Ok(missing) = self.recents.missing(has) else {
+        let Ok(missing) = self.body.copy().missing(has) else {
             // Loro failed: the document is read back from its file ([`Replica::heal`]).
             self.broken = true;
             return Vec::new();
@@ -473,7 +885,7 @@ impl Doc {
                 }
                 let run = missing.iter().take_while(|(p, _, _)| self.own_peers.contains(p) == own).count();
                 let max = PUSH_PART.min(MAX_UPDATE_BYTES >> self.strikes);
-                self.recents.export_prefix(&missing[..run], max, MAX_UPDATE_BYTES >> self.strikes).map(|(bytes, _)| Some(bytes))
+                self.body.copy().export_prefix(&missing[..run], max, MAX_UPDATE_BYTES >> self.strikes).map(|(bytes, _)| Some(bytes))
             }
         };
         match part {
@@ -497,7 +909,10 @@ impl Doc {
                 Vec::new()
             }
             Err(e) => {
-                let line = format!("the recents of {} can't go up to the server ({e}); they stay on this machine", self.app);
+                let line = self.told(
+                    |app| format!("the recents of {app} can't go up to the server ({e}); they stay on this machine"),
+                    |id| format!("the live document {id} can't go up to the server ({e}); it stays on this machine"),
+                );
                 self.say(notes, line);
                 Vec::new()
             }
@@ -513,16 +928,20 @@ impl Doc {
         self.push_wait = None;
         self.waiting.clear();
         self.stuck = false;
-        if let Ok(snapshot) = self.recents.snapshot()
-            && let Ok(fresh) = Recents::load(&snapshot, self.recents.peer())
+        if let Ok(snapshot) = self.body.copy().snapshot()
+            && let Ok(fresh) = Body::load(&self.kind, &snapshot, self.body.copy().peer())
         {
-            self.recents = fresh;
+            self.body = fresh;
             for pending in &self.pending {
-                let _ = self.recents.import(&pending.bytes);
+                let _ = self.body.import_any_size(&pending.bytes);
             }
         }
         self.forget_acks();
+        // The log is learnt again from the start.
+        self.log = LogVersion::anchored(0, Version::new());
+        self.compact_ask = None;
         self.dirty = true;
+        self.urgent = true;
     }
 
     /// Acks of numbers not reached are forgotten: their updates go again (the server acks one it has).
@@ -532,10 +951,49 @@ impl Doc {
         }
     }
 
-    /// `subscribe` from what the document has, without `create` (the server has it: on the same connection).
+    /// `subscribe` from what the document has, without `create` (the server has it: on the same connection); a
+    /// document whose server snapshot didn't read here follows the whole log instead.
     fn resubscribe(&mut self, id: DocId) -> Vec<ClientFrame> {
         self.sub = Sub::CatchingUp;
+        if self.log_only {
+            return vec![ClientFrame::SubscribeLog { doc: id, after: self.have.upto, at: self.at() }];
+        }
         vec![ClientFrame::Subscribe { doc: id, after: self.have.upto, at: self.at() }]
+    }
+
+    /// The server's snapshot of the document, at the start of a catch-up from below it: imported (Loro merges it with
+    /// what is here), and the log is had up to its base. One that doesn't read here (or that Loro fails on: the
+    /// document is read back from its file) is given up on: this machine follows the whole log instead
+    /// (`subscribe_log`), from where it was. `true` when it was taken.
+    fn take_snapshot(&mut self, base: u64, bytes: &[u8], notes: &mut Vec<String>, changed: &mut bool) -> Result<(), UpdateError> {
+        let had_history = self.body.copy().has_history();
+        match self.body.import_any_size(bytes) {
+            Ok(Imported::Applied { changed: list } | Imported::Waiting { changed: list, .. }) => *changed |= list,
+            Err(e) => {
+                let line = self.told(
+                    |app| format!("the server's snapshot of the recents of {app} doesn't read here ({e}); this machine reads the whole log instead"),
+                    |id| format!("the server's snapshot of the live document {id} doesn't read here ({e}); this machine reads the whole log instead"),
+                );
+                self.say(notes, line);
+                self.log_only = true;
+                self.stale = true;
+                self.dirty = true;
+                self.urgent = true;
+                return Err(e);
+            }
+        }
+        if !had_history && self.rewait(changed).is_err() {
+            // (Read back from its file by the caller.)
+            return Err(UpdateError::Panicked);
+        }
+        self.waiting.retain(|w| !self.body.copy().covers(&w.needs));
+        self.on_server(bytes);
+        if base >= self.have.upto {
+            self.have = Have { upto: base, upto_hash: if base == self.have.upto { self.have.upto_hash } else { None } };
+            self.log = LogVersion::anchored(base, version_of(bytes).unwrap_or_default());
+        }
+        self.dirty = true;
+        Ok(())
     }
 
     fn at(&self) -> Option<[u8; 32]> {
@@ -591,6 +1049,12 @@ pub struct Replica<S: DocStore> {
     push_stopped: BTreeSet<AppName>,
     /// Documents let go of without dropping ([`Replica::forgotten`]).
     forgotten: usize,
+    /// The live protocol `welcome` named (0 while the link isn't up).
+    protocol: u32,
+    /// What happened to documents of files since [`Replica::take_events`].
+    events: Vec<DocEvent>,
+    /// Counts opens, for which document was used least recently.
+    uses: u64,
 }
 
 impl<S: DocStore> Drop for Replica<S> {
@@ -616,6 +1080,13 @@ impl<S: DocStore> Replica<S> {
                 docs.insert(id, doc);
             }
         }
+        for (name, bytes) in store.load_documents()? {
+            if let Some((id, mut doc)) = load_document(&mut store, space, &name, &bytes, peers(), &mut notes) {
+                // Followed again when an app opens it, or now if it has something to send.
+                doc.parked = doc.pending.is_empty() && doc.pushing.is_none();
+                docs.insert(id, doc);
+            }
+        }
         Ok(Self {
             store,
             space,
@@ -628,6 +1099,9 @@ impl<S: DocStore> Replica<S> {
             heals: BTreeMap::new(),
             push_stopped: BTreeSet::new(),
             forgotten: 0,
+            protocol: 0,
+            events: Vec::new(),
+            uses: 0,
         })
     }
 
@@ -642,12 +1116,15 @@ impl<S: DocStore> Replica<S> {
 
     /// `app`'s list, newest first.
     pub fn entries(&self, app: &AppName) -> Vec<RecentEntry> {
-        self.docs.get(&self.doc_id(app)).map(|d| d.recents.view()).unwrap_or_default()
+        self.docs.get(&self.doc_id(app)).map(|d| d.body.view()).unwrap_or_default()
     }
 
     /// The newest entry for a file, if the list shows it (to keep its `saved` time when it is only opened).
     pub fn current(&self, app: &AppName, entry: &RecentEntry) -> Option<RecentEntry> {
-        self.docs.get(&self.doc_id(app)).and_then(|d| d.recents.current(entry.node, &entry.path))
+        self.docs.get(&self.doc_id(app)).and_then(|d| match &d.body {
+            Body::Recents(recents) => recents.current(entry.node, &entry.path),
+            Body::Document(_) => None,
+        })
     }
 
     /// An app follows its list: its document is opened (and, with the link up, subscribed). Frames to send.
@@ -662,18 +1139,19 @@ impl<S: DocStore> Replica<S> {
     pub fn add(&mut self, app: &AppName, key: AddKey, entry: RecentEntry) -> Result<Vec<ClientFrame>, AddError> {
         let (space, up, epoch) = (self.space, self.link == Link::Up, self.epoch);
         let (id, doc) = doc_in(&mut self.docs, space, app, &mut self.peers);
-        let before = doc.recents.view();
-        let bytes = doc.recents.add(key, &entry).map_err(|e| AddError::Invalid(e.to_string()))?;
+        let Body::Recents(recents) = &doc.body else { return Err(AddError::Invalid("not a recents document".into())) };
+        let before = recents.view();
+        let bytes = recents.add(key, &entry).map_err(|e| AddError::Invalid(e.to_string()))?;
         let client_seq = doc.next_client_seq;
         doc.next_client_seq = client_seq.saturating_add(1);
         doc.pending.push(Pending { client_seq, bytes: bytes.clone(), acked: None, push: false });
-        let changed = doc.recents.view() != before;
+        let changed = doc.body.view() != before;
         // On disk before the app hears it is kept.
         if let Err(e) = save(&mut self.store, space, id, doc) {
             self.reload(id);
             return Err(e.into());
         }
-        let doc_app = doc.app.clone();
+        let doc_app = doc.app().clone();
         let frames = match doc.sub {
             // (While a push is under way, its parts carry the add.)
             Sub::Live if doc.full.is_none() && doc.pushing.is_none() => {
@@ -706,16 +1184,32 @@ impl<S: DocStore> Replica<S> {
             self.forgotten += 1;
         }
         let name = id.to_string();
-        let stored = self.store.load().ok().and_then(|files| files.get(&name).cloned());
-        let stored = stored.map(|bytes| match (drop, postcard::from_bytes::<DocFile>(&bytes)) {
-            (Some(hash), Ok(mut file)) => {
-                file.waiting.retain(|w| w.hash != hash);
-                postcard::to_stdvec(&file).unwrap_or(bytes)
-            }
-            _ => bytes,
-        });
         let peer = (self.peers)();
-        match stored.and_then(|bytes| load_doc(&mut self.store, self.space, &name, &bytes, peer, &mut self.notes)) {
+        let document = self.store.load_document(&name).ok().flatten();
+        let reloaded = match document {
+            Some(bytes) => {
+                let bytes = match (drop, postcard::from_bytes::<DocumentFile>(&bytes)) {
+                    (Some(hash), Ok(mut file)) => {
+                        file.waiting.retain(|w| w.hash != hash);
+                        postcard::to_stdvec(&file).unwrap_or(bytes)
+                    }
+                    _ => bytes,
+                };
+                load_document(&mut self.store, self.space, &name, &bytes, peer, &mut self.notes)
+            }
+            None => {
+                let stored = self.store.load().ok().and_then(|files| files.get(&name).cloned());
+                let stored = stored.map(|bytes| match (drop, postcard::from_bytes::<DocFile>(&bytes)) {
+                    (Some(hash), Ok(mut file)) => {
+                        file.waiting.retain(|w| w.hash != hash);
+                        postcard::to_stdvec(&file).unwrap_or(bytes)
+                    }
+                    _ => bytes,
+                });
+                stored.and_then(|bytes| load_doc(&mut self.store, self.space, &name, &bytes, peer, &mut self.notes))
+            }
+        };
+        match reloaded {
             Some((_, mut doc)) => {
                 doc.dirty |= drop.is_some();
                 self.docs.insert(id, doc);
@@ -728,27 +1222,51 @@ impl<S: DocStore> Replica<S> {
 
     /// Loro failed on update `seq` (`hash`) of `id`: the document is read back from its file (nothing half-changed
     /// stays), and caught up again from there, with that update counted as had and not imported.
-    fn recover(&mut self, id: DocId, app: AppName, seq: u64, hash: [u8; 32]) -> Vec<ClientFrame> {
+    fn recover_doc(&mut self, id: DocId, kind: Kind, seq: u64, hash: [u8; 32]) -> Vec<ClientFrame> {
         self.reload(id);
         let (up, epoch) = (self.link == Link::Up, self.epoch);
-        let (_, doc) = doc_in(&mut self.docs, self.space, &app, &mut self.peers);
+        let Some(doc) = doc_again(&mut self.docs, self.space, &mut self.peers, id, &kind) else { return Vec::new() };
         doc.skip = Some((seq, hash));
-        let line = format!("a recents update for {app} from the server made Loro fail; it was skipped");
+        let line = doc.told(
+            |app| format!("a recents update for {app} from the server made Loro fail; it was skipped"),
+            |id| format!("an update of the live document {id} from the server made Loro fail; it was skipped"),
+        );
+        let frames = if up { subscribe(id, doc, epoch) } else { Vec::new() };
         doc.say(&mut self.notes, line);
-        self.changed.insert(app);
-        if up { subscribe(id, doc, epoch) } else { Vec::new() }
+        if let Kind::Recents(app) = kind {
+            self.changed.insert(app);
+        }
+        frames
     }
 
     /// Loro failed on a waiting update of `id` imported again (`hash`): that one is dropped (the incoming update is
     /// not to blame, and comes again), and the document read back from its file and caught up from there.
-    fn recover_waiting(&mut self, id: DocId, app: AppName, hash: [u8; 32]) -> Vec<ClientFrame> {
+    fn recover_waiting_doc(&mut self, id: DocId, kind: Kind, hash: [u8; 32]) -> Vec<ClientFrame> {
         self.reload_without(id, Some(hash));
         let (up, epoch) = (self.link == Link::Up, self.epoch);
-        let (_, doc) = doc_in(&mut self.docs, self.space, &app, &mut self.peers);
-        let line = format!("a waiting recents update for {app} made Loro fail; it was dropped");
+        let Some(doc) = doc_again(&mut self.docs, self.space, &mut self.peers, id, &kind) else { return Vec::new() };
+        let line = doc.told(
+            |app| format!("a waiting recents update for {app} made Loro fail; it was dropped"),
+            |id| format!("a waiting update of the live document {id} made Loro fail; it was dropped"),
+        );
+        let frames = if up { subscribe(id, doc, epoch) } else { Vec::new() };
         doc.say(&mut self.notes, line);
-        self.changed.insert(app);
-        if up { subscribe(id, doc, epoch) } else { Vec::new() }
+        if let Kind::Recents(app) = kind {
+            self.changed.insert(app);
+        }
+        frames
+    }
+
+    /// [`Replica::recover_doc`] of `app`'s recents (as the tests call it).
+    #[cfg(test)]
+    fn recover(&mut self, id: DocId, app: AppName, seq: u64, hash: [u8; 32]) -> Vec<ClientFrame> {
+        self.recover_doc(id, Kind::Recents(app), seq, hash)
+    }
+
+    /// [`Replica::recover_waiting_doc`] of `app`'s recents (as the tests call it).
+    #[cfg(test)]
+    fn recover_waiting(&mut self, id: DocId, app: AppName, hash: [u8; 32]) -> Vec<ClientFrame> {
+        self.recover_waiting_doc(id, Kind::Recents(app), hash)
     }
 
     /// A connection to the server is open: the first frame to send.
@@ -757,10 +1275,17 @@ impl<S: DocStore> Replica<S> {
         vec![ClientFrame::Hello { min: LIVE_PROTOCOL_MIN, max: LIVE_PROTOCOL_MAX }]
     }
 
-    /// The connection ended: everything is subscribed and sent again on the next one.
+    /// The connection ended: everything is subscribed and sent again on the next one. A document of a file still being
+    /// joined is given up on (it was never live here): the apps that wait for it open the file as a plain file.
     pub fn disconnected(&mut self) {
         self.link = Link::Down;
         self.epoch = None;
+        self.protocol = 0;
+        let joining: Vec<DocId> = self.docs.iter().filter(|(_, d)| !d.joined).map(|(id, _)| *id).collect();
+        for id in joining {
+            self.docs.remove(&id);
+            self.events.push(DocEvent::NotLive(id, NotLiveReason::Offline, "the connection to the server went".into()));
+        }
         for doc in self.docs.values_mut() {
             doc.sub = Sub::No;
             doc.sent.clear();
@@ -768,7 +1293,235 @@ impl<S: DocStore> Replica<S> {
             doc.create_refused = false;
             doc.full = None;
             doc.stuck = false;
+            doc.creating = false;
+            doc.compact_ask = None;
+            doc.stale = false;
         }
+    }
+
+    /// Whether the server speaks documents of files: `None` while the link isn't up.
+    pub fn documents_supported(&self) -> Option<bool> {
+        (self.link == Link::Up).then_some(self.protocol >= LIVE_DOCUMENTS_PROTOCOL)
+    }
+
+    /// Opens the document of the file node `node` for `app`: one live here already is followed again (if it was put
+    /// aside) and opens from its copy, online or not; one that isn't is joined, which needs the server. Frames to send.
+    pub fn open_document(&mut self, node: NodeId, app: &AppName) -> (DocId, Opening, Vec<ClientFrame>) {
+        let id = node_doc(self.space, node);
+        self.uses += 1;
+        let (up, epoch, uses) = (self.link == Link::Up, self.epoch, self.uses);
+        let documents = self.protocol >= LIVE_DOCUMENTS_PROTOCOL;
+        if let Some(doc) = self.docs.get_mut(&id) {
+            doc.last_used = uses;
+            if !doc.joined {
+                return (id, Opening::Joining, Vec::new());
+            }
+            let was_parked = std::mem::replace(&mut doc.parked, false);
+            // Room first (an unsubscribe before the subscribe that needs its slot).
+            let mut frames = if was_parked { self.evict() } else { Vec::new() };
+            let Some(doc) = self.docs.get_mut(&id) else { return (id, Opening::Live, frames) };
+            if up && documents && doc.sub == Sub::No && doc.retry.is_none() {
+                frames.extend(subscribe(id, doc, epoch));
+            }
+            return (id, Opening::Live, frames);
+        }
+        if !up {
+            return (id, Opening::NotLive(NotLiveReason::Offline, "the agent can't reach the server".into()), Vec::new());
+        }
+        if !documents {
+            return (id, Opening::NotLive(NotLiveReason::Offline, "live documents need a newer Craft Cloud server".into()), Vec::new());
+        }
+        let peer = (self.peers)();
+        let kind = Kind::Document { node, app: app.clone() };
+        let mut doc = Doc::with(id, kind.clone(), Body::new(&kind, peer), Have::default(), Vec::new(), Vec::new(), 1, epoch, None);
+        doc.joined = false;
+        doc.join = Some(Join::Probing);
+        doc.last_used = uses;
+        doc.log = LogVersion::anchored(0, Version::new());
+        let subscribe = doc.resubscribe(id);
+        self.docs.insert(id, doc);
+        // Room first (an unsubscribe before the subscribe that needs its slot).
+        let mut frames = self.evict();
+        frames.extend(subscribe);
+        (id, Opening::Joining, frames)
+    }
+
+    /// The app's import of a file whose document the server doesn't have (after [`DocEvent::NeedsImport`]): a Loro
+    /// snapshot, checked here, sent up as `create`. Frames to send, or why it was refused (the file then opens as a
+    /// plain file).
+    pub fn import_document(&mut self, id: DocId, snapshot: &[u8]) -> Result<Vec<ClientFrame>, (NotLiveReason, String)> {
+        let Some(doc) = self.docs.get_mut(&id) else { return Err((NotLiveReason::Offline, "the document isn't being opened any more".into())) };
+        if doc.join != Some(Join::NeedsImport) {
+            return Err((NotLiveReason::Offline, "no import is waited for".into()));
+        }
+        let Kind::Document { node, app } = doc.kind.clone() else { return Err((NotLiveReason::NotInFolder, "not a document of a file".into())) };
+        if snapshot.is_empty() || snapshot.len() > MAX_SNAPSHOT_BYTES {
+            self.docs.remove(&id);
+            return Err((NotLiveReason::TooLarge, format!("an import is 1 byte to {MAX_SNAPSHOT_BYTES} bytes")));
+        }
+        // Checked by Loro before it goes anywhere: an import that doesn't read is never made a document.
+        let peer = (self.peers)();
+        match LiveCopy::load(snapshot, peer) {
+            Ok(copy) => {
+                // (A copy Loro failed in is let go of without dropping.)
+                if copy.is_poisoned() {
+                    std::mem::forget(copy);
+                }
+            }
+            Err(e) => {
+                self.docs.remove(&id);
+                return Err((NotLiveReason::Offline, format!("the import doesn't read: {e}")));
+            }
+        }
+        if self.link != Link::Up {
+            self.docs.remove(&id);
+            return Err((NotLiveReason::Offline, "the connection to the server went".into()));
+        }
+        doc.join = Some(Join::Creating(snapshot.to_vec()));
+        Ok(vec![ClientFrame::CreateDocument { doc: id, node, app, snapshot: snapshot.to_vec() }])
+    }
+
+    /// An app that was to import a document is gone (it closed its connection mid-import): the join is given up on;
+    /// nothing was sent to the server.
+    pub fn abandon_join(&mut self, id: DocId) -> Vec<ClientFrame> {
+        match self.docs.get(&id) {
+            Some(doc) if !doc.joined && matches!(doc.join, Some(Join::NeedsImport | Join::Probing)) => {
+                let following = doc.sub != Sub::No;
+                self.docs.remove(&id);
+                if following { vec![ClientFrame::Unsubscribe { doc: id }] } else { Vec::new() }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// A document of a file live here: its state for an app opening it, a Loro snapshot (its unsent updates are in
+    /// it), and the server's updates still waiting for their history (to import after it).
+    pub fn document_state(&self, id: DocId) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+        let doc = self.docs.get(&id).filter(|d| d.joined && d.kind.is_document())?;
+        let snapshot = doc.body.copy().snapshot().ok()?;
+        Some((snapshot, doc.waiting.iter().map(|w| w.bytes.clone()).collect()))
+    }
+
+    /// Whether a document being joined waits for an app's import (the server doesn't have it).
+    pub fn needs_import(&self, id: DocId) -> bool {
+        self.docs.get(&id).is_some_and(|d| d.join == Some(Join::NeedsImport))
+    }
+
+    /// Whether a document of a file is live here (it opens offline).
+    pub fn has_document(&self, id: DocId) -> bool {
+        self.docs.get(&id).is_some_and(|d| d.joined && d.kind.is_document())
+    }
+
+    /// The node a document of a file belongs to.
+    pub fn document_node(&self, id: DocId) -> Option<NodeId> {
+        match self.docs.get(&id).map(|d| &d.kind) {
+            Some(Kind::Document { node, .. }) => Some(*node),
+            _ => None,
+        }
+    }
+
+    /// How a document stands: whether its edits go out as they are made, and how many of this machine's wait for the
+    /// server's ack.
+    pub fn document_status(&self, id: DocId) -> Option<(bool, u64)> {
+        let doc = self.docs.get(&id)?;
+        let online = self.link == Link::Up && doc.sub == Sub::Live && doc.full.is_none();
+        Some((online, (doc.pending.len() + usize::from(doc.pushing.is_some())) as u64))
+    }
+
+    /// An app has (`true`) or no longer has (`false`) the document open: one no app has open may be unfollowed past
+    /// the device's cap.
+    pub fn set_open(&mut self, id: DocId, open: bool) {
+        if let Some(doc) = self.docs.get_mut(&id) {
+            doc.open = if open { doc.open.saturating_add(1) } else { doc.open.saturating_sub(1) };
+        }
+    }
+
+    /// An app's own change to a document of a file: imported into the copy with Loro's checked import (refused, it
+    /// leaves the copy as it was; Loro failing reads the document back from disk), on disk in its journal before this
+    /// returns, and sent when the link is up. Returns the frames to send.
+    pub fn local_update(&mut self, id: DocId, bytes: &[u8]) -> Result<Vec<ClientFrame>, LocalError> {
+        let Some(doc) = self.docs.get_mut(&id).filter(|d| d.joined && d.kind.is_document()) else {
+            return Err(LocalError::Invalid("the document isn't open here".into()));
+        };
+        if bytes.is_empty() || bytes.len() > MAX_UPDATE_BYTES {
+            return Err(LocalError::Invalid(format!("an update is 1 to {MAX_UPDATE_BYTES} bytes")));
+        }
+        match doc.body.import(bytes) {
+            Ok(_) => {}
+            Err(UpdateError::Panicked) => {
+                self.reload(id);
+                return Err(LocalError::Invalid("Loro failed on the update; it was dropped and the document read back from disk".into()));
+            }
+            Err(e) => return Err(LocalError::Invalid(e.to_string())),
+        }
+        let client_seq = doc.next_client_seq;
+        let record = JournalRecord { client_seq, bytes: bytes.to_vec() };
+        let written = journal_record(&record).and_then(|rec| self.store.append_journal(&id.to_string(), &rec).map(|()| rec.len()));
+        let Some(doc) = self.docs.get_mut(&id) else { return Err(LocalError::Invalid("the document is gone".into())) };
+        match written {
+            Ok(len) => doc.journal = doc.journal.saturating_add(len),
+            Err(e) => {
+                // The copy goes back to what is on disk: the app is told it isn't kept.
+                self.reload(id);
+                return Err(e.into());
+            }
+        }
+        doc.next_client_seq = client_seq.saturating_add(1);
+        doc.pending.push(Pending { client_seq, bytes: bytes.to_vec(), acked: None, push: false });
+        doc.dirty = true;
+        let (up, epoch) = (self.link == Link::Up, self.epoch);
+        Ok(match doc.sub {
+            Sub::Live if doc.full.is_none() && doc.pushing.is_none() => {
+                doc.sent.insert(client_seq);
+                vec![ClientFrame::Update { doc: id, client_seq, bytes: bytes.to_vec() }]
+            }
+            Sub::No if up && self.protocol >= LIVE_DOCUMENTS_PROTOCOL && doc.retry.is_none() => {
+                doc.parked = false;
+                subscribe(id, doc, epoch)
+            }
+            Sub::No | Sub::CatchingUp | Sub::Live => Vec::new(),
+        })
+    }
+
+    /// An app's presence in a document of a file, for the document's other machines (only while it is followed).
+    pub fn presence(&mut self, id: DocId, bytes: &[u8]) -> Vec<ClientFrame> {
+        match self.docs.get(&id) {
+            Some(doc) if self.link == Link::Up && self.protocol >= LIVE_DOCUMENTS_PROTOCOL && doc.sub == Sub::Live && doc.joined => {
+                vec![ClientFrame::Presence { doc: id, bytes: bytes.to_vec() }]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// What happened to documents of files since the last call.
+    pub fn take_events(&mut self) -> Vec<DocEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Past the device's cap on followed documents: the least recently used ones no app has open and with nothing to
+    /// send are unfollowed (they stay on disk). Frames to send.
+    fn evict(&mut self) -> Vec<ClientFrame> {
+        let followed = self.docs.values().filter(|d| !d.parked).count();
+        let Some(extra) = followed.checked_sub(MAX_SUBSCRIPTIONS).filter(|n| *n > 0) else { return Vec::new() };
+        let mut idle: Vec<(u64, DocId)> = self
+            .docs
+            .iter()
+            .filter(|(_, d)| d.kind.is_document() && d.joined && !d.parked && d.open == 0 && d.pending.is_empty() && d.pushing.is_none())
+            .map(|(id, d)| (d.last_used, *id))
+            .collect();
+        idle.sort_unstable();
+        let mut frames = Vec::new();
+        for (_, id) in idle.into_iter().take(extra) {
+            if let Some(doc) = self.docs.get_mut(&id) {
+                if doc.sub != Sub::No {
+                    frames.push(ClientFrame::Unsubscribe { doc: id });
+                }
+                doc.sub = Sub::No;
+                doc.retry = None;
+                doc.parked = true;
+            }
+        }
+        frames
     }
 
     /// Whether the link is up (welcomed).
@@ -803,7 +1556,7 @@ impl<S: DocStore> Replica<S> {
                 d.sent.len(),
                 d.pending.iter().filter(|p| p.push).count(),
                 d.pending.iter().filter_map(|p| p.acked).collect::<Vec<_>>(),
-                d.pushing.as_ref().map(|has| d.recents.missing(has)),
+                d.pushing.as_ref().map(|has| d.body.copy().missing(has)),
                 d.push_wait,
                 d.full,
                 d.stuck,
@@ -847,42 +1600,67 @@ impl<S: DocStore> Replica<S> {
 
     /// Every entry of `app`'s document that reads, by key (for a simulation that wants to look inside).
     pub fn readable(&self, app: &AppName) -> Vec<(String, RecentEntry)> {
-        self.docs.get(&self.doc_id(app)).map(|d| d.recents.readable()).unwrap_or_default()
+        self.docs
+            .get(&self.doc_id(app))
+            .and_then(|d| match &d.body {
+                Body::Recents(recents) => Some(recents.readable()),
+                Body::Document(_) => None,
+            })
+            .unwrap_or_default()
     }
 
     /// A document as a Loro snapshot (for a simulation that wants to look inside).
     pub fn snapshot_of(&self, doc: DocId) -> Option<Vec<u8>> {
-        self.docs.get(&doc).and_then(|d| d.recents.snapshot().ok())
+        self.docs.get(&doc).and_then(|d| d.body.copy().snapshot().ok())
     }
 
     /// Documents Loro failed in outside an import: read back from their files, and caught up again from there.
     /// After the second heal of a document in one run, its push stops (the same state would fail the same way again):
     /// its unacked adds go up as plain updates, and [`Replica::push_stopped`] says so for the app to show.
     fn heal(&mut self) -> Vec<ClientFrame> {
-        let broken: Vec<(DocId, AppName)> = self.docs.iter().filter(|(_, d)| d.is_broken()).map(|(id, d)| (*id, d.app.clone())).collect();
+        let broken: Vec<(DocId, Kind)> = self.docs.iter().filter(|(_, d)| d.is_broken()).map(|(id, d)| (*id, d.kind.clone())).collect();
         let mut frames = Vec::new();
-        for (id, app) in broken {
+        for (id, kind) in broken {
+            // A document of a file that isn't joined yet has no file: it is given up on, and its apps told.
+            if self.docs.get(&id).is_some_and(|d| !d.joined) {
+                if let Some(old) = self.docs.remove(&id) {
+                    std::mem::forget(old);
+                    self.forgotten += 1;
+                }
+                self.events.push(DocEvent::NotLive(id, NotLiveReason::Offline, "Loro failed on the document".into()));
+                continue;
+            }
             self.reload(id);
             let heals = self.heals.entry(id).or_insert(0);
             *heals += 1;
             let stop = *heals >= MAX_HEALS;
-            let (up, epoch) = (self.link == Link::Up, self.epoch);
-            let (_, doc) = doc_in(&mut self.docs, self.space, &app, &mut self.peers);
-            let line = format!("Loro failed on the recents of {app}; they were read back from disk");
+            let (up, epoch, documents) = (self.link == Link::Up, self.epoch, self.protocol >= LIVE_DOCUMENTS_PROTOCOL);
+            let Some(doc) = doc_again(&mut self.docs, self.space, &mut self.peers, id, &kind) else { continue };
+            let line = doc.told(
+                |app| format!("Loro failed on the recents of {app}; they were read back from disk"),
+                |id| format!("Loro failed on the live document {id}; it was read back from disk"),
+            );
             doc.say(&mut self.notes, line);
             if stop && doc.pushing.is_some() {
                 doc.pushing = None;
                 doc.push_wait = None;
                 doc.dirty = true;
-                self.push_stopped.insert(app.clone());
-                // The app's followers are told (their list event carries the status).
-                self.changed.insert(app.clone());
-                let line = format!(
-                    "the recents of {app} can't be sent up whole after Loro failed again; new ones are sent one by one, and what the server lacks of the rest stays on this machine"
+                let line = doc.told(
+                    |app| format!(
+                        "the recents of {app} can't be sent up whole after Loro failed again; new ones are sent one by one, and what the server lacks of the rest stays on this machine"
+                    ),
+                    |id| format!(
+                        "the live document {id} can't be sent up whole after Loro failed again; new changes are sent one by one, and what the server lacks of the rest stays on this machine"
+                    ),
                 );
                 doc.say(&mut self.notes, line);
+                if let Kind::Recents(app) = &kind {
+                    self.push_stopped.insert(app.clone());
+                    // The app's followers are told (their list event carries the status).
+                    self.changed.insert(app.clone());
+                }
             }
-            if up {
+            if up && (!kind.is_document() || (documents && !doc.parked)) {
                 frames.extend(subscribe(id, doc, epoch));
             }
         }
@@ -953,11 +1731,20 @@ impl<S: DocStore> Replica<S> {
 
     fn on_frame_inner(&mut self, frame: ServerFrame) -> Result<Vec<ClientFrame>, LinkError> {
         match frame {
-            ServerFrame::Welcome { epoch, .. } => {
+            ServerFrame::Welcome { protocol, epoch } => {
                 self.link = Link::Up;
                 self.epoch = Some(epoch);
+                self.protocol = protocol;
+                let documents = protocol >= LIVE_DOCUMENTS_PROTOCOL;
+                if !documents && self.docs.values().any(|d| d.kind.is_document()) {
+                    self.notes.push("live documents need a newer Craft Cloud server; their changes stay on this machine until it is updated".into());
+                }
                 let mut frames = Vec::new();
                 for (id, doc) in &mut self.docs {
+                    // Documents of files only with a server that has them, and only those followed.
+                    if doc.kind.is_document() && (!documents || doc.parked || !doc.joined) {
+                        continue;
+                    }
                     frames.extend(subscribe(*id, doc, Some(epoch)));
                 }
                 Ok(frames)
@@ -965,6 +1752,12 @@ impl<S: DocStore> Replica<S> {
             ServerFrame::Created { .. } => Ok(Vec::new()),
             ServerFrame::Update { doc: id, seq, bytes, .. } => {
                 let Some(doc) = self.docs.get_mut(&id) else { return Ok(Vec::new()) };
+                // The update at the base of a snapshot the catch-up started with: its hash names it in the next `at`.
+                if seq == doc.have.upto && seq > 0 && doc.have.upto_hash.is_none() {
+                    doc.have.upto_hash = Some(update_hash(&bytes));
+                    doc.dirty = true;
+                    return Ok(Vec::new());
+                }
                 if seq <= doc.have.upto || doc.stuck {
                     return Ok(Vec::new());
                 }
@@ -975,18 +1768,30 @@ impl<S: DocStore> Replica<S> {
                 }
                 let mut changed = false;
                 let taken = doc.take(seq, &bytes, &mut self.notes, &mut changed);
-                let app = doc.app.clone();
+                let kind = doc.kind.clone();
+                let mut frames = if matches!(taken, Taken::Had) { doc.try_compact() } else { Vec::new() };
                 if changed {
-                    self.changed.insert(app.clone());
+                    match &kind {
+                        Kind::Recents(app) => {
+                            self.changed.insert(app.clone());
+                        }
+                        Kind::Document { .. } => self.events.push(DocEvent::Remote(id, bytes.clone())),
+                    }
                 }
-                Ok(match taken {
+                frames.extend(match taken {
                     Taken::Had | Taken::Stuck => Vec::new(),
-                    Taken::Panicked => self.recover(id, app, seq, update_hash(&bytes)),
-                    Taken::WaitingPanicked(hash) => self.recover_waiting(id, app, hash),
-                })
+                    Taken::Panicked => self.recover_doc(id, kind, seq, update_hash(&bytes)),
+                    Taken::WaitingPanicked(hash) => self.recover_waiting_doc(id, kind, hash),
+                });
+                Ok(frames)
             }
             ServerFrame::Subscribed { doc: id, head } => {
                 let Some(doc) = self.docs.get_mut(&id) else { return Ok(Vec::new()) };
+                if doc.stale {
+                    // The end of a catch-up given up on: the next one, from where it is.
+                    doc.stale = false;
+                    return Ok(doc.resubscribe(id));
+                }
                 if head < doc.have.upto {
                     // The server has less than this machine read of it (restored without a new epoch): from the start,
                     // so `have` names updates of this log, and then what the log lacks goes up.
@@ -996,8 +1801,17 @@ impl<S: DocStore> Replica<S> {
                 doc.sub = Sub::Live;
                 doc.retry = None;
                 doc.create_refused = false;
+                if matches!(doc.join, Some(Join::Probing | Join::Following)) {
+                    // The server has it, and this machine all of it: live here from now on.
+                    doc.join = None;
+                    doc.joined = true;
+                    doc.dirty = true;
+                    doc.urgent = true;
+                    self.events.push(DocEvent::Joined(id));
+                }
                 let mut frames = send_pending(id, doc);
                 frames.extend(doc.push_next(id, &mut self.notes, &mut self.peers));
+                frames.extend(doc.try_compact());
                 Ok(frames)
             }
             ServerFrame::Ack { doc: id, client_seq, seq } => {
@@ -1016,6 +1830,7 @@ impl<S: DocStore> Replica<S> {
                 } else if seq == doc.have.upto.saturating_add(1) {
                     let own = doc.pending.remove(i);
                     doc.sent.remove(&client_seq);
+                    doc.log.note(seq, spans_of(&own.bytes).unwrap_or_default());
                     doc.advance(seq, update_hash(&own.bytes));
                 } else if let Some(pending) = doc.pending.get_mut(i) {
                     // Others' updates below it are on their way: counted once they are here. (A push part counts as
@@ -1023,11 +1838,144 @@ impl<S: DocStore> Replica<S> {
                     pending.acked = Some(seq);
                     pending.push = false;
                 }
-                Ok(if push { doc.push_next(id, &mut self.notes, &mut self.peers) } else { Vec::new() })
+                let mut frames = if push { doc.push_next(id, &mut self.notes, &mut self.peers) } else { Vec::new() };
+                frames.extend(doc.try_compact());
+                Ok(frames)
             }
             ServerFrame::Error { code, message, doc, client_seq } => self.refused(&code, &message, doc, client_seq),
-            ServerFrame::Compact { .. } | ServerFrame::Snapshot { .. } | ServerFrame::Presence { .. } | ServerFrame::CreatedDocument { .. } => {
+            ServerFrame::Compact { doc: id, upto } => {
+                let Some(doc) = self.docs.get_mut(&id) else { return Ok(Vec::new()) };
+                doc.compact_ask = Some(upto);
+                Ok(doc.try_compact())
+            }
+            ServerFrame::Snapshot { doc: id, base, bytes } => {
+                let Some(doc) = self.docs.get_mut(&id) else { return Ok(Vec::new()) };
+                // Only as the start of a catch-up (a stray one, from a connection given up on, is no news).
+                if doc.sub != Sub::CatchingUp || doc.stale {
+                    return Ok(Vec::new());
+                }
+                let mut changed = false;
+                let taken = doc.take_snapshot(base, &bytes, &mut self.notes, &mut changed);
+                let kind = doc.kind.clone();
+                if changed {
+                    match &kind {
+                        Kind::Recents(app) => {
+                            self.changed.insert(app.clone());
+                        }
+                        Kind::Document { .. } => self.events.push(DocEvent::Remote(id, bytes)),
+                    }
+                }
+                Ok(match taken {
+                    Ok(()) => Vec::new(),
+                    // Read back from its file (Loro failed in it), and caught up again with the whole log.
+                    Err(UpdateError::Panicked) => {
+                        self.reload(id);
+                        let (up, epoch) = (self.link == Link::Up, self.epoch);
+                        match doc_again(&mut self.docs, self.space, &mut self.peers, id, &kind) {
+                            Some(doc) if up => {
+                                doc.log_only = true;
+                                subscribe(id, doc, epoch)
+                            }
+                            _ => Vec::new(),
+                        }
+                    }
+                    Err(_) => Vec::new(),
+                })
+            }
+            ServerFrame::Presence { doc: id, bytes } => {
+                if self.docs.get(&id).is_some_and(|d| d.joined && d.kind.is_document()) {
+                    self.events.push(DocEvent::Presence(id, bytes));
+                }
                 Ok(Vec::new())
+            }
+            ServerFrame::CreatedDocument { doc: id, kept } => Ok(self.created(id, kept)),
+        }
+    }
+
+    /// A refused `create` or `subscribe` of a document of a file, where it differs from recents: `Some(frames)` when
+    /// handled here.
+    fn refused_document(&mut self, id: DocId, code: &str, message: &str) -> Option<Vec<ClientFrame>> {
+        let doc = self.docs.get_mut(&id).filter(|d| d.kind.is_document())?;
+        let Kind::Document { node, app } = doc.kind.clone() else { return None };
+        match (&doc.join, code) {
+            // The server doesn't have it: the app is asked for its import.
+            (Some(Join::Probing | Join::Following), codes::NOT_FOUND) => {
+                doc.sub = Sub::No;
+                doc.join = Some(Join::NeedsImport);
+                self.events.push(DocEvent::NeedsImport(id));
+                Some(Vec::new())
+            }
+            // The import was refused: the file opens as a plain file (and is tried again at the next open).
+            (Some(Join::Creating(_)), _) => {
+                let reason = match code {
+                    codes::NOT_FOUND => NotLiveReason::NotSynced,
+                    codes::TOO_LARGE | codes::QUOTA_EXCEEDED => NotLiveReason::TooLarge,
+                    _ => NotLiveReason::Offline,
+                };
+                self.docs.remove(&id);
+                self.events.push(DocEvent::NotLive(id, reason, format!("the server refused the import ({code}: {message})")));
+                Some(Vec::new())
+            }
+            // Refused while joining for another reason: given up on for now.
+            (Some(_), _) if code != codes::RATE_LIMITED => {
+                self.docs.remove(&id);
+                self.events.push(DocEvent::NotLive(id, NotLiveReason::Offline, format!("the server can't open it now ({code}: {message})")));
+                Some(Vec::new())
+            }
+            // A joined document the server doesn't have (a restore from before it was made, or a reset): made again from
+            // this machine's copy; nothing it holds is lost. If that is refused too (the file is gone on the server),
+            // tried again after a growing pause.
+            (None, codes::NOT_FOUND) if !doc.creating => {
+                let snapshot = doc.body.copy().snapshot().ok().filter(|s| !s.is_empty() && s.len() <= MAX_SNAPSHOT_BYTES)?;
+                doc.sub = Sub::No;
+                doc.creating = true;
+                Some(vec![ClientFrame::CreateDocument { doc: id, node, app, snapshot }])
+            }
+            (None, codes::NOT_FOUND | codes::QUOTA_EXCEEDED | codes::TOO_LARGE) => {
+                doc.creating = false;
+                let pause = doc.retry.map_or(1, |(_, pause)| pause.max(1));
+                doc.sub = Sub::No;
+                doc.retry = Some((pause, pause));
+                let line = format!("the server can't make the live document {id} again ({code}: {message}); it stays on this machine");
+                doc.say(&mut self.notes, line);
+                Some(Vec::new())
+            }
+            _ => None,
+        }
+    }
+
+    /// `created {doc, kept}`: this machine's import is the document (kept), or another machine's is (not kept: this one
+    /// is dropped, and the document caught up from the start). A joined document made again from its copy (its
+    /// server lost it) starts over either way, so what the log lacks of it goes up.
+    fn created(&mut self, id: DocId, kept: bool) -> Vec<ClientFrame> {
+        let Some(doc) = self.docs.get_mut(&id) else { return Vec::new() };
+        if doc.creating {
+            doc.creating = false;
+            doc.start_over();
+            return doc.resubscribe(id);
+        }
+        let Some(Join::Creating(snapshot)) = doc.join.take() else { return Vec::new() };
+        if !kept {
+            doc.join = Some(Join::Following);
+            return doc.resubscribe(id);
+        }
+        let peer = doc.body.copy().peer();
+        match Body::load(&doc.kind, &snapshot, peer) {
+            Ok(body) => {
+                doc.body = body;
+                doc.own_peers = vec![peer];
+                doc.log = LogVersion::anchored(0, version_of(&snapshot).unwrap_or_default());
+                doc.joined = true;
+                doc.dirty = true;
+                doc.urgent = true;
+                self.events.push(DocEvent::Joined(id));
+                // Followed from the start: the server sends this import back, then what others add.
+                doc.resubscribe(id)
+            }
+            Err(_) => {
+                // (Checked before it went up; Loro reads it differently now.) Caught up from the server instead.
+                doc.join = Some(Join::Following);
+                doc.resubscribe(id)
             }
         }
     }
@@ -1037,6 +1985,11 @@ impl<S: DocStore> Replica<S> {
             return Err(LinkError::Mismatch(message.to_owned()));
         }
         let epoch = self.epoch;
+        if let (Some(id), None) = (doc, client_seq)
+            && let Some(frames) = self.refused_document(id, code, message)
+        {
+            return Ok(frames);
+        }
         let found = doc.and_then(|id| self.docs.get_mut(&id).map(|d| (id, d)));
         match (code, found, client_seq) {
             // Sent again by `resend`, a moment later.
@@ -1051,7 +2004,10 @@ impl<S: DocStore> Replica<S> {
                 }
                 doc.strikes = doc.strikes.saturating_add(1);
                 if doc.strikes > MAX_STRIKES {
-                    let line = format!("the server refuses even small parts of the recents of {} ({message}); they stay on this machine", doc.app);
+                    let line = doc.told(
+                        |app| format!("the server refuses even small parts of the recents of {app} ({message}); they stay on this machine"),
+                        |id| format!("the server refuses even small parts of the live document {id} ({message}); it stays on this machine"),
+                    );
                     doc.say(&mut self.notes, line);
                     return Ok(Vec::new());
                 }
@@ -1070,7 +2026,10 @@ impl<S: DocStore> Replica<S> {
                     doc.full_pause = (doc.full_pause * 2).clamp(1, MAX_RETRY_TICKS);
                     doc.full = Some(doc.full_pause);
                 }
-                let line = format!("the server takes no more recents of {} for now ({message}); new ones stay on this machine", doc.app);
+                let line = doc.told(
+                    |app| format!("the server takes no more recents of {app} for now ({message}); new ones stay on this machine"),
+                    |id| format!("the live document {id} is full on the server for now ({message}); new changes stay on this machine"),
+                );
                 doc.say(&mut self.notes, line);
                 Ok(Vec::new())
             }
@@ -1087,9 +2046,15 @@ impl<S: DocStore> Replica<S> {
                 doc.sub = Sub::No;
                 doc.retry = Some((pause, pause));
                 doc.create_refused = true;
-                let line = format!(
-                    "the account has as many live documents as the server allows; the recents of {} stay on this machine ({message})",
-                    doc.app
+                let line = doc.told(
+                    |app| {
+                        format!("the account has as many live documents as the server allows; the recents of {app} stay on this machine ({message})")
+                    },
+                    |id| {
+                        format!(
+                            "the account has as many live documents as the server allows; the live document {id} stays on this machine ({message})"
+                        )
+                    },
                 );
                 doc.say(&mut self.notes, line);
                 Ok(Vec::new())
@@ -1102,9 +2067,21 @@ impl<S: DocStore> Replica<S> {
                 doc.retry = Some((pause, pause));
                 // After a refused create the subscribe comes back `not_found`: that was said already.
                 if !doc.create_refused {
-                    let line = format!("the server can't follow the recents of {} right now ({message}); trying again shortly", doc.app);
+                    let line = doc.told(
+                        |app| format!("the server can't follow the recents of {app} right now ({message}); trying again shortly"),
+                        |id| format!("the server can't follow the live document {id} right now ({message}); trying again shortly"),
+                    );
                     doc.say(&mut self.notes, line);
                 }
+                Ok(Vec::new())
+            }
+            // A catch-up that failed on the server (its snapshot doesn't read there): tried again after a pause, with the
+            // whole log.
+            (codes::INTERNAL, Some((_, doc)), None) if doc.kind.is_document() || doc.log_only => {
+                let pause = doc.retry.map_or(1, |(_, pause)| pause.max(1));
+                doc.sub = Sub::No;
+                doc.retry = Some((pause, pause));
+                doc.log_only = true;
                 Ok(Vec::new())
             }
             _ => Err(LinkError::Retry(format!("the server refused a live frame ({code}: {message})"))),
@@ -1113,10 +2090,26 @@ impl<S: DocStore> Replica<S> {
 
     /// Writes every document changed since it was last written. Called after a batch of frames: a crash before it only
     /// loses what the server sends again.
+    /// A document of a file is written here only when it must be (it was just joined, started over, or its journal is
+    /// long); otherwise now and then ([`Replica::flush_documents`]): its local updates are on disk in its journal
+    /// already, and the server's come again.
     pub fn flush(&mut self) -> std::io::Result<()> {
         let space = self.space;
         for (id, doc) in &mut self.docs {
-            if doc.dirty {
+            let now = !doc.kind.is_document() || doc.urgent || doc.journal > MAX_JOURNAL_BYTES;
+            if doc.dirty && doc.joined && now {
+                save(&mut self.store, space, *id, doc)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes every document changed since it was last written, documents of files too (now and then, and when the
+    /// agent stops).
+    pub fn flush_documents(&mut self) -> std::io::Result<()> {
+        let space = self.space;
+        for (id, doc) in &mut self.docs {
+            if doc.dirty && doc.joined {
                 save(&mut self.store, space, *id, doc)?;
             }
         }
@@ -1153,7 +2146,7 @@ fn load_doc<S: DocStore>(store: &mut S, space: SpaceId, name: &str, bytes: &[u8]
                     // A copy aside first (durable), then the rebuilt document over the original: a crash between them
                     // finds the original again, and rebuilds again.
                     let (set, copied) = aside(store);
-                    let mut doc = Doc::from_pending(app.clone(), pending, next, peer);
+                    let mut doc = Doc::from_pending(id, Kind::Recents(app.clone()), pending, next, peer);
                     // (Without a copy, the original stays as it is until the document is next written.)
                     let written = match copied.then(|| save(store, space, id, &mut doc)) {
                         Some(Ok(())) => "written afresh".to_owned(),
@@ -1185,6 +2178,79 @@ fn load_doc<S: DocStore>(store: &mut S, space: SpaceId, name: &str, bytes: &[u8]
     }
 }
 
+/// The document of a file a `.doc` file holds, with the local updates its journal has beyond it (`None` for a file of
+/// another space, or one that doesn't read at all, which is set aside and removed, as a recents file is). A file whose
+/// snapshot doesn't read starts afresh from its unsent updates, which are kept and sent, and catches up from the start.
+fn load_document<S: DocStore>(store: &mut S, space: SpaceId, name: &str, bytes: &[u8], peer: u64, notes: &mut Vec<String>) -> Option<(DocId, Doc)> {
+    let journal = store.load_journal(name).unwrap_or_default();
+    let aside = |store: &mut S| match store.set_aside_document(name) {
+        Ok(to) => (format!("a copy set aside as {to}"), true),
+        Err(e) => (format!("no copy set aside ({e})"), false),
+    };
+    match postcard::from_bytes::<DocumentFile>(bytes) {
+        Ok(file) if file.format <= DOCUMENT_FILE_FORMAT && file.space == space && file.doc == node_doc(space, file.node) => {
+            let id = file.doc;
+            let kind = Kind::Document { node: file.node, app: file.app.clone() };
+            let (mut pending, mut next) = (file.pending, file.next_client_seq.max(1));
+            // The journal's records the file doesn't have yet (one cut off by a crash ends it: it was never acked).
+            let mut journalled = 0usize;
+            for record in journal_records(&journal) {
+                if record.client_seq >= next {
+                    next = record.client_seq.saturating_add(1);
+                    pending.push(Pending { client_seq: record.client_seq, bytes: record.bytes, acked: None, push: false });
+                    journalled += 1;
+                }
+            }
+            let parts = Parts {
+                id,
+                kind: kind.clone(),
+                have: file.have,
+                next_client_seq: next,
+                pending: pending.clone(),
+                snapshot: file.snapshot,
+                waiting: file.waiting,
+                epoch: file.epoch,
+                pushing: file.pushing,
+                own_peers: file.own_peers,
+                push_wait: file.push_wait,
+            };
+            match Doc::from_parts(parts, peer, notes) {
+                Ok(mut doc) => {
+                    doc.log_only = file.log_only;
+                    doc.journal = journal.len();
+                    doc.dirty = journalled > 0;
+                    Some((id, doc))
+                }
+                Err(e) => {
+                    let (set, copied) = aside(store);
+                    let mut doc = Doc::from_pending(id, kind, pending, next, peer);
+                    let written = match copied.then(|| save(store, space, id, &mut doc)) {
+                        Some(Ok(())) => "written afresh".to_owned(),
+                        Some(Err(e)) => format!("not yet written afresh ({e})"),
+                        None => "kept in memory".to_owned(),
+                    };
+                    notes.push(format!(
+                        "the live document file {name} doesn't read ({e}); {set}; the document starts again from its {} unsent update(s), which are kept ({written}), and the rest comes from the server",
+                        doc.pending.len()
+                    ));
+                    Some((id, doc))
+                }
+            }
+        }
+        Ok(_) => None,
+        Err(e) => {
+            let (set, copied) = aside(store);
+            let removed = match copied.then(|| store.remove_document(name)) {
+                Some(Ok(())) => "and removed".to_owned(),
+                Some(Err(e)) => format!("not removed ({e})"),
+                None => "left in place".to_owned(),
+            };
+            notes.push(format!("the live document file {name} doesn't read ({e}); {set}, {removed}; it is filled from the server again"));
+            None
+        }
+    }
+}
+
 /// Whether every range of `ranges` is in `has`.
 fn held_by(has: &Spans, ranges: &[(u64, i32, i32)]) -> bool {
     ranges.iter().all(|(peer, s, e)| s >= e || has.get(peer).is_some_and(|list| list.iter().any(|(hs, he)| hs <= s && e <= he)))
@@ -1193,8 +2259,17 @@ fn held_by(has: &Spans, ranges: &[(u64, i32, i32)]) -> bool {
 /// The document of `app` in `docs`, made (empty) if there is none yet.
 fn doc_in<'a>(docs: &'a mut BTreeMap<DocId, Doc>, space: SpaceId, app: &AppName, peers: &mut Peers) -> (DocId, &'a mut Doc) {
     let id = recents_doc(space, app);
-    let doc = docs.entry(id).or_insert_with(|| Doc::empty(app, peers()));
+    let doc = docs.entry(id).or_insert_with(|| Doc::empty(app, peers(), id));
     (id, doc)
+}
+
+/// The document `id` of `kind` after a reload: a recents document is made afresh if it had no file; a document of a
+/// file without one is gone.
+fn doc_again<'a>(docs: &'a mut BTreeMap<DocId, Doc>, space: SpaceId, peers: &mut Peers, id: DocId, kind: &Kind) -> Option<&'a mut Doc> {
+    match kind {
+        Kind::Recents(app) => Some(doc_in(docs, space, app, peers).1),
+        Kind::Document { .. } => docs.get_mut(&id),
+    }
 }
 
 /// `create` (the server may lack the document) and `subscribe` from what it has, naming the update it has at that
@@ -1212,7 +2287,12 @@ fn subscribe(id: DocId, doc: &mut Doc, epoch: Option<Epoch>) -> Vec<ClientFrame>
     }
     doc.forget_acks();
     doc.sent.clear();
-    let mut frames = vec![ClientFrame::Create { doc: id, kind: DocKind::Recents { app: doc.app.clone() } }];
+    // A document of a file is made by import, never by a bare `create`: one the server lost answers `not_found`, and
+    // is made again from this copy ([`Replica::refused_document`]).
+    let mut frames = match &doc.kind {
+        Kind::Recents(app) => vec![ClientFrame::Create { doc: id, kind: DocKind::Recents { app: app.clone() } }],
+        Kind::Document { .. } => Vec::new(),
+    };
     frames.extend(doc.resubscribe(id));
     frames
 }
@@ -1233,24 +2313,55 @@ fn send_pending(id: DocId, doc: &mut Doc) -> Vec<ClientFrame> {
 }
 
 fn save<S: DocStore>(store: &mut S, space: SpaceId, id: DocId, doc: &mut Doc) -> std::io::Result<()> {
-    let file = DocFile {
-        format: DOC_FILE_FORMAT,
-        space,
-        doc: id,
-        app: doc.app.clone(),
-        have: doc.have.clone(),
-        next_client_seq: doc.next_client_seq,
-        pending: doc.pending.clone(),
-        snapshot: doc.recents.snapshot().map_err(std::io::Error::other)?,
-        waiting: doc.waiting.clone(),
-        epoch: doc.epoch,
-        pushing: doc.pushing.clone(),
-        own_peers: doc.own_peers.clone(),
-        push_wait: doc.push_wait,
-    };
-    let bytes = postcard::to_stdvec(&file).map_err(std::io::Error::other)?;
-    store.save(&id.to_string(), &bytes)?;
+    let snapshot = doc.body.copy().snapshot().map_err(std::io::Error::other)?;
+    match &doc.kind {
+        Kind::Recents(app) => {
+            let file = DocFile {
+                format: DOC_FILE_FORMAT,
+                space,
+                doc: id,
+                app: app.clone(),
+                have: doc.have.clone(),
+                next_client_seq: doc.next_client_seq,
+                pending: doc.pending.clone(),
+                snapshot,
+                waiting: doc.waiting.clone(),
+                epoch: doc.epoch,
+                pushing: doc.pushing.clone(),
+                own_peers: doc.own_peers.clone(),
+                push_wait: doc.push_wait,
+            };
+            let bytes = postcard::to_stdvec(&file).map_err(std::io::Error::other)?;
+            store.save(&id.to_string(), &bytes)?;
+        }
+        Kind::Document { node, app } => {
+            let file = DocumentFile {
+                format: DOCUMENT_FILE_FORMAT,
+                space,
+                doc: id,
+                node: *node,
+                app: app.clone(),
+                have: doc.have.clone(),
+                next_client_seq: doc.next_client_seq,
+                pending: doc.pending.clone(),
+                snapshot,
+                waiting: doc.waiting.clone(),
+                epoch: doc.epoch,
+                pushing: doc.pushing.clone(),
+                own_peers: doc.own_peers.clone(),
+                push_wait: doc.push_wait,
+                log_only: doc.log_only,
+            };
+            let bytes = postcard::to_stdvec(&file).map_err(std::io::Error::other)?;
+            let name = id.to_string();
+            store.save_document(&name, &bytes)?;
+            // Its journal's updates are in the file now (a crash before this finds them there and skips them).
+            store.clear_journal(&name)?;
+            doc.journal = 0;
+        }
+    }
     doc.dirty = false;
+    doc.urgent = false;
     Ok(())
 }
 
@@ -1982,7 +3093,7 @@ mod tests {
         r.add(&app(), [1; 16], entry("a.txt", 1)).unwrap();
         r.on_frame(ServerFrame::Ack { doc, client_seq: 1, seq: 1 }).unwrap();
         r.flush().unwrap();
-        r.docs.get(&doc).unwrap().recents.poison();
+        r.docs.get(&doc).unwrap().body.poison();
         assert!(r.entries(&app()).is_empty(), "a poisoned document reads as empty, it doesn't panic");
         assert!(r.wants_tick());
         let frames = r.resend();
@@ -2003,7 +3114,7 @@ mod tests {
         r.flush().unwrap();
         for round in 0..2 {
             assert!(r.docs.get(&doc).unwrap().pushing.is_some(), "round {round}: a push is under way");
-            r.docs.get(&doc).unwrap().recents.poison();
+            r.docs.get(&doc).unwrap().body.poison();
             r.resend();
             r.on_frame(ServerFrame::Subscribed { doc, head: 0 }).unwrap();
             r.flush().unwrap();
@@ -2037,5 +3148,59 @@ mod tests {
         r.on_frame(ServerFrame::Update { doc, seq: 3, bytes: good, device: device() }).unwrap();
         assert_eq!(r.entries(&app()).len(), 1, "the next good one applies");
         assert!(matches!(r.on_frame(ServerFrame::error(PROTOCOL_MISMATCH, "old", None, None)), Err(LinkError::Mismatch(_))));
+    }
+
+    /// A journal reads up to its first record that doesn't (one a crash cut off: never acked to the app).
+    #[test]
+    fn a_journal_ends_at_a_record_cut_off() {
+        let records: Vec<Vec<u8>> = (1..=3u64).map(|i| journal_record(&JournalRecord { client_seq: i, bytes: vec![i as u8; 10] }).unwrap()).collect();
+        let whole: Vec<u8> = records.concat();
+        assert_eq!(journal_records(&whole).iter().map(|r| r.client_seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+        for cut in [whole.len() - 1, whole.len() - 9, records[0].len() + 3] {
+            let read = journal_records(&whole[..cut]);
+            assert!(read.len() < 3 && read.iter().enumerate().all(|(i, r)| r.client_seq == i as u64 + 1), "cut at {cut}");
+        }
+        let mut damaged = whole.clone();
+        let at = records[0].len() + 6;
+        damaged[at] ^= 1;
+        assert_eq!(journal_records(&damaged).len(), 1, "a damaged record ends it");
+        assert!(journal_records(&[]).is_empty());
+        assert!(journal_records(&[0xff, 0xff, 0xff, 0xff, 1]).is_empty(), "a length past the end");
+    }
+
+    /// The version a log's updates make is worked out from the copy at load: everything but its own unsent updates
+    /// (when those are each peer's last operations); unknown otherwise.
+    #[test]
+    fn the_log_version_is_worked_out_from_the_copy() {
+        let space = SpaceId::generate();
+        let node = NodeId::generate();
+        let id = node_doc(space, node);
+        let kind = Kind::Document { node, app: app() };
+        let mut doc =
+            Doc::with(id, kind.clone(), Body::new(&kind, 1), Have { upto: 3, upto_hash: Some([3; 32]) }, Vec::new(), Vec::new(), 1, None, None);
+        let other = loro::LoroDoc::new();
+        other.set_peer_id(9).unwrap();
+        let update = |d: &loro::LoroDoc, s: &str| {
+            let vv = d.oplog_vv();
+            d.get_text("text").insert(0, s).unwrap();
+            d.commit();
+            d.export(loro::ExportMode::updates(&vv)).unwrap()
+        };
+        let logged = update(&other, "abc");
+        doc.body.import(&logged).unwrap();
+        // Its own, unsent: peer 1's last operations.
+        let own = loro::LoroDoc::new();
+        own.import(&logged).unwrap();
+        own.set_peer_id(1).unwrap();
+        let mine = update(&own, "xy");
+        doc.body.import(&mine).unwrap();
+        doc.pending.push(Pending { client_seq: 1, bytes: mine, acked: None, push: false });
+        doc.derive_log();
+        let version = doc.log.at(3).unwrap();
+        assert_eq!(version.get(&9), Some(&3));
+        assert_eq!(version.get(&1), None, "its own unsent update isn't in the log");
+        doc.waiting.push(Waiting { hash: [0; 32], needs: vec![(5, 1)], bytes: vec![1] });
+        doc.derive_log();
+        assert!(!doc.log.is_known(), "something waits: unknown");
     }
 }

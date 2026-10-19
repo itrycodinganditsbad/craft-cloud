@@ -30,13 +30,23 @@ pub struct LiveDoc {
     pub created_ms: i64,
     /// Its last sequence number (0: no update yet).
     pub head: u64,
-    /// The bytes of updates its log holds above its snapshot (at or over [`Meta::live_doc_cap`]: full).
+    /// The bytes of updates its log holds, every row (compacted ones too).
     pub bytes: u64,
+    /// The bytes of the rows at or below `base`: the rest ([`LiveDoc::above_base`]) counts against the cap (at or over
+    /// [`Meta::live_doc_cap`]: full).
+    pub compacted_bytes: u64,
     /// The last update its snapshot holds (0: none, or a snapshot of an import only).
     pub base: u64,
     /// Whether it has a snapshot ([`Meta::live_snapshot`]), and its size.
     pub has_snapshot: bool,
     pub snapshot_bytes: u64,
+}
+
+impl LiveDoc {
+    /// The bytes of the log above its snapshot: what counts against its cap.
+    pub fn above_base(&self) -> u64 {
+        self.bytes.saturating_sub(self.compacted_bytes)
+    }
 }
 
 /// The largest piece a snapshot is stored in: a chunk.
@@ -100,8 +110,7 @@ pub struct Appended {
     pub repeat: bool,
 }
 
-const DOC_COLUMNS: &str =
-    "kind, node, created_ms, head_seq, bytes, base_seq, snapshot_bytes, CAST(CASE WHEN snapshot IS NULL THEN 0 ELSE 1 END AS BIGINT) AS has_snapshot";
+const DOC_COLUMNS: &str = "kind, node, created_ms, head_seq, bytes, compacted_bytes, base_seq, snapshot_bytes, CAST(CASE WHEN snapshot IS NULL THEN 0 ELSE 1 END AS BIGINT) AS has_snapshot";
 
 /// One stored update.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +154,7 @@ fn doc_from(row: &sqlx::any::AnyRow, id: DocId) -> Result<LiveDoc, MetaError> {
         created_ms: row.try_get("created_ms")?,
         head: to_u64(row.try_get("head_seq")?)?,
         bytes: to_u64(row.try_get("bytes")?)?,
+        compacted_bytes: to_u64(row.try_get("compacted_bytes")?)?,
         base: to_u64(row.try_get("base_seq")?)?,
         has_snapshot: flag(row, "has_snapshot")?,
         snapshot_bytes: to_u64(row.try_get("snapshot_bytes")?)?,
@@ -205,7 +215,18 @@ impl Meta {
             return Err(MetaError::TooManyDocRows { limit: self.live_doc_rows_cap });
         }
         w.commit().await?;
-        Ok(LiveDoc { id, kind: kind.to_owned(), node, created_ms: now_ms, head: 0, bytes: 0, base: 0, has_snapshot: false, snapshot_bytes: 0 })
+        Ok(LiveDoc {
+            id,
+            kind: kind.to_owned(),
+            node,
+            created_ms: now_ms,
+            head: 0,
+            bytes: 0,
+            compacted_bytes: 0,
+            base: 0,
+            has_snapshot: false,
+            snapshot_bytes: 0,
+        })
     }
 
     /// Makes the document `id` of the file node `node` of `space` by import: `kind` (`document:<app>`), its first
@@ -241,8 +262,8 @@ impl Meta {
             _ => return Err(MetaError::NotFound("file")),
         }
         let inserted = sqlx::query(
-            "INSERT INTO live_docs (space_id, id, kind, node, created_ms, head_seq, base_seq, snapshot, snapshot_bytes) \
-             VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7) ON CONFLICT (space_id, id) DO NOTHING",
+            "INSERT INTO live_docs (space_id, id, kind, node, created_ms, head_seq, base_seq, snapshot, snapshot_bytes, import_snapshot, import_bytes) \
+             VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $6, $7) ON CONFLICT (space_id, id) DO NOTHING",
         )
         .bind(space_key.clone())
         .bind(id_key.clone())
@@ -285,6 +306,7 @@ impl Meta {
             created_ms: now_ms,
             head: 0,
             bytes: 0,
+            compacted_bytes: 0,
             base: 0,
             has_snapshot: true,
             snapshot_bytes: snapshot.bytes,
@@ -303,6 +325,19 @@ impl Meta {
         let Some(ids) = row.try_get::<Option<Vec<u8>>, _>("snapshot")? else { return Ok(None) };
         let snapshot = SnapshotRef::decode(&ids, to_u64(row.try_get("snapshot_bytes")?)?)?;
         Ok(Some((to_u64(row.try_get("base_seq")?)?, snapshot)))
+    }
+
+    /// The snapshot a document of a file was made by import with (kept when its log is compacted: the log doesn't hold
+    /// it), if it has one.
+    pub async fn live_import_snapshot(&self, space: SpaceId, doc: DocId) -> Result<Option<SnapshotRef>, MetaError> {
+        let row = sqlx::query("SELECT import_snapshot, import_bytes FROM live_docs WHERE space_id = $1 AND id = $2")
+            .bind(uuid_bytes(space.as_uuid()))
+            .bind(uuid_bytes(doc.as_uuid()))
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else { return Ok(None) };
+        let Some(ids) = row.try_get::<Option<Vec<u8>>, _>("import_snapshot")? else { return Ok(None) };
+        Ok(Some(SnapshotRef::decode(&ids, to_u64(row.try_get("import_bytes")?)?)?))
     }
 
     /// Compacts the document's log: `snapshot` (stored in the chunk store already, durably) holds the updates 1..=`upto`
@@ -339,7 +374,7 @@ impl Meta {
         .try_get("n")?;
         // Only from the base read above: a compaction that raced this one (Postgres) leaves nothing to change here.
         let done = sqlx::query(
-            "UPDATE live_docs SET base_seq = $3, snapshot = $4, snapshot_bytes = $5, bytes = CASE WHEN bytes > $6 THEN bytes - $6 ELSE 0 END \
+            "UPDATE live_docs SET base_seq = $3, snapshot = $4, snapshot_bytes = $5, compacted_bytes = compacted_bytes + $6 \
              WHERE space_id = $1 AND id = $2 AND base_seq = $7",
         )
         .bind(space_key)
@@ -383,7 +418,8 @@ impl Meta {
         .execute(&mut *w.tx)
         .await?;
         let done = sqlx::query(
-            "UPDATE live_docs SET head_seq = 0, bytes = 0, base_seq = 0, snapshot = NULL, snapshot_bytes = 0 WHERE space_id = $1 AND id = $2",
+            "UPDATE live_docs SET head_seq = 0, bytes = 0, compacted_bytes = 0, base_seq = 0, snapshot = NULL, snapshot_bytes = 0, \
+             import_snapshot = NULL, import_bytes = 0 WHERE space_id = $1 AND id = $2",
         )
         .bind(space_key.clone())
         .bind(doc_key.clone())
@@ -460,7 +496,8 @@ impl Meta {
         // time and the check for a repeat below can't race another append of the same update.
         let size = i64::try_from(bytes.len()).map_err(|_| MetaError::Invalid("an update too large"))?;
         let head = sqlx::query(
-            "UPDATE live_docs SET head_seq = head_seq + 1, bytes = bytes + $3 WHERE space_id = $1 AND id = $2 RETURNING head_seq, bytes, base_seq, kind",
+            "UPDATE live_docs SET head_seq = head_seq + 1, bytes = bytes + $3 WHERE space_id = $1 AND id = $2 \
+             RETURNING head_seq, bytes, compacted_bytes, base_seq, kind",
         )
         .bind(space_key.clone())
         .bind(doc_key.clone())
@@ -469,7 +506,8 @@ impl Meta {
         .await?
         .ok_or(MetaError::NotFound("document"))?;
         let seq: i64 = head.try_get("head_seq")?;
-        let total = to_u64(head.try_get("bytes")?)?;
+        // What counts against the cap: the log above its snapshot.
+        let total = to_u64(head.try_get("bytes")?)?.saturating_sub(to_u64(head.try_get("compacted_bytes")?)?);
         let base = to_u64(head.try_get("base_seq")?)?;
         let recents = !head.try_get::<String, _>("kind")?.starts_with(craft_cloud_proto::live::DOCUMENT_KIND_PREFIX);
         let earlier = sqlx::query("SELECT seq, bytes FROM live_updates WHERE space_id = $1 AND doc = $2 AND device = $3 AND client_seq = $4")
@@ -555,8 +593,9 @@ impl Meta {
             // (A snapshot past the head the backup has goes back to the head: what a backup taken back then holds is
             // [`Meta::restore_live_snapshot`]'s to set.)
             "UPDATE live_docs SET head_seq = $3, base_seq = CASE WHEN base_seq > $3 THEN $3 ELSE base_seq END, \
-             bytes = (SELECT COALESCE(SUM(LENGTH(u.bytes)), 0) FROM live_updates u \
-             WHERE u.space_id = $1 AND u.doc = $2 AND u.seq > live_docs.base_seq) WHERE space_id = $1 AND id = $2"
+             bytes = (SELECT COALESCE(SUM(LENGTH(u.bytes)), 0) FROM live_updates u WHERE u.space_id = $1 AND u.doc = $2), \
+             compacted_bytes = (SELECT COALESCE(SUM(LENGTH(u.bytes)), 0) FROM live_updates u \
+             WHERE u.space_id = $1 AND u.doc = $2 AND u.seq <= live_docs.base_seq AND u.seq <= $3) WHERE space_id = $1 AND id = $2"
         } else {
             "DELETE FROM live_docs WHERE space_id = $1 AND id = $2 AND $3 = 0"
         };
@@ -575,8 +614,8 @@ impl Meta {
             None => (0, None, 0),
         };
         sqlx::query(
-            "UPDATE live_docs SET base_seq = $3, snapshot = $4, snapshot_bytes = $5, bytes = (SELECT COALESCE(SUM(LENGTH(u.bytes)), 0) \
-             FROM live_updates u WHERE u.space_id = $1 AND u.doc = $2 AND u.seq > $3) WHERE space_id = $1 AND id = $2",
+            "UPDATE live_docs SET base_seq = $3, snapshot = $4, snapshot_bytes = $5, compacted_bytes = (SELECT COALESCE(SUM(LENGTH(u.bytes)), 0) \
+             FROM live_updates u WHERE u.space_id = $1 AND u.doc = $2 AND u.seq <= $3) WHERE space_id = $1 AND id = $2",
         )
         .bind(space_key)
         .bind(doc_key)

@@ -48,6 +48,8 @@ pub enum Command {
     Resume(oneshot::Sender<Result<(), AgentError>>),
     /// Finish the pass under way and stop the agent. Answered at once.
     Quit(oneshot::Sender<Result<(), AgentError>>),
+    /// Run a sync pass soon (an app opened a file that isn't uploaded yet, to make it live). Not answered.
+    SyncSoon,
 }
 
 /// What [`Status`] reports, kept up to date by the `run` loop.
@@ -146,6 +148,11 @@ impl Control {
     /// Whether the agent reaches the server right now (the live hub's connection is up).
     pub fn set_online(&self, online: bool) {
         self.with(|s| s.online = online);
+    }
+
+    /// Asks the `run` loop for a sync pass soon (never waits: a loop that is busy takes it when it can).
+    pub fn request_pass(&self) {
+        let _ = self.commands.try_send(Command::SyncSoon);
     }
 
     /// The live hub that serves recents (while signed in).

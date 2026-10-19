@@ -612,6 +612,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             server: account.server.clone(),
             token: account.token.clone(),
             machine: account.device_name.clone(),
+            folder: account.folder.clone(),
         };
         let hub = match Hub::start(hub_config, control.clone(), user_paused) {
             Ok(hub) => Some(hub),
@@ -907,6 +908,12 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                         watching.watcher = None;
                         let _ = reply.send(Ok(()));
                     }
+                    // An app opened a file that isn't uploaded yet: a pass soon (not while paused).
+                    Some(Command::SyncSoon) => {
+                        if !user_paused {
+                            scheduler.urgent_change();
+                        }
+                    }
                     None => commands_open = false,
                 },
                 () = sleep => {}
@@ -1029,6 +1036,7 @@ async fn wait_needing_you(
                     let _ = reply.send(Ok(()));
                     return Stuck::Stop;
                 }
+                Some(Command::SyncSoon) => {}
                 None => commands_open = false,
             },
             signal = stop.recv(), if *stop_open => match signal {
@@ -1091,6 +1099,7 @@ async fn wait_for_sign_in(
                     let _ = reply.send(Ok(()));
                     return SignedOut::Stop;
                 }
+                Some(Command::SyncSoon) => {}
                 None => commands_open = false,
             },
             signal = stop.recv(), if *stop_open => match signal {

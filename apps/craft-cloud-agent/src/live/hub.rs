@@ -1,14 +1,24 @@
-//! The live hub's task: owns the account's [`Replica`], answers the local API's recents calls, and keeps the live
-//! connection to the server up while the agent is signed in (connecting again with backoff, from 1 s doubling to 5
-//! minutes with jitter; every 10 minutes for a server that speaks another live protocol). Offline it keeps working:
-//! adds are kept on disk and reach the server once the connection is back. While syncing is paused the connection is
-//! held the same way (closed, and not dialed until resumed).
+//! The live hub's task: owns the account's [`Replica`], answers the local API's recents and documents calls, and keeps
+//! the live connection to the server up while the agent is signed in (connecting again with backoff, from 1 s doubling
+//! to 5 minutes with jitter; every 10 minutes for a server that speaks another live protocol). Offline it keeps
+//! working: adds and edits are kept on disk and reach the server once the connection is back. While syncing is paused
+//! the connection is held the same way (closed, and not dialed until resumed).
+//!
+//! **Documents of files** ([`DocsCall`]): an app opens a path; the hub finds its node in the sync state (a file not
+//! uploaded yet gets a sync pass started for it, and the open waits up to [`NODE_WAIT`] for its node), and opens its
+//! document through the replica. Its state goes to the app, and then every remote change and presence as they come,
+//! and to the document's other apps on this machine every change one of them makes. A document's status (online, how
+//! many changes wait, whether its file was deleted) goes to its apps when it changes. Nothing the hub sends an app ever
+//! waits for the app: a connection whose queue is full is dropped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use craft_cloud_proto::live::{AppName, ClientFrame, MAX_SUBSCRIPTIONS, ServerFrame};
-use craft_cloud_proto::local::{MAX_MACHINE_BYTES, MAX_TITLE_BYTES, NewRecent, RecentEntry, recent_path};
+use craft_cloud_proto::DocId;
+use craft_cloud_proto::live::{AppName, ClientFrame, MAX_SNAPSHOT_BYTES, MAX_SUBSCRIPTIONS, PRESENCE_PER_SEC, ServerFrame};
+use craft_cloud_proto::local::{DocState, MAX_MACHINE_BYTES, MAX_TITLE_BYTES, NewRecent, NotLiveReason, RecentEntry, recent_path};
 use craft_cloud_proto::{NodeId, SpaceId};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -16,7 +26,7 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::link::{DialError, LiveSocket, dial};
-use super::replica::{AddError, LinkError, Replica};
+use super::replica::{AddError, DocEvent, LinkError, LocalError, Opening, Replica};
 use super::store::DiskStore;
 use crate::account::DataDir;
 use crate::http::{DeviceToken, ServerUrl};
@@ -31,6 +41,81 @@ pub struct HubConfig {
     pub token: DeviceToken,
     /// This machine's name in the entries it adds (the device name).
     pub machine: String,
+    /// The synced folder (the paths apps open documents by are in it).
+    pub folder: PathBuf,
+}
+
+/// How long an open of a file that isn't uploaded yet waits for its node (a sync pass is started for it).
+pub const NODE_WAIT: Duration = Duration::from_secs(5);
+/// How often the hub looks again for the nodes opens wait for.
+const NODE_LOOK_EVERY: Duration = Duration::from_millis(100);
+/// How often documents of files are written whole (their local changes are in their journals at once).
+const DOCUMENTS_FLUSH_EVERY: Duration = Duration::from_secs(2);
+/// Messages one docs connection may have queued before it is dropped (an app that doesn't read).
+pub const DOCS_QUEUE: usize = 1024;
+
+/// One app connection of the docs WebSocket.
+pub type ConnId = u64;
+
+/// What the hub sends a docs connection, in order.
+#[derive(Debug, Clone)]
+pub enum DocOut {
+    /// The document opened as `id` is live: its state (a snapshot, then updates still waiting for their history).
+    Opened { id: u64, doc: DocId, state: DocState, snapshot: Vec<u8>, waiting: Vec<Vec<u8>> },
+    /// Send the file's content as an import.
+    NeedsImport { id: u64 },
+    /// The file opens as a plain file.
+    NotLive { id: u64, reason: NotLiveReason, message: String },
+    /// The app's update `seq` of `id` is on disk.
+    Ack { id: u64, seq: u64 },
+    /// A request was refused.
+    Refused { id: Option<u64>, seq: Option<u64>, code: &'static str, message: String },
+    /// A change from another machine or app.
+    Update { id: u64, bytes: Arc<Vec<u8>> },
+    /// Presence from another machine or app.
+    Presence { id: u64, bytes: Arc<Vec<u8>> },
+    /// How the document stands now.
+    Status { doc: DocId, online: bool, waiting: u64, deleted: bool },
+}
+
+/// What a docs connection asks the hub.
+#[derive(Debug)]
+pub enum DocsCall {
+    /// A new connection: what the hub sends it goes to `out`.
+    Connect {
+        conn: ConnId,
+        out: mpsc::Sender<DocOut>,
+    },
+    Open {
+        conn: ConnId,
+        id: u64,
+        path: String,
+        app: String,
+    },
+    Import {
+        conn: ConnId,
+        id: u64,
+        bytes: Vec<u8>,
+    },
+    Update {
+        conn: ConnId,
+        id: u64,
+        seq: u64,
+        bytes: Vec<u8>,
+    },
+    Presence {
+        conn: ConnId,
+        id: u64,
+        bytes: Vec<u8>,
+    },
+    Close {
+        conn: ConnId,
+        doc: DocId,
+    },
+    /// The connection ended.
+    Gone {
+        conn: ConnId,
+    },
 }
 
 /// Why a recents call was refused.
@@ -63,6 +148,8 @@ enum Request {
     },
     /// Hold the live connection (closed, and not dialed) or let it run again; answered once done.
     Pause(bool, oneshot::Sender<()>),
+    /// A docs connection's request (answered on its own channel).
+    Docs(DocsCall),
 }
 
 /// How the local API reaches the hub. Cheap to clone.
@@ -92,6 +179,11 @@ impl HubHandle {
         let (reply, rx) = oneshot::channel();
         self.tx.send(Request::Pause(paused, reply)).await.map_err(|_| HubError::Gone)?;
         rx.await.map_err(|_| HubError::Gone)
+    }
+
+    /// Hands a docs connection's request to the hub (its answers come on the connection's channel).
+    pub async fn docs(&self, call: DocsCall) -> Result<(), HubError> {
+        self.tx.send(Request::Docs(call)).await.map_err(|_| HubError::Gone)
     }
 }
 
@@ -140,15 +232,86 @@ struct NodeLookup {
 }
 
 impl NodeLookup {
-    fn node(&mut self, path: &str) -> Option<NodeId> {
+    /// The sync state, read again if `state.json` changed.
+    fn state(&mut self) -> Option<&craft_cloud_sync::State> {
         let file = self.data.path().join(crate::account::STATE_FILE);
         let stamp = std::fs::metadata(&file).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
         if stamp != self.seen {
             self.seen = stamp;
             self.state = self.data.load_state().ok().map(|s| s.state);
         }
-        self.state.as_ref()?.base_at(&craft_cloud_sync::rel(path))
+        self.state.as_ref()
     }
+
+    fn node(&mut self, path: &str) -> Option<NodeId> {
+        self.state()?.base_at(&craft_cloud_sync::rel(path))
+    }
+
+    /// The node of the file at `path`, if the sync knows one there (a folder is none).
+    fn file_node(&mut self, path: &str) -> Option<NodeId> {
+        let state = self.state()?;
+        let node = state.base_at(&craft_cloud_sync::rel(path))?;
+        matches!(state.base.get(&node).map(|e| &e.kind), Some(craft_cloud_sync::BaseKind::File { .. })).then_some(node)
+    }
+
+    /// Whether the sync still has the file node `node` (`false` once it was deleted, here or elsewhere).
+    fn has_file(&mut self, node: NodeId) -> bool {
+        // (Unknown: no state to look in. Not said to be deleted.)
+        self.state().is_none_or(|state| state.base.contains_key(&node))
+    }
+}
+
+/// A token bucket for one app's presence in one document: [`PRESENCE_PER_SEC`] a second.
+struct PresenceBudget {
+    tokens: f64,
+    at: Instant,
+}
+
+impl PresenceBudget {
+    fn new() -> Self {
+        Self { tokens: f64::from(PRESENCE_PER_SEC), at: Instant::now() }
+    }
+
+    fn spend(&mut self) -> bool {
+        let now = Instant::now();
+        let rate = f64::from(PRESENCE_PER_SEC);
+        self.tokens = (self.tokens + now.saturating_duration_since(self.at).as_secs_f64() * rate).min(rate);
+        self.at = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// One docs connection: where its messages go, and the documents it has open (by its own numbers).
+struct DocsConn {
+    out: mpsc::Sender<DocOut>,
+    handles: BTreeMap<u64, DocId>,
+    presence: HashMap<u64, PresenceBudget>,
+}
+
+/// An open waiting for its file's node.
+struct Lookup {
+    conn: ConnId,
+    id: u64,
+    path: String,
+    app: AppName,
+    until: Instant,
+}
+
+/// The hub's documents of files: connections, opens waiting, imports asked for, and the status each was last told.
+#[derive(Default)]
+struct Docs {
+    conns: HashMap<ConnId, DocsConn>,
+    /// Opens waiting for a document's join, in order.
+    waiting: BTreeMap<DocId, Vec<(ConnId, u64)>>,
+    /// The open asked for a document's import.
+    importer: BTreeMap<DocId, (ConnId, u64)>,
+    lookups: Vec<Lookup>,
+    told: BTreeMap<DocId, (bool, u64, bool)>,
 }
 
 /// `text` cut to `max` bytes at a character boundary, without control characters.
@@ -198,6 +361,12 @@ struct State {
     delay: Duration,
     /// Syncing is paused: no connection is dialed (see [`HubHandle::set_paused`]).
     paused: bool,
+    docs: Docs,
+}
+
+/// A refusal sent to an app.
+fn refusal(id: Option<u64>, seq: Option<u64>, code: &'static str, message: impl Into<String>) -> DocOut {
+    DocOut::Refused { id, seq, code, message: message.into() }
 }
 
 impl State {
@@ -214,21 +383,317 @@ impl State {
         }
     }
 
-    /// Hands the changed lists to their followers, says the notes and writes what changed.
-    fn settle(&mut self) {
+    /// Hands the changed lists to their followers and what happened to documents to their apps, says the notes and
+    /// writes what changed. Frames to send (an event may call for some).
+    fn settle(&mut self) -> Vec<ClientFrame> {
         for (app, entries) in self.replica.take_changed() {
             if let Some(list) = self.lists.get(&app) {
                 let push_stopped = self.replica.push_stopped(&app);
                 list.send_replace(Listing { entries, push_stopped });
             }
         }
+        let frames = self.doc_events();
+        self.tell_status();
         for note in self.replica.take_notes() {
             self.say(note);
         }
         if let Err(e) = self.replica.flush() {
-            self.say(format!("the recents couldn't be written to disk: {e}"));
+            self.say(format!("the live documents couldn't be written to disk: {e}"));
         }
         self.control.set_online(self.replica.is_up());
+        frames
+    }
+
+    /// Sends `message` to docs connection `conn`; one that can't take it (it doesn't read, or it is gone) is dropped.
+    fn tell(&mut self, conn: ConnId, message: DocOut) -> Vec<ClientFrame> {
+        let Some(c) = self.docs.conns.get(&conn) else { return Vec::new() };
+        if c.out.try_send(message).is_ok() {
+            return Vec::new();
+        }
+        self.gone(conn)
+    }
+
+    /// The opens of `doc`: every connection and number it is open as.
+    fn handles_of(&self, doc: DocId) -> Vec<(ConnId, u64)> {
+        let mut out = Vec::new();
+        for (conn, c) in &self.docs.conns {
+            out.extend(c.handles.iter().filter(|(_, d)| **d == doc).map(|(id, _)| (*conn, *id)));
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Hands what happened to documents of files to the apps that have them open or wait for them.
+    fn doc_events(&mut self) -> Vec<ClientFrame> {
+        let mut frames = Vec::new();
+        for event in self.replica.take_events() {
+            match event {
+                DocEvent::Joined(doc) => {
+                    self.docs.importer.remove(&doc);
+                    for (conn, id) in self.docs.waiting.remove(&doc).unwrap_or_default() {
+                        frames.extend(self.deliver(conn, id, doc));
+                    }
+                }
+                DocEvent::NeedsImport(doc) => frames.extend(self.ask_import(doc)),
+                DocEvent::NotLive(doc, reason, message) => {
+                    self.docs.importer.remove(&doc);
+                    for (conn, id) in self.docs.waiting.remove(&doc).unwrap_or_default() {
+                        frames.extend(self.tell(conn, DocOut::NotLive { id, reason, message: message.clone() }));
+                    }
+                }
+                DocEvent::Remote(doc, bytes) => {
+                    let bytes = Arc::new(bytes);
+                    for (conn, id) in self.handles_of(doc) {
+                        frames.extend(self.tell(conn, DocOut::Update { id, bytes: bytes.clone() }));
+                    }
+                }
+                DocEvent::Presence(doc, bytes) => {
+                    let bytes = Arc::new(bytes);
+                    for (conn, id) in self.handles_of(doc) {
+                        frames.extend(self.tell(conn, DocOut::Presence { id, bytes: bytes.clone() }));
+                    }
+                }
+            }
+        }
+        frames
+    }
+
+    /// The first open waiting for `doc` is asked for its import; with none left, the join is given up on.
+    fn ask_import(&mut self, doc: DocId) -> Vec<ClientFrame> {
+        let first = self.docs.waiting.get(&doc).and_then(|w| w.first().copied());
+        match first {
+            Some((conn, id)) => {
+                self.docs.importer.insert(doc, (conn, id));
+                self.tell(conn, DocOut::NeedsImport { id })
+            }
+            None => {
+                self.docs.importer.remove(&doc);
+                self.replica.abandon_join(doc)
+            }
+        }
+    }
+
+    /// Opens `doc`, live here, as `id` on `conn`: its state goes to the app.
+    fn deliver(&mut self, conn: ConnId, id: u64, doc: DocId) -> Vec<ClientFrame> {
+        let Some((snapshot, waiting)) = self.replica.document_state(doc) else {
+            return self.tell(conn, DocOut::NotLive { id, reason: NotLiveReason::Offline, message: "the document can't be read here".into() });
+        };
+        let Some(c) = self.docs.conns.get_mut(&conn) else { return Vec::new() };
+        c.handles.insert(id, doc);
+        self.replica.set_open(doc, true);
+        let (online, waiting_n) = self.replica.document_status(doc).unwrap_or((false, 0));
+        let state = DocState { online, waiting: waiting_n, bytes: snapshot.len() as u64 };
+        self.tell(conn, DocOut::Opened { id, doc, state, snapshot, waiting })
+    }
+
+    /// A docs connection ended (or was dropped): its documents are closed, its waiting opens dropped, an import it was
+    /// asked for asked of the next open waiting (or the join given up on).
+    fn gone(&mut self, conn: ConnId) -> Vec<ClientFrame> {
+        let Some(c) = self.docs.conns.remove(&conn) else { return Vec::new() };
+        for doc in c.handles.values() {
+            self.replica.set_open(*doc, false);
+        }
+        self.docs.lookups.retain(|l| l.conn != conn);
+        for waiting in self.docs.waiting.values_mut() {
+            waiting.retain(|(c, _)| *c != conn);
+        }
+        let orphaned: Vec<DocId> = self.docs.importer.iter().filter(|(_, (c, _))| *c == conn).map(|(doc, _)| *doc).collect();
+        let mut frames = Vec::new();
+        for doc in orphaned {
+            frames.extend(self.ask_import(doc));
+        }
+        self.docs.waiting.retain(|_, w| !w.is_empty());
+        frames
+    }
+
+    /// The path an app named, relative to the synced folder (one given absolute must be inside it).
+    fn relative(&self, path: &str) -> Option<String> {
+        let given = std::path::Path::new(path);
+        if given.is_absolute() {
+            let inside = given.strip_prefix(&self.config.folder).ok()?;
+            let names: Option<Vec<&str>> = inside.components().map(|c| c.as_os_str().to_str()).collect();
+            return recent_path(&names?.join("/"));
+        }
+        recent_path(path)
+    }
+
+    /// An app opens `path` as `id`.
+    fn open(&mut self, conn: ConnId, id: u64, path: &str, app: &str) -> Vec<ClientFrame> {
+        let not_live = |reason, message: &str| DocOut::NotLive { id, reason, message: message.to_owned() };
+        let Some(c) = self.docs.conns.get(&conn) else { return Vec::new() };
+        if c.handles.contains_key(&id)
+            || self.docs.waiting.values().any(|w| w.contains(&(conn, id)))
+            || self.docs.lookups.iter().any(|l| l.conn == conn && l.id == id)
+        {
+            return self.tell(conn, refusal(Some(id), None, craft_cloud_proto::api::codes::INVALID, "that number is in use on this connection"));
+        }
+        let Ok(app) = AppName::new(app) else {
+            return self
+                .tell(conn, refusal(Some(id), None, craft_cloud_proto::api::codes::INVALID, "app names are 1-32 lowercase letters, digits or '-'"));
+        };
+        let Some(rel) = self.relative(path) else {
+            return self.tell(conn, not_live(NotLiveReason::NotInFolder, "that isn't a path inside the synced folder"));
+        };
+        match std::fs::metadata(self.config.folder.join(&rel)) {
+            Ok(m) if m.is_file() && m.len() > MAX_SNAPSHOT_BYTES as u64 => {
+                return self.tell(conn, not_live(NotLiveReason::TooLarge, "the file is over the limit for live documents"));
+            }
+            Ok(m) if m.is_file() => {}
+            _ => return self.tell(conn, not_live(NotLiveReason::NotInFolder, "there is no such file in the synced folder")),
+        }
+        match self.lookup.file_node(&rel) {
+            Some(node) => self.open_node(conn, id, node, &app),
+            None => {
+                // Not uploaded yet: a pass for it, and a few seconds for its node.
+                self.control.request_pass();
+                self.docs.lookups.push(Lookup { conn, id, path: rel, app, until: Instant::now() + NODE_WAIT });
+                Vec::new()
+            }
+        }
+    }
+
+    /// Opens the document of the file node `node` as `id` on `conn`.
+    fn open_node(&mut self, conn: ConnId, id: u64, node: NodeId, app: &AppName) -> Vec<ClientFrame> {
+        let (doc, opening, mut frames) = self.replica.open_document(node, app);
+        match opening {
+            Opening::Live => frames.extend(self.deliver(conn, id, doc)),
+            Opening::Joining => {
+                self.docs.waiting.entry(doc).or_default().push((conn, id));
+                // The server lacks it and the open asked for its import is gone: this one is asked.
+                if self.replica.needs_import(doc) && !self.docs.importer.contains_key(&doc) {
+                    frames.extend(self.ask_import(doc));
+                }
+            }
+            Opening::NotLive(reason, message) => frames.extend(self.tell(conn, DocOut::NotLive { id, reason, message })),
+        }
+        frames
+    }
+
+    /// Looks again for the nodes opens wait for: found, opened; past their wait, the file opens as a plain file.
+    fn look_again(&mut self) -> Vec<ClientFrame> {
+        let now = Instant::now();
+        let mut frames = Vec::new();
+        for l in std::mem::take(&mut self.docs.lookups) {
+            match self.lookup.file_node(&l.path) {
+                Some(node) => frames.extend(self.open_node(l.conn, l.id, node, &l.app)),
+                None if now >= l.until => frames.extend(self.tell(
+                    l.conn,
+                    DocOut::NotLive {
+                        id: l.id,
+                        reason: NotLiveReason::NotSynced,
+                        message: "the file isn't uploaded yet; open it again in a moment".into(),
+                    },
+                )),
+                None => self.docs.lookups.push(l),
+            }
+        }
+        frames
+    }
+
+    /// Tells the apps of each open document how it stands, when that changed.
+    fn tell_status(&mut self) {
+        let open: Vec<DocId> = {
+            let mut docs: Vec<DocId> = self.docs.conns.values().flat_map(|c| c.handles.values().copied()).collect();
+            docs.sort_unstable();
+            docs.dedup();
+            docs
+        };
+        self.docs.told.retain(|doc, _| open.contains(doc));
+        for doc in open {
+            let (online, waiting) = self.replica.document_status(doc).unwrap_or((false, 0));
+            let deleted = self.replica.document_node(doc).is_some_and(|node| !self.lookup.has_file(node));
+            let now = (online, waiting, deleted);
+            if self.docs.told.get(&doc) == Some(&now) {
+                continue;
+            }
+            self.docs.told.insert(doc, now);
+            let mut conns: Vec<ConnId> = self.handles_of(doc).into_iter().map(|(conn, _)| conn).collect();
+            conns.dedup();
+            for conn in conns {
+                let _ = self.tell(conn, DocOut::Status { doc, online, waiting, deleted });
+            }
+        }
+    }
+
+    /// A docs connection's request.
+    fn docs_call(&mut self, call: DocsCall) -> Vec<ClientFrame> {
+        match call {
+            DocsCall::Connect { conn, out } => {
+                self.docs.conns.insert(conn, DocsConn { out, handles: BTreeMap::new(), presence: HashMap::new() });
+                Vec::new()
+            }
+            DocsCall::Open { conn, id, path, app } => self.open(conn, id, &path, &app),
+            DocsCall::Import { conn, id, bytes } => {
+                let doc = self.docs.importer.iter().find(|(_, who)| **who == (conn, id)).map(|(doc, _)| *doc);
+                let Some(doc) = doc else {
+                    return self.tell(conn, refusal(Some(id), None, craft_cloud_proto::api::codes::INVALID, "no import was asked for"));
+                };
+                match self.replica.import_document(doc, &bytes) {
+                    Ok(frames) => frames,
+                    Err((reason, message)) => {
+                        self.docs.importer.remove(&doc);
+                        let mut frames = Vec::new();
+                        for (conn, id) in self.docs.waiting.remove(&doc).unwrap_or_default() {
+                            frames.extend(self.tell(conn, DocOut::NotLive { id, reason, message: message.clone() }));
+                        }
+                        frames
+                    }
+                }
+            }
+            DocsCall::Update { conn, id, seq, bytes } => {
+                let Some(doc) = self.docs.conns.get(&conn).and_then(|c| c.handles.get(&id)).copied() else {
+                    return self.tell(conn, refusal(Some(id), Some(seq), craft_cloud_proto::api::codes::NOT_FOUND, "that document isn't open here"));
+                };
+                match self.replica.local_update(doc, &bytes) {
+                    Ok(mut frames) => {
+                        frames.extend(self.tell(conn, DocOut::Ack { id, seq }));
+                        // The document's other apps on this machine get it at once.
+                        let bytes = Arc::new(bytes);
+                        for (other, other_id) in self.handles_of(doc) {
+                            if (other, other_id) != (conn, id) {
+                                frames.extend(self.tell(other, DocOut::Update { id: other_id, bytes: bytes.clone() }));
+                            }
+                        }
+                        frames
+                    }
+                    Err(LocalError::Invalid(message)) => {
+                        self.tell(conn, refusal(Some(id), Some(seq), craft_cloud_proto::api::codes::INVALID, message))
+                    }
+                    Err(LocalError::Io(e)) => {
+                        let message = format!("the change couldn't be written to disk: {e}");
+                        self.tell(conn, refusal(Some(id), Some(seq), craft_cloud_proto::api::codes::INTERNAL, message))
+                    }
+                }
+            }
+            DocsCall::Presence { conn, id, bytes } => {
+                let Some(c) = self.docs.conns.get_mut(&conn) else { return Vec::new() };
+                let Some(doc) = c.handles.get(&id).copied() else { return Vec::new() };
+                // Over the budget: dropped (the next one says where the cursor is).
+                if !c.presence.entry(id).or_insert_with(PresenceBudget::new).spend() {
+                    return Vec::new();
+                }
+                let mut frames = self.replica.presence(doc, &bytes);
+                let bytes = Arc::new(bytes);
+                for (other, other_id) in self.handles_of(doc) {
+                    if (other, other_id) != (conn, id) {
+                        frames.extend(self.tell(other, DocOut::Presence { id: other_id, bytes: bytes.clone() }));
+                    }
+                }
+                frames
+            }
+            DocsCall::Close { conn, doc } => {
+                if let Some(c) = self.docs.conns.get_mut(&conn) {
+                    let ids: Vec<u64> = c.handles.iter().filter(|(_, d)| **d == doc).map(|(id, _)| *id).collect();
+                    for id in ids {
+                        c.handles.remove(&id);
+                        c.presence.remove(&id);
+                        self.replica.set_open(doc, false);
+                    }
+                }
+                Vec::new()
+            }
+            DocsCall::Gone { conn } => self.gone(conn),
+        }
     }
 
     /// Sends frames; false when the connection broke (it is dropped).
@@ -283,6 +748,10 @@ impl State {
         match request {
             // The run loop's to handle (it owns the dialing).
             Request::Pause(..) => {}
+            Request::Docs(call) => {
+                let frames = self.docs_call(call);
+                self.send(frames).await;
+            }
             Request::Follow { app, reply } => {
                 if !self.lists.contains_key(&app) && self.lists.len() >= MAX_SUBSCRIPTIONS {
                     let _ = reply.send(Err(HubError::Invalid(format!("the agent follows at most {MAX_SUBSCRIPTIONS} apps' recents"))));
@@ -347,12 +816,15 @@ async fn run(
         retry_at: Instant::now(),
         delay: RETRY_FIRST,
         paused,
+        docs: Docs::default(),
     };
     state.settle();
     let mut dialing: Option<tokio::task::JoinHandle<Result<LiveSocket, DialError>>> = None;
     let mut last_heard = Instant::now();
     let mut ping = tokio::time::interval(PING_EVERY);
     let mut resend = tokio::time::interval(RESEND_EVERY);
+    let mut look = tokio::time::interval(NODE_LOOK_EVERY);
+    let mut write_documents = tokio::time::interval(DOCUMENTS_FLUSH_EVERY);
     loop {
         if state.socket.is_none() && dialing.is_none() && !state.paused && Instant::now() >= state.retry_at {
             let (server, token) = (state.config.server.clone(), state.config.token.clone());
@@ -363,6 +835,9 @@ async fn run(
             _ = &mut stop => {
                 if let Some(mut socket) = state.socket.take() {
                     close_within(&mut socket, CLOSE_TIMEOUT).await;
+                }
+                if let Err(e) = state.replica.flush_documents() {
+                    state.say(format!("the live documents couldn't be written to disk: {e}"));
                 }
                 return;
             }
@@ -447,9 +922,19 @@ async fn run(
                 let frames = state.replica.resend();
                 state.send(frames).await;
             }
+            _ = look.tick(), if !state.docs.lookups.is_empty() => {
+                let frames = state.look_again();
+                state.send(frames).await;
+            }
+            _ = write_documents.tick() => {
+                if let Err(e) = state.replica.flush_documents() {
+                    state.say(format!("the live documents couldn't be written to disk: {e}"));
+                }
+            }
             () = tokio::time::sleep_until(retry_at), if !up && dialing.is_none() && !state.paused => {}
         }
-        state.settle();
+        let frames = state.settle();
+        state.send(frames).await;
     }
 }
 

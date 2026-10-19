@@ -23,9 +23,13 @@
 use std::collections::HashSet;
 
 use craft_cloud_proto::NodeId;
-use craft_cloud_proto::live::MAX_UPDATE_BYTES;
 use craft_cloud_proto::local::{MAX_MACHINE_BYTES, MAX_RECENTS, MAX_TITLE_BYTES, RecentEntry, recent_path};
-use loro::{ExportMode, IdSpan, LoroDoc, LoroValue, ValueOrContainer};
+use loro::{ExportMode, LoroDoc, LoroValue, ValueOrContainer};
+
+use super::copy::{LiveCopy, Taken};
+pub use super::copy::{Spans, UpdateError, add_spans, spans_of};
+#[cfg(test)]
+use craft_cloud_proto::live::MAX_UPDATE_BYTES;
 
 /// The key of one add: random, never reused.
 pub type AddKey = [u8; 16];
@@ -38,20 +42,6 @@ const MAX_ENTRY_JSON: usize = 16 * 1024;
 
 const ENTRIES: &str = "entries";
 const SCHEMA: &str = "schema";
-
-/// Why an update or a stored document was refused.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum UpdateError {
-    #[error("the recents update doesn't import: {0}")]
-    Malformed(String),
-    #[error("the recents document is of version {0}; this agent reads version {RECENTS_VERSION}")]
-    Newer(i64),
-    #[error("the recents update breaks a limit: {0}")]
-    Invalid(&'static str),
-    /// Loro panicked on it: the document may be half-changed and is read back from its file.
-    #[error("Loro failed on the recents update")]
-    Panicked,
-}
 
 fn check_entry(entry: &RecentEntry) -> Result<(), UpdateError> {
     if recent_path(&entry.path).as_deref() != Some(entry.path.as_str()) {
@@ -70,17 +60,17 @@ fn hex(key: &AddKey) -> String {
     key.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A Loro peer ID this document may use (`u64::MAX` is reserved by Loro).
-fn usable_peer(peer: u64) -> u64 {
-    if peer == u64::MAX { peer - 1 } else { peer }
+/// One app's recents document: a [`LiveCopy`] (whose generic calls it offers as its own) read as a list.
+pub struct Recents {
+    copy: LiveCopy,
 }
 
-/// One app's recents document.
-pub struct Recents {
-    doc: LoroDoc,
-    /// Loro panicked in a call on this document: its lock is poisoned, so the document is read back from its file and
-    /// this one let go of without dropping it (dropping a poisoned Loro document panics again).
-    poisoned: std::cell::Cell<bool>,
+impl std::ops::Deref for Recents {
+    type Target = LiveCopy;
+
+    fn deref(&self) -> &LiveCopy {
+        &self.copy
+    }
 }
 
 impl std::fmt::Debug for Recents {
@@ -158,83 +148,30 @@ pub enum Imported {
     Waiting { needs: Vec<(u64, i32)>, changed: bool },
 }
 
-/// Ranges of each Loro peer's operations (`[start, end)` counters), as a log is known to hold them.
-pub type Spans = std::collections::BTreeMap<u64, Vec<(i32, i32)>>;
-
-/// The ranges of operations an update (or snapshot) holds, read from its header without importing it; `None` for
-/// bytes Loro can't read.
-pub fn spans_of(bytes: &[u8]) -> Option<Vec<(u64, i32, i32)>> {
-    let meta = guarded(|| LoroDoc::decode_import_blob_meta(bytes, true).map_err(|e| UpdateError::Malformed(e.to_string()))).ok()?;
-    Some(meta.partial_end_vv.iter().map(|(peer, end)| (*peer, meta.partial_start_vv.get(peer).copied().unwrap_or(0), *end)).collect())
-}
-
-/// Adds `ranges` to `spans`, merging what touches.
-pub fn add_spans(spans: &mut Spans, ranges: &[(u64, i32, i32)]) {
-    for &(peer, start, end) in ranges {
-        if start >= end {
-            continue;
-        }
-        let list = spans.entry(peer).or_default();
-        list.push((start, end));
-        list.sort_unstable();
-        let mut merged: Vec<(i32, i32)> = Vec::with_capacity(list.len());
-        for &(s, e) in list.iter() {
-            match merged.last_mut() {
-                Some(last) if s <= last.1 => last.1 = last.1.max(e),
-                _ => merged.push((s, e)),
-            }
-        }
-        *list = merged;
-    }
-}
-
-/// Runs `f`, turning a panic inside Loro into [`UpdateError::Panicked`] (never into a crashed agent).
-fn guarded<T>(f: impl FnOnce() -> Result<T, UpdateError>) -> Result<T, UpdateError> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(Err(UpdateError::Panicked))
-}
-
 impl Recents {
     /// An empty document, editing as Loro peer `peer` (unique per machine and run).
     pub fn new(peer: u64) -> Self {
-        let doc = LoroDoc::new();
-        // A fresh document has no history, so any peer ID is accepted.
-        let _ = doc.set_peer_id(usable_peer(peer));
-        Self { doc, poisoned: std::cell::Cell::new(false) }
+        Self { copy: LiveCopy::new(peer) }
     }
 
-    /// Runs `f` on the document under [`guarded`]; a panic marks it poisoned. Every Loro call on a document goes
-    /// through here (it may hold any machine's data).
+    /// The document as a recents list (a copy loaded or caught up as any live document).
+    pub fn from_copy(copy: LiveCopy) -> Self {
+        Self { copy }
+    }
+
+    /// The generic copy underneath.
+    pub fn into_copy(self) -> LiveCopy {
+        self.copy
+    }
+
     fn guard<T>(&self, f: impl FnOnce(&LoroDoc) -> Result<T, UpdateError>) -> Result<T, UpdateError> {
-        if self.poisoned.get() {
-            return Err(UpdateError::Panicked);
-        }
-        let result = guarded(|| f(&self.doc));
-        if matches!(result, Err(UpdateError::Panicked)) {
-            self.poisoned.set(true);
-        }
-        result
-    }
-
-    /// Whether Loro panicked in a call on this document ([`Recents::guard`]): it must be read back from its file, and
-    /// this one never dropped.
-    pub fn is_poisoned(&self) -> bool {
-        self.poisoned.get()
-    }
-
-    /// Marks the document as one Loro failed in (for tests: a real Loro panic can't be made on demand).
-    #[cfg(test)]
-    pub(crate) fn poison(&self) {
-        self.poisoned.set(true);
+        self.copy.guard(f)
     }
 
     /// A stored document (a Loro snapshot), editing as `peer`. Of any size: the 1 MiB limit is on updates from the
     /// server, not on this machine's own document.
     pub fn load(snapshot: &[u8], peer: u64) -> Result<Self, UpdateError> {
-        let recents = Self::new(peer);
-        match recents.import_any_size(snapshot)? {
-            Imported::Applied { .. } => Ok(recents),
-            Imported::Waiting { .. } => Err(UpdateError::Malformed("a stored document that needs more history".into())),
-        }
+        LiveCopy::load(snapshot, peer).map(Self::from_copy)
     }
 
     /// Merges an update (or a snapshot) from elsewhere. Refused only when Loro can't decode it, or it is over the
@@ -243,178 +180,25 @@ impl Recents {
     /// disagree about what they took, and their later updates would wait on each other for good. Entries that don't
     /// read, or break the rules, are only ever hidden by the list ([`read_entry`]).
     pub fn import(&self, bytes: &[u8]) -> Result<Imported, UpdateError> {
-        if bytes.len() > MAX_UPDATE_BYTES {
-            return Err(UpdateError::Invalid("over 1 MiB"));
-        }
-        self.import_any_size(bytes)
+        let before = self.view();
+        let taken = self.copy.import(bytes)?;
+        Ok(self.imported(taken, &before))
     }
 
     /// [`Recents::import`] without the update limit: for this machine's own stored document (or a simulation merging
     /// machines' documents), never for an update from the server.
     pub fn import_any_size(&self, bytes: &[u8]) -> Result<Imported, UpdateError> {
         let before = self.view();
-        let status = self.guard(|doc| doc.import(bytes).map_err(|e| UpdateError::Malformed(e.to_string())))?;
+        let taken = self.copy.import_any_size(bytes)?;
+        Ok(self.imported(taken, &before))
+    }
+
+    fn imported(&self, taken: Taken, before: &[RecentEntry]) -> Imported {
         let changed = self.view() != before;
-        let needs: Vec<(u64, i32)> = status.pending.map(|p| p.iter().map(|(peer, (_, end))| (*peer, *end)).collect()).unwrap_or_default();
-        Ok(if needs.is_empty() { Imported::Applied { changed } } else { Imported::Waiting { needs, changed } })
-    }
-
-    /// Whether the document has any operations (Loro drops the updates waiting in a document without any when a
-    /// snapshot comes in: the caller imports them again).
-    pub fn has_history(&self) -> bool {
-        self.guard(|doc| Ok(!doc.oplog_vv().is_empty())).unwrap_or(false)
-    }
-
-    /// The Loro peer this document edits as (a plain field read: no lock).
-    pub fn peer(&self) -> u64 {
-        self.doc.peer_id()
-    }
-
-    /// Whether every peer's operations here reach as far as `needs` says (a waiting update is then in).
-    pub fn covers(&self, needs: &[(u64, i32)]) -> bool {
-        self.guard(|doc| {
-            let vv = doc.oplog_vv();
-            Ok(needs.iter().all(|(peer, end)| vv.get(peer).is_some_and(|have| have >= end)))
-        })
-        .unwrap_or(false)
-    }
-
-    /// The whole document (a Loro snapshot): to store it, or to send it up again to a server that lost it.
-    pub fn snapshot(&self) -> Result<Vec<u8>, UpdateError> {
-        self.guard(|doc| doc.export(ExportMode::Snapshot).map_err(|e| UpdateError::Malformed(e.to_string())))
-    }
-
-    /// The changes (Loro commits: peer, first and end counter) of this document that `has` doesn't wholly hold, in
-    /// causal order: by Lamport time (a change's dependencies all have a smaller one), then peer. Any prefix of it,
-    /// sent after what `has` holds, applies on its own.
-    pub fn missing(&self, has: &Spans) -> Result<Vec<(u64, i32, i32)>, UpdateError> {
-        self.guard(|doc| Ok(Self::missing_in(doc, has)))
-    }
-
-    fn missing_in(doc: &LoroDoc, has: &Spans) -> Vec<(u64, i32, i32)> {
-        let mut out = Vec::new();
-        let ends: Vec<(u64, i32)> = doc.oplog_vv().iter().map(|(peer, end)| (*peer, *end)).collect();
-        for (peer, end) in ends {
-            let mut at = 0;
-            while at < end {
-                let Some(change) = doc.get_change(loro::ID::new(peer, at)) else { break };
-                let (start, stop) = (change.id.counter, change.id.counter.saturating_add(i32::try_from(change.len).unwrap_or(i32::MAX)));
-                if stop <= at {
-                    break;
-                }
-                // The pieces of the change `has` lacks (a change may be partly sent: a big one goes in pieces), each
-                // at the Lamport time of its first operation.
-                let mut from = start;
-                for &(s, e) in has.get(&peer).map(Vec::as_slice).unwrap_or_default() {
-                    if e <= from || s >= stop {
-                        continue;
-                    }
-                    if s > from {
-                        out.push((change.lamport.saturating_add(u32::try_from(from - start).unwrap_or(0)), peer, from, s));
-                    }
-                    from = from.max(e);
-                }
-                if from < stop {
-                    out.push((change.lamport.saturating_add(u32::try_from(from - start).unwrap_or(0)), peer, from, stop));
-                }
-                at = stop;
-            }
+        match taken {
+            Taken::Applied { .. } => Imported::Applied { changed },
+            Taken::Waiting { needs } => Imported::Waiting { needs, changed },
         }
-        out.sort_unstable();
-        out.into_iter().map(|(_, peer, start, stop)| (peer, start, stop)).collect()
-    }
-
-    /// `changes` (whole Loro commits) as one update.
-    /// Each peer's pieces must follow on from each other ([`Recents::export_prefix`] keeps them so): Loro panics on a
-    /// range export of one peer's operations with a gap.
-    pub fn export_changes(&self, changes: &[(u64, i32, i32)]) -> Result<Vec<u8>, UpdateError> {
-        let mut spans: std::collections::BTreeMap<u64, (i32, i32)> = std::collections::BTreeMap::new();
-        for &(peer, start, end) in changes {
-            let span = spans.entry(peer).or_insert((start, end));
-            span.0 = span.0.min(start);
-            span.1 = span.1.max(end);
-        }
-        let spans: Vec<IdSpan> = spans.into_iter().map(|(peer, (start, end))| IdSpan::new(peer, start, end)).collect();
-        self.guard(|doc| doc.export(ExportMode::updates_in_range(spans)).map_err(|e| UpdateError::Malformed(e.to_string())))
-    }
-
-    /// The longest start of `changes` that fits in `max` bytes as one update (at least one change; `Invalid` if that
-    /// one doesn't fit in `hard_max`), with how many changes it holds.
-    pub fn export_prefix(&self, changes: &[(u64, i32, i32)], max: usize, hard_max: usize) -> Result<(Vec<u8>, usize), UpdateError> {
-        let Some(&(peer, start, end)) = changes.first() else { return Err(UpdateError::Invalid("nothing to send")) };
-        // The most operations of the first change that fit, by doubling from one and then halving the gap, so no
-        // export is much bigger than a part (a big change isn't exported whole for every piece of it). A change too big
-        // for a part goes in pieces: its operations depend on the ones before them, so a start of it applies once
-        // those before it are in.
-        let total = end - start;
-        let (mut ops, mut one) = (0, Vec::new());
-        let (mut try_ops, mut over) = (1, None);
-        while over.is_none() && ops < total {
-            let n = try_ops.min(total);
-            let bytes = self.export_changes(&[(peer, start, start + n)])?;
-            if bytes.len() <= max {
-                (ops, one) = (n, bytes);
-                try_ops = n.saturating_mul(2);
-            } else {
-                over = Some(n);
-            }
-        }
-        if let Some(mut high) = over {
-            while high - ops > 1 {
-                let mid = ops + (high - ops) / 2;
-                let bytes = self.export_changes(&[(peer, start, start + mid)])?;
-                if bytes.len() <= max {
-                    (ops, one) = (mid, bytes);
-                } else {
-                    high = mid;
-                }
-            }
-        }
-        if ops == 0 {
-            // One operation over a part: sent alone if it fits an update at all.
-            let bytes = self.export_changes(&[(peer, start, start + 1)])?;
-            return if bytes.len() <= hard_max { Ok((bytes, 1)) } else { Err(UpdateError::Invalid("one operation is larger than an update may be")) };
-        }
-        if ops < total {
-            return Ok((one, 1));
-        }
-        // Only as far as each peer's pieces follow on from each other (a piece after a gap waits for a later part).
-        let mut ends: std::collections::BTreeMap<u64, i32> = std::collections::BTreeMap::new();
-        let mut usable = 0;
-        for &(peer, start, end) in changes {
-            if ends.get(&peer).is_some_and(|last| *last != start) {
-                break;
-            }
-            ends.insert(peer, end);
-            usable += 1;
-        }
-        let changes = &changes[..usable.max(1)];
-        // The most changes that fit: doubling, then halving the gap.
-        let (mut fits, mut best) = (1, one);
-        let mut too_many = None;
-        let mut try_n = 2;
-        while too_many.is_none() && fits < changes.len() {
-            let n = try_n.min(changes.len());
-            let bytes = self.export_changes(&changes[..n])?;
-            if bytes.len() <= max {
-                (fits, best) = (n, bytes);
-                try_n = n * 2;
-            } else {
-                too_many = Some(n);
-            }
-        }
-        if let Some(mut high) = too_many {
-            while high - fits > 1 {
-                let mid = fits + (high - fits) / 2;
-                let bytes = self.export_changes(&changes[..mid])?;
-                if bytes.len() <= max {
-                    (fits, best) = (mid, bytes);
-                } else {
-                    high = mid;
-                }
-            }
-        }
-        Ok((best, fits))
     }
 
     /// The list apps see: newest first, one entry per file, at most [`MAX_RECENTS`].

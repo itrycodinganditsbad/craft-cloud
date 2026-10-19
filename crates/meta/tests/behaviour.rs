@@ -124,6 +124,7 @@ on_every_backend!(
     a_snapshot_over_the_storage_cap_changes_nothing,
     documents_of_files_have_caps_of_their_own,
     a_compacted_log_still_holds_updates,
+    the_import_stays_when_the_log_is_compacted,
     a_pairing_code_works_once,
     an_expired_code_is_refused,
     a_replaced_invite_s_old_code_fails,
@@ -882,7 +883,8 @@ async fn a_log_is_compacted_into_a_snapshot(meta: &Meta) {
     let s = snapshot(&[9; 40]);
     assert!(meta.compact_live_doc(ana.space, doc, 3, &s, NOW).await.unwrap());
     let compacted = meta.live_doc(ana.space, doc).await.unwrap().unwrap();
-    assert_eq!((compacted.base, compacted.bytes, compacted.head, compacted.snapshot_bytes), (3, 200, 5, 40), "rows 1-3 no longer count");
+    assert_eq!((compacted.base, compacted.above_base(), compacted.head, compacted.snapshot_bytes), (3, 200, 5, 40), "rows 1-3 no longer count");
+    assert_eq!((compacted.bytes, compacted.compacted_bytes), (500, 300), "but stay in the log");
     assert_eq!(meta.live_snapshot(ana.space, doc).await.unwrap(), Some((3, s.clone())));
     assert_eq!(meta.live_updates(ana.space, doc, 0, 10).await.unwrap().len(), 5, "the compacted rows are kept");
     // Older, equal or past the head: ignored.
@@ -893,7 +895,7 @@ async fn a_log_is_compacted_into_a_snapshot(meta: &Meta) {
     // Under the cap again: appends go on.
     assert_eq!(meta.append_live_update(ana.space, doc, dev, 6, &[6; 10], NOW).await.unwrap(), 6);
     assert!(meta.compact_live_doc(ana.space, doc, 6, &snapshot(&[8; 50]), NOW).await.unwrap());
-    assert_eq!(meta.live_doc(ana.space, doc).await.unwrap().unwrap().bytes, 0);
+    assert_eq!(meta.live_doc(ana.space, doc).await.unwrap().unwrap().above_base(), 0);
     assert!(matches!(meta.compact_live_doc(ana.space, DocId::generate(), 1, &snapshot(&[1]), NOW).await, Err(MetaError::NotFound(_))));
     // A reset empties the log and drops the snapshot.
     meta.reset_live_doc(ana.space, doc).await.unwrap();
@@ -928,7 +930,8 @@ async fn concurrent_compactions_take_one(meta: &Meta) {
     let after = meta.live_doc(ana.space, doc).await.unwrap().unwrap();
     assert!(taken.len() <= 2 && taken.iter().filter(|u| **u == 4).count() <= 1 && taken.iter().filter(|u| **u == 8).count() <= 1, "{taken:?}");
     assert_eq!(after.base, *taken.iter().max().unwrap(), "the base is the furthest one taken");
-    assert_eq!(after.bytes, (10 - after.base) * 10, "each row stopped counting once");
+    assert_eq!(after.above_base(), (10 - after.base) * 10, "each row stopped counting once");
+    assert_eq!(after.bytes, 100);
 }
 
 async fn a_snapshot_over_the_storage_cap_changes_nothing(meta: &Meta) {
@@ -977,6 +980,27 @@ async fn documents_of_files_have_caps_of_their_own(meta: &Meta) {
     ));
 }
 
+/// The log doesn't hold a document's import: compaction replaces the snapshot, never the import, which a machine that
+/// can't read the snapshot reads with the whole log. A reset drops both.
+async fn the_import_stays_when_the_log_is_compacted(meta: &Meta) {
+    use craft_cloud_proto::live::node_doc;
+    let ana = user(meta, "ana").await;
+    let dev = device(meta, &ana).await;
+    let node = file(meta, &ana, "a.txt").await;
+    let doc = node_doc(ana.space, node);
+    let import = snapshot(&[1; 20]);
+    meta.create_live_document(ana.space, doc, "document:wordcraft", node, &import, NOW).await.unwrap();
+    assert_eq!(meta.live_import_snapshot(ana.space, doc).await.unwrap(), Some(import.clone()));
+    meta.append_live_update(ana.space, doc, dev, 1, b"x", NOW).await.unwrap();
+    let compacted = snapshot(&[2; 30]);
+    assert!(meta.compact_live_doc(ana.space, doc, 1, &compacted, NOW).await.unwrap());
+    assert_eq!(meta.live_snapshot(ana.space, doc).await.unwrap(), Some((1, compacted)));
+    assert_eq!(meta.live_import_snapshot(ana.space, doc).await.unwrap(), Some(import), "the import stays");
+    meta.reset_live_doc(ana.space, doc).await.unwrap();
+    assert_eq!(meta.live_import_snapshot(ana.space, doc).await.unwrap(), None);
+    assert_eq!(meta.live_import_snapshot(ana.space, craft_cloud_proto::DocId::generate()).await.unwrap(), None);
+}
+
 /// A recents document whose whole log was compacted still holds updates: it counts against the account's cap, and
 /// its next update isn't taken for a first one.
 async fn a_compacted_log_still_holds_updates(meta: &Meta) {
@@ -990,7 +1014,7 @@ async fn a_compacted_log_still_holds_updates(meta: &Meta) {
     }
     meta.append_live_update(ana.space, a, dev, 1, b"x", NOW).await.unwrap();
     assert!(meta.compact_live_doc(ana.space, a, 1, &snapshot(&[1]), NOW).await.unwrap());
-    assert_eq!(meta.live_doc(ana.space, a).await.unwrap().unwrap().bytes, 0);
+    assert_eq!(meta.live_doc(ana.space, a).await.unwrap().unwrap().above_base(), 0);
     assert!(matches!(meta.append_live_update(ana.space, b, dev, 1, b"y", NOW).await, Err(MetaError::TooManyDocs { limit: 1 })));
     assert_eq!(meta.append_live_update(ana.space, a, dev, 2, b"z", NOW).await.unwrap(), 2, "the compacted one goes on");
 }

@@ -300,6 +300,8 @@ struct Subscription {
     catching_up: bool,
     /// The catch-up starts with the document's snapshot if the agent's `after` (this) is below it, or 0.
     snapshot_from: Option<u64>,
+    /// …with the document's import instead (`subscribe_log` from 0: the whole log follows, which doesn't hold it).
+    import: bool,
 }
 
 /// What [`Session::handle`] answers.
@@ -636,8 +638,11 @@ impl Session {
         // An agent that holds more than the log (the server was restored from a backup) is told the log's end in
         // `subscribed` and sends its own state up again.
         let sent = after.min(found.head);
-        let snapshot_from = (self.documents() && !log_only && found.has_snapshot && (sent < found.base || sent == 0)).then_some(sent);
-        self.subscriptions.insert(doc, Subscription { sent, catching_up: true, snapshot_from });
+        // From below the snapshot (or from 0): the snapshot first. The whole log (`subscribe_log`) from 0 of a document
+        // made by import: its import first, which no row holds.
+        let import = log_only && sent == 0 && found.kind.starts_with(DOCUMENT_KIND_PREFIX);
+        let snapshot_from = (self.documents() && found.has_snapshot && (import || (!log_only && (sent < found.base || sent == 0)))).then_some(sent);
+        self.subscriptions.insert(doc, Subscription { sent, catching_up: true, snapshot_from, import });
         self.dirty.insert(doc);
         Ok(())
     }
@@ -722,16 +727,22 @@ impl Session {
         // The snapshot first, as it is now (a compaction since the `subscribe` only moves it on): alone in its batch,
         // then the log from its base on (the update at the base too, whose hash the agent's next `at` names).
         if let Some(after) = sub.snapshot_from.take() {
-            let found = self.state.meta.live_snapshot(self.space, doc).await?;
+            let found = if sub.import {
+                self.state.meta.live_import_snapshot(self.space, doc).await?.map(|import| (0, import))
+            } else {
+                self.state.meta.live_snapshot(self.space, doc).await?
+            };
             if let Some((base, stored)) = found.filter(|(base, _)| after < *base || after == 0) {
                 let bytes = match read_snapshot(&self.state, &stored).await {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        // This document can't be caught up now (its agent tries again later); the others go on.
+                        // This document can't be caught up now (its agent tries again later, with the whole log); the
+                        // others go on. Always `internal`: a missing blob is the server's fault, not a missing document.
+                        tracing::error!(code = e.code, "a live document's snapshot can't be read");
                         self.subscriptions.remove(&doc);
                         self.dirty.remove(&doc);
                         release(&self.state.live.subscriptions, self.device, 1);
-                        return Ok(vec![refused(e, Some(doc), None)]);
+                        return Ok(vec![refused(ApiError::internal(), Some(doc), None)]);
                     }
                 };
                 sub.sent = base.saturating_sub(1).max(after);
@@ -763,7 +774,7 @@ impl Session {
             && let Some(found) = self.state.meta.live_doc(self.space, doc).await?
             && found.head == sub.sent
         {
-            frames.extend(self.maybe_compact(doc, found.head, found.base, found.bytes));
+            frames.extend(self.maybe_compact(doc, found.head, found.base, found.above_base()));
         }
         Ok(frames)
     }
@@ -1288,7 +1299,7 @@ mod tests {
         assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap().base, 0);
         pc.handle(ClientFrame::Snapshot { doc, upto: 4, bytes: vec![8; 40] }).await;
         let compacted = a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap();
-        assert_eq!((compacted.base, compacted.bytes, compacted.snapshot_bytes), (4, 10, 40));
+        assert_eq!((compacted.base, compacted.above_base(), compacted.snapshot_bytes), (4, 10, 40));
         pc.handle(ClientFrame::Snapshot { doc, upto: 4, bytes: vec![9; 40] }).await;
         assert_eq!(a.meta.live_snapshot(a.user.space, doc).await.unwrap().unwrap().1.bytes, 40);
         // From the start: the snapshot, then the log from its base (the row at the base gives the next `at`).
@@ -1309,11 +1320,14 @@ mod tests {
         tablet.handle(ClientFrame::Subscribe { doc, after: 4, at: Some(update_hash(&[4; 10])) }).await;
         let frames = drain(&mut tablet).await;
         assert_eq!((snapshot_of(&frames), updates(&frames)), (None, vec![5]));
-        // `subscribe_log` never gets the snapshot, but every row.
+        // `subscribe_log` never gets the snapshot, but every row, after the import (which no row holds).
         let (mut reader, _) = a.session(2).await;
         reader.handle(ClientFrame::SubscribeLog { doc, after: 0, at: None }).await;
         let frames = drain(&mut reader).await;
-        assert_eq!((snapshot_of(&frames), updates(&frames)), (None, vec![1, 2, 3, 4, 5]));
+        assert_eq!((snapshot_of(&frames), updates(&frames)), (Some((0, vec![1; 10])), vec![1, 2, 3, 4, 5]));
+        reader.handle(ClientFrame::SubscribeLog { doc, after: 2, at: Some(update_hash(&[2; 10])) }).await;
+        let frames = drain(&mut reader).await;
+        assert_eq!((snapshot_of(&frames), updates(&frames)), (None, vec![3, 4, 5]), "from 2 it had the import");
     }
 
     /// A device that just caught up holds the whole log: if it is long and nobody is asked, it is.
