@@ -1,7 +1,7 @@
 //! One of each per user: the app's window, and (on Linux) its tray process. The first of a kind holds a lock on its
-//! `<name>.lock` and listens on a loopback port it writes, with a random token, to `<name>.port`; both are in the
-//! folder above the agent's data folder (the per-user data folder: `%LOCALAPPDATA%`, `~/Library/Application Support`,
-//! `~/.local/share`). A later start finds the lock taken, connects to that port and sends a [`Command`]: `show` (the
+//! `<name>.lock` and listens on a loopback port it writes, with a random token, to `<name>.port`; both are in
+//! `craft-cloud-app`, next to the agent's data folder in the per-user data folder (`%LOCALAPPDATA%`,
+//! `~/Library/Application Support`, `~/.local/share`). A later start finds the lock taken, connects to that port and sends a [`Command`]: `show` (the
 //! first brings its window forward, also from the tray, and the second exits, so there is never a second tray icon)
 //! or `quit` (the tray's Quit ends the window too, and the window's Quit the tray).
 //!
@@ -30,8 +30,8 @@ pub enum Name {
 impl Name {
     fn stem(self) -> &'static str {
         match self {
-            Name::Window => "craft-cloud-app",
-            Name::Tray => "craft-cloud-tray",
+            Name::Window => "window",
+            Name::Tray => "tray",
         }
     }
 
@@ -86,9 +86,17 @@ pub struct Running {
     name: Name,
 }
 
-/// The folder for the locks and the channels: the one above the agent's data folder.
+/// The folder of the locks and the channels, next to the agent's data folder (the uninstallers remove it).
+pub const FOLDER_NAME: &str = "craft-cloud-app";
+
+/// The folder for the locks and the channels: [`FOLDER_NAME`] next to the agent's data folder.
 pub fn folder() -> Option<PathBuf> {
-    craft_cloud_proto::local::data_dir(|name| std::env::var_os(name)).and_then(|data| data.parent().map(Path::to_owned))
+    craft_cloud_proto::local::data_dir(|name| std::env::var_os(name)).and_then(|data| folder_beside(&data))
+}
+
+/// [`FOLDER_NAME`] next to the agent's data folder `data`.
+fn folder_beside(data: &Path) -> Option<PathBuf> {
+    data.parent().map(|parent| parent.join(FOLDER_NAME))
 }
 
 /// Takes the lock of `name` in `dir`, or finds the process that holds it.
@@ -230,6 +238,19 @@ mod tests {
         send(dir.path(), Name::Tray, Command::Quit).unwrap();
         assert_eq!(heard.recv_timeout(Duration::from_secs(10)).unwrap(), Command::Quit);
         assert!(is_running(dir.path(), Name::Tray), "asking doesn't take the lock");
+    }
+
+    /// The locks and the channels have a folder of their own, next to the agent's, not loose in the per-user folder.
+    #[test]
+    fn the_files_are_in_a_folder_of_their_own() {
+        let data = Path::new("/home/u/.local/share/craft-cloud-agent");
+        assert_eq!(folder_beside(data).unwrap(), Path::new("/home/u/.local/share/craft-cloud-app"));
+        let dir = tempfile::tempdir().unwrap();
+        let inside = dir.path().join(FOLDER_NAME);
+        let _first = claim(&inside, Name::Window).unwrap();
+        let loose: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(loose, [FOLDER_NAME], "nothing else beside it");
+        assert!(inside.join("window.lock").is_file() && inside.join("window.port").is_file());
     }
 
     #[test]

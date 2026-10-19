@@ -29,13 +29,14 @@ jobs:
       - uses: actions/checkout@v4
 
       # The Craft Cloud app's window (egui on winit and wgpu) needs these headers on Linux, and its snapshot tests a
-      # CPU renderer (Mesa's lavapipe). Its tray and folder picker talk D-Bus in pure Rust: no GTK or libdbus.
-      - name: Install Linux system dependencies (egui/winit, lavapipe)
+      # CPU renderer (Mesa's lavapipe). Its tray and folder picker talk D-Bus in pure Rust: no GTK or libdbus; the
+      # tray's tests run a private bus of their own (dbus-daemon).
+      - name: Install Linux system dependencies (egui/winit, lavapipe, dbus-daemon)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev mesa-vulkan-drivers
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev mesa-vulkan-drivers dbus
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -57,6 +58,13 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+      # The tray's D-Bus tests again, required: without dbus-daemon they would skip, and pass, above.
+      - name: Test the Linux tray on D-Bus (required)
+        if: runner.os == 'Linux'
+        env:
+          CRAFT_CLOUD_REQUIRE_BACKENDS: "1"
+        run: cargo test -p craft-cloud-desktop --lib --locked tray::linux
 
       # The app bundle is built only on macOS: CI checks it builds (unsigned, not published).
       - name: Package (macOS app bundle)

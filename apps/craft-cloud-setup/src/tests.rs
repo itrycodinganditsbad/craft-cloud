@@ -11,6 +11,8 @@ struct Recorder {
     running: Mutex<bool>,
     /// The agent doesn't stop, even when ended.
     stuck: bool,
+    /// The agent accepts the quit, then whether it has ended can't be told (tasklist fails).
+    unknowable: bool,
     /// Where `autostart on` writes the agent's Run value, as the agent does (for the program it was run as)…
     registry: Option<(Arc<MemoryRegistry>, String)>,
     /// …unless an old agent still running answered it and registered itself.
@@ -37,6 +39,9 @@ impl Machine for Recorder {
         self.note("stop agent".into());
         if self.stuck {
             AgentStop::StillRunning("process 4242 doesn't end".into())
+        } else if self.unknowable {
+            *self.running.lock().unwrap() = false;
+            AgentStop::Unknown("tasklist can't tell: tasklist failed".into())
         } else if std::mem::replace(&mut *self.running.lock().unwrap(), false) {
             AgentStop::Stopped
         } else {
@@ -87,6 +92,7 @@ fn user(keys: &str) -> User {
         run_key: format!(r"{keys}\Run"),
         uninstall_key: format!(r"{keys}\Uninstall\CraftCloud"),
         agent_data: data.clone(),
+        app_files: local.join(APP_FILES_DIR),
         patience: std::time::Duration::from_millis(300),
     };
     let synced = root.path().join("Craft Cloud");
@@ -156,6 +162,67 @@ fn an_upgrade_stops_the_agent_and_the_app_replaces_the_files_and_starts_the_agen
     assert!(u.data.join("account.json").exists() && u.synced.join("notes.txt").exists());
 }
 
+/// An install that fails once the agent is stopped (here the setup's own exe can't be read) starts the agent again,
+/// from the folder its start at login names, and says so.
+#[test]
+fn an_install_that_fails_after_the_stop_starts_the_agent_again() {
+    let u = user("Test");
+    let (registry, machine) = (MemoryRegistry::default(), Recorder::default());
+    let old: &[(&str, &[u8])] = &[(APP_EXE, b"app v1"), (AGENT_EXE, b"agent v1"), (AGENT_BG_EXE, b"agent-bg v1")];
+    install(&u.places, &registry, &machine, old, &u.setup, &options(true)).unwrap();
+    let value = format!("\"{}\" run --log", u.places.dir().join(AGENT_BG_EXE).display());
+    registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, &value).unwrap();
+    *machine.running.lock().unwrap() = true;
+    machine.asked.lock().unwrap().clear();
+
+    let gone = u.setup.with_file_name("not-there.exe");
+    let e = install(&u.places, &registry, &machine, V2, &gone, &options(true)).unwrap_err();
+    assert!(e.contains("not-there.exe") && e.ends_with("The agent was started again."), "{e}");
+    assert_eq!(machine.asked(), ["close app", "stop agent", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
+
+    // Nothing to start (the program folder can't even be made, and there is no older install): said too.
+    let bare = user("Bare");
+    std::fs::write(&bare.places.programs, "not a folder").unwrap();
+    let machine = Recorder::default();
+    *machine.running.lock().unwrap() = true;
+    let e = install(&bare.places, &registry, &machine, V2, &bare.setup, &options(true)).unwrap_err();
+    assert!(e.ends_with("The agent couldn't be started again (no agent is there to start); it starts at the next login."), "{e}");
+    assert_eq!(machine.asked(), ["close app", "stop agent"]);
+
+    // Not running before: nothing is started.
+    let machine = Recorder::default();
+    let e = install(&u.places, &registry, &machine, V2, &gone, &options(true)).unwrap_err();
+    assert!(!e.contains("agent"), "{e}");
+    assert_eq!(machine.asked(), ["close app", "stop agent"]);
+}
+
+/// The agent accepts the quit, then tasklist fails: the install and the uninstall stop with nothing else changed,
+/// and the agent (which may be stopping) is started again from the folder its start at login names.
+#[test]
+fn an_agent_asked_to_quit_whose_end_cant_be_told_is_started_again() {
+    let u = user("Test");
+    let registry = MemoryRegistry::default();
+    let old: &[(&str, &[u8])] = &[(APP_EXE, b"app v1"), (AGENT_EXE, b"agent v1"), (AGENT_BG_EXE, b"agent-bg v1")];
+    install(&u.places, &registry, &Recorder::default(), old, &u.setup, &options(true)).unwrap();
+    let value = format!("\"{}\" run --log", u.places.dir().join(AGENT_BG_EXE).display());
+    registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, &value).unwrap();
+    let before = registry.values.lock().unwrap().clone();
+
+    let machine = Recorder { unknowable: true, ..Recorder::default() };
+    *machine.running.lock().unwrap() = true;
+    let e = install(&u.places, &registry, &machine, V2, &u.setup, &options(true)).unwrap_err();
+    assert!(e.contains("can't be told") && e.ends_with("The agent was started again."), "{e}");
+    assert_eq!(machine.asked(), ["close app", "stop agent", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
+    assert_eq!(*registry.values.lock().unwrap(), before);
+    assert_eq!(std::fs::read(u.places.dir().join(AGENT_EXE)).unwrap(), b"agent v1", "the files are the old ones");
+
+    machine.asked.lock().unwrap().clear();
+    let e = uninstall(&u.places, &registry, &machine, &u.setup).unwrap_err();
+    assert!(e.ends_with("The agent was started again."), "{e}");
+    assert_eq!(machine.asked(), ["close app", "stop agent", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
+    assert_eq!(*registry.values.lock().unwrap(), before);
+}
+
 /// BEAST's install, made by hand in `Programs\craft-cloud`: its agent starts at login from there. The new agent takes
 /// start at login over; the old files stay.
 #[test]
@@ -216,18 +283,26 @@ fn uninstall_takes_everything_away_but_the_files_and_the_sign_in() {
     registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, &format!("\"{}\" run --log", dir.join(AGENT_BG_EXE).display())).unwrap();
     registry.set_string(&u.places.run_key, APP_RUN_VALUE, &format!("\"{}\" --hidden", dir.join(APP_EXE).display())).unwrap();
     registry.set_string(&u.places.run_key, "Something else", r#""C:\Other\other.exe""#).unwrap();
+    std::fs::create_dir_all(&u.places.app_files).unwrap();
+    std::fs::write(u.places.app_files.join("window.lock"), "").unwrap();
+    let old_loose = u.places.app_files.with_file_name("craft-cloud-tray.port");
+    std::fs::write(&old_loose, "").unwrap();
     machine.asked.lock().unwrap().clear();
 
     uninstall(&u.places, &registry, &machine, &u.setup).unwrap();
     assert_eq!(machine.asked(), ["close app", "stop agent"]);
+    assert!(!u.places.app_files.exists() && !old_loose.exists(), "the app's single-instance files go, old names too");
     assert_eq!(registry.get(&u.places.run_key, AGENT_RUN_VALUE), None);
     assert_eq!(registry.get(&u.places.run_key, APP_RUN_VALUE), None);
     assert!(registry.get(&u.places.run_key, "Something else").is_some(), "other programs' values stay");
     assert_eq!(registry.get(&u.places.uninstall_key, "DisplayName"), None);
     assert!(!dir.exists() && !u.places.shortcut().exists());
     assert!(u.data.join("account.json").exists() && u.synced.join("notes.txt").exists());
-    // Again, with nothing there: fine.
+    // Again, with nothing there: fine. Something else in the app's folder stays, and so does the folder.
+    std::fs::create_dir_all(&u.places.app_files).unwrap();
+    std::fs::write(u.places.app_files.join("mine.txt"), "mine").unwrap();
     uninstall(&u.places, &registry, &machine, &u.setup).unwrap();
+    assert!(u.places.app_files.join("mine.txt").exists(), "only the app's own names are removed");
 
     // From "Apps & features": the setup in the folder runs; everything else goes now, the folder after it ends.
     install(&u.places, &registry, &machine, V2, &u.setup, &options(true)).unwrap();
@@ -279,6 +354,12 @@ fn a_running_agents_file_is_read_and_it_is_asked_to_quit() {
     assert!(!lists_agent(tasklist, 424));
     assert!(!lists_agent("\"notepad.exe\",\"4242\",\"Console\",\"1\",\"9,000 K\"", 4242), "a reused pid is another program");
     assert!(!lists_agent("INFO: No tasks are running which match the specified criteria.", 4242));
+    // Only an answer counts: a tasklist that can't run, fails or says nothing isn't an agent that has ended.
+    assert_eq!(tasklist_says(Ok((true, tasklist.into())), 4242), Ok(true));
+    assert_eq!(tasklist_says(Ok((true, "INFO: No tasks are running which match the specified criteria.\r\n".into())), 4242), Ok(false));
+    assert!(tasklist_says(Err("not found".into()), 4242).is_err());
+    assert!(tasklist_says(Ok((false, String::new())), 4242).is_err());
+    assert!(tasklist_says(Ok((true, " \r\n".into())), 4242).is_err());
 
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -389,4 +470,83 @@ fn the_start_menu_shortcut_is_a_shell_link() {
     crate::windows::ThisMachine.shortcut(&lnk, &target).unwrap();
     let bytes = std::fs::read(&lnk).unwrap();
     assert_eq!(bytes[..4], [0x4c, 0, 0, 0], "a shell link starts with its header size");
+}
+
+/// Waits (up to 30 s) for `done`; whether it came.
+#[cfg(windows)]
+fn comes(done: impl Fn() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !done() {
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    true
+}
+
+/// A program the setup starts (the agent) shares none of its handles: with the setup's output a pipe (as from WSL),
+/// the pipe ends with the start, not with the program, which runs on.
+#[cfg(windows)]
+#[test]
+fn a_detached_start_keeps_none_of_the_setups_handles() {
+    let dir = tempfile::tempdir().unwrap();
+    let done = dir.path().join("done.txt");
+    let cmd = std::env::var_os("ComSpec").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+    // Twenty seconds of `ping`, then a file.
+    let args = format!("/d /c ping -n 21 127.0.0.1 >nul & echo done> \"{}\"", done.display());
+    let started = std::time::Instant::now();
+    let out = crate::windows::start_detached(&cmd, &args, dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    // PowerShell's own start may take seconds on a cold machine; the program runs twenty.
+    assert!(started.elapsed() < std::time::Duration::from_secs(15), "the pipe stayed open while the program ran: {:?}", started.elapsed());
+    assert!(!done.exists(), "it runs on");
+    assert!(comes(|| done.exists()), "and it was started");
+}
+
+/// Uninstalling from "Apps & features": the program folder goes once the setup in it has ended, however long its
+/// last message stayed open (here a `ping` of seven seconds stands for the setup), not after a fixed delay. Through
+/// PowerShell, and through `cmd` alone (where PowerShell can't run). A link inside the folder is removed, not followed.
+#[cfg(windows)]
+#[test]
+fn the_program_folder_goes_once_the_setup_has_ended() {
+    for with_cmd in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("Craft & Cloud");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), "keep").unwrap();
+        std::fs::write(dir.join(SETUP_EXE), "setup").unwrap();
+        std::fs::write(dir.join("sub").join("file.txt"), "file").unwrap();
+        let junction = std::process::Command::new(crate::windows::system_program("cmd.exe"))
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(dir.join("link"))
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(junction.status.success(), "{junction:?}");
+        let mut setup = std::process::Command::new(crate::windows::system_program("PING.EXE"))
+            .args(["-n", "8", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut remover = if with_cmd {
+            crate::windows::remove_after_with_cmd(setup.id(), "ping.exe", &dir)
+        } else {
+            crate::windows::remove_after(setup.id(), &dir)
+        }
+        .spawn()
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        assert!(dir.join(SETUP_EXE).exists(), "not while the setup runs (cmd: {with_cmd})");
+        setup.wait().unwrap();
+        remover.wait().unwrap();
+        assert!(!dir.exists(), "gone once it has ended (cmd: {with_cmd})");
+        assert!(outside.join("keep.txt").exists(), "the link wasn't followed (cmd: {with_cmd})");
+    }
 }

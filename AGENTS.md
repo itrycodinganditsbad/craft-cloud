@@ -138,6 +138,8 @@ cargo xtask ci              # fmt --check, licenses, clippy -D warnings, test
 ```
 
 Or piecemeal: `cargo test -p <crate>`, `cargo clippy -p <crate> --all-targets -- -D warnings`.
+The app's Linux tray tests run a private D-Bus and need `dbus-daemon`; without it they skip, and CI
+(`CRAFT_CLOUD_REQUIRE_BACKENDS=1`) fails them.
 
 ## 5. Versions
 
