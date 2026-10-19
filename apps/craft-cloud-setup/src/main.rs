@@ -94,5 +94,5 @@ fn run(args: &Args) -> Result<(), String> {
 
 #[cfg(not(windows))]
 fn run(_args: &Args) -> Result<(), String> {
-    Err("craft-cloud-setup is Windows' installer; on this system use the package for it (see the README)".into())
+    Err("craft-cloud-setup is Windows' installer; on this system use the package for it (see docs/install.md)".into())
 }
