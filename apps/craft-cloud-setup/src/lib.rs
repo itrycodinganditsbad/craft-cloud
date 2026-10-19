@@ -146,6 +146,8 @@ pub trait Machine {
     fn shortcut(&self, lnk: &Path, target: &Path) -> Result<(), String>;
     /// Removes the folder `dir` once this process has ended (it holds this setup's own exe).
     fn remove_after_exit(&self, dir: &Path) -> Result<(), String>;
+    /// Whether the process `pid` runs (any program); `true` when that can't be told.
+    fn process_runs(&self, pid: u32) -> bool;
     /// Renames (moves) `from` to `to` in one step, which fails as a whole: on Windows a file a program holds open (or
     /// a folder with one in it) can't be moved, so a failure leaves everything where it was. (A running exe can be.)
     fn rename(&self, from: &Path, to: &Path) -> Result<(), String> {
@@ -260,6 +262,7 @@ fn install_stopped(
     let dir = places.dir();
     let old = places.programs.join(OLD_DIR_NAME);
     let mut warnings = Vec::new();
+    clear_leftovers(places, machine, true);
     std::fs::create_dir_all(&dir).map_err(io(&dir))?;
     for (name, bytes) in payload {
         write_replacing(&dir.join(name), bytes)?;
@@ -356,6 +359,7 @@ fn uninstall_stopped(
     removed_values: &mut Vec<(&'static str, String)>,
 ) -> Result<(), String> {
     let dir = places.dir();
+    clear_leftovers(places, machine, false);
     for value in [AGENT_RUN_VALUE, APP_RUN_VALUE] {
         if let Some(v) = registry.get(&places.run_key, value).filter(|v| starts_from(v, &dir)) {
             registry.remove_value(&places.run_key, value)?;
@@ -395,21 +399,58 @@ fn remove_program_folder(places: &Places, machine: &dyn Machine, running: &Path)
             }
             let to = aside.join(path.file_name().unwrap_or_default());
             if let Err(e) = machine.rename(&path, &to) {
+                let mut stranded = Vec::new();
                 for (from, to) in moved.iter().rev() {
-                    let _ = machine.rename(to.as_path(), from.as_path());
+                    if machine.rename(to, from).is_err() {
+                        stranded.push(from.file_name().unwrap_or_default().to_string_lossy().into_owned());
+                    }
                 }
                 let _ = std::fs::remove_dir(&aside);
-                return Err(e);
+                if stranded.is_empty() {
+                    return Err(e);
+                }
+                return Err(format!(
+                    "{e}; and {} couldn't be moved back from {} (the next run of the setup puts them back)",
+                    stranded.join(", "),
+                    aside.display()
+                ));
             }
             moved.push((path, to));
         }
     } else {
         machine.rename(&dir, &aside)?;
     }
+    // Past the point of no return: what can't be deleted now or after the setup is a leftover the next run removes.
     if remove_patiently(&aside, places.patience).is_err() {
-        machine.remove_after_exit(&aside)?;
+        let _ = machine.remove_after_exit(&aside);
     }
     if running_inside { machine.remove_after_exit(&dir) } else { Ok(()) }
+}
+
+/// Folders an earlier uninstall moved aside (`<folder>.removing-<pid>`) and left behind, its setup no longer running:
+/// a roll-back that couldn't finish, or a delete that couldn't. On install (`restore`), every file the program folder
+/// lacks is moved back into it first; then, and on uninstall, the leftover is deleted (best effort).
+fn clear_leftovers(places: &Places, machine: &dyn Machine, restore: bool) {
+    let dir = places.dir();
+    let prefix = format!("{DIR_NAME}.removing-");
+    let Ok(entries) = std::fs::read_dir(&places.programs) else { return };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix(&prefix).and_then(|pid| pid.parse::<u32>().ok()) else { continue };
+        if pid == std::process::id() || machine.process_runs(pid) {
+            continue;
+        }
+        let leftover = entry.path();
+        if restore && std::fs::create_dir_all(&dir).is_ok() {
+            for file in std::fs::read_dir(&leftover).into_iter().flatten().filter_map(Result::ok) {
+                let back = dir.join(file.file_name());
+                if !back.exists() {
+                    let _ = machine.rename(&file.path(), &back);
+                }
+            }
+        }
+        let _ = remove_patiently(&leftover, places.patience);
+    }
 }
 
 /// The uninstall failed (`failure`) after the agent was stopped and maybe its start at login removed: while the

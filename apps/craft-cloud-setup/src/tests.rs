@@ -15,6 +15,9 @@ struct Recorder {
     unknowable: bool,
     /// Moving a file or folder fails (one is still in use).
     rename_fails: bool,
+    /// Only the move with this number (from 1) fails.
+    rename_fails_at: Option<usize>,
+    renames: Mutex<usize>,
     /// Where `autostart on` writes the agent's Run value, as the agent does (for the program it was run as)…
     registry: Option<(Arc<MemoryRegistry>, String)>,
     /// …unless an old agent still running answered it and registered itself.
@@ -73,8 +76,16 @@ impl Machine for Recorder {
         self.note(format!("remove after exit {}", dir.display()));
         Ok(())
     }
+    fn process_runs(&self, _pid: u32) -> bool {
+        false
+    }
     fn rename(&self, from: &Path, to: &Path) -> Result<(), String> {
-        if self.rename_fails {
+        let number = {
+            let mut renames = self.renames.lock().unwrap();
+            *renames += 1;
+            *renames
+        };
+        if self.rename_fails || self.rename_fails_at == Some(number) {
             return Err(format!("{} can't be moved (is it still running?)", from.display()));
         }
         std::fs::rename(from, to).map_err(|e| e.to_string())
@@ -255,6 +266,94 @@ fn an_uninstall_with_a_file_still_held_leaves_the_folder_whole_and_puts_the_agen
         let siblings: Vec<_> = std::fs::read_dir(&u.places.programs).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(siblings, [DIR_NAME], "nothing left aside");
     }
+}
+
+/// From "Apps & features" (the setup runs from the folder) the files move one by one: the third can't, so the two
+/// moved come back, the Run values are put back and the agent is started again.
+#[test]
+fn a_move_that_fails_partway_puts_the_moved_files_back() {
+    let u = user("Test");
+    let registry = MemoryRegistry::default();
+    install(&u.places, &registry, &Recorder::default(), V2, &u.setup, &options(false)).unwrap();
+    let dir = u.places.dir();
+    let value = format!("\"{}\" run --log", dir.join(AGENT_BG_EXE).display());
+    registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, &value).unwrap();
+    let before = registry.values.lock().unwrap().clone();
+    let machine = Recorder { rename_fails_at: Some(3), ..Recorder::default() };
+    *machine.running.lock().unwrap() = true;
+    let e = uninstall(&u.places, &registry, &machine, &dir.join(SETUP_EXE)).unwrap_err();
+    assert!(e.contains("can't be moved") && !e.contains("couldn't be moved back") && e.ends_with("Start at login was put back."), "{e}");
+    assert_eq!(*machine.renames.lock().unwrap(), 5, "two moves, the failed third, two moves back");
+    assert_eq!(machine.asked(), ["close app", "stop agent", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
+    assert_eq!(*registry.values.lock().unwrap(), before);
+    for (file, bytes) in V2 {
+        assert_eq!(std::fs::read(dir.join(file)).unwrap(), *bytes, "{file} is back");
+    }
+    let siblings: Vec<_> = std::fs::read_dir(&u.places.programs).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(siblings, [DIR_NAME], "nothing left aside");
+
+    // Moves back that fail too: the two files left aside are named.
+    let e = uninstall(&u.places, &registry, &FailingBack(Recorder::default()), &dir.join(SETUP_EXE)).unwrap_err();
+    let (_, stranded) = e.split_once("; and ").unwrap();
+    assert_eq!(V2.iter().filter(|(file, _)| stranded.contains(file)).count(), 2, "{e}");
+    assert!(e.contains("the next run of the setup puts them back"), "{e}");
+}
+
+/// A machine whose third move fails, and every move after it.
+struct FailingBack(Recorder);
+
+impl Machine for FailingBack {
+    fn stop_agent(&self, data: &Path) -> AgentStop {
+        self.0.stop_agent(data)
+    }
+    fn close_app(&self) {}
+    fn run_agent(&self, agent: &Path, args: &[&str]) -> Result<(), String> {
+        self.0.run_agent(agent, args)
+    }
+    fn start_agent(&self, agent_bg: &Path, data: &Path) -> Result<(), String> {
+        self.0.start_agent(agent_bg, data)
+    }
+    fn shortcut(&self, lnk: &Path, target: &Path) -> Result<(), String> {
+        self.0.shortcut(lnk, target)
+    }
+    fn remove_after_exit(&self, dir: &Path) -> Result<(), String> {
+        self.0.remove_after_exit(dir)
+    }
+    fn process_runs(&self, _pid: u32) -> bool {
+        false
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<(), String> {
+        let mut renames = self.0.renames.lock().unwrap();
+        *renames += 1;
+        if *renames >= 3 {
+            return Err(format!("{} can't be moved", from.display()));
+        }
+        std::fs::rename(from, to).map_err(|e| e.to_string())
+    }
+}
+
+/// A folder an earlier uninstall left aside (its setup gone) holding the agent's exe the program folder lacks: the
+/// next install moves it back first and installs over it; the leftover is gone. An uninstall just deletes one.
+#[test]
+fn a_leftover_aside_folder_is_restored_by_install_and_removed_by_uninstall() {
+    let u = user("Test");
+    let registry = MemoryRegistry::default();
+    install(&u.places, &registry, &Recorder::default(), V2, &u.setup, &options(false)).unwrap();
+    let dir = u.places.dir();
+    let leftover = dir.with_file_name(format!("{DIR_NAME}.removing-4000000"));
+    std::fs::create_dir_all(&leftover).unwrap();
+    std::fs::rename(dir.join(AGENT_BG_EXE), leftover.join(AGENT_BG_EXE)).unwrap();
+    std::fs::write(leftover.join("notes.txt"), "kept by an older version").unwrap();
+    // The install's payload lacks notes.txt: only a file moved back can be there afterwards.
+    install(&u.places, &registry, &Recorder::default(), V2, &u.setup, &options(false)).unwrap();
+    assert!(!leftover.exists(), "the leftover is gone");
+    assert_eq!(std::fs::read(dir.join(AGENT_BG_EXE)).unwrap(), b"agent-bg v2");
+    assert!(dir.join("notes.txt").is_file(), "what the folder lacked was moved back");
+
+    std::fs::create_dir_all(&leftover).unwrap();
+    std::fs::write(leftover.join(AGENT_EXE), "old").unwrap();
+    uninstall(&u.places, &registry, &Recorder::default(), &u.setup).unwrap();
+    assert!(!leftover.exists() && !dir.exists());
 }
 
 /// The agent accepts the quit, then tasklist fails: the install and the uninstall stop with nothing else changed,
@@ -625,5 +724,10 @@ fn the_cmd_remover_waits_while_tasklist_cant_tell() {
     remover.wait().unwrap();
     assert!(started.elapsed() >= std::time::Duration::from_secs(2), "it waited each round (a broken line ends at once): {:?}", started.elapsed());
     assert!(dir.join(SETUP_EXE).exists(), "nothing was removed while it couldn't tell");
-    let _ = std::fs::remove_file(std::env::temp_dir().join(format!("craft-cloud-uninstall-{}.txt", std::process::id())));
+    let mine = format!("craft-cloud-uninstall-{}-", std::process::id());
+    for file in std::fs::read_dir(std::env::temp_dir()).unwrap().filter_map(Result::ok) {
+        if file.file_name().to_string_lossy().starts_with(&mine) {
+            let _ = std::fs::remove_file(file.path());
+        }
+    }
 }

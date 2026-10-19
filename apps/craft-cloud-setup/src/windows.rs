@@ -96,7 +96,10 @@ fn remove_after_with_cmd_using(tasklist: &Path, rounds: u32, pid: u32, image: &s
         tasklist = tasklist.display(),
         find = find.display()
     );
-    let tasks = std::env::temp_dir().join(format!("craft-cloud-uninstall-{pid}.txt"));
+    // One file per remover: two may run at once (the moved-aside folder's and the program folder's).
+    static REMOVERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = REMOVERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tasks = std::env::temp_dir().join(format!("craft-cloud-uninstall-{pid}-{n}.txt"));
     let mut command = quiet(&system_program("cmd.exe"));
     command.raw_arg(line).env("CRAFT_CLOUD_DIR", dir).env("CRAFT_CLOUD_TASKS", tasks);
     detached_from(command, dir)
@@ -279,6 +282,17 @@ impl Machine for ThisMachine {
         .status()
         .map_err(|e| format!("powershell: {e}"))?;
         if status.success() && lnk.exists() { Ok(()) } else { Err(format!("the shortcut wasn't written ({status})")) }
+    }
+
+    fn process_runs(&self, pid: u32) -> bool {
+        let out = quiet(&system_program("tasklist.exe")).args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]).stdout(Stdio::piped()).output();
+        match out {
+            Ok(out) if out.status.success() && !out.stdout.is_empty() => {
+                String::from_utf8_lossy(&out.stdout).lines().any(|line| line.split("\",\"").nth(1) == Some(pid.to_string().as_str()))
+            }
+            // Can't tell: taken as running, so nothing of it is touched.
+            _ => true,
+        }
     }
 
     fn remove_after_exit(&self, dir: &Path) -> Result<(), String> {
