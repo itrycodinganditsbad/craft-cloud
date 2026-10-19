@@ -96,9 +96,10 @@ const PUSH_PART: usize = 64 * 1024;
 /// first). With delivery within a tick, a part goes twice only when two machines draw the same lowest wait: about 1 in
 /// this many per other machine.
 const PUSH_PATIENCE: u32 = 8;
-/// The Loro peers of this machine's latest runs a push counts as its own (older ones count as others': they still go
-/// up, after a wait). One per run, so without a cap the list would grow for good.
-const MAX_OWN_PEERS: usize = 16;
+/// The Loro peers a push counts as this machine's own, latest first: its own copy's in its latest runs, and those its
+/// apps wrote a document of a file as (older ones count as others': they still go up, after a wait). A few per run, so
+/// without a cap the list would grow for good.
+const MAX_OWN_PEERS: usize = 64;
 /// Heals of one document in a run after which its push stops (the same state fails the same way again).
 const MAX_HEALS: u32 = 2;
 /// The format of a document of a file's file (`.doc`).
@@ -640,17 +641,38 @@ impl Doc {
                 continue;
             }
             let own = self.pending.remove(i);
-            let sent = self.sent.remove(&own.client_seq);
-            match own.acked {
-                Some(n) if n > self.have.upto => {
-                    self.back_acked.insert(n, own.bytes);
-                }
-                Some(_) => {}
-                None if sent => {
-                    self.taken_back.insert(own.client_seq, own.bytes);
-                }
-                None => {}
+            self.stored(own);
+        }
+    }
+
+    /// An unacked update, out of the list, is stored (the log holds its operations): an ack that came for it already
+    /// is kept until the rows below it are here, one on its way is counted when it comes.
+    fn stored(&mut self, own: Pending) {
+        let sent = self.sent.remove(&own.client_seq);
+        match own.acked {
+            Some(n) if n > self.have.upto => {
+                self.back_acked.insert(n, own.bytes);
             }
+            Some(_) => {}
+            None if sent => {
+                self.taken_back.insert(own.client_seq, own.bytes);
+            }
+            None => {}
+        }
+        self.dirty = true;
+    }
+
+    /// `bytes` (an update or snapshot) were written by this machine's apps: their peers are its own in a push (which
+    /// sends its own operations without a wait).
+    fn own(&mut self, bytes: &[u8]) {
+        let Some(ranges) = spans_of(bytes) else { return };
+        for (peer, start, end) in ranges {
+            if start >= end || self.own_peers.first() == Some(&peer) {
+                continue;
+            }
+            self.own_peers.retain(|p| *p != peer);
+            self.own_peers.insert(0, peer);
+            self.own_peers.truncate(MAX_OWN_PEERS);
             self.dirty = true;
         }
     }
@@ -1023,8 +1045,15 @@ impl Doc {
             }
             Ok(None) => {
                 let has = self.pushing.take().unwrap_or_default();
-                // (One acked above what is had stays: it is counted when the numbers below it come.)
-                self.pending.retain(|p| p.acked.is_some() || !spans_of(&p.bytes).is_some_and(|ranges| held_by(&has, &ranges)));
+                // (One acked above what is had stays: it is counted when the numbers below it come. One sent and not
+                // acked yet is counted when its ack comes.)
+                let (held, keep): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut self.pending)
+                    .into_iter()
+                    .partition(|p| p.acked.is_none() && spans_of(&p.bytes).is_some_and(|ranges| held_by(&has, &ranges)));
+                self.pending = keep;
+                for own in held {
+                    self.stored(own);
+                }
                 self.dirty = true;
                 send_pending(id, self)
             }
@@ -1695,10 +1724,13 @@ impl<S: DocStore> Replica<S> {
         }
         doc.next_client_seq = client_seq.saturating_add(1);
         doc.pending.push(Pending { client_seq, bytes: bytes.to_vec(), acked: None, push: false });
+        doc.own(bytes);
         doc.dirty = true;
         let (up, epoch) = (self.link == Link::Up, self.epoch);
         Ok(match doc.sub {
-            Sub::Live if doc.full.is_none() && doc.pushing.is_none() => {
+            // (During a push too: an app's change goes at once, not behind the push's parts. Its operations count as
+            // in the log for the push once it is acked.)
+            Sub::Live if doc.full.is_none() => {
                 doc.sent.insert(client_seq);
                 vec![ClientFrame::Update { doc: id, client_seq, bytes: bytes.to_vec() }]
             }
@@ -2317,6 +2349,8 @@ impl<S: DocStore> Replica<S> {
             Ok(body) => {
                 doc.body = body;
                 doc.own_peers = vec![peer];
+                // The import is this machine's app's.
+                doc.own(&snapshot);
                 let version = version_of(&snapshot).unwrap_or_default();
                 let ranges: Vec<(u64, i32, i32)> = version.iter().map(|(peer, end)| (*peer, 0, *end)).collect();
                 doc.saw(&ranges);
@@ -3263,6 +3297,42 @@ mod tests {
             assert!(text.contains("<kept>"), "{how:?}: an acked change is lost: {text:?}");
             assert!(!text.contains("<refused>"), "{how:?}: a refused change came back: {text:?}");
         }
+    }
+
+    /// After a restore (a new epoch) a document goes up whole: what this machine's apps wrote is its own, so it goes
+    /// at once (no random wait), and a change an app makes meanwhile goes at once too, not behind the push.
+    #[test]
+    fn an_apps_changes_are_its_machines_own_in_a_push() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        // This machine's app imported the file (peer 40) and then edited it (peer 50).
+        let app_doc = text_doc(40);
+        insert(&app_doc, 0, "import");
+        let import = app_doc.export(loro::ExportMode::Snapshot).unwrap();
+        let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+        r.connected();
+        r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        let (id, _, _) = r.open_document(node, &app());
+        r.on_frame(ServerFrame::error("not_found", "no such document", Some(id), None)).unwrap();
+        assert!(r.take_events().contains(&DocEvent::NeedsImport(id)));
+        let frames = r.import_document(id, &import).unwrap();
+        assert!(matches!(frames.as_slice(), [ClientFrame::CreateDocument { .. }]), "{frames:?}");
+        r.on_frame(ServerFrame::CreatedDocument { doc: id, kept: true }).unwrap();
+        r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
+        let d = text_doc(50);
+        d.import(&import).unwrap();
+        r.local_update(id, &insert(&d, 0, "<mine>")).unwrap();
+        r.on_frame(ServerFrame::Ack { doc: id, client_seq: 1, seq: 1 }).unwrap();
+        // The server is restored from a backup that has none of it.
+        r.disconnected();
+        r.connected();
+        let frames = r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(2) }).unwrap();
+        assert!(frames.iter().any(|f| matches!(f, ClientFrame::Subscribe { after: 0, .. })), "{frames:?}");
+        let frames = r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
+        assert!(frames.iter().any(|f| matches!(f, ClientFrame::Update { .. })), "its own goes up at once: {frames:?}");
+        // A change its app makes meanwhile goes at once too, not behind the push.
+        let typed = r.local_update(id, &insert(&d, 0, "<typed>")).unwrap();
+        assert!(matches!(typed.as_slice(), [ClientFrame::Update { .. }]), "{typed:?}");
     }
 
     /// A document read back from its file after a refused change (its journal failed) is followed again at the next
