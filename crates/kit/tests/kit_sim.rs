@@ -101,6 +101,39 @@ fn run_seed(seed: u64) {
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+    // The file catches up on its own: one window saves, then each saves while its file is behind (as an app's
+    // autosave does), and soon none is; the file then has the version every session has.
+    if let Ok(point) = sessions[0].save_point() {
+        sessions[0].record(&point, b"healed");
+    }
+    let (mut saves, mut quiet) = (0usize, 0);
+    while quiet < 30 {
+        let mut saved = false;
+        for s in &mut sessions {
+            s.poll();
+            if s.file_behind()
+                && let Ok(point) = s.save_point()
+            {
+                s.record(&point, format!("caught up {saves}").as_bytes());
+                saves += 1;
+                saved = true;
+            }
+        }
+        quiet = if saved { 0 } else { quiet + 1 };
+        assert!(Instant::now() < deadline + Duration::from_secs(30), "seed {seed}: the file never caught up ({saves} saves)");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(saves <= sessions.len(), "seed {seed}: {saves} saves to catch up");
+    let version = |s: &Session<TestApp>| {
+        let doc = loro::LoroDoc::new();
+        doc.import(&s.snapshot().unwrap()).unwrap();
+        let mut v: Vec<(u64, u32)> = doc.oplog_vv().iter().map(|(p, c)| (*p, u32::try_from(*c).unwrap())).collect();
+        v.sort_unstable();
+        v
+    };
+    for (i, s) in sessions.iter().enumerate() {
+        assert_eq!(hub.file(PATH), Some(version(s)), "seed {seed}: session {i}'s edits aren't all in the file");
+    }
     for (i, s) in sessions.iter().enumerate() {
         if let Err(why) = valid(s.model()) {
             panic!("seed {seed}: session {i}'s model isn't one the app could make: {why}");
