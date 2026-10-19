@@ -102,12 +102,13 @@ impl DiskStore {
         let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let to = self.dir.join(format!("{name}{suffix}{ASIDE}{stamp:013}-{count:08}-{}", crate::account::random_hex(4)?));
         write_atomic(&to, &bytes, true)?;
-        // Oldest first: the name sorts by its time.
+        // Oldest first: the name sorts by its time. Each kind of file keeps its own few.
+        let kind = format!("{suffix}{ASIDE}");
         let mut aside: Vec<(String, PathBuf)> = std::fs::read_dir(&self.dir)?
             .filter_map(Result::ok)
             .filter_map(|e| {
                 let file = e.file_name().to_str()?.to_owned();
-                let at = file.find(ASIDE)?;
+                let at = file.find(&kind)?;
                 Some((file[at..].to_owned(), e.path()))
             })
             .collect();
@@ -158,29 +159,7 @@ impl DocStore for DiskStore {
     }
 
     fn set_aside(&mut self, name: &str) -> io::Result<String> {
-        let bytes = std::fs::read(self.dir.join(format!("{name}{SUFFIX}")))?;
-        // Unique: the time, then random bytes (two in one millisecond, or a clock gone back, don't collide). Written
-        // like a document (temporary file, fsync, rename, folder fsync).
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
-        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let to = self.dir.join(format!("{name}{SUFFIX}{ASIDE}{stamp:013}-{count:08}-{}", crate::account::random_hex(4)?));
-        write_atomic(&to, &bytes, true)?;
-        // Oldest first: the name sorts by its time.
-        let mut aside: Vec<(String, PathBuf)> = std::fs::read_dir(&self.dir)?
-            .filter_map(Result::ok)
-            .filter_map(|e| {
-                let file = e.file_name().to_str()?.to_owned();
-                let at = file.find(ASIDE)?;
-                Some((file[at..].to_owned(), e.path()))
-            })
-            .collect();
-        aside.sort();
-        let extra = aside.len().saturating_sub(MAX_SET_ASIDE);
-        for (_, path) in aside.into_iter().take(extra) {
-            std::fs::remove_file(path)?;
-        }
-        Ok(to.display().to_string())
+        self.set_aside_suffix(name, SUFFIX)
     }
 
     fn remove(&mut self, name: &str) -> io::Result<()> {
@@ -434,6 +413,27 @@ impl DocStore for MemStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recents files and documents of files each keep their own few set-aside copies: many of one kind never push out
+    /// the other's.
+    #[test]
+    fn recents_and_documents_keep_set_aside_copies_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DiskStore::open(dir.path()).unwrap();
+        store.save("recents", b"damaged list").unwrap();
+        store.save_document("doc", b"damaged document").unwrap();
+        store.set_aside("recents").unwrap();
+        for _ in 0..MAX_SET_ASIDE + 2 {
+            store.set_aside_document("doc").unwrap();
+        }
+        let aside: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().to_str().map(str::to_owned))
+            .filter(|n| n.contains(ASIDE))
+            .collect();
+        assert_eq!(aside.iter().filter(|n| n.contains(&format!("{SUFFIX}{ASIDE}"))).count(), 1, "the recents copy stays: {aside:?}");
+        assert_eq!(aside.iter().filter(|n| n.contains(&format!("{DOCUMENT_SUFFIX}{ASIDE}"))).count(), MAX_SET_ASIDE, "{aside:?}");
+    }
 
     /// Setting a file aside copies it (renaming would lose the document to a crash until the next load rebuilt it), the
     /// original stays until the caller writes over it, names are unique (not just by the millisecond), and only the

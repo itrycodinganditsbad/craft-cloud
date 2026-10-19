@@ -122,7 +122,12 @@ pub struct LiveHub {
     subscriptions: Mutex<HashMap<DeviceId, usize>>,
     revoked: broadcast::Sender<DeviceId>,
     compactions: Mutex<HashMap<(SpaceId, DocId), Compaction>>,
+    /// Each device's presence budget per document, across its connections.
+    presence_budgets: Mutex<HashMap<(DeviceId, DocId), Budget>>,
 }
+
+/// Presence budgets kept at most (a full one is as good as none, and goes first).
+const MAX_PRESENCE_BUDGETS: usize = 100_000;
 
 impl Default for LiveHub {
     fn default() -> Self {
@@ -133,6 +138,7 @@ impl Default for LiveHub {
             subscriptions: Mutex::default(),
             revoked: broadcast::channel(64).0,
             compactions: Mutex::default(),
+            presence_budgets: Mutex::default(),
         }
     }
 }
@@ -238,6 +244,16 @@ impl LiveHub {
         true
     }
 
+    /// Whether `device` may send one more presence message for `doc` now (`per_sec` a second, across its connections).
+    fn spend_presence(&self, device: DeviceId, doc: DocId, per_sec: u32) -> bool {
+        let mut all = self.presence_budgets.lock().unwrap_or_else(PoisonError::into_inner);
+        if all.len() >= MAX_PRESENCE_BUDGETS {
+            // The ones refilled to the full are no different from new ones.
+            all.retain(|_, budget| !budget.is_full());
+        }
+        all.entry((device, doc)).or_insert_with(|| Budget::of(per_sec, per_sec)).spend()
+    }
+
     /// `doc` was compacted: a later request may go to any device again.
     fn compacted(&self, space: SpaceId, doc: DocId) {
         self.compactions.lock().unwrap_or_else(PoisonError::into_inner).remove(&(space, doc));
@@ -273,6 +289,11 @@ impl Budget {
     fn of(burst: u32, per_sec: u32) -> Self {
         let burst = f64::from(burst);
         Self { tokens: burst, at: Instant::now(), burst, per_sec: f64::from(per_sec) }
+    }
+
+    /// Whether it has refilled to the full by now.
+    fn is_full(&self) -> bool {
+        self.tokens + Instant::now().saturating_duration_since(self.at).as_secs_f64() * self.per_sec >= self.burst
     }
 
     fn spend(&mut self) -> bool {
@@ -327,8 +348,6 @@ pub struct Session {
     /// Documents with updates the agent may not have been sent yet.
     dirty: BTreeSet<DocId>,
     budget: Budget,
-    /// Presence budgets, per subscribed document.
-    presence: HashMap<DocId, Budget>,
     /// The `upto` this session's agent was asked to compact each document at: only that snapshot is taken from it.
     asked: BTreeMap<DocId, u64>,
 }
@@ -362,7 +381,6 @@ impl Session {
             subscriptions: BTreeMap::new(),
             dirty: BTreeSet::new(),
             budget,
-            presence: HashMap::new(),
             asked: BTreeMap::new(),
         }
     }
@@ -419,7 +437,6 @@ impl Session {
                     release(&self.state.live.subscriptions, self.device, 1);
                 }
                 self.dirty.remove(&doc);
-                self.presence.remove(&doc);
                 Reply::default()
             }
             ClientFrame::Update { doc, client_seq, bytes } => match self.update(doc, client_seq, bytes).await {
@@ -495,13 +512,13 @@ impl Session {
         }
     }
 
-    /// `presence {doc, bytes}`: relayed to the document's other subscribers, within the budget (over it, dropped).
+    /// `presence {doc, bytes}`: relayed to the document's other subscribers, within the device's budget for the
+    /// document (across its connections) and the connection's frame budget (over either, dropped).
     fn presence(&mut self, doc: DocId, bytes: Vec<u8>) {
         if !self.subscriptions.contains_key(&doc) {
             return;
         }
-        let per_sec = self.state.limits.presence_per_sec;
-        if !self.presence.entry(doc).or_insert_with(|| Budget::of(per_sec, per_sec)).spend() {
+        if !self.state.live.spend_presence(self.device, doc, self.state.limits.presence_per_sec) || !self.budget.spend() {
             return;
         }
         self.state.live.publish_presence(self.space, PresenceNote { doc, bytes: Arc::new(bytes), from: self.id });
@@ -1494,6 +1511,30 @@ mod tests {
         assert!(heard.try_recv().is_err());
         assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap().head, 0, "nothing stored");
         assert!(a.meta.live_updates(a.user.space, doc, 0, 10).await.unwrap().is_empty());
+    }
+
+    /// Presence is budgeted per device and document, across the device's connections: two connections of one device
+    /// share its 20 a second.
+    #[tokio::test]
+    async fn presence_is_budgeted_per_device_across_its_connections() {
+        let mut a = Account::new(crate::state::Limits { presence_per_sec: 20, ..Default::default() }).await;
+        let (mut pc, auth) = a.session(2).await;
+        let doc = imported(&a, &mut pc, &auth, &[1; 10]).await;
+        // A second connection of the same device.
+        let mut again = Session::new(a.state.clone(), &auth);
+        again.handle(ClientFrame::Hello { min: 1, max: 2 }).await;
+        again.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
+        drain(&mut again).await;
+        let mut heard = a.state.live.listen_presence(a.user.space);
+        for i in 0..15u8 {
+            pc.handle(ClientFrame::Presence { doc, bytes: vec![i] }).await;
+            again.handle(ClientFrame::Presence { doc, bytes: vec![i] }).await;
+        }
+        let mut relayed = 0;
+        while heard.try_recv().is_ok() {
+            relayed += 1;
+        }
+        assert_eq!(relayed, 20, "the device's 20, not 20 per connection");
     }
 
     /// The admin's reset drops the snapshot with the log; a machine that knew the document before (at 3, base 4 now)

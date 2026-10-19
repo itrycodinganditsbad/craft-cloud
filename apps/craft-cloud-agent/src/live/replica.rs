@@ -3708,6 +3708,55 @@ mod tests {
         assert!(matches!(typed.as_slice(), [ClientFrame::Update { .. }]), "{typed:?}");
     }
 
+    /// A journal is written into its document's file at the next write once it holds over [`MAX_JOURNAL_BYTES`], not
+    /// before (the file is written now and then besides).
+    #[test]
+    fn a_journal_past_its_cap_is_written_into_the_file() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let (mut r, id, import) = joined(&store, space, node);
+        let d = text_doc(50);
+        d.import(&import).unwrap();
+        let name = id.to_string();
+        let big = "x".repeat(900_000);
+        for i in 0..4 {
+            r.local_update(id, &put(&d, i, &big)).unwrap();
+        }
+        let held = store.journals().get(&name).map_or(0, Vec::len);
+        assert!(held < MAX_JOURNAL_BYTES, "{held}");
+        r.flush().unwrap();
+        assert_eq!(store.journals().get(&name).map_or(0, Vec::len), held, "under the cap: left for the next write");
+        r.local_update(id, &put(&d, 4, &big)).unwrap();
+        assert!(store.journals().get(&name).map_or(0, Vec::len) > MAX_JOURNAL_BYTES);
+        r.flush().unwrap();
+        assert_eq!(store.journals().get(&name).map_or(0, Vec::len), 0, "over it: written into the file");
+    }
+
+    /// A catch-up's updates are taken a batch at a time: once more than [`MAX_BATCH_BYTES`] wait, they are taken
+    /// before `subscribed`.
+    #[test]
+    fn a_catch_up_batch_is_taken_past_its_cap() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let (mut r, id, import) = joined(&store, space, node);
+        r.disconnected();
+        r.connected();
+        r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        let other = text_doc(60);
+        other.import(&import).unwrap();
+        let big = "y".repeat(1_000_000);
+        let mut batched = 0;
+        let mut seq = 0;
+        while batched <= MAX_BATCH_BYTES {
+            let row = put(&other, seq, &big);
+            batched += row.len();
+            seq += 1;
+            assert!(r.describe_doc(id).contains("upto 0"), "not taken at {batched} bytes: {}", r.describe_doc(id));
+            r.on_frame(ServerFrame::Update { doc: id, seq, bytes: row, device: device() }).unwrap();
+        }
+        assert!(r.describe_doc(id).contains(&format!("upto {seq}")), "taken past the cap: {}", r.describe_doc(id));
+    }
+
     /// A document read back from its file after a refused change (its journal failed) is followed again at the next
     /// tick, not left unfollowed while the link is up.
     #[test]
@@ -4276,6 +4325,14 @@ mod tests {
     /// The snapshot `manifest` names, from what the replica asked to upload.
     fn uploaded(r: &mut Replica<MemStore>, manifest: ManifestId) -> Vec<u8> {
         r.take_uploads().into_iter().find(|u| u.id() == manifest).expect("uploaded before it is named").bytes()
+    }
+
+    /// Sets key `k<n>` of the map `map` to `s`: the change.
+    fn put(d: &loro::LoroDoc, n: u64, s: &str) -> Vec<u8> {
+        let vv = d.oplog_vv();
+        d.get_map("map").insert(&format!("k{n}"), s).unwrap();
+        d.commit();
+        d.export(loro::ExportMode::updates(&vv)).unwrap()
     }
 
     fn text_doc(peer: u64) -> loro::LoroDoc {
