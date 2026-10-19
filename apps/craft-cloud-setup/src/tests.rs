@@ -180,12 +180,14 @@ fn an_install_that_fails_after_the_stop_starts_the_agent_again() {
     assert!(e.contains("not-there.exe") && e.ends_with("The agent was started again."), "{e}");
     assert_eq!(machine.asked(), ["close app", "stop agent", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
 
-    // Nothing to start: said too.
+    // Nothing to start (the program folder can't even be made, and there is no older install): said too.
     let bare = user("Bare");
+    std::fs::write(&bare.places.programs, "not a folder").unwrap();
     let machine = Recorder::default();
     *machine.running.lock().unwrap() = true;
-    let e = install(&bare.places, &registry, &machine, V2, &gone, &options(true)).unwrap_err();
-    assert!(e.contains("The agent was started again"), "the new folder's agent was written before the failure: {e}");
+    let e = install(&bare.places, &registry, &machine, V2, &bare.setup, &options(true)).unwrap_err();
+    assert!(e.ends_with("The agent couldn't be started again (no agent is there to start); it starts at the next login."), "{e}");
+    assert_eq!(machine.asked(), ["close app", "stop agent"]);
 
     // Not running before: nothing is started.
     let machine = Recorder::default();

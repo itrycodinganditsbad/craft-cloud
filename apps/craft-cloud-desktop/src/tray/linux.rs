@@ -244,10 +244,15 @@ pub fn start(clicks: Clicks) -> Result<Option<SniTray>, String> {
 /// Registers the item `name` with the watcher on `connection`'s bus. A watcher that refuses it is said on stderr (the
 /// icon then doesn't show until the watcher comes back), as the app says its other troubles.
 fn register(connection: &Connection, name: &str) -> Result<(), String> {
+    register_saying(connection, name, &mut std::io::stderr())
+}
+
+/// [`register`], saying a refusal to `say`.
+fn register_saying(connection: &Connection, name: &str, say: &mut dyn std::io::Write) -> Result<(), String> {
     let watcher = zbus::blocking::Proxy::new(connection, WATCHER, WATCHER_PATH, WATCHER).map_err(|e| e.to_string());
     let registered = watcher.and_then(|w| w.call::<_, _, ()>("RegisterStatusNotifierItem", &(name,)).map_err(|e| e.to_string()));
     if let Err(e) = &registered {
-        eprintln!("Craft Cloud: the tray didn't take the icon ({e}); it is offered again when the tray restarts");
+        let _ = writeln!(say, "Craft Cloud: the tray didn't take the icon ({e}); it is offered again when the tray restarts");
     }
     registered
 }
@@ -491,7 +496,10 @@ mod tests {
             .unwrap();
         let connection = bus.connect();
         let _tray = start_on(connection.clone(), clicks().0).unwrap();
-        assert!(register(&connection, "org.kde.StatusNotifierItem-1-1").is_err());
+        let mut said = Vec::new();
+        assert!(register_saying(&connection, "org.kde.StatusNotifierItem-1-1", &mut said).is_err());
+        let said = String::from_utf8(said).unwrap();
+        assert!(said.starts_with("Craft Cloud: the tray didn't take the icon ("), "said: {said}");
     }
 
     /// Without `dbus-daemon` the D-Bus tests are skipped, unless they are required.
