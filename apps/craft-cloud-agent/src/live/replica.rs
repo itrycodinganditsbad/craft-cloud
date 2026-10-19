@@ -215,7 +215,7 @@ struct Parts {
 }
 
 /// One record of a document's journal: a local update, on disk before the app is told it is kept.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct JournalRecord {
     client_seq: u64,
     bytes: Vec<u8>,
@@ -233,9 +233,10 @@ fn journal_record(record: &JournalRecord) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// The records of a journal, up to the first that doesn't read.
-fn journal_records(mut bytes: &[u8]) -> Vec<JournalRecord> {
+/// The records of a journal, up to the first that doesn't read, and how many bytes they take (where it is cut).
+fn journal_records(mut bytes: &[u8]) -> (Vec<JournalRecord>, usize) {
     let mut out = Vec::new();
+    let mut read = 0;
     while bytes.len() >= 4 {
         let Some(len) = bytes.get(..4).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(u32::from_le_bytes) else { break };
         let len = len as usize;
@@ -248,8 +249,9 @@ fn journal_records(mut bytes: &[u8]) -> Vec<JournalRecord> {
             Err(_) => break,
         }
         bytes = bytes.get(12 + len..).unwrap_or_default();
+        read += 12 + len;
     }
-    out
+    (out, read)
 }
 
 /// Which document it is.
@@ -512,6 +514,9 @@ struct Doc {
     stale: bool,
     /// Bytes appended to its journal since its file was last written.
     journal: usize,
+    /// An append to its journal failed (or its end couldn't be cut): it is written whole before its journal takes
+    /// another change, so nothing after a bad record is ever hidden by it.
+    journal_failed: bool,
     /// Its file must be written at the next flush (not only now and then).
     urgent: bool,
     /// The waiting update Loro just failed on, imported again ([`Doc::rewait`]).
@@ -583,6 +588,7 @@ impl Doc {
             log_only: false,
             stale: false,
             journal: 0,
+            journal_failed: false,
             urgent: false,
             waiting_failed: None,
             from_snapshot: false,
@@ -1649,28 +1655,41 @@ impl<S: DocStore> Replica<S> {
             return Err(LocalError::Invalid(format!("an update is 1 to {MAX_UPDATE_BYTES} bytes")));
         }
         // Its journal needs its file beside it (a journal alone isn't loaded): a document joined since it was last
-        // written is written first (as it is, before this update).
-        if !doc.on_disk {
+        // written is written first (as it is, before this update). So is one whose journal failed: written whole, its
+        // journal starts empty.
+        if !doc.on_disk || doc.journal_failed {
             let space = self.space;
             save(&mut self.store, space, id, doc)?;
+            doc.journal_failed = false;
         }
         match doc.body.import(bytes) {
             Ok(_) => {}
             Err(UpdateError::Panicked) => {
                 self.reload(id);
+                self.follow_again_soon(id);
                 return Err(LocalError::Invalid("Loro failed on the update; it was dropped and the document read back from disk".into()));
             }
             Err(e) => return Err(LocalError::Invalid(e.to_string())),
         }
         let client_seq = doc.next_client_seq;
+        let before = doc.journal;
         let record = JournalRecord { client_seq, bytes: bytes.to_vec() };
-        let written = journal_record(&record).and_then(|rec| self.store.append_journal(&id.to_string(), &rec).map(|()| rec.len()));
+        let name = id.to_string();
+        let written = journal_record(&record).and_then(|rec| self.store.append_journal(&name, &rec).map(|()| rec.len()));
         let Some(doc) = self.docs.get_mut(&id) else { return Err(LocalError::Invalid("the document is gone".into())) };
         match written {
             Ok(len) => doc.journal = doc.journal.saturating_add(len),
             Err(e) => {
-                // The copy goes back to what is on disk: the app is told it isn't kept.
+                // Not kept: the journal is cut back to where it was (whatever part of the record got there must not
+                // come back after a crash, nor hide what comes after it), the copy goes back to what is on disk, the
+                // app is told, and the document is written whole before its journal takes another change.
+                let _ = self.store.truncate_journal(&name, before);
                 self.reload(id);
+                if let Some(doc) = self.docs.get_mut(&id) {
+                    doc.journal_failed = true;
+                    doc.urgent = true;
+                }
+                self.follow_again_soon(id);
                 return Err(e.into());
             }
         }
@@ -1689,6 +1708,18 @@ impl<S: DocStore> Replica<S> {
             }
             Sub::No | Sub::CatchingUp | Sub::Live => Vec::new(),
         })
+    }
+
+    /// A document read back from its file (so unfollowed) while the link is up: followed again at the next tick.
+    fn follow_again_soon(&mut self, id: DocId) {
+        let up = self.link == Link::Up && self.protocol >= LIVE_DOCUMENTS_PROTOCOL;
+        if let Some(doc) = self.docs.get_mut(&id)
+            && up
+            && doc.sub == Sub::No
+        {
+            doc.parked = false;
+            doc.retry = Some((1, 0));
+        }
     }
 
     /// An app's presence in a document of a file, for the document's other machines (only while it is followed).
@@ -2539,9 +2570,16 @@ fn load_document<S: DocStore>(
             let id = file.doc;
             let kind = Kind::Document { node: file.node, app: file.app.clone() };
             let (mut pending, mut next) = (file.pending, file.next_client_seq.max(1));
-            // The journal's records the file doesn't have yet (one cut off by a crash ends it: it was never acked).
+            // The journal's records the file doesn't have yet (one cut off by a crash ends it: it was never acked). The
+            // journal is cut there, so what is appended next reads after the good ones.
             let mut journalled = 0usize;
-            for record in journal_records(&journal) {
+            let (records, good) = journal_records(&journal);
+            if good < journal.len()
+                && let Err(e) = store.truncate_journal(name, good)
+            {
+                notes.push(format!("the journal of the live document {name} couldn't be cut at its end that doesn't read ({e})"));
+            }
+            for record in records {
                 if record.client_seq >= next {
                     next = record.client_seq.saturating_add(1);
                     pending.push(Pending { client_seq: record.client_seq, bytes: record.bytes, acked: None, push: false });
@@ -2565,8 +2603,10 @@ fn load_document<S: DocStore>(
             match Doc::from_parts(parts, peer, notes) {
                 Ok(mut doc) => {
                     doc.log_only = file.log_only;
-                    doc.journal = journal.len();
+                    doc.journal = good;
                     doc.dirty = journalled > 0;
+                    // (Not cut: written whole before the next change goes into it.)
+                    doc.journal_failed = good < journal.len() && store.load_journal(name).map_or(true, |j| j.len() > good);
                     Some((id, doc))
                 }
                 Err(e) => {
@@ -3175,6 +3215,98 @@ mod tests {
         assert_eq!(r.take_notes().len(), 1);
     }
 
+    /// A replica on `store` with a document of a file joined from an import ("import", peer 40), its file written.
+    fn joined(store: &MemStore, space: SpaceId, node: NodeId) -> (Replica<MemStore>, DocId, Vec<u8>) {
+        let importer = text_doc(40);
+        insert(&importer, 0, "import");
+        let import = importer.export(loro::ExportMode::Snapshot).unwrap();
+        let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+        r.connected();
+        r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        let (id, _, _) = r.open_document(node, &app());
+        r.on_frame(ServerFrame::Snapshot { doc: id, base: 0, bytes: import.clone() }).unwrap();
+        r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
+        r.flush_documents().unwrap();
+        (r, id, import)
+    }
+
+    /// The text of document `id` as `r` has it.
+    fn text_of(r: &Replica<MemStore>, id: DocId) -> String {
+        let d = loro::LoroDoc::new();
+        d.import(&r.snapshot_of(id).unwrap()).unwrap();
+        d.get_text("text").to_string()
+    }
+
+    /// A journal append that fails part-way, or whose flush fails, is refused to the app and leaves nothing a crash
+    /// would bring back or that would hide the changes acked after it.
+    #[test]
+    fn a_failed_journal_append_hides_no_later_change() {
+        use crate::live::store::JournalFailure;
+        for how in [JournalFailure::Torn, JournalFailure::Unflushed] {
+            let store = MemStore::default();
+            let (space, node) = (SpaceId::generate(), NodeId::generate());
+            let (mut r, id, import) = joined(&store, space, node);
+            let edit = |peer: u64, s: &str| {
+                let d = text_doc(peer);
+                d.import(&import).unwrap();
+                insert(&d, 0, s)
+            };
+            store.fail_journal_as(Some(how));
+            assert!(r.local_update(id, &edit(50, "<refused>")).is_err(), "{how:?}");
+            store.fail_journal_as(None);
+            r.local_update(id, &edit(51, "<kept>")).unwrap();
+            // A crash before the document is next written.
+            drop(r);
+            let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+            r.open_document(node, &app());
+            let text = text_of(&r, id);
+            assert!(text.contains("<kept>"), "{how:?}: an acked change is lost: {text:?}");
+            assert!(!text.contains("<refused>"), "{how:?}: a refused change came back: {text:?}");
+        }
+    }
+
+    /// A document read back from its file after a refused change (its journal failed) is followed again at the next
+    /// tick, not left unfollowed while the link is up.
+    #[test]
+    fn a_document_read_back_after_a_refused_change_is_followed_again() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let (mut r, id, import) = joined(&store, space, node);
+        let d = text_doc(50);
+        d.import(&import).unwrap();
+        store.fail_journal(true);
+        assert!(r.local_update(id, &insert(&d, 0, "x")).is_err());
+        store.fail_journal(false);
+        let frames = r.resend();
+        assert!(frames.iter().any(|f| matches!(f, ClientFrame::Subscribe { doc, .. } if *doc == id)), "{frames:?}");
+    }
+
+    /// A journal whose end doesn't read (cut off by a crash) is read up to there and cut there, so what is appended
+    /// after it reads.
+    #[test]
+    fn a_journal_is_cut_at_its_first_bad_record() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let (mut r, id, import) = joined(&store, space, node);
+        let d = text_doc(50);
+        d.import(&import).unwrap();
+        r.local_update(id, &insert(&d, 0, "<one>")).unwrap();
+        drop(r);
+        let name = id.to_string();
+        let good = store.journals().get(&name).cloned().unwrap();
+        let mut s = store.clone();
+        s.append_journal(&name, &[9, 0, 0, 0, 1, 2]).unwrap();
+        let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+        r.open_document(node, &app());
+        assert_eq!(store.journals().get(&name), Some(&good), "cut at the bad record");
+        r.local_update(id, &insert(&d, 0, "<two>")).unwrap();
+        drop(r);
+        let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+        r.open_document(node, &app());
+        let text = text_of(&r, id);
+        assert!(text.contains("<one>") && text.contains("<two>"), "{text:?}");
+    }
+
     /// Serves `rows` (numbered from 1) to every `subscribe` in `frames` until none is asked for; the rounds it took.
     fn serve_catch_ups(r: &mut Replica<MemStore>, doc: DocId, rows: &[Vec<u8>], mut frames: Vec<ClientFrame>) -> usize {
         let mut rounds = 0;
@@ -3628,17 +3760,20 @@ mod tests {
     fn a_journal_ends_at_a_record_cut_off() {
         let records: Vec<Vec<u8>> = (1..=3u64).map(|i| journal_record(&JournalRecord { client_seq: i, bytes: vec![i as u8; 10] }).unwrap()).collect();
         let whole: Vec<u8> = records.concat();
-        assert_eq!(journal_records(&whole).iter().map(|r| r.client_seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+        let (read, good) = journal_records(&whole);
+        assert_eq!(read.iter().map(|r| r.client_seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(good, whole.len());
         for cut in [whole.len() - 1, whole.len() - 9, records[0].len() + 3] {
-            let read = journal_records(&whole[..cut]);
+            let (read, good) = journal_records(&whole[..cut]);
             assert!(read.len() < 3 && read.iter().enumerate().all(|(i, r)| r.client_seq == i as u64 + 1), "cut at {cut}");
+            assert_eq!(good, records[..read.len()].iter().map(Vec::len).sum::<usize>(), "where it ends");
         }
         let mut damaged = whole.clone();
         let at = records[0].len() + 6;
         damaged[at] ^= 1;
-        assert_eq!(journal_records(&damaged).len(), 1, "a damaged record ends it");
-        assert!(journal_records(&[]).is_empty());
-        assert!(journal_records(&[0xff, 0xff, 0xff, 0xff, 1]).is_empty(), "a length past the end");
+        assert_eq!(journal_records(&damaged), (journal_records(&records[0]).0, records[0].len()), "a damaged record ends it");
+        assert!(journal_records(&[]).0.is_empty());
+        assert!(journal_records(&[0xff, 0xff, 0xff, 0xff, 1]).0.is_empty(), "a length past the end");
     }
 
     /// The version a log's updates make is worked out from the copy at load: everything but its own unsent updates

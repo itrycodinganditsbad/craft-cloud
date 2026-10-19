@@ -40,9 +40,14 @@ pub trait DocStore: Send {
     fn save_document(&mut self, _name: &str, _bytes: &[u8]) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
-    /// Appends `record` to the document's journal, durably, before this returns.
+    /// Appends `record` to the document's journal, durably, before this returns. On an error the journal is cut back
+    /// to where it was, as far as the store can (the caller cuts it back too, and writes the document whole).
     fn append_journal(&mut self, _name: &str, _record: &[u8]) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    /// Cuts the document's journal to its first `len` bytes (what follows doesn't read, or was never kept), durably.
+    fn truncate_journal(&mut self, _name: &str, _len: usize) -> io::Result<()> {
+        Ok(())
     }
     /// The document's journal (empty if it has none).
     fn load_journal(&self, _name: &str) -> io::Result<Vec<u8>> {
@@ -218,11 +223,30 @@ impl DocStore for DiskStore {
         let path = self.dir.join(format!("{name}{JOURNAL_SUFFIX}"));
         let new = !path.exists();
         let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
-        file.write_all(record)?;
-        file.sync_data()?;
+        let before = file.metadata()?.len();
+        if let Err(e) = file.write_all(record).and_then(|()| file.sync_data()) {
+            // Not kept: whatever part of it got there goes (a record cut off, or one whose flush failed, must not come
+            // back after a crash as a change the app was told wasn't kept, nor hide the records after it).
+            let _ = file.set_len(before).and_then(|()| file.sync_data());
+            return Err(e);
+        }
         // A journal made just now: its name is durable too.
         if new {
             self.sync_dir()?;
+        }
+        Ok(())
+    }
+
+    fn truncate_journal(&mut self, name: &str, len: usize) -> io::Result<()> {
+        let path = self.dir.join(format!("{name}{JOURNAL_SUFFIX}"));
+        let file = match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if file.metadata()?.len() > len as u64 {
+            file.set_len(len as u64)?;
+            file.sync_data()?;
         }
         Ok(())
     }
@@ -265,14 +289,36 @@ pub struct MemStore {
     set_aside_count: Arc<std::sync::atomic::AtomicU64>,
     documents: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     journals: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
-    /// Journal appends fail from now on (a full disk, for tests).
-    failing: Arc<std::sync::atomic::AtomicBool>,
+    /// How journal appends fail from now on ([`JournalFailure`] as a number; 0: they don't), for tests.
+    failing: Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// How a [`MemStore`]'s journal appends fail, for tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalFailure {
+    /// Nothing is written (a full disk).
+    Nothing,
+    /// Half the record is written, and stays (a store that couldn't cut it back).
+    Torn,
+    /// The whole record is written, and stays, but the flush fails.
+    Unflushed,
 }
 
 impl MemStore {
-    /// Makes every journal append fail (`true`) or work again: a full disk, for tests.
+    /// Makes every journal append fail (`true`, writing nothing) or work again: a full disk, for tests.
     pub fn fail_journal(&self, fail: bool) {
-        self.failing.store(fail, std::sync::atomic::Ordering::Relaxed);
+        self.fail_journal_as(fail.then_some(JournalFailure::Nothing));
+    }
+
+    /// Makes every journal append fail as `how`, or work again (`None`).
+    pub fn fail_journal_as(&self, how: Option<JournalFailure>) {
+        let n = match how {
+            None => 0,
+            Some(JournalFailure::Nothing) => 1,
+            Some(JournalFailure::Torn) => 2,
+            Some(JournalFailure::Unflushed) => 3,
+        };
+        self.failing.store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The journals, by document (for tests that look inside).
@@ -334,10 +380,27 @@ impl DocStore for MemStore {
     }
 
     fn append_journal(&mut self, name: &str, record: &[u8]) -> io::Result<()> {
-        if self.failing.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(io::Error::other("the disk is full (test)"));
+        let mut journals = self.journals.lock().unwrap_or_else(PoisonError::into_inner);
+        match self.failing.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => {}
+            1 => return Err(io::Error::other("the disk is full (test)")),
+            2 => {
+                journals.entry(name.to_owned()).or_default().extend_from_slice(record.get(..record.len() / 2).unwrap_or_default());
+                return Err(io::Error::other("the disk filled up mid-write (test)"));
+            }
+            _ => {
+                journals.entry(name.to_owned()).or_default().extend_from_slice(record);
+                return Err(io::Error::other("the flush failed (test)"));
+            }
         }
-        self.journals.lock().unwrap_or_else(PoisonError::into_inner).entry(name.to_owned()).or_default().extend_from_slice(record);
+        journals.entry(name.to_owned()).or_default().extend_from_slice(record);
+        Ok(())
+    }
+
+    fn truncate_journal(&mut self, name: &str, len: usize) -> io::Result<()> {
+        if let Some(journal) = self.journals.lock().unwrap_or_else(PoisonError::into_inner).get_mut(name) {
+            journal.truncate(len);
+        }
         Ok(())
     }
 
