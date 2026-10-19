@@ -161,12 +161,20 @@ pub enum Badge {
     Waiting(u64),
     ReadOnly,
     Offline,
+    /// Too much waits for the agent: new changes are refused until it is back.
+    Stalled,
+    /// Nothing more goes out (`Status::error` says why): save the document to keep the work.
+    Stopped,
 }
 
 impl Status {
     pub fn badge(&self) -> Badge {
         if self.read_only.is_some() {
             Badge::ReadOnly
+        } else if self.stopped {
+            Badge::Stopped
+        } else if self.stalled {
+            Badge::Stalled
         } else if !self.connected || !self.online {
             Badge::Offline
         } else if self.waiting > 0 || self.queued > 0 {

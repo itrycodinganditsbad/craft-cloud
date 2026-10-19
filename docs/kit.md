@@ -74,7 +74,9 @@ impl LiveDocument for DemoApp {
 - **`normalise`** is required: it repairs what a merge can break (two layers with one name, a cell whose row went, a
   reference to a deleted element), so the result is a model the app could have made itself. The kit writes back what
   it changed (no undo step). It runs after every remote change, then **`refresh_derived`** recomputes what is
-  derived and never synced, before the app gets the model.
+  derived and never synced, before the app gets the model. Every machine normalises the same merge and writes its
+  repair, so a repair must be deterministic: the same model in, the same repair out, with any new element's ID and
+  value derived from what it repairs (never `ElemId::new()` or the clock), so two machines' repairs are one.
 - Property values ([`Value`]) are numbers, strings, bytes and chunk references, at most 256 KiB each. Binary
   content never goes into the document: put it in a [`BlobStore`] ([`AgentBlobs`] is the agent's) and keep the
   [`ChunkRef`].

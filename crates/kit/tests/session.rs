@@ -163,22 +163,30 @@ fn past_the_queue_cap_changes_are_refused_until_the_agent_is_back() {
     let mut a = open::<App>(&pc, "q.txt", Notes::new("q", &[]));
     pc.restart();
     until(&mut [&mut a], "the drop is seen", |s| s.iter().all(|s| !s.status().connected));
-    let block = 200 * 1024;
+    // Big changes up to near the cap, then small ones (a few hundred bytes each), so the edge is met within one.
     let mut i = 0usize;
+    let mut last_taken = 0;
     loop {
         let queued = a.poll().status.queued_bytes;
+        let block = match MAX_QUEUE_BYTES - queued.min(MAX_QUEUE_BYTES) {
+            left if left > 1024 * 1024 => 200 * 1024,
+            left if left > 8 * 1024 => 4 * 1024,
+            _ => 1,
+        };
         let title = format!("{i:08}{}", "q".repeat(block));
         let result = change(&mut a, |m| m.with_title(&title));
         if queued < MAX_QUEUE_BYTES {
             assert!(result.is_ok(), "{queued} bytes queued: still taken ({result:?})");
+            last_taken = queued;
         } else {
             assert!(matches!(result, Err(KitError::Stalled(_))), "{queued} bytes queued: refused");
             assert!(a.poll().status.stalled);
+            assert!(queued - MAX_QUEUE_BYTES < 1024, "refused at the first change past the cap ({queued} bytes)");
             break;
         }
         i += 1;
     }
-    assert!(i * block >= MAX_QUEUE_BYTES - block, "the cap is 64 MiB");
+    assert!(MAX_QUEUE_BYTES - last_taken < 1024, "taken up to one small change below the cap ({last_taken} bytes)");
     pc.start();
     until(&mut [&mut a], "drained", |s| s.iter().all(|s| s.status().queued == 0 && !s.status().stalled));
     change(&mut a, |m| m.with_title("taken again")).unwrap();

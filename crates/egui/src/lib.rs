@@ -65,6 +65,8 @@ pub fn badge_text(badge: Badge) -> String {
         Badge::Waiting(n) => format!("Waiting {n}"),
         Badge::ReadOnly => "Read-only".to_owned(),
         Badge::Offline => "Offline".to_owned(),
+        Badge::Stalled => "Stalled".to_owned(),
+        Badge::Stopped => "Stopped".to_owned(),
     }
 }
 
@@ -141,6 +143,14 @@ pub fn badge(ui: &mut Ui, status: &craft_cloud_kit::Status) {
             },
         ),
         Badge::Offline => (Color32::from_rgb(0xb0, 0x40, 0x30), "Edits are kept and go out when Craft Cloud is back".to_owned()),
+        Badge::Stalled => (
+            Color32::from_rgb(0xc0, 0x20, 0x20),
+            "Stalled: too much is waiting for Craft Cloud, so new changes are not kept until it is back".to_owned(),
+        ),
+        Badge::Stopped => (
+            Color32::from_rgb(0xc0, 0x20, 0x20),
+            format!("Stopped: changes no longer go out ({}); save the document to keep them", status.error.as_deref().unwrap_or("see the agent")),
+        ),
     };
     ui.colored_label(color, badge_text(b)).on_hover_text(hover);
 }

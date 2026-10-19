@@ -621,7 +621,15 @@ pub struct SaveRecord {
 impl SaveRecord {
     /// Whether this save's version includes everything `other`'s does.
     pub fn includes(&self, other: &SaveRecord) -> bool {
-        other.version.iter().all(|(peer, end)| self.version.iter().any(|(p, e)| p == peer && e >= end))
+        let sorted = self.version.windows(2).all(|w| matches!(w, [a, b] if a.0 < b.0));
+        let end_of = |peer: u64| {
+            if sorted {
+                self.version.binary_search_by_key(&peer, |(p, _)| *p).ok().and_then(|i| self.version.get(i)).map(|(_, e)| *e)
+            } else {
+                self.version.iter().find(|(p, _)| *p == peer).map(|(_, e)| *e)
+            }
+        };
+        other.version.iter().all(|(peer, end)| end_of(*peer).is_some_and(|e| e >= *end))
     }
 }
 
