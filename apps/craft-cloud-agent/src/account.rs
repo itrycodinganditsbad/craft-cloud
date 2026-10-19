@@ -579,7 +579,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> io::Resu
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temp, path)
+        replace(&temp, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
@@ -592,9 +592,64 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> io::Resu
     Ok(())
 }
 
+/// Renames `temp` over `path`. On Windows the rename is refused while another program (a virus scanner, the search
+/// indexer, a backup tool) holds `path` open without delete sharing, usually for milliseconds: try again for about a
+/// second and a half before giving up.
+fn replace(temp: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        // ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION.
+        const BUSY: [i32; 2] = [5, 32];
+        let mut wait = std::time::Duration::from_millis(5);
+        for _ in 0..12 {
+            match fs::rename(temp, path) {
+                Err(e) if e.raw_os_error().is_some_and(|code| BUSY.contains(&code)) => {
+                    std::thread::sleep(wait);
+                    wait = (wait * 2).min(std::time::Duration::from_millis(200));
+                }
+                other => return other,
+            }
+        }
+    }
+    fs::rename(temp, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Another program holding the file for a moment (without delete sharing, as virus scanners do) delays the write;
+    /// it doesn't fail it.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_held_open_for_a_moment_is_still_replaced() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        fs::write(&path, b"old").unwrap();
+        // FILE_SHARE_READ only: renaming over the file is refused while this handle is open.
+        let held = OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+        });
+        write_atomic(&path, b"new", false).unwrap();
+        release.join().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    /// A file held open for good still fails the write, after the retries, and leaves no temporary file behind.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_held_open_for_good_fails_the_write_cleanly() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        fs::write(&path, b"old").unwrap();
+        let _held = OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+        assert!(write_atomic(&path, b"new", false).is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "the temporary file is removed");
+    }
 
     fn account(folder: &Path) -> Account {
         Account {
