@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use craft_cloud_app::Client;
-use craft_cloud_app::live::{Document, Documents, Event, NotLiveReason, Opened, Waker};
+use craft_cloud_app::live::{Document, Documents, Event, NotLiveReason, OpenOptions, Opened, Waker};
 use loro::event::{Diff, DiffEvent};
 use loro::{ContainerID, ExpandType, Index, LoroDoc, LoroValue, StyleConfig, StyleConfigMap, TreeID, UndoManager, ValueOrContainer};
 
@@ -257,10 +257,11 @@ pub(crate) struct Ctx {
     pub(crate) styles: StyleConfigMap,
 }
 
-/// The connection to the agent: the documents connection (kept alive) and the document.
+/// The connection to the agent: the document and its documents connection (kept alive). The document goes first, so
+/// the agent hears it closed (and lends its peer to the next open at once) before the connection ends.
 struct Link {
-    _docs: Documents,
     doc: Document,
+    _docs: Documents,
 }
 
 /// Why a reopen didn't attach.
@@ -278,6 +279,8 @@ type Reopened = Result<(Documents, Document), Reopen>;
 pub struct Session<D: LiveDocument> {
     doc: LoroDoc,
     undo: UndoManager,
+    /// The document's peer is the agent's, lent from its pool for this session.
+    leased: bool,
     model: Arc<D::Doc>,
     ctx: Ctx,
     layout: Vec<(&'static str, Kind)>,
@@ -331,6 +334,20 @@ fn new_doc() -> LoroDoc {
     let doc = LoroDoc::new();
     doc.config_default_text_style(Some(StyleConfig { expand: ExpandType::After }));
     doc
+}
+
+/// The undo manager of a session's document: this machine's changes only, each step carrying where it starts, which
+/// names its size (`step_sizes`).
+fn new_undo(doc: &LoroDoc) -> UndoManager {
+    let mut undo = UndoManager::new(doc);
+    undo.add_exclude_origin_prefix(KIT_ORIGIN);
+    undo.set_max_undo_steps(UNDO_STEPS);
+    undo.set_on_push(Some(Box::new(|_, span, _| {
+        let mut meta = loro::UndoItemMeta::new();
+        meta.set_value(LoroValue::I64(i64::from(span.start)));
+        meta
+    })));
+    undo
 }
 
 /// Writes the difference of two models (everything, when `old` is `None`) through `w`.
@@ -440,7 +457,7 @@ impl<D: LiveDocument> Session<D> {
             Ok(d) => d,
             Err(e) => return not_running(e),
         };
-        let opened = match docs.open(path, D::APP) {
+        let opened = match docs.open_with(path, D::APP, &OpenOptions::default()) {
             Ok(o) => o,
             Err(craft_cloud_app::Error::Refused { code, message }) => return Err(KitError::Agent(format!("{code}: {message}"))),
             Err(e) => return not_running(e),
@@ -450,7 +467,7 @@ impl<D: LiveDocument> Session<D> {
             Opened::NotLive(reason) => return Ok(Open::NotLive(NotLive::Reason(reason))),
             Opened::Live(document) => (document, None),
             Opened::NeedsImport(importer) => {
-                let snapshot = Self::import_snapshot(&file, file_hash.as_ref())?;
+                let snapshot = Self::import_snapshot(&file, file_hash.as_ref(), importer.peer())?;
                 match importer.import(&snapshot) {
                     Ok(document) => (document, Some(snapshot)),
                     Err(craft_cloud_app::Error::Refused { code, .. }) if code == "not_live" => {
@@ -460,8 +477,8 @@ impl<D: LiveDocument> Session<D> {
                 }
             }
         };
-        let ours = snapshot.as_deref().is_some_and(|s| s == document.state());
-        let mut session = Self::start(agent.clone(), path, file, document.state(), ours)?;
+        let ours = snapshot.as_deref().is_some_and(|s| s == document.state()) && document.state_updates().is_empty();
+        let mut session = Self::start(agent.clone(), path, file, (document.state(), document.state_updates()), ours, document.peer())?;
         if let Some(hash) = file_hash
             && snapshot.is_none()
         {
@@ -474,8 +491,11 @@ impl<D: LiveDocument> Session<D> {
     }
 
     /// The snapshot that makes `file` a live document: its schema, its parts, and a save mark for its bytes.
-    fn import_snapshot(file: &D::Doc, hash: Option<&[u8; 32]>) -> Result<Vec<u8>, KitError> {
+    fn import_snapshot(file: &D::Doc, hash: Option<&[u8; 32]>, peer: Option<u64>) -> Result<Vec<u8>, KitError> {
         let doc = new_doc();
+        if let Some(peer) = peer {
+            doc.set_peer_id(peer)?;
+        }
         let mut schema = HashMap::new();
         schema.insert("app".to_owned(), LoroValue::from(D::APP));
         schema.insert("version".to_owned(), LoroValue::from(i64::from(D::SCHEMA)));
@@ -492,25 +512,29 @@ impl<D: LiveDocument> Session<D> {
 
     /// A session over the document `state` (a snapshot), for `file` (kept as the model when `ours`: the state is the
     /// import just made from it).
-    fn start(agent: Agent, path: &str, file: Arc<D::Doc>, state: &[u8], ours: bool) -> Result<Self, KitError> {
+    fn start(agent: Agent, path: &str, file: Arc<D::Doc>, state: (&[u8], &[Vec<u8>]), ours: bool, peer: Option<u64>) -> Result<Self, KitError> {
         let layout = D::mappings(&file).layout()?;
         let doc = new_doc();
-        doc.import(state)?;
+        doc.import(state.0)?;
+        // The updates that are part of the state, before anything is written with the peer (it may have written some
+        // of them, in a window closed before).
+        let mut unread = None;
+        for update in state.1 {
+            if let Err(e) = doc.import(update) {
+                unread = Some(format!("a change from another machine doesn't read: {e}"));
+            }
+        }
+        if let Some(peer) = peer {
+            doc.set_peer_id(peer)?;
+        }
         let collector = Arc::new(Mutex::new(Collector::default()));
         let c = collector.clone();
         let events = doc.subscribe_root(Arc::new(move |event: DiffEvent<'_>| collect(&c, event)));
-        let mut undo = UndoManager::new(&doc);
-        undo.add_exclude_origin_prefix(KIT_ORIGIN);
-        undo.set_max_undo_steps(UNDO_STEPS);
-        // Each step carries where it starts, which names its size (`step_sizes`).
-        undo.set_on_push(Some(Box::new(|_, span, _| {
-            let mut meta = loro::UndoItemMeta::new();
-            meta.set_value(LoroValue::I64(i64::from(span.start)));
-            meta
-        })));
+        let undo = new_undo(&doc);
         let mut session = Self {
             doc,
             undo,
+            leased: peer.is_some(),
             model: file,
             ctx: Ctx::default(),
             layout,
@@ -544,6 +568,7 @@ impl<D: LiveDocument> Session<D> {
         };
         session.reindex_trees();
         session.check_schema();
+        session.status.error = unread;
         if !ours {
             session.rebuild(Touched::everything())?;
         }
@@ -584,16 +609,48 @@ impl<D: LiveDocument> Session<D> {
         }
         // What the agent's copy has of this peer's changes: the rest goes again.
         let ours = self.doc.peer_id();
-        let held =
-            loro::LoroDoc::decode_import_blob_meta(link.doc.state(), false).ok().and_then(|m| m.partial_end_vv.get(&ours).copied()).unwrap_or(0);
+        let held = std::iter::once(link.doc.state())
+            .chain(link.doc.state_updates().iter().map(Vec::as_slice))
+            .filter_map(|bytes| loro::LoroDoc::decode_import_blob_meta(bytes, false).ok()?.partial_end_vv.get(&ours).copied())
+            .max()
+            .unwrap_or(0);
         self.outbox.retain(|o| o.end > held);
         for out in &mut self.outbox {
             out.seq = None;
         }
         self.outbox_bytes = self.outbox.iter().map(|o| o.bytes.len()).sum();
+        self.take_peer(link.doc.peer());
         self.link = Some(link);
         self.backoff = FIRST_BACKOFF;
         self.send_outbox();
+    }
+
+    /// Takes the peer the agent lent on a reopen. It is the one asked for unless another window took it while the
+    /// agent was away (or the agent no longer lends one): then this session's changes from now on are written with the
+    /// new peer (its undo history starts again). Changes still waiting under the old peer can't go out then (the other
+    /// window writes the same IDs): the session stops, and the app saves the model to keep them.
+    fn take_peer(&mut self, wanted: Option<u64>) {
+        let ours = self.doc.peer_id();
+        if wanted == Some(ours) || (!self.leased && wanted.is_none()) {
+            return;
+        }
+        if !self.outbox.is_empty() {
+            let why = "peer_taken: another window has this document's place since Craft Cloud went away, and changes made here \
+                       meanwhile can't go out; save the document to keep them"
+                .to_owned();
+            self.refused = Some(why.clone());
+            self.status.error = Some(why);
+            return;
+        }
+        let peer = wanted.unwrap_or_else(|| LoroDoc::new().peer_id());
+        if let Err(e) = self.doc.set_peer_id(peer) {
+            self.status.error = Some(format!("the live document: {e}"));
+            return;
+        }
+        self.undo = new_undo(&self.doc);
+        self.step_sizes.clear();
+        self.group_key = None;
+        self.leased = wanted.is_some();
     }
 
     /// The model as it is now (after the last local change or applied remote one).
@@ -939,6 +996,7 @@ impl<D: LiveDocument> Session<D> {
                 Ok(Ok((docs, doc))) => {
                     self.reopening = None;
                     self.incoming.push(doc.state().to_vec());
+                    self.incoming.extend(doc.state_updates().iter().cloned());
                     self.status.error = None;
                     self.attach(Link { _docs: docs, doc });
                     if let Some(waker) = &self.waker {
@@ -972,12 +1030,14 @@ impl<D: LiveDocument> Session<D> {
         let snapshot = self.doc.export(loro::ExportMode::Snapshot).unwrap_or_default();
         let waker = self.waker.clone();
         let expected = self.doc_id;
+        // The same peer again, if no other window took it meanwhile.
+        let options = OpenOptions { peer: Some(self.doc.peer_id()) };
         let spawned = std::thread::Builder::new().name("craft-cloud-kit-reopen".into()).spawn(move || {
             let result = (|| -> Reopened {
                 let retry = |e: craft_cloud_app::Error| Reopen::Retry(e.to_string());
                 let client = agent.client().map_err(retry)?;
                 let docs = client.documents().map_err(retry)?;
-                match docs.open(&path, D::APP).map_err(retry)? {
+                match docs.open_with(&path, D::APP, &options).map_err(retry)? {
                     // The same document, or none known yet (it was never attached).
                     Opened::Live(doc) if expected.is_none_or(|id| id == doc.id()) => Ok((docs, doc)),
                     Opened::Live(_) => Err(Reopen::Replaced(format!("{path} is another document now"))),

@@ -10,10 +10,7 @@ use crate::hash::ManifestId;
 use crate::ids::{DeviceId, Epoch, NodeId, VersionId};
 use crate::name::Name;
 
-pub use craft_cloud_api::local::SaveRecord;
-
-/// Most entries a save record's version may have (peers that edited the live document).
-pub const MAX_SAVE_PEERS: usize = 4096;
+pub use craft_cloud_api::local::{MAX_SAVE_PEERS, SaveRecord};
 
 /// A new file version. Its size comes from the manifest, which must already be uploaded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

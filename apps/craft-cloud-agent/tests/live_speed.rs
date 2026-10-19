@@ -53,6 +53,11 @@ async fn a_keystroke_reaches_the_other_machine_in_under_250_ms() {
     mine.import(doc_pc.state()).unwrap();
     let theirs = LoroDoc::new();
     theirs.import(doc_laptop.state()).unwrap();
+    for (doc, updates) in [(&mine, doc_pc.state_updates()), (&theirs, doc_laptop.state_updates())] {
+        for u in updates {
+            doc.import(u).unwrap();
+        }
+    }
     let (pc_side, laptop_side) = (Arc::new(Mutex::new((mine, doc_pc))), Arc::new(Mutex::new((theirs, doc_laptop))));
     // Both online (the laptop's document followed).
     let l = laptop_side.clone();

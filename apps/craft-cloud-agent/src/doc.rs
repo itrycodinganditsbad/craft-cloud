@@ -105,6 +105,10 @@ fn session(
     };
     let mirror = LoroDoc::new();
     mirror.import(document.state()).map_err(|e| usage(format!("the document's state doesn't read: {e}")))?;
+    for update in document.state_updates() {
+        // (An update this copy can't take is the other side's; the agent has it, and so will a fresh open.)
+        let _ = mirror.import(update);
+    }
     let text = |mirror: &LoroDoc| mirror.get_text(TEXT).to_string();
     // What came right after the state (updates still waiting for their history), before anything else.
     let take = |mirror: &LoroDoc, event: &Event| {

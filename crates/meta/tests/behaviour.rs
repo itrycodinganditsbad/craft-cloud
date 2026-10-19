@@ -86,6 +86,7 @@ on_every_backend!(
     users_and_devices,
     a_new_space_has_only_its_root,
     a_version_keeps_its_save_record,
+    pages_of_save_records_stay_small,
     manifests_need_their_chunks_and_are_per_space,
     stored_bytes_are_counted_once_per_space_and_capped,
     concurrent_chunk_batches_charge_a_shared_chunk_once,
@@ -161,6 +162,58 @@ async fn device(meta: &Meta, u: &UserRecord) -> DeviceId {
 }
 
 /// Uploads one random chunk and a manifest for it to the user's space; returns the manifest ID.
+/// Files whose versions all carry the biggest save record there can be: every page of the listing and of the change
+/// feed ends before its records pass their budget, far under what an agent reads of a page, and the pages together
+/// still list every file once, each with its record.
+async fn pages_of_save_records_stay_small(meta: &Meta) {
+    use craft_cloud_meta::MAX_PAGE_SAVE_BYTES;
+    let u = user(meta, "ana").await;
+    let dev = meta.create_device(u.id, "pc", &[3u8; 32], NOW).await.unwrap();
+    let parent = root(meta, &u).await;
+    let m = manifest(meta, &u, 4).await;
+    let biggest = craft_cloud_proto::SaveRecord {
+        doc: craft_cloud_proto::DocId::generate(),
+        version: (0..craft_cloud_proto::ops::MAX_SAVE_PEERS as u64).map(|p| (u64::MAX - p, u32::MAX)).collect(),
+    };
+    let record_bytes = serde_json::to_string(&biggest).unwrap().len();
+    assert!(record_bytes < 10 * 1024, "{record_bytes}");
+    let files = 2 * MAX_PAGE_SAVE_BYTES / record_bytes + 10;
+    let mut made = std::collections::BTreeSet::new();
+    for batch in 0..files.div_ceil(500) {
+        let ops: Vec<Op> = (0..500.min(files - batch * 500))
+            .map(|i| {
+                let node = NodeId::generate();
+                made.insert(node);
+                let v = NewVersion { save: Some(biggest.clone()), ..version(m) };
+                Op::Create { node, parent, name: name(&format!("f{batch}-{i}.kitdemo")), version: v }
+            })
+            .collect();
+        meta.commit(u.space, dev, &ops, NOW).await.unwrap();
+    }
+    for feed in [false, true] {
+        let (mut after, mut seen, mut pages) = (None, std::collections::BTreeSet::new(), 0);
+        loop {
+            let page =
+                if feed { meta.changes(u.space, 0, after, MAX_PAGE_NODES).await.unwrap() } else { meta.tree(u.space, after, MAX_PAGE_NODES).await.unwrap() };
+            pages += 1;
+            let json = serde_json::to_vec(&page).unwrap().len();
+            assert!(json < MAX_PAGE_SAVE_BYTES + 2 * 1024 * 1024, "a page of {json} bytes");
+            for n in &page.nodes {
+                if let NodeKind::File(f) = &n.kind {
+                    assert_eq!(f.save.as_ref(), Some(&biggest));
+                    assert!(seen.insert(n.id), "listed twice");
+                }
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen, made, "every file, once");
+        assert!(pages >= 3, "cut into pages by their records: {pages}");
+    }
+}
+
 async fn manifest(meta: &Meta, u: &UserRecord, len: u32) -> ManifestId {
     let chunk = ChunkId::from_bytes(*blake3::hash(uuid::Uuid::now_v7().as_bytes()).as_bytes());
     meta.add_chunk(u.space, &chunk, u64::from(len) + 1, NOW).await.unwrap();

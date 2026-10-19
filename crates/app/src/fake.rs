@@ -24,6 +24,7 @@ use craft_cloud_api::DocId;
 use craft_cloud_api::limits::{MAX_BLOB_BYTES, MAX_PRESENCE_BYTES, MAX_UPDATE_BYTES};
 use craft_cloud_api::local::blobs::{Stored, hex, parse_hex};
 use craft_cloud_api::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, STATE, UPDATE, decode_binary, encode_binary};
+use craft_cloud_api::local::peers::Leases;
 use craft_cloud_api::local::{DocState, DocsEvent, DocsRequest, LOCAL_API_MAX, MAX_LOCAL_JSON_BYTES, NotLiveReason, RunState, Status, paths};
 use tungstenite::protocol::{Role, WebSocketConfig};
 use tungstenite::{Message, WebSocket};
@@ -92,6 +93,20 @@ struct Machine {
     saves: Vec<(DocId, String, Version)>,
     /// Codes the next updates are refused with ([`Fake::refuse_next`]).
     refuse: VecDeque<String>,
+    /// The Loro peers lent to open documents, as the agent lends them.
+    leases: Leases,
+}
+
+impl Machine {
+    /// The peer for open `id` on `conn` of `doc`, as the agent hands it out.
+    fn lease(&mut self, conn: u64, id: u64, doc: DocId) -> Option<u64> {
+        let (app, hint) = self.conns.get(&conn)?.apps.get(&id)?.clone();
+        let mut key = self.name.as_bytes().to_vec();
+        key.push(0);
+        key.extend_from_slice(app.as_bytes());
+        let base = u64::from_le_bytes(fake_hash(&key).first_chunk::<8>().copied().unwrap_or_default());
+        self.leases.lease(doc, &app, base, (conn, id), hint, std::time::Instant::now())
+    }
 }
 
 /// A live document's version vector: `(peer, end counter)`.
@@ -103,8 +118,10 @@ struct Conn {
     stream: TcpStream,
     /// Each document number opened: the document, how much of the machine's copy went out, and the app's updates.
     open: HashMap<u64, Opened>,
-    /// A `needs_import` waiting for its import, by number: the path.
-    importing: HashMap<u64, String>,
+    /// A `needs_import` waiting for its import, by number: the path, and the document it will be.
+    importing: HashMap<u64, (String, DocId)>,
+    /// Each open's app and the peer it asked for again, by number.
+    apps: HashMap<u64, (String, Option<u64>)>,
     told: HashMap<DocId, (bool, u64)>,
 }
 
@@ -146,6 +163,7 @@ impl Hub {
                     conns: HashMap::new(),
                     saves: Vec::new(),
                     refuse: VecDeque::new(),
+                    leases: Leases::default(),
                 },
             );
             id
@@ -303,7 +321,10 @@ impl Hub {
             let conn = inner.next_conn;
             inner.next_conn += 1;
             let Some(m) = inner.machines.get_mut(&machine) else { return };
-            m.conns.insert(conn, Conn { writer, stream: shut, open: HashMap::new(), importing: HashMap::new(), told: HashMap::new() });
+            m.conns.insert(
+                conn,
+                Conn { writer, stream: shut, open: HashMap::new(), importing: HashMap::new(), apps: HashMap::new(), told: HashMap::new() },
+            );
             conn
         };
         loop {
@@ -325,16 +346,29 @@ impl Hub {
         let mut inner = lock(&self.inner);
         if let Some(m) = inner.machines.get_mut(&machine) {
             m.conns.remove(&conn);
+            // Gone without a close (a close came first otherwise): its peers are kept a while for it.
+            m.leases.gone(conn, std::time::Instant::now());
         }
     }
 
     fn on_request(&self, machine: usize, conn: u64, request: DocsRequest) {
         let mut inner = lock(&self.inner);
         match request {
-            DocsRequest::Open { id, path, app: _ } => open(&mut inner, machine, conn, id, &path),
-            DocsRequest::Close { doc } => {
+            DocsRequest::Open { id, path, app, peer } => {
                 if let Some(c) = inner.machines.get_mut(&machine).and_then(|m| m.conns.get_mut(&conn)) {
-                    c.open.retain(|_, o| o.doc != doc);
+                    c.apps.insert(id, (app, peer));
+                }
+                open(&mut inner, machine, conn, id, &path);
+            }
+            DocsRequest::Close { doc } => {
+                if let Some(m) = inner.machines.get_mut(&machine) {
+                    let closed: Vec<u64> = m.conns.get(&conn).map(|c| c.open.iter().filter(|(_, o)| o.doc == doc).map(|(id, _)| *id).collect()).unwrap_or_default();
+                    for id in closed {
+                        m.leases.release((conn, id));
+                    }
+                    if let Some(c) = m.conns.get_mut(&conn) {
+                        c.open.retain(|_, o| o.doc != doc);
+                    }
                 }
             }
             DocsRequest::Saved { doc, hash, frontiers: _, version } => {
@@ -349,7 +383,9 @@ impl Hub {
         let mut inner = lock(&self.inner);
         match kind {
             IMPORT => {
-                let Some(path) = inner.machines.get_mut(&machine).and_then(|m| m.conns.get_mut(&conn)).and_then(|c| c.importing.remove(&id)) else {
+                let Some((path, new_id)) =
+                    inner.machines.get_mut(&machine).and_then(|m| m.conns.get_mut(&conn)).and_then(|c| c.importing.remove(&id))
+                else {
                     return;
                 };
                 let online = inner.machines.get(&machine).is_some_and(|m| m.online);
@@ -357,7 +393,7 @@ impl Hub {
                     return tell(&inner, machine, conn, &DocsEvent::NotLive { id, reason: NotLiveReason::Offline, message: None });
                 }
                 // The first import is kept; a later one joins it.
-                inner.docs.entry(path.clone()).or_insert_with(|| HubDoc { id: DocId::generate(), import: body.to_vec(), log: Vec::new() });
+                inner.docs.entry(path.clone()).or_insert_with(|| HubDoc { id: new_id, import: body.to_vec(), log: Vec::new() });
                 open(&mut inner, machine, conn, id, &path);
             }
             UPDATE => {
@@ -423,10 +459,12 @@ fn open(inner: &mut Inner, machine: usize, conn: u64, id: u64, path: &str) {
             doc
         }
         (None, None) if m.online => {
+            let new_id = DocId::generate();
             if let Some(c) = m.conns.get_mut(&conn) {
-                c.importing.insert(id, path.to_owned());
+                c.importing.insert(id, (path.to_owned(), new_id));
             }
-            return tell(inner, machine, conn, &DocsEvent::NeedsImport { id });
+            let peer = m.lease(conn, id, new_id);
+            return tell(inner, machine, conn, &DocsEvent::NeedsImport { id, peer });
         }
         (None, _) => return tell(inner, machine, conn, &DocsEvent::NotLive { id, reason: NotLiveReason::Offline, message: None }),
     };
@@ -434,14 +472,15 @@ fn open(inner: &mut Inner, machine: usize, conn: u64, id: u64, path: &str) {
     sync(inner);
     let Some(m) = inner.machines.get_mut(&machine) else { return };
     let online = m.online;
+    let peer = m.lease(conn, id, doc);
     let Some(d) = m.docs.get(&doc) else { return };
-    let state = DocState { online, waiting: d.pending.len() as u64, bytes: d.import.len() as u64 };
+    let state = DocState { online, waiting: d.pending.len() as u64, bytes: d.import.len() as u64, updates: d.log.len() as u64 };
     let (import, log): (Vec<u8>, Vec<Vec<u8>>) = (d.import.clone(), d.log.iter().map(|(_, b)| b.clone()).collect());
     let Some(c) = m.conns.get_mut(&conn) else { return };
     c.open.insert(id, Opened { doc, sent: log.len(), seq: 0 });
     c.told.insert(doc, (online, state.waiting));
     let mut w = lock(&c.writer);
-    let opened = DocsEvent::Opened { id, doc, state };
+    let opened = DocsEvent::Opened { id, doc, state, peer };
     if let Ok(text) = serde_json::to_string(&opened) {
         let _ = w.send(Message::Text(text.into()));
     }

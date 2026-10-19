@@ -16,6 +16,10 @@ const NODE_SELECT: &str = "SELECT n.id, n.parent, n.name, n.is_dir, n.deleted, n
      v.mtime_ms AS v_mtime, v.exec AS v_exec, v.device AS v_device, v.epoch AS v_epoch, v.save AS v_save \
      FROM nodes n LEFT JOIN versions v ON v.space_id = n.space_id AND v.id = n.version";
 
+/// The most bytes of save records one page of the tree or the change feed carries (it ends early otherwise): with the
+/// rest of [`MAX_PAGE_NODES`] nodes, well under the 16 MiB an agent reads of a page.
+pub const MAX_PAGE_SAVE_BYTES: usize = 4 * 1024 * 1024;
+
 /// A space's epoch, current sequence number and root directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpaceInfo {
@@ -131,8 +135,19 @@ impl Meta {
             .fetch_all(&mut *tx)
             .await?;
         tx.commit().await?;
-        let more = rows.len() > usize::try_from(limit).map_err(|_| MetaError::Invalid("limit too large"))?;
-        let kept = if more { rows.len() - 1 } else { rows.len() };
+        let mut more = rows.len() > usize::try_from(limit).map_err(|_| MetaError::Invalid("limit too large"))?;
+        let mut kept = if more { rows.len() - 1 } else { rows.len() };
+        // Save records are what can make a page big (up to about 9 KiB each): the page ends early rather than pass
+        // their budget, so no listing comes near what an agent reads of one.
+        let mut save_bytes = 0usize;
+        for (i, row) in rows.iter().take(kept).enumerate() {
+            save_bytes = save_bytes.saturating_add(row.try_get::<Option<String>, _>("v_save")?.map_or(0, |s| s.len()));
+            if save_bytes > MAX_PAGE_SAVE_BYTES && i > 0 {
+                kept = i;
+                more = true;
+                break;
+            }
+        }
         let nodes = rows.iter().take(kept).map(node_state).collect::<Result<Vec<_>, _>>()?;
         let next = match (more, kept.checked_sub(1).and_then(|i| rows.get(i)), nodes.last()) {
             (true, Some(row), Some(last)) => Some(PageCursor { seq: to_u64(row.try_get("changed_seq")?)?, node: last.id }),

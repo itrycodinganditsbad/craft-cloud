@@ -18,8 +18,9 @@ use std::time::Duration;
 
 use craft_cloud_proto::DocId;
 use craft_cloud_proto::live::{AppName, ClientFrame, MAX_SNAPSHOT_BYTES, MAX_SUBSCRIPTIONS, PRESENCE_PER_SEC, ServerFrame};
+use craft_cloud_proto::local::peers::Leases;
 use craft_cloud_proto::local::{DocState, MAX_MACHINE_BYTES, MAX_TITLE_BYTES, NewRecent, NotLiveReason, RecentEntry, recent_path};
-use craft_cloud_proto::{NodeId, SpaceId};
+use craft_cloud_proto::{DeviceId, NodeId, SpaceId};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -45,6 +46,17 @@ pub struct HubConfig {
     pub machine: String,
     /// The synced folder (the paths apps open documents by are in it).
     pub folder: PathBuf,
+    /// This machine's device (the Loro peers its apps write with are made from it: [`peer_base`]).
+    pub device: DeviceId,
+}
+
+/// The base of the Loro peers this machine hands `app` ([`craft_cloud_proto::local::peers`]): the same on every run.
+pub fn peer_base(device: DeviceId, app: &str) -> u64 {
+    let mut h = blake3::Hasher::new();
+    h.update(b"craft-cloud peer v1\0");
+    h.update(device.as_uuid().as_bytes());
+    h.update(app.as_bytes());
+    u64::from_le_bytes(h.finalize().as_bytes().first_chunk::<8>().copied().unwrap_or_default())
 }
 
 /// How long an open of a file that isn't uploaded yet waits for its node (a sync pass is started for it).
@@ -62,10 +74,11 @@ pub type ConnId = u64;
 /// What the hub sends a docs connection, in order.
 #[derive(Debug, Clone)]
 pub enum DocOut {
-    /// The document opened as `id` is live: its state (a snapshot, then updates still waiting for their history).
-    Opened { id: u64, doc: DocId, state: DocState, snapshot: Vec<u8>, waiting: Vec<Vec<u8>> },
-    /// Send the file's content as an import.
-    NeedsImport { id: u64 },
+    /// The document opened as `id` is live: its state (a snapshot, then updates still waiting for their history), and
+    /// the Loro peer the app writes it with.
+    Opened { id: u64, doc: DocId, state: DocState, peer: Option<u64>, snapshot: Vec<u8>, waiting: Vec<Vec<u8>> },
+    /// Send the file's content as an import (written with `peer`).
+    NeedsImport { id: u64, peer: Option<u64> },
     /// The file opens as a plain file.
     NotLive { id: u64, reason: NotLiveReason, message: String },
     /// The app's update `seq` of `id` is on disk.
@@ -93,6 +106,8 @@ pub enum DocsCall {
         id: u64,
         path: String,
         app: String,
+        /// The peer the app had for the document before.
+        peer: Option<u64>,
     },
     Import {
         conn: ConnId,
@@ -314,6 +329,10 @@ struct Docs {
     importer: BTreeMap<DocId, (ConnId, u64)>,
     lookups: Vec<Lookup>,
     told: BTreeMap<DocId, (bool, u64, bool, bool)>,
+    /// Opens not answered yet: the app, and the peer it asked for again.
+    opens: HashMap<(ConnId, u64), (AppName, Option<u64>)>,
+    /// The Loro peers lent to open documents.
+    leases: Leases,
 }
 
 /// `text` cut to `max` bytes at a character boundary, without control characters.
@@ -505,7 +524,8 @@ impl State {
         match first {
             Some((conn, id)) => {
                 self.docs.importer.insert(doc, (conn, id));
-                self.tell(conn, DocOut::NeedsImport { id })
+                let peer = self.lease(conn, id, doc);
+                self.tell(conn, DocOut::NeedsImport { id, peer })
             }
             None => {
                 self.docs.importer.remove(&doc);
@@ -519,12 +539,21 @@ impl State {
         let Some((snapshot, waiting)) = self.replica.document_state(doc) else {
             return self.tell(conn, DocOut::NotLive { id, reason: NotLiveReason::Offline, message: "the document can't be read here".into() });
         };
+        let peer = self.lease(conn, id, doc);
+        self.docs.opens.remove(&(conn, id));
         let Some(c) = self.docs.conns.get_mut(&conn) else { return Vec::new() };
         c.handles.insert(id, doc);
         self.replica.set_open(doc, true);
         let (online, waiting_n) = self.replica.document_status(doc).unwrap_or((false, 0));
-        let state = DocState { online, waiting: waiting_n, bytes: snapshot.len() as u64 };
-        self.tell(conn, DocOut::Opened { id, doc, state, snapshot, waiting })
+        let state = DocState { online, waiting: waiting_n, bytes: snapshot.len() as u64, updates: waiting.len() as u64 };
+        self.tell(conn, DocOut::Opened { id, doc, state, peer, snapshot, waiting })
+    }
+
+    /// The Loro peer for open `id` on `conn` of `doc` (the one it has already, or the one it asked for again if free).
+    fn lease(&mut self, conn: ConnId, id: u64, doc: DocId) -> Option<u64> {
+        let (app, hint) = self.docs.opens.get(&(conn, id))?.clone();
+        let base = peer_base(self.config.device, app.as_str());
+        self.docs.leases.lease(doc, app.as_str(), base, (conn, id), hint, std::time::Instant::now())
     }
 
     /// A docs connection ended (or was dropped): its documents are closed, its waiting opens dropped, an import it was
@@ -534,6 +563,9 @@ impl State {
         for doc in c.handles.values() {
             self.replica.set_open(*doc, false);
         }
+        // Gone without closing: its peers are kept for a while, for its apps to come back to.
+        self.docs.leases.gone(conn, std::time::Instant::now());
+        self.docs.opens.retain(|(c, _), _| *c != conn);
         self.docs.lookups.retain(|l| l.conn != conn);
         for waiting in self.docs.waiting.values_mut() {
             waiting.retain(|(c, _)| *c != conn);
@@ -559,7 +591,7 @@ impl State {
     }
 
     /// An app opens `path` as `id`.
-    fn open(&mut self, conn: ConnId, id: u64, path: &str, app: &str) -> Vec<ClientFrame> {
+    fn open(&mut self, conn: ConnId, id: u64, path: &str, app: &str, peer: Option<u64>) -> Vec<ClientFrame> {
         let not_live = |reason, message: &str| DocOut::NotLive { id, reason, message: message.to_owned() };
         let Some(c) = self.docs.conns.get(&conn) else { return Vec::new() };
         if c.handles.contains_key(&id)
@@ -582,6 +614,7 @@ impl State {
             Ok(m) if m.is_file() => {}
             _ => return self.tell(conn, not_live(NotLiveReason::NotInFolder, "there is no such file in the synced folder")),
         }
+        self.docs.opens.insert((conn, id), (app.clone(), peer));
         match self.lookup.file_node(&rel) {
             Some(node) => self.open_node(conn, id, node, &app),
             None => {
@@ -664,7 +697,7 @@ impl State {
                 self.docs.conns.insert(conn, DocsConn { out, handles: BTreeMap::new(), presence: HashMap::new() });
                 Vec::new()
             }
-            DocsCall::Open { conn, id, path, app } => self.open(conn, id, &path, &app),
+            DocsCall::Open { conn, id, path, app, peer } => self.open(conn, id, &path, &app, peer),
             DocsCall::Import { conn, id, bytes } => {
                 let doc = self.docs.importer.iter().find(|(_, who)| **who == (conn, id)).map(|(doc, _)| *doc);
                 let Some(doc) = doc else {
@@ -730,6 +763,7 @@ impl State {
                         c.handles.remove(&id);
                         c.presence.remove(&id);
                         self.replica.set_open(doc, false);
+                        self.docs.leases.release((conn, id));
                     }
                 }
                 Vec::new()

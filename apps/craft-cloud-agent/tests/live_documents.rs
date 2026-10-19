@@ -33,6 +33,9 @@ impl AppDoc {
         let loro = LoroDoc::new();
         loro.set_peer_id(peer).unwrap();
         loro.import(doc.state()).unwrap();
+        for u in doc.state_updates() {
+            loro.import(u).unwrap();
+        }
         Self { loro, doc }
     }
 
@@ -144,6 +147,56 @@ async fn a_file_opened_on_one_machine_is_live_on_the_other() {
     drop((docs_pc, docs_laptop, s));
     run_pc.stop().await.0.unwrap();
     run_laptop.stop().await.0.unwrap();
+}
+
+/// The agent lends each open a Loro peer from its pool: two opens at once get distinct ones (the import's is the
+/// first open's), a closed one's goes to the next open, and an open that asks for its peer again gets it while free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opens_get_peers_from_the_agents_pool() {
+    use craft_cloud_app::live::OpenOptions;
+    let server = Server::new().await;
+    let pc = Agent::signed_in(&server, "pc").await;
+    let run_pc = pc.run();
+    let on_pc = pc.client().await;
+    std::fs::create_dir_all(&pc.folder).unwrap();
+    std::fs::write(pc.folder.join("p.txt"), "pooled").unwrap();
+    let c = on_pc.clone();
+    eventually("the file is synced", move || {
+        let docs = c.documents().ok()?;
+        matches!(docs.open("p.txt", "wordcraft").ok()?, Opened::NeedsImport(_)).then_some(())
+    })
+    .await;
+    let c = on_pc.clone();
+    let peers = off(move || {
+        let docs = c.documents().unwrap();
+        let import_peer = match docs.open("p.txt", "wordcraft").unwrap() {
+            Opened::NeedsImport(importer) => importer.peer(),
+            _ => panic!("not asked for the import"),
+        };
+        drop(docs);
+        let (one, two) = (c.documents().unwrap(), c.documents().unwrap());
+        let a = open(&one, "p.txt", "pooled");
+        let b = open(&two, "p.txt", "pooled");
+        let (pa, pb) = (a.peer(), b.peer());
+        // A close frees its peer for the next open.
+        drop(b);
+        let next = open(&two, "p.txt", "pooled").peer();
+        // A new connection asking for a peer held by a live open gets another; one that is free, itself.
+        let three = c.documents().unwrap();
+        let taken = match three.open_with("p.txt", "wordcraft", &OpenOptions { peer: pa }).unwrap() {
+            Opened::Live(d) => d.peer(),
+            _ => panic!("not live"),
+        };
+        (import_peer, pa, pb, next, taken, a, one, two, three)
+    })
+    .await;
+    let (import_peer, pa, pb, next, taken, ..) = &peers;
+    assert!(import_peer.is_some() && pa.is_some() && pb.is_some());
+    assert_ne!(pa, pb, "two opens at once");
+    assert_eq!(next, pb, "a closed open's peer is the next one's");
+    assert!(taken.is_some() && taken != pa, "a peer held by a live open isn't lent twice");
+    drop(peers);
+    run_pc.stop().await.0.unwrap();
 }
 
 /// Snapshots go through the chunk API: the import goes up before `create` names it, a compaction's snapshot before

@@ -613,6 +613,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             token: account.token.clone(),
             machine: account.device_name.clone(),
             folder: account.folder.clone(),
+            device: account.device,
         };
         let hub = match Hub::start(hub_config, control.clone(), user_paused) {
             Ok(hub) => Some(hub),

@@ -401,6 +401,44 @@ fn open_other() -> Vec<u8> {
 }
 
 /// A session opened off the UI thread can be handed to it.
+/// Peers come from the agent's small pool: two sessions of one app on one machine at once get distinct ones, a closed
+/// session's peer is the next one's, a reconnect keeps its peer, and after many sessions opened, edited and closed
+/// (and others on another machine) the document's version vector, so a save record, has only the pool's peers.
+#[test]
+fn peers_come_from_the_agents_pool_and_are_used_again() {
+    use craft_cloud_api::local::PEER_POOL;
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open::<App>(&pc, "p.txt", Notes::new("p", &[]));
+    let mut b = open::<App>(&pc, "p.txt", Notes::default());
+    assert_ne!(a.peer(), b.peer(), "two windows at once");
+    let b_peer = b.peer();
+    change(&mut b, |m| m.with_item(0, "from b")).unwrap();
+    until(&mut [&mut a, &mut b], "acked", |s| s.iter().all(|s| s.status().queued == 0));
+    drop(b);
+    let mut c = open::<App>(&pc, "p.txt", Notes::default());
+    assert_eq!(c.peer(), b_peer, "a closed window's peer is the next one's");
+    // A reconnect asks for its peer again and gets it.
+    let a_peer = a.peer();
+    pc.drop_connections();
+    until(&mut [&mut a, &mut c], "back", |s| s.iter().all(|s| s.status().connected));
+    assert_eq!((a.peer(), c.peer()), (a_peer, b_peer));
+    drop(c);
+    for round in 0..30 {
+        let fake = if round % 2 == 0 { &pc } else { &laptop };
+        let mut s = open::<App>(fake, "p.txt", Notes::default());
+        change(&mut s, |m| m.with_item(0, &format!("round {round}"))).unwrap();
+        until(&mut [&mut s], "acked", |s| s.iter().all(|s| s.status().queued == 0));
+    }
+    until(&mut [&mut a], "every round", |s| s[0].model().items.len() == 31);
+    change(&mut a, |m| m.with_title("last")).unwrap();
+    let doc = loro::LoroDoc::new();
+    doc.import(&a.snapshot().unwrap()).unwrap();
+    let peers = doc.oplog_vv().len();
+    assert!(peers <= 2 * PEER_POOL, "{peers} peers in the version vector");
+    assert!(peers <= 4, "a window open the whole time, and one at a time besides on each machine: {peers}");
+}
+
 #[test]
 fn a_session_can_move_to_another_thread() {
     fn send<T: Send>() {}
