@@ -8,6 +8,11 @@
 //! - **Linux**: `craft-cloud-<version>-linux-<arch>.tar.gz`: both programs, the icon, and `install.sh` and
 //!   `uninstall.sh` (`packaging/linux/`), which install into `~/.local`.
 //!
+//! Each package carries `LICENSES.txt` ([`licenses_text`]), installed next to the programs: Craft Cloud's own licences
+//! and NOTICE, and the licences of what is bundled that need their text to go along: the fonts egui builds into the
+//! app (from `epaint_default_fonts`) and the Boost licence of `clipboard-win` and `error-code` (the app's Windows
+//! clipboard) and `xxhash-rust` (in the agent). The third-party texts are read from the crates cargo fetched.
+//!
 //! The last line printed is the package's path.
 
 use std::path::{Path, PathBuf};
@@ -33,6 +38,75 @@ fn fresh_dir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
+/// The licences' file in every package.
+pub const LICENSES: &str = "LICENSES.txt";
+
+/// The bundled crates whose licence texts go along, and the file in each with the text: (heading, crate, files).
+const THIRD_PARTY: &[(&str, &str, &[&str])] = &[
+    (
+        "The fonts in the app (egui's default fonts, crate epaint_default_fonts): Ubuntu-Light under the Ubuntu Font \
+         Licence 1.0, NotoEmoji-Regular under the SIL Open Font License 1.1, Hack-Regular and emoji-icon-font under \
+         the MIT License",
+        "epaint_default_fonts",
+        &["fonts/UFL.txt", "fonts/OFL.txt", "fonts/Hack-Regular.txt", "fonts/emoji-icon-font-mit-license.txt"],
+    ),
+    (
+        "clipboard-win and error-code (the app's clipboard on Windows) and xxhash-rust (in the agent), under the Boost \
+         Software License 1.0",
+        "error-code",
+        &["LICENSE"],
+    ),
+];
+
+/// `LICENSES.txt`: Craft Cloud's `NOTICE`, `LICENSE-MIT` and `LICENSE-APACHE`, then each of `third_party`'s heading
+/// and texts.
+pub fn licenses_text(notice: &str, mit: &str, apache: &str, third_party: &[(&str, Vec<String>)]) -> String {
+    let rule = "=".repeat(80);
+    let mut text = format!("Craft Cloud: its licences, and those of the third-party material bundled with it.\n\n{rule}\n{}\n", notice.trim_end());
+    for own in [mit, apache] {
+        text.push_str(&format!("\n{rule}\n{}\n", own.trim_end()));
+    }
+    for (heading, texts) in third_party {
+        text.push_str(&format!("\n{rule}\n{heading}\n"));
+        for one in texts {
+            text.push_str(&format!("\n{}\n", one.trim_end()));
+        }
+    }
+    text
+}
+
+/// The folder of the crate `name` (any version in the lock), from `cargo metadata`'s JSON: its `manifest_path`'s.
+pub fn crate_dir(metadata: &str, name: &str) -> Option<PathBuf> {
+    let key = "\"manifest_path\":\"";
+    metadata.match_indices(key).find_map(|(at, _)| {
+        let rest = metadata.get(at + key.len()..)?;
+        let manifest = rest.get(..rest.find('"')?)?.replace("\\\\", "\\");
+        let dir = manifest.strip_suffix("Cargo.toml")?.trim_end_matches(['/', '\\']);
+        let version = dir.rsplit(['/', '\\']).next()?.strip_prefix(name)?.strip_prefix('-')?;
+        version.starts_with(|c: char| c.is_ascii_digit()).then(|| PathBuf::from(dir))
+    })
+}
+
+/// Writes `LICENSES.txt` to `to`.
+fn write_licenses(root: &Path, to: &Path) -> Result<(), String> {
+    let read = |path: &Path| std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()));
+    let mut cmd = crate::cargo();
+    cmd.args(["metadata", "--format-version", "1", "--locked"]);
+    let output = cmd.output().map_err(|e| format!("cargo metadata: failed to spawn: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("cargo metadata: exited with {}", output.status));
+    }
+    let metadata = String::from_utf8_lossy(&output.stdout);
+    let mut third_party = Vec::new();
+    for (heading, name, files) in THIRD_PARTY {
+        let dir = crate_dir(&metadata, name).ok_or_else(|| format!("{name} isn't among the crates (its licence text goes in {LICENSES})"))?;
+        let texts = files.iter().map(|file| read(&dir.join(file))).collect::<Result<Vec<_>, _>>()?;
+        third_party.push((*heading, texts));
+    }
+    let text = licenses_text(&read(&root.join("NOTICE"))?, &read(&root.join("LICENSE-MIT"))?, &read(&root.join("LICENSE-APACHE"))?, &third_party);
+    std::fs::write(to, text).map_err(|e| format!("{}: {e}", to.display()))
+}
+
 pub fn run(root: &Path) -> Result<(), String> {
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).map_err(|e| format!("Cargo.toml: {e}"))?;
     let version = crate::version::read(&manifest)?;
@@ -41,6 +115,7 @@ pub fn run(root: &Path) -> Result<(), String> {
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     crate::cargo_step(&["build", "--release", "--locked", "-p", "craft-cloud-desktop", "--bin", "craft-cloud", "-p", "craft-cloud-agent", "--bins"])?;
     let release = target.join("release");
+    write_licenses(root, &release.join(LICENSES))?;
     let package = if cfg!(windows) {
         windows(&release, &out)?
     } else if cfg!(target_os = "macos") {
@@ -52,7 +127,7 @@ pub fn run(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The setup, built with the exes in it.
+/// The setup, built with the exes and the licences in it.
 fn windows(release: &Path, out: &Path) -> Result<PathBuf, String> {
     let mut build = crate::cargo();
     build.args(["build", "--release", "--locked", "-p", "craft-cloud-setup"]).env("CRAFT_CLOUD_SETUP_PAYLOAD", release);
@@ -109,6 +184,7 @@ fn macos(root: &Path, release: &Path, out: &Path, version: &str) -> Result<PathB
         copy(&release.join(name), &macos.join(name))?;
     }
     copy(&root.join("apps").join("craft-cloud-desktop").join("assets").join("icon.icns"), &resources.join("icon.icns"))?;
+    copy(&release.join(LICENSES), &resources.join(LICENSES))?;
     std::fs::write(contents.join("Info.plist"), info_plist(version)).map_err(|e| format!("Info.plist: {e}"))?;
     let zip = out.join(format!("craft-cloud-{version}-macos-{}.zip", std::env::consts::ARCH));
     let _ = std::fs::remove_file(&zip);
@@ -123,7 +199,7 @@ pub fn linux_name(version: &str, arch: &str) -> String {
     format!("craft-cloud-{version}-linux-{arch}")
 }
 
-/// The tarball: the programs, the icon and the scripts in a folder of the package's name.
+/// The tarball: the programs, the icon, the licences and the scripts in a folder of the package's name.
 fn linux(root: &Path, release: &Path, out: &Path, version: &str) -> Result<PathBuf, String> {
     let name = linux_name(version, std::env::consts::ARCH);
     let stage = out.join(&name);
@@ -132,6 +208,7 @@ fn linux(root: &Path, release: &Path, out: &Path, version: &str) -> Result<PathB
         copy(&release.join(program), &stage.join(program))?;
     }
     copy(&root.join("apps").join("craft-cloud-desktop").join("assets").join("icon.png"), &stage.join("craft-cloud.png"))?;
+    copy(&release.join(LICENSES), &stage.join(LICENSES))?;
     for script in ["install.sh", "uninstall.sh"] {
         let to = stage.join(script);
         copy(&root.join("packaging").join("linux").join(script), &to)?;
@@ -160,6 +237,45 @@ mod tests {
         assert!(plist.contains("<string>craft-cloud</string>") && plist.contains("<string>0.1.0</string>"));
     }
 
+    #[test]
+    fn the_licences_file_has_every_text_with_its_heading() {
+        let fonts = ("The fonts", vec!["UBUNTU FONT LICENCE\n".to_owned(), "SIL OPEN FONT LICENSE\n".to_owned()]);
+        let text = licenses_text("Craft Cloud NOTICE\n", "MIT text", "Apache text\n\n", &[fonts]);
+        let order = ["Craft Cloud NOTICE", "MIT text", "Apache text", "The fonts", "UBUNTU FONT LICENCE", "SIL OPEN FONT LICENSE"];
+        let at: Vec<usize> = order.iter().map(|part| text.find(part).unwrap_or_else(|| panic!("{part} missing:\n{text}"))).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{text}");
+    }
+
+    #[test]
+    fn a_crates_folder_is_found_in_cargos_metadata() {
+        let metadata = r#"{"packages":[{"name":"error-code-ext","manifest_path":"/r/error-code-ext-1.0.0/Cargo.toml"},{"name":"error-code","manifest_path":"C:\\reg\\error-code-3.4.0\\Cargo.toml"}]}"#;
+        let dir = crate_dir(metadata, "error-code").unwrap();
+        assert_eq!(dir.display().to_string(), r"C:\reg\error-code-3.4.0");
+        assert_eq!(crate_dir(metadata, "epaint_default_fonts"), None);
+    }
+
+    /// The real texts, as `cargo xtask package` writes them: every one is there.
+    #[test]
+    fn the_licences_file_is_written_from_the_crates() {
+        let dir = std::env::temp_dir().join(format!("craft-cloud-licences-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_licenses(&crate::root(), &dir.join(LICENSES)).unwrap();
+        let text = std::fs::read_to_string(dir.join(LICENSES)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        for part in [
+            "Craft Cloud",
+            "MIT License",
+            "Apache License",
+            "UBUNTU FONT LICENCE",
+            "SIL OPEN FONT LICENSE",
+            "Hack",
+            "John Slegers",
+            "Boost Software License",
+        ] {
+            assert!(text.contains(part), "{part} missing");
+        }
+    }
+
     /// `install.sh` and `uninstall.sh` in a temporary home, with stand-ins for the programs (the agent records how it
     /// was called): the files, links, menu entry and icon go in and out; start at login is moved to the new copy when
     /// the agent had it; the synced and data folders stay.
@@ -179,6 +295,7 @@ mod tests {
         std::fs::write(src.join("craft-cloud-agent"), agent).unwrap();
         std::fs::write(src.join("craft-cloud"), "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::write(src.join("craft-cloud.png"), "png").unwrap();
+        std::fs::write(src.join(LICENSES), "licences").unwrap();
         for script in ["install.sh", "uninstall.sh"] {
             std::fs::copy(root.join("packaging").join("linux").join(script), src.join(script)).unwrap();
         }
@@ -212,6 +329,7 @@ mod tests {
         let menu = std::fs::read_to_string(home.join(".local/share/applications/craft-cloud.desktop")).unwrap();
         assert!(menu.contains(&format!("Exec=\"{}\"", lib.join("craft-cloud").display())) && menu.contains("Name=Craft Cloud"), "{menu}");
         assert!(home.join(".local/share/icons/hicolor/256x256/apps/craft-cloud.png").is_file());
+        assert_eq!(std::fs::read_to_string(lib.join(LICENSES)).unwrap(), "licences", "the licences go along");
         assert!(!home.join("Desktop").exists(), "nothing on the desktop");
         let said = std::fs::read_to_string(&calls).unwrap();
         assert!(said.contains("agent quit") && said.contains("agent autostart on"), "{said}");
@@ -278,6 +396,7 @@ mod tests {
             std::fs::write(src.join("craft-cloud-agent"), agent).unwrap();
             std::fs::write(src.join("craft-cloud"), "#!/bin/sh\nexit 0\n").unwrap();
             std::fs::write(src.join("craft-cloud.png"), "png").unwrap();
+            std::fs::write(src.join(LICENSES), "licences").unwrap();
             std::fs::copy(crate::root().join("packaging/linux/install.sh"), src.join("install.sh")).unwrap();
             std::fs::write(bin.join("systemctl"), format!("#!/bin/sh\necho \"systemctl $*\" >> \"{}\"\n", calls.display())).unwrap();
             for file in [src.join("craft-cloud-agent"), src.join("craft-cloud"), src.join("install.sh"), bin.join("systemctl")] {

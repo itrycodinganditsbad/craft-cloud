@@ -14,7 +14,8 @@ The app comes with the agent, and installs for you alone: no admin rights, and n
   `~/.local/lib/craft-cloud`, links `craft-cloud` and `craft-cloud-agent` into `~/.local/bin` and adds Craft
   Cloud to the app menu (`--no-menu` leaves that out). Running it again upgrades. `./uninstall.sh` removes it.
 
-Uninstalling keeps your synced folder and the agent's data folder (the sign-in).
+Uninstalling keeps your synced folder and the agent's data folder (the sign-in). Every package carries
+`LICENSES.txt`, installed next to the programs: Craft Cloud's licences and those of the third-party material in it.
 
 Open Craft Cloud and enter a join string: an invite from the server's admin (`craft-cloud-server user invite`),
 or a code from a computer that is signed in (Add a computer there). Then this computer starts syncing by itself

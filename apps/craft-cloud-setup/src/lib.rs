@@ -1,5 +1,5 @@
-//! Craft Cloud's Windows setup: installs `craft-cloud.exe`, `craft-cloud-agent.exe` and `craft-cloud-agent-bg.exe` for
-//! this user into `%LOCALAPPDATA%\Programs\Craft Cloud` (no admin rights), with an "Apps & features" entry and a
+//! Craft Cloud's Windows setup: installs `craft-cloud.exe`, `craft-cloud-agent.exe` and `craft-cloud-agent-bg.exe`
+//! (with `LICENSES.txt`) for this user into `%LOCALAPPDATA%\Programs\Craft Cloud` (no admin rights), with an "Apps & features" entry and a
 //! Start-menu shortcut (unless `--no-start-menu`); `--uninstall` takes them away again.
 //!
 //! - **Install** ([`install`]): the app is closed and a running agent stopped first: asked to quit through its local
@@ -29,11 +29,13 @@ pub const DIR_NAME: &str = "Craft Cloud";
 /// An older install's folder (made by hand, before there was a setup).
 pub const OLD_DIR_NAME: &str = "craft-cloud";
 /// The files installed, besides the setup itself.
-pub const FILES: [&str; 3] = ["craft-cloud.exe", "craft-cloud-agent.exe", "craft-cloud-agent-bg.exe"];
+pub const FILES: [&str; 4] = ["craft-cloud.exe", "craft-cloud-agent.exe", "craft-cloud-agent-bg.exe", LICENSES];
 pub const APP_EXE: &str = "craft-cloud.exe";
 pub const AGENT_EXE: &str = "craft-cloud-agent.exe";
 pub const AGENT_BG_EXE: &str = "craft-cloud-agent-bg.exe";
 pub const SETUP_EXE: &str = "craft-cloud-setup.exe";
+/// Craft Cloud's licences and those of the third-party material in it (written by `cargo xtask package`).
+pub const LICENSES: &str = "LICENSES.txt";
 /// The `Run` values: the agent's and the app's.
 pub const AGENT_RUN_VALUE: &str = "Craft Cloud";
 pub const APP_RUN_VALUE: &str = "Craft Cloud tray";
@@ -50,6 +52,7 @@ pub const PAYLOAD: &[(&str, &[u8])] = &[
     (APP_EXE, include_bytes!(concat!(env!("CRAFT_CLOUD_SETUP_PAYLOAD"), "/craft-cloud.exe"))),
     (AGENT_EXE, include_bytes!(concat!(env!("CRAFT_CLOUD_SETUP_PAYLOAD"), "/craft-cloud-agent.exe"))),
     (AGENT_BG_EXE, include_bytes!(concat!(env!("CRAFT_CLOUD_SETUP_PAYLOAD"), "/craft-cloud-agent-bg.exe"))),
+    (LICENSES, include_bytes!(concat!(env!("CRAFT_CLOUD_SETUP_PAYLOAD"), "/LICENSES.txt"))),
 ];
 #[cfg(not(payload))]
 pub const PAYLOAD: &[(&str, &[u8])] = &[];

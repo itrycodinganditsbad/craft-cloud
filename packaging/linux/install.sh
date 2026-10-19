@@ -1,6 +1,6 @@
 #!/bin/sh
 # Installs Craft Cloud for this user, from the folder this script is in (the unpacked tarball):
-#   ~/.local/lib/craft-cloud/      craft-cloud (the app) and craft-cloud-agent
+#   ~/.local/lib/craft-cloud/      craft-cloud (the app), craft-cloud-agent and LICENSES.txt
 #   ~/.local/bin/                  links to both
 #   ~/.local/share/applications/   craft-cloud.desktop (the app menu's entry), unless --no-menu
 #   ~/.local/share/icons/          the icon
@@ -89,6 +89,7 @@ for name in craft-cloud craft-cloud-agent; do
     mv -f "$lib/.$name.new" "$lib/$name"
     ln -sf "$lib/$name" "$bin/$name"
 done
+cp "$here/LICENSES.txt" "$lib/LICENSES.txt"
 cp "$here/craft-cloud.png" "$icons/craft-cloud.png"
 
 if [ "$menu" = 1 ]; then
