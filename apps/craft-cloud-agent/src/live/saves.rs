@@ -103,8 +103,10 @@ impl SaveBook {
         Self { path, space, cache }
     }
 
+    /// The entries on disk; one that doesn't read (an earlier build's form, a damaged one) is left out, the rest kept.
     fn entries(&self) -> Vec<Entry> {
-        std::fs::read(&self.path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+        let all: Vec<serde_json::Value> = std::fs::read(&self.path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        all.into_iter().filter_map(|e| serde_json::from_value(e).ok()).collect()
     }
 
     /// The entries by document and content, from the cache unless the file changed.
@@ -256,6 +258,13 @@ mod tests {
         let reopened = SaveBook::new(temp.path(), space);
         assert!(reopened.record(node, &FileHash::from_bytes([20; 32])).is_some(), "kept on disk");
         assert!(reopened.record(node, &FileHash::from_bytes([0; 32])).is_none(), "the oldest went");
+        // An entry in an earlier build's form is left out; the others still read.
+        let mut on_disk: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&book.path).unwrap()).unwrap();
+        on_disk.insert(0, serde_json::json!({ "doc": doc, "hash": hex(&[200; 32]), "version": [[1, 5]], "at_ms": 1 }));
+        std::fs::write(&book.path, serde_json::to_vec(&on_disk).unwrap()).unwrap();
+        let reread = SaveBook { path: book.path.clone(), space, cache: Arc::new(Mutex::new(None)) };
+        assert!(reread.record(node, &FileHash::from_bytes([20; 32])).is_some(), "the others read");
+        assert!(reread.record(node, &FileHash::from_bytes([200; 32])).is_none());
         // No hub: which is newer can't be told.
         let (a, b) = (SaveRecord { doc, frontiers: vec![(1, 2)] }, SaveRecord { doc, frontiers: vec![(1, 1)] });
         assert_eq!(book.includes(&a, &b), None);

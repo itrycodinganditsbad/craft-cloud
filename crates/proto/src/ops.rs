@@ -21,8 +21,8 @@ pub struct NewVersion {
     pub mtime_ms: i64,
     pub exec: bool,
     /// A Craft app saved this content from a live document: which, and its version then. Appended: an older agent
-    /// sends none, an older server ignores it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// sends none, an older server ignores it. One that doesn't read is none ([`SaveRecord::lenient`]).
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "SaveRecord::lenient")]
     pub save: Option<SaveRecord>,
 }
 
@@ -112,8 +112,9 @@ pub struct FileState {
     /// The space epoch the version was committed in.
     pub epoch: Epoch,
     /// The version's save record, when a Craft app saved it from a live document (see [`NewVersion::save`]).
-    /// Appended: an older server sends none, an older agent ignores it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Appended: an older server sends none, an older agent ignores it. One that doesn't read (an earlier build's
+    /// form, a damaged one) is none, and the file state reads ([`SaveRecord::lenient`]).
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "SaveRecord::lenient")]
     pub save: Option<SaveRecord>,
 }
 
@@ -327,8 +328,21 @@ mod tests {
         let json = serde_json::to_value(&state).unwrap();
         assert!(json.get("save").is_some());
         assert!(serde_json::from_value::<OlderFileState>(json).is_ok());
-        // A record from before frontiers (a version vector) reads as no record.
+        // A record from before frontiers (a version vector), a damaged one or one not well formed is no record, and the
+        // file state and new version holding it still read (the reviewer's probe: the whole file state failed).
         let vector = serde_json::json!({ "doc": doc, "version": [[1, 5]] });
-        assert!(serde_json::from_value::<SaveRecord>(vector).is_err());
+        assert!(serde_json::from_value::<SaveRecord>(vector.clone()).is_err());
+        for odd in [vector, serde_json::json!("junk"), serde_json::json!({ "doc": doc, "frontiers": [[2, 1], [1, 5]] })] {
+            let mut j = serde_json::to_value(&state).unwrap();
+            j["save"] = odd.clone();
+            let read = serde_json::from_value::<FileState>(j).unwrap_or_else(|e| panic!("{odd}: {e}"));
+            assert_eq!(read, FileState { save: None, ..state.clone() });
+            let mut j = serde_json::to_value(&saved).unwrap();
+            j["save"] = odd;
+            assert_eq!(serde_json::from_value::<NewVersion>(j).unwrap(), plain);
+        }
+        let mut j = serde_json::to_value(&state).unwrap();
+        j["save"] = serde_json::Value::Null;
+        assert_eq!(serde_json::from_value::<FileState>(j).unwrap().save, None);
     }
 }

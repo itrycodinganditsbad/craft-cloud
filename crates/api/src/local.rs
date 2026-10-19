@@ -533,6 +533,22 @@ impl SaveRecord {
     pub fn is_valid(&self) -> bool {
         self.frontiers.len() <= MAX_SAVE_HEADS && self.frontiers.windows(2).all(|w| matches!(w, [a, b] if a < b))
     }
+
+    /// Reads an optional record field leniently (`#[serde(deserialize_with)]`): a record that doesn't read (an older
+    /// build's form, a damaged one, an unknown later one) or isn't well formed is no record, and only the record is
+    /// lost, never what holds it.
+    pub fn lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<SaveRecord>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Any {
+            Record(SaveRecord),
+            Other(serde::de::IgnoredAny),
+        }
+        Ok(match Option::<Any>::deserialize(d)? {
+            Some(Any::Record(r)) if r.is_valid() => Some(r),
+            _ => None,
+        })
+    }
 }
 
 /// How a document stands, as `opened` and `status` say it.
