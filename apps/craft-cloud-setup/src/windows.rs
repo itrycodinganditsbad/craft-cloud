@@ -41,6 +41,18 @@ pub fn start_detached(program: &Path, args: &str, dir: &Path) -> Command {
     command
 }
 
+/// Removes the folder `dir` once the process `pid` has ended (it holds its own exe, in the folder), trying again for
+/// a while if a file is still held. .NET's recursive delete doesn't follow links inside the folder.
+pub fn remove_after(pid: u32, dir: &Path) -> Command {
+    let mut command = powershell(
+        "Wait-Process -Id $env:CRAFT_CLOUD_PID -Timeout 3600 -ErrorAction SilentlyContinue; \
+         for ($i = 0; $i -lt 60 -and (Test-Path -LiteralPath $env:CRAFT_CLOUD_DIR); $i++) { \
+         try { [System.IO.Directory]::Delete($env:CRAFT_CLOUD_DIR, $true) } catch { Start-Sleep -Milliseconds 500 } }",
+    );
+    command.env("CRAFT_CLOUD_PID", pid.to_string()).env("CRAFT_CLOUD_DIR", dir).creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    command
+}
+
 /// `HKEY_CURRENT_USER`.
 pub struct UserRegistry;
 
@@ -183,14 +195,7 @@ impl Machine for ThisMachine {
     }
 
     fn remove_after_exit(&self, dir: &Path) -> Result<(), String> {
-        // `cmd` waits a few seconds (this setup has ended by then), then removes the folder. A folder under
-        // %LOCALAPPDATA% can't hold a `"`; inside the quotes `&` and spaces are plain.
-        let line = format!("/d /c ping -n 4 127.0.0.1 >nul & rmdir /s /q \"{}\"", dir.display());
-        quiet(Path::new("cmd.exe"))
-            .raw_arg(line)
-            .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("the program folder can't be removed: {e}"))
+        // Waits for this setup to end, however long its last message stays open.
+        remove_after(std::process::id(), dir).spawn().map(|_| ()).map_err(|e| format!("the program folder can't be removed: {e}"))
     }
 }

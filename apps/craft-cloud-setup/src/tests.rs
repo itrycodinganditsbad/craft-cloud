@@ -467,3 +467,23 @@ fn a_detached_start_keeps_none_of_the_setups_handles() {
     assert!(!done.exists(), "it runs on");
     assert!(comes(|| done.exists()), "and it was started");
 }
+
+/// Uninstalling from "Apps & features": the program folder goes once the setup in it has ended, however long its
+/// last message stayed open (here a `ping` of seven seconds stands for the setup), not after a fixed delay.
+#[cfg(windows)]
+#[test]
+fn the_program_folder_goes_once_the_setup_has_ended() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("Craft Cloud");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join(SETUP_EXE), "setup").unwrap();
+    std::fs::write(dir.join("sub").join("file.txt"), "file").unwrap();
+    let mut setup = std::process::Command::new("ping").args(["-n", "8", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+    let mut remover = crate::windows::remove_after(setup.id(), &dir).spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    assert!(dir.join(SETUP_EXE).exists(), "not while the setup runs");
+    setup.wait().unwrap();
+    remover.wait().unwrap();
+    assert!(!dir.exists(), "gone once it has ended");
+    assert!(root.path().exists(), "only the folder");
+}
