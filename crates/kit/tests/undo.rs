@@ -119,3 +119,36 @@ fn a_group_and_a_split_change_are_one_step_each() {
     until(&mut [&mut a, &mut b], "all redone", |s| s.iter().all(|s| s.model().grid.cells.len() == 5 && story(s) == "one two three four"));
     assert!(a.status().error.is_none(), "{:?}", a.status().error);
 }
+
+/// An undo asked for during a gesture (remote changes held) changes nothing under the app: the gesture's change is
+/// taken (its `old` is still the session's model), and the undo runs once the gesture ends, after the held remote
+/// change (the reviewer's probe).
+#[test]
+fn an_undo_during_a_gesture_waits_for_its_end() {
+    use common::{App, Notes};
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open::<App>(&pc, "h.txt", Notes::new("t", &["x"]));
+    let mut b = open::<App>(&laptop, "h.txt", Notes::default());
+    change(&mut a, |m| m.with_item(1, "mine")).unwrap();
+    until(&mut [&mut a, &mut b], "both", |s| s.iter().all(|s| s.model().texts().len() == 2));
+    a.hold_remote(true);
+    let gesture_old = a.model().clone();
+    change(&mut b, |m| m.with_title("remote")).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    while std::time::Instant::now() < deadline {
+        b.poll();
+        a.poll();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!a.undo().unwrap(), "deferred");
+    assert!(Arc::ptr_eq(a.model(), &gesture_old), "nothing changed under the gesture");
+    let gesture_new = Arc::new(gesture_old.with_edit(0, "dragged"));
+    a.local_change(&gesture_old, &gesture_new).unwrap();
+    a.hold_remote(false);
+    assert!(a.poll().changed);
+    // The remote title came, and the deferred undo took back the gesture's change (the last step).
+    assert_eq!(*a.model().title, "remote");
+    assert_eq!(a.model().texts(), vec!["x", "mine"]);
+    until(&mut [&mut a, &mut b], "the same on both", |s| s.iter().all(|s| *s.model().title == "remote" && s.model().texts() == ["x", "mine"]));
+}

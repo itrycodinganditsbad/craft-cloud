@@ -288,6 +288,8 @@ pub struct Session<D: LiveDocument> {
     /// The agent refused a change for good (it doesn't decode, it is over the cap): nothing more is sent, and the
     /// session says it is stopped; the model stays editable, and saving to the file (without a record) keeps the work.
     refused: Option<String>,
+    /// Undos (`true`) and redos asked for while remote changes were held: run once the gesture ends.
+    deferred: Vec<bool>,
     /// The agent refused a change for now (its disk): the queue goes again, in order, from this moment.
     resend_at: Instant,
     resend_backoff: Duration,
@@ -501,6 +503,7 @@ impl<D: LiveDocument> Session<D> {
             waker: None,
             read_from: None,
             refused: None,
+            deferred: Vec::new(),
             resend_at: Instant::now(),
             resend_backoff: FIRST_BACKOFF,
         };
@@ -681,7 +684,9 @@ impl<D: LiveDocument> Session<D> {
     }
 
     /// Takes back this machine's last change (remote changes since stay). The model changes as after a remote change:
-    /// take [`Session::model`]. False if there was nothing to undo.
+    /// take [`Session::model`]. False if there was nothing to undo. While the app holds remote changes back
+    /// ([`Session::hold_remote`]: a gesture), the undo waits: it answers false now and runs at the first poll after the
+    /// gesture ends (which then says the model changed).
     pub fn undo(&mut self) -> Result<bool, KitError> {
         self.undo_redo(true)
     }
@@ -697,6 +702,12 @@ impl<D: LiveDocument> Session<D> {
         if self.outbox_bytes >= MAX_QUEUE_BYTES {
             self.status.stalled = true;
             return Err(KitError::Stalled(self.outbox_bytes));
+        }
+        // Mid-gesture nothing changes the model under the app (its `old` must stay the session's): the undo waits for
+        // the gesture's end, and runs at the first poll after it.
+        if self.held {
+            self.deferred.push(undo);
+            return Ok(false);
         }
         self.end_group();
         // What came meanwhile first, so the step applies to the newest document.
@@ -721,7 +732,7 @@ impl<D: LiveDocument> Session<D> {
     pub fn poll(&mut self) -> Polled {
         self.take_events();
         self.reconnect();
-        let changed = if self.held {
+        let mut changed = if self.held {
             false
         } else {
             match self.apply_incoming() {
@@ -732,6 +743,15 @@ impl<D: LiveDocument> Session<D> {
                 }
             }
         };
+        // Undos asked for during a gesture, now that it is over, in order.
+        if !self.held {
+            for undo in std::mem::take(&mut self.deferred) {
+                match self.undo_redo(undo) {
+                    Ok(done) => changed |= done,
+                    Err(e) => self.status.error = Some(e.to_string()),
+                }
+            }
+        }
         self.keep_presence();
         // What a refusal for now held back goes again once its pause is over.
         if self.outbox.iter().any(|o| o.seq.is_none()) {
