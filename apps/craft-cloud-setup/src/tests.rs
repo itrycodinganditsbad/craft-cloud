@@ -486,8 +486,8 @@ fn a_detached_start_keeps_none_of_the_setups_handles() {
     let dir = tempfile::tempdir().unwrap();
     let done = dir.path().join("done.txt");
     let cmd = std::env::var_os("ComSpec").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
-    // Ten seconds of `ping`, then a file.
-    let args = format!("/d /c ping -n 11 127.0.0.1 >nul & echo done> \"{}\"", done.display());
+    // Twenty seconds of `ping`, then a file.
+    let args = format!("/d /c ping -n 21 127.0.0.1 >nul & echo done> \"{}\"", done.display());
     let started = std::time::Instant::now();
     let out = crate::windows::start_detached(&cmd, &args, dir.path())
         .stdout(std::process::Stdio::piped())
@@ -495,27 +495,51 @@ fn a_detached_start_keeps_none_of_the_setups_handles() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
-    assert!(started.elapsed() < std::time::Duration::from_secs(8), "the pipe stayed open while the program ran: {:?}", started.elapsed());
+    // PowerShell's own start may take seconds on a cold machine; the program runs twenty.
+    assert!(started.elapsed() < std::time::Duration::from_secs(15), "the pipe stayed open while the program ran: {:?}", started.elapsed());
     assert!(!done.exists(), "it runs on");
     assert!(comes(|| done.exists()), "and it was started");
 }
 
 /// Uninstalling from "Apps & features": the program folder goes once the setup in it has ended, however long its
-/// last message stayed open (here a `ping` of seven seconds stands for the setup), not after a fixed delay.
+/// last message stayed open (here a `ping` of seven seconds stands for the setup), not after a fixed delay. Through
+/// PowerShell, and through `cmd` alone (where PowerShell can't run). A link inside the folder is removed, not followed.
 #[cfg(windows)]
 #[test]
 fn the_program_folder_goes_once_the_setup_has_ended() {
-    let root = tempfile::tempdir().unwrap();
-    let dir = root.path().join("Craft Cloud");
-    std::fs::create_dir_all(dir.join("sub")).unwrap();
-    std::fs::write(dir.join(SETUP_EXE), "setup").unwrap();
-    std::fs::write(dir.join("sub").join("file.txt"), "file").unwrap();
-    let mut setup = std::process::Command::new("ping").args(["-n", "8", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
-    let mut remover = crate::windows::remove_after(setup.id(), &dir).spawn().unwrap();
-    std::thread::sleep(std::time::Duration::from_secs(4));
-    assert!(dir.join(SETUP_EXE).exists(), "not while the setup runs");
-    setup.wait().unwrap();
-    remover.wait().unwrap();
-    assert!(!dir.exists(), "gone once it has ended");
-    assert!(root.path().exists(), "only the folder");
+    for with_cmd in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("Craft & Cloud");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), "keep").unwrap();
+        std::fs::write(dir.join(SETUP_EXE), "setup").unwrap();
+        std::fs::write(dir.join("sub").join("file.txt"), "file").unwrap();
+        let junction = std::process::Command::new(crate::windows::system_program("cmd.exe"))
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(dir.join("link"))
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(junction.status.success(), "{junction:?}");
+        let mut setup = std::process::Command::new(crate::windows::system_program("PING.EXE"))
+            .args(["-n", "8", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut remover = if with_cmd {
+            crate::windows::remove_after_with_cmd(setup.id(), "ping.exe", &dir)
+        } else {
+            crate::windows::remove_after(setup.id(), &dir)
+        }
+        .spawn()
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        assert!(dir.join(SETUP_EXE).exists(), "not while the setup runs (cmd: {with_cmd})");
+        setup.wait().unwrap();
+        remover.wait().unwrap();
+        assert!(!dir.exists(), "gone once it has ended (cmd: {with_cmd})");
+        assert!(outside.join("keep.txt").exists(), "the link wasn't followed (cmd: {with_cmd})");
+    }
 }

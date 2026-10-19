@@ -1,7 +1,7 @@
 //! The real registry (`HKEY_CURRENT_USER`) and programs, on Windows.
 
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -20,10 +20,17 @@ fn quiet(program: &Path) -> Command {
     command
 }
 
+/// Windows' own program `name` (`tasklist.exe`, `cmd.exe`, …), by its full path in `%SystemRoot%\System32`: a bare
+/// name is looked for in the setup's own folder first, where anything may have been put next to a download.
+pub fn system_program(name: &str) -> PathBuf {
+    let root = std::env::var_os("SystemRoot").map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    root.join("System32").join(name)
+}
+
 /// PowerShell running `script`, quietly. What the script works on goes in as environment variables, so nothing in a
 /// path is ever read as script.
 fn powershell(script: &str) -> Command {
-    let mut command = quiet(Path::new("powershell.exe"));
+    let mut command = quiet(&system_program(r"WindowsPowerShell\v1.0\powershell.exe"));
     command.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]);
     command
 }
@@ -41,15 +48,47 @@ pub fn start_detached(program: &Path, args: &str, dir: &Path) -> Command {
     command
 }
 
+/// The removal's `cmd` line: `rmdir /s /q` of the folder named by `CRAFT_CLOUD_DIR` (cmd expands the variable once;
+/// its value is never read as a command, and inside the quotes `&` and spaces are plain). `rmdir /s` removes a
+/// junction or link inside the folder without following it, so nothing outside the folder is ever removed.
+const RMDIR: &str = r#"rmdir /s /q "%CRAFT_CLOUD_DIR%""#;
+
 /// Removes the folder `dir` once the process `pid` has ended (it holds its own exe, in the folder), trying again for
-/// a while if a file is still held. .NET's recursive delete doesn't follow links inside the folder.
+/// a while if a file is still held: PowerShell waits for the process, then `cmd` removes the folder ([`RMDIR`],
+/// started with `Start-Process`, which works in PowerShell's constrained language mode too).
 pub fn remove_after(pid: u32, dir: &Path) -> Command {
     let mut command = powershell(
         "Wait-Process -Id $env:CRAFT_CLOUD_PID -Timeout 3600 -ErrorAction SilentlyContinue; \
          for ($i = 0; $i -lt 60 -and (Test-Path -LiteralPath $env:CRAFT_CLOUD_DIR); $i++) { \
-         try { [System.IO.Directory]::Delete($env:CRAFT_CLOUD_DIR, $true) } catch { Start-Sleep -Milliseconds 500 } }",
+         Start-Process -FilePath $env:CRAFT_CLOUD_CMD -ArgumentList $env:CRAFT_CLOUD_RMDIR -Wait -WindowStyle Hidden; \
+         if (Test-Path -LiteralPath $env:CRAFT_CLOUD_DIR) { Start-Sleep -Milliseconds 500 } }",
     );
-    command.env("CRAFT_CLOUD_PID", pid.to_string()).env("CRAFT_CLOUD_DIR", dir).creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    command
+        .env("CRAFT_CLOUD_PID", pid.to_string())
+        .env("CRAFT_CLOUD_DIR", dir)
+        .env("CRAFT_CLOUD_CMD", system_program("cmd.exe"))
+        .env("CRAFT_CLOUD_RMDIR", format!("/d /c {RMDIR}"));
+    detached_from(command, dir)
+}
+
+/// [`remove_after`] without PowerShell: `cmd` alone asks `tasklist` every second whether the process `pid` (whose
+/// exe is `image`) still runs, for up to an hour, then removes the folder ([`RMDIR`], again a moment later if a file
+/// was still held). The `if` is in parentheses of its own: cmd would take a following `& exit` as part of it.
+pub fn remove_after_with_cmd(pid: u32, image: &str, dir: &Path) -> Command {
+    let tasklist = system_program("tasklist.exe");
+    let line = format!(
+        "/d /c for /l %i in (1,1,3600) do @(\"{tasklist}\" /FI \"PID eq {pid}\" /NH | find /i \"{image}\" >nul && ping -n 2 127.0.0.1 >nul \
+         || ({RMDIR} & (if exist \"%CRAFT_CLOUD_DIR%\" (ping -n 2 127.0.0.1 >nul & {RMDIR})) & exit))",
+        tasklist = tasklist.display()
+    );
+    let mut command = quiet(&system_program("cmd.exe"));
+    command.raw_arg(line).env("CRAFT_CLOUD_DIR", dir);
+    detached_from(command, dir)
+}
+
+/// In a process group of its own, and working in the folder above `dir` (a remover working inside it would hold it).
+fn detached_from(mut command: Command, dir: &Path) -> Command {
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP).current_dir(dir.parent().unwrap_or(dir));
     command
 }
 
@@ -97,7 +136,7 @@ pub struct ThisMachine;
 /// Whether the process `pid` runs and is an agent (`craft-cloud-agent*.exe`): a pid of an agent that has ended may
 /// already belong to another program, which is never touched. An error when `tasklist` can't tell.
 fn agent_alive(pid: u32) -> Result<bool, String> {
-    let ran = quiet(Path::new("tasklist"))
+    let ran = quiet(&system_program("tasklist.exe"))
         .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
         .stdout(Stdio::piped())
         .output()
@@ -159,7 +198,7 @@ impl Machine for ThisMachine {
             Err(e) => return unknown(e),
         }
         // Then ended: the agent's writes are atomic, so a stop at any point is safe (as after a crash).
-        let _ = quiet(Path::new("taskkill")).args(["/PID", &agent.pid.to_string(), "/F"]).status();
+        let _ = quiet(&system_program("taskkill.exe")).args(["/PID", &agent.pid.to_string(), "/F"]).status();
         match ended(agent.pid, Duration::from_secs(10)) {
             Ok(true) => AgentStop::Stopped,
             Ok(false) => AgentStop::StillRunning(format!("process {} doesn't end", agent.pid)),
@@ -168,7 +207,7 @@ impl Machine for ThisMachine {
     }
 
     fn close_app(&self) {
-        let _ = quiet(Path::new("taskkill")).args(["/IM", APP_EXE, "/F"]).status();
+        let _ = quiet(&system_program("taskkill.exe")).args(["/IM", APP_EXE, "/F"]).status();
     }
 
     fn run_agent(&self, agent: &Path, args: &[&str]) -> Result<(), String> {
@@ -178,9 +217,20 @@ impl Machine for ThisMachine {
 
     fn start_agent(&self, agent_bg: &Path, data: &Path) -> Result<(), String> {
         let dir = agent_bg.parent().ok_or_else(|| format!("{} can't be started", agent_bg.display()))?;
-        let status = start_detached(agent_bg, "run --log", dir).status().map_err(|e| format!("powershell: {e}"))?;
-        if !status.success() {
-            return Err(format!("{} wasn't started ({status})", agent_bg.display()));
+        // Through the shell, so it holds none of this setup's handles; where PowerShell can't run (blocked by policy),
+        // straight from here, which works but shares the setup's handles.
+        match start_detached(agent_bg, "run --log", dir).status() {
+            Ok(status) if status.success() => eprintln!("craft-cloud-setup: the agent was started through PowerShell"),
+            failed => {
+                let why = failed.map_or_else(|e| e.to_string(), |status| status.to_string());
+                eprintln!("craft-cloud-setup: PowerShell couldn't start the agent ({why}); it is started directly");
+                quiet(agent_bg)
+                    .args(["run", "--log"])
+                    .current_dir(dir)
+                    .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
+                    .spawn()
+                    .map_err(|e| format!("{}: {e}", agent_bg.display()))?;
+            }
         }
         // It answers once its local API is up (as the app waits for it).
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -210,7 +260,12 @@ impl Machine for ThisMachine {
     }
 
     fn remove_after_exit(&self, dir: &Path) -> Result<(), String> {
-        // Waits for this setup to end, however long its last message stays open.
-        remove_after(std::process::id(), dir).spawn().map(|_| ()).map_err(|e| format!("the program folder can't be removed: {e}"))
+        // Waits for this setup to end, however long its last message stays open: through PowerShell, else `cmd`.
+        let pid = std::process::id();
+        let Err(e) = remove_after(pid, dir).spawn() else { return Ok(()) };
+        eprintln!("craft-cloud-setup: PowerShell can't run ({e}); cmd removes the program folder");
+        let image = std::env::current_exe().ok().and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()));
+        let image = image.unwrap_or_else(|| crate::SETUP_EXE.to_owned());
+        remove_after_with_cmd(pid, &image, dir).spawn().map(|_| ()).map_err(|e| format!("the program folder can't be removed: {e}"))
     }
 }
