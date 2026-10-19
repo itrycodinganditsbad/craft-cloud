@@ -73,3 +73,15 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
 
   An entry added offline is kept and reaches the other machines once the server is back. Each list keeps
   the 100 files opened last.
+- A file of the synced folder as a live plain-text document (through the running agent, as an app opens one; a
+  test tool for live documents):
+
+  ```sh
+  ./target/release/craft-cloud-agent doc Notes/todo.txt                    # its text
+  ./target/release/craft-cloud-agent doc Notes/todo.txt --append "eggs"    # add to it, on every machine
+  ./target/release/craft-cloud-agent doc Notes/todo.txt --watch            # again after every change
+  ```
+
+  The first machine to open a file makes it a live document from the file's content (UTF-8 text only); the others
+  join it. Changes go to every machine that has it open as they are made, and edits made offline merge when the
+  machine is back. `doc` never writes the file: what it shows is the live document.
