@@ -479,6 +479,36 @@ fn saves_reach_the_agent_and_a_file_changed_outside_is_reported() {
     assert!(!other.status().changed_outside);
 }
 
+/// Whether the file was changed outside Craft is decided once, at the open, from the agent's records, whatever the
+/// number of saves: a reader that opened the import's bytes stays "not changed" through 40 saves on another machine
+/// (the reviewer's probe flipped at the 33rd), a window that opens the first of those saves' bytes sees no outside
+/// edit, and one that opens other bytes does, and keeps saying so while others save, until it saves itself.
+#[test]
+fn changed_outside_is_decided_at_the_open_by_the_records() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let imported = b"file as read at the import".to_vec();
+    let mut a = open_with_bytes(&pc, "n.txt", Notes::new("t", &["a"]), &imported);
+    let mut b = open_with_bytes(&laptop, "n.txt", Notes::default(), &imported);
+    assert!(!a.status().changed_outside && !b.status().changed_outside, "the import's own bytes");
+    for i in 0..40 {
+        change(&mut a, |m| m.with_title(&format!("t{i}"))).unwrap();
+        save(&mut a, format!("save {i}").as_bytes());
+    }
+    until(&mut [&mut a, &mut b], "every save is known", |s| *s[1].model().title == "t39" && pc.saves().len() >= 40);
+    assert!(!b.status().changed_outside, "a reader is never told its Craft file was edited outside");
+    let first = open_with_bytes(&laptop, "n.txt", Notes::default(), b"save 0");
+    assert!(!first.status().changed_outside, "the oldest of 40 saves is still a Craft save");
+    let mut edited = open_with_bytes(&laptop, "n.txt", Notes::default(), b"edited in another program");
+    assert!(edited.status().changed_outside);
+    change(&mut a, |m| m.with_title("t40")).unwrap();
+    save(&mut a, b"save 40");
+    until(&mut [&mut a, &mut edited], "the next save came", |s| *s[1].model().title == "t40");
+    assert!(edited.status().changed_outside, "decided at the open");
+    save(&mut edited, b"saved from the live document");
+    assert!(!edited.status().changed_outside);
+}
+
 /// A save as an app makes it: the save point, then the record (before the file is written).
 fn save<D: craft_cloud_kit::LiveDocument>(s: &mut Session<D>, bytes: &[u8]) -> craft_cloud_kit::SaveRecord {
     let point = s.save_point().unwrap();

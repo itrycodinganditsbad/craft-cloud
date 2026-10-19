@@ -183,7 +183,7 @@ async fn opens_get_peers_from_the_agents_pool() {
         let next = open(&two, "p.txt", "pooled").peer();
         // A new connection asking for a peer held by a live open gets another; one that is free, itself.
         let three = c.documents().unwrap();
-        let taken = match three.open_with("p.txt", "wordcraft", &OpenOptions { peer: pa }).unwrap() {
+        let taken = match three.open_with("p.txt", "wordcraft", &OpenOptions { peer: pa, ..OpenOptions::default() }).unwrap() {
             Opened::Live(d) => d.peer(),
             _ => panic!("not live"),
         };
@@ -738,6 +738,21 @@ async fn a_craft_save_goes_up_with_its_record() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(plain, "an edit outside Craft goes up without a record");
+    // An open says whether the bytes the app read were a Craft save: the app's save yes, the editor's no.
+    let c = on_pc.clone();
+    let (outside, ours) = off(move || {
+        let docs = c.documents().unwrap();
+        let ask = |bytes: &[u8]| {
+            let options = craft_cloud_app::live::OpenOptions { file_hash: Some(*blake3::hash(bytes).as_bytes()), ..Default::default() };
+            match docs.open_with("story.txt", "wordcraft", &options).unwrap() {
+                Opened::Live(d) => d.changed_outside(),
+                _ => panic!("not live"),
+            }
+        };
+        (ask(b"edited in a text editor"), ask(b"start, then saved by the app"))
+    })
+    .await;
+    assert_eq!((outside, ours), (Some(true), Some(false)));
     // A save whose record comes after its upload (made while the agent was away): added to that version.
     let late = b"saved while the agent was away".to_vec();
     std::fs::write(pc.folder.join("story.txt"), &late).unwrap();

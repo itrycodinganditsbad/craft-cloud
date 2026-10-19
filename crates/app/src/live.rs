@@ -105,6 +105,9 @@ pub struct OpenOptions {
     /// The Loro peer it wrote this document with before (opening it again after the connection went): the agent
     /// gives it the same one if no other app has it now.
     pub peer: Option<u64>,
+    /// The BLAKE3 hash of the file's bytes as the app read them: [`Document::changed_outside`] says whether a Craft
+    /// app saved them.
+    pub file_hash: Option<[u8; 32]>,
 }
 
 /// What `opened` says, before its state comes.
@@ -113,6 +116,7 @@ struct Head {
     doc: DocId,
     state: DocState,
     peer: Option<u64>,
+    changed_outside: Option<bool>,
 }
 
 /// An open's state so far: what `opened` said, the snapshot, and the updates that are part of it.
@@ -192,8 +196,8 @@ impl Shared {
     fn on_message(&self, message: Message) {
         match message {
             Message::Text(text) => match serde_json::from_str::<DocsEvent>(text.as_str()) {
-                Ok(DocsEvent::Opened { id, doc, state, peer }) => {
-                    lock(&self.opening).insert(id, Head { doc, state, peer });
+                Ok(DocsEvent::Opened { id, doc, state, peer, changed_outside }) => {
+                    lock(&self.opening).insert(id, Head { doc, state, peer, changed_outside });
                 }
                 Ok(DocsEvent::NeedsImport { id, peer }) => self.answer(id, Answer::NeedsImport { peer }),
                 Ok(DocsEvent::NotLive { id, reason, .. }) => self.answer(id, Answer::NotLive(reason)),
@@ -355,7 +359,8 @@ impl Documents {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (events_tx, events) = mpsc::channel();
         lock(&self.shared.routes).insert(id, events_tx);
-        let request = DocsRequest::Open { id, path: path.to_owned(), app: app.to_owned(), peer: options.peer };
+        let file_hash = options.file_hash.map(|h| h.iter().map(|b| format!("{b:02x}")).collect());
+        let request = DocsRequest::Open { id, path: path.to_owned(), app: app.to_owned(), peer: options.peer, file_hash };
         let answer = self.ask(id, || self.shared.send_json(&request));
         self.opened(id, answer, events)
     }
@@ -502,6 +507,12 @@ impl Document {
         self.head.peer
     }
 
+    /// For an open that named the file's hash ([`OpenOptions::file_hash`]): whether no Craft app's save of this
+    /// document has that content (the file was edited outside Craft). None: the agent can't tell (or is older).
+    pub fn changed_outside(&self) -> Option<bool> {
+        self.head.changed_outside
+    }
+
     /// Sends this app's change (a Loro update, at most 1 MiB); returns its number, which [`Event::Acked`] names once
     /// it is on the agent's disk.
     pub fn send(&self, update: &[u8]) -> Result<u64, Error> {
@@ -599,7 +610,7 @@ mod tests {
         let (events_tx, events) = mpsc::channel();
         lock(&shared.routes).insert(5, events_tx);
         let opened =
-            DocsEvent::Opened { id: 5, doc: DocId::generate(), state: DocState { online: true, waiting: 0, bytes: 1, updates: 2 }, peer: None };
+            DocsEvent::Opened { id: 5, doc: DocId::generate(), state: DocState { online: true, waiting: 0, bytes: 1, updates: 2 }, peer: None, changed_outside: None };
         shared.on_message(Message::Text(serde_json::to_string(&opened).unwrap().into()));
         shared.on_message(Message::Binary(encode_binary(STATE, 5, b"s").into()));
         shared.on_message(Message::Binary(encode_binary(UPDATE, 5, b"1").into()));
@@ -621,13 +632,14 @@ mod tests {
         let (events_tx, events) = mpsc::channel();
         lock(&shared.routes).insert(4, events_tx);
         let doc = DocId::generate();
-        let opened = DocsEvent::Opened { id: 4, doc, state: DocState { online: true, waiting: 0, bytes: 3, updates: 0 }, peer: Some(9) };
+        let opened =
+            DocsEvent::Opened { id: 4, doc, state: DocState { online: true, waiting: 0, bytes: 3, updates: 0 }, peer: Some(9), changed_outside: Some(true) };
         shared.on_message(Message::Text(serde_json::to_string(&opened).unwrap().into()));
         assert!(answer.try_recv().is_err(), "not before the state");
         shared.on_message(Message::Binary(encode_binary(STATE, 4, b"abc").into()));
         let Ok(Answer::Live { snapshot, head, .. }) = answer.try_recv() else { panic!("no answer") };
         assert_eq!(snapshot, b"abc");
-        assert_eq!(head.peer, Some(9));
+        assert_eq!((head.peer, head.changed_outside), (Some(9), Some(true)));
         shared.on_message(Message::Binary(encode_binary(UPDATE, 4, b"u").into()));
         let status = DocsEvent::Status { doc, online: false, waiting: 2, deleted: true, stopped: true };
         shared.on_message(Message::Text(serde_json::to_string(&status).unwrap().into()));

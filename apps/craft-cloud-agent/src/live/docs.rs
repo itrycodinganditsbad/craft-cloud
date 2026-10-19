@@ -125,8 +125,10 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                 }
             };
             match request {
-                DocsRequest::Open { id, path, app, peer } => match link.hub(api).await {
-                    Some(hub) => hub.docs(DocsCall::Open { conn: link.conn, id, path, app, peer }).await.map(|()| true).map_err(|_| End::Hub),
+                DocsRequest::Open { id, path, app, peer, file_hash } => match link.hub(api).await {
+                    Some(hub) => {
+                        hub.docs(DocsCall::Open { conn: link.conn, id, path, app, peer, file_hash }).await.map(|()| true).map_err(|_| End::Hub)
+                    }
                     None => {
                         let event = DocsEvent::NotLive {
                             id,
@@ -197,8 +199,8 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
 /// Sends one of the hub's messages to the app; false when the app is gone (or too slow).
 async fn send_out(socket: &mut WebSocket, out: DocOut) -> bool {
     match out {
-        DocOut::Opened { id, doc, state, peer, snapshot, waiting } => {
-            send_json(socket, &DocsEvent::Opened { id, doc, state, peer }).await && send_binary(socket, STATE, id, &snapshot).await && {
+        DocOut::Opened { id, doc, state, peer, changed_outside, snapshot, waiting } => {
+            send_json(socket, &DocsEvent::Opened { id, doc, state, peer, changed_outside }).await && send_binary(socket, STATE, id, &snapshot).await && {
                 let mut ok = true;
                 for update in &waiting {
                     ok = ok && send_binary(socket, UPDATE, id, update).await;

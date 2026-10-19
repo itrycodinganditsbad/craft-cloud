@@ -100,7 +100,7 @@ struct Machine {
 impl Machine {
     /// The peer for open `id` on `conn` of `doc`, as the agent hands it out.
     fn lease(&mut self, conn: u64, id: u64, doc: DocId) -> Option<u64> {
-        let (app, hint) = self.conns.get(&conn)?.apps.get(&id)?.clone();
+        let (app, hint, _) = self.conns.get(&conn)?.apps.get(&id)?.clone();
         let mut key = self.name.as_bytes().to_vec();
         key.push(0);
         key.extend_from_slice(app.as_bytes());
@@ -120,8 +120,8 @@ struct Conn {
     open: HashMap<u64, Opened>,
     /// A `needs_import` waiting for its import, by number: the path, and the document it will be.
     importing: HashMap<u64, (String, DocId)>,
-    /// Each open's app and the peer it asked for again, by number.
-    apps: HashMap<u64, (String, Option<u64>)>,
+    /// Each open's app, the peer it asked for again and the hash (hex) of the file it read, by number.
+    apps: HashMap<u64, (String, Option<u64>, Option<String>)>,
     told: HashMap<DocId, (bool, u64)>,
 }
 
@@ -354,9 +354,9 @@ impl Hub {
     fn on_request(&self, machine: usize, conn: u64, request: DocsRequest) {
         let mut inner = lock(&self.inner);
         match request {
-            DocsRequest::Open { id, path, app, peer } => {
+            DocsRequest::Open { id, path, app, peer, file_hash } => {
                 if let Some(c) = inner.machines.get_mut(&machine).and_then(|m| m.conns.get_mut(&conn)) {
-                    c.apps.insert(id, (app, peer));
+                    c.apps.insert(id, (app, peer, file_hash));
                 }
                 open(&mut inner, machine, conn, id, &path);
             }
@@ -470,6 +470,9 @@ fn open(inner: &mut Inner, machine: usize, conn: u64, id: u64, path: &str) {
     };
     // Take what the hub has first (when online), so the state is as fresh as it can be.
     sync(inner);
+    // Edited outside Craft unless some machine's app saved that content (the server's versions keep every record).
+    let file_hash = inner.machines.get(&machine).and_then(|m| m.conns.get(&conn)).and_then(|c| c.apps.get(&id)).and_then(|a| a.2.clone());
+    let changed_outside = file_hash.map(|h| !inner.machines.values().any(|m| m.saves.iter().any(|(d, saved, _)| *d == doc && *saved == h)));
     let Some(m) = inner.machines.get_mut(&machine) else { return };
     let online = m.online;
     let peer = m.lease(conn, id, doc);
@@ -480,7 +483,7 @@ fn open(inner: &mut Inner, machine: usize, conn: u64, id: u64, path: &str) {
     c.open.insert(id, Opened { doc, sent: log.len(), seq: 0 });
     c.told.insert(doc, (online, state.waiting));
     let mut w = lock(&c.writer);
-    let opened = DocsEvent::Opened { id, doc, state, peer };
+    let opened = DocsEvent::Opened { id, doc, state, peer, changed_outside };
     if let Ok(text) = serde_json::to_string(&opened) {
         let _ = w.send(Message::Text(text.into()));
     }

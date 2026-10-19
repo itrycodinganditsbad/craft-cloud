@@ -160,7 +160,10 @@ The agent records it with the version it uploads, so two machines saving one liv
 the save that includes the other's wins, or else the newer upload (the live document has both sides' edits, and the
 next save writes them all). A file edited outside Craft has no record: it gets a conflict copy as always, and the
 kit says so on open (`status().changed_outside`), so the app can bring the file in as an ordinary local change
-(`local_change(model, file_model)`) or keep the live content.
+(`local_change(model, file_model)`) or keep the live content. It is decided once, at the open, from the bytes the
+app read (`Session::open`'s `file_bytes`): the agent looks their hash up among this machine's records and the record
+of the file's version on the server, so any Craft save, however many came after it, is never taken for an outside
+edit. Saving clears it.
 
 ## Presence
 

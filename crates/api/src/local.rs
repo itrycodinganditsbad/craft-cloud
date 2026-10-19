@@ -583,13 +583,16 @@ pub enum DocsRequest {
     /// Open the file at `path` (relative to the synced folder, `/`-separated, or absolute inside it) as a live document
     /// for `app` (a lowercase app name), under the number `id` on this connection. `peer`: the Loro peer the app
     /// used for this document before (reopening it after the connection went), which the agent gives it again if it
-    /// is free ([`PEER_POOL`]).
+    /// is free ([`PEER_POOL`]). `file_hash`: the BLAKE3 hash (hex) of the file's bytes as the app read them, for
+    /// `opened` to say whether a Craft app saved them ([`DocsEvent::Opened`]'s `changed_outside`).
     Open {
         id: u64,
         path: String,
         app: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         peer: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_hash: Option<String>,
     },
     /// The app is done with the document.
     Close { doc: crate::ids::DocId },
@@ -663,13 +666,17 @@ pub enum NotLiveReason {
 pub enum DocsEvent {
     /// The document is live: its state follows as a binary frame of `state.bytes` bytes. `peer`: the Loro peer the
     /// app writes this document with while it has it open ([`PEER_POOL`]; none from an older agent, or when every one
-    /// is taken: the app picks a random one).
+    /// is taken: the app picks a random one). `changed_outside`, for an open that named its `file_hash`: whether no
+    /// Craft app's save of this document (this machine's records, or the file version's on the server) has that
+    /// content: the file was edited outside Craft, and the app may offer to bring it in. None: the agent can't tell.
     Opened {
         id: u64,
         doc: crate::ids::DocId,
         state: DocState,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         peer: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        changed_outside: Option<bool>,
     },
     /// The file has never been live: send its content as a binary import frame (written with `peer`, as `opened`'s).
     NeedsImport {
@@ -898,9 +905,16 @@ mod tests {
         assert_eq!(docs::decode_binary(&frame[..8]), None, "too short for a header");
         assert_eq!(docs::decode_binary(&[]), None);
         let open: DocsRequest = serde_json::from_value(serde_json::json!({ "type": "open", "id": 1, "path": "a.txt", "app": "wordcraft" })).unwrap();
-        assert_eq!(open, DocsRequest::Open { id: 1, path: "a.txt".into(), app: "wordcraft".into(), peer: None });
-        let plain = serde_json::to_value(DocsEvent::Opened { id: 1, doc: crate::ids::DocId::generate(), state: DocState::default(), peer: None }).unwrap();
-        assert!(plain.get("peer").is_none(), "no peer: no field (as an older agent sends it)");
+        assert_eq!(open, DocsRequest::Open { id: 1, path: "a.txt".into(), app: "wordcraft".into(), peer: None, file_hash: None });
+        let plain = serde_json::to_value(DocsEvent::Opened {
+            id: 1,
+            doc: crate::ids::DocId::generate(),
+            state: DocState::default(),
+            peer: None,
+            changed_outside: None,
+        })
+        .unwrap();
+        assert!(plain.get("peer").is_none() && plain.get("changed_outside").is_none(), "none: no field (as an older agent sends it)");
         let not_live = serde_json::to_value(DocsEvent::NotLive { id: 1, reason: NotLiveReason::NotSynced, message: None }).unwrap();
         assert_eq!(not_live, serde_json::json!({ "type": "not_live", "id": 1, "reason": "not_synced", "message": null }));
         let status: DocsEvent =

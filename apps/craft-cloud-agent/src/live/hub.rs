@@ -76,7 +76,7 @@ pub type ConnId = u64;
 pub enum DocOut {
     /// The document opened as `id` is live: its state (a snapshot, then updates still waiting for their history), and
     /// the Loro peer the app writes it with.
-    Opened { id: u64, doc: DocId, state: DocState, peer: Option<u64>, snapshot: Vec<u8>, waiting: Vec<Vec<u8>> },
+    Opened { id: u64, doc: DocId, state: DocState, peer: Option<u64>, changed_outside: Option<bool>, snapshot: Vec<u8>, waiting: Vec<Vec<u8>> },
     /// Send the file's content as an import (written with `peer`).
     NeedsImport { id: u64, peer: Option<u64> },
     /// The file opens as a plain file.
@@ -108,6 +108,8 @@ pub enum DocsCall {
         app: String,
         /// The peer the app had for the document before.
         peer: Option<u64>,
+        /// The hash (hex) of the file's bytes as the app read them.
+        file_hash: Option<String>,
     },
     Import {
         conn: ConnId,
@@ -329,8 +331,8 @@ struct Docs {
     importer: BTreeMap<DocId, (ConnId, u64)>,
     lookups: Vec<Lookup>,
     told: BTreeMap<DocId, (bool, u64, bool, bool)>,
-    /// Opens not answered yet: the app, and the peer it asked for again.
-    opens: HashMap<(ConnId, u64), (AppName, Option<u64>)>,
+    /// Opens not answered yet: the app, the peer it asked for again, and the hash of the file it read.
+    opens: HashMap<(ConnId, u64), (AppName, Option<u64>, Option<String>)>,
     /// The Loro peers lent to open documents.
     leases: Leases,
 }
@@ -422,6 +424,8 @@ struct State {
     /// Syncing is paused: no connection is dialed (see [`HubHandle::set_paused`]).
     paused: bool,
     docs: Docs,
+    /// What apps on this machine saved (for whether a file opened was edited outside Craft).
+    saves: super::saves::SaveBook,
 }
 
 /// A refusal sent to an app.
@@ -540,18 +544,33 @@ impl State {
             return self.tell(conn, DocOut::NotLive { id, reason: NotLiveReason::Offline, message: "the document can't be read here".into() });
         };
         let peer = self.lease(conn, id, doc);
-        self.docs.opens.remove(&(conn, id));
+        let file_hash = self.docs.opens.remove(&(conn, id)).and_then(|(_, _, hash)| hash);
+        let changed_outside = file_hash.and_then(|hash| self.changed_outside(doc, &hash));
         let Some(c) = self.docs.conns.get_mut(&conn) else { return Vec::new() };
         c.handles.insert(id, doc);
         self.replica.set_open(doc, true);
         let (online, waiting_n) = self.replica.document_status(doc).unwrap_or((false, 0));
         let state = DocState { online, waiting: waiting_n, bytes: snapshot.len() as u64, updates: waiting.len() as u64 };
-        self.tell(conn, DocOut::Opened { id, doc, state, peer, snapshot, waiting })
+        self.tell(conn, DocOut::Opened { id, doc, state, peer, changed_outside, snapshot, waiting })
+    }
+
+    /// Whether the file content `hash` (hex) an app read for `doc` was edited outside Craft (see
+    /// [`super::saves::changed_outside`]); none when the sync doesn't know the file.
+    fn changed_outside(&mut self, doc: DocId, hash: &str) -> Option<bool> {
+        let node = self.replica.document_node(doc)?;
+        let saved_here = self.saves.find(doc, hash).is_some();
+        let state = self.lookup.state()?;
+        let base = state.base.get(&node).and_then(|e| match &e.kind {
+            craft_cloud_sync::BaseKind::File { version, hash, .. } => Some((*version, *hash)),
+            craft_cloud_sync::BaseKind::Dir { .. } => None,
+        });
+        let remote = state.remote.get(&node).and_then(|r| r.file.as_ref());
+        super::saves::changed_outside(doc, hash, saved_here, base, remote)
     }
 
     /// The Loro peer for open `id` on `conn` of `doc` (the one it has already, or the one it asked for again if free).
     fn lease(&mut self, conn: ConnId, id: u64, doc: DocId) -> Option<u64> {
-        let (app, hint) = self.docs.opens.get(&(conn, id))?.clone();
+        let (app, hint, _) = self.docs.opens.get(&(conn, id))?.clone();
         let base = peer_base(self.config.device, app.as_str());
         self.docs.leases.lease(doc, app.as_str(), base, (conn, id), hint, std::time::Instant::now())
     }
@@ -591,7 +610,7 @@ impl State {
     }
 
     /// An app opens `path` as `id`.
-    fn open(&mut self, conn: ConnId, id: u64, path: &str, app: &str, peer: Option<u64>) -> Vec<ClientFrame> {
+    fn open(&mut self, conn: ConnId, id: u64, path: &str, app: &str, peer: Option<u64>, file_hash: Option<String>) -> Vec<ClientFrame> {
         let not_live = |reason, message: &str| DocOut::NotLive { id, reason, message: message.to_owned() };
         let Some(c) = self.docs.conns.get(&conn) else { return Vec::new() };
         if c.handles.contains_key(&id)
@@ -614,7 +633,7 @@ impl State {
             Ok(m) if m.is_file() => {}
             _ => return self.tell(conn, not_live(NotLiveReason::NotInFolder, "there is no such file in the synced folder")),
         }
-        self.docs.opens.insert((conn, id), (app.clone(), peer));
+        self.docs.opens.insert((conn, id), (app.clone(), peer, file_hash));
         match self.lookup.file_node(&rel) {
             Some(node) => self.open_node(conn, id, node, &app),
             None => {
@@ -697,7 +716,7 @@ impl State {
                 self.docs.conns.insert(conn, DocsConn { out, handles: BTreeMap::new(), presence: HashMap::new() });
                 Vec::new()
             }
-            DocsCall::Open { conn, id, path, app, peer } => self.open(conn, id, &path, &app, peer),
+            DocsCall::Open { conn, id, path, app, peer, file_hash } => self.open(conn, id, &path, &app, peer, file_hash),
             DocsCall::Import { conn, id, bytes } => {
                 let doc = self.docs.importer.iter().find(|(_, who)| **who == (conn, id)).map(|(doc, _)| *doc);
                 let Some(doc) = doc else {
@@ -962,7 +981,9 @@ async fn run(
     let (blob_tx, mut blob_rx) = mpsc::unbounded_channel();
     let transport = HttpTransport::new(config.server.clone(), &config.token).ok().map(Arc::new);
     let blobs = Blobs { transport, done: blob_tx, generation: 0, uploading: BTreeMap::new(), held: BTreeMap::new() };
+    let saves = super::saves::SaveBook::new(config.data.path(), config.space);
     let mut state = State {
+        saves,
         config,
         replica,
         blobs,

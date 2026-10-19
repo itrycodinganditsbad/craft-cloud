@@ -110,6 +110,35 @@ impl SaveBook {
     }
 }
 
+/// Whether the content `hash` (hex) an app read from `doc`'s file was edited outside Craft, decided once, at the open:
+/// - an app on this machine saved exactly that ([`SaveBook::find`], `saved_here`): no;
+/// - it is the content the sync agreed on (`base`: version and hash) and that version is the server's: no if the
+///   version carries a record of this document (an app on another machine saved it), yes if none;
+/// - it is the agreed content but the server has a newer version: the sync brings that one; can't tell (none);
+/// - other content (an edit here the sync hasn't taken, with no record here): yes.
+///
+/// No window of recent saves: every Craft save of the file is either this machine's record or its version's.
+pub fn changed_outside(
+    doc: DocId,
+    hash: &str,
+    saved_here: bool,
+    base: Option<(craft_cloud_proto::VersionId, FileHash)>,
+    remote: Option<&craft_cloud_proto::FileState>,
+) -> Option<bool> {
+    if saved_here {
+        return Some(false);
+    }
+    let (version, agreed) = base?;
+    if hex(agreed.as_bytes()) != hash {
+        return Some(true);
+    }
+    let remote = remote?;
+    if remote.version != version {
+        return None;
+    }
+    Some(!remote.save.as_ref().is_some_and(|s| s.doc == doc))
+}
+
 impl SaveRecords for SaveBook {
     fn record(&self, node: NodeId, hash: &FileHash) -> Option<SaveRecord> {
         self.find(node_doc(self.space, node), &hex(hash.as_bytes()))
@@ -140,5 +169,34 @@ mod tests {
         assert!(book.entries().len() <= MAX_SAVES);
         let reopened = SaveBook::new(temp.path(), space);
         assert!(reopened.record(node, &FileHash::from_bytes([3; 32])).is_some(), "kept on disk");
+    }
+
+    /// Whether a file was edited outside Craft: by this machine's records, or the agreed version's record, whatever
+    /// number of saves came before.
+    #[test]
+    fn a_file_is_changed_outside_unless_a_craft_save_has_its_content() {
+        use craft_cloud_proto::{DeviceId, Epoch, FileState, ManifestId, VersionId};
+        let doc = DocId::generate();
+        let (v, h) = (VersionId::generate(), FileHash::from_bytes([5; 32]));
+        let file = |version: VersionId, save: Option<SaveRecord>| FileState {
+            version,
+            manifest: ManifestId::from_bytes([0; 32]),
+            size: 1,
+            mtime_ms: 0,
+            exec: false,
+            device: DeviceId::generate(),
+            epoch: Epoch::generate(),
+            save,
+        };
+        let ours = Some(SaveRecord { doc, version: vec![(1, 2)] });
+        let theirs = Some(SaveRecord { doc: DocId::generate(), version: vec![(1, 2)] });
+        let agreed = hex(h.as_bytes());
+        assert_eq!(changed_outside(doc, "ab", true, None, None), Some(false), "saved here");
+        assert_eq!(changed_outside(doc, &agreed, false, Some((v, h)), Some(&file(v, ours.clone()))), Some(false), "saved elsewhere");
+        assert_eq!(changed_outside(doc, &agreed, false, Some((v, h)), Some(&file(v, None))), Some(true), "a version without a record");
+        assert_eq!(changed_outside(doc, &agreed, false, Some((v, h)), Some(&file(v, theirs))), Some(true), "another document's record");
+        assert_eq!(changed_outside(doc, &agreed, false, Some((v, h)), Some(&file(VersionId::generate(), ours))), None, "a newer version comes");
+        assert_eq!(changed_outside(doc, "other", false, Some((v, h)), None), Some(true), "edited here");
+        assert_eq!(changed_outside(doc, &agreed, false, None, None), None, "not synced");
     }
 }

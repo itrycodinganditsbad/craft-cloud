@@ -41,19 +41,17 @@ const FIRST_BACKOFF: Duration = Duration::from_millis(200);
 /// Presence is sent again this often while set, and a peer's is dropped after this long without one.
 pub const PRESENCE_EVERY: Duration = Duration::from_secs(3);
 pub const PRESENCE_TTL: Duration = Duration::from_secs(10);
-/// How many save marks a document keeps (for [`Status::changed_outside`]).
-const MAX_SAVES: usize = 32;
 /// Undo steps kept.
 const UNDO_STEPS: usize = 500;
 /// The most text (inserted and deleted, in bytes) one step may change and still be undone while live. Loro's undo of a
 /// run of text takes time growing with its square: about 35 ms at 64 KiB, 2.4 s at 512 KiB, 10 s at 1 MB.
 pub const MAX_UNDO_TEXT_BYTES: usize = 64 * 1024;
 
-/// The root map of the kit's own keys: `schema` (`{app, version}`).
+/// The root map of the kit's own keys: `schema` (`{app, version}`) and `import` (the hash, hex, of the file's bytes
+/// the document was imported from).
 const ROOT: &str = "root";
 const SCHEMA: &str = "schema";
-/// The root map of save marks: content hash (hex) to when (ms).
-const SAVES: &str = "$saves";
+const IMPORT: &str = "import";
 
 /// An app's model, mapped onto a live document. The app implements it once, over its own document type.
 pub trait LiveDocument {
@@ -337,8 +335,6 @@ pub struct Session<D: LiveDocument> {
     presence: Option<Vec<u8>>,
     presence_sent: Option<Instant>,
     waker: Option<Waker>,
-    /// The hash of the file's bytes as the app read them at open (for [`Status::changed_outside`]), until saved.
-    read_from: Option<[u8; 32]>,
     /// The agent refused a change for good (it doesn't decode, it is over the cap): nothing more is sent, and the
     /// session says it is stopped; the model stays editable, and saving to the file (without a record) keeps the work.
     refused: Option<String>,
@@ -454,30 +450,12 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-}
-
-/// Notes a save of content `hash` in the document's save marks, keeping the newest [`MAX_SAVES`].
-fn mark_saved(w: &mut Writer<'_>, hash: &[u8; 32]) -> Result<(), KitError> {
-    let saves = w.doc.get_map(SAVES);
-    w.set_raw(&saves, &hex(hash), LoroValue::from(now_ms()), 8)?;
-    let mut all: Vec<(i64, String)> = Vec::new();
-    saves.for_each(|k, v| {
-        let at = match v {
-            ValueOrContainer::Value(LoroValue::I64(at)) => at,
-            _ => 0,
-        };
-        all.push((at, k.to_owned()));
-    });
-    if all.len() > MAX_SAVES {
-        all.sort();
-        let extra = all.len() - MAX_SAVES;
-        for (_, k) in all.into_iter().take(extra) {
-            w.delete(&saves, &k)?;
-        }
+/// The hash (hex) of the file bytes the document was imported from, if the import said.
+fn import_hash(doc: &LoroDoc) -> Option<String> {
+    match doc.get_map(ROOT).get(IMPORT)? {
+        ValueOrContainer::Value(LoroValue::String(s)) => Some(s.to_string()),
+        _ => None,
     }
-    Ok(())
 }
 
 impl<D: LiveDocument> Session<D> {
@@ -494,12 +472,12 @@ impl<D: LiveDocument> Session<D> {
             Ok(d) => d,
             Err(e) => return not_running(e),
         };
-        let opened = match docs.open_with(path, D::APP, &OpenOptions::default()) {
+        let file_hash = file_bytes.map(|b| *blake3::hash(b).as_bytes());
+        let opened = match docs.open_with(path, D::APP, &OpenOptions { peer: None, file_hash }) {
             Ok(o) => o,
             Err(craft_cloud_app::Error::Refused { code, message }) => return Err(KitError::Agent(format!("{code}: {message}"))),
             Err(e) => return not_running(e),
         };
-        let file_hash = file_bytes.map(|b| *blake3::hash(b).as_bytes());
         let (document, snapshot) = match opened {
             Opened::NotLive(reason) => return Ok(Open::NotLive(NotLive::Reason(reason))),
             Opened::Live(document) => (document, None),
@@ -516,18 +494,16 @@ impl<D: LiveDocument> Session<D> {
         };
         let ours = snapshot.as_deref().is_some_and(|s| s == document.state()) && document.state_updates().is_empty();
         let mut session = Self::start(agent.clone(), path, file, (document.state(), document.state_updates()), ours, document.peer())?;
-        if let Some(hash) = file_hash
-            && snapshot.is_none()
-        {
-            // Looked at again as the agent's waiting updates come (a save mark may be among them).
-            session.read_from = Some(hash);
-            session.check_outside();
-        }
+        // Decided once, here: the agent knows every Craft save of the file (its records, the server's versions'); the
+        // bytes the document was imported from are no edit either.
+        session.status.changed_outside = snapshot.is_none()
+            && document.changed_outside() == Some(true)
+            && file_hash.is_some_and(|h| import_hash(&session.doc) != Some(hex(&h)));
         session.attach(Link { _docs: docs, doc: document });
         Ok(Open::Live(Box::new(session)))
     }
 
-    /// The snapshot that makes `file` a live document: its schema, its parts, and a save mark for its bytes.
+    /// The snapshot that makes `file` a live document: its schema, the hash of the bytes it was read from, its parts.
     fn import_snapshot(file: &D::Doc, hash: Option<&[u8; 32]>, peer: Option<u64>) -> Result<Vec<u8>, KitError> {
         let doc = new_doc();
         if let Some(peer) = peer {
@@ -537,12 +513,12 @@ impl<D: LiveDocument> Session<D> {
         schema.insert("app".to_owned(), LoroValue::from(D::APP));
         schema.insert("version".to_owned(), LoroValue::from(i64::from(D::SCHEMA)));
         doc.get_map(ROOT).insert(SCHEMA, LoroValue::from(schema))?;
+        if let Some(hash) = hash {
+            doc.get_map(ROOT).insert(IMPORT, LoroValue::from(hex(hash)))?;
+        }
         let mut ctx = Ctx::default();
         let mut w = Writer::new(&doc, KIT_ORIGIN);
         write_diff::<D>(&mut w, None, file, &mut ctx)?;
-        if let Some(hash) = hash {
-            mark_saved(&mut w, hash)?;
-        }
         w.finish()?;
         Ok(doc.export(loro::ExportMode::Snapshot)?)
     }
@@ -593,7 +569,6 @@ impl<D: LiveDocument> Session<D> {
             presence: None,
             presence_sent: None,
             waker: None,
-            read_from: None,
             refused: None,
             doc_id: None,
             deferred: Vec::new(),
@@ -627,13 +602,6 @@ impl<D: LiveDocument> Session<D> {
             Some((app, version)) => Some(ReadOnly { app, version }),
             None => Some(ReadOnly { app: String::new(), version: 0 }),
         };
-    }
-
-    /// Whether the bytes the app read at open are a save (or the import) of this document.
-    fn check_outside(&mut self) {
-        if let Some(hash) = self.read_from {
-            self.status.changed_outside = self.doc.get_map(SAVES).get(&hex(&hash)).is_none();
-        }
     }
 
     fn attach(&mut self, link: Link) {
@@ -1073,7 +1041,7 @@ impl<D: LiveDocument> Session<D> {
         let waker = self.waker.clone();
         let expected = self.doc_id;
         // The same peer again, if no other window took it meanwhile.
-        let options = OpenOptions { peer: Some(self.doc.peer_id()) };
+        let options = OpenOptions { peer: Some(self.doc.peer_id()), file_hash: None };
         let spawned = std::thread::Builder::new().name("craft-cloud-kit-reopen".into()).spawn(move || {
             let result = (|| -> Reopened {
                 let retry = |e: craft_cloud_app::Error| Reopen::Retry(e.to_string());
@@ -1120,13 +1088,12 @@ impl<D: LiveDocument> Session<D> {
         let raw = std::mem::take(&mut lock(&self.collector).raw);
         lock(&self.collector).on = false;
         let touched = self.classify(raw);
-        let (was_read_only, was_outside) = (self.status.read_only.clone(), self.status.changed_outside);
+        let was_read_only = self.status.read_only.clone();
         if touched.kit {
             self.check_schema();
-            self.check_outside();
         }
         if !touched.any() {
-            return Ok(was_read_only != self.status.read_only || was_outside != self.status.changed_outside);
+            return Ok(was_read_only != self.status.read_only);
         }
         self.rebuild(touched)?;
         Ok(true)
@@ -1137,7 +1104,7 @@ impl<D: LiveDocument> Session<D> {
         let mut touched = Touched::default();
         let mut reindex = Vec::new();
         for r in raw {
-            if r.root == ROOT || r.root == SAVES {
+            if r.root == ROOT {
                 touched.kit = true;
                 continue;
             }
@@ -1344,15 +1311,8 @@ impl<D: LiveDocument> Session<D> {
     /// version the agent uploads for that content carries the record. Call it before the write.
     pub fn record(&mut self, point: &SavePoint<D>, bytes: &[u8]) -> SaveRecord {
         let hash = *blake3::hash(bytes).as_bytes();
-        if self.status.read_only.is_none() {
-            let mut w = Writer::new(&self.doc, KIT_ORIGIN);
-            let marked = mark_saved(&mut w, &hash);
-            if let (Ok(()), Ok((updates, _))) = (marked, w.finish()) {
-                self.queue(updates);
-            }
-        }
+        // The file is a Craft save from now on (nothing is written to the document: the record is the agent's).
         self.status.changed_outside = false;
-        self.read_from = None;
         let record = SaveRecord { hash, frontiers: point.frontiers.clone(), version: point.version.clone() };
         self.records.push_back(record.clone());
         while self.records.len() > KEPT_RECORDS {
