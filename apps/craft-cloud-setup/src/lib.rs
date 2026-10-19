@@ -1,17 +1,19 @@
-//! Craft Cloud's Windows setup: installs `craft-cloud.exe`, `craft-cloud-agent.exe` and `craft-cloud-agent-bg.exe` for
-//! this user into `%LOCALAPPDATA%\Programs\Craft Cloud` (no admin rights), with an "Apps & features" entry and a
+//! Craft Cloud's Windows setup: installs `craft-cloud.exe`, `craft-cloud-agent.exe` and `craft-cloud-agent-bg.exe`
+//! (with `LICENSES.txt`) for this user into `%LOCALAPPDATA%\Programs\Craft Cloud` (no admin rights), with an "Apps & features" entry and a
 //! Start-menu shortcut (unless `--no-start-menu`); `--uninstall` takes them away again.
 //!
 //! - **Install** ([`install`]): the app is closed and a running agent stopped first: asked to quit through its local
 //!   API (it finishes the pass under way), waited for up to a minute, then ended, and its process checked gone. An
 //!   agent that can't be stopped stops the install before anything is changed. Then the files, the Uninstall key
 //!   (`HKCU\…\Uninstall\CraftCloud`, its `UninstallString` calling this setup, copied into the program folder, with
-//!   `--uninstall`), and the shortcut. An agent that ran is started again (and waited for). An older install in
+//!   `--uninstall`), and the shortcut. Start at login (the agent's and the tray's `Run` values, where there are any) is
+//!   pointed at this install, wherever it pointed before. An agent that ran is started again (and waited for), also when the install
+//!   fails after the stop. An older install in
 //!   `%LOCALAPPDATA%\Programs\craft-cloud` whose agent the `Run` value starts is moved: the new agent's
 //!   `autostart on` points the value at the new folder (read back to check); the old folder's files are left alone.
 //! - **Uninstall** ([`uninstall`]): closes the app and stops the agent as above (fine when it isn't running), removes their
-//!   `Run` values (`Craft Cloud`, `Craft Cloud tray`) where they start this install, the shortcut, the program folder
-//!   and the Uninstall key. The synced folder and the agent's data folder (the sign-in) stay.
+//!   `Run` values (`Craft Cloud`, `Craft Cloud tray`) where they start this install, the shortcut, the app's
+//!   single-instance files, the program folder and the Uninstall key. The synced folder and the agent's data folder (the sign-in) stay.
 //!
 //! The registry and everything that runs a program are behind [`Registry`] and [`Machine`], so the logic is tested
 //! against an in-memory registry and temporary folders on every OS, and against the real registry (under a throwaway
@@ -28,16 +30,20 @@ pub const DIR_NAME: &str = "Craft Cloud";
 /// An older install's folder (made by hand, before there was a setup).
 pub const OLD_DIR_NAME: &str = "craft-cloud";
 /// The files installed, besides the setup itself.
-pub const FILES: [&str; 3] = ["craft-cloud.exe", "craft-cloud-agent.exe", "craft-cloud-agent-bg.exe"];
+pub const FILES: [&str; 4] = ["craft-cloud.exe", "craft-cloud-agent.exe", "craft-cloud-agent-bg.exe", LICENSES];
 pub const APP_EXE: &str = "craft-cloud.exe";
 pub const AGENT_EXE: &str = "craft-cloud-agent.exe";
 pub const AGENT_BG_EXE: &str = "craft-cloud-agent-bg.exe";
 pub const SETUP_EXE: &str = "craft-cloud-setup.exe";
+/// Craft Cloud's licences and those of the third-party material in it (written by `cargo xtask package`).
+pub const LICENSES: &str = "LICENSES.txt";
 /// The `Run` values: the agent's and the app's.
 pub const AGENT_RUN_VALUE: &str = "Craft Cloud";
 pub const APP_RUN_VALUE: &str = "Craft Cloud tray";
 pub const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 pub const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\CraftCloud";
+/// The app's folder for its single-instance files, next to the agent's data folder.
+pub const APP_FILES_DIR: &str = "craft-cloud-app";
 /// The Start-menu shortcut's file.
 pub const SHORTCUT: &str = "Craft Cloud.lnk";
 
@@ -47,6 +53,7 @@ pub const PAYLOAD: &[(&str, &[u8])] = &[
     (APP_EXE, include_bytes!(concat!(env!("CRAFT_CLOUD_SETUP_PAYLOAD"), "/craft-cloud.exe"))),
     (AGENT_EXE, include_bytes!(concat!(env!("CRAFT_CLOUD_SETUP_PAYLOAD"), "/craft-cloud-agent.exe"))),
     (AGENT_BG_EXE, include_bytes!(concat!(env!("CRAFT_CLOUD_SETUP_PAYLOAD"), "/craft-cloud-agent-bg.exe"))),
+    (LICENSES, include_bytes!(concat!(env!("CRAFT_CLOUD_SETUP_PAYLOAD"), "/LICENSES.txt"))),
 ];
 #[cfg(not(payload))]
 pub const PAYLOAD: &[(&str, &[u8])] = &[];
@@ -63,6 +70,8 @@ pub struct Places {
     pub uninstall_key: String,
     /// The agent's data folder, where a running agent's `local-api.json` names its pid, port and token.
     pub agent_data: PathBuf,
+    /// The app's single-instance files (`%LOCALAPPDATA%\craft-cloud-app`, next to the agent's data folder).
+    pub app_files: PathBuf,
     /// How long a file still held by a program that is ending is tried again for.
     pub patience: std::time::Duration,
 }
@@ -73,12 +82,15 @@ impl Places {
         let local = var("LOCALAPPDATA")?;
         // As the agent finds it: `CRAFT_CLOUD_AGENT_DIR`, else `%LOCALAPPDATA%\craft-cloud-agent`.
         let agent_data = var("CRAFT_CLOUD_AGENT_DIR").unwrap_or_else(|_| local.join("craft-cloud-agent"));
+        // As the app finds it: next to the agent's data folder.
+        let app_files = agent_data.parent().unwrap_or(&local).join(APP_FILES_DIR);
         Ok(Self {
             programs: local.join("Programs"),
             start_menu: var("APPDATA")?.join("Microsoft").join("Windows").join("Start Menu").join("Programs"),
             run_key: RUN_KEY.to_owned(),
             uninstall_key: UNINSTALL_KEY.to_owned(),
             agent_data,
+            app_files,
             patience: std::time::Duration::from_secs(10),
         })
     }
@@ -113,6 +125,9 @@ pub enum AgentStop {
     Stopped,
     /// One runs, and couldn't be stopped (why).
     StillRunning(String),
+    /// One was asked to quit (or ended), and then whether it has ended couldn't be told (why): it may be stopped, so
+    /// it is started again.
+    Unknown(String),
 }
 
 /// Running programs.
@@ -132,6 +147,13 @@ pub trait Machine {
     fn shortcut(&self, lnk: &Path, target: &Path) -> Result<(), String>;
     /// Removes the folder `dir` once this process has ended (it holds this setup's own exe).
     fn remove_after_exit(&self, dir: &Path) -> Result<(), String>;
+    /// Whether the process `pid` runs (any program); `true` when that can't be told.
+    fn process_runs(&self, pid: u32) -> bool;
+    /// Renames (moves) `from` to `to` in one step, which fails as a whole: on Windows a file a program holds open (or
+    /// a folder with one in it) can't be moved, so a failure leaves everything where it was. (A running exe can be.)
+    fn rename(&self, from: &Path, to: &Path) -> Result<(), String> {
+        std::fs::rename(from, to).map_err(|e| format!("{} can't be moved (is it still running?): {e}", from.display()))
+    }
 }
 
 /// How to install.
@@ -201,8 +223,6 @@ pub fn install(
         return Err("this setup was built without Craft Cloud in it (build it with `cargo xtask package`)".into());
     }
     let dir = places.dir();
-    let old = places.programs.join(OLD_DIR_NAME);
-    let mut warnings = Vec::new();
 
     // What runs is stopped first: an exe in use can't be replaced. The app goes before the agent (an open app's Try
     // again would start the old agent again in between); the agent finishes the pass under way.
@@ -213,8 +233,37 @@ pub fn install(
         AgentStop::NotRunning => false,
         AgentStop::Stopped => true,
         AgentStop::StillRunning(why) => return Err(still_running(&why)),
+        AgentStop::Unknown(why) => return Err(restarted_after(places, registry, machine, &unknown_stop(&why))),
     };
 
+    // From here on the agent is stopped: if the install fails, the agent is started again, so this computer keeps
+    // syncing.
+    match install_stopped(places, registry, machine, payload, setup, options) {
+        Ok((moved_from, mut warnings)) => {
+            if agent_was_running && let Err(e) = machine.start_agent(&dir.join(AGENT_BG_EXE), &places.agent_data) {
+                warnings.push(format!("the agent couldn't be started again ({e}); it starts at the next login"));
+            }
+            Ok(Installed { dir, agent_was_running, moved_from, warnings })
+        }
+        Err(e) if agent_was_running => Err(restarted_after(places, registry, machine, &e)),
+        Err(e) => Err(e),
+    }
+}
+
+/// The install's changes, once nothing runs: the files, the move of an older install's start at login, the "Apps &
+/// features" entry and the shortcut. Where an older install was moved from, and the warnings.
+fn install_stopped(
+    places: &Places,
+    registry: &dyn Registry,
+    machine: &dyn Machine,
+    payload: &[(&str, &[u8])],
+    setup: &Path,
+    options: &Options,
+) -> Result<(Option<PathBuf>, Vec<String>), String> {
+    let dir = places.dir();
+    let old = places.programs.join(OLD_DIR_NAME);
+    let mut warnings = Vec::new();
+    clear_leftovers(places, machine, true);
     std::fs::create_dir_all(&dir).map_err(io(&dir))?;
     for (name, bytes) in payload {
         write_replacing(&dir.join(name), bytes)?;
@@ -225,20 +274,29 @@ pub fn install(
         write_replacing(&setup_copy, &bytes)?;
     }
 
-    // The older install's agent starts at login: the new one takes that over (no agent runs now, so the new agent
-    // writes its own entry). The old files stay. The value is read back: only a value that starts the new agent is a
-    // move.
+    // Start at login runs this install from now on. The agent's value, wherever it points (the older install, or a
+    // build run from elsewhere): the new agent takes it over (no agent runs now, so it writes its own entry), and the
+    // value is read back; only one that starts the new agent counts. The app's tray value, which the app writes for
+    // whichever copy last ran: pointed at this one. A value that isn't there stays away (start at login was turned
+    // off). The older install's files stay.
     let mut moved_from = None;
-    let run_value = registry.get(&places.run_key, AGENT_RUN_VALUE);
-    if old.join(AGENT_EXE).is_file() && run_value.as_deref().is_some_and(|v| starts_from(v, &old)) {
+    if let Some(value) = registry.get(&places.run_key, AGENT_RUN_VALUE).filter(|v| !starts_from(v, &dir)) {
         let moved =
             machine.run_agent(&dir.join(AGENT_EXE), &["autostart", "on"]).and_then(|()| match registry.get(&places.run_key, AGENT_RUN_VALUE) {
                 Some(v) if starts_from(&v, &dir) => Ok(()),
                 other => Err(format!("the Run value is still {}", other.unwrap_or_else(|| "missing".into()))),
             });
         match moved {
-            Ok(()) => moved_from = Some(old.clone()),
-            Err(e) => warnings.push(format!("start at login still runs the old agent in {} ({e})", old.display())),
+            Ok(()) if starts_from(&value, &old) => moved_from = Some(old.clone()),
+            Ok(()) => {}
+            Err(e) if starts_from(&value, &old) => warnings.push(format!("start at login still runs the old agent in {} ({e})", old.display())),
+            Err(e) => warnings.push(format!("start at login still runs another agent ({value}): {e}")),
+        }
+    }
+    if registry.get(&places.run_key, APP_RUN_VALUE).is_some_and(|v| !starts_from(&v, &dir)) {
+        let tray = format!("\"{}\" --hidden", dir.join(APP_EXE).display());
+        if let Err(e) = registry.set_string(&places.run_key, APP_RUN_VALUE, &tray) {
+            warnings.push(format!("the tray still starts at login from another copy ({e})"));
         }
     }
 
@@ -267,45 +325,189 @@ pub fn install(
         std::fs::remove_file(&shortcut).map_err(io(&shortcut))?;
     }
 
-    if agent_was_running && let Err(e) = machine.start_agent(&dir.join(AGENT_BG_EXE), &places.agent_data) {
-        warnings.push(format!("the agent couldn't be started again ({e}); it starts at the next login"));
+    Ok((moved_from, warnings))
+}
+
+/// The install failed (`failure`) after the agent was stopped: it is started again, from the folder its start at
+/// login names (the new one or the older install's), else from the new folder, else the older one. What is said.
+fn restarted_after(places: &Places, registry: &dyn Registry, machine: &dyn Machine, failure: &str) -> String {
+    let (dir, old) = (places.dir(), places.programs.join(OLD_DIR_NAME));
+    let run_value = registry.get(&places.run_key, AGENT_RUN_VALUE).unwrap_or_default();
+    let named = [&dir, &old].into_iter().find(|d| starts_from(&run_value, d));
+    let from = named.into_iter().chain([&dir, &old]).find(|d| d.join(AGENT_BG_EXE).is_file());
+    let started = match from {
+        Some(from) => machine.start_agent(&from.join(AGENT_BG_EXE), &places.agent_data),
+        None => Err("no agent is there to start".into()),
+    };
+    match started {
+        Ok(()) => format!("{failure}. The agent was started again."),
+        Err(e) => format!("{failure}. The agent couldn't be started again ({e}); it starts at the next login."),
     }
-    Ok(Installed { dir, agent_was_running, moved_from, warnings })
 }
 
 /// Removes the install at `places`; `running` is this setup's own exe (in the program folder when started from
 /// "Apps & features": then the folder goes once this process has ended).
 pub fn uninstall(places: &Places, registry: &dyn Registry, machine: &dyn Machine, running: &Path) -> Result<(), String> {
-    let dir = places.dir();
     machine.close_app();
-    if let AgentStop::StillRunning(why) = machine.stop_agent(&places.agent_data) {
-        return Err(still_running(&why));
-    }
+    let was_running = match machine.stop_agent(&places.agent_data) {
+        AgentStop::NotRunning => false,
+        AgentStop::Stopped => true,
+        AgentStop::StillRunning(why) => return Err(still_running(&why)),
+        AgentStop::Unknown(why) => return Err(restarted_after(places, registry, machine, &unknown_stop(&why))),
+    };
+    let mut removed_values = Vec::new();
+    uninstall_stopped(places, registry, machine, running, &mut removed_values)
+        .map_err(|e| put_back(places, registry, machine, was_running, &removed_values, &e))
+}
+
+/// The uninstall's changes once nothing runs; the `Run` values it removed (name, value) go into `removed_values`.
+fn uninstall_stopped(
+    places: &Places,
+    registry: &dyn Registry,
+    machine: &dyn Machine,
+    running: &Path,
+    removed_values: &mut Vec<(&'static str, String)>,
+) -> Result<(), String> {
+    let dir = places.dir();
+    clear_leftovers(places, machine, false);
     for value in [AGENT_RUN_VALUE, APP_RUN_VALUE] {
-        if registry.get(&places.run_key, value).as_deref().is_some_and(|v| starts_from(v, &dir)) {
+        if let Some(v) = registry.get(&places.run_key, value).filter(|v| starts_from(v, &dir)) {
             registry.remove_value(&places.run_key, value)?;
+            removed_values.push((value, v));
         }
     }
     let shortcut = places.shortcut();
     if shortcut.exists() {
         std::fs::remove_file(&shortcut).map_err(io(&shortcut))?;
     }
-    // The files before the "Apps & features" entry: if one can't go, the entry stays, to run it again.
+    // The files before the "Apps & features" entry: if they can't go, the entry stays, to run it again.
     if dir.exists() {
-        let running_inside = running.parent().is_some_and(|p| same_path(p, &dir));
-        if running_inside {
-            for entry in std::fs::read_dir(&dir).map_err(io(&dir))? {
-                let path = entry.map_err(io(&dir))?.path();
-                if !same_path(&path, running) {
-                    remove_patiently(&path, places.patience)?;
+        remove_program_folder(places, machine, running)?;
+    }
+    registry.remove_key(&places.uninstall_key)?;
+    remove_app_files(&places.app_files);
+    Ok(())
+}
+
+/// Removes the program folder. Its files are first moved aside, into `<folder>.removing-<pid>` next to it, each move
+/// one step that fails as a whole if a file is held open: if any can't be moved, those moved go back, and the folder
+/// is as it was (so the agent can be put back). Only then is anything deleted: the moved-aside folder (what can't be
+/// deleted yet, such as an exe still running, once this setup has ended), and the program folder itself (once this
+/// setup has ended, when this setup runs from it).
+fn remove_program_folder(places: &Places, machine: &dyn Machine, running: &Path) -> Result<(), String> {
+    let dir = places.dir();
+    let aside = dir.with_file_name(format!("{DIR_NAME}.removing-{}", std::process::id()));
+    let running_inside = running.parent().is_some_and(|p| same_path(p, &dir));
+    if running_inside {
+        // This setup's own exe can't move: everything else does, one by one, back again if one can't.
+        std::fs::create_dir_all(&aside).map_err(io(&aside))?;
+        let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for entry in std::fs::read_dir(&dir).map_err(io(&dir))? {
+            let path = entry.map_err(io(&dir))?.path();
+            if same_path(&path, running) {
+                continue;
+            }
+            let to = aside.join(path.file_name().unwrap_or_default());
+            if let Err(e) = machine.rename(&path, &to) {
+                let mut stranded = Vec::new();
+                for (from, to) in moved.iter().rev() {
+                    if machine.rename(to, from).is_err() {
+                        stranded.push(from.file_name().unwrap_or_default().to_string_lossy().into_owned());
+                    }
+                }
+                let _ = std::fs::remove_dir(&aside);
+                if stranded.is_empty() {
+                    return Err(e);
+                }
+                return Err(format!(
+                    "{e}; and {} couldn't be moved back from {} (the next run of the setup puts them back)",
+                    stranded.join(", "),
+                    aside.display()
+                ));
+            }
+            moved.push((path, to));
+        }
+    } else {
+        machine.rename(&dir, &aside)?;
+    }
+    // Past the point of no return: what can't be deleted now or after the setup is a leftover the next run removes.
+    if remove_patiently(&aside, places.patience).is_err() {
+        let _ = machine.remove_after_exit(&aside);
+    }
+    if running_inside { machine.remove_after_exit(&dir) } else { Ok(()) }
+}
+
+/// Folders an earlier uninstall moved aside (`<folder>.removing-<pid>`) and left behind, its setup no longer running:
+/// a roll-back that couldn't finish, or a delete that couldn't. On install (`restore`), every file the program folder
+/// lacks is moved back into it first; then, and on uninstall, the leftover is deleted (best effort).
+fn clear_leftovers(places: &Places, machine: &dyn Machine, restore: bool) {
+    let dir = places.dir();
+    let prefix = format!("{DIR_NAME}.removing-");
+    let Ok(entries) = std::fs::read_dir(&places.programs) else { return };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix(&prefix).and_then(|pid| pid.parse::<u32>().ok()) else { continue };
+        if pid == std::process::id() || machine.process_runs(pid) {
+            continue;
+        }
+        let leftover = entry.path();
+        if restore && std::fs::create_dir_all(&dir).is_ok() {
+            for file in std::fs::read_dir(&leftover).into_iter().flatten().filter_map(Result::ok) {
+                let back = dir.join(file.file_name());
+                if !back.exists() {
+                    let _ = machine.rename(&file.path(), &back);
                 }
             }
-            machine.remove_after_exit(&dir)?;
-        } else {
-            remove_patiently(&dir, places.patience)?;
+        }
+        let _ = remove_patiently(&leftover, places.patience);
+    }
+}
+
+/// The uninstall failed (`failure`) after the agent was stopped and maybe its start at login removed: while the
+/// program folder is whole, its `Run` values are put back and, if it ran, it is started again, so this computer keeps
+/// syncing until the uninstall is run again. What is said.
+fn put_back(
+    places: &Places,
+    registry: &dyn Registry,
+    machine: &dyn Machine,
+    was_running: bool,
+    removed_values: &[(&'static str, String)],
+    failure: &str,
+) -> String {
+    let dir = places.dir();
+    if ![APP_EXE, AGENT_EXE, AGENT_BG_EXE].iter().all(|file| dir.join(file).is_file()) {
+        return format!("{failure}. Run the uninstall again to finish it.");
+    }
+    let restored = removed_values.iter().all(|(name, value)| registry.set_string(&places.run_key, name, value).is_ok());
+    let told = match (removed_values.is_empty(), restored) {
+        (true, _) => String::new(),
+        (false, true) => " Start at login was put back.".to_owned(),
+        (false, false) => " Start at login couldn't all be put back: run the uninstall again, or the setup.".to_owned(),
+    };
+    if was_running { format!("{}{told}", restarted_after(places, registry, machine, failure)) } else { format!("{failure}.{told}") }
+}
+
+/// The app's single-instance files in `app_files`, the folder itself once empty, and the loose ones older versions
+/// kept beside it. Only these names: anything else there stays. Last, and best effort: a file an app that couldn't be
+/// closed still holds stays, and is harmless.
+fn remove_app_files(app_files: &Path) {
+    for name in ["window.lock", "window.port", "window.port.tmp", "tray.lock", "tray.port", "tray.port.tmp"] {
+        let _ = std::fs::remove_file(app_files.join(name));
+    }
+    let _ = std::fs::remove_dir(app_files);
+    if let Some(parent) = app_files.parent() {
+        for old in ["craft-cloud-app.lock", "craft-cloud-app.port", "craft-cloud-tray.lock", "craft-cloud-tray.port"] {
+            let _ = std::fs::remove_file(parent.join(old));
         }
     }
-    registry.remove_key(&places.uninstall_key)
+}
+
+/// What is said when the agent was asked to quit and then whether it ended couldn't be told: nothing else was changed
+/// (and it is started again).
+fn unknown_stop(why: &str) -> String {
+    format!(
+        "Craft Cloud's agent was asked to quit, but whether it has stopped can't be told ({why}). Nothing else was changed: try again in a minute"
+    )
 }
 
 /// What is said when the agent can't be stopped: nothing was changed.
@@ -347,6 +549,18 @@ pub fn lists_agent(csv: &str, pid: u32) -> bool {
         let image = columns.next().unwrap_or_default().trim_start_matches('"').to_lowercase();
         image.starts_with("craft-cloud-agent") && columns.next() == Some(pid.to_string().as_str())
     })
+}
+
+/// What a `tasklist /FI "PID eq <pid>" /FO CSV /NH` run says about the agent `pid`: whether it runs, or why that
+/// can't be told. Only an answer counts: `tasklist` that couldn't run, failed or said nothing (it always prints a
+/// row or a note that nothing matched) is never taken for an agent that has ended.
+pub fn tasklist_says(ran: Result<(bool, String), String>, pid: u32) -> Result<bool, String> {
+    match ran {
+        Err(e) => Err(format!("tasklist can't run: {e}")),
+        Ok((false, _)) => Err("tasklist failed".into()),
+        Ok((true, out)) if out.trim().is_empty() => Err("tasklist answered nothing".into()),
+        Ok((true, out)) => Ok(lists_agent(&out, pid)),
+    }
 }
 
 /// Asks the agent at `file`'s port to quit (`POST /v1/quit` on its local API, as an app does). Whether it said yes.

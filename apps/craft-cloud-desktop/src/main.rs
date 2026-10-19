@@ -5,6 +5,9 @@
 //! - Linux: `--tray` is the tray process (no window: [`tray::process`]), which the start-at-login entry runs (an
 //!   older entry's `--hidden` means the same). The window is a process of its own that ends when closed (Wayland can't
 //!   hide a window), and starts the tray process if none runs.
+//!
+//! `--close` ends the window and the tray process that run (an installer's upgrade: also an older version's) and
+//! prints which did (`window`, `tray`, a line each); the agent is left alone.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -29,6 +32,12 @@ fn main() -> ExitCode {
         eprintln!("Craft Cloud can't find your user data folder");
         return ExitCode::FAILURE;
     };
+    if has("--close") {
+        for name in single_instance::close_running(&dir) {
+            println!("{}", if name == Name::Tray { "tray" } else { "window" });
+        }
+        return ExitCode::SUCCESS;
+    }
     let (outside_tx, outside_rx) = std::sync::mpsc::channel::<Event>();
     let window: Arc<OnceLock<egui::Context>> = Arc::new(OnceLock::new());
     match single_instance::claim(&dir, Name::Window) {

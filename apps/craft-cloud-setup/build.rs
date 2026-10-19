@@ -1,13 +1,13 @@
 //! The setup's payload and, on Windows, its icon and version resource.
 //!
 //! `cargo xtask package` builds the app and the agent first, then this crate with `CRAFT_CLOUD_SETUP_PAYLOAD` naming
-//! the folder they are in: their bytes are then built in (`include_bytes!`, under `cfg(payload)`). Without it (every
+//! the folder they (and `LICENSES.txt`) are in: their bytes are then built in (`include_bytes!`, under `cfg(payload)`). Without it (every
 //! other build: clippy, tests) the setup carries nothing and says so if run.
 
 use std::path::Path;
 
 /// The files the payload folder must hold.
-const PAYLOAD: [&str; 3] = ["craft-cloud.exe", "craft-cloud-agent.exe", "craft-cloud-agent-bg.exe"];
+const PAYLOAD: [&str; 4] = ["craft-cloud.exe", "craft-cloud-agent.exe", "craft-cloud-agent-bg.exe", "LICENSES.txt"];
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");

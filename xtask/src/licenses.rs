@@ -27,6 +27,13 @@ const MPL_IDS: &[&str] = &["MPL-2.0", "MPL-2.0+"];
 /// which eframe always builds with.
 const BSL_CRATES: &[&str] = &["xxhash-rust", "clipboard-win", "error-code"];
 
+/// Every crate named in an exception above (the packages' notices must carry each that is in a program).
+#[cfg(test)]
+pub fn excepted_crates() -> Vec<&'static str> {
+    let data = DATA_ONLY.iter().flat_map(|(_, crates)| crates.iter().copied());
+    data.chain(MPL_UNMODIFIED.iter().copied()).chain(BSL_CRATES.iter().copied()).collect()
+}
+
 /// Licence exceptions that only add permissions (`Apache-2.0 WITH LLVM-exception`).
 const EXCEPTIONS: &[&str] = &["LLVM-exception"];
 

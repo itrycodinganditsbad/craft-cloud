@@ -1,7 +1,7 @@
 //! One of each per user: the app's window, and (on Linux) its tray process. The first of a kind holds a lock on its
-//! `<name>.lock` and listens on a loopback port it writes, with a random token, to `<name>.port`; both are in the
-//! folder above the agent's data folder (the per-user data folder: `%LOCALAPPDATA%`, `~/Library/Application Support`,
-//! `~/.local/share`). A later start finds the lock taken, connects to that port and sends a [`Command`]: `show` (the
+//! `<name>.lock` and listens on a loopback port it writes, with a random token, to `<name>.port`; both are in
+//! `craft-cloud-app`, next to the agent's data folder in the per-user data folder (`%LOCALAPPDATA%`,
+//! `~/Library/Application Support`, `~/.local/share`). A later start finds the lock taken, connects to that port and sends a [`Command`]: `show` (the
 //! first brings its window forward, also from the tray, and the second exits, so there is never a second tray icon)
 //! or `quit` (the tray's Quit ends the window too, and the window's Quit the tray).
 //!
@@ -30,8 +30,8 @@ pub enum Name {
 impl Name {
     fn stem(self) -> &'static str {
         match self {
-            Name::Window => "craft-cloud-app",
-            Name::Tray => "craft-cloud-tray",
+            Name::Window => "window",
+            Name::Tray => "tray",
         }
     }
 
@@ -44,6 +44,27 @@ impl Name {
     pub fn port_file(self) -> String {
         format!("{}.port", self.stem())
     }
+
+    /// Its lock and port files in `dir`.
+    fn files(self, dir: &Path) -> Files {
+        Files { lock: dir.join(self.lock_file()), port: dir.join(self.port_file()) }
+    }
+
+    /// Where versions before the folder of its own kept them: loose in the per-user data folder (`parent`).
+    fn old_files(self, parent: &Path) -> Files {
+        let stem = match self {
+            Name::Window => "craft-cloud-app",
+            Name::Tray => "craft-cloud-tray",
+        };
+        Files { lock: parent.join(format!("{stem}.lock")), port: parent.join(format!("{stem}.port")) }
+    }
+}
+
+/// A process kind's lock and port files.
+#[derive(Debug, Clone)]
+struct Files {
+    lock: PathBuf,
+    port: PathBuf,
 }
 
 /// What a later start asks the first.
@@ -82,43 +103,86 @@ pub struct First {
 
 /// Another one's address.
 pub struct Running {
-    dir: PathBuf,
-    name: Name,
+    files: Files,
 }
 
-/// The folder for the locks and the channels: the one above the agent's data folder.
+/// The folder of the locks and the channels, next to the agent's data folder (the uninstallers remove it).
+pub const FOLDER_NAME: &str = "craft-cloud-app";
+
+/// The folder for the locks and the channels: [`FOLDER_NAME`] next to the agent's data folder.
 pub fn folder() -> Option<PathBuf> {
-    craft_cloud_proto::local::data_dir(|name| std::env::var_os(name)).and_then(|data| data.parent().map(Path::to_owned))
+    craft_cloud_proto::local::data_dir(|name| std::env::var_os(name)).and_then(|data| folder_beside(&data))
+}
+
+/// [`FOLDER_NAME`] next to the agent's data folder `data`.
+fn folder_beside(data: &Path) -> Option<PathBuf> {
+    data.parent().map(|parent| parent.join(FOLDER_NAME))
 }
 
 /// Takes the lock of `name` in `dir`, or finds the process that holds it.
 pub fn claim(dir: &Path, name: Name) -> std::io::Result<Instance> {
     std::fs::create_dir_all(dir)?;
-    let lock = OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(name.lock_file()))?;
+    claim_files(name.files(dir))
+}
+
+fn claim_files(files: Files) -> std::io::Result<Instance> {
+    let lock = OpenOptions::new().create(true).truncate(false).write(true).open(&files.lock)?;
     match lock.try_lock() {
         Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(Instance::Running(Running { dir: dir.to_owned(), name })),
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(Instance::Running(Running { files })),
         Err(std::fs::TryLockError::Error(e)) => return Err(e),
     }
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let token = token()?;
     let port = listener.local_addr()?.port();
     // Written whole, then renamed into place, so a later start never reads half of it.
-    let temp = dir.join(format!("{}.tmp", name.port_file()));
+    let mut temp = files.port.clone().into_os_string();
+    temp.push(".tmp");
     std::fs::write(&temp, format!("{port} {token}\n"))?;
-    std::fs::rename(&temp, dir.join(name.port_file()))?;
+    std::fs::rename(&temp, &files.port)?;
     Ok(Instance::First(First { lock, listener, token }))
 }
 
 /// Whether a process of `name` runs (holds its lock), without taking it for long.
 pub fn is_running(dir: &Path, name: Name) -> bool {
-    let Ok(lock) = OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(name.lock_file())) else { return false };
+    holds(&name.files(dir).lock)
+}
+
+/// Whether a process holds the lock `lock` (one that isn't there isn't made).
+fn holds(lock: &Path) -> bool {
+    let Ok(lock) = OpenOptions::new().write(true).open(lock) else { return false };
     matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }
 
 /// Sends `command` to the running process of `name`, if one answers (within a few seconds).
 pub fn send(dir: &Path, name: Name, command: Command) -> std::io::Result<()> {
-    Running { dir: dir.to_owned(), name }.send(command)
+    Running { files: name.files(dir) }.send(command)
+}
+
+/// Ends the window and the tray process that run for `dir`, also those of a version that kept its files loose in
+/// the folder above (an upgrade replaces the programs under them), and waits (a few seconds) for each to let go of its
+/// lock. The kinds that were running. The agent is left alone.
+pub fn close_running(dir: &Path) -> Vec<Name> {
+    let parent = dir.parent().unwrap_or(dir);
+    let mut closed = Vec::new();
+    for name in [Name::Window, Name::Tray] {
+        for files in [name.files(dir), name.old_files(parent)] {
+            if !holds(&files.lock) {
+                continue;
+            }
+            let lock = files.lock.clone();
+            if (Running { files }).send(Command::Quit).is_ok() {
+                let deadline = Instant::now() + PATIENCE;
+                while holds(&lock) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if !closed.contains(&name) {
+                    closed.push(name);
+                }
+            }
+        }
+    }
+    closed
 }
 
 fn token() -> std::io::Result<String> {
@@ -172,14 +236,14 @@ impl Running {
             match self.try_send(command) {
                 Ok(()) => return Ok(()),
                 // The first may be starting: its port file comes a moment after its lock.
-                Err(_) if Instant::now() < deadline && is_running(&self.dir, self.name) => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) if Instant::now() < deadline && holds(&self.files.lock) => std::thread::sleep(Duration::from_millis(100)),
                 Err(e) => return Err(e),
             }
         }
     }
 
     fn try_send(&self, command: Command) -> std::io::Result<()> {
-        let text = std::fs::read_to_string(self.dir.join(self.name.port_file()))?;
+        let text = std::fs::read_to_string(&self.files.port)?;
         let (port, token) = text.trim().split_once(' ').ok_or_else(|| std::io::Error::other("the port file doesn't read"))?;
         let port: u16 = port.parse().map_err(|_| std::io::Error::other("the port file doesn't read"))?;
         let mut stream = TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), Duration::from_secs(1))?;
@@ -230,6 +294,42 @@ mod tests {
         send(dir.path(), Name::Tray, Command::Quit).unwrap();
         assert_eq!(heard.recv_timeout(Duration::from_secs(10)).unwrap(), Command::Quit);
         assert!(is_running(dir.path(), Name::Tray), "asking doesn't take the lock");
+    }
+
+    /// The locks and the channels have a folder of their own, next to the agent's, not loose in the per-user folder.
+    #[test]
+    fn the_files_are_in_a_folder_of_their_own() {
+        let data = Path::new("/home/u/.local/share/craft-cloud-agent");
+        assert_eq!(folder_beside(data).unwrap(), Path::new("/home/u/.local/share/craft-cloud-app"));
+        let dir = tempfile::tempdir().unwrap();
+        let inside = dir.path().join(FOLDER_NAME);
+        let _first = claim(&inside, Name::Window).unwrap();
+        let loose: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(loose, [FOLDER_NAME], "nothing else beside it");
+        assert!(inside.join("window.lock").is_file() && inside.join("window.port").is_file());
+    }
+
+    /// An upgrade closes what runs: here a tray in the folder and a window of an older version, whose files are loose
+    /// in the folder above. Each is told to quit; nothing runs where nothing is told.
+    #[test]
+    fn close_running_tells_the_window_and_the_tray_new_and_old() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join(FOLDER_NAME);
+        assert!(close_running(&dir).is_empty(), "nothing runs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (told, heard) = channel();
+        let Instance::First(tray) = claim(&dir, Name::Tray).unwrap() else { panic!("not first") };
+        let Instance::First(old_window) = claim_files(Name::Window.old_files(parent.path())).unwrap() else { panic!("not first") };
+        for (name, first) in [(Name::Tray, tray), (Name::Window, old_window)] {
+            let told = told.clone();
+            first.listen(move |command| {
+                let _ = told.send((name, command));
+            });
+        }
+        assert_eq!(close_running(&dir), [Name::Window, Name::Tray]);
+        let mut heard: Vec<_> = (0..2).map(|_| heard.recv_timeout(Duration::from_secs(10)).unwrap()).collect();
+        heard.sort_by_key(|(name, _)| *name == Name::Tray);
+        assert_eq!(heard, [(Name::Window, Command::Quit), (Name::Tray, Command::Quit)]);
     }
 
     #[test]

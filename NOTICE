@@ -8,4 +8,9 @@ endorsed by the ArtCraft Team, and it contains none of the ArtCraft name, logo o
 
 Third-party material
 
-None is bundled yet. The per-file list (author, source, license) is in ATTRIBUTION.md.
+The packages of the Craft Cloud app carry LICENSES.txt: these licences, then every third-party crate compiled into
+the programs, with its licence and the licence and notice files it ships. Among them are egui's default fonts, built
+into the app (crate epaint_default_fonts: Ubuntu Font Licence 1.0, SIL Open Font License 1.1, MIT), crates under the
+Boost Software License 1.0, and im, bitmaps and sized-chunks (in the agent) under the Mozilla Public License 2.0,
+used unmodified, with their source at crates.io.
+The per-file list of this repository's own assets (author, source, license) is in ATTRIBUTION.md.
