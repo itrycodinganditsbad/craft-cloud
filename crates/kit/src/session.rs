@@ -290,6 +290,9 @@ pub struct Session<D: LiveDocument> {
     refused: Option<String>,
     /// Undos (`true`) and redos asked for while remote changes were held: run once the gesture ends.
     deferred: Vec<bool>,
+    /// A rebuild failed: the live document is ahead of the model, which takes no local change until a whole rebuild
+    /// succeeds.
+    model_stale: bool,
     /// The agent refused a change for now (its disk): the queue goes again, in order, from this moment.
     resend_at: Instant,
     resend_backoff: Duration,
@@ -504,6 +507,7 @@ impl<D: LiveDocument> Session<D> {
             read_from: None,
             refused: None,
             deferred: Vec::new(),
+            model_stale: false,
             resend_at: Instant::now(),
             resend_backoff: FIRST_BACKOFF,
         };
@@ -600,6 +604,9 @@ impl<D: LiveDocument> Session<D> {
     pub fn local_change(&mut self, old: &Arc<D::Doc>, new: &Arc<D::Doc>) -> Result<(), KitError> {
         if let Some(ro) = &self.status.read_only {
             return Err(KitError::ReadOnly { app: ro.app.clone(), version: ro.version });
+        }
+        if self.model_stale {
+            return Err(KitError::ModelStale);
         }
         if !Arc::ptr_eq(old, &self.model) {
             return Err(KitError::Stale);
@@ -743,8 +750,16 @@ impl<D: LiveDocument> Session<D> {
                 }
             }
         };
+        // A model left behind by a failed rebuild: a whole rebuild, tried again each poll.
+        if self.model_stale && !self.held {
+            self.reindex_trees();
+            if self.rebuild(Touched::everything()).is_ok() {
+                self.status.error = None;
+                changed = true;
+            }
+        }
         // Undos asked for during a gesture, now that it is over, in order.
-        if !self.held {
+        if !self.held && !self.model_stale {
             for undo in std::mem::take(&mut self.deferred) {
                 match self.undo_redo(undo) {
                     Ok(done) => changed |= done,
@@ -1001,9 +1016,26 @@ impl<D: LiveDocument> Session<D> {
         touched
     }
 
+    /// Rebuilds the model from the touched parts (see [`Session::rebuild_parts`]). If that fails, the document has
+    /// moved on and the model hasn't: the model is marked stale, local changes are refused ([`KitError::ModelStale`])
+    /// so no diff is ever written from it, and each poll tries a whole rebuild until one succeeds.
+    fn rebuild(&mut self, touched: Touched) -> Result<(), KitError> {
+        match self.rebuild_parts(touched) {
+            Ok(()) => {
+                self.model_stale = false;
+                Ok(())
+            }
+            Err(e) => {
+                self.model_stale = true;
+                self.status.error = Some(format!("the model couldn't take a change from the live document: {e}"));
+                Err(e)
+            }
+        }
+    }
+
     /// Rebuilds the model from the touched parts, normalises it (writing back what that repaired), refreshes what is
     /// derived, and makes it the session's.
-    fn rebuild(&mut self, touched: Touched) -> Result<(), KitError> {
+    fn rebuild_parts(&mut self, touched: Touched) -> Result<(), KitError> {
         let raw = {
             // The old parts, for the texts to be patched rather than read whole.
             let old_parts = D::mappings(&self.model);

@@ -31,6 +31,10 @@ pub enum KitError {
     /// The app's own codec failed.
     #[error("{0}")]
     App(String),
+    /// The model couldn't take a change from the live document (`apply_remote` or a repair failed): it is behind, so
+    /// no local change is taken from it until the session has rebuilt it whole (it tries at each poll).
+    #[error("model_stale: the model is behind the live document; wait for the session to rebuild it")]
+    ModelStale,
 }
 
 impl From<loro::LoroError> for KitError {

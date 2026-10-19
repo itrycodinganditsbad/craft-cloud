@@ -283,6 +283,83 @@ fn a_change_refused_for_good_stops_the_session() {
     assert!(b.model().items.is_empty(), "nothing went out after the refusal");
 }
 
+/// A flat list of layers whose `apply_remote` fails while `fail` is set (an app's codec that can't read something).
+#[derive(Clone, Debug)]
+struct Flaky {
+    layers: Arc<Vec<(craft_cloud_kit::ElemId, String)>>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct FlakyLayers<'a>(&'a Flaky);
+
+impl craft_cloud_kit::TreeSource for FlakyLayers<'_> {
+    fn roots(&self) -> Vec<craft_cloud_kit::ElemId> {
+        self.0.layers.iter().map(|(id, _)| *id).collect()
+    }
+    fn children(&self, _: craft_cloud_kit::ElemId) -> Vec<craft_cloud_kit::ElemId> {
+        Vec::new()
+    }
+    fn write(&self, id: craft_cloud_kit::ElemId, props: &mut craft_cloud_kit::Props<'_, '_>) -> Result<(), KitError> {
+        if let Some((_, name)) = self.0.layers.iter().find(|(i, _)| *i == id) {
+            props.set("name", name.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+struct FlakyApp;
+
+impl craft_cloud_kit::LiveDocument for FlakyApp {
+    type Doc = Flaky;
+    const APP: &'static str = "flaky";
+    const SCHEMA: u32 = 1;
+    fn mappings(doc: &Flaky) -> craft_cloud_kit::Mappings<'_> {
+        craft_cloud_kit::Mappings::new().tree("layers", FlakyLayers(doc))
+    }
+    fn apply_remote(old: &Arc<Flaky>, patch: &craft_cloud_kit::RemotePatch<'_>) -> Result<Arc<Flaky>, KitError> {
+        if old.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(KitError::App("this layer doesn't read".into()));
+        }
+        let mut new = (**old).clone();
+        if let Some(tree) = patch.tree("layers") {
+            new.layers = Arc::new(tree.roots().into_iter().map(|id| (id, tree.props(id).and_then(|p| p.str("name")).unwrap_or_default())).collect());
+        }
+        Ok(Arc::new(new))
+    }
+    fn normalise(_: &mut Flaky) {}
+    fn refresh_derived(_: &mut Flaky) {}
+}
+
+/// A remote change the model can't take leaves it stale: local changes are refused (never a diff from a model behind
+/// the document, which would delete the other machine's new layer), and once a whole rebuild succeeds at a poll the
+/// session goes on, with nothing lost.
+#[test]
+fn a_model_behind_the_document_takes_no_local_change_until_rebuilt() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let first = craft_cloud_kit::ElemId::new();
+    let flaky = |fail: bool| Flaky { layers: Arc::new(vec![(first, "one".into())]), fail: Arc::new(std::sync::atomic::AtomicBool::new(fail)) };
+    let mut a = open::<FlakyApp>(&pc, "l.txt", flaky(false));
+    let mut b = open::<FlakyApp>(&laptop, "l.txt", flaky(false));
+    let fail = b.model().fail.clone();
+    fail.store(true, std::sync::atomic::Ordering::Relaxed);
+    change(&mut a, |m| Flaky { layers: Arc::new(vec![(first, "one".into()), (craft_cloud_kit::ElemId::new(), "two".into())]), ..m.clone() }).unwrap();
+    until(&mut [&mut a, &mut b], "the laptop failed to take it", |s| s.get(1).is_some_and(|b| b.status().error.is_some()));
+    let refused = change(&mut b, |m| Flaky { layers: Arc::new(vec![(first, "renamed".into())]), ..m.clone() });
+    assert_eq!(refused, Err(KitError::ModelStale));
+    fail.store(false, std::sync::atomic::Ordering::Relaxed);
+    until(&mut [&mut a, &mut b], "rebuilt", |s| s.get(1).is_some_and(|b| b.model().layers.len() == 2));
+    change(&mut b, |m| {
+        let mut layers = (*m.layers).clone();
+        layers[0].1 = "renamed".into();
+        Flaky { layers: Arc::new(layers), ..m.clone() }
+    })
+    .unwrap();
+    until(&mut [&mut a, &mut b], "both layers on both", |s| {
+        s.iter().all(|s| s.model().layers.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>() == ["renamed", "two"])
+    });
+}
+
 /// A session opened off the UI thread can be handed to it.
 #[test]
 fn a_session_can_move_to_another_thread() {
