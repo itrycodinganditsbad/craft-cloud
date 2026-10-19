@@ -108,8 +108,18 @@ async fn live_reset_doc_takes_a_document_id_and_drops_its_snapshot() {
     let doc = craft_cloud_proto::DocId::generate();
     meta.create_live_doc(ana.space, doc, "recents:wordcraft", None, 0).await.unwrap();
     meta.append_live_update(ana.space, doc, device, 1, &[1; 20], 0).await.unwrap();
-    let (snapshot, _) = craft_cloud_meta::SnapshotRef::split(&[7; 30]);
-    assert!(meta.compact_live_doc(ana.space, doc, 1, &snapshot, 0).await.unwrap());
+    // A snapshot as an agent uploads one: a chunk, and the manifest naming it.
+    let chunk = craft_cloud_proto::ChunkId::from_bytes([7; 32]);
+    meta.add_chunk(ana.space, &chunk, 31, 0).await.unwrap();
+    let manifest = craft_cloud_proto::Manifest::new(
+        craft_cloud_proto::ChunkerParamsId::new("fastcdc-v1").unwrap(),
+        30,
+        craft_cloud_proto::FileHash::from_bytes([7; 32]),
+        vec![craft_cloud_proto::ChunkRef { id: chunk, len: 30 }],
+    )
+    .unwrap();
+    meta.add_manifest(ana.space, &manifest, 100, 0).await.unwrap();
+    assert!(meta.compact_live_doc(ana.space, doc, 1, &manifest.id()).await.unwrap());
     let out = cli(&["live", "--config", c, "reset-doc", "ana", &doc.to_string()], "").await.unwrap();
     assert!(out.contains(&format!("emptied the live document {doc} of ana")), "{out}");
     let reset = meta.live_doc(ana.space, doc).await.unwrap().unwrap();

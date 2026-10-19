@@ -134,6 +134,7 @@ fn a_big_document_opens_from_its_snapshot_and_tail_in_under_a_second() {
         let auth = w.meta.device_by_token(&token).await.unwrap().unwrap();
         let mut writer = craft_cloud_server::live::Session::new(w.state.clone(), &auth);
         writer.handle(ClientFrame::Hello { min: 1, max: 2 }).await;
+        let import = w.upload(doc, &import).await;
         let made_reply = writer.handle(ClientFrame::CreateDocument { doc, node, app: docs_common::app(), snapshot: import }).await;
         assert_eq!(made_reply.frames, vec![ServerFrame::CreatedDocument { doc, kept: true }]);
         let line = "the quick brown fox jumps over the lazy dog, again\n";
@@ -151,11 +152,8 @@ fn a_big_document_opens_from_its_snapshot_and_tail_in_under_a_second() {
         }
         // Compacted at 99,000 (as an agent would answer), the last 1,000 above it.
         let snapshot = tail_from.unwrap();
-        let (stored, pieces) = craft_cloud_meta::SnapshotRef::split(&snapshot);
-        for (id, piece) in stored.pieces.iter().zip(pieces) {
-            w.state.store.put(craft_cloud_store::BlobKey::chunk(id), piece).await.unwrap();
-        }
-        assert!(w.meta.compact_live_doc(w.space, doc, 99_000, &stored, 0).await.unwrap());
+        let stored = w.upload(doc, &snapshot).await;
+        assert!(w.meta.compact_live_doc(w.space, doc, 99_000, &stored).await.unwrap());
         let text_len = made.get_text("text").len_utf8();
         assert!(text_len >= 5_000_000, "{text_len} bytes of text");
         // A machine that never had it opens it.

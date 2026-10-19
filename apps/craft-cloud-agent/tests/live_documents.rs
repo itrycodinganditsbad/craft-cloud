@@ -146,6 +146,70 @@ async fn a_file_opened_on_one_machine_is_live_on_the_other() {
     run_laptop.stop().await.0.unwrap();
 }
 
+/// Snapshots go through the chunk API: the import goes up before `create` names it, a compaction's snapshot before
+/// `snapshot` names it, and a machine that never had the document downloads the server's snapshot before the log
+/// above it. The live connection never carries one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshots_go_up_and_down_through_the_chunk_api() {
+    let server = Server::with_limits(craft_cloud_server::state::Limits { compact_updates: 3, ..Default::default() }).await;
+    let pc = Agent::signed_in(&server, "pc").await;
+    let run_pc = pc.run();
+    let on_pc = pc.client().await;
+    std::fs::create_dir_all(&pc.folder).unwrap();
+    std::fs::write(pc.folder.join("long.txt"), "start").unwrap();
+    let c = on_pc.clone();
+    eventually("the file is synced", move || {
+        let docs = c.documents().ok()?;
+        matches!(docs.open("long.txt", "wordcraft").ok()?, Opened::NeedsImport(_)).then_some(())
+    })
+    .await;
+    let c = on_pc.clone();
+    let (docs_pc, app) = off(move || {
+        let docs = c.documents().unwrap();
+        let doc = open(&docs, "long.txt", "start");
+        (docs, AppDoc::new(doc, 21))
+    })
+    .await;
+    let app = Arc::new(Mutex::new(app));
+    let mut last = 0;
+    for i in 0..12 {
+        last = app.lock().unwrap().append(&format!(" {i}"));
+    }
+    let a = app.clone();
+    eventually("every change acked", move || a.lock().unwrap().pump().contains(&Event::Acked(last)).then_some(())).await;
+    let node = server_node(&server, "long.txt").await.unwrap();
+    let space = server.meta.user_by_name("ana").await.unwrap().unwrap().space;
+    let doc = craft_cloud_proto::live::node_doc(space, node);
+    let meta = server.meta.clone();
+    let mut compacted = 0;
+    for _ in 0..600 {
+        compacted = meta.live_doc(space, doc).await.unwrap().map_or(0, |d| d.base);
+        if compacted > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(compacted > 0, "the pc's snapshot was taken");
+    let (_, snapshot) = meta.live_snapshot(space, doc).await.unwrap().unwrap();
+    assert!(meta.has_manifest(space, &snapshot.manifest).await.unwrap(), "uploaded as the account's");
+    // A machine that never had it: from the snapshot (downloaded) and the log above it.
+    let laptop = Agent::signed_in(&server, "laptop").await;
+    let run_laptop = laptop.run();
+    let on_laptop = laptop.client().await;
+    synced(&laptop, "long.txt").await;
+    let c = on_laptop.clone();
+    let (docs_laptop, joined) = off(move || {
+        let docs = c.documents().unwrap();
+        let doc = open(&docs, "long.txt", "never used");
+        (docs, AppDoc::new(doc, 22))
+    })
+    .await;
+    assert_eq!(joined.text(), "start 0 1 2 3 4 5 6 7 8 9 10 11");
+    drop((docs_pc, docs_laptop, joined, app));
+    run_pc.stop().await.0.unwrap();
+    run_laptop.stop().await.0.unwrap();
+}
+
 /// A file not uploaded yet: the open starts a sync pass and waits for the file's node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_file_not_uploaded_yet_is_synced_for_the_open() {

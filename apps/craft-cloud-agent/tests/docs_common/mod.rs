@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+pub mod blobs;
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -183,11 +185,40 @@ impl World {
         }
     }
 
-    /// One round of delivery on every connection; whether anything moved.
+    /// The chunk API of the account's space, as the agents reach it (for snapshots).
+    pub fn blobs(&self) -> blobs::ServerBlobs {
+        blobs::ServerBlobs { state: self.state.clone(), space: self.space }
+    }
+
+    /// `bytes` uploaded as a snapshot of `doc`, as an agent uploads one: the manifest that names it.
+    pub async fn upload(&self, doc: DocId, bytes: &[u8]) -> craft_cloud_proto::ManifestId {
+        let up = craft_cloud_agent::live::blobs::cut(doc, bytes).unwrap();
+        craft_cloud_agent::live::blobs::upload(&self.blobs(), &up).await.unwrap();
+        up.id()
+    }
+
+    /// The snapshot `manifest` names, downloaded as an agent downloads one.
+    pub async fn download(&self, manifest: &craft_cloud_proto::ManifestId) -> Vec<u8> {
+        craft_cloud_agent::live::blobs::download(&self.blobs(), manifest).await.unwrap()
+    }
+
+    /// One round of delivery on every connection; whether anything moved. Snapshots go up and down through the chunk
+    /// API as the hub moves them: each upload before the frames that follow it, each download handed back before what
+    /// comes next.
     pub async fn step(&mut self) -> bool {
         let mut moved = false;
+        let api = self.blobs();
         for machine in &mut self.machines {
             let Some(conn) = machine.conn.as_mut() else { continue };
+            if let Some(replica) = machine.replica.as_mut() {
+                for up in replica.take_uploads() {
+                    if let Err(e) = craft_cloud_agent::live::blobs::upload(&api, &up).await {
+                        replica.upload_failed(up.doc, &e.to_string());
+                        let id = up.id();
+                        machine.up.retain(|f| !matches!(f, ClientFrame::Snapshot { manifest, .. } | ClientFrame::CreateDocument { snapshot: manifest, .. } if *manifest == id));
+                    }
+                }
+            }
             while let Some(mut frame) = machine.up.pop_front() {
                 moved = true;
                 if machine.old_server
@@ -213,7 +244,13 @@ impl World {
                 moved = true;
                 machine.heard.push(frame.clone());
                 match replica.on_frame(frame) {
-                    Ok(frames) => machine.up.extend(frames),
+                    Ok(frames) => {
+                        machine.up.extend(frames);
+                        for (doc, manifest) in replica.take_fetches() {
+                            let got = craft_cloud_agent::live::blobs::download(&api, &manifest).await.map_err(|e| e.to_string());
+                            machine.up.extend(replica.on_snapshot(doc, manifest, got));
+                        }
+                    }
                     Err(e) => {
                         machine.said.push(format!("the link ended: {e}"));
                         machine.conn = None;

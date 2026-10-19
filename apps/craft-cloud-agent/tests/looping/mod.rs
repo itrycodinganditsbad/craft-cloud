@@ -130,19 +130,24 @@ pub struct Server {
 
 impl Server {
     pub async fn new() -> Self {
-        Self::start(None).await
+        Self::start(None, Default::default()).await
     }
 
     /// A server whose every message takes `delay` each way (a gate that can't go down).
     pub async fn delayed(delay: Duration) -> Self {
-        Self::start(Some(delay)).await
+        Self::start(Some(delay), Default::default()).await
     }
 
-    async fn start(delay: Option<Duration>) -> Self {
+    /// A server with other limits (a compaction asked for early, say).
+    pub async fn with_limits(limits: craft_cloud_server::state::Limits) -> Self {
+        Self::start(None, limits).await
+    }
+
+    async fn start(delay: Option<Duration>, limits: craft_cloud_server::state::Limits) -> Self {
         let (db, blobs) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
         meta.create_user("ana", &hash_password(PASSWORD).unwrap(), Role::Member, 0).await.unwrap();
-        let state = AppState::new(meta.clone(), Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![]).unwrap();
+        let state = AppState::new(meta.clone(), Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![]).unwrap().with_limits(limits);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gate = match delay {
             Some(delay) => Gate::delayed(listener.local_addr().unwrap(), delay).await,

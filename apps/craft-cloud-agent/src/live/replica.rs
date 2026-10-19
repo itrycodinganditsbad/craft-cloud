@@ -82,9 +82,10 @@ use craft_cloud_proto::live::{
     MAX_UPDATE_BYTES, PROTOCOL_MISMATCH, ServerFrame, node_doc, recents_doc, update_hash,
 };
 use craft_cloud_proto::local::{NotLiveReason, RecentEntry};
-use craft_cloud_proto::{DocId, Epoch, NodeId, SpaceId};
+use craft_cloud_proto::{DocId, Epoch, ManifestId, NodeId, SpaceId};
 use serde::{Deserialize, Serialize};
 
+use super::blobs::{Upload, cut};
 use super::copy::{LiveCopy, LogVersion, Taken as CopyTaken, Version, version_of};
 use super::recents::{AddKey, Imported, Recents, Spans, UpdateError, add_spans, spans_of};
 use super::store::DocStore;
@@ -540,6 +541,12 @@ struct Doc {
     /// The catch-up's updates not taken yet ([`Replica::take_batch`]), and their bytes.
     batch: Vec<(u64, Vec<u8>)>,
     batched: usize,
+    /// The catch-up started with the server's snapshot (its base and manifest), being downloaded: its updates wait in
+    /// `batch` (and its `subscribed`, in `deferred_head`) until it is here ([`Replica::on_snapshot`]).
+    fetching: Option<(u64, ManifestId)>,
+    deferred_head: Option<u64>,
+    /// Snapshots to upload before the frames that name them go ([`Replica::take_uploads`]).
+    uploads: Vec<Upload>,
 }
 
 impl Doc {
@@ -607,6 +614,9 @@ impl Doc {
             on_disk: false,
             batch: Vec::new(),
             batched: 0,
+            fetching: None,
+            deferred_head: None,
+            uploads: Vec::new(),
         }
     }
 
@@ -723,8 +733,12 @@ impl Doc {
         let Some(version) = self.log.at(upto) else { return Vec::new() };
         match self.body.copy().snapshot_at(&version) {
             Ok(bytes) if !bytes.is_empty() && bytes.len() <= MAX_SNAPSHOT_BYTES => {
+                // Uploaded first (through the chunk API), then named.
+                let Ok(upload) = cut(self.id, &bytes) else { return Vec::new() };
                 self.log.rebase(upto, version);
-                vec![ClientFrame::Snapshot { doc: self.id, upto, bytes }]
+                let manifest = upload.id();
+                self.uploads.push(upload);
+                vec![ClientFrame::Snapshot { doc: self.id, upto, manifest }]
             }
             Err(UpdateError::Panicked) => {
                 self.broken = true;
@@ -1263,6 +1277,8 @@ pub struct Replica<S: DocStore> {
     /// Documents of files on disk and not loaded: nothing to send, nothing waiting, no app holding them
     /// ([`Replica::load`], [`Replica::unload`]).
     unloaded: BTreeSet<DocId>,
+    /// Snapshots catch-ups started with, to download ([`Replica::take_fetches`]).
+    fetches: Vec<(DocId, ManifestId)>,
     /// Documents let go of without dropping ([`Replica::forgotten`]).
     forgotten: usize,
     /// The live protocol `welcome` named (0 while the link isn't up).
@@ -1326,6 +1342,7 @@ impl<S: DocStore> Replica<S> {
             one_by_one: BTreeSet::new(),
             stopped: BTreeSet::new(),
             unloaded,
+            fetches: Vec::new(),
             forgotten: 0,
             protocol: 0,
             events: Vec::new(),
@@ -1613,7 +1630,12 @@ impl<S: DocStore> Replica<S> {
             // (The server sends them again with the next catch-up.)
             doc.batch.clear();
             doc.batched = 0;
+            doc.fetching = None;
+            doc.deferred_head = None;
+            // (The frames that would have named them are gone with the connection.)
+            doc.uploads.clear();
         }
+        self.fetches.clear();
     }
 
     /// Whether the server speaks documents of files: `None` while the link isn't up.
@@ -1700,8 +1722,46 @@ impl<S: DocStore> Replica<S> {
             self.docs.remove(&id);
             return Err((NotLiveReason::Offline, "the connection to the server went".into()));
         }
+        // Uploaded first (through the chunk API), then named in `create`.
+        let upload = match cut(id, snapshot) {
+            Ok(upload) => upload,
+            Err(e) => {
+                self.docs.remove(&id);
+                return Err((NotLiveReason::TooLarge, e));
+            }
+        };
+        let manifest = upload.id();
+        doc.uploads.push(upload);
         doc.join = Some(Join::Creating(snapshot.to_vec()));
-        Ok(vec![ClientFrame::CreateDocument { doc: id, node, app, snapshot: snapshot.to_vec() }])
+        Ok(vec![ClientFrame::CreateDocument { doc: id, node, app, snapshot: manifest }])
+    }
+
+    /// The snapshots to upload now, each before the frames of its document that follow it (a frame names one by its
+    /// manifest). One that can't be uploaded is said with [`Replica::upload_failed`].
+    pub fn take_uploads(&mut self) -> Vec<Upload> {
+        self.docs.values_mut().flat_map(|d| std::mem::take(&mut d.uploads)).collect()
+    }
+
+    /// A snapshot of `doc` couldn't be uploaded (the frame that names it isn't sent): an import's join is given up on
+    /// (the app opens the file as it is), a joined document's making again is tried later, and a compaction's answer
+    /// is just not given (another device is asked).
+    pub fn upload_failed(&mut self, id: DocId, why: &str) {
+        let Some(doc) = self.docs.get_mut(&id) else { return };
+        if matches!(doc.join, Some(Join::Creating(_))) {
+            self.docs.remove(&id);
+            self.events.push(DocEvent::NotLive(id, NotLiveReason::Offline, format!("the import couldn't go up to the server: {why}")));
+        } else if doc.creating {
+            doc.creating = false;
+            doc.sub = Sub::No;
+            let pause = doc.retry.map_or(1, |(_, pause)| pause.max(1));
+            doc.retry = Some((pause, pause));
+        }
+    }
+
+    /// The snapshots of catch-ups to download now, by document and manifest; each is handed back with
+    /// [`Replica::on_snapshot`].
+    pub fn take_fetches(&mut self) -> Vec<(DocId, ManifestId)> {
+        std::mem::take(&mut self.fetches)
     }
 
     /// An app that was to import a document is gone (it closed its connection mid-import): the join is given up on;
@@ -2127,6 +2187,12 @@ impl<S: DocStore> Replica<S> {
             ServerFrame::Created { .. } => Ok(Vec::new()),
             ServerFrame::Update { doc: id, seq, bytes, .. } => {
                 let Some(doc) = self.docs.get_mut(&id) else { return Ok(Vec::new()) };
+                // While the snapshot the catch-up started with downloads, its updates wait here (it comes first).
+                if doc.fetching.is_some() && doc.sub == Sub::CatchingUp {
+                    doc.batched = doc.batched.saturating_add(bytes.len());
+                    doc.batch.push((seq, bytes));
+                    return Ok(Vec::new());
+                }
                 // A catch-up of a document of a file is taken a batch at a time (one Loro import for many updates is
                 // far quicker on a big document): the updates wait here until `subscribed`, or a few MiB of them.
                 if doc.kind.is_document() && doc.sub == Sub::CatchingUp && !doc.stale {
@@ -2137,12 +2203,100 @@ impl<S: DocStore> Replica<S> {
                 Ok(self.on_update(id, seq, bytes))
             }
             ServerFrame::Subscribed { doc: id, head } => {
+                if let Some(doc) = self.docs.get_mut(&id)
+                    && doc.fetching.is_some()
+                    && doc.sub == Sub::CatchingUp
+                {
+                    doc.deferred_head = Some(head);
+                    return Ok(Vec::new());
+                }
                 let mut frames = self.take_batch(id);
                 frames.extend(self.on_subscribed(id, head));
                 Ok(frames)
             }
             ServerFrame::Ack { doc: id, client_seq, seq } => Ok(self.on_ack(id, client_seq, seq)),
             other => self.on_other(other),
+        }
+    }
+
+    /// The snapshot `manifest` names, which the catch-up of `id` started with, downloaded (`Ok`), or not (`Err`: it
+    /// can't be got or doesn't read; this machine then follows the whole log instead, `subscribe_log`). Then the
+    /// catch-up's updates that waited for it are taken, and its `subscribed` if it came. Frames to send.
+    pub fn on_snapshot(&mut self, id: DocId, manifest: ManifestId, bytes: Result<Vec<u8>, String>) -> Vec<ClientFrame> {
+        let mut frames = self.on_snapshot_inner(id, manifest, bytes);
+        frames.extend(self.heal());
+        frames
+    }
+
+    fn on_snapshot_inner(&mut self, id: DocId, manifest: ManifestId, bytes: Result<Vec<u8>, String>) -> Vec<ClientFrame> {
+        let Some(doc) = self.docs.get_mut(&id) else { return Vec::new() };
+        let Some((base, _)) = doc.fetching.filter(|(_, m)| *m == manifest) else { return Vec::new() };
+        doc.fetching = None;
+        let head = doc.deferred_head.take();
+        let mut changed = false;
+        let taken = match &bytes {
+            Ok(bytes) => doc.take_snapshot(base, bytes, &mut self.notes, &mut changed),
+            Err(why) => {
+                // As one that doesn't read: the whole log instead.
+                let line = doc.told(
+                    |app| {
+                        format!("the server's snapshot of the recents of {app} can't be got here ({why}); this machine reads the whole log instead")
+                    },
+                    |id| {
+                        format!("the server's snapshot of the live document {id} can't be got here ({why}); this machine reads the whole log instead")
+                    },
+                );
+                doc.say(&mut self.notes, line);
+                doc.log_only = true;
+                doc.stale = true;
+                doc.dirty = true;
+                doc.urgent = true;
+                Err(UpdateError::Invalid("not got"))
+            }
+        };
+        let kind = doc.kind.clone();
+        if changed {
+            match &kind {
+                Kind::Recents(app) => {
+                    self.changed.insert(app.clone());
+                }
+                Kind::Document { .. } => {
+                    if let Ok(bytes) = bytes {
+                        self.events.push(DocEvent::Remote(id, bytes));
+                    }
+                }
+            }
+        }
+        match taken {
+            Ok(()) => {
+                // The updates that waited, and the end of the catch-up.
+                let mut frames = self.take_batch(id);
+                if let Some(head) = head {
+                    frames.extend(self.on_subscribed(id, head));
+                }
+                frames
+            }
+            // Read back from its file (Loro failed in it), and caught up again with the whole log.
+            Err(UpdateError::Panicked) => {
+                self.reload(id);
+                let (up, epoch) = (self.link == Link::Up, self.epoch);
+                match doc_again(&mut self.docs, self.space, &mut self.peers, id, &kind) {
+                    Some(doc) if up => {
+                        doc.log_only = true;
+                        subscribe(id, doc, epoch)
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            // Given up on: what waited goes (the next catch-up, of the whole log, brings it); its `subscribed` starts
+            // that one.
+            Err(_) => {
+                if let Some(doc) = self.docs.get_mut(&id) {
+                    doc.batch.clear();
+                    doc.batched = 0;
+                }
+                head.map(|head| self.on_subscribed(id, head)).unwrap_or_default()
+            }
         }
     }
 
@@ -2171,9 +2325,13 @@ impl<S: DocStore> Replica<S> {
                 Err(_) => false,
             }
         };
+        let kind = doc.kind.clone();
         let mut frames = Vec::new();
+        if new && let Kind::Recents(app) = &kind {
+            self.changed.insert(app.clone());
+        }
         for (seq, bytes) in batch {
-            if new {
+            if new && kind.is_document() {
                 self.events.push(DocEvent::Remote(id, bytes.clone()));
             }
             frames.extend(self.on_update(id, seq, bytes));
@@ -2336,39 +2494,16 @@ impl<S: DocStore> Replica<S> {
                 doc.compact_ask = Some(upto);
                 Ok(doc.try_compact())
             }
-            ServerFrame::Snapshot { doc: id, base, bytes } => {
+            ServerFrame::Snapshot { doc: id, base, manifest } => {
                 let Some(doc) = self.docs.get_mut(&id) else { return Ok(Vec::new()) };
-                // Only as the start of a catch-up (a stray one, from a connection given up on, is no news).
-                if doc.sub != Sub::CatchingUp || doc.stale {
+                // Only as the start of a catch-up (a stray one, from a connection given up on, is no news). It is
+                // downloaded through the chunk API; the catch-up's updates wait for it ([`Replica::on_snapshot`]).
+                if doc.sub != Sub::CatchingUp || doc.stale || doc.fetching.is_some() {
                     return Ok(Vec::new());
                 }
-                let mut changed = false;
-                let taken = doc.take_snapshot(base, &bytes, &mut self.notes, &mut changed);
-                let kind = doc.kind.clone();
-                if changed {
-                    match &kind {
-                        Kind::Recents(app) => {
-                            self.changed.insert(app.clone());
-                        }
-                        Kind::Document { .. } => self.events.push(DocEvent::Remote(id, bytes)),
-                    }
-                }
-                Ok(match taken {
-                    Ok(()) => Vec::new(),
-                    // Read back from its file (Loro failed in it), and caught up again with the whole log.
-                    Err(UpdateError::Panicked) => {
-                        self.reload(id);
-                        let (up, epoch) = (self.link == Link::Up, self.epoch);
-                        match doc_again(&mut self.docs, self.space, &mut self.peers, id, &kind) {
-                            Some(doc) if up => {
-                                doc.log_only = true;
-                                subscribe(id, doc, epoch)
-                            }
-                            _ => Vec::new(),
-                        }
-                    }
-                    Err(_) => Vec::new(),
-                })
+                doc.fetching = Some((base, manifest));
+                self.fetches.push((id, manifest));
+                Ok(Vec::new())
             }
             ServerFrame::Presence { doc: id, bytes } => {
                 if self.docs.get(&id).is_some_and(|d| d.joined && d.kind.is_document()) {
@@ -2414,10 +2549,26 @@ impl<S: DocStore> Replica<S> {
             // this machine's copy; nothing it holds is lost. If that is refused too (the file is gone on the server),
             // tried again after a growing pause.
             (None, codes::NOT_FOUND) if !doc.creating => {
-                let snapshot = doc.body.copy().snapshot().ok().filter(|s| !s.is_empty() && s.len() <= MAX_SNAPSHOT_BYTES)?;
+                let upload = doc.body.copy().snapshot().map_err(|e| e.to_string()).and_then(|s| cut(id, &s));
+                let upload = match upload {
+                    Ok(upload) => upload,
+                    Err(e) => {
+                        // (Over the snapshot limit, say: it can't be made again from here. Said, and tried again later
+                        // as any refusal, in case it shrinks.)
+                        doc.sub = Sub::No;
+                        let pause = doc.retry.map_or(1, |(_, pause)| pause.max(1));
+                        doc.retry = Some((pause, pause));
+                        let line =
+                            format!("the server lost the live document {id}, and this machine can't make it again ({e}); it stays on this machine");
+                        doc.say(&mut self.notes, line);
+                        return Some(Vec::new());
+                    }
+                };
                 doc.sub = Sub::No;
                 doc.creating = true;
-                Some(vec![ClientFrame::CreateDocument { doc: id, node, app, snapshot }])
+                let manifest = upload.id();
+                doc.uploads.push(upload);
+                Some(vec![ClientFrame::CreateDocument { doc: id, node, app, snapshot: manifest }])
             }
             (None, codes::NOT_FOUND | codes::QUOTA_EXCEEDED | codes::TOO_LARGE) => {
                 doc.creating = false;
@@ -3372,7 +3523,7 @@ mod tests {
         r.connected();
         r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
         let (id, _, _) = r.open_document(node, &app());
-        r.on_frame(ServerFrame::Snapshot { doc: id, base: 0, bytes: import.clone() }).unwrap();
+        snapshot_in(&mut r, id, 0, &import);
         r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
         r.flush_documents().unwrap();
         (r, id, import)
@@ -3383,6 +3534,42 @@ mod tests {
         let d = loro::LoroDoc::new();
         d.import(&r.snapshot_of(id).unwrap()).unwrap();
         d.get_text("text").to_string()
+    }
+
+    /// The snapshot a catch-up starts with is downloaded through the chunk API: the catch-up's updates and its
+    /// `subscribed` wait for it. One that can't be got makes this machine follow the whole log instead.
+    #[test]
+    fn a_catch_up_waits_for_its_snapshot_and_reads_the_whole_log_without_it() {
+        for got in [true, false] {
+            let (space, node) = (SpaceId::generate(), NodeId::generate());
+            let mut r = Replica::open(MemStore::default(), space, peers()).unwrap();
+            r.connected();
+            r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+            let (id, _, _) = r.open_document(node, &app());
+            let server = text_doc(40);
+            insert(&server, 0, "import");
+            insert(&server, 0, "<1>");
+            let r2 = insert(&server, 0, "<2>");
+            let snapshot = server.export(loro::ExportMode::Snapshot).unwrap();
+            let r3 = insert(&server, 0, "<3>");
+            let manifest = cut(id, &snapshot).unwrap().id();
+            assert!(r.on_frame(ServerFrame::Snapshot { doc: id, base: 2, manifest }).unwrap().is_empty());
+            assert_eq!(r.take_fetches(), vec![(id, manifest)]);
+            for (seq, bytes) in [(2, r2.clone()), (3, r3.clone())] {
+                assert!(r.on_frame(ServerFrame::Update { doc: id, seq, bytes, device: device() }).unwrap().is_empty());
+            }
+            assert!(r.on_frame(ServerFrame::Subscribed { doc: id, head: 3 }).unwrap().is_empty(), "waits for the snapshot");
+            assert!(!r.has_document(id));
+            if got {
+                r.on_snapshot(id, manifest, Ok(snapshot.clone()));
+                assert!(r.take_events().contains(&DocEvent::Joined(id)));
+                assert_eq!(text_of(&r, id), "<3><2><1>import");
+            } else {
+                let frames = r.on_snapshot(id, manifest, Err("gone".into()));
+                assert!(frames.iter().any(|f| matches!(f, ClientFrame::SubscribeLog { after: 0, .. })), "{frames:?}");
+                assert!(r.take_notes().iter().any(|n| n.contains("can't be got")));
+            }
+        }
     }
 
     /// A journal append that fails part-way, or whose flush fails, is refused to the app and leaves nothing a crash
@@ -3430,7 +3617,7 @@ mod tests {
         let mut ids = Vec::new();
         for node in &nodes {
             let (id, _, _) = r.open_document(*node, &app());
-            r.on_frame(ServerFrame::Snapshot { doc: id, base: 0, bytes: import.clone() }).unwrap();
+            snapshot_in(&mut r, id, 0, &import);
             r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
             ids.push(id);
         }
@@ -3600,7 +3787,7 @@ mod tests {
         r.connected();
         r.on_frame(w2.clone()).unwrap();
         let (id, _, _) = r.open_document(node, &app());
-        r.on_frame(ServerFrame::Snapshot { doc: id, base: 0, bytes: import.clone() }).unwrap();
+        snapshot_in(&mut r, id, 0, &import);
         r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
         r.flush_documents().unwrap();
         // (Each row from a machine of its own: none needs another's operations.)
@@ -4076,6 +4263,21 @@ mod tests {
         assert!(!doc.log.is_known(), "something waits: unknown");
     }
 
+    /// The server's snapshot `bytes` at the start of a catch-up, as the hub hands it over: the frame naming it, then
+    /// its bytes, downloaded. Frames to send.
+    fn snapshot_in(r: &mut Replica<MemStore>, doc: DocId, base: u64, bytes: &[u8]) -> Vec<ClientFrame> {
+        let manifest = cut(doc, bytes).unwrap().id();
+        let mut frames = r.on_frame(ServerFrame::Snapshot { doc, base, manifest }).unwrap();
+        assert_eq!(r.take_fetches(), vec![(doc, manifest)], "asked to download it");
+        frames.extend(r.on_snapshot(doc, manifest, Ok(bytes.to_vec())));
+        frames
+    }
+
+    /// The snapshot `manifest` names, from what the replica asked to upload.
+    fn uploaded(r: &mut Replica<MemStore>, manifest: ManifestId) -> Vec<u8> {
+        r.take_uploads().into_iter().find(|u| u.id() == manifest).expect("uploaded before it is named").bytes()
+    }
+
     fn text_doc(peer: u64) -> loro::LoroDoc {
         let d = loro::LoroDoc::new();
         d.set_peer_id(peer).unwrap();
@@ -4120,7 +4322,7 @@ mod tests {
         r.on_frame(w2.clone()).unwrap();
         let (id, opening, _) = r.open_document(node, &app());
         assert_eq!(opening, Opening::Joining);
-        r.on_frame(ServerFrame::Snapshot { doc: id, base: 0, bytes: import.clone() }).unwrap();
+        snapshot_in(&mut r, id, 0, &import);
         r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
         assert!(r.has_document(id));
         // P: sent, stored as row 1 by the server, its ack lost with the connection.
@@ -4130,7 +4332,7 @@ mod tests {
         // Rows 2, 3 from the other machine; compacted to base 3. The next catch-up starts from the snapshot.
         r.connected();
         r.on_frame(w2.clone()).unwrap();
-        r.on_frame(ServerFrame::Snapshot { doc: id, base: 3, bytes: s3 }).unwrap();
+        snapshot_in(&mut r, id, 3, &s3);
         r.on_frame(ServerFrame::Update { doc: id, seq: 3, bytes: o3.clone(), device: device() }).unwrap();
         let frames = r.on_frame(ServerFrame::Subscribed { doc: id, head: 3 }).unwrap();
         assert!(!frames.iter().any(|f| matches!(f, ClientFrame::Update { .. })), "P is stored, not sent again: {frames:?}");
@@ -4161,10 +4363,11 @@ mod tests {
         r.on_frame(ServerFrame::Update { doc: id, seq: 5, bytes: l5, device: device() }).unwrap();
         // Asked to compact at 5 (base 3: the server takes it).
         let frames = r.on_frame(ServerFrame::Compact { doc: id, upto: 5 }).unwrap();
-        let bytes = frames
+        let manifest = frames
             .iter()
-            .find_map(|f| if let ClientFrame::Snapshot { upto: 5, bytes, .. } = f { Some(bytes.clone()) } else { None })
+            .find_map(|f| if let ClientFrame::Snapshot { upto: 5, manifest, .. } = f { Some(*manifest) } else { None })
             .expect("answered");
+        let bytes = uploaded(&mut r, manifest);
         let fresh = loro::LoroDoc::new();
         fresh.import(&bytes).unwrap();
         let text = fresh.get_text("text").to_string();
@@ -4192,7 +4395,7 @@ mod tests {
         r.connected();
         r.on_frame(w2.clone()).unwrap();
         let (id, _, _) = r.open_document(node, &app());
-        r.on_frame(ServerFrame::Snapshot { doc: id, base: 0, bytes: import.clone() }).unwrap();
+        snapshot_in(&mut r, id, 0, &import);
         r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
         r.on_frame(ServerFrame::Update { doc: id, seq: 1, bytes: o1, device: device() }).unwrap();
         // Row 2 never applies here.

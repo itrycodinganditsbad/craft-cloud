@@ -138,7 +138,8 @@ pub enum CliError {
 
 /// Opens the database and blob storage a config names.
 pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
-    let meta = Meta::open(&config.database.url).await?.with_stored_bytes_cap(config.stored_bytes_per_user);
+    let meta =
+        Meta::open(&config.database.url).await?.with_stored_bytes_cap(config.stored_bytes_per_user).with_live_bytes_cap(config.live_bytes_per_user);
     let store = match (&config.storage, config.storage.s3()?) {
         (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
         (StorageConfig::Disk { path }, None) => Store::new(DiskBackend::new(path)?),

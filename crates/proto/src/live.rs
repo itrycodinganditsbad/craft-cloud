@@ -24,17 +24,23 @@
 //! From protocol [`LIVE_DOCUMENTS_PROTOCOL`] on (an agent and a server that both speak it; an older peer never sees
 //! these frames):
 //!
+//! - **Snapshots never travel in frames**: a snapshot (a Loro snapshot of a whole document, up to
+//!   [`MAX_SNAPSHOT_BYTES`]) goes up and down as a file's content does, through the chunk API (cut into chunks named by
+//!   a manifest, with that API's body limits, hash checks and the account's storage cap), and frames name it by its
+//!   manifest. The agent uploads it before the frame that names it; the server checks that the manifest is the
+//!   account's before recording anything.
 //! - **Documents linked to files**: `create {doc, node, app, snapshot}` ([`ClientFrame::CreateDocument`], on the wire
-//!   a `create` of [`DocKind::Document`] with the snapshot appended) makes the document of a file node by import; its
-//!   ID is [`node_doc`]. The server keeps the first snapshot it sees and answers `created {doc, kept}`
+//!   a `create` of [`DocKind::Document`] with the snapshot's manifest appended) makes the document of a file node by
+//!   import; its ID is [`node_doc`]. The server keeps the first snapshot it sees and answers `created {doc, kept}`
 //!   ([`ServerFrame::CreatedDocument`], a `created` with `kept` appended): an agent whose import wasn't kept drops it
 //!   and catches up from the start. A recents `create` and its `created` are byte for byte what they were.
 //! - **Snapshots and compaction**: once a document's log above its snapshot passes [`COMPACT_UPDATES`] updates or
 //!   [`COMPACT_BYTES`], the server asks one device that holds every update up to `upto` for `compact {doc, upto}`; it
-//!   answers `snapshot {doc, upto, bytes}`, a Loro snapshot of exactly the updates 1..=`upto`. A `subscribe` from
-//!   below the snapshot (or from 0) gets `snapshot {doc, base, bytes}` first, then the log from `base` on (the update
-//!   at `base` too, so the agent learns its hash for the next `at`). `subscribe_log` is a `subscribe` that never gets
-//!   a snapshot, for an agent that couldn't read one: the log's rows below the snapshot are kept.
+//!   answers `snapshot {doc, upto, manifest}`, naming a Loro snapshot of exactly the updates 1..=`upto`. A `subscribe`
+//!   from below the snapshot (or from 0) gets `snapshot {doc, base, manifest}` first (the agent downloads it), then the
+//!   log from `base` on (the update at `base` too, so the agent learns its hash for the next `at`). `subscribe_log` is
+//!   a `subscribe` that never gets a snapshot, for an agent that couldn't read one: the log's rows below the snapshot
+//!   are kept.
 //! - **Presence**: `presence {doc, bytes}` both ways, at most [`MAX_PRESENCE_BYTES`] and [`PRESENCE_PER_SEC`] a second
 //!   per document per device, relayed to the document's other subscribers and never stored.
 //!
@@ -51,6 +57,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ManifestId;
 use crate::ids::{DeviceId, DocId, Epoch, NodeId, SpaceId};
 
 /// Live protocol versions this build speaks. An agent and a server must share at least one.
@@ -66,11 +73,9 @@ pub const MAX_UPDATE_BYTES: usize = 1024 * 1024;
 pub const MAX_SUBSCRIPTIONS: usize = 256;
 /// Largest encoded frame: an update and its envelope (IDs, numbers, an error message).
 pub const MAX_FRAME_BYTES: usize = MAX_UPDATE_BYTES + 4096;
-/// Largest snapshot of a document (an import, or a compaction), in bytes: the manifest limit.
+/// Largest snapshot of a document (an import, or a compaction), in bytes (it travels through the chunk API, never in
+/// a frame).
 pub const MAX_SNAPSHOT_BYTES: usize = crate::limits::MAX_MANIFEST_BYTES;
-/// Largest encoded frame that carries a snapshot (`create` of a document, `snapshot` either way). Every other frame is
-/// at most [`MAX_FRAME_BYTES`].
-pub const MAX_LARGE_FRAME_BYTES: usize = MAX_SNAPSHOT_BYTES + 4096;
 /// Largest presence message (Loro's ephemeral state: a cursor, a selection, a machine name), in bytes.
 pub const MAX_PRESENCE_BYTES: usize = 4096;
 /// Most presence messages one device may send a second for one document (more are dropped, never stored anyway).
@@ -242,12 +247,12 @@ pub enum ClientFrame {
         client_seq: u64,
         bytes: Vec<u8>,
     },
-    /// The answer to `compact {doc, upto}`: a Loro snapshot of exactly the updates 1..=`upto` of the document (and the
-    /// snapshot it was made from), at most [`MAX_SNAPSHOT_BYTES`]. Never answered.
+    /// The answer to `compact {doc, upto}`: the manifest of a Loro snapshot of exactly the updates 1..=`upto` of the
+    /// document (and the snapshot it was made from), at most [`MAX_SNAPSHOT_BYTES`], uploaded already. Never answered.
     Snapshot {
         doc: DocId,
         upto: u64,
-        bytes: Vec<u8>,
+        manifest: ManifestId,
     },
     /// Ephemeral state (a cursor, a selection) for the document's other subscribers, at most [`MAX_PRESENCE_BYTES`];
     /// relayed, never stored, never answered.
@@ -263,16 +268,16 @@ pub enum ClientFrame {
         at: Option<[u8; 32]>,
     },
     // Frames that are only appended to on the wire go above this line. The one below is a `create` of a document with
-    // its snapshot appended (see [`ClientFrame::encode`]): it has no index of its own, so it stays last.
-    /// Make the document of the file node `node` by import, with `snapshot` (a Loro snapshot, at most
-    /// [`MAX_SNAPSHOT_BYTES`]) as its content if the space doesn't have it yet. Answered `created {doc, kept}`. On the
-    /// wire: `create {doc, kind: document {node, app}}` with the snapshot appended.
+    // its snapshot's manifest appended (see [`ClientFrame::encode`]): it has no index of its own, so it stays last.
+    /// Make the document of the file node `node` by import, with the snapshot `snapshot` names (a Loro snapshot, at
+    /// most [`MAX_SNAPSHOT_BYTES`], uploaded already) as its content if the space doesn't have it yet. Answered
+    /// `created {doc, kept}`. On the wire: `create {doc, kind: document {node, app}}` with the manifest appended.
     #[serde(skip)]
     CreateDocument {
         doc: DocId,
         node: NodeId,
         app: AppName,
-        snapshot: Vec<u8>,
+        snapshot: ManifestId,
     },
 }
 
@@ -296,9 +301,10 @@ pub enum ServerFrame {
     /// The document's log above its snapshot is long: answer `snapshot {doc, upto, bytes}` once this device holds
     /// every update up to `upto` (or don't; another device is asked later).
     Compact { doc: DocId, upto: u64 },
-    /// The catch-up of a `subscribe` from below the document's snapshot: the snapshot, which holds the updates
-    /// 1..=`base` (and, for a document made by import, its import). The log from `base` on follows.
-    Snapshot { doc: DocId, base: u64, bytes: Vec<u8> },
+    /// The catch-up of a `subscribe` from below the document's snapshot: the manifest of the snapshot (to download),
+    /// which holds the updates 1..=`base` (and, for a document made by import, its import). The log from `base` on
+    /// follows.
+    Snapshot { doc: DocId, base: u64, manifest: ManifestId },
     /// Another device's presence in a subscribed document, as it sent it.
     Presence { doc: DocId, bytes: Vec<u8> },
     // Frames that are only appended to on the wire go above this line; see [`ClientFrame::CreateDocument`].
@@ -338,7 +344,7 @@ fn encode<T: Serialize, A: Serialize>(frame: &T, trailer: Option<&A>, limit: usi
 
 /// Decodes the start of a frame, returning what follows it (a trailer, or nothing).
 fn decode_head<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<(T, &'a [u8]), FrameError> {
-    if bytes.len() > MAX_LARGE_FRAME_BYTES {
+    if bytes.len() > MAX_FRAME_BYTES {
         return Err(FrameError::TooLarge(bytes.len()));
     }
     postcard::take_from_bytes(bytes).map_err(malformed)
@@ -353,37 +359,19 @@ fn decode_trailer<'a, T: Deserialize<'a>>(rest: &'a [u8]) -> Result<T, FrameErro
     Ok(value)
 }
 
-/// What a frame of `len` bytes that isn't one of the large ones (a snapshot) may be.
-fn small(len: usize, large: bool) -> Result<(), FrameError> {
-    if !large && len > MAX_FRAME_BYTES { Err(FrameError::TooLarge(len)) } else { Ok(()) }
-}
-
-fn snapshot_ok(bytes: &[u8]) -> Result<(), FrameError> {
-    if bytes.is_empty() || bytes.len() > MAX_SNAPSHOT_BYTES {
-        Err(FrameError::Invalid("a snapshot is 1 byte up to the manifest limit"))
-    } else {
-        Ok(())
-    }
-}
-
 fn presence_ok(bytes: &[u8]) -> Result<(), FrameError> {
     if bytes.is_empty() || bytes.len() > MAX_PRESENCE_BYTES { Err(FrameError::Invalid("a presence message is 1 byte to 4 KiB")) } else { Ok(()) }
 }
 
 impl ClientFrame {
-    /// Whether the frame carries a snapshot (and may be up to [`MAX_LARGE_FRAME_BYTES`]).
-    pub fn is_large(&self) -> bool {
-        matches!(self, ClientFrame::CreateDocument { .. } | ClientFrame::Snapshot { .. })
-    }
-
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         self.check()?;
         match self {
             ClientFrame::CreateDocument { doc, node, app, snapshot } => {
                 let head = ClientFrame::Create { doc: *doc, kind: DocKind::Document { node: *node, app: app.clone() } };
-                encode(&head, Some(snapshot), MAX_LARGE_FRAME_BYTES)
+                encode(&head, Some(snapshot), MAX_FRAME_BYTES)
             }
-            frame => encode::<_, ()>(frame, None, if frame.is_large() { MAX_LARGE_FRAME_BYTES } else { MAX_FRAME_BYTES }),
+            frame => encode::<_, ()>(frame, None, MAX_FRAME_BYTES),
         }
     }
 
@@ -395,7 +383,6 @@ impl ClientFrame {
                 ClientFrame::CreateDocument { doc, node, app, snapshot: decode_trailer(rest)? }
             }
             head => {
-                small(bytes.len(), head.is_large())?;
                 if !rest.is_empty() {
                     return Err(FrameError::Malformed(format!("{} bytes after the frame", rest.len())));
                 }
@@ -411,7 +398,6 @@ impl ClientFrame {
             ClientFrame::Update { bytes, .. } if bytes.len() > MAX_UPDATE_BYTES => Err(FrameError::Invalid("an update is at most 1 MiB")),
             ClientFrame::Update { bytes, .. } if bytes.is_empty() => Err(FrameError::Invalid("an update can't be empty")),
             ClientFrame::Create { kind: DocKind::Document { .. }, .. } => Err(FrameError::Invalid("a document is created with its snapshot")),
-            ClientFrame::CreateDocument { snapshot: bytes, .. } | ClientFrame::Snapshot { bytes, .. } => snapshot_ok(bytes),
             ClientFrame::Presence { bytes, .. } => presence_ok(bytes),
             _ => Ok(()),
         }
@@ -419,23 +405,17 @@ impl ClientFrame {
 }
 
 impl ServerFrame {
-    /// Whether the frame carries a snapshot (and may be up to [`MAX_LARGE_FRAME_BYTES`]).
-    pub fn is_large(&self) -> bool {
-        matches!(self, ServerFrame::Snapshot { .. })
-    }
-
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         self.check()?;
         match self {
             ServerFrame::CreatedDocument { doc, kept } => encode(&ServerFrame::Created { doc: *doc }, Some(kept), MAX_FRAME_BYTES),
-            frame => encode::<_, ()>(frame, None, if frame.is_large() { MAX_LARGE_FRAME_BYTES } else { MAX_FRAME_BYTES }),
+            frame => encode::<_, ()>(frame, None, MAX_FRAME_BYTES),
         }
     }
 
     /// Decodes and checks a frame from the network (hostile: every length is checked).
     pub fn decode(bytes: &[u8]) -> Result<Self, FrameError> {
         let (head, rest): (Self, &[u8]) = decode_head(bytes)?;
-        small(bytes.len(), head.is_large())?;
         let frame = match head {
             ServerFrame::Created { doc } if !rest.is_empty() => ServerFrame::CreatedDocument { doc, kept: decode_trailer(rest)? },
             head => {
@@ -457,7 +437,6 @@ impl ServerFrame {
             ServerFrame::Error { code, message, .. } if code.len() > MAX_CODE_BYTES || message.len() > MAX_MESSAGE_BYTES => {
                 Err(FrameError::Invalid("an error's code or message is too long"))
             }
-            ServerFrame::Snapshot { bytes, .. } => snapshot_ok(bytes),
             ServerFrame::Presence { bytes, .. } => presence_ok(bytes),
             _ => Ok(()),
         }
@@ -487,13 +466,13 @@ impl std::fmt::Debug for ClientFrame {
             ClientFrame::Subscribe { doc, after, at } => write!(f, "Subscribe({doc}, after {after}, at {})", if at.is_some() { "hash" } else { "-" }),
             ClientFrame::Unsubscribe { doc } => write!(f, "Unsubscribe({doc})"),
             ClientFrame::Update { doc, client_seq, bytes } => write!(f, "Update({doc}, client_seq {client_seq}, {} bytes)", bytes.len()),
-            ClientFrame::Snapshot { doc, upto, bytes } => write!(f, "Snapshot({doc}, upto {upto}, {} bytes)", bytes.len()),
+            ClientFrame::Snapshot { doc, upto, manifest } => write!(f, "Snapshot({doc}, upto {upto}, manifest {manifest})"),
             ClientFrame::Presence { doc, bytes } => write!(f, "Presence({doc}, {} bytes)", bytes.len()),
             ClientFrame::SubscribeLog { doc, after, at } => {
                 write!(f, "SubscribeLog({doc}, after {after}, at {})", if at.is_some() { "hash" } else { "-" })
             }
             ClientFrame::CreateDocument { doc, node, app, snapshot } => {
-                write!(f, "CreateDocument({doc}, node {node}, {app}, {} bytes)", snapshot.len())
+                write!(f, "CreateDocument({doc}, node {node}, {app}, manifest {snapshot})")
             }
         }
     }
@@ -509,7 +488,7 @@ impl std::fmt::Debug for ServerFrame {
             ServerFrame::Ack { doc, client_seq, seq } => write!(f, "Ack({doc}, client_seq {client_seq}, seq {seq})"),
             ServerFrame::Error { code, message, doc, client_seq } => write!(f, "Error({code}: {message}; {doc:?}, {client_seq:?})"),
             ServerFrame::Compact { doc, upto } => write!(f, "Compact({doc}, upto {upto})"),
-            ServerFrame::Snapshot { doc, base, bytes } => write!(f, "Snapshot({doc}, base {base}, {} bytes)", bytes.len()),
+            ServerFrame::Snapshot { doc, base, manifest } => write!(f, "Snapshot({doc}, base {base}, manifest {manifest})"),
             ServerFrame::Presence { doc, bytes } => write!(f, "Presence({doc}, {} bytes)", bytes.len()),
             ServerFrame::CreatedDocument { doc, kept } => write!(f, "CreatedDocument({doc}, kept {kept})"),
         }
@@ -681,9 +660,10 @@ mod tests {
     #[test]
     fn document_frames_round_trip() {
         let (doc, node) = (DocId::generate(), NodeId::generate());
+        let manifest = ManifestId::from_bytes([0xab; 32]);
         let client = [
-            ClientFrame::CreateDocument { doc, node, app: app("wordcraft"), snapshot: vec![9; 300] },
-            ClientFrame::Snapshot { doc, upto: 1001, bytes: vec![1; 5000] },
+            ClientFrame::CreateDocument { doc, node, app: app("wordcraft"), snapshot: manifest },
+            ClientFrame::Snapshot { doc, upto: 1001, manifest },
             ClientFrame::Presence { doc, bytes: vec![2; 40] },
             ClientFrame::SubscribeLog { doc, after: 3, at: Some(update_hash(b"x")) },
         ];
@@ -694,7 +674,7 @@ mod tests {
             ServerFrame::CreatedDocument { doc, kept: true },
             ServerFrame::CreatedDocument { doc, kept: false },
             ServerFrame::Compact { doc, upto: 1001 },
-            ServerFrame::Snapshot { doc, base: 1001, bytes: vec![3; 2 * MAX_UPDATE_BYTES] },
+            ServerFrame::Snapshot { doc, base: 1001, manifest },
             ServerFrame::Presence { doc, bytes: vec![4; MAX_PRESENCE_BYTES] },
         ];
         for frame in server {
@@ -705,14 +685,16 @@ mod tests {
         let mut want = ServerFrame::Created { doc: doc7() }.encode().unwrap();
         want.push(1);
         assert_eq!(kept, want);
-        // A document's `create` is a `create` of kind 1 (`document {node, app}`), the snapshot after it.
+        // A document's `create` is a `create` of kind 1 (`document {node, app}`), the snapshot's manifest (in hex) after
+        // it.
         let node = NodeId::from_uuid(uuid::Uuid::from_bytes([8; 16]));
-        let made = ClientFrame::CreateDocument { doc: doc7(), node, app: app("ab"), snapshot: vec![0xee, 0xff] }.encode().unwrap();
+        let made = ClientFrame::CreateDocument { doc: doc7(), node, app: app("ab"), snapshot: manifest }.encode().unwrap();
         let mut want = vec![1, 16];
         want.extend([7; 16]);
         want.extend([1, 16]);
         want.extend([8; 16]);
-        want.extend([2, b'a', b'b', 2, 0xee, 0xff]);
+        want.extend([2, b'a', b'b', 64]);
+        want.extend("ab".repeat(32).bytes());
         assert_eq!(made, want);
     }
 
@@ -773,37 +755,32 @@ mod tests {
         assert!(presence(0).encode().is_err());
         let raw = postcard::to_stdvec(&presence(MAX_PRESENCE_BYTES + 1)).unwrap();
         assert!(matches!(ClientFrame::decode(&raw), Err(FrameError::Invalid(_))));
-        let snapshot = |n| ClientFrame::Snapshot { doc, upto: 1, bytes: vec![1; n] };
-        assert!(snapshot(MAX_SNAPSHOT_BYTES).encode().is_ok(), "a snapshot up to the manifest limit");
-        assert!(snapshot(MAX_SNAPSHOT_BYTES + 1).encode().is_err());
-        assert!(snapshot(0).encode().is_err());
-        let create = |n| ClientFrame::CreateDocument { doc, node, app: app("wordcraft"), snapshot: vec![1; n] };
-        let big = create(MAX_SNAPSHOT_BYTES).encode().unwrap();
-        assert!(ClientFrame::decode(&big).is_ok());
-        assert!(create(MAX_SNAPSHOT_BYTES + 1).encode().is_err());
-        assert!(create(0).encode().is_err());
+        let create = |m: [u8; 32]| ClientFrame::CreateDocument { doc, node, app: app("wordcraft"), snapshot: ManifestId::from_bytes(m) };
+        // A manifest that isn't one (not 64 lowercase hex digits) doesn't decode.
+        let mut bad = postcard::to_stdvec(&ClientFrame::Create { doc, kind: DocKind::Document { node, app: app("wordcraft") } }).unwrap();
+        bad.extend(postcard::to_stdvec(&"AB".repeat(32)).unwrap());
+        assert!(ClientFrame::decode(&bad).is_err());
         // A document `create` without its snapshot, or with bytes after it, is refused; so is one of a recents kind with
         // a snapshot after it.
         let bare = postcard::to_stdvec(&ClientFrame::Create { doc, kind: DocKind::Document { node, app: app("x") } }).unwrap();
         assert!(ClientFrame::decode(&bare).is_err());
         assert!(ClientFrame::Create { doc, kind: DocKind::Document { node, app: app("x") } }.encode().is_err());
-        let mut extra = create(10).encode().unwrap();
+        let mut extra = create([1; 32]).encode().unwrap();
+        assert!(ClientFrame::decode(&extra).is_ok());
         extra.push(0);
         assert!(ClientFrame::decode(&extra).is_err());
         let mut recents = ClientFrame::Create { doc, kind: DocKind::Recents { app: app("x") } }.encode().unwrap();
         recents.extend(postcard::to_stdvec(&vec![1u8; 3]).unwrap());
         assert!(ClientFrame::decode(&recents).is_err());
-        // Only frames with a snapshot may be large: an update padded past the small limit is refused as too large.
+        // Every frame is at most the small limit, either way (no frame carries a snapshot).
         let mut padded = postcard::to_stdvec(&ClientFrame::Unsubscribe { doc }).unwrap();
         padded.resize(MAX_FRAME_BYTES + 1, 0);
         assert!(matches!(ClientFrame::decode(&padded), Err(FrameError::TooLarge(_))));
-        assert!(matches!(ClientFrame::decode(&vec![5; MAX_LARGE_FRAME_BYTES + 1]), Err(FrameError::TooLarge(_))));
+        assert!(matches!(ServerFrame::decode(&padded), Err(FrameError::TooLarge(_))));
         // `created` with a trailer that isn't a flag.
         let mut created = ServerFrame::Created { doc }.encode().unwrap();
         created.push(2);
         assert!(ServerFrame::decode(&created).is_err());
-        let s = ServerFrame::Snapshot { doc, base: 1, bytes: vec![1; MAX_SNAPSHOT_BYTES + 1] };
-        assert!(s.encode().is_err());
         let p = ServerFrame::Presence { doc, bytes: vec![1; MAX_PRESENCE_BYTES + 1] };
         assert!(p.encode().is_err());
     }
@@ -812,9 +789,9 @@ mod tests {
     fn debug_output_never_shows_document_bytes() {
         let doc = DocId::generate();
         let frames = [
-            format!("{:?}", ClientFrame::CreateDocument { doc, node: NodeId::generate(), app: app("w"), snapshot: b"secret".to_vec() }),
+            format!("{:?}", ClientFrame::Update { doc, client_seq: 1, bytes: b"secret".to_vec() }),
             format!("{:?}", ClientFrame::Presence { doc, bytes: b"secret".to_vec() }),
-            format!("{:?}", ServerFrame::Snapshot { doc, base: 1, bytes: b"secret".to_vec() }),
+            format!("{:?}", ServerFrame::Presence { doc, bytes: b"secret".to_vec() }),
         ];
         for shown in frames {
             assert!(!shown.contains("secret") && shown.contains("6 bytes"), "{shown}");

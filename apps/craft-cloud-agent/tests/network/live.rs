@@ -386,16 +386,24 @@ async fn connection(world: &Arc<World>, m: usize, wake: &Arc<Notify>) -> bool {
     }
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     let mut last_heard = tokio::time::Instant::now();
+    let api = crate::blobs::ServerBlobs { state: world.state.clone(), space: world.space };
     loop {
-        let out = {
+        let (out, uploads) = {
             let mut host = world.hosts[m].lock().unwrap();
             if host.crash {
                 return true;
             }
-            std::mem::take(&mut host.out)
+            (std::mem::take(&mut host.out), host.replica.take_uploads())
         };
         if writer.0.is_finished() {
             return true;
+        }
+        // The snapshots these frames name go up first, through the chunk API (in-process here: the simulated network
+        // carries the live connection only).
+        for up in uploads {
+            if let Err(e) = held(world, craft_cloud_agent::live::blobs::upload(&api, &up)).await {
+                world.hosts[m].lock().unwrap().replica.upload_failed(up.doc, &e.to_string());
+            }
         }
         for frame in out {
             let _ = to_writer.send(Message::Binary(frame.encode().unwrap().into()));
@@ -409,12 +417,23 @@ async fn connection(world: &Arc<World>, m: usize, wake: &Arc<Notify>) -> bool {
                     _ => return true,
                 };
                 let Ok(frame) = ServerFrame::decode(&bytes) else { return true };
-                let mut host = world.hosts[m].lock().unwrap();
-                match host.replica.on_frame(frame) {
-                    Ok(frames) => host.out.extend(frames),
-                    Err(_) => return true,
+                let fetches = {
+                    let mut host = world.hosts[m].lock().unwrap();
+                    match host.replica.on_frame(frame) {
+                        Ok(frames) => host.out.extend(frames),
+                        Err(_) => return true,
+                    }
+                    host.events(world.node);
+                    host.replica.take_fetches()
+                };
+                // A snapshot a catch-up starts with: downloaded (in-process), then handed back.
+                for (doc, manifest) in fetches {
+                    let got = held(world, craft_cloud_agent::live::blobs::download(&api, &manifest)).await.map_err(|e| e.to_string());
+                    let mut host = world.hosts[m].lock().unwrap();
+                    let frames = host.replica.on_snapshot(doc, manifest, got);
+                    host.out.extend(frames);
+                    host.events(world.node);
                 }
-                host.events(world.node);
             }
             _ = tick.tick() => {
                 // A connection silent for 90 s is gone (as the hub's pings find); a ping keeps a quiet one heard.

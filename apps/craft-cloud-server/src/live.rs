@@ -54,14 +54,13 @@ use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, State};
 use axum::response::Response;
-use craft_cloud_meta::{BlobKind, DeviceAuth, SnapshotRef};
+use craft_cloud_meta::DeviceAuth;
 use craft_cloud_proto::api::codes;
 use craft_cloud_proto::live::{
-    AppName, ClientFrame, DOCUMENT_KIND_PREFIX, DocKind, LIVE_DOCUMENTS_PROTOCOL, MAX_LARGE_FRAME_BYTES, MAX_SUBSCRIPTIONS, MAX_UPDATE_BYTES,
+    AppName, ClientFrame, DOCUMENT_KIND_PREFIX, DocKind, LIVE_DOCUMENTS_PROTOCOL, MAX_FRAME_BYTES, MAX_SUBSCRIPTIONS, MAX_UPDATE_BYTES,
     PROTOCOL_MISMATCH, ServerFrame, node_doc, shared_version, update_hash,
 };
-use craft_cloud_proto::{DeviceId, DocId, Epoch, NodeId, SpaceId};
-use craft_cloud_store::BlobKey;
+use craft_cloud_proto::{DeviceId, DocId, Epoch, ManifestId, NodeId, SpaceId};
 use tokio::sync::broadcast;
 use tokio::time::Instant;
 
@@ -343,30 +342,6 @@ impl Drop for Session {
     }
 }
 
-/// Stores a snapshot in the chunk store, in pieces, each checked against the space's room first (the disk backend
-/// writes each one durably before this returns).
-async fn store_snapshot(state: &AppState, space: SpaceId, bytes: &[u8]) -> Result<SnapshotRef, ApiError> {
-    let (snapshot, pieces) = SnapshotRef::split(bytes);
-    for (id, piece) in snapshot.pieces.iter().zip(pieces) {
-        state.meta.check_room(space, BlobKind::Chunk, id.as_bytes(), piece.len() as u64 + 1).await?;
-        state.store.put(BlobKey::chunk(id), piece).await?;
-    }
-    Ok(snapshot)
-}
-
-/// Reads a snapshot back from the chunk store (every piece checked against its ID).
-async fn read_snapshot(state: &AppState, snapshot: &SnapshotRef) -> Result<Vec<u8>, ApiError> {
-    let mut out = Vec::with_capacity(usize::try_from(snapshot.bytes).unwrap_or(0).min(craft_cloud_proto::live::MAX_SNAPSHOT_BYTES));
-    for piece in &snapshot.pieces {
-        out.extend_from_slice(&state.store.get(BlobKey::chunk(piece)).await?);
-    }
-    if out.len() as u64 != snapshot.bytes {
-        tracing::error!("a live document's snapshot is not the size recorded for it");
-        return Err(ApiError::internal());
-    }
-    Ok(out)
-}
-
 fn refused(e: ApiError, doc: Option<DocId>, client_seq: Option<u64>) -> ServerFrame {
     ServerFrame::error(e.code, e.message, doc, client_seq)
 }
@@ -463,8 +438,8 @@ impl Session {
                 Ok(()) => Reply::default(),
                 Err(e) => one(refused(e, Some(doc), None)),
             },
-            ClientFrame::Snapshot { doc, upto, bytes } => {
-                self.snapshot(doc, upto, bytes).await;
+            ClientFrame::Snapshot { doc, upto, manifest } => {
+                self.snapshot(doc, upto, manifest).await;
                 Reply::default()
             }
             ClientFrame::Presence { doc, bytes } => {
@@ -474,9 +449,11 @@ impl Session {
         }
     }
 
-    /// `create {doc, node, app, snapshot}`: the document of a file, made by import. The first snapshot is kept; a
-    /// document that is there already answers `kept: false` without storing anything.
-    async fn create_document(&mut self, doc: DocId, node: NodeId, app: AppName, snapshot: Vec<u8>) -> ServerFrame {
+    /// `create {doc, node, app, snapshot}`: the document of a file, made by import from the snapshot `manifest` names
+    /// (uploaded through the chunk API already, and charged to the account there). Recorded only for a file of the
+    /// space and a manifest of the space, both checked in the same transaction (the file is looked at first too, so a
+    /// made-up node costs a read). The first snapshot is kept; a document that is there already answers `kept: false`.
+    async fn create_document(&mut self, doc: DocId, node: NodeId, app: AppName, manifest: ManifestId) -> ServerFrame {
         if !self.budget.spend() {
             return refused(ApiError::rate_limited("too many frames; send again in a moment", None), Some(doc), None);
         }
@@ -491,33 +468,27 @@ impl Session {
             Ok(None) => {}
             Err(e) => return refused(e.into(), Some(doc), None),
         }
-        let stored = match store_snapshot(&self.state, self.space, &snapshot).await {
-            Ok(stored) => stored,
-            Err(e) => return refused(e, Some(doc), None),
-        };
+        match self.state.meta.is_live_file(self.space, node).await {
+            Ok(true) => {}
+            Ok(false) => return refused(ApiError::not_found("file"), Some(doc), None),
+            Err(e) => return refused(e.into(), Some(doc), None),
+        }
         let kind = DocKind::Document { node, app }.as_text();
-        match self.state.meta.create_live_document(self.space, doc, &kind, node, &stored, self.state.now_ms()).await {
+        match self.state.meta.create_live_document(self.space, doc, &kind, node, &manifest, self.state.now_ms()).await {
             Ok((_, kept)) => ServerFrame::CreatedDocument { doc, kept },
             Err(e) => refused(e.into(), Some(doc), None),
         }
     }
 
-    /// `snapshot {doc, upto, bytes}`: the answer to this session's `compact`, taken only for the `upto` it was asked;
-    /// stored in the chunk store, then recorded (past the current base only). Never answered: a snapshot that isn't
-    /// taken changes nothing, and another device is asked later.
-    async fn snapshot(&mut self, doc: DocId, upto: u64, bytes: Vec<u8>) {
+    /// `snapshot {doc, upto, manifest}`: the answer to this session's `compact`, taken only for the `upto` it was
+    /// asked, and only for a manifest the account uploaded; recorded past the current base only. Never answered: a
+    /// snapshot that isn't taken changes nothing, and another device is asked later.
+    async fn snapshot(&mut self, doc: DocId, upto: u64, manifest: ManifestId) {
         if !self.subscriptions.contains_key(&doc) || self.asked.get(&doc) != Some(&upto) {
             return;
         }
         self.asked.remove(&doc);
-        let stored = match store_snapshot(&self.state, self.space, &bytes).await {
-            Ok(stored) => stored,
-            Err(e) => {
-                tracing::info!(code = e.code, "a live document's snapshot wasn't stored");
-                return;
-            }
-        };
-        match self.state.meta.compact_live_doc(self.space, doc, upto, &stored, self.state.now_ms()).await {
+        match self.state.meta.compact_live_doc(self.space, doc, upto, &manifest).await {
             Ok(true) => self.state.live.compacted(self.space, doc),
             Ok(false) => {}
             Err(e) => tracing::info!(error = %e, "a live document's snapshot wasn't recorded"),
@@ -733,21 +704,10 @@ impl Session {
                 self.state.meta.live_snapshot(self.space, doc).await?
             };
             if let Some((base, stored)) = found.filter(|(base, _)| after < *base || after == 0) {
-                let bytes = match read_snapshot(&self.state, &stored).await {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        // This document can't be caught up now (its agent tries again later, with the whole log); the
-                        // others go on. Always `internal`: a missing blob is the server's fault, not a missing document.
-                        tracing::error!(code = e.code, "a live document's snapshot can't be read");
-                        self.subscriptions.remove(&doc);
-                        self.dirty.remove(&doc);
-                        release(&self.state.live.subscriptions, self.device, 1);
-                        return Ok(vec![refused(ApiError::internal(), Some(doc), None)]);
-                    }
-                };
+                // The agent downloads it through the chunk API (one it can't get or read, it follows the whole log).
                 sub.sent = base.saturating_sub(1).max(after);
                 self.subscriptions.insert(doc, sub);
-                return Ok(vec![ServerFrame::Snapshot { doc, base, bytes }]);
+                return Ok(vec![ServerFrame::Snapshot { doc, base, manifest: stored.manifest }]);
             }
         }
         let (page, full) = self.state.meta.live_page(self.space, doc, sub.sent, PUMP_BYTES, PUMP_PAGE).await?;
@@ -791,8 +751,8 @@ pub async fn connect(
         return Err(ApiError::rate_limited(format!("a device may hold at most {MAX_CONNECTIONS_PER_DEVICE} live connections"), Some(5)));
     }
     let slot = ConnectionSlot { hub: state.clone(), device: auth.device };
-    // Messages up to a snapshot's size: every frame but a snapshot is checked against the smaller limit as it is read.
-    Ok(upgrade.max_message_size(MAX_LARGE_FRAME_BYTES).max_frame_size(MAX_LARGE_FRAME_BYTES).on_upgrade(move |socket| async move {
+    // No frame is over an update and its envelope (snapshots travel through the chunk API).
+    Ok(upgrade.max_message_size(MAX_FRAME_BYTES).max_frame_size(MAX_FRAME_BYTES).on_upgrade(move |socket| async move {
         let _slot = slot;
         // Listening before the session reads anything, so no update falls between a read and the notification.
         let notes = state.live.listen(auth.space);
@@ -1090,6 +1050,7 @@ mod tests {
     // ---- documents of files, snapshots, compaction and presence (protocol 2) ----
 
     use craft_cloud_proto::{ChunkId, ChunkRef, ChunkerParamsId, FileHash, Manifest, Name, NewVersion, Op};
+    use craft_cloud_store::BlobKey;
 
     /// One account's state, with devices to open sessions for.
     struct Account {
@@ -1123,6 +1084,24 @@ mod tests {
             (session, auth)
         }
 
+        /// `bytes` uploaded as the account's through what the chunk API does (each chunk, then the manifest naming
+        /// them): what an agent does with a snapshot before the frame that names it.
+        async fn upload(&self, bytes: &[u8]) -> ManifestId {
+            let space = self.user.space;
+            let mut chunks = Vec::new();
+            for piece in bytes.chunks(craft_cloud_proto::limits::MAX_CHUNK_BYTES as usize) {
+                let id = ChunkId::from_bytes(*blake3::hash(piece).as_bytes());
+                self.state.store.put(BlobKey::chunk(&id), piece).await.unwrap();
+                self.meta.add_chunk(space, &id, piece.len() as u64 + 1, 0).await.unwrap();
+                chunks.push(ChunkRef { id, len: u32::try_from(piece.len()).unwrap() });
+            }
+            let file_hash = FileHash::from_bytes(*blake3::hash(bytes).as_bytes());
+            let manifest = Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), bytes.len() as u64, file_hash, chunks).unwrap();
+            self.state.store.put(BlobKey::manifest(&manifest.id()), &manifest.encode()).await.unwrap();
+            self.meta.add_manifest(space, &manifest, 100, 0).await.unwrap();
+            manifest.id()
+        }
+
         /// A file of the account's space.
         async fn file(&self, auth: &DeviceAuth, name: &str) -> NodeId {
             let space = self.user.space;
@@ -1154,11 +1133,12 @@ mod tests {
         out
     }
 
-    /// Makes the document of a new file by import from `s` and follows it from the start.
+    /// Makes the document of a new file by import from `s` (its snapshot uploaded first) and follows it from the start.
     async fn imported(a: &Account, s: &mut Session, auth: &DeviceAuth, snapshot: &[u8]) -> DocId {
         let node = a.file(auth, &format!("f{}.txt", DocId::generate())).await;
         let doc = node_doc(a.user.space, node);
-        let made = s.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: snapshot.to_vec() }).await;
+        let snapshot = a.upload(snapshot).await;
+        let made = s.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot }).await;
         assert_eq!(made.frames, vec![ServerFrame::CreatedDocument { doc, kept: true }]);
         s.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
         drain(s).await;
@@ -1169,8 +1149,9 @@ mod tests {
         frames.iter().filter_map(|f| if let ServerFrame::Update { seq, .. } = f { Some(*seq) } else { None }).collect()
     }
 
-    fn snapshot_of(frames: &[ServerFrame]) -> Option<(u64, Vec<u8>)> {
-        frames.iter().find_map(|f| if let ServerFrame::Snapshot { base, bytes, .. } = f { Some((*base, bytes.clone())) } else { None })
+    /// The snapshot a catch-up named: its base and its manifest.
+    fn snapshot_of(frames: &[ServerFrame]) -> Option<(u64, ManifestId)> {
+        frames.iter().find_map(|f| if let ServerFrame::Snapshot { base, manifest, .. } = f { Some((*base, *manifest)) } else { None })
     }
 
     fn compacts(frames: &[ServerFrame]) -> Vec<u64> {
@@ -1190,7 +1171,7 @@ mod tests {
         let (mut old, auth) = a.session(1).await;
         let node = a.file(&auth, "a.txt").await;
         let doc = node_doc(a.user.space, node);
-        let refused = old.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: vec![1; 10] }).await;
+        let refused = old.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: a.upload(&[1; 10]).await }).await;
         assert_eq!(code(&refused), Some("invalid"));
         let recents = recents_doc(a.user.space, &app());
         old.handle(ClientFrame::Create { doc: recents, kind: DocKind::Recents { app: app() } }).await;
@@ -1201,14 +1182,12 @@ mod tests {
             assert!(matches!(reply.frames.as_slice(), [ServerFrame::Ack { .. }]), "never a compact: {:?}", reply.frames);
         }
         assert!(old.handle(ClientFrame::Presence { doc: recents, bytes: vec![1] }).await.frames.is_empty());
-        assert!(old.handle(ClientFrame::Snapshot { doc: recents, upto: 2, bytes: vec![1] }).await.frames.is_empty());
+        let one = a.upload(&[1]).await;
+        assert!(old.handle(ClientFrame::Snapshot { doc: recents, upto: 2, manifest: one }).await.frames.is_empty());
         assert_eq!(a.meta.live_doc(a.user.space, recents).await.unwrap().unwrap().base, 0, "an unasked snapshot changes nothing");
         // Compacted by another (newer) device: the old one still gets every row, never a snapshot.
-        let (stored, pieces) = SnapshotRef::split(&[9; 20]);
-        for (id, piece) in stored.pieces.iter().zip(pieces) {
-            a.state.store.put(BlobKey::chunk(id), piece).await.unwrap();
-        }
-        assert!(a.meta.compact_live_doc(a.user.space, recents, 3, &stored, 0).await.unwrap());
+        let stored = a.upload(&[9; 20]).await;
+        assert!(a.meta.compact_live_doc(a.user.space, recents, 3, &stored).await.unwrap());
         let (mut old2, _) = a.session(1).await;
         old2.handle(ClientFrame::Subscribe { doc: recents, after: 0, at: None }).await;
         let frames = drain(&mut old2).await;
@@ -1229,28 +1208,73 @@ mod tests {
         let (mut laptop, _) = a.session(2).await;
         let node = a.file(&pc_auth, "doc1.txt").await;
         let doc = node_doc(a.user.space, node);
-        let first = pc.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: vec![1; 3000] }).await;
+        let (one, two) = (a.upload(&[1; 3000]).await, a.upload(&[2; 3000]).await);
+        let first = pc.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: one }).await;
         assert_eq!(first.frames, vec![ServerFrame::CreatedDocument { doc, kept: true }]);
-        let second = laptop.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: vec![2; 3000] }).await;
+        let second = laptop.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: two }).await;
         assert_eq!(second.frames, vec![ServerFrame::CreatedDocument { doc, kept: false }]);
         laptop.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
         let frames = drain(&mut laptop).await;
-        assert_eq!(snapshot_of(&frames), Some((0, vec![1; 3000])), "the kept import");
+        assert_eq!(snapshot_of(&frames), Some((0, one)), "the kept import");
         assert_eq!(frames.last(), Some(&ServerFrame::Subscribed { doc, head: 0 }));
         // The ID must be the node's, the node a file of this account's space.
         let other = a.file(&pc_auth, "doc2.txt").await;
-        let wrong = pc.handle(ClientFrame::CreateDocument { doc, node: other, app: app(), snapshot: vec![1] }).await;
+        let wrong = pc.handle(ClientFrame::CreateDocument { doc, node: other, app: app(), snapshot: one }).await;
         assert_eq!(code(&wrong), Some("invalid"));
         let missing = NodeId::generate();
-        let gone =
-            pc.handle(ClientFrame::CreateDocument { doc: node_doc(a.user.space, missing), node: missing, app: app(), snapshot: vec![1] }).await;
+        let gone = pc.handle(ClientFrame::CreateDocument { doc: node_doc(a.user.space, missing), node: missing, app: app(), snapshot: one }).await;
         assert_eq!(code(&gone), Some("not_found"));
         let mut b = Account::with_meta(Default::default(), a.meta.clone(), "bo").await;
         b.next_token = 100;
         let (mut bo, _) = b.session(2).await;
-        let theirs = bo.handle(ClientFrame::CreateDocument { doc: node_doc(b.user.space, node), node, app: app(), snapshot: vec![1] }).await;
+        let bos = b.upload(&[1]).await;
+        let theirs = bo.handle(ClientFrame::CreateDocument { doc: node_doc(b.user.space, node), node, app: app(), snapshot: bos }).await;
         assert_eq!(code(&theirs), Some("not_found"), "another account's file is no file of this one");
         assert_eq!(code(&bo.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await), Some("not_found"), "nor its document");
+    }
+
+    /// Snapshots never travel in frames: a `create` or `snapshot` names a manifest the account uploaded (through the
+    /// chunk API, charged there), and one naming a manifest it doesn't have (never uploaded, or another account's)
+    /// records nothing. A refused `create` stores nothing either: the server writes no blob for a frame.
+    #[tokio::test]
+    async fn a_snapshot_is_named_by_a_manifest_the_account_uploaded() {
+        let meta = Meta::open("sqlite::memory:").await.unwrap().with_stored_bytes_cap(Some(1000));
+        let mut a = Account::with_meta(small_logs(), meta, "ana").await;
+        let (mut s, auth) = a.session(2).await;
+        // Made-up nodes: refused, nothing stored, nothing charged.
+        let used = a.meta.stored_bytes(a.user.space).await.unwrap();
+        for i in 0..5u8 {
+            let node = NodeId::generate();
+            let reply = s
+                .handle(ClientFrame::CreateDocument {
+                    doc: node_doc(a.user.space, node),
+                    node,
+                    app: app(),
+                    snapshot: ManifestId::from_bytes([i; 32]),
+                })
+                .await;
+            assert_eq!(code(&reply), Some("not_found"));
+        }
+        assert_eq!(a.meta.stored_bytes(a.user.space).await.unwrap(), used);
+        // A file, but a manifest never uploaded, or another account's: refused, nothing recorded.
+        let node = a.file(&auth, "a.txt").await;
+        let doc = node_doc(a.user.space, node);
+        let never = ManifestId::from_bytes([3; 32]);
+        assert_eq!(code(&s.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: never }).await), Some("not_found"));
+        let mut b = Account::with_meta(Default::default(), a.meta.clone(), "bo").await;
+        b.next_token = 100;
+        let bos = b.upload(&[5; 10]).await;
+        assert_eq!(code(&s.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: bos }).await), Some("not_found"));
+        assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap(), None);
+        // A compaction answer naming one it doesn't have isn't taken (and the next ask goes ahead).
+        let doc = imported(&a, &mut s, &auth, &[1; 10]).await;
+        let mut asked = Vec::new();
+        for client_seq in 1..=4u64 {
+            asked.extend(compacts(&s.handle(ClientFrame::Update { doc, client_seq, bytes: vec![client_seq as u8; 10] }).await.frames));
+        }
+        assert_eq!(asked, vec![4]);
+        s.handle(ClientFrame::Snapshot { doc, upto: 4, manifest: bos }).await;
+        assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap().base, 0, "another account's manifest isn't taken");
     }
 
     /// Two machines import the same never-live file at the same moment: one import is kept, and both end on it.
@@ -1261,9 +1285,10 @@ mod tests {
         let (mut laptop, _) = a.session(2).await;
         let node = a.file(&auth, "a.txt").await;
         let doc = node_doc(a.user.space, node);
+        let (one, two) = (a.upload(&[1; 100]).await, a.upload(&[2; 100]).await);
         let (x, y) = tokio::join!(
-            pc.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: vec![1; 100] }),
-            laptop.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: vec![2; 100] })
+            pc.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: one }),
+            laptop.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: two })
         );
         let kept: Vec<bool> = [x, y]
             .iter()
@@ -1273,10 +1298,10 @@ mod tests {
             })
             .collect();
         assert_eq!(kept.iter().filter(|k| **k).count(), 1, "{kept:?}");
-        let winner = if kept[0] { vec![1; 100] } else { vec![2; 100] };
+        let winner = if kept[0] { one } else { two };
         for s in [&mut pc, &mut laptop] {
             s.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
-            assert_eq!(snapshot_of(&drain(s).await), Some((0, winner.clone())), "both end on the kept one");
+            assert_eq!(snapshot_of(&drain(s).await), Some((0, winner)), "both end on the kept one");
         }
     }
 
@@ -1295,18 +1320,19 @@ mod tests {
         }
         assert_eq!(asked, vec![4], "past 3 updates, asked once");
         // Another `upto` than asked, or the right one twice: only the asked one is taken, once.
-        pc.handle(ClientFrame::Snapshot { doc, upto: 5, bytes: vec![7; 40] }).await;
+        let (s7, s8, s9) = (a.upload(&[7; 40]).await, a.upload(&[8; 40]).await, a.upload(&[9; 41]).await);
+        pc.handle(ClientFrame::Snapshot { doc, upto: 5, manifest: s7 }).await;
         assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap().base, 0);
-        pc.handle(ClientFrame::Snapshot { doc, upto: 4, bytes: vec![8; 40] }).await;
+        pc.handle(ClientFrame::Snapshot { doc, upto: 4, manifest: s8 }).await;
         let compacted = a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap();
         assert_eq!((compacted.base, compacted.above_base(), compacted.snapshot_bytes), (4, 10, 40));
-        pc.handle(ClientFrame::Snapshot { doc, upto: 4, bytes: vec![9; 40] }).await;
-        assert_eq!(a.meta.live_snapshot(a.user.space, doc).await.unwrap().unwrap().1.bytes, 40);
+        pc.handle(ClientFrame::Snapshot { doc, upto: 4, manifest: s9 }).await;
+        assert_eq!(a.meta.live_snapshot(a.user.space, doc).await.unwrap().unwrap().1.manifest, s8);
         // From the start: the snapshot, then the log from its base (the row at the base gives the next `at`).
         let (mut laptop, _) = a.session(2).await;
         laptop.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
         let frames = drain(&mut laptop).await;
-        assert_eq!(snapshot_of(&frames), Some((4, vec![8; 40])));
+        assert_eq!(snapshot_of(&frames), Some((4, s8)));
         assert_eq!(updates(&frames), vec![4, 5]);
         assert_eq!(frames.last(), Some(&ServerFrame::Subscribed { doc, head: 5 }));
         // From below the base, the hash checked against the kept row.
@@ -1324,7 +1350,8 @@ mod tests {
         let (mut reader, _) = a.session(2).await;
         reader.handle(ClientFrame::SubscribeLog { doc, after: 0, at: None }).await;
         let frames = drain(&mut reader).await;
-        assert_eq!((snapshot_of(&frames), updates(&frames)), (Some((0, vec![1; 10])), vec![1, 2, 3, 4, 5]));
+        let import = a.meta.live_import_snapshot(a.user.space, doc).await.unwrap().unwrap().manifest;
+        assert_eq!((snapshot_of(&frames), updates(&frames)), (Some((0, import)), vec![1, 2, 3, 4, 5]));
         reader.handle(ClientFrame::SubscribeLog { doc, after: 2, at: Some(update_hash(&[2; 10])) }).await;
         let frames = drain(&mut reader).await;
         assert_eq!((snapshot_of(&frames), updates(&frames)), (None, vec![3, 4, 5]), "from 2 it had the import");
@@ -1345,7 +1372,7 @@ mod tests {
         let frames = drain(&mut laptop).await;
         assert_eq!(compacts(&frames), vec![5], "asked after `subscribed`");
         assert!(matches!(frames.iter().rev().nth(1), Some(ServerFrame::Subscribed { head: 5, .. })), "{frames:?}");
-        laptop.handle(ClientFrame::Snapshot { doc, upto: 5, bytes: vec![5; 10] }).await;
+        laptop.handle(ClientFrame::Snapshot { doc, upto: 5, manifest: a.upload(&[5; 10]).await }).await;
         assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap().base, 5);
     }
 
@@ -1367,9 +1394,9 @@ mod tests {
         assert_eq!(send(&mut laptop, 1).await, vec![3], "it didn't answer in time: the laptop is asked");
         assert!(send(&mut pc, 3).await.is_empty(), "the pc is skipped for a while");
         // The pc answers late: its snapshot moves the base on, so it is taken.
-        pc.handle(ClientFrame::Snapshot { doc, upto: 2, bytes: vec![2; 10] }).await;
+        pc.handle(ClientFrame::Snapshot { doc, upto: 2, manifest: a.upload(&[2; 10]).await }).await;
         assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap().base, 2);
-        laptop.handle(ClientFrame::Snapshot { doc, upto: 3, bytes: vec![3; 10] }).await;
+        laptop.handle(ClientFrame::Snapshot { doc, upto: 3, manifest: a.upload(&[3; 10]).await }).await;
         assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap().base, 3, "the laptop's, past it, too");
         // After a compaction anyone may be asked again, the skipped pc too (5 is two above the base).
         assert_eq!(send(&mut pc, 4).await, vec![5]);
@@ -1388,51 +1415,54 @@ mod tests {
         pc.handle(ClientFrame::Update { doc, client_seq: 1, bytes: vec![1] }).await;
         assert_eq!(compacts(&pc.handle(ClientFrame::Update { doc, client_seq: 2, bytes: vec![2] }).await.frames), vec![2]);
         assert_eq!(compacts(&laptop.handle(ClientFrame::Update { doc, client_seq: 1, bytes: vec![3] }).await.frames), vec![3]);
+        let (s3, s2) = (a.upload(&[3; 10]).await, a.upload(&[2; 10]).await);
         tokio::join!(
-            laptop.handle(ClientFrame::Snapshot { doc, upto: 3, bytes: vec![3; 10] }),
-            pc.handle(ClientFrame::Snapshot { doc, upto: 2, bytes: vec![2; 10] })
+            laptop.handle(ClientFrame::Snapshot { doc, upto: 3, manifest: s3 }),
+            pc.handle(ClientFrame::Snapshot { doc, upto: 2, manifest: s2 })
         );
         assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap().base, 3);
         let (mut fresh, _) = a.session(2).await;
         fresh.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
         let frames = drain(&mut fresh).await;
-        assert_eq!((snapshot_of(&frames), updates(&frames)), (Some((3, vec![3; 10])), vec![3]));
+        assert_eq!((snapshot_of(&frames), updates(&frames)), (Some((3, s3)), vec![3]));
     }
 
-    /// A crash between storing a snapshot's blobs and recording it leaves blobs nothing names: the document is as it
-    /// was, and a later compaction works.
+    /// Past the account's cap on live bytes (every row of every live document, compacted ones too), an update is
+    /// refused with `quota_exceeded`, naming it, and nothing is stored.
     #[tokio::test]
-    async fn a_snapshot_stored_but_never_recorded_changes_nothing() {
+    async fn an_update_past_the_accounts_live_bytes_is_refused() {
+        let meta = Meta::open("sqlite::memory:").await.unwrap().with_live_bytes_cap(25);
+        let mut a = Account::with_meta(small_logs(), meta, "ana").await;
+        let (mut pc, auth) = a.session(2).await;
+        let doc = imported(&a, &mut pc, &auth, &[1; 10]).await;
+        for client_seq in 1..=2u64 {
+            let reply = pc.handle(ClientFrame::Update { doc, client_seq, bytes: vec![client_seq as u8; 10] }).await;
+            assert!(matches!(reply.frames.first(), Some(ServerFrame::Ack { .. })), "{:?}", reply.frames);
+        }
+        let reply = pc.handle(ClientFrame::Update { doc, client_seq: 3, bytes: vec![3; 10] }).await;
+        assert_eq!(code(&reply), Some("quota_exceeded"));
+        assert!(matches!(reply.frames.as_slice(), [ServerFrame::Error { client_seq: Some(3), .. }]));
+        assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap().head, 2, "nothing stored");
+    }
+
+    /// A snapshot uploaded but never named (the agent stopped between its upload and its frame) changes nothing: the
+    /// document is as it was, and a later compaction works.
+    #[tokio::test]
+    async fn a_snapshot_uploaded_but_never_named_changes_nothing() {
         let mut a = Account::new(small_logs()).await;
         let (mut pc, auth) = a.session(2).await;
         let doc = imported(&a, &mut pc, &auth, &[1; 10]).await;
+        let import = a.meta.live_import_snapshot(a.user.space, doc).await.unwrap().unwrap().manifest;
         for client_seq in 1..=4u64 {
             pc.handle(ClientFrame::Update { doc, client_seq, bytes: vec![client_seq as u8; 10] }).await;
         }
-        store_snapshot(&a.state, a.user.space, &[6; 50]).await.unwrap();
+        a.upload(&[6; 50]).await;
         let (mut laptop, _) = a.session(2).await;
         laptop.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
         let frames = drain(&mut laptop).await;
-        assert_eq!((snapshot_of(&frames), updates(&frames)), (Some((0, vec![1; 10])), vec![1, 2, 3, 4]), "the import and the whole log");
-        pc.handle(ClientFrame::Snapshot { doc, upto: 4, bytes: vec![4; 50] }).await;
+        assert_eq!((snapshot_of(&frames), updates(&frames)), (Some((0, import)), vec![1, 2, 3, 4]), "the import and the whole log");
+        pc.handle(ClientFrame::Snapshot { doc, upto: 4, manifest: a.upload(&[4; 50]).await }).await;
         assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap().base, 4);
-    }
-
-    /// A snapshot that can't be read back (its blob is gone) fails that document's catch-up only.
-    #[tokio::test]
-    async fn an_unreadable_snapshot_fails_only_its_documents_catch_up() {
-        let mut a = Account::new(Default::default()).await;
-        let (mut pc, auth) = a.session(2).await;
-        let doc = imported(&a, &mut pc, &auth, &[1; 10]).await;
-        let other = imported(&a, &mut pc, &auth, &[2; 10]).await;
-        let (_, stored) = a.meta.live_snapshot(a.user.space, doc).await.unwrap().unwrap();
-        a.state.store.delete(BlobKey::chunk(&stored.pieces[0])).await.unwrap();
-        let (mut laptop, _) = a.session(2).await;
-        laptop.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
-        laptop.handle(ClientFrame::Subscribe { doc: other, after: 0, at: None }).await;
-        let frames = drain(&mut laptop).await;
-        assert!(frames.iter().any(|f| matches!(f, ServerFrame::Error { doc: Some(d), client_seq: None, .. } if *d == doc)), "{frames:?}");
-        assert!(frames.contains(&ServerFrame::Subscribed { doc: other, head: 0 }), "the other goes on: {frames:?}");
     }
 
     /// Presence goes to the document's other subscribers, never back, never to one that doesn't follow it or speaks
@@ -1476,7 +1506,7 @@ mod tests {
         for client_seq in 1..=4u64 {
             pc.handle(ClientFrame::Update { doc, client_seq, bytes: vec![client_seq as u8; 10] }).await;
         }
-        pc.handle(ClientFrame::Snapshot { doc, upto: 4, bytes: vec![4; 10] }).await;
+        pc.handle(ClientFrame::Snapshot { doc, upto: 4, manifest: a.upload(&[4; 10]).await }).await;
         let (mut behind, _) = a.session(2).await;
         behind.handle(ClientFrame::Subscribe { doc, after: 3, at: Some(update_hash(&[3; 10])) }).await;
         let frames = drain(&mut behind).await;

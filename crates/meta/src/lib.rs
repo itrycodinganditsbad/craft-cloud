@@ -28,8 +28,8 @@ pub use commit::CommitOutcome;
 pub use craft_cloud_proto::BlobKind;
 pub use join::{InviteFor, Redeemed};
 pub use live::{
-    Appended, LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE, MAX_LIVE_DOCS_PER_SPACE, MAX_LIVE_DOCUMENTS_PER_SPACE,
-    MAX_LIVE_PAGE, SNAPSHOT_PIECE_BYTES, SnapshotRef,
+    Appended, DEFAULT_LIVE_BYTES_PER_SPACE, LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE, MAX_LIVE_DOCS_PER_SPACE,
+    MAX_LIVE_DOCUMENTS_HOLDING_UPDATES, MAX_LIVE_DOCUMENTS_PER_SPACE, MAX_LIVE_PAGE, SnapshotRef,
 };
 pub use tree::SpaceInfo;
 pub use users::{DeviceAuth, DeviceRecord, Role, UserId, UserRecord, valid_username};
@@ -58,8 +58,13 @@ pub enum MetaError {
     /// `used` is what the log holds.
     #[error("this live document is full on the server: its log holds {used} of {limit} bytes")]
     DocFull { used: u64, limit: u64 },
+    /// An update would take the bytes all of a space's live documents hold (compacted rows too) over its cap
+    /// ([`Meta::with_live_bytes_cap`]); nothing was stored. `used` is what they hold.
+    #[error("the account's live documents hold {used} of {limit} bytes on the server, the most they may")]
+    LiveFull { used: u64, limit: u64 },
     /// The first update to a live document would take its space over the most documents holding updates it may have
-    /// ([`MAX_LIVE_DOCS_PER_SPACE`]); nothing was stored.
+    /// ([`MAX_LIVE_DOCS_PER_SPACE`] recents, [`MAX_LIVE_DOCUMENTS_HOLDING_UPDATES`] documents of files); nothing was
+    /// stored.
     #[error("the account has {limit} live documents holding updates on the server, the most it may have")]
     TooManyDocs { limit: u64 },
     /// A new live document would take its space over the most rows it may have ([`MAX_LIVE_DOC_ROWS_PER_SPACE`]);
@@ -104,6 +109,10 @@ pub struct Meta {
     live_doc_rows_cap: u64,
     /// The most documents of files one space may have ([`Meta::with_live_documents_cap`]).
     live_documents_cap: u64,
+    /// The most documents of files holding updates one space may have ([`Meta::with_live_held_documents_cap`]).
+    live_held_documents_cap: u64,
+    /// The most bytes all of one space's live documents may hold ([`Meta::with_live_bytes_cap`]).
+    live_bytes_cap: u64,
 }
 
 impl Meta {
@@ -158,6 +167,8 @@ impl Meta {
             live_docs_cap: MAX_LIVE_DOCS_PER_SPACE,
             live_doc_rows_cap: MAX_LIVE_DOC_ROWS_PER_SPACE,
             live_documents_cap: MAX_LIVE_DOCUMENTS_PER_SPACE,
+            live_held_documents_cap: MAX_LIVE_DOCUMENTS_HOLDING_UPDATES,
+            live_bytes_cap: DEFAULT_LIVE_BYTES_PER_SPACE,
         })
     }
 
@@ -188,6 +199,22 @@ impl Meta {
     /// [`MAX_LIVE_DOCUMENTS_PER_SPACE`]); a create over it is refused with [`MetaError::TooManyDocRows`]. For tests.
     pub fn with_live_documents_cap(mut self, cap: u64) -> Self {
         self.live_documents_cap = cap;
+        self
+    }
+
+    /// The store with another cap on the number of documents of files holding updates one space may have (the default
+    /// is [`MAX_LIVE_DOCUMENTS_HOLDING_UPDATES`]); the first update to one over it is refused with
+    /// [`MetaError::TooManyDocs`]. For tests.
+    pub fn with_live_held_documents_cap(mut self, cap: u64) -> Self {
+        self.live_held_documents_cap = cap;
+        self
+    }
+
+    /// The store with another cap on the bytes all of one space's live documents may hold, compacted rows too (the
+    /// default is [`DEFAULT_LIVE_BYTES_PER_SPACE`]; the server's `live_bytes_per_user` sets it); an append over it is
+    /// refused with [`MetaError::LiveFull`]. The cap belongs to this handle and its clones.
+    pub fn with_live_bytes_cap(mut self, cap: u64) -> Self {
+        self.live_bytes_cap = cap;
         self
     }
 

@@ -1,6 +1,7 @@
 //! The live hub: the agent's side of live documents: each app's recents, shared by every machine of the account, and
 //! documents of files, opened by apps by path.
 //!
+//! - [`blobs`]: snapshots up and down through the chunk API.
 //! - [`copy`]: a document's local copy (a Loro document merged from opaque updates, checked by Loro) and what the
 //!   server's log holds of it.
 //! - [`recents`]: the recents document and the list apps see.
@@ -14,6 +15,7 @@
 //! The local API's recents WebSocket ([`recents_socket`]) is a client of the hub like any other: an app subscribes
 //! to its list (the whole list comes now and after every change) and adds entries (answered once they are on disk).
 
+pub mod blobs;
 pub mod copy;
 pub mod docs;
 pub mod hub;

@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use craft_cloud_proto::live::MAX_LARGE_FRAME_BYTES;
+use craft_cloud_proto::live::MAX_FRAME_BYTES;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
@@ -92,8 +92,7 @@ pub async fn dial(server: &ServerUrl, token: &DeviceToken) -> Result<LiveSocket,
     let auth = token.bearer().map_err(|e| DialError::Unavailable(e.to_string()))?;
     request.headers_mut().insert(AUTHORIZATION, auth);
     request.headers_mut().insert(USER_AGENT, tokio_tungstenite::tungstenite::http::HeaderValue::from_static(USER_AGENT_VALUE));
-    // Up to a snapshot's size: every frame but a snapshot is checked against the smaller limit as it is decoded.
-    let config = WebSocketConfig::default().max_message_size(Some(MAX_LARGE_FRAME_BYTES)).max_frame_size(Some(MAX_LARGE_FRAME_BYTES));
+    let config = WebSocketConfig::default().max_message_size(Some(MAX_FRAME_BYTES)).max_frame_size(Some(MAX_FRAME_BYTES));
     match tokio::time::timeout(STEP_TIMEOUT, tokio_tungstenite::client_async_with_config(request, stream, Some(config))).await {
         Ok(Ok((socket, _))) => Ok(socket),
         Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response))) => match response.status().as_u16() {

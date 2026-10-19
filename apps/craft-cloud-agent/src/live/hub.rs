@@ -25,12 +25,14 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
+use super::blobs::{Upload, download, upload};
 use super::link::{DialError, LiveSocket, dial};
 use super::replica::{AddError, DocEvent, LinkError, LocalError, Opening, Replica};
 use super::store::DiskStore;
 use crate::account::DataDir;
-use crate::http::{DeviceToken, ServerUrl};
+use crate::http::{DeviceToken, HttpTransport, ServerUrl};
 use crate::local_api::Control;
+use craft_cloud_proto::ManifestId;
 
 /// What the hub needs to know about the account.
 #[derive(Debug, Clone)]
@@ -348,9 +350,48 @@ const PING_EVERY: Duration = Duration::from_secs(30);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What a snapshot's upload or download says when it is done (for the connection `generation` it was for).
+enum BlobDone {
+    Uploaded { generation: u64, doc: DocId, manifest: ManifestId, result: Result<(), String> },
+    Downloaded { generation: u64, doc: DocId, manifest: ManifestId, result: Result<Vec<u8>, String> },
+}
+
+/// Snapshots on their way up or down through the chunk API, and the frames waiting for them.
+struct Blobs {
+    /// The chunk API (`None` if it couldn't be set up: every upload and download then fails, and is said).
+    transport: Option<Arc<HttpTransport>>,
+    done: mpsc::UnboundedSender<BlobDone>,
+    /// The connection the transfers under way are for: one that ended makes their results no news.
+    generation: u64,
+    /// Uploads under way, by document: the document's frames wait behind them, in order.
+    uploading: BTreeMap<DocId, Vec<ManifestId>>,
+    held: BTreeMap<DocId, Vec<ClientFrame>>,
+}
+
+/// The document a frame is about, if any.
+fn frame_doc(frame: &ClientFrame) -> Option<DocId> {
+    match frame {
+        ClientFrame::Hello { .. } => None,
+        ClientFrame::Create { doc, .. }
+        | ClientFrame::Subscribe { doc, .. }
+        | ClientFrame::Unsubscribe { doc }
+        | ClientFrame::Update { doc, .. }
+        | ClientFrame::Snapshot { doc, .. }
+        | ClientFrame::Presence { doc, .. }
+        | ClientFrame::SubscribeLog { doc, .. }
+        | ClientFrame::CreateDocument { doc, .. } => Some(*doc),
+    }
+}
+
+/// Whether `frame` names the snapshot `manifest`.
+fn names(frame: &ClientFrame, manifest: ManifestId) -> bool {
+    matches!(frame, ClientFrame::Snapshot { manifest: m, .. } | ClientFrame::CreateDocument { snapshot: m, .. } if *m == manifest)
+}
+
 struct State {
     config: HubConfig,
     replica: Replica<DiskStore>,
+    blobs: Blobs,
     lookup: NodeLookup,
     lists: BTreeMap<AppName, watch::Sender<Listing>>,
     socket: Option<Conn>,
@@ -697,13 +738,83 @@ impl State {
         }
     }
 
+    /// Starts the snapshot uploads and downloads the replica asks for: each in a task of its own, done when it says so
+    /// ([`State::blob_done`]). While a document's upload is under way, its frames wait behind it.
+    fn start_blobs(&mut self) {
+        let uploads: Vec<Upload> = self.replica.take_uploads();
+        let fetches = self.replica.take_fetches();
+        if self.socket.is_none() {
+            return;
+        }
+        let generation = self.blobs.generation;
+        for up in uploads {
+            let (doc, manifest) = (up.doc, up.id());
+            self.blobs.uploading.entry(doc).or_default().push(manifest);
+            let (transport, done) = (self.blobs.transport.clone(), self.blobs.done.clone());
+            tokio::spawn(async move {
+                let result = match transport {
+                    Some(t) => upload(t.as_ref(), &up).await.map_err(|e| e.to_string()),
+                    None => Err("the server's API can't be reached".into()),
+                };
+                let _ = done.send(BlobDone::Uploaded { generation, doc, manifest, result });
+            });
+        }
+        for (doc, manifest) in fetches {
+            let (transport, done) = (self.blobs.transport.clone(), self.blobs.done.clone());
+            tokio::spawn(async move {
+                let result = match transport {
+                    Some(t) => download(t.as_ref(), &manifest).await.map_err(|e| e.to_string()),
+                    None => Err("the server's API can't be reached".into()),
+                };
+                let _ = done.send(BlobDone::Downloaded { generation, doc, manifest, result });
+            });
+        }
+    }
+
+    /// A snapshot's upload or download is done: an upload's document's frames go (the one naming a snapshot that
+    /// didn't go up is dropped, and the replica told), a download goes to the replica. Frames to send.
+    fn blob_done(&mut self, done: BlobDone) -> Vec<ClientFrame> {
+        match done {
+            BlobDone::Uploaded { generation, .. } | BlobDone::Downloaded { generation, .. } if generation != self.blobs.generation => Vec::new(),
+            BlobDone::Uploaded { doc, manifest, result, .. } => {
+                if let Err(e) = &result {
+                    self.say(format!("a live document's snapshot couldn't go up to the server: {e}"));
+                    self.replica.upload_failed(doc, e);
+                    if let Some(held) = self.blobs.held.get_mut(&doc) {
+                        held.retain(|f| !names(f, manifest));
+                    }
+                }
+                let left = self.blobs.uploading.get_mut(&doc).map(|list| {
+                    if let Some(i) = list.iter().position(|m| *m == manifest) {
+                        list.remove(i);
+                    }
+                    list.len()
+                });
+                if left == Some(0) {
+                    self.blobs.uploading.remove(&doc);
+                    return self.blobs.held.remove(&doc).unwrap_or_default();
+                }
+                Vec::new()
+            }
+            BlobDone::Downloaded { doc, manifest, result, .. } => self.replica.on_snapshot(doc, manifest, result),
+        }
+    }
+
     /// Sends frames; false when the connection broke (it is dropped).
     async fn send(&mut self, frames: Vec<ClientFrame>) -> bool {
+        self.start_blobs();
         if self.socket.is_none() {
             return true;
         }
         let mut encoded = Vec::with_capacity(frames.len());
         for frame in frames {
+            // Behind an upload of its document: it goes once that is done.
+            if let Some(doc) = frame_doc(&frame)
+                && self.blobs.uploading.contains_key(&doc)
+            {
+                self.blobs.held.entry(doc).or_default().push(frame);
+                continue;
+            }
             match frame.encode() {
                 Ok(bytes) => encoded.push(bytes),
                 Err(e) => self.say(format!("a live frame couldn't be encoded: {e}")),
@@ -726,6 +837,14 @@ impl State {
         }
         self.replica.disconnected();
         self.control.set_online(false);
+        self.new_generation();
+    }
+
+    /// Transfers under way and the frames held behind them are for a connection that ended: no news any more.
+    fn new_generation(&mut self) {
+        self.blobs.generation += 1;
+        self.blobs.uploading.clear();
+        self.blobs.held.clear();
     }
 
     fn entry(&mut self, app: &AppName, new: &NewRecent) -> Result<RecentEntry, HubError> {
@@ -806,9 +925,13 @@ async fn run(
     paused: bool,
 ) {
     let lookup = NodeLookup { data: config.data.clone(), seen: None, state: None };
+    let (blob_tx, mut blob_rx) = mpsc::unbounded_channel();
+    let transport = HttpTransport::new(config.server.clone(), &config.token).ok().map(Arc::new);
+    let blobs = Blobs { transport, done: blob_tx, generation: 0, uploading: BTreeMap::new(), held: BTreeMap::new() };
     let mut state = State {
         config,
         replica,
+        blobs,
         lookup,
         lists: BTreeMap::new(),
         socket: None,
@@ -854,6 +977,7 @@ async fn run(
                             socket.close().await;
                         }
                         state.replica.disconnected();
+                        state.new_generation();
                         // Offline before the caller hears it, so the status it reads next says so.
                         state.control.set_online(false);
                     } else {
@@ -870,6 +994,7 @@ async fn run(
                 dialing = None;
                 match dialed {
                     Ok(Ok(socket)) => {
+                        state.new_generation();
                         state.socket = Some(Conn::new(socket));
                         last_heard = Instant::now();
                         let hello = state.replica.connected();
@@ -881,6 +1006,10 @@ async fn run(
                     }
                     Err(_) => state.back_off(None),
                 }
+            }
+            Some(done) = blob_rx.recv() => {
+                let frames = state.blob_done(done);
+                state.send(frames).await;
             }
             // The writer gave up (the server took nothing for the send timeout): the connection is gone.
             () = async { match &writer_gone { Some(gone) => gone.notified().await, None => std::future::pending().await } } => {

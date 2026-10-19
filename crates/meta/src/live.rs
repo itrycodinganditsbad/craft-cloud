@@ -12,10 +12,10 @@
 //! kept (compacted: no longer counted against the document's cap, and not sent to an agent that reads the snapshot)
 //! until the retention rules come.
 
-use craft_cloud_proto::{BlobKind, ChunkId, DeviceId, DocId, NodeId, SpaceId};
+use craft_cloud_proto::{DeviceId, DocId, ManifestId, NodeId, SpaceId};
 use sqlx::Row;
 
-use crate::blobs::{Blob, record};
+use crate::blobs::manifest_file_size;
 use crate::codec::{flag, to_i64, to_u64, uuid_bytes, uuid_from};
 use crate::{Meta, MetaError};
 
@@ -49,53 +49,46 @@ impl LiveDoc {
     }
 }
 
-/// The largest piece a snapshot is stored in: a chunk.
-pub const SNAPSHOT_PIECE_BYTES: usize = craft_cloud_proto::limits::MAX_CHUNK_BYTES as usize;
-
-/// Where a snapshot is in the chunk store: its pieces, in order, and its size.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A snapshot: the manifest that names it (a file's content, uploaded through the chunk API and charged to the space
+/// like any), and its size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotRef {
-    pub pieces: Vec<ChunkId>,
+    pub manifest: ManifestId,
     pub bytes: u64,
 }
 
 impl SnapshotRef {
-    /// The pieces `snapshot` is stored in, with their IDs (the caller stores each piece as a chunk).
-    pub fn split(snapshot: &[u8]) -> (Self, Vec<&[u8]>) {
-        let pieces: Vec<&[u8]> = snapshot.chunks(SNAPSHOT_PIECE_BYTES.max(1)).collect();
-        let ids = pieces.iter().map(|p| ChunkId::from_bytes(craft_cloud_proto::live::update_hash(p))).collect();
-        (Self { pieces: ids, bytes: snapshot.len() as u64 }, pieces)
+    fn decode(id: &[u8], bytes: u64) -> Result<Self, MetaError> {
+        let id = <[u8; 32]>::try_from(id).map_err(|_| MetaError::Corrupt("a snapshot's manifest ID"))?;
+        Ok(Self { manifest: ManifestId::from_bytes(id), bytes })
     }
+}
 
-    /// The size of piece `i`: every piece is [`SNAPSHOT_PIECE_BYTES`] but the last.
-    fn piece_len(&self, i: usize) -> u64 {
-        let before = (i as u64).saturating_mul(SNAPSHOT_PIECE_BYTES as u64);
-        self.bytes.saturating_sub(before).min(SNAPSHOT_PIECE_BYTES as u64)
+/// The snapshot `manifest` names, if `space` has that manifest and it is a snapshot's size; read in the caller's
+/// transaction, so it is the space's when recorded. Nothing a client sends is recorded unless it was uploaded (and
+/// charged) as the space's.
+async fn snapshot_of(tx: &mut sqlx::AnyConnection, space: SpaceId, manifest: &ManifestId) -> Result<SnapshotRef, MetaError> {
+    let bytes = manifest_file_size(tx, space, manifest).await?.ok_or(MetaError::NotFound("snapshot manifest"))?;
+    if bytes == 0 || bytes > craft_cloud_proto::live::MAX_SNAPSHOT_BYTES as u64 {
+        return Err(MetaError::Invalid("a snapshot is 1 byte up to the snapshot limit"));
     }
-
-    fn encode(&self) -> Vec<u8> {
-        self.pieces.iter().flat_map(|p| p.as_bytes().iter().copied()).collect()
-    }
-
-    fn decode(ids: &[u8], bytes: u64) -> Result<Self, MetaError> {
-        if !ids.len().is_multiple_of(32) {
-            return Err(MetaError::Corrupt("a snapshot's piece list is not whole IDs"));
-        }
-        let pieces: Vec<ChunkId> = ids
-            .chunks(32)
-            .map(|c| <[u8; 32]>::try_from(c).map(ChunkId::from_bytes))
-            .collect::<Result<_, _>>()
-            .map_err(|_| MetaError::Corrupt("a snapshot piece ID"))?;
-        if (pieces.len() as u64) != bytes.div_ceil(SNAPSHOT_PIECE_BYTES as u64) {
-            return Err(MetaError::Corrupt("a snapshot's pieces don't add up to its size"));
-        }
-        Ok(Self { pieces, bytes })
-    }
+    Ok(SnapshotRef { manifest: *manifest, bytes })
 }
 
 /// The most documents of files (rows) one space may have. A document of a file needs a file node of the space, so
 /// they are bounded by the tree already; this is a loose cap on top, counted apart from recents.
 pub const MAX_LIVE_DOCUMENTS_PER_SPACE: u64 = 65_536;
+
+/// The most documents of files holding updates one space may have. The first update to one more is refused with
+/// [`MetaError::TooManyDocs`] (`quota_exceeded`, as for a full document); one that holds updates already never is. On
+/// Postgres the count is read without a lock, so concurrent first updates can overshoot it by a few; that soft cap is
+/// accepted.
+pub const MAX_LIVE_DOCUMENTS_HOLDING_UPDATES: u64 = 10_000;
+
+/// The default for the most bytes of updates all of one space's live documents may hold together, compacted rows too
+/// (they are kept until retention): 1 GiB. Over it, every append is refused with [`MetaError::QuotaExceeded`]
+/// (`quota_exceeded`). The server's `live_bytes_per_user` sets it.
+pub const DEFAULT_LIVE_BYTES_PER_SPACE: u64 = 1024 * 1024 * 1024;
 
 /// What an append did ([`Meta::append_live_update_counted`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,16 +154,6 @@ fn doc_from(row: &sqlx::any::AnyRow, id: DocId) -> Result<LiveDoc, MetaError> {
     })
 }
 
-/// Records the snapshot's pieces as chunks of `space` (charged to it, under its cap), in the caller's transaction.
-async fn record_pieces(tx: &mut sqlx::AnyConnection, space: SpaceId, snapshot: &SnapshotRef, now_ms: i64, cap: Option<u64>) -> Result<(), MetaError> {
-    for (i, piece) in snapshot.pieces.iter().enumerate() {
-        // As a chunk is stored: one format byte and the bytes.
-        let stored_size = to_i64(snapshot.piece_len(i).saturating_add(1))?;
-        record(tx, space, Blob { kind: BlobKind::Chunk, id: piece.as_bytes(), stored_size, file_size: None }, now_ms, cap).await?;
-    }
-    Ok(())
-}
-
 impl Meta {
     /// Makes the document `id` of `kind` in `space`, unless it is there already. A document that exists with the same
     /// kind is returned as it is (two machines may create the same recents document); one of another kind is
@@ -229,26 +212,36 @@ impl Meta {
         })
     }
 
+    /// Whether `node` is a file of `space` (not a folder, not deleted): what a document of a file needs.
+    pub async fn is_live_file(&self, space: SpaceId, node: NodeId) -> Result<bool, MetaError> {
+        let row = sqlx::query("SELECT is_dir, deleted FROM nodes WHERE space_id = $1 AND id = $2")
+            .bind(uuid_bytes(space.as_uuid()))
+            .bind(uuid_bytes(node.as_uuid()))
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => Ok(!flag(&row, "is_dir")? && !flag(&row, "deleted")?),
+            None => Ok(false),
+        }
+    }
+
     /// Makes the document `id` of the file node `node` of `space` by import: `kind` (`document:<app>`), its first
-    /// snapshot (whose pieces the caller stored in the chunk store already), unless the space has the document
-    /// already. Returns the document and whether this snapshot was kept: the first one is, every later one (another
-    /// machine imported the same file at the same moment) is not, and the document stays as it is. `NotFound` if the
-    /// space has no such file (a missing, deleted or folder node), `TooManyDocRows` over the space's cap on documents of
-    /// files, `QuotaExceeded` if the snapshot would take the space over its stored-bytes cap.
+    /// snapshot (the one `manifest` names, uploaded as the space's already), unless the space has the document already.
+    /// Returns the document and whether this snapshot was kept: the first one is, every later one (another machine
+    /// imported the same file at the same moment) is not, and the document stays as it is. `NotFound` if the space has
+    /// no such file (a missing, deleted or folder node) or no such manifest, `Invalid` for a manifest of a size no
+    /// snapshot has, `TooManyDocRows` over the space's cap on documents of files.
     pub async fn create_live_document(
         &self,
         space: SpaceId,
         id: DocId,
         kind: &str,
         node: NodeId,
-        snapshot: &SnapshotRef,
+        manifest: &ManifestId,
         now_ms: i64,
     ) -> Result<(LiveDoc, bool), MetaError> {
         if !kind.starts_with(craft_cloud_proto::live::DOCUMENT_KIND_PREFIX) || kind.len() > 64 {
             return Err(MetaError::Invalid("a document of a file is of kind document:<app>"));
-        }
-        if snapshot.pieces.is_empty() {
-            return Err(MetaError::Invalid("a document made by import has a snapshot"));
         }
         let (space_key, id_key, node_key) = (uuid_bytes(space.as_uuid()), uuid_bytes(id.as_uuid()), uuid_bytes(node.as_uuid()));
         let mut w = self.begin_write().await?;
@@ -261,6 +254,7 @@ impl Meta {
             Some(row) if !flag(&row, "is_dir")? && !flag(&row, "deleted")? => {}
             _ => return Err(MetaError::NotFound("file")),
         }
+        let snapshot = snapshot_of(&mut w.tx, space, manifest).await?;
         let inserted = sqlx::query(
             "INSERT INTO live_docs (space_id, id, kind, node, created_ms, head_seq, base_seq, snapshot, snapshot_bytes, import_snapshot, import_bytes) \
              VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $6, $7) ON CONFLICT (space_id, id) DO NOTHING",
@@ -270,7 +264,7 @@ impl Meta {
         .bind(kind)
         .bind(node_key)
         .bind(now_ms)
-        .bind(snapshot.encode())
+        .bind(snapshot.manifest.as_bytes().to_vec())
         .bind(to_i64(snapshot.bytes)?)
         .execute(&mut *w.tx)
         .await?
@@ -297,7 +291,6 @@ impl Meta {
         if to_u64(count)? > self.live_documents_cap {
             return Err(MetaError::TooManyDocRows { limit: self.live_documents_cap });
         }
-        record_pieces(&mut w.tx, space, snapshot, now_ms, self.stored_cap).await?;
         w.commit().await?;
         let doc = LiveDoc {
             id,
@@ -340,17 +333,16 @@ impl Meta {
         Ok(Some(SnapshotRef::decode(&ids, to_u64(row.try_get("import_bytes")?)?)?))
     }
 
-    /// Compacts the document's log: `snapshot` (stored in the chunk store already, durably) holds the updates 1..=`upto`
-    /// (and the snapshot before it). Recorded with `base = upto` in one transaction, and the rows up to `upto` stop
-    /// counting against the document's cap; they are kept. Only a snapshot past the current base, and not past the
-    /// head, is taken: one for an older or equal `upto` (a second device answering late, or two at once) is ignored,
-    /// `Ok(false)`. `QuotaExceeded` if the snapshot would take the space over its stored-bytes cap (nothing changes).
-    pub async fn compact_live_doc(&self, space: SpaceId, doc: DocId, upto: u64, snapshot: &SnapshotRef, now_ms: i64) -> Result<bool, MetaError> {
-        if snapshot.pieces.is_empty() {
-            return Err(MetaError::Invalid("an empty snapshot"));
-        }
+    /// Compacts the document's log: the snapshot `manifest` names (uploaded as the space's already, durably) holds the
+    /// updates 1..=`upto` (and the snapshot before it). Recorded with `base = upto` in one transaction, and the rows up
+    /// to `upto` stop counting against the document's cap; they are kept. Only a snapshot past the current base, and
+    /// not past the head, is taken: one for an older or equal `upto` (a second device answering late, or two at once)
+    /// is ignored, `Ok(false)`. `NotFound` if the space has no such manifest, `Invalid` for one of a size no snapshot
+    /// has (nothing changes).
+    pub async fn compact_live_doc(&self, space: SpaceId, doc: DocId, upto: u64, manifest: &ManifestId) -> Result<bool, MetaError> {
         let (space_key, doc_key) = (uuid_bytes(space.as_uuid()), uuid_bytes(doc.as_uuid()));
         let mut w = self.begin_write().await?;
+        let snapshot = snapshot_of(&mut w.tx, space, manifest).await?;
         let row = sqlx::query("SELECT base_seq, head_seq FROM live_docs WHERE space_id = $1 AND id = $2")
             .bind(space_key.clone())
             .bind(doc_key.clone())
@@ -380,7 +372,7 @@ impl Meta {
         .bind(space_key)
         .bind(doc_key)
         .bind(to_i64(upto)?)
-        .bind(snapshot.encode())
+        .bind(snapshot.manifest.as_bytes().to_vec())
         .bind(to_i64(snapshot.bytes)?)
         .bind(compacted)
         .bind(to_i64(base)?)
@@ -390,7 +382,6 @@ impl Meta {
         if done == 0 {
             return Ok(false);
         }
-        record_pieces(&mut w.tx, space, snapshot, now_ms, self.stored_cap).await?;
         w.commit().await?;
         Ok(true)
     }
@@ -417,6 +408,12 @@ impl Meta {
         .bind(space_key.clone())
         .execute(&mut *w.tx)
         .await?;
+        // Its rows no longer count towards the space's live bytes.
+        sqlx::query("UPDATE spaces SET live_bytes = live_bytes - (SELECT bytes FROM live_docs WHERE space_id = $1 AND id = $2) WHERE id = $1 AND EXISTS (SELECT 1 FROM live_docs WHERE space_id = $1 AND id = $2)")
+            .bind(space_key.clone())
+            .bind(doc_key.clone())
+            .execute(&mut *w.tx)
+            .await?;
         let done = sqlx::query(
             "UPDATE live_docs SET head_seq = 0, bytes = 0, compacted_bytes = 0, base_seq = 0, snapshot = NULL, snapshot_bytes = 0, \
              import_snapshot = NULL, import_bytes = 0 WHERE space_id = $1 AND id = $2",
@@ -538,18 +535,37 @@ impl Meta {
         // full document. A repeat was acked above, and a document that holds updates already is never refused here
         // (by its numbers, not its bytes: a compacted log holds updates, though none count against its cap). Documents
         // of files aren't counted: each needs a file of the space.
-        if recents && seq == 1 {
-            let holding =
-                sqlx::query("SELECT COUNT(*) AS n FROM live_docs WHERE space_id = $1 AND id <> $2 AND head_seq > 0 AND kind NOT LIKE 'document:%'")
-                    .bind(space_key.clone())
-                    .bind(doc_key.clone())
-                    .fetch_one(&mut *w.tx)
-                    .await?
-                    .try_get::<i64, _>("n")?;
-            if to_u64(holding)? >= self.live_docs_cap {
+        if seq == 1 {
+            // Documents of files are counted apart: each needs a file of the space, and their cap is far higher.
+            let (sql, cap) = if recents {
+                (
+                    "SELECT COUNT(*) AS n FROM live_docs WHERE space_id = $1 AND id <> $2 AND head_seq > 0 AND kind NOT LIKE 'document:%'",
+                    self.live_docs_cap,
+                )
+            } else {
+                (
+                    "SELECT COUNT(*) AS n FROM live_docs WHERE space_id = $1 AND id <> $2 AND head_seq > 0 AND kind LIKE 'document:%'",
+                    self.live_held_documents_cap,
+                )
+            };
+            let holding = sqlx::query(sql).bind(space_key.clone()).bind(doc_key.clone()).fetch_one(&mut *w.tx).await?.try_get::<i64, _>("n")?;
+            if to_u64(holding)? >= cap {
                 w.tx.rollback().await?;
-                return Err(MetaError::TooManyDocs { limit: self.live_docs_cap });
+                return Err(MetaError::TooManyDocs { limit: cap });
             }
+        }
+        // Every row of every live document of the space, compacted ones too, counts towards its live bytes (kept until
+        // retention): over the cap, nothing is stored. A repeat was acked above.
+        let live: i64 = sqlx::query("UPDATE spaces SET live_bytes = live_bytes + $1 WHERE id = $2 RETURNING live_bytes")
+            .bind(size)
+            .bind(space_key.clone())
+            .fetch_one(&mut *w.tx)
+            .await?
+            .try_get("live_bytes")?;
+        let live = to_u64(live)?;
+        if live > self.live_bytes_cap {
+            w.tx.rollback().await?;
+            return Err(MetaError::LiveFull { used: live.saturating_sub(to_u64(size)?), limit: self.live_bytes_cap });
         }
         sqlx::query("INSERT INTO live_updates (space_id, doc, seq, bytes, device, client_seq, created_ms) VALUES ($1, $2, $3, $4, $5, $6, $7)")
             .bind(space_key)
@@ -599,18 +615,22 @@ impl Meta {
         } else {
             "DELETE FROM live_docs WHERE space_id = $1 AND id = $2 AND $3 = 0"
         };
-        sqlx::query(sql).bind(space_key).bind(doc_key).bind(keep).execute(&mut *w.tx).await?;
+        sqlx::query(sql).bind(space_key.clone()).bind(doc_key).bind(keep).execute(&mut *w.tx).await?;
+        sqlx::query("UPDATE spaces SET live_bytes = (SELECT CAST(COALESCE(SUM(d.bytes), 0) AS BIGINT) FROM live_docs d WHERE d.space_id = spaces.id) WHERE id = $1")
+            .bind(space_key)
+            .execute(&mut *w.tx)
+            .await?;
         w.commit().await
     }
 
     /// The document's snapshot and base as a backup holds them (`None`: no snapshot, base 0). A test seam (the
-    /// `test-support` feature), for the simulations' restores; the pieces must be in the chunk store.
+    /// `test-support` feature), for the simulations' restores; the manifest must be the space's.
     #[cfg(feature = "test-support")]
     pub async fn restore_live_snapshot(&self, space: SpaceId, doc: DocId, snapshot: Option<(u64, SnapshotRef)>) -> Result<(), MetaError> {
         let (space_key, doc_key) = (uuid_bytes(space.as_uuid()), uuid_bytes(doc.as_uuid()));
         let mut w = self.begin_write().await?;
         let (base, ids, size) = match &snapshot {
-            Some((base, s)) => (to_i64(*base)?, Some(s.encode()), to_i64(s.bytes)?),
+            Some((base, s)) => (to_i64(*base)?, Some(s.manifest.as_bytes().to_vec()), to_i64(s.bytes)?),
             None => (0, None, 0),
         };
         sqlx::query(

@@ -6,6 +6,7 @@
 //! trusted_proxies = []          # proxies whose X-Forwarded-For is believed; needed with behind_proxy
 //! # ignore_forwarded_for = true # behind a proxy without naming it: every client then counts as the proxy
 //! # stored_bytes_per_user = 2_000_000_000_000   # cap on what one account stores, in bytes (unset: no cap)
+//! # live_bytes_per_user = 1_073_741_824         # cap on what one account's live documents hold, in bytes (1 GiB)
 //! # public_url = "https://cloud.example.com"    # where computers reach the server; `user invite` prints it
 //!
 //! [database]
@@ -78,6 +79,12 @@ pub struct Config {
     /// default): no cap. This is not yet the per-user quota on files' logical size (that comes with history).
     #[serde(default)]
     pub stored_bytes_per_user: Option<u64>,
+    /// The most bytes one account's live documents may hold together: every update in their logs, compacted ones too
+    /// (they are kept until retention rules come). An update that would go over it is refused (`quota_exceeded`); the
+    /// agent keeps it and tries again later, as for a full document. Snapshots aren't counted here: they are uploads,
+    /// under `stored_bytes_per_user`. Default 1 GiB.
+    #[serde(default = "default_live_bytes")]
+    pub live_bytes_per_user: u64,
     /// The address computers reach the server at, `https://host[:port][/prefix]` (the reverse proxy's). `user invite`
     /// puts it in front of the code it prints. Normalised when the config is read: the host in lower case, no
     /// trailing slash. Unset: `user invite` prints the bare code and says to put the address in front.
@@ -85,6 +92,10 @@ pub struct Config {
     pub public_url: Option<String>,
     pub database: DatabaseConfig,
     pub storage: StorageConfig,
+}
+
+fn default_live_bytes() -> u64 {
+    craft_cloud_meta::DEFAULT_LIVE_BYTES_PER_SPACE
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -286,6 +297,9 @@ path = "/tmp/blobs"
         // Under one chunk the agent would count every refusal as a full account: refused at load.
         assert!(matches!(Config::parse(&format!("stored_bytes_per_user = 4194303\n{DISK}")), Err(ConfigError::StoredBytesCapTooSmall(4_194_303, _))));
         assert_eq!(Config::parse(&format!("stored_bytes_per_user = 4194304\n{DISK}")).unwrap().stored_bytes_per_user, Some(4_194_304));
+        assert_eq!(Config::parse(DISK).unwrap().live_bytes_per_user, 1 << 30, "1 GiB by default");
+        assert_eq!(Config::parse(&format!("live_bytes_per_user = 5_000_000\n{DISK}")).unwrap().live_bytes_per_user, 5_000_000);
+        assert!(matches!(Config::parse(&format!("live_bytes_per_user = -1\n{DISK}")), Err(ConfigError::Parse(_))));
     }
 
     #[test]

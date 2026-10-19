@@ -286,7 +286,8 @@ fn a_snapshot_another_machine_cant_read_is_skipped_for_the_whole_log() {
             asked = asked.or(reply.frames.iter().find_map(|f| if let ServerFrame::Compact { upto, .. } = f { Some(*upto) } else { None }));
         }
         let upto = asked.expect("the rogue was asked");
-        rogue.handle(ClientFrame::Snapshot { doc, upto, bytes: vec![0xde, 0xad, 0xbe, 0xef] }).await;
+        let junk = w.upload(doc, &[0xde, 0xad, 0xbe, 0xef]).await;
+        rogue.handle(ClientFrame::Snapshot { doc, upto, manifest: junk }).await;
         assert_eq!(w.meta.live_doc(w.space, doc).await.unwrap().unwrap().base, upto, "the junk is the snapshot now");
         w.settle().await;
         // A fresh machine: the snapshot doesn't read; it reads the import and every row.
@@ -335,8 +336,8 @@ fn a_snapshot_that_lacks_updates_is_caught_by_the_whole_log() {
         }
         let upto = asked.expect("the rogue was asked");
         // A snapshot of the import only: it reads, but holds none of the updates up to `upto`.
-        let wrong = App::new(1).with_text("import").snapshot();
-        rogue.handle(ClientFrame::Snapshot { doc, upto, bytes: wrong }).await;
+        let wrong = w.upload(doc, &App::new(1).with_text("import").snapshot()).await;
+        rogue.handle(ClientFrame::Snapshot { doc, upto, manifest: wrong }).await;
         let more = app.append(" after");
         rogue.handle(ClientFrame::Update { doc, client_seq: 6, bytes: more }).await;
         let b = w.machine().await;
@@ -373,11 +374,12 @@ fn a_device_behind_answers_compaction_only_once_it_holds_the_updates() {
         w.edit(a, doc, &u);
         w.settle().await;
         let answer = w.machines[b].said_up.iter().find_map(|f| match f {
-            ClientFrame::Snapshot { upto, bytes, .. } => Some((*upto, bytes.clone())),
+            ClientFrame::Snapshot { upto, manifest, .. } => Some((*upto, *manifest)),
             _ => None,
         });
-        let (upto, bytes) = answer.expect("answered once the update came");
+        let (upto, manifest) = answer.expect("answered once the update came");
         assert_eq!(upto, 4);
+        let bytes = w.download(&manifest).await;
         // A snapshot of exactly the updates 1-4: with the log above it, a fresh copy is the document.
         let fresh = App::new(9);
         fresh.apply(&bytes);
@@ -415,10 +417,11 @@ fn a_compaction_snapshot_holds_nothing_past_upto() {
         frames.extend(r.on_frame(ServerFrame::Update { doc, seq: 1, bytes: u.clone(), device: craft_cloud_proto::DeviceId::generate() }).unwrap());
         frames.extend(r.on_frame(ServerFrame::Subscribed { doc, head: 1 }).unwrap());
         frames.extend(r.on_frame(ServerFrame::Compact { doc, upto: 1 }).unwrap());
-        let bytes = frames
+        let manifest = frames
             .iter()
-            .find_map(|f| if let ClientFrame::Snapshot { upto: 1, bytes, .. } = f { Some(bytes.clone()) } else { None })
+            .find_map(|f| if let ClientFrame::Snapshot { upto: 1, manifest, .. } = f { Some(*manifest) } else { None })
             .expect("answered");
+        let bytes = r.take_uploads().into_iter().find(|u| u.id() == manifest).expect("uploaded before it is named").bytes();
         let fresh = App::new(9);
         fresh.apply(&bytes);
         assert_eq!(fresh.text(), "base acked", "nothing past upto");

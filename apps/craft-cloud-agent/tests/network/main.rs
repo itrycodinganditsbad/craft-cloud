@@ -31,6 +31,8 @@
 //! run; `SIM_SEEDS=1000 SIM_FIRST=2000` runs seeds 2000 to 2999 (use `--release`), in parallel on `SIM_JOBS`
 //! threads. `SIM_TRACE=1` prints every pass and every change of the network.
 
+#[path = "../docs_common/blobs.rs"]
+mod blobs;
 #[path = "../../../../crates/sync/tests/common/mod.rs"]
 mod common;
 mod harness;

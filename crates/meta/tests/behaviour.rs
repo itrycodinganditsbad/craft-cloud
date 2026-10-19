@@ -121,7 +121,7 @@ on_every_backend!(
     concurrent_imports_of_one_file_keep_one,
     a_log_is_compacted_into_a_snapshot,
     concurrent_compactions_take_one,
-    a_snapshot_over_the_storage_cap_changes_nothing,
+    a_space_s_live_bytes_are_capped,
     documents_of_files_have_caps_of_their_own,
     a_compacted_log_still_holds_updates,
     the_import_stays_when_the_log_is_compacted,
@@ -784,9 +784,21 @@ async fn file(meta: &Meta, u: &UserRecord, file_name: &str) -> NodeId {
     node
 }
 
-/// A snapshot's pieces as the server stores them (here only their IDs matter).
-fn snapshot(bytes: &[u8]) -> craft_cloud_meta::SnapshotRef {
-    craft_cloud_meta::SnapshotRef::split(bytes).0
+/// A snapshot of `size` bytes uploaded as `u`'s (its chunks and the manifest that names them), as an agent uploads one.
+async fn snapshot(meta: &Meta, u: &UserRecord, size: u64) -> craft_cloud_meta::SnapshotRef {
+    let max = u64::from(craft_cloud_proto::limits::MAX_CHUNK_BYTES);
+    let mut chunks = Vec::new();
+    let mut left = size;
+    while left > 0 {
+        let len = left.min(max);
+        let chunk = ChunkId::from_bytes(*blake3::hash(uuid::Uuid::now_v7().as_bytes()).as_bytes());
+        meta.add_chunk(u.space, &chunk, len + 1, NOW).await.unwrap();
+        chunks.push(ChunkRef { id: chunk, len: u32::try_from(len).unwrap() });
+        left -= len;
+    }
+    let m = Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), size, FileHash::from_bytes([1; 32]), chunks).unwrap();
+    meta.add_manifest(u.space, &m, 100, NOW).await.unwrap();
+    craft_cloud_meta::SnapshotRef { manifest: m.id(), bytes: size }
 }
 
 async fn a_document_is_made_by_import_once(meta: &Meta) {
@@ -795,28 +807,41 @@ async fn a_document_is_made_by_import_once(meta: &Meta) {
     let bo = user(meta, "bo").await;
     let node = file(meta, &ana, "a.txt").await;
     let doc = node_doc(ana.space, node);
+    let first = snapshot(meta, &ana, 100).await;
     let before = meta.stored_bytes(ana.space).await.unwrap();
-    let first = snapshot(&[1; 100]);
-    let (made, kept) = meta.create_live_document(ana.space, doc, "document:wordcraft", node, &first, NOW).await.unwrap();
+    let (made, kept) = meta.create_live_document(ana.space, doc, "document:wordcraft", node, &first.manifest, NOW).await.unwrap();
     assert!(kept, "the first import is kept");
     assert_eq!((made.node, made.base, made.has_snapshot, made.snapshot_bytes, made.head), (Some(node), 0, true, 100, 0));
-    assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), before + 101, "the snapshot is charged like a chunk");
+    assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), before, "charged when it was uploaded, not again");
     // Another machine's import of the same file (even by another app): not kept, nothing changes.
-    let (again, kept) = meta.create_live_document(ana.space, doc, "document:gridcraft", node, &snapshot(&[2; 50]), NOW + 1).await.unwrap();
+    let second = snapshot(meta, &ana, 50).await;
+    let (again, kept) = meta.create_live_document(ana.space, doc, "document:gridcraft", node, &second.manifest, NOW + 1).await.unwrap();
     assert!(!kept);
     assert_eq!(again, made);
-    assert_eq!(meta.live_snapshot(ana.space, doc).await.unwrap(), Some((0, first.clone())), "the first snapshot stays");
-    assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), before + 101, "the second wasn't charged");
+    assert_eq!(meta.live_snapshot(ana.space, doc).await.unwrap(), Some((0, first)), "the first snapshot stays");
     // Only for a file of the space that is there.
+    let one = snapshot(meta, &ana, 1).await.manifest;
     let missing = NodeId::generate();
-    let refused = meta.create_live_document(ana.space, node_doc(ana.space, missing), "document:wordcraft", missing, &snapshot(&[1]), NOW).await;
+    assert!(!meta.is_live_file(ana.space, missing).await.unwrap());
+    let refused = meta.create_live_document(ana.space, node_doc(ana.space, missing), "document:wordcraft", missing, &one, NOW).await;
     assert!(matches!(refused, Err(MetaError::NotFound(_))), "{refused:?}");
     let r = root(meta, &ana).await;
-    let refused = meta.create_live_document(ana.space, node_doc(ana.space, r), "document:wordcraft", r, &snapshot(&[1]), NOW).await;
+    assert!(!meta.is_live_file(ana.space, r).await.unwrap());
+    let refused = meta.create_live_document(ana.space, node_doc(ana.space, r), "document:wordcraft", r, &one, NOW).await;
     assert!(matches!(refused, Err(MetaError::NotFound(_))), "a folder: {refused:?}");
-    let refused = meta.create_live_document(bo.space, node_doc(bo.space, node), "document:wordcraft", node, &snapshot(&[1]), NOW).await;
+    let bos = snapshot(meta, &bo, 1).await.manifest;
+    let refused = meta.create_live_document(bo.space, node_doc(bo.space, node), "document:wordcraft", node, &bos, NOW).await;
     assert!(matches!(refused, Err(MetaError::NotFound(_))), "another account's file: {refused:?}");
     assert_eq!(meta.live_doc(bo.space, doc).await.unwrap(), None, "and another account's document");
+    // Only with a snapshot the space uploaded.
+    let other = file(meta, &ana, "other.txt").await;
+    assert!(meta.is_live_file(ana.space, other).await.unwrap());
+    let refused = meta.create_live_document(ana.space, node_doc(ana.space, other), "document:wordcraft", other, &bos, NOW).await;
+    assert!(matches!(refused, Err(MetaError::NotFound(_))), "another account's manifest: {refused:?}");
+    let never = ManifestId::from_bytes([9; 32]);
+    let refused = meta.create_live_document(ana.space, node_doc(ana.space, other), "document:wordcraft", other, &never, NOW).await;
+    assert!(matches!(refused, Err(MetaError::NotFound(_))), "a manifest never uploaded: {refused:?}");
+    assert_eq!(meta.live_doc(ana.space, node_doc(ana.space, other)).await.unwrap(), None, "nothing recorded");
     // A deleted file.
     let gone = file(meta, &ana, "gone.txt").await;
     let dev = device(meta, &ana).await;
@@ -826,17 +851,20 @@ async fn a_document_is_made_by_import_once(meta: &Meta) {
         _ => panic!("not a file"),
     };
     meta.commit(ana.space, dev, &[Op::Delete { node: gone, expected: Some(current) }], NOW).await.unwrap();
-    let refused = meta.create_live_document(ana.space, node_doc(ana.space, gone), "document:wordcraft", gone, &snapshot(&[1]), NOW).await;
+    assert!(!meta.is_live_file(ana.space, gone).await.unwrap());
+    let refused = meta.create_live_document(ana.space, node_doc(ana.space, gone), "document:wordcraft", gone, &one, NOW).await;
     assert!(matches!(refused, Err(MetaError::NotFound(_))), "a deleted file: {refused:?}");
-    // Of the right kind, and with a snapshot.
-    assert!(matches!(meta.create_live_document(ana.space, doc, "recents:wordcraft", node, &first, NOW).await, Err(MetaError::Invalid(_))));
-    let empty = craft_cloud_meta::SnapshotRef { pieces: vec![], bytes: 0 };
-    assert!(matches!(meta.create_live_document(ana.space, doc, "document:wordcraft", node, &empty, NOW).await, Err(MetaError::Invalid(_))));
-    // A snapshot over a chunk's size is stored in pieces.
-    let big = snapshot(&vec![3; craft_cloud_meta::SNAPSHOT_PIECE_BYTES * 2 + 5]);
-    assert_eq!(big.pieces.len(), 3);
-    let other = file(meta, &ana, "big.txt").await;
-    meta.create_live_document(ana.space, node_doc(ana.space, other), "document:wordcraft", other, &big, NOW).await.unwrap();
+    // Of the right kind, and with a snapshot of a snapshot's size: up to the limit, not past it.
+    assert!(matches!(meta.create_live_document(ana.space, doc, "recents:wordcraft", node, &first.manifest, NOW).await, Err(MetaError::Invalid(_))));
+    let limit = craft_cloud_proto::live::MAX_SNAPSHOT_BYTES as u64;
+    let empty = snapshot(meta, &ana, 0).await.manifest;
+    let refused = meta.create_live_document(ana.space, node_doc(ana.space, other), "document:wordcraft", other, &empty, NOW).await;
+    assert!(matches!(refused, Err(MetaError::Invalid(_))), "an empty one: {refused:?}");
+    let over = snapshot(meta, &ana, limit + 1).await.manifest;
+    let refused = meta.create_live_document(ana.space, node_doc(ana.space, other), "document:wordcraft", other, &over, NOW).await;
+    assert!(matches!(refused, Err(MetaError::Invalid(_))), "one past the limit: {refused:?}");
+    let big = snapshot(meta, &ana, limit).await;
+    meta.create_live_document(ana.space, node_doc(ana.space, other), "document:wordcraft", other, &big.manifest, NOW).await.unwrap();
     assert_eq!(meta.live_snapshot(ana.space, node_doc(ana.space, other)).await.unwrap(), Some((0, big)));
 }
 
@@ -845,12 +873,16 @@ async fn concurrent_imports_of_one_file_keep_one(meta: &Meta) {
     let ana = user(meta, "ana").await;
     let node = file(meta, &ana, "a.txt").await;
     let doc = node_doc(ana.space, node);
-    let tasks: Vec<_> = (0..8u8)
-        .map(|i| {
+    let mut snapshots = Vec::new();
+    for i in 0..8u64 {
+        snapshots.push(snapshot(meta, &ana, 64 + i).await);
+    }
+    let tasks: Vec<_> = snapshots
+        .into_iter()
+        .map(|s| {
             let meta = meta.clone();
             tokio::spawn(async move {
-                let s = snapshot(&[i; 64]);
-                let (_, kept) = meta.create_live_document(ana.space, doc, "document:wordcraft", node, &s, NOW).await.unwrap();
+                let (_, kept) = meta.create_live_document(ana.space, doc, "document:wordcraft", node, &s.manifest, NOW).await.unwrap();
                 (kept, s)
             })
         })
@@ -880,23 +912,27 @@ async fn a_log_is_compacted_into_a_snapshot(meta: &Meta) {
     let repeat = meta.append_live_update_counted(ana.space, doc, dev, 2, &[2; 100], NOW).await.unwrap();
     assert_eq!((repeat.seq, repeat.repeat), (2, true));
     assert!(meta.append_live_update(ana.space, doc, dev, 6, &[6; 10], NOW).await.is_err(), "500 bytes: full");
-    let s = snapshot(&[9; 40]);
-    assert!(meta.compact_live_doc(ana.space, doc, 3, &s, NOW).await.unwrap());
+    let s = snapshot(&meta, &ana, 40).await;
+    assert!(meta.compact_live_doc(ana.space, doc, 3, &s.manifest).await.unwrap());
     let compacted = meta.live_doc(ana.space, doc).await.unwrap().unwrap();
     assert_eq!((compacted.base, compacted.above_base(), compacted.head, compacted.snapshot_bytes), (3, 200, 5, 40), "rows 1-3 no longer count");
     assert_eq!((compacted.bytes, compacted.compacted_bytes), (500, 300), "but stay in the log");
-    assert_eq!(meta.live_snapshot(ana.space, doc).await.unwrap(), Some((3, s.clone())));
+    assert_eq!(meta.live_snapshot(ana.space, doc).await.unwrap(), Some((3, s)));
     assert_eq!(meta.live_updates(ana.space, doc, 0, 10).await.unwrap().len(), 5, "the compacted rows are kept");
     // Older, equal or past the head: ignored.
+    let one = snapshot(&meta, &ana, 1).await.manifest;
     for (upto, why) in [(3, "equal"), (2, "older"), (6, "past the head"), (0, "nothing")] {
-        assert!(!meta.compact_live_doc(ana.space, doc, upto, &snapshot(&[1]), NOW).await.unwrap(), "{why}");
+        assert!(!meta.compact_live_doc(ana.space, doc, upto, &one).await.unwrap(), "{why}");
     }
+    // Only with a snapshot the space uploaded.
+    let refused = meta.compact_live_doc(ana.space, doc, 4, &ManifestId::from_bytes([9; 32])).await;
+    assert!(matches!(refused, Err(MetaError::NotFound(_))), "{refused:?}");
     assert_eq!(meta.live_snapshot(ana.space, doc).await.unwrap(), Some((3, s)), "unchanged");
     // Under the cap again: appends go on.
     assert_eq!(meta.append_live_update(ana.space, doc, dev, 6, &[6; 10], NOW).await.unwrap(), 6);
-    assert!(meta.compact_live_doc(ana.space, doc, 6, &snapshot(&[8; 50]), NOW).await.unwrap());
+    assert!(meta.compact_live_doc(ana.space, doc, 6, &snapshot(&meta, &ana, 50).await.manifest).await.unwrap());
     assert_eq!(meta.live_doc(ana.space, doc).await.unwrap().unwrap().above_base(), 0);
-    assert!(matches!(meta.compact_live_doc(ana.space, DocId::generate(), 1, &snapshot(&[1]), NOW).await, Err(MetaError::NotFound(_))));
+    assert!(matches!(meta.compact_live_doc(ana.space, DocId::generate(), 1, &one).await, Err(MetaError::NotFound(_))));
     // A reset empties the log and drops the snapshot.
     meta.reset_live_doc(ana.space, doc).await.unwrap();
     let reset = meta.live_doc(ana.space, doc).await.unwrap().unwrap();
@@ -913,11 +949,16 @@ async fn concurrent_compactions_take_one(meta: &Meta) {
     for i in 1..=10u64 {
         meta.append_live_update(ana.space, doc, dev, i, &[1; 10], NOW).await.unwrap();
     }
-    let tasks: Vec<_> = (0..6u8)
-        .map(|i| {
+    let mut snapshots = Vec::new();
+    for i in 0..6u64 {
+        snapshots.push((i, snapshot(meta, &ana, 8 + i).await.manifest));
+    }
+    let tasks: Vec<_> = snapshots
+        .into_iter()
+        .map(|(i, s)| {
             let meta = meta.clone();
-            let upto = 4 + u64::from(i % 2) * 4;
-            tokio::spawn(async move { (upto, meta.compact_live_doc(ana.space, doc, upto, &snapshot(&[i; 8]), NOW).await.unwrap()) })
+            let upto = 4 + (i % 2) * 4;
+            tokio::spawn(async move { (upto, meta.compact_live_doc(ana.space, doc, upto, &s).await.unwrap()) })
         })
         .collect();
     let mut taken = Vec::new();
@@ -934,46 +975,66 @@ async fn concurrent_compactions_take_one(meta: &Meta) {
     assert_eq!(after.bytes, 100);
 }
 
-async fn a_snapshot_over_the_storage_cap_changes_nothing(meta: &Meta) {
-    use craft_cloud_proto::live::node_doc;
-    let ana = user(meta, "ana").await;
-    let node = file(meta, &ana, "a.txt").await;
-    let used = meta.stored_bytes(ana.space).await.unwrap();
-    let meta = meta.clone().with_stored_bytes_cap(Some(used + 50));
-    let doc = node_doc(ana.space, node);
-    let refused = meta.create_live_document(ana.space, doc, "document:wordcraft", node, &snapshot(&[1; 100]), NOW).await;
-    assert!(matches!(refused, Err(MetaError::QuotaExceeded { .. })), "{refused:?}");
-    assert_eq!(meta.live_doc(ana.space, doc).await.unwrap(), None, "not made");
-    meta.create_live_document(ana.space, doc, "document:wordcraft", node, &snapshot(&[1; 10]), NOW).await.unwrap();
+/// Every row of every live document of a space, compacted ones too, counts towards its live bytes: over the cap, every
+/// append is refused (nothing stored), and a reset gives the document's bytes back.
+async fn a_space_s_live_bytes_are_capped(meta: &Meta) {
+    use craft_cloud_proto::DocId;
+    let meta = meta.clone().with_live_bytes_cap(250);
+    let ana = user(&meta, "ana").await;
+    let bo = user(&meta, "bo").await;
     let dev = device(&meta, &ana).await;
-    meta.append_live_update(ana.space, doc, dev, 1, b"x", NOW).await.unwrap();
-    let refused = meta.compact_live_doc(ana.space, doc, 1, &snapshot(&[2; 100]), NOW).await;
-    assert!(matches!(refused, Err(MetaError::QuotaExceeded { .. })), "{refused:?}");
-    let after = meta.live_doc(ana.space, doc).await.unwrap().unwrap();
-    assert_eq!((after.base, after.bytes, after.snapshot_bytes), (0, 1, 10), "nothing changed");
+    let (a, b) = (DocId::generate(), DocId::generate());
+    for doc in [a, b] {
+        meta.create_live_doc(ana.space, doc, "recents:wordcraft", None, NOW).await.unwrap();
+    }
+    meta.append_live_update(ana.space, a, dev, 1, &[1; 100], NOW).await.unwrap();
+    meta.append_live_update(ana.space, b, dev, 1, &[2; 100], NOW).await.unwrap();
+    // Compacting doesn't give bytes back: the rows are kept.
+    assert!(meta.compact_live_doc(ana.space, a, 1, &snapshot(&meta, &ana, 10).await.manifest).await.unwrap());
+    assert_eq!(meta.append_live_update(ana.space, a, dev, 2, &[3; 50], NOW).await.unwrap(), 2, "250: at the cap");
+    let refused = meta.append_live_update(ana.space, b, dev, 2, &[4; 1], NOW).await;
+    assert!(matches!(refused, Err(MetaError::LiveFull { used: 250, limit: 250 })), "{refused:?}");
+    assert_eq!(meta.live_doc(ana.space, b).await.unwrap().unwrap().head, 1, "nothing stored");
+    // A repeat of a stored update is still acked.
+    assert_eq!(meta.append_live_update(ana.space, a, dev, 2, &[3; 50], NOW).await.unwrap(), 2);
+    // Another account has room of its own.
+    let bo_dev = device(&meta, &bo).await;
+    let theirs = DocId::generate();
+    meta.create_live_doc(bo.space, theirs, "recents:wordcraft", None, NOW).await.unwrap();
+    assert_eq!(meta.append_live_update(bo.space, theirs, bo_dev, 1, &[5; 200], NOW).await.unwrap(), 1);
+    // A reset gives the document's bytes back.
+    meta.reset_live_doc(ana.space, a).await.unwrap();
+    assert_eq!(meta.append_live_update(ana.space, b, dev, 2, &[4; 100], NOW).await.unwrap(), 2);
 }
 
 async fn documents_of_files_have_caps_of_their_own(meta: &Meta) {
     use craft_cloud_proto::DocId;
     use craft_cloud_proto::live::node_doc;
-    let meta = meta.clone().with_live_docs_cap(1).with_live_doc_rows_cap(1).with_live_documents_cap(2);
+    let meta = meta.clone().with_live_docs_cap(1).with_live_doc_rows_cap(1).with_live_documents_cap(3).with_live_held_documents_cap(2);
     let ana = user(&meta, "ana").await;
     let dev = device(&meta, &ana).await;
     let recents = DocId::generate();
     meta.create_live_doc(ana.space, recents, "recents:wordcraft", None, NOW).await.unwrap();
     meta.append_live_update(ana.space, recents, dev, 1, b"x", NOW).await.unwrap();
     // Documents of files count neither as recents rows nor as recents holding updates.
+    let one = snapshot(&meta, &ana, 1).await.manifest;
     let mut docs = Vec::new();
-    for i in 0..2 {
+    for i in 0..3 {
         let node = file(&meta, &ana, &format!("f{i}.txt")).await;
         let doc = node_doc(ana.space, node);
-        meta.create_live_document(ana.space, doc, "document:wordcraft", node, &snapshot(&[1]), NOW).await.unwrap();
-        assert_eq!(meta.append_live_update(ana.space, doc, dev, 1, b"y", NOW).await.unwrap(), 1);
+        meta.create_live_document(ana.space, doc, "document:wordcraft", node, &one, NOW).await.unwrap();
         docs.push(doc);
     }
-    let third = file(&meta, &ana, "f2.txt").await;
-    let refused = meta.create_live_document(ana.space, node_doc(ana.space, third), "document:wordcraft", third, &snapshot(&[1]), NOW).await;
-    assert!(matches!(refused, Err(MetaError::TooManyDocRows { limit: 2 })), "{refused:?}");
+    // Holding updates: two may, the third's first update is refused (and a held one goes on).
+    for doc in &docs[..2] {
+        assert_eq!(meta.append_live_update(ana.space, *doc, dev, 1, b"y", NOW).await.unwrap(), 1);
+    }
+    let refused = meta.append_live_update(ana.space, docs[2], dev, 1, b"y", NOW).await;
+    assert!(matches!(refused, Err(MetaError::TooManyDocs { limit: 2 })), "{refused:?}");
+    assert_eq!(meta.append_live_update(ana.space, docs[0], dev, 2, b"z", NOW).await.unwrap(), 2);
+    let fourth = file(&meta, &ana, "f3.txt").await;
+    let refused = meta.create_live_document(ana.space, node_doc(ana.space, fourth), "document:wordcraft", fourth, &one, NOW).await;
+    assert!(matches!(refused, Err(MetaError::TooManyDocRows { limit: 3 })), "{refused:?}");
     assert!(matches!(
         meta.create_live_doc(ana.space, DocId::generate(), "recents:other", None, NOW).await,
         Err(MetaError::TooManyDocRows { limit: 1 })
@@ -988,12 +1049,12 @@ async fn the_import_stays_when_the_log_is_compacted(meta: &Meta) {
     let dev = device(meta, &ana).await;
     let node = file(meta, &ana, "a.txt").await;
     let doc = node_doc(ana.space, node);
-    let import = snapshot(&[1; 20]);
-    meta.create_live_document(ana.space, doc, "document:wordcraft", node, &import, NOW).await.unwrap();
-    assert_eq!(meta.live_import_snapshot(ana.space, doc).await.unwrap(), Some(import.clone()));
+    let import = snapshot(meta, &ana, 20).await;
+    meta.create_live_document(ana.space, doc, "document:wordcraft", node, &import.manifest, NOW).await.unwrap();
+    assert_eq!(meta.live_import_snapshot(ana.space, doc).await.unwrap(), Some(import));
     meta.append_live_update(ana.space, doc, dev, 1, b"x", NOW).await.unwrap();
-    let compacted = snapshot(&[2; 30]);
-    assert!(meta.compact_live_doc(ana.space, doc, 1, &compacted, NOW).await.unwrap());
+    let compacted = snapshot(meta, &ana, 30).await;
+    assert!(meta.compact_live_doc(ana.space, doc, 1, &compacted.manifest).await.unwrap());
     assert_eq!(meta.live_snapshot(ana.space, doc).await.unwrap(), Some((1, compacted)));
     assert_eq!(meta.live_import_snapshot(ana.space, doc).await.unwrap(), Some(import), "the import stays");
     meta.reset_live_doc(ana.space, doc).await.unwrap();
@@ -1013,7 +1074,7 @@ async fn a_compacted_log_still_holds_updates(meta: &Meta) {
         meta.create_live_doc(ana.space, doc, "recents:wordcraft", None, NOW).await.unwrap();
     }
     meta.append_live_update(ana.space, a, dev, 1, b"x", NOW).await.unwrap();
-    assert!(meta.compact_live_doc(ana.space, a, 1, &snapshot(&[1]), NOW).await.unwrap());
+    assert!(meta.compact_live_doc(ana.space, a, 1, &snapshot(&meta, &ana, 1).await.manifest).await.unwrap());
     assert_eq!(meta.live_doc(ana.space, a).await.unwrap().unwrap().above_base(), 0);
     assert!(matches!(meta.append_live_update(ana.space, b, dev, 1, b"y", NOW).await, Err(MetaError::TooManyDocs { limit: 1 })));
     assert_eq!(meta.append_live_update(ana.space, a, dev, 2, b"z", NOW).await.unwrap(), 2, "the compacted one goes on");
@@ -1589,6 +1650,8 @@ async fn upgrading_counts_what_each_space_already_stores() {
         use sqlx::Connection;
         let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
         sqlx::query("ALTER TABLE spaces DROP COLUMN stored_bytes").execute(&mut conn).await.unwrap();
+        // And before live documents of files.
+        sqlx::query("ALTER TABLE spaces DROP COLUMN live_bytes").execute(&mut conn).await.unwrap();
         // And before live documents.
         sqlx::query("DROP TABLE live_updates").execute(&mut conn).await.unwrap();
         sqlx::query("DROP TABLE live_docs").execute(&mut conn).await.unwrap();

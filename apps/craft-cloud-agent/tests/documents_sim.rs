@@ -67,7 +67,7 @@ fn up_text(frame: &ClientFrame) -> String {
         ClientFrame::Snapshot { upto, .. } => format!("snapshot upto {upto}"),
         ClientFrame::Presence { .. } => "presence".into(),
         ClientFrame::SubscribeLog { after, .. } => format!("subscribe the log after {after}"),
-        ClientFrame::CreateDocument { snapshot, .. } => format!("create document ({} bytes)", snapshot.len()),
+        ClientFrame::CreateDocument { snapshot, .. } => format!("create document (manifest {snapshot})"),
     }
 }
 
@@ -229,15 +229,18 @@ impl Sim {
         match self.rng.below(100) {
             0..=24 => self.edit(m),
             25..=44 => {
-                // One frame up.
+                // One frame up (the snapshot it may name goes up before it, as the hub sends it).
+                let api = self.w.blobs();
                 let machine = &mut self.w.machines[m];
-                if let (Some(conn), Some(frame)) = (machine.conn.as_mut(), machine.up.pop_front()) {
-                    let mut text = up_text(&frame);
-                    if self.trace
-                        && let ClientFrame::Snapshot { bytes, .. } = &frame
-                    {
-                        text.push_str(&format!(" {:?}", loro::LoroDoc::decode_import_blob_meta(bytes, true).map(|m| m.partial_end_vv)));
+                if let Some(replica) = machine.replica.as_mut()
+                    && machine.conn.is_some()
+                {
+                    for up in replica.take_uploads() {
+                        craft_cloud_agent::live::blobs::upload(&api, &up).await.unwrap();
                     }
+                }
+                if let (Some(conn), Some(frame)) = (machine.conn.as_mut(), machine.up.pop_front()) {
+                    let text = up_text(&frame);
                     let reply = conn.session.handle(frame).await;
                     machine.down.extend(reply.frames);
                     self.say(format!("m{m} up {text}"));
@@ -250,7 +253,18 @@ impl Sim {
                     let text = down_text(&frame);
                     self.last_down[m] = matches!(frame, ServerFrame::Update { .. } | ServerFrame::Ack { .. }).then(|| frame.clone());
                     match replica.on_frame(frame) {
-                        Ok(frames) => machine.up.extend(frames),
+                        Ok(frames) => {
+                            machine.up.extend(frames);
+                            // A snapshot a catch-up starts with is downloaded (as the hub does).
+                            for (doc, manifest) in replica.take_fetches() {
+                                let got = craft_cloud_agent::live::blobs::download(&self.w.blobs(), &manifest).await.map_err(|e| e.to_string());
+                                let machine = &mut self.w.machines[m];
+                                if let Some(replica) = machine.replica.as_mut() {
+                                    let frames = replica.on_snapshot(doc, manifest, got);
+                                    machine.up.extend(frames);
+                                }
+                            }
+                        }
                         Err(e) => {
                             self.say(format!("m{m} link ends: {e}"));
                             self.w.disconnect(m);

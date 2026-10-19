@@ -16,6 +16,8 @@ bytes.workspace = true
 clap.workspace = true
 # `recents`, and `login`/`logout` while `run` runs, are clients of the running agent like an app.
 craft-cloud-app.workspace = true
+# Live documents' snapshots go up as files' content does: cut into chunks.
+craft-cloud-chunker.workspace = true
 craft-cloud-proto.workspace = true
 craft-cloud-sync.workspace = true
 file-id.workspace = true
@@ -57,7 +59,6 @@ path = "src/main.rs"
 winresource.workspace = true
 
 [dev-dependencies]
-craft-cloud-chunker.workspace = true
 craft-cloud-meta = { workspace = true, features = ["test-support"] }
 craft-cloud-server = { workspace = true, features = ["test-support"] }
 craft-cloud-store.workspace = true
