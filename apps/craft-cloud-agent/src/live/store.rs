@@ -28,9 +28,9 @@ pub trait DocStore: Send {
 
     // (By default a store has none, and takes none: one for recents only.)
 
-    /// Every document of a file there is, by name.
-    fn load_documents(&self) -> io::Result<BTreeMap<String, Vec<u8>>> {
-        Ok(BTreeMap::new())
+    /// The names of every document of a file there is (each read with [`DocStore::load_document`], one at a time).
+    fn document_names(&self) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
     }
     /// One document of a file, if there is one.
     fn load_document(&self, _name: &str) -> io::Result<Option<Vec<u8>>> {
@@ -91,18 +91,6 @@ impl DiskStore {
         // (Interrupted writes of documents and of set-aside copies.)
         remove_atomic_temps(dir, |of| of.ends_with(SUFFIX) || of.ends_with(DOCUMENT_SUFFIX) || of.contains(ASIDE), std::time::Duration::ZERO)?;
         Ok(Self { dir: dir.to_owned() })
-    }
-
-    fn load_suffix(&self, suffix: &str) -> io::Result<BTreeMap<String, Vec<u8>>> {
-        let mut out = BTreeMap::new();
-        for entry in std::fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
-            if name.ends_with(suffix) && !name.starts_with('.') && entry.file_type()?.is_file() {
-                out.insert(name.trim_end_matches(suffix).to_owned(), std::fs::read(entry.path())?);
-            }
-        }
-        Ok(out)
     }
 
     fn set_aside_suffix(&mut self, name: &str, suffix: &str) -> io::Result<String> {
@@ -202,8 +190,20 @@ impl DocStore for DiskStore {
         Ok(())
     }
 
-    fn load_documents(&self) -> io::Result<BTreeMap<String, Vec<u8>>> {
-        self.load_suffix(DOCUMENT_SUFFIX)
+    fn document_names(&self) -> io::Result<Vec<String>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+            if let Some(doc) = name.strip_suffix(DOCUMENT_SUFFIX)
+                && !name.starts_with('.')
+                && entry.file_type()?.is_file()
+            {
+                out.push(doc.to_owned());
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     fn load_document(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
@@ -366,8 +366,8 @@ impl DocStore for MemStore {
         Ok(())
     }
 
-    fn load_documents(&self) -> io::Result<BTreeMap<String, Vec<u8>>> {
-        Ok(self.documents())
+    fn document_names(&self) -> io::Result<Vec<String>> {
+        Ok(self.documents().into_keys().collect())
     }
 
     fn load_document(&self, name: &str) -> io::Result<Option<Vec<u8>>> {

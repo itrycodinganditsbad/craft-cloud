@@ -16,11 +16,13 @@
 //!   had as soon as it is taken. Loro applies a waiting one when its history comes; the waiting ones are kept in the
 //!   file (Loro doesn't keep them in a snapshot) and imported again on load. An update Loro can't decode (or that made
 //!   it fail) has no operations anything can depend on: it counts as had, and is said once.
-//! - **Its own acks** may come before the updates of others numbered below them: such an ack is noted on the unacked
-//!   update, which stays unacked until the number is reached (then it counts as had). On every new connection those
-//!   notes are forgotten and the updates sent again: the server acks one it has with its number, and stores one a
-//!   restore lost. A gap in what the server sends otherwise (a frame lost on a connection given up on) is caught up by
-//!   subscribing again from the number it has.
+//! - **What the server holds is known by version, not by acks**: an unacked update all of whose operations are in the
+//!   rows taken (and the snapshot a catch-up started with) is stored, and leaves the unacked list, whatever its ack
+//!   does. Its own acks may come before the updates of others numbered below them: such an ack is kept (on the unacked
+//!   update, or beside it once the update is stored) until the number is reached, then it counts as had. On every new
+//!   connection those notes are forgotten and the updates sent again: the catch-up brings the rows themselves, the
+//!   server acks one it has with its number, and stores one a restore lost. A gap in what the server sends otherwise
+//!   (a frame lost on a connection given up on) is caught up by subscribing again from the number it has.
 //! - **A server restored from a backup, or a log the admin emptied**: the epoch is new (a reset starts one too), or
 //!   the update at `after` isn't the one this machine has there (`resync_required`), or `subscribed` names a head below
 //!   the number it has. The document starts over: its waiting updates go, it catches up from the start, and then sends
@@ -37,9 +39,11 @@
 //! - **Waiting updates are capped** at [`MAX_WAITING_BYTES`] per document: an update past it isn't taken, and the
 //!   document stops taking the server's updates until the next connection, said once (an honest log never comes near;
 //!   a device that does this is revoked, and the admin resets the document).
-//! - **Loro failing** on an update from the server: the document is read back from its file and that update skipped; on
-//!   a waiting update imported again: that one is dropped. A file that doesn't read is set aside (kept); its document
-//!   starts afresh from its unacked updates, which are kept and sent.
+//! - **Loro failing** on an update from the server: the document is read back from its file and that update skipped (a
+//!   catch-up's batch Loro fails on is taken again one row at a time, so only the row at fault is); on a waiting update
+//!   imported again: that one is dropped. A machine that dropped a row never compacts past it. A second failure in a
+//!   run stops the document until the agent restarts (its local changes are kept), and its apps are told. A file that
+//!   doesn't read is set aside (kept); its document starts afresh from its unacked updates, which are kept and sent.
 //! - A newer agent's update is taken like any other: once the document says it is of a newer version, this agent only
 //!   stops adding to it (the design's rule: an older agent is read-only on a newer document), and says why.
 //!
@@ -52,19 +56,23 @@
 //!   dropped and the document caught up from the start. The app hears it is live only once that is settled
 //!   ([`DocEvent::Joined`]). A document that isn't joined yet is never written to disk, so a file that has never been
 //!   live never opens offline from an empty copy. A joined document whose server lost it (`not_found`) is made again
-//!   from this machine's copy.
+//!   from this machine's copy. One the server holds nothing of (an admin reset it, and its machines haven't sent it
+//!   back) isn't joined: the app opens the file (`not_live {resetting}`).
 //! - **Local updates** ([`Replica::local_update`]) are imported into the copy with Loro's checked import (an update
 //!   Loro refuses leaves the copy as it was; one it fails on reads the document back from disk), appended to the
-//!   document's journal (durable) before the app is told, and sent. The document's file itself is written now and then
-//!   ([`Replica::flush_documents`]), not per keystroke; the journal is cleared after.
+//!   document's journal (durable) before the app is told, and sent at once (during a push too: the apps' peers are this
+//!   machine's own). The document's file itself is written now and then ([`Replica::flush_documents`]), not per
+//!   keystroke; the journal is cleared after. A journal append that fails is cut back and refused, and the document is
+//!   written whole before its journal takes another; a journal is read up to its first bad record, and cut there.
 //! - **Snapshots**: a catch-up from below the server's snapshot starts with it; one this agent can't read makes it
 //!   follow the whole log instead (`subscribe_log`). When the server asks to compact, the agent answers once it holds
 //!   every update up to `upto` and nothing waits, with a snapshot of exactly those updates ([`LogVersion`]), or not at
 //!   all (another device is asked).
 //! - **Presence** goes both ways as it is; remote updates and presence are handed to the apps ([`Replica::take_events`]).
-//! - **At most [`MAX_SUBSCRIPTIONS`] followed**: past that, the least recently used document no app has open and with
-//!   nothing to send is unfollowed (it stays on disk, and is followed again when opened). Documents loaded at start are
-//!   followed only if they have something to send.
+//! - **At most [`MAX_SUBSCRIPTIONS`] followed and [`MAX_LOADED_DOCUMENTS`] in memory**: past those, the least recently
+//!   used document no app has open and with nothing to send or waiting is unfollowed, and then written and let go of
+//!   (it stays on disk, and is loaded and followed again when opened). At start, only documents with something to send
+//!   or waiting are loaded (and followed).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -100,6 +108,9 @@ const PUSH_PATIENCE: u32 = 8;
 /// apps wrote a document of a file as (older ones count as others': they still go up, after a wait). A few per run, so
 /// without a cap the list would grow for good.
 const MAX_OWN_PEERS: usize = 64;
+/// Documents of files a replica keeps loaded (in memory) at most: past it, the least recently used one with nothing to
+/// send and no app holding it is written and let go of ([`Replica::unload`]), and loaded again when opened.
+pub const MAX_LOADED_DOCUMENTS: usize = 256;
 /// Heals of one document in a run after which its push stops (the same state fails the same way again).
 const MAX_HEALS: u32 = 2;
 /// The format of a document of a file's file (`.doc`).
@@ -1249,6 +1260,9 @@ pub struct Replica<S: DocStore> {
     one_by_one: BTreeSet<DocId>,
     /// Documents not followed for the rest of this run: Loro failed on a second row ([`Replica::is_stopped`]).
     stopped: BTreeSet<DocId>,
+    /// Documents of files on disk and not loaded: nothing to send, nothing waiting, no app holding them
+    /// ([`Replica::load`], [`Replica::unload`]).
+    unloaded: BTreeSet<DocId>,
     /// Documents let go of without dropping ([`Replica::forgotten`]).
     forgotten: usize,
     /// The live protocol `welcome` named (0 while the link isn't up).
@@ -1282,7 +1296,15 @@ impl<S: DocStore> Replica<S> {
                 docs.insert(id, doc);
             }
         }
-        for (name, bytes) in store.load_documents()? {
+        // Documents of files are loaded only when they have something to send or that waits; the rest stay on disk
+        // until an app opens one ([`Replica::open_document`]).
+        let mut unloaded = BTreeSet::new();
+        for name in store.document_names()? {
+            let Some(bytes) = store.load_document(&name)? else { continue };
+            if let Some(id) = idle_on_disk(&store, space, &name, &bytes) {
+                unloaded.insert(id);
+                continue;
+            }
             if let Some((id, mut doc)) = load_document(&mut store, space, &name, &bytes, peers(), None, &mut notes) {
                 // Followed again when an app opens it, or now if it has something to send.
                 doc.parked = doc.pending.is_empty() && doc.pushing.is_none();
@@ -1303,11 +1325,72 @@ impl<S: DocStore> Replica<S> {
             failures: BTreeMap::new(),
             one_by_one: BTreeSet::new(),
             stopped: BTreeSet::new(),
+            unloaded,
             forgotten: 0,
             protocol: 0,
             events: Vec::new(),
             uses: 0,
         })
+    }
+
+    /// Loads document `id` of a file from disk if it is there and not loaded. Whether it is loaded now.
+    fn load(&mut self, id: DocId) -> bool {
+        if self.docs.contains_key(&id) {
+            return true;
+        }
+        if !self.unloaded.remove(&id) {
+            return false;
+        }
+        let name = id.to_string();
+        let Ok(Some(bytes)) = self.store.load_document(&name) else { return false };
+        let peer = (self.peers)();
+        match load_document(&mut self.store, self.space, &name, &bytes, peer, None, &mut self.notes) {
+            Some((loaded, mut doc)) if loaded == id => {
+                doc.parked = true;
+                doc.stopped = self.stopped.contains(&id);
+                self.docs.insert(id, doc);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Past [`MAX_LOADED_DOCUMENTS`] documents of files in memory: the least recently used ones with nothing unacked or
+    /// waiting, no push under way and no app holding them are written (if changed) and let go of (unfollowed first);
+    /// they stay on disk, and are loaded again when opened. One that can't be written stays. Frames to send.
+    fn unload(&mut self) -> Vec<ClientFrame> {
+        let loaded = self.loaded_documents();
+        let Some(extra) = loaded.checked_sub(MAX_LOADED_DOCUMENTS).filter(|n| *n > 0) else { return Vec::new() };
+        let mut idle: Vec<(u64, DocId)> = self
+            .docs
+            .iter()
+            .filter(|(_, d)| {
+                d.kind.is_document()
+                    && d.joined
+                    && d.open == 0
+                    && d.pending.is_empty()
+                    && d.waiting.is_empty()
+                    && d.pushing.is_none()
+                    && !d.is_broken()
+                    && d.batch.is_empty()
+            })
+            .map(|(id, d)| (d.last_used, *id))
+            .collect();
+        idle.sort_unstable();
+        let mut frames = Vec::new();
+        let up = self.link == Link::Up;
+        for (_, id) in idle.into_iter().take(extra) {
+            let Some(doc) = self.docs.get_mut(&id) else { continue };
+            if (doc.dirty || !doc.on_disk) && save(&mut self.store, self.space, id, doc).is_err() {
+                continue;
+            }
+            if doc.sub != Sub::No && up {
+                frames.push(ClientFrame::Unsubscribe { doc: id });
+            }
+            self.docs.remove(&id);
+            self.unloaded.insert(id);
+        }
+        frames
     }
 
     fn doc_id(&self, app: &AppName) -> DocId {
@@ -1545,6 +1628,8 @@ impl<S: DocStore> Replica<S> {
         self.uses += 1;
         let (up, epoch, uses) = (self.link == Link::Up, self.epoch, self.uses);
         let documents = self.protocol >= LIVE_DOCUMENTS_PROTOCOL;
+        // One on disk is loaded now.
+        self.load(id);
         if let Some(doc) = self.docs.get_mut(&id) {
             doc.last_used = uses;
             if !doc.joined {
@@ -1552,7 +1637,10 @@ impl<S: DocStore> Replica<S> {
             }
             let was_parked = std::mem::replace(&mut doc.parked, false);
             // Room first (an unsubscribe before the subscribe that needs its slot).
-            let mut frames = if was_parked { self.evict() } else { Vec::new() };
+            let mut frames = self.unload();
+            if was_parked {
+                frames.extend(self.evict());
+            }
             let Some(doc) = self.docs.get_mut(&id) else { return (id, Opening::Live, frames) };
             if up && documents && doc.sub == Sub::No && doc.retry.is_none() {
                 frames.extend(subscribe(id, doc, epoch));
@@ -1575,7 +1663,8 @@ impl<S: DocStore> Replica<S> {
         let subscribe = doc.resubscribe(id);
         self.docs.insert(id, doc);
         // Room first (an unsubscribe before the subscribe that needs its slot).
-        let mut frames = self.evict();
+        let mut frames = self.unload();
+        frames.extend(self.evict());
         frames.extend(subscribe);
         (id, Opening::Joining, frames)
     }
@@ -1646,7 +1735,7 @@ impl<S: DocStore> Replica<S> {
 
     /// Whether a document of a file is live here (it opens offline).
     pub fn has_document(&self, id: DocId) -> bool {
-        self.docs.get(&id).is_some_and(|d| d.joined && d.kind.is_document())
+        self.unloaded.contains(&id) || self.docs.get(&id).is_some_and(|d| d.joined && d.kind.is_document())
     }
 
     /// The node a document of a file belongs to.
@@ -1793,6 +1882,11 @@ impl<S: DocStore> Replica<S> {
             }
         }
         frames
+    }
+
+    /// How many documents of files are loaded (in memory), for tests and the status.
+    pub fn loaded_documents(&self) -> usize {
+        self.docs.values().filter(|d| d.kind.is_document()).count()
     }
 
     /// Whether Loro failed on the document twice in this run: it isn't followed again until the agent restarts.
@@ -2529,6 +2623,17 @@ impl<S: DocStore> Replica<S> {
 /// The document a file holds (`None` for a file of another space, or one that doesn't read). A file that doesn't read
 /// is never deleted: it is set aside (renamed, kept). If its unacked updates can still be read (Loro fails on the
 /// snapshot), the document starts afresh from them and catches up from the start; they are kept and sent.
+/// The document of a file `bytes` hold, if it can stay on disk unloaded: of this space, and with nothing unacked (in
+/// the file or its journal), nothing waiting and no push under way. A file that doesn't read is loaded (and so set
+/// aside) as before.
+fn idle_on_disk<S: DocStore>(store: &S, space: SpaceId, name: &str, bytes: &[u8]) -> Option<DocId> {
+    let file = postcard::from_bytes::<DocumentFile>(bytes).ok()?;
+    let ours = file.format <= DOCUMENT_FILE_FORMAT && file.space == space && file.doc == node_doc(space, file.node) && file.doc.to_string() == name;
+    let idle = file.pending.is_empty() && file.waiting.is_empty() && file.pushing.is_none();
+    let journal = store.load_journal(name).ok()?;
+    (ours && idle && journal_records(&journal).0.is_empty()).then_some(file.doc)
+}
+
 /// `drop`: a waiting update to leave out (Loro failed on it).
 fn load_doc<S: DocStore>(
     store: &mut S,
@@ -3306,6 +3411,52 @@ mod tests {
             assert!(text.contains("<kept>"), "{how:?}: an acked change is lost: {text:?}");
             assert!(!text.contains("<refused>"), "{how:?}: a refused change came back: {text:?}");
         }
+    }
+
+    /// At start only documents with something unacked or waiting are loaded; the rest stay on disk until an app opens
+    /// one. Past [`MAX_LOADED_DOCUMENTS`] loaded, the least recently used one with nothing unacked or waiting and no app
+    /// holding it is unloaded (written first, so nothing is lost).
+    #[test]
+    fn documents_load_when_opened_and_unload_past_the_cap() {
+        let store = MemStore::default();
+        let space = SpaceId::generate();
+        let importer = text_doc(40);
+        insert(&importer, 0, "import");
+        let import = importer.export(loro::ExportMode::Snapshot).unwrap();
+        let nodes: Vec<NodeId> = (0..300).map(|_| NodeId::generate()).collect();
+        let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+        r.connected();
+        r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        let mut ids = Vec::new();
+        for node in &nodes {
+            let (id, _, _) = r.open_document(*node, &app());
+            r.on_frame(ServerFrame::Snapshot { doc: id, base: 0, bytes: import.clone() }).unwrap();
+            r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
+            ids.push(id);
+        }
+        assert!(r.loaded_documents() <= MAX_LOADED_DOCUMENTS, "{} loaded", r.loaded_documents());
+        // One with a change not yet acked.
+        let (_, opening, _) = r.open_document(nodes[0], &app());
+        assert_eq!(opening, Opening::Live);
+        let d = text_doc(50);
+        d.import(&import).unwrap();
+        r.local_update(ids[0], &insert(&d, 0, "<unacked>")).unwrap();
+        r.flush_documents().unwrap();
+        drop(r);
+        let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+        assert_eq!(r.loaded_documents(), 1, "only the one with something to send");
+        r.connected();
+        r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        let (_, opening, frames) = r.open_document(nodes[7], &app());
+        assert_eq!(opening, Opening::Live, "loaded when opened, from disk");
+        assert!(frames.iter().any(|f| matches!(f, ClientFrame::Subscribe { doc, .. } if *doc == ids[7])), "{frames:?}");
+        assert_eq!(r.loaded_documents(), 2);
+        assert!(text_of(&r, ids[7]).contains("import"));
+        for node in &nodes {
+            assert_eq!(r.open_document(*node, &app()).1, Opening::Live);
+        }
+        assert!(r.loaded_documents() <= MAX_LOADED_DOCUMENTS, "{} loaded", r.loaded_documents());
+        assert!(text_of(&r, ids[0]).contains("<unacked>"), "the one with a change waiting stays");
     }
 
     /// A machine with no copy of a document the server has but holds nothing of (an empty log, no snapshot: an admin

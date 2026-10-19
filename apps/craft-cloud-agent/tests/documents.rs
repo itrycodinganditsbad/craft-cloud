@@ -473,8 +473,10 @@ fn past_the_cap_the_least_recently_used_document_is_unfollowed() {
         assert_eq!(w.text(a, docs[0]), "d0");
         let (online, _) = w.machines[a].replica().document_status(docs[0]).unwrap();
         assert!(online, "followed again");
-        let (online, _) = w.machines[a].replica().document_status(docs[1]).unwrap();
-        assert!(!online, "the next least recent went instead");
+        // (Unloaded too: past the cap on documents in memory as well.)
+        let followed = w.machines[a].replica().document_status(docs[1]).is_some_and(|(online, _)| online);
+        assert!(!followed, "the next least recent went instead");
+        assert!(w.machines[a].replica().loaded_documents() <= craft_cloud_agent::live::replica::MAX_LOADED_DOCUMENTS);
     });
 }
 
