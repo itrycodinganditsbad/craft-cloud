@@ -63,6 +63,8 @@ pub struct Places {
     pub uninstall_key: String,
     /// The agent's data folder, where a running agent's `local-api.json` names its pid, port and token.
     pub agent_data: PathBuf,
+    /// How long a file still held by a program that is ending is tried again for.
+    pub patience: std::time::Duration,
 }
 
 impl Places {
@@ -77,6 +79,7 @@ impl Places {
             run_key: RUN_KEY.to_owned(),
             uninstall_key: UNINSTALL_KEY.to_owned(),
             agent_data,
+            patience: std::time::Duration::from_secs(10),
         })
     }
 
@@ -287,22 +290,22 @@ pub fn uninstall(places: &Places, registry: &dyn Registry, machine: &dyn Machine
     if shortcut.exists() {
         std::fs::remove_file(&shortcut).map_err(io(&shortcut))?;
     }
-    registry.remove_key(&places.uninstall_key)?;
-    if !dir.exists() {
-        return Ok(());
-    }
-    let running_inside = running.parent().is_some_and(|p| same_path(p, &dir));
-    if running_inside {
-        for entry in std::fs::read_dir(&dir).map_err(io(&dir))? {
-            let path = entry.map_err(io(&dir))?.path();
-            if !same_path(&path, running) {
-                remove_path(&path)?;
+    // The files before the "Apps & features" entry: if one can't go, the entry stays, to run it again.
+    if dir.exists() {
+        let running_inside = running.parent().is_some_and(|p| same_path(p, &dir));
+        if running_inside {
+            for entry in std::fs::read_dir(&dir).map_err(io(&dir))? {
+                let path = entry.map_err(io(&dir))?.path();
+                if !same_path(&path, running) {
+                    remove_patiently(&path, places.patience)?;
+                }
             }
+            machine.remove_after_exit(&dir)?;
+        } else {
+            remove_patiently(&dir, places.patience)?;
         }
-        machine.remove_after_exit(&dir)
-    } else {
-        std::fs::remove_dir_all(&dir).map_err(io(&dir))
     }
+    registry.remove_key(&places.uninstall_key)
 }
 
 /// What is said when the agent can't be stopped: nothing was changed.
@@ -362,6 +365,19 @@ pub fn ask_to_quit(file: &AgentFile) -> Result<(), String> {
     let n = stream.read(&mut head).map_err(|e| e.to_string())?;
     let line = String::from_utf8_lossy(head.get(..n).unwrap_or_default()).into_owned();
     if line.starts_with("HTTP/1.1 200") { Ok(()) } else { Err(format!("it answered {}", line.lines().next().unwrap_or_default())) }
+}
+
+/// Removes `path` (a file or a folder), trying again for up to `patience` while it fails: a program that has just
+/// been stopped may still hold its exe for a moment.
+pub fn remove_patiently(path: &Path, patience: std::time::Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + patience;
+    loop {
+        match remove_path(path) {
+            Ok(()) => return Ok(()),
+            Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => return Err(format!("{e} (is it still running?)")),
+        }
+    }
 }
 
 fn remove_path(path: &Path) -> Result<(), String> {

@@ -87,6 +87,7 @@ fn user(keys: &str) -> User {
         run_key: format!(r"{keys}\Run"),
         uninstall_key: format!(r"{keys}\Uninstall\CraftCloud"),
         agent_data: data.clone(),
+        patience: std::time::Duration::from_millis(300),
     };
     let synced = root.path().join("Craft Cloud");
     for dir in [&data, &synced] {
@@ -293,6 +294,46 @@ fn a_running_agents_file_is_read_and_it_is_asked_to_quit() {
     let request = agent.join().unwrap();
     assert!(request.starts_with("POST /v1/quit HTTP/1.1\r\n"), "{request}");
     assert!(request.contains(&format!("Host: 127.0.0.1:{port}\r\n")) && request.contains("Authorization: Bearer a1b2c3\r\n"), "{request}");
+}
+
+/// Files that can't be removed (still held by a program that is ending): tried again for a while; if they still
+/// can't, the uninstall fails with the "Apps & features" entry still there, so it can be run again.
+#[cfg(unix)]
+#[test]
+fn files_that_cant_be_removed_leave_the_uninstall_entry() {
+    use std::os::unix::fs::PermissionsExt;
+    let u = user("Test");
+    let registry = MemoryRegistry::default();
+    install(&u.places, &registry, &Recorder::default(), V2, &u.setup, &options(false)).unwrap();
+    let dir = u.places.dir();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let removed = uninstall(&u.places, &registry, &Recorder::default(), &u.setup);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(removed.is_err());
+    assert_eq!(registry.get(&u.places.uninstall_key, "DisplayName").as_deref(), Some("Craft Cloud"), "removed last");
+    // Once they can be removed, running it again finishes.
+    uninstall(&u.places, &registry, &Recorder::default(), &u.setup).unwrap();
+    assert!(!dir.exists() && registry.get(&u.places.uninstall_key, "DisplayName").is_none());
+}
+
+/// A file that is held for a moment (a program ending) is removed once it is free.
+#[cfg(unix)]
+#[test]
+fn a_file_held_for_a_moment_is_removed_once_free() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let held = dir.path().join("held");
+    std::fs::create_dir(&held).unwrap();
+    std::fs::write(held.join("craft-cloud.exe"), "x").unwrap();
+    std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let freed = held.clone();
+    let freeing = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::fs::set_permissions(&freed, std::fs::Permissions::from_mode(0o700)).unwrap();
+    });
+    remove_patiently(&held.join("craft-cloud.exe"), std::time::Duration::from_secs(10)).unwrap();
+    freeing.join().unwrap();
+    assert!(!held.join("craft-cloud.exe").exists());
 }
 
 #[test]
