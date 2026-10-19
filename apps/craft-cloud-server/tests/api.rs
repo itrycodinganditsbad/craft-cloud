@@ -173,6 +173,7 @@ on_every_backend!(
     live_updates_fan_out_to_the_accounts_other_devices,
     live_catch_up_after_a_gap,
     live_a_revoked_device_is_cut_off,
+    live_documents_carry_snapshots_and_presence,
     pairings_are_made_polled_and_cancelled,
     a_pairing_code_signs_a_new_computer_in,
     wrong_expired_and_used_codes_get_the_same_answer,
@@ -1191,6 +1192,32 @@ async fn live_needs_a_device_token(s: &Server) {
     }
     assert_eq!(open_live(s, Some(&token)).await.err(), Some(StatusCode::TOO_MANY_REQUESTS));
     drop(held);
+}
+
+/// Over a real WebSocket: a document of a file made by import with a snapshot bigger than an update may be, kept once,
+/// sent whole to another device catching up, and presence relayed between them.
+async fn live_documents_carry_snapshots_and_presence(s: &Server) {
+    add_user(s, "ana").await;
+    let (pc_token, laptop_token) = (login(s, "ana").await, login(s, "ana").await);
+    let m = upload(s, &pc_token, b"the file's bytes").await;
+    let node = NodeId::generate();
+    let r = root(s, &pc_token).await;
+    assert_eq!(commit(s, &pc_token, &[create(node, r, "doc1.txt", m)]).await.status(), StatusCode::OK);
+    let doc = craft_cloud_proto::live::node_doc(space_of(s, &pc_token).await.space, node);
+    let mut pc = live_ready(s, &pc_token).await;
+    let mut laptop = live_ready(s, &laptop_token).await;
+    let snapshot: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let app = AppName::new("wordcraft").unwrap();
+    live_send(&mut pc, ClientFrame::CreateDocument { doc, node, app: app.clone(), snapshot: snapshot.clone() }).await;
+    assert_eq!(live_next(&mut pc).await, Some(ServerFrame::CreatedDocument { doc, kept: true }));
+    live_send(&mut laptop, ClientFrame::CreateDocument { doc, node, app, snapshot: vec![1; 10] }).await;
+    assert_eq!(live_next(&mut laptop).await, Some(ServerFrame::CreatedDocument { doc, kept: false }));
+    let frames = live_subscribe(&mut laptop, doc, 0).await;
+    assert_eq!(frames, vec![ServerFrame::Snapshot { doc, base: 0, bytes: snapshot }, ServerFrame::Subscribed { doc, head: 0 }]);
+    live_subscribe(&mut pc, doc, 0).await;
+    live_send(&mut pc, ClientFrame::Presence { doc, bytes: b"cursor at 7".to_vec() }).await;
+    assert_eq!(live_next(&mut laptop).await, Some(ServerFrame::Presence { doc, bytes: b"cursor at 7".to_vec() }));
+    live_quiet(&mut pc).await;
 }
 
 async fn live_hello_checks_the_version(s: &Server) {
