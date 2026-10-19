@@ -313,7 +313,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 }
                 // Both saved by Craft apps from the file's live document: no conflict copy (see `SaveRecords`).
                 if let Some(file) = &remote.file
-                    && let Some(winner) = self.live_winner(id, file, &bpath)
+                    && let Some((winner, checked)) = self.live_winner(id, file, &bpath)?
                 {
                     if moved {
                         self.settle_occupants(id, &rpath, Some(&bpath), None, report).await?;
@@ -321,10 +321,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     }
                     match winner {
                         LiveWinner::Server => {
-                            // Its record includes ours: everything here is in it. Replaces exactly what is here (a
-                            // save meanwhile keeps the old base, and the next pass decides again).
-                            let here = self.stat(&rpath)?;
-                            if let Some((meta, hash)) = self.download(id, file, &rpath, here, report).await? {
+                            // Its record includes ours: everything here is in it. Replaces exactly what was hashed,
+                            // stat'ed before the hash (a rename keeps the file's ID and time); a save that landed since
+                            // keeps the old base, and the next pass decides again.
+                            if let Some((meta, hash)) = self.download(id, file, &rpath, checked, report).await? {
                                 new_entry.kind = self.base_file(file, meta, hash);
                             }
                         }
@@ -1036,14 +1036,17 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// Whether the file at `at` holds exactly the content the base recorded (hashed; an unreadable file doesn't).
     /// Which side wins when `id`'s file changed here and on the server and both versions carry save records of one
     /// live document; `None` when either lacks one (a conflict, as always).
-    fn live_winner(&self, id: NodeId, file: &FileState, at: &RelPath) -> Option<LiveWinner> {
-        let theirs = file.save.as_ref()?;
-        let hash = self.content_hash(at)?;
-        let ours = self.save_record(id, &hash)?;
+    /// With what the file looked like before it was hashed: a download may only replace exactly that (a save that
+    /// lands after the hash keeps the old base, and the next pass decides again, by its own record or as a conflict).
+    fn live_winner(&self, id: NodeId, file: &FileState, at: &RelPath) -> Result<Option<(LiveWinner, Option<FsKind>)>, SyncError> {
+        let Some(theirs) = file.save.as_ref() else { return Ok(None) };
+        let checked = self.stat(at)?;
+        let Some(hash) = self.content_hash(at) else { return Ok(None) };
+        let Some(ours) = self.save_record(id, &hash) else { return Ok(None) };
         if ours.doc != theirs.doc {
-            return None;
+            return Ok(None);
         }
-        Some(if theirs.includes(&ours) { LiveWinner::Server } else { LiveWinner::Here })
+        Ok(Some((if theirs.includes(&ours) { LiveWinner::Server } else { LiveWinner::Here }, checked)))
     }
 
     fn holds_base_content(&self, entry: &BaseEntry, at: &RelPath) -> bool {

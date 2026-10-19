@@ -140,3 +140,46 @@ async fn saves_of_different_documents_are_a_conflict() {
     rounds(&mut a, &mut b).await;
     assert_eq!(files(&a).len(), 2, "{:?}", files(&a));
 }
+
+/// The server's save includes the laptop's, so the laptop's file is to be replaced; but another program saves the
+/// file while the engine reads it (at each of its reads in turn). That save is never replaced unseen: it ends as a
+/// file on both machines (a conflict copy, having no record).
+#[tokio::test]
+async fn a_save_landing_while_the_server_wins_is_kept() {
+    use common::{SaveDuring, SaveOn, machine_on};
+    for n in 1..=5 {
+        let server = Server::new().await;
+        let ana = server.user("ana").await;
+        let mut a = machine_on(&server, &ana, "laptop", SaveDuring::default(), 50, |_| {}).await;
+        let mut b = machine(&server, &ana, "desktop").await;
+        let (book_a, book_b) = (Book::default(), Book::default());
+        a.set_save_records(Arc::new(book_a.clone()));
+        b.set_save_records(Arc::new(book_b.clone()));
+        a.fs().write(&path("doc.kitdemo"), b"v1");
+        a.sync_once().await.unwrap();
+        b.sync_once().await.unwrap();
+        let doc = DocId::generate();
+        // The laptop's save, and the desktop's later one that includes it.
+        let laptop = b"laptop's save".to_vec();
+        a.fs().write(&path("doc.kitdemo"), &laptop);
+        let at = a.state().base.keys().copied().find(|id| a.state().base_path(*id).as_ref() == Some(&path("doc.kitdemo"))).unwrap();
+        book_a.0.lock().unwrap().insert((at, FileHash::from_bytes(*blake3::hash(&laptop).as_bytes())), SaveRecord { doc, version: vec![(1, 5)] });
+        book_b.save(&mut b, "doc.kitdemo", b"desktop's later save", doc, &[(1, 5), (2, 3)]);
+        b.sync_once().await.unwrap();
+        a.fs().arm(path("doc.kitdemo"), b"another program's save, meanwhile", SaveOn::Open(n));
+        for _ in 0..5 {
+            a.sync_once().await.unwrap();
+            b.sync_once().await.unwrap();
+        }
+        let on_a: Vec<Vec<u8>> = a.fs().files().into_values().collect();
+        let on_b: Vec<Vec<u8>> = b.fs().files().into_values().collect();
+        if a.fs().fired() {
+            for files in [&on_a, &on_b] {
+                assert!(files.iter().any(|d| d == b"another program's save, meanwhile"), "read {n}: {files:?}");
+            }
+        }
+        // (A save landing after the download replaced the file is an ordinary later edit: it goes up over the
+        // desktop's version, which stays in the server's history.)
+        assert_eq!(on_a.len(), on_b.len(), "read {n}");
+    }
+}
