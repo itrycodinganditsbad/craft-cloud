@@ -330,16 +330,31 @@ fn restarted_after(places: &Places, registry: &dyn Registry, machine: &dyn Machi
 /// Removes the install at `places`; `running` is this setup's own exe (in the program folder when started from
 /// "Apps & features": then the folder goes once this process has ended).
 pub fn uninstall(places: &Places, registry: &dyn Registry, machine: &dyn Machine, running: &Path) -> Result<(), String> {
-    let dir = places.dir();
     machine.close_app();
-    match machine.stop_agent(&places.agent_data) {
-        AgentStop::NotRunning | AgentStop::Stopped => {}
+    let was_running = match machine.stop_agent(&places.agent_data) {
+        AgentStop::NotRunning => false,
+        AgentStop::Stopped => true,
         AgentStop::StillRunning(why) => return Err(still_running(&why)),
         AgentStop::Unknown(why) => return Err(restarted_after(places, registry, machine, &unknown_stop(&why))),
-    }
+    };
+    let mut removed_values = Vec::new();
+    uninstall_stopped(places, registry, machine, running, &mut removed_values)
+        .map_err(|e| put_back(places, registry, machine, was_running, &removed_values, &e))
+}
+
+/// The uninstall's changes once nothing runs; the `Run` values it removed (name, value) go into `removed_values`.
+fn uninstall_stopped(
+    places: &Places,
+    registry: &dyn Registry,
+    machine: &dyn Machine,
+    running: &Path,
+    removed_values: &mut Vec<(&'static str, String)>,
+) -> Result<(), String> {
+    let dir = places.dir();
     for value in [AGENT_RUN_VALUE, APP_RUN_VALUE] {
-        if registry.get(&places.run_key, value).as_deref().is_some_and(|v| starts_from(v, &dir)) {
+        if let Some(v) = registry.get(&places.run_key, value).filter(|v| starts_from(v, &dir)) {
             registry.remove_value(&places.run_key, value)?;
+            removed_values.push((value, v));
         }
     }
     let shortcut = places.shortcut();
@@ -364,6 +379,30 @@ pub fn uninstall(places: &Places, registry: &dyn Registry, machine: &dyn Machine
     registry.remove_key(&places.uninstall_key)?;
     remove_app_files(&places.app_files);
     Ok(())
+}
+
+/// The uninstall failed (`failure`) after the agent was stopped and maybe its start at login removed: while the
+/// agent's program is still there, its `Run` values are put back and, if it ran, it is started again, so this
+/// computer keeps syncing until the uninstall is run again. What is said.
+fn put_back(
+    places: &Places,
+    registry: &dyn Registry,
+    machine: &dyn Machine,
+    was_running: bool,
+    removed_values: &[(&'static str, String)],
+    failure: &str,
+) -> String {
+    if !places.dir().join(AGENT_BG_EXE).is_file() {
+        return format!("{failure}. Run the uninstall again to finish it.");
+    }
+    for (name, value) in removed_values {
+        let _ = registry.set_string(&places.run_key, name, value);
+    }
+    if was_running {
+        format!("{} Start at login was put back.", restarted_after(places, registry, machine, failure))
+    } else {
+        format!("{failure}. Start at login was put back.")
+    }
 }
 
 /// The app's single-instance files in `app_files`, the folder itself once empty, and the loose ones older versions

@@ -196,6 +196,33 @@ fn an_install_that_fails_after_the_stop_starts_the_agent_again() {
     assert_eq!(machine.asked(), ["close app", "stop agent"]);
 }
 
+/// An uninstall that fails after the agent was stopped and its start at login removed (here the shortcut can't be
+/// removed): the Run values are put back and the agent is started again; without a running agent, only put back.
+#[test]
+fn an_uninstall_that_fails_after_the_stop_puts_the_agent_back() {
+    let u = user("Test");
+    let registry = MemoryRegistry::default();
+    install(&u.places, &registry, &Recorder::default(), V2, &u.setup, &options(false)).unwrap();
+    let value = format!("\"{}\" run --log", u.places.dir().join(AGENT_BG_EXE).display());
+    registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, &value).unwrap();
+    let before = registry.values.lock().unwrap().clone();
+    // A "shortcut" that is a folder with something in it: removing it fails.
+    std::fs::create_dir_all(u.places.shortcut().join("x")).unwrap();
+
+    let machine = Recorder::default();
+    *machine.running.lock().unwrap() = true;
+    let e = uninstall(&u.places, &registry, &machine, &u.setup).unwrap_err();
+    assert!(e.contains("The agent was started again.") && e.ends_with("Start at login was put back."), "{e}");
+    assert_eq!(machine.asked(), ["close app", "stop agent", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
+    assert_eq!(*registry.values.lock().unwrap(), before, "the Run value is back, the entry stays");
+
+    let machine = Recorder::default();
+    let e = uninstall(&u.places, &registry, &machine, &u.setup).unwrap_err();
+    assert!(e.ends_with("Start at login was put back.") && !e.contains("started again"), "{e}");
+    assert_eq!(machine.asked(), ["close app", "stop agent"]);
+    assert_eq!(*registry.values.lock().unwrap(), before);
+}
+
 /// The agent accepts the quit, then tasklist fails: the install and the uninstall stop with nothing else changed,
 /// and the agent (which may be stopping) is started again from the folder its start at login names.
 #[test]
