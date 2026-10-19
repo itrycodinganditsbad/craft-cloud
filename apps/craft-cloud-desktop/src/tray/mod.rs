@@ -1,13 +1,18 @@
 //! The tray icon, where the desktop has a tray: synced, syncing, offline, needs attention or paused (from the 2 s
 //! status poll), with Open, Open folder, Pause or Resume, and Quit. `tray-icon` on Windows and macOS
-//! ([`windows_macos`]); a StatusNotifierItem over the session D-Bus on Linux ([`linux`]), only when a
-//! `org.kde.StatusNotifierWatcher` is there (waybar's tray, KDE, GNOME with the extension). Without a tray the window
-//! is the only way in, and closing it ends the app (see [`crate::model`]).
+//! ([`windows_macos`]), in the window's process, where closing the window hides it into the tray. On Linux a
+//! StatusNotifierItem over the session D-Bus ([`linux`]) in a process of its own, `craft-cloud --tray`
+//! ([`process`]): Wayland can't hide a window, so there the window is a normal process that ends when closed, and the
+//! tray process starts it (Open). The item registers with an `org.kde.StatusNotifierWatcher` (waybar's tray, KDE,
+//! GNOME with the extension) whenever one is there.
 //!
-//! The menu's clicks come to the model as events on the outside channel; the icon follows [`state_of`] the status.
+//! In the window's process the menu's clicks come to the model as events on the outside channel; the icon follows
+//! [`state_of`] the status.
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "linux")]
+pub mod process;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub mod windows_macos;
 
@@ -129,13 +134,12 @@ impl Clicks {
     }
 }
 
-/// The tray icon, if this desktop has a tray (and it could be made); `None` otherwise, said on standard error.
+/// The window process's tray icon, where the tray lives in it (Windows, macOS) and could be made; `None` otherwise
+/// (Linux, whose tray is a process of its own: [`process`]), said on standard error when it fails.
 pub fn start(clicks: Clicks) -> Option<Box<dyn Tray>> {
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     let made = windows_macos::start(clicks).map(|tray| Some(Box::new(tray) as Box<dyn Tray>));
-    #[cfg(target_os = "linux")]
-    let made = linux::start(clicks).map(|tray| tray.map(|tray| Box::new(tray) as Box<dyn Tray>));
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let made: Result<Option<Box<dyn Tray>>, String> = {
         let _ = clicks;
         Ok(None)

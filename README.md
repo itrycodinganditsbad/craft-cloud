@@ -173,9 +173,11 @@ or a code from a computer that is signed in (Add a computer there). Then this co
 at every login. A computer that was signed in before (with `login`) shows its account at once.
 
 The tray icon says whether everything is synced, syncing, offline, paused or needs you, and has Open, Open
-folder, Pause and Quit (which stops syncing until the next login). Closing the window leaves it in the tray. On
-Linux the tray needs a StatusNotifierItem host (waybar's tray, KDE, GNOME with the AppIndicator extension);
-without one, closing the window ends the app, and the agent keeps syncing.
+folder, Pause and Quit (which stops syncing until the next login). On Windows and macOS, closing the window leaves
+it in the tray. On Linux the tray icon is a small process of its own (`craft-cloud --tray`, what starts at login),
+because Wayland can't hide a window: closing the window ends it, and the tray's Open brings it back. The icon needs a
+StatusNotifierItem host (waybar's tray, KDE, GNOME with the AppIndicator extension), and appears whenever one is
+there; without one the window is the way in, and the agent keeps syncing either way.
 
 ## Running the server
 

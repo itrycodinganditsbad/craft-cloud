@@ -244,6 +244,8 @@ pub enum Event {
     Show,
     /// The window's close button.
     CloseRequested,
+    /// Linux: the tray process quit Craft Cloud (it stopped the agent): the window ends too.
+    Exit,
 }
 
 /// What to do.
@@ -267,6 +269,8 @@ pub enum Effect {
     Pause,
     Resume,
     QuitAgent,
+    /// Linux: end the tray process too (Quit); nothing elsewhere, where the tray is this process's.
+    QuitTray,
     /// Ask for a folder with the OS's folder picker, starting at this one ([`Event::FolderPicked`]).
     PickFolder(String),
     /// Open the synced folder in the file manager.
@@ -277,11 +281,12 @@ pub enum Effect {
     AppAutostart(bool),
 }
 
-/// Whether the app should start at login, hidden in the tray, given the agent's status: while signed in with the
-/// agent starting at login, and only where there is a tray to start into. `None` while the agent doesn't say (an
-/// agent that doesn't handle start at login): the entry is left as it is.
-pub fn app_autostart_wanted(status: &Status, tray: bool) -> Option<bool> {
-    status.autostart.map(|on| on && status.signed_in && tray)
+/// Whether the app should start at login, in the tray, given the agent's status: while signed in with the agent
+/// starting at login, where the app has a login entry to start into (`entry`: Windows and macOS with a tray icon;
+/// Linux always, its entry being the tray process, which waits for a tray to appear). `None` while the agent doesn't
+/// say (an agent that doesn't handle start at login): the entry is left as it is.
+pub fn app_autostart_wanted(status: &Status, entry: bool) -> Option<bool> {
+    status.autostart.map(|on| on && status.signed_in && entry)
 }
 
 /// The app's state.
@@ -292,8 +297,12 @@ pub struct Model {
     pub status: Option<Status>,
     /// The time of the last tick.
     pub now_ms: i64,
-    /// Whether there is a tray icon (else closing the window quits the app).
+    /// Whether the window hides into a tray icon of this process when closed (else closing it ends this process; the
+    /// agent keeps syncing). Windows and macOS with a tray; never on Linux, whose tray is a process of its own.
     pub tray: bool,
+    /// Whether the app has a start-at-login entry ([`app_autostart_wanted`]); the same as `tray` but on Linux, where
+    /// it is the tray process's, written whether or not a tray is there right now.
+    pub login_entry: bool,
     /// Whether the window is shown.
     pub window_visible: bool,
     /// Start at login couldn't be turned on: said until it is, with Try again.
@@ -319,6 +328,7 @@ impl Model {
             status: None,
             now_ms: 0,
             tray,
+            login_entry: tray,
             window_visible: true,
             autostart_problem: None,
             busy: None,
@@ -500,8 +510,9 @@ impl Model {
                     return Vec::new();
                 }
                 self.busy = Some(Busy::Quitting);
-                vec![Effect::QuitAgent]
+                vec![Effect::QuitTray, Effect::QuitAgent]
             }
+            Event::Exit => vec![Effect::QuitApp],
             Event::TryAgain => {
                 if !matches!(self.screen, Screen::NotRunning(_)) {
                     return Vec::new();
@@ -578,7 +589,7 @@ impl Model {
     fn status_came(&mut self, status: Status) -> Vec<Effect> {
         let mut effects = Vec::new();
         self.status = Some(status.clone());
-        if let Some(wanted) = app_autostart_wanted(&status, self.tray)
+        if let Some(wanted) = app_autostart_wanted(&status, self.login_entry)
             && self.app_autostart != Some(wanted)
         {
             self.app_autostart = Some(wanted);
@@ -1248,7 +1259,7 @@ pub(crate) mod tests {
         assert!(!m.window_visible);
         m.update(Event::Show);
         assert!(m.window_visible);
-        assert_eq!(m.update(Event::Quit), vec![Effect::QuitAgent]);
+        assert_eq!(m.update(Event::Quit), vec![Effect::QuitTray, Effect::QuitAgent], "the tray process too, on Linux");
         assert!(m.update(Event::Quit).is_empty());
         // The agent stopping isn't taken for a problem.
         m.update(Event::Polled(Err(Error::NotRunning("gone".into()))));
@@ -1268,6 +1279,22 @@ pub(crate) mod tests {
         assert!(!effects.contains(&Effect::AppAutostart(true)));
         assert_eq!(m.update(Event::CloseRequested), vec![Effect::QuitApp]);
         assert!(m.window_visible);
+    }
+
+    /// Linux: the window is a process of its own (Wayland can't hide a window), so closing it ends it; the login entry
+    /// is the tray process's, written whether or not a tray is there now; the tray process's Quit ends the window.
+    #[test]
+    fn on_linux_the_window_ends_when_closed_and_the_tray_process_has_the_login_entry() {
+        let mut m = Model::new(defaults(), false, String::new());
+        m.login_entry = true;
+        m.update(Event::Start);
+        let effects = m.update(Event::Found(Ok(status(true))));
+        assert!(effects.contains(&Effect::AppAutostart(true)), "{effects:?}");
+        assert_eq!(m.update(Event::CloseRequested), vec![Effect::QuitApp]);
+        assert_eq!(m.update(Event::Exit), vec![Effect::QuitApp]);
+        // Removed at sign-out only.
+        let effects = m.update(Event::SignedOut(Ok(status(false))));
+        assert!(effects.contains(&Effect::AppAutostart(false)), "{effects:?}");
     }
 
     #[test]

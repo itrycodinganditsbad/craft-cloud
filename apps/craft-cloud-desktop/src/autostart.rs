@@ -1,11 +1,12 @@
-//! The app's own start-at-login entry, so the tray icon is there after a restart (hidden: `--hidden`). The agent has
+//! The app's own start-at-login entry, so the tray icon is there after a restart (without the window). The agent has
 //! its own entry (`craft-cloud-agent autostart`); this one follows it ([`crate::model::app_autostart_wanted`]): set
-//! when joining and at each start, removed at sign-out, and only where there is a tray.
+//! when joining and at each start, removed at sign-out; on Windows and macOS only where there is a tray.
 //!
 //! - **Windows**: the value [`RUN_VALUE`] under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`:
 //!   `"<dir>\craft-cloud.exe" --hidden`.
 //! - **macOS**: `~/Library/LaunchAgents/ch.craftcloud.app.plist` (`RunAtLoad`, no `KeepAlive`: a quit app stays quit).
-//! - **Linux**: `~/.config/autostart/craft-cloud.desktop` with `Exec=… --hidden`.
+//! - **Linux**: `~/.config/autostart/craft-cloud.desktop` with `Exec=… --tray`, the tray process, which waits for a
+//!   tray (waybar may start after it) and shows its icon whenever there is one.
 //!
 //! The entries are written by pure functions (tested against golden files on every OS) into [`Roots`], so tests write
 //! into temporary places; the registry is only touched on Windows.
@@ -96,7 +97,7 @@ pub fn desktop_entry(exe: &Path) -> Result<String, String> {
          Type=Application\n\
          Name=Craft Cloud\n\
          Comment=Craft Cloud in the tray: your cloud's sync, on this computer\n\
-         Exec={} --hidden\n\
+         Exec={} --tray\n\
          Icon=craft-cloud\n\
          Terminal=false\n\
          NoDisplay=true\n\
@@ -256,7 +257,8 @@ mod tests {
         let file = if cfg!(target_vendor = "apple") { roots.plist_file() } else { roots.desktop_file() };
         set(&roots, exe, true).unwrap();
         set(&roots, exe, true).unwrap();
-        assert!(std::fs::read_to_string(&file).unwrap().contains("--hidden"));
+        let flag = if cfg!(target_vendor = "apple") { "--hidden" } else { "--tray" };
+        assert!(std::fs::read_to_string(&file).unwrap().contains(flag));
         assert_eq!(std::fs::read_dir(file.parent().unwrap()).unwrap().count(), 1);
         set(&roots, exe, false).unwrap();
         assert!(!file.exists());

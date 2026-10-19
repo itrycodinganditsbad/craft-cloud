@@ -33,8 +33,13 @@ pub fn agent_next_to(app: &Path) -> PathBuf {
 /// Starts `exe run --log`, detached: no console, no input or output, in a process group of its own (so it keeps
 /// running when this app or its terminal goes). A thread waits for it, so it leaves no zombie behind on Unix.
 pub fn spawn(exe: &Path) -> std::io::Result<()> {
+    spawn_detached(exe, &["run", "--log"])
+}
+
+/// Starts `exe` with `args`, detached as [`spawn`] does it.
+pub fn spawn_detached(exe: &Path, args: &[&str]) -> std::io::Result<()> {
     let mut command = Command::new(exe);
-    command.args(["run", "--log"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

@@ -1,5 +1,10 @@
-//! `craft-cloud`: the Craft Cloud app. `--hidden` starts it without its window (in the tray), as its start-at-login
-//! entry does. A second start brings the first one's window forward and exits.
+//! `craft-cloud`: the Craft Cloud app. A second start brings the first one's window forward and exits.
+//!
+//! - Windows and macOS: the window and the tray icon are one process; `--hidden` starts it in the tray, as its
+//!   start-at-login entry does, and closing the window hides it there.
+//! - Linux: `--tray` is the tray process (no window: [`tray::process`]), which the start-at-login entry runs (an
+//!   older entry's `--hidden` means the same). The window is a process of its own that ends when closed (Wayland can't
+//!   hide a window), and starts the tray process if none runs.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -9,18 +14,24 @@ use std::sync::{Arc, OnceLock};
 use craft_cloud_desktop::agent::ClientAgent;
 use craft_cloud_desktop::app::{App, System};
 use craft_cloud_desktop::model::{Event, Model};
-use craft_cloud_desktop::single_instance::{self, Instance};
+use craft_cloud_desktop::single_instance::{self, Command, Instance, Name};
 use craft_cloud_desktop::{tray, ui};
 
 fn main() -> ExitCode {
-    let hidden = std::env::args_os().skip(1).any(|arg| arg == "--hidden");
+    let has = |flag: &str| std::env::args_os().skip(1).any(|arg| arg == flag);
+    let linux = cfg!(target_os = "linux");
+    #[cfg(target_os = "linux")]
+    if has("--tray") || has("--hidden") {
+        return tray::process::run();
+    }
+    let hidden = !linux && has("--hidden");
     let Some(dir) = single_instance::folder() else {
         eprintln!("Craft Cloud can't find your user data folder");
         return ExitCode::FAILURE;
     };
     let (outside_tx, outside_rx) = std::sync::mpsc::channel::<Event>();
     let window: Arc<OnceLock<egui::Context>> = Arc::new(OnceLock::new());
-    match single_instance::claim(&dir) {
+    match single_instance::claim(&dir, Name::Window) {
         Ok(Instance::Running(running)) => {
             return match running.show() {
                 Ok(()) => ExitCode::SUCCESS,
@@ -32,8 +43,12 @@ fn main() -> ExitCode {
         }
         Ok(Instance::First(first)) => {
             let (tx, window) = (outside_tx.clone(), window.clone());
-            first.listen(move || {
-                let _ = tx.send(Event::Show);
+            first.listen(move |command| {
+                let _ = tx.send(match command {
+                    Command::Show => Event::Show,
+                    // The tray process quit Craft Cloud.
+                    Command::Quit => Event::Exit,
+                });
                 if let Some(ctx) = window.get() {
                     ctx.request_repaint();
                 }
@@ -43,6 +58,13 @@ fn main() -> ExitCode {
             eprintln!("Craft Cloud can't start: {e}");
             return ExitCode::FAILURE;
         }
+    }
+    // Linux: the tray is its own process; the window starts it if none runs.
+    if linux
+        && !single_instance::is_running(&dir, Name::Tray)
+        && let Ok(app) = std::env::current_exe()
+    {
+        let _ = craft_cloud_desktop::start_agent::spawn_detached(&app, &["--tray"]);
     }
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -65,10 +87,12 @@ fn main() -> ExitCode {
             let clicks = tray::Clicks { to: outside_tx.clone(), wake: Arc::new(move || wake_ctx.request_repaint()) };
             let tray = tray::start(clicks);
             let mut model = Model::new(craft_cloud_desktop::join_defaults(), tray.is_some(), craft_cloud_desktop::agent_log());
+            // Linux: the login entry is the tray process's, kept whether or not a tray is there now.
+            model.login_entry = tray.is_some() || linux;
             // Started hidden with no tray to live in (an entry left over from a desktop that had one): shown after all.
             model.window_visible = !hidden || tray.is_none();
             let agent = Arc::new(ClientAgent::new(None));
-            let host = Box::new(System { tray });
+            let host = Box::new(System { tray, tray_process: linux.then_some(dir) });
             let app = App::new(&cc.egui_ctx, agent, craft_cloud_desktop::start_agent::starter(), model, (outside_tx, outside_rx), host);
             Ok(Box::new(app))
         }),

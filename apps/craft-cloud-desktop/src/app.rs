@@ -36,6 +36,8 @@ pub trait Host {
     fn set_autostart(&self, on: bool) -> Result<(), String>;
     /// Shows the OS's folder picker at `start`, off the UI thread; the answer is sent to `answer` (then `wake`).
     fn pick_folder(&self, start: String, answer: Sender<Event>, wake: Arc<dyn Fn() + Send + Sync>);
+    /// Ends the tray process (Linux, where the tray is a process of its own).
+    fn quit_tray(&self) {}
     /// Called every frame with the model, to show its state (the tray icon); events it has go to the model.
     fn frame(&mut self, _model: &Model) -> Vec<Event> {
         Vec::new()
@@ -73,6 +75,7 @@ impl App {
             match self.link.perform(effect) {
                 None => {}
                 Some(Effect::OpenFolder(folder)) => self.host.open_folder(&folder),
+                Some(Effect::QuitTray) => self.host.quit_tray(),
                 Some(Effect::QuitApp) => {
                     self.closing = true;
                     ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -137,9 +140,17 @@ impl eframe::App for App {
 /// at login.
 pub struct System {
     pub tray: Option<Box<dyn crate::tray::Tray>>,
+    /// Linux: the single-instance folder, where the tray process is told to end at Quit.
+    pub tray_process: Option<std::path::PathBuf>,
 }
 
 impl Host for System {
+    fn quit_tray(&self) {
+        if let Some(dir) = &self.tray_process {
+            let _ = crate::single_instance::send(dir, crate::single_instance::Name::Tray, crate::single_instance::Command::Quit);
+        }
+    }
+
     fn frame(&mut self, model: &Model) -> Vec<Event> {
         if let Some(tray) = &mut self.tray {
             let paused = model.status.as_ref().is_some_and(|s| s.run_state == craft_cloud_app::RunState::PausedByUser);
@@ -149,25 +160,7 @@ impl Host for System {
     }
 
     fn open_folder(&self, folder: &str) {
-        let opener = if cfg!(windows) {
-            "explorer"
-        } else if cfg!(target_vendor = "apple") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        // Its own process; nothing waits for it (a thread reaps it).
-        if let Ok(mut child) = std::process::Command::new(opener)
-            .arg(folder)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            let _ = std::thread::Builder::new().name("craft-cloud-opener".into()).spawn(move || {
-                let _ = child.wait();
-            });
-        }
+        open_folder(folder);
     }
 
     fn set_autostart(&self, on: bool) -> Result<(), String> {
@@ -185,6 +178,19 @@ impl Host for System {
             wake();
         });
     }
+}
+
+/// Opens `folder` in the file manager (`explorer`, `open`, `xdg-open`), in a process of its own that nothing waits
+/// for.
+pub fn open_folder(folder: &str) {
+    let opener = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_vendor = "apple") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = crate::start_agent::spawn_detached(std::path::Path::new(opener), &[folder]);
 }
 
 /// Runs `future` to its end on this thread (the folder picker's, which has nothing else to do meanwhile).
