@@ -1,0 +1,27 @@
+[package]
+name = "craft-cloud-kit-demo"
+description = "The app kit's demo: a rich-text story and a layer tree beside it, live through Craft Cloud (not packaged or installed)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+craft-cloud-app.workspace = true
+craft-cloud-egui.workspace = true
+craft-cloud-kit.workspace = true
+egui.workspace = true
+# The window, as the Craft apps have it (wgpu; Wayland and X11 on Linux).
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11"] }
+# The `.kitdemo` file (JSON).
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+craft-cloud-app = { workspace = true, features = ["fake"] }
+egui_kittest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -5,6 +5,7 @@
 //! Each part has a key (`layers`, `story`); its Loro containers are named after it (`layers`, `story`, `cells.rows`,
 //! …), so two parts never share one.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
@@ -56,10 +57,10 @@ pub trait TextSource {
     }
     fn text(&self) -> &str;
     /// Runs with character attributes: byte ranges of [`TextSource::text`] on character boundaries, in order, not
-    /// overlapping. What no run covers has none.
-    fn runs(&self) -> Vec<(Range<usize>, Attrs)>;
+    /// overlapping. What no run covers has none. (Borrowed when the app keeps them so: a keystroke copies nothing.)
+    fn runs(&self) -> Cow<'_, [(Range<usize>, Attrs)]>;
     /// Each paragraph's attributes, in order: one more than the text has `\n`s (missing ones have none).
-    fn paragraphs(&self) -> Vec<Attrs>;
+    fn paragraphs(&self) -> Cow<'_, [Attrs]>;
 }
 
 /// A table (or keyed records, with one column): movable lists of row and column IDs, and a map of cells by row and
@@ -150,10 +151,10 @@ impl<T: TextSource + ?Sized> TextSource for &T {
     fn text(&self) -> &str {
         (**self).text()
     }
-    fn runs(&self) -> Vec<(Range<usize>, Attrs)> {
+    fn runs(&self) -> Cow<'_, [(Range<usize>, Attrs)]> {
         (**self).runs()
     }
-    fn paragraphs(&self) -> Vec<Attrs> {
+    fn paragraphs(&self) -> Cow<'_, [Attrs]> {
         (**self).paragraphs()
     }
 }

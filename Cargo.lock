@@ -1211,6 +1211,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-cloud-egui"
+version = "0.0.1"
+dependencies = [
+ "craft-cloud-app",
+ "craft-cloud-kit",
+ "egui",
+ "egui_kittest",
+]
+
+[[package]]
 name = "craft-cloud-kit"
 version = "0.0.1"
 dependencies = [
@@ -1221,6 +1231,21 @@ dependencies = [
  "loro",
  "proptest",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "craft-cloud-kit-demo"
+version = "0.0.1"
+dependencies = [
+ "craft-cloud-app",
+ "craft-cloud-egui",
+ "craft-cloud-kit",
+ "eframe",
+ "egui",
+ "egui_kittest",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

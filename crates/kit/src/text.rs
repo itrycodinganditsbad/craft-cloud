@@ -17,8 +17,8 @@ use crate::mapping::{Attrs, TextSource};
 use crate::writer::Writer;
 use crate::{KitError, Value};
 
-/// Character runs: byte ranges with their attributes.
-type Runs = Vec<(Range<usize>, Attrs)>;
+/// A character run: a byte range with its attributes.
+type Run = (Range<usize>, Attrs);
 
 /// The prefix of paragraph marks.
 const PARA: char = '¶';
@@ -55,12 +55,12 @@ impl TextSource for RichText {
         &self.text
     }
 
-    fn runs(&self) -> Vec<(Range<usize>, Attrs)> {
-        self.runs.clone()
+    fn runs(&self) -> Cow<'_, [(Range<usize>, Attrs)]> {
+        Cow::Borrowed(&self.runs)
     }
 
-    fn paragraphs(&self) -> Vec<Attrs> {
-        self.paragraphs.clone()
+    fn paragraphs(&self) -> Cow<'_, [Attrs]> {
+        Cow::Borrowed(&self.paragraphs)
     }
 }
 
@@ -281,8 +281,8 @@ pub(crate) fn write(
     let new_text = new.text();
     let new_runs = new.runs();
     check_runs(new_text, &new_runs)?;
-    let mut new_paras = new.paragraphs();
-    for attrs in &new_paras {
+    let new_paras = new.paragraphs();
+    for attrs in new_paras.iter() {
         for (k, v) in attrs {
             crate::props::check_key(k)?;
             v.check()?;
@@ -290,11 +290,11 @@ pub(crate) fn write(
     }
     // What Loro holds: the old model, unless it is out of step (then Loro's own).
     let stored;
-    let (old_text, old_runs, old_paras): (Cow<'_, str>, Runs, Vec<Attrs>) = match old {
+    let (old_text, old_runs, old_paras): (Cow<'_, str>, Cow<'_, [Run]>, Cow<'_, [Attrs]>) = match old {
         Some(o) if text.len_utf8() == o.text().len() => (Cow::Borrowed(o.text()), o.runs(), o.paragraphs()),
         _ => {
             stored = read(w.doc, key);
-            (Cow::Owned(stored.text), stored.runs, stored.paragraphs)
+            (Cow::Owned(stored.text), Cow::Owned(stored.runs), Cow::Owned(stored.paragraphs))
         }
     };
     let p = common_prefix(&old_text, new_text);
@@ -330,21 +330,23 @@ pub(crate) fn write(
     let current = moved_runs(&old_runs, p, old_end, new_end, middle);
     apply(w, &text, styles, differences(&new_runs, &current), "")?;
     // Paragraph attributes, on the `\n`s.
-    let new_count = new_text.matches('\n').count().max(new_paras.len().saturating_sub(1));
-    new_paras.resize(new_count + 1, Attrs::new());
+    // (Paragraphs the app didn't give attributes for have none.)
+    let new_count = new_text.matches('\n').count();
+    let empty = Attrs::new();
+    let want_at = |j: usize| new_paras.get(j).unwrap_or(&empty);
     let inserted = new_text.get(p..new_end).map_or(0, |t| t.matches('\n').count());
     let removed = old_text.get(p..old_end).map_or(0, |t| t.matches('\n').count());
-    let empty = Attrs::new();
     let mut differ: Vec<usize> = Vec::new();
     if inserted == 0 && removed == 0 {
-        for (j, want) in new_paras.iter().take(new_count).enumerate() {
-            if old_paras.get(j).unwrap_or(&empty) != want {
+        for j in 0..new_count {
+            if old_paras.get(j).unwrap_or(&empty) != want_at(j) {
                 differ.push(j);
             }
         }
     } else {
         let before = new_text.get(..p).map_or(0, |t| t.matches('\n').count());
-        for (j, want) in new_paras.iter().take(new_count).enumerate() {
+        for j in 0..new_count {
+            let want = want_at(j);
             let have = if j < before {
                 old_paras.get(j)
             } else if j < before + inserted {
@@ -364,7 +366,7 @@ pub(crate) fn write(
         for j in differ {
             let Some(&x) = positions.get(j) else { continue };
             let range = x..x + 1;
-            desired.push((range.clone(), new_paras.get(j).cloned().unwrap_or_default()));
+            desired.push((range.clone(), want_at(j).clone()));
             // What the `\n` holds now.
             let mut held = Attrs::new();
             for delta in text.slice_delta(x, x + 1, PosType::Bytes)? {

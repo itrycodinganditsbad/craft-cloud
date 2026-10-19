@@ -1,0 +1,19 @@
+[package]
+name = "craft-cloud-egui"
+description = "Craft Cloud's piece of a Craft app's window (egui): the account and status line, the shared recent files, and a live document's badge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+craft-cloud-app.workspace = true
+craft-cloud-kit.workspace = true
+egui.workspace = true
+
+[dev-dependencies]
+egui_kittest.workspace = true
+
+[lints]
+workspace = true

@@ -236,11 +236,11 @@ impl TextSource for StorySrc<'_> {
     fn text(&self) -> &str {
         &self.0.text
     }
-    fn runs(&self) -> Vec<(Range<usize>, Attrs)> {
-        self.0.runs.clone()
+    fn runs(&self) -> std::borrow::Cow<'_, [(Range<usize>, Attrs)]> {
+        std::borrow::Cow::Borrowed(&self.0.runs)
     }
-    fn paragraphs(&self) -> Vec<Attrs> {
-        self.0.paragraphs.clone()
+    fn paragraphs(&self) -> std::borrow::Cow<'_, [Attrs]> {
+        std::borrow::Cow::Borrowed(&self.0.paragraphs)
     }
 }
 

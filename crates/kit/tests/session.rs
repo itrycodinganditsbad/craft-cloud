@@ -243,6 +243,13 @@ fn blobs_go_through_the_agent_and_an_old_agent_says_so() {
     assert!(matches!(opened, Open::NotLive(_)));
 }
 
+/// A session opened off the UI thread can be handed to it.
+#[test]
+fn a_session_can_move_to_another_thread() {
+    fn send<T: Send>() {}
+    send::<Session<App>>();
+}
+
 fn open_with_bytes(fake: &craft_cloud_app::fake::Fake, path: &str, file: Notes, bytes: &[u8]) -> Session<App> {
     match Session::<App>::open(&common::agent(fake), path, Arc::new(file), Some(bytes)).unwrap() {
         Open::Live(s) => *s,
