@@ -333,14 +333,17 @@ struct Docs {
     importer: BTreeMap<DocId, (ConnId, u64)>,
     lookups: Vec<Lookup>,
     told: BTreeMap<DocId, (bool, u64, bool, bool)>,
-    /// Opens not answered yet: the app, the peer it asked for again, and the hash of the file it read.
-    opens: HashMap<(ConnId, u64), (AppName, Option<u64>, Option<String>)>,
+    /// Opens not answered yet.
+    opens: HashMap<(ConnId, u64), Pending>,
     /// The Loro peers lent to open documents.
     leases: Leases,
     /// Each open document's file as last looked at: its length and modification time then, its content's hash, and
     /// the record its apps were last told.
     files: HashMap<DocId, FileSeen>,
 }
+
+/// An open not answered yet: the app, the peer it asked for again, and the hash (hex) of the file it read.
+type Pending = (AppName, Option<u64>, Option<String>);
 
 /// A document's file as last looked at ([`State::tell_files`]).
 #[derive(Default)]

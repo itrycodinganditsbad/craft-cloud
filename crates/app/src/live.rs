@@ -618,8 +618,13 @@ mod tests {
         lock(&shared.answers).insert(5, answer_tx);
         let (events_tx, events) = mpsc::channel();
         lock(&shared.routes).insert(5, events_tx);
-        let opened =
-            DocsEvent::Opened { id: 5, doc: DocId::generate(), state: DocState { online: true, waiting: 0, bytes: 1, updates: 2 }, peer: None, changed_outside: None };
+        let opened = DocsEvent::Opened {
+            id: 5,
+            doc: DocId::generate(),
+            state: DocState { online: true, waiting: 0, bytes: 1, updates: 2 },
+            peer: None,
+            changed_outside: None,
+        };
         shared.on_message(Message::Text(serde_json::to_string(&opened).unwrap().into()));
         shared.on_message(Message::Binary(encode_binary(STATE, 5, b"s").into()));
         shared.on_message(Message::Binary(encode_binary(UPDATE, 5, b"1").into()));
@@ -641,8 +646,13 @@ mod tests {
         let (events_tx, events) = mpsc::channel();
         lock(&shared.routes).insert(4, events_tx);
         let doc = DocId::generate();
-        let opened =
-            DocsEvent::Opened { id: 4, doc, state: DocState { online: true, waiting: 0, bytes: 3, updates: 0 }, peer: Some(9), changed_outside: Some(true) };
+        let opened = DocsEvent::Opened {
+            id: 4,
+            doc,
+            state: DocState { online: true, waiting: 0, bytes: 3, updates: 0 },
+            peer: Some(9),
+            changed_outside: Some(true),
+        };
         shared.on_message(Message::Text(serde_json::to_string(&opened).unwrap().into()));
         assert!(answer.try_recv().is_err(), "not before the state");
         shared.on_message(Message::Binary(encode_binary(STATE, 4, b"abc").into()));

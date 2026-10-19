@@ -6,8 +6,8 @@
 mod looping;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use craft_cloud_kit::{Agent as KitAgent, ElemId, KitError, LiveDocument, Mappings, Open, RemotePatch, Session, TableSource, Value};
@@ -80,8 +80,11 @@ impl LiveDocument for LinesApp {
 
     fn apply_remote(old: &Arc<Lines>, patch: &RemotePatch<'_>) -> Result<Arc<Lines>, KitError> {
         let Some(table) = patch.table("lines") else { return Ok(old.clone()) };
-        let rows =
-            table.rows().into_iter().map(|row| (row, table.cell(row, TEXT).and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default())).collect();
+        let rows = table
+            .rows()
+            .into_iter()
+            .map(|row| (row, table.cell(row, TEXT).and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default()))
+            .collect();
         Ok(Arc::new(Lines { rows: Arc::new(rows) }))
     }
 

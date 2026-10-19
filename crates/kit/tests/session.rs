@@ -577,7 +577,7 @@ fn the_file_catches_up_with_every_edit_and_saving_stops() {
     autosave(&mut b, &mut true, &mut saves);
     change(&mut a, |m| m.with_item(0, "pc, meanwhile")).unwrap();
     autosave(&mut a, &mut true, &mut saves);
-    until(&mut [&mut a], "the pc's save is the file", |s| hub.file("f.txt") == Some(vv(&s[0])));
+    until(&mut [&mut a], "the pc's save is the file", |s| hub.file("f.txt") == Some(vv(s[0])));
     laptop.set_online(true);
     let before = saves;
     settle(&mut a, &mut b, &mut dirty_a, &mut dirty_b, &mut saves, "a save from offline");

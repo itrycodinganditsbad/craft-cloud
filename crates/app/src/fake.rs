@@ -390,7 +390,8 @@ impl Hub {
             }
             DocsRequest::Close { doc } => {
                 if let Some(m) = inner.machines.get_mut(&machine) {
-                    let closed: Vec<u64> = m.conns.get(&conn).map(|c| c.open.iter().filter(|(_, o)| o.doc == doc).map(|(id, _)| *id).collect()).unwrap_or_default();
+                    let closed: Vec<u64> =
+                        m.conns.get(&conn).map(|c| c.open.iter().filter(|(_, o)| o.doc == doc).map(|(id, _)| *id).collect()).unwrap_or_default();
                     for id in closed {
                         m.leases.release((conn, id));
                     }

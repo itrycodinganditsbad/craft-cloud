@@ -186,7 +186,8 @@ async fn a_late_save_record_is_appended_once(meta: &Meta) {
     let NodeKind::File(f) = &find(&tree.nodes, node).kind else { panic!("a file") };
     assert_eq!(f.save, Some(record));
     assert!(matches!(meta.attach_save(u.space, NodeId::generate(), v.id, &other).await, Err(MetaError::NotFound(_))));
-    let too_many = craft_cloud_proto::SaveRecord { doc: other.doc, version: (0..=craft_cloud_proto::ops::MAX_SAVE_PEERS as u64).map(|p| (p, 1)).collect() };
+    let too_many =
+        craft_cloud_proto::SaveRecord { doc: other.doc, version: (0..=craft_cloud_proto::ops::MAX_SAVE_PEERS as u64).map(|p| (p, 1)).collect() };
     assert!(matches!(meta.attach_save(u.space, node, v.id, &too_many).await, Err(MetaError::Invalid(_))));
 }
 
@@ -221,8 +222,11 @@ async fn pages_of_save_records_stay_small(meta: &Meta) {
     for feed in [false, true] {
         let (mut after, mut seen, mut pages) = (None, std::collections::BTreeSet::new(), 0);
         loop {
-            let page =
-                if feed { meta.changes(u.space, 0, after, MAX_PAGE_NODES).await.unwrap() } else { meta.tree(u.space, after, MAX_PAGE_NODES).await.unwrap() };
+            let page = if feed {
+                meta.changes(u.space, 0, after, MAX_PAGE_NODES).await.unwrap()
+            } else {
+                meta.tree(u.space, after, MAX_PAGE_NODES).await.unwrap()
+            };
             pages += 1;
             let json = serde_json::to_vec(&page).unwrap().len();
             assert!(json < MAX_PAGE_SAVE_BYTES + 2 * 1024 * 1024, "a page of {json} bytes");

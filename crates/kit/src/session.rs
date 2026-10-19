@@ -506,9 +506,8 @@ impl<D: LiveDocument> Session<D> {
         let mut session = Self::start(agent.clone(), path, file, (document.state(), document.state_updates()), ours, document.peer())?;
         // Decided once, here: the agent knows every Craft save of the file (its records, the server's versions'); the
         // bytes the document was imported from are no edit either.
-        session.status.changed_outside = snapshot.is_none()
-            && document.changed_outside() == Some(true)
-            && file_hash.is_some_and(|h| import_hash(&session.doc) != Some(hex(&h)));
+        session.status.changed_outside =
+            snapshot.is_none() && document.changed_outside() == Some(true) && file_hash.is_some_and(|h| import_hash(&session.doc) != Some(hex(&h)));
         session.attach(Link { _docs: docs, doc: document });
         Ok(Open::Live(Box::new(session)))
     }

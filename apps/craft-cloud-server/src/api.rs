@@ -364,7 +364,11 @@ async fn commit(State(state): State<Shared>, Extension(auth): Extension<DeviceAu
 }
 
 /// `POST /saves`: a save record for a version that went up without one ([`craft_cloud_proto::api::SaveAttach`]).
-async fn attach_save(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>, request: Request) -> Result<Json<CommitResponse>, ApiError> {
+async fn attach_save(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    request: Request,
+) -> Result<Json<CommitResponse>, ApiError> {
     let req: craft_cloud_proto::api::SaveAttach = read_json(&state, request, SMALL_JSON_BYTES).await?;
     let task_state = state.clone();
     // As a commit: the publish is never skipped for a change that went through.
