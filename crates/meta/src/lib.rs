@@ -27,7 +27,10 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 pub use commit::CommitOutcome;
 pub use craft_cloud_proto::BlobKind;
 pub use join::{InviteFor, Redeemed};
-pub use live::{LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE, MAX_LIVE_DOCS_PER_SPACE, MAX_LIVE_PAGE};
+pub use live::{
+    Appended, LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE, MAX_LIVE_DOCS_PER_SPACE, MAX_LIVE_DOCUMENTS_PER_SPACE,
+    MAX_LIVE_PAGE, SNAPSHOT_PIECE_BYTES, SnapshotRef,
+};
 pub use tree::SpaceInfo;
 pub use users::{DeviceAuth, DeviceRecord, Role, UserId, UserRecord, valid_username};
 
@@ -99,6 +102,8 @@ pub struct Meta {
     live_docs_cap: u64,
     /// The most live document rows one space may have ([`Meta::with_live_doc_rows_cap`]).
     live_doc_rows_cap: u64,
+    /// The most documents of files one space may have ([`Meta::with_live_documents_cap`]).
+    live_documents_cap: u64,
 }
 
 impl Meta {
@@ -152,6 +157,7 @@ impl Meta {
             live_doc_cap: MAX_LIVE_DOC_BYTES,
             live_docs_cap: MAX_LIVE_DOCS_PER_SPACE,
             live_doc_rows_cap: MAX_LIVE_DOC_ROWS_PER_SPACE,
+            live_documents_cap: MAX_LIVE_DOCUMENTS_PER_SPACE,
         })
     }
 
@@ -175,6 +181,13 @@ impl Meta {
     /// For tests.
     pub fn with_live_doc_rows_cap(mut self, cap: u64) -> Self {
         self.live_doc_rows_cap = cap;
+        self
+    }
+
+    /// The store with another cap on the number of documents of files one space may have (the default is
+    /// [`MAX_LIVE_DOCUMENTS_PER_SPACE`]); a create over it is refused with [`MetaError::TooManyDocRows`]. For tests.
+    pub fn with_live_documents_cap(mut self, cap: u64) -> Self {
+        self.live_documents_cap = cap;
         self
     }
 

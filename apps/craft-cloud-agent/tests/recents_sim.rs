@@ -118,6 +118,10 @@ fn up_text(frame: &ClientFrame) -> String {
         ClientFrame::Subscribe { after, .. } => format!("subscribe after {after}"),
         ClientFrame::Unsubscribe { .. } => "unsubscribe".into(),
         ClientFrame::Update { client_seq, bytes, .. } => format!("update {client_seq} ({} bytes)", bytes.len()),
+        ClientFrame::Snapshot { upto, bytes, .. } => format!("snapshot upto {upto} ({} bytes)", bytes.len()),
+        ClientFrame::Presence { bytes, .. } => format!("presence ({} bytes)", bytes.len()),
+        ClientFrame::SubscribeLog { after, .. } => format!("subscribe the log after {after}"),
+        ClientFrame::CreateDocument { snapshot, .. } => format!("create a document ({} bytes)", snapshot.len()),
     }
 }
 
@@ -129,6 +133,10 @@ fn down_text(frame: &ServerFrame) -> String {
         ServerFrame::Subscribed { head, .. } => format!("subscribed head {head}"),
         ServerFrame::Ack { client_seq, seq, .. } => format!("ack {client_seq} as {seq}"),
         ServerFrame::Error { code, message, client_seq, .. } => format!("error {code} {client_seq:?}: {message}"),
+        ServerFrame::Compact { upto, .. } => format!("compact upto {upto}"),
+        ServerFrame::Snapshot { base, bytes, .. } => format!("snapshot base {base} ({} bytes)", bytes.len()),
+        ServerFrame::Presence { bytes, .. } => format!("presence ({} bytes)", bytes.len()),
+        ServerFrame::CreatedDocument { kept, .. } => format!("created, kept {kept}"),
     }
 }
 

@@ -4,27 +4,104 @@
 //! write transaction that stores it, so a document's updates are numbered 1, 2, 3… without gaps. An append is
 //! durable when it returns (the transaction committed), which is what lets the server ack it. Everything is keyed by
 //! `(space, doc)`, so a document of another space is simply not found.
+//!
+//! **Snapshots.** A document of a file is made by import, with a snapshot ([`Meta::create_live_document`]); any
+//! document's log is compacted into a new snapshot ([`Meta::compact_live_doc`]). A snapshot is stored as blobs in the
+//! chunk store (pieces of at most [`SNAPSHOT_PIECE_BYTES`], each a chunk named by its BLAKE3, charged to the space
+//! like any chunk); the database holds which, and the last update it holds (`base`). The rows at or below `base` are
+//! kept (compacted: no longer counted against the document's cap, and not sent to an agent that reads the snapshot)
+//! until the retention rules come.
 
-use craft_cloud_proto::{DeviceId, DocId, NodeId, SpaceId};
+use craft_cloud_proto::{BlobKind, ChunkId, DeviceId, DocId, NodeId, SpaceId};
 use sqlx::Row;
 
-use crate::codec::{to_i64, to_u64, uuid_bytes, uuid_from};
+use crate::blobs::{Blob, record};
+use crate::codec::{flag, to_i64, to_u64, uuid_bytes, uuid_from};
 use crate::{Meta, MetaError};
 
 /// A live document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveDoc {
     pub id: DocId,
-    /// Its kind as text (`recents:<app>`).
+    /// Its kind as text (`recents:<app>`, `document:<app>`).
     pub kind: String,
     /// The file node it belongs to, if any (recents have none).
     pub node: Option<NodeId>,
     pub created_ms: i64,
     /// Its last sequence number (0: no update yet).
     pub head: u64,
-    /// The bytes of updates its log holds (at or over [`Meta::live_doc_cap`]: full).
+    /// The bytes of updates its log holds above its snapshot (at or over [`Meta::live_doc_cap`]: full).
+    pub bytes: u64,
+    /// The last update its snapshot holds (0: none, or a snapshot of an import only).
+    pub base: u64,
+    /// Whether it has a snapshot ([`Meta::live_snapshot`]), and its size.
+    pub has_snapshot: bool,
+    pub snapshot_bytes: u64,
+}
+
+/// The largest piece a snapshot is stored in: a chunk.
+pub const SNAPSHOT_PIECE_BYTES: usize = craft_cloud_proto::limits::MAX_CHUNK_BYTES as usize;
+
+/// Where a snapshot is in the chunk store: its pieces, in order, and its size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotRef {
+    pub pieces: Vec<ChunkId>,
     pub bytes: u64,
 }
+
+impl SnapshotRef {
+    /// The pieces `snapshot` is stored in, with their IDs (the caller stores each piece as a chunk).
+    pub fn split(snapshot: &[u8]) -> (Self, Vec<&[u8]>) {
+        let pieces: Vec<&[u8]> = snapshot.chunks(SNAPSHOT_PIECE_BYTES.max(1)).collect();
+        let ids = pieces.iter().map(|p| ChunkId::from_bytes(craft_cloud_proto::live::update_hash(p))).collect();
+        (Self { pieces: ids, bytes: snapshot.len() as u64 }, pieces)
+    }
+
+    /// The size of piece `i`: every piece is [`SNAPSHOT_PIECE_BYTES`] but the last.
+    fn piece_len(&self, i: usize) -> u64 {
+        let before = (i as u64).saturating_mul(SNAPSHOT_PIECE_BYTES as u64);
+        self.bytes.saturating_sub(before).min(SNAPSHOT_PIECE_BYTES as u64)
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        self.pieces.iter().flat_map(|p| p.as_bytes().iter().copied()).collect()
+    }
+
+    fn decode(ids: &[u8], bytes: u64) -> Result<Self, MetaError> {
+        if !ids.len().is_multiple_of(32) {
+            return Err(MetaError::Corrupt("a snapshot's piece list is not whole IDs"));
+        }
+        let pieces: Vec<ChunkId> = ids
+            .chunks(32)
+            .map(|c| <[u8; 32]>::try_from(c).map(ChunkId::from_bytes))
+            .collect::<Result<_, _>>()
+            .map_err(|_| MetaError::Corrupt("a snapshot piece ID"))?;
+        if (pieces.len() as u64) != bytes.div_ceil(SNAPSHOT_PIECE_BYTES as u64) {
+            return Err(MetaError::Corrupt("a snapshot's pieces don't add up to its size"));
+        }
+        Ok(Self { pieces, bytes })
+    }
+}
+
+/// The most documents of files (rows) one space may have. A document of a file needs a file node of the space, so
+/// they are bounded by the tree already; this is a loose cap on top, counted apart from recents.
+pub const MAX_LIVE_DOCUMENTS_PER_SPACE: u64 = 65_536;
+
+/// What an append did ([`Meta::append_live_update_counted`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Appended {
+    /// The update's sequence number (its first one, for a repeat).
+    pub seq: u64,
+    /// The document's snapshot holds the updates up to here.
+    pub base: u64,
+    /// The bytes of the log above `base`, with this update.
+    pub above_bytes: u64,
+    /// The update was stored before (a repeat after a lost ack).
+    pub repeat: bool,
+}
+
+const DOC_COLUMNS: &str =
+    "kind, node, created_ms, head_seq, bytes, base_seq, snapshot_bytes, CAST(CASE WHEN snapshot IS NULL THEN 0 ELSE 1 END AS BIGINT) AS has_snapshot";
 
 /// One stored update.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +145,20 @@ fn doc_from(row: &sqlx::any::AnyRow, id: DocId) -> Result<LiveDoc, MetaError> {
         created_ms: row.try_get("created_ms")?,
         head: to_u64(row.try_get("head_seq")?)?,
         bytes: to_u64(row.try_get("bytes")?)?,
+        base: to_u64(row.try_get("base_seq")?)?,
+        has_snapshot: flag(row, "has_snapshot")?,
+        snapshot_bytes: to_u64(row.try_get("snapshot_bytes")?)?,
     })
+}
+
+/// Records the snapshot's pieces as chunks of `space` (charged to it, under its cap), in the caller's transaction.
+async fn record_pieces(tx: &mut sqlx::AnyConnection, space: SpaceId, snapshot: &SnapshotRef, now_ms: i64, cap: Option<u64>) -> Result<(), MetaError> {
+    for (i, piece) in snapshot.pieces.iter().enumerate() {
+        // As a chunk is stored: one format byte and the bytes.
+        let stored_size = to_i64(snapshot.piece_len(i).saturating_add(1))?;
+        record(tx, space, Blob { kind: BlobKind::Chunk, id: piece.as_bytes(), stored_size, file_size: None }, now_ms, cap).await?;
+    }
+    Ok(())
 }
 
 impl Meta {
@@ -96,7 +186,7 @@ impl Meta {
         .await?
         .rows_affected();
         if inserted == 0 {
-            let row = sqlx::query("SELECT kind, node, created_ms, head_seq, bytes FROM live_docs WHERE space_id = $1 AND id = $2")
+            let row = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {DOC_COLUMNS} FROM live_docs WHERE space_id = $1 AND id = $2")))
                 .bind(space_key)
                 .bind(id_key)
                 .fetch_one(&mut *w.tx)
@@ -104,9 +194,9 @@ impl Meta {
             let doc = doc_from(&row, id)?;
             return if doc.kind == kind { Ok(doc) } else { Err(MetaError::Invalid("the document exists with another kind")) };
         }
-        // A new document: the space may not go over its cap on rows. Counted with this one; over the cap, the
-        // transaction (and the insert) is dropped uncommitted.
-        let count = sqlx::query("SELECT COUNT(*) AS n FROM live_docs WHERE space_id = $1")
+        // A new document: the space may not go over its cap on rows (of recents: documents of files have their own).
+        // Counted with this one; over the cap, the transaction (and the insert) is dropped uncommitted.
+        let count = sqlx::query("SELECT COUNT(*) AS n FROM live_docs WHERE space_id = $1 AND kind NOT LIKE 'document:%'")
             .bind(space_key)
             .fetch_one(&mut *w.tx)
             .await?
@@ -115,7 +205,159 @@ impl Meta {
             return Err(MetaError::TooManyDocRows { limit: self.live_doc_rows_cap });
         }
         w.commit().await?;
-        Ok(LiveDoc { id, kind: kind.to_owned(), node, created_ms: now_ms, head: 0, bytes: 0 })
+        Ok(LiveDoc { id, kind: kind.to_owned(), node, created_ms: now_ms, head: 0, bytes: 0, base: 0, has_snapshot: false, snapshot_bytes: 0 })
+    }
+
+    /// Makes the document `id` of the file node `node` of `space` by import: `kind` (`document:<app>`), its first
+    /// snapshot (whose pieces the caller stored in the chunk store already), unless the space has the document
+    /// already. Returns the document and whether this snapshot was kept: the first one is, every later one (another
+    /// machine imported the same file at the same moment) is not, and the document stays as it is. `NotFound` if the
+    /// space has no such file (a missing, deleted or folder node), `TooManyDocRows` over the space's cap on documents of
+    /// files, `QuotaExceeded` if the snapshot would take the space over its stored-bytes cap.
+    pub async fn create_live_document(
+        &self,
+        space: SpaceId,
+        id: DocId,
+        kind: &str,
+        node: NodeId,
+        snapshot: &SnapshotRef,
+        now_ms: i64,
+    ) -> Result<(LiveDoc, bool), MetaError> {
+        if !kind.starts_with(craft_cloud_proto::live::DOCUMENT_KIND_PREFIX) || kind.len() > 64 {
+            return Err(MetaError::Invalid("a document of a file is of kind document:<app>"));
+        }
+        if snapshot.pieces.is_empty() {
+            return Err(MetaError::Invalid("a document made by import has a snapshot"));
+        }
+        let (space_key, id_key, node_key) = (uuid_bytes(space.as_uuid()), uuid_bytes(id.as_uuid()), uuid_bytes(node.as_uuid()));
+        let mut w = self.begin_write().await?;
+        let file = sqlx::query("SELECT is_dir, deleted FROM nodes WHERE space_id = $1 AND id = $2")
+            .bind(space_key.clone())
+            .bind(node_key.clone())
+            .fetch_optional(&mut *w.tx)
+            .await?;
+        match file {
+            Some(row) if !flag(&row, "is_dir")? && !flag(&row, "deleted")? => {}
+            _ => return Err(MetaError::NotFound("file")),
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO live_docs (space_id, id, kind, node, created_ms, head_seq, base_seq, snapshot, snapshot_bytes) \
+             VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7) ON CONFLICT (space_id, id) DO NOTHING",
+        )
+        .bind(space_key.clone())
+        .bind(id_key.clone())
+        .bind(kind)
+        .bind(node_key)
+        .bind(now_ms)
+        .bind(snapshot.encode())
+        .bind(to_i64(snapshot.bytes)?)
+        .execute(&mut *w.tx)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            let row = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {DOC_COLUMNS} FROM live_docs WHERE space_id = $1 AND id = $2")))
+                .bind(space_key)
+                .bind(id_key)
+                .fetch_one(&mut *w.tx)
+                .await?;
+            let doc = doc_from(&row, id)?;
+            // Another machine's import (of any app) was first: this one is not kept, and nothing changes.
+            return if doc.kind.starts_with(craft_cloud_proto::live::DOCUMENT_KIND_PREFIX) && doc.node == Some(node) {
+                Ok((doc, false))
+            } else {
+                Err(MetaError::Invalid("the document exists with another kind"))
+            };
+        }
+        let count = sqlx::query("SELECT COUNT(*) AS n FROM live_docs WHERE space_id = $1 AND kind LIKE 'document:%'")
+            .bind(space_key)
+            .fetch_one(&mut *w.tx)
+            .await?
+            .try_get::<i64, _>("n")?;
+        if to_u64(count)? > self.live_documents_cap {
+            return Err(MetaError::TooManyDocRows { limit: self.live_documents_cap });
+        }
+        record_pieces(&mut w.tx, space, snapshot, now_ms, self.stored_cap).await?;
+        w.commit().await?;
+        let doc = LiveDoc {
+            id,
+            kind: kind.to_owned(),
+            node: Some(node),
+            created_ms: now_ms,
+            head: 0,
+            bytes: 0,
+            base: 0,
+            has_snapshot: true,
+            snapshot_bytes: snapshot.bytes,
+        };
+        Ok((doc, true))
+    }
+
+    /// The document's snapshot, if it has one: the last update it holds, and where it is.
+    pub async fn live_snapshot(&self, space: SpaceId, doc: DocId) -> Result<Option<(u64, SnapshotRef)>, MetaError> {
+        let row = sqlx::query("SELECT base_seq, snapshot, snapshot_bytes FROM live_docs WHERE space_id = $1 AND id = $2")
+            .bind(uuid_bytes(space.as_uuid()))
+            .bind(uuid_bytes(doc.as_uuid()))
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else { return Ok(None) };
+        let Some(ids) = row.try_get::<Option<Vec<u8>>, _>("snapshot")? else { return Ok(None) };
+        let snapshot = SnapshotRef::decode(&ids, to_u64(row.try_get("snapshot_bytes")?)?)?;
+        Ok(Some((to_u64(row.try_get("base_seq")?)?, snapshot)))
+    }
+
+    /// Compacts the document's log: `snapshot` (stored in the chunk store already, durably) holds the updates 1..=`upto`
+    /// (and the snapshot before it). Recorded with `base = upto` in one transaction, and the rows up to `upto` stop
+    /// counting against the document's cap; they are kept. Only a snapshot past the current base, and not past the
+    /// head, is taken: one for an older or equal `upto` (a second device answering late, or two at once) is ignored,
+    /// `Ok(false)`. `QuotaExceeded` if the snapshot would take the space over its stored-bytes cap (nothing changes).
+    pub async fn compact_live_doc(&self, space: SpaceId, doc: DocId, upto: u64, snapshot: &SnapshotRef, now_ms: i64) -> Result<bool, MetaError> {
+        if snapshot.pieces.is_empty() {
+            return Err(MetaError::Invalid("an empty snapshot"));
+        }
+        let (space_key, doc_key) = (uuid_bytes(space.as_uuid()), uuid_bytes(doc.as_uuid()));
+        let mut w = self.begin_write().await?;
+        let row = sqlx::query("SELECT base_seq, head_seq FROM live_docs WHERE space_id = $1 AND id = $2")
+            .bind(space_key.clone())
+            .bind(doc_key.clone())
+            .fetch_optional(&mut *w.tx)
+            .await?
+            .ok_or(MetaError::NotFound("document"))?;
+        let (base, head) = (to_u64(row.try_get("base_seq")?)?, to_u64(row.try_get("head_seq")?)?);
+        if upto <= base || upto > head {
+            return Ok(false);
+        }
+        // Postgres sums BIGINT as NUMERIC, which the `Any` driver can't read: cast back.
+        let compacted: i64 = sqlx::query(
+            "SELECT CAST(COALESCE(SUM(LENGTH(bytes)), 0) AS BIGINT) AS n FROM live_updates WHERE space_id = $1 AND doc = $2 AND seq > $3 AND seq <= $4",
+        )
+        .bind(space_key.clone())
+        .bind(doc_key.clone())
+        .bind(to_i64(base)?)
+        .bind(to_i64(upto)?)
+        .fetch_one(&mut *w.tx)
+        .await?
+        .try_get("n")?;
+        // Only from the base read above: a compaction that raced this one (Postgres) leaves nothing to change here.
+        let done = sqlx::query(
+            "UPDATE live_docs SET base_seq = $3, snapshot = $4, snapshot_bytes = $5, bytes = CASE WHEN bytes > $6 THEN bytes - $6 ELSE 0 END \
+             WHERE space_id = $1 AND id = $2 AND base_seq = $7",
+        )
+        .bind(space_key)
+        .bind(doc_key)
+        .bind(to_i64(upto)?)
+        .bind(snapshot.encode())
+        .bind(to_i64(snapshot.bytes)?)
+        .bind(compacted)
+        .bind(to_i64(base)?)
+        .execute(&mut *w.tx)
+        .await?
+        .rows_affected();
+        if done == 0 {
+            return Ok(false);
+        }
+        record_pieces(&mut w.tx, space, snapshot, now_ms, self.stored_cap).await?;
+        w.commit().await?;
+        Ok(true)
     }
 
     /// The most bytes of updates a live document's log may hold ([`Meta::with_live_doc_cap`]).
@@ -127,8 +369,9 @@ impl Meta {
     /// live generation in the same transaction, so its live epoch ([`Meta::live_epoch`]) changes: a reset no agent can
     /// miss, however far the log grows back before it looks (its `welcome`, and every connection's ping, compare the
     /// live epoch). Every agent then catches up from the start and sends up what the log lacks of its document; nothing
-    /// any machine holds is lost. The space's own epoch, which the file sync reads, doesn't change. `NotFound` if the
-    /// space has no such document.
+    /// any machine holds is lost. The space's own epoch, which the file sync reads, doesn't change. The snapshot goes
+    /// too (`base` back to 0; its blobs stay in the chunk store): machines that hold the document send it up again as
+    /// updates. `NotFound` if the space has no such document.
     pub async fn reset_live_doc(&self, space: SpaceId, doc: DocId) -> Result<(), MetaError> {
         let (space_key, doc_key) = (uuid_bytes(space.as_uuid()), uuid_bytes(doc.as_uuid()));
         let mut w = self.begin_write().await?;
@@ -139,11 +382,13 @@ impl Meta {
         .bind(space_key.clone())
         .execute(&mut *w.tx)
         .await?;
-        let done = sqlx::query("UPDATE live_docs SET head_seq = 0, bytes = 0 WHERE space_id = $1 AND id = $2")
-            .bind(space_key.clone())
-            .bind(doc_key.clone())
-            .execute(&mut *w.tx)
-            .await?;
+        let done = sqlx::query(
+            "UPDATE live_docs SET head_seq = 0, bytes = 0, base_seq = 0, snapshot = NULL, snapshot_bytes = 0 WHERE space_id = $1 AND id = $2",
+        )
+        .bind(space_key.clone())
+        .bind(doc_key.clone())
+        .execute(&mut *w.tx)
+        .await?;
         if done.rows_affected() == 0 {
             return Err(MetaError::NotFound("document"));
         }
@@ -174,7 +419,7 @@ impl Meta {
 
     /// The document `id` of `space`, if it has one.
     pub async fn live_doc(&self, space: SpaceId, id: DocId) -> Result<Option<LiveDoc>, MetaError> {
-        let row = sqlx::query("SELECT kind, node, created_ms, head_seq, bytes FROM live_docs WHERE space_id = $1 AND id = $2")
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {DOC_COLUMNS} FROM live_docs WHERE space_id = $1 AND id = $2")))
             .bind(uuid_bytes(space.as_uuid()))
             .bind(uuid_bytes(id.as_uuid()))
             .fetch_optional(&self.pool)
@@ -194,22 +439,39 @@ impl Meta {
         bytes: &[u8],
         now_ms: i64,
     ) -> Result<u64, MetaError> {
+        Ok(self.append_live_update_counted(space, doc, device, client_seq, bytes, now_ms).await?.seq)
+    }
+
+    /// [`Meta::append_live_update`], also saying how long the document's log is above its snapshot (whether to compact
+    /// it).
+    pub async fn append_live_update_counted(
+        &self,
+        space: SpaceId,
+        doc: DocId,
+        device: DeviceId,
+        client_seq: u64,
+        bytes: &[u8],
+        now_ms: i64,
+    ) -> Result<Appended, MetaError> {
         let client_seq = to_i64(client_seq)?;
         let (space_key, doc_key, device_key) = (uuid_bytes(space.as_uuid()), uuid_bytes(doc.as_uuid()), uuid_bytes(device.as_uuid()));
         let mut w = self.begin_write().await?;
         // Taking the next number locks the document's row (on Postgres), so appends to one document run one at a
         // time and the check for a repeat below can't race another append of the same update.
         let size = i64::try_from(bytes.len()).map_err(|_| MetaError::Invalid("an update too large"))?;
-        let head =
-            sqlx::query("UPDATE live_docs SET head_seq = head_seq + 1, bytes = bytes + $3 WHERE space_id = $1 AND id = $2 RETURNING head_seq, bytes")
-                .bind(space_key.clone())
-                .bind(doc_key.clone())
-                .bind(size)
-                .fetch_optional(&mut *w.tx)
-                .await?
-                .ok_or(MetaError::NotFound("document"))?;
+        let head = sqlx::query(
+            "UPDATE live_docs SET head_seq = head_seq + 1, bytes = bytes + $3 WHERE space_id = $1 AND id = $2 RETURNING head_seq, bytes, base_seq, kind",
+        )
+        .bind(space_key.clone())
+        .bind(doc_key.clone())
+        .bind(size)
+        .fetch_optional(&mut *w.tx)
+        .await?
+        .ok_or(MetaError::NotFound("document"))?;
         let seq: i64 = head.try_get("head_seq")?;
         let total = to_u64(head.try_get("bytes")?)?;
+        let base = to_u64(head.try_get("base_seq")?)?;
+        let recents = !head.try_get::<String, _>("kind")?.starts_with(craft_cloud_proto::live::DOCUMENT_KIND_PREFIX);
         let earlier = sqlx::query("SELECT seq, bytes FROM live_updates WHERE space_id = $1 AND doc = $2 AND device = $3 AND client_seq = $4")
             .bind(space_key.clone())
             .bind(doc_key.clone())
@@ -222,7 +484,7 @@ impl Meta {
                 let first = to_u64(row.try_get("seq")?)?;
                 // The number taken above goes back.
                 w.tx.rollback().await?;
-                return Ok(first);
+                return Ok(Appended { seq: first, base, above_bytes: total.saturating_sub(to_u64(size)?), repeat: true });
             }
         }
         // Full is one way: once the log holds the cap, every append is refused (the one that crosses it is stored), so
@@ -233,16 +495,19 @@ impl Meta {
             w.tx.rollback().await?;
             return Err(MetaError::DocFull { used, limit: self.live_doc_cap });
         }
-        // The first update to a document: the space may have only so many that hold updates. Counted after the row lock
-        // above, in the same transaction; over the cap, nothing is stored and the number goes back, as for a full
-        // document. A repeat was acked above, and a document that holds updates already is never refused here.
-        if used == 0 {
-            let holding = sqlx::query("SELECT COUNT(*) AS n FROM live_docs WHERE space_id = $1 AND id <> $2 AND bytes > 0")
-                .bind(space_key.clone())
-                .bind(doc_key.clone())
-                .fetch_one(&mut *w.tx)
-                .await?
-                .try_get::<i64, _>("n")?;
+        // The first update to a recents document: the space may have only so many that hold updates. Counted after the
+        // row lock above, in the same transaction; over the cap, nothing is stored and the number goes back, as for a
+        // full document. A repeat was acked above, and a document that holds updates already is never refused here
+        // (by its numbers, not its bytes: a compacted log holds updates, though none count against its cap). Documents
+        // of files aren't counted: each needs a file of the space.
+        if recents && seq == 1 {
+            let holding =
+                sqlx::query("SELECT COUNT(*) AS n FROM live_docs WHERE space_id = $1 AND id <> $2 AND head_seq > 0 AND kind NOT LIKE 'document:%'")
+                    .bind(space_key.clone())
+                    .bind(doc_key.clone())
+                    .fetch_one(&mut *w.tx)
+                    .await?
+                    .try_get::<i64, _>("n")?;
             if to_u64(holding)? >= self.live_docs_cap {
                 w.tx.rollback().await?;
                 return Err(MetaError::TooManyDocs { limit: self.live_docs_cap });
@@ -259,7 +524,7 @@ impl Meta {
             .execute(&mut *w.tx)
             .await?;
         w.commit().await?;
-        to_u64(seq)
+        Ok(Appended { seq: to_u64(seq)?, base, above_bytes: total, repeat: false })
     }
 
     /// Every live document of `space` with its last sequence number: what a backup of the database holds. A test seam
@@ -287,12 +552,39 @@ impl Meta {
             .execute(&mut *w.tx)
             .await?;
         let sql = if head.is_some() {
-            "UPDATE live_docs SET head_seq = $3, bytes = (SELECT COALESCE(SUM(LENGTH(u.bytes)), 0) FROM live_updates u \
-             WHERE u.space_id = $1 AND u.doc = $2) WHERE space_id = $1 AND id = $2"
+            // (A snapshot past the head the backup has goes back to the head: what a backup taken back then holds is
+            // [`Meta::restore_live_snapshot`]'s to set.)
+            "UPDATE live_docs SET head_seq = $3, base_seq = CASE WHEN base_seq > $3 THEN $3 ELSE base_seq END, \
+             bytes = (SELECT COALESCE(SUM(LENGTH(u.bytes)), 0) FROM live_updates u \
+             WHERE u.space_id = $1 AND u.doc = $2 AND u.seq > live_docs.base_seq) WHERE space_id = $1 AND id = $2"
         } else {
             "DELETE FROM live_docs WHERE space_id = $1 AND id = $2 AND $3 = 0"
         };
         sqlx::query(sql).bind(space_key).bind(doc_key).bind(keep).execute(&mut *w.tx).await?;
+        w.commit().await
+    }
+
+    /// The document's snapshot and base as a backup holds them (`None`: no snapshot, base 0). A test seam (the
+    /// `test-support` feature), for the simulations' restores; the pieces must be in the chunk store.
+    #[cfg(feature = "test-support")]
+    pub async fn restore_live_snapshot(&self, space: SpaceId, doc: DocId, snapshot: Option<(u64, SnapshotRef)>) -> Result<(), MetaError> {
+        let (space_key, doc_key) = (uuid_bytes(space.as_uuid()), uuid_bytes(doc.as_uuid()));
+        let mut w = self.begin_write().await?;
+        let (base, ids, size) = match &snapshot {
+            Some((base, s)) => (to_i64(*base)?, Some(s.encode()), to_i64(s.bytes)?),
+            None => (0, None, 0),
+        };
+        sqlx::query(
+            "UPDATE live_docs SET base_seq = $3, snapshot = $4, snapshot_bytes = $5, bytes = (SELECT COALESCE(SUM(LENGTH(u.bytes)), 0) \
+             FROM live_updates u WHERE u.space_id = $1 AND u.doc = $2 AND u.seq > $3) WHERE space_id = $1 AND id = $2",
+        )
+        .bind(space_key)
+        .bind(doc_key)
+        .bind(base)
+        .bind(ids)
+        .bind(size)
+        .execute(&mut *w.tx)
+        .await?;
         w.commit().await
     }
 

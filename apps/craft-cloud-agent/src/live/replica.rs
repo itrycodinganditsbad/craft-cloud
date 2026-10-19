@@ -1026,6 +1026,9 @@ impl<S: DocStore> Replica<S> {
                 Ok(if push { doc.push_next(id, &mut self.notes, &mut self.peers) } else { Vec::new() })
             }
             ServerFrame::Error { code, message, doc, client_seq } => self.refused(&code, &message, doc, client_seq),
+            ServerFrame::Compact { .. } | ServerFrame::Snapshot { .. } | ServerFrame::Presence { .. } | ServerFrame::CreatedDocument { .. } => {
+                Ok(Vec::new())
+            }
         }
     }
 

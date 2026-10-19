@@ -284,6 +284,10 @@ impl Session {
                 Ok(seq) => ServerFrame::Ack { doc, client_seq, seq },
                 Err(e) => refused(e, Some(doc), Some(client_seq)),
             }),
+            ClientFrame::CreateDocument { doc, .. }
+            | ClientFrame::Snapshot { doc, .. }
+            | ClientFrame::Presence { doc, .. }
+            | ClientFrame::SubscribeLog { doc, .. } => one(refused(ApiError::invalid("this server doesn't take that frame yet"), Some(doc), None)),
         }
     }
 
