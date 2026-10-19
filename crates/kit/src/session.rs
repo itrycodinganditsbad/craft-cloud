@@ -206,6 +206,41 @@ pub struct SaveRecord {
     pub version: Vec<(u64, u32)>,
 }
 
+/// What a save is made from ([`Session::save_point`]): the model to write, and the live document's version it
+/// matches.
+pub struct SavePoint<D: LiveDocument> {
+    model: Arc<D::Doc>,
+    frontiers: Vec<u8>,
+    version: Vec<(u64, u32)>,
+}
+
+impl<D: LiveDocument> SavePoint<D> {
+    /// The model to write to the file.
+    pub fn model(&self) -> &Arc<D::Doc> {
+        &self.model
+    }
+
+    /// The live document's version vector (peer, end counter) the model matches.
+    pub fn version(&self) -> &[(u64, u32)] {
+        &self.version
+    }
+}
+
+impl<D: LiveDocument> Clone for SavePoint<D> {
+    fn clone(&self) -> Self {
+        Self { model: self.model.clone(), frontiers: self.frontiers.clone(), version: self.version.clone() }
+    }
+}
+
+impl<D: LiveDocument> std::fmt::Debug for SavePoint<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SavePoint").field("version", &self.version).finish_non_exhaustive()
+    }
+}
+
+/// How many save records a session keeps to tell the agent (again) when it is back.
+const KEPT_RECORDS: usize = 16;
+
 /// Another machine's (or app's) presence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
@@ -321,6 +356,8 @@ pub struct Session<D: LiveDocument> {
     /// The agent refused a change for now (its disk): the queue goes again, in order, from this moment.
     resend_at: Instant,
     resend_backoff: Duration,
+    /// The last saves' records, told the agent again on every reconnect (it may have missed them; it keeps one once).
+    records: VecDeque<SaveRecord>,
 }
 
 impl<D: LiveDocument> std::fmt::Debug for Session<D> {
@@ -565,6 +602,7 @@ impl<D: LiveDocument> Session<D> {
             model_stale: false,
             resend_at: Instant::now(),
             resend_backoff: FIRST_BACKOFF,
+            records: VecDeque::new(),
         };
         session.reindex_trees();
         session.check_schema();
@@ -620,6 +658,10 @@ impl<D: LiveDocument> Session<D> {
         }
         self.outbox_bytes = self.outbox.iter().map(|o| o.bytes.len()).sum();
         self.take_peer(link.doc.peer());
+        // Saves made while the agent was away (and the last ones again: the agent keeps a record once).
+        for r in &self.records {
+            let _ = link.doc.saved(r.hash, &r.frontiers, &r.version);
+        }
         self.link = Some(link);
         self.backoff = FIRST_BACKOFF;
         self.send_outbox();
@@ -1268,24 +1310,59 @@ impl<D: LiveDocument> Session<D> {
         &self.peers
     }
 
-    /// The app saved the document's file with `bytes`: notes the save in the document (so the file isn't taken for
-    /// one changed outside Craft) and tells the agent, which records it with the version it uploads.
-    pub fn saved(&mut self, bytes: &[u8]) -> Result<SaveRecord, KitError> {
+    /// Where a save starts: the model to write to the file and the live document's version it matches. Refused
+    /// ([`KitError::NoRecord`]) when a save now can't say what it holds: the document is read-only (a newer app's), the
+    /// session is stalled or stopped, or the model is behind the live document (a remote change it couldn't take
+    /// yet). The app then saves its own model without a record, as it would without Craft Cloud.
+    ///
+    /// The order of a save: `save_point`, the bytes from [`SavePoint::model`], [`Session::record`] with them, and only
+    /// then the write to disk (the agent has to know the content before its sync pass sees it).
+    pub fn save_point(&self) -> Result<SavePoint<D>, KitError> {
+        let no = |why: &str| Err(KitError::NoRecord(why.to_owned()));
+        if self.status.read_only.is_some() {
+            return no("the document is a newer app's (read-only here)");
+        }
+        if self.outbox_bytes >= MAX_QUEUE_BYTES {
+            return no("too much waits for Craft Cloud (stalled)");
+        }
+        if self.status.stopped || self.refused.is_some() || self.status.replaced {
+            return no("the live document stopped here");
+        }
+        if self.model_stale {
+            return no("the model is behind the live document");
+        }
+        let mut version: Vec<(u64, u32)> = self.doc.oplog_vv().iter().map(|(p, c)| (*p, u32::try_from(*c).unwrap_or(0))).collect();
+        version.sort_unstable();
+        if version.len() > craft_cloud_api::local::MAX_SAVE_PEERS {
+            return no("too many machines and windows have edited the document");
+        }
+        Ok(SavePoint { model: self.model.clone(), frontiers: self.doc.oplog_frontiers().encode(), version })
+    }
+
+    /// The app is about to write `bytes` (made from `point`'s model) to the document's file: tells the agent first
+    /// (or, while it is away, keeps the record and tells it once back; it is added to the file's version then), so the
+    /// version the agent uploads for that content carries the record. Call it before the write.
+    pub fn record(&mut self, point: &SavePoint<D>, bytes: &[u8]) -> SaveRecord {
         let hash = *blake3::hash(bytes).as_bytes();
         if self.status.read_only.is_none() {
             let mut w = Writer::new(&self.doc, KIT_ORIGIN);
-            mark_saved(&mut w, &hash)?;
-            let (updates, _) = w.finish()?;
-            self.queue(updates);
+            let marked = mark_saved(&mut w, &hash);
+            if let (Ok(()), Ok((updates, _))) = (marked, w.finish()) {
+                self.queue(updates);
+            }
         }
         self.status.changed_outside = false;
         self.read_from = None;
-        let version = self.doc.oplog_vv().iter().map(|(p, c)| (*p, u32::try_from(*c).unwrap_or(0))).collect();
-        let record = SaveRecord { hash, frontiers: self.doc.oplog_frontiers().encode(), version };
+        let record = SaveRecord { hash, frontiers: point.frontiers.clone(), version: point.version.clone() };
+        self.records.push_back(record.clone());
+        while self.records.len() > KEPT_RECORDS {
+            self.records.pop_front();
+        }
         if let Some(link) = &self.link {
+            // Not sent (the connection just broke): it goes on the reconnect, with the others kept.
             let _ = link.doc.saved(record.hash, &record.frontiers, &record.version);
         }
-        Ok(record)
+        record
     }
 
     /// The live document's state as a Loro snapshot (for tests and diagnostics).

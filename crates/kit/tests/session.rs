@@ -461,7 +461,7 @@ fn saves_reach_the_agent_and_a_file_changed_outside_is_reported() {
     let mut a = open_with_bytes(&pc, "s.txt", Notes::new("s", &["x"]), b"as read at import");
     assert!(!a.status().changed_outside, "the import's own bytes");
     change(&mut a, |m| m.with_title("saved")).unwrap();
-    let record = a.saved(b"as saved").unwrap();
+    let record = save(&mut a, b"as saved");
     assert_eq!(record.hash, *blake3::hash(b"as saved").as_bytes());
     assert!(record.version.iter().any(|(p, _)| *p == a.peer()), "this session's edits are in it");
     until(&mut [&mut a], "the agent has the record", |_| pc.saves().iter().any(|(h, _)| *h == craft_cloud_api::local::blobs::hex(&record.hash)));
@@ -475,6 +475,60 @@ fn saves_reach_the_agent_and_a_file_changed_outside_is_reported() {
     until(&mut [&mut other], "caught up", |s| s.iter().all(|s| *s.model().title == "saved"));
     assert!(other.status().changed_outside);
     // Saving clears it.
-    other.saved(b"saved from the live document").unwrap();
+    save(&mut other, b"saved from the live document");
     assert!(!other.status().changed_outside);
+}
+
+/// A save as an app makes it: the save point, then the record (before the file is written).
+fn save<D: craft_cloud_kit::LiveDocument>(s: &mut Session<D>, bytes: &[u8]) -> craft_cloud_kit::SaveRecord {
+    let point = s.save_point().unwrap();
+    s.record(&point, bytes)
+}
+
+/// A save point says which model the bytes come from and the version it matches; there is none (and so no record)
+/// when the document is read-only here (the reviewer's probe), stopped, or the model is behind the live document.
+#[test]
+fn a_save_point_is_refused_when_a_record_would_be_wrong() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let _newer = open::<NotesApp<2>>(&pc, "r.txt", Notes::new("v2", &["a"]));
+    let mut older = open::<NotesApp<1>>(&laptop, "r.txt", Notes::default());
+    assert!(older.status().read_only.is_some());
+    assert!(matches!(older.save_point(), Err(KitError::NoRecord(_))), "read-only");
+    for _ in 0..20 {
+        older.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(laptop.saves().is_empty(), "no record from a read-only document");
+    // Stopped: a change refused for good.
+    let mut a = open::<App>(&pc, "q.txt", Notes::new("q", &[]));
+    let point = a.save_point().unwrap();
+    assert_eq!(**point.model(), **a.model());
+    assert!(point.version().iter().any(|(p, _)| *p == a.peer()));
+    pc.refuse_next("invalid", 1);
+    change(&mut a, |m| m.with_title("refused")).unwrap();
+    until(&mut [&mut a], "stopped", |s| s.iter().all(|s| s.status().stopped));
+    assert!(matches!(a.save_point(), Err(KitError::NoRecord(_))), "stopped");
+}
+
+/// The record goes to the agent before the file is written, and one made while the agent is away is kept and goes
+/// once it is back (the agent then adds it to the version it uploaded meanwhile).
+#[test]
+fn a_record_made_while_the_agent_is_away_goes_once_it_is_back() {
+    let hub = Hub::new();
+    let pc = hub.machine("pc").unwrap();
+    let mut a = open::<App>(&pc, "w.txt", Notes::new("w", &[]));
+    let hex = |b: &[u8]| craft_cloud_api::local::blobs::hex(blake3::hash(b).as_bytes());
+    save(&mut a, b"saved with the agent there");
+    until(&mut [&mut a], "told at once", |_| pc.saves().iter().any(|(h, _)| *h == hex(b"saved with the agent there")));
+    pc.restart();
+    until(&mut [&mut a], "the agent went", |s| s.iter().all(|s| !s.status().connected));
+    change(&mut a, |m| m.with_title("offline")).unwrap();
+    let record = save(&mut a, b"saved while the agent was away");
+    assert!(record.version.iter().any(|(p, _)| *p == a.peer()));
+    assert!(!pc.saves().iter().any(|(h, _)| *h == hex(b"saved while the agent was away")));
+    pc.start();
+    until(&mut [&mut a], "the record went once the agent was back", |_| {
+        pc.saves().iter().any(|(h, v)| *h == hex(b"saved while the agent was away") && *v == record.version)
+    });
 }

@@ -135,12 +135,26 @@ applies.
 
 ## Saving
 
-Save and autosave work as before. After writing the file, tell the session what was written:
+Save and autosave work as before, in this order:
 
 ```rust
+// 1. Where the save starts: the model to write and the live document's version it matches.
+let point = self.session.save_point();
+// 2. The bytes, from that model (or, with no save point, from the app's own model: no record then).
+let bytes = to_file(point.as_ref().map_or(&self.model, |p| p.model()));
+// 3. The record (content hash and version) to the agent, before the file changes on disk.
+if let Ok(point) = &point {
+    self.session.record(point, &bytes);
+}
+// 4. The write.
 write_atomic(&path, &bytes)?;
-self.session.saved(&bytes)?; // the save record: content hash and the document's version
 ```
+
+`save_point()` refuses (`KitError::NoRecord`) when a record would be wrong: the document is read-only here (a newer
+app's), the session is stalled or stopped, or the model is behind the live document. The app saves its own model
+then, and the file syncs as any file does. The record goes before the write so the agent knows the content before
+its sync pass sees it; while the agent is away the session keeps the record and tells it once back, and the agent
+adds it to the version it uploaded meanwhile (a server call of its own, appended once).
 
 The agent records it with the version it uploads, so two machines saving one live file never make a conflict copy:
 the save that includes the other's wins, or else the newer upload (the live document has both sides' edits, and the

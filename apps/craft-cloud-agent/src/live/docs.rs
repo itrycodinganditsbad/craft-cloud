@@ -146,7 +146,12 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                     let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
                     let added = tokio::task::spawn_blocking(move || book.add(doc, &hash, version, at)).await.unwrap_or_else(|e| Err(e.to_string()));
                     match added {
-                        Ok(()) => Ok(true),
+                        Ok(()) => {
+                            // A record that comes after its file went up (saved while the agent was away) is added to
+                            // that version by the next pass.
+                            api.control.request_pass();
+                            Ok(true)
+                        }
                         Err(message) => {
                             Ok(send_json(socket, &DocsEvent::Error { id: None, seq: None, code: api_codes::INVALID.into(), message }).await)
                         }

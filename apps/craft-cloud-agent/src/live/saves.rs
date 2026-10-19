@@ -4,8 +4,9 @@
 //! version it uploads with saved content carries the record, and two saved versions of one document never make a
 //! conflict copy.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use craft_cloud_proto::live::node_doc;
 use craft_cloud_proto::ops::MAX_SAVE_PEERS;
@@ -31,11 +32,16 @@ struct Entry {
 /// Adds from several app connections at once take turns.
 static WRITING: Mutex<()> = Mutex::new(());
 
+/// The book as last read: the file's modification time and length then, and its entries by document and content.
+type Read = (Option<(std::time::SystemTime, u64)>, Arc<HashMap<(DocId, String), Entry>>);
+
 /// A space's save records.
 #[derive(Debug, Clone)]
 pub struct SaveBook {
     path: PathBuf,
     space: SpaceId,
+    /// Read again only when the file changed (the sync engine asks for every file of every pass).
+    cache: Arc<Mutex<Option<Read>>>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -44,11 +50,36 @@ fn hex(bytes: &[u8]) -> String {
 
 impl SaveBook {
     pub fn new(data: &Path, space: SpaceId) -> Self {
-        Self { path: data.join("live").join(space.to_string()).join("saves.json"), space }
+        Self { path: data.join("live").join(space.to_string()).join("saves.json"), space, cache: Arc::new(Mutex::new(None)) }
     }
 
     fn entries(&self) -> Vec<Entry> {
         std::fs::read(&self.path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    /// The entries by document and content, from the cache unless the file changed.
+    fn by_key(&self) -> Arc<HashMap<(DocId, String), Entry>> {
+        let stamp = std::fs::metadata(&self.path).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
+        let mut cache = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((seen, map)) = cache.as_ref()
+            && *seen == stamp
+            && stamp.is_some()
+        {
+            return map.clone();
+        }
+        let mut map = HashMap::new();
+        // Newest first in the file: the first of a key is kept.
+        for e in self.entries() {
+            map.entry((e.doc, e.hash.clone())).or_insert(e);
+        }
+        let map = Arc::new(map);
+        *cache = Some((stamp, map.clone()));
+        map
+    }
+
+    /// The record of `doc`'s save with content `hash` (hex), if an app on this machine saved exactly that.
+    pub fn find(&self, doc: DocId, hash: &str) -> Option<SaveRecord> {
+        self.by_key().get(&(doc, hash.to_owned())).map(|e| SaveRecord { doc, version: e.version.clone() })
     }
 
     /// Notes a save of `doc` with content `hash` (64 hex digits) at `version`. Refused (`Err` with why) when the
@@ -72,15 +103,16 @@ impl SaveBook {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         let json = serde_json::to_vec(&entries).map_err(|e| e.to_string())?;
-        write_atomic(&self.path, &json, true).map_err(|e| e.to_string())
+        let written = write_atomic(&self.path, &json, true).map_err(|e| e.to_string());
+        // (A write within the file clock's resolution could keep its stamp.)
+        *self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        written
     }
 }
 
 impl SaveRecords for SaveBook {
     fn record(&self, node: NodeId, hash: &FileHash) -> Option<SaveRecord> {
-        let doc = node_doc(self.space, node);
-        let hash = hex(hash.as_bytes());
-        self.entries().into_iter().find(|e| e.doc == doc && e.hash == hash).map(|e| SaveRecord { doc, version: e.version })
+        self.find(node_doc(self.space, node), &hex(hash.as_bytes()))
     }
 }
 

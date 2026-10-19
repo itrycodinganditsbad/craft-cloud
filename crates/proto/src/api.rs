@@ -134,6 +134,17 @@ pub struct CommitRequest {
     pub ops: Vec<Op>,
 }
 
+/// `POST /api/v1/saves`: a save record for a version that went up without one (its app's record reached the agent
+/// late). Appended: a version that has one keeps it, and the same call again changes nothing. Answered with a
+/// [`CommitResponse`] (the sequence number the node is in the change feed at, or the current one when nothing
+/// changed); `not_found` when the node has no such version. An older server answers `not_found` for the path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveAttach {
+    pub node: crate::NodeId,
+    pub version: crate::VersionId,
+    pub save: crate::SaveRecord,
+}
+
 /// A commit that applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitResponse {

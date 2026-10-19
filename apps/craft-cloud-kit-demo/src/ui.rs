@@ -259,17 +259,21 @@ impl Demo {
         self.dirty_since.get_or_insert_with(Instant::now);
     }
 
-    /// Writes the file (atomically) and, live, tells the session (the save record).
+    /// Writes the file (atomically). Live, in the kit's order: the save point (the model and the live document's
+    /// version it matches), the record to the agent, then the write. Without a save point (read-only, stopped, …) it
+    /// writes its own model with no record.
     pub fn save(&mut self) {
-        let bytes = model::to_file(&self.model);
+        let point = match &self.mode {
+            Mode::Live(session) => session.save_point().map_err(|e| self.message = e.to_string()).ok(),
+            _ => None,
+        };
+        let bytes = model::to_file(point.as_ref().map_or(&self.model, |p| p.model()));
+        if let (Mode::Live(session), Some(point)) = (&mut self.mode, &point) {
+            session.record(point, &bytes);
+        }
         if let Err(e) = write_atomic(&self.file, &bytes) {
             self.message = format!("not saved: {e}");
             return;
-        }
-        if let Mode::Live(session) = &mut self.mode
-            && let Err(e) = session.saved(&bytes)
-        {
-            self.message = e.to_string();
         }
         if let Some(w) = &self.watch {
             w.add_recent(&self.rel, true);

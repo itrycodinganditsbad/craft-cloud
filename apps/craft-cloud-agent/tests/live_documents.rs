@@ -738,6 +738,35 @@ async fn a_craft_save_goes_up_with_its_record() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(plain, "an edit outside Craft goes up without a record");
+    // A save whose record comes after its upload (made while the agent was away): added to that version.
+    let late = b"saved while the agent was away".to_vec();
+    std::fs::write(pc.folder.join("story.txt"), &late).unwrap();
+    let mut up = None;
+    for _ in 0..600 {
+        if let Some(f) = current(server.meta.clone()).await
+            && f.size == late.len() as u64
+        {
+            up = Some(f);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let up = up.expect("the save went up");
+    assert_eq!(up.save, None);
+    app.doc.saved(*blake3::hash(&late).as_bytes(), &[1], &[(31, 9)]).unwrap();
+    let mut added = None;
+    for _ in 0..600 {
+        if let Some(f) = current(server.meta.clone()).await
+            && f.save.is_some()
+        {
+            added = Some(f);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let added = added.expect("the late record was added");
+    assert_eq!(added.version, up.version, "to the version that went up");
+    assert_eq!(added.save.map(|s| s.version), Some(vec![(31, 9)]));
     drop((docs, app));
     run_pc.stop().await.0.unwrap();
 }

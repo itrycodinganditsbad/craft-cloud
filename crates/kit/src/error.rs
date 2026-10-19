@@ -35,6 +35,10 @@ pub enum KitError {
     /// no local change is taken from it until the session has rebuilt it whole (it tries at each poll).
     #[error("model_stale: the model is behind the live document; wait for the session to rebuild it")]
     ModelStale,
+    /// A save now carries no record ([`crate::Session::save_point`] says why): the app saves its own model as it
+    /// would without Craft Cloud, and the file syncs as any file does (a conflict copy if it meets another edit).
+    #[error("this save can't carry a record: {0}")]
+    NoRecord(String),
     /// The step changed more text than can be undone while others edit (Loro's undo of it would freeze the app). It
     /// stays on the undo stack as a barrier.
     #[error("too large to undo while others edit ({bytes} bytes of text)")]

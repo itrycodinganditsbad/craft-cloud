@@ -87,6 +87,7 @@ on_every_backend!(
     a_new_space_has_only_its_root,
     a_version_keeps_its_save_record,
     pages_of_save_records_stay_small,
+    a_late_save_record_is_appended_once,
     manifests_need_their_chunks_and_are_per_space,
     stored_bytes_are_counted_once_per_space_and_capped,
     concurrent_chunk_batches_charge_a_shared_chunk_once,
@@ -162,6 +163,33 @@ async fn device(meta: &Meta, u: &UserRecord) -> DeviceId {
 }
 
 /// Uploads one random chunk and a manifest for it to the user's space; returns the manifest ID.
+/// A save record that comes after its version: added to that version (the node is in the change feed again), once;
+/// a version with a record keeps it; the same call again changes nothing; another node's version is not found.
+async fn a_late_save_record_is_appended_once(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = meta.create_device(u.id, "pc", &[3u8; 32], NOW).await.unwrap();
+    let parent = root(meta, &u).await;
+    let m = manifest(meta, &u, 4).await;
+    let (node, v) = (NodeId::generate(), version(m));
+    meta.commit(u.space, dev, &[Op::Create { node, parent, name: name("late.kitdemo"), version: v.clone() }], NOW).await.unwrap();
+    let before = meta.space_info(u.space).await.unwrap().seq;
+    let record = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::DocId::generate(), version: vec![(1, 5)] };
+    let added = meta.attach_save(u.space, node, v.id, &record).await.unwrap();
+    assert_eq!(added.seq, before + 1);
+    let feed = meta.changes(u.space, before, None, MAX_PAGE_NODES).await.unwrap();
+    let NodeKind::File(f) = &find(&feed.nodes, node).kind else { panic!("a file") };
+    assert_eq!((f.version, f.save.clone()), (v.id, Some(record.clone())), "in the feed again, with its record");
+    let other = craft_cloud_proto::SaveRecord { doc: record.doc, version: vec![(2, 1)] };
+    assert_eq!(meta.attach_save(u.space, node, v.id, &other).await.unwrap().seq, before + 1, "kept, nothing changed");
+    assert_eq!(meta.attach_save(u.space, node, v.id, &record).await.unwrap().seq, before + 1);
+    let tree = full_tree(meta, u.space).await;
+    let NodeKind::File(f) = &find(&tree.nodes, node).kind else { panic!("a file") };
+    assert_eq!(f.save, Some(record));
+    assert!(matches!(meta.attach_save(u.space, NodeId::generate(), v.id, &other).await, Err(MetaError::NotFound(_))));
+    let too_many = craft_cloud_proto::SaveRecord { doc: other.doc, version: (0..=craft_cloud_proto::ops::MAX_SAVE_PEERS as u64).map(|p| (p, 1)).collect() };
+    assert!(matches!(meta.attach_save(u.space, node, v.id, &too_many).await, Err(MetaError::Invalid(_))));
+}
+
 /// Files whose versions all carry the biggest save record there can be: every page of the listing and of the change
 /// feed ends before its records pass their budget, far under what an agent reads of a page, and the pages together
 /// still list every file once, each with its record.

@@ -183,3 +183,47 @@ async fn a_save_landing_while_the_server_wins_is_kept() {
         assert_eq!(on_a.len(), on_b.len(), "read {n}");
     }
 }
+
+/// The server's file version of `doc.kitdemo`, as `m` lists it.
+async fn server_file(m: &Machine) -> craft_cloud_proto::FileState {
+    let listing = m.transport().tree(None).await.unwrap();
+    listing
+        .nodes
+        .into_iter()
+        .find_map(|n| match n.kind {
+            craft_cloud_proto::NodeKind::File(f) if !n.deleted => Some(f),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// A record that reaches the agent after its file went up (the app saved while the agent was away): the next pass adds
+/// it to that version on the server, once; the other machine learns it from the change feed; a version that has a
+/// record keeps it; and the call again changes nothing.
+#[tokio::test]
+async fn a_record_that_comes_late_is_added_to_its_version() {
+    let server = Server::new().await;
+    let (mut a, mut b, book_a, _book_b, doc) = two(&server).await;
+    let saved = b"saved while the agent was away".to_vec();
+    a.fs_mut().write(&path("doc.kitdemo"), &saved, false, 0).unwrap();
+    a.sync_once().await.unwrap();
+    let up = server_file(&a).await;
+    assert_eq!(up.save, None, "it went up without its record");
+    // The record comes.
+    let record = SaveRecord { doc, version: vec![(1, 7)] };
+    book_a.0.lock().unwrap().insert((node(&a, "doc.kitdemo"), FileHash::from_bytes(*blake3::hash(&saved).as_bytes())), record.clone());
+    a.sync_once().await.unwrap();
+    let late = server_file(&a).await;
+    assert_eq!((late.version, late.save.clone()), (up.version, Some(record.clone())), "added to the same version");
+    b.sync_once().await.unwrap();
+    let on_b = b.state().remote.values().find_map(|n| n.file.clone()).unwrap();
+    assert_eq!(on_b.save, Some(record.clone()), "the other machine learns it");
+    // Appended only, and the same again changes nothing.
+    let other = SaveRecord { doc, version: vec![(9, 9)] };
+    let seq = a.transport().space().await.unwrap().seq;
+    a.transport().attach_save(node(&a, "doc.kitdemo"), up.version, &other).await.unwrap();
+    a.transport().attach_save(node(&a, "doc.kitdemo"), up.version, &record).await.unwrap();
+    assert_eq!(server_file(&a).await.save, Some(record));
+    assert_eq!(a.transport().space().await.unwrap().seq, seq, "nothing changed");
+    assert!(a.transport().attach_save(NodeId::generate(), up.version, &other).await.is_err(), "no such version there");
+}

@@ -35,7 +35,7 @@ pub use opaque::Opaque;
 pub use props::{Props, PropsRead};
 pub use session::{
     Agent, Badge, LiveDocument, MAX_BACKOFF, MAX_QUEUE_BYTES, MAX_UNDO_TEXT_BYTES, NotLive, Open, PRESENCE_EVERY, PRESENCE_TTL, Peer, Polled,
-    ReadOnly, SaveRecord, Session, Status, UndoKind,
+    ReadOnly, SavePoint, SaveRecord, Session, Status, UndoKind,
 };
 pub use table::{TableTouch, TableView};
 pub use text::RichText;

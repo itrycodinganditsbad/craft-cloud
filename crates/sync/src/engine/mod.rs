@@ -348,6 +348,8 @@ pub struct Engine<F: Fs, T: Transport> {
     quota: Option<(u64, u64)>,
     /// What Craft apps saved from live documents ([`Engine::set_save_records`]).
     saves: Option<std::sync::Arc<dyn SaveRecords>>,
+    /// Versions a late save record was sent for this run (see [`Engine::attach_late_saves`]).
+    attached: BTreeSet<(NodeId, craft_cloud_proto::VersionId)>,
 }
 
 /// What Craft apps saved from live documents, as the agent learnt it from them (`craft_cloud_proto::SaveRecord`).
@@ -408,6 +410,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             declined_dir_ids: BTreeSet::new(),
             quota: None,
             saves: None,
+            attached: BTreeSet::new(),
         })
     }
 
@@ -507,7 +510,39 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         self.push(&mut report).await?;
         self.approval = Approval::None;
         self.release.clear();
+        self.attach_late_saves().await;
         Ok(report)
+    }
+
+    /// Save records that came after their version went up (an app saved while the agent was away, and told it once
+    /// back): each is added to its version on the server (appended; the same again changes nothing), so the version
+    /// counts as a Craft save everywhere. Only a file whose server version is the one this machine agreed on, with the
+    /// content the record names, and none yet. Sent once per version per run; an older server (`NotFound`) is let be,
+    /// anything else tried again next pass.
+    async fn attach_late_saves(&mut self) {
+        if self.saves.is_none() {
+            return;
+        }
+        let mut late = Vec::new();
+        for (id, entry) in self.state.base.iter() {
+            let BaseKind::File { version, hash, .. } = &entry.kind else { continue };
+            let Some(remote) = self.state.remote.get(id).and_then(|r| r.file.as_ref()) else { continue };
+            if remote.version != *version || remote.save.is_some() || self.attached.contains(&(*id, *version)) {
+                continue;
+            }
+            if let Some(record) = self.save_record(*id, hash) {
+                late.push((*id, *version, record));
+            }
+        }
+        for (node, version, record) in late {
+            self.attached.insert((node, version));
+            match self.transport.attach_save(node, version, &record).await {
+                Ok(()) | Err(TransportError::NotFound) => {}
+                Err(_) => {
+                    self.attached.remove(&(node, version));
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------- pull

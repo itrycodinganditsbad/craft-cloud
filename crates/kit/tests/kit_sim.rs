@@ -54,7 +54,9 @@ fn run_seed(seed: u64) {
                 sessions[i].redo().unwrap_or_else(|e| panic!("seed {seed} step {step}: redo: {e}"));
             }
             15 => {
-                sessions[i].saved(format!("seed {seed} step {step}").as_bytes()).unwrap();
+                if let Ok(point) = sessions[i].save_point() {
+                    sessions[i].record(&point, format!("seed {seed} step {step}").as_bytes());
+                }
             }
             16 => fakes[m].set_online(false),
             17 | 18 => fakes[m].set_online(true),
