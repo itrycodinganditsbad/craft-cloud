@@ -96,6 +96,8 @@ pub struct Client {
     token: String,
     /// Where `local-api.json` is: a watch looks there again to reconnect.
     dir: PathBuf,
+    /// Whether this agent knows `/v1/blobs`, once asked ([`blobs::Blobs`]): shared by the client's clones.
+    blobs_known: std::sync::Arc<std::sync::OnceLock<bool>>,
 }
 
 impl Client {
@@ -113,7 +115,12 @@ impl Client {
         let record: LocalApiFile = serde_json::from_slice(&bytes).map_err(|e| Error::NotRunning(format!("{} doesn't read: {e}", file.display())))?;
         // A file a crashed agent left behind names a port nobody, or someone else, answers on: the connection tells.
         // (Its pid isn't used for that: an app in a sandbox with a PID namespace of its own can't see the agent's.)
-        let client = Self { addr: SocketAddr::from((Ipv4Addr::LOCALHOST, record.port)), token: record.token, dir: dir.to_owned() };
+        let client = Self {
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, record.port)),
+            token: record.token,
+            dir: dir.to_owned(),
+            blobs_known: Default::default(),
+        };
         match client.status() {
             Ok(status) if (LOCAL_API_MIN..=LOCAL_API_MAX).contains(&status.api) => Ok(client),
             Ok(status) => Err(Error::Version(status.api)),
@@ -160,7 +167,7 @@ impl Client {
     /// A client of the agent at `addr` with `token` (a fake agent's, in tests), whose `local-api.json` is in `dir`.
     #[cfg(feature = "fake")]
     pub(crate) fn at(addr: SocketAddr, token: String, dir: PathBuf) -> Self {
-        Self { addr, token, dir }
+        Self { addr, token, dir, blobs_known: Default::default() }
     }
 
     /// Whether the agent is signed in, as whom, to which server, whether it is online and what it is doing. Quick

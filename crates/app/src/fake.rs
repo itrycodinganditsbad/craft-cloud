@@ -190,12 +190,18 @@ impl Hub {
 
     fn serve(&self, machine: usize, mut stream: TcpStream) {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-        let Ok(Some(request)) = read_request(&mut stream) else { return };
         let (token, running, too_old, name) = {
             let inner = lock(&self.inner);
             let Some(m) = inner.machines.get(&machine) else { return };
             (m.token.clone(), m.running, m.too_old, m.name.clone())
         };
+        // An agent from before blobs answers an unknown call from its fallback without reading the body.
+        let Ok(Some(request)) = read_request(&mut stream, !too_old) else { return };
+        if too_old && request.path.starts_with(paths::BLOBS) {
+            respond_error(&mut stream, 404, "not_found", "no such call");
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
         if !running {
             let _ = stream.shutdown(Shutdown::Both);
             return;
@@ -648,8 +654,9 @@ struct Request {
     body: Vec<u8>,
 }
 
-/// One HTTP request: its head (at most 16 KiB) and its body (by `Content-Length`, at most the blob limit).
-fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+/// One HTTP request: its head (at most 16 KiB) and, with `body`, its body (by `Content-Length`, at most the blob
+/// limit).
+fn read_request(stream: &mut TcpStream, body: bool) -> std::io::Result<Option<Request>> {
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
@@ -681,6 +688,9 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
                     ws_key: header("sec-websocket-key"),
                     body: buf.split_off(head.min(buf.len())),
                 };
+                if !body {
+                    return Ok(Some(request));
+                }
                 while request.body.len() < length {
                     let n = stream.read(&mut chunk)?;
                     if n == 0 {
@@ -787,6 +797,9 @@ mod tests {
         assert!(matches!(b.client().blobs().get(&[1; 32], 3), Err(crate::Error::Refused { code, .. }) if code == "blob_not_found"));
         b.too_old();
         assert!(matches!(b.client().blobs().put(b"x"), Err(crate::Error::Refused { code, .. }) if code == "agent_too_old"));
+        // A big put too: an old agent answers before reading the body, and the client asks before sending it.
+        let put = b.client().blobs().put(&vec![9u8; 8 * 1024 * 1024]);
+        assert!(matches!(&put, Err(crate::Error::Refused { code, .. }) if code == "agent_too_old"), "{put:?}");
         assert!(matches!(b.client().blobs().get(&stored.hash, stored.len), Err(crate::Error::Refused { code, .. }) if code == "agent_too_old"));
         assert!(b.client().status().is_ok(), "the rest still works");
         let big = vec![0u8; MAX_UPDATE_BYTES + 1];
