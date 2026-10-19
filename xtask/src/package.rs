@@ -312,8 +312,24 @@ mod tests {
             std::fs::write(src.join("craft-cloud.png"), "png").unwrap();
             std::fs::write(src.join(LICENSES), "licences").unwrap();
             std::fs::copy(crate::root().join("packaging/linux/install.sh"), src.join("install.sh")).unwrap();
-            std::fs::write(bin.join("systemctl"), format!("#!/bin/sh\necho \"systemctl $*{note}\" >> \"{}\"\n", calls.display())).unwrap();
-            for file in [src.join("craft-cloud-agent"), src.join("craft-cloud"), src.join("install.sh"), bin.join("systemctl")] {
+            // systemd-run: one unit of a name at a time (`unit` marks it running); systemctl says so for is-active.
+            let unit = tmp.join("unit-running");
+            let systemctl = format!(
+                "#!/bin/sh\nif [ \"$3\" = is-active ]; then [ -e \"{unit}\" ]; exit; fi\necho \"systemctl $*{note}\" >> \"{calls}\"\n",
+                unit = unit.display(),
+                calls = calls.display()
+            );
+            std::fs::write(bin.join("systemctl"), systemctl).unwrap();
+            let systemd_run = format!(
+                "#!/bin/sh\nopts=\"\"\nwhile [ \"${{1#--}}\" != \"$1\" ]; do opts=\"$opts $1\"; shift; done\n[ -e \"{unit}\" ] && exit 1\n\
+                 echo \"systemd-run$opts\" >> \"{calls}\"\ntouch \"{unit}\"\n(\"$@\"; rm -f \"{unit}\") >/dev/null 2>&1 &\n",
+                unit = unit.display(),
+                calls = calls.display()
+            );
+            std::fs::write(bin.join("systemd-run"), systemd_run).unwrap();
+            for file in
+                [src.join("craft-cloud-agent"), src.join("craft-cloud"), src.join("install.sh"), bin.join("systemctl"), bin.join("systemd-run")]
+            {
                 std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
             let unit = home.join(".config/systemd/user/craft-cloud-agent.service");
@@ -431,6 +447,45 @@ mod tests {
         assert!(!up.home.join(".local/lib/craft-cloud").exists(), "nothing installed");
         std::thread::sleep(std::time::Duration::from_secs(2));
         assert!(!up.calls().iter().any(|c| c.starts_with("systemctl")), "not while it runs: {:?}", up.calls());
+        assert!(up.calls().iter().any(|c| c == "systemd-run --user --quiet --collect --unit=craft-cloud-agent-restart"), "{:?}", up.calls());
+        up.agent_ends();
+        let start = "systemctl --user start craft-cloud-agent.service";
+        assert_eq!(up.ends_with(start).last().map(String::as_str), Some(start));
+    }
+
+    /// Two installs that give up while the agent finishes a long pass: the second finds the first's waiter (a systemd
+    /// unit of a fixed name) and adds none, so the agent is started once.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_second_install_that_gives_up_adds_no_second_waiter() {
+        let up = Upgrade::new("timeout-twice", 1, 120);
+        for _ in 0..2 {
+            let _ = std::fs::remove_file(up.tmp.join("quits.txt"));
+            let out = up.install("2");
+            assert_eq!(out.status.code(), Some(1), "{out:?}");
+        }
+        up.agent_ends();
+        let start = "systemctl --user start craft-cloud-agent.service";
+        up.ends_with(start);
+        // Time for a second start, if there were a second waiter.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let calls = up.calls();
+        assert_eq!(calls.iter().filter(|c| c.starts_with("systemd-run")).count(), 1, "{calls:?}");
+        assert_eq!(calls.iter().filter(|c| *c == start).count(), 1, "{calls:?}");
+    }
+
+    /// Without systemd-run the waiter runs in the background of this shell (nohup).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn without_systemd_run_the_waiter_still_starts_the_agent() {
+        let up = Upgrade::new("timeout-nosystemdrun", 1, 120);
+        std::fs::remove_file(up.bin.join("systemd-run")).unwrap();
+        // The test's PATH has /usr/bin too, where a real systemd-run may be: a stand-in that isn't there.
+        std::fs::write(up.bin.join("systemd-run"), "#!/bin/sh\nexit 1\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(up.bin.join("systemd-run"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = up.install("2");
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
         up.agent_ends();
         let start = "systemctl --user start craft-cloud-agent.service";
         assert_eq!(up.ends_with(start).last().map(String::as_str), Some(start));

@@ -47,9 +47,11 @@ has_unit() {
 
 # Starts the agent again once the process $1 (or, with no pid known, the one whose local-api.json is in the data
 # folder) has ended and so let go of the data folder: an agent started before that finds the folder taken and exits.
-# Through systemd when $2 is "systemd", else `$3 run --log`. In the background: the wait may be long.
+# Through systemd when $2 is "systemd", else `$3 run --log`. In the background: the wait may be long. Where the user
+# has systemd, the waiter is a unit of its own (systemd-run --user): it outlives this login session (logind's
+# KillUserProcesses), and its fixed name keeps it to one at a time; a second install that gives up finds it waiting.
 start_after_exit() {
-    nohup sh -c '
+    waiter='
         n=0
         if [ -n "$1" ]; then
             while kill -0 "$1" 2>/dev/null && [ "$n" -lt 86400 ]; do
@@ -68,7 +70,16 @@ start_after_exit() {
         else
             "$3" run --log
         fi
-    ' sh "$1" "$2" "$3" "$data" >/dev/null 2>&1 &
+    '
+    if command -v systemd-run >/dev/null 2>&1; then
+        if systemd-run --user --quiet --collect --unit=craft-cloud-agent-restart /bin/sh -c "$waiter" sh "$1" "$2" "$3" "$data" >/dev/null 2>&1; then
+            return 0
+        fi
+        if command -v systemctl >/dev/null 2>&1 && systemctl --user --quiet is-active craft-cloud-agent-restart.service 2>/dev/null; then
+            return 0
+        fi
+    fi
+    nohup sh -c "$waiter" sh "$1" "$2" "$3" "$data" >/dev/null 2>&1 &
 }
 
 # The agent that ran and was stopped is started again (once): this computer keeps syncing.
