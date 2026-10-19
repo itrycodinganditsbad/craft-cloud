@@ -1130,7 +1130,7 @@ mod tests {
             self.meta.add_manifest(space, &manifest, 100, 0).await.unwrap();
             let root = self.meta.space_info(space).await.unwrap().root;
             let node = NodeId::generate();
-            let version = NewVersion { id: craft_cloud_proto::VersionId::generate(), manifest: manifest.id(), mtime_ms: 0, exec: false };
+            let version = NewVersion { id: craft_cloud_proto::VersionId::generate(), manifest: manifest.id(), mtime_ms: 0, exec: false, save: None };
             let op = Op::Create { node, parent: root, name: Name::new(name).unwrap(), version };
             self.meta.commit(space, auth.device, &[op], 0).await.unwrap();
             node

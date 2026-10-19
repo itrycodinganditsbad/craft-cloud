@@ -13,7 +13,7 @@ use crate::{Meta, MetaError};
 
 /// Node columns plus its current version (if a file).
 const NODE_SELECT: &str = "SELECT n.id, n.parent, n.name, n.is_dir, n.deleted, n.changed_seq, v.id AS v_id, v.manifest AS v_manifest, v.size AS v_size, \
-     v.mtime_ms AS v_mtime, v.exec AS v_exec, v.device AS v_device, v.epoch AS v_epoch \
+     v.mtime_ms AS v_mtime, v.exec AS v_exec, v.device AS v_device, v.epoch AS v_epoch, v.save AS v_save \
      FROM nodes n LEFT JOIN versions v ON v.space_id = n.space_id AND v.id = n.version";
 
 /// A space's epoch, current sequence number and root directory.
@@ -57,6 +57,8 @@ fn node_state(row: &AnyRow) -> Result<NodeState, MetaError> {
             exec: flag(row, "v_exec")?,
             device: DeviceId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("v_device")?)?),
             epoch: Epoch::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("v_epoch")?)?),
+            // A record that doesn't read is as none: the file syncs as any file does.
+            save: row.try_get::<Option<String>, _>("v_save")?.and_then(|json| serde_json::from_str(&json).ok()),
         })
     };
     Ok(NodeState {

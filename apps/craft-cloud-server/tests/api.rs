@@ -265,7 +265,12 @@ async fn root(s: &Server, token: &str) -> NodeId {
 }
 
 fn create(node: NodeId, parent: NodeId, name: &str, manifest: ManifestId) -> Op {
-    Op::Create { node, parent, name: Name::new(name).unwrap(), version: NewVersion { id: VersionId::generate(), manifest, mtime_ms: 1, exec: false } }
+    Op::Create {
+        node,
+        parent,
+        name: Name::new(name).unwrap(),
+        version: NewVersion { id: VersionId::generate(), manifest, mtime_ms: 1, exec: false, save: None },
+    }
 }
 
 // ---- scenarios ----

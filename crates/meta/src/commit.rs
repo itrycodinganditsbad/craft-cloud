@@ -180,9 +180,14 @@ impl Ctx<'_> {
         let Some(size) = manifest_file_size(self.conn, space, &v.manifest).await? else {
             return Ok(Err(ConflictKind::MissingManifest { manifest: v.manifest }));
         };
+        // The save record as the agent sent it (the server never reads what it means), within its peer limit.
+        let save = match &v.save {
+            Some(record) if record.version.len() <= craft_cloud_proto::ops::MAX_SAVE_PEERS => serde_json::to_string(record).ok(),
+            _ => None,
+        };
         sqlx::query(
-            "INSERT INTO versions (space_id, id, node, parent_version, epoch, manifest, size, mtime_ms, exec, device, created_ms, seq) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            "INSERT INTO versions (space_id, id, node, parent_version, epoch, manifest, size, mtime_ms, exec, device, created_ms, seq, save) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(self.space())
         .bind(uuid_bytes(v.id.as_uuid()))
@@ -196,6 +201,7 @@ impl Ctx<'_> {
         .bind(uuid_bytes(self.device.as_uuid()))
         .bind(self.now_ms)
         .bind(self.seq)
+        .bind(save)
         .execute(&mut *self.conn)
         .await?;
         Ok(Ok(()))

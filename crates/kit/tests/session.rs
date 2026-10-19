@@ -242,3 +242,37 @@ fn blobs_go_through_the_agent_and_an_old_agent_says_so() {
     let opened = Session::<App>::open(&common::agent(&pc), "x.txt", Arc::new(Notes::default()), None).unwrap();
     assert!(matches!(opened, Open::NotLive(_)));
 }
+
+fn open_with_bytes(fake: &craft_cloud_app::fake::Fake, path: &str, file: Notes, bytes: &[u8]) -> Session<App> {
+    match Session::<App>::open(&common::agent(fake), path, Arc::new(file), Some(bytes)).unwrap() {
+        Open::Live(s) => *s,
+        Open::NotLive(why) => panic!("not live: {why:?}"),
+    }
+}
+
+/// Saving tells the agent (content hash and version) and marks the document; a machine that opens the file with
+/// content a Craft app saved (or imported) sees nothing changed outside, one with other content does.
+#[test]
+fn saves_reach_the_agent_and_a_file_changed_outside_is_reported() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open_with_bytes(&pc, "s.txt", Notes::new("s", &["x"]), b"as read at import");
+    assert!(!a.status().changed_outside, "the import's own bytes");
+    change(&mut a, |m| m.with_title("saved")).unwrap();
+    let record = a.saved(b"as saved").unwrap();
+    assert_eq!(record.hash, *blake3::hash(b"as saved").as_bytes());
+    assert!(record.version.iter().any(|(p, _)| *p == a.peer()), "this session's edits are in it");
+    until(&mut [&mut a], "the agent has the record", |_| pc.saves().iter().any(|(h, _)| *h == craft_cloud_api::local::blobs::hex(&record.hash)));
+    until(&mut [&mut a], "sent", |s| s.iter().all(|s| s.status().queued == 0));
+    // (The save mark may come with the agent's first updates after the state: looked at again as they come.)
+    let mut same = open_with_bytes(&laptop, "s.txt", Notes::default(), b"as saved");
+    until(&mut [&mut same], "the save is known", |s| s.iter().all(|s| *s.model().title == "saved" && !s.status().changed_outside));
+    let mut imported = open_with_bytes(&laptop, "s.txt", Notes::default(), b"as read at import");
+    until(&mut [&mut imported], "the import is known", |s| s.iter().all(|s| *s.model().title == "saved" && !s.status().changed_outside));
+    let mut other = open_with_bytes(&laptop, "s.txt", Notes::default(), b"edited in another program");
+    until(&mut [&mut other], "caught up", |s| s.iter().all(|s| *s.model().title == "saved"));
+    assert!(other.status().changed_outside);
+    // Saving clears it.
+    other.saved(b"saved from the live document").unwrap();
+    assert!(!other.status().changed_outside);
+}

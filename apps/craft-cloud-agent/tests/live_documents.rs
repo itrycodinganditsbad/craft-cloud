@@ -617,3 +617,74 @@ async fn blobs_put_on_one_machine_are_got_on_the_other() {
     run_pc.stop().await.0.unwrap();
     run_laptop.stop().await.0.unwrap();
 }
+
+/// An app's save of a live document: it tells the agent (`saved`), writes the file, and the version the agent uploads
+/// for that content carries the save record; a later edit by another program goes up without one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_craft_save_goes_up_with_its_record() {
+    let server = Server::new().await;
+    let pc = Agent::signed_in(&server, "pc").await;
+    let run_pc = pc.run();
+    let on_pc = pc.client().await;
+    std::fs::create_dir_all(&pc.folder).unwrap();
+    std::fs::write(pc.folder.join("story.txt"), "start").unwrap();
+    let c = on_pc.clone();
+    eventually("the file is synced", move || {
+        let docs = c.documents().ok()?;
+        matches!(docs.open("story.txt", "wordcraft").ok()?, Opened::NeedsImport(_)).then_some(())
+    })
+    .await;
+    let c = on_pc.clone();
+    let (docs, app) = off(move || {
+        let docs = c.documents().unwrap();
+        let doc = open(&docs, "story.txt", "start");
+        (docs, AppDoc::new(doc, 31))
+    })
+    .await;
+    let saved = b"start, then saved by the app".to_vec();
+    app.doc.saved(*blake3::hash(&saved).as_bytes(), &[1, 2, 3], &[(31, 4), (7, 2)]).unwrap();
+    // The agent writes the record down before the app writes the file (the app's call comes first).
+    let book = pc.data.path().join("live");
+    eventually("the record is kept", move || {
+        std::fs::read_dir(&book).ok()?.flatten().any(|space| space.path().join("saves.json").exists()).then_some(())
+    })
+    .await;
+    std::fs::write(pc.folder.join("story.txt"), &saved).unwrap();
+    let node = server_node(&server, "story.txt").await.unwrap();
+    let space = server.meta.user_by_name("ana").await.unwrap().unwrap().space;
+    let current = |meta: craft_cloud_meta::Meta| async move {
+        let tree = meta.tree(space, None, 5000).await.unwrap();
+        tree.nodes.into_iter().find(|n| n.id == node).and_then(|n| match n.kind {
+            craft_cloud_proto::NodeKind::File(f) => Some(f),
+            craft_cloud_proto::NodeKind::Dir => None,
+        })
+    };
+    let mut record = None;
+    for _ in 0..600 {
+        if let Some(f) = current(server.meta.clone()).await
+            && f.save.is_some()
+        {
+            record = f.save;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let record = record.expect("the save went up with its record");
+    assert_eq!(record.doc, app.doc.id());
+    assert_eq!(record.version, vec![(7, 2), (31, 4)]);
+    // Another program edits it: no record.
+    std::fs::write(pc.folder.join("story.txt"), "edited in a text editor").unwrap();
+    let mut plain = false;
+    for _ in 0..600 {
+        if let Some(f) = current(server.meta.clone()).await
+            && f.save.is_none()
+        {
+            plain = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(plain, "an edit outside Craft goes up without a record");
+    drop((docs, app));
+    run_pc.stop().await.0.unwrap();
+}

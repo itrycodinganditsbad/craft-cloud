@@ -1435,6 +1435,8 @@ impl Session {
         let transport = HttpTransport::new(account.server.clone(), &account.token)?;
         let config = Config::new(account.device_name.clone(), account.device);
         let mut engine = Engine::new(fs, transport, std::mem::take(&mut saved.state), config, conflict_stamp)?;
+        // What Craft apps saved from live documents (their local API's `saved`): see `live::saves`.
+        engine.set_save_records(std::sync::Arc::new(crate::live::saves::SaveBook::new(data.path(), account.space)));
         // `state.json` is also written at the pass's checkpoints, so a crash or a kill loses at most what the pass did
         // since the last one (the last pass's outcome stays as it was until this one ends).
         let last_pass = std::sync::Arc::new(std::sync::Mutex::new(saved.last_pass));

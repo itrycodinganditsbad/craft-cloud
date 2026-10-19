@@ -21,4 +21,4 @@ pub use hash::{BlobKind, ChunkId, FileHash, HexIdError, ManifestId};
 pub use ids::{DeviceId, DocId, Epoch, NodeId, SpaceId, VersionId};
 pub use manifest::{ChunkRef, ChunkerParamsId, Manifest, ManifestError};
 pub use name::{FoldKey, Name, NameError, UNICODE_VERSION};
-pub use ops::{ChangeSet, Conflict, ConflictKind, FileState, NewVersion, NodeKind, NodeState, Op, PageCursor};
+pub use ops::{ChangeSet, Conflict, ConflictKind, FileState, NewVersion, NodeKind, NodeState, Op, PageCursor, SaveRecord};

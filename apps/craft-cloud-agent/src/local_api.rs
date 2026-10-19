@@ -257,6 +257,13 @@ pub struct ApiState {
     data: PathBuf,
 }
 
+impl ApiState {
+    /// The agent's data folder.
+    pub fn data(&self) -> &std::path::Path {
+        &self.data
+    }
+}
+
 /// The running local API. Dropping it stops the server and removes `local-api.json`.
 pub struct LocalApi {
     port: u16,

@@ -85,6 +85,7 @@ macro_rules! on_every_backend {
 on_every_backend!(
     users_and_devices,
     a_new_space_has_only_its_root,
+    a_version_keeps_its_save_record,
     manifests_need_their_chunks_and_are_per_space,
     stored_bytes_are_counted_once_per_space_and_capped,
     concurrent_chunk_batches_charge_a_shared_chunk_once,
@@ -171,7 +172,7 @@ async fn manifest(meta: &Meta, u: &UserRecord, len: u32) -> ManifestId {
 }
 
 fn version(manifest: ManifestId) -> NewVersion {
-    NewVersion { id: VersionId::generate(), manifest, mtime_ms: NOW, exec: false }
+    NewVersion { id: VersionId::generate(), manifest, mtime_ms: NOW, exec: false, save: None }
 }
 
 async fn full_tree(meta: &Meta, space: craft_cloud_proto::SpaceId) -> craft_cloud_proto::ChangeSet {
@@ -218,6 +219,35 @@ async fn users_and_devices(meta: &Meta) {
     meta.revoke_device(ana.id, dev).await.unwrap();
     assert_eq!(meta.device_by_token(&token).await.unwrap(), None);
     assert!(meta.list_devices(ana.id).await.unwrap()[0].revoked);
+}
+
+/// A version a Craft app saved keeps its save record (as stored, unread), in the listing and the change feed; one
+/// without has none; one over the record limit is stored without it.
+async fn a_version_keeps_its_save_record(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = meta.create_device(u.id, "pc", &[3u8; 32], NOW).await.unwrap();
+    let parent = root(meta, &u).await;
+    let record = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::DocId::generate(), version: vec![(1, 5), (2, 3)] };
+    let (saved, plain, huge) = (NodeId::generate(), NodeId::generate(), NodeId::generate());
+    let op = |node: NodeId, name: &str, v: NewVersion| Op::Create { node, parent, name: craft_cloud_proto::Name::new(name).unwrap(), version: v };
+    let m = manifest(meta, &u, 4).await;
+    let too_many =
+        craft_cloud_proto::SaveRecord { doc: record.doc, version: (0..=craft_cloud_proto::ops::MAX_SAVE_PEERS as u64).map(|p| (p, 1)).collect() };
+    let ops = [
+        op(saved, "a.kitdemo", NewVersion { save: Some(record.clone()), ..version(m) }),
+        op(plain, "b.txt", version(m)),
+        op(huge, "c.kitdemo", NewVersion { save: Some(too_many), ..version(m) }),
+    ];
+    meta.commit(u.space, dev, &ops, NOW).await.unwrap();
+    for listing in [full_tree(meta, u.space).await, meta.changes(u.space, 0, None, MAX_PAGE_NODES).await.unwrap()] {
+        let save = |id| match &find(&listing.nodes, id).kind {
+            NodeKind::File(f) => f.save.clone(),
+            NodeKind::Dir => None,
+        };
+        assert_eq!(save(saved), Some(record.clone()));
+        assert_eq!(save(plain), None);
+        assert_eq!(save(huge), None, "over the limit: stored without it");
+    }
 }
 
 async fn a_new_space_has_only_its_root(meta: &Meta) {
@@ -1659,6 +1689,8 @@ async fn upgrading_counts_what_each_space_already_stores() {
         // And before join codes.
         sqlx::query("DROP TABLE pairings").execute(&mut conn).await.unwrap();
         sqlx::query("DROP TABLE invites").execute(&mut conn).await.unwrap();
+        // And before save records.
+        sqlx::query("ALTER TABLE versions DROP COLUMN save").execute(&mut conn).await.unwrap();
         sqlx::query("DELETE FROM schema_version WHERE version >= 2").execute(&mut conn).await.unwrap();
     }
     let meta = Meta::open(&url).await.unwrap();
@@ -1683,5 +1715,5 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 5);
+    assert_eq!(versions, 6);
 }

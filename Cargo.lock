@@ -1229,6 +1229,7 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "craft-cloud-proto",
+ "serde_json",
  "sqlx",
  "tempfile",
  "thiserror 2.0.21",

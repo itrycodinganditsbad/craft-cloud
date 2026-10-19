@@ -346,6 +346,21 @@ pub struct Engine<F: Fs, T: Transport> {
     /// bigger than the room left is skipped before it is read (see [`Engine::upload`]). Forgotten at the start of
     /// every pass, since the admin may have raised the cap or the room may have grown.
     quota: Option<(u64, u64)>,
+    /// What Craft apps saved from live documents ([`Engine::set_save_records`]).
+    saves: Option<std::sync::Arc<dyn SaveRecords>>,
+}
+
+/// What Craft apps saved from live documents, as the agent learnt it from them (`craft_cloud_proto::SaveRecord`).
+///
+/// - A new version of a file whose content is one an app saved carries the save record.
+/// - When a file changed here and on the server, and both this content and the server's version carry a record of
+///   the same live document, there is no conflict copy: the live document holds both sides' edits. The server's
+///   version wins if its record includes this one's (it was saved later, from a document with everything this one
+///   had); otherwise this one goes up over it (it is the newer upload, and the next save writes everything anyway).
+/// - Without a record on either side (a file edited outside Craft), it is a conflict as always.
+pub trait SaveRecords: Send + Sync {
+    /// The record of the save that wrote content `hash` to `node`'s file, if an app saved exactly that.
+    fn record(&self, node: NodeId, hash: &FileHash) -> Option<craft_cloud_proto::SaveRecord>;
 }
 
 /// Which deletions the mass-delete guard lets through this pass.
@@ -392,7 +407,20 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             checkpoint: None,
             declined_dir_ids: BTreeSet::new(),
             quota: None,
+            saves: None,
         })
+    }
+
+    /// Where the engine learns what Craft apps saved from live documents: a version uploaded with content an app
+    /// saved carries its record, and two versions of a live-linked file that both do never make a conflict copy
+    /// (see [`SaveRecords`]).
+    pub fn set_save_records(&mut self, saves: std::sync::Arc<dyn SaveRecords>) {
+        self.saves = Some(saves);
+    }
+
+    /// The save record of `node`'s content `hash`, within the record limit.
+    pub(crate) fn save_record(&self, node: NodeId, hash: &FileHash) -> Option<craft_cloud_proto::SaveRecord> {
+        self.saves.as_ref()?.record(node, hash).filter(|r| r.version.len() <= craft_cloud_proto::ops::MAX_SAVE_PEERS)
     }
 
     /// Saves the state at safe points during a pass, so a crash loses less than the whole pass: once the server's

@@ -23,6 +23,7 @@ pub mod hub;
 pub mod link;
 pub mod recents;
 pub mod replica;
+pub mod saves;
 pub mod store;
 
 use std::sync::Arc;

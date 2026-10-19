@@ -9,6 +9,8 @@ publish = false
 
 [dependencies]
 craft-cloud-proto.workspace = true
+# A version's save record, kept as the JSON the agent sent.
+serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -281,6 +281,8 @@ pub struct Session<D: LiveDocument> {
     presence: Option<Vec<u8>>,
     presence_sent: Option<Instant>,
     waker: Option<Waker>,
+    /// The hash of the file's bytes as the app read them at open (for [`Status::changed_outside`]), until saved.
+    read_from: Option<[u8; 32]>,
 }
 
 impl<D: LiveDocument> std::fmt::Debug for Session<D> {
@@ -428,7 +430,9 @@ impl<D: LiveDocument> Session<D> {
         if let Some(hash) = file_hash
             && snapshot.is_none()
         {
-            session.status.changed_outside = !session.doc.get_map(SAVES).get(&hex(&hash)).is_some();
+            // Looked at again as the agent's waiting updates come (a save mark may be among them).
+            session.read_from = Some(hash);
+            session.check_outside();
         }
         session.attach(Link { _docs: docs, doc: document });
         Ok(Open::Live(Box::new(session)))
@@ -487,6 +491,7 @@ impl<D: LiveDocument> Session<D> {
             presence: None,
             presence_sent: None,
             waker: None,
+            read_from: None,
         };
         session.reindex_trees();
         session.check_schema();
@@ -510,6 +515,13 @@ impl<D: LiveDocument> Session<D> {
             Some((app, version)) => Some(ReadOnly { app, version }),
             None => Some(ReadOnly { app: String::new(), version: 0 }),
         };
+    }
+
+    /// Whether the bytes the app read at open are a save (or the import) of this document.
+    fn check_outside(&mut self) {
+        if let Some(hash) = self.read_from {
+            self.status.changed_outside = self.doc.get_map(SAVES).get(&hex(&hash)).is_none();
+        }
     }
 
     fn attach(&mut self, link: Link) {
@@ -851,12 +863,13 @@ impl<D: LiveDocument> Session<D> {
         let raw = std::mem::take(&mut lock(&self.collector).raw);
         lock(&self.collector).on = false;
         let touched = self.classify(raw);
-        let was_read_only = self.status.read_only.clone();
+        let (was_read_only, was_outside) = (self.status.read_only.clone(), self.status.changed_outside);
         if touched.kit {
             self.check_schema();
+            self.check_outside();
         }
         if !touched.any() {
-            return Ok(was_read_only != self.status.read_only);
+            return Ok(was_read_only != self.status.read_only || was_outside != self.status.changed_outside);
         }
         self.rebuild(touched)?;
         Ok(true)
@@ -1021,6 +1034,7 @@ impl<D: LiveDocument> Session<D> {
             self.queue(updates);
         }
         self.status.changed_outside = false;
+        self.read_from = None;
         let version = self.doc.oplog_vv().iter().map(|(p, c)| (*p, u32::try_from(*c).unwrap_or(0))).collect();
         let record = SaveRecord { hash, frontiers: self.doc.oplog_frontiers().encode(), version };
         if let Some(link) = &self.link {

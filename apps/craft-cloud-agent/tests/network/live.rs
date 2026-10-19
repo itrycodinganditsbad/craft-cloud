@@ -630,7 +630,13 @@ pub fn run_seed(seed: u64) -> Vec<String> {
         meta.add_manifest(user.space, &manifest, 100, 0).await.unwrap();
         let root = meta.space_info(user.space).await.unwrap().root;
         let node = NodeId::from_uuid(uuid::Uuid::from_u64_pair(seed, 7));
-        let version = NewVersion { id: VersionId::from_uuid(uuid::Uuid::from_u64_pair(seed, 8)), manifest: manifest.id(), mtime_ms: 0, exec: false };
+        let version = NewVersion {
+            id: VersionId::from_uuid(uuid::Uuid::from_u64_pair(seed, 8)),
+            manifest: manifest.id(),
+            mtime_ms: 0,
+            exec: false,
+            save: None,
+        };
         meta.commit(user.space, auths[0].device, &[Op::Create { node, parent: root, name: Name::new("doc.txt").unwrap(), version }], 0)
             .await
             .unwrap();

@@ -5,7 +5,20 @@ use std::io;
 
 use bytes::Bytes;
 use craft_cloud_chunker::{FASTCDC_V1, chunk_reader};
-use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_TREE_DEPTH};
+use craft_cloud_proto::limits::{MAX_BATCH_JSON_BYTES, MAX_BATCH_OPS, MAX_TREE_DEPTH};
+
+/// What an operation adds to a commit body, at most: a longest operation without a save record is at most 1/1000 of
+/// the body limit (`craft_cloud_proto::ops` tests that a full batch of them fits), and a record adds its document and
+/// under 48 bytes per entry of its version. Without records a batch is the full [`MAX_BATCH_OPS`].
+fn op_weight(op: &Op) -> usize {
+    let save = match op {
+        Op::Create { version, .. } | Op::Update { version, .. } => {
+            version.save.as_ref().map_or(0, |s| s.version.len().saturating_mul(48).saturating_add(64))
+        }
+        _ => 0,
+    };
+    (MAX_BATCH_JSON_BYTES / MAX_BATCH_OPS).saturating_add(save)
+}
 use craft_cloud_proto::{
     ChunkId, ChunkRef, ChunkerParamsId, Conflict, Epoch, FileHash, FileState, FoldKey, Manifest, Name, NewVersion, NodeId, Op, VersionId,
 };
@@ -371,6 +384,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 continue;
             };
             let Some((version, size, meta, hash)) = self.upload(path, exec, base_size, report).await? else { continue };
+            // Content a Craft app saved from the file's live document carries its record.
+            let version = NewVersion { save: self.save_record(*id, &hash), ..version };
             ops.push((Op::Update { node: *id, expected, version: version.clone() }, Effect::Update { id: *id, version, size, meta, hash }));
         }
         // New files.
@@ -555,7 +570,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         }
         report.uploaded.push(path.clone());
         let exec = if self.fs.has_exec_bit() { before.exec } else { base_exec };
-        let version = NewVersion { id: VersionId::generate(), manifest: manifest.id(), mtime_ms: before.mtime_ms, exec };
+        let version = NewVersion { id: VersionId::generate(), manifest: manifest.id(), mtime_ms: before.mtime_ms, exec, save: None };
         Ok(Some((version, summary.size, before, FileHash::from_bytes(summary.file_hash))))
     }
 
@@ -598,7 +613,17 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         let mut queue: std::collections::VecDeque<(Op, Effect)> = ops.into();
         let mut retried: BTreeSet<NodeId> = BTreeSet::new();
         while !queue.is_empty() {
-            let take = queue.len().min(MAX_BATCH_OPS);
+            // At most the batch limit, and within the body limit (save records make operations bigger).
+            let mut take = 0usize;
+            let mut bytes = 0usize;
+            for (op, _) in queue.iter().take(MAX_BATCH_OPS) {
+                let weight = op_weight(op);
+                if take > 0 && bytes.saturating_add(weight) > MAX_BATCH_JSON_BYTES {
+                    break;
+                }
+                bytes = bytes.saturating_add(weight);
+                take += 1;
+            }
             let mut batch: Vec<(Op, Effect)> = queue.drain(..take).collect();
             loop {
                 if batch.is_empty() {
@@ -778,6 +803,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     exec: version.exec,
                     device: self.config.device,
                     epoch,
+                    save: version.save.clone(),
                 };
                 self.state.remote.insert(id, RemoteNode { parent: Some(parent), name: Some(name.clone()), file: Some(file.clone()) });
                 self.state.base.insert(id, BaseEntry { parent: Some(parent), name: Some(name), kind: self.base_file(&file, meta, hash) });
@@ -792,6 +818,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     exec: version.exec,
                     device: self.config.device,
                     epoch,
+                    save: version.save.clone(),
                 };
                 if let Some(r) = self.state.remote.get_mut(&id) {
                     r.file = Some(file.clone());

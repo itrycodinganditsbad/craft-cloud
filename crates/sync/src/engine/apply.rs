@@ -12,6 +12,14 @@ use crate::transport::Transport;
 
 use super::{Engine, Local, Mode, OTHER_REASON, Report, SyncError, io_err, per_node};
 
+/// Who wins a file both sides saved from its live document.
+enum LiveWinner {
+    /// The server's version (its save includes ours).
+    Server,
+    /// Ours, uploaded over it.
+    Here,
+}
+
 impl<F: Fs, T: Transport> Engine<F, T> {
     pub(super) async fn apply_remote(&mut self, mode: Mode, report: &mut Report) -> Result<(), SyncError> {
         let root = self.state.root.ok_or_else(|| SyncError::Corrupt("no root".into()))?;
@@ -300,6 +308,46 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                         self.relocate(&bpath, &rpath, report)?;
                     }
                     new_entry.kind = self.base_file(file, meta, hash);
+                    self.state.base.insert(id, new_entry);
+                    return Ok(());
+                }
+                // Both saved by Craft apps from the file's live document: no conflict copy (see `SaveRecords`).
+                if let Some(file) = &remote.file
+                    && let Some(winner) = self.live_winner(id, file, &bpath)
+                {
+                    if moved {
+                        self.settle_occupants(id, &rpath, Some(&bpath), None, report).await?;
+                        self.relocate(&bpath, &rpath, report)?;
+                    }
+                    match winner {
+                        LiveWinner::Server => {
+                            // Its record includes ours: everything here is in it. Replaces exactly what is here (a
+                            // save meanwhile keeps the old base, and the next pass decides again).
+                            let here = self.stat(&rpath)?;
+                            if let Some((meta, hash)) = self.download(id, file, &rpath, here, report).await? {
+                                new_entry.kind = self.base_file(file, meta, hash);
+                            }
+                        }
+                        LiveWinner::Here => {
+                            // Ours goes up over theirs: the base takes the server's version, so the push sends ours
+                            // as its next version (the time never matches, so it is always seen as changed).
+                            let manifest = self.fetch_manifest(&file.manifest).await?;
+                            let local_id = match self.stat(&rpath)? {
+                                Some(FsKind::File(m)) => m.id,
+                                _ => None,
+                            };
+                            new_entry.kind = BaseKind::File {
+                                version: file.version,
+                                manifest: file.manifest,
+                                size: file.size,
+                                mtime_ms: i64::MIN,
+                                exec: file.exec,
+                                local_id,
+                                hash: *manifest.file_hash(),
+                                seen_ms: self.fs.now_ms(),
+                            };
+                        }
+                    }
                     self.state.base.insert(id, new_entry);
                     return Ok(());
                 }
@@ -986,6 +1034,18 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     }
 
     /// Whether the file at `at` holds exactly the content the base recorded (hashed; an unreadable file doesn't).
+    /// Which side wins when `id`'s file changed here and on the server and both versions carry save records of one
+    /// live document; `None` when either lacks one (a conflict, as always).
+    fn live_winner(&self, id: NodeId, file: &FileState, at: &RelPath) -> Option<LiveWinner> {
+        let theirs = file.save.as_ref()?;
+        let hash = self.content_hash(at)?;
+        let ours = self.save_record(id, &hash)?;
+        if ours.doc != theirs.doc {
+            return None;
+        }
+        Some(if theirs.includes(&ours) { LiveWinner::Server } else { LiveWinner::Here })
+    }
+
     fn holds_base_content(&self, entry: &BaseEntry, at: &RelPath) -> bool {
         match &entry.kind {
             BaseKind::File { hash, .. } => self.content_hash(at) == Some(*hash),
