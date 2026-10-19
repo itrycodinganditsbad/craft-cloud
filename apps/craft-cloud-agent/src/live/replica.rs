@@ -445,6 +445,13 @@ struct Doc {
     sub: Sub,
     /// Unacked updates sent on this connection (by client_seq).
     sent: BTreeSet<u64>,
+    /// Own updates sent on this connection that a row of the log brought back before their ack (the same bytes, sent
+    /// again after a reconnect): the ack still comes, with the number of a second row that holds the same bytes and is
+    /// never sent to this machine, so it counts as had when it comes (by client_seq: the update's bytes).
+    taken_back: BTreeMap<u64, Vec<u8>>,
+    /// Such an update's ack above what is had (rows below it on their way): by the row's number, its bytes, counted
+    /// when the rows below it are here (as [`Pending::acked`]; this connection only, a catch-up sends the row).
+    back_acked: BTreeMap<u64, Vec<u8>>,
     /// `too_large` refusals since the last ack.
     strikes: u32,
     /// A refused create or subscribe: ticks until it is tried again, and the pause it had.
@@ -527,6 +534,8 @@ impl Doc {
             broken: false,
             sub: Sub::No,
             sent: BTreeSet::new(),
+            taken_back: BTreeMap::new(),
+            back_acked: BTreeMap::new(),
             strikes: 0,
             retry: None,
             create_refused: false,
@@ -778,12 +787,15 @@ impl Doc {
         self.waiting.retain(|w| !self.body.copy().covers(&w.needs));
         self.on_server(bytes);
         // One of this machine's own unacked updates, brought back by a catch-up (its ack was lost, or forgotten with
-        // the connection): the log has it, so it is had (its ack, if one comes, finds nothing). So the unacked updates
+        // the connection): the log has it, so it is had (an ack still on its way, for the same bytes sent again, numbers
+        // a second row this machine is never sent: [`Doc::taken_back`] counts it when it comes). So the unacked updates
         // are always ones the log doesn't hold up to what is had, which is what working out the log's version from the
         // copy relies on ([`Doc::derive_log`]).
         if let Some(i) = self.pending.iter().position(|p| p.bytes.len() == bytes.len() && p.bytes == bytes) {
             let own = self.pending.remove(i);
-            self.sent.remove(&own.client_seq);
+            if self.sent.remove(&own.client_seq) {
+                self.taken_back.insert(own.client_seq, own.bytes);
+            }
         }
         // What the log holds, as far as this copy has it (an update that never applies isn't in it).
         self.log.note(seq, if in_log { spans_of(bytes).unwrap_or_default() } else { Vec::new() });
@@ -826,12 +838,21 @@ impl Doc {
     /// The log is had up to `seq` (whose update has `hash`), and up to the own acks that follow it.
     fn advance(&mut self, seq: u64, hash: [u8; 32]) {
         self.have = Have { upto: seq, upto_hash: Some(hash) };
-        while let Some(i) = self.pending.iter().position(|p| p.acked == Some(self.have.upto.saturating_add(1))) {
-            let own = self.pending.remove(i);
-            self.sent.remove(&own.client_seq);
-            self.on_server(&own.bytes);
-            self.have = Have { upto: self.have.upto.saturating_add(1), upto_hash: Some(update_hash(&own.bytes)) };
-            self.log.note(self.have.upto, spans_of(&own.bytes).unwrap_or_default());
+        self.back_acked.retain(|at, _| *at > seq);
+        loop {
+            let next = self.have.upto.saturating_add(1);
+            let bytes = if let Some(i) = self.pending.iter().position(|p| p.acked == Some(next)) {
+                let own = self.pending.remove(i);
+                self.sent.remove(&own.client_seq);
+                self.on_server(&own.bytes);
+                own.bytes
+            } else if let Some(bytes) = self.back_acked.remove(&next) {
+                bytes
+            } else {
+                break;
+            };
+            self.have = Have { upto: next, upto_hash: Some(update_hash(&bytes)) };
+            self.log.note(next, spans_of(&bytes).unwrap_or_default());
         }
         // Own updates the catch-up brought back count as had too.
         let upto = self.have.upto;
@@ -973,6 +994,8 @@ impl Doc {
         for pending in &mut self.pending {
             pending.acked = None;
         }
+        self.taken_back.clear();
+        self.back_acked.clear();
     }
 
     /// `subscribe` from what the document has, without `create` (the server has it: on the same connection); a
@@ -1336,6 +1359,8 @@ impl<S: DocStore> Replica<S> {
         for doc in self.docs.values_mut() {
             doc.sub = Sub::No;
             doc.sent.clear();
+            doc.taken_back.clear();
+            doc.back_acked.clear();
             doc.retry = None;
             doc.create_refused = false;
             doc.full = None;
@@ -1939,7 +1964,23 @@ impl<S: DocStore> Replica<S> {
         {
             {
                 let Some(doc) = self.docs.get_mut(&id) else { return Vec::new() };
-                let Some(i) = doc.pending.iter().position(|p| p.client_seq == client_seq) else { return Vec::new() };
+                let i = match doc.pending.iter().position(|p| p.client_seq == client_seq) {
+                    Some(i) => i,
+                    // Brought back by a row before its ack: the acked row holds the same bytes, which the copy has, so
+                    // it counts as had like any ack (or waits for the rows below it, as any ack does).
+                    None => {
+                        if let Some(bytes) = doc.taken_back.remove(&client_seq) {
+                            if seq == doc.have.upto.saturating_add(1) {
+                                doc.log.note(seq, spans_of(&bytes).unwrap_or_default());
+                                doc.advance(seq, update_hash(&bytes));
+                            } else if seq > doc.have.upto {
+                                doc.back_acked.insert(seq, bytes);
+                            }
+                            return doc.try_compact();
+                        }
+                        return Vec::new();
+                    }
+                };
                 doc.strikes = 0;
                 doc.full_pause = 0;
                 doc.dirty = true;
@@ -2417,6 +2458,8 @@ fn subscribe(id: DocId, doc: &mut Doc, epoch: Option<Epoch>) -> Vec<ClientFrame>
     }
     doc.forget_acks();
     doc.sent.clear();
+    doc.taken_back.clear();
+    doc.back_acked.clear();
     // A document of a file is made by import, never by a bare `create`: one the server lost answers `not_found`, and
     // is made again from this copy ([`Replica::refused_document`]).
     let mut frames = match &doc.kind {
@@ -2835,6 +2878,28 @@ mod tests {
         assert_eq!(r.waiting(), 0, "seq 2 is ours");
         assert!(r.on_frame(ServerFrame::Update { doc, seq: 3, bytes: u3, device: device() }).unwrap().is_empty(), "no gap");
         assert_eq!(r.entries(&app()).len(), 3);
+    }
+
+    /// An own update that a row brought back before its ack (sent once on an old connection, again on this one): the
+    /// ack, numbering a second row with the same bytes that this machine is never sent, still counts once the rows
+    /// below it came, so the log goes on without a gap and nothing waits.
+    #[test]
+    fn an_ack_for_an_update_a_row_brought_back_still_counts() {
+        let space = SpaceId::generate();
+        let doc = recents_doc(space, &app());
+        let mut r = live(space, MemStore::default());
+        let frames = r.add(&app(), [3; 16], entry("mine.txt", 3)).unwrap();
+        let [ClientFrame::Update { bytes: mine, .. }] = frames.as_slice() else { panic!("{frames:?}") };
+        r.on_frame(ServerFrame::Update { doc, seq: 1, bytes: mine.clone(), device: device() }).unwrap();
+        assert_eq!(r.waiting(), 0, "the log has it");
+        r.on_frame(ServerFrame::Ack { doc, client_seq: 1, seq: 3 }).unwrap();
+        let other = Recents::new(77);
+        let u2 = other.add([5; 16], &entry("second.txt", 1)).unwrap();
+        let u4 = other.add([6; 16], &entry("fourth.txt", 4)).unwrap();
+        r.on_frame(ServerFrame::Update { doc, seq: 2, bytes: u2, device: device() }).unwrap();
+        assert!(r.on_frame(ServerFrame::Update { doc, seq: 4, bytes: u4, device: device() }).unwrap().is_empty(), "no gap at 3");
+        assert_eq!(r.entries(&app()).len(), 3);
+        assert_eq!(r.waiting(), 0);
     }
 
     /// A gap on a caught-up document (frames lost on an old connection): a catch-up from what it has.
