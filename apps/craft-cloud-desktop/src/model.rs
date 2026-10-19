@@ -725,7 +725,11 @@ impl Model {
                 form.error = Some(INVALID_CODE.to_owned());
                 Screen::Join(form)
             }
-            (codes::ALREADY_SIGNED_IN, _) => return vec![Effect::Status],
+            // Signed in meanwhile: the form, until the status (asked now) shows the signed-in view.
+            (codes::ALREADY_SIGNED_IN, _) => {
+                self.screen = Screen::Join(form);
+                return vec![Effect::Status];
+            }
             (_, Some(pw)) => back_to_password(pw, text),
             (_, None) => {
                 form.error = Some(text);
@@ -978,6 +982,19 @@ pub(crate) mod tests {
         assert!(!form(&mut m).ask_adopt);
         form(&mut m).adopt_for = Some("/elsewhere".into());
         assert!(!join_request(&m.update(Event::SubmitJoin)).adopt);
+    }
+
+    /// Signed in meanwhile (another program joined first): the join's refusal moves on to the signed-in view at the
+    /// next status, not a "Joining…" that never ends.
+    #[test]
+    fn a_join_refused_as_already_signed_in_moves_on() {
+        let mut m = on_join_form();
+        form(&mut m).join = "cloud.shadows.ch/K7M4-Q9TX".into();
+        m.update(Event::SubmitJoin);
+        assert_eq!(m.update(Event::Joined(Err(refused(codes::ALREADY_SIGNED_IN, "already signed in as fabio")))), vec![Effect::Status]);
+        assert!(!matches!(m.screen, Screen::Joining { .. }), "{:?}", m.screen);
+        m.update(Event::Polled(Ok(status(true))));
+        assert!(matches!(m.screen, Screen::SignedIn(_)), "{:?}", m.screen);
     }
 
     #[test]
