@@ -15,6 +15,7 @@
 //! The local API's recents WebSocket ([`recents_socket`]) is a client of the hub like any other: an app subscribes
 //! to its list (the whole list comes now and after every change) and adds entries (answered once they are on disk).
 
+pub mod app_blobs;
 pub mod blobs;
 pub mod copy;
 pub mod docs;

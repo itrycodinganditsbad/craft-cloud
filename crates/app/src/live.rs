@@ -56,6 +56,9 @@ pub use craft_cloud_api::local::NotLiveReason;
 use crate::http::CONNECT_TIMEOUT;
 use crate::{Client, Error};
 
+/// What a document calls when an event came for it (from the reader's thread): an egui app's `request_repaint`.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
 /// How long an open may take: finding the file's node (the agent may sync it first, up to 5 s), joining the document on
 /// the server, and its state.
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -114,6 +117,8 @@ struct Shared {
     opening: Mutex<HashMap<u64, (DocId, DocState)>>,
     /// Which numbers a document is open as (its status names the document).
     numbers: Mutex<HashMap<DocId, Vec<u64>>>,
+    /// What to call after an event went to a document's channel, by number ([`Document::set_waker`]).
+    wakers: Mutex<HashMap<u64, Waker>>,
     closed: AtomicBool,
     next_id: AtomicU64,
     /// A clone of the stream: dropping the connection shuts it down (which wakes the reader).
@@ -144,6 +149,14 @@ impl Shared {
     fn route(&self, id: u64, event: Event) {
         if let Some(events) = lock(&self.routes).get(&id) {
             let _ = events.send(event);
+        }
+        self.wake(id);
+    }
+
+    fn wake(&self, id: u64) {
+        let waker = lock(&self.wakers).get(&id).cloned();
+        if let Some(waker) = waker {
+            waker();
         }
     }
 
@@ -196,6 +209,10 @@ impl Shared {
         self.closed.store(true, Ordering::Relaxed);
         for (_, events) in lock(&self.routes).drain() {
             let _ = events.send(Event::Closed(why.to_owned()));
+        }
+        let wakers: Vec<Waker> = lock(&self.wakers).drain().map(|(_, w)| w).collect();
+        for waker in wakers {
+            waker();
         }
         for (_, waiting) in lock(&self.answers).drain() {
             let _ = waiting.send(Answer::Refused(Error::Io(why.to_owned())));
@@ -271,6 +288,7 @@ impl Documents {
             answers: Mutex::new(HashMap::new()),
             opening: Mutex::new(HashMap::new()),
             numbers: Mutex::new(HashMap::new()),
+            wakers: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             stream,
@@ -425,9 +443,25 @@ impl Document {
         Ok(seq)
     }
 
+    /// Tells the agent the app saved the document's file: the content's BLAKE3 `hash`, and the live document's
+    /// version it was made from (Loro's encoded frontiers and its version vector). The agent records it with the file
+    /// version it uploads for that content. Doesn't wait for an answer.
+    pub fn saved(&self, hash: [u8; 32], frontiers: &[u8], version: &[(u64, u32)]) -> Result<(), Error> {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let mut version = version.to_vec();
+        version.sort_unstable();
+        self.shared.send_json(&DocsRequest::Saved { doc: self.doc, hash: hex(&hash), frontiers: hex(frontiers), version })
+    }
+
     /// Sends this app's presence (at most 4 KiB, at most 20 a second; more are dropped).
     pub fn presence(&self, bytes: &[u8]) -> Result<(), Error> {
         self.shared.send_binary(PRESENCE, self.id, bytes)
+    }
+
+    /// Calls `waker` (from the connection's reader thread) after each event that comes for this document from now on,
+    /// and once when the connection ends: an app's UI repaints, then takes the events with [`Document::try_recv`].
+    pub fn set_waker(&self, waker: Waker) {
+        lock(&self.shared.wakers).insert(self.id, waker);
     }
 
     /// The next event, if one came.
@@ -449,6 +483,7 @@ impl Document {
 impl Drop for Document {
     fn drop(&mut self) {
         lock(&self.shared.routes).remove(&self.id);
+        lock(&self.shared.wakers).remove(&self.id);
         let mut numbers = lock(&self.shared.numbers);
         let remaining = numbers.get_mut(&self.doc).map(|ids| {
             ids.retain(|id| *id != self.id);
@@ -477,6 +512,7 @@ mod tests {
             answers: Mutex::new(HashMap::new()),
             opening: Mutex::new(HashMap::new()),
             numbers: Mutex::new(HashMap::new()),
+            wakers: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             stream,

@@ -33,10 +33,14 @@ use craft_cloud_proto::local::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+use craft_cloud_proto::limits::MAX_BLOB_BYTES;
+use craft_cloud_proto::local::blobs::{Stored, parse_hex};
+
 use crate::account::{Account, DataDir, random_hex, write_atomic};
 use crate::autostart::{self, Roots};
 use crate::cli::{AgentError, Exit};
 use crate::http::HttpTransport;
+use crate::live::app_blobs::{self, BlobError};
 
 /// What the local API asks the `run` loop to do, with where to send the outcome.
 pub enum Command {
@@ -258,6 +262,8 @@ pub struct LocalApi {
     port: u16,
     file: PathBuf,
     task: tokio::task::JoinHandle<()>,
+    /// The task that uploads blobs put while offline.
+    retry: tokio::task::JoinHandle<()>,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
@@ -270,6 +276,7 @@ impl LocalApi {
         let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await.map_err(io)?;
         let port = listener.local_addr().map_err(io)?.port();
         let token = random_hex(32).map_err(io)?;
+        let retry = tokio::spawn(retry_blobs(control.clone(), data.path().to_owned()));
         let state = Arc::new(ApiState { port, token: token.clone(), control, data: data.path().to_owned() });
         let app = router(state);
         let (shutdown, shutting_down) = oneshot::channel::<()>();
@@ -290,9 +297,10 @@ impl LocalApi {
         let json = serde_json::to_vec_pretty(&record).map_err(|e| AgentError::Io { path: file.clone(), source: std::io::Error::other(e) })?;
         if let Err(e) = write_atomic(&file, &json, true) {
             task.abort();
+            retry.abort();
             return Err(io(e));
         }
-        Ok(Self { port, file, task, shutdown: Some(shutdown) })
+        Ok(Self { port, file, task, retry, shutdown: Some(shutdown) })
     }
 
     pub fn port(&self) -> u16 {
@@ -303,6 +311,7 @@ impl LocalApi {
     /// [`STOP_GRACE`], and removes `local-api.json`.
     pub async fn stop(mut self) {
         let _ = std::fs::remove_file(&self.file);
+        self.retry.abort();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -316,6 +325,7 @@ const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 impl Drop for LocalApi {
     fn drop(&mut self) {
         self.task.abort();
+        self.retry.abort();
         let _ = std::fs::remove_file(&self.file);
     }
 }
@@ -338,6 +348,8 @@ fn router(state: Api) -> Router {
         .route(paths::PAUSE, post(pause))
         .route(paths::RESUME, post(resume))
         .route(paths::QUIT, post(quit))
+        .route(paths::BLOBS, axum::routing::put(put_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
+        .route(&format!("{}/{{hash}}", paths::BLOBS), get(get_blob))
         .fallback(|| async { LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such call") })
         .layer(DefaultBodyLimit::max(MAX_LOCAL_JSON_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
@@ -392,6 +404,59 @@ async fn login(State(state): State<Api>, body: Result<Json<LoginRequest>, JsonRe
 async fn logout(State(state): State<Api>, body: Result<Json<LogoutRequest>, JsonRejection>) -> Result<Json<Status>, LocalError> {
     let Json(request) = body?;
     ask(&state, |reply| Command::Logout(request, reply)).await
+}
+
+fn blob_error(e: BlobError) -> LocalError {
+    let message = e.to_string();
+    match e {
+        BlobError::Size => LocalError::new(StatusCode::PAYLOAD_TOO_LARGE, api_codes::TOO_LARGE, message),
+        BlobError::BadName => LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, message),
+        BlobError::NotFound => LocalError::new(StatusCode::NOT_FOUND, codes::BLOB_NOT_FOUND, message),
+        BlobError::Offline(_) => LocalError::new(StatusCode::SERVICE_UNAVAILABLE, codes::OFFLINE, message),
+        BlobError::Failed(_) => LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, message),
+    }
+}
+
+/// `PUT /v1/blobs`: keeps the body as a blob, answers its name, and uploads it (now if it can, later otherwise).
+async fn put_blob(
+    State(state): State<Api>,
+    body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
+) -> Result<Json<Stored>, LocalError> {
+    let body = body.map_err(|e| LocalError::new(e.status(), api_codes::TOO_LARGE, e.body_text()))?;
+    let account = state.control.account().ok_or(AgentError::NotSignedIn)?;
+    let dir = app_blobs::dir(&state.data, account.space);
+    let put_dir = dir.clone();
+    let stored = tokio::task::spawn_blocking(move || app_blobs::put(&put_dir, &body))
+        .await
+        .map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))?
+        .map_err(blob_error)?;
+    if let Ok(transport) = HttpTransport::new(account.server.clone(), &account.token) {
+        tokio::spawn(async move {
+            // This one, and any put while offline before it. Offline, they wait for the next try.
+            app_blobs::upload_pending(&dir, &transport).await;
+        });
+    }
+    Ok(Json(stored))
+}
+
+/// `GET /v1/blobs/{hash}`: the blob's bytes, downloaded first if this machine doesn't have them.
+async fn get_blob(State(state): State<Api>, hash: Result<Path<String>, PathRejection>) -> Result<Response, LocalError> {
+    let hash = parse_hex(&path_id(hash)?).ok_or_else(|| blob_error(BlobError::BadName))?;
+    let account = state.control.account().ok_or(AgentError::NotSignedIn)?;
+    let transport = HttpTransport::new(account.server.clone(), &account.token).ok();
+    let bytes = app_blobs::get(app_blobs::dir(&state.data, account.space), hash, transport.as_ref()).await.map_err(blob_error)?;
+    Ok(([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
+}
+
+/// Uploads, every [`app_blobs::RETRY_EVERY`], the blobs put while the server couldn't be reached.
+async fn retry_blobs(control: Control, data: PathBuf) {
+    let mut every = tokio::time::interval(app_blobs::RETRY_EVERY);
+    loop {
+        every.tick().await;
+        let Some(account) = control.account() else { continue };
+        let Ok(transport) = HttpTransport::new(account.server.clone(), &account.token) else { continue };
+        app_blobs::upload_pending(&app_blobs::dir(&data, account.space), &transport).await;
+    }
 }
 
 async fn join(State(state): State<Api>, body: Result<Json<JoinRequest>, JsonRejection>) -> Result<Json<Status>, LocalError> {

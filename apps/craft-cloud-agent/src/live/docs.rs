@@ -140,6 +140,7 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                     Some(hub) => hub.docs(DocsCall::Close { conn: link.conn, doc }).await.map(|()| true).map_err(|_| End::Hub),
                     None => Ok(true),
                 },
+                DocsRequest::Saved { .. } => Ok(true),
             }
         }
         Message::Binary(bytes) => {

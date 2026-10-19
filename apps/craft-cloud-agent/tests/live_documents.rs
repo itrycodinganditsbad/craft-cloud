@@ -581,3 +581,39 @@ async fn signed_out_every_file_is_a_plain_file() {
     assert!(matches!(opened, Opened::NotLive(NotLiveReason::NotSignedIn)), "{opened:?}");
     running.stop().await.0.unwrap();
 }
+
+/// Apps' blobs: one put on the pc (bigger than a chunk) is got whole on the laptop, which downloads it; the same bytes
+/// have the same name everywhere; one put while the server can't be reached stays on the pc's disk and goes up with
+/// the next put once it can; an unknown name is `blob_not_found`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blobs_put_on_one_machine_are_got_on_the_other() {
+    let server = Server::new().await;
+    let pc = Agent::signed_in(&server, "pc").await;
+    let laptop = Agent::signed_in(&server, "laptop").await;
+    let (run_pc, run_laptop) = (pc.run(), laptop.run());
+    let (on_pc, on_laptop) = (pc.client().await, laptop.client().await);
+    let big: Vec<u8> = (0..9_000_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 9) as u8).collect();
+    let (c, b) = (on_pc.clone(), big.clone());
+    let stored = off(move || c.blobs().put(&b).unwrap()).await;
+    assert_eq!(stored.len, big.len() as u64);
+    let c = on_laptop.clone();
+    let got = eventually("the laptop gets the pc's blob", move || c.blobs().get(&stored.hash, stored.len).ok()).await;
+    assert!(got == big, "the bytes came whole");
+    let (c, b) = (on_laptop.clone(), big.clone());
+    assert_eq!(off(move || c.blobs().put(&b).unwrap()).await, stored, "the same name on every machine");
+    let c = on_laptop.clone();
+    let unknown = off(move || c.blobs().get(&[7; 32], 1)).await;
+    assert!(matches!(&unknown, Err(craft_cloud_app::Error::Refused { code, .. }) if code == "blob_not_found"), "{unknown:?}");
+
+    server.gate.down();
+    let c = on_pc.clone();
+    let offline = off(move || c.blobs().put(b"put while offline").unwrap()).await;
+    server.gate.up();
+    let c = on_pc.clone();
+    off(move || c.blobs().put(b"the next put, online").unwrap()).await;
+    let c = on_laptop.clone();
+    let got = eventually("the offline put went up with the next", move || c.blobs().get(&offline.hash, offline.len).ok()).await;
+    assert_eq!(got, b"put while offline");
+    run_pc.stop().await.0.unwrap();
+    run_laptop.stop().await.0.unwrap();
+}

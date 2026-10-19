@@ -493,6 +493,29 @@ pub enum DocsRequest {
     Open { id: u64, path: String, app: String },
     /// The app is done with the document.
     Close { doc: crate::ids::DocId },
+    /// The app saved the document's file: its content's BLAKE3 hash (hex) and the live document's version it was made
+    /// from (Loro's frontiers, hex, and the version vector as `[peer, end counter]` pairs). The agent records it with
+    /// the file version it uploads for that content ([`SaveRecord`]). An agent from before save records answers
+    /// `error` and saves nothing; the file syncs as any file does.
+    Saved { doc: crate::ids::DocId, hash: String, frontiers: String, version: Vec<(u64, u32)> },
+}
+
+/// A file version a Craft app saved from a live document: what the version's content came from. Kept with the
+/// version on the server (an older server or agent ignores it), so the file sync can tell two Craft saves of one live
+/// document from an edit outside Craft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveRecord {
+    /// The live document.
+    pub doc: crate::ids::DocId,
+    /// The live document's version vector when saved: `(peer, end counter)`, sorted by peer.
+    pub version: Vec<(u64, u32)>,
+}
+
+impl SaveRecord {
+    /// Whether this save's version includes everything `other`'s does.
+    pub fn includes(&self, other: &SaveRecord) -> bool {
+        other.version.iter().all(|(peer, end)| self.version.iter().any(|(p, e)| p == peer && e >= end))
+    }
 }
 
 /// How a document stands, as `opened` and `status` say it.

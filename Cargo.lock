@@ -1211,6 +1211,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-cloud-kit"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "craft-cloud-api",
+ "craft-cloud-app",
+ "getrandom 0.4.3",
+ "loro",
+ "proptest",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "craft-cloud-meta"
 version = "0.0.1"
 dependencies = [

@@ -1,0 +1,244 @@
+//! The session against the fake agent: two machines (or apps) on one hub, a small model (an opaque title and a list).
+
+mod common;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use common::{App, Notes, NotesApp, change, open, until};
+use craft_cloud_app::fake::Hub;
+use craft_cloud_kit::{AgentBlobs, BlobStore, KitError, MAX_QUEUE_BYTES, Open, SPLIT_BYTES, Session};
+
+#[test]
+fn a_file_imported_on_one_machine_is_live_on_the_other() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open::<App>(&pc, "notes.txt", Notes::new("Groceries", &["eggs", "milk"]));
+    let mut b = open::<App>(&laptop, "notes.txt", Notes::default());
+    assert_eq!(b.model().texts(), vec!["eggs", "milk"], "the laptop built its model from the live document");
+    assert_eq!(*b.model().title, "Groceries");
+    assert!(a.status().read_only.is_none() && b.status().read_only.is_none());
+    change(&mut a, |m| m.with_title("Shopping")).unwrap();
+    change(&mut b, |m| m.with_item(1, "bread")).unwrap();
+    until(&mut [&mut a, &mut b], "both edits on both", |s| {
+        s.iter().all(|s| *s.model().title == "Shopping" && s.model().texts() == ["eggs", "bread", "milk"])
+    });
+    // Unchanged parts write nothing: the same model again sends nothing.
+    let before = hub.updates("notes.txt");
+    let same = a.model().clone();
+    a.local_change(&same, &Arc::new((*same).clone())).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    a.poll();
+    assert_eq!(hub.updates("notes.txt"), before, "nothing changed, nothing sent");
+}
+
+/// A document made by a newer version of the app opens read-only: it is shown, remote changes still come, and local
+/// ones (and undo) are refused; the same version and an older one are writable.
+#[test]
+fn a_document_from_a_newer_app_is_read_only() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut newer = open::<NotesApp<2>>(&pc, "n.txt", Notes::new("v2", &["a"]));
+    let mut same = open::<NotesApp<2>>(&laptop, "n.txt", Notes::default());
+    assert!(same.status().read_only.is_none(), "the same version is writable");
+    let mut older = open::<NotesApp<1>>(&laptop, "n.txt", Notes::default());
+    let ro = older.status().read_only.clone().unwrap();
+    assert_eq!((ro.app.as_str(), ro.version), ("notes", 2));
+    assert_eq!(older.model().texts(), vec!["a"], "shown");
+    let refused = change(&mut older, |m| m.with_title("nope"));
+    assert!(matches!(refused, Err(KitError::ReadOnly { version: 2, .. })), "{refused:?}");
+    assert!(matches!(older.undo(), Err(KitError::ReadOnly { .. })));
+    change(&mut newer, |m| m.with_title("from v2")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while *older.model().title != "from v2" {
+        newer.poll();
+        same.poll();
+        older.poll();
+        assert!(Instant::now() < deadline, "the newer app's change came");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // A document whose version is older than the app's opens writable (migrating it is the app's own change).
+    let hub2 = Hub::new();
+    let pc2 = hub2.machine("pc").unwrap();
+    let _v1 = open::<NotesApp<1>>(&pc2, "o.txt", Notes::new("v1", &[]));
+    let mut v2 = open::<NotesApp<2>>(&pc2, "o.txt", Notes::default());
+    assert!(v2.status().read_only.is_none());
+    change(&mut v2, |m| m.with_title("migrated")).unwrap();
+}
+
+/// A change over the split size goes as several commits, each under it: a 5 MB change (twenty 250 KiB notes) arrives
+/// whole on the other machine, and every update stays under the agent's 1 MiB cap.
+#[test]
+fn a_five_megabyte_change_arrives_whole() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open::<App>(&pc, "big.txt", Notes::new("big", &[]));
+    let mut b = open::<App>(&laptop, "big.txt", Notes::default());
+    let before = hub.updates("big.txt");
+    let notes: Vec<String> = (0..20).map(|i| format!("{i:02}{}", "x".repeat(250 * 1024))).collect();
+    change(&mut a, |m| {
+        let mut items = (*m.items).clone();
+        let mut hint = Vec::new();
+        for n in &notes {
+            let id = craft_cloud_kit::ElemId::new();
+            hint.push(id);
+            items.push((id, n.clone()));
+        }
+        Notes { items: Arc::new(items), hint: Some(hint), ..m.clone() }
+    })
+    .unwrap();
+    until(&mut [&mut a, &mut b], "the laptop has all 5 MB", |s| s.get(1).is_some_and(|b| b.model().texts() == notes));
+    let sent = hub.updates("big.txt") - before;
+    assert!(sent >= 10, "{sent} updates for 5 MB: it was split");
+    assert!(a.status().error.is_none() && b.status().error.is_none(), "{:?} {:?}", a.status().error, b.status().error);
+    const { assert!(SPLIT_BYTES * 2 <= craft_cloud_api::limits::MAX_UPDATE_BYTES) };
+    // One undo step takes the whole change back, on both.
+    assert!(a.undo().unwrap());
+    until(&mut [&mut a, &mut b], "the undo is on both", |s| s.iter().all(|s| s.model().items.is_empty()));
+}
+
+/// Reconnecting: the agent drops the app; the model stays editable, changes queue, and go out once the session is
+/// back by itself (none lost, none twice).
+#[test]
+fn a_dropped_connection_comes_back_and_sends_what_queued() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open::<App>(&pc, "r.txt", Notes::new("r", &[]));
+    let mut b = open::<App>(&laptop, "r.txt", Notes::default());
+    pc.restart();
+    until(&mut [&mut a], "the drop is seen", |s| s.iter().all(|s| !s.status().connected));
+    for i in 0..5 {
+        change(&mut a, |m| m.with_item(i, &format!("offline {i}"))).unwrap();
+    }
+    assert_eq!(a.poll().status.queued, 5);
+    pc.start();
+    until(&mut [&mut a, &mut b], "back, and sent", |s| {
+        s.get(1).is_some_and(|b| b.model().items.len() == 5) && s.iter().all(|s| s.status().connected)
+    });
+    until(&mut [&mut a, &mut b], "acked", |s| s.first().is_some_and(|a| a.status().queued == 0));
+    assert_eq!(b.model().texts(), (0..5).map(|i| format!("offline {i}")).collect::<Vec<_>>());
+    // A dropped connection while the agent keeps running.
+    pc.drop_connections();
+    change(&mut a, |m| m.with_title("after the drop")).unwrap();
+    until(&mut [&mut a, &mut b], "the title came", |s| s.get(1).is_some_and(|b| *b.model().title == "after the drop"));
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let w = wakes.clone();
+    b.set_waker(Arc::new(move || {
+        w.fetch_add(1, Ordering::Relaxed);
+    }));
+    change(&mut a, |m| m.with_title("wake up")).unwrap();
+    until(&mut [&mut a, &mut b], "woken", |_| wakes.load(Ordering::Relaxed) > 0);
+}
+
+/// Restarting offline with unsent edits: the app's edits were taken by the agent (its journal) while the machine was
+/// offline; the app quits; the agent restarts; the app opens the document again and sees its own edits, and they go
+/// out when the machine is back online.
+#[test]
+fn an_app_restarted_offline_sees_its_unsent_edits() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open::<App>(&pc, "j.txt", Notes::new("j", &[]));
+    let mut b = open::<App>(&laptop, "j.txt", Notes::default());
+    pc.set_online(false);
+    change(&mut a, |m| m.with_item(0, "written offline")).unwrap();
+    until(&mut [&mut a], "acked by the agent", |s| s.iter().all(|s| s.status().queued == 0));
+    assert_eq!(pc.waiting("j.txt"), 1);
+    drop(a);
+    pc.restart();
+    pc.start();
+    let mut again = open::<App>(&pc, "j.txt", Notes::default());
+    assert_eq!(again.status().waiting, 1);
+    // The agent's state, then the updates it holds that the server hasn't acked yet (taken at the first polls).
+    until(&mut [&mut again], "its own unsent edit, from the agent", |s| s.iter().all(|s| s.model().texts() == ["written offline"]));
+    pc.set_online(true);
+    until(&mut [&mut again, &mut b], "out once online", |s| s.get(1).is_some_and(|b| b.model().texts() == ["written offline"]));
+}
+
+/// The queue's cap: past 64 MiB waiting for the agent, local changes are refused (stalled) until it is back.
+#[test]
+fn past_the_queue_cap_changes_are_refused_until_the_agent_is_back() {
+    let hub = Hub::new();
+    let pc = hub.machine("pc").unwrap();
+    let mut a = open::<App>(&pc, "q.txt", Notes::new("q", &[]));
+    pc.restart();
+    until(&mut [&mut a], "the drop is seen", |s| s.iter().all(|s| !s.status().connected));
+    let block = 200 * 1024;
+    let mut i = 0usize;
+    loop {
+        let queued = a.poll().status.queued_bytes;
+        let title = format!("{i:08}{}", "q".repeat(block));
+        let result = change(&mut a, |m| m.with_title(&title));
+        if queued < MAX_QUEUE_BYTES {
+            assert!(result.is_ok(), "{queued} bytes queued: still taken ({result:?})");
+        } else {
+            assert!(matches!(result, Err(KitError::Stalled(_))), "{queued} bytes queued: refused");
+            assert!(a.poll().status.stalled);
+            break;
+        }
+        i += 1;
+    }
+    assert!(i * block >= MAX_QUEUE_BYTES - block, "the cap is 64 MiB");
+    pc.start();
+    until(&mut [&mut a], "drained", |s| s.iter().all(|s| s.status().queued == 0 && !s.status().stalled));
+    change(&mut a, |m| m.with_title("taken again")).unwrap();
+}
+
+/// Review focus 1: a remote change that comes while the app holds remote changes back (a drag, an IME composition)
+/// is applied at the next poll after the gesture, never inside it; the local edit isn't lost or doubled. A change
+/// from a stale model is refused and writes nothing.
+#[test]
+fn a_remote_change_during_a_gesture_waits_for_its_end() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open::<App>(&pc, "g.txt", Notes::new("g", &["one"]));
+    let mut b = open::<App>(&laptop, "g.txt", Notes::default());
+    a.hold_remote(true);
+    let before = a.model().clone();
+    change(&mut b, |m| m.with_item(1, "remote")).unwrap();
+    let deadline = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < deadline {
+        b.poll();
+        assert!(!a.poll().changed, "nothing applied during the gesture");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(Arc::ptr_eq(a.model(), &before));
+    let after = Arc::new(before.with_edit(0, "one, dragged"));
+    a.local_change(&before, &after).unwrap();
+    a.hold_remote(false);
+    until(&mut [&mut a, &mut b], "both have both", |s| s.iter().all(|s| s.model().texts() == ["one, dragged", "remote"]));
+    // A stale `old` (not the session's model) writes nothing.
+    let stale = before.clone();
+    let refused = a.local_change(&stale, &Arc::new(stale.with_title("stale")));
+    assert_eq!(refused, Err(KitError::Stale));
+    assert_eq!(*a.model().title, "g");
+}
+
+#[test]
+fn presence_goes_to_the_other_machine_and_fades() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open::<App>(&pc, "p.txt", Notes::new("p", &[]));
+    let mut b = open::<App>(&laptop, "p.txt", Notes::default());
+    a.set_presence(Some(b"cursor at 3".to_vec())).unwrap();
+    until(&mut [&mut a, &mut b], "the laptop sees it", |s| s.get(1).is_some_and(|b| b.peers().values().any(|p| p.bytes == b"cursor at 3")));
+    assert!(b.peers().contains_key(&a.peer()));
+    assert!(a.peers().is_empty(), "its own isn't shown");
+    assert!(a.set_presence(Some(vec![0; 4096])).is_err(), "at most 4 KiB with its header");
+}
+
+#[test]
+fn blobs_go_through_the_agent_and_an_old_agent_says_so() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let (a, b) = (AgentBlobs(pc.client().blobs()), AgentBlobs(laptop.client().blobs()));
+    let chunk = a.put(b"an image").unwrap();
+    assert_eq!(&*b.get(&chunk).unwrap(), b"an image");
+    laptop.too_old();
+    let e = b.get(&chunk).unwrap_err();
+    assert!(e.to_string().contains("agent_too_old"), "{e}");
+    // Not running at all: the file opens as a plain file.
+    pc.restart();
+    let opened = Session::<App>::open(&common::agent(&pc), "x.txt", Arc::new(Notes::default()), None).unwrap();
+    assert!(matches!(opened, Open::NotLive(_)));
+}

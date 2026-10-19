@@ -26,6 +26,8 @@ craft-cloud-server = { path = "apps/craft-cloud-server" }
 craft-cloud-sync = { path = "crates/sync" }
 craft-cloud-agent = { path = "apps/craft-cloud-agent" }
 craft-cloud-app = { path = "crates/app" }
+craft-cloud-kit = { path = "crates/kit" }
+craft-cloud-egui = { path = "crates/egui" }
 argon2 = "0.6"
 async-trait = "0.1.89"
 # `ws`: the server's live service and the agent's local API are WebSockets (tokio-tungstenite, MIT).

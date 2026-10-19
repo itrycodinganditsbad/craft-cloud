@@ -1,0 +1,27 @@
+[package]
+name = "craft-cloud-kit"
+description = "The Craft Cloud app kit: a Craft app's model live through the agent, mapped onto Loro (tree, rich text, table, timeline, opaque values), with undo while live and binary content by reference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# `craft_cloud_kit::testing`: the fake agent of `craft-cloud-app`, re-exported for an app's adapter tests.
+fake = ["craft-cloud-app/fake"]
+
+[dependencies]
+blake3.workspace = true
+craft-cloud-api.workspace = true
+craft-cloud-app.workspace = true
+getrandom.workspace = true
+loro.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+craft-cloud-app = { workspace = true, features = ["fake"] }
+proptest.workspace = true
+
+[lints]
+workspace = true
