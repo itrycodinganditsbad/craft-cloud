@@ -6,7 +6,8 @@
 //!   API (it finishes the pass under way), waited for up to a minute, then ended, and its process checked gone. An
 //!   agent that can't be stopped stops the install before anything is changed. Then the files, the Uninstall key
 //!   (`HKCU\…\Uninstall\CraftCloud`, its `UninstallString` calling this setup, copied into the program folder, with
-//!   `--uninstall`), and the shortcut. An agent that ran is started again (and waited for). An older install in
+//!   `--uninstall`), and the shortcut. An agent that ran is started again (and waited for), also when the install
+//!   fails after the stop. An older install in
 //!   `%LOCALAPPDATA%\Programs\craft-cloud` whose agent the `Run` value starts is moved: the new agent's
 //!   `autostart on` points the value at the new folder (read back to check); the old folder's files are left alone.
 //! - **Uninstall** ([`uninstall`]): closes the app and stops the agent as above (fine when it isn't running), removes their
@@ -208,8 +209,6 @@ pub fn install(
         return Err("this setup was built without Craft Cloud in it (build it with `cargo xtask package`)".into());
     }
     let dir = places.dir();
-    let old = places.programs.join(OLD_DIR_NAME);
-    let mut warnings = Vec::new();
 
     // What runs is stopped first: an exe in use can't be replaced. The app goes before the agent (an open app's Try
     // again would start the old agent again in between); the agent finishes the pass under way.
@@ -222,6 +221,33 @@ pub fn install(
         AgentStop::StillRunning(why) => return Err(still_running(&why)),
     };
 
+    // From here on the agent is stopped: if the install fails, the agent is started again, so this computer keeps
+    // syncing.
+    match install_stopped(places, registry, machine, payload, setup, options) {
+        Ok((moved_from, mut warnings)) => {
+            if agent_was_running && let Err(e) = machine.start_agent(&dir.join(AGENT_BG_EXE), &places.agent_data) {
+                warnings.push(format!("the agent couldn't be started again ({e}); it starts at the next login"));
+            }
+            Ok(Installed { dir, agent_was_running, moved_from, warnings })
+        }
+        Err(e) if agent_was_running => Err(restarted_after(places, registry, machine, &e)),
+        Err(e) => Err(e),
+    }
+}
+
+/// The install's changes, once nothing runs: the files, the move of an older install's start at login, the "Apps &
+/// features" entry and the shortcut. Where an older install was moved from, and the warnings.
+fn install_stopped(
+    places: &Places,
+    registry: &dyn Registry,
+    machine: &dyn Machine,
+    payload: &[(&str, &[u8])],
+    setup: &Path,
+    options: &Options,
+) -> Result<(Option<PathBuf>, Vec<String>), String> {
+    let dir = places.dir();
+    let old = places.programs.join(OLD_DIR_NAME);
+    let mut warnings = Vec::new();
     std::fs::create_dir_all(&dir).map_err(io(&dir))?;
     for (name, bytes) in payload {
         write_replacing(&dir.join(name), bytes)?;
@@ -274,10 +300,24 @@ pub fn install(
         std::fs::remove_file(&shortcut).map_err(io(&shortcut))?;
     }
 
-    if agent_was_running && let Err(e) = machine.start_agent(&dir.join(AGENT_BG_EXE), &places.agent_data) {
-        warnings.push(format!("the agent couldn't be started again ({e}); it starts at the next login"));
+    Ok((moved_from, warnings))
+}
+
+/// The install failed (`failure`) after the agent was stopped: it is started again, from the folder its start at
+/// login names (the new one or the older install's), else from the new folder, else the older one. What is said.
+fn restarted_after(places: &Places, registry: &dyn Registry, machine: &dyn Machine, failure: &str) -> String {
+    let (dir, old) = (places.dir(), places.programs.join(OLD_DIR_NAME));
+    let run_value = registry.get(&places.run_key, AGENT_RUN_VALUE).unwrap_or_default();
+    let named = [&dir, &old].into_iter().find(|d| starts_from(&run_value, d));
+    let from = named.into_iter().chain([&dir, &old]).find(|d| d.join(AGENT_BG_EXE).is_file());
+    let started = match from {
+        Some(from) => machine.start_agent(&from.join(AGENT_BG_EXE), &places.agent_data),
+        None => Err("no agent is there to start".into()),
+    };
+    match started {
+        Ok(()) => format!("{failure}. The agent was started again."),
+        Err(e) => format!("{failure}. The agent couldn't be started again ({e}); it starts at the next login."),
     }
-    Ok(Installed { dir, agent_was_running, moved_from, warnings })
 }
 
 /// Removes the install at `places`; `running` is this setup's own exe (in the program folder when started from

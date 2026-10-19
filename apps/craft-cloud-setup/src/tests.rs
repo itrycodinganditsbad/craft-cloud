@@ -157,6 +157,38 @@ fn an_upgrade_stops_the_agent_and_the_app_replaces_the_files_and_starts_the_agen
     assert!(u.data.join("account.json").exists() && u.synced.join("notes.txt").exists());
 }
 
+/// An install that fails once the agent is stopped (here the setup's own exe can't be read) starts the agent again,
+/// from the folder its start at login names, and says so.
+#[test]
+fn an_install_that_fails_after_the_stop_starts_the_agent_again() {
+    let u = user("Test");
+    let (registry, machine) = (MemoryRegistry::default(), Recorder::default());
+    let old: &[(&str, &[u8])] = &[(APP_EXE, b"app v1"), (AGENT_EXE, b"agent v1"), (AGENT_BG_EXE, b"agent-bg v1")];
+    install(&u.places, &registry, &machine, old, &u.setup, &options(true)).unwrap();
+    let value = format!("\"{}\" run --log", u.places.dir().join(AGENT_BG_EXE).display());
+    registry.set_string(&u.places.run_key, AGENT_RUN_VALUE, &value).unwrap();
+    *machine.running.lock().unwrap() = true;
+    machine.asked.lock().unwrap().clear();
+
+    let gone = u.setup.with_file_name("not-there.exe");
+    let e = install(&u.places, &registry, &machine, V2, &gone, &options(true)).unwrap_err();
+    assert!(e.contains("not-there.exe") && e.ends_with("The agent was started again."), "{e}");
+    assert_eq!(machine.asked(), ["close app", "stop agent", "start Craft Cloud/craft-cloud-agent-bg.exe"]);
+
+    // Nothing to start: said too.
+    let bare = user("Bare");
+    let machine = Recorder::default();
+    *machine.running.lock().unwrap() = true;
+    let e = install(&bare.places, &registry, &machine, V2, &gone, &options(true)).unwrap_err();
+    assert!(e.contains("The agent was started again"), "the new folder's agent was written before the failure: {e}");
+
+    // Not running before: nothing is started.
+    let machine = Recorder::default();
+    let e = install(&u.places, &registry, &machine, V2, &gone, &options(true)).unwrap_err();
+    assert!(!e.contains("agent"), "{e}");
+    assert_eq!(machine.asked(), ["close app", "stop agent"]);
+}
+
 /// BEAST's install, made by hand in `Programs\craft-cloud`: its agent starts at login from there. The new agent takes
 /// start at login over; the old files stay.
 #[test]
