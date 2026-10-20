@@ -40,7 +40,7 @@ use craft_cloud_proto::api::{
 };
 use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_PAGE_NODES};
 use craft_cloud_proto::local::MAX_MACHINE_BYTES;
-use craft_cloud_proto::{ChangeSet, ChunkId, DeviceId, ManifestId, Op, PageCursor};
+use craft_cloud_proto::{ChangeSet, ChunkId, DeviceId, ManifestId, NodeId, Op, PageCursor, SaveRecord, VersionId};
 use craft_cloud_sync::{Transport, TransportError};
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT};
 use reqwest::{Client, Method, StatusCode, Url};
@@ -748,6 +748,13 @@ impl<C: Connection> Transport for HttpTransport<C> {
     async fn commit(&self, ops: &[Op]) -> Result<CommitResponse, TransportError> {
         let req = self.request(Method::POST, "commit", MAX_SMALL_JSON_BYTES).json(&CommitRequest { ops: ops.to_vec() })?;
         json(self.send(req).await?, MAX_SMALL_JSON_BYTES).await
+    }
+
+    async fn attach_save(&self, node: NodeId, version: VersionId, save: &SaveRecord) -> Result<(), TransportError> {
+        let body = craft_cloud_proto::api::SaveAttach { node, version, save: save.clone() };
+        let req = self.request(Method::POST, "saves", MAX_SMALL_JSON_BYTES).json(&body)?;
+        let _: CommitResponse = json(self.send(req).await?, MAX_SMALL_JSON_BYTES).await?;
+        Ok(())
     }
 }
 

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.94"
@@ -17,6 +17,7 @@ dbg_macro = "warn"
 todo = "warn"
 
 [workspace.dependencies]
+craft-cloud-api = { path = "crates/api" }
 craft-cloud-proto = { path = "crates/proto" }
 craft-cloud-chunker = { path = "crates/chunker" }
 craft-cloud-store = { path = "crates/store" }
@@ -25,6 +26,8 @@ craft-cloud-server = { path = "apps/craft-cloud-server" }
 craft-cloud-sync = { path = "crates/sync" }
 craft-cloud-agent = { path = "apps/craft-cloud-agent" }
 craft-cloud-app = { path = "crates/app" }
+craft-cloud-kit = { path = "crates/kit" }
+craft-cloud-egui = { path = "crates/egui" }
 argon2 = "0.6"
 async-trait = "0.1.89"
 # `ws`: the server's live service and the agent's local API are WebSockets (tokio-tungstenite, MIT).

@@ -55,6 +55,7 @@ pub fn router(state: Shared) -> Router {
         .route("/chunks/{id}", put(put_chunk).get(get_chunk).layer(DefaultBodyLimit::max(MAX_CHUNK_BYTES as usize)))
         .route("/manifests/{id}", put(put_manifest).get(get_manifest).layer(DefaultBodyLimit::max(MAX_MANIFEST_BYTES)))
         .route("/commit", post(commit).layer(DefaultBodyLimit::max(MAX_BATCH_JSON_BYTES)))
+        .route("/saves", post(attach_save).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
         .route("/space", get(space))
         .route("/tree", get(tree))
         .route("/changes", get(changes))
@@ -357,6 +358,28 @@ async fn commit(State(state): State<Shared>, Extension(auth): Extension<DeviceAu
     .await
     .map_err(|e| {
         tracing::error!(error = %e, "commit task failed");
+        ApiError::internal()
+    })??;
+    Ok(Json(CommitResponse { seq: outcome.seq, epoch: outcome.epoch }))
+}
+
+/// `POST /saves`: a save record for a version that went up without one ([`craft_cloud_proto::api::SaveAttach`]).
+async fn attach_save(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    request: Request,
+) -> Result<Json<CommitResponse>, ApiError> {
+    let req: craft_cloud_proto::api::SaveAttach = read_json(&state, request, SMALL_JSON_BYTES).await?;
+    let task_state = state.clone();
+    // As a commit: the publish is never skipped for a change that went through.
+    let outcome = tokio::spawn(async move {
+        let outcome = task_state.meta.attach_save(auth.space, req.node, req.version, &req.save).await?;
+        task_state.notifier.publish(auth.space, outcome.seq);
+        Ok::<_, ApiError>(outcome)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "save attach task failed");
         ApiError::internal()
     })??;
     Ok(Json(CommitResponse { seq: outcome.seq, epoch: outcome.epoch }))

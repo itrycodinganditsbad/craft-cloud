@@ -10,7 +10,7 @@ use unicode_normalization::UnicodeNormalization;
 use crate::limits::MAX_NAME_BYTES;
 
 /// Characters Windows forbids in names (besides control characters, which are rejected separately).
-pub(crate) const FORBIDDEN: [char; 9] = ['/', '\\', '<', '>', ':', '"', '|', '?', '*'];
+pub const FORBIDDEN: [char; 9] = ['/', '\\', '<', '>', ':', '"', '|', '?', '*'];
 
 /// The Unicode version behind [`Name`]'s NFC form and [`FoldKey`]. Both are only stable within one Unicode
 /// version: anything that stores fold keys must store this version with them and recompute the keys when it

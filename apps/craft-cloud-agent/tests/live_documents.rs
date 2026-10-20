@@ -33,11 +33,21 @@ impl AppDoc {
         let loro = LoroDoc::new();
         loro.set_peer_id(peer).unwrap();
         loro.import(doc.state()).unwrap();
+        for u in doc.state_updates() {
+            loro.import(u).unwrap();
+        }
         Self { loro, doc }
     }
 
     fn text(&self) -> String {
         self.loro.get_text("text").to_string()
+    }
+
+    /// The document's heads, as a save record names them.
+    fn heads(&self) -> Vec<(u64, u32)> {
+        let mut heads: Vec<(u64, u32)> = self.loro.oplog_frontiers().iter().map(|id| (id.peer, id.counter as u32)).collect();
+        heads.sort_unstable();
+        heads
     }
 
     /// Applies what came; the other events.
@@ -144,6 +154,153 @@ async fn a_file_opened_on_one_machine_is_live_on_the_other() {
     drop((docs_pc, docs_laptop, s));
     run_pc.stop().await.0.unwrap();
     run_laptop.stop().await.0.unwrap();
+}
+
+/// The records the agent's save book holds, by content hash (hex), as the sync reads them.
+fn book(data: &std::path::Path) -> Vec<(String, Vec<(u64, u32)>)> {
+    let Ok(spaces) = std::fs::read_dir(data.join("live")) else { return Vec::new() };
+    let mut out = Vec::new();
+    for space in spaces.flatten() {
+        let Ok(bytes) = std::fs::read(space.path().join("saves.json")) else { continue };
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap_or_default();
+        for e in entries {
+            let frontiers = serde_json::from_value(e["frontiers"].clone()).unwrap_or_default();
+            out.push((e["hash"].as_str().unwrap_or_default().to_owned(), frontiers));
+        }
+    }
+    out
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Asks `agent`'s save book, as the sync does, whether the document at frontiers `a` holds `b`'s.
+async fn ask(agent: &Agent, doc: craft_cloud_proto::DocId, a: &[(u64, u32)], b: &[(u64, u32)]) -> Option<bool> {
+    use craft_cloud_sync::SaveRecords;
+    let data = agent.data.path().to_owned();
+    let space = agent.data.load_account().unwrap().unwrap().space;
+    let (a, b) = (craft_cloud_proto::SaveRecord { doc, frontiers: a.to_vec() }, craft_cloud_proto::SaveRecord { doc, frontiers: b.to_vec() });
+    off(move || craft_cloud_agent::live::saves::SaveBook::new(&data, space).includes(&a, &b)).await
+}
+
+/// The real save-order path (the save book asks the live hub, which asks its copy): a later save includes an earlier
+/// one and not the other way round, and operations it hasn't got can't be told. After the agent restarts with no
+/// window open, the document isn't loaded: the question loads it (and follows it again) and is answered from it,
+/// soon, not left unknown until the 10-minute fallback (the reviewer's probe answered unknown for good).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn save_order_questions_load_the_document_to_answer() {
+    let server = Server::new().await;
+    let pc = Agent::signed_in(&server, "pc").await;
+    let run_pc = pc.run();
+    let on_pc = pc.client().await;
+    std::fs::create_dir_all(&pc.folder).unwrap();
+    std::fs::write(pc.folder.join("o.txt"), "start").unwrap();
+    let c = on_pc.clone();
+    eventually("synced", move || {
+        let docs = c.documents().ok()?;
+        matches!(docs.open("o.txt", "wordcraft").ok()?, Opened::NeedsImport(_)).then_some(())
+    })
+    .await;
+    let c = on_pc.clone();
+    let (docs, app) = off(move || {
+        let docs = c.documents().unwrap();
+        let doc = open(&docs, "o.txt", "start");
+        (docs, AppDoc::new(doc, 61))
+    })
+    .await;
+    let doc = app.doc.id();
+    let acked = |app: &AppDoc, seq: u64| {
+        let (deadline, mut seen) = (std::time::Instant::now() + Duration::from_secs(10), false);
+        while !seen {
+            seen = app.pump().contains(&Event::Acked(seq));
+            assert!(std::time::Instant::now() < deadline, "acked");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let seq = app.append(" one");
+    acked(&app, seq);
+    let h1 = app.heads();
+    let mut last = 0;
+    for i in 0..5 {
+        last = app.append(&format!(" n{i}"));
+    }
+    acked(&app, last);
+    let h2 = app.heads();
+    assert_eq!(ask(&pc, doc, &h2, &h1).await, Some(true));
+    assert_eq!(ask(&pc, doc, &h1, &h2).await, Some(false));
+    assert_eq!(ask(&pc, doc, &h2, &[(999, 0)]).await, None, "operations it hasn't got");
+    drop((app, docs));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    run_pc.stop().await.0.unwrap();
+    let run_pc = pc.run();
+    let _on_pc = pc.client().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if ask(&pc, doc, &h2, &h1).await == Some(true) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never answered after the restart");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    run_pc.stop().await.0.unwrap();
+}
+
+/// A save record that comes before the changes it covers waits for them: kept once they are in the agent's copy,
+/// never before; one whose app closes the document before its changes come is dropped, and its changes arriving
+/// later on another connection don't bring it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_save_record_waits_for_the_changes_it_covers() {
+    let server = Server::new().await;
+    let pc = Agent::signed_in(&server, "pc").await;
+    let run_pc = pc.run();
+    let on_pc = pc.client().await;
+    std::fs::create_dir_all(&pc.folder).unwrap();
+    std::fs::write(pc.folder.join("w.txt"), "waits").unwrap();
+    let c = on_pc.clone();
+    eventually("the file is synced", move || {
+        let docs = c.documents().ok()?;
+        matches!(docs.open("w.txt", "wordcraft").ok()?, Opened::NeedsImport(_)).then_some(())
+    })
+    .await;
+    let c = on_pc.clone();
+    let (docs, app) = off(move || {
+        let docs = c.documents().unwrap();
+        let doc = open(&docs, "w.txt", "waits");
+        (docs, AppDoc::new(doc, 51))
+    })
+    .await;
+    // A change made, its record sent first, the change after.
+    let t = app.loro.get_text("text");
+    let before = app.loro.oplog_vv();
+    t.insert(t.len_unicode(), " and saved").unwrap();
+    app.loro.commit();
+    let heads = app.heads();
+    app.doc.saved(*blake3::hash(b"first").as_bytes(), &heads).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let data = pc.data.path().to_owned();
+    assert!(!book(&data).iter().any(|(h, _)| *h == hex(blake3::hash(b"first").as_bytes())), "not before its change");
+    app.doc.send(&app.loro.export(ExportMode::updates(&before)).unwrap()).unwrap();
+    let (d, want) = (data.clone(), (hex(blake3::hash(b"first").as_bytes()), heads.clone()));
+    eventually("kept once its change is in", move || book(&d).contains(&want).then_some(())).await;
+    // Another, whose change never comes on its connection: the app closes the document first.
+    let before = app.loro.oplog_vv();
+    t.insert(t.len_unicode(), "!").unwrap();
+    app.loro.commit();
+    let update = app.loro.export(ExportMode::updates(&before)).unwrap();
+    app.doc.saved(*blake3::hash(b"second").as_bytes(), &app.heads()).unwrap();
+    drop((app, docs));
+    let c = on_pc.clone();
+    let _later = off(move || {
+        let docs = c.documents().unwrap();
+        let doc = open(&docs, "w.txt", "waits");
+        doc.send(&update).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        (docs, doc)
+    })
+    .await;
+    assert!(!book(&data).iter().any(|(h, _)| *h == hex(blake3::hash(b"second").as_bytes())), "dropped with its session");
+    run_pc.stop().await.0.unwrap();
 }
 
 /// Snapshots go through the chunk API: the import goes up before `create` names it, a compaction's snapshot before
@@ -395,14 +552,14 @@ mod raw {
         }
     }
 
-    /// The next control message, skipping binary ones and `status` events (which come whenever the document's state
-    /// changes, between any two answers).
+    /// The next control message, skipping binary ones and `status` and `file` events (which come whenever the
+    /// document's state or its file changes, between any two answers).
     pub async fn next_json(ws: &mut Ws) -> Option<serde_json::Value> {
         loop {
             match next(ws).await? {
                 Message::Text(text) => {
                     let value: serde_json::Value = serde_json::from_str(text.as_str()).ok()?;
-                    if value["type"] != "status" {
+                    if value["type"] != "status" && value["type"] != "file" {
                         return Some(value);
                     }
                 }
@@ -594,4 +751,160 @@ async fn signed_out_every_file_is_a_plain_file() {
     let opened = off(move || client.documents().unwrap().open("a.txt", "wordcraft").unwrap()).await;
     assert!(matches!(opened, Opened::NotLive(NotLiveReason::NotSignedIn)), "{opened:?}");
     running.stop().await.0.unwrap();
+}
+
+/// Apps' blobs: one put on the pc (bigger than a chunk) is got whole on the laptop, which downloads it; the same bytes
+/// have the same name everywhere; one put while the server can't be reached stays on the pc's disk and goes up with
+/// the next put once it can; an unknown name is `blob_not_found`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blobs_put_on_one_machine_are_got_on_the_other() {
+    let server = Server::new().await;
+    let pc = Agent::signed_in(&server, "pc").await;
+    let laptop = Agent::signed_in(&server, "laptop").await;
+    let (run_pc, run_laptop) = (pc.run(), laptop.run());
+    let (on_pc, on_laptop) = (pc.client().await, laptop.client().await);
+    let big: Vec<u8> = (0..9_000_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 9) as u8).collect();
+    let (c, b) = (on_pc.clone(), big.clone());
+    let stored = off(move || c.blobs().put(&b).unwrap()).await;
+    assert_eq!(stored.len, big.len() as u64);
+    let c = on_laptop.clone();
+    let got = eventually("the laptop gets the pc's blob", move || c.blobs().get(&stored.hash, stored.len).ok()).await;
+    assert!(got == big, "the bytes came whole");
+    let (c, b) = (on_laptop.clone(), big.clone());
+    assert_eq!(off(move || c.blobs().put(&b).unwrap()).await, stored, "the same name on every machine");
+    let c = on_laptop.clone();
+    let unknown = off(move || c.blobs().get(&[7; 32], 1)).await;
+    assert!(matches!(&unknown, Err(craft_cloud_app::Error::Refused { code, .. }) if code == "blob_not_found"), "{unknown:?}");
+
+    server.gate.down();
+    let c = on_pc.clone();
+    let offline = off(move || c.blobs().put(b"put while offline").unwrap()).await;
+    server.gate.up();
+    let c = on_pc.clone();
+    off(move || c.blobs().put(b"the next put, online").unwrap()).await;
+    let c = on_laptop.clone();
+    let got = eventually("the offline put went up with the next", move || c.blobs().get(&offline.hash, offline.len).ok()).await;
+    assert_eq!(got, b"put while offline");
+    run_pc.stop().await.0.unwrap();
+    run_laptop.stop().await.0.unwrap();
+}
+
+/// An app's save of a live document: it tells the agent (`saved`), writes the file, and the version the agent uploads
+/// for that content carries the save record; a later edit by another program goes up without one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_craft_save_goes_up_with_its_record() {
+    let server = Server::new().await;
+    let pc = Agent::signed_in(&server, "pc").await;
+    let run_pc = pc.run();
+    let on_pc = pc.client().await;
+    std::fs::create_dir_all(&pc.folder).unwrap();
+    std::fs::write(pc.folder.join("story.txt"), "start").unwrap();
+    let c = on_pc.clone();
+    eventually("the file is synced", move || {
+        let docs = c.documents().ok()?;
+        matches!(docs.open("story.txt", "wordcraft").ok()?, Opened::NeedsImport(_)).then_some(())
+    })
+    .await;
+    let c = on_pc.clone();
+    let (docs, app) = off(move || {
+        let docs = c.documents().unwrap();
+        let doc = open(&docs, "story.txt", "start");
+        (docs, AppDoc::new(doc, 31))
+    })
+    .await;
+    let saved = b"start, then saved by the app".to_vec();
+    // The app's change, then its record (after the change, on the same stream).
+    app.append(", then saved by the app");
+    let heads = app.heads();
+    app.doc.saved(*blake3::hash(&saved).as_bytes(), &heads).unwrap();
+    // The agent writes the record down before the app writes the file (the app's call comes first).
+    let book = pc.data.path().join("live");
+    eventually("the record is kept", move || {
+        std::fs::read_dir(&book).ok()?.flatten().any(|space| space.path().join("saves.json").exists()).then_some(())
+    })
+    .await;
+    std::fs::write(pc.folder.join("story.txt"), &saved).unwrap();
+    let node = server_node(&server, "story.txt").await.unwrap();
+    let space = server.meta.user_by_name("ana").await.unwrap().unwrap().space;
+    let current = |meta: craft_cloud_meta::Meta| async move {
+        let tree = meta.tree(space, None, 5000).await.unwrap();
+        tree.nodes.into_iter().find(|n| n.id == node).and_then(|n| match n.kind {
+            craft_cloud_proto::NodeKind::File(f) => Some(f),
+            craft_cloud_proto::NodeKind::Dir => None,
+        })
+    };
+    let mut record = None;
+    for _ in 0..600 {
+        if let Some(f) = current(server.meta.clone()).await
+            && f.save.is_some()
+        {
+            record = f.save;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let record = record.expect("the save went up with its record");
+    assert_eq!(record.doc, app.doc.id());
+    assert_eq!(record.frontiers, heads);
+    // Another program edits it: no record.
+    std::fs::write(pc.folder.join("story.txt"), "edited in a text editor").unwrap();
+    let mut plain = false;
+    for _ in 0..600 {
+        if let Some(f) = current(server.meta.clone()).await
+            && f.save.is_none()
+        {
+            plain = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(plain, "an edit outside Craft goes up without a record");
+    // An open says whether the bytes the app read were a Craft save: the app's save yes, the editor's no.
+    let c = on_pc.clone();
+    let (outside, ours) = off(move || {
+        let docs = c.documents().unwrap();
+        let ask = |bytes: &[u8]| {
+            let options = craft_cloud_app::live::OpenOptions { file_hash: Some(*blake3::hash(bytes).as_bytes()) };
+            match docs.open_with("story.txt", "wordcraft", &options).unwrap() {
+                Opened::Live(d) => d.changed_outside(),
+                _ => panic!("not live"),
+            }
+        };
+        (ask(b"edited in a text editor"), ask(b"start, then saved by the app"))
+    })
+    .await;
+    assert_eq!((outside, ours), (Some(true), Some(false)));
+    // A save whose record comes after its upload (made while the agent was away): added to that version.
+    let late = b"saved while the agent was away".to_vec();
+    std::fs::write(pc.folder.join("story.txt"), &late).unwrap();
+    let mut up = None;
+    for _ in 0..600 {
+        if let Some(f) = current(server.meta.clone()).await
+            && f.size == late.len() as u64
+        {
+            up = Some(f);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let up = up.expect("the save went up");
+    assert_eq!(up.save, None);
+    app.append(" (later)");
+    let late_heads = app.heads();
+    app.doc.saved(*blake3::hash(&late).as_bytes(), &late_heads).unwrap();
+    let mut added = None;
+    for _ in 0..600 {
+        if let Some(f) = current(server.meta.clone()).await
+            && f.save.is_some()
+        {
+            added = Some(f);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let added = added.expect("the late record was added");
+    assert_eq!(added.version, up.version, "to the version that went up");
+    assert_eq!(added.save.map(|s| s.frontiers), Some(late_heads));
+    drop((docs, app));
+    run_pc.stop().await.0.unwrap();
 }

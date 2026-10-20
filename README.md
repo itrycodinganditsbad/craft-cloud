@@ -7,8 +7,8 @@ all your machines, and the folder `~/Craft Cloud` stays in sync, with version hi
 There is no hosted service and no account with anyone but you. Nothing phones home.
 
 > **Status: early development.** File sync, shared recent files and the Craft Cloud app work. Live
-> documents (an edit shows on your other machines as you type) work in the agent and the server; the apps take
-> them up next.
+> documents (an edit shows on your other machines as you type) work in the agent and the server, and the app kit
+> lets a Craft app take them up with one adapter; the apps take them up next.
 
 - **Big files sync quickly.** Files are split into content-defined chunks, so a change to a 20 GB project
   uploads only what changed, and an interrupted upload resumes.
@@ -38,6 +38,7 @@ that is signed in, and enter its code on the new one.
 - [Running the server](docs/server.md): reverse proxy, Postgres and S3, accounts, invites, backups
 - [The agent on the command line](docs/agent.md): `login`, `run`, `sync`, `join`, start at login
 - [Development](docs/development.md): how it fits together, building, testing, the sync engine's rules
+- [The app kit](docs/kit.md): how a Craft app makes its documents live
 - Design: [`sync.md`](docs/design/sync.md) and [`live.md`](docs/design/live.md). Contributors and AI agents
   start with [`AGENTS.md`](AGENTS.md).
 

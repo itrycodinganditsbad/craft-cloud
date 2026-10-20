@@ -85,6 +85,9 @@ macro_rules! on_every_backend {
 on_every_backend!(
     users_and_devices,
     a_new_space_has_only_its_root,
+    a_version_keeps_its_save_record,
+    pages_of_save_records_stay_small,
+    a_late_save_record_is_appended_once,
     manifests_need_their_chunks_and_are_per_space,
     stored_bytes_are_counted_once_per_space_and_capped,
     concurrent_chunk_batches_charge_a_shared_chunk_once,
@@ -160,6 +163,96 @@ async fn device(meta: &Meta, u: &UserRecord) -> DeviceId {
 }
 
 /// Uploads one random chunk and a manifest for it to the user's space; returns the manifest ID.
+/// A save record that comes after its version: added to that version (the node is in the change feed again), once;
+/// a version with a record keeps it; the same call again changes nothing; another node's version is not found.
+async fn a_late_save_record_is_appended_once(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = meta.create_device(u.id, "pc", &[3u8; 32], NOW).await.unwrap();
+    let parent = root(meta, &u).await;
+    let m = manifest(meta, &u, 4).await;
+    let (node, v) = (NodeId::generate(), version(m));
+    meta.commit(u.space, dev, &[Op::Create { node, parent, name: name("late.kitdemo"), version: v.clone() }], NOW).await.unwrap();
+    let before = meta.space_info(u.space).await.unwrap().seq;
+    let doc = craft_cloud_proto::live::node_doc(u.space, node);
+    let stranger = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::DocId::generate(), frontiers: vec![(1, 5)] };
+    assert!(matches!(meta.attach_save(u.space, node, v.id, &stranger).await, Err(MetaError::Invalid(_))), "another file's document");
+    let unsorted = craft_cloud_proto::SaveRecord { doc, frontiers: vec![(2, 1), (1, 5)] };
+    assert!(matches!(meta.attach_save(u.space, node, v.id, &unsorted).await, Err(MetaError::Invalid(_))));
+    let record = craft_cloud_proto::SaveRecord { doc, frontiers: vec![(1, 5)] };
+    let added = meta.attach_save(u.space, node, v.id, &record).await.unwrap();
+    assert_eq!(added.seq, before + 1);
+    let feed = meta.changes(u.space, before, None, MAX_PAGE_NODES).await.unwrap();
+    let NodeKind::File(f) = &find(&feed.nodes, node).kind else { panic!("a file") };
+    assert_eq!((f.version, f.save.clone()), (v.id, Some(record.clone())), "in the feed again, with its record");
+    let other = craft_cloud_proto::SaveRecord { doc: record.doc, frontiers: vec![(2, 1)] };
+    assert_eq!(meta.attach_save(u.space, node, v.id, &other).await.unwrap().seq, before + 1, "kept, nothing changed");
+    assert_eq!(meta.attach_save(u.space, node, v.id, &record).await.unwrap().seq, before + 1);
+    let tree = full_tree(meta, u.space).await;
+    let NodeKind::File(f) = &find(&tree.nodes, node).kind else { panic!("a file") };
+    assert_eq!(f.save, Some(record));
+    let nowhere = NodeId::generate();
+    let theirs = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::live::node_doc(u.space, nowhere), frontiers: vec![(2, 1)] };
+    assert!(matches!(meta.attach_save(u.space, nowhere, v.id, &theirs).await, Err(MetaError::NotFound(_))));
+    let too_many =
+        craft_cloud_proto::SaveRecord { doc: other.doc, frontiers: (0..=craft_cloud_proto::ops::MAX_SAVE_HEADS as u64).map(|p| (p, 1)).collect() };
+    assert!(matches!(meta.attach_save(u.space, node, v.id, &too_many).await, Err(MetaError::Invalid(_))));
+}
+
+/// Files whose versions all carry the biggest save record there can be: every page of the listing and of the change
+/// feed ends before its records pass their budget, far under what an agent reads of a page, and the pages together
+/// still list every file once, each with its record.
+async fn pages_of_save_records_stay_small(meta: &Meta) {
+    use craft_cloud_meta::MAX_PAGE_SAVE_BYTES;
+    let u = user(meta, "ana").await;
+    let dev = meta.create_device(u.id, "pc", &[3u8; 32], NOW).await.unwrap();
+    let parent = root(meta, &u).await;
+    let m = manifest(meta, &u, 4).await;
+    let biggest = craft_cloud_proto::SaveRecord {
+        doc: craft_cloud_proto::DocId::generate(),
+        frontiers: (0..craft_cloud_proto::ops::MAX_SAVE_HEADS as u64).map(|p| (u64::MAX - 1000 + p, u32::MAX)).collect(),
+    };
+    let record_bytes = serde_json::to_string(&biggest).unwrap().len();
+    assert!(record_bytes < 10 * 1024, "{record_bytes}");
+    let files = 2 * MAX_PAGE_SAVE_BYTES / record_bytes + 10;
+    let mut made = std::collections::BTreeSet::new();
+    for batch in 0..files.div_ceil(500) {
+        let ops: Vec<Op> = (0..500.min(files - batch * 500))
+            .map(|i| {
+                let node = NodeId::generate();
+                made.insert(node);
+                let v = NewVersion { save: Some(biggest.clone()), ..version(m) };
+                Op::Create { node, parent, name: name(&format!("f{batch}-{i}.kitdemo")), version: v }
+            })
+            .collect();
+        meta.commit(u.space, dev, &ops, NOW).await.unwrap();
+    }
+    for feed in [false, true] {
+        let (mut after, mut seen, mut pages) = (None, std::collections::BTreeSet::new(), 0);
+        loop {
+            let page = if feed {
+                meta.changes(u.space, 0, after, MAX_PAGE_NODES).await.unwrap()
+            } else {
+                meta.tree(u.space, after, MAX_PAGE_NODES).await.unwrap()
+            };
+            pages += 1;
+            let json = serde_json::to_vec(&page).unwrap().len();
+            assert!(json < MAX_PAGE_SAVE_BYTES + 2 * 1024 * 1024, "a page of {json} bytes");
+            for n in &page.nodes {
+                if let NodeKind::File(f) = &n.kind {
+                    assert_eq!(f.save.as_ref(), Some(&biggest));
+                    assert!(seen.insert(n.id), "listed twice");
+                }
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen, made, "every file, once");
+        assert!(pages >= 3, "cut into pages by their records: {pages}");
+    }
+}
+
 async fn manifest(meta: &Meta, u: &UserRecord, len: u32) -> ManifestId {
     let chunk = ChunkId::from_bytes(*blake3::hash(uuid::Uuid::now_v7().as_bytes()).as_bytes());
     meta.add_chunk(u.space, &chunk, u64::from(len) + 1, NOW).await.unwrap();
@@ -171,7 +264,7 @@ async fn manifest(meta: &Meta, u: &UserRecord, len: u32) -> ManifestId {
 }
 
 fn version(manifest: ManifestId) -> NewVersion {
-    NewVersion { id: VersionId::generate(), manifest, mtime_ms: NOW, exec: false }
+    NewVersion { id: VersionId::generate(), manifest, mtime_ms: NOW, exec: false, save: None }
 }
 
 async fn full_tree(meta: &Meta, space: craft_cloud_proto::SpaceId) -> craft_cloud_proto::ChangeSet {
@@ -218,6 +311,35 @@ async fn users_and_devices(meta: &Meta) {
     meta.revoke_device(ana.id, dev).await.unwrap();
     assert_eq!(meta.device_by_token(&token).await.unwrap(), None);
     assert!(meta.list_devices(ana.id).await.unwrap()[0].revoked);
+}
+
+/// A version a Craft app saved keeps its save record (as stored, unread), in the listing and the change feed; one
+/// without has none; one over the record limit is stored without it.
+async fn a_version_keeps_its_save_record(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = meta.create_device(u.id, "pc", &[3u8; 32], NOW).await.unwrap();
+    let parent = root(meta, &u).await;
+    let record = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::DocId::generate(), frontiers: vec![(1, 5), (2, 3)] };
+    let (saved, plain, huge) = (NodeId::generate(), NodeId::generate(), NodeId::generate());
+    let op = |node: NodeId, name: &str, v: NewVersion| Op::Create { node, parent, name: craft_cloud_proto::Name::new(name).unwrap(), version: v };
+    let m = manifest(meta, &u, 4).await;
+    let too_many =
+        craft_cloud_proto::SaveRecord { doc: record.doc, frontiers: (0..=craft_cloud_proto::ops::MAX_SAVE_HEADS as u64).map(|p| (p, 1)).collect() };
+    let ops = [
+        op(saved, "a.kitdemo", NewVersion { save: Some(record.clone()), ..version(m) }),
+        op(plain, "b.txt", version(m)),
+        op(huge, "c.kitdemo", NewVersion { save: Some(too_many), ..version(m) }),
+    ];
+    meta.commit(u.space, dev, &ops, NOW).await.unwrap();
+    for listing in [full_tree(meta, u.space).await, meta.changes(u.space, 0, None, MAX_PAGE_NODES).await.unwrap()] {
+        let save = |id| match &find(&listing.nodes, id).kind {
+            NodeKind::File(f) => f.save.clone(),
+            NodeKind::Dir => None,
+        };
+        assert_eq!(save(saved), Some(record.clone()));
+        assert_eq!(save(plain), None);
+        assert_eq!(save(huge), None, "over the limit: stored without it");
+    }
 }
 
 async fn a_new_space_has_only_its_root(meta: &Meta) {
@@ -1659,6 +1781,8 @@ async fn upgrading_counts_what_each_space_already_stores() {
         // And before join codes.
         sqlx::query("DROP TABLE pairings").execute(&mut conn).await.unwrap();
         sqlx::query("DROP TABLE invites").execute(&mut conn).await.unwrap();
+        // And before save records.
+        sqlx::query("ALTER TABLE versions DROP COLUMN save").execute(&mut conn).await.unwrap();
         sqlx::query("DELETE FROM schema_version WHERE version >= 2").execute(&mut conn).await.unwrap();
     }
     let meta = Meta::open(&url).await.unwrap();
@@ -1683,5 +1807,5 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 5);
+    assert_eq!(versions, 6);
 }

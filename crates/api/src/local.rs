@@ -15,8 +15,9 @@
 //!   `DELETE /v1/devices/{id}` → the list after; `POST /v1/pause`, `/v1/resume` and `/v1/quit` → [`Status`];
 //!   `POST /v1/autostart` ([`AutostartRequest`]) → [`Status`]; `GET /v1/recents`, upgraded to a WebSocket of JSON
 //!   text messages: [`RecentsRequest`] in, [`RecentsEvent`] out; `GET /v1/docs`, upgraded to a WebSocket of live
-//!   documents ([`docs`]: [`DocsRequest`] and binary frames in, [`DocsEvent`] and binary frames out). Errors are the HTTP API's
-//!   [`ErrorBody`](crate::api::ErrorBody) with its codes and [`codes`].
+//!   documents ([`docs`]: [`DocsRequest`] and binary frames in, [`DocsEvent`] and binary frames out); `PUT /v1/blobs`
+//!   and `GET /v1/blobs/{hash}`: binary content kept out of live documents ([`blobs`]). Errors are the HTTP API's error
+//!   body ([`ErrorAnswer`](crate::api::ErrorAnswer) reads its code and message) with its codes and [`codes`].
 //! - **Versions**: [`Status::api`] is the local API version the agent speaks; a client refuses one outside
 //!   [`LOCAL_API_MIN`]..=[`LOCAL_API_MAX`] when it connects.
 
@@ -52,7 +53,7 @@ pub const MAX_MACHINE_BYTES: usize = 128;
 /// Largest JSON body or WebSocket message of the local API, either way.
 pub const MAX_LOCAL_JSON_BYTES: usize = 1024 * 1024;
 
-/// Error codes of the local API (the `error` field of [`ErrorBody`](crate::api::ErrorBody)), beside the HTTP API's
+/// Error codes of the local API (the `error` field of [`ErrorAnswer`](crate::api::ErrorAnswer)), beside the HTTP API's
 /// `invalid`, `unauthorized` (the token), `not_found`, `too_large` and `internal`.
 pub mod codes {
     /// A `Host` that isn't `127.0.0.1:<port>`, or an `Origin` header: the request didn't come from a local program.
@@ -83,6 +84,11 @@ pub mod codes {
     /// `join` or `login` without `adopt`: the folder already has files in it. Nothing was sent to the server, so the
     /// code still works; ask whether to sync those files, and send it again with `adopt` if so.
     pub const FOLDER_HAS_FILES: &str = "folder_has_files";
+    /// `GET /v1/blobs/{hash}`: neither this machine nor the account's server has that blob.
+    pub const BLOB_NOT_FOUND: &str = "blob_not_found";
+    /// Never sent by an agent: what a client reports when the agent answers a call it doesn't know (`not_found` for
+    /// the call itself), as one from before that call answers it. Update Craft Cloud.
+    pub const AGENT_TOO_OLD: &str = "agent_too_old";
 }
 
 /// The paths of the local API.
@@ -108,6 +114,69 @@ pub mod paths {
     pub const QUIT: &str = "/v1/quit";
     /// `POST` ([`super::AutostartRequest`]): start, or don't start, the agent at login → [`super::Status`].
     pub const AUTOSTART: &str = "/v1/autostart";
+    /// `PUT`: a blob → [`super::blobs::Stored`]; `GET /v1/blobs/{hash}`: its bytes ([`super::blobs`]).
+    pub const BLOBS: &str = "/v1/blobs";
+}
+
+/// Binary content an app keeps out of a live document (images, audio, a font): `PUT /v1/blobs` with the bytes as the
+/// body (`application/octet-stream`, 1 byte to [`MAX_BLOB_BYTES`](crate::limits::MAX_BLOB_BYTES)) is answered with
+/// [`Stored`] once the blob is on the agent's disk; it goes up to the server as a file's content does (cut into
+/// chunks, then a manifest), at once when online and later otherwise. `GET /v1/blobs/{hash}` answers the bytes: from
+/// the agent's disk, or downloaded first when this machine doesn't have them yet (`offline` when it can't reach the
+/// server; [`codes::BLOB_NOT_FOUND`](super::codes::BLOB_NOT_FOUND) when the account has no such blob).
+///
+/// A blob is named by its content: `hash` is the BLAKE3 hash of the manifest the bytes cut into (with `fastcdc-v1`,
+/// as the file sync cuts content), so the same bytes have the same name on every machine. An agent from before blobs
+/// answers both calls with the local API's `not_found` for an unknown call; a client reads that as
+/// [`codes::AGENT_TOO_OLD`](super::codes::AGENT_TOO_OLD).
+pub mod blobs {
+    use serde::{Deserialize, Serialize};
+
+    /// The answer to a `PUT`: the blob's name and length.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Stored {
+        /// 64 lowercase hex digits.
+        #[serde(with = "hex32")]
+        pub hash: [u8; 32],
+        pub len: u64,
+    }
+
+    /// `hash` written as 64 lowercase hex digits, for the `GET` path.
+    pub fn hex(hash: &[u8; 32]) -> String {
+        hash.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// 64 lowercase hex digits as a hash; `None` for anything else.
+    pub fn parse_hex(text: &str) -> Option<[u8; 32]> {
+        let bytes = text.as_bytes();
+        if bytes.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (slot, pair) in out.iter_mut().zip(bytes.chunks(2)) {
+            let digit = |c: u8| match c {
+                b'0'..=b'9' => Some(c - b'0'),
+                b'a'..=b'f' => Some(c - b'a' + 10),
+                _ => None,
+            };
+            let (hi, lo) = (digit(*pair.first()?)?, digit(*pair.get(1)?)?);
+            *slot = (hi << 4) | lo;
+        }
+        Some(out)
+    }
+
+    mod hex32 {
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        pub fn serialize<S: Serializer>(hash: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&super::hex(hash))
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+            let text = String::deserialize(d)?;
+            super::parse_hex(&text).ok_or_else(|| serde::de::Error::custom("expected 64 lowercase hex digits"))
+        }
+    }
 }
 
 /// The agent's data folder: `$CRAFT_CLOUD_AGENT_DIR` if set, else [`default_data_dir`]. `env` reads an environment
@@ -241,7 +310,7 @@ impl std::fmt::Debug for LoginRequest {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRequest {
     /// As typed or pasted: `cloud.example.com/K7M4-Q9TX`, or the link `https://cloud.example.com/join/K7M4-Q9TX`
-    /// (see [`crate::join::JoinString`]).
+    /// (see `craft_cloud_proto::join::JoinString`).
     pub join: String,
     /// The folder to sync (absolute). Default: "Craft Cloud" in the home folder.
     #[serde(default)]
@@ -396,7 +465,7 @@ pub mod docs {
     /// The header of a binary frame: kind and id.
     pub const HEADER_BYTES: usize = 9;
     /// Largest binary frame (a state or an import: a snapshot), either way.
-    pub const MAX_BINARY_BYTES: usize = crate::live::MAX_SNAPSHOT_BYTES + HEADER_BYTES;
+    pub const MAX_BINARY_BYTES: usize = crate::limits::MAX_SNAPSHOT_BYTES + HEADER_BYTES;
 
     /// A binary frame.
     pub fn encode_binary(kind: u8, id: u64, bytes: &[u8]) -> Vec<u8> {
@@ -420,10 +489,71 @@ pub mod docs {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum DocsRequest {
     /// Open the file at `path` (relative to the synced folder, `/`-separated, or absolute inside it) as a live document
-    /// for `app` (a lowercase app name), under the number `id` on this connection.
-    Open { id: u64, path: String, app: String },
+    /// for `app` (a lowercase app name), under the number `id` on this connection. `file_hash`: the BLAKE3 hash (hex)
+    /// of the file's bytes as the app read them, for `opened` to say whether a Craft app saved them
+    /// ([`DocsEvent::Opened`]'s `changed_outside`).
+    Open {
+        id: u64,
+        path: String,
+        app: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_hash: Option<String>,
+    },
     /// The app is done with the document.
     Close { doc: crate::ids::DocId },
+    /// The app is about to write the document's file: its content's BLAKE3 hash (hex) and the live document's
+    /// frontiers it was made from (Loro's heads, `[peer, counter]` operation IDs). Sent on the same stream after every
+    /// change it covers; the agent keeps it once all those operations are in its copy (one that comes first waits for
+    /// them, and is dropped if the app closes the document before), and records it with the file version it uploads
+    /// for that content ([`SaveRecord`]).
+    Saved { doc: crate::ids::DocId, hash: String, frontiers: Vec<(u64, u32)> },
+    /// The app is about to write the document's file with content `hash` (hex), and its record (`saved`) follows once
+    /// the changes it covers have gone: sent at once, before the write. Until the record comes (or the app closes the
+    /// document), the agent's sync takes that content for a Craft save on its way: it doesn't upload it without its
+    /// record, nor make a conflict copy of it, but waits (at most the save-order wait, 10 minutes).
+    Saving { doc: crate::ids::DocId, hash: String },
+}
+
+/// Most heads a save record's frontiers may have: the live document's concurrent tips, one or two in practice
+/// (a record with more is a hostile one and isn't kept). At most about 9 KiB of JSON.
+pub const MAX_SAVE_HEADS: usize = 256;
+
+/// A file version a Craft app saved from a live document: what the version's content came from. Kept with the
+/// version on the server (an older server or agent ignores it), so the file sync can tell two Craft saves of one live
+/// document from an edit outside Craft.
+///
+/// It names the live document's frontiers when saved (its heads: the last operations, as `(peer, counter)`), never a
+/// version vector, so it stays small however many machines and sessions have edited the document. Whether one record
+/// includes another is answered by an agent that holds the document, from its copy (see the sync's `SaveRecords`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveRecord {
+    /// The live document.
+    pub doc: crate::ids::DocId,
+    /// The live document's frontiers when saved: `(peer, counter)` operation IDs, sorted.
+    pub frontiers: Vec<(u64, u32)>,
+}
+
+impl SaveRecord {
+    /// Whether the record is well formed: at most [`MAX_SAVE_HEADS`] heads, sorted and distinct.
+    pub fn is_valid(&self) -> bool {
+        self.frontiers.len() <= MAX_SAVE_HEADS && self.frontiers.windows(2).all(|w| matches!(w, [a, b] if a < b))
+    }
+
+    /// Reads an optional record field leniently (`#[serde(deserialize_with)]`): a record that doesn't read (an older
+    /// build's form, a damaged one, an unknown later one) or isn't well formed is no record, and only the record is
+    /// lost, never what holds it.
+    pub fn lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<SaveRecord>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Any {
+            Record(SaveRecord),
+            Other(serde::de::IgnoredAny),
+        }
+        Ok(match Option::<Any>::deserialize(d)? {
+            Some(Any::Record(r)) if r.is_valid() => Some(r),
+            _ => None,
+        })
+    }
 }
 
 /// How a document stands, as `opened` and `status` say it.
@@ -436,6 +566,10 @@ pub struct DocState {
     /// The size of the binary state that follows `opened` (0 in `status`).
     #[serde(default)]
     pub bytes: u64,
+    /// How many `update` frames follow the state as part of it (updates still waiting for their history): an app
+    /// imports them with the state before it writes with its peer (0 in `status`, and from an older agent).
+    #[serde(default)]
+    pub updates: u64,
 }
 
 /// Why a file opens as a plain file rather than a live document.
@@ -461,8 +595,17 @@ pub enum NotLiveReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum DocsEvent {
-    /// The document is live: its state follows as a binary frame of `state.bytes` bytes.
-    Opened { id: u64, doc: crate::ids::DocId, state: DocState },
+    /// The document is live: its state follows as a binary frame of `state.bytes` bytes. `changed_outside`, for an
+    /// open that named its `file_hash`: whether no Craft app's save of this document (this machine's records, or the
+    /// file version's on the server) has that content: the file was edited outside Craft, and the app may offer to
+    /// bring it in. None: the agent can't tell. (Every app session writes with a fresh random Loro peer of its own.)
+    Opened {
+        id: u64,
+        doc: crate::ids::DocId,
+        state: DocState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        changed_outside: Option<bool>,
+    },
     /// The file has never been live: send its content as a binary import frame.
     NeedsImport { id: u64 },
     /// The file opens as a plain file.
@@ -485,6 +628,15 @@ pub enum DocsEvent {
         deleted: bool,
         #[serde(default)]
         stopped: bool,
+    },
+    /// The file of an open document, as it is on this machine's disk now: the live document's frontiers a Craft app
+    /// saved it from (the record of that save, this machine's or the server's version's), or none when no record is
+    /// known (edited outside Craft, not synced yet). Sent after `opened` and whenever it changes (the app saved, the
+    /// sync brought another machine's save). An app whose live document is strictly ahead of it saves again.
+    File {
+        doc: crate::ids::DocId,
+        #[serde(default)]
+        frontiers: Option<Vec<(u64, u32)>>,
     },
     /// A request or a binary frame was refused (`id` and `seq` name it when they can). `code` is one of
     /// [`crate::api::codes`] or [`codes`].
@@ -516,6 +668,17 @@ pub fn recent_path(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A save record names frontiers, sorted and distinct, at most [`MAX_SAVE_HEADS`] of them.
+    #[test]
+    fn a_save_record_is_its_frontiers() {
+        let doc = crate::ids::DocId::generate();
+        assert!(SaveRecord { doc, frontiers: vec![(1, 5), (2, 0)] }.is_valid());
+        assert!(SaveRecord { doc, frontiers: Vec::new() }.is_valid(), "an empty document");
+        assert!(!SaveRecord { doc, frontiers: vec![(2, 0), (1, 5)] }.is_valid(), "unsorted");
+        assert!(!SaveRecord { doc, frontiers: vec![(1, 5), (1, 5)] }.is_valid(), "twice");
+        assert!(!SaveRecord { doc, frontiers: (0..=MAX_SAVE_HEADS as u64).map(|p| (p, 1)).collect() }.is_valid());
+    }
 
     /// A list's event says when its push stopped; without the field (an older agent) it hasn't.
     #[test]
@@ -633,7 +796,11 @@ mod tests {
         assert_eq!(docs::decode_binary(&frame[..8]), None, "too short for a header");
         assert_eq!(docs::decode_binary(&[]), None);
         let open: DocsRequest = serde_json::from_value(serde_json::json!({ "type": "open", "id": 1, "path": "a.txt", "app": "wordcraft" })).unwrap();
-        assert_eq!(open, DocsRequest::Open { id: 1, path: "a.txt".into(), app: "wordcraft".into() });
+        assert_eq!(open, DocsRequest::Open { id: 1, path: "a.txt".into(), app: "wordcraft".into(), file_hash: None });
+        let plain =
+            serde_json::to_value(DocsEvent::Opened { id: 1, doc: crate::ids::DocId::generate(), state: DocState::default(), changed_outside: None })
+                .unwrap();
+        assert!(plain.get("changed_outside").is_none(), "none: no field (as an older agent sends it)");
         let not_live = serde_json::to_value(DocsEvent::NotLive { id: 1, reason: NotLiveReason::NotSynced, message: None }).unwrap();
         assert_eq!(not_live, serde_json::json!({ "type": "not_live", "id": 1, "reason": "not_synced", "message": null }));
         let status: DocsEvent =

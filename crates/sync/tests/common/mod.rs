@@ -231,6 +231,16 @@ impl Transport for Local {
         }
         Ok(CommitResponse { seq: out.seq, epoch: out.epoch })
     }
+
+    async fn attach_save(
+        &self,
+        node: craft_cloud_proto::NodeId,
+        version: craft_cloud_proto::VersionId,
+        save: &craft_cloud_proto::SaveRecord,
+    ) -> Result<(), TransportError> {
+        self.faults.check()?;
+        self.meta.attach_save(self.space, node, version, save).await.map(|_| ()).map_err(meta_err)
+    }
 }
 
 pub const STAMP: ConflictStamp = ConflictStamp { year: 2026, month: 10, day: 11, hour: 14, minute: 3, utc: false };

@@ -66,14 +66,32 @@ per app connection for live sessions. `run` serves it while signed out too. Call
     kept);
   - a binary presence from the app (at most 4 KiB, at most 20 a second per document) goes to the document's other
     machines and apps; `close {doc}`: the app is done with it (the agent keeps it);
+  - `saved {doc, hash, frontiers, version}` (appended): the app saved the document's file; `hash` is the BLAKE3 hash
+    of the bytes it wrote (hex), `frontiers` Loro's (hex, kept for the app's own use) and `version` the document's
+    version vector as `[peer, end counter]` pairs, at most 4,096. The agent keeps the newest 512 in
+    `live/<space>/saves.json` (atomically) and answers nothing; an `error` only when it doesn't look like a save. An
+    agent from before save records answers `error` (not a request it knows) and nothing else changes: the file syncs
+    as any file;
   - a binary frame without a header, or of a kind an app doesn't send, ends the connection; a text message that
     isn't a request is answered `error`. An app that doesn't take a message within 10 s is dropped (so is one whose
     messages queue up past 1,024 in the agent); its documents stay with the agent. An app that goes away mid-import
     leaves nothing on the server (the import goes up only once whole); the next app to open the file is asked.
 
+- `PUT /v1/blobs` (the body: 1 byte to 64 MiB of binary content an app keeps out of a live document) → `{hash, len}`
+  once the bytes are on the agent's disk (`live/<space>/blobs/<hash>`, with a `<hash>.pending` mark written first);
+  `hash` is the BLAKE3 hash of the manifest the bytes cut into with `fastcdc-v1`, so the same bytes have the same
+  name everywhere. The bytes go up through the chunk API (the chunks the server lacks, then the manifest, the
+  account's storage cap applying) at once when the server can be reached, and otherwise with the next put or every
+  30 s; the mark goes once they are up. `GET /v1/blobs/{hash}` → the bytes: from the agent's disk (checked against
+  the name on every read; a damaged copy is dropped and fetched again), or downloaded (every chunk checked, the whole
+  against the manifest) and kept. `blob_not_found` when the account has no such blob, `offline` when it isn't here
+  and the server can't be reached. An agent from before blobs answers both with the local API's `not_found` for an
+  unknown call, which `craft-cloud-app` reports as `agent_too_old` (blob calls only: everything else works as
+  before).
+
 Errors use stable codes (`forbidden`, `wrong_password`, `already_signed_in`, `not_signed_in`, `offline`,
 `needs_you`, and for joining `invalid_code`, `password_required`, `weak_password`, `untrusted_certificate`,
-`cannot_remove_self`, `autostart_failed`, `folder_has_files`). Every call has the same `Host`, `Origin` and token checks. Each request is answered before the next is read; a client that doesn't take a message within 10 s is
+`cannot_remove_self`, `autostart_failed`, `folder_has_files`, and for blobs `blob_not_found`). Every call has the same `Host`, `Origin` and token checks. Each request is answered before the next is read; a client that doesn't take a message within 10 s is
 disconnected, and the crate reconnects.
 
 **Server live endpoint** (agent ↔ server): `GET /api/v1/live` upgraded to a WebSocket, signed in with the device
@@ -186,4 +204,38 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
   alone.
 - Loro failing on a row of a catch-up taken as a batch: the catch-up is taken again one row at a time, so only the
   row at fault is dropped (and said). A second failure in a run stops the document (`status.stopped`) until the agent
-  restarts.
+  restarts. A batch goes to Loro in groups of at most 16 KiB of updates (Loro's batch import of much text at once
+  takes time growing with its square).
+
+**Save records** (the file sync and live documents): each file version a Craft app saves records the live
+document's version it was made from.
+- The app tells its agent (`saved`, above); the sync engine's new version of a file whose content an app saved
+  carries the record, `NewVersion.save = {doc, version}` (appended: an older agent sends none, an older server ignores
+  it). The server keeps it with the version as the JSON it came as (`versions.save`, migration 0006; a record of more
+  than 4,096 entries is kept as none) and lists it as `FileState.save` (an older agent ignores it). The server never
+  reads what it means, and never parses Loro.
+- When a file changed here and on the server, and this content and the server's version both carry a record of the
+  same live document, the engine makes no conflict copy: the server's version wins if its record's version includes
+  this one's (it was saved later from a document that had everything this one had: it is downloaded over the file);
+  otherwise this one goes up over it (the newer upload; the live document holds both sides' edits, so the next save
+  writes them all). A version without a record (edited outside Craft), or records of two documents, is a conflict as
+  always, with its copy.
+- A file whose bytes are no save (or the import) of its document is reported by the app kit on open
+  (`changed_outside`): the app may bring the file in as an ordinary local change, or keep the live content. The kit
+  keeps the newest 32 saves' hashes in the document's `$saves` map for that.
+
+**The app kit** (`craft-cloud-kit`, what apps link; see `docs/kit.md`): the content's layout in Loro.
+- The root map `root` holds `schema: {app, version}`, written at import. A document whose app differs, whose version
+  is newer than the app's, or that has none opens read-only.
+- Each part of an app's model has a key: a tree `k` (`LoroTree`, fractional index on, each node's meta map holding
+  the element's ID under `$id` and its properties), a rich text `k` (`LoroText`: character attributes as marks
+  expanding after, paragraph attributes as marks `¶<name>` on each paragraph's `\n` never expanding, the last
+  paragraph's in the root map `k.last`), a table (`k.rows`, `k.cols`: movable lists of IDs; `k.cells`: a map from
+  `row:column` to a value), a timeline (`k.tracks`: a movable list; `k.track`: track properties; `k.items`: item ID
+  to `{$track, $start, $len, …}`; `k.keys`: keyframe ID to `{$item, $at, $value}`), an opaque value (the root map
+  `$opaque`, key `k`, bytes). IDs are 16 bytes (little-endian `u128`), or 32 hex digits as map keys. Binary content
+  is never in Loro: it is a `{$chunk, $len}` value naming a blob.
+- A local change is written as commits of at most 512 KiB each (estimated: payload and 32 bytes per operation), each
+  exported at once; an export still over 512 KiB is cut by counter range. One change is one undo step.
+- Presence an app sets is sent as `[u64 peer, big-endian][the app's bytes]`, again every 3 s, and dropped 10 s after
+  its peer goes quiet.

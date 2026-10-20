@@ -42,19 +42,22 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use craft_cloud_proto::DocId;
-use craft_cloud_proto::api::ErrorBody;
-use craft_cloud_proto::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, STATE, UPDATE, decode_binary, encode_binary};
-use craft_cloud_proto::local::{DocState, DocsEvent, DocsRequest, MAX_LOCAL_JSON_BYTES, paths};
+use craft_cloud_api::DocId;
+use craft_cloud_api::api::ErrorAnswer as ErrorBody;
+use craft_cloud_api::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, STATE, UPDATE, decode_binary, encode_binary};
+use craft_cloud_api::local::{DocState, DocsEvent, DocsRequest, MAX_LOCAL_JSON_BYTES, paths};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::HandshakeError;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 
-pub use craft_cloud_proto::local::NotLiveReason;
+pub use craft_cloud_api::local::NotLiveReason;
 
 use crate::http::CONNECT_TIMEOUT;
 use crate::{Client, Error};
+
+/// What a document calls when an event came for it (from the reader's thread): an egui app's `request_repaint`.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
 /// How long an open may take: finding the file's node (the agent may sync it first, up to 5 s), joining the document on
 /// the server, and its state.
@@ -73,13 +76,17 @@ pub enum Event {
     Presence(Vec<u8>),
     /// This app's change number `seq` ([`Document::send`]'s answer) is on the agent's disk.
     Acked(u64),
-    /// This app's change number `seq` was refused (it doesn't decode, or is over 1 MiB): the agent's copy doesn't have
-    /// it.
-    Refused { seq: u64, message: String },
+    /// This app's change number `seq` was refused: the agent's copy doesn't have it. `code` says whether sending it
+    /// again can help: `invalid` (it doesn't decode) and `too_large` (over 1 MiB) never will; anything else (`internal`:
+    /// the agent couldn't write it to disk) is worth sending again later.
+    Refused { seq: u64, code: String, message: String },
     /// How the document stands: `online` (edits go out as they are made), changes waiting for the server, and whether
     /// its file was deleted (the document still works; a later open of the path is a new file), and whether the agent
     /// stopped following it until it restarts (Loro failed on it twice; changes made meanwhile are kept).
     Status { online: bool, waiting: u64, deleted: bool, stopped: bool },
+    /// The document's file on this machine's disk now: the live document's frontiers (`(peer, counter)` heads) a Craft
+    /// app saved it from, or none when no save record is known for it (see `DocsEvent::File`).
+    File(Option<Vec<(u64, u32)>>),
     /// The connection to the agent ended.
     Closed(String),
 }
@@ -95,9 +102,28 @@ pub enum Opened {
     NotLive(NotLiveReason),
 }
 
+/// What an app may tell the agent when it opens a file ([`Documents::open_with`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenOptions {
+    /// The BLAKE3 hash of the file's bytes as the app read them: [`Document::changed_outside`] says whether a Craft
+    /// app saved them.
+    pub file_hash: Option<[u8; 32]>,
+}
+
+/// What `opened` says, before its state comes.
+#[derive(Debug, Clone)]
+struct Head {
+    doc: DocId,
+    state: DocState,
+    changed_outside: Option<bool>,
+}
+
+/// An open's state so far: what `opened` said, the snapshot, and the updates that are part of it.
+type Filling = (Head, Vec<u8>, Vec<Vec<u8>>);
+
 /// What the reader hands an open in progress.
 enum Answer {
-    Live { doc: DocId, state: DocState, snapshot: Vec<u8> },
+    Live { head: Head, snapshot: Vec<u8>, updates: Vec<Vec<u8>> },
     NeedsImport,
     NotLive(NotLiveReason),
     Refused(Error),
@@ -111,9 +137,13 @@ struct Shared {
     routes: Mutex<HashMap<u64, Sender<Event>>>,
     answers: Mutex<HashMap<u64, Sender<Answer>>>,
     /// An `opened` whose state hasn't come yet, by number.
-    opening: Mutex<HashMap<u64, (DocId, DocState)>>,
+    opening: Mutex<HashMap<u64, Head>>,
+    /// An open whose state came and whose state's updates are still coming, by number.
+    filling: Mutex<HashMap<u64, Filling>>,
     /// Which numbers a document is open as (its status names the document).
     numbers: Mutex<HashMap<DocId, Vec<u64>>>,
+    /// What to call after an event went to a document's channel, by number ([`Document::set_waker`]).
+    wakers: Mutex<HashMap<u64, Waker>>,
     closed: AtomicBool,
     next_id: AtomicU64,
     /// A clone of the stream: dropping the connection shuts it down (which wakes the reader).
@@ -145,6 +175,14 @@ impl Shared {
         if let Some(events) = lock(&self.routes).get(&id) {
             let _ = events.send(event);
         }
+        self.wake(id);
+    }
+
+    fn wake(&self, id: u64) {
+        let waker = lock(&self.wakers).get(&id).cloned();
+        if let Some(waker) = waker {
+            waker();
+        }
     }
 
     fn answer(&self, id: u64, answer: Answer) {
@@ -157,8 +195,8 @@ impl Shared {
     fn on_message(&self, message: Message) {
         match message {
             Message::Text(text) => match serde_json::from_str::<DocsEvent>(text.as_str()) {
-                Ok(DocsEvent::Opened { id, doc, state }) => {
-                    lock(&self.opening).insert(id, (doc, state));
+                Ok(DocsEvent::Opened { id, doc, state, changed_outside }) => {
+                    lock(&self.opening).insert(id, Head { doc, state, changed_outside });
                 }
                 Ok(DocsEvent::NeedsImport { id }) => self.answer(id, Answer::NeedsImport),
                 Ok(DocsEvent::NotLive { id, reason, .. }) => self.answer(id, Answer::NotLive(reason)),
@@ -169,7 +207,13 @@ impl Shared {
                         self.route(id, Event::Status { online, waiting, deleted, stopped });
                     }
                 }
-                Ok(DocsEvent::Error { id: Some(id), seq: Some(seq), message, .. }) => self.route(id, Event::Refused { seq, message }),
+                Ok(DocsEvent::File { doc, frontiers }) => {
+                    let ids = lock(&self.numbers).get(&doc).cloned().unwrap_or_default();
+                    for id in ids {
+                        self.route(id, Event::File(frontiers.clone()));
+                    }
+                }
+                Ok(DocsEvent::Error { id: Some(id), seq: Some(seq), code, message }) => self.route(id, Event::Refused { seq, code, message }),
                 Ok(DocsEvent::Error { id: Some(id), seq: None, code, message }) => self.answer(id, Answer::Refused(Error::Refused { code, message })),
                 Ok(DocsEvent::Error { id: None, .. }) | Err(_) => {}
             },
@@ -177,12 +221,31 @@ impl Shared {
                 let Some((kind, id, body)) = decode_binary(&bytes) else { return };
                 match kind {
                     STATE => {
-                        if let Some((doc, state)) = lock(&self.opening).remove(&id) {
-                            lock(&self.numbers).entry(doc).or_default().push(id);
-                            self.answer(id, Answer::Live { doc, state, snapshot: body.to_vec() });
+                        if let Some(head) = lock(&self.opening).remove(&id) {
+                            lock(&self.numbers).entry(head.doc).or_default().push(id);
+                            if head.state.updates == 0 {
+                                self.answer(id, Answer::Live { head, snapshot: body.to_vec(), updates: Vec::new() });
+                            } else {
+                                lock(&self.filling).insert(id, (head, body.to_vec(), Vec::new()));
+                            }
                         }
                     }
-                    UPDATE => self.route(id, Event::Update(body.to_vec())),
+                    UPDATE => {
+                        // An update that is part of an open's state: kept with it until the last has come.
+                        let mut filling = lock(&self.filling);
+                        if let Some((head, _, updates)) = filling.get_mut(&id) {
+                            updates.push(body.to_vec());
+                            if updates.len() as u64 >= head.state.updates
+                                && let Some((head, snapshot, updates)) = filling.remove(&id)
+                            {
+                                drop(filling);
+                                self.answer(id, Answer::Live { head, snapshot, updates });
+                            }
+                            return;
+                        }
+                        drop(filling);
+                        self.route(id, Event::Update(body.to_vec()));
+                    }
                     PRESENCE => self.route(id, Event::Presence(body.to_vec())),
                     _ => {}
                 }
@@ -197,6 +260,11 @@ impl Shared {
         for (_, events) in lock(&self.routes).drain() {
             let _ = events.send(Event::Closed(why.to_owned()));
         }
+        let wakers: Vec<Waker> = lock(&self.wakers).drain().map(|(_, w)| w).collect();
+        for waker in wakers {
+            waker();
+        }
+        lock(&self.filling).clear();
         for (_, waiting) in lock(&self.answers).drain() {
             let _ = waiting.send(Answer::Refused(Error::Io(why.to_owned())));
         }
@@ -270,7 +338,9 @@ impl Documents {
             routes: Mutex::new(HashMap::new()),
             answers: Mutex::new(HashMap::new()),
             opening: Mutex::new(HashMap::new()),
+            filling: Mutex::new(HashMap::new()),
             numbers: Mutex::new(HashMap::new()),
+            wakers: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             stream,
@@ -286,10 +356,17 @@ impl Documents {
     /// Opens the file at `path` (relative to the synced folder, `/`-separated, or absolute inside it) for `app` (its
     /// lowercase name, as in recents). Waits for the answer, [`OPEN_TIMEOUT`] at most.
     pub fn open(&self, path: &str, app: &str) -> Result<Opened, Error> {
+        self.open_with(path, app, &OpenOptions::default())
+    }
+
+    /// [`Documents::open`], with what the app knows already ([`OpenOptions`]).
+    pub fn open_with(&self, path: &str, app: &str, options: &OpenOptions) -> Result<Opened, Error> {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (events_tx, events) = mpsc::channel();
         lock(&self.shared.routes).insert(id, events_tx);
-        let answer = self.ask(id, || self.shared.send_json(&DocsRequest::Open { id, path: path.to_owned(), app: app.to_owned() }));
+        let file_hash = options.file_hash.map(|h| h.iter().map(|b| format!("{b:02x}")).collect());
+        let request = DocsRequest::Open { id, path: path.to_owned(), app: app.to_owned(), file_hash };
+        let answer = self.ask(id, || self.shared.send_json(&request));
         self.opened(id, answer, events)
     }
 
@@ -316,8 +393,8 @@ impl Documents {
             lock(&self.shared.routes).remove(&id);
         };
         match answer {
-            Ok(Answer::Live { doc, state, snapshot }) => {
-                Ok(Opened::Live(Document { id, doc, state, snapshot, events, shared: self.shared.clone(), seq: AtomicU64::new(0) }))
+            Ok(Answer::Live { head, snapshot, updates }) => {
+                Ok(Opened::Live(Document { id, head, snapshot, updates, events, shared: self.shared.clone(), seq: AtomicU64::new(0) }))
             }
             Ok(Answer::NeedsImport) => Ok(Opened::NeedsImport(Importer { id, events, shared: self.shared.clone() })),
             Ok(Answer::NotLive(reason)) => {
@@ -370,8 +447,8 @@ impl Importer {
         }
         let answer = answer.recv_timeout(OPEN_TIMEOUT).map_err(|_| Error::Io("the agent didn't answer the import in time".into()))?;
         match answer {
-            Answer::Live { doc, state, snapshot } => {
-                Ok(Document { id: self.id, doc, state, snapshot, events: self.events, shared: self.shared, seq: AtomicU64::new(0) })
+            Answer::Live { head, snapshot, updates } => {
+                Ok(Document { id: self.id, head, snapshot, updates, events: self.events, shared: self.shared, seq: AtomicU64::new(0) })
             }
             Answer::NotLive(reason) => {
                 Err(Error::Refused { code: "not_live".into(), message: format!("the file opens as a plain file ({reason:?})") })
@@ -385,9 +462,9 @@ impl Importer {
 /// An open live document.
 pub struct Document {
     id: u64,
-    doc: DocId,
-    state: DocState,
+    head: Head,
     snapshot: Vec<u8>,
+    updates: Vec<Vec<u8>>,
     events: Receiver<Event>,
     shared: Arc<Shared>,
     /// This app's changes sent so far (the agent numbers them the same way).
@@ -396,25 +473,36 @@ pub struct Document {
 
 impl std::fmt::Debug for Document {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Document").field("doc", &self.doc).field("state", &self.state).finish()
+        f.debug_struct("Document").field("doc", &self.head.doc).field("state", &self.head.state).finish()
     }
 }
 
 impl Document {
-    /// The document as it was when opened: a Loro snapshot (updates still waiting for their history come as the first
-    /// [`Event::Update`]s).
+    /// The document as it was when opened: a Loro snapshot, then [`Document::state_updates`] (from an older agent,
+    /// updates still waiting for their history come as the first [`Event::Update`]s instead).
     pub fn state(&self) -> &[u8] {
         &self.snapshot
     }
 
+    /// The updates that are part of the state (still waiting for their history), to import after it, in order.
+    pub fn state_updates(&self) -> &[Vec<u8>] {
+        &self.updates
+    }
+
     /// Whether it was online, and how many changes waited, when opened.
     pub fn opened_state(&self) -> DocState {
-        self.state
+        self.head.state
     }
 
     /// The live document's ID.
     pub fn id(&self) -> DocId {
-        self.doc
+        self.head.doc
+    }
+
+    /// For an open that named the file's hash ([`OpenOptions::file_hash`]): whether no Craft app's save of this
+    /// document has that content (the file was edited outside Craft). None: the agent can't tell (or is older).
+    pub fn changed_outside(&self) -> Option<bool> {
+        self.head.changed_outside
     }
 
     /// Sends this app's change (a Loro update, at most 1 MiB); returns its number, which [`Event::Acked`] names once
@@ -425,9 +513,35 @@ impl Document {
         Ok(seq)
     }
 
+    /// Tells the agent the app is about to write the document's file: the content's BLAKE3 `hash`, and the live
+    /// document's frontiers it was made from (`(peer, counter)` heads). Send it after every change it covers
+    /// ([`Document::send`]): the agent keeps it once those are in its copy, and records it with the file version it
+    /// uploads for that content. Doesn't wait for an answer.
+    pub fn saved(&self, hash: [u8; 32], frontiers: &[(u64, u32)]) -> Result<(), Error> {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let mut frontiers = frontiers.to_vec();
+        frontiers.sort_unstable();
+        frontiers.dedup();
+        self.shared.send_json(&DocsRequest::Saved { doc: self.head.doc, hash: hex(&hash), frontiers })
+    }
+
+    /// Tells the agent, at once and before the file is written, that the app is writing the document's file with
+    /// content `hash`, and that its record ([`Document::saved`]) follows: until it comes, the agent's sync waits for it
+    /// rather than take the content for an edit outside Craft. An older agent answers `error`; nothing else changes.
+    pub fn saving(&self, hash: [u8; 32]) -> Result<(), Error> {
+        let hex = hash.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        self.shared.send_json(&DocsRequest::Saving { doc: self.head.doc, hash: hex })
+    }
+
     /// Sends this app's presence (at most 4 KiB, at most 20 a second; more are dropped).
     pub fn presence(&self, bytes: &[u8]) -> Result<(), Error> {
         self.shared.send_binary(PRESENCE, self.id, bytes)
+    }
+
+    /// Calls `waker` (from the connection's reader thread) after each event that comes for this document from now on,
+    /// and once when the connection ends: an app's UI repaints, then takes the events with [`Document::try_recv`].
+    pub fn set_waker(&self, waker: Waker) {
+        lock(&self.shared.wakers).insert(self.id, waker);
     }
 
     /// The next event, if one came.
@@ -449,15 +563,17 @@ impl Document {
 impl Drop for Document {
     fn drop(&mut self) {
         lock(&self.shared.routes).remove(&self.id);
+        lock(&self.shared.wakers).remove(&self.id);
         let mut numbers = lock(&self.shared.numbers);
-        let remaining = numbers.get_mut(&self.doc).map(|ids| {
+        let doc = self.head.doc;
+        let remaining = numbers.get_mut(&doc).map(|ids| {
             ids.retain(|id| *id != self.id);
             ids.len()
         });
         if remaining == Some(0) {
-            numbers.remove(&self.doc);
+            numbers.remove(&doc);
             drop(numbers);
-            let _ = self.shared.send_json(&DocsRequest::Close { doc: self.doc });
+            let _ = self.shared.send_json(&DocsRequest::Close { doc });
         }
     }
 }
@@ -476,12 +592,41 @@ mod tests {
             routes: Mutex::new(HashMap::new()),
             answers: Mutex::new(HashMap::new()),
             opening: Mutex::new(HashMap::new()),
+            filling: Mutex::new(HashMap::new()),
             numbers: Mutex::new(HashMap::new()),
+            wakers: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             stream,
         });
         (shared, listener)
+    }
+
+    /// A state with updates that are part of it: answered once the last of them came, with them; the updates after
+    /// it are the document's events.
+    #[test]
+    fn an_open_waits_for_the_updates_of_its_state() {
+        let (shared, _listener) = shared();
+        let (answer_tx, answer) = mpsc::channel();
+        lock(&shared.answers).insert(5, answer_tx);
+        let (events_tx, events) = mpsc::channel();
+        lock(&shared.routes).insert(5, events_tx);
+        let opened = DocsEvent::Opened {
+            id: 5,
+            doc: DocId::generate(),
+            state: DocState { online: true, waiting: 0, bytes: 1, updates: 2 },
+            changed_outside: None,
+        };
+        shared.on_message(Message::Text(serde_json::to_string(&opened).unwrap().into()));
+        shared.on_message(Message::Binary(encode_binary(STATE, 5, b"s").into()));
+        shared.on_message(Message::Binary(encode_binary(UPDATE, 5, b"1").into()));
+        assert!(answer.try_recv().is_err(), "one of its updates is still to come");
+        shared.on_message(Message::Binary(encode_binary(UPDATE, 5, b"2").into()));
+        shared.on_message(Message::Binary(encode_binary(UPDATE, 5, b"3").into()));
+        let Ok(Answer::Live { updates, .. }) = answer.try_recv() else { panic!("no answer") };
+        assert_eq!(updates, vec![b"1".to_vec(), b"2".to_vec()]);
+        assert_eq!(events.try_recv().unwrap(), Event::Update(b"3".to_vec()));
+        assert!(events.try_recv().is_err());
     }
 
     /// `opened` then the state: one answer; the events after it go to the document, its status by document ID.
@@ -493,12 +638,14 @@ mod tests {
         let (events_tx, events) = mpsc::channel();
         lock(&shared.routes).insert(4, events_tx);
         let doc = DocId::generate();
-        let opened = DocsEvent::Opened { id: 4, doc, state: DocState { online: true, waiting: 0, bytes: 3 } };
+        let opened =
+            DocsEvent::Opened { id: 4, doc, state: DocState { online: true, waiting: 0, bytes: 3, updates: 0 }, changed_outside: Some(true) };
         shared.on_message(Message::Text(serde_json::to_string(&opened).unwrap().into()));
         assert!(answer.try_recv().is_err(), "not before the state");
         shared.on_message(Message::Binary(encode_binary(STATE, 4, b"abc").into()));
-        let Ok(Answer::Live { snapshot, .. }) = answer.try_recv() else { panic!("no answer") };
+        let Ok(Answer::Live { snapshot, head, .. }) = answer.try_recv() else { panic!("no answer") };
         assert_eq!(snapshot, b"abc");
+        assert_eq!(head.changed_outside, Some(true));
         shared.on_message(Message::Binary(encode_binary(UPDATE, 4, b"u").into()));
         let status = DocsEvent::Status { doc, online: false, waiting: 2, deleted: true, stopped: true };
         shared.on_message(Message::Text(serde_json::to_string(&status).unwrap().into()));

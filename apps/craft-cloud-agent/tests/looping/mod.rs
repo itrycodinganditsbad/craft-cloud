@@ -185,12 +185,17 @@ impl Agent {
     }
 
     pub fn run(&self) -> Running {
+        self.run_with(quick())
+    }
+
+    /// Runs with other options than [`quick`]'s.
+    pub fn run_with(&self, options: RunOptions) -> Running {
         let (stop, stops) = mpsc::unbounded_channel();
         let data = self.data.clone();
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             let mut out = Vec::new();
-            let exit = runtime.block_on(run_loop(&data, quick(), stops, &mut out));
+            let exit = runtime.block_on(run_loop(&data, options, stops, &mut out));
             (exit, String::from_utf8_lossy(&out).into_owned())
         });
         Running { stop, thread: Some(thread) }
@@ -232,6 +237,10 @@ pub fn quick() -> RunOptions {
         poll_min_spacing: Duration::from_millis(100),
         poll_busy: Duration::from_millis(200),
         fail_watch: false,
+        record_delay: Duration::ZERO,
+        // An unannounced change of a file an app had open is waited for this long (60 s on a real machine).
+        session_grace: Duration::from_secs(10),
+        announce_delay: Duration::ZERO,
         // Never this machine's own start-at-login entry.
         autostart: craft_cloud_agent::autostart::Target::Off,
     }

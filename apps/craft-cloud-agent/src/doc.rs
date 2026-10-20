@@ -105,6 +105,10 @@ fn session(
     };
     let mirror = LoroDoc::new();
     mirror.import(document.state()).map_err(|e| usage(format!("the document's state doesn't read: {e}")))?;
+    for update in document.state_updates() {
+        // (An update this copy can't take is the other side's; the agent has it, and so will a fresh open.)
+        let _ = mirror.import(update);
+    }
     let text = |mirror: &LoroDoc| mirror.get_text(TEXT).to_string();
     // What came right after the state (updates still waiting for their history), before anything else.
     let take = |mirror: &LoroDoc, event: &Event| {
@@ -128,7 +132,7 @@ fn session(
             let left = until.saturating_duration_since(Instant::now());
             match document.recv_timeout(left) {
                 Some(Event::Acked(acked)) if acked == seq => break,
-                Some(Event::Refused { seq: refused, message }) if refused == seq => {
+                Some(Event::Refused { seq: refused, message, .. }) if refused == seq => {
                     return Err(usage(format!("the agent refused the change: {message}")));
                 }
                 Some(Event::Closed(why)) => return Err(usage(format!("the connection to the agent ended: {why}"))),
@@ -157,7 +161,7 @@ fn session(
                 say(format!("the connection to the agent ended: {why}"));
                 return Ok(Exit::Failed);
             }
-            Some(Event::Presence(_) | Event::Acked(_) | Event::Refused { .. }) | None => {}
+            Some(Event::Presence(_) | Event::Acked(_) | Event::Refused { .. } | Event::File(_)) | None => {}
         }
     }
 }

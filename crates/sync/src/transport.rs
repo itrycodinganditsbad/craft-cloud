@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use craft_cloud_proto::api::{CommitResponse, SpaceResponse};
-use craft_cloud_proto::{ChangeSet, ChunkId, Conflict, ManifestId, Op, PageCursor};
+use craft_cloud_proto::{ChangeSet, ChunkId, Conflict, ManifestId, NodeId, Op, PageCursor, SaveRecord, VersionId};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TransportError {
@@ -46,4 +46,10 @@ pub trait Transport: Send + Sync {
     async fn put_manifest(&self, id: &ManifestId, data: Bytes) -> Result<(), TransportError>;
     async fn get_manifest(&self, id: &ManifestId) -> Result<Bytes, TransportError>;
     async fn commit(&self, ops: &[Op]) -> Result<CommitResponse, TransportError>;
+    /// Adds a save record to `node`'s version `version`, which went up without one (`POST /saves`, appended and
+    /// idempotent). A server from before late records: `NotFound`, as this default says.
+    async fn attach_save(&self, node: NodeId, version: VersionId, save: &SaveRecord) -> Result<(), TransportError> {
+        let _ = (node, version, save);
+        Err(TransportError::NotFound)
+    }
 }

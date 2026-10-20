@@ -60,6 +60,9 @@ fn quick() -> RunOptions {
         poll_min_spacing: Duration::from_millis(100),
         poll_busy: Duration::from_millis(200),
         fail_watch: false,
+        record_delay: Duration::ZERO,
+        session_grace: Duration::from_secs(10),
+        announce_delay: Duration::ZERO,
         // Never this machine's own start-at-login entry.
         autostart: craft_cloud_agent::autostart::Target::Off,
     }

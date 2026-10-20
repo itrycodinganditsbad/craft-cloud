@@ -67,9 +67,9 @@ uuid_id!(
     Epoch
 );
 uuid_id!(
-    /// A live document (see [`crate::live`]). Keyed by `(space, doc)` on the server, like nodes, so an ID never
-    /// reaches into another space. An app's recents document has an ID derived from the space and the app
-    /// ([`crate::live::recents_doc`]), so every machine finds the same one without asking.
+    /// A live document (see `craft_cloud_proto::live`). Keyed by `(space, doc)` on the server, like nodes, so an ID
+    /// never reaches into another space. An app's recents document has an ID derived from the space and the app
+    /// (`craft_cloud_proto::live::recents_doc`), so every machine finds the same one without asking.
     DocId
 );
 

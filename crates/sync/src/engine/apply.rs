@@ -12,6 +12,16 @@ use crate::transport::Transport;
 
 use super::{Engine, Local, Mode, OTHER_REASON, Report, SyncError, io_err, per_node};
 
+/// Who wins a file both sides saved from its live document.
+enum LiveWinner {
+    /// The server's version (its save includes ours).
+    Server,
+    /// Ours, uploaded over it.
+    Here,
+    /// Not known yet which is newer: neither is taken this pass.
+    Wait,
+}
+
 impl<F: Fs, T: Transport> Engine<F, T> {
     pub(super) async fn apply_remote(&mut self, mode: Mode, report: &mut Report) -> Result<(), SyncError> {
         let root = self.state.root.ok_or_else(|| SyncError::Corrupt("no root".into()))?;
@@ -300,6 +310,52 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                         self.relocate(&bpath, &rpath, report)?;
                     }
                     new_entry.kind = self.base_file(file, meta, hash);
+                    self.state.base.insert(id, new_entry);
+                    return Ok(());
+                }
+                // Both saved by Craft apps from the file's live document: no conflict copy (see `SaveRecords`).
+                if let Some(file) = &remote.file
+                    && let Some((winner, checked)) = self.live_winner(id, file, &bpath)?
+                {
+                    if matches!(winner, LiveWinner::Wait) {
+                        // The base stays as it is, and the push leaves the file too: the next pass decides again.
+                        report.skipped.push((bpath.to_string(), format!("{}; tried again next pass", super::SAVE_ORDER_WAITS)));
+                        return Ok(());
+                    }
+                    if moved {
+                        self.settle_occupants(id, &rpath, Some(&bpath), None, report).await?;
+                        self.relocate(&bpath, &rpath, report)?;
+                    }
+                    match winner {
+                        LiveWinner::Server => {
+                            // Its record includes ours: everything here is in it. Replaces exactly what was hashed,
+                            // stat'ed before the hash (a rename keeps the file's ID and time); a save that landed since
+                            // keeps the old base, and the next pass decides again.
+                            if let Some((meta, hash)) = self.download(id, file, &rpath, checked, report).await? {
+                                new_entry.kind = self.base_file(file, meta, hash);
+                            }
+                        }
+                        LiveWinner::Here => {
+                            // Ours goes up over theirs: the base takes the server's version, so the push sends ours
+                            // as its next version (the time never matches, so it is always seen as changed).
+                            let manifest = self.fetch_manifest(&file.manifest).await?;
+                            let local_id = match self.stat(&rpath)? {
+                                Some(FsKind::File(m)) => m.id,
+                                _ => None,
+                            };
+                            new_entry.kind = BaseKind::File {
+                                version: file.version,
+                                manifest: file.manifest,
+                                size: file.size,
+                                mtime_ms: i64::MIN,
+                                exec: file.exec,
+                                local_id,
+                                hash: *manifest.file_hash(),
+                                seen_ms: self.fs.now_ms(),
+                            };
+                        }
+                        LiveWinner::Wait => {}
+                    }
                     self.state.base.insert(id, new_entry);
                     return Ok(());
                 }
@@ -986,6 +1042,60 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     }
 
     /// Whether the file at `at` holds exactly the content the base recorded (hashed; an unreadable file doesn't).
+    /// Which side wins when `id`'s file changed here and on the server and both versions carry save records of one
+    /// live document; `None` when either lacks one (a conflict, as always).
+    /// With what the file looked like before it was hashed: a download may only replace exactly that (a save that
+    /// lands after the hash keeps the old base, and the next pass decides again, by its own record or as a conflict).
+    ///
+    /// When the agent can't tell yet which save is newer, the file waits ([`LiveWinner::Wait`]); after
+    /// `save_order_wait_ms` of that, `None` (a conflict copy). A winner is never guessed.
+    fn live_winner(&mut self, id: NodeId, file: &FileState, at: &RelPath) -> Result<Option<(LiveWinner, Option<FsKind>)>, SyncError> {
+        let checked = self.stat(at)?;
+        let hash = self.content_hash(at);
+        // Our content is a Craft save whose record is on its way: never a conflict copy, it waits for the record.
+        if let Some(hash) = &hash
+            && self.save_pending(id, hash)
+        {
+            return Ok(self.wait(id).map(|w| (w, checked)));
+        }
+        // A pair that isn't (or no longer is) two Craft saves starts no wait, and ends one under way.
+        let ours = hash.and_then(|h| self.save_record(id, &h));
+        let pair = match (file.save.clone(), ours) {
+            (Some(theirs), Some(ours)) if theirs.doc == ours.doc => Some((theirs, ours)),
+            _ => None,
+        };
+        let Some((theirs, ours)) = pair else {
+            self.unknown_since.remove(&id);
+            return Ok(None);
+        };
+        let winner = match self.save_includes(&theirs, &ours) {
+            Some(true) => LiveWinner::Server,
+            Some(false) => LiveWinner::Here,
+            None => match self.wait(id) {
+                Some(wait) => wait,
+                None => return Ok(None),
+            },
+        };
+        if !matches!(winner, LiveWinner::Wait) {
+            self.unknown_since.remove(&id);
+        }
+        Ok(Some((winner, checked)))
+    }
+
+    /// `id`'s file waits this pass ([`LiveWinner::Wait`]), unless it has waited `save_order_wait_ms` already: then
+    /// `None`, and it is handled as any two edits are (a conflict copy).
+    fn wait(&mut self, id: NodeId) -> Option<LiveWinner> {
+        // The machine's clock while awake (`Instant`), so a sleep through the wait doesn't end it.
+        let now = std::time::Instant::now();
+        let since = *self.unknown_since.entry(id).or_insert(now);
+        if now.saturating_duration_since(since).as_millis() >= u128::try_from(self.config.save_order_wait_ms.max(0)).unwrap_or(0) {
+            self.unknown_since.remove(&id);
+            return None;
+        }
+        self.deferred.insert(id);
+        Some(LiveWinner::Wait)
+    }
+
     fn holds_base_content(&self, entry: &BaseEntry, at: &RelPath) -> bool {
         match &entry.kind {
             BaseKind::File { hash, .. } => self.content_hash(at) == Some(*hash),

@@ -8,6 +8,7 @@ mod icons;
 mod licenses;
 mod notices;
 mod package;
+mod suite_deps;
 mod version;
 
 use std::path::{Path, PathBuf};
@@ -24,6 +25,9 @@ commands:
                   (zipped) or the Linux tarball
   version [set X.Y.Z[-pre]]
                   print the workspace version, or set it (Cargo.toml + Cargo.lock)
+  suite-deps <Cargo.lock>...
+                  the crates craft-cloud-kit and craft-cloud-egui pull in that none of the given lock files (the
+                  Craft apps') has; fails if any but Loro's own (not part of ci)
 ";
 
 fn main() -> ExitCode {
@@ -35,6 +39,7 @@ fn main() -> ExitCode {
         Some("icons") => icons::run(&root(), &rest),
         Some("package") => package::run(&root()),
         Some("version") => version::run(&root(), &rest),
+        Some("suite-deps") => suite_deps::run(&rest),
         Some("-h" | "--help" | "help") | None => {
             print!("{USAGE}");
             Ok(())

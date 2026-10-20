@@ -125,8 +125,8 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                 }
             };
             match request {
-                DocsRequest::Open { id, path, app } => match link.hub(api).await {
-                    Some(hub) => hub.docs(DocsCall::Open { conn: link.conn, id, path, app }).await.map(|()| true).map_err(|_| End::Hub),
+                DocsRequest::Open { id, path, app, file_hash } => match link.hub(api).await {
+                    Some(hub) => hub.docs(DocsCall::Open { conn: link.conn, id, path, app, file_hash }).await.map(|()| true).map_err(|_| End::Hub),
                     None => {
                         let event = DocsEvent::NotLive {
                             id,
@@ -138,6 +138,16 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                 },
                 DocsRequest::Close { doc } => match link.hub.clone() {
                     Some(hub) => hub.docs(DocsCall::Close { conn: link.conn, doc }).await.map(|()| true).map_err(|_| End::Hub),
+                    None => Ok(true),
+                },
+                // In order with the connection's changes: the hub keeps it once the changes it covers are in.
+                DocsRequest::Saved { doc, hash, frontiers } => match link.hub.clone() {
+                    Some(hub) => hub.docs(DocsCall::Saved { conn: link.conn, doc, hash, frontiers }).await.map(|()| true).map_err(|_| End::Hub),
+                    None => Ok(true),
+                },
+                // At once, before the app writes the file: the sync waits for that save's record.
+                DocsRequest::Saving { doc, hash } => match link.hub.clone() {
+                    Some(hub) => hub.docs(DocsCall::Saving { conn: link.conn, doc, hash }).await.map(|()| true).map_err(|_| End::Hub),
                     None => Ok(true),
                 },
             }
@@ -180,8 +190,8 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
 /// Sends one of the hub's messages to the app; false when the app is gone (or too slow).
 async fn send_out(socket: &mut WebSocket, out: DocOut) -> bool {
     match out {
-        DocOut::Opened { id, doc, state, snapshot, waiting } => {
-            send_json(socket, &DocsEvent::Opened { id, doc, state }).await && send_binary(socket, STATE, id, &snapshot).await && {
+        DocOut::Opened { id, doc, state, changed_outside, snapshot, waiting } => {
+            send_json(socket, &DocsEvent::Opened { id, doc, state, changed_outside }).await && send_binary(socket, STATE, id, &snapshot).await && {
                 let mut ok = true;
                 for update in &waiting {
                     ok = ok && send_binary(socket, UPDATE, id, update).await;
@@ -198,6 +208,7 @@ async fn send_out(socket: &mut WebSocket, out: DocOut) -> bool {
         DocOut::Status { doc, online, waiting, deleted, stopped } => {
             send_json(socket, &DocsEvent::Status { doc, online, waiting, deleted, stopped }).await
         }
+        DocOut::File { doc, frontiers } => send_json(socket, &DocsEvent::File { doc, frontiers }).await,
     }
 }
 

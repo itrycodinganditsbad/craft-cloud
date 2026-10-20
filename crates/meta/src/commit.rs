@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_TREE_DEPTH};
-use craft_cloud_proto::{Conflict, ConflictKind, DeviceId, Epoch, Name, NewVersion, NodeId, Op, SpaceId, VersionId};
+use craft_cloud_proto::{Conflict, ConflictKind, DeviceId, Epoch, Name, NewVersion, NodeId, Op, SaveRecord, SpaceId, VersionId};
 use sqlx::Row;
 
 use crate::blobs::manifest_file_size;
@@ -180,9 +180,14 @@ impl Ctx<'_> {
         let Some(size) = manifest_file_size(self.conn, space, &v.manifest).await? else {
             return Ok(Err(ConflictKind::MissingManifest { manifest: v.manifest }));
         };
+        // The save record as the agent sent it (the server never reads what it means), if well formed.
+        let save = match &v.save {
+            Some(record) if record.is_valid() => serde_json::to_string(record).ok(),
+            _ => None,
+        };
         sqlx::query(
-            "INSERT INTO versions (space_id, id, node, parent_version, epoch, manifest, size, mtime_ms, exec, device, created_ms, seq) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            "INSERT INTO versions (space_id, id, node, parent_version, epoch, manifest, size, mtime_ms, exec, device, created_ms, seq, save) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(self.space())
         .bind(uuid_bytes(v.id.as_uuid()))
@@ -196,6 +201,7 @@ impl Ctx<'_> {
         .bind(uuid_bytes(self.device.as_uuid()))
         .bind(self.now_ms)
         .bind(self.seq)
+        .bind(save)
         .execute(&mut *self.conn)
         .await?;
         Ok(Ok(()))
@@ -406,6 +412,48 @@ impl Meta {
         if !conflicts.is_empty() {
             return Err(MetaError::Rejected(conflicts));
         }
+        sqlx::query("UPDATE spaces SET seq = $1 WHERE id = $2").bind(to_i64(seq)?).bind(uuid_bytes(space.as_uuid())).execute(&mut *w.tx).await?;
+        w.commit().await?;
+        Ok(CommitOutcome { seq, epoch: info.epoch })
+    }
+
+    /// Adds a save record to `node`'s version `version`, which went up without one (the app's record reached the
+    /// agent only after the upload: it was saved while the agent was away). Appended only: a version that has a
+    /// record keeps it, and the same call again changes nothing. When it is added, the node is in the change feed
+    /// again, so the other machines learn it. `NotFound` when `node` has no such version.
+    pub async fn attach_save(&self, space: SpaceId, node: NodeId, version: VersionId, save: &SaveRecord) -> Result<CommitOutcome, MetaError> {
+        if !save.is_valid() {
+            return Err(MetaError::Invalid("a save record's frontiers are at most 256 heads, sorted and distinct"));
+        }
+        if save.doc != craft_cloud_proto::live::node_doc(space, node) {
+            return Err(MetaError::Invalid("a save record names the live document of its own file"));
+        }
+        let json = serde_json::to_string(save).map_err(|_| MetaError::Invalid("a save record that can't be written"))?;
+        let mut w = self.begin_write().await?;
+        let info = space_info(&mut w.tx, space, self.dialect == Dialect::Postgres).await?;
+        let found = sqlx::query("SELECT save FROM versions WHERE space_id = $1 AND id = $2 AND node = $3")
+            .bind(uuid_bytes(space.as_uuid()))
+            .bind(uuid_bytes(version.as_uuid()))
+            .bind(uuid_bytes(node.as_uuid()))
+            .fetch_optional(&mut *w.tx)
+            .await?
+            .ok_or(MetaError::NotFound("version"))?;
+        if found.try_get::<Option<String>, _>("save")?.is_some() {
+            return Ok(CommitOutcome { seq: info.seq, epoch: info.epoch });
+        }
+        let seq = info.seq.checked_add(1).ok_or(MetaError::Corrupt("sequence overflow"))?;
+        sqlx::query("UPDATE versions SET save = $1 WHERE space_id = $2 AND id = $3")
+            .bind(json)
+            .bind(uuid_bytes(space.as_uuid()))
+            .bind(uuid_bytes(version.as_uuid()))
+            .execute(&mut *w.tx)
+            .await?;
+        sqlx::query("UPDATE nodes SET changed_seq = $1 WHERE space_id = $2 AND id = $3")
+            .bind(to_i64(seq)?)
+            .bind(uuid_bytes(space.as_uuid()))
+            .bind(uuid_bytes(node.as_uuid()))
+            .execute(&mut *w.tx)
+            .await?;
         sqlx::query("UPDATE spaces SET seq = $1 WHERE id = $2").bind(to_i64(seq)?).bind(uuid_bytes(space.as_uuid())).execute(&mut *w.tx).await?;
         w.commit().await?;
         Ok(CommitOutcome { seq, epoch: info.epoch })

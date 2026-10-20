@@ -87,6 +87,122 @@ struct Driver {
     at_crash: Vec<BTreeSet<FileHash>>,
     seen: BTreeSet<FileHash>,
     destroyed: BTreeSet<FileHash>,
+    /// Craft saves of the live-linked file [`LIVE_FILE`] (see [`Driver::craft_save`]).
+    craft: CraftSaves,
+}
+
+/// The live-linked file Craft apps save on every machine.
+const LIVE_FILE: &str = "live.kitdemo";
+
+/// The simulation's Craft apps: each machine's save book (what its apps told its agent they saved), and what each
+/// machine's live document knows of every machine's edits (`knows[i][j]`: machine `i` has machine `j`'s edits up to
+/// that count). A save writes the file with a record of the document's version on that machine.
+struct CraftSaves {
+    rng: Rng,
+    doc: craft_cloud_proto::DocId,
+    books: Vec<CraftBook>,
+    knows: Vec<Vec<u32>>,
+    saves: u32,
+    /// Records on their way to their save books ([`Driver::deliver_late`]).
+    late: Vec<LateRecord>,
+}
+
+/// A machine's save records. Their frontiers stand for version vectors here, compared as vectors (the agent asks its
+/// copy of the document). The first time a pair is asked, the answer is "can't tell yet", as an agent that lacks the
+/// operations says: the files wait a pass.
+/// The third part: saves announced whose records are late (a slow agent), waited for by the sync.
+#[derive(Default, Clone)]
+struct CraftBook(
+    Arc<Mutex<BTreeMap<(NodeId, FileHash), craft_cloud_proto::SaveRecord>>>,
+    Arc<Mutex<BTreeSet<AskedPair>>>,
+    Arc<Mutex<BTreeSet<(NodeId, FileHash)>>>,
+);
+
+/// Two records' frontiers asked about.
+type AskedPair = (Vec<(u64, u32)>, Vec<(u64, u32)>);
+
+impl craft_cloud_sync::SaveRecords for CraftBook {
+    fn record(&self, node: NodeId, hash: &FileHash) -> Option<craft_cloud_proto::SaveRecord> {
+        self.0.lock().unwrap().get(&(node, *hash)).cloned()
+    }
+
+    fn includes(&self, a: &craft_cloud_proto::SaveRecord, b: &craft_cloud_proto::SaveRecord) -> Option<bool> {
+        if self.1.lock().unwrap().insert((a.frontiers.clone(), b.frontiers.clone())) {
+            return None;
+        }
+        Some(b.frontiers.iter().all(|(peer, end)| a.frontiers.iter().any(|(p, e)| p == peer && e >= end)))
+    }
+
+    fn pending(&self, node: NodeId, hash: &FileHash) -> bool {
+        self.2.lock().unwrap().contains(&(node, *hash))
+    }
+}
+
+/// A save record on its way (machine, file and content, the record, steps until it reaches the save book).
+type LateRecord = (usize, (NodeId, FileHash), craft_cloud_proto::SaveRecord, usize);
+
+impl Driver {
+    /// Late save records arrive: those whose steps ran out, or all (`all`, before the network heals).
+    fn deliver_late(&mut self, all: bool) {
+        let c = &mut self.craft;
+        for late in std::mem::take(&mut c.late) {
+            let (i, key, record, left) = late;
+            if all || left <= 1 {
+                if let Some(book) = c.books.get(i) {
+                    book.2.lock().unwrap().remove(&key);
+                    book.0.lock().unwrap().insert(key, record);
+                }
+            } else {
+                c.late.push((i, key, record, left - 1));
+            }
+        }
+    }
+
+    /// A Craft app on machine `i` saves [`LIVE_FILE`] (once the machine tracks it): its live document first takes
+    /// another machine's edits now and then (live updates arriving), then gets one of its own, and the save records
+    /// that version. The file's earlier content and this save's may both vanish (the live document holds them, and a
+    /// save that includes them, or a newer upload, replaces them), so both count as overwritten.
+    fn craft_save(&mut self, i: usize) {
+        let Some(m) = self.slots.get_mut(i).and_then(Option::as_mut) else { return };
+        let target = common::path(LIVE_FILE);
+        let Some(node) = m.state().base.keys().copied().find(|id| m.state().base_path(*id).as_ref() == Some(&target)) else { return };
+        let c = &mut self.craft;
+        let from = c.rng.below(MACHINES);
+        if c.rng.below(2) == 0
+            && from != i
+            && let Some(theirs) = c.knows.get(from).cloned()
+            && let Some(mine) = c.knows.get_mut(i)
+        {
+            for (k, n) in mine.iter_mut().zip(theirs) {
+                *k = (*k).max(n);
+            }
+        }
+        let Some(mine) = c.knows.get_mut(i) else { return };
+        if let Some(own) = mine.get_mut(i) {
+            *own += 1;
+        }
+        let version: Vec<(u64, u32)> = mine.iter().enumerate().filter(|(_, n)| **n > 0).map(|(j, n)| (j as u64 + 1, *n)).collect();
+        c.saves += 1;
+        let data = format!("craft save {} by m{i}: {version:?}", c.saves).into_bytes();
+        let before = m.fs().files().get(&target).map(|d| FileHash::from_bytes(*blake3::hash(d).as_bytes()));
+        if m.fs_mut().write(&target, &data, false, 0).is_err() {
+            return;
+        }
+        let hash = FileHash::from_bytes(*blake3::hash(&data).as_bytes());
+        self.destroyed.extend(before);
+        self.destroyed.insert(hash);
+        let record = craft_cloud_proto::SaveRecord { doc: c.doc, frontiers: version };
+        if let Some(book) = c.books.get(i) {
+            // Half the records are slow to reach the agent (announced at once, the record some steps later).
+            if c.rng.below(2) == 0 {
+                book.2.lock().unwrap().insert((node, hash));
+                c.late.push((i, (node, hash), record, 1 + c.rng.below(6)));
+            } else {
+                book.0.lock().unwrap().insert((node, hash), record);
+            }
+        }
+        self.net.event(format!("{} m{i} craft save {}", stamp(), c.saves));
+    }
 }
 
 /// What a pass did, without node IDs (they are random), for the trace.
@@ -172,10 +288,18 @@ impl Driver {
         let mut writes = Rng::new(seed ^ 0x57AB_1E5E_ED00_0001);
         let mut extra = Rng::new(seed ^ 0xC04B_0ED0_0000_0002);
         let mut moments = Rng::new(seed ^ 0x7177_0000_0000_0005);
+        // The live-linked file starts on the first machine.
+        if let Some(m) = self.slots.first_mut().and_then(Option::as_mut) {
+            let _ = m.fs_mut().write(&common::path(LIVE_FILE), b"live document, first save", false, 0);
+        }
         for step in 0..steps {
             tokio::time::sleep(Duration::from_millis(moments.below(2_000) as u64)).await;
             let i = rng.below(MACHINES);
             self.join(i).await;
+            self.deliver_late(false);
+            if self.craft.rng.below(4) == 0 {
+                self.craft_save(i);
+            }
             let Some(m) = self.slots.get_mut(i).and_then(Option::as_mut) else { continue };
             if writes.below(10) == 0
                 && let Some(f) = writes.pick(&files_of(m)).cloned()
@@ -237,6 +361,16 @@ impl Driver {
         settle_and_check(self.seed, &self.net.server, &mut ms, out).await;
         for (i, m) in ms.iter().enumerate() {
             self.net.event(format!("m{i} ends with {}", listing(m)));
+            // Craft saves of one live document never make a conflict copy, however they crossed. (The first content
+            // is a plain file, written before the document was live: it may, as any file may.)
+            let copies: Vec<String> = m
+                .fs()
+                .files()
+                .into_iter()
+                .filter(|(p, data)| p.to_string().starts_with("live (conflict") && data.starts_with(b"craft save"))
+                .map(|(p, _)| p.to_string())
+                .collect();
+            assert!(copies.is_empty(), "seed {}: m{i} has conflict copies of Craft saves of the live file: {copies:?}", self.seed);
         }
     }
 }
@@ -249,7 +383,19 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
     let latency = [2, 20, 100, 400][choose.below(4)];
     let stormy = choose.below(4) != 0;
     let (lose, cut) = ([0, 6, 25][choose.below(3)], [0, 6, 25][choose.below(3)]);
-    let (net, machines) = world(seed, &Setup { page, latency, lose, cut, password: None });
+    let (net, mut machines) = world(seed, &Setup { page, latency, lose, cut, password: None });
+    let books: Vec<CraftBook> = (0..MACHINES).map(|_| CraftBook::default()).collect();
+    for (m, book) in machines.iter_mut().zip(&books) {
+        m.set_save_records(Arc::new(book.clone()));
+    }
+    let craft = CraftSaves {
+        rng: Rng::new(seed ^ 0xC2AF_75A7_E000_0009),
+        doc: craft_cloud_proto::DocId::from_uuid(uuid::Uuid::from_u64_pair(seed, 0x11fe)),
+        books,
+        knows: vec![vec![0; MACHINES]; MACHINES],
+        saves: 0,
+        late: Vec::new(),
+    };
     net.event(format!("seed {seed}: pages of {page}, latency up to {latency} ms, stormy {stormy}, lose 1/{lose}, cut 1/{cut}"));
     let driving = net.clone();
     simulate(seed, latency, &net, async move {
@@ -275,8 +421,11 @@ fn run_seed(seed: u64, steps: usize) -> Vec<String> {
             at_crash: vec![BTreeSet::new(); MACHINES],
             seen: BTreeSet::new(),
             destroyed: BTreeSet::new(),
+            craft,
         };
         driver.run(steps).await;
+        // Every late record arrives.
+        driver.deliver_late(true);
         // The network heals and the server's faults stop.
         calm.store(true, Ordering::Relaxed);
         for i in 0..MACHINES {

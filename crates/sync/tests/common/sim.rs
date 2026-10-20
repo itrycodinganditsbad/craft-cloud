@@ -174,8 +174,13 @@ pub struct Linked {
 /// Replaces a tracked file or folder on `m` with a link, keeping what it held.
 fn make_link<T: Transport>(rng: &mut Rng, m: &mut Machine<T>) -> Option<Linked> {
     let index = m.state().base_index();
-    let candidates: Vec<RelPath> =
-        index.keys().filter(|p| !p.is_root() && matches!(m.fs().stat(p), Ok(Some(FsKind::File(_) | FsKind::Dir { .. })))).cloned().collect();
+    // (Never a live document's file: only its app touches that, see `act`.)
+    let candidates: Vec<RelPath> = index
+        .keys()
+        .filter(|p| !p.is_root() && !p.file_name().is_some_and(|n| n.as_str().ends_with(".kitdemo")))
+        .filter(|p| matches!(m.fs().stat(p), Ok(Some(FsKind::File(_) | FsKind::Dir { .. }))))
+        .cloned()
+        .collect();
     let at = rng.pick(&candidates)?.clone();
     let below = |p: &RelPath| p.names().get(at.depth()..).map(<[Name]>::to_vec).unwrap_or_default();
     let was_dir = matches!(m.fs().stat(&at), Ok(Some(FsKind::Dir { .. })));
@@ -328,7 +333,9 @@ pub fn act<T: Transport>(
     // It counts as destroyed only once the user's write or delete went through.
     let old = |m: &Machine<T>, p: &RelPath| m.fs().files().get(p).map(|d| FileHash::from_bytes(*blake3::hash(d).as_bytes()));
     let dirs: Vec<RelPath> = m.fs().dirs();
-    let files = files_of(m);
+    // A live document's file (`*.kitdemo`, the network simulation's Craft saves) is only ever saved by its app: the
+    // user doesn't edit, delete or rename it outside it.
+    let files: Vec<RelPath> = files_of(m).into_iter().filter(|f| !f.file_name().is_some_and(|n| n.as_str().ends_with(".kitdemo"))).collect();
     match rng.below(11) {
         0 | 1 => {
             let dir = if rng.below(3) == 0 { RelPath::root() } else { rel(rng.pick(DIRS).copied().unwrap_or("x")) };
@@ -761,6 +768,11 @@ pub async fn settle_and_check<T: Transport>(seed: u64, server: &Server, ms: &mut
                 eprintln!("TRACE settle m{i} sync: {report:?}\n  files {}\n  dirs {:?}", listing(m), m.fs().dirs());
             }
             changed |= report.changed() || !report.pending_deletes.is_empty() || !report.pending_local_deletes.is_empty();
+            // Two Craft saves waiting to learn which is newer are asked about again next pass: not settled yet.
+            changed |= report
+                .skipped
+                .iter()
+                .any(|(_, why)| why.starts_with(craft_cloud_sync::SAVE_ORDER_WAITS) || why.starts_with(craft_cloud_sync::SAVE_RECORD_WAITS));
             if let Some(s) = skipped.get_mut(i) {
                 *s = report.skipped.iter().filter(|(_, why)| is_case_clash(why)).map(|(p, _)| rel(p)).collect();
             }

@@ -59,6 +59,7 @@ path = "src/main.rs"
 winresource.workspace = true
 
 [dev-dependencies]
+craft-cloud-kit.workspace = true
 craft-cloud-meta = { workspace = true, features = ["test-support"] }
 craft-cloud-server = { workspace = true, features = ["test-support"] }
 craft-cloud-store.workspace = true

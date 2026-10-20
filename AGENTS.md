@@ -26,11 +26,14 @@ The design lives in `docs/design/sync.md`; the live protocols (the server's live
 
 ```text
 crates/
-  proto     craft-cloud-proto     wire types: names, IDs, hashes, manifests, commit ops, API bodies, limits, join codes and join strings (`join.rs`)
+  api       craft-cloud-api       what apps need of the protocol, with no postcard: IDs, names, limits, the agent's local API (`local.rs`, `/v1/blobs` too), error codes and the account's devices (`api.rs`)
+  proto     craft-cloud-proto     wire types: hashes, manifests, commit ops, API bodies, join codes and join strings (`join.rs`), the live protocol (`live.rs`); re-exports `craft-cloud-api` under the same paths
   chunker   craft-cloud-chunker   FastCDC `fastcdc-v1` + BLAKE3, frozen by golden vectors
   store     craft-cloud-store     blob store: disk, S3, memory; checks every blob in and out
   meta      craft-cloud-meta      metadata on SQLite or Postgres; the batch commit; the change feed; invites and pairings (`join.rs`); live documents' logs and snapshots (`live.rs`)
   sync      craft-cloud-sync      the sync engine over `Fs`/`Transport` traits; `MemFs`; scenario tests and the simulation
+  kit       craft-cloud-kit       the app kit (`docs/kit.md`): an app's model live through the agent; the `LiveDocument` trait and `Session` (`session.rs`: open, the `local_change` hook, `poll`, undo through Loro's undo manager, reconnect and the 64 MiB queue, presence, saves), the change writer that cuts commits under 512 KiB (`writer.rs`), the mappings (`tree.rs`, `text.rs`, `table.rs`, `timeline.rs`, `opaque.rs`, `list.rs`), values, chunk references and blob stores (`value.rs`)
+  egui      craft-cloud-egui      Craft Cloud's piece of an app's window: the account line, the shared recents, a live document's badge, and `CloudWatch` that keeps them current
   app       craft-cloud-app       what apps link: a blocking client of the agent's local API (status, sign-in, joining, computers, pause, autostart, recents, live documents at the level of bytes: `live.rs`)
 apps/
   craft-cloud-server              HTTP API (`/api/v1`), the live service (`/api/v1/live`, `live.rs`: logs, documents by import, snapshots and compaction, presence), join codes (`join.rs`: pairings, join, the `/join/{code}` page), auth, admin CLI (`init`, `serve`, `user` with `invite`, `device`, `reset-epoch`, `live`)
@@ -41,14 +44,17 @@ apps/
   craft-cloud-desktop             the Craft Cloud app (`craft-cloud`, eframe/egui): the pure model (`model.rs`), the agent behind a trait and calls on threads (`agent.rs`), starting the agent (`start_agent.rs`), one app per user (`single_instance.rs`), the window (`ui/`, `app.rs`), the tray (`tray/`: tray-icon in the window's process on Windows and macOS; on Linux a StatusNotifierItem over zbus in a process of its own, `craft-cloud --tray`, `tray/process.rs`, since Wayland can't hide a window), the app's own start at login (`autostart.rs`), its icons (`assets/`, drawn by `cargo xtask icons`)
     tests/snapshots/              every screen as kittest draws it (`UPDATE_SNAPSHOTS=1` redraws them)
   craft-cloud-setup               the Windows setup (`craft-cloud-setup.exe`): install, upgrade, move from a hand-made install, `--uninstall`; the exes built in by `cargo xtask package`
+  craft-cloud-kit-demo            the app kit's demo (never packaged or installed): a story and a layer tree, live through the kit; its model and adapter (`model.rs`), its window (`ui.rs`); tests drive two windows on one fake hub, and time the kit on a big document
 packaging/linux/                  the Linux tarball's `install.sh` and `uninstall.sh` (into `~/.local`)
 xtask/                            cargo xtask ci | licenses | icons | package | version
 docs/                             design documents and the self-hosting guide
 ```
 
-Layering: `proto` and `chunker` depend on nothing else in the workspace. `store` and `meta` depend on `proto`.
+Layering: `api` and `chunker` depend on nothing else in the workspace; `proto` depends on `api` only. What apps link
+(`app`, `kit`, `egui`) depends on `api`, never on `proto`, so it brings no crate a Craft app doesn't already lock but
+Loro's own (`cargo xtask suite-deps <the apps' Cargo.lock files>` checks). `store` and `meta` depend on `proto`.
 The server depends on all three; nothing depends on the server outside tests. `sync` depends on `proto` and `chunker`
-(its tests also use `meta` and `store` as an in-process server). `app` depends on `proto` only and has no async
+(its tests also use `meta` and `store` as an in-process server). `app` depends on `api` only and has no async
 runtime. The agent depends on `proto`, `sync` and `app` (its `recents` commands are clients like an app); its
 tests also run the server on a loopback port, and `tests/network/` runs the server's router and agents over
 `turmoil` (a dev-dependency: the shipped binaries never link it). That test target includes sync's test harness

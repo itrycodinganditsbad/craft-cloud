@@ -3099,7 +3099,7 @@ async fn a_pass_costs_about_the_size_of_the_folder_not_its_square() {
         let folder = NodeId::generate();
         let mut ops = vec![Op::Mkdir { node: folder, parent: root, name: Name::new(&format!("f{f}")).unwrap() }];
         for i in 0..PER_FOLDER {
-            let version = NewVersion { id: VersionId::generate(), manifest: manifest.id(), mtime_ms: 1, exec: false };
+            let version = NewVersion { id: VersionId::generate(), manifest: manifest.id(), mtime_ms: 1, exec: false, save: None };
             ops.push(Op::Create { node: NodeId::generate(), parent: folder, name: Name::new(&format!("{i}.txt")).unwrap(), version });
             if ops.len() == 1000 {
                 server.meta.commit(ana.space, device, &std::mem::take(&mut ops), 0).await.unwrap();

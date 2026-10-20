@@ -39,6 +39,11 @@ pub type Spans = BTreeMap<u64, Vec<(i32, i32)>>;
 /// A version: how far each peer's operations reach.
 pub type Version = BTreeMap<u64, i32>;
 
+/// Loro frontiers of `(peer, counter)` operation IDs (`None` for a counter past Loro's).
+pub fn frontiers(ids: &[(u64, u32)]) -> Option<loro::Frontiers> {
+    ids.iter().map(|(peer, counter)| Some(loro::ID::new(*peer, i32::try_from(*counter).ok()?))).collect::<Option<Vec<_>>>().map(loro::Frontiers::from)
+}
+
 /// The ranges of operations an update (or snapshot) holds, read from its header without importing it; `None` for
 /// bytes Loro can't read.
 pub fn spans_of(bytes: &[u8]) -> Option<Vec<(u64, i32, i32)>> {
@@ -85,6 +90,27 @@ pub(crate) fn fail_on(bytes: &[u8]) {
 /// A Loro peer ID this document may use (`u64::MAX` is reserved by Loro).
 fn usable_peer(peer: u64) -> u64 {
     if peer == u64::MAX { peer - 1 } else { peer }
+}
+
+/// The most bytes of updates one of Loro's batch imports takes ([`LiveCopy::import_batch`]).
+const BATCH_GROUP_BYTES: usize = 16 * 1024;
+
+/// `updates` in consecutive groups of at most `max` bytes (an update bigger than that alone).
+fn groups(updates: &[Vec<u8>], max: usize) -> Vec<&[Vec<u8>]> {
+    let mut out = Vec::new();
+    let (mut start, mut size) = (0, 0usize);
+    for (i, u) in updates.iter().enumerate() {
+        if i > start && size.saturating_add(u.len()) > max {
+            out.extend(updates.get(start..i));
+            start = i;
+            size = 0;
+        }
+        size = size.saturating_add(u.len());
+    }
+    if start < updates.len() {
+        out.extend(updates.get(start..));
+    }
+    out
 }
 
 /// One live document's copy on this machine.
@@ -186,7 +212,12 @@ impl LiveCopy {
         let _ = self.guard(|doc| {
             #[cfg(test)]
             Self::failing(&updates.iter().map(Vec::as_slice).collect::<Vec<_>>());
-            doc.import_batch(updates).map_err(|e| UpdateError::Malformed(e.to_string()))
+            // In groups of at most `BATCH_GROUP_BYTES`: Loro's batch import of much text at once takes time growing
+            // with its square (a 1 MB paste in pieces: seconds), while small groups keep the batch's speed.
+            for group in groups(updates, BATCH_GROUP_BYTES) {
+                doc.import_batch(group).map_err(|e| UpdateError::Malformed(e.to_string()))?;
+            }
+            Ok(())
         });
         Ok(self.version()? != before)
     }
@@ -209,6 +240,24 @@ impl LiveCopy {
             Ok(needs.iter().all(|(peer, end)| vv.get(peer).is_some_and(|have| have >= end)))
         })
         .unwrap_or(false)
+    }
+
+    /// Whether every operation `ids` names (`(peer, counter)`: a save's frontiers) is in this copy.
+    pub fn holds(&self, ids: &[(u64, u32)]) -> bool {
+        self.guard(|doc| {
+            let vv = doc.oplog_vv();
+            Ok(ids.iter().all(|(peer, counter)| i32::try_from(*counter).is_ok_and(|c| vv.includes_id(loro::ID::new(*peer, c)))))
+        })
+        .unwrap_or(false)
+    }
+
+    /// Whether the document as frontiers `a` name it holds every operation of frontiers `b`; `None` when this copy
+    /// lacks one of their operations (it can't tell).
+    pub fn includes(&self, a: &[(u64, u32)], b: &[(u64, u32)]) -> Option<bool> {
+        let (fa, fb) = (frontiers(a)?, frontiers(b)?);
+        self.guard(|doc| Ok(doc.cmp_frontiers(&fa, &fb).ok().map(|o| matches!(o, Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)))))
+            .ok()
+            .flatten()
     }
 
     /// How far each peer's operations reach in this copy.
@@ -470,6 +519,64 @@ mod tests {
         doc.get_text("text").insert(at, s).unwrap();
         doc.commit();
         doc.export(ExportMode::updates(&before)).unwrap()
+    }
+
+    fn heads(doc: &LoroDoc) -> Vec<(u64, u32)> {
+        doc.oplog_frontiers().iter().map(|id| (id.peer, id.counter as u32)).collect()
+    }
+
+    /// Which of two saves is newer, from the copy's operations: one made after the other includes it, two made apart
+    /// include neither, and frontiers whose operations aren't here yet can't be told (none) until they are.
+    #[test]
+    fn saves_are_ordered_by_the_copys_operations() {
+        let (x, y) = (LoroDoc::new(), LoroDoc::new());
+        x.set_peer_id(1).unwrap();
+        y.set_peer_id(2).unwrap();
+        let base = text_update(&x, 0, "base");
+        y.import(&base).unwrap();
+        let first = heads(&x);
+        let ux = text_update(&x, 4, " x");
+        let uy = text_update(&y, 4, " y");
+        let (on_x, on_y) = (heads(&x), heads(&y));
+        let copy = LiveCopy::new(9);
+        copy.import(&base).unwrap();
+        assert!(copy.holds(&first) && !copy.holds(&on_x));
+        assert_eq!(copy.includes(&on_x, &first), None, "x's save isn't here yet");
+        copy.import(&ux).unwrap();
+        copy.import(&uy).unwrap();
+        assert_eq!(copy.includes(&on_x, &first), Some(true));
+        assert_eq!(copy.includes(&first, &on_x), Some(false));
+        assert_eq!(copy.includes(&on_x, &on_y), Some(false), "made apart");
+        assert_eq!(copy.includes(&on_y, &on_x), Some(false));
+        assert_eq!(copy.includes(&on_x, &on_x), Some(true));
+        let both = heads(&{
+            x.import(&uy).unwrap();
+            x
+        });
+        assert_eq!(both.len(), 2, "two heads");
+        assert_eq!(copy.includes(&both, &on_x), Some(true));
+        assert_eq!(copy.includes(&both, &on_y), Some(true));
+    }
+
+    /// A batch is imported in small groups: a 2.5 MB paste in pieces (which Loro's batch import takes minutes for in
+    /// one go) comes in at once, and the groups never pass the limit but for one big update alone.
+    #[test]
+    fn a_big_paste_in_a_batch_is_imported_in_small_groups() {
+        let sizes = [10usize, 20_000, 3, 9_000, 9_000, 1];
+        let updates: Vec<Vec<u8>> = sizes.iter().map(|n| vec![0; *n]).collect();
+        let g = groups(&updates, BATCH_GROUP_BYTES);
+        assert_eq!(g.iter().map(|g| g.len()).collect::<Vec<_>>(), vec![1, 1, 2, 2]);
+        assert!(groups(&[], BATCH_GROUP_BYTES).is_empty());
+        let other = LoroDoc::new();
+        other.set_peer_id(2).unwrap();
+        let pieces: Vec<Vec<u8>> = (0..5).map(|i| text_update(&other, i * 500 * 1024, &"p".repeat(500 * 1024))).collect();
+        let copy = LiveCopy::new(1);
+        let started = std::time::Instant::now();
+        assert!(copy.import_batch(&pieces).unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        let back = LoroDoc::new();
+        back.import(&copy.snapshot().unwrap()).unwrap();
+        assert_eq!(back.get_text("text").len_utf8(), 5 * 500 * 1024, "all of it");
     }
 
     /// An update Loro refuses leaves the copy as it was (Ruling: validation without a scratch copy).

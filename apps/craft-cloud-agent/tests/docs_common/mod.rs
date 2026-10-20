@@ -129,7 +129,7 @@ impl World {
                 .unwrap();
         self.meta.add_manifest(self.space, &manifest, 100, 0).await.unwrap();
         let node = NodeId::generate();
-        let version = NewVersion { id: VersionId::generate(), manifest: manifest.id(), mtime_ms: 0, exec: false };
+        let version = NewVersion { id: VersionId::generate(), manifest: manifest.id(), mtime_ms: 0, exec: false, save: None };
         let device = self.machines.first().map_or_else(craft_cloud_proto::DeviceId::generate, |m| m.auth.device);
         self.meta.commit(self.space, device, &[Op::Create { node, parent: self.root, name: Name::new(&name).unwrap(), version }], 0).await.unwrap();
         node

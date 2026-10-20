@@ -1788,6 +1788,39 @@ impl<S: DocStore> Replica<S> {
         Some((snapshot, after))
     }
 
+    /// Whether this machine's copy of a document of a file holds every operation `ids` names (a save's frontiers).
+    pub fn document_holds(&self, id: DocId, ids: &[(u64, u32)]) -> bool {
+        self.docs.get(&id).filter(|d| d.kind.is_document()).is_some_and(|d| d.body.copy().holds(ids))
+    }
+
+    /// Whether a document of a file, as frontiers `a` name it, holds every operation of frontiers `b`; `None` when this
+    /// machine's copy can't tell (it lacks their operations, or isn't loaded).
+    pub fn document_includes(&self, id: DocId, a: &[(u64, u32)], b: &[(u64, u32)]) -> Option<bool> {
+        self.docs.get(&id).filter(|d| d.kind.is_document())?.body.copy().includes(a, b)
+    }
+
+    /// A document of a file whose saves are asked about: loaded from disk if it isn't, and followed again if it was
+    /// put aside, within the same caps as an open (the least recently used make room), so its copy can tell which of
+    /// two saves is newer once the server's operations are in. Frames to send.
+    pub fn consult_document(&mut self, id: DocId) -> Vec<ClientFrame> {
+        self.uses += 1;
+        let (up, epoch, uses) = (self.link == Link::Up, self.epoch, self.uses);
+        let documents = self.protocol >= LIVE_DOCUMENTS_PROTOCOL;
+        self.load(id);
+        let Some(doc) = self.docs.get_mut(&id).filter(|d| d.joined && d.kind.is_document()) else { return Vec::new() };
+        doc.last_used = uses;
+        let was_parked = std::mem::replace(&mut doc.parked, false);
+        let mut frames = self.unload();
+        if was_parked {
+            frames.extend(self.evict());
+        }
+        let Some(doc) = self.docs.get_mut(&id) else { return frames };
+        if up && documents && doc.sub == Sub::No && doc.retry.is_none() {
+            frames.extend(subscribe(id, doc, epoch));
+        }
+        frames
+    }
+
     /// Whether a document being joined waits for an app's import (the server doesn't have it).
     pub fn needs_import(&self, id: DocId) -> bool {
         self.docs.get(&id).is_some_and(|d| d.join == Some(Join::NeedsImport))
@@ -1827,7 +1860,8 @@ impl<S: DocStore> Replica<S> {
     /// returns, and sent when the link is up. Returns the frames to send.
     pub fn local_update(&mut self, id: DocId, bytes: &[u8]) -> Result<Vec<ClientFrame>, LocalError> {
         let Some(doc) = self.docs.get_mut(&id).filter(|d| d.joined && d.kind.is_document()) else {
-            return Err(LocalError::Invalid("the document isn't open here".into()));
+            // (After a disk error the copy may be being read back: for now, worth sending again.)
+            return Err(LocalError::Io(std::io::Error::other("the document isn't open here (being read back from disk?)")));
         };
         if bytes.is_empty() || bytes.len() > MAX_UPDATE_BYTES {
             return Err(LocalError::Invalid(format!("an update is 1 to {MAX_UPDATE_BYTES} bytes")));

@@ -100,6 +100,11 @@ async fn time_keystrokes(scan: bool) -> Vec<Keystroke> {
     mine.import(doc_pc.state()).unwrap();
     let theirs = LoroDoc::new();
     theirs.import(doc_laptop.state()).unwrap();
+    for (doc, updates) in [(&mine, doc_pc.state_updates()), (&theirs, doc_laptop.state_updates())] {
+        for u in updates {
+            doc.import(u).unwrap();
+        }
+    }
     let (pc_side, laptop_side) = (Arc::new(Mutex::new((mine, doc_pc))), Arc::new(Mutex::new((theirs, doc_laptop))));
     // Both online: the laptop's document followed, and the pc's caught up with its own import (the server sends it
     // back once it is kept). Until then the pc's keystrokes wait in its journal, and the first ones would time the

@@ -922,6 +922,9 @@ fn show_time(ms: i64) -> String {
     }
 }
 
+/// How soon a pass that left a Craft save waiting is followed by another.
+const SAVE_WAIT_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub(crate) fn now_ms() -> i64 {
     Timestamp::now().as_millisecond()
 }
@@ -1435,6 +1438,8 @@ impl Session {
         let transport = HttpTransport::new(account.server.clone(), &account.token)?;
         let config = Config::new(account.device_name.clone(), account.device);
         let mut engine = Engine::new(fs, transport, std::mem::take(&mut saved.state), config, conflict_stamp)?;
+        // What Craft apps saved from live documents (their local API's `saved`): see `live::saves`.
+        engine.set_save_records(std::sync::Arc::new(crate::live::saves::SaveBook::new(data.path(), account.space)));
         // `state.json` is also written at the pass's checkpoints, so a crash or a kill loses at most what the pass did
         // since the last one (the last pass's outcome stays as it was until this one ends).
         let last_pass = std::sync::Arc::new(std::sync::Mutex::new(saved.last_pass));
@@ -1496,6 +1501,15 @@ impl Session {
             (Ok(_), Some(stability), Some(started)) => stability.pass_finished(started),
             _ => None,
         };
+        // A Craft save waiting for its record, or two whose order isn't known yet: looked at again soon (a record that
+        // lands asks for a pass by itself; a wait that runs out doesn't).
+        let waits = |why: &String| why.starts_with(craft_cloud_sync::SAVE_RECORD_WAITS) || why.starts_with(craft_cloud_sync::SAVE_ORDER_WAITS);
+        if let Ok(report) = &result
+            && report.skipped.iter().any(|(_, why)| waits(why))
+        {
+            let soon = SAVE_WAIT_RECHECK;
+            self.recheck_in = Some(self.recheck_in.map_or(soon, |at| at.min(soon)));
+        }
         let (outcome, summary) = match &result {
             Ok(report) => {
                 let summary = PassSummary::from_report(report);
