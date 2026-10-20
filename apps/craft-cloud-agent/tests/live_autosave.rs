@@ -218,6 +218,8 @@ async fn both_machines_autosaving_end_with_every_edit_in_the_file_and_stop() {
     let (pc_folder, laptop_folder, s) = (pc.folder.clone(), laptop.folder.clone(), shared.clone());
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
+        // A window that stopped early (its thread panicked) says why, rather than leave the files to never settle.
+        assert!(!first.is_finished() && !second.is_finished(), "a window stopped early (see its panic above)");
         let (on_pc, on_laptop) = (files(&pc_folder), files(&laptop_folder));
         let full = |f: &[(String, Vec<u8>)]| f.len() == 1 && Lines::from_file(&f[0].1).rows.len() == 25;
         let quiet = t0.elapsed().as_millis() as u64 > s.last_save_ms.load(Ordering::SeqCst) + 3000;
