@@ -104,7 +104,9 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
   a new agent and an older server) carries recents only, and is sent a compacted log whole. Protocol 3 adds changes
   in fragments (see Fragments below): the server stages a connection's fragments and stores a set whole, and never
   sends a fragment or a bundle to a connection below 3 (that agent is refused the document with "update Craft Cloud
-  on this computer"); an agent never sends fragments to a server below 3. A new agent with an older
+  on this computer"), and refuses a fragment from one (stored one by one, its set could be stored in part). An
+  agent never sends fragments or bundles to a server below 3: a change that needs them is refused while it is the
+  server, and what it holds of them waits, with everything after it, until the server is updated. A new agent with an older
   server keeps recents and says live documents need a newer server; a document live on it already keeps its changes
   on the machine until then.
 - `create {doc, kind}` → `created {doc}`; idempotent. Kinds: `recents:<app>`, whose ID is derived from the account and
@@ -187,8 +189,13 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
 - Quota: once a document's log holds 16 MiB (about 30,000 recents adds), every later append is refused with
   `quota_exceeded` (one-way: the update that crosses the cap is the last one stored). A change in fragments counts
   only once its set is whole: one that would start in a full log is refused whole (every fragment's `client_seq`
-  named), one that crosses the cap is stored whole. A change is at most 8 MiB, half the cap. The agent keeps every
-  unacked update, retries with a pause growing to about 64 s, and says the document is full.
+  named), one that crosses the cap is stored whole. A change is at most 8 MiB, half the cap (a set that joins to
+  more is refused whole). A refusal as full asks the refused device to compact (once per head, not while another
+  device's ask is out): with nothing more stored, no append would. The agent keeps every unacked update, retries
+  with a pause growing to about 64 s, and says the document is full.
+  `craft-cloud-server live check-sets <user>` lists the user's live documents whose log holds part of a change in
+  fragments (stored by a server before whole sets, and never completed: no machine compacts such a log past it),
+  each with the `reset-doc` that empties it.
   `craft-cloud-server live reset-doc <user> <app>` (or, for a document of a file, `<user> <document ID>`) empties the
   log, drops the snapshot and the import, and raises the space's live generation in the same transaction, so every
   live connection ends at its next ping and every agent starts over and pushes what the log lacks. The file sync's
@@ -265,9 +272,12 @@ document's version it was made from.
   the way never reaches it). The agent journals the change whole and sends its fragments up as updates of their own
   (each a `client_seq`, numbered in the fragments' order). The server (protocol 3) stages a connection's fragments
   (at most 16 sets and 16 MiB) and stores a set whole, in one transaction with consecutive numbers, or refuses it
-  whole; it acks every fragment then, so one fragment's ack says the whole set is stored (the agent counts its other
-  fragments stored with it). A connection that ends drops what it staged; nothing of it was acked, and the agent
-  sends it all again.
+  whole; it acks every fragment then. A connection that ends drops what it staged; nothing of it was acked, and the
+  agent sends it all again. Fragments of the set that the device has in the log already (a set stored in part
+  before whole sets, or one whose acks were lost, of which the agent sends only the rest) count as there: they are
+  found by their `client_seq` (a set's fragments are numbered one after the other) and acked with the numbers they
+  have. After a restore, the agent drops the rest of a set whose first fragments were acked (the log may have lost
+  them) and pushes its operations instead.
   A receiving agent keeps fragment rows (counted as had, in the document's file; at most 16 sets and 16 MiB per
   document, past which a row isn't taken and the next connection brings it again) until the change is whole, then
   imports it and hands it to its apps whole: the agent's apps never get a fragment, and the app library joins none.

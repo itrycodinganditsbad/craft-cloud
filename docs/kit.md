@@ -295,9 +295,13 @@ way with kittest.
 - **Every machine's agent must know fragments and bundles, and so must the server.** A server on live protocol 3
   stores a change in fragments whole and never sends a fragment or a bundle to an agent from before them: it is
   refused the document with "update Craft Cloud on this computer" (and the newer machines show "<machine> runs an
-  older Craft Cloud" from its presence). An agent never sends fragments to a server before protocol 3: a change that
-  needs them is refused while it is the server, and fragments made before wait on the machine until it is updated.
-  A new app on an older agent isn't live (`NotLive::AgentTooOld`).
+  older Craft Cloud" from its presence, best effort: once it is refused the document its presence stops). An agent
+  never sends fragments or bundles to a server before protocol 3: a change that needs them is refused while it is
+  the server, and what it holds of them waits on the machine, with every change after it, until it is updated. A
+  new app on an older agent isn't live (`NotLive::AgentTooOld`). An older app on a newer agent still connects (the
+  agent says its oldest local API version as `api`, and its newest as `api_max`) and gets recents and blobs; its
+  live documents can't read a newer app's big changes, so the apps that edit live are updated with the agent. The
+  safe order: the server, then every agent and app.
 - **After a server's restore**, a machine that sends up history the log lost sends a big Loro change in pieces (Loro
   merges one peer's commits into one change, so its boundaries aren't an app's): an app open on a machine that also
   lacked that history may see part of a change from before the restore.
