@@ -855,6 +855,7 @@ pub(crate) mod tests {
     pub(crate) fn status(signed_in: bool) -> Status {
         Status {
             api: 1,
+            api_max: None,
             signed_in,
             account: signed_in.then(|| "fabio".into()),
             server: signed_in.then(|| "https://cloud.shadows.ch".into()),

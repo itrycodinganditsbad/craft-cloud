@@ -14,6 +14,7 @@ async fn an_old_agent_is_too_old_for_blobs_of_any_size() {
     // (An agent from before blobs speaks the first local API version.)
     let status = Status {
         api: LOCAL_API_MIN,
+        api_max: None,
         signed_in: true,
         account: Some("a".into()),
         server: Some("https://x.invalid".into()),

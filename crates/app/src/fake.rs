@@ -359,7 +359,8 @@ impl Hub {
             ("GET", paths::STATUS) => {
                 let online = lock(&self.inner).machines.get(&machine).is_some_and(|m| m.online);
                 let status = Status {
-                    api: if too_old { 1 } else { LOCAL_API_MAX },
+                    api: 1,
+                    api_max: (!too_old).then_some(LOCAL_API_MAX),
                     signed_in: true,
                     account: Some("fake".into()),
                     server: Some("https://fake.invalid".into()),

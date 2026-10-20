@@ -378,7 +378,7 @@ impl Documents {
     pub(crate) fn connect(client: &Client) -> Result<Self, Error> {
         // An agent from before changes in fragments would take each fragment as a change of its own (and its apps
         // and machines would get them so): live documents need an update of Craft Cloud first.
-        let api = client.status()?.api;
+        let api = client.status()?.api_newest();
         if api < LOCAL_API_FRAGMENTS {
             return Err(Error::Refused { code: codes::AGENT_TOO_OLD.into(), message: AGENT_TOO_OLD.into() });
         }
