@@ -773,8 +773,50 @@ pub fn edit(doc: &Doc, shape: Shape, rng: &mut Rng) -> Doc {
     d
 }
 
+/// The name every big paste's layer starts with ([`big_paste`]): random edits leave such a layer alone (it is the
+/// simulation's check that nothing a machine made is lost).
+pub const BIG: &str = "big:";
+
+/// The layers random edits may pick: all but the big pastes' (their children are anyone's).
+fn editable(roots: &[Arc<Node>]) -> Vec<(ElemId, Option<ElemId>)> {
+    flatten(roots).into_iter().filter(|(id, _)| find(roots, *id).is_none_or(|n| !n.name.starts_with(BIG))).collect()
+}
+
+/// A big paste: a new layer at the top whose story is 30 to 100 KB of text (the change goes as slices in a bundle, and
+/// past the frame limit, which the simulation sets to 16 KiB, in fragments). The layer's ID and its text, to look for
+/// at the end.
+pub fn big_paste(doc: &Doc, rng: &mut Rng) -> (Doc, ElemId, String) {
+    let id = rng.id();
+    let word = format!("{} ", rng.word());
+    let len = 30_000 + rng.below(70_000);
+    let text: String = word.repeat(len / word.len() + 1).chars().take(len).collect();
+    let mut node = Node::leaf(id, &format!("{BIG}{id}"));
+    node.text = RichText::plain(&text);
+    let mut d = doc.clone();
+    d.layers = Arc::new(insert(&doc.layers, None, 0, Arc::new(node)));
+    TestApp::refresh_derived(&mut d);
+    (d, id, text)
+}
+
+/// A big change that can be undone: a column and 100 to 300 rows of 300-byte cells added to the grid (30 to 100 KB, in
+/// fragments past the simulation's frame limit).
+pub fn big_fill(doc: &Doc, rng: &mut Rng) -> Doc {
+    let mut g = (*doc.grid).clone();
+    let col = rng.id();
+    g.cols.push(col);
+    let cell = "c".repeat(300);
+    for _ in 0..100 + rng.below(200) {
+        let row = rng.id();
+        g.rows.push(row);
+        g.cells.insert((row, col), cell.clone());
+    }
+    let mut d = doc.clone();
+    d.grid = Arc::new(g);
+    d
+}
+
 pub fn edit_tree(roots: &[Arc<Node>], rng: &mut Rng) -> Vec<Arc<Node>> {
-    let all = flatten(roots);
+    let all = editable(roots);
     let pick = |rng: &mut Rng| all.get(rng.below(all.len())).map(|(id, _)| *id);
     match if all.is_empty() { 0 } else { rng.below(4) } {
         0 => {
@@ -806,7 +848,7 @@ pub fn edit_tree(roots: &[Arc<Node>], rng: &mut Rng) -> Vec<Arc<Node>> {
 
 /// An edit inside a layer: its story (typing, formatting), or its cards (made, edited, removed).
 pub fn edit_nested(roots: &[Arc<Node>], rng: &mut Rng) -> Vec<Arc<Node>> {
-    let all = flatten(roots);
+    let all = editable(roots);
     let Some((id, _)) = all.get(rng.below(all.len())).copied() else { return edit_tree(roots, rng) };
     let Some(node) = find(roots, id) else { return roots.to_vec() };
     let mut n = (**node).clone();

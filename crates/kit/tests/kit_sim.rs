@@ -1,9 +1,13 @@
 //! The kit simulation: app sessions on three machines of one fake hub (two apps on the third), each making random
 //! edits of every shape (tree, rich text, table, timeline, opaque; stories and tables nested in layers, a table whose
 //! cells are maps with stories), undoing and redoing, saving, while machines go
-//! offline, drop their apps' connections and restart, and the live relay goes down while files still sync. Healed,
-//! every session ends with the same model, every model is one the app could make (normalised), and the file catches up
-//! with the autosave rule within a save per window.
+//! offline, drop their apps' connections and restart, and the live relay goes down while files still sync. Now and
+//! then a big change (a paste of 30 to 100 KB, a fill of the grid that can be undone) goes as a bundle of slices, in
+//! fragments past the frame limit (16 KiB here, 1 MiB for real); fragments on their way to the apps are dropped or
+//! held back (out of order), and an agent
+//! sometimes stops part of the way through taking one. Healed, every session ends with the same model, every model is
+//! one the app could make (normalised), every big paste is whole on every session, and the file catches up with the
+//! autosave rule within a save per window.
 //!
 //! `SIM_SEEDS=5000 SIM_FIRST=0 cargo test --release -p craft-cloud-kit --test kit_sim` runs seeds 0 to 4999 on
 //! `SIM_JOBS` threads (default 4); `SIM_SEED=17` runs one. A seed's history is random but not replayed exactly: the
@@ -17,18 +21,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use common::{change, open};
-use craft_cloud_app::fake::{Fake, Hub};
+use craft_cloud_app::fake::{Fake, FragmentFaults, Hub};
 use craft_cloud_kit::{KitError, Session};
 use model::{Doc, Rng, SHAPES, TestApp, edit, valid};
 
 const PATH: &str = "sim/story.kitdemo";
+/// Over every seed run: the big changes made, and the gaps the sessions caught up from (a set of fragments that never
+/// came whole on a connection). Both must happen for the run to say anything.
+static BIG_CHANGES: AtomicU64 = AtomicU64::new(0);
+static GAPS: AtomicU64 = AtomicU64::new(0);
 const STEPS: usize = 80;
 /// Which machine each session runs on: the third machine has two apps open on the document.
 const ON: [usize; 4] = [0, 1, 2, 2];
 
 fn run_seed(seed: u64) {
+    // (A set of fragments that stopped coming is dropped soon: the session catches up by opening the document again.
+    // Frames of 16 KiB: the big changes here, of tens of KB, go in fragments as changes over 1 MiB do.)
+    craft_cloud_app::live::set_fragment_patience_for_tests(Duration::from_millis(300));
+    craft_cloud_app::live::set_frame_limit_for_tests(16 * 1024);
     let hub = Hub::new();
     let fakes: Vec<Fake> = (0..3).map(|i| hub.machine(&format!("m{i}")).unwrap()).collect();
+    // Fragments on their way to the apps: some dropped, some held back a few steps (so they come after later changes,
+    // out of order).
+    for (i, f) in (0u64..).zip(&fakes) {
+        f.set_fragment_faults(Some(FragmentFaults { seed: seed.wrapping_mul(7).wrapping_add(i), drop: 150, delay: 300, max_delay: 4 }));
+    }
     let mut rng = Rng(seed);
     let start = model::random_doc(&mut rng, 12);
     let mut sessions: Vec<Session<TestApp>> = Vec::new();
@@ -36,9 +53,42 @@ fn run_seed(seed: u64) {
         sessions.push(open::<TestApp>(&fakes[*m], PATH, if k == 0 { start.clone() } else { Doc::empty() }));
     }
     let mut stopped = [false; 3];
+    // The big pastes made (their layer and text): every session has each of them at the end.
+    let mut bigs = Vec::new();
     for step in 0..STEPS {
         let i = rng.below(sessions.len());
         let m = ON[i];
+        // Now and then a big change (in fragments past 1 MiB): a paste no edit touches again, or a fill that can be
+        // undone; sometimes the agent stops part of the way through taking it.
+        if rng.chance(4) {
+            BIG_CHANGES.fetch_add(1, Ordering::Relaxed);
+            if rng.chance(30) {
+                fakes[m].drop_connections_after(rng.below(3));
+            }
+            if rng.chance(60) {
+                let mut r = rng.clone();
+                let old = sessions[i].model().clone();
+                let (new, id, text) = model::big_paste(&old, &mut r);
+                rng = r;
+                match sessions[i].background_change(&old, &std::sync::Arc::new(new)) {
+                    Ok(()) => bigs.push((id, text)),
+                    Err(KitError::Stalled(_)) => {}
+                    Err(e) => panic!("seed {seed} step {step}: session {i}'s big paste failed: {e}"),
+                }
+            } else {
+                let mut r = rng.clone();
+                match change(&mut sessions[i], |d| model::big_fill(d, &mut r)) {
+                    Ok(()) | Err(KitError::Stalled(_)) => {}
+                    Err(e) => panic!("seed {seed} step {step}: session {i}'s big fill failed: {e}"),
+                }
+                rng = r;
+            }
+            for s in &mut sessions {
+                s.poll();
+            }
+            hub.tick();
+            continue;
+        }
         match rng.below(24) {
             0..=11 => {
                 let shape = SHAPES[rng.below(SHAPES.len())];
@@ -78,12 +128,18 @@ fn run_seed(seed: u64) {
         for s in &mut sessions {
             s.poll();
         }
+        hub.tick();
     }
-    // Healed: every machine runs and is online, the live relay is up, and every session tries at once.
+    // Healed: every machine runs and is online, the live relay is up, no fragment is lost or held, and every session
+    // tries at once.
     hub.set_live(true);
     for f in &fakes {
+        f.set_fragment_faults(None);
         f.start();
         f.set_online(true);
+    }
+    for _ in 0..8 {
+        hub.tick();
     }
     for s in &mut sessions {
         s.reconnect_now();
@@ -106,6 +162,7 @@ fn run_seed(seed: u64) {
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+    GAPS.fetch_add(sessions.iter().map(|s| s.status().gaps).sum(), Ordering::Relaxed);
     // The file catches up on its own: one window saves, then each saves while its file is behind (as an app's
     // autosave does), and soon none is; the file then has the version every session has.
     if let Ok(point) = sessions[0].save_point() {
@@ -143,6 +200,11 @@ fn run_seed(seed: u64) {
     for (i, s) in sessions.iter().enumerate() {
         if let Err(why) = valid(s.model()) {
             panic!("seed {seed}: session {i}'s model isn't one the app could make: {why}");
+        }
+        // Nothing a machine made is lost: every big paste is there, whole.
+        for (id, text) in &bigs {
+            let found = s.model().layers.iter().find(|n| n.id == *id);
+            assert!(found.is_some_and(|n| n.text.text == *text), "seed {seed}: session {i} lost the big paste {id}");
         }
         assert!(s.status().read_only.is_none());
         // The model the session built change by change (texts patched from Loro's deltas) is the one its document
@@ -190,5 +252,10 @@ fn kit_sessions_converge() {
     });
     if let Some((seed, message)) = failed.into_inner().unwrap() {
         panic!("seed {seed} failed (SIM_SEED={seed} replays it, as near as the clock allows): {message}");
+    }
+    let (big, gaps) = (BIG_CHANGES.load(Ordering::Relaxed), GAPS.load(Ordering::Relaxed));
+    eprintln!("kit sim: {seeds} seeds, {big} big changes, {gaps} gaps caught up");
+    if seeds >= 16 {
+        assert!(big > 0 && gaps > 0, "the run made {big} big changes and caught up from {gaps} gaps: it tested nothing of them");
     }
 }

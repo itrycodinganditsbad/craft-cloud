@@ -110,6 +110,15 @@ pub fn set_fragment_patience_for_tests(patience: Duration) {
 
 static PATIENCE_MS: AtomicU64 = AtomicU64::new(craft_cloud_api::fragments::PATIENCE.as_secs() * 1000);
 
+/// For tests and simulations: updates over `bytes` go in fragments of at most `bytes` from now on, in this process (so
+/// changes of a few dozen KB exercise what changes over 1 MiB do). At most the frame limit.
+#[doc(hidden)]
+pub fn set_frame_limit_for_tests(bytes: usize) {
+    FRAME_LIMIT.store(bytes.clamp(craft_cloud_api::fragments::HEADER_BYTES + 1, MAX_UPDATE_BYTES), Ordering::Relaxed);
+}
+
+static FRAME_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MAX_UPDATE_BYTES);
+
 /// The most bytes of fragments a connection keeps per document while their sets come.
 const MAX_FRAGMENT_BYTES: usize = 2 * MAX_WHOLE_BYTES;
 
@@ -600,7 +609,7 @@ impl Document {
     /// agent takes only together); returns its number, which [`Event::Acked`] (or [`Event::Refused`]) names once it is
     /// on the agent's disk. An update over the limit is refused here (`too_large`), and nothing is sent.
     pub fn send(&self, update: &[u8]) -> Result<u64, Error> {
-        let frames = split(update, MAX_UPDATE_BYTES)
+        let frames = split(update, FRAME_LIMIT.load(Ordering::Relaxed))
             .map_err(|e| Error::Refused { code: craft_cloud_api::api::codes::TOO_LARGE.into(), message: e.to_string() })?;
         let count = frames.len() as u64;
         let first = self.seq.fetch_add(count, Ordering::Relaxed) + 1;
