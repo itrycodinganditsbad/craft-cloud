@@ -571,8 +571,8 @@ impl<D: LiveDocument> Session<D> {
         doc.import(state.0)?;
         // The updates that are part of the state.
         let mut unread = None;
-        for update in state.1.iter().flat_map(|u| parts(u).unwrap_or_default()) {
-            if let Err(e) = doc.import(update) {
+        for update in state.1 {
+            if let Err(e) = import_slices(&doc, &parts(update).unwrap_or_default()) {
                 unread = Some(format!("a change from another machine doesn't read: {e}"));
             }
         }
@@ -1193,10 +1193,8 @@ impl<D: LiveDocument> Session<D> {
             // (A bundle's slices one after the other: the model sees them only together, below.)
             match parts(bytes) {
                 Some(updates) => {
-                    for update in updates {
-                        if let Err(e) = self.doc.import(update) {
-                            self.status.error = Some(format!("a change from another machine doesn't read: {e}"));
-                        }
+                    if let Err(e) = import_slices(&self.doc, &updates) {
+                        self.status.error = Some(format!("a change from another machine doesn't read: {e}"));
                     }
                 }
                 None => self.status.error = Some("a change from another machine doesn't read (a bundle cut short)".into()),
@@ -1580,6 +1578,49 @@ impl<D: LiveDocument> Session<D> {
     }
 }
 
+/// A slice's import this slow means Loro took its slow way: see [`import_slices`].
+const SLOW_SLICE: Duration = Duration::from_millis(50);
+
+/// Imports one change's slices (a bundle's, or the one update) one after the other. Each slice normally goes in in
+/// milliseconds; but with this machine's own edits in the same text concurrent with the change, Loro (in one order
+/// of the two peers) works the text out again from where the edits parted for each slice, so each costs more than the
+/// last and a 1.2 MB paste took minutes. Once a slice is that slow, the rest goes in as one update (joined on a
+/// detached fork, which only takes their operations), which Loro works out once (seconds for a megabyte). Undo is
+/// kept either way. The first error is returned; the slices after it are still imported.
+fn import_slices(doc: &LoroDoc, slices: &[&[u8]]) -> Result<(), loro::LoroError> {
+    let mut first_error = None;
+    let mut i = 0;
+    while let Some(slice) = slices.get(i) {
+        let started = Instant::now();
+        if let Err(e) = doc.import(slice) {
+            first_error.get_or_insert(e);
+        }
+        i += 1;
+        let rest = slices.get(i..).unwrap_or_default();
+        if rest.len() >= 2
+            && started.elapsed() > SLOW_SLICE
+            && let Some(one) = joined(doc, rest)
+        {
+            if let Err(e) = doc.import(&one) {
+                first_error.get_or_insert(e);
+            }
+            break;
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// `updates` (which follow on from what `doc` holds) as one update, if they all read.
+fn joined(doc: &LoroDoc, updates: &[&[u8]]) -> Option<Vec<u8>> {
+    let fork = doc.fork();
+    fork.detach();
+    let before = fork.oplog_vv();
+    for u in updates {
+        fork.import(u).ok()?;
+    }
+    fork.export(loro::ExportMode::updates(&before)).ok()
+}
+
 /// Loro's events, noted while the collector is on (an import, an undo).
 fn collect(collector: &Mutex<Collector>, event: DiffEvent<'_>) {
     let mut c = lock(collector);
@@ -1619,5 +1660,51 @@ fn collect(collector: &Mutex<Collector>, event: DiffEvent<'_>) {
             _ => {}
         }
         c.raw.push(raw);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// A 600 KB paste from another peer into a text this machine edited at the same moment, this machine's peer below
+    /// the sender's (the order Loro is slow in: each slice costs more than the last, a minute for these): a few slices
+    /// go in one by one, then the rest together, in seconds. The text is the paste and the edit, and this machine's
+    /// undo step stays (it takes back only the edit).
+    #[test]
+    fn slices_that_turn_slow_go_in_together() {
+        let base = LoroDoc::new();
+        base.set_peer_id(1).unwrap();
+        base.get_text("t").insert(0, "abc").unwrap();
+        base.commit();
+        let snapshot = base.export(loro::ExportMode::Snapshot).unwrap();
+        let sender = LoroDoc::new();
+        sender.set_peer_id(9).unwrap();
+        sender.import(&snapshot).unwrap();
+        let paste = "p".repeat(600 * 1024);
+        sender.get_text("t").insert(3, &paste).unwrap();
+        sender.commit();
+        let end = sender.oplog_vv().get(&9).copied().unwrap();
+        let mut slices = Vec::new();
+        let mut at = 0;
+        while at < end {
+            let to = (at + craft_cloud_api::fragments::SLICE_OPS).min(end);
+            slices.push(sender.export(loro::ExportMode::updates_in_range(vec![loro::IdSpan::new(9, at, to)])).unwrap());
+            at = to;
+        }
+        let here = new_doc();
+        here.set_peer_id(2).unwrap();
+        here.import(&snapshot).unwrap();
+        let mut undo = new_undo(&here);
+        here.get_text("t").insert(0, "hello ").unwrap();
+        here.commit();
+        let started = Instant::now();
+        import_slices(&here, &slices.iter().map(Vec::as_slice).collect::<Vec<_>>()).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(15), "{:?}", started.elapsed());
+        assert_eq!(here.get_text("t").to_string(), format!("hello abc{paste}"));
+        assert!(undo.undo().unwrap());
+        assert_eq!(here.get_text("t").to_string(), format!("abc{paste}"));
     }
 }

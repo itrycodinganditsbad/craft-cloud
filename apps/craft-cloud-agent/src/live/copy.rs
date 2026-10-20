@@ -102,6 +102,8 @@ fn usable_peer(peer: u64) -> u64 {
 
 /// The most bytes of updates one of Loro's batch imports takes ([`LiveCopy::import_batch`]).
 const BATCH_GROUP_BYTES: usize = 16 * 1024;
+/// A bundle's slice whose import takes this long: the rest goes in as one update ([`LiveCopy::import_any_size`]).
+const SLOW_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// `updates` in consecutive groups of at most `max` bytes (an update bigger than that alone).
 fn groups(updates: &[Vec<u8>], max: usize) -> Vec<&[Vec<u8>]> {
@@ -203,15 +205,43 @@ impl LiveCopy {
         if is_bundle(bytes) {
             let slices = parts(bytes).ok_or_else(|| UpdateError::Malformed("a bundle cut short".into()))?;
             let (mut new, mut needs) = (false, Vec::new());
-            for slice in slices {
-                match self.import_one(slice)? {
-                    Taken::Applied { new: n } => new |= n,
-                    Taken::Waiting { needs: more } => needs.extend(more),
+            let mut take = |taken: Taken| match taken {
+                Taken::Applied { new: n } => new |= n,
+                Taken::Waiting { needs: more } => needs.extend(more),
+            };
+            let mut i = 0;
+            while let Some(slice) = slices.get(i) {
+                let started = std::time::Instant::now();
+                take(self.import_one(slice)?);
+                i += 1;
+                // A slice this slow: Loro takes its slow way (edits in the same text concurrent with the change, in
+                // one order of the peers, make each slice cost more than the last): the rest goes in as one update.
+                let rest = slices.get(i..).unwrap_or_default();
+                if rest.len() >= 2
+                    && started.elapsed() > SLOW_SLICE
+                    && let Ok(one) = self.joined(rest)
+                {
+                    take(self.import_one(&one)?);
+                    break;
                 }
             }
             return Ok(if needs.is_empty() { Taken::Applied { new } } else { Taken::Waiting { needs } });
         }
         self.import_one(bytes)
+    }
+
+    /// `updates` (which follow on from this copy) as one update, joined on a detached fork (which only takes their
+    /// operations).
+    fn joined(&self, updates: &[&[u8]]) -> Result<Vec<u8>, UpdateError> {
+        self.guard(|doc| {
+            let fork = doc.fork();
+            fork.detach();
+            let before = fork.oplog_vv();
+            for u in updates {
+                fork.import(u).map_err(|e| UpdateError::Malformed(e.to_string()))?;
+            }
+            fork.export(ExportMode::updates(&before)).map_err(|e| UpdateError::Malformed(e.to_string()))
+        })
     }
 
     fn import_one(&self, bytes: &[u8]) -> Result<Taken, UpdateError> {
@@ -660,6 +690,44 @@ mod tests {
         let at_now = copy.snapshot_at(&copy.version().unwrap()).unwrap();
         assert!(!at_now.is_empty());
         assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+    }
+
+    /// A 600 KB paste's bundle into a copy holding an app's edit of the same text made at the same moment, the edit's
+    /// peer below the paste's (the order Loro is slow in, slice after slice: about a minute here): a few slices one
+    /// by one, then the rest together, in seconds, and the copy holds both.
+    #[test]
+    fn a_bundle_into_a_text_edited_at_the_same_moment_goes_in_in_seconds() {
+        use craft_cloud_proto::fragments::{SLICE_OPS, bundle};
+        let importer = LoroDoc::new();
+        importer.set_peer_id(40).unwrap();
+        text_update(&importer, 0, "import");
+        let import = importer.export(ExportMode::Snapshot).unwrap();
+        let typist = LoroDoc::new();
+        typist.set_peer_id(10).unwrap();
+        typist.import(&import).unwrap();
+        let typed = text_update(&typist, 0, "hello ");
+        let paster = LoroDoc::new();
+        paster.set_peer_id(50).unwrap();
+        paster.import(&import).unwrap();
+        let paste = "p".repeat(600 * 1024);
+        paster.get_text("text").insert(6, &paste).unwrap();
+        paster.commit();
+        let end = *paster.oplog_vv().get(&50).unwrap();
+        let mut slices = Vec::new();
+        let mut at = 0;
+        while at < end {
+            let to = (at + SLICE_OPS).min(end);
+            slices.push(paster.export(ExportMode::updates_in_range(vec![IdSpan::new(50, at, to)])).unwrap());
+            at = to;
+        }
+        let copy = LiveCopy::load(&import, 1).unwrap();
+        copy.import(&typed).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(copy.import_any_size(&bundle(&slices)).unwrap(), Taken::Applied { new: true });
+        assert!(started.elapsed() < std::time::Duration::from_secs(15), "{:?}", started.elapsed());
+        let back = LoroDoc::new();
+        back.import(&copy.snapshot().unwrap()).unwrap();
+        assert_eq!(back.get_text("text").to_string(), format!("hello import{paste}"));
     }
 
     /// An update Loro refuses leaves the copy as it was (Ruling: validation without a scratch copy).

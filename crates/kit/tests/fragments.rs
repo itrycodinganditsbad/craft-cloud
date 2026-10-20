@@ -23,7 +23,11 @@ const PATIENCE: Duration = Duration::from_millis(1500);
 
 fn setup() {
     static ONCE: Once = Once::new();
-    ONCE.call_once(|| craft_cloud_app::live::set_fragment_patience_for_tests(PATIENCE));
+    ONCE.call_once(|| {
+        craft_cloud_app::live::set_fragment_patience_for_tests(PATIENCE);
+        // Frames of 64 KiB: changes of a few hundred KB go in fragments as changes over 1 MiB do.
+        craft_cloud_app::live::set_frame_limit_for_tests(64 * 1024);
+    });
 }
 
 /// Six rows of 200 KiB each, added at the top: about 1.2 MB, more than a frame.
@@ -111,7 +115,7 @@ fn a_five_megabyte_change_arrives_whole_and_undoes_whole() {
     });
     assert_eq!(b.model().texts(), notes);
     let sent = hub.updates("big.txt") - before;
-    assert!((5..=6).contains(&sent), "{sent} fragments for one 5 MB update");
+    assert!(sent >= 70, "{sent} fragments of 64 KiB for one 5 MB update");
     assert!(a.status().error.is_none() && b.status().error.is_none(), "{:?} {:?}", a.status().error, b.status().error);
     // One undo step takes the whole change back, on both, whole.
     assert!(a.undo().unwrap());
@@ -154,7 +158,7 @@ fn local_edits_while_a_change_comes_in_fragments_keep_both() {
     assert!(b.status().gaps >= 1, "the set stopped coming: the laptop caught up");
 }
 
-/// The same with the change in a tree node's story (a 1.2 MB paste into a layer's text): meanwhile the other machine
+/// The same with the change in a tree node's story (a 300 KB paste into a layer's text): meanwhile the other machine
 /// renames that node and types at the start of its story. Both keep everything.
 #[test]
 fn edits_of_the_same_node_and_story_while_a_paste_comes_keep_both() {
@@ -170,7 +174,9 @@ fn edits_of_the_same_node_and_story_while_a_paste_comes_keep_both() {
     let mut b = open::<TestApp>(&laptop, "paste.kitdemo", Doc::empty());
     until(&mut [&mut a, &mut b], "the laptop has the layer", |s| s[1].model().layers.len() == 1);
     laptop.set_fragment_faults(Some(FIRST_ONLY));
-    let paste = "p".repeat(1200 * 1024);
+    // (300 KB: in fragments, as the test's frames are 64 KiB. Loro's import of a big paste into a text this machine
+    // edits at the same moment takes time growing with the square of its size, seconds for a megabyte.)
+    let paste = "p".repeat(300 * 1024);
     change(&mut a, |d| Doc {
         layers: Arc::new(model::update(&d.layers, id, &|n| Node { text: RichText::plain(&format!("abc{paste}")), ..n.clone() })),
         ..d.clone()
