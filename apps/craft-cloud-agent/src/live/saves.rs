@@ -17,6 +17,7 @@ use craft_cloud_sync::SaveRecords;
 use serde::{Deserialize, Serialize};
 
 use crate::account::write_atomic;
+use crate::cli::now_ms;
 
 /// How many saves the book keeps of one document (newest first)…
 pub const SAVES_PER_DOC: usize = 32;
@@ -40,11 +41,145 @@ struct Entry {
 /// Adds from several app connections at once take turns.
 static WRITING: Mutex<()> = Mutex::new(());
 
-/// Saves announced (`saving`) whose records haven't come yet, by book file, then by document and content: since when.
-type Announced = HashMap<(DocId, String), Instant>;
-static ANNOUNCED: Mutex<BTreeMap<PathBuf, Announced>> = Mutex::new(BTreeMap::new());
-/// How long an announced save is waited for: as long as the sync waits to learn which of two saves is newer.
-pub const ANNOUNCED_FOR: Duration = Duration::from_secs(10 * 60);
+/// Each book's saves possibly on their way ([`Pending`]), by book file.
+static PENDING: Mutex<BTreeMap<PathBuf, Pending>> = Mutex::new(BTreeMap::new());
+/// How long content is waited for in all, at most, from the first time it was: no announcement renews it.
+pub const MAX_PENDING_WAIT: Duration = Duration::from_secs(10 * 60);
+/// How long after an app session had a document open a change to its file still counts as a Craft save on its way
+/// (the session may be reconnecting, or the agent restarting), and an app connection's announcements still hold after
+/// it went.
+pub const SESSION_GRACE: Duration = Duration::from_secs(60);
+/// Most announcements one app connection has held at once (the kit keeps 16 records); past it, the oldest go.
+pub const MAX_ANNOUNCED_PER_CONN: usize = 64;
+
+/// Whether an app session has a document open on this machine, or since when none has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    Open,
+    ClosedAt(Instant),
+}
+
+/// Saves a Craft app may be making whose records haven't come: the sync waits for them rather than take the content
+/// for an edit outside Craft ([`SaveRecords::pending`]).
+///
+/// Content of a document's file counts as such a save while an app session has the document open on this machine and
+/// for [`SESSION_GRACE`] after (reconnecting, or the agent restarting: the agent keeps when sessions had documents open,
+/// [`Pending::sessions`]), or while a connection's announcement of it holds (at most [`MAX_ANNOUNCED_PER_CONN`] per
+/// connection, only of documents it has open, for [`SESSION_GRACE`] after it went). Content waits from the first time
+/// it was waited for: an announced save at most [`MAX_PENDING_WAIT`], one only a session makes likely (never announced:
+/// saved while the app had no agent) at most [`SESSION_GRACE`]; never again after, and announcing renews nothing. Past
+/// that the content counts as made outside Craft, as without an app.
+#[derive(Debug, Default)]
+pub struct Pending {
+    by_conn: HashMap<u64, std::collections::VecDeque<(DocId, String)>>,
+    /// Announcements of connections that went, and until when they hold.
+    gone: HashMap<(DocId, String), Instant>,
+    sessions: HashMap<DocId, Seen>,
+    /// The first time each content was waited for.
+    first: HashMap<(DocId, String), Instant>,
+    /// The grace, when not [`SESSION_GRACE`] (tests).
+    grace: Option<Duration>,
+}
+
+impl Pending {
+    /// Another grace than [`SESSION_GRACE`] (tests: the run loop's `session_grace`).
+    pub fn set_grace(&mut self, grace: Duration) {
+        self.grace = Some(grace);
+    }
+
+    fn grace(&self) -> Duration {
+        self.grace.unwrap_or(SESSION_GRACE)
+    }
+
+    /// Connection `conn` announced a save of `doc` with content `hash`; refused (false) when it hasn't `doc` open.
+    pub fn announce(&mut self, conn: u64, doc: DocId, hash: &str, open: bool) -> bool {
+        if !open {
+            return false;
+        }
+        let mine = self.by_conn.entry(conn).or_default();
+        if !mine.iter().any(|(d, h)| *d == doc && h == hash) {
+            mine.push_back((doc, hash.to_owned()));
+            while mine.len() > MAX_ANNOUNCED_PER_CONN {
+                mine.pop_front();
+            }
+        }
+        true
+    }
+
+    /// Connection `conn` closed `doc`: its announcements of it no longer hold.
+    pub fn closed(&mut self, conn: u64, doc: DocId) {
+        if let Some(mine) = self.by_conn.get_mut(&conn) {
+            mine.retain(|(d, _)| *d != doc);
+        }
+    }
+
+    /// Connection `conn` went without closing: its announcements hold [`SESSION_GRACE`] more.
+    pub fn gone(&mut self, conn: u64, now: Instant) {
+        let grace = self.grace();
+        for key in self.by_conn.remove(&conn).unwrap_or_default() {
+            self.gone.insert(key, now + grace);
+        }
+    }
+
+    /// Whether an app session has `doc` open on this machine now.
+    pub fn session(&mut self, doc: DocId, open: bool, now: Instant) {
+        let seen = if open { Seen::Open } else { Seen::ClosedAt(now) };
+        self.sessions.insert(doc, seen);
+    }
+
+    /// The record of `doc`'s content `hash` came: nothing more to wait for.
+    pub fn recorded(&mut self, doc: DocId, hash: &str) {
+        let key = (doc, hash.to_owned());
+        for mine in self.by_conn.values_mut() {
+            mine.retain(|k| *k != key);
+        }
+        self.gone.remove(&key);
+        self.first.remove(&key);
+    }
+
+    /// Whether content `hash` of `doc`'s file is (possibly) a Craft save on its way, to be waited for now.
+    pub fn is_pending(&mut self, doc: DocId, hash: &str, now: Instant) -> bool {
+        let (key, grace) = ((doc, hash.to_owned()), self.grace());
+        let session = match self.sessions.get(&doc) {
+            Some(Seen::Open) => true,
+            Some(Seen::ClosedAt(at)) => now.saturating_duration_since(*at) < grace,
+            None => false,
+        };
+        let announced = self.by_conn.values().any(|mine| mine.contains(&key)) || self.gone.get(&key).is_some_and(|until| now < *until);
+        if !session && !announced {
+            return false;
+        }
+        // (Old firsts are forgotten after a day; one that waited its time stays done until then.)
+        self.first.retain(|_, at| now.saturating_duration_since(*at) < Duration::from_secs(24 * 3600));
+        let first = *self.first.entry(key).or_insert(now);
+        now.saturating_duration_since(first) < if announced { MAX_PENDING_WAIT } else { grace }
+    }
+
+    /// When sessions last had documents open, as kept on disk: by document, `None` while one has it open, else when it
+    /// closed (ms since the epoch).
+    pub fn sessions(&self, now: Instant, now_ms: i64) -> BTreeMap<DocId, Option<i64>> {
+        self.sessions
+            .iter()
+            .filter_map(|(doc, seen)| match seen {
+                Seen::Open => Some((*doc, None)),
+                Seen::ClosedAt(at) => {
+                    let ago = now.saturating_duration_since(*at);
+                    (ago < self.grace()).then(|| (*doc, Some(now_ms - i64::try_from(ago.as_millis()).unwrap_or(i64::MAX))))
+                }
+            })
+            .collect()
+    }
+
+    /// What [`Pending::sessions`] kept, read back at the agent's start: one open then went at the restart.
+    pub fn restore(&mut self, kept: &BTreeMap<DocId, Option<i64>>, now: Instant, now_ms: i64) {
+        for (doc, closed) in kept {
+            let ago = closed.map_or(Duration::ZERO, |ms| Duration::from_millis(u64::try_from(now_ms.saturating_sub(ms)).unwrap_or(u64::MAX)));
+            if ago < self.grace() {
+                self.sessions.insert(*doc, Seen::ClosedAt(now.checked_sub(ago).unwrap_or(now)));
+            }
+        }
+    }
+}
 
 /// The books' caches, by file (shared by every [`SaveBook`] of one file in the process).
 type Cache = Arc<Mutex<Option<Read>>>;
@@ -141,35 +276,32 @@ impl SaveBook {
         map
     }
 
-    /// An app announced it is writing `doc`'s file with content `hash` (hex), its record to follow (kept in memory: an
-    /// app announces its saves again when it reconnects).
-    pub fn announce(&self, doc: DocId, hash: &str) {
-        if self.find(doc, hash).is_some() {
-            return;
-        }
-        let mut all = ANNOUNCED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = Instant::now();
-        let mine = all.entry(self.path.clone()).or_default();
-        mine.retain(|_, since| now.duration_since(*since) < ANNOUNCED_FOR);
-        mine.entry((doc, hash.to_owned())).or_insert(now);
+    /// This book's saves possibly on their way ([`Pending`]), shared by every book of its file in the process.
+    pub fn with_pending<T>(&self, f: impl FnOnce(&mut Pending) -> T) -> T {
+        let mut all = PENDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(all.entry(self.path.clone()).or_default())
     }
 
-    /// The announced save of `doc` with content `hash` won't have its record (its app closed the document first).
-    pub fn forget(&self, doc: DocId, hash: &str) {
-        if let Some(mine) = ANNOUNCED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(&self.path) {
-            mine.remove(&(doc, hash.to_owned()));
-        }
+    /// Where [`Pending::sessions`] is kept: next to the book.
+    fn sessions_path(&self) -> PathBuf {
+        self.path.with_file_name("sessions.json")
     }
 
-    /// Whether a save of `doc` with content `hash` (hex) was announced and its record hasn't come yet (for at most
-    /// [`ANNOUNCED_FOR`]).
-    pub fn announced(&self, doc: DocId, hash: &str) -> bool {
-        ANNOUNCED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&self.path)
-            .and_then(|mine| mine.get(&(doc, hash.to_owned())))
-            .is_some_and(|since| since.elapsed() < ANNOUNCED_FOR)
+    /// Writes when sessions last had documents open (atomically), so a restarted agent still waits for their saves.
+    pub fn keep_sessions(&self) -> Result<(), String> {
+        let kept = self.with_pending(|p| p.sessions(Instant::now(), now_ms()));
+        let json = serde_json::to_vec(&kept).map_err(|e| e.to_string())?;
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        write_atomic(&self.sessions_path(), &json, true).map_err(|e| e.to_string())
+    }
+
+    /// Reads back what [`SaveBook::keep_sessions`] wrote (at the agent's start).
+    pub fn restore_sessions(&self) {
+        let kept: BTreeMap<DocId, Option<i64>> =
+            std::fs::read(self.sessions_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        self.with_pending(|p| p.restore(&kept, Instant::now(), now_ms()));
     }
 
     /// The record of `doc`'s save with content `hash` (hex), if an app on this machine saved exactly that.
@@ -194,7 +326,7 @@ impl SaveBook {
     pub fn add(&self, doc: DocId, hash: &str, frontiers: Vec<(u64, u32)>, at_ms: i64) -> Result<(), String> {
         Self::check(hash, &frontiers)?;
         // Its record came: no longer on its way.
-        self.forget(doc, hash);
+        self.with_pending(|p| p.recorded(doc, hash));
         let mut frontiers = frontiers;
         frontiers.sort_unstable();
         frontiers.dedup();
@@ -256,7 +388,9 @@ impl SaveRecords for SaveBook {
     }
 
     fn pending(&self, node: NodeId, hash: &FileHash) -> bool {
-        self.announced(node_doc(self.space, node), &hex(hash.as_bytes()))
+        let doc = node_doc(self.space, node);
+        let hash = hex(hash.as_bytes());
+        self.find(doc, &hash).is_none() && self.with_pending(|p| p.is_pending(doc, &hash, Instant::now()))
     }
 
     /// Asked of the live hub, which holds the document's operations; `None` when no hub runs, it doesn't answer in
@@ -311,6 +445,64 @@ mod tests {
         // No hub: which is newer can't be told.
         let (a, b) = (SaveRecord { doc, frontiers: vec![(1, 2)] }, SaveRecord { doc, frontiers: vec![(1, 1)] });
         assert_eq!(book.includes(&a, &b), None);
+    }
+
+    /// The bounds on saves possibly on their way: a session's document waits while open and a grace after; an
+    /// announcement holds only for a document its connection has open, at most 64 per connection (the oldest go),
+    /// a grace after the connection went, and no longer once closed; each content waits 10 minutes in all, from its
+    /// first wait, and announcing again doesn't renew it; a record ends the wait; what is kept on disk comes back.
+    #[test]
+    fn pending_saves_are_bounded() {
+        let t0 = Instant::now();
+        let (doc, other) = (DocId::generate(), DocId::generate());
+        let mut p = Pending::default();
+        assert!(!p.is_pending(doc, "h", t0), "nothing known");
+        // Sessions.
+        p.session(doc, true, t0);
+        assert!(p.is_pending(doc, "h", t0), "while open");
+        assert!(p.is_pending(doc, "o", t0));
+        assert!(!p.is_pending(doc, "o", t0 + SESSION_GRACE), "never announced: a grace at most, even while open");
+        p.session(doc, false, t0);
+        assert!(p.is_pending(doc, "h2", t0 + SESSION_GRACE - Duration::from_secs(1)), "a grace after");
+        assert!(!p.is_pending(doc, "h3", t0 + SESSION_GRACE), "not past it");
+        // Announcements: only of an open document.
+        assert!(!p.announce(1, other, "a", false));
+        assert!(!p.is_pending(other, "a", t0));
+        assert!(p.announce(1, other, "a", true));
+        assert!(p.is_pending(other, "a", t0));
+        // At most 64 per connection: the oldest go.
+        for i in 0..MAX_ANNOUNCED_PER_CONN {
+            assert!(p.announce(1, other, &format!("n{i}"), true));
+        }
+        assert!(!p.is_pending(other, "a", t0), "the oldest went");
+        assert!(p.is_pending(other, "n63", t0));
+        // Closed: they no longer hold. Gone: a grace more.
+        p.closed(1, other);
+        assert!(!p.is_pending(other, "n63", t0));
+        assert!(p.announce(2, other, "g", true));
+        p.gone(2, t0);
+        assert!(p.is_pending(other, "g", t0 + SESSION_GRACE - Duration::from_secs(1)));
+        assert!(!p.is_pending(other, "g", t0 + SESSION_GRACE));
+        // Ten minutes in all, never renewed.
+        assert!(p.announce(3, other, "long", true));
+        assert!(p.is_pending(other, "long", t0));
+        assert!(p.is_pending(other, "long", t0 + MAX_PENDING_WAIT - Duration::from_secs(1)));
+        assert!(!p.is_pending(other, "long", t0 + MAX_PENDING_WAIT));
+        assert!(p.announce(4, other, "long", true));
+        assert!(!p.is_pending(other, "long", t0 + MAX_PENDING_WAIT + Duration::from_secs(5)), "announcing again renews nothing");
+        // A record ends it.
+        assert!(p.announce(3, other, "r", true));
+        p.recorded(other, "r");
+        p.closed(3, other);
+        assert!(!p.is_pending(other, "r", t0));
+        // Kept on disk and read back: a document open at the restart waits a grace from it.
+        let mut q = Pending::default();
+        q.session(doc, true, t0);
+        let kept = q.sessions(t0, 1_000_000);
+        let mut back = Pending::default();
+        back.restore(&kept, t0, 1_000_000);
+        assert!(back.is_pending(doc, "x", t0 + Duration::from_secs(1)));
+        assert!(!back.is_pending(doc, "y", t0 + SESSION_GRACE));
     }
 
     /// Whether a file was edited outside Craft: by this machine's records, or the agreed version's record, whatever

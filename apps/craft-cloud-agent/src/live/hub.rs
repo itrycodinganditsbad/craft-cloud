@@ -47,6 +47,8 @@ pub struct HubConfig {
     pub folder: PathBuf,
     /// Tests: how long every save record is held back before it is taken (a slow agent).
     pub record_delay: Duration,
+    /// How long after a session an unannounced change is still waited for (`saves::SESSION_GRACE`).
+    pub session_grace: Duration,
 }
 
 /// How long an open of a file that isn't uploaded yet waits for its node (a sync pass is started for it).
@@ -344,8 +346,6 @@ struct Docs {
     early: Vec<EarlyRecord>,
     /// Documents the sync asked about and this copy couldn't tell yet: a pass is asked for once operations come.
     asked: BTreeSet<DocId>,
-    /// Saves announced (`saving`) whose records haven't come, by connection: let go if it closes the document first.
-    announced: Vec<(ConnId, DocId, String)>,
 }
 
 /// A save record waiting for its operations ([`Docs::early`]).
@@ -585,6 +585,7 @@ impl State {
         let Some(c) = self.docs.conns.get_mut(&conn) else { return Vec::new() };
         c.handles.insert(id, doc);
         self.replica.set_open(doc, true);
+        self.sessions_changed(&[doc]);
         let (online, waiting_n) = self.replica.document_status(doc).unwrap_or((false, 0));
         let state = DocState { online, waiting: waiting_n, bytes: snapshot.len() as u64, updates: waiting.len() as u64 };
         let mut frames = self.tell(conn, DocOut::Opened { id, doc, state, changed_outside, snapshot, waiting });
@@ -692,7 +693,6 @@ impl State {
     /// failed shows by the agent's next word).
     fn keep_record(&mut self, doc: DocId, hash: &str, frontiers: Vec<(u64, u32)>) {
         let at = crate::cli::now_ms();
-        self.docs.announced.retain(|(_, d, h)| !(*d == doc && h == hash));
         if let Err(e) = self.saves.add(doc, hash, frontiers, at) {
             self.say(format!("a save record couldn't be kept: {e}"));
             return;
@@ -700,6 +700,19 @@ impl State {
         self.control.request_pass();
         if let Some(seen) = self.docs.files.get_mut(&doc) {
             seen.told = None;
+        }
+    }
+
+    /// Whether app sessions have `docs` open now, told the save book and kept on disk (a restarted agent still waits
+    /// for saves its apps may have been making).
+    fn sessions_changed(&mut self, docs: &[DocId]) {
+        let now = std::time::Instant::now();
+        for doc in docs {
+            let open = !self.handles_of(*doc).is_empty();
+            self.saves.with_pending(|p| p.session(*doc, open, now));
+        }
+        if let Err(e) = self.saves.keep_sessions() {
+            self.say(format!("which documents apps had open couldn't be written down: {e}"));
         }
     }
 
@@ -726,8 +739,12 @@ impl State {
         for doc in c.handles.values() {
             self.replica.set_open(*doc, false);
         }
-        // Its records still waiting for their changes: those never came (the version, if any, has no record).
+        // Its records still waiting for their changes: those never came (the version, if any, has no record). Its
+        // announcements, and its sessions, hold a grace more: it may be reconnecting.
         self.docs.early.retain(|r| r.conn != conn);
+        self.saves.with_pending(|p| p.gone(conn, std::time::Instant::now()));
+        let docs: Vec<DocId> = c.handles.values().copied().collect();
+        self.sessions_changed(&docs);
         self.docs.opens.retain(|(c, _), _| *c != conn);
         self.docs.lookups.retain(|l| l.conn != conn);
         for waiting in self.docs.waiting.values_mut() {
@@ -863,9 +880,10 @@ impl State {
             DocsCall::Open { conn, id, path, app, file_hash } => self.open(conn, id, &path, &app, file_hash),
             DocsCall::Saved { conn, doc, hash, frontiers } => self.saved(conn, doc, hash, frontiers),
             DocsCall::Saving { conn, doc, hash } => {
-                if super::saves::SaveBook::check(&hash, &[]).is_ok() {
-                    self.saves.announce(doc, &hash);
-                    self.docs.announced.push((conn, doc, hash));
+                // Only of a document this connection has open, and at most so many per connection ([`Pending`]).
+                let open = self.docs.conns.get(&conn).is_some_and(|c| c.handles.values().any(|d| *d == doc));
+                if super::saves::SaveBook::check(&hash, &[]).is_err() || !self.saves.with_pending(|p| p.announce(conn, doc, &hash, open)) {
+                    return self.tell(conn, refusal(None, None, craft_cloud_proto::api::codes::INVALID, "a save of a document not open here"));
                 }
                 Vec::new()
             }
@@ -938,17 +956,11 @@ impl State {
                         self.replica.set_open(doc, false);
                     }
                 }
-                // Closed before the changes its records cover came: those records are dropped, and its saves on their
-                // way with them (their content is then as any edit: the version has no record).
+                // Closed before the changes its records cover came: those records are dropped, and its announcements
+                // with them (the session's grace still holds a while: `Pending`).
                 self.docs.early.retain(|r| !(r.conn == conn && r.doc == doc));
-                let saves = &self.saves;
-                self.docs.announced.retain(|(c, d, h)| {
-                    let closed = *c == conn && *d == doc;
-                    if closed {
-                        saves.forget(*d, h);
-                    }
-                    !closed
-                });
+                self.saves.with_pending(|p| p.closed(conn, doc));
+                self.sessions_changed(&[doc]);
                 Vec::new()
             }
             DocsCall::Gone { conn } => self.gone(conn),
@@ -1146,6 +1158,9 @@ async fn run(
     let transport = HttpTransport::new(config.server.clone(), &config.token).ok().map(Arc::new);
     let blobs = Blobs { transport, done: blob_tx, generation: 0, uploading: BTreeMap::new(), held: BTreeMap::new() };
     let saves = super::saves::SaveBook::new(config.data.path(), config.space);
+    // Documents apps had open before the agent (re)started: their files may hold saves whose records come on reconnect.
+    saves.with_pending(|p| p.set_grace(config.session_grace));
+    saves.restore_sessions();
     // The sync engine's questions: which of two saves of a document is newer (this copy's operations say).
     let (_orders, mut orders) = super::saves::Orders::serve(config.data.path(), config.space);
     let mut state = State {

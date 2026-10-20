@@ -72,6 +72,9 @@ pub struct RunOptions {
     /// Tests: how long the live hub holds every app's save record back before taking it (a slow agent, as under load).
     #[doc(hidden)]
     pub record_delay: Duration,
+    /// How long after an app session had a document open an unannounced change of its file is still waited for as a
+    /// Craft save on its way (`live::saves::SESSION_GRACE`, 60 s; tests shorten it).
+    pub session_grace: Duration,
 }
 
 impl Default for RunOptions {
@@ -87,6 +90,7 @@ impl Default for RunOptions {
             fail_watch: false,
             autostart: crate::autostart::Target::User,
             record_delay: Duration::ZERO,
+            session_grace: crate::live::saves::SESSION_GRACE,
         }
     }
 }
@@ -618,6 +622,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             machine: account.device_name.clone(),
             folder: account.folder.clone(),
             record_delay: options.record_delay,
+            session_grace: options.session_grace,
         };
         let hub = match Hub::start(hub_config, control.clone(), user_paused) {
             Ok(hub) => Some(hub),

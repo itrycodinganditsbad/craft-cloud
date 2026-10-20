@@ -1272,7 +1272,8 @@ impl<D: LiveDocument> Session<D> {
         let Some(link) = &self.link else { return };
         // Saves on their way, announced at once (before the changes they cover, which may wait): the agent's sync then
         // waits for their records rather than take the files for edits outside Craft.
-        for kept in self.records.iter_mut().filter(|k| !k.announced && !k.sent) {
+        // (Never while refused for good: those records can't come, and the agent's grace ends their wait.)
+        for kept in self.records.iter_mut().filter(|k| !k.announced && !k.sent && self.refused.is_none()) {
             if link.doc.saving(kept.record.hash).is_ok() {
                 kept.announced = true;
             }

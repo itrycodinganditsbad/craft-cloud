@@ -304,10 +304,11 @@ async fn saves_whose_order_is_unknown_wait_then_are_a_conflict() {
 async fn a_save_whose_record_is_late_waits_for_it_and_never_conflicts() {
     let server = Server::new().await;
     let (mut a, mut b, book_a, book_b, doc) = two(&server).await;
+    let before = server_file(&a).await;
     let late = book_a.saving(&mut a, "doc.kitdemo", b"laptop's save, record on its way");
     a.sync_once().await.unwrap();
-    assert_eq!(server_file(&a).await.save, None, "nothing went up yet");
     let up = server_file(&a).await;
+    assert_eq!(up.version, before.version, "nothing went up yet (not even without its record)");
     // The desktop's save meanwhile.
     book_b.save(&mut b, "doc.kitdemo", b"desktop's save", doc, &[(2, 3)]);
     b.sync_once().await.unwrap();

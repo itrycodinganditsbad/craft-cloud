@@ -922,6 +922,9 @@ fn show_time(ms: i64) -> String {
     }
 }
 
+/// How soon a pass that left a Craft save waiting is followed by another.
+const SAVE_WAIT_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub(crate) fn now_ms() -> i64 {
     Timestamp::now().as_millisecond()
 }
@@ -1498,6 +1501,15 @@ impl Session {
             (Ok(_), Some(stability), Some(started)) => stability.pass_finished(started),
             _ => None,
         };
+        // A Craft save waiting for its record, or two whose order isn't known yet: looked at again soon (a record that
+        // lands asks for a pass by itself; a wait that runs out doesn't).
+        let waits = |why: &String| why.starts_with(craft_cloud_sync::SAVE_RECORD_WAITS) || why.starts_with(craft_cloud_sync::SAVE_ORDER_WAITS);
+        if let Ok(report) = &result
+            && report.skipped.iter().any(|(_, why)| waits(why))
+        {
+            let soon = SAVE_WAIT_RECHECK;
+            self.recheck_in = Some(self.recheck_in.map_or(soon, |at| at.min(soon)));
+        }
         let (outcome, summary) = match &result {
             Ok(report) => {
                 let summary = PassSummary::from_report(report);

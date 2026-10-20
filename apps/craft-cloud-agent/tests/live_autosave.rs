@@ -255,3 +255,128 @@ async fn both_machines_autosaving_end_with_every_edit_in_the_file_and_stop() {
     run_pc.stop().await.0.unwrap();
     run_laptop.stop().await.0.unwrap();
 }
+
+/// Saves the session's model in the kit's order (save point, record, write); the bytes.
+fn save_now(session: &mut Session<LinesApp>, path: &std::path::Path) -> Vec<u8> {
+    let point = session.save_point().unwrap();
+    let bytes = point.model().to_file();
+    session.record(&point, &bytes);
+    let tmp = path.with_extension("tmp-save");
+    std::fs::write(&tmp, &bytes).unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+    bytes
+}
+
+/// A save made while the app has no agent (the agent restarts) can't be announced: the agent, back, still waits for
+/// it, since an app had the document open moments ago (kept on disk), while the laptop's own Craft save of the same
+/// document has gone up meanwhile. The app reconnects within its backoff and records the save: no conflict copy, and
+/// the version on the server carries the record. (Before: the agent's first pass made a conflict copy.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_save_made_while_the_agent_was_away_is_waited_for_and_never_conflicts() {
+    let server = Server::new().await;
+    let (pc, laptop) = (Agent::signed_in(&server, "pc").await, Agent::signed_in(&server, "laptop").await);
+    let (run_pc, run_laptop) = (pc.run(), laptop.run());
+    let (_on_pc, on_laptop) = (pc.client().await, laptop.client().await);
+    std::fs::create_dir_all(&pc.folder).unwrap();
+    std::fs::write(pc.folder.join(FILE), "start").unwrap();
+    let there = laptop.folder.join(FILE);
+    eventually("the file reached the laptop", move || there.exists().then_some(())).await;
+    // The pc's app finds its agent afresh each time (it restarts below).
+    let pc_data = pc.data.path().to_owned();
+    let pc_agent = KitAgent::from_fn(move || craft_cloud_app::Client::connect_in(&pc_data));
+    let (pc_folder, laptop_folder) = (pc.folder.clone(), laptop.folder.clone());
+    let open_on = |agent: KitAgent, folder: PathBuf| {
+        let bytes = std::fs::read(folder.join(FILE)).unwrap();
+        match Session::<LinesApp>::open(&agent, FILE, Arc::new(Lines::from_file(&bytes)), Some(&bytes)).unwrap() {
+            Open::Live(s) => *s,
+            Open::NotLive(why) => panic!("not live: {why:?}"),
+        }
+    };
+    let (a_agent, a_folder) = (pc_agent.clone(), pc_folder.clone());
+    let mut a = tokio::task::spawn_blocking(move || open_on(a_agent, a_folder)).await.unwrap();
+    let laptop_client = on_laptop.clone();
+    let b_folder = laptop_folder.clone();
+    let mut b = tokio::task::spawn_blocking(move || open_on(KitAgent::from_fn(move || Ok(laptop_client.clone())), b_folder)).await.unwrap();
+    // The pc's agent goes away; the app saves meanwhile, unannounced.
+    run_pc.stop().await.0.unwrap();
+    let (mut a, pc_saved) = tokio::task::spawn_blocking(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.poll().status.connected {
+            assert!(Instant::now() < deadline, "the app saw its agent go");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let old = a.model().clone();
+        a.local_change(&old, &Arc::new(old.with("pc, while its agent was away"))).unwrap();
+        let saved = save_now(&mut a, &pc_folder.join(FILE));
+        (a, saved)
+    })
+    .await
+    .unwrap();
+    // The laptop saves its own edit, and it goes up with its record.
+    let (b_back, laptop_saved) = tokio::task::spawn_blocking(move || {
+        let old = b.model().clone();
+        b.local_change(&old, &Arc::new(old.with("the laptop's"))).unwrap();
+        let saved = save_now(&mut b, &laptop_folder.join(FILE));
+        (b, saved)
+    })
+    .await
+    .unwrap();
+    let mut b = b_back;
+    let m = server.meta.clone();
+    let space = server.meta.user_by_name("ana").await.unwrap().unwrap().space;
+    let up = move || {
+        let m = m.clone();
+        async move {
+            let tree = m.tree(space, None, 5000).await.unwrap();
+            tree.nodes.into_iter().find_map(|n| match n.kind {
+                craft_cloud_proto::NodeKind::File(f) if n.name.as_ref().is_some_and(|x| x.as_str() == FILE) => Some(f),
+                _ => None,
+            })
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(f) = up().await
+            && f.save.is_some()
+            && f.size == laptop_saved.len() as u64
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the laptop's save went up");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The pc's agent is back; its app reconnects within its backoff and records the save it made.
+    let run_pc = pc.run();
+    let _back = pc.client().await;
+    let (pc_dir, laptop_dir) = (pc.folder.clone(), laptop.folder.clone());
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        a = tokio::task::spawn_blocking(move || {
+            a.poll();
+            a
+        })
+        .await
+        .unwrap();
+        b = tokio::task::spawn_blocking(move || {
+            b.poll();
+            b
+        })
+        .await
+        .unwrap();
+        let (on_pc, on_laptop) = (files(&pc_dir), files(&laptop_dir));
+        let conflict = on_pc.iter().chain(&on_laptop).any(|(n, _)| n.contains("conflict"));
+        assert!(!conflict, "a conflict copy of two Craft saves: pc {on_pc:?}, laptop {on_laptop:?}");
+        if let Some(f) = up().await
+            && f.save.is_some()
+            && f.size == pc_saved.len() as u64
+            && on_pc == on_laptop
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never settled: pc {on_pc:?}, laptop {on_laptop:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop((a, b));
+    run_pc.stop().await.0.unwrap();
+    run_laptop.stop().await.0.unwrap();
+}
