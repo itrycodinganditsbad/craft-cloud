@@ -76,8 +76,8 @@ fn undo_after_a_remote_edit_to_the_same_element_keeps_the_remote_edit() {
     });
 }
 
-/// Typing grouped into one step; a big change (here 1.25 MB of cells, split into several commits under the cap) is
-/// one step too. (Loro's undo of one big run of text takes time growing with its square, about 10 s for 1 MB: the
+/// Typing grouped into one step; a big change (here 1.25 MB of cells: one update, in fragments past the 1 MiB frame)
+/// is one step too. (Loro's undo of one big run of text takes time growing with its square, about 10 s for 1 MB: the
 /// report's concerns, so the big change here is cells.)
 #[test]
 fn a_group_and_a_split_change_are_one_step_each() {
@@ -104,7 +104,7 @@ fn a_group_and_a_split_change_are_one_step_each() {
     let sent = hub.updates("u.kitdemo");
     change(&mut a, big).unwrap();
     until(&mut [&mut a, &mut b], "the big change arrived", |s| s.iter().all(|s| s.model().grid.cells.len() == 5));
-    assert!(hub.updates("u.kitdemo") - sent >= 3, "split into several updates");
+    assert!(hub.updates("u.kitdemo") - sent >= 2, "one update over the frame limit: in fragments");
     assert!(a.undo().unwrap(), "the big change");
     until(&mut [&mut a, &mut b], "the big change undone in one step", |s| {
         s.iter().all(|s| s.model().grid.rows.is_empty() && story(s) == "one two three four")
