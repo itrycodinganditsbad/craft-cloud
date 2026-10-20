@@ -147,10 +147,11 @@ if !Arc::ptr_eq(&before, &self.doc) {
   square of the text) in one bundle, and one over the agent's 1 MiB frame limit in fragments that every receiver
   joins before anything imports them. A 5 MB paste goes, and undoes, whole: no machine, agent or app ever holds part
   of a change, so an app never sees, repairs or writes back half of one, whatever it does meanwhile (an edit, an
-  undo, a save). A change whose fragments stop coming (its sender went part of the way) is dropped, never applied:
-  the session opens the document again (`Status::gaps` counts it) and the catch-up brings whatever came whole. A
-  change over a snapshot's limit (`MAX_CHANGE_BYTES`, 36 MiB) can't go: the session stops, as for one the agent
-  refuses for good.
+  undo, a save). The agent gives its apps every change whole: one that comes part of the way (its sender, or this
+  machine, slept or lost the connection meanwhile) is kept by the agent until the rest comes, and the app sees nothing
+  of it until then. A change over `MAX_CHANGE_BYTES` (8 MiB, half a document's log cap on the server) can't go: the
+  session stops, as for one the agent refuses for good; the model stays editable, and saving it to the file keeps the
+  work.
 - **A gesture** (a drag, an IME composition) whose `before` must stay put until it ends: `session.hold_remote(true)`
   while it runs; remote changes wait and come at the first poll after.
 - Typing: `session.group(|s| …)` (or `begin_group`/`end_group`) makes several changes one undo step.
@@ -257,7 +258,13 @@ back. Saving clears `changed_outside`.
 ## Presence
 
 `session.set_presence(Some(bytes))` shows this app's cursor or selection to the others (the bytes are the app's,
-at most 4 KiB less 8); `session.peers()` is theirs, dropped 10 s after they go quiet. Drawing them is the app's.
+at most 4 KiB less 16); `session.peers()` is theirs, dropped 10 s after they go quiet. Drawing them is the app's.
+Each presence also says the version of the Craft Cloud it runs on: `Peer::older()` (and `Status::older_peer`) is
+true for a machine on a Craft Cloud too old for this one's big changes; show "<machine> runs an older Craft Cloud;
+update it", with the machine's name from the app's own presence bytes.
+
+A Craft Cloud on this computer older than the kit's live documents (local API below 2) opens a file as
+`Open::NotLive(NotLive::AgentTooOld)`: open it as a plain file, and say to update Craft Cloud.
 
 ## Craft Cloud's piece of the window
 
@@ -268,11 +275,12 @@ the path); `watch.add_recent(path, saved)` puts a file on every machine's list.
 ## Testing the adapter
 
 With the `fake` feature, `craft_cloud_kit::testing::{Hub, Fake}` is an agent in the test's own process: machines of
-one account on a shared hub, with `set_online`, `restart` and `start`, `drop_connections`, and an old-agent mode;
-`set_fragment_faults` drops or holds back fragments on their way to a machine's apps (`Hub::tick` moves the held
-ones on), `drop_connections_after` stops the agent part of the way through an app's change, and
-`set_fragment_patience_for_tests` (and `craft_cloud_app::live::set_frame_limit_for_tests`) make sets that stop coming
-drop sooner, and changes of a few dozen KB go in fragments.
+one account on a shared hub, with `set_online`, `restart` and `start`, `drop_connections`, and an old-agent mode
+(`too_old`: before blobs and fragments). A fake machine joins a change's fragments before its apps get it, as the
+agent does; `set_fragment_faults` stops a machine's link from the hub inside such a change for a while (`sleep`:
+`SLEEP_TICKS` ticks, `delay`: a few; `Hub::tick` moves them on, `set_fragment_faults(None)` wakes it), and
+`drop_connections_after` stops the agent part of the way through an app's change.
+`craft_cloud_app::live::set_frame_limit_for_tests` makes changes of a few dozen KB go in fragments.
 Two sessions on two fakes test merges, undo and reconnects with no server; the demo's tests drive two windows that
 way with kittest.
 
@@ -284,9 +292,12 @@ way with kittest.
   stay alike). References other machines' repairs dropped meanwhile (a connector's end to a deleted shape) don't come
   back with the undo either. A soft delete (nodes moved to a hidden root, so undo moves them back) would keep them.
 
-- **Every machine's agent and app must know fragments and bundles.** An agent or app from before them refuses a
-  fragment or a bundle as an update that doesn't decode (it never imports part of a change), so a big change doesn't
-  reach it; the server stores and relays them as any update and needs no change.
+- **Every machine's agent must know fragments and bundles, and so must the server.** A server on live protocol 3
+  stores a change in fragments whole and never sends a fragment or a bundle to an agent from before them: it is
+  refused the document with "update Craft Cloud on this computer" (and the newer machines show "<machine> runs an
+  older Craft Cloud" from its presence). An agent never sends fragments to a server before protocol 3: a change that
+  needs them is refused while it is the server, and fragments made before wait on the machine until it is updated.
+  A new app on an older agent isn't live (`NotLive::AgentTooOld`).
 - **After a server's restore**, a machine that sends up history the log lost sends a big Loro change in pieces (Loro
   merges one peer's commits into one change, so its boundaries aren't an app's): an app open on a machine that also
   lacked that history may see part of a change from before the restore.

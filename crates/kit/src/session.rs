@@ -48,8 +48,9 @@ pub const PRESENCE_TTL: Duration = Duration::from_secs(10);
 const PRESENCE_MARK: [u8; 4] = *b"ccp2";
 /// The peer, the mark and the version before the app's bytes in a presence frame.
 const PRESENCE_HEADER: usize = 16;
-/// The largest change the kit sends (one update, in fragments past 1 MiB): a snapshot's limit. A change over it can't
-/// be live: the session stops (the model stays editable; save it to the file).
+/// The largest change the kit sends (one update, in fragments past 1 MiB): 8 MiB, half a document's log cap on the
+/// server, so the change after it still fits once the log is compacted. A change over it can't be live: the session
+/// stops (the model stays editable; save it to the file).
 pub const MAX_CHANGE_BYTES: usize = craft_cloud_api::fragments::MAX_WHOLE_BYTES;
 /// Undo steps kept.
 const UNDO_STEPS: usize = 500;
