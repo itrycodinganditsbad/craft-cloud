@@ -612,9 +612,9 @@ fn replace(temp: &Path, path: &Path) -> io::Result<()> {
 }
 
 /// Whether `e` is Windows refusing a file operation because another program holds the file (ERROR_ACCESS_DENIED or
-/// ERROR_SHARING_VIOLATION; [`retry_busy`] waits those out). Never elsewhere.
+/// ERROR_SHARING_VIOLATION; [`retry_busy`] waits those out), or a store saying so (`ResourceBusy`).
 pub(crate) fn is_busy(e: &io::Error) -> bool {
-    cfg!(windows) && e.raw_os_error().is_some_and(|code| BUSY.contains(&code))
+    (cfg!(windows) && e.raw_os_error().is_some_and(|code| BUSY.contains(&code))) || e.kind() == io::ErrorKind::ResourceBusy
 }
 
 /// ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION.

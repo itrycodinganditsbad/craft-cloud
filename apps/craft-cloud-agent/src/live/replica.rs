@@ -3759,6 +3759,58 @@ mod tests {
         assert!(matches!(typed.as_slice(), [ClientFrame::Update { .. }]), "{typed:?}");
     }
 
+    /// A write now and then that another program refuses loses nothing. A document whose file is held stays dirty
+    /// and is written at the next write. One whose journal is held is written, with the journal kept as it was. Either
+    /// way, a crash then (or after more changes) reads every acked change back, each once.
+    #[test]
+    fn a_write_another_program_refuses_is_made_later_and_loses_nothing() {
+        use crate::live::store::Held;
+        for held in [Held::Documents, Held::Journals] {
+            let store = MemStore::default();
+            let (space, node) = (SpaceId::generate(), NodeId::generate());
+            let (mut r, id, import) = joined(&store, space, node);
+            let name = id.to_string();
+            let edit = |peer: u64, s: &str| {
+                let d = text_doc(peer);
+                d.import(&import).unwrap();
+                insert(&d, 0, s)
+            };
+            r.local_update(id, &edit(50, "<a>")).unwrap();
+            let (file, journal) = (store.documents().get(&name).cloned(), store.journals().get(&name).cloned());
+            store.hold(Some(held));
+            r.flush_documents_now_and_then().unwrap();
+            r.flush().unwrap();
+            match held {
+                Held::Documents => {
+                    assert_eq!(store.documents().get(&name), file.as_ref(), "the held file isn't written");
+                    assert_eq!(store.journals().get(&name), journal.as_ref(), "nor its journal emptied");
+                }
+                Held::Journals => {
+                    assert_ne!(store.documents().get(&name), file.as_ref(), "the file is written");
+                    assert_eq!(store.journals().get(&name), journal.as_ref(), "the held journal is kept as it was");
+                }
+            }
+            r.local_update(id, &edit(51, "<b>")).unwrap();
+            // A crash with the files held.
+            drop(r);
+            let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+            r.open_document(node, &app());
+            let text = text_of(&r, id);
+            assert!(text.contains("<a>") && text.contains("<b>"), "{held:?}: an acked change is lost: {text:?}");
+            assert_eq!(r.document_status(id).map(|(_, waiting)| waiting), Some(2), "{held:?}: each change once");
+            // Released: the next write now and then writes it and empties the journal.
+            store.hold(None);
+            r.local_update(id, &edit(52, "<c>")).unwrap();
+            r.flush_documents_now_and_then().unwrap();
+            assert_eq!(store.journals().get(&name).map_or(0, Vec::len), 0, "{held:?}");
+            drop(r);
+            let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+            r.open_document(node, &app());
+            let text = text_of(&r, id);
+            assert!(["<a>", "<b>", "<c>"].iter().all(|s| text.contains(s)), "{held:?}: {text:?}");
+        }
+    }
+
     /// A journal is written into its document's file at the next write once it holds over [`MAX_JOURNAL_BYTES`], not
     /// before (the file is written now and then besides).
     #[test]

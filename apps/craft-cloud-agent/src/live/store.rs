@@ -312,6 +312,18 @@ pub struct MemStore {
     journals: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     /// How journal appends fail from now on ([`JournalFailure`] as a number; 0: they don't), for tests.
     failing: Arc<std::sync::atomic::AtomicU8>,
+    /// Which files another program holds, for the writes that don't wait ([`Held`] as a number; 0: none), for tests.
+    held: Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// Which of a [`MemStore`]'s files another program holds, for tests: the writes that don't wait for it are refused
+/// as busy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held {
+    /// Documents' files.
+    Documents,
+    /// Journals.
+    Journals,
 }
 
 /// How a [`MemStore`]'s journal appends fail, for tests.
@@ -340,6 +352,24 @@ impl MemStore {
             Some(JournalFailure::Unflushed) => 3,
         };
         self.failing.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Has another program hold `held` (or nothing), for tests.
+    pub fn hold(&self, held: Option<Held>) {
+        let n = match held {
+            None => 0,
+            Some(Held::Documents) => 1,
+            Some(Held::Journals) => 2,
+        };
+        self.held.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn holds(&self, held: Held) -> io::Result<()> {
+        let n = if held == Held::Documents { 1 } else { 2 };
+        if self.held.load(std::sync::atomic::Ordering::Relaxed) == n {
+            return Err(io::Error::new(io::ErrorKind::ResourceBusy, "another program holds the file (test)"));
+        }
+        Ok(())
     }
 
     /// The journals, by document (for tests that look inside).
@@ -398,6 +428,16 @@ impl DocStore for MemStore {
     fn save_document(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
         self.documents.lock().unwrap_or_else(PoisonError::into_inner).insert(name.to_owned(), bytes.to_vec());
         Ok(())
+    }
+
+    fn save_document_unless_busy(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        self.holds(Held::Documents)?;
+        self.save_document(name, bytes)
+    }
+
+    fn clear_journal_unless_busy(&mut self, name: &str) -> io::Result<()> {
+        self.holds(Held::Journals)?;
+        self.clear_journal(name)
     }
 
     fn append_journal(&mut self, name: &str, record: &[u8]) -> io::Result<()> {

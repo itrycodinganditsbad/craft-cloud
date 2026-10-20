@@ -62,6 +62,9 @@ fn scanner(data: Vec<std::path::PathBuf>, stop: Arc<std::sync::atomic::AtomicBoo
 /// Two agents, a file opened live on both, and [`KEYSTROKES`] keystrokes typed on the pc and timed to the laptop's
 /// app; with `scan`, a [`scanner`] holds the agents' files from just before the open on (Windows only).
 async fn time_keystrokes(scan: bool) -> Vec<Keystroke> {
+    // One latency test at a time: two at once (four agents, two servers) time each other on a CI runner's few cores.
+    static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one = ONE_AT_A_TIME.lock().await;
     let server = Server::delayed(Duration::from_millis(2)).await;
     let (pc, laptop) = (Agent::signed_in(&server, "pc").await, Agent::signed_in(&server, "laptop").await);
     let (run_pc, run_laptop) = (pc.run(), laptop.run());
@@ -116,6 +119,21 @@ async fn time_keystrokes(scan: bool) -> Vec<Keystroke> {
         .await;
     }
     let (p, l) = (pc_side.clone(), laptop_side.clone());
+    let data = [("pc", pc.data.path().to_owned()), ("laptop", laptop.data.path().to_owned())];
+    // More load on demand: `CRAFT_CLOUD_TEST_LOAD=8` adds eight threads that keep the CPUs busy while typing.
+    let burners: usize = std::env::var("CRAFT_CLOUD_TEST_LOAD").ok().and_then(|n| n.parse().ok()).unwrap_or(0);
+    let burning: Vec<_> = (0..burners)
+        .map(|_| {
+            let stop = stop_scanning.clone();
+            std::thread::spawn(move || {
+                let mut x = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    std::hint::black_box(x);
+                }
+            })
+        })
+        .collect();
     let typed = off(move || {
         let mut typed = Vec::new();
         let start = Instant::now();
@@ -135,6 +153,9 @@ async fn time_keystrokes(scan: bool) -> Vec<Keystroke> {
             };
             let want = i + 1;
             let (theirs, doc) = &*l.lock().unwrap();
+            // A keystroke that takes over 5 s is waited for up to a minute, and said: a late one fails the bounds with
+            // the report below, one that never comes is a lost update, reported with what each agent has on disk.
+            let mut late = false;
             let took = loop {
                 match doc.recv_timeout(Duration::from_secs(5)) {
                     Some(Event::Update(bytes)) => {
@@ -148,9 +169,24 @@ async fn time_keystrokes(scan: bool) -> Vec<Keystroke> {
                             events.push(format!("laptop {other:?}"));
                         }
                     }
-                    None => panic!("keystroke {i} never arrived"),
+                    None if at.elapsed() < Duration::from_secs(60) => {
+                        if !late {
+                            late = true;
+                            events.push(format!("not there after 5 s; on disk then: {}", on_disk(&data)));
+                        }
+                        let pc = p.lock().unwrap();
+                        events.extend(std::iter::from_fn(|| pc.1.try_recv()).filter(worth_saying).map(|e| format!("pc {e:?}")));
+                    }
+                    None => panic!(
+                        "keystroke {i} never arrived (a minute); the laptop has {:?}; on disk: {}; meanwhile: {events:?}",
+                        theirs.get_text("text").to_string(),
+                        on_disk(&data)
+                    ),
                 }
             };
+            if late {
+                events.push(format!("arrived late; on disk now: {}", on_disk(&data)));
+            }
             typed.push(Keystroke { sent: at - start, took, events });
             // A typist's pace: a keystroke batch every 30 ms.
             std::thread::sleep(Duration::from_millis(30));
@@ -159,6 +195,9 @@ async fn time_keystrokes(scan: bool) -> Vec<Keystroke> {
     })
     .await;
     stop_scanning.store(true, std::sync::atomic::Ordering::Relaxed);
+    for burner in burning {
+        burner.join().unwrap();
+    }
     #[cfg(windows)]
     if let Some(scanning) = scanning {
         scanning.join().unwrap();
@@ -169,6 +208,23 @@ async fn time_keystrokes(scan: bool) -> Vec<Keystroke> {
     run_pc.stop().await.0.unwrap();
     run_laptop.stop().await.0.unwrap();
     typed
+}
+
+/// Each agent's live document files (`<data>/live/<space>/`) and their sizes, for a report.
+fn on_disk(data: &[(&str, std::path::PathBuf)]) -> String {
+    let mut out = Vec::new();
+    for (who, dir) in data {
+        let mut files: Vec<String> = std::fs::read_dir(dir.join("live"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|space| std::fs::read_dir(space.path()).into_iter().flatten().flatten())
+            .map(|e| format!("{} {}", e.file_name().to_string_lossy(), e.metadata().map_or(0, |m| m.len())))
+            .collect();
+        files.sort();
+        out.push(format!("{who} [{}]", files.join(", ")));
+    }
+    out.join("; ")
 }
 
 /// Holds the keystrokes' times to the bounds below, showing each keystroke in order.
