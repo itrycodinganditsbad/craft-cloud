@@ -105,16 +105,21 @@ fn session(
     };
     let mirror = LoroDoc::new();
     mirror.import(document.state()).map_err(|e| usage(format!("the document's state doesn't read: {e}")))?;
+    // (An update this copy can't take is the other side's; the agent has it, and so will a fresh open. A bundle's
+    // slices go in one after the other.)
+    let import = |mirror: &LoroDoc, bytes: &[u8]| {
+        for part in craft_cloud_proto::fragments::parts(bytes).unwrap_or_default() {
+            let _ = mirror.import(part);
+        }
+    };
     for update in document.state_updates() {
-        // (An update this copy can't take is the other side's; the agent has it, and so will a fresh open.)
-        let _ = mirror.import(update);
+        import(&mirror, update);
     }
     let text = |mirror: &LoroDoc| mirror.get_text(TEXT).to_string();
     // What came right after the state (updates still waiting for their history), before anything else.
     let take = |mirror: &LoroDoc, event: &Event| {
         if let Event::Update(bytes) = event {
-            // (An update this copy can't take is the other side's; the agent has it, and so will a fresh open.)
-            let _ = mirror.import(bytes);
+            import(mirror, bytes);
         }
     };
     while let Some(event) = document.try_recv() {
@@ -148,7 +153,7 @@ fn session(
     loop {
         match document.recv_timeout(Duration::from_secs(1)) {
             Some(Event::Update(bytes)) => {
-                let _ = mirror.import(&bytes);
+                import(&mirror, &bytes);
                 say("--".into());
                 say(text(&mirror));
             }
@@ -159,6 +164,10 @@ fn session(
             }
             Some(Event::Closed(why)) => {
                 say(format!("the connection to the agent ended: {why}"));
+                return Ok(Exit::Failed);
+            }
+            Some(Event::Gap) => {
+                say("a change from another machine came only part of the way; run the command again to see the document".into());
                 return Ok(Exit::Failed);
             }
             Some(Event::Presence(_) | Event::Acked(_) | Event::Refused { .. } | Event::File(_)) | None => {}

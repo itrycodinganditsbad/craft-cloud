@@ -3,8 +3,10 @@
 //! turns the app's messages into [`DocsCall`]s for the hub and the hub's [`DocOut`]s into messages for the app.
 //!
 //! Everything from an app is hostile: a text message that isn't a request is answered `error`; a binary frame without
-//! a header or of a kind an app doesn't send ends the connection; an update over 1 MiB, presence over 4 KiB or an
-//! import over the snapshot limit is refused (and never reaches the hub). An app that doesn't take a message within 10
+//! a header or of a kind an app doesn't send ends the connection; an update frame over 1 MiB, presence over 4 KiB or an
+//! import over the snapshot limit is refused (and never reaches the hub). A change over 1 MiB comes in fragments
+//! (`craft-cloud-proto::fragments`): it reaches the hub only whole, under its last fragment's number; one the app
+//! stops sending part of the way never does. An app that doesn't take a message within 10
 //! s is dropped, and so is one whose queue at the hub fills up; its documents stay with the agent. An app that goes
 //! away mid-import leaves nothing behind: the import goes up only once it is whole. Signed out, every `open` is
 //! answered `not_live {not_signed_in}`.
@@ -12,13 +14,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::{IntoResponse, Response};
 use craft_cloud_proto::api::codes as api_codes;
+use craft_cloud_proto::fragments::{MAX_WHOLE_BYTES, PATIENCE, Reassembler, Taken, is_fragment};
 use craft_cloud_proto::live::{MAX_PRESENCE_BYTES, MAX_SNAPSHOT_BYTES, MAX_UPDATE_BYTES};
 use craft_cloud_proto::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, STATE, UPDATE, decode_binary, encode_binary};
 use craft_cloud_proto::local::{DocsEvent, DocsRequest, MAX_LOCAL_JSON_BYTES, NotLiveReason};
@@ -60,6 +63,10 @@ struct Link {
     from_hub: Option<mpsc::Receiver<DocOut>>,
     /// The app's updates so far, per document number (their `seq`).
     seqs: HashMap<u64, u64>,
+    /// The fragments of the app's changes still coming, per document number: a change goes to the hub only whole
+    /// (under its last fragment's number, which the app's answer names); one the app stops sending part of the way
+    /// (it went, or crashed) never does.
+    sets: HashMap<u64, Reassembler>,
 }
 
 impl Link {
@@ -79,7 +86,7 @@ impl Link {
 }
 
 async fn serve(mut socket: WebSocket, api: Arc<ApiState>) {
-    let mut link = Link { conn: NEXT_CONN.fetch_add(1, Ordering::Relaxed), hub: None, from_hub: None, seqs: HashMap::new() };
+    let mut link = Link { conn: NEXT_CONN.fetch_add(1, Ordering::Relaxed), hub: None, from_hub: None, seqs: HashMap::new(), sets: HashMap::new() };
     link.hub(&api).await;
     let end = loop {
         tokio::select! {
@@ -161,10 +168,26 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                 UPDATE => {
                     let seq = link.seqs.entry(id).or_insert(0);
                     *seq += 1;
+                    let seq = *seq;
                     if body.len() > MAX_UPDATE_BYTES {
-                        return Ok(send_json(socket, &refuse(Some(*seq), format!("an update is at most {MAX_UPDATE_BYTES} bytes"))).await);
+                        return Ok(send_json(socket, &refuse(Some(seq), format!("an update is at most {MAX_UPDATE_BYTES} bytes"))).await);
                     }
-                    DocsCall::Update { conn: link.conn, id, seq: *seq, bytes: body.to_vec() }
+                    if is_fragment(body) {
+                        let now = Instant::now();
+                        let sets = link.sets.entry(id).or_insert_with(|| Reassembler::new(2 * MAX_WHOLE_BYTES));
+                        // (A set the app stopped sending part of the way: dropped, never taken.)
+                        sets.expire(now, PATIENCE);
+                        match sets.take(body, now) {
+                            Taken::Whole(bytes) => DocsCall::Update { conn: link.conn, id, seq, bytes },
+                            Taken::Waiting => return Ok(true),
+                            Taken::Refused(why) => {
+                                let event = DocsEvent::Error { id: Some(id), seq: Some(seq), code: api_codes::INVALID.into(), message: why.into() };
+                                return Ok(send_json(socket, &event).await);
+                            }
+                        }
+                    } else {
+                        DocsCall::Update { conn: link.conn, id, seq, bytes: body.to_vec() }
+                    }
                 }
                 PRESENCE => {
                     if body.is_empty() || body.len() > MAX_PRESENCE_BYTES {

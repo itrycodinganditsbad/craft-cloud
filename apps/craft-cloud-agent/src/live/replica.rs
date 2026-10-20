@@ -77,6 +77,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use craft_cloud_proto::api::codes;
+use craft_cloud_proto::fragments::{MAX_WHOLE_BYTES, is_bundle, is_fragment, join, parse, split};
 use craft_cloud_proto::live::{
     AppName, ClientFrame, DocKind, LIVE_DOCUMENTS_PROTOCOL, LIVE_PROTOCOL_MAX, LIVE_PROTOCOL_MIN, MAX_SNAPSHOT_BYTES, MAX_SUBSCRIPTIONS,
     MAX_UPDATE_BYTES, PROTOCOL_MISMATCH, ServerFrame, node_doc, recents_doc, update_hash,
@@ -120,6 +121,15 @@ const DOCUMENT_FILE_FORMAT: u32 = 1;
 const MAX_JOURNAL_BYTES: usize = 4 * 1024 * 1024;
 /// A catch-up's updates are taken a batch at a time, at most this many bytes of them at once.
 const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+/// Most bytes of rows of a document's log that are fragments of changes not whole yet, kept until they are.
+pub const MAX_FRAGMENT_BYTES: usize = 2 * MAX_WHOLE_BYTES;
+/// Ticks of [`Replica::resend`] (about 2 s each in the agent) without a new fragment after which the fragments of a
+/// change that never came whole are dropped, never applied (about a week of the agent running: its sender's agent
+/// sends every fragment it has again until the server has it, so only one that lost its own can leave one half-way).
+pub const FRAGMENT_PATIENCE_TICKS: u32 = 300_000;
+/// The most operations a copy may be past the version a compaction asks for and still make its snapshot (Loro checks
+/// the document out there, in time growing with the square of the text it takes back).
+const MAX_CHECKOUT_OPS: i64 = 64 * 1024;
 
 /// Every update of the log up to `upto` is in the document's file; `upto_hash` is the hash of the update at `upto`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +221,50 @@ struct DocumentFile {
     dropped: Option<u64>,
 }
 
+/// What a document of a file's file holds beyond [`DocumentFile`], written after it when there is any (an older agent
+/// reads the file and ignores what follows).
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct DocumentFileMore {
+    /// [`Doc::fragments`].
+    fragments: Vec<(u64, Vec<u8>)>,
+}
+
+/// A document of a file's file: [`DocumentFile`], and [`DocumentFileMore`] when it has it.
+fn read_document_file(bytes: &[u8]) -> postcard::Result<(DocumentFile, DocumentFileMore)> {
+    let (file, rest) = postcard::take_from_bytes::<DocumentFile>(bytes)?;
+    let more = if rest.is_empty() { DocumentFileMore::default() } else { postcard::from_bytes(rest).unwrap_or_default() };
+    Ok((file, more))
+}
+
+/// The updates `pending` (this machine's unacked updates, in order) make whole: one as it is, a change in fragments
+/// once (at its first fragment's place), and none of a change whose fragments aren't all there.
+fn wholes(pending: &[Pending]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut done = BTreeSet::new();
+    for (i, p) in pending.iter().enumerate() {
+        let Some(f) = parse(&p.bytes) else {
+            out.push(p.bytes.clone());
+            continue;
+        };
+        if done.contains(&f.set) {
+            continue;
+        }
+        let parts: Vec<&[u8]> =
+            pending.iter().skip(i).filter(|q| parse(&q.bytes).is_some_and(|g| g.set == f.set)).map(|q| q.bytes.as_slice()).collect();
+        if let Some(whole) = join(parts) {
+            done.insert(f.set);
+            out.push(whole);
+        }
+    }
+    out
+}
+
+/// Imports `bytes` into `body`, an update of any size up to a whole change's (the frame limit is checked where an
+/// update comes in, a whole change's when its fragments are joined).
+fn import_whole(body: &Body, bytes: &[u8]) -> Result<Imported, UpdateError> {
+    if bytes.len() > MAX_UPDATE_BYTES { body.import_any_size(bytes) } else { body.import(bytes) }
+}
+
 /// What a file of either kind holds, as [`Doc::from_parts`] reads it.
 struct Parts {
     id: DocId,
@@ -225,6 +279,7 @@ struct Parts {
     own_peers: Vec<u64>,
     push_wait: Option<u32>,
     dropped: Option<u64>,
+    fragments: Vec<(u64, Vec<u8>)>,
 }
 
 /// One record of a document's journal: a local update, on disk before the app is told it is kept.
@@ -547,6 +602,24 @@ struct Doc {
     deferred_head: Option<u64>,
     /// Snapshots to upload before the frames that name them go ([`Replica::take_uploads`]).
     uploads: Vec<Upload>,
+    /// The rows of the log (taken from the server, or this machine's own acked) that are fragments of a change not
+    /// whole yet: its number and bytes. They count as had; the change goes into the copy (and to the apps) once every
+    /// fragment of it is here, never before. Kept in its file. No snapshot is made for the server while any is here.
+    fragments: Vec<(u64, Vec<u8>)>,
+    /// Ticks since the last fragment came, while some are here ([`FRAGMENT_PATIENCE_TICKS`]).
+    fragment_ticks: u32,
+    /// The change the row just taken made whole, for the apps ([`Doc::take`]).
+    joined_now: Option<Vec<u8>>,
+}
+
+/// What a row that is a fragment did ([`Doc::take_fragment`]).
+enum Fragmented {
+    /// Kept: more of its change is to come.
+    Waiting,
+    /// It was the last: the change whole, and the row its first fragment took.
+    Whole { first: u64, update: Vec<u8> },
+    /// It doesn't read, or its change's fragments don't make the change they name: never applied.
+    Broken,
 }
 
 impl Doc {
@@ -617,7 +690,57 @@ impl Doc {
             fetching: None,
             deferred_head: None,
             uploads: Vec::new(),
+            fragments: Vec::new(),
+            fragment_ticks: 0,
+            joined_now: None,
         }
+    }
+
+    /// Row `seq` of the log is a fragment: kept until its change is whole (rows taken again are kept once).
+    fn take_fragment(&mut self, seq: u64, bytes: &[u8]) -> Fragmented {
+        let Some(f) = parse(bytes) else { return Fragmented::Broken };
+        if !self.fragments.iter().any(|(s, _)| *s == seq) {
+            self.fragments.push((seq, bytes.to_vec()));
+            self.dirty = true;
+        }
+        self.fragment_ticks = 0;
+        let of_set = |b: &[u8]| parse(b).is_some_and(|g| g.set == f.set);
+        let indexes: BTreeSet<u16> = self.fragments.iter().filter(|(_, b)| of_set(b)).filter_map(|(_, b)| parse(b).map(|g| g.index)).collect();
+        if indexes.len() < usize::from(f.count) {
+            return Fragmented::Waiting;
+        }
+        let first = self.fragments.iter().filter(|(_, b)| of_set(b)).map(|(s, _)| *s).min().unwrap_or(seq);
+        let whole = join(self.fragments.iter().filter(|(_, b)| of_set(b)).map(|(_, b)| b.as_slice()));
+        self.fragments.retain(|(_, b)| !of_set(b));
+        match whole {
+            Some(update) => Fragmented::Whole { first, update },
+            None => Fragmented::Broken,
+        }
+    }
+
+    /// Row `seq` of the log is this machine's own update `bytes` (acked, or taken back): the server holds its
+    /// operations. An own change in fragments is in the log from its last fragment's row on (it is in the copy
+    /// already).
+    fn note_own_row(&mut self, seq: u64, bytes: &[u8]) {
+        let ranges = if self.kind.is_document() && is_fragment(bytes) {
+            match self.take_fragment(seq, bytes) {
+                Fragmented::Whole { first, update } => {
+                    self.log.note_set(first, seq);
+                    self.on_server(&update);
+                    spans_of(&update).unwrap_or_default()
+                }
+                Fragmented::Waiting | Fragmented::Broken => Vec::new(),
+            }
+        } else {
+            spans_of(bytes).unwrap_or_default()
+        };
+        self.saw(&ranges);
+        self.log.note(seq, ranges);
+    }
+
+    /// The bytes of rows kept as fragments.
+    fn fragment_bytes(&self) -> usize {
+        self.fragments.iter().map(|(_, b)| b.len()).sum()
     }
 
     /// The app this document belongs to.
@@ -639,7 +762,7 @@ impl Doc {
     /// which; nothing waits; no push under way; no row dropped). Unknown otherwise, until those are gone.
     fn derive_log(&mut self) {
         self.log = LogVersion::unknown();
-        if !self.waiting.is_empty() || self.pushing.is_some() || !self.pending.is_empty() || self.dropped.is_some() {
+        if !self.waiting.is_empty() || self.pushing.is_some() || !self.pending.is_empty() || self.dropped.is_some() || !self.fragments.is_empty() {
             return;
         }
         let Ok(mut version) = self.body.copy().version() else { return };
@@ -719,8 +842,10 @@ impl Doc {
             return Vec::new();
         }
         self.compact_ask = None;
-        // (A push under way doesn't stop it: the log was learnt from the start then, and is noted from there.)
-        if !self.waiting.is_empty() || self.stuck || !self.joined || self.is_broken() {
+        // (A push under way doesn't stop it: the log was learnt from the start then, and is noted from there.) Nor is
+        // one made while a change's fragments are coming: the snapshot would lack the change, and the log would lose
+        // its first fragments.
+        if !self.waiting.is_empty() || self.stuck || !self.joined || self.is_broken() || !self.fragments.is_empty() {
             return Vec::new();
         }
         // A row it dropped is below: its copy lacks that row, and a snapshot from it would too.
@@ -731,6 +856,14 @@ impl Doc {
             self.derive_log();
         }
         let Some(version) = self.log.at(upto) else { return Vec::new() };
+        // Not from a copy far past that version: a snapshot of an earlier one makes Loro check the document out there,
+        // which for a big paste since (an own change not in the log yet) takes time growing with the square of its
+        // text, tens of seconds on the hub's thread. Another device answers, or the next ask finds this one there.
+        let Ok(now) = self.body.copy().version() else { return Vec::new() };
+        let past: i64 = now.iter().map(|(peer, end)| i64::from(*end) - i64::from(version.get(peer).copied().unwrap_or(0))).filter(|n| *n > 0).sum();
+        if past > MAX_CHECKOUT_OPS {
+            return Vec::new();
+        }
         match self.body.copy().snapshot_at(&version) {
             Ok(bytes) if !bytes.is_empty() && bytes.len() <= MAX_SNAPSHOT_BYTES => {
                 // Uploaded first (through the chunk API), then named.
@@ -768,6 +901,7 @@ impl Doc {
             pushing: file.pushing,
             own_peers: file.own_peers,
             push_wait: file.push_wait,
+            fragments: Vec::new(),
         };
         Self::from_parts(parts, peer, notes)
     }
@@ -775,16 +909,18 @@ impl Doc {
     /// [`Doc::from_file`], for a file of either kind.
     fn from_parts(mut file: Parts, peer: u64, notes: &mut Vec<String>) -> Result<Self, UpdateError> {
         let (mut bad_pending, mut bad_waiting) = (BTreeSet::new(), BTreeSet::new());
+        // (Unacked changes in fragments go in whole.)
+        let own = wholes(&file.pending);
         let body = 'load: loop {
             let body = Body::load(&file.kind, &file.snapshot, peer)?;
-            for (i, pending) in file.pending.iter().enumerate() {
-                if !bad_pending.contains(&i) && body.import_any_size(&pending.bytes) == Err(UpdateError::Panicked) {
+            for (i, pending) in own.iter().enumerate() {
+                if !bad_pending.contains(&i) && body.import_any_size(pending) == Err(UpdateError::Panicked) {
                     bad_pending.insert(i);
                     continue 'load;
                 }
             }
             for (i, waiting) in file.waiting.iter().enumerate() {
-                if !bad_waiting.contains(&i) && body.import(&waiting.bytes) == Err(UpdateError::Panicked) {
+                if !bad_waiting.contains(&i) && import_whole(&body, &waiting.bytes) == Err(UpdateError::Panicked) {
                     bad_waiting.insert(i);
                     continue 'load;
                 }
@@ -818,6 +954,7 @@ impl Doc {
         }
         doc.push_wait = file.push_wait;
         doc.dropped = file.dropped;
+        doc.fragments = file.fragments;
         doc.on_disk = true;
         doc.derive_log();
         Ok(doc)
@@ -827,8 +964,8 @@ impl Doc {
     /// unacked updates, which are kept and sent; it catches up from the start, so nothing the server has is missed.
     fn from_pending(id: DocId, kind: Kind, pending: Vec<Pending>, next_client_seq: u64, peer: u64) -> Self {
         let body = Body::new(&kind, peer);
-        for p in &pending {
-            let _ = body.import_any_size(&p.bytes);
+        for update in wholes(&pending) {
+            let _ = body.import_any_size(&update);
         }
         let pending = pending.into_iter().map(|p| Pending { acked: None, push: false, ..p }).collect();
         let mut doc = Self::with(id, kind, body, Have::default(), pending, Vec::new(), next_client_seq.max(1), None, None);
@@ -852,13 +989,59 @@ impl Doc {
         if self.skip == Some((seq, hash)) {
             self.skip = None;
             self.drop_row(seq);
+            // A fragment Loro failed on (its change whole): the rest of that change goes too.
+            if let Some(f) = parse(bytes) {
+                self.fragments.retain(|(_, b)| parse(b).is_none_or(|g| g.set != f.set));
+            }
             self.log.note(seq, Vec::new());
             self.advance(seq, hash);
             return Taken::Had;
         }
+        // A fragment of a change (a document's): kept, and counted as had, until the change is whole; only then does
+        // the change go into the copy, and to the apps.
+        let joined;
+        let bytes: &[u8] = if self.kind.is_document() && is_fragment(bytes) {
+            match self.take_fragment(seq, bytes) {
+                Fragmented::Waiting => {
+                    if self.fragment_bytes() > MAX_FRAGMENT_BYTES {
+                        self.fragments.retain(|(s, _)| *s != seq);
+                        self.stuck = true;
+                        let line = format!(
+                            "more than {} MiB of fragments of changes of the live document {} wait for the rest; this machine takes no more of them until it connects again",
+                            MAX_FRAGMENT_BYTES >> 20,
+                            self.id
+                        );
+                        self.say(notes, line);
+                        return Taken::Stuck;
+                    }
+                    self.log.note(seq, Vec::new());
+                    self.advance(seq, hash);
+                    return Taken::Had;
+                }
+                Fragmented::Broken => {
+                    let line = format!(
+                        "a change of the live document {} came in fragments that don't make it; it was skipped, and this machine leaves compacting it to other devices",
+                        self.id
+                    );
+                    self.say(notes, line);
+                    self.drop_row(seq);
+                    self.log.note(seq, Vec::new());
+                    self.advance(seq, hash);
+                    return Taken::Had;
+                }
+                Fragmented::Whole { first, update } => {
+                    self.log.note_set(first, seq);
+                    joined = update;
+                    self.joined_now = Some(joined.clone());
+                    &joined
+                }
+            }
+        } else {
+            bytes
+        };
         let had_history = self.body.copy().has_history();
         let mut in_log = true;
-        match self.body.import(bytes) {
+        match import_whole(&self.body, bytes) {
             Ok(Imported::Applied { changed: list }) => {
                 *changed |= list;
                 if !had_history && self.rewait(changed).is_err() {
@@ -934,7 +1117,7 @@ impl Doc {
     /// one Loro failed on (in [`Doc::waiting_failed`]).
     fn rewait(&mut self, changed: &mut bool) -> Result<(), ()> {
         for waiting in &self.waiting {
-            match self.body.import(&waiting.bytes) {
+            match import_whole(&self.body, &waiting.bytes) {
                 Ok(Imported::Applied { changed: list } | Imported::Waiting { changed: list, .. }) => *changed |= list,
                 Err(UpdateError::Panicked) => {
                     self.waiting_failed = Some(waiting.hash);
@@ -979,9 +1162,7 @@ impl Doc {
                 break;
             };
             self.have = Have { upto: next, upto_hash: Some(update_hash(&bytes)) };
-            let ranges = spans_of(&bytes).unwrap_or_default();
-            self.saw(&ranges);
-            self.log.note(next, ranges);
+            self.note_own_row(next, &bytes);
         }
         // Own updates the catch-up brought back count as had too.
         let upto = self.have.upto;
@@ -1062,9 +1243,12 @@ impl Doc {
         };
         match part {
             Ok(Some(bytes)) => {
-                let client_seq = self.next_client_seq;
-                self.next_client_seq = client_seq.saturating_add(1);
-                self.pending.push(Pending { client_seq, bytes, acked: None, push: true });
+                let frames = split(&bytes, MAX_UPDATE_BYTES >> self.strikes).unwrap_or_else(|_| vec![bytes]);
+                for bytes in frames {
+                    let client_seq = self.next_client_seq;
+                    self.next_client_seq = client_seq.saturating_add(1);
+                    self.pending.push(Pending { client_seq, bytes, acked: None, push: true });
+                }
                 self.dirty = true;
                 send_pending(id, self)
             }
@@ -1106,13 +1290,15 @@ impl Doc {
         self.pushing = Some(Spans::new());
         self.push_wait = None;
         self.waiting.clear();
+        // (The catch-up brings every row again, fragments too.)
+        self.fragments.clear();
         self.stuck = false;
         if let Ok(snapshot) = self.body.copy().snapshot()
             && let Ok(fresh) = Body::load(&self.kind, &snapshot, self.body.copy().peer())
         {
             self.body = fresh;
-            for pending in &self.pending {
-                let _ = self.body.import_any_size(&pending.bytes);
+            for update in wholes(&self.pending) {
+                let _ = self.body.import_any_size(&update);
             }
         }
         self.forget_acks();
@@ -1211,6 +1397,7 @@ impl Doc {
         self.have = Have::default();
         self.log = LogVersion::anchored(0, Version::new());
         self.forget_seen();
+        self.fragments.clear();
         self.compact_ask = None;
         self.dirty = true;
         self.urgent = true;
@@ -1387,6 +1574,7 @@ impl<S: DocStore> Replica<S> {
                     && d.open == 0
                     && d.pending.is_empty()
                     && d.waiting.is_empty()
+                    && d.fragments.is_empty()
                     && d.pushing.is_none()
                     && !d.is_broken()
                     && d.batch.is_empty()
@@ -1784,7 +1972,8 @@ impl<S: DocStore> Replica<S> {
     pub fn document_state(&self, id: DocId) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
         let doc = self.docs.get(&id).filter(|d| d.joined && d.kind.is_document())?;
         let snapshot = doc.body.copy().snapshot().ok()?;
-        let after = doc.waiting.iter().map(|w| w.bytes.clone()).chain(doc.pending.iter().map(|p| p.bytes.clone())).collect();
+        // (Whole: an unacked change in fragments goes as the change.)
+        let after = doc.waiting.iter().map(|w| w.bytes.clone()).chain(wholes(&doc.pending)).collect();
         Some((snapshot, after))
     }
 
@@ -1863,8 +2052,10 @@ impl<S: DocStore> Replica<S> {
             // (After a disk error the copy may be being read back: for now, worth sending again.)
             return Err(LocalError::Io(std::io::Error::other("the document isn't open here (being read back from disk?)")));
         };
-        if bytes.is_empty() || bytes.len() > MAX_UPDATE_BYTES {
-            return Err(LocalError::Invalid(format!("an update is 1 to {MAX_UPDATE_BYTES} bytes")));
+        // (An update over the frame limit came from the app in fragments, joined by its connection: it goes into the
+        // journal whole, and up to the server as fragments again.)
+        if bytes.is_empty() || bytes.len() > MAX_WHOLE_BYTES {
+            return Err(LocalError::Invalid(format!("an update is 1 to {MAX_WHOLE_BYTES} bytes")));
         }
         // Its journal needs its file beside it (a journal alone isn't loaded): a document joined since it was last
         // written is written first (as it is, before this update). So is one whose journal failed: written whole, its
@@ -1874,7 +2065,9 @@ impl<S: DocStore> Replica<S> {
             save(&mut self.store, space, id, doc)?;
             doc.journal_failed = false;
         }
-        match doc.body.import(bytes) {
+        // Fragments of it: what goes up (each an update of the log), and its numbers.
+        let frames = split(bytes, MAX_UPDATE_BYTES).map_err(|e| LocalError::Invalid(e.to_string()))?;
+        match import_whole(&doc.body, bytes) {
             Ok(_) => {}
             Err(UpdateError::Panicked) => {
                 self.reload(id);
@@ -1905,18 +2098,25 @@ impl<S: DocStore> Replica<S> {
                 return Err(e.into());
             }
         }
-        doc.next_client_seq = client_seq.saturating_add(1);
-        doc.pending.push(Pending { client_seq, bytes: bytes.to_vec(), acked: None, push: false });
+        // (The journal's record is the whole update under its first number; its fragments take the numbers after.)
+        let seqs = client_seq..client_seq.saturating_add(frames.len() as u64);
+        doc.next_client_seq = seqs.end;
+        for (seq, frame) in seqs.clone().zip(&frames) {
+            doc.pending.push(Pending { client_seq: seq, bytes: frame.clone(), acked: None, push: false });
+        }
         doc.own(bytes);
         doc.dirty = true;
         let (up, epoch) = (self.link == Link::Up, self.epoch);
         Ok(match doc.sub {
             // (During a push too: an app's change goes at once, not behind the push's parts. Its operations count as
             // in the log for the push once it is acked.)
-            Sub::Live if doc.full.is_none() => {
-                doc.sent.insert(client_seq);
-                vec![ClientFrame::Update { doc: id, client_seq, bytes: bytes.to_vec() }]
-            }
+            Sub::Live if doc.full.is_none() => seqs
+                .zip(frames)
+                .map(|(client_seq, bytes)| {
+                    doc.sent.insert(client_seq);
+                    ClientFrame::Update { doc: id, client_seq, bytes }
+                })
+                .collect(),
             Sub::No if up && self.protocol >= LIVE_DOCUMENTS_PROTOCOL && doc.retry.is_none() => {
                 doc.parked = false;
                 subscribe(id, doc, epoch)
@@ -1960,7 +2160,9 @@ impl<S: DocStore> Replica<S> {
         let mut idle: Vec<(u64, DocId)> = self
             .docs
             .iter()
-            .filter(|(_, d)| d.kind.is_document() && d.joined && !d.parked && d.open == 0 && d.pending.is_empty() && d.pushing.is_none())
+            .filter(|(_, d)| {
+                d.kind.is_document() && d.joined && !d.parked && d.open == 0 && d.pending.is_empty() && d.pushing.is_none() && d.fragments.is_empty()
+            })
             .map(|(id, d)| (d.last_used, *id))
             .collect();
         idle.sort_unstable();
@@ -2158,6 +2360,20 @@ impl<S: DocStore> Replica<S> {
         let (up, epoch) = (self.link == Link::Up, self.epoch);
         let mut frames = Vec::new();
         for (id, doc) in &mut self.docs {
+            // The fragments of a change that stopped coming for good: dropped, never applied.
+            if !doc.fragments.is_empty() && doc.sub == Sub::Live {
+                doc.fragment_ticks = doc.fragment_ticks.saturating_add(1);
+                if doc.fragment_ticks > FRAGMENT_PATIENCE_TICKS {
+                    let line = format!(
+                        "a change of the live document {id} came part of the way and the rest never came; what came of it was dropped, never applied"
+                    );
+                    doc.say(&mut self.notes, line);
+                    doc.fragments.clear();
+                    doc.fragment_ticks = 0;
+                    doc.dirty = true;
+                    doc.urgent = true;
+                }
+            }
             match doc.sub {
                 Sub::Live => {
                     match doc.full {
@@ -2351,8 +2567,13 @@ impl<S: DocStore> Replica<S> {
             // (Each row's own import says what it brought.)
             false
         } else {
-            let updates: Vec<Vec<u8>> =
-                batch.iter().filter(|(seq, bytes)| doc.skip != Some((*seq, update_hash(bytes)))).map(|(_, bytes)| bytes.clone()).collect();
+            // (Fragments are taken row by row: their change goes in once it is whole. So are bundles: their slices go
+            // in one after the other, which Loro's batch import can't do.)
+            let updates: Vec<Vec<u8>> = batch
+                .iter()
+                .filter(|(seq, bytes)| doc.skip != Some((*seq, update_hash(bytes))) && !is_fragment(bytes) && !is_bundle(bytes))
+                .map(|(_, bytes)| bytes.clone())
+                .collect();
             match doc.body.copy().import_batch(&updates) {
                 Ok(new) => new,
                 Err(UpdateError::Panicked) => return self.take_one_by_one(id),
@@ -2365,7 +2586,7 @@ impl<S: DocStore> Replica<S> {
             self.changed.insert(app.clone());
         }
         for (seq, bytes) in batch {
-            if new && kind.is_document() {
+            if new && kind.is_document() && !is_fragment(&bytes) && !is_bundle(&bytes) {
                 self.events.push(DocEvent::Remote(id, bytes.clone()));
             }
             frames.extend(self.on_update(id, seq, bytes));
@@ -2403,6 +2624,8 @@ impl<S: DocStore> Replica<S> {
         }
         let mut changed = false;
         let taken = doc.take(seq, &bytes, &mut self.notes, &mut changed);
+        // (A row that made a change in fragments whole: the apps get the change, never a fragment.)
+        let joined = doc.joined_now.take();
         let kind = doc.kind.clone();
         let mut frames = if matches!(taken, Taken::Had) { doc.try_compact() } else { Vec::new() };
         if changed {
@@ -2410,7 +2633,7 @@ impl<S: DocStore> Replica<S> {
                 Kind::Recents(app) => {
                     self.changed.insert(app.clone());
                 }
-                Kind::Document { .. } => self.events.push(DocEvent::Remote(id, bytes.clone())),
+                Kind::Document { .. } => self.events.push(DocEvent::Remote(id, joined.unwrap_or_else(|| bytes.clone()))),
             }
         }
         frames.extend(match taken {
@@ -2478,9 +2701,7 @@ impl<S: DocStore> Replica<S> {
             // row holds them, and counts as had like any ack (or waits for the rows below it, as any ack does).
             let Some(bytes) = doc.taken_back.remove(&client_seq) else { return Vec::new() };
             if seq == doc.have.upto.saturating_add(1) {
-                let ranges = spans_of(&bytes).unwrap_or_default();
-                doc.saw(&ranges);
-                doc.log.note(seq, ranges);
+                doc.note_own_row(seq, &bytes);
                 doc.advance(seq, update_hash(&bytes));
             } else if seq > doc.have.upto {
                 doc.back_acked.insert(seq, bytes);
@@ -2502,9 +2723,7 @@ impl<S: DocStore> Replica<S> {
         } else if seq == doc.have.upto.saturating_add(1) {
             let own = doc.pending.remove(i);
             doc.sent.remove(&client_seq);
-            let ranges = spans_of(&own.bytes).unwrap_or_default();
-            doc.saw(&ranges);
-            doc.log.note(seq, ranges);
+            doc.note_own_row(seq, &own.bytes);
             doc.advance(seq, update_hash(&own.bytes));
         } else if let Some(pending) = doc.pending.get_mut(i) {
             // Others' updates below it are on their way: counted once they are here. (A push part counts as
@@ -2688,9 +2907,19 @@ impl<S: DocStore> Replica<S> {
                     doc.say(&mut self.notes, line);
                     return Ok(Vec::new());
                 }
-                // Its operations go up in the parts of a push (of the whole document, if no push is under way).
-                doc.pending.retain(|p| p.client_seq != client_seq);
-                doc.sent.remove(&client_seq);
+                // Its operations go up in the parts of a push (of the whole document, if no push is under way). A
+                // fragment takes the rest of its change with it: the push sends the change whole again.
+                let set = doc.pending.iter().find(|p| p.client_seq == client_seq).and_then(|p| parse(&p.bytes)).map(|f| f.set);
+                let gone: Vec<u64> = doc
+                    .pending
+                    .iter()
+                    .filter(|p| p.client_seq == client_seq || set.is_some_and(|s| parse(&p.bytes).is_some_and(|f| f.set == s)))
+                    .map(|p| p.client_seq)
+                    .collect();
+                doc.pending.retain(|p| !gone.contains(&p.client_seq));
+                for seq in gone {
+                    doc.sent.remove(&seq);
+                }
                 doc.pushing.get_or_insert_with(Spans::new);
                 doc.dirty = true;
                 Ok(doc.push_next(id, &mut self.notes, &mut self.peers))
@@ -2823,9 +3052,9 @@ impl<S: DocStore> Replica<S> {
 /// the file or its journal), nothing waiting and no push under way. A file that doesn't read is loaded (and so set
 /// aside) as before.
 fn idle_on_disk<S: DocStore>(store: &S, space: SpaceId, name: &str, bytes: &[u8]) -> Option<DocId> {
-    let file = postcard::from_bytes::<DocumentFile>(bytes).ok()?;
+    let (file, more) = read_document_file(bytes).ok()?;
     let ours = file.format <= DOCUMENT_FILE_FORMAT && file.space == space && file.doc == node_doc(space, file.node) && file.doc.to_string() == name;
-    let idle = file.pending.is_empty() && file.waiting.is_empty() && file.pushing.is_none();
+    let idle = file.pending.is_empty() && file.waiting.is_empty() && file.pushing.is_none() && more.fragments.is_empty();
     let journal = store.load_journal(name).ok()?;
     (ours && idle && journal_records(&journal).0.is_empty()).then_some(file.doc)
 }
@@ -2906,8 +3135,8 @@ fn load_document<S: DocStore>(
         Ok(to) => (format!("a copy set aside as {to}"), true),
         Err(e) => (format!("no copy set aside ({e})"), false),
     };
-    match postcard::from_bytes::<DocumentFile>(bytes) {
-        Ok(mut file) if file.format <= DOCUMENT_FILE_FORMAT && file.space == space && file.doc == node_doc(space, file.node) => {
+    match read_document_file(bytes) {
+        Ok((mut file, more)) if file.format <= DOCUMENT_FILE_FORMAT && file.space == space && file.doc == node_doc(space, file.node) => {
             if let Some(hash) = drop {
                 file.waiting.retain(|w| w.hash != hash);
             }
@@ -2925,8 +3154,12 @@ fn load_document<S: DocStore>(
             }
             for record in records {
                 if record.client_seq >= next {
-                    next = record.client_seq.saturating_add(1);
-                    pending.push(Pending { client_seq: record.client_seq, bytes: record.bytes, acked: None, push: false });
+                    // A change over the frame limit is in the journal whole, under the first of its fragments' numbers.
+                    let frames = split(&record.bytes, MAX_UPDATE_BYTES).unwrap_or_else(|_| vec![record.bytes.clone()]);
+                    for (k, bytes) in (0u64..).zip(frames) {
+                        pending.push(Pending { client_seq: record.client_seq.saturating_add(k), bytes, acked: None, push: false });
+                        next = record.client_seq.saturating_add(k + 1);
+                    }
                     journalled += 1;
                 }
             }
@@ -2943,6 +3176,7 @@ fn load_document<S: DocStore>(
                 own_peers: file.own_peers,
                 push_wait: file.push_wait,
                 dropped: file.dropped,
+                fragments: more.fragments,
             };
             match Doc::from_parts(parts, peer, notes) {
                 Ok(mut doc) => {
@@ -3112,7 +3346,11 @@ fn save_as<S: DocStore>(store: &mut S, space: SpaceId, id: DocId, doc: &mut Doc,
                 log_only: doc.log_only,
                 dropped: doc.dropped,
             };
-            let bytes = postcard::to_stdvec(&file).map_err(std::io::Error::other)?;
+            let mut bytes = postcard::to_stdvec(&file).map_err(std::io::Error::other)?;
+            // (Nothing more to say without fragments: the file is as an older agent writes it.)
+            if !doc.fragments.is_empty() {
+                bytes.extend(postcard::to_stdvec(&DocumentFileMore { fragments: doc.fragments.clone() }).map_err(std::io::Error::other)?);
+            }
             let name = id.to_string();
             match patience {
                 Patience::Wait => store.save_document(&name, &bytes)?,
@@ -4485,6 +4723,23 @@ mod tests {
         d.export(loro::ExportMode::updates(&vv)).unwrap()
     }
 
+    /// `s` inserted at the start, as an app's kit sends a big change: its slices in a bundle.
+    fn sliced(d: &loro::LoroDoc, s: &str) -> Vec<u8> {
+        let peer = d.peer_id();
+        let start = d.oplog_vv().get(&peer).copied().unwrap_or(0);
+        d.get_text("text").insert(0, s).unwrap();
+        d.commit();
+        let end = d.oplog_vv().get(&peer).copied().unwrap_or(0);
+        let mut slices = Vec::new();
+        let mut at = start;
+        while at < end {
+            let to = (at + craft_cloud_proto::fragments::SLICE_OPS).min(end);
+            slices.push(d.export(loro::ExportMode::updates_in_range(vec![loro::IdSpan::new(peer, at, to)])).unwrap());
+            at = to;
+        }
+        craft_cloud_proto::fragments::bundle(&slices)
+    }
+
     /// An own update the server stored (its ack lost), whose operations the server's snapshot holds on the next
     /// catch-up: it is stored (not sent again, nothing waits), and a compaction after a restart has it, though another
     /// machine's later rows don't build on it.
@@ -4651,5 +4906,124 @@ mod tests {
         let other = Recents::new(77);
         let u4 = other.add([5; 16], &entry("c.docx", 4)).unwrap();
         assert!(r.on_frame(ServerFrame::Update { doc, seq: 4, bytes: u4, device: device() }).unwrap().is_empty(), "no gap at 3");
+    }
+
+    /// A change in fragments from the server goes into the copy, and to the apps, only once it is whole: its first
+    /// fragments count as had and stay in the file across a restart (the catch-up goes on after them), and no
+    /// snapshot is made for the server while it comes, nor at a number between its first fragment and its last.
+    #[test]
+    fn a_change_in_fragments_goes_in_only_whole_even_across_a_restart() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let (mut r, id, import) = joined(&store, space, node);
+        r.take_events();
+        let other = text_doc(41);
+        other.import(&import).unwrap();
+        let small = insert(&other, 0, "s ");
+        let big = sliced(&other, &"b".repeat(2 * MAX_UPDATE_BYTES));
+        let frames = split(&big, MAX_UPDATE_BYTES).unwrap();
+        assert_eq!(frames.len(), 3);
+        let row = |seq: u64, bytes: &[u8]| ServerFrame::Update { doc: id, seq, bytes: bytes.to_vec(), device: device() };
+        r.on_frame(row(1, &small)).unwrap();
+        r.on_frame(row(2, &frames[0])).unwrap();
+        r.on_frame(row(3, &frames[1])).unwrap();
+        assert_eq!(text_of(&r, id), "s import", "nothing of the change in the copy");
+        let events = r.take_events();
+        assert_eq!(events.iter().filter(|e| matches!(e, DocEvent::Remote(..))).count(), 1, "only the small change went to the apps: {events:?}");
+        assert!(r.on_frame(ServerFrame::Compact { doc: id, upto: 3 }).unwrap().is_empty(), "no snapshot while it comes");
+        // The agent stops and starts again: the fragments are in the file, and counted as had.
+        r.flush_documents().unwrap();
+        drop(r);
+        let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+        r.connected();
+        let mut frames_out = r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        let (_, opening, opened) = r.open_document(node, &app());
+        assert_eq!(opening, Opening::Live);
+        frames_out.extend(opened);
+        assert!(frames_out.iter().any(|f| matches!(f, ClientFrame::Subscribe { after: 3, .. })), "{frames_out:?}");
+        r.on_frame(row(4, &frames[2])).unwrap();
+        r.on_frame(ServerFrame::Subscribed { doc: id, head: 4 }).unwrap();
+        assert_eq!(text_of(&r, id), format!("{}s import", "b".repeat(2 * MAX_UPDATE_BYTES)), "whole once its last fragment came");
+        assert!(r.take_events().contains(&DocEvent::Remote(id, big.clone())), "the apps get the change, whole");
+        let last = u32::try_from(2 + 2 * MAX_UPDATE_BYTES - 1).unwrap();
+        assert!(r.document_holds(id, &[(41, last)]));
+        // No snapshot between its first fragment and its last; one past it holds it.
+        assert!(r.on_frame(ServerFrame::Compact { doc: id, upto: 3 }).unwrap().is_empty(), "not inside the change's rows");
+        let frames_out = r.on_frame(ServerFrame::Compact { doc: id, upto: 4 }).unwrap();
+        let manifest = frames_out
+            .iter()
+            .find_map(|f| if let ClientFrame::Snapshot { upto: 4, manifest, .. } = f { Some(*manifest) } else { None })
+            .expect("answered at 4");
+        let fresh = loro::LoroDoc::new();
+        fresh.import(&uploaded(&mut r, manifest)).unwrap();
+        assert_eq!(fresh.get_text("text").len_utf8(), 2 * MAX_UPDATE_BYTES + "s import".len());
+    }
+
+    /// An app's change over the frame limit: imported whole, journalled whole, and sent as fragments that fit a frame
+    /// (each its own number). After a crash before the file is written, the journal brings back the fragments to send
+    /// with the same numbers, and an app opening the document gets the change whole.
+    #[test]
+    fn a_local_change_over_a_frame_is_journalled_whole_and_sent_in_fragments() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let (mut r, id, import) = joined(&store, space, node);
+        let app_doc = text_doc(50);
+        app_doc.import(&import).unwrap();
+        let big = sliced(&app_doc, &"a".repeat(3 * MAX_UPDATE_BYTES));
+        let frames = r.local_update(id, &big).unwrap();
+        let sent: Vec<(u64, usize)> = frames
+            .iter()
+            .filter_map(|f| if let ClientFrame::Update { client_seq, bytes, .. } = f { Some((*client_seq, bytes.len())) } else { None })
+            .collect();
+        assert_eq!(sent.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![1, 2, 3, 4], "{sent:?}");
+        assert!(sent.iter().all(|(_, len)| *len <= MAX_UPDATE_BYTES));
+        assert!(r.document_holds(id, &[(50, 1)]));
+        // A crash: the journal has it, the file doesn't.
+        drop(r);
+        let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+        r.connected();
+        r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        let (_, opening, _) = r.open_document(node, &app());
+        assert_eq!(opening, Opening::Live);
+        let (_, after) = r.document_state(id).unwrap();
+        assert!(after.contains(&big), "an app opening it gets the change whole");
+        assert!(r.document_holds(id, &[(50, 1)]), "in the copy again");
+        let frames = r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
+        let again: Vec<u64> =
+            frames.iter().filter_map(|f| if let ClientFrame::Update { client_seq, .. } = f { Some(*client_seq) } else { None }).collect();
+        assert_eq!(again, vec![1, 2, 3, 4], "the same fragments, the same numbers: {frames:?}");
+        for (k, seq) in again.iter().enumerate() {
+            r.on_frame(ServerFrame::Ack { doc: id, client_seq: *seq, seq: k as u64 + 1 }).unwrap();
+        }
+        assert_eq!(r.document_status(id), Some((true, 0)), "nothing waits");
+        let frames_out = r.on_frame(ServerFrame::Compact { doc: id, upto: 4 }).unwrap();
+        assert!(frames_out.iter().any(|f| matches!(f, ClientFrame::Snapshot { upto: 4, .. })), "its rows are in the log: {frames_out:?}");
+    }
+
+    /// Asked to compact while a big change of its own isn't in the log yet, a machine doesn't answer: the snapshot
+    /// would have Loro check the document out before the change, which takes tens of seconds for a big paste. Once
+    /// the change is in the log, it answers.
+    #[test]
+    fn no_snapshot_from_a_copy_far_past_the_asked_version() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let (mut r, id, import) = joined(&store, space, node);
+        let app_doc = text_doc(50);
+        app_doc.import(&import).unwrap();
+        let small = insert(&app_doc, 0, "s ");
+        r.on_frame(ServerFrame::Update { doc: id, seq: 1, bytes: small, device: device() }).unwrap();
+        let big = sliced(&app_doc, &"a".repeat(2 * MAX_UPDATE_BYTES));
+        let sent = r.local_update(id, &big).unwrap();
+        let started = std::time::Instant::now();
+        assert!(r.on_frame(ServerFrame::Compact { doc: id, upto: 1 }).unwrap().is_empty(), "not answered");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        let seqs: Vec<u64> =
+            sent.iter().filter_map(|f| if let ClientFrame::Update { client_seq, .. } = f { Some(*client_seq) } else { None }).collect();
+        for (k, seq) in seqs.iter().enumerate() {
+            r.on_frame(ServerFrame::Ack { doc: id, client_seq: *seq, seq: k as u64 + 2 }).unwrap();
+        }
+        let upto = seqs.len() as u64 + 1;
+        let frames = r.on_frame(ServerFrame::Compact { doc: id, upto }).unwrap();
+        assert!(frames.iter().any(|f| matches!(f, ClientFrame::Snapshot { upto: u, .. } if *u == upto)), "{frames:?}");
     }
 }

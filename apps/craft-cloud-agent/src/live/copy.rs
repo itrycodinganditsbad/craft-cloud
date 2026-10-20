@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use craft_cloud_proto::fragments::{is_bundle, parts};
 use craft_cloud_proto::live::MAX_UPDATE_BYTES;
 use loro::{ExportMode, IdSpan, LoroDoc, VersionVector};
 
@@ -44,9 +45,16 @@ pub fn frontiers(ids: &[(u64, u32)]) -> Option<loro::Frontiers> {
     ids.iter().map(|(peer, counter)| Some(loro::ID::new(*peer, i32::try_from(*counter).ok()?))).collect::<Option<Vec<_>>>().map(loro::Frontiers::from)
 }
 
-/// The ranges of operations an update (or snapshot) holds, read from its header without importing it; `None` for
-/// bytes Loro can't read.
+/// The ranges of operations an update (or snapshot, or a bundle of updates: its slices', merged) holds, read from its
+/// header without importing it; `None` for bytes Loro can't read.
 pub fn spans_of(bytes: &[u8]) -> Option<Vec<(u64, i32, i32)>> {
+    if is_bundle(bytes) {
+        let mut spans = Spans::new();
+        for part in parts(bytes)? {
+            add_spans(&mut spans, &spans_of(part)?);
+        }
+        return Some(spans.into_iter().flat_map(|(peer, list)| list.into_iter().map(move |(s, e)| (peer, s, e))).collect());
+    }
     let meta = guarded(|| LoroDoc::decode_import_blob_meta(bytes, true).map_err(|e| UpdateError::Malformed(e.to_string()))).ok()?;
     Some(meta.partial_end_vv.iter().map(|(peer, end)| (*peer, meta.partial_start_vv.get(peer).copied().unwrap_or(0), *end)).collect())
 }
@@ -188,8 +196,25 @@ impl LiveCopy {
         self.import_any_size(bytes)
     }
 
-    /// [`LiveCopy::import`] without the update limit: for a snapshot, or this machine's own stored document.
+    /// [`LiveCopy::import`] without the update limit: for a snapshot, or this machine's own stored document. A bundle
+    /// (one change as its slices) goes in slice by slice, all of it before this returns; one that doesn't read is
+    /// refused whole.
     pub fn import_any_size(&self, bytes: &[u8]) -> Result<Taken, UpdateError> {
+        if is_bundle(bytes) {
+            let slices = parts(bytes).ok_or_else(|| UpdateError::Malformed("a bundle cut short".into()))?;
+            let (mut new, mut needs) = (false, Vec::new());
+            for slice in slices {
+                match self.import_one(slice)? {
+                    Taken::Applied { new: n } => new |= n,
+                    Taken::Waiting { needs: more } => needs.extend(more),
+                }
+            }
+            return Ok(if needs.is_empty() { Taken::Applied { new } } else { Taken::Waiting { needs } });
+        }
+        self.import_one(bytes)
+    }
+
+    fn import_one(&self, bytes: &[u8]) -> Result<Taken, UpdateError> {
         let status = self.guard(|doc| {
             #[cfg(test)]
             Self::failing(&[bytes]);
@@ -340,6 +365,9 @@ impl LiveCopy {
 
     /// The longest start of `changes` that fits in `max` bytes as one update (at least one change; `Invalid` if that
     /// one doesn't fit in `hard_max`), with how many changes it holds.
+    ///
+    /// (A Loro change is a run of one peer's commits Loro merged, not an app's change, so a big one goes in pieces
+    /// here: this is history the log lost, sent up again after a server's restore.)
     pub fn export_prefix(&self, changes: &[(u64, i32, i32)], max: usize, hard_max: usize) -> Result<(Vec<u8>, usize), UpdateError> {
         let Some(&(peer, start, end)) = changes.first() else { return Err(UpdateError::Invalid("nothing to send")) };
         // The most operations of the first change that fit, by doubling from one and then halving the gap, so no
@@ -425,11 +453,17 @@ impl LiveCopy {
 /// after a catch-up from the start, or worked out from the copy when nothing else is in it); every update taken after
 /// it adds its ranges. A version with a gap (an update whose history comes later in the log) is no version at all:
 /// no snapshot can be made there.
+///
+/// A change that came in fragments is in the log from its last fragment's row on (its ranges are noted there), and
+/// no version is offered between its first fragment's row and its last: a snapshot there would drop its first
+/// fragments from the log and keep the rest, and a machine catching up later would never get it whole.
 #[derive(Debug, Clone, Default)]
 pub struct LogVersion {
     anchor: Option<(u64, Version)>,
     /// The updates taken since the anchor, in order: number and ranges.
     since: Vec<(u64, Ranges)>,
+    /// The rows of the changes that came in fragments since the anchor: first and last.
+    sets: Vec<(u64, u64)>,
 }
 
 /// The ranges of operations of an update: peer, first and end counter.
@@ -441,7 +475,14 @@ const MAX_SINCE: usize = 100_000;
 impl LogVersion {
     /// Anchored at `seq` with `version`.
     pub fn anchored(seq: u64, version: Version) -> Self {
-        Self { anchor: Some((seq, version)), since: Vec::new() }
+        Self { anchor: Some((seq, version)), since: Vec::new(), sets: Vec::new() }
+    }
+
+    /// A change that came in fragments took the rows `first` to `last`.
+    pub fn note_set(&mut self, first: u64, last: u64) {
+        if self.anchor.is_some() && last > first {
+            self.sets.push((first, last));
+        }
     }
 
     /// Nothing known.
@@ -469,7 +510,7 @@ impl LogVersion {
     /// The version the log's updates up to `upto` make, if it is known and has no gap.
     pub fn at(&self, upto: u64) -> Option<Version> {
         let (at, base) = self.anchor.as_ref()?;
-        if upto < *at {
+        if upto < *at || self.sets.iter().any(|(first, last)| *first <= upto && upto < *last) {
             return None;
         }
         let mut spans = Spans::new();
@@ -495,6 +536,7 @@ impl LogVersion {
     /// The version at `upto` is `version` (a snapshot was made there): what came before is forgotten.
     pub fn rebase(&mut self, upto: u64, version: Version) {
         self.since.retain(|(seq, _)| *seq > upto);
+        self.sets.retain(|(_, last)| *last > upto);
         self.anchor = Some((upto, version));
     }
 }
@@ -577,6 +619,47 @@ mod tests {
         let back = LoroDoc::new();
         back.import(&copy.snapshot().unwrap()).unwrap();
         assert_eq!(back.get_text("text").len_utf8(), 5 * 500 * 1024, "all of it");
+    }
+
+    /// A 4 MiB paste on top of another peer's text: whole in one update, Loro's import takes seconds (time growing
+    /// with the square of the text); as a bundle of slices (as the kit sends it), the copy takes it in a moment, and
+    /// holds all of it. A bundle's ranges are its slices'.
+    #[test]
+    fn a_big_change_as_a_bundle_of_slices_imports_at_once() {
+        use craft_cloud_proto::fragments::{SLICE_OPS, bundle};
+        let importer = LoroDoc::new();
+        importer.set_peer_id(40).unwrap();
+        text_update(&importer, 0, "import");
+        let import = importer.export(ExportMode::Snapshot).unwrap();
+        let app = LoroDoc::new();
+        app.set_peer_id(50).unwrap();
+        app.import(&import).unwrap();
+        app.get_text("text").insert(0, &"a".repeat(4 * 1024 * 1024)).unwrap();
+        app.commit();
+        let end = *app.oplog_vv().get(&50).unwrap();
+        let mut slices = Vec::new();
+        let mut at = 0;
+        while at < end {
+            let to = (at + SLICE_OPS).min(end);
+            slices.push(app.export(ExportMode::updates_in_range(vec![IdSpan::new(50, at, to)])).unwrap());
+            at = to;
+        }
+        let bundle_bytes = bundle(&slices);
+        assert!(is_bundle(&bundle_bytes));
+        assert_eq!(spans_of(&bundle_bytes), Some(vec![(50, 0, end)]), "its ranges, merged");
+        let copy = LiveCopy::load(&import, 1).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(copy.import_any_size(&bundle_bytes).unwrap(), Taken::Applied { new: true });
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(copy.covers(&[(50, end)]));
+        let back = LoroDoc::new();
+        back.import(&copy.snapshot().unwrap()).unwrap();
+        assert_eq!(back.get_text("text").len_utf8(), 4 * 1024 * 1024 + "import".len());
+        // A snapshot of the copy as it is: at once too.
+        let started = std::time::Instant::now();
+        let at_now = copy.snapshot_at(&copy.version().unwrap()).unwrap();
+        assert!(!at_now.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
     }
 
     /// An update Loro refuses leaves the copy as it was (Ruling: validation without a scratch copy).

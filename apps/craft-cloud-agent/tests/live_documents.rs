@@ -22,6 +22,30 @@ fn text_snapshot(text: &str) -> Vec<u8> {
     craft_cloud_agent::doc::plain_text_snapshot(text).unwrap()
 }
 
+/// Imports an update as an app's kit does: a bundle's slices one after the other.
+fn import(loro: &LoroDoc, bytes: &[u8]) {
+    for part in craft_cloud_proto::fragments::parts(bytes).unwrap() {
+        loro.import(part).unwrap();
+    }
+}
+
+/// A big change as an app's kit sends it: `s` at the start, its slices in a bundle.
+fn sliced(loro: &LoroDoc, s: &str) -> Vec<u8> {
+    let peer = loro.peer_id();
+    let start = loro.oplog_vv().get(&peer).copied().unwrap_or(0);
+    loro.get_text("text").insert(0, s).unwrap();
+    loro.commit();
+    let end = loro.oplog_vv().get(&peer).copied().unwrap_or(0);
+    let mut slices = Vec::new();
+    let mut at = start;
+    while at < end {
+        let to = (at + craft_cloud_proto::fragments::SLICE_OPS).min(end);
+        slices.push(loro.export(ExportMode::updates_in_range(vec![loro::IdSpan::new(peer, at, to)])).unwrap());
+        at = to;
+    }
+    craft_cloud_proto::fragments::bundle(&slices)
+}
+
 /// An app's Loro document for an open live document.
 struct AppDoc {
     loro: LoroDoc,
@@ -34,7 +58,7 @@ impl AppDoc {
         loro.set_peer_id(peer).unwrap();
         loro.import(doc.state()).unwrap();
         for u in doc.state_updates() {
-            loro.import(u).unwrap();
+            import(&loro, u);
         }
         Self { loro, doc }
     }
@@ -55,9 +79,7 @@ impl AppDoc {
         let mut others = Vec::new();
         while let Some(event) = self.doc.try_recv() {
             match event {
-                Event::Update(bytes) => {
-                    self.loro.import(&bytes).unwrap();
-                }
+                Event::Update(bytes) => import(&self.loro, &bytes),
                 other => others.push(other),
             }
         }
@@ -152,6 +174,83 @@ async fn a_file_opened_on_one_machine_is_live_on_the_other() {
     })
     .await;
     drop((docs_pc, docs_laptop, s));
+    run_pc.stop().await.0.unwrap();
+    run_laptop.stop().await.0.unwrap();
+}
+
+/// A change over the 1 MiB frame limit (a 3 MiB paste, as a kit's bundle of slices): the app sends it in fragments, the
+/// agent takes it whole, the server stores its fragments, and the other machine's app gets it whole, never in part,
+/// also when that machine's agent was stopped meanwhile and catches up from the log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_over_a_frame_goes_across_whole() {
+    let server = Server::new().await;
+    let (pc, laptop) = (Agent::signed_in(&server, "pc").await, Agent::signed_in(&server, "laptop").await);
+    let (run_pc, run_laptop) = (pc.run(), laptop.run());
+    let (on_pc, on_laptop) = (pc.client().await, laptop.client().await);
+    std::fs::create_dir_all(&pc.folder).unwrap();
+    std::fs::write(pc.folder.join("big.txt"), "start").unwrap();
+    synced(&laptop, "big.txt").await;
+    let c = on_pc.clone();
+    let (docs_pc, app_pc) = off(move || {
+        let docs = c.documents().unwrap();
+        let doc = open(&docs, "big.txt", "start");
+        (docs, AppDoc::new(doc, 21))
+    })
+    .await;
+    let c = on_laptop.clone();
+    let (docs_laptop, app_laptop) = off(move || {
+        let docs = c.documents().unwrap();
+        let doc = open(&docs, "big.txt", "never used");
+        (docs, AppDoc::new(doc, 22))
+    })
+    .await;
+    let (app_pc, app_laptop) = (Arc::new(Mutex::new(app_pc)), Arc::new(Mutex::new(app_laptop)));
+    let paste = "p".repeat(3 * 1024 * 1024);
+    let seq = {
+        let app = app_pc.lock().unwrap();
+        let update = sliced(&app.loro, &paste);
+        assert!(update.len() > craft_cloud_proto::live::MAX_UPDATE_BYTES);
+        app.doc.send(&update).unwrap()
+    };
+    let a = app_pc.clone();
+    eventually("the pc's change is acked", move || a.lock().unwrap().pump().contains(&Event::Acked(seq)).then_some(())).await;
+    let want = format!("{paste}start");
+    let (l, w) = (app_laptop.clone(), want.clone());
+    eventually("the laptop has the paste, whole", move || {
+        let app = l.lock().unwrap();
+        app.pump();
+        let text = app.text();
+        assert!(text == "start" || text == w, "the laptop held part of the change ({} bytes)", text.len());
+        (text == w).then_some(())
+    })
+    .await;
+    // The laptop's agent stops; another big change is made meanwhile; the agent comes back and catches up from the log.
+    drop(docs_laptop);
+    drop(app_laptop);
+    run_laptop.stop().await.0.unwrap();
+    let second = "q".repeat(2 * 1024 * 1024);
+    let seq = {
+        let app = app_pc.lock().unwrap();
+        app.doc.send(&sliced(&app.loro, &second)).unwrap()
+    };
+    let a = app_pc.clone();
+    eventually("the second is acked", move || a.lock().unwrap().pump().contains(&Event::Acked(seq)).then_some(())).await;
+    let run_laptop = laptop.run();
+    let c = laptop.client().await;
+    let want = format!("{second}{want}");
+    eventually("the laptop catches up with the second, whole", move || {
+        let docs = c.documents().ok()?;
+        let doc = match docs.open("big.txt", "wordcraft").ok()? {
+            Opened::Live(doc) => doc,
+            _ => return None,
+        };
+        let app = AppDoc::new(doc, 23);
+        let text = app.text();
+        assert!(text.len() == want.len() || text.len() == want.len() - second.len(), "part of a change: {} bytes", text.len());
+        (text == want).then_some(())
+    })
+    .await;
+    drop((docs_pc, app_pc));
     run_pc.stop().await.0.unwrap();
     run_laptop.stop().await.0.unwrap();
 }
