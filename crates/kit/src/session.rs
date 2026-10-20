@@ -20,6 +20,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use craft_cloud_api::fragments::parts;
 use craft_cloud_app::Client;
 use craft_cloud_app::live::{Document, Documents, Event, NotLiveReason, OpenOptions, Opened, Waker};
 use loro::event::{Diff, DiffEvent};
@@ -570,7 +571,7 @@ impl<D: LiveDocument> Session<D> {
         doc.import(state.0)?;
         // The updates that are part of the state.
         let mut unread = None;
-        for update in state.1 {
+        for update in state.1.iter().flat_map(|u| parts(u).unwrap_or_default()) {
             if let Err(e) = doc.import(update) {
                 unread = Some(format!("a change from another machine doesn't read: {e}"));
             }
@@ -655,7 +656,7 @@ impl<D: LiveDocument> Session<D> {
         // random and never handed out, so whatever the agent has under it is this session's.)
         let ours = self.doc.peer_id();
         let held = std::iter::once(link.doc.state())
-            .chain(link.doc.state_updates().iter().map(Vec::as_slice))
+            .chain(link.doc.state_updates().iter().flat_map(|u| parts(u).unwrap_or_default()))
             .filter_map(|bytes| loro::LoroDoc::decode_import_blob_meta(bytes, false).ok()?.partial_end_vv.get(&ours).copied())
             .max()
             .unwrap_or(0);
@@ -1189,8 +1190,16 @@ impl<D: LiveDocument> Session<D> {
         // means only an update Loro refuses is lost (the agent checked them all already).
         lock(&self.collector).on = true;
         for bytes in &batch {
-            if let Err(e) = self.doc.import(bytes) {
-                self.status.error = Some(format!("a change from another machine doesn't read: {e}"));
+            // (A bundle's slices one after the other: the model sees them only together, below.)
+            match parts(bytes) {
+                Some(updates) => {
+                    for update in updates {
+                        if let Err(e) = self.doc.import(update) {
+                            self.status.error = Some(format!("a change from another machine doesn't read: {e}"));
+                        }
+                    }
+                }
+                None => self.status.error = Some("a change from another machine doesn't read (a bundle cut short)".into()),
             }
         }
         let raw = std::mem::take(&mut lock(&self.collector).raw);

@@ -66,6 +66,20 @@ fn a_big_change_is_one_update_and_goes_in_fragments() {
     r.write::<App>(None, &base).unwrap();
     let (updates, _) = r.write::<App>(Some(&base), &big_rows(&base)).unwrap();
     assert!(updates[0].len() > MAX_UPDATE_BYTES, "the tests' 1 MB change is over a frame: {} bytes", updates[0].len());
+    // A big paste of text: a bundle of slices of at most SLICE_OPS operations (Loro imports each in milliseconds).
+    let mut r = craft_cloud_kit::raw::Replica::default();
+    let (none, _) = r.write::<TestApp>(None, &Doc::empty()).unwrap();
+    let mut pasted = Doc::empty();
+    pasted.story = Arc::new(RichText::plain(&"t".repeat(300_000)));
+    let (updates, _) = r.write::<TestApp>(Some(&Doc::empty()), &pasted).unwrap();
+    assert!(none.len() <= 1 && updates.len() == 1);
+    let slices = craft_cloud_api::fragments::parts(&updates[0]).unwrap();
+    assert!(slices.len() >= 300_000 / craft_cloud_api::fragments::SLICE_OPS as usize, "{} slices", slices.len());
+    for s in slices {
+        let meta = loro::LoroDoc::decode_import_blob_meta(s, false).unwrap();
+        let ops: i32 = meta.partial_end_vv.iter().map(|(p, e)| e - meta.partial_start_vv.get(p).copied().unwrap_or(0)).sum();
+        assert!(ops <= craft_cloud_api::fragments::SLICE_OPS, "{ops} operations in a slice");
+    }
 }
 
 /// A 5 MB change (twenty 250 KiB notes) goes as one update in fragments and arrives whole: the other machine's model

@@ -1,8 +1,9 @@
 //! Writing one local change into Loro: the mappings write through a [`Writer`], which counts what they write, and the
-//! change is one commit, exported whole as one update ([`export_since`]) whatever its size. An update over the agent's
-//! 1 MiB frame limit goes in fragments (`craft-cloud-app` cuts it), and every receiver imports it only once it holds
-//! all of them, so no machine ever holds part of a change.
+//! change is one commit, exported as one update ([`export_since`]: a big one as a bundle of slices) whatever its size.
+//! An update over the agent's 1 MiB frame limit goes in fragments (`craft-cloud-app` cuts it), and every receiver
+//! imports it only once it holds all of them, so no machine ever holds part of a change.
 
+use craft_cloud_api::fragments::{SLICE_OPS, bundle};
 use loro::{IdSpan, LoroDoc, LoroMap, LoroValue, ValueOrContainer, VersionVector};
 
 use crate::{KitError, Value};
@@ -87,18 +88,22 @@ impl<'d> Writer<'d> {
 }
 
 /// The export of every change since `from` (all made by this peer: a local change, an undo, a repair) as one update,
-/// appended to `out` (nothing when there is none).
+/// appended to `out` (nothing when there is none): its slices of at most `SLICE_OPS` operations in a bundle when it
+/// has more (Loro imports one update in time growing with the square of the text in it; slices import in
+/// milliseconds, and the bundle keeps them one change).
 pub(crate) fn export_since(doc: &LoroDoc, from: &VersionVector, out: &mut Updates) -> Result<(), KitError> {
     let now = doc.oplog_vv();
-    let mut spans = Vec::new();
+    let mut slices = Vec::new();
     for (peer, end) in now.iter() {
-        let start = from.get(peer).copied().unwrap_or(0);
-        if *end > start {
-            spans.push(IdSpan::new(*peer, start, *end));
+        let mut at = from.get(peer).copied().unwrap_or(0);
+        while at < *end {
+            let to = at.saturating_add(SLICE_OPS).min(*end);
+            slices.push(doc.export(loro::ExportMode::updates_in_range(vec![IdSpan::new(*peer, at, to)]))?);
+            at = to;
         }
     }
-    if !spans.is_empty() {
-        out.push(doc.export(loro::ExportMode::updates_in_range(spans))?);
+    if !slices.is_empty() {
+        out.push(bundle(&slices));
     }
     Ok(())
 }

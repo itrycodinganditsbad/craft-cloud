@@ -82,10 +82,13 @@ pub mod raw {
             w.finish()
         }
 
-        /// Imports updates and indexes the trees again.
+        /// Imports updates (a bundle's slices one after the other) and indexes the trees again.
         pub fn import(&mut self, updates: &[Vec<u8>], trees: &[&str]) -> Result<(), KitError> {
             for u in updates {
-                self.doc.import(u)?;
+                let parts = craft_cloud_api::fragments::parts(u).ok_or_else(|| KitError::Invalid("a bundle cut short".into()))?;
+                for part in parts {
+                    self.doc.import(part)?;
+                }
             }
             self.reindex(trees);
             Ok(())

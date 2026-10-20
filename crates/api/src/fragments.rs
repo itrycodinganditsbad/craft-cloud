@@ -9,6 +9,8 @@
 //! know fragments refuses one as an update that doesn't decode rather than importing part of a change. The cut is
 //! deterministic: the same update always gives the same fragments, so a set sent again (after a reconnect) is the same
 //! set, and the server keeps a fragment it already has once.
+//!
+//! What goes in fragments (or in one frame) may be a [`bundle`]: a big change as slices of it, imported together.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -17,6 +19,13 @@ use crate::limits::MAX_SNAPSHOT_BYTES;
 
 /// What every fragment starts with.
 pub const MAGIC: [u8; 4] = *b"ccf1";
+/// What a bundle starts with: one change as several Loro updates, imported one after the other and together
+/// ([`bundle`], [`parts`]). Loro's import of one update takes time growing with the square of the text in it (a 1 MiB
+/// paste from another peer: seconds), so a big change goes as slices of it, which import in milliseconds, in one
+/// bundle, so no receiver ever holds some of the slices and not the others.
+pub const BUNDLE_MAGIC: [u8; 4] = *b"ccb1";
+/// The most operations a change's slice holds ([`bundle`]'s parts, as the kit and the agent cut them).
+pub const SLICE_OPS: i32 = 16 * 1024;
 /// The bytes before a fragment's part of the update: [`MAGIC`], the set (16), the index and the count (2 each, big
 /// endian).
 pub const HEADER_BYTES: usize = 24;
@@ -129,6 +138,45 @@ pub fn join<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> Option<Vec<u8>> {
     }
     let whole: Vec<u8> = bodies.values().flat_map(|b| b.iter().copied()).collect();
     (Some(set_of(&whole)) == set).then_some(whole)
+}
+
+/// One change's updates (its slices, in order) as one: the update itself when there is one, else a bundle
+/// ([`BUNDLE_MAGIC`], their count, and each one's length and bytes; lengths and count are 4 bytes, big endian).
+pub fn bundle(updates: &[Vec<u8>]) -> Vec<u8> {
+    if let [one] = updates {
+        return one.clone();
+    }
+    let len = 8 + updates.iter().map(|u| 4 + u.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(len);
+    out.extend_from_slice(&BUNDLE_MAGIC);
+    out.extend_from_slice(&u32::try_from(updates.len()).unwrap_or(u32::MAX).to_be_bytes());
+    for u in updates {
+        out.extend_from_slice(&u32::try_from(u.len()).unwrap_or(u32::MAX).to_be_bytes());
+        out.extend_from_slice(u);
+    }
+    out
+}
+
+/// Whether `bytes` are a bundle (they start with [`BUNDLE_MAGIC`]).
+pub fn is_bundle(bytes: &[u8]) -> bool {
+    bytes.starts_with(&BUNDLE_MAGIC)
+}
+
+/// The updates to import for `bytes`, in order: a bundle's, or the update itself; `None` for a bundle that doesn't
+/// read (nothing of it is imported).
+pub fn parts(bytes: &[u8]) -> Option<Vec<&[u8]>> {
+    if !is_bundle(bytes) {
+        return Some(vec![bytes]);
+    }
+    let count = u32::from_be_bytes(bytes.get(4..8)?.try_into().ok()?) as usize;
+    let mut out = Vec::with_capacity(count.min(bytes.len() / 4));
+    let mut at = 8;
+    for _ in 0..count {
+        let len = u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize;
+        out.push(bytes.get(at + 4..at.checked_add(4 + len)?)?);
+        at += 4 + len;
+    }
+    (at == bytes.len()).then_some(out)
 }
 
 /// What [`Reassembler::take`] did with a fragment.
@@ -280,6 +328,21 @@ mod tests {
         // Its last fragment alone, later: a set of its own again, still waiting.
         assert_eq!(r.take(&frames[frames.len() - 1], now + PATIENCE), Taken::Waiting);
         assert!(join(frames[1..].iter().map(Vec::as_slice)).is_none(), "a part missing");
+    }
+
+    #[test]
+    fn a_bundle_gives_its_updates_back_and_one_update_is_itself() {
+        let ups = vec![update(10), Vec::new(), update(70_000)];
+        let b = bundle(&ups);
+        assert!(is_bundle(&b));
+        assert_eq!(parts(&b).unwrap(), ups.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        assert_eq!(bundle(&[update(5)]), update(5), "one update: itself");
+        assert_eq!(parts(&update(5)).unwrap(), vec![update(5).as_slice()]);
+        assert!(parts(&b[..b.len() - 1]).is_none(), "cut short");
+        let mut longer = b.clone();
+        longer.push(0);
+        assert!(parts(&longer).is_none(), "junk after it");
+        assert!(parts(b"ccb1\xff\xff\xff\xff").is_none());
     }
 
     #[test]
