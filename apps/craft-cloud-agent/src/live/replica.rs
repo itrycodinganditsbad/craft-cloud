@@ -77,10 +77,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use craft_cloud_proto::api::codes;
-use craft_cloud_proto::fragments::{MAX_WHOLE_BYTES, is_bundle, is_fragment, join, parse, split};
+use craft_cloud_proto::fragments::{FRAGMENT_OVERHEAD, MAX_SETS, MAX_WHOLE_BYTES, SetId, is_bundle, is_fragment, join, parse, split};
 use craft_cloud_proto::live::{
-    AppName, ClientFrame, DocKind, LIVE_DOCUMENTS_PROTOCOL, LIVE_PROTOCOL_MAX, LIVE_PROTOCOL_MIN, MAX_SNAPSHOT_BYTES, MAX_SUBSCRIPTIONS,
-    MAX_UPDATE_BYTES, PROTOCOL_MISMATCH, ServerFrame, node_doc, recents_doc, update_hash,
+    AppName, ClientFrame, DocKind, LIVE_DOCUMENTS_PROTOCOL, LIVE_FRAGMENTS_PROTOCOL, LIVE_PROTOCOL_MAX, LIVE_PROTOCOL_MIN, MAX_SNAPSHOT_BYTES,
+    MAX_SUBSCRIPTIONS, MAX_UPDATE_BYTES, PROTOCOL_MISMATCH, ServerFrame, node_doc, recents_doc, update_hash,
 };
 use craft_cloud_proto::local::{NotLiveReason, RecentEntry};
 use craft_cloud_proto::{DocId, Epoch, ManifestId, NodeId, SpaceId};
@@ -121,12 +121,15 @@ const DOCUMENT_FILE_FORMAT: u32 = 1;
 const MAX_JOURNAL_BYTES: usize = 4 * 1024 * 1024;
 /// A catch-up's updates are taken a batch at a time, at most this many bytes of them at once.
 const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
-/// Most bytes of rows of a document's log that are fragments of changes not whole yet, kept until they are.
+/// Most bytes of rows of a document's log that are fragments of changes not whole yet, kept until they are (at most
+/// [`MAX_SETS`] sets). Past it a row isn't taken (it doesn't count as had) and the document takes nothing more until
+/// the next connection, which brings that row again.
+///
+/// No time ends a kept set: a server on protocol 3 stores a set whole, so its rows come together, and a connection
+/// that ends part of the way through them brings the rest with the next catch-up (the kept rows count as had). Only
+/// evidence ends one: a snapshot of the log past its rows (the copy has the change then: no device snapshots inside a
+/// set), or the log learnt again from the start.
 pub const MAX_FRAGMENT_BYTES: usize = 2 * MAX_WHOLE_BYTES;
-/// Ticks of [`Replica::resend`] (about 2 s each in the agent) without a new fragment after which the fragments of a
-/// change that never came whole are dropped, never applied (about a week of the agent running: its sender's agent
-/// sends every fragment it has again until the server has it, so only one that lost its own can leave one half-way).
-pub const FRAGMENT_PATIENCE_TICKS: u32 = 300_000;
 /// The most operations a copy may be past the version a compaction asks for and still make its snapshot (Loro checks
 /// the document out there, in time growing with the square of the text it takes back).
 const MAX_CHECKOUT_OPS: i64 = 64 * 1024;
@@ -603,13 +606,32 @@ struct Doc {
     /// Snapshots to upload before the frames that name them go ([`Replica::take_uploads`]).
     uploads: Vec<Upload>,
     /// The rows of the log (taken from the server, or this machine's own acked) that are fragments of a change not
-    /// whole yet: its number and bytes. They count as had; the change goes into the copy (and to the apps) once every
-    /// fragment of it is here, never before. Kept in its file. No snapshot is made for the server while any is here.
-    fragments: Vec<(u64, Vec<u8>)>,
-    /// Ticks since the last fragment came, while some are here ([`FRAGMENT_PATIENCE_TICKS`]).
-    fragment_ticks: u32,
+    /// whole yet, by set. They count as had; the change goes into the copy (and to the apps) once every fragment of it
+    /// is here, never before. Kept in its file (see [`MAX_FRAGMENT_BYTES`] for what ends a hold). No snapshot is made
+    /// for the server at or past a kept set's first row.
+    fragments: BTreeMap<SetId, KeptSet>,
+    /// The server (as of its last `welcome`) is before fragments: unacked ones wait unsent ([`send_pending`]).
+    whole_only: bool,
     /// The change the row just taken made whole, for the apps ([`Doc::take`]).
     joined_now: Option<Vec<u8>>,
+}
+
+/// One set's fragments kept so far: their count, and each index's row number and bytes.
+#[derive(Debug, Clone, Default)]
+struct KeptSet {
+    count: u16,
+    rows: BTreeMap<u16, (u64, Vec<u8>)>,
+}
+
+impl KeptSet {
+    /// The row its first kept fragment took.
+    fn first(&self) -> u64 {
+        self.rows.values().map(|(s, _)| *s).min().unwrap_or(u64::MAX)
+    }
+
+    fn bytes(&self) -> usize {
+        self.rows.values().map(|(_, b)| b.len().saturating_add(FRAGMENT_OVERHEAD)).sum()
+    }
 }
 
 /// What a row that is a fragment did ([`Doc::take_fragment`]).
@@ -620,6 +642,8 @@ enum Fragmented {
     Whole { first: u64, update: Vec<u8> },
     /// It doesn't read, or its change's fragments don't make the change they name: never applied.
     Broken,
+    /// Over what a document keeps (bytes or sets): not taken.
+    Full,
 }
 
 impl Doc {
@@ -690,32 +714,67 @@ impl Doc {
             fetching: None,
             deferred_head: None,
             uploads: Vec::new(),
-            fragments: Vec::new(),
-            fragment_ticks: 0,
+            fragments: BTreeMap::new(),
+            whole_only: false,
             joined_now: None,
         }
     }
 
-    /// Row `seq` of the log is a fragment: kept until its change is whole (rows taken again are kept once).
+    /// Row `seq` of the log is a fragment: kept until its change is whole (a row taken again is kept once). Over what
+    /// a document keeps, it isn't taken ([`Fragmented::Full`]).
     fn take_fragment(&mut self, seq: u64, bytes: &[u8]) -> Fragmented {
         let Some(f) = parse(bytes) else { return Fragmented::Broken };
-        if !self.fragments.iter().any(|(s, _)| *s == seq) {
-            self.fragments.push((seq, bytes.to_vec()));
-            self.dirty = true;
-        }
-        self.fragment_ticks = 0;
-        let of_set = |b: &[u8]| parse(b).is_some_and(|g| g.set == f.set);
-        let indexes: BTreeSet<u16> = self.fragments.iter().filter(|(_, b)| of_set(b)).filter_map(|(_, b)| parse(b).map(|g| g.index)).collect();
-        if indexes.len() < usize::from(f.count) {
+        let known = self.fragments.get(&f.set);
+        if known.is_some_and(|s| s.rows.contains_key(&f.index)) {
             return Fragmented::Waiting;
         }
-        let first = self.fragments.iter().filter(|(_, b)| of_set(b)).map(|(s, _)| *s).min().unwrap_or(seq);
-        let whole = join(self.fragments.iter().filter(|(_, b)| of_set(b)).map(|(_, b)| b.as_slice()));
-        self.fragments.retain(|(_, b)| !of_set(b));
-        match whole {
+        if known.is_none() && self.fragments.len() >= MAX_SETS {
+            return Fragmented::Full;
+        }
+        if self.fragment_bytes().saturating_add(bytes.len()) > MAX_FRAGMENT_BYTES {
+            return Fragmented::Full;
+        }
+        let set = self.fragments.entry(f.set).or_insert_with(|| KeptSet { count: f.count, ..KeptSet::default() });
+        if set.count != f.count {
+            return Fragmented::Broken;
+        }
+        if let std::collections::btree_map::Entry::Vacant(slot) = set.rows.entry(f.index) {
+            slot.insert((seq, bytes.to_vec()));
+            self.dirty = true;
+        }
+        if set.rows.len() < usize::from(set.count) {
+            return Fragmented::Waiting;
+        }
+        let Some(done) = self.fragments.remove(&f.set) else { return Fragmented::Waiting };
+        let first = done.first();
+        match join(done.rows.values().map(|(_, b)| b.as_slice())) {
             Some(update) => Fragmented::Whole { first, update },
             None => Fragmented::Broken,
         }
+    }
+
+    /// The fragments kept, as rows (for the file).
+    fn fragment_rows(&self) -> Vec<(u64, Vec<u8>)> {
+        let mut rows: Vec<(u64, Vec<u8>)> = self.fragments.values().flat_map(|s| s.rows.values().cloned()).collect();
+        rows.sort_by_key(|(s, _)| *s);
+        rows
+    }
+
+    /// Kept rows (from the file) back into their sets.
+    fn keep_rows(&mut self, rows: Vec<(u64, Vec<u8>)>) {
+        for (seq, bytes) in rows {
+            let Some(f) = parse(&bytes) else { continue };
+            let (set, count, index) = (f.set, f.count, f.index);
+            let kept = self.fragments.entry(set).or_insert_with(|| KeptSet { count, ..KeptSet::default() });
+            if kept.count == count {
+                kept.rows.entry(index).or_insert((seq, bytes));
+            }
+        }
+    }
+
+    /// Whether a kept set has a row at or below `upto` (a snapshot there would drop part of a change from the log).
+    fn keeps_at_or_below(&self, upto: u64) -> bool {
+        self.fragments.values().any(|s| s.first() <= upto)
     }
 
     /// Row `seq` of the log is this machine's own update `bytes` (acked, or taken back): the server holds its
@@ -730,6 +789,12 @@ impl Doc {
                     spans_of(&update).unwrap_or_default()
                 }
                 Fragmented::Waiting | Fragmented::Broken => Vec::new(),
+                // Not kept: the change's last row can't say it is in the log, so what the log holds isn't known
+                // until it is worked out from the copy again (no snapshot is made from a guess that lacks it).
+                Fragmented::Full => {
+                    self.log = LogVersion::unknown();
+                    return;
+                }
             }
         } else {
             spans_of(bytes).unwrap_or_default()
@@ -738,9 +803,9 @@ impl Doc {
         self.log.note(seq, ranges);
     }
 
-    /// The bytes of rows kept as fragments.
+    /// The bytes of rows kept as fragments (with their bookkeeping).
     fn fragment_bytes(&self) -> usize {
-        self.fragments.iter().map(|(_, b)| b.len()).sum()
+        self.fragments.values().map(KeptSet::bytes).sum()
     }
 
     /// The app this document belongs to.
@@ -843,9 +908,9 @@ impl Doc {
         }
         self.compact_ask = None;
         // (A push under way doesn't stop it: the log was learnt from the start then, and is noted from there.) Nor is
-        // one made while a change's fragments are coming: the snapshot would lack the change, and the log would lose
-        // its first fragments.
-        if !self.waiting.is_empty() || self.stuck || !self.joined || self.is_broken() || !self.fragments.is_empty() {
+        // one made at or past a kept set's first row: the snapshot would lack that change (not whole here), and the
+        // log would lose its first fragments. A set kept past `upto` is left in the log, and doesn't stop it.
+        if !self.waiting.is_empty() || self.stuck || !self.joined || self.is_broken() || self.keeps_at_or_below(upto) {
             return Vec::new();
         }
         // A row it dropped is below: its copy lacks that row, and a snapshot from it would too.
@@ -860,7 +925,21 @@ impl Doc {
         // which for a big paste since (an own change not in the log yet) takes time growing with the square of its
         // text, tens of seconds on the hub's thread. Another device answers, or the next ask finds this one there.
         let Ok(now) = self.body.copy().version() else { return Vec::new() };
-        let past: i64 = now.iter().map(|(peer, end)| i64::from(*end) - i64::from(version.get(peer).copied().unwrap_or(0))).filter(|n| *n > 0).sum();
+        let mut past: i64 =
+            now.iter().map(|(peer, end)| i64::from(*end) - i64::from(version.get(peer).copied().unwrap_or(0))).filter(|n| *n > 0).sum();
+        // In a document refused as full since this machine's last ack, its own unacked operations don't count: they can't be acked until it is
+        // compacted, and with them counted the only device there is would never answer (the check-out is slow once,
+        // instead of the document full for good). Otherwise they are acked soon, and the next ask finds them in.
+        if past > MAX_CHECKOUT_OPS && self.full_pause > 0 {
+            for whole in wholes(&self.pending) {
+                for (peer, start, end) in spans_of(&whole).unwrap_or_default() {
+                    let from = start.max(version.get(&peer).copied().unwrap_or(0));
+                    if end > from {
+                        past -= i64::from(end) - i64::from(from);
+                    }
+                }
+            }
+        }
         if past > MAX_CHECKOUT_OPS {
             return Vec::new();
         }
@@ -954,7 +1033,7 @@ impl Doc {
         }
         doc.push_wait = file.push_wait;
         doc.dropped = file.dropped;
-        doc.fragments = file.fragments;
+        doc.keep_rows(file.fragments);
         doc.on_disk = true;
         doc.derive_log();
         Ok(doc)
@@ -991,7 +1070,7 @@ impl Doc {
             self.drop_row(seq);
             // A fragment Loro failed on (its change whole): the rest of that change goes too.
             if let Some(f) = parse(bytes) {
-                self.fragments.retain(|(_, b)| parse(b).is_none_or(|g| g.set != f.set));
+                self.fragments.remove(&f.set);
             }
             self.log.note(seq, Vec::new());
             self.advance(seq, hash);
@@ -1003,20 +1082,21 @@ impl Doc {
         let bytes: &[u8] = if self.kind.is_document() && is_fragment(bytes) {
             match self.take_fragment(seq, bytes) {
                 Fragmented::Waiting => {
-                    if self.fragment_bytes() > MAX_FRAGMENT_BYTES {
-                        self.fragments.retain(|(s, _)| *s != seq);
-                        self.stuck = true;
-                        let line = format!(
-                            "more than {} MiB of fragments of changes of the live document {} wait for the rest; this machine takes no more of them until it connects again",
-                            MAX_FRAGMENT_BYTES >> 20,
-                            self.id
-                        );
-                        self.say(notes, line);
-                        return Taken::Stuck;
-                    }
                     self.log.note(seq, Vec::new());
                     self.advance(seq, hash);
                     return Taken::Had;
+                }
+                // Not taken (not counted as had): the next connection brings the row again.
+                Fragmented::Full => {
+                    self.stuck = true;
+                    let line = format!(
+                        "fragments of {} changes of the live document {} (or {} MiB of them) wait for the rest; this machine takes no more of them until it connects again",
+                        MAX_SETS,
+                        self.id,
+                        MAX_FRAGMENT_BYTES >> 20
+                    );
+                    self.say(notes, line);
+                    return Taken::Stuck;
                 }
                 Fragmented::Broken => {
                     let line = format!(
@@ -1361,6 +1441,10 @@ impl Doc {
             return Err(UpdateError::Panicked);
         }
         self.waiting.retain(|w| !self.body.copy().covers(&w.needs));
+        // A kept set from at or below the base is in the snapshot whole (no device snapshots inside a set: the server
+        // stores one whole, and an answer is never made at or past a kept set's first row): the copy has its change
+        // now, and its rows go.
+        self.fragments.retain(|_, set| set.first() > base);
         self.on_server(bytes);
         let version = version_of(bytes).unwrap_or_default();
         if base >= self.have.upto {
@@ -2067,6 +2151,10 @@ impl<S: DocStore> Replica<S> {
         }
         // Fragments of it: what goes up (each an update of the log), and its numbers.
         let frames = split(bytes, MAX_UPDATE_BYTES).map_err(|e| LocalError::Invalid(e.to_string()))?;
+        // A server before fragments would store them one by one, and its other devices couldn't read them.
+        if frames.len() > 1 && self.link == Link::Up && self.protocol < LIVE_FRAGMENTS_PROTOCOL {
+            return Err(LocalError::Invalid("a change this big needs a newer Craft Cloud server; it wasn't shared".into()));
+        }
         match import_whole(&doc.body, bytes) {
             Ok(_) => {}
             Err(UpdateError::Panicked) => {
@@ -2360,20 +2448,6 @@ impl<S: DocStore> Replica<S> {
         let (up, epoch) = (self.link == Link::Up, self.epoch);
         let mut frames = Vec::new();
         for (id, doc) in &mut self.docs {
-            // The fragments of a change that stopped coming for good: dropped, never applied.
-            if !doc.fragments.is_empty() && doc.sub == Sub::Live {
-                doc.fragment_ticks = doc.fragment_ticks.saturating_add(1);
-                if doc.fragment_ticks > FRAGMENT_PATIENCE_TICKS {
-                    let line = format!(
-                        "a change of the live document {id} came part of the way and the rest never came; what came of it was dropped, never applied"
-                    );
-                    doc.say(&mut self.notes, line);
-                    doc.fragments.clear();
-                    doc.fragment_ticks = 0;
-                    doc.dirty = true;
-                    doc.urgent = true;
-                }
-            }
             match doc.sub {
                 Sub::Live => {
                     match doc.full {
@@ -2425,6 +2499,15 @@ impl<S: DocStore> Replica<S> {
                     self.notes.push("live documents need a newer Craft Cloud server; their changes stay on this machine until it is updated".into());
                 }
                 let mut frames = Vec::new();
+                for doc in self.docs.values_mut() {
+                    doc.whole_only = protocol < LIVE_FRAGMENTS_PROTOCOL;
+                }
+                if documents && protocol < LIVE_FRAGMENTS_PROTOCOL && self.docs.values().any(|d| d.pending.iter().any(|p| is_fragment(&p.bytes))) {
+                    self.notes.push(
+                        "a big change of a live document needs a newer Craft Cloud server; it stays on this machine until the server is updated"
+                            .into(),
+                    );
+                }
                 for (id, doc) in &mut self.docs {
                     // Documents of files only with a server that has them, and only those followed.
                     if doc.kind.is_document() && (!documents || doc.parked || !doc.joined) {
@@ -3276,6 +3359,10 @@ fn send_pending(id: DocId, doc: &mut Doc) -> Vec<ClientFrame> {
         return frames;
     }
     for pending in &doc.pending {
+        // (Fragments wait for a server that takes them.)
+        if doc.whole_only && is_fragment(&pending.bytes) {
+            continue;
+        }
         // While a push is under way, only its parts go: they carry every other unacked update.
         if (pending.push || doc.pushing.is_none()) && doc.sent.insert(pending.client_seq) {
             frames.push(ClientFrame::Update { doc: id, client_seq: pending.client_seq, bytes: pending.bytes.clone() });
@@ -3349,7 +3436,7 @@ fn save_as<S: DocStore>(store: &mut S, space: SpaceId, id: DocId, doc: &mut Doc,
             let mut bytes = postcard::to_stdvec(&file).map_err(std::io::Error::other)?;
             // (Nothing more to say without fragments: the file is as an older agent writes it.)
             if !doc.fragments.is_empty() {
-                bytes.extend(postcard::to_stdvec(&DocumentFileMore { fragments: doc.fragments.clone() }).map_err(std::io::Error::other)?);
+                bytes.extend(postcard::to_stdvec(&DocumentFileMore { fragments: doc.fragment_rows() }).map_err(std::io::Error::other)?);
             }
             let name = id.to_string();
             match patience {
@@ -3844,7 +3931,7 @@ mod tests {
         let import = importer.export(loro::ExportMode::Snapshot).unwrap();
         let mut r = Replica::open(store.clone(), space, peers()).unwrap();
         r.connected();
-        r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) }).unwrap();
         let (id, _, _) = r.open_document(node, &app());
         snapshot_in(&mut r, id, 0, &import);
         r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
@@ -3867,7 +3954,7 @@ mod tests {
             let (space, node) = (SpaceId::generate(), NodeId::generate());
             let mut r = Replica::open(MemStore::default(), space, peers()).unwrap();
             r.connected();
-            r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+            r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) }).unwrap();
             let (id, _, _) = r.open_document(node, &app());
             let server = text_doc(40);
             insert(&server, 0, "import");
@@ -3936,7 +4023,7 @@ mod tests {
         let nodes: Vec<NodeId> = (0..300).map(|_| NodeId::generate()).collect();
         let mut r = Replica::open(store.clone(), space, peers()).unwrap();
         r.connected();
-        r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) }).unwrap();
         let mut ids = Vec::new();
         for node in &nodes {
             let (id, _, _) = r.open_document(*node, &app());
@@ -3956,7 +4043,7 @@ mod tests {
         let mut r = Replica::open(store.clone(), space, peers()).unwrap();
         assert_eq!(r.loaded_documents(), 1, "only the one with something to send");
         r.connected();
-        r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) }).unwrap();
         let (_, opening, frames) = r.open_document(nodes[7], &app());
         assert_eq!(opening, Opening::Live, "loaded when opened, from disk");
         assert!(frames.iter().any(|f| matches!(f, ClientFrame::Subscribe { doc, .. } if *doc == ids[7])), "{frames:?}");
@@ -3977,7 +4064,7 @@ mod tests {
         let (space, node) = (SpaceId::generate(), NodeId::generate());
         let mut r = Replica::open(MemStore::default(), space, peers()).unwrap();
         r.connected();
-        r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) }).unwrap();
         let (id, opening, _) = r.open_document(node, &app());
         assert_eq!(opening, Opening::Joining);
         let frames = r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
@@ -4007,7 +4094,7 @@ mod tests {
         let import = app_doc.export(loro::ExportMode::Snapshot).unwrap();
         let mut r = Replica::open(store.clone(), space, peers()).unwrap();
         r.connected();
-        r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) }).unwrap();
         let (id, _, _) = r.open_document(node, &app());
         r.on_frame(ServerFrame::error("not_found", "no such document", Some(id), None)).unwrap();
         assert!(r.take_events().contains(&DocEvent::NeedsImport(id)));
@@ -4022,7 +4109,7 @@ mod tests {
         // The server is restored from a backup that has none of it.
         r.disconnected();
         r.connected();
-        let frames = r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(2) }).unwrap();
+        let frames = r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(2) }).unwrap();
         assert!(frames.iter().any(|f| matches!(f, ClientFrame::Subscribe { after: 0, .. })), "{frames:?}");
         let frames = r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap();
         assert!(frames.iter().any(|f| matches!(f, ClientFrame::Update { .. })), "its own goes up at once: {frames:?}");
@@ -4116,7 +4203,7 @@ mod tests {
         let (mut r, id, import) = joined(&store, space, node);
         r.disconnected();
         r.connected();
-        r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) }).unwrap();
         let other = text_doc(60);
         other.import(&import).unwrap();
         let big = "y".repeat(1_000_000);
@@ -4203,7 +4290,7 @@ mod tests {
     fn a_row_loro_fails_on_in_a_batch_is_found_and_only_it_dropped() {
         let space = SpaceId::generate();
         let node = NodeId::generate();
-        let w2 = ServerFrame::Welcome { protocol: 2, epoch: epoch(1) };
+        let w2 = ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) };
         let importer = text_doc(40);
         insert(&importer, 0, "import");
         let import = importer.export(loro::ExportMode::Snapshot).unwrap();
@@ -4748,7 +4835,7 @@ mod tests {
         let store = MemStore::default();
         let space = SpaceId::generate();
         let node = NodeId::generate();
-        let w2 = ServerFrame::Welcome { protocol: 2, epoch: epoch(1) };
+        let w2 = ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) };
         // The import (peer 40), this machine's app edit P (peer 50), another machine's concurrent edits (peer 60).
         let importer = text_doc(40);
         insert(&importer, 0, "import");
@@ -4832,7 +4919,7 @@ mod tests {
         let store = MemStore::default();
         let space = SpaceId::generate();
         let node = NodeId::generate();
-        let w2 = ServerFrame::Welcome { protocol: 2, epoch: epoch(1) };
+        let w2 = ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) };
         let importer = text_doc(40);
         insert(&importer, 0, "import");
         let import = importer.export(loro::ExportMode::Snapshot).unwrap();
@@ -4936,7 +5023,7 @@ mod tests {
         drop(r);
         let mut r = Replica::open(store.clone(), space, peers()).unwrap();
         r.connected();
-        let mut frames_out = r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        let mut frames_out = r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) }).unwrap();
         let (_, opening, opened) = r.open_document(node, &app());
         assert_eq!(opening, Opening::Live);
         frames_out.extend(opened);
@@ -4982,7 +5069,7 @@ mod tests {
         drop(r);
         let mut r = Replica::open(store.clone(), space, peers()).unwrap();
         r.connected();
-        r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) }).unwrap();
         let (_, opening, _) = r.open_document(node, &app());
         assert_eq!(opening, Opening::Live);
         let (_, after) = r.document_state(id).unwrap();
@@ -5025,5 +5112,167 @@ mod tests {
         let upto = seqs.len() as u64 + 1;
         let frames = r.on_frame(ServerFrame::Compact { doc: id, upto }).unwrap();
         assert!(frames.iter().any(|f| matches!(f, ClientFrame::Snapshot { upto: u, .. } if *u == upto)), "{frames:?}");
+    }
+
+    /// In a document the server refused as full, a machine far past the asked version answers anyway: its own big
+    /// change can't be acked until the document is compacted, and with only this device it would never be.
+    #[test]
+    fn a_full_document_is_compacted_even_from_a_copy_far_past_the_asked_version() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let (mut r, id, import) = joined(&store, space, node);
+        let app_doc = text_doc(50);
+        app_doc.import(&import).unwrap();
+        let small = insert(&app_doc, 0, "s ");
+        r.on_frame(ServerFrame::Update { doc: id, seq: 1, bytes: small, device: device() }).unwrap();
+        let paste = sliced(&app_doc, &"a".repeat(80 * 1024));
+        let sent = r.local_update(id, &paste).unwrap();
+        assert!(r.on_frame(ServerFrame::Compact { doc: id, upto: 1 }).unwrap().is_empty(), "not answered while it may be acked");
+        for f in &sent {
+            if let ClientFrame::Update { client_seq, .. } = f {
+                let full =
+                    ServerFrame::Error { code: codes::QUOTA_EXCEEDED.into(), message: "full".into(), doc: Some(id), client_seq: Some(*client_seq) };
+                r.on_frame(full).unwrap();
+            }
+        }
+        let frames = r.on_frame(ServerFrame::Compact { doc: id, upto: 1 }).unwrap();
+        let manifest = frames
+            .iter()
+            .find_map(|f| if let ClientFrame::Snapshot { upto: 1, manifest, .. } = f { Some(*manifest) } else { None })
+            .expect("answered at 1");
+        let fresh = loro::LoroDoc::new();
+        fresh.import(&uploaded(&mut r, manifest)).unwrap();
+        assert_eq!(fresh.get_text("text").to_string(), "s import", "the log's rows only, not the unacked paste");
+    }
+
+    /// A receiver that slept part of the way through a change catches up from a snapshot past it (another device
+    /// compacted meanwhile): the copy has the change from the snapshot, and the fragments kept go at once, so they
+    /// stop nothing (a compaction past them is answered).
+    #[test]
+    fn a_snapshot_past_a_kept_set_ends_it() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let (mut r, id, import) = joined(&store, space, node);
+        let other = text_doc(41);
+        other.import(&import).unwrap();
+        let small = insert(&other, 0, "s ");
+        let big = sliced(&other, &"b".repeat(2 * MAX_UPDATE_BYTES));
+        let frames = split(&big, MAX_UPDATE_BYTES).unwrap();
+        let row = |seq: u64, bytes: &[u8]| ServerFrame::Update { doc: id, seq, bytes: bytes.to_vec(), device: device() };
+        r.on_frame(row(1, &small)).unwrap();
+        r.on_frame(row(2, &frames[0])).unwrap();
+        r.flush_documents().unwrap();
+        drop(r);
+        // Asleep: rows 3 and 4 came, and another device compacted at 4.
+        let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+        r.connected();
+        r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) }).unwrap();
+        r.open_document(node, &app());
+        assert_eq!(r.docs.get(&id).unwrap().fragments.len(), 1, "the first fragment kept across the restart");
+        let snap = other.export(loro::ExportMode::Snapshot).unwrap();
+        snapshot_in(&mut r, id, 4, &snap);
+        r.on_frame(ServerFrame::Subscribed { doc: id, head: 4 }).unwrap();
+        assert!(r.docs.get(&id).unwrap().fragments.is_empty(), "the snapshot holds the change: its fragments go");
+        assert!(text_of(&r, id).starts_with(&"b".repeat(2 * MAX_UPDATE_BYTES)), "the change is in the copy");
+        let after = insert(&other, 0, "t ");
+        r.on_frame(row(5, &after)).unwrap();
+        let answer = r.on_frame(ServerFrame::Compact { doc: id, upto: 5 }).unwrap();
+        assert!(answer.iter().any(|f| matches!(f, ClientFrame::Snapshot { upto: 5, .. })), "{answer:?}");
+    }
+
+    /// A sender that slept part of the way through sending a change (an old server stored what came; this one
+    /// stores a set whole, but a receiver's connection can end inside it too): the receiver keeps what came for as
+    /// long as it takes (no time ends it), answers no compaction at or past its first row meanwhile, answers one
+    /// below it, and takes the change whole when the rest comes, after a restart and a new connection.
+    #[test]
+    fn a_kept_set_waits_for_its_rest_however_long_it_takes() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let (mut r, id, import) = joined(&store, space, node);
+        let other = text_doc(41);
+        other.import(&import).unwrap();
+        let small = insert(&other, 0, "s ");
+        let big = sliced(&other, &"b".repeat(2 * MAX_UPDATE_BYTES));
+        let frames = split(&big, MAX_UPDATE_BYTES).unwrap();
+        assert_eq!(frames.len(), 3);
+        let row = |seq: u64, bytes: &[u8]| ServerFrame::Update { doc: id, seq, bytes: bytes.to_vec(), device: device() };
+        r.on_frame(row(1, &small)).unwrap();
+        r.on_frame(row(2, &frames[0])).unwrap();
+        r.on_frame(row(3, &frames[1])).unwrap();
+        for _ in 0..5000 {
+            r.resend();
+        }
+        assert_eq!(r.docs.get(&id).unwrap().fragments.values().map(|s| s.rows.len()).sum::<usize>(), 2, "still kept");
+        assert!(r.on_frame(ServerFrame::Compact { doc: id, upto: 3 }).unwrap().is_empty(), "not at or past its first row");
+        let below = r.on_frame(ServerFrame::Compact { doc: id, upto: 1 }).unwrap();
+        assert!(below.iter().any(|f| matches!(f, ClientFrame::Snapshot { upto: 1, .. })), "below it: {below:?}");
+        r.flush_documents().unwrap();
+        r.disconnected();
+        drop(r);
+        let mut r = Replica::open(store.clone(), space, peers()).unwrap();
+        r.connected();
+        let mut out = r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) }).unwrap();
+        out.extend(r.open_document(node, &app()).2);
+        assert!(out.iter().any(|f| matches!(f, ClientFrame::Subscribe { after: 3, .. })), "the kept rows count as had: {out:?}");
+        r.on_frame(row(4, &frames[2])).unwrap();
+        r.on_frame(ServerFrame::Subscribed { doc: id, head: 4 }).unwrap();
+        assert!(r.docs.get(&id).unwrap().fragments.is_empty());
+        assert!(text_of(&r, id).starts_with(&"b".repeat(2 * MAX_UPDATE_BYTES)), "the change, whole");
+        assert!(r.take_events().contains(&DocEvent::Remote(id, big.clone())));
+        let answer = r.on_frame(ServerFrame::Compact { doc: id, upto: 4 }).unwrap();
+        assert!(answer.iter().any(|f| matches!(f, ClientFrame::Snapshot { upto: 4, .. })), "{answer:?}");
+    }
+
+    /// Past [`MAX_SETS`] sets kept, a row of another set isn't taken (not counted as had): the next connection
+    /// brings it again, and nothing of it is lost.
+    #[test]
+    fn past_the_sets_a_document_keeps_a_row_is_not_taken() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let (mut r, id, import) = joined(&store, space, node);
+        let other = text_doc(41);
+        other.import(&import).unwrap();
+        let row = |seq: u64, bytes: &[u8]| ServerFrame::Update { doc: id, seq, bytes: bytes.to_vec(), device: device() };
+        let sets: Vec<Vec<Vec<u8>>> = (0..=MAX_SETS).map(|i| split(&insert(&other, 0, &format!("change {i} ")), 32).unwrap()).collect();
+        assert!(sets.iter().all(|s| s.len() >= 2));
+        for (k, set) in sets.iter().enumerate() {
+            r.on_frame(row(k as u64 + 1, &set[0])).unwrap();
+        }
+        let doc = r.docs.get(&id).unwrap();
+        assert_eq!(doc.fragments.len(), MAX_SETS);
+        assert_eq!(doc.have.upto, MAX_SETS as u64, "the row past them isn't had");
+        r.disconnected();
+        let mut out = r.connected();
+        out.extend(r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) }).unwrap());
+        assert!(out.iter().any(|f| matches!(f, ClientFrame::Subscribe { after, .. } if *after == MAX_SETS as u64)), "{out:?}");
+    }
+
+    /// A server before fragments is never sent one: an app's change that needs them is refused while it is the
+    /// server, and fragments made before it came wait unsent until a server that takes them.
+    #[test]
+    fn a_server_before_fragments_is_sent_none() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let (mut r, id, import) = joined(&store, space, node);
+        let app_doc = text_doc(50);
+        app_doc.import(&import).unwrap();
+        r.disconnected();
+        let big = sliced(&app_doc, &"a".repeat(2 * MAX_UPDATE_BYTES));
+        assert!(r.local_update(id, &big).unwrap().is_empty(), "the link is down: kept");
+        let welcome = |r: &mut Replica<MemStore>, protocol: u32| {
+            let mut out = r.connected();
+            out.extend(r.on_frame(ServerFrame::Welcome { protocol, epoch: epoch(1) }).unwrap());
+            out.extend(r.on_frame(ServerFrame::Subscribed { doc: id, head: 0 }).unwrap());
+            out
+        };
+        let out = welcome(&mut r, LIVE_DOCUMENTS_PROTOCOL);
+        assert!(!out.iter().any(|f| matches!(f, ClientFrame::Update { .. })), "no fragment to the old server: {out:?}");
+        let more = sliced(&app_doc, &"c".repeat(2 * MAX_UPDATE_BYTES));
+        assert!(matches!(r.local_update(id, &more), Err(LocalError::Invalid(_))), "refused while it is the server");
+        assert!(r.resend().iter().all(|f| !matches!(f, ClientFrame::Update { .. })));
+        r.disconnected();
+        let out = welcome(&mut r, LIVE_FRAGMENTS_PROTOCOL);
+        let sent = out.iter().filter(|f| matches!(f, ClientFrame::Update { .. })).count();
+        assert_eq!(sent, split(&big, MAX_UPDATE_BYTES).unwrap().len(), "sent once the server takes them: {out:?}");
     }
 }
