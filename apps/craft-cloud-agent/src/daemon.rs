@@ -21,7 +21,9 @@
 //!   reach the server after resume). It is kept in `state.json`, so a paused agent starts paused. Resuming runs a full
 //!   pass at once. **Quit** (the local API's `quit`) is a first stop request.
 //! - **Status**: `status.json` in the data folder ([`LoopStatus`]) is written on every change of state and as a
-//!   heartbeat, so `status` can tell whether the loop runs and what it is doing.
+//!   heartbeat, so `status` can tell whether the loop runs and what it is doing. It is written on a thread of its own
+//!   ([`StatusWriter`]): the loop's runtime also serves the local API, the apps' live documents among it, and a write
+//!   that waits for the disk or for a virus scanner holding the file must never hold up a keystroke on its way.
 //! - **Approval**: while deletions wait, the loop looks for `approval.json` (written by `sync --approve-deletes`
 //!   from another terminal, for the set `status` showed) and releases exactly the deletions it names, if they are
 //!   still the set that waits; any other approval is discarded with a message. Deletes held behind a link are a set
@@ -428,8 +430,102 @@ fn run_state(state: &LoopState) -> RunState {
 
 /// The loop's clock and its status file. Its own clock is monotonic (scheduling only); every time it writes is the
 /// wall clock's.
-struct Status {
+/// Writes the loop's `status.json` off the loop's runtime: on a thread of its own, or (in a test of the file alone, or
+/// when no thread can be started) in the caller's. Only the newest status waits: one handed over while another is
+/// being written replaces any older one still waiting. Dropping it writes what still waits before it returns, so the
+/// loop's last status (`Stopped`) is on disk when the loop ends.
+struct StatusWriter {
     data: DataDir,
+    shared: std::sync::Arc<(std::sync::Mutex<Handover>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// What the loop hands the status thread.
+#[derive(Default)]
+struct Handover {
+    next: Option<LoopStatus>,
+    /// A write failed since the loop last asked ([`StatusWriter::take_failed`]).
+    failed: bool,
+    closed: bool,
+}
+
+impl StatusWriter {
+    fn start(data: &DataDir) -> Self {
+        let mut writer = Self::inline(data);
+        let (shared, data) = (writer.shared.clone(), data.clone());
+        // No thread: written in the loop, as before.
+        writer.thread = std::thread::Builder::new().name("craft-cloud-status".into()).spawn(move || write_statuses(&data, &shared)).ok();
+        writer
+    }
+
+    fn inline(data: &DataDir) -> Self {
+        Self { data: data.clone(), shared: std::sync::Arc::default(), thread: None }
+    }
+
+    fn handover(&self) -> std::sync::MutexGuard<'_, Handover> {
+        self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Has `status` written (soon, on the thread).
+    fn write(&self, status: LoopStatus) {
+        if self.thread.is_none() {
+            self.write_now(&status);
+            return;
+        }
+        self.handover().next = Some(status);
+        self.shared.1.notify_one();
+    }
+
+    /// Writes `status` in the caller, before returning. Only while the thread has nothing to write (at the start), so
+    /// the two never race.
+    fn write_now(&self, status: &LoopStatus) {
+        if let Err(e) = self.data.save_status(status) {
+            crate::runlog::note(format_args!("can't write the status file: {e}"));
+            self.handover().failed = true;
+        }
+    }
+
+    /// Whether a write failed since the last call.
+    fn take_failed(&self) -> bool {
+        std::mem::take(&mut self.handover().failed)
+    }
+}
+
+impl Drop for StatusWriter {
+    fn drop(&mut self) {
+        self.handover().closed = true;
+        self.shared.1.notify_one();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The status thread: writes each status handed over, the newest first, until the writer is dropped and nothing waits.
+fn write_statuses(data: &DataDir, shared: &(std::sync::Mutex<Handover>, std::sync::Condvar)) {
+    let lock = || shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        let status = {
+            let mut handover = lock();
+            loop {
+                if let Some(status) = handover.next.take() {
+                    break status;
+                }
+                if handover.closed {
+                    return;
+                }
+                handover = shared.1.wait(handover).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        };
+        if let Err(e) = data.save_status(&status) {
+            crate::runlog::note(format_args!("can't write the status file: {e}"));
+            lock().failed = true;
+        }
+    }
+}
+
+struct Status {
+    writer: StatusWriter,
     start: Instant,
     started_ms: i64,
     heartbeat: Duration,
@@ -478,8 +574,28 @@ impl Status {
     /// converted from the loop's clock afresh at every call, so they jitter by a millisecond or so, and a new next try
     /// or next check only ever comes with a pass, whose `Syncing` is written in between. The loop wakes on every
     /// watcher event, so comparing them would write (and flush) the file on every other event while it retries.
-    /// A failed write is reported once per failure and tried again next time; it never stops the loop.
+    /// A failed write is reported once per failure and tried again next time; it never stops the loop. The write
+    /// itself happens on the status thread ([`StatusWriter`]).
     fn write(&mut self, state: LoopState, waiting_for_approval: bool, force: bool) {
+        self.write_as(state, waiting_for_approval, force, false);
+    }
+
+    /// [`Status::write`], on disk before this returns: for the first status, written before the local API answers
+    /// anyone (who may run `status` next and must find the loop running).
+    fn write_now(&mut self, state: LoopState) {
+        self.write_as(state, false, true, true);
+    }
+
+    /// Writes what still waits, and stops the status thread: the loop's last status is on disk before the loop lets
+    /// go of the data folder (a `run` started next must never have its status overwritten by this one's).
+    fn finish(self) {
+        drop(self);
+    }
+
+    fn write_as(&mut self, state: LoopState, waiting_for_approval: bool, force: bool, now_on_disk: bool) {
+        if self.writer.take_failed() {
+            self.last_written = None;
+        }
         if let Some(pass) = &self.last_pass
             && !matches!(pass.outcome, Outcome::Failed(_))
         {
@@ -508,10 +624,12 @@ impl Status {
         }
         // Tried again at the next beat either way, never in a hot loop.
         self.next_beat = now.saturating_add(u64::try_from(self.heartbeat.as_millis()).unwrap_or(u64::MAX));
-        match self.data.save_status(&status) {
-            Ok(()) => self.last_written = Some(status),
-            Err(e) => crate::runlog::note(format_args!("can't write the status file: {e}")),
+        if now_on_disk {
+            self.writer.write_now(&status);
+        } else {
+            self.writer.write(status.clone());
         }
+        self.last_written = Some(status);
     }
 }
 
@@ -536,10 +654,8 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
     });
     let control = Control::new(commands_tx).with_autostart(autostart_roots, data.path());
     control.refresh_autostart().await;
-    let api = LocalApi::start(data, control.clone()).await?;
-    say(out, &format!("craft-cloud-agent: local API on 127.0.0.1:{} (for the Craft Cloud app and the other Craft apps)", api.port()));
     let mut status = Status {
-        data: data.clone(),
+        writer: StatusWriter::start(data),
         start: Instant::now(),
         started_ms: now_ms(),
         heartbeat: options.heartbeat,
@@ -551,6 +667,22 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
         last_synced_ms: None,
         control: Some(control.clone()),
     };
+    // The first status is on disk before the local API answers: whoever finds the API up (the app, `status`, a second
+    // `run`) also finds the loop running. (The loop says what it does next as soon as it knows.)
+    status.write_now(match data.load_account() {
+        Ok(Some(_)) => LoopState::Idle,
+        Ok(None) => LoopState::SignedOut,
+        Err(e) => LoopState::Paused { reason: e.to_string(), next_check_ms: None },
+    });
+    let api = match LocalApi::start(data, control.clone()).await {
+        Ok(api) => api,
+        Err(e) => {
+            // No loop after all: `status` mustn't think one runs.
+            status.write_now(LoopState::Stopped);
+            return Err(e);
+        }
+    };
+    say(out, &format!("craft-cloud-agent: local API on 127.0.0.1:{} (for the Craft Cloud app and the other Craft apps)", api.port()));
     let mut stops = 0;
     let mut stop_open = true;
     // A sign-out revoked the device but couldn't remove the account file: the dead account is never used again.
@@ -980,6 +1112,8 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             }
         }
     };
+    // Its last status (`Stopped`) on disk before the API goes and the data folder is let go of.
+    status.finish();
     api.stop().await;
     drop(data_lock);
     say(out, "stopped");
@@ -1266,7 +1400,7 @@ mod tests {
         let data = DataDir::new(dir.path());
         let eight_hours = 8 * 3_600 * 1_000;
         let mut status = Status {
-            data: data.clone(),
+            writer: StatusWriter::inline(&data),
             start: Instant::now(),
             // Started 8 h (of wall-clock time) ago, but the monotonic clock only counted the time awake.
             started_ms: now_ms() - eight_hours,
@@ -1297,7 +1431,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data = DataDir::new(dir.path());
         let mut status = Status {
-            data: data.clone(),
+            writer: StatusWriter::inline(&data),
             start: Instant::now(),
             started_ms: now_ms(),
             heartbeat: Duration::from_secs(15),
@@ -1338,6 +1472,34 @@ mod tests {
         status.next_beat = status.now();
         status.write(LoopState::Retrying { next_try_ms: at, message: "offline".into() }, false, false);
         assert!(file.exists(), "the heartbeat writes");
+    }
+
+    /// The status thread writes the newest status it was handed, and dropping the writer writes what still waits
+    /// before it returns (the loop's last status is on disk when the loop ends).
+    #[test]
+    fn the_status_thread_writes_the_newest_status_and_finishes_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path());
+        let writer = StatusWriter::start(&data);
+        assert!(writer.thread.is_some());
+        let status = |state: LoopState| LoopStatus {
+            schema: STATUS_SCHEMA,
+            pid: std::process::id(),
+            started_ms: now_ms(),
+            heartbeat_ms: now_ms(),
+            heartbeat_every_ms: 15_000,
+            state,
+            waiting_for_approval: false,
+            held: false,
+            last_pass: None,
+            not_watching: None,
+        };
+        for _ in 0..50 {
+            writer.write(status(LoopState::Syncing));
+        }
+        writer.write(status(LoopState::Stopped));
+        drop(writer);
+        assert_eq!(data.load_status().unwrap().unwrap().state, LoopState::Stopped);
     }
 
     /// Finding 4 of the second review: every watcher start but the first is followed by a full pass, since events

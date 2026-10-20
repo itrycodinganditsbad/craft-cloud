@@ -489,7 +489,11 @@ impl DataDir {
             Err(e) => return Err(io_at(&path)(e)),
         }
         let approval = load::<Approval>(&taken, APPROVAL_SCHEMA);
-        remove(&taken)?;
+        // (A name of its own already: deleted as it is.)
+        match fs::remove_file(&taken) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_at(&taken)(e)),
+            _ => {}
+        }
         approval
     }
 }
@@ -514,11 +518,10 @@ fn save<T: Serialize>(path: &Path, value: &T) -> Result<(), AccountError> {
     write_atomic(path, &json, true).map_err(io_at(path))
 }
 
+/// Deletes a file of the data folder (absent is fine), freeing its name at once ([`retire`]): `state.json` is written
+/// again soon after a sign-in removes it.
 fn remove(path: &Path) -> Result<(), AccountError> {
-    match fs::remove_file(path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io_at(path)(e)),
-        _ => Ok(()),
-    }
+    retire(path).map(drop).map_err(io_at(path))
 }
 
 /// The file a temporary name of [`write_atomic`] is for: `Some("state.json")` for exactly
@@ -562,6 +565,16 @@ pub(crate) fn random_hex(n: usize) -> io::Result<String> {
 /// Writes `bytes` to `path` atomically: a temporary file next to it, flushed, then renamed over it. `private`
 /// makes the file owner-only on Unix (mode 0600 from creation, so it is never readable by others).
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
+    write_atomic_as(path, bytes, private, true)
+}
+
+/// [`write_atomic`], except that another program holding `path` refuses it at once ([`is_busy`]) rather than being
+/// waited for: for a write that can as well be made later.
+pub(crate) fn write_atomic_unless_busy(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
+    write_atomic_as(path, bytes, private, false)
+}
+
+fn write_atomic_as(path: &Path, bytes: &[u8], private: bool, wait: bool) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| io::Error::other("no parent folder"))?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let temp = dir.join(format!(".{name}.{}.tmp", random_hex(8)?));
@@ -579,7 +592,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> io::Resu
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temp, path)
+        if wait { replace(&temp, path) } else { fs::rename(&temp, path) }
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
@@ -592,9 +605,122 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> io::Resu
     Ok(())
 }
 
+/// Renames `temp` over `path` ([`retry_busy`]: on Windows the rename is refused while another program holds `path`
+/// open without delete sharing).
+fn replace(temp: &Path, path: &Path) -> io::Result<()> {
+    retry_busy(|| fs::rename(temp, path))
+}
+
+/// Whether `e` is Windows refusing a file operation because another program holds the file (ERROR_ACCESS_DENIED or
+/// ERROR_SHARING_VIOLATION; [`retry_busy`] waits those out), or a store saying so (`ResourceBusy`).
+pub(crate) fn is_busy(e: &io::Error) -> bool {
+    (cfg!(windows) && e.raw_os_error().is_some_and(|code| BUSY.contains(&code))) || e.kind() == io::ErrorKind::ResourceBusy
+}
+
+/// ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION.
+const BUSY: [i32; 2] = [5, 32];
+
+/// Runs the file operation `op`. On Windows another program (a virus scanner, the search indexer, a backup tool)
+/// holding the file open without sharing it for what `op` does makes it fail with ERROR_ACCESS_DENIED or
+/// ERROR_SHARING_VIOLATION, usually for milliseconds: `op` is tried again for about a second and a half before
+/// giving up. Elsewhere it runs once.
+pub(crate) fn retry_busy<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    #[cfg(windows)]
+    {
+        let mut wait = std::time::Duration::from_millis(5);
+        for _ in 0..12 {
+            match op() {
+                Err(e) if is_busy(&e) => {
+                    std::thread::sleep(wait);
+                    wait = (wait * 2).min(std::time::Duration::from_millis(200));
+                }
+                other => return other,
+            }
+        }
+    }
+    op()
+}
+
+/// Deletes the file at `path`; `Ok(false)` if there was none. It is first renamed to a temporary name of its own
+/// beside it (the one [`write_atomic`] uses, so the clean-ups of interrupted writes remove one a crash leaves), then
+/// that is deleted: its own name is free at once, so a file written there next never meets a deleted one that
+/// another program still holds open (which Windows may keep, "delete pending", refusing a new file of that name
+/// with ERROR_ACCESS_DENIED until the last handle closes). A holder that doesn't share the file for deletion is
+/// waited for ([`retry_busy`]). The caller makes the change durable (the folder's fsync) if it must be.
+pub(crate) fn retire(path: &Path) -> io::Result<bool> {
+    let dir = path.parent().ok_or_else(|| io::Error::other("no parent folder"))?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let gone = dir.join(format!(".{name}.{}.tmp", random_hex(8)?));
+    match retry_busy(|| fs::rename(path, &gone)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    // The name is free now; a renamed file that can't be deleted yet is only a temporary file left behind.
+    let _ = retry_busy(|| fs::remove_file(&gone));
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Another program holding the file for a moment (without delete sharing, as virus scanners do) delays the write;
+    /// it doesn't fail it.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_held_open_for_a_moment_is_still_replaced() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        fs::write(&path, b"old").unwrap();
+        // FILE_SHARE_READ only: renaming over the file is refused while this handle is open.
+        let held = OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+        });
+        write_atomic(&path, b"new", false).unwrap();
+        release.join().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    /// A file held open for good still fails the write, after the retries, and leaves no temporary file behind.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_held_open_for_good_fails_the_write_cleanly() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        fs::write(&path, b"old").unwrap();
+        let _held = OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+        assert!(write_atomic(&path, b"new", false).is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "the temporary file is removed");
+    }
+
+    /// Signing in again forgets the old sync state and writes a new one soon after: a scanner holding `state.json` for
+    /// a moment (without delete sharing) delays the removal, it doesn't fail the sign-in, and the name is free for the
+    /// new state at once.
+    #[cfg(windows)]
+    #[test]
+    fn a_state_held_for_a_moment_is_still_removed_and_written_again() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path().join("data"));
+        data.save_state(&SavedState { schema: STATE_SCHEMA, ..SavedState::default() }).unwrap();
+        let path = data.file(STATE_FILE);
+        // FILE_SHARE_READ | FILE_SHARE_WRITE: neither deleting nor renaming it works while this is open.
+        let held = OpenOptions::new().read(true).share_mode(1 | 2).open(&path).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+        });
+        data.remove_state().unwrap();
+        release.join().unwrap();
+        assert!(!path.exists());
+        data.save_state(&SavedState { schema: STATE_SCHEMA, ..SavedState::default() }).unwrap();
+        assert!(path.exists());
+    }
 
     fn account(folder: &Path) -> Account {
         Account {

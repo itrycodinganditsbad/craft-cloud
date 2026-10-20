@@ -522,6 +522,20 @@ mod raw {
         tokio_tungstenite::connect_async(request).await.unwrap().0
     }
 
+    /// [`connect`], with a receive buffer of 64 KiB: an app that never reads then holds up the agent's sends once
+    /// the agent's own send buffer is full, whatever the system would let a receive buffer grow to (macOS lets
+    /// loopback buffers grow to megabytes).
+    pub async fn connect_with_a_small_receive_buffer(agent: &super::Agent) -> Ws {
+        let api: craft_cloud_proto::local::LocalApiFile =
+            serde_json::from_slice(&std::fs::read(agent.data.path().join(craft_cloud_proto::local::LOCAL_API_FILE)).unwrap()).unwrap();
+        let mut request = format!("ws://127.0.0.1:{}/v1/docs", api.port).into_client_request().unwrap();
+        request.headers_mut().insert("authorization", format!("Bearer {}", api.token).parse().unwrap());
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(64 * 1024).unwrap();
+        let stream = socket.connect(std::net::SocketAddr::from(([127, 0, 0, 1], api.port))).await.unwrap();
+        tokio_tungstenite::client_async(request, tokio_tungstenite::MaybeTlsStream::Plain(stream)).await.unwrap().0
+    }
+
     pub async fn send_text(ws: &mut Ws, json: serde_json::Value) {
         ws.send(Message::Text(json.to_string().into())).await.unwrap();
     }
@@ -629,7 +643,7 @@ async fn an_app_that_misbehaves_is_refused_or_dropped_and_the_rest_go_on() {
     .await;
     assert_eq!(other.1.text(), "other");
     // An app that never reads while another floods its document with big changes: dropped (it can't hold the agent up).
-    let mut lazy = raw::connect(&pc).await;
+    let mut lazy = raw::connect_with_a_small_receive_buffer(&pc).await;
     raw::send_text(&mut lazy, serde_json::json!({ "type": "open", "id": 1, "path": "doc.txt", "app": "wordcraft" })).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let good = Arc::new(Mutex::new(good));

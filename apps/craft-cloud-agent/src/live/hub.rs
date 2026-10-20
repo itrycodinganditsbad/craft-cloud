@@ -1340,7 +1340,7 @@ async fn run(
                 state.tell_files();
             }
             _ = write_documents.tick() => {
-                if let Err(e) = state.replica.flush_documents() {
+                if let Err(e) = state.replica.flush_documents_now_and_then() {
                     state.say(format!("the live documents couldn't be written to disk: {e}"));
                 }
             }
