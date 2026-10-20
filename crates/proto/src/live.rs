@@ -62,10 +62,15 @@ use crate::ids::{DeviceId, DocId, Epoch, NodeId, SpaceId};
 
 /// Live protocol versions this build speaks. An agent and a server must share at least one.
 pub const LIVE_PROTOCOL_MIN: u32 = 1;
-pub const LIVE_PROTOCOL_MAX: u32 = 2;
+pub const LIVE_PROTOCOL_MAX: u32 = 3;
 /// The protocol that adds documents linked to files, snapshots, compaction and presence. A connection on an older one
 /// carries recents only.
 pub const LIVE_DOCUMENTS_PROTOCOL: u32 = 2;
+/// The protocol that adds changes in fragments and bundles (`crate::fragments`): the server stages an agent's
+/// fragments and stores a set whole or not at all (acking each fragment's `client_seq` then), and never sends a
+/// fragment or a bundle to a connection on an older protocol (it refuses that connection the document instead: its
+/// agent can't read them). An agent sends fragments only on it.
+pub const LIVE_FRAGMENTS_PROTOCOL: u32 = 3;
 
 /// Largest update, in bytes; largest snapshot of a document (an import, or a compaction), in bytes (it travels through
 /// the chunk API, never in a frame); largest presence message (Loro's ephemeral state: a cursor, a selection, a machine
@@ -622,7 +627,8 @@ mod tests {
     fn versions_are_negotiated_to_the_highest_shared() {
         assert_eq!(shared_version(1, 1), Some(1));
         assert_eq!(shared_version(1, 5), Some(LIVE_PROTOCOL_MAX));
-        assert_eq!(shared_version(2, 5), Some(LIVE_DOCUMENTS_PROTOCOL));
+        assert_eq!(shared_version(2, 5), Some(LIVE_FRAGMENTS_PROTOCOL));
+        assert_eq!(shared_version(1, 2), Some(LIVE_DOCUMENTS_PROTOCOL), "an agent from before fragments");
         assert_eq!(shared_version(LIVE_PROTOCOL_MAX + 1, LIVE_PROTOCOL_MAX + 4), None);
         assert_eq!(shared_version(0, 0), None);
         assert_eq!(shared_version(3, 1), None, "an empty range");

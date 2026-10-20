@@ -118,6 +118,7 @@ on_every_backend!(
     concurrent_live_creates_make_one_document,
     live_pages_stop_at_their_byte_limit,
     a_live_document_is_capped_by_bytes,
+    a_set_of_updates_is_stored_whole_or_not_at_all,
     live_documents_holding_updates_are_capped,
     live_document_rows_are_capped,
     a_document_is_made_by_import_once,
@@ -770,6 +771,30 @@ async fn live_pages_stop_at_their_byte_limit(meta: &Meta) {
     assert!(meta.device_active(dev).await.unwrap());
     meta.revoke_device(ana.id, dev).await.unwrap();
     assert!(!meta.device_active(dev).await.unwrap(), "revoked");
+}
+
+/// A set of updates (a change's fragments) goes into the log whole, with consecutive numbers, or not at all: a set
+/// that would start in a full log is refused whole, nothing of it stored; one that crosses the cap is stored whole (as
+/// one update that crosses it is). Sent again, its updates get their numbers back.
+async fn a_set_of_updates_is_stored_whole_or_not_at_all(meta: &Meta) {
+    use craft_cloud_proto::DocId;
+    let meta = meta.clone().with_live_doc_cap(2500);
+    let ana = user(&meta, "ana").await;
+    let (dev, other) = (device(&meta, &ana).await, device(&meta, &ana).await);
+    let doc = DocId::generate();
+    meta.create_live_doc(ana.space, doc, "document:x", None, NOW).await.unwrap();
+    meta.append_live_update(ana.space, doc, other, 1, &[9; 100], NOW).await.unwrap();
+    let set: Vec<(u64, &[u8])> = vec![(1, &[1u8; 1000][..]), (2, &[2u8; 1000][..]), (3, &[3u8; 1000][..])];
+    let stored = meta.append_live_updates_counted(ana.space, doc, dev, &set, NOW).await.unwrap();
+    assert_eq!(stored.iter().map(|a| a.seq).collect::<Vec<_>>(), vec![2, 3, 4], "consecutive, crossing the cap whole");
+    assert!(stored.iter().all(|a| !a.repeat && a.above_bytes == 3100));
+    let again = meta.append_live_updates_counted(ana.space, doc, dev, &set, NOW).await.unwrap();
+    assert_eq!(again.iter().map(|a| (a.seq, a.repeat)).collect::<Vec<_>>(), vec![(2, true), (3, true), (4, true)]);
+    let next: Vec<(u64, &[u8])> = vec![(4, &[4u8; 10][..]), (5, &[5u8; 10][..])];
+    let full = meta.append_live_updates_counted(ana.space, doc, dev, &next, NOW).await;
+    assert!(matches!(full, Err(MetaError::DocFull { .. })), "{full:?}");
+    let d = meta.live_doc(ana.space, doc).await.unwrap().unwrap();
+    assert_eq!((d.head, d.bytes), (4, 3100), "nothing of the refused set stored");
 }
 
 /// A document's log is capped by bytes, one way: the update that crosses the cap is
