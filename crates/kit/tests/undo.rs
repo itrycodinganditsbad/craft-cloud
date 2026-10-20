@@ -172,9 +172,7 @@ fn typing_in_one_nodes_story_on_both_then_one_undoes() {
     };
     let (mut a, mut b, _pc, _laptop) = pair(&hub, start);
     until(&mut [&mut a, &mut b], "the laptop has the box", |s| s.iter().all(|s| layer_text(s) == "[]"));
-    // The pc types "abc" inside the brackets as one group; the laptop types "XY" after them, each keystroke alone,
-    // interleaved with the pc's.
-    a.begin_group();
+    // The pc types "abc" inside the brackets, the laptop "XY" after them, each keystroke a step, interleaved.
     for (k, (pc, laptop)) in [("a", Some("X")), ("b", Some("Y")), ("c", None)].into_iter().enumerate() {
         change(&mut a, |d| type_in_layer(d, 1 + k, pc)).unwrap();
         if let Some(t) = laptop {
@@ -184,13 +182,16 @@ fn typing_in_one_nodes_story_on_both_then_one_undoes() {
         a.poll();
         b.poll();
     }
-    a.end_group();
     until(&mut [&mut a, &mut b], "both have both", |s| s.iter().all(|s| layer_text(s) == "[abc]XY"));
-    assert!(a.undo().unwrap());
+    for _ in 0..3 {
+        assert!(a.undo().unwrap());
+    }
     until(&mut [&mut a, &mut b], "the pc's typing went on both", |s| s.iter().all(|s| layer_text(s) == "[]XY"));
     assert!(b.undo().unwrap());
     until(&mut [&mut a, &mut b], "the laptop's last keystroke went", |s| s.iter().all(|s| layer_text(s) == "[]X"));
-    assert!(a.redo().unwrap());
+    for _ in 0..3 {
+        assert!(a.redo().unwrap());
+    }
     until(&mut [&mut a, &mut b], "the pc's typing back", |s| s.iter().all(|s| layer_text(s) == "[abc]X"));
 }
 
