@@ -80,6 +80,20 @@ pub trait TableSource {
     fn changed_cells(&self) -> Option<Vec<(ElemId, ElemId)>> {
         None
     }
+    /// Whether the cells are property maps (values and stories of their own, written by
+    /// [`TableSource::write_cell`]) rather than one value each. Then every cell of every row and column is one, and
+    /// [`TableSource::cell`] and [`TableSource::cells`] aren't used.
+    fn cell_maps(&self) -> bool {
+        false
+    }
+    /// For map cells: the same value in two models when the cell is the same; `None`: compare.
+    fn cell_key(&self, _row: ElemId, _column: ElemId) -> Option<usize> {
+        None
+    }
+    /// For map cells: writes the cell's properties and stories ([`Props::set`], [`Props::text`]).
+    fn write_cell(&self, _row: ElemId, _column: ElemId, _props: &mut Props<'_, '_>) -> Result<(), KitError> {
+        Ok(())
+    }
 }
 
 /// An item's place on its track, in the app's time unit.
@@ -177,6 +191,15 @@ impl<T: TableSource + ?Sized> TableSource for &T {
     }
     fn changed_cells(&self) -> Option<Vec<(ElemId, ElemId)>> {
         (**self).changed_cells()
+    }
+    fn cell_maps(&self) -> bool {
+        (**self).cell_maps()
+    }
+    fn cell_key(&self, row: ElemId, column: ElemId) -> Option<usize> {
+        (**self).cell_key(row, column)
+    }
+    fn write_cell(&self, row: ElemId, column: ElemId, props: &mut Props<'_, '_>) -> Result<(), KitError> {
+        (**self).write_cell(row, column, props)
     }
 }
 
@@ -312,6 +335,10 @@ pub struct Touched {
     /// Loro's text deltas, by text, in the order they came (to patch the model's text rather than read it whole).
     pub(crate) text_deltas: BTreeMap<String, Vec<Vec<loro::TextDelta>>>,
     pub(crate) tables: BTreeMap<String, TableTouch>,
+    /// Loro's text deltas of stories nested in tree nodes, by tree, then by node and story key.
+    pub(crate) node_text_deltas: BTreeMap<String, crate::tree::NodeDeltas>,
+    /// Loro's text deltas of stories in map cells, by table, then by row, column and story key.
+    pub(crate) cell_text_deltas: BTreeMap<String, crate::table::CellDeltas>,
     pub(crate) timelines: BTreeMap<String, TimelineTouch>,
     pub(crate) opaques: BTreeSet<String>,
     /// The schema (or the save marks) changed.
@@ -354,7 +381,7 @@ impl RemotePatch<'_> {
     pub fn tree(&self, key: &str) -> Option<TreeView<'_>> {
         let touch = if self.touched.all { TreeTouch::whole() } else { self.touched.trees.get(key)?.clone() };
         let index = self.trees.get(key)?;
-        Some(TreeView::new(self.doc, key, index, touch))
+        Some(TreeView::new(self.doc, key, index, touch, self.touched.node_text_deltas.get(key)))
     }
 
     /// The rich text `key` as it is now, if the change touched it.
@@ -377,7 +404,7 @@ impl RemotePatch<'_> {
     /// The table `key`, if the change touched it.
     pub fn table(&self, key: &str) -> Option<TableView<'_>> {
         let touch = if self.touched.all { TableTouch::whole() } else { self.touched.tables.get(key)?.clone() };
-        Some(TableView::new(self.doc, key, touch))
+        Some(TableView::new(self.doc, key, touch, self.touched.cell_text_deltas.get(key)))
     }
 
     /// The timeline `key`, if the change touched it.

@@ -235,6 +235,14 @@ document's version it was made from.
   to `{$track, $start, $len, …}`; `k.keys`: keyframe ID to `{$item, $at, $value}`), an opaque value (the root map
   `$opaque`, key `k`, bytes). IDs are 16 bytes (little-endian `u128`), or 32 hex digits as map keys. Binary content
   is never in Loro: it is a `{$chunk, $len}` value naming a blob.
+- Inside a tree node's meta map, a timeline item's or track's map, or a table's map cell, an app's codec can put a
+  rich text and a table under a key of its own, as Loro's mergeable child containers (the same container on every
+  machine that makes it, so two first edits at once merge): a story `s` is a `LoroText` at `s` laid out as a root
+  one, its last paragraph's attributes in a mergeable map `$last.s` beside it (made only when there are some); a
+  table `t` is a mergeable map at `t` holding mergeable `rows` and `cols` (movable lists of IDs) and `cells`. A cell
+  is a value, or, when the table's source says its cells are maps, a mergeable map at `row:column` holding the
+  cell's properties and stories. Deleting the key hides the child (a node's story that the app stops writing goes);
+  a deleted node takes everything nested in it.
 - A local change is written as commits of at most 512 KiB each (estimated: payload and 32 bytes per operation), each
   exported at once; an export still over 512 KiB is cut by counter range. One change is one undo step.
 - Presence an app sets is sent as `[u64 peer, big-endian][the app's bytes]`, again every 3 s, and dropped 10 s after

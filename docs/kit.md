@@ -81,6 +81,40 @@ impl LiveDocument for DemoApp {
   content never goes into the document: put it in a [`BlobStore`] ([`AgentBlobs`] is the agent's) and keep the
   [`ChunkRef`].
 
+### Text and tables inside elements
+
+A model with one text per element (a shape's text body, a slide's notes, a table cell's text) or a table per element
+(a table shape) keeps them inside the element, under a key its codec names:
+
+```rust
+fn write(&self, id: ElemId, props: &mut Props<'_, '_>) -> Result<(), KitError> {
+    let shape = self.shape(id);
+    props.set("xfrm", shape.xfrm_json())?;
+    props.text("text", &shape.story())?;          // a rich text, as a root one
+    if let Some(table) = &shape.table {
+        props.table("table", &TableSrc(table))?;  // rows, columns, cells
+    }
+    Ok(())
+}
+```
+
+- A nested story maps exactly as a root one does (marks, paragraph attributes, the diff that writes one insert per
+  keystroke). Two machines typing in one shape's text merge character by character, and a shape deleted on one machine
+  while the other types in it is deleted on both.
+- A table's cells are values, or, when its source says [`TableSource::cell_maps`], property maps written by
+  `write_cell` like a node's, with stories of their own. Every cell of every row and column is then one; a row added
+  on one machine while a column is added on the other leaves the cell they cross unmade: `normalise` makes it (the
+  same plain cell on both, so the repairs are one).
+- Both are mergeable children of the element's map: two machines making a shape's text at once make one. Write a
+  story whenever the element exists (empty if it has none): an element whose story stops being written loses it,
+  and typing that arrives in it then is lost with it.
+- Reading back, [`TreeView::text_patched`] (and [`TableView::cell_text`]) patch the old text with the remote change's
+  deltas, as a root story is patched; [`TreeTouch::stories`] says which stories changed, [`PropsRead::table`] reads a
+  nested table whole.
+
+A change the app makes by itself rather than the user (an upload that finished and now has its chunk reference) goes
+through [`Session::background_change`]: sent like a local change, never an undo step.
+
 ## Opening
 
 ```rust

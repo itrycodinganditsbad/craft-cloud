@@ -8,7 +8,7 @@ mod model;
 use std::sync::Arc;
 
 use craft_cloud_kit::raw::Replica;
-use craft_cloud_kit::{RichText, Value};
+use craft_cloud_kit::{ElemId, RichText, Value};
 use model::{Doc, Grid, Item, Key, Node, Rng, SHAPES, Shape, TestApp, Timeline, edit, valid};
 use proptest::prelude::*;
 
@@ -38,7 +38,7 @@ proptest! {
 
     /// Model to Loro and back: an import, then every change after it, read back exactly.
     #[test]
-    fn every_shape_round_trips(seed in any::<u64>(), shape in 0usize..6) {
+    fn every_shape_round_trips(seed in any::<u64>(), shape in 0usize..8) {
         let mut rng = Rng(seed);
         let mut doc = match SHAPES.get(shape) {
             Some(s) => shape_doc(&mut rng, *s, 12),
@@ -49,7 +49,7 @@ proptest! {
         r.reindex(TREES);
         prop_assert_eq!(&settle(&mut r), &doc);
         for _ in 0..12 {
-            let s = SHAPES.get(shape).copied().unwrap_or(SHAPES[rng.below(5)]);
+            let s = SHAPES.get(shape).copied().unwrap_or(SHAPES[rng.below(SHAPES.len())]);
             let next = edit(&doc, s, &mut rng);
             r.write::<TestApp>(Some(&doc), &next).unwrap();
             doc = settle(&mut r);
@@ -59,7 +59,7 @@ proptest! {
 
     /// Two replicas from one import, random edits on both, then each takes the other's: both end equal, and valid.
     #[test]
-    fn every_shape_merges(seed in any::<u64>(), shape in 0usize..6) {
+    fn every_shape_merges(seed in any::<u64>(), shape in 0usize..8) {
         let mut rng = Rng(seed);
         let start = model::random_doc(&mut rng, 15);
         let mut a = Replica::default();
@@ -71,13 +71,13 @@ proptest! {
         for _round in 0..3 {
             let (mut out_a, mut out_b) = (Vec::new(), Vec::new());
             for _ in 0..rng.below(6) {
-                let s = SHAPES.get(shape).copied().unwrap_or(SHAPES[rng.below(5)]);
+                let s = SHAPES.get(shape).copied().unwrap_or(SHAPES[rng.below(SHAPES.len())]);
                 let next = edit(&da, s, &mut rng);
                 out_a.extend(a.write::<TestApp>(Some(&da), &next).unwrap().0);
                 da = next;
             }
             for _ in 0..rng.below(6) {
-                let s = SHAPES.get(shape).copied().unwrap_or(SHAPES[rng.below(5)]);
+                let s = SHAPES.get(shape).copied().unwrap_or(SHAPES[rng.below(SHAPES.len())]);
                 let next = edit(&db, s, &mut rng);
                 out_b.extend(b.write::<TestApp>(Some(&db), &next).unwrap().0);
                 db = next;
@@ -119,7 +119,7 @@ fn unchanged_parts_write_nothing() {
     let doc = {
         let mut d = doc;
         if model::flatten(&d.layers).is_empty() {
-            d.layers = Arc::new(vec![Arc::new(Node { id: rng.id(), name: "l".into(), children: Vec::new() })]);
+            d.layers = Arc::new(vec![Arc::new(Node::leaf(rng.id(), "l"))]);
         }
         d
     };
@@ -133,6 +133,7 @@ fn unchanged_parts_write_nothing() {
         grid: Arc::new((*doc.grid).clone()),
         timeline: Arc::new((*doc.timeline).clone()),
         settings: Arc::new((*doc.settings).clone()),
+        cards: Arc::new((*doc.cards).clone()),
         words: doc.words,
     };
     assert_eq!(ops(&mut r, &doc, &copy), 0, "the same content writes nothing");
@@ -161,6 +162,160 @@ fn unchanged_parts_write_nothing() {
     let doc = celled;
     let settings = Doc { settings: Arc::new(vec![1, 2, 3]), ..doc.clone() };
     assert_eq!(ops(&mut r, &doc, &settings), 1, "one value");
+    let doc = settings;
+    // A keystroke in a layer's own story, and one in a card of a layer's nested table.
+    let typed =
+        Doc { layers: Arc::new(model::update(&doc.layers, first, &|n| Node { text: model::type_at(&n.text, 0, "Q"), ..n.clone() })), ..doc.clone() };
+    assert_eq!(ops(&mut r, &doc, &typed), 1, "a keystroke in a node's story is one insert");
+    let doc = typed;
+    let carded = Doc {
+        layers: Arc::new(model::update(&doc.layers, first, &|n| Node { cards: Some(Arc::new(model::one_card(&mut Rng(9), "c"))), ..n.clone() })),
+        ..doc.clone()
+    };
+    r.write::<TestApp>(Some(&doc), &carded).unwrap();
+    let doc = carded;
+    let in_card = Doc {
+        layers: Arc::new(model::update(&doc.layers, first, &|n| {
+            let mut c = (**n.cards.as_ref().unwrap()).clone();
+            let card = c.cells.values_mut().next().unwrap();
+            card.text = model::type_at(&card.text, 1, "!");
+            Node { cards: Some(Arc::new(c)), ..n.clone() }
+        })),
+        ..doc.clone()
+    };
+    assert_eq!(ops(&mut r, &doc, &in_card), 1, "a keystroke in a nested cell's story is one insert");
+    // The same document again in new allocations writes nothing, stories and nested tables included.
+    let copy = Doc { layers: Arc::new(in_card.layers.iter().map(|n| Arc::new((**n).clone())).collect()), ..in_card.clone() };
+    assert_eq!(ops(&mut r, &in_card, &copy), 0);
+}
+
+fn layer(id: ElemId, text: &str) -> Arc<Node> {
+    Arc::new(Node { text: RichText::plain(text), ..Node::leaf(id, "layer") })
+}
+
+fn layer_text(doc: &Doc, id: ElemId) -> Option<String> {
+    model::find(&doc.layers, id).map(|n| n.text.text.clone())
+}
+
+fn type_in_layer(doc: &Doc, id: ElemId, at: usize, s: &str) -> Doc {
+    Doc { layers: Arc::new(model::update(&doc.layers, id, &|n| Node { text: model::type_at(&n.text, at, s), ..n.clone() })), ..doc.clone() }
+}
+
+/// Two machines typing in one layer's story at once (a shape's text): it merges character by character, both words
+/// whole, each where it was typed; marks made meanwhile on one side cover the same characters on both.
+#[test]
+fn typing_in_one_nodes_story_at_once_merges() {
+    let mut rng = Rng(21);
+    let id = rng.id();
+    let (mut a, mut b, doc) = pair(&Doc { layers: Arc::new(vec![layer(id, "abcd")]), ..Doc::empty() });
+    a.write::<TestApp>(Some(&doc), &type_in_layer(&doc, id, 1, "XY")).unwrap();
+    b.write::<TestApp>(Some(&doc), &type_in_layer(&doc, id, 3, "12")).unwrap();
+    let merged = exchange(&mut a, &mut b);
+    assert_eq!(layer_text(&merged, id).as_deref(), Some("aXYbc12d"));
+    // At one spot at once: both words, not interleaved.
+    a.write::<TestApp>(Some(&merged), &type_in_layer(&merged, id, 0, "PQR")).unwrap();
+    b.write::<TestApp>(Some(&merged), &type_in_layer(&merged, id, 0, "789")).unwrap();
+    let merged = exchange(&mut a, &mut b);
+    let text = layer_text(&merged, id).unwrap();
+    assert!(text == "PQR789aXYbc12d" || text == "789PQRaXYbc12d", "{text}");
+    // A bolds "bc" while B types inside it.
+    let bold = Doc {
+        layers: Arc::new(model::update(&merged.layers, id, &|n| Node {
+            text: model::format(&n.text, 9..11, "b", Some(Value::Bool(true))),
+            ..n.clone()
+        })),
+        ..merged.clone()
+    };
+    a.write::<TestApp>(Some(&merged), &bold).unwrap();
+    b.write::<TestApp>(Some(&merged), &type_in_layer(&merged, id, 10, "_")).unwrap();
+    let merged = exchange(&mut a, &mut b);
+    let n = model::find(&merged.layers, id).unwrap();
+    let bolded: String = n.text.text.char_indices().filter(|(i, _)| n.text.attrs_at(*i).contains_key("b")).map(|(_, c)| c).collect();
+    assert_eq!(bolded, "b_c", "the bold covers what was typed inside it: {:?}", n.text);
+}
+
+/// A layer deleted on one machine while the other types in its story: deleted on both, nothing left of it.
+#[test]
+fn a_node_deleted_while_typed_in_is_gone_on_both() {
+    let mut rng = Rng(22);
+    let (id, other) = (rng.id(), rng.id());
+    let (mut a, mut b, doc) = pair(&Doc { layers: Arc::new(vec![layer(id, "hello"), layer(other, "stays")]), ..Doc::empty() });
+    a.write::<TestApp>(Some(&doc), &Doc { layers: Arc::new(model::remove(&doc.layers, id).0), ..doc.clone() }).unwrap();
+    let mut typed = doc.clone();
+    for (k, c) in ["x", "y", "z"].into_iter().enumerate() {
+        let next = type_in_layer(&typed, id, 5 + k, c);
+        b.write::<TestApp>(Some(&typed), &next).unwrap();
+        typed = next;
+    }
+    let merged = exchange(&mut a, &mut b);
+    assert!(model::find(&merged.layers, id).is_none(), "the layer is gone on both");
+    assert_eq!(layer_text(&merged, other).as_deref(), Some("stays"));
+    // And it stays gone after more typing elsewhere.
+    let next = type_in_layer(&merged, other, 0, "!");
+    b.write::<TestApp>(Some(&merged), &next).unwrap();
+    let merged = exchange(&mut a, &mut b);
+    assert_eq!(model::flatten(&merged.layers).len(), 1);
+}
+
+fn type_in_card(cards: &model::Cards, cell: (ElemId, ElemId), at: usize, s: &str) -> model::Cards {
+    let mut c = cards.clone();
+    if let Some(card) = c.cells.get_mut(&cell) {
+        card.text = model::type_at(&card.text, at, s);
+    }
+    c
+}
+
+/// A table whose cells are maps with stories: typing in one cell's story at once merges; a row added on one machine
+/// while a column is added on the other leaves one cell nobody made, which both machines' `normalise` make alike; a
+/// row deleted while its cell is typed in goes with its cells. The same in a table nested in a layer.
+#[test]
+fn stories_in_cells_merge() {
+    let mut rng = Rng(23);
+    let cards = model::one_card(&mut rng, "ab");
+    let cell = *cards.cells.keys().next().unwrap();
+    let id = rng.id();
+    let start = Doc {
+        cards: Arc::new(cards.clone()),
+        layers: Arc::new(vec![Arc::new(Node { cards: Some(Arc::new(cards.clone())), ..Node::leaf(id, "with cards") })]),
+        ..Doc::empty()
+    };
+    let (mut a, mut b, doc) = pair(&start);
+    // Typing at once in the root table's cell, and in the nested one's.
+    let nested = |d: &Doc, f: &dyn Fn(&model::Cards) -> model::Cards| Doc {
+        layers: Arc::new(model::update(&d.layers, id, &|n| Node { cards: n.cards.as_deref().map(|c| Arc::new(f(c))), ..n.clone() })),
+        ..d.clone()
+    };
+    let da = nested(&Doc { cards: Arc::new(type_in_card(&doc.cards, cell, 1, "X")), ..doc.clone() }, &|c| type_in_card(c, cell, 0, "<"));
+    let db = nested(&Doc { cards: Arc::new(type_in_card(&doc.cards, cell, 2, "Y")), ..doc.clone() }, &|c| type_in_card(c, cell, 2, ">"));
+    a.write::<TestApp>(Some(&doc), &da).unwrap();
+    b.write::<TestApp>(Some(&doc), &db).unwrap();
+    let merged = exchange(&mut a, &mut b);
+    assert_eq!(merged.cards.cells[&cell].text.text, "aXbY");
+    let inner = model::find(&merged.layers, id).unwrap().cards.clone().unwrap();
+    assert_eq!(inner.cells[&cell].text.text, "<ab>");
+    // A row on one machine, a column on the other.
+    let mut ca = (*merged.cards).clone();
+    let r = rng.id();
+    ca.rows.push(r);
+    ca.cells.insert((r, cell.1), model::Card::default());
+    let mut cb = (*merged.cards).clone();
+    let c = rng.id();
+    cb.cols.push(c);
+    cb.cells.insert((cell.0, c), model::Card { n: 7, text: RichText::plain("new") });
+    a.write::<TestApp>(Some(&merged), &Doc { cards: Arc::new(ca), ..merged.clone() }).unwrap();
+    b.write::<TestApp>(Some(&merged), &Doc { cards: Arc::new(cb), ..merged.clone() }).unwrap();
+    let merged = exchange(&mut a, &mut b);
+    assert_eq!((merged.cards.rows.len(), merged.cards.cols.len(), merged.cards.cells.len()), (2, 2, 4), "the missing card is made");
+    assert_eq!(merged.cards.cells[&(cell.0, c)].text.text, "new");
+    assert_eq!(merged.cards.cells[&(r, c)], model::Card::default());
+    // The new row deleted on A while B types in its card.
+    let mut ca = (*merged.cards).clone();
+    ca.rows.retain(|x| *x != r);
+    ca.cells.retain(|(x, _), _| *x != r);
+    a.write::<TestApp>(Some(&merged), &Doc { cards: Arc::new(ca), ..merged.clone() }).unwrap();
+    b.write::<TestApp>(Some(&merged), &Doc { cards: Arc::new(type_in_card(&merged.cards, (r, c), 0, "lost")), ..merged.clone() }).unwrap();
+    let merged = exchange(&mut a, &mut b);
+    assert_eq!((merged.cards.rows.len(), merged.cards.cells.len()), (1, 2));
 }
 
 /// Two replicas of `doc`.
@@ -272,8 +427,7 @@ fn rows_inserted_at_once_are_both_kept() {
 fn moves_that_would_make_a_cycle_end_in_one_tree() {
     let mut rng = Rng(11);
     let (x, y) = (rng.id(), rng.id());
-    let layers =
-        vec![Arc::new(Node { id: x, name: "x".into(), children: Vec::new() }), Arc::new(Node { id: y, name: "y".into(), children: Vec::new() })];
+    let layers = vec![Arc::new(Node::leaf(x, "x")), Arc::new(Node::leaf(y, "y"))];
     let (mut a, mut b, doc) = pair(&Doc { layers: Arc::new(layers), ..Doc::empty() });
     let (rest, taken) = model::remove(&doc.layers, x);
     let a_moves = Doc { layers: Arc::new(model::insert(&rest, Some(y), 0, taken.unwrap())), ..doc.clone() };

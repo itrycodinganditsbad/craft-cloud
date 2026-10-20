@@ -1,5 +1,6 @@
 //! The kit simulation: app sessions on three machines of one fake hub (two apps on the third), each making random
-//! edits of every shape (tree, rich text, table, timeline, opaque), undoing and redoing, saving, while machines go
+//! edits of every shape (tree, rich text, table, timeline, opaque; stories and tables nested in layers, a table whose
+//! cells are maps with stories), undoing and redoing, saving, while machines go
 //! offline, drop their apps' connections and restart, and the live relay goes down while files still sync. Healed,
 //! every session ends with the same model, every model is one the app could make (normalised), and the file catches up
 //! with the autosave rule within a save per window.

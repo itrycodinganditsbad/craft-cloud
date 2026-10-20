@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use loro::{LoroDoc, LoroMap, LoroMovableList, ValueOrContainer};
+use loro::{LoroDoc, LoroMap, LoroMovableList, StyleConfigMap, ValueOrContainer};
 
 use crate::mapping::{Span, TimelineSource, props_of};
 use crate::props::{Props, PropsRead};
@@ -78,7 +78,13 @@ fn all_items(src: &dyn TimelineSource) -> HashMap<ElemId, ElemId> {
 }
 
 /// Writes what changed from `old` to `new` (everything, when `old` is `None`) into the timeline `key`.
-pub(crate) fn write(w: &mut Writer<'_>, key: &str, old: Option<&dyn TimelineSource>, new: &dyn TimelineSource) -> Result<(), KitError> {
+pub(crate) fn write(
+    w: &mut Writer<'_>,
+    key: &str,
+    old: Option<&dyn TimelineSource>,
+    new: &dyn TimelineSource,
+    styles: &mut StyleConfigMap,
+) -> Result<(), KitError> {
     if let (Some(old), Some(k)) = (old, new.key())
         && old.key() == Some(k)
     {
@@ -98,7 +104,7 @@ pub(crate) fn write(w: &mut Writer<'_>, key: &str, old: Option<&dyn TimelineSour
             continue;
         }
         let map = child_map(w, &c.track_props, &track.hex())?;
-        let mut props = Props::new(map, w);
+        let mut props = Props::new(map, w, styles);
         new.write_track(*track, &mut props)?;
         props.finish()?;
         for item in new.items(*track) {
@@ -107,7 +113,7 @@ pub(crate) fn write(w: &mut Writer<'_>, key: &str, old: Option<&dyn TimelineSour
             if same_item {
                 continue;
             }
-            write_item(w, &c, item, *track, old, new)?;
+            write_item(w, &c, item, *track, old, new, styles)?;
         }
     }
     // Items gone, with their keyframes.
@@ -129,6 +135,7 @@ fn write_item(
     track: ElemId,
     old: Option<&dyn TimelineSource>,
     new: &dyn TimelineSource,
+    styles: &mut StyleConfigMap,
 ) -> Result<(), KitError> {
     let Some(Span { start, len }) = new.span(item) else {
         return Err(KitError::Invalid(format!("the item {item} has no span")));
@@ -137,7 +144,7 @@ fn write_item(
     w.set(&map, TRACK, &Value::Bytes(track.0.to_le_bytes().to_vec()))?;
     w.set(&map, START, &Value::I64(start))?;
     w.set(&map, LEN, &Value::I64(len))?;
-    let mut props = Props::new(map, w);
+    let mut props = Props::new(map, w, styles);
     new.write_item(item, &mut props)?;
     props.finish()?;
     // Keyframes: by ID; only the ones that changed.

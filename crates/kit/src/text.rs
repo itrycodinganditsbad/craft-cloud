@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use loro::cursor::PosType;
-use loro::{ExpandType, LoroDoc, LoroText, StyleConfig, StyleConfigMap, TextDelta, ValueOrContainer};
+use loro::{Container, ExpandType, LoroDoc, LoroMap, LoroText, StyleConfig, StyleConfigMap, TextDelta, ValueOrContainer};
 
 use crate::mapping::{Attrs, TextSource};
 use crate::writer::Writer;
@@ -25,6 +25,71 @@ const PARA: char = '¶';
 
 pub(crate) fn last_name(key: &str) -> String {
     format!("{key}.last")
+}
+
+/// The key, beside a nested story in its node's or cell's map, of the map holding its last paragraph's attributes.
+pub(crate) fn nested_last_key(key: &str) -> String {
+    format!("$last.{key}")
+}
+
+/// Where the last paragraph's attributes of a story are kept.
+#[derive(Clone)]
+enum Last {
+    /// A root story's: the root map `<key>.last`.
+    Root(LoroMap),
+    /// A nested story's: a mergeable map beside it in its parent map, made only when there is something to keep.
+    Under { parent: LoroMap, key: String },
+}
+
+/// One rich text in the document: a root story (a part of its own), or a story nested in a tree node's or a table
+/// cell's map, under a key the app's codec names. Both map, diff, mark and patch the same way.
+#[derive(Clone)]
+pub(crate) struct Story {
+    pub(crate) text: LoroText,
+    last: Last,
+}
+
+impl Story {
+    /// The root story `key`.
+    pub(crate) fn root(doc: &LoroDoc, key: &str) -> Self {
+        Self { text: doc.get_text(key), last: Last::Root(doc.get_map(last_name(key))) }
+    }
+
+    /// The story under `key` of `parent`, made if it isn't there: a mergeable child, so two machines making it at once
+    /// make one, and their typing merges in it.
+    pub(crate) fn nested(parent: &LoroMap, key: &str) -> Result<Self, KitError> {
+        let text = parent.ensure_mergeable_text(key)?;
+        Ok(Self { text, last: Last::Under { parent: parent.clone(), key: nested_last_key(key) } })
+    }
+
+    /// The story under `key` of `parent`, if there is one.
+    pub(crate) fn existing(parent: &LoroMap, key: &str) -> Option<Self> {
+        match parent.get(key)? {
+            ValueOrContainer::Container(Container::Text(text)) => {
+                Some(Self { text, last: Last::Under { parent: parent.clone(), key: nested_last_key(key) } })
+            }
+            _ => None,
+        }
+    }
+
+    /// The map of the last paragraph's attributes, if there is one.
+    fn last_map(&self) -> Option<LoroMap> {
+        match &self.last {
+            Last::Root(map) => Some(map.clone()),
+            Last::Under { parent, key } => match parent.get(key)? {
+                ValueOrContainer::Container(Container::Map(map)) => Some(map),
+                _ => None,
+            },
+        }
+    }
+
+    /// The map of the last paragraph's attributes, made if it isn't there.
+    fn last_map_made(&self) -> Result<LoroMap, KitError> {
+        match &self.last {
+            Last::Root(map) => Ok(map.clone()),
+            Last::Under { parent, key } => Ok(parent.ensure_mergeable_map(key)?),
+        }
+    }
 }
 
 /// A story as plain data: text, character runs and paragraph attributes. It is a [`TextSource`] too.
@@ -264,7 +329,7 @@ fn breaks(text: &str) -> Vec<usize> {
     text.bytes().enumerate().filter(|(_, b)| *b == b'\n').map(|(i, _)| i).collect()
 }
 
-/// Writes what changed from `old` to `new` (everything, when `old` is `None`) into the text `key`.
+/// Writes what changed from `old` to `new` (everything, when `old` is `None`) into the root text `key`.
 pub(crate) fn write(
     w: &mut Writer<'_>,
     key: &str,
@@ -277,7 +342,19 @@ pub(crate) fn write(
     {
         return Ok(());
     }
-    let text = w.doc.get_text(key);
+    let story = Story::root(w.doc, key);
+    write_story(w, &story, old, new, styles)
+}
+
+/// Writes what changed from `old` (`None`: what the story holds) to `new` into `story`.
+pub(crate) fn write_story(
+    w: &mut Writer<'_>,
+    story: &Story,
+    old: Option<&dyn TextSource>,
+    new: &dyn TextSource,
+    styles: &mut StyleConfigMap,
+) -> Result<(), KitError> {
+    let text = story.text.clone();
     let new_text = new.text();
     let new_runs = new.runs();
     check_runs(new_text, &new_runs)?;
@@ -293,7 +370,7 @@ pub(crate) fn write(
     let (old_text, old_runs, old_paras): (Cow<'_, str>, Cow<'_, [Run]>, Cow<'_, [Attrs]>) = match old {
         Some(o) if text.len_utf8() == o.text().len() => (Cow::Borrowed(o.text()), o.runs(), o.paragraphs()),
         _ => {
-            stored = read(w.doc, key);
+            stored = read_story(story);
             (Cow::Owned(stored.text), Cow::Owned(stored.runs), Cow::Owned(stored.paragraphs))
         }
     };
@@ -380,27 +457,34 @@ pub(crate) fn write(
         }
         apply(w, &text, styles, differences(&desired, &current), &PARA.to_string())?;
     }
-    // The last paragraph's.
-    let last = w.doc.get_map(last_name(key));
+    // The last paragraph's (a nested story's map is made only when there is something to keep).
     let want = new_paras.get(new_count).cloned().unwrap_or_default();
-    for (k, v) in &want {
-        w.set(&last, k, v)?;
-    }
-    let mut stale = Vec::new();
-    last.for_each(|k, _| {
-        if !want.contains_key(k) {
-            stale.push(k.to_owned());
+    let last = if want.is_empty() { story.last_map() } else { Some(story.last_map_made()?) };
+    if let Some(last) = last {
+        for (k, v) in &want {
+            w.set(&last, k, v)?;
         }
-    });
-    for k in stale {
-        w.delete(&last, &k)?;
+        let mut stale = Vec::new();
+        last.for_each(|k, _| {
+            if !want.contains_key(k) {
+                stale.push(k.to_owned());
+            }
+        });
+        for k in stale {
+            w.delete(&last, &k)?;
+        }
     }
     Ok(())
 }
 
-/// The text `key` as stored.
+/// The root text `key` as stored.
 pub(crate) fn read(doc: &LoroDoc, key: &str) -> RichText {
-    let text = doc.get_text(key);
+    read_story(&Story::root(doc, key))
+}
+
+/// A story as stored.
+pub(crate) fn read_story(story: &Story) -> RichText {
+    let text = &story.text;
     let mut out = RichText::default();
     for delta in text.to_delta() {
         let TextDelta::Insert { insert, attributes } = delta else { continue };
@@ -419,14 +503,15 @@ pub(crate) fn read(doc: &LoroDoc, key: &str) -> RichText {
             _ => out.runs.push((start..end, chars)),
         }
     }
-    out.paragraphs.push(last_paragraph(doc, key));
+    out.paragraphs.push(last_paragraph(story));
     out
 }
 
 /// The last paragraph's attributes, as stored beside the text.
-fn last_paragraph(doc: &LoroDoc, key: &str) -> Attrs {
+fn last_paragraph(story: &Story) -> Attrs {
     let mut last = Attrs::new();
-    doc.get_map(last_name(key)).for_each(|k, v| {
+    let Some(map) = story.last_map() else { return last };
+    map.for_each(|k, v| {
         if let ValueOrContainer::Value(v) = v
             && let Some(v) = Value::from_loro(&v)
         {
@@ -535,6 +620,11 @@ fn changes<'a>(attributes: impl IntoIterator<Item = (&'a String, &'a loro::LoroV
 /// changed is touched (a remote keystroke in a 1 MB story copies the text once and moves its runs, without reading the
 /// whole text back from Loro). `None` when the deltas don't fit `old` (the model was out of step): read it whole.
 pub(crate) fn patch(doc: &LoroDoc, key: &str, old: &dyn TextSource, deltas: &[Vec<TextDelta>]) -> Option<RichText> {
+    patch_story(&Story::root(doc, key), old, deltas)
+}
+
+/// [`patch`] for any story.
+pub(crate) fn patch_story(story: &Story, old: &dyn TextSource, deltas: &[Vec<TextDelta>]) -> Option<RichText> {
     let mut text = old.text().to_owned();
     let mut runs: Vec<(Range<usize>, Attrs)> = old.runs().into_owned();
     let mut paras: Vec<Attrs> = old.paragraphs().into_owned();
@@ -627,10 +717,10 @@ pub(crate) fn patch(doc: &LoroDoc, key: &str, old: &dyn TextSource, deltas: &[Ve
         paras = new_paras;
     }
     // Out of step with what Loro holds: no answer.
-    if text.len() != doc.get_text(key).len_utf8() || paras.len() != text.matches('\n').count() {
+    if text.len() != story.text.len_utf8() || paras.len() != text.matches('\n').count() {
         return None;
     }
-    paras.push(last_paragraph(doc, key));
+    paras.push(last_paragraph(story));
     Some(RichText { text, runs, paragraphs: paras })
 }
 

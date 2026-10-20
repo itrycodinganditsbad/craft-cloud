@@ -285,8 +285,13 @@ struct Raw {
     nodes: Vec<TreeID>,
     keys: Vec<String>,
     tree: bool,
-    /// A text's delta (the text root's own).
+    /// A text's delta (the text root's own, or a nested story's).
     text: Option<Vec<loro::TextDelta>>,
+    /// The deepest tree node on the path, and the keys after it (a story nested in a node: `["text"]`).
+    node: Option<TreeID>,
+    under_node: Vec<String>,
+    /// The keys after the root's own (a story in a root table's map cell: `["<row>:<col>", "text"]`).
+    under_root: Vec<String>,
 }
 
 #[derive(Default)]
@@ -428,7 +433,7 @@ pub(crate) fn write_diff<D: LiveDocument>(w: &mut Writer<'_>, old: Option<&D::Do
                     _ => None,
                 };
                 let index = ctx.trees.entry((*key).to_owned()).or_default();
-                crate::tree::write(w, key, o, n.as_ref(), index)?;
+                crate::tree::write(w, key, o, n.as_ref(), index, &mut ctx.styles)?;
             }
             Part::Text(n) => {
                 let o = match old_part {
@@ -442,14 +447,14 @@ pub(crate) fn write_diff<D: LiveDocument>(w: &mut Writer<'_>, old: Option<&D::Do
                     Some(Part::Table(o)) => Some(o.as_ref()),
                     _ => None,
                 };
-                crate::table::write(w, key, o, n.as_ref())?;
+                crate::table::write(w, key, o, n.as_ref(), &mut ctx.styles)?;
             }
             Part::Timeline(n) => {
                 let o = match old_part {
                     Some(Part::Timeline(o)) => Some(o.as_ref()),
                     _ => None,
                 };
-                crate::timeline::write(w, key, o, n.as_ref())?;
+                crate::timeline::write(w, key, o, n.as_ref(), &mut ctx.styles)?;
             }
             Part::Opaque(n) => {
                 let o = match old_part {
@@ -751,6 +756,57 @@ impl<D: LiveDocument> Session<D> {
             }
             Err(e) => {
                 // What was written stays (and goes out); the model is built again from the document, so they agree.
+                if self.doc.oplog_vv() != before {
+                    self.reindex_trees();
+                    let _ = self.rebuild(Touched::everything());
+                }
+                self.status.error = Some(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    /// A change the app makes by itself rather than the user (a media upload that finished and now has its chunk
+    /// reference, bytes read back into the model): written and sent like [`Session::local_change`], with the same
+    /// rules for `old`, but never an undo step, so undo never takes it back.
+    pub fn background_change(&mut self, old: &Arc<D::Doc>, new: &Arc<D::Doc>) -> Result<(), KitError> {
+        if let Some(ro) = &self.status.read_only {
+            return Err(KitError::ReadOnly { app: ro.app.clone(), version: ro.version });
+        }
+        if self.model_stale {
+            return Err(KitError::ModelStale);
+        }
+        if !Arc::ptr_eq(old, &self.model) {
+            return Err(KitError::Stale);
+        }
+        if Arc::ptr_eq(old, new) {
+            return Ok(());
+        }
+        if self.outbox_bytes >= MAX_QUEUE_BYTES {
+            self.status.stalled = true;
+            return Err(KitError::Stalled(self.outbox_bytes));
+        }
+        let before = self.doc.oplog_vv();
+        let mut w = Writer::new(&self.doc, KIT_ORIGIN);
+        let wrote = write_diff::<D>(&mut w, Some(old.as_ref()), new.as_ref(), &mut self.ctx);
+        let updates = match w.finish() {
+            Ok((updates, _)) => updates,
+            Err(_) => {
+                let mut rest = Vec::new();
+                let _ = export_since(&self.doc, &before, &mut rest);
+                rest
+            }
+        };
+        if self.doc.oplog_vv() != before {
+            self.changed_since_save = true;
+        }
+        self.queue(updates);
+        match wrote {
+            Ok(()) => {
+                self.model = new.clone();
+                Ok(())
+            }
+            Err(e) => {
                 if self.doc.oplog_vv() != before {
                     self.reindex_trees();
                     let _ = self.rebuild(Touched::everything());
@@ -1141,6 +1197,7 @@ impl<D: LiveDocument> Session<D> {
     fn classify(&mut self, raw: Vec<Raw>) -> Touched {
         let mut touched = Touched::default();
         let mut reindex = Vec::new();
+        let mut nested: Vec<(&'static str, TreeID, String, Option<Vec<loro::TextDelta>>)> = Vec::new();
         for r in raw {
             if r.root == ROOT {
                 touched.kit = true;
@@ -1165,6 +1222,12 @@ impl<D: LiveDocument> Session<D> {
                         reindex.push(key);
                     }
                     t.nodes.extend(r.nodes.iter().filter_map(|n| self.ctx.trees.get(key).and_then(|i| i.elem_of.get(n)).copied()));
+                    // Inside a node's child container (its story, its table): named once the index is current.
+                    if let Some(tid) = r.node
+                        && !r.under_node.is_empty()
+                    {
+                        nested.push((key, tid, r.under_node.join("/"), r.text.clone()));
+                    }
                 }
                 Kind::Text => {
                     touched.texts.insert(key.to_owned());
@@ -1179,7 +1242,25 @@ impl<D: LiveDocument> Session<D> {
                     match suffix {
                         "rows" => t.rows = true,
                         "cols" => t.columns = true,
-                        _ => t.cells.extend(r.keys.iter().filter_map(|k| parse_cell_key(k))),
+                        _ => {
+                            t.cells.extend(r.keys.iter().filter_map(|k| parse_cell_key(k)));
+                            // A map cell's story: the cell, then the story's key.
+                            if let (Some(cell), Some(story)) = (r.under_root.first().and_then(|k| parse_cell_key(k)), r.under_root.get(1..))
+                                && !story.is_empty()
+                            {
+                                let story = story.join("/");
+                                t.stories.insert((cell.0, cell.1, story.clone()));
+                                if let Some(delta) = r.text.clone() {
+                                    touched
+                                        .cell_text_deltas
+                                        .entry(key.to_owned())
+                                        .or_default()
+                                        .entry((cell.0, cell.1, story))
+                                        .or_default()
+                                        .push(delta);
+                                }
+                            }
+                        }
                     }
                 }
                 Kind::Timeline => {
@@ -1204,6 +1285,16 @@ impl<D: LiveDocument> Session<D> {
                 }
             }
             self.ctx.trees.insert(key.to_owned(), index);
+        }
+        for (key, tid, story, delta) in nested {
+            let Some(id) = self.ctx.trees.get(key).and_then(|i| i.elem_of.get(&tid)).copied() else { continue };
+            if let Some(t) = touched.trees.get_mut(key) {
+                t.nodes.insert(id);
+                t.stories.insert((id, story.clone()));
+            }
+            if let Some(delta) = delta {
+                touched.node_text_deltas.entry(key.to_owned()).or_default().entry((id, story)).or_default().push(delta);
+            }
         }
         touched
     }
@@ -1451,10 +1542,22 @@ fn collect(collector: &Mutex<Collector>, event: DiffEvent<'_>) {
         let first = diff.path.first().map(|(id, _)| id).unwrap_or(diff.target);
         let Some(root) = root_name(first) else { continue };
         let mut raw = Raw { root, ..Raw::default() };
-        for (_, index) in diff.path {
+        for (i, (_, index)) in diff.path.iter().enumerate() {
             match index {
-                Index::Node(t) => raw.nodes.push(*t),
-                Index::Key(k) => raw.keys.push(k.to_string()),
+                Index::Node(t) => {
+                    raw.nodes.push(*t);
+                    raw.node = Some(*t);
+                    raw.under_node.clear();
+                }
+                Index::Key(k) => {
+                    raw.keys.push(k.to_string());
+                    if i > 0 {
+                        raw.under_root.push(k.to_string());
+                        if raw.node.is_some() {
+                            raw.under_node.push(k.to_string());
+                        }
+                    }
+                }
                 Index::Seq(_) => {}
             }
         }

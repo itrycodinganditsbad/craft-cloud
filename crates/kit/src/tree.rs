@@ -6,12 +6,13 @@
 //! the old one; under each parent it visits, it creates what is missing, moves only what is out of order (the longest
 //! run in order stays), and deletes, at the end, what left and went nowhere else.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use loro::{LoroDoc, LoroTree, TreeID, TreeParentId, ValueOrContainer};
+use loro::{LoroDoc, LoroTree, StyleConfigMap, TextDelta, TreeID, TreeParentId, ValueOrContainer};
 
-use crate::mapping::{TreeSource, props_of};
+use crate::mapping::{TextSource, TreeSource, props_of};
 use crate::props::{Props, PropsRead};
+use crate::text::RichText;
 use crate::writer::Writer;
 use crate::{ElemId, KitError};
 
@@ -71,6 +72,7 @@ pub(crate) fn write(
     old: Option<&dyn TreeSource>,
     new: &dyn TreeSource,
     index: &mut TreeIndex,
+    styles: &mut StyleConfigMap,
 ) -> Result<(), KitError> {
     if let (Some(old), Some(k)) = (old, new.key())
         && old.key() == Some(k)
@@ -108,7 +110,7 @@ pub(crate) fn write(
                 skipped.push(tid);
                 continue;
             }
-            let mut props = Props::new(tree.get_meta(tid)?, w);
+            let mut props = Props::new(tree.get_meta(tid)?, w, styles);
             new.write(*id, &mut props)?;
             props.finish()?;
             stack.push((TreeParentId::Node(tid), new.children(*id)));
@@ -195,26 +197,45 @@ pub struct TreeTouch {
     pub all: bool,
     /// Nodes were created, moved or deleted: read the structure again.
     pub structure: bool,
-    /// The nodes whose properties changed (and the ones created).
+    /// The nodes whose properties, stories or tables changed (and the ones created).
     pub nodes: BTreeSet<ElemId>,
+    /// What changed inside nodes' child containers: the node and the path of keys under it (`text` for the story
+    /// `text`; `table/cells/<row>:<col>/text` for a story in a cell of the table `table`).
+    pub stories: BTreeSet<(ElemId, String)>,
 }
 
 impl TreeTouch {
     pub(crate) fn whole() -> Self {
-        Self { all: true, structure: true, nodes: BTreeSet::new() }
+        Self { all: true, structure: true, ..Self::default() }
     }
 }
+
+/// Loro's text deltas of the stories nested in a tree's nodes, by node and story key, in the order they came.
+pub(crate) type NodeDeltas = BTreeMap<(ElemId, String), Vec<Vec<TextDelta>>>;
 
 /// A tree as stored, after a remote change.
 pub struct TreeView<'a> {
     tree: LoroTree,
     index: &'a TreeIndex,
     touch: TreeTouch,
+    deltas: Option<&'a NodeDeltas>,
 }
 
 impl<'a> TreeView<'a> {
-    pub(crate) fn new(doc: &'a LoroDoc, key: &str, index: &'a TreeIndex, touch: TreeTouch) -> Self {
-        Self { tree: doc.get_tree(key), index, touch }
+    pub(crate) fn new(doc: &'a LoroDoc, key: &str, index: &'a TreeIndex, touch: TreeTouch, deltas: Option<&'a NodeDeltas>) -> Self {
+        Self { tree: doc.get_tree(key), index, touch, deltas }
+    }
+
+    /// An element's story `key` as stored (`None`: it has none).
+    pub fn text(&self, id: ElemId, key: &str) -> Option<RichText> {
+        self.props(id)?.text(key)
+    }
+
+    /// An element's story `key`, patched from `old` (the app's text of it before the change: only what changed is
+    /// touched) when the remote change's deltas fit it, else read whole. `None`: it has none.
+    pub fn text_patched(&self, id: ElemId, key: &str, old: Option<&dyn TextSource>) -> Option<RichText> {
+        let deltas = self.deltas.and_then(|d| d.get(&(id, key.to_owned())));
+        self.props(id)?.text_patched(key, old, deltas)
     }
 
     pub fn touch(&self) -> &TreeTouch {
