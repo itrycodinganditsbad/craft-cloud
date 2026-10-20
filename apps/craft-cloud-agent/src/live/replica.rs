@@ -1387,6 +1387,16 @@ impl Doc {
         // (The catch-up brings every row again, fragments too.)
         self.fragments.clear();
         self.stuck = false;
+        // The rest of an own set whose first fragments were acked (the log may not hold them any more: a restore)
+        // goes: sent alone it would never make a set. Its operations are in the copy, and the push sends them.
+        let whole: BTreeSet<SetId> = {
+            let mut by_set: BTreeMap<SetId, (u16, BTreeSet<u16>)> = BTreeMap::new();
+            for f in self.pending.iter().filter_map(|p| parse(&p.bytes)) {
+                by_set.entry(f.set).or_insert((f.count, BTreeSet::new())).1.insert(f.index);
+            }
+            by_set.into_iter().filter(|(_, (count, got))| got.len() == usize::from(*count)).map(|(set, _)| set).collect()
+        };
+        self.pending.retain(|p| parse(&p.bytes).is_none_or(|f| whole.contains(&f.set)));
         if let Ok(snapshot) = self.body.copy().snapshot()
             && let Ok(fresh) = Body::load(&self.kind, &snapshot, self.body.copy().peer())
         {
@@ -2808,31 +2818,10 @@ impl<S: DocStore> Replica<S> {
     }
 
     /// `ack {doc, client_seq, seq}`: one of this machine's updates is in the log.
+    /// (A fragment's ack is for it alone. One whose set's other acks were lost with a connection sends the rest again:
+    /// the server finds the fragments it stored already, by their numbers, and acks the set whole with the numbers it
+    /// has.)
     fn on_ack(&mut self, id: DocId, client_seq: u64, seq: u64) -> Vec<ClientFrame> {
-        // A fragment's ack says its whole set is stored: the server stores a set in one go, with numbers following
-        // on in the order of the fragments' (as this machine numbered them). Its other fragments still unacked here
-        // (their acks lost with a connection) are stored too: sent again alone, they would never make a set.
-        let set = self.docs.get(&id).and_then(|d| {
-            let f = parse(&d.pending.iter().find(|p| p.client_seq == client_seq)?.bytes)?;
-            let mut seqs: Vec<u64> = d
-                .pending
-                .iter()
-                .filter(|q| q.client_seq == client_seq || (q.acked.is_none() && parse(&q.bytes).is_some_and(|g| g.set == f.set)))
-                .map(|q| q.client_seq)
-                .collect();
-            seqs.sort_unstable();
-            Some(seqs)
-        });
-        let Some(set) = set else { return self.on_ack_one(id, client_seq, seq) };
-        let mut frames = Vec::new();
-        for c in set {
-            let Some(s) = seq.checked_add(c).and_then(|x| x.checked_sub(client_seq)) else { continue };
-            frames.extend(self.on_ack_one(id, c, s));
-        }
-        frames
-    }
-
-    fn on_ack_one(&mut self, id: DocId, client_seq: u64, seq: u64) -> Vec<ClientFrame> {
         let Some(doc) = self.docs.get_mut(&id) else { return Vec::new() };
         let Some(i) = doc.pending.iter().position(|p| p.client_seq == client_seq) else {
             // Stored already as far as this machine knew (the log held its operations before the ack came): the acked
@@ -5104,10 +5093,11 @@ mod tests {
         assert_eq!(fresh.get_text("text").len_utf8(), 2 * MAX_UPDATE_BYTES + "s import".len());
     }
 
-    /// The ack of one fragment of an own change says the whole set is stored (the server stores it in one go): the
-    /// others are stored too, their acks lost with the connection. Sent again alone, they would never make a set.
+    /// A fragment's ack is for it alone: the rest of the set, their acks lost with the connection, goes again (the
+    /// server finds what it stored of the set by its numbers, and acks it whole with them), and nothing waits once
+    /// those acks come.
     #[test]
-    fn one_ack_of_a_set_stores_the_whole_set() {
+    fn the_rest_of_a_set_whose_acks_were_lost_goes_again() {
         let store = MemStore::default();
         let (space, node) = (SpaceId::generate(), NodeId::generate());
         let (mut r, id, import) = joined(&store, space, node);
@@ -5117,12 +5107,18 @@ mod tests {
         let sent = r.local_update(id, &big).unwrap();
         assert_eq!(sent.len(), 3);
         r.on_frame(ServerFrame::Ack { doc: id, client_seq: 1, seq: 1 }).unwrap();
-        assert_eq!(r.document_status(id), Some((true, 0)), "nothing waits");
+        assert_eq!(r.document_status(id), Some((true, 2)), "the rest waits");
         r.disconnected();
         r.connected();
         let mut out = r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) }).unwrap();
-        out.extend(r.on_frame(ServerFrame::Subscribed { doc: id, head: 3 }).unwrap());
-        assert!(!out.iter().any(|f| matches!(f, ClientFrame::Update { .. })), "nothing sent again: {out:?}");
+        out.extend(r.on_frame(ServerFrame::Subscribed { doc: id, head: 1 }).unwrap());
+        let again: Vec<u64> =
+            out.iter().filter_map(|f| if let ClientFrame::Update { client_seq, .. } = f { Some(*client_seq) } else { None }).collect();
+        assert_eq!(again, vec![2, 3], "{out:?}");
+        for seq in [2, 3] {
+            r.on_frame(ServerFrame::Ack { doc: id, client_seq: seq, seq }).unwrap();
+        }
+        assert_eq!(r.document_status(id), Some((true, 0)), "nothing waits");
         let answer = r.on_frame(ServerFrame::Compact { doc: id, upto: 3 }).unwrap();
         assert!(answer.iter().any(|f| matches!(f, ClientFrame::Snapshot { upto: 3, .. })), "its rows are in the log: {answer:?}");
     }
