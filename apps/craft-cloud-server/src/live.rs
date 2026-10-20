@@ -475,8 +475,11 @@ impl Session {
                 // (A set refused: every one of its fragments is, so the agent hears it whichever it waits on.)
                 Err(refusal) => {
                     let (e, seqs) = *refusal;
+                    // A full document is compacted only so: with nothing more stored, no append asks any device again,
+                    // so this refusal does (once per head, and not while another device's ask is out).
+                    let ask = if e.code == codes::QUOTA_EXCEEDED { self.ask_when_full(doc).await } else { None };
                     Reply {
-                        frames: seqs.into_iter().map(|s| ServerFrame::error(e.code, e.message.clone(), Some(doc), Some(s))).collect(),
+                        frames: seqs.into_iter().map(|s| ServerFrame::error(e.code, e.message.clone(), Some(doc), Some(s))).chain(ask).collect(),
                         close: false,
                     }
                 }
@@ -568,6 +571,13 @@ impl Session {
 
     /// The `compact` to ask this session's agent for, if the log above the snapshot is long (`upto - base` updates,
     /// `above` bytes) and no other device is asked already.
+    /// A compaction ask of this device for a document refused as full, at its head ([`Session::maybe_compact`]).
+    async fn ask_when_full(&mut self, doc: DocId) -> Option<ServerFrame> {
+        let found = self.state.meta.live_doc(self.space, doc).await.ok().flatten()?;
+        let above = found.bytes.saturating_sub(found.compacted_bytes);
+        self.maybe_compact(doc, found.head, found.base, above)
+    }
+
     fn maybe_compact(&mut self, doc: DocId, upto: u64, base: u64, above: u64) -> Option<ServerFrame> {
         let limits = &self.state.limits;
         let long = upto.saturating_sub(base) > limits.compact_updates || above > limits.compact_bytes;
@@ -1439,6 +1449,32 @@ mod tests {
             .collect();
         assert_eq!(refused, vec![20, 21, 22], "{answers:?}");
         assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap().head, 6, "nothing of the refused set stored");
+    }
+
+    /// A refusal as full asks the refused device to compact (the document gets below its cap only so, and no append
+    /// asks anyone once nothing more is stored), unless another device's ask is out.
+    #[tokio::test]
+    async fn a_device_refused_as_full_is_asked_to_compact() {
+        let meta = Meta::open("sqlite::memory:").await.unwrap().with_live_doc_cap(5000);
+        let limits = crate::state::Limits { compact_updates: 1, compact_timeout: std::time::Duration::ZERO, ..Default::default() };
+        let mut a = Account::with_meta(limits, meta, "ana").await;
+        let (mut pc, pc_auth) = a.session(3).await;
+        let (mut laptop, _) = a.session(3).await;
+        let node = a.file(&pc_auth, "full.txt").await;
+        let doc = node_doc(a.user.space, node);
+        let import = a.upload(&[1; 100]).await;
+        pc.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: import }).await;
+        for s in [&mut pc, &mut laptop] {
+            s.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
+            drain(s).await;
+        }
+        pc.handle(ClientFrame::Update { doc, client_seq: 1, bytes: vec![1; 4000] }).await;
+        let crossed = pc.handle(ClientFrame::Update { doc, client_seq: 2, bytes: vec![2; 2000] }).await;
+        assert!(crossed.frames.iter().any(|f| matches!(f, ServerFrame::Compact { upto: 2, .. })), "{:?}", crossed.frames);
+        drain(&mut laptop).await;
+        let refused = laptop.handle(ClientFrame::Update { doc, client_seq: 1, bytes: vec![3; 10] }).await;
+        assert!(refused.frames.iter().any(|f| matches!(f, ServerFrame::Error { code, .. } if code == "quota_exceeded")), "{:?}", refused.frames);
+        assert!(refused.frames.iter().any(|f| matches!(f, ServerFrame::Compact { upto: 2, .. })), "asked: {:?}", refused.frames);
     }
 
     /// A set stored in part before whole sets (an older server stored fragments one by one) is made whole when its
