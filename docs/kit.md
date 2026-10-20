@@ -142,10 +142,15 @@ if !Arc::ptr_eq(&before, &self.doc) {
 
 - `before` must be the session's model ([`KitError::Stale`] otherwise: a remote change came in between; make the
   change again from `session.model()`).
-- A change is cut into commits under 512 KiB (the agent takes updates of up to 1 MiB): a 5 MB paste goes, and
-  undoes, whole. Every commit but the last is marked continued, and the other machines apply the change only once its
-  last commit is in (or after `CHANGE_WAIT`, 10 s, if the sender went away half-way), so an app never sees, repairs or
-  writes back half a change.
+- A change is one commit and goes as one update, whatever its size: a big one as its slices (at most 16,384
+  operations each, which Loro imports in milliseconds; one update with much text takes it time growing with the
+  square of the text) in one bundle, and one over the agent's 1 MiB frame limit in fragments that every receiver
+  joins before anything imports them. A 5 MB paste goes, and undoes, whole: no machine, agent or app ever holds part
+  of a change, so an app never sees, repairs or writes back half of one, whatever it does meanwhile (an edit, an
+  undo, a save). A change whose fragments stop coming (its sender went part of the way) is dropped, never applied:
+  the session opens the document again (`Status::gaps` counts it) and the catch-up brings whatever came whole. A
+  change over a snapshot's limit (`MAX_CHANGE_BYTES`, 36 MiB) can't go: the session stops, as for one the agent
+  refuses for good.
 - **A gesture** (a drag, an IME composition) whose `before` must stay put until it ends: `session.hold_remote(true)`
   while it runs; remote changes wait and come at the first poll after.
 - Typing: `session.group(|s| …)` (or `begin_group`/`end_group`) makes several changes one undo step.
@@ -263,7 +268,11 @@ the path); `watch.add_recent(path, saved)` puts a file on every machine's list.
 ## Testing the adapter
 
 With the `fake` feature, `craft_cloud_kit::testing::{Hub, Fake}` is an agent in the test's own process: machines of
-one account on a shared hub, with `set_online`, `restart` and `start`, `drop_connections`, and an old-agent mode.
+one account on a shared hub, with `set_online`, `restart` and `start`, `drop_connections`, and an old-agent mode;
+`set_fragment_faults` drops or holds back fragments on their way to a machine's apps (`Hub::tick` moves the held
+ones on), `drop_connections_after` stops the agent part of the way through an app's change, and
+`set_fragment_patience_for_tests` (and `craft_cloud_app::live::set_frame_limit_for_tests`) make sets that stop coming
+drop sooner, and changes of a few dozen KB go in fragments.
 Two sessions on two fakes test merges, undo and reconnects with no server; the demo's tests drive two windows that
 way with kittest.
 
@@ -275,10 +284,21 @@ way with kittest.
   stay alike). References other machines' repairs dropped meanwhile (a connector's end to a deleted shape) don't come
   back with the undo either. A soft delete (nodes moved to a hidden root, so undo moves them back) would keep them.
 
+- **Every machine's agent and app must know fragments and bundles.** An agent or app from before them refuses a
+  fragment or a bundle as an update that doesn't decode (it never imports part of a change), so a big change doesn't
+  reach it; the server stores and relays them as any update and needs no change.
+- **After a server's restore**, a machine that sends up history the log lost sends a big Loro change in pieces (Loro
+  merges one peer's commits into one change, so its boundaries aren't an app's): an app open on a machine that also
+  lacked that history may see part of a change from before the restore.
+
 ## Costs to know
 
 - Loro's undo of one big run of inserted text takes time growing with its square (about 10 s for a 1 MB paste).
   Undo of ordinary edits is instant.
+- Loro's import of one update takes time growing with the square of the text in it when the text builds on another
+  peer's (1 MiB: 7 s); the kit's slices keep a 4 MiB paste's import at about 10 ms. So does its checkout to an earlier
+  version: an agent asked for a compaction while its copy is far past the asked version (its own big change not in the
+  log yet) leaves the answer to another device.
 - A remote change to a rich text is patched into the old text; a tree's structure change reads the tree's
   structure again (cheap per node, 5,000 nodes in a few milliseconds); a table or timeline is read back by the app as
   much as it wants.

@@ -55,7 +55,8 @@ per app connection for live sessions. `run` serves it while signed out too. Call
     such file in the synced folder) and `resetting` (the admin reset the server's document and no machine has sent it
     back yet: an app here would get an empty document). The app then opens and saves the file as always. A document
     that has been live on this machine opens offline from the agent's copy;
-  - a binary update from the app (its own change, at most 1 MiB) → `ack {id, seq}` once it is on the agent's disk
+  - a binary update from the app (its own change, at most 1 MiB a frame; a bigger one in fragments, see below, acked by
+    its last fragment's number) → `ack {id, seq}` once it is on the agent's disk
     (`seq` counts the app's updates of that document on this connection, from 1), or `error {id, seq, code,
     message}` when the agent refused it (`invalid`: Loro doesn't take it; `too_large`); the agent's copy is as it was;
   - from the agent: remote changes as binary updates, other machines' and apps' presence as binary presence (as
@@ -148,7 +149,9 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
   update that crossed, or one that just caught up); one request per document at a time. That agent answers `snapshot
   {doc, upto, manifest}`, naming a Loro snapshot of exactly the updates 1..=`upto` (exported at the version those
   updates make as the agent took them, never including later ones: the agent tracks what the log holds, as a version
-  per update), once it holds them and nothing waits for its history; otherwise it doesn't answer. An agent that
+  per update), once it holds them, nothing waits for its history, no change's fragments are kept, `upto` isn't
+  inside a change's fragments, and its copy is at most 65,536 operations past that version (Loro's checkout to an
+  earlier version is slow for a big paste); otherwise it doesn't answer. An agent that
   dropped a row at or below `upto` (Loro failed on it, or it never applies) never answers, and says so. The server
   takes only the snapshot it asked that session for, and only a manifest the account uploaded: it records `base =
   upto` and the manifest in one metadata transaction, only past the current base (a second snapshot for an older or
@@ -243,9 +246,20 @@ document's version it was made from.
   is a value, or, when the table's source says its cells are maps, a mergeable map at `row:column` holding the
   cell's properties and stories. Deleting the key hides the child (a node's story that the app stops writing goes);
   a deleted node takes everything nested in it.
-- Every commit of a change but its last carries the commit message `$cont`: a session that imported a peer's
-  change up to a `$cont` commit applies nothing of it to its model until the rest comes (10 s at most).
-- A local change is written as commits of at most 512 KiB each (estimated: payload and 32 bytes per operation), each
-  exported at once; an export still over 512 KiB is cut by counter range. One change is one undo step.
+- A local change is one commit, one undo step, and one update: its export cut by counter range into slices of at
+  most 16,384 operations (`SLICE_OPS`), several of them in a bundle (`ccb1`, a 4-byte count, then each slice's
+  4-byte length and bytes, big endian), which a receiver imports slice by slice before its model sees any of it.
+- **Fragments** (`craft-cloud-api::fragments`): an update over the 1 MiB frame limit goes as frames of at most 1 MiB,
+  each `ccf1`, the set (the first 16 bytes of the update's BLAKE3), the index and the count (2 bytes each, big
+  endian), then its part. The cut is deterministic, so a set sent again is the same set. The app library sends a
+  change's fragments back to back and answers by the last one's number; the agent's local API joins them per
+  document and hands the hub the whole change (one an app stops sending part of the way never reaches it). The agent
+  journals the change whole and sends its fragments up as updates of their own (each a `client_seq`); the server
+  stores and relays them like any update. A receiving agent keeps fragment rows (counted as had, in the document's
+  file) until the change is whole, then imports it and hands it to its apps whole; it makes no compaction snapshot
+  while fragments are kept, nor at a number between a change's first fragment and its last. An app library joins any
+  fragments it gets; a set that stops coming on a connection (`PATIENCE`, 60 s) is dropped and the app hears `gap`,
+  and opens the document again to catch up. A set kept by an agent that never completes (its sender lost what it
+  sent) is dropped after about a week of the agent running. Nothing ever imports part of a change.
 - Presence an app sets is sent as `[u64 peer, big-endian][the app's bytes]`, again every 3 s, and dropped 10 s after
   its peer goes quiet.
