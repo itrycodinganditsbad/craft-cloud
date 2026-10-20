@@ -195,6 +195,39 @@ fn typing_in_one_nodes_story_on_both_then_one_undoes() {
     until(&mut [&mut a, &mut b], "the pc's typing back", |s| s.iter().all(|s| layer_text(s) == "[abc]X"));
 }
 
+/// Loro's undo of a deletion makes the nodes again under new tree IDs (the old ones stay deleted, carrying the same
+/// element IDs). A layer deleted on the pc while the laptop, offline, renames it, then the pc's undo: both machines
+/// end with the same model, which is what their documents hold (the revived copy wins on both; the rename, made on the
+/// node that stays deleted, is lost, the same on both).
+#[test]
+fn undoing_a_delete_while_the_other_edits_ends_the_same_on_both() {
+    let hub = Hub::new();
+    let id = craft_cloud_kit::ElemId::new();
+    let start = Doc {
+        layers: Arc::new(vec![Arc::new(Node::leaf(id, "before")), Arc::new(Node::leaf(craft_cloud_kit::ElemId::new(), "other"))]),
+        ..Doc::empty()
+    };
+    let (mut a, mut b, _pc, laptop) = pair(&hub, start);
+    until(&mut [&mut a, &mut b], "in step", |s| s.iter().all(|s| s.model().layers.len() == 2));
+    laptop.set_online(false);
+    change(&mut a, |d| Doc { layers: Arc::new(model::remove(&d.layers, id).0), ..d.clone() }).unwrap();
+    change(&mut b, |d| Doc { layers: Arc::new(model::rename(&d.layers, id, "renamed offline")), ..d.clone() }).unwrap();
+    assert!(a.undo().unwrap(), "the delete is undone");
+    laptop.set_online(true);
+    until(&mut [&mut a, &mut b], "the same on both", |s| {
+        let (x, y) = (&s[0].model().layers, &s[1].model().layers);
+        x == y && x.len() == 2
+    });
+    // And each model is what its document holds.
+    for s in [&a, &b] {
+        let mut r = craft_cloud_kit::raw::Replica::default();
+        r.import(&[s.snapshot().unwrap()], &["layers"]).unwrap();
+        let back = r.read::<TestApp>(&Arc::new(Doc::empty())).unwrap();
+        assert_eq!(model::flatten(&back.layers), model::flatten(&s.model().layers));
+        assert_eq!(model::find(&back.layers, id).map(|n| n.name.clone()), model::find(&s.model().layers, id).map(|n| n.name.clone()));
+    }
+}
+
 /// A change the app makes by itself (`background_change`: an upload that finished) goes to the other machine but is
 /// never an undo step: undo takes back the user's change before it and leaves it.
 #[test]

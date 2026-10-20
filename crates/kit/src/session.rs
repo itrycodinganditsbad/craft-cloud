@@ -1221,7 +1221,14 @@ impl<D: LiveDocument> Session<D> {
                         t.structure = true;
                         reindex.push(key);
                     }
-                    t.nodes.extend(r.nodes.iter().filter_map(|n| self.ctx.trees.get(key).and_then(|i| i.elem_of.get(n)).copied()));
+                    // A node the index doesn't name (deleted, or a second node carrying an element's ID) still names its
+                    // element in its meta: the element is touched.
+                    let tree = self.doc.get_tree(key);
+                    t.nodes.extend(
+                        r.nodes.iter().filter_map(|n| {
+                            self.ctx.trees.get(key).and_then(|i| i.elem_of.get(n)).copied().or_else(|| crate::tree::node_id(&tree, *n))
+                        }),
+                    );
                     // Inside a node's child container (its story, its table): named once the index is current.
                     if let Some(tid) = r.node
                         && !r.under_node.is_empty()
@@ -1279,9 +1286,13 @@ impl<D: LiveDocument> Session<D> {
             let tree = self.doc.get_tree(key);
             let index = TreeIndex::build(&tree);
             if let Some(t) = touched.trees.get_mut(key) {
-                // Created nodes: their IDs are known only now.
-                for (id, _) in index.tid_of.iter().filter(|(id, _)| !self.ctx.trees.get(key).is_some_and(|old| old.tid_of.contains_key(id))) {
-                    t.nodes.insert(*id);
+                // Created nodes: their IDs are known only now. And an element whose node is another one now (two nodes
+                // came to carry its ID, and the other one wins): its content may be another, so it is touched.
+                let old = self.ctx.trees.get(key);
+                for (id, tid) in &index.tid_of {
+                    if old.and_then(|o| o.tid_of.get(id)) != Some(tid) {
+                        t.nodes.insert(*id);
+                    }
                 }
             }
             self.ctx.trees.insert(key.to_owned(), index);

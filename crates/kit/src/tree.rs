@@ -57,7 +57,7 @@ impl TreeIndex {
     }
 }
 
-fn node_id(tree: &LoroTree, tid: TreeID) -> Option<ElemId> {
+pub(crate) fn node_id(tree: &LoroTree, tid: TreeID) -> Option<ElemId> {
     let meta = tree.get_meta(tid).ok()?;
     match meta.get(ID_KEY)? {
         ValueOrContainer::Value(v) => ElemId::from_loro(&v),
