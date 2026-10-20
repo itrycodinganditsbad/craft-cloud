@@ -316,6 +316,11 @@ impl Hub {
         lock(&self.inner).files.get(path).cloned().flatten()
     }
 
+    /// The updates the hub holds of the document at `path`, in order (each a row of the server's log).
+    pub fn rows(&self, path: &str) -> Vec<Vec<u8>> {
+        lock(&self.inner).docs.get(path).map(|d| d.log.iter().map(|(_, b)| b.clone()).collect()).unwrap_or_default()
+    }
+
     /// How many updates the hub holds of the document at `path` (0 when it has none).
     pub fn updates(&self, path: &str) -> usize {
         lock(&self.inner).docs.get(path).map_or(0, |d| d.log.len())

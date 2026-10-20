@@ -85,7 +85,8 @@ fn a_big_change_is_one_update_and_goes_in_fragments() {
 }
 
 /// A 5 MB change (twenty 250 KiB notes) goes as one update in fragments and arrives whole: the other machine's model
-/// has none or all of it at every poll. Its undo, as big, goes and arrives whole too.
+/// has none or all of it at every poll, and the log has one set. Its undo goes and arrives whole too. So does a 5 MB
+/// paste of text, whose slices go in one bundle (sent as separate updates, the other machine shows part of it).
 #[test]
 fn a_five_megabyte_change_arrives_whole_and_undoes_whole() {
     setup();
@@ -115,6 +116,17 @@ fn a_five_megabyte_change_arrives_whole_and_undoes_whole() {
     assert_eq!(b.model().texts(), notes);
     let sent = hub.updates("big.txt") - before;
     assert!(sent >= 70, "{sent} fragments of 64 KiB for one 5 MB update");
+    // One update: every row it took is a fragment of one set, and they join (a change sent as separate updates, its
+    // slices, would arrive in parts a poll could show).
+    let one_set = |rows: &[Vec<u8>]| {
+        let sets: std::collections::BTreeSet<_> = rows.iter().map(|r| craft_cloud_api::fragments::parse(r).map(|f| f.set)).collect();
+        assert_eq!(sets.len(), 1, "rows of one change, all fragments of one set: {:?}", sets.len());
+        assert!(sets.iter().all(Option::is_some), "every row a fragment");
+        assert!(craft_cloud_api::fragments::join(rows.iter().map(Vec::as_slice)).is_some(), "they make the change");
+    };
+    let rows = hub.rows("big.txt");
+    one_set(&rows[before..]);
+    let after_change = rows.len();
     assert!(a.status().error.is_none() && b.status().error.is_none(), "{:?} {:?}", a.status().error, b.status().error);
     // One undo step takes the whole change back, on both, whole.
     assert!(a.undo().unwrap());
@@ -123,6 +135,25 @@ fn a_five_megabyte_change_arrives_whole_and_undoes_whole() {
         assert!(texts.is_empty() || texts == notes, "the laptop held part of the undo: {} notes", texts.len());
         s.iter().all(|s| s.model().items.is_empty())
     });
+    // The undo is one update too: one row, or the fragments of one set.
+    let undo = hub.rows("big.txt").split_off(after_change);
+    if undo.len() > 1 {
+        one_set(&undo);
+    }
+    assert!(!undo.is_empty());
+    // A 5 MB paste of text: its operations cut into hundreds of slices, in one bundle, in fragments. The other
+    // machine's story is empty or the whole paste at every poll, and the log has one set.
+    let mut a = open::<TestApp>(&pc, "paste.kitdemo", Doc::empty());
+    let mut b = open::<TestApp>(&laptop, "paste.kitdemo", Doc::empty());
+    let before = hub.updates("paste.kitdemo");
+    let paste = "q".repeat(5 * 1024 * 1024);
+    change(&mut a, |d| Doc { story: Arc::new(RichText::plain(&paste)), ..d.clone() }).unwrap();
+    until(&mut [&mut a, &mut b], "the laptop has the paste", |s| {
+        let len = s[1].model().story.text.len();
+        assert!(len == 0 || len == paste.len(), "the laptop held part of the paste: {len} bytes");
+        len == paste.len()
+    });
+    one_set(&hub.rows("paste.kitdemo")[before..]);
 }
 
 /// The other machine gets a 1 MB change part of the way (its first fragment, then it sleeps), and meanwhile adds a
