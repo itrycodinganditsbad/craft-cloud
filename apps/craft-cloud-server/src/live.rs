@@ -686,8 +686,13 @@ impl Session {
         }
         // A fragment: staged until its set is whole, then the set goes into the log in one go (and counts against the
         // document's cap only then), or is refused whole: no device ever gets part of a change from the log.
-        if self.protocol >= LIVE_FRAGMENTS_PROTOCOL && is_fragment(&bytes) {
-            let Some((set_id, count)) = parse(&bytes).map(|f| (f.set, f.count)) else {
+        // A connection before protocol 3 (an agent from before whole sets) has its fragments refused: stored one by one,
+        // a set could be stored in part, which the newer agents would keep for good.
+        if self.protocol < LIVE_FRAGMENTS_PROTOCOL && is_fragment(&bytes) {
+            return Err(one(ApiError::invalid("a change in fragments needs a newer Craft Cloud on this computer: update Craft Cloud")));
+        }
+        if is_fragment(&bytes) {
+            let Some((set_id, count, index)) = parse(&bytes).map(|f| (f.set, f.count, f.index)) else {
                 return Err(one(ApiError::invalid("a fragment that doesn't read")));
             };
             let key = (doc, set_id);
@@ -695,7 +700,24 @@ impl Session {
             if self.staged_bytes.saturating_add(bytes.len()) > MAX_STAGED_BYTES || (new_set && self.staged.len() >= MAX_SETS) {
                 return Err(one(ApiError::invalid("too many fragments wait on this connection")));
             }
+            // Fragments of the set this device has in the log already (a set stored in part before whole sets, or one
+            // whose acks were lost: the agent sends only the rest) count as here: the device numbered the set's
+            // fragments one after the other, so each is found by its number.
+            let mut found = Vec::new();
+            if new_set {
+                for i in (0..count).filter(|i| *i != index) {
+                    let Some(seq) = (client_seq + u64::from(i)).checked_sub(u64::from(index)).filter(|s| *s > 0) else { continue };
+                    let stored = self.state.meta.live_updates_sent(self.space, doc, self.device, seq).await.map_err(|e| one(e.into()))?;
+                    if let Some(b) = stored.into_iter().find(|b| parse(b).is_some_and(|g| g.set == set_id && g.index == i && g.count == count)) {
+                        found.push((seq, b));
+                    }
+                }
+            }
             let set = self.staged.entry(key).or_default();
+            for (seq, b) in found {
+                self.staged_bytes += b.len();
+                set.push((seq, b));
+            }
             if !set.iter().any(|(s, _)| *s == client_seq) {
                 self.staged_bytes += bytes.len();
                 set.push((client_seq, bytes));
@@ -711,8 +733,12 @@ impl Session {
             set.sort_by_key(|(_, b)| parse(b).map(|g| g.index));
             set.dedup_by_key(|(_, b)| parse(b).map(|g| g.index));
             let seqs: Vec<u64> = set.iter().map(|(s, _)| *s).collect();
-            if join(set.iter().map(|(_, b)| b.as_slice())).is_none() {
-                return Err(Box::new((ApiError::invalid("fragments that don't make the change they name"), seqs)));
+            match join(set.iter().map(|(_, b)| b.as_slice())) {
+                None => return Err(Box::new((ApiError::invalid("fragments that don't make the change they name"), seqs))),
+                Some(whole) if whole.len() > MAX_WHOLE_BYTES => {
+                    return Err(Box::new((ApiError::too_large(format!("a change is at most {MAX_WHOLE_BYTES} bytes")), seqs)));
+                }
+                Some(_) => {}
             }
             let (state, space, device) = (self.state.clone(), self.space, self.device);
             let appended = tokio::spawn(async move {
@@ -1413,6 +1439,65 @@ mod tests {
             .collect();
         assert_eq!(refused, vec![20, 21, 22], "{answers:?}");
         assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap().head, 6, "nothing of the refused set stored");
+    }
+
+    /// A set stored in part before whole sets (an older server stored fragments one by one) is made whole when its
+    /// device sends the rest: the part in the log counts as here, and every fragment is acked with its number. A
+    /// device on protocol 2 has its fragments refused (stored one by one, a set could be stored in part). A set that
+    /// joins to more than a change's limit is refused whole.
+    #[tokio::test]
+    async fn the_rest_of_a_set_stored_in_part_completes_it_and_older_agents_send_none() {
+        let mut a = Account::new(Default::default()).await;
+        let (mut pc, pc_auth) = a.session(3).await;
+        let (mut old, _) = a.session(2).await;
+        let node = a.file(&pc_auth, "part.txt").await;
+        let doc = node_doc(a.user.space, node);
+        let import = a.upload(&[1; 100]).await;
+        pc.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: import }).await;
+        for s in [&mut pc, &mut old] {
+            s.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
+            drain(s).await;
+        }
+        let change: Vec<u8> = (0..3000u32).map(|i| (i % 249) as u8).collect();
+        let frames = craft_cloud_proto::fragments::split(&change, 1100).unwrap();
+        // Its first fragment alone in the log, as an older server stored it.
+        assert_eq!(a.meta.append_live_update(a.user.space, doc, pc_auth.device, 1, &frames[0], 0).await.unwrap(), 1);
+        pc.handle(ClientFrame::Update { doc, client_seq: 2, bytes: frames[1].clone() }).await;
+        let last = pc.handle(ClientFrame::Update { doc, client_seq: 3, bytes: frames[2].clone() }).await;
+        let acks: Vec<(u64, u64)> = last
+            .frames
+            .iter()
+            .filter_map(|f| if let ServerFrame::Ack { client_seq, seq, .. } = f { Some((*client_seq, *seq)) } else { None })
+            .collect();
+        assert_eq!(acks, vec![(1, 1), (2, 2), (3, 3)], "{:?}", last.frames);
+        let rows = a.meta.live_updates(a.user.space, doc, 0, 10).await.unwrap();
+        assert_eq!(craft_cloud_proto::fragments::join(rows.iter().map(|r| r.bytes.as_slice())), Some(change.clone()), "whole in the log");
+        // Protocol 2: refused, nothing stored.
+        let other = craft_cloud_proto::fragments::split(&[change.clone(), vec![5]].concat(), 1100).unwrap();
+        let reply = old.handle(ClientFrame::Update { doc, client_seq: 1, bytes: other[0].clone() }).await;
+        assert!(
+            matches!(reply.frames.as_slice(), [ServerFrame::Error { code, message, client_seq: Some(1), .. }] if code == "invalid" && message.contains("update Craft Cloud")),
+            "{:?}",
+            reply.frames
+        );
+        // Over a change's limit, once joined: refused whole.
+        let whole = vec![3u8; MAX_WHOLE_BYTES + 10];
+        let set = blake3::hash(&whole);
+        let body = MAX_UPDATE_BYTES - craft_cloud_proto::fragments::HEADER_BYTES;
+        let chunks: Vec<&[u8]> = whole.chunks(body).collect();
+        let count = u16::try_from(chunks.len()).unwrap();
+        let mut answers = Vec::new();
+        for (i, chunk) in (0u16..).zip(&chunks) {
+            let mut f = b"ccf1".to_vec();
+            f.extend_from_slice(&set.as_bytes()[..16]);
+            f.extend_from_slice(&i.to_be_bytes());
+            f.extend_from_slice(&count.to_be_bytes());
+            f.extend_from_slice(chunk);
+            answers.extend(pc.handle(ClientFrame::Update { doc, client_seq: 10 + u64::from(i), bytes: f }).await.frames);
+        }
+        let refused = answers.iter().filter(|f| matches!(f, ServerFrame::Error { code, .. } if code == "too_large")).count();
+        assert_eq!(refused, chunks.len(), "{answers:?}");
+        assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap().head, 3, "nothing of it stored");
     }
 
     /// Snapshots never travel in frames: a `create` or `snapshot` names a manifest the account uploaded (through the

@@ -93,6 +93,37 @@ async fn live_reset_doc_empties_a_full_document() {
     assert!(matches!(cli(&["live", "--config", c, "reset-doc", "nobody", "wordcraft"], "").await, Err(CliError::Usage(_))));
 }
 
+/// `live check-sets` lists a document whose log holds part of a change in fragments (stored before whole sets),
+/// with the `reset-doc` that empties it; a whole set isn't listed.
+#[tokio::test]
+async fn live_check_sets_finds_part_of_a_change() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config_path = dir.join("config.toml");
+    let c = config_path.to_str().unwrap();
+    let (meta, _) = craft_cloud_server::cli::open(&Config::load(&config_path).unwrap()).await.unwrap();
+    let ana = meta.user_by_name("ana").await.unwrap().unwrap();
+    let device = meta.create_device(ana.id, "pc", &[3; 32], 0).await.unwrap();
+    let (whole, part) = (craft_cloud_proto::DocId::generate(), craft_cloud_proto::DocId::generate());
+    let change: Vec<u8> = (0..3000u32).map(|i| (i % 247) as u8).collect();
+    let frames = craft_cloud_proto::fragments::split(&change, 1100).unwrap();
+    for doc in [whole, part] {
+        meta.create_live_doc(ana.space, doc, "recents:wordcraft", None, 0).await.unwrap();
+    }
+    for (i, f) in frames.iter().enumerate() {
+        meta.append_live_update(ana.space, whole, device, i as u64 + 1, f, 0).await.unwrap();
+    }
+    meta.append_live_update(ana.space, part, device, 1, &frames[0], 0).await.unwrap();
+    let out = cli(&["live", "--config", c, "check-sets", "ana"], "").await.unwrap();
+    assert!(out.contains(&format!("live document {part} of ana holds part of 1 change(s)")), "{out}");
+    assert!(out.contains(&format!("live reset-doc ana {part}")), "{out}");
+    assert!(!out.contains(&whole.to_string()), "{out}");
+    cli(&["live", "--config", c, "reset-doc", "ana", &part.to_string()], "").await.unwrap();
+    let out = cli(&["live", "--config", c, "check-sets", "ana"], "").await.unwrap();
+    assert!(out.contains("no live document of ana holds part of a change"), "{out}");
+}
+
 /// `live reset-doc` takes a document's ID too (a document of a file has no app name to find it by), and drops its
 /// snapshot with its log.
 #[tokio::test]

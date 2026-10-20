@@ -624,9 +624,8 @@ impl Meta {
         Ok(out)
     }
 
-    /// Every live document of `space` with its last sequence number: what a backup of the database holds. A test seam
-    /// (the `test-support` feature), for the recents simulation's restores.
-    #[cfg(feature = "test-support")]
+    /// Every live document of `space` with its last sequence number (for the admin's checks, and the recents
+    /// simulation's restores).
     pub async fn live_heads(&self, space: SpaceId) -> Result<Vec<(DocId, u64)>, MetaError> {
         let rows = sqlx::query("SELECT id, head_seq FROM live_docs WHERE space_id = $1 ORDER BY id")
             .bind(uuid_bytes(space.as_uuid()))
@@ -744,6 +743,19 @@ impl Meta {
             })
             .collect::<Result<Vec<_>, MetaError>>()?;
         Ok((page, more))
+    }
+
+    /// The updates `device` sent as `client_seq` to the document that the log holds (their bytes): normally none or
+    /// one. (A change in fragments partly stored before: the rest of it is joined with what is here.)
+    pub async fn live_updates_sent(&self, space: SpaceId, doc: DocId, device: DeviceId, client_seq: u64) -> Result<Vec<Vec<u8>>, MetaError> {
+        let rows = sqlx::query("SELECT bytes FROM live_updates WHERE space_id = $1 AND doc = $2 AND device = $3 AND client_seq = $4 ORDER BY seq")
+            .bind(uuid_bytes(space.as_uuid()))
+            .bind(uuid_bytes(doc.as_uuid()))
+            .bind(uuid_bytes(device.as_uuid()))
+            .bind(to_i64(client_seq)?)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(|row| Ok(row.try_get("bytes")?)).collect()
     }
 
     /// The document's updates with a sequence number above `after`, in order, at most `limit` (and at most
