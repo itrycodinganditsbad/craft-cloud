@@ -34,8 +34,8 @@ pub use mapping::{Attrs, Mappings, OpaqueSource, RemotePatch, Span, TableSource,
 pub use opaque::Opaque;
 pub use props::{Props, PropsRead};
 pub use session::{
-    Agent, Badge, CATCH_UP_EVERY, LiveDocument, MAX_BACKOFF, MAX_QUEUE_BYTES, MAX_UNDO_TEXT_BYTES, NotLive, Open, PRESENCE_EVERY, PRESENCE_TTL, Peer,
-    Polled, REPLACE_WITH_FILE, ReadOnly, SavePoint, SaveRecord, Session, Status, UndoKind,
+    Agent, Badge, CATCH_UP_EVERY, CHANGE_WAIT, LiveDocument, MAX_BACKOFF, MAX_QUEUE_BYTES, MAX_UNDO_TEXT_BYTES, NotLive, Open, PRESENCE_EVERY,
+    PRESENCE_TTL, Peer, Polled, REPLACE_WITH_FILE, ReadOnly, SavePoint, SaveRecord, Session, Status, UndoKind,
 };
 pub use table::{TableTouch, TableView};
 pub use text::RichText;

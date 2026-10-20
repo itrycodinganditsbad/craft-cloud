@@ -853,3 +853,37 @@ fn a_record_made_while_the_agent_is_away_goes_once_it_is_back() {
         pc.saves().iter().any(|(h, v)| *h == hex(b"saved while the agent was away") && *v == record.frontiers)
     });
 }
+
+/// A change cut into several commits is applied whole: with only its first commit in, the receiving model shows
+/// nothing of it (no half change, no repair made from one), a local edit made meanwhile goes through, and once the
+/// rest is in, the whole change and the local edit are both there.
+#[test]
+fn a_change_cut_in_several_commits_is_applied_whole() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let a = open::<App>(&pc, "atomic.txt", Notes::new("t", &["first"]));
+    let mut b = open::<App>(&laptop, "atomic.txt", Notes::default());
+    // Another machine's change of about 1 MB (five rows of 200 KB), cut into several commits.
+    let mut r = craft_cloud_kit::raw::Replica::default();
+    r.import(&[a.snapshot().unwrap()], &[]).unwrap();
+    let base = a.model().clone();
+    let mut big = (*base).clone();
+    for i in 0..5 {
+        big = big.with_item(i, &format!("{i}{}", "x".repeat(200 * 1024)));
+    }
+    big.hint = None;
+    let (updates, commits) = r.write::<App>(Some(&base), &big).unwrap();
+    assert!(commits >= 2 && updates.len() >= 2, "{commits} commits, {} updates", updates.len());
+    let (first, rest) = updates.split_first().unwrap();
+    b.receive_for_tests(first.clone());
+    b.poll();
+    assert_eq!(b.model().texts(), vec!["first"], "nothing of a change that came in part");
+    // A local edit meanwhile.
+    change(&mut b, |m| m.with_title("local")).unwrap();
+    for u in rest {
+        b.receive_for_tests(u.clone());
+    }
+    b.poll();
+    assert_eq!(b.model().items.len(), 6, "the whole change once its last commit is in");
+    assert_eq!(*b.model().title, "local");
+}

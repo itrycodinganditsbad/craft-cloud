@@ -14,6 +14,8 @@ pub const SPLIT_BYTES: usize = 512 * 1024;
 pub const OP_OVERHEAD: usize = 32;
 /// The origin of the kit's commits of local changes (the undo manager records them).
 pub const LOCAL_ORIGIN: &str = "craft-cloud-kit:local";
+/// The message of a commit that isn't a change's last: the change was cut in several, and the rest follows.
+pub(crate) const CONTINUED: &str = "$cont";
 /// The origin of the kit's own repairs (a normalised merge, a save mark): never an undo step.
 pub const KIT_ORIGIN: &str = "craft-cloud-kit:kit";
 
@@ -55,12 +57,14 @@ impl<'d> Writer<'d> {
         Ok(())
     }
 
-    /// Commits what is open and takes its export.
+    /// Commits what is open and takes its export. More of the change follows: the commit is marked continued, so a
+    /// receiver applies the change only once its last commit is in.
     pub(crate) fn cut(&mut self) -> Result<(), KitError> {
         if self.spent == 0 {
             return Ok(());
         }
         self.doc.set_next_commit_origin(self.origin);
+        self.doc.set_next_commit_message(CONTINUED);
         self.doc.commit();
         self.commits += 1;
         export_since(self.doc, &self.from, &mut self.out)?;
@@ -71,10 +75,12 @@ impl<'d> Writer<'d> {
 
     /// The change's updates (the last commit made now).
     pub(crate) fn finish(mut self) -> Result<(Updates, usize), KitError> {
-        self.cut()?;
-        // Anything written without being counted (there should be none) still goes out.
+        // The last commit (with anything written without being counted, of which there should be none): not continued.
         self.doc.set_next_commit_origin(self.origin);
         self.doc.commit();
+        if self.spent > 0 {
+            self.commits += 1;
+        }
         export_since(self.doc, &self.from, &mut self.out)?;
         Ok((self.out, self.commits))
     }

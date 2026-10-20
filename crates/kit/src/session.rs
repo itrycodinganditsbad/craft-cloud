@@ -29,7 +29,7 @@ use crate::mapping::{Kind, Mappings, Part, RemotePatch, Touched};
 use crate::table::{TableTouch, parse_cell_key};
 use crate::timeline::TimelineTouch;
 use crate::tree::{TreeIndex, TreeTouch};
-use crate::writer::{KIT_ORIGIN, LOCAL_ORIGIN, Updates, Writer, export_since};
+use crate::writer::{CONTINUED, KIT_ORIGIN, LOCAL_ORIGIN, Updates, Writer, export_since};
 use crate::{ElemId, KitError};
 
 /// The most bytes of changes a session keeps in memory for the agent; at or past it, local changes are refused
@@ -41,6 +41,9 @@ const FIRST_BACKOFF: Duration = Duration::from_millis(200);
 /// Presence is sent again this often while set, and a peer's is dropped after this long without one.
 pub const PRESENCE_EVERY: Duration = Duration::from_secs(3);
 pub const PRESENCE_TTL: Duration = Duration::from_secs(10);
+/// How long a change another machine sent in several commits waits for its last commit before what came is applied
+/// anyway (the sender went away half-way: its app will send the rest when it is back).
+pub const CHANGE_WAIT: Duration = Duration::from_secs(10);
 /// Undo steps kept.
 const UNDO_STEPS: usize = 500;
 /// The most text (inserted and deleted, in bytes) one step may change and still be undone while live. Loro's undo of a
@@ -354,6 +357,9 @@ pub struct Session<D: LiveDocument> {
     outbox: VecDeque<Out>,
     outbox_bytes: usize,
     incoming: Vec<Vec<u8>>,
+    /// Remote changes imported but not applied yet: another machine's change came in part (`change_open`).
+    waiting: Vec<Raw>,
+    waiting_since: Option<Instant>,
     held: bool,
     grouping: bool,
     status: Status,
@@ -590,6 +596,8 @@ impl<D: LiveDocument> Session<D> {
             outbox: VecDeque::new(),
             outbox_bytes: 0,
             incoming: Vec::new(),
+            waiting: Vec::new(),
+            waiting_since: None,
             held: false,
             grouping: false,
             status: Status::default(),
@@ -1167,7 +1175,7 @@ impl<D: LiveDocument> Session<D> {
 
     /// Imports what came and hands the app the touched parts. True if the model changed.
     fn apply_incoming(&mut self) -> Result<bool, KitError> {
-        if self.incoming.is_empty() {
+        if self.incoming.is_empty() && self.waiting.is_empty() {
             return Ok(false);
         }
         let batch = std::mem::take(&mut self.incoming);
@@ -1181,6 +1189,17 @@ impl<D: LiveDocument> Session<D> {
         }
         let raw = std::mem::take(&mut lock(&self.collector).raw);
         lock(&self.collector).on = false;
+        self.waiting.extend(raw);
+        // A change another machine sent in several commits is applied whole: while one has come in part, what came
+        // waits (at most `CHANGE_WAIT`, for a sender that went away half-way).
+        if self.change_open() {
+            let since = *self.waiting_since.get_or_insert_with(Instant::now);
+            if since.elapsed() < CHANGE_WAIT {
+                return Ok(false);
+            }
+        }
+        self.waiting_since = None;
+        let raw = std::mem::take(&mut self.waiting);
         let touched = self.classify(raw);
         let was_read_only = self.status.read_only.clone();
         if touched.kit {
@@ -1191,6 +1210,21 @@ impl<D: LiveDocument> Session<D> {
         }
         self.rebuild(touched)?;
         Ok(true)
+    }
+
+    /// Whether another peer's last change here is one it sent in several commits and not all of them came yet: its
+    /// last change here is marked as continued, or came in part.
+    fn change_open(&self) -> bool {
+        let me = self.doc.peer_id();
+        self.doc.oplog_vv().iter().any(|(peer, end)| {
+            if *peer == me || *end <= 0 {
+                return false;
+            }
+            match self.doc.get_change(loro::ID::new(*peer, end - 1)) {
+                Some(c) => c.message.as_deref() == Some(CONTINUED) || c.id.counter + i32::try_from(c.len).unwrap_or(i32::MAX) > *end,
+                None => false,
+            }
+        })
     }
 
     /// Sorts Loro's raw touches out by part.
@@ -1535,6 +1569,12 @@ impl<D: LiveDocument> Session<D> {
     /// The live document's state as a Loro snapshot (for tests and diagnostics).
     pub fn snapshot(&self) -> Result<Vec<u8>, KitError> {
         Ok(self.doc.export(loro::ExportMode::Snapshot)?)
+    }
+
+    /// For the kit's tests: an update as if it came from the agent (applied at the next poll).
+    #[doc(hidden)]
+    pub fn receive_for_tests(&mut self, update: Vec<u8>) {
+        self.incoming.push(update);
     }
 
     /// This session's Loro peer.

@@ -143,7 +143,9 @@ if !Arc::ptr_eq(&before, &self.doc) {
 - `before` must be the session's model ([`KitError::Stale`] otherwise: a remote change came in between; make the
   change again from `session.model()`).
 - A change is cut into commits under 512 KiB (the agent takes updates of up to 1 MiB): a 5 MB paste goes, and
-  undoes, whole.
+  undoes, whole. Every commit but the last is marked continued, and the other machines apply the change only once its
+  last commit is in (or after `CHANGE_WAIT`, 10 s, if the sender went away half-way), so an app never sees, repairs or
+  writes back half a change.
 - **A gesture** (a drag, an IME composition) whose `before` must stay put until it ends: `session.hold_remote(true)`
   while it runs; remote changes wait and come at the first poll after.
 - Typing: `session.group(|s| …)` (or `begin_group`/`end_group`) makes several changes one undo step.
@@ -264,6 +266,14 @@ With the `fake` feature, `craft_cloud_kit::testing::{Hub, Fake}` is an agent in 
 one account on a shared hub, with `set_online`, `restart` and `start`, `drop_connections`, and an old-agent mode.
 Two sessions on two fakes test merges, undo and reconnects with no server; the demo's tests drive two windows that
 way with kittest.
+
+## Known gaps
+
+- **Undo of a deletion makes the elements again as copies.** Loro's undo of a tree deletion creates new nodes (new
+  tree IDs, the same element IDs and properties); the old nodes stay deleted. What another machine changed in those
+  elements between the deletion and the undo went to the old nodes and is lost, the same on every machine (the models
+  stay alike). References other machines' repairs dropped meanwhile (a connector's end to a deleted shape) don't come
+  back with the undo either. A soft delete (nodes moved to a hidden root, so undo moves them back) would keep them.
 
 ## Costs to know
 

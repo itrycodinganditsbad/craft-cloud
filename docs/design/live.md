@@ -243,6 +243,8 @@ document's version it was made from.
   is a value, or, when the table's source says its cells are maps, a mergeable map at `row:column` holding the
   cell's properties and stories. Deleting the key hides the child (a node's story that the app stops writing goes);
   a deleted node takes everything nested in it.
+- Every commit of a change but its last carries the commit message `$cont`: a session that imported a peer's
+  change up to a `$cont` commit applies nothing of it to its model until the rest comes (10 s at most).
 - A local change is written as commits of at most 512 KiB each (estimated: payload and 32 bytes per operation), each
   exported at once; an export still over 512 KiB is cut by counter range. One change is one undo step.
 - Presence an app sets is sent as `[u64 peer, big-endian][the app's bytes]`, again every 3 s, and dropped 10 s after
