@@ -2,13 +2,21 @@
 //! (temporary file, flush, rename), so a crash leaves the old file or the new one. A document's file holds its state,
 //! what the agent has of the server's log and its local updates not yet acked, so an add is on disk before the app
 //! is told it is kept.
+//!
+//! A document's journal is one file for as long as the document is here: appended to, cut back, and emptied in place
+//! once its updates are in the document's file, never deleted and made again. (On Windows a virus scanner or the
+//! search indexer opens files the agent just wrote; one that doesn't share the journal for deletion made the
+//! deletion fail, and a deleted name another program still holds can stay "delete pending" and refuse a new file of
+//! that name.) A holder that doesn't share the file for what the store does is waited for, about a second and a half
+//! at most ([`crate::account::retry_busy`]). Files that do go (a document that doesn't read) are renamed to a name of
+//! their own first, so their names are free at once ([`crate::account::retire`]).
 
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::account::{remove_atomic_temps, write_atomic};
+use crate::account::{remove_atomic_temps, retire, retry_busy, write_atomic, write_atomic_unless_busy};
 
 /// A place for the documents of one account.
 pub trait DocStore: Send {
@@ -39,6 +47,15 @@ pub trait DocStore: Send {
     /// Writes a document of a file whole, atomically and durably.
     fn save_document(&mut self, _name: &str, _bytes: &[u8]) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    /// [`DocStore::save_document`], refused at once (on Windows) while another program holds the file, for a write
+    /// that can as well be made later (see [`crate::account::is_busy`]).
+    fn save_document_unless_busy(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        self.save_document(name, bytes)
+    }
+    /// [`DocStore::clear_journal`], refused at once (on Windows) while another program holds the journal.
+    fn clear_journal_unless_busy(&mut self, name: &str) -> io::Result<()> {
+        self.clear_journal(name)
     }
     /// Appends `record` to the document's journal, durably, before this returns. On an error the journal is cut back
     /// to where it was, as far as the store can (the caller cuts it back too, and writes the document whole).
@@ -88,8 +105,12 @@ impl DiskStore {
     /// The store in `dir` (made owner-only if missing; interrupted writes cleaned up).
     pub fn open(dir: &Path) -> io::Result<Self> {
         make_private_dirs(dir)?;
-        // (Interrupted writes of documents and of set-aside copies.)
-        remove_atomic_temps(dir, |of| of.ends_with(SUFFIX) || of.ends_with(DOCUMENT_SUFFIX) || of.contains(ASIDE), std::time::Duration::ZERO)?;
+        // (Interrupted writes of documents and of set-aside copies, and removals a crash interrupted.)
+        remove_atomic_temps(
+            dir,
+            |of| of.ends_with(SUFFIX) || of.ends_with(DOCUMENT_SUFFIX) || of.ends_with(JOURNAL_SUFFIX) || of.contains(ASIDE),
+            std::time::Duration::ZERO,
+        )?;
         Ok(Self { dir: dir.to_owned() })
     }
 
@@ -163,10 +184,11 @@ impl DocStore for DiskStore {
     }
 
     fn remove(&mut self, name: &str) -> io::Result<()> {
-        std::fs::remove_file(self.dir.join(format!("{name}{SUFFIX}")))?;
-        #[cfg(unix)]
-        std::fs::File::open(&self.dir)?.sync_all()?;
-        Ok(())
+        // (Written again soon: the document is filled from the server.)
+        if !retire(&self.dir.join(format!("{name}{SUFFIX}")))? {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        self.sync_dir()
     }
 
     fn document_names(&self) -> io::Result<Vec<String>> {
@@ -197,11 +219,19 @@ impl DocStore for DiskStore {
         write_atomic(&self.dir.join(format!("{name}{DOCUMENT_SUFFIX}")), bytes, true)
     }
 
+    fn save_document_unless_busy(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        write_atomic_unless_busy(&self.dir.join(format!("{name}{DOCUMENT_SUFFIX}")), bytes, true)
+    }
+
+    fn clear_journal_unless_busy(&mut self, name: &str) -> io::Result<()> {
+        cut_as(&self.dir.join(format!("{name}{JOURNAL_SUFFIX}")), 0, false)
+    }
+
     fn append_journal(&mut self, name: &str, record: &[u8]) -> io::Result<()> {
         use std::io::Write;
         let path = self.dir.join(format!("{name}{JOURNAL_SUFFIX}"));
         let new = !path.exists();
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = retry_busy(|| std::fs::OpenOptions::new().create(true).append(true).open(&path))?;
         let before = file.metadata()?.len();
         if let Err(e) = file.write_all(record).and_then(|()| file.sync_data()) {
             // Not kept: whatever part of it got there goes (a record cut off, or one whose flush failed, must not come
@@ -217,17 +247,7 @@ impl DocStore for DiskStore {
     }
 
     fn truncate_journal(&mut self, name: &str, len: usize) -> io::Result<()> {
-        let path = self.dir.join(format!("{name}{JOURNAL_SUFFIX}"));
-        let file = match std::fs::OpenOptions::new().write(true).open(&path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        if file.metadata()?.len() > len as u64 {
-            file.set_len(len as u64)?;
-            file.sync_data()?;
-        }
-        Ok(())
+        cut(&self.dir.join(format!("{name}{JOURNAL_SUFFIX}")), len as u64)
     }
 
     fn load_journal(&self, name: &str) -> io::Result<Vec<u8>> {
@@ -239,11 +259,9 @@ impl DocStore for DiskStore {
     }
 
     fn clear_journal(&mut self, name: &str) -> io::Result<()> {
-        match std::fs::remove_file(self.dir.join(format!("{name}{JOURNAL_SUFFIX}"))) {
-            Ok(()) => self.sync_dir(),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
+        // Emptied in place, not deleted: the next change's append finds the same file (see the module's doc). A crash
+        // before the cut is durable leaves the records, which the document's file has now, and a load skips them.
+        cut(&self.dir.join(format!("{name}{JOURNAL_SUFFIX}")), 0)
     }
 
     fn set_aside_document(&mut self, name: &str) -> io::Result<String> {
@@ -251,10 +269,34 @@ impl DocStore for DiskStore {
     }
 
     fn remove_document(&mut self, name: &str) -> io::Result<()> {
-        std::fs::remove_file(self.dir.join(format!("{name}{DOCUMENT_SUFFIX}")))?;
-        self.clear_journal(name)?;
+        // (Written again soon, with a new journal: the document is filled from the server.)
+        if !retire(&self.dir.join(format!("{name}{DOCUMENT_SUFFIX}")))? {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        retire(&self.dir.join(format!("{name}{JOURNAL_SUFFIX}")))?;
         self.sync_dir()
     }
+}
+
+/// Cuts the file at `path` to its first `len` bytes if it is longer, durably (a missing file is empty already). A
+/// holder that doesn't share it for writing is waited for.
+fn cut(path: &Path, len: u64) -> io::Result<()> {
+    cut_as(path, len, true)
+}
+
+/// [`cut`]; without `wait`, a holder refuses it at once.
+fn cut_as(path: &Path, len: u64, wait: bool) -> io::Result<()> {
+    let open = || std::fs::OpenOptions::new().write(true).open(path);
+    let file = match if wait { retry_busy(open) } else { open() } {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if file.metadata()?.len() > len {
+        file.set_len(len)?;
+        file.sync_data()?;
+    }
+    Ok(())
 }
 
 /// What a set-aside file's name has after the document's.
@@ -270,6 +312,18 @@ pub struct MemStore {
     journals: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     /// How journal appends fail from now on ([`JournalFailure`] as a number; 0: they don't), for tests.
     failing: Arc<std::sync::atomic::AtomicU8>,
+    /// Which files another program holds, for the writes that don't wait ([`Held`] as a number; 0: none), for tests.
+    held: Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// Which of a [`MemStore`]'s files another program holds, for tests: the writes that don't wait for it are refused
+/// as busy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held {
+    /// Documents' files.
+    Documents,
+    /// Journals.
+    Journals,
 }
 
 /// How a [`MemStore`]'s journal appends fail, for tests.
@@ -298,6 +352,24 @@ impl MemStore {
             Some(JournalFailure::Unflushed) => 3,
         };
         self.failing.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Has another program hold `held` (or nothing), for tests.
+    pub fn hold(&self, held: Option<Held>) {
+        let n = match held {
+            None => 0,
+            Some(Held::Documents) => 1,
+            Some(Held::Journals) => 2,
+        };
+        self.held.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn holds(&self, held: Held) -> io::Result<()> {
+        let n = if held == Held::Documents { 1 } else { 2 };
+        if self.held.load(std::sync::atomic::Ordering::Relaxed) == n {
+            return Err(io::Error::new(io::ErrorKind::ResourceBusy, "another program holds the file (test)"));
+        }
+        Ok(())
     }
 
     /// The journals, by document (for tests that look inside).
@@ -358,6 +430,16 @@ impl DocStore for MemStore {
         Ok(())
     }
 
+    fn save_document_unless_busy(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        self.holds(Held::Documents)?;
+        self.save_document(name, bytes)
+    }
+
+    fn clear_journal_unless_busy(&mut self, name: &str) -> io::Result<()> {
+        self.holds(Held::Journals)?;
+        self.clear_journal(name)
+    }
+
     fn append_journal(&mut self, name: &str, record: &[u8]) -> io::Result<()> {
         let mut journals = self.journals.lock().unwrap_or_else(PoisonError::into_inner);
         match self.failing.load(std::sync::atomic::Ordering::Relaxed) {
@@ -413,6 +495,105 @@ impl DocStore for MemStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Another program (a virus scanner, the search indexer, a backup tool) holding `path` open, sharing it as
+    /// `share` (`FILE_SHARE_READ` 1, `FILE_SHARE_WRITE` 2, `FILE_SHARE_DELETE` 4).
+    #[cfg(windows)]
+    fn hold(path: &Path, share: u32) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).share_mode(share).open(path).unwrap()
+    }
+
+    /// A journal is emptied in place once its updates are in the document's file (the same file takes the next
+    /// change); removing a document leaves neither its file, nor its journal, nor a temporary name behind; and a
+    /// removal a crash cut short (the renamed file) is cleaned up at the next open.
+    #[test]
+    fn a_journal_is_emptied_in_place_and_a_removed_document_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join(format!("doc{JOURNAL_SUFFIX}"));
+        let mut store = DiskStore::open(dir.path()).unwrap();
+        store.save_document("doc", b"document").unwrap();
+        store.append_journal("doc", b"first").unwrap();
+        store.clear_journal("doc").unwrap();
+        assert_eq!(std::fs::metadata(&journal).unwrap().len(), 0, "the journal stays, empty");
+        assert!(store.load_journal("doc").unwrap().is_empty());
+        store.append_journal("doc", b"second").unwrap();
+        assert_eq!(store.load_journal("doc").unwrap(), b"second");
+        store.clear_journal("never-journalled").unwrap();
+        assert!(!dir.path().join(format!("never-journalled{JOURNAL_SUFFIX}")).exists());
+        store.remove_document("doc").unwrap();
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(left.is_empty(), "{left:?}");
+        assert!(store.remove_document("doc").is_err(), "a document that isn't there");
+        let interrupted = dir.path().join(format!(".doc{JOURNAL_SUFFIX}.0011223344556677.tmp"));
+        std::fs::write(&interrupted, b"records").unwrap();
+        DiskStore::open(dir.path()).unwrap();
+        assert!(!interrupted.exists(), "the interrupted removal is left behind");
+    }
+
+    /// A scanner holding a document's journal without delete sharing doesn't fail the document's write (its journal
+    /// emptied once its updates are in its file) nor the next change's append.
+    #[cfg(windows)]
+    #[test]
+    fn a_journal_held_without_delete_sharing_is_still_emptied_and_appended_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DiskStore::open(dir.path()).unwrap();
+        store.save_document("doc", b"document").unwrap();
+        store.append_journal("doc", b"first").unwrap();
+        let _scanner = hold(&dir.path().join(format!("doc{JOURNAL_SUFFIX}")), 1 | 2);
+        store.save_document("doc", b"document, first in").unwrap();
+        store.clear_journal("doc").unwrap();
+        store.append_journal("doc", b"second").unwrap();
+        assert_eq!(store.load_journal("doc").unwrap(), b"second");
+    }
+
+    /// A scanner holding the journal for a moment without sharing it for writing delays an append, a cut and an
+    /// emptying; it doesn't fail them.
+    #[cfg(windows)]
+    #[test]
+    fn a_journal_held_for_a_moment_delays_its_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join(format!("doc{JOURNAL_SUFFIX}"));
+        let mut store = DiskStore::open(dir.path()).unwrap();
+        store.save_document("doc", b"document").unwrap();
+        store.append_journal("doc", b"first").unwrap();
+        let held_for_a_moment = |store: &mut DiskStore, what: &dyn Fn(&mut DiskStore) -> io::Result<()>| {
+            let scanner = hold(&journal, 1);
+            let release = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                drop(scanner);
+            });
+            let done = what(store);
+            release.join().unwrap();
+            done
+        };
+        held_for_a_moment(&mut store, &|s| s.append_journal("doc", b"second")).unwrap();
+        assert_eq!(store.load_journal("doc").unwrap(), b"firstsecond");
+        held_for_a_moment(&mut store, &|s| s.truncate_journal("doc", 5)).unwrap();
+        assert_eq!(store.load_journal("doc").unwrap(), b"first");
+        held_for_a_moment(&mut store, &|s| s.clear_journal("doc")).unwrap();
+        assert!(store.load_journal("doc").unwrap().is_empty());
+    }
+
+    /// The lead this was found from: a file deleted while another program holds it (sharing it for deletion, as
+    /// scanners do) used to keep its name "delete pending" on Windows, and making a file of that name failed with
+    /// ERROR_ACCESS_DENIED until the last handle closed. A journal is never deleted and made again now; this checks
+    /// the store's own way of removing a document frees its names at once either way.
+    #[cfg(windows)]
+    #[test]
+    fn a_document_removed_while_held_can_be_written_again_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DiskStore::open(dir.path()).unwrap();
+        store.save_document("doc", b"damaged").unwrap();
+        store.append_journal("doc", b"first").unwrap();
+        let _scanners =
+            (hold(&dir.path().join(format!("doc{DOCUMENT_SUFFIX}")), 1 | 2 | 4), hold(&dir.path().join(format!("doc{JOURNAL_SUFFIX}")), 1 | 2 | 4));
+        store.remove_document("doc").unwrap();
+        store.save_document("doc", b"rebuilt").unwrap();
+        store.append_journal("doc", b"again").unwrap();
+        assert_eq!(store.load_document("doc").unwrap().as_deref(), Some(&b"rebuilt"[..]));
+        assert_eq!(store.load_journal("doc").unwrap(), b"again");
+    }
 
     /// Recents files and documents of files each keep their own few set-aside copies: many of one kind never push out
     /// the other's.
