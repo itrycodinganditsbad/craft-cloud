@@ -134,6 +134,15 @@ pub const MAX_FRAGMENT_BYTES: usize = 2 * MAX_WHOLE_BYTES;
 /// the document out there, in time growing with the square of the text it takes back).
 const MAX_CHECKOUT_OPS: i64 = 64 * 1024;
 
+/// For tests and simulations: an app's changes over `bytes` go up in fragments of at most `bytes` from now on, in this
+/// process (so changes of a few KB do what changes over 1 MiB do). At most the frame limit.
+#[doc(hidden)]
+pub fn set_frame_limit_for_tests(bytes: usize) {
+    FRAME_LIMIT.store(bytes.clamp(craft_cloud_proto::fragments::HEADER_BYTES + 1, MAX_UPDATE_BYTES), std::sync::atomic::Ordering::Relaxed);
+}
+
+static FRAME_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MAX_UPDATE_BYTES);
+
 /// Every update of the log up to `upto` is in the document's file; `upto_hash` is the hash of the update at `upto`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Have {
@@ -2120,6 +2129,11 @@ impl<S: DocStore> Replica<S> {
         Some((online, (doc.pending.len() + usize::from(doc.pushing.is_some())) as u64))
     }
 
+    /// How many rows of the document's log this machine keeps as fragments of changes not whole here yet.
+    pub fn kept_fragments(&self, id: DocId) -> usize {
+        self.docs.get(&id).map_or(0, |d| d.fragments.values().map(|s| s.rows.len()).sum())
+    }
+
     /// An app has (`true`) or no longer has (`false`) the document open: one no app has open may be unfollowed past
     /// the device's cap.
     pub fn set_open(&mut self, id: DocId, open: bool) {
@@ -2150,7 +2164,7 @@ impl<S: DocStore> Replica<S> {
             doc.journal_failed = false;
         }
         // Fragments of it: what goes up (each an update of the log), and its numbers.
-        let frames = split(bytes, MAX_UPDATE_BYTES).map_err(|e| LocalError::Invalid(e.to_string()))?;
+        let frames = split(bytes, FRAME_LIMIT.load(std::sync::atomic::Ordering::Relaxed)).map_err(|e| LocalError::Invalid(e.to_string()))?;
         // A server before fragments would store them one by one, and its other devices couldn't read them.
         if frames.len() > 1 && self.link == Link::Up && self.protocol < LIVE_FRAGMENTS_PROTOCOL {
             return Err(LocalError::Invalid("a change this big needs a newer Craft Cloud server; it wasn't shared".into()));
@@ -2646,6 +2660,9 @@ impl<S: DocStore> Replica<S> {
         if batch.is_empty() {
             return Vec::new();
         }
+        // What the copy had before: a row with anything past it goes to the apps (one Loro holds back for its history
+        // too: taken again on its own after the batch, Loro has it already and says nothing of it).
+        let before = doc.body.copy().version().unwrap_or_default();
         let new = if one_by_one {
             // (Each row's own import says what it brought.)
             false
@@ -2668,8 +2685,9 @@ impl<S: DocStore> Replica<S> {
         if new && let Kind::Recents(app) = &kind {
             self.changed.insert(app.clone());
         }
+        let past = |bytes: &[u8]| spans_of(bytes).is_none_or(|r| r.iter().any(|(peer, _, end)| *end > before.get(peer).copied().unwrap_or(0)));
         for (seq, bytes) in batch {
-            if new && kind.is_document() && !is_fragment(&bytes) && !is_bundle(&bytes) {
+            if !one_by_one && kind.is_document() && !is_fragment(&bytes) && !is_bundle(&bytes) && past(&bytes) {
                 self.events.push(DocEvent::Remote(id, bytes.clone()));
             }
             frames.extend(self.on_update(id, seq, bytes));
@@ -2778,6 +2796,30 @@ impl<S: DocStore> Replica<S> {
 
     /// `ack {doc, client_seq, seq}`: one of this machine's updates is in the log.
     fn on_ack(&mut self, id: DocId, client_seq: u64, seq: u64) -> Vec<ClientFrame> {
+        // A fragment's ack says its whole set is stored: the server stores a set in one go, with numbers following
+        // on in the order of the fragments' (as this machine numbered them). Its other fragments still unacked here
+        // (their acks lost with a connection) are stored too: sent again alone, they would never make a set.
+        let set = self.docs.get(&id).and_then(|d| {
+            let f = parse(&d.pending.iter().find(|p| p.client_seq == client_seq)?.bytes)?;
+            let mut seqs: Vec<u64> = d
+                .pending
+                .iter()
+                .filter(|q| q.client_seq == client_seq || (q.acked.is_none() && parse(&q.bytes).is_some_and(|g| g.set == f.set)))
+                .map(|q| q.client_seq)
+                .collect();
+            seqs.sort_unstable();
+            Some(seqs)
+        });
+        let Some(set) = set else { return self.on_ack_one(id, client_seq, seq) };
+        let mut frames = Vec::new();
+        for c in set {
+            let Some(s) = seq.checked_add(c).and_then(|x| x.checked_sub(client_seq)) else { continue };
+            frames.extend(self.on_ack_one(id, c, s));
+        }
+        frames
+    }
+
+    fn on_ack_one(&mut self, id: DocId, client_seq: u64, seq: u64) -> Vec<ClientFrame> {
         let Some(doc) = self.docs.get_mut(&id) else { return Vec::new() };
         let Some(i) = doc.pending.iter().position(|p| p.client_seq == client_seq) else {
             // Stored already as far as this machine knew (the log held its operations before the ack came): the acked
@@ -5044,6 +5086,29 @@ mod tests {
         let fresh = loro::LoroDoc::new();
         fresh.import(&uploaded(&mut r, manifest)).unwrap();
         assert_eq!(fresh.get_text("text").len_utf8(), 2 * MAX_UPDATE_BYTES + "s import".len());
+    }
+
+    /// The ack of one fragment of an own change says the whole set is stored (the server stores it in one go): the
+    /// others are stored too, their acks lost with the connection. Sent again alone, they would never make a set.
+    #[test]
+    fn one_ack_of_a_set_stores_the_whole_set() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let (mut r, id, import) = joined(&store, space, node);
+        let app_doc = text_doc(50);
+        app_doc.import(&import).unwrap();
+        let big = sliced(&app_doc, &"a".repeat(2 * MAX_UPDATE_BYTES));
+        let sent = r.local_update(id, &big).unwrap();
+        assert_eq!(sent.len(), 3);
+        r.on_frame(ServerFrame::Ack { doc: id, client_seq: 1, seq: 1 }).unwrap();
+        assert_eq!(r.document_status(id), Some((true, 0)), "nothing waits");
+        r.disconnected();
+        r.connected();
+        let mut out = r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) }).unwrap();
+        out.extend(r.on_frame(ServerFrame::Subscribed { doc: id, head: 3 }).unwrap());
+        assert!(!out.iter().any(|f| matches!(f, ClientFrame::Update { .. })), "nothing sent again: {out:?}");
+        let answer = r.on_frame(ServerFrame::Compact { doc: id, upto: 3 }).unwrap();
+        assert!(answer.iter().any(|f| matches!(f, ClientFrame::Snapshot { upto: 3, .. })), "its rows are in the log: {answer:?}");
     }
 
     /// An app's change over the frame limit: imported whole, journalled whole, and sent as fragments that fit a frame
