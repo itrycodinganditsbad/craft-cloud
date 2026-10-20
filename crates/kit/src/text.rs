@@ -383,26 +383,11 @@ pub(crate) fn write_story(
         text.delete_utf8(p, old_end - p)?;
         w.text_bytes = w.text_bytes.saturating_add(old_end - p);
     }
-    let mut at = p;
-    while at < new_end {
-        let mut room = w.room();
-        if room == 0 {
-            w.cut()?;
-            room = w.room();
-        }
-        let mut end = (at + room.max(1)).min(new_end);
-        while end > at && !new_text.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end == at {
-            // One character bigger than the room: it goes alone.
-            end = at + new_text.get(at..).and_then(|t| t.chars().next()).map_or(1, char::len_utf8);
-        }
-        let piece = new_text.get(at..end).ok_or_else(|| KitError::Invalid("the text's edit isn't on character boundaries".into()))?;
+    if new_end > p {
+        let piece = new_text.get(p..new_end).ok_or_else(|| KitError::Invalid("the text's edit isn't on character boundaries".into()))?;
         w.spend(piece.len())?;
-        text.insert_utf8(at, piece)?;
+        text.insert_utf8(p, piece)?;
         w.text_bytes = w.text_bytes.saturating_add(piece.len());
-        at = end;
     }
     // Character attributes.
     let middle = stored_runs(&text, p, new_end)?;

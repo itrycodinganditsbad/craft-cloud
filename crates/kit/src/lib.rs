@@ -34,7 +34,7 @@ pub use mapping::{Attrs, Mappings, OpaqueSource, RemotePatch, Span, TableSource,
 pub use opaque::Opaque;
 pub use props::{Props, PropsRead};
 pub use session::{
-    Agent, Badge, CATCH_UP_EVERY, CHANGE_WAIT, LiveDocument, MAX_BACKOFF, MAX_QUEUE_BYTES, MAX_UNDO_TEXT_BYTES, NotLive, Open, PRESENCE_EVERY,
+    Agent, Badge, CATCH_UP_EVERY, LiveDocument, MAX_BACKOFF, MAX_CHANGE_BYTES, MAX_QUEUE_BYTES, MAX_UNDO_TEXT_BYTES, NotLive, Open, PRESENCE_EVERY,
     PRESENCE_TTL, Peer, Polled, REPLACE_WITH_FILE, ReadOnly, SavePoint, SaveRecord, Session, Status, UndoKind,
 };
 pub use table::{TableTouch, TableView};
@@ -42,12 +42,13 @@ pub use text::RichText;
 pub use timeline::{ItemRead, TimelineTouch, TimelineView};
 pub use tree::{TreeTouch, TreeView};
 pub use value::{AgentBlobs, BlobStore, ChunkRef, ElemId, MAX_VALUE_BYTES, MemoryBlobs, OpaqueCodec, Value};
-pub use writer::{OP_OVERHEAD, SPLIT_BYTES};
+pub use writer::OP_OVERHEAD;
 
 /// For an app's adapter tests: the fake agent of `craft-cloud-app` (feature `fake`).
 #[cfg(feature = "fake")]
 pub mod testing {
-    pub use craft_cloud_app::fake::{Fake, Hub};
+    pub use craft_cloud_app::fake::{Fake, FragmentFaults, Hub};
+    pub use craft_cloud_app::live::set_fragment_patience_for_tests;
 }
 
 /// For the kit's own tests and simulations: the mappings without a session.
@@ -74,7 +75,7 @@ pub mod raw {
     }
 
     impl Replica {
-        /// Writes `old` → `new`; the updates (each commit's export) and how many commits.
+        /// Writes `old` → `new`; the update (none if nothing changed, else one, whole) and how many commits (0 or 1).
         pub fn write<D: LiveDocument>(&mut self, old: Option<&D::Doc>, new: &D::Doc) -> Result<(Vec<Vec<u8>>, usize), KitError> {
             let mut w = Writer::new(&self.doc, LOCAL_ORIGIN);
             write_diff::<D>(&mut w, old, new, &mut self.ctx)?;

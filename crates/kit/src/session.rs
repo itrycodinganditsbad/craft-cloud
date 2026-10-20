@@ -29,7 +29,7 @@ use crate::mapping::{Kind, Mappings, Part, RemotePatch, Touched};
 use crate::table::{TableTouch, parse_cell_key};
 use crate::timeline::TimelineTouch;
 use crate::tree::{TreeIndex, TreeTouch};
-use crate::writer::{CONTINUED, KIT_ORIGIN, LOCAL_ORIGIN, Updates, Writer, export_since};
+use crate::writer::{KIT_ORIGIN, LOCAL_ORIGIN, Updates, Writer, export_since};
 use crate::{ElemId, KitError};
 
 /// The most bytes of changes a session keeps in memory for the agent; at or past it, local changes are refused
@@ -41,9 +41,9 @@ const FIRST_BACKOFF: Duration = Duration::from_millis(200);
 /// Presence is sent again this often while set, and a peer's is dropped after this long without one.
 pub const PRESENCE_EVERY: Duration = Duration::from_secs(3);
 pub const PRESENCE_TTL: Duration = Duration::from_secs(10);
-/// How long a change another machine sent in several commits waits for its last commit before what came is applied
-/// anyway (the sender went away half-way: its app will send the rest when it is back).
-pub const CHANGE_WAIT: Duration = Duration::from_secs(10);
+/// The largest change the kit sends (one update, in fragments past 1 MiB): a snapshot's limit. A change over it can't
+/// be live: the session stops (the model stays editable; save it to the file).
+pub const MAX_CHANGE_BYTES: usize = craft_cloud_api::fragments::MAX_WHOLE_BYTES;
 /// Undo steps kept.
 const UNDO_STEPS: usize = 500;
 /// The most text (inserted and deleted, in bytes) one step may change and still be undone while live. Loro's undo of a
@@ -153,6 +153,9 @@ pub struct Status {
     /// The file on disk wasn't saved by a Craft app from this document (edited outside): the app may bring it in as a
     /// local change, or keep the live content.
     pub changed_outside: bool,
+    /// Changes another machine sent in fragments that didn't come whole on a connection (dropped, never applied), in
+    /// this session: each time, the session opened the document again and caught up.
+    pub gaps: u64,
     /// The last error, for the app to show.
     pub error: Option<String>,
 }
@@ -357,9 +360,6 @@ pub struct Session<D: LiveDocument> {
     outbox: VecDeque<Out>,
     outbox_bytes: usize,
     incoming: Vec<Vec<u8>>,
-    /// Remote changes imported but not applied yet: another machine's change came in part (`change_open`).
-    waiting: Vec<Raw>,
-    waiting_since: Option<Instant>,
     held: bool,
     grouping: bool,
     status: Status,
@@ -596,8 +596,6 @@ impl<D: LiveDocument> Session<D> {
             outbox: VecDeque::new(),
             outbox_bytes: 0,
             incoming: Vec::new(),
-            waiting: Vec::new(),
-            waiting_since: None,
             held: false,
             grouping: false,
             status: Status::default(),
@@ -1016,6 +1014,7 @@ impl<D: LiveDocument> Session<D> {
 
     fn take_events(&mut self) {
         let mut closed = None;
+        let mut gap = false;
         let mut events = Vec::new();
         if let Some(link) = &self.link {
             while let Some(event) = link.doc.try_recv() {
@@ -1067,11 +1066,18 @@ impl<D: LiveDocument> Session<D> {
                     self.status.stopped = stopped || self.refused.is_some() || self.status.replaced;
                 }
                 Event::File(frontiers) => self.file_version = frontiers,
+                Event::Gap => gap = true,
                 Event::Closed(why) => closed = Some(why),
             }
         }
         if let Some(why) = closed {
             self.drop_link(&why);
+        } else if gap {
+            // A change another machine sent in fragments didn't come whole: nothing of it was applied. The document
+            // is opened again at once, and its state brings the change (or what of it is still coming).
+            self.status.gaps += 1;
+            self.drop_link("a change from another machine came in part; catching up");
+            self.reconnect_now();
         }
     }
 
@@ -1175,7 +1181,7 @@ impl<D: LiveDocument> Session<D> {
 
     /// Imports what came and hands the app the touched parts. True if the model changed.
     fn apply_incoming(&mut self) -> Result<bool, KitError> {
-        if self.incoming.is_empty() && self.waiting.is_empty() {
+        if self.incoming.is_empty() {
             return Ok(false);
         }
         let batch = std::mem::take(&mut self.incoming);
@@ -1189,17 +1195,7 @@ impl<D: LiveDocument> Session<D> {
         }
         let raw = std::mem::take(&mut lock(&self.collector).raw);
         lock(&self.collector).on = false;
-        self.waiting.extend(raw);
-        // A change another machine sent in several commits is applied whole: while one has come in part, what came
-        // waits (at most `CHANGE_WAIT`, for a sender that went away half-way).
-        if self.change_open() {
-            let since = *self.waiting_since.get_or_insert_with(Instant::now);
-            if since.elapsed() < CHANGE_WAIT {
-                return Ok(false);
-            }
-        }
-        self.waiting_since = None;
-        let raw = std::mem::take(&mut self.waiting);
+        // (Each update is a whole change: one that came in fragments was joined before it got here.)
         let touched = self.classify(raw);
         let was_read_only = self.status.read_only.clone();
         if touched.kit {
@@ -1210,21 +1206,6 @@ impl<D: LiveDocument> Session<D> {
         }
         self.rebuild(touched)?;
         Ok(true)
-    }
-
-    /// Whether another peer's last change here is one it sent in several commits and not all of them came yet: its
-    /// last change here is marked as continued, or came in part.
-    fn change_open(&self) -> bool {
-        let me = self.doc.peer_id();
-        self.doc.oplog_vv().iter().any(|(peer, end)| {
-            if *peer == me || *end <= 0 {
-                return false;
-            }
-            match self.doc.get_change(loro::ID::new(*peer, end - 1)) {
-                Some(c) => c.message.as_deref() == Some(CONTINUED) || c.id.counter + i32::try_from(c.len).unwrap_or(i32::MAX) > *end,
-                None => false,
-            }
-        })
     }
 
     /// Sorts Loro's raw touches out by part.
@@ -1398,6 +1379,13 @@ impl<D: LiveDocument> Session<D> {
         }
         let end = self.doc.oplog_vv().get(&self.doc.peer_id()).copied().unwrap_or(0);
         for bytes in updates {
+            if bytes.len() > MAX_CHANGE_BYTES && self.refused.is_none() {
+                // It can never go (nor anything after it, which needs it): the session stops, the model stays.
+                let why =
+                    format!("a change of {} bytes is over what Craft Cloud takes ({MAX_CHANGE_BYTES}); save the document to the file", bytes.len());
+                self.refused = Some(why.clone());
+                self.status.error = Some(why);
+            }
             self.outbox_bytes = self.outbox_bytes.saturating_add(bytes.len());
             self.outbox.push_back(Out { bytes, end, seq: None });
         }
