@@ -47,7 +47,7 @@ use craft_cloud_api::api::ErrorAnswer as ErrorBody;
 use craft_cloud_api::fragments::split;
 use craft_cloud_api::limits::MAX_UPDATE_BYTES;
 use craft_cloud_api::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, STATE, UPDATE, decode_binary, encode_binary};
-use craft_cloud_api::local::{DocState, DocsEvent, DocsRequest, MAX_LOCAL_JSON_BYTES, paths};
+use craft_cloud_api::local::{DocState, DocsEvent, DocsRequest, LOCAL_API_FRAGMENTS, MAX_LOCAL_JSON_BYTES, codes, paths};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::HandshakeError;
 use tungstenite::protocol::WebSocketConfig;
@@ -68,6 +68,9 @@ pub const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the reader waits for data before it looks whether it is to stop.
 const IDLE_WAKE: Duration = Duration::from_millis(250);
+
+/// What an agent too old for this app's live documents is refused with ([`codes::AGENT_TOO_OLD`]), for people.
+pub const AGENT_TOO_OLD: &str = "Craft Cloud on this computer is older than this app; update Craft Cloud to edit live";
 
 /// What happens to an open document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,6 +364,8 @@ fn read_loop(shared: Arc<Shared>, mut socket: WebSocket<TcpStream>) {
 pub struct Documents {
     shared: Arc<Shared>,
     reader: Option<JoinHandle<()>>,
+    /// The local API version the agent spoke when this connected.
+    api: u32,
 }
 
 impl std::fmt::Debug for Documents {
@@ -371,6 +376,12 @@ impl std::fmt::Debug for Documents {
 
 impl Documents {
     pub(crate) fn connect(client: &Client) -> Result<Self, Error> {
+        // An agent from before changes in fragments would take each fragment as a change of its own (and its apps
+        // and machines would get them so): live documents need an update of Craft Cloud first.
+        let api = client.status()?.api;
+        if api < LOCAL_API_FRAGMENTS {
+            return Err(Error::Refused { code: codes::AGENT_TOO_OLD.into(), message: AGENT_TOO_OLD.into() });
+        }
         let stream = TcpStream::connect_timeout(&client.addr(), CONNECT_TIMEOUT).map_err(|e| Error::NotRunning(format!("can't reach it: {e}")))?;
         stream.set_nodelay(true).map_err(|e| Error::Io(e.to_string()))?;
         stream.set_read_timeout(Some(OPEN_TIMEOUT)).map_err(|e| Error::Io(e.to_string()))?;
@@ -420,7 +431,13 @@ impl Documents {
             .name("craft-cloud-docs".into())
             .spawn(move || read_loop(reader_shared, reader_socket))
             .map_err(|e| Error::Io(e.to_string()))?;
-        Ok(Self { shared, reader: Some(reader) })
+        Ok(Self { shared, reader: Some(reader), api })
+    }
+
+    /// The local API version the agent spoke when this connected (at least [`LOCAL_API_FRAGMENTS`]): an app tells the
+    /// document's other machines with its presence, so a newer one can say to update an older one.
+    pub fn agent_api(&self) -> u32 {
+        self.api
     }
 
     /// Opens the file at `path` (relative to the synced folder, `/`-separated, or absolute inside it) for `app` (its

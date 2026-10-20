@@ -17,8 +17,8 @@
 //! app's change.
 //!
 //! [`Fake::restart`] drops every app connection and refuses new ones until [`Fake::start`] (an agent that stopped):
-//! what the machine held stays, as the agent's files do. [`Fake::too_old`] makes a machine answer the blob calls as an
-//! agent from before blobs (`not_found` for the call). [`Hub::set_live`] holds live updates back between machines while
+//! what the machine held stays, as the agent's files do. [`Fake::too_old`] makes a machine answer as an agent from
+//! before blobs and changes in fragments (`not_found` for the blob calls, local API version 1). [`Hub::set_live`] holds live updates back between machines while
 //! saved files' records still go (a proxy that blocks WebSockets).
 
 use std::collections::{HashMap, VecDeque};
@@ -359,7 +359,7 @@ impl Hub {
             ("GET", paths::STATUS) => {
                 let online = lock(&self.inner).machines.get(&machine).is_some_and(|m| m.online);
                 let status = Status {
-                    api: LOCAL_API_MAX,
+                    api: if too_old { 1 } else { LOCAL_API_MAX },
                     signed_in: true,
                     account: Some("fake".into()),
                     server: Some("https://fake.invalid".into()),
@@ -891,7 +891,8 @@ impl Fake {
         }
     }
 
-    /// Answer the blob calls as an agent from before blobs.
+    /// Answer as an agent from before blobs and changes in fragments: the blob calls aren't known, and the status
+    /// names local API version 1 (an app's live documents are refused as `agent_too_old` before they connect).
     pub fn too_old(&self) {
         if let Some(m) = lock(&self.hub.inner).machines.get_mut(&self.id) {
             m.too_old = true;
@@ -1106,6 +1107,11 @@ mod tests {
         assert!(matches!(&put, Err(crate::Error::Refused { code, .. }) if code == "agent_too_old"), "{put:?}");
         assert!(matches!(b.client().blobs().get(&stored.hash, stored.len), Err(crate::Error::Refused { code, .. }) if code == "agent_too_old"));
         assert!(b.client().status().is_ok(), "the rest still works");
+        assert_eq!(
+            b.client().documents().unwrap_err(),
+            crate::Error::Refused { code: "agent_too_old".into(), message: crate::live::AGENT_TOO_OLD.into() },
+            "live documents need a newer agent"
+        );
         // An update over 1 MiB goes in fragments: it comes whole, acked once; one over a snapshot's limit isn't sent.
         let big: Vec<u8> = (0..3 * MAX_UPDATE_BYTES).map(|i| (i % 253) as u8).collect();
         acked(&doc_a, doc_a.send(&big).unwrap());

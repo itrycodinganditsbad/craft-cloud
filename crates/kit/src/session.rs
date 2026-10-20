@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use craft_cloud_api::fragments::parts;
+use craft_cloud_api::local::LOCAL_API_FRAGMENTS;
 use craft_cloud_app::Client;
 use craft_cloud_app::live::{Document, Documents, Event, NotLiveReason, OpenOptions, Opened, Waker};
 use loro::event::{Diff, DiffEvent};
@@ -42,6 +43,11 @@ const FIRST_BACKOFF: Duration = Duration::from_millis(200);
 /// Presence is sent again this often while set, and a peer's is dropped after this long without one.
 pub const PRESENCE_EVERY: Duration = Duration::from_secs(3);
 pub const PRESENCE_TTL: Duration = Duration::from_secs(10);
+/// A presence frame names the sender's agent version after its peer: this mark, then the version (u32, big-endian),
+/// then the app's bytes. A kit from before versions sends the app's bytes right after the peer.
+const PRESENCE_MARK: [u8; 4] = *b"ccp2";
+/// The peer, the mark and the version before the app's bytes in a presence frame.
+const PRESENCE_HEADER: usize = 16;
 /// The largest change the kit sends (one update, in fragments past 1 MiB): a snapshot's limit. A change over it can't
 /// be live: the session stops (the model stays editable; save it to the file).
 pub const MAX_CHANGE_BYTES: usize = craft_cloud_api::fragments::MAX_WHOLE_BYTES;
@@ -109,6 +115,9 @@ impl Agent {
 pub enum NotLive {
     /// Craft Cloud isn't running here (or refused): the message says why.
     NoAgent(String),
+    /// Craft Cloud runs here, but is older than this app's live documents: show "update Craft Cloud on this
+    /// computer to edit live" ([`craft_cloud_app::live::AGENT_TOO_OLD`]).
+    AgentTooOld,
     /// The agent's reason (offline before the first live open, not synced yet, …).
     Reason(NotLiveReason),
 }
@@ -154,6 +163,9 @@ pub struct Status {
     /// The file on disk wasn't saved by a Craft app from this document (edited outside): the app may bring it in as a
     /// local change, or keep the live content.
     pub changed_outside: bool,
+    /// Another machine with the document open runs an older Craft Cloud ([`Peer::older`]): show "<machine> runs an
+    /// older Craft Cloud; update it" (its name is in its presence, as the app sends it).
+    pub older_peer: bool,
     /// The last error, for the app to show.
     pub error: Option<String>,
 }
@@ -271,6 +283,30 @@ struct Kept {
 pub struct Peer {
     pub bytes: Vec<u8>,
     pub seen: Instant,
+    /// The local API version of the agent it runs on, as its presence says; `None` from an app on a Craft Cloud from
+    /// before versions in presence (older than this one).
+    pub agent_api: Option<u32>,
+}
+
+impl Peer {
+    /// Whether it runs on a Craft Cloud too old for changes in fragments: its machine should update it (it may lack
+    /// this machine's big changes). Show "<machine> runs an older Craft Cloud; update it".
+    pub fn older(&self) -> bool {
+        self.agent_api.is_none_or(|api| api < LOCAL_API_FRAGMENTS)
+    }
+}
+
+/// A presence frame's peer, its sender's agent version (none from a kit before versions) and the app's bytes.
+fn read_presence(frame: &[u8]) -> Option<(u64, Option<u32>, &[u8])> {
+    let (peer, rest) = frame.split_first_chunk::<8>()?;
+    let peer = u64::from_be_bytes(*peer);
+    match rest.split_first_chunk::<4>() {
+        Some((mark, after)) if *mark == PRESENCE_MARK => {
+            let (api, bytes) = after.split_first_chunk::<4>()?;
+            Some((peer, Some(u32::from_be_bytes(*api)), bytes))
+        }
+        _ => Some((peer, None, rest)),
+    }
 }
 
 /// One change waiting for the agent.
@@ -326,7 +362,7 @@ pub(crate) struct Ctx {
 /// the agent hears it closed before the connection ends.
 struct Link {
     doc: Document,
-    _docs: Documents,
+    docs: Documents,
 }
 
 /// Why a reopen didn't attach.
@@ -510,6 +546,9 @@ impl<D: LiveDocument> Session<D> {
         };
         let docs = match client.documents() {
             Ok(d) => d,
+            Err(craft_cloud_app::Error::Refused { code, .. }) if code == craft_cloud_api::local::codes::AGENT_TOO_OLD => {
+                return Ok(Open::NotLive(NotLive::AgentTooOld));
+            }
             Err(e) => return not_running(e),
         };
         let file_hash = file_bytes.map(|b| *blake3::hash(b).as_bytes());
@@ -538,7 +577,7 @@ impl<D: LiveDocument> Session<D> {
         // bytes the document was imported from are no edit either.
         session.status.changed_outside =
             snapshot.is_none() && document.changed_outside() == Some(true) && file_hash.is_some_and(|h| import_hash(&session.doc) != Some(hex(&h)));
-        session.attach(Link { _docs: docs, doc: document });
+        session.attach(Link { docs, doc: document });
         Ok(Open::Live(Box::new(session)))
     }
 
@@ -1022,11 +1061,12 @@ impl<D: LiveDocument> Session<D> {
             match event {
                 Event::Update(bytes) => self.incoming.push(bytes),
                 Event::Presence(bytes) => {
-                    if let Some((peer, payload)) = bytes.split_first_chunk::<8>() {
-                        let peer = u64::from_be_bytes(*peer);
-                        if peer != self.doc.peer_id() {
-                            self.peers.insert(peer, Peer { bytes: payload.to_vec(), seen: Instant::now() });
-                        }
+                    if let Some((peer, agent_api, payload)) = read_presence(&bytes)
+                        && peer != self.doc.peer_id()
+                    {
+                        let peer_now = Peer { bytes: payload.to_vec(), seen: Instant::now(), agent_api };
+                        self.status.older_peer |= peer_now.older();
+                        self.peers.insert(peer, peer_now);
                     }
                 }
                 Event::Acked(seq) => {
@@ -1105,7 +1145,7 @@ impl<D: LiveDocument> Session<D> {
                     self.incoming.push(doc.state().to_vec());
                     self.incoming.extend(doc.state_updates().iter().cloned());
                     self.status.error = None;
-                    self.attach(Link { _docs: docs, doc });
+                    self.attach(Link { docs, doc });
                     if let Some(waker) = &self.waker {
                         waker();
                     }
@@ -1431,12 +1471,14 @@ impl<D: LiveDocument> Session<D> {
     }
 
     /// Shows this app's cursor or selection to the document's other machines and apps (the bytes are the app's, at
-    /// most 4 KiB less 8); `None` stops showing it. Sent now and again every [`PRESENCE_EVERY`].
+    /// most 4 KiB less 16); `None` stops showing it. Sent now and again every [`PRESENCE_EVERY`], with this machine's
+    /// agent version ([`Peer::older`] on the others).
     pub fn set_presence(&mut self, bytes: Option<Vec<u8>>) -> Result<(), KitError> {
+        let max = craft_cloud_api::limits::MAX_PRESENCE_BYTES - PRESENCE_HEADER;
         if let Some(b) = &bytes
-            && b.len() + 8 > craft_cloud_api::limits::MAX_PRESENCE_BYTES
+            && b.len() > max
         {
-            return Err(KitError::TooLarge { what: "a presence", len: b.len(), max: craft_cloud_api::limits::MAX_PRESENCE_BYTES - 8 });
+            return Err(KitError::TooLarge { what: "a presence", len: b.len(), max });
         }
         self.presence = bytes;
         self.presence_sent = None;
@@ -1447,11 +1489,14 @@ impl<D: LiveDocument> Session<D> {
     fn keep_presence(&mut self) {
         let now = Instant::now();
         self.peers.retain(|_, p| now.duration_since(p.seen) < PRESENCE_TTL);
+        self.status.older_peer = self.peers.values().any(Peer::older);
         let (Some(link), Some(bytes)) = (&self.link, &self.presence) else { return };
         if self.presence_sent.is_some_and(|at| now.duration_since(at) < PRESENCE_EVERY) {
             return;
         }
         let mut frame = self.doc.peer_id().to_be_bytes().to_vec();
+        frame.extend_from_slice(&PRESENCE_MARK);
+        frame.extend_from_slice(&link.docs.agent_api().to_be_bytes());
         frame.extend_from_slice(bytes);
         if link.doc.presence(&frame).is_ok() {
             self.presence_sent = Some(now);

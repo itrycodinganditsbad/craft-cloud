@@ -36,7 +36,11 @@ pub const LOCAL_API_FILE: &str = "local-api.json";
 pub const LOCAL_API_SCHEMA: u32 = 1;
 /// Local API versions this build speaks.
 pub const LOCAL_API_MIN: u32 = 1;
-pub const LOCAL_API_MAX: u32 = 1;
+pub const LOCAL_API_MAX: u32 = 2;
+/// The local API version from which the agent takes an app's change in fragments ([`fragments`](crate::fragments))
+/// and sends every change to its apps whole, and its server log keeps a change whole: an app's live documents need
+/// an agent of at least this version (an older one is told to update Craft Cloud).
+pub const LOCAL_API_FRAGMENTS: u32 = 2;
 /// The environment variable that overrides the agent's data folder.
 pub const DATA_DIR_ENV: &str = "CRAFT_CLOUD_AGENT_DIR";
 /// The data folder's name inside the OS's per-user data folder.

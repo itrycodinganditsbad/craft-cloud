@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use common::{App, Notes, NotesApp, change, open, until};
 use craft_cloud_app::fake::Hub;
-use craft_cloud_kit::{AgentBlobs, BlobStore, KitError, MAX_QUEUE_BYTES, Open, Session};
+use craft_cloud_kit::{AgentBlobs, BlobStore, KitError, MAX_QUEUE_BYTES, NotLive, Open, Session};
 
 #[test]
 fn a_file_imported_on_one_machine_is_live_on_the_other() {
@@ -202,6 +202,20 @@ fn presence_goes_to_the_other_machine_and_fades() {
     assert!(b.peers().contains_key(&a.peer()));
     assert!(a.peers().is_empty(), "its own isn't shown");
     assert!(a.set_presence(Some(vec![0; 4096])).is_err(), "at most 4 KiB with its header");
+    // Each says its agent's version: the laptop's is current. An app on a Craft Cloud from before versions in
+    // presence (the bytes right after its peer) is older: the session says so.
+    b.set_presence(Some(b"laptop".to_vec())).unwrap();
+    until(&mut [&mut a, &mut b], "the pc sees the laptop", |s| s[0].peers().contains_key(&s[1].peer()));
+    assert_eq!(a.peers()[&b.peer()].agent_api, Some(craft_cloud_api::local::LOCAL_API_MAX));
+    assert!(!a.peers()[&b.peer()].older() && !a.status().older_peer);
+    let docs = laptop.client().documents().unwrap();
+    let Ok(craft_cloud_app::live::Opened::Live(old)) = docs.open("p.txt", <App as craft_cloud_kit::LiveDocument>::APP) else { panic!("not live") };
+    let mut frame = 77u64.to_be_bytes().to_vec();
+    frame.extend_from_slice(b"an older one");
+    old.presence(&frame).unwrap();
+    until(&mut [&mut a], "the pc sees an older Craft Cloud", |s| s[0].status().older_peer);
+    assert_eq!(a.peers()[&77].bytes, b"an older one");
+    assert!(a.peers()[&77].older());
 }
 
 #[test]
@@ -214,6 +228,9 @@ fn blobs_go_through_the_agent_and_an_old_agent_says_so() {
     laptop.too_old();
     let e = b.get(&chunk).unwrap_err();
     assert!(e.to_string().contains("agent_too_old"), "{e}");
+    // Too old for live documents too: the file opens as a plain file, and the app can say to update Craft Cloud.
+    let opened = Session::<App>::open(&common::agent(&laptop), "x.txt", Arc::new(Notes::default()), None).unwrap();
+    assert!(matches!(opened, Open::NotLive(NotLive::AgentTooOld)));
     // Not running at all: the file opens as a plain file.
     pc.restart();
     let opened = Session::<App>::open(&common::agent(&pc), "x.txt", Arc::new(Notes::default()), None).unwrap();
