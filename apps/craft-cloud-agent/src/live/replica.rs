@@ -2171,7 +2171,8 @@ impl<S: DocStore> Replica<S> {
         // Fragments of it: what goes up (each an update of the log), and its numbers.
         let frames = split(bytes, FRAME_LIMIT.load(std::sync::atomic::Ordering::Relaxed)).map_err(|e| LocalError::Invalid(e.to_string()))?;
         // A server before fragments would store them one by one, and its other devices couldn't read them.
-        if frames.len() > 1 && self.link == Link::Up && self.protocol < LIVE_FRAGMENTS_PROTOCOL {
+        // Nor a bundle: an agent before them can't read it.
+        if (frames.len() > 1 || is_bundle(bytes)) && self.link == Link::Up && self.protocol < LIVE_FRAGMENTS_PROTOCOL {
             return Err(LocalError::Invalid("a change this big needs a newer Craft Cloud server; it wasn't shared".into()));
         }
         match import_whole(&doc.body, bytes) {
@@ -2214,7 +2215,10 @@ impl<S: DocStore> Replica<S> {
         doc.own(bytes);
         doc.dirty = true;
         let (up, epoch) = (self.link == Link::Up, self.epoch);
+        doc.whole_only = self.protocol < LIVE_FRAGMENTS_PROTOCOL;
         Ok(match doc.sub {
+            // A server before fragments: in order behind any fragment or bundle held back ([`send_pending`]).
+            Sub::Live if doc.full.is_none() && doc.whole_only => send_pending(id, doc),
             // (During a push too: an app's change goes at once, not behind the push's parts. Its operations count as
             // in the log for the push once it is acked.)
             Sub::Live if doc.full.is_none() => seqs
@@ -2465,8 +2469,10 @@ impl<S: DocStore> Replica<S> {
 
     fn resend_inner(&mut self) -> Vec<ClientFrame> {
         let (up, epoch) = (self.link == Link::Up, self.epoch);
+        let whole_only = self.protocol < LIVE_FRAGMENTS_PROTOCOL;
         let mut frames = Vec::new();
         for (id, doc) in &mut self.docs {
+            doc.whole_only = whole_only;
             match doc.sub {
                 Sub::Live => {
                     match doc.full {
@@ -2793,6 +2799,8 @@ impl<S: DocStore> Replica<S> {
             doc.dirty = true;
             self.events.push(DocEvent::Joined(id));
         }
+        // (From the link, not from the document: one read back since the welcome has it right too.)
+        doc.whole_only = self.protocol < LIVE_FRAGMENTS_PROTOCOL;
         let mut frames = send_pending(id, doc);
         frames.extend(doc.push_next(id, &mut self.notes, &mut self.peers));
         frames.extend(doc.try_compact());
@@ -3408,9 +3416,10 @@ fn send_pending(id: DocId, doc: &mut Doc) -> Vec<ClientFrame> {
         return frames;
     }
     for pending in &doc.pending {
-        // (Fragments wait for a server that takes them.)
-        if doc.whole_only && is_fragment(&pending.bytes) {
-            continue;
+        // Fragments and bundles wait for a server that takes them, and everything after them too: a later change
+        // builds on them, and would wait on every other machine for history that never came.
+        if doc.whole_only && (is_fragment(&pending.bytes) || is_bundle(&pending.bytes)) {
+            break;
         }
         // While a push is under way, only its parts go: they carry every other unacked update.
         if (pending.push || doc.pushing.is_none()) && doc.sent.insert(pending.client_seq) {
@@ -5342,10 +5351,22 @@ mod tests {
         assert!(!out.iter().any(|f| matches!(f, ClientFrame::Update { .. })), "no fragment to the old server: {out:?}");
         let more = sliced(&app_doc, &"c".repeat(2 * MAX_UPDATE_BYTES));
         assert!(matches!(r.local_update(id, &more), Err(LocalError::Invalid(_))), "refused while it is the server");
+        // A bundle in one frame too: an agent before bundles can't read it.
+        let bundled = sliced(&app_doc, &"d".repeat(craft_cloud_proto::fragments::SLICE_OPS as usize + 10));
+        assert!(bundled.len() < MAX_UPDATE_BYTES && is_bundle(&bundled));
+        assert!(matches!(r.local_update(id, &bundled), Err(LocalError::Invalid(_))), "a bundle is refused too");
+        // A small change after the held one waits behind it: it builds on it.
+        let small = insert(&app_doc, 0, "s");
+        assert!(r.local_update(id, &small).unwrap().is_empty(), "behind the held fragments");
         assert!(r.resend().iter().all(|f| !matches!(f, ClientFrame::Update { .. })));
+        // Read back from its file meanwhile (as after Loro failed): still held.
+        r.reload(id);
+        r.disconnected();
+        let out = welcome(&mut r, LIVE_DOCUMENTS_PROTOCOL);
+        assert!(!out.iter().any(|f| matches!(f, ClientFrame::Update { .. })), "a document read back holds them too: {out:?}");
         r.disconnected();
         let out = welcome(&mut r, LIVE_FRAGMENTS_PROTOCOL);
         let sent = out.iter().filter(|f| matches!(f, ClientFrame::Update { .. })).count();
-        assert_eq!(sent, split(&big, MAX_UPDATE_BYTES).unwrap().len(), "sent once the server takes them: {out:?}");
+        assert_eq!(sent, split(&big, MAX_UPDATE_BYTES).unwrap().len() + 1, "sent once the server takes them, in order: {out:?}");
     }
 }
