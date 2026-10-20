@@ -126,6 +126,8 @@ const FRAME: usize = 2048;
 static BIG: AtomicU64 = AtomicU64::new(0);
 static KEPT: AtomicU64 = AtomicU64::new(0);
 static FROM_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
+/// Big changes stored in part first (as a server before whole sets stored them), the rest sent again later.
+static PARTS: AtomicU64 = AtomicU64::new(0);
 
 impl Sim {
     fn say(&mut self, line: String) {
@@ -207,13 +209,13 @@ impl Sim {
     }
 
     /// An edit by the machine's app: a token typed into the text, or a key of the map.
-    fn edit(&mut self, m: usize) {
+    async fn edit(&mut self, m: usize) {
         let Some(doc) = self.doc else { return };
         let Some(app) = &self.apps[m].app else { return };
         self.edits += 1;
         // Now and then a big one, over the frame limit: it goes up in fragments, the server stores it whole, and
         // every machine keeps what came of its rows until it is whole (its text is one token: never cut in two).
-        let big = self.rng.chance(8);
+        let big = self.rng.chance(12);
         let token =
             if big { format!("m{m}e{}{};", self.edits, "x".repeat(3 * FRAME + self.rng.below(4 * FRAME))) } else { format!("m{m}e{};", self.edits) };
         let update = if big || self.rng.chance(70) {
@@ -233,7 +235,21 @@ impl Sim {
                     BIG.fetch_add(1, Ordering::Relaxed);
                 }
                 self.say(format!("m{m} edits {} ({} frames)", &token[..token.len().min(12)], frames.len()));
-                self.w.send(m, frames);
+                // Now and then a big one is stored in part, as a server before whole sets stored one whose sender's
+                // connection ended after its first fragment: that row alone is in the log (the other machines keep
+                // it, maybe for long), and the sender sends the rest again once it is back.
+                if big && frames.len() > 1 && self.w.machines[m].conn.is_some() && self.rng.chance(60) {
+                    if let Some(ClientFrame::Update { client_seq, bytes, .. }) = frames.first() {
+                        let device = self.w.machines[m].auth.device;
+                        self.w.meta.append_live_update(self.w.space, doc, device, *client_seq, bytes, 0).await.unwrap();
+                        self.w.state.live.publish(self.w.space, doc);
+                        PARTS.fetch_add(1, Ordering::Relaxed);
+                        self.say(format!("m{m}'s first fragment alone is stored, and its link ends"));
+                        self.w.disconnect(m);
+                    }
+                } else {
+                    self.w.send(m, frames);
+                }
             }
             Err(e) => {
                 // Not taken: the app's own copy has it, the agent's doesn't. It opens the document again.
@@ -246,6 +262,11 @@ impl Sim {
 
     /// One random step.
     async fn step(&mut self) {
+        // (How often a machine keeps part of a change: counted every step, for every machine.)
+        if let Some(doc) = self.doc {
+            let keeping = self.w.machines.iter().filter(|x| x.replica.as_ref().is_some_and(|r| r.kept_fragments(doc) > 0)).count();
+            KEPT.fetch_add(keeping as u64, Ordering::Relaxed);
+        }
         let m = self.rng.below(MACHINES);
         // Asleep (a laptop's lid closed): nothing of it moves.
         if self.asleep[m] > 0 {
@@ -253,7 +274,7 @@ impl Sim {
             return;
         }
         match self.rng.below(100) {
-            0..=24 => self.edit(m),
+            0..=24 => self.edit(m).await,
             25..=44 => {
                 // One frame up (the snapshot it may name goes up before it, as the hub sends it).
                 let api = self.w.blobs();
@@ -280,6 +301,7 @@ impl Sim {
                     if matches!(frame, ServerFrame::Snapshot { .. }) {
                         FROM_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
                     }
+                    let row = matches!(&frame, ServerFrame::Update { bytes, .. } if craft_cloud_proto::fragments::is_fragment(bytes));
                     self.last_down[m] = matches!(frame, ServerFrame::Update { .. } | ServerFrame::Ack { .. }).then(|| frame.clone());
                     match replica.on_frame(frame) {
                         Ok(frames) => {
@@ -300,17 +322,19 @@ impl Sim {
                         }
                     }
                     self.say(format!("m{m} down {text}"));
+                    // (A row of another machine's change: this one keeps part of it now. Its own acked fragments are
+                    // kept too, but those are in its copy already.)
                     if let Some(doc) = self.doc
+                        && row
                         && self.w.machines[m].replica.as_ref().is_some_and(|r| r.kept_fragments(doc) > 0)
                     {
-                        KEPT.fetch_add(1, Ordering::Relaxed);
                         // Part of the way through a change's rows: now and then the laptop sleeps right here, its
                         // connection often not outlasting it (the rest comes with a catch-up, maybe from a snapshot
                         // past the change), or the agent crashes (what it kept is in its file once written).
-                        if self.rng.chance(20) {
+                        if self.rng.chance(50) {
                             let steps = 20 + self.rng.below(100);
                             self.say(format!("m{m} sleeps {steps} steps part of the way through a change"));
-                            if self.rng.chance(60) {
+                            if self.rng.chance(80) {
                                 self.w.disconnect(m);
                             }
                             self.asleep[m] = steps;
@@ -464,8 +488,14 @@ impl Sim {
         let found = meta.live_doc(space, doc).await.ok().flatten();
         let mut ranges = Vec::new();
         for row in &rows {
-            let d = loro::LoroDoc::decode_import_blob_meta(&row.bytes, true).unwrap();
-            ranges.push((row.seq, format!("{:?}", d.partial_end_vv)));
+            let what = match craft_cloud_proto::fragments::parse(&row.bytes) {
+                Some(f) => format!("fragment {}/{} of {:02x}{:02x} from {}", f.index, f.count, f.set[0], f.set[1], row.device),
+                None => match loro::LoroDoc::decode_import_blob_meta(&row.bytes, true) {
+                    Ok(d) => format!("{:?}", d.partial_end_vv),
+                    Err(_) => "a bundle".into(),
+                },
+            };
+            ranges.push((row.seq, what));
         }
         format!("{found:?}; rows {ranges:?}")
     }
@@ -505,6 +535,9 @@ impl Sim {
 
 async fn run(seed: u64) -> Vec<String> {
     craft_cloud_agent::live::replica::set_frame_limit_for_tests(FRAME);
+    // A catch-up taken in parts of a few KB, as one of megabytes is: a connection that ends inside it leaves the
+    // machine keeping part of a change.
+    craft_cloud_agent::live::replica::set_batch_bytes_for_tests(3 * FRAME);
     let mut rng = Rng::new(seed);
     let compact_updates = 2 + rng.below(30) as u64;
     let compact_timeout = if rng.chance(50) { Duration::ZERO } else { Duration::from_secs(3600) };
@@ -579,7 +612,13 @@ async fn check(sim: &mut Sim, seed: u64) {
         let (_, waiting) = sim.w.machines[m].replica().document_status(doc).unwrap();
         assert_eq!(waiting, 0, "seed {seed}: m{m} has {waiting} change(s) the server never acked");
         let kept = sim.w.machines[m].replica().kept_fragments(doc);
-        assert_eq!(kept, 0, "seed {seed}: m{m} still keeps {kept} fragment(s) of a change it never got whole");
+        if kept > 0 {
+            let server = sim.server_version(doc).await;
+            panic!(
+                "seed {seed}: m{m} still keeps {kept} fragment(s) of a change it never got whole; it said {:?}; the server: {server}",
+                sim.w.machines[m].said
+            );
+        }
     }
     let view = sim.w.app_of(0, doc, 1);
     let text = view.text();
@@ -659,9 +698,15 @@ fn documents_converge_without_losing_an_edit() {
         block_on(run(seed));
     });
     let (big, kept, snapshots) = (BIG.load(Ordering::Relaxed), KEPT.load(Ordering::Relaxed), FROM_SNAPSHOT.load(Ordering::Relaxed));
-    eprintln!("documents sim: {big} big changes, {kept} steps keeping part of one, {snapshots} catch-ups from a snapshot");
+    let parts = PARTS.load(Ordering::Relaxed);
+    eprintln!(
+        "documents sim: {big} big changes ({parts} stored in part first), {kept} steps keeping part of one, {snapshots} catch-ups from a snapshot"
+    );
     if std::env::var("SIM_SEED").is_err() {
-        assert!(big > 0 && kept > 0 && snapshots > 0, "the run tested nothing of big changes ({big}, {kept}) or snapshots ({snapshots})");
+        assert!(
+            big > 0 && parts > 0 && kept > 0 && snapshots > 0,
+            "the run tested nothing of big changes ({big}, {parts}, {kept}) or snapshots ({snapshots})"
+        );
     }
 }
 

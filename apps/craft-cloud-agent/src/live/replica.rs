@@ -143,6 +143,16 @@ pub fn set_frame_limit_for_tests(bytes: usize) {
 
 static FRAME_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MAX_UPDATE_BYTES);
 
+/// For simulations: a catch-up's updates are taken a batch at a time once more than `bytes` of them wait, from now
+/// on, in this process (so a catch-up of a few KB is taken in parts as one of megabytes is). At most
+/// [`MAX_BATCH_BYTES`].
+#[doc(hidden)]
+pub fn set_batch_bytes_for_tests(bytes: usize) {
+    BATCH_BYTES.store(bytes.min(MAX_BATCH_BYTES), std::sync::atomic::Ordering::Relaxed);
+}
+
+static BATCH_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MAX_BATCH_BYTES);
+
 /// Every update of the log up to `upto` is in the document's file; `upto_hash` is the hash of the update at `upto`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Have {
@@ -2566,7 +2576,8 @@ impl<S: DocStore> Replica<S> {
                 if doc.kind.is_document() && doc.sub == Sub::CatchingUp && !doc.stale {
                     doc.batched = doc.batched.saturating_add(bytes.len());
                     doc.batch.push((seq, bytes));
-                    return Ok(if doc.batched > MAX_BATCH_BYTES { self.take_batch(id) } else { Vec::new() });
+                    let max = BATCH_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+                    return Ok(if doc.batched > max { self.take_batch(id) } else { Vec::new() });
                 }
                 Ok(self.on_update(id, seq, bytes))
             }
@@ -3283,8 +3294,10 @@ fn load_document<S: DocStore>(
             }
             for record in records {
                 if record.client_seq >= next {
-                    // A change over the frame limit is in the journal whole, under the first of its fragments' numbers.
-                    let frames = split(&record.bytes, MAX_UPDATE_BYTES).unwrap_or_else(|_| vec![record.bytes.clone()]);
+                    // A change over the frame limit is in the journal whole, under the first of its fragments' numbers:
+                    // cut as it was cut when it was sent (the same fragments, the same numbers).
+                    let limit = FRAME_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+                    let frames = split(&record.bytes, limit).unwrap_or_else(|_| vec![record.bytes.clone()]);
                     for (k, bytes) in (0u64..).zip(frames) {
                         pending.push(Pending { client_seq: record.client_seq.saturating_add(k), bytes, acked: None, push: false });
                         next = record.client_seq.saturating_add(k + 1);
@@ -5091,6 +5104,35 @@ mod tests {
         let fresh = loro::LoroDoc::new();
         fresh.import(&uploaded(&mut r, manifest)).unwrap();
         assert_eq!(fresh.get_text("text").len_utf8(), 2 * MAX_UPDATE_BYTES + "s import".len());
+    }
+
+    /// A catch-up's batch whose later row Loro holds back for its history (a change in fragments below it, not whole
+    /// until its rows are taken one by one): the row still goes to the apps, after the change it builds on.
+    #[test]
+    fn a_batched_row_loro_holds_back_reaches_the_apps() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let (mut r, id, import) = joined(&store, space, node);
+        let other = text_doc(41);
+        other.import(&import).unwrap();
+        let big = sliced(&other, &"b".repeat(2 * MAX_UPDATE_BYTES));
+        let frames = split(&big, MAX_UPDATE_BYTES).unwrap();
+        let after = insert(&other, 0, "after ");
+        r.disconnected();
+        r.connected();
+        r.on_frame(ServerFrame::Welcome { protocol: LIVE_FRAGMENTS_PROTOCOL, epoch: epoch(1) }).unwrap();
+        r.take_events();
+        let row = |seq: u64, bytes: &[u8]| ServerFrame::Update { doc: id, seq, bytes: bytes.to_vec(), device: device() };
+        for (k, f) in frames.iter().enumerate() {
+            r.on_frame(row(k as u64 + 1, f)).unwrap();
+        }
+        r.on_frame(row(frames.len() as u64 + 1, &after)).unwrap();
+        r.on_frame(ServerFrame::Subscribed { doc: id, head: frames.len() as u64 + 1 }).unwrap();
+        let events = r.take_events();
+        let remote: Vec<&Vec<u8>> = events.iter().filter_map(|e| if let DocEvent::Remote(_, b) = e { Some(b) } else { None }).collect();
+        let sizes: Vec<usize> = remote.iter().map(|b| b.len()).collect();
+        assert!(remote == vec![&big, &after], "the change, then the row after it: {sizes:?}");
+        assert!(text_of(&r, id).starts_with("after b"));
     }
 
     /// A fragment's ack is for it alone: the rest of the set, their acks lost with the connection, goes again (the
