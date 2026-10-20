@@ -299,8 +299,11 @@ way with kittest.
   never sends fragments or bundles to a server before protocol 3: a change that needs them is refused while it is
   the server, and what it holds of them waits on the machine, with every change after it, until it is updated. A
   new app on an older agent isn't live (`NotLive::AgentTooOld`). An older app on a newer agent still connects (the
-  agent says its oldest local API version as `api`, and its newest as `api_max`) and gets recents and blobs; its
-  live documents can't read a newer app's big changes, so the apps that edit live are updated with the agent. The
+  agent says its oldest local API version as `api`, and its newest as `api_max`) and gets recents and blobs. But an
+  older live-editing app on a new agent can't read bundles: a newer app's big change shows in it as one that doesn't
+  read, its model goes apart from the others', and it may save that model. The agent can't tell it apart yet (the
+  docs channel names no app version), so quit every older Craft app before the agents are updated, and update the
+  apps with them. The
   safe order: the server, then every agent and app.
 - **After a server's restore**, a machine that sends up history the log lost sends a big Loro change in pieces (Loro
   merges one peer's commits into one change, so its boundaries aren't an app's): an app open on a machine that also
