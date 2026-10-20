@@ -47,8 +47,7 @@ pub use writer::OP_OVERHEAD;
 /// For an app's adapter tests: the fake agent of `craft-cloud-app` (feature `fake`).
 #[cfg(feature = "fake")]
 pub mod testing {
-    pub use craft_cloud_app::fake::{Fake, FragmentFaults, Hub};
-    pub use craft_cloud_app::live::set_fragment_patience_for_tests;
+    pub use craft_cloud_app::fake::{Fake, FragmentFaults, Hub, SLEEP_TICKS};
 }
 
 /// For the kit's own tests and simulations: the mappings without a session.

@@ -166,10 +166,6 @@ fn session(
                 say(format!("the connection to the agent ended: {why}"));
                 return Ok(Exit::Failed);
             }
-            Some(Event::Gap) => {
-                say("a change from another machine came only part of the way; run the command again to see the document".into());
-                return Ok(Exit::Failed);
-            }
             Some(Event::Presence(_) | Event::Acked(_) | Event::Refused { .. } | Event::File(_)) | None => {}
         }
     }

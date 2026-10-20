@@ -1,7 +1,8 @@
 //! Changes over the agent's 1 MiB frame limit: one change is one update, which goes in fragments, and no machine
 //! ever holds part of one. What the other machine does meanwhile (a local edit of the same rows, node or story, an
-//! undo, a save) never sees, repairs or writes back part of it; a set that stops coming holds nothing up and comes
-//! whole through the next catch-up; a sender or receiver that stops part of the way loses nothing.
+//! undo, a save) never sees, repairs or writes back part of it; a receiving machine that sleeps part of the way
+//! through a change gives its apps the change whole once it wakes; a sender that stops part of the way holds nothing
+//! up and loses nothing.
 
 mod common;
 mod model;
@@ -16,15 +17,12 @@ use craft_cloud_app::fake::{FragmentFaults, Hub};
 use craft_cloud_kit::{ElemId, RichText, Session};
 use model::{Doc, Node, TestApp};
 
-/// Fragments after a set's first never reach the apps (the set comes part of the way, and stops).
-const FIRST_ONLY: FragmentFaults = FragmentFaults { seed: 3, drop: 1000, delay: 0, max_delay: 0 };
-/// How long a set that stopped coming is kept, for every test here (the process's one setting).
-const PATIENCE: Duration = Duration::from_millis(1500);
+/// The machine sleeps after a set's first fragment (until the test wakes it): the change comes part of the way.
+const FIRST_ONLY: FragmentFaults = FragmentFaults { seed: 3, sleep: 1000, delay: 0, max_delay: 0 };
 
 fn setup() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        craft_cloud_app::live::set_fragment_patience_for_tests(PATIENCE);
         // Frames of 64 KiB: changes of a few hundred KB go in fragments as changes over 1 MiB do.
         craft_cloud_app::live::set_frame_limit_for_tests(64 * 1024);
     });
@@ -109,9 +107,10 @@ fn a_five_megabyte_change_arrives_whole_and_undoes_whole() {
     })
     .unwrap();
     until(&mut [&mut a, &mut b], "the laptop has all 5 MB", |s| {
-        let n = s[1].model().items.len();
-        assert!(n == 0 || n == 20, "the laptop held {n} of the 20 notes");
-        n == 20
+        let texts = s[1].model().texts();
+        // (Its text too: a note in it, but only part of its text, is part of the change.)
+        assert!(texts.is_empty() || texts == notes, "the laptop held part of the change: {} notes", texts.len());
+        texts.len() == 20
     });
     assert_eq!(b.model().texts(), notes);
     let sent = hub.updates("big.txt") - before;
@@ -120,16 +119,16 @@ fn a_five_megabyte_change_arrives_whole_and_undoes_whole() {
     // One undo step takes the whole change back, on both, whole.
     assert!(a.undo().unwrap());
     until(&mut [&mut a, &mut b], "the undo is on both", |s| {
-        let n = s[1].model().items.len();
-        assert!(n == 0 || n == 20, "the laptop held {n} of the 20 notes during the undo");
+        let texts = s[1].model().texts();
+        assert!(texts.is_empty() || texts == notes, "the laptop held part of the undo: {} notes", texts.len());
         s.iter().all(|s| s.model().items.is_empty())
     });
 }
 
-/// The other machine gets a 1 MB change part of the way (its first fragment), and meanwhile adds a row, edits and
-/// undoes a cell, and changes the title: its model never shows part of the change, nothing of it is written back,
-/// and once the change comes whole (the set stopped coming: a gap, and the catch-up brings it), every row of it and
-/// every local edit are on both machines.
+/// The other machine gets a 1 MB change part of the way (its first fragment, then it sleeps), and meanwhile adds a
+/// row, edits and undoes a cell, and changes the title: its model never shows part of the change, nothing of it is
+/// written back, and once the change comes whole (the machine wakes, and its link brings the rest), every row of it
+/// and every local edit are on both machines.
 #[test]
 fn local_edits_while_a_change_comes_in_fragments_keep_both() {
     setup();
@@ -155,7 +154,6 @@ fn local_edits_while_a_change_comes_in_fragments_keep_both() {
     });
     assert!(b.model().texts().contains(&"local".to_owned()));
     assert_eq!(a.model(), b.model());
-    assert!(b.status().gaps >= 1, "the set stopped coming: the laptop caught up");
 }
 
 /// The same with the change in a tree node's story (a 300 KB paste into a layer's text): meanwhile the other machine

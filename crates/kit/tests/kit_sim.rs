@@ -26,25 +26,23 @@ use craft_cloud_kit::{KitError, Session};
 use model::{Doc, Rng, SHAPES, TestApp, edit, valid};
 
 const PATH: &str = "sim/story.kitdemo";
-/// Over every seed run: the big changes made, and the gaps the sessions caught up from (a set of fragments that never
-/// came whole on a connection). Both must happen for the run to say anything.
+/// Over every seed run: the big changes made, and the times a machine's link stopped inside one (it slept part of the
+/// way through). Both must happen for the run to say anything.
 static BIG_CHANGES: AtomicU64 = AtomicU64::new(0);
-static GAPS: AtomicU64 = AtomicU64::new(0);
+static PAUSES: AtomicU64 = AtomicU64::new(0);
 const STEPS: usize = 80;
 /// Which machine each session runs on: the third machine has two apps open on the document.
 const ON: [usize; 4] = [0, 1, 2, 2];
 
 fn run_seed(seed: u64) {
-    // (A set of fragments that stopped coming is dropped soon: the session catches up by opening the document again.
-    // Frames of 16 KiB: the big changes here, of tens of KB, go in fragments as changes over 1 MiB do.)
-    craft_cloud_app::live::set_fragment_patience_for_tests(Duration::from_millis(300));
+    // (Frames of 16 KiB: the big changes here, of tens of KB, go in fragments as changes over 1 MiB do.)
     craft_cloud_app::live::set_frame_limit_for_tests(16 * 1024);
     let hub = Hub::new();
     let fakes: Vec<Fake> = (0..3).map(|i| hub.machine(&format!("m{i}")).unwrap()).collect();
-    // Fragments on their way to the apps: some dropped, some held back a few steps (so they come after later changes,
-    // out of order).
+    // A machine's link stops inside a change in fragments: now and then for a long sleep, more often a few steps. The
+    // machine keeps what came, and its apps get the change whole once the rest is there (as the agent does).
     for (i, f) in (0u64..).zip(&fakes) {
-        f.set_fragment_faults(Some(FragmentFaults { seed: seed.wrapping_mul(7).wrapping_add(i), drop: 150, delay: 300, max_delay: 4 }));
+        f.set_fragment_faults(Some(FragmentFaults { seed: seed.wrapping_mul(7).wrapping_add(i), sleep: 150, delay: 300, max_delay: 4 }));
     }
     let mut rng = Rng(seed);
     let start = model::random_doc(&mut rng, 12);
@@ -162,7 +160,7 @@ fn run_seed(seed: u64) {
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    GAPS.fetch_add(sessions.iter().map(|s| s.status().gaps).sum(), Ordering::Relaxed);
+    PAUSES.fetch_add(fakes.iter().map(Fake::pauses).sum(), Ordering::Relaxed);
     // The file catches up on its own: one window saves, then each saves while its file is behind (as an app's
     // autosave does), and soon none is; the file then has the version every session has.
     if let Ok(point) = sessions[0].save_point() {
@@ -253,9 +251,9 @@ fn kit_sessions_converge() {
     if let Some((seed, message)) = failed.into_inner().unwrap() {
         panic!("seed {seed} failed (SIM_SEED={seed} replays it, as near as the clock allows): {message}");
     }
-    let (big, gaps) = (BIG_CHANGES.load(Ordering::Relaxed), GAPS.load(Ordering::Relaxed));
-    eprintln!("kit sim: {seeds} seeds, {big} big changes, {gaps} gaps caught up");
+    let (big, pauses) = (BIG_CHANGES.load(Ordering::Relaxed), PAUSES.load(Ordering::Relaxed));
+    eprintln!("kit sim: {seeds} seeds, {big} big changes, {pauses} stops inside one");
     if seeds >= 16 {
-        assert!(big > 0 && gaps > 0, "the run made {big} big changes and caught up from {gaps} gaps: it tested nothing of them");
+        assert!(big > 0 && pauses > 0, "the run made {big} big changes and stopped inside {pauses}: it tested nothing of them");
     }
 }

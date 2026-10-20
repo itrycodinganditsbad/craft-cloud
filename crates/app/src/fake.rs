@@ -10,9 +10,11 @@
 //! state an app opens is the import followed by the updates as `update` frames (the local API allows that).
 //!
 //! A change an app sends in fragments goes into the machine's copy (and is acked) only once it is whole, as its
-//! fragments, each an update of the log (as the agent's log and the server keep them); the apps join them.
-//! [`Fake::set_fragment_faults`] drops or holds back fragments on their way to a machine's apps ([`Hub::tick`] moves
-//! the held ones on), and [`Fake::drop_connections_after`] stops the agent part of the way through an app's change.
+//! fragments, each an update of the log (as the agent's log and the server keep them). A machine joins them before
+//! its apps get the change, as the agent does: an app never gets a fragment. [`Fake::set_fragment_faults`] stops a
+//! machine's link from the hub inside such a change for a while (a laptop that sleeps part of the way through it;
+//! [`Hub::tick`] moves the pauses on), and [`Fake::drop_connections_after`] stops the agent part of the way through an
+//! app's change.
 //!
 //! [`Fake::restart`] drops every app connection and refuses new ones until [`Fake::start`] (an agent that stopped):
 //! what the machine held stays, as the agent's files do. [`Fake::too_old`] makes a machine answer the blob calls as an
@@ -88,6 +90,11 @@ struct MachineDoc {
     hub_seen: usize,
     /// Positions in `log` of this machine's updates the hub doesn't have yet.
     pending: VecDeque<usize>,
+    /// Ticks the hub's rows wait for (from `hub_seen` on): the machine's link stopped inside a change in fragments
+    /// ([`FragmentFaults`]).
+    pause: u32,
+    /// The hub row a pause stopped at: taken without asking the faults again once the pause is over.
+    paused_at: Option<usize>,
 }
 
 struct Machine {
@@ -106,26 +113,31 @@ struct Machine {
     refuse: VecDeque<String>,
     /// Saves made here that haven't gone up yet (offline): each path's file record on this machine until they do.
     file_pending: HashMap<String, Version>,
-    /// What happens to fragments on their way to this machine's apps ([`Fake::set_fragment_faults`]).
+    /// What happens to fragments on their way from the hub to this machine ([`Fake::set_fragment_faults`]).
     faults: Option<Faults>,
+    /// How many times the faults stopped the link inside a change.
+    pauses: u64,
     /// App updates (frames) left before every app connection ends ([`Fake::drop_connections_after`]).
     drop_after: Option<usize>,
 }
 
-/// What happens to the fragments of changes on their way from a machine's copy to its apps: some are dropped (the
-/// app's set never comes whole on that connection; it catches up by opening the document again), some held back a few
-/// [`Hub::tick`]s (so they come after later updates, and out of order), from a seeded generator.
+/// What happens to the fragments of changes on their way from the hub (the server's log) to a machine, from a seeded
+/// generator: before some fragment after a set's first, the machine's link stops for a while (the laptop sleeps
+/// part of the way through the change, or its connection drops), and the rest of the log comes later. The machine
+/// keeps what came, as the agent does, and its apps get the change whole once the rest is there, never part of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FragmentFaults {
     pub seed: u64,
-    /// Of every 1000 fragments after a set's first, how many are dropped (the app sees the set come part of the way,
-    /// as when a connection breaks off mid-change).
-    pub drop: u32,
-    /// Of every 1000 fragments, how many are held back.
+    /// Of every 1000 fragments after a set's first, before how many the machine sleeps ([`SLEEP_TICKS`] ticks).
+    pub sleep: u32,
+    /// Of every 1000 fragments after a set's first, before how many the link stops a few ticks.
     pub delay: u32,
-    /// The most ticks one is held back.
+    /// The most ticks such a stop lasts.
     pub max_delay: u32,
 }
+
+/// How many [`Hub::tick`]s a machine sleeps inside a change ([`FragmentFaults::sleep`]).
+pub const SLEEP_TICKS: u32 = 20;
 
 struct Faults {
     spec: FragmentFaults,
@@ -141,18 +153,42 @@ impl Faults {
         x ^ (x >> 31)
     }
 
-    /// For one fragment: `None` to drop it, else how many ticks it is held back (0: it goes now).
-    fn fate(&mut self, bytes: &[u8]) -> Option<u32> {
-        let first = parse(bytes).is_some_and(|f| f.index == 0);
+    /// For one fragment: how many ticks the link stops before it (0: it comes now).
+    fn fate(&mut self, bytes: &[u8]) -> u32 {
+        if parse(bytes).is_none_or(|f| f.index == 0) {
+            return 0;
+        }
         let roll = u32::try_from(self.next() % 1000).unwrap_or(0);
-        if roll < self.spec.drop {
-            if first { Some(0) } else { None }
-        } else if roll < self.spec.drop.saturating_add(self.spec.delay) {
-            Some(1 + u32::try_from(self.next() % u64::from(self.spec.max_delay.max(1))).unwrap_or(0))
+        if roll < self.spec.sleep {
+            SLEEP_TICKS
+        } else if roll < self.spec.sleep.saturating_add(self.spec.delay) {
+            1 + u32::try_from(self.next() % u64::from(self.spec.max_delay.max(1))).unwrap_or(0)
         } else {
-            Some(0)
+            0
         }
     }
+}
+
+/// A row of a machine's log on its way to an app, joined as the agent joins: a change in fragments is kept (in
+/// `kept`, by set) until it is whole, and goes whole; anything else goes as it is. `None` while it isn't whole (or
+/// for a fragment that doesn't read).
+fn joined_row(kept: &mut HashMap<SetId, Vec<Vec<u8>>>, bytes: &[u8]) -> Option<Vec<u8>> {
+    if !is_fragment(bytes) {
+        return Some(bytes.to_vec());
+    }
+    let f = parse(bytes)?;
+    let set = kept.entry(f.set).or_default();
+    set.push(bytes.to_vec());
+    let mut indexes: Vec<u16> = set.iter().filter_map(|b| parse(b).map(|x| x.index)).collect();
+    indexes.sort_unstable();
+    indexes.dedup();
+    if indexes.len() < usize::from(f.count) {
+        return None;
+    }
+    let mut frames = kept.remove(&f.set)?;
+    frames.sort_by_key(|b| parse(b).map(|x| x.index));
+    frames.dedup_by_key(|b| parse(b).map(|x| x.index));
+    join(frames.iter().map(Vec::as_slice))
 }
 
 /// A live document's frontiers: `(peer, counter)` heads.
@@ -183,8 +219,8 @@ struct Opened {
     doc: DocId,
     sent: usize,
     seq: u64,
-    /// Fragments held back on their way to the app ([`FragmentFaults`]): the bytes and the ticks left.
-    held: Vec<(Vec<u8>, u32)>,
+    /// The fragments of the log's changes not whole yet, by set: the app gets each change whole ([`joined_row`]).
+    kept: HashMap<SetId, Vec<Vec<u8>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -221,6 +257,7 @@ impl Hub {
                     refuse: VecDeque::new(),
                     file_pending: HashMap::new(),
                     faults: None,
+                    pauses: 0,
                     drop_after: None,
                 },
             );
@@ -284,17 +321,13 @@ impl Hub {
         lock(&self.inner).docs.get(path).map_or(0, |d| d.log.len())
     }
 
-    /// A tick: fragments held back on their way to the apps ([`FragmentFaults`]) come one tick closer, and those due
-    /// go.
+    /// A tick: a machine's link stopped inside a change ([`FragmentFaults`]) comes one tick closer to going on, and the
+    /// rows of the ones due come.
     pub fn tick(&self) {
         let mut inner = lock(&self.inner);
         for m in inner.machines.values_mut() {
-            for c in m.conns.values_mut() {
-                for o in c.open.values_mut() {
-                    for (_, left) in &mut o.held {
-                        *left = left.saturating_sub(1);
-                    }
-                }
+            for d in m.docs.values_mut() {
+                d.pause = d.pause.saturating_sub(1);
             }
         }
         sync(&mut inner);
@@ -606,7 +639,10 @@ fn open(inner: &mut Inner, machine: usize, conn: u64, id: u64, path: &str) {
     let doc = match (known, hub_doc) {
         (Some(doc), _) => doc,
         (None, Some((doc, import))) if m.online => {
-            m.docs.insert(doc, MachineDoc { path: path.to_owned(), import, log: Vec::new(), hub_seen: 0, pending: VecDeque::new() });
+            m.docs.insert(
+                doc,
+                MachineDoc { path: path.to_owned(), import, log: Vec::new(), hub_seen: 0, pending: VecDeque::new(), pause: 0, paused_at: None },
+            );
             doc
         }
         (None, None) if m.online => {
@@ -626,10 +662,13 @@ fn open(inner: &mut Inner, machine: usize, conn: u64, id: u64, path: &str) {
     let Some(m) = inner.machines.get_mut(&machine) else { return };
     let online = m.online;
     let Some(d) = m.docs.get(&doc) else { return };
-    let state = DocState { online, waiting: d.pending.len() as u64, bytes: d.import.len() as u64, updates: d.log.len() as u64 };
-    let (import, log): (Vec<u8>, Vec<Vec<u8>>) = (d.import.clone(), d.log.iter().map(|(_, b)| b.clone()).collect());
+    // (Its changes whole: one whose fragments aren't all here yet is kept, and goes once it is.)
+    let mut kept = HashMap::new();
+    let log: Vec<Vec<u8>> = d.log.iter().filter_map(|(_, b)| joined_row(&mut kept, b)).collect();
+    let state = DocState { online, waiting: d.pending.len() as u64, bytes: d.import.len() as u64, updates: log.len() as u64 };
+    let (import, rows) = (d.import.clone(), d.log.len());
     let Some(c) = m.conns.get_mut(&conn) else { return };
-    c.open.insert(id, Opened { doc, sent: log.len(), seq: 0, held: Vec::new() });
+    c.open.insert(id, Opened { doc, sent: rows, seq: 0, kept });
     c.told.insert(doc, (online, state.waiting));
     let mut w = lock(&c.writer);
     let opened = DocsEvent::Opened { id, doc, state, changed_outside };
@@ -685,52 +724,50 @@ fn sync(inner: &mut Inner) {
             }
         }
     }
-    // Down: what the others sent.
+    // Down: what the others sent, in the log's order. The link may stop inside a change in fragments
+    // ([`FragmentFaults`]): the rows from there on come once the pause is over.
     for mid in &ids {
         let Some(m) = machines.get_mut(mid) else { continue };
         if !m.online {
             continue;
         }
-        for d in m.docs.values_mut() {
+        let Machine { docs: machine_docs, faults, pauses, .. } = m;
+        for d in machine_docs.values_mut() {
             let Some(hub) = docs.get(&d.path) else { continue };
-            if live_down {
+            if live_down || d.pause > 0 {
                 continue;
             }
-            for (from, bytes) in hub.log.iter().skip(d.hub_seen) {
+            while let Some((from, bytes)) = hub.log.get(d.hub_seen) {
                 if from != mid {
+                    if d.paused_at != Some(d.hub_seen)
+                        && let Some(ticks) = faults.as_mut().map(|f| f.fate(bytes)).filter(|t| *t > 0)
+                    {
+                        d.pause = ticks;
+                        d.paused_at = Some(d.hub_seen);
+                        *pauses += 1;
+                        break;
+                    }
                     d.log.push((Origin::Remote, bytes.clone()));
                 }
+                d.hub_seen += 1;
             }
-            d.hub_seen = hub.log.len();
         }
     }
-    // Out to the apps: the copy's new updates (an app's own not back to it), and status when it changed. Fragments
-    // may be dropped or held back on the way ([`FragmentFaults`]); those held back go once their ticks ran out.
+    // Out to the apps: the copy's new updates (an app's own not back to it), each change whole (as the agent joins
+    // the server's fragments before its apps get a change), and status when it changed.
     for m in machines.values_mut() {
         let online = m.online;
-        let Machine { conns, docs: machine_docs, faults, file_pending, .. } = m;
+        let Machine { conns, docs: machine_docs, file_pending, .. } = m;
         for (cid, c) in conns.iter_mut() {
             let mut w = lock(&c.writer);
             for (number, o) in c.open.iter_mut() {
                 let Some(d) = machine_docs.get(&o.doc) else { continue };
-                let due: Vec<Vec<u8>> = {
-                    let (due, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut o.held).into_iter().partition(|(_, left)| *left == 0);
-                    o.held = keep;
-                    due.into_iter().map(|(bytes, _)| bytes).collect()
-                };
-                for bytes in due.iter().rev() {
-                    let _ = w.send(Message::Binary(encode_binary(UPDATE, *number, bytes).into()));
-                }
                 for (origin, bytes) in d.log.iter().skip(o.sent) {
                     if *origin == Origin::Conn(*cid) {
                         continue;
                     }
-                    match faults.as_mut().filter(|_| is_fragment(bytes)).map(|f| f.fate(bytes)) {
-                        Some(None) => {}
-                        Some(Some(ticks)) if ticks > 0 => o.held.push((bytes.clone(), ticks)),
-                        _ => {
-                            let _ = w.send(Message::Binary(encode_binary(UPDATE, *number, bytes).into()));
-                        }
+                    if let Some(update) = joined_row(&mut o.kept, bytes) {
+                        let _ = w.send(Message::Binary(encode_binary(UPDATE, *number, &update).into()));
                     }
                 }
                 o.sent = d.log.len();
@@ -822,12 +859,19 @@ impl Fake {
         }
     }
 
-    /// From now on (`Some`), fragments on their way to this machine's apps are dropped or held back as `faults` say
-    /// ([`Hub::tick`] moves the held ones on); `None` stops it.
+    /// From now on (`Some`), this machine's link from the hub stops inside changes in fragments as `faults` say
+    /// ([`Hub::tick`] moves the pauses on); `None` stops it, and ends a pause under way (the machine wakes).
     pub fn set_fragment_faults(&self, faults: Option<FragmentFaults>) {
-        if let Some(m) = lock(&self.hub.inner).machines.get_mut(&self.id) {
+        let mut inner = lock(&self.hub.inner);
+        if let Some(m) = inner.machines.get_mut(&self.id) {
+            if faults.is_none() {
+                for d in m.docs.values_mut() {
+                    d.pause = 0;
+                }
+            }
             m.faults = faults.map(|spec| Faults { spec, state: spec.seed });
         }
+        sync(&mut inner);
     }
 
     /// After `updates` more update frames from its apps, the agent drops every app connection (as when it stops or
@@ -863,6 +907,11 @@ impl Fake {
     pub fn waiting(&self, path: &str) -> usize {
         let inner = lock(&self.hub.inner);
         inner.machines.get(&self.id).map_or(0, |m| m.docs.values().filter(|d| d.path == path).map(|d| d.pending.len()).sum())
+    }
+
+    /// How many times this machine's link stopped inside a change in fragments ([`FragmentFaults`]).
+    pub fn pauses(&self) -> u64 {
+        lock(&self.hub.inner).machines.get(&self.id).map_or(0, |m| m.pauses)
     }
 }
 
@@ -992,6 +1041,11 @@ mod tests {
         panic!("no update came");
     }
 
+    /// Whether no update comes for `doc` within about 200 ms.
+    fn no_update(doc: &crate::live::Document) -> bool {
+        (0..8).all(|_| !matches!(doc.recv_timeout(Duration::from_millis(25)), Some(Event::Update(_))))
+    }
+
     fn acked(doc: &crate::live::Document, seq: u64) {
         for _ in 0..200 {
             if let Some(Event::Acked(s)) = doc.recv_timeout(Duration::from_millis(25))
@@ -1063,10 +1117,11 @@ mod tests {
         assert!(matches!(doc_a.send(&huge), Err(crate::Error::Refused { code, .. }) if code == "too_large"));
     }
 
-    /// Fragments on their way to an app may be held back (they come later, out of order, still whole) or dropped (the
-    /// app hears a gap, and the document opened again has the change).
+    /// A machine whose link stops inside a change in fragments keeps what came: its apps get nothing of the change
+    /// (nor what comes after it in the log) until the rest is there, then the change whole; an app opening the
+    /// document meanwhile gets it whole once it is, never a fragment.
     #[test]
-    fn faults_hold_back_or_drop_fragments_and_a_gap_is_caught_up() {
+    fn a_machine_that_sleeps_inside_a_change_gives_its_apps_the_change_whole() {
         let hub = Hub::new();
         let (a, b) = (hub.machine("a").unwrap(), hub.machine("b").unwrap());
         let docs_a = a.client().documents().unwrap();
@@ -1075,22 +1130,22 @@ mod tests {
         let docs_b = b.client().documents().unwrap();
         let Opened::Live(doc_b) = docs_b.open("f.txt", "test").unwrap() else { panic!("not live on b") };
         let big: Vec<u8> = (0..2 * MAX_UPDATE_BYTES + 5).map(|i| (i % 251) as u8).collect();
-        b.set_fragment_faults(Some(FragmentFaults { seed: 1, drop: 0, delay: 1000, max_delay: 3 }));
+        b.set_fragment_faults(Some(FragmentFaults { seed: 1, sleep: 1000, delay: 0, max_delay: 0 }));
         doc_a.send(&big).unwrap();
         doc_a.send(b"small").unwrap();
-        assert_eq!(next_update(&doc_b), b"small", "the small one first: the fragments are held back");
-        for _ in 0..4 {
+        assert!(no_update(&doc_b), "asleep inside the change");
+        let Opened::Live(meanwhile) = docs_b.open("f.txt", "test").unwrap() else { panic!("not live on b") };
+        assert!(meanwhile.state_updates().is_empty(), "nothing of the change in the state");
+        // Awake after the sleep: the next fragment, then asleep again before the last.
+        for _ in 0..SLEEP_TICKS {
             hub.tick();
         }
-        assert_eq!(next_update(&doc_b), big);
-        b.set_fragment_faults(Some(FragmentFaults { seed: 2, drop: 1000, delay: 0, max_delay: 0 }));
-        crate::live::set_fragment_patience_for_tests(Duration::from_millis(100));
-        doc_a.send(&big).unwrap();
-        let gap = (0..200).any(|_| matches!(doc_b.recv_timeout(Duration::from_millis(25)), Some(Event::Gap)));
-        crate::live::set_fragment_patience_for_tests(craft_cloud_api::fragments::PATIENCE);
-        assert!(gap, "nothing of it came whole: a gap");
+        assert!(no_update(&doc_b), "still not whole");
         b.set_fragment_faults(None);
+        assert_eq!(next_update(&doc_b), big, "the change, whole");
+        assert_eq!(next_update(&doc_b), b"small");
+        assert_eq!(next_update(&meanwhile), big, "whole for the app that opened it meanwhile too");
         let Opened::Live(again) = docs_b.open("f.txt", "test").unwrap() else { panic!("not live on b") };
-        assert_eq!(again.state_updates().iter().filter(|u| **u == big).count(), 2, "the state has both, whole");
+        assert_eq!(again.state_updates(), [big, b"small".to_vec()], "the state has it whole");
     }
 }

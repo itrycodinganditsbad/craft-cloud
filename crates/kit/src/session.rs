@@ -154,9 +154,6 @@ pub struct Status {
     /// The file on disk wasn't saved by a Craft app from this document (edited outside): the app may bring it in as a
     /// local change, or keep the live content.
     pub changed_outside: bool,
-    /// Changes another machine sent in fragments that didn't come whole on a connection (dropped, never applied), in
-    /// this session: each time, the session opened the document again and caught up.
-    pub gaps: u64,
     /// The last error, for the app to show.
     pub error: Option<String>,
 }
@@ -1015,7 +1012,6 @@ impl<D: LiveDocument> Session<D> {
 
     fn take_events(&mut self) {
         let mut closed = None;
-        let mut gap = false;
         let mut events = Vec::new();
         if let Some(link) = &self.link {
             while let Some(event) = link.doc.try_recv() {
@@ -1067,18 +1063,11 @@ impl<D: LiveDocument> Session<D> {
                     self.status.stopped = stopped || self.refused.is_some() || self.status.replaced;
                 }
                 Event::File(frontiers) => self.file_version = frontiers,
-                Event::Gap => gap = true,
                 Event::Closed(why) => closed = Some(why),
             }
         }
         if let Some(why) = closed {
             self.drop_link(&why);
-        } else if gap {
-            // A change another machine sent in fragments didn't come whole: nothing of it was applied. The document
-            // is opened again at once, and its state brings the change (or what of it is still coming).
-            self.status.gaps += 1;
-            self.drop_link("a change from another machine came in part; catching up");
-            self.reconnect_now();
         }
     }
 
