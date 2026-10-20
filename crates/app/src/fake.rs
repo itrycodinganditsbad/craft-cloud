@@ -9,6 +9,11 @@
 //! when the machine is back, and the other machines' updates come down then. What the bytes mean is never read: the
 //! state an app opens is the import followed by the updates as `update` frames (the local API allows that).
 //!
+//! A change an app sends in fragments goes into the machine's copy (and is acked) only once it is whole, as its
+//! fragments, each an update of the log (as the agent's log and the server keep them); the apps join them.
+//! [`Fake::set_fragment_faults`] drops or holds back fragments on their way to a machine's apps ([`Hub::tick`] moves
+//! the held ones on), and [`Fake::drop_connections_after`] stops the agent part of the way through an app's change.
+//!
 //! [`Fake::restart`] drops every app connection and refuses new ones until [`Fake::start`] (an agent that stopped):
 //! what the machine held stays, as the agent's files do. [`Fake::too_old`] makes a machine answer the blob calls as an
 //! agent from before blobs (`not_found` for the call). [`Hub::set_live`] holds live updates back between machines while
@@ -22,6 +27,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use craft_cloud_api::DocId;
+use craft_cloud_api::fragments::{SetId, is_fragment, join, parse};
 use craft_cloud_api::limits::{MAX_BLOB_BYTES, MAX_PRESENCE_BYTES, MAX_UPDATE_BYTES};
 use craft_cloud_api::local::blobs::{Stored, hex, parse_hex};
 use craft_cloud_api::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, STATE, UPDATE, decode_binary, encode_binary};
@@ -100,6 +106,53 @@ struct Machine {
     refuse: VecDeque<String>,
     /// Saves made here that haven't gone up yet (offline): each path's file record on this machine until they do.
     file_pending: HashMap<String, Version>,
+    /// What happens to fragments on their way to this machine's apps ([`Fake::set_fragment_faults`]).
+    faults: Option<Faults>,
+    /// App updates (frames) left before every app connection ends ([`Fake::drop_connections_after`]).
+    drop_after: Option<usize>,
+}
+
+/// What happens to the fragments of changes on their way from a machine's copy to its apps: some are dropped (the
+/// app's set never comes whole on that connection; it catches up by opening the document again), some held back a few
+/// [`Hub::tick`]s (so they come after later updates, and out of order), from a seeded generator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FragmentFaults {
+    pub seed: u64,
+    /// Of every 1000 fragments after a set's first, how many are dropped (the app sees the set come part of the way,
+    /// as when a connection breaks off mid-change).
+    pub drop: u32,
+    /// Of every 1000 fragments, how many are held back.
+    pub delay: u32,
+    /// The most ticks one is held back.
+    pub max_delay: u32,
+}
+
+struct Faults {
+    spec: FragmentFaults,
+    state: u64,
+}
+
+impl Faults {
+    fn next(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut x = self.state;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    }
+
+    /// For one fragment: `None` to drop it, else how many ticks it is held back (0: it goes now).
+    fn fate(&mut self, bytes: &[u8]) -> Option<u32> {
+        let first = parse(bytes).is_some_and(|f| f.index == 0);
+        let roll = u32::try_from(self.next() % 1000).unwrap_or(0);
+        if roll < self.spec.drop {
+            if first { Some(0) } else { None }
+        } else if roll < self.spec.drop.saturating_add(self.spec.delay) {
+            Some(1 + u32::try_from(self.next() % u64::from(self.spec.max_delay.max(1))).unwrap_or(0))
+        } else {
+            Some(0)
+        }
+    }
 }
 
 /// A live document's frontiers: `(peer, counter)` heads.
@@ -118,12 +171,20 @@ struct Conn {
     told: HashMap<DocId, (bool, u64)>,
     /// The file record each document's apps were last told.
     told_file: HashMap<DocId, Option<Version>>,
+    /// The fragments of the app's changes still coming, by document number and set: with their numbers. A change goes
+    /// into the machine's copy (and is acked) only once it is whole, as the agent takes it.
+    sets: HashMap<(u64, SetId), Vec<Numbered>>,
 }
+
+/// An app's update frame and its number.
+type Numbered = (u64, Vec<u8>);
 
 struct Opened {
     doc: DocId,
     sent: usize,
     seq: u64,
+    /// Fragments held back on their way to the app ([`FragmentFaults`]): the bytes and the ticks left.
+    held: Vec<(Vec<u8>, u32)>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -159,6 +220,8 @@ impl Hub {
                     saves: Vec::new(),
                     refuse: VecDeque::new(),
                     file_pending: HashMap::new(),
+                    faults: None,
+                    drop_after: None,
                 },
             );
             id
@@ -219,6 +282,22 @@ impl Hub {
     /// How many updates the hub holds of the document at `path` (0 when it has none).
     pub fn updates(&self, path: &str) -> usize {
         lock(&self.inner).docs.get(path).map_or(0, |d| d.log.len())
+    }
+
+    /// A tick: fragments held back on their way to the apps ([`FragmentFaults`]) come one tick closer, and those due
+    /// go.
+    pub fn tick(&self) {
+        let mut inner = lock(&self.inner);
+        for m in inner.machines.values_mut() {
+            for c in m.conns.values_mut() {
+                for o in c.open.values_mut() {
+                    for (_, left) in &mut o.held {
+                        *left = left.saturating_sub(1);
+                    }
+                }
+            }
+        }
+        sync(&mut inner);
     }
 
     fn serve(&self, machine: usize, mut stream: TcpStream) {
@@ -346,6 +425,7 @@ impl Hub {
                     apps: HashMap::new(),
                     told: HashMap::new(),
                     told_file: HashMap::new(),
+                    sets: HashMap::new(),
                 },
             );
             conn
@@ -419,6 +499,18 @@ impl Hub {
             }
             UPDATE => {
                 let Some(m) = inner.machines.get_mut(&machine) else { return };
+                // An agent that stops after so many updates ([`Fake::drop_connections_after`]): this one never
+                // arrives, and every app connection ends.
+                if let Some(left) = m.drop_after.as_mut() {
+                    if *left == 0 {
+                        m.drop_after = None;
+                        for (_, c) in m.conns.drain() {
+                            let _ = c.stream.shutdown(Shutdown::Both);
+                        }
+                        return;
+                    }
+                    *left -= 1;
+                }
                 let Some(c) = m.conns.get_mut(&conn) else { return };
                 let Some(opened) = c.open.get_mut(&id) else { return };
                 opened.seq += 1;
@@ -427,16 +519,54 @@ impl Hub {
                     let message = format!("an update is 1 byte to {MAX_UPDATE_BYTES} bytes");
                     return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "too_large".into(), message });
                 }
-                // A refusal asked for ([`Fake::refuse_next`]): the update isn't kept.
-                if let Some(code) = m.refuse.pop_front() {
-                    let message = format!("refused as asked ({code})");
-                    return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code, message });
+                // A fragment: kept until its change is whole, which then goes into the copy as its fragments (each an
+                // update of the log, as the agent's log keeps them) and is acked fragment by fragment.
+                let frames: Vec<(u64, Vec<u8>)> = if is_fragment(body) {
+                    let Some(f) = parse(body) else {
+                        let message = "a fragment that doesn't read".to_owned();
+                        return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "invalid".into(), message });
+                    };
+                    let set = c.sets.entry((id, f.set)).or_default();
+                    set.push((seq, body.to_vec()));
+                    let mut indexes: Vec<u16> = set.iter().filter_map(|(_, b)| parse(b).map(|x| x.index)).collect();
+                    indexes.sort_unstable();
+                    indexes.dedup();
+                    if indexes.len() < usize::from(f.count) {
+                        return;
+                    }
+                    let mut frames = c.sets.remove(&(id, f.set)).unwrap_or_default();
+                    if join(frames.iter().map(|(_, b)| b.as_slice())).is_none() {
+                        for (seq, _) in frames {
+                            // (Each fragment's number is refused: the app hears it by the last one's.)
+                            let message = "fragments that don't make the change they name".to_owned();
+                            tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "invalid".into(), message });
+                        }
+                        return;
+                    }
+                    frames.sort_by_key(|(_, b)| parse(b).map(|x| x.index));
+                    frames.dedup_by_key(|(_, b)| parse(b).map(|x| x.index));
+                    frames
+                } else {
+                    vec![(seq, body.to_vec())]
+                };
+                // A refusal asked for ([`Fake::refuse_next`]): the change isn't kept.
+                if let Some(code) = inner.machines.get_mut(&machine).and_then(|m| m.refuse.pop_front()) {
+                    for (seq, _) in &frames {
+                        let message = format!("refused as asked ({code})");
+                        tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(*seq), code: code.clone(), message });
+                    }
+                    return;
                 }
+                let Some(m) = inner.machines.get_mut(&machine) else { return };
                 if let Some(d) = m.docs.get_mut(&doc) {
-                    d.log.push((Origin::Conn(conn), body.to_vec()));
-                    d.pending.push_back(d.log.len() - 1);
+                    for (_, bytes) in &frames {
+                        d.log.push((Origin::Conn(conn), bytes.clone()));
+                        d.pending.push_back(d.log.len() - 1);
+                    }
                 }
-                tell(&inner, machine, conn, &DocsEvent::Ack { id, seq });
+                for (seq, _) in &frames {
+                    tell(&inner, machine, conn, &DocsEvent::Ack { id, seq: *seq });
+                }
                 sync(&mut inner);
             }
             PRESENCE => {
@@ -499,7 +629,7 @@ fn open(inner: &mut Inner, machine: usize, conn: u64, id: u64, path: &str) {
     let state = DocState { online, waiting: d.pending.len() as u64, bytes: d.import.len() as u64, updates: d.log.len() as u64 };
     let (import, log): (Vec<u8>, Vec<Vec<u8>>) = (d.import.clone(), d.log.iter().map(|(_, b)| b.clone()).collect());
     let Some(c) = m.conns.get_mut(&conn) else { return };
-    c.open.insert(id, Opened { doc, sent: log.len(), seq: 0 });
+    c.open.insert(id, Opened { doc, sent: log.len(), seq: 0, held: Vec::new() });
     c.told.insert(doc, (online, state.waiting));
     let mut w = lock(&c.writer);
     let opened = DocsEvent::Opened { id, doc, state, changed_outside };
@@ -574,16 +704,33 @@ fn sync(inner: &mut Inner) {
             d.hub_seen = hub.log.len();
         }
     }
-    // Out to the apps: the copy's new updates (an app's own not back to it), and status when it changed.
+    // Out to the apps: the copy's new updates (an app's own not back to it), and status when it changed. Fragments
+    // may be dropped or held back on the way ([`FragmentFaults`]); those held back go once their ticks ran out.
     for m in machines.values_mut() {
         let online = m.online;
-        for (cid, c) in m.conns.iter_mut() {
+        let Machine { conns, docs: machine_docs, faults, file_pending, .. } = m;
+        for (cid, c) in conns.iter_mut() {
             let mut w = lock(&c.writer);
             for (number, o) in c.open.iter_mut() {
-                let Some(d) = m.docs.get(&o.doc) else { continue };
+                let Some(d) = machine_docs.get(&o.doc) else { continue };
+                let due: Vec<Vec<u8>> = {
+                    let (due, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut o.held).into_iter().partition(|(_, left)| *left == 0);
+                    o.held = keep;
+                    due.into_iter().map(|(bytes, _)| bytes).collect()
+                };
+                for bytes in due.iter().rev() {
+                    let _ = w.send(Message::Binary(encode_binary(UPDATE, *number, bytes).into()));
+                }
                 for (origin, bytes) in d.log.iter().skip(o.sent) {
-                    if *origin != Origin::Conn(*cid) {
-                        let _ = w.send(Message::Binary(encode_binary(UPDATE, *number, bytes).into()));
+                    if *origin == Origin::Conn(*cid) {
+                        continue;
+                    }
+                    match faults.as_mut().filter(|_| is_fragment(bytes)).map(|f| f.fate(bytes)) {
+                        Some(None) => {}
+                        Some(Some(ticks)) if ticks > 0 => o.held.push((bytes.clone(), ticks)),
+                        _ => {
+                            let _ = w.send(Message::Binary(encode_binary(UPDATE, *number, bytes).into()));
+                        }
                     }
                 }
                 o.sent = d.log.len();
@@ -596,7 +743,7 @@ fn sync(inner: &mut Inner) {
                     }
                 }
                 // The file here: this machine's save not up yet, else the server's (offline: as it was).
-                let file = match m.file_pending.get(&d.path) {
+                let file = match file_pending.get(&d.path) {
                     Some(v) => Some(v.clone()),
                     None if online => files.get(&d.path).cloned().flatten(),
                     None => c.told_file.get(&o.doc).cloned().flatten(),
@@ -672,6 +819,23 @@ impl Fake {
             for (_, c) in m.conns.drain() {
                 let _ = c.stream.shutdown(Shutdown::Both);
             }
+        }
+    }
+
+    /// From now on (`Some`), fragments on their way to this machine's apps are dropped or held back as `faults` say
+    /// ([`Hub::tick`] moves the held ones on); `None` stops it.
+    pub fn set_fragment_faults(&self, faults: Option<FragmentFaults>) {
+        if let Some(m) = lock(&self.hub.inner).machines.get_mut(&self.id) {
+            m.faults = faults.map(|spec| Faults { spec, state: spec.seed });
+        }
+    }
+
+    /// After `updates` more update frames from its apps, the agent drops every app connection (as when it stops or
+    /// crashes): that frame never arrives, and a change whose fragments were coming is never taken (the app sends it
+    /// again once it is back).
+    pub fn drop_connections_after(&self, updates: usize) {
+        if let Some(m) = lock(&self.hub.inner).machines.get_mut(&self.id) {
+            m.drop_after = Some(updates);
         }
     }
 
@@ -888,12 +1052,45 @@ mod tests {
         assert!(matches!(&put, Err(crate::Error::Refused { code, .. }) if code == "agent_too_old"), "{put:?}");
         assert!(matches!(b.client().blobs().get(&stored.hash, stored.len), Err(crate::Error::Refused { code, .. }) if code == "agent_too_old"));
         assert!(b.client().status().is_ok(), "the rest still works");
-        let big = vec![0u8; MAX_UPDATE_BYTES + 1];
-        let seq = doc_a.send(&big).unwrap();
-        let refused = (0..200).find_map(|_| match doc_a.recv_timeout(Duration::from_millis(25)) {
-            Some(Event::Refused { seq: s, .. }) => Some(s),
-            _ => None,
-        });
-        assert_eq!(refused, Some(seq), "an update over 1 MiB is refused");
+        // An update over 1 MiB goes in fragments: it comes whole, acked once; one over a snapshot's limit isn't sent.
+        let big: Vec<u8> = (0..3 * MAX_UPDATE_BYTES).map(|i| (i % 253) as u8).collect();
+        acked(&doc_a, doc_a.send(&big).unwrap());
+        assert_eq!(next_update(&again), big);
+        let fragments = craft_cloud_api::fragments::split(&big, MAX_UPDATE_BYTES).unwrap().len();
+        assert_eq!(fragments, 4);
+        assert_eq!(hub.updates("x.txt"), 4 + fragments, "its fragments, each an update of the log");
+        let huge = vec![0u8; craft_cloud_api::fragments::MAX_WHOLE_BYTES + 1];
+        assert!(matches!(doc_a.send(&huge), Err(crate::Error::Refused { code, .. }) if code == "too_large"));
+    }
+
+    /// Fragments on their way to an app may be held back (they come later, out of order, still whole) or dropped (the
+    /// app hears a gap, and the document opened again has the change).
+    #[test]
+    fn faults_hold_back_or_drop_fragments_and_a_gap_is_caught_up() {
+        let hub = Hub::new();
+        let (a, b) = (hub.machine("a").unwrap(), hub.machine("b").unwrap());
+        let docs_a = a.client().documents().unwrap();
+        let Opened::NeedsImport(importer) = docs_a.open("f.txt", "test").unwrap() else { panic!("not new") };
+        let doc_a = importer.import(b"snapshot").unwrap();
+        let docs_b = b.client().documents().unwrap();
+        let Opened::Live(doc_b) = docs_b.open("f.txt", "test").unwrap() else { panic!("not live on b") };
+        let big: Vec<u8> = (0..2 * MAX_UPDATE_BYTES + 5).map(|i| (i % 251) as u8).collect();
+        b.set_fragment_faults(Some(FragmentFaults { seed: 1, drop: 0, delay: 1000, max_delay: 3 }));
+        doc_a.send(&big).unwrap();
+        doc_a.send(b"small").unwrap();
+        assert_eq!(next_update(&doc_b), b"small", "the small one first: the fragments are held back");
+        for _ in 0..4 {
+            hub.tick();
+        }
+        assert_eq!(next_update(&doc_b), big);
+        b.set_fragment_faults(Some(FragmentFaults { seed: 2, drop: 1000, delay: 0, max_delay: 0 }));
+        crate::live::set_fragment_patience_for_tests(Duration::from_millis(100));
+        doc_a.send(&big).unwrap();
+        let gap = (0..200).any(|_| matches!(doc_b.recv_timeout(Duration::from_millis(25)), Some(Event::Gap)));
+        crate::live::set_fragment_patience_for_tests(craft_cloud_api::fragments::PATIENCE);
+        assert!(gap, "nothing of it came whole: a gap");
+        b.set_fragment_faults(None);
+        let Opened::Live(again) = docs_b.open("f.txt", "test").unwrap() else { panic!("not live on b") };
+        assert_eq!(again.state_updates().iter().filter(|u| **u == big).count(), 2, "the state has both, whole");
     }
 }
