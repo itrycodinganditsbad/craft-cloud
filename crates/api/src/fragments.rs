@@ -1,9 +1,10 @@
 //! Live updates over the 1 MiB frame limit, sent in fragments: one update (a Loro update of any size up to
 //! [`MAX_WHOLE_BYTES`]) cut into frames of at most the limit, each a fragment naming its set (the first 16 bytes of the
 //! update's BLAKE3), its index and the set's count. Every place that imports an update or answers for what a document
-//! holds (an app's session, an agent's copy) takes a fragment only into a [`Reassembler`], and imports the update once
-//! it holds every fragment of it: no document ever holds part of a change. The places that only store and relay
-//! updates (the server, an agent's log of rows) keep fragments as they are, as updates of their own.
+//! holds (an agent's copy, its local API for an app's change) takes a fragment only into a [`Reassembler`] (or keeps it
+//! aside), and imports the update once it holds every fragment of it: no document ever holds part of a change. The
+//! server stages an agent's fragments and stores a set in one go, as updates of their own, or refuses it whole; an
+//! agent's log of rows keeps them as they are. Agents hand apps whole changes only.
 //!
 //! A fragment starts with [`MAGIC`], which no Loro update starts with (Loro's begin `loro`), so a program that doesn't
 //! know fragments refuses one as an update that doesn't decode rather than importing part of a change. The cut is
@@ -29,13 +30,21 @@ pub const SLICE_OPS: i32 = 16 * 1024;
 /// The bytes before a fragment's part of the update: [`MAGIC`], the set (16), the index and the count (2 each, big
 /// endian).
 pub const HEADER_BYTES: usize = 24;
-/// The largest update that may be sent in fragments: a snapshot's limit (an update can't hold more than a document).
-pub const MAX_WHOLE_BYTES: usize = MAX_SNAPSHOT_BYTES;
+/// The largest change (one update) that may be sent in fragments: 8 MiB, well under the server's 16 MiB cap on a
+/// document's log above its snapshot, so a change always fits a document that has room for updates at all.
+pub const MAX_WHOLE_BYTES: usize = 8 * 1024 * 1024;
+const _: () = assert!(MAX_WHOLE_BYTES <= MAX_SNAPSHOT_BYTES);
 /// The most fragments one update is cut into.
 pub const MAX_FRAGMENTS: usize = 4096;
-/// How long a receiver keeps the fragments of a set that stopped coming before it drops them (never applied): the
-/// data comes again through the next catch-up.
+/// The most sets a [`Reassembler`] (or anything that keeps fragments) holds at once: each costs bookkeeping besides its
+/// bytes.
+pub const MAX_SETS: usize = 16;
+/// How long the agent's local API keeps the fragments of an app's change that stopped coming (the app went part of
+/// the way) before it drops them, never taken.
 pub const PATIENCE: Duration = Duration::from_secs(60);
+
+/// What a kept fragment costs beside its part of the update (its index, its map entry).
+pub const FRAGMENT_OVERHEAD: usize = 64;
 
 /// The name of a set: the first 16 bytes of its update's BLAKE3.
 pub type SetId = [u8; 16];
@@ -220,11 +229,14 @@ impl Reassembler {
     /// Takes a fragment that came at `now`.
     pub fn take(&mut self, frame: &[u8], now: Instant) -> Taken {
         let Some(f) = parse(frame) else { return Taken::Refused("not a fragment") };
-        let fits = self.bytes.saturating_add(f.body.len()) <= self.max_bytes;
+        // (Each fragment is charged its bookkeeping too, so tiny ones can't make many sets cheap.)
+        let cost = f.body.len().saturating_add(FRAGMENT_OVERHEAD);
+        let fits = self.bytes.saturating_add(cost) <= self.max_bytes;
+        let room = self.sets.len() < MAX_SETS;
         let partial = match self.sets.get_mut(&f.set) {
             Some(p) if p.count != f.count => return Taken::Refused("a fragment that doesn't fit its set"),
             Some(p) => p,
-            None if !fits => return Taken::Refused("too many fragments wait"),
+            None if !fits || !room => return Taken::Refused("too many fragments wait"),
             None => self.sets.entry(f.set).or_insert(Partial { count: f.count, parts: BTreeMap::new(), bytes: 0, last: now }),
         };
         partial.last = now;
@@ -233,8 +245,8 @@ impl Reassembler {
                 return Taken::Refused("too many fragments wait");
             }
             slot.insert(f.body.to_vec());
-            partial.bytes += f.body.len();
-            self.bytes += f.body.len();
+            partial.bytes += cost;
+            self.bytes += cost;
         }
         if partial.parts.len() < usize::from(partial.count) {
             return Taken::Waiting;
@@ -366,5 +378,18 @@ mod tests {
         assert_eq!(small.take(&split(&u, 1000).unwrap()[0], now), Taken::Refused("too many fragments wait"));
         assert_eq!(split(&update(MAX_WHOLE_BYTES + 1), 1 << 20), Err(SplitError::TooLarge(MAX_WHOLE_BYTES + 1)));
         assert_eq!(split(&u, HEADER_BYTES), Err(SplitError::FrameTooSmall(HEADER_BYTES)));
+    }
+
+    #[test]
+    fn the_sets_kept_are_bounded_in_number_as_well_as_bytes() {
+        let mut r = Reassembler::new(1 << 30);
+        let now = Instant::now();
+        for i in 0..MAX_SETS {
+            let frames = split(&[update(300), vec![u8::try_from(i).unwrap()]].concat(), 100).unwrap();
+            assert_eq!(r.take(&frames[0], now), Taken::Waiting);
+        }
+        let one_more = split(&update(301), 100).unwrap();
+        assert_eq!(r.take(&one_more[0], now), Taken::Refused("too many fragments wait"));
+        assert_eq!(r.len(), MAX_SETS);
     }
 }
