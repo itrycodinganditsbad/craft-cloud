@@ -299,6 +299,10 @@ way with kittest.
   peer's (1 MiB: 7 s); the kit's slices keep a 4 MiB paste's import at about 10 ms. So does its checkout to an earlier
   version: an agent asked for a compaction while its copy is far past the asked version (its own big change not in the
   log yet) leaves the answer to another device.
+- A big paste into a text another machine edits at that very moment is the slow case left: in one order of the two
+  peers Loro works the text out again for every slice, so once a slice is slow the kit (and the agent) take the rest
+  as one update, which costs those seconds once (about 7 s for 1.2 MB, 0.5 s for 300 KB) on the machine that was
+  typing. Edits elsewhere at the same moment (another text, a property) cost nothing.
 - A remote change to a rich text is patched into the old text; a tree's structure change reads the tree's
   structure again (cheap per node, 5,000 nodes in a few milliseconds); a table or timeline is read back by the app as
   much as it wants.
