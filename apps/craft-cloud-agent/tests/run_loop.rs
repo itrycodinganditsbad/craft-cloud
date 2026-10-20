@@ -234,6 +234,7 @@ fn quick() -> RunOptions {
         fail_watch: false,
         record_delay: Duration::ZERO,
         session_grace: Duration::from_secs(10),
+        announce_delay: Duration::ZERO,
         // Never this machine's own start-at-login entry.
         autostart: craft_cloud_agent::autostart::Target::Off,
     }

@@ -49,6 +49,8 @@ pub struct HubConfig {
     pub record_delay: Duration,
     /// How long after a session an unannounced change is still waited for (`saves::SESSION_GRACE`).
     pub session_grace: Duration,
+    /// Tests: how late the hub reads every save announcement (a hub busy elsewhere).
+    pub announce_delay: Duration,
 }
 
 /// How long an open of a file that isn't uploaded yet waits for its node (a sync pass is started for it).
@@ -346,6 +348,8 @@ struct Docs {
     early: Vec<EarlyRecord>,
     /// Documents the sync asked about and this copy couldn't tell yet: a pass is asked for once operations come.
     asked: BTreeSet<DocId>,
+    /// Tests ([`HubConfig::announce_delay`]): announcements read late, and when.
+    late_announcements: Vec<(Instant, ConnId, DocId, String)>,
 }
 
 /// A save record waiting for its operations ([`Docs::early`]).
@@ -716,8 +720,26 @@ impl State {
         }
     }
 
+    /// An app connection announced a save: noted only of a document it has open, at most so many per connection
+    /// ([`super::saves::Pending`]).
+    fn announce(&mut self, conn: ConnId, doc: DocId, hash: &str) -> Vec<ClientFrame> {
+        let open = self.docs.conns.get(&conn).is_some_and(|c| c.handles.values().any(|d| *d == doc));
+        if super::saves::SaveBook::check(hash, &[]).is_err() || !self.saves.with_pending(|p| p.announce(conn, doc, hash, open)) {
+            return self.tell(conn, refusal(None, None, craft_cloud_proto::api::codes::INVALID, "a save of a document not open here"));
+        }
+        Vec::new()
+    }
+
     /// Keeps the early records whose operations have come.
     fn take_early(&mut self) {
+        let now = Instant::now();
+        for (at, conn, doc, hash) in std::mem::take(&mut self.docs.late_announcements) {
+            if at <= now {
+                let _ = self.announce(conn, doc, &hash);
+            } else {
+                self.docs.late_announcements.push((at, conn, doc, hash));
+            }
+        }
         if self.docs.early.is_empty() {
             return;
         }
@@ -880,12 +902,12 @@ impl State {
             DocsCall::Open { conn, id, path, app, file_hash } => self.open(conn, id, &path, &app, file_hash),
             DocsCall::Saved { conn, doc, hash, frontiers } => self.saved(conn, doc, hash, frontiers),
             DocsCall::Saving { conn, doc, hash } => {
-                // Only of a document this connection has open, and at most so many per connection ([`Pending`]).
-                let open = self.docs.conns.get(&conn).is_some_and(|c| c.handles.values().any(|d| *d == doc));
-                if super::saves::SaveBook::check(&hash, &[]).is_err() || !self.saves.with_pending(|p| p.announce(conn, doc, &hash, open)) {
-                    return self.tell(conn, refusal(None, None, craft_cloud_proto::api::codes::INVALID, "a save of a document not open here"));
+                if !self.config.announce_delay.is_zero() {
+                    // Tests: a hub that reads the announcement late (busy elsewhere).
+                    self.docs.late_announcements.push((Instant::now() + self.config.announce_delay, conn, doc, hash));
+                    return Vec::new();
                 }
-                Vec::new()
+                self.announce(conn, doc, &hash)
             }
             DocsCall::Import { conn, id, bytes } => {
                 let doc = self.docs.importer.iter().find(|(_, who)| **who == (conn, id)).map(|(doc, _)| *doc);

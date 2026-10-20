@@ -240,6 +240,7 @@ pub fn quick() -> RunOptions {
         record_delay: Duration::ZERO,
         // An unannounced change of a file an app had open is waited for this long (60 s on a real machine).
         session_grace: Duration::from_secs(10),
+        announce_delay: Duration::ZERO,
         // Never this machine's own start-at-login entry.
         autostart: craft_cloud_agent::autostart::Target::Off,
     }

@@ -147,7 +147,7 @@ fn window(client: craft_cloud_app::Client, folder: PathBuf, name: &'static str, 
             let bytes = point.model().to_file();
             session.record(&point, &bytes);
             std::fs::write(&tmp, &bytes).unwrap();
-            std::fs::rename(&tmp, &path).unwrap();
+            replace(&tmp, &path);
             dirty = false;
             last_save = Instant::now();
             shared.saves.fetch_add(1, Ordering::SeqCst);
@@ -157,6 +157,23 @@ fn window(client: craft_cloud_app::Client, folder: PathBuf, name: &'static str, 
     }
     let behind = session.file_behind();
     (session.model().as_ref().clone(), behind)
+}
+
+/// Puts `tmp` in `path`'s place, as an app's atomic save does. On Windows the agent may be reading the file just then
+/// (its sync hashing it), which refuses the replace for a moment ("access denied"): tried again, as an app tries its
+/// save again.
+fn replace(tmp: &std::path::Path, path: &std::path::Path) {
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(tmp, path) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && tries < 100 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("the save couldn't replace {}: {e}", path.display()),
+        }
+    }
 }
 
 /// Every file in `folder`, by name.
@@ -176,7 +193,13 @@ async fn both_machines_autosaving_end_with_every_edit_in_the_file_and_stop() {
     let server = Server::new().await;
     let (pc, laptop) = (Agent::signed_in(&server, "pc").await, Agent::signed_in(&server, "laptop").await);
     // Slow agents: every save record reaches the save book late, after the app wrote its file (as under load).
-    let slow = || craft_cloud_agent::daemon::RunOptions { record_delay: Duration::from_millis(RECORD_DELAY_MS), ..looping::quick() };
+    // And a hub too busy to read the announcement before the sync pass sees the file (the 200 ms stability window
+    // here): the Windows CI failure's path.
+    let slow = || craft_cloud_agent::daemon::RunOptions {
+        record_delay: Duration::from_millis(RECORD_DELAY_MS),
+        announce_delay: Duration::from_millis(1000),
+        ..looping::quick()
+    };
     let (run_pc, run_laptop) = (pc.run_with(slow()), laptop.run_with(slow()));
     let (on_pc, on_laptop) = (pc.client().await, laptop.client().await);
     std::fs::create_dir_all(&pc.folder).unwrap();
@@ -265,7 +288,7 @@ fn save_now(session: &mut Session<LinesApp>, path: &std::path::Path) -> Vec<u8> 
     session.record(&point, &bytes);
     let tmp = path.with_extension("tmp-save");
     std::fs::write(&tmp, &bytes).unwrap();
-    std::fs::rename(&tmp, path).unwrap();
+    replace(&tmp, path);
     bytes
 }
 
