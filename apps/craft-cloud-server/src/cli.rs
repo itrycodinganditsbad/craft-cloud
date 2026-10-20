@@ -288,17 +288,18 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
 pub async fn partial_sets(meta: &Meta, space: craft_cloud_proto::SpaceId, doc: craft_cloud_proto::DocId) -> Result<usize, CliError> {
     use craft_cloud_proto::fragments::{SetId, parse};
     let Some(found) = meta.live_doc(space, doc).await? else { return Ok(0) };
-    let mut sets: std::collections::BTreeMap<SetId, (u16, std::collections::BTreeSet<u16>)> = std::collections::BTreeMap::new();
+    // (By set and count: two cuts of one change, at different limits, are two sets, never one that looks whole.)
+    let mut sets: std::collections::BTreeMap<(SetId, u16), std::collections::BTreeSet<u16>> = std::collections::BTreeMap::new();
     let mut after = found.base;
     loop {
         let rows = meta.live_updates(space, doc, after, craft_cloud_meta::MAX_LIVE_PAGE).await?;
         let Some(last) = rows.last() else { break };
         after = last.seq;
         for f in rows.iter().filter_map(|r| parse(&r.bytes)) {
-            sets.entry(f.set).or_insert((f.count, Default::default())).1.insert(f.index);
+            sets.entry((f.set, f.count)).or_default().insert(f.index);
         }
     }
-    Ok(sets.values().filter(|(count, got)| got.len() < usize::from(*count)).count())
+    Ok(sets.iter().filter(|((_, count), got)| got.len() < usize::from(*count)).count())
 }
 
 /// `user invite`: makes the invite and prints how to use it. The code is printed only here, never logged.

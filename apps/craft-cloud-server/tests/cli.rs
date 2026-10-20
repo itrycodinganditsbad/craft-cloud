@@ -115,7 +115,17 @@ async fn live_check_sets_finds_part_of_a_change() {
         meta.append_live_update(ana.space, whole, device, i as u64 + 1, f, 0).await.unwrap();
     }
     meta.append_live_update(ana.space, part, device, 1, &frames[0], 0).await.unwrap();
+    // Two cuts of one change (at different limits) never make one that looks whole: by set and count, two parts.
+    let cuts = craft_cloud_proto::DocId::generate();
+    meta.create_live_doc(ana.space, cuts, "recents:wordcraft", None, 0).await.unwrap();
+    let two = craft_cloud_proto::fragments::split(&change, 1600).unwrap();
+    assert_eq!((two.len(), frames.len()), (2, 3));
+    meta.append_live_update(ana.space, cuts, device, 1, &two[0], 0).await.unwrap();
+    meta.append_live_update(ana.space, cuts, device, 2, &frames[1], 0).await.unwrap();
+    meta.append_live_update(ana.space, cuts, device, 3, &frames[2], 0).await.unwrap();
     let out = cli(&["live", "--config", c, "check-sets", "ana"], "").await.unwrap();
+    assert!(out.contains(&format!("live document {cuts} of ana holds part of 2 change(s)")), "{out}");
+    cli(&["live", "--config", c, "reset-doc", "ana", &cuts.to_string()], "").await.unwrap();
     assert!(out.contains(&format!("live document {part} of ana holds part of 1 change(s)")), "{out}");
     assert!(out.contains(&format!("live reset-doc ana {part}")), "{out}");
     assert!(!out.contains(&whole.to_string()), "{out}");
