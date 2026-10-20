@@ -715,13 +715,37 @@ impl Session {
             // fragments one after the other, so each is found by its number.
             let mut found = Vec::new();
             if new_set {
+                let mut below_base = false;
+                let mut base = None;
                 for i in (0..count).filter(|i| *i != index) {
                     let Some(seq) = (client_seq + u64::from(i)).checked_sub(u64::from(index)).filter(|s| *s > 0) else { continue };
                     let stored = self.state.meta.live_updates_sent(self.space, doc, self.device, seq).await.map_err(|e| one(e.into()))?;
-                    if let Some(b) = stored.into_iter().find(|b| parse(b).is_some_and(|g| g.set == set_id && g.index == i && g.count == count)) {
-                        found.push((seq, b));
+                    let Some((row, b)) =
+                        stored.into_iter().find(|(_, b)| parse(b).is_some_and(|g| g.set == set_id && g.index == i && g.count == count))
+                    else {
+                        continue;
+                    };
+                    if base.is_none() {
+                        base = Some(self.state.meta.live_doc(self.space, doc).await.map_err(|e| one(e.into()))?.map_or(0, |d| d.base));
                     }
+                    below_base |= base.is_some_and(|base| row <= base);
+                    found.push((seq, b));
                 }
+                // Part of the set is at or below the snapshot's base (a device from before whole sets compacted past
+                // it): stored above it, the rest would be a set no machine ever gets whole. The agent starts this
+                // document over instead: it drops the set and sends its operations up as a push.
+                if below_base {
+                    return Err(one(ApiError::new(
+                        axum::http::StatusCode::GONE,
+                        codes::RESYNC_REQUIRED,
+                        "part of this change is in the document's snapshot, the rest not: start the document over",
+                    )));
+                }
+            }
+            // (What is found counts against the connection's staging too.)
+            let found_bytes: usize = found.iter().map(|(_, b): &(u64, Vec<u8>)| b.len()).sum();
+            if self.staged_bytes.saturating_add(bytes.len()).saturating_add(found_bytes) > MAX_STAGED_BYTES {
+                return Err(one(ApiError::invalid("too many fragments wait on this connection")));
             }
             let set = self.staged.entry(key).or_default();
             for (seq, b) in found {
@@ -1475,6 +1499,40 @@ mod tests {
         let refused = laptop.handle(ClientFrame::Update { doc, client_seq: 1, bytes: vec![3; 10] }).await;
         assert!(refused.frames.iter().any(|f| matches!(f, ServerFrame::Error { code, .. } if code == "quota_exceeded")), "{:?}", refused.frames);
         assert!(refused.frames.iter().any(|f| matches!(f, ServerFrame::Compact { upto: 2, .. })), "asked: {:?}", refused.frames);
+    }
+
+    /// The first part of a set stored alone, then compacted past (a device from before whole sets did): the rest,
+    /// sent now, is refused with `resync_required` (the agent starts the document over and sends the change as a
+    /// push), never stored above the base as a set no machine would get whole.
+    #[tokio::test]
+    async fn the_rest_of_a_set_whose_part_is_below_the_base_is_refused_for_a_start_over() {
+        let mut a = Account::new(Default::default()).await;
+        let (mut pc, pc_auth) = a.session(3).await;
+        let (_laptop, laptop_auth) = a.session(3).await;
+        let node = a.file(&pc_auth, "part.txt").await;
+        let doc = node_doc(a.user.space, node);
+        let import = a.upload(&[1; 100]).await;
+        pc.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: import }).await;
+        let change: Vec<u8> = (0..3000u32).map(|i| (i % 249) as u8).collect();
+        let frames = craft_cloud_proto::fragments::split(&change, 1100).unwrap();
+        assert_eq!(a.meta.append_live_update(a.user.space, doc, pc_auth.device, 1, &frames[0], 0).await.unwrap(), 1);
+        assert_eq!(a.meta.append_live_update(a.user.space, doc, laptop_auth.device, 1, &[7; 10], 0).await.unwrap(), 2);
+        let snap = a.upload(&[9; 20]).await;
+        assert!(a.meta.compact_live_doc(a.user.space, doc, 2, &snap).await.unwrap());
+        pc.handle(ClientFrame::Subscribe { doc, after: 2, at: None }).await;
+        drain(&mut pc).await;
+        let mut answers = pc.handle(ClientFrame::Update { doc, client_seq: 2, bytes: frames[1].clone() }).await.frames;
+        answers.extend(pc.handle(ClientFrame::Update { doc, client_seq: 3, bytes: frames[2].clone() }).await.frames);
+        let resync: Vec<Option<u64>> = answers
+            .iter()
+            .filter_map(
+                |f| if let ServerFrame::Error { code, client_seq, .. } = f { (code == "resync_required").then_some(*client_seq) } else { None },
+            )
+            .collect();
+        assert_eq!(resync, vec![Some(2), Some(3)], "{answers:?}");
+        assert!(!answers.iter().any(|f| matches!(f, ServerFrame::Ack { .. })), "{answers:?}");
+        let found = a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap();
+        assert_eq!((found.base, found.head), (2, 2), "nothing stored above the base");
     }
 
     /// A set stored in part before whole sets (an older server stored fragments one by one) is made whole when its

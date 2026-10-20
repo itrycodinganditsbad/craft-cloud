@@ -3085,6 +3085,20 @@ impl<S: DocStore> Replica<S> {
                 doc.start_over();
                 Ok(subscribe(id, doc, epoch))
             }
+            // A fragment of a set whose first part the log's snapshot holds alone (a device from before whole sets
+            // compacted past it): the set goes from what waits, and the document starts over, so its operations go
+            // up as a push. (Once: the set's other fragments, refused the same way, aren't waiting any more.)
+            (codes::RESYNC_REQUIRED, Some((id, doc)), Some(client_seq)) => {
+                let Some(set) = doc.pending.iter().find(|p| p.client_seq == client_seq).and_then(|p| parse(&p.bytes)).map(|f| f.set) else {
+                    return Ok(Vec::new());
+                };
+                doc.pending.retain(|p| parse(&p.bytes).is_none_or(|f| f.set != set));
+                let line =
+                    format!("a change of the live document {id} was stored in part by an older Craft Cloud; this machine sends it again whole");
+                doc.say(&mut self.notes, line);
+                doc.start_over();
+                Ok(subscribe(id, doc, epoch))
+            }
             // A create refused because the account is at its live-document limit (the server's cap): tried again after a
             // growing pause, and the recents stay here until then. The link stays up for the other lists.
             (codes::QUOTA_EXCEEDED, Some((_, doc)), None) => {
@@ -5133,6 +5147,32 @@ mod tests {
         let sizes: Vec<usize> = remote.iter().map(|b| b.len()).collect();
         assert!(remote == vec![&big, &after], "the change, then the row after it: {sizes:?}");
         assert!(text_of(&r, id).starts_with("after b"));
+    }
+
+    /// The rest of a set refused with `resync_required` (its first part is in the server's snapshot alone): the set
+    /// goes from what waits, once, and the document starts over, its operations going up as a push.
+    #[test]
+    fn a_set_refused_for_a_start_over_goes_as_a_push() {
+        let store = MemStore::default();
+        let (space, node) = (SpaceId::generate(), NodeId::generate());
+        let (mut r, id, import) = joined(&store, space, node);
+        let app_doc = text_doc(50);
+        app_doc.import(&import).unwrap();
+        let big = sliced(&app_doc, &"a".repeat(2 * MAX_UPDATE_BYTES));
+        assert_eq!(r.local_update(id, &big).unwrap().len(), 3);
+        r.on_frame(ServerFrame::Ack { doc: id, client_seq: 1, seq: 1 }).unwrap();
+        let refusal = |client_seq| ServerFrame::Error {
+            code: codes::RESYNC_REQUIRED.into(),
+            message: "part of it in the snapshot".into(),
+            doc: Some(id),
+            client_seq: Some(client_seq),
+        };
+        let out = r.on_frame(refusal(2)).unwrap();
+        assert!(out.iter().any(|f| matches!(f, ClientFrame::Subscribe { after: 0, .. })), "started over: {out:?}");
+        let doc = r.docs.get(&id).unwrap();
+        assert!(doc.pending.iter().all(|p| !is_fragment(&p.bytes)), "the set no longer waits");
+        assert!(doc.pushing.is_some(), "its operations go as a push");
+        assert!(r.on_frame(refusal(3)).unwrap().is_empty(), "once");
     }
 
     /// A fragment's ack is for it alone: the rest of the set, their acks lost with the connection, goes again (the

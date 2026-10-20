@@ -745,17 +745,18 @@ impl Meta {
         Ok((page, more))
     }
 
-    /// The updates `device` sent as `client_seq` to the document that the log holds (their bytes): normally none or
-    /// one. (A change in fragments partly stored before: the rest of it is joined with what is here.)
-    pub async fn live_updates_sent(&self, space: SpaceId, doc: DocId, device: DeviceId, client_seq: u64) -> Result<Vec<Vec<u8>>, MetaError> {
-        let rows = sqlx::query("SELECT bytes FROM live_updates WHERE space_id = $1 AND doc = $2 AND device = $3 AND client_seq = $4 ORDER BY seq")
-            .bind(uuid_bytes(space.as_uuid()))
-            .bind(uuid_bytes(doc.as_uuid()))
-            .bind(uuid_bytes(device.as_uuid()))
-            .bind(to_i64(client_seq)?)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter().map(|row| Ok(row.try_get("bytes")?)).collect()
+    /// The updates `device` sent as `client_seq` to the document that the log holds (their numbers and bytes):
+    /// normally none or one. (A change in fragments partly stored before: the rest of it is joined with what is here.)
+    pub async fn live_updates_sent(&self, space: SpaceId, doc: DocId, device: DeviceId, client_seq: u64) -> Result<Vec<(u64, Vec<u8>)>, MetaError> {
+        let rows =
+            sqlx::query("SELECT seq, bytes FROM live_updates WHERE space_id = $1 AND doc = $2 AND device = $3 AND client_seq = $4 ORDER BY seq")
+                .bind(uuid_bytes(space.as_uuid()))
+                .bind(uuid_bytes(doc.as_uuid()))
+                .bind(uuid_bytes(device.as_uuid()))
+                .bind(to_i64(client_seq)?)
+                .fetch_all(&self.pool)
+                .await?;
+        rows.iter().map(|row| Ok((to_u64(row.try_get("seq")?)?, row.try_get("bytes")?))).collect()
     }
 
     /// The document's updates with a sequence number above `after`, in order, at most `limit` (and at most
