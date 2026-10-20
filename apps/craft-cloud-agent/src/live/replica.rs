@@ -3096,6 +3096,12 @@ impl<S: DocStore> Replica<S> {
                 let line =
                     format!("a change of the live document {id} was stored in part by an older Craft Cloud; this machine sends it again whole");
                 doc.say(&mut self.notes, line);
+                doc.dirty = true;
+                // (A start over under way, its push to come or going, sends these operations too: not another one,
+                // whose subscribe the server would refuse while the first one's catch-up runs.)
+                if doc.pushing.is_some() {
+                    return Ok(Vec::new());
+                }
                 doc.start_over();
                 Ok(subscribe(id, doc, epoch))
             }
