@@ -204,6 +204,10 @@ impl LiveCopy {
     pub fn import_any_size(&self, bytes: &[u8]) -> Result<Taken, UpdateError> {
         if is_bundle(bytes) {
             let slices = parts(bytes).ok_or_else(|| UpdateError::Malformed("a bundle cut short".into()))?;
+            // Every slice is read before any goes in: one that doesn't read refuses the bundle whole, nothing of it in.
+            for slice in &slices {
+                guarded(|| LoroDoc::decode_import_blob_meta(slice, true).map_err(|e| UpdateError::Malformed(e.to_string())))?;
+            }
             let (mut new, mut needs) = (false, Vec::new());
             let mut take = |taken: Taken| match taken {
                 Taken::Applied { new: n } => new |= n,
@@ -690,6 +694,12 @@ mod tests {
         let at_now = copy.snapshot_at(&copy.version().unwrap()).unwrap();
         assert!(!at_now.is_empty());
         assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        // A bundle with a slice that doesn't read is refused whole: nothing of its other slices goes in.
+        let fresh = LiveCopy::load(&import, 1).unwrap();
+        let mut bad: Vec<Vec<u8>> = slices.iter().take(3).cloned().collect();
+        bad.push(b"not an update".to_vec());
+        assert!(fresh.import_any_size(&bundle(&bad)).is_err());
+        assert!(!fresh.covers(&[(50, 1)]), "nothing of it in");
     }
 
     /// A 600 KB paste's bundle into a copy holding an app's edit of the same text made at the same moment, the edit's

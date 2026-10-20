@@ -1586,8 +1586,12 @@ const SLOW_SLICE: Duration = Duration::from_millis(50);
 /// of the two peers) works the text out again from where the edits parted for each slice, so each costs more than the
 /// last and a 1.2 MB paste took minutes. Once a slice is that slow, the rest goes in as one update (joined on a
 /// detached fork, which only takes their operations), which Loro works out once (seconds for a megabyte). Undo is
-/// kept either way. The first error is returned; the slices after it are still imported.
+/// kept either way. Every slice is read first: one that doesn't read refuses the change whole, nothing of it in.
+/// Past that, the first error is returned; the slices after it are still imported.
 fn import_slices(doc: &LoroDoc, slices: &[&[u8]]) -> Result<(), loro::LoroError> {
+    for slice in slices {
+        LoroDoc::decode_import_blob_meta(slice, true)?;
+    }
     let mut first_error = None;
     let mut i = 0;
     while let Some(slice) = slices.get(i) {
@@ -1706,5 +1710,21 @@ mod tests {
         assert_eq!(here.get_text("t").to_string(), format!("hello abc{paste}"));
         assert!(undo.undo().unwrap());
         assert_eq!(here.get_text("t").to_string(), format!("abc{paste}"));
+    }
+
+    /// A change with a slice that doesn't read is refused whole: nothing of its other slices goes in.
+    #[test]
+    fn a_change_with_a_slice_that_does_not_read_goes_in_not_at_all() {
+        let sender = LoroDoc::new();
+        sender.set_peer_id(9).unwrap();
+        sender.get_text("t").insert(0, "abcdef").unwrap();
+        sender.commit();
+        let one = sender.export(loro::ExportMode::updates_in_range(vec![loro::IdSpan::new(9, 0, 3)])).unwrap();
+        let two = sender.export(loro::ExportMode::updates_in_range(vec![loro::IdSpan::new(9, 3, 6)])).unwrap();
+        let here = new_doc();
+        assert!(import_slices(&here, &[one.as_slice(), b"not an update", two.as_slice()]).is_err());
+        assert_eq!(here.get_text("t").to_string(), "", "nothing of it in");
+        import_slices(&here, &[one.as_slice(), two.as_slice()]).unwrap();
+        assert_eq!(here.get_text("t").to_string(), "abcdef");
     }
 }
