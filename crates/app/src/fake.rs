@@ -820,7 +820,9 @@ impl std::fmt::Debug for Fake {
 impl Fake {
     /// A client of this machine's agent, as [`Client::connect`] gives one.
     pub fn client(&self) -> Client {
-        Client::at(self.addr, self.token.clone(), std::env::temp_dir())
+        // (Its versions known, as a client that connected through `local-api.json` knows them: no call of its own.)
+        let too_old = lock(&self.hub.inner).machines.get(&self.id).is_some_and(|m| m.too_old);
+        Client::at(self.addr, self.token.clone(), std::env::temp_dir(), if too_old { 1 } else { LOCAL_API_MAX })
     }
 
     /// The machine reaches the hub (`true`) or not: offline, its updates and blobs wait, and others' don't come.
