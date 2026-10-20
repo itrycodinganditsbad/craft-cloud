@@ -34,16 +34,18 @@
 //! The connection isn't made again here when it goes ([`Event::Closed`]): an app opens its documents again on a new
 //! [`Documents`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use craft_cloud_api::DocId;
 use craft_cloud_api::api::ErrorAnswer as ErrorBody;
+use craft_cloud_api::fragments::{MAX_WHOLE_BYTES, Reassembler, Taken, is_fragment, split};
+use craft_cloud_api::limits::MAX_UPDATE_BYTES;
 use craft_cloud_api::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, STATE, UPDATE, decode_binary, encode_binary};
 use craft_cloud_api::local::{DocState, DocsEvent, DocsRequest, MAX_LOCAL_JSON_BYTES, paths};
 use tungstenite::client::IntoClientRequest;
@@ -87,9 +89,29 @@ pub enum Event {
     /// The document's file on this machine's disk now: the live document's frontiers (`(peer, counter)` heads) a Craft
     /// app saved it from, or none when no save record is known for it (see `DocsEvent::File`).
     File(Option<Vec<(u64, u32)>>),
+    /// A change that came in fragments never came whole on this connection (its fragments stopped coming for
+    /// [`fragment_patience`], or didn't make the change they named): what came of it was dropped, never applied. Open
+    /// the document again to catch up (its state then holds the change, or the fragments still coming).
+    Gap,
     /// The connection to the agent ended.
     Closed(String),
 }
+
+/// How long a set of fragments that stopped coming is kept before it is dropped ([`Event::Gap`]).
+pub fn fragment_patience() -> Duration {
+    Duration::from_millis(PATIENCE_MS.load(Ordering::Relaxed))
+}
+
+/// For tests: [`fragment_patience`] from now on, in this process.
+#[doc(hidden)]
+pub fn set_fragment_patience_for_tests(patience: Duration) {
+    PATIENCE_MS.store(u64::try_from(patience.as_millis()).unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+static PATIENCE_MS: AtomicU64 = AtomicU64::new(craft_cloud_api::fragments::PATIENCE.as_secs() * 1000);
+
+/// The most bytes of fragments a connection keeps per document while their sets come.
+const MAX_FRAGMENT_BYTES: usize = 2 * MAX_WHOLE_BYTES;
 
 /// What opening a file gives.
 #[derive(Debug)]
@@ -118,8 +140,14 @@ struct Head {
     changed_outside: Option<bool>,
 }
 
-/// An open's state so far: what `opened` said, the snapshot, and the updates that are part of it.
-type Filling = (Head, Vec<u8>, Vec<Vec<u8>>);
+/// An open's state so far: what `opened` said, the snapshot, the updates that are part of it (whole: fragments are
+/// joined first), and how many of its update frames came.
+struct Filling {
+    head: Head,
+    snapshot: Vec<u8>,
+    updates: Vec<Vec<u8>>,
+    frames: u64,
+}
 
 /// What the reader hands an open in progress.
 enum Answer {
@@ -144,6 +172,11 @@ struct Shared {
     numbers: Mutex<HashMap<DocId, Vec<u64>>>,
     /// What to call after an event went to a document's channel, by number ([`Document::set_waker`]).
     wakers: Mutex<HashMap<u64, Waker>>,
+    /// The fragments of the changes still coming, by number.
+    sets: Mutex<HashMap<u64, Reassembler>>,
+    /// The numbers (document number, `seq`) of the fragments sent that aren't a change's last: the agent answers for a
+    /// change by its last fragment's number, and these answers aren't the app's.
+    inner_seqs: Mutex<HashSet<(u64, u64)>>,
     closed: AtomicBool,
     next_id: AtomicU64,
     /// A clone of the stream: dropping the connection shuts it down (which wakes the reader).
@@ -169,6 +202,51 @@ impl Shared {
 
     fn send_binary(&self, kind: u8, id: u64, bytes: &[u8]) -> Result<(), Error> {
         self.send(Message::Binary(encode_binary(kind, id, bytes).into()))
+    }
+
+    /// Sends `frames` (one change's fragments) back to back: nothing of another sender's goes between them, so their
+    /// numbers follow on.
+    fn send_frames(&self, kind: u8, id: u64, frames: &[Vec<u8>]) -> Result<(), Error> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Error::Io("the connection to the agent is closed".into()));
+        }
+        let mut socket = lock(&self.socket);
+        for frame in frames {
+            socket.send(Message::Binary(encode_binary(kind, id, frame).into())).map_err(|e| Error::Io(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// An update frame for document number `id`: whole, it is the update; a fragment is kept until its set is whole.
+    fn joined(&self, id: u64, frame: &[u8]) -> Option<Vec<u8>> {
+        if !is_fragment(frame) {
+            return Some(frame.to_vec());
+        }
+        let taken = lock(&self.sets).entry(id).or_insert_with(|| Reassembler::new(MAX_FRAGMENT_BYTES)).take(frame, Instant::now());
+        match taken {
+            Taken::Whole(update) => Some(update),
+            Taken::Waiting => None,
+            Taken::Refused(_) => {
+                // Its set can't come whole on this connection: the app catches up by opening the document again.
+                self.route(id, Event::Gap);
+                None
+            }
+        }
+    }
+
+    /// Drops the sets of fragments that stopped coming: their documents hear [`Event::Gap`].
+    fn expire(&self) {
+        let now = Instant::now();
+        let patience = fragment_patience();
+        let gaps: Vec<u64> = lock(&self.sets).iter_mut().filter_map(|(id, r)| (r.expire(now, patience) > 0).then_some(*id)).collect();
+        for id in gaps {
+            self.route(id, Event::Gap);
+        }
+    }
+
+    /// Whether the agent's answer for (`id`, `seq`) is for a fragment that isn't a change's last (not the app's).
+    fn inner(&self, id: u64, seq: u64) -> bool {
+        lock(&self.inner_seqs).remove(&(id, seq))
     }
 
     fn route(&self, id: u64, event: Event) {
@@ -200,6 +278,7 @@ impl Shared {
                 }
                 Ok(DocsEvent::NeedsImport { id }) => self.answer(id, Answer::NeedsImport),
                 Ok(DocsEvent::NotLive { id, reason, .. }) => self.answer(id, Answer::NotLive(reason)),
+                Ok(DocsEvent::Ack { id, seq }) if self.inner(id, seq) => {}
                 Ok(DocsEvent::Ack { id, seq }) => self.route(id, Event::Acked(seq)),
                 Ok(DocsEvent::Status { doc, online, waiting, deleted, stopped }) => {
                     let ids = lock(&self.numbers).get(&doc).cloned().unwrap_or_default();
@@ -213,6 +292,7 @@ impl Shared {
                         self.route(id, Event::File(frontiers.clone()));
                     }
                 }
+                Ok(DocsEvent::Error { id: Some(id), seq: Some(seq), .. }) if self.inner(id, seq) => {}
                 Ok(DocsEvent::Error { id: Some(id), seq: Some(seq), code, message }) => self.route(id, Event::Refused { seq, code, message }),
                 Ok(DocsEvent::Error { id: Some(id), seq: None, code, message }) => self.answer(id, Answer::Refused(Error::Refused { code, message })),
                 Ok(DocsEvent::Error { id: None, .. }) | Err(_) => {}
@@ -223,28 +303,36 @@ impl Shared {
                     STATE => {
                         if let Some(head) = lock(&self.opening).remove(&id) {
                             lock(&self.numbers).entry(head.doc).or_default().push(id);
+                            // (A number opened again starts its fragments afresh.)
+                            lock(&self.sets).remove(&id);
                             if head.state.updates == 0 {
                                 self.answer(id, Answer::Live { head, snapshot: body.to_vec(), updates: Vec::new() });
                             } else {
-                                lock(&self.filling).insert(id, (head, body.to_vec(), Vec::new()));
+                                lock(&self.filling).insert(id, Filling { head, snapshot: body.to_vec(), updates: Vec::new(), frames: 0 });
                             }
                         }
                     }
                     UPDATE => {
-                        // An update that is part of an open's state: kept with it until the last has come.
+                        // An update that is part of an open's state: kept with it until the last has come. (The
+                        // state counts frames: a fragment whose set isn't whole yet waits for the rest, which comes
+                        // as the document's events.)
+                        let whole = self.joined(id, body);
                         let mut filling = lock(&self.filling);
-                        if let Some((head, _, updates)) = filling.get_mut(&id) {
-                            updates.push(body.to_vec());
-                            if updates.len() as u64 >= head.state.updates
-                                && let Some((head, snapshot, updates)) = filling.remove(&id)
+                        if let Some(f) = filling.get_mut(&id) {
+                            f.frames += 1;
+                            f.updates.extend(whole);
+                            if f.frames >= f.head.state.updates
+                                && let Some(f) = filling.remove(&id)
                             {
                                 drop(filling);
-                                self.answer(id, Answer::Live { head, snapshot, updates });
+                                self.answer(id, Answer::Live { head: f.head, snapshot: f.snapshot, updates: f.updates });
                             }
                             return;
                         }
                         drop(filling);
-                        self.route(id, Event::Update(body.to_vec()));
+                        if let Some(update) = whole {
+                            self.route(id, Event::Update(update));
+                        }
                     }
                     PRESENCE => self.route(id, Event::Presence(body.to_vec())),
                     _ => {}
@@ -265,6 +353,7 @@ impl Shared {
             waker();
         }
         lock(&self.filling).clear();
+        lock(&self.sets).clear();
         for (_, waiting) in lock(&self.answers).drain() {
             let _ = waiting.send(Answer::Refused(Error::Io(why.to_owned())));
         }
@@ -281,7 +370,7 @@ fn read_loop(shared: Arc<Shared>, mut socket: WebSocket<TcpStream>) {
         match socket.read() {
             Ok(Message::Close(_)) => return shared.end("the agent closed the connection"),
             Ok(message) => shared.on_message(message),
-            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => shared.expire(),
             Err(e) => return shared.end(&e.to_string()),
         }
     }
@@ -341,6 +430,8 @@ impl Documents {
             filling: Mutex::new(HashMap::new()),
             numbers: Mutex::new(HashMap::new()),
             wakers: Mutex::new(HashMap::new()),
+            sets: Mutex::new(HashMap::new()),
+            inner_seqs: Mutex::new(HashSet::new()),
             closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             stream,
@@ -505,12 +596,20 @@ impl Document {
         self.head.changed_outside
     }
 
-    /// Sends this app's change (a Loro update, at most 1 MiB); returns its number, which [`Event::Acked`] names once
-    /// it is on the agent's disk.
+    /// Sends this app's change (a Loro update, of up to a snapshot's limit: one over 1 MiB goes in fragments, which the
+    /// agent takes only together); returns its number, which [`Event::Acked`] (or [`Event::Refused`]) names once it is
+    /// on the agent's disk. An update over the limit is refused here (`too_large`), and nothing is sent.
     pub fn send(&self, update: &[u8]) -> Result<u64, Error> {
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        self.shared.send_binary(UPDATE, self.id, update)?;
-        Ok(seq)
+        let frames = split(update, MAX_UPDATE_BYTES)
+            .map_err(|e| Error::Refused { code: craft_cloud_api::api::codes::TOO_LARGE.into(), message: e.to_string() })?;
+        let count = frames.len() as u64;
+        let first = self.seq.fetch_add(count, Ordering::Relaxed) + 1;
+        let last = first + count - 1;
+        if count > 1 {
+            lock(&self.shared.inner_seqs).extend((first..last).map(|seq| (self.id, seq)));
+        }
+        self.shared.send_frames(UPDATE, self.id, &frames)?;
+        Ok(last)
     }
 
     /// Tells the agent the app is about to write the document's file: the content's BLAKE3 `hash`, and the live
@@ -595,6 +694,8 @@ mod tests {
             filling: Mutex::new(HashMap::new()),
             numbers: Mutex::new(HashMap::new()),
             wakers: Mutex::new(HashMap::new()),
+            sets: Mutex::new(HashMap::new()),
+            inner_seqs: Mutex::new(HashSet::new()),
             closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             stream,
@@ -626,6 +727,71 @@ mod tests {
         let Ok(Answer::Live { updates, .. }) = answer.try_recv() else { panic!("no answer") };
         assert_eq!(updates, vec![b"1".to_vec(), b"2".to_vec()]);
         assert_eq!(events.try_recv().unwrap(), Event::Update(b"3".to_vec()));
+        assert!(events.try_recv().is_err());
+    }
+
+    /// A change in fragments, in an open's state and after it: the open is answered once the state's frames came, with
+    /// the changes that came whole; the rest of a set still coming is an event once it is whole, never before.
+    #[test]
+    fn fragments_are_joined_in_the_state_and_in_the_events() {
+        let (shared, _listener) = shared();
+        let (answer_tx, answer) = mpsc::channel();
+        lock(&shared.answers).insert(6, answer_tx);
+        let (events_tx, events) = mpsc::channel();
+        lock(&shared.routes).insert(6, events_tx);
+        let one: Vec<u8> = (0..3000u32).map(|i| (i % 256) as u8).collect();
+        let two: Vec<u8> = (0..2500u32).map(|i| (i % 7) as u8).collect();
+        let (f1, f2) = (split(&one, 1000).unwrap(), split(&two, 1000).unwrap());
+        // The state: `one` whole in fragments, then the first of `two`'s.
+        let frames = f1.len() as u64 + 1;
+        let opened = DocsEvent::Opened {
+            id: 6,
+            doc: DocId::generate(),
+            state: DocState { online: true, waiting: 0, bytes: 1, updates: frames },
+            changed_outside: None,
+        };
+        shared.on_message(Message::Text(serde_json::to_string(&opened).unwrap().into()));
+        shared.on_message(Message::Binary(encode_binary(STATE, 6, b"s").into()));
+        for f in f1.iter().rev() {
+            shared.on_message(Message::Binary(encode_binary(UPDATE, 6, f).into()));
+        }
+        assert!(answer.try_recv().is_err(), "a frame of the state is still to come");
+        shared.on_message(Message::Binary(encode_binary(UPDATE, 6, &f2[0]).into()));
+        let Ok(Answer::Live { updates, .. }) = answer.try_recv() else { panic!("no answer") };
+        assert_eq!(updates, vec![one]);
+        for f in &f2[1..f2.len() - 1] {
+            shared.on_message(Message::Binary(encode_binary(UPDATE, 6, f).into()));
+        }
+        assert!(events.try_recv().is_err(), "nothing of a change before it is whole");
+        shared.on_message(Message::Binary(encode_binary(UPDATE, 6, &f2[f2.len() - 1]).into()));
+        assert_eq!(events.try_recv().unwrap(), Event::Update(two));
+    }
+
+    /// A set whose fragments stop coming is dropped after the patience, and the document hears it must catch up; the
+    /// agent's answers for fragments that aren't a change's last aren't the app's.
+    #[test]
+    fn a_set_that_stops_coming_is_a_gap_and_inner_answers_are_not_the_apps() {
+        let (shared, _listener) = shared();
+        let (events_tx, events) = mpsc::channel();
+        lock(&shared.routes).insert(7, events_tx);
+        let f = split(&vec![9u8; 5000], 1000).unwrap();
+        shared.on_message(Message::Binary(encode_binary(UPDATE, 7, &f[0]).into()));
+        shared.expire();
+        assert!(events.try_recv().is_err(), "within the patience");
+        set_fragment_patience_for_tests(Duration::ZERO);
+        shared.expire();
+        set_fragment_patience_for_tests(craft_cloud_api::fragments::PATIENCE);
+        assert_eq!(events.try_recv().unwrap(), Event::Gap);
+        // The rest alone is never a change.
+        for frame in &f[1..] {
+            shared.on_message(Message::Binary(encode_binary(UPDATE, 7, frame).into()));
+        }
+        assert!(events.try_recv().is_err());
+        lock(&shared.inner_seqs).extend([(7, 1), (7, 2)]);
+        for seq in 1..=3 {
+            shared.on_message(Message::Text(serde_json::to_string(&DocsEvent::Ack { id: 7, seq }).unwrap().into()));
+        }
+        assert_eq!(events.try_recv().unwrap(), Event::Acked(3));
         assert!(events.try_recv().is_err());
     }
 

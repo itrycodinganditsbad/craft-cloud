@@ -14,7 +14,7 @@ pub mod live;
 pub mod manifest;
 pub mod ops;
 
-pub use craft_cloud_api::{ids, limits, local, name};
+pub use craft_cloud_api::{fragments, ids, limits, local, name};
 
 pub use conflict::{ConflictStamp, conflict_name};
 pub use hash::{BlobKind, ChunkId, FileHash, HexIdError, ManifestId};
