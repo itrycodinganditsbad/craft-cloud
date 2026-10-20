@@ -407,6 +407,33 @@ async fn a_sign_out_that_cant_forget_the_account_stays_signed_out() {
     let _ = running.stop().await;
 }
 
+/// Whoever finds the local API up finds `status.json` saying the loop runs (a second `run`, then `status`, relies on
+/// it), even when another program holds the old `status.json` for a moment as the loop starts: the first status is
+/// on disk before the API answers.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn once_the_local_api_is_up_status_json_says_the_loop_runs() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    std::fs::create_dir_all(data.path()).unwrap();
+    // A status an agent left long ago, held (for reading only, no delete sharing) for the first second.
+    let file = data.path().join("status.json");
+    std::fs::write(&file, b"{}").unwrap();
+    let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(&file).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(1));
+        drop(held);
+    });
+    let running = Running::start(&data);
+    api_file(data.path()).await;
+    let status = data.load_status();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    assert!(matches!(&status, Ok(Some(s)) if s.running(now)), "{status:?}");
+    release.join().unwrap();
+    let _ = running.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_starts_signed_out_and_signs_in_and_out_through_the_local_api() {
     let server = server().await;

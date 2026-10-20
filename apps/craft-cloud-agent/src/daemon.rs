@@ -457,14 +457,20 @@ impl StatusWriter {
     /// Has `status` written (soon, on the thread).
     fn write(&self, status: LoopStatus) {
         if self.thread.is_none() {
-            if let Err(e) = self.data.save_status(&status) {
-                crate::runlog::note(format_args!("can't write the status file: {e}"));
-                self.handover().failed = true;
-            }
+            self.write_now(&status);
             return;
         }
         self.handover().next = Some(status);
         self.shared.1.notify_one();
+    }
+
+    /// Writes `status` in the caller, before returning. Only while the thread has nothing to write (at the start), so
+    /// the two never race.
+    fn write_now(&self, status: &LoopStatus) {
+        if let Err(e) = self.data.save_status(status) {
+            crate::runlog::note(format_args!("can't write the status file: {e}"));
+            self.handover().failed = true;
+        }
     }
 
     /// Whether a write failed since the last call.
@@ -559,6 +565,22 @@ impl Status {
     /// A failed write is reported once per failure and tried again next time; it never stops the loop. The write
     /// itself happens on the status thread ([`StatusWriter`]).
     fn write(&mut self, state: LoopState, waiting_for_approval: bool, force: bool) {
+        self.write_as(state, waiting_for_approval, force, false);
+    }
+
+    /// [`Status::write`], on disk before this returns: for the first status, written before the local API answers
+    /// anyone (who may run `status` next and must find the loop running).
+    fn write_now(&mut self, state: LoopState) {
+        self.write_as(state, false, true, true);
+    }
+
+    /// Writes what still waits, and stops the status thread: the loop's last status is on disk before the loop lets
+    /// go of the data folder (a `run` started next must never have its status overwritten by this one's).
+    fn finish(self) {
+        drop(self);
+    }
+
+    fn write_as(&mut self, state: LoopState, waiting_for_approval: bool, force: bool, now_on_disk: bool) {
         if self.writer.take_failed() {
             self.last_written = None;
         }
@@ -590,7 +612,11 @@ impl Status {
         }
         // Tried again at the next beat either way, never in a hot loop.
         self.next_beat = now.saturating_add(u64::try_from(self.heartbeat.as_millis()).unwrap_or(u64::MAX));
-        self.writer.write(status.clone());
+        if now_on_disk {
+            self.writer.write_now(&status);
+        } else {
+            self.writer.write(status.clone());
+        }
         self.last_written = Some(status);
     }
 }
@@ -616,8 +642,6 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
     });
     let control = Control::new(commands_tx).with_autostart(autostart_roots, data.path());
     control.refresh_autostart().await;
-    let api = LocalApi::start(data, control.clone()).await?;
-    say(out, &format!("craft-cloud-agent: local API on 127.0.0.1:{} (for the Craft Cloud app and the other Craft apps)", api.port()));
     let mut status = Status {
         writer: StatusWriter::start(data),
         start: Instant::now(),
@@ -631,6 +655,22 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
         last_synced_ms: None,
         control: Some(control.clone()),
     };
+    // The first status is on disk before the local API answers: whoever finds the API up (the app, `status`, a second
+    // `run`) also finds the loop running. (The loop says what it does next as soon as it knows.)
+    status.write_now(match data.load_account() {
+        Ok(Some(_)) => LoopState::Idle,
+        Ok(None) => LoopState::SignedOut,
+        Err(e) => LoopState::Paused { reason: e.to_string(), next_check_ms: None },
+    });
+    let api = match LocalApi::start(data, control.clone()).await {
+        Ok(api) => api,
+        Err(e) => {
+            // No loop after all: `status` mustn't think one runs.
+            status.write_now(LoopState::Stopped);
+            return Err(e);
+        }
+    };
+    say(out, &format!("craft-cloud-agent: local API on 127.0.0.1:{} (for the Craft Cloud app and the other Craft apps)", api.port()));
     let mut stops = 0;
     let mut stop_open = true;
     // A sign-out revoked the device but couldn't remove the account file: the dead account is never used again.
@@ -1057,6 +1097,8 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             }
         }
     };
+    // Its last status (`Stopped`) on disk before the API goes and the data folder is let go of.
+    status.finish();
     api.stop().await;
     drop(data_lock);
     say(out, "stopped");
