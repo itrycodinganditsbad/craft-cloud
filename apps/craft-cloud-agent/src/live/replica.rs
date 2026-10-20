@@ -909,7 +909,9 @@ impl Doc {
 
     /// The answer to the server's `compact`, once this machine holds every update up to `upto`: a snapshot of exactly
     /// those, or nothing (something waits, it dropped a row at or below `upto`, or the version there isn't known;
-    /// another device is asked). The question is dropped either way once it can be answered.
+    /// another device is asked). The question is dropped either way once it can be answered, unless the copy is far
+    /// past the version asked: then it is kept, and tried again at the next ack, or when the document is refused as
+    /// full.
     fn try_compact(&mut self) -> Vec<ClientFrame> {
         let Some(upto) = self.compact_ask else { return Vec::new() };
         if self.sub != Sub::Live || self.have.upto < upto {
@@ -950,6 +952,9 @@ impl Doc {
             }
         }
         if past > MAX_CHECKOUT_OPS {
+            // Kept: answered once its own change is acked (it is in the log then), or once the document is refused
+            // as full (its own operations don't count then); the server may ask another device meanwhile.
+            self.compact_ask = Some(upto);
             return Vec::new();
         }
         match self.body.copy().snapshot_at(&version) {
@@ -3062,7 +3067,9 @@ impl<S: DocStore> Replica<S> {
                     |id| format!("the live document {id} is full on the server for now ({message}); new changes stay on this machine"),
                 );
                 doc.say(&mut self.notes, line);
-                Ok(Vec::new())
+                // A compaction asked of it that it left for later (far past the version asked) is answered now: the
+                // document gets below its cap only so, and this may be the only device there is.
+                Ok(doc.try_compact())
             }
             // The update at `after` isn't the one this machine has there: the log was restored (its epoch reset hasn't
             // run). From the start, and the whole document up again.
@@ -5193,14 +5200,15 @@ mod tests {
         let paste = sliced(&app_doc, &"a".repeat(80 * 1024));
         let sent = r.local_update(id, &paste).unwrap();
         assert!(r.on_frame(ServerFrame::Compact { doc: id, upto: 1 }).unwrap().is_empty(), "not answered while it may be acked");
+        // Refused as full: the ask it kept is answered then (no other ask comes: nothing more is stored).
+        let mut frames = Vec::new();
         for f in &sent {
             if let ClientFrame::Update { client_seq, .. } = f {
                 let full =
                     ServerFrame::Error { code: codes::QUOTA_EXCEEDED.into(), message: "full".into(), doc: Some(id), client_seq: Some(*client_seq) };
-                r.on_frame(full).unwrap();
+                frames.extend(r.on_frame(full).unwrap());
             }
         }
-        let frames = r.on_frame(ServerFrame::Compact { doc: id, upto: 1 }).unwrap();
         let manifest = frames
             .iter()
             .find_map(|f| if let ClientFrame::Snapshot { upto: 1, manifest, .. } = f { Some(*manifest) } else { None })
