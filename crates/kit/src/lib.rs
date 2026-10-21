@@ -34,20 +34,19 @@ pub use mapping::{Attrs, Mappings, OpaqueSource, RemotePatch, Span, TableSource,
 pub use opaque::Opaque;
 pub use props::{Props, PropsRead};
 pub use session::{
-    Agent, Badge, CATCH_UP_EVERY, LiveDocument, MAX_BACKOFF, MAX_QUEUE_BYTES, MAX_UNDO_TEXT_BYTES, NotLive, Open, PRESENCE_EVERY, PRESENCE_TTL, Peer,
-    Polled, REPLACE_WITH_FILE, ReadOnly, SavePoint, SaveRecord, Session, Status, UndoKind,
+    Agent, Badge, CATCH_UP_EVERY, LiveDocument, MAX_BACKOFF, MAX_CHANGE_BYTES, MAX_QUEUE_BYTES, MAX_UNDO_TEXT_BYTES, NotLive, Open, PRESENCE_EVERY,
+    PRESENCE_TTL, Peer, Polled, REPLACE_WITH_FILE, ReadOnly, SavePoint, SaveRecord, Session, Status, UndoKind,
 };
 pub use table::{TableTouch, TableView};
 pub use text::RichText;
 pub use timeline::{ItemRead, TimelineTouch, TimelineView};
 pub use tree::{TreeTouch, TreeView};
 pub use value::{AgentBlobs, BlobStore, ChunkRef, ElemId, MAX_VALUE_BYTES, MemoryBlobs, OpaqueCodec, Value};
-pub use writer::{OP_OVERHEAD, SPLIT_BYTES};
 
 /// For an app's adapter tests: the fake agent of `craft-cloud-app` (feature `fake`).
 #[cfg(feature = "fake")]
 pub mod testing {
-    pub use craft_cloud_app::fake::{Fake, Hub};
+    pub use craft_cloud_app::fake::{Fake, FragmentFaults, Hub, SLEEP_TICKS};
 }
 
 /// For the kit's own tests and simulations: the mappings without a session.
@@ -74,17 +73,20 @@ pub mod raw {
     }
 
     impl Replica {
-        /// Writes `old` → `new`; the updates (each commit's export) and how many commits.
+        /// Writes `old` → `new`; the update (none if nothing changed, else one, whole) and how many commits (0 or 1).
         pub fn write<D: LiveDocument>(&mut self, old: Option<&D::Doc>, new: &D::Doc) -> Result<(Vec<Vec<u8>>, usize), KitError> {
             let mut w = Writer::new(&self.doc, LOCAL_ORIGIN);
             write_diff::<D>(&mut w, old, new, &mut self.ctx)?;
             w.finish()
         }
 
-        /// Imports updates and indexes the trees again.
+        /// Imports updates (a bundle's slices one after the other) and indexes the trees again.
         pub fn import(&mut self, updates: &[Vec<u8>], trees: &[&str]) -> Result<(), KitError> {
             for u in updates {
-                self.doc.import(u)?;
+                let parts = craft_cloud_api::fragments::parts(u).ok_or_else(|| KitError::Invalid("a bundle cut short".into()))?;
+                for part in parts {
+                    self.doc.import(part)?;
+                }
             }
             self.reindex(trees);
             Ok(())

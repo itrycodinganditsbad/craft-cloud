@@ -1,6 +1,5 @@
 //! Undo while live, two sessions on the fake agent: undo takes back only this machine's change (the other's edit to
-//! the same element stays), redo puts it back, a group is one step, and a change split into several commits is one
-//! step.
+//! the same element stays), redo puts it back, a group is one step, and a change sent in fragments is one step.
 
 mod common;
 mod model;
@@ -59,8 +58,7 @@ fn undo_takes_back_only_this_machines_change_and_redo_puts_it_back() {
 fn undo_after_a_remote_edit_to_the_same_element_keeps_the_remote_edit() {
     let hub = Hub::new();
     let (x, y) = (craft_cloud_kit::ElemId::new(), craft_cloud_kit::ElemId::new());
-    let layers =
-        vec![Arc::new(Node { id: x, name: "x".into(), children: Vec::new() }), Arc::new(Node { id: y, name: "y".into(), children: Vec::new() })];
+    let layers = vec![Arc::new(Node::leaf(x, "x")), Arc::new(Node::leaf(y, "y"))];
     let (mut a, mut b, _pc, _laptop) = pair(&hub, Doc { layers: Arc::new(layers), ..Doc::empty() });
     change(&mut a, |d| Doc { layers: Arc::new(model::rename(&d.layers, x, "renamed")), ..d.clone() }).unwrap();
     until(&mut [&mut a, &mut b], "renamed on both", |s| s.iter().all(|s| model::find(&s.model().layers, x).is_some_and(|n| n.name == "renamed")));
@@ -77,11 +75,11 @@ fn undo_after_a_remote_edit_to_the_same_element_keeps_the_remote_edit() {
     });
 }
 
-/// Typing grouped into one step; a big change (here 1.25 MB of cells, split into several commits under the cap) is
-/// one step too. (Loro's undo of one big run of text takes time growing with its square, about 10 s for 1 MB: the
+/// Typing grouped into one step; a big change (here 1.25 MB of cells: one update, in fragments past the 1 MiB frame)
+/// is one step too. (Loro's undo of one big run of text takes time growing with its square, about 10 s for 1 MB: the
 /// report's concerns, so the big change here is cells.)
 #[test]
-fn a_group_and_a_split_change_are_one_step_each() {
+fn a_group_and_a_fragmented_change_are_one_step_each() {
     let hub = Hub::new();
     let (mut a, mut b, _pc, _laptop) = pair(&hub, Doc { story: Arc::new(RichText::plain("")), ..Doc::empty() });
     a.group(|s| {
@@ -105,7 +103,7 @@ fn a_group_and_a_split_change_are_one_step_each() {
     let sent = hub.updates("u.kitdemo");
     change(&mut a, big).unwrap();
     until(&mut [&mut a, &mut b], "the big change arrived", |s| s.iter().all(|s| s.model().grid.cells.len() == 5));
-    assert!(hub.updates("u.kitdemo") - sent >= 3, "split into several updates");
+    assert!(hub.updates("u.kitdemo") - sent >= 2, "one update over the frame limit: in fragments");
     assert!(a.undo().unwrap(), "the big change");
     until(&mut [&mut a, &mut b], "the big change undone in one step", |s| {
         s.iter().all(|s| s.model().grid.rows.is_empty() && story(s) == "one two three four")
@@ -151,6 +149,103 @@ fn an_undo_during_a_gesture_waits_for_its_end() {
     assert_eq!(*a.model().title, "remote");
     assert_eq!(a.model().texts(), vec!["x", "mine"]);
     until(&mut [&mut a, &mut b], "the same on both", |s| s.iter().all(|s| *s.model().title == "remote" && s.model().texts() == ["x", "mine"]));
+}
+
+fn layer_text(s: &Session<TestApp>) -> String {
+    s.model().layers.first().map(|n| n.text.text.clone()).unwrap_or_default()
+}
+
+fn type_in_layer(d: &Doc, at: usize, s: &str) -> Doc {
+    let Some(id) = d.layers.first().map(|n| n.id) else { return d.clone() };
+    Doc { layers: Arc::new(model::update(&d.layers, id, &|n| Node { text: model::type_at(&n.text, at, s), ..n.clone() })), ..d.clone() }
+}
+
+/// Typing in one layer's story on both machines at once (a shape's text box), keystroke by keystroke, then one undoes:
+/// only its own typing goes, on both machines; the other's stays where it was typed.
+#[test]
+fn typing_in_one_nodes_story_on_both_then_one_undoes() {
+    let hub = Hub::new();
+    let start = Doc {
+        layers: Arc::new(vec![Arc::new(Node { text: RichText::plain("[]"), ..Node::leaf(craft_cloud_kit::ElemId::new(), "box") })]),
+        ..Doc::empty()
+    };
+    let (mut a, mut b, _pc, _laptop) = pair(&hub, start);
+    until(&mut [&mut a, &mut b], "the laptop has the box", |s| s.iter().all(|s| layer_text(s) == "[]"));
+    // The pc types "abc" inside the brackets, the laptop "XY" after them, each keystroke a step, interleaved.
+    for (k, (pc, laptop)) in [("a", Some("X")), ("b", Some("Y")), ("c", None)].into_iter().enumerate() {
+        change(&mut a, |d| type_in_layer(d, 1 + k, pc)).unwrap();
+        if let Some(t) = laptop {
+            let at = layer_text(&b).chars().count();
+            change(&mut b, |d| type_in_layer(d, at, t)).unwrap();
+        }
+        a.poll();
+        b.poll();
+    }
+    until(&mut [&mut a, &mut b], "both have both", |s| s.iter().all(|s| layer_text(s) == "[abc]XY"));
+    for _ in 0..3 {
+        assert!(a.undo().unwrap());
+    }
+    until(&mut [&mut a, &mut b], "the pc's typing went on both", |s| s.iter().all(|s| layer_text(s) == "[]XY"));
+    assert!(b.undo().unwrap());
+    until(&mut [&mut a, &mut b], "the laptop's last keystroke went", |s| s.iter().all(|s| layer_text(s) == "[]X"));
+    for _ in 0..3 {
+        assert!(a.redo().unwrap());
+    }
+    until(&mut [&mut a, &mut b], "the pc's typing back", |s| s.iter().all(|s| layer_text(s) == "[abc]X"));
+}
+
+/// Loro's undo of a deletion makes the nodes again under new tree IDs (the old ones stay deleted, carrying the same
+/// element IDs). A layer deleted on the pc while the laptop, offline, renames it, then the pc's undo: both machines
+/// end with the same model, which is what their documents hold (the revived copy wins on both; the rename, made on the
+/// node that stays deleted, is lost, the same on both).
+#[test]
+fn undoing_a_delete_while_the_other_edits_ends_the_same_on_both() {
+    let hub = Hub::new();
+    let id = craft_cloud_kit::ElemId::new();
+    let start = Doc {
+        layers: Arc::new(vec![Arc::new(Node::leaf(id, "before")), Arc::new(Node::leaf(craft_cloud_kit::ElemId::new(), "other"))]),
+        ..Doc::empty()
+    };
+    let (mut a, mut b, _pc, laptop) = pair(&hub, start);
+    until(&mut [&mut a, &mut b], "in step", |s| s.iter().all(|s| s.model().layers.len() == 2));
+    laptop.set_online(false);
+    change(&mut a, |d| Doc { layers: Arc::new(model::remove(&d.layers, id).0), ..d.clone() }).unwrap();
+    change(&mut b, |d| Doc { layers: Arc::new(model::rename(&d.layers, id, "renamed offline")), ..d.clone() }).unwrap();
+    assert!(a.undo().unwrap(), "the delete is undone");
+    laptop.set_online(true);
+    until(&mut [&mut a, &mut b], "the same on both", |s| {
+        let (x, y) = (&s[0].model().layers, &s[1].model().layers);
+        x == y && x.len() == 2
+    });
+    // And each model is what its document holds.
+    for s in [&a, &b] {
+        let mut r = craft_cloud_kit::raw::Replica::default();
+        r.import(&[s.snapshot().unwrap()], &["layers"]).unwrap();
+        let back = r.read::<TestApp>(&Arc::new(Doc::empty())).unwrap();
+        assert_eq!(model::flatten(&back.layers), model::flatten(&s.model().layers));
+        assert_eq!(model::find(&back.layers, id).map(|n| n.name.clone()), model::find(&s.model().layers, id).map(|n| n.name.clone()));
+    }
+}
+
+/// A change the app makes by itself (`background_change`: an upload that finished) goes to the other machine but is
+/// never an undo step: undo takes back the user's change before it and leaves it.
+#[test]
+fn a_background_change_is_sent_but_never_undone() {
+    let hub = Hub::new();
+    let (mut a, mut b, _pc, _laptop) = pair(&hub, Doc { story: Arc::new(RichText::plain("s")), ..Doc::empty() });
+    change(&mut a, |d| type_end(d, "!")).unwrap();
+    let old = a.model().clone();
+    let new = Arc::new(Doc { settings: Arc::new(vec![7, 7]), ..(*old).clone() });
+    a.background_change(&old, &new).unwrap();
+    until(&mut [&mut a, &mut b], "the laptop has both", |s| s.iter().all(|s| story(s) == "s!" && *s.model().settings == vec![7, 7]));
+    assert!(a.undo().unwrap());
+    until(&mut [&mut a, &mut b], "the typing went, the background change stayed", |s| {
+        s.iter().all(|s| story(s) == "s" && *s.model().settings == vec![7, 7])
+    });
+    assert!(!a.undo().unwrap(), "the background change isn't a step");
+    // A stale `old` is refused, as for a local change.
+    let stale = Arc::new(Doc::empty());
+    assert_eq!(a.background_change(&stale, &new), Err(craft_cloud_kit::KitError::Stale));
 }
 
 /// The story with `paste` added at its end, as one change (plain text: no runs to move).

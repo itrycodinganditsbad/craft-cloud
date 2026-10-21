@@ -20,6 +20,8 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use craft_cloud_api::fragments::parts;
+use craft_cloud_api::local::LOCAL_API_FRAGMENTS;
 use craft_cloud_app::Client;
 use craft_cloud_app::live::{Document, Documents, Event, NotLiveReason, OpenOptions, Opened, Waker};
 use loro::event::{Diff, DiffEvent};
@@ -41,6 +43,15 @@ const FIRST_BACKOFF: Duration = Duration::from_millis(200);
 /// Presence is sent again this often while set, and a peer's is dropped after this long without one.
 pub const PRESENCE_EVERY: Duration = Duration::from_secs(3);
 pub const PRESENCE_TTL: Duration = Duration::from_secs(10);
+/// A presence frame names the sender's agent version after its peer: this mark, then the version (u32, big-endian),
+/// then the app's bytes. A kit from before versions sends the app's bytes right after the peer.
+const PRESENCE_MARK: [u8; 4] = *b"ccp2";
+/// The peer, the mark and the version before the app's bytes in a presence frame.
+const PRESENCE_HEADER: usize = 16;
+/// The largest change the kit sends (one update, in fragments past 1 MiB): 8 MiB, half a document's log cap on the
+/// server, so the change after it still fits once the log is compacted. A change over it can't be live: the session
+/// stops (the model stays editable; save it to the file).
+pub const MAX_CHANGE_BYTES: usize = craft_cloud_api::fragments::MAX_WHOLE_BYTES;
 /// Undo steps kept.
 const UNDO_STEPS: usize = 500;
 /// The most text (inserted and deleted, in bytes) one step may change and still be undone while live. Loro's undo of a
@@ -105,6 +116,9 @@ impl Agent {
 pub enum NotLive {
     /// Craft Cloud isn't running here (or refused): the message says why.
     NoAgent(String),
+    /// Craft Cloud runs here, but is older than this app's live documents: show "update Craft Cloud on this
+    /// computer to edit live" ([`craft_cloud_app::live::AGENT_TOO_OLD`]).
+    AgentTooOld,
     /// The agent's reason (offline before the first live open, not synced yet, …).
     Reason(NotLiveReason),
 }
@@ -150,6 +164,13 @@ pub struct Status {
     /// The file on disk wasn't saved by a Craft app from this document (edited outside): the app may bring it in as a
     /// local change, or keep the live content.
     pub changed_outside: bool,
+    /// Another machine with the document open runs an older Craft Cloud ([`Peer::older`]): show "<machine> runs an
+    /// older Craft Cloud; update it" (its name is in its presence, as the app sends it).
+    pub older_peer: bool,
+    /// Changes from other machines that didn't read here (a bundle cut short, or one Loro refused), in this session:
+    /// never applied, each also said in `error`. The model may lack them; opening the document again brings what the
+    /// agent has.
+    pub unread: u64,
     /// The last error, for the app to show.
     pub error: Option<String>,
 }
@@ -267,6 +288,30 @@ struct Kept {
 pub struct Peer {
     pub bytes: Vec<u8>,
     pub seen: Instant,
+    /// The local API version of the agent it runs on, as its presence says; `None` from an app on a Craft Cloud from
+    /// before versions in presence (older than this one).
+    pub agent_api: Option<u32>,
+}
+
+impl Peer {
+    /// Whether it runs on a Craft Cloud too old for changes in fragments: its machine should update it (it may lack
+    /// this machine's big changes). Show "<machine> runs an older Craft Cloud; update it".
+    pub fn older(&self) -> bool {
+        self.agent_api.is_none_or(|api| api < LOCAL_API_FRAGMENTS)
+    }
+}
+
+/// A presence frame's peer, its sender's agent version (none from a kit before versions) and the app's bytes.
+fn read_presence(frame: &[u8]) -> Option<(u64, Option<u32>, &[u8])> {
+    let (peer, rest) = frame.split_first_chunk::<8>()?;
+    let peer = u64::from_be_bytes(*peer);
+    match rest.split_first_chunk::<4>() {
+        Some((mark, after)) if *mark == PRESENCE_MARK => {
+            let (api, bytes) = after.split_first_chunk::<4>()?;
+            Some((peer, Some(u32::from_be_bytes(*api)), bytes))
+        }
+        _ => Some((peer, None, rest)),
+    }
 }
 
 /// One change waiting for the agent.
@@ -285,8 +330,13 @@ struct Raw {
     nodes: Vec<TreeID>,
     keys: Vec<String>,
     tree: bool,
-    /// A text's delta (the text root's own).
+    /// A text's delta (the text root's own, or a nested story's).
     text: Option<Vec<loro::TextDelta>>,
+    /// The deepest tree node on the path, and the keys after it (a story nested in a node: `["text"]`).
+    node: Option<TreeID>,
+    under_node: Vec<String>,
+    /// The keys after the root's own (a story in a root table's map cell: `["<row>:<col>", "text"]`).
+    under_root: Vec<String>,
 }
 
 #[derive(Default)]
@@ -317,7 +367,7 @@ pub(crate) struct Ctx {
 /// the agent hears it closed before the connection ends.
 struct Link {
     doc: Document,
-    _docs: Documents,
+    docs: Documents,
 }
 
 /// Why a reopen didn't attach.
@@ -428,7 +478,7 @@ pub(crate) fn write_diff<D: LiveDocument>(w: &mut Writer<'_>, old: Option<&D::Do
                     _ => None,
                 };
                 let index = ctx.trees.entry((*key).to_owned()).or_default();
-                crate::tree::write(w, key, o, n.as_ref(), index)?;
+                crate::tree::write(w, key, o, n.as_ref(), index, &mut ctx.styles)?;
             }
             Part::Text(n) => {
                 let o = match old_part {
@@ -442,14 +492,14 @@ pub(crate) fn write_diff<D: LiveDocument>(w: &mut Writer<'_>, old: Option<&D::Do
                     Some(Part::Table(o)) => Some(o.as_ref()),
                     _ => None,
                 };
-                crate::table::write(w, key, o, n.as_ref())?;
+                crate::table::write(w, key, o, n.as_ref(), &mut ctx.styles)?;
             }
             Part::Timeline(n) => {
                 let o = match old_part {
                     Some(Part::Timeline(o)) => Some(o.as_ref()),
                     _ => None,
                 };
-                crate::timeline::write(w, key, o, n.as_ref())?;
+                crate::timeline::write(w, key, o, n.as_ref(), &mut ctx.styles)?;
             }
             Part::Opaque(n) => {
                 let o = match old_part {
@@ -501,6 +551,9 @@ impl<D: LiveDocument> Session<D> {
         };
         let docs = match client.documents() {
             Ok(d) => d,
+            Err(craft_cloud_app::Error::Refused { code, .. }) if code == craft_cloud_api::local::codes::AGENT_TOO_OLD => {
+                return Ok(Open::NotLive(NotLive::AgentTooOld));
+            }
             Err(e) => return not_running(e),
         };
         let file_hash = file_bytes.map(|b| *blake3::hash(b).as_bytes());
@@ -529,7 +582,7 @@ impl<D: LiveDocument> Session<D> {
         // bytes the document was imported from are no edit either.
         session.status.changed_outside =
             snapshot.is_none() && document.changed_outside() == Some(true) && file_hash.is_some_and(|h| import_hash(&session.doc) != Some(hex(&h)));
-        session.attach(Link { _docs: docs, doc: document });
+        session.attach(Link { docs, doc: document });
         Ok(Open::Live(Box::new(session)))
     }
 
@@ -559,9 +612,17 @@ impl<D: LiveDocument> Session<D> {
         doc.import(state.0)?;
         // The updates that are part of the state.
         let mut unread = None;
+        let mut unread_count = 0;
         for update in state.1 {
-            if let Err(e) = doc.import(update) {
+            // (A bundle that doesn't read is said and counted, never taken as an empty change.)
+            let Some(slices) = parts(update) else {
+                unread = Some("a change from another machine doesn't read (a bundle cut short)".to_owned());
+                unread_count += 1;
+                continue;
+            };
+            if let Err(e) = import_slices(&doc, &slices) {
                 unread = Some(format!("a change from another machine doesn't read: {e}"));
+                unread_count += 1;
             }
         }
         let collector = Arc::new(Mutex::new(Collector::default()));
@@ -609,6 +670,7 @@ impl<D: LiveDocument> Session<D> {
         session.reindex_trees();
         session.check_schema();
         session.status.error = unread;
+        session.status.unread = unread_count;
         if !ours {
             session.rebuild(Touched::everything())?;
         }
@@ -644,7 +706,7 @@ impl<D: LiveDocument> Session<D> {
         // random and never handed out, so whatever the agent has under it is this session's.)
         let ours = self.doc.peer_id();
         let held = std::iter::once(link.doc.state())
-            .chain(link.doc.state_updates().iter().map(Vec::as_slice))
+            .chain(link.doc.state_updates().iter().flat_map(|u| parts(u).unwrap_or_default()))
             .filter_map(|bytes| loro::LoroDoc::decode_import_blob_meta(bytes, false).ok()?.partial_end_vv.get(&ours).copied())
             .max()
             .unwrap_or(0);
@@ -751,6 +813,57 @@ impl<D: LiveDocument> Session<D> {
             }
             Err(e) => {
                 // What was written stays (and goes out); the model is built again from the document, so they agree.
+                if self.doc.oplog_vv() != before {
+                    self.reindex_trees();
+                    let _ = self.rebuild(Touched::everything());
+                }
+                self.status.error = Some(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    /// A change the app makes by itself rather than the user (a media upload that finished and now has its chunk
+    /// reference, bytes read back into the model): written and sent like [`Session::local_change`], with the same
+    /// rules for `old`, but never an undo step, so undo never takes it back.
+    pub fn background_change(&mut self, old: &Arc<D::Doc>, new: &Arc<D::Doc>) -> Result<(), KitError> {
+        if let Some(ro) = &self.status.read_only {
+            return Err(KitError::ReadOnly { app: ro.app.clone(), version: ro.version });
+        }
+        if self.model_stale {
+            return Err(KitError::ModelStale);
+        }
+        if !Arc::ptr_eq(old, &self.model) {
+            return Err(KitError::Stale);
+        }
+        if Arc::ptr_eq(old, new) {
+            return Ok(());
+        }
+        if self.outbox_bytes >= MAX_QUEUE_BYTES {
+            self.status.stalled = true;
+            return Err(KitError::Stalled(self.outbox_bytes));
+        }
+        let before = self.doc.oplog_vv();
+        let mut w = Writer::new(&self.doc, KIT_ORIGIN);
+        let wrote = write_diff::<D>(&mut w, Some(old.as_ref()), new.as_ref(), &mut self.ctx);
+        let updates = match w.finish() {
+            Ok((updates, _)) => updates,
+            Err(_) => {
+                let mut rest = Vec::new();
+                let _ = export_since(&self.doc, &before, &mut rest);
+                rest
+            }
+        };
+        if self.doc.oplog_vv() != before {
+            self.changed_since_save = true;
+        }
+        self.queue(updates);
+        match wrote {
+            Ok(()) => {
+                self.model = new.clone();
+                Ok(())
+            }
+            Err(e) => {
                 if self.doc.oplog_vv() != before {
                     self.reindex_trees();
                     let _ = self.rebuild(Touched::everything());
@@ -962,11 +1075,12 @@ impl<D: LiveDocument> Session<D> {
             match event {
                 Event::Update(bytes) => self.incoming.push(bytes),
                 Event::Presence(bytes) => {
-                    if let Some((peer, payload)) = bytes.split_first_chunk::<8>() {
-                        let peer = u64::from_be_bytes(*peer);
-                        if peer != self.doc.peer_id() {
-                            self.peers.insert(peer, Peer { bytes: payload.to_vec(), seen: Instant::now() });
-                        }
+                    if let Some((peer, agent_api, payload)) = read_presence(&bytes)
+                        && peer != self.doc.peer_id()
+                    {
+                        let peer_now = Peer { bytes: payload.to_vec(), seen: Instant::now(), agent_api };
+                        self.status.older_peer |= peer_now.older();
+                        self.peers.insert(peer, peer_now);
                     }
                 }
                 Event::Acked(seq) => {
@@ -1045,7 +1159,7 @@ impl<D: LiveDocument> Session<D> {
                     self.incoming.push(doc.state().to_vec());
                     self.incoming.extend(doc.state_updates().iter().cloned());
                     self.status.error = None;
-                    self.attach(Link { _docs: docs, doc });
+                    self.attach(Link { docs, doc });
                     if let Some(waker) = &self.waker {
                         waker();
                     }
@@ -1119,12 +1233,23 @@ impl<D: LiveDocument> Session<D> {
         // means only an update Loro refuses is lost (the agent checked them all already).
         lock(&self.collector).on = true;
         for bytes in &batch {
-            if let Err(e) = self.doc.import(bytes) {
-                self.status.error = Some(format!("a change from another machine doesn't read: {e}"));
+            // (A bundle's slices one after the other: the model sees them only together, below.)
+            match parts(bytes) {
+                Some(updates) => {
+                    if let Err(e) = import_slices(&self.doc, &updates) {
+                        self.status.error = Some(format!("a change from another machine doesn't read: {e}"));
+                        self.status.unread += 1;
+                    }
+                }
+                None => {
+                    self.status.error = Some("a change from another machine doesn't read (a bundle cut short)".into());
+                    self.status.unread += 1;
+                }
             }
         }
         let raw = std::mem::take(&mut lock(&self.collector).raw);
         lock(&self.collector).on = false;
+        // (Each update is a whole change: one that came in fragments was joined before it got here.)
         let touched = self.classify(raw);
         let was_read_only = self.status.read_only.clone();
         if touched.kit {
@@ -1141,6 +1266,7 @@ impl<D: LiveDocument> Session<D> {
     fn classify(&mut self, raw: Vec<Raw>) -> Touched {
         let mut touched = Touched::default();
         let mut reindex = Vec::new();
+        let mut nested: Vec<(&'static str, TreeID, String, Option<Vec<loro::TextDelta>>)> = Vec::new();
         for r in raw {
             if r.root == ROOT {
                 touched.kit = true;
@@ -1164,7 +1290,20 @@ impl<D: LiveDocument> Session<D> {
                         t.structure = true;
                         reindex.push(key);
                     }
-                    t.nodes.extend(r.nodes.iter().filter_map(|n| self.ctx.trees.get(key).and_then(|i| i.elem_of.get(n)).copied()));
+                    // A node the index doesn't name (deleted, or a second node carrying an element's ID) still names its
+                    // element in its meta: the element is touched.
+                    let tree = self.doc.get_tree(key);
+                    t.nodes.extend(
+                        r.nodes.iter().filter_map(|n| {
+                            self.ctx.trees.get(key).and_then(|i| i.elem_of.get(n)).copied().or_else(|| crate::tree::node_id(&tree, *n))
+                        }),
+                    );
+                    // Inside a node's child container (its story, its table): named once the index is current.
+                    if let Some(tid) = r.node
+                        && !r.under_node.is_empty()
+                    {
+                        nested.push((key, tid, r.under_node.join("/"), r.text.clone()));
+                    }
                 }
                 Kind::Text => {
                     touched.texts.insert(key.to_owned());
@@ -1179,7 +1318,25 @@ impl<D: LiveDocument> Session<D> {
                     match suffix {
                         "rows" => t.rows = true,
                         "cols" => t.columns = true,
-                        _ => t.cells.extend(r.keys.iter().filter_map(|k| parse_cell_key(k))),
+                        _ => {
+                            t.cells.extend(r.keys.iter().filter_map(|k| parse_cell_key(k)));
+                            // A map cell's story: the cell, then the story's key.
+                            if let (Some(cell), Some(story)) = (r.under_root.first().and_then(|k| parse_cell_key(k)), r.under_root.get(1..))
+                                && !story.is_empty()
+                            {
+                                let story = story.join("/");
+                                t.stories.insert((cell.0, cell.1, story.clone()));
+                                if let Some(delta) = r.text.clone() {
+                                    touched
+                                        .cell_text_deltas
+                                        .entry(key.to_owned())
+                                        .or_default()
+                                        .entry((cell.0, cell.1, story))
+                                        .or_default()
+                                        .push(delta);
+                                }
+                            }
+                        }
                     }
                 }
                 Kind::Timeline => {
@@ -1198,12 +1355,26 @@ impl<D: LiveDocument> Session<D> {
             let tree = self.doc.get_tree(key);
             let index = TreeIndex::build(&tree);
             if let Some(t) = touched.trees.get_mut(key) {
-                // Created nodes: their IDs are known only now.
-                for (id, _) in index.tid_of.iter().filter(|(id, _)| !self.ctx.trees.get(key).is_some_and(|old| old.tid_of.contains_key(id))) {
-                    t.nodes.insert(*id);
+                // Created nodes: their IDs are known only now. And an element whose node is another one now (two nodes
+                // came to carry its ID, and the other one wins): its content may be another, so it is touched.
+                let old = self.ctx.trees.get(key);
+                for (id, tid) in &index.tid_of {
+                    if old.and_then(|o| o.tid_of.get(id)) != Some(tid) {
+                        t.nodes.insert(*id);
+                    }
                 }
             }
             self.ctx.trees.insert(key.to_owned(), index);
+        }
+        for (key, tid, story, delta) in nested {
+            let Some(id) = self.ctx.trees.get(key).and_then(|i| i.elem_of.get(&tid)).copied() else { continue };
+            if let Some(t) = touched.trees.get_mut(key) {
+                t.nodes.insert(id);
+                t.stories.insert((id, story.clone()));
+            }
+            if let Some(delta) = delta {
+                touched.node_text_deltas.entry(key.to_owned()).or_default().entry((id, story)).or_default().push(delta);
+            }
         }
         touched
     }
@@ -1262,6 +1433,13 @@ impl<D: LiveDocument> Session<D> {
         }
         let end = self.doc.oplog_vv().get(&self.doc.peer_id()).copied().unwrap_or(0);
         for bytes in updates {
+            if bytes.len() > MAX_CHANGE_BYTES && self.refused.is_none() {
+                // It can never go (nor anything after it, which needs it): the session stops, the model stays.
+                let why =
+                    format!("a change of {} bytes is over what Craft Cloud takes ({MAX_CHANGE_BYTES}); save the document to the file", bytes.len());
+                self.refused = Some(why.clone());
+                self.status.error = Some(why);
+            }
             self.outbox_bytes = self.outbox_bytes.saturating_add(bytes.len());
             self.outbox.push_back(Out { bytes, end, seq: None });
         }
@@ -1311,12 +1489,14 @@ impl<D: LiveDocument> Session<D> {
     }
 
     /// Shows this app's cursor or selection to the document's other machines and apps (the bytes are the app's, at
-    /// most 4 KiB less 8); `None` stops showing it. Sent now and again every [`PRESENCE_EVERY`].
+    /// most 4 KiB less 16); `None` stops showing it. Sent now and again every [`PRESENCE_EVERY`], with this machine's
+    /// agent version ([`Peer::older`] on the others).
     pub fn set_presence(&mut self, bytes: Option<Vec<u8>>) -> Result<(), KitError> {
+        let max = craft_cloud_api::limits::MAX_PRESENCE_BYTES - PRESENCE_HEADER;
         if let Some(b) = &bytes
-            && b.len() + 8 > craft_cloud_api::limits::MAX_PRESENCE_BYTES
+            && b.len() > max
         {
-            return Err(KitError::TooLarge { what: "a presence", len: b.len(), max: craft_cloud_api::limits::MAX_PRESENCE_BYTES - 8 });
+            return Err(KitError::TooLarge { what: "a presence", len: b.len(), max });
         }
         self.presence = bytes;
         self.presence_sent = None;
@@ -1327,11 +1507,14 @@ impl<D: LiveDocument> Session<D> {
     fn keep_presence(&mut self) {
         let now = Instant::now();
         self.peers.retain(|_, p| now.duration_since(p.seen) < PRESENCE_TTL);
+        self.status.older_peer = self.peers.values().any(Peer::older);
         let (Some(link), Some(bytes)) = (&self.link, &self.presence) else { return };
         if self.presence_sent.is_some_and(|at| now.duration_since(at) < PRESENCE_EVERY) {
             return;
         }
         let mut frame = self.doc.peer_id().to_be_bytes().to_vec();
+        frame.extend_from_slice(&PRESENCE_MARK);
+        frame.extend_from_slice(&link.docs.agent_api().to_be_bytes());
         frame.extend_from_slice(bytes);
         if link.doc.presence(&frame).is_ok() {
             self.presence_sent = Some(now);
@@ -1435,10 +1618,64 @@ impl<D: LiveDocument> Session<D> {
         Ok(self.doc.export(loro::ExportMode::Snapshot)?)
     }
 
+    /// For the kit's tests: an update as if it came from the agent (applied at the next poll).
+    #[doc(hidden)]
+    pub fn receive_for_tests(&mut self, update: Vec<u8>) {
+        self.incoming.push(update);
+    }
+
     /// This session's Loro peer.
     pub fn peer(&self) -> u64 {
         self.doc.peer_id()
     }
+}
+
+/// A slice's import this slow means Loro took its slow way: see [`import_slices`]. (The agent's copy takes slices
+/// the same way, with the same threshold: `LiveCopy::import_any_size` in the agent; keep the two alike.)
+const SLOW_SLICE: Duration = Duration::from_millis(50);
+
+/// Imports one change's slices (a bundle's, or the one update) one after the other. Each slice normally goes in in
+/// milliseconds; but with this machine's own edits in the same text concurrent with the change, Loro (in one order
+/// of the two peers) works the text out again from where the edits parted for each slice, so each costs more than the
+/// last and a 1.2 MB paste took minutes. Once a slice is that slow, the rest goes in as one update (joined on a
+/// detached fork, which only takes their operations), which Loro works out once (seconds for a megabyte). Undo is
+/// kept either way. Every slice is read first: one that doesn't read refuses the change whole, nothing of it in.
+/// Past that, the first error is returned; the slices after it are still imported.
+fn import_slices(doc: &LoroDoc, slices: &[&[u8]]) -> Result<(), loro::LoroError> {
+    for slice in slices {
+        LoroDoc::decode_import_blob_meta(slice, true)?;
+    }
+    let mut first_error = None;
+    let mut i = 0;
+    while let Some(slice) = slices.get(i) {
+        let started = Instant::now();
+        if let Err(e) = doc.import(slice) {
+            first_error.get_or_insert(e);
+        }
+        i += 1;
+        let rest = slices.get(i..).unwrap_or_default();
+        if rest.len() >= 2
+            && started.elapsed() > SLOW_SLICE
+            && let Some(one) = joined(doc, rest)
+        {
+            if let Err(e) = doc.import(&one) {
+                first_error.get_or_insert(e);
+            }
+            break;
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// `updates` (which follow on from what `doc` holds) as one update, if they all read.
+fn joined(doc: &LoroDoc, updates: &[&[u8]]) -> Option<Vec<u8>> {
+    let fork = doc.fork();
+    fork.detach();
+    let before = fork.oplog_vv();
+    for u in updates {
+        fork.import(u).ok()?;
+    }
+    fork.export(loro::ExportMode::updates(&before)).ok()
 }
 
 /// Loro's events, noted while the collector is on (an import, an undo).
@@ -1451,10 +1688,22 @@ fn collect(collector: &Mutex<Collector>, event: DiffEvent<'_>) {
         let first = diff.path.first().map(|(id, _)| id).unwrap_or(diff.target);
         let Some(root) = root_name(first) else { continue };
         let mut raw = Raw { root, ..Raw::default() };
-        for (_, index) in diff.path {
+        for (i, (_, index)) in diff.path.iter().enumerate() {
             match index {
-                Index::Node(t) => raw.nodes.push(*t),
-                Index::Key(k) => raw.keys.push(k.to_string()),
+                Index::Node(t) => {
+                    raw.nodes.push(*t);
+                    raw.node = Some(*t);
+                    raw.under_node.clear();
+                }
+                Index::Key(k) => {
+                    raw.keys.push(k.to_string());
+                    if i > 0 {
+                        raw.under_root.push(k.to_string());
+                        if raw.node.is_some() {
+                            raw.under_node.push(k.to_string());
+                        }
+                    }
+                }
                 Index::Seq(_) => {}
             }
         }
@@ -1468,5 +1717,67 @@ fn collect(collector: &Mutex<Collector>, event: DiffEvent<'_>) {
             _ => {}
         }
         c.raw.push(raw);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// A 600 KB paste from another peer into a text this machine edited at the same moment, this machine's peer below
+    /// the sender's (the order Loro is slow in: each slice costs more than the last, a minute for these): a few slices
+    /// go in one by one, then the rest together, in seconds. The text is the paste and the edit, and this machine's
+    /// undo step stays (it takes back only the edit).
+    #[test]
+    fn slices_that_turn_slow_go_in_together() {
+        let base = LoroDoc::new();
+        base.set_peer_id(1).unwrap();
+        base.get_text("t").insert(0, "abc").unwrap();
+        base.commit();
+        let snapshot = base.export(loro::ExportMode::Snapshot).unwrap();
+        let sender = LoroDoc::new();
+        sender.set_peer_id(9).unwrap();
+        sender.import(&snapshot).unwrap();
+        let paste = "p".repeat(600 * 1024);
+        sender.get_text("t").insert(3, &paste).unwrap();
+        sender.commit();
+        let end = sender.oplog_vv().get(&9).copied().unwrap();
+        let mut slices = Vec::new();
+        let mut at = 0;
+        while at < end {
+            let to = (at + craft_cloud_api::fragments::SLICE_OPS).min(end);
+            slices.push(sender.export(loro::ExportMode::updates_in_range(vec![loro::IdSpan::new(9, at, to)])).unwrap());
+            at = to;
+        }
+        let here = new_doc();
+        here.set_peer_id(2).unwrap();
+        here.import(&snapshot).unwrap();
+        let mut undo = new_undo(&here);
+        here.get_text("t").insert(0, "hello ").unwrap();
+        here.commit();
+        let started = Instant::now();
+        import_slices(&here, &slices.iter().map(Vec::as_slice).collect::<Vec<_>>()).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(15), "{:?}", started.elapsed());
+        assert_eq!(here.get_text("t").to_string(), format!("hello abc{paste}"));
+        assert!(undo.undo().unwrap());
+        assert_eq!(here.get_text("t").to_string(), format!("abc{paste}"));
+    }
+
+    /// A change with a slice that doesn't read is refused whole: nothing of its other slices goes in.
+    #[test]
+    fn a_change_with_a_slice_that_does_not_read_goes_in_not_at_all() {
+        let sender = LoroDoc::new();
+        sender.set_peer_id(9).unwrap();
+        sender.get_text("t").insert(0, "abcdef").unwrap();
+        sender.commit();
+        let one = sender.export(loro::ExportMode::updates_in_range(vec![loro::IdSpan::new(9, 0, 3)])).unwrap();
+        let two = sender.export(loro::ExportMode::updates_in_range(vec![loro::IdSpan::new(9, 3, 6)])).unwrap();
+        let here = new_doc();
+        assert!(import_slices(&here, &[one.as_slice(), b"not an update", two.as_slice()]).is_err());
+        assert_eq!(here.get_text("t").to_string(), "", "nothing of it in");
+        import_slices(&here, &[one.as_slice(), two.as_slice()]).unwrap();
+        assert_eq!(here.get_text("t").to_string(), "abcdef");
     }
 }

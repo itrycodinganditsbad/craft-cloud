@@ -56,9 +56,10 @@ use axum::extract::{Extension, State};
 use axum::response::Response;
 use craft_cloud_meta::DeviceAuth;
 use craft_cloud_proto::api::codes;
+use craft_cloud_proto::fragments::{MAX_SETS, MAX_WHOLE_BYTES, SetId, is_bundle, is_fragment, join, parse};
 use craft_cloud_proto::live::{
-    AppName, ClientFrame, DOCUMENT_KIND_PREFIX, DocKind, LIVE_DOCUMENTS_PROTOCOL, MAX_FRAME_BYTES, MAX_SUBSCRIPTIONS, MAX_UPDATE_BYTES,
-    PROTOCOL_MISMATCH, ServerFrame, node_doc, shared_version, update_hash,
+    AppName, ClientFrame, DOCUMENT_KIND_PREFIX, DocKind, LIVE_DOCUMENTS_PROTOCOL, LIVE_FRAGMENTS_PROTOCOL, MAX_FRAME_BYTES, MAX_SUBSCRIPTIONS,
+    MAX_UPDATE_BYTES, PROTOCOL_MISMATCH, ServerFrame, node_doc, shared_version, update_hash,
 };
 use craft_cloud_proto::{DeviceId, DocId, Epoch, ManifestId, NodeId, SpaceId};
 use tokio::sync::broadcast;
@@ -69,6 +70,8 @@ use crate::state::{AppState, Limits};
 
 /// Live connections one device may hold at once (a reconnect may overlap the old connection for a moment).
 pub const MAX_CONNECTIONS_PER_DEVICE: usize = 4;
+/// The most bytes of fragments a connection stages while their sets come (two changes of the largest size).
+pub const MAX_STAGED_BYTES: usize = 2 * MAX_WHOLE_BYTES + 2 * MAX_SETS * craft_cloud_proto::fragments::FRAGMENT_OVERHEAD;
 /// Updates (and creates) a connection may send at once before it is refilled…
 pub const UPDATE_BURST: u32 = 400;
 /// …at this many per second.
@@ -350,6 +353,25 @@ pub struct Session {
     budget: Budget,
     /// The `upto` this session's agent was asked to compact each document at: only that snapshot is taken from it.
     asked: BTreeMap<DocId, u64>,
+    /// The fragments of the agent's changes still coming (protocol [`LIVE_FRAGMENTS_PROTOCOL`]), by document and set,
+    /// with their `client_seq`s: a set goes into the log whole once its last fragment is here, or not at all. A
+    /// connection that ends drops them (none was acked: the agent sends them all again).
+    staged: BTreeMap<(DocId, SetId), Staged>,
+    staged_bytes: usize,
+}
+
+/// A set's fragments staged so far, with their `client_seq`s.
+type Staged = Vec<(u64, Vec<u8>)>;
+
+/// An update refused: why, and the `client_seq`s refused (a set's every fragment).
+type Refusal = Box<(ApiError, Vec<u64>)>;
+
+/// What `update` did with an update: stored (its number, the `compact` to ask for), or staged as a fragment of a set
+/// still coming (no answer yet), or a set stored whole (each fragment's `client_seq` and number).
+enum Stored {
+    One(u64, Option<ServerFrame>),
+    Staged,
+    Set(Vec<(u64, u64)>, Option<ServerFrame>),
 }
 
 impl Drop for Session {
@@ -382,6 +404,8 @@ impl Session {
             dirty: BTreeSet::new(),
             budget,
             asked: BTreeMap::new(),
+            staged: BTreeMap::new(),
+            staged_bytes: 0,
         }
     }
 
@@ -440,10 +464,25 @@ impl Session {
                 Reply::default()
             }
             ClientFrame::Update { doc, client_seq, bytes } => match self.update(doc, client_seq, bytes).await {
-                Ok((seq, compact)) => {
+                Ok(Stored::One(seq, compact)) => {
                     Reply { frames: std::iter::once(ServerFrame::Ack { doc, client_seq, seq }).chain(compact).collect(), close: false }
                 }
-                Err(e) => one(refused(e, Some(doc), Some(client_seq))),
+                Ok(Stored::Staged) => Reply::default(),
+                Ok(Stored::Set(acks, compact)) => Reply {
+                    frames: acks.into_iter().map(|(client_seq, seq)| ServerFrame::Ack { doc, client_seq, seq }).chain(compact).collect(),
+                    close: false,
+                },
+                // (A set refused: every one of its fragments is, so the agent hears it whichever it waits on.)
+                Err(refusal) => {
+                    let (e, seqs) = *refusal;
+                    // A full document is compacted only so: with nothing more stored, no append asks any device again,
+                    // so this refusal does (once per head, and not while another device's ask is out).
+                    let ask = if e.code == codes::QUOTA_EXCEEDED { self.ask_when_full(doc).await } else { None };
+                    Reply {
+                        frames: seqs.into_iter().map(|s| ServerFrame::error(e.code, e.message.clone(), Some(doc), Some(s))).chain(ask).collect(),
+                        close: false,
+                    }
+                }
             },
             // The frames of documents, snapshots and presence are for a connection that speaks them.
             ClientFrame::CreateDocument { doc, .. } | ClientFrame::SubscribeLog { doc, .. } if !self.documents() => {
@@ -528,6 +567,13 @@ impl Session {
     pub fn relay(&self, note: &PresenceNote) -> Option<ServerFrame> {
         (self.documents() && note.from != self.id && self.subscriptions.contains_key(&note.doc))
             .then(|| ServerFrame::Presence { doc: note.doc, bytes: note.bytes.as_ref().clone() })
+    }
+
+    /// A compaction ask of this device for a document refused as full, at its head ([`Session::maybe_compact`]).
+    async fn ask_when_full(&mut self, doc: DocId) -> Option<ServerFrame> {
+        let found = self.state.meta.live_doc(self.space, doc).await.ok().flatten()?;
+        let above = found.bytes.saturating_sub(found.compacted_bytes);
+        self.maybe_compact(doc, found.head, found.base, above)
     }
 
     /// The `compact` to ask this session's agent for, if the log above the snapshot is long (`upto - base` updates,
@@ -635,16 +681,119 @@ impl Session {
         Ok(())
     }
 
-    /// Appends an update; the `compact` to ask for after its ack, if its log is long now.
-    async fn update(&mut self, doc: DocId, client_seq: u64, bytes: Vec<u8>) -> Result<(u64, Option<ServerFrame>), ApiError> {
+    /// Appends an update (or stages a fragment, and appends its set once whole); the `compact` to ask for after the
+    /// acks, if the log is long now. A refusal names the `client_seq`s it refuses.
+    async fn update(&mut self, doc: DocId, client_seq: u64, bytes: Vec<u8>) -> Result<Stored, Refusal> {
+        let one = |e: ApiError| Box::new((e, vec![client_seq]));
         if !self.subscriptions.contains_key(&doc) {
-            return Err(ApiError::not_found("subscribed document"));
+            return Err(one(ApiError::not_found("subscribed document")));
         }
         if bytes.is_empty() || bytes.len() > MAX_UPDATE_BYTES {
-            return Err(ApiError::too_large(format!("an update is 1 to {MAX_UPDATE_BYTES} bytes")));
+            return Err(one(ApiError::too_large(format!("an update is 1 to {MAX_UPDATE_BYTES} bytes"))));
         }
         if !self.budget.spend() {
-            return Err(ApiError::rate_limited("too many updates; send again in a moment", None));
+            return Err(one(ApiError::rate_limited("too many updates; send again in a moment", None)));
+        }
+        // A fragment: staged until its set is whole, then the set goes into the log in one go (and counts against the
+        // document's cap only then), or is refused whole: no device ever gets part of a change from the log.
+        // A connection before protocol 3 (an agent from before whole sets) has its fragments refused: stored one by one,
+        // a set could be stored in part, which the newer agents would keep for good.
+        if self.protocol < LIVE_FRAGMENTS_PROTOCOL && is_fragment(&bytes) {
+            return Err(one(ApiError::invalid("a change in fragments needs a newer Craft Cloud on this computer: update Craft Cloud")));
+        }
+        if is_fragment(&bytes) {
+            let Some((set_id, count, index)) = parse(&bytes).map(|f| (f.set, f.count, f.index)) else {
+                return Err(one(ApiError::invalid("a fragment that doesn't read")));
+            };
+            let key = (doc, set_id);
+            let new_set = !self.staged.contains_key(&key);
+            if self.staged_bytes.saturating_add(bytes.len()) > MAX_STAGED_BYTES || (new_set && self.staged.len() >= MAX_SETS) {
+                return Err(one(ApiError::invalid("too many fragments wait on this connection")));
+            }
+            // Fragments of the set this device has in the log already (a set stored in part before whole sets, or one
+            // whose acks were lost: the agent sends only the rest) count as here: the device numbered the set's
+            // fragments one after the other, so each is found by its number.
+            let mut found = Vec::new();
+            if new_set {
+                let mut below_base = false;
+                // (The set's numbers, from this fragment's: one query for all of them, whatever the count says.)
+                let first = client_seq.saturating_sub(u64::from(index)).max(1);
+                let last = client_seq.saturating_add(u64::from(count).saturating_sub(u64::from(index) + 1));
+                let stored = self.state.meta.live_updates_sent(self.space, doc, self.device, first, last).await.map_err(|e| one(e.into()))?;
+                let mut base = None;
+                for (c, row, b) in stored {
+                    let Some(f) = parse(&b) else { continue };
+                    let at = (client_seq + u64::from(f.index)).checked_sub(u64::from(index));
+                    if f.set != set_id || f.count != count || f.index == index || at != Some(c) || found.iter().any(|(s, _)| *s == c) {
+                        continue;
+                    }
+                    if base.is_none() {
+                        base = Some(self.state.meta.live_doc(self.space, doc).await.map_err(|e| one(e.into()))?.map_or(0, |d| d.base));
+                    }
+                    below_base |= base.is_some_and(|base| row <= base);
+                    found.push((c, b));
+                }
+                // Part of the set is at or below the snapshot's base (a device from before whole sets compacted past
+                // it): stored above it, the rest would be a set no machine ever gets whole. The agent starts this
+                // document over instead: it drops the set and sends its operations up as a push.
+                if below_base {
+                    return Err(one(ApiError::new(
+                        axum::http::StatusCode::GONE,
+                        codes::RESYNC_REQUIRED,
+                        "part of this change is in the document's snapshot, the rest not: start the document over",
+                    )));
+                }
+            }
+            // (What is found counts against the connection's staging too.)
+            let found_bytes: usize = found.iter().map(|(_, b): &(u64, Vec<u8>)| b.len()).sum();
+            if self.staged_bytes.saturating_add(bytes.len()).saturating_add(found_bytes) > MAX_STAGED_BYTES {
+                return Err(one(ApiError::invalid("too many fragments wait on this connection")));
+            }
+            let set = self.staged.entry(key).or_default();
+            for (seq, b) in found {
+                self.staged_bytes += b.len();
+                set.push((seq, b));
+            }
+            if !set.iter().any(|(s, _)| *s == client_seq) {
+                self.staged_bytes += bytes.len();
+                set.push((client_seq, bytes));
+            }
+            let mut indexes: Vec<u16> = set.iter().filter_map(|(_, b)| parse(b).map(|g| g.index)).collect();
+            indexes.sort_unstable();
+            indexes.dedup();
+            if indexes.len() < usize::from(count) {
+                return Ok(Stored::Staged);
+            }
+            let mut set = self.staged.remove(&key).unwrap_or_default();
+            self.staged_bytes = self.staged_bytes.saturating_sub(set.iter().map(|(_, b)| b.len()).sum());
+            set.sort_by_key(|(_, b)| parse(b).map(|g| g.index));
+            set.dedup_by_key(|(_, b)| parse(b).map(|g| g.index));
+            let seqs: Vec<u64> = set.iter().map(|(s, _)| *s).collect();
+            match join(set.iter().map(|(_, b)| b.as_slice())) {
+                None => return Err(Box::new((ApiError::invalid("fragments that don't make the change they name"), seqs))),
+                Some(whole) if whole.len() > MAX_WHOLE_BYTES => {
+                    return Err(Box::new((ApiError::too_large(format!("a change is at most {MAX_WHOLE_BYTES} bytes")), seqs)));
+                }
+                Some(_) => {}
+            }
+            let (state, space, device) = (self.state.clone(), self.space, self.device);
+            let appended = tokio::spawn(async move {
+                let rows: Vec<(u64, &[u8])> = set.iter().map(|(s, b)| (*s, b.as_slice())).collect();
+                let appended = state.meta.append_live_updates_counted(space, doc, device, &rows, state.now_ms()).await?;
+                state.live.publish(space, doc);
+                Ok::<_, ApiError>(appended)
+            })
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "live append task failed");
+                Box::new((ApiError::internal(), seqs.clone()))
+            })?
+            .map_err(|e| Box::new((e, seqs.clone())))?;
+            let compact = match appended.last() {
+                Some(last) if !last.repeat => self.maybe_compact(doc, last.seq, last.base, last.above_bytes),
+                _ => None,
+            };
+            return Ok(Stored::Set(seqs.into_iter().zip(appended.into_iter().map(|a| a.seq)).collect(), compact));
         }
         // Appended and published in a task of its own: a connection that drops meanwhile must not skip the publish of
         // an update that was stored.
@@ -657,12 +806,13 @@ impl Session {
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "live append task failed");
-            ApiError::internal()
-        })??;
+            one(ApiError::internal())
+        })?
+        .map_err(one)?;
         // The device that sent the update that made the log long is asked first: it holds every update up to it once
         // those below have reached it.
         let compact = if appended.repeat { None } else { self.maybe_compact(doc, appended.seq, appended.base, appended.above_bytes) };
-        Ok((appended.seq, compact))
+        Ok(Stored::One(appended.seq, compact))
     }
 
     /// `doc` got an update: if it is subscribed, the next [`Session::pump`]s send what the agent lacks.
@@ -730,6 +880,20 @@ impl Session {
         let (page, full) = self.state.meta.live_page(self.space, doc, sub.sent, PUMP_BYTES, PUMP_PAGE).await?;
         let mut frames = Vec::new();
         for update in page {
+            // An agent on an older protocol can't read a change in fragments or a bundle: it would skip it, and every
+            // later change that builds on it would wait there for good. It is refused the document instead, and says so.
+            if self.protocol < LIVE_FRAGMENTS_PROTOCOL && (is_fragment(&update.bytes) || is_bundle(&update.bytes)) {
+                self.subscriptions.remove(&doc);
+                release(&self.state.live.subscriptions, self.device, 1);
+                self.dirty.remove(&doc);
+                frames.push(ServerFrame::error(
+                    codes::INVALID,
+                    "this live document holds changes this Craft Cloud agent can't read: update Craft Cloud on this computer",
+                    Some(doc),
+                    None,
+                ));
+                return Ok(frames);
+            }
             sub.sent = sub.sent.max(update.seq);
             if sub.catching_up || update.device != self.device {
                 frames.push(ServerFrame::Update { doc, seq: update.seq, bytes: update.bytes, device: update.device });
@@ -1248,6 +1412,188 @@ mod tests {
         let theirs = bo.handle(ClientFrame::CreateDocument { doc: node_doc(b.user.space, node), node, app: app(), snapshot: bos }).await;
         assert_eq!(code(&theirs), Some("not_found"), "another account's file is no file of this one");
         assert_eq!(code(&bo.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await), Some("not_found"), "nor its document");
+    }
+
+    /// On protocol 3 a change's fragments are staged and stored whole: nothing is answered (or stored, or sent to the
+    /// other device) until the last one is here, then each is acked with consecutive numbers and the other device gets
+    /// them all. A set that would start in a full document is refused whole, every fragment named, nothing stored. A
+    /// device on protocol 2 is refused the document once it holds fragments (it can't read them).
+    #[tokio::test]
+    async fn a_change_in_fragments_is_stored_whole_or_refused_whole() {
+        let meta = Meta::open("sqlite::memory:").await.unwrap().with_live_doc_cap(5000);
+        let mut a = Account::with_meta(Default::default(), meta, "ana").await;
+        let (mut pc, pc_auth) = a.session(3).await;
+        let (mut laptop, _) = a.session(3).await;
+        let (mut old, _) = a.session(2).await;
+        let node = a.file(&pc_auth, "big.txt").await;
+        let doc = node_doc(a.user.space, node);
+        let import = a.upload(&[1; 100]).await;
+        pc.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: import }).await;
+        for s in [&mut pc, &mut laptop, &mut old] {
+            s.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
+            drain(s).await;
+        }
+        let change: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        let frames = craft_cloud_proto::fragments::split(&change, 1100).unwrap();
+        assert_eq!(frames.len(), 3);
+        for (i, f) in frames.iter().enumerate().take(2) {
+            let reply = pc.handle(ClientFrame::Update { doc, client_seq: i as u64 + 1, bytes: f.clone() }).await;
+            assert!(reply.frames.is_empty(), "staged: {:?}", reply.frames);
+        }
+        laptop.note(doc);
+        assert!(updates(&drain(&mut laptop).await).is_empty(), "nothing of it in the log yet");
+        let last = pc.handle(ClientFrame::Update { doc, client_seq: 3, bytes: frames[2].clone() }).await;
+        let acks: Vec<(u64, u64)> = last
+            .frames
+            .iter()
+            .filter_map(|f| if let ServerFrame::Ack { client_seq, seq, .. } = f { Some((*client_seq, *seq)) } else { None })
+            .collect();
+        assert_eq!(acks, vec![(1, 1), (2, 2), (3, 3)], "{:?}", last.frames);
+        laptop.note(doc);
+        assert_eq!(updates(&drain(&mut laptop).await), vec![1, 2, 3], "the whole set");
+        old.note(doc);
+        let refused = drain(&mut old).await;
+        assert!(
+            matches!(refused.as_slice(), [ServerFrame::Error { code, message, .. }] if code == "invalid" && message.contains("update Craft Cloud")),
+            "{refused:?}"
+        );
+        // 3000 of the cap's 5000 used: one more set of 3000 crosses it and is stored whole; the next is refused whole.
+        let more = craft_cloud_proto::fragments::split(&[change.clone(), vec![7]].concat(), 1100).unwrap();
+        for (i, f) in more.iter().enumerate() {
+            pc.handle(ClientFrame::Update { doc, client_seq: 10 + i as u64, bytes: f.clone() }).await;
+        }
+        let third = craft_cloud_proto::fragments::split(&[change.clone(), vec![8]].concat(), 1100).unwrap();
+        let mut answers = Vec::new();
+        for (i, f) in third.iter().enumerate() {
+            answers.extend(pc.handle(ClientFrame::Update { doc, client_seq: 20 + i as u64, bytes: f.clone() }).await.frames);
+        }
+        let refused: Vec<u64> = answers
+            .iter()
+            .filter_map(
+                |f| if let ServerFrame::Error { client_seq: Some(s), code, .. } = f { (code == "quota_exceeded").then_some(*s) } else { None },
+            )
+            .collect();
+        assert_eq!(refused, vec![20, 21, 22], "{answers:?}");
+        assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap().head, 6, "nothing of the refused set stored");
+    }
+
+    /// A refusal as full asks the refused device to compact (the document gets below its cap only so, and no append
+    /// asks anyone once nothing more is stored), unless another device's ask is out.
+    #[tokio::test]
+    async fn a_device_refused_as_full_is_asked_to_compact() {
+        let meta = Meta::open("sqlite::memory:").await.unwrap().with_live_doc_cap(5000);
+        let limits = crate::state::Limits { compact_updates: 1, compact_timeout: std::time::Duration::ZERO, ..Default::default() };
+        let mut a = Account::with_meta(limits, meta, "ana").await;
+        let (mut pc, pc_auth) = a.session(3).await;
+        let (mut laptop, _) = a.session(3).await;
+        let node = a.file(&pc_auth, "full.txt").await;
+        let doc = node_doc(a.user.space, node);
+        let import = a.upload(&[1; 100]).await;
+        pc.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: import }).await;
+        for s in [&mut pc, &mut laptop] {
+            s.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
+            drain(s).await;
+        }
+        pc.handle(ClientFrame::Update { doc, client_seq: 1, bytes: vec![1; 4000] }).await;
+        let crossed = pc.handle(ClientFrame::Update { doc, client_seq: 2, bytes: vec![2; 2000] }).await;
+        assert!(crossed.frames.iter().any(|f| matches!(f, ServerFrame::Compact { upto: 2, .. })), "{:?}", crossed.frames);
+        drain(&mut laptop).await;
+        let refused = laptop.handle(ClientFrame::Update { doc, client_seq: 1, bytes: vec![3; 10] }).await;
+        assert!(refused.frames.iter().any(|f| matches!(f, ServerFrame::Error { code, .. } if code == "quota_exceeded")), "{:?}", refused.frames);
+        assert!(refused.frames.iter().any(|f| matches!(f, ServerFrame::Compact { upto: 2, .. })), "asked: {:?}", refused.frames);
+    }
+
+    /// The first part of a set stored alone, then compacted past (a device from before whole sets did): the rest,
+    /// sent now, is refused with `resync_required` (the agent starts the document over and sends the change as a
+    /// push), never stored above the base as a set no machine would get whole.
+    #[tokio::test]
+    async fn the_rest_of_a_set_whose_part_is_below_the_base_is_refused_for_a_start_over() {
+        let mut a = Account::new(Default::default()).await;
+        let (mut pc, pc_auth) = a.session(3).await;
+        let (_laptop, laptop_auth) = a.session(3).await;
+        let node = a.file(&pc_auth, "part.txt").await;
+        let doc = node_doc(a.user.space, node);
+        let import = a.upload(&[1; 100]).await;
+        pc.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: import }).await;
+        let change: Vec<u8> = (0..3000u32).map(|i| (i % 249) as u8).collect();
+        let frames = craft_cloud_proto::fragments::split(&change, 1100).unwrap();
+        assert_eq!(a.meta.append_live_update(a.user.space, doc, pc_auth.device, 1, &frames[0], 0).await.unwrap(), 1);
+        assert_eq!(a.meta.append_live_update(a.user.space, doc, laptop_auth.device, 1, &[7; 10], 0).await.unwrap(), 2);
+        let snap = a.upload(&[9; 20]).await;
+        assert!(a.meta.compact_live_doc(a.user.space, doc, 2, &snap).await.unwrap());
+        pc.handle(ClientFrame::Subscribe { doc, after: 2, at: None }).await;
+        drain(&mut pc).await;
+        let mut answers = pc.handle(ClientFrame::Update { doc, client_seq: 2, bytes: frames[1].clone() }).await.frames;
+        answers.extend(pc.handle(ClientFrame::Update { doc, client_seq: 3, bytes: frames[2].clone() }).await.frames);
+        let resync: Vec<Option<u64>> = answers
+            .iter()
+            .filter_map(
+                |f| if let ServerFrame::Error { code, client_seq, .. } = f { (code == "resync_required").then_some(*client_seq) } else { None },
+            )
+            .collect();
+        assert_eq!(resync, vec![Some(2), Some(3)], "{answers:?}");
+        assert!(!answers.iter().any(|f| matches!(f, ServerFrame::Ack { .. })), "{answers:?}");
+        let found = a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap();
+        assert_eq!((found.base, found.head), (2, 2), "nothing stored above the base");
+    }
+
+    /// A set stored in part before whole sets (an older server stored fragments one by one) is made whole when its
+    /// device sends the rest: the part in the log counts as here, and every fragment is acked with its number. A
+    /// device on protocol 2 has its fragments refused (stored one by one, a set could be stored in part). A set that
+    /// joins to more than a change's limit is refused whole.
+    #[tokio::test]
+    async fn the_rest_of_a_set_stored_in_part_completes_it_and_older_agents_send_none() {
+        let mut a = Account::new(Default::default()).await;
+        let (mut pc, pc_auth) = a.session(3).await;
+        let (mut old, _) = a.session(2).await;
+        let node = a.file(&pc_auth, "part.txt").await;
+        let doc = node_doc(a.user.space, node);
+        let import = a.upload(&[1; 100]).await;
+        pc.handle(ClientFrame::CreateDocument { doc, node, app: app(), snapshot: import }).await;
+        for s in [&mut pc, &mut old] {
+            s.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
+            drain(s).await;
+        }
+        let change: Vec<u8> = (0..3000u32).map(|i| (i % 249) as u8).collect();
+        let frames = craft_cloud_proto::fragments::split(&change, 1100).unwrap();
+        // Its first fragment alone in the log, as an older server stored it.
+        assert_eq!(a.meta.append_live_update(a.user.space, doc, pc_auth.device, 1, &frames[0], 0).await.unwrap(), 1);
+        pc.handle(ClientFrame::Update { doc, client_seq: 2, bytes: frames[1].clone() }).await;
+        let last = pc.handle(ClientFrame::Update { doc, client_seq: 3, bytes: frames[2].clone() }).await;
+        let acks: Vec<(u64, u64)> = last
+            .frames
+            .iter()
+            .filter_map(|f| if let ServerFrame::Ack { client_seq, seq, .. } = f { Some((*client_seq, *seq)) } else { None })
+            .collect();
+        assert_eq!(acks, vec![(1, 1), (2, 2), (3, 3)], "{:?}", last.frames);
+        let rows = a.meta.live_updates(a.user.space, doc, 0, 10).await.unwrap();
+        assert_eq!(craft_cloud_proto::fragments::join(rows.iter().map(|r| r.bytes.as_slice())), Some(change.clone()), "whole in the log");
+        // Protocol 2: refused, nothing stored.
+        let other = craft_cloud_proto::fragments::split(&[change.clone(), vec![5]].concat(), 1100).unwrap();
+        let reply = old.handle(ClientFrame::Update { doc, client_seq: 1, bytes: other[0].clone() }).await;
+        assert!(
+            matches!(reply.frames.as_slice(), [ServerFrame::Error { code, message, client_seq: Some(1), .. }] if code == "invalid" && message.contains("update Craft Cloud")),
+            "{:?}",
+            reply.frames
+        );
+        // Over a change's limit, once joined: refused whole.
+        let whole = vec![3u8; MAX_WHOLE_BYTES + 10];
+        let set = blake3::hash(&whole);
+        let body = MAX_UPDATE_BYTES - craft_cloud_proto::fragments::HEADER_BYTES;
+        let chunks: Vec<&[u8]> = whole.chunks(body).collect();
+        let count = u16::try_from(chunks.len()).unwrap();
+        let mut answers = Vec::new();
+        for (i, chunk) in (0u16..).zip(&chunks) {
+            let mut f = b"ccf1".to_vec();
+            f.extend_from_slice(&set.as_bytes()[..16]);
+            f.extend_from_slice(&i.to_be_bytes());
+            f.extend_from_slice(&count.to_be_bytes());
+            f.extend_from_slice(chunk);
+            answers.extend(pc.handle(ClientFrame::Update { doc, client_seq: 10 + u64::from(i), bytes: f }).await.frames);
+        }
+        let refused = answers.iter().filter(|f| matches!(f, ServerFrame::Error { code, .. } if code == "too_large")).count();
+        assert_eq!(refused, chunks.len(), "{answers:?}");
+        assert_eq!(a.meta.live_doc(a.user.space, doc).await.unwrap().unwrap().head, 3, "nothing of it stored");
     }
 
     /// Snapshots never travel in frames: a `create` or `snapshot` names a manifest the account uploaded (through the

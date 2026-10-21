@@ -44,8 +44,10 @@ use std::time::Duration;
 
 use craft_cloud_api::DocId;
 use craft_cloud_api::api::ErrorAnswer as ErrorBody;
+use craft_cloud_api::fragments::split;
+use craft_cloud_api::limits::MAX_UPDATE_BYTES;
 use craft_cloud_api::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, STATE, UPDATE, decode_binary, encode_binary};
-use craft_cloud_api::local::{DocState, DocsEvent, DocsRequest, MAX_LOCAL_JSON_BYTES, paths};
+use craft_cloud_api::local::{DocState, DocsEvent, DocsRequest, LOCAL_API_FRAGMENTS, MAX_LOCAL_JSON_BYTES, codes, paths};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::HandshakeError;
 use tungstenite::protocol::WebSocketConfig;
@@ -66,6 +68,9 @@ pub const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the reader waits for data before it looks whether it is to stop.
 const IDLE_WAKE: Duration = Duration::from_millis(250);
+
+/// What an agent too old for this app's live documents is refused with ([`codes::AGENT_TOO_OLD`]), for people.
+pub const AGENT_TOO_OLD: &str = "Craft Cloud on this computer is older than this app; update Craft Cloud to edit live";
 
 /// What happens to an open document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +95,24 @@ pub enum Event {
     /// The connection to the agent ended.
     Closed(String),
 }
+
+/// What the agent's answer for a fragment of this app's that isn't its change's last is ([`Document::send`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Inner {
+    /// Not the app's (its change is answered under `last`), unless it is a refusal: then the change is refused.
+    Of(u64),
+    /// A number of a change refused already: its answers are dropped (until the document is).
+    Answered,
+}
+
+/// For tests and simulations: updates over `bytes` go in fragments of at most `bytes` from now on, in this process (so
+/// changes of a few dozen KB exercise what changes over 1 MiB do). At most the frame limit.
+#[doc(hidden)]
+pub fn set_frame_limit_for_tests(bytes: usize) {
+    FRAME_LIMIT.store(bytes.clamp(craft_cloud_api::fragments::HEADER_BYTES + 1, MAX_UPDATE_BYTES), Ordering::Relaxed);
+}
+
+static FRAME_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MAX_UPDATE_BYTES);
 
 /// What opening a file gives.
 #[derive(Debug)]
@@ -119,7 +142,11 @@ struct Head {
 }
 
 /// An open's state so far: what `opened` said, the snapshot, and the updates that are part of it.
-type Filling = (Head, Vec<u8>, Vec<Vec<u8>>);
+struct Filling {
+    head: Head,
+    snapshot: Vec<u8>,
+    updates: Vec<Vec<u8>>,
+}
 
 /// What the reader hands an open in progress.
 enum Answer {
@@ -144,6 +171,9 @@ struct Shared {
     numbers: Mutex<HashMap<DocId, Vec<u64>>>,
     /// What to call after an event went to a document's channel, by number ([`Document::set_waker`]).
     wakers: Mutex<HashMap<u64, Waker>>,
+    /// The numbers (document number, `seq`) of the fragments sent that aren't a change's last, and what their answers
+    /// are ([`Inner`]): the agent answers for a change by its last fragment's number.
+    inner_seqs: Mutex<HashMap<(u64, u64), Inner>>,
     closed: AtomicBool,
     next_id: AtomicU64,
     /// A clone of the stream: dropping the connection shuts it down (which wakes the reader).
@@ -169,6 +199,49 @@ impl Shared {
 
     fn send_binary(&self, kind: u8, id: u64, bytes: &[u8]) -> Result<(), Error> {
         self.send(Message::Binary(encode_binary(kind, id, bytes).into()))
+    }
+
+    /// Sends `frames` (one change's fragments) back to back: nothing of another sender's goes between them, so their
+    /// numbers follow on.
+    fn send_frames(&self, kind: u8, id: u64, frames: &[Vec<u8>]) -> Result<(), Error> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Error::Io("the connection to the agent is closed".into()));
+        }
+        let mut socket = lock(&self.socket);
+        for frame in frames {
+            socket.send(Message::Binary(encode_binary(kind, id, frame).into())).map_err(|e| Error::Io(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// What the agent's answer for (`id`, `seq`) is, when it isn't simply the app's: a fragment that isn't a change's
+    /// last, or a number of a change refused already.
+    fn inner(&self, id: u64, seq: u64) -> Option<Inner> {
+        lock(&self.inner_seqs).get(&(id, seq)).copied()
+    }
+
+    /// The change ending at `last` was answered for (acked, or refused under its last number): what was kept for its
+    /// earlier fragments goes (the agent answers a change once, by its last number).
+    fn answered(&self, id: u64, last: u64) {
+        lock(&self.inner_seqs).retain(|(i, _), what| !(*i == id && *what == Inner::Of(last)));
+    }
+
+    /// A fragment of a change (not its last, `last`) was refused: the change is, under its last number, once; every
+    /// answer still to come for any of its numbers is dropped (kept as answered until the document is dropped).
+    fn refuse_change(&self, id: u64, last: u64, code: String, message: String) {
+        {
+            let mut inner = lock(&self.inner_seqs);
+            for what in inner.iter_mut().filter(|((i, _), w)| *i == id && **w == Inner::Of(last)).map(|(_, w)| w) {
+                *what = Inner::Answered;
+            }
+            inner.insert((id, last), Inner::Answered);
+        }
+        self.route(id, Event::Refused { seq: last, code, message });
+    }
+
+    /// What was kept for document number `id`'s changes goes (it was dropped).
+    fn forget(&self, id: u64) {
+        lock(&self.inner_seqs).retain(|(i, _), _| *i != id);
     }
 
     fn route(&self, id: u64, event: Event) {
@@ -200,7 +273,17 @@ impl Shared {
                 }
                 Ok(DocsEvent::NeedsImport { id }) => self.answer(id, Answer::NeedsImport),
                 Ok(DocsEvent::NotLive { id, reason, .. }) => self.answer(id, Answer::NotLive(reason)),
-                Ok(DocsEvent::Ack { id, seq }) => self.route(id, Event::Acked(seq)),
+                Ok(DocsEvent::Ack { id, seq }) => match self.inner(id, seq) {
+                    None => {
+                        self.answered(id, seq);
+                        self.route(id, Event::Acked(seq));
+                    }
+                    // (An agent that answers an earlier fragment: not the app's; the change's ack is by its last.)
+                    Some(Inner::Of(_)) => {
+                        lock(&self.inner_seqs).remove(&(id, seq));
+                    }
+                    Some(Inner::Answered) => {}
+                },
                 Ok(DocsEvent::Status { doc, online, waiting, deleted, stopped }) => {
                     let ids = lock(&self.numbers).get(&doc).cloned().unwrap_or_default();
                     for id in ids {
@@ -213,7 +296,14 @@ impl Shared {
                         self.route(id, Event::File(frontiers.clone()));
                     }
                 }
-                Ok(DocsEvent::Error { id: Some(id), seq: Some(seq), code, message }) => self.route(id, Event::Refused { seq, code, message }),
+                Ok(DocsEvent::Error { id: Some(id), seq: Some(seq), code, message }) => match self.inner(id, seq) {
+                    None => {
+                        self.answered(id, seq);
+                        self.route(id, Event::Refused { seq, code, message });
+                    }
+                    Some(Inner::Of(last)) => self.refuse_change(id, last, code, message),
+                    Some(Inner::Answered) => {}
+                },
                 Ok(DocsEvent::Error { id: Some(id), seq: None, code, message }) => self.answer(id, Answer::Refused(Error::Refused { code, message })),
                 Ok(DocsEvent::Error { id: None, .. }) | Err(_) => {}
             },
@@ -226,20 +316,21 @@ impl Shared {
                             if head.state.updates == 0 {
                                 self.answer(id, Answer::Live { head, snapshot: body.to_vec(), updates: Vec::new() });
                             } else {
-                                lock(&self.filling).insert(id, (head, body.to_vec(), Vec::new()));
+                                lock(&self.filling).insert(id, Filling { head, snapshot: body.to_vec(), updates: Vec::new() });
                             }
                         }
                     }
                     UPDATE => {
-                        // An update that is part of an open's state: kept with it until the last has come.
+                        // An update that is part of an open's state: kept with it until the last has come. (The agent
+                        // sends changes whole, never in fragments: it joins the server's before.)
                         let mut filling = lock(&self.filling);
-                        if let Some((head, _, updates)) = filling.get_mut(&id) {
-                            updates.push(body.to_vec());
-                            if updates.len() as u64 >= head.state.updates
-                                && let Some((head, snapshot, updates)) = filling.remove(&id)
+                        if let Some(f) = filling.get_mut(&id) {
+                            f.updates.push(body.to_vec());
+                            if f.updates.len() as u64 >= f.head.state.updates
+                                && let Some(f) = filling.remove(&id)
                             {
                                 drop(filling);
-                                self.answer(id, Answer::Live { head, snapshot, updates });
+                                self.answer(id, Answer::Live { head: f.head, snapshot: f.snapshot, updates: f.updates });
                             }
                             return;
                         }
@@ -292,6 +383,8 @@ fn read_loop(shared: Arc<Shared>, mut socket: WebSocket<TcpStream>) {
 pub struct Documents {
     shared: Arc<Shared>,
     reader: Option<JoinHandle<()>>,
+    /// The local API version the agent spoke when this connected.
+    api: u32,
 }
 
 impl std::fmt::Debug for Documents {
@@ -302,6 +395,12 @@ impl std::fmt::Debug for Documents {
 
 impl Documents {
     pub(crate) fn connect(client: &Client) -> Result<Self, Error> {
+        // An agent from before changes in fragments would take each fragment as a change of its own (and its apps
+        // and machines would get them so): live documents need an update of Craft Cloud first.
+        let api = client.agent_api()?;
+        if api < LOCAL_API_FRAGMENTS {
+            return Err(Error::Refused { code: codes::AGENT_TOO_OLD.into(), message: AGENT_TOO_OLD.into() });
+        }
         let stream = TcpStream::connect_timeout(&client.addr(), CONNECT_TIMEOUT).map_err(|e| Error::NotRunning(format!("can't reach it: {e}")))?;
         stream.set_nodelay(true).map_err(|e| Error::Io(e.to_string()))?;
         stream.set_read_timeout(Some(OPEN_TIMEOUT)).map_err(|e| Error::Io(e.to_string()))?;
@@ -341,6 +440,7 @@ impl Documents {
             filling: Mutex::new(HashMap::new()),
             numbers: Mutex::new(HashMap::new()),
             wakers: Mutex::new(HashMap::new()),
+            inner_seqs: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             stream,
@@ -350,7 +450,19 @@ impl Documents {
             .name("craft-cloud-docs".into())
             .spawn(move || read_loop(reader_shared, reader_socket))
             .map_err(|e| Error::Io(e.to_string()))?;
-        Ok(Self { shared, reader: Some(reader) })
+        Ok(Self { shared, reader: Some(reader), api })
+    }
+
+    /// How many numbers of changes in fragments the connection keeps answers for (none once each is answered).
+    #[cfg(test)]
+    pub(crate) fn kept_numbers(&self) -> usize {
+        lock(&self.shared.inner_seqs).len()
+    }
+
+    /// The local API version the agent spoke when this connected (at least [`LOCAL_API_FRAGMENTS`]): an app tells the
+    /// document's other machines with its presence, so a newer one can say to update an older one.
+    pub fn agent_api(&self) -> u32 {
+        self.api
     }
 
     /// Opens the file at `path` (relative to the synced folder, `/`-separated, or absolute inside it) for `app` (its
@@ -505,12 +617,20 @@ impl Document {
         self.head.changed_outside
     }
 
-    /// Sends this app's change (a Loro update, at most 1 MiB); returns its number, which [`Event::Acked`] names once
-    /// it is on the agent's disk.
+    /// Sends this app's change (a Loro update, of up to a snapshot's limit: one over 1 MiB goes in fragments, which the
+    /// agent takes only together); returns its number, which [`Event::Acked`] (or [`Event::Refused`]) names once it is
+    /// on the agent's disk. An update over the limit is refused here (`too_large`), and nothing is sent.
     pub fn send(&self, update: &[u8]) -> Result<u64, Error> {
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        self.shared.send_binary(UPDATE, self.id, update)?;
-        Ok(seq)
+        let frames = split(update, FRAME_LIMIT.load(Ordering::Relaxed))
+            .map_err(|e| Error::Refused { code: craft_cloud_api::api::codes::TOO_LARGE.into(), message: e.to_string() })?;
+        let count = frames.len() as u64;
+        let first = self.seq.fetch_add(count, Ordering::Relaxed) + 1;
+        let last = first + count - 1;
+        if count > 1 {
+            lock(&self.shared.inner_seqs).extend((first..last).map(|seq| ((self.id, seq), Inner::Of(last))));
+        }
+        self.shared.send_frames(UPDATE, self.id, &frames)?;
+        Ok(last)
     }
 
     /// Tells the agent the app is about to write the document's file: the content's BLAKE3 `hash`, and the live
@@ -564,6 +684,7 @@ impl Drop for Document {
     fn drop(&mut self) {
         lock(&self.shared.routes).remove(&self.id);
         lock(&self.shared.wakers).remove(&self.id);
+        self.shared.forget(self.id);
         let mut numbers = lock(&self.shared.numbers);
         let doc = self.head.doc;
         let remaining = numbers.get_mut(&doc).map(|ids| {
@@ -595,6 +716,7 @@ mod tests {
             filling: Mutex::new(HashMap::new()),
             numbers: Mutex::new(HashMap::new()),
             wakers: Mutex::new(HashMap::new()),
+            inner_seqs: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             stream,
@@ -627,6 +749,64 @@ mod tests {
         assert_eq!(updates, vec![b"1".to_vec(), b"2".to_vec()]);
         assert_eq!(events.try_recv().unwrap(), Event::Update(b"3".to_vec()));
         assert!(events.try_recv().is_err());
+    }
+
+    /// The agent answers a change in fragments once, by its last number (as the agent's local API does): that ack is
+    /// the app's, and nothing is kept for the change after it. A refusal of an earlier fragment is the change's,
+    /// under its last number, once: every later answer for any of its numbers is dropped, and a document dropped
+    /// leaves nothing kept.
+    #[test]
+    fn a_change_is_answered_by_its_last_number_and_nothing_is_kept_after() {
+        let (shared, _listener) = shared();
+        let (events_tx, events) = mpsc::channel();
+        lock(&shared.routes).insert(7, events_tx);
+        let ack = |seq: u64| Message::Text(serde_json::to_string(&DocsEvent::Ack { id: 7, seq }).unwrap().into());
+        let refusal = |seq: u64| {
+            let e = DocsEvent::Error { id: Some(7), seq: Some(seq), code: "invalid".into(), message: "no".into() };
+            Message::Text(serde_json::to_string(&e).unwrap().into())
+        };
+        lock(&shared.inner_seqs).extend([((7, 1), Inner::Of(3)), ((7, 2), Inner::Of(3))]);
+        shared.on_message(ack(3));
+        assert_eq!(events.try_recv().unwrap(), Event::Acked(3));
+        assert!(lock(&shared.inner_seqs).is_empty(), "nothing kept after the change's ack");
+        // Fragments 4 to 6: the second refused, then each of the others too (a set refused fragment by fragment).
+        lock(&shared.inner_seqs).extend([((7, 4), Inner::Of(6)), ((7, 5), Inner::Of(6))]);
+        shared.on_message(refusal(5));
+        assert_eq!(events.try_recv().unwrap(), Event::Refused { seq: 6, code: "invalid".into(), message: "no".into() });
+        for seq in [4, 6, 5] {
+            shared.on_message(refusal(seq));
+        }
+        shared.on_message(ack(6));
+        assert!(events.try_recv().is_err(), "refused once, nothing for a number the app never had as an answer");
+        shared.forget(7);
+        assert!(lock(&shared.inner_seqs).is_empty(), "a document dropped leaves nothing");
+    }
+
+    /// The agent's answers for fragments that aren't a change's last aren't the app's; a refusal of one is the
+    /// change's, under its last number, once (the answers still to come for the change are dropped).
+    #[test]
+    fn inner_answers_are_not_the_apps_but_a_refusal_refuses_the_change() {
+        let (shared, _listener) = shared();
+        let (events_tx, events) = mpsc::channel();
+        lock(&shared.routes).insert(7, events_tx);
+        let ack = |seq: u64| Message::Text(serde_json::to_string(&DocsEvent::Ack { id: 7, seq }).unwrap().into());
+        let refusal = |seq: u64| {
+            let e = DocsEvent::Error { id: Some(7), seq: Some(seq), code: "invalid".into(), message: "no".into() };
+            Message::Text(serde_json::to_string(&e).unwrap().into())
+        };
+        lock(&shared.inner_seqs).extend([((7, 1), Inner::Of(3)), ((7, 2), Inner::Of(3))]);
+        for seq in 1..=3 {
+            shared.on_message(ack(seq));
+        }
+        assert_eq!(events.try_recv().unwrap(), Event::Acked(3));
+        assert!(events.try_recv().is_err());
+        // The next change, of fragments 4 to 6: its second is refused.
+        lock(&shared.inner_seqs).extend([((7, 4), Inner::Of(6)), ((7, 5), Inner::Of(6))]);
+        shared.on_message(ack(4));
+        shared.on_message(refusal(5));
+        assert_eq!(events.try_recv().unwrap(), Event::Refused { seq: 6, code: "invalid".into(), message: "no".into() });
+        shared.on_message(refusal(6));
+        assert!(events.try_recv().is_err(), "refused once");
     }
 
     /// `opened` then the state: one answer; the events after it go to the document, its status by document ID.

@@ -211,6 +211,46 @@ fn a_refused_or_unwritten_change_leaves_the_document_as_it_was() {
     });
 }
 
+/// A change in fragments that crosses the document's cap on the server is stored whole, never half; the next one, a
+/// big paste already in the sender's copy when the compaction is asked, is refused as full and kept. The sender, the
+/// only device, far past the version asked, answers once it is refused (it would never be asked again: nothing more
+/// is stored), the log gets below its cap, the paste goes, and a machine joining at the end has both, whole.
+#[test]
+fn a_change_over_the_cap_is_stored_whole_and_the_document_gets_below_it_again() {
+    rt().block_on(async {
+        // (Fragments of 2 KiB: the change of 12 KB goes in six, as a change over 1 MiB does.)
+        craft_cloud_agent::live::replica::set_frame_limit_for_tests(2048);
+        let meta = craft_cloud_meta::Meta::open("sqlite::memory:").await.unwrap().with_live_doc_cap(8_000);
+        let limits = Limits { compact_updates: 3, ..Limits::default() };
+        let mut w = World::with_meta(limits, meta).await;
+        let (a, b) = (w.machine().await, w.machine().await);
+        w.connect(a);
+        w.settle().await;
+        let node = w.file().await;
+        let doc = joined(&mut w, a, node, "start").await;
+        let app_a = w.app_of(a, doc, 501);
+        let big = format!("[{}]", "b".repeat(12_000));
+        let paste = format!("({})", "p".repeat(70_000));
+        w.edit(a, doc, &app_a.append(&big));
+        w.edit(a, doc, &app_a.append(&paste));
+        w.settle().await;
+        assert!(w.machines[a].said.iter().any(|s| s.contains("full on the server")), "refused as full: {:?}", w.machines[a].said);
+        for _ in 0..40 {
+            w.settle().await;
+        }
+        assert_eq!(w.machines[a].replica().document_status(doc).map(|s| s.1), Some(0), "nothing waits: {:?}", w.machines[a].said);
+        let found = w.meta.live_doc(w.space, doc).await.unwrap().unwrap();
+        assert!(found.base > 0, "compacted: {found:?}");
+        let rows = w.meta.live_updates(w.space, doc, found.base, 1000).await.unwrap();
+        let fragments = rows.iter().filter(|r| craft_cloud_proto::fragments::is_fragment(&r.bytes)).count();
+        assert!(fragments == 0 || fragments >= 35, "whole sets in the log: {fragments} fragment rows");
+        w.connect(b);
+        w.settle().await;
+        joined(&mut w, b, node, "").await;
+        assert_eq!(w.text(b, doc), format!("start{big}{paste}"), "the other machine has both, whole");
+    });
+}
+
 /// A long log is compacted by an agent, at the server's asking; a machine opening the document later starts from
 /// the snapshot and the log above it, and ends on the same document.
 #[test]

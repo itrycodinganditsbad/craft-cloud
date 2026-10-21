@@ -30,6 +30,7 @@ fn defaults() -> JoinDefaults {
 fn signed_in() -> Status {
     Status {
         api: 1,
+        api_max: None,
         signed_in: true,
         account: Some("fabio".into()),
         server: Some("https://cloud.shadows.ch".into()),

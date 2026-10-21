@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use common::{App, Notes, NotesApp, change, open, until};
 use craft_cloud_app::fake::Hub;
-use craft_cloud_kit::{AgentBlobs, BlobStore, KitError, MAX_QUEUE_BYTES, Open, SPLIT_BYTES, Session};
+use craft_cloud_kit::{AgentBlobs, BlobStore, KitError, MAX_QUEUE_BYTES, NotLive, Open, Session};
 
 #[test]
 fn a_file_imported_on_one_machine_is_live_on_the_other() {
@@ -65,37 +65,6 @@ fn a_document_from_a_newer_app_is_read_only() {
     let mut v2 = open::<NotesApp<2>>(&pc2, "o.txt", Notes::default());
     assert!(v2.status().read_only.is_none());
     change(&mut v2, |m| m.with_title("migrated")).unwrap();
-}
-
-/// A change over the split size goes as several commits, each under it: a 5 MB change (twenty 250 KiB notes) arrives
-/// whole on the other machine, and every update stays under the agent's 1 MiB cap.
-#[test]
-fn a_five_megabyte_change_arrives_whole() {
-    let hub = Hub::new();
-    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
-    let mut a = open::<App>(&pc, "big.txt", Notes::new("big", &[]));
-    let mut b = open::<App>(&laptop, "big.txt", Notes::default());
-    let before = hub.updates("big.txt");
-    let notes: Vec<String> = (0..20).map(|i| format!("{i:02}{}", "x".repeat(250 * 1024))).collect();
-    change(&mut a, |m| {
-        let mut items = (*m.items).clone();
-        let mut hint = Vec::new();
-        for n in &notes {
-            let id = craft_cloud_kit::ElemId::new();
-            hint.push(id);
-            items.push((id, n.clone()));
-        }
-        Notes { items: Arc::new(items), hint: Some(hint), ..m.clone() }
-    })
-    .unwrap();
-    until(&mut [&mut a, &mut b], "the laptop has all 5 MB", |s| s.get(1).is_some_and(|b| b.model().texts() == notes));
-    let sent = hub.updates("big.txt") - before;
-    assert!(sent >= 10, "{sent} updates for 5 MB: it was split");
-    assert!(a.status().error.is_none() && b.status().error.is_none(), "{:?} {:?}", a.status().error, b.status().error);
-    const { assert!(SPLIT_BYTES * 2 <= craft_cloud_api::limits::MAX_UPDATE_BYTES) };
-    // One undo step takes the whole change back, on both.
-    assert!(a.undo().unwrap());
-    until(&mut [&mut a, &mut b], "the undo is on both", |s| s.iter().all(|s| s.model().items.is_empty()));
 }
 
 /// Reconnecting: the agent drops the app; the model stays editable, changes queue, and go out once the session is
@@ -233,6 +202,40 @@ fn presence_goes_to_the_other_machine_and_fades() {
     assert!(b.peers().contains_key(&a.peer()));
     assert!(a.peers().is_empty(), "its own isn't shown");
     assert!(a.set_presence(Some(vec![0; 4096])).is_err(), "at most 4 KiB with its header");
+    // Each says its agent's version: the laptop's is current. An app on a Craft Cloud from before versions in
+    // presence (the bytes right after its peer) is older: the session says so.
+    b.set_presence(Some(b"laptop".to_vec())).unwrap();
+    until(&mut [&mut a, &mut b], "the pc sees the laptop", |s| s[0].peers().contains_key(&s[1].peer()));
+    assert_eq!(a.peers()[&b.peer()].agent_api, Some(craft_cloud_api::local::LOCAL_API_MAX));
+    assert!(!a.peers()[&b.peer()].older() && !a.status().older_peer);
+    let docs = laptop.client().documents().unwrap();
+    let Ok(craft_cloud_app::live::Opened::Live(old)) = docs.open("p.txt", <App as craft_cloud_kit::LiveDocument>::APP) else { panic!("not live") };
+    let mut frame = 77u64.to_be_bytes().to_vec();
+    frame.extend_from_slice(b"an older one");
+    old.presence(&frame).unwrap();
+    until(&mut [&mut a], "the pc sees an older Craft Cloud", |s| s[0].status().older_peer);
+    assert_eq!(a.peers()[&77].bytes, b"an older one");
+    assert!(a.peers()[&77].older());
+}
+
+/// A change that doesn't read (a bundle cut short) is never taken as an empty one, at open or after: it is said and
+/// counted.
+#[test]
+fn a_change_that_does_not_read_is_said_and_counted() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open::<App>(&pc, "u.txt", Notes::new("u", &["one"]));
+    // Another app on the pc sends a bundle cut short (its count says five slices; none follow).
+    let docs = pc.client().documents().unwrap();
+    let Ok(craft_cloud_app::live::Opened::Live(raw)) = docs.open("u.txt", <App as craft_cloud_kit::LiveDocument>::APP) else { panic!("not live") };
+    let mut cut = b"ccb1".to_vec();
+    cut.extend_from_slice(&5u32.to_be_bytes());
+    raw.send(&cut).unwrap();
+    until(&mut [&mut a], "the pc's session hears it", |s| s[0].status().unread == 1);
+    assert!(a.status().error.as_deref().is_some_and(|e| e.contains("doesn't read")), "{:?}", a.status().error);
+    let b = open::<App>(&laptop, "u.txt", Notes::default());
+    assert_eq!(b.status().unread, 1, "at open too: {:?}", b.status().error);
+    assert_eq!(b.model().texts(), ["one"]);
 }
 
 #[test]
@@ -245,6 +248,9 @@ fn blobs_go_through_the_agent_and_an_old_agent_says_so() {
     laptop.too_old();
     let e = b.get(&chunk).unwrap_err();
     assert!(e.to_string().contains("agent_too_old"), "{e}");
+    // Too old for live documents too: the file opens as a plain file, and the app can say to update Craft Cloud.
+    let opened = Session::<App>::open(&common::agent(&laptop), "x.txt", Arc::new(Notes::default()), None).unwrap();
+    assert!(matches!(opened, Open::NotLive(NotLive::AgentTooOld)));
     // Not running at all: the file opens as a plain file.
     pc.restart();
     let opened = Session::<App>::open(&common::agent(&pc), "x.txt", Arc::new(Notes::default()), None).unwrap();

@@ -81,6 +81,40 @@ impl LiveDocument for DemoApp {
   content never goes into the document: put it in a [`BlobStore`] ([`AgentBlobs`] is the agent's) and keep the
   [`ChunkRef`].
 
+### Text and tables inside elements
+
+A model with one text per element (a shape's text body, a slide's notes, a table cell's text) or a table per element
+(a table shape) keeps them inside the element, under a key its codec names:
+
+```rust
+fn write(&self, id: ElemId, props: &mut Props<'_, '_>) -> Result<(), KitError> {
+    let shape = self.shape(id);
+    props.set("xfrm", shape.xfrm_json())?;
+    props.text("text", &shape.story())?;          // a rich text, as a root one
+    if let Some(table) = &shape.table {
+        props.table("table", &TableSrc(table))?;  // rows, columns, cells
+    }
+    Ok(())
+}
+```
+
+- A nested story maps exactly as a root one does (marks, paragraph attributes, the diff that writes one insert per
+  keystroke). Two machines typing in one shape's text merge character by character, and a shape deleted on one machine
+  while the other types in it is deleted on both.
+- A table's cells are values, or, when its source says [`TableSource::cell_maps`], property maps written by
+  `write_cell` like a node's, with stories of their own. Every cell of every row and column is then one; a row added
+  on one machine while a column is added on the other leaves the cell they cross unmade: `normalise` makes it (the
+  same plain cell on both, so the repairs are one).
+- Both are mergeable children of the element's map: two machines making a shape's text at once make one. Write a
+  story whenever the element exists (empty if it has none): an element whose story stops being written loses it,
+  and typing that arrives in it then is lost with it.
+- Reading back, [`TreeView::text_patched`] (and [`TableView::cell_text`]) patch the old text with the remote change's
+  deltas, as a root story is patched; [`TreeTouch::stories`] says which stories changed, [`PropsRead::table`] reads a
+  nested table whole.
+
+A change the app makes by itself rather than the user (an upload that finished and now has its chunk reference) goes
+through [`Session::background_change`]: sent like a local change, never an undo step.
+
 ## Opening
 
 ```rust
@@ -108,8 +142,16 @@ if !Arc::ptr_eq(&before, &self.doc) {
 
 - `before` must be the session's model ([`KitError::Stale`] otherwise: a remote change came in between; make the
   change again from `session.model()`).
-- A change is cut into commits under 512 KiB (the agent takes updates of up to 1 MiB): a 5 MB paste goes, and
-  undoes, whole.
+- A change is one commit and goes as one update, whatever its size: a big one as its slices (at most 16,384
+  operations each, which Loro imports in milliseconds; one update with much text takes it time growing with the
+  square of the text) in one bundle, and one over the agent's 1 MiB frame limit in fragments that every receiver
+  joins before anything imports them. A 5 MB paste goes, and undoes, whole: no machine, agent or app ever holds part
+  of a change, so an app never sees, repairs or writes back half of one, whatever it does meanwhile (an edit, an
+  undo, a save). The agent gives its apps every change whole: one that comes part of the way (its sender, or this
+  machine, slept or lost the connection meanwhile) is kept by the agent until the rest comes, and the app sees nothing
+  of it until then. A change over `MAX_CHANGE_BYTES` (8 MiB, half a document's log cap on the server) can't go: the
+  session stops, as for one the agent refuses for good; the model stays editable, and saving it to the file keeps the
+  work.
 - **A gesture** (a drag, an IME composition) whose `before` must stay put until it ends: `session.hold_remote(true)`
   while it runs; remote changes wait and come at the first poll after.
 - Typing: `session.group(|s| …)` (or `begin_group`/`end_group`) makes several changes one undo step.
@@ -216,7 +258,13 @@ back. Saving clears `changed_outside`.
 ## Presence
 
 `session.set_presence(Some(bytes))` shows this app's cursor or selection to the others (the bytes are the app's,
-at most 4 KiB less 8); `session.peers()` is theirs, dropped 10 s after they go quiet. Drawing them is the app's.
+at most 4 KiB less 16); `session.peers()` is theirs, dropped 10 s after they go quiet. Drawing them is the app's.
+Each presence also says the version of the Craft Cloud it runs on: `Peer::older()` (and `Status::older_peer`) is
+true for a machine on a Craft Cloud too old for this one's big changes; show "<machine> runs an older Craft Cloud;
+update it", with the machine's name from the app's own presence bytes.
+
+A Craft Cloud on this computer older than the kit's live documents (local API below 2) opens a file as
+`Open::NotLive(NotLive::AgentTooOld)`: open it as a plain file, and say to update Craft Cloud.
 
 ## Craft Cloud's piece of the window
 
@@ -227,14 +275,51 @@ the path); `watch.add_recent(path, saved)` puts a file on every machine's list.
 ## Testing the adapter
 
 With the `fake` feature, `craft_cloud_kit::testing::{Hub, Fake}` is an agent in the test's own process: machines of
-one account on a shared hub, with `set_online`, `restart` and `start`, `drop_connections`, and an old-agent mode.
+one account on a shared hub, with `set_online`, `restart` and `start`, `drop_connections`, and an old-agent mode
+(`too_old`: before blobs and fragments). A fake machine joins a change's fragments before its apps get it, as the
+agent does; `set_fragment_faults` stops a machine's link from the hub inside such a change for a while (`sleep`:
+`SLEEP_TICKS` ticks, `delay`: a few; `Hub::tick` moves them on, `set_fragment_faults(None)` wakes it), and
+`drop_connections_after` stops the agent part of the way through an app's change.
+`craft_cloud_app::live::set_frame_limit_for_tests` makes changes of a few dozen KB go in fragments.
 Two sessions on two fakes test merges, undo and reconnects with no server; the demo's tests drive two windows that
 way with kittest.
+
+## Known gaps
+
+- **Undo of a deletion makes the elements again as copies.** Loro's undo of a tree deletion creates new nodes (new
+  tree IDs, the same element IDs and properties); the old nodes stay deleted. What another machine changed in those
+  elements between the deletion and the undo went to the old nodes and is lost, the same on every machine (the models
+  stay alike). References other machines' repairs dropped meanwhile (a connector's end to a deleted shape) don't come
+  back with the undo either. A soft delete (nodes moved to a hidden root, so undo moves them back) would keep them.
+
+- **Every machine's agent must know fragments and bundles, and so must the server.** A server on live protocol 3
+  stores a change in fragments whole and never sends a fragment or a bundle to an agent from before them: it is
+  refused the document with "update Craft Cloud on this computer" (and the newer machines show "<machine> runs an
+  older Craft Cloud" from its presence, best effort: once it is refused the document its presence stops). An agent
+  never sends fragments or bundles to a server before protocol 3: a change that needs them is refused while it is
+  the server, and what it holds of them waits on the machine, with every change after it, until it is updated. A
+  new app on an older agent isn't live (`NotLive::AgentTooOld`). An older app on a newer agent still connects (the
+  agent says its oldest local API version as `api`, and its newest as `api_max`) and gets recents and blobs. But an
+  older live-editing app on a new agent can't read bundles: a newer app's big change shows in it as one that doesn't
+  read, its model goes apart from the others', and it may save that model. The agent can't tell it apart yet (the
+  docs channel names no app version), so quit every older Craft app before the agents are updated, and update the
+  apps with them. The safe order: the server, then every agent and app.
+- **After a server's restore**, a machine that sends up history the log lost sends a big Loro change in pieces (Loro
+  merges one peer's commits into one change, so its boundaries aren't an app's): an app open on a machine that also
+  lacked that history may see part of a change from before the restore.
 
 ## Costs to know
 
 - Loro's undo of one big run of inserted text takes time growing with its square (about 10 s for a 1 MB paste).
   Undo of ordinary edits is instant.
+- Loro's import of one update takes time growing with the square of the text in it when the text builds on another
+  peer's (1 MiB: 7 s); the kit's slices keep a 4 MiB paste's import at about 10 ms. So does its checkout to an earlier
+  version: an agent asked for a compaction while its copy is far past the asked version (its own big change not in the
+  log yet) leaves the answer to another device.
+- A big paste into a text another machine edits at that very moment is the slow case left: in one order of the two
+  peers Loro works the text out again for every slice, so once a slice is slow the kit (and the agent) take the rest
+  as one update, which costs those seconds once (about 7 s for 1.2 MB, 0.5 s for 300 KB) on the machine that was
+  typing. Edits elsewhere at the same moment (another text, a property) cost nothing.
 - A remote change to a rich text is patched into the old text; a tree's structure change reads the tree's
   structure again (cheap per node, 5,000 nodes in a few milliseconds); a table or timeline is read back by the app as
   much as it wants.

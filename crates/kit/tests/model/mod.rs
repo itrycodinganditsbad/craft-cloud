@@ -49,10 +49,167 @@ impl Rng {
 pub struct Node {
     pub id: ElemId,
     pub name: String,
+    /// The layer's own text: a story nested in its node.
+    pub text: RichText,
+    /// A table of cards on the layer (map cells with stories), nested in its node.
+    pub cards: Option<Arc<Cards>>,
     pub children: Vec<Arc<Node>>,
 }
 
+impl Node {
+    /// A layer with a name and nothing else.
+    pub fn leaf(id: ElemId, name: &str) -> Self {
+        Self { id, name: name.to_owned(), text: RichText::plain(""), cards: None, children: Vec::new() }
+    }
+}
+
 pub type Roots = Arc<Vec<Arc<Node>>>;
+
+// The cards: a table whose cells are property maps with a story each (`n`, and the story `t`).
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Card {
+    pub n: i64,
+    pub text: RichText,
+}
+
+impl Default for Card {
+    fn default() -> Self {
+        Self { n: 0, text: RichText::plain("") }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Cards {
+    pub rows: Vec<ElemId>,
+    pub cols: Vec<ElemId>,
+    /// One for every row and column.
+    pub cells: BTreeMap<(ElemId, ElemId), Card>,
+}
+
+pub struct CardsSrc<'a>(pub &'a Arc<Cards>);
+
+impl TableSource for CardsSrc<'_> {
+    fn key(&self) -> Option<usize> {
+        Some(Arc::as_ptr(self.0) as usize)
+    }
+    fn rows(&self) -> Vec<ElemId> {
+        self.0.rows.clone()
+    }
+    fn columns(&self) -> Vec<ElemId> {
+        self.0.cols.clone()
+    }
+    fn cell(&self, _row: ElemId, _column: ElemId) -> Option<Value> {
+        None
+    }
+    fn cells(&self) -> Vec<(ElemId, ElemId, Value)> {
+        Vec::new()
+    }
+    fn cell_maps(&self) -> bool {
+        true
+    }
+    fn write_cell(&self, row: ElemId, column: ElemId, props: &mut Props<'_, '_>) -> Result<(), KitError> {
+        let empty = Card::default();
+        let card = self.0.cells.get(&(row, column)).unwrap_or(&empty);
+        props.set("n", card.n)?;
+        props.text("t", &card.text)
+    }
+}
+
+/// The cards as stored (cells a merge left out are missing: `normalise` makes them).
+pub fn read_cards(view: &craft_cloud_kit::TableView<'_>, old: Option<&Cards>) -> Cards {
+    let (rows, cols) = (view.rows(), view.columns());
+    let mut cells = BTreeMap::new();
+    for r in &rows {
+        for c in &cols {
+            let Some(p) = view.cell_props(*r, *c) else { continue };
+            let before = old.and_then(|o| o.cells.get(&(*r, *c))).map(|card| &card.text as &dyn TextSource);
+            let text = view.cell_text(*r, *c, "t", before).unwrap_or_else(|| RichText::plain(""));
+            cells.insert((*r, *c), Card { n: p.i64("n").unwrap_or(0), text });
+        }
+    }
+    Cards { rows, cols, cells }
+}
+
+/// The cards repaired: a card for every row and column (a plain one where a merge left none), none of rows or columns
+/// that are gone, canonical texts. `None` when they are fine already.
+pub fn repair_cards(c: &Cards) -> Option<Cards> {
+    let complete = c.rows.iter().all(|r| c.cols.iter().all(|col| c.cells.contains_key(&(*r, *col))));
+    let tidy = c.cells.keys().all(|(r, col)| c.rows.contains(r) && c.cols.contains(col));
+    let canonical_texts = c.cells.values().all(|card| runs_canonical(&card.text));
+    if complete && tidy && canonical_texts {
+        return None;
+    }
+    let mut out = c.clone();
+    out.cells.retain(|(r, col), _| c.rows.contains(r) && c.cols.contains(col));
+    for r in &c.rows {
+        for col in &c.cols {
+            out.cells.entry((*r, *col)).or_default();
+        }
+    }
+    for card in out.cells.values_mut() {
+        if !runs_canonical(&card.text) {
+            card.text = canonical(&card.text);
+        }
+    }
+    Some(out)
+}
+
+pub fn edit_cards(c: &Cards, rng: &mut Rng) -> Cards {
+    let mut c = c.clone();
+    match rng.below(6) {
+        0 => {
+            let (at, r) = (rng.below(c.rows.len() + 1), rng.id());
+            c.rows.insert(at, r);
+            for col in &c.cols {
+                c.cells.insert((r, *col), Card::default());
+            }
+        }
+        1 => {
+            let (at, col) = (rng.below(c.cols.len() + 1), rng.id());
+            c.cols.insert(at, col);
+            for r in &c.rows {
+                c.cells.insert((*r, col), Card::default());
+            }
+        }
+        2 if c.rows.len() > 1 => {
+            let r = c.rows.remove(rng.below(c.rows.len()));
+            c.cells.retain(|(row, _), _| *row != r);
+        }
+        3 if c.cols.len() > 1 => {
+            let col = c.cols.remove(rng.below(c.cols.len()));
+            c.cells.retain(|(_, cc), _| *cc != col);
+        }
+        _ if !c.cells.is_empty() => {
+            let keys: Vec<(ElemId, ElemId)> = c.cells.keys().copied().collect();
+            let k = keys[rng.below(keys.len())];
+            if let Some(card) = c.cells.get_mut(&k) {
+                if rng.chance(30) {
+                    card.n += 1;
+                } else {
+                    card.text = edit_text(&card.text, rng);
+                }
+            }
+        }
+        _ => {
+            let (r, col) = (rng.id(), rng.id());
+            c.rows.push(r);
+            c.cols.push(col);
+            for row in &c.rows {
+                for cc in &c.cols {
+                    c.cells.entry((*row, *cc)).or_default();
+                }
+            }
+        }
+    }
+    c
+}
+
+/// Cards with one row, one column and one card.
+pub fn one_card(rng: &mut Rng, text: &str) -> Cards {
+    let (r, c) = (rng.id(), rng.id());
+    Cards { rows: vec![r], cols: vec![c], cells: [((r, c), Card { n: 1, text: RichText::plain(text) })].into() }
+}
 
 pub struct LayersSrc<'a> {
     roots: &'a Roots,
@@ -87,9 +244,29 @@ impl TreeSource for LayersSrc<'_> {
     fn write(&self, id: ElemId, props: &mut Props<'_, '_>) -> Result<(), KitError> {
         if let Some(n) = self.index.get(&id) {
             props.set("name", n.name.as_str())?;
+            props.text("text", &n.text)?;
+            if let Some(cards) = &n.cards {
+                props.table("cards", &CardsSrc(cards))?;
+            }
         }
         Ok(())
     }
+}
+
+/// `roots` with the node `id` replaced by what `f` makes of it (its ancestors copied, everything else shared).
+pub fn update(roots: &[Arc<Node>], id: ElemId, f: &dyn Fn(&Node) -> Node) -> Vec<Arc<Node>> {
+    roots
+        .iter()
+        .map(|n| {
+            if n.id == id {
+                Arc::new(f(n))
+            } else if contains(n, id) {
+                Arc::new(Node { children: update(&n.children, id, f), ..(**n).clone() })
+            } else {
+                n.clone()
+            }
+        })
+        .collect()
 }
 
 /// Every node: id, parent, depth-first.
@@ -117,7 +294,7 @@ pub fn remove(roots: &[Arc<Node>], id: ElemId) -> (Vec<Arc<Node>>, Option<Arc<No
         } else if taken.is_none() && contains(n, id) {
             let (children, t) = remove(&n.children, id);
             taken = t;
-            out.push(Arc::new(Node { id: n.id, name: n.name.clone(), children }));
+            out.push(Arc::new(Node { children, ..(**n).clone() }));
         } else {
             out.push(n.clone());
         }
@@ -139,9 +316,9 @@ pub fn insert(roots: &[Arc<Node>], parent: Option<ElemId>, at: usize, node: Arc<
                 if n.id == p {
                     let mut children = n.children.clone();
                     children.insert(at.min(children.len()), node.clone());
-                    Arc::new(Node { id: n.id, name: n.name.clone(), children })
+                    Arc::new(Node { children, ..(**n).clone() })
                 } else if contains(n, p) {
-                    Arc::new(Node { id: n.id, name: n.name.clone(), children: insert(&n.children, parent, at, node.clone()) })
+                    Arc::new(Node { children: insert(&n.children, parent, at, node.clone()), ..(**n).clone() })
                 } else {
                     n.clone()
                 }
@@ -151,18 +328,7 @@ pub fn insert(roots: &[Arc<Node>], parent: Option<ElemId>, at: usize, node: Arc<
 }
 
 pub fn rename(roots: &[Arc<Node>], id: ElemId, name: &str) -> Vec<Arc<Node>> {
-    roots
-        .iter()
-        .map(|n| {
-            if n.id == id {
-                Arc::new(Node { id, name: name.to_owned(), children: n.children.clone() })
-            } else if contains(n, id) {
-                Arc::new(Node { id: n.id, name: n.name.clone(), children: rename(&n.children, id, name) })
-            } else {
-                n.clone()
-            }
-        })
-        .collect()
+    update(roots, id, &|n| Node { name: name.to_owned(), ..n.clone() })
 }
 
 pub fn find(roots: &[Arc<Node>], id: ElemId) -> Option<&Arc<Node>> {
@@ -399,6 +565,8 @@ pub struct Doc {
     pub grid: Arc<Grid>,
     pub timeline: Arc<Timeline>,
     pub settings: Arc<Vec<u8>>,
+    /// A root table of map cells with stories.
+    pub cards: Arc<Cards>,
     /// Derived from the story, never synced.
     pub words: usize,
 }
@@ -429,20 +597,33 @@ impl LiveDocument for TestApp {
             .table("grid", GridSrc(&doc.grid))
             .timeline("timeline", TimelineSrc(&doc.timeline))
             .opaque("settings", Opaque { value: Some(&*doc.settings), key: Some(Arc::as_ptr(&doc.settings) as usize) })
+            .table("cards", CardsSrc(&doc.cards))
     }
 
     fn apply_remote(old: &Arc<Doc>, patch: &RemotePatch<'_>) -> Result<Arc<Doc>, KitError> {
         let mut new = (**old).clone();
         if let Some(tree) = patch.tree("layers") {
-            fn build(tree: &craft_cloud_kit::TreeView<'_>, ids: Vec<ElemId>) -> Vec<Arc<Node>> {
+            fn build(tree: &craft_cloud_kit::TreeView<'_>, ids: Vec<ElemId>, old: &HashMap<ElemId, &Arc<Node>>) -> Vec<Arc<Node>> {
                 ids.into_iter()
                     .map(|id| {
-                        let name = tree.props(id).and_then(|p| p.str("name")).unwrap_or_default();
-                        Arc::new(Node { id, name, children: build(tree, tree.children(id)) })
+                        let props = tree.props(id);
+                        let name = props.as_ref().and_then(|p| p.str("name")).unwrap_or_default();
+                        let before = old.get(&id);
+                        // The node's story patched from what the model had (only what came is applied).
+                        let text = tree.text_patched(id, "text", before.map(|n| &n.text as &dyn TextSource)).unwrap_or_else(|| RichText::plain(""));
+                        let cards = props
+                            .as_ref()
+                            .and_then(|p| p.table("cards"))
+                            .map(|view| Arc::new(read_cards(&view, before.and_then(|n| n.cards.as_deref()))));
+                        Arc::new(Node { id, name, text, cards, children: build(tree, tree.children(id), old) })
                     })
                     .collect()
             }
-            new.layers = Arc::new(build(&tree, tree.roots()));
+            let index = LayersSrc::new(&old.layers).index;
+            new.layers = Arc::new(build(&tree, tree.roots(), &index));
+        }
+        if let Some(view) = patch.table("cards") {
+            new.cards = Arc::new(read_cards(&view, Some(&old.cards)));
         }
         if let Some(story) = patch.text("story") {
             new.story = Arc::new(story);
@@ -488,6 +669,26 @@ impl LiveDocument for TestApp {
         if !runs_canonical(&doc.story) {
             doc.story = Arc::new(canonical(&doc.story));
         }
+        // Cards a merge left out (a row and a column added at once) are made, the same on every machine.
+        if let Some(fixed) = repair_cards(&doc.cards) {
+            doc.cards = Arc::new(fixed);
+        }
+        let mut layers = (*doc.layers).clone();
+        for (id, _) in flatten(&doc.layers) {
+            let Some(n) = find(&layers, id) else { continue };
+            let text = (!runs_canonical(&n.text)).then(|| canonical(&n.text));
+            let cards = n.cards.as_deref().and_then(repair_cards);
+            if text.is_some() || cards.is_some() {
+                layers = update(&layers, id, &|n| Node {
+                    text: text.clone().unwrap_or_else(|| n.text.clone()),
+                    cards: cards.clone().map(Arc::new).or_else(|| n.cards.clone()),
+                    ..n.clone()
+                });
+            }
+        }
+        if layers != *doc.layers {
+            doc.layers = Arc::new(layers);
+        }
     }
 
     fn refresh_derived(doc: &mut Doc) {
@@ -525,6 +726,18 @@ pub fn valid(doc: &Doc) -> Result<(), String> {
     if doc.words != count_words(&doc.story.text) {
         return Err("derived words are stale".into());
     }
+    if repair_cards(&doc.cards).is_some() {
+        return Err("the cards miss a card, or keep one of a missing row or column".into());
+    }
+    for (id, _) in &ids {
+        let Some(n) = find(&doc.layers, *id) else { continue };
+        if canonical(&n.text) != n.text || n.text.paragraphs.len() != n.text.text.matches('\n').count() + 1 {
+            return Err(format!("layer {id}'s text isn't canonical"));
+        }
+        if n.cards.as_deref().is_some_and(|c| repair_cards(c).is_some()) {
+            return Err(format!("layer {id}'s cards miss a card"));
+        }
+    }
     Ok(())
 }
 
@@ -536,9 +749,13 @@ pub enum Shape {
     Table,
     Timeline,
     Opaque,
+    /// A layer's own story, or its cards (a table nested in its node).
+    Nested,
+    /// The root table of map cells with stories.
+    Cards,
 }
 
-pub const SHAPES: [Shape; 5] = [Shape::Tree, Shape::Text, Shape::Table, Shape::Timeline, Shape::Opaque];
+pub const SHAPES: [Shape; 7] = [Shape::Tree, Shape::Text, Shape::Table, Shape::Timeline, Shape::Opaque, Shape::Nested, Shape::Cards];
 
 /// A random edit of `shape`, as a command of the app makes it (the result is refreshed).
 pub fn edit(doc: &Doc, shape: Shape, rng: &mut Rng) -> Doc {
@@ -549,18 +766,62 @@ pub fn edit(doc: &Doc, shape: Shape, rng: &mut Rng) -> Doc {
         Shape::Table => d.grid = Arc::new(edit_grid(&doc.grid, rng)),
         Shape::Timeline => d.timeline = Arc::new(edit_timeline(&doc.timeline, rng)),
         Shape::Opaque => d.settings = Arc::new((0..rng.below(20)).map(|_| rng.next() as u8).collect()),
+        Shape::Nested => d.layers = Arc::new(edit_nested(&doc.layers, rng)),
+        Shape::Cards => d.cards = Arc::new(edit_cards(&doc.cards, rng)),
     }
     TestApp::refresh_derived(&mut d);
     d
 }
 
+/// The name every big paste's layer starts with ([`big_paste`]): random edits leave such a layer alone (it is the
+/// simulation's check that nothing a machine made is lost).
+pub const BIG: &str = "big:";
+
+/// The layers random edits may pick: all but the big pastes' (their children are anyone's).
+fn editable(roots: &[Arc<Node>]) -> Vec<(ElemId, Option<ElemId>)> {
+    flatten(roots).into_iter().filter(|(id, _)| find(roots, *id).is_none_or(|n| !n.name.starts_with(BIG))).collect()
+}
+
+/// A big paste: a new layer at the top whose story is 30 to 100 KB of text (the change goes as slices in a bundle, and
+/// past the frame limit, which the simulation sets to 16 KiB, in fragments). The layer's ID and its text, to look for
+/// at the end.
+pub fn big_paste(doc: &Doc, rng: &mut Rng) -> (Doc, ElemId, String) {
+    let id = rng.id();
+    let word = format!("{} ", rng.word());
+    let len = 30_000 + rng.below(70_000);
+    let text: String = word.repeat(len / word.len() + 1).chars().take(len).collect();
+    let mut node = Node::leaf(id, &format!("{BIG}{id}"));
+    node.text = RichText::plain(&text);
+    let mut d = doc.clone();
+    d.layers = Arc::new(insert(&doc.layers, None, 0, Arc::new(node)));
+    TestApp::refresh_derived(&mut d);
+    (d, id, text)
+}
+
+/// A big change that can be undone: a column and 100 to 300 rows of 300-byte cells added to the grid (30 to 100 KB, in
+/// fragments past the simulation's frame limit).
+pub fn big_fill(doc: &Doc, rng: &mut Rng) -> Doc {
+    let mut g = (*doc.grid).clone();
+    let col = rng.id();
+    g.cols.push(col);
+    let cell = "c".repeat(300);
+    for _ in 0..100 + rng.below(200) {
+        let row = rng.id();
+        g.rows.push(row);
+        g.cells.insert((row, col), cell.clone());
+    }
+    let mut d = doc.clone();
+    d.grid = Arc::new(g);
+    d
+}
+
 pub fn edit_tree(roots: &[Arc<Node>], rng: &mut Rng) -> Vec<Arc<Node>> {
-    let all = flatten(roots);
+    let all = editable(roots);
     let pick = |rng: &mut Rng| all.get(rng.below(all.len())).map(|(id, _)| *id);
     match if all.is_empty() { 0 } else { rng.below(4) } {
         0 => {
             let parent = if rng.chance(40) { None } else { pick(rng) };
-            let n = Arc::new(Node { id: rng.id(), name: rng.word(), children: Vec::new() });
+            let n = Arc::new(Node::leaf(rng.id(), &rng.word()));
             let at = rng.below(8);
             insert(roots, parent, at, n)
         }
@@ -583,6 +844,28 @@ pub fn edit_tree(roots: &[Arc<Node>], rng: &mut Rng) -> Vec<Arc<Node>> {
             }
         }
     }
+}
+
+/// An edit inside a layer: its story (typing, formatting), or its cards (made, edited, removed).
+pub fn edit_nested(roots: &[Arc<Node>], rng: &mut Rng) -> Vec<Arc<Node>> {
+    let all = editable(roots);
+    let Some((id, _)) = all.get(rng.below(all.len())).copied() else { return edit_tree(roots, rng) };
+    let Some(node) = find(roots, id) else { return roots.to_vec() };
+    let mut n = (**node).clone();
+    match rng.below(10) {
+        0..=5 => n.text = edit_text(&n.text, rng),
+        6 if n.cards.is_some() && rng.chance(30) => n.cards = None,
+        _ => {
+            n.cards = Some(Arc::new(match &n.cards {
+                Some(c) => edit_cards(c, rng),
+                None => {
+                    let word = rng.word();
+                    one_card(rng, &word)
+                }
+            }))
+        }
+    }
+    update(roots, id, &|_| n.clone())
 }
 
 pub fn edit_text(t: &RichText, rng: &mut Rng) -> RichText {

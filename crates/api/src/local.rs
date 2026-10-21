@@ -18,8 +18,10 @@
 //!   documents ([`docs`]: [`DocsRequest`] and binary frames in, [`DocsEvent`] and binary frames out); `PUT /v1/blobs`
 //!   and `GET /v1/blobs/{hash}`: binary content kept out of live documents ([`blobs`]). Errors are the HTTP API's error
 //!   body ([`ErrorAnswer`](crate::api::ErrorAnswer) reads its code and message) with its codes and [`codes`].
-//! - **Versions**: [`Status::api`] is the local API version the agent speaks; a client refuses one outside
-//!   [`LOCAL_API_MIN`]..=[`LOCAL_API_MAX`] when it connects.
+//! - **Versions**: [`Status::api`]..=[`Status::api_newest`] are the local API versions the agent speaks (`api` is the
+//!   oldest, so an app from before `api_max` still connects to a newer agent); a client refuses one whose versions
+//!   and its own [`LOCAL_API_MIN`]..=[`LOCAL_API_MAX`] don't overlap, and gates what it uses by `api_newest` (live
+//!   documents need [`LOCAL_API_FRAGMENTS`]).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -36,7 +38,11 @@ pub const LOCAL_API_FILE: &str = "local-api.json";
 pub const LOCAL_API_SCHEMA: u32 = 1;
 /// Local API versions this build speaks.
 pub const LOCAL_API_MIN: u32 = 1;
-pub const LOCAL_API_MAX: u32 = 1;
+pub const LOCAL_API_MAX: u32 = 2;
+/// The local API version from which the agent takes an app's change in fragments ([`fragments`](crate::fragments))
+/// and sends every change to its apps whole, and its server log keeps a change whole: an app's live documents need
+/// an agent of at least this version (an older one is told to update Craft Cloud).
+pub const LOCAL_API_FRAGMENTS: u32 = 2;
 /// The environment variable that overrides the agent's data folder.
 pub const DATA_DIR_ENV: &str = "CRAFT_CLOUD_AGENT_DIR";
 /// The data folder's name inside the OS's per-user data folder.
@@ -241,8 +247,13 @@ pub enum RunState {
 /// `GET /v1/status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
-    /// The local API version the agent speaks.
+    /// The oldest local API version the agent speaks: what an app from before `api_max` checks (so an older app
+    /// still connects to a newer agent, and gets what that version has).
     pub api: u32,
+    /// The newest local API version the agent speaks; none from an agent before it (that one speaks `api` only).
+    /// An app gates what it uses by it ([`Status::api_newest`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_max: Option<u32>,
     pub signed_in: bool,
     /// The account's username, when signed in.
     #[serde(default)]
@@ -271,6 +282,13 @@ pub struct Status {
     /// admin): nothing syncs until it signs out and joins again. Its files stay.
     #[serde(default)]
     pub removed: bool,
+}
+
+impl Status {
+    /// The newest local API version the agent speaks: what an app's features are gated by.
+    pub fn api_newest(&self) -> u32 {
+        self.api_max.unwrap_or(self.api).max(self.api)
+    }
 }
 
 /// `POST /v1/login`: what `craft-cloud-agent login` asks for. The password goes to the agent and from there to the
@@ -760,6 +778,7 @@ mod tests {
         );
         let status = Status {
             api: 1,
+            api_max: Some(2),
             signed_in: false,
             account: None,
             server: None,
@@ -783,6 +802,8 @@ mod tests {
         assert_eq!(older.autostart, None, "an older agent says nothing about autostart");
         assert_eq!(older.last_sync_ms, None, "nor about the last sync");
         assert!(!older.removed);
+        assert_eq!((older.api_max, older.api_newest()), (None, 1), "an older agent speaks its one version");
+        assert_eq!(status.api_newest(), 2);
         let login: LoginRequest = serde_json::from_value(serde_json::json!({ "server": "s", "user": "u", "password": "p", "extra": 1 })).unwrap();
         assert!(!login.adopt && login.folder.is_none(), "missing optional fields default; unknown ones are ignored");
     }

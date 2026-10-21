@@ -34,8 +34,9 @@ per app connection for live sessions. `run` serves it while signed out too. Call
   `status.autostart` says whether it is on (absent where the agent doesn't handle it). Signing out turns it off. The
   entry belongs to the agent with the default data folder only; an agent with a data folder of its own is refused
   (`autostart_failed`), reports nothing and leaves the entry alone when it signs out;
-- `GET /v1/status` → `{api, signed_in, account, server, folder, machine, online, run_state, autostart?,
-  last_sync_ms?, removed}` (`last_sync_ms`: when the last pass that didn't fail finished; `removed`: the server
+- `GET /v1/status` → `{api, api_max?, signed_in, account, server, folder, machine, online, run_state, autostart?,
+  last_sync_ms?, removed}` (`api`: the oldest local API version the agent speaks, `api_max` the newest, absent from
+  an agent that speaks one; an app takes an agent whose range overlaps its own; `last_sync_ms`: when the last pass that didn't fail finished; `removed`: the server
   refused this device at the last pass, so it was removed from the account and must sign out and join again). Something only a person can put
   right found as `run` starts (a damaged or newer `account.json`, a damaged token) keeps the agent up, signed out with
   `run_state` `paused` and the reason; every call but `logout` (which forgets the account here) and `quit` is answered
@@ -55,11 +56,12 @@ per app connection for live sessions. `run` serves it while signed out too. Call
     such file in the synced folder) and `resetting` (the admin reset the server's document and no machine has sent it
     back yet: an app here would get an empty document). The app then opens and saves the file as always. A document
     that has been live on this machine opens offline from the agent's copy;
-  - a binary update from the app (its own change, at most 1 MiB) → `ack {id, seq}` once it is on the agent's disk
+  - a binary update from the app (its own change, at most 1 MiB a frame; a bigger one in fragments, see below, acked by
+    its last fragment's number) → `ack {id, seq}` once it is on the agent's disk
     (`seq` counts the app's updates of that document on this connection, from 1), or `error {id, seq, code,
     message}` when the agent refused it (`invalid`: Loro doesn't take it; `too_large`); the agent's copy is as it was;
-  - from the agent: remote changes as binary updates, other machines' and apps' presence as binary presence (as
-    sent), and `status {doc, online, waiting, deleted, stopped}` when that changes (`deleted`: the file was deleted,
+  - from the agent: remote changes as binary updates (each change whole, never a fragment), other machines' and
+    apps' presence as binary presence (as sent), and `status {doc, online, waiting, deleted, stopped}` when that changes (`deleted`: the file was deleted,
     here or on another machine; the document still works, and a later open of the path is a new node and a new
     document; a rename or move keeps the document, which belongs to the node; `stopped`: Loro failed on the
     document twice in this run, and the agent follows it again only once it restarts; changes made meanwhile are
@@ -100,7 +102,12 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
 `craft-cloud-proto`:
 - `hello {min, max}` → `welcome {protocol, epoch}` (the space's epoch), or `error protocol_mismatch`. Protocol 2 adds
   documents of files, snapshots, compaction and presence; a connection on protocol 1 (an agent from before them, or
-  a new agent and an older server) carries recents only, and is sent a compacted log whole. A new agent with an older
+  a new agent and an older server) carries recents only, and is sent a compacted log whole. Protocol 3 adds changes
+  in fragments (see Fragments below): the server stages a connection's fragments and stores a set whole, and never
+  sends a fragment or a bundle to a connection below 3 (that agent is refused the document with "update Craft Cloud
+  on this computer"), and refuses a fragment from one (stored one by one, its set could be stored in part). An
+  agent never sends fragments or bundles to a server below 3: a change that needs them is refused while it is the
+  server, and what it holds of them waits, with everything after it, until the server is updated. A new agent with an older
   server keeps recents and says live documents need a newer server; a document live on it already keeps its changes
   on the machine until then.
 - `create {doc, kind}` → `created {doc}`; idempotent. Kinds: `recents:<app>`, whose ID is derived from the account and
@@ -148,7 +155,11 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
   update that crossed, or one that just caught up); one request per document at a time. That agent answers `snapshot
   {doc, upto, manifest}`, naming a Loro snapshot of exactly the updates 1..=`upto` (exported at the version those
   updates make as the agent took them, never including later ones: the agent tracks what the log holds, as a version
-  per update), once it holds them and nothing waits for its history; otherwise it doesn't answer. An agent that
+  per update), once it holds them, nothing waits for its history, no change it keeps fragments of starts at or below
+  `upto`, `upto` isn't inside a change's fragments, and its copy is at most 65,536 operations past that version
+  (Loro's checkout to an earlier version is slow for a big paste; its own unacked operations don't count once the
+  document was refused as full, and an ask it leaves for that reason is kept and answered at its next ack or
+  refusal); otherwise it doesn't answer. An agent that
   dropped a row at or below `upto` (Loro failed on it, or it never applies) never answers, and says so. The server
   takes only the snapshot it asked that session for, and only a manifest the account uploaded: it records `base =
   upto` and the manifest in one metadata transaction, only past the current base (a second snapshot for an older or
@@ -177,8 +188,15 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
   device, 400 updates, creates and subscribes per connection refilled at 200/s; over them, `too_large` /
   `rate_limited` like the HTTP API.
 - Quota: once a document's log holds 16 MiB (about 30,000 recents adds), every later append is refused with
-  `quota_exceeded` (one-way: the update that crosses the cap is the last one stored). The agent keeps every unacked
-  update, retries with a pause growing to about 64 s, and says the document is full.
+  `quota_exceeded` (one-way: the update that crosses the cap is the last one stored). A change in fragments counts
+  only once its set is whole: one that would start in a full log is refused whole (every fragment's `client_seq`
+  named), one that crosses the cap is stored whole. A change is at most 8 MiB, half the cap (a set that joins to
+  more is refused whole). A refusal as full asks the refused device to compact (once per head, not while another
+  device's ask is out): with nothing more stored, no append would. The agent keeps every unacked update, retries
+  with a pause growing to about 64 s, and says the document is full.
+  `craft-cloud-server live check-sets <user>` lists the user's live documents whose log holds part of a change in
+  fragments (stored by a server before whole sets, and never completed: no machine compacts such a log past it),
+  each with the `reset-doc` that empties it.
   `craft-cloud-server live reset-doc <user> <app>` (or, for a document of a file, `<user> <document ID>`) empties the
   log, drops the snapshot and the import, and raises the space's live generation in the same transaction, so every
   live connection ends at its next ping and every agent starts over and pushes what the log lacks. The file sync's
@@ -235,7 +253,40 @@ document's version it was made from.
   to `{$track, $start, $len, …}`; `k.keys`: keyframe ID to `{$item, $at, $value}`), an opaque value (the root map
   `$opaque`, key `k`, bytes). IDs are 16 bytes (little-endian `u128`), or 32 hex digits as map keys. Binary content
   is never in Loro: it is a `{$chunk, $len}` value naming a blob.
-- A local change is written as commits of at most 512 KiB each (estimated: payload and 32 bytes per operation), each
-  exported at once; an export still over 512 KiB is cut by counter range. One change is one undo step.
-- Presence an app sets is sent as `[u64 peer, big-endian][the app's bytes]`, again every 3 s, and dropped 10 s after
-  its peer goes quiet.
+- Inside a tree node's meta map, a timeline item's or track's map, or a table's map cell, an app's codec can put a
+  rich text and a table under a key of its own, as Loro's mergeable child containers (the same container on every
+  machine that makes it, so two first edits at once merge): a story `s` is a `LoroText` at `s` laid out as a root
+  one, its last paragraph's attributes in a mergeable map `$last.s` beside it (made only when there are some); a
+  table `t` is a mergeable map at `t` holding mergeable `rows` and `cols` (movable lists of IDs) and `cells`. A cell
+  is a value, or, when the table's source says its cells are maps, a mergeable map at `row:column` holding the
+  cell's properties and stories. Deleting the key hides the child (a node's story that the app stops writing goes);
+  a deleted node takes everything nested in it.
+- A local change is one commit, one undo step, and one update: its export cut by counter range into slices of at
+  most 16,384 operations (`SLICE_OPS`), several of them in a bundle (`ccb1`, a 4-byte count, then each slice's
+  4-byte length and bytes, big endian), which a receiver imports slice by slice before its model sees any of it.
+- **Fragments** (`craft-cloud-api::fragments`): an update over the 1 MiB frame limit goes as frames of at most 1 MiB,
+  each `ccf1`, the set (the first 16 bytes of the update's BLAKE3), the index and the count (2 bytes each, big
+  endian), then its part. The cut is deterministic, so a set sent again is the same set. The app library sends a
+  change's fragments back to back and answers by the last one's number (a refusal of any of them refuses the change
+  under that number); the agent's local API (version 2: an app's live documents need it, and refuse an older agent
+  as `agent_too_old`) joins them per document and hands the hub the whole change (one an app stops sending part of
+  the way never reaches it). The agent journals the change whole and sends its fragments up as updates of their own
+  (each a `client_seq`, numbered in the fragments' order). The server (protocol 3) stages a connection's fragments
+  (at most 16 sets and 16 MiB) and stores a set whole, in one transaction with consecutive numbers, or refuses it
+  whole; it acks every fragment then. A connection that ends drops what it staged; nothing of it was acked, and the
+  agent sends it all again. Fragments of the set that the device has in the log already (a set stored in part
+  before whole sets, or one whose acks were lost, of which the agent sends only the rest) count as there: they are
+  found by their `client_seq` (a set's fragments are numbered one after the other) and acked with the numbers they
+  have. After a restore, the agent drops the rest of a set whose first fragments were acked (the log may have lost
+  them) and pushes its operations instead.
+  A receiving agent keeps fragment rows (counted as had, in the document's file; at most 16 sets and 16 MiB per
+  document, past which a row isn't taken and the next connection brings it again) until the change is whole, then
+  imports it and hands it to its apps whole: the agent's apps never get a fragment, and the app library joins none.
+  No time ends a kept set; only evidence does: its last row comes (the rows of a set are stored together, so a
+  catch-up after a sleep or a dropped connection brings the rest), a snapshot at or past its first row is imported
+  (the copy has the change then), or the log is learnt again from the start. It makes no compaction snapshot at or
+  past a kept set's first row, nor at a number between a change's first fragment and its last. Nothing ever imports
+  part of a change.
+- Presence an app's kit sets is sent as `[u64 peer, big-endian]["ccp2"][u32 local API version of its agent][the
+  app's bytes]`, again every 3 s, and dropped 10 s after its peer goes quiet. One without the mark comes from a kit
+  before versions in presence: an older Craft Cloud, which the kit says (`Peer::older`).

@@ -93,6 +93,10 @@ pub enum LiveAction {
     /// instead of an app, that live document of a file. Its log and its snapshot go; every machine then sends its whole
     /// document up again, so nothing any machine holds is lost.
     ResetDoc { username: String, app: String },
+    /// List a user's live documents whose log holds part of a change in fragments (stored before this server stored
+    /// a change whole): no machine compacts such a log past it, and it fills up. Each is printed with the `reset-doc`
+    /// that empties it (every machine then sends its whole document up again).
+    CheckSets { username: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -256,7 +260,46 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
             writeln!(out, "emptied the {app} recents of {}; every machine sends its own again when it next connects", user.username)?;
             Ok(())
         }
+        Command::Live { config, action: LiveAction::CheckSets { username } } => {
+            let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
+            let user = user_id(&meta, &username).await?;
+            let mut found = 0;
+            for (doc, _) in meta.live_heads(user.space).await? {
+                let parts = partial_sets(&meta, user.space, doc).await?;
+                if parts > 0 {
+                    found += 1;
+                    writeln!(
+                        out,
+                        "the live document {doc} of {} holds part of {parts} change(s): `craft-cloud-server live reset-doc {} {doc}` empties it",
+                        user.username, user.username
+                    )?;
+                }
+            }
+            if found == 0 {
+                writeln!(out, "no live document of {} holds part of a change", user.username)?;
+            }
+            Ok(())
+        }
     }
+}
+
+/// How many changes in fragments the log of `doc` holds only part of, above its snapshot (rows at or below the base
+/// are in the snapshot whole).
+pub async fn partial_sets(meta: &Meta, space: craft_cloud_proto::SpaceId, doc: craft_cloud_proto::DocId) -> Result<usize, CliError> {
+    use craft_cloud_proto::fragments::{SetId, parse};
+    let Some(found) = meta.live_doc(space, doc).await? else { return Ok(0) };
+    // (By set and count: two cuts of one change, at different limits, are two sets, never one that looks whole.)
+    let mut sets: std::collections::BTreeMap<(SetId, u16), std::collections::BTreeSet<u16>> = std::collections::BTreeMap::new();
+    let mut after = found.base;
+    loop {
+        let rows = meta.live_updates(space, doc, after, craft_cloud_meta::MAX_LIVE_PAGE).await?;
+        let Some(last) = rows.last() else { break };
+        after = last.seq;
+        for f in rows.iter().filter_map(|r| parse(&r.bytes)) {
+            sets.entry((f.set, f.count)).or_default().insert(f.index);
+        }
+    }
+    Ok(sets.iter().filter(|((_, count), got)| got.len() < usize::from(*count)).count())
 }
 
 /// `user invite`: makes the invite and prints how to use it. The code is printed only here, never logged.

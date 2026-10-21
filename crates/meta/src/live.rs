@@ -486,56 +486,80 @@ impl Meta {
         bytes: &[u8],
         now_ms: i64,
     ) -> Result<Appended, MetaError> {
-        let client_seq = to_i64(client_seq)?;
+        let mut appended = self.append_live_updates_counted(space, doc, device, &[(client_seq, bytes)], now_ms).await?;
+        appended.pop().ok_or(MetaError::Invalid("no update"))
+    }
+
+    /// [`Meta::append_live_update_counted`] for several updates of one device, stored together or not at all (a change
+    /// sent in fragments: it is in the log whole or not at all, and counts against the document's cap only then).
+    /// Each update sent again (as it was stored) gets its first number back; the fresh ones are stored with
+    /// consecutive numbers. The answers are in the order of `updates`.
+    pub async fn append_live_updates_counted(
+        &self,
+        space: SpaceId,
+        doc: DocId,
+        device: DeviceId,
+        updates: &[(u64, &[u8])],
+        now_ms: i64,
+    ) -> Result<Vec<Appended>, MetaError> {
         let (space_key, doc_key, device_key) = (uuid_bytes(space.as_uuid()), uuid_bytes(doc.as_uuid()), uuid_bytes(device.as_uuid()));
         let mut w = self.begin_write().await?;
-        // Taking the next number locks the document's row (on Postgres), so appends to one document run one at a
-        // time and the check for a repeat below can't race another append of the same update.
-        let size = i64::try_from(bytes.len()).map_err(|_| MetaError::Invalid("an update too large"))?;
+        // Locking the document's row first (on Postgres), so appends to one document run one at a time and the check
+        // for a repeat below can't race another append of the same update.
         let head = sqlx::query(
-            "UPDATE live_docs SET head_seq = head_seq + 1, bytes = bytes + $3 WHERE space_id = $1 AND id = $2 \
-             RETURNING head_seq, bytes, compacted_bytes, base_seq, kind",
+            "UPDATE live_docs SET head_seq = head_seq WHERE space_id = $1 AND id = $2 RETURNING head_seq, bytes, compacted_bytes, base_seq, kind",
         )
         .bind(space_key.clone())
         .bind(doc_key.clone())
-        .bind(size)
         .fetch_optional(&mut *w.tx)
         .await?
         .ok_or(MetaError::NotFound("document"))?;
-        let seq: i64 = head.try_get("head_seq")?;
+        let head_seq: i64 = head.try_get("head_seq")?;
         // What counts against the cap: the log above its snapshot.
         let total = to_u64(head.try_get("bytes")?)?.saturating_sub(to_u64(head.try_get("compacted_bytes")?)?);
         let base = to_u64(head.try_get("base_seq")?)?;
         let recents = !head.try_get::<String, _>("kind")?.starts_with(craft_cloud_proto::live::DOCUMENT_KIND_PREFIX);
-        let earlier = sqlx::query("SELECT seq, bytes FROM live_updates WHERE space_id = $1 AND doc = $2 AND device = $3 AND client_seq = $4")
-            .bind(space_key.clone())
-            .bind(doc_key.clone())
-            .bind(device_key.clone())
-            .bind(client_seq)
-            .fetch_all(&mut *w.tx)
-            .await?;
-        for row in earlier {
-            if row.try_get::<Vec<u8>, _>("bytes")? == bytes {
-                let first = to_u64(row.try_get("seq")?)?;
-                // The number taken above goes back.
-                w.tx.rollback().await?;
-                return Ok(Appended { seq: first, base, above_bytes: total.saturating_sub(to_u64(size)?), repeat: true });
+        // Which were stored before (their acks lost): their first numbers.
+        let mut repeats: Vec<Option<u64>> = Vec::with_capacity(updates.len());
+        for (client_seq, bytes) in updates {
+            let earlier = sqlx::query("SELECT seq, bytes FROM live_updates WHERE space_id = $1 AND doc = $2 AND device = $3 AND client_seq = $4")
+                .bind(space_key.clone())
+                .bind(doc_key.clone())
+                .bind(device_key.clone())
+                .bind(to_i64(*client_seq)?)
+                .fetch_all(&mut *w.tx)
+                .await?;
+            let mut first = None;
+            for row in earlier {
+                if row.try_get::<Vec<u8>, _>("bytes")? == *bytes {
+                    first = Some(to_u64(row.try_get("seq")?)?);
+                    break;
+                }
             }
+            repeats.push(first);
         }
-        // Full is one way: once the log holds the cap, every append is refused (the one that crosses it is stored), so
-        // no later, smaller update can be stored past a refused one it depends on. A repeat above is still acked, so
-        // a full document never stalls a device whose ack was lost. Only `reset_live_doc` empties it again.
-        let used = total.saturating_sub(to_u64(size)?);
+        let fresh: Vec<&(u64, &[u8])> = updates.iter().zip(&repeats).filter(|(_, r)| r.is_none()).map(|(u, _)| u).collect();
+        if fresh.is_empty() {
+            w.tx.rollback().await?;
+            return Ok(repeats.into_iter().map(|r| Appended { seq: r.unwrap_or_default(), base, above_bytes: total, repeat: true }).collect());
+        }
+        let size = fresh.iter().map(|(_, b)| b.len()).sum::<usize>();
+        let size_i = i64::try_from(size).map_err(|_| MetaError::Invalid("updates too large"))?;
+        // Full is one way: once the log holds the cap, every append is refused (the one that crosses it is stored, a
+        // set of fragments whole), so no later, smaller update can be stored past a refused one it depends on. A
+        // repeat above is still acked, so a full document never stalls a device whose ack was lost. Only
+        // `reset_live_doc` empties it again.
+        let used = total;
         if used >= self.live_doc_cap {
             w.tx.rollback().await?;
             return Err(MetaError::DocFull { used, limit: self.live_doc_cap });
         }
         // The first update to a recents document: the space may have only so many that hold updates. Counted after the
-        // row lock above, in the same transaction; over the cap, nothing is stored and the number goes back, as for a
-        // full document. A repeat was acked above, and a document that holds updates already is never refused here
-        // (by its numbers, not its bytes: a compacted log holds updates, though none count against its cap). Documents
-        // of files aren't counted: each needs a file of the space.
-        if seq == 1 {
+        // row lock above, in the same transaction; over the cap, nothing is stored, as for a full document. A repeat
+        // was acked above, and a document that holds updates already is never refused here (by its numbers, not its
+        // bytes: a compacted log holds updates, though none count against its cap). Documents of files aren't counted:
+        // each needs a file of the space.
+        if head_seq == 0 {
             // Documents of files are counted apart: each needs a file of the space, and their cap is far higher.
             let (sql, cap) = if recents {
                 (
@@ -557,7 +581,7 @@ impl Meta {
         // Every row of every live document of the space, compacted ones too, counts towards its live bytes (kept until
         // retention): over the cap, nothing is stored. A repeat was acked above.
         let live: i64 = sqlx::query("UPDATE spaces SET live_bytes = live_bytes + $1 WHERE id = $2 RETURNING live_bytes")
-            .bind(size)
+            .bind(size_i)
             .bind(space_key.clone())
             .fetch_one(&mut *w.tx)
             .await?
@@ -565,25 +589,43 @@ impl Meta {
         let live = to_u64(live)?;
         if live > self.live_bytes_cap {
             w.tx.rollback().await?;
-            return Err(MetaError::LiveFull { used: live.saturating_sub(to_u64(size)?), limit: self.live_bytes_cap });
+            return Err(MetaError::LiveFull { used: live.saturating_sub(to_u64(size_i)?), limit: self.live_bytes_cap });
         }
-        sqlx::query("INSERT INTO live_updates (space_id, doc, seq, bytes, device, client_seq, created_ms) VALUES ($1, $2, $3, $4, $5, $6, $7)")
-            .bind(space_key)
-            .bind(doc_key)
-            .bind(seq)
-            .bind(bytes.to_vec())
-            .bind(device_key)
-            .bind(client_seq)
-            .bind(now_ms)
+        let n = i64::try_from(fresh.len()).map_err(|_| MetaError::Invalid("too many updates"))?;
+        sqlx::query("UPDATE live_docs SET head_seq = head_seq + $3, bytes = bytes + $4 WHERE space_id = $1 AND id = $2")
+            .bind(space_key.clone())
+            .bind(doc_key.clone())
+            .bind(n)
+            .bind(size_i)
             .execute(&mut *w.tx)
             .await?;
+        let above_bytes = total.saturating_add(to_u64(size_i)?);
+        let mut next = head_seq;
+        let mut out = Vec::with_capacity(updates.len());
+        for ((client_seq, bytes), repeat) in updates.iter().zip(repeats) {
+            if let Some(first) = repeat {
+                out.push(Appended { seq: first, base, above_bytes, repeat: true });
+                continue;
+            }
+            next += 1;
+            sqlx::query("INSERT INTO live_updates (space_id, doc, seq, bytes, device, client_seq, created_ms) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+                .bind(space_key.clone())
+                .bind(doc_key.clone())
+                .bind(next)
+                .bind(bytes.to_vec())
+                .bind(device_key.clone())
+                .bind(to_i64(*client_seq)?)
+                .bind(now_ms)
+                .execute(&mut *w.tx)
+                .await?;
+            out.push(Appended { seq: to_u64(next)?, base, above_bytes, repeat: false });
+        }
         w.commit().await?;
-        Ok(Appended { seq: to_u64(seq)?, base, above_bytes: total, repeat: false })
+        Ok(out)
     }
 
-    /// Every live document of `space` with its last sequence number: what a backup of the database holds. A test seam
-    /// (the `test-support` feature), for the recents simulation's restores.
-    #[cfg(feature = "test-support")]
+    /// Every live document of `space` with its last sequence number (for the admin's checks, and the recents
+    /// simulation's restores).
     pub async fn live_heads(&self, space: SpaceId) -> Result<Vec<(DocId, u64)>, MetaError> {
         let rows = sqlx::query("SELECT id, head_seq FROM live_docs WHERE space_id = $1 ORDER BY id")
             .bind(uuid_bytes(space.as_uuid()))
@@ -701,6 +743,31 @@ impl Meta {
             })
             .collect::<Result<Vec<_>, MetaError>>()?;
         Ok((page, more))
+    }
+
+    /// The updates `device` sent to the document as `client_seq`s `from..=to` that the log holds: their `client_seq`,
+    /// number and bytes, in one query. (A change in fragments partly stored before: the rest of it is joined with
+    /// what is here.)
+    pub async fn live_updates_sent(
+        &self,
+        space: SpaceId,
+        doc: DocId,
+        device: DeviceId,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<(u64, u64, Vec<u8>)>, MetaError> {
+        let rows = sqlx::query(
+            "SELECT client_seq, seq, bytes FROM live_updates WHERE space_id = $1 AND doc = $2 AND device = $3 AND client_seq >= $4 \
+             AND client_seq <= $5 ORDER BY seq",
+        )
+        .bind(uuid_bytes(space.as_uuid()))
+        .bind(uuid_bytes(doc.as_uuid()))
+        .bind(uuid_bytes(device.as_uuid()))
+        .bind(to_i64(from)?)
+        .bind(to_i64(to)?)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|row| Ok((to_u64(row.try_get("client_seq")?)?, to_u64(row.try_get("seq")?)?, row.try_get("bytes")?))).collect()
     }
 
     /// The document's updates with a sequence number above `after`, in order, at most `limit` (and at most

@@ -28,8 +28,8 @@ use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::{DeviceInfo, ErrorBody, PairingStatus, codes as api_codes};
 use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
 use craft_cloud_proto::local::{
-    AutostartRequest, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES,
-    PairingInfo, RunState, Status, codes, paths,
+    AutostartRequest, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_MIN, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest,
+    MAX_LOCAL_JSON_BYTES, PairingInfo, RunState, Status, codes, paths,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -176,7 +176,10 @@ impl Control {
     /// What `GET /v1/status` answers.
     pub fn status(&self) -> Status {
         self.with(|s| Status {
-            api: LOCAL_API_MAX,
+            // (The oldest it speaks first: an app from before `api_max` checks only `api`, and gets what that
+            // version has, its recents and blobs.)
+            api: LOCAL_API_MIN,
+            api_max: Some(LOCAL_API_MAX),
             signed_in: s.account.is_some(),
             account: s.account.as_ref().map(|a| a.username.clone()),
             server: s.account.as_ref().map(|a| a.server.to_string()),

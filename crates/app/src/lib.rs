@@ -98,6 +98,9 @@ pub struct Client {
     dir: PathBuf,
     /// Whether this agent knows `/v1/blobs`, once asked ([`blobs::Blobs`]): shared by the client's clones.
     blobs_known: std::sync::Arc<std::sync::OnceLock<bool>>,
+    /// The newest local API version the agent speaks, once its status said ([`Client::agent_api`]): shared by the
+    /// client's clones.
+    api_known: std::sync::Arc<std::sync::OnceLock<u32>>,
 }
 
 impl Client {
@@ -120,9 +123,15 @@ impl Client {
             token: record.token,
             dir: dir.to_owned(),
             blobs_known: Default::default(),
+            api_known: Default::default(),
         };
         match client.status() {
-            Ok(status) if (LOCAL_API_MIN..=LOCAL_API_MAX).contains(&status.api) => Ok(client),
+            // Any agent that speaks a version this app does: what the app uses past the oldest is gated by
+            // `Status::api_newest` (live documents need `LOCAL_API_FRAGMENTS`).
+            Ok(status) if speaks(&status) => {
+                let _ = client.api_known.set(status.api_newest());
+                Ok(client)
+            }
             Ok(status) => Err(Error::Version(status.api)),
             Err(Error::Refused { code, .. }) if code == "unauthorized" => Err(Error::NotRunning(format!("{} is stale", file.display()))),
             Err(Error::Io(e) | Error::Protocol(e)) => Err(Error::NotRunning(format!("{} is stale ({e})", file.display()))),
@@ -166,8 +175,20 @@ impl Client {
 
     /// A client of the agent at `addr` with `token` (a fake agent's, in tests), whose `local-api.json` is in `dir`.
     #[cfg(feature = "fake")]
-    pub(crate) fn at(addr: SocketAddr, token: String, dir: PathBuf) -> Self {
-        Self { addr, token, dir, blobs_known: Default::default() }
+    pub(crate) fn at(addr: SocketAddr, token: String, dir: PathBuf, api: u32) -> Self {
+        let api_known = std::sync::Arc::new(std::sync::OnceLock::new());
+        let _ = api_known.set(api);
+        Self { addr, token, dir, blobs_known: Default::default(), api_known }
+    }
+
+    /// The newest local API version the agent speaks: known from connecting, or asked once (a call of its own).
+    pub fn agent_api(&self) -> Result<u32, Error> {
+        if let Some(api) = self.api_known.get() {
+            return Ok(*api);
+        }
+        let api = self.status()?.api_newest();
+        let _ = self.api_known.set(api);
+        Ok(api)
     }
 
     /// Whether the agent is signed in, as whom, to which server, whether it is online and what it is doing. Quick
@@ -283,6 +304,11 @@ impl Client {
     }
 }
 
+/// Whether the agent speaks a local API version this app does (its range and the app's overlap).
+fn speaks(status: &craft_cloud_api::local::Status) -> bool {
+    status.api <= LOCAL_API_MAX && status.api_newest() >= LOCAL_API_MIN
+}
+
 /// `answer` if it succeeded, else the agent's refusal (its code and message).
 fn refusal(answer: http::Answer) -> Result<http::Answer, Error> {
     if (200..300).contains(&answer.status) {
@@ -355,6 +381,7 @@ mod tests {
     fn status(signed_in: bool) -> Status {
         Status {
             api: 1,
+            api_max: Some(LOCAL_API_MAX),
             signed_in,
             account: signed_in.then(|| "ana".into()),
             server: None,
@@ -370,6 +397,16 @@ mod tests {
 
     fn json(value: &impl serde::Serialize) -> String {
         serde_json::to_string(value).unwrap()
+    }
+
+    /// An app takes any agent whose versions overlap its own: an older one (version 1 only), a newer one (from 1 on,
+    /// up to past this app's), never one that speaks only versions after this app's.
+    #[test]
+    fn an_agent_whose_versions_overlap_is_taken() {
+        let with = |api, api_max| Status { api, api_max, ..status(true) };
+        assert!(speaks(&with(1, None)), "an agent before api_max");
+        assert!(speaks(&with(1, Some(LOCAL_API_MAX + 5))), "a newer agent");
+        assert!(!speaks(&with(LOCAL_API_MAX + 1, Some(LOCAL_API_MAX + 5))), "one with nothing this app speaks");
     }
 
     /// Every call sends its request to its path, and reads its answer; a refusal comes back with its code.

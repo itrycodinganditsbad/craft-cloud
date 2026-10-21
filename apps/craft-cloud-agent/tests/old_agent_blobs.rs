@@ -7,12 +7,14 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use craft_cloud_proto::local::{LOCAL_API_FILE, LOCAL_API_MAX, LocalApiFile, RunState, Status};
+use craft_cloud_proto::local::{LOCAL_API_FILE, LOCAL_API_MIN, LocalApiFile, RunState, Status};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_old_agent_is_too_old_for_blobs_of_any_size() {
+    // (An agent from before blobs speaks the first local API version.)
     let status = Status {
-        api: LOCAL_API_MAX,
+        api: LOCAL_API_MIN,
+        api_max: None,
         signed_in: true,
         account: Some("a".into()),
         server: Some("https://x.invalid".into()),
