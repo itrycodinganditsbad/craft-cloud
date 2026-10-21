@@ -8,8 +8,8 @@ use loro::{IdSpan, LoroDoc, LoroMap, LoroValue, ValueOrContainer, VersionVector}
 
 use crate::{KitError, Value};
 
-/// What one operation adds to the estimate beside its payload (IDs, positions, keys).
-pub const OP_OVERHEAD: usize = 32;
+/// What one operation adds to the count beside its payload (IDs, positions, keys).
+pub(crate) const OP_OVERHEAD: usize = 32;
 /// The origin of the kit's commits of local changes (the undo manager records them).
 pub const LOCAL_ORIGIN: &str = "craft-cloud-kit:local";
 /// The origin of the kit's own repairs (a normalised merge, a save mark): never an undo step.
@@ -22,7 +22,8 @@ pub type Updates = Vec<Vec<u8>>;
 pub struct Writer<'d> {
     pub(crate) doc: &'d LoroDoc,
     origin: &'static str,
-    /// The estimate of what the change holds.
+    /// What the change wrote, roughly (it only says whether it wrote anything: a change is one commit whatever its
+    /// size).
     spent: usize,
     /// Where the change started.
     from: VersionVector,
@@ -35,7 +36,8 @@ impl<'d> Writer<'d> {
         Self { doc, origin, spent: 0, from: doc.oplog_vv(), text_bytes: 0 }
     }
 
-    /// Counts an operation of `payload` bytes.
+    /// Counts an operation of `payload` bytes. (Never fails now that a change is never cut; kept a `Result` for the
+    /// mappings, which may refuse a write later.)
     pub(crate) fn spend(&mut self, payload: usize) -> Result<(), KitError> {
         self.spent = self.spent.saturating_add(payload.saturating_add(OP_OVERHEAD));
         Ok(())

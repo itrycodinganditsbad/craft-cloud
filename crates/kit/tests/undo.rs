@@ -1,6 +1,5 @@
 //! Undo while live, two sessions on the fake agent: undo takes back only this machine's change (the other's edit to
-//! the same element stays), redo puts it back, a group is one step, and a change split into several commits is one
-//! step.
+//! the same element stays), redo puts it back, a group is one step, and a change sent in fragments is one step.
 
 mod common;
 mod model;
@@ -80,7 +79,7 @@ fn undo_after_a_remote_edit_to_the_same_element_keeps_the_remote_edit() {
 /// is one step too. (Loro's undo of one big run of text takes time growing with its square, about 10 s for 1 MB: the
 /// report's concerns, so the big change here is cells.)
 #[test]
-fn a_group_and_a_split_change_are_one_step_each() {
+fn a_group_and_a_fragmented_change_are_one_step_each() {
     let hub = Hub::new();
     let (mut a, mut b, _pc, _laptop) = pair(&hub, Doc { story: Arc::new(RichText::plain("")), ..Doc::empty() });
     a.group(|s| {

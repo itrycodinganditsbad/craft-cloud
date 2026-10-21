@@ -490,10 +490,10 @@ impl Meta {
         appended.pop().ok_or(MetaError::Invalid("no update"))
     }
 
-    /// [`Meta::append_live_update_counted`] for several updates of one device, stored together or not at all, with
-    /// consecutive sequence numbers (a change sent in fragments: it is in the log whole or not at all, and counts
-    /// against the document's cap only then). Each update sent again (as it was stored) gets its first number back;
-    /// the rest are stored. The answers are in the order of `updates`.
+    /// [`Meta::append_live_update_counted`] for several updates of one device, stored together or not at all (a change
+    /// sent in fragments: it is in the log whole or not at all, and counts against the document's cap only then).
+    /// Each update sent again (as it was stored) gets its first number back; the fresh ones are stored with
+    /// consecutive numbers. The answers are in the order of `updates`.
     pub async fn append_live_updates_counted(
         &self,
         space: SpaceId,

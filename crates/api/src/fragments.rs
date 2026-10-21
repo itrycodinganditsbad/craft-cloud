@@ -1,8 +1,8 @@
 //! Live updates over the 1 MiB frame limit, sent in fragments: one update (a Loro update of any size up to
 //! [`MAX_WHOLE_BYTES`]) cut into frames of at most the limit, each a fragment naming its set (the first 16 bytes of the
-//! update's BLAKE3), its index and the set's count. Every place that imports an update or answers for what a document
-//! holds (an agent's copy, its local API for an app's change) takes a fragment only into a [`Reassembler`] (or keeps it
-//! aside), and imports the update once it holds every fragment of it: no document ever holds part of a change. The
+//! update's BLAKE3), its index and the set's count. The agent's local API joins an app's fragments in a
+//! [`Reassembler`]; its replica keeps the log's fragment rows until they are whole; either imports the update only once
+//! it holds every fragment of it: no document ever holds part of a change. The
 //! server stages an agent's fragments and stores a set in one go, as updates of their own, or refuses it whole; an
 //! agent's log of rows keeps them as they are. Agents hand apps whole changes only.
 //!

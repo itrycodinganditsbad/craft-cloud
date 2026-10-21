@@ -1630,7 +1630,8 @@ impl<D: LiveDocument> Session<D> {
     }
 }
 
-/// A slice's import this slow means Loro took its slow way: see [`import_slices`].
+/// A slice's import this slow means Loro took its slow way: see [`import_slices`]. (The agent's copy takes slices
+/// the same way, with the same threshold: `LiveCopy::import_any_size` in the agent; keep the two alike.)
 const SLOW_SLICE: Duration = Duration::from_millis(50);
 
 /// Imports one change's slices (a bundle's, or the one update) one after the other. Each slice normally goes in in

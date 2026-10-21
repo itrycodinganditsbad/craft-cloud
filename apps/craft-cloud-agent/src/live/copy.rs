@@ -103,6 +103,8 @@ fn usable_peer(peer: u64) -> u64 {
 /// The most bytes of updates one of Loro's batch imports takes ([`LiveCopy::import_batch`]).
 const BATCH_GROUP_BYTES: usize = 16 * 1024;
 /// A bundle's slice whose import takes this long: the rest goes in as one update ([`LiveCopy::import_any_size`]).
+/// (The kit takes slices the same way, with the same threshold: `import_slices` in `craft-cloud-kit`; keep the two
+/// alike.)
 const SLOW_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// `updates` in consecutive groups of at most `max` bytes (an update bigger than that alone).

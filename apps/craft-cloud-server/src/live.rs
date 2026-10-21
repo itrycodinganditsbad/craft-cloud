@@ -71,7 +71,7 @@ use crate::state::{AppState, Limits};
 /// Live connections one device may hold at once (a reconnect may overlap the old connection for a moment).
 pub const MAX_CONNECTIONS_PER_DEVICE: usize = 4;
 /// The most bytes of fragments a connection stages while their sets come (two changes of the largest size).
-pub const MAX_STAGED_BYTES: usize = 2 * MAX_WHOLE_BYTES + 2 * MAX_SETS * 64;
+pub const MAX_STAGED_BYTES: usize = 2 * MAX_WHOLE_BYTES + 2 * MAX_SETS * craft_cloud_proto::fragments::FRAGMENT_OVERHEAD;
 /// Updates (and creates) a connection may send at once before it is refilled…
 pub const UPDATE_BURST: u32 = 400;
 /// …at this many per second.

@@ -303,8 +303,7 @@ way with kittest.
   older live-editing app on a new agent can't read bundles: a newer app's big change shows in it as one that doesn't
   read, its model goes apart from the others', and it may save that model. The agent can't tell it apart yet (the
   docs channel names no app version), so quit every older Craft app before the agents are updated, and update the
-  apps with them. The
-  safe order: the server, then every agent and app.
+  apps with them. The safe order: the server, then every agent and app.
 - **After a server's restore**, a machine that sends up history the log lost sends a big Loro change in pieces (Loro
   merges one peer's commits into one change, so its boundaries aren't an app's): an app open on a machine that also
   lacked that history may see part of a change from before the restore.

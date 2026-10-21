@@ -42,7 +42,6 @@ pub use text::RichText;
 pub use timeline::{ItemRead, TimelineTouch, TimelineView};
 pub use tree::{TreeTouch, TreeView};
 pub use value::{AgentBlobs, BlobStore, ChunkRef, ElemId, MAX_VALUE_BYTES, MemoryBlobs, OpaqueCodec, Value};
-pub use writer::OP_OVERHEAD;
 
 /// For an app's adapter tests: the fake agent of `craft-cloud-app` (feature `fake`).
 #[cfg(feature = "fake")]

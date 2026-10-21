@@ -141,13 +141,11 @@ struct Head {
     changed_outside: Option<bool>,
 }
 
-/// An open's state so far: what `opened` said, the snapshot, the updates that are part of it, and how many of its
-/// update frames came.
+/// An open's state so far: what `opened` said, the snapshot, and the updates that are part of it.
 struct Filling {
     head: Head,
     snapshot: Vec<u8>,
     updates: Vec<Vec<u8>>,
-    frames: u64,
 }
 
 /// What the reader hands an open in progress.
@@ -318,7 +316,7 @@ impl Shared {
                             if head.state.updates == 0 {
                                 self.answer(id, Answer::Live { head, snapshot: body.to_vec(), updates: Vec::new() });
                             } else {
-                                lock(&self.filling).insert(id, Filling { head, snapshot: body.to_vec(), updates: Vec::new(), frames: 0 });
+                                lock(&self.filling).insert(id, Filling { head, snapshot: body.to_vec(), updates: Vec::new() });
                             }
                         }
                     }
@@ -327,9 +325,8 @@ impl Shared {
                         // sends changes whole, never in fragments: it joins the server's before.)
                         let mut filling = lock(&self.filling);
                         if let Some(f) = filling.get_mut(&id) {
-                            f.frames += 1;
                             f.updates.push(body.to_vec());
-                            if f.frames >= f.head.state.updates
+                            if f.updates.len() as u64 >= f.head.state.updates
                                 && let Some(f) = filling.remove(&id)
                             {
                                 drop(filling);

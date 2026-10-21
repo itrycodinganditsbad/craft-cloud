@@ -750,7 +750,7 @@ impl Doc {
         if known.is_none() && self.fragments.len() >= MAX_SETS {
             return Fragmented::Full;
         }
-        if self.fragment_bytes().saturating_add(bytes.len()) > MAX_FRAGMENT_BYTES {
+        if self.fragment_bytes().saturating_add(bytes.len() + FRAGMENT_OVERHEAD) > MAX_FRAGMENT_BYTES {
             return Fragmented::Full;
         }
         let set = self.fragments.entry(f.set).or_insert_with(|| KeptSet { count: f.count, ..KeptSet::default() });
