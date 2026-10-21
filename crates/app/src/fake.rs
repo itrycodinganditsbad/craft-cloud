@@ -559,7 +559,8 @@ impl Hub {
                     return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "too_large".into(), message });
                 }
                 // A fragment: kept until its change is whole, which then goes into the copy as its fragments (each an
-                // update of the log, as the agent's log keeps them) and is acked fragment by fragment.
+                // update of the log, as the agent's log keeps them). As the agent's local API does, the change is
+                // answered once, under the number of the fragment that made it whole; the earlier ones get nothing.
                 let frames: Vec<(u64, Vec<u8>)> = if is_fragment(body) {
                     let Some(f) = parse(body) else {
                         let message = "a fragment that doesn't read".to_owned();
@@ -575,12 +576,8 @@ impl Hub {
                     }
                     let mut frames = c.sets.remove(&(id, f.set)).unwrap_or_default();
                     if join(frames.iter().map(|(_, b)| b.as_slice())).is_none() {
-                        for (seq, _) in frames {
-                            // (Each fragment's number is refused: the app hears it by the last one's.)
-                            let message = "fragments that don't make the change they name".to_owned();
-                            tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "invalid".into(), message });
-                        }
-                        return;
+                        let message = "fragments that don't make the change they name".to_owned();
+                        return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "invalid".into(), message });
                     }
                     frames.sort_by_key(|(_, b)| parse(b).map(|x| x.index));
                     frames.dedup_by_key(|(_, b)| parse(b).map(|x| x.index));
@@ -590,11 +587,8 @@ impl Hub {
                 };
                 // A refusal asked for ([`Fake::refuse_next`]): the change isn't kept.
                 if let Some(code) = inner.machines.get_mut(&machine).and_then(|m| m.refuse.pop_front()) {
-                    for (seq, _) in &frames {
-                        let message = format!("refused as asked ({code})");
-                        tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(*seq), code: code.clone(), message });
-                    }
-                    return;
+                    let message = format!("refused as asked ({code})");
+                    return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code, message });
                 }
                 let Some(m) = inner.machines.get_mut(&machine) else { return };
                 if let Some(d) = m.docs.get_mut(&doc) {
@@ -603,9 +597,7 @@ impl Hub {
                         d.pending.push_back(d.log.len() - 1);
                     }
                 }
-                for (seq, _) in &frames {
-                    tell(&inner, machine, conn, &DocsEvent::Ack { id, seq: *seq });
-                }
+                tell(&inner, machine, conn, &DocsEvent::Ack { id, seq });
                 sync(&mut inner);
             }
             PRESENCE => {
@@ -1129,6 +1121,32 @@ mod tests {
         assert_eq!(hub.updates("x.txt"), 4 + fragments, "its fragments, each an update of the log");
         let huge = vec![0u8; craft_cloud_api::fragments::MAX_WHOLE_BYTES + 1];
         assert!(matches!(doc_a.send(&huge), Err(crate::Error::Refused { code, .. }) if code == "too_large"));
+    }
+
+    /// A change in fragments is answered once, under its last fragment's number, as by the agent: acked, the app
+    /// library keeps nothing of it; refused, the app hears it once, and nothing is kept once the document is
+    /// dropped.
+    #[test]
+    fn a_change_in_fragments_is_answered_once_and_nothing_is_kept() {
+        let hub = Hub::new();
+        let a = hub.machine("a").unwrap();
+        let docs = a.client().documents().unwrap();
+        let Opened::NeedsImport(importer) = docs.open("k.txt", "test").unwrap() else { panic!("not new") };
+        let doc = importer.import(b"snapshot").unwrap();
+        let big: Vec<u8> = (0..2 * MAX_UPDATE_BYTES + 5).map(|i| (i % 241) as u8).collect();
+        acked(&doc, doc.send(&big).unwrap());
+        assert_eq!(docs.kept_numbers(), 0, "nothing kept once the change is acked");
+        a.refuse_next("invalid", 1);
+        let last = doc.send(&big).unwrap();
+        let refused: Vec<u64> = (0..40)
+            .filter_map(|_| match doc.recv_timeout(Duration::from_millis(25)) {
+                Some(Event::Refused { seq, .. }) => Some(seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refused, vec![last], "refused once, under the last number");
+        drop(doc);
+        assert_eq!(docs.kept_numbers(), 0, "nothing kept once the document is dropped");
     }
 
     /// A machine whose link stops inside a change in fragments keeps what came: its apps get nothing of the change

@@ -101,7 +101,7 @@ pub enum Event {
 enum Inner {
     /// Not the app's (its change is answered under `last`), unless it is a refusal: then the change is refused.
     Of(u64),
-    /// A change's last, whose change was refused already: dropped.
+    /// A number of a change refused already: its answers are dropped (until the document is).
     Answered,
 }
 
@@ -217,20 +217,33 @@ impl Shared {
     }
 
     /// What the agent's answer for (`id`, `seq`) is, when it isn't simply the app's: a fragment that isn't a change's
-    /// last, or a change's last whose change was refused already.
+    /// last, or a number of a change refused already.
     fn inner(&self, id: u64, seq: u64) -> Option<Inner> {
-        lock(&self.inner_seqs).remove(&(id, seq))
+        lock(&self.inner_seqs).get(&(id, seq)).copied()
     }
 
-    /// A fragment of a change (not its last, `last`) was refused: the change is, under its last number, and the
-    /// answers still to come for it are dropped.
+    /// The change ending at `last` was answered for (acked, or refused under its last number): what was kept for its
+    /// earlier fragments goes (the agent answers a change once, by its last number).
+    fn answered(&self, id: u64, last: u64) {
+        lock(&self.inner_seqs).retain(|(i, _), what| !(*i == id && *what == Inner::Of(last)));
+    }
+
+    /// A fragment of a change (not its last, `last`) was refused: the change is, under its last number, once; every
+    /// answer still to come for any of its numbers is dropped (kept as answered until the document is dropped).
     fn refuse_change(&self, id: u64, last: u64, code: String, message: String) {
         {
             let mut inner = lock(&self.inner_seqs);
-            inner.retain(|(i, _), what| !(*i == id && *what == Inner::Of(last)));
+            for what in inner.iter_mut().filter(|((i, _), w)| *i == id && **w == Inner::Of(last)).map(|(_, w)| w) {
+                *what = Inner::Answered;
+            }
             inner.insert((id, last), Inner::Answered);
         }
         self.route(id, Event::Refused { seq: last, code, message });
+    }
+
+    /// What was kept for document number `id`'s changes goes (it was dropped).
+    fn forget(&self, id: u64) {
+        lock(&self.inner_seqs).retain(|(i, _), _| *i != id);
     }
 
     fn route(&self, id: u64, event: Event) {
@@ -262,11 +275,17 @@ impl Shared {
                 }
                 Ok(DocsEvent::NeedsImport { id }) => self.answer(id, Answer::NeedsImport),
                 Ok(DocsEvent::NotLive { id, reason, .. }) => self.answer(id, Answer::NotLive(reason)),
-                Ok(DocsEvent::Ack { id, seq }) => {
-                    if self.inner(id, seq).is_none() {
+                Ok(DocsEvent::Ack { id, seq }) => match self.inner(id, seq) {
+                    None => {
+                        self.answered(id, seq);
                         self.route(id, Event::Acked(seq));
                     }
-                }
+                    // (An agent that answers an earlier fragment: not the app's; the change's ack is by its last.)
+                    Some(Inner::Of(_)) => {
+                        lock(&self.inner_seqs).remove(&(id, seq));
+                    }
+                    Some(Inner::Answered) => {}
+                },
                 Ok(DocsEvent::Status { doc, online, waiting, deleted, stopped }) => {
                     let ids = lock(&self.numbers).get(&doc).cloned().unwrap_or_default();
                     for id in ids {
@@ -280,7 +299,10 @@ impl Shared {
                     }
                 }
                 Ok(DocsEvent::Error { id: Some(id), seq: Some(seq), code, message }) => match self.inner(id, seq) {
-                    None => self.route(id, Event::Refused { seq, code, message }),
+                    None => {
+                        self.answered(id, seq);
+                        self.route(id, Event::Refused { seq, code, message });
+                    }
                     Some(Inner::Of(last)) => self.refuse_change(id, last, code, message),
                     Some(Inner::Answered) => {}
                 },
@@ -432,6 +454,12 @@ impl Documents {
             .spawn(move || read_loop(reader_shared, reader_socket))
             .map_err(|e| Error::Io(e.to_string()))?;
         Ok(Self { shared, reader: Some(reader), api })
+    }
+
+    /// How many numbers of changes in fragments the connection keeps answers for (none once each is answered).
+    #[cfg(test)]
+    pub(crate) fn kept_numbers(&self) -> usize {
+        lock(&self.shared.inner_seqs).len()
     }
 
     /// The local API version the agent spoke when this connected (at least [`LOCAL_API_FRAGMENTS`]): an app tells the
@@ -659,6 +687,7 @@ impl Drop for Document {
     fn drop(&mut self) {
         lock(&self.shared.routes).remove(&self.id);
         lock(&self.shared.wakers).remove(&self.id);
+        self.shared.forget(self.id);
         let mut numbers = lock(&self.shared.numbers);
         let doc = self.head.doc;
         let remaining = numbers.get_mut(&doc).map(|ids| {
@@ -725,6 +754,37 @@ mod tests {
         assert!(events.try_recv().is_err());
     }
 
+    /// The agent answers a change in fragments once, by its last number (as the agent's local API does): that ack is
+    /// the app's, and nothing is kept for the change after it. A refusal of an earlier fragment is the change's,
+    /// under its last number, once: every later answer for any of its numbers is dropped, and a document dropped
+    /// leaves nothing kept.
+    #[test]
+    fn a_change_is_answered_by_its_last_number_and_nothing_is_kept_after() {
+        let (shared, _listener) = shared();
+        let (events_tx, events) = mpsc::channel();
+        lock(&shared.routes).insert(7, events_tx);
+        let ack = |seq: u64| Message::Text(serde_json::to_string(&DocsEvent::Ack { id: 7, seq }).unwrap().into());
+        let refusal = |seq: u64| {
+            let e = DocsEvent::Error { id: Some(7), seq: Some(seq), code: "invalid".into(), message: "no".into() };
+            Message::Text(serde_json::to_string(&e).unwrap().into())
+        };
+        lock(&shared.inner_seqs).extend([((7, 1), Inner::Of(3)), ((7, 2), Inner::Of(3))]);
+        shared.on_message(ack(3));
+        assert_eq!(events.try_recv().unwrap(), Event::Acked(3));
+        assert!(lock(&shared.inner_seqs).is_empty(), "nothing kept after the change's ack");
+        // Fragments 4 to 6: the second refused, then each of the others too (a set refused fragment by fragment).
+        lock(&shared.inner_seqs).extend([((7, 4), Inner::Of(6)), ((7, 5), Inner::Of(6))]);
+        shared.on_message(refusal(5));
+        assert_eq!(events.try_recv().unwrap(), Event::Refused { seq: 6, code: "invalid".into(), message: "no".into() });
+        for seq in [4, 6, 5] {
+            shared.on_message(refusal(seq));
+        }
+        shared.on_message(ack(6));
+        assert!(events.try_recv().is_err(), "refused once, nothing for a number the app never had as an answer");
+        shared.forget(7);
+        assert!(lock(&shared.inner_seqs).is_empty(), "a document dropped leaves nothing");
+    }
+
     /// The agent's answers for fragments that aren't a change's last aren't the app's; a refusal of one is the
     /// change's, under its last number, once (the answers still to come for the change are dropped).
     #[test]
@@ -750,7 +810,6 @@ mod tests {
         assert_eq!(events.try_recv().unwrap(), Event::Refused { seq: 6, code: "invalid".into(), message: "no".into() });
         shared.on_message(refusal(6));
         assert!(events.try_recv().is_err(), "refused once");
-        assert!(lock(&shared.inner_seqs).is_empty());
     }
 
     /// `opened` then the state: one answer; the events after it go to the document, its status by document ID.
