@@ -167,6 +167,10 @@ pub struct Status {
     /// Another machine with the document open runs an older Craft Cloud ([`Peer::older`]): show "<machine> runs an
     /// older Craft Cloud; update it" (its name is in its presence, as the app sends it).
     pub older_peer: bool,
+    /// Changes from other machines that didn't read here (a bundle cut short, or one Loro refused), in this session:
+    /// never applied, each also said in `error`. The model may lack them; opening the document again brings what the
+    /// agent has.
+    pub unread: u64,
     /// The last error, for the app to show.
     pub error: Option<String>,
 }
@@ -608,9 +612,17 @@ impl<D: LiveDocument> Session<D> {
         doc.import(state.0)?;
         // The updates that are part of the state.
         let mut unread = None;
+        let mut unread_count = 0;
         for update in state.1 {
-            if let Err(e) = import_slices(&doc, &parts(update).unwrap_or_default()) {
+            // (A bundle that doesn't read is said and counted, never taken as an empty change.)
+            let Some(slices) = parts(update) else {
+                unread = Some("a change from another machine doesn't read (a bundle cut short)".to_owned());
+                unread_count += 1;
+                continue;
+            };
+            if let Err(e) = import_slices(&doc, &slices) {
                 unread = Some(format!("a change from another machine doesn't read: {e}"));
+                unread_count += 1;
             }
         }
         let collector = Arc::new(Mutex::new(Collector::default()));
@@ -658,6 +670,7 @@ impl<D: LiveDocument> Session<D> {
         session.reindex_trees();
         session.check_schema();
         session.status.error = unread;
+        session.status.unread = unread_count;
         if !ours {
             session.rebuild(Touched::everything())?;
         }
@@ -1225,9 +1238,13 @@ impl<D: LiveDocument> Session<D> {
                 Some(updates) => {
                     if let Err(e) = import_slices(&self.doc, &updates) {
                         self.status.error = Some(format!("a change from another machine doesn't read: {e}"));
+                        self.status.unread += 1;
                     }
                 }
-                None => self.status.error = Some("a change from another machine doesn't read (a bundle cut short)".into()),
+                None => {
+                    self.status.error = Some("a change from another machine doesn't read (a bundle cut short)".into());
+                    self.status.unread += 1;
+                }
             }
         }
         let raw = std::mem::take(&mut lock(&self.collector).raw);

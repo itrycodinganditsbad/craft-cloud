@@ -218,6 +218,26 @@ fn presence_goes_to_the_other_machine_and_fades() {
     assert!(a.peers()[&77].older());
 }
 
+/// A change that doesn't read (a bundle cut short) is never taken as an empty one, at open or after: it is said and
+/// counted.
+#[test]
+fn a_change_that_does_not_read_is_said_and_counted() {
+    let hub = Hub::new();
+    let (pc, laptop) = (hub.machine("pc").unwrap(), hub.machine("laptop").unwrap());
+    let mut a = open::<App>(&pc, "u.txt", Notes::new("u", &["one"]));
+    // Another app on the pc sends a bundle cut short (its count says five slices; none follow).
+    let docs = pc.client().documents().unwrap();
+    let Ok(craft_cloud_app::live::Opened::Live(raw)) = docs.open("u.txt", <App as craft_cloud_kit::LiveDocument>::APP) else { panic!("not live") };
+    let mut cut = b"ccb1".to_vec();
+    cut.extend_from_slice(&5u32.to_be_bytes());
+    raw.send(&cut).unwrap();
+    until(&mut [&mut a], "the pc's session hears it", |s| s[0].status().unread == 1);
+    assert!(a.status().error.as_deref().is_some_and(|e| e.contains("doesn't read")), "{:?}", a.status().error);
+    let b = open::<App>(&laptop, "u.txt", Notes::default());
+    assert_eq!(b.status().unread, 1, "at open too: {:?}", b.status().error);
+    assert_eq!(b.model().texts(), ["one"]);
+}
+
 #[test]
 fn blobs_go_through_the_agent_and_an_old_agent_says_so() {
     let hub = Hub::new();
