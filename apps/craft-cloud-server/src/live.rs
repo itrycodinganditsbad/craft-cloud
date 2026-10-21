@@ -716,20 +716,22 @@ impl Session {
             let mut found = Vec::new();
             if new_set {
                 let mut below_base = false;
+                // (The set's numbers, from this fragment's: one query for all of them, whatever the count says.)
+                let first = client_seq.saturating_sub(u64::from(index)).max(1);
+                let last = client_seq.saturating_add(u64::from(count).saturating_sub(u64::from(index) + 1));
+                let stored = self.state.meta.live_updates_sent(self.space, doc, self.device, first, last).await.map_err(|e| one(e.into()))?;
                 let mut base = None;
-                for i in (0..count).filter(|i| *i != index) {
-                    let Some(seq) = (client_seq + u64::from(i)).checked_sub(u64::from(index)).filter(|s| *s > 0) else { continue };
-                    let stored = self.state.meta.live_updates_sent(self.space, doc, self.device, seq).await.map_err(|e| one(e.into()))?;
-                    let Some((row, b)) =
-                        stored.into_iter().find(|(_, b)| parse(b).is_some_and(|g| g.set == set_id && g.index == i && g.count == count))
-                    else {
+                for (c, row, b) in stored {
+                    let Some(f) = parse(&b) else { continue };
+                    let at = (client_seq + u64::from(f.index)).checked_sub(u64::from(index));
+                    if f.set != set_id || f.count != count || f.index == index || at != Some(c) || found.iter().any(|(s, _)| *s == c) {
                         continue;
-                    };
+                    }
                     if base.is_none() {
                         base = Some(self.state.meta.live_doc(self.space, doc).await.map_err(|e| one(e.into()))?.map_or(0, |d| d.base));
                     }
                     below_base |= base.is_some_and(|base| row <= base);
-                    found.push((seq, b));
+                    found.push((c, b));
                 }
                 // Part of the set is at or below the snapshot's base (a device from before whole sets compacted past
                 // it): stored above it, the rest would be a set no machine ever gets whole. The agent starts this
