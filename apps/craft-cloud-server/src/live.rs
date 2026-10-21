@@ -569,8 +569,6 @@ impl Session {
             .then(|| ServerFrame::Presence { doc: note.doc, bytes: note.bytes.as_ref().clone() })
     }
 
-    /// The `compact` to ask this session's agent for, if the log above the snapshot is long (`upto - base` updates,
-    /// `above` bytes) and no other device is asked already.
     /// A compaction ask of this device for a document refused as full, at its head ([`Session::maybe_compact`]).
     async fn ask_when_full(&mut self, doc: DocId) -> Option<ServerFrame> {
         let found = self.state.meta.live_doc(self.space, doc).await.ok().flatten()?;
@@ -578,6 +576,8 @@ impl Session {
         self.maybe_compact(doc, found.head, found.base, above)
     }
 
+    /// The `compact` to ask this session's agent for, if the log above the snapshot is long (`upto - base` updates,
+    /// `above` bytes) and no other device is asked already.
     fn maybe_compact(&mut self, doc: DocId, upto: u64, base: u64, above: u64) -> Option<ServerFrame> {
         let limits = &self.state.limits;
         let long = upto.saturating_sub(base) > limits.compact_updates || above > limits.compact_bytes;

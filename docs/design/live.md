@@ -34,8 +34,9 @@ per app connection for live sessions. `run` serves it while signed out too. Call
   `status.autostart` says whether it is on (absent where the agent doesn't handle it). Signing out turns it off. The
   entry belongs to the agent with the default data folder only; an agent with a data folder of its own is refused
   (`autostart_failed`), reports nothing and leaves the entry alone when it signs out;
-- `GET /v1/status` → `{api, signed_in, account, server, folder, machine, online, run_state, autostart?,
-  last_sync_ms?, removed}` (`last_sync_ms`: when the last pass that didn't fail finished; `removed`: the server
+- `GET /v1/status` → `{api, api_max?, signed_in, account, server, folder, machine, online, run_state, autostart?,
+  last_sync_ms?, removed}` (`api`: the oldest local API version the agent speaks, `api_max` the newest, absent from
+  an agent that speaks one; an app takes an agent whose range overlaps its own; `last_sync_ms`: when the last pass that didn't fail finished; `removed`: the server
   refused this device at the last pass, so it was removed from the account and must sign out and join again). Something only a person can put
   right found as `run` starts (a damaged or newer `account.json`, a damaged token) keeps the agent up, signed out with
   `run_state` `paused` and the reason; every call but `logout` (which forgets the account here) and `quit` is answered
