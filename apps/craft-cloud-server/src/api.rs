@@ -473,8 +473,12 @@ async fn changes(
         // Subscribe before reading the sequence number, so a commit in between still wakes us.
         let mut updates = state.notifier.subscribe(auth.space);
         let mut stopping = state.notifier.shutdown_signal();
-        // Also before the sequence number, so a revoke while this request waits ends the wait.
+        // Listening for revocations first, then looking the device up: a revoke before the lookup is seen by it, one
+        // after it ends the wait, so none is missed between the sign-in check and the wait.
         let mut revocations = state.live.revocations();
+        if !state.meta.device_active(auth.device).await? {
+            return Err(ApiError::unauthorized());
+        }
         if state.meta.space_info(auth.space).await?.seq == q.since {
             let deadline = Duration::from_secs(q.wait.min(MAX_WAIT_SECS));
             // Whichever comes first: a commit, the deadline, the server shutting down, or this device signed out.
@@ -484,11 +488,14 @@ async fn changes(
                 () = revoked(&mut revocations, auth.device) => {}
             }
         }
-        // The sign-in check was before the wait: a device signed out meanwhile (by the API, or by the command line
-        // in another process, which wakes nothing) gets no change feed.
-        if !state.meta.device_active(auth.device).await? {
-            return Err(ApiError::unauthorized());
-        }
     }
-    Ok(Json(state.meta.changes(auth.space, q.since, cursor, q.limit.unwrap_or(MAX_PAGE_NODES)).await?))
+    let changes = state.meta.changes(auth.space, q.since, cursor, q.limit.unwrap_or(MAX_PAGE_NODES)).await?;
+    // A long-poll looks the device up once more after the fetch, the last thing before the answer: a device signed
+    // out while it waited or while the change set was read (by the API, or by the command line in another process,
+    // which wakes nothing) gets no change feed. A revoke that commits after this lookup is a sign-out that happened
+    // after the answer was decided.
+    if slot.is_some() && !state.meta.device_active(auth.device).await? {
+        return Err(ApiError::unauthorized());
+    }
+    Ok(Json(changes))
 }
