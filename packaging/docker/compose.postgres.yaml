@@ -1,0 +1,96 @@
+# Overlay for Postgres instead of SQLite:
+#   docker compose -f compose.yaml -f compose.postgres.yaml up -d --wait
+# Adds the `db` container (on the internal `backend` network, which Caddy is not attached to) and `db-init`, which
+# creates the server's database role. The data volume still holds the blobs.
+#
+# The connection is not encrypted: the server's sqlx has no TLS feature. That is acceptable on an internal network of
+# one host only. An external Postgres over TLS is not covered.
+
+x-postgres-image: &postgres-image postgres:17-alpine@sha256:266d3c257594e195b309ae9d1805e54c788f1d7b375f56bf6c367aac6c917e7b
+
+services:
+  # Compose puts a file secret into the container's root filesystem, so this one service cannot be read-only here.
+  secrets-init:
+    read_only: false
+    environment:
+      DB_KIND: postgres
+    secrets:
+      - db_superuser_password
+      - db_password
+
+  db:
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    image: *postgres-image
+    environment:
+      POSTGRES_DB: craft_cloud
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_superuser_password
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --data-checksums"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Read by the image's entrypoint while it still runs as root.
+      - type: volume
+        source: secrets
+        target: /run/secrets
+        read_only: true
+        volume: {subpath: db}
+    depends_on:
+      secrets-init: {condition: service_completed_successfully}
+    tmpfs:
+      - /tmp
+      - /run/postgresql
+    # The entrypoint starts as root to fix the ownership of the data directory and then drops to the postgres user; it
+    # needs exactly these capabilities.
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE, SETUID, SETGID]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "craft_cloud"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks: [backend]
+    mem_limit: 1g
+    pids_limit: 200
+    stop_grace_period: 60s
+
+  # Creates the database role of the server, or refreshes its password. Runs on every `up`; safe to run again.
+  db-init:
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+    image: *postgres-image
+    # The postgres user of the alpine image.
+    user: "70:70"
+    entrypoint: ["/bin/sh", "/db-init.sh"]
+    environment:
+      PGHOST: db
+      PGDATABASE: craft_cloud
+    volumes:
+      - ./db-init.sh:/db-init.sh:ro
+      - type: volume
+        source: secrets
+        target: /run/secrets
+        read_only: true
+        volume: {subpath: db-init}
+    depends_on:
+      db: {condition: service_healthy}
+    healthcheck: {disable: true}
+    networks: [backend]
+    mem_limit: 128m
+    pids_limit: 50
+
+  server:
+    depends_on:
+      db-init: {condition: service_completed_successfully}
+    networks: [backend]
+
+volumes:
+  pgdata: {}
+
+secrets:
+  db_superuser_password: {environment: CC_SECRET_DB_SUPERUSER_PASSWORD}
+  db_password: {environment: CC_SECRET_DB_PASSWORD}

@@ -1,0 +1,147 @@
+# Docker Compose deployment of Craft Cloud: the server (SQLite and local disk) behind Caddy, which terminates TLS.
+# Postgres and S3 are overlays: -f compose.yaml -f compose.postgres.yaml [-f compose.s3.yaml]. See "Docker" in
+# docs/server.md, and run ./install.sh for a first setup.
+#
+#   ./install.sh                                  # writes .env, builds the image, starts the stack
+#   docker compose up -d --wait                   # after that
+#
+# Secrets never appear in this file or in the environment of a service that runs. Compose reads them from the
+# gitignored .env and gives them to the one-shot `secrets-init` service only, which writes them as files (mode 0400,
+# owned by the reading user) into the `secrets` volume. Every other service mounts just its own subdirectory
+# read-only.
+#
+# Volume subpaths (used below) need Docker Compose 2.32 or newer.
+
+name: craft-cloud
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: "no"
+
+services:
+  # Renders config.toml and distributes the secrets (see secrets-init.sh). It has no network at all, runs as root for
+  # about a second and needs only the capabilities to change the owner and mode of the files it writes.
+  secrets-init:
+    <<: *hardening
+    # Any image with busybox will do; the one of Caddy is needed anyway.
+    image: caddy:2.11-alpine@sha256:e70b164da81ef698b3ad19af799ea6086ce6d9e48ed4079eb9fe26f6fbf14ee5
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/secrets-init.sh"]
+    network_mode: none
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    # Not secrets: what render-config.sh puts into config.toml.
+    environment:
+      PUBLIC_URL: ${CC_PUBLIC_URL:?set CC_PUBLIC_URL in .env, or run ./install.sh}
+      TRUSTED_PROXY: ${CC_CADDY_IP:-172.29.215.2}
+      DB_KIND: sqlite
+      STORAGE_KIND: disk
+    volumes:
+      - ./secrets-init.sh:/secrets-init.sh:ro
+      - ./render-config.sh:/render-config.sh:ro
+      - ./config.toml.in:/config.toml.in:ro
+      - secrets:/out
+    healthcheck: {disable: true}
+    mem_limit: 64m
+    pids_limit: 50
+
+  server:
+    <<: *hardening
+    restart: unless-stopped
+    image: ${CC_IMAGE:-craft-cloud:local}
+    build:
+      context: ../..
+      dockerfile: packaging/docker/Dockerfile
+      args:
+        CRAFT_CLOUD_VERSION: ${CC_VERSION:-0.0.0}
+        CRAFT_CLOUD_REVISION: ${CC_REVISION:-unknown}
+    user: "65532:65532"
+    command: ["serve", "--config", "/etc/craft-cloud/config.toml"]
+    volumes:
+      # The SQLite database and the blobs. A new named volume inherits the owner (65532) and mode (0700) of the image's
+      # directory. A bind mount must be given both first: chown 65532:65532 DIR && chmod 0700 DIR.
+      - data:/var/lib/craft-cloud
+      - type: volume
+        source: secrets
+        target: /etc/craft-cloud
+        read_only: true
+        volume: {subpath: server}
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    depends_on:
+      secrets-init: {condition: service_completed_successfully}
+    # The image has no shell and no curl: the binary asks its own listener.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/craft-cloud-server", "healthcheck", "--addr", "127.0.0.1:8080"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks: [frontend]
+    mem_limit: 1g
+    pids_limit: 512
+    stop_grace_period: 30s
+
+  caddy:
+    <<: *hardening
+    restart: unless-stopped
+    image: caddy:2.11-alpine@sha256:e70b164da81ef698b3ad19af799ea6086ce6d9e48ed4079eb9fe26f6fbf14ee5
+    ports:
+      - "${CC_HTTP_PORT:-80}:80"
+      - "${CC_HTTPS_PORT:-443}:443"
+      - "${CC_HTTPS_PORT:-443}:443/udp"
+    environment:
+      CC_DOMAIN: ${CC_DOMAIN:?set CC_DOMAIN in .env, or run ./install.sh}
+      CC_TLS_MODE: ${CC_TLS_MODE:-acme}
+      CC_PUBLIC_URL: ${CC_PUBLIC_URL:?set CC_PUBLIC_URL in .env, or run ./install.sh}
+      CC_ACME_EMAIL: ${CC_ACME_EMAIL:-}
+    volumes:
+      - ./caddy:/etc/caddy:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      # Only read in the `custom` TLS mode.
+      - ${CC_TLS_DIR:-./tls}:/certs:ro
+    tmpfs:
+      - /tmp
+    # Runs as root inside the container (the official image does), with no capability except binding ports 80 and 443.
+    cap_add: [NET_BIND_SERVICE]
+    depends_on:
+      server: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      edge: {}
+      # The fixed address the server lists in trusted_proxies.
+      frontend:
+        ipv4_address: ${CC_CADDY_IP:-172.29.215.2}
+    mem_limit: 256m
+    pids_limit: 200
+
+networks:
+  # Published ports and outbound access (ACME); only Caddy is attached.
+  edge:
+    ipam:
+      config:
+        - subnet: ${CC_EDGE_SUBNET:-172.29.216.0/24}
+  # Caddy to the server. `internal`: no route to the outside world.
+  frontend:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${CC_FRONTEND_SUBNET:-172.29.215.0/24}
+  # Server and database in the Postgres profile. `internal`, and Caddy is not attached.
+  backend:
+    internal: true
+
+volumes:
+  # The SQLite database and, with disk storage, the blobs: the data to back up.
+  data: {}
+  # config.toml and the secret files written by `secrets-init`, one directory per consuming service.
+  secrets: {}
+  caddy_data: {}
+  caddy_config: {}

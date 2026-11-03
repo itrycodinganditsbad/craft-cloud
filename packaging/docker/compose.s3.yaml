@@ -1,0 +1,29 @@
+# Overlay for S3-compatible storage instead of the local disk (combine it with compose.postgres.yaml if you like):
+#   docker compose -f compose.yaml -f compose.s3.yaml up -d --wait
+# Set CC_S3_* and CC_SECRET_S3_* in .env. The keys go into config.toml (mode 0400, readable by the server only) like
+# the database password; they are not in the server's environment.
+#
+# The server needs a route to the S3 endpoint, so it also joins the `edge` network, the only one with outbound access.
+# That network publishes no port of the server.
+
+services:
+  # Compose puts a file secret into the container's root filesystem, so this one service cannot be read-only here.
+  secrets-init:
+    read_only: false
+    environment:
+      STORAGE_KIND: s3
+      S3_BUCKET: ${CC_S3_BUCKET:?set CC_S3_BUCKET in .env}
+      S3_PREFIX: ${CC_S3_PREFIX:-}
+      S3_REGION: ${CC_S3_REGION:-us-east-1}
+      S3_ENDPOINT: ${CC_S3_ENDPOINT:-}
+      S3_ALLOW_HTTP: ${CC_S3_ALLOW_HTTP:-false}
+    secrets:
+      - s3_access_key_id
+      - s3_secret_access_key
+
+  server:
+    networks: [edge]
+
+secrets:
+  s3_access_key_id: {environment: CC_SECRET_S3_ACCESS_KEY_ID}
+  s3_secret_access_key: {environment: CC_SECRET_S3_SECRET_ACCESS_KEY}
