@@ -32,7 +32,10 @@ pub use live::{
     MAX_LIVE_DOCUMENTS_HOLDING_UPDATES, MAX_LIVE_DOCUMENTS_PER_SPACE, MAX_LIVE_PAGE, SnapshotRef,
 };
 pub use tree::{MAX_PAGE_SAVE_BYTES, SpaceInfo};
-pub use users::{DeviceAuth, DeviceRecord, Role, UserId, UserRecord, valid_username};
+pub use users::{
+    AccountRecord, CLIENT_KINDS, DeviceAuth, DeviceClient, DeviceRecord, MAX_CLIENT_FIELD_BYTES, RevokeReason, Role, UserId, UserRecord,
+    valid_username,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetaError {

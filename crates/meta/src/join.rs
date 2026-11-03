@@ -18,7 +18,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::codec::{uuid_bytes, uuid_from};
-use crate::users::{check_device_name, insert_device, insert_user};
+use crate::users::{DeviceClient, check_device_name, insert_device, insert_user};
 use crate::{Meta, MetaError, Role, UserId, valid_username};
 
 /// The account an invite is for, from [`Meta::create_invite`].
@@ -164,7 +164,21 @@ impl Meta {
         new_password_hash: Option<&str>,
         now_ms: i64,
     ) -> Result<Redeemed, MetaError> {
+        self.redeem_with(code_hash, device_name, &DeviceClient::default(), token_hash, new_password_hash, now_ms).await
+    }
+
+    /// [`Meta::redeem`] for a device that says what client it is.
+    pub async fn redeem_with(
+        &self,
+        code_hash: &[u8; 32],
+        device_name: &str,
+        client: &DeviceClient,
+        token_hash: &[u8; 32],
+        new_password_hash: Option<&str>,
+        now_ms: i64,
+    ) -> Result<Redeemed, MetaError> {
         check_device_name(device_name)?;
+        client.check()?;
         let device = DeviceId::generate();
         let mut w = self.begin_write().await?;
         let invite = sqlx::query("DELETE FROM invites WHERE code_hash = $1 AND expires_ms > $2 RETURNING user_id")
@@ -203,7 +217,7 @@ impl Meta {
                 UserId(uuid_from(&pairing.try_get::<Vec<u8>, _>("user_id")?)?)
             }
         };
-        insert_device(&mut w.tx, device, user, device_name, token_hash, now_ms).await?;
+        insert_device(&mut w.tx, device, user, device_name, client, token_hash, now_ms).await?;
         w.commit().await?;
         Ok(Redeemed { user, device })
     }
