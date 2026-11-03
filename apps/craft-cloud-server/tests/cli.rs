@@ -294,3 +294,106 @@ fn the_binary_serves_what_init_created() {
     assert!(body.starts_with("HTTP/1.1 200"), "{body}");
     assert!(body.contains("\"chunker_params\":[\"fastcdc-v1\"]"), "{body}");
 }
+
+/// A listener on a free loopback port that answers every connection with `reply` (or, with `None`, reads the
+/// request and then stays silent until `hold` has passed), for `healthcheck` to ask.
+fn fake_server(reply: Option<&'static str>, hold: Duration) -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { return };
+            let mut request = [0u8; 512];
+            let _ = conn.read(&mut request);
+            match reply {
+                Some(text) => {
+                    let _ = conn.write_all(text.as_bytes());
+                }
+                None => std::thread::sleep(hold),
+            }
+        }
+    });
+    addr
+}
+
+fn healthcheck(addr: std::net::SocketAddr) -> std::process::Output {
+    Process::new(env!("CARGO_BIN_EXE_craft-cloud-server")).args(["healthcheck", "--addr", &addr.to_string()]).output().unwrap()
+}
+
+#[test]
+fn healthcheck_succeeds_only_on_a_200() {
+    let ok = fake_server(Some("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}"), Duration::ZERO);
+    let out = healthcheck(ok);
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty() && out.stderr.is_empty());
+
+    let broken = fake_server(Some("HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n"), Duration::ZERO);
+    let out = healthcheck(broken);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("status 500") && !stderr.contains("panicked"), "{stderr}");
+
+    let not_http = fake_server(Some("hello there\r\n"), Duration::ZERO);
+    let out = healthcheck(not_http);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8(out.stderr).unwrap().contains("not an HTTP answer"));
+}
+
+#[test]
+fn healthcheck_fails_with_nobody_listening_and_with_a_bad_address() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let out = healthcheck(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("can't connect") && !stderr.contains("panicked"), "{stderr}");
+
+    let out = Process::new(env!("CARGO_BIN_EXE_craft-cloud-server")).args(["healthcheck", "--addr", "not an address"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8(out.stderr).unwrap().contains("bad address"));
+}
+
+#[test]
+fn healthcheck_gives_up_on_an_answer_that_never_comes() {
+    // Called in-process with a short timeout so the test stays quick; the binary uses `HEALTH_TIMEOUT`.
+    let silent = fake_server(None, Duration::from_secs(5));
+    let started = Instant::now();
+    let result = craft_cloud_server::cli::check_health(silent, Duration::from_millis(300));
+    assert!(matches!(result, Err(CliError::Usage(m)) if m.contains("no answer in time")));
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    let started = Instant::now();
+    let out = healthcheck(silent);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+}
+
+#[test]
+fn healthcheck_is_ok_against_the_real_server() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let exe = env!("CARGO_BIN_EXE_craft-cloud-server");
+    let mut init = Process::new(exe)
+        .args(["init", "--dir", dir.to_str().unwrap(), "--admin", "ana", "--listen", &format!("127.0.0.1:{port}")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    init.stdin.take().unwrap().write_all(b"admin password 1\n").unwrap();
+    assert!(init.wait().unwrap().success());
+    let _server =
+        Server(Process::new(exe).args(["serve", "--config", dir.join("config.toml").to_str().unwrap()]).stderr(Stdio::null()).spawn().unwrap());
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if healthcheck(addr).status.success() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the server never became healthy");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
