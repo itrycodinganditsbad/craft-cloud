@@ -78,6 +78,9 @@ services:
         volume: {subpath: db-init}
     depends_on:
       db: {condition: service_healthy}
+    # For the private password file db-init.sh writes.
+    tmpfs:
+      - /tmp:size=1m,mode=1777,noexec,nosuid,nodev
     healthcheck: {disable: true}
     networks: [backend]
     mem_limit: 128m

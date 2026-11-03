@@ -128,12 +128,14 @@ networks:
     ipam:
       config:
         - subnet: ${CC_EDGE_SUBNET:-172.29.216.0/24}
-  # Caddy to the server. `internal`: no route to the outside world.
+  # Caddy to the server. `internal`: no route to the outside world. The other containers get their addresses from the
+  # upper half, so none of them can take Caddy's fixed address (CC_CADDY_IP) first.
   frontend:
     internal: true
     ipam:
       config:
         - subnet: ${CC_FRONTEND_SUBNET:-172.29.215.0/24}
+          ip_range: ${CC_FRONTEND_POOL:-172.29.215.128/25}
   # Server and database in the Postgres profile. `internal`, and Caddy is not attached.
   backend:
     internal: true

@@ -134,7 +134,8 @@ and then `docker compose up -d`.
 
 The server believes `X-Forwarded-For` only from Caddy. `trusted_proxies` takes single addresses, no networks, so
 Caddy has a fixed address (`CC_CADDY_IP`, `172.29.215.2` in the network `CC_FRONTEND_SUBNET`, `172.29.215.0/24`). If
-these defaults clash with a network on your host, change both together.
+these defaults clash with a network on your host, change both together, and `CC_FRONTEND_POOL` (where the other
+containers get addresses from) with them.
 
 ### TLS modes
 
@@ -148,7 +149,7 @@ Set `CC_TLS_MODE` in `.env`:
   readable by root only, and restart Caddy to load a renewed one.
 
 Caddy sets a request header timeout of 10 seconds, as the checklist above asks. It writes no access log, because URLs hold invite
-codes (`/join/<code>`).
+codes (`/join/<code>`); its error log leaves out the request's URI and headers for the same reason.
 
 ### Postgres
 
@@ -176,8 +177,8 @@ leaves the internal `backend` network. An external Postgres over TLS is not cove
 `compose.s3.yaml` replaces the disk storage with an S3 bucket: fill in the `CC_S3_*` and `CC_SECRET_S3_*` lines of
 `.env.example` in `.env` and add `compose.s3.yaml` to `COMPOSE_FILE`. The keys end up in `config.toml` like the
 database password, not in the server's environment. The server joins the `edge` network to reach the endpoint. The
-image holds the CA certificates the server needs for HTTPS endpoints. This overlay has only been written, not yet
-run against a real S3 service.
+image holds the CA certificates the server needs for HTTPS endpoints. The overlay has been tried with a local S3 mock
+over plain HTTP (`CC_S3_ALLOW_HTTP=true`), not with a real S3 service or an HTTPS endpoint.
 
 ### The first admin and more accounts
 
@@ -211,8 +212,8 @@ There is no backup automation yet. Stop the server (`docker compose stop server`
 
 - `secrets-init` fails with a message such as `PUBLIC_URL has a value that is empty or has characters that are not
   allowed`: a setting in `.env` is wrong. The message names the setting and never shows the value.
-- The server exits at once with a permission error on `/var/lib/craft-cloud`: the data directory is not owned by
-  65532 (see bind mounts above).
+- The server exits at once with `unable to open database file`: the data directory is not owned by 65532 (see bind
+  mounts above).
 - `server` is not healthy: `docker compose logs server`. The check is `craft-cloud-server healthcheck`, a
   `GET /api/info` request to `127.0.0.1:8080` inside the container.
 - All devices share one sign-in budget: `trusted_proxies` does not contain Caddy's address. `CC_CADDY_IP` must lie in
