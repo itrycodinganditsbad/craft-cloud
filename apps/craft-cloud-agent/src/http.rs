@@ -505,7 +505,8 @@ pub async fn login_over<C: Connection>(
     password: &str,
     device_name: &str,
 ) -> Result<LoginResponse, TransportError> {
-    let body = LoginRequest { username: username.to_owned(), password: password.to_owned(), device_name: device_name.to_owned() };
+    let body =
+        LoginRequest { username: username.to_owned(), password: password.to_owned(), device_name: device_name.to_owned(), ..LoginRequest::default() };
     let req = request(Method::POST, server.endpoint("auth/login"), None, 0).json(&body)?;
     json(connection.send(req).await?, MAX_SMALL_JSON_BYTES).await
 }
@@ -542,7 +543,8 @@ pub async fn join_over<C: Connection>(
     device_name: &str,
     password: Option<&str>,
 ) -> Result<LoginResponse, JoinError> {
-    let body = JoinRequest { code: code.to_owned(), device_name: device_name.to_owned(), password: password.map(str::to_owned) };
+    let body =
+        JoinRequest { code: code.to_owned(), device_name: device_name.to_owned(), password: password.map(str::to_owned), ..JoinRequest::default() };
     let req = request(Method::POST, server.endpoint("join"), None, 0).json(&body).map_err(JoinError::Transport)?;
     let resp = connection.send(req).await.map_err(JoinError::Transport)?;
     if resp.status.is_success() {
@@ -811,7 +813,12 @@ mod tests {
     #[test]
     fn requests_keep_bodies_and_tokens_out_of_debug_output() {
         let server = ServerUrl::parse("http://127.0.0.1:1").unwrap();
-        let body = LoginRequest { username: "ana".into(), password: "correct horse battery".into(), device_name: "laptop".into() };
+        let body = LoginRequest {
+            username: "ana".into(),
+            password: "correct horse battery".into(),
+            device_name: "laptop".into(),
+            ..LoginRequest::default()
+        };
         let login = request(Method::POST, server.endpoint("auth/login"), None, 0).json(&body).unwrap();
         let shown = format!("{login:?}");
         assert!(!shown.contains("correct horse") && !shown.contains("ana"), "{shown}");

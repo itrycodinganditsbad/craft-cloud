@@ -2,6 +2,7 @@
 //! (`craft-cloud-store`), the live service on a WebSocket ([`live`]), plus the admin command line.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod account;
 pub mod api;
 pub mod auth;
 pub mod cli;

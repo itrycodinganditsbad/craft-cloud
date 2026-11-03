@@ -57,9 +57,9 @@ pub const MAX_LOCAL_JSON_BYTES: usize = 1024 * 1024;
 /// `invalid`, `unauthorized` (the token), `not_found`, `too_large` and `internal`.
 pub mod codes {
     /// A `Host` that isn't `127.0.0.1:<port>`, or an `Origin` header: the request didn't come from a local program.
-    pub const FORBIDDEN: &str = "forbidden";
+    pub const FORBIDDEN: &str = crate::api::codes::FORBIDDEN;
     /// `login`: the server refused the username or password.
-    pub const WRONG_PASSWORD: &str = "wrong_password";
+    pub const WRONG_PASSWORD: &str = crate::api::codes::WRONG_PASSWORD;
     /// `login` while signed in: sign out first.
     pub const ALREADY_SIGNED_IN: &str = "already_signed_in";
     /// `logout`, or recents, while signed out.
