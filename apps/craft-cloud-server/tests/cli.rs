@@ -343,6 +343,24 @@ fn healthcheck_succeeds_only_on_a_200() {
 }
 
 #[test]
+fn healthcheck_needs_a_complete_status_line() {
+    // Stops inside the status line, with and without closing the connection later.
+    let truncated = fake_server(Some("HTTP/1.1 200"), Duration::ZERO);
+    let out = healthcheck(truncated);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8(out.stderr).unwrap().contains("ended inside the status line"));
+
+    // More than the buffer holds without a line end.
+    let endless = fake_server(Some("HTTP/1.1 200 OK xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"), Duration::ZERO);
+    let out = healthcheck(endless);
+    assert_eq!(out.status.code(), Some(1));
+
+    // A bare line feed is not a status line end.
+    let bare = fake_server(Some("HTTP/1.1 200 OK\n"), Duration::ZERO);
+    assert_eq!(healthcheck(bare).status.code(), Some(1));
+}
+
+#[test]
 fn healthcheck_fails_with_nobody_listening_and_with_a_bad_address() {
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let out = healthcheck(std::net::SocketAddr::from(([127, 0, 0, 1], port)));

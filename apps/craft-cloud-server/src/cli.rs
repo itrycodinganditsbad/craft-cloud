@@ -285,24 +285,25 @@ pub fn check_health(addr: SocketAddr, timeout: Duration) -> Result<(), CliError>
     let request = format!("GET /api/info HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     stream.set_write_timeout(left()).map_err(|e| fail(&e.to_string()))?;
     stream.write_all(request.as_bytes()).map_err(|e| fail(&format!("can't send the request: {e}")))?;
-    // The status line fits in 64 bytes; a server that sends more before a line ending is not answering HTTP.
+    // The status line fits in 64 bytes. It counts only when it is complete (ends in CRLF): an answer that stops inside
+    // it, or goes on for 64 bytes without a line end, is not a healthy server.
     let mut head = [0u8; 64];
     let mut len = 0;
-    loop {
+    let line_end = loop {
+        if let Some(end) = head.get(..len).and_then(|read| read.windows(2).position(|pair| pair == b"\r\n")) {
+            break end;
+        }
         let wait = left().ok_or_else(|| fail("no answer in time"))?;
         stream.set_read_timeout(Some(wait)).map_err(|e| fail(&e.to_string()))?;
-        let Some(room) = head.get_mut(len..).filter(|room| !room.is_empty()) else { break };
+        let Some(room) = head.get_mut(len..).filter(|room| !room.is_empty()) else { return Err(fail("not an HTTP answer")) };
         match stream.read(room) {
-            Ok(0) => break,
+            Ok(0) => return Err(fail("the answer ended inside the status line")),
             Ok(n) => len += n,
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Err(fail("no answer in time")),
             Err(e) => return Err(fail(&format!("can't read the answer: {e}"))),
         }
-        if head.get(..len).is_some_and(|read| read.contains(&b'\n')) {
-            break;
-        }
-    }
-    let line = String::from_utf8_lossy(head.get(..len).unwrap_or_default());
+    };
+    let line = String::from_utf8_lossy(head.get(..line_end).unwrap_or_default());
     let mut parts = line.split_whitespace();
     match (parts.next(), parts.next()) {
         (Some(version), Some("200")) if version.starts_with("HTTP/1.") => Ok(()),
