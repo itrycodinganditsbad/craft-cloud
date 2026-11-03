@@ -349,6 +349,9 @@ impl Meta {
     /// first time and reason, and the call succeeds.
     pub async fn revoke_device_as(&self, user: UserId, device: DeviceId, reason: RevokeReason, now_ms: i64) -> Result<(), MetaError> {
         let mut w = self.begin_write().await?;
+        if !lock_user(&mut w.tx, user).await? {
+            return Err(MetaError::NotFound("device"));
+        }
         let done = sqlx::query("UPDATE devices SET revoked = 1, revoked_ms = $1, revoke_reason = $2 WHERE id = $3 AND user_id = $4 AND revoked = 0")
             .bind(now_ms)
             .bind(reason.as_str())
@@ -400,6 +403,9 @@ impl Meta {
     /// devices made, in one transaction. Returns the devices revoked, for the caller to end their live connections.
     pub async fn revoke_other_devices(&self, user: UserId, keep: DeviceId, reason: RevokeReason, now_ms: i64) -> Result<Vec<DeviceId>, MetaError> {
         let mut w = self.begin_write().await?;
+        if !lock_user(&mut w.tx, user).await? {
+            return Ok(Vec::new());
+        }
         let revoked = revoke_devices(&mut w.tx, user, Some(keep), reason, now_ms).await?;
         w.commit().await?;
         Ok(revoked)
@@ -408,6 +414,9 @@ impl Meta {
     /// [`Meta::revoke_other_devices`] for every device of `user` (the admin's command line).
     pub async fn revoke_all_devices(&self, user: UserId, reason: RevokeReason, now_ms: i64) -> Result<Vec<DeviceId>, MetaError> {
         let mut w = self.begin_write().await?;
+        if !lock_user(&mut w.tx, user).await? {
+            return Ok(Vec::new());
+        }
         let revoked = revoke_devices(&mut w.tx, user, None, reason, now_ms).await?;
         w.commit().await?;
         Ok(revoked)
@@ -428,6 +437,8 @@ impl Meta {
         now_ms: i64,
     ) -> Result<Vec<DeviceId>, MetaError> {
         let mut w = self.begin_write().await?;
+        // The user's row first, as everywhere (see `lock_user`).
+        lock_user(&mut w.tx, user).await?;
         // The caller's device must still be signed in: its Argon2 checks took a while, and a revoke since would
         // otherwise leave a password changed by a device that is signed out. The no-op update locks the row on
         // both databases, so a revoke running now waits for this transaction (and then finds the device kept).
@@ -460,6 +471,7 @@ impl Meta {
     /// `NotFound` for a user that isn't there. Returns the devices revoked.
     pub async fn reset_password(&self, user: UserId, new_hash: &str, keep_devices: bool, now_ms: i64) -> Result<Vec<DeviceId>, MetaError> {
         let mut w = self.begin_write().await?;
+        lock_user(&mut w.tx, user).await?;
         let done = sqlx::query("UPDATE users SET password_hash = $1, password_changed_ms = $2 WHERE id = $3")
             .bind(new_hash)
             .bind(now_ms)
@@ -474,6 +486,16 @@ impl Meta {
         w.commit().await?;
         Ok(revoked)
     }
+}
+
+/// Takes the row lock of `user` (a no-op update, so nothing changes), and says whether the user exists. Every
+/// transaction that revokes devices or changes a password takes it first, then the rows of the devices, then those of
+/// the pairings: one order for all of them, so two of them at once (a password change from one device, a sign-out of
+/// the others from another, an admin reset) wait for each other on Postgres and never deadlock. SQLite writers are
+/// serialised already.
+async fn lock_user(tx: &mut sqlx::Transaction<'static, sqlx::Any>, user: UserId) -> Result<bool, MetaError> {
+    let done = sqlx::query("UPDATE users SET username = username WHERE id = $1").bind(uuid_bytes(&user.0)).execute(&mut **tx).await?;
+    Ok(done.rows_affected() > 0)
 }
 
 fn device_record(row: &sqlx::any::AnyRow) -> Result<DeviceRecord, MetaError> {

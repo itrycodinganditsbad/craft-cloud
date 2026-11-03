@@ -145,6 +145,7 @@ on_every_backend!(
     revoking_others_keeps_the_caller_and_ends_their_pairings,
     a_password_change_is_one_step,
     an_admin_reset_signs_out_every_device_unless_kept,
+    concurrent_password_changes_and_sign_outs_never_fail_the_database,
 );
 
 // ---- helpers ----
@@ -2046,6 +2047,35 @@ async fn an_admin_reset_signs_out_every_device_unless_kept(meta: &Meta) {
     assert!(matches!(meta.reset_password(UserId(uuid::Uuid::now_v7()), "$argon2id$x", false, NOW).await, Err(MetaError::NotFound(_))));
 }
 
+/// A password change from one device, a sign-out of the others from another and an admin reset, at the same moment
+/// and over and over: each ends as a success or as a conflict or a signed-out caller, never as a database error (on
+/// Postgres, two transactions taking the same rows in different orders would deadlock and one would fail).
+async fn concurrent_password_changes_and_sign_outs_never_fail_the_database(meta: &Meta) {
+    for round in 0..15 {
+        let ana = user(meta, &format!("ana{round}")).await;
+        let (a, b) = (device(meta, &ana).await, device(meta, &ana).await);
+        let mut tasks = Vec::new();
+        for job in 0..6 {
+            let meta = meta.clone();
+            tasks.push(tokio::spawn(async move {
+                match job {
+                    0 => meta.change_password(ana.id, "$argon2id$stub", "$argon2id$one", a, NOW + 1).await.map(|_| ()),
+                    1 => meta.change_password(ana.id, "$argon2id$stub", "$argon2id$two", b, NOW + 1).await.map(|_| ()),
+                    2 => meta.revoke_other_devices(ana.id, b, RevokeReason::Others, NOW + 1).await.map(|_| ()),
+                    3 => meta.revoke_device_as(ana.id, a, RevokeReason::User, NOW + 1).await,
+                    4 => meta.reset_password(ana.id, "$argon2id$reset", false, NOW + 1).await.map(|_| ()),
+                    _ => meta.revoke_all_devices(ana.id, RevokeReason::Admin, NOW + 1).await.map(|_| ()),
+                }
+            }));
+        }
+        for task in tasks {
+            let result = task.await.unwrap();
+            assert!(matches!(result, Ok(()) | Err(MetaError::Conflict(_) | MetaError::DeviceRevoked)), "round {round}: {result:?}");
+        }
+        assert_revoke_columns_agree(&meta.list_devices(ana.id).await.unwrap());
+    }
+}
+
 // ---- the migration from 0006 to 0007 ----
 
 /// Drops what migration 0007 added and forgets it ran, which leaves the database as 0006 left it (with its rows).
@@ -2151,6 +2181,7 @@ async fn mend_pairing_deletes(url: &str) {
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
     sqlx::query("DROP TRIGGER cc_test_boom ON pairings").execute(&mut conn).await.ok();
     sqlx::query("DROP TRIGGER cc_test_boom").execute(&mut conn).await.ok();
+    sqlx::query("DROP FUNCTION cc_test_boom()").execute(&mut conn).await.ok();
 }
 
 /// A step that fails after others were written undoes them all: the hash, the time, the devices, the pairings and
