@@ -70,8 +70,9 @@ An account's devices (computers and apps) each hold a token that does not expire
   without touching the password. `device revoke name DEVICE_ID` signs out one; `device list name` shows them.
 
 The command line runs in its own process, so it cannot reach the server's open connections. A signed-out device's live
-connection ends at its next ping (within about 30 seconds), and a change-feed long-poll within 60 seconds; every
-other request is refused at once (`401 unauthorized`). Devices signed out through the API end their live connections
+connection ends at its next ping (within about 30 seconds), and a change-feed long-poll within 60 seconds (when it
+ends, it is answered `401 unauthorized`, never with changes); every other request is refused at once (`401
+unauthorized`). Devices signed out through the API end their live connections
 immediately.
 
 ## Upgrading

@@ -1477,6 +1477,7 @@ on_sqlite_and_postgres!(
     other_devices_are_signed_out_at_once,
     revoking_a_device_records_why_once,
     an_older_client_reads_the_device_list,
+    a_waiting_long_poll_of_a_signed_out_device_gets_no_changes,
 );
 
 async fn devices_of(s: &Server, token: &str) -> Vec<DeviceInfo> {
@@ -1843,4 +1844,60 @@ async fn password_changes_wait_for_a_free_check_slot_and_cost_no_try() {
     assert_eq!(change_password(&s, &pc, PASSWORD, "a brand new password").await.status(), StatusCode::NO_CONTENT);
     // The slot is given back after the change.
     assert_eq!(login_with(&s, "ana", "a brand new password").await.status(), StatusCode::OK);
+}
+
+/// A device signed out while its `/changes` long-poll waits is told so (401) instead of being sent the next change
+/// set: when the API signs it out (the wait ends at once) and when something else does, such as the command line in
+/// another process, which wakes nothing (the next commit ends the wait, and the device is looked up again).
+async fn a_waiting_long_poll_of_a_signed_out_device_gets_no_changes(s: &Server) {
+    add_user(s, "ana").await;
+    let other = login(s, "ana").await;
+    let ana = s.meta.user_by_name("ana").await.unwrap().unwrap();
+    let poll = |token: String, since: u64| {
+        let (client, url) = (s.client.clone(), format!("{}/changes?since={since}&wait=30", s.base));
+        tokio::spawn(async move { client.get(url).bearer_auth(token).send().await.unwrap() })
+    };
+    let commit_a_file = |name: &'static str| {
+        let other = other.clone();
+        async move {
+            let data = format!("{name} {}", uuid::Uuid::now_v7()).into_bytes();
+            let manifest = upload(s, &other, &data).await;
+            let parent = root(s, &other).await;
+            assert_eq!(commit(s, &other, &[create(NodeId::generate(), parent, name, manifest)]).await.status(), StatusCode::OK);
+        }
+    };
+
+    // Signed out through the API: the wait ends at once, with 401.
+    let first = login(s, "ana").await;
+    let since = space_of(s, &other).await.seq;
+    let waiting = poll(first.clone(), since);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!waiting.is_finished(), "the poll waits");
+    let started = Instant::now();
+    assert_eq!(s.client.post(format!("{}/devices/revoke-others", s.base)).bearer_auth(&other).send().await.unwrap().status(), StatusCode::OK);
+    let (status, body) = error(tokio::time::timeout(Duration::from_secs(10), waiting).await.expect("the wait ends").unwrap()).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "unauthorized"));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    commit_a_file("a.txt").await;
+
+    // Signed out behind the server's back: the next commit wakes the poll, and it is refused all the same.
+    let second = login(s, "ana").await;
+    let since = space_of(s, &other).await.seq;
+    let waiting = poll(second.clone(), since);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let second_id = current_device(s, &second).await;
+    s.meta.revoke_device_as(ana.id, second_id, craft_cloud_meta::RevokeReason::Admin, 1).await.unwrap();
+    assert!(!waiting.is_finished(), "nothing woke the poll");
+    commit_a_file("b.txt").await;
+    let (status, body) = error(tokio::time::timeout(Duration::from_secs(10), waiting).await.expect("the commit ends the wait").unwrap()).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "unauthorized"));
+
+    // A device that stays signed in still gets its changes.
+    let since = space_of(s, &other).await.seq;
+    let waiting = poll(other.clone(), since);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    commit_a_file("c.txt").await;
+    let res = tokio::time::timeout(Duration::from_secs(10), waiting).await.expect("the commit ends the wait").unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.json::<ChangeSet>().await.unwrap().seq, since + 1);
 }

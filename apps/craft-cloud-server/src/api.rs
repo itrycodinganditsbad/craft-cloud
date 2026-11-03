@@ -428,6 +428,19 @@ async fn tree(
     Ok(Json(state.meta.tree(auth.space, cursor(q.after_seq, q.after_node)?, q.limit.unwrap_or(MAX_PAGE_NODES)).await?))
 }
 
+/// Resolves when `device` is revoked (or some revocations were missed, so that it must be looked up).
+async fn revoked(revocations: &mut tokio::sync::broadcast::Receiver<DeviceId>, device: DeviceId) {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match revocations.recv().await {
+            Ok(revoked) if revoked == device => return,
+            Ok(_) => {}
+            Err(RecvError::Lagged(_)) => return,
+            Err(RecvError::Closed) => std::future::pending::<()>().await,
+        }
+    }
+}
+
 // The paging fields are written out here rather than flattened from `PageQuery`: serde's `flatten` buffers
 // values as strings, so numbers in a query string would never parse.
 #[derive(Debug, Deserialize)]
@@ -460,13 +473,21 @@ async fn changes(
         // Subscribe before reading the sequence number, so a commit in between still wakes us.
         let mut updates = state.notifier.subscribe(auth.space);
         let mut stopping = state.notifier.shutdown_signal();
+        // Also before the sequence number, so a revoke while this request waits ends the wait.
+        let mut revocations = state.live.revocations();
         if state.meta.space_info(auth.space).await?.seq == q.since {
             let deadline = Duration::from_secs(q.wait.min(MAX_WAIT_SECS));
-            // Whichever comes first: a commit, the deadline, or the server shutting down.
+            // Whichever comes first: a commit, the deadline, the server shutting down, or this device signed out.
             tokio::select! {
                 _ = tokio::time::timeout(deadline, updates.wait_for(|seq| *seq > q.since)) => {}
                 _ = stopping.wait_for(|stop| *stop) => {}
+                () = revoked(&mut revocations, auth.device) => {}
             }
+        }
+        // The sign-in check was before the wait: a device signed out meanwhile (by the API, or by the command line
+        // in another process, which wakes nothing) gets no change feed.
+        if !state.meta.device_active(auth.device).await? {
+            return Err(ApiError::unauthorized());
         }
     }
     Ok(Json(state.meta.changes(auth.space, q.since, cursor, q.limit.unwrap_or(MAX_PAGE_NODES)).await?))
