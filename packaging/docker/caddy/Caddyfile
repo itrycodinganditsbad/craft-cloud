@@ -8,7 +8,22 @@
 {
 	# Not exposed: the admin API listens on loopback inside this container only.
 	admin localhost:2019
+	# Caddy cannot install its internal CA into a read-only container and would log an error about it.
+	skip_install_trust
 	email "{$CC_ACME_EMAIL}"
+
+	# Caddy logs a failed request (an upstream error, for example) with its full URI, which would hold an invite code
+	# (/join/<code>) and any query. The log keeps neither the URI nor the headers (Authorization, Cookie).
+	log {
+		output stderr
+		format filter {
+			wrap console
+			fields {
+				request>uri delete
+				request>headers delete
+			}
+		}
+	}
 
 	servers {
 		timeouts {
@@ -52,6 +67,6 @@ http://{$CC_DOMAIN} {
 		}
 	}
 
-	# No access log on purpose: a log of full URLs would keep invite codes (/join/<code>). If you need one, drop the
-	# path and the query, and never write the Authorization and Cookie headers.
+	# No access log on purpose: a log of full URLs would keep invite codes (/join/<code>). The error log above leaves
+	# out the URI and the headers. If you add an access log, filter them out the same way.
 }
