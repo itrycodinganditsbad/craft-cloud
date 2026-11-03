@@ -8,10 +8,17 @@ case $- in *x*) set +x ;; esac
 # change them. That is less separation than an owner role plus a runtime role would give. The role is not a
 # superuser and has no other privileges, and nobody else may connect to its database or to the other databases.
 set -eu
+umask 077
 
+# The superuser password goes into a private password file (mode 0600, on the tmpfs at /tmp, removed on exit), so it
+# is neither in a process's environment nor on a command line. The password only holds the characters
+# A-Za-z0-9._~-, which need no escaping in this file format.
+passfile=$(mktemp /tmp/pgpass.XXXXXX)
+trap 'rm -f "$passfile"' EXIT INT TERM
+printf '*:*:*:postgres:%s\n' "$(cat /run/secrets/db_superuser_password)" >"$passfile"
 PGUSER=postgres
-PGPASSWORD="$(cat /run/secrets/db_superuser_password)"
-export PGUSER PGPASSWORD
+PGPASSFILE=$passfile
+export PGUSER PGPASSFILE
 
 # POSTGRES_PASSWORD_FILE only applies when the data directory is first created, so a changed superuser password in
 # .env cannot log in here.
