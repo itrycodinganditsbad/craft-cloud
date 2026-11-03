@@ -588,7 +588,7 @@ changes locally, then pushes local changes. These rules came out of the simulati
     password-check slots (all busy: `429` with `Retry-After`, and the try is given back), then in one transaction sets
     the new hash and `password_changed_ms`, revokes every other device (`revoke_reason = password`) and deletes the
     account's open invite and all its pairings, so no code made before the change works after it; if the password
-    changed meanwhile nothing changes. Afterwards each revoked device's live connections end at once. The same two
+    changed meanwhile nothing changes (`409 conflict`), and neither does it if the calling device was signed out meanwhile (`401`). Afterwards each revoked device's live connections end at once. The same two
     steps run for `user reset-password` (all devices, reason `reset`, unless `--keep-devices`) and `device revoke-all`
     (reason `admin`) on the command line, which cannot reach the server's live connections: those end at the next ping
     (within about 30 s) and a change-feed long-poll within 60 s.

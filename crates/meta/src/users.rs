@@ -254,20 +254,6 @@ impl Meta {
         }))
     }
 
-    pub async fn set_password_hash(&self, user: UserId, password_hash: &str) -> Result<(), MetaError> {
-        let w = self.begin_write().await?;
-        let mut w = w;
-        let done = sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
-            .bind(password_hash)
-            .bind(uuid_bytes(&user.0))
-            .execute(&mut *w.tx)
-            .await?;
-        if done.rows_affected() == 0 {
-            return Err(MetaError::NotFound("user"));
-        }
-        w.commit().await
-    }
-
     /// Registers a device for `user` under the hash of its token, with no word on its client.
     pub async fn create_device(&self, user: UserId, name: &str, token_hash: &[u8; 32], now_ms: i64) -> Result<DeviceId, MetaError> {
         self.create_device_with(user, name, &DeviceClient::default(), token_hash, now_ms).await
@@ -431,7 +417,8 @@ impl Meta {
     /// revokes every device but `keep` ([`RevokeReason::Password`]), and deletes the account's open invite and all
     /// its pairings (a code made before the change must not work after it). `current_hash` is the hash the caller
     /// verified the current password against: if the password changed meanwhile, nothing changes and the answer is
-    /// `Invalid`. Returns the devices revoked. A failure at any step changes nothing.
+    /// `Conflict`; if `keep` was revoked meanwhile, it is `DeviceRevoked`. Returns the devices revoked. A failure at
+    /// any step changes nothing.
     pub async fn change_password(
         &self,
         user: UserId,
@@ -441,6 +428,17 @@ impl Meta {
         now_ms: i64,
     ) -> Result<Vec<DeviceId>, MetaError> {
         let mut w = self.begin_write().await?;
+        // The caller's device must still be signed in: its Argon2 checks took a while, and a revoke since would
+        // otherwise leave a password changed by a device that is signed out. The no-op update locks the row on
+        // both databases, so a revoke running now waits for this transaction (and then finds the device kept).
+        let kept = sqlx::query("UPDATE devices SET revoked = 0 WHERE id = $1 AND user_id = $2 AND revoked = 0")
+            .bind(uuid_bytes(keep.as_uuid()))
+            .bind(uuid_bytes(&user.0))
+            .execute(&mut *w.tx)
+            .await?;
+        if kept.rows_affected() == 0 {
+            return Err(MetaError::DeviceRevoked);
+        }
         let done = sqlx::query("UPDATE users SET password_hash = $1, password_changed_ms = $2 WHERE id = $3 AND password_hash = $4")
             .bind(new_hash)
             .bind(now_ms)
@@ -449,7 +447,7 @@ impl Meta {
             .execute(&mut *w.tx)
             .await?;
         if done.rows_affected() == 0 {
-            return Err(MetaError::Invalid("the password changed while this request was running; try again"));
+            return Err(MetaError::Conflict("the password changed while this request was running; try again"));
         }
         let revoked = revoke_devices(&mut w.tx, user, Some(keep), RevokeReason::Password, now_ms).await?;
         delete_join_codes(&mut w.tx, user).await?;

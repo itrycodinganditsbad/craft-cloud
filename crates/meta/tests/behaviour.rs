@@ -297,7 +297,7 @@ async fn users_and_devices(meta: &Meta) {
     assert_eq!(meta.user_by_name("ana").await.unwrap(), Some(ana.clone()));
     assert_eq!(meta.user_by_name("bob").await.unwrap(), None);
 
-    meta.set_password_hash(ana.id, "$argon2id$new").await.unwrap();
+    meta.reset_password(ana.id, "$argon2id$new", true, NOW + 1).await.unwrap();
     assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$new");
 
     let token = [7u8; 32];
@@ -1985,7 +1985,7 @@ async fn a_password_change_is_one_step(meta: &Meta) {
 
     // A password that is not the one the caller verified (it changed meanwhile): nothing at all changes.
     let stale = meta.change_password(ana.id, "$argon2id$stale", "$argon2id$new", keep, NOW + 5).await;
-    assert!(matches!(stale, Err(MetaError::Invalid(_))), "{stale:?}");
+    assert!(matches!(stale, Err(MetaError::Conflict(_))), "{stale:?}");
     assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$stub");
     assert_eq!(meta.account(ana.id).await.unwrap().password_changed_ms, None);
     assert!(meta.device_active(keep).await.unwrap() && meta.device_active(other).await.unwrap());
@@ -2006,7 +2006,13 @@ async fn a_password_change_is_one_step(meta: &Meta) {
     assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 8).await.unwrap(), None);
     assert!(matches!(redeem(meta, &invite, "pc", NOW + 8).await, Err(MetaError::InvalidCode)));
     // The old hash no longer matches, so the same change again (a replayed request) does nothing.
-    assert!(matches!(meta.change_password(ana.id, "$argon2id$stub", "$argon2id$third", keep, NOW + 9).await, Err(MetaError::Invalid(_))));
+    assert!(matches!(meta.change_password(ana.id, "$argon2id$stub", "$argon2id$third", keep, NOW + 9).await, Err(MetaError::Conflict(_))));
+    // A caller that was signed out meanwhile changes nothing either.
+    assert!(matches!(meta.change_password(ana.id, "$argon2id$new", "$argon2id$third", other, NOW + 9).await, Err(MetaError::DeviceRevoked)), "revoked");
+    assert!(matches!(meta.change_password(ana.id, "$argon2id$new", "$argon2id$third", DeviceId::generate(), NOW + 9).await, Err(MetaError::DeviceRevoked)), "unknown");
+    let bobs_device = device(meta, &user(meta, "cy").await).await;
+    assert!(matches!(meta.change_password(ana.id, "$argon2id$new", "$argon2id$third", bobs_device, NOW + 9).await, Err(MetaError::DeviceRevoked)), "another account's");
+    assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$new");
     // Another account is never touched.
     assert_eq!(meta.user_by_name("bob").await.unwrap().unwrap().password_hash, "$argon2id$stub");
     assert!(meta.device_active(bobs).await.unwrap());
@@ -2118,4 +2124,84 @@ async fn migrating_from_0006_keeps_the_rows_on_postgres() {
         return;
     };
     migrating_from_0006_keeps_the_rows(&url).await;
+}
+
+// ---- a failure in the middle of a transaction ----
+
+/// A trigger that makes every delete from `pairings` fail, which is the step after the password and the devices
+/// were already written in `change_password` and `reset_password`. Test only: the migrations carry no trigger.
+async fn break_pairing_deletes(url: &str, postgres: bool) {
+    use sqlx::Connection;
+    let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    let statements: &[&str] = if postgres {
+        &[
+            "CREATE FUNCTION cc_test_boom() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'boom'; END $$ LANGUAGE plpgsql",
+            "CREATE TRIGGER cc_test_boom BEFORE DELETE ON pairings FOR EACH STATEMENT EXECUTE FUNCTION cc_test_boom()",
+        ]
+    } else {
+        &["CREATE TRIGGER cc_test_boom BEFORE DELETE ON pairings BEGIN SELECT RAISE(ABORT, 'boom'); END"]
+    };
+    for statement in statements {
+        sqlx::query(sqlx::AssertSqlSafe((*statement).to_owned())).execute(&mut conn).await.unwrap();
+    }
+}
+
+async fn mend_pairing_deletes(url: &str) {
+    use sqlx::Connection;
+    let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    sqlx::query("DROP TRIGGER cc_test_boom ON pairings").execute(&mut conn).await.ok();
+    sqlx::query("DROP TRIGGER cc_test_boom").execute(&mut conn).await.ok();
+}
+
+/// A step that fails after others were written undoes them all: the hash, the time, the devices, the pairings and
+/// the invite are as they were, for a password change and for an admin reset; once the step works, the same call
+/// goes through.
+async fn a_failure_in_the_middle_changes_nothing(url: &str, postgres: bool) {
+    let meta = Meta::open(url).await.unwrap();
+    let (ana, keep, _, pairing_id) = paired(&meta, "ana").await;
+    let other = device(&meta, &ana).await;
+    let other_pairing = meta.create_pairing(ana.id, other, &code(PAIRING_CHARS).hash(), NOW).await.unwrap();
+    let invite = code(INVITE_CHARS);
+    meta.create_invite("ana", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    break_pairing_deletes(url, postgres).await;
+
+    let unchanged = |meta: Meta| {
+        let ana = ana.clone();
+        async move {
+            assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$stub");
+            assert_eq!(meta.account(ana.id).await.unwrap().password_changed_ms, None);
+            let devices = meta.list_devices(ana.id).await.unwrap();
+            assert!(devices.iter().all(|d| !d.revoked && d.revoked_ms.is_none() && d.revoke_reason.is_none()), "{devices:?}");
+            assert!(meta.pairing_status(ana.id, pairing_id, NOW + 1).await.unwrap().is_some());
+            assert!(meta.pairing_status(ana.id, other_pairing, NOW + 1).await.unwrap().is_some());
+            assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 1).await.unwrap(), Some(false));
+        }
+    };
+    let failed = meta.change_password(ana.id, "$argon2id$stub", "$argon2id$new", keep, NOW + 2).await;
+    assert!(matches!(failed, Err(MetaError::Db(_))), "{failed:?}");
+    unchanged(meta.clone()).await;
+    let failed = meta.reset_password(ana.id, "$argon2id$new", false, NOW + 2).await;
+    assert!(matches!(failed, Err(MetaError::Db(_))), "{failed:?}");
+    unchanged(meta.clone()).await;
+    let failed = meta.revoke_other_devices(ana.id, keep, RevokeReason::Others, NOW + 2).await;
+    assert!(matches!(failed, Err(MetaError::Db(_))), "{failed:?}");
+    unchanged(meta.clone()).await;
+
+    mend_pairing_deletes(url).await;
+    assert_eq!(meta.change_password(ana.id, "$argon2id$stub", "$argon2id$new", keep, NOW + 3).await.unwrap(), vec![other]);
+}
+
+#[tokio::test]
+async fn a_failure_in_the_middle_changes_nothing_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    a_failure_in_the_middle_changes_nothing(&format!("sqlite:{}", dir.path().join("meta.db").display()), false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failure_in_the_middle_changes_nothing_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    a_failure_in_the_middle_changes_nothing(&url, true).await;
 }

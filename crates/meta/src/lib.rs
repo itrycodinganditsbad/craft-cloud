@@ -80,6 +80,14 @@ pub enum MetaError {
     /// An invite to an account without a password was redeemed without a new one; nothing was changed.
     #[error("this invite needs a new password for the account")]
     PasswordRequired,
+    /// The device that asked for a change was revoked while the request ran (it is no longer signed in); nothing was
+    /// changed.
+    #[error("this device is no longer signed in")]
+    DeviceRevoked,
+    /// What the request was based on changed while it ran (the password it checked is no longer the account's);
+    /// nothing was changed and the request may be made again.
+    #[error("{0}")]
+    Conflict(&'static str),
     #[error("invalid input: {0}")]
     Invalid(&'static str),
     #[error("stored data is damaged: {0}")]
