@@ -578,6 +578,22 @@ changes locally, then pushes local changes. These rules came out of the simulati
   database (not a supported setup) would each count their own, so twice the sign-in attempts and twice the writes.
 - **Setup**: `craft-cloud-server init` writes the config, creates the data directory and the first admin.
   Solo use is that one admin account and nothing more.
+- **Device sessions** (migration 0007): a device token has no expiry and its format is unchanged (43 characters, stored as a
+  BLAKE3 hash); what changed is what a device records and how an account ends them. A device records the `client_kind`,
+  `platform` and `app_version` it said at sign-in (display only), and, once revoked, when (`revoked_ms`) and why
+  (`revoke_reason`). The `revoked` flag is still the check: the three are set together in one transaction and only by
+  the first revoke, so a second revoke changes neither. A user keeps `password_changed_ms`. `users.disabled_ms` is created
+  for a later release and nothing reads it yet.
+  - **Changing the password** (`POST /account/password`) checks the current password under one of the server-wide
+    password-check slots (all busy: `429` with `Retry-After`, and the try is given back), then in one transaction sets
+    the new hash and `password_changed_ms`, revokes every other device (`revoke_reason = password`) and deletes the
+    account's open invite and all its pairings, so no code made before the change works after it; if the password
+    changed meanwhile nothing changes. Afterwards each revoked device's live connections end at once. The same two
+    steps run for `user reset-password` (all devices, reason `reset`, unless `--keep-devices`) and `device revoke-all`
+    (reason `admin`) on the command line, which cannot reach the server's live connections: those end at the next ping
+    (within about 30 s) and a change-feed long-poll within 60 s.
+  - **Limits**: `password_changes` counts every try, a wrong password included, 5 per account per 15 minutes; the
+    password and device-name bodies are read up to 4 KiB (the sign-in bodies stay at 1 MiB).
 - **Join codes**: a machine can also get its device token with a code instead of a password. Codes are Crockford
   base32 (`0-9` and letters without I, L, O, U; on input case is ignored, O reads as 0, I and L as 1, dashes and spaces
   are dropped), shown in groups of four (`K7M4-Q9TX`), and stored only as their BLAKE3 hash (migration 0004:
@@ -630,8 +646,8 @@ changes locally, then pushes local changes. These rules came out of the simulati
   admins who back up the bucket themselves (bucket versioning or replication); GC must stay paused until
   that bucket backup is done, or the admin keeps the bucket's own deleted-object retention longer than the
   GC grace. **Restore** sets a new epoch for every space.
-- **Admin CLI**: `init`, `serve`, `user add|reset-password|invite [--revoke]`, `device list|revoke` and `reset-epoch`
-  exist; `user remove|quota`, `gc`, `verify` (re-hash every chunk), `backup <dir>` and `restore <dir>` come with M4.
+- **Admin CLI**: `init`, `serve`, `user add|reset-password [--keep-devices]|invite [--revoke]`, `device list|revoke|revoke-all` and
+  `reset-epoch` exist; `user remove|quota`, `gc`, `verify` (re-hash every chunk), `backup <dir>` and `restore <dir>` come with M4.
   `user invite` prints the join string and link when `public_url` is in the config, else the code and how to finish
   it; it logs that an invite was made (the username at debug only, never the code).
 - No web UI in v1. No telemetry, no update check.
@@ -641,14 +657,15 @@ the `craft-epoch` header, and commits/tree/changes carry it in the body too). Er
 `{error, message, conflicts?, missing?, quota?}` with stable codes (`conflict` 409, `missing_chunks` 409,
 `resync_required` 410, `unauthorized` 401, `rate_limited` 429, `invalid` 400, `not_found` 404, `too_large` 413,
 `timeout` 408, `quota_exceeded` 507,
-`username_taken` 409, `invalid_code` 404, `password_required` 400, `weak_password` 400, `internal` 500; the codes are constants in `craft-cloud-proto::api::codes`). Unknown routes and
+`username_taken` 409, `invalid_code` 404, `password_required` 400, `weak_password` 400, `wrong_password` 403, `forbidden` 403 (not used
+by the server yet), `internal` 500; the codes are constants in `craft-cloud-proto::api::codes`). Unknown routes and
 methods answer `not_found` / `invalid` (405) the same way:
 
 | Call | Purpose |
 |---|---|
 | `GET /info` (also unversioned at `/api/info`) | protocol versions, chunker parameter sets, limits (no auth); a client probes `/api/info` first |
 | `GET /space` | the signed-in user's space: space ID, root node ID, epoch, current seq, username |
-| `POST /auth/login` | username + password + device name → device ID + token (shown once); 10 tries per account and 30 per address per 5 minutes; a wrong password and an unknown user look the same |
+| `POST /auth/login` | username + password + device name (+ optional `client_kind` `agent`\|`desktop`\|`cli`, `platform` and `app_version`, each at most 32 bytes, shown in the device list and never a basis for a permission; an unknown kind or a control character is `invalid`, checked before the try is counted) → device ID + token (shown once); 10 tries per account and 30 per address per 5 minutes; a wrong password and an unknown user look the same |
 | `GET /tree?after_seq=…&after_node=…&limit=…` | full listing for a first sync or a reconcile, in pages of up to 5,000 (cursor = changed seq + node ID) |
 | `GET /changes?since=N&after_seq=…&after_node=…&limit=…&wait=30` | changes after N, in pages, long-poll up to 60 s; `resync_required` if N is too old or ahead of the server |
 | `POST /chunks/missing` | which of these chunk IDs (up to 10,000) this space lacks |
@@ -656,10 +673,15 @@ methods answer `not_found` / `invalid` (405) the same way:
 | `PUT /manifests/{id}` / `GET /manifests/{id}` | one manifest (binary); the server checks the ID, the limits and that every chunk is present |
 | `POST /commit` | batch of version/mkdir/move/delete operations, one transaction; `409 conflict` listing every conflicting operation (a version whose manifest isn't uploaded is a `missing_manifest` conflict) |
 | `GET /nodes/{id}/history` / `POST /nodes/{id}/restore` | list versions / make an old one current (M4) |
-| `GET /devices`, `DELETE /devices/{id}` | your devices |
+| `GET /account` | the signed-in account, flat: `{user_id, username, role, created_ms, password_changed_ms, two_factor_enabled}` (`password_changed_ms` is `null` until the password changes through the server, `two_factor_enabled` is always `false` for now) |
+| `POST /account/password` | `{current_password, new_password}` → 204. Signs every *other* device out and deletes the account's open invite and pairings, in one transaction; the device that asked stays signed in. A wrong current password is `403 wrong_password` (never 401: see below), a new one that breaks the rules or equals the current one `400 weak_password`; 5 tries per account per 15 minutes (`429 rate_limited`); body at most 4 KiB, passwords at most 1,024 bytes |
+| `GET /devices` | your devices: `{id, name, created_ms, last_used_ms, revoked, current, client_kind, platform, app_version, revoked_ms, revoke_reason}`; the last five are new and a client may ignore them (`revoke_reason` is `user`, `others`, `password`, `admin`, `disabled`, `two_factor`, `idle` or `reset`) |
+| `PATCH /devices/{id}` | `{name}` (at most 4 KiB, the device-name rule) → 200 with the device. Only your own devices that are not revoked, otherwise `404 not_found` |
+| `POST /devices/revoke-others` | signs out every other device of the account (and deletes their pairings) → `{revoked: n}`, 0 when there is none |
+| `DELETE /devices/{id}` | signs one of your devices out → 204; its time and reason (`user`) are kept, and a second call changes neither |
 | `POST /pairings` | a new add-a-computer code from this device → `{id, code, expires_ms}` (the code shown once, normalised) |
 | `GET /pairings/{id}`, `DELETE /pairings/{id}` | one of your pairings: `{state: waiting\|used\|expired, device_name?}` / cancel it (204) |
-| `POST /join` | code + device name (+ password for an invite to a new account) → device ID + token, as a sign-in (no auth); `invalid_code`, `password_required`, `weak_password`, `rate_limited` |
+| `POST /join` | code + device name (+ password for an invite to a new account, + the optional client fields of a sign-in) → device ID + token, as a sign-in (no auth); `invalid_code`, `password_required`, `weak_password`, `rate_limited` |
 
 **Client contract** (what the sync agent relies on):
 
@@ -672,7 +694,11 @@ methods answer `not_found` / `invalid` (405) the same way:
   `version_exists` conflicts for exactly the retried operations mean the first attempt applied.
 - A long-poll refused because 16 are already waiting on the space answers `429 rate_limited` with `Retry-After`;
   wait that long before polling again.
-- Unknown JSON fields are ignored in both directions, so later protocol versions can add fields.
+- Unknown JSON fields are ignored in both directions, so later protocol versions can add fields. The device list's client
+  fields and revoke time and reason were added that way: a body without them reads as empty.
+- **A signed-in route never answers 401 for anything but the token.** The agent reads every 401 on a signed-in route as
+  "this device was revoked" and signs out. A wrong password on a route that asks for one (`POST /account/password`) is
+  therefore `403 wrong_password`; 401 is for a missing, unknown or revoked token, and for the sign-in and join routes.
 - After an admin restores a backup they run `craft-cloud-server reset-epoch --all`; agents then reconcile.
 
 ## Agent and launcher API
