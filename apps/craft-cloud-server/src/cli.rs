@@ -282,11 +282,7 @@ pub fn check_health(addr: SocketAddr, timeout: Duration) -> Result<(), CliError>
     let deadline = Instant::now() + timeout;
     let left = || deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero());
     let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|e| fail(&format!("can't connect: {e}")))?;
-    let request = format!("GET /api/info HTTP/1.0
-Host: {addr}
-Connection: close
-
-");
+    let request = format!("GET /api/info HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     stream.set_write_timeout(left()).map_err(|e| fail(&e.to_string()))?;
     stream.write_all(request.as_bytes()).map_err(|e| fail(&format!("can't send the request: {e}")))?;
     // The status line fits in 64 bytes; a server that sends more before a line ending is not answering HTTP.
@@ -302,8 +298,7 @@ Connection: close
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Err(fail("no answer in time")),
             Err(e) => return Err(fail(&format!("can't read the answer: {e}"))),
         }
-        if head.get(..len).is_some_and(|read| read.contains(&b'
-')) {
+        if head.get(..len).is_some_and(|read| read.contains(&b'\n')) {
             break;
         }
     }
@@ -311,7 +306,7 @@ Connection: close
     let mut parts = line.split_whitespace();
     match (parts.next(), parts.next()) {
         (Some(version), Some("200")) if version.starts_with("HTTP/1.") => Ok(()),
-        (Some(_), Some(status)) => Err(fail(&format!("status {}", status.chars().take(3).collect::<String>()))),
+        (Some(version), Some(status)) if version.starts_with("HTTP/") => Err(fail(&format!("status {}", status.chars().take(3).collect::<String>()))),
         _ => Err(fail("not an HTTP answer")),
     }
 }
