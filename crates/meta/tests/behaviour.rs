@@ -3335,8 +3335,15 @@ async fn a_build_resets_a_wrong_index_in_batches_on(url: &str) {
     assert_eq!(meta.index_edges(&m.id()).await.unwrap(), edge_list(&chunks));
 }
 
-/// An edge at `i64::MAX` follows valid pages and keeps a manifest from validating without overflowing the cursor.
-async fn an_edge_at_i64_max_is_reported_on(url: &str) {
+/// An extra edge at the highest possible ordinal, `i64::MAX`, after valid ones is reported as a missing edge at the first
+/// ordinal that is not there, and the report is stable.
+///
+/// This does not reach the `raw.checked_add(1)` that guards the page cursor in `compare`. An edge at `i64::MAX` is
+/// returned as `MissingEdge` as soon as it is seen, because its ordinal is above the next expected one, and no
+/// manifest has the 2^63 chunks that would make it the expected one, so the cursor step at `i64::MAX` cannot be
+/// reached through the public meta API. The test pins that a high-ordinal edge is rejected without an error or an
+/// overflow, not the checked addition.
+async fn an_extra_edge_at_the_highest_ordinal_is_reported_as_missing_on(url: &str) {
     use craft_cloud_meta::{EdgeCheck, EdgeProblemKind};
     let meta = Meta::open(url).await.unwrap().with_index_batch_rows(2);
     let ana = user(&meta, "ana").await;
@@ -3355,10 +3362,10 @@ async fn an_edge_at_i64_max_is_reported_on(url: &str) {
 
     let expected = EdgeCheck::Mismatch(craft_cloud_meta::EdgeProblem { ordinal: 3, kind: EdgeProblemKind::MissingEdge });
     assert_eq!(meta.index_check(&m).await.unwrap(), expected);
-    assert_eq!(meta.index_check(&m).await.unwrap(), expected, "the later page is stable, with no cursor overflow");
+    assert_eq!(meta.index_check(&m).await.unwrap(), expected, "the report is stable");
     let edges = meta.index_edges(&m.id()).await.unwrap();
     assert_eq!(edges.len(), 4);
-    assert_eq!(edges.last().unwrap().0, i64::MAX as u64, "the final page contains the maximum ordinal");
+    assert_eq!(edges.last().unwrap().0, i64::MAX as u64, "the stored edge at the maximum ordinal is still there");
 }
 
 /// A reset of 12 edges at budget 3 takes four full batches and one empty batch before returning to building state 0.
@@ -3435,11 +3442,37 @@ async fn concurrent_index_completes_reset_one_manifest_on(url: &str) {
         .await
         .unwrap();
 
+    // Force the overlap: a third connection holds the row lock of the manifest's index row, both builders start and are
+    // proven to wait on it, and only then is it released, so both reach the reset together.
+    let mut holder = raw(url).await;
+    sqlx::query("BEGIN").execute(&mut holder).await.unwrap();
+    sqlx::query("SELECT 1 FROM manifest_index WHERE manifest = $1 FOR UPDATE").bind(m.id().as_bytes().to_vec()).execute(&mut holder).await.unwrap();
+
     let left_manifest = m.clone();
     let right_manifest = m.clone();
     let left_builder = left.clone();
     let mut first = tokio::spawn(async move { left_builder.index_complete(&left_manifest).await });
     let mut second = tokio::spawn(async move { right.index_complete(&right_manifest).await });
+    let mut waiting = 0i64;
+    for _ in 0..300 {
+        waiting = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%manifest_index%FOR UPDATE%'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        if waiting >= 2 || first.is_finished() || second.is_finished() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let overlapped = waiting == 2 && !first.is_finished() && !second.is_finished();
+    sqlx::query("ROLLBACK").execute(&mut holder).await.unwrap();
+    if !overlapped {
+        first.abort();
+        second.abort();
+    }
+    assert!(overlapped, "both builders must be blocked on the manifest's index row at once (waiting backends: {waiting})");
     let joined = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         (&mut first).await.unwrap().unwrap();
         (&mut second).await.unwrap().unwrap();
@@ -3507,18 +3540,18 @@ async fn a_build_resets_a_wrong_index_in_batches_on_postgres() {
 }
 
 #[tokio::test]
-async fn an_edge_at_i64_max_is_reported_on_sqlite() {
+async fn an_extra_edge_at_the_highest_ordinal_is_reported_as_missing_on_sqlite() {
     let dir = tempfile::tempdir().unwrap();
-    an_edge_at_i64_max_is_reported_on(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+    an_extra_edge_at_the_highest_ordinal_is_reported_as_missing_on(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_edge_at_i64_max_is_reported_on_postgres() {
+async fn an_extra_edge_at_the_highest_ordinal_is_reported_as_missing_on_postgres() {
     let Some((url, _guard)) = postgres_database().await else {
         eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
         return;
     };
-    an_edge_at_i64_max_is_reported_on(&url).await;
+    an_extra_edge_at_the_highest_ordinal_is_reported_as_missing_on(&url).await;
 }
 
 #[tokio::test]

@@ -361,15 +361,14 @@ async fn raw_sqlite(url: &str) -> sqlx::SqliteConnection {
     sqlx::SqliteConnection::connect(url).await.unwrap()
 }
 
-async fn sqlite_snapshot(url: &str, db_path: &std::path::Path) -> Vec<Option<Vec<u8>>> {
-    use sqlx::Connection;
-    let mut conn = raw_sqlite(url).await;
-    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&mut conn).await.unwrap();
-    conn.close().await.unwrap();
-    [db_path.to_owned(), db_path.with_extension("db-wal"), db_path.with_extension("db-shm")]
-        .into_iter()
-        .map(|path| path.exists().then(|| std::fs::read(path).unwrap()))
-        .collect()
+/// The bytes of the database file and of its WAL, read straight from disk without opening SQLite, so that nothing here
+/// can checkpoint away a change the command under test made. A WAL that is not there counts as an empty one: opening a
+/// WAL-mode database that has no open connection makes an empty `-wal` and a `-shm` file, which changes no data. The
+/// `-shm` file is a rebuilt shared-memory index of the WAL, not data, so it is not compared; a change to the data
+/// shows up in the database file or in the WAL's bytes.
+fn sqlite_snapshot(db_path: &std::path::Path) -> (Vec<u8>, Vec<u8>) {
+    let read = |path: std::path::PathBuf| if path.exists() { std::fs::read(path).unwrap() } else { Vec::new() };
+    (read(db_path.to_owned()), read(db_path.with_extension("db-wal")))
 }
 
 fn object_path(dir: &std::path::Path, kind: &str, id: &[u8; 32]) -> std::path::PathBuf {
@@ -578,11 +577,13 @@ async fn verify_refuses_older_and_newer_schemas_without_changing_the_database() 
         let mut conn = raw_sqlite(&s.db_url).await;
         sqlx::query("DELETE FROM schema_version").execute(&mut conn).await.unwrap();
         sqlx::query("INSERT INTO schema_version (version) VALUES ($1)").bind(version).execute(&mut conn).await.unwrap();
+        // Checkpoint during setup only, then close every connection, so the snapshots below are taken of files at rest.
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&mut conn).await.unwrap();
         conn.close().await.unwrap();
-        let before = sqlite_snapshot(&s.db_url, &db_path).await;
+        let before = sqlite_snapshot(&db_path);
         let error = cli(&["verify", "--config", &s.config], "").await.expect_err("verify must refuse a non-current schema");
         assert!(error.to_string().contains(message), "{error}");
-        assert!(sqlite_snapshot(&s.db_url, &db_path).await == before, "verify changed the database, WAL, or SHM for schema version {version}");
+        assert!(sqlite_snapshot(&db_path) == before, "verify changed the database or its WAL for schema version {version}");
     }
 }
 
