@@ -193,6 +193,53 @@ fn snapshot_signed_in() {
     snapshot(signed_in_model(paused), egui::Theme::Light, "signed-in-paused");
 }
 
+fn versions_model(loaded: bool) -> Model {
+    let mut model = signed_in_model(signed_in());
+    model.update(Event::OpenVersions);
+    model.update(Event::VersionsPath("Projects/painting.png".into()));
+    if loaded {
+        let versions = vec![
+            craft_cloud_app::HistoryVersion {
+                id: craft_cloud_app::VersionId::from_uuid(Uuid::nil()),
+                parent_version: None,
+                epoch: craft_cloud_proto::Epoch::from_uuid(Uuid::nil()),
+                seq: 9,
+                size: 42_000,
+                mtime_ms: NOW,
+                device: DeviceId::from_uuid(Uuid::nil()),
+                created_ms: NOW - 30_000,
+                save: false,
+                pruned: false,
+            },
+            craft_cloud_app::HistoryVersion {
+                id: craft_cloud_app::VersionId::from_uuid(Uuid::from_u128(1)),
+                parent_version: None,
+                epoch: craft_cloud_proto::Epoch::from_uuid(Uuid::nil()),
+                seq: 8,
+                size: 38_000,
+                mtime_ms: NOW - 60_000,
+                device: DeviceId::from_uuid(Uuid::from_u128(1)),
+                created_ms: NOW - 60_000,
+                save: true,
+                pruned: false,
+            },
+        ];
+        model.update(Event::History { ticket: 1, result: Ok(craft_cloud_app::HistoryResponse { versions, next: Some("next-page".into()) }) });
+    }
+    model
+}
+
+#[test]
+fn snapshot_versions() {
+    snapshot(versions_model(false), egui::Theme::Light, "versions-empty");
+    snapshot(versions_model(true), egui::Theme::Light, "versions-loaded");
+    let mut model = versions_model(true);
+    if let Screen::Versions(versions) = &mut model.screen {
+        versions.confirm = versions.page.as_ref().and_then(|page| page.versions.get(1)).map(|version| version.id);
+    }
+    snapshot(model, egui::Theme::Light, "versions-confirm");
+}
+
 #[test]
 fn snapshot_adding_a_computer() {
     let mut model = signed_in_model(signed_in());
