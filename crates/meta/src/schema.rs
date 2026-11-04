@@ -13,6 +13,7 @@ const SQLITE: &[&str] = &[
     include_str!("../migrations/sqlite/0005_live_documents.sql"),
     include_str!("../migrations/sqlite/0006_save_records.sql"),
     include_str!("../migrations/sqlite/0007_devices_v2.sql"),
+    include_str!("../migrations/sqlite/0008_admin_resets.sql"),
 ];
 const POSTGRES: &[&str] = &[
     include_str!("../migrations/postgres/0001_init.sql"),
@@ -22,6 +23,7 @@ const POSTGRES: &[&str] = &[
     include_str!("../migrations/postgres/0005_live_documents.sql"),
     include_str!("../migrations/postgres/0006_save_records.sql"),
     include_str!("../migrations/postgres/0007_devices_v2.sql"),
+    include_str!("../migrations/postgres/0008_admin_resets.sql"),
 ];
 
 /// Arbitrary fixed key for the Postgres advisory lock that serialises migrations between servers sharing one

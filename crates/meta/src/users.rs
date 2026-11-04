@@ -32,7 +32,7 @@ impl Role {
         }
     }
 
-    fn parse(s: &str) -> Result<Self, MetaError> {
+    pub(crate) fn parse(s: &str) -> Result<Self, MetaError> {
         match s {
             "admin" => Ok(Role::Admin),
             "member" => Ok(Role::Member),
@@ -122,15 +122,15 @@ pub enum RevokeReason {
     Others,
     /// The user changed the password.
     Password,
-    /// The admin revoked it on the command line.
+    /// An admin revoked it, on the command line or through the admin API.
     Admin,
-    /// The account was disabled (reserved).
+    /// The account was disabled or marked for removal by an admin.
     Disabled,
     /// Two-factor sign-in was set up or changed (reserved).
     TwoFactor,
     /// The device sat idle too long (reserved).
     Idle,
-    /// The admin reset the password on the command line.
+    /// An admin reset the password (on the command line), or a reset code the admin made was redeemed.
     Reset,
 }
 
@@ -272,6 +272,14 @@ impl Meta {
         client.check()?;
         let device = DeviceId::generate();
         let mut w = self.begin_write().await?;
+        // The account first, as every transaction that disables it or revokes its devices takes it: a device is
+        // never added to an account that was disabled or marked for removal meanwhile.
+        if !lock_user(&mut w.tx, user).await? {
+            return Err(MetaError::NotFound("user"));
+        }
+        if account_blocked(&mut w.tx, user).await? {
+            return Err(MetaError::AccountDisabled);
+        }
         insert_device(&mut w.tx, device, user, name, client, token_hash, now_ms).await?;
         w.commit().await?;
         Ok(device)
@@ -281,7 +289,8 @@ impl Meta {
     /// account's: `hash` is the stored hash the caller verified. The account is locked first and the hash compared
     /// again in the same transaction, so a password change or reset that committed while the (slow) check ran is
     /// not followed by a device that check let in. `None`: the user is gone or the password changed meanwhile; the
-    /// caller answers as for a wrong password.
+    /// caller answers as for a wrong password. An account that is disabled or marked for removal is
+    /// [`MetaError::AccountDisabled`], which the caller may only say after the password was right.
     pub async fn sign_in_device(
         &self,
         user: UserId,
@@ -306,16 +315,19 @@ impl Meta {
         if same.is_none() {
             return Ok(None);
         }
+        if account_blocked(&mut w.tx, user).await? {
+            return Err(MetaError::AccountDisabled);
+        }
         insert_device(&mut w.tx, device, user, name, client, token_hash, now_ms).await?;
         w.commit().await?;
         Ok(Some(device))
     }
 
-    /// The device holding this token hash, if any and not revoked.
+    /// The device holding this token hash, if any, not revoked and of an account that isn't disabled.
     pub async fn device_by_token(&self, token_hash: &[u8; 32]) -> Result<Option<DeviceAuth>, MetaError> {
         let row = sqlx::query(
             "SELECT d.id, d.user_id, u.role, u.username, s.id AS space FROM devices d JOIN users u ON u.id = d.user_id JOIN spaces s ON s.owner = u.id \
-             WHERE d.token_hash = $1 AND d.revoked = 0",
+             WHERE d.token_hash = $1 AND d.revoked = 0 AND u.disabled_ms IS NULL",
         )
         .bind(token_hash.to_vec())
         .fetch_optional(&self.pool)
@@ -481,7 +493,7 @@ impl Meta {
             .bind(uuid_bytes(&user.0))
             .execute(&mut *w.tx)
             .await?;
-        if kept.rows_affected() == 0 {
+        if kept.rows_affected() == 0 || account_blocked(&mut w.tx, user).await? {
             return Err(MetaError::DeviceRevoked);
         }
         let done = sqlx::query("UPDATE users SET password_hash = $1, password_changed_ms = $2 WHERE id = $3 AND password_hash = $4")
@@ -532,6 +544,13 @@ pub(crate) async fn lock_user(tx: &mut sqlx::Transaction<'static, sqlx::Any>, us
     Ok(done.rows_affected() > 0)
 }
 
+/// Whether `user` is disabled or marked for removal, read in `tx` after the user's row was locked.
+pub(crate) async fn account_blocked(tx: &mut sqlx::Transaction<'static, sqlx::Any>, user: UserId) -> Result<bool, MetaError> {
+    let row = sqlx::query("SELECT disabled_ms, removed_ms FROM users WHERE id = $1").bind(uuid_bytes(&user.0)).fetch_optional(&mut **tx).await?;
+    let Some(row) = row else { return Ok(false) };
+    Ok(row.try_get::<Option<i64>, _>("disabled_ms")?.is_some() || row.try_get::<Option<i64>, _>("removed_ms")?.is_some())
+}
+
 fn device_record(row: &sqlx::any::AnyRow) -> Result<DeviceRecord, MetaError> {
     Ok(DeviceRecord {
         id: DeviceId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("id")?)?),
@@ -547,7 +566,7 @@ fn device_record(row: &sqlx::any::AnyRow) -> Result<DeviceRecord, MetaError> {
 
 /// Revokes `user`'s devices that aren't revoked yet, except `keep`, and deletes the pairings of every revoked device
 /// of theirs, in `tx`. Time and reason are set with the flag, and only here, so a device revoked before keeps its own.
-async fn revoke_devices(
+pub(crate) async fn revoke_devices(
     tx: &mut sqlx::Transaction<'static, sqlx::Any>,
     user: UserId,
     keep: Option<DeviceId>,
@@ -582,7 +601,7 @@ async fn revoke_devices(
 }
 
 /// Deletes `user`'s open invite and every pairing of theirs, in `tx`.
-async fn delete_join_codes(tx: &mut sqlx::Transaction<'static, sqlx::Any>, user: UserId) -> Result<(), MetaError> {
+pub(crate) async fn delete_join_codes(tx: &mut sqlx::Transaction<'static, sqlx::Any>, user: UserId) -> Result<(), MetaError> {
     sqlx::query("DELETE FROM invites WHERE user_id = $1").bind(uuid_bytes(&user.0)).execute(&mut **tx).await?;
     sqlx::query("DELETE FROM pairings WHERE user_id = $1").bind(uuid_bytes(&user.0)).execute(&mut **tx).await?;
     Ok(())

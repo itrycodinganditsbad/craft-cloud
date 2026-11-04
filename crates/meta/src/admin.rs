@@ -1,0 +1,493 @@
+//! What an administrator does through the admin API: server counters, listing and creating accounts, changing a role or
+//! a quota, disabling, enabling and removing an account, invites and password reset codes, and a user's devices.
+//!
+//! - **One `Meta` method per change, with a typed result**, so a later audit trail can be written in the same transaction
+//!   without reshaping the handlers.
+//! - **The acting admin is checked again inside every change** ([`AdminActor`], `begin_admin`): the role the middleware
+//!   read and the password the handler verified (a slow Argon2id check) can be stale by the time the transaction runs.
+//!   The device must still be signed in, the account neither disabled nor marked for removal, the role still `admin`
+//!   and the password hash still the one that was verified.
+//! - **Lock order** in every change: (1) the `last_admin` transaction lock, if the change can take away an
+//!   administrator; (2) the rows of the acting admin and of the target, in ascending ID; (3) rows derived from them
+//!   (devices, invites, pairings). Sign-ins, redeems and pairings take the user's row first as well (see
+//!   `users::lock_user`), so none of these can deadlock with another, and a disable can never be followed by a device
+//!   that an earlier check let in.
+//! - **The last administrator** cannot be demoted, disabled or removed. A count cannot be locked with `FOR UPDATE`, and
+//!   locking the rows of two different targets does not serialise two changes that each look at the other's row. So
+//!   every change that can take an administrator away takes one transaction-wide lock first and counts after it: on
+//!   Postgres `pg_advisory_xact_lock`, on SQLite the write transaction (`BEGIN IMMEDIATE`, held by one writer at a
+//!   time) already is that lock.
+
+use craft_cloud_proto::limits::MAX_CHUNK_BYTES;
+use craft_cloud_proto::{DeviceId, NodeId, SpaceId};
+use sqlx::Row;
+use uuid::Uuid;
+
+use crate::codec::{to_i64, to_u64, uuid_bytes, uuid_from};
+use crate::join::{Purpose, put_code};
+use crate::users::{delete_join_codes, insert_user, lock_user, revoke_devices};
+use crate::{DeviceRecord, Dialect, Meta, MetaError, RevokeReason, Role, UserId, WriteTx, valid_username};
+
+/// The key of the Postgres advisory lock that serialises changes which can take an administrator away. Arbitrary and
+/// fixed, and different from the migration lock's.
+const LAST_ADMIN_LOCK_KEY: i64 = 7240318150662;
+
+/// The smallest quota an admin may give an account: one maximal chunk, like the server-wide cap.
+pub const MIN_QUOTA_BYTES: u64 = MAX_CHUNK_BYTES as u64;
+
+/// The longest username search an admin may make, in bytes.
+pub const MAX_SEARCH_BYTES: usize = 64;
+
+/// The admin who asks, as the handler knew them when it verified their password.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AdminActor {
+    pub user: UserId,
+    /// The device the request came with; it must still be signed in.
+    pub device: DeviceId,
+    /// The stored password hash the confirmation was verified against; it must still be the account's.
+    pub password_hash: String,
+}
+
+impl std::fmt::Debug for AdminActor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminActor").field("user", &self.user).field("device", &self.device).field("password_hash", &"<redacted>").finish()
+    }
+}
+
+/// An account as the admin lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminUser {
+    pub id: UserId,
+    pub username: String,
+    pub role: Role,
+    pub created_ms: i64,
+    pub disabled_ms: Option<i64>,
+    /// Devices that are not revoked.
+    pub devices_active: u64,
+    pub stored_bytes: u64,
+    /// The quota an admin set for the account (`None`: the server-wide cap, if any, applies).
+    pub quota_bytes: Option<u64>,
+    /// An unexpired invite is open (a reset code is not an invite).
+    pub invite_pending: bool,
+}
+
+/// The counters `GET /admin/server` shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerCounts {
+    pub users: u64,
+    pub devices_active: u64,
+    pub stored_bytes: u64,
+    pub live_bytes: u64,
+}
+
+/// One page of [`Meta::admin_list_users`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserPage {
+    pub users: Vec<AdminUser>,
+    /// The username to continue after, when there are more.
+    pub next_after: Option<String>,
+}
+
+/// A code an admin made: when it stops working. The code itself is never stored, only its hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Issued {
+    pub expires_ms: i64,
+}
+
+/// How long a password reset code works: one hour.
+pub const RESET_TTL_MS: i64 = 60 * 60 * 1000;
+
+struct Target {
+    role: Role,
+    disabled: bool,
+    removed: bool,
+    has_password: bool,
+}
+
+const USER_SELECT: &str = "SELECT u.id, u.username, u.role, u.created_ms, u.disabled_ms, s.stored_bytes, s.quota_bytes, \
+     (SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id AND d.revoked = 0) AS devices_active, \
+     (SELECT COUNT(*) FROM invites i WHERE i.user_id = u.id AND i.purpose = 'invite' AND i.expires_ms > $1) AS invites \
+     FROM users u JOIN spaces s ON s.owner = u.id";
+
+fn admin_user_from(row: &sqlx::any::AnyRow) -> Result<AdminUser, MetaError> {
+    let quota: Option<i64> = row.try_get("quota_bytes")?;
+    Ok(AdminUser {
+        id: UserId(uuid_from(&row.try_get::<Vec<u8>, _>("id")?)?),
+        username: row.try_get("username")?,
+        role: Role::parse(&row.try_get::<String, _>("role")?)?,
+        created_ms: row.try_get("created_ms")?,
+        disabled_ms: row.try_get("disabled_ms")?,
+        devices_active: to_u64(row.try_get("devices_active")?)?,
+        stored_bytes: to_u64(row.try_get("stored_bytes")?)?,
+        quota_bytes: quota.map(to_u64).transpose()?,
+        invite_pending: row.try_get::<i64, _>("invites")? > 0,
+    })
+}
+
+/// `text` as a `LIKE` pattern that matches it literally (`\` is the escape character, see the queries).
+fn escape_like(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn same_user(a: UserId, b: UserId) -> bool {
+    a.0 == b.0
+}
+
+impl Meta {
+    /// Starts the write transaction of a change the admin `actor` makes (to `target`, if it has one): takes the
+    /// locks in the order the module describes and checks the actor again. `reduces_admins`: the change can take an
+    /// administrator away, so it takes the `last_admin` lock first.
+    async fn begin_admin(&self, actor: &AdminActor, target: Option<UserId>, reduces_admins: bool) -> Result<WriteTx, MetaError> {
+        let mut w = self.begin_write().await?;
+        // SQLite: the write transaction already serialises every change, so nothing more is needed there.
+        if reduces_admins && self.dialect == Dialect::Postgres {
+            sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(LAST_ADMIN_LOCK_KEY).execute(&mut *w.tx).await?;
+        }
+        let mut ids = vec![actor.user];
+        if let Some(target) = target
+            && !same_user(target, actor.user)
+        {
+            ids.push(target);
+        }
+        ids.sort_by_key(|id| *id.0.as_bytes());
+        for id in ids {
+            // A target that isn't there is the caller's `NotFound`; the actor's own row is checked just below.
+            lock_user(&mut w.tx, id).await?;
+        }
+        let row = sqlx::query("SELECT role, password_hash, disabled_ms, removed_ms FROM users WHERE id = $1")
+            .bind(uuid_bytes(&actor.user.0))
+            .fetch_optional(&mut *w.tx)
+            .await?;
+        let Some(row) = row else { return Err(MetaError::DeviceRevoked) };
+        let still_signed_in = sqlx::query("SELECT 1 FROM devices WHERE id = $1 AND user_id = $2 AND revoked = 0")
+            .bind(uuid_bytes(actor.device.as_uuid()))
+            .bind(uuid_bytes(&actor.user.0))
+            .fetch_optional(&mut *w.tx)
+            .await?;
+        if still_signed_in.is_none()
+            || row.try_get::<Option<i64>, _>("disabled_ms")?.is_some()
+            || row.try_get::<Option<i64>, _>("removed_ms")?.is_some()
+        {
+            return Err(MetaError::DeviceRevoked);
+        }
+        if Role::parse(&row.try_get::<String, _>("role")?)? != Role::Admin {
+            return Err(MetaError::Forbidden("you are no longer an administrator"));
+        }
+        if row.try_get::<String, _>("password_hash")? != actor.password_hash {
+            return Err(MetaError::Conflict("your password changed while this request was running; try again"));
+        }
+        Ok(w)
+    }
+
+    async fn target(w: &mut WriteTx, user: UserId) -> Result<Target, MetaError> {
+        let row = sqlx::query("SELECT role, password_hash, disabled_ms, removed_ms FROM users WHERE id = $1")
+            .bind(uuid_bytes(&user.0))
+            .fetch_optional(&mut *w.tx)
+            .await?
+            .ok_or(MetaError::NotFound("user"))?;
+        Ok(Target {
+            role: Role::parse(&row.try_get::<String, _>("role")?)?,
+            disabled: row.try_get::<Option<i64>, _>("disabled_ms")?.is_some(),
+            removed: row.try_get::<Option<i64>, _>("removed_ms")?.is_some(),
+            has_password: !row.try_get::<String, _>("password_hash")?.is_empty(),
+        })
+    }
+
+    /// `LastAdmin` unless an administrator who is not disabled and not marked for removal is left, counted in `w`
+    /// after the `last_admin` lock was taken and the change was made.
+    async fn keep_an_admin(w: &mut WriteTx) -> Result<(), MetaError> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND disabled_ms IS NULL AND removed_ms IS NULL")
+            .fetch_one(&mut *w.tx)
+            .await?;
+        if row.try_get::<i64, _>("n")? < 1 { Err(MetaError::LastAdmin) } else { Ok(()) }
+    }
+
+    /// The counters of `GET /admin/server`: accounts that are not marked for removal, devices that are not revoked, and
+    /// the bytes accounts store and their live documents hold.
+    pub async fn admin_server_counts(&self) -> Result<ServerCounts, MetaError> {
+        let count = |row: sqlx::any::AnyRow, column: &str| -> Result<u64, MetaError> { to_u64(row.try_get(column)?) };
+        // Postgres sums BIGINT as NUMERIC, which the `Any` driver can't read: cast back.
+        let users = sqlx::query("SELECT COUNT(*) AS n FROM users WHERE removed_ms IS NULL").fetch_one(&self.pool).await?;
+        let devices = sqlx::query("SELECT COUNT(*) AS n FROM devices WHERE revoked = 0").fetch_one(&self.pool).await?;
+        let bytes = sqlx::query(
+            "SELECT CAST(COALESCE(SUM(stored_bytes), 0) AS BIGINT) AS stored, CAST(COALESCE(SUM(live_bytes), 0) AS BIGINT) AS live FROM spaces",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(ServerCounts {
+            users: count(users, "n")?,
+            devices_active: count(devices, "n")?,
+            stored_bytes: to_u64(bytes.try_get("stored")?)?,
+            live_bytes: to_u64(bytes.try_get("live")?)?,
+        })
+    }
+
+    /// One page of accounts that are not marked for removal, by username ascending: those after `after` (exclusive)
+    /// whose username contains `search` (case does not matter, `%` and `_` are ordinary characters), at most `limit`.
+    /// `next_after` is set when there are more. A `search` over [`MAX_SEARCH_BYTES`] is `Invalid`.
+    pub async fn admin_list_users(&self, after: Option<&str>, search: Option<&str>, limit: u32, now_ms: i64) -> Result<UserPage, MetaError> {
+        let search = search.unwrap_or_default();
+        if search.len() > MAX_SEARCH_BYTES {
+            return Err(MetaError::Invalid("the search is at most 64 bytes"));
+        }
+        let pattern = format!("%{}%", escape_like(&search.to_ascii_lowercase()));
+        let sql =
+            format!("{USER_SELECT} WHERE u.removed_ms IS NULL AND u.username > $2 AND u.username LIKE $3 ESCAPE '\\' ORDER BY u.username LIMIT $4");
+        let fetch = i64::from(limit).saturating_add(1);
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(now_ms)
+            .bind(after.unwrap_or_default())
+            .bind(pattern)
+            .bind(fetch)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut users = rows.iter().map(admin_user_from).collect::<Result<Vec<_>, _>>()?;
+        let more = users.len() > limit as usize;
+        users.truncate(limit as usize);
+        let next_after = if more { users.last().map(|u| u.username.clone()) } else { None };
+        Ok(UserPage { users, next_after })
+    }
+
+    /// One account, marked for removal or not; `None` if there is no such user.
+    pub async fn admin_user(&self, user: UserId, now_ms: i64) -> Result<Option<AdminUser>, MetaError> {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!("{USER_SELECT} WHERE u.id = $2")))
+            .bind(now_ms)
+            .bind(uuid_bytes(&user.0))
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(admin_user_from).transpose()
+    }
+
+    /// Makes an account for `username` with `role`, no password and its own space, and an invite under `code_hash`
+    /// (good for `ttl_ms`) the person redeems to choose a password. A name that is taken, by any account (one marked for
+    /// removal too), is `UsernameTaken`.
+    pub async fn admin_create_user(
+        &self,
+        actor: &AdminActor,
+        username: &str,
+        role: Role,
+        code_hash: &[u8; 32],
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<(AdminUser, Issued), MetaError> {
+        if !valid_username(username) {
+            return Err(MetaError::Invalid("usernames are 1-64 letters, digits, '.', '_' or '-'"));
+        }
+        let username = username.to_ascii_lowercase();
+        let expires_ms = now_ms.checked_add(ttl_ms).ok_or(MetaError::Invalid("the invite's lifetime is too long"))?;
+        let mut w = self.begin_admin(actor, None, false).await?;
+        let taken = sqlx::query("SELECT 1 FROM users WHERE username = $1").bind(username.as_str()).fetch_optional(&mut *w.tx).await?;
+        if taken.is_some() {
+            return Err(MetaError::UsernameTaken);
+        }
+        let ids = (UserId(Uuid::now_v7()), SpaceId::generate(), NodeId::generate());
+        let user = insert_user(&mut w.tx, &username, "", role, now_ms, ids).await?.id;
+        put_code(&mut w.tx, user, code_hash, Purpose::Invite, now_ms, expires_ms).await?;
+        w.commit().await?;
+        let made = self.admin_user(user, now_ms).await?.ok_or(MetaError::Corrupt("a new account is missing"))?;
+        Ok((made, Issued { expires_ms }))
+    }
+
+    /// Changes an account's role and/or its quota: `role` `None` leaves the role, `quota` `None` leaves the quota,
+    /// `Some(None)` removes it, `Some(Some(n))` sets it (at least [`MIN_QUOTA_BYTES`], at most `i64::MAX`). Demoting the
+    /// last administrator is `LastAdmin`; an account marked for removal is `Conflict`.
+    pub async fn admin_update_user(
+        &self,
+        actor: &AdminActor,
+        target: UserId,
+        role: Option<Role>,
+        quota: Option<Option<u64>>,
+        now_ms: i64,
+    ) -> Result<AdminUser, MetaError> {
+        if role.is_none() && quota.is_none() {
+            return Err(MetaError::Invalid("give a role or a quota_bytes to change"));
+        }
+        if let Some(Some(bytes)) = quota
+            && !(MIN_QUOTA_BYTES..=i64::MAX as u64).contains(&bytes)
+        {
+            return Err(MetaError::Invalid("quota_bytes is at least one chunk (4194304) and at most 9223372036854775807"));
+        }
+        let mut w = self.begin_admin(actor, Some(target), role == Some(Role::Member)).await?;
+        let found = Self::target(&mut w, target).await?;
+        if found.removed {
+            return Err(MetaError::Conflict("this account is marked for removal"));
+        }
+        if let Some(role) = role {
+            sqlx::query("UPDATE users SET role = $1 WHERE id = $2").bind(role.as_str()).bind(uuid_bytes(&target.0)).execute(&mut *w.tx).await?;
+            if found.role == Role::Admin && role == Role::Member {
+                Self::keep_an_admin(&mut w).await?;
+            }
+        }
+        if let Some(quota) = quota {
+            let quota = quota.map(to_i64).transpose()?;
+            sqlx::query("UPDATE spaces SET quota_bytes = $1 WHERE owner = $2").bind(quota).bind(uuid_bytes(&target.0)).execute(&mut *w.tx).await?;
+        }
+        w.commit().await?;
+        self.admin_user(target, now_ms).await?.ok_or(MetaError::NotFound("user"))
+    }
+
+    /// Disables an account: sets `disabled_ms`, signs every device out ([`RevokeReason::Disabled`]) and deletes the
+    /// account's invite, reset code and pairings. Disabling one's own account is `Invalid`, the last enabled
+    /// administrator `LastAdmin`; an account that is disabled already is left as it is. Returns the devices signed out.
+    pub async fn admin_disable_user(&self, actor: &AdminActor, target: UserId, now_ms: i64) -> Result<Vec<DeviceId>, MetaError> {
+        if same_user(actor.user, target) {
+            return Err(MetaError::Invalid("you can't disable your own account"));
+        }
+        let mut w = self.begin_admin(actor, Some(target), true).await?;
+        Self::target(&mut w, target).await?;
+        sqlx::query("UPDATE users SET disabled_ms = COALESCE(disabled_ms, $1) WHERE id = $2")
+            .bind(now_ms)
+            .bind(uuid_bytes(&target.0))
+            .execute(&mut *w.tx)
+            .await?;
+        Self::keep_an_admin(&mut w).await?;
+        let revoked = revoke_devices(&mut w.tx, target, None, RevokeReason::Disabled, now_ms).await?;
+        delete_join_codes(&mut w.tx, target).await?;
+        w.commit().await?;
+        Ok(revoked)
+    }
+
+    /// Enables a disabled account. Devices that were signed out stay signed out. One marked for removal is `Conflict`.
+    pub async fn admin_enable_user(&self, actor: &AdminActor, target: UserId) -> Result<(), MetaError> {
+        let mut w = self.begin_admin(actor, Some(target), false).await?;
+        if Self::target(&mut w, target).await?.removed {
+            return Err(MetaError::Conflict("this account is marked for removal"));
+        }
+        sqlx::query("UPDATE users SET disabled_ms = NULL WHERE id = $1").bind(uuid_bytes(&target.0)).execute(&mut *w.tx).await?;
+        w.commit().await
+    }
+
+    /// Marks an account for removal: as [`Meta::admin_disable_user`], and also sets `removed_ms`, which leaves it out of
+    /// the lists and cannot be undone here. Nothing it stored is deleted; its username stays taken. Removing one's
+    /// own account is `Invalid`, the last enabled administrator `LastAdmin`. Returns the devices signed out.
+    pub async fn admin_remove_user(&self, actor: &AdminActor, target: UserId, now_ms: i64) -> Result<Vec<DeviceId>, MetaError> {
+        if same_user(actor.user, target) {
+            return Err(MetaError::Invalid("you can't remove your own account"));
+        }
+        let mut w = self.begin_admin(actor, Some(target), true).await?;
+        Self::target(&mut w, target).await?;
+        sqlx::query("UPDATE users SET removed_ms = COALESCE(removed_ms, $1), disabled_ms = COALESCE(disabled_ms, $1) WHERE id = $2")
+            .bind(now_ms)
+            .bind(uuid_bytes(&target.0))
+            .execute(&mut *w.tx)
+            .await?;
+        Self::keep_an_admin(&mut w).await?;
+        let revoked = revoke_devices(&mut w.tx, target, None, RevokeReason::Disabled, now_ms).await?;
+        delete_join_codes(&mut w.tx, target).await?;
+        w.commit().await?;
+        Ok(revoked)
+    }
+
+    /// An invite under `code_hash` for an account that has no password yet (one nobody redeemed an invite for), replacing
+    /// its open invite or reset code. An account with a password is `Conflict`: an invite adds a computer without asking
+    /// for the password, which would give whoever holds it the account's files; a reset code is the way in there. A
+    /// disabled account, or one marked for removal, is `Conflict` too.
+    pub async fn admin_issue_invite(
+        &self,
+        actor: &AdminActor,
+        target: UserId,
+        code_hash: &[u8; 32],
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<Issued, MetaError> {
+        let expires_ms = now_ms.checked_add(ttl_ms).ok_or(MetaError::Invalid("the invite's lifetime is too long"))?;
+        let mut w = self.begin_admin(actor, Some(target), false).await?;
+        let found = Self::target(&mut w, target).await?;
+        if found.removed || found.disabled {
+            return Err(MetaError::Conflict("this account is disabled or marked for removal"));
+        }
+        if found.has_password {
+            return Err(MetaError::Conflict("this account has a password: make a password reset code for it instead"));
+        }
+        put_code(&mut w.tx, target, code_hash, Purpose::Invite, now_ms, expires_ms).await?;
+        w.commit().await?;
+        Ok(Issued { expires_ms })
+    }
+
+    /// Deletes the account's open invite or reset code; `NotFound` when there is none.
+    pub async fn admin_revoke_invite(&self, actor: &AdminActor, target: UserId) -> Result<(), MetaError> {
+        let mut w = self.begin_admin(actor, Some(target), false).await?;
+        Self::target(&mut w, target).await?;
+        let done = sqlx::query("DELETE FROM invites WHERE user_id = $1").bind(uuid_bytes(&target.0)).execute(&mut *w.tx).await?;
+        if done.rows_affected() == 0 {
+            return Err(MetaError::NotFound("invite"));
+        }
+        w.commit().await
+    }
+
+    /// A password reset code under `code_hash`, good for `ttl_ms`, replacing the account's open invite or reset code.
+    /// Redeeming it sets a new password and signs every device of the account out ([`Meta::redeem`]). Nothing changes
+    /// until then. Resetting one's own password is `Invalid` (change it), another administrator's `Forbidden`: that
+    /// takes a second factor on the acting admin's side, which this server does not have yet. A disabled account, or
+    /// one marked for removal, is `Conflict`.
+    pub async fn admin_issue_reset(
+        &self,
+        actor: &AdminActor,
+        target: UserId,
+        code_hash: &[u8; 32],
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<Issued, MetaError> {
+        if same_user(actor.user, target) {
+            return Err(MetaError::Invalid("change your own password in your account instead"));
+        }
+        let expires_ms = now_ms.checked_add(ttl_ms).ok_or(MetaError::Invalid("the code's lifetime is too long"))?;
+        let mut w = self.begin_admin(actor, Some(target), false).await?;
+        let found = Self::target(&mut w, target).await?;
+        if found.removed || found.disabled {
+            return Err(MetaError::Conflict("this account is disabled or marked for removal"));
+        }
+        // Without a second factor on this server, an admin account can only be reset by the command line on its host.
+        if found.role == Role::Admin {
+            return Err(MetaError::Forbidden(
+                "resetting another administrator's password needs two-factor sign-in on your own account, which this server does not have yet; \
+                 use the command line on the server",
+            ));
+        }
+        put_code(&mut w.tx, target, code_hash, Purpose::Reset, now_ms, expires_ms).await?;
+        w.commit().await?;
+        Ok(Issued { expires_ms })
+    }
+
+    /// All of an account's devices, revoked ones too; `NotFound` for a user that isn't there.
+    pub async fn admin_devices(&self, target: UserId) -> Result<Vec<DeviceRecord>, MetaError> {
+        let found = sqlx::query("SELECT 1 FROM users WHERE id = $1").bind(uuid_bytes(&target.0)).fetch_optional(&self.pool).await?;
+        if found.is_none() {
+            return Err(MetaError::NotFound("user"));
+        }
+        self.list_devices(target).await
+    }
+
+    /// Signs one of `target`'s devices out ([`RevokeReason::Admin`]) and deletes the pairing it made. A device that is
+    /// revoked already stays as it is. A device of another account, or an unknown user, is `NotFound`.
+    pub async fn admin_revoke_device(&self, actor: &AdminActor, target: UserId, device: DeviceId, now_ms: i64) -> Result<(), MetaError> {
+        let mut w = self.begin_admin(actor, Some(target), false).await?;
+        Self::target(&mut w, target).await?;
+        let done = sqlx::query("UPDATE devices SET revoked = 1, revoked_ms = $1, revoke_reason = $2 WHERE id = $3 AND user_id = $4 AND revoked = 0")
+            .bind(now_ms)
+            .bind(RevokeReason::Admin.as_str())
+            .bind(uuid_bytes(device.as_uuid()))
+            .bind(uuid_bytes(&target.0))
+            .execute(&mut *w.tx)
+            .await?;
+        if done.rows_affected() == 0 {
+            let owned = sqlx::query("SELECT 1 FROM devices WHERE id = $1 AND user_id = $2")
+                .bind(uuid_bytes(device.as_uuid()))
+                .bind(uuid_bytes(&target.0))
+                .fetch_optional(&mut *w.tx)
+                .await?;
+            if owned.is_none() {
+                return Err(MetaError::NotFound("device"));
+            }
+        }
+        sqlx::query("DELETE FROM pairings WHERE device_id = $1").bind(uuid_bytes(device.as_uuid())).execute(&mut *w.tx).await?;
+        w.commit().await
+    }
+}

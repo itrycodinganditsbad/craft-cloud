@@ -7,6 +7,7 @@
 //! row, so commits to one space run one at a time and commits to different spaces run in parallel.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod admin;
 mod blobs;
 mod codec;
 mod commit;
@@ -24,6 +25,7 @@ use sqlx::any::{AnyConnectOptions, AnyPoolOptions};
 use sqlx::{AnyPool, ConnectOptions};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+pub use admin::{AdminActor, AdminUser, Issued, MAX_SEARCH_BYTES, MIN_QUOTA_BYTES, RESET_TTL_MS, ServerCounts, UserPage};
 pub use commit::CommitOutcome;
 pub use craft_cloud_proto::BlobKind;
 pub use join::{InviteFor, Redeemed};
@@ -88,6 +90,17 @@ pub enum MetaError {
     /// nothing was changed and the request may be made again.
     #[error("{0}")]
     Conflict(&'static str),
+    /// The admin who asked may not do this (their role changed while the request ran, or the rules about resetting
+    /// another admin); nothing was changed.
+    #[error("{0}")]
+    Forbidden(&'static str),
+    /// The change would leave the server without an administrator who can sign in; nothing was changed.
+    #[error("this would leave the server without an enabled administrator")]
+    LastAdmin,
+    /// The account is disabled or marked for removal. Said only to someone who proved they hold its password or a
+    /// code of it, never to a guesser.
+    #[error("this account is disabled")]
+    AccountDisabled,
     #[error("invalid input: {0}")]
     Invalid(&'static str),
     #[error("stored data is damaged: {0}")]
@@ -235,6 +248,14 @@ impl Meta {
     pub fn with_stored_bytes_cap(mut self, cap: Option<u64>) -> Self {
         self.stored_cap = cap;
         self
+    }
+
+    /// `sqlite` or `postgres`, for the admin's server overview.
+    pub fn database_kind(&self) -> &'static str {
+        match self.dialect {
+            Dialect::Sqlite => "sqlite",
+            Dialect::Postgres => "postgres",
+        }
     }
 
     /// Whether a database connection is in use (a query under way, or a connection on its way back to the pool).
