@@ -175,6 +175,9 @@ const ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/v1/devices/0192f0c4-0000-7000-8000-000000000000"),
     ("GET", "/v1/files/history?path=Notes%2Ftodo.txt"),
     ("POST", "/v1/files/restore"),
+    ("GET", "/v1/trash?limit=1"),
+    ("POST", "/v1/trash/restore"),
+    ("POST", "/v1/trash/remove"),
     ("POST", "/v1/autostart"),
 ];
 
@@ -621,6 +624,98 @@ async fn local_file_history_rejects_unknown_outside_and_directory_paths() {
     assert_eq!((code, error_code(&body).as_str()), (404, "not_found"), "{body}");
     let (code, body) = call(&api, "GET", "/v1/files/history?path=..%2Foutside.txt", "");
     assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+    let _ = running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_trash_pages_restores_renames_and_removes_nodes() {
+    use craft_cloud_proto::local::TrashResponse;
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder = dir.path().join("Craft Cloud");
+    let (running, api) = signed_in(&server, &data, &folder).await;
+
+    std::fs::write(folder.join("first.txt"), b"first bytes").unwrap();
+    std::fs::write(folder.join("second.txt"), b"second bytes").unwrap();
+    reaches_the_server(&server, "first.txt").await;
+    reaches_the_server(&server, "second.txt").await;
+    std::fs::remove_file(folder.join("first.txt")).unwrap();
+    std::fs::remove_file(folder.join("second.txt")).unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    let page = loop {
+        let (code, body) = call(&api, "GET", "/v1/trash?limit=1", "");
+        if code == 200 {
+            let page: TrashResponse = serde_json::from_str(&body).unwrap();
+            if page.items.len() == 1 && page.next.is_some() {
+                break page;
+            }
+        }
+        assert!(Instant::now() < deadline, "both deleted files enter the trash");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let first = page.items.first().unwrap();
+    assert_eq!(first.path.as_deref(), Some(first.name.as_str()), "live root parent yields a path hint");
+    let cursor = page.next.as_deref().unwrap();
+    let (code, body) = call(&api, "GET", &format!("/v1/trash?limit=1&cursor={cursor}"), "");
+    assert_eq!(code, 200, "{body}");
+    let second_page: TrashResponse = serde_json::from_str(&body).unwrap();
+    let second = second_page.items.first().unwrap();
+    assert_ne!(first.id, second.id);
+
+    let restore_body = serde_json::json!({ "id": first.id }).to_string();
+    let (code, body) = call(&api, "POST", "/v1/trash/restore", &restore_body);
+    assert_eq!(code, 200, "{body}");
+    let restored: craft_cloud_proto::api::TrashRestoreResponse = serde_json::from_str(&body).unwrap();
+    assert!(!restored.renamed);
+    let restored_path = folder.join(&restored.name);
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if std::fs::read(&restored_path)
+            .is_ok_and(|bytes| bytes.as_slice() == if first.name == "first.txt" { &b"first bytes"[..] } else { &b"second bytes"[..] })
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the agent syncs restored bytes to disk");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Re-delete the restored ID, create a live node with its old name, then verify conflict rename on restore.
+    std::fs::remove_file(&restored_path).unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    let mut trashed_again = false;
+    while !trashed_again {
+        let (code, body) = call(&api, "GET", "/v1/trash?limit=50", "");
+        if code == 200 {
+            let page: TrashResponse = serde_json::from_str(&body).unwrap();
+            trashed_again = page.items.iter().any(|item| item.id == restored.node);
+        }
+        assert!(Instant::now() < deadline, "restored node is deleted again");
+        if !trashed_again {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    std::fs::write(&restored_path, b"replacement bytes").unwrap();
+    reaches_the_server(&server, &restored.name).await;
+    let (code, body) = call(&api, "POST", "/v1/trash/restore", &serde_json::json!({ "id": restored.node }).to_string());
+    assert_eq!(code, 200, "{body}");
+    let renamed: craft_cloud_proto::api::TrashRestoreResponse = serde_json::from_str(&body).unwrap();
+    assert!(renamed.renamed, "{renamed:?}");
+    assert_ne!(renamed.name, restored.name);
+
+    let (code, body) = call(&api, "POST", "/v1/trash/remove", &serde_json::json!({ "id": second.id }).to_string());
+    assert_eq!(code, 204, "{body}");
+    let (code, body) = call(&api, "GET", "/v1/trash?limit=50", "");
+    assert_eq!(code, 200, "{body}");
+    let remaining: TrashResponse = serde_json::from_str(&body).unwrap();
+    assert!(remaining.items.iter().all(|item| item.id != second.id));
+    let (code, body) = call(&api, "POST", "/v1/trash/restore", &serde_json::json!({ "id": second.id }).to_string());
+    assert_eq!((code, error_code(&body).as_str()), (404, "not_found"), "{body}");
+    let (code, body) = call(&api, "POST", "/v1/trash/restore", &serde_json::json!({ "id": "invalid" }).to_string());
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+    let unknown = craft_cloud_proto::NodeId::generate();
+    let (code, body) = call(&api, "POST", "/v1/trash/restore", &serde_json::json!({ "id": unknown }).to_string());
+    assert_eq!((code, error_code(&body).as_str()), (404, "not_found"), "{body}");
     let _ = running.stop().await;
 }
 

@@ -648,6 +648,46 @@ impl<C: Connection> HttpTransport<C> {
         history_answer(answer).await
     }
 
+    /// The server's newest-first trash page.
+    pub async fn trash(&self, cursor: Option<&str>, limit: Option<u32>) -> Result<craft_cloud_proto::api::TrashResponse, HistoryCallError> {
+        let mut url = self.server.endpoint("trash");
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(cursor) = cursor {
+                query.append_pair("cursor", cursor);
+            }
+            if let Some(limit) = limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+        }
+        let req = request(Method::GET, url, Some(&self.auth), MAX_SMALL_JSON_BYTES);
+        let answer = self.send(req).await.map_err(HistoryCallError::Transport)?;
+        history_answer(answer).await
+    }
+
+    /// Restores a deleted node from the server's trash.
+    pub async fn restore_from_trash(&self, node: NodeId) -> Result<craft_cloud_proto::api::TrashRestoreResponse, HistoryCallError> {
+        let req = self.request(Method::POST, &format!("trash/{node}/restore"), MAX_SMALL_JSON_BYTES);
+        let answer = self.send(req).await.map_err(HistoryCallError::Transport)?;
+        history_answer(answer).await
+    }
+
+    /// Marks a deleted node out of the server's trash. This does not free stored data yet.
+    pub async fn remove_from_trash(&self, node: NodeId) -> Result<(), HistoryCallError> {
+        let req = self.request(Method::DELETE, &format!("trash/{node}"), MAX_SMALL_JSON_BYTES);
+        let answer = self.send(req).await.map_err(HistoryCallError::Transport)?;
+        if answer.status.is_success() {
+            return Ok(());
+        }
+        let status = answer.status;
+        let body = body_capped(answer, MAX_SMALL_JSON_BYTES)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ErrorBody>(&bytes).ok())
+            .unwrap_or_else(|| ErrorBody { error: codes::INTERNAL.into(), message: status.to_string(), ..ErrorBody::default() });
+        Err(HistoryCallError::Refused { status, body })
+    }
+
     fn request(&self, method: Method, path: &str, max_body: usize) -> Request {
         request(method, self.server.endpoint(path), Some(&self.auth), max_body)
     }

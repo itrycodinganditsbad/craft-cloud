@@ -714,7 +714,7 @@ pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, cr
 pub(crate) fn local_error(e: AgentError) -> AgentError {
     use craft_cloud_proto::local::codes;
     match e {
-        AgentError::Local(craft_cloud_app::Error::Refused { code, message }) => match code.as_str() {
+        AgentError::Local(craft_cloud_app::Error::Refused { code, message, .. }) => match code.as_str() {
             codes::WRONG_PASSWORD => AgentError::WrongPassword,
             codes::NOT_SIGNED_IN => AgentError::NotSignedIn,
             codes::OFFLINE => AgentError::Offline(message),

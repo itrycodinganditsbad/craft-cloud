@@ -25,7 +25,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use craft_cloud_proto::DeviceId;
-use craft_cloud_proto::api::{DeviceInfo, ErrorBody, HistoryResponse, PairingStatus, RestoreResponse, codes as api_codes};
+use craft_cloud_proto::api::{DeviceInfo, ErrorAnswer, HistoryResponse, PairingStatus, RestoreResponse, codes as api_codes};
 use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
 use craft_cloud_proto::local::{
     AutostartRequest, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES,
@@ -191,27 +191,28 @@ impl Control {
     }
 }
 
-/// An error answer: the HTTP status and the [`ErrorBody`].
+/// An error answer: the HTTP status and the local API's typed error answer.
 #[derive(Debug)]
 pub struct LocalError {
     pub status: StatusCode,
     pub code: String,
     pub message: String,
+    pub name_taken: Option<bool>,
 }
 
 impl LocalError {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code: code.to_owned(), message: message.into() }
+        Self { status, code: code.to_owned(), message: message.into(), name_taken: None }
     }
 
     fn with_code(status: StatusCode, code: String, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into() }
+        Self { status, code, message: message.into(), name_taken: None }
     }
 }
 
 impl IntoResponse for LocalError {
     fn into_response(self) -> Response {
-        (self.status, Json(ErrorBody { error: self.code, message: self.message, ..ErrorBody::default() })).into_response()
+        (self.status, Json(ErrorAnswer { error: self.code, message: self.message, name_taken: self.name_taken })).into_response()
     }
 }
 
@@ -361,6 +362,9 @@ fn router(state: Api) -> Router {
         .route(paths::QUIT, post(quit))
         .route(paths::FILE_HISTORY, get(file_history))
         .route(paths::FILE_RESTORE, post(file_restore))
+        .route(paths::TRASH, get(trash))
+        .route(paths::TRASH_RESTORE, post(trash_restore))
+        .route(paths::TRASH_REMOVE, post(trash_remove))
         .route(paths::BLOBS, axum::routing::put(put_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         .route(&format!("{}/{{hash}}", paths::BLOBS), get(get_blob))
         .fallback(|| async { LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such call") })
@@ -401,7 +405,13 @@ fn history_error(error: crate::http::HistoryCallError) -> LocalError {
         crate::http::HistoryCallError::Refused { status: StatusCode::UNAUTHORIZED, body } => {
             LocalError::new(StatusCode::CONFLICT, codes::NEEDS_YOU, body.message)
         }
-        crate::http::HistoryCallError::Refused { status, body } => LocalError::with_code(status, body.error, body.message),
+        crate::http::HistoryCallError::Refused { status, body } => {
+            let name_taken = body
+                .conflicts
+                .as_ref()
+                .map(|conflicts| conflicts.iter().any(|conflict| matches!(conflict.kind, craft_cloud_proto::ConflictKind::NameTaken { .. })));
+            LocalError { status, code: body.error, message: body.message, name_taken }
+        }
         crate::http::HistoryCallError::Transport(craft_cloud_sync::TransportError::NotFound) => {
             LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such file or version")
         }
@@ -432,6 +442,68 @@ async fn file_restore(
     let answer = transport.restore_file(node, request.version, request.expected_version).await.map_err(history_error)?;
     state.control.request_pass();
     Ok(Json(answer))
+}
+
+#[derive(serde::Deserialize)]
+struct TrashQuery {
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
+fn trash_path_hint(saved: Option<&crate::account::SavedState>, parent: craft_cloud_proto::NodeId, name: &str) -> Option<String> {
+    let saved = saved?;
+    let parent_path = saved.state.base_path(parent)?;
+    if parent_path.is_root() { Some(name.to_owned()) } else { Some(format!("{parent_path}/{name}")) }
+}
+
+async fn trash(
+    State(state): State<Api>,
+    query: Result<Query<TrashQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<craft_cloud_proto::local::TrashResponse>, LocalError> {
+    let Query(query) = query.map_err(|e| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, e.body_text()))?;
+    let (_, transport) = server_api(&state)?;
+    let response = transport.trash(query.cursor.as_deref(), query.limit).await.map_err(history_error)?;
+    let saved = DataDir::new(&state.data).load_state().ok();
+    Ok(Json(craft_cloud_proto::local::TrashResponse {
+        items: response
+            .items
+            .into_iter()
+            .map(|item| craft_cloud_proto::local::TrashItem {
+                path: trash_path_hint(saved.as_ref(), item.parent, &item.name),
+                id: item.id,
+                parent: item.parent,
+                name: item.name,
+                is_dir: item.is_dir,
+                size: item.size,
+                deleted_ms: item.deleted_ms,
+                purge_after_ms: item.purge_after_ms,
+            })
+            .collect(),
+        next: response.next,
+    }))
+}
+
+async fn trash_restore(
+    State(state): State<Api>,
+    body: Result<Json<craft_cloud_proto::local::TrashNodeRequest>, JsonRejection>,
+) -> Result<Json<craft_cloud_proto::api::TrashRestoreResponse>, LocalError> {
+    let Json(request) = body?;
+    let id = request.id.parse().map_err(|_| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "id must be a node ID"))?;
+    let (_, transport) = server_api(&state)?;
+    let answer = transport.restore_from_trash(id).await.map_err(history_error)?;
+    state.control.request_pass();
+    Ok(Json(answer))
+}
+
+async fn trash_remove(
+    State(state): State<Api>,
+    body: Result<Json<craft_cloud_proto::local::TrashNodeRequest>, JsonRejection>,
+) -> Result<StatusCode, LocalError> {
+    let Json(request) = body?;
+    let id = request.id.parse().map_err(|_| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "id must be a node ID"))?;
+    let (_, transport) = server_api(&state)?;
+    transport.remove_from_trash(id).await.map_err(history_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Equal strings, compared in time that doesn't depend on where they differ.
