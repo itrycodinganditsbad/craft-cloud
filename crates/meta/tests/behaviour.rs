@@ -1787,6 +1787,8 @@ async fn upgrading_counts_what_each_space_already_stores() {
         sqlx::query("DROP TABLE pairings").execute(&mut conn).await.unwrap();
         sqlx::query("DROP TABLE invites").execute(&mut conn).await.unwrap();
         // And before save records.
+        // And before the history index.
+        sqlx::query("DROP INDEX versions_node_seq").execute(&mut conn).await.unwrap();
         sqlx::query("ALTER TABLE versions DROP COLUMN save").execute(&mut conn).await.unwrap();
         sqlx::query("DELETE FROM schema_version WHERE version >= 2").execute(&mut conn).await.unwrap();
     }
@@ -1812,7 +1814,7 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 6);
+    assert_eq!(versions, 7);
 }
 
 /// A file with `n` versions, one commit each (the first by create): its node and the versions, oldest first.
@@ -2049,4 +2051,49 @@ async fn a_restore_and_a_late_save_record_both_apply(meta: &Meta) {
     assert_eq!(history[0].id, restored.version);
     // The create, two updates, the record and the restore.
     assert_eq!(meta.space_info(space).await.unwrap().seq, 5);
+}
+
+/// The database at the newest version when the code knows it: the version table holds one row per migration, and a
+/// database written by a newer build is refused rather than half-read.
+#[tokio::test]
+async fn the_schema_version_is_recorded_and_a_newer_database_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}", dir.path().join("meta.db").display());
+    drop(Meta::open(&url).await.unwrap());
+    use sqlx::Connection;
+    let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+    let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
+    assert_eq!(latest, 7);
+    // Opening again changes nothing.
+    drop(Meta::open(&url).await.unwrap());
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
+    assert_eq!(rows, 7);
+    sqlx::query("INSERT INTO schema_version (version) VALUES (8)").execute(&mut conn).await.unwrap();
+    drop(conn);
+    assert!(matches!(Meta::open(&url).await, Err(MetaError::Corrupt(_))), "a newer database is refused");
+}
+
+/// A history page is read through the index on `(space_id, node, seq, id)`, not by scanning the versions table.
+#[tokio::test]
+async fn a_history_page_uses_the_node_index_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}", dir.path().join("meta.db").display());
+    drop(Meta::open(&url).await.unwrap());
+    use sqlx::Connection;
+    let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+    let plan = sqlx::query(
+        "EXPLAIN QUERY PLAN SELECT id FROM versions WHERE space_id = ?1 AND node = ?2 AND (seq, id) < (?3, ?4) ORDER BY seq DESC, id DESC LIMIT ?5",
+    )
+    .bind(vec![0u8; 16])
+    .bind(vec![0u8; 16])
+    .bind(i64::MAX)
+    .bind(vec![0xffu8; 16])
+    .bind(51i64)
+    .fetch_all(&mut conn)
+    .await
+    .unwrap();
+    use sqlx::Row;
+    let detail: Vec<String> = plan.iter().map(|r| r.get::<String, _>("detail")).collect();
+    assert!(detail.iter().any(|d| d.contains("versions_node_seq")), "{detail:?}");
+    assert!(!detail.iter().any(|d| d.contains("TEMP B-TREE")), "no sort: {detail:?}");
 }

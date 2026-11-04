@@ -671,9 +671,10 @@ and that `expected_version` is still the file's current version; then it records
 parent is the current version, with the manifest, modification time and executable bit of the old one, at the space's
 next sequence number. The epoch does not change (only `reset-epoch` and backup restores do that), the change feed
 reports the file like any other update, and a restore needs no quota because the manifest is already the space's.
-The new version carries **no save record**: a save record names a state of a live document, and a restore replaces
-file content only, so the engine keeps preferring a newer local live-document state over the restored file for a
-file that has a live document (which is why such a file is refused). Unknown node, foreign node, a version of
+The new version carries **no save record**: a save record names a state of a live document, and a restore
+copies none and invents none. A restore is an ordinary new version, so agents take it in under the normal rules,
+including the conflict rules for a machine with unsynced edits of its own. A file that has a live document is
+refused, so file versions and live-document state stay separate. Unknown node, foreign node, a version of
 another file and a missing manifest are all `not_found`; a deleted file, a folder and a file with a live document are
 `invalid`; a stale `expected_version` is `conflict` (409, with the conflict list as for a commit).
 

@@ -41,11 +41,13 @@ impl Meta {
             // Above every sequence number and every ID.
             None => (i64::MAX, vec![0xff; 16]),
         };
-        // One row more than asked for tells whether another page follows. The cursor is exclusive.
+        // One row more than asked for tells whether another page follows. The cursor is exclusive. The row-value
+        // comparison and the order match the index `versions_node_seq`, so the database seeks to the cursor and stops
+        // after the page.
         let rows = sqlx::query(
             "SELECT id, parent_version, epoch, seq, size, mtime_ms, device, created_ms, \
                     CAST(CASE WHEN save IS NULL THEN 0 ELSE 1 END AS BIGINT) AS has_save \
-             FROM versions WHERE space_id = $1 AND node = $2 AND (seq < $3 OR (seq = $3 AND id < $4)) \
+             FROM versions WHERE space_id = $1 AND node = $2 AND (seq, id) < ($3, $4) \
              ORDER BY seq DESC, id DESC LIMIT $5",
         )
         .bind(uuid_bytes(space.as_uuid()))
