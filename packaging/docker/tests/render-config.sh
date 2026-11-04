@@ -104,6 +104,18 @@ printf '%s' 'short' >"$secrets/db_password"
 refuse 'short database password' DB_KIND=postgres
 printf '%s' 'abcdefghijklmnopqrstuvwxyz0123456@/x"' >"$secrets/db_password"
 refuse 'database password with URL characters' DB_KIND=postgres
+printf 'abcdefghijklmnopqrstuvwxyz0123456789
+secondline
+' >"$secrets/db_password"
+refuse 'database password with a second line' DB_KIND=postgres
+printf 'abcdefghijklmnopqrstuvwxyz0123456789
+
+' >"$secrets/db_password"
+refuse 'database password with an empty second line' DB_KIND=postgres
+printf '%s
+' "$password" >"$secrets/db_password"
+run DB_KIND=postgres || fail "a password with one trailing line feed was refused: $(cat "$work/err")"
+expect_line "url = \"postgres://craft_cloud:$password@db:5432/craft_cloud\""
 rm "$secrets/db_password"
 refuse 'missing database password' DB_KIND=postgres
 printf '%s' 'abc"def' >"$secrets/s3_secret_access_key"

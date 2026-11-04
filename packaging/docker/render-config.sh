@@ -40,10 +40,16 @@ template=${1:-}
 [ -r "$template" ] || die "can't read the template"
 secrets=${SECRETS_DIR:-/run/secrets}
 
-# secret <file name>: prints nothing; sets $secret_value to the file's first line.
+# secret <file name>: prints nothing; sets $secret_value to the whole file, minus one trailing line feed. A secret with
+# a line feed inside is refused, so what is checked here is all that other services (db-init reads the whole file)
+# will see.
 secret() {
     [ -r "$secrets/$1" ] || die "the secret file $1 is missing"
-    IFS= read -r secret_value <"$secrets/$1" || [ -n "$secret_value" ] || die "the secret file $1 is empty"
+    secret_value=$(cat "$secrets/$1"; printf x) || die "can't read the secret file $1"
+    secret_value=${secret_value%x}
+    secret_value=${secret_value%"$nl"}
+    case $secret_value in *"$nl"*) die "the secret file $1 has more than one line" ;; esac
+    [ -n "$secret_value" ] || die "the secret file $1 is empty"
 }
 
 public_url=${PUBLIC_URL:-}
