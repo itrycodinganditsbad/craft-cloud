@@ -652,6 +652,10 @@ fn audit_events() -> Vec<AuditEvent> {
         count,
         details,
         at_ms: NOW - (n as i64) * 3_600_000 - 5_000,
+        actor_user: (!action.starts_with("cli.") && !action.ends_with("login_failed"))
+            .then(|| Uuid::from_u128(0x0123_4567_89ab_cdef_0000_0000_0000_0000 + u128::from(n))),
+        target_kind: if action.starts_with("admin.") { "user".into() } else { String::new() },
+        target_id: action.starts_with("admin.").then(|| Uuid::from_u128(0xfedc_ba98_7654_3210_0000_0000_0000_0000 + u128::from(n))),
         ..FakeAgent::sample_event(n, action)
     };
     vec![
@@ -701,15 +705,15 @@ fn snapshot_audit_and_activity_pages() {
     let ana = id_of(&model, "ana");
     let mut narrowed = audit_model(&agent, vec![Event::Audit(AuditMsg::OpenAudit(Some((ana, "ana".into()))))]);
     narrowed.update(Event::Audit(AuditMsg::Export));
-    narrowed.update(Event::Audit(AuditMsg::ExportPicked(Some("C:/Users/fabio/craft-cloud-audit.ndjson".into()))));
+    crate::audit::tests::picked(&mut narrowed, Some("C:/Users/fabio/craft-cloud-audit.ndjson"));
     snapshot(narrowed.clone(), egui::Theme::Light, "audit-log-exporting");
-    narrowed.update(Event::Audit(AuditMsg::Exported(Ok(craft_cloud_app::ExportOutcome { events: 100_000, truncated: true }))));
+    crate::audit::tests::finished(&mut narrowed, Ok(craft_cloud_app::ExportOutcome { events: 100_000, truncated: true }));
     assert!(matches!(view_of(&narrowed).export, ExportState::Done { .. }));
     snapshot(narrowed.clone(), egui::Theme::Light, "audit-log-export-truncated");
     narrowed.update(Event::Audit(AuditMsg::DismissExport));
     narrowed.update(Event::Audit(AuditMsg::Export));
-    narrowed.update(Event::Audit(AuditMsg::ExportPicked(Some("out.ndjson".into()))));
-    narrowed.update(Event::Audit(AuditMsg::Exported(Err(craft_cloud_app::Error::Io("the export broke off: connection reset".into())))));
+    crate::audit::tests::picked(&mut narrowed, Some("out.ndjson"));
+    crate::audit::tests::finished(&mut narrowed, Err(craft_cloud_app::Error::Io("the export broke off: connection reset".into())));
     snapshot(narrowed, egui::Theme::Light, "audit-log-export-failed");
 
     // The account's own activity, for a member too.

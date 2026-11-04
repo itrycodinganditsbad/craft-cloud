@@ -108,11 +108,14 @@ pub struct AuditFilter {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExportState {
     Idle,
-    /// The file picker is open.
-    Picking,
-    /// The stream is being written to this file.
+    /// The file picker is open (the call `ticket` is the one whose answer is wanted).
+    Picking {
+        ticket: u64,
+    },
+    /// The stream is being written to this file (the call `ticket` is the one whose answer is wanted).
     Running {
         path: String,
+        ticket: u64,
     },
     /// Written: how many events, and whether the server cut it at its limit (then it is not the whole log).
     Done {
@@ -149,7 +152,10 @@ pub enum AuditMsg {
         result: Result<AuditPage, Error>,
     },
     /// [`Effect::AuditExport`]'s answer.
-    Exported(Result<ExportOutcome, Error>),
+    Exported {
+        ticket: u64,
+        result: Result<ExportOutcome, Error>,
+    },
 
     /// The admin's audit view, for one account or all of them.
     OpenAudit(Option<(Uuid, String)>),
@@ -163,7 +169,10 @@ pub enum AuditMsg {
     /// Export what the filters say to a file (the person picks it).
     Export,
     /// The file picker's answer (`None`: cancelled).
-    ExportPicked(Option<String>),
+    ExportPicked {
+        ticket: u64,
+        path: Option<String>,
+    },
     /// The note about the last export was read.
     DismissExport,
 
@@ -302,15 +311,18 @@ impl AdminScreen {
             }
             AuditMsg::Export => {
                 let Some(view) = self.audit_view() else { return Vec::new() };
-                if matches!(view.export, ExportState::Picking | ExportState::Running { .. }) {
+                if matches!(view.export, ExportState::Picking { .. } | ExportState::Running { .. }) {
                     return Vec::new();
                 }
-                view.export = ExportState::Picking;
-                vec![Effect::PickExportFile { suggested: EXPORT_NAME.to_owned() }]
+                // The answers of the picker and of the export carry this number: one that comes after the pages were left and
+                // opened again, or for an earlier export, matches nothing.
+                let ticket = fresh();
+                view.export = ExportState::Picking { ticket };
+                vec![Effect::PickExportFile { suggested: EXPORT_NAME.to_owned(), ticket }]
             }
-            AuditMsg::ExportPicked(picked) => {
+            AuditMsg::ExportPicked { ticket, path: picked } => {
                 let Some(view) = self.audit_view() else { return Vec::new() };
-                if view.export != ExportState::Picking {
+                if view.export != (ExportState::Picking { ticket }) {
                     return Vec::new();
                 }
                 match picked {
@@ -319,7 +331,7 @@ impl AdminScreen {
                         Vec::new()
                     }
                     Some(path) => {
-                        view.export = ExportState::Running { path: path.clone() };
+                        view.export = ExportState::Running { path: path.clone(), ticket };
                         // Every event the filters say, not one page: no cursor, no limit.
                         let query = AuditQuery {
                             cursor: None,
@@ -328,13 +340,16 @@ impl AdminScreen {
                             user: view.filter.user.as_ref().map(|(id, _)| *id),
                             action: view.filter.action.clone(),
                         };
-                        vec![Effect::AuditExport { query, path }]
+                        vec![Effect::AuditExport { query, path, ticket }]
                     }
                 }
             }
-            AuditMsg::Exported(result) => {
+            AuditMsg::Exported { ticket, result } => {
                 let Some(view) = self.audit_view() else { return Vec::new() };
-                let ExportState::Running { path } = &view.export else { return Vec::new() };
+                let ExportState::Running { path, ticket: running } = &view.export else { return Vec::new() };
+                if *running != ticket {
+                    return Vec::new();
+                }
                 let path = path.clone();
                 match result {
                     Ok(outcome) => {
@@ -350,7 +365,7 @@ impl AdminScreen {
             }
             AuditMsg::DismissExport => {
                 if let Some(view) = self.audit_view()
-                    && !matches!(view.export, ExportState::Running { .. } | ExportState::Picking)
+                    && !matches!(view.export, ExportState::Running { .. } | ExportState::Picking { .. })
                 {
                     view.export = ExportState::Idle;
                 }
@@ -424,6 +439,47 @@ pub fn filter_choices() -> Vec<&'static str> {
     choices
 }
 
+/// The first eight characters of an ID, to tell accounts and computers apart in a line (the whole ID is on hover).
+pub fn short_id(id: impl std::fmt::Display) -> String {
+    id.to_string().chars().filter(|c| *c != '-').take(8).collect()
+}
+
+/// Who did it and what it was about, in a line, and the same with the whole IDs for hover: the account that acted (or "command
+/// line" for the server's own commands, "unknown" for a failed sign-in, where nobody proved who they were), the account or computer
+/// it concerned, and the computer a sign-out or admin act names in its details.
+pub fn who_line(event: &AuditEvent) -> (String, String) {
+    let mut line = Vec::new();
+    let mut full = Vec::new();
+    match (event.actor_user, event.action.starts_with("cli.")) {
+        (Some(user), _) => {
+            line.push(format!("by {}", short_id(user)));
+            full.push(format!("by account {user}"));
+        }
+        (None, true) => {
+            line.push("by the command line".to_owned());
+            full.push("by the server's command line".to_owned());
+        }
+        (None, false) => {
+            line.push("by unknown".to_owned());
+            full.push("by unknown: nobody had proved who they were".to_owned());
+        }
+    }
+    if let Some(device) = event.actor_device {
+        line.push(format!("on computer {}", short_id(device)));
+        full.push(format!("on computer {device}"));
+    }
+    if let Some(target) = event.target_id {
+        let kind = if event.target_kind.is_empty() || event.target_kind == "user" { "account" } else { event.target_kind.as_str() };
+        line.push(format!("about {kind} {}", short_id(target)));
+        full.push(format!("about {kind} {target}"));
+    }
+    if let Some(device) = event.details.device {
+        line.push(format!("computer {}", short_id(device)));
+        full.push(format!("computer {device}"));
+    }
+    (line.join(" · "), full.join("\n"))
+}
+
 /// The typed details of an event in a few words (nothing the server doesn't write from closed lists).
 pub fn details_line(event: &AuditEvent) -> String {
     let d = &event.details;
@@ -464,7 +520,7 @@ pub fn details_line(event: &AuditEvent) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use craft_cloud_proto::api::AuditDetails;
@@ -475,6 +531,20 @@ mod tests {
     use crate::agent::fake::FakeAgent;
     use crate::agent::{Starter, call};
     use crate::model::Event;
+
+    /// The picker's answer for the export that waits for it.
+    pub(crate) fn picked(model: &mut Model, path: Option<&str>) -> Vec<Effect> {
+        let View::Audit(view) = &model.admin_screen().unwrap().view else { panic!("not the audit view") };
+        let ExportState::Picking { ticket } = view.export else { panic!("not picking: {:?}", view.export) };
+        model.update(Event::Audit(AuditMsg::ExportPicked { ticket, path: path.map(str::to_owned) }))
+    }
+
+    /// The answer of the export that runs.
+    pub(crate) fn finished(model: &mut Model, result: Result<ExportOutcome, Error>) {
+        let View::Audit(view) = &model.admin_screen().unwrap().view else { panic!("not the audit view") };
+        let ExportState::Running { ticket, .. } = view.export else { panic!("not running: {:?}", view.export) };
+        model.update(Event::Audit(AuditMsg::Exported { ticket, result }));
+    }
 
     fn on_audit(agent: &FakeAgent) -> Model {
         let mut model = support::on_the_pages(agent);
@@ -591,50 +661,126 @@ mod tests {
         boss.audit_events.lock().unwrap().extend((0..3).map(|n| FakeAgent::sample_event(n, "auth.login")));
         let mut model = on_audit(&boss);
         // Cancelling the picker is nothing.
-        assert_eq!(model.update(Event::Audit(AuditMsg::Export)), vec![Effect::PickExportFile { suggested: EXPORT_NAME.to_owned() }]);
+        let asked = model.update(Event::Audit(AuditMsg::Export));
+        assert!(matches!(asked.as_slice(), [Effect::PickExportFile { suggested, .. }] if suggested == EXPORT_NAME), "{asked:?}");
         assert!(model.update(Event::Audit(AuditMsg::Export)).is_empty(), "one at a time");
-        model.update(Event::Audit(AuditMsg::ExportPicked(None)));
+        picked(&mut model, None);
         assert_eq!(view(&model).export, ExportState::Idle);
         // Whole.
         support::run(&mut model, &boss, ev(AuditMsg::SetAction(Some("auth.".into()))));
         model.update(Event::Audit(AuditMsg::Export));
-        let effects = model.update(Event::Audit(AuditMsg::ExportPicked(Some("out.ndjson".into()))));
-        let [Effect::AuditExport { query, path }] = effects.as_slice() else { panic!("{effects:?}") };
-        assert_eq!((path.as_str(), query.action.as_deref(), query.cursor.clone(), query.limit), ("out.ndjson", Some("auth."), None, None));
-        let start: Starter = Arc::new(|_: &dyn crate::agent::Agent| Err(String::new()));
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("out.ndjson").display().to_string();
-        let effects = vec![Effect::AuditExport { query: query.clone(), path: file.clone() }];
+        let effects = picked(&mut model, Some(&file));
+        let [Effect::AuditExport { query, path, .. }] = effects.as_slice() else { panic!("{effects:?}") };
+        assert_eq!((path.as_str(), query.action.as_deref(), query.cursor.clone(), query.limit), (file.as_str(), Some("auth."), None, None));
+        let start: Starter = Arc::new(|_: &dyn crate::agent::Agent| Err(String::new()));
         let answer = call(&boss, &start, effects.into_iter().next().unwrap()).unwrap();
         model.update(answer);
-        assert_eq!(view(&model).export, ExportState::Done { path: "out.ndjson".into(), outcome: ExportOutcome { events: 3, truncated: false } });
-        let text = std::fs::read_to_string(&file).unwrap();
-        assert_eq!(text.lines().count(), 3);
-        assert!(!std::path::Path::new(&format!("{file}.part")).exists(), "the part file is moved into place");
+        assert_eq!(view(&model).export, ExportState::Done { path: file.clone(), outcome: ExportOutcome { events: 3, truncated: false } });
+        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 3);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temporary file is left");
         // Truncated: the file is the newest events and the page says it is not the whole log.
         *boss.export_truncated.lock().unwrap() = true;
         model.update(Event::Audit(AuditMsg::DismissExport));
         model.update(Event::Audit(AuditMsg::Export));
-        model.update(Event::Audit(AuditMsg::ExportPicked(Some("out.ndjson".into()))));
-        let answer = call(&boss, &start, Effect::AuditExport { query: query.clone(), path: file.clone() }).unwrap();
+        let effects = picked(&mut model, Some(&file));
+        let answer = call(&boss, &start, effects.into_iter().next().unwrap()).unwrap();
         model.update(answer);
         assert!(matches!(&view(&model).export, ExportState::Done { outcome, .. } if outcome.truncated), "{:?}", view(&model).export);
-        // Failed (the stream broke): said, and no file is left, not even a half one, and an older one is not replaced.
+        // Failed (the stream broke): said, and no file of ours is left, and an older one, and a `.part` that is somebody else's,
+        // are not touched.
         *boss.export_truncated.lock().unwrap() = false;
         std::fs::write(&file, "old").unwrap();
+        let theirs = format!("{file}.part");
+        std::fs::write(&theirs, "not ours").unwrap();
         boss.export_fails.lock().unwrap().push(Error::Io("the export broke off: reset".into()));
         model.update(Event::Audit(AuditMsg::DismissExport));
         model.update(Event::Audit(AuditMsg::Export));
-        model.update(Event::Audit(AuditMsg::ExportPicked(Some("out.ndjson".into()))));
-        let answer = call(&boss, &start, Effect::AuditExport { query: query.clone(), path: file.clone() }).unwrap();
+        let effects = picked(&mut model, Some(&file));
+        let answer = call(&boss, &start, effects.into_iter().next().unwrap()).unwrap();
         model.update(answer);
         assert!(matches!(&view(&model).export, ExportState::Failed(m) if m.contains("broke off")), "{:?}", view(&model).export);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "old", "a failed export leaves what was there");
-        assert!(!std::path::Path::new(&format!("{file}.part")).exists());
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "not ours", "a file called .part is not ours to truncate or delete");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2, "only those two files");
+        // A whole export replaces the destination and still leaves the other file alone.
+        model.update(Event::Audit(AuditMsg::DismissExport));
+        model.update(Event::Audit(AuditMsg::Export));
+        let effects = picked(&mut model, Some(&file));
+        let answer = call(&boss, &start, effects.into_iter().next().unwrap()).unwrap();
+        model.update(answer);
+        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 3);
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "not ours");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
         // An answer when no export runs is ignored.
         model.update(Event::Audit(AuditMsg::DismissExport));
-        model.update(Event::Audit(AuditMsg::Exported(Ok(ExportOutcome { events: 1, truncated: false }))));
+        model.update(Event::Audit(AuditMsg::Exported { ticket: 1, result: Ok(ExportOutcome { events: 1, truncated: false }) }));
         assert_eq!(view(&model).export, ExportState::Idle);
+    }
+
+    /// An export's answer belongs to the export that asked: leave the pages and open them again, start another, and the first one's
+    /// answer (or its picker's) finishes nothing of the second.
+    #[test]
+    fn an_old_exports_answers_finish_nothing_of_a_newer_one() {
+        let boss = support::agent(true, 1);
+        boss.audit_events.lock().unwrap().extend((0..3).map(|n| FakeAgent::sample_event(n, "auth.login")));
+        let mut model = on_audit(&boss);
+        model.update(Event::Audit(AuditMsg::Export));
+        let a = picked(&mut model, Some("a.ndjson"));
+        let [Effect::AuditExport { ticket: a_ticket, .. }] = a.as_slice() else { panic!("{a:?}") };
+        let a_ticket = *a_ticket;
+        // Leave and come back, and start B (its picker open, then running).
+        support::run(&mut model, &boss, vec![Event::Admin(AdminEvent::BackToList)]);
+        support::run(&mut model, &boss, vec![Event::Audit(AuditMsg::OpenAudit(None))]);
+        let asked = model.update(Event::Audit(AuditMsg::Export));
+        let [Effect::PickExportFile { ticket: b_picker, .. }] = asked.as_slice() else { panic!("{asked:?}") };
+        let b_picker = *b_picker;
+        assert_ne!(a_ticket, b_picker);
+        // A's answer arrives while B is still picking, and A's old picker answer arrives too.
+        model.update(Event::Audit(AuditMsg::Exported { ticket: a_ticket, result: Ok(ExportOutcome { events: 3, truncated: false }) }));
+        assert_eq!(view(&model).export, ExportState::Picking { ticket: b_picker });
+        model.update(Event::Audit(AuditMsg::ExportPicked { ticket: a_ticket, path: Some("a.ndjson".into()) }));
+        assert_eq!(view(&model).export, ExportState::Picking { ticket: b_picker }, "A's picker answer is not B's");
+        let b = model.update(Event::Audit(AuditMsg::ExportPicked { ticket: b_picker, path: Some("b.ndjson".into()) }));
+        assert!(matches!(b.as_slice(), [Effect::AuditExport { path, .. }] if path == "b.ndjson"), "{b:?}");
+        // B runs; A's answer comes late and finishes nothing; B's own does.
+        model.update(Event::Audit(AuditMsg::Exported { ticket: a_ticket, result: Err(Error::Io("the export broke off".into())) }));
+        assert!(matches!(&view(&model).export, ExportState::Running { path, .. } if path == "b.ndjson"), "{:?}", view(&model).export);
+        model.update(Event::Audit(AuditMsg::Exported { ticket: b_picker, result: Ok(ExportOutcome { events: 3, truncated: false }) }));
+        assert!(matches!(&view(&model).export, ExportState::Done { path, .. } if path == "b.ndjson"), "{:?}", view(&model).export);
+    }
+
+    #[test]
+    fn who_did_it_and_what_it_was_about_is_in_every_line() {
+        let user = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+        let other = Uuid::from_u128(0xfedc_ba98_7654_3210_fedc_ba98_7654_3210);
+        let mut e = FakeAgent::sample_event(1, "admin.user_disabled");
+        e.actor_user = Some(user);
+        e.target_kind = "user".into();
+        e.target_id = Some(other);
+        let (line, full) = who_line(&e);
+        assert_eq!(line, "by 01234567 · about account fedcba98");
+        assert!(full.contains(&user.to_string()) && full.contains(&other.to_string()), "{full}");
+        // A computer in the details; a computer that acted.
+        let device = craft_cloud_app::DeviceId::generate();
+        e.details.device = Some(device);
+        e.actor_device = Some(device);
+        let (line, full) = who_line(&e);
+        assert!(line.contains(&format!("on computer {}", short_id(device))) && line.contains(&format!("computer {}", short_id(device))), "{line}");
+        assert!(full.contains(&device.to_string()));
+        // Nobody: the command line, or an unproven sign-in.
+        let cli = FakeAgent::sample_event(2, "cli.password_reset");
+        assert_eq!(who_line(&cli).0, "by the command line");
+        let failed = FakeAgent::sample_event(3, "auth.login_failed");
+        assert_eq!(who_line(&failed).0, "by unknown");
+        assert!(who_line(&failed).1.contains("nobody had proved"));
+        // A target of another kind keeps its kind.
+        let mut gone = FakeAgent::sample_event(4, "device.revoked");
+        gone.actor_user = Some(user);
+        gone.target_kind = "device".into();
+        gone.target_id = Some(other);
+        assert_eq!(who_line(&gone).0, "by 01234567 · about device fedcba98");
     }
 
     #[test]

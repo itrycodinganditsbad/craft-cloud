@@ -322,7 +322,7 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
             let result = if own { agent.account_activity(&query) } else { agent.admin_audit(&query) };
             Event::Audit(AuditMsg::Page { own, ticket, result })
         }
-        Effect::AuditExport { query, path } => Event::Audit(AuditMsg::Exported(export_to_file(agent, &query, &path))),
+        Effect::AuditExport { query, path, ticket } => Event::Audit(AuditMsg::Exported { ticket, result: export_to_file(agent, &query, &path) }),
         Effect::AdminDo { action, confirm } => Event::Admin(AdminEvent::Done(change(agent, &action, confirm))),
         // Not running is as good as stopped.
         Effect::QuitAgent => {
@@ -347,14 +347,29 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
     })
 }
 
-/// Writes the audit export to `path`: first to `<path>.part`, which is moved into place only when the stream ended properly (the
-/// server's last line, the right count) and the file was written to the end. Anything else removes the part file and leaves what
-/// was at `path` as it was, so a broken export is never mistaken for a whole one. A stream the server cut at its limit is a good
-/// file, and says so in the outcome.
+/// Writes the audit export to `path`: first to a file of its own in the same folder, created for this export alone (it must not
+/// exist yet, and no link in its place is followed), which is moved over `path` only when the stream ended properly (the server's
+/// last line, the right count) and the file was written to the end. Anything else removes that file, and only that file, and
+/// leaves what is at `path` as it was (a file called `<path>.part` is somebody else's), so a broken export is never mistaken for a
+/// whole one. A stream the server cut at its limit is a good file, and says so in the outcome.
 fn export_to_file(agent: &dyn Agent, query: &AuditQuery, path: &str) -> Result<ExportOutcome, Error> {
-    let part = format!("{path}.part");
     let io = |what: &str, e: std::io::Error| Error::Io(format!("{what}: {e}"));
-    let file = std::fs::File::create(&part).map_err(|e| io("can't write the export file", e))?;
+    let target = std::path::Path::new(path);
+    let name = target.file_name().ok_or_else(|| Error::Io(format!("{path} is not a file name")))?.to_string_lossy().into_owned();
+    let dir = target.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let mut made = None;
+    for _ in 0..16 {
+        let part = dir.join(format!(".{name}.{}.{}.part", std::process::id(), crate::admin::fresh()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&part) {
+            Ok(file) => {
+                made = Some((part, file));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(io("can't write the export file", e)),
+        }
+    }
+    let Some((part, file)) = made else { return Err(Error::Io("can't make a file for the export".into())) };
     let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
     let result = agent.admin_audit_export(query, &mut writer);
     let finished = writer.flush().and_then(|()| writer.get_ref().sync_all());
@@ -370,7 +385,7 @@ fn export_to_file(agent: &dyn Agent, query: &AuditQuery, path: &str) -> Result<E
             return Err(e);
         }
     };
-    if let Err(e) = std::fs::rename(&part, path) {
+    if let Err(e) = std::fs::rename(&part, target) {
         let _ = std::fs::remove_file(&part);
         return Err(io("can't save the export file", e));
     }

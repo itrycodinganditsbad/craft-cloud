@@ -356,10 +356,12 @@ pub enum Effect {
     AuditExport {
         query: craft_cloud_app::AuditQuery,
         path: String,
+        ticket: u64,
     },
     /// Ask for the file an export goes to, with the OS's save dialog, starting at this name ([`AuditMsg::ExportPicked`]).
     PickExportFile {
         suggested: String,
+        ticket: u64,
     },
     /// A change, with the admin's confirmation ([`AdminEvent::Done`]). Its `Debug` output hides the password.
     AdminDo {

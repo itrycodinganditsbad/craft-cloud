@@ -4,7 +4,7 @@
 use egui::RichText;
 
 use crate::admin::AdminEvent;
-use crate::audit::{ActivityScreen, AuditList, AuditMsg, AuditView, ExportState, action_label, details_line, filter_choices, filter_label};
+use crate::audit::{ActivityScreen, AuditList, AuditMsg, AuditView, ExportState, action_label, details_line, filter_choices, filter_label, who_line};
 use crate::model::Event;
 use craft_cloud_proto::api::AuditEvent;
 
@@ -42,6 +42,9 @@ fn event_row(ui: &mut egui::Ui, event: &AuditEvent, now_ms: i64) {
             line.push_str(&details);
         }
         ui.add(egui::Label::new(RichText::new(line).small().weak()).wrap());
+        // Who did it and what it was about, with the whole IDs on hover.
+        let (who, full) = who_line(event);
+        ui.add(egui::Label::new(RichText::new(who).small().weak()).wrap().sense(egui::Sense::hover())).on_hover_text(full);
         ui.separator();
     });
 }
@@ -104,13 +107,13 @@ pub(super) fn log(ui: &mut egui::Ui, view: &mut AuditView, now_ms: i64, events: 
 
     // The export.
     ui.horizontal(|ui| {
-        let idle = !matches!(view.export, ExportState::Picking | ExportState::Running { .. });
+        let idle = !matches!(view.export, ExportState::Picking { .. } | ExportState::Running { .. });
         if ui.add_enabled(idle, egui::Button::new("Export…")).on_hover_text("Save what these filters show, all of it, as a file").clicked() {
             send(events, AuditMsg::Export);
         }
         match &view.export {
             ExportState::Idle => {}
-            ExportState::Picking => {
+            ExportState::Picking { .. } => {
                 ui.label(RichText::new("Choose where to save it…").weak());
             }
             ExportState::Running { .. } => {

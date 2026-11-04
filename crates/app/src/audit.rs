@@ -315,6 +315,10 @@ mod tests {
         (result, String::from_utf8(out).unwrap())
     }
 
+    fn head_again() -> Vec<u8> {
+        b"HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n".to_vec()
+    }
+
     /// Over a real connection: a chunked export that ends properly, one whose connection drops in the middle (no
     /// terminating chunk: a failed export, whatever came before), and a refusal before it starts.
     #[test]
@@ -346,6 +350,14 @@ mod tests {
         no_end.extend(b"0\r\n\r\n");
         let (result, _) = exported(no_end);
         assert!(matches!(result, Err(Error::Protocol(ref m)) if m.contains("no last line")), "{result:?}");
+        // The last chunk, then the connection ends before the body's last line break, or inside a trailer: not complete.
+        for tail in [&b"0\r\n"[..], &b"0\r\nX-Trailer: y"[..], &b"0\r\nX-Trailer: y\r\n"[..]] {
+            let mut cut_at_the_end = head_again();
+            cut_at_the_end.extend(chunk(&format!("{}\n{{\"complete\":true,\"exported\":1}}\n", event(1))));
+            cut_at_the_end.extend(tail);
+            let (result, _) = exported(cut_at_the_end);
+            assert!(matches!(result, Err(Error::Io(_))), "{tail:?}: {result:?}");
+        }
         // A refusal: the agent's JSON, with the server's wait.
         let body = r#"{"error":"rate_limited","message":"too many tries"}"#;
         let refused = format!("HTTP/1.1 429 Too Many Requests\r\nretry-after: 30\r\ncontent-length: {}\r\n\r\n{body}", body.len());

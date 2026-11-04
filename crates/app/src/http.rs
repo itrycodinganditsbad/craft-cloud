@@ -251,12 +251,21 @@ impl<R: BufRead> BodyReader<R> {
         let size = text.trim().split(';').next().unwrap_or_default().trim();
         let size = u64::from_str_radix(size, 16).map_err(|_| bad("a chunk size isn't a number"))?;
         if size == 0 {
-            // The trailers, up to the empty line.
+            // The trailers, up to the empty line that ends the body: a stream that ends before it, or inside a trailer, is cut
+            // off (an error, not an end), and the trailers are bounded as the head is.
+            let mut seen = 0usize;
             loop {
                 let mut trailer = Vec::new();
-                let n = (&mut self.inner).take(MAX_HEAD_BYTES as u64).read_until(b'\n', &mut trailer)?;
-                if n == 0 || trailer == b"\r\n" || trailer == b"\n" {
+                let n = (&mut self.inner).take(MAX_HEAD_BYTES as u64 + 1).read_until(b'\n', &mut trailer)?;
+                if n == 0 || trailer.last() != Some(&b'\n') {
+                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "the body ended before its last line break"));
+                }
+                if trailer == b"\r\n" || trailer == b"\n" {
                     break;
+                }
+                seen = seen.saturating_add(n);
+                if seen > MAX_HEAD_BYTES {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "the body's trailers are too long"));
                 }
             }
         }
@@ -359,6 +368,13 @@ content-length: 2
         assert!(read(BodyReader::chunked(&b"5\r\nhel"[..])).is_err());
         assert!(read(BodyReader::chunked(&b"5\r\nhello\r\n"[..])).is_err());
         assert!(read(BodyReader::chunked(&b"5\r\nhello"[..])).is_err());
+        // The last chunk without the line break that ends the body, or cut inside a trailer: cut off, not complete.
+        assert!(read(BodyReader::chunked(&b"5\r\nhello\r\n0\r\n"[..])).is_err());
+        assert!(read(BodyReader::chunked(&b"5\r\nhello\r\n0\r\nTrailer: x"[..])).is_err());
+        assert!(read(BodyReader::chunked(&b"5\r\nhello\r\n0\r\nTrailer: x\r\n"[..])).is_err());
+        assert_eq!(read(BodyReader::chunked(&b"5\r\nhello\r\n0\r\n\r\n"[..])).unwrap(), b"hello");
+        let long = format!("5\r\nhello\r\n0\r\n{}\r\n\r\n", "X: y\r\n".repeat(5_000));
+        assert!(read(BodyReader::chunked(long.as_bytes())).is_err(), "trailers are bounded");
         assert!(read(BodyReader::with_length(&b"abc"[..], 4)).is_err());
         // Garbage and over-long size lines.
         assert!(read(BodyReader::chunked(&b"zz\r\n"[..])).is_err());
