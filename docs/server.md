@@ -173,7 +173,9 @@ The command line stays as the way in without HTTP and enforces neither the confi
 The server keeps a log of the events that matter for who may do what, in its database: sign-ins and failed sign-ins (a
 row per account and minute, with a count), devices signed out, password changes, an administrator's changes to accounts,
 roles, quotas, invites, reset codes and devices, codes redeemed on a new computer, and what the command line does to an
-account (`user reset-password`, `device revoke`, `device revoke-all`). Reading it:
+account (`user reset-password`, `user reset-2fa`, `device revoke`, `device revoke-all`). Two-factor sign-in writes its
+changes, a recovery code's use, a lock and the wrong second steps of a sign-in or a join (never a code), but not each wrong code
+on a signed-in route. Reading it:
 
 - Every account sees its own events, and what was done to it, with `GET /api/v1/account/activity`.
 - Admins read all of it with `GET /api/v1/admin/audit` (filters `user`, an account ID, and `action`, an event name like

@@ -665,8 +665,8 @@ changes locally, then pushes local changes. These rules came out of the simulati
   `admin.user_removed`, `admin.role_changed`, `admin.quota_changed`, `admin.invite_issued`, `admin.invite_revoked`,
   `admin.password_reset_issued`, `admin.two_factor_reset`, `admin.device_revoked`, `join.invite_redeemed`,
   `join.reset_redeemed`, `join.pairing_redeemed`, `cli.password_reset`, `cli.two_factor_reset`, `cli.device_revoked`,
-  `cli.devices_revoked_all` and `cli.user_removed`. A name whose change does not exist yet (two-factor sign-in,
-  `user remove`) is listed so the vocabulary a client filters by does not change; its writer arrives with that change.
+  `cli.devices_revoked_all` and `cli.user_removed`. A name whose change does not exist yet (`user remove`) is listed so
+  the vocabulary a client filters by does not change; its writer arrives with that change.
   - **Rows.** `id` (UUIDv7), `at_ms`, `actor_user` and `actor_device` (`NULL` for the command line, and for a sign-in that
     failed: nobody proved who they were), `action`, `target_kind` (`user`, `device` or empty) and `target_id`, `outcome`
     (`success`, or `failure` for a failed sign-in), `details`, and for aggregated rows `agg_key` and `agg_count` (the API
@@ -688,12 +688,28 @@ changes locally, then pushes local changes. These rules came out of the simulati
   - **`details` is typed.** Each event has its own few fields, each a closed list of words or a number: `client_kind`
     (`agent`, `desktop`, `cli`) and `platform` (`windows`, `macos`, `linux`, `android`, `ios`, `other`) for a sign-in or
     join, `reason` (as in the device list), `step` (`password`, `totp`, `recovery`, `challenge_expired`), `role_from` and
-    `role_to`, `quota_bytes` (a number, `null` when the quota was removed), `revoked` (a count) and `device` (an ID). A
+    `role_to`, `quota_bytes` (a number, `null` when the quota was removed), `revoked` (a count), `device` (an ID) and `two_factor_removed` (`true`, only on `join.reset_redeemed`). A
     device may call its platform any printable text of 32 bytes, an address or a file name included, so anything not in
     the list is `other`; nothing a client typed ever reaches a row. The text is at most 2,048 bytes: if it would be more,
     whole fields go, the least important first, and `"truncated": true` is added; bytes are never cut off, which would
     leave invalid JSON. **No address, file name, path, device name, name of an account that does not exist, password,
     code, challenge, token, key or e-mail address is stored anywhere in a row.**
+  - **Two-factor sign-in** writes these, all in the transaction of the change unless said otherwise. A sign-in that made a
+    device writes `auth.login` whichever way it went (no second factor, a code, a recovery code); the challenge `POST
+    /auth/login` gives writes nothing, since nobody is signed in yet. Turning it on, new recovery codes and turning it off write
+    `account.two_factor_enabled`, `account.recovery_codes_regenerated` and `account.two_factor_disabled` (the account, from the
+    device that asked). A recovery code that is used up writes `auth.recovery_code_used` in the transaction that uses it up
+    (sign-in, join, turning it off, an admin's confirmation, which commits on its own before the change it confirms), by the
+    account and the device where there is one; never the code. An admin's reset writes `admin.two_factor_reset` (admin, target)
+    and the command line `cli.two_factor_reset` (no actor, with `revoked`); a reset code made with `reset_two_factor` that is
+    redeemed writes `join.reset_redeemed` with `two_factor_removed: true`, by the account that redeemed it: the code does not
+    say which admin made it, and none is made up. The wrong second step of a sign-in or a join is `auth.second_factor_failed`
+    (`step`: `totp` or `recovery`; `challenge_expired` for a challenge that is unknown, expired, used or out of tries, with no
+    account when it was not found), aggregated and written after the answer is decided, like `auth.login_failed`. **A wrong proof
+    on a signed-in route** (turning it off, new recovery codes, an admin's confirmation) **is not written one by one**; the lock
+    it can cause is: `auth.two_factor_locked`, once when a lock is set or lengthened and never for a refusal while it holds. That
+    event is written like a failed sign-in's, in a transaction of its own after the counters and the lock are committed, so a
+    fault in the log can neither undo the lock nor change the answer; it is logged without content and the event is lost.
   - **Failed sign-ins** are one row per account, action and minute, `agg_key` = action + account + minute, written
     after the answer is decided and in a transaction of its own: `INSERT … ON CONFLICT (agg_key) DO UPDATE SET agg_count =
     audit_events.agg_count + 1` (the column is qualified, since a bare one is ambiguous against `excluded` on Postgres),
