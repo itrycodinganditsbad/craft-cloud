@@ -342,7 +342,7 @@ impl Meta {
         }
         let mut w = self.begin_admin(actor, Some(target), true).await?;
         Self::target(&mut w, target).await?;
-        sqlx::query("UPDATE users SET disabled_ms = COALESCE(disabled_ms, $1) WHERE id = $2")
+        sqlx::query("UPDATE users SET disabled_ms = COALESCE(disabled_ms, $1), auth_gen = auth_gen + 1 WHERE id = $2")
             .bind(now_ms)
             .bind(uuid_bytes(&target.0))
             .execute(&mut *w.tx)
@@ -360,7 +360,10 @@ impl Meta {
         if Self::target(&mut w, target).await?.removed {
             return Err(MetaError::Conflict("this account is marked for removal"));
         }
-        sqlx::query("UPDATE users SET disabled_ms = NULL WHERE id = $1").bind(uuid_bytes(&target.0)).execute(&mut *w.tx).await?;
+        sqlx::query("UPDATE users SET disabled_ms = NULL, auth_gen = auth_gen + 1 WHERE id = $1")
+            .bind(uuid_bytes(&target.0))
+            .execute(&mut *w.tx)
+            .await?;
         w.commit().await
     }
 
@@ -373,11 +376,13 @@ impl Meta {
         }
         let mut w = self.begin_admin(actor, Some(target), true).await?;
         Self::target(&mut w, target).await?;
-        sqlx::query("UPDATE users SET removed_ms = COALESCE(removed_ms, $1), disabled_ms = COALESCE(disabled_ms, $1) WHERE id = $2")
-            .bind(now_ms)
-            .bind(uuid_bytes(&target.0))
-            .execute(&mut *w.tx)
-            .await?;
+        sqlx::query(
+            "UPDATE users SET removed_ms = COALESCE(removed_ms, $1), disabled_ms = COALESCE(disabled_ms, $1), auth_gen = auth_gen + 1 WHERE id = $2",
+        )
+        .bind(now_ms)
+        .bind(uuid_bytes(&target.0))
+        .execute(&mut *w.tx)
+        .await?;
         Self::keep_an_admin(&mut w).await?;
         let revoked = revoke_devices(&mut w.tx, target, None, RevokeReason::Disabled, now_ms).await?;
         delete_join_codes(&mut w.tx, target).await?;

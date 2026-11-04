@@ -283,7 +283,7 @@ impl Meta {
                     Purpose::Reset => {
                         // Dropping the transaction puts the code back.
                         let new = new_password_hash.filter(|hash| !hash.is_empty()).ok_or(MetaError::PasswordRequired)?;
-                        sqlx::query("UPDATE users SET password_hash = $1, password_changed_ms = $2 WHERE id = $3")
+                        sqlx::query("UPDATE users SET password_hash = $1, password_changed_ms = $2, auth_gen = auth_gen + 1 WHERE id = $3")
                             .bind(new)
                             .bind(now_ms)
                             .bind(uuid_bytes(&user.0))

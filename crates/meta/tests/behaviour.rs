@@ -152,6 +152,7 @@ on_every_backend!(
     a_sign_in_checked_against_an_old_password_creates_no_device,
     redeems_sign_ins_and_resets_at_the_same_moment_leave_no_live_device,
     the_admin_list_pages_searches_and_counts,
+    a_sign_in_checked_before_a_disable_and_an_enable_creates_no_device,
     an_admin_makes_an_account_with_a_role_and_an_invite,
     an_admin_changes_a_role_and_a_quota,
     the_acting_admins_state_is_checked_in_the_transaction,
@@ -1814,6 +1815,7 @@ async fn upgrading_counts_what_each_space_already_stores() {
         // And before the admin API (its `invites` column went with the table).
         sqlx::query("ALTER TABLE spaces DROP COLUMN quota_bytes").execute(&mut conn).await.unwrap();
         sqlx::query("ALTER TABLE users DROP COLUMN removed_ms").execute(&mut conn).await.unwrap();
+        sqlx::query("ALTER TABLE users DROP COLUMN auth_gen").execute(&mut conn).await.unwrap();
         // And before device sessions.
         for column in ["client_kind", "platform", "app_version", "revoked_ms", "revoke_reason"] {
             sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE devices DROP COLUMN {column}"))).execute(&mut conn).await.unwrap();
@@ -2116,22 +2118,22 @@ async fn concurrent_password_changes_and_sign_outs_never_fail_the_database(meta:
 async fn a_sign_in_checked_against_an_old_password_creates_no_device(meta: &Meta) {
     let ana = user(meta, "ana").await;
     let client = DeviceClient::default();
-    let first = meta.sign_in_device(ana.id, "$argon2id$stub", "pc", &client, &token(), NOW).await.unwrap();
+    let first = meta.sign_in_device(ana.id, ("$argon2id$stub", 0), "pc", &client, &token(), NOW).await.unwrap();
     assert!(first.is_some_and(|d| d != DeviceId::generate()));
-    assert!(meta.sign_in_device(ana.id, "$argon2id$other", "pc", &client, &token(), NOW).await.unwrap().is_none(), "not the stored hash");
+    assert!(meta.sign_in_device(ana.id, ("$argon2id$other", 0), "pc", &client, &token(), NOW).await.unwrap().is_none(), "not the stored hash");
     assert!(
-        meta.sign_in_device(UserId(uuid::Uuid::now_v7()), "$argon2id$stub", "pc", &client, &token(), NOW).await.unwrap().is_none(),
+        meta.sign_in_device(UserId(uuid::Uuid::now_v7()), ("$argon2id$stub", 0), "pc", &client, &token(), NOW).await.unwrap().is_none(),
         "no such user"
     );
-    assert!(matches!(meta.sign_in_device(ana.id, "$argon2id$stub", "", &client, &token(), NOW).await, Err(MetaError::Invalid(_))));
+    assert!(matches!(meta.sign_in_device(ana.id, ("$argon2id$stub", 0), "", &client, &token(), NOW).await, Err(MetaError::Invalid(_))));
     // The password was checked, then reset: the account's devices are signed out and the late sign-in adds none.
     meta.reset_password(ana.id, "$argon2id$reset", false, NOW + 1).await.unwrap();
-    assert!(meta.sign_in_device(ana.id, "$argon2id$stub", "late", &client, &token(), NOW + 2).await.unwrap().is_none());
+    assert!(meta.sign_in_device(ana.id, ("$argon2id$stub", 0), "late", &client, &token(), NOW + 2).await.unwrap().is_none());
     let devices = meta.list_devices(ana.id).await.unwrap();
     assert_eq!(devices.len(), 1);
     assert!(devices.iter().all(|d| d.revoked));
     // With the new hash it works.
-    assert!(meta.sign_in_device(ana.id, "$argon2id$reset", "new", &client, &token(), NOW + 3).await.unwrap().is_some());
+    assert!(meta.sign_in_device(ana.id, ("$argon2id$reset", gen_of(meta, "ana").await), "new", &client, &token(), NOW + 3).await.unwrap().is_some());
 }
 
 /// Redeeming an invite or a pairing, a password sign-in and a reset at the same moment, over and over: no database
@@ -2149,7 +2151,9 @@ async fn redeems_sign_ins_and_resets_at_the_same_moment_leave_no_live_device(met
                 match job {
                     0 => meta.redeem(&invite, "invited", &token(), None, NOW + 1).await.map(|_| ()),
                     1 => meta.redeem(&pairing, "paired", &token(), None, NOW + 1).await.map(|_| ()),
-                    2 => meta.sign_in_device(ana.id, "$argon2id$stub", "signed in", &DeviceClient::default(), &token(), NOW + 1).await.map(|_| ()),
+                    2 => {
+                        meta.sign_in_device(ana.id, ("$argon2id$stub", 0), "signed in", &DeviceClient::default(), &token(), NOW + 1).await.map(|_| ())
+                    }
                     3 => meta.create_pairing(ana.id, maker, &code(PAIRING_CHARS).hash(), NOW + 1).await.map(|_| ()),
                     _ => meta.reset_password(ana.id, "$argon2id$reset", false, NOW + 2).await.map(|_| ()),
                 }
@@ -2175,6 +2179,7 @@ async fn back_to_0006(url: &str) {
     sqlx::query("ALTER TABLE invites DROP COLUMN purpose").execute(&mut conn).await.unwrap();
     sqlx::query("ALTER TABLE spaces DROP COLUMN quota_bytes").execute(&mut conn).await.unwrap();
     sqlx::query("ALTER TABLE users DROP COLUMN removed_ms").execute(&mut conn).await.unwrap();
+    sqlx::query("ALTER TABLE users DROP COLUMN auth_gen").execute(&mut conn).await.unwrap();
     for column in ["client_kind", "platform", "app_version", "revoked_ms", "revoke_reason"] {
         sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE devices DROP COLUMN {column}"))).execute(&mut conn).await.unwrap();
     }
@@ -2338,6 +2343,11 @@ async fn admin_actor(meta: &Meta, username: &str) -> (UserRecord, AdminActor) {
     let device = device(meta, &u).await;
     let actor = AdminActor { user: u.id, device, password_hash: ADMIN_HASH.to_owned() };
     (u, actor)
+}
+
+/// The generation a sign-in would read for `username` now.
+async fn gen_of(meta: &Meta, username: &str) -> i64 {
+    meta.user_by_name(username).await.unwrap().unwrap().auth_gen
 }
 
 async fn admin_view(meta: &Meta, user: UserId) -> AdminUser {
@@ -2561,7 +2571,7 @@ async fn disabling_signs_everything_out_and_enabling_brings_back_nothing(meta: &
     assert_eq!(admin_view(meta, ana.id).await.disabled_ms, Some(NOW + 1), "the first time stays");
 
     // Nothing gets in: a sign-in that checked the right password, a device, a code the command line makes, a pairing.
-    let sign_in = meta.sign_in_device(ana.id, "$argon2id$stub", "pc", &DeviceClient::default(), &token(), NOW + 3).await;
+    let sign_in = meta.sign_in_device(ana.id, ("$argon2id$stub", gen_of(meta, "ana").await), "pc", &DeviceClient::default(), &token(), NOW + 3).await;
     assert!(matches!(sign_in, Err(MetaError::AccountDisabled)), "{sign_in:?}");
     assert!(matches!(meta.create_device(ana.id, "pc", &token(), NOW + 3).await, Err(MetaError::AccountDisabled)));
     let late_invite = code(INVITE_CHARS);
@@ -2576,7 +2586,12 @@ async fn disabling_signs_everything_out_and_enabling_brings_back_nothing(meta: &
     assert_eq!(admin_view(meta, ana.id).await.disabled_ms, None);
     assert!(meta.list_devices(ana.id).await.unwrap().iter().all(|d| d.revoked));
     assert_eq!(meta.device_by_token(&other_token).await.unwrap(), None);
-    assert!(meta.sign_in_device(ana.id, "$argon2id$stub", "pc", &DeviceClient::default(), &token(), NOW + 6).await.unwrap().is_some());
+    assert!(
+        meta.sign_in_device(ana.id, ("$argon2id$stub", gen_of(meta, "ana").await), "pc", &DeviceClient::default(), &token(), NOW + 6)
+            .await
+            .unwrap()
+            .is_some()
+    );
     // The code made while the account was disabled works now, as an invite made for an enabled account would.
     redeem(meta, &late_invite, "pc2", NOW + 7).await.unwrap();
 
@@ -2592,7 +2607,7 @@ async fn disabling_signs_everything_out_and_enabling_brings_back_nothing(meta: &
         Err(MetaError::UsernameTaken)
     ));
     assert!(matches!(meta.admin_issue_reset(&actor, bob.id, &code(INVITE_CHARS).hash(), NOW, RESET_TTL_MS).await, Err(MetaError::Conflict(_))));
-    let sign_in = meta.sign_in_device(bob.id, "$argon2id$stub", "pc", &DeviceClient::default(), &token(), NOW + 9).await;
+    let sign_in = meta.sign_in_device(bob.id, ("$argon2id$stub", gen_of(meta, "bob").await), "pc", &DeviceClient::default(), &token(), NOW + 9).await;
     assert!(matches!(sign_in, Err(MetaError::AccountDisabled)), "{sign_in:?}");
     assert!(meta.admin_remove_user(&actor, bob.id, NOW + 10).await.unwrap().is_empty(), "removing again is harmless");
     assert_eq!(meta.admin_server_counts().await.unwrap().users, 2);
@@ -2615,7 +2630,9 @@ async fn issuing_access_while_an_account_is_disabled_leaves_no_usable_token(meta
                 match job {
                     0 => meta.redeem(&invite, "invited", &token(), None, NOW + 1).await.map(|_| ()),
                     1 => meta.redeem(&pairing, "paired", &token(), None, NOW + 1).await.map(|_| ()),
-                    2 => meta.sign_in_device(ana.id, "$argon2id$stub", "signed in", &DeviceClient::default(), &token(), NOW + 1).await.map(|_| ()),
+                    2 => {
+                        meta.sign_in_device(ana.id, ("$argon2id$stub", 0), "signed in", &DeviceClient::default(), &token(), NOW + 1).await.map(|_| ())
+                    }
                     3 => meta.create_pairing(ana.id, maker, &code(PAIRING_CHARS).hash(), NOW + 1).await.map(|_| ()),
                     4 => meta.create_device(ana.id, "plain", &token(), NOW + 1).await.map(|_| ()),
                     _ => meta.admin_disable_user(&actor, ana.id, NOW + 2).await.map(|_| ()),
@@ -2637,6 +2654,39 @@ async fn issuing_access_while_an_account_is_disabled_leaves_no_usable_token(meta
         assert!(devices.iter().all(|d| d.revoked), "round {round}: {devices:?}");
         assert_revoke_columns_agree(&devices);
     }
+}
+
+/// A sign-in reads the hash and generation, verifies the password (slowly), and asks to create the device. A disable and
+/// an enable in between leave the hash as it was but not the generation: the device is not created. So are a password
+/// change and a removal. The interleaving is played out by calling the API in that order.
+async fn a_sign_in_checked_before_a_disable_and_an_enable_creates_no_device(meta: &Meta) {
+    let (_, actor) = admin_actor(meta, "root").await;
+    let ana = user(meta, "ana").await;
+    let bob = user(meta, "bob").await;
+    let client = DeviceClient::default();
+    for (name, id) in [("ana", ana.id), ("bob", bob.id)] {
+        let read = meta.user_by_name(name).await.unwrap().unwrap();
+        if name == "ana" {
+            meta.admin_disable_user(&actor, id, NOW).await.unwrap();
+            meta.admin_enable_user(&actor, id).await.unwrap();
+        } else {
+            meta.admin_remove_user(&actor, id, NOW).await.unwrap();
+        }
+        let late = meta.sign_in_device(id, (&read.password_hash, read.auth_gen), "pc", &client, &token(), NOW + 1).await;
+        match name {
+            "ana" => assert!(matches!(late, Ok(None)), "{late:?}"),
+            _ => assert!(matches!(late, Ok(None) | Err(MetaError::AccountDisabled)), "{late:?}"),
+        }
+        assert!(meta.list_devices(id).await.unwrap().is_empty(), "{name}: no device was made");
+    }
+    // A sign-in that read the state after the enable goes through.
+    let fresh = meta.user_by_name("ana").await.unwrap().unwrap();
+    assert!(fresh.auth_gen >= 2);
+    assert!(meta.sign_in_device(ana.id, (&fresh.password_hash, fresh.auth_gen), "pc", &client, &token(), NOW + 2).await.unwrap().is_some());
+    // A password change moves the generation too.
+    let before = gen_of(meta, "ana").await;
+    meta.reset_password(ana.id, "$argon2id$new", true, NOW + 3).await.unwrap();
+    assert!(gen_of(meta, "ana").await > before);
 }
 
 async fn invites_and_reset_codes_replace_each_other(meta: &Meta) {
@@ -2898,6 +2948,7 @@ async fn back_to_0007(url: &str) {
     sqlx::query("ALTER TABLE invites DROP COLUMN purpose").execute(&mut conn).await.unwrap();
     sqlx::query("ALTER TABLE spaces DROP COLUMN quota_bytes").execute(&mut conn).await.unwrap();
     sqlx::query("ALTER TABLE users DROP COLUMN removed_ms").execute(&mut conn).await.unwrap();
+    sqlx::query("ALTER TABLE users DROP COLUMN auth_gen").execute(&mut conn).await.unwrap();
     sqlx::query("DELETE FROM schema_version WHERE version >= 8").execute(&mut conn).await.unwrap();
 }
 

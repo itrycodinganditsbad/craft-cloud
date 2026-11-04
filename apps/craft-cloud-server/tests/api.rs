@@ -1481,6 +1481,7 @@ on_sqlite_and_postgres!(
     every_admin_route_needs_an_admin,
     every_admin_change_needs_the_admins_password,
     wrong_confirmation_passwords_are_limited,
+    refused_tries_do_not_eat_the_refund_of_a_right_password,
     a_demoted_admin_loses_the_admin_routes_at_once,
     the_last_admin_stays_and_nobody_disables_themselves,
     a_disabled_account_is_shut_out_everywhere,
@@ -2137,6 +2138,29 @@ async fn wrong_confirmation_passwords_are_limited(s: &Server) {
     add_admin(s, "root2").await;
     let root2 = login(s, "root2").await;
     assert_eq!(admin_call(s, &root2, M::POST, &path, json!({})).await.status(), StatusCode::NO_CONTENT);
+}
+
+/// Tries refused while the account is at its limit are not counted, so the refund of a try that was counted (and
+/// passed) at the same moment gives back exactly its own place: four wrong passwords and a burst of right ones leave
+/// room for exactly one more wrong one.
+async fn refused_tries_do_not_eat_the_refund_of_a_right_password(s: &Server) {
+    use reqwest::Method as M;
+    add_admin(s, "root").await;
+    add_user(s, "ana").await;
+    let root = login(s, "root").await;
+    let path = format!("/admin/users/{}/enable", id_of(s, "ana").await);
+    let wrong = || call(s, Some(&root), M::POST, &path, Some(json!({ "password": "wrong password!" })));
+    for _ in 0..4 {
+        assert_eq!(refusal(wrong().await).await, (StatusCode::FORBIDDEN, "wrong_password".to_owned()));
+    }
+    // Eight right passwords at the same moment: one finds the one place left, the others are refused or follow
+    // after it was given back; none leaves a mark.
+    let burst = futures_util::future::join_all((0..8).map(|_| admin_call(s, &root, M::POST, &path, json!({})))).await;
+    assert!(burst.iter().all(|r| matches!(r.status(), StatusCode::NO_CONTENT | StatusCode::TOO_MANY_REQUESTS)));
+    assert!(burst.iter().any(|r| r.status() == StatusCode::NO_CONTENT));
+    // Four wrong ones are on record, so one more is answered, and the one after it is held off.
+    assert_eq!(refusal(wrong().await).await, (StatusCode::FORBIDDEN, "wrong_password".to_owned()));
+    assert_eq!(refusal(wrong().await).await.0, StatusCode::TOO_MANY_REQUESTS);
 }
 
 async fn a_demoted_admin_loses_the_admin_routes_at_once(s: &Server) {

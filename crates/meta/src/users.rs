@@ -48,6 +48,9 @@ pub struct UserRecord {
     pub password_hash: String,
     pub role: Role,
     pub space: SpaceId,
+    /// Counts the changes that end what a sign-in checked before them (a disable, an enable, a removal, a password
+    /// change or reset). Read together with the password hash, and handed back to [`Meta::sign_in_device`].
+    pub auth_gen: i64,
 }
 
 impl std::fmt::Debug for UserRecord {
@@ -58,6 +61,7 @@ impl std::fmt::Debug for UserRecord {
             .field("password_hash", &"<redacted>")
             .field("role", &self.role)
             .field("space", &self.space)
+            .field("auth_gen", &self.auth_gen)
             .finish()
     }
 }
@@ -239,7 +243,7 @@ impl Meta {
     pub async fn user_by_name(&self, username: &str) -> Result<Option<UserRecord>, MetaError> {
         let username = username.to_ascii_lowercase();
         let row = sqlx::query(
-            "SELECT u.id, u.username, u.password_hash, u.role, s.id AS space FROM users u JOIN spaces s ON s.owner = u.id WHERE u.username = $1",
+            "SELECT u.id, u.username, u.password_hash, u.role, u.auth_gen, s.id AS space FROM users u JOIN spaces s ON s.owner = u.id WHERE u.username = $1",
         )
         .bind(username.as_str())
         .fetch_optional(&self.pool)
@@ -251,6 +255,7 @@ impl Meta {
             password_hash: row.try_get("password_hash")?,
             role: Role::parse(&row.try_get::<String, _>("role")?)?,
             space: SpaceId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("space")?)?),
+            auth_gen: row.try_get("auth_gen")?,
         }))
     }
 
@@ -286,15 +291,16 @@ impl Meta {
     }
 
     /// Registers a device for `user` after a password sign-in, if the password it was checked against is still the
-    /// account's: `hash` is the stored hash the caller verified. The account is locked first and the hash compared
-    /// again in the same transaction, so a password change or reset that committed while the (slow) check ran is
-    /// not followed by a device that check let in. `None`: the user is gone or the password changed meanwhile; the
-    /// caller answers as for a wrong password. An account that is disabled or marked for removal is
+    /// account's: `checked` is the stored hash and the generation ([`UserRecord::password_hash`], [`UserRecord::auth_gen`]) the caller read
+    /// before it verified the password. The account is locked first and both compared again in the same transaction, so a
+    /// password change or reset, or a disable followed by an enable (which leaves the hash as it was), that committed
+    /// while the (slow) check ran is not followed by a device that check let in. `None`: the user is gone or
+    /// something changed meanwhile; the caller answers as for a wrong password. An account that is disabled or marked for removal is
     /// [`MetaError::AccountDisabled`], which the caller may only say after the password was right.
     pub async fn sign_in_device(
         &self,
         user: UserId,
-        hash: &str,
+        checked: (&str, i64),
         name: &str,
         client: &DeviceClient,
         token_hash: &[u8; 32],
@@ -302,14 +308,16 @@ impl Meta {
     ) -> Result<Option<DeviceId>, MetaError> {
         check_device_name(name)?;
         client.check()?;
+        let (hash, auth_gen) = checked;
         let device = DeviceId::generate();
         let mut w = self.begin_write().await?;
         if !lock_user(&mut w.tx, user).await? {
             return Ok(None);
         }
-        let same = sqlx::query("SELECT 1 FROM users WHERE id = $1 AND password_hash = $2")
+        let same = sqlx::query("SELECT 1 FROM users WHERE id = $1 AND password_hash = $2 AND auth_gen = $3")
             .bind(uuid_bytes(&user.0))
             .bind(hash)
+            .bind(auth_gen)
             .fetch_optional(&mut *w.tx)
             .await?;
         if same.is_none() {
@@ -496,13 +504,15 @@ impl Meta {
         if kept.rows_affected() == 0 || account_blocked(&mut w.tx, user).await? {
             return Err(MetaError::DeviceRevoked);
         }
-        let done = sqlx::query("UPDATE users SET password_hash = $1, password_changed_ms = $2 WHERE id = $3 AND password_hash = $4")
-            .bind(new_hash)
-            .bind(now_ms)
-            .bind(uuid_bytes(&user.0))
-            .bind(current_hash)
-            .execute(&mut *w.tx)
-            .await?;
+        let done = sqlx::query(
+            "UPDATE users SET password_hash = $1, password_changed_ms = $2, auth_gen = auth_gen + 1 WHERE id = $3 AND password_hash = $4",
+        )
+        .bind(new_hash)
+        .bind(now_ms)
+        .bind(uuid_bytes(&user.0))
+        .bind(current_hash)
+        .execute(&mut *w.tx)
+        .await?;
         if done.rows_affected() == 0 {
             return Err(MetaError::Conflict("the password changed while this request was running; try again"));
         }
@@ -518,7 +528,7 @@ impl Meta {
     pub async fn reset_password(&self, user: UserId, new_hash: &str, keep_devices: bool, now_ms: i64) -> Result<Vec<DeviceId>, MetaError> {
         let mut w = self.begin_write().await?;
         lock_user(&mut w.tx, user).await?;
-        let done = sqlx::query("UPDATE users SET password_hash = $1, password_changed_ms = $2 WHERE id = $3")
+        let done = sqlx::query("UPDATE users SET password_hash = $1, password_changed_ms = $2, auth_gen = auth_gen + 1 WHERE id = $3")
             .bind(new_hash)
             .bind(now_ms)
             .bind(uuid_bytes(&user.0))
@@ -659,7 +669,7 @@ pub(crate) async fn insert_user(
     .bind(uuid_bytes(root.as_uuid()))
     .execute(&mut **tx)
     .await?;
-    Ok(UserRecord { id: user, username: username.to_owned(), password_hash: password_hash.to_owned(), role, space })
+    Ok(UserRecord { id: user, username: username.to_owned(), password_hash: password_hash.to_owned(), role, space, auth_gen: 0 })
 }
 
 /// Inserts a device (its name already checked) in `tx`.
