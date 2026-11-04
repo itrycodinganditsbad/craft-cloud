@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use craft_cloud_app::{DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingState, PairingStatus, RunState, Status, Uuid, codes};
-use craft_cloud_app::{HistoryResponse, RestoreResponse, VersionId};
+use craft_cloud_app::{HistoryResponse, NodeId, RestoreResponse, TrashResponse, TrashRestoreResponse, VersionId};
 use craft_cloud_proto::api::codes as api_codes;
 use craft_cloud_proto::join::JoinString;
 
@@ -53,6 +53,8 @@ pub enum Screen {
     SignedIn(Overview),
     /// File version history for a path inside the sync root.
     Versions(Versions),
+    /// Deleted files and folders awaiting retention expiry.
+    Trash(Trash),
     /// Showing an add-a-computer code.
     AddingComputer(Adding),
     /// The server refused this computer: it was removed from the account.
@@ -161,6 +163,24 @@ pub struct Versions {
     pub ticket: u64,
 }
 
+/// Trash list and action state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trash {
+    pub page: Option<TrashResponse>,
+    pub loading: bool,
+    pub action: Option<TrashAction>,
+    pub error: Option<String>,
+    pub notice: Option<String>,
+    pub confirm: Option<NodeId>,
+    pub ticket: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrashAction {
+    Restore { path: Option<String>, parent_path: Option<String> },
+    Remove,
+}
+
 impl Overview {
     fn new(status: Status) -> Self {
         Self { status, devices: None, devices_error: None, removing: None, error: None, offer_local_sign_out: false }
@@ -226,6 +246,18 @@ pub enum Event {
         ticket: u64,
         result: Result<RestoreResponse, Error>,
     },
+    TrashPage {
+        ticket: u64,
+        result: Result<TrashResponse, Error>,
+    },
+    TrashRestored {
+        ticket: u64,
+        result: Result<TrashRestoreResponse, Error>,
+    },
+    TrashRemoved {
+        ticket: u64,
+        result: Result<(), Error>,
+    },
     SignedOut(Result<Status, Error>),
     /// [`Effect::Pause`]'s or [`Effect::Resume`]'s answer.
     Answered(Result<Status, Error>),
@@ -242,6 +274,7 @@ pub enum Event {
     CancelPassword,
     OpenFolder,
     OpenVersions,
+    OpenTrash,
     VersionsPath(String),
     LoadVersions,
     NextVersions,
@@ -249,6 +282,13 @@ pub enum Event {
     ConfirmRestore(VersionId),
     CancelRestore,
     RestoreVersion,
+    LoadTrash,
+    NextTrash,
+    BackTrash,
+    RestoreTrash(NodeId),
+    ConfirmRemoveTrash(NodeId),
+    CancelRemoveTrash,
+    RemoveTrash,
     AddComputer,
     /// Done or Cancel on the add-a-computer view.
     CloseAdding,
@@ -304,6 +344,18 @@ pub enum Effect {
         path: String,
         version: VersionId,
         expected_version: VersionId,
+        ticket: u64,
+    },
+    Trash {
+        cursor: Option<String>,
+        ticket: u64,
+    },
+    RestoreTrash {
+        id: NodeId,
+        ticket: u64,
+    },
+    RemoveTrash {
+        id: NodeId,
         ticket: u64,
     },
     RemoveDevice(DeviceId),
@@ -364,6 +416,7 @@ pub struct Model {
     /// The app's start-at-login entry as last asked for.
     app_autostart: Option<bool>,
     versions_ticket: u64,
+    trash_ticket: u64,
 }
 
 impl Model {
@@ -385,6 +438,7 @@ impl Model {
             failed_polls: 0,
             app_autostart: None,
             versions_ticket: 0,
+            trash_ticket: 0,
         }
     }
 
@@ -524,6 +578,79 @@ impl Model {
                     }
                 }
             }
+            Event::TrashPage { ticket, result } => {
+                let Screen::Trash(trash) = &mut self.screen else { return Vec::new() };
+                if trash.ticket != ticket {
+                    return Vec::new();
+                }
+                trash.loading = false;
+                match result {
+                    Ok(page) => {
+                        trash.page = Some(page);
+                        trash.error = None;
+                    }
+                    Err(e) => trash.error = Some(message(&e)),
+                }
+                Vec::new()
+            }
+            Event::TrashRestored { ticket, result } => {
+                let Screen::Trash(trash) = &mut self.screen else { return Vec::new() };
+                if trash.ticket != ticket {
+                    return Vec::new();
+                }
+                let prior = trash.action.take();
+                match result {
+                    Ok(response) => {
+                        let (path, parent_path) = prior
+                            .and_then(|action| match action {
+                                TrashAction::Restore { path, parent_path, .. } => Some((path, parent_path)),
+                                _ => None,
+                            })
+                            .unwrap_or((None, None));
+                        trash.notice = Some(if response.renamed {
+                            match parent_path {
+                                Some(parent) => format!("Restored as {} in {}.", response.name, parent),
+                                None => format!("Restored as {}. The destination path is unavailable.", response.name),
+                            }
+                        } else {
+                            match path {
+                                Some(path) => format!("Restored to {}.", path),
+                                None => format!("Restored {}. The destination path is unavailable.", response.name),
+                            }
+                        });
+                        self.request_trash(None)
+                    }
+                    Err(Error::Refused { code, name_taken, .. }) if code == api_codes::CONFLICT => {
+                        trash.error = Some(if name_taken == Some(true) {
+                            "This item couldn't be restored because another item already has that name.".into()
+                        } else {
+                            "This item couldn't be restored because it conflicts with the current folder contents.".into()
+                        });
+                        Vec::new()
+                    }
+                    Err(e) => {
+                        trash.error = Some(message(&e));
+                        Vec::new()
+                    }
+                }
+            }
+            Event::TrashRemoved { ticket, result } => {
+                let Screen::Trash(trash) = &mut self.screen else { return Vec::new() };
+                if trash.ticket != ticket {
+                    return Vec::new();
+                }
+                trash.action = None;
+                match result {
+                    Ok(()) => {
+                        trash.notice = Some("Removed from trash. It can no longer be restored from the trash.".into());
+                        self.request_trash(None)
+                    }
+                    Err(e) => {
+                        trash.error = Some(message(&e));
+                        Vec::new()
+                    }
+                }
+            }
             Event::SignedOut(result) => self.signed_out(result),
             Event::Answered(result) => {
                 self.busy = self.busy.filter(|b| *b != Busy::Pausing);
@@ -577,6 +704,64 @@ impl Model {
                     ticket: 0,
                 });
                 Vec::new()
+            }
+            Event::OpenTrash => {
+                if !matches!(self.screen, Screen::SignedIn(_)) {
+                    return Vec::new();
+                }
+                self.screen = Screen::Trash(Trash { page: None, loading: false, action: None, error: None, notice: None, confirm: None, ticket: 0 });
+                self.request_trash(None)
+            }
+            Event::LoadTrash => self.request_trash(None),
+            Event::NextTrash => {
+                let cursor = match &self.screen {
+                    Screen::Trash(t) if t.action.is_none() && !t.loading => t.page.as_ref().and_then(|p| p.next.clone()),
+                    _ => None,
+                };
+                cursor.map(|cursor| self.request_trash(Some(cursor))).unwrap_or_default()
+            }
+            Event::BackTrash => {
+                if matches!(self.screen, Screen::Trash(_)) {
+                    self.screen =
+                        self.status.clone().filter(|s| s.signed_in).map(|s| Screen::SignedIn(Overview::new(s))).unwrap_or_else(|| Screen::Starting);
+                    self.trash_ticket = self.trash_ticket.saturating_add(1);
+                    return self.overview().map(|_| Effect::Devices).into_iter().collect();
+                }
+                Vec::new()
+            }
+            Event::RestoreTrash(id) => {
+                let Screen::Trash(t) = &mut self.screen else { return Vec::new() };
+                if t.loading || t.action.is_some() {
+                    return Vec::new();
+                }
+                let Some(item) = t.page.as_ref().and_then(|p| p.items.iter().find(|item| item.id == id)) else { return Vec::new() };
+                let path = item.path.clone();
+                let parent_path = path.as_deref().and_then(|p| p.rsplit_once('/').map(|(parent, _)| parent.to_owned()));
+                self.begin_trash_action(id, TrashAction::Restore { path, parent_path })
+            }
+            Event::ConfirmRemoveTrash(id) => {
+                if let Screen::Trash(t) = &mut self.screen
+                    && !t.loading
+                    && t.action.is_none()
+                    && t.page.as_ref().is_some_and(|p| p.items.iter().any(|i| i.id == id))
+                {
+                    t.confirm = Some(id);
+                }
+                Vec::new()
+            }
+            Event::CancelRemoveTrash => {
+                if let Screen::Trash(t) = &mut self.screen {
+                    t.confirm = None;
+                }
+                Vec::new()
+            }
+            Event::RemoveTrash => {
+                let Screen::Trash(t) = &mut self.screen else { return Vec::new() };
+                if t.loading || t.action.is_some() {
+                    return Vec::new();
+                }
+                let Some(id) = t.confirm.take() else { return Vec::new() };
+                self.begin_trash_action(id, TrashAction::Remove)
             }
             Event::VersionsPath(path) => {
                 if let Screen::Versions(v) = &mut self.screen {
@@ -775,7 +960,7 @@ impl Model {
                 Screen::AddingComputer(adding) => adding.overview.status = status,
                 // The join's own answer moves on from there.
                 Screen::Joining { .. } => {}
-                Screen::Versions(_) => {}
+                Screen::Versions(_) | Screen::Trash(_) => {}
                 _ => {
                     self.screen = Screen::SignedIn(Overview::new(status));
                     effects.push(Effect::Devices);
@@ -880,7 +1065,7 @@ impl Model {
             Err(e) => e,
         };
         let (code, text) = match &e {
-            Error::Refused { code, message } => (code.as_str(), message.clone()),
+            Error::Refused { code, message, .. } => (code.as_str(), message.clone()),
             Error::NotRunning(_) => {
                 self.status = None;
                 self.screen = Screen::NotRunning(self.not_running(STOPPED, &e.to_string()));
@@ -977,6 +1162,34 @@ impl Model {
         versions.loading = true;
         versions.error = None;
         vec![Effect::History { path: path.to_owned(), cursor, ticket: versions.ticket }]
+    }
+
+    fn request_trash(&mut self, cursor: Option<String>) -> Vec<Effect> {
+        let Screen::Trash(trash) = &mut self.screen else { return Vec::new() };
+        if trash.loading || trash.action.is_some() {
+            return Vec::new();
+        }
+        self.trash_ticket = self.trash_ticket.saturating_add(1);
+        trash.ticket = self.trash_ticket;
+        trash.loading = true;
+        trash.error = None;
+        vec![Effect::Trash { cursor, ticket: trash.ticket }]
+    }
+
+    fn begin_trash_action(&mut self, id: NodeId, action: TrashAction) -> Vec<Effect> {
+        let Screen::Trash(trash) = &mut self.screen else { return Vec::new() };
+        if trash.loading || trash.action.is_some() {
+            return Vec::new();
+        }
+        self.trash_ticket = self.trash_ticket.saturating_add(1);
+        trash.ticket = self.trash_ticket;
+        trash.error = None;
+        trash.action = Some(action);
+        match &trash.action {
+            Some(TrashAction::Restore { .. }) => vec![Effect::RestoreTrash { id, ticket: trash.ticket }],
+            Some(TrashAction::Remove) => vec![Effect::RemoveTrash { id, ticket: trash.ticket }],
+            None => Vec::new(),
+        }
     }
 
     fn restore_version(&mut self) -> Vec<Effect> {
@@ -1081,6 +1294,22 @@ pub(crate) mod tests {
         }
     }
 
+    fn trash_page() -> TrashResponse {
+        TrashResponse {
+            items: vec![craft_cloud_app::TrashItem {
+                id: NodeId::generate(),
+                parent: NodeId::generate(),
+                name: "painting.png".into(),
+                is_dir: false,
+                size: Some(42_000),
+                deleted_ms: 1_790_000_000_000,
+                purge_after_ms: 1_792_000_000_000,
+                path: Some("Projects/painting.png".into()),
+            }],
+            next: Some("trash-cursor".into()),
+        }
+    }
+
     pub(crate) fn status(signed_in: bool) -> Status {
         Status {
             api: 1,
@@ -1146,12 +1375,137 @@ pub(crate) mod tests {
             .is_empty()
         );
         assert!(
-            m.update(Event::Restored { ticket: 4, result: Err(Error::Refused { code: api_codes::CONFLICT.into(), message: "conflict".into() }) })
-                .iter()
-                .any(|e| matches!(e, Effect::History { cursor: None, .. }))
+            m.update(Event::Restored {
+                ticket: 4,
+                result: Err(Error::Refused { code: api_codes::CONFLICT.into(), message: "conflict".into(), name_taken: None })
+            })
+            .iter()
+            .any(|e| matches!(e, Effect::History { cursor: None, .. }))
         );
         let Screen::Versions(v) = &m.screen else { panic!("expected versions screen") };
         assert_eq!(v.notice.as_deref(), Some("The file changed meanwhile. Version list reloaded."));
+    }
+
+    #[test]
+    fn trash_pages_restore_remove_confirmation_and_stale_tickets() {
+        let mut m = model();
+        m.screen = Screen::SignedIn(Overview::new(status(true)));
+        assert_eq!(m.update(Event::OpenTrash), vec![Effect::Trash { cursor: None, ticket: 1 }]);
+        let page = trash_page();
+        let id = page.items[0].id;
+        assert!(m.update(Event::TrashPage { ticket: 0, result: Ok(page.clone()) }).is_empty());
+        assert!(matches!(&m.screen, Screen::Trash(t) if t.loading && t.page.is_none()));
+        m.update(Event::TrashPage { ticket: 1, result: Ok(page.clone()) });
+        assert_eq!(m.update(Event::NextTrash), vec![Effect::Trash { cursor: Some("trash-cursor".into()), ticket: 2 }]);
+        assert!(m.update(Event::RestoreTrash(id)).is_empty()); // page load excludes actions
+        assert!(m.update(Event::ConfirmRemoveTrash(id)).is_empty());
+        assert!(m.update(Event::RemoveTrash).is_empty());
+        m.update(Event::TrashPage { ticket: 2, result: Ok(page.clone()) });
+        assert_eq!(m.update(Event::RestoreTrash(id)), vec![Effect::RestoreTrash { id, ticket: 3 }]);
+        assert!(m.update(Event::LoadTrash).is_empty()); // action excludes page loads
+        assert!(m.update(Event::TrashRestored { ticket: 2, result: Err(Error::Io("stale".into())) }).is_empty());
+        assert!(matches!(&m.screen, Screen::Trash(t) if t.action.is_some() && !t.loading));
+        let restored = TrashRestoreResponse {
+            node: id,
+            parent: page.items[0].parent,
+            name: "painting (1).png".into(),
+            renamed: true,
+            version: None,
+            seq: 2,
+            epoch: craft_cloud_proto::Epoch::generate(),
+        };
+        assert_eq!(m.update(Event::TrashRestored { ticket: 3, result: Ok(restored) }), vec![Effect::Trash { cursor: None, ticket: 4 }]);
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert_eq!(t.notice.as_deref(), Some("Restored as painting (1).png in Projects."));
+        m.update(Event::TrashPage { ticket: 4, result: Ok(page.clone()) });
+        assert!(m.update(Event::ConfirmRemoveTrash(id)).is_empty());
+        assert!(matches!(&m.screen, Screen::Trash(t) if t.confirm == Some(id)));
+        assert_eq!(m.update(Event::RemoveTrash), vec![Effect::RemoveTrash { id, ticket: 5 }]);
+        assert!(m.update(Event::LoadTrash).is_empty()); // removal excludes page loads too
+        assert!(m.update(Event::TrashRemoved { ticket: 4, result: Ok(()) }).is_empty());
+        assert_eq!(m.update(Event::TrashRemoved { ticket: 5, result: Ok(()) }), vec![Effect::Trash { cursor: None, ticket: 6 }]);
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert_eq!(t.notice.as_deref(), Some("Removed from trash. It can no longer be restored from the trash."));
+    }
+
+    #[test]
+    fn trash_restore_name_taken_is_clear_and_returns_to_idle_without_reload() {
+        let mut m = model();
+        let page = trash_page();
+        let id = page.items[0].id;
+        m.screen = Screen::Trash(Trash { page: Some(page), loading: false, action: None, error: None, notice: None, confirm: None, ticket: 0 });
+        assert!(m.update(Event::RemoveTrash).is_empty());
+        assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
+        let ticket = match &m.screen {
+            Screen::Trash(t) => t.ticket,
+            _ => 0,
+        };
+        assert!(
+            m.update(Event::TrashRestored {
+                ticket,
+                result: Err(Error::Refused { code: api_codes::CONFLICT.into(), message: "conflict".into(), name_taken: Some(true) })
+            })
+            .is_empty()
+        );
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert!(t.error.as_deref().unwrap_or_default().contains("another item already has that name"));
+        assert!(!t.loading);
+        assert!(t.action.is_none());
+    }
+
+    #[test]
+    fn trash_restore_without_path_does_not_invent_a_destination() {
+        let mut m = model();
+        let mut page = trash_page();
+        page.items[0].path = None;
+        let id = page.items[0].id;
+        m.screen = Screen::Trash(Trash { page: Some(page), loading: false, action: None, error: None, notice: None, confirm: None, ticket: 0 });
+        assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
+        let ticket = match &m.screen {
+            Screen::Trash(t) => t.ticket,
+            _ => 0,
+        };
+        assert_eq!(
+            m.update(Event::TrashRestored {
+                ticket,
+                result: Ok(TrashRestoreResponse {
+                    node: id,
+                    parent: NodeId::generate(),
+                    name: "painting.png".into(),
+                    renamed: false,
+                    version: None,
+                    seq: 1,
+                    epoch: craft_cloud_proto::Epoch::generate(),
+                })
+            }),
+            vec![Effect::Trash { cursor: None, ticket: ticket + 1 }]
+        );
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert_eq!(t.notice.as_deref(), Some("Restored painting.png. The destination path is unavailable."));
+    }
+
+    #[test]
+    fn other_trash_conflicts_are_generic_and_do_not_reload() {
+        let mut m = model();
+        let page = trash_page();
+        let id = page.items[0].id;
+        m.screen = Screen::Trash(Trash { page: Some(page), loading: false, action: None, error: None, notice: None, confirm: None, ticket: 0 });
+        assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
+        let ticket = match &m.screen {
+            Screen::Trash(t) => t.ticket,
+            _ => 0,
+        };
+        assert!(
+            m.update(Event::TrashRestored {
+                ticket,
+                result: Err(Error::Refused { code: api_codes::CONFLICT.into(), message: "conflict".into(), name_taken: Some(false) })
+            })
+            .is_empty()
+        );
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert!(t.error.as_deref().unwrap_or_default().contains("conflicts with the current folder contents"));
+        assert!(!t.loading);
+        assert!(t.action.is_none());
     }
 
     #[test]
@@ -1204,7 +1558,10 @@ pub(crate) mod tests {
             Some(Effect::Restore { ticket, .. }) => *ticket,
             other => panic!("{other:?}"),
         };
-        m.update(Event::Restored { ticket, result: Err(Error::Refused { code: api_codes::INVALID.into(), message: "invalid".into() }) });
+        m.update(Event::Restored {
+            ticket,
+            result: Err(Error::Refused { code: api_codes::INVALID.into(), message: "invalid".into(), name_taken: None }),
+        });
         let Screen::Versions(v) = &m.screen else { panic!("expected versions screen") };
         assert!(v.error.as_deref().unwrap_or_default().contains("live document or deleted"));
     }
@@ -1334,7 +1691,7 @@ pub(crate) mod tests {
     }
 
     fn refused(code: &str, message: &str) -> Error {
-        Error::Refused { code: code.into(), message: message.into() }
+        Error::Refused { code: code.into(), message: message.into(), name_taken: None }
     }
 
     /// A model past the start, on the join form.

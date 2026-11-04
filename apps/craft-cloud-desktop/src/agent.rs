@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use craft_cloud_app::{
-    Client, DeviceId, DeviceInfo, Error, HistoryResponse, JoinRequest, PairingInfo, PairingStatus, RestoreResponse, Status, Uuid, VersionId,
+    Client, DeviceId, DeviceInfo, Error, HistoryResponse, JoinRequest, NodeId, PairingInfo, PairingStatus, RestoreResponse, Status, TrashResponse,
+    TrashRestoreResponse, Uuid, VersionId,
 };
 
 use crate::model::{Effect, Event};
@@ -37,6 +38,9 @@ pub trait Agent: Send + Sync {
     fn set_autostart(&self, on: bool) -> Result<Status, Error>;
     fn file_history(&self, path: &str, cursor: Option<&str>) -> Result<HistoryResponse, Error>;
     fn restore_file(&self, path: &str, version: VersionId, expected_version: VersionId) -> Result<RestoreResponse, Error>;
+    fn trash(&self, cursor: Option<&str>) -> Result<TrashResponse, Error>;
+    fn restore_from_trash(&self, id: NodeId) -> Result<TrashRestoreResponse, Error>;
+    fn remove_from_trash(&self, id: NodeId) -> Result<(), Error>;
 }
 
 /// The agent through `craft_cloud_app::Client`. It finds the agent again whenever a call finds it gone (the agent
@@ -123,6 +127,15 @@ impl Agent for ClientAgent {
     fn restore_file(&self, path: &str, version: VersionId, expected_version: VersionId) -> Result<RestoreResponse, Error> {
         self.with(|c| c.restore_file(path, version, expected_version))
     }
+    fn trash(&self, cursor: Option<&str>) -> Result<TrashResponse, Error> {
+        self.with(|c| c.trash(cursor, Some(50)))
+    }
+    fn restore_from_trash(&self, id: NodeId) -> Result<TrashRestoreResponse, Error> {
+        self.with(|c| c.restore_from_trash(id))
+    }
+    fn remove_from_trash(&self, id: NodeId) -> Result<(), Error> {
+        self.with(|c| c.remove_from_trash(id))
+    }
 }
 
 /// Starts the agent and waits for it ([`crate::start_agent::start_and_wait`]), for [`Effect::StartAgent`].
@@ -172,6 +185,7 @@ impl Link {
         if !is_call(&effect) {
             return Some(effect);
         }
+        let failed_effect = effect.clone();
         let (agent, start, wake, tx) = (self.agent.clone(), self.start.clone(), self.wake.clone(), self.tx.clone());
         let spawned = std::thread::Builder::new().name("craft-cloud-call".into()).spawn(move || {
             if let Some(event) = call(agent.as_ref(), &start, effect) {
@@ -180,8 +194,15 @@ impl Link {
             }
         });
         if let Err(e) = spawned {
-            // No thread to run it on: said as the call's failure.
-            let _ = self.tx.send(Event::Polled(Err(Error::Io(format!("can't start a thread: {e}")))));
+            let error = Error::Io(format!("can't start a thread: {e}"));
+            let event = match failed_effect {
+                Effect::Trash { ticket, .. } => Event::TrashPage { ticket, result: Err(error) },
+                Effect::RestoreTrash { ticket, .. } => Event::TrashRestored { ticket, result: Err(error) },
+                Effect::RemoveTrash { ticket, .. } => Event::TrashRemoved { ticket, result: Err(error) },
+                _ => Event::Polled(Err(error)),
+            };
+            let _ = self.tx.send(event);
+            (self.wake)();
         }
         None
     }
@@ -213,6 +234,9 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         Effect::Restore { path, version, expected_version, ticket } => {
             Event::Restored { ticket, result: agent.restore_file(&path, version, expected_version) }
         }
+        Effect::Trash { cursor, ticket } => Event::TrashPage { ticket, result: agent.trash(cursor.as_deref()) },
+        Effect::RestoreTrash { id, ticket } => Event::TrashRestored { ticket, result: agent.restore_from_trash(id) },
+        Effect::RemoveTrash { id, ticket } => Event::TrashRemoved { ticket, result: agent.remove_from_trash(id) },
         Effect::Logout { local } => Event::SignedOut(agent.logout(local)),
         Effect::Pause => Event::Answered(agent.pause()),
         Effect::Resume => Event::Answered(agent.resume()),
@@ -305,7 +329,16 @@ pub(crate) mod fake {
             self.answer("file_history", |_| HistoryResponse { versions: Vec::new(), next: None })
         }
         fn restore_file(&self, _path: &str, _version: VersionId, _expected_version: VersionId) -> Result<RestoreResponse, Error> {
-            Err(Error::Refused { code: "invalid".into(), message: "not configured".into() })
+            Err(Error::Refused { code: "invalid".into(), message: "not configured".into(), name_taken: None })
+        }
+        fn trash(&self, _cursor: Option<&str>) -> Result<TrashResponse, Error> {
+            self.answer("trash", |_| TrashResponse { items: Vec::new(), next: None })
+        }
+        fn restore_from_trash(&self, _id: NodeId) -> Result<TrashRestoreResponse, Error> {
+            Err(Error::Refused { code: "invalid".into(), message: "not configured".into(), name_taken: None })
+        }
+        fn remove_from_trash(&self, _id: NodeId) -> Result<(), Error> {
+            self.answer("remove_from_trash", |_| ())
         }
     }
 }
