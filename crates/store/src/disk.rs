@@ -73,6 +73,10 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> io::Result<T> + Send + 
 
 #[async_trait]
 impl Backend for DiskBackend {
+    fn kind(&self) -> &'static str {
+        "disk"
+    }
+
     async fn put_raw(&self, path: &str, data: Bytes) -> Result<(), StoreError> {
         let target = self.full_path(path);
         blocking(move || write_atomic(&target, &data)).await
