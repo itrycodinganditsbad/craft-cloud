@@ -1514,6 +1514,7 @@ on_sqlite_and_postgres!(
     turning_two_factor_on_ends_live_connections_and_long_polls,
     an_admin_with_two_factor_confirms_changes_with_a_code,
     an_admin_resets_the_two_factor_of_an_account,
+    two_factor_sign_in_and_join_are_audited,
 );
 
 async fn devices_of(s: &Server, token: &str) -> Vec<DeviceInfo> {
@@ -3441,4 +3442,71 @@ async fn the_two_factor_routes_count_wrong_passwords_and_wait_for_a_check_slot()
     )
     .await;
     assert_eq!((status, answer.error.as_str()), (StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+}
+
+/// What sign-in with a second factor and a join write to the audit log, over HTTP: a login for every device made (a challenge is
+/// none), the wrong second steps in one row per account and minute, a challenge that is not good in one row of its own with no
+/// account, a recovery code's use, and never a code, a challenge or a name.
+async fn two_factor_sign_in_and_join_are_audited(s: &Server) {
+    use craft_cloud_meta::AuditQuery;
+    let events = |s: &Server| {
+        let meta = s.meta.clone();
+        async move { meta.audit_list(&AuditQuery { limit: 1000, ..AuditQuery::default() }).await.unwrap() }
+    };
+    let named = |all: &[craft_cloud_meta::AuditEvent], action: &str| all.iter().filter(|e| e.action.as_str() == action).count();
+    let ana = turn_on_two_factor(s, "ana", false).await;
+    let id = s.meta.user_by_name("ana").await.unwrap().unwrap().id;
+    let all = events(s).await;
+    assert_eq!(named(&all, "account.two_factor_enabled"), 1);
+    let logins = named(&all, "auth.login");
+
+    // A challenge is not a login; a wrong code is a failure row of the account, with how far it got.
+    let challenge = login_challenge(s, "ana").await;
+    assert_eq!(named(&events(s).await, "auth.login"), logins, "the challenge is no login");
+    let right = ana.fresh_code(s);
+    let (status, body) = error(second_step(s, &challenge.challenge, json!({ "totp_code": wrong_code(&right) })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "two_factor_invalid"));
+    let all = events(s).await;
+    let failed: Vec<_> = all.iter().filter(|e| e.action.as_str() == "auth.second_factor_failed").collect();
+    assert_eq!(failed.len(), 1);
+    assert_eq!((failed[0].target_id, failed[0].actor_user, failed[0].count), (Some(id.0), None, 1));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&failed[0].details).unwrap(), json!({ "step": "totp" }));
+    // A challenge that is no token, and one that is not there: one more row, of no account, and the same answer.
+    for bad in ["short".to_owned(), "A".repeat(43)] {
+        let (status, body) = error(second_step(s, &bad, json!({ "totp_code": right })).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let all = events(s).await;
+    let gone: Vec<_> = all.iter().filter(|e| e.action.as_str() == "auth.second_factor_failed" && e.target_id.is_none()).collect();
+    assert_eq!((gone.len(), gone[0].count), (1, 2));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&gone[0].details).unwrap(), json!({ "step": "challenge_expired" }));
+
+    // The right code: a login of the new device.
+    let res = second_step(s, &challenge.challenge, json!({ "totp_code": right })).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let all = events(s).await;
+    assert_eq!(named(&all, "auth.login"), logins + 1);
+    let login = all.iter().find(|e| e.action.as_str() == "auth.login" && e.actor_user == Some(id) && e.at_ms == s.at()).unwrap();
+    assert!(login.actor_device.is_some());
+
+    // A recovery code at sign-in, and at a join: the use of the code with each.
+    let challenge = login_challenge(s, "ana").await;
+    let res = second_step(s, &challenge.challenge, json!({ "recovery_code": ana.recovery[0] })).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let all = events(s).await;
+    assert_eq!((named(&all, "auth.login"), named(&all, "auth.recovery_code_used")), (logins + 2, 1));
+    let invite = Code::generate(INVITE_CHARS).unwrap();
+    s.meta.create_invite("ana", &invite.hash(), s.at(), INVITE_TTL_MS).await.unwrap();
+    let body = json!({ "code": invite.as_str(), "device_name": "new pc", "recovery_code": ana.recovery[1] });
+    let device = joined(call(s, None, reqwest::Method::POST, "/join", Some(body)).await).await;
+    assert!(accepted(s, &device.token).await);
+    let all = events(s).await;
+    assert_eq!((named(&all, "join.invite_redeemed"), named(&all, "auth.recovery_code_used")), (1, 2));
+
+    // Nothing secret is in any row: no code, recovery code, challenge, token or name.
+    let everything = serde_json::to_string(&all.iter().map(|e| (&e.details, e.action.as_str())).collect::<Vec<_>>()).unwrap();
+    let secrets: [&str; 6] = [&challenge.challenge, &ana.recovery[0], &ana.recovery[1], &ana.token, &device.token, "ana"];
+    for secret in secrets {
+        assert!(!everything.contains(secret), "{secret}");
+    }
 }

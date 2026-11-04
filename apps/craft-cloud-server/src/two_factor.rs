@@ -285,8 +285,14 @@ pub async fn second_factor(
         return Err(ApiError::rate_limited("too many wrong codes from this address; wait a few minutes", None));
     };
     let gone = || ApiError::from(MetaError::ChallengeGone);
-    let Some(hash) = challenge_hash(&req.challenge) else { return Err(gone()) };
-    let Some((user, username)) = state.meta.challenge_owner(&hash, now_ms).await? else { return Err(gone()) };
+    let Some(hash) = challenge_hash(&req.challenge) else {
+        crate::audit::challenge_failed(&state, None).await;
+        return Err(gone());
+    };
+    let Some((user, username)) = state.meta.challenge_owner(&hash, now_ms).await? else {
+        crate::audit::challenge_failed(&state, None).await;
+        return Err(gone());
+    };
     let user_key = format!("user:{username}");
     let Some(user_counted) = state.second_factors.count(&user_key, SECOND_FACTORS_PER_USER, now) else {
         state.second_factors.refund(&ip, ip_counted);
@@ -318,6 +324,11 @@ pub async fn second_factor(
             state.second_factors.refund(&ip, ip_counted);
             state.second_factors.refund(&user_key, user_counted);
             Err(ApiError::from(MetaError::TwoFactorLocked { retry_after_ms }))
+        }
+        Err(MetaError::ChallengeGone) => {
+            // The challenge was found a moment ago and has gone since (used, out of tries, expired, or the account changed).
+            crate::audit::challenge_failed(&state, Some(user)).await;
+            Err(gone())
         }
         Err(e) => Err(e.into()),
     }

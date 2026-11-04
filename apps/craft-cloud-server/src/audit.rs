@@ -88,6 +88,16 @@ pub(crate) async fn login_failed(state: &AppState, target: Option<UserId>) {
     }
 }
 
+/// Writes the event of a sign-in whose challenge was not good (unknown, expired, used, or out of tries), as
+/// [`login_failed`] does. `target` is the account when the challenge was found, `None` when it was not (nothing a client sent
+/// is stored). The wrong second factors themselves are written by the store, where the account is known.
+pub(crate) async fn challenge_failed(state: &AppState, target: Option<UserId>) {
+    let failure = AuditFailure { action: craft_cloud_meta::AuditAction::AuthSecondFactorFailed, target, step: Step::ChallengeExpired };
+    if let Err(e) = state.meta.audit_record_failure(failure, state.now_ms()).await {
+        tracing::warn!(error = %e, "couldn't write an audit event");
+    }
+}
+
 // ---- reading parameters ----
 
 /// The query of the two lists and the export. Unknown parameters are ignored, as everywhere in the API.
