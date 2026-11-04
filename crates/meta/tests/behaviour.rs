@@ -120,6 +120,9 @@ on_every_backend!(
     a_trash_restore_and_an_edit_of_the_file_agree,
     a_restored_file_gets_a_new_version_with_its_old_content,
     a_restore_does_not_exceed_the_depth_limit,
+    a_new_manifest_has_exact_edges_complete_in_its_own_transaction,
+    a_long_manifest_is_indexed_in_batches_of_the_budget,
+    the_index_stays_exact_through_every_write_path,
     batch_size_is_limited,
     folders_nest_at_most_max_tree_depth,
     creating_or_moving_into_a_deleted_folder_brings_it_back,
@@ -1798,6 +1801,9 @@ async fn upgrading_counts_what_each_space_already_stores() {
         sqlx::query("DROP TABLE pairings").execute(&mut conn).await.unwrap();
         sqlx::query("DROP TABLE invites").execute(&mut conn).await.unwrap();
         // And before save records.
+        // And before the reference index.
+        sqlx::query("DROP TABLE manifest_chunks").execute(&mut conn).await.unwrap();
+        sqlx::query("DROP TABLE manifest_index").execute(&mut conn).await.unwrap();
         // And before the trash.
         sqlx::query("DROP INDEX nodes_trash").execute(&mut conn).await.unwrap();
         sqlx::query("ALTER TABLE nodes DROP COLUMN deleted_ms").execute(&mut conn).await.unwrap();
@@ -1829,7 +1835,7 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 8);
+    assert_eq!(versions, 9);
 }
 
 /// A file with `n` versions, one commit each (the first by create): its node and the versions, oldest first.
@@ -2078,12 +2084,12 @@ async fn the_schema_version_is_recorded_and_a_newer_database_is_refused() {
     use sqlx::Connection;
     let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
     let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(latest, 8);
+    assert_eq!(latest, 9);
     // Opening again changes nothing.
     drop(Meta::open(&url).await.unwrap());
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(rows, 8);
-    sqlx::query("INSERT INTO schema_version (version) VALUES (9)").execute(&mut conn).await.unwrap();
+    assert_eq!(rows, 9);
+    sqlx::query("INSERT INTO schema_version (version) VALUES (10)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(&url).await, Err(MetaError::Corrupt(_))), "a newer database is refused");
 }
@@ -2504,6 +2510,8 @@ async fn raw(url: &str) -> sqlx::AnyConnection {
 async fn undo_the_trash_migration(url: &str) {
     let mut conn = raw(url).await;
     for statement in [
+        "DROP TABLE manifest_chunks",
+        "DROP TABLE manifest_index",
         "DROP INDEX nodes_trash",
         "ALTER TABLE nodes DROP COLUMN deleted_ms",
         "ALTER TABLE nodes DROP COLUMN purge_requested_ms",
@@ -2552,7 +2560,7 @@ async fn the_trash_migration_dates_old_deletions_at_the_migration(url: &str) {
     assert_eq!(again.entries, page.entries);
     let mut conn = raw(url).await;
     let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(latest, 8);
+    assert_eq!(latest, 9);
     let live_with_time: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE deleted = 0 AND (deleted_ms IS NOT NULL OR purge_requested_ms IS NOT NULL)")
             .fetch_one(&mut conn)
@@ -2689,4 +2697,529 @@ async fn a_restore_does_not_exceed_the_depth_limit(meta: &Meta) {
     // A file may sit in the deepest folder: it comes back, in `spare`, which is live (it was never deleted).
     let done = meta.restore_from_trash(u.space, dev, g, NOW + 7).await.unwrap();
     assert_eq!((done.parent, done.name.as_str()), (spare, "g.txt"));
+}
+
+// ---- the reference index ----
+
+/// A manifest over `chunks` (each one byte), the chunks recorded as `u`'s; the manifest itself is not recorded.
+async fn manifest_over(meta: &Meta, u: &UserRecord, chunks: &[ChunkId]) -> Manifest {
+    let unique: Vec<(ChunkId, u64)> = chunks.iter().map(|c| (*c, 2)).collect();
+    meta.add_chunks(u.space, &unique, NOW).await.unwrap();
+    let refs: Vec<ChunkRef> = chunks.iter().map(|id| ChunkRef { id: *id, len: 1 }).collect();
+    Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), chunks.len() as u64, FileHash::from_bytes([chunks.len() as u8; 32]), refs).unwrap()
+}
+
+fn fresh_chunks(n: usize) -> Vec<ChunkId> {
+    (0..n).map(|_| random_chunk()).collect()
+}
+
+fn edge_list(chunks: &[ChunkId]) -> Vec<(u64, ChunkId)> {
+    chunks.iter().enumerate().map(|(i, c)| (i as u64, *c)).collect()
+}
+
+/// The index of a manifest is written in the transaction that records it, exactly: in order, repeated chunks at each
+/// of their places; recording it again (another space, the same bytes) changes nothing; a manifest the quota refuses
+/// leaves no index behind; an empty file's manifest is complete with no edges.
+async fn a_new_manifest_has_exact_edges_complete_in_its_own_transaction(meta: &Meta) {
+    use craft_cloud_meta::{EdgeCheck, IndexState};
+    let ana = user(meta, "ana").await;
+    let bob = user(meta, "bob").await;
+    let (a, b, c) = (random_chunk(), random_chunk(), random_chunk());
+    let chunks = [a, b, a, c];
+    let m = manifest_over(meta, &ana, &chunks).await;
+    assert_eq!(meta.index_state(&m.id()).await.unwrap(), IndexState::Absent);
+    meta.add_manifest(ana.space, &m, 100, NOW).await.unwrap();
+    assert_eq!(meta.index_state(&m.id()).await.unwrap(), IndexState::Complete { total: 4 });
+    assert_eq!(meta.index_edges(&m.id()).await.unwrap(), edge_list(&chunks));
+    assert_eq!(meta.index_check(&m).await.unwrap(), EdgeCheck::Exact);
+
+    // The same manifest from another space: nothing is written twice.
+    let edges = meta.index_edge_count().await.unwrap();
+    let again = manifest_over(meta, &bob, &chunks).await;
+    meta.add_manifest(bob.space, &again, 100, NOW).await.unwrap();
+    assert_eq!(meta.index_edge_count().await.unwrap(), edges);
+    assert_eq!(meta.index_state(&m.id()).await.unwrap(), IndexState::Complete { total: 4 });
+
+    // An empty file.
+    let empty = Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), 0, FileHash::from_bytes([0; 32]), vec![]).unwrap();
+    meta.add_manifest(ana.space, &empty, 10, NOW).await.unwrap();
+    assert_eq!(meta.index_state(&empty.id()).await.unwrap(), IndexState::Complete { total: 0 });
+    assert_eq!(meta.index_edge_count().await.unwrap(), edges);
+
+    // A manifest the stored-bytes cap refuses leaves no index: its transaction rolls back whole.
+    let capped = meta.clone().with_stored_bytes_cap(Some(50));
+    let carol = user(&capped, "carol").await;
+    let chunks = fresh_chunks(3);
+    let refused = manifest_over(&capped, &carol, &chunks).await;
+    assert!(matches!(capped.add_manifest(carol.space, &refused, 1_000, NOW).await, Err(MetaError::QuotaExceeded { .. })));
+    assert_eq!(capped.index_state(&refused.id()).await.unwrap(), IndexState::Absent);
+    assert_eq!(capped.index_edge_count().await.unwrap(), edges);
+    // A manifest whose chunks the space lacks is refused before anything is written.
+    let lacking =
+        Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), 1, FileHash::from_bytes([7; 32]), vec![ChunkRef { id: random_chunk(), len: 1 }])
+            .unwrap();
+    assert!(matches!(meta.add_manifest(ana.space, &lacking, 100, NOW).await, Err(MetaError::MissingChunks(_))));
+    assert_eq!(meta.index_state(&lacking.id()).await.unwrap(), IndexState::Absent);
+}
+
+/// A manifest longer than the budget is indexed in batches of at most that many edges, each its own transaction, and is
+/// complete only after the comparison with its manifest.
+async fn a_long_manifest_is_indexed_in_batches_of_the_budget(meta: &Meta) {
+    use craft_cloud_meta::{IndexState, Validation};
+    let meta = meta.clone().with_index_batch_rows(5);
+    let ana = user(&meta, "ana").await;
+    let chunks = fresh_chunks(12);
+    let m = manifest_over(&meta, &ana, &chunks).await;
+    let before = meta.index_edge_count().await.unwrap();
+    meta.add_manifest(ana.space, &m, 100, NOW).await.unwrap();
+    assert_eq!(meta.index_state(&m.id()).await.unwrap(), IndexState::Building { done: 5, total: 12 });
+    assert_eq!(meta.index_edge_count().await.unwrap() - before, 5, "no more than the budget in the recording transaction");
+    assert_eq!(meta.manifests_to_index(None, 10).await.unwrap(), vec![m.id()]);
+
+    for (expected_done, expected_rows) in [(10u64, 10u64), (12, 12)] {
+        let state = meta.index_stage(&m).await.unwrap();
+        assert_eq!(state, IndexState::Building { done: expected_done, total: 12 });
+        assert_eq!(meta.index_edge_count().await.unwrap() - before, expected_rows, "at most the budget more per stage");
+    }
+    // Every edge is written, and still it is not complete: only the comparison makes it so.
+    assert_eq!(meta.index_state(&m.id()).await.unwrap(), IndexState::Building { done: 12, total: 12 });
+    assert_eq!(meta.index_validate(&m).await.unwrap(), Validation::Complete);
+    assert_eq!(meta.index_state(&m.id()).await.unwrap(), IndexState::Complete { total: 12 });
+    assert_eq!(meta.index_edges(&m.id()).await.unwrap(), edge_list(&chunks));
+    assert!(meta.manifests_to_index(None, 10).await.unwrap().is_empty());
+    // Once complete, more stages change nothing.
+    assert_eq!(meta.index_stage(&m).await.unwrap(), IndexState::Complete { total: 12 });
+    assert_eq!(meta.index_edge_count().await.unwrap() - before, 12);
+
+    // `index_complete` does all of it, and again is a no-op.
+    let more = fresh_chunks(23);
+    let long = manifest_over(&meta, &ana, &more).await;
+    meta.add_manifest(ana.space, &long, 100, NOW).await.unwrap();
+    meta.index_complete(&long).await.unwrap();
+    meta.index_complete(&long).await.unwrap();
+    assert_eq!(meta.index_state(&long.id()).await.unwrap(), IndexState::Complete { total: 23 });
+    assert_eq!(meta.index_edges(&long.id()).await.unwrap(), edge_list(&more));
+}
+
+/// The index is built from what a manifest says, not from what is there: wrong, swapped, missing and extra edges, a
+/// repeated chunk collapsed or changed, and a wrong edge written before the build started are each found by the
+/// comparison, the index does not become complete, and a build that repeats the manifest's own list makes it exact.
+async fn an_index_is_complete_only_when_every_edge_is_right_on(url: &str) {
+    use craft_cloud_meta::{EdgeProblemKind, IndexState, Validation};
+    let meta = Meta::open(url).await.unwrap().with_index_batch_rows(3);
+    let ana = user(&meta, "ana").await;
+    let mut conn = raw(url).await;
+    let (a, b, c, d, e, f) = (random_chunk(), random_chunk(), random_chunk(), random_chunk(), random_chunk(), random_chunk());
+    let spare = random_chunk();
+    // `(what, chunks, damage SQL, expected first problem)`: `$1` is a chunk ID and `$2` the manifest.
+    type Case<'a> = (&'a str, Vec<ChunkId>, &'a str, (u64, EdgeProblemKind));
+    let cases: Vec<Case> = vec![
+        (
+            "wrong chunk",
+            vec![a, b, c, d, e, f],
+            "UPDATE manifest_chunks SET chunk = $1 WHERE manifest = $2 AND ordinal = 2",
+            (2, EdgeProblemKind::WrongChunk),
+        ),
+        (
+            "a missing edge",
+            vec![a, b, c, d, e, f],
+            "DELETE FROM manifest_chunks WHERE manifest = $2 AND ordinal = 4 AND chunk <> $1",
+            (4, EdgeProblemKind::MissingEdge),
+        ),
+        (
+            "an extra edge",
+            vec![a, b, c, d, e, f],
+            "INSERT INTO manifest_chunks (manifest, ordinal, chunk) VALUES ($2, 6, $1)",
+            (6, EdgeProblemKind::ExtraEdge),
+        ),
+        (
+            "a repeated chunk changed",
+            vec![a, b, a, c],
+            "UPDATE manifest_chunks SET chunk = $1 WHERE manifest = $2 AND ordinal = 2",
+            (2, EdgeProblemKind::WrongChunk),
+        ),
+        (
+            "a repeated chunk collapsed",
+            vec![a, b, a, c],
+            "DELETE FROM manifest_chunks WHERE manifest = $2 AND ordinal = 2 AND chunk = $1",
+            (2, EdgeProblemKind::MissingEdge),
+        ),
+    ];
+    for (what, chunks, damage, (ordinal, kind)) in cases {
+        // A distinct manifest per case: its chunks differ in size by the case.
+        let chunks: Vec<ChunkId> =
+            chunks.iter().map(|c| ChunkId::from_bytes(*blake3::hash(&[c.as_bytes().as_slice(), what.as_bytes()].concat()).as_bytes())).collect();
+        let m = manifest_over(&meta, &ana, &chunks).await;
+        meta.add_manifest(ana.space, &m, 100, NOW).await.unwrap();
+        while !matches!(meta.index_stage(&m).await.unwrap(), IndexState::Building { done, total } if done == total) {}
+        assert!(matches!(meta.index_state(&m.id()).await.unwrap(), IndexState::Building { .. }), "{what}: all edges written, not yet compared");
+        // Damage it with every edge written, before the comparison.
+        let wrong = chunks.first().map(|c| *c.as_bytes()).unwrap_or(*spare.as_bytes());
+        let other = if damage.starts_with("UPDATE") { *spare.as_bytes() } else { wrong };
+        sqlx::query(sqlx::AssertSqlSafe(damage.to_owned())).bind(other.to_vec()).bind(m.id().as_bytes().to_vec()).execute(&mut conn).await.unwrap();
+        let outcome = meta.index_validate(&m).await.unwrap();
+        match outcome {
+            Validation::Mismatch(problem) => assert_eq!((problem.ordinal, problem.kind), (ordinal, kind), "{what}"),
+            other => panic!("{what}: expected a mismatch, got {other:?}"),
+        }
+        assert!(!matches!(meta.index_state(&m.id()).await.unwrap(), IndexState::Complete { .. }), "{what}: not complete");
+        // A build repeats the manifest's own list and ends exact.
+        meta.index_complete(&m).await.unwrap();
+        assert_eq!(meta.index_state(&m.id()).await.unwrap(), IndexState::Complete { total: chunks.len() as u64 }, "{what}");
+        assert_eq!(meta.index_edges(&m.id()).await.unwrap(), edge_list(&chunks), "{what}");
+    }
+
+    // A wrong edge that was there before the build began is not taken for the right one.
+    let chunks = fresh_chunks(4);
+    let m = manifest_over(&meta, &ana, &chunks).await;
+    sqlx::query("INSERT INTO manifest_chunks (manifest, ordinal, chunk) VALUES ($1, 1, $2)")
+        .bind(m.id().as_bytes().to_vec())
+        .bind(spare.as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    meta.add_manifest(ana.space, &m, 100, NOW).await.unwrap();
+    assert!(!matches!(meta.index_state(&m.id()).await.unwrap(), IndexState::Complete { .. }), "recorded with a wrong edge present");
+    meta.index_complete(&m).await.unwrap();
+    assert_eq!(meta.index_edges(&m.id()).await.unwrap(), edge_list(&chunks));
+
+    // A complete index that was damaged afterwards is found by the checks that read it, not trusted.
+    let chunks = fresh_chunks(3);
+    let m = manifest_over(&meta, &ana, &chunks).await;
+    meta.add_manifest(ana.space, &m, 100, NOW).await.unwrap();
+    assert_eq!(meta.index_state(&m.id()).await.unwrap(), IndexState::Complete { total: 3 });
+    sqlx::query("UPDATE manifest_chunks SET chunk = $1 WHERE manifest = $2 AND ordinal = 0")
+        .bind(spare.as_bytes().to_vec())
+        .bind(m.id().as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert!(matches!(meta.index_check(&m).await.unwrap(), craft_cloud_meta::EdgeCheck::Mismatch(p) if p.ordinal == 0));
+    // The builder leaves a complete row alone (it is the checker's to report), and a mismatch there is an error, not a silent rewrite.
+    assert_eq!(meta.index_stage(&m).await.unwrap(), IndexState::Complete { total: 3 });
+}
+
+/// A build stopped part way resumes where it was, after the database was closed and opened again, and a manifest
+/// recorded before the index existed (no row at all) is found and indexed.
+async fn an_index_build_resumes_after_a_restart_on(url: &str) {
+    use craft_cloud_meta::IndexState;
+    let chunks = fresh_chunks(10);
+    let (ana, m) = {
+        let meta = Meta::open(url).await.unwrap().with_index_batch_rows(4);
+        let ana = user(&meta, "ana").await;
+        let m = manifest_over(&meta, &ana, &chunks).await;
+        meta.add_manifest(ana.space, &m, 100, NOW).await.unwrap();
+        assert_eq!(meta.index_stage(&m).await.unwrap(), IndexState::Building { done: 8, total: 10 });
+        (ana, m)
+    };
+    // The "restart": a new handle on the same database.
+    let meta = Meta::open(url).await.unwrap().with_index_batch_rows(4);
+    assert_eq!(meta.index_state(&m.id()).await.unwrap(), IndexState::Building { done: 8, total: 10 });
+    assert_eq!(meta.manifests_to_index(None, 10).await.unwrap(), vec![m.id()]);
+    assert_eq!(meta.index_edge_count().await.unwrap(), 8);
+    meta.index_complete(&m).await.unwrap();
+    assert_eq!(meta.index_edges(&m.id()).await.unwrap(), edge_list(&chunks));
+    assert!(meta.manifests_to_index(None, 10).await.unwrap().is_empty());
+
+    // A manifest from before the index: recorded, no row, no edges.
+    let old_chunks = fresh_chunks(6);
+    let old = manifest_over(&meta, &ana, &old_chunks).await;
+    meta.add_manifest(ana.space, &old, 100, NOW).await.unwrap();
+    let mut conn = raw(url).await;
+    sqlx::query("DELETE FROM manifest_chunks WHERE manifest = $1").bind(old.id().as_bytes().to_vec()).execute(&mut conn).await.unwrap();
+    sqlx::query("DELETE FROM manifest_index WHERE manifest = $1").bind(old.id().as_bytes().to_vec()).execute(&mut conn).await.unwrap();
+    assert_eq!(meta.index_state(&old.id()).await.unwrap(), IndexState::Absent);
+    assert_eq!(meta.manifests_to_index(None, 10).await.unwrap(), vec![old.id()]);
+    let audit = meta.index_audit(5).await.unwrap();
+    assert_eq!((audit.manifests, audit.complete, audit.absent), (2, 1, 1));
+    meta.index_complete(&old).await.unwrap();
+    assert_eq!(meta.index_edges(&old.id()).await.unwrap(), edge_list(&old_chunks));
+    assert_eq!(meta.index_audit(5).await.unwrap().complete, 2);
+}
+
+/// The migration that adds the index does not pretend: manifests recorded before it have no row and are reported as not
+/// indexed until a build indexes them.
+async fn the_index_migration_leaves_old_manifests_unindexed_on(url: &str) {
+    use craft_cloud_meta::IndexState;
+    let (m, ana) = {
+        let meta = Meta::open(url).await.unwrap();
+        let ana = user(&meta, "ana").await;
+        let m = manifest_over(&meta, &ana, &fresh_chunks(3)).await;
+        meta.add_manifest(ana.space, &m, 100, NOW).await.unwrap();
+        (m, ana)
+    };
+    let _ = ana;
+    {
+        let mut conn = raw(url).await;
+        for statement in ["DROP TABLE manifest_chunks", "DROP TABLE manifest_index", "DELETE FROM schema_version WHERE version >= 9"] {
+            sqlx::query(statement).execute(&mut conn).await.unwrap();
+        }
+    }
+    let meta = Meta::open(url).await.unwrap();
+    assert_eq!(meta.index_state(&m.id()).await.unwrap(), IndexState::Absent, "recorded before the index: not indexed");
+    let audit = meta.index_audit(5).await.unwrap();
+    assert_eq!((audit.manifests, audit.complete, audit.absent, audit.building), (1, 0, 1, 0));
+    let mut conn = raw(url).await;
+    let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
+    assert_eq!(latest, 9);
+}
+
+/// What the database alone can say is wrong, in seeded damage: orphan edges, an index row without its manifest, an edge
+/// to a chunk that is not recorded, a root naming a manifest that is not recorded; and the notices: manifests no version
+/// or snapshot names (the live-document asset case) and chunks no manifest names.
+async fn the_audit_names_what_is_wrong_on(url: &str) {
+    let meta = Meta::open(url).await.unwrap();
+    let ana = user(&meta, "ana").await;
+    let dev = device(&meta, &ana).await;
+    let r = root(&meta, &ana).await;
+    let mut conn = raw(url).await;
+
+    // A healthy file, an asset no version names, and a chunk no manifest names.
+    let chunks = fresh_chunks(3);
+    let file_manifest = manifest_over(&meta, &ana, &chunks).await;
+    meta.add_manifest(ana.space, &file_manifest, 100, NOW).await.unwrap();
+    let node = NodeId::generate();
+    let v = version(file_manifest.id());
+    meta.commit(ana.space, dev, &[Op::Create { node, parent: r, name: name("f.txt"), version: v }], NOW).await.unwrap();
+    let asset = manifest_over(&meta, &ana, &fresh_chunks(2)).await;
+    meta.add_manifest(ana.space, &asset, 100, NOW).await.unwrap();
+    let stray = random_chunk();
+    meta.add_chunk(ana.space, &stray, 10, NOW).await.unwrap();
+    let healthy = meta.index_audit(5).await.unwrap();
+    assert_eq!((healthy.manifests, healthy.complete, healthy.building, healthy.absent), (2, 2, 0, 0));
+    assert_eq!(healthy.unrooted_manifests.count, 1, "the asset is named by no version");
+    assert_eq!(healthy.unrooted_manifests.examples, vec![asset.id().to_string()]);
+    assert_eq!(healthy.unreferenced_chunks.count, 1);
+    for finding in [
+        &healthy.index_without_manifest,
+        &healthy.edges_without_index,
+        &healthy.complete_with_wrong_count,
+        &healthy.unknown_dependencies,
+        &healthy.roots_without_manifest,
+        &healthy.roots_not_indexed,
+        &healthy.space_blobs_without_blob,
+    ] {
+        assert_eq!(finding.count, 0, "{finding:?}");
+    }
+
+    // Damage: orphan edges, an index row without a manifest, an unknown dependency, a root without its manifest.
+    let ghost = ManifestId::from_bytes([0xaa; 32]);
+    sqlx::query("INSERT INTO manifest_chunks (manifest, ordinal, chunk) VALUES ($1, 0, $2)")
+        .bind(ghost.as_bytes().to_vec())
+        .bind(stray.as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let ghost_row = ManifestId::from_bytes([0xbb; 32]);
+    sqlx::query("INSERT INTO manifest_index (manifest, chunk_count, indexed_ordinals, state) VALUES ($1, 0, 0, 1)")
+        .bind(ghost_row.as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM blobs WHERE kind = 0 AND id = $1").bind(chunks[1].as_bytes().to_vec()).execute(&mut conn).await.unwrap();
+    sqlx::query("DELETE FROM blobs WHERE kind = 1 AND id = $1").bind(file_manifest.id().as_bytes().to_vec()).execute(&mut conn).await.unwrap();
+    let damaged = meta.index_audit(5).await.unwrap();
+    assert_eq!(damaged.edges_without_index.examples, vec![ghost.to_string()]);
+    assert_eq!(damaged.index_without_manifest.count, 2, "the made-up row and the manifest whose record was removed");
+    assert!(damaged.index_without_manifest.examples.contains(&ghost_row.to_string()));
+    assert_eq!(damaged.unknown_dependencies.count, 1);
+    assert_eq!(damaged.unknown_dependencies.examples, vec![format!("{}/{}", file_manifest.id(), chunks[1])]);
+    assert_eq!(damaged.roots_without_manifest.examples, vec![file_manifest.id().to_string()], "the version names a manifest that is gone");
+    assert_eq!(damaged.space_blobs_without_blob.count, 2, "the memberships of the removed blobs");
+    // A complete index whose edge count is not its chunk count.
+    sqlx::query("DELETE FROM manifest_chunks WHERE manifest = $1 AND ordinal = 0")
+        .bind(asset.id().as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(meta.index_audit(5).await.unwrap().complete_with_wrong_count.examples, vec![asset.id().to_string()]);
+}
+
+/// Every path that records or uses a manifest leaves the index exactly as the manifests made it: commit, update,
+/// restore of a version, restore from the trash, a late save record, a live document's import and compaction. Their
+/// roots are always indexed, and none of them writes an edge.
+async fn the_index_stays_exact_through_every_write_path(meta: &Meta) {
+    use craft_cloud_proto::live::node_doc;
+    let ana = user(meta, "ana").await;
+    let dev = device(meta, &ana).await;
+    let r = root(meta, &ana).await;
+    let clean = |label: &'static str, edges: u64| async move {
+        let audit = meta.index_audit(5).await.unwrap();
+        assert_eq!(audit.complete, audit.manifests, "{label}: every manifest is complete");
+        assert_eq!(audit.roots_not_indexed.count + audit.roots_without_manifest.count + audit.unknown_dependencies.count, 0, "{label}");
+        assert_eq!(audit.edges_without_index.count + audit.index_without_manifest.count + audit.complete_with_wrong_count.count, 0, "{label}");
+        assert_eq!(meta.index_edge_count().await.unwrap(), edges, "{label}: the path wrote no edge");
+    };
+    let (c1, c2, c3) = (fresh_chunks(3), fresh_chunks(2), fresh_chunks(4));
+    let (m1, m2, m3) = (manifest_over(meta, &ana, &c1).await, manifest_over(meta, &ana, &c2).await, manifest_over(meta, &ana, &c3).await);
+    for m in [&m1, &m2, &m3] {
+        meta.add_manifest(ana.space, m, 100, NOW).await.unwrap();
+    }
+    let edges = 3 + 2 + 4;
+    clean("uploads", edges).await;
+
+    let node = NodeId::generate();
+    let v1 = version(m1.id());
+    meta.commit(ana.space, dev, &[Op::Create { node, parent: r, name: name("path.txt"), version: v1.clone() }], NOW).await.unwrap();
+    clean("create", edges).await;
+    let v2 = version(m2.id());
+    meta.commit(ana.space, dev, &[Op::Update { node, expected: v1.id, version: v2.clone() }], NOW + 1).await.unwrap();
+    clean("update", edges).await;
+    let restored = meta.restore_version(ana.space, dev, node, v1.id, v2.id, NOW + 2).await.unwrap();
+    clean("restore of a version", edges).await;
+    let record = craft_cloud_proto::SaveRecord { doc: node_doc(ana.space, node), frontiers: vec![(1, 2)] };
+    meta.attach_save(ana.space, node, v2.id, &record).await.unwrap();
+    clean("a late save record", edges).await;
+    meta.commit(ana.space, dev, &[Op::Delete { node, expected: Some(restored.version) }], NOW + 3).await.unwrap();
+    clean("delete", edges).await;
+    meta.restore_from_trash(ana.space, dev, node, NOW + 4).await.unwrap();
+    clean("restore from the trash", edges).await;
+
+    // A live document of a file: its import snapshot and a compaction's snapshot are roots too.
+    let doc_node = file(meta, &ana, "doc.txt").await;
+    let doc = node_doc(ana.space, doc_node);
+    let first = snapshot(meta, &ana, 100).await;
+    let edges = meta.index_edge_count().await.unwrap();
+    meta.create_live_document(ana.space, doc, "document:wordcraft", doc_node, &first.manifest, NOW).await.unwrap();
+    clean("a live document's import", edges).await;
+    meta.append_live_update(ana.space, doc, dev, 1, &[1; 10], NOW).await.unwrap();
+    let compacted = snapshot(meta, &ana, 40).await;
+    let edges = meta.index_edge_count().await.unwrap();
+    assert!(meta.compact_live_doc(ana.space, doc, 1, &compacted.manifest).await.unwrap());
+    clean("a compaction", edges).await;
+    let audit = meta.index_audit(5).await.unwrap();
+    assert_eq!(audit.unrooted_manifests.count, 1, "only m3 is named by nothing");
+}
+
+/// A build runs beside commits and uploads: manifests recorded before the index (no rows) are indexed while new files
+/// are committed and new manifests recorded, and the result is exact for all of them.
+async fn a_build_runs_beside_commits_on(url: &str) {
+    use craft_cloud_meta::IndexState;
+    let meta = Meta::open(url).await.unwrap().with_index_batch_rows(3);
+    let ana = user(&meta, "ana").await;
+    let dev = device(&meta, &ana).await;
+    let r = root(&meta, &ana).await;
+    let mut conn = raw(url).await;
+    let mut old = Vec::new();
+    for i in 0..6 {
+        let chunks = fresh_chunks(7 + i);
+        let m = manifest_over(&meta, &ana, &chunks).await;
+        meta.add_manifest(ana.space, &m, 100, NOW).await.unwrap();
+        sqlx::query("DELETE FROM manifest_chunks WHERE manifest = $1").bind(m.id().as_bytes().to_vec()).execute(&mut conn).await.unwrap();
+        sqlx::query("DELETE FROM manifest_index WHERE manifest = $1").bind(m.id().as_bytes().to_vec()).execute(&mut conn).await.unwrap();
+        old.push((m, chunks));
+    }
+    let builder = {
+        let (meta, old) = (meta.clone(), old.clone());
+        tokio::spawn(async move {
+            for (m, _) in &old {
+                meta.index_complete(m).await.unwrap();
+            }
+        })
+    };
+    let writer = {
+        let (meta, space) = (meta.clone(), ana.space);
+        tokio::spawn(async move {
+            let mut made = Vec::new();
+            for i in 0..8 {
+                let chunks = fresh_chunks(5);
+                let ids: Vec<(ChunkId, u64)> = chunks.iter().map(|c| (*c, 2)).collect();
+                meta.add_chunks(space, &ids, NOW).await.unwrap();
+                let refs: Vec<ChunkRef> = chunks.iter().map(|id| ChunkRef { id: *id, len: 1 }).collect();
+                let m = Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), 5, FileHash::from_bytes([i; 32]), refs).unwrap();
+                meta.add_manifest(space, &m, 100, NOW).await.unwrap();
+                // As the server's upload handler does, beside the builder: the part the recording left.
+                meta.index_complete(&m).await.unwrap();
+                let node = NodeId::generate();
+                let v = NewVersion { id: VersionId::generate(), manifest: m.id(), mtime_ms: NOW, exec: false, save: None };
+                meta.commit(space, dev, &[Op::Create { node, parent: r, name: name(&format!("w{i}.txt")), version: v }], NOW).await.unwrap();
+                made.push((m, chunks));
+            }
+            made
+        })
+    };
+    builder.await.unwrap();
+    let made = writer.await.unwrap();
+    for (m, chunks) in old.iter().chain(made.iter()) {
+        assert_eq!(meta.index_state(&m.id()).await.unwrap(), IndexState::Complete { total: chunks.len() as u64 });
+        assert_eq!(meta.index_edges(&m.id()).await.unwrap(), edge_list(chunks));
+    }
+    let audit = meta.index_audit(5).await.unwrap();
+    assert_eq!((audit.manifests, audit.complete), (14, 14));
+    assert_eq!(audit.roots_not_indexed.count, 0);
+}
+
+#[tokio::test]
+async fn an_index_is_complete_only_when_every_edge_is_right_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    an_index_is_complete_only_when_every_edge_is_right_on(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_index_is_complete_only_when_every_edge_is_right_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    an_index_is_complete_only_when_every_edge_is_right_on(&url).await;
+}
+
+#[tokio::test]
+async fn an_index_build_resumes_after_a_restart_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    an_index_build_resumes_after_a_restart_on(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_index_build_resumes_after_a_restart_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    an_index_build_resumes_after_a_restart_on(&url).await;
+}
+
+#[tokio::test]
+async fn the_index_migration_leaves_old_manifests_unindexed_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    the_index_migration_leaves_old_manifests_unindexed_on(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_index_migration_leaves_old_manifests_unindexed_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    the_index_migration_leaves_old_manifests_unindexed_on(&url).await;
+}
+
+#[tokio::test]
+async fn the_audit_names_what_is_wrong_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    the_audit_names_what_is_wrong_on(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_audit_names_what_is_wrong_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    the_audit_names_what_is_wrong_on(&url).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_build_runs_beside_commits_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    a_build_runs_beside_commits_on(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_build_runs_beside_commits_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    a_build_runs_beside_commits_on(&url).await;
 }

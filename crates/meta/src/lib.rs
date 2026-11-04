@@ -11,6 +11,7 @@ mod blobs;
 mod codec;
 mod commit;
 mod history;
+mod index;
 mod join;
 mod live;
 mod schema;
@@ -29,6 +30,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 pub use commit::{CommitOutcome, RestoreOutcome, TrashRestoreOutcome};
 pub use craft_cloud_proto::BlobKind;
 pub use history::HistoryPage;
+pub use index::{EdgeCheck, EdgeProblem, EdgeProblemKind, Finding, INDEX_BATCH_ROWS, IndexAudit, IndexState, Validation};
 pub use join::{InviteFor, Redeemed};
 pub use live::{
     Appended, DEFAULT_LIVE_BYTES_PER_SPACE, LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE, MAX_LIVE_DOCS_PER_SPACE,
@@ -117,6 +119,8 @@ pub struct Meta {
     live_held_documents_cap: u64,
     /// The most bytes all of one space's live documents may hold ([`Meta::with_live_bytes_cap`]).
     live_bytes_cap: u64,
+    /// Edges of the reference index one transaction writes ([`Meta::with_index_batch_rows`]).
+    index_rows: usize,
 }
 
 impl Meta {
@@ -173,6 +177,7 @@ impl Meta {
             live_documents_cap: MAX_LIVE_DOCUMENTS_PER_SPACE,
             live_held_documents_cap: MAX_LIVE_DOCUMENTS_HOLDING_UPDATES,
             live_bytes_cap: DEFAULT_LIVE_BYTES_PER_SPACE,
+            index_rows: INDEX_BATCH_ROWS,
         })
     }
 
