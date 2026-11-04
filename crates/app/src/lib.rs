@@ -64,8 +64,11 @@ use craft_cloud_api::api::ErrorAnswer;
 use craft_cloud_api::local::{AutostartRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_MIN, LocalApiFile, LogoutRequest, paths};
 
 pub use craft_cloud_api::DeviceId;
+pub use craft_cloud_api::VersionId;
 pub use craft_cloud_api::api::{DeviceInfo, PairingState, PairingStatus};
-pub use craft_cloud_api::local::{JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RunState, Status, codes};
+pub use craft_cloud_api::local::{
+    HistoryResponse, HistoryVersion, JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RestoreResponse, RunState, Status, codes,
+};
 pub use recents::{RecentsEvent, RecentsWatch};
 pub use uuid::Uuid;
 
@@ -228,6 +231,27 @@ impl Client {
         self.call("DELETE", &format!("{}/{id}", paths::DEVICES), None, http::SLOW_TIMEOUT)
     }
 
+    /// The newest-first server history for a file in the synced folder. `cursor` is the opaque `next` value from the
+    /// previous page. Asks the server: call it off the UI thread.
+    pub fn file_history(&self, path: &str, cursor: Option<&str>, limit: Option<u32>) -> Result<HistoryResponse, Error> {
+        let mut query = format!("path={}", query_component(path));
+        if let Some(cursor) = cursor {
+            query.push_str(&format!("&cursor={}", query_component(cursor)));
+        }
+        if let Some(limit) = limit {
+            query.push_str(&format!("&limit={limit}"));
+        }
+        self.call("GET", &format!("{}?{query}", paths::FILE_HISTORY), None, http::SLOW_TIMEOUT)
+    }
+
+    /// Restores `version` of a file in the synced folder, if `expected_version` is still current. Asks the server:
+    /// call it off the UI thread.
+    pub fn restore_file(&self, path: &str, version: VersionId, expected_version: VersionId) -> Result<RestoreResponse, Error> {
+        let body = serde_json::to_vec(&craft_cloud_api::local::RestoreRequest { path: path.to_owned(), version, expected_version })
+            .map_err(|e| Error::Protocol(e.to_string()))?;
+        self.call("POST", paths::FILE_RESTORE, Some(body), http::SLOW_TIMEOUT)
+    }
+
     /// Pauses syncing until [`Client::resume`], also across restarts; recents keep working. Answered by the agent
     /// itself (a few seconds at most): fine from a UI thread.
     pub fn pause(&self) -> Result<Status, Error> {
@@ -281,6 +305,18 @@ impl Client {
     pub fn blobs(&self) -> blobs::Blobs {
         blobs::Blobs::new(self.clone())
     }
+}
+
+fn query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 /// `answer` if it succeeded, else the agent's refusal (its code and message).
@@ -428,6 +464,39 @@ mod tests {
         let (method, path, body) = next();
         assert_eq!((method.as_str(), path.as_str()), ("POST", paths::AUTOSTART));
         assert_eq!(serde_json::from_str::<AutostartRequest>(&body).unwrap(), AutostartRequest { on: true });
+    }
+
+    #[test]
+    fn history_and_restore_use_relative_paths_and_typed_bodies() {
+        let restored = RestoreResponse {
+            version: VersionId::generate(),
+            parent_version: VersionId::generate(),
+            seq: 3,
+            epoch: craft_cloud_api::Epoch::generate(),
+        };
+        let (_dir, agent, asked) = fake_agent(vec![
+            (200, json(&HistoryResponse { versions: vec![], next: Some("7.0192f0c4-0000-7000-8000-000000000000".into()) })),
+            (200, json(&restored)),
+        ]);
+        let history = agent.file_history("Art Folder/paint #1.craft", None, Some(25)).unwrap();
+        assert_eq!(history.next.as_deref(), Some("7.0192f0c4-0000-7000-8000-000000000000"));
+        let (method, path, body) = asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/v1/files/history?path=Art%20Folder/paint%20%231.craft&limit=25");
+        assert!(body.is_empty());
+
+        let expected = VersionId::generate();
+        assert_eq!(agent.restore_file("Art Folder/paint #1.craft", restored.version, expected).unwrap(), restored);
+        let (method, path, body) = asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((method.as_str(), path.as_str()), ("POST", paths::FILE_RESTORE));
+        assert_eq!(
+            serde_json::from_str::<craft_cloud_api::local::RestoreRequest>(&body).unwrap(),
+            craft_cloud_api::local::RestoreRequest {
+                path: "Art Folder/paint #1.craft".into(),
+                version: restored.version,
+                expected_version: expected,
+            }
+        );
     }
 
     /// An agent that takes the connection but never answers (hung, or something else on its port) costs a
