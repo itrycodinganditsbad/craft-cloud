@@ -97,3 +97,36 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
   The first machine to open a file makes it a live document from the file's content (UTF-8 text only); the others
   join it. Changes go to every machine that has it open as they are made, and edits made offline merge when the
   machine is back. `doc` never writes the file: what it shows is the live document.
+
+## The local API's admin calls
+
+For the Craft Cloud app's admin pages the running agent passes the server's admin API on (`/api/v1/admin/…`, see
+[`server.md`](server.md), "Managing accounts over HTTP") under `/v1/admin/…`, with the signed-in device's token. They
+have the same checks as every local call (the `Host`, no `Origin`, the token in `Authorization: Bearer`), bodies of at
+most 8 KiB, and need the agent to be signed in (`not_signed_in` otherwise).
+
+| Local call | Server call | Body, answer |
+| --- | --- | --- |
+| `GET /v1/admin/server` | `GET /admin/server` | the server's counters and kinds; a member is refused `forbidden`, which is how the app finds out whether to show its admin pages |
+| `GET /v1/admin/users?cursor&limit&query` | `GET /admin/users` | a page of accounts by username; `next` is the cursor of the following page; `query` finds a username containing it |
+| `POST /v1/admin/users` | `POST /admin/users` | `{username, role, password}` → the account and its invite code |
+| `PATCH /v1/admin/users/{id}` | `PATCH /admin/users/{id}` | `{role?, quota_bytes?, password}` → the account (`null` removes the quota) |
+| `POST /v1/admin/users/{id}/disable`, `…/enable` | the same | `{password}` → 204 |
+| `DELETE /v1/admin/users/{id}` | the same | `{password}` → 202 |
+| `POST /v1/admin/users/{id}/invite`, `…/password-reset` | the same | `{password}` → `{code, join_url?, expires_ms}` |
+| `DELETE /v1/admin/users/{id}/invite` | the same | `{password}` → 204 |
+| `GET /v1/admin/users/{id}/devices` | the same | every device of the account |
+| `DELETE /v1/admin/users/{id}/devices/{device_id}` | the same | `{password}` → 204 |
+
+- **The server decides.** The agent checks no role and makes no decision of its own; it reads each body as the shared
+  type, writes it to the server again and answers what the server answered, with the server's HTTP status, error code and
+  message. A wrong password stays `403 wrong_password`, a member's call `403 forbidden`, a disabled admin's
+  `403 account_disabled`, the last enabled admin's demotion `409 last_admin`, too many tries `429 rate_limited` with the
+  server's `Retry-After` header. The one status the agent does not pass on is the server's `401`: on a signed-in route it
+  says this device was revoked, and the local API answers it as every other call does (`409 needs_you`); a local `401` always means a wrong token.
+- **The confirmation is not kept.** Every change carries the acting admin's current password in its body, from the app
+  through the agent to the server. The agent holds it only for the length of the request, never writes or logs it, and
+  the `Debug` output of every body hides it. The codes the server makes (an invite, a password reset code) are shown by
+  the app once and kept by neither side.
+- A second factor's code (`totp_code`, `recovery_code`) joins the confirmation when the server has two-factor sign-in:
+  the shared body types get the fields, and nothing else here changes.

@@ -24,6 +24,9 @@ per app connection for live sessions. `run` serves it while signed out too. Call
   one), `GET /v1/pairings/{id}` → `{state: waiting|used|expired, device_name?}`, `DELETE /v1/pairings/{id}` → 204;
 - `GET /v1/devices` → the account's devices (`current` marks this one); `DELETE /v1/devices/{id}` revokes another one
   and answers the list after (this one is refused with `cannot_remove_self`: that is `logout`);
+- `GET`, `POST`, `PATCH` and `DELETE` `/v1/admin/…`: the server's admin API passed on for the Craft Cloud app's admin
+  pages, with the server's status and error codes (listed in [`../agent.md`](../agent.md), "The local API's admin
+  calls");
 - `POST /v1/pause` / `POST /v1/resume` → status: while paused no sync pass starts (one under way finishes), and the
   long-poll, the folder watcher and the live connection hold; the local API and the apps' recents keep working (adds
   reach the server after resume). Kept in `state.json`, so a paused agent starts paused; `run_state` is
