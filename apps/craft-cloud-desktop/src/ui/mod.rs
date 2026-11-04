@@ -4,6 +4,7 @@
 
 mod add_computer;
 mod admin;
+mod audit;
 mod computers;
 mod join;
 mod overview;
@@ -40,6 +41,7 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
                 Screen::SignedIn(o) => overview::show(ui, o, busy, now_ms, autostart_problem.as_deref(), &mut events),
                 Screen::AddingComputer(adding) => add_computer::show(ui, adding, now_ms, &mut events),
                 Screen::Admin(a) => admin::show(ui, a, now_ms, &mut events),
+                Screen::Activity(a) => audit::activity(ui, a, now_ms, &mut events),
                 Screen::Removed => problem::removed(ui, busy, &mut events),
             }
             if let Some(note) = note {

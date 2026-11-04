@@ -402,6 +402,8 @@ pub enum View {
     List,
     Create(CreateForm),
     User(Box<UserView>),
+    /// The security audit log ([`crate::audit`]).
+    Audit(Box<crate::audit::AuditView>),
 }
 
 /// The admin pages.
@@ -853,7 +855,7 @@ pub fn valid_username(name: &str) -> bool {
     (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-fn is_forbidden(e: &Error) -> bool {
+pub(crate) fn is_forbidden(e: &Error) -> bool {
     matches!(e, Error::Refused { code, .. } if code == codes::FORBIDDEN)
 }
 
@@ -938,7 +940,7 @@ impl From<AdminEvent> for Event {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
@@ -947,7 +949,7 @@ mod tests {
     use crate::model::{JoinDefaults, tests::status};
 
     /// An agent signed in as `fabio`, an admin (or not), with `others` more accounts after fabio's own.
-    fn agent(admin: bool, others: usize) -> FakeAgent {
+    pub(crate) fn agent(admin: bool, others: usize) -> FakeAgent {
         let agent = FakeAgent::new(status(true));
         agent.admin.store(admin, std::sync::atomic::Ordering::SeqCst);
         let mut users = vec![AdminUserInfo { role: "admin".into(), ..sample_user("fabio", Uuid::now_v7()) }];
@@ -957,7 +959,7 @@ mod tests {
     }
 
     /// Feeds `events` to the model, each effect answered by the fake until nothing is left (as the link does).
-    fn run(model: &mut Model, agent: &FakeAgent, events: Vec<Event>) {
+    pub(crate) fn run(model: &mut Model, agent: &FakeAgent, events: Vec<Event>) {
         let start: Starter = Arc::new(|_: &dyn crate::agent::Agent| Err("not started in tests".to_owned()));
         for event in events {
             let mut pending = model.update(event);
@@ -969,44 +971,44 @@ mod tests {
         }
     }
 
-    fn signed_in(agent: &FakeAgent) -> Model {
+    pub(crate) fn signed_in(agent: &FakeAgent) -> Model {
         let mut model = Model::new(JoinDefaults::default(), true, "run.log".into());
         run(&mut model, agent, vec![Event::Start]);
         model
     }
 
     /// The model on the admin pages.
-    fn on_the_pages(agent: &FakeAgent) -> Model {
+    pub(crate) fn on_the_pages(agent: &FakeAgent) -> Model {
         let mut model = signed_in(agent);
         run(&mut model, agent, vec![Event::Admin(AdminEvent::Open)]);
         assert!(model.admin_screen().is_some(), "{:?}", model.screen);
         model
     }
 
-    fn admin(model: &Model) -> &AdminScreen {
+    pub(crate) fn admin(model: &Model) -> &AdminScreen {
         model.admin_screen().unwrap_or_else(|| panic!("not on the admin pages: {:?}", model.screen))
     }
 
-    fn admin_mut(model: &mut Model) -> &mut AdminScreen {
+    pub(crate) fn admin_mut(model: &mut Model) -> &mut AdminScreen {
         match &mut model.screen {
             Screen::Admin(admin) => admin,
             other => panic!("not on the admin pages: {other:?}"),
         }
     }
 
-    fn user_named(model: &Model, name: &str) -> AdminUserInfo {
+    pub(crate) fn user_named(model: &Model, name: &str) -> AdminUserInfo {
         admin(model).list.users.iter().find(|u| u.username == name).cloned().unwrap_or_else(|| panic!("no {name} in the list"))
     }
 
-    fn ev(event: AdminEvent) -> Vec<Event> {
+    pub(crate) fn ev(event: AdminEvent) -> Vec<Event> {
         vec![Event::Admin(event)]
     }
 
-    fn type_password(model: &mut Model, password: &str) {
+    pub(crate) fn type_password(model: &mut Model, password: &str) {
         admin_mut(model).dialog.as_mut().unwrap().confirmation.password = password.to_owned();
     }
 
-    fn refused(code: &str, message: &str) -> Error {
+    pub(crate) fn refused(code: &str, message: &str) -> Error {
         Error::Refused { code: code.into(), message: message.into() }
     }
 

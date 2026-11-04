@@ -72,9 +72,9 @@ pub use admin::UserQuery;
 pub use audit::{AuditQuery, ExportOutcome};
 pub use craft_cloud_api::DeviceId;
 pub use craft_cloud_api::api::{
-    AccountInfo, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser,
-    AdminUserInfo, AdminUserList, AuditEvent, AuditPage, DeviceInfo, PairingState, PairingStatus, RecoveryCodes, RevokedOthers, TwoFactorChallenge,
-    TwoFactorSetupResponse, TwoFactorStatus,
+    AUDIT_ACTIONS, AccountInfo, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo,
+    AdminUpdateUser, AdminUserInfo, AdminUserList, AuditEvent, AuditPage, DeviceInfo, PairingState, PairingStatus, RecoveryCodes, RevokedOthers,
+    TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus, valid_audit_action,
 };
 pub use craft_cloud_api::local::{
     JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RunState, SecondFactorLoginRequest, Status, TwoFactorProofRequest, codes,

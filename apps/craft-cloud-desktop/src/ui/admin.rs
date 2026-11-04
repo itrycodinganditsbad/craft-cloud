@@ -26,6 +26,7 @@ pub(super) fn show(ui: &mut egui::Ui, admin: &mut AdminScreen, now_ms: i64, even
     match &mut admin.view {
         View::List => users(ui, server.as_ref(), &mut admin.list, &me, events),
         View::Create(form) => create(ui, form, events),
+        View::Audit(view) => super::audit::log(ui, view, now_ms, events),
         View::User(view) => {
             let user = admin.list.users.iter().find(|u| u.id == view.id).cloned();
             account(ui, view, user.as_ref(), &me, now_ms, events);
@@ -92,6 +93,9 @@ fn users(ui: &mut egui::Ui, server: Option<&craft_cloud_app::AdminServerInfo>, l
         }
         if ui.add_enabled(!list.loading, egui::Button::new("Refresh")).clicked() {
             send(events, AdminEvent::Reload);
+        }
+        if ui.button("Audit log").on_hover_text("Sign-ins, changes and what admins did").clicked() {
+            events.push(Event::Audit(crate::audit::AuditMsg::OpenAudit(None)));
         }
     });
     ui.add_space(8.0);
@@ -203,6 +207,11 @@ fn account(ui: &mut egui::Ui, view: &mut UserView, user: Option<&AdminUserInfo>,
     ui.label(RichText::new(describe(user)).small().weak());
     ui.add_space(10.0);
     let is_me = user.username == me;
+
+    if ui.button("Activity of this account").on_hover_text("The audit log, for this account").clicked() {
+        events.push(Event::Audit(crate::audit::AuditMsg::OpenAudit(Some((user.id, user.username.clone())))));
+    }
+    ui.add_space(8.0);
 
     ui.label(RichText::new("Role and quota").strong());
     role_choice(ui, &mut view.role);

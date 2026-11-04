@@ -75,6 +75,9 @@ pub(super) fn show(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: 
         if ui.button("Security…").on_hover_text("Two-factor sign-in, your password, your other computers").clicked() {
             events.push(Event::OpenSecurity);
         }
+        if ui.button("Activity").on_hover_text("What happened to your account: sign-ins, password changes, computers signed out").clicked() {
+            events.push(Event::Audit(crate::audit::AuditMsg::OpenActivity));
+        }
         if matches!(o.access, Access::Admin { .. })
             && ui.button("Administration").on_hover_text("Accounts, invites, computers and the audit log").clicked()
         {

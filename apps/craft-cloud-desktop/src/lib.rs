@@ -15,6 +15,7 @@
 pub mod admin;
 pub mod agent;
 pub mod app;
+pub mod audit;
 pub mod autostart;
 pub mod model;
 pub mod security;

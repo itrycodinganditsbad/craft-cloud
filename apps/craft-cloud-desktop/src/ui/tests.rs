@@ -639,3 +639,154 @@ fn a_typed_code_is_not_left_in_eguis_undo_history() {
     undo(&mut h, 1);
     assert_eq!(typed(&h).1, "");
 }
+
+// ---- the audit log, the account's own activity and the second factor's confirmation ----
+
+use crate::audit::{AuditMsg, ExportState};
+use craft_cloud_proto::api::{AuditDetails, AuditEvent};
+
+/// Events as the server writes them, newest first, with the variety the page tells in words.
+fn audit_events() -> Vec<AuditEvent> {
+    let event = |n: u64, action: &str, outcome: &str, count: u64, details: AuditDetails| AuditEvent {
+        outcome: outcome.into(),
+        count,
+        details,
+        at_ms: NOW - (n as i64) * 3_600_000 - 5_000,
+        ..FakeAgent::sample_event(n, action)
+    };
+    vec![
+        event(
+            0,
+            "admin.role_changed",
+            "success",
+            1,
+            AuditDetails { role_from: Some("member".into()), role_to: Some("admin".into()), ..Default::default() },
+        ),
+        event(1, "auth.login_failed", "failure", 4, AuditDetails { step: Some("password".into()), ..Default::default() }),
+        event(
+            2,
+            "auth.login",
+            "success",
+            1,
+            AuditDetails { client_kind: Some("desktop".into()), platform: Some("windows".into()), ..Default::default() },
+        ),
+        event(3, "device.revoked_others", "success", 1, AuditDetails { revoked: Some(2), ..Default::default() }),
+        event(4, "admin.quota_changed", "success", 1, AuditDetails { quota_bytes: Some(Some(5_368_709_120)), ..Default::default() }),
+        event(5, "account.two_factor_enabled", "success", 1, AuditDetails::default()),
+    ]
+}
+
+fn audit_model(agent: &FakeAgent, more: Vec<Event>) -> Model {
+    *agent.audit_events.lock().unwrap() = audit_events();
+    let mut events = vec![Event::Devices(Ok(devices())), Event::Admin(AdminEvent::Open), Event::Audit(AuditMsg::OpenAudit(None))];
+    events.extend(more);
+    after(agent, events)
+}
+
+fn view_of(model: &Model) -> &crate::audit::AuditView {
+    match &model.admin_screen().unwrap().view {
+        View::Audit(view) => view,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn snapshot_audit_and_activity_pages() {
+    let agent = admin_agent();
+    let mut model = audit_model(&agent, Vec::new());
+    snapshot(model.clone(), egui::Theme::Light, "audit-log");
+    snapshot(model.clone(), egui::Theme::Dark, "audit-log-dark");
+
+    // Narrowed to one account, with an export that the server cut at its limit, and one that failed.
+    let ana = id_of(&model, "ana");
+    let mut narrowed = audit_model(&agent, vec![Event::Audit(AuditMsg::OpenAudit(Some((ana, "ana".into()))))]);
+    narrowed.update(Event::Audit(AuditMsg::Export));
+    narrowed.update(Event::Audit(AuditMsg::ExportPicked(Some("C:/Users/fabio/craft-cloud-audit.ndjson".into()))));
+    snapshot(narrowed.clone(), egui::Theme::Light, "audit-log-exporting");
+    narrowed.update(Event::Audit(AuditMsg::Exported(Ok(craft_cloud_app::ExportOutcome { events: 100_000, truncated: true }))));
+    assert!(matches!(view_of(&narrowed).export, ExportState::Done { .. }));
+    snapshot(narrowed.clone(), egui::Theme::Light, "audit-log-export-truncated");
+    narrowed.update(Event::Audit(AuditMsg::DismissExport));
+    narrowed.update(Event::Audit(AuditMsg::Export));
+    narrowed.update(Event::Audit(AuditMsg::ExportPicked(Some("out.ndjson".into()))));
+    narrowed.update(Event::Audit(AuditMsg::Exported(Err(craft_cloud_app::Error::Io("the export broke off: connection reset".into())))));
+    snapshot(narrowed, egui::Theme::Light, "audit-log-export-failed");
+
+    // The account's own activity, for a member too.
+    model.update(Event::Admin(AdminEvent::Close));
+    *agent.audit_events.lock().unwrap() = audit_events();
+    let member = FakeAgent::new(signed_in());
+    *member.audit_events.lock().unwrap() = audit_events();
+    let activity = after(&member, vec![Event::Devices(Ok(devices())), Event::Audit(AuditMsg::OpenActivity)]);
+    assert!(activity.activity_screen().is_some());
+    snapshot(activity, egui::Theme::Light, "activity");
+}
+
+/// An account with two-factor sign-in: its page says so and offers to turn it off; confirming asks for a code too.
+#[test]
+fn snapshot_two_factor_in_the_admin_pages() {
+    let agent = admin_agent();
+    agent.two_factor.store(true, std::sync::atomic::Ordering::SeqCst);
+    agent.users.lock().unwrap()[1].two_factor_enabled = true;
+    let ana = {
+        let model = on_admin_pages(&agent, Vec::new());
+        assert!(matches!(model.overview().unwrap().access, crate::admin::Access::Admin { two_factor: true }));
+        id_of(&model, "ana")
+    };
+    let mut model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(ana))]);
+    snapshot(model.clone(), egui::Theme::Light, "admin-account-two-factor");
+    model.update(Event::Admin(AdminEvent::Ask(Action::ResetTwoFactor { id: ana, username: "ana".into() })));
+    password_typed(&mut model, "not-my-password");
+    if let Screen::Admin(admin) = &mut model.screen {
+        admin.dialog.as_mut().unwrap().confirmation.code = "123456".into();
+    }
+    snapshot(model, egui::Theme::Light, "admin-confirm-two-factor");
+}
+
+/// The buttons of the audit and activity pages send what they stand for.
+#[test]
+fn audit_buttons_send_their_events() {
+    let agent = admin_agent();
+    let model = audit_model(&agent, Vec::new());
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_label("Refresh").click();
+    h.run_steps(2);
+    h.get_by_label("Export…").click();
+    h.run_steps(2);
+    h.get_by_label("Back to the accounts").click();
+    h.run_steps(2);
+    assert_eq!(
+        std::mem::take(&mut h.state_mut().1),
+        [Event::Audit(AuditMsg::Reload), Event::Audit(AuditMsg::Export), Event::Admin(AdminEvent::BackToList)]
+    );
+    // A page of the account list opens the log, and an account's page opens its own part of it.
+    let model = on_admin_pages(&agent, Vec::new());
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_label("Audit log").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Audit(AuditMsg::OpenAudit(None))]);
+    let ana = id_of(&h.state().0, "ana");
+    let model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(ana))]);
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_label("Activity of this account").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Audit(AuditMsg::OpenAudit(Some((ana, "ana".into()))))]);
+    // The signed-in view has an Activity button for everyone; the activity page goes back.
+    let member = FakeAgent::new(signed_in());
+    let model = after(&member, vec![Event::Devices(Ok(devices()))]);
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    assert_eq!(h.query_all_by_label("Administration").count(), 0);
+    h.get_by_label("Activity").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Audit(AuditMsg::OpenActivity)]);
+    let model = after(&member, vec![Event::Devices(Ok(devices())), Event::Audit(AuditMsg::OpenActivity)]);
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_label("Back").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Audit(AuditMsg::CloseActivity)]);
+}

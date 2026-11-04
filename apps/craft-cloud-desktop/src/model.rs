@@ -13,6 +13,7 @@ use craft_cloud_proto::api::codes as api_codes;
 use craft_cloud_proto::join::JoinString;
 
 use crate::admin::{Access, Action, AdminEvent, AdminScreen};
+use crate::audit::{ActivityScreen, AuditMsg};
 use crate::security::{SecondFactorForm, SecurityAnswer, SecurityCall, SecurityEvent, SecurityPage};
 
 /// A code that is wrong, expired or used (the server never says which).
@@ -60,8 +61,10 @@ pub enum Screen {
     Security(Box<SecurityPage>),
     /// Showing an add-a-computer code.
     AddingComputer(Adding),
-    /// The admin pages (an admin's only): the users, one user, a new account.
+    /// The admin pages (an admin's only): the users, one user, a new account, the audit log.
     Admin(Box<AdminScreen>),
+    /// The signed-in account's own activity: its security events ([`crate::audit`]).
+    Activity(Box<ActivityScreen>),
     /// The server refused this computer: it was removed from the account.
     Removed,
     /// Something the agent can't put right by itself (a damaged account file), or that this app can't work with.
@@ -288,6 +291,8 @@ pub enum Event {
     Exit,
     /// Something on the admin pages, or the answer to one of their calls ([`crate::admin`]).
     Admin(AdminEvent),
+    /// Something on the audit pages (the admin's log, or the account's own activity), or an answer to one of their calls.
+    Audit(AuditMsg),
 }
 
 /// What to do.
@@ -340,6 +345,21 @@ pub enum Effect {
     AdminDevices {
         user: Uuid,
         ticket: u64,
+    },
+    /// A page of the audit log or of the account's own activity ([`AuditMsg::Page`] with the same `ticket`).
+    AuditPage {
+        own: bool,
+        query: craft_cloud_app::AuditQuery,
+        ticket: u64,
+    },
+    /// The audit export, written to `path` ([`AuditMsg::Exported`]).
+    AuditExport {
+        query: craft_cloud_app::AuditQuery,
+        path: String,
+    },
+    /// Ask for the file an export goes to, with the OS's save dialog, starting at this name ([`AuditMsg::ExportPicked`]).
+    PickExportFile {
+        suggested: String,
     },
     /// A change, with the admin's confirmation ([`AdminEvent::Done`]). Its `Debug` output hides the password.
     AdminDo {
@@ -416,6 +436,7 @@ impl Model {
             Screen::Security(page) => Some(&page.overview),
             Screen::AddingComputer(adding) => Some(&adding.overview),
             Screen::Admin(admin) => Some(&admin.overview),
+            Screen::Activity(activity) => Some(&activity.overview),
             _ => None,
         }
     }
@@ -426,6 +447,7 @@ impl Model {
             Screen::Security(page) => Some(&mut page.overview),
             Screen::AddingComputer(adding) => Some(&mut adding.overview),
             Screen::Admin(admin) => Some(&mut admin.overview),
+            Screen::Activity(activity) => Some(&mut activity.overview),
             _ => None,
         }
     }
@@ -594,6 +616,7 @@ impl Model {
                 std::iter::once(Effect::Devices).chain(again).collect()
             }
             Event::Admin(event) => self.admin(event),
+            Event::Audit(msg) => self.audit(msg),
             Event::SignOut => self.sign_out(false),
             Event::SignOutHere => self.sign_out(true),
             Event::Pause | Event::Resume => {
@@ -704,6 +727,7 @@ impl Model {
                 Screen::Security(page) => page.overview.status = status,
                 Screen::AddingComputer(adding) => adding.overview.status = status,
                 Screen::Admin(admin) => admin.overview.status = status,
+                Screen::Activity(activity) => activity.overview.status = status,
                 // The join's own answer moves on from there.
                 Screen::Joining { .. } => {}
                 _ => {

@@ -5,6 +5,7 @@
 //! link wakes the UI (`wake`), so the UI thread never waits for the agent; a slow call (a join waits for the server)
 //! holds up nothing else. A clock thread sends [`Event::Tick`] every 2 s, from which the model asks for the status.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -12,11 +13,12 @@ use std::time::Duration;
 
 use craft_cloud_app::{
     AccountInfo, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser,
-    AdminUserInfo, AdminUserList, Client, DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingStatus, RecoveryCodes, RevokedOthers, Status,
-    TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, UserQuery, Uuid,
+    AdminUserInfo, AdminUserList, AuditPage, AuditQuery, Client, DeviceId, DeviceInfo, Error, ExportOutcome, JoinRequest, PairingInfo, PairingStatus,
+    RecoveryCodes, RevokedOthers, Status, TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, UserQuery, Uuid,
 };
 
 use crate::admin::{Action, AdminEvent, Outcome};
+use crate::audit::AuditMsg;
 use crate::model::{Effect, Event};
 use crate::security::{SecurityAnswer, SecurityCall};
 
@@ -49,6 +51,10 @@ pub trait Agent: Send + Sync {
     fn revoke_other_devices(&self) -> Result<RevokedOthers, Error>;
     // The admin calls: each asks the server, which decides every one.
     fn account(&self) -> Result<AccountInfo, Error>;
+    /// The account's own activity, and for an admin the whole audit log and its export (which is written to `out` as it comes).
+    fn account_activity(&self, query: &AuditQuery) -> Result<AuditPage, Error>;
+    fn admin_audit(&self, query: &AuditQuery) -> Result<AuditPage, Error>;
+    fn admin_audit_export(&self, query: &AuditQuery, out: &mut dyn Write) -> Result<ExportOutcome, Error>;
     fn admin_server(&self) -> Result<AdminServerInfo, Error>;
     fn admin_users(&self, query: &UserQuery) -> Result<AdminUserList, Error>;
     fn admin_devices(&self, user: Uuid) -> Result<AdminDevices, Error>;
@@ -166,6 +172,15 @@ impl Agent for ClientAgent {
     fn account(&self) -> Result<AccountInfo, Error> {
         self.with(Client::account)
     }
+    fn account_activity(&self, query: &AuditQuery) -> Result<AuditPage, Error> {
+        self.with(|c| c.account_activity(query))
+    }
+    fn admin_audit(&self, query: &AuditQuery) -> Result<AuditPage, Error> {
+        self.with(|c| c.admin_audit(query))
+    }
+    fn admin_audit_export(&self, query: &AuditQuery, out: &mut dyn Write) -> Result<ExportOutcome, Error> {
+        self.with(|c| c.admin_audit_export(query, out))
+    }
     fn admin_reset_two_factor(&self, id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
         self.with(|c| c.admin_reset_two_factor(id, confirm))
     }
@@ -271,7 +286,10 @@ impl Link {
 
 /// Whether `effect` is a call of the agent.
 fn is_call(effect: &Effect) -> bool {
-    !matches!(effect, Effect::OpenFolder(_) | Effect::QuitApp | Effect::QuitTray | Effect::AppAutostart(_) | Effect::PickFolder(_))
+    !matches!(
+        effect,
+        Effect::OpenFolder(_) | Effect::QuitApp | Effect::QuitTray | Effect::AppAutostart(_) | Effect::PickFolder(_) | Effect::PickExportFile { .. }
+    )
 }
 
 /// Makes the call `effect` names, blocking, and gives its answer as the event the model expects.
@@ -300,6 +318,11 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         Effect::AdminDevices { user, ticket } => {
             Event::Admin(AdminEvent::Devices { user, ticket, result: agent.admin_devices(user).map(|d| d.devices) })
         }
+        Effect::AuditPage { own, query, ticket } => {
+            let result = if own { agent.account_activity(&query) } else { agent.admin_audit(&query) };
+            Event::Audit(AuditMsg::Page { own, ticket, result })
+        }
+        Effect::AuditExport { query, path } => Event::Audit(AuditMsg::Exported(export_to_file(agent, &query, &path))),
         Effect::AdminDo { action, confirm } => Event::Admin(AdminEvent::Done(change(agent, &action, confirm))),
         // Not running is as good as stopped.
         Effect::QuitAgent => {
@@ -315,8 +338,43 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
             SecurityCall::ChangePassword { current, new } => SecurityAnswer::ChangePassword(agent.change_password(&current, &new)),
             SecurityCall::SignOutOthers => SecurityAnswer::SignOutOthers(agent.revoke_other_devices()),
         }),
-        Effect::OpenFolder(_) | Effect::QuitApp | Effect::QuitTray | Effect::AppAutostart(_) | Effect::PickFolder(_) => return None,
+        Effect::OpenFolder(_)
+        | Effect::QuitApp
+        | Effect::QuitTray
+        | Effect::AppAutostart(_)
+        | Effect::PickFolder(_)
+        | Effect::PickExportFile { .. } => return None,
     })
+}
+
+/// Writes the audit export to `path`: first to `<path>.part`, which is moved into place only when the stream ended properly (the
+/// server's last line, the right count) and the file was written to the end. Anything else removes the part file and leaves what
+/// was at `path` as it was, so a broken export is never mistaken for a whole one. A stream the server cut at its limit is a good
+/// file, and says so in the outcome.
+fn export_to_file(agent: &dyn Agent, query: &AuditQuery, path: &str) -> Result<ExportOutcome, Error> {
+    let part = format!("{path}.part");
+    let io = |what: &str, e: std::io::Error| Error::Io(format!("{what}: {e}"));
+    let file = std::fs::File::create(&part).map_err(|e| io("can't write the export file", e))?;
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+    let result = agent.admin_audit_export(query, &mut writer);
+    let finished = writer.flush().and_then(|()| writer.get_ref().sync_all());
+    drop(writer);
+    let outcome = match (result, finished) {
+        (Ok(outcome), Ok(())) => outcome,
+        (Ok(_), Err(e)) => {
+            let _ = std::fs::remove_file(&part);
+            return Err(io("can't write the export file", e));
+        }
+        (Err(e), _) => {
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+    };
+    if let Err(e) = std::fs::rename(&part, path) {
+        let _ = std::fs::remove_file(&part);
+        return Err(io("can't save the export file", e));
+    }
+    Ok(outcome)
 }
 
 /// Makes the change `action` names with the admin's `confirm`ation, blocking. This is the one place where the
@@ -391,6 +449,12 @@ pub(crate) mod fake {
         pub two_factor: AtomicBool,
         /// The `reset_two_factor` flag of each password reset code asked for.
         pub resets: Mutex<Vec<bool>>,
+        /// The audit events the audit calls and the activity list (newest first, as given), and what was asked.
+        pub audit_events: Mutex<Vec<craft_cloud_proto::api::AuditEvent>>,
+        pub audit_queries: Mutex<Vec<AuditQuery>>,
+        /// An export that the server cuts at its limit; and failures an export answers instead of succeeding.
+        pub export_truncated: Mutex<bool>,
+        pub export_fails: Mutex<Vec<Error>>,
     }
 
     fn refused(code: &str, message: &str) -> Error {
@@ -412,6 +476,10 @@ pub(crate) mod fake {
                 factors: Mutex::new(Vec::new()),
                 two_factor: AtomicBool::new(false),
                 resets: Mutex::new(Vec::new()),
+                audit_events: Mutex::new(Vec::new()),
+                audit_queries: Mutex::new(Vec::new()),
+                export_truncated: Mutex::new(false),
+                export_fails: Mutex::new(Vec::new()),
             }
         }
 
@@ -468,6 +536,45 @@ pub(crate) mod fake {
                 return Err(e);
             }
             Ok(ok())
+        }
+
+        /// An event of the audit log, `n` seconds after the epoch.
+        pub fn sample_event(n: u64, action: &str) -> craft_cloud_proto::api::AuditEvent {
+            craft_cloud_proto::api::AuditEvent {
+                id: Uuid::from_u128(u128::from(n) + 1),
+                at_ms: 1_790_000_000_000 - i64::try_from(n).unwrap_or(0) * 1_000,
+                actor_user: None,
+                actor_device: None,
+                action: action.to_owned(),
+                target_kind: String::new(),
+                target_id: None,
+                outcome: "success".into(),
+                details: Default::default(),
+                count: 1,
+            }
+        }
+
+        /// The events a query lets through, from the cursor (an index) on: one page, and the cursor of the next.
+        fn audit_page(&self, query: &AuditQuery) -> AuditPage {
+            self.audit_queries.lock().unwrap().push(query.clone());
+            let all: Vec<_> = self
+                .audit_events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| match query.action.as_deref() {
+                    Some(a) if a.ends_with('.') => e.action.starts_with(a),
+                    Some(a) => e.action == a,
+                    None => true,
+                })
+                .filter(|e| query.user.is_none_or(|u| e.actor_user == Some(u) || e.target_id == Some(u)))
+                .cloned()
+                .collect();
+            let from = query.cursor.as_deref().and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+            let limit = query.limit.unwrap_or(50) as usize;
+            let events: Vec<_> = all.iter().skip(from).take(limit).cloned().collect();
+            let next = (from + limit < all.len()).then(|| (from + limit).to_string());
+            AuditPage { events, next }
         }
 
         fn user(&self, id: Uuid) -> AdminUserInfo {
@@ -611,6 +718,27 @@ pub(crate) mod fake {
                 password_changed_ms: None,
                 two_factor_enabled: self.two_factor.load(Ordering::SeqCst),
             })
+        }
+        fn account_activity(&self, query: &AuditQuery) -> Result<AuditPage, Error> {
+            self.answer("account_activity", |_| ())?;
+            Ok(self.audit_page(&AuditQuery { user: None, action: None, ..query.clone() }))
+        }
+        fn admin_audit(&self, query: &AuditQuery) -> Result<AuditPage, Error> {
+            self.admin_call("admin_audit", || self.audit_page(query))
+        }
+        fn admin_audit_export(&self, query: &AuditQuery, out: &mut dyn Write) -> Result<ExportOutcome, Error> {
+            self.admin_call("admin_audit_export", || ())?;
+            if let Some(e) = self.export_fails.lock().unwrap().pop() {
+                // Some lines came before the stream broke.
+                let _ = out.write_all(b"{\"partial\":true}\n");
+                return Err(e);
+            }
+            let page = self.audit_page(&AuditQuery { cursor: None, limit: Some(u32::MAX), ..query.clone() });
+            for event in &page.events {
+                let _ = out.write_all(format!("{{\"id\":\"{}\",\"action\":\"{}\"}}", event.id, event.action).as_bytes());
+                let _ = out.write_all(b"\n");
+            }
+            Ok(ExportOutcome { events: page.events.len() as u64, truncated: *self.export_truncated.lock().unwrap() })
         }
         fn admin_reset_two_factor(&self, _id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
             self.admin_change("admin_reset_two_factor", confirm.password.clone(), (confirm.totp_code.clone(), confirm.recovery_code.clone()), || ())
