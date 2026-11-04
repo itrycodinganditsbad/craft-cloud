@@ -64,10 +64,12 @@ use craft_cloud_api::api::ErrorAnswer;
 use craft_cloud_api::local::{AutostartRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_MIN, LocalApiFile, LogoutRequest, paths};
 
 pub use craft_cloud_api::DeviceId;
+pub use craft_cloud_api::NodeId;
 pub use craft_cloud_api::VersionId;
 pub use craft_cloud_api::api::{DeviceInfo, PairingState, PairingStatus};
 pub use craft_cloud_api::local::{
-    HistoryResponse, HistoryVersion, JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RestoreResponse, RunState, Status, codes,
+    HistoryResponse, HistoryVersion, JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RestoreResponse, RunState, Status, TrashItem,
+    TrashNodeRequest, TrashResponse, TrashRestoreResponse, codes,
 };
 pub use recents::{RecentsEvent, RecentsWatch};
 pub use uuid::Uuid;
@@ -81,9 +83,10 @@ pub enum Error {
     /// The agent speaks another local API version: one of the two needs an update.
     #[error("the Craft Cloud agent speaks local API version {0}, this app {LOCAL_API_MIN}-{LOCAL_API_MAX}: update the older one")]
     Version(u32),
-    /// The agent refused the request: `code` is one of [`codes`] (or the HTTP API's), `message` is for people.
+    /// The agent refused the request: `code` is one of [`codes`] (or the HTTP API's), `message` is for people, and
+    /// `name_taken` identifies this cause in a trash-restore conflict when the server provides it.
     #[error("{message}")]
-    Refused { code: String, message: String },
+    Refused { code: String, message: String, name_taken: Option<bool> },
     /// The connection broke, or the agent didn't answer in time.
     #[error("the connection to the Craft Cloud agent broke: {0}")]
     Io(String),
@@ -252,6 +255,31 @@ impl Client {
         self.call("POST", paths::FILE_RESTORE, Some(body), http::SLOW_TIMEOUT)
     }
 
+    /// The server's newest-first trash page. `cursor` is the opaque `next` value from the preceding page.
+    pub fn trash(&self, cursor: Option<&str>, limit: Option<u32>) -> Result<TrashResponse, Error> {
+        let mut query = Vec::new();
+        if let Some(cursor) = cursor {
+            query.push(format!("cursor={}", query_component(cursor)));
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        let path = if query.is_empty() { paths::TRASH.to_owned() } else { format!("{}?{}", paths::TRASH, query.join("&")) };
+        self.call("GET", &path, None, http::SLOW_TIMEOUT)
+    }
+
+    /// Restores a node from the server's trash. Call off the UI thread.
+    pub fn restore_from_trash(&self, id: NodeId) -> Result<TrashRestoreResponse, Error> {
+        let body = serde_json::to_vec(&TrashNodeRequest { id: id.to_string() }).map_err(|e| Error::Protocol(e.to_string()))?;
+        self.call("POST", paths::TRASH_RESTORE, Some(body), http::SLOW_TIMEOUT)
+    }
+
+    /// Marks a node as removed from the server's trash. This does not free its stored data yet.
+    pub fn remove_from_trash(&self, id: NodeId) -> Result<(), Error> {
+        let body = serde_json::to_vec(&TrashNodeRequest { id: id.to_string() }).map_err(|e| Error::Protocol(e.to_string()))?;
+        self.answer("POST", paths::TRASH_REMOVE, Some(body), http::SLOW_TIMEOUT).map(|_| ())
+    }
+
     /// Pauses syncing until [`Client::resume`], also across restarts; recents keep working. Answered by the agent
     /// itself (a few seconds at most): fine from a UI thread.
     pub fn pause(&self) -> Result<Status, Error> {
@@ -325,7 +353,7 @@ fn refusal(answer: http::Answer) -> Result<http::Answer, Error> {
         Ok(answer)
     } else {
         match serde_json::from_slice::<ErrorAnswer>(&answer.body) {
-            Ok(body) => Err(Error::Refused { code: body.error, message: body.message }),
+            Ok(body) => Err(Error::Refused { code: body.error, message: body.message, name_taken: body.name_taken }),
             Err(_) => Err(Error::Protocol(format!("HTTP {}", answer.status))),
         }
     }
@@ -416,7 +444,7 @@ mod tests {
         let info = PairingInfo { id, join: "c.example/K7M4-Q9TX".into(), link: "https://c.example/join/K7M4-Q9TX".into(), expires_ms: 9 };
         let used = PairingStatus { state: PairingState::Used, device_name: Some("lptp1".into()) };
         let list = vec![DeviceInfo { id: device, name: "lptp1".into(), created_ms: 1, last_used_ms: 2, revoked: false, current: false }];
-        let refused = json(&ErrorAnswer { error: "password_required".into(), message: "choose a password".into() });
+        let refused = json(&ErrorAnswer { error: "password_required".into(), message: "choose a password".into(), name_taken: None });
         let script = vec![
             (400, refused),
             (200, json(&status(true))),
@@ -497,6 +525,58 @@ mod tests {
                 expected_version: expected,
             }
         );
+    }
+
+    #[test]
+    fn trash_calls_use_paging_and_typed_node_ids() {
+        let id = NodeId::generate();
+        let restored = TrashRestoreResponse {
+            node: id,
+            parent: NodeId::generate(),
+            name: "restored.txt".into(),
+            renamed: true,
+            version: Some(VersionId::generate()),
+            seq: 4,
+            epoch: craft_cloud_api::Epoch::generate(),
+        };
+        let item = craft_cloud_api::local::TrashItem {
+            id,
+            parent: restored.parent,
+            name: "gone.txt".into(),
+            is_dir: false,
+            size: Some(3),
+            deleted_ms: 10,
+            purge_after_ms: 20,
+            path: Some("folder/gone.txt".into()),
+        };
+        let (_dir, agent, asked) = fake_agent(vec![
+            (200, json(&TrashResponse { items: vec![item], next: Some("cursor value".into()) })),
+            (200, json(&restored)),
+            (204, String::new()),
+        ]);
+        assert_eq!(agent.trash(None, Some(25)).unwrap().next.as_deref(), Some("cursor value"));
+        let (method, path, body) = asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((method.as_str(), path.as_str()), ("GET", "/v1/trash?limit=25"));
+        assert!(body.is_empty());
+
+        assert_eq!(agent.restore_from_trash(id).unwrap(), restored);
+        let (method, path, body) = asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((method.as_str(), path.as_str()), ("POST", paths::TRASH_RESTORE));
+        assert_eq!(serde_json::from_str::<TrashNodeRequest>(&body).unwrap(), TrashNodeRequest { id: id.to_string() });
+
+        agent.remove_from_trash(id).unwrap();
+        let (method, path, body) = asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((method.as_str(), path.as_str()), ("POST", paths::TRASH_REMOVE));
+        assert_eq!(serde_json::from_str::<TrashNodeRequest>(&body).unwrap(), TrashNodeRequest { id: id.to_string() });
+    }
+
+    #[test]
+    fn trash_restore_keeps_the_server_name_taken_detail() {
+        let id = NodeId::generate();
+        let refused = json(&ErrorAnswer { error: "conflict".into(), message: "no free conflict name".into(), name_taken: Some(true) });
+        let (_dir, agent, _asked) = fake_agent(vec![(409, refused)]);
+        let result = agent.restore_from_trash(id);
+        assert!(matches!(result, Err(Error::Refused { ref code, name_taken: Some(true), .. }) if code == "conflict"), "{result:?}");
     }
 
     /// An agent that takes the connection but never answers (hung, or something else on its port) costs a
