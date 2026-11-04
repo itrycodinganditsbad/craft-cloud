@@ -52,6 +52,10 @@ impl Backend for CountingBackend {
     async fn delete_raw(&self, path: &str) -> Result<(), StoreError> {
         self.inner.delete_raw(path).await
     }
+
+    async fn list_raw(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<String>, StoreError> {
+        self.inner.list_raw(prefix, after, limit).await
+    }
 }
 
 async fn server() -> Server {
