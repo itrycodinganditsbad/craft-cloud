@@ -6,9 +6,9 @@
 //! - **A sealed secret** is one byte naming the key (see below), a 12-byte random nonce and the AES-256-GCM ciphertext
 //!   with its tag. The associated data is `craft-cloud:totp:v1:` and the 16 bytes of the account's ID, so a ciphertext
 //!   copied to another account does not open.
-//! - **The key's name** is the first byte of the BLAKE3 hash of the key file's bytes. It is a function of the key, so a
-//!   name is never given to a second key (two keys that share one are refused when the server starts, and the
-//!   authentication tag makes a wrong guess fail anyway). With a second, older key (`key_file_old`) configured, the
+//! - **The key's name** is the first byte of the BLAKE3 hash of the key file's bytes: one of 256 values, only there to tell
+//!   the current key from the older one, so two keys that share one are refused when the server starts. It does not
+//!   identify a key, and the authentication tag refuses a wrong key whatever the name says. With a second, older key (`key_file_old`) configured, the
 //!   name picks the key to open a secret with; sealing always uses the current key. The `two-factor rekey` command
 //!   rewrites the secrets under the current key, after which the old key can go.
 //! - **Errors say nothing about their input**: not the key, not the plaintext, not the ciphertext.

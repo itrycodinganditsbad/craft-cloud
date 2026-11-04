@@ -3159,12 +3159,17 @@ async fn wrong_second_factors_at_join_count_against_the_address_and_the_account(
         let (status, body) = error(join_with(wrong_code(&right)).await).await;
         assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "two_factor_invalid"), "wrong code {n}");
     }
-    // They were counted against the address: it is held off now, even for the right code (a code that was given back
-    // would be answered `two_factor_locked` instead, as the account is locked, see below).
-    let res = join_with(right.clone()).await;
+    // They were counted against the address (none was given back): a code that maps to no account is held off with the
+    // limiter's answer, which says no time.
+    let bogus = Code::generate(PAIRING_CHARS).unwrap();
+    let res = call(s, None, reqwest::Method::POST, "/join", Some(json!({ "code": bogus.as_str(), "device_name": "pc" }))).await;
     assert_eq!(retry_after(&res).await, None);
     let (status, body) = error(res).await;
     assert_eq!((status, body.error.as_str()), (StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+    // The real invite of the locked account: the lock wins over the limiter, with the time left, as at sign-in.
+    let res = join_with(right.clone()).await;
+    assert_eq!((res.status(), retry_after(&res).await.as_deref()), (StatusCode::TOO_MANY_REQUESTS, Some("900")));
+    assert_eq!(error(res).await.1.error, "two_factor_locked");
     // And against the account: the lock holds on the route that takes the password and a code, with the time left.
     let res = post_json(s, &ana.token, "/account/two-factor/disable", json!({ "password": PASSWORD, "totp_code": right })).await;
     assert_eq!((res.status(), retry_after(&res).await.as_deref()), (StatusCode::TOO_MANY_REQUESTS, Some("900")));

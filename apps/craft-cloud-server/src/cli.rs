@@ -132,7 +132,9 @@ pub enum TwoFactorAction {
     /// Rewrite every two-factor secret that is sealed with the older key (`key_file_old`) under the current one
     /// (`key_file`). To rotate the key: put the new key in `key_file` and the old one in `key_file_old`, run this, then
     /// remove `key_file_old`. It can be run again, changes nothing when it is done, and refuses (changing nothing) when a
-    /// secret is sealed with a key that is neither. Prints counts, never a secret or a key.
+    /// secret is sealed with a key that is neither. Prints counts, never a secret or a key. Restart every server instance on
+    /// the database with the new `key_file` and `key_file_old` first (a running server holds the keys it started with), and
+    /// remove `key_file_old` only after this reports that every secret is under the current key.
     Rekey,
 }
 
@@ -349,10 +351,15 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                     "there is no key: set [two_factor] key_file (and key_file_old for the key to rotate away from) in the config".into(),
                 ));
             };
-            let done = crate::two_factor::rekey(&meta, &secret_box, now_ms()).await.map_err(CliError::Usage)?;
+            let done = crate::two_factor::rekey(&meta, &secret_box).await.map_err(CliError::Usage)?;
             writeln!(out, "rewrote {} secret(s) under the current key; {} were under it already", done.rewritten, done.already_current)?;
             if secret_box.old_id().is_some() {
-                writeln!(out, "key_file_old can be removed from the config now")?;
+                writeln!(
+                    out,
+                    "every secret is under the current key now. key_file_old can be removed once every server instance on this database has been \
+                     restarted with key_file (the new key) and key_file_old, as it must have been before this command: an instance still running with \
+                     only the old key would seal new secrets with it"
+                )?;
             }
             Ok(())
         }

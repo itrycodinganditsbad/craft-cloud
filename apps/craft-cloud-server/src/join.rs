@@ -99,7 +99,7 @@ pub async fn join(
     // Counted before the redeem, so tries made at the same moment are held to the limit too; given back unless the
     // code didn't work.
     let Some(counted) = state.joins.count(&key, JOINS_PER_IP, now) else {
-        return Err(ApiError::rate_limited("too many tries with codes that don't work; wait a minute", None));
+        return Err(locked_or(&state, &req, ApiError::rate_limited("too many tries with codes that don't work; wait a minute", None)).await);
     };
     // A second factor is also counted against the address's second-factor limiter: wrong ones stay counted.
     let second = match proof {
@@ -107,7 +107,7 @@ pub async fn join(
             Some(counted) => Some(counted),
             None => {
                 state.joins.refund(&key, counted);
-                return Err(ApiError::rate_limited("too many wrong codes from this address; wait a few minutes", None));
+                return Err(locked_or(&state, &req, ApiError::rate_limited("too many wrong codes from this address; wait a few minutes", None)).await);
             }
         },
         None => None,
@@ -123,6 +123,17 @@ pub async fn join(
         state.second_factors.refund(&key, second);
     }
     result.map(Json)
+}
+
+/// The answer for a join the limiters refuse: when the code is a real invite or reset code of an account whose second factor
+/// is locked, the lock wins (`429 two_factor_locked` with `Retry-After`), as it does at sign-in, so that ten wrong codes don't
+/// turn into a "too many tries" that says nothing of how long. A code that maps to no account gets the limiter's answer.
+async fn locked_or(state: &AppState, req: &JoinRequest, limited: ApiError) -> ApiError {
+    let Some(code) = Code::parse_any(&req.code) else { return limited };
+    match state.meta.join_code_locked_for(&code.hash(), state.now_ms()).await {
+        Ok(Some(locked_ms)) => ApiError::two_factor_locked(craft_cloud_meta::retry_after_secs(locked_ms)),
+        _ => limited,
+    }
 }
 
 async fn redeem(state: &AppState, req: &JoinRequest, client: &DeviceClient, proof: Option<ProofInput>) -> Result<LoginResponse, ApiError> {

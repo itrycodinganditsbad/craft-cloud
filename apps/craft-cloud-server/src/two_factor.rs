@@ -470,46 +470,78 @@ pub struct Rekeyed {
     pub already_current: usize,
 }
 
-/// Rewrites every secret (the active ones and the open set-ups') that is sealed with the older key under the current one,
-/// one account at a time, each in its own transaction, so it can be run again after an interruption. It refuses, before
-/// changing anything, when a secret is sealed with a key that is neither (a key that was lost) or can't be opened. Neither
-/// the secrets nor the keys are printed. After it, `key_file_old` can be removed.
-pub async fn rekey(meta: &Meta, secret_box: &SecretBox, now_ms: i64) -> Result<Rekeyed, String> {
-    let mut work = Vec::new();
+/// Rewrites every secret (the active ones and the set-ups', expired ones too) that is sealed with the older key under the
+/// current one, one account at a time, each in a transaction that reads the account's ciphertexts fresh under its lock and
+/// rewrites both, so a confirmation that races it can't leave one behind. It refuses, before changing anything, when a secret
+/// is sealed with a key that is neither (a key that was lost) or can't be opened. It then scans again and goes round again
+/// (at most five times) until no ciphertext is under any key but the current one, and fails if some still is: only a
+/// successful return means `key_file_old` can be removed **and** that no server still running holds only the old key, which
+/// is the operator's to see to (every instance must run with both keys before this, see `docs/server.md`). Neither the
+/// secrets nor the keys are printed. It can be run again.
+pub async fn rekey(meta: &Meta, secret_box: &SecretBox) -> Result<Rekeyed, String> {
+    let neither = || {
+        "some secrets are sealed with a key that is neither key_file nor key_file_old: nothing was changed; put that key in key_file_old first"
+            .to_owned()
+    };
     let mut already_current = 0usize;
-    for row in meta.two_factor_secrets(now_ms).await.map_err(|e| e.to_string())? {
-        for (pending, sealed) in [(false, row.active), (true, row.pending)] {
-            let Some(sealed) = sealed else { continue };
+    for row in meta.two_factor_all_secrets().await.map_err(|e| e.to_string())? {
+        for sealed in [row.active, row.pending].into_iter().flatten() {
             let id = SecretBox::key_id(&sealed);
             if id == Some(secret_box.current_id()) {
                 // Under the current key: it must open, or the rest of the work would hide a lost key.
                 secret_box.open(row.user, &sealed).map_err(|_| "a secret that carries the current key's name does not open with it".to_owned())?;
                 already_current += 1;
             } else if id.is_some() && id == secret_box.old_id() {
-                work.push((row.user, pending, sealed));
+                secret_box.open(row.user, &sealed).map_err(|_| "a secret does not open with key_file_old: nothing was changed".to_owned())?;
             } else {
-                return Err(
-                    "some secrets are sealed with a key that is neither key_file nor key_file_old: nothing was changed; put that key in key_file_old first"
-                        .to_owned(),
-                );
+                return Err(neither());
             }
         }
     }
-    // Everything that will be rewritten opens: checked before the first write.
-    let mut plain = Vec::with_capacity(work.len());
-    for (user, pending, sealed) in &work {
-        let secret = secret_box.open(*user, sealed).map_err(|_| "a secret does not open with key_file_old: nothing was changed".to_owned())?;
-        plain.push((*user, *pending, sealed.clone(), secret));
-    }
+    let current = secret_box.current_id();
+    let rewrite = |user: UserId, sealed: &[u8]| -> Result<Option<Vec<u8>>, UnreadableSecret> {
+        if SecretBox::key_id(sealed) == Some(current) {
+            return Ok(None);
+        }
+        let secret = secret_box.open(user, sealed).map_err(|_| UnreadableSecret)?;
+        secret_box.seal(user, &secret).map(Some).map_err(|_| UnreadableSecret)
+    };
     let mut rewritten = 0usize;
-    for (user, pending, old, secret) in plain {
-        let new = secret_box.seal(user, &secret).map_err(|e| e.to_string())?;
-        // A secret changed meanwhile (a set-up that ended, a reset) is left as it is.
-        if meta.two_factor_replace_ciphertext(user, pending, &old, &new).await.map_err(|e| e.to_string())? {
-            rewritten += 1;
+    for _round in 0..5 {
+        let behind: Vec<UserId> = meta
+            .two_factor_all_secrets()
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|row| [&row.active, &row.pending].into_iter().flatten().any(|sealed| SecretBox::key_id(sealed) != Some(current)))
+            .map(|row| row.user)
+            .collect();
+        if behind.is_empty() {
+            return Ok(Rekeyed { rewritten, already_current });
+        }
+        for user in behind {
+            let (done, _) = meta.two_factor_rewrite(user, &rewrite).await.map_err(|e| e.to_string())?;
+            rewritten += done;
         }
     }
-    Ok(Rekeyed { rewritten, already_current })
+    // One last look: a secret still under another key means the migration is not complete.
+    let left = meta
+        .two_factor_all_secrets()
+        .await
+        .map_err(|e| e.to_string())?
+        .iter()
+        .flat_map(|row| [&row.active, &row.pending])
+        .flatten()
+        .filter(|sealed| SecretBox::key_id(sealed) != Some(current))
+        .count();
+    if left == 0 {
+        Ok(Rekeyed { rewritten, already_current })
+    } else {
+        Err(format!(
+            "{left} secret(s) are still sealed with another key after rewriting: a server may still be sealing new ones with the old key. \
+             Restart every instance with key_file and key_file_old, and run this again; do not remove key_file_old yet"
+        ))
+    }
 }
 
 #[cfg(test)]
