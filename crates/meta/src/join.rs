@@ -204,22 +204,6 @@ impl Meta {
         w.commit().await
     }
 
-    /// How many milliseconds after `now_ms` the second factor of the account an unexpired invite or reset code under
-    /// `code_hash` is for stays locked (`None`: no such code, the account has no two-factor sign-in, or it is not locked). A
-    /// plain read, so the join route can say "locked" with the time instead of "too many tries" to someone who holds a code.
-    pub async fn join_code_locked_for(&self, code_hash: &[u8; 32], now_ms: i64) -> Result<Option<i64>, MetaError> {
-        let row = sqlx::query(
-            "SELECT t.locked_until_ms FROM invites i JOIN user_two_factor t ON t.user_id = i.user_id \
-             WHERE i.code_hash = $1 AND i.expires_ms > $2 AND t.enabled_ms IS NOT NULL",
-        )
-        .bind(code_hash.to_vec())
-        .bind(now_ms)
-        .fetch_optional(&self.pool)
-        .await?;
-        let until: Option<i64> = row.map(|row| row.try_get("locked_until_ms")).transpose()?.flatten();
-        Ok(until.filter(|until| *until > now_ms).map(|until| until - now_ms))
-    }
-
     /// Whether the invite under `code_hash` needs a new password (its account has none, or it is a reset code, which
     /// always does): `None` when no unexpired invite has that hash (it may be a pairing's, or wrong). Lets the server
     /// answer `password_required` before it spends time hashing a password.

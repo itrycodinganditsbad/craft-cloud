@@ -3159,17 +3159,25 @@ async fn wrong_second_factors_at_join_count_against_the_address_and_the_account(
         let (status, body) = error(join_with(wrong_code(&right)).await).await;
         assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "two_factor_invalid"), "wrong code {n}");
     }
-    // They were counted against the address (none was given back): a code that maps to no account is held off with the
-    // limiter's answer, which says no time.
+    // They were counted against the address (none was given back): the limiter refuses now, and says the same to everyone, a
+    // made-up code, the real invite of the locked account and the right code alike, with the time until its window ends.
     let bogus = Code::generate(PAIRING_CHARS).unwrap();
-    let res = call(s, None, reqwest::Method::POST, "/join", Some(json!({ "code": bogus.as_str(), "device_name": "pc" }))).await;
-    assert_eq!(retry_after(&res).await, None);
-    let (status, body) = error(res).await;
-    assert_eq!((status, body.error.as_str()), (StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
-    // The real invite of the locked account: the lock wins over the limiter, with the time left, as at sign-in.
-    let res = join_with(right.clone()).await;
-    assert_eq!((res.status(), retry_after(&res).await.as_deref()), (StatusCode::TOO_MANY_REQUESTS, Some("900")));
-    assert_eq!(error(res).await.1.error, "two_factor_locked");
+    let refusals = [
+        call(s, None, reqwest::Method::POST, "/join", Some(json!({ "code": bogus.as_str(), "device_name": "pc" }))).await,
+        join_with(right.clone()).await,
+        join_with(wrong_code(&right)).await,
+    ];
+    let mut seen = Vec::new();
+    for res in refusals {
+        let wait: u32 = retry_after(&res).await.expect("Retry-After").parse().unwrap();
+        let (status, body) = error(res).await;
+        seen.push((status, body.error, body.message, body.two_factor.is_none(), wait));
+    }
+    assert_eq!((seen[0].0, seen[0].1.as_str()), (StatusCode::TOO_MANY_REQUESTS, "rate_limited"), "{seen:?}");
+    for other in &seen[1..] {
+        assert_eq!((&other.0, &other.1, &other.2, other.3), (&seen[0].0, &seen[0].1, &seen[0].2, seen[0].3), "identical answers: {seen:?}");
+        assert!(other.4.abs_diff(seen[0].4) <= 1 && (1..=61).contains(&other.4), "the same window: {seen:?}");
+    }
     // And against the account: the lock holds on the route that takes the password and a code, with the time left.
     let res = post_json(s, &ana.token, "/account/two-factor/disable", json!({ "password": PASSWORD, "totp_code": right })).await;
     assert_eq!((res.status(), retry_after(&res).await.as_deref()), (StatusCode::TOO_MANY_REQUESTS, Some("900")));

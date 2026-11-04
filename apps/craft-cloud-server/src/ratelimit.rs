@@ -64,6 +64,13 @@ impl Limiter {
         Some(Counted(entry.0))
     }
 
+    /// How long until `key`'s current window ends (when its count starts again from nothing): what a refused caller is
+    /// told in `Retry-After`. A key that has no window running is `Duration::ZERO`.
+    pub fn retry_after(&self, key: &str, now: Instant) -> Duration {
+        let windows = self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        windows.entries.get(key).map_or(Duration::ZERO, |(start, _)| (*start + self.period).saturating_duration_since(now))
+    }
+
     /// Gives back one attempt [`Limiter::count`] counted for `key`, if the window it was counted in is still the
     /// current one: for a caller that counts only failures, but must count every attempt up front so that attempts
     /// made at the same moment are held to the limit too. A later window (one that started while the attempt ran)

@@ -99,7 +99,7 @@ pub async fn join(
     // Counted before the redeem, so tries made at the same moment are held to the limit too; given back unless the
     // code didn't work.
     let Some(counted) = state.joins.count(&key, JOINS_PER_IP, now) else {
-        return Err(locked_or(&state, &req, ApiError::rate_limited("too many tries with codes that don't work; wait a minute", None)).await);
+        return Err(limited("too many tries with codes that don't work; wait a minute", state.joins.retry_after(&key, now)));
     };
     // A second factor is also counted against the address's second-factor limiter: wrong ones stay counted.
     let second = match proof {
@@ -107,7 +107,7 @@ pub async fn join(
             Some(counted) => Some(counted),
             None => {
                 state.joins.refund(&key, counted);
-                return Err(locked_or(&state, &req, ApiError::rate_limited("too many wrong codes from this address; wait a few minutes", None)).await);
+                return Err(limited("too many wrong codes from this address; wait a few minutes", state.second_factors.retry_after(&key, now)));
             }
         },
         None => None,
@@ -125,15 +125,12 @@ pub async fn join(
     result.map(Json)
 }
 
-/// The answer for a join the limiters refuse: when the code is a real invite or reset code of an account whose second factor
-/// is locked, the lock wins (`429 two_factor_locked` with `Retry-After`), as it does at sign-in, so that ten wrong codes don't
-/// turn into a "too many tries" that says nothing of how long. A code that maps to no account gets the limiter's answer.
-async fn locked_or(state: &AppState, req: &JoinRequest, limited: ApiError) -> ApiError {
-    let Some(code) = Code::parse_any(&req.code) else { return limited };
-    match state.meta.join_code_locked_for(&code.hash(), state.now_ms()).await {
-        Ok(Some(locked_ms)) => ApiError::two_factor_locked(craft_cloud_meta::retry_after_secs(locked_ms)),
-        _ => limited,
-    }
+/// The answer for a join a limiter refuses: the same for every code (a real invite, a locked account's, a made-up one), with the
+/// time until the limiter's window ends in `Retry-After`, so that the refusal tells a guesser nothing about codes or locks.
+/// A lock is only told to a request the limiters let through (and counted), as at sign-in.
+fn limited(message: &'static str, window: std::time::Duration) -> ApiError {
+    let secs = u32::try_from(window.as_secs().saturating_add(1)).unwrap_or(u32::MAX).max(1);
+    ApiError::rate_limited(message, Some(secs))
 }
 
 async fn redeem(state: &AppState, req: &JoinRequest, client: &DeviceClient, proof: Option<ProofInput>) -> Result<LoginResponse, ApiError> {

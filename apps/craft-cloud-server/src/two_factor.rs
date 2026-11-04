@@ -479,6 +479,13 @@ pub struct Rekeyed {
 /// is the operator's to see to (every instance must run with both keys before this, see `docs/server.md`). Neither the
 /// secrets nor the keys are printed. It can be run again.
 pub async fn rekey(meta: &Meta, secret_box: &SecretBox) -> Result<Rekeyed, String> {
+    rekey_hooked(meta, secret_box, &|| {}).await
+}
+
+/// [`rekey`] with a test seam: `after_scan` is called once, after the first scan of what is stored and before anything is
+/// rewritten, so a test can let other changes (a confirmation moving a set-up's secret) land exactly there. It blocks the
+/// thread it runs on, so a test runs the rest on others.
+pub async fn rekey_hooked(meta: &Meta, secret_box: &SecretBox, after_scan: &(dyn Fn() + Sync)) -> Result<Rekeyed, String> {
     let neither = || {
         "some secrets are sealed with a key that is neither key_file nor key_file_old: nothing was changed; put that key in key_file_old first"
             .to_owned()
@@ -498,6 +505,7 @@ pub async fn rekey(meta: &Meta, secret_box: &SecretBox) -> Result<Rekeyed, Strin
             }
         }
     }
+    after_scan();
     let current = secret_box.current_id();
     let rewrite = |user: UserId, sealed: &[u8]| -> Result<Option<Vec<u8>>, UnreadableSecret> {
         if SecretBox::key_id(sealed) == Some(current) {

@@ -580,7 +580,7 @@ async fn the_audit_config_section_is_optional_and_checked() {
 
 use craft_cloud_meta::{DeviceActor, Meta, MetaError, RevokeReason, UserId};
 use craft_cloud_server::secretbox::{KEY_BYTES, SecretBox, TwoFactorKey};
-use craft_cloud_server::two_factor::{KeyState, check_startup, load_keys, rekey};
+use craft_cloud_server::two_factor::{KeyState, check_startup, load_keys, rekey_hooked};
 
 /// A data directory made by `init` (admin `ana`) and its database.
 async fn init_dir(parent: &std::path::Path) -> (std::path::PathBuf, Meta) {
@@ -919,48 +919,63 @@ fn serve_never_makes_the_key_and_refuses_secrets_it_cannot_open() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("can't be opened"), "{}", String::from_utf8_lossy(&refused.stderr));
 }
 
-/// A confirmation that races `two-factor rekey` can't leave a secret under the old key: the set-up's secret is read fresh under the
-/// account's lock and moved with it, and the command scans again before it says the old key can go.
+/// A confirmation that lands exactly between `two-factor rekey`'s first scan and its rewrite can't leave a secret under the old
+/// key. The seam (`rekey_hooked`) holds the rekey after its scan until the confirmations, which move each set-up's secret to the
+/// active one, have all committed. Rekey reads an account's secrets fresh under its lock; a rewrite from the scan's snapshot would
+/// find its pending ciphertext gone and leave the one now active under the old key. The first successful rekey is the one that
+/// is checked: no second run repairs anything here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_confirmation_racing_rekey_leaves_nothing_under_the_old_key() {
+async fn a_confirmation_between_rekeys_scan_and_rewrite_leaves_nothing_under_the_old_key() {
     let parent = tempfile::tempdir().unwrap();
     let (dir, meta) = init_dir(parent.path()).await;
     let old = TwoFactorKey::from_file(&dir.join("two-factor.key")).unwrap();
     let old_box = SecretBox::new(&old, None).unwrap();
     let new_key = key_with_other_name(&[old.id()]);
-    let both = SecretBox::new(&new_key, Some(&old)).unwrap();
     let now = craft_cloud_server::state::now_ms();
-    for round in 0..12 {
-        let mut jobs = Vec::new();
+    for round in 0..4 {
+        let mut confirms = Vec::new();
         for n in 0..6 {
             let user = meta.create_user(&format!("u{round}x{n}"), "$argon2id$stub", craft_cloud_meta::Role::Member, 0).await.unwrap();
             let device = meta.create_device(user.id, "pc", blake3::hash(uuid::Uuid::now_v7().as_bytes()).as_bytes(), 0).await.unwrap();
             let actor = DeviceActor { user: user.id, device, password_hash: "$argon2id$stub".to_owned() };
             meta.two_factor_begin_setup(&actor, &old_box.seal(user.id, b"12345678901234567890").unwrap(), now).await.unwrap();
-            let meta = meta.clone();
-            jobs.push(tokio::spawn(async move {
-                let hashes: Vec<[u8; 32]> = (0..10).map(|_| Code::generate(INVITE_CHARS).unwrap().hash()).collect();
-                meta.two_factor_confirm(user.id, device, &|_: UserId, _: &[u8]| Ok(Some(5)), &hashes, now + 1).await.map(|_| ())
-            }));
+            confirms.push((user.id, device));
         }
+        let (scanned_tx, scanned_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         let rekeying = {
             let meta = meta.clone();
             let both = SecretBox::new(&new_key, Some(&old)).unwrap();
-            tokio::spawn(async move { rekey(&meta, &both).await })
+            tokio::spawn(async move {
+                let go_rx = std::sync::Mutex::new(go_rx);
+                let hold = move || {
+                    let _ = scanned_tx.send(());
+                    let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(30));
+                };
+                rekey_hooked(&meta, &both, &hold).await
+            })
         };
-        for job in jobs {
-            job.await.unwrap().unwrap();
+        // Rekey has scanned (its snapshot holds every set-up's secret as a pending one under the old key)…
+        tokio::task::spawn_blocking(move || scanned_rx.recv_timeout(Duration::from_secs(30))).await.unwrap().expect("rekey scanned");
+        // …now every confirmation commits, moving the pending secret to the active one…
+        for (user, device) in confirms {
+            let hashes: Vec<[u8; 32]> = (0..10).map(|_| Code::generate(INVITE_CHARS).unwrap().hash()).collect();
+            meta.two_factor_confirm(user, device, &|_: UserId, _: &[u8]| Ok(Some(5)), &hashes, now + 1).await.unwrap();
         }
-        rekeying.await.unwrap().unwrap();
-        // One more run, as the operator would: whatever the race left is moved, and then nothing is under the old key.
-        rekey(&meta, &both).await.unwrap();
+        assert!(
+            meta.two_factor_all_secrets().await.unwrap().iter().all(|row| row.pending.is_none() && row.active.is_some()),
+            "the set-ups are active now"
+        );
+        // …and only then does rekey go on.
+        go_tx.send(()).unwrap();
+        let done = rekeying.await.unwrap().expect("rekey succeeds");
+        assert_eq!(done.rewritten, 6, "round {round}: the secrets that became active meanwhile were rewritten");
         for row in meta.two_factor_all_secrets().await.unwrap() {
             for sealed in [row.active, row.pending].into_iter().flatten() {
-                assert_eq!(SecretBox::key_id(&sealed), Some(new_key.id()), "round {round}: a secret is still under the old key");
+                assert_eq!(SecretBox::key_id(&sealed), Some(new_key.id()), "round {round}: a secret is still under the old key after one rekey");
             }
         }
     }
-    // Everything opens with the new key alone.
     let alone = SecretBox::new(&new_key, None).unwrap();
     for row in meta.two_factor_all_secrets().await.unwrap() {
         for sealed in [row.active, row.pending].into_iter().flatten() {
