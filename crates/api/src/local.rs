@@ -26,7 +26,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::NodeId;
+use crate::ids::{DeviceId, Epoch, NodeId, VersionId};
 use crate::limits::MAX_TREE_DEPTH;
 use crate::name::Name;
 
@@ -116,6 +116,60 @@ pub mod paths {
     pub const AUTOSTART: &str = "/v1/autostart";
     /// `PUT`: a blob → [`super::blobs::Stored`]; `GET /v1/blobs/{hash}`: its bytes ([`super::blobs`]).
     pub const BLOBS: &str = "/v1/blobs";
+    /// `GET`: version history for a synced file, addressed by its path relative to the sync root.
+    pub const FILE_HISTORY: &str = "/v1/files/history";
+    /// `POST`: restore a prior version of a synced file, addressed by its path relative to the sync root.
+    pub const FILE_RESTORE: &str = "/v1/files/restore";
+}
+
+/// One version in a file's newest-first history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryVersion {
+    pub id: VersionId,
+    pub parent_version: Option<VersionId>,
+    pub epoch: Epoch,
+    pub seq: u64,
+    pub size: u64,
+    pub mtime_ms: i64,
+    pub device: DeviceId,
+    pub created_ms: i64,
+    pub save: bool,
+    pub pruned: bool,
+}
+
+/// A page of a file's newest-first version history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryResponse {
+    pub versions: Vec<HistoryVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// The path and page cursor for `GET /v1/files/history`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileHistoryRequest {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// `POST /v1/files/restore`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreRequest {
+    pub path: String,
+    pub version: VersionId,
+    pub expected_version: VersionId,
+}
+
+/// The new version made by a successful restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreResponse {
+    pub version: VersionId,
+    pub parent_version: VersionId,
+    pub seq: u64,
+    pub epoch: Epoch,
 }
 
 /// Binary content an app keeps out of a live document (images, audio, a font): `PUT /v1/blobs` with the bytes as the
