@@ -50,6 +50,8 @@ pub struct TrashRestoreOutcome {
     pub parent: NodeId,
     pub name: String,
     pub renamed: bool,
+    /// The file's new version (a copy of its last one); none for a folder.
+    pub version: Option<VersionId>,
     pub seq: u64,
     pub epoch: Epoch,
 }
@@ -490,13 +492,60 @@ impl Ctx<'_> {
                     }
                 }
             };
+            // A folder comes back where it did not stand before (below a live folder that has moved, or merged into
+            // another): it must not take the tree past its depth limit. A file may sit in the deepest folder.
+            if (!is_target || is_dir)
+                && let Err(kind) = self.check_placement(parent, None).await?
+            {
+                return Err(rejected(kind));
+            }
             self.revive(a.id, parent, &final_name).await?;
             parent = a.id;
         }
+        // A file comes back as a new version with the content of its last one. A machine that sent the delete and
+        // never heard the answer still names the old version in it, and so can't delete the restored file again: the
+        // server refuses that delete as a version mismatch, and the machine's engine already treats a node that came
+        // back at another version as one whose delete went through.
+        let version = if is_dir { None } else { Some(self.renew_version(node).await?) };
         let placed = self.node(node).await?.ok_or(MetaError::Corrupt("a restored node vanished"))?;
         let parent = placed.parent.ok_or(MetaError::Corrupt("a restored node has no parent"))?;
         let original = up.first().map(|a| a.name.as_str()).unwrap_or_default();
-        Ok(TrashRestoreOutcome { node, parent, renamed: placed.name != original, name: placed.name, seq: 0, epoch: self.epoch })
+        Ok(TrashRestoreOutcome { node, parent, renamed: placed.name != original, name: placed.name, version, seq: 0, epoch: self.epoch })
+    }
+
+    /// Gives the file `node` a new current version with the manifest, modification time and executable bit of its last
+    /// one (no save record), after it. Returns the new version's ID.
+    async fn renew_version(&mut self, node: NodeId) -> Result<VersionId, MetaError> {
+        let row = sqlx::query(
+            "SELECT n.version AS last, v.manifest, v.mtime_ms, v.exec FROM nodes n \
+             JOIN versions v ON v.space_id = n.space_id AND v.id = n.version WHERE n.space_id = $1 AND n.id = $2",
+        )
+        .bind(self.space())
+        .bind(uuid_bytes(node.as_uuid()))
+        .fetch_optional(&mut *self.conn)
+        .await?
+        .ok_or(MetaError::Corrupt("a file has no current version"))?;
+        let last = VersionId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("last")?)?);
+        let new = NewVersion {
+            id: VersionId::generate(),
+            manifest: ManifestId::from_bytes(hash_from(&row.try_get::<Vec<u8>, _>("manifest")?)?),
+            mtime_ms: row.try_get("mtime_ms")?,
+            exec: flag(&row, "exec")?,
+            save: None,
+        };
+        match self.insert_version(node, Some(last), &new).await? {
+            Ok(()) => {}
+            // The space no longer holds the manifest: the content is not there to bring back.
+            Err(ConflictKind::MissingManifest { .. }) => return Err(MetaError::NotFound("manifest")),
+            Err(kind) => return Err(rejected(kind)),
+        }
+        sqlx::query("UPDATE nodes SET version = $1 WHERE space_id = $2 AND id = $3")
+            .bind(uuid_bytes(new.id.as_uuid()))
+            .bind(self.space())
+            .bind(uuid_bytes(node.as_uuid()))
+            .execute(&mut *self.conn)
+            .await?;
+        Ok(new.id)
     }
 
     /// `node` and its ancestors, nearest first; stops after `MAX_TREE_DEPTH + 2` rows, so a walk that did not

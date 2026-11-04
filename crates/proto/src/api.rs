@@ -297,6 +297,10 @@ pub struct TrashRestoreResponse {
     pub parent: NodeId,
     pub name: String,
     pub renamed: bool,
+    /// For a file, its new current version: a copy of its last one (the same content), so a delete sent against the old
+    /// version, whose answer a machine never heard, can't delete it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<VersionId>,
     pub seq: u64,
     pub epoch: Epoch,
 }

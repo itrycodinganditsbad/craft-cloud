@@ -118,6 +118,8 @@ on_every_backend!(
     removing_from_the_trash_frees_nothing,
     a_trash_restore_and_a_commit_for_the_same_name_agree,
     a_trash_restore_and_an_edit_of_the_file_agree,
+    a_restored_file_gets_a_new_version_with_its_old_content,
+    a_restore_does_not_exceed_the_depth_limit,
     batch_size_is_limited,
     folders_nest_at_most_max_tree_depth,
     creating_or_moving_into_a_deleted_folder_brings_it_back,
@@ -2178,9 +2180,10 @@ async fn deleting_stamps_the_time_once_and_coming_back_clears_it(meta: &Meta) {
     assert_eq!(meta.trash(u.space, None, 10, NOW + 9_000).await.unwrap().entries[0].deleted_ms, NOW + 7_000);
 
     // A restore from the trash clears it too, and the next deletion starts afresh again.
-    meta.restore_from_trash(u.space, dev, file, NOW + 8_000).await.unwrap();
+    let restored = meta.restore_from_trash(u.space, dev, file, NOW + 8_000).await.unwrap();
     assert!(trash_ids(meta, &u).await.is_empty());
-    delete_file(meta, &u, dev, file, edited.id, NOW + 8_500).await;
+    // The restore made a new current version: the next delete names it.
+    delete_file(meta, &u, dev, file, restored.version.unwrap(), NOW + 8_500).await;
     assert_eq!(meta.trash(u.space, None, 10, NOW + 9_000).await.unwrap().entries[0].deleted_ms, NOW + 8_500);
 }
 
@@ -2270,7 +2273,9 @@ async fn a_restore_brings_the_deleted_folders_back_with_their_ids(meta: &Meta) {
     expected.sort();
     assert_eq!(changed, expected);
     let NodeKind::File(state) = &find(&feed.nodes, f).kind else { panic!("a file") };
-    assert_eq!(state.version, v.id, "the file's last version is its content again");
+    assert_eq!(state.manifest, v.manifest, "the file's content is what it was");
+    assert_eq!(Some(state.version), done.version, "as a new version after the last one");
+    assert_ne!(state.version, v.id);
 }
 
 /// A name taken by a file or by anything at the node itself gives a conflict name (never an overwrite); a deleted
@@ -2458,8 +2463,9 @@ async fn a_trash_restore_and_a_commit_for_the_same_name_agree(meta: &Meta) {
     assert_eq!(names.len(), total);
 }
 
-/// A restore and an edit of the same deleted file run together: whichever is first, the file ends live with its
-/// versions intact, and the second is either an update on a live file or a "not in the trash".
+/// A restore and an edit of the same deleted file run together: whichever is first, the file ends live with its versions
+/// intact. If the edit is first it brings the file back and the restore finds nothing in the trash; if the restore is
+/// first it makes a new current version, so the edit, made on the old one, is refused as a stale update.
 async fn a_trash_restore_and_an_edit_of_the_file_agree(meta: &Meta) {
     let u = user(meta, "ana").await;
     let dev = device(meta, &u).await;
@@ -2472,8 +2478,14 @@ async fn a_trash_restore_and_an_edit_of_the_file_agree(meta: &Meta) {
     let restore = tokio::spawn(async move { m1.restore_from_trash(space, dev, f, NOW).await });
     let update = tokio::spawn(async move { m2.commit(space, dev, &[edit_op], NOW + 2).await });
     let restored = restore.await.unwrap();
-    update.await.unwrap().unwrap();
-    assert!(matches!(restored, Ok(_) | Err(MetaError::NotFound(_))), "{restored:?}");
+    let updated = update.await.unwrap();
+    match (&restored, &updated) {
+        // The edit came first and brought the file back: the restore finds nothing in the trash.
+        (Err(MetaError::NotFound(_)), Ok(_)) => {}
+        // The restore came first and made a new current version: the edit, made on the old one, is a stale update.
+        (Ok(_), Err(MetaError::Rejected(list))) => assert!(matches!(list[0].kind, ConflictKind::VersionMismatch { .. })),
+        other => panic!("one of them must win: {other:?}"),
+    }
     assert_eq!(live_name(meta, &u, f).await, (Some(r), "both.txt".to_owned(), false));
     assert!(trash_ids(meta, &u).await.is_empty());
     assert_eq!(meta.history(u.space, f, None, 10).await.unwrap().versions.len(), 2);
@@ -2594,4 +2606,87 @@ async fn a_damaged_deletion_time_on_postgres() {
         return;
     };
     a_deleted_node_without_a_time_is_stamped_when_read(&url).await;
+}
+
+/// A file that comes back from the trash gets a new current version with its last content, after the last one and
+/// without a save record, so a delete that was sent against the old version (and whose answer a machine never heard)
+/// is refused as a version mismatch and can't delete the restored file again; a folder has no version.
+async fn a_restored_file_gets_a_new_version_with_its_old_content(meta: &Meta) {
+    use craft_cloud_proto::api::HISTORY_MAX_LIMIT;
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    let (node, versions) = file_with_versions(meta, &u, dev, 2).await;
+    let record = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::live::node_doc(u.space, node), frontiers: vec![(1, 5)] };
+    meta.attach_save(u.space, node, versions[1].id, &record).await.unwrap();
+    delete_file(meta, &u, dev, node, versions[1].id, NOW + 10).await;
+    let before = meta.space_info(u.space).await.unwrap();
+
+    let done = meta.restore_from_trash(u.space, dev, node, NOW + 20).await.unwrap();
+    let new = done.version.unwrap();
+    assert!(!versions.iter().any(|v| v.id == new));
+    assert_eq!(done.seq, before.seq + 1, "one change of the space");
+    let history = meta.history(u.space, node, None, HISTORY_MAX_LIMIT).await.unwrap().versions;
+    assert_eq!(history.len(), 3);
+    assert_eq!(
+        (history[0].id, history[0].parent_version, history[0].size, history[0].save, history[0].seq),
+        (new, Some(versions[1].id), 4, false, done.seq)
+    );
+    assert!(history.iter().any(|v| v.id == versions[1].id && v.save), "the old version keeps its record");
+    let feed = meta.changes(u.space, before.seq, None, MAX_PAGE_NODES).await.unwrap();
+    let NodeKind::File(f) = &find(&feed.nodes, node).kind else { panic!("a file") };
+    assert_eq!((f.version, f.manifest, f.mtime_ms, f.save.clone()), (new, versions[1].manifest, versions[1].mtime_ms, None));
+
+    // The delete a machine sent before the restore, with the old version, is refused and the file stays.
+    let stale = meta.commit(u.space, dev, &[Op::Delete { node, expected: Some(versions[1].id) }], NOW + 30).await;
+    assert_eq!(refused_restore(stale), vec![(0, ConflictKind::VersionMismatch { current: Some(new) })]);
+    assert!(!live_name(meta, &u, node).await.2);
+
+    // A folder has no version.
+    let dir = folder(meta, &u, dev, r, "plain-dir", NOW + 40).await;
+    delete_folder(meta, &u, dev, dir, NOW + 41).await;
+    assert_eq!(meta.restore_from_trash(u.space, dev, dir, NOW + 42).await.unwrap().version, None);
+}
+
+/// A restore never takes the tree past its depth limit: a folder that comes back below a live folder that has moved
+/// deep meanwhile is refused as too deep, for the folder itself and for a file whose folder would come back, and
+/// the refusal changes nothing; a file in a folder at the limit is fine.
+async fn a_restore_does_not_exceed_the_depth_limit(meta: &Meta) {
+    use craft_cloud_proto::limits::MAX_TREE_DEPTH;
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    let shallow = folder(meta, &u, dev, r, "shallow", NOW).await;
+    let c = folder(meta, &u, dev, shallow, "c", NOW).await;
+    let (f, fv) = file_in(meta, &u, dev, c, "f.txt", NOW).await;
+    let spare = folder(meta, &u, dev, shallow, "spare", NOW).await;
+    let (g, gv) = file_in(meta, &u, dev, spare, "g.txt", NOW).await;
+    delete_file(meta, &u, dev, f, fv.id, NOW + 1).await;
+    delete_folder(meta, &u, dev, c, NOW + 2).await;
+    delete_file(meta, &u, dev, g, gv.id, NOW + 3).await;
+    // A chain of folders down to depth MAX_TREE_DEPTH - 1, and the live folder moved to its end: depth MAX_TREE_DEPTH.
+    let mut ops = Vec::new();
+    let mut parent = r;
+    for i in 0..MAX_TREE_DEPTH - 1 {
+        let id = NodeId::generate();
+        ops.push(Op::Mkdir { node: id, parent, name: name(&format!("d{i}")) });
+        parent = id;
+    }
+    meta.commit(u.space, dev, &ops, NOW + 4).await.unwrap();
+    meta.commit(u.space, dev, &[Op::Move { node: shallow, from_parent: r, from_name: name("shallow"), parent, name: name("shallow") }], NOW + 5)
+        .await
+        .unwrap();
+    let before = meta.space_info(u.space).await.unwrap();
+    let trash_before = trash_ids(meta, &u).await;
+
+    // The deleted folder would sit one level too deep, and so would the folder of the file: refused, nothing changes.
+    for node in [c, f] {
+        let refused = meta.restore_from_trash(u.space, dev, node, NOW + 6).await;
+        assert_eq!(refused_restore(refused), vec![(0, ConflictKind::TooDeep)], "restoring {node}");
+        assert_eq!(meta.space_info(u.space).await.unwrap().seq, before.seq);
+        assert_eq!(trash_ids(meta, &u).await, trash_before);
+    }
+    // A file may sit in the deepest folder: it comes back, in `spare`, which is live (it was never deleted).
+    let done = meta.restore_from_trash(u.space, dev, g, NOW + 7).await.unwrap();
+    assert_eq!((done.parent, done.name.as_str()), (spare, "g.txt"));
 }
