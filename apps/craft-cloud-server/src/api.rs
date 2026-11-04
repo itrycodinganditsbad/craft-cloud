@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router, middleware};
-use craft_cloud_meta::{BlobKind, DeviceAuth, DeviceClient, DeviceRecord, RevokeReason, valid_username};
+use craft_cloud_meta::{BlobKind, DeviceAuth, DeviceClient, DeviceRecord, Origin, RevokeReason, valid_username};
 use craft_cloud_proto::api::{
     CommitRequest, CommitResponse, DeviceInfo, InfoResponse, LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse,
     PROTOCOL_MAX, PROTOCOL_MIN, SpaceResponse, codes,
@@ -217,7 +217,7 @@ async fn revoke_device(
     id: Result<Path<DeviceId>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
     let Path(id) = id?;
-    state.meta.revoke_device_as(auth.user, id, RevokeReason::User, state.now_ms()).await?;
+    state.meta.revoke_device_by(auth.user, id, RevokeReason::User, Origin::Device(auth.device), state.now_ms()).await?;
     // Its live connections end now, not at their next request.
     state.live.revoke(id);
     Ok(StatusCode::NO_CONTENT)

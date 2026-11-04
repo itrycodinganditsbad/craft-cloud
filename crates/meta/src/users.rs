@@ -12,6 +12,7 @@ use craft_cloud_proto::{DeviceId, Epoch, NodeId, SpaceId};
 use sqlx::Row;
 use uuid::Uuid;
 
+use crate::audit::{AuditAction, AuditDetails, NewEvent, Origin, record_in};
 use crate::codec::{flag, uuid_bytes, uuid_from};
 use crate::{Meta, MetaError};
 
@@ -327,7 +328,9 @@ impl Meta {
             return Err(MetaError::AccountDisabled);
         }
         insert_device(&mut w.tx, device, user, name, client, token_hash, now_ms).await?;
-        w.commit().await?;
+        let login = NewEvent::new(AuditAction::AuthLogin).by(user, Some(device)).on_device(device).with(AuditDetails::client(client));
+        record_in(&mut w.tx, now_ms, login).await?;
+        self.commit_audited(w, now_ms).await?;
         Ok(Some(device))
     }
 
@@ -400,8 +403,15 @@ impl Meta {
 
     /// Revokes one of `user`'s devices, and deletes the pairing it made, if any (its add-a-computer code dies with
     /// it). Revoking another user's device is `NotFound`. A device that is revoked already stays as it is, with its
-    /// first time and reason, and the call succeeds.
+    /// first time and reason, and the call succeeds. The audit event is `device.revoked` for the account's own act
+    /// ([`Origin::Account`]); [`Meta::revoke_device_by`] says which device asked, or that the command line did.
     pub async fn revoke_device_as(&self, user: UserId, device: DeviceId, reason: RevokeReason, now_ms: i64) -> Result<(), MetaError> {
+        self.revoke_device_by(user, device, reason, Origin::Account, now_ms).await
+    }
+
+    /// [`Meta::revoke_device_as`] with who asked. A device that was revoked already is left as it is and writes no event:
+    /// nothing changed.
+    pub async fn revoke_device_by(&self, user: UserId, device: DeviceId, reason: RevokeReason, origin: Origin, now_ms: i64) -> Result<(), MetaError> {
         let mut w = self.begin_write().await?;
         if !lock_user(&mut w.tx, user).await? {
             return Err(MetaError::NotFound("device"));
@@ -424,7 +434,17 @@ impl Meta {
             }
         }
         sqlx::query("DELETE FROM pairings WHERE device_id = $1").bind(uuid_bytes(device.as_uuid())).execute(&mut *w.tx).await?;
-        w.commit().await
+        if done.rows_affected() > 0 {
+            let details = AuditDetails { reason: Some(reason), device: Some(device), ..AuditDetails::default() };
+            let event = match origin {
+                Origin::Account => NewEvent::new(AuditAction::DeviceRevoked).by(user, None).on_device(device),
+                Origin::Device(by) => NewEvent::new(AuditAction::DeviceRevoked).by(user, Some(by)).on_device(device),
+                // The command line acts as no account. The event is about the account, whose own activity then shows it.
+                Origin::Cli => NewEvent::new(AuditAction::CliDeviceRevoked).on_user(user),
+            };
+            record_in(&mut w.tx, now_ms, event.with(details)).await?;
+        }
+        self.commit_audited(w, now_ms).await
     }
 
     /// Renames one of `user`'s devices that isn't revoked and returns it. Another user's, a revoked or a missing
@@ -461,18 +481,29 @@ impl Meta {
             return Ok(Vec::new());
         }
         let revoked = revoke_devices(&mut w.tx, user, Some(keep), reason, now_ms).await?;
-        w.commit().await?;
+        // One event with the count, however many devices went, and none when there was nobody to sign out.
+        if !revoked.is_empty() {
+            let details =
+                AuditDetails { reason: Some(reason), revoked: Some(u32::try_from(revoked.len()).unwrap_or(u32::MAX)), ..AuditDetails::default() };
+            record_in(&mut w.tx, now_ms, NewEvent::new(AuditAction::DeviceRevokedOthers).by(user, Some(keep)).on_user(user).with(details)).await?;
+        }
+        self.commit_audited(w, now_ms).await?;
         Ok(revoked)
     }
 
-    /// [`Meta::revoke_other_devices`] for every device of `user` (the admin's command line).
+    /// [`Meta::revoke_other_devices`] for every device of `user` (the admin's command line, which writes
+    /// `cli.devices_revoked_all` when there was a device to sign out).
     pub async fn revoke_all_devices(&self, user: UserId, reason: RevokeReason, now_ms: i64) -> Result<Vec<DeviceId>, MetaError> {
         let mut w = self.begin_write().await?;
         if !lock_user(&mut w.tx, user).await? {
             return Ok(Vec::new());
         }
         let revoked = revoke_devices(&mut w.tx, user, None, reason, now_ms).await?;
-        w.commit().await?;
+        if !revoked.is_empty() {
+            record_in(&mut w.tx, now_ms, NewEvent::new(AuditAction::CliDevicesRevokedAll).on_user(user).with(AuditDetails::revoked(revoked.len())))
+                .await?;
+        }
+        self.commit_audited(w, now_ms).await?;
         Ok(revoked)
     }
 
@@ -518,11 +549,15 @@ impl Meta {
         }
         let revoked = revoke_devices(&mut w.tx, user, Some(keep), RevokeReason::Password, now_ms).await?;
         delete_join_codes(&mut w.tx, user).await?;
-        w.commit().await?;
+        // The devices signed out with it are counted in this one event, not in events of their own.
+        let changed =
+            NewEvent::new(AuditAction::AccountPasswordChanged).by(user, Some(keep)).on_user(user).with(AuditDetails::revoked(revoked.len()));
+        record_in(&mut w.tx, now_ms, changed).await?;
+        self.commit_audited(w, now_ms).await?;
         Ok(revoked)
     }
 
-    /// The admin's password reset: sets `new_hash` and `password_changed_ms`, deletes the account's open invite and
+    /// The admin's password reset on the command line (`cli.password_reset`): sets `new_hash` and `password_changed_ms`, deletes the account's open invite and
     /// pairings, and, unless `keep_devices`, revokes every device ([`RevokeReason::Reset`]), all in one transaction.
     /// `NotFound` for a user that isn't there. Returns the devices revoked.
     pub async fn reset_password(&self, user: UserId, new_hash: &str, keep_devices: bool, now_ms: i64) -> Result<Vec<DeviceId>, MetaError> {
@@ -539,7 +574,8 @@ impl Meta {
         }
         let revoked = if keep_devices { Vec::new() } else { revoke_devices(&mut w.tx, user, None, RevokeReason::Reset, now_ms).await? };
         delete_join_codes(&mut w.tx, user).await?;
-        w.commit().await?;
+        record_in(&mut w.tx, now_ms, NewEvent::new(AuditAction::CliPasswordReset).on_user(user).with(AuditDetails::revoked(revoked.len()))).await?;
+        self.commit_audited(w, now_ms).await?;
         Ok(revoked)
     }
 }

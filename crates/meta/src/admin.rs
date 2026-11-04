@@ -1,8 +1,9 @@
 //! What an administrator does through the admin API: server counters, listing and creating accounts, changing a role or
 //! a quota, disabling, enabling and removing an account, invites and password reset codes, and a user's devices.
 //!
-//! - **One `Meta` method per change, with a typed result**, so a later audit trail can be written in the same transaction
-//!   without reshaping the handlers.
+//! - **One `Meta` method per change, with a typed result**, and each writes its audit event in its own transaction, before
+//!   the commit, so a change whose event cannot be written is not made. A change that changes nothing (disabling an account
+//!   that is disabled, signing out a device that is out already, giving the role an account has) writes no event.
 //! - **The acting admin is checked again inside every change** ([`AdminActor`], `begin_admin`): the role the middleware
 //!   read and the password the handler verified (a slow Argon2id check) can be stale by the time the transaction runs.
 //!   The device must still be signed in, the account neither disabled nor marked for removal, the role still `admin`
@@ -23,6 +24,7 @@ use craft_cloud_proto::{DeviceId, NodeId, SpaceId};
 use sqlx::Row;
 use uuid::Uuid;
 
+use crate::audit::{AuditAction, AuditDetails, NewEvent, record_in};
 use crate::codec::{to_i64, to_u64, uuid_bytes, uuid_from};
 use crate::join::{Purpose, put_code};
 use crate::users::{delete_join_codes, insert_user, lock_user, revoke_devices};
@@ -134,6 +136,11 @@ fn escape_like(text: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// An event the acting admin makes to `target`.
+fn by_admin(actor: &AdminActor, action: AuditAction, target: UserId) -> NewEvent {
+    NewEvent::new(action).by(actor.user, Some(actor.device)).on_user(target)
 }
 
 fn same_user(a: UserId, b: UserId) -> bool {
@@ -290,7 +297,9 @@ impl Meta {
         let ids = (UserId(Uuid::now_v7()), SpaceId::generate(), NodeId::generate());
         let user = insert_user(&mut w.tx, &username, "", role, now_ms, ids).await?.id;
         put_code(&mut w.tx, user, code_hash, Purpose::Invite, now_ms, expires_ms).await?;
-        w.commit().await?;
+        let created = by_admin(actor, AuditAction::AdminUserCreated, user).with(AuditDetails { role_to: Some(role), ..AuditDetails::default() });
+        record_in(&mut w.tx, now_ms, created).await?;
+        self.commit_audited(w, now_ms).await?;
         let made = self.admin_user(user, now_ms).await?.ok_or(MetaError::Corrupt("a new account is missing"))?;
         Ok((made, Issued { expires_ms }))
     }
@@ -324,12 +333,29 @@ impl Meta {
             if found.role == Role::Admin && role == Role::Member {
                 Self::keep_an_admin(&mut w).await?;
             }
+            // One event for the role and one for the quota when both change, in this transaction. A role the account has
+            // already is no change and has none.
+            if role != found.role {
+                let details = AuditDetails { role_from: Some(found.role), role_to: Some(role), ..AuditDetails::default() };
+                record_in(&mut w.tx, now_ms, by_admin(actor, AuditAction::AdminRoleChanged, target).with(details)).await?;
+            }
         }
         if let Some(quota) = quota {
             let quota = quota.map(to_i64).transpose()?;
+            let before: Option<i64> = sqlx::query("SELECT quota_bytes FROM spaces WHERE owner = $1")
+                .bind(uuid_bytes(&target.0))
+                .fetch_optional(&mut *w.tx)
+                .await?
+                .map(|row| row.try_get("quota_bytes"))
+                .transpose()?
+                .flatten();
             sqlx::query("UPDATE spaces SET quota_bytes = $1 WHERE owner = $2").bind(quota).bind(uuid_bytes(&target.0)).execute(&mut *w.tx).await?;
+            if quota != before {
+                let details = AuditDetails { quota_bytes: Some(quota.map(to_u64).transpose()?), ..AuditDetails::default() };
+                record_in(&mut w.tx, now_ms, by_admin(actor, AuditAction::AdminQuotaChanged, target).with(details)).await?;
+            }
         }
-        w.commit().await?;
+        self.commit_audited(w, now_ms).await?;
         self.admin_user(target, now_ms).await?.ok_or(MetaError::NotFound("user"))
     }
 
@@ -341,7 +367,7 @@ impl Meta {
             return Err(MetaError::Invalid("you can't disable your own account"));
         }
         let mut w = self.begin_admin(actor, Some(target), true).await?;
-        Self::target(&mut w, target).await?;
+        let found = Self::target(&mut w, target).await?;
         sqlx::query("UPDATE users SET disabled_ms = COALESCE(disabled_ms, $1), auth_gen = auth_gen + 1 WHERE id = $2")
             .bind(now_ms)
             .bind(uuid_bytes(&target.0))
@@ -350,21 +376,30 @@ impl Meta {
         Self::keep_an_admin(&mut w).await?;
         let revoked = revoke_devices(&mut w.tx, target, None, RevokeReason::Disabled, now_ms).await?;
         delete_join_codes(&mut w.tx, target).await?;
-        w.commit().await?;
+        // The devices signed out with it are counted in the event. An account that was disabled already is no change.
+        if !found.disabled {
+            record_in(&mut w.tx, now_ms, by_admin(actor, AuditAction::AdminUserDisabled, target).with(AuditDetails::revoked(revoked.len()))).await?;
+        }
+        self.commit_audited(w, now_ms).await?;
         Ok(revoked)
     }
 
     /// Enables a disabled account. Devices that were signed out stay signed out. One marked for removal is `Conflict`.
-    pub async fn admin_enable_user(&self, actor: &AdminActor, target: UserId) -> Result<(), MetaError> {
+    /// An account that is not disabled is left as it is and writes no event.
+    pub async fn admin_enable_user(&self, actor: &AdminActor, target: UserId, now_ms: i64) -> Result<(), MetaError> {
         let mut w = self.begin_admin(actor, Some(target), false).await?;
-        if Self::target(&mut w, target).await?.removed {
+        let found = Self::target(&mut w, target).await?;
+        if found.removed {
             return Err(MetaError::Conflict("this account is marked for removal"));
         }
         sqlx::query("UPDATE users SET disabled_ms = NULL, auth_gen = auth_gen + 1 WHERE id = $1")
             .bind(uuid_bytes(&target.0))
             .execute(&mut *w.tx)
             .await?;
-        w.commit().await
+        if found.disabled {
+            record_in(&mut w.tx, now_ms, by_admin(actor, AuditAction::AdminUserEnabled, target)).await?;
+        }
+        self.commit_audited(w, now_ms).await
     }
 
     /// Marks an account for removal: as [`Meta::admin_disable_user`], and also sets `removed_ms`, which leaves it out of
@@ -375,7 +410,7 @@ impl Meta {
             return Err(MetaError::Invalid("you can't remove your own account"));
         }
         let mut w = self.begin_admin(actor, Some(target), true).await?;
-        Self::target(&mut w, target).await?;
+        let found = Self::target(&mut w, target).await?;
         sqlx::query(
             "UPDATE users SET removed_ms = COALESCE(removed_ms, $1), disabled_ms = COALESCE(disabled_ms, $1), auth_gen = auth_gen + 1 WHERE id = $2",
         )
@@ -386,7 +421,11 @@ impl Meta {
         Self::keep_an_admin(&mut w).await?;
         let revoked = revoke_devices(&mut w.tx, target, None, RevokeReason::Disabled, now_ms).await?;
         delete_join_codes(&mut w.tx, target).await?;
-        w.commit().await?;
+        // The event outlives the account, which stays only as a mark. Marked already: no change, no event.
+        if !found.removed {
+            record_in(&mut w.tx, now_ms, by_admin(actor, AuditAction::AdminUserRemoved, target).with(AuditDetails::revoked(revoked.len()))).await?;
+        }
+        self.commit_audited(w, now_ms).await?;
         Ok(revoked)
     }
 
@@ -412,19 +451,22 @@ impl Meta {
             return Err(MetaError::Conflict("this account has a password: make a password reset code for it instead"));
         }
         put_code(&mut w.tx, target, code_hash, Purpose::Invite, now_ms, expires_ms).await?;
-        w.commit().await?;
+        record_in(&mut w.tx, now_ms, by_admin(actor, AuditAction::AdminInviteIssued, target)).await?;
+        self.commit_audited(w, now_ms).await?;
         Ok(Issued { expires_ms })
     }
 
-    /// Deletes the account's open invite or reset code; `NotFound` when there is none.
-    pub async fn admin_revoke_invite(&self, actor: &AdminActor, target: UserId) -> Result<(), MetaError> {
+    /// Deletes the account's open invite or reset code; `NotFound` when there is none (so nothing changed and nothing is
+    /// written).
+    pub async fn admin_revoke_invite(&self, actor: &AdminActor, target: UserId, now_ms: i64) -> Result<(), MetaError> {
         let mut w = self.begin_admin(actor, Some(target), false).await?;
         Self::target(&mut w, target).await?;
         let done = sqlx::query("DELETE FROM invites WHERE user_id = $1").bind(uuid_bytes(&target.0)).execute(&mut *w.tx).await?;
         if done.rows_affected() == 0 {
             return Err(MetaError::NotFound("invite"));
         }
-        w.commit().await
+        record_in(&mut w.tx, now_ms, by_admin(actor, AuditAction::AdminInviteRevoked, target)).await?;
+        self.commit_audited(w, now_ms).await
     }
 
     /// A password reset code under `code_hash`, good for `ttl_ms`, replacing the account's open invite or reset code.
@@ -457,7 +499,8 @@ impl Meta {
             ));
         }
         put_code(&mut w.tx, target, code_hash, Purpose::Reset, now_ms, expires_ms).await?;
-        w.commit().await?;
+        record_in(&mut w.tx, now_ms, by_admin(actor, AuditAction::AdminPasswordResetIssued, target)).await?;
+        self.commit_audited(w, now_ms).await?;
         Ok(Issued { expires_ms })
     }
 
@@ -493,6 +536,12 @@ impl Meta {
             }
         }
         sqlx::query("DELETE FROM pairings WHERE device_id = $1").bind(uuid_bytes(device.as_uuid())).execute(&mut *w.tx).await?;
-        w.commit().await
+        // The event is about the account, whose own activity then shows it, and names the device. A device signed out
+        // already is no change.
+        if done.rows_affected() > 0 {
+            let details = AuditDetails { device: Some(device), reason: Some(RevokeReason::Admin), ..AuditDetails::default() };
+            record_in(&mut w.tx, now_ms, by_admin(actor, AuditAction::AdminDeviceRevoked, target).with(details)).await?;
+        }
+        self.commit_audited(w, now_ms).await
     }
 }

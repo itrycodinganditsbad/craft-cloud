@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use craft_cloud_meta::{Meta, RevokeReason, Role, valid_username};
+use craft_cloud_meta::{Meta, Origin, RevokeReason, Role, valid_username};
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::join::{Code, INVITE_CHARS, INVITE_TTL_MS, JoinString};
 use craft_cloud_store::Store;
@@ -241,7 +241,7 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                 }
                 DeviceAction::Revoke { username, device } => {
                     let user = user_id(&meta, &username).await?;
-                    meta.revoke_device_as(user.id, device, RevokeReason::Admin, now_ms()).await?;
+                    meta.revoke_device_by(user.id, device, RevokeReason::Admin, Origin::Cli, now_ms()).await?;
                     writeln!(out, "revoked {device}")?;
                 }
                 DeviceAction::RevokeAll { username } => {

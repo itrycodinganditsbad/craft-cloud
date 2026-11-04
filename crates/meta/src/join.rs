@@ -23,6 +23,7 @@ use craft_cloud_proto::{DeviceId, NodeId, SpaceId};
 use sqlx::Row;
 use uuid::Uuid;
 
+use crate::audit::{AuditAction, AuditDetails, NewEvent, record_in};
 use crate::codec::{uuid_bytes, uuid_from};
 use crate::users::{DeviceClient, account_blocked, check_device_name, delete_join_codes, insert_device, insert_user, lock_user, revoke_devices};
 use crate::{Meta, MetaError, RevokeReason, Role, UserId, valid_username};
@@ -252,7 +253,7 @@ impl Meta {
             .fetch_optional(&mut *w.tx)
             .await?;
         let mut revoked = Vec::new();
-        let user = match found {
+        let (user, action) = match found {
             Some(row) => {
                 let user = UserId(uuid_from(&row.try_get::<Vec<u8>, _>("user_id")?)?);
                 let purpose = Purpose::parse(&row.try_get::<String, _>("purpose")?)?;
@@ -305,7 +306,7 @@ impl Meta {
                     }
                     Purpose::Invite => {}
                 }
-                user
+                (user, if purpose == Purpose::Reset { AuditAction::JoinResetRedeemed } else { AuditAction::JoinInviteRedeemed })
             }
             None => {
                 // The same for a pairing: its account is locked before the device is added, so a reset that revokes
@@ -330,11 +331,16 @@ impl Meta {
                 .fetch_optional(&mut *w.tx)
                 .await?
                 .ok_or(MetaError::InvalidCode)?;
-                UserId(uuid_from(&pairing.try_get::<Vec<u8>, _>("user_id")?)?)
+                (UserId(uuid_from(&pairing.try_get::<Vec<u8>, _>("user_id")?)?), AuditAction::JoinPairingRedeemed)
             }
         };
         insert_device(&mut w.tx, device, user, device_name, client, token_hash, now_ms).await?;
-        w.commit().await?;
+        let mut details = AuditDetails::client(client);
+        if action == AuditAction::JoinResetRedeemed {
+            details.revoked = Some(u32::try_from(revoked.len()).unwrap_or(u32::MAX));
+        }
+        record_in(&mut w.tx, now_ms, NewEvent::new(action).by(user, Some(device)).on_device(device).with(details)).await?;
+        self.commit_audited(w, now_ms).await?;
         Ok(Redeemed { user, device, revoked })
     }
 }

@@ -304,7 +304,7 @@ async fn enable_user(
     let target = user_id(id)?;
     let req: AdminConfirm = read_body(&state, request).await?;
     let actor = confirm(&state, &auth, req.password).await?;
-    state.meta.admin_enable_user(&actor, target).await?;
+    state.meta.admin_enable_user(&actor, target, state.now_ms()).await?;
     tracing::info!(actor = %auth.device, target = %target.0, "admin: account enabled");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -351,7 +351,7 @@ async fn revoke_invite(
     let target = user_id(id)?;
     let req: AdminConfirm = read_body(&state, request).await?;
     let actor = confirm(&state, &auth, req.password).await?;
-    state.meta.admin_revoke_invite(&actor, target).await?;
+    state.meta.admin_revoke_invite(&actor, target, state.now_ms()).await?;
     tracing::info!(actor = %auth.device, target = %target.0, "admin: invite revoked");
     Ok(StatusCode::NO_CONTENT)
 }

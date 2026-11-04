@@ -8,6 +8,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod admin;
+mod audit;
 mod blobs;
 mod codec;
 mod commit;
@@ -26,6 +27,10 @@ use sqlx::{AnyPool, ConnectOptions};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub use admin::{AdminActor, AdminUser, Issued, MAX_SEARCH_BYTES, MIN_QUOTA_BYTES, RESET_TTL_MS, ServerCounts, UserPage};
+pub use audit::{
+    ActionFilter, AuditAction, AuditCursor, AuditDetails, AuditEvent, AuditFailure, AuditOutcome, AuditQuery, ClientKind, Field, MAX_DETAILS_BYTES,
+    MAX_RETENTION_DAYS, MIN_RETENTION_DAYS, OPPORTUNISTIC_PRUNE_BATCHES, Origin, PRUNE_BATCH, PRUNE_EVERY_MS, Platform, Pruned, Step, TargetKind,
+};
 pub use commit::CommitOutcome;
 pub use craft_cloud_proto::BlobKind;
 pub use join::{InviteFor, Redeemed};
@@ -137,6 +142,10 @@ pub struct Meta {
     live_held_documents_cap: u64,
     /// The most bytes all of one space's live documents may hold ([`Meta::with_live_bytes_cap`]).
     live_bytes_cap: u64,
+    /// How long audit events are kept when a write prunes them ([`Meta::with_audit_retention_days`]); `None`: a write never prunes.
+    audit_retention_ms: Option<i64>,
+    /// When the last complete pruning ran, and whether one runs now; shared by the clones.
+    prune_state: Arc<audit::PruneState>,
 }
 
 impl Meta {
@@ -193,6 +202,8 @@ impl Meta {
             live_documents_cap: MAX_LIVE_DOCUMENTS_PER_SPACE,
             live_held_documents_cap: MAX_LIVE_DOCUMENTS_HOLDING_UPDATES,
             live_bytes_cap: DEFAULT_LIVE_BYTES_PER_SPACE,
+            audit_retention_ms: None,
+            prune_state: Arc::new(audit::PruneState::new()),
         })
     }
 
