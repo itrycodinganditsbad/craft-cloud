@@ -77,6 +77,28 @@ pub enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Check the database and the blob store against each other and report: the reference index of every manifest, the
+    /// manifests and chunks the database names against the objects in the store, and what names what. Changes nothing;
+    /// exits with an error when it finds a problem. Reads every chunk object (`--skip-chunk-reads` leaves that out).
+    Verify {
+        /// Path to config.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Check chunks against the database only; do not read their objects from the store.
+        #[arg(long)]
+        skip_chunk_reads: bool,
+    },
+    /// The reference index of what each manifest names.
+    Index {
+        /// Path to config.toml. May come before or after the action.
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: IndexAction,
+    },
     /// Manage live documents.
     Live {
         /// Path to config.toml. May come before or after the action.
@@ -84,6 +106,18 @@ pub enum Command {
         config: Option<PathBuf>,
         #[command(subcommand)]
         action: LiveAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IndexAction {
+    /// Complete the index of every manifest whose index is not complete: reads each manifest from the store, checks it
+    /// against its ID, and writes its edges in batches. Writes only that derived index. Safe to stop and run again, and to
+    /// run beside the server.
+    Build {
+        /// Edges written per database transaction (default 5000).
+        #[arg(long)]
+        batch_rows: Option<usize>,
     },
 }
 
@@ -132,6 +166,9 @@ pub enum CliError {
     Store(#[from] craft_cloud_store::StoreError),
     #[error("{0}")]
     Usage(String),
+    /// A check found something wrong (its report was written first).
+    #[error("{0}")]
+    Inconsistent(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -240,6 +277,37 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                 writeln!(out, "new epoch {epoch} for {}", user.username)?;
             }
             Ok(())
+        }
+        Command::Verify { config, json, skip_chunk_reads } => {
+            let (meta, store) = open(&Config::load(&config_path(config)?)?).await?;
+            let report = crate::verify::verify(&meta, &store, crate::verify::VerifyOptions { read_chunks: !skip_chunk_reads }).await?;
+            if json {
+                writeln!(out, "{}", report.to_json())?;
+            } else {
+                write!(out, "{}", report.to_text())?;
+            }
+            match report.problem_count() {
+                0 => Ok(()),
+                n => Err(CliError::Inconsistent(format!("verify found {n} problem(s)"))),
+            }
+        }
+        Command::Index { config, action: IndexAction::Build { batch_rows } } => {
+            let (meta, store) = open(&Config::load(&config_path(config)?)?).await?;
+            let meta = match batch_rows {
+                Some(0) => return Err(CliError::Usage("--batch-rows must be at least 1".into())),
+                Some(rows) => meta.with_index_batch_rows(rows),
+                None => meta,
+            };
+            let report = crate::verify::build_index(&meta, &store).await?;
+            writeln!(out, "indexed {} manifest(s)", report.indexed)?;
+            for (id, why) in &report.unreadable {
+                writeln!(out, "could not index manifest {id}: {why}")?;
+            }
+            if report.unreadable.is_empty() {
+                Ok(())
+            } else {
+                Err(CliError::Inconsistent(format!("{} manifest(s) could not be indexed", report.unreadable.len())))
+            }
         }
         Command::Live { config, action: LiveAction::ResetDoc { username, app } } => {
             let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;

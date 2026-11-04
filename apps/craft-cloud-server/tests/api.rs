@@ -1777,3 +1777,71 @@ async fn the_purge_time_follows_the_configured_trash_days() {
     let page: TrashResponse = trash_page(&s, &ana, "").await.json().await.unwrap();
     assert_eq!(page.items[0].purge_after_ms - page.items[0].deleted_ms, 7 * DAY_MS);
 }
+
+// ---- the reference index ----
+
+/// A server whose metadata writes only a few index edges per transaction (SQLite and disk).
+async fn sqlite_disk_with_index_budget(rows: usize) -> Server {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap().with_index_batch_rows(rows);
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let state = AppState::new(meta.clone(), store, vec![]).unwrap();
+    start_state(state, meta, vec![db, blobs], None).await
+}
+
+/// A manifest of `n` chunks (the first one twice), their data distinct; uploaded chunks first.
+async fn upload_many(s: &Server, token: &str, n: usize, tag: &str) -> (Manifest, Vec<ChunkId>) {
+    let datas: Vec<Vec<u8>> = (0..n).map(|i| format!("index {tag} {i} {}", uuid::Uuid::now_v7()).into_bytes()).collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.push(0);
+    for data in &datas {
+        assert_eq!(put_chunk(s, token, data).await, StatusCode::NO_CONTENT);
+    }
+    let refs: Vec<ChunkRef> = order.iter().map(|i| ChunkRef { id: chunk_id(&datas[*i]), len: u32::try_from(datas[*i].len()).unwrap() }).collect();
+    let size = refs.iter().map(|r| u64::from(r.len)).sum();
+    let manifest = Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), size, FileHash::from_bytes([9; 32]), refs.clone()).unwrap();
+    (manifest, refs.iter().map(|r| r.id).collect())
+}
+
+/// A manifest accepted is indexed, exactly and completely, before the upload is acknowledged: a short one in the
+/// transaction that records it, a longer one (past the server's budget per transaction) in the batches the handler
+/// finishes. Uploading it again, or as another account, changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uploaded_manifest_is_indexed_before_the_upload_is_acknowledged() {
+    use craft_cloud_meta::IndexState;
+    let s = sqlite_disk_with_index_budget(3).await;
+    add_user(&s, "ana").await;
+    add_user(&s, "bob").await;
+    let (ana, bob) = (login(&s, "ana").await, login(&s, "bob").await);
+    for (n, label) in [(2usize, "short"), (9, "long")] {
+        let (manifest, chunks) = upload_many(&s, &ana, n, label).await;
+        assert_eq!(put_manifest(&s, &ana, &manifest).await.status(), StatusCode::NO_CONTENT, "{label}");
+        assert_eq!(s.meta.index_state(&manifest.id()).await.unwrap(), IndexState::Complete { total: n as u64 + 1 }, "{label}");
+        let edges = s.meta.index_edges(&manifest.id()).await.unwrap();
+        assert_eq!(edges.iter().map(|(_, c)| *c).collect::<Vec<_>>(), chunks, "{label}: in order, the first chunk at both its places");
+        // Again, and as another account (which has to upload the chunks too).
+        let before = s.meta.index_edge_count().await.unwrap();
+        assert_eq!(put_manifest(&s, &ana, &manifest).await.status(), StatusCode::NO_CONTENT);
+        for chunk in manifest.chunks() {
+            let data = s.client.get(format!("{}/chunks/{}", s.base, chunk.id)).bearer_auth(&ana).send().await.unwrap().bytes().await.unwrap();
+            assert_eq!(
+                s.client.put(format!("{}/chunks/{}", s.base, chunk.id)).bearer_auth(&bob).body(data.to_vec()).send().await.unwrap().status(),
+                StatusCode::NO_CONTENT
+            );
+        }
+        assert_eq!(put_manifest(&s, &bob, &manifest).await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(s.meta.index_edge_count().await.unwrap(), before, "{label}: nothing written twice");
+    }
+    // A manifest naming a chunk the account lacks is refused, and leaves no index behind.
+    let (manifest, _) = upload_many(&s, &ana, 2, "refused").await;
+    let lacking = {
+        let mut refs = manifest.chunks().to_vec();
+        refs.push(ChunkRef { id: chunk_id(b"never uploaded"), len: 14 });
+        let size = refs.iter().map(|r| u64::from(r.len)).sum();
+        Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), size, FileHash::from_bytes([8; 32]), refs).unwrap()
+    };
+    let (status, body) = error(put_manifest(&s, &ana, &lacking).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::CONFLICT, "missing_chunks"));
+    assert_eq!(s.meta.index_state(&lacking.id()).await.unwrap(), IndexState::Absent);
+}

@@ -294,3 +294,223 @@ fn the_binary_serves_what_init_created() {
     assert!(body.starts_with("HTTP/1.1 200"), "{body}");
     assert!(body.contains("\"chunker_params\":[\"fastcdc-v1\"]"), "{body}");
 }
+
+// ---- verify and the reference index ----
+
+/// A data directory with a user and the pieces `verify` looks at: one file's manifest of three chunks (one repeated),
+/// recorded and stored as an upload does, and a commit that names it. Returns what the tests damage.
+struct Seeded {
+    dir: std::path::PathBuf,
+    config: String,
+    db_url: String,
+    chunks: Vec<craft_cloud_proto::ChunkId>,
+    manifest: craft_cloud_proto::ManifestId,
+    meta: craft_cloud_meta::Meta,
+    _keep: tempfile::TempDir,
+}
+
+fn chunk_bytes(n: u8) -> Vec<u8> {
+    format!("verify chunk {n} {}", uuid::Uuid::now_v7()).into_bytes()
+}
+
+async fn seeded() -> Seeded {
+    use craft_cloud_proto::{ChunkRef, ChunkerParamsId, FileHash, Manifest, Name, NewVersion, NodeId, Op, VersionId};
+    use craft_cloud_store::BlobKey;
+    let keep = tempfile::tempdir().unwrap();
+    let dir = keep.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config_path = dir.join("config.toml");
+    let config = Config::load(&config_path).unwrap();
+    let (meta, store) = craft_cloud_server::cli::open(&config).await.unwrap();
+    let ana = meta.user_by_name("ana").await.unwrap().unwrap();
+    let datas = [chunk_bytes(1), chunk_bytes(2)];
+    let mut chunks = Vec::new();
+    for data in &datas {
+        let id = craft_cloud_proto::ChunkId::from_bytes(*blake3::hash(data).as_bytes());
+        store.put(BlobKey::chunk(&id), data).await.unwrap();
+        meta.add_chunk(ana.space, &id, data.len() as u64 + 1, 0).await.unwrap();
+        chunks.push(id);
+    }
+    // The first chunk twice: [a, b, a].
+    let order = [chunks[0], chunks[1], chunks[0]];
+    let lens = [datas[0].len() as u32, datas[1].len() as u32, datas[0].len() as u32];
+    let refs: Vec<ChunkRef> = order.iter().zip(lens).map(|(id, len)| ChunkRef { id: *id, len }).collect();
+    let size = lens.iter().map(|l| u64::from(*l)).sum();
+    let manifest = Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), size, FileHash::from_bytes([3; 32]), refs).unwrap();
+    store.put(BlobKey::manifest(&manifest.id()), &manifest.encode()).await.unwrap();
+    meta.add_manifest(ana.space, &manifest, manifest.encode().len() as u64 + 1, 0).await.unwrap();
+    let info = meta.space_info(ana.space).await.unwrap();
+    let device = meta.create_device(ana.id, "laptop", &[5u8; 32], 0).await.unwrap();
+    let v = NewVersion { id: VersionId::generate(), manifest: manifest.id(), mtime_ms: 1, exec: false, save: None };
+    meta.commit(ana.space, device, &[Op::Create { node: NodeId::generate(), parent: info.root, name: Name::new("f.txt").unwrap(), version: v }], 0)
+        .await
+        .unwrap();
+    Seeded {
+        db_url: config.database.url.clone(),
+        config: config_path.to_str().unwrap().to_owned(),
+        dir,
+        chunks,
+        manifest: manifest.id(),
+        meta,
+        _keep: keep,
+    }
+}
+
+async fn raw_sqlite(url: &str) -> sqlx::SqliteConnection {
+    use sqlx::Connection;
+    sqlx::SqliteConnection::connect(url).await.unwrap()
+}
+
+fn object_path(dir: &std::path::Path, kind: &str, id: &[u8; 32]) -> std::path::PathBuf {
+    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    dir.join("blobs").join(kind).join(&hex[0..2]).join(&hex[2..4]).join(&hex)
+}
+
+async fn verify_json(c: &str, extra: &[&str]) -> (serde_json::Value, bool) {
+    let mut args = vec!["verify", "--config", c, "--json"];
+    args.extend_from_slice(extra);
+    match cli(&args, "").await {
+        Ok(out) => (serde_json::from_str(&out).unwrap(), true),
+        Err(CliError::Inconsistent(_)) => {
+            // The report is written before the error: run it again through `run` for its text.
+            let parsed = Cli::try_parse_from(std::iter::once("craft-cloud-server").chain(args.iter().copied())).unwrap();
+            let mut out = Vec::new();
+            let _ = run(parsed.command, &mut Cursor::new(Vec::new()), &mut out).await;
+            (serde_json::from_slice(&out).unwrap(), false)
+        }
+        Err(other) => panic!("{other}"),
+    }
+}
+
+#[tokio::test]
+async fn verify_passes_on_a_sound_server_and_changes_nothing() {
+    let s = seeded().await;
+    let before = s.meta.index_edge_count().await.unwrap();
+    let out = cli(&["verify", "--config", &s.config], "").await.unwrap();
+    assert!(out.contains("no problems found"), "{out}");
+    assert!(out.contains("checked 1 manifest(s) and 2 chunk(s) (chunk objects read and hashed)"), "{out}");
+    let (json, ok) = verify_json(&s.config, &[]).await;
+    assert!(ok);
+    assert_eq!(json["ok"], true);
+    assert_eq!(
+        (json["index"]["manifests"].as_u64(), json["index"]["complete"].as_u64(), json["index"]["all_complete"].as_bool()),
+        (Some(1), Some(1), Some(true))
+    );
+    assert_eq!(json["problems"]["total"], 0);
+    assert_eq!(s.meta.index_edge_count().await.unwrap(), before);
+    assert_eq!(s.meta.index_edges(&s.manifest).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn verify_reports_a_missing_chunk_object_and_a_missing_manifest_object() {
+    let s = seeded().await;
+    std::fs::remove_file(object_path(&s.dir, "chunks", s.chunks[1].as_bytes())).unwrap();
+    let (json, ok) = verify_json(&s.config, &[]).await;
+    assert!(!ok);
+    assert_eq!(json["problems"]["by_kind"]["chunk_object_missing"], 1, "{json}");
+    assert_eq!(json["problems"]["listed"][0]["id"], s.chunks[1].to_string());
+    // Without reading chunk objects it is not seen, and the text says so.
+    let (json, ok) = verify_json(&s.config, &["--skip-chunk-reads"]).await;
+    assert!(ok, "{json}");
+    assert_eq!(json["checked"]["chunk_objects_read"], false);
+    assert!(cli(&["verify", "--config", &s.config, "--skip-chunk-reads"], "").await.unwrap().contains("chunk objects not read"));
+    // A damaged chunk object is reported as damaged, not missing.
+    std::fs::write(object_path(&s.dir, "chunks", s.chunks[0].as_bytes()), b"\0not the chunk").unwrap();
+    let (json, _) = verify_json(&s.config, &[]).await;
+    assert_eq!(json["problems"]["by_kind"]["chunk_object_corrupt"], 1, "{json}");
+    // The manifest object is gone: reported (what it names cannot be checked without it).
+    std::fs::remove_file(object_path(&s.dir, "manifests", s.manifest.as_bytes())).unwrap();
+    let (json, ok) = verify_json(&s.config, &[]).await;
+    assert!(!ok);
+    assert_eq!(json["problems"]["by_kind"]["manifest_object_missing"], 1, "{json}");
+    // Verify never repairs: the same report again.
+    let (again, _) = verify_json(&s.config, &[]).await;
+    assert_eq!(again["problems"]["by_kind"], json["problems"]["by_kind"]);
+}
+
+#[tokio::test]
+async fn verify_reports_index_damage_and_unknown_dependencies() {
+    let s = seeded().await;
+    let mut conn = raw_sqlite(&s.db_url).await;
+    // A wrong edge in a complete index, an orphan edge, an index row with no manifest, and a chunk that is not recorded.
+    sqlx::query("UPDATE manifest_chunks SET chunk = $1 WHERE manifest = $2 AND ordinal = 1")
+        .bind(s.chunks[0].as_bytes().to_vec())
+        .bind(s.manifest.as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO manifest_chunks (manifest, ordinal, chunk) VALUES ($1, 0, $2)")
+        .bind(vec![0xaa; 32])
+        .bind(s.chunks[0].as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO manifest_index (manifest, chunk_count, indexed_ordinals, state) VALUES ($1, 0, 0, 1)")
+        .bind(vec![0xbb; 32])
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let (json, ok) = verify_json(&s.config, &["--skip-chunk-reads"]).await;
+    assert!(!ok);
+    let by = &json["problems"]["by_kind"];
+    assert_eq!(
+        (by["index_mismatch"].as_u64(), by["orphan_edges"].as_u64(), by["index_without_manifest"].as_u64()),
+        (Some(1), Some(1), Some(1)),
+        "{json}"
+    );
+    let mismatch = json["problems"]["listed"].as_array().unwrap().iter().find(|p| p["kind"] == "index_mismatch").unwrap();
+    assert_eq!(mismatch["detail"], "ordinal 1: wrong_chunk");
+    // A chunk the database does not record: both the manifest walk and the audit say so.
+    sqlx::query("DELETE FROM blobs WHERE kind = 0 AND id = $1").bind(s.chunks[0].as_bytes().to_vec()).execute(&mut conn).await.unwrap();
+    let (json, _) = verify_json(&s.config, &["--skip-chunk-reads"]).await;
+    assert!(json["problems"]["by_kind"]["chunk_not_recorded"].as_u64().unwrap() >= 1, "{json}");
+    assert!(json["problems"]["by_kind"]["unknown_dependency"].as_u64().unwrap() >= 1, "{json}");
+    // A version that names a manifest that is not recorded.
+    sqlx::query("DELETE FROM blobs WHERE kind = 1 AND id = $1").bind(s.manifest.as_bytes().to_vec()).execute(&mut conn).await.unwrap();
+    let (json, _) = verify_json(&s.config, &["--skip-chunk-reads"]).await;
+    assert_eq!(json["problems"]["by_kind"]["root_manifest_unknown"], 1, "{json}");
+    // Nothing was repaired or removed by looking.
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM manifest_chunks").fetch_one(&mut conn).await.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn an_index_built_after_the_fact_is_exact_and_verify_notices_until_then() {
+    let s = seeded().await;
+    let mut conn = raw_sqlite(&s.db_url).await;
+    // The index as an upgrade finds it: manifests recorded, nothing indexed.
+    sqlx::query("DELETE FROM manifest_chunks").execute(&mut conn).await.unwrap();
+    sqlx::query("DELETE FROM manifest_index").execute(&mut conn).await.unwrap();
+    let (json, ok) = verify_json(&s.config, &[]).await;
+    assert!(ok, "an incomplete index is a notice, not a problem: {json}");
+    assert_eq!((json["index"]["absent"].as_u64(), json["index"]["all_complete"].as_bool()), (Some(1), Some(false)));
+    assert_eq!(json["notices"]["manifests_without_complete_index"], 1);
+    assert!(cli(&["verify", "--config", &s.config], "").await.unwrap().contains("index build"));
+
+    // A build in batches of two edges, then it is complete, exact, and verify says so.
+    let out = cli(&["index", "build", "--config", &s.config, "--batch-rows", "2"], "").await.unwrap();
+    assert!(out.contains("indexed 1 manifest(s)"), "{out}");
+    assert_eq!(
+        s.meta.index_edges(&s.manifest).await.unwrap().iter().map(|(_, c)| *c).collect::<Vec<_>>(),
+        vec![s.chunks[0], s.chunks[1], s.chunks[0]]
+    );
+    let (json, ok) = verify_json(&s.config, &[]).await;
+    assert!(ok);
+    assert_eq!(json["index"]["all_complete"], true);
+    // Again changes nothing.
+    assert!(cli(&["index", "build", "--config", &s.config], "").await.unwrap().contains("indexed 0 manifest(s)"));
+    assert!(matches!(cli(&["index", "build", "--config", &s.config, "--batch-rows", "0"], "").await, Err(CliError::Usage(_))));
+
+    // A manifest whose object cannot be read is reported and stays unindexed: nothing is guessed from the database.
+    sqlx::query("DELETE FROM manifest_chunks").execute(&mut conn).await.unwrap();
+    sqlx::query("DELETE FROM manifest_index").execute(&mut conn).await.unwrap();
+    std::fs::remove_file(object_path(&s.dir, "manifests", s.manifest.as_bytes())).unwrap();
+    let built = cli(&["index", "build", "--config", &s.config], "").await;
+    assert!(matches!(built, Err(CliError::Inconsistent(_))), "{built:?}");
+    assert_eq!(s.meta.index_state(&s.manifest).await.unwrap(), craft_cloud_meta::IndexState::Absent);
+    assert!(s.meta.index_edges(&s.manifest).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn verify_needs_a_config() {
+    assert!(matches!(cli(&["verify"], "").await, Err(CliError::Usage(m)) if m.contains("--config")));
+}

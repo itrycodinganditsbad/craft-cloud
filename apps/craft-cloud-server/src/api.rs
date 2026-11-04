@@ -334,6 +334,9 @@ async fn put_manifest(
     state.meta.check_room(auth.space, BlobKind::Manifest, id.as_bytes(), body.len() as u64 + 1).await?;
     state.store.put(BlobKey::manifest(&id), &body).await?;
     state.meta.add_manifest(auth.space, &manifest, body.len() as u64 + 1, state.now_ms()).await?;
+    // The index of its chunks is complete before the upload is acknowledged: a manifest of up to the index budget was indexed
+    // in the transaction above, a longer one is finished here in batches (and by `index build` if this is cut short).
+    state.meta.index_complete(&manifest).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
