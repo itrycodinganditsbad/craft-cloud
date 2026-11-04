@@ -45,6 +45,19 @@ pub mod codes {
     pub const ACCOUNT_DISABLED: &str = "account_disabled";
     /// An admin change would leave the server without an enabled administrator (HTTP 409).
     pub const LAST_ADMIN: &str = "last_admin";
+    /// A password sign-in (or the redeeming of an invite or reset code for an account with two-factor sign-in) was
+    /// right, but needs a second factor (HTTP 401, no token). The answer's `two_factor` carries the challenge.
+    pub const TWO_FACTOR_REQUIRED: &str = "two_factor_required";
+    /// A code or recovery code was wrong, or a code was used before (HTTP 401 at sign-in and join, which are not
+    /// signed in, and 403 on a signed-in route, where a 401 would read as "this device was revoked").
+    pub const TWO_FACTOR_INVALID: &str = "two_factor_invalid";
+    /// The server has no key for two-factor secrets (`[two_factor] key_file`), so it can't set it up (HTTP 503).
+    pub const TWO_FACTOR_UNAVAILABLE: &str = "two_factor_unavailable";
+    /// A set-up is running on another device (HTTP 409).
+    pub const TWO_FACTOR_PENDING: &str = "two_factor_pending";
+    /// Too many wrong codes: every check of this account's second factor is refused until `Retry-After` is over
+    /// (HTTP 429). A lock never lasts for good.
+    pub const TWO_FACTOR_LOCKED: &str = "two_factor_locked";
     pub const INTERNAL: &str = "internal";
 }
 
@@ -54,6 +67,22 @@ pub mod codes {
 pub struct ErrorAnswer {
     pub error: String,
     pub message: String,
+}
+
+/// The second step of a sign-in: what `two_factor_required` carries. `challenge` is a secret, good once and until
+/// `expires_ms` (milliseconds since the Unix epoch, by the server's clock); the code or recovery code goes with it to
+/// `POST /auth/login/second-factor`. Its `Debug` output hides the challenge. For `POST /join` there is no challenge
+/// (the code is simply sent again with the second factor): `challenge` is empty there.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoFactorChallenge {
+    pub challenge: String,
+    pub expires_ms: i64,
+}
+
+impl std::fmt::Debug for TwoFactorChallenge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoFactorChallenge").field("challenge", &"<redacted>").field("expires_ms", &self.expires_ms).finish()
+    }
 }
 
 /// Where an add-a-computer code stands, in [`PairingStatus`].
@@ -142,6 +171,17 @@ mod tests {
         assert_eq!(codes::FORBIDDEN, "forbidden");
         assert_eq!(codes::ACCOUNT_DISABLED, "account_disabled");
         assert_eq!(codes::LAST_ADMIN, "last_admin");
+    }
+
+    #[test]
+    fn the_two_factor_codes_are_stable_and_a_challenge_hides_itself() {
+        assert_eq!(codes::TWO_FACTOR_REQUIRED, "two_factor_required");
+        assert_eq!(codes::TWO_FACTOR_INVALID, "two_factor_invalid");
+        assert_eq!(codes::TWO_FACTOR_UNAVAILABLE, "two_factor_unavailable");
+        assert_eq!(codes::TWO_FACTOR_PENDING, "two_factor_pending");
+        assert_eq!(codes::TWO_FACTOR_LOCKED, "two_factor_locked");
+        let shown = format!("{:?}", TwoFactorChallenge { challenge: "challenge-secret".into(), expires_ms: 5 });
+        assert!(!shown.contains("challenge-secret") && shown.contains("<redacted>"), "{shown}");
     }
 
     #[test]

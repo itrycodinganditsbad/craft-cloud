@@ -9,7 +9,7 @@ use crate::ids::{DeviceId, Epoch, NodeId, SpaceId};
 use crate::ops::{Conflict, Op};
 
 /// What apps see of these bodies lives in `craft-cloud-api` (no postcard), re-exported here.
-pub use craft_cloud_api::api::{AccountInfo, DeviceInfo, ErrorAnswer, PairingState, PairingStatus, codes};
+pub use craft_cloud_api::api::{AccountInfo, DeviceInfo, ErrorAnswer, PairingState, PairingStatus, TwoFactorChallenge, codes};
 
 /// Protocol versions this build speaks. A client and server must share at least one.
 pub const PROTOCOL_MIN: u32 = 1;
@@ -108,8 +108,10 @@ impl std::fmt::Debug for PairingCreated {
 
 /// `POST /api/v1/join` (no auth): redeem an invite or an add-a-computer code (normalised or as typed) for a new
 /// device; answered with a [`LoginResponse`]. `password` is required, and only taken, for an invite to an account
-/// that has none yet. `client_kind`, `platform` and `app_version` are as in [`LoginRequest`]. Its `Debug` output hides
-/// the code and the password.
+/// that has none yet. `client_kind`, `platform` and `app_version` are as in [`LoginRequest`]. `totp_code` or
+/// `recovery_code` (one of them) is the second factor of an account that has two-factor sign-in: the server answers
+/// `two_factor_required` without using the code up, and the same body is sent again with it. Its `Debug` output hides
+/// the code, the password and the second factor.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRequest {
     pub code: String,
@@ -123,6 +125,10 @@ pub struct JoinRequest {
     pub platform: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
 }
 
 impl std::fmt::Debug for JoinRequest {
@@ -134,6 +140,8 @@ impl std::fmt::Debug for JoinRequest {
             .field("client_kind", &self.client_kind)
             .field("platform", &self.platform)
             .field("app_version", &self.app_version)
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -167,27 +175,183 @@ pub struct RevokedOthers {
     pub revoked: u32,
 }
 
+// ---- two-factor sign-in (`/api/v1/account/two-factor/…`, `/api/v1/auth/login/second-factor`) ----
+//
+// The second factor is a TOTP code (`totp_code`, six digits) or a recovery code (`recovery_code`, 16 letters and
+// digits, with dashes or without). A wrong one is `403 two_factor_invalid` on a signed-in route and `401` at sign-in and
+// join (which are not signed in); too many wrong ones lock the account's second factor for a while (`429
+// two_factor_locked` with `Retry-After`). Every type here that holds a secret hides it in `Debug`.
+
+/// `POST /account/two-factor/setup`: the account's password starts setting two-factor sign-in up. Its `Debug` output
+/// hides the password.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoFactorSetupRequest {
+    pub password: String,
+}
+
+impl std::fmt::Debug for TwoFactorSetupRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoFactorSetupRequest").field("password", &"<redacted>").finish()
+    }
+}
+
+/// The answer to a set-up: the secret as Base32 without padding and as an `otpauth://` URI (for a QR code), good until
+/// `expires_ms`. Shown once. Its `Debug` output hides both.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoFactorSetupResponse {
+    pub secret: String,
+    pub otpauth_uri: String,
+    pub expires_ms: i64,
+}
+
+impl std::fmt::Debug for TwoFactorSetupResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoFactorSetupResponse")
+            .field("secret", &"<redacted>")
+            .field("otpauth_uri", &"<redacted>")
+            .field("expires_ms", &self.expires_ms)
+            .finish()
+    }
+}
+
+/// `POST /account/two-factor/confirm`: the first code from the authenticator app turns two-factor sign-in on. Its
+/// `Debug` output hides the code.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoFactorConfirmRequest {
+    pub totp_code: String,
+}
+
+impl std::fmt::Debug for TwoFactorConfirmRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoFactorConfirmRequest").field("totp_code", &"<redacted>").finish()
+    }
+}
+
+/// `POST /account/two-factor/disable` and `POST /account/two-factor/recovery-codes`: the password and one second
+/// factor (`recovery-codes` takes `totp_code` only). Its `Debug` output hides all three.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoFactorProofRequest {
+    pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
+}
+
+impl std::fmt::Debug for TwoFactorProofRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoFactorProofRequest")
+            .field("password", &"<redacted>")
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Ten recovery codes, shown once (in groups of four, like `ABCD-EFGH-JKMN-PQRS`; any case, with or without dashes is
+/// accepted back). Each works once. Its `Debug` output hides them.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryCodes {
+    pub recovery_codes: Vec<String>,
+}
+
+impl std::fmt::Debug for RecoveryCodes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryCodes").field("recovery_codes", &format_args!("<{} redacted>", self.recovery_codes.len())).finish()
+    }
+}
+
+/// `GET /account/two-factor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoFactorStatus {
+    pub enabled: bool,
+    /// When it was turned on.
+    #[serde(default)]
+    pub enabled_ms: Option<i64>,
+    /// Recovery codes not used yet (0 while it is off).
+    pub recovery_codes_left: u32,
+    /// A set-up is running (it ends after ten minutes or five wrong codes).
+    pub pending: bool,
+}
+
+/// `POST /auth/login/second-factor`: the challenge `two_factor_required` gave, and one second factor. Answered with a
+/// [`LoginResponse`]. Its `Debug` output hides all of it.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecondFactorRequest {
+    pub challenge: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
+}
+
+impl std::fmt::Debug for SecondFactorRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecondFactorRequest")
+            .field("challenge", &"<redacted>")
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 // ---- the admin API (`/api/v1/admin/…`, an admin's device token) ----
 //
 // Every change asks for a fresh confirmation in its body: the acting admin's `password`. A device token never expires,
 // so a stolen admin token alone must not be enough. A missing or mistyped field is `400 invalid`, a wrong password `403
-// wrong_password` (never 401). A later release adds optional `totp_code` and `recovery_code` fields to the same bodies
-// for an admin with two-factor sign-in; a body without them keeps working for an admin without it, and fields a server
-// does not know are ignored, so nothing here has to change for that.
+// wrong_password` (never 401). An admin with two-factor sign-in adds `totp_code` (or `recovery_code`) to the same
+// bodies; a body without them keeps working for an admin without it, and fields a server does not know are ignored.
 
 /// The body of an admin change that needs nothing but the confirmation: `POST …/disable`, `POST …/enable`,
-/// `DELETE /admin/users/{id}`, `POST` and `DELETE …/invite`, `POST …/password-reset` and `DELETE …/devices/{id}`. Its
-/// `Debug` output hides the password.
+/// `DELETE /admin/users/{id}`, `POST` and `DELETE …/invite`, `POST …/reset-two-factor` and `DELETE …/devices/{id}`. Its
+/// `Debug` output hides the password and the second factor.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminConfirm {
     /// The acting admin's current password. Missing: `400 invalid`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// The acting admin's code, when their account has two-factor sign-in. Missing or wrong then: `403
+    /// two_factor_invalid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    /// A recovery code instead of `totp_code`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
 }
 
 impl std::fmt::Debug for AdminConfirm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AdminConfirm").field("password", &self.password.as_ref().map(|_| "<redacted>")).finish()
+        f.debug_struct("AdminConfirm")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// `POST /admin/users/{id}/password-reset`: the confirmation as in [`AdminConfirm`], and whether redeeming the code also
+/// turns the account's two-factor sign-in off (`reset_two_factor`, default `false`: an account that has it then needs
+/// its second factor to redeem the code). Its `Debug` output hides the password and the second factor.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminPasswordReset {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
+    #[serde(default)]
+    pub reset_two_factor: bool,
+}
+
+impl std::fmt::Debug for AdminPasswordReset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminPasswordReset")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .field("reset_two_factor", &self.reset_two_factor)
+            .finish()
     }
 }
 
@@ -217,7 +381,7 @@ pub struct AdminUserInfo {
     pub created_ms: i64,
     /// When an admin disabled it (`null`: enabled).
     pub disabled_ms: Option<i64>,
-    /// Always `false` until the server has two-factor sign-in.
+    /// Whether the account has two-factor sign-in on.
     pub two_factor_enabled: bool,
     /// Devices that are not revoked.
     pub devices_active: u64,
@@ -245,6 +409,10 @@ pub struct AdminCreateUser {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
 }
 
 impl std::fmt::Debug for AdminCreateUser {
@@ -253,6 +421,8 @@ impl std::fmt::Debug for AdminCreateUser {
             .field("username", &self.username)
             .field("role", &self.role)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -294,6 +464,10 @@ pub struct AdminUpdateUser {
     pub quota_bytes: Option<Option<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
 }
 
 /// A field that is there, `null` or not: `Some(None)` for `null`, `Some(Some(x))` for a value (a missing field is
@@ -312,6 +486,8 @@ impl std::fmt::Debug for AdminUpdateUser {
             .field("role", &self.role)
             .field("quota_bytes", &self.quota_bytes)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -443,7 +619,8 @@ pub struct QuotaUse {
 }
 
 /// Every error answer. `error` is a stable code, one of [`codes`]; `message` is for people. `conflicts` is
-/// set for `conflict`, `missing` for `missing_chunks`, `quota` for `quota_exceeded`. Clients ignore codes and JSON
+/// set for `conflict`, `missing` for `missing_chunks`, `quota` for `quota_exceeded`, `two_factor` for
+/// `two_factor_required`. Clients ignore codes and JSON
 /// fields they don't know (the server may add more later), so match on the codes you handle and treat the rest by
 /// HTTP status.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -456,6 +633,9 @@ pub struct ErrorBody {
     pub missing: Option<Vec<ChunkId>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<QuotaUse>,
+    /// Set for `two_factor_required`: the challenge to answer at `POST /auth/login/second-factor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_factor: Option<TwoFactorChallenge>,
 }
 
 /// Response header carrying the space's epoch on every signed-in request.
@@ -481,15 +661,67 @@ mod tests {
         let shown = format!("{change:?}");
         assert!(!shown.contains("old-secret-pw") && !shown.contains("new-secret-pw"), "{shown}");
         assert_eq!(shown.matches("<redacted>").count(), 2);
-        let confirm = AdminConfirm { password: Some("admin-secret-pw".into()) };
-        assert!(!format!("{confirm:?}").contains("admin-secret-pw"));
-        let create = AdminCreateUser { username: "ana".into(), role: "member".into(), password: Some("admin-secret-pw".into()) };
+        let confirm = AdminConfirm {
+            password: Some("admin-secret-pw".into()),
+            totp_code: Some("918273".into()),
+            recovery_code: Some("RECOVERYSECRET00".into()),
+        };
+        let shown = format!("{confirm:?}");
+        assert!(!shown.contains("admin-secret-pw") && !shown.contains("918273") && !shown.contains("RECOVERYSECRET"), "{shown}");
+        let reset =
+            AdminPasswordReset { password: Some("admin-secret-pw".into()), totp_code: Some("918273".into()), ..AdminPasswordReset::default() };
+        let shown = format!("{reset:?}");
+        assert!(!shown.contains("admin-secret-pw") && !shown.contains("918273"), "{shown}");
+        let create =
+            AdminCreateUser { username: "ana".into(), role: "member".into(), password: Some("admin-secret-pw".into()), ..AdminCreateUser::default() };
         assert!(!format!("{create:?}").contains("admin-secret-pw"));
         let update = AdminUpdateUser { password: Some("admin-secret-pw".into()), ..AdminUpdateUser::default() };
         assert!(!format!("{update:?}").contains("admin-secret-pw"));
         let code = AdminCode { code: "ABCDEFGHJKMNPQRS".into(), join_url: Some("cloud.example.org/ABCD-EFGH-JKMN-PQRS".into()), expires_ms: 1 };
         let shown = format!("{code:?} {:?}", AdminCreatedUser { user: sample_user(), invite: code.clone() });
         assert!(!shown.contains("ABCDEFGH") && !shown.contains("cloud.example.org"), "{shown}");
+    }
+
+    #[test]
+    fn two_factor_secrets_stay_out_of_debug_output() {
+        let setup = TwoFactorSetupResponse {
+            secret: "JBSWY3DPEHPK3PXP".into(),
+            otpauth_uri: "otpauth://totp/Craft%20Cloud:ana?secret=JBSWY3DPEHPK3PXP".into(),
+            expires_ms: 5,
+        };
+        let shown = format!("{setup:?}");
+        assert!(!shown.contains("JBSWY3DP") && !shown.contains("otpauth:"), "{shown}");
+        let codes = RecoveryCodes { recovery_codes: vec!["ABCD-EFGH-JKMN-PQRS".into(), "WXYZ-0123-4567-89AB".into()] };
+        let shown = format!("{codes:?}");
+        assert!(!shown.contains("ABCD") && !shown.contains("WXYZ"), "{shown}");
+        let second =
+            SecondFactorRequest { challenge: "challenge-secret".into(), totp_code: Some("123456".into()), recovery_code: Some("RC-SECRET".into()) };
+        let shown = format!("{second:?}");
+        assert!(!shown.contains("challenge-secret") && !shown.contains("123456") && !shown.contains("RC-SECRET"), "{shown}");
+        let proof = TwoFactorProofRequest { password: "pw-secret-1".into(), totp_code: Some("654321".into()), recovery_code: None };
+        let shown = format!("{proof:?}");
+        assert!(!shown.contains("pw-secret-1") && !shown.contains("654321"), "{shown}");
+        assert!(!format!("{:?}", TwoFactorSetupRequest { password: "pw-secret-1".into() }).contains("pw-secret-1"));
+        assert!(!format!("{:?}", TwoFactorConfirmRequest { totp_code: "654321".into() }).contains("654321"));
+        let join = JoinRequest {
+            code: "K7M4Q9TX".into(),
+            totp_code: Some("111222".into()),
+            recovery_code: Some("RC-SECRET".into()),
+            ..JoinRequest::default()
+        };
+        let shown = format!("{join:?}");
+        assert!(!shown.contains("111222") && !shown.contains("RC-SECRET"), "{shown}");
+        let body = ErrorBody {
+            error: codes::TWO_FACTOR_REQUIRED.into(),
+            message: "m".into(),
+            two_factor: Some(TwoFactorChallenge { challenge: "challenge-secret".into(), expires_ms: 1 }),
+            ..ErrorBody::default()
+        };
+        assert!(!format!("{body:?}").contains("challenge-secret"));
+        // The challenge travels in the error body, and an older client that doesn't know the field ignores it.
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["two_factor"], serde_json::json!({ "challenge": "challenge-secret", "expires_ms": 1 }));
+        assert_eq!(serde_json::from_value::<ErrorBody>(json).unwrap(), body);
     }
 
     fn sample_user() -> AdminUserInfo {
@@ -521,9 +753,8 @@ mod tests {
 
     #[test]
     fn an_admin_body_ignores_fields_it_does_not_know() {
-        // A later release adds `totp_code` here, and today's server reads such a body as it reads one without it.
-        let confirm: AdminConfirm = serde_json::from_value(serde_json::json!({ "password": "p", "totp_code": "123456" })).unwrap();
-        assert_eq!(confirm.password.as_deref(), Some("p"));
+        let confirm: AdminConfirm = serde_json::from_value(serde_json::json!({ "password": "p", "totp_code": "123456", "later": 1 })).unwrap();
+        assert_eq!((confirm.password.as_deref(), confirm.totp_code.as_deref(), confirm.recovery_code), (Some("p"), Some("123456"), None));
         assert_eq!(serde_json::from_value::<AdminConfirm>(serde_json::json!({})).unwrap().password, None);
     }
 
