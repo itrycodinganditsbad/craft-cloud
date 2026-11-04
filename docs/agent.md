@@ -85,3 +85,18 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
   The first machine to open a file makes it a live document from the file's content (UTF-8 text only); the others
   join it. Changes go to every machine that has it open as they are made, and edits made offline merge when the
   machine is back. `doc` never writes the file: what it shows is the live document.
+
+## Local API: file history
+
+The local API exposes server history to desktop clients. Paths are relative to the synced folder and resolve through
+the agent's saved sync state; unknown or unsynced paths return `404 not_found`, paths outside the root return
+`400 invalid`, and folders return `400 invalid`.
+
+| Method and path | Request | Success |
+|---|---|---|
+| `GET /v1/files/history?path=<relative-path>&cursor=<opaque>&limit=<count>` | Query parameters; `cursor` and `limit` optional | `200` with `{versions, next}`; newest first |
+| `POST /v1/files/restore` | `{"path":"Notes/todo.txt","version":"…","expected_version":"…"}` | `200` with the new version, its parent, sequence and epoch |
+
+Restore requires the file's current version to match `expected_version`; otherwise the API answers `409 conflict`.
+The agent does not write restored bytes directly. Its normal change feed picks up the new server version and syncs it
+to disk.

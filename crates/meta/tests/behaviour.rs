@@ -104,6 +104,11 @@ on_every_backend!(
     ids_are_never_reused,
     the_change_feed_and_epochs,
     concurrent_commits_on_one_file_let_exactly_one_win,
+    history_pages_newest_first_for_own_files_only,
+    a_restore_is_a_new_version_after_the_head,
+    a_restore_refuses_what_it_can_not_restore,
+    concurrent_restores_let_exactly_one_win,
+    a_restore_and_a_late_save_record_both_apply,
     batch_size_is_limited,
     folders_nest_at_most_max_tree_depth,
     creating_or_moving_into_a_deleted_folder_brings_it_back,
@@ -1782,6 +1787,8 @@ async fn upgrading_counts_what_each_space_already_stores() {
         sqlx::query("DROP TABLE pairings").execute(&mut conn).await.unwrap();
         sqlx::query("DROP TABLE invites").execute(&mut conn).await.unwrap();
         // And before save records.
+        // And before the history index.
+        sqlx::query("DROP INDEX versions_node_seq").execute(&mut conn).await.unwrap();
         sqlx::query("ALTER TABLE versions DROP COLUMN save").execute(&mut conn).await.unwrap();
         sqlx::query("DELETE FROM schema_version WHERE version >= 2").execute(&mut conn).await.unwrap();
     }
@@ -1807,5 +1814,286 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 6);
+    assert_eq!(versions, 7);
+}
+
+/// A file with `n` versions, one commit each (the first by create): its node and the versions, oldest first.
+async fn file_with_versions(meta: &Meta, u: &UserRecord, dev: DeviceId, n: usize) -> (NodeId, Vec<NewVersion>) {
+    let r = root(meta, u).await;
+    let m = manifest(meta, u, 3).await;
+    let node = NodeId::generate();
+    let mut versions = vec![version(m)];
+    meta.commit(u.space, dev, &[Op::Create { node, parent: r, name: name("history.txt"), version: versions[0].clone() }], NOW).await.unwrap();
+    for i in 1..n {
+        let m = manifest(meta, u, 3 + i as u32).await;
+        let next = NewVersion { mtime_ms: NOW + i as i64, ..version(m) };
+        let expected = versions[i - 1].id;
+        meta.commit(u.space, dev, &[Op::Update { node, expected, version: next.clone() }], NOW + i as i64).await.unwrap();
+        versions.push(next);
+    }
+    (node, versions)
+}
+
+async fn file_named(meta: &Meta, u: &UserRecord, dev: DeviceId, file_name: &str) -> (NodeId, NewVersion) {
+    let r = root(meta, u).await;
+    let node = NodeId::generate();
+    let v = version(manifest(meta, u, 5).await);
+    meta.commit(u.space, dev, &[Op::Create { node, parent: r, name: name(file_name), version: v.clone() }], NOW).await.unwrap();
+    (node, v)
+}
+
+fn refused_restore<T: std::fmt::Debug>(result: Result<T, MetaError>) -> Vec<(usize, ConflictKind)> {
+    match result {
+        Err(MetaError::Rejected(list)) => list.into_iter().map(|c| (c.op, c.kind)).collect(),
+        other => panic!("expected a refused restore, got {other:?}"),
+    }
+}
+
+/// The history comes newest first in pages that follow each other without gaps or repeats, also across versions that
+/// share one sequence number (a batch of updates); only files of the caller's own space have one; a deleted file keeps
+/// its history; `pruned` is false and `save` tells whether a record hangs on the version.
+async fn history_pages_newest_first_for_own_files_only(meta: &Meta) {
+    use craft_cloud_proto::api::{HISTORY_MAX_LIMIT, HistoryCursor, HistoryVersion};
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let (node, mut versions) = file_with_versions(meta, &u, dev, 4).await;
+    // Three more versions in one commit: they share a sequence number, so the order inside it is by ID.
+    let (mut ops, mut prev) = (Vec::new(), versions[3].id);
+    for i in 0..3 {
+        let next = version(manifest(meta, &u, 20 + i).await);
+        ops.push(Op::Update { node, expected: prev, version: next.clone() });
+        prev = next.id;
+        versions.push(next);
+    }
+    meta.commit(u.space, dev, &ops, NOW + 100).await.unwrap();
+    let head = prev;
+    let epoch = meta.space_info(u.space).await.unwrap().epoch;
+
+    let all = meta.history(u.space, node, None, HISTORY_MAX_LIMIT).await.unwrap();
+    assert_eq!(all.next, None);
+    assert_eq!(all.versions.len(), 7);
+    let key = |v: &HistoryVersion| (v.seq, *v.id.as_uuid().as_bytes());
+    assert!(all.versions.windows(2).all(|w| key(&w[0]) > key(&w[1])), "strictly descending by (seq, id)");
+    assert!(all.versions.iter().all(|v| !v.pruned && !v.save && v.device == dev && v.epoch == epoch));
+    assert_eq!(all.versions.iter().filter(|v| v.seq == 5).count(), 3, "the batch shares one sequence number");
+    let oldest = all.versions.last().unwrap();
+    assert_eq!((oldest.id, oldest.parent_version, oldest.seq, oldest.size), (versions[0].id, None, 1, 3));
+    let second = &all.versions[all.versions.len() - 2];
+    assert_eq!((second.id, second.parent_version, second.mtime_ms, second.size), (versions[1].id, Some(versions[0].id), NOW + 1, 4));
+
+    for limit in [1u32, 2, 3] {
+        let (mut seen, mut after, mut pages) = (Vec::new(), None, 0);
+        loop {
+            let page = meta.history(u.space, node, after, limit).await.unwrap();
+            assert!(page.versions.len() <= limit as usize);
+            seen.extend(page.versions.iter().cloned());
+            pages += 1;
+            match page.next {
+                Some(next) => {
+                    let last = page.versions.last().unwrap();
+                    assert_eq!(next, HistoryCursor { seq: last.seq, version: last.id });
+                    after = Some(next);
+                }
+                None => break,
+            }
+        }
+        assert_eq!(seen, all.versions, "limit {limit}: every version once, in order");
+        assert_eq!(pages, 7usize.div_ceil(limit as usize));
+    }
+
+    // The limit is 1 to 200; a cursor past the end gives an empty last page.
+    assert!(matches!(meta.history(u.space, node, None, 0).await, Err(MetaError::Invalid(_))));
+    assert!(matches!(meta.history(u.space, node, None, HISTORY_MAX_LIMIT + 1).await, Err(MetaError::Invalid(_))));
+    let past = meta.history(u.space, node, Some(HistoryCursor { seq: 0, version: VersionId::generate() }), 10).await.unwrap();
+    assert_eq!((past.versions.len(), past.next), (0, None));
+
+    // A record hanging on a version shows as `save`.
+    let record = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::live::node_doc(u.space, node), frontiers: vec![(1, 5)] };
+    meta.attach_save(u.space, node, versions[1].id, &record).await.unwrap();
+    let with_save: Vec<_> = meta.history(u.space, node, None, HISTORY_MAX_LIMIT).await.unwrap().versions.into_iter().filter(|v| v.save).collect();
+    assert_eq!(with_save.iter().map(|v| v.id).collect::<Vec<_>>(), vec![versions[1].id]);
+
+    // Folders have no history, another account's node is not found, and a deleted file keeps its history.
+    let r = root(meta, &u).await;
+    assert!(matches!(meta.history(u.space, r, None, 10).await, Err(MetaError::Invalid(_))));
+    assert!(matches!(meta.history(u.space, NodeId::generate(), None, 10).await, Err(MetaError::NotFound(_))));
+    let bob = user(meta, "bob").await;
+    assert!(matches!(meta.history(bob.space, node, None, 10).await, Err(MetaError::NotFound(_))));
+    meta.commit(u.space, dev, &[Op::Delete { node, expected: Some(head) }], NOW + 200).await.unwrap();
+    assert_eq!(meta.history(u.space, node, None, HISTORY_MAX_LIMIT).await.unwrap().versions.len(), 7);
+}
+
+/// A restore is an ordinary update after the head: a fresh version with the old content (manifest, size, mtime), the
+/// head as its parent, the next sequence number, the same epoch and no save record; it shows in the change feed, and
+/// the old version stays where it was.
+async fn a_restore_is_a_new_version_after_the_head(meta: &Meta) {
+    use craft_cloud_proto::api::HISTORY_MAX_LIMIT;
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let other = meta.create_device(u.id, "phone", &[9u8; 32], NOW).await.unwrap();
+    let (node, versions) = file_with_versions(meta, &u, dev, 3).await;
+    let record = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::live::node_doc(u.space, node), frontiers: vec![(1, 5)] };
+    meta.attach_save(u.space, node, versions[0].id, &record).await.unwrap();
+    let before = meta.space_info(u.space).await.unwrap();
+
+    let done = meta.restore_version(u.space, other, node, versions[0].id, versions[2].id, NOW + 50).await.unwrap();
+    assert_eq!((done.parent_version, done.epoch, done.seq), (versions[2].id, before.epoch, before.seq + 1));
+    assert!(!versions.iter().any(|v| v.id == done.version), "a fresh version ID");
+    let after = meta.space_info(u.space).await.unwrap();
+    assert_eq!((after.seq, after.epoch), (before.seq + 1, before.epoch));
+
+    let feed = meta.changes(u.space, before.seq, None, MAX_PAGE_NODES).await.unwrap();
+    let NodeKind::File(f) = &find(&feed.nodes, node).kind else { panic!("a file") };
+    assert_eq!(
+        (f.version, f.manifest, f.mtime_ms, f.device, f.save.clone()),
+        (done.version, versions[0].manifest, versions[0].mtime_ms, other, None)
+    );
+
+    let history = meta.history(u.space, node, None, HISTORY_MAX_LIMIT).await.unwrap().versions;
+    assert_eq!(history.len(), 4);
+    assert_eq!(history[0].id, done.version);
+    assert_eq!((history[0].parent_version, history[0].size, history[0].save, history[0].seq), (Some(versions[2].id), 3, false, done.seq));
+    assert!(history.iter().any(|v| v.id == versions[0].id && v.save), "the old version and its record stay");
+
+    // The restored content is the head now: a stale `expected` is refused and changes nothing.
+    let stale = meta.restore_version(u.space, dev, node, versions[1].id, versions[2].id, NOW + 60).await;
+    assert_eq!(refused_restore(stale), vec![(0, ConflictKind::VersionMismatch { current: Some(done.version) })]);
+    assert_eq!(meta.space_info(u.space).await.unwrap().seq, after.seq);
+    // Restoring the content that is already current is allowed: it is one more version.
+    let again = meta.restore_version(u.space, dev, node, done.version, done.version, NOW + 70).await.unwrap();
+    assert_eq!(again.seq, after.seq + 1);
+}
+
+/// What a restore turns down, each leaving the space as it was: a folder, a deleted file, a file with a live document,
+/// a node or version that is not there, a version of another file, and anything of another account.
+async fn a_restore_refuses_what_it_can_not_restore(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let (space, dev) = (u.space, device(meta, &u).await);
+    let (file, versions) = file_with_versions(meta, &u, dev, 2).await;
+    let (second, second_version) = file_named(meta, &u, dev, "second.txt").await;
+    let r = root(meta, &u).await;
+    let seq = meta.space_info(space).await.unwrap().seq;
+    let (old, head) = (versions[0].id, versions[1].id);
+    let restore = |node: NodeId, source: VersionId, expected: VersionId| {
+        let meta = meta.clone();
+        async move { meta.restore_version(space, dev, node, source, expected, NOW + 9).await }
+    };
+
+    assert!(matches!(restore(r, old, head).await, Err(MetaError::Invalid(_))), "a folder");
+    assert!(matches!(restore(NodeId::generate(), old, head).await, Err(MetaError::NotFound(_))), "no such node");
+    assert!(matches!(restore(file, VersionId::generate(), head).await, Err(MetaError::NotFound(_))), "no such version");
+    assert!(matches!(restore(file, second_version.id, head).await, Err(MetaError::NotFound(_))), "a version of another file");
+    // The source is checked before the head: a missing source is not a conflict.
+    assert!(matches!(restore(file, VersionId::generate(), VersionId::generate()).await, Err(MetaError::NotFound(_))));
+    assert_eq!(refused_restore(restore(file, old, VersionId::generate()).await).len(), 1, "a head that is not current");
+
+    let bob = user(meta, "bob").await;
+    let bob_device = device(meta, &bob).await;
+    assert!(matches!(meta.restore_version(bob.space, bob_device, file, old, head, NOW).await, Err(MetaError::NotFound(_))), "another space's node");
+
+    // A file with a live document.
+    let doc = craft_cloud_proto::live::node_doc(space, second);
+    meta.create_live_doc(space, doc, "document:kitdemo", Some(second), NOW).await.unwrap();
+    assert!(matches!(restore(second, second_version.id, second_version.id).await, Err(MetaError::Invalid(_))), "a live document");
+    assert_eq!(meta.space_info(space).await.unwrap().seq, seq, "nothing changed so far");
+
+    // A deleted file.
+    meta.commit(space, dev, &[Op::Delete { node: file, expected: Some(head) }], NOW + 5).await.unwrap();
+    assert!(matches!(restore(file, old, head).await, Err(MetaError::Invalid(_))), "a deleted file");
+    assert_eq!(meta.space_info(space).await.unwrap().seq, seq + 1, "only the delete");
+    let feed = meta.changes(space, seq, None, MAX_PAGE_NODES).await.unwrap();
+    assert!(feed.nodes.len() == 1 && find(&feed.nodes, file).deleted, "still deleted");
+}
+
+/// Several restores of different old versions against one head: exactly one applies, the rest are refused with a
+/// version mismatch, and the space moves one step.
+async fn concurrent_restores_let_exactly_one_win(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let (node, versions) = file_with_versions(meta, &u, dev, 3).await;
+    let head = versions[2].id;
+    let before = meta.space_info(u.space).await.unwrap().seq;
+    let mut tasks = Vec::new();
+    for i in 0..8 {
+        let (meta, space, source) = (meta.clone(), u.space, versions[i % 2].id);
+        tasks.push(tokio::spawn(async move { meta.restore_version(space, dev, node, source, head, NOW + 20).await }));
+    }
+    let mut wins = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(_) => wins += 1,
+            Err(MetaError::Rejected(list)) => assert!(matches!(list[0].kind, ConflictKind::VersionMismatch { .. })),
+            Err(other) => panic!("unexpected error {other:?}"),
+        }
+    }
+    assert_eq!(wins, 1);
+    assert_eq!(meta.space_info(u.space).await.unwrap().seq, before + 1);
+}
+
+/// A restore and a late save record for the head it replaces run together: both apply under the space's one lock, the
+/// record stays on the version it was meant for, and the restored version never gets a record.
+async fn a_restore_and_a_late_save_record_both_apply(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let (node, versions) = file_with_versions(meta, &u, dev, 3).await;
+    let (head, old) = (versions[2].id, versions[0].id);
+    let record = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::live::node_doc(u.space, node), frontiers: vec![(1, 5)] };
+    let (m1, m2, space) = (meta.clone(), meta.clone(), u.space);
+    let save = tokio::spawn(async move { m1.attach_save(space, node, head, &record).await });
+    let restore = tokio::spawn(async move { m2.restore_version(space, dev, node, old, head, NOW + 30).await });
+    save.await.unwrap().unwrap();
+    let restored = restore.await.unwrap().unwrap();
+    let history = meta.history(space, node, None, 50).await.unwrap().versions;
+    assert_eq!(history.len(), 4);
+    for v in &history {
+        assert_eq!(v.save, v.id == head, "only the old head has the record: {}", v.id);
+    }
+    assert_eq!(history[0].id, restored.version);
+    // The create, two updates, the record and the restore.
+    assert_eq!(meta.space_info(space).await.unwrap().seq, 5);
+}
+
+/// The database at the newest version when the code knows it: the version table holds one row per migration, and a
+/// database written by a newer build is refused rather than half-read.
+#[tokio::test]
+async fn the_schema_version_is_recorded_and_a_newer_database_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}", dir.path().join("meta.db").display());
+    drop(Meta::open(&url).await.unwrap());
+    use sqlx::Connection;
+    let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+    let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
+    assert_eq!(latest, 7);
+    // Opening again changes nothing.
+    drop(Meta::open(&url).await.unwrap());
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
+    assert_eq!(rows, 7);
+    sqlx::query("INSERT INTO schema_version (version) VALUES (8)").execute(&mut conn).await.unwrap();
+    drop(conn);
+    assert!(matches!(Meta::open(&url).await, Err(MetaError::Corrupt(_))), "a newer database is refused");
+}
+
+/// A history page is read through the index on `(space_id, node, seq, id)`, not by scanning the versions table.
+#[tokio::test]
+async fn a_history_page_uses_the_node_index_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}", dir.path().join("meta.db").display());
+    drop(Meta::open(&url).await.unwrap());
+    use sqlx::Connection;
+    let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+    let plan = sqlx::query(
+        "EXPLAIN QUERY PLAN SELECT id FROM versions WHERE space_id = ?1 AND node = ?2 AND (seq, id) < (?3, ?4) ORDER BY seq DESC, id DESC LIMIT ?5",
+    )
+    .bind(vec![0u8; 16])
+    .bind(vec![0u8; 16])
+    .bind(i64::MAX)
+    .bind(vec![0xffu8; 16])
+    .bind(51i64)
+    .fetch_all(&mut conn)
+    .await
+    .unwrap();
+    use sqlx::Row;
+    let detail: Vec<String> = plan.iter().map(|r| r.get::<String, _>("detail")).collect();
+    assert!(detail.iter().any(|d| d.contains("versions_node_seq")), "{detail:?}");
+    assert!(!detail.iter().any(|d| d.contains("TEMP B-TREE")), "no sort: {detail:?}");
 }

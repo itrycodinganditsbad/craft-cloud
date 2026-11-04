@@ -10,7 +10,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use craft_cloud_app::{Client, DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingStatus, Status, Uuid};
+use craft_cloud_app::{
+    Client, DeviceId, DeviceInfo, Error, HistoryResponse, JoinRequest, PairingInfo, PairingStatus, RestoreResponse, Status, Uuid, VersionId,
+};
 
 use crate::model::{Effect, Event};
 
@@ -33,6 +35,8 @@ pub trait Agent: Send + Sync {
     fn resume(&self) -> Result<Status, Error>;
     fn quit(&self) -> Result<Status, Error>;
     fn set_autostart(&self, on: bool) -> Result<Status, Error>;
+    fn file_history(&self, path: &str, cursor: Option<&str>) -> Result<HistoryResponse, Error>;
+    fn restore_file(&self, path: &str, version: VersionId, expected_version: VersionId) -> Result<RestoreResponse, Error>;
 }
 
 /// The agent through `craft_cloud_app::Client`. It finds the agent again whenever a call finds it gone (the agent
@@ -112,6 +116,12 @@ impl Agent for ClientAgent {
     }
     fn set_autostart(&self, on: bool) -> Result<Status, Error> {
         self.with(|c| c.set_autostart(on))
+    }
+    fn file_history(&self, path: &str, cursor: Option<&str>) -> Result<HistoryResponse, Error> {
+        self.with(|c| c.file_history(path, cursor, Some(50)))
+    }
+    fn restore_file(&self, path: &str, version: VersionId, expected_version: VersionId) -> Result<RestoreResponse, Error> {
+        self.with(|c| c.restore_file(path, version, expected_version))
     }
 }
 
@@ -199,6 +209,10 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         }
         Effect::Devices => Event::Devices(agent.devices()),
         Effect::RemoveDevice(id) => Event::Devices(agent.remove_device(id)),
+        Effect::History { path, cursor, ticket } => Event::History { ticket, result: agent.file_history(&path, cursor.as_deref()) },
+        Effect::Restore { path, version, expected_version, ticket } => {
+            Event::Restored { ticket, result: agent.restore_file(&path, version, expected_version) }
+        }
         Effect::Logout { local } => Event::SignedOut(agent.logout(local)),
         Effect::Pause => Event::Answered(agent.pause()),
         Effect::Resume => Event::Answered(agent.resume()),
@@ -286,6 +300,12 @@ pub(crate) mod fake {
         }
         fn set_autostart(&self, on: bool) -> Result<Status, Error> {
             self.answer("set_autostart", |s| Status { autostart: Some(on), ..s.clone() })
+        }
+        fn file_history(&self, _path: &str, _cursor: Option<&str>) -> Result<HistoryResponse, Error> {
+            self.answer("file_history", |_| HistoryResponse { versions: Vec::new(), next: None })
+        }
+        fn restore_file(&self, _path: &str, _version: VersionId, _expected_version: VersionId) -> Result<RestoreResponse, Error> {
+            Err(Error::Refused { code: "invalid".into(), message: "not configured".into() })
         }
     }
 }
