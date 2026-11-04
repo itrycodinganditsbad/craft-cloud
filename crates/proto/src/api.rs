@@ -480,6 +480,9 @@ pub struct AuditDetails {
     /// The device an admin or the command line signed out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<DeviceId>,
+    /// Set (to `true`) when redeeming a password reset code also turned the account's two-factor sign-in off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_factor_removed: Option<bool>,
     /// Set when the values were too long for the log and whole fields were left out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,

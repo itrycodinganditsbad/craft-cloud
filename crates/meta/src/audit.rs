@@ -164,7 +164,7 @@ impl AuditAction {
         use Field::*;
         match self {
             AuditAction::AuthLogin | AuditAction::JoinInviteRedeemed | AuditAction::JoinPairingRedeemed => &[ClientKind, Platform],
-            AuditAction::JoinResetRedeemed => &[Revoked, ClientKind, Platform],
+            AuditAction::JoinResetRedeemed => &[Revoked, TwoFactorRemoved, ClientKind, Platform],
             AuditAction::AuthLoginFailed | AuditAction::AuthSecondFactorFailed => &[Step],
             AuditAction::DeviceRevoked => &[Reason],
             AuditAction::DeviceRevokedOthers => &[Revoked, Reason],
@@ -206,6 +206,8 @@ pub enum Field {
     QuotaBytes,
     Revoked,
     Device,
+    /// A reset code redeemed for an account that had two-factor sign-in turned it off.
+    TwoFactorRemoved,
 }
 
 /// The platforms an event names. A device may call its platform any printable text; only these reach the log.
@@ -301,6 +303,8 @@ pub struct AuditDetails {
     pub quota_bytes: Option<Option<u64>>,
     pub revoked: Option<u32>,
     pub device: Option<DeviceId>,
+    /// Redeeming a reset code also took the account's two-factor sign-in away (only ever set to `true`).
+    pub two_factor_removed: bool,
 }
 
 impl AuditDetails {
@@ -333,6 +337,7 @@ impl AuditDetails {
             Field::QuotaBytes => self.quota_bytes.map(|v| v.map_or(Value::Null, Value::from)),
             Field::Revoked => self.revoked.map(Value::from),
             Field::Device => self.device.map(|v| Value::from(v.to_string())),
+            Field::TwoFactorRemoved => self.two_factor_removed.then_some(Value::Bool(true)),
         }
     }
 
@@ -347,6 +352,7 @@ impl AuditDetails {
             Field::QuotaBytes => "quota_bytes",
             Field::Revoked => "revoked",
             Field::Device => "device",
+            Field::TwoFactorRemoved => "two_factor_removed",
         }
     }
 
@@ -899,6 +905,7 @@ mod tests {
             quota_bytes: Some(None),
             revoked: Some(3),
             device: Some(DeviceId::from_uuid(Uuid::nil())),
+            two_factor_removed: true,
         };
         let keys = |action: AuditAction| -> Vec<String> {
             let value: Value = serde_json::from_str(&all.to_json(action)).unwrap();
@@ -912,6 +919,8 @@ mod tests {
         assert_eq!(keys(AuditAction::AdminQuotaChanged), ["quota_bytes"]);
         assert_eq!(keys(AuditAction::AdminUserEnabled), Vec::<String>::new());
         assert_eq!(keys(AuditAction::CliDeviceRevoked), ["device", "reason"]);
+        assert_eq!(keys(AuditAction::JoinResetRedeemed), ["client_kind", "platform", "revoked", "two_factor_removed"]);
+        assert_eq!(keys(AuditAction::AccountTwoFactorEnabled), Vec::<String>::new());
         assert_eq!(all.to_json(AuditAction::AdminQuotaChanged), r#"{"quota_bytes":null}"#);
         assert_eq!(AuditDetails::revoked(2).to_json(AuditAction::AdminUserDisabled), r#"{"revoked":2}"#);
         assert_eq!(AuditDetails::default().to_json(AuditAction::AdminInviteIssued), "{}");

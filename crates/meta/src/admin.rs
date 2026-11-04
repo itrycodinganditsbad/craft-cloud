@@ -531,7 +531,8 @@ impl Meta {
         let found = Self::target(&mut w, target).await?;
         Self::admin_target_needs_two_factor(&found, actor)?;
         let revoked = two_factor::reset_in(&mut w.tx, target, now_ms).await?.ok_or(MetaError::Conflict("this account has no two-factor sign-in"))?;
-        w.commit().await?;
+        record_in(&mut w.tx, now_ms, by_admin(actor, AuditAction::AdminTwoFactorReset, target)).await?;
+        self.commit_audited(w, now_ms).await?;
         Ok(revoked)
     }
 

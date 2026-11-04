@@ -197,6 +197,11 @@ on_every_backend!(
     secrets_are_listed_and_replaced_only_if_unchanged,
     parallel_wrong_proofs_on_one_challenge_count_exactly_five,
     parallel_wrong_proofs_lock_for_exactly_fifteen_minutes,
+    two_factor_changes_write_their_events,
+    two_factor_sign_in_writes_login_and_counts_failures,
+    the_lock_writes_one_event_when_it_is_set,
+    a_join_writes_its_two_factor_events,
+    resets_and_confirmations_write_their_events,
 );
 
 // ---- helpers ----
@@ -4705,4 +4710,346 @@ async fn parallel_wrong_proofs_lock_for_exactly_fifteen_minutes(meta: &Meta) {
         assert_eq!((wrong_ones, locked), (10, 14), "round {round}");
         assert_eq!(meta.two_factor_locked_for(id, now).await.unwrap(), Some(15 * MINUTE), "round {round}: 15 minutes, not 30");
     }
+}
+
+// ---- the audit log of two-factor sign-in ----
+
+/// The events of `action` in the log, oldest first (an aggregated row counts as one).
+async fn events_of(meta: &Meta, action: AuditAction) -> Vec<AuditEvent> {
+    let mut events: Vec<AuditEvent> = all_events(meta).await.into_iter().filter(|e| e.action == action).collect();
+    events.reverse();
+    events
+}
+
+/// Turning it on, new recovery codes and turning it off each write their event in their own transaction, as the account's own
+/// act from the device that asked; a wrong proof on these routes writes nothing, and a recovery code that is used up writes
+/// `auth.recovery_code_used` with the change it served.
+async fn two_factor_changes_write_their_events(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let (first, _second) = (device(meta, &ana).await, device(meta, &ana).await);
+    let actor = DeviceActor { user: ana.id, device: first, password_hash: "$argon2id$stub".to_owned() };
+    let mut seen = Seen::new(meta).await;
+    let hashes: Vec<[u8; 32]> = (0..10).map(|_| code(INVITE_CHARS).hash()).collect();
+
+    meta.two_factor_begin_setup(&actor, b"cipher-of-the-secret", SETUP_AT).await.unwrap();
+    assert!(seen.actions().await.is_empty(), "a set-up is not a change");
+    assert!(matches!(meta.two_factor_confirm(ana.id, first, &*wrong(), &hashes, SETUP_AT + 1).await, Err(MetaError::TwoFactorInvalid)));
+    assert!(seen.actions().await.is_empty(), "a wrong first code writes nothing");
+    meta.two_factor_confirm(ana.id, first, &*right(FIRST_STEP), &hashes, SETUP_AT + 2).await.unwrap();
+    let e = seen.one().await;
+    assert_eq!(
+        (e.action, e.outcome, e.actor_user, e.actor_device, e.target_id, e.at_ms),
+        (AuditAction::AccountTwoFactorEnabled, AuditOutcome::Success, Some(ana.id), Some(first), Some(ana.id.0), SETUP_AT + 2)
+    );
+    assert_eq!(e.target_kind.as_str(), "user");
+    assert_eq!(details(&e), json("{}"));
+
+    // New recovery codes: a wrong code writes nothing (the lock it can cause would), a right one the event.
+    let result = meta.two_factor_new_recovery_codes(&actor, &totp(&wrong()), &hashes, SETUP_AT + 3).await;
+    assert!(matches!(result, Err(MetaError::TwoFactorInvalid)));
+    assert!(seen.actions().await.is_empty(), "a wrong proof on a signed-in route is not written one by one");
+    meta.two_factor_new_recovery_codes(&actor, &totp(&right(FIRST_STEP + 1)), &hashes, SETUP_AT + 4).await.unwrap();
+    let e = seen.one().await;
+    assert_eq!(
+        (e.action, e.actor_user, e.actor_device, e.target_id),
+        (AuditAction::AccountRecoveryCodesRegenerated, Some(ana.id), Some(first), Some(ana.id.0))
+    );
+    assert_eq!(details(&e), json("{}"));
+
+    // Turning it off with a recovery code: the change and the code's use, from the same device.
+    meta.two_factor_disable(&actor, &Proof::Recovery(hashes[0]), SETUP_AT + 5).await.unwrap();
+    assert_eq!(seen.actions().await, ["account.two_factor_disabled", "auth.recovery_code_used"]);
+    let used = &events_of(meta, AuditAction::AuthRecoveryCodeUsed).await[0];
+    assert_eq!((used.actor_user, used.actor_device, used.target_id, used.at_ms), (Some(ana.id), Some(first), Some(ana.id.0), SETUP_AT + 5));
+    assert_eq!(details(used), json("{}"), "never the code");
+    let off = &events_of(meta, AuditAction::AccountTwoFactorDisabled).await[0];
+    assert_eq!((off.actor_user, off.actor_device), (Some(ana.id), Some(first)));
+    // Off: nothing to turn off, nothing written.
+    assert!(matches!(meta.two_factor_disable(&actor, &totp(&right(FIRST_STEP + 2)), SETUP_AT + 6).await, Err(MetaError::Conflict(_))));
+    assert!(seen.actions().await.is_empty());
+}
+
+/// A sign-in that made a device is `auth.login` whichever way it went (no second factor, a code, a recovery code); the
+/// challenge writes nothing; a wrong second step is one aggregated `auth.second_factor_failed` row per account and minute,
+/// written after the answer is decided.
+async fn two_factor_sign_in_writes_login_and_counts_failures(meta: &Meta) {
+    let me = protected(meta, "ana").await;
+    let plain = user(meta, "bob").await;
+    let mut seen = Seen::new(meta).await;
+    let client = DeviceClient::new(Some("desktop"), Some("Windows"), Some("1.0")).unwrap();
+    let now = SETUP_AT + 100;
+
+    // No two-factor sign-in: a login at once.
+    let generation = gen_of(meta, "bob").await;
+    let signed = meta.sign_in(plain.id, ("$argon2id$stub", generation), "pc", &client, &token(), &new_challenge(), now).await.unwrap();
+    let Some(SignIn::Device(bobs)) = signed else { panic!("{signed:?}") };
+    let e = seen.one().await;
+    assert_eq!(
+        (e.action, e.outcome, e.actor_user, e.actor_device, e.target_id),
+        (AuditAction::AuthLogin, AuditOutcome::Success, Some(plain.id), Some(bobs), Some(*bobs.as_uuid()))
+    );
+    assert_eq!(details(&e), json(r#"{"client_kind":"desktop","platform":"windows"}"#));
+
+    // Two-factor sign-in: the challenge is no login.
+    let generation = gen_of(meta, "ana").await;
+    let chal = new_challenge();
+    let signed = meta.sign_in(me.user.id, ("$argon2id$stub", generation), "pc", &client, &token(), &chal, now).await.unwrap();
+    assert!(matches!(signed, Some(SignIn::Challenge { .. })));
+    assert!(seen.actions().await.is_empty(), "no one is signed in yet");
+    // A wrong code: one failure row, no login, the actor unknown (nobody proved who they were).
+    let result = meta.complete_second_factor(&chal.id_hash, &totp(&wrong()), &token(), now + 1).await;
+    assert!(matches!(result, Err(MetaError::TwoFactorInvalid)));
+    let e = seen.one().await;
+    assert_eq!(
+        (e.action, e.outcome, e.actor_user, e.actor_device, e.target_id, e.count),
+        (AuditAction::AuthSecondFactorFailed, AuditOutcome::Failure, None, None, Some(me.user.id.0), 1)
+    );
+    assert_eq!(details(&e), json(r#"{"step":"totp"}"#));
+    // More in the same minute make the same row count up (a recovery code that is wrong too).
+    let result = meta.complete_second_factor(&chal.id_hash, &Proof::Recovery(code(INVITE_CHARS).hash()), &token(), now + 2).await;
+    assert!(matches!(result, Err(MetaError::TwoFactorInvalid)));
+    assert!(seen.actions().await.is_empty(), "the row was written already; only its count goes up");
+    let rows = events_of(meta, AuditAction::AuthSecondFactorFailed).await;
+    assert_eq!((rows.len(), rows[0].count), (1, 2));
+    // A right code: the login of the new device.
+    let done = meta.complete_second_factor(&chal.id_hash, &totp(&right(FIRST_STEP + 1)), &token(), now + 3).await.unwrap();
+    let e = seen.one().await;
+    assert_eq!(
+        (e.action, e.actor_user, e.actor_device, e.target_id),
+        (AuditAction::AuthLogin, Some(me.user.id), Some(done.device), Some(*done.device.as_uuid()))
+    );
+    assert_eq!(details(&e), json(r#"{"client_kind":"desktop","platform":"windows"}"#));
+
+    // A recovery code: the login and the code's use, the device the same.
+    let chal = new_challenge();
+    let generation = gen_of(meta, "ana").await;
+    meta.sign_in(me.user.id, ("$argon2id$stub", generation), "pc", &client, &token(), &chal, now + 4).await.unwrap();
+    let done = meta.complete_second_factor(&chal.id_hash, &Proof::Recovery(me.hashes()[0]), &token(), now + 5).await.unwrap();
+    assert_eq!(seen.actions().await, ["auth.login", "auth.recovery_code_used"]);
+    let used = &events_of(meta, AuditAction::AuthRecoveryCodeUsed).await[0];
+    assert_eq!((used.actor_user, used.actor_device, used.target_id), (Some(me.user.id), Some(done.device), Some(me.user.id.0)));
+    // The same code again is a wrong recovery code: a failure, not a use.
+    let chal = new_challenge();
+    meta.sign_in(me.user.id, ("$argon2id$stub", generation), "pc", &client, &token(), &chal, now + 6).await.unwrap();
+    let result = meta.complete_second_factor(&chal.id_hash, &Proof::Recovery(me.hashes()[0]), &token(), now + 7).await;
+    assert!(matches!(result, Err(MetaError::TwoFactorInvalid)));
+    assert_eq!(events_of(meta, AuditAction::AuthRecoveryCodeUsed).await.len(), 1);
+    assert_eq!(events_of(meta, AuditAction::AuthSecondFactorFailed).await[0].count, 3);
+}
+
+/// The lock writes `auth.two_factor_locked` once, when it is set or lengthened, and never for a refusal while it holds; wrong
+/// proofs on a signed-in route or an admin's confirmation count towards it without an event of their own.
+async fn the_lock_writes_one_event_when_it_is_set(meta: &Meta) {
+    let me = protected(meta, "ana").await;
+    let id = me.user.id;
+    let mut seen = Seen::new(meta).await;
+    let mut now = SETUP_AT + 100;
+    for n in 1..=9 {
+        assert!(matches!(confirm_with(meta, id, None, now).await, Err(MetaError::TwoFactorInvalid)), "wrong proof {n}");
+    }
+    assert!(seen.actions().await.is_empty(), "nine wrong proofs are not written one by one");
+    assert!(matches!(confirm_with(meta, id, None, now).await, Err(MetaError::TwoFactorInvalid)));
+    let e = seen.one().await;
+    assert_eq!(
+        (e.action, e.outcome, e.actor_user, e.actor_device, e.target_id, e.at_ms),
+        (AuditAction::AuthTwoFactorLocked, AuditOutcome::Success, None, None, Some(id.0), now)
+    );
+    assert_eq!(details(&e), json("{}"));
+    // Refused while it holds, by every path: no further event.
+    for offset in 1..4 {
+        let locked = confirm_with(meta, id, Some(FIRST_STEP + 1), now + offset).await;
+        assert!(matches!(locked, Err(MetaError::TwoFactorLocked { .. })), "{locked:?}");
+    }
+    assert!(matches!(meta.two_factor_disable(&me.actor(), &Proof::Recovery(me.hashes()[1]), now + 5).await, Err(MetaError::TwoFactorLocked { .. })));
+    assert!(seen.actions().await.is_empty(), "a refusal under the lock writes nothing");
+    // Over, one more wrong proof sets a longer lock: a new event.
+    now += 15 * MINUTE + 1;
+    assert!(matches!(confirm_with(meta, id, None, now).await, Err(MetaError::TwoFactorInvalid)));
+    let e = seen.one().await;
+    assert_eq!((e.action, e.at_ms), (AuditAction::AuthTwoFactorLocked, now));
+    assert_eq!(events_of(meta, AuditAction::AuthTwoFactorLocked).await.len(), 2);
+    assert!(events_of(meta, AuditAction::AuthSecondFactorFailed).await.is_empty(), "these are not sign-in steps");
+}
+
+/// The second factor at a join: a wrong one is one failure row and the invite stays; a recovery code used for it is written
+/// with the redemption; a reset code made with `reset_two_factor` takes it away and the redemption says so, by the account that
+/// redeemed it (no admin acts at that moment).
+async fn a_join_writes_its_two_factor_events(meta: &Meta) {
+    let me = protected(meta, "ana").await;
+    let id = me.user.id;
+    let (_, admin) = admin_actor(meta, "root").await;
+    let mut seen = Seen::new(meta).await;
+    let now = SETUP_AT + 100;
+
+    let invite = code(INVITE_CHARS);
+    meta.create_invite("ana", &invite.hash(), now, INVITE_TTL_MS).await.unwrap();
+    assert!(matches!(redeem_with_factor(meta, &invite.hash(), None, now + 1).await, Err(MetaError::TwoFactorRequired)));
+    assert!(seen.actions().await.is_empty(), "asking for the factor writes nothing");
+    assert!(matches!(redeem_with_factor(meta, &invite.hash(), Some(&totp(&wrong())), now + 2).await, Err(MetaError::TwoFactorInvalid)));
+    let e = seen.one().await;
+    assert_eq!(
+        (e.action, e.outcome, e.actor_user, e.target_id, e.count),
+        (AuditAction::AuthSecondFactorFailed, AuditOutcome::Failure, None, Some(id.0), 1)
+    );
+    assert_eq!(details(&e), json(r#"{"step":"totp"}"#));
+    // With a recovery code: the redemption and the code's use, by the new device.
+    let device = redeem_with_factor(meta, &invite.hash(), Some(&Proof::Recovery(me.hashes()[0])), now + 3).await.unwrap();
+    assert_eq!(seen.actions().await, ["auth.recovery_code_used", "join.invite_redeemed"]);
+    let used = &events_of(meta, AuditAction::AuthRecoveryCodeUsed).await[0];
+    assert_eq!((used.actor_user, used.actor_device), (Some(id), Some(device)));
+
+    // A reset code without the removal of two-factor: the right code is needed; the event has no such detail.
+    let reset = code(INVITE_CHARS);
+    meta.admin_issue_reset(&admin, id, &reset.hash(), false, now + 4, RESET_TTL_MS).await.unwrap();
+    assert_eq!(seen.actions().await, ["admin.password_reset_issued"]);
+    let redeemed = meta
+        .redeem_with_second_factor(
+            &reset.hash(),
+            "new pc",
+            &DeviceClient::default(),
+            &token(),
+            Some("$argon2id$new"),
+            Some(&totp(&right(FIRST_STEP + 1))),
+            now + 5,
+        )
+        .await
+        .unwrap();
+    let e = seen.one().await;
+    assert_eq!((e.action, e.actor_user, e.actor_device), (AuditAction::JoinResetRedeemed, Some(id), Some(redeemed.device)));
+    assert_eq!(details(&e), json(&format!(r#"{{"revoked":{}}}"#, redeemed.revoked.len())), "two-factor sign-in is still on");
+    assert!(meta.two_factor_enabled(id).await.unwrap());
+
+    // A reset code made with `reset_two_factor`: it takes the second factor away and the event says so.
+    let reset = code(INVITE_CHARS);
+    meta.admin_issue_reset(&admin, id, &reset.hash(), true, now + 6, RESET_TTL_MS).await.unwrap();
+    assert_eq!(seen.actions().await, ["admin.password_reset_issued"]);
+    let redeemed = meta
+        .redeem_with_second_factor(&reset.hash(), "newer pc", &DeviceClient::default(), &token(), Some("$argon2id$newer"), None, now + 7)
+        .await
+        .unwrap();
+    let e = seen.one().await;
+    assert_eq!(
+        (e.action, e.actor_user, e.actor_device, e.target_id),
+        (AuditAction::JoinResetRedeemed, Some(id), Some(redeemed.device), Some(*redeemed.device.as_uuid()))
+    );
+    assert_eq!(details(&e), json(&format!(r#"{{"revoked":{},"two_factor_removed":true}}"#, redeemed.revoked.len())));
+    assert!(!meta.two_factor_enabled(id).await.unwrap());
+    assert!(events_of(meta, AuditAction::AdminTwoFactorReset).await.is_empty(), "no admin is made up for it");
+}
+
+/// An admin's reset of another account's two-factor sign-in and the command line's each write their event; the admin's
+/// confirmation by recovery code writes the code's use, for the admin's account, even if the change it confirms fails.
+async fn resets_and_confirmations_write_their_events(meta: &Meta) {
+    let (_, admin) = admin_actor(meta, "root").await;
+    let member = protected(meta, "member").await;
+    let other = protected(meta, "other").await;
+    let mut seen = Seen::new(meta).await;
+    let now = SETUP_AT + 100;
+
+    let revoked = meta.admin_reset_two_factor(&admin, member.user.id, now).await.unwrap();
+    let e = seen.one().await;
+    assert_eq!(
+        (e.action, e.outcome, e.actor_user, e.actor_device, e.target_id),
+        (AuditAction::AdminTwoFactorReset, AuditOutcome::Success, Some(admin.user), Some(admin.device), Some(member.user.id.0))
+    );
+    assert_eq!(details(&e), json("{}"));
+    assert_eq!(revoked.len(), 1);
+    assert!(matches!(meta.admin_reset_two_factor(&admin, member.user.id, now + 1).await, Err(MetaError::Conflict(_))));
+    assert!(seen.actions().await.is_empty(), "nothing to reset: nothing written");
+
+    let revoked = meta.reset_two_factor(other.user.id, now + 2).await.unwrap();
+    let e = seen.one().await;
+    assert_eq!((e.action, e.actor_user, e.actor_device, e.target_id), (AuditAction::CliTwoFactorReset, None, None, Some(other.user.id.0)));
+    assert_eq!(details(&e), json(&format!(r#"{{"revoked":{}}}"#, revoked.len())));
+    assert!(matches!(meta.reset_two_factor(other.user.id, now + 3).await, Err(MetaError::Conflict(_))));
+    assert!(seen.actions().await.is_empty());
+
+    // An account's confirmation by recovery code, as an admin gives it: the code's use, no device.
+    let bea = protected(meta, "bea").await;
+    let mut seen = Seen::new(meta).await;
+    assert!(meta.confirm_second_factor(bea.user.id, Some(&Proof::Recovery(bea.hashes()[3])), now + 4).await.unwrap());
+    let e = seen.one().await;
+    assert_eq!(
+        (e.action, e.actor_user, e.actor_device, e.target_id),
+        (AuditAction::AuthRecoveryCodeUsed, Some(bea.user.id), None, Some(bea.user.id.0))
+    );
+    // A wrong proof, or the same code again: nothing written.
+    assert!(matches!(confirm_with(meta, bea.user.id, None, now + 5).await, Err(MetaError::TwoFactorInvalid)));
+    assert!(matches!(
+        meta.confirm_second_factor(bea.user.id, Some(&Proof::Recovery(bea.hashes()[3])), now + 6).await,
+        Err(MetaError::TwoFactorInvalid)
+    ));
+    assert!(seen.actions().await.is_empty());
+}
+
+/// An error in the log fails every two-factor change and changes nothing; a wrong second step is still answered as wrong, since
+/// its event is written after the answer is decided and only reported.
+async fn an_error_in_the_log_fails_every_two_factor_change(url: &str) {
+    sqlx::any::install_default_drivers();
+    let meta = Meta::open(url).await.unwrap();
+    let me = protected(&meta, "ana").await;
+    let (_, admin) = admin_actor(&meta, "root").await;
+    let setup = user(&meta, "setup").await;
+    let setup_device = device(&meta, &setup).await;
+    let setup_actor = DeviceActor { user: setup.id, device: setup_device, password_hash: "$argon2id$stub".to_owned() };
+    meta.two_factor_begin_setup(&setup_actor, b"cipher", SETUP_AT).await.unwrap();
+    let plain = user(&meta, "plain").await;
+    let locker = protected(&meta, "locker").await;
+    let events_before = all_events(&meta).await.len();
+    let now = SETUP_AT + 100;
+    let generation = gen_of(&meta, "ana").await;
+    let chal = new_challenge();
+    meta.sign_in(me.user.id, ("$argon2id$stub", generation), "pc", &DeviceClient::default(), &token(), &chal, now).await.unwrap();
+    let invite = code(INVITE_CHARS);
+    meta.create_invite("ana", &invite.hash(), now, INVITE_TTL_MS).await.unwrap();
+
+    break_audit(url).await;
+    let is_db = |r: Result<(), MetaError>| assert!(matches!(r, Err(MetaError::Db(_))), "{r:?}");
+    let hashes = me.hashes();
+    is_db(meta.two_factor_confirm(setup.id, setup_device, &*right(FIRST_STEP), &hashes, now).await.map(|_| ()));
+    is_db(meta.two_factor_new_recovery_codes(&me.actor(), &totp(&right(FIRST_STEP + 1)), &hashes, now).await);
+    is_db(meta.two_factor_disable(&me.actor(), &Proof::Recovery(hashes[0]), now).await.map(|_| ()));
+    is_db(meta.confirm_second_factor(me.user.id, Some(&Proof::Recovery(hashes[1])), now).await.map(|_| ()));
+    is_db(meta.complete_second_factor(&chal.id_hash, &totp(&right(FIRST_STEP + 1)), &token(), now).await.map(|_| ()));
+    is_db(redeem_with_factor(&meta, &invite.hash(), Some(&Proof::Recovery(hashes[2])), now).await.map(|_| ()));
+    is_db(meta.sign_in(plain.id, ("$argon2id$stub", 0), "pc", &DeviceClient::default(), &token(), &new_challenge(), now).await.map(|_| ()));
+    is_db(meta.admin_reset_two_factor(&admin, me.user.id, now).await.map(|_| ()));
+    is_db(meta.reset_two_factor(me.user.id, now).await.map(|_| ()));
+    // A wrong second step: the answer is the same, whether or not the log works.
+    let result = meta.complete_second_factor(&chal.id_hash, &totp(&wrong()), &token(), now).await;
+    assert!(matches!(result, Err(MetaError::TwoFactorInvalid)), "{result:?}");
+    // The lock is set by the tenth wrong proof although its event can't be written: failing closed there would let a fault in
+    // the log undo the lock. The answer is the same and the counters and the lock are committed.
+    for n in 1..=10 {
+        let result = confirm_with(&meta, locker.user.id, None, now).await;
+        assert!(matches!(result, Err(MetaError::TwoFactorInvalid)), "wrong proof {n}: {result:?}");
+    }
+    assert_eq!(meta.two_factor_locked_for(locker.user.id, now).await.unwrap(), Some(15 * MINUTE), "the lock holds");
+    repair_audit(url).await;
+
+    // Nothing was changed by any of it: still on, no code used, nobody signed out, the set-up still open.
+    assert_eq!(all_events(&meta).await.len(), events_before, "no event, no change (the lock's event was lost, only reported)");
+    assert!(meta.two_factor_enabled(me.user.id).await.unwrap());
+    assert_eq!(meta.two_factor_info(me.user.id, now).await.unwrap().recovery_codes_left, 10);
+    assert_eq!(live_devices(&meta, &me.user).await, vec![me.first]);
+    assert!(meta.two_factor_info(setup.id, now).await.unwrap().pending);
+    assert!(!meta.two_factor_enabled(setup.id).await.unwrap());
+    assert_eq!(meta.invite_needs_password(&invite.hash(), now).await.unwrap(), Some(false), "the invite is still there");
+    // And the same changes work once the log does.
+    meta.two_factor_new_recovery_codes(&me.actor(), &totp(&right(FIRST_STEP + 2)), &hashes, now + 1).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_error_in_the_log_fails_every_two_factor_change_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    an_error_in_the_log_fails_every_two_factor_change(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_error_in_the_log_fails_every_two_factor_change_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    an_error_in_the_log_fails_every_two_factor_change(&url).await;
 }

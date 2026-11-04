@@ -28,6 +28,7 @@
 use craft_cloud_proto::DeviceId;
 use sqlx::Row;
 
+use crate::audit::{AuditAction, AuditDetails, AuditFailure, NewEvent, Step as AuditStep, record_in};
 use crate::codec::{uuid_bytes, uuid_from};
 use crate::users::{DeviceClient, account_blocked, check_device_name, delete_join_codes, insert_device, lock_user, revoke_devices};
 use crate::{Meta, MetaError, RevokeReason, UserId, WriteTx};
@@ -207,10 +208,12 @@ pub(crate) enum Checked {
 
 /// Checks `proof` against the account's two-factor row `row` and, when it is right, uses it up and clears the wrong-proof
 /// counters, all in `tx` (the account's row is locked). A lock that is in force is [`MetaError::TwoFactorLocked`] and
-/// nothing is checked or counted.
+/// nothing is checked or counted. A recovery code that is used up writes `auth.recovery_code_used` in `tx` (a code that
+/// is not used up writes nothing); `device` is the device it was used from, where there is one.
 pub(crate) async fn check_proof(
     tx: &mut sqlx::Transaction<'static, sqlx::Any>,
     user: UserId,
+    device: Option<DeviceId>,
     row: &TfRow,
     proof: &Proof<'_>,
     now_ms: i64,
@@ -250,6 +253,7 @@ pub(crate) async fn check_proof(
                 .bind(uuid_bytes(&user.0))
                 .execute(&mut **tx)
                 .await?;
+            record_in(tx, now_ms, NewEvent::new(AuditAction::AuthRecoveryCodeUsed).by(user, device).on_user(user)).await?;
             Ok(Checked::Accepted)
         }
     }
@@ -445,7 +449,8 @@ impl Meta {
         sqlx::query("DELETE FROM login_challenges WHERE user_id = $1").bind(uuid_bytes(&user.0)).execute(&mut *w.tx).await?;
         let revoked = revoke_devices(&mut w.tx, user, Some(device), RevokeReason::TwoFactor, now_ms).await?;
         delete_join_codes(&mut w.tx, user).await?;
-        w.commit().await?;
+        record_in(&mut w.tx, now_ms, NewEvent::new(AuditAction::AccountTwoFactorEnabled).by(user, Some(device)).on_user(user)).await?;
+        self.commit_audited(w, now_ms).await?;
         Ok(revoked)
     }
 
@@ -458,13 +463,15 @@ impl Meta {
         check_actor(&mut w, actor).await?;
         let row = load_row(&mut w.tx, actor.user).await?.filter(TfRow::active);
         let Some(row) = row else { return Err(MetaError::Conflict("two-factor sign-in is not on")) };
-        if let Checked::Wrong = check_proof(&mut w.tx, actor.user, &row, proof, now_ms).await? {
+        if let Checked::Wrong = check_proof(&mut w.tx, actor.user, Some(actor.device), &row, proof, now_ms).await? {
             return Err(self.refuse_proof(w, actor.user, None, now_ms).await);
         }
         remove_in(&mut w.tx, actor.user).await?;
         let revoked = revoke_devices(&mut w.tx, actor.user, Some(actor.device), RevokeReason::TwoFactor, now_ms).await?;
         delete_join_codes(&mut w.tx, actor.user).await?;
-        w.commit().await?;
+        let event = NewEvent::new(AuditAction::AccountTwoFactorDisabled).by(actor.user, Some(actor.device)).on_user(actor.user);
+        record_in(&mut w.tx, now_ms, event).await?;
+        self.commit_audited(w, now_ms).await?;
         Ok(revoked)
     }
 
@@ -481,11 +488,13 @@ impl Meta {
         check_actor(&mut w, actor).await?;
         let row = load_row(&mut w.tx, actor.user).await?.filter(TfRow::active);
         let Some(row) = row else { return Err(MetaError::Conflict("two-factor sign-in is not on")) };
-        if let Checked::Wrong = check_proof(&mut w.tx, actor.user, &row, proof, now_ms).await? {
+        if let Checked::Wrong = check_proof(&mut w.tx, actor.user, Some(actor.device), &row, proof, now_ms).await? {
             return Err(self.refuse_proof(w, actor.user, None, now_ms).await);
         }
         replace_recovery_codes(&mut w.tx, actor.user, recovery_hashes).await?;
-        w.commit().await
+        let event = NewEvent::new(AuditAction::AccountRecoveryCodesRegenerated).by(actor.user, Some(actor.device)).on_user(actor.user);
+        record_in(&mut w.tx, now_ms, event).await?;
+        self.commit_audited(w, now_ms).await
     }
 
     /// The confirmation an admin gives for a change: when `user` has two-factor sign-in on, `proof` is checked and used up
@@ -500,10 +509,12 @@ impl Meta {
         }
         let Some(row) = load_row(&mut w.tx, user).await?.filter(TfRow::active) else { return Ok(false) };
         let Some(proof) = proof else { return Err(MetaError::TwoFactorInvalid) };
-        if let Checked::Wrong = check_proof(&mut w.tx, user, &row, proof, now_ms).await? {
+        if let Checked::Wrong = check_proof(&mut w.tx, user, None, &row, proof, now_ms).await? {
             return Err(self.refuse_proof(w, user, None, now_ms).await);
         }
-        w.commit().await?;
+        // The proof is used up here, in a transaction of its own that commits before the change it confirms: a recovery
+        // code used for a change that then fails is still used, and its event stays.
+        self.commit_audited(w, now_ms).await?;
         Ok(true)
     }
 
@@ -517,7 +528,9 @@ impl Meta {
             return Err(MetaError::NotFound("user"));
         }
         let revoked = reset_in(&mut w.tx, user, now_ms).await?.ok_or(MetaError::Conflict("this account has no two-factor sign-in"))?;
-        w.commit().await?;
+        let event = NewEvent::new(AuditAction::CliTwoFactorReset).on_user(user).with(AuditDetails::revoked(revoked.len()));
+        record_in(&mut w.tx, now_ms, event).await?;
+        self.commit_audited(w, now_ms).await?;
         Ok(revoked)
     }
 
@@ -594,7 +607,10 @@ impl Meta {
         }
         let device = DeviceId::generate();
         insert_device(&mut w.tx, device, user, name, client, token_hash, now_ms).await?;
-        w.commit().await?;
+        // A sign-in that made a device is a login; a challenge (above) is not: nobody is signed in yet.
+        let login = NewEvent::new(AuditAction::AuthLogin).by(user, Some(device)).on_device(device).with(AuditDetails::client(client));
+        record_in(&mut w.tx, now_ms, login).await?;
+        self.commit_audited(w, now_ms).await?;
         Ok(Some(SignIn::Device(device)))
     }
 
@@ -652,8 +668,9 @@ impl Meta {
         if attempts >= MAX_CHALLENGE_ATTEMPTS {
             return Err(MetaError::ChallengeGone);
         }
-        if let Checked::Wrong = check_proof(&mut w.tx, user, &row, proof, now_ms).await? {
-            return Err(self.refuse_proof(w, user, Some(challenge), now_ms).await);
+        let device = DeviceId::generate();
+        if let Checked::Wrong = check_proof(&mut w.tx, user, Some(device), &row, proof, now_ms).await? {
+            return Err(self.refuse_sign_in_proof(w, user, Some(challenge), proof, now_ms).await);
         }
         if account_blocked(&mut w.tx, user).await? {
             return Err(MetaError::AccountDisabled);
@@ -669,9 +686,10 @@ impl Meta {
         let client =
             DeviceClient { kind: found.try_get("client_kind")?, platform: found.try_get("platform")?, app_version: found.try_get("app_version")? };
         let name: String = found.try_get("device_name")?;
-        let device = DeviceId::generate();
         insert_device(&mut w.tx, device, user, &name, &client, token_hash, now_ms).await?;
-        w.commit().await?;
+        let login = NewEvent::new(AuditAction::AuthLogin).by(user, Some(device)).on_device(device).with(AuditDetails::client(&client));
+        record_in(&mut w.tx, now_ms, login).await?;
+        self.commit_audited(w, now_ms).await?;
         Ok(Completed { user, device })
     }
 
@@ -682,14 +700,59 @@ impl Meta {
     /// challenge, and the lock set by exactly the tenth.
     pub(crate) async fn refuse_proof(&self, mut w: WriteTx, user: UserId, challenge: Option<&[u8; 32]>, now_ms: i64) -> MetaError {
         let counted = async {
-            count_wrong_in(&mut w.tx, user, challenge, now_ms).await?;
-            w.commit().await
+            let locked = count_wrong_in(&mut w.tx, user, challenge, now_ms).await?;
+            w.commit().await?;
+            Ok::<bool, MetaError>(locked)
         }
         .await;
         match counted {
-            Ok(()) => MetaError::TwoFactorInvalid,
+            Ok(locked) => {
+                if locked {
+                    // After the counters and the lock are committed, like a failed sign-in's event: an error in the log
+                    // is reported and changes neither the answer nor what was counted (failing closed here would let a
+                    // fault in the log undo the lock).
+                    if let Err(e) = self.audit_lock_set(user, now_ms).await {
+                        tracing::warn!(error = %e, "couldn't write an audit event");
+                    }
+                }
+                MetaError::TwoFactorInvalid
+            }
             Err(e) => e,
         }
+    }
+
+    /// `auth.two_factor_locked`, in a transaction of its own. Nobody proved who they were: no actor.
+    async fn audit_lock_set(&self, user: UserId, now_ms: i64) -> Result<(), MetaError> {
+        let mut w = self.begin_write().await?;
+        record_in(&mut w.tx, now_ms, NewEvent::new(AuditAction::AuthTwoFactorLocked).on_user(user)).await?;
+        self.commit_audited(w, now_ms).await
+    }
+
+    /// [`Meta::refuse_proof`] for a proof given at sign-in (the second step, or a join): after the counters are committed
+    /// and the answer is decided, the wrong proof is also counted in the audit log, `auth.second_factor_failed`, in a
+    /// transaction of its own and aggregated per account and minute. Writing it can fail without changing the answer. A
+    /// wrong proof on a signed-in route (turning it off, new recovery codes, an admin's confirmation) is not written one by
+    /// one: the lock they can cause is (`auth.two_factor_locked`).
+    pub(crate) async fn refuse_sign_in_proof(
+        &self,
+        w: WriteTx,
+        user: UserId,
+        challenge: Option<&[u8; 32]>,
+        proof: &Proof<'_>,
+        now_ms: i64,
+    ) -> MetaError {
+        let refused = self.refuse_proof(w, user, challenge, now_ms).await;
+        if matches!(refused, MetaError::TwoFactorInvalid) {
+            let step = match proof {
+                Proof::Totp(_) => AuditStep::Totp,
+                Proof::Recovery(_) => AuditStep::Recovery,
+            };
+            let failure = AuditFailure { action: AuditAction::AuthSecondFactorFailed, target: Some(user), step };
+            if let Err(e) = self.audit_record_failure(failure, now_ms).await {
+                tracing::warn!(error = %e, "couldn't write an audit event");
+            }
+        }
+        refused
     }
 
     /// The ciphertexts of every account's secrets (the active ones, and the open set-ups' that are not expired), for the
@@ -806,12 +869,14 @@ async fn count_wrong_setup_in(tx: &mut sqlx::Transaction<'static, sqlx::Any>, us
 /// Counts one wrong second factor of `user` in `tx` (the account's row is locked by it): the wrong proofs in a row go up,
 /// and at [`LOCK_AFTER_FAILURES`] (and every one after) the lock is set or doubled; the challenge's attempts go up too, and
 /// the challenge is deleted at [`MAX_CHALLENGE_ATTEMPTS`]. Lock order: the account's row, the two-factor row, the challenge.
+/// Answers whether a lock was set or lengthened (for the caller to write its event once the counters are committed).
 async fn count_wrong_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Any>,
     user: UserId,
     challenge: Option<&[u8; 32]>,
     now_ms: i64,
-) -> Result<(), MetaError> {
+) -> Result<bool, MetaError> {
+    let mut locked = false;
     let counted = sqlx::query(
         "UPDATE user_two_factor SET failed_attempts = failed_attempts + 1 WHERE user_id = $1 AND enabled_ms IS NOT NULL \
          RETURNING failed_attempts, locked_until_ms",
@@ -829,6 +894,9 @@ async fn count_wrong_in(
             .bind(uuid_bytes(&user.0))
             .execute(&mut **tx)
             .await?;
+        // Only here, where the lock is set or doubled, and never for a refusal while it is in force (`check_proof` stops
+        // those before anything is counted).
+        locked = true;
     }
     if let Some(challenge) = challenge {
         sqlx::query("UPDATE login_challenges SET attempts = attempts + 1 WHERE id_hash = $1").bind(challenge.to_vec()).execute(&mut **tx).await?;
@@ -838,7 +906,7 @@ async fn count_wrong_in(
             .execute(&mut **tx)
             .await?;
     }
-    Ok(())
+    Ok(locked)
 }
 
 /// Makes `hashes` the account's recovery codes, all unused, in `tx` (the old ones, used or not, are gone).

@@ -284,6 +284,7 @@ impl Meta {
             .fetch_optional(&mut *w.tx)
             .await?;
         let mut revoked = Vec::new();
+        let mut two_factor_removed = false;
         let (user, action) = match found {
             Some(row) => {
                 let user = UserId(uuid_from(&row.try_get::<Vec<u8>, _>("user_id")?)?);
@@ -319,13 +320,14 @@ impl Meta {
                 if two_factor::is_enabled(&mut w.tx, user).await? {
                     if purpose == Purpose::Reset && reset_two_factor == 1 {
                         two_factor::remove_in(&mut w.tx, user).await?;
+                        two_factor_removed = true;
                     } else {
                         let Some(proof) = second_factor else { return Err(MetaError::TwoFactorRequired) };
                         let row = two_factor::load_row(&mut w.tx, user).await?.ok_or(MetaError::Corrupt("two-factor row vanished under the lock"))?;
-                        if let two_factor::Checked::Wrong = two_factor::check_proof(&mut w.tx, user, &row, proof, now_ms).await? {
+                        if let two_factor::Checked::Wrong = two_factor::check_proof(&mut w.tx, user, Some(device), &row, proof, now_ms).await? {
                             // Nothing has been consumed yet: the wrong proof is counted and committed in this very
                             // transaction, under the account's lock, and the invite stays.
-                            return Err(self.refuse_proof(w, user, None, now_ms).await);
+                            return Err(self.refuse_sign_in_proof(w, user, None, proof, now_ms).await);
                         }
                     }
                 }
@@ -401,6 +403,8 @@ impl Meta {
         let mut details = AuditDetails::client(client);
         if action == AuditAction::JoinResetRedeemed {
             details.revoked = Some(u32::try_from(revoked.len()).unwrap_or(u32::MAX));
+            // The actor is the account that redeemed the code: the code does not say which admin made it.
+            details.two_factor_removed = two_factor_removed;
         }
         record_in(&mut w.tx, now_ms, NewEvent::new(action).by(user, Some(device)).on_device(device).with(details)).await?;
         self.commit_audited(w, now_ms).await?;
