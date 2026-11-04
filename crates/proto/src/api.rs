@@ -322,6 +322,84 @@ pub struct AdminDevices {
     pub devices: Vec<DeviceInfo>,
 }
 
+/// The typed values of a security event (`details`). Every field is a closed list of words or a number: nothing a client
+/// typed is ever in it. Fields an event does not have are missing, and fields a later release adds are ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditDetails {
+    /// `agent`, `desktop` or `cli`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_kind: Option<String>,
+    /// `windows`, `macos`, `linux`, `android`, `ios` or `other`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    /// Why a device was signed out: `user`, `others`, `password`, `admin`, `disabled`, `two_factor`, `idle` or `reset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// How far a failed sign-in got: `password`, `totp`, `recovery` or `challenge_expired`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    /// `admin` or `member`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_to: Option<String>,
+    /// The quota an admin set: `null` when they removed it, missing when the event is not about a quota.
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<Option<u64>>,
+    /// How many devices an event signed out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked: Option<u32>,
+    /// The device an admin or the command line signed out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceId>,
+    /// Set when the values were too long for the log and whole fields were left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+}
+
+/// One security event, as `GET /account/activity`, `GET /admin/audit` and the export show it. No address, name of a file or
+/// device, or secret is ever in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub id: Uuid,
+    pub at_ms: i64,
+    /// The account that acted; `null` for the command line, and for a sign-in that failed (nobody proved who they were).
+    pub actor_user: Option<Uuid>,
+    pub actor_device: Option<DeviceId>,
+    /// A name from the closed list in `docs/design/sync.md`, like `auth.login`.
+    pub action: String,
+    /// `user` or `device`, or empty.
+    pub target_kind: String,
+    pub target_id: Option<Uuid>,
+    /// `success` or `failure`.
+    pub outcome: String,
+    pub details: AuditDetails,
+    /// How many tries the event stands for: failed sign-ins are one event per account and minute. 1 for every other event.
+    pub count: u64,
+}
+
+/// A page of `GET /account/activity` or `GET /admin/audit`, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditPage {
+    pub events: Vec<AuditEvent>,
+    /// Opaque; give it back as `cursor` for the next (older) page. Missing on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// The last line of `GET /admin/audit/export` (the lines before it are [`AuditEvent`]s). `complete` says the export holds
+/// every event up to the moment it started; `truncated` says there were more than the export holds. A stream that ends
+/// without either line was cut off and is not a complete export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditExportEnd {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complete: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    /// The events before this line.
+    pub exported: u64,
+}
+
 /// `POST /api/v1/chunks/missing` and its answer: which of `ids` this space doesn't have.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissingRequest {
@@ -464,6 +542,34 @@ mod tests {
         assert_eq!(codes::INVALID_CODE, "invalid_code");
         assert_eq!(codes::PASSWORD_REQUIRED, "password_required");
         assert_eq!(codes::WEAK_PASSWORD, "weak_password");
+    }
+
+    #[test]
+    fn audit_bodies_have_a_plain_json_form() {
+        let details: AuditDetails = serde_json::from_str(r#"{"revoked":2,"a_later_field":"x","quota_bytes":null}"#).unwrap();
+        assert_eq!(details.revoked, Some(2));
+        assert_eq!(details.quota_bytes, Some(None));
+        assert_eq!(serde_json::to_string(&details).unwrap(), r#"{"quota_bytes":null,"revoked":2}"#);
+        assert_eq!(serde_json::from_str::<AuditDetails>("{}").unwrap(), AuditDetails::default());
+        assert_eq!(serde_json::to_string(&AuditDetails::default()).unwrap(), "{}");
+        let end = AuditExportEnd { complete: Some(true), truncated: None, exported: 3 };
+        assert_eq!(serde_json::to_string(&end).unwrap(), r#"{"complete":true,"exported":3}"#);
+        let event = AuditEvent {
+            id: Uuid::nil(),
+            at_ms: 5,
+            actor_user: None,
+            actor_device: None,
+            action: "auth.login_failed".into(),
+            target_kind: String::new(),
+            target_id: None,
+            outcome: "failure".into(),
+            details: AuditDetails { step: Some("password".into()), ..AuditDetails::default() },
+            count: 4,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["actor_user"], serde_json::Value::Null);
+        assert_eq!(json["count"], 4);
+        assert_eq!(serde_json::from_value::<AuditEvent>(json).unwrap(), event);
     }
 
     #[test]
