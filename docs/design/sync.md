@@ -686,11 +686,11 @@ changes locally, then pushes local changes. These rules came out of the simulati
     The admin and command line events about a device are about its **account** (`target_kind = user`) and carry the device
     in `details`, so the account's own activity shows them.
   - **`details` is typed.** Each event has its own few fields, each a closed list of words or a number: `client_kind`
-    (`agent`, `desktop`, `cli`) and `platform` (`windows`, `macos`, `linux`, `android`, `ios`, `other`) for a sign-in or
+    (`agent`, `desktop`, `cli`, `web`) and `platform` (`windows`, `macos`, `linux`, `android`, `ios`, `other`) for a sign-in or
     join, `reason` (as in the device list), `step` (`password`, `totp`, `recovery`, `challenge_expired`), `role_from` and
     `role_to`, `quota_bytes` (a number, `null` when the quota was removed), `revoked` (a count), `device` (an ID) and `two_factor_removed` (`true`, only on `join.reset_redeemed`). A
     device may call its platform any printable text of 32 bytes, an address or a file name included, so anything not in
-    the list is `other`; nothing a client typed ever reaches a row. The text is at most 2,048 bytes: if it would be more,
+    the list is `other`; `web` means a browser session of the admin pages and cannot be named by a device. Nothing a client typed ever reaches a row. The text is at most 2,048 bytes: if it would be more,
     whole fields go, the least important first, and `"truncated": true` is added; bytes are never cut off, which would
     leave invalid JSON. **No address, file name, path, device name, name of an account that does not exist, password,
     code, challenge, token, key or e-mail address is stored anywhere in a row.**
@@ -710,11 +710,11 @@ changes locally, then pushes local changes. These rules came out of the simulati
     it can cause is: `auth.two_factor_locked`, once when a lock is set or lengthened and never for a refusal while it holds. That
     event is written like a failed sign-in's, in a transaction of its own after the counters and the lock are committed, so a
     fault in the log can neither undo the lock nor change the answer; it is logged without content and the event is lost.
-  - **Failed sign-ins** are one row per account, action and minute, `agg_key` = action + account + minute, written
+  - **Failed sign-ins** are one row per account, action, client kind and minute, `agg_key` = action + client kind + account + minute, written
     after the answer is decided and in a transaction of its own: `INSERT … ON CONFLICT (agg_key) DO UPDATE SET agg_count =
     audit_events.agg_count + 1` (the column is qualified, since a bare one is ambiguous against `excluded` on Postgres),
     so many tries at one moment make one row that counts them all and keeps the identity, time and details of the first.
-    Tries with a name no account has share one row per minute with no account in it, so a guesser can neither put text in
+    Tries with a name no account has share one row per client kind and minute with no account in it, so a guesser can neither put text in
     the log nor make it grow without bound. A failure to write this row is logged (no content) and changes neither the
     answer nor the limits on tries, which are not stored in the log at all.
   - **Reading.** Pages are newest first by `(at_ms, id)` descending. `cursor` is that pair, opaque, and exclusive: the next

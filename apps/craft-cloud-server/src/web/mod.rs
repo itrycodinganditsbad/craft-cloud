@@ -505,7 +505,7 @@ async fn login(State(state): State<Shared>, ConnectInfo(peer): ConnectInfo<Socke
         ApiError::internal()
     })?;
     let (Some(user), true) = (user, ok && usable) else {
-        audit::login_failed(&state, known).await;
+        audit::web_login_failed(&state, known).await;
         return Ok(login_answer(StatusCode::UNAUTHORIZED, WRONG_LOGIN, None));
     };
     let (token, id_hash) = new_token()?;
@@ -515,7 +515,7 @@ async fn login(State(state): State<Shared>, ConnectInfo(peer): ConnectInfo<Socke
     // A member, a disabled account and a password that changed meanwhile are all `None`: answered like a wrong password.
     match state.meta.web_sign_in(user.id, (&user.password_hash, user.auth_gen), &challenge, &session, state.now_ms()).await? {
         None => {
-            audit::login_failed(&state, known).await;
+            audit::web_login_failed(&state, known).await;
             Ok(login_answer(StatusCode::UNAUTHORIZED, WRONG_LOGIN, None))
         }
         Some(WebSignIn::Session) => {
@@ -555,11 +555,11 @@ async fn second_factor(State(state): State<Shared>, ConnectInfo(peer): ConnectIn
         return Ok(again(StatusCode::TOO_MANY_REQUESTS, "Too many wrong codes from this address. Wait a few minutes.", Some(wait)));
     };
     let Some(hash) = challenge_hash(&form.challenge) else {
-        audit::challenge_failed(&state, None).await;
+        audit::web_challenge_failed(&state, None).await;
         return Ok(gone());
     };
     let Some((user, username)) = state.meta.web_challenge_owner(&hash, now_ms).await? else {
-        audit::challenge_failed(&state, None).await;
+        audit::web_challenge_failed(&state, None).await;
         return Ok(gone());
     };
     let user_key = format!("user:{username}");
@@ -603,7 +603,7 @@ async fn second_factor(State(state): State<Shared>, ConnectInfo(peer): ConnectIn
             ))
         }
         Err(MetaError::ChallengeGone) => {
-            audit::challenge_failed(&state, Some(user)).await;
+            audit::web_challenge_failed(&state, Some(user)).await;
             Ok(gone())
         }
         Err(e) => Err(e.into()),

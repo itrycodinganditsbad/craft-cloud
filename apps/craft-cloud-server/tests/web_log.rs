@@ -146,6 +146,30 @@ async fn the_admin_pages_log_no_secret() {
     assert_eq!(signed.status(), StatusCode::SEE_OTHER);
     let line = signed.headers().get("set-cookie").unwrap().to_str().unwrap().to_owned();
     let token = line.strip_prefix(&format!("{COOKIE_NAME}=")).unwrap().split(';').next().unwrap().to_owned();
+    let activity: serde_json::Value =
+        client.get(format!("{base}/api/v1/account/activity?limit=100")).bearer_auth(&device).send().await.unwrap().json().await.unwrap();
+    assert!(activity["events"].as_array().unwrap().iter().any(|event| event["action"] == "auth.login" && event["details"]["client_kind"] == "web"));
+    let audit: serde_json::Value =
+        client.get(format!("{base}/api/v1/admin/audit?limit=200")).bearer_auth(&device).send().await.unwrap().json().await.unwrap();
+    let events = audit["events"].as_array().unwrap();
+    assert!(events.iter().any(|event| event["action"] == "auth.login" && event["details"]["client_kind"] == "web"));
+    assert!(events.iter().any(|event| event["action"] == "auth.login_failed" && event["details"]["client_kind"] == "web"));
+    assert!(events.iter().any(|event| event["action"] == "auth.second_factor_failed" && event["details"]["client_kind"] == "web"));
+    assert!(events.iter().any(|event| event["action"] == "auth.recovery_code_used" && event["details"]["client_kind"] == "web"));
+    let export = client.get(format!("{base}/api/v1/admin/audit/export")).bearer_auth(&device).send().await.unwrap().text().await.unwrap();
+    assert!(export.lines().any(|line| line.contains("\"action\":\"auth.login\"") && line.contains("\"client_kind\":\"web\"")), "{export}");
+    assert!(export.lines().any(|line| line.contains("\"action\":\"auth.login_failed\"") && line.contains("\"client_kind\":\"web\"")), "{export}");
+    assert!(
+        export.lines().any(|line| line.contains("\"action\":\"auth.second_factor_failed\"") && line.contains("\"client_kind\":\"web\"")),
+        "{export}"
+    );
+    assert!(
+        export.lines().any(|line| line.contains("\"action\":\"auth.recovery_code_used\"") && line.contains("\"client_kind\":\"web\"")),
+        "{export}"
+    );
+    let audit_page =
+        client.get(format!("{base}/web/audit")).header("cookie", format!("{COOKIE_NAME}={token}")).send().await.unwrap().text().await.unwrap();
+    assert!(audit_page.contains("&quot;client_kind&quot;:&quot;web&quot;"), "{audit_page}");
     let page = client.get(format!("{base}/web")).header("cookie", format!("{COOKIE_NAME}={token}")).send().await.unwrap().text().await.unwrap();
     let marker = "name=\"csrf\" value=\"";
     let csrf = page[page.find(marker).unwrap() + marker.len()..].split('"').next().unwrap().to_owned();

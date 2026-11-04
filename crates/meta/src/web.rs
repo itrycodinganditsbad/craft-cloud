@@ -21,7 +21,7 @@
 use craft_cloud_proto::DeviceId;
 use sqlx::Row;
 
-use crate::audit::{AuditAction, NewEvent, record_in};
+use crate::audit::{AuditAction, AuditDetails, NewEvent, record_in};
 use crate::codec::{to_u64, uuid_bytes, uuid_from};
 use crate::two_factor::{
     CHALLENGE_TTL_MS, Checked, MAX_CHALLENGE_ATTEMPTS, MAX_OPEN_CHALLENGES, NewChallenge, Proof, TfRow, check_proof, is_enabled, load_row,
@@ -164,7 +164,7 @@ impl Meta {
             return Ok(Some(WebSignIn::Challenge { expires_ms }));
         }
         insert_session(&mut w.tx, user, session, None, now_ms).await?;
-        record_in(&mut w.tx, now_ms, NewEvent::new(AuditAction::AuthLogin).by(user, None::<DeviceId>)).await?;
+        record_in(&mut w.tx, now_ms, NewEvent::new(AuditAction::AuthLogin).by(user, None::<DeviceId>).with(AuditDetails::web())).await?;
         self.commit_audited(w, now_ms).await?;
         Ok(Some(WebSignIn::Session))
     }
@@ -221,8 +221,8 @@ impl Meta {
         if attempts >= MAX_CHALLENGE_ATTEMPTS || account_blocked(&mut w.tx, user).await? || !is_admin(&mut w.tx, user).await? {
             return Err(MetaError::ChallengeGone);
         }
-        if let Checked::Wrong = check_proof(&mut w.tx, user, None, &row, proof, now_ms).await? {
-            return Err(self.refuse_sign_in_proof(w, user, Some(challenge), proof, now_ms).await);
+        if let Checked::Wrong = check_proof(&mut w.tx, user, None, true, &row, proof, now_ms).await? {
+            return Err(self.refuse_sign_in_proof(w, user, Some(challenge), proof, now_ms, true).await);
         }
         let used = sqlx::query("DELETE FROM login_challenges WHERE id_hash = $1 AND user_id = $2")
             .bind(challenge.to_vec())
@@ -233,7 +233,7 @@ impl Meta {
             return Err(MetaError::ChallengeGone);
         }
         insert_session(&mut w.tx, user, session, Some(now_ms), now_ms).await?;
-        record_in(&mut w.tx, now_ms, NewEvent::new(AuditAction::AuthLogin).by(user, None::<DeviceId>)).await?;
+        record_in(&mut w.tx, now_ms, NewEvent::new(AuditAction::AuthLogin).by(user, None::<DeviceId>).with(AuditDetails::web())).await?;
         self.commit_audited(w, now_ms).await?;
         Ok(user)
     }

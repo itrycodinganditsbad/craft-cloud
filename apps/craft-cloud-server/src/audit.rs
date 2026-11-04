@@ -83,8 +83,21 @@ pub fn admin_routes() -> Router<Shared> {
 /// guess was about, `None` for a name no account has (the log never holds a name that was typed). A failure is logged and
 /// otherwise ignored: the answer to the client and the limits around it do not depend on the log.
 pub(crate) async fn login_failed(state: &AppState, target: Option<UserId>) {
+    record_login_failure(state, target, false).await;
+}
+
+pub(crate) async fn web_login_failed(state: &AppState, target: Option<UserId>) {
+    record_login_failure(state, target, true).await;
+}
+
+async fn record_login_failure(state: &AppState, target: Option<UserId>, web: bool) {
     let failure = AuditFailure { action: craft_cloud_meta::AuditAction::AuthLoginFailed, target, step: Step::Password };
-    if let Err(e) = state.meta.audit_record_failure(failure, state.now_ms()).await {
+    let result = if web {
+        state.meta.audit_record_web_failure(failure, state.now_ms()).await
+    } else {
+        state.meta.audit_record_failure(failure, state.now_ms()).await
+    };
+    if let Err(e) = result {
         tracing::warn!(error = %e, "couldn't write an audit event");
     }
 }
@@ -93,8 +106,21 @@ pub(crate) async fn login_failed(state: &AppState, target: Option<UserId>) {
 /// [`login_failed`] does. `target` is the account when the challenge was found, `None` when it was not (nothing a client sent
 /// is stored). The wrong second factors themselves are written by the store, where the account is known.
 pub(crate) async fn challenge_failed(state: &AppState, target: Option<UserId>) {
+    record_challenge_failure(state, target, false).await;
+}
+
+pub(crate) async fn web_challenge_failed(state: &AppState, target: Option<UserId>) {
+    record_challenge_failure(state, target, true).await;
+}
+
+async fn record_challenge_failure(state: &AppState, target: Option<UserId>, web: bool) {
     let failure = AuditFailure { action: craft_cloud_meta::AuditAction::AuthSecondFactorFailed, target, step: Step::ChallengeExpired };
-    if let Err(e) = state.meta.audit_record_failure(failure, state.now_ms()).await {
+    let result = if web {
+        state.meta.audit_record_web_failure(failure, state.now_ms()).await
+    } else {
+        state.meta.audit_record_failure(failure, state.now_ms()).await
+    };
+    if let Err(e) = result {
         tracing::warn!(error = %e, "couldn't write an audit event");
     }
 }

@@ -128,6 +128,7 @@ on_sqlite_and_postgres!(
     signing_in_sets_a_strict_host_cookie_and_keeps_only_a_hash,
     every_answer_carries_the_security_headers_and_no_script,
     a_refused_sign_in_never_says_why,
+    a_web_audit_page_shows_the_web_client_kind,
     sign_in_attempts_are_limited_apart_from_the_json_api,
     a_sign_in_with_two_factor_takes_the_second_step,
     wrong_second_steps_lock_like_the_json_sign_in,
@@ -609,6 +610,12 @@ async fn wrong_second_steps_lock_like_the_json_sign_in(s: &Web) {
     assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(res.headers().get("retry-after").is_some());
     assert!(res.text().await.unwrap().contains("locked"));
+    let events = s.meta.audit_list(&craft_cloud_meta::AuditQuery { limit: 200, ..Default::default() }).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| { event.action == craft_cloud_meta::AuditAction::AuthTwoFactorLocked && event.details.contains("\"client_kind\":\"web\"") })
+    );
     // And past the per-account window's ten wrong codes the answer is a 429 with a wait of its own.
     let res = s.post("/web/login/second-factor", None, &[("challenge", &challenges[2]), ("totp_code", "000000")]).await;
     assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -1300,6 +1307,7 @@ async fn the_audit_log_filters_pages_and_downloads(s: &Web) {
     let end = lines.last().unwrap();
     assert_eq!(end["complete"], true, "{end}");
     assert!(lines.len() > 50 && end["exported"].as_u64().unwrap() as usize == lines.len() - 1);
+    assert!(lines.iter().any(|line| line["action"] == "auth.login" && line["details"]["client_kind"] == "web"));
     let res = s.get("/web/audit/export?action=auth.login", Some(&sess.token)).await;
     let body = res.text().await.unwrap();
     assert!(body.lines().all(|l| !l.contains("auth.login_failed")));
@@ -1308,6 +1316,13 @@ async fn the_audit_log_filters_pages_and_downloads(s: &Web) {
     assert_eq!((res.status(), location(&res).as_str()), (StatusCode::SEE_OTHER, "/web/login"));
     let res = s.get("/web/audit/export?action=nope", Some(&sess.token)).await;
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+async fn a_web_audit_page_shows_the_web_client_kind(s: &Web) {
+    s.add_admin("root").await;
+    let session = s.sign_in("root").await;
+    let page = s.get("/web/audit", Some(&session.token)).await.text().await.unwrap();
+    assert!(page.contains("&quot;client_kind&quot;:&quot;web&quot;"), "{page}");
 }
 
 // ---- text that comes from outside ----

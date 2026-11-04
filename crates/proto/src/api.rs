@@ -454,7 +454,7 @@ pub struct AdminDevices {
 /// typed is ever in it. Fields an event does not have are missing, and fields a later release adds are ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditDetails {
-    /// `agent`, `desktop` or `cli`.
+    /// `agent`, `desktop`, `cli` or `web` (`web` means a browser session of the admin pages).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_kind: Option<String>,
     /// `windows`, `macos`, `linux`, `android`, `ios` or `other`.
@@ -505,7 +505,7 @@ pub struct AuditEvent {
     /// `success` or `failure`.
     pub outcome: String,
     pub details: AuditDetails,
-    /// How many tries the event stands for: failed sign-ins are one event per account and minute. 1 for every other event.
+    /// How many tries the event stands for: failed sign-ins are one event per account, client kind and minute. 1 for every other event.
     pub count: u64,
 }
 

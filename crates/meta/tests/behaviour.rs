@@ -3393,7 +3393,7 @@ async fn a_refused_change_writes_no_event(meta: &Meta) {
     assert_eq!(meta.account(actor.user).await.unwrap().role, Role::Admin);
 }
 
-/// A sign-in step that failed is one row per account, action and minute, whose count goes up and whose identity, time and
+/// A sign-in step that failed is one row per account, action, client kind and minute, whose count goes up and whose identity, time and
 /// details stay those of the first try; names no account has share one row per minute; an event that is not a failed step
 /// cannot be aggregated.
 async fn failed_sign_ins_count_up_in_one_row_per_account_and_minute(meta: &Meta) {
@@ -3409,12 +3409,17 @@ async fn failed_sign_ins_count_up_in_one_row_per_account_and_minute(meta: &Meta)
         (AuditAction::AuthLoginFailed, AuditOutcome::Failure, 1, None, Some(ana.id.0))
     );
     assert_eq!((first.target_kind.as_str(), details(&first)), ("user", json(r#"{"step":"password"}"#)));
+    meta.audit_record_web_failure(login(Some(ana.id)), minute + 1_000).await.unwrap();
+    let rows = all_events(meta).await;
+    assert_eq!(rows.len(), 2, "device and web failure aggregates stay separate");
+    assert!(rows.iter().any(|event| details(event) == json(r#"{"client_kind":"web","step":"password"}"#)));
     // The same minute: the count goes up, nothing else changes.
     meta.audit_record_failure(login(Some(ana.id)), minute + 59_000).await.unwrap();
     meta.audit_record_failure(login(Some(ana.id)), minute + 59_999).await.unwrap();
     let rows = all_events(meta).await;
-    assert_eq!(rows.len(), 1);
-    assert_eq!((rows[0].id, rows[0].at_ms, rows[0].count, &rows[0].details), (first.id, minute + 1_000, 3, &first.details));
+    assert_eq!(rows.len(), 2);
+    let device_row = rows.iter().find(|event| event.id == first.id).unwrap();
+    assert_eq!((device_row.id, device_row.at_ms, device_row.count, &device_row.details), (first.id, minute + 1_000, 3, &first.details));
     // The next minute is a new row; another account, another action, another row.
     meta.audit_record_failure(login(Some(ana.id)), minute + 60_000).await.unwrap();
     meta.audit_record_failure(login(Some(bob.id)), minute + 1_000).await.unwrap();
@@ -3422,10 +3427,13 @@ async fn failed_sign_ins_count_up_in_one_row_per_account_and_minute(meta: &Meta)
         .await
         .unwrap();
     let rows = all_events(meta).await;
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 5);
     let mut counts: Vec<(&str, u64)> = rows.iter().map(|e| (e.action.as_str(), e.count)).collect();
     counts.sort_unstable();
-    assert_eq!(counts, [("auth.login_failed", 1), ("auth.login_failed", 1), ("auth.login_failed", 3), ("auth.second_factor_failed", 1)]);
+    assert_eq!(
+        counts,
+        [("auth.login_failed", 1), ("auth.login_failed", 1), ("auth.login_failed", 1), ("auth.login_failed", 3), ("auth.second_factor_failed", 1)]
+    );
     // Names nobody has: one row a minute whatever was typed, with no account in it.
     for _ in 0..4 {
         meta.audit_record_failure(login(None), minute + 2_000).await.unwrap();
@@ -5123,6 +5131,8 @@ async fn web_sessions_are_made_looked_up_expire_and_log_out(meta: &Meta) {
     let events = all_events(meta).await;
     let login = events.iter().find(|e| e.action == AuditAction::AuthLogin).unwrap();
     assert_eq!((login.actor_user, login.actor_device), (Some(root.id), None));
+    assert_eq!(details(login), json(r#"{"client_kind":"web"}"#));
+    assert!(DeviceClient::new(Some("web"), None, None).is_err(), "devices cannot claim web");
 
     // Idle: valid just inside the idle time, over at it, and a use moves it.
     assert!(session_is_valid(meta, &session, NOW + WEB_IDLE_MS - 1).await);
@@ -5299,6 +5309,10 @@ async fn a_web_sign_in_with_two_factor_needs_its_own_challenge(meta: &Meta) {
     let found = meta.web_session(&session.id_hash, SETUP_AT + 22, WEB_IDLE_MS).await.unwrap().unwrap();
     assert_eq!(found.mfa_verified_ms, Some(SETUP_AT + 21), "the session says when the second factor was given");
     assert_eq!(live_devices(meta, &me).await, vec![first], "a web sign-in makes no device");
+    let login = all_events(meta).await.into_iter().find(|event| event.action == AuditAction::AuthLogin).unwrap();
+    assert_eq!(details(&login), json(r#"{"client_kind":"web"}"#));
+    let failed = all_events(meta).await.into_iter().find(|event| event.action == AuditAction::AuthSecondFactorFailed).unwrap();
+    assert_eq!(details(&failed), json(r#"{"client_kind":"web","step":"totp"}"#));
     let again = meta.web_complete_second_factor(&chal.id_hash, &totp(&right(FIRST_STEP + 2)), &new_session(), SETUP_AT + 23).await;
     assert!(matches!(again, Err(MetaError::ChallengeGone)), "once: {again:?}");
 

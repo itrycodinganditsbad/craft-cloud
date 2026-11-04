@@ -235,7 +235,7 @@ checked by reading the markup and the tests, **not yet with a screen reader**: r
 ## The security audit log
 
 The server keeps a log of the events that matter for who may do what, in its database: sign-ins and failed sign-ins (a
-row per account and minute, with a count), devices signed out, password changes, an administrator's changes to accounts,
+row per account, client kind and minute, with a count), devices signed out, password changes, an administrator's changes to accounts,
 roles, quotas, invites, reset codes and devices, codes redeemed on a new computer, and what the command line does to an
 account (`user reset-password`, `user reset-2fa`, `device revoke`, `device revoke-all`). Two-factor sign-in writes its
 changes, a recovery code's use, a lock and the wrong second steps of a sign-in or a join (never a code), but not each wrong code
@@ -253,7 +253,8 @@ on a signed-in route. Reading it:
 
 **What is in it, and what is not.** A row has a time, the IDs of the account and device that acted and of what it acted
 on, an event name, success or failure, and a few typed values (how many devices were signed out, the role before and after,
-which kind of client and which platform out of a short list). It has **no IP addresses, no file names, no device names, no
+which kind of client and which platform out of a short list). Client kinds are `agent`, `desktop`, `cli` and `web`; `web`
+means a browser session of the admin pages. It has **no IP addresses, no file names, no device names, no
 names of accounts that do not exist, no passwords, codes, tokens or other secrets**; what a client types is never copied
 into it. Because it holds account IDs and times it is personal data about the people who use the server: tell them
 what you keep it for (finding out who changed what and who signed in or tried to), and for how long. An event keeps the ID

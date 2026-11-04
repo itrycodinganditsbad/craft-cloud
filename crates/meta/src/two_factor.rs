@@ -214,6 +214,7 @@ pub(crate) async fn check_proof(
     tx: &mut sqlx::Transaction<'static, sqlx::Any>,
     user: UserId,
     device: Option<DeviceId>,
+    web: bool,
     row: &TfRow,
     proof: &Proof<'_>,
     now_ms: i64,
@@ -253,7 +254,9 @@ pub(crate) async fn check_proof(
                 .bind(uuid_bytes(&user.0))
                 .execute(&mut **tx)
                 .await?;
-            record_in(tx, now_ms, NewEvent::new(AuditAction::AuthRecoveryCodeUsed).by(user, device).on_user(user)).await?;
+            let event = NewEvent::new(AuditAction::AuthRecoveryCodeUsed).by(user, device).on_user(user);
+            let event = if web { event.with(AuditDetails::web()) } else { event };
+            record_in(tx, now_ms, event).await?;
             Ok(Checked::Accepted)
         }
     }
@@ -463,8 +466,8 @@ impl Meta {
         check_actor(&mut w, actor).await?;
         let row = load_row(&mut w.tx, actor.user).await?.filter(TfRow::active);
         let Some(row) = row else { return Err(MetaError::Conflict("two-factor sign-in is not on")) };
-        if let Checked::Wrong = check_proof(&mut w.tx, actor.user, Some(actor.device), &row, proof, now_ms).await? {
-            return Err(self.refuse_proof(w, actor.user, None, now_ms).await);
+        if let Checked::Wrong = check_proof(&mut w.tx, actor.user, Some(actor.device), false, &row, proof, now_ms).await? {
+            return Err(self.refuse_proof(w, actor.user, None, now_ms, false).await);
         }
         remove_in(&mut w.tx, actor.user).await?;
         let revoked = revoke_devices(&mut w.tx, actor.user, Some(actor.device), RevokeReason::TwoFactor, now_ms).await?;
@@ -488,8 +491,8 @@ impl Meta {
         check_actor(&mut w, actor).await?;
         let row = load_row(&mut w.tx, actor.user).await?.filter(TfRow::active);
         let Some(row) = row else { return Err(MetaError::Conflict("two-factor sign-in is not on")) };
-        if let Checked::Wrong = check_proof(&mut w.tx, actor.user, Some(actor.device), &row, proof, now_ms).await? {
-            return Err(self.refuse_proof(w, actor.user, None, now_ms).await);
+        if let Checked::Wrong = check_proof(&mut w.tx, actor.user, Some(actor.device), false, &row, proof, now_ms).await? {
+            return Err(self.refuse_proof(w, actor.user, None, now_ms, false).await);
         }
         replace_recovery_codes(&mut w.tx, actor.user, recovery_hashes).await?;
         let event = NewEvent::new(AuditAction::AccountRecoveryCodesRegenerated).by(actor.user, Some(actor.device)).on_user(actor.user);
@@ -509,8 +512,8 @@ impl Meta {
         }
         let Some(row) = load_row(&mut w.tx, user).await?.filter(TfRow::active) else { return Ok(false) };
         let Some(proof) = proof else { return Err(MetaError::TwoFactorInvalid) };
-        if let Checked::Wrong = check_proof(&mut w.tx, user, None, &row, proof, now_ms).await? {
-            return Err(self.refuse_proof(w, user, None, now_ms).await);
+        if let Checked::Wrong = check_proof(&mut w.tx, user, None, false, &row, proof, now_ms).await? {
+            return Err(self.refuse_proof(w, user, None, now_ms, false).await);
         }
         // The proof is used up here, in a transaction of its own that commits before the change it confirms: a recovery
         // code used for a change that then fails is still used, and its event stays.
@@ -670,8 +673,8 @@ impl Meta {
             return Err(MetaError::ChallengeGone);
         }
         let device = DeviceId::generate();
-        if let Checked::Wrong = check_proof(&mut w.tx, user, Some(device), &row, proof, now_ms).await? {
-            return Err(self.refuse_sign_in_proof(w, user, Some(challenge), proof, now_ms).await);
+        if let Checked::Wrong = check_proof(&mut w.tx, user, Some(device), false, &row, proof, now_ms).await? {
+            return Err(self.refuse_sign_in_proof(w, user, Some(challenge), proof, now_ms, false).await);
         }
         if account_blocked(&mut w.tx, user).await? {
             return Err(MetaError::AccountDisabled);
@@ -699,7 +702,7 @@ impl Meta {
     /// [`MetaError::TwoFactorInvalid`] (or the error that stopped the counters being written). Counting under the same lock as
     /// the check means the next request sees the attempts and the lock this one made: no more than five wrong proofs per
     /// challenge, and the lock set by exactly the tenth.
-    pub(crate) async fn refuse_proof(&self, mut w: WriteTx, user: UserId, challenge: Option<&[u8; 32]>, now_ms: i64) -> MetaError {
+    pub(crate) async fn refuse_proof(&self, mut w: WriteTx, user: UserId, challenge: Option<&[u8; 32]>, now_ms: i64, web: bool) -> MetaError {
         let counted = async {
             let locked = count_wrong_in(&mut w.tx, user, challenge, now_ms).await?;
             w.commit().await?;
@@ -712,7 +715,7 @@ impl Meta {
                     // After the counters and the lock are committed, like a failed sign-in's event: an error in the log
                     // is reported and changes neither the answer nor what was counted (failing closed here would let a
                     // fault in the log undo the lock).
-                    if let Err(e) = self.audit_lock_set(user, now_ms).await {
+                    if let Err(e) = self.audit_lock_set(user, now_ms, web).await {
                         tracing::warn!(error = %e, "couldn't write an audit event");
                     }
                 }
@@ -723,9 +726,11 @@ impl Meta {
     }
 
     /// `auth.two_factor_locked`, in a transaction of its own. Nobody proved who they were: no actor.
-    async fn audit_lock_set(&self, user: UserId, now_ms: i64) -> Result<(), MetaError> {
+    async fn audit_lock_set(&self, user: UserId, now_ms: i64, web: bool) -> Result<(), MetaError> {
         let mut w = self.begin_write().await?;
-        record_in(&mut w.tx, now_ms, NewEvent::new(AuditAction::AuthTwoFactorLocked).on_user(user)).await?;
+        let event = NewEvent::new(AuditAction::AuthTwoFactorLocked).on_user(user);
+        let event = if web { event.with(AuditDetails::web()) } else { event };
+        record_in(&mut w.tx, now_ms, event).await?;
         self.commit_audited(w, now_ms).await
     }
 
@@ -741,15 +746,17 @@ impl Meta {
         challenge: Option<&[u8; 32]>,
         proof: &Proof<'_>,
         now_ms: i64,
+        web: bool,
     ) -> MetaError {
-        let refused = self.refuse_proof(w, user, challenge, now_ms).await;
+        let refused = self.refuse_proof(w, user, challenge, now_ms, web).await;
         if matches!(refused, MetaError::TwoFactorInvalid) {
             let step = match proof {
                 Proof::Totp(_) => AuditStep::Totp,
                 Proof::Recovery(_) => AuditStep::Recovery,
             };
             let failure = AuditFailure { action: AuditAction::AuthSecondFactorFailed, target: Some(user), step };
-            if let Err(e) = self.audit_record_failure(failure, now_ms).await {
+            let result = if web { self.audit_record_web_failure(failure, now_ms).await } else { self.audit_record_failure(failure, now_ms).await };
+            if let Err(e) = result {
                 tracing::warn!(error = %e, "couldn't write an audit event");
             }
         }
