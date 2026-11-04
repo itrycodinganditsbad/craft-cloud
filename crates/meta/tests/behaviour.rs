@@ -3223,3 +3223,159 @@ async fn a_build_runs_beside_commits_on_postgres() {
     };
     a_build_runs_beside_commits_on(&url).await;
 }
+
+/// An edge at a negative ordinal, which pagination starting at -1 once skipped, is found by the comparison: the index
+/// of such a manifest is not marked complete, however it got there, and a build throws the edge away.
+async fn an_edge_at_a_negative_ordinal_keeps_an_index_from_completing_on(url: &str) {
+    use craft_cloud_meta::{EdgeProblemKind, IndexState, Validation};
+    let meta = Meta::open(url).await.unwrap().with_index_batch_rows(3);
+    let ana = user(&meta, "ana").await;
+    let mut conn = raw(url).await;
+    let spare = random_chunk();
+    for ordinal in [-1i64, -7, i64::MIN] {
+        let chunks = fresh_chunks(5);
+        let m = manifest_over(&meta, &ana, &chunks).await;
+        // The stray edge is there before the manifest is recorded, and stays after all its own edges were written.
+        sqlx::query("INSERT INTO manifest_chunks (manifest, ordinal, chunk) VALUES ($1, $2, $3)")
+            .bind(m.id().as_bytes().to_vec())
+            .bind(ordinal)
+            .bind(spare.as_bytes().to_vec())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        meta.add_manifest(ana.space, &m, 100, NOW).await.unwrap();
+        while !matches!(meta.index_stage(&m).await.unwrap(), IndexState::Building { done, total } if done == total) {}
+        match meta.index_check(&m).await.unwrap() {
+            craft_cloud_meta::EdgeCheck::Mismatch(p) => {
+                assert_eq!((p.ordinal, p.kind), (ordinal.unsigned_abs(), EdgeProblemKind::NegativeOrdinal), "{ordinal}")
+            }
+            other => panic!("{ordinal}: expected a mismatch, got {other:?}"),
+        }
+        assert!(matches!(meta.index_validate(&m).await.unwrap(), Validation::Mismatch(p) if p.kind == EdgeProblemKind::NegativeOrdinal), "{ordinal}");
+        assert!(!matches!(meta.index_state(&m.id()).await.unwrap(), IndexState::Complete { .. }), "{ordinal}: not complete");
+        // The build rebuilds from the manifest, and the stray edge is gone.
+        meta.index_complete(&m).await.unwrap();
+        assert_eq!(meta.index_state(&m.id()).await.unwrap(), IndexState::Complete { total: 5 }, "{ordinal}");
+        assert_eq!(meta.index_edges(&m.id()).await.unwrap(), edge_list(&chunks), "{ordinal}");
+    }
+}
+
+/// Throwing away the edges of an index that starts again takes batches of the index budget, each its own transaction,
+/// and a run that stops between two of them leaves a marker the next one resumes from; nothing is written or marked
+/// complete while edges of the old list are left.
+async fn a_reset_of_an_index_goes_in_batches_and_resumes_on(url: &str) {
+    use craft_cloud_meta::IndexState;
+    let chunks = fresh_chunks(12);
+    let spare = random_chunk();
+    let m = {
+        let meta = Meta::open(url).await.unwrap().with_index_batch_rows(3);
+        let ana = user(&meta, "ana").await;
+        let m = manifest_over(&meta, &ana, &chunks).await;
+        meta.add_manifest(ana.space, &m, 100, NOW).await.unwrap();
+        while !matches!(meta.index_stage(&m).await.unwrap(), IndexState::Building { done, total } if done == total) {}
+        m
+    };
+    let mut conn = raw(url).await;
+    // A wrong edge, and one at a negative ordinal; the index was not marked complete.
+    sqlx::query("UPDATE manifest_chunks SET chunk = $1 WHERE manifest = $2 AND ordinal = 5")
+        .bind(spare.as_bytes().to_vec())
+        .bind(m.id().as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO manifest_chunks (manifest, ordinal, chunk) VALUES ($1, -1, $2)")
+        .bind(m.id().as_bytes().to_vec())
+        .bind(spare.as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // The reset starts (what a build does on a mismatch) and the process stops right after: only the marker is there.
+    sqlx::query("UPDATE manifest_index SET indexed_ordinals = 0, state = 2 WHERE manifest = $1")
+        .bind(m.id().as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // A new handle carries on, one batch of 3 rows per transaction, and writes nothing meanwhile.
+    let meta = Meta::open(url).await.unwrap().with_index_batch_rows(3);
+    assert_eq!(meta.index_edge_count().await.unwrap(), 13);
+    let mut left = 13u64;
+    while left > 0 {
+        assert_eq!(meta.index_stage(&m).await.unwrap(), IndexState::Building { done: 0, total: 12 }, "{left} edges left");
+        let now = meta.index_edge_count().await.unwrap();
+        assert_eq!(left - now, left.min(3), "a batch deletes at most the budget");
+        assert!(!matches!(meta.index_state(&m.id()).await.unwrap(), IndexState::Complete { .. }));
+        left = now;
+    }
+    // The last batch (fewer rows than the budget) put the row back to building, so the next stage writes edges.
+    assert_eq!(meta.index_edge_count().await.unwrap(), 0);
+    assert_eq!(meta.index_stage(&m).await.unwrap(), IndexState::Building { done: 3, total: 12 });
+    meta.index_complete(&m).await.unwrap();
+    assert_eq!(meta.index_state(&m.id()).await.unwrap(), IndexState::Complete { total: 12 });
+    assert_eq!(meta.index_edges(&m.id()).await.unwrap(), edge_list(&chunks));
+}
+
+/// A build that meets a wrong edge resets the index across several batches by itself, and ends exact.
+async fn a_build_resets_a_wrong_index_in_batches_on(url: &str) {
+    use craft_cloud_meta::IndexState;
+    let chunks = fresh_chunks(10);
+    let meta = Meta::open(url).await.unwrap().with_index_batch_rows(2);
+    let ana = user(&meta, "ana").await;
+    let m = manifest_over(&meta, &ana, &chunks).await;
+    meta.add_manifest(ana.space, &m, 100, NOW).await.unwrap();
+    while !matches!(meta.index_stage(&m).await.unwrap(), IndexState::Building { done, total } if done == total) {}
+    let mut conn = raw(url).await;
+    sqlx::query("UPDATE manifest_chunks SET chunk = $1 WHERE manifest = $2 AND ordinal = 7")
+        .bind(random_chunk().as_bytes().to_vec())
+        .bind(m.id().as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    meta.index_complete(&m).await.unwrap();
+    assert_eq!(meta.index_state(&m.id()).await.unwrap(), IndexState::Complete { total: 10 });
+    assert_eq!(meta.index_edges(&m.id()).await.unwrap(), edge_list(&chunks));
+}
+
+#[tokio::test]
+async fn an_edge_at_a_negative_ordinal_keeps_an_index_from_completing_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    an_edge_at_a_negative_ordinal_keeps_an_index_from_completing_on(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edge_at_a_negative_ordinal_keeps_an_index_from_completing_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    an_edge_at_a_negative_ordinal_keeps_an_index_from_completing_on(&url).await;
+}
+
+#[tokio::test]
+async fn a_reset_of_an_index_goes_in_batches_and_resumes_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    a_reset_of_an_index_goes_in_batches_and_resumes_on(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_of_an_index_goes_in_batches_and_resumes_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    a_reset_of_an_index_goes_in_batches_and_resumes_on(&url).await;
+}
+
+#[tokio::test]
+async fn a_build_resets_a_wrong_index_in_batches_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    a_build_resets_a_wrong_index_in_batches_on(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_build_resets_a_wrong_index_in_batches_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    a_build_resets_a_wrong_index_in_batches_on(&url).await;
+}

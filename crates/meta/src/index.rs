@@ -11,6 +11,11 @@
 //! rest in further transactions of at most that many rows, so no one holds the write lock for a million rows. The same
 //! builder indexes manifests that existed before the index did; it resumes where an interrupted run stopped.
 //!
+//! When the edges of a manifest do not match it, they are thrown away and written again, in batches of the same size
+//! (state 2, "resetting", marks it): an index of a million edges is never deleted in one transaction, and a run that stops
+//! between two batches is resumed by the next stage. Rows are compared from the lowest ordinal there is, so an edge at a
+//! negative ordinal is found too.
+//!
 //! Nothing here frees anything. The index is read by the checker (`verify`) and by whatever later decides what is
 //! garbage; until it says a manifest is complete, that manifest's chunks are unknown, and unknown means kept.
 
@@ -35,6 +40,10 @@ const REBUILDS: usize = 2;
 
 const BUILDING: i64 = 0;
 const COMPLETE: i64 = 1;
+/// The edges are being thrown away to start the index again, a batch of rows to a transaction. Nothing is written
+/// and nothing is marked complete until the last edge is gone and the state is back to [`BUILDING`]. A run that stops
+/// halfway leaves this marker, and the next one carries on from the rows that are left.
+const RESETTING: i64 = 2;
 
 /// How far a manifest's index has come.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +80,8 @@ pub enum EdgeProblemKind {
     MissingEdge,
     /// There is an edge at an ordinal the manifest has no chunk for.
     ExtraEdge,
+    /// There is an edge at a negative ordinal, which no manifest has. The ordinal of the problem is its absolute value.
+    NegativeOrdinal,
 }
 
 impl EdgeProblemKind {
@@ -79,6 +90,7 @@ impl EdgeProblemKind {
             EdgeProblemKind::WrongChunk => "wrong_chunk",
             EdgeProblemKind::MissingEdge => "missing_edge",
             EdgeProblemKind::ExtraEdge => "extra_edge",
+            EdgeProblemKind::NegativeOrdinal => "negative_ordinal",
         }
     }
 }
@@ -161,15 +173,41 @@ async fn ensure_state(conn: &mut sqlx::AnyConnection, id: &ManifestId, total: i6
     read_state(conn, id, for_update).await?.ok_or(MetaError::Corrupt("an index row vanished"))
 }
 
-/// Throws away the edges of a manifest and starts its index again (the edges are derived: the manifest is the authority).
-async fn reset(conn: &mut sqlx::AnyConnection, id: &ManifestId, total: i64) -> Result<(), MetaError> {
-    sqlx::query("DELETE FROM manifest_chunks WHERE manifest = $1").bind(id.as_bytes().to_vec()).execute(&mut *conn).await?;
-    sqlx::query("UPDATE manifest_index SET chunk_count = $1, indexed_ordinals = 0, state = 0 WHERE manifest = $2")
+/// Marks a manifest's index as starting again: the row takes the manifest's chunk count, writes nothing, and is not
+/// complete (the edges are derived: the manifest is the authority). The edges themselves go in [`reset_step`].
+async fn begin_reset(conn: &mut sqlx::AnyConnection, id: &ManifestId, total: i64) -> Result<(), MetaError> {
+    sqlx::query("UPDATE manifest_index SET chunk_count = $1, indexed_ordinals = 0, state = $2 WHERE manifest = $3")
         .bind(total)
+        .bind(RESETTING)
         .bind(id.as_bytes().to_vec())
         .execute(&mut *conn)
         .await?;
     Ok(())
+}
+
+/// Throws away at most `budget` of the edges of a manifest whose index starts again, the lowest ordinals first (a
+/// negative one included), so no transaction holds the write lock for the up to a million rows a manifest can have.
+/// Returns whether none are left: then the row is building again. Fewer rows deleted than the budget means none are.
+async fn reset_step(conn: &mut sqlx::AnyConnection, id: &ManifestId, budget: usize) -> Result<bool, MetaError> {
+    let limit = i64::try_from(budget.max(1)).map_err(|_| MetaError::Invalid("batch too large"))?;
+    let deleted = sqlx::query(
+        "DELETE FROM manifest_chunks WHERE manifest = $1 AND ordinal IN (SELECT ordinal FROM manifest_chunks WHERE manifest = $1 ORDER BY ordinal LIMIT $2)",
+    )
+    .bind(id.as_bytes().to_vec())
+    .bind(limit)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    let finished = i64::try_from(deleted).is_ok_and(|n| n < limit);
+    if finished {
+        sqlx::query("UPDATE manifest_index SET state = $1 WHERE manifest = $2 AND state = $3")
+            .bind(BUILDING)
+            .bind(id.as_bytes().to_vec())
+            .bind(RESETTING)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(finished)
 }
 
 /// Writes the edges for the ordinals `from..to` of `manifest`, 500 to a statement. Edges already there are left alone
@@ -198,16 +236,22 @@ async fn compare(conn: &mut sqlx::AnyConnection, manifest: &Manifest, page: usiz
     let id = manifest.id();
     let chunks = manifest.chunks();
     let limit = i64::try_from(page.max(1)).map_err(|_| MetaError::Invalid("page too large"))?;
-    let (mut next, mut after): (usize, i64) = (0, -1);
+    // Pagination starts at the lowest number there is, so an edge at a negative ordinal is not skipped.
+    let (mut next, mut from): (usize, i64) = (0, i64::MIN);
     loop {
-        let rows = sqlx::query("SELECT ordinal, chunk FROM manifest_chunks WHERE manifest = $1 AND ordinal > $2 ORDER BY ordinal LIMIT $3")
+        let rows = sqlx::query("SELECT ordinal, chunk FROM manifest_chunks WHERE manifest = $1 AND ordinal >= $2 ORDER BY ordinal LIMIT $3")
             .bind(id.as_bytes().to_vec())
-            .bind(after)
+            .bind(from)
             .bind(limit)
             .fetch_all(&mut *conn)
             .await?;
         for row in &rows {
-            let ordinal = to_u64(row.try_get("ordinal")?)?;
+            let raw: i64 = row.try_get("ordinal")?;
+            if raw < 0 {
+                // Rows come lowest first, so a negative ordinal is the first thing seen: no manifest has such an edge.
+                return Ok(EdgeCheck::Mismatch(EdgeProblem { ordinal: raw.unsigned_abs(), kind: EdgeProblemKind::NegativeOrdinal }));
+            }
+            let ordinal = to_u64(raw)?;
             let chunk = hash_from(&row.try_get::<Vec<u8>, _>("chunk")?)?;
             let expected = next as u64;
             if ordinal > expected {
@@ -219,7 +263,10 @@ async fn compare(conn: &mut sqlx::AnyConnection, manifest: &Manifest, page: usiz
                 Some(_) => {}
             }
             next += 1;
-            after = to_i64(ordinal)?;
+            from = match raw.checked_add(1) {
+                Some(n) => n,
+                None => return Ok(EdgeCheck::Mismatch(EdgeProblem { ordinal, kind: EdgeProblemKind::ExtraEdge })),
+            };
         }
         if rows.len() < page.max(1) {
             break;
@@ -242,19 +289,24 @@ async fn mark_complete(conn: &mut sqlx::AnyConnection, id: &ManifestId, total: i
     Ok(done.rows_affected() == 1)
 }
 
-/// Writes the next batch of edges of `manifest` (at most `budget`) and moves the frontier. Returns the state after it.
-pub(crate) async fn stage(conn: &mut sqlx::AnyConnection, pg: bool, manifest: &Manifest, budget: usize) -> Result<IndexState, MetaError> {
+/// Writes the next batch of edges of `manifest` (at most `budget`) and moves the frontier. Returns the state after it,
+/// and whether the index is still being thrown away to start again (then this step only deleted edges, at most
+/// `budget` of them, and `done` says nothing about edges being written).
+pub(crate) async fn stage(conn: &mut sqlx::AnyConnection, pg: bool, manifest: &Manifest, budget: usize) -> Result<(IndexState, bool), MetaError> {
     let id = manifest.id();
     let total = manifest.chunks().len();
     let total_i = to_i64(total as u64)?;
-    let mut row = ensure_state(conn, &id, total_i, pg).await?;
-    if row.chunk_count != total_i || row.indexed < 0 || row.indexed > total_i {
-        // The row does not belong to this manifest's list: the manifest is the authority, so it starts again.
-        reset(conn, &id, total_i).await?;
-        row = IndexRow { chunk_count: total_i, indexed: 0, state: BUILDING };
+    let row = ensure_state(conn, &id, total_i, pg).await?;
+    // A row that does not belong to this manifest's list starts again: the manifest is the authority.
+    let foreign = row.chunk_count != total_i || row.indexed < 0 || row.indexed > total_i;
+    if foreign {
+        begin_reset(conn, &id, total_i).await?;
+    } else if row.state == COMPLETE {
+        return Ok((IndexState::Complete { total: total as u64 }, false));
     }
-    if row.state == COMPLETE {
-        return Ok(IndexState::Complete { total: total as u64 });
+    if foreign || row.state == RESETTING {
+        let finished = reset_step(conn, &id, budget).await?;
+        return Ok((IndexState::Building { done: 0, total: total as u64 }, !finished));
     }
     let start = usize::try_from(row.indexed).map_err(|_| MetaError::Corrupt("a negative index frontier"))?;
     let end = start.saturating_add(budget.max(1)).min(total);
@@ -266,7 +318,7 @@ pub(crate) async fn stage(conn: &mut sqlx::AnyConnection, pg: bool, manifest: &M
             .execute(&mut *conn)
             .await?;
     }
-    Ok(IndexState::Building { done: end as u64, total: total as u64 })
+    Ok((IndexState::Building { done: end as u64, total: total as u64 }, false))
 }
 
 /// Called in the transaction that records a manifest: makes its index row and writes up to a budget of edges, and when
@@ -275,7 +327,7 @@ pub(crate) async fn stage(conn: &mut sqlx::AnyConnection, pg: bool, manifest: &M
 pub(crate) async fn register(conn: &mut sqlx::AnyConnection, pg: bool, manifest: &Manifest, budget: usize) -> Result<(), MetaError> {
     let id = manifest.id();
     let total = to_i64(manifest.chunks().len() as u64)?;
-    if let IndexState::Building { done, total: n } = stage(conn, pg, manifest, budget).await?
+    if let (IndexState::Building { done, total: n }, false) = stage(conn, pg, manifest, budget).await?
         && done >= n
         && compare(conn, manifest, budget).await? == EdgeCheck::Exact
     {
@@ -296,7 +348,7 @@ impl Meta {
     /// [`Meta::index_complete`], which does both. Each call is safe to repeat and to run beside commits and other builders.
     pub async fn index_stage(&self, manifest: &Manifest) -> Result<IndexState, MetaError> {
         let mut w = self.begin_write().await?;
-        let state = stage(&mut w.tx, self.dialect == Dialect::Postgres, manifest, self.index_rows).await?;
+        let (state, _) = stage(&mut w.tx, self.dialect == Dialect::Postgres, manifest, self.index_rows).await?;
         w.commit().await?;
         Ok(state)
     }
@@ -309,7 +361,7 @@ impl Meta {
         let check = {
             let mut tx = self.read_snapshot().await?;
             let state = read_state(&mut tx, &id, false).await?;
-            let ready = state.is_some_and(|s| s.chunk_count == total && s.indexed == total);
+            let ready = state.is_some_and(|s| s.chunk_count == total && s.indexed == total && s.state != RESETTING);
             let check = if ready { Some(compare(&mut tx, manifest, self.index_rows).await?) } else { None };
             tx.commit().await?;
             check
@@ -340,8 +392,13 @@ impl Meta {
         let mut rebuilds = 0;
         for _ in 0..(REBUILDS + 1) * 4 {
             loop {
-                match self.index_stage(manifest).await? {
+                let mut w = self.begin_write().await?;
+                let (state, resetting) = stage(&mut w.tx, self.dialect == Dialect::Postgres, manifest, self.index_rows).await?;
+                w.commit().await?;
+                match state {
                     IndexState::Complete { .. } => return Ok(()),
+                    // Still throwing edges away: nothing is written yet, whatever the frontier says.
+                    IndexState::Building { .. } if resetting => {}
                     IndexState::Building { done, .. } if done >= total => break,
                     IndexState::Building { .. } | IndexState::Absent => {}
                 }
@@ -357,8 +414,9 @@ impl Meta {
                     let mut w = self.begin_write().await?;
                     // Only a row that is not complete is rebuilt here: a complete one that is wrong is the checker's to report.
                     let row = read_state(&mut w.tx, &id, self.dialect == Dialect::Postgres).await?;
+                    // The edges go in batches of the next stages, each its own transaction, and a stop between them resumes.
                     if row.is_some_and(|r| r.state != COMPLETE) {
-                        reset(&mut w.tx, &id, to_i64(total)?).await?;
+                        begin_reset(&mut w.tx, &id, to_i64(total)?).await?;
                     }
                     w.commit().await?;
                 }
