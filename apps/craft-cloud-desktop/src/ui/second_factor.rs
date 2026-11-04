@@ -12,7 +12,9 @@ pub(super) fn show(ui: &mut egui::Ui, form: &mut SecondFactorForm, events: &mut 
     ui.add_space(8.0);
     ui.label(if form.recovery { "Recovery code" } else { "Code from the authenticator app" });
     let hint = if form.recovery { "ABCD-EFGH-JKMN-PQRS" } else { "123456" };
-    let response = ui.add(egui::TextEdit::singleline(&mut form.code).hint_text(hint).desired_width(f32::INFINITY));
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut form.code).id(super::security::secret_id("second-factor-code")).hint_text(hint).desired_width(f32::INFINITY),
+    );
     let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
     ui.add_space(4.0);
     let toggle = if form.recovery { "Use a code from the app" } else { "Use a recovery code" };

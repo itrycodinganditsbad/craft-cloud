@@ -22,6 +22,7 @@ pub const TITLE: &str = "Craft Cloud";
 /// Draws the window for `model` at `now_ms`, and returns what its buttons asked for.
 pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
     let mut events = Vec::new();
+    security::forget_secrets(ui.ctx(), &model.screen);
     egui::CentralPanel::default().show(ui, |ui| {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(8.0);

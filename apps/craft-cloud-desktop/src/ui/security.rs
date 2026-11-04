@@ -10,10 +10,59 @@ fn send(events: &mut Vec<Event>, event: SecurityEvent) {
     events.push(Event::Security(event));
 }
 
+/// The id of a secret field of the page (a password or a code), by name.
+pub(super) fn secret_id(name: &str) -> egui::Id {
+    egui::Id::new(("security-secret", name))
+}
+
+/// Every secret field of the page and the second step of a join: its name, and the text the model holds for it in `screen`
+/// (empty when the field isn't there).
+fn secrets(screen: &crate::model::Screen) -> Vec<(&'static str, &str)> {
+    use crate::model::Screen;
+    match screen {
+        Screen::Security(page) => match &page.step {
+            Step::SetupPassword { password } => vec![("setup-password", password)],
+            Step::SetupCode { code, .. } => vec![("setup-code", code)],
+            Step::Disable { password, code, .. } => vec![("disable-password", password), ("disable-code", code)],
+            Step::Regenerate { password, code } => vec![("regenerate-password", password), ("regenerate-code", code)],
+            Step::Password { current, new, again } => vec![("password-current", current), ("password-new", new), ("password-again", again)],
+            Step::Home | Step::Codes { .. } | Step::SignOutOthers => Vec::new(),
+        },
+        Screen::SecondFactor(form) => vec![("second-factor-code", &form.code)],
+        _ => Vec::new(),
+    }
+}
+
+const SECRET_NAMES: [&str; 10] = [
+    "setup-password",
+    "setup-code",
+    "disable-password",
+    "disable-code",
+    "regenerate-password",
+    "regenerate-code",
+    "password-current",
+    "password-new",
+    "password-again",
+    "second-factor-code",
+];
+
+/// Drops what egui remembers of every secret field (its cursor and, above all, its undo history, which holds the text as it
+/// was typed) unless the model holds something typed in that field right now. So once a password or code was sent, a step was
+/// cancelled or the page left, Undo can't bring it back; called every frame, before the fields are drawn. egui keeps this state
+/// in memory only (this app doesn't enable eframe's persistence, and the undo history is not serialized either).
+pub(super) fn forget_secrets(ctx: &egui::Context, screen: &crate::model::Screen) {
+    let typed = secrets(screen);
+    for name in SECRET_NAMES {
+        if !typed.iter().any(|(n, text)| *n == name && !text.is_empty()) {
+            ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(secret_id(name)));
+        }
+    }
+}
+
 /// A password field.
-fn password_field(ui: &mut egui::Ui, label: &str, text: &mut String) -> egui::Response {
+fn password_field(ui: &mut egui::Ui, name: &str, label: &str, text: &mut String) -> egui::Response {
     ui.label(label);
-    let response = ui.add(egui::TextEdit::singleline(text).password(true).desired_width(f32::INFINITY));
+    let response = ui.add(egui::TextEdit::singleline(text).id(secret_id(name)).password(true).desired_width(f32::INFINITY));
     ui.add_space(6.0);
     response
 }
@@ -29,7 +78,7 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut SecurityPage, events: &mut Vec<
                 "Two-factor sign-in asks for a code from an app on your phone (Aegis, 1Password, Google Authenticator…) as well as your password.",
             );
             ui.add_space(8.0);
-            let response = password_field(ui, "Your password", password);
+            let response = password_field(ui, "setup-password", "Your password", password);
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             footer(ui, busy, error.as_deref(), "Continue", enter, events);
         }
@@ -52,7 +101,7 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut SecurityPage, events: &mut Vec<
             });
             ui.add_space(10.0);
             ui.label("2. Type the six digits the app shows now.");
-            let response = ui.add(egui::TextEdit::singleline(code).hint_text("123456").desired_width(160.0));
+            let response = ui.add(egui::TextEdit::singleline(code).id(secret_id("setup-code")).hint_text("123456").desired_width(160.0));
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(6.0);
             footer(ui, busy, error.as_deref(), "Turn on", enter, events);
@@ -86,9 +135,9 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut SecurityPage, events: &mut Vec<
         Step::Disable { password, code, recovery } => {
             ui.label("Turning it off signs your other computers out. Type your password and a code from the app.");
             ui.add_space(8.0);
-            password_field(ui, "Your password", password);
+            password_field(ui, "disable-password", "Your password", password);
             ui.label(if *recovery { "A recovery code" } else { "The six digits from the app" });
-            let response = ui.add(egui::TextEdit::singleline(code).desired_width(f32::INFINITY));
+            let response = ui.add(egui::TextEdit::singleline(code).id(secret_id("disable-code")).desired_width(f32::INFINITY));
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui.small_button(if *recovery { "Use a code from the app" } else { "Use a recovery code instead" }).clicked() {
                 send(events, SecurityEvent::ToggleRecovery);
@@ -99,9 +148,9 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut SecurityPage, events: &mut Vec<
         Step::Regenerate { password, code } => {
             ui.label("New recovery codes replace the old ones at once. Type your password and a code from the app.");
             ui.add_space(8.0);
-            password_field(ui, "Your password", password);
+            password_field(ui, "regenerate-password", "Your password", password);
             ui.label("The six digits from the app");
-            let response = ui.add(egui::TextEdit::singleline(code).desired_width(160.0));
+            let response = ui.add(egui::TextEdit::singleline(code).id(secret_id("regenerate-code")).desired_width(160.0));
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(6.0);
             footer(ui, busy, error.as_deref(), "Make new codes", enter, events);
@@ -109,9 +158,9 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut SecurityPage, events: &mut Vec<
         Step::Password { current, new, again } => {
             ui.label("Changing your password signs your other computers out.");
             ui.add_space(8.0);
-            password_field(ui, "Current password", current);
-            password_field(ui, "New password", new);
-            let response = password_field(ui, "The new password again", again);
+            password_field(ui, "password-current", "Current password", current);
+            password_field(ui, "password-new", "New password", new);
+            let response = password_field(ui, "password-again", "The new password again", again);
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             footer(ui, busy, error.as_deref(), "Change password", enter, events);
         }

@@ -395,15 +395,12 @@ fn refusal(answer: http::Answer) -> Result<http::Answer, Error> {
         match serde_json::from_slice::<ErrorAnswer>(&answer.body) {
             Ok(body) => {
                 let extras = serde_json::from_slice::<ErrorExtras>(&answer.body).unwrap_or_default();
-                if extras == ErrorExtras::default() {
+                // The wait is in the answer's JSON; the `Retry-After` header is the same wait, used when the JSON lacks it.
+                let retry_after_secs = extras.retry_after_secs.or(answer.retry_after_secs);
+                if extras.two_factor.is_none() && retry_after_secs.is_none() {
                     Err(Error::Refused { code: body.error, message: body.message })
                 } else {
-                    Err(Error::RefusedWith {
-                        code: body.error,
-                        message: body.message,
-                        two_factor: extras.two_factor,
-                        retry_after_secs: extras.retry_after_secs,
-                    })
+                    Err(Error::RefusedWith { code: body.error, message: body.message, two_factor: extras.two_factor, retry_after_secs })
                 }
             }
             Err(_) => Err(Error::Protocol(format!("HTTP {}", answer.status))),
@@ -415,6 +412,23 @@ fn refusal(answer: http::Answer) -> Result<http::Answer, Error> {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn a_refusal_takes_its_wait_from_the_retry_after_header_when_the_json_has_none() {
+        let body = |text: &str| text.as_bytes().to_vec();
+        let only_header = http::Answer { status: 429, body: body(r#"{"error":"two_factor_locked","message":"wait"}"#), retry_after_secs: Some(900) };
+        assert_eq!(refusal(only_header).unwrap_err().retry_after_secs(), Some(900));
+        // The JSON wins when both are there.
+        let both = http::Answer {
+            status: 429,
+            body: body(r#"{"error":"two_factor_locked","message":"wait","retry_after_secs":840}"#),
+            retry_after_secs: Some(900),
+        };
+        assert_eq!(refusal(both).unwrap_err().retry_after_secs(), Some(840));
+        // Neither: a plain refusal.
+        let neither = http::Answer { status: 403, body: body(r#"{"error":"two_factor_invalid","message":"no"}"#), retry_after_secs: None };
+        assert!(matches!(refusal(neither).unwrap_err(), Error::Refused { .. }));
+    }
 
     /// What the fake agent was asked: method, path and body.
     type Asked = (String, String, String);

@@ -511,3 +511,119 @@ fn the_overview_has_a_security_button_and_the_page_its_buttons() {
     assert!(events.contains(&Event::Security(SecurityEvent::StartPassword)), "{events:?}");
     assert!(events.contains(&Event::Security(SecurityEvent::Close)), "{events:?}");
 }
+
+// ---- what egui remembers of what was typed ----
+
+type H = Harness<'static, (Model, Vec<Event>)>;
+
+/// Whether egui still has state for the field: and whether Undo could bring typed text back into an empty field.
+fn remembered(h: &H, name: &str) -> (bool, bool) {
+    use egui::text_edit::TextEditState;
+    let state = TextEditState::load(&h.ctx, super::security::secret_id(name));
+    let undoable = state.as_ref().is_some_and(|s| s.undoer().undo(&(egui::text::CCursorRange::default(), String::new())).is_some());
+    (state.is_some(), undoable)
+}
+
+fn undo(h: &mut H, role: egui::accesskit::Role) {
+    h.get_by_role(role).focus();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(3);
+}
+
+#[test]
+fn a_typed_password_or_code_is_not_left_in_eguis_undo_history() {
+    use egui::accesskit::Role;
+    let agent = FakeAgent::new(signed_in());
+    agent.factor.lock().unwrap().enabled = true;
+    let model = security_model(&agent, vec![Event::Security(SecurityEvent::StartDisable)]);
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(3);
+    let typed = |h: &H| match &h.state().0.screen {
+        Screen::Security(page) => match &page.step {
+            Step::Disable { password, code, .. } => (password.clone(), code.clone()),
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    };
+
+    h.get_by_role(Role::PasswordInput).focus();
+    h.get_by_role(Role::PasswordInput).type_text("hunter2-secret");
+    h.run_steps(8);
+    assert!(remembered(&h, "disable-password").1, "while typed, egui has the field's history (the test sees what it guards against)");
+    h.get_by_role(Role::TextInput).focus();
+    h.get_by_role(Role::TextInput).type_text("123456");
+    h.run_steps(8);
+    assert_eq!(typed(&h), ("hunter2-secret".into(), "123456".into()));
+    assert!(remembered(&h, "disable-code").1, "and the code's");
+
+    // Sent: the model moved the typed text into the call and cleared the fields.
+    let effects = h.state_mut().0.update(Event::Security(SecurityEvent::Submit));
+    assert!(matches!(effects.as_slice(), [Effect::Security(_)]), "{effects:?}");
+    h.run_steps(2);
+    assert!(!remembered(&h, "disable-password").1, "once sent: no history (a field still drawn has an empty state)");
+    assert!(!remembered(&h, "disable-code").1, "once sent: no history (a field still drawn has an empty state)");
+    let refused = Error::Refused { code: "wrong_password".into(), message: "no".into() };
+    h.state_mut().0.update(Event::SecurityAnswer(crate::security::SecurityAnswer::Disable(Err(refused))));
+    h.run_steps(3);
+    undo(&mut h, Role::PasswordInput);
+    undo(&mut h, Role::TextInput);
+    assert_eq!(typed(&h), (String::new(), String::new()), "Undo brings nothing back");
+
+    // Typed again and cancelled, then the step opened again.
+    h.get_by_role(Role::PasswordInput).focus();
+    h.get_by_role(Role::PasswordInput).type_text("another-secret");
+    h.run_steps(8);
+    assert!(remembered(&h, "disable-password").1);
+    h.state_mut().0.update(Event::Security(SecurityEvent::Home));
+    h.run_steps(2);
+    assert_eq!(remembered(&h, "disable-password"), (false, false), "once cancelled");
+    h.state_mut().0.update(Event::Security(SecurityEvent::StartDisable));
+    h.run_steps(3);
+    undo(&mut h, Role::PasswordInput);
+    assert_eq!(typed(&h).0, "");
+
+    // Left with something typed: the same.
+    h.get_by_role(Role::PasswordInput).focus();
+    h.get_by_role(Role::PasswordInput).type_text("third-secret");
+    h.run_steps(3);
+    h.state_mut().0.update(Event::Security(SecurityEvent::Close));
+    h.run_steps(2);
+    assert_eq!(remembered(&h, "disable-password"), (false, false), "once the page is left");
+}
+
+#[test]
+fn a_typed_join_code_is_not_left_in_eguis_undo_history() {
+    use egui::accesskit::Role;
+    let form = crate::security::SecondFactorForm::new(
+        crate::model::JoinForm { join: "cloud.shadows.ch/K7M4-Q9TX".into(), folder: absolute_folder(), ..Default::default() },
+        None,
+        None,
+    );
+    let mut model = Model::new(defaults(), true, String::new());
+    model.screen = Screen::SecondFactor(form);
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(3);
+    h.get_by_role(Role::TextInput).focus();
+    h.get_by_role(Role::TextInput).type_text("654321");
+    h.run_steps(8);
+    assert!(remembered(&h, "second-factor-code").1, "while typed, egui has its history");
+    // Back to the join form, then the field again.
+    h.state_mut().0.update(Event::CancelSecondFactor);
+    h.run_steps(2);
+    assert_eq!(remembered(&h, "second-factor-code"), (false, false), "once cancelled");
+    let form = crate::security::SecondFactorForm::new(crate::model::JoinForm::default(), None, None);
+    h.state_mut().0.screen = Screen::SecondFactor(form);
+    h.run_steps(3);
+    undo(&mut h, Role::TextInput);
+    match &h.state().0.screen {
+        Screen::SecondFactor(form) => assert_eq!(form.code, "", "Undo brings nothing back"),
+        other => panic!("{other:?}"),
+    }
+    // A code sent (the model clears or leaves the screen): forgotten as well.
+    h.get_by_role(Role::TextInput).type_text("111111");
+    h.run_steps(8);
+    h.state_mut().0.screen = Screen::Join(Default::default());
+    h.run_steps(2);
+    assert_eq!(remembered(&h, "second-factor-code"), (false, false), "once the screen is left");
+}
