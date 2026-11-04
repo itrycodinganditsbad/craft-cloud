@@ -232,6 +232,75 @@ pub struct RestoreResponse {
     pub epoch: Epoch,
 }
 
+/// Items in one `GET /api/v1/trash` page when `limit` is not given.
+pub const TRASH_DEFAULT_LIMIT: u32 = 50;
+/// Most items in one trash page; a larger `limit` is `invalid`.
+pub const TRASH_MAX_LIMIT: u32 = 200;
+
+/// Where the next trash page starts: after this `(deleted_ms, node)` in the newest-deleted-first order. Opaque on the
+/// wire, like [`HistoryCursor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrashCursor {
+    pub deleted_ms: i64,
+    pub node: NodeId,
+}
+
+impl std::fmt::Display for TrashCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.deleted_ms, self.node)
+    }
+}
+
+impl std::str::FromStr for TrashCursor {
+    type Err = BadHistoryCursor;
+
+    /// Only the exact form [`Display`](std::fmt::Display) writes is accepted.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (deleted_ms, node) = s.split_once('.').ok_or(BadHistoryCursor)?;
+        let cursor = TrashCursor { deleted_ms: deleted_ms.parse().map_err(|_| BadHistoryCursor)?, node: node.parse().map_err(|_| BadHistoryCursor)? };
+        if cursor.to_string() == s { Ok(cursor) } else { Err(BadHistoryCursor) }
+    }
+}
+
+/// One deleted node in the trash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashItem {
+    pub id: NodeId,
+    /// The folder it was in when it was deleted (itself deleted, perhaps).
+    pub parent: NodeId,
+    pub name: String,
+    pub is_dir: bool,
+    /// The size of a file's last version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    pub deleted_ms: i64,
+    /// `deleted_ms` plus the server's `retention.trash_days`: when the server may remove the node for good. Nothing is
+    /// removed yet, so this is a promise of the earliest time, not an event.
+    pub purge_after_ms: i64,
+}
+
+/// `GET /api/v1/trash?cursor&limit`: the deleted nodes of your space that were not removed from the trash, newest
+/// deletion first by `(deleted_ms, id)`. `next` is the `cursor` of the following page, absent on the last.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashResponse {
+    pub items: Vec<TrashItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// `POST /api/v1/trash/{id}/restore`: the node is back. `parent` and `name` say where, which differs from where it was
+/// when a folder of its path was merged into a live folder of the same name, or when `renamed` is set: the name was
+/// taken, so the node got a conflict name like the sync engine makes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashRestoreResponse {
+    pub node: NodeId,
+    pub parent: NodeId,
+    pub name: String,
+    pub renamed: bool,
+    pub seq: u64,
+    pub epoch: Epoch,
+}
+
 /// A commit that applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitResponse {
@@ -335,6 +404,16 @@ mod tests {
             assert_eq!(bad.parse::<HistoryCursor>(), Err(BadHistoryCursor), "{bad:?}");
         }
         assert_eq!("-1.00000000-0000-0000-0000-000000000000".parse::<HistoryCursor>(), Err(BadHistoryCursor));
+    }
+
+    #[test]
+    fn trash_cursors_have_one_spelling() {
+        let cursor = TrashCursor { deleted_ms: 1_760_000_000_000, node: NodeId::generate() };
+        assert_eq!(cursor.to_string().parse::<TrashCursor>(), Ok(cursor));
+        let text = cursor.to_string();
+        for bad in ["", "7", "7.", ".x", "x.y", &format!("+{text}"), &text.to_uppercase(), &format!("{text}x"), &format!(" {text}")] {
+            assert_eq!(bad.parse::<TrashCursor>(), Err(BadHistoryCursor), "{bad:?}");
+        }
     }
 
     #[test]
