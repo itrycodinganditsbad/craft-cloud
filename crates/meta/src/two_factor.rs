@@ -615,10 +615,11 @@ impl Meta {
     }
 
     /// The account a challenge was made for and its username, by a plain read: only so the caller can count the try against
-    /// the account before the real check. `None` for a challenge that is unknown, expired or used.
+    /// the account before the real check. `None` for a challenge that is unknown, expired or used. Only the challenges of a
+    /// device sign-in count: a web sign-in's ([`Meta::web_challenge_owner`]) can never make a device.
     pub async fn challenge_owner(&self, id_hash: &[u8; 32], now_ms: i64) -> Result<Option<(UserId, String)>, MetaError> {
         let row = sqlx::query(
-            "SELECT c.user_id, u.username FROM login_challenges c JOIN users u ON u.id = c.user_id WHERE c.id_hash = $1 AND c.expires_ms > $2",
+            "SELECT c.user_id, u.username FROM login_challenges c JOIN users u ON u.id = c.user_id              WHERE c.id_hash = $1 AND c.kind = 'login' AND c.expires_ms > $2",
         )
         .bind(id_hash.to_vec())
         .bind(now_ms)
@@ -648,7 +649,7 @@ impl Meta {
             return Err(MetaError::ChallengeGone);
         }
         let found = sqlx::query(
-            "SELECT device_name, client_kind, platform, app_version, attempts, expires_ms FROM login_challenges WHERE id_hash = $1 AND user_id = $2",
+            "SELECT device_name, client_kind, platform, app_version, attempts, expires_ms FROM login_challenges              WHERE id_hash = $1 AND user_id = $2 AND kind = 'login'",
         )
         .bind(challenge.to_vec())
         .bind(uuid_bytes(&user.0))

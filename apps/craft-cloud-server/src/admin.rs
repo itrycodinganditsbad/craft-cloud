@@ -31,7 +31,7 @@ use axum::routing::{get, post};
 use axum::{Router, middleware};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use craft_cloud_meta::{AdminActor, AdminUser, DeviceAuth, Role, UserId, valid_username};
+use craft_cloud_meta::{AdminActor, AdminUser, AdminVia, DeviceAuth, Role, UserId, valid_username};
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::{
     AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser, AdminUserInfo,
@@ -110,7 +110,7 @@ async fn confirm(state: &AppState, auth: &DeviceAuth, given: Confirmation) -> Re
     let proof = crate::two_factor::parse_proof(given.totp_code, given.recovery_code)?;
     let password_hash = confirm_password(state, auth, password).await?;
     let two_factor = crate::two_factor::confirm_admin_second_factor(state, auth, proof).await?;
-    Ok(AdminActor { user: auth.user, device: auth.device, password_hash, two_factor })
+    Ok(AdminActor { user: auth.user, via: AdminVia::Device(auth.device), password_hash, two_factor })
 }
 
 fn user_id(id: Result<Path<Uuid>, PathRejection>) -> Result<UserId, ApiError> {

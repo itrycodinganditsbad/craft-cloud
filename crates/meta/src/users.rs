@@ -666,7 +666,7 @@ pub(crate) async fn delete_join_codes(tx: &mut sqlx::Transaction<'static, sqlx::
 }
 
 /// The system clock, for the call that takes no time of its own.
-fn wall_clock_ms() -> i64 {
+pub(crate) fn wall_clock_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)).unwrap_or(0)
 }
 

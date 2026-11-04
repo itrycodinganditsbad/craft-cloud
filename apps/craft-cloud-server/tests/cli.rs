@@ -417,7 +417,7 @@ fn the_binary_serves_what_init_created() {
 /// (one row per account, so the reset code stops working), and makes an invite that adds a computer as before.
 #[tokio::test]
 async fn user_invite_replaces_a_password_reset_code() {
-    use craft_cloud_meta::{AdminActor, RESET_TTL_MS};
+    use craft_cloud_meta::{AdminActor, AdminVia, RESET_TTL_MS};
     let parent = tempfile::tempdir().unwrap();
     let dir = parent.path().join("data");
     cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
@@ -428,7 +428,7 @@ async fn user_invite_replaces_a_password_reset_code() {
     let ana = meta.user_by_name("ana").await.unwrap().unwrap();
     let bob = meta.user_by_name("bob").await.unwrap().unwrap();
     let device = meta.create_device(ana.id, "pc", &[9u8; 32], 0).await.unwrap();
-    let actor = AdminActor { user: ana.id, device, password_hash: ana.password_hash.clone(), two_factor: false };
+    let actor = AdminActor { user: ana.id, via: AdminVia::Device(device), password_hash: ana.password_hash.clone(), two_factor: false };
     let reset = Code::generate(INVITE_CHARS).unwrap();
     meta.admin_issue_reset(&actor, bob.id, &reset.hash(), false, 0, RESET_TTL_MS).await.unwrap();
     assert_eq!(meta.invite_needs_password(&reset.hash(), 1).await.unwrap(), Some(true));

@@ -18,6 +18,7 @@ mod schema;
 mod tree;
 mod two_factor;
 mod users;
+mod web;
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -27,7 +28,7 @@ use sqlx::any::{AnyConnectOptions, AnyPoolOptions};
 use sqlx::{AnyPool, ConnectOptions};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-pub use admin::{AdminActor, AdminUser, Issued, MAX_SEARCH_BYTES, MIN_QUOTA_BYTES, RESET_TTL_MS, ServerCounts, UserPage};
+pub use admin::{AdminActor, AdminUser, AdminVia, Issued, MAX_SEARCH_BYTES, MIN_QUOTA_BYTES, RESET_TTL_MS, ServerCounts, UserPage};
 pub use audit::{
     ActionFilter, AuditAction, AuditCursor, AuditDetails, AuditEvent, AuditFailure, AuditOutcome, AuditQuery, ClientKind, Field, MAX_DETAILS_BYTES,
     MAX_RETENTION_DAYS, MIN_RETENTION_DAYS, OPPORTUNISTIC_PRUNE_BATCHES, Origin, PRUNE_BATCH, PRUNE_EVERY_MS, Platform, Pruned, Step, TargetKind,
@@ -49,6 +50,7 @@ pub use users::{
     AccountRecord, CLIENT_KINDS, DeviceAuth, DeviceClient, DeviceRecord, MAX_CLIENT_FIELD_BYTES, RevokeReason, Role, UserId, UserRecord,
     valid_username,
 };
+pub use web::{NewWebSession, WebSession, WebSignIn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetaError {
@@ -169,6 +171,9 @@ pub struct Meta {
     audit_retention_ms: Option<i64>,
     /// When the last complete pruning ran, and whether one runs now; shared by the clones.
     prune_state: Arc<audit::PruneState>,
+    /// Where the store reads the time of day for what it judges itself (a browser session's expiry inside an admin change);
+    /// `None`: the system clock ([`Meta::with_clock`]).
+    clock: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
 }
 
 impl Meta {
@@ -227,7 +232,21 @@ impl Meta {
             live_bytes_cap: DEFAULT_LIVE_BYTES_PER_SPACE,
             audit_retention_ms: None,
             prune_state: Arc::new(audit::PruneState::new()),
+            clock: None,
         })
+    }
+
+    /// The store with another clock, for what it judges by the time of day itself: whether a browser session is still inside its
+    /// lifetimes when an admin change runs (read after the change's locks are taken). The server gives it the clock it injects
+    /// for tests; without one the system clock is read. The clock belongs to this handle and its clones.
+    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Milliseconds since the Unix epoch, by the store's clock.
+    pub(crate) fn clock_ms(&self) -> i64 {
+        self.clock.as_ref().map_or_else(users::wall_clock_ms, |clock| clock())
     }
 
     /// The store with another cap on the bytes of updates one live document's log may hold (the default is
