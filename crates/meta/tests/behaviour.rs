@@ -109,6 +109,15 @@ on_every_backend!(
     a_restore_refuses_what_it_can_not_restore,
     concurrent_restores_let_exactly_one_win,
     a_restore_and_a_late_save_record_both_apply,
+    deleting_stamps_the_time_once_and_coming_back_clears_it,
+    the_trash_pages_newest_first_for_its_own_space,
+    a_restore_brings_the_deleted_folders_back_with_their_ids,
+    a_restore_merges_into_live_folders_and_renames_around_taken_names,
+    a_restore_with_no_free_name_changes_nothing,
+    only_nodes_in_the_trash_can_be_restored_or_removed,
+    removing_from_the_trash_frees_nothing,
+    a_trash_restore_and_a_commit_for_the_same_name_agree,
+    a_trash_restore_and_an_edit_of_the_file_agree,
     batch_size_is_limited,
     folders_nest_at_most_max_tree_depth,
     creating_or_moving_into_a_deleted_folder_brings_it_back,
@@ -1787,6 +1796,10 @@ async fn upgrading_counts_what_each_space_already_stores() {
         sqlx::query("DROP TABLE pairings").execute(&mut conn).await.unwrap();
         sqlx::query("DROP TABLE invites").execute(&mut conn).await.unwrap();
         // And before save records.
+        // And before the trash.
+        sqlx::query("DROP INDEX nodes_trash").execute(&mut conn).await.unwrap();
+        sqlx::query("ALTER TABLE nodes DROP COLUMN deleted_ms").execute(&mut conn).await.unwrap();
+        sqlx::query("ALTER TABLE nodes DROP COLUMN purge_requested_ms").execute(&mut conn).await.unwrap();
         // And before the history index.
         sqlx::query("DROP INDEX versions_node_seq").execute(&mut conn).await.unwrap();
         sqlx::query("ALTER TABLE versions DROP COLUMN save").execute(&mut conn).await.unwrap();
@@ -1814,7 +1827,7 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 7);
+    assert_eq!(versions, 8);
 }
 
 /// A file with `n` versions, one commit each (the first by create): its node and the versions, oldest first.
@@ -2063,12 +2076,12 @@ async fn the_schema_version_is_recorded_and_a_newer_database_is_refused() {
     use sqlx::Connection;
     let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
     let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(latest, 7);
+    assert_eq!(latest, 8);
     // Opening again changes nothing.
     drop(Meta::open(&url).await.unwrap());
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(rows, 7);
-    sqlx::query("INSERT INTO schema_version (version) VALUES (8)").execute(&mut conn).await.unwrap();
+    assert_eq!(rows, 8);
+    sqlx::query("INSERT INTO schema_version (version) VALUES (9)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(&url).await, Err(MetaError::Corrupt(_))), "a newer database is refused");
 }
@@ -2096,4 +2109,489 @@ async fn a_history_page_uses_the_node_index_on_sqlite() {
     let detail: Vec<String> = plan.iter().map(|r| r.get::<String, _>("detail")).collect();
     assert!(detail.iter().any(|d| d.contains("versions_node_seq")), "{detail:?}");
     assert!(!detail.iter().any(|d| d.contains("TEMP B-TREE")), "no sort: {detail:?}");
+}
+
+// ---- the trash ----
+
+/// A folder `name` in `parent`: its node.
+async fn folder(meta: &Meta, u: &UserRecord, dev: DeviceId, parent: NodeId, folder_name: &str, now: i64) -> NodeId {
+    let node = NodeId::generate();
+    meta.commit(u.space, dev, &[Op::Mkdir { node, parent, name: name(folder_name) }], now).await.unwrap();
+    node
+}
+
+/// A file `name` in `parent` with one version: its node and version.
+async fn file_in(meta: &Meta, u: &UserRecord, dev: DeviceId, parent: NodeId, file_name: &str, now: i64) -> (NodeId, NewVersion) {
+    let node = NodeId::generate();
+    let v = version(manifest(meta, u, 6).await);
+    meta.commit(u.space, dev, &[Op::Create { node, parent, name: name(file_name), version: v.clone() }], now).await.unwrap();
+    (node, v)
+}
+
+async fn delete_file(meta: &Meta, u: &UserRecord, dev: DeviceId, node: NodeId, current: VersionId, now: i64) {
+    meta.commit(u.space, dev, &[Op::Delete { node, expected: Some(current) }], now).await.unwrap();
+}
+
+async fn delete_folder(meta: &Meta, u: &UserRecord, dev: DeviceId, node: NodeId, now: i64) {
+    meta.commit(u.space, dev, &[Op::Delete { node, expected: None }], now).await.unwrap();
+}
+
+async fn trash_ids(meta: &Meta, u: &UserRecord) -> Vec<NodeId> {
+    meta.trash(u.space, None, 200, NOW).await.unwrap().entries.iter().map(|e| e.id).collect()
+}
+
+/// The name a restore gives a node whose name is taken, in the minute of `NOW` (2025-10-09 08:53 UTC), from a device
+/// called `laptop`.
+fn conflict_of(original: &str, is_dir: bool, counter: u32) -> String {
+    let stamp = craft_cloud_proto::ConflictStamp { year: 2025, month: 10, day: 9, hour: 8, minute: 53, utc: true };
+    craft_cloud_proto::conflict_name(&name(original), is_dir, "laptop", stamp, counter).unwrap().as_str().to_owned()
+}
+
+async fn live_name(meta: &Meta, u: &UserRecord, node: NodeId) -> (Option<NodeId>, String, bool) {
+    // The feed from the start, which has deleted nodes too.
+    let feed = meta.changes(u.space, 0, None, MAX_PAGE_NODES).await.unwrap();
+    let n = find(&feed.nodes, node);
+    (n.parent, n.name.as_ref().map(|n| n.as_str().to_owned()).unwrap_or_default(), n.deleted)
+}
+
+/// The time in the trash starts when a live node is deleted, not when a deleted one is deleted again; coming back
+/// clears it, by an edit or by a restore from the trash, and the next deletion starts afresh.
+async fn deleting_stamps_the_time_once_and_coming_back_clears_it(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    let (file, v) = file_in(meta, &u, dev, r, "stamp.txt", NOW).await;
+    assert!(trash_ids(meta, &u).await.is_empty());
+
+    delete_file(meta, &u, dev, file, v.id, NOW + 1_000).await;
+    let page = meta.trash(u.space, None, 10, NOW + 9_000).await.unwrap();
+    assert_eq!((page.entries.len(), page.entries[0].deleted_ms, page.repaired), (1, NOW + 1_000, 0));
+    // Deleting a deleted file again is no change: the time stays, and the file is not stamped twice.
+    delete_file(meta, &u, dev, file, v.id, NOW + 5_000).await;
+    assert_eq!(meta.trash(u.space, None, 10, NOW + 9_000).await.unwrap().entries[0].deleted_ms, NOW + 1_000);
+
+    // An edit brings it back and leaves the trash; a later deletion starts the time again.
+    let edited = version(manifest(meta, &u, 7).await);
+    meta.commit(u.space, dev, &[Op::Update { node: file, expected: v.id, version: edited.clone() }], NOW + 6_000).await.unwrap();
+    assert!(trash_ids(meta, &u).await.is_empty(), "an edit brings the file back");
+    delete_file(meta, &u, dev, file, edited.id, NOW + 7_000).await;
+    assert_eq!(meta.trash(u.space, None, 10, NOW + 9_000).await.unwrap().entries[0].deleted_ms, NOW + 7_000);
+
+    // A restore from the trash clears it too, and the next deletion starts afresh again.
+    meta.restore_from_trash(u.space, dev, file, NOW + 8_000).await.unwrap();
+    assert!(trash_ids(meta, &u).await.is_empty());
+    delete_file(meta, &u, dev, file, edited.id, NOW + 8_500).await;
+    assert_eq!(meta.trash(u.space, None, 10, NOW + 9_000).await.unwrap().entries[0].deleted_ms, NOW + 8_500);
+}
+
+/// The trash lists a space's deleted files and folders, newest deletion first by `(deleted_ms, id)`, in pages without
+/// gaps or repeats (also for nodes deleted in one instant), with sizes of files; it lists nothing of another space and
+/// nothing that was removed from the trash.
+async fn the_trash_pages_newest_first_for_its_own_space(meta: &Meta) {
+    use craft_cloud_proto::api::{TRASH_MAX_LIMIT, TrashCursor};
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    let mut made = Vec::new();
+    for i in 0..5 {
+        let (node, v) = file_in(meta, &u, dev, r, &format!("f{i}.txt"), NOW).await;
+        // The last three go in one instant.
+        delete_file(meta, &u, dev, node, v.id, NOW + 1_000 + i64::from(i.min(2)) * 10).await;
+        made.push(node);
+    }
+    let dir = folder(meta, &u, dev, r, "dir", NOW).await;
+    delete_folder(meta, &u, dev, dir, NOW + 5_000).await;
+
+    let all = meta.trash(u.space, None, TRASH_MAX_LIMIT, NOW).await.unwrap();
+    assert_eq!((all.entries.len(), all.next), (6, None));
+    assert_eq!(all.entries[0].id, dir);
+    assert!(all.entries[0].is_dir && all.entries[0].size.is_none() && all.entries[0].parent == r);
+    assert!(all.entries[1..].iter().all(|e| !e.is_dir && e.size == Some(6)));
+    let key = |e: &craft_cloud_meta::TrashEntry| (e.deleted_ms, *e.id.as_uuid().as_bytes());
+    assert!(all.entries.windows(2).all(|w| key(&w[0]) > key(&w[1])), "strictly descending by (deleted_ms, id)");
+    for limit in [1u32, 2, 4] {
+        let (mut seen, mut after) = (Vec::new(), None);
+        loop {
+            let page = meta.trash(u.space, after, limit, NOW).await.unwrap();
+            assert!(page.entries.len() <= limit as usize);
+            seen.extend(page.entries.iter().cloned());
+            match page.next {
+                Some(next) => {
+                    let last = page.entries.last().unwrap();
+                    assert_eq!(next, TrashCursor { deleted_ms: last.deleted_ms, node: last.id });
+                    after = Some(next);
+                }
+                None => break,
+            }
+        }
+        assert_eq!(seen, all.entries, "limit {limit}");
+    }
+    assert!(matches!(meta.trash(u.space, None, 0, NOW).await, Err(MetaError::Invalid(_))));
+    assert!(matches!(meta.trash(u.space, None, TRASH_MAX_LIMIT + 1, NOW).await, Err(MetaError::Invalid(_))));
+
+    // Another space sees none of it. A node removed from the trash is not listed any more.
+    let bob = user(meta, "bob").await;
+    assert!(meta.trash(bob.space, None, 10, NOW).await.unwrap().entries.is_empty());
+    meta.request_purge(u.space, dir, NOW + 6_000).await.unwrap();
+    assert_eq!(trash_ids(meta, &u).await.len(), 5);
+    assert!(!trash_ids(meta, &u).await.contains(&dir));
+}
+
+/// A file in deleted folders comes back with the folders, every node keeping its ID, as one change of the space.
+async fn a_restore_brings_the_deleted_folders_back_with_their_ids(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    let a = folder(meta, &u, dev, r, "a", NOW).await;
+    let b = folder(meta, &u, dev, a, "b", NOW).await;
+    let (f, v) = file_in(meta, &u, dev, b, "f.txt", NOW).await;
+    let (sibling, sv) = file_in(meta, &u, dev, b, "sibling.txt", NOW).await;
+    delete_file(meta, &u, dev, f, v.id, NOW + 1).await;
+    delete_file(meta, &u, dev, sibling, sv.id, NOW + 2).await;
+    delete_folder(meta, &u, dev, b, NOW + 3).await;
+    delete_folder(meta, &u, dev, a, NOW + 4).await;
+    let before = meta.space_info(u.space).await.unwrap();
+
+    let done = meta.restore_from_trash(u.space, dev, f, NOW).await.unwrap();
+    assert_eq!((done.node, done.parent, done.name.as_str(), done.renamed), (f, b, "f.txt", false));
+    assert_eq!((done.seq, done.epoch), (before.seq + 1, before.epoch));
+    let after = meta.space_info(u.space).await.unwrap();
+    assert_eq!((after.seq, after.epoch), (before.seq + 1, before.epoch), "one change of the space");
+    assert_eq!(live_name(meta, &u, a).await, (Some(r), "a".to_owned(), false));
+    assert_eq!(live_name(meta, &u, b).await, (Some(a), "b".to_owned(), false));
+    assert_eq!(live_name(meta, &u, f).await, (Some(b), "f.txt".to_owned(), false));
+    assert_eq!(trash_ids(meta, &u).await, vec![sibling], "only the node that was asked for and its folders come back");
+
+    // The change feed reports exactly the nodes that came back, at the new sequence number, as live.
+    let feed = meta.changes(u.space, before.seq, None, MAX_PAGE_NODES).await.unwrap();
+    let mut changed: Vec<_> = feed.nodes.iter().map(|n| (n.id, n.deleted)).collect();
+    changed.sort();
+    let mut expected = vec![(a, false), (b, false), (f, false)];
+    expected.sort();
+    assert_eq!(changed, expected);
+    let NodeKind::File(state) = &find(&feed.nodes, f).kind else { panic!("a file") };
+    assert_eq!(state.version, v.id, "the file's last version is its content again");
+}
+
+/// A name taken by a file or by anything at the node itself gives a conflict name (never an overwrite); a deleted
+/// folder whose name is held by a live folder is merged into it; every name tried is free, and a folder that is renamed
+/// is a folder.
+async fn a_restore_merges_into_live_folders_and_renames_around_taken_names(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+
+    // The node's own name is taken: a conflict name, and the live file is untouched.
+    let (f, fv) = file_in(meta, &u, dev, r, "plan.txt", NOW).await;
+    delete_file(meta, &u, dev, f, fv.id, NOW + 1).await;
+    let (squatter, _) = file_in(meta, &u, dev, r, "PLAN.txt", NOW + 2).await;
+    let done = meta.restore_from_trash(u.space, dev, f, NOW).await.unwrap();
+    assert_eq!((done.renamed, done.name.clone()), (true, conflict_of("plan.txt", false, 1)));
+    assert_eq!(live_name(meta, &u, squatter).await, (Some(r), "PLAN.txt".to_owned(), false));
+    assert_eq!(live_name(meta, &u, f).await, (Some(r), conflict_of("plan.txt", false, 1), false));
+
+    // A second restore of the same name in the same minute takes the next counter.
+    let (g, gv) = file_in(meta, &u, dev, r, "plan2.txt", NOW + 3).await;
+    delete_file(meta, &u, dev, g, gv.id, NOW + 4).await;
+    let (_h, _) = file_in(meta, &u, dev, r, "plan2.txt", NOW + 5).await;
+    let (_i, _) = file_in(meta, &u, dev, r, &conflict_of("plan2.txt", false, 1), NOW + 6).await;
+    let done = meta.restore_from_trash(u.space, dev, g, NOW).await.unwrap();
+    assert_eq!(done.name, conflict_of("plan2.txt", false, 2));
+
+    // A deleted folder held by a live folder of the same name: the live folder takes what is restored.
+    let a = folder(meta, &u, dev, r, "a", NOW).await;
+    let b = folder(meta, &u, dev, a, "b", NOW).await;
+    let (x, xv) = file_in(meta, &u, dev, b, "x.txt", NOW).await;
+    delete_file(meta, &u, dev, x, xv.id, NOW + 10).await;
+    delete_folder(meta, &u, dev, b, NOW + 11).await;
+    delete_folder(meta, &u, dev, a, NOW + 12).await;
+    let live_a = folder(meta, &u, dev, r, "a", NOW + 13).await;
+    let done = meta.restore_from_trash(u.space, dev, x, NOW).await.unwrap();
+    assert_eq!((done.renamed, done.name.as_str()), (false, "x.txt"));
+    assert_eq!(live_name(meta, &u, b).await, (Some(live_a), "b".to_owned(), false), "b moved into the live folder");
+    assert_eq!(live_name(meta, &u, x).await, (Some(b), "x.txt".to_owned(), false));
+    assert_eq!(live_name(meta, &u, a).await, (Some(r), "a".to_owned(), true), "the deleted a stays deleted");
+    assert_eq!(trash_ids(meta, &u).await, vec![a]);
+
+    // A deleted folder held by a file: the folder comes back under a conflict name, with its content below it.
+    let c = folder(meta, &u, dev, r, "c", NOW).await;
+    let (y, yv) = file_in(meta, &u, dev, c, "y.txt", NOW).await;
+    delete_file(meta, &u, dev, y, yv.id, NOW + 20).await;
+    delete_folder(meta, &u, dev, c, NOW + 21).await;
+    let (_c_file, _) = file_in(meta, &u, dev, r, "c", NOW + 22).await;
+    let done = meta.restore_from_trash(u.space, dev, y, NOW).await.unwrap();
+    assert_eq!((done.parent, done.name.as_str()), (c, "y.txt"));
+    assert_eq!(live_name(meta, &u, c).await, (Some(r), conflict_of("c", true, 1), false));
+
+    // A deleted folder restored itself, its name held by a live folder: no merge for the node asked for.
+    let d = folder(meta, &u, dev, r, "d", NOW).await;
+    delete_folder(meta, &u, dev, d, NOW + 30).await;
+    let live_d = folder(meta, &u, dev, r, "d", NOW + 31).await;
+    let done = meta.restore_from_trash(u.space, dev, d, NOW).await.unwrap();
+    assert_eq!((done.renamed, done.name.clone()), (true, conflict_of("d", true, 1)));
+    assert_eq!(live_name(meta, &u, live_d).await.1, "d");
+}
+
+/// When every conflict name is taken too, the restore is refused as a conflict and the space is exactly as it was: no
+/// sequence number, no revived node, the node still in the trash.
+async fn a_restore_with_no_free_name_changes_nothing(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    let (f, fv) = file_in(meta, &u, dev, r, "busy.txt", NOW).await;
+    delete_file(meta, &u, dev, f, fv.id, NOW + 1).await;
+    // The name itself and its 100 conflict names, in one batch.
+    let m = manifest(meta, &u, 1).await;
+    let mut names = vec!["busy.txt".to_owned()];
+    names.extend((1..=100).map(|n| conflict_of("busy.txt", false, n)));
+    let ops: Vec<Op> = names.iter().map(|n| Op::Create { node: NodeId::generate(), parent: r, name: name(n), version: version(m) }).collect();
+    meta.commit(u.space, dev, &ops, NOW + 2).await.unwrap();
+    let before = meta.space_info(u.space).await.unwrap();
+    let tree_before = full_tree(meta, u.space).await.nodes.len();
+
+    let refused = meta.restore_from_trash(u.space, dev, f, NOW).await;
+    let list = refused_restore(refused);
+    assert!(matches!(list[0].1, ConflictKind::NameTaken { .. }), "{list:?}");
+    assert_eq!(meta.space_info(u.space).await.unwrap().seq, before.seq);
+    assert_eq!(trash_ids(meta, &u).await, vec![f]);
+    assert_eq!(full_tree(meta, u.space).await.nodes.len(), tree_before);
+    assert!(meta.changes(u.space, before.seq, None, MAX_PAGE_NODES).await.unwrap().nodes.is_empty());
+}
+
+/// What is not in the trash can't be restored or removed from it: a live node, an unknown one, another space's, one
+/// already removed from the trash.
+async fn only_nodes_in_the_trash_can_be_restored_or_removed(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    let (live, _) = file_in(meta, &u, dev, r, "live.txt", NOW).await;
+    let (gone, gv) = file_in(meta, &u, dev, r, "gone.txt", NOW).await;
+    let (kept, kv) = file_in(meta, &u, dev, r, "kept.txt", NOW).await;
+    delete_file(meta, &u, dev, gone, gv.id, NOW + 1).await;
+    delete_file(meta, &u, dev, kept, kv.id, NOW + 1).await;
+    meta.request_purge(u.space, gone, NOW + 2).await.unwrap();
+    let seq = meta.space_info(u.space).await.unwrap().seq;
+    let bob = user(meta, "bob").await;
+    let bob_device = device(meta, &bob).await;
+
+    for node in [live, NodeId::generate(), r, gone] {
+        assert!(matches!(meta.restore_from_trash(u.space, dev, node, NOW).await, Err(MetaError::NotFound(_))), "restore {node}");
+    }
+    for node in [live, NodeId::generate(), r] {
+        assert!(matches!(meta.request_purge(u.space, node, NOW).await, Err(MetaError::NotFound(_))), "remove {node}");
+    }
+    assert!(matches!(meta.restore_from_trash(bob.space, bob_device, kept, NOW).await, Err(MetaError::NotFound(_))), "another space's node");
+    assert!(matches!(meta.request_purge(bob.space, kept, NOW).await, Err(MetaError::NotFound(_))));
+    assert_eq!(meta.space_info(u.space).await.unwrap().seq, seq, "nothing changed");
+    assert_eq!(trash_ids(meta, &u).await, vec![kept]);
+}
+
+/// Removing from the trash only marks the node: no version, manifest or tombstone changes, the change feed and the
+/// sequence number stay, the history is still readable; asking twice changes nothing; an edit that brings the node back
+/// ends the mark, and the next deletion lists it again.
+async fn removing_from_the_trash_frees_nothing(meta: &Meta) {
+    use craft_cloud_proto::api::HISTORY_MAX_LIMIT;
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let (node, versions) = file_with_versions(meta, &u, dev, 3).await;
+    delete_file(meta, &u, dev, node, versions[2].id, NOW + 100).await;
+    let before = meta.space_info(u.space).await.unwrap();
+    let feed_before = meta.changes(u.space, 0, None, MAX_PAGE_NODES).await.unwrap();
+
+    meta.request_purge(u.space, node, NOW + 200).await.unwrap();
+    meta.request_purge(u.space, node, NOW + 300).await.unwrap();
+    assert!(trash_ids(meta, &u).await.is_empty(), "it left the trash");
+    assert_eq!(meta.space_info(u.space).await.unwrap().seq, before.seq, "no change of the space");
+    assert_eq!(meta.changes(u.space, 0, None, MAX_PAGE_NODES).await.unwrap(), feed_before, "the tombstone is as it was");
+    let history = meta.history(u.space, node, None, HISTORY_MAX_LIMIT).await.unwrap().versions;
+    assert_eq!(history.len(), 3, "every version is still there");
+    for v in &versions {
+        assert!(meta.has_manifest(u.space, &v.manifest).await.unwrap(), "every manifest is still the space's");
+    }
+
+    // An edit still brings the file back (an edit beats a deletion), which ends the mark.
+    let edit = version(manifest(meta, &u, 9).await);
+    meta.commit(u.space, dev, &[Op::Update { node, expected: versions[2].id, version: edit.clone() }], NOW + 400).await.unwrap();
+    assert!(!live_name(meta, &u, node).await.2);
+    delete_file(meta, &u, dev, node, edit.id, NOW + 500).await;
+    let page = meta.trash(u.space, None, 10, NOW + 600).await.unwrap();
+    assert_eq!((page.entries.len(), page.entries[0].deleted_ms), (1, NOW + 500));
+}
+
+/// A restore and a commit that wants the same name run together: both are applied in some order and the result is
+/// consistent, never two live nodes with one name.
+async fn a_trash_restore_and_a_commit_for_the_same_name_agree(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    for round in 0..4 {
+        let file_name = format!("race{round}.txt");
+        let (f, fv) = file_in(meta, &u, dev, r, &file_name, NOW).await;
+        delete_file(meta, &u, dev, f, fv.id, NOW + 1).await;
+        let (m1, m2, space) = (meta.clone(), meta.clone(), u.space);
+        let rival = NodeId::generate();
+        let rival_op = Op::Create { node: rival, parent: r, name: name(&file_name), version: version(manifest(meta, &u, 2).await) };
+        let restore = tokio::spawn(async move { m1.restore_from_trash(space, dev, f, NOW).await });
+        let create = tokio::spawn(async move { m2.commit(space, dev, &[rival_op], NOW + 2).await });
+        let restored = restore.await.unwrap().unwrap();
+        match create.await.unwrap() {
+            // The commit came first: it holds the name, and the restore went around it.
+            Ok(_) => {
+                assert!(restored.renamed, "round {round}");
+                assert_eq!(live_name(meta, &u, rival).await.1, file_name);
+            }
+            // The restore came first: the commit finds the name taken.
+            Err(MetaError::Rejected(list)) => {
+                assert!(matches!(list[0].kind, ConflictKind::NameTaken { .. }), "round {round}");
+                assert!(!restored.renamed);
+                assert_eq!(live_name(meta, &u, f).await.1, file_name);
+            }
+            Err(other) => panic!("unexpected error {other:?}"),
+        }
+    }
+    // No two live nodes share a name (the unique index would have refused it; this says what is seen).
+    let tree = full_tree(meta, u.space).await;
+    let mut names: Vec<String> = tree.nodes.iter().filter_map(|n| n.name.as_ref().map(|n| n.fold_key().as_str().to_owned())).collect();
+    let total = names.len();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), total);
+}
+
+/// A restore and an edit of the same deleted file run together: whichever is first, the file ends live with its
+/// versions intact, and the second is either an update on a live file or a "not in the trash".
+async fn a_trash_restore_and_an_edit_of_the_file_agree(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    let (f, fv) = file_in(meta, &u, dev, r, "both.txt", NOW).await;
+    delete_file(meta, &u, dev, f, fv.id, NOW + 1).await;
+    let edit = version(manifest(meta, &u, 4).await);
+    let (m1, m2, space) = (meta.clone(), meta.clone(), u.space);
+    let edit_op = Op::Update { node: f, expected: fv.id, version: edit.clone() };
+    let restore = tokio::spawn(async move { m1.restore_from_trash(space, dev, f, NOW).await });
+    let update = tokio::spawn(async move { m2.commit(space, dev, &[edit_op], NOW + 2).await });
+    let restored = restore.await.unwrap();
+    update.await.unwrap().unwrap();
+    assert!(matches!(restored, Ok(_) | Err(MetaError::NotFound(_))), "{restored:?}");
+    assert_eq!(live_name(meta, &u, f).await, (Some(r), "both.txt".to_owned(), false));
+    assert!(trash_ids(meta, &u).await.is_empty());
+    assert_eq!(meta.history(u.space, f, None, 10).await.unwrap().versions.len(), 2);
+}
+
+// ---- the trash: the migration and a damaged database ----
+
+/// A raw connection to the database `url`, for what the library never does (reading and breaking columns).
+async fn raw(url: &str) -> sqlx::AnyConnection {
+    use sqlx::Connection;
+    sqlx::any::install_default_drivers();
+    sqlx::AnyConnection::connect(url).await.unwrap()
+}
+
+/// Puts the database back to the state before the trash migration: no columns, no index, one version fewer.
+async fn undo_the_trash_migration(url: &str) {
+    let mut conn = raw(url).await;
+    for statement in [
+        "DROP INDEX nodes_trash",
+        "ALTER TABLE nodes DROP COLUMN deleted_ms",
+        "ALTER TABLE nodes DROP COLUMN purge_requested_ms",
+        "DELETE FROM schema_version WHERE version >= 8",
+    ] {
+        sqlx::query(statement).execute(&mut conn).await.unwrap();
+    }
+}
+
+fn wall_clock_ms() -> i64 {
+    i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()).unwrap()
+}
+
+/// Nodes deleted before the trash existed start their time in the trash at the migration, once: live nodes get no
+/// time, and opening the database again does not stamp them again.
+async fn the_trash_migration_dates_old_deletions_at_the_migration(url: &str) {
+    let (ana, file, folder_node) = {
+        let meta = Meta::open(url).await.unwrap();
+        let ana = user(&meta, "ana").await;
+        let dev = device(&meta, &ana).await;
+        let r = root(&meta, &ana).await;
+        let (file, v) = file_in(&meta, &ana, dev, r, "old.txt", NOW).await;
+        let (_kept, _) = file_in(&meta, &ana, dev, r, "kept.txt", NOW).await;
+        let dir = folder(&meta, &ana, dev, r, "olddir", NOW).await;
+        delete_file(&meta, &ana, dev, file, v.id, NOW + 1).await;
+        delete_folder(&meta, &ana, dev, dir, NOW + 2).await;
+        (ana, file, dir)
+    };
+    undo_the_trash_migration(url).await;
+    let before = wall_clock_ms();
+    let meta = Meta::open(url).await.unwrap();
+    let after = wall_clock_ms();
+    let page = meta.trash(ana.space, None, 10, 0).await.unwrap();
+    assert_eq!(page.repaired, 0, "the migration stamped them, nothing was left to repair");
+    let mut ids: Vec<_> = page.entries.iter().map(|e| e.id).collect();
+    ids.sort();
+    let mut expected = vec![file, folder_node];
+    expected.sort();
+    assert_eq!(ids, expected, "the live file is not in the trash");
+    let stamps: Vec<i64> = page.entries.iter().map(|e| e.deleted_ms).collect();
+    assert!(stamps.iter().all(|t| (before - 1_000..=after + 1_000).contains(t)), "{stamps:?} not in {before}..{after}");
+    assert_eq!(stamps[0], stamps[1], "one baseline for all of them");
+    // Another open changes nothing.
+    drop(meta);
+    let again = Meta::open(url).await.unwrap().trash(ana.space, None, 10, 0).await.unwrap();
+    assert_eq!(again.entries, page.entries);
+    let mut conn = raw(url).await;
+    let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
+    assert_eq!(latest, 8);
+    let live_with_time: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE deleted = 0 AND (deleted_ms IS NOT NULL OR purge_requested_ms IS NOT NULL)")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(live_with_time, 0);
+}
+
+#[tokio::test]
+async fn the_trash_migration_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    the_trash_migration_dates_old_deletions_at_the_migration(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_trash_migration_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    the_trash_migration_dates_old_deletions_at_the_migration(&url).await;
+}
+
+/// A deleted node without a deletion time (it can't happen through this code) is stamped with the time of the read
+/// and reported, never listed as expired; the stamp stays.
+async fn a_deleted_node_without_a_time_is_stamped_when_read(url: &str) {
+    let meta = Meta::open(url).await.unwrap();
+    let ana = user(&meta, "ana").await;
+    let dev = device(&meta, &ana).await;
+    let r = root(&meta, &ana).await;
+    let (file, v) = file_in(&meta, &ana, dev, r, "damaged.txt", NOW).await;
+    delete_file(&meta, &ana, dev, file, v.id, NOW + 1).await;
+    let mut conn = raw(url).await;
+    sqlx::query("UPDATE nodes SET deleted_ms = NULL WHERE deleted = 1").execute(&mut conn).await.unwrap();
+    let page = meta.trash(ana.space, None, 10, NOW + 77).await.unwrap();
+    assert_eq!((page.repaired, page.entries.len(), page.entries[0].deleted_ms), (1, 1, NOW + 77));
+    let later = meta.trash(ana.space, None, 10, NOW + 99).await.unwrap();
+    assert_eq!((later.repaired, later.entries[0].deleted_ms), (0, NOW + 77));
+}
+
+#[tokio::test]
+async fn a_damaged_deletion_time_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    a_deleted_node_without_a_time_is_stamped_when_read(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_damaged_deletion_time_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    a_deleted_node_without_a_time_is_stamped_when_read(&url).await;
 }

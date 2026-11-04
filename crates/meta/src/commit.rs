@@ -13,8 +13,11 @@
 
 use std::collections::HashMap;
 
+use craft_cloud_proto::conflict_name;
 use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_TREE_DEPTH};
-use craft_cloud_proto::{Conflict, ConflictKind, DeviceId, Epoch, ManifestId, Name, NewVersion, NodeId, Op, SaveRecord, SpaceId, VersionId};
+use craft_cloud_proto::{
+    Conflict, ConflictKind, ConflictStamp, DeviceId, Epoch, ManifestId, Name, NewVersion, NodeId, Op, SaveRecord, SpaceId, VersionId,
+};
 use sqlx::Row;
 
 use crate::blobs::manifest_file_size;
@@ -37,6 +40,49 @@ pub struct RestoreOutcome {
     pub parent_version: VersionId,
     pub seq: u64,
     pub epoch: Epoch,
+}
+
+/// A node that came back from the trash: where it sits now, whether it took a conflict name, and the space's new
+/// sequence number and epoch (unchanged).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashRestoreOutcome {
+    pub node: NodeId,
+    pub parent: NodeId,
+    pub name: String,
+    pub renamed: bool,
+    pub seq: u64,
+    pub epoch: Epoch,
+}
+
+/// The most conflict names tried for one restored node.
+const MAX_CONFLICT_COUNTER: u32 = 100;
+
+fn rejected(kind: ConflictKind) -> MetaError {
+    MetaError::Rejected(vec![Conflict { op: 0, kind }])
+}
+
+/// `ms` since the Unix epoch as a UTC minute, for a conflict name (the server doesn't know a user's time zone).
+fn conflict_stamp(ms: i64) -> ConflictStamp {
+    let days = ms.div_euclid(86_400_000);
+    let minutes = ms.rem_euclid(86_400_000) / 60_000;
+    // Days to a civil date in the proleptic Gregorian calendar, counted from 0000-03-01.
+    let z = days.saturating_add(719_468);
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 { shifted_month + 3 } else { shifted_month - 9 };
+    let year = year_of_era.saturating_add(era.saturating_mul(400)).saturating_add(i64::from(month <= 2));
+    ConflictStamp {
+        year: u16::try_from(year).unwrap_or(0),
+        month: u8::try_from(month).unwrap_or(1),
+        day: u8::try_from(day).unwrap_or(1),
+        hour: u8::try_from(minutes / 60).unwrap_or(0),
+        minute: u8::try_from(minutes % 60).unwrap_or(0),
+        utc: true,
+    }
 }
 
 struct NodeRow {
@@ -126,8 +172,12 @@ impl Ctx<'_> {
         if deleted {
             self.failed_restores.clear();
         }
-        sqlx::query("UPDATE nodes SET deleted = $1, changed_seq = $2 WHERE space_id = $3 AND id = $4")
+        // The time in the trash starts at the change from live to deleted and ends when the node comes back: a later
+        // deletion starts it afresh, and a pending request to remove the node for good dies with the deletion it was for.
+        let deleted_ms = deleted.then_some(self.now_ms);
+        sqlx::query("UPDATE nodes SET deleted = $1, deleted_ms = $2, purge_requested_ms = NULL, changed_seq = $3 WHERE space_id = $4 AND id = $5")
             .bind(i64::from(deleted))
+            .bind(deleted_ms)
             .bind(self.seq)
             .bind(self.space())
             .bind(uuid_bytes(id.as_uuid()))
@@ -354,6 +404,101 @@ impl Ctx<'_> {
             }
         }
     }
+    /// The first of 100 conflict names for `original` in `parent` that no live node has (the first has no counter,
+    /// then `, 2` to `, 100`), or `None`.
+    async fn free_conflict_name(&mut self, parent: NodeId, original: &Name, is_dir: bool, device: &str) -> Result<Option<Name>, MetaError> {
+        let stamp = conflict_stamp(self.now_ms);
+        for counter in 1..=MAX_CONFLICT_COUNTER {
+            let candidate = conflict_name(original, is_dir, device, stamp, counter).map_err(|_| MetaError::Corrupt("a stored name is invalid"))?;
+            if self.live_child(parent, &candidate).await?.is_none() {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Writes where a deleted node comes back and makes it live: one statement, one sequence number.
+    async fn revive(&mut self, id: NodeId, parent: NodeId, name: &Name) -> Result<(), MetaError> {
+        sqlx::query(
+            "UPDATE nodes SET parent = $1, name = $2, fold_key = $3, deleted = 0, deleted_ms = NULL, purge_requested_ms = NULL, changed_seq = $4 \
+             WHERE space_id = $5 AND id = $6",
+        )
+        .bind(uuid_bytes(parent.as_uuid()))
+        .bind(name.as_str().to_owned())
+        .bind(name.fold_key().as_str().to_owned())
+        .bind(self.seq)
+        .bind(self.space())
+        .bind(uuid_bytes(id.as_uuid()))
+        .execute(&mut *self.conn)
+        .await?;
+        Ok(())
+    }
+
+    /// Brings a node of the trash back, with the deleted folders above it, root-most first and with their IDs. Where
+    /// a deleted folder's name is taken by a live folder, that folder is used instead (the deleted one stays deleted)
+    /// and what is below it moves in. Where a name is taken by a file, or the node's own name is taken by anything, the
+    /// node comes back under a conflict name. Never overwrites, never creates a node. A conflict that can't be solved
+    /// is an `Err(MetaError::Rejected)`, and the caller drops the transaction.
+    async fn restore_from_trash(&mut self, node: NodeId) -> Result<TrashRestoreOutcome, MetaError> {
+        let found = sqlx::query("SELECT deleted, purge_requested_ms, is_dir FROM nodes WHERE space_id = $1 AND id = $2")
+            .bind(self.space())
+            .bind(uuid_bytes(node.as_uuid()))
+            .fetch_optional(&mut *self.conn)
+            .await?;
+        let Some(found) = found else { return Err(MetaError::NotFound("node in the trash")) };
+        // A node that was removed from the trash is gone from it, whatever the tombstone still holds.
+        if !flag(&found, "deleted")? || found.try_get::<Option<i64>, _>("purge_requested_ms")?.is_some() {
+            return Err(MetaError::NotFound("node in the trash"));
+        }
+        let is_dir = flag(&found, "is_dir")?;
+        let device = sqlx::query("SELECT name FROM devices WHERE id = $1")
+            .bind(uuid_bytes(self.device.as_uuid()))
+            .fetch_optional(&mut *self.conn)
+            .await?
+            .map(|row| row.try_get::<String, _>("name"))
+            .transpose()?
+            .unwrap_or_default();
+        let up = self.ancestors(node).await?;
+        let deleted_run: Vec<&Ancestor> = up.iter().take_while(|a| a.deleted).collect();
+        let Some(base) = up.get(deleted_run.len()) else {
+            // The walk ended inside the deleted run: the depth bound (too deep) or a deleted root (damaged data).
+            return if up.last().is_some_and(|a| a.parent.is_some()) {
+                Err(rejected(ConflictKind::TooDeep))
+            } else {
+                Err(MetaError::Corrupt("the root is deleted"))
+            };
+        };
+        let mut parent = base.id;
+        for (index, a) in deleted_run.iter().enumerate().rev() {
+            let own = Name::new(&a.name).map_err(|_| MetaError::Corrupt("a stored name is invalid"))?;
+            let taken = self.live_child(parent, &own).await?;
+            let is_target = index == 0;
+            if !is_target && let Some(existing) = taken {
+                // A live folder of that name stands in for the deleted one; a file there means this folder is renamed.
+                if self.node(existing).await?.is_some_and(|n| n.is_dir) {
+                    parent = existing;
+                    continue;
+                }
+            }
+            let final_name = match taken {
+                None => own,
+                Some(existing) => {
+                    let folder = !is_target || is_dir;
+                    match self.free_conflict_name(parent, &own, folder, &device).await? {
+                        Some(candidate) => candidate,
+                        None => return Err(rejected(ConflictKind::NameTaken { existing })),
+                    }
+                }
+            };
+            self.revive(a.id, parent, &final_name).await?;
+            parent = a.id;
+        }
+        let placed = self.node(node).await?.ok_or(MetaError::Corrupt("a restored node vanished"))?;
+        let parent = placed.parent.ok_or(MetaError::Corrupt("a restored node has no parent"))?;
+        let original = up.first().map(|a| a.name.as_str()).unwrap_or_default();
+        Ok(TrashRestoreOutcome { node, parent, renamed: placed.name != original, name: placed.name, seq: 0, epoch: self.epoch })
+    }
+
     /// `node` and its ancestors, nearest first; stops after `MAX_TREE_DEPTH + 2` rows, so a walk that did not
     /// reach the root (last parent is `Some`) is too deep.
     async fn ancestors(&mut self, node: NodeId) -> Result<Vec<Ancestor>, MetaError> {
@@ -427,6 +572,20 @@ impl Meta {
         Ok(CommitOutcome { seq, epoch: info.epoch })
     }
 
+    /// Brings the node `node` of the trash back in `space`, as one change of the space (one sequence number, all or
+    /// nothing): see `Ctx::restore_from_trash` for the rules. `NotFound` for a node that is not in the trash (live,
+    /// unknown, another space's, or removed from the trash); `Rejected` (`NameTaken`) when no conflict name is free.
+    pub async fn restore_from_trash(&self, space: SpaceId, device: DeviceId, node: NodeId, now_ms: i64) -> Result<TrashRestoreOutcome, MetaError> {
+        let mut w = self.begin_write().await?;
+        let info = space_info(&mut w.tx, space, self.dialect == Dialect::Postgres).await?;
+        let seq = info.seq.checked_add(1).ok_or(MetaError::Corrupt("sequence overflow"))?;
+        let mut ctx = Ctx { conn: &mut w.tx, space, seq: to_i64(seq)?, epoch: info.epoch, device, now_ms, failed_restores: HashMap::new() };
+        let outcome = ctx.restore_from_trash(node).await?;
+        sqlx::query("UPDATE spaces SET seq = $1 WHERE id = $2").bind(to_i64(seq)?).bind(uuid_bytes(space.as_uuid())).execute(&mut *w.tx).await?;
+        w.commit().await?;
+        Ok(TrashRestoreOutcome { seq, ..outcome })
+    }
+
     /// Makes `source`, an older version of the file `node`, its content again as a new version: an ordinary
     /// `Update` after `expected`, which must still be the current version. The new version has a fresh ID, copies the
     /// manifest, modification time and executable bit of `source`, and gets no save record (a save record names a
@@ -455,7 +614,7 @@ impl Meta {
             return Err(MetaError::Invalid("only files have versions to restore"));
         }
         if row.deleted {
-            return Err(MetaError::Invalid("the file is deleted: bring it back from the trash first, then restore a version"));
+            return Err(MetaError::Invalid("the file is deleted: bring it back with POST /trash/{id}/restore first, then restore a version"));
         }
         let live = sqlx::query("SELECT 1 FROM live_docs WHERE space_id = $1 AND node = $2 LIMIT 1")
             .bind(ctx.space())
@@ -531,5 +690,27 @@ impl Meta {
         sqlx::query("UPDATE spaces SET seq = $1 WHERE id = $2").bind(to_i64(seq)?).bind(uuid_bytes(space.as_uuid())).execute(&mut *w.tx).await?;
         w.commit().await?;
         Ok(CommitOutcome { seq, epoch: info.epoch })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_millisecond_count_reads_as_a_utc_minute() {
+        let at = |ms: i64| {
+            let s = conflict_stamp(ms);
+            (s.year, s.month, s.day, s.hour, s.minute, s.utc)
+        };
+        assert_eq!(at(0), (1970, 1, 1, 0, 0, true));
+        assert_eq!(at(1_760_000_000_000), (2025, 10, 9, 8, 53, true));
+        // A leap day, and the last minute of a year.
+        assert_eq!(at(1_709_164_800_000 + 59 * 60_000), (2024, 2, 29, 0, 59, true));
+        assert_eq!(at(1_767_225_540_000), (2025, 12, 31, 23, 59, true));
+        // Before the epoch and absurd values do not panic.
+        assert_eq!(at(-1).0, 1969);
+        let _ = conflict_stamp(i64::MAX);
+        let _ = conflict_stamp(i64::MIN);
     }
 }
