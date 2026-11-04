@@ -283,3 +283,212 @@ fn times_and_addresses_read_as_people_say_them() {
     let (line, _) = overview::sync_line(&Status { online: false, run_state: RunState::Retrying { message: "x".into() }, ..signed_in() });
     assert_eq!(line, "Can't reach cloud.shadows.ch — trying again");
 }
+
+// ---- the admin pages ----
+
+use crate::admin::{Action, AdminEvent, CodeKind, RoleChoice, View};
+use crate::agent::fake::sample_user;
+use craft_cloud_app::AdminUserInfo;
+
+/// An agent signed in as `fabio`, an admin, with a few more accounts.
+fn admin_agent() -> FakeAgent {
+    let agent = FakeAgent::new(signed_in());
+    agent.admin.store(true, std::sync::atomic::Ordering::SeqCst);
+    let account = |name: &str, f: &dyn Fn(&mut AdminUserInfo)| {
+        let mut user = sample_user(name, Uuid::now_v7());
+        f(&mut user);
+        user
+    };
+    *agent.users.lock().unwrap() = vec![
+        account("fabio", &|u| {
+            u.role = "admin".into();
+            u.devices_active = 2;
+            u.stored_bytes = 3_400_000_000;
+        }),
+        account("ana", &|u| {
+            u.devices_active = 1;
+            u.stored_bytes = 640_000_000;
+            u.quota_bytes = Some(5 * 1_073_741_824);
+        }),
+        account("ben", &|u| {
+            u.devices_active = 0;
+            u.disabled_ms = Some(1_789_000_000_000);
+        }),
+        account("cleo.m", &|u| {
+            u.devices_active = 0;
+            u.invite_pending = true;
+        }),
+    ];
+    agent
+}
+
+fn on_admin_pages(agent: &FakeAgent, more: Vec<Event>) -> Model {
+    let mut events = vec![Event::Devices(Ok(devices())), Event::Admin(AdminEvent::Open)];
+    events.extend(more);
+    after(agent, events)
+}
+
+fn id_of(model: &Model, name: &str) -> Uuid {
+    model.admin_screen().unwrap().list.users.iter().find(|u| u.username == name).unwrap().id
+}
+
+fn password_typed(model: &mut Model, password: &str) {
+    let Screen::Admin(admin) = &mut model.screen else { panic!("{:?}", model.screen) };
+    admin.dialog.as_mut().unwrap().confirmation.password = password.to_owned();
+}
+
+/// The model after the change asked for was sent and the fake answered it.
+fn confirm_sent(model: &mut Model, agent: &FakeAgent) {
+    let effects = model.update(Event::Admin(AdminEvent::Confirm));
+    let answer = call(agent, &no_start(), effects.into_iter().next().unwrap()).unwrap();
+    model.update(answer);
+}
+
+#[test]
+fn snapshot_admin_pages() {
+    let agent = admin_agent();
+    // The signed-in view offers the pages to an admin only.
+    let model = after(&agent, vec![Event::Devices(Ok(devices()))]);
+    assert!(model.is_admin());
+    snapshot(model, egui::Theme::Light, "admin-signed-in");
+
+    let mut model = on_admin_pages(&agent, Vec::new());
+    snapshot(model.clone(), egui::Theme::Light, "admin-users");
+    snapshot(model.clone(), egui::Theme::Dark, "admin-users-dark");
+
+    model.update(Event::Admin(AdminEvent::NewUser));
+    if let Screen::Admin(admin) = &mut model.screen
+        && let View::Create(form) = &mut admin.view
+    {
+        form.username = "dora".into();
+        form.role = RoleChoice::Member;
+    }
+    snapshot(model, egui::Theme::Light, "admin-new-account");
+
+    let ana = id_of(&on_admin_pages(&agent, Vec::new()), "ana");
+    let mut model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(ana))]);
+    snapshot(model.clone(), egui::Theme::Light, "admin-account");
+
+    // A change asks for the password; the wrong one is said in the words of the server's refusal.
+    model.update(Event::Admin(AdminEvent::Ask(Action::Disable { id: ana, username: "ana".into() })));
+    password_typed(&mut model, "not-my-password");
+    snapshot(model.clone(), egui::Theme::Light, "admin-confirm");
+    let error = craft_cloud_app::Error::Refused { code: "wrong_password".into(), message: "the password is wrong".into() };
+    agent.admin_fails.lock().unwrap().push(error);
+    confirm_sent(&mut model, &agent);
+    snapshot(model, egui::Theme::Light, "admin-confirm-wrong-password");
+
+    // The invite a new account got, shown once.
+    let mut model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::NewUser)]);
+    if let Screen::Admin(admin) = &mut model.screen
+        && let View::Create(form) = &mut admin.view
+    {
+        form.username = "dora".into();
+    }
+    model.update(Event::Admin(AdminEvent::SubmitCreate));
+    password_typed(&mut model, "admin-secret-pw");
+    confirm_sent(&mut model, &agent);
+    let code = model.admin_screen().unwrap().code.clone().unwrap();
+    assert_eq!((code.username.as_str(), code.kind), ("dora", CodeKind::Invite));
+    snapshot(model, egui::Theme::Light, "admin-invite-code");
+}
+
+/// A member never sees the way in.
+#[test]
+fn a_member_has_no_administration_button() {
+    let agent = admin_agent();
+    agent.admin.store(false, std::sync::atomic::Ordering::SeqCst);
+    let model = after(&agent, vec![Event::Devices(Ok(devices()))]);
+    assert!(!model.is_admin());
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    assert_eq!(h.query_all_by_label("Administration").count(), 0);
+}
+
+/// The admin pages' buttons send the events they stand for.
+#[test]
+fn admin_buttons_send_their_events() {
+    let agent = admin_agent();
+    let model = after(&agent, vec![Event::Devices(Ok(devices()))]);
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_label("Administration").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Admin(AdminEvent::Open)]);
+
+    let model = on_admin_pages(&agent, Vec::new());
+    let ana = id_of(&model, "ana");
+    let fabio = id_of(&model, "fabio");
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_label("New account").click();
+    h.run_steps(2);
+    h.get_by_label("Search").click();
+    h.run_steps(2);
+    h.get_by_label("Refresh").click();
+    h.run_steps(2);
+    // One Manage per account.
+    assert_eq!(h.query_all_by_label("Manage").count(), 4);
+    h.query_all_by_label("Manage").nth(1).unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("Back").click();
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    assert_eq!(
+        events,
+        [
+            Event::Admin(AdminEvent::NewUser),
+            Event::Admin(AdminEvent::Search),
+            Event::Admin(AdminEvent::Reload),
+            Event::Admin(AdminEvent::OpenUser(ana)),
+            Event::Admin(AdminEvent::Close),
+        ]
+    );
+
+    // Ana is enabled and has a computer: the buttons ask for the password of their change.
+    let model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(ana))]);
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    for label in ["Save changes", "Disable", "Remove", "New invite", "Password reset code", "Revoke"] {
+        h.get_by_label(label).click();
+        h.run_steps(2);
+    }
+    let events = std::mem::take(&mut h.state_mut().1);
+    let asked: Vec<&Action> = events.iter().filter_map(|e| if let Event::Admin(AdminEvent::Ask(a)) = e { Some(a) } else { None }).collect();
+    assert!(
+        matches!(
+            asked.as_slice(),
+            [Action::Disable { .. }, Action::Remove { .. }, Action::IssueInvite { .. }, Action::IssueReset { .. }, Action::RevokeDevice { .. }]
+        ),
+        "{events:?}"
+    );
+    assert!(events.contains(&Event::Admin(AdminEvent::SubmitEdit)));
+    // Your own account has no Disable or Remove.
+    let model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(fabio))]);
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    assert_eq!(h.query_all_by_label("Disable").count() + h.query_all_by_label("Remove").count(), 0);
+
+    // The password page: the confirm button and Cancel.
+    let mut model = on_admin_pages(&agent, Vec::new());
+    model.update(Event::Admin(AdminEvent::Ask(Action::Enable { id: ana, username: "ana".into() })));
+    password_typed(&mut model, "pw");
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_label("Enable").click();
+    h.run_steps(2);
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Admin(AdminEvent::Confirm), Event::Admin(AdminEvent::CancelDialog)]);
+
+    // A code shown: Done forgets it.
+    let mut model = on_admin_pages(&agent, Vec::new());
+    model.update(Event::Admin(AdminEvent::Ask(Action::IssueReset { id: ana, username: "ana".into() })));
+    password_typed(&mut model, "pw");
+    confirm_sent(&mut model, &agent);
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_label("Done").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Admin(AdminEvent::DismissCode)]);
+}

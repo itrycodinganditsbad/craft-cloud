@@ -11,10 +11,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use craft_cloud_app::{
-    Client, DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingStatus, RecoveryCodes, RevokedOthers, Status, TwoFactorProofRequest,
-    TwoFactorSetupResponse, TwoFactorStatus, Uuid,
+    AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser, AdminUserInfo,
+    AdminUserList, Client, DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingStatus, RecoveryCodes, RevokedOthers, Status,
+    TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, UserQuery, Uuid,
 };
 
+use crate::admin::{Action, AdminEvent, Outcome};
 use crate::model::{Effect, Event};
 use crate::security::{SecurityAnswer, SecurityCall};
 
@@ -45,6 +47,19 @@ pub trait Agent: Send + Sync {
     fn two_factor_recovery_codes(&self, password: &str, totp_code: &str) -> Result<RecoveryCodes, Error>;
     fn change_password(&self, current: &str, new: &str) -> Result<(), Error>;
     fn revoke_other_devices(&self) -> Result<RevokedOthers, Error>;
+    // The admin calls: each asks the server, which decides every one.
+    fn admin_server(&self) -> Result<AdminServerInfo, Error>;
+    fn admin_users(&self, query: &UserQuery) -> Result<AdminUserList, Error>;
+    fn admin_devices(&self, user: Uuid) -> Result<AdminDevices, Error>;
+    fn admin_create_user(&self, request: &AdminCreateUser) -> Result<AdminCreatedUser, Error>;
+    fn admin_update_user(&self, id: Uuid, request: &AdminUpdateUser) -> Result<AdminUserInfo, Error>;
+    fn admin_disable_user(&self, id: Uuid, confirm: &AdminConfirm) -> Result<(), Error>;
+    fn admin_enable_user(&self, id: Uuid, confirm: &AdminConfirm) -> Result<(), Error>;
+    fn admin_remove_user(&self, id: Uuid, confirm: &AdminConfirm) -> Result<(), Error>;
+    fn admin_issue_invite(&self, id: Uuid, confirm: &AdminConfirm) -> Result<AdminCode, Error>;
+    fn admin_revoke_invite(&self, id: Uuid, confirm: &AdminConfirm) -> Result<(), Error>;
+    fn admin_issue_reset(&self, id: Uuid, request: &AdminPasswordReset) -> Result<AdminCode, Error>;
+    fn admin_revoke_device(&self, id: Uuid, device: DeviceId, confirm: &AdminConfirm) -> Result<(), Error>;
 }
 
 /// The agent through `craft_cloud_app::Client`. It finds the agent again whenever a call finds it gone (the agent
@@ -146,6 +161,42 @@ impl Agent for ClientAgent {
     fn revoke_other_devices(&self) -> Result<RevokedOthers, Error> {
         self.with(Client::revoke_other_devices)
     }
+    fn admin_server(&self) -> Result<AdminServerInfo, Error> {
+        self.with(Client::admin_server)
+    }
+    fn admin_users(&self, query: &UserQuery) -> Result<AdminUserList, Error> {
+        self.with(|c| c.admin_users(query))
+    }
+    fn admin_devices(&self, user: Uuid) -> Result<AdminDevices, Error> {
+        self.with(|c| c.admin_devices(user))
+    }
+    fn admin_create_user(&self, request: &AdminCreateUser) -> Result<AdminCreatedUser, Error> {
+        self.with(|c| c.admin_create_user(request))
+    }
+    fn admin_update_user(&self, id: Uuid, request: &AdminUpdateUser) -> Result<AdminUserInfo, Error> {
+        self.with(|c| c.admin_update_user(id, request))
+    }
+    fn admin_disable_user(&self, id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
+        self.with(|c| c.admin_disable_user(id, confirm))
+    }
+    fn admin_enable_user(&self, id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
+        self.with(|c| c.admin_enable_user(id, confirm))
+    }
+    fn admin_remove_user(&self, id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
+        self.with(|c| c.admin_remove_user(id, confirm))
+    }
+    fn admin_issue_invite(&self, id: Uuid, confirm: &AdminConfirm) -> Result<AdminCode, Error> {
+        self.with(|c| c.admin_issue_invite(id, confirm))
+    }
+    fn admin_revoke_invite(&self, id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
+        self.with(|c| c.admin_revoke_invite(id, confirm))
+    }
+    fn admin_issue_reset(&self, id: Uuid, request: &AdminPasswordReset) -> Result<AdminCode, Error> {
+        self.with(|c| c.admin_issue_reset(id, request))
+    }
+    fn admin_revoke_device(&self, id: Uuid, device: DeviceId, confirm: &AdminConfirm) -> Result<(), Error> {
+        self.with(|c| c.admin_revoke_device(id, device, confirm))
+    }
 }
 
 /// Starts the agent and waits for it ([`crate::start_agent::start_and_wait`]), for [`Effect::StartAgent`].
@@ -235,6 +286,10 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         Effect::Logout { local } => Event::SignedOut(agent.logout(local)),
         Effect::Pause => Event::Answered(agent.pause()),
         Effect::Resume => Event::Answered(agent.resume()),
+        Effect::AdminServer => Event::Admin(AdminEvent::Server(agent.admin_server())),
+        Effect::AdminUsers { query, ticket } => Event::Admin(AdminEvent::Users { ticket, result: agent.admin_users(&query) }),
+        Effect::AdminDevices(user) => Event::Admin(AdminEvent::Devices { user, result: agent.admin_devices(user).map(|d| d.devices) }),
+        Effect::AdminDo { action, confirm } => Event::Admin(AdminEvent::Done(change(agent, &action, confirm))),
         // Not running is as good as stopped.
         Effect::QuitAgent => {
             let _ = agent.quit();
@@ -251,6 +306,32 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         }),
         Effect::OpenFolder(_) | Effect::QuitApp | Effect::QuitTray | Effect::AppAutostart(_) | Effect::PickFolder(_) => return None,
     })
+}
+
+/// Makes the change `action` names with the admin's `confirm`ation, blocking. This is the one place where the
+/// confirmation goes into a call's body (the create and change calls carry it in their own fields).
+fn change(agent: &dyn Agent, action: &Action, confirm: AdminConfirm) -> Result<Outcome, Error> {
+    let password = confirm.password.clone();
+    match action {
+        Action::CreateUser { username, role } => {
+            let request = AdminCreateUser { username: username.clone(), role: role.as_str().to_owned(), password, ..AdminCreateUser::default() };
+            agent.admin_create_user(&request).map(Outcome::Created)
+        }
+        Action::UpdateUser { id, role, quota, .. } => {
+            let request = AdminUpdateUser { role: role.map(|r| r.as_str().to_owned()), quota_bytes: *quota, password, ..AdminUpdateUser::default() };
+            agent.admin_update_user(*id, &request).map(Outcome::Updated)
+        }
+        Action::Disable { id, .. } => agent.admin_disable_user(*id, &confirm).map(|()| Outcome::Done),
+        Action::Enable { id, .. } => agent.admin_enable_user(*id, &confirm).map(|()| Outcome::Done),
+        Action::Remove { id, .. } => agent.admin_remove_user(*id, &confirm).map(|()| Outcome::Done),
+        Action::IssueInvite { id, .. } => agent.admin_issue_invite(*id, &confirm).map(Outcome::Code),
+        Action::RevokeInvite { id, .. } => agent.admin_revoke_invite(*id, &confirm).map(|()| Outcome::Done),
+        Action::IssueReset { id, .. } => {
+            let request = AdminPasswordReset { password, ..AdminPasswordReset::default() };
+            agent.admin_issue_reset(*id, &request).map(Outcome::Code)
+        }
+        Action::RevokeDevice { id, device, .. } => agent.admin_revoke_device(*id, *device, &confirm).map(|()| Outcome::Done),
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +365,14 @@ pub(crate) mod fake {
         pub joins: Mutex<Vec<Result<Status, Error>>>,
         pub asked: Mutex<Vec<String>>,
         pub factor: Mutex<FakeFactor>,
+        /// Whether the account is an admin (else every admin call is refused as `forbidden`).
+        pub admin: AtomicBool,
+        /// The accounts the admin calls list.
+        pub users: Mutex<Vec<AdminUserInfo>>,
+        /// What the admin changes answer instead of succeeding, taken from the end.
+        pub admin_fails: Mutex<Vec<Error>>,
+        /// The password each admin change was sent with.
+        pub passwords: Mutex<Vec<Option<String>>>,
     }
 
     fn refused(code: &str, message: &str) -> Error {
@@ -298,6 +387,10 @@ pub(crate) mod fake {
                 joins: Mutex::new(Vec::new()),
                 asked: Mutex::new(Vec::new()),
                 factor: Mutex::new(FakeFactor::default()),
+                admin: AtomicBool::new(false),
+                users: Mutex::new(Vec::new()),
+                admin_fails: Mutex::new(Vec::new()),
+                passwords: Mutex::new(Vec::new()),
             }
         }
 
@@ -325,6 +418,32 @@ pub(crate) mod fake {
 
         fn codes() -> RecoveryCodes {
             RecoveryCodes { recovery_codes: (0..10).map(|n| format!("AAAA-BBBB-CCCC-{n:04}")).collect() }
+        }
+
+        /// An admin call: refused as a member's is unless the account is an admin.
+        fn admin_call<T>(&self, what: &str, ok: impl FnOnce() -> T) -> Result<T, Error> {
+            self.asked.lock().unwrap().push(what.to_owned());
+            if self.gone.load(Ordering::SeqCst) {
+                return Err(Error::NotRunning("can't reach it: connection refused".into()));
+            }
+            if !self.admin.load(Ordering::SeqCst) {
+                return Err(Error::Refused { code: "forbidden".into(), message: "this needs an administrator".into() });
+            }
+            Ok(ok())
+        }
+
+        /// An admin change: the password it was sent with is kept, and a failure set up is answered first.
+        fn admin_change<T>(&self, what: &str, password: Option<String>, ok: impl FnOnce() -> T) -> Result<T, Error> {
+            self.passwords.lock().unwrap().push(password);
+            self.admin_call(what, || ())?;
+            if let Some(e) = self.admin_fails.lock().unwrap().pop() {
+                return Err(e);
+            }
+            Ok(ok())
+        }
+
+        fn user(&self, id: Uuid) -> AdminUserInfo {
+            self.users.lock().unwrap().iter().find(|u| u.id == id).cloned().unwrap_or_else(|| sample_user("someone", id))
         }
 
         fn answer<T>(&self, what: &str, ok: impl FnOnce(&Status) -> T) -> Result<T, Error> {
@@ -454,6 +573,114 @@ pub(crate) mod fake {
             let mut f = self.factor.lock().unwrap();
             let revoked = std::mem::take(&mut f.other_computers);
             Ok(RevokedOthers { revoked })
+        }
+        fn admin_server(&self) -> Result<AdminServerInfo, Error> {
+            self.admin_call("admin_server", || AdminServerInfo {
+                version: "0.1.0".into(),
+                users: self.users.lock().unwrap().len() as u64,
+                devices_active: 3,
+                stored_bytes: 5_000_000_000,
+                live_bytes: 120_000,
+                storage_kind: "disk".into(),
+                database_kind: "sqlite".into(),
+            })
+        }
+        fn admin_users(&self, query: &UserQuery) -> Result<AdminUserList, Error> {
+            self.admin_call("admin_users", || {
+                let needle = query.query.as_deref().unwrap_or_default().to_lowercase();
+                let all: Vec<AdminUserInfo> =
+                    self.users.lock().unwrap().iter().filter(|u| u.username.to_lowercase().contains(&needle)).cloned().collect();
+                // The cursor is the index of the page's first account.
+                let from = query.cursor.as_deref().and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+                let limit = query.limit.unwrap_or(50) as usize;
+                let users: Vec<AdminUserInfo> = all.iter().skip(from).take(limit).cloned().collect();
+                let next = (from + limit < all.len()).then(|| (from + limit).to_string());
+                AdminUserList { users, next }
+            })
+        }
+        fn admin_devices(&self, user: Uuid) -> Result<AdminDevices, Error> {
+            self.admin_call("admin_devices", || AdminDevices {
+                devices: vec![DeviceInfo {
+                    id: DeviceId::generate(),
+                    name: format!("{} laptop", self.user(user).username),
+                    created_ms: 0,
+                    last_used_ms: 1_789_990_000_000,
+                    revoked: false,
+                    current: false,
+                    client_kind: "agent".into(),
+                    platform: "linux".into(),
+                    app_version: "0.1.0".into(),
+                    revoked_ms: None,
+                    revoke_reason: None,
+                }],
+            })
+        }
+        fn admin_create_user(&self, request: &AdminCreateUser) -> Result<AdminCreatedUser, Error> {
+            self.admin_change("admin_create_user", request.password.clone(), || AdminCreatedUser {
+                user: AdminUserInfo { role: request.role.clone(), invite_pending: true, ..sample_user(&request.username, Uuid::now_v7()) },
+                invite: AdminCode {
+                    code: "K7M4Q9TXK7M4Q9TX".into(),
+                    join_url: Some("cloud.shadows.ch/K7M4-Q9TX-K7M4-Q9TX".into()),
+                    expires_ms: 1_790_600_000_000,
+                },
+            })
+        }
+        fn admin_update_user(&self, id: Uuid, request: &AdminUpdateUser) -> Result<AdminUserInfo, Error> {
+            self.admin_change("admin_update_user", request.password.clone(), || {
+                let mut user = self.user(id);
+                if let Some(role) = &request.role {
+                    user.role = role.clone();
+                }
+                if let Some(quota) = request.quota_bytes {
+                    user.quota_bytes = quota;
+                }
+                user
+            })
+        }
+        fn admin_disable_user(&self, _id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
+            self.admin_change("admin_disable_user", confirm.password.clone(), || ())
+        }
+        fn admin_enable_user(&self, _id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
+            self.admin_change("admin_enable_user", confirm.password.clone(), || ())
+        }
+        fn admin_remove_user(&self, _id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
+            self.admin_change("admin_remove_user", confirm.password.clone(), || ())
+        }
+        fn admin_issue_invite(&self, _id: Uuid, confirm: &AdminConfirm) -> Result<AdminCode, Error> {
+            self.admin_change("admin_issue_invite", confirm.password.clone(), || AdminCode {
+                code: "ABCDEFGHJKMNPQRS".into(),
+                join_url: Some("cloud.shadows.ch/ABCD-EFGH-JKMN-PQRS".into()),
+                expires_ms: 1_790_600_000_000,
+            })
+        }
+        fn admin_revoke_invite(&self, _id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
+            self.admin_change("admin_revoke_invite", confirm.password.clone(), || ())
+        }
+        fn admin_issue_reset(&self, _id: Uuid, request: &AdminPasswordReset) -> Result<AdminCode, Error> {
+            self.admin_change("admin_issue_reset", request.password.clone(), || AdminCode {
+                code: "TUVWXYZ234567ABC".into(),
+                join_url: None,
+                expires_ms: 1_790_003_600_000,
+            })
+        }
+        fn admin_revoke_device(&self, _id: Uuid, _device: DeviceId, confirm: &AdminConfirm) -> Result<(), Error> {
+            self.admin_change("admin_revoke_device", confirm.password.clone(), || ())
+        }
+    }
+
+    /// An enabled member account that stores nothing.
+    pub fn sample_user(username: &str, id: Uuid) -> AdminUserInfo {
+        AdminUserInfo {
+            id,
+            username: username.to_owned(),
+            role: "member".into(),
+            created_ms: 1_780_000_000_000,
+            disabled_ms: None,
+            two_factor_enabled: false,
+            devices_active: 1,
+            stored_bytes: 0,
+            quota_bytes: None,
+            invite_pending: false,
         }
     }
 }

@@ -2,7 +2,8 @@
 //! another computer, pauses and quits. It never syncs or touches the synced files itself: all of that is the agent's
 //! (`craft-cloud-agent run`), which it reaches through `craft-cloud-app` and starts when none answers.
 //!
-//! - [`model`]: the state and every way between its screens, pure (unit-tested against a fake agent).
+//! - [`model`]: the state and every way between its screens, pure (unit-tested against a fake agent); [`admin`]: the
+//!   admin pages' part of it.
 //! - [`security`]: the Security page and the code a join asks for (two-factor sign-in).
 //! - [`agent`]: the agent's calls behind a trait, run off the UI thread.
 //! - [`start_agent`]: starting the agent from this app's folder.
@@ -11,6 +12,7 @@
 //! - [`tray`]: the tray icon where there is one; [`autostart`]: the app's own start-at-login entry.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod admin;
 pub mod agent;
 pub mod app;
 pub mod autostart;

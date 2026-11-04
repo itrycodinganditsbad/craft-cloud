@@ -7,10 +7,12 @@
 
 use std::path::Path;
 
-use craft_cloud_app::{DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingState, PairingStatus, RunState, Status, Uuid, codes};
+use craft_cloud_app::{DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingState, PairingStatus, RunState, Status, UserQuery, Uuid, codes};
+use craft_cloud_proto::api::AdminConfirm;
 use craft_cloud_proto::api::codes as api_codes;
 use craft_cloud_proto::join::JoinString;
 
+use crate::admin::{Access, Action, AdminEvent, AdminScreen};
 use crate::security::{SecondFactorForm, SecurityAnswer, SecurityCall, SecurityEvent, SecurityPage};
 
 /// A code that is wrong, expired or used (the server never says which).
@@ -58,6 +60,8 @@ pub enum Screen {
     Security(Box<SecurityPage>),
     /// Showing an add-a-computer code.
     AddingComputer(Adding),
+    /// The admin pages (an admin's only): the users, one user, a new account.
+    Admin(Box<AdminScreen>),
     /// The server refused this computer: it was removed from the account.
     Removed,
     /// Something the agent can't put right by itself (a damaged account file), or that this app can't work with.
@@ -155,11 +159,13 @@ pub struct Overview {
     pub error: Option<String>,
     /// Signing out failed because the server can't be reached: offer to forget the account here only.
     pub offer_local_sign_out: bool,
+    /// Whether the server lets this account use the admin pages (asked at sign-in).
+    pub access: Access,
 }
 
 impl Overview {
     fn new(status: Status) -> Self {
-        Self { status, devices: None, devices_error: None, removing: None, error: None, offer_local_sign_out: false }
+        Self { status, devices: None, devices_error: None, removing: None, error: None, offer_local_sign_out: false, access: Access::Unknown }
     }
 }
 
@@ -269,6 +275,8 @@ pub enum Event {
     CloseRequested,
     /// Linux: the tray process quit Craft Cloud (it stopped the agent): the window ends too.
     Exit,
+    /// Something on the admin pages, or the answer to one of their calls ([`crate::admin`]).
+    Admin(AdminEvent),
 }
 
 /// What to do.
@@ -304,6 +312,20 @@ pub enum Effect {
     QuitApp,
     /// Write (`true`) or remove the app's own start-at-login entry.
     AppAutostart(bool),
+    /// The server's counters: also how the app finds out whether the account is an admin ([`AdminEvent::Server`]).
+    AdminServer,
+    /// A page of the user list ([`AdminEvent::Users`] with the same `ticket`).
+    AdminUsers {
+        query: UserQuery,
+        ticket: u64,
+    },
+    /// A user's devices ([`AdminEvent::Devices`]).
+    AdminDevices(Uuid),
+    /// A change, with the admin's confirmation ([`AdminEvent::Done`]). Its `Debug` output hides the password.
+    AdminDo {
+        action: Action,
+        confirm: AdminConfirm,
+    },
 }
 
 /// Whether the app should start at login, in the tray, given the agent's status: while signed in with the agent
@@ -373,15 +395,17 @@ impl Model {
             Screen::SignedIn(overview) => Some(overview),
             Screen::Security(page) => Some(&page.overview),
             Screen::AddingComputer(adding) => Some(&adding.overview),
+            Screen::Admin(admin) => Some(&admin.overview),
             _ => None,
         }
     }
 
-    fn overview_mut(&mut self) -> Option<&mut Overview> {
+    pub(crate) fn overview_mut(&mut self) -> Option<&mut Overview> {
         match &mut self.screen {
             Screen::SignedIn(overview) => Some(overview),
             Screen::Security(page) => Some(&mut page.overview),
             Screen::AddingComputer(adding) => Some(&mut adding.overview),
+            Screen::Admin(admin) => Some(&mut admin.overview),
             _ => None,
         }
     }
@@ -543,7 +567,13 @@ impl Model {
                 overview.removing = Some(id);
                 vec![Effect::RemoveDevice(id)]
             }
-            Event::RefreshDevices => self.overview().map(|_| Effect::Devices).into_iter().collect(),
+            Event::RefreshDevices => {
+                let Some(overview) = self.overview() else { return Vec::new() };
+                // An admin check that couldn't be made at sign-in is made again.
+                let again = (overview.access == Access::Unknown).then_some(Effect::AdminServer);
+                std::iter::once(Effect::Devices).chain(again).collect()
+            }
+            Event::Admin(event) => self.admin(event),
             Event::SignOut => self.sign_out(false),
             Event::SignOutHere => self.sign_out(true),
             Event::Pause | Event::Resume => {
@@ -653,11 +683,14 @@ impl Model {
                 Screen::SignedIn(overview) => overview.status = status,
                 Screen::Security(page) => page.overview.status = status,
                 Screen::AddingComputer(adding) => adding.overview.status = status,
+                Screen::Admin(admin) => admin.overview.status = status,
                 // The join's own answer moves on from there.
                 Screen::Joining { .. } => {}
                 _ => {
                     self.screen = Screen::SignedIn(Overview::new(status));
                     effects.push(Effect::Devices);
+                    // Whether the account is an admin, for the admin pages.
+                    effects.push(Effect::AdminServer);
                 }
             }
             return effects;
@@ -781,7 +814,7 @@ impl Model {
                 self.screen = Screen::SignedIn(Overview::new(status.clone()));
                 let mut effects = self.status_came(status);
                 // Start at login: the agent's entry (the app's follows it).
-                effects.extend([Effect::SetAutostart(true), Effect::Devices]);
+                effects.extend([Effect::SetAutostart(true), Effect::Devices, Effect::AdminServer]);
                 return effects;
             }
             Err(e) => e,
@@ -1415,7 +1448,7 @@ pub(crate) mod tests {
         // At each start, matched once; again only when it changes.
         let mut m = model();
         m.update(Event::Start);
-        assert_eq!(m.update(Event::Found(Ok(on.clone()))), vec![Effect::AppAutostart(true), Effect::Devices]);
+        assert_eq!(m.update(Event::Found(Ok(on.clone()))), vec![Effect::AppAutostart(true), Effect::Devices, Effect::AdminServer]);
         assert!(m.update(Event::Polled(Ok(on.clone()))).is_empty());
         assert_eq!(m.update(Event::Polled(Ok(Status { autostart: Some(false), ..on }))), vec![Effect::AppAutostart(false)]);
     }
