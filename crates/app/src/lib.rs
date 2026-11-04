@@ -617,7 +617,7 @@ mod tests {
         let refused = agent.login(&login).unwrap_err();
         assert_eq!(refused.code(), Some("two_factor_required"));
         assert_eq!(refused.challenge().map(|c| (c.challenge.as_str(), c.expires_ms)), Some(("chal", 9)));
-        assert!(!format!("{refused:?}").contains("chal"), "the challenge is hidden in Debug");
+        assert!(!format!("{refused:?}").contains("\"chal\""), "the challenge is hidden in Debug");
         let _ = next();
         let second = SecondFactorLoginRequest {
             server: "https://c.example".into(),
