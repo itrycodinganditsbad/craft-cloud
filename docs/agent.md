@@ -100,3 +100,20 @@ the agent's saved sync state; unknown or unsynced paths return `404 not_found`, 
 Restore requires the file's current version to match `expected_version`; otherwise the API answers `409 conflict`.
 The agent does not write restored bytes directly. Its normal change feed picks up the new server version and syncs it
 to disk.
+
+## Local API: trash
+
+Trash items are addressed by their server node ID because deleted nodes are absent from the agent's sync tree. The
+agent validates that each ID has the expected UUID form before forwarding it. List responses may include `path`, a
+display hint formed from a currently synced parent folder and the item's name; it is `null` when that parent is not
+live on this machine. A missing hint does not fail the request.
+
+| Method and path | Request | Success |
+|---|---|---|
+| `GET /v1/trash?cursor=<opaque>&limit=<count>` | Optional paging query parameters | `200` with `{items, next}`, newest deletion first |
+| `POST /v1/trash/restore` | `{"id":"<node-id>"}` | `200` with restored node, parent, name, rename flag, version (for files), sequence and epoch |
+| `POST /v1/trash/remove` | `{"id":"<node-id>"}` | `204` |
+
+A successful restore asks the agent for a normal sync pass; it never writes files directly. Removing an item only
+marks it out of the trash. It cannot be restored from the trash afterward, but stored space is not freed yet. Server
+HTTP status and error code are preserved; a server `401 unauthorized` becomes local `409 needs_you`.
