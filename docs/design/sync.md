@@ -848,12 +848,81 @@ changes locally, then pushes local changes. These rules came out of the simulati
   admins who back up the bucket themselves (bucket versioning or replication); GC must stay paused until
   that bucket backup is done, or the admin keeps the bucket's own deleted-object retention longer than the
   GC grace. **Restore** sets a new epoch for every space.
+- **Web admin and browser sessions** (migration 0011, off unless `[web_admin] enabled = true`): the admin API's operations
+  also have pages in the browser, under `/web`, **server-rendered HTML in Rust**: no script, no build step, no Node, one
+  stylesheet served by the server itself (`GET /web/style.css`). The pages are an adapter over the same `craft_cloud_meta` calls
+  and the same confirmation as the JSON routes, so the rules (last administrator, who may reset whom, quotas) have one home, and the
+  JSON routes stay as they were. This replaces "no web UI in v1" for **administrators only**: there is no page for a member and
+  none for files.
+  - **Setup is explicit.** The pages exist only with `[web_admin] enabled = true`, which the config accepts only with
+    `behind_proxy = true` and `public_url = "https://host[:port]"` without a path (a TLS proxy in front; `public_url` is the
+    origin the pages check forms against). Otherwise `/web` is `404` like any unknown route. `idle_minutes` (5 to 1440, default 480)
+    and `absolute_hours` (1 to 720, default 168) set the session lifetimes; unknown keys are refused.
+  - **Sessions** (`web_sessions`): the cookie `__Host-craft_cloud_session` holds 32 random bytes (base64url, 43 characters); the
+    table keeps only their BLAKE3 hash, the account, the account's `auth_gen` at sign-in, `created_ms`, `last_seen_ms`,
+    `absolute_expires_ms`, `revoked_ms` and `mfa_verified_ms` (when a second factor was given; `NULL` for an account without one).
+    The cookie is `Secure; HttpOnly; SameSite=Strict; Path=/`, with no `Domain` and no lifetime of its own (the server decides, so
+    a copied cookie can't outlive its session). A session is valid while it is not logged out, was made less than
+    `absolute_hours` ago, was used within `idle_minutes` (its last-seen time is moved at most once a minute, by the next
+    request), the account is neither disabled nor marked for removal, **and the account's `auth_gen` is still the one it
+    was made under**. Every change that raises `auth_gen` therefore ends the account's sessions with no code of its own: a password
+    change or reset (device, command line or redeemed code), a disable, an enable, a removal, turning two-factor sign-in on or off,
+    and a reset of it by an admin or the command line. The role is read from the database for every request, so a demoted admin
+    gets `403` at once. A change made on a session checks, in its transaction under the account's lock, that the session is still
+    logged in under the account's current `auth_gen` (the same re-check a device gets) **and still inside its idle and absolute lifetimes at the time
+    of the change** (the time is read after the change has taken its locks, so a wait for them does not extend a session), so a request that began before the session ended (a slow body, a wait for a lock or the password check) cannot
+    change anything after it.
+  - **Sign-in** (`POST /web/login`, then `POST /web/login/second-factor` for an account with two-factor sign-in): the JSON
+    sign-in's own steps in the same order (name and password shape first, a password-check slot, then the counts, a dummy
+    hash for a name nobody has), with limiters of their own (`AppState::web_logins`: 30 per client address and 10 per account
+    in five minutes), so an attack on the pages does not lock the API and the other way round. **Only administrators get a
+    session**, and every refusal of the password step (unknown name, wrong password, a member, a disabled or removed account)
+    is the same `401` page, so nothing says which accounts exist or what role they have. The second step uses the second factor's
+    own code (`totp_code` or `recovery_code`, a time step serving once, five wrong codes deleting the challenge, ten locking the
+    account for 15 minutes and doubling after that, with the per-account and per-address limits of the device sign-in): the
+    lock is the account's, so it holds for pages and devices alike. The challenge is a row of `login_challenges` of kind `web`; a
+    web challenge can never make a device and a device's can never make a session. The sign-in writes `auth.login` with no
+    device; a failed one the usual `auth.login_failed`.
+  - **One credential at a time.** The pages know the cookie only; the JSON admin routes know the bearer token only (no JSON
+    route takes the cookie). A request to either with an `Authorization` header **and** the session cookie is `400 invalid`,
+    so a client can't be unsure which credential acted.
+  - **CSRF and origin.** Every form carries `csrf`, a value derived from the session token under a key-derivation context of
+    its own (so the stored hash can't make it), compared in constant time; missing, wrong or another session's is `403`. Every
+    request that is not a `GET` or `HEAD`, the sign-in too, must carry an `Origin` equal to the origin of `public_url` or,
+    without one, a `Referer` on it; an `Origin` that differs (including `null`) is `403` whatever the `Referer`. No `GET`
+    changes anything (the audit export is a read). The sign-in form has no CSRF token, as no session exists to bind one to:
+    the origin check is what stops another site from signing a browser in.
+  - **Headers on every answer under `/web`**, errors and redirects included: `Content-Security-Policy: default-src 'self';
+    script-src 'none'; style-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action
+    'self'; frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`,
+    `Cross-Origin-Opener-Policy` and `Cross-Origin-Resource-Policy: same-origin`, a restrictive `Permissions-Policy`, and
+    `Cache-Control: no-store` (the stylesheet `no-cache`). No page has a script, an inline style, an event handler or a file from
+    another host. `Strict-Transport-Security` is the proxy's to send.
+  - **Statuses** are one contract for the pages: `401` for a missing, expired or unknown session (a `GET` is sent to `/web/login`
+    with `303` instead; a form post gets the sign-in page), for a wrong username or password at sign-in, and for a sign-in step
+    (challenge) that is unknown, used up or expired; `403` for a member or demoted admin, a wrong second factor (the page of the
+    second step again, with the same challenge), a wrong confirmation password or code, a bad CSRF token or origin; `400` for a
+    malformed form, **including a body that is not a form (no `415`)**; `429` for the limits and the lock, **always with
+    `Retry-After`** (the end of the window that refused, or the lock's); `413` over 4 KiB; `409`/`404` as the store says. A sign-in
+    for an account that has no password yet (an open invite) spends the same password check as an unknown name and fails the
+    same way, in the pages and in `POST /auth/login`. `/web/` has the same headers and origin check as the other paths. Every change asks for the **confirmation in its form**: the admin's password, and `totp_code` or
+    `recovery_code` when their account has two-factor sign-in (the server asks whatever the page showed), checked by the
+    JSON routes' function with their counters, so a wrong password counts against the same five-in-fifteen-minutes window.
+  - **Pages**: overview (counters, kinds), users (search, 50 a page by cursor, create), one user (role and quota, disable, enable,
+    remove, invite, password reset code, end the open code, reset two-factor, devices with revoke), the audit log (filters
+    `user`, `action`, 50 a page by cursor, and `GET /web/audit/export`, the JSON export's NDJSON download). Invite and reset
+    codes are the answer to the `POST` that made them, shown once and kept nowhere; a reload asks the browser to post the form again.
+    Every value not written by the server's code is HTML-escaped on the way in, including a device's name and platform.
+  - **Cleanup without a periodic task.** A sign-in deletes up to 100 sessions that are over (logged out, past their lifetime,
+    idle); `craft-cloud-server web-sessions prune [--dry-run]` deletes all of them (run it from cron, as `audit prune`). Neither
+    touches a valid session.
+  - Nothing secret is logged (cookie, CSRF token, challenge, password, codes); events are logged at `info` with kind and target ID.
 - **Admin CLI** (the way in without HTTP: it asks for no confirmation and does not enforce `last_admin`, since whoever runs it
   has the files): `init` (which also makes the two-factor key file), `serve`, `user add|reset-password [--keep-devices]|invite [--revoke]|reset-2fa`,
-  `device list|revoke|revoke-all`, `two-factor rekey` and `reset-epoch` exist; `user remove|quota`, `gc`, `verify` (re-hash every chunk), `backup <dir>` and `restore <dir>` come with M4.
+  `device list|revoke|revoke-all`, `web-sessions prune [--dry-run]`, `two-factor rekey` and `reset-epoch` exist; `user remove|quota`, `gc`, `verify` (re-hash every chunk), `backup <dir>` and `restore <dir>` come with M4.
   `user invite` prints the join string and link when `public_url` is in the config, else the code and how to finish
   it; it logs that an invite was made (the username at debug only, never the code).
-- No web UI in v1. No telemetry, no update check.
+- No web UI for files, and none for members. No telemetry, no update check.
 
 API (`/api/v1`, JSON except chunk and manifest bodies; every signed-in response carries the space's epoch in
 the `craft-epoch` header, and commits/tree/changes carry it in the body too). Errors are
@@ -1420,7 +1489,7 @@ From the reviews of M3c, less what their fix rounds did:
 
 ## Out of scope for Phase 1
 
-Hosted service; collaboration and sharing; locking; web UI; mobile; virtual files and on-demand download;
+Hosted service; collaboration and sharing; locking; a web UI for users' files (the administrators' pages, see "Web admin and browser sessions", are in); mobile; virtual files and on-demand download;
 end-to-end encryption (not built, but chunk IDs are opaque and stored chunks have a format byte so it can
 come later); per-chunk compression (same format byte); a packed small-chunk upload endpoint (one request per
 chunk until measurements say otherwise); compatibility with any other sync service.

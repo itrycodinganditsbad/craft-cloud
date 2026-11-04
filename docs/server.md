@@ -125,7 +125,8 @@ can make one: **any signed-in computer can add more**, and turning two-factor si
 ## Managing accounts over HTTP
 
 Accounts have a role, `admin` or `member`, and the routes under `/api/v1/admin` are for admins only (the first admin is
-still made by `init`). They are an API for a tool or a later admin app: the server brings no web page. Every change asks
+still made by `init`). They are an API for a tool or an admin app; the server's own admin pages are an option, see "The admin
+pages in the browser" below. Every change asks
 for **a fresh confirmation in its body**, the acting admin's own current password (and, for an admin who has two-factor
 sign-in, a `totp_code` or `recovery_code` too), because a device's token never expires and must not be enough on its own:
 
@@ -167,6 +168,69 @@ A wrong confirmation password is `403 wrong_password` (never 401); five wrong on
 the rest of the window. A wrong or missing code for an admin who has two-factor sign-in is `403 two_factor_invalid`. A signed-out device's live connection ends at once in the server process that did it; another
 server process on the same database, or the command line, finds out at the connection's next ping (within about 30 seconds).
 The command line stays as the way in without HTTP and enforces neither the confirmation nor `last_admin`.
+
+## The admin pages in the browser
+
+The server can serve admin pages: users, invites and reset codes, a user's devices, the audit log and its download, in
+plain server-rendered HTML (no script, no Node, nothing to build). They are **off by default** and only administrators can
+sign in. They do the same things as the admin API with the same confirmation (your password again for every change, and a
+code when your account has two-factor sign-in).
+
+```toml
+public_url = "https://cloud.example.org"   # the address of the pages, https, no path
+behind_proxy = true
+trusted_proxies = ["10.0.0.2"]
+
+[web_admin]
+enabled = true
+idle_minutes = 480      # a session ends when unused for this long (5 to 1440, default 8 hours)
+absolute_hours = 168    # and at the latest this long after signing in (1 to 720, default 7 days)
+```
+
+Open `https://cloud.example.org/web` and sign in as an admin. The server refuses to start with `enabled = true` unless
+`behind_proxy = true` and `public_url` is an `https://` address with no path: the pages' cookie is `Secure` (a browser only
+sends it over HTTPS) and every form is checked against the origin of `public_url`.
+
+**Behind the proxy.**
+
+- The proxy terminates TLS and forwards `/web` and `/api` (and `/join`) to the server's `listen` address. It must pass the
+  `Origin` and `Cookie` headers through and must not rewrite the `Host` to something that changes the origin the browser
+  sees: browsers send `Origin: https://cloud.example.org`, and anything else is refused with `403`. Serving the pages under a
+  path prefix is not supported (`public_url` may not have a path).
+- Put the proxy in `trusted_proxies` and let it **overwrite** `X-Forwarded-For` with the client's address; the sign-in limits
+  count the address that yields. A proxy that passes a client's own `X-Forwarded-For` along lets a visitor pick the address
+  the limits count. A misconfigured server shows itself at start (the config is refused) or as `403` on every form (the
+  proxy changed the origin).
+- Send `Strict-Transport-Security` from the proxy; the server does not. Do not cache `/web` in the proxy: every answer says
+  `Cache-Control: no-store`.
+- Bind `listen` to the proxy-facing address only. The cookie never leaves the browser over plain HTTP, but the plain HTTP
+  port must not be reachable by anyone but the proxy.
+
+**Sessions.** The session is a random value in the cookie `__Host-craft_cloud_session` (`Secure`, `HttpOnly`,
+`SameSite=Strict`); the database keeps only its hash. A session ends when you sign out, after `idle_minutes` without use,
+after `absolute_hours`, and **whenever the account changes**: a password change or reset, disabling, enabling or removing it,
+and turning its two-factor sign-in on or off or resetting it. A demoted admin is out at the next request. Signing in again
+makes a new session; there is no "remember me". Because the cookie is `SameSite=Strict`, opening the pages from a link on
+another site shows the sign-in page once, and the next click on the pages themselves works.
+
+**Cleaning up.** Expired sessions are deleted a few at a time when someone signs in. On a server that is signed in to rarely,
+or to empty the table:
+
+```sh
+craft-cloud-server web-sessions --config cc-data/config.toml prune            # deletes what is over, prints how many
+craft-cloud-server web-sessions --config cc-data/config.toml prune --dry-run  # only counts
+```
+
+Run it from cron or the task scheduler (daily is plenty), like `audit prune`. A valid session is never touched. There is no
+background task.
+
+**What the log shows.** A sign-in to the pages is `auth.login` without a device; changes made there are the usual
+`admin.*` events with the admin as the actor and no device. Failed sign-ins, second-factor failures and the lock are the
+usual `auth.*` events. Nothing secret is logged: not the cookie, the page's forms, a code or a password.
+
+**Accessibility.** The pages are plain HTML: labelled fields, tables with captions and header cells, a skip link, visible
+focus and no script, so they work with a keyboard and a screen reader and scale with the browser's zoom. They have been
+checked by reading the markup and the tests, **not yet with a screen reader**: report what does not work.
 
 ## The security audit log
 
@@ -213,16 +277,18 @@ who can write to the database can change it; keep the database file and Postgres
 ## Upgrading
 
 This release adds migrations (`0007`, device sessions, `0008`, the admin API: reset codes, per-account quotas, the
-removal mark, `0009`, the audit log, and `0010`, two-factor sign-in: the secrets, recovery codes and sign-in challenges).
-The server applies them when it starts. A database it
+removal mark, `0009`, the audit log, `0010`, two-factor sign-in: the secrets, recovery codes and sign-in challenges, and
+`0011`, the admin pages' browser sessions). The server applies them when it starts. A database it
 has migrated cannot be opened by an older server: that one refuses to start ("the database was created by a newer Craft
 Cloud"). Rolling back therefore means restoring a backup taken before the upgrade, so take one first. Upgrade the
 server first: agents and apps keep working unchanged, **except that an account that turns on two-factor sign-in can't sign in
 with an agent from before this release** (see "Two-factor sign-in"). Then update the desktop package with its matching agent,
 then agents installed on their own. The `init` of a data directory made before this release did not make a key: add one
 with `[two_factor] key_file` in `config.toml` (32 random bytes, owner-only) before anyone sets up two-factor sign-in. A config
-that has the new `[audit]` section is refused by an older server (it rejects unknown settings), so remove the section before
-going back to one.
+that has the new `[audit]` or `[web_admin]` section is refused by an older server (it rejects unknown settings), so remove the section before
+going back to one. To turn the admin pages on after the upgrade: take the backup, start the new server (it migrates), then add
+`[web_admin]` as described above and restart behind the proxy. Several servers on one Postgres database must all run this
+release before any of them is given `[web_admin]`, as for every migration.
 
 ## Restoring a backup
 
