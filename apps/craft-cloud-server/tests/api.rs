@@ -162,6 +162,7 @@ on_every_backend!(
     the_history_of_a_file_pages_newest_first_for_its_owner_only,
     restoring_an_old_version_makes_a_new_one,
     parallel_restores_against_one_head_let_one_win,
+    the_trash_lists_restores_and_removes_over_http,
     every_rejection_is_a_json_error,
     one_request_cant_list_unbounded_missing_chunks,
     long_polls_are_capped_per_space,
@@ -1617,4 +1618,162 @@ async fn parallel_restores_against_one_head_let_one_win(s: &Server) {
     }
     assert_eq!((won.len(), conflicted), (1, 5));
     assert_eq!(space_of(s, &ana).await.seq, before + 1);
+}
+
+// ---- the trash ----
+
+const DAY_MS: i64 = 86_400_000;
+
+async fn trash_page(s: &Server, token: &str, query: &str) -> reqwest::Response {
+    s.client.get(format!("{}/trash{query}", s.base)).bearer_auth(token).send().await.unwrap()
+}
+
+async fn trash_restore(s: &Server, token: &str, node: NodeId) -> reqwest::Response {
+    s.client.post(format!("{}/trash/{node}/restore", s.base)).bearer_auth(token).send().await.unwrap()
+}
+
+async fn trash_remove(s: &Server, token: &str, node: NodeId) -> reqwest::Response {
+    s.client.delete(format!("{}/trash/{node}", s.base)).bearer_auth(token).send().await.unwrap()
+}
+
+/// Uploads `data` and makes it the file `node` in `parent`: its first version.
+async fn new_file(s: &Server, token: &str, parent: NodeId, file_name: &str, data: &[u8]) -> (NodeId, VersionId) {
+    let node = NodeId::generate();
+    let manifest = upload(s, token, data).await;
+    let op = create(node, parent, file_name, manifest);
+    let Op::Create { version, .. } = &op else { panic!("a create") };
+    let id = version.id;
+    assert_eq!(commit(s, token, &[op]).await.status(), StatusCode::OK);
+    (node, id)
+}
+
+async fn delete_node(s: &Server, token: &str, node: NodeId, version: VersionId) {
+    assert_eq!(commit(s, token, &[Op::Delete { node, expected: Some(version) }]).await.status(), StatusCode::OK);
+}
+
+async fn the_trash_lists_restores_and_removes_over_http(s: &Server) {
+    use craft_cloud_proto::api::{HistoryResponse, TrashResponse, TrashRestoreResponse};
+    add_user(s, "ana").await;
+    add_user(s, "bob").await;
+    let (ana, bob) = (login(s, "ana").await, login(s, "bob").await);
+    let r = root(s, &ana).await;
+    let tag = uuid::Uuid::now_v7();
+
+    let empty: TrashResponse = trash_page(s, &ana, "").await.json().await.unwrap();
+    assert_eq!((empty.items.len(), empty.next), (0, None));
+    let mut files = Vec::new();
+    for i in 0..3 {
+        let data = format!("trash {tag} {i}").into_bytes();
+        let (node, version) = new_file(s, &ana, r, &format!("t{i}.txt"), &data).await;
+        delete_node(s, &ana, node, version).await;
+        files.push((node, version, data));
+    }
+
+    // Newest deletion first, with the time the server will wait (30 days by default).
+    let all: TrashResponse = trash_page(s, &ana, "").await.json().await.unwrap();
+    assert_eq!(all.items.len(), 3);
+    assert!(all.items.iter().all(|i| i.parent == r && !i.is_dir && i.purge_after_ms == i.deleted_ms + 30 * DAY_MS && i.deleted_ms > 0));
+    assert!(all.items.windows(2).all(|w| (w[0].deleted_ms, w[0].id.to_string()) > (w[1].deleted_ms, w[1].id.to_string())), "newest first");
+    assert_eq!(all.items.iter().find(|i| i.id == files[1].0).unwrap().size, Some(files[1].2.len() as u64));
+    let (mut seen, mut query) = (Vec::new(), "?limit=2".to_owned());
+    loop {
+        let page: TrashResponse = trash_page(s, &ana, &query).await.json().await.unwrap();
+        seen.extend(page.items.iter().map(|i| i.id));
+        match page.next {
+            Some(next) => query = format!("?limit=2&cursor={next}"),
+            None => break,
+        }
+    }
+    assert_eq!(seen, all.items.iter().map(|i| i.id).collect::<Vec<_>>());
+    for bad in ["?limit=0", "?limit=201", "?cursor=nonsense", "?cursor=%201.00000000-0000-0000-0000-000000000000"] {
+        let (status, body) = error(trash_page(s, &ana, bad).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "{bad}");
+    }
+
+    // Nobody else sees, restores or removes it; no token, no trash.
+    let theirs: TrashResponse = trash_page(s, &bob, "").await.json().await.unwrap();
+    assert!(theirs.items.is_empty());
+    for res in [trash_restore(s, &bob, files[0].0).await, trash_remove(s, &bob, files[0].0).await] {
+        let (status, body) = error(res).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+    }
+    assert_eq!(trash_page(s, "not-a-token", "").await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(s.client.post(format!("{}/trash/{}/restore", s.base, files[0].0)).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(s.client.delete(format!("{}/trash/{}", s.base, files[0].0)).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // A restore is one change: the file is live again with its content.
+    let before = space_of(s, &ana).await;
+    let res = trash_restore(s, &ana, files[0].0).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let done: TrashRestoreResponse = res.json().await.unwrap();
+    assert_eq!(
+        (done.node, done.parent, done.name.as_str(), done.renamed, done.seq, done.epoch),
+        (files[0].0, r, "t0.txt", false, before.seq + 1, before.epoch)
+    );
+    let feed: ChangeSet =
+        s.client.get(format!("{}/changes?since={}", s.base, before.seq)).bearer_auth(&ana).send().await.unwrap().json().await.unwrap();
+    let state = feed.nodes.iter().find(|n| n.id == files[0].0).unwrap();
+    assert!(!state.deleted);
+    let NodeKind::File(file) = &state.kind else { panic!("a file") };
+    assert_eq!(download(s, &ana, &file.manifest).await, files[0].2);
+    let after: TrashResponse = trash_page(s, &ana, "").await.json().await.unwrap();
+    assert_eq!(after.items.len(), 2);
+    // Not in the trash any more, and not there at all.
+    for node in [files[0].0, NodeId::generate(), r] {
+        let (status, body) = error(trash_restore(s, &ana, node).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"), "{node}");
+        let (status, body) = error(trash_remove(s, &ana, node).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"), "{node}");
+    }
+    let (status, body) = error(s.client.post(format!("{}/trash/not-a-uuid/restore", s.base)).bearer_auth(&ana).send().await.unwrap()).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+
+    // The name was taken meanwhile: the restore goes around it and says so, and the new file is untouched.
+    let (taken, _) = new_file(s, &ana, r, "t1.txt", format!("squatter {tag}").as_bytes()).await;
+    let done: TrashRestoreResponse = trash_restore(s, &ana, files[1].0).await.json().await.unwrap();
+    assert!(done.renamed && done.name.starts_with("t1 (conflict, laptop, ") && done.name.ends_with(").txt"), "{}", done.name);
+    let tree: ChangeSet = s.client.get(format!("{}/tree", s.base)).bearer_auth(&ana).send().await.unwrap().json().await.unwrap();
+    let names: Vec<_> =
+        tree.nodes.iter().filter(|n| n.id == taken || n.id == files[1].0).map(|n| n.name.as_ref().unwrap().as_str().to_owned()).collect();
+    assert!(names.contains(&"t1.txt".to_owned()) && names.contains(&done.name), "{names:?}");
+
+    // Removing from the trash only marks it: the history and the content are still there, nothing changes in the feed.
+    let seq = space_of(s, &ana).await.seq;
+    assert_eq!(trash_remove(s, &ana, files[2].0).await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(trash_remove(s, &ana, files[2].0).await.status(), StatusCode::NO_CONTENT, "asking again is the same");
+    assert_eq!(space_of(s, &ana).await.seq, seq);
+    let left: TrashResponse = trash_page(s, &ana, "").await.json().await.unwrap();
+    assert!(left.items.is_empty());
+    let history: HistoryResponse = history_page(s, &ana, files[2].0, "").await.json().await.unwrap();
+    assert_eq!(history.versions.len(), 1);
+    assert_eq!(download(s, &ana, &manifest_for(&files[2].2).id()).await, files[2].2);
+    let (status, body) = error(trash_restore(s, &ana, files[2].0).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+    // The restore of a version refuses a deleted file, and points to the trash.
+    let (status, body) = error(restore_request(s, &ana, files[2].0, json!({ "version": files[2].1, "expected_version": files[2].1 })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+    assert!(body.message.contains("/trash/"), "{}", body.message);
+}
+
+/// A server with another `retention.trash_days` (SQLite and disk).
+async fn sqlite_disk_with_trash_days(days: u32) -> Server {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let state = AppState::new(meta.clone(), store, vec![]).unwrap().with_trash_days(days);
+    start_state(state, meta, vec![db, blobs], None).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_purge_time_follows_the_configured_trash_days() {
+    use craft_cloud_proto::api::TrashResponse;
+    let s = sqlite_disk_with_trash_days(7).await;
+    add_user(&s, "ana").await;
+    let ana = login(&s, "ana").await;
+    let r = root(&s, &ana).await;
+    let (node, version) = new_file(&s, &ana, r, "week.txt", b"seven days").await;
+    delete_node(&s, &ana, node, version).await;
+    let page: TrashResponse = trash_page(&s, &ana, "").await.json().await.unwrap();
+    assert_eq!(page.items[0].purge_after_ms - page.items[0].deleted_ms, 7 * DAY_MS);
 }

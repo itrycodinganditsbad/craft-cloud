@@ -16,7 +16,8 @@ use axum::{Json, Router, middleware};
 use craft_cloud_meta::{BlobKind, DeviceAuth, valid_username};
 use craft_cloud_proto::api::{
     CommitRequest, CommitResponse, DeviceInfo, HISTORY_DEFAULT_LIMIT, HistoryCursor, HistoryResponse, InfoResponse, LoginRequest, LoginResponse,
-    MAX_MISSING_IDS, MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, RestoreRequest, RestoreResponse, SpaceResponse, codes,
+    MAX_MISSING_IDS, MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, RestoreRequest, RestoreResponse, SpaceResponse,
+    TRASH_DEFAULT_LIMIT, TrashCursor, TrashItem, TrashResponse, TrashRestoreResponse, codes,
 };
 use craft_cloud_proto::limits::{MAX_BATCH_JSON_BYTES, MAX_BATCH_OPS, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_PAGE_NODES};
 use craft_cloud_proto::{ChangeSet, ChunkId, DeviceId, Manifest, ManifestId, NodeId, PageCursor};
@@ -58,6 +59,9 @@ pub fn router(state: Shared) -> Router {
         .route("/saves", post(attach_save).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
         .route("/nodes/{id}/history", get(history))
         .route("/nodes/{id}/restore", post(restore).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
+        .route("/trash", get(trash))
+        .route("/trash/{id}/restore", post(restore_from_trash))
+        .route("/trash/{id}", delete(remove_from_trash))
         .route("/space", get(space))
         .route("/tree", get(tree))
         .route("/changes", get(changes))
@@ -430,6 +434,83 @@ async fn restore(
         ApiError::internal()
     })??;
     Ok(Json(RestoreResponse { version: outcome.version, parent_version: outcome.parent_version, seq: outcome.seq, epoch: outcome.epoch }))
+}
+
+const MS_PER_DAY: i64 = 86_400_000;
+
+#[derive(Debug, Deserialize)]
+struct TrashQuery {
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
+/// `GET /trash`: the deleted nodes of the caller's own space, newest deletion first.
+async fn trash(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    q: Result<Query<TrashQuery>, QueryRejection>,
+) -> Result<Json<TrashResponse>, ApiError> {
+    let Query(q) = q?;
+    let after = q.cursor.as_deref().map(str::parse::<TrashCursor>).transpose().map_err(|_| ApiError::invalid("bad trash cursor"))?;
+    let page = state.meta.trash(auth.space, after, q.limit.unwrap_or(TRASH_DEFAULT_LIMIT), state.now_ms()).await?;
+    if page.repaired > 0 {
+        tracing::warn!(count = page.repaired, "deleted nodes without a deletion time were stamped with the current time");
+    }
+    let keep = i64::from(state.trash_days).saturating_mul(MS_PER_DAY);
+    let items = page
+        .entries
+        .into_iter()
+        .map(|e| TrashItem {
+            id: e.id,
+            parent: e.parent,
+            name: e.name,
+            is_dir: e.is_dir,
+            size: e.size,
+            deleted_ms: e.deleted_ms,
+            purge_after_ms: e.deleted_ms.saturating_add(keep),
+        })
+        .collect();
+    Ok(Json(TrashResponse { items, next: page.next.map(|c| c.to_string()) }))
+}
+
+/// `POST /trash/{id}/restore`: a deleted node of the caller's space comes back, in one change.
+async fn restore_from_trash(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    id: Result<Path<NodeId>, PathRejection>,
+) -> Result<Json<TrashRestoreResponse>, ApiError> {
+    let Path(node) = id?;
+    // As a commit: the publish is never skipped for a change that went through.
+    let task_state = state.clone();
+    let outcome = tokio::spawn(async move {
+        let outcome = task_state.meta.restore_from_trash(auth.space, auth.device, node, task_state.now_ms()).await?;
+        task_state.notifier.publish(auth.space, outcome.seq);
+        Ok::<_, ApiError>(outcome)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "trash restore task failed");
+        ApiError::internal()
+    })??;
+    Ok(Json(TrashRestoreResponse {
+        node: outcome.node,
+        parent: outcome.parent,
+        name: outcome.name,
+        renamed: outcome.renamed,
+        seq: outcome.seq,
+        epoch: outcome.epoch,
+    }))
+}
+
+/// `DELETE /trash/{id}`: takes a deleted node out of the trash. Only marks it: nothing is freed.
+async fn remove_from_trash(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    id: Result<Path<NodeId>, PathRejection>,
+) -> Result<StatusCode, ApiError> {
+    let Path(node) = id?;
+    state.meta.request_purge(auth.space, node, state.now_ms()).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn cursor(after_seq: Option<u64>, after_node: Option<NodeId>) -> Result<Option<PageCursor>, ApiError> {

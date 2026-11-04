@@ -9,6 +9,9 @@
 //! # live_bytes_per_user = 1_073_741_824         # cap on what one account's live documents hold, in bytes (1 GiB)
 //! # public_url = "https://cloud.example.com"    # where computers reach the server; `user invite` prints it
 //!
+//! # [retention]
+//! # trash_days = 30   # how long a deleted file stays in the trash before the server may remove it (1 to 3650)
+//!
 //! [database]
 //! url = "sqlite:/var/lib/craft-cloud/meta.db"   # or postgres://user:pass@host/db
 //!
@@ -55,10 +58,37 @@ pub enum ConfigError {
          agent could not tell a full account from a file that is too big. Raise it, or remove it for no cap"
     )]
     StoredBytesCapTooSmall(u64, u32),
+    #[error("retention.trash_days = {0} is not between {MIN_TRASH_DAYS} and {MAX_TRASH_DAYS}")]
+    TrashDays(u32),
     #[error("public_url = {0:?} is not a server address like https://cloud.example.com (a host, an optional port and path, no query)")]
     PublicUrl(String),
     #[error("storage.{0} is missing (set it in the config or the {1} environment variable)")]
     MissingS3Credential(&'static str, &'static str),
+}
+
+/// Fewest and most days a deleted node waits in the trash.
+pub const MIN_TRASH_DAYS: u32 = 1;
+pub const MAX_TRASH_DAYS: u32 = 3650;
+/// Days in the trash when `retention.trash_days` is not set.
+pub const DEFAULT_TRASH_DAYS: u32 = 30;
+
+/// `[retention]`: how long things are kept. Only the trash today; nothing is removed by it yet.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionConfig {
+    /// Days a deleted node stays in the trash before the server may remove it for good (shown as `purge_after_ms`).
+    #[serde(default = "default_trash_days")]
+    pub trash_days: u32,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self { trash_days: DEFAULT_TRASH_DAYS }
+    }
+}
+
+fn default_trash_days() -> u32 {
+    DEFAULT_TRASH_DAYS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -90,6 +120,8 @@ pub struct Config {
     /// trailing slash. Unset: `user invite` prints the bare code and says to put the address in front.
     #[serde(default)]
     pub public_url: Option<String>,
+    #[serde(default)]
+    pub retention: RetentionConfig,
     pub database: DatabaseConfig,
     pub storage: StorageConfig,
 }
@@ -185,6 +217,9 @@ impl Config {
             && cap < u64::from(MAX_CHUNK_BYTES)
         {
             return Err(ConfigError::StoredBytesCapTooSmall(cap, MAX_CHUNK_BYTES));
+        }
+        if !(MIN_TRASH_DAYS..=MAX_TRASH_DAYS).contains(&config.retention.trash_days) {
+            return Err(ConfigError::TrashDays(config.retention.trash_days));
         }
         let mut config = config;
         if let Some(url) = &config.public_url {
@@ -321,6 +356,23 @@ path = "/tmp/blobs"
         // Without a proxy there is nothing to ignore.
         let no_proxy = format!("ignore_forwarded_for = true\n{DISK}");
         assert!(matches!(Config::parse(&no_proxy), Err(ConfigError::IgnoreForwardedForMisplaced)));
+    }
+
+    #[test]
+    fn the_trash_period_has_a_default_and_bounds() {
+        assert_eq!(Config::parse(DISK).unwrap().retention, RetentionConfig { trash_days: 30 });
+        // A table has to come after the top-level keys, so the section goes at the end.
+        let at_end = |days: &str| Config::parse(&format!("{DISK}\n[retention]\ntrash_days = {days}\n"));
+        assert_eq!(at_end("1").unwrap().retention.trash_days, 1);
+        assert_eq!(at_end("3650").unwrap().retention.trash_days, 3650);
+        for bad in ["0", "3651", "-1", "\"30\"", "1.5"] {
+            assert!(at_end(bad).is_err(), "{bad}");
+        }
+        assert!(matches!(at_end("0"), Err(ConfigError::TrashDays(0))));
+        assert!(matches!(at_end("3651"), Err(ConfigError::TrashDays(3651))));
+        // Nothing but `trash_days` is accepted in the section, and the section may be empty.
+        assert!(matches!(Config::parse(&format!("{DISK}\n[retention]\ngc_wait_hours = 24\n")), Err(ConfigError::Parse(_))));
+        assert_eq!(Config::parse(&format!("{DISK}\n[retention]\n")).unwrap().retention.trash_days, 30);
     }
 
     #[test]
