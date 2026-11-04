@@ -85,6 +85,57 @@ impl std::fmt::Debug for TwoFactorChallenge {
     }
 }
 
+/// The answer to a set-up: the secret as Base32 without padding and as an `otpauth://` URI (for a QR code), good until
+/// `expires_ms`. Shown once. Its `Debug` output hides both.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoFactorSetupResponse {
+    pub secret: String,
+    pub otpauth_uri: String,
+    pub expires_ms: i64,
+}
+
+impl std::fmt::Debug for TwoFactorSetupResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoFactorSetupResponse")
+            .field("secret", &"<redacted>")
+            .field("otpauth_uri", &"<redacted>")
+            .field("expires_ms", &self.expires_ms)
+            .finish()
+    }
+}
+
+/// Ten recovery codes, shown once (in groups of four, like `ABCD-EFGH-JKMN-PQRS`; any case, with or without dashes is
+/// accepted back). Each works once. Its `Debug` output hides them.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryCodes {
+    pub recovery_codes: Vec<String>,
+}
+
+impl std::fmt::Debug for RecoveryCodes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryCodes").field("recovery_codes", &format_args!("<{} redacted>", self.recovery_codes.len())).finish()
+    }
+}
+
+/// `GET /account/two-factor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoFactorStatus {
+    pub enabled: bool,
+    /// When it was turned on.
+    #[serde(default)]
+    pub enabled_ms: Option<i64>,
+    /// Recovery codes not used yet (0 while it is off).
+    pub recovery_codes_left: u32,
+    /// A set-up is running (it ends after ten minutes or five wrong codes).
+    pub pending: bool,
+}
+
+/// `POST /api/v1/devices/revoke-others` (device auth): how many other devices were signed out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokedOthers {
+    pub revoked: u32,
+}
+
 /// Where an add-a-computer code stands, in [`PairingStatus`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
