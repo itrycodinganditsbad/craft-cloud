@@ -129,8 +129,9 @@ for S3, the keys. The server's `Debug` output hides the URL's credentials, and `
 services shows no secret, since none is in an environment or a Compose file. The values are checked against short
 lists of allowed characters before they are written, so a value cannot break the TOML or add a setting.
 
-To change a setting in `.env` (`CC_*`, see `.env.example`), edit the file, run `docker compose run --rm secrets-init`
-and then `docker compose up -d`.
+To change a setting in `.env` (`CC_*`, see `.env.example`), edit the file, run `docker compose up -d --force-recreate secrets-init`
+(it must be recreated to see the new values: Compose gives a container its secrets when it is created, and a plain
+`up` would start the old container again and write the old values back), then `docker compose restart server`.
 
 The server believes `X-Forwarded-For` only from Caddy. `trusted_proxies` takes single addresses, no networks, so
 Caddy has a fixed address (`CC_CADDY_IP`, `172.29.215.2` in the network `CC_FRONTEND_SUBNET`, `172.29.215.0/24`). If
@@ -165,8 +166,8 @@ create in its schema, and the role cannot connect to `postgres` or `template1`. 
 for the Postgres container and `db-init`. Blobs stay on the data volume.
 
 To rotate the database password, change `CC_SECRET_DB_PASSWORD` in `.env` (characters from `A-Za-z0-9._~-`, at least
-32), then run `docker compose run --rm secrets-init`, `docker compose up -d db-init` and
-`docker compose restart server`. The superuser password cannot be changed that way: Postgres applies it only when
+32), then run `docker compose up -d --force-recreate secrets-init`,
+`docker compose up -d --force-recreate db-init` and `docker compose restart server`. The superuser password cannot be changed that way: Postgres applies it only when
 the data directory is created. Change it with `ALTER ROLE postgres` first and then in `.env`.
 
 The connection between the server and Postgres is not encrypted (the server's `sqlx` has no TLS feature). It never
@@ -217,7 +218,7 @@ There is no backup automation yet. Stop the server (`docker compose stop server`
 - `server` is not healthy: `docker compose logs server`. The check is `craft-cloud-server healthcheck`, a
   `GET /api/info` request to `127.0.0.1:8080` inside the container.
 - All devices share one sign-in budget: `trusted_proxies` does not contain Caddy's address. `CC_CADDY_IP` must lie in
-  `CC_FRONTEND_SUBNET`; run `docker compose run --rm secrets-init` after changing either.
+  `CC_FRONTEND_SUBNET`; run `docker compose up -d --force-recreate secrets-init` and `docker compose up -d` after changing either.
 
 ### Not covered
 

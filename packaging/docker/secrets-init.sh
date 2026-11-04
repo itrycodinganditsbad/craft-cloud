@@ -15,7 +15,8 @@ case $- in *x*) set +x ;; esac
 # postgres user of the postgres:*-alpine images.
 #
 # Nothing here prints a secret. Every run rewrites all files, so changing a value in .env and running
-# `docker compose run --rm secrets-init` is how a password or a setting is changed; restart the server afterwards.
+# `docker compose up -d --force-recreate secrets-init` is how a password or a setting is changed (the container must be
+# recreated to get the new secrets from .env; a plain start would write the old ones back). Restart the server afterwards.
 #
 # The directories are mounted into running containers (volume subpaths), so they are never deleted or recreated:
 # each file is written next to its place and moved over the old one, and only files that no longer belong are removed.
