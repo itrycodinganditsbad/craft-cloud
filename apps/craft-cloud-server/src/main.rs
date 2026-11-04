@@ -35,7 +35,13 @@ async fn run_server(config_path: &std::path::Path) -> Result<(), String> {
         tracing::warn!("ignore_forwarded_for is set: every client shares one address for sign-in rate limits");
     }
     let (meta, store) = open(&config).await.map_err(|e| e.to_string())?;
-    let state = AppState::new(meta, store, config.trusted_proxies.clone()).map_err(|e| e.message)?.with_public_url(config.public_url.clone());
+    // Fail closed: a database that holds two-factor secrets the key can't open is not served. The server never makes the key.
+    let keys = craft_cloud_server::two_factor::load_keys(&config).map_err(|e| e.to_string())?;
+    let secrets = craft_cloud_server::two_factor::check_startup(&meta, keys, &config, craft_cloud_server::state::now_ms()).await?;
+    let state = AppState::new(meta, store, config.trusted_proxies.clone())
+        .map_err(|e| e.message)?
+        .with_public_url(config.public_url.clone())
+        .with_two_factor(secrets);
     let listener = tokio::net::TcpListener::bind(config.listen).await.map_err(|e| format!("can't listen on {}: {e}", config.listen))?;
     tracing::info!(listen = %config.listen, behind_proxy = config.behind_proxy, "Craft Cloud server running");
     let shutdown = async {

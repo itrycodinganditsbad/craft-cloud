@@ -1,5 +1,6 @@
-//! The HTTP API, under `/api/v1`. Everything but `info`, `auth/login` and `join` needs a device token. The account
-//! and its devices' routes (`account`, `account/password`, renaming and signing out devices) are in [`crate::account`]. `GET /live`
+//! The HTTP API, under `/api/v1`. Everything but `info`, `auth/login`, `auth/login/second-factor` and `join` needs a device
+//! token. The account and its devices' routes (`account`, `account/password`, renaming and signing out devices) are in
+//! [`crate::account`], two-factor sign-in's in [`crate::two_factor`]. `GET /live`
 //! becomes the live service's WebSocket ([`crate::live`]); join codes (`pairings`, `join`, and the `/join/{code}` page
 //! outside the API) are in [`crate::join`].
 
@@ -14,7 +15,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router, middleware};
-use craft_cloud_meta::{BlobKind, DeviceAuth, DeviceClient, DeviceRecord, Origin, RevokeReason, valid_username};
+use craft_cloud_meta::{BlobKind, DeviceAuth, DeviceClient, DeviceRecord, NewChallenge, Origin, RevokeReason, SignIn, valid_username};
 use craft_cloud_proto::api::{
     CommitRequest, CommitResponse, DeviceInfo, InfoResponse, LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse,
     PROTOCOL_MAX, PROTOCOL_MIN, SpaceResponse, codes,
@@ -31,12 +32,13 @@ use crate::error::ApiError;
 use crate::join;
 use crate::ratelimit::{client_ip, ip_key};
 use crate::state::AppState;
+use crate::two_factor;
 
 /// Chunker parameter sets the server accepts.
 pub const CHUNKER_PARAMS: &[&str] = &["fastcdc-v1"];
 /// Login attempts per account and per client address in five minutes.
-const LOGINS_PER_USER: u32 = 10;
-const LOGINS_PER_IP: u32 = 30;
+pub(crate) const LOGINS_PER_USER: u32 = 10;
+pub(crate) const LOGINS_PER_IP: u32 = 30;
 /// Longest change-feed long-poll.
 const MAX_WAIT_SECS: u64 = 60;
 /// `Retry-After` for a refused long-poll.
@@ -55,6 +57,11 @@ pub fn router(state: Shared) -> Router {
         .route("/account", get(account::get_account))
         .route("/account/password", post(account::change_password).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/account/activity", get(audit::account_activity))
+        .route("/account/two-factor", get(two_factor::get_status))
+        .route("/account/two-factor/setup", post(two_factor::setup).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route("/account/two-factor/confirm", post(two_factor::confirm).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route("/account/two-factor/disable", post(two_factor::disable).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route("/account/two-factor/recovery-codes", post(two_factor::recovery_codes).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/devices", get(list_devices))
         .route("/devices/revoke-others", post(account::revoke_others))
         .route("/devices/{id}", delete(revoke_device).patch(account::rename_device).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
@@ -76,6 +83,7 @@ pub fn router(state: Shared) -> Router {
     let public = Router::new()
         .route("/info", get(info))
         .route("/auth/login", post(login).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
+        .route("/auth/login/second-factor", post(two_factor::second_factor).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/join", post(join::join).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)));
     Router::new()
         .nest("/api/v1", public.merge(signed_in))
@@ -163,12 +171,21 @@ async fn login(
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED, "wrong username or password"));
     };
     let (token, token_hash) = new_token()?;
+    // A challenge is made only if the account needs a second factor; the token the client gets for it is a secret of its own.
+    let (challenge_token, challenge_hash) = new_token()?;
+    let challenge = NewChallenge { id_hash: challenge_hash, client_key: ip_key(ip) };
     // Created only if the password just checked is still the account's: one changed meanwhile (and the devices
-    // signed out with it) must not be followed by a device that the old password let in. Answered as a wrong password.
-    let Some(device) =
-        state.meta.sign_in_device(user.id, (&user.password_hash, user.auth_gen), &req.device_name, &client, &token_hash, state.now_ms()).await?
-    else {
-        return Err(ApiError::new(StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED, "wrong username or password"));
+    // signed out with it) must not be followed by a device that the old password let in. Answered as a wrong password. The
+    // account's two-factor state is read under the same lock: with it on, there is a challenge and no device.
+    let signed_in =
+        state.meta.sign_in(user.id, (&user.password_hash, user.auth_gen), &req.device_name, &client, &token_hash, &challenge, state.now_ms()).await?;
+    let device = match signed_in {
+        None => return Err(ApiError::new(StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED, "wrong username or password")),
+        Some(SignIn::Device(device)) => device,
+        Some(SignIn::Challenge { expires_ms }) => {
+            tracing::info!("sign-in needs a second factor");
+            return Err(ApiError::two_factor_required(challenge_token, expires_ms));
+        }
     };
     // The username is the only personal identifier the server could log here: kept to debug.
     tracing::debug!(user = %user.username, "sign-in");

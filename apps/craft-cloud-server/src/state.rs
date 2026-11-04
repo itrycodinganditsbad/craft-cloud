@@ -16,6 +16,7 @@ use crate::error::ApiError;
 use crate::live::LiveHub;
 use crate::notify::Notifier;
 use crate::ratelimit::Limiter;
+use crate::secretbox::SecretBox;
 
 /// How much one user, or one request, may hold on the server at once. Each user's limits are their own, so a
 /// stalled or greedy client only ever slows its own account.
@@ -112,6 +113,10 @@ pub struct AppState {
     pub joins: Limiter,
     /// Password change tries per account, in 15-minute windows ([`crate::account`]).
     pub password_changes: Limiter,
+    /// Wrong second factors per account and per client address, in five-minute windows ([`crate::two_factor`]).
+    pub second_factors: Limiter,
+    /// Seals and opens the secrets of two-factor sign-in; `None`: no key is configured, so it can't be set up.
+    pub two_factor: Option<Arc<SecretBox>>,
     pub notifier: Notifier,
     /// The live service's connections and subscriptions ([`crate::live`]).
     pub live: LiveHub,
@@ -143,6 +148,8 @@ impl AppState {
             logins: Limiter::new(Duration::from_secs(300)),
             joins: Limiter::new(Duration::from_secs(60)),
             password_changes: Limiter::new(Duration::from_secs(900)),
+            second_factors: Limiter::new(Duration::from_secs(300)),
+            two_factor: None,
             notifier: Notifier::default(),
             live: LiveHub::default(),
             bodies: PerUser::new(limits.bodies_per_user),
@@ -169,6 +176,12 @@ impl AppState {
     /// The state with other bounds for the audit export (tests use small ones).
     pub fn with_audit_export(mut self, limits: AuditExportLimits) -> Self {
         self.audit_export = limits;
+        self
+    }
+
+    /// The state with the key for two-factor secrets (`None`: none is configured and two-factor sign-in can't be set up).
+    pub fn with_two_factor(mut self, secrets: Option<SecretBox>) -> Self {
+        self.two_factor = secrets.map(Arc::new);
         self
     }
 

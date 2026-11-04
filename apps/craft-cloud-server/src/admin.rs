@@ -9,8 +9,10 @@
 //!   missing or mistyped field is `400 invalid`, a wrong password `403 wrong_password` (never 401: on a signed-in route
 //!   the agent reads 401 as "this device was revoked"). Tries are counted per account in
 //!   [`AppState::password_changes`], the same window the password change uses, but only a wrong password stays counted;
-//!   every check holds a server-wide password-check slot. `totp_code` joins the confirmation when the server has
-//!   two-factor sign-in (see `docs/design/sync.md`); a body that has one already is read, and the field ignored.
+//!   every check holds a server-wide password-check slot. An admin whose account has two-factor sign-in adds `totp_code`
+//!   (or `recovery_code`): missing or wrong is `403 two_factor_invalid`, too many wrong ones `429 two_factor_locked`. The
+//!   code is used up by the confirmation (one time step serves one change, as at sign-in), and the check shares its
+//!   counters and limiter with sign-in.
 //! - **Bodies are tiny** ([`TINY_JSON_BYTES`]), the `DELETE` routes carry one too, and are read under the same deadline
 //!   as every JSON body.
 //! - **Nothing secret is logged**: not a password, a code or a join link. Events are logged at `info` with the kind and
@@ -32,15 +34,16 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use craft_cloud_meta::{AdminActor, AdminUser, DeviceAuth, Role, UserId, valid_username};
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::{
-    AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminServerInfo, AdminUpdateUser, AdminUserInfo, AdminUserList,
+    AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser, AdminUserInfo,
+    AdminUserList,
 };
 use craft_cloud_proto::join::{Code, INVITE_CHARS, INVITE_TTL_MS, JoinString};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::account::{PASSWORD_CHANGES_PER_USER, wrong_password};
-use crate::api::{PASSWORD_RETRY_SECS, TINY_JSON_BYTES, body_too_slow, device_info};
-use crate::auth::{MAX_PASSWORD_BYTES, require_admin, verify_password};
+use crate::account::confirm_password;
+use crate::api::{TINY_JSON_BYTES, body_too_slow, device_info};
+use crate::auth::require_admin;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -64,6 +67,7 @@ pub fn routes() -> Router<Shared> {
         .route("/admin/users/{id}/enable", post(enable_user).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/admin/users/{id}/invite", post(issue_invite).delete(revoke_invite).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/admin/users/{id}/password-reset", post(issue_reset).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route("/admin/users/{id}/reset-two-factor", post(reset_two_factor).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/admin/users/{id}/devices", get(list_devices))
         .route("/admin/users/{id}/devices/{device_id}", axum::routing::delete(revoke_device).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route_layer(middleware::from_fn(require_admin))
@@ -82,47 +86,31 @@ async fn read_body<T: serde::de::DeserializeOwned>(state: &AppState, request: Re
         .map_err(|_| ApiError::invalid("the body must be a JSON object with your current password in `password`, and the fields of this call"))
 }
 
-/// Checks the acting admin's password and returns the actor to hand to the change. One wrong password stays counted
-/// against the account ([`PASSWORD_CHANGES_PER_USER`] in 15 minutes); a right one is given back.
-async fn confirm(state: &AppState, auth: &DeviceAuth, password: Option<String>) -> Result<AdminActor, ApiError> {
-    let password = password.ok_or_else(|| ApiError::invalid("this change needs your current password in `password`"))?;
-    if password.len() > MAX_PASSWORD_BYTES {
-        return Err(ApiError::invalid("passwords are at most 1024 bytes"));
+/// What an admin's body gives for a confirmation: the password, and the second factor when the account has one.
+struct Confirmation {
+    password: Option<String>,
+    totp_code: Option<String>,
+    recovery_code: Option<String>,
+}
+
+impl Confirmation {
+    fn new(password: Option<String>, totp_code: Option<String>, recovery_code: Option<String>) -> Self {
+        Self { password, totp_code, recovery_code }
     }
-    // tokio's clock: the system's monotonic clock in the server, the simulated one in a simulation.
-    let now = tokio::time::Instant::now().into_std();
-    let key = format!("user:{}", auth.username);
-    let Some(counted) = state.password_changes.count(&key, PASSWORD_CHANGES_PER_USER, now) else {
-        return Err(ApiError::rate_limited("too many wrong passwords; wait a few minutes", None));
-    };
-    // Each check costs 19 MiB and real CPU time: all slots busy is told to come back, not queued, and costs no try.
-    let Ok(permit) = state.password_checks.clone().try_acquire_owned() else {
-        state.password_changes.refund(&key, counted);
-        return Err(ApiError::rate_limited("the server is busy checking other passwords; try again in a moment", Some(PASSWORD_RETRY_SECS)));
-    };
-    let user = match state.meta.user_by_name(&auth.username).await {
-        Ok(Some(user)) if user.id == auth.user => user,
-        other => {
-            state.password_changes.refund(&key, counted);
-            other?;
-            return Err(ApiError::unauthorized());
-        }
-    };
-    let hash = user.password_hash.clone();
-    let ok = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        verify_password(&password, &hash)
-    })
-    .await
-    .map_err(|e| {
-        tracing::error!(error = %e, "password check task failed");
-        ApiError::internal()
-    })?;
-    if !ok {
-        return Err(wrong_password());
-    }
-    state.password_changes.refund(&key, counted);
-    Ok(AdminActor { user: auth.user, device: auth.device, password_hash: user.password_hash })
+}
+
+/// Checks the acting admin's confirmation and returns the actor to hand to the change: the password ([`confirm_password`]:
+/// one wrong password stays counted against the account, a right one is given back), then, when the admin's account has
+/// two-factor sign-in, the second factor (`totp_code`, or `recovery_code`), which is used up here: the time step or the
+/// recovery code can't serve a second change, and wrong ones are counted and can lock ([`crate::two_factor`]). A password
+/// that is wrong is told before anything about the second factor.
+async fn confirm(state: &AppState, auth: &DeviceAuth, given: Confirmation) -> Result<AdminActor, ApiError> {
+    let password = given.password.ok_or_else(|| ApiError::invalid("this change needs your current password in `password`"))?;
+    // The shape of the second factor is checked before anything is counted.
+    let proof = crate::two_factor::parse_proof(given.totp_code, given.recovery_code)?;
+    let password_hash = confirm_password(state, auth, password).await?;
+    let two_factor = crate::two_factor::confirm_admin_second_factor(state, auth, proof).await?;
+    Ok(AdminActor { user: auth.user, device: auth.device, password_hash, two_factor })
 }
 
 fn user_id(id: Result<Path<Uuid>, PathRejection>) -> Result<UserId, ApiError> {
@@ -145,8 +133,7 @@ fn user_info(u: AdminUser) -> AdminUserInfo {
         role: u.role.as_str().to_owned(),
         created_ms: u.created_ms,
         disabled_ms: u.disabled_ms,
-        // Two-factor sign-in isn't part of the server yet.
-        two_factor_enabled: false,
+        two_factor_enabled: u.two_factor_enabled,
         devices_active: u.devices_active,
         stored_bytes: u.stored_bytes,
         quota_bytes: u.quota_bytes,
@@ -251,7 +238,7 @@ async fn create_user(
         return Err(ApiError::invalid("usernames are 1-64 letters, digits, '.', '_' or '-'"));
     }
     let role = role_of(&req.role)?;
-    let actor = confirm(&state, &auth, req.password).await?;
+    let actor = confirm(&state, &auth, Confirmation::new(req.password, req.totp_code, req.recovery_code)).await?;
     let code = new_code()?;
     let now = state.now_ms();
     let (user, issued) = state.meta.admin_create_user(&actor, &req.username, role, &code.hash(), now, INVITE_TTL_MS).await?;
@@ -272,7 +259,7 @@ async fn update_user(
     if role.is_none() && req.quota_bytes.is_none() {
         return Err(ApiError::invalid("give a role or a quota_bytes to change"));
     }
-    let actor = confirm(&state, &auth, req.password).await?;
+    let actor = confirm(&state, &auth, Confirmation::new(req.password, req.totp_code, req.recovery_code)).await?;
     let user = state.meta.admin_update_user(&actor, target, role, req.quota_bytes, state.now_ms()).await?;
     tracing::info!(actor = %auth.device, target = %target.0, role_changed = role.is_some(), quota_changed = req.quota_bytes.is_some(), "admin: account changed");
     Ok(Json(user_info(user)))
@@ -287,7 +274,7 @@ async fn disable_user(
 ) -> Result<StatusCode, ApiError> {
     let target = user_id(id)?;
     let req: AdminConfirm = read_body(&state, request).await?;
-    let actor = confirm(&state, &auth, req.password).await?;
+    let actor = confirm(&state, &auth, Confirmation::new(req.password, req.totp_code, req.recovery_code)).await?;
     let revoked = state.meta.admin_disable_user(&actor, target, state.now_ms()).await?;
     end_live_connections(&state, &revoked);
     tracing::info!(actor = %auth.device, target = %target.0, revoked = revoked.len(), "admin: account disabled");
@@ -303,7 +290,7 @@ async fn enable_user(
 ) -> Result<StatusCode, ApiError> {
     let target = user_id(id)?;
     let req: AdminConfirm = read_body(&state, request).await?;
-    let actor = confirm(&state, &auth, req.password).await?;
+    let actor = confirm(&state, &auth, Confirmation::new(req.password, req.totp_code, req.recovery_code)).await?;
     state.meta.admin_enable_user(&actor, target, state.now_ms()).await?;
     tracing::info!(actor = %auth.device, target = %target.0, "admin: account enabled");
     Ok(StatusCode::NO_CONTENT)
@@ -318,7 +305,7 @@ async fn remove_user(
 ) -> Result<StatusCode, ApiError> {
     let target = user_id(id)?;
     let req: AdminConfirm = read_body(&state, request).await?;
-    let actor = confirm(&state, &auth, req.password).await?;
+    let actor = confirm(&state, &auth, Confirmation::new(req.password, req.totp_code, req.recovery_code)).await?;
     let revoked = state.meta.admin_remove_user(&actor, target, state.now_ms()).await?;
     end_live_connections(&state, &revoked);
     tracing::info!(actor = %auth.device, target = %target.0, revoked = revoked.len(), "admin: account marked for removal");
@@ -334,7 +321,7 @@ async fn issue_invite(
 ) -> Result<Json<AdminCode>, ApiError> {
     let target = user_id(id)?;
     let req: AdminConfirm = read_body(&state, request).await?;
-    let actor = confirm(&state, &auth, req.password).await?;
+    let actor = confirm(&state, &auth, Confirmation::new(req.password, req.totp_code, req.recovery_code)).await?;
     let code = new_code()?;
     let issued = state.meta.admin_issue_invite(&actor, target, &code.hash(), state.now_ms(), INVITE_TTL_MS).await?;
     tracing::info!(actor = %auth.device, target = %target.0, "admin: invite issued");
@@ -350,7 +337,7 @@ async fn revoke_invite(
 ) -> Result<StatusCode, ApiError> {
     let target = user_id(id)?;
     let req: AdminConfirm = read_body(&state, request).await?;
-    let actor = confirm(&state, &auth, req.password).await?;
+    let actor = confirm(&state, &auth, Confirmation::new(req.password, req.totp_code, req.recovery_code)).await?;
     state.meta.admin_revoke_invite(&actor, target, state.now_ms()).await?;
     tracing::info!(actor = %auth.device, target = %target.0, "admin: invite revoked");
     Ok(StatusCode::NO_CONTENT)
@@ -365,12 +352,30 @@ async fn issue_reset(
     request: Request,
 ) -> Result<Json<AdminCode>, ApiError> {
     let target = user_id(id)?;
-    let req: AdminConfirm = read_body(&state, request).await?;
-    let actor = confirm(&state, &auth, req.password).await?;
+    let req: AdminPasswordReset = read_body(&state, request).await?;
+    let actor = confirm(&state, &auth, Confirmation::new(req.password, req.totp_code, req.recovery_code)).await?;
     let code = new_code()?;
-    let issued = state.meta.admin_issue_reset(&actor, target, &code.hash(), state.now_ms(), craft_cloud_meta::RESET_TTL_MS).await?;
-    tracing::info!(actor = %auth.device, target = %target.0, "admin: password reset code issued");
+    let issued =
+        state.meta.admin_issue_reset(&actor, target, &code.hash(), req.reset_two_factor, state.now_ms(), craft_cloud_meta::RESET_TTL_MS).await?;
+    tracing::info!(actor = %auth.device, target = %target.0, reset_two_factor = req.reset_two_factor, "admin: password reset code issued");
     Ok(Json(admin_code(&state, code, issued.expires_ms)))
+}
+
+/// `POST /admin/users/{id}/reset-two-factor`: 204. Takes the account's two-factor sign-in away and signs every device of
+/// it out (for someone who lost their authenticator and their recovery codes).
+async fn reset_two_factor(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    id: Result<Path<Uuid>, PathRejection>,
+    request: Request,
+) -> Result<StatusCode, ApiError> {
+    let target = user_id(id)?;
+    let req: AdminConfirm = read_body(&state, request).await?;
+    let actor = confirm(&state, &auth, Confirmation::new(req.password, req.totp_code, req.recovery_code)).await?;
+    let revoked = state.meta.admin_reset_two_factor(&actor, target, state.now_ms()).await?;
+    end_live_connections(&state, &revoked);
+    tracing::info!(actor = %auth.device, target = %target.0, revoked = revoked.len(), "admin: two-factor sign-in reset");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /admin/users/{id}/devices/{device_id}`: 204.
@@ -382,7 +387,7 @@ async fn revoke_device(
 ) -> Result<StatusCode, ApiError> {
     let Path((target, device)) = ids?;
     let req: AdminConfirm = read_body(&state, request).await?;
-    let actor = confirm(&state, &auth, req.password).await?;
+    let actor = confirm(&state, &auth, Confirmation::new(req.password, req.totp_code, req.recovery_code)).await?;
     state.meta.admin_revoke_device(&actor, UserId(target), device, state.now_ms()).await?;
     state.live.revoke(device);
     tracing::info!(actor = %auth.device, target = %target, %device, "admin: device revoked");

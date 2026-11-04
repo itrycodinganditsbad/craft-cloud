@@ -6,7 +6,7 @@ use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection, Que
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use craft_cloud_meta::MetaError;
-use craft_cloud_proto::api::{ErrorBody, QuotaUse, codes};
+use craft_cloud_proto::api::{ErrorBody, QuotaUse, TwoFactorChallenge, codes};
 use craft_cloud_proto::{ChunkId, Conflict};
 use craft_cloud_store::StoreError;
 
@@ -21,11 +21,13 @@ pub struct ApiError {
     pub quota: Option<Box<QuotaUse>>,
     /// Seconds for the `Retry-After` header.
     pub retry_after: Option<u32>,
+    /// The challenge of `two_factor_required`. Boxed for the same reason as `quota`.
+    pub two_factor: Option<Box<TwoFactorChallenge>>,
 }
 
 impl ApiError {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into(), conflicts: None, missing: None, quota: None, retry_after: None }
+        Self { status, code, message: message.into(), conflicts: None, missing: None, quota: None, retry_after: None, two_factor: None }
     }
 
     /// `507 quota_exceeded`: the account would store more than the server lets it.
@@ -74,6 +76,49 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, codes::PASSWORD_REQUIRED, "this invite is for a new account: choose a password for it")
     }
 
+    /// `401 two_factor_required`: the password (or code) was right and the account needs its second factor. No token.
+    /// `challenge` is the secret to send back to `POST /auth/login/second-factor` (empty for `/join`, which has none).
+    pub fn two_factor_required(challenge: String, expires_ms: i64) -> Self {
+        let mut e = Self::new(StatusCode::UNAUTHORIZED, codes::TWO_FACTOR_REQUIRED, "this account needs a code from its authenticator app");
+        e.two_factor = Some(Box::new(TwoFactorChallenge { challenge, expires_ms }));
+        e
+    }
+
+    /// `403 two_factor_invalid`: a wrong code or recovery code on a signed-in route (never 401: on a signed-in route the
+    /// agent reads 401 as "this device was revoked"). [`ApiError::on_public_route`] makes it 401 for sign-in and join.
+    pub fn two_factor_invalid() -> Self {
+        Self::new(StatusCode::FORBIDDEN, codes::TWO_FACTOR_INVALID, "the code is wrong, or was used already")
+    }
+
+    /// `429 two_factor_locked` with `Retry-After`.
+    pub fn two_factor_locked(retry_after_secs: u32) -> Self {
+        let mut e = Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            codes::TWO_FACTOR_LOCKED,
+            "too many wrong codes: this account's second factor is locked for a while; try again later, or ask the server's admin",
+        );
+        e.retry_after = Some(retry_after_secs);
+        e
+    }
+
+    /// `503 two_factor_unavailable`: the server has no key for two-factor secrets.
+    pub fn two_factor_unavailable() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            codes::TWO_FACTOR_UNAVAILABLE,
+            "this server has no key for two-factor secrets; the admin sets [two_factor] key_file in its config",
+        )
+    }
+
+    /// The answer on a route that is not signed in (sign-in's second step, join): a wrong second factor is `401` there,
+    /// where it is `403` on every signed-in route.
+    pub fn on_public_route(mut self) -> Self {
+        if self.code == codes::TWO_FACTOR_INVALID {
+            self.status = StatusCode::UNAUTHORIZED;
+        }
+        self
+    }
+
     pub fn internal() -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, codes::INTERNAL, "the server hit an internal error; the admin can find details in its log")
     }
@@ -104,6 +149,18 @@ impl From<MetaError> for ApiError {
             MetaError::Forbidden(message) => Self::forbidden(message),
             MetaError::LastAdmin => Self::new(StatusCode::CONFLICT, codes::LAST_ADMIN, e.to_string()),
             MetaError::AccountDisabled => Self::new(StatusCode::FORBIDDEN, codes::ACCOUNT_DISABLED, "this account is disabled; ask an administrator"),
+            // The status of a wrong second factor depends on the route: 403 here (every signed-in route), made 401 by
+            // `on_public_route` for sign-in and join.
+            MetaError::TwoFactorInvalid => Self::two_factor_invalid(),
+            MetaError::TwoFactorLocked { retry_after_ms } => Self::two_factor_locked(craft_cloud_meta::retry_after_secs(retry_after_ms)),
+            MetaError::TwoFactorPending => {
+                Self::new(StatusCode::CONFLICT, codes::TWO_FACTOR_PENDING, "a two-factor set-up is open on another device: finish it there, or wait")
+            }
+            // Only the join route can see this and it builds its own answer; a signed-in route never asks a second factor.
+            MetaError::TwoFactorRequired => Self::new(StatusCode::UNAUTHORIZED, codes::TWO_FACTOR_REQUIRED, "this account needs its second factor"),
+            MetaError::ChallengeGone => {
+                Self::new(StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED, "this sign-in step doesn't work any more: sign in again")
+            }
             MetaError::Conflict(message) => Self::new(StatusCode::CONFLICT, codes::CONFLICT, message),
             MetaError::UsernameTaken => Self::new(StatusCode::CONFLICT, codes::USERNAME_TAKEN, "the username is taken"),
             MetaError::QuotaExceeded { used, limit } => Self::quota_exceeded(used, limit),
@@ -170,6 +227,7 @@ impl IntoResponse for ApiError {
             conflicts: self.conflicts,
             missing: self.missing,
             quota: self.quota.map(|q| *q),
+            two_factor: self.two_factor.map(|t| *t),
         };
         let mut response = (self.status, Json(body)).into_response();
         if let Some(secs) = self.retry_after {
@@ -195,5 +253,25 @@ mod tests {
         assert_eq!((last.status, last.code), (StatusCode::CONFLICT, codes::LAST_ADMIN));
         let disabled = ApiError::from(MetaError::AccountDisabled);
         assert_eq!((disabled.status, disabled.code), (StatusCode::FORBIDDEN, codes::ACCOUNT_DISABLED));
+    }
+
+    #[test]
+    fn second_factor_errors_are_403_on_signed_in_routes_and_401_on_public_ones() {
+        let invalid = ApiError::from(MetaError::TwoFactorInvalid);
+        assert_eq!((invalid.status, invalid.code), (StatusCode::FORBIDDEN, codes::TWO_FACTOR_INVALID));
+        let public = invalid.on_public_route();
+        assert_eq!((public.status, public.code), (StatusCode::UNAUTHORIZED, codes::TWO_FACTOR_INVALID));
+        let locked = ApiError::from(MetaError::TwoFactorLocked { retry_after_ms: 1500 });
+        assert_eq!((locked.status, locked.code, locked.retry_after), (StatusCode::TOO_MANY_REQUESTS, codes::TWO_FACTOR_LOCKED, Some(2)));
+        let locked = locked.on_public_route();
+        assert_eq!(locked.status, StatusCode::TOO_MANY_REQUESTS);
+        let pending = ApiError::from(MetaError::TwoFactorPending);
+        assert_eq!((pending.status, pending.code), (StatusCode::CONFLICT, codes::TWO_FACTOR_PENDING));
+        assert_eq!(ApiError::two_factor_unavailable().status, StatusCode::SERVICE_UNAVAILABLE);
+        let gone = ApiError::from(MetaError::ChallengeGone);
+        assert_eq!((gone.status, gone.code), (StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED));
+        let required = ApiError::two_factor_required("challenge-secret".into(), 5);
+        assert_eq!((required.status, required.code), (StatusCode::UNAUTHORIZED, codes::TWO_FACTOR_REQUIRED));
+        assert!(!format!("{required:?}").contains("challenge-secret"), "the challenge is hidden in Debug");
     }
 }

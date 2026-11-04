@@ -38,6 +38,52 @@ pub(crate) fn wrong_password() -> ApiError {
     ApiError::new(StatusCode::FORBIDDEN, codes::WRONG_PASSWORD, "the current password is wrong")
 }
 
+/// Checks the signed-in account's own password for a route that asks for one again (a change of the two-factor settings, an
+/// admin's confirmation) and returns the password hash it was verified against, which the change then compares with the
+/// stored one under the account's lock. Wrong passwords are counted per account ([`PASSWORD_CHANGES_PER_USER`] in 15
+/// minutes, the window of the password change) and a right one is given back, so only a wrong password stays counted;
+/// every check holds one of the server-wide password-check slots, and all busy is `429 rate_limited` that costs no try. A
+/// wrong password is `403 wrong_password`, never 401.
+pub(crate) async fn confirm_password(state: &AppState, auth: &DeviceAuth, password: String) -> Result<String, ApiError> {
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(ApiError::invalid("passwords are at most 1024 bytes"));
+    }
+    // tokio's clock: the system's monotonic clock in the server, the simulated one in a simulation.
+    let now = tokio::time::Instant::now().into_std();
+    let key = format!("user:{}", auth.username);
+    let Some(counted) = state.password_changes.count(&key, PASSWORD_CHANGES_PER_USER, now) else {
+        return Err(ApiError::rate_limited("too many wrong passwords; wait a few minutes", None));
+    };
+    // Each check costs 19 MiB and real CPU time: all slots busy is told to come back, not queued, and costs no try.
+    let Ok(permit) = state.password_checks.clone().try_acquire_owned() else {
+        state.password_changes.refund(&key, counted);
+        return Err(ApiError::rate_limited("the server is busy checking other passwords; try again in a moment", Some(PASSWORD_RETRY_SECS)));
+    };
+    let user = match state.meta.user_by_name(&auth.username).await {
+        Ok(Some(user)) if user.id == auth.user => user,
+        other => {
+            state.password_changes.refund(&key, counted);
+            other?;
+            return Err(ApiError::unauthorized());
+        }
+    };
+    let hash = user.password_hash.clone();
+    let ok = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_password(&password, &hash)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "password check task failed");
+        ApiError::internal()
+    })?;
+    if !ok {
+        return Err(wrong_password());
+    }
+    state.password_changes.refund(&key, counted);
+    Ok(user.password_hash)
+}
+
 /// `GET /api/v1/account`.
 pub async fn get_account(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>) -> Result<Json<AccountInfo>, ApiError> {
     let account = state.meta.account(auth.user).await?;
@@ -47,8 +93,7 @@ pub async fn get_account(State(state): State<Shared>, Extension(auth): Extension
         role: account.role.as_str().to_owned(),
         created_ms: account.created_ms,
         password_changed_ms: account.password_changed_ms,
-        // Two-factor sign-in isn't part of the server yet.
-        two_factor_enabled: false,
+        two_factor_enabled: account.two_factor_enabled,
     }))
 }
 

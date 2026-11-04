@@ -15,6 +15,7 @@ use craft_cloud_store::s3::S3Backend;
 
 use crate::auth::{check_password_rules, hash_password};
 use crate::config::{Config, StorageConfig};
+use crate::secretbox::TwoFactorKey;
 use crate::state::now_ms;
 
 #[derive(Debug, Parser)]
@@ -85,6 +86,14 @@ pub enum Command {
         #[command(subcommand)]
         action: AuditCommand,
     },
+    /// Manage the key for two-factor secrets.
+    TwoFactor {
+        /// Path to config.toml. May come before or after the action.
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: TwoFactorAction,
+    },
     /// Manage live documents.
     Live {
         /// Path to config.toml. May come before or after the action.
@@ -119,6 +128,15 @@ pub enum AuditCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum TwoFactorAction {
+    /// Rewrite every two-factor secret that is sealed with the older key (`key_file_old`) under the current one
+    /// (`key_file`). To rotate the key: put the new key in `key_file` and the old one in `key_file_old`, run this, then
+    /// remove `key_file_old`. It can be run again, changes nothing when it is done, and refuses (changing nothing) when a
+    /// secret is sealed with a key that is neither. Prints counts, never a secret or a key.
+    Rekey,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum LiveAction {
     /// Empty a user's recents document of an app (one that is full: `quota_exceeded`), or, given a document's ID
     /// instead of an app, that live document of a file. Its log and its snapshot go; every machine then sends its whole
@@ -144,6 +162,13 @@ pub enum UserAction {
         #[arg(long)]
         keep_devices: bool,
     },
+    /// Take away an account's two-factor sign-in, for someone who lost their authenticator and their recovery codes: its
+    /// secret, recovery codes and open sign-in challenges are deleted, the lock after wrong codes goes, **every device of the
+    /// account is signed out** and its open invite and add-a-computer codes are deleted. Prints how many devices were signed
+    /// out. The person signs in with their password again and can set it up anew. A device's live connection ends at its next
+    /// ping (about 30 seconds), since the server runs in another process.
+    #[command(name = "reset-2fa")]
+    Reset2fa { username: String },
     /// Print an invite code for an account, good once for 7 days, to join a computer with in Craft Cloud. Creates the
     /// account (without a password, chosen when the invite is redeemed) if there is none, and replaces its earlier
     /// invite or password reset code.
@@ -242,6 +267,12 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                     writeln!(out, "revoked the invite for {}", username.to_ascii_lowercase())?;
                 }
                 UserAction::Invite { username, revoke: false } => invite(&meta, &config, &username, out).await?,
+                UserAction::Reset2fa { username } => {
+                    let user = user_id(&meta, &username).await?;
+                    let revoked = meta.reset_two_factor(user.id, now_ms()).await?;
+                    tracing::info!(revoked = revoked.len(), "two-factor sign-in reset");
+                    writeln!(out, "two-factor sign-in of {} is off; signed out {} device(s)", user.username, revoked.len())?;
+                }
                 UserAction::Add { username, admin } => {
                     let password = read_password(input)?;
                     let role = if admin { Role::Admin } else { Role::Member };
@@ -306,6 +337,22 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                 let user = user_id(&meta, &username).await?;
                 let epoch = meta.reset_epoch(user.space).await?;
                 writeln!(out, "new epoch {epoch} for {}", user.username)?;
+            }
+            Ok(())
+        }
+        Command::TwoFactor { config, action: TwoFactorAction::Rekey } => {
+            let config = Config::load(&config_path(config)?)?;
+            let (meta, _) = open(&config).await?;
+            let keys = crate::two_factor::load_keys(&config).map_err(|e| CliError::Usage(e.to_string()))?;
+            let crate::two_factor::KeyState::Loaded(secret_box) = keys else {
+                return Err(CliError::Usage(
+                    "there is no key: set [two_factor] key_file (and key_file_old for the key to rotate away from) in the config".into(),
+                ));
+            };
+            let done = crate::two_factor::rekey(&meta, &secret_box, now_ms()).await.map_err(CliError::Usage)?;
+            writeln!(out, "rewrote {} secret(s) under the current key; {} were under it already", done.rewritten, done.already_current)?;
+            if secret_box.old_id().is_some() {
+                writeln!(out, "key_file_old can be removed from the config now")?;
             }
             Ok(())
         }
@@ -442,7 +489,8 @@ async fn init(
     let blobs = without_verbatim_prefix(&dir.join("blobs").display().to_string()).to_owned();
     let trusted: Vec<String> = trusted_proxies.iter().map(|ip| format!("\"{ip}\"")).collect();
     let config_text = format!(
-        "listen = \"{listen}\"\nbehind_proxy = {behind_proxy}\ntrusted_proxies = [{}]\n\n[database]\nurl = {}\n\n[storage]\nkind = \"disk\"\npath = {}\n",
+        "listen = \"{listen}\"\nbehind_proxy = {behind_proxy}\ntrusted_proxies = [{}]\n\n[database]\nurl = {}\n\n[storage]\nkind = \"disk\"\npath = {}\n\n\
+         [two_factor]\nkey_file = \"{KEY_FILE_NAME}\"\n",
         trusted.join(", "),
         toml_string(&format!("sqlite:{db}")),
         toml_string(&blobs),
@@ -457,12 +505,18 @@ async fn init(
         return Err(e);
     }
     writeln!(out, "created {}\nrun: craft-cloud-server serve --config {}", dir.display(), dir.join("config.toml").display())?;
+    writeln!(
+        out,
+        "two-factor key: {}. Keep a copy apart from your database backups: without it the two-factor secrets in a backup can't be opened.",
+        dir.join(KEY_FILE_NAME).display()
+    )?;
     Ok(())
 }
 
 async fn create_files(dir: &Path, config_text: &str, config: &Config, admin: &str, hash: &str) -> Result<(), CliError> {
     create_data_dir(dir)?;
     write_config(&dir.join("config.toml"), config_text)?;
+    write_key_file(&dir.join(KEY_FILE_NAME))?;
     let (meta, _) = open(config).await?;
     meta.create_user(admin, hash, Role::Admin, now_ms()).await?;
     for name in ["meta.db", "meta.db-wal", "meta.db-shm"] {
@@ -528,10 +582,28 @@ fn write_config(path: &Path, text: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+/// The key file `init` makes, next to `config.toml`.
+const KEY_FILE_NAME: &str = "two-factor.key";
+
+/// Writes a new random key for two-factor secrets: 32 bytes, owner-only on Unix, and never over a file that is there.
+fn write_key_file(path: &Path) -> Result<(), CliError> {
+    let key = TwoFactorKey::generate().map_err(|e| CliError::Usage(format!("the system random source failed: {e}")))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(key.to_file_bytes().as_slice())?;
+    Ok(())
+}
+
 /// Removes what a failed `init` made. The directory was empty (or absent) when `init` started, so
 /// everything in it is `init`'s. Best effort: the original error is what the admin needs to see.
 fn remove_made(dir: &Path, created_dir: bool) {
-    for name in ["config.toml", "meta.db", "meta.db-wal", "meta.db-shm"] {
+    for name in ["config.toml", KEY_FILE_NAME, "meta.db", "meta.db-wal", "meta.db-shm"] {
         let _ = std::fs::remove_file(dir.join(name));
     }
     let _ = std::fs::remove_dir_all(dir.join("blobs"));
@@ -586,7 +658,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let dir = parent.path().join("data");
         std::fs::create_dir_all(dir.join("blobs")).unwrap();
-        for name in ["config.toml", "meta.db", "meta.db-wal", "blobs/chunk"] {
+        for name in ["config.toml", "two-factor.key", "meta.db", "meta.db-wal", "blobs/chunk"] {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
         remove_made(&dir, true);

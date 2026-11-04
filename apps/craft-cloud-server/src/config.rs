@@ -19,6 +19,10 @@
 //! kind = "disk"
 //! path = "/var/lib/craft-cloud/blobs"
 //! # kind = "s3", bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http
+//!
+//! [two_factor]                  # optional: without it, two-factor sign-in can't be set up
+//! key_file = "two-factor.key"   # 32 random bytes, made by `init`; relative to this file
+//! # key_file_old = "old.key"    # while rotating the key, see `two-factor rekey`
 //! ```
 //!
 //! The server speaks plain HTTP. It refuses to listen anywhere but loopback unless `behind_proxy = true`,
@@ -100,6 +104,29 @@ pub struct Config {
     pub audit: AuditConfig,
     pub database: DatabaseConfig,
     pub storage: StorageConfig,
+    /// The key for the secrets of two-factor sign-in. Without it two-factor sign-in can't be set up (`503
+    /// two_factor_unavailable`), and a server whose database already holds secrets refuses to start. `init` makes the
+    /// key file and writes this section. The server never makes the key itself: a second server on the same database,
+    /// or a restore without the key, would otherwise seal secrets nobody can open.
+    #[serde(default)]
+    pub two_factor: Option<TwoFactorConfig>,
+    /// The directory the config file is in, which `key_file` paths are relative to. Set by [`Config::load`], never read
+    /// from the file.
+    #[serde(skip)]
+    pub dir: Option<PathBuf>,
+}
+
+/// `[two_factor]`: where the key for two-factor secrets is.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TwoFactorConfig {
+    /// A file of 32 random bytes (mode 0600; Windows has no equivalent here, keep it out of everyone's reach). A relative
+    /// path is relative to the directory of `config.toml`.
+    pub key_file: PathBuf,
+    /// The key the secrets were sealed with before a rotation: new secrets are sealed with `key_file`, old ones still
+    /// open with this one until `two-factor rekey` has rewritten them. Remove it after that.
+    #[serde(default)]
+    pub key_file_old: Option<PathBuf>,
 }
 
 fn default_live_bytes() -> u64 {
@@ -192,7 +219,19 @@ impl std::fmt::Debug for Secret {
 impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read { path: path.to_owned(), source })?;
-        Self::parse(&text)
+        let mut config = Self::parse(&text)?;
+        // A relative path to the config file has a parent too, possibly empty: that is the working directory.
+        config.dir = Some(path.parent().map(Path::to_owned).unwrap_or_default());
+        Ok(config)
+    }
+
+    /// `path` of a `[two_factor]` key file as the server opens it: relative paths are relative to the config file's
+    /// directory (when the config was loaded from a file).
+    pub fn key_path(&self, path: &Path) -> PathBuf {
+        match (&self.dir, path.is_absolute()) {
+            (Some(dir), false) => dir.join(path),
+            _ => path.to_owned(),
+        }
     }
 
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
@@ -377,6 +416,31 @@ path = "/tmp/blobs"
     #[test]
     fn unknown_keys_are_errors() {
         assert!(matches!(Config::parse(&format!("lisen = 1\n{DISK}")), Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn the_two_factor_section_is_optional_and_strict() {
+        assert_eq!(Config::parse(DISK).unwrap().two_factor, None, "a config from before two-factor sign-in still loads");
+        let with = |section: &str| Config::parse(&format!("{DISK}\n[two_factor]\n{section}\n"));
+        let c = with("key_file = \"two-factor.key\"").unwrap();
+        assert_eq!(c.two_factor, Some(TwoFactorConfig { key_file: "two-factor.key".into(), key_file_old: None }));
+        let c = with("key_file = \"new.key\"\nkey_file_old = \"old.key\"").unwrap();
+        assert_eq!(c.two_factor.unwrap().key_file_old, Some("old.key".into()));
+        assert!(matches!(with("key_file = \"k\"\nkey = \"x\""), Err(ConfigError::Parse(_))), "an unknown key in the section");
+        assert!(matches!(with("key_file_old = \"old.key\""), Err(ConfigError::Parse(_))), "key_file is required");
+    }
+
+    #[test]
+    fn key_files_are_relative_to_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, format!("{DISK}\n[two_factor]\nkey_file = \"two-factor.key\"\n")).unwrap();
+        let c = Config::load(&path).unwrap();
+        assert_eq!(c.key_path(Path::new("two-factor.key")), dir.path().join("two-factor.key"));
+        let absolute = dir.path().join("elsewhere.key");
+        assert_eq!(c.key_path(&absolute), absolute);
+        // A config that was parsed from text has no directory: the path stays as it is.
+        assert_eq!(Config::parse(DISK).unwrap().key_path(Path::new("k")), PathBuf::from("k"));
     }
 
     #[test]

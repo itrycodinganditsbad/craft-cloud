@@ -14,7 +14,10 @@ pub mod join;
 pub mod live;
 pub mod notify;
 pub mod ratelimit;
+pub mod secretbox;
 pub mod state;
+pub mod totp;
+pub mod two_factor;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

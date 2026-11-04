@@ -33,6 +33,8 @@ struct Server {
     client: Client,
     /// The server's password-check slots, so a test can keep them busy.
     password_checks: std::sync::Arc<tokio::sync::Semaphore>,
+    /// The server's clock while a test holds it still (milliseconds; 0: the real clock).
+    clock: std::sync::Arc<std::sync::atomic::AtomicI64>,
     shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     _dirs: Vec<tempfile::TempDir>,
     _pg: Option<PgGuard>,
@@ -73,17 +75,24 @@ async fn start(meta: Meta, store: Store, dirs: Vec<tempfile::TempDir>, pg: Optio
 }
 
 async fn start_with(meta: Meta, store: Store, dirs: Vec<tempfile::TempDir>, pg: Option<PgGuard>, limits: Limits) -> Server {
-    let state = AppState::new(meta.clone(), store, vec![]).unwrap().with_limits(limits);
+    let state = AppState::new(meta.clone(), store, vec![]).unwrap().with_limits(limits).with_two_factor(Some(test_box()));
     start_state(state, meta, dirs, pg).await
 }
 
 /// A server that believes `X-Forwarded-For` from `trusted` (SQLite and disk).
 async fn start_trusting(meta: Meta, store: Store, dirs: Vec<tempfile::TempDir>, trusted: Vec<std::net::IpAddr>) -> Server {
-    let state = AppState::new(meta.clone(), store, trusted).unwrap();
+    let state = AppState::new(meta.clone(), store, trusted).unwrap().with_two_factor(Some(test_box()));
     start_state(state, meta, dirs, None).await
 }
 
 async fn start_state(state: AppState, meta: Meta, dirs: Vec<tempfile::TempDir>, pg: Option<PgGuard>) -> Server {
+    // The real clock, unless a test freezes it (see `Server::freeze`).
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let ticking = clock.clone();
+    let state = state.with_clock(std::sync::Arc::new(move || match ticking.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => craft_cloud_server::state::now_ms(),
+        frozen => frozen,
+    }));
     let password_checks = state.password_checks.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/api/v1", listener.local_addr().unwrap());
@@ -91,7 +100,7 @@ async fn start_state(state: AppState, meta: Meta, dirs: Vec<tempfile::TempDir>, 
     tokio::spawn(craft_cloud_server::serve(state, listener, async move {
         let _ = rx.await;
     }));
-    Server { base, meta, client: Client::new(), password_checks, shutdown: std::sync::Mutex::new(Some(tx)), _dirs: dirs, _pg: pg }
+    Server { base, meta, client: Client::new(), password_checks, clock, shutdown: std::sync::Mutex::new(Some(tx)), _dirs: dirs, _pg: pg }
 }
 
 async fn sqlite_disk() -> Server {
@@ -1492,6 +1501,19 @@ on_sqlite_and_postgres!(
     the_server_overview_shows_counters_only,
     an_admin_lists_and_revokes_a_users_devices_over_http,
     an_admin_sets_quotas_that_hold_before_any_byte_is_stored,
+    two_factor_is_set_up_confirmed_and_turned_off,
+    a_set_up_on_one_device_is_pending_for_the_others,
+    the_two_factor_routes_refuse_a_signed_out_device_and_big_or_odd_bodies,
+    a_sign_in_with_two_factor_needs_the_second_step,
+    a_challenge_expires_takes_five_tries_and_dies_with_a_password_change,
+    wrong_codes_lock_the_second_factor_for_a_while,
+    wrong_second_steps_are_counted_and_limited,
+    joining_an_account_with_two_factor_needs_the_factor,
+    wrong_second_factors_at_join_count_against_the_address_and_the_account,
+    a_reset_code_for_a_protected_account,
+    turning_two_factor_on_ends_live_connections_and_long_polls,
+    an_admin_with_two_factor_confirms_changes_with_a_code,
+    an_admin_resets_the_two_factor_of_an_account,
 );
 
 async fn devices_of(s: &Server, token: &str) -> Vec<DeviceInfo> {
@@ -1982,12 +2004,14 @@ async fn every_admin_route_needs_an_admin(s: &Server) {
         (M::POST, format!("/admin/users/{pending}/invite"), Some(json!({})), StatusCode::OK),
         (M::DELETE, format!("/admin/users/{pending}/invite"), Some(json!({})), StatusCode::NO_CONTENT),
         (M::POST, format!("/admin/users/{ana}/password-reset"), Some(json!({})), StatusCode::OK),
+        // Ana has no two-factor sign-in: an admin gets through to the change, which has nothing to reset.
+        (M::POST, format!("/admin/users/{ana}/reset-two-factor"), Some(json!({})), StatusCode::CONFLICT),
         (M::GET, format!("/admin/users/{ana}/devices"), None, StatusCode::OK),
         (M::DELETE, format!("/admin/users/{bob}/devices/{spare_id}"), Some(json!({})), StatusCode::NO_CONTENT),
         (M::DELETE, format!("/admin/users/{carl}"), Some(json!({})), StatusCode::ACCEPTED),
     ];
-    // Every `.route(` of the admin module is in the table (nine paths): a route added without a row fails here.
-    assert_eq!(include_str!("../src/admin.rs").matches(".route(\"/admin/").count(), 9);
+    // Every `.route(` of the admin module is in the table (ten paths): a route added without a row fails here.
+    assert_eq!(include_str!("../src/admin.rs").matches(".route(\"/admin/").count(), 10);
     let distinct: std::collections::BTreeSet<_> = routes
         .iter()
         .map(|(_, p, _, _)| {
@@ -1998,7 +2022,7 @@ async fn every_admin_route_needs_an_admin(s: &Server) {
                 .replace(&spare_id.to_string(), "{device_id}")
         })
         .collect();
-    assert_eq!(distinct.len(), 9, "{distinct:?}");
+    assert_eq!(distinct.len(), 10, "{distinct:?}");
 
     for (method, path, body, ok) in routes {
         let counts = s.meta.admin_server_counts().await.unwrap();
@@ -2615,4 +2639,793 @@ async fn admin_invites_carry_the_join_link_when_the_server_knows_its_address() {
     assert!(link.starts_with("https://cloud.example.org/join/"), "{link}");
     // The code in the link is the one that works.
     joined(join(&s, &made.invite.code, "pc", Some("a password of mine")).await).await;
+}
+
+// ---- two-factor sign-in ----
+
+use craft_cloud_proto::api::{AdminCode, RecoveryCodes, TwoFactorSetupResponse, TwoFactorStatus};
+use craft_cloud_server::secretbox::{SecretBox, TwoFactorKey};
+use craft_cloud_server::totp;
+
+fn test_box() -> SecretBox {
+    SecretBox::new(&TwoFactorKey::from_bytes([42; 32]), None).unwrap()
+}
+
+impl Server {
+    /// The server's time of day now, in milliseconds.
+    fn at(&self) -> i64 {
+        match self.clock.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => craft_cloud_server::state::now_ms(),
+            frozen => frozen,
+        }
+    }
+
+    /// Stops the server's clock at the start of the current TOTP step (plus a second), so that codes don't change under a test.
+    fn freeze(&self) {
+        if self.clock.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            let step = totp::step_at(craft_cloud_server::state::now_ms());
+            self.clock.store(step * 30_000 + 1_000, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Moves the frozen clock on.
+    fn advance(&self, ms: i64) {
+        let now = self.at();
+        self.clock.store(now + ms, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A different six digits from `code`.
+fn wrong_code(code: &str) -> String {
+    format!("{:06}", (code.parse::<u32>().unwrap() + 1) % 1_000_000)
+}
+
+/// An account with two-factor sign-in on: the token of the device that turned it on, its secret and recovery codes.
+struct Tf {
+    token: String,
+    secret: Vec<u8>,
+    recovery: Vec<String>,
+}
+
+impl Tf {
+    /// The code for the server's current time step.
+    fn code(&self, s: &Server) -> String {
+        totp::code_for(&self.secret, totp::step_at(s.at())).unwrap()
+    }
+
+    /// The server's clock moves one step on, and the code for that step: never one that was used.
+    fn fresh_code(&self, s: &Server) -> String {
+        s.advance(30_000);
+        self.code(s)
+    }
+}
+
+async fn post_json(s: &Server, token: &str, path: &str, body: serde_json::Value) -> reqwest::Response {
+    call(s, Some(token), reqwest::Method::POST, path, Some(body)).await
+}
+
+/// Makes `name` (an admin if `admin`) and turns two-factor sign-in on from one device, with the clock frozen: the first
+/// code is the step the clock is in. Every device but the one that did it is signed out.
+async fn turn_on_two_factor(s: &Server, name: &str, admin: bool) -> Tf {
+    s.freeze();
+    if admin {
+        add_admin(s, name).await;
+    } else {
+        add_user(s, name).await;
+    }
+    let token = login(s, name).await;
+    let setup: TwoFactorSetupResponse = get_json(post_json(s, &token, "/account/two-factor/setup", json!({ "password": PASSWORD })).await).await;
+    let secret = totp::base32_decode(&setup.secret).unwrap();
+    let tf = Tf { token, secret, recovery: Vec::new() };
+    let res = post_json(s, &tf.token, "/account/two-factor/confirm", json!({ "totp_code": tf.code(s) })).await;
+    let codes: RecoveryCodes = get_json(res).await;
+    Tf { recovery: codes.recovery_codes, ..tf }
+}
+
+/// `POST /auth/login` for `name` with the right password, answered `two_factor_required`: the challenge.
+async fn login_challenge(s: &Server, name: &str) -> craft_cloud_proto::api::TwoFactorChallenge {
+    let (status, body) = error(login_with(s, name, PASSWORD).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "two_factor_required"), "{}", body.message);
+    body.two_factor.expect("a challenge")
+}
+
+async fn second_step(s: &Server, challenge: &str, proof: serde_json::Value) -> reqwest::Response {
+    let mut body = json!({ "challenge": challenge });
+    if let (Some(extra), Some(object)) = (proof.as_object(), body.as_object_mut()) {
+        object.extend(extra.clone());
+    }
+    call(s, None, reqwest::Method::POST, "/auth/login/second-factor", Some(body)).await
+}
+
+async fn retry_after(res: &reqwest::Response) -> Option<String> {
+    res.headers().get("retry-after").and_then(|v| v.to_str().ok()).map(str::to_owned)
+}
+
+async fn status_of(s: &Server, token: &str) -> TwoFactorStatus {
+    get_json(call(s, Some(token), reqwest::Method::GET, "/account/two-factor", None).await).await
+}
+
+async fn two_factor_is_set_up_confirmed_and_turned_off(s: &Server) {
+    s.freeze();
+    add_user(s, "ana").await;
+    let (pc, laptop) = (login(s, "ana").await, login(s, "ana").await);
+    assert_eq!(status_of(s, &pc).await, TwoFactorStatus { enabled: false, enabled_ms: None, recovery_codes_left: 0, pending: false });
+    let account: serde_json::Value = get_json(call(s, Some(&pc), reqwest::Method::GET, "/account", None).await).await;
+    assert_eq!(account["two_factor_enabled"], json!(false));
+
+    // The password is asked again, and a wrong one is 403, never 401.
+    let (status, body) = error(post_json(s, &pc, "/account/two-factor/setup", json!({ "password": "wrong password!" })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "wrong_password"));
+    let first: TwoFactorSetupResponse = get_json(post_json(s, &pc, "/account/two-factor/setup", json!({ "password": PASSWORD })).await).await;
+    assert_eq!(first.expires_ms, s.at() + 10 * 60_000);
+    assert_eq!(first.secret.len(), 32);
+    assert_eq!(totp::base32_decode(&first.secret).map(|s| s.len()), Some(20));
+    assert_eq!(
+        first.otpauth_uri,
+        format!("otpauth://totp/Craft%20Cloud:ana?secret={}&issuer=Craft%20Cloud&algorithm=SHA1&digits=6&period=30", first.secret)
+    );
+    let status = status_of(s, &pc).await;
+    assert_eq!((status.enabled, status.pending), (false, true));
+    // The same device may start again; that replaces the secret.
+    let second: TwoFactorSetupResponse = get_json(post_json(s, &pc, "/account/two-factor/setup", json!({ "password": PASSWORD })).await).await;
+    assert_ne!(first.secret, second.secret);
+    let secret = totp::base32_decode(&second.secret).unwrap();
+    let right = totp::code_for(&secret, totp::step_at(s.at())).unwrap();
+
+    // A code that isn't six digits is 400 (nothing counted), a wrong one 403.
+    for bad in ["12345", "1234567", "12345a", ""] {
+        let (status, body) = error(post_json(s, &pc, "/account/two-factor/confirm", json!({ "totp_code": bad })).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "{bad:?}");
+    }
+    let (status, body) = error(post_json(s, &pc, "/account/two-factor/confirm", json!({ "totp_code": wrong_code(&right) })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "two_factor_invalid"));
+    assert_eq!(post_json(s, &pc, "/account/two-factor/confirm", json!({})).await.status(), StatusCode::BAD_REQUEST);
+
+    let codes: RecoveryCodes = get_json(post_json(s, &pc, "/account/two-factor/confirm", json!({ "totp_code": right })).await).await;
+    assert_eq!(codes.recovery_codes.len(), 10);
+    let unique: std::collections::BTreeSet<_> = codes.recovery_codes.iter().collect();
+    assert_eq!(unique.len(), 10);
+    for code in &codes.recovery_codes {
+        assert_eq!(code.len(), 19, "{code}: four groups of four");
+        assert!(code.split('-').all(|g| g.len() == 4 && g.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())), "{code}");
+    }
+    // The other device is signed out, with the reason; this one stays.
+    assert!(!accepted(s, &laptop).await);
+    let devices = devices_of(s, &pc).await;
+    let out = devices.iter().find(|d| d.revoked).unwrap();
+    assert_eq!(out.revoke_reason.as_deref(), Some("two_factor"));
+    assert!(devices.iter().find(|d| d.current).is_some_and(|d| !d.revoked));
+    let status = status_of(s, &pc).await;
+    assert_eq!((status.enabled, status.enabled_ms.is_some(), status.recovery_codes_left, status.pending), (true, true, 10, false));
+    let account: serde_json::Value = get_json(call(s, Some(&pc), reqwest::Method::GET, "/account", None).await).await;
+    assert_eq!(account["two_factor_enabled"], json!(true));
+    // On already: a new set-up and another confirmation are conflicts.
+    let (status, body) = error(post_json(s, &pc, "/account/two-factor/setup", json!({ "password": PASSWORD })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::CONFLICT, "conflict"));
+    let (status, body) = error(
+        post_json(s, &pc, "/account/two-factor/confirm", json!({ "totp_code": totp::code_for(&secret, totp::step_at(s.at()) + 1).unwrap() })).await,
+    )
+    .await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::CONFLICT, "conflict"));
+
+    // New recovery codes: the password and a code from the app (a step after the one that was used); the old ones die.
+    let next = |offset: i64| totp::code_for(&secret, totp::step_at(s.at()) + offset).unwrap();
+    let (status, body) =
+        error(post_json(s, &pc, "/account/two-factor/recovery-codes", json!({ "password": "wrong password!", "totp_code": next(1) })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "wrong_password"));
+    let (status, body) = error(post_json(s, &pc, "/account/two-factor/recovery-codes", json!({ "password": PASSWORD })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+    let body = json!({ "password": PASSWORD, "recovery_code": codes.recovery_codes[0] });
+    assert_eq!(post_json(s, &pc, "/account/two-factor/recovery-codes", body).await.status(), StatusCode::BAD_REQUEST, "a code from the app");
+    let (status, body) =
+        error(post_json(s, &pc, "/account/two-factor/recovery-codes", json!({ "password": PASSWORD, "totp_code": wrong_code(&next(1)) })).await)
+            .await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "two_factor_invalid"));
+    let (status, body) =
+        error(post_json(s, &pc, "/account/two-factor/recovery-codes", json!({ "password": PASSWORD, "totp_code": next(0) })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "two_factor_invalid"), "the step that turned it on is used");
+    let fresh: RecoveryCodes =
+        get_json(post_json(s, &pc, "/account/two-factor/recovery-codes", json!({ "password": PASSWORD, "totp_code": next(1) })).await).await;
+    assert_eq!(fresh.recovery_codes.len(), 10);
+    assert!(fresh.recovery_codes.iter().all(|c| !codes.recovery_codes.contains(c)));
+    assert_eq!(status_of(s, &pc).await.recovery_codes_left, 10);
+
+    // Off: the password and a code or a recovery code; the old recovery codes are dead.
+    let (status, body) = error(
+        post_json(s, &pc, "/account/two-factor/disable", json!({ "password": "wrong password!", "recovery_code": fresh.recovery_codes[0] })).await,
+    )
+    .await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "wrong_password"));
+    let (status, body) =
+        error(post_json(s, &pc, "/account/two-factor/disable", json!({ "password": PASSWORD, "recovery_code": codes.recovery_codes[0] })).await)
+            .await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "two_factor_invalid"), "a code of the first set");
+    let (status, body) = error(post_json(s, &pc, "/account/two-factor/disable", json!({ "password": PASSWORD })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+    let (status, body) =
+        error(post_json(s, &pc, "/account/two-factor/disable", json!({ "password": PASSWORD, "recovery_code": "nonsense" })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+    let pc2 = {
+        // A second device, signed in before the turn-off through a code of its own: it is signed out by it.
+        let challenge = login_challenge(s, "ana").await;
+        let res = second_step(s, &challenge.challenge, json!({ "recovery_code": fresh.recovery_codes[1].to_lowercase().replace('-', "") })).await;
+        res.json::<LoginResponse>().await.unwrap().token
+    };
+    assert!(accepted(s, &pc2).await);
+    let res = post_json(s, &pc, "/account/two-factor/disable", json!({ "password": PASSWORD, "recovery_code": fresh.recovery_codes[0] })).await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert!(!accepted(s, &pc2).await, "the other device is signed out");
+    assert_eq!(status_of(s, &pc).await, TwoFactorStatus { enabled: false, enabled_ms: None, recovery_codes_left: 0, pending: false });
+    // Off again: a password sign-in gives a token at once.
+    login(s, "ana").await;
+    let (status, body) = error(post_json(s, &pc, "/account/two-factor/disable", json!({ "password": PASSWORD, "totp_code": next(2) })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::CONFLICT, "conflict"));
+}
+
+async fn a_set_up_on_one_device_is_pending_for_the_others(s: &Server) {
+    s.freeze();
+    add_user(s, "ana").await;
+    let (pc, laptop) = (login(s, "ana").await, login(s, "ana").await);
+    let setup: TwoFactorSetupResponse = get_json(post_json(s, &pc, "/account/two-factor/setup", json!({ "password": PASSWORD })).await).await;
+    let secret = totp::base32_decode(&setup.secret).unwrap();
+    let right = totp::code_for(&secret, totp::step_at(s.at())).unwrap();
+    // The laptop may neither start another set-up nor confirm this one, and its code is not tried (no wrong try is used up).
+    let (status, body) = error(post_json(s, &laptop, "/account/two-factor/setup", json!({ "password": PASSWORD })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::CONFLICT, "two_factor_pending"));
+    for _ in 0..7 {
+        let (status, body) = error(post_json(s, &laptop, "/account/two-factor/confirm", json!({ "totp_code": right })).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::CONFLICT, "conflict"));
+    }
+    assert!(status_of(s, &laptop).await.pending);
+    // Five wrong codes from the device that started it use the set-up up.
+    for _ in 0..5 {
+        let (status, body) = error(post_json(s, &pc, "/account/two-factor/confirm", json!({ "totp_code": wrong_code(&right) })).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "two_factor_invalid"));
+    }
+    assert!(!status_of(s, &pc).await.pending);
+    let (status, body) = error(post_json(s, &pc, "/account/two-factor/confirm", json!({ "totp_code": right })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::CONFLICT, "conflict"), "start again");
+    // After ten minutes an open set-up is not in the way of another device.
+    post_json(s, &pc, "/account/two-factor/setup", json!({ "password": PASSWORD })).await;
+    s.advance(10 * 60_000 + 1);
+    assert!(!status_of(s, &pc).await.pending);
+    let again: TwoFactorSetupResponse = get_json(post_json(s, &laptop, "/account/two-factor/setup", json!({ "password": PASSWORD })).await).await;
+    let secret = totp::base32_decode(&again.secret).unwrap();
+    let code = totp::code_for(&secret, totp::step_at(s.at())).unwrap();
+    assert_eq!(post_json(s, &laptop, "/account/two-factor/confirm", json!({ "totp_code": code })).await.status(), StatusCode::OK);
+    assert!(!accepted(s, &pc).await);
+}
+
+async fn the_two_factor_routes_refuse_a_signed_out_device_and_big_or_odd_bodies(s: &Server) {
+    let ana = turn_on_two_factor(s, "ana", false).await;
+    let other = {
+        let challenge = login_challenge(s, "ana").await;
+        let res = second_step(s, &challenge.challenge, json!({ "totp_code": ana.fresh_code(s) })).await;
+        res.json::<LoginResponse>().await.unwrap().token
+    };
+    let id = current_device(s, &other).await;
+    assert_eq!(s.client.delete(format!("{}/devices/{id}", s.base)).bearer_auth(&ana.token).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    // A device that was signed out is 401 on each of them, as on every route; nothing else is.
+    for (path, body) in [
+        ("/account/two-factor/setup", json!({ "password": PASSWORD })),
+        ("/account/two-factor/confirm", json!({ "totp_code": "123456" })),
+        ("/account/two-factor/disable", json!({ "password": PASSWORD, "totp_code": "123456" })),
+        ("/account/two-factor/recovery-codes", json!({ "password": PASSWORD, "totp_code": "123456" })),
+    ] {
+        let (status, body) = error(post_json(s, &other, path, body).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "unauthorized"), "{path}");
+        assert_eq!(post_json(s, "x", path, json!({})).await.status(), StatusCode::UNAUTHORIZED, "{path}: no token");
+        // Bodies are tiny: over 4 KiB is refused before it is read.
+        let big = json!({ "password": "x".repeat(5000), "totp_code": "123456" });
+        let (status, body) = error(post_json(s, &ana.token, path, big).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::PAYLOAD_TOO_LARGE, "too_large"), "{path}");
+        // Not JSON, or the wrong shape, is 400 `invalid`.
+        let res = s.client.post(format!("{}{path}", s.base)).bearer_auth(&ana.token).body("not json").send().await.unwrap();
+        let (status, body) = error(res).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "{path}");
+        let (status, body) = error(post_json(s, &ana.token, path, json!({ "password": 7 })).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "{path}");
+    }
+    let big = json!({ "challenge": "x".repeat(5000), "totp_code": "123456" });
+    let (status, _) = error(call(s, None, reqwest::Method::POST, "/auth/login/second-factor", Some(big)).await).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    // A long password is refused without a check (400), not as a wrong one.
+    let (status, body) =
+        error(post_json(s, &ana.token, "/account/two-factor/disable", json!({ "password": "x".repeat(2000), "totp_code": "123456" })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+}
+
+async fn a_sign_in_with_two_factor_needs_the_second_step(s: &Server) {
+    let ana = turn_on_two_factor(s, "ana", false).await;
+    // A wrong password and an unknown user: `unauthorized`, with nothing said about two-factor sign-in.
+    for (name, password) in [("ana", "wrong password!"), ("nobody", PASSWORD)] {
+        let (status, body) = error(login_with(s, name, password).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "unauthorized"));
+        assert!(body.two_factor.is_none());
+    }
+    // The right password: a challenge, 401, no token, no device.
+    let devices = devices_of(s, &ana.token).await.len();
+    let res = call(
+        s,
+        None,
+        reqwest::Method::POST,
+        "/auth/login",
+        Some(json!({ "username": "ana", "password": PASSWORD, "device_name": "work laptop", "client_kind": "desktop", "platform": "windows", "app_version": "1.0" })),
+    )
+    .await;
+    let (status, body) = error(res).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "two_factor_required"));
+    let challenge = body.two_factor.unwrap();
+    assert_eq!(challenge.challenge.len(), 43);
+    assert_eq!(challenge.expires_ms, s.at() + 5 * 60_000);
+    assert_eq!(devices_of(s, &ana.token).await.len(), devices, "no device without the second factor");
+
+    // Not a code, both, neither, a made-up challenge: nothing is spent.
+    let right = ana.fresh_code(s);
+    for (proof, expected) in [
+        (json!({ "totp_code": "12345" }), (StatusCode::BAD_REQUEST, "invalid")),
+        (json!({ "totp_code": right, "recovery_code": ana.recovery[0] }), (StatusCode::BAD_REQUEST, "invalid")),
+        (json!({}), (StatusCode::BAD_REQUEST, "invalid")),
+        (json!({ "recovery_code": "zzz" }), (StatusCode::BAD_REQUEST, "invalid")),
+        (json!({ "totp_code": wrong_code(&right) }), (StatusCode::UNAUTHORIZED, "two_factor_invalid")),
+    ] {
+        let (status, body) = error(second_step(s, &challenge.challenge, proof.clone()).await).await;
+        assert_eq!((status, body.error.as_str()), expected, "{proof}");
+    }
+    let (status, body) = error(second_step(s, &"A".repeat(43), json!({ "totp_code": right })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "unauthorized"));
+    let (status, body) = error(second_step(s, "short", json!({ "totp_code": right })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "unauthorized"));
+
+    // The right code: a device, as a sign-in makes one, with what the first call said.
+    let res = second_step(s, &challenge.challenge, json!({ "totp_code": right })).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let token = res.json::<LoginResponse>().await.unwrap().token;
+    assert!(accepted(s, &token).await);
+    let made = devices_of(s, &token).await.into_iter().find(|d| d.current).unwrap();
+    assert_eq!(
+        (made.name.as_str(), made.client_kind.as_str(), made.platform.as_str(), made.app_version.as_str()),
+        ("work laptop", "desktop", "windows", "1.0")
+    );
+    // Once: the challenge is used up.
+    let (status, body) = error(second_step(s, &challenge.challenge, json!({ "totp_code": ana.fresh_code(s) })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "unauthorized"));
+    // And the code is: on a new challenge it is `two_factor_invalid`, in the step after it works.
+    let again = login_challenge(s, "ana").await;
+    let (status, body) = error(second_step(s, &again.challenge, json!({ "totp_code": right })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "two_factor_invalid"));
+    assert_eq!(second_step(s, &again.challenge, json!({ "totp_code": ana.fresh_code(s) })).await.status(), StatusCode::OK);
+    // A recovery code, in any case and with or without dashes, once.
+    let third = login_challenge(s, "ana").await;
+    let typed = ana.recovery[0].to_lowercase().replace('-', " ");
+    assert_eq!(second_step(s, &third.challenge, json!({ "recovery_code": typed })).await.status(), StatusCode::OK);
+    let fourth = login_challenge(s, "ana").await;
+    let (status, body) = error(second_step(s, &fourth.challenge, json!({ "recovery_code": ana.recovery[0] })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "two_factor_invalid"), "a recovery code works once");
+    assert_eq!(status_of(s, &ana.token).await.recovery_codes_left, 9);
+}
+
+async fn a_challenge_expires_takes_five_tries_and_dies_with_a_password_change(s: &Server) {
+    let ana = turn_on_two_factor(s, "ana", false).await;
+    // Five minutes.
+    let challenge = login_challenge(s, "ana").await;
+    s.advance(5 * 60_000 + 1);
+    let (status, body) = error(second_step(s, &challenge.challenge, json!({ "totp_code": ana.code(s) })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "unauthorized"));
+    // Five wrong codes delete it; the right one is then too late.
+    let challenge = login_challenge(s, "ana").await;
+    let right = ana.fresh_code(s);
+    for n in 1..=5 {
+        let (status, body) = error(second_step(s, &challenge.challenge, json!({ "totp_code": wrong_code(&right) })).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "two_factor_invalid"), "try {n}");
+    }
+    let (status, body) = error(second_step(s, &challenge.challenge, json!({ "totp_code": right })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "unauthorized"));
+    // A challenge made before a password change gives no token afterwards (the change deletes it).
+    let challenge = login_challenge(s, "ana").await;
+    assert_eq!(change_password(s, &ana.token, PASSWORD, "a brand new password").await.status(), StatusCode::NO_CONTENT);
+    let (status, body) = error(second_step(s, &challenge.challenge, json!({ "totp_code": ana.fresh_code(s) })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "unauthorized"));
+    assert_eq!(devices_of(s, &ana.token).await.iter().filter(|d| !d.revoked).count(), 1, "no device was made");
+}
+
+async fn wrong_codes_lock_the_second_factor_for_a_while(s: &Server) {
+    let ana = turn_on_two_factor(s, "ana", false).await;
+    let right = ana.fresh_code(s);
+    // Ten wrong codes on a route that takes the password and a code (the right password is not counted against the account).
+    for n in 1..=10 {
+        let (status, body) =
+            error(post_json(s, &ana.token, "/account/two-factor/disable", json!({ "password": PASSWORD, "totp_code": wrong_code(&right) })).await)
+                .await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "two_factor_invalid"), "wrong code {n}");
+    }
+    // Locked: 429 with Retry-After, on every path that checks a second factor, for the right code too.
+    let res = post_json(s, &ana.token, "/account/two-factor/disable", json!({ "password": PASSWORD, "totp_code": right })).await;
+    assert_eq!(retry_after(&res).await.as_deref(), Some("900"));
+    let (status, body) = error(res).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::TOO_MANY_REQUESTS, "two_factor_locked"));
+    let res = post_json(s, &ana.token, "/account/two-factor/recovery-codes", json!({ "password": PASSWORD, "totp_code": right })).await;
+    assert_eq!((res.status(), retry_after(&res).await.as_deref()), (StatusCode::TOO_MANY_REQUESTS, Some("900")));
+    let challenge = login_challenge(s, "ana").await;
+    let res = second_step(s, &challenge.challenge, json!({ "recovery_code": ana.recovery[0] })).await;
+    assert_eq!((res.status(), retry_after(&res).await.as_deref()), (StatusCode::TOO_MANY_REQUESTS, Some("900")));
+    assert_eq!(error(second_step(s, &challenge.challenge, json!({ "totp_code": right })).await).await.1.error, "two_factor_locked");
+    // The lock runs down with time (and counts down in what it says), and the next right code works and resets it.
+    s.advance(60_000);
+    let res = post_json(s, &ana.token, "/account/two-factor/disable", json!({ "password": PASSWORD, "totp_code": right })).await;
+    assert_eq!(retry_after(&res).await.as_deref(), Some("840"));
+    s.advance(14 * 60_000);
+    let challenge = login_challenge(s, "ana").await;
+    let res = second_step(s, &challenge.challenge, json!({ "totp_code": ana.code(s) })).await;
+    assert_eq!(res.status(), StatusCode::OK, "{:?}", res.text().await);
+    // The success reset the counters: one wrong code now is only one.
+    let right = ana.fresh_code(s);
+    let (status, _) =
+        error(post_json(s, &ana.token, "/account/two-factor/disable", json!({ "password": PASSWORD, "totp_code": wrong_code(&right) })).await).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a success reset the counters: one wrong code is only one");
+}
+
+/// Ten wrong codes at the second step (in two challenges, as one takes five) lock the account; and a wrong code is also
+/// counted against the address, which holds off at 30 however many accounts they are spread over.
+async fn wrong_second_steps_are_counted_and_limited(s: &Server) {
+    // Everything that signs in comes first: wrong codes count against the sign-in limiter as well.
+    let ana = turn_on_two_factor(s, "ana", false).await;
+    let ana_challenges = [login_challenge(s, "ana").await, login_challenge(s, "ana").await, login_challenge(s, "ana").await];
+    let mut bobs = Vec::new();
+    for n in 0..4 {
+        let name = format!("bob{n}");
+        let bob = turn_on_two_factor(s, &name, false).await;
+        let challenges = [login_challenge(s, &name).await, login_challenge(s, &name).await];
+        bobs.push((bob, challenges));
+    }
+    let right = ana.fresh_code(s);
+    for challenge in &ana_challenges[..2] {
+        for _ in 0..5 {
+            let (status, body) = error(second_step(s, &challenge.challenge, json!({ "totp_code": wrong_code(&right) })).await).await;
+            assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "two_factor_invalid"));
+        }
+    }
+    // Ten wrong ones filled the account's window and locked it: said as a lock, with the time.
+    let res = second_step(s, &ana_challenges[2].challenge, json!({ "totp_code": right })).await;
+    assert_eq!((res.status(), retry_after(&res).await.as_deref()), (StatusCode::TOO_MANY_REQUESTS, Some("900")));
+    assert_eq!(error(res).await.1.error, "two_factor_locked");
+
+    // Four more accounts, 8 wrong codes each: the address has counted 10, then 8 and 8, and the 21st of these is the 31st.
+    let mut answers = Vec::new();
+    for (bob, challenges) in &bobs {
+        let right = bob.fresh_code(s);
+        for i in 0..8 {
+            let challenge = &challenges[usize::from(i >= 5)];
+            let (status, body) = error(second_step(s, &challenge.challenge, json!({ "totp_code": wrong_code(&right) })).await).await;
+            answers.push((answers.len() + 1, status, body.error));
+        }
+    }
+    let first_limited = answers.iter().find(|(_, _, e)| e == "rate_limited").map(|(n, ..)| *n);
+    assert_eq!(first_limited, Some(21), "{answers:?}");
+    assert!(answers.iter().take(20).all(|(_, status, e)| *status == StatusCode::UNAUTHORIZED && e == "two_factor_invalid"), "{answers:?}");
+    assert!(answers.iter().skip(20).all(|(_, status, e)| *status == StatusCode::TOO_MANY_REQUESTS && e == "rate_limited"), "{answers:?}");
+}
+
+async fn joining_an_account_with_two_factor_needs_the_factor(s: &Server) {
+    let ana = turn_on_two_factor(s, "ana", false).await;
+    let invite = Code::generate(INVITE_CHARS).unwrap();
+    s.meta.create_invite("ana", &invite.hash(), s.at(), INVITE_TTL_MS).await.unwrap();
+    let join_with = |extra: serde_json::Value| {
+        let mut body = json!({ "code": invite.as_str(), "device_name": "new pc" });
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        call(s, None, reqwest::Method::POST, "/join", Some(body))
+    };
+    // No second factor: `two_factor_required`, no challenge row (the field is empty), and the invite is not used up.
+    let (status, body) = error(join_with(json!({})).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "two_factor_required"));
+    assert_eq!(body.two_factor.map(|t| t.challenge), Some(String::new()));
+    // Malformed ones are 400 and cost nothing.
+    assert_eq!(join_with(json!({ "totp_code": "12" })).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(join_with(json!({ "totp_code": "123456", "recovery_code": ana.recovery[0] })).await.status(), StatusCode::BAD_REQUEST);
+    // A wrong code is `two_factor_invalid`, 401, and the invite stays.
+    let right = ana.fresh_code(s);
+    let (status, body) = error(join_with(json!({ "totp_code": wrong_code(&right) })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "two_factor_invalid"));
+    let (status, body) = error(join_with(json!({ "recovery_code": "0000-0000-0000-0000" })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "two_factor_invalid"));
+    assert_eq!(s.meta.invite_needs_password(&invite.hash(), s.at()).await.unwrap(), Some(false), "the invite is still there");
+    // The right code: a device, and the invite is used up with it.
+    let device = joined(join_with(json!({ "totp_code": right })).await).await;
+    assert!(accepted(s, &device.token).await);
+    let (status, body) = error(join_with(json!({ "totp_code": ana.fresh_code(s) })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "invalid_code"));
+    // A recovery code does it too.
+    let invite2 = Code::generate(INVITE_CHARS).unwrap();
+    s.meta.create_invite("ana", &invite2.hash(), s.at(), INVITE_TTL_MS).await.unwrap();
+    let body = json!({ "code": invite2.as_str(), "device_name": "second", "recovery_code": ana.recovery[3].to_lowercase() });
+    assert_eq!(call(s, None, reqwest::Method::POST, "/join", Some(body)).await.status(), StatusCode::OK);
+    // A pairing code needs none: it comes from a device that is signed in.
+    let pairing = new_pairing(s, &ana.token).await;
+    joined(join(s, &pairing.code, "paired", None).await).await;
+}
+
+/// A wrong second factor at `/join` is not given back to the address's tries, and counts against the account.
+async fn wrong_second_factors_at_join_count_against_the_address_and_the_account(s: &Server) {
+    let ana = turn_on_two_factor(s, "ana", false).await;
+    let invite = Code::generate(INVITE_CHARS).unwrap();
+    s.meta.create_invite("ana", &invite.hash(), s.at(), INVITE_TTL_MS).await.unwrap();
+    let right = ana.fresh_code(s);
+    let join_with = |code: String| {
+        let body = json!({ "code": invite.as_str(), "device_name": "pc", "totp_code": code });
+        call(s, None, reqwest::Method::POST, "/join", Some(body))
+    };
+    // Ten wrong codes in a row: the tenth locks the account's second factor, whatever route they came by.
+    for n in 1..=10 {
+        let (status, body) = error(join_with(wrong_code(&right)).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "two_factor_invalid"), "wrong code {n}");
+    }
+    // They were counted against the address: it is held off now, even for the right code (a code that was given back
+    // would be answered `two_factor_locked` instead, as the account is locked, see below).
+    let res = join_with(right.clone()).await;
+    assert_eq!(retry_after(&res).await, None);
+    let (status, body) = error(res).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+    // And against the account: the lock holds on the route that takes the password and a code, with the time left.
+    let res = post_json(s, &ana.token, "/account/two-factor/disable", json!({ "password": PASSWORD, "totp_code": right })).await;
+    assert_eq!((res.status(), retry_after(&res).await.as_deref()), (StatusCode::TOO_MANY_REQUESTS, Some("900")));
+    assert_eq!(error(res).await.1.error, "two_factor_locked");
+    assert_eq!(s.meta.invite_needs_password(&invite.hash(), s.at()).await.unwrap(), Some(false), "the invite survived all of it");
+}
+
+async fn a_reset_code_for_a_protected_account(s: &Server) {
+    let ana = turn_on_two_factor(s, "ana", false).await;
+    add_admin(s, "root").await;
+    let root = login(s, "root").await;
+    let ana_id = id_of(s, "ana").await;
+    // Without `reset_two_factor` the account's second factor is needed to redeem the code.
+    let reset: AdminCode =
+        get_json(admin_call(s, &root, reqwest::Method::POST, &format!("/admin/users/{ana_id}/password-reset"), json!({})).await).await;
+    let body = json!({ "code": reset.code, "device_name": "recovery", "password": "a brand new password" });
+    let (status, answer) = error(call(s, None, reqwest::Method::POST, "/join", Some(body.clone())).await).await;
+    assert_eq!((status, answer.error.as_str()), (StatusCode::UNAUTHORIZED, "two_factor_required"));
+    login_challenge(s, "ana").await; // the old password still stands: nothing changed
+    let mut with_code = body.clone();
+    with_code["totp_code"] = json!(wrong_code(&ana.fresh_code(s)));
+    let (status, answer) = error(call(s, None, reqwest::Method::POST, "/join", Some(with_code)).await).await;
+    assert_eq!((status, answer.error.as_str()), (StatusCode::UNAUTHORIZED, "two_factor_invalid"));
+    let mut with_code = body.clone();
+    with_code["totp_code"] = json!(ana.fresh_code(s));
+    let first = joined(call(s, None, reqwest::Method::POST, "/join", Some(with_code)).await).await;
+    assert!(!accepted(s, &ana.token).await, "every device was signed out");
+    assert!(accepted(s, &first.token).await);
+    assert!(status_of(s, &first.token).await.enabled, "it did not turn two-factor sign-in off");
+    let (status, answer) = error(login_with(s, "ana", "a brand new password").await).await;
+    assert_eq!(
+        (status, answer.error.as_str()),
+        (StatusCode::UNAUTHORIZED, "two_factor_required"),
+        "the new password still asks for the second factor"
+    );
+
+    // With `reset_two_factor` the code takes it away: no second factor, and the account is plain again.
+    let reset: AdminCode = get_json(
+        admin_call(s, &root, reqwest::Method::POST, &format!("/admin/users/{ana_id}/password-reset"), json!({ "reset_two_factor": true })).await,
+    )
+    .await;
+    let body = json!({ "code": reset.code, "device_name": "recovery 2", "password": "another new password" });
+    let second = joined(call(s, None, reqwest::Method::POST, "/join", Some(body)).await).await;
+    assert!(!accepted(s, &first.token).await);
+    assert_eq!(status_of(s, &second.token).await, TwoFactorStatus { enabled: false, enabled_ms: None, recovery_codes_left: 0, pending: false });
+    assert_eq!(login_with(s, "ana", "another new password").await.status(), StatusCode::OK);
+}
+
+/// Turning two-factor sign-in on signs the account's other devices out at once: their live socket closes and their waiting
+/// change-feed long-poll is answered 401 with no changes.
+async fn turning_two_factor_on_ends_live_connections_and_long_polls(s: &Server) {
+    s.freeze();
+    add_user(s, "ana").await;
+    let (pc, laptop) = (login(s, "ana").await, login(s, "ana").await);
+    let mut ws = live_ready(s, &laptop).await;
+    let since = space_of(s, &laptop).await.seq;
+    let poll = {
+        let (client, url, token) = (s.client.clone(), format!("{}/changes?since={since}&wait=30", s.base), laptop.clone());
+        tokio::spawn(async move { client.get(url).bearer_auth(token).send().await.unwrap() })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!poll.is_finished());
+    let setup: TwoFactorSetupResponse = get_json(post_json(s, &pc, "/account/two-factor/setup", json!({ "password": PASSWORD })).await).await;
+    let secret = totp::base32_decode(&setup.secret).unwrap();
+    let code = totp::code_for(&secret, totp::step_at(s.at())).unwrap();
+    assert_eq!(post_json(s, &pc, "/account/two-factor/confirm", json!({ "totp_code": code })).await.status(), StatusCode::OK);
+    assert_eq!(error_code(live_next(&mut ws).await), "unauthorized");
+    assert_eq!(live_next(&mut ws).await, None, "closed");
+    let res = tokio::time::timeout(Duration::from_secs(10), poll).await.expect("the long-poll ends at once").unwrap();
+    let (status, body) = error(res).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "unauthorized"));
+    assert_eq!(open_live(s, Some(&laptop)).await.err(), Some(StatusCode::UNAUTHORIZED));
+    assert!(accepted(s, &pc).await);
+}
+
+/// The admin API asks an admin with two-factor sign-in for a code as well as the password, and a time step serves one change.
+async fn an_admin_with_two_factor_confirms_changes_with_a_code(s: &Server) {
+    let root = turn_on_two_factor(s, "root", true).await;
+    add_user(s, "ana").await;
+    let ana_id = id_of(s, "ana").await;
+    let path = format!("/admin/users/{ana_id}/password-reset");
+    let call_with = |extra: serde_json::Value| admin_call(s, &root.token, reqwest::Method::POST, &path, extra);
+    // Missing: 403 `two_factor_invalid` (the field is a credential here, not a form field); malformed: 400; wrong: 403.
+    let (status, body) = error(call_with(json!({})).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "two_factor_invalid"));
+    let right = root.fresh_code(s);
+    let (status, body) = error(call_with(json!({ "totp_code": "12" })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+    let (status, body) = error(call_with(json!({ "totp_code": wrong_code(&right) })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "two_factor_invalid"));
+    // A wrong password is told first, whatever the code.
+    let body = json!({ "password": "wrong password!", "totp_code": right });
+    let (status, body) = error(call(s, Some(&root.token), reqwest::Method::POST, &path, Some(body)).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "wrong_password"));
+    // The right code works once: the same step again is refused, the next one goes through.
+    assert_eq!(call_with(json!({ "totp_code": right })).await.status(), StatusCode::OK);
+    let (status, body) = error(call_with(json!({ "totp_code": right })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "two_factor_invalid"), "the same time step twice");
+    assert_eq!(call_with(json!({ "totp_code": root.fresh_code(s) })).await.status(), StatusCode::OK);
+    // The step sign-in used is spent for the admin too (they share it).
+    let challenge = login_challenge(s, "root").await;
+    let used = root.fresh_code(s);
+    assert_eq!(second_step(s, &challenge.challenge, json!({ "totp_code": used })).await.status(), StatusCode::OK);
+    let (status, body) = error(call_with(json!({ "totp_code": used })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "two_factor_invalid"));
+    // A recovery code stands in for the code, once.
+    assert_eq!(call_with(json!({ "recovery_code": root.recovery[0] })).await.status(), StatusCode::OK);
+    let (status, body) = error(call_with(json!({ "recovery_code": root.recovery[0] })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "two_factor_invalid"));
+    // The list shows who has it.
+    let list: craft_cloud_proto::api::AdminUserList = get_json(call(s, Some(&root.token), reqwest::Method::GET, "/admin/users", None).await).await;
+    let flags: Vec<_> = list.users.iter().map(|u| (u.username.as_str(), u.two_factor_enabled)).collect();
+    assert_eq!(flags, vec![("ana", false), ("root", true)]);
+    // Ten wrong codes in a row (a right one in between starts the count again) lock it, for the admin API as for every
+    // other path: 429 with Retry-After, whatever the code.
+    let boss = turn_on_two_factor(s, "boss", true).await;
+    let boss_call = |extra: serde_json::Value| admin_call(s, &boss.token, reqwest::Method::POST, &path, extra);
+    let right = boss.fresh_code(s);
+    for n in 1..=10 {
+        let (status, body) = error(boss_call(json!({ "totp_code": wrong_code(&right) })).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "two_factor_invalid"), "wrong code {n}");
+    }
+    let res = boss_call(json!({ "totp_code": right })).await;
+    assert_eq!((res.status(), retry_after(&res).await.as_deref()), (StatusCode::TOO_MANY_REQUESTS, Some("900")));
+    assert_eq!(error(res).await.1.error, "two_factor_locked");
+    // The command line lifts the lock.
+    s.meta.reset_two_factor(s.meta.user_by_name("boss").await.unwrap().unwrap().id, s.at()).await.unwrap();
+    let again = login(s, "boss").await;
+    let res = admin_call(s, &again, reqwest::Method::POST, &path, json!({})).await;
+    assert_eq!(res.status(), StatusCode::OK, "two-factor sign-in is off for boss, so the password alone does it");
+}
+
+async fn an_admin_resets_the_two_factor_of_an_account(s: &Server) {
+    let root = turn_on_two_factor(s, "root", true).await;
+    let ana = turn_on_two_factor(s, "ana", false).await;
+    let ana_id = id_of(s, "ana").await;
+    add_admin(s, "boss").await;
+    let boss = login(s, "boss").await;
+    let (root_id, boss_id) = (id_of(s, "root").await, id_of(s, "boss").await);
+    // An admin without two-factor sign-in may not reset another admin's password or second factor.
+    for path in [format!("/admin/users/{root_id}/password-reset"), format!("/admin/users/{root_id}/reset-two-factor")] {
+        let (status, body) = error(admin_call(s, &boss, reqwest::Method::POST, &path, json!({})).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "forbidden"), "{path}");
+    }
+    // The admin who has it may reset a member's: the account is plain again and every device of it is signed out.
+    let path = format!("/admin/users/{ana_id}/reset-two-factor");
+    let (status, body) = error(admin_call(s, &root.token, reqwest::Method::POST, &path, json!({})).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::FORBIDDEN, "two_factor_invalid"), "the admin's own code is needed");
+    let res = admin_call(s, &root.token, reqwest::Method::POST, &path, json!({ "totp_code": root.fresh_code(s) })).await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert!(!accepted(s, &ana.token).await);
+    let token = login(s, "ana").await;
+    assert!(!status_of(s, &token).await.enabled);
+    // Nothing is left to reset; one's own account is not reset this way.
+    let (status, body) = error(admin_call(s, &root.token, reqwest::Method::POST, &path, json!({ "recovery_code": root.recovery[0] })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::CONFLICT, "conflict"));
+    let own = format!("/admin/users/{root_id}/reset-two-factor");
+    let (status, body) = error(admin_call(s, &root.token, reqwest::Method::POST, &own, json!({ "recovery_code": root.recovery[1] })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+    // Another admin's password: allowed to an admin who has it.
+    let path = format!("/admin/users/{boss_id}/password-reset");
+    let res = admin_call(s, &root.token, reqwest::Method::POST, &path, json!({ "recovery_code": root.recovery[2] })).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    // …and so is another admin's second factor, once they have one.
+    let (status, body) = error(
+        admin_call(
+            s,
+            &root.token,
+            reqwest::Method::POST,
+            &format!("/admin/users/{boss_id}/reset-two-factor"),
+            json!({ "recovery_code": root.recovery[3] }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::CONFLICT, "conflict"), "boss has none");
+}
+
+// ---- two-factor sign-in: one server each ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setting_it_up_needs_a_key_the_server_never_makes() {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    // No key: the state as the server's `main` builds it for a config without `[two_factor]`.
+    let s = start_state(AppState::new(meta.clone(), store, vec![]).unwrap(), meta, vec![db, blobs], None).await;
+    add_user(&s, "ana").await;
+    let token = login(&s, "ana").await;
+    let (status, body) = error(post_json(&s, &token, "/account/two-factor/setup", json!({ "password": PASSWORD })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "two_factor_unavailable"));
+    // Unavailable is said before the password is looked at: a wrong one is not counted either.
+    for _ in 0..8 {
+        let (status, body) = error(post_json(&s, &token, "/account/two-factor/setup", json!({ "password": "wrong password!" })).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "two_factor_unavailable"));
+    }
+    assert_eq!(status_of(&s, &token).await, TwoFactorStatus { enabled: false, enabled_ms: None, recovery_codes_left: 0, pending: false });
+    assert_eq!(
+        change_password(&s, &token, PASSWORD, "a brand new password").await.status(),
+        StatusCode::NO_CONTENT,
+        "the password's tries are untouched"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_challenge_works_from_another_address() {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let s = start_trusting(meta, store, vec![db, blobs], vec!["127.0.0.1".parse().unwrap()]).await;
+    let ana = turn_on_two_factor(&s, "ana", false).await;
+    let from = |addr: &'static str, body: serde_json::Value, path: &'static str| {
+        let req = s.client.post(format!("{}{path}", s.base)).header("x-forwarded-for", addr).json(&body);
+        async move { req.send().await.unwrap() }
+    };
+    let res = from("198.51.100.1", json!({ "username": "ana", "password": PASSWORD, "device_name": "pc" }), "/auth/login").await;
+    let challenge = error(res).await.1.two_factor.unwrap();
+    // The secret token binds the challenge, not the address: another one finishes it.
+    let res = from("203.0.113.9", json!({ "challenge": challenge.challenge, "totp_code": ana.fresh_code(&s) }), "/auth/login/second-factor").await;
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+/// Setting up, turning off and new recovery codes count wrong passwords like a password change does (5 in 15 minutes per
+/// account, then `429 rate_limited`), and take one of the server-wide password-check slots (all busy: `429` with
+/// `Retry-After: 1` and no try used).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_two_factor_routes_count_wrong_passwords_and_wait_for_a_check_slot() {
+    let s = sqlite_disk_with(Limits { password_checks: 1, ..Limits::default() }).await;
+    // One account for each route: the tries are the account's, shared by every route that asks for the password.
+    let mut cases = Vec::new();
+    for (name, path, body) in [
+        ("ana", "/account/two-factor/setup", json!({ "password": "wrong password!" })),
+        ("bob", "/account/two-factor/disable", json!({ "password": "wrong password!", "totp_code": "123456" })),
+        ("cy", "/account/two-factor/recovery-codes", json!({ "password": "wrong password!", "totp_code": "123456" })),
+    ] {
+        cases.push((turn_on_two_factor(&s, name, false).await, path, body));
+    }
+    for (account, path, body) in &cases {
+        let token = &account.token;
+        // A busy slot is told to come back, and costs no try however often it is asked.
+        let busy = s.password_checks.clone().try_acquire_owned().unwrap();
+        for _ in 0..7 {
+            let res = post_json(&s, token, path, body.clone()).await;
+            assert_eq!(retry_after(&res).await.as_deref(), Some("1"), "{path}");
+            assert_eq!(error(res).await.1.error, "rate_limited", "{path}");
+        }
+        drop(busy);
+        for n in 1..=5 {
+            let (status, answer) = error(post_json(&s, token, path, body.clone()).await).await;
+            assert_eq!((status, answer.error.as_str()), (StatusCode::FORBIDDEN, "wrong_password"), "{path} try {n}");
+        }
+        let (status, answer) = error(post_json(&s, token, path, body.clone()).await).await;
+        assert_eq!((status, answer.error.as_str()), (StatusCode::TOO_MANY_REQUESTS, "rate_limited"), "{path}: the sixth");
+    }
+    // The tries are the account's: the right password is held off as well while the window lasts.
+    let (account, _, _) = &cases[0];
+    let (status, answer) = error(
+        post_json(&s, &account.token, "/account/two-factor/disable", json!({ "password": PASSWORD, "recovery_code": account.recovery[0] })).await,
+    )
+    .await;
+    assert_eq!((status, answer.error.as_str()), (StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
 }
