@@ -3350,3 +3350,110 @@ async fn only_the_file_restored_after_a_lost_delete_answer_brings_its_folder_bac
     assert_eq!(files(&b), expected);
     assert_eq!(a.fs().dirs(), vec![path("d")]);
 }
+
+/// A tree of nested folders with a file at its bottom, all deleted here in one commit whose answer is lost, then
+/// brought back from the trash in different ways (by node name). Whatever comes back, nothing is deleted a second time.
+async fn lost_delete_of_a_nested_tree(
+    dirs: &[&str],
+    file: &str,
+    restore: &[&str],
+) -> (common::Machine, common::Machine, Server, craft_cloud_meta::UserRecord) {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    for dir in dirs {
+        a.fs_mut().mkdir(&path(dir)).unwrap();
+    }
+    write(&mut a, file, b"keep me");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().remove_file(&path(file)).unwrap();
+    for dir in dirs.iter().rev() {
+        a.fs_mut().remove_dir(&path(dir)).unwrap();
+    }
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    for name in restore {
+        restore_from_trash(&server, &ana, node_named(&server, &ana, name).await).await;
+    }
+    settle(&mut [&mut a, &mut b], 6).await;
+    settle(&mut [&mut a, &mut b], 3).await;
+    (a, b, server, ana)
+}
+
+/// Both machines and a fresh one have exactly the folders `dirs` and no file, and the server still has them.
+async fn assert_only_dirs(m: (common::Machine, common::Machine, Server, craft_cloud_meta::UserRecord), dirs: &[&str]) {
+    let (a, b, server, ana) = m;
+    let expected: Vec<_> = dirs.iter().map(|d| path(d)).collect();
+    assert_eq!(a.fs().dirs(), expected, "the laptop");
+    assert_eq!(b.fs().dirs(), expected, "the desktop");
+    assert!(files(&a).is_empty() && files(&b).is_empty(), "the file stays in the trash");
+    let mut c = machine(&server, &ana, "studio").await;
+    c.sync_once().await.unwrap();
+    assert_eq!(c.fs().dirs(), expected, "the server still has the folders");
+}
+
+#[tokio::test]
+async fn a_nested_folder_restored_alone_after_a_lost_delete_answer_is_not_deleted_again() {
+    let m = lost_delete_of_a_nested_tree(&["d", "d/sub"], "d/sub/f.txt", &["d"]).await;
+    assert_only_dirs(m, &["d"]).await;
+}
+
+#[tokio::test]
+async fn a_nested_folder_and_its_subfolder_restored_after_a_lost_delete_answer_come_back() {
+    let m = lost_delete_of_a_nested_tree(&["d", "d/sub"], "d/sub/f.txt", &["d", "sub"]).await;
+    assert_only_dirs(m, &["d", "d/sub"]).await;
+}
+
+#[tokio::test]
+async fn only_the_deepest_file_restored_after_a_lost_delete_answer_brings_the_whole_chain_back() {
+    let (a, b, _server, _ana) = lost_delete_of_a_nested_tree(&["d", "d/sub"], "d/sub/f.txt", &["f.txt"]).await;
+    let expected = vec![("d/sub/f.txt".to_owned(), b"keep me".to_vec())];
+    assert_eq!(files(&a), expected);
+    assert_eq!(files(&b), expected);
+    assert_eq!(a.fs().dirs(), vec![path("d"), path("d/sub")]);
+}
+
+#[tokio::test]
+async fn a_three_deep_folder_restored_alone_after_a_lost_delete_answer_is_not_deleted_again() {
+    let m = lost_delete_of_a_nested_tree(&["d", "d/a", "d/a/b"], "d/a/b/f.txt", &["d"]).await;
+    assert_only_dirs(m, &["d"]).await;
+}
+
+#[tokio::test]
+async fn a_three_deep_folder_and_its_middle_folder_restored_after_a_lost_delete_answer_come_back() {
+    let m = lost_delete_of_a_nested_tree(&["d", "d/a", "d/a/b"], "d/a/b/f.txt", &["d", "a"]).await;
+    assert_only_dirs(m, &["d", "d/a"]).await;
+}
+
+#[tokio::test]
+async fn only_the_deepest_folder_restored_after_a_lost_delete_answer_brings_its_parents_back() {
+    let m = lost_delete_of_a_nested_tree(&["d", "d/a", "d/a/b"], "d/a/b/f.txt", &["b"]).await;
+    assert_only_dirs(m, &["d", "d/a", "d/a/b"]).await;
+}
+
+/// The change feed is cut short after the lost delete answer and the restore: the machine lists the tree again, at the
+/// same epoch. A restored empty folder is in that listing, and must not be deleted a second time.
+#[tokio::test]
+async fn a_folder_restored_after_a_lost_delete_answer_and_a_relist_is_not_deleted_again() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("e")).unwrap();
+    settle(&mut [&mut a, &mut b], 5).await;
+
+    a.fs_mut().remove_dir(&path("e")).unwrap();
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    restore_from_trash(&server, &ana, node_named(&server, &ana, "e").await).await;
+    a.transport().faults.resync_next_changes.store(true, Ordering::Relaxed);
+
+    settle(&mut [&mut a, &mut b], 6).await;
+    settle(&mut [&mut a, &mut b], 3).await;
+    assert_eq!(a.fs().dirs(), vec![path("e")]);
+    assert_eq!(b.fs().dirs(), vec![path("e")]);
+    let mut c = machine(&server, &ana, "studio").await;
+    c.sync_once().await.unwrap();
+    assert_eq!(c.fs().dirs(), vec![path("e")], "the server still has the folder");
+}

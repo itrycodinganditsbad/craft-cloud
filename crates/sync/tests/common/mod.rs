@@ -80,6 +80,9 @@ pub struct Faults {
     pub every: AtomicU64,
     /// Make the next commit apply on the server but report failure, as if its reply was lost.
     pub lose_commit_reply: AtomicBool,
+    /// Make the next read of the change feed answer `ResyncRequired`, as if the server's history had been cut short:
+    /// the machine then lists the tree again.
+    pub resync_next_changes: AtomicBool,
     /// Make every commit come back refused, naming an operation the batch doesn't have.
     pub bad_conflict_index: AtomicBool,
     /// The machine died (see `MemFs::die_after`): every call fails.
@@ -158,6 +161,9 @@ impl Transport for Local {
 
     async fn changes(&self, since: u64, after: Option<PageCursor>) -> Result<ChangeSet, TransportError> {
         self.faults.check()?;
+        if self.faults.resync_next_changes.swap(false, Ordering::Relaxed) {
+            return Err(TransportError::ResyncRequired);
+        }
         self.meta.changes(self.space, since, after, self.page).await.map_err(meta_err)
     }
 
