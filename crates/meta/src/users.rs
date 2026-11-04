@@ -76,6 +76,8 @@ pub struct AccountRecord {
     pub created_ms: i64,
     /// When the password last changed through the server (`None`: never, the password is still the first one).
     pub password_changed_ms: Option<i64>,
+    /// Whether signing in asks for a second factor.
+    pub two_factor_enabled: bool,
 }
 
 /// The client kinds a device may name when it signs in. Empty means the client didn't say.
@@ -292,7 +294,8 @@ impl Meta {
     }
 
     /// Registers a device for `user` after a password sign-in, if the password it was checked against is still the
-    /// account's: `checked` is the stored hash and the generation ([`UserRecord::password_hash`], [`UserRecord::auth_gen`]) the caller read
+    /// account's (an account with two-factor sign-in is [`MetaError::TwoFactorRequired`] here: it gets a device only from
+    /// [`Meta::complete_second_factor`], and [`Meta::sign_in`] is the call that knows both): `checked` is the stored hash and the generation ([`UserRecord::password_hash`], [`UserRecord::auth_gen`]) the caller read
     /// before it verified the password. The account is locked first and both compared again in the same transaction, so a
     /// password change or reset, or a disable followed by an enable (which leaves the hash as it was), that committed
     /// while the (slow) check ran is not followed by a device that check let in. `None`: the user is gone or
@@ -326,6 +329,9 @@ impl Meta {
         }
         if account_blocked(&mut w.tx, user).await? {
             return Err(MetaError::AccountDisabled);
+        }
+        if crate::two_factor::is_enabled(&mut w.tx, user).await? {
+            return Err(MetaError::TwoFactorRequired);
         }
         insert_device(&mut w.tx, device, user, name, client, token_hash, now_ms).await?;
         let login = NewEvent::new(AuditAction::AuthLogin).by(user, Some(device)).on_device(device).with(AuditDetails::client(client));
@@ -373,17 +379,21 @@ impl Meta {
 
     /// What `GET /account` tells about `user`; `NotFound` for a user that isn't there.
     pub async fn account(&self, user: UserId) -> Result<AccountRecord, MetaError> {
-        let row = sqlx::query("SELECT username, role, created_ms, password_changed_ms FROM users WHERE id = $1")
-            .bind(uuid_bytes(&user.0))
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or(MetaError::NotFound("user"))?;
+        let row = sqlx::query(
+            "SELECT username, role, created_ms, password_changed_ms, \
+             (SELECT COUNT(*) FROM user_two_factor t WHERE t.user_id = users.id AND t.enabled_ms IS NOT NULL) AS two_factor FROM users WHERE id = $1",
+        )
+        .bind(uuid_bytes(&user.0))
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(MetaError::NotFound("user"))?;
         Ok(AccountRecord {
             id: user,
             username: row.try_get("username")?,
             role: Role::parse(&row.try_get::<String, _>("role")?)?,
             created_ms: row.try_get("created_ms")?,
             password_changed_ms: row.try_get("password_changed_ms")?,
+            two_factor_enabled: row.try_get::<i64, _>("two_factor")? > 0,
         })
     }
 
@@ -646,10 +656,12 @@ pub(crate) async fn revoke_devices(
     rows.iter().map(|row| Ok(DeviceId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("id")?)?))).collect()
 }
 
-/// Deletes `user`'s open invite and every pairing of theirs, in `tx`.
+/// Deletes `user`'s open invite, every pairing of theirs and every open sign-in challenge, in `tx`: a code or challenge
+/// made before a password change, a reset or a disable must not work after it.
 pub(crate) async fn delete_join_codes(tx: &mut sqlx::Transaction<'static, sqlx::Any>, user: UserId) -> Result<(), MetaError> {
     sqlx::query("DELETE FROM invites WHERE user_id = $1").bind(uuid_bytes(&user.0)).execute(&mut **tx).await?;
     sqlx::query("DELETE FROM pairings WHERE user_id = $1").bind(uuid_bytes(&user.0)).execute(&mut **tx).await?;
+    sqlx::query("DELETE FROM login_challenges WHERE user_id = $1").bind(uuid_bytes(&user.0)).execute(&mut **tx).await?;
     Ok(())
 }
 

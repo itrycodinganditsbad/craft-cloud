@@ -27,6 +27,7 @@ use uuid::Uuid;
 use crate::audit::{AuditAction, AuditDetails, NewEvent, record_in};
 use crate::codec::{to_i64, to_u64, uuid_bytes, uuid_from};
 use crate::join::{Purpose, put_code};
+use crate::two_factor;
 use crate::users::{delete_join_codes, insert_user, lock_user, revoke_devices};
 use crate::{DeviceRecord, Dialect, Meta, MetaError, RevokeReason, Role, UserId, WriteTx, valid_username};
 
@@ -48,11 +49,19 @@ pub struct AdminActor {
     pub device: DeviceId,
     /// The stored password hash the confirmation was verified against; it must still be the account's.
     pub password_hash: String,
+    /// Whether the acting admin's account had two-factor sign-in on when their confirmation was checked
+    /// ([`Meta::confirm_second_factor`]); it must still be so (turning it on or off meanwhile is `Conflict`).
+    pub two_factor: bool,
 }
 
 impl std::fmt::Debug for AdminActor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AdminActor").field("user", &self.user).field("device", &self.device).field("password_hash", &"<redacted>").finish()
+        f.debug_struct("AdminActor")
+            .field("user", &self.user)
+            .field("device", &self.device)
+            .field("password_hash", &"<redacted>")
+            .field("two_factor", &self.two_factor)
+            .finish()
     }
 }
 
@@ -64,6 +73,8 @@ pub struct AdminUser {
     pub role: Role,
     pub created_ms: i64,
     pub disabled_ms: Option<i64>,
+    /// Two-factor sign-in is on.
+    pub two_factor_enabled: bool,
     /// Devices that are not revoked.
     pub devices_active: u64,
     pub stored_bytes: u64,
@@ -107,6 +118,7 @@ struct Target {
 }
 
 const USER_SELECT: &str = "SELECT u.id, u.username, u.role, u.created_ms, u.disabled_ms, s.stored_bytes, s.quota_bytes, \
+     (SELECT COUNT(*) FROM user_two_factor t WHERE t.user_id = u.id AND t.enabled_ms IS NOT NULL) AS two_factor, \
      (SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id AND d.revoked = 0) AS devices_active, \
      (SELECT COUNT(*) FROM invites i WHERE i.user_id = u.id AND i.purpose = 'invite' AND i.expires_ms > $1) AS invites \
      FROM users u JOIN spaces s ON s.owner = u.id";
@@ -119,6 +131,7 @@ fn admin_user_from(row: &sqlx::any::AnyRow) -> Result<AdminUser, MetaError> {
         role: Role::parse(&row.try_get::<String, _>("role")?)?,
         created_ms: row.try_get("created_ms")?,
         disabled_ms: row.try_get("disabled_ms")?,
+        two_factor_enabled: row.try_get::<i64, _>("two_factor")? > 0,
         devices_active: to_u64(row.try_get("devices_active")?)?,
         stored_bytes: to_u64(row.try_get("stored_bytes")?)?,
         quota_bytes: quota.map(to_u64).transpose()?,
@@ -189,6 +202,10 @@ impl Meta {
         }
         if row.try_get::<String, _>("password_hash")? != actor.password_hash {
             return Err(MetaError::Conflict("your password changed while this request was running; try again"));
+        }
+        // The confirmation asked for a second factor, or didn't, by what the account had then.
+        if two_factor::is_enabled(&mut w.tx, actor.user).await? != actor.two_factor {
+            return Err(MetaError::Conflict("your two-factor sign-in changed while this request was running; try again"));
         }
         Ok(w)
     }
@@ -296,7 +313,7 @@ impl Meta {
         }
         let ids = (UserId(Uuid::now_v7()), SpaceId::generate(), NodeId::generate());
         let user = insert_user(&mut w.tx, &username, "", role, now_ms, ids).await?.id;
-        put_code(&mut w.tx, user, code_hash, Purpose::Invite, now_ms, expires_ms).await?;
+        put_code(&mut w.tx, user, code_hash, Purpose::Invite, false, now_ms, expires_ms).await?;
         let created = by_admin(actor, AuditAction::AdminUserCreated, user).with(AuditDetails { role_to: Some(role), ..AuditDetails::default() });
         record_in(&mut w.tx, now_ms, created).await?;
         self.commit_audited(w, now_ms).await?;
@@ -450,7 +467,7 @@ impl Meta {
         if found.has_password {
             return Err(MetaError::Conflict("this account has a password: make a password reset code for it instead"));
         }
-        put_code(&mut w.tx, target, code_hash, Purpose::Invite, now_ms, expires_ms).await?;
+        put_code(&mut w.tx, target, code_hash, Purpose::Invite, false, now_ms, expires_ms).await?;
         record_in(&mut w.tx, now_ms, by_admin(actor, AuditAction::AdminInviteIssued, target)).await?;
         self.commit_audited(w, now_ms).await?;
         Ok(Issued { expires_ms })
@@ -471,14 +488,16 @@ impl Meta {
 
     /// A password reset code under `code_hash`, good for `ttl_ms`, replacing the account's open invite or reset code.
     /// Redeeming it sets a new password and signs every device of the account out ([`Meta::redeem`]). Nothing changes
-    /// until then. Resetting one's own password is `Invalid` (change it), another administrator's `Forbidden`: that
-    /// takes a second factor on the acting admin's side, which this server does not have yet. A disabled account, or
-    /// one marked for removal, is `Conflict`.
+    /// until then. With `reset_two_factor`, redeeming it also turns the account's two-factor sign-in off; without, an
+    /// account that has it needs its second factor to redeem the code. Resetting one's own password is `Invalid` (change
+    /// it), another administrator's `Forbidden` unless the acting admin has two-factor sign-in on themselves. A disabled
+    /// account, or one marked for removal, is `Conflict`.
     pub async fn admin_issue_reset(
         &self,
         actor: &AdminActor,
         target: UserId,
         code_hash: &[u8; 32],
+        reset_two_factor: bool,
         now_ms: i64,
         ttl_ms: i64,
     ) -> Result<Issued, MetaError> {
@@ -491,17 +510,41 @@ impl Meta {
         if found.removed || found.disabled {
             return Err(MetaError::Conflict("this account is disabled or marked for removal"));
         }
-        // Without a second factor on this server, an admin account can only be reset by the command line on its host.
-        if found.role == Role::Admin {
-            return Err(MetaError::Forbidden(
-                "resetting another administrator's password needs two-factor sign-in on your own account, which this server does not have yet; \
-                 use the command line on the server",
-            ));
-        }
-        put_code(&mut w.tx, target, code_hash, Purpose::Reset, now_ms, expires_ms).await?;
+        Self::admin_target_needs_two_factor(&found, actor)?;
+        put_code(&mut w.tx, target, code_hash, Purpose::Reset, reset_two_factor, now_ms, expires_ms).await?;
         record_in(&mut w.tx, now_ms, by_admin(actor, AuditAction::AdminPasswordResetIssued, target)).await?;
         self.commit_audited(w, now_ms).await?;
         Ok(Issued { expires_ms })
+    }
+
+    /// Takes away another account's two-factor sign-in: the secret, the codes and the challenges go, every device is signed
+    /// out ([`RevokeReason::TwoFactor`]) and the invite and pairings are deleted, in one transaction (the target's lock
+    /// and the acting admin's checks are as for every admin change). Returns the devices signed out, for the caller to end
+    /// their live connections. Your own account is `Invalid` (turn it off in your account), an account without two-factor
+    /// sign-in `Conflict` (nothing is signed out), another administrator's `Forbidden` unless the acting admin has
+    /// two-factor sign-in on themselves.
+    pub async fn admin_reset_two_factor(&self, actor: &AdminActor, target: UserId, now_ms: i64) -> Result<Vec<DeviceId>, MetaError> {
+        if same_user(actor.user, target) {
+            return Err(MetaError::Invalid("turn your own two-factor sign-in off in your account instead"));
+        }
+        let mut w = self.begin_admin(actor, Some(target), false).await?;
+        let found = Self::target(&mut w, target).await?;
+        Self::admin_target_needs_two_factor(&found, actor)?;
+        let revoked = two_factor::reset_in(&mut w.tx, target, now_ms).await?.ok_or(MetaError::Conflict("this account has no two-factor sign-in"))?;
+        w.commit().await?;
+        Ok(revoked)
+    }
+
+    /// Resetting another **administrator's** password or two-factor sign-in takes the acting admin's own two-factor
+    /// sign-in: a stolen admin token and password alone can't take over the other admins' accounts. (`begin_admin` has
+    /// compared `actor.two_factor` with the account's state under the lock, so it is the truth here.)
+    fn admin_target_needs_two_factor(target: &Target, actor: &AdminActor) -> Result<(), MetaError> {
+        if target.role == Role::Admin && !actor.two_factor {
+            return Err(MetaError::Forbidden(
+                "resetting another administrator needs two-factor sign-in on your own account: turn it on first, or use the command line on the server",
+            ));
+        }
+        Ok(())
     }
 
     /// All of an account's devices, revoked ones too; `NotFound` for a user that isn't there.

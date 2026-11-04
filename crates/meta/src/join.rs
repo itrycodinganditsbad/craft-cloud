@@ -15,6 +15,11 @@
 //!   after the account's row is locked, so a disable that commits meanwhile is not followed by a device.
 //! - A pairing works only while the device that made it is signed in: revoking that device deletes it, and a redeem
 //!   checks it too.
+//! - An account with two-factor sign-in needs its second factor to redeem an invite or a reset code ([`Proof`]): the
+//!   factor is checked and used up in the same transaction as the invite and the device, a wrong one leaves the invite
+//!   as it was (its counters are committed on their own), and none is [`MetaError::TwoFactorRequired`] without using the
+//!   code up. A reset code the admin made with `reset_two_factor` takes the second factor away instead of asking for it.
+//!   A pairing needs none: only a signed-in device can make one.
 //! - Expired rows are deleted on the next write to their table (a new invite or a new pairing).
 
 use craft_cloud_proto::api::PairingState;
@@ -25,6 +30,7 @@ use uuid::Uuid;
 
 use crate::audit::{AuditAction, AuditDetails, NewEvent, record_in};
 use crate::codec::{uuid_bytes, uuid_from};
+use crate::two_factor::{self, Proof};
 use crate::users::{DeviceClient, account_blocked, check_device_name, delete_join_codes, insert_device, insert_user, lock_user, revoke_devices};
 use crate::{Meta, MetaError, RevokeReason, Role, UserId, valid_username};
 
@@ -55,21 +61,24 @@ impl Purpose {
 }
 
 /// Replaces `user`'s open invite or reset code with one under `code_hash`, in `tx`, after deleting every expired one.
+/// `reset_two_factor`: redeeming a reset code also turns the account's two-factor sign-in off.
 pub(crate) async fn put_code(
     tx: &mut sqlx::Transaction<'static, sqlx::Any>,
     user: UserId,
     code_hash: &[u8; 32],
     purpose: Purpose,
+    reset_two_factor: bool,
     now_ms: i64,
     expires_ms: i64,
 ) -> Result<(), MetaError> {
     sqlx::query("DELETE FROM invites WHERE expires_ms <= $1").bind(now_ms).execute(&mut **tx).await?;
     sqlx::query("DELETE FROM invites WHERE user_id = $1").bind(uuid_bytes(&user.0)).execute(&mut **tx).await?;
-    sqlx::query("INSERT INTO invites (user_id, code_hash, expires_ms, purpose) VALUES ($1, $2, $3, $4)")
+    sqlx::query("INSERT INTO invites (user_id, code_hash, expires_ms, purpose, reset_two_factor) VALUES ($1, $2, $3, $4, $5)")
         .bind(uuid_bytes(&user.0))
         .bind(code_hash.to_vec())
         .bind(expires_ms)
         .bind(purpose.as_str())
+        .bind(i64::from(reset_two_factor))
         .execute(&mut **tx)
         .await?;
     Ok(())
@@ -113,7 +122,7 @@ impl Meta {
             }
         };
         // An open reset code of the account is replaced as well: the command line's invite is an invite.
-        put_code(&mut w.tx, user, code_hash, Purpose::Invite, now_ms, expires_ms).await?;
+        put_code(&mut w.tx, user, code_hash, Purpose::Invite, false, now_ms, expires_ms).await?;
         w.commit().await?;
         Ok(InviteFor { user, new_account })
     }
@@ -230,7 +239,8 @@ impl Meta {
         self.redeem_with(code_hash, device_name, &DeviceClient::default(), token_hash, new_password_hash, now_ms).await
     }
 
-    /// [`Meta::redeem`] for a device that says what client it is.
+    /// [`Meta::redeem`] for a device that says what client it is. An account with two-factor sign-in is
+    /// [`MetaError::TwoFactorRequired`] here (see [`Meta::redeem_with_second_factor`]).
     pub async fn redeem_with(
         &self,
         code_hash: &[u8; 32],
@@ -240,6 +250,27 @@ impl Meta {
         new_password_hash: Option<&str>,
         now_ms: i64,
     ) -> Result<Redeemed, MetaError> {
+        self.redeem_with_second_factor(code_hash, device_name, client, token_hash, new_password_hash, None, now_ms).await
+    }
+
+    /// [`Meta::redeem_with`] with the second factor the person gave, for an invite or reset code of an account that has
+    /// two-factor sign-in. Under the account's lock, after the invite is found again and consumed, the account's
+    /// **current** state decides: with two-factor sign-in on, a reset code made with `reset_two_factor` takes it away and
+    /// asks for nothing; any other code needs `second_factor`. None is [`MetaError::TwoFactorRequired`]; a wrong one
+    /// [`MetaError::TwoFactorInvalid`], with the invite still there and the wrong-proof counters committed on their own;
+    /// a lock in force [`MetaError::TwoFactorLocked`]. A right one is used up in this transaction, with the invite and the
+    /// device. A pairing code never needs one, and a second factor given for an account that has none is ignored.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn redeem_with_second_factor(
+        &self,
+        code_hash: &[u8; 32],
+        device_name: &str,
+        client: &DeviceClient,
+        token_hash: &[u8; 32],
+        new_password_hash: Option<&str>,
+        second_factor: Option<&Proof<'_>>,
+        now_ms: i64,
+    ) -> Result<Redeemed, MetaError> {
         check_device_name(device_name)?;
         client.check()?;
         let device = DeviceId::generate();
@@ -247,7 +278,7 @@ impl Meta {
         // The account's row is locked before the invite is consumed (see `lock_user`): a password reset takes the
         // user and then deletes the invite, so taking them the other way round could deadlock on Postgres. The invite
         // is found with a plain read first, and consumed under the lock with its conditions checked again.
-        let found = sqlx::query("SELECT user_id, purpose FROM invites WHERE code_hash = $1 AND expires_ms > $2")
+        let found = sqlx::query("SELECT user_id, purpose, reset_two_factor FROM invites WHERE code_hash = $1 AND expires_ms > $2")
             .bind(code_hash.to_vec())
             .bind(now_ms)
             .fetch_optional(&mut *w.tx)
@@ -257,14 +288,18 @@ impl Meta {
             Some(row) => {
                 let user = UserId(uuid_from(&row.try_get::<Vec<u8>, _>("user_id")?)?);
                 let purpose = Purpose::parse(&row.try_get::<String, _>("purpose")?)?;
+                let reset_two_factor: i64 = row.try_get("reset_two_factor")?;
                 lock_user(&mut w.tx, user).await?;
-                let consumed = sqlx::query("DELETE FROM invites WHERE code_hash = $1 AND user_id = $2 AND expires_ms > $3 AND purpose = $4")
-                    .bind(code_hash.to_vec())
-                    .bind(uuid_bytes(&user.0))
-                    .bind(now_ms)
-                    .bind(purpose.as_str())
-                    .execute(&mut *w.tx)
-                    .await?;
+                let consumed = sqlx::query(
+                    "DELETE FROM invites WHERE code_hash = $1 AND user_id = $2 AND expires_ms > $3 AND purpose = $4 AND reset_two_factor = $5",
+                )
+                .bind(code_hash.to_vec())
+                .bind(uuid_bytes(&user.0))
+                .bind(now_ms)
+                .bind(purpose.as_str())
+                .bind(reset_two_factor)
+                .execute(&mut *w.tx)
+                .await?;
                 if consumed.rows_affected() == 0 {
                     // Taken, replaced or deleted (a reset) while this waited for the lock.
                     return Err(MetaError::InvalidCode);
@@ -280,6 +315,19 @@ impl Meta {
                     .await?
                     .ok_or(MetaError::Corrupt("an invite's account is missing"))?
                     .try_get("password_hash")?;
+                // The account's two-factor state as it is under the lock now, whatever it was when the invite was made.
+                if two_factor::is_enabled(&mut w.tx, user).await? {
+                    if purpose == Purpose::Reset && reset_two_factor == 1 {
+                        two_factor::remove_in(&mut w.tx, user).await?;
+                    } else {
+                        let Some(proof) = second_factor else { return Err(MetaError::TwoFactorRequired) };
+                        let row = two_factor::load_row(&mut w.tx, user).await?.ok_or(MetaError::Corrupt("two-factor row vanished under the lock"))?;
+                        if let two_factor::Checked::Wrong = two_factor::check_proof(&mut w.tx, user, &row, proof, now_ms).await? {
+                            // The invite goes back with the rollback; the wrong proof is counted on its own.
+                            return Err(self.refuse_proof(w, user, None, now_ms).await);
+                        }
+                    }
+                }
                 match purpose {
                     Purpose::Reset => {
                         // Dropping the transaction puts the code back.

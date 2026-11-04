@@ -4,8 +4,8 @@
 //! `CRAFT_CLOUD_TEST_PG` into a failure instead of a skip.
 
 use craft_cloud_meta::{
-    AdminActor, AdminUser, BlobKind, DeviceClient, DeviceRecord, InviteFor, MIN_QUOTA_BYTES, Meta, MetaError, RESET_TTL_MS, Redeemed, RevokeReason,
-    Role, UserId, UserRecord,
+    AdminActor, AdminUser, BlobKind, DeviceActor, DeviceClient, DeviceRecord, InviteFor, MIN_QUOTA_BYTES, Meta, MetaError, NewChallenge, Proof,
+    RECOVERY_CODES, RESET_TTL_MS, Redeemed, RevokeReason, Role, SignIn, UnreadableSecret, UserId, UserRecord,
 };
 use craft_cloud_proto::api::PairingState;
 use craft_cloud_proto::join::{Code, INVITE_CHARS, INVITE_TTL_MS, PAIRING_CHARS, PAIRING_TTL_MS};
@@ -176,6 +176,25 @@ on_every_backend!(
     pruning_works_in_batches_and_keeps_its_time_until_done,
     a_removed_accounts_events_stay,
     no_event_holds_a_name_or_a_secret,
+    set_up_confirmed_and_listed,
+    a_set_up_belongs_to_one_device_expires_and_takes_five_tries,
+    changes_of_the_settings_recheck_the_device_and_the_password,
+    two_confirmations_at_once_turn_it_on_once,
+    a_time_step_is_accepted_once_and_only_later_ones_after_it,
+    recovery_codes_work_once_and_new_ones_replace_them,
+    wrong_proofs_lock_for_a_while_double_and_reset_on_success,
+    wrong_proofs_at_the_same_moment_all_count,
+    a_challenge_is_made_counted_used_once_and_carries_the_device,
+    an_account_keeps_five_open_challenges_and_expired_ones_go,
+    a_challenge_dies_with_every_change_of_the_account,
+    two_completions_of_one_challenge_give_one_device,
+    completions_and_changes_of_the_account_at_the_same_moment_leave_no_stray_device,
+    turning_two_factor_on_and_off_at_the_same_moment_as_a_sign_in,
+    an_invite_to_a_protected_account_needs_the_second_factor_in_the_same_transaction,
+    a_reset_code_for_a_protected_account_needs_the_factor_unless_it_turns_it_off,
+    admins_two_factor_is_checked_in_the_change_and_resets_need_it,
+    the_command_line_resets_two_factor_and_the_account_shows_it,
+    secrets_are_listed_and_replaced_only_if_unchanged,
 );
 
 // ---- helpers ----
@@ -1810,6 +1829,9 @@ async fn upgrading_counts_what_each_space_already_stores() {
         let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
         // Before the audit log.
         sqlx::query("DROP TABLE audit_events").execute(&mut conn).await.unwrap();
+        sqlx::query("DROP TABLE login_challenges").execute(&mut conn).await.unwrap();
+        sqlx::query("DROP TABLE user_recovery_codes").execute(&mut conn).await.unwrap();
+        sqlx::query("DROP TABLE user_two_factor").execute(&mut conn).await.unwrap();
         sqlx::query("ALTER TABLE spaces DROP COLUMN stored_bytes").execute(&mut conn).await.unwrap();
         // And before live documents of files.
         sqlx::query("ALTER TABLE spaces DROP COLUMN live_bytes").execute(&mut conn).await.unwrap();
@@ -1857,7 +1879,7 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 9);
+    assert_eq!(versions, 10);
 }
 
 // ---- device sessions (migration 0007) ----
@@ -2185,8 +2207,12 @@ async fn redeems_sign_ins_and_resets_at_the_same_moment_leave_no_live_device(met
 async fn back_to_0006(url: &str) {
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    // What migrations 0009 and 0008 added goes first: they run again with 0007 on the next open.
+    // What migrations 0010, 0009 and 0008 added goes first: they run again with 0007 on the next open.
     sqlx::query("DROP TABLE audit_events").execute(&mut conn).await.unwrap();
+    sqlx::query("DROP TABLE login_challenges").execute(&mut conn).await.unwrap();
+    sqlx::query("DROP TABLE user_recovery_codes").execute(&mut conn).await.unwrap();
+    sqlx::query("DROP TABLE user_two_factor").execute(&mut conn).await.unwrap();
+    sqlx::query("ALTER TABLE invites DROP COLUMN reset_two_factor").execute(&mut conn).await.unwrap();
     sqlx::query("ALTER TABLE invites DROP COLUMN purpose").execute(&mut conn).await.unwrap();
     sqlx::query("ALTER TABLE spaces DROP COLUMN quota_bytes").execute(&mut conn).await.unwrap();
     sqlx::query("ALTER TABLE users DROP COLUMN removed_ms").execute(&mut conn).await.unwrap();
@@ -2224,7 +2250,7 @@ async fn migrating_from_0006_keeps_the_rows(url: &str) {
     assert_eq!(schema_version(url).await, 6);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 9);
+    assert_eq!(schema_version(url).await, 10);
     let old = record(&meta, &ana, live).await;
     assert_eq!(
         (old.name.as_str(), old.revoked, old.client, old.revoked_ms, old.revoke_reason),
@@ -2245,7 +2271,7 @@ async fn migrating_from_0006_keeps_the_rows(url: &str) {
     // A database from a newer Craft Cloud is still refused.
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    sqlx::query("INSERT INTO schema_version (version) VALUES (10)").execute(&mut conn).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (11)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
 }
@@ -2352,7 +2378,7 @@ const ADMIN_HASH: &str = "$argon2id$admin";
 async fn admin_actor(meta: &Meta, username: &str) -> (UserRecord, AdminActor) {
     let u = meta.create_user(username, ADMIN_HASH, Role::Admin, NOW).await.unwrap();
     let device = device(meta, &u).await;
-    let actor = AdminActor { user: u.id, device, password_hash: ADMIN_HASH.to_owned() };
+    let actor = AdminActor { user: u.id, device, password_hash: ADMIN_HASH.to_owned(), two_factor: false };
     (u, actor)
 }
 
@@ -2414,7 +2440,7 @@ async fn the_admin_list_pages_searches_and_counts(meta: &Meta) {
     assert!(!meta.admin_user(ana.id, NOW + INVITE_TTL_MS).await.unwrap().unwrap().invite_pending);
     // A reset code is not an invite.
     let bob = meta.user_by_name("bob").await.unwrap().unwrap();
-    meta.admin_issue_reset(&actor, bob.id, &code(INVITE_CHARS).hash(), NOW, RESET_TTL_MS).await.unwrap();
+    meta.admin_issue_reset(&actor, bob.id, &code(INVITE_CHARS).hash(), false, NOW, RESET_TTL_MS).await.unwrap();
     assert!(!admin_view(meta, bob.id).await.invite_pending);
 
     // The counters: accounts, live devices, bytes.
@@ -2485,7 +2511,7 @@ async fn an_admin_changes_a_role_and_a_quota(meta: &Meta) {
     // The demoted admin's next change is refused: they are no admin any more.
     let result = meta.admin_update_user(&actor, ana.id, Some(Role::Member), None, NOW).await;
     assert!(matches!(result, Err(MetaError::Forbidden(_))), "{result:?}");
-    let ana_actor = AdminActor { user: ana.id, device: device(meta, &ana).await, password_hash: "$argon2id$stub".to_owned() };
+    let ana_actor = AdminActor { user: ana.id, device: device(meta, &ana).await, password_hash: "$argon2id$stub".to_owned(), two_factor: false };
     meta.admin_remove_user(&ana_actor, root.id, NOW).await.unwrap();
     let result = meta.admin_update_user(&ana_actor, root.id, Some(Role::Admin), None, NOW).await;
     assert!(matches!(result, Err(MetaError::Conflict(_))), "{result:?}");
@@ -2534,7 +2560,8 @@ async fn the_acting_admins_state_is_checked_in_the_transaction(meta: &Meta) {
     let borrowed = AdminActor { device: device(meta, &victim).await, ..boss.clone() };
     assert!(matches!(issue(borrowed).await, Err(MetaError::DeviceRevoked)));
     // A member who is no admin at all.
-    let member_actor = AdminActor { user: victim.id, device: device(meta, &victim).await, password_hash: "$argon2id$stub".to_owned() };
+    let member_actor =
+        AdminActor { user: victim.id, device: device(meta, &victim).await, password_hash: "$argon2id$stub".to_owned(), two_factor: false };
     assert!(matches!(meta.admin_disable_user(&member_actor, demoted.id, NOW).await, Err(MetaError::Forbidden(_))));
     assert_eq!(meta.admin_server_counts().await.unwrap().users, users_before + 4, "only the four admins made here, no account from a refused change");
     // Every kind of change checks, not only the first: one of each against a stale actor.
@@ -2547,7 +2574,7 @@ async fn the_acting_admins_state_is_checked_in_the_transaction(meta: &Meta) {
     let hash = code(INVITE_CHARS).hash();
     assert!(matches!(meta.admin_issue_invite(&stale_actor, victim.id, &hash, NOW, INVITE_TTL_MS).await, Err(MetaError::Forbidden(_))));
     assert!(matches!(meta.admin_revoke_invite(&stale_actor, victim.id, NOW).await, Err(MetaError::Forbidden(_))));
-    assert!(matches!(meta.admin_issue_reset(&stale_actor, victim.id, &hash, NOW, RESET_TTL_MS).await, Err(MetaError::Forbidden(_))));
+    assert!(matches!(meta.admin_issue_reset(&stale_actor, victim.id, &hash, false, NOW, RESET_TTL_MS).await, Err(MetaError::Forbidden(_))));
     let victims_device = device(meta, &victim).await;
     assert!(matches!(meta.admin_revoke_device(&stale_actor, victim.id, victims_device, NOW).await, Err(MetaError::Forbidden(_))));
     assert!(meta.device_active(victims_device).await.unwrap());
@@ -2617,7 +2644,10 @@ async fn disabling_signs_everything_out_and_enabling_brings_back_nothing(meta: &
         meta.admin_create_user(&actor, "bob", Role::Member, &code(INVITE_CHARS).hash(), NOW, INVITE_TTL_MS).await,
         Err(MetaError::UsernameTaken)
     ));
-    assert!(matches!(meta.admin_issue_reset(&actor, bob.id, &code(INVITE_CHARS).hash(), NOW, RESET_TTL_MS).await, Err(MetaError::Conflict(_))));
+    assert!(matches!(
+        meta.admin_issue_reset(&actor, bob.id, &code(INVITE_CHARS).hash(), false, NOW, RESET_TTL_MS).await,
+        Err(MetaError::Conflict(_))
+    ));
     let sign_in = meta.sign_in_device(bob.id, ("$argon2id$stub", gen_of(meta, "bob").await), "pc", &DeviceClient::default(), &token(), NOW + 9).await;
     assert!(matches!(sign_in, Err(MetaError::AccountDisabled)), "{sign_in:?}");
     assert!(meta.admin_remove_user(&actor, bob.id, NOW + 10).await.unwrap().is_empty(), "removing again is harmless");
@@ -2722,28 +2752,28 @@ async fn invites_and_reset_codes_replace_each_other(meta: &Meta) {
     // A reset code replaces an invite and the other way round, and the account has one row either way.
     let invite = code(INVITE_CHARS);
     meta.create_invite("ana", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
-    meta.admin_issue_reset(&actor, ana.id, &reset.hash(), NOW + 1, RESET_TTL_MS).await.unwrap();
+    meta.admin_issue_reset(&actor, ana.id, &reset.hash(), false, NOW + 1, RESET_TTL_MS).await.unwrap();
     assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 2).await.unwrap(), None);
     assert_eq!(meta.invite_needs_password(&reset.hash(), NOW + 2).await.unwrap(), Some(true), "a reset always needs a password, though ana has one");
     let invite_again = code(INVITE_CHARS);
     meta.create_invite("ana", &invite_again.hash(), NOW + 3, INVITE_TTL_MS).await.unwrap();
     assert_eq!(meta.invite_needs_password(&reset.hash(), NOW + 4).await.unwrap(), None, "the command line's invite replaces a reset code");
     assert_eq!(meta.invite_needs_password(&invite_again.hash(), NOW + 4).await.unwrap(), Some(false));
-    meta.admin_issue_reset(&actor, ana.id, &reset.hash(), NOW + 5, RESET_TTL_MS).await.unwrap();
+    meta.admin_issue_reset(&actor, ana.id, &reset.hash(), false, NOW + 5, RESET_TTL_MS).await.unwrap();
     meta.admin_revoke_invite(&actor, ana.id, NOW).await.unwrap();
     assert_eq!(meta.invite_needs_password(&reset.hash(), NOW + 6).await.unwrap(), None, "a revoke ends a reset code too");
 
     // Not oneself, and not another admin.
-    assert!(matches!(meta.admin_issue_reset(&actor, root.id, &reset.hash(), NOW, RESET_TTL_MS).await, Err(MetaError::Invalid(_))));
+    assert!(matches!(meta.admin_issue_reset(&actor, root.id, &reset.hash(), false, NOW, RESET_TTL_MS).await, Err(MetaError::Invalid(_))));
     let (boss, _) = admin_actor(meta, "boss").await;
-    let result = meta.admin_issue_reset(&actor, boss.id, &reset.hash(), NOW, RESET_TTL_MS).await;
+    let result = meta.admin_issue_reset(&actor, boss.id, &reset.hash(), false, NOW, RESET_TTL_MS).await;
     assert!(matches!(result, Err(MetaError::Forbidden(_))), "{result:?}");
     assert_eq!(meta.invite_needs_password(&reset.hash(), NOW + 6).await.unwrap(), None);
     // Not a disabled account.
     meta.admin_disable_user(&actor, ana.id, NOW).await.unwrap();
-    assert!(matches!(meta.admin_issue_reset(&actor, ana.id, &reset.hash(), NOW, RESET_TTL_MS).await, Err(MetaError::Conflict(_))));
+    assert!(matches!(meta.admin_issue_reset(&actor, ana.id, &reset.hash(), false, NOW, RESET_TTL_MS).await, Err(MetaError::Conflict(_))));
     assert!(matches!(
-        meta.admin_issue_reset(&actor, UserId(uuid::Uuid::now_v7()), &reset.hash(), NOW, RESET_TTL_MS).await,
+        meta.admin_issue_reset(&actor, UserId(uuid::Uuid::now_v7()), &reset.hash(), false, NOW, RESET_TTL_MS).await,
         Err(MetaError::NotFound(_))
     ));
 }
@@ -2753,7 +2783,7 @@ async fn a_reset_code_sets_a_password_and_signs_everything_out(meta: &Meta) {
     let (ana, maker, pairing, pairing_id) = paired(meta, "ana").await;
     let other = device(meta, &ana).await;
     let reset = code(INVITE_CHARS);
-    meta.admin_issue_reset(&actor, ana.id, &reset.hash(), NOW, RESET_TTL_MS).await.unwrap();
+    meta.admin_issue_reset(&actor, ana.id, &reset.hash(), false, NOW, RESET_TTL_MS).await.unwrap();
     // Nothing changes until it is redeemed.
     assert!(meta.device_active(maker).await.unwrap());
     assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$stub");
@@ -2786,7 +2816,7 @@ async fn a_reset_code_sets_a_password_and_signs_everything_out(meta: &Meta) {
 
     // It lasts an hour.
     let late = code(INVITE_CHARS);
-    meta.admin_issue_reset(&actor, ana.id, &late.hash(), NOW + 10, RESET_TTL_MS).await.unwrap();
+    meta.admin_issue_reset(&actor, ana.id, &late.hash(), false, NOW + 10, RESET_TTL_MS).await.unwrap();
     let result = meta.redeem(&late.hash(), "late", &token(), Some("$argon2id$x"), NOW + 10 + RESET_TTL_MS).await;
     assert!(matches!(result, Err(MetaError::InvalidCode)), "{result:?}");
     assert_eq!(RESET_TTL_MS, 3_600_000);
@@ -2794,7 +2824,7 @@ async fn a_reset_code_sets_a_password_and_signs_everything_out(meta: &Meta) {
 
     // Disabling the account deletes the reset code it still held.
     let disabled_code = code(INVITE_CHARS);
-    meta.admin_issue_reset(&actor, ana.id, &disabled_code.hash(), NOW + 20, RESET_TTL_MS).await.unwrap();
+    meta.admin_issue_reset(&actor, ana.id, &disabled_code.hash(), false, NOW + 20, RESET_TTL_MS).await.unwrap();
     meta.admin_disable_user(&actor, ana.id, NOW + 21).await.unwrap();
     assert_eq!(meta.invite_needs_password(&disabled_code.hash(), NOW + 22).await.unwrap(), None, "disabling deletes it");
 }
@@ -2952,12 +2982,63 @@ async fn a_self_demotion_and_a_disable_of_the_other_at_once_keep_an_admin(meta: 
 
 // ---- the migration from 0007 to 0008 ----
 
+/// An account, its invite and the audit log survive the two-factor migration (0010, which runs after the audit log's 0009).
+async fn migrating_from_0009_keeps_the_rows(url: &str) {
+    use sqlx::{Connection, Row};
+    sqlx::any::install_default_drivers();
+    let (ana, invite, audit_rows) = {
+        let meta = Meta::open(url).await.unwrap();
+        let ana = user(&meta, "ana").await;
+        let invite = code(INVITE_CHARS);
+        meta.create_invite("ana", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+        meta.sign_in_device(ana.id, (&ana.password_hash, ana.auth_gen), "pc", &DeviceClient::default(), &token(), NOW).await.unwrap().unwrap();
+        let events = all_events(&meta).await;
+        assert!(!events.is_empty(), "the audit log has rows to keep");
+        (ana, invite, events.len())
+    };
+    let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    sqlx::query("DROP TABLE login_challenges").execute(&mut conn).await.unwrap();
+    sqlx::query("DROP TABLE user_recovery_codes").execute(&mut conn).await.unwrap();
+    sqlx::query("DROP TABLE user_two_factor").execute(&mut conn).await.unwrap();
+    sqlx::query("ALTER TABLE invites DROP COLUMN reset_two_factor").execute(&mut conn).await.unwrap();
+    sqlx::query("DELETE FROM schema_version WHERE version = 10").execute(&mut conn).await.unwrap();
+    drop(conn);
+    assert_eq!(schema_version(url).await, 9, "the audit log's migration stays");
+    let meta = Meta::open(url).await.unwrap();
+    assert_eq!(schema_version(url).await, 10);
+    assert_eq!(all_events(&meta).await.len(), audit_rows, "the audit rows are kept");
+    assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().id, ana.id);
+    assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 1).await.unwrap(), Some(false));
+    let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    let row = sqlx::query("SELECT reset_two_factor FROM invites").fetch_one(&mut conn).await.unwrap();
+    assert_eq!(row.try_get::<i64, _>("reset_two_factor").unwrap(), 0);
+}
+
+#[tokio::test]
+async fn migrating_from_0009_keeps_the_rows_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    migrating_from_0009_keeps_the_rows(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migrating_from_0009_keeps_the_rows_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    migrating_from_0009_keeps_the_rows(&url).await;
+}
+
 /// Drops what migration 0008 added and forgets it ran, which leaves the database as 0007 left it (with its rows).
 async fn back_to_0007(url: &str) {
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    // The audit log (migration 0009) goes first: it runs again with 0008 on the next open.
+    // The audit log (migration 0009) and two-factor sign-in (migration 0010) go first: they run again with 0008 on the next open.
     sqlx::query("DROP TABLE audit_events").execute(&mut conn).await.unwrap();
+    sqlx::query("DROP TABLE login_challenges").execute(&mut conn).await.unwrap();
+    sqlx::query("DROP TABLE user_recovery_codes").execute(&mut conn).await.unwrap();
+    sqlx::query("DROP TABLE user_two_factor").execute(&mut conn).await.unwrap();
+    sqlx::query("ALTER TABLE invites DROP COLUMN reset_two_factor").execute(&mut conn).await.unwrap();
     sqlx::query("ALTER TABLE invites DROP COLUMN purpose").execute(&mut conn).await.unwrap();
     sqlx::query("ALTER TABLE spaces DROP COLUMN quota_bytes").execute(&mut conn).await.unwrap();
     sqlx::query("ALTER TABLE users DROP COLUMN removed_ms").execute(&mut conn).await.unwrap();
@@ -2983,7 +3064,7 @@ async fn migrating_from_0007_keeps_the_rows(url: &str) {
     assert_eq!(schema_version(url).await, 7);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 9);
+    assert_eq!(schema_version(url).await, 10);
     assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.user), Some(ana.id));
     let row = admin_view(&meta, ana.id).await;
     assert_eq!((row.disabled_ms, row.quota_bytes, row.stored_bytes, row.devices_active, row.invite_pending), (None, None, 42, 1, true));
@@ -2995,7 +3076,7 @@ async fn migrating_from_0007_keeps_the_rows(url: &str) {
 
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    sqlx::query("INSERT INTO schema_version (version) VALUES (10)").execute(&mut conn).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (11)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
 }
@@ -3168,7 +3249,7 @@ async fn every_operation_writes_exactly_its_events(meta: &Meta) {
 
     // A reset code, and its redemption: the devices it signs out are counted in the one event.
     let reset = code(INVITE_CHARS);
-    meta.admin_issue_reset(&actor, ana.id, &reset.hash(), NOW, RESET_TTL_MS).await.unwrap();
+    meta.admin_issue_reset(&actor, ana.id, &reset.hash(), false, NOW, RESET_TTL_MS).await.unwrap();
     assert_eq!(seen.actions().await, ["admin.password_reset_issued"]);
     let active = meta.list_devices(ana.id).await.unwrap().iter().filter(|d| !d.revoked).count();
     let redeemed = meta.redeem_with(&reset.hash(), "recovery", &client, &token(), Some("$argon2id$reset"), NOW).await.unwrap();
@@ -3271,7 +3352,7 @@ async fn a_refused_change_writes_no_event(meta: &Meta) {
     assert!(matches!(meta.admin_update_user(&actor, UserId(uuid::Uuid::now_v7()), Some(Role::Admin), None, NOW).await, Err(MetaError::NotFound(_))));
     // A reset code without the new password, a name that is taken, a device of someone else.
     let reset = code(INVITE_CHARS);
-    meta.admin_issue_reset(&actor, ana.id, &reset.hash(), NOW, RESET_TTL_MS).await.unwrap();
+    meta.admin_issue_reset(&actor, ana.id, &reset.hash(), false, NOW, RESET_TTL_MS).await.unwrap();
     seen.fresh().await;
     assert!(matches!(meta.redeem(&reset.hash(), "pc", &token(), None, NOW).await, Err(MetaError::PasswordRequired)));
     assert!(matches!(
@@ -3646,7 +3727,7 @@ async fn an_error_in_the_log_fails_every_change_and_changes_nothing(url: &str) {
     is_db(meta.admin_update_user(&actor, ana.id, Some(Role::Admin), Some(Some(MIN_QUOTA_BYTES)), NOW).await.map(|_| ()));
     is_db(meta.admin_disable_user(&actor, ana.id, NOW).await.map(|_| ()));
     is_db(meta.admin_remove_user(&actor, ana.id, NOW).await.map(|_| ()));
-    is_db(meta.admin_issue_reset(&actor, ana.id, &code(INVITE_CHARS).hash(), NOW, RESET_TTL_MS).await.map(|_| ()));
+    is_db(meta.admin_issue_reset(&actor, ana.id, &code(INVITE_CHARS).hash(), false, NOW, RESET_TTL_MS).await.map(|_| ()));
     is_db(meta.admin_revoke_device(&actor, ana.id, dev, NOW).await);
     is_db(meta.admin_issue_invite(&actor, fresh.id, &code(INVITE_CHARS).hash(), NOW, INVITE_TTL_MS).await.map(|_| ()));
     is_db(meta.admin_revoke_invite(&actor, fresh.id, NOW).await);
@@ -3714,13 +3795,17 @@ async fn a_write_prunes_old_events_after_its_commit() {
     assert_eq!(all_events(&meta).await.len(), 2, "the two sign-ins stay");
 }
 
-// ---- the migration from 0008 to 0009 ----
+// ---- the migration from 0008 to 0009 (and on to 0010) ----
 
-/// Drops what migration 0009 added and forgets it ran, which leaves the database as 0008 left it (with its rows).
+/// Drops what migrations 0009 (the audit log) and 0010 (two-factor sign-in) added and forgets they ran, which leaves the database as 0008 left it (with its rows).
 async fn back_to_0008(url: &str) {
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
     sqlx::query("DROP TABLE audit_events").execute(&mut conn).await.unwrap();
+    sqlx::query("DROP TABLE login_challenges").execute(&mut conn).await.unwrap();
+    sqlx::query("DROP TABLE user_recovery_codes").execute(&mut conn).await.unwrap();
+    sqlx::query("DROP TABLE user_two_factor").execute(&mut conn).await.unwrap();
+    sqlx::query("ALTER TABLE invites DROP COLUMN reset_two_factor").execute(&mut conn).await.unwrap();
     sqlx::query("DELETE FROM schema_version WHERE version >= 9").execute(&mut conn).await.unwrap();
 }
 
@@ -3741,7 +3826,7 @@ async fn migrating_from_0008_adds_the_audit_log(url: &str) {
     assert_eq!(schema_version(url).await, 8);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 9);
+    assert_eq!(schema_version(url).await, 10, "the audit log's migration is 9, two-factor sign-in's 10: both run");
     assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.user), Some(ana.id));
     assert!(all_events(&meta).await.is_empty(), "a new log is empty");
     meta.sign_in_device(ana.id, (&ana.password_hash, ana.auth_gen), "pc", &DeviceClient::default(), &token(), NOW).await.unwrap().unwrap();
@@ -3750,7 +3835,7 @@ async fn migrating_from_0008_adds_the_audit_log(url: &str) {
 
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    sqlx::query("INSERT INTO schema_version (version) VALUES (10)").execute(&mut conn).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (11)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
 }
@@ -3768,4 +3853,795 @@ async fn migrating_from_0008_adds_the_audit_log_on_postgres() {
         return;
     };
     migrating_from_0008_adds_the_audit_log(&url).await;
+}
+
+// ---- two-factor sign-in (migration 0010) ----
+
+type Check = Box<dyn Fn(UserId, &[u8]) -> Result<Option<i64>, UnreadableSecret> + Send + Sync>;
+
+/// A TOTP check that says every code is right for time step `step` (the crypto is the server's; here only the order of
+/// operations and what the database does with the answer are under test).
+fn right(step: i64) -> Check {
+    Box::new(move |_, _| Ok(Some(step)))
+}
+
+/// A TOTP check that says every code is wrong.
+fn wrong() -> Check {
+    Box::new(|_, _| Ok(None))
+}
+
+fn totp(check: &Check) -> Proof<'_> {
+    Proof::Totp(&**check)
+}
+
+/// The admin's confirmation with a TOTP check that says `step` (`None`: a wrong code).
+async fn confirm_with(meta: &Meta, user: UserId, step: Option<i64>, now: i64) -> Result<bool, MetaError> {
+    let check = step.map_or_else(wrong, right);
+    meta.confirm_second_factor(user, Some(&totp(&check)), now).await
+}
+
+async fn redeem_with_factor(meta: &Meta, hash: &[u8; 32], proof: Option<&Proof<'_>>, now: i64) -> Result<DeviceId, MetaError> {
+    meta.redeem_with_second_factor(hash, "new pc", &DeviceClient::default(), &token(), None, proof, now).await.map(|r| r.device)
+}
+
+const FIRST_STEP: i64 = 1_000;
+const SETUP_AT: i64 = NOW + 1_000;
+const MINUTE: i64 = 60_000;
+
+/// An account with a password, two devices (`first` asked for the set-up and stays signed in, `second` is signed out by
+/// turning it on), and two-factor sign-in on from [`SETUP_AT`] (its first code was step [`FIRST_STEP`]).
+struct Protected {
+    user: UserRecord,
+    first: DeviceId,
+    second: DeviceId,
+    codes: Vec<Code>,
+}
+
+impl Protected {
+    fn actor(&self) -> DeviceActor {
+        DeviceActor { user: self.user.id, device: self.first, password_hash: "$argon2id$stub".to_owned() }
+    }
+
+    fn hashes(&self) -> Vec<[u8; 32]> {
+        self.codes.iter().map(Code::hash).collect()
+    }
+}
+
+async fn protected(meta: &Meta, username: &str) -> Protected {
+    let user = user(meta, username).await;
+    let first = device(meta, &user).await;
+    let second = device(meta, &user).await;
+    let codes: Vec<Code> = (0..10).map(|_| code(INVITE_CHARS)).collect();
+    let me = Protected { user, first, second, codes };
+    meta.two_factor_begin_setup(&me.actor(), b"cipher-of-the-secret", SETUP_AT).await.unwrap();
+    let revoked = meta.two_factor_confirm(me.user.id, me.first, &*right(FIRST_STEP), &me.hashes(), SETUP_AT + 1).await.unwrap();
+    assert_eq!(revoked, vec![me.second]);
+    me
+}
+
+fn new_challenge() -> NewChallenge {
+    NewChallenge { id_hash: token(), client_key: "ip:203.0.113.7".to_owned() }
+}
+
+async fn live_devices(meta: &Meta, user: &UserRecord) -> Vec<DeviceId> {
+    meta.list_devices(user.id).await.unwrap().into_iter().filter(|d| !d.revoked).map(|d| d.id).collect()
+}
+
+async fn set_up_confirmed_and_listed(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let (first, second) = (device(meta, &ana).await, device(meta, &ana).await);
+    let info = meta.two_factor_info(ana.id, SETUP_AT).await.unwrap();
+    assert_eq!((info.enabled_ms, info.recovery_codes_left, info.pending), (None, 0, false));
+    assert!(!meta.two_factor_enabled(ana.id).await.unwrap());
+    meta.create_invite("ana", &code(INVITE_CHARS).hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    let pairing = code(PAIRING_CHARS);
+    meta.create_pairing(ana.id, second, &pairing.hash(), NOW).await.unwrap();
+
+    let actor = DeviceActor { user: ana.id, device: first, password_hash: "$argon2id$stub".to_owned() };
+    let expires = meta.two_factor_begin_setup(&actor, b"cipher-of-the-secret", SETUP_AT).await.unwrap();
+    assert_eq!(expires, SETUP_AT + 10 * MINUTE);
+    let info = meta.two_factor_info(ana.id, SETUP_AT + 1).await.unwrap();
+    assert_eq!((info.enabled_ms, info.pending), (None, true), "a set-up is not two-factor sign-in");
+    assert!(!meta.two_factor_enabled(ana.id).await.unwrap());
+    // A password sign-in still gives a device while it is only set up.
+    let generation = gen_of(meta, "ana").await;
+    let signed =
+        meta.sign_in(ana.id, ("$argon2id$stub", generation), "pc", &DeviceClient::default(), &token(), &new_challenge(), SETUP_AT).await.unwrap();
+    assert!(matches!(signed, Some(SignIn::Device(_))));
+    let extra = live_devices(meta, &ana).await.len();
+    assert_eq!(extra, 3);
+
+    // A wrong first code is refused and the set-up stays.
+    assert!(matches!(meta.two_factor_confirm(ana.id, first, &*wrong(), &[], SETUP_AT + 2).await, Err(MetaError::TwoFactorInvalid)));
+    assert!(!meta.two_factor_enabled(ana.id).await.unwrap());
+    let hashes: Vec<[u8; 32]> = (0..RECOVERY_CODES).map(|_| code(INVITE_CHARS).hash()).collect();
+    let before = gen_of(meta, "ana").await;
+    let revoked = meta.two_factor_confirm(ana.id, first, &*right(FIRST_STEP), &hashes, SETUP_AT + 3).await.unwrap();
+    assert_eq!(revoked.len(), 2, "every other device is signed out");
+    assert_eq!(live_devices(meta, &ana).await, vec![first]);
+    let devices = meta.list_devices(ana.id).await.unwrap();
+    assert!(devices.iter().filter(|d| d.revoked).all(|d| d.revoke_reason == Some(RevokeReason::TwoFactor)));
+    assert_revoke_columns_agree(&devices);
+    assert_eq!(gen_of(meta, "ana").await, before + 1, "what a sign-in checked before no longer counts");
+    assert!(!meta.revoke_invite("ana").await.unwrap(), "the invite is gone");
+    assert!(matches!(meta.redeem(&pairing.hash(), "x", &token(), None, SETUP_AT + 4).await, Err(MetaError::InvalidCode)), "pairings are deleted");
+    let info = meta.two_factor_info(ana.id, SETUP_AT + 5).await.unwrap();
+    assert_eq!((info.enabled_ms, info.recovery_codes_left, info.pending), (Some(SETUP_AT + 3), 10, false));
+    assert!(meta.two_factor_enabled(ana.id).await.unwrap());
+    assert!(meta.account(ana.id).await.unwrap().two_factor_enabled);
+    // It is on: a set-up is a conflict, and so is a second confirmation.
+    assert!(matches!(meta.two_factor_begin_setup(&actor, b"other", SETUP_AT + 6).await, Err(MetaError::Conflict(_))));
+    assert!(matches!(meta.two_factor_confirm(ana.id, first, &*right(FIRST_STEP + 5), &hashes, SETUP_AT + 7).await, Err(MetaError::Conflict(_))));
+}
+
+async fn a_set_up_belongs_to_one_device_expires_and_takes_five_tries(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let (first, second) = (device(meta, &ana).await, device(meta, &ana).await);
+    let actor = |device| DeviceActor { user: ana.id, device, password_hash: "$argon2id$stub".to_owned() };
+    meta.two_factor_begin_setup(&actor(first), b"one", SETUP_AT).await.unwrap();
+    // Open on the first device: the second may not start, nor confirm (and its code is not tried at all).
+    assert!(matches!(meta.two_factor_begin_setup(&actor(second), b"two", SETUP_AT + 1).await, Err(MetaError::TwoFactorPending)));
+    assert!(matches!(meta.two_factor_confirm(ana.id, second, &*right(FIRST_STEP), &[], SETUP_AT + 1).await, Err(MetaError::Conflict(_))));
+    // The first may start again; that replaces the secret and gives it five new tries.
+    for round in 0..2 {
+        meta.two_factor_begin_setup(&actor(first), b"again", SETUP_AT + 2).await.unwrap();
+        for _ in 0..4 {
+            assert!(
+                matches!(meta.two_factor_confirm(ana.id, first, &*wrong(), &[], SETUP_AT + 3).await, Err(MetaError::TwoFactorInvalid)),
+                "round {round}"
+            );
+        }
+        assert!(meta.two_factor_info(ana.id, SETUP_AT + 3).await.unwrap().pending, "four wrong codes leave it open");
+    }
+    // The fifth wrong code uses it up: even the right code then is a conflict, and the set-up has to start again.
+    assert!(matches!(meta.two_factor_confirm(ana.id, first, &*wrong(), &[], SETUP_AT + 3).await, Err(MetaError::TwoFactorInvalid)));
+    assert!(!meta.two_factor_info(ana.id, SETUP_AT + 3).await.unwrap().pending);
+    assert!(matches!(meta.two_factor_confirm(ana.id, first, &*right(FIRST_STEP), &[], SETUP_AT + 4).await, Err(MetaError::Conflict(_))));
+    // After the ten minutes it ran out; another device may start one.
+    meta.two_factor_begin_setup(&actor(first), b"fresh", SETUP_AT + 5).await.unwrap();
+    assert!(matches!(
+        meta.two_factor_confirm(ana.id, first, &*right(FIRST_STEP), &[], SETUP_AT + 5 + 10 * MINUTE).await,
+        Err(MetaError::Conflict(_))
+    ));
+    assert!(!meta.two_factor_info(ana.id, SETUP_AT + 5 + 10 * MINUTE).await.unwrap().pending);
+    meta.two_factor_begin_setup(&actor(second), b"second's", SETUP_AT + 6 + 10 * MINUTE).await.unwrap();
+    assert!(!meta.two_factor_enabled(ana.id).await.unwrap(), "nothing was ever turned on");
+}
+
+/// Set-up, confirm, disable and new recovery codes check, under the account's lock, that the device is still signed in and
+/// that the password that was verified is still the account's.
+async fn changes_of_the_settings_recheck_the_device_and_the_password(meta: &Meta) {
+    let me = protected(meta, "ana").await;
+    let revoked_actor = DeviceActor { device: me.second, ..me.actor() };
+    let stale_actor = DeviceActor { password_hash: "$argon2id$other".to_owned(), ..me.actor() };
+    let hashes = me.hashes();
+    for (name, actor, expect_gone) in [("revoked device", &revoked_actor, true), ("changed password", &stale_actor, false)] {
+        let results = [
+            meta.two_factor_begin_setup(actor, b"x", SETUP_AT + 10).await.map(|_| ()),
+            meta.two_factor_disable(actor, &Proof::Recovery(hashes[0]), SETUP_AT + 10).await.map(|_| ()),
+            meta.two_factor_new_recovery_codes(actor, &totp(&right(FIRST_STEP + 50)), &hashes, SETUP_AT + 10).await,
+        ];
+        for result in results {
+            if expect_gone {
+                assert!(matches!(result, Err(MetaError::DeviceRevoked)), "{name}: {result:?}");
+            } else {
+                assert!(matches!(result, Err(MetaError::Conflict(_))), "{name}: {result:?}");
+            }
+        }
+    }
+    // Confirming from a device that was signed out is refused too.
+    assert!(matches!(meta.two_factor_confirm(me.user.id, me.second, &*right(FIRST_STEP), &[], SETUP_AT + 11).await, Err(MetaError::DeviceRevoked)));
+    // Nothing changed: it is still on, with all ten codes, and no proof was spent.
+    let info = meta.two_factor_info(me.user.id, SETUP_AT + 12).await.unwrap();
+    assert_eq!((info.enabled_ms.is_some(), info.recovery_codes_left), (true, 10));
+    // A disabled account's device is gone as well.
+    meta.reset_password(me.user.id, "$argon2id$stub", false, SETUP_AT + 13).await.unwrap();
+    assert!(matches!(meta.two_factor_begin_setup(&me.actor(), b"x", SETUP_AT + 14).await, Err(MetaError::DeviceRevoked)));
+}
+
+async fn two_confirmations_at_once_turn_it_on_once(meta: &Meta) {
+    for round in 0..8 {
+        let ana = user(meta, &format!("ana{round}")).await;
+        let first = device(meta, &ana).await;
+        let actor = DeviceActor { user: ana.id, device: first, password_hash: "$argon2id$stub".to_owned() };
+        meta.two_factor_begin_setup(&actor, b"secret", SETUP_AT).await.unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let (meta, id) = (meta.clone(), ana.id);
+            let hashes: Vec<[u8; 32]> = (0..RECOVERY_CODES).map(|_| code(INVITE_CHARS).hash()).collect();
+            tasks.push(tokio::spawn(async move { meta.two_factor_confirm(id, first, &*right(FIRST_STEP), &hashes, SETUP_AT + 1).await }));
+        }
+        let mut turned_on = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => turned_on += 1,
+                Err(MetaError::Conflict(_)) => {}
+                other => panic!("round {round}: {other:?}"),
+            }
+        }
+        assert_eq!(turned_on, 1, "round {round}");
+        assert_eq!(meta.two_factor_info(ana.id, SETUP_AT + 2).await.unwrap().recovery_codes_left, 10, "one set of codes, round {round}");
+    }
+}
+
+/// The step of a code is accepted once, and only a later one after it. The admin's confirmation and the sign-in share it.
+async fn a_time_step_is_accepted_once_and_only_later_ones_after_it(meta: &Meta) {
+    let me = protected(meta, "ana").await;
+    let id = me.user.id;
+    let at = SETUP_AT + 100;
+    // The first code of the set-up was step 1000: it can't be used again, nor an earlier step.
+    for step in [FIRST_STEP, FIRST_STEP - 1, 0] {
+        assert!(matches!(confirm_with(meta, id, Some(step), at).await, Err(MetaError::TwoFactorInvalid)), "step {step}");
+    }
+    assert!(matches!(confirm_with(meta, id, Some(FIRST_STEP + 1), at).await, Ok(true)));
+    assert!(matches!(confirm_with(meta, id, Some(FIRST_STEP + 1), at).await, Err(MetaError::TwoFactorInvalid)), "the same step twice");
+    assert!(matches!(confirm_with(meta, id, None, at).await, Err(MetaError::TwoFactorInvalid)));
+    // Eight requests with one code at once: exactly one gets through.
+    for round in 0..6 {
+        let step = FIRST_STEP + 10 + round;
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let meta = meta.clone();
+            tasks.push(tokio::spawn(async move { confirm_with(&meta, id, Some(step), at).await }));
+        }
+        let mut accepted = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(true) => accepted += 1,
+                Err(MetaError::TwoFactorInvalid | MetaError::TwoFactorLocked { .. }) => {}
+                other => panic!("round {round}: {other:?}"),
+            }
+        }
+        assert_eq!(accepted, 1, "round {round}: one time step, one use");
+    }
+    // An account without two-factor sign-in asks for nothing, and a missing proof for one with it is refused unspent.
+    let bob = user(meta, "bob").await;
+    assert!(matches!(meta.confirm_second_factor(bob.id, None, at).await, Ok(false)));
+    assert!(matches!(confirm_with(meta, bob.id, Some(1), at).await, Ok(false)));
+    assert!(matches!(meta.confirm_second_factor(id, None, at).await, Err(MetaError::TwoFactorInvalid)));
+}
+
+async fn recovery_codes_work_once_and_new_ones_replace_them(meta: &Meta) {
+    let me = protected(meta, "ana").await;
+    let (id, hashes) = (me.user.id, me.hashes());
+    let at = SETUP_AT + 100;
+    assert!(matches!(meta.confirm_second_factor(id, Some(&Proof::Recovery(hashes[0])), at).await, Ok(true)));
+    assert!(matches!(meta.confirm_second_factor(id, Some(&Proof::Recovery(hashes[0])), at).await, Err(MetaError::TwoFactorInvalid)));
+    assert!(matches!(meta.confirm_second_factor(id, Some(&Proof::Recovery(code(INVITE_CHARS).hash())), at).await, Err(MetaError::TwoFactorInvalid)));
+    assert_eq!(meta.two_factor_info(id, at).await.unwrap().recovery_codes_left, 9);
+    // The same code at the same moment: one wins.
+    let mut tasks = Vec::new();
+    for _ in 0..6 {
+        let (meta, hash) = (meta.clone(), hashes[1]);
+        tasks.push(tokio::spawn(async move { meta.confirm_second_factor(id, Some(&Proof::Recovery(hash)), at).await }));
+    }
+    let mut accepted = 0;
+    for task in tasks {
+        if matches!(task.await.unwrap(), Ok(true)) {
+            accepted += 1;
+        }
+    }
+    assert_eq!(accepted, 1);
+    // New codes: the old ones, used or not, are dead, and the new ones all live.
+    let new: Vec<[u8; 32]> = (0..RECOVERY_CODES).map(|_| code(INVITE_CHARS).hash()).collect();
+    meta.two_factor_new_recovery_codes(&me.actor(), &totp(&right(FIRST_STEP + 1)), &new, at).await.unwrap();
+    assert_eq!(meta.two_factor_info(id, at).await.unwrap().recovery_codes_left, 10);
+    assert!(matches!(meta.confirm_second_factor(id, Some(&Proof::Recovery(hashes[5])), at).await, Err(MetaError::TwoFactorInvalid)));
+    assert!(matches!(meta.confirm_second_factor(id, Some(&Proof::Recovery(new[3])), at).await, Ok(true)));
+    // A repeated code can't be stored (the primary key), and then nothing changes: the old set is still there.
+    let again = vec![new[0]; 2];
+    assert!(meta.two_factor_new_recovery_codes(&me.actor(), &totp(&right(FIRST_STEP + 2)), &again, at).await.is_err());
+    assert_eq!(meta.two_factor_info(id, at).await.unwrap().recovery_codes_left, 9);
+    assert!(matches!(meta.confirm_second_factor(id, Some(&Proof::Recovery(new[7])), at).await, Ok(true)));
+    // A wrong proof for new codes changes none.
+    assert!(matches!(meta.two_factor_new_recovery_codes(&me.actor(), &totp(&wrong()), &new, at).await, Err(MetaError::TwoFactorInvalid)));
+}
+
+/// Ten wrong proofs in a row lock the second factor for 15 minutes; each wrong one after that doubles it, to 24 hours; a
+/// right one resets all of it. While locked even a right proof is refused and nothing is counted.
+async fn wrong_proofs_lock_for_a_while_double_and_reset_on_success(meta: &Meta) {
+    let me = protected(meta, "ana").await;
+    let id = me.user.id;
+    let mut now = SETUP_AT + 100;
+    for n in 1..=9 {
+        assert!(matches!(confirm_with(meta, id, None, now).await, Err(MetaError::TwoFactorInvalid)), "wrong proof {n}");
+    }
+    // The tenth locks.
+    assert!(matches!(confirm_with(meta, id, None, now).await, Err(MetaError::TwoFactorInvalid)));
+    let locked = confirm_with(meta, id, Some(FIRST_STEP + 1), now + 1_000).await;
+    assert!(matches!(locked, Err(MetaError::TwoFactorLocked { retry_after_ms }) if retry_after_ms == 15 * MINUTE - 1_000), "{locked:?}");
+    // Every path refuses while it lasts: recovery codes, disable, new codes, a challenge.
+    let actor = me.actor();
+    assert!(matches!(meta.confirm_second_factor(id, Some(&Proof::Recovery(me.hashes()[0])), now + 2).await, Err(MetaError::TwoFactorLocked { .. })));
+    assert!(matches!(meta.two_factor_disable(&actor, &Proof::Recovery(me.hashes()[1]), now + 2).await, Err(MetaError::TwoFactorLocked { .. })));
+    assert!(matches!(
+        meta.two_factor_new_recovery_codes(&actor, &totp(&right(5)), &me.hashes(), now + 2).await,
+        Err(MetaError::TwoFactorLocked { .. })
+    ));
+    let generation = gen_of(meta, "ana").await;
+    let chal = new_challenge();
+    meta.sign_in(id, ("$argon2id$stub", generation), "pc", &DeviceClient::default(), &token(), &chal, now + 2).await.unwrap();
+    assert!(matches!(
+        meta.complete_second_factor(&chal.id_hash, &Proof::Recovery(me.hashes()[2]), &token(), now + 3).await,
+        Err(MetaError::TwoFactorLocked { .. })
+    ));
+    assert_eq!(meta.two_factor_info(id, now + 2).await.unwrap().recovery_codes_left, 10, "a refused check uses nothing up");
+    // Over, a wrong proof locks again for twice as long: 30 minutes, then 60.
+    now += 15 * MINUTE + 1;
+    assert!(matches!(confirm_with(meta, id, None, now).await, Err(MetaError::TwoFactorInvalid)));
+    let locked = confirm_with(meta, id, Some(FIRST_STEP + 1), now + 1).await;
+    assert!(matches!(locked, Err(MetaError::TwoFactorLocked { retry_after_ms }) if retry_after_ms == 30 * MINUTE - 1), "{locked:?}");
+    now += 30 * MINUTE + 1;
+    assert!(matches!(confirm_with(meta, id, None, now).await, Err(MetaError::TwoFactorInvalid)));
+    assert!(matches!(
+        confirm_with(meta, id, Some(FIRST_STEP + 1), now + 1).await,
+        Err(MetaError::TwoFactorLocked { retry_after_ms }) if retry_after_ms == 60 * MINUTE - 1
+    ));
+    // A right proof after it ran out resets the counters: nine more wrong ones do not lock.
+    now += 60 * MINUTE + 1;
+    assert!(matches!(confirm_with(meta, id, Some(FIRST_STEP + 1), now).await, Ok(true)));
+    for n in 1..=9 {
+        assert!(matches!(confirm_with(meta, id, None, now).await, Err(MetaError::TwoFactorInvalid)), "after the reset, wrong proof {n}");
+    }
+    assert!(matches!(confirm_with(meta, id, Some(FIRST_STEP + 2), now).await, Ok(true)), "nine are not ten");
+    // The command line lifts any lock.
+    for _ in 0..10 {
+        let _ = confirm_with(meta, id, None, now).await;
+    }
+    assert!(matches!(confirm_with(meta, id, Some(FIRST_STEP + 3), now + 1).await, Err(MetaError::TwoFactorLocked { .. })));
+    meta.reset_two_factor(id, now + 2).await.unwrap();
+    assert!(matches!(confirm_with(meta, id, Some(FIRST_STEP + 3), now + 3).await, Ok(false)), "off, and nothing is locked");
+}
+
+/// The counters of wrong proofs are written outside the transaction that refused them, so requests at the same moment all
+/// count: twenty wrong proofs lock it.
+async fn wrong_proofs_at_the_same_moment_all_count(meta: &Meta) {
+    let me = protected(meta, "ana").await;
+    let (id, now) = (me.user.id, SETUP_AT + 100);
+    let mut tasks = Vec::new();
+    for _ in 0..12 {
+        let meta = meta.clone();
+        tasks.push(tokio::spawn(async move { confirm_with(&meta, id, None, now).await }));
+    }
+    for task in tasks {
+        assert!(matches!(task.await.unwrap(), Err(MetaError::TwoFactorInvalid | MetaError::TwoFactorLocked { .. })));
+    }
+    assert!(matches!(confirm_with(meta, id, Some(FIRST_STEP + 1), now + 1).await, Err(MetaError::TwoFactorLocked { .. })));
+}
+
+async fn a_challenge_is_made_counted_used_once_and_carries_the_device(meta: &Meta) {
+    let me = protected(meta, "ana").await;
+    let id = me.user.id;
+    let generation = gen_of(meta, "ana").await;
+    let client = DeviceClient::new(Some("desktop"), Some("linux"), Some("1.2")).unwrap();
+    let chal = new_challenge();
+    let made = meta.sign_in(id, ("$argon2id$stub", generation), "work laptop", &client, &token(), &chal, SETUP_AT + 10).await.unwrap();
+    assert_eq!(made, Some(SignIn::Challenge { expires_ms: SETUP_AT + 10 + 5 * MINUTE }));
+    assert_eq!(live_devices(meta, &me.user).await, vec![me.first], "no device without the second factor");
+    // The old call, for a caller that doesn't know, refuses an account that has two-factor sign-in.
+    assert!(matches!(
+        meta.sign_in_device(id, ("$argon2id$stub", generation), "x", &client, &token(), SETUP_AT + 10).await,
+        Err(MetaError::TwoFactorRequired)
+    ));
+    assert_eq!(meta.challenge_owner(&chal.id_hash, SETUP_AT + 11).await.unwrap(), Some((id, "ana".to_owned())));
+    // Four wrong codes are counted, the challenge stays, and the right one then works (a fifth wrong would delete it).
+    for _ in 0..4 {
+        let result = meta.complete_second_factor(&chal.id_hash, &totp(&wrong()), &token(), SETUP_AT + 12).await;
+        assert!(matches!(result, Err(MetaError::TwoFactorInvalid)), "{result:?}");
+    }
+    let tok = token();
+    let done = meta.complete_second_factor(&chal.id_hash, &totp(&right(FIRST_STEP + 1)), &tok, SETUP_AT + 13).await.unwrap();
+    assert_eq!(done.user, id);
+    let auth = meta.device_by_token(&tok).await.unwrap().unwrap();
+    assert_eq!(auth.device, done.device);
+    let made = meta.list_devices(id).await.unwrap().into_iter().find(|d| d.id == done.device).unwrap();
+    assert_eq!((made.name.as_str(), made.client), ("work laptop", client.clone()), "the device is what the first call said");
+    // Once: the same challenge again is gone, for a right proof as for a wrong one.
+    for proof in [totp(&right(FIRST_STEP + 2)), totp(&wrong())] {
+        assert!(matches!(meta.complete_second_factor(&chal.id_hash, &proof, &token(), SETUP_AT + 14).await, Err(MetaError::ChallengeGone)));
+    }
+    assert!(meta.challenge_owner(&chal.id_hash, SETUP_AT + 14).await.unwrap().is_none());
+
+    // Five wrong codes delete the challenge: the right one is too late.
+    let chal = new_challenge();
+    meta.sign_in(id, ("$argon2id$stub", generation), "pc", &client, &token(), &chal, SETUP_AT + 20).await.unwrap();
+    for _ in 0..5 {
+        assert!(matches!(
+            meta.complete_second_factor(&chal.id_hash, &totp(&wrong()), &token(), SETUP_AT + 21).await,
+            Err(MetaError::TwoFactorInvalid)
+        ));
+    }
+    assert!(matches!(
+        meta.complete_second_factor(&chal.id_hash, &totp(&right(FIRST_STEP + 3)), &token(), SETUP_AT + 22).await,
+        Err(MetaError::ChallengeGone)
+    ));
+    // One that ran out is as gone, and an unknown one.
+    let chal = new_challenge();
+    meta.sign_in(id, ("$argon2id$stub", generation), "pc", &client, &token(), &chal, SETUP_AT + 30).await.unwrap();
+    assert!(matches!(
+        meta.complete_second_factor(&chal.id_hash, &totp(&right(FIRST_STEP + 3)), &token(), SETUP_AT + 30 + 5 * MINUTE).await,
+        Err(MetaError::ChallengeGone)
+    ));
+    assert!(matches!(
+        meta.complete_second_factor(&token(), &totp(&right(FIRST_STEP + 3)), &token(), SETUP_AT + 30).await,
+        Err(MetaError::ChallengeGone)
+    ));
+    // The recovery code finishes a sign-in too, once.
+    let chal = new_challenge();
+    meta.sign_in(id, ("$argon2id$stub", generation), "pc", &client, &token(), &chal, SETUP_AT + 40).await.unwrap();
+    meta.complete_second_factor(&chal.id_hash, &Proof::Recovery(me.hashes()[4]), &token(), SETUP_AT + 41).await.unwrap();
+    let chal = new_challenge();
+    meta.sign_in(id, ("$argon2id$stub", generation), "pc", &client, &token(), &chal, SETUP_AT + 42).await.unwrap();
+    assert!(matches!(
+        meta.complete_second_factor(&chal.id_hash, &Proof::Recovery(me.hashes()[4]), &token(), SETUP_AT + 43).await,
+        Err(MetaError::TwoFactorInvalid)
+    ));
+}
+
+/// Each account keeps at most five open challenges (the oldest goes), and expired ones are deleted by the next sign-in.
+async fn an_account_keeps_five_open_challenges_and_expired_ones_go(meta: &Meta) {
+    let me = protected(meta, "ana").await;
+    let generation = gen_of(meta, "ana").await;
+    let mut made = Vec::new();
+    for n in 0..7 {
+        let chal = new_challenge();
+        meta.sign_in(me.user.id, ("$argon2id$stub", generation), "pc", &DeviceClient::default(), &token(), &chal, SETUP_AT + 10 + n).await.unwrap();
+        made.push(chal);
+    }
+    for (n, chal) in made.iter().enumerate() {
+        let open = meta.challenge_owner(&chal.id_hash, SETUP_AT + 20).await.unwrap().is_some();
+        assert_eq!(open, n >= 2, "challenge {n}: the two oldest were replaced");
+    }
+    // The next sign-in after they ran out deletes them (nothing else would).
+    let later = SETUP_AT + 10 + 5 * MINUTE + 100;
+    let fresh = new_challenge();
+    meta.sign_in(me.user.id, ("$argon2id$stub", generation), "pc", &DeviceClient::default(), &token(), &fresh, later).await.unwrap();
+    assert!(meta.challenge_owner(&fresh.id_hash, later).await.unwrap().is_some());
+    // A stale password hash makes neither a challenge nor a device.
+    let stale = new_challenge();
+    assert!(
+        meta.sign_in(me.user.id, ("$argon2id$old", generation), "pc", &DeviceClient::default(), &token(), &stale, later).await.unwrap().is_none()
+    );
+    assert!(
+        meta.sign_in(me.user.id, ("$argon2id$stub", generation - 1), "pc", &DeviceClient::default(), &token(), &stale, later)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(meta.challenge_owner(&stale.id_hash, later).await.unwrap().is_none());
+    assert_eq!(live_devices(meta, &me.user).await, vec![me.first]);
+}
+
+/// A challenge made before a password change, a reset, a turn-off, a reset of the second factor or a disable gives nothing after.
+async fn a_challenge_dies_with_every_change_of_the_account(meta: &Meta) {
+    let (_, actor) = admin_actor(meta, "root").await;
+    for round in 0..6 {
+        let me = protected(meta, &format!("ana{round}")).await;
+        let generation = gen_of(meta, &format!("ana{round}")).await;
+        let chal = new_challenge();
+        meta.sign_in(me.user.id, ("$argon2id$stub", generation), "pc", &DeviceClient::default(), &token(), &chal, SETUP_AT + 10).await.unwrap();
+        let at = SETUP_AT + 11;
+        match round {
+            0 => drop(meta.change_password(me.user.id, "$argon2id$stub", "$argon2id$new", me.first, at).await.unwrap()),
+            1 => drop(meta.reset_password(me.user.id, "$argon2id$new", true, at).await.unwrap()),
+            2 => drop(meta.two_factor_disable(&me.actor(), &Proof::Recovery(me.hashes()[0]), at).await.unwrap()),
+            3 => drop(meta.reset_two_factor(me.user.id, at).await.unwrap()),
+            4 => drop(meta.admin_disable_user(&actor, me.user.id, at).await.unwrap()),
+            _ => drop(meta.admin_reset_two_factor(&actor, me.user.id, at).await.unwrap()),
+        }
+        assert!(meta.challenge_owner(&chal.id_hash, at).await.unwrap().is_none(), "round {round}");
+        let result = meta.complete_second_factor(&chal.id_hash, &Proof::Recovery(me.hashes()[1]), &token(), at + 1).await;
+        assert!(matches!(result, Err(MetaError::ChallengeGone)), "round {round}: {result:?}");
+        assert!(live_devices(meta, &me.user).await.iter().all(|d| *d == me.first), "round {round}: no new device");
+    }
+}
+
+async fn two_completions_of_one_challenge_give_one_device(meta: &Meta) {
+    for round in 0..8 {
+        let me = protected(meta, &format!("ana{round}")).await;
+        let generation = gen_of(meta, &format!("ana{round}")).await;
+        let chal = new_challenge();
+        meta.sign_in(me.user.id, ("$argon2id$stub", generation), "pc", &DeviceClient::default(), &token(), &chal, SETUP_AT + 10).await.unwrap();
+        let mut tasks = Vec::new();
+        for job in 0..6 {
+            let (meta, hash, recovery) = (meta.clone(), chal.id_hash, me.hashes()[job % 2]);
+            tasks.push(tokio::spawn(async move {
+                // The same TOTP step for some, two recovery codes for the others: a code is no way past the challenge.
+                if job % 2 == 0 {
+                    meta.complete_second_factor(&hash, &totp(&right(FIRST_STEP + 1)), &token(), SETUP_AT + 11).await
+                } else {
+                    meta.complete_second_factor(&hash, &Proof::Recovery(recovery), &token(), SETUP_AT + 11).await
+                }
+            }));
+        }
+        let mut done = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => done += 1,
+                Err(MetaError::ChallengeGone | MetaError::TwoFactorInvalid) => {}
+                other => panic!("round {round}: {other:?}"),
+            }
+        }
+        assert_eq!(done, 1, "round {round}");
+        assert_eq!(live_devices(meta, &me.user).await.len(), 2, "round {round}: the first device and one more");
+    }
+}
+
+/// Completing a sign-in and a password change, a reset, a turn-off or the command line's reset at the same moment, over and
+/// over: no database error, and once the change is done no device of the account but the one that asked is signed in,
+/// whichever came first.
+async fn completions_and_changes_of_the_account_at_the_same_moment_leave_no_stray_device(meta: &Meta) {
+    for round in 0..12 {
+        let name = format!("ana{round}");
+        let me = protected(meta, &name).await;
+        let generation = gen_of(meta, &name).await;
+        let chal = new_challenge();
+        meta.sign_in(me.user.id, ("$argon2id$stub", generation), "pc", &DeviceClient::default(), &token(), &chal, SETUP_AT + 10).await.unwrap();
+        // A password change keeps the device that asked; a reset of the second factor or of the password signs out all.
+        let all_gone = round % 3 != 0;
+        let (completing, changing) = {
+            let (m1, m2) = (meta.clone(), meta.clone());
+            let (hash, id, first, recovery) = (chal.id_hash, me.user.id, me.first, me.hashes());
+            let completing =
+                tokio::spawn(
+                    async move { m1.complete_second_factor(&hash, &Proof::Recovery(recovery[0]), &token(), SETUP_AT + 11).await.map(|_| ()) },
+                );
+            let changing = tokio::spawn(async move {
+                match round % 3 {
+                    0 => m2.change_password(id, "$argon2id$stub", "$argon2id$new", first, SETUP_AT + 12).await.map(|_| ()),
+                    1 => m2.reset_two_factor(id, SETUP_AT + 12).await.map(|_| ()),
+                    _ => m2.reset_password(id, "$argon2id$new", false, SETUP_AT + 12).await.map(|_| ()),
+                }
+            });
+            (completing, changing)
+        };
+        let (completed, changed) = (completing.await.unwrap(), changing.await.unwrap());
+        assert!(matches!(completed, Ok(()) | Err(MetaError::ChallengeGone)), "round {round}: {completed:?}");
+        changed.unwrap_or_else(|e| panic!("round {round}: {e:?}"));
+        let live = live_devices(meta, &me.user).await;
+        if all_gone {
+            assert!(live.is_empty(), "round {round}: {live:?}");
+        } else {
+            assert!(live.iter().all(|d| *d == me.first), "round {round}: {live:?}");
+        }
+        assert_revoke_columns_agree(&meta.list_devices(me.user.id).await.unwrap());
+    }
+}
+
+/// Turning two-factor sign-in on or off while a password sign-in is under way: a device made without a second factor
+/// before it is signed out by the turn-on, and one checked before it makes no device at all.
+async fn turning_two_factor_on_and_off_at_the_same_moment_as_a_sign_in(meta: &Meta) {
+    for round in 0..8 {
+        let name = format!("on{round}");
+        let ana = user(meta, &name).await;
+        let first = device(meta, &ana).await;
+        let actor = DeviceActor { user: ana.id, device: first, password_hash: "$argon2id$stub".to_owned() };
+        meta.two_factor_begin_setup(&actor, b"cipher", SETUP_AT).await.unwrap();
+        let generation = gen_of(meta, &name).await;
+        let (m1, m2) = (meta.clone(), meta.clone());
+        let id = ana.id;
+        let signing = tokio::spawn(async move {
+            m1.sign_in(id, ("$argon2id$stub", generation), "late", &DeviceClient::default(), &token(), &new_challenge(), SETUP_AT + 5).await
+        });
+        let hashes: Vec<[u8; 32]> = (0..RECOVERY_CODES).map(|_| code(INVITE_CHARS).hash()).collect();
+        let enabling = tokio::spawn(async move { m2.two_factor_confirm(id, first, &*right(FIRST_STEP), &hashes, SETUP_AT + 5).await });
+        let (signed, enabled) = (signing.await.unwrap(), enabling.await.unwrap());
+        enabled.unwrap();
+        assert!(matches!(signed, Ok(None | Some(SignIn::Device(_)))), "round {round}: a sign-in that checked before the turn-on makes no challenge");
+        assert_eq!(live_devices(meta, &ana).await, vec![first], "round {round}: only the device that turned it on");
+
+        // And off: a challenge made under it works once, but a device it made is signed out by the turn-off.
+        let generation = gen_of(meta, &name).await;
+        let chal = new_challenge();
+        meta.sign_in(id, ("$argon2id$stub", generation), "x", &DeviceClient::default(), &token(), &chal, SETUP_AT + 6).await.unwrap();
+        let (m1, m2) = (meta.clone(), meta.clone());
+        let (hash, other_code) = (chal.id_hash, code(INVITE_CHARS).hash());
+        let completing =
+            tokio::spawn(async move { m1.complete_second_factor(&hash, &Proof::Recovery(other_code), &token(), SETUP_AT + 7).await.map(|_| ()) });
+        let actor = DeviceActor { user: id, device: first, password_hash: "$argon2id$stub".to_owned() };
+        let disabling = tokio::spawn(async move { m2.two_factor_disable(&actor, &totp(&right(FIRST_STEP + 1)), SETUP_AT + 7).await.map(|_| ()) });
+        let completed = completing.await.unwrap();
+        disabling.await.unwrap().unwrap();
+        assert!(matches!(completed, Err(MetaError::TwoFactorInvalid | MetaError::ChallengeGone)), "round {round}: {completed:?}");
+        assert_eq!(live_devices(meta, &ana).await, vec![first]);
+    }
+}
+
+async fn an_invite_to_a_protected_account_needs_the_second_factor_in_the_same_transaction(meta: &Meta) {
+    let me = protected(meta, "ana").await;
+    let id = me.user.id;
+    let invite = code(INVITE_CHARS);
+    meta.create_invite("ana", &invite.hash(), SETUP_AT + 10, INVITE_TTL_MS).await.unwrap();
+    // No second factor: refused and the invite is kept (not used up), and nothing is counted.
+    assert!(matches!(redeem_with_factor(meta, &invite.hash(), None, SETUP_AT + 11).await, Err(MetaError::TwoFactorRequired)));
+    let old_call = meta.redeem_with(&invite.hash(), "x", &DeviceClient::default(), &token(), None, SETUP_AT + 11).await;
+    assert!(matches!(old_call, Err(MetaError::TwoFactorRequired)));
+    // Wrong factors: refused, the invite stays, and nine of them leave the counters just short of the lock.
+    for n in 1..=9 {
+        let result = redeem_with_factor(meta, &invite.hash(), Some(&totp(&wrong())), SETUP_AT + 12).await;
+        assert!(matches!(result, Err(MetaError::TwoFactorInvalid)), "wrong factor {n}: {result:?}");
+    }
+    assert_eq!(meta.invite_needs_password(&invite.hash(), SETUP_AT + 12).await.unwrap(), Some(false), "the invite is still there");
+    // The tenth locks, with the invite still there, and a right one is refused while it lasts.
+    assert!(matches!(redeem_with_factor(meta, &invite.hash(), Some(&totp(&wrong())), SETUP_AT + 12).await, Err(MetaError::TwoFactorInvalid)));
+    let locked = redeem_with_factor(meta, &invite.hash(), Some(&totp(&right(FIRST_STEP + 1))), SETUP_AT + 13).await;
+    assert!(matches!(locked, Err(MetaError::TwoFactorLocked { .. })), "{locked:?}");
+    // A step that was used is wrong, even after the lock.
+    let after = SETUP_AT + 12 + 15 * MINUTE + 1;
+    let replay = redeem_with_factor(meta, &invite.hash(), Some(&totp(&right(FIRST_STEP))), after).await;
+    assert!(matches!(replay, Err(MetaError::TwoFactorInvalid)), "the set-up's own step: {replay:?}");
+    assert_eq!(meta.invite_needs_password(&invite.hash(), after).await.unwrap(), Some(false), "still there");
+    assert_eq!(live_devices(meta, &me.user).await, vec![me.first], "no device was made by any of it");
+    let _ = id;
+
+    // A fresh account: a new step is right, and the invite, the step and the device go together.
+    let bea = protected(meta, "bea").await;
+    let invite = code(INVITE_CHARS);
+    meta.create_invite("bea", &invite.hash(), SETUP_AT + 10, INVITE_TTL_MS).await.unwrap();
+    let device = redeem_with_factor(meta, &invite.hash(), Some(&totp(&right(FIRST_STEP + 1))), SETUP_AT + 20).await.unwrap();
+    assert_eq!(live_devices(meta, &bea.user).await.len(), 2);
+    assert!(live_devices(meta, &bea.user).await.contains(&device));
+    assert_eq!(meta.invite_needs_password(&invite.hash(), SETUP_AT + 21).await.unwrap(), None, "used up with the device");
+    // Nobody else can use that step now (sign-in and join share the counter).
+    assert!(matches!(confirm_with(meta, bea.user.id, Some(FIRST_STEP + 1), SETUP_AT + 22).await, Err(MetaError::TwoFactorInvalid)));
+    // A pairing needs no second factor: only a signed-in device can make one.
+    let pairing = code(PAIRING_CHARS);
+    meta.create_pairing(bea.user.id, bea.first, &pairing.hash(), SETUP_AT + 30).await.unwrap();
+    meta.redeem_with(&pairing.hash(), "paired", &DeviceClient::default(), &token(), None, SETUP_AT + 31).await.unwrap();
+}
+
+async fn a_reset_code_for_a_protected_account_needs_the_factor_unless_it_turns_it_off(meta: &Meta) {
+    let (_, admin) = admin_actor(meta, "root").await;
+    let admin = AdminActor { two_factor: false, ..admin };
+    let me = protected(meta, "ana").await;
+    let (id, stale) = (me.user.id, me.hashes());
+    let reset = code(INVITE_CHARS);
+    meta.admin_issue_reset(&admin, id, &reset.hash(), false, SETUP_AT + 10, RESET_TTL_MS).await.unwrap();
+    assert!(matches!(
+        meta.redeem_with(&reset.hash(), "pc", &DeviceClient::default(), &token(), Some("$argon2id$fresh"), SETUP_AT + 11).await,
+        Err(MetaError::TwoFactorRequired)
+    ));
+    assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$stub", "nothing changed");
+    assert!(matches!(
+        meta.redeem_with_second_factor(
+            &reset.hash(),
+            "pc",
+            &DeviceClient::default(),
+            &token(),
+            Some("$argon2id$fresh"),
+            Some(&totp(&wrong())),
+            SETUP_AT + 11
+        )
+        .await,
+        Err(MetaError::TwoFactorInvalid)
+    ));
+    assert_eq!(live_devices(meta, &me.user).await, vec![me.first], "the failed redeem signed nothing out");
+    let first_done = meta
+        .redeem_with_second_factor(
+            &reset.hash(),
+            "pc",
+            &DeviceClient::default(),
+            &token(),
+            Some("$argon2id$fresh"),
+            Some(&Proof::Recovery(stale[0])),
+            SETUP_AT + 12,
+        )
+        .await
+        .unwrap();
+    let done = &first_done;
+    assert_eq!(done.revoked, vec![me.first]);
+    assert!(meta.two_factor_enabled(id).await.unwrap(), "the code did not turn two-factor sign-in off");
+    assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$fresh");
+
+    // A code made to turn it off asks for no second factor, turns it off and signs everything out.
+    let reset = code(INVITE_CHARS);
+    meta.admin_issue_reset(&admin, id, &reset.hash(), true, SETUP_AT + 20, RESET_TTL_MS).await.unwrap();
+    let done = meta.redeem_with(&reset.hash(), "pc2", &DeviceClient::default(), &token(), Some("$argon2id$newer"), SETUP_AT + 21).await.unwrap();
+    assert_eq!(done.revoked, vec![first_done.device], "the computer of the first redeem is signed out with the rest");
+    assert!(!meta.two_factor_enabled(id).await.unwrap());
+    assert_eq!(meta.two_factor_info(id, SETUP_AT + 22).await.unwrap().recovery_codes_left, 0);
+    assert_eq!(live_devices(meta, &me.user).await, vec![done.device], "the redeeming computer is the only one signed in");
+    // An account without two-factor sign-in redeems a reset code as it always did, whatever the flag.
+    let plain = user(meta, "plain").await;
+    let reset = code(INVITE_CHARS);
+    meta.admin_issue_reset(&admin, plain.id, &reset.hash(), false, SETUP_AT + 30, RESET_TTL_MS).await.unwrap();
+    meta.redeem_with(&reset.hash(), "pc", &DeviceClient::default(), &token(), Some("$argon2id$fresh"), SETUP_AT + 31).await.unwrap();
+}
+
+/// The admin's own two-factor state is compared again in every change, and resetting someone's two-factor sign-in, or another
+/// admin's password, needs the acting admin's own.
+async fn admins_two_factor_is_checked_in_the_change_and_resets_need_it(meta: &Meta) {
+    let (root, plain_actor) = admin_actor(meta, "root").await;
+    let (other, _) = admin_actor(meta, "other").await;
+    let member = protected(meta, "member").await;
+    let (boss_admin, boss_actor) = {
+        let (u, a) = admin_actor(meta, "boss").await;
+        (u, a)
+    };
+    // Turn two-factor sign-in on for the acting admin "boss" (device `boss_actor.device`).
+    let actor_for = DeviceActor { user: boss_admin.id, device: boss_actor.device, password_hash: ADMIN_HASH.to_owned() };
+    meta.two_factor_begin_setup(&actor_for, b"cipher", SETUP_AT).await.unwrap();
+    meta.two_factor_confirm(boss_admin.id, boss_actor.device, &*right(FIRST_STEP), &[code(INVITE_CHARS).hash()], SETUP_AT + 1).await.unwrap();
+    // A confirmation that was given when it was off, and a change after it turned on, conflict (and the other way round).
+    let hash = code(INVITE_CHARS).hash();
+    let result = meta.admin_issue_invite(&boss_actor, member.user.id, &hash, SETUP_AT + 2, INVITE_TTL_MS).await;
+    assert!(matches!(result, Err(MetaError::Conflict(_))), "{result:?}");
+    let with_factor = AdminActor { two_factor: true, ..boss_actor.clone() };
+    let result = meta.admin_issue_invite(&with_factor, member.user.id, &hash, SETUP_AT + 2, INVITE_TTL_MS).await;
+    assert!(matches!(result, Err(MetaError::Conflict(_))), "it has a password: {result:?}");
+    let result =
+        meta.admin_issue_invite(&AdminActor { two_factor: true, ..plain_actor.clone() }, member.user.id, &hash, SETUP_AT + 2, INVITE_TTL_MS).await;
+    assert!(matches!(result, Err(MetaError::Conflict(_))), "root has none: {result:?}");
+
+    // Resetting a member's two-factor sign-in: without the admin's own it works for a member, not for an admin.
+    let result = meta.admin_reset_two_factor(&plain_actor, other.id, SETUP_AT + 3).await;
+    assert!(matches!(result, Err(MetaError::Forbidden(_))), "another admin, no two-factor of one's own: {result:?}");
+    let result = meta.admin_issue_reset(&plain_actor, other.id, &hash, false, SETUP_AT + 3, RESET_TTL_MS).await;
+    assert!(matches!(result, Err(MetaError::Forbidden(_))), "{result:?}");
+    assert!(matches!(meta.admin_reset_two_factor(&plain_actor, root.id, SETUP_AT + 3).await, Err(MetaError::Invalid(_))), "not one's own");
+    assert!(matches!(meta.admin_reset_two_factor(&plain_actor, UserId(uuid::Uuid::now_v7()), SETUP_AT + 3).await, Err(MetaError::NotFound(_))));
+    // An admin with it may reset another admin's password, and that admin's two-factor sign-in (once they have one).
+    meta.admin_issue_reset(&with_factor, other.id, &hash, false, SETUP_AT + 4, RESET_TTL_MS).await.unwrap();
+    let result = meta.admin_reset_two_factor(&with_factor, other.id, SETUP_AT + 4).await;
+    assert!(matches!(result, Err(MetaError::Conflict(_))), "the other admin has none: {result:?}");
+    // A member's: everything of it goes, every device is signed out, the lock goes with it.
+    let revoked = meta.admin_reset_two_factor(&plain_actor, member.user.id, SETUP_AT + 5).await.unwrap();
+    assert_eq!(revoked, vec![member.first]);
+    assert!(!meta.two_factor_enabled(member.user.id).await.unwrap());
+    assert!(live_devices(meta, &member.user).await.is_empty());
+    let devices = meta.list_devices(member.user.id).await.unwrap();
+    assert!(devices.iter().any(|d| d.revoke_reason == Some(RevokeReason::TwoFactor)));
+    assert!(matches!(meta.admin_reset_two_factor(&plain_actor, member.user.id, SETUP_AT + 6).await, Err(MetaError::Conflict(_))), "twice");
+    let row = admin_view(meta, boss_admin.id).await;
+    assert!(row.two_factor_enabled);
+    assert!(!admin_view(meta, member.user.id).await.two_factor_enabled);
+}
+
+async fn the_command_line_resets_two_factor_and_the_account_shows_it(meta: &Meta) {
+    let me = protected(meta, "ana").await;
+    let id = me.user.id;
+    assert!(meta.account(id).await.unwrap().two_factor_enabled);
+    assert!(admin_view(meta, id).await.two_factor_enabled);
+    let generation = gen_of(meta, "ana").await;
+    meta.sign_in(id, ("$argon2id$stub", generation), "pc", &DeviceClient::default(), &token(), &new_challenge(), SETUP_AT + 5).await.unwrap();
+    meta.create_invite("ana", &code(INVITE_CHARS).hash(), SETUP_AT + 5, INVITE_TTL_MS).await.unwrap();
+    let revoked = meta.reset_two_factor(id, SETUP_AT + 6).await.unwrap();
+    assert_eq!(revoked, vec![me.first]);
+    assert!(!meta.account(id).await.unwrap().two_factor_enabled);
+    assert!(!admin_view(meta, id).await.two_factor_enabled);
+    assert!(!meta.revoke_invite("ana").await.unwrap());
+    assert!(matches!(meta.reset_two_factor(id, SETUP_AT + 7).await, Err(MetaError::Conflict(_))), "nothing to reset: nothing is signed out");
+    assert!(matches!(meta.reset_two_factor(UserId(uuid::Uuid::now_v7()), SETUP_AT + 7).await, Err(MetaError::NotFound(_))));
+    // After it a password sign-in gives a device again, and the account can set it up anew.
+    let generation = gen_of(meta, "ana").await;
+    let signed =
+        meta.sign_in(id, ("$argon2id$stub", generation), "pc", &DeviceClient::default(), &token(), &new_challenge(), SETUP_AT + 8).await.unwrap();
+    assert!(matches!(signed, Some(SignIn::Device(_))));
+}
+
+/// The key tools read the ciphertexts and replace one only if it is still the one they read.
+async fn secrets_are_listed_and_replaced_only_if_unchanged(meta: &Meta) {
+    let me = protected(meta, "ana").await;
+    let other = user(meta, "bob").await;
+    let dev = device(meta, &other).await;
+    let actor = DeviceActor { user: other.id, device: dev, password_hash: "$argon2id$stub".to_owned() };
+    meta.two_factor_begin_setup(&actor, b"cipher-pending", SETUP_AT).await.unwrap();
+    let listed = meta.two_factor_secrets(SETUP_AT + 1).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    let ana = listed.iter().find(|s| s.user == me.user.id).unwrap();
+    assert_eq!((ana.active.as_deref(), ana.pending.as_deref()), (Some(b"cipher-of-the-secret".as_slice()), None));
+    let bob = listed.iter().find(|s| s.user == other.id).unwrap();
+    assert_eq!((bob.active.as_deref(), bob.pending.as_deref()), (None, Some(b"cipher-pending".as_slice())));
+    let later = meta.two_factor_secrets(SETUP_AT + 11 * MINUTE).await.unwrap();
+    assert!(later.iter().find(|s| s.user == other.id).is_some_and(|s| s.pending.is_none()), "an expired set-up is not listed");
+    assert!(meta.two_factor_replace_ciphertext(me.user.id, false, b"cipher-of-the-secret", b"new-cipher").await.unwrap());
+    assert!(
+        !meta.two_factor_replace_ciphertext(me.user.id, false, b"cipher-of-the-secret", b"newer").await.unwrap(),
+        "no longer the one that was read"
+    );
+    assert!(meta.two_factor_replace_ciphertext(other.id, true, b"cipher-pending", b"new-pending").await.unwrap());
+    let listed = meta.two_factor_secrets(SETUP_AT + 1).await.unwrap();
+    assert_eq!(listed.iter().find(|s| s.user == me.user.id).unwrap().active.as_deref(), Some(b"new-cipher".as_slice()));
+    // A secret that isn't the account's is never touched.
+    assert!(!meta.two_factor_replace_ciphertext(UserId(uuid::Uuid::now_v7()), false, b"x", b"y").await.unwrap());
 }

@@ -16,6 +16,7 @@ mod join;
 mod live;
 mod schema;
 mod tree;
+mod two_factor;
 mod users;
 
 use std::str::FromStr;
@@ -39,6 +40,11 @@ pub use live::{
     MAX_LIVE_DOCUMENTS_HOLDING_UPDATES, MAX_LIVE_DOCUMENTS_PER_SPACE, MAX_LIVE_PAGE, SnapshotRef,
 };
 pub use tree::{MAX_PAGE_SAVE_BYTES, SpaceInfo};
+pub use two_factor::{
+    CHALLENGE_TTL_MS, Completed, DeviceActor, LOCK_AFTER_FAILURES, LOCK_BASE_MS, LOCK_MAX_MS, MAX_CHALLENGE_ATTEMPTS, MAX_OPEN_CHALLENGES,
+    MAX_SETUP_ATTEMPTS, NewChallenge, Proof, RECOVERY_CODES, SETUP_TTL_MS, SignIn, StoredSecrets, TotpVerifier, TwoFactorInfo, UnreadableSecret,
+    retry_after_secs,
+};
 pub use users::{
     AccountRecord, CLIENT_KINDS, DeviceAuth, DeviceClient, DeviceRecord, MAX_CLIENT_FIELD_BYTES, RevokeReason, Role, UserId, UserRecord,
     valid_username,
@@ -106,6 +112,23 @@ pub enum MetaError {
     /// code of it, never to a guesser.
     #[error("this account is disabled")]
     AccountDisabled,
+    /// The account has two-factor sign-in and the request carried no second factor; nothing was changed (an invite or
+    /// reset code is not used up).
+    #[error("this account needs its second factor")]
+    TwoFactorRequired,
+    /// A code or recovery code was wrong, or a code that was used before; its counters were committed and nothing else
+    /// was changed.
+    #[error("the second factor is wrong")]
+    TwoFactorInvalid,
+    /// Too many wrong second factors: every check is refused until `retry_after_ms` have passed.
+    #[error("the second factor is locked after too many wrong codes")]
+    TwoFactorLocked { retry_after_ms: i64 },
+    /// A set-up of two-factor sign-in is open on another device.
+    #[error("two-factor set-up is open on another device")]
+    TwoFactorPending,
+    /// A sign-in challenge that is unknown, expired, used or no longer fit, never saying which.
+    #[error("this sign-in step doesn't work any more")]
+    ChallengeGone,
     #[error("invalid input: {0}")]
     Invalid(&'static str),
     #[error("stored data is damaged: {0}")]
@@ -303,6 +326,13 @@ struct WriteTx {
 impl WriteTx {
     async fn commit(self) -> Result<(), MetaError> {
         self.tx.commit().await?;
+        Ok(())
+    }
+
+    /// Rolls back now, and (on SQLite) lets go of the write lock, for a caller that goes on to write something that must
+    /// survive the rollback.
+    async fn rollback(self) -> Result<(), MetaError> {
+        self.tx.rollback().await?;
         Ok(())
     }
 }
