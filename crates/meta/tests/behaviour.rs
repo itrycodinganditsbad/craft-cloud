@@ -2009,10 +2009,22 @@ async fn a_password_change_is_one_step(meta: &Meta) {
     // The old hash no longer matches, so the same change again (a replayed request) does nothing.
     assert!(matches!(meta.change_password(ana.id, "$argon2id$stub", "$argon2id$third", keep, NOW + 9).await, Err(MetaError::Conflict(_))));
     // A caller that was signed out meanwhile changes nothing either.
-    assert!(matches!(meta.change_password(ana.id, "$argon2id$new", "$argon2id$third", other, NOW + 9).await, Err(MetaError::DeviceRevoked)), "revoked");
-    assert!(matches!(meta.change_password(ana.id, "$argon2id$new", "$argon2id$third", DeviceId::generate(), NOW + 9).await, Err(MetaError::DeviceRevoked)), "unknown");
+    assert!(
+        matches!(meta.change_password(ana.id, "$argon2id$new", "$argon2id$third", other, NOW + 9).await, Err(MetaError::DeviceRevoked)),
+        "revoked"
+    );
+    assert!(
+        matches!(
+            meta.change_password(ana.id, "$argon2id$new", "$argon2id$third", DeviceId::generate(), NOW + 9).await,
+            Err(MetaError::DeviceRevoked)
+        ),
+        "unknown"
+    );
     let bobs_device = device(meta, &user(meta, "cy").await).await;
-    assert!(matches!(meta.change_password(ana.id, "$argon2id$new", "$argon2id$third", bobs_device, NOW + 9).await, Err(MetaError::DeviceRevoked)), "another account's");
+    assert!(
+        matches!(meta.change_password(ana.id, "$argon2id$new", "$argon2id$third", bobs_device, NOW + 9).await, Err(MetaError::DeviceRevoked)),
+        "another account's"
+    );
     assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$new");
     // Another account is never touched.
     assert_eq!(meta.user_by_name("bob").await.unwrap().unwrap().password_hash, "$argon2id$stub");
@@ -2196,27 +2208,25 @@ async fn a_failure_in_the_middle_changes_nothing(url: &str, postgres: bool) {
     meta.create_invite("ana", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
     break_pairing_deletes(url, postgres).await;
 
-    let unchanged = |meta: Meta| {
-        let ana = ana.clone();
-        async move {
-            assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$stub");
-            assert_eq!(meta.account(ana.id).await.unwrap().password_changed_ms, None);
-            let devices = meta.list_devices(ana.id).await.unwrap();
-            assert!(devices.iter().all(|d| !d.revoked && d.revoked_ms.is_none() && d.revoke_reason.is_none()), "{devices:?}");
-            assert!(meta.pairing_status(ana.id, pairing_id, NOW + 1).await.unwrap().is_some());
-            assert!(meta.pairing_status(ana.id, other_pairing, NOW + 1).await.unwrap().is_some());
-            assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 1).await.unwrap(), Some(false));
-        }
+    let invite_hash = invite.hash();
+    let unchanged = || async {
+        assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$stub");
+        assert_eq!(meta.account(ana.id).await.unwrap().password_changed_ms, None);
+        let devices = meta.list_devices(ana.id).await.unwrap();
+        assert!(devices.iter().all(|d| !d.revoked && d.revoked_ms.is_none() && d.revoke_reason.is_none()), "{devices:?}");
+        assert!(meta.pairing_status(ana.id, pairing_id, NOW + 1).await.unwrap().is_some());
+        assert!(meta.pairing_status(ana.id, other_pairing, NOW + 1).await.unwrap().is_some());
+        assert_eq!(meta.invite_needs_password(&invite_hash, NOW + 1).await.unwrap(), Some(false));
     };
     let failed = meta.change_password(ana.id, "$argon2id$stub", "$argon2id$new", keep, NOW + 2).await;
     assert!(matches!(failed, Err(MetaError::Db(_))), "{failed:?}");
-    unchanged(meta.clone()).await;
+    unchanged().await;
     let failed = meta.reset_password(ana.id, "$argon2id$new", false, NOW + 2).await;
     assert!(matches!(failed, Err(MetaError::Db(_))), "{failed:?}");
-    unchanged(meta.clone()).await;
+    unchanged().await;
     let failed = meta.revoke_other_devices(ana.id, keep, RevokeReason::Others, NOW + 2).await;
     assert!(matches!(failed, Err(MetaError::Db(_))), "{failed:?}");
-    unchanged(meta.clone()).await;
+    unchanged().await;
 
     mend_pairing_deletes(url).await;
     assert_eq!(meta.change_password(ana.id, "$argon2id$stub", "$argon2id$new", keep, NOW + 3).await.unwrap(), vec![other]);
