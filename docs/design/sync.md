@@ -610,10 +610,16 @@ changes locally, then pushes local changes. These rules came out of the simulati
     field is `400 invalid`; a wrong password is `403 wrong_password`, never 401, because the agent reads every 401 on a
     signed-in route as a revoked device. Tries are counted per account in the password change's limiter (5 wrong
     passwords in 15 minutes, then `429`; a right password is given back), and every check takes one of the
-    server-wide password-check slots. **Two-factor sign-in does not exist yet.** When it arrives, the same bodies get
-    optional `totp_code` and `recovery_code` fields, required of an admin who has it; servers ignore fields they do not
-    know, so clients can already send them. Until then, resetting another administrator's password through the API is
-    `403 forbidden` (the acting admin could not prove a second factor); the command line on the host is the way.
+    server-wide password-check slots. **An admin whose account has two-factor sign-in** adds `totp_code` (or a
+    `recovery_code`) to the same body: missing or wrong is `403 two_factor_invalid` (the field is a credential there, not
+    a form field; a code that is not six digits is `400 invalid`), too many wrong ones `429 two_factor_locked` with
+    `Retry-After`. The code is checked and used up by the confirmation, on the same counters, limiter and time-step rule
+    as sign-in's second step (below): **one 30-second step serves one change**, the next change takes the next code or
+    a recovery code. The password is told first: a wrong one is `403 wrong_password` whatever the code. Resetting another
+    **administrator's** password or two-factor sign-in takes the acting admin's own two-factor sign-in (`403 forbidden`
+    without it; the command line on the host is the way then). The change compares the admin's two-factor state with
+    the one the confirmation saw, under the account's lock, so a confirmation given before they turned it on or off is
+    `409 conflict`.
   - **The acting admin in the transaction.** After the password check (a slow Argon2id run) the admin's role, device or
     password can have changed. Every change locks, in this order, (1) the `last_admin` lock if it can take an
     administrator away, (2) the user rows of the actor and the target in ascending ID, (3) the rows derived from them,
@@ -715,6 +721,61 @@ changes locally, then pushes local changes. These rules came out of the simulati
   - **Personal data.** A row holds account and device IDs and times, which is personal data. `docs/server.md` says how long
     it is kept and why; the server stores no address.
   - Reading the log is not itself an event.
+- **Two-factor sign-in** (migration 0010, after the audit log's 0009): an account may turn on a TOTP second factor (RFC 6238: HMAC-SHA-1, six
+  digits, 30-second steps, one step either way for a clock that is a little off; the codes authenticator apps make) with
+  ten recovery codes. With it on, a right password gives **no token**: `POST /auth/login` answers `401
+  two_factor_required` with `two_factor: {challenge, expires_ms}`, and `POST /auth/login/second-factor` with the
+  challenge and a `totp_code` (or `recovery_code`) makes the device.
+  - **The secret** is 160 random bits, shown once (Base32 and an `otpauth://` URI) and stored only as an AES-256-GCM
+    ciphertext: a key-name byte, a 12-byte nonce and the ciphertext, with `craft-cloud:totp:v1:` and the account's ID as
+    associated data, so a ciphertext moved to another account does not open. The key is 32 random bytes in the file the
+    config names (`[two_factor] key_file`, relative to `config.toml`), which `init` makes and the **server never makes**
+    (a second server on the same Postgres database, or a restore without the key, would otherwise seal secrets
+    nobody can open); the AES key is BLAKE3 `derive_key("craft-cloud 2026 totp secret v1", key)` of it. The key's name is
+    the first byte of the BLAKE3 hash of the key file, so it is a function of the key and never given to another one.
+    **Fail closed**: when the database holds secrets, the server opens **every** one at start and refuses to run if the key
+    is missing or one does not open, naming the file. With no secrets and no key it runs, and set-up answers `503
+    two_factor_unavailable`. **Rotation**: the new key in `key_file`, the old in `key_file_old`, then `two-factor rekey`
+    rewrites the secrets under the new one (one account at a time, repeatable, refusing when a secret has a key that is
+    neither), then `key_file_old` goes. Without the key the secrets of a backup are unusable: keep it apart from backups.
+  - **Recovery codes** are ten of 16 characters in the join codes' alphabet (80 bits, shown in groups of four), stored as
+    the BLAKE3 hash of the normalised code, no pepper: 80 bits can't be searched even from a leaked database, and the codes
+    work whatever happens to the key. Each works once; new ones replace all the old. A recovery code stands in for a
+    code at sign-in, join, turning it off and the admin's confirmation.
+  - **Set-up** (`POST /account/two-factor/setup`, the password again) keeps a new secret for 10 minutes, bound to the
+    device that asked and apart from any active secret; another device gets `409 two_factor_pending`; five wrong codes use
+    it up. `confirm` with the first code turns it on, shows the recovery codes and, in the same transaction, signs every
+    other device out (`revoke_reason = two_factor`), raises `users.auth_gen` and deletes the account's invite,
+    pairings and challenges. Two confirmations at once turn it on once. Turning it off (`disable`: password and a code or
+    recovery code) does the same, and so do `user reset-2fa` and the admin's `reset-two-factor` (which sign **all** devices out).
+  - **The transaction contract.** Everything that issues a challenge or a device, or uses a proof up, locks the account's
+    row first (the order every other change of the account uses), checks again under the lock what the handler checked
+    before (the device still signed in, the password hash still the verified one, `auth_gen`, the account's **current**
+    two-factor state, the challenge), and only then acts. Sign-in's challenge is made in that transaction: a stale hash
+    is `401 unauthorized` like a wrong password, an account with it on gets a challenge and no device. The second
+    step finds the challenge by a plain read to learn the owner, locks the account, checks the challenge again, then uses up
+    the time step (or recovery code) **and** the challenge and makes the device in one transaction with one commit.
+    `join` does the same for an invite or reset code. A **time step is accepted once and only a later one after it**
+    (`last_accepted_step`, updated `WHERE last_accepted_step < step`, shared by sign-in and the admin's confirmations), so
+    two requests with one code can't both succeed. A challenge is 32 random bytes, kept as a BLAKE3 hash, good 5 minutes,
+    five tries, once; at most five are open per account (the oldest goes); the address it was made for is only an extra
+    binding (behind a proxy that hides addresses all clients share one), the secret token is what binds it. A password
+    change, a reset, turning it off or on and a disable delete the account's challenges.
+  - **Wrong proofs** are committed in a transaction of their own after the one that refused them rolled back (the invite
+    stays, the challenge stays, the counters survive). Ten wrong ones in a row lock the account's second factor for 15
+    minutes; each wrong one after a lock ran out doubles it, up to 24 hours; a right one resets it; `user reset-2fa` lifts
+    it. While it lasts every path (second step, join, turning off, new recovery codes, the admin's confirmation) answers
+    `429 two_factor_locked` with `Retry-After`. It is never permanent, so nobody with the bare password can lock an
+    account out for good. Separate limiter `second_factors`: 10 wrong codes
+    per account and 30 per address in 5 minutes (a right one is given back), and they count against the sign-in limiter.
+  - **Join**: an invite or reset code of an account with it on needs `totp_code` or `recovery_code` in the same body;
+    without it the answer is `401 two_factor_required` (its `challenge` is empty: `/join` has no challenge row, the same
+    body is sent again with the code) and the code is **not** used up; a wrong factor is `401 two_factor_invalid`, is not
+    given back to the address's join tries and counts against the account. A reset code made with `reset_two_factor`
+    turns it off instead of asking. **A pairing needs no second factor** (only a signed-in device can make one, and turning
+    two-factor sign-in on signs the other devices out), so **any valid device token can add devices**.
+  - **Status codes**: a wrong code is `401` at sign-in and join (not signed in) and `403` on every signed-in route, where a
+    401 would read as a revoked device. The 2FA bodies are at most 4 KiB and a malformed one is `400 invalid`.
 - **Join codes**: a machine can also get its device token with a code instead of a password. Codes are Crockford
   base32 (`0-9` and letters without I, L, O, U; on input case is ignored, O reads as 0, I and L as 1, dashes and spaces
   are dropped), shown in groups of four (`K7M4-Q9TX`), and stored only as their BLAKE3 hash (migration 0004:
@@ -768,26 +829,29 @@ changes locally, then pushes local changes. These rules came out of the simulati
   that bucket backup is done, or the admin keeps the bucket's own deleted-object retention longer than the
   GC grace. **Restore** sets a new epoch for every space.
 - **Admin CLI** (the way in without HTTP: it asks for no confirmation and does not enforce `last_admin`, since whoever runs it
-  has the files): `init`, `serve`, `user add|reset-password [--keep-devices]|invite [--revoke]`, `device list|revoke|revoke-all` and
-  `reset-epoch` exist; `user remove|quota`, `gc`, `verify` (re-hash every chunk), `backup <dir>` and `restore <dir>` come with M4.
+  has the files): `init` (which also makes the two-factor key file), `serve`, `user add|reset-password [--keep-devices]|invite [--revoke]|reset-2fa`,
+  `device list|revoke|revoke-all`, `two-factor rekey` and `reset-epoch` exist; `user remove|quota`, `gc`, `verify` (re-hash every chunk), `backup <dir>` and `restore <dir>` come with M4.
   `user invite` prints the join string and link when `public_url` is in the config, else the code and how to finish
   it; it logs that an invite was made (the username at debug only, never the code).
 - No web UI in v1. No telemetry, no update check.
 
 API (`/api/v1`, JSON except chunk and manifest bodies; every signed-in response carries the space's epoch in
 the `craft-epoch` header, and commits/tree/changes carry it in the body too). Errors are
-`{error, message, conflicts?, missing?, quota?}` with stable codes (`conflict` 409, `missing_chunks` 409,
+`{error, message, conflicts?, missing?, quota?, two_factor?}` with stable codes (`conflict` 409, `missing_chunks` 409,
 `resync_required` 410, `unauthorized` 401, `rate_limited` 429, `invalid` 400, `not_found` 404, `too_large` 413,
 `timeout` 408, `quota_exceeded` 507,
 `username_taken` 409, `invalid_code` 404, `password_required` 400, `weak_password` 400, `wrong_password` 403, `forbidden` 403 (an
-admin route called by a member), `account_disabled` 403 (sign-in and join only), `last_admin` 409, `internal` 500; the codes are constants in `craft-cloud-proto::api::codes`). Unknown routes and
+admin route called by a member), `account_disabled` 403 (sign-in and join only), `last_admin` 409, `two_factor_required` 401 (with
+`two_factor`), `two_factor_invalid` (401 at sign-in and join, 403 on signed-in routes), `two_factor_unavailable` 503,
+`two_factor_pending` 409, `two_factor_locked` 429 (with `Retry-After`), `internal` 500; the codes are constants in `craft-cloud-proto::api::codes`). Unknown routes and
 methods answer `not_found` / `invalid` (405) the same way:
 
 | Call | Purpose |
 |---|---|
 | `GET /info` (also unversioned at `/api/info`) | protocol versions, chunker parameter sets, limits (no auth); a client probes `/api/info` first |
 | `GET /space` | the signed-in user's space: space ID, root node ID, epoch, current seq, username |
-| `POST /auth/login` | username + password + device name (+ optional `client_kind` `agent`\|`desktop`\|`cli`, `platform` and `app_version`, each at most 32 bytes, shown in the device list and never a basis for a permission; an unknown kind or a control character is `invalid`, checked before the try is counted) → device ID + token (shown once); 10 tries per account and 30 per address per 5 minutes; a wrong password and an unknown user look the same |
+| `POST /auth/login` | username + password + device name (+ optional `client_kind` `agent`\|`desktop`\|`cli`, `platform` and `app_version`, each at most 32 bytes, shown in the device list and never a basis for a permission; an unknown kind or a control character is `invalid`, checked before the try is counted) → device ID + token (shown once); 10 tries per account and 30 per address per 5 minutes; a wrong password and an unknown user look the same. For an account with two-factor sign-in a right password gives **no token**: `401 two_factor_required` with `two_factor: {challenge, expires_ms}` (the challenge is good 5 minutes, five tries, once) |
+| `POST /auth/login/second-factor` | `{challenge, totp_code}` or `{challenge, recovery_code}` (no auth, at most 4 KiB) → device ID + token as a sign-in; a challenge that is unknown, expired, used or no longer fit is `401 unauthorized` (the same for each), a wrong code `401 two_factor_invalid`, a malformed one `400 invalid`, a lock `429 two_factor_locked` with `Retry-After`; `second_factors` limiter |
 | `GET /tree?after_seq=…&after_node=…&limit=…` | full listing for a first sync or a reconcile, in pages of up to 5,000 (cursor = changed seq + node ID) |
 | `GET /changes?since=N&after_seq=…&after_node=…&limit=…&wait=30` | changes after N, in pages, long-poll up to 60 s; `resync_required` if N is too old or ahead of the server |
 | `POST /chunks/missing` | which of these chunk IDs (up to 10,000) this space lacks |
@@ -795,7 +859,12 @@ methods answer `not_found` / `invalid` (405) the same way:
 | `PUT /manifests/{id}` / `GET /manifests/{id}` | one manifest (binary); the server checks the ID, the limits and that every chunk is present |
 | `POST /commit` | batch of version/mkdir/move/delete operations, one transaction; `409 conflict` listing every conflicting operation (a version whose manifest isn't uploaded is a `missing_manifest` conflict) |
 | `GET /nodes/{id}/history` / `POST /nodes/{id}/restore` | list versions / make an old one current (M4) |
-| `GET /account` | the signed-in account, flat: `{user_id, username, role, created_ms, password_changed_ms, two_factor_enabled}` (`password_changed_ms` is `null` until the password changes through the server, `two_factor_enabled` is always `false` for now) |
+| `GET /account` | the signed-in account, flat: `{user_id, username, role, created_ms, password_changed_ms, two_factor_enabled}` (`password_changed_ms` is `null` until the password changes through the server) |
+| `GET /account/two-factor` | `{enabled, enabled_ms, recovery_codes_left, pending}` |
+| `POST /account/two-factor/setup` | `{password}` → `{secret, otpauth_uri, expires_ms}` (secret Base32 without padding, shown once; the set-up lasts 10 minutes, belongs to this device, replaces none that is on). `409 conflict` when it is on, `409 two_factor_pending` when another device has a set-up open, `503 two_factor_unavailable` without a key, `403 wrong_password`; the password's tries are the password change's (5 wrong per account per 15 minutes) and take a check slot |
+| `POST /account/two-factor/confirm` | `{totp_code}` → `{recovery_codes: [10]}` shown once. Turns it on, signs every other device out, deletes the invite, pairings and challenges. At most 5 wrong codes per set-up; `403 two_factor_invalid`; `409 conflict` for no set-up, an expired one, or one another device started |
+| `POST /account/two-factor/disable` | `{password, totp_code}` or `{password, recovery_code}` → 204. Deletes the secret, codes and challenges and signs every other device out; wrong code `403 two_factor_invalid`, `429 two_factor_locked` |
+| `POST /account/two-factor/recovery-codes` | `{password, totp_code}` → `{recovery_codes: [10]}`; the old ones stop working |
 | `POST /account/password` | `{current_password, new_password}` → 204. Signs every *other* device out and deletes the account's open invite and pairings, in one transaction; the device that asked stays signed in. A wrong current password is `403 wrong_password` (never 401: see below), a new one that breaks the rules or equals the current one `400 weak_password`; 5 tries per account per 15 minutes (`429 rate_limited`); body at most 4 KiB, passwords at most 1,024 bytes |
 | `GET /devices` | your devices: `{id, name, created_ms, last_used_ms, revoked, current, client_kind, platform, app_version, revoked_ms, revoke_reason}`; the last five are new and a client may ignore them (`revoke_reason` is `user`, `others`, `password`, `admin`, `disabled`, `two_factor`, `idle` or `reset`) |
 | `PATCH /devices/{id}` | `{name}` (at most 4 KiB, the device-name rule) → 200 with the device. Only your own devices that are not revoked, otherwise `404 not_found` |
@@ -803,15 +872,16 @@ methods answer `not_found` / `invalid` (405) the same way:
 | `DELETE /devices/{id}` | signs one of your devices out → 204; its time and reason (`user`) are kept, and a second call changes neither |
 | `POST /pairings` | a new add-a-computer code from this device → `{id, code, expires_ms}` (the code shown once, normalised) |
 | `GET /pairings/{id}`, `DELETE /pairings/{id}` | one of your pairings: `{state: waiting\|used\|expired, device_name?}` / cancel it (204) |
-| `POST /join` | code + device name (+ password for an invite to a new account **and always for a password reset code**, + the optional client fields of a sign-in) → device ID + token, as a sign-in (no auth); `invalid_code`, `password_required`, `weak_password`, `account_disabled`, `rate_limited`. A reset code signs every other device of the account out |
+| `POST /join` | code + device name (+ password for an invite to a new account **and always for a password reset code**, + the optional client fields of a sign-in) → device ID + token, as a sign-in (no auth); `invalid_code`, `password_required`, `weak_password`, `account_disabled`, `rate_limited`. A reset code signs every other device of the account out. Optional `totp_code` or `recovery_code`: an invite or reset code of an account with two-factor sign-in needs one (`401 two_factor_required` without, code not used up; `401 two_factor_invalid`, not given back to the address's tries), unless the reset code was made with `reset_two_factor`; a pairing code never does |
 | `GET /admin/server` | (admin) `{version, users, devices_active, stored_bytes, live_bytes, storage_kind (disk\|s3\|memory), database_kind (sqlite\|postgres)}`: counters and kinds only, no path, address or setting |
-| `GET /admin/users?cursor&limit&query` | (admin) `{users: [{id, username, role, created_ms, disabled_ms, two_factor_enabled, devices_active, stored_bytes, quota_bytes, invite_pending}], next?}` by username; `limit` 1 to 200 (default 50, otherwise `invalid`); `cursor` is opaque (the last username, base64url) and `next` is missing on the last page; `query` finds usernames containing it (case-insensitive, at most 64 bytes of printable characters, `%` and `_` are ordinary characters). Accounts marked for removal are left out; `two_factor_enabled` is always `false` for now |
+| `GET /admin/users?cursor&limit&query` | (admin) `{users: [{id, username, role, created_ms, disabled_ms, two_factor_enabled, devices_active, stored_bytes, quota_bytes, invite_pending}], next?}` by username; `limit` 1 to 200 (default 50, otherwise `invalid`); `cursor` is opaque (the last username, base64url) and `next` is missing on the last page; `query` finds usernames containing it (case-insensitive, at most 64 bytes of printable characters, `%` and `_` are ordinary characters). Accounts marked for removal are left out |
 | `POST /admin/users` | (admin, confirmation) `{username, role, password}` → `{user, invite: {code, join_url?, expires_ms}}`: an account with no password and a 7-day invite; `username_taken` 409 (also for an account marked for removal), `invalid` for a bad name or role |
 | `PATCH /admin/users/{id}` | (admin, confirmation) `{role?, quota_bytes?, password}` → the user. Neither field is `invalid`; a missing `quota_bytes` leaves it, `null` removes it; `last_admin` 409 |
 | `POST /admin/users/{id}/disable`, `/enable` | (admin, confirmation) → 204. Disable signs every device out and deletes the codes and pairings; not oneself (`invalid`), `last_admin`; enabling an account marked for removal is `conflict` |
 | `DELETE /admin/users/{id}` | (admin, confirmation) → 202. Marks the account for removal as above; nothing is deleted |
 | `POST /admin/users/{id}/invite`, `DELETE …/invite` | (admin, confirmation) → `{code, join_url?, expires_ms}` / 204: an invite only for an account that has no password (`conflict` otherwise); the delete ends the account's invite or reset code (`not_found` when there is none) |
-| `POST /admin/users/{id}/password-reset` | (admin, confirmation) → `{code, join_url?, expires_ms}`: a one-hour reset code for a member (another admin's, or one's own: `forbidden` and `invalid`); redeemed at `POST /join` |
+| `POST /admin/users/{id}/password-reset` | (admin, confirmation) `{reset_two_factor?: bool}` → `{code, join_url?, expires_ms}`: a one-hour reset code, redeemed at `POST /join`; with `reset_two_factor` redeeming it also turns the account's two-factor sign-in off, else an account that has it needs its second factor to redeem. Another admin's needs two-factor sign-in on the acting admin's own (`forbidden`), one's own is `invalid` |
+| `POST /admin/users/{id}/reset-two-factor` | (admin, confirmation) → 204: takes the account's two-factor sign-in away, deletes its challenges and signs **every** device out (`revoke_reason = two_factor`); not one's own (`invalid`), none to reset is `409 conflict`, another admin's needs the acting admin's own two-factor sign-in (`forbidden`) |
 | `GET /admin/users/{id}/devices`, `DELETE …/devices/{device_id}` | (admin; the delete with confirmation) → `{devices: [device as in GET /devices]}`, revoked ones too / 204 (`revoke_reason = admin`); another user's device or an unknown user is `not_found` |
 | `GET /account/activity?cursor&before_ms&limit` | the signed-in account's own security events, newest first: `{events: [event], next?}`; the events it acted in or was the target of, with the device shown only for its own acts, and the details only of events about itself (not of what a former administrator once did to others). `limit` 1 to 100 (default 50, otherwise `invalid`); `cursor` is opaque and exclusive and wins over `before_ms`, which only limits the first page; a cursor this server did not make is `invalid` |
 | `GET /admin/audit?cursor&before_ms&limit&user&action` | (admin) the whole log in the same form (`limit` up to 200); `user` is an account ID (events it acted in or was the target of), `action` an event name or a group ending in a dot like `auth.`; anything else is `invalid` |
@@ -834,6 +904,7 @@ methods answer `not_found` / `invalid` (405) the same way:
   "this device was revoked" and signs out. A wrong password on a route that asks for one (`POST /account/password`) is
   therefore `403 wrong_password`; 401 is for a missing, unknown or revoked token (a disabled account's tokens are revoked), and for
   the sign-in and join routes. The admin routes follow the same rule: a wrong confirmation password is 403, a member is 403.
+  A wrong code or recovery code is `403 two_factor_invalid` on a signed-in route and `401` only at sign-in's second step and join.
 - After an admin restores a backup they run `craft-cloud-server reset-epoch --all`; agents then reconcile.
 
 ## Agent and launcher API

@@ -25,6 +25,9 @@ For a non-loopback `--listen`, `init` also needs `--behind-proxy` and the proxy'
 
 For Postgres or S3, edit `[database]` and `[storage]` in `config.toml`.
 
+`init` also makes `two-factor.key` next to `config.toml` and names it in the config (`[two_factor] key_file`). It is the key
+for two-factor sign-in (below). **Back it up, apart from your database backups.**
+
 To cap what one account may store, set `stored_bytes_per_user` (in bytes; there is no cap by default) in
 `config.toml`. It counts every chunk and manifest an account uploaded once, and nothing frees space until
 garbage collection arrives, including what a refused file stored before it was refused. A file that would go
@@ -75,12 +78,51 @@ ends, it is answered `401 unauthorized`, never with changes); every other reques
 unauthorized`). Devices signed out through the API end their live connections
 immediately.
 
+## Two-factor sign-in
+
+An account can turn on a second factor in an app that offers it: a code from an authenticator app (TOTP: Aegis, 1Password,
+Google Authenticator and the like), with ten recovery codes to keep. With it on, a right password does not sign anyone in:
+the app also asks for the code, and so does joining a computer with an invite or an admin's password reset code. A
+computer joined with an add-a-computer code (a pairing) asks for nothing, since only a computer that is already signed in
+can make one: **any signed-in computer can add more**, and turning two-factor sign-in on signs every other one out.
+
+- **The key.** The authenticator's secret is stored only encrypted (AES-256-GCM, bound to its account), with the key in the
+  file `[two_factor] key_file` names (32 random bytes; a relative path is relative to `config.toml`). `init` makes it; **the
+  server never makes it** (a second server on the same database, or a restore without the key, would otherwise seal
+  secrets nobody can open). **Without this key the secrets in a database backup are unusable**: keep a copy apart from
+  the backups, and keep it out of everyone's reach. On Unix `init` makes it owner-only;
+  **on Windows the server sets no file permissions**, so put it somewhere only the account that runs the server can read.
+  The recovery codes do not depend on the key, so they still work if it is lost; the authenticator codes do not.
+- **Failing closed.** When the database holds two-factor secrets, `serve` opens every one of them at start and refuses to
+  run if the key is missing, unreadable, or does not open all of them; the error names the key file the config expects.
+  A server without a key and without any secrets runs, and setting it up answers `503 two_factor_unavailable`. Several
+  servers on one Postgres database must all have the same key.
+- **Rotating the key.** Make a new key file, put it in `key_file` and the old one in `key_file_old`, run
+  `craft-cloud-server two-factor rekey --config cc-data/config.toml` (it rewrites every secret under the new key, one
+  account at a time, can be run again, prints only counts, and refuses without changing anything if a secret was sealed with
+  a key that is neither), then remove `key_file_old`. The server runs in the middle of a rotation, with both.
+- **A locked-out account.** A person who lost their authenticator and their recovery codes: `craft-cloud-server user
+  --config cc-data/config.toml reset-2fa name` deletes its two-factor secret, recovery codes and sign-in challenges, lifts
+  any lock, **signs every device out** (it prints how many) and deletes its open invite and add-a-computer codes. They sign
+  in with their password and can set it up again. Over HTTP an admin does the same with `POST /admin/users/{id}/reset-two-factor`
+  (below). Both need no key.
+- **Wrong codes lock for a while.** Ten wrong codes or recovery codes in a row (at sign-in, joining, turning it off,
+  making new recovery codes, an admin's confirmation) lock the account's second factor for 15 minutes; each wrong one after
+  that doubles the time, up to 24 hours; a right one resets it. While it lasts everything answers `429 two_factor_locked`
+  with `Retry-After`. The lock is never for good, so someone who only has a password can not lock an account out forever.
+  Wrong codes also count against the sign-in limit (10 per account and 30 per address in 5 minutes, then `429`).
+- **Recovery codes** are ten of 16 letters and digits (shown in groups of four), each good once. Only a hash is stored.
+- **Older apps.** An agent from before this release shows every `401` at sign-in as "wrong password", so an account with
+  two-factor sign-in can't sign in with it (it never gets a token). Update the server first, then the Craft Cloud
+  desktop package with its agent, then stand-alone agents.
+- **Logs** never carry a secret, code, recovery code, challenge, password or key.
+
 ## Managing accounts over HTTP
 
 Accounts have a role, `admin` or `member`, and the routes under `/api/v1/admin` are for admins only (the first admin is
 still made by `init`). They are an API for a tool or a later admin app: the server brings no web page. Every change asks
-for **a fresh confirmation in its body**, the acting admin's own current password, because a device's token never
-expires and must not be enough on its own:
+for **a fresh confirmation in its body**, the acting admin's own current password (and, for an admin who has two-factor
+sign-in, a `totp_code` or `recovery_code` too), because a device's token never expires and must not be enough on its own:
 
 ```sh
 curl -s -X POST https://cloud.example.org/api/v1/admin/users/USER_ID/disable \
@@ -93,9 +135,11 @@ curl -s -X POST https://cloud.example.org/api/v1/admin/users/USER_ID/disable \
 - `POST /admin/users` makes an account (role `admin` or `member`) with no password and gives an **invite**, shown once:
   the person chooses their password when they join with it (a whole join link is included when `public_url` is set).
   `POST /admin/users/{id}/invite` makes a new invite, but only for an account that still has no password; for one with a
-  password, make a **password reset code** (`POST …/password-reset`, good for an hour, members only). Whoever redeems
+  password, make a **password reset code** (`POST …/password-reset`, good for an hour). Whoever redeems
   it in Craft Cloud chooses a new password, **every device of the account is signed out, and the computer that redeems
-  it is signed in**. Codes are only shown in the answer, never in the log.
+  it is signed in**. If the account has two-factor sign-in, redeeming the code needs its second factor too, unless the
+  admin asked for `"reset_two_factor": true`, which turns it off with the redeem. Codes are only shown in the answer,
+  never in the log.
 - `PATCH /admin/users/{id}` changes the role and/or `quota_bytes`, a limit on what that account may store that replaces
   `stored_bytes_per_user` for it (at least 4 MiB; `null` removes it; it also holds when there is no server-wide cap; one
   below what the account stores deletes nothing and refuses new bytes).
@@ -105,11 +149,17 @@ curl -s -X POST https://cloud.example.org/api/v1/admin/users/USER_ID/disable \
   garbage collection). You cannot disable or remove yourself, and the last enabled admin cannot be demoted, disabled or
   removed (`last_admin`).
 - `GET /admin/users/{id}/devices` lists an account's devices and `DELETE …/devices/{device_id}` signs one out.
-- Resetting another **admin's** password over HTTP is refused until the server has two-factor sign-in: use the command
-  line on the host. When it arrives, the confirmation takes a `totp_code` (or `recovery_code`) as well for admins who have it.
+- `POST …/reset-two-factor` takes an account's two-factor sign-in away (it lost its authenticator and its recovery codes):
+  its secret, recovery codes and sign-in challenges go, and **every device is signed out**. Not your own account (turn
+  that off in your account), and nothing to reset is `409 conflict`.
+- Resetting another **admin's** password or two-factor sign-in over HTTP needs two-factor sign-in on your own account
+  (`403 forbidden` without it); the command line on the host is the way if no admin has it.
+- **A code serves one change.** The server accepts one 30-second step of an account's authenticator once, and only a later
+  step after it; sign-in and the admin's confirmations share that. So a second change in the same 30 seconds takes the
+  next code (wait for it) or an unused recovery code.
 
 A wrong confirmation password is `403 wrong_password` (never 401); five wrong ones in 15 minutes hold the account off for
-the rest of the window. A signed-out device's live connection ends at once in the server process that did it; another
+the rest of the window. A wrong or missing code for an admin who has two-factor sign-in is `403 two_factor_invalid`. A signed-out device's live connection ends at once in the server process that did it; another
 server process on the same database, or the command line, finds out at the connection's next ping (within about 30 seconds).
 The command line stays as the way in without HTTP and enforces neither the confirmation nor `last_admin`.
 
@@ -156,15 +206,21 @@ who can write to the database can change it; keep the database file and Postgres
 ## Upgrading
 
 This release adds migrations (`0007`, device sessions, `0008`, the admin API: reset codes, per-account quotas, the
-removal mark, and `0009`, the audit log). The server applies it when it starts. A database it
+removal mark, `0009`, the audit log, and `0010`, two-factor sign-in: the secrets, recovery codes and sign-in challenges).
+The server applies them when it starts. A database it
 has migrated cannot be opened by an older server: that one refuses to start ("the database was created by a newer Craft
 Cloud"). Rolling back therefore means restoring a backup taken before the upgrade, so take one first. Upgrade the
-server first: agents and apps keep working unchanged. A config that has the new `[audit]` section is refused by an older
-server (it rejects unknown settings), so remove the section before going back to one.
+server first: agents and apps keep working unchanged, **except that an account that turns on two-factor sign-in can't sign in
+with an agent from before this release** (see "Two-factor sign-in"). Then update the desktop package with its matching agent,
+then agents installed on their own. The `init` of a data directory made before this release did not make a key: add one
+with `[two_factor] key_file` in `config.toml` (32 random bytes, owner-only) before anyone sets up two-factor sign-in. A config
+that has the new `[audit]` section is refused by an older server (it rejects unknown settings), so remove the section before
+going back to one.
 
 ## Restoring a backup
 
-With the server stopped, restore the database and the chunk storage from the backup, then run
+With the server stopped, restore the database and the chunk storage from the backup (and the two-factor key file, if
+accounts use two-factor sign-in: the server will not start without it), then run
 `craft-cloud-server reset-epoch --config cc-data/config.toml --all`, and only then start `serve` again. Every
 account then starts a new epoch, so each synced machine reconciles with the restored state instead of trusting its
 own change counter. `reset-epoch --config … name` resets one account. (A reset run while the server is up still
