@@ -10,6 +10,7 @@ use craft_cloud_proto::DeviceId;
 use craft_cloud_store::Store;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::audit::AuditExportLimits;
 use crate::auth::hash_password;
 use crate::error::ApiError;
 use crate::live::LiveHub;
@@ -115,6 +116,8 @@ pub struct AppState {
     /// The live service's connections and subscriptions ([`crate::live`]).
     pub live: LiveHub,
     pub limits: Limits,
+    /// How the audit export is cut into pages and bounded ([`crate::audit`]).
+    pub audit_export: AuditExportLimits,
     /// The address computers reach the server at (`public_url` in the config), for the join links of the admin API.
     pub public_url: Option<String>,
     /// Chunk and manifest bodies being received, per user ([`Limits::bodies_per_user`]).
@@ -146,6 +149,7 @@ impl AppState {
             manifests: PerUser::new(limits.manifests_per_user),
             password_checks: Arc::new(Semaphore::new(limits.password_checks)),
             limits,
+            audit_export: AuditExportLimits::default(),
             public_url: None,
             touches: Mutex::new(HashMap::new()),
             dummy_hash: hash_password("craft-cloud dummy password")?,
@@ -159,6 +163,12 @@ impl AppState {
         self.manifests = PerUser::new(limits.manifests_per_user);
         self.password_checks = Arc::new(Semaphore::new(limits.password_checks));
         self.limits = limits;
+        self
+    }
+
+    /// The state with other bounds for the audit export (tests use small ones).
+    pub fn with_audit_export(mut self, limits: AuditExportLimits) -> Self {
+        self.audit_export = limits;
         self
     }
 

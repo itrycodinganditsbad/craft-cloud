@@ -443,3 +443,135 @@ async fn user_invite_replaces_a_password_reset_code() {
     // The command line does not enforce what the HTTP API does: it can reset the last admin's password.
     assert!(cli(&["user", "--config", c, "reset-password", "ana"], "a brand new password\n").await.unwrap().contains("password changed for ana"));
 }
+
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// A failed sign-in's event `days` days ago, written through the store a config opens, for the pruning to find.
+async fn failure_days_ago(config: &Config, days: i64, target: Option<craft_cloud_meta::UserId>) {
+    use craft_cloud_meta::{AuditAction, AuditFailure, Step};
+    // Opened without the retention, which would prune the older events when a later one is written: the events are dated
+    // in the past here, and the server's clock is not.
+    let meta = craft_cloud_meta::Meta::open(&config.database.url).await.unwrap();
+    let failure = AuditFailure { action: AuditAction::AuthLoginFailed, target, step: Step::Password };
+    meta.audit_record_failure(failure, craft_cloud_server::state::now_ms() - days * DAY_MS).await.unwrap();
+}
+
+/// The command line's recovery actions write their `cli.*` events, with no account acting, and `audit list` shows them as
+/// text, newest first, with IDs and no names.
+#[tokio::test]
+async fn the_recovery_commands_write_events_and_audit_list_shows_them() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config_path = dir.join("config.toml");
+    let c = config_path.to_str().unwrap();
+    cli(&["user", "--config", c, "add", "bob"], "bob password 1\n").await.unwrap();
+    let (meta, _) = craft_cloud_server::cli::open(&Config::load(&config_path).unwrap()).await.unwrap();
+    let bob = meta.user_by_name("bob").await.unwrap().unwrap();
+    // Adding an account is not one of the events.
+    assert!(cli(&["audit", "--config", c, "list"], "").await.unwrap().ends_with("0 event(s)\n"));
+
+    let first = meta.create_device(bob.id, "pc", &[1; 32], 0).await.unwrap();
+    let _second = meta.create_device(bob.id, "laptop", &[2; 32], 0).await.unwrap();
+    cli(&["user", "--config", c, "reset-password", "bob", "--keep-devices"], "a brand new password\n").await.unwrap();
+    cli(&["device", "--config", c, "revoke", "bob", &first.to_string()], "").await.unwrap();
+    // The same again changes nothing, and so writes nothing.
+    cli(&["device", "--config", c, "revoke", "bob", &first.to_string()], "").await.unwrap();
+    meta.create_device(bob.id, "third", &[3; 32], 0).await.unwrap();
+    cli(&["device", "--config", c, "revoke-all", "bob"], "").await.unwrap();
+    cli(&["device", "--config", c, "revoke-all", "bob"], "").await.unwrap();
+
+    let events = meta.audit_list(&craft_cloud_meta::AuditQuery { limit: 100, ..Default::default() }).await.unwrap();
+    let mut names: Vec<&str> = events.iter().map(|e| e.action.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["cli.device_revoked", "cli.devices_revoked_all", "cli.password_reset"]);
+    for e in &events {
+        assert_eq!(
+            (e.actor_user, e.actor_device, e.target_id),
+            (None, None, Some(bob.id.0)),
+            "the command line is no account: {}",
+            e.action.as_str()
+        );
+    }
+
+    let out = cli(&["audit", "--config", c, "list"], "").await.unwrap();
+    assert!(out.ends_with("3 event(s)\n"), "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].contains("cli.devices_revoked_all") && lines[0].contains("success") && lines[0].contains("actor=-  device=-"), "{out}");
+    assert!(lines[0].contains(&format!("target=user:{}", bob.id.0)) && lines[0].contains(r#"{"revoked":2}"#), "{out}");
+    assert!(lines[2].contains("cli.password_reset") && lines[2].contains(r#"{"revoked":0}"#), "{out}");
+    // Accounts are named by ID: no name, no device name, no password in the text.
+    for secret in ["bob", "ana", "laptop", "third", "$argon2"] {
+        assert!(!out.contains(secret), "{secret} in {out}");
+    }
+    // Filters, on a name or on a group of names, on an account, and a limit.
+    assert!(cli(&["audit", "--config", c, "list", "--action", "cli."], "").await.unwrap().ends_with("3 event(s)\n"));
+    assert!(cli(&["audit", "--config", c, "list", "--action", "cli.password_reset"], "").await.unwrap().ends_with("1 event(s)\n"));
+    assert!(cli(&["audit", "--config", c, "list", "--action", "auth."], "").await.unwrap().ends_with("0 event(s)\n"));
+    assert!(cli(&["audit", "--config", c, "list", "--user", "Bob"], "").await.unwrap().ends_with("3 event(s)\n"));
+    assert!(cli(&["audit", "--config", c, "list", "--user", "ana"], "").await.unwrap().ends_with("0 event(s)\n"));
+    assert!(cli(&["audit", "--config", c, "list", "--limit", "2"], "").await.unwrap().ends_with("2 event(s)\n"));
+    // Bad input is a usage error.
+    for bad in [&["--limit", "0"][..], &["--limit", "201"], &["--action", "bogus"], &["--action", "cli"], &["--user", "nobody"]] {
+        let mut args = vec!["audit", "--config", c, "list"];
+        args.extend_from_slice(bad);
+        assert!(matches!(cli(&args, "").await, Err(CliError::Usage(_))), "{bad:?}");
+    }
+    assert!(matches!(cli(&["audit", "list"], "").await, Err(CliError::Usage(m)) if m.contains("--config")));
+}
+
+/// `audit prune` deletes the events older than `[audit] retention_days` (365 without the section) and reports how many;
+/// `--dry-run` only counts.
+#[tokio::test]
+async fn audit_prune_deletes_what_is_past_the_retention_and_dry_run_only_counts() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config_path = dir.join("config.toml");
+    let c = config_path.to_str().unwrap();
+    // Without the section: a year.
+    assert_eq!(Config::load(&config_path).unwrap().audit.retention_days, 365);
+    for days in [400, 399, 300, 1] {
+        failure_days_ago(&Config::load(&config_path).unwrap(), days, None).await;
+    }
+    let dry = cli(&["audit", "--config", c, "prune", "--dry-run"], "").await.unwrap();
+    assert_eq!(dry, "2 audit event(s) are older than 365 days; dry run, nothing deleted\n");
+    assert!(cli(&["audit", "--config", c, "list"], "").await.unwrap().ends_with("4 event(s)\n"), "a dry run deletes nothing");
+    assert_eq!(cli(&["audit", "--config", c, "prune"], "").await.unwrap(), "deleted 2 audit event(s) older than 365 days\n");
+    assert!(cli(&["audit", "--config", c, "list"], "").await.unwrap().ends_with("2 event(s)\n"));
+    assert_eq!(cli(&["audit", "--config", c, "prune"], "").await.unwrap(), "deleted 0 audit event(s) older than 365 days\n");
+
+    // With the section: a month.
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(&config_path, format!("{text}\n[audit]\nretention_days = 30\n")).unwrap();
+    assert_eq!(Config::load(&config_path).unwrap().audit.retention_days, 30);
+    failure_days_ago(&Config::load(&config_path).unwrap(), 31, None).await;
+    assert_eq!(
+        cli(&["audit", "--config", c, "prune"], "").await.unwrap(),
+        "deleted 2 audit event(s) older than 30 days\n",
+        "the one of 300 days ago and the one of 31"
+    );
+    assert!(cli(&["audit", "--config", c, "list"], "").await.unwrap().ends_with("1 event(s)\n"), "the one of yesterday stays");
+}
+
+/// `[audit]` is read or refused as the design says: absent it is the default, a value out of range or an unknown key is an
+/// error that names the problem and not the file's text.
+#[tokio::test]
+async fn the_audit_config_section_is_optional_and_checked() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config_path = dir.join("config.toml");
+    let base = std::fs::read_to_string(&config_path).unwrap();
+    let with = |section: &str| Config::parse(&format!("{base}\n{section}\n"));
+    assert_eq!(with("").unwrap().audit.retention_days, 365);
+    assert_eq!(with("[audit]").unwrap().audit.retention_days, 365);
+    assert_eq!(with("[audit]\nretention_days = 1").unwrap().audit.retention_days, 1);
+    assert_eq!(with("[audit]\nretention_days = 3650").unwrap().audit.retention_days, 3650);
+    assert!(matches!(with("[audit]\nretention_days = 0"), Err(ConfigError::AuditRetention(0, 1, 3650))));
+    assert!(matches!(with("[audit]\nretention_days = 3651"), Err(ConfigError::AuditRetention(3651, 1, 3650))));
+    assert!(matches!(with("[audit]\nretention_days = -1"), Err(ConfigError::Parse(_))));
+    assert!(matches!(with("[audit]\nretention = 30"), Err(ConfigError::Parse(_))), "an unknown key is refused");
+    let shown = with("[audit]\nretention_days = 9999").unwrap_err().to_string();
+    assert!(shown.contains("9999") && shown.contains("3650"), "{shown}");
+}

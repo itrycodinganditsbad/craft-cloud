@@ -25,6 +25,7 @@ use craft_cloud_store::{BlobKey, StoreError};
 use serde::Deserialize;
 
 use crate::account;
+use crate::audit;
 use crate::auth::{new_token, require_device, verify_password};
 use crate::error::ApiError;
 use crate::join;
@@ -53,6 +54,7 @@ pub fn router(state: Shared) -> Router {
     let signed_in = Router::new()
         .route("/account", get(account::get_account))
         .route("/account/password", post(account::change_password).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route("/account/activity", get(audit::account_activity))
         .route("/devices", get(list_devices))
         .route("/devices/revoke-others", post(account::revoke_others))
         .route("/devices/{id}", delete(revoke_device).patch(account::rename_device).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
@@ -69,6 +71,7 @@ pub fn router(state: Shared) -> Router {
         .route("/live", get(crate::live::connect))
         // The admin routes carry `require_admin` themselves; `require_device` below wraps them too and runs first.
         .merge(crate::admin::routes())
+        .merge(audit::admin_routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_device));
     let public = Router::new()
         .route("/info", get(info))
@@ -141,6 +144,7 @@ async fn login(
         return Err(ApiError::invalid("passwords are at most 1024 bytes"));
     }
     let user = state.meta.user_by_name(&username).await?;
+    let known = user.as_ref().map(|u| u.id);
     let hash = user.as_ref().map_or(state.dummy_hash.as_str(), |u| u.password_hash.as_str()).to_owned();
     let password = req.password.clone();
     let ok = tokio::task::spawn_blocking(move || {
@@ -153,6 +157,9 @@ async fn login(
         ApiError::internal()
     })?;
     let (Some(user), true) = (user, ok) else {
+        // Written after the answer is decided and in a transaction of its own: a log that cannot be written changes
+        // neither the answer nor the limits above. A name no account has is never put in the log.
+        audit::login_failed(&state, known).await;
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED, "wrong username or password"));
     };
     let (token, token_hash) = new_token()?;
