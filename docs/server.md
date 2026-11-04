@@ -55,6 +55,14 @@ invite replaces the old one, and `user invite --revoke name` ends it. Every late
 that is signed in (`craft-cloud-agent add-computer`, see [`agent.md`](agent.md)). Codes that don't work are refused alike (wrong,
 expired or used), and an address that tries ten in a minute is held off for the rest of it.
 
+## Version history
+
+The server keeps every version of every file; nothing is thinned or removed yet. A signed-in device can list a file's
+versions (`GET /api/v1/nodes/{id}/history`) and make an old one current again (`POST /api/v1/nodes/{id}/restore`),
+which adds a new version at the end of the file's history rather than rewinding it, so other computers pick it up
+through the normal change feed. This needs no setting and no database migration, and an older server answers
+`not_found` for both paths. The agent and the apps do not use them yet.
+
 ## Restoring a backup
 
 With the server stopped, restore the database and the chunk storage from the backup, then run

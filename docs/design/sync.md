@@ -655,11 +655,28 @@ methods answer `not_found` / `invalid` (405) the same way:
 | `PUT /chunks/{id}` / `GET /chunks/{id}` | one chunk, max 4 MiB, checked by the server; you can only download chunks your space uploaded |
 | `PUT /manifests/{id}` / `GET /manifests/{id}` | one manifest (binary); the server checks the ID, the limits and that every chunk is present |
 | `POST /commit` | batch of version/mkdir/move/delete operations, one transaction; `409 conflict` listing every conflicting operation (a version whose manifest isn't uploaded is a `missing_manifest` conflict) |
-| `GET /nodes/{id}/history` / `POST /nodes/{id}/restore` | list versions / make an old one current (M4) |
+| `GET /nodes/{id}/history?cursor=…&limit=…` | the versions of one file of your space, newest first by `(seq, id)`, in pages (default 50, at most 200): `{versions: [{id, parent_version, epoch, seq, size, mtime_ms, device, created_ms, save, pruned}], next?}`; `next` is an opaque cursor for the next page; a folder is `invalid`, another account's or an unknown node `not_found`; a deleted file keeps its history |
+| `POST /nodes/{id}/restore` | `{version, expected_version}` → `{version, parent_version, seq, epoch}`: makes an old version's content the file's content again as a new version (see below); `409 conflict` when `expected_version` is not the current version |
 | `GET /devices`, `DELETE /devices/{id}` | your devices |
 | `POST /pairings` | a new add-a-computer code from this device → `{id, code, expires_ms}` (the code shown once, normalised) |
 | `GET /pairings/{id}`, `DELETE /pairings/{id}` | one of your pairings: `{state: waiting\|used\|expired, device_name?}` / cancel it (204) |
 | `POST /join` | code + device name (+ password for an invite to a new account) → device ID + token, as a sign-in (no auth); `invalid_code`, `password_required`, `weak_password`, `rate_limited` |
+
+**History and restore.** Versions are never removed today, so the history lists every version of a file, and `pruned`
+is always `false`: the field is in the contract for the day versions can be thinned (a thinned version will stay
+in the list with `pruned: true`, its metadata intact, and can't be restored). A restore is an ordinary `update` made
+by the server: it checks, under the same lock as a commit, that the node is a file of the caller's space that is not
+deleted and has no live document, that `version` is a version of this node, that its manifest is still in the space,
+and that `expected_version` is still the file's current version; then it records a new version with a fresh ID whose
+parent is the current version, with the manifest, modification time and executable bit of the old one, at the space's
+next sequence number. The epoch does not change (only `reset-epoch` and backup restores do that), the change feed
+reports the file like any other update, and a restore needs no quota because the manifest is already the space's.
+The new version carries **no save record**: a save record names a state of a live document, and a restore
+copies none and invents none. A restore is an ordinary new version, so agents take it in under the normal rules,
+including the conflict rules for a machine with unsynced edits of its own. A file that has a live document is
+refused, so file versions and live-document state stay separate. Unknown node, foreign node, a version of
+another file and a missing manifest are all `not_found`; a deleted file, a folder and a file with a live document are
+`invalid`; a stale `expected_version` is `conflict` (409, with the conflict list as for a commit).
 
 **Client contract** (what the sync agent relies on):
 
@@ -1061,7 +1078,7 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
 | M3b2b1 | Agent on its own: seed 112337, `run` loop, watcher, long-poll, stability window, backoff, status file | DONE (2026-10-14) |
 | M3b2b2 | Simulated network (`turmoil`): partitions, delays, dropped connections | DONE (2026-10-15) |
 | M3c | Fixes from the full repo review | DONE (2026-10-15) |
-| M4 | History, restore, trash, thinning, GC (including the chunks of uploads the stored-bytes cap refused), logical quotas, admin CLI (`user remove\|quota`, `gc`, `verify`), backup/restore | TODO |
+| M4 | History, restore, trash, thinning, GC (including the chunks of uploads the stored-bytes cap refused), logical quotas, admin CLI (`user remove\|quota`, `gc`, `verify`), backup/restore | IN PROGRESS: history and restore of file versions done (server API only); the rest TODO |
 | M5 | Selective sync, large-media polish (a few chunks in flight at once), ignore rules | TODO |
 | M6 | Packaging: binaries, Docker, systemd, built-in TLS, self-hosting guide | TODO |
 | M7 | Local control API + launcher integration PR | TODO |

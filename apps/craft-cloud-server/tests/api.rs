@@ -159,6 +159,9 @@ on_every_backend!(
     a_client_ahead_of_the_server_must_resync,
     overlong_usernames_are_refused_before_rate_limiting,
     the_change_feed_pages,
+    the_history_of_a_file_pages_newest_first_for_its_owner_only,
+    restoring_an_old_version_makes_a_new_one,
+    parallel_restores_against_one_head_let_one_win,
     every_rejection_is_a_json_error,
     one_request_cant_list_unbounded_missing_chunks,
     long_polls_are_capped_per_space,
@@ -1429,4 +1432,189 @@ async fn live_subscriptions_are_capped_per_device() {
     live_send(&mut ws, ClientFrame::Unsubscribe { doc: recents_doc(space, &AppName::new("app0").unwrap()) }).await;
     live_quiet(&mut ws).await;
     assert_eq!(live_subscribe(&mut other, doc, 0).await, vec![ServerFrame::Subscribed { doc, head: 0 }]);
+}
+
+// ---- history and restore ----
+
+fn update(node: NodeId, expected: VersionId, manifest: ManifestId) -> Op {
+    Op::Update { node, expected, version: NewVersion { id: VersionId::generate(), manifest, mtime_ms: 7, exec: false, save: None } }
+}
+
+async fn history_page(s: &Server, token: &str, node: NodeId, query: &str) -> reqwest::Response {
+    s.client.get(format!("{}/nodes/{node}/history{query}", s.base)).bearer_auth(token).send().await.unwrap()
+}
+
+async fn restore_request(s: &Server, token: &str, node: NodeId, body: serde_json::Value) -> reqwest::Response {
+    s.client.post(format!("{}/nodes/{node}/restore", s.base)).bearer_auth(token).json(&body).send().await.unwrap()
+}
+
+/// A file of `contents.len()` versions, one per entry: its node, the version IDs and manifests, oldest first.
+async fn file_with_history(s: &Server, token: &str, contents: &[&[u8]]) -> (NodeId, Vec<VersionId>, Vec<ManifestId>) {
+    let r = root(s, token).await;
+    let node = NodeId::generate();
+    let mut manifests = Vec::new();
+    for data in contents {
+        manifests.push(upload(s, token, data).await);
+    }
+    let first = create(node, r, &format!("history-{node}.txt"), manifests[0]);
+    let Op::Create { version, .. } = &first else { panic!("a create") };
+    let mut versions = vec![version.id];
+    assert_eq!(commit(s, token, &[first]).await.status(), StatusCode::OK);
+    for manifest in &manifests[1..] {
+        let op = update(node, *versions.last().unwrap(), *manifest);
+        let Op::Update { version, .. } = &op else { panic!("an update") };
+        versions.push(version.id);
+        assert_eq!(commit(s, token, &[op]).await.status(), StatusCode::OK);
+    }
+    (node, versions, manifests)
+}
+
+async fn the_history_of_a_file_pages_newest_first_for_its_owner_only(s: &Server) {
+    use craft_cloud_proto::api::HistoryResponse;
+    add_user(s, "ana").await;
+    add_user(s, "bob").await;
+    let (ana, bob) = (login(s, "ana").await, login(s, "bob").await);
+    let tag = uuid::Uuid::now_v7();
+    let contents: Vec<Vec<u8>> = (0..5).map(|i| format!("history {tag} {i}").into_bytes()).collect();
+    let refs: Vec<&[u8]> = contents.iter().map(Vec::as_slice).collect();
+    let (node, versions, _) = file_with_history(s, &ana, &refs).await;
+
+    let all: HistoryResponse = history_page(s, &ana, node, "").await.json().await.unwrap();
+    assert_eq!(all.next, None);
+    assert_eq!(all.versions.iter().map(|v| v.id).collect::<Vec<_>>(), versions.iter().rev().copied().collect::<Vec<_>>());
+    assert!(all.versions.iter().all(|v| !v.pruned && !v.save && v.size == contents[0].len() as u64));
+    assert_eq!(all.versions[4].parent_version, None);
+    assert_eq!(all.versions[0].parent_version, Some(versions[3]));
+    assert_eq!(all.versions.iter().map(|v| v.seq).collect::<Vec<_>>(), vec![5, 4, 3, 2, 1]);
+
+    // Pages of two follow each other through `next`.
+    let (mut seen, mut query, mut pages) = (Vec::new(), "?limit=2".to_owned(), 0);
+    loop {
+        let page: HistoryResponse = history_page(s, &ana, node, &query).await.json().await.unwrap();
+        seen.extend(page.versions.iter().map(|v| v.id));
+        pages += 1;
+        match page.next {
+            Some(next) => query = format!("?limit=2&cursor={next}"),
+            None => break,
+        }
+    }
+    assert_eq!((pages, seen), (3, all.versions.iter().map(|v| v.id).collect::<Vec<_>>()));
+
+    // Bad paging is `invalid`.
+    for bad in ["?limit=0", "?limit=201", "?limit=-1", "?cursor=nonsense", "?cursor=1", "?cursor=%201.00000000-0000-0000-0000-000000000000"] {
+        let (status, body) = error(history_page(s, &ana, node, bad).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "{bad}");
+    }
+    assert_eq!(history_page(s, &ana, node, "?limit=200").await.status(), StatusCode::OK);
+
+    // Other accounts, unknown nodes and folders; a missing or wrong token.
+    let (status, body) = error(history_page(s, &bob, node, "").await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"), "another account's file");
+    let (status, body) = error(history_page(s, &ana, NodeId::generate(), "").await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+    let (status, body) = error(history_page(s, &ana, root(s, &ana).await, "").await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "a folder");
+    assert_eq!(history_page(s, "not-a-token", node, "").await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(s.client.get(format!("{}/nodes/{node}/history", s.base)).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    let (status, body) = error(s.client.get(format!("{}/nodes/not-a-uuid/history", s.base)).bearer_auth(&ana).send().await.unwrap()).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+
+    // A deleted file keeps its history.
+    let del = Op::Delete { node, expected: Some(*versions.last().unwrap()) };
+    assert_eq!(commit(s, &ana, &[del]).await.status(), StatusCode::OK);
+    let kept: HistoryResponse = history_page(s, &ana, node, "").await.json().await.unwrap();
+    assert_eq!(kept.versions.len(), 5);
+}
+
+async fn restoring_an_old_version_makes_a_new_one(s: &Server) {
+    use craft_cloud_proto::api::{HistoryResponse, RestoreResponse};
+    add_user(s, "ana").await;
+    add_user(s, "bob").await;
+    let (ana, bob) = (login(s, "ana").await, login(s, "bob").await);
+    let tag = uuid::Uuid::now_v7();
+    let (first, second, third) = (format!("first {tag}").into_bytes(), format!("second {tag}").into_bytes(), format!("third {tag}").into_bytes());
+    let (node, versions, _) = file_with_history(s, &ana, &[&first, &second, &third]).await;
+    let before: SpaceResponse = space_of(s, &ana).await;
+
+    // Another account can neither read nor restore it.
+    let body = json!({ "version": versions[0], "expected_version": versions[2] });
+    let (status, error_body) = error(restore_request(s, &bob, node, body.clone()).await).await;
+    assert_eq!((status, error_body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+    assert_eq!(restore_request(s, "not-a-token", node, body.clone()).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(space_of(s, &ana).await.seq, before.seq, "refused restores change nothing");
+
+    let res = restore_request(s, &ana, node, body.clone()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let done: RestoreResponse = res.json().await.unwrap();
+    assert_eq!((done.parent_version, done.seq, done.epoch), (versions[2], before.seq + 1, before.epoch));
+    assert!(!versions.contains(&done.version));
+
+    // It is an ordinary change: in the feed, with the old content, and the old versions stay.
+    let feed: ChangeSet =
+        s.client.get(format!("{}/changes?since={}", s.base, before.seq)).bearer_auth(&ana).send().await.unwrap().json().await.unwrap();
+    let node_state = feed.nodes.iter().find(|n| n.id == node).unwrap();
+    let NodeKind::File(state) = &node_state.kind else { panic!("a file") };
+    assert_eq!((state.version, state.save.clone(), state.size), (done.version, None, first.len() as u64));
+    assert_eq!(download(s, &ana, &state.manifest).await, first);
+    let history: HistoryResponse = history_page(s, &ana, node, "").await.json().await.unwrap();
+    assert_eq!(history.versions.len(), 4);
+    assert_eq!((history.versions[0].id, history.versions[0].parent_version), (done.version, Some(versions[2])));
+
+    // The old `expected_version` is stale now: 409 with the conflict list, nothing changes.
+    let (status, stale) = error(restore_request(s, &ana, node, body).await).await;
+    assert_eq!((status, stale.error.as_str()), (StatusCode::CONFLICT, "conflict"));
+    assert_eq!(stale.conflicts.as_ref().map(Vec::len), Some(1));
+    assert_eq!(space_of(s, &ana).await.seq, before.seq + 1);
+
+    // A version that is not this file's: 404. Garbage bodies: 400.
+    let unknown = json!({ "version": VersionId::generate(), "expected_version": done.version });
+    let (status, body) = error(restore_request(s, &ana, node, unknown).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+    let (other, other_versions, _) = file_with_history(s, &ana, &[format!("other {tag}").as_bytes()]).await;
+    assert_ne!(other, node);
+    let foreign = json!({ "version": other_versions[0], "expected_version": done.version });
+    let (status, body) = error(restore_request(s, &ana, node, foreign).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"), "a version of another file");
+    for bad in [json!({}), json!({ "version": "x", "expected_version": "y" }), json!({ "version": versions[0] })] {
+        let (status, body) = error(restore_request(s, &ana, node, bad).await).await;
+        assert!(status.is_client_error() && body.error == "invalid", "{status} {}", body.error);
+    }
+    let folder = root(s, &ana).await;
+    let (status, body) = error(restore_request(s, &ana, folder, json!({ "version": versions[0], "expected_version": versions[0] })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "a folder");
+
+    // A deleted file is not restored from here.
+    let seq = space_of(s, &ana).await.seq;
+    assert_eq!(commit(s, &ana, &[Op::Delete { node, expected: Some(done.version) }]).await.status(), StatusCode::OK);
+    let (status, body) = error(restore_request(s, &ana, node, json!({ "version": versions[0], "expected_version": done.version })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "a deleted file");
+    assert_eq!(space_of(s, &ana).await.seq, seq + 1, "only the delete");
+}
+
+async fn parallel_restores_against_one_head_let_one_win(s: &Server) {
+    use craft_cloud_proto::api::RestoreResponse;
+    add_user(s, "ana").await;
+    let ana = login(s, "ana").await;
+    let tag = uuid::Uuid::now_v7();
+    let contents: Vec<Vec<u8>> = (0..3).map(|i| format!("parallel {tag} {i}").into_bytes()).collect();
+    let refs: Vec<&[u8]> = contents.iter().map(Vec::as_slice).collect();
+    let (node, versions, _) = file_with_history(s, &ana, &refs).await;
+    let before = space_of(s, &ana).await.seq;
+    let mut tasks = Vec::new();
+    for i in 0..6 {
+        let (client, url, token) = (s.client.clone(), format!("{}/nodes/{node}/restore", s.base), ana.clone());
+        let body = json!({ "version": versions[i % 2], "expected_version": versions[2] });
+        tasks.push(tokio::spawn(async move { client.post(url).bearer_auth(token).json(&body).send().await.unwrap() }));
+    }
+    let (mut won, mut conflicted) = (Vec::new(), 0);
+    for task in tasks {
+        let res = task.await.unwrap();
+        match res.status() {
+            StatusCode::OK => won.push(res.json::<RestoreResponse>().await.unwrap()),
+            StatusCode::CONFLICT => conflicted += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!((won.len(), conflicted), (1, 5));
+    assert_eq!(space_of(s, &ana).await.seq, before + 1);
 }

@@ -14,17 +14,27 @@
 use std::collections::HashMap;
 
 use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_TREE_DEPTH};
-use craft_cloud_proto::{Conflict, ConflictKind, DeviceId, Epoch, Name, NewVersion, NodeId, Op, SaveRecord, SpaceId, VersionId};
+use craft_cloud_proto::{Conflict, ConflictKind, DeviceId, Epoch, ManifestId, Name, NewVersion, NodeId, Op, SaveRecord, SpaceId, VersionId};
 use sqlx::Row;
 
 use crate::blobs::manifest_file_size;
-use crate::codec::{flag, to_i64, uuid_bytes, uuid_from};
+use crate::codec::{flag, hash_from, to_i64, uuid_bytes, uuid_from};
 use crate::tree::space_info;
 use crate::{Dialect, Meta, MetaError};
 
 /// A successful commit: the space's new sequence number and its epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitOutcome {
+    pub seq: u64,
+    pub epoch: Epoch,
+}
+
+/// A successful restore of an old version: the version it made, the one that was current, and the space's new
+/// sequence number and epoch (unchanged by a restore).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    pub version: VersionId,
+    pub parent_version: VersionId,
     pub seq: u64,
     pub epoch: Epoch,
 }
@@ -415,6 +425,70 @@ impl Meta {
         sqlx::query("UPDATE spaces SET seq = $1 WHERE id = $2").bind(to_i64(seq)?).bind(uuid_bytes(space.as_uuid())).execute(&mut *w.tx).await?;
         w.commit().await?;
         Ok(CommitOutcome { seq, epoch: info.epoch })
+    }
+
+    /// Makes `source`, an older version of the file `node`, its content again as a new version: an ordinary
+    /// `Update` after `expected`, which must still be the current version. The new version has a fresh ID, copies the
+    /// manifest, modification time and executable bit of `source`, and gets no save record (a save record names a
+    /// state of a live document, and a restore changes the file only). The epoch stays. Everything is checked under the
+    /// space's write lock, in the transaction that writes the version.
+    ///
+    /// `NotFound` for a node or source version the space does not have (a source of another file included) or whose
+    /// manifest the space no longer holds. `Invalid` for a directory, a deleted file, or a file that has a live
+    /// document. `Rejected` (a `VersionMismatch` for operation 0) when `expected` is no longer current.
+    pub async fn restore_version(
+        &self,
+        space: SpaceId,
+        device: DeviceId,
+        node: NodeId,
+        source: VersionId,
+        expected: VersionId,
+        now_ms: i64,
+    ) -> Result<RestoreOutcome, MetaError> {
+        let mut w = self.begin_write().await?;
+        // On Postgres this row lock orders the restore with every other commit and save of the space.
+        let info = space_info(&mut w.tx, space, self.dialect == Dialect::Postgres).await?;
+        let seq = info.seq.checked_add(1).ok_or(MetaError::Corrupt("sequence overflow"))?;
+        let mut ctx = Ctx { conn: &mut w.tx, space, seq: to_i64(seq)?, epoch: info.epoch, device, now_ms, failed_restores: HashMap::new() };
+        let row = ctx.node(node).await?.ok_or(MetaError::NotFound("node"))?;
+        if row.is_dir {
+            return Err(MetaError::Invalid("only files have versions to restore"));
+        }
+        if row.deleted {
+            return Err(MetaError::Invalid("the file is deleted: bring it back from the trash first, then restore a version"));
+        }
+        let live = sqlx::query("SELECT 1 FROM live_docs WHERE space_id = $1 AND node = $2 LIMIT 1")
+            .bind(ctx.space())
+            .bind(uuid_bytes(node.as_uuid()))
+            .fetch_optional(&mut *ctx.conn)
+            .await?;
+        if live.is_some() {
+            return Err(MetaError::Invalid("this file has a live document: restoring a version applies to plain file versions only"));
+        }
+        let found = sqlx::query("SELECT manifest, mtime_ms, exec FROM versions WHERE space_id = $1 AND id = $2 AND node = $3")
+            .bind(ctx.space())
+            .bind(uuid_bytes(source.as_uuid()))
+            .bind(uuid_bytes(node.as_uuid()))
+            .fetch_optional(&mut *ctx.conn)
+            .await?
+            .ok_or(MetaError::NotFound("version"))?;
+        let new = NewVersion {
+            id: VersionId::generate(),
+            manifest: ManifestId::from_bytes(hash_from(&found.try_get::<Vec<u8>, _>("manifest")?)?),
+            mtime_ms: found.try_get("mtime_ms")?,
+            exec: flag(&found, "exec")?,
+            save: None,
+        };
+        let version = new.id;
+        match ctx.apply(&Op::Update { node, expected, version: new }).await? {
+            Ok(()) => {}
+            // The space holds no manifest of that ID any more: the data is not there to restore.
+            Err(ConflictKind::MissingManifest { .. }) => return Err(MetaError::NotFound("manifest")),
+            Err(kind) => return Err(MetaError::Rejected(vec![Conflict { op: 0, kind }])),
+        }
+        sqlx::query("UPDATE spaces SET seq = $1 WHERE id = $2").bind(to_i64(seq)?).bind(uuid_bytes(space.as_uuid())).execute(&mut *w.tx).await?;
+        w.commit().await?;
+        Ok(RestoreOutcome { version, parent_version: expected, seq, epoch: info.epoch })
     }
 
     /// Adds a save record to `node`'s version `version`, which went up without one (the app's record reached the

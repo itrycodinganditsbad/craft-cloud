@@ -15,8 +15,8 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router, middleware};
 use craft_cloud_meta::{BlobKind, DeviceAuth, valid_username};
 use craft_cloud_proto::api::{
-    CommitRequest, CommitResponse, DeviceInfo, InfoResponse, LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse,
-    PROTOCOL_MAX, PROTOCOL_MIN, SpaceResponse, codes,
+    CommitRequest, CommitResponse, DeviceInfo, HISTORY_DEFAULT_LIMIT, HistoryCursor, HistoryResponse, InfoResponse, LoginRequest, LoginResponse,
+    MAX_MISSING_IDS, MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, RestoreRequest, RestoreResponse, SpaceResponse, codes,
 };
 use craft_cloud_proto::limits::{MAX_BATCH_JSON_BYTES, MAX_BATCH_OPS, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_PAGE_NODES};
 use craft_cloud_proto::{ChangeSet, ChunkId, DeviceId, Manifest, ManifestId, NodeId, PageCursor};
@@ -56,6 +56,8 @@ pub fn router(state: Shared) -> Router {
         .route("/manifests/{id}", put(put_manifest).get(get_manifest).layer(DefaultBodyLimit::max(MAX_MANIFEST_BYTES)))
         .route("/commit", post(commit).layer(DefaultBodyLimit::max(MAX_BATCH_JSON_BYTES)))
         .route("/saves", post(attach_save).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
+        .route("/nodes/{id}/history", get(history))
+        .route("/nodes/{id}/restore", post(restore).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
         .route("/space", get(space))
         .route("/tree", get(tree))
         .route("/changes", get(changes))
@@ -383,6 +385,51 @@ async fn attach_save(
         ApiError::internal()
     })??;
     Ok(Json(CommitResponse { seq: outcome.seq, epoch: outcome.epoch }))
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
+/// `GET /nodes/{id}/history`: the versions of a file of the caller's own space, newest first. The node is looked
+/// up in the space of the device token, so another account's node is `not_found`.
+async fn history(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    id: Result<Path<NodeId>, PathRejection>,
+    q: Result<Query<HistoryQuery>, QueryRejection>,
+) -> Result<Json<HistoryResponse>, ApiError> {
+    let Path(node) = id?;
+    let Query(q) = q?;
+    let after = q.cursor.as_deref().map(str::parse::<HistoryCursor>).transpose().map_err(|_| ApiError::invalid("bad history cursor"))?;
+    let page = state.meta.history(auth.space, node, after, q.limit.unwrap_or(HISTORY_DEFAULT_LIMIT)).await?;
+    Ok(Json(HistoryResponse { versions: page.versions, next: page.next.map(|c| c.to_string()) }))
+}
+
+/// `POST /nodes/{id}/restore`: a new version with the content of an old one, as an ordinary update of the file.
+async fn restore(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    id: Result<Path<NodeId>, PathRejection>,
+    request: Request,
+) -> Result<Json<RestoreResponse>, ApiError> {
+    let Path(node) = id?;
+    let req: RestoreRequest = read_json(&state, request, SMALL_JSON_BYTES).await?;
+    // As a commit: the publish is never skipped for a change that went through.
+    let task_state = state.clone();
+    let outcome = tokio::spawn(async move {
+        let outcome = task_state.meta.restore_version(auth.space, auth.device, node, req.version, req.expected_version, task_state.now_ms()).await?;
+        task_state.notifier.publish(auth.space, outcome.seq);
+        Ok::<_, ApiError>(outcome)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "restore task failed");
+        ApiError::internal()
+    })??;
+    Ok(Json(RestoreResponse { version: outcome.version, parent_version: outcome.parent_version, seq: outcome.seq, epoch: outcome.epoch }))
 }
 
 fn cursor(after_seq: Option<u64>, after_node: Option<NodeId>) -> Result<Option<PageCursor>, ApiError> {
