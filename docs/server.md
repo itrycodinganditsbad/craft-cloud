@@ -82,6 +82,19 @@ A file brought back gets a new version with its old content, so another computer
 The change adds two columns and an index to the metadata (migration 0009 in the proposal). An older server refuses the
 upgraded database and rejects the `[retention]` section, so take a backup before upgrading and do not roll back.
 
+## Checking the storage
+
+`craft-cloud-server verify --config cc-data/config.toml` checks the database and the blob storage against each other
+and prints what it finds; `--json` prints a machine-readable report and `--skip-chunk-reads` skips reading every chunk
+object (which hashes it, and takes as long as reading all your data). It changes nothing and exits with an error if
+it found a problem. The report also says how many manifests have a complete reference index, which is what a later
+cleanup would need before it could free anything. After upgrading, run `craft-cloud-server index build --config
+cc-data/config.toml` once: it indexes the manifests stored before the index existed, writing only that index, in small
+steps, and it can be stopped and run again. Nothing in the server frees storage yet.
+
+The change adds two tables to the metadata (migration 0010 in the proposal). An older server refuses the upgraded database,
+so take a backup before upgrading and do not roll back.
+
 ## Restoring a backup
 
 With the server stopped, restore the database and the chunk storage from the backup, then run

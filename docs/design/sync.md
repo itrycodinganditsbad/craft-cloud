@@ -708,6 +708,33 @@ one, a folder restored in the short window after a delete whose answer was lost 
 is empty and can be restored again), so update agents with or soon after the server. Restoring a *version* of a deleted file is still refused: bring the file back
 from the trash first.
 
+**Reference index and `verify`.** The chunks a manifest names live in its object in the store. `manifest_chunks`
+(manifest, ordinal, chunk) is a copy of that list in the database, and `manifest_index` records per manifest how many
+chunks it names, how many edges are written (ordinals 0 up to that number, never a gap) and whether the list was
+compared with the manifest (state 1) or is still being built (state 0). A manifest with no row is not indexed. The index
+is derived data and is never the authority; it exists so the database can answer "which chunks does this manifest need" and
+"which manifests use this chunk". It is written in the transaction that records a manifest (`add_manifest`), up to a budget
+of 5,000 edges per transaction; a longer manifest (up to about a million chunks) is left being built, and the upload
+handler finishes it in batches of at most that many edges before it answers, so no write lock is held for a long list.
+`craft-cloud-server index build` indexes manifests recorded before the index existed (and any left unfinished), reading
+each from the store and checking it against its ID first; it resumes where it stopped and may run beside the server.
+A manifest is marked complete only after every edge was compared, ordinal by ordinal, with the manifest it was made from:
+equal counts are not enough, and repeated chunks, wrong IDs, swapped order, missing and extra edges are all found. An
+index that does not match its manifest while it is still being built is thrown away and written again; a complete index
+that is wrong is only reported. Nothing in this slice frees anything: no deletion, no claims, no collection, no retention.
+
+`craft-cloud-server verify [--json] [--skip-chunk-reads]` reads and reports and changes nothing (opening the database
+brings its schema up to date, as every command does). It lists problems (which make it exit with an error): a manifest
+object that is missing, damaged or not a manifest; a complete index that does not equal its manifest; edges whose manifest
+has no index row; an index row without a recorded manifest; an edge or a manifest that names a chunk that is not recorded;
+a chunk object that is missing or damaged; a version, snapshot or import snapshot that names a manifest that is not
+recorded; blob memberships without a blob. It also gives notices (which do not): manifests whose index is not complete,
+manifests no version or snapshot names, and chunks no complete manifest names. **The manifests no version or snapshot
+names are not garbage.** A live document's binary assets (images and the like, uploaded through the agent's blob
+interface as a manifest of their own) are named only by the document's state, which the server stores as opaque bytes, so
+the database holds no reference to them. Until that gap is closed (the owner decides how assets are rooted), anything that
+frees storage has to treat these manifests, and the chunks they name, as in use.
+
 **Client contract** (what the sync agent relies on):
 
 - Probe `GET /api/info` and refuse to sync when the protocol ranges don't overlap.
