@@ -107,16 +107,21 @@ most 8 KiB, and need the agent to be signed in (`not_signed_in` otherwise).
 
 | Local call | Server call | Body, answer |
 | --- | --- | --- |
-| `GET /v1/admin/server` | `GET /admin/server` | the server's counters and kinds; a member is refused `forbidden`, which is how the app finds out whether to show its admin pages |
+| `GET /v1/admin/server` | `GET /admin/server` | the server's counters and kinds; a member is refused `forbidden` |
 | `GET /v1/admin/users?cursor&limit&query` | `GET /admin/users` | a page of accounts by username; `next` is the cursor of the following page; `query` finds a username containing it |
-| `POST /v1/admin/users` | `POST /admin/users` | `{username, role, password}` → the account and its invite code |
-| `PATCH /v1/admin/users/{id}` | `PATCH /admin/users/{id}` | `{role?, quota_bytes?, password}` → the account (`null` removes the quota) |
+| `POST /v1/admin/users` | `POST /admin/users` | `{username, role, password, totp_code?, recovery_code?}` → the account and its invite code |
+| `PATCH /v1/admin/users/{id}` | `PATCH /admin/users/{id}` | `{role?, quota_bytes?, password, totp_code?, recovery_code?}` → the account (`null` removes the quota) |
 | `POST /v1/admin/users/{id}/disable`, `…/enable` | the same | `{password}` → 204 |
 | `DELETE /v1/admin/users/{id}` | the same | `{password}` → 202 |
-| `POST /v1/admin/users/{id}/invite`, `…/password-reset` | the same | `{password}` → `{code, join_url?, expires_ms}` |
+| `POST /v1/admin/users/{id}/invite`, `…/password-reset` | the same | `{password}` (a reset code: also `totp_code?`, `recovery_code?`, `reset_two_factor?`) → `{code, join_url?, expires_ms}` |
 | `DELETE /v1/admin/users/{id}/invite` | the same | `{password}` → 204 |
 | `GET /v1/admin/users/{id}/devices` | the same | every device of the account |
 | `DELETE /v1/admin/users/{id}/devices/{device_id}` | the same | `{password}` → 204 |
+| `POST /v1/admin/users/{id}/reset-two-factor` | the same | `{password, totp_code?, recovery_code?}` → 204: takes the account's two-factor sign-in away and signs its computers out |
+| `GET /v1/account` | `GET /account` | the signed-in account: `role`, `two_factor_enabled` (how the app finds out whether to show its admin pages) |
+| `GET /v1/account/activity?cursor&before_ms&limit` | the same | the account's own security events, newest first, any account (`user` and `action` are not read) |
+| `GET /v1/admin/audit?cursor&before_ms&limit&user&action` | `GET /admin/audit` | the whole log, newest first; `user` an account ID, `action` an event name or a prefix like `auth.` of the closed list; a cursor is passed back as it came |
+| `GET /v1/admin/audit/export?before_ms&user&action` | `GET /admin/audit/export` | the log as NDJSON, **streamed** through (chunked): event lines, then a last line `{"complete":true,"exported":n}` or `{"truncated":true,"exported":n}` |
 
 - **The server decides.** The agent checks no role and makes no decision of its own; it reads each body as the shared
   type, writes it to the server again and answers what the server answered, with the server's HTTP status, error code and
@@ -128,5 +133,15 @@ most 8 KiB, and need the agent to be signed in (`not_signed_in` otherwise).
   through the agent to the server. The agent holds it only for the length of the request, never writes or logs it, and
   the `Debug` output of every body hides it. The codes the server makes (an invite, a password reset code) are shown by
   the app once and kept by neither side.
-- A second factor's code (`totp_code`, `recovery_code`) joins the confirmation when the server has two-factor sign-in:
-  the shared body types get the fields, and nothing else here changes.
+- **A second factor** joins the confirmation when the admin's account has two-factor sign-in: `totp_code` (a code from the
+  authenticator app) or `recovery_code`, in the same body as the password, passed on as typed fields and never kept. The server
+  answers a missing or wrong one `403 two_factor_invalid` and too many `429 two_factor_locked` with the wait (the body's
+  `retry_after_secs` and the `Retry-After` header); neither is a revoked device, so the agent stays signed in. A password reset
+  code takes the whole `AdminPasswordReset` (the same fields and `reset_two_factor`, which makes redeeming the code turn the
+  account's two-factor sign-in off).
+- **The audit export is never held whole.** The agent passes the server's stream through chunk by chunk; a client that
+  reads it (`craft-cloud-app`'s `admin_audit_export`) counts it as whole only with the server's `complete` line and the number
+  of events it says, and takes a stream that ends without it (a broken connection, a server that failed in the middle) for a
+  failed export. `truncated` is a good export of the newest events that is not the whole log. Filters and limits are checked
+  before anything is sent: an `action` outside the closed list is `400 invalid`, as is a `limit` of 0 or over 200 (100 for an
+  account's own activity).
