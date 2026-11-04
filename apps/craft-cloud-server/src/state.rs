@@ -115,6 +115,10 @@ pub struct AppState {
     pub password_changes: Limiter,
     /// Wrong second factors per account and per client address, in five-minute windows ([`crate::two_factor`]).
     pub second_factors: Limiter,
+    /// Sign-in attempts to the admin pages per client address and per account, in five-minute windows ([`crate::web`]).
+    pub web_logins: Limiter,
+    /// The admin pages' settings; `None`: they are off and `/web` does not exist.
+    pub web: Option<crate::web::WebSettings>,
     /// Seals and opens the secrets of two-factor sign-in; `None`: no key is configured, so it can't be set up.
     pub two_factor: Option<Arc<SecretBox>>,
     pub notifier: Notifier,
@@ -149,6 +153,8 @@ impl AppState {
             joins: Limiter::new(Duration::from_secs(60)),
             password_changes: Limiter::new(Duration::from_secs(900)),
             second_factors: Limiter::new(Duration::from_secs(300)),
+            web_logins: Limiter::new(Duration::from_secs(300)),
+            web: None,
             two_factor: None,
             notifier: Notifier::default(),
             live: LiveHub::default(),
@@ -185,6 +191,12 @@ impl AppState {
         self
     }
 
+    /// The state with the admin pages on (`None`: off, the default): their address, session lifetimes and the like.
+    pub fn with_web_admin(mut self, web: Option<crate::web::WebSettings>) -> Self {
+        self.web = web;
+        self
+    }
+
     /// The state with the server's public address (`public_url`), which the admin API puts in the join links it makes.
     pub fn with_public_url(mut self, public_url: Option<String>) -> Self {
         self.public_url = public_url;
@@ -195,6 +207,8 @@ impl AppState {
     /// written again follow simulated time, never the real one. A test seam (the `test-support` feature).
     #[cfg(feature = "test-support")]
     pub fn with_clock(mut self, clock: Clock) -> Self {
+        // The store judges a browser session's expiry inside an admin change by the same simulated time.
+        self.meta = self.meta.clone().with_clock(clock.clone());
         self.clock = clock;
         self
     }

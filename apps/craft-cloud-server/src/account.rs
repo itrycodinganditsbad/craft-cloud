@@ -19,7 +19,7 @@ use axum::Json;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Extension, Path, Request, State};
 use axum::http::StatusCode;
-use craft_cloud_meta::{DeviceAuth, RevokeReason};
+use craft_cloud_meta::{DeviceAuth, RevokeReason, UserId};
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::{AccountInfo, ChangePasswordRequest, DeviceInfo, RenameDeviceRequest, RevokedOthers, codes};
 
@@ -38,19 +38,19 @@ pub(crate) fn wrong_password() -> ApiError {
     ApiError::new(StatusCode::FORBIDDEN, codes::WRONG_PASSWORD, "the current password is wrong")
 }
 
-/// Checks the signed-in account's own password for a route that asks for one again (a change of the two-factor settings, an
-/// admin's confirmation) and returns the password hash it was verified against, which the change then compares with the
+/// Checks the signed-in account's own password (`user`, named `username`: a device's account, or a browser session's) for a
+/// route that asks for one again (a change of the two-factor settings, an admin's confirmation) and returns the password hash it was verified against, which the change then compares with the
 /// stored one under the account's lock. Wrong passwords are counted per account ([`PASSWORD_CHANGES_PER_USER`] in 15
 /// minutes, the window of the password change) and a right one is given back, so only a wrong password stays counted;
 /// every check holds one of the server-wide password-check slots, and all busy is `429 rate_limited` that costs no try. A
 /// wrong password is `403 wrong_password`, never 401.
-pub(crate) async fn confirm_password(state: &AppState, auth: &DeviceAuth, password: String) -> Result<String, ApiError> {
+pub(crate) async fn confirm_password(state: &AppState, user_id: UserId, username: &str, password: String) -> Result<String, ApiError> {
     if password.len() > MAX_PASSWORD_BYTES {
         return Err(ApiError::invalid("passwords are at most 1024 bytes"));
     }
     // tokio's clock: the system's monotonic clock in the server, the simulated one in a simulation.
     let now = tokio::time::Instant::now().into_std();
-    let key = format!("user:{}", auth.username);
+    let key = format!("user:{username}");
     let Some(counted) = state.password_changes.count(&key, PASSWORD_CHANGES_PER_USER, now) else {
         return Err(ApiError::rate_limited("too many wrong passwords; wait a few minutes", None));
     };
@@ -59,8 +59,8 @@ pub(crate) async fn confirm_password(state: &AppState, auth: &DeviceAuth, passwo
         state.password_changes.refund(&key, counted);
         return Err(ApiError::rate_limited("the server is busy checking other passwords; try again in a moment", Some(PASSWORD_RETRY_SECS)));
     };
-    let user = match state.meta.user_by_name(&auth.username).await {
-        Ok(Some(user)) if user.id == auth.user => user,
+    let user = match state.meta.user_by_name(username).await {
+        Ok(Some(user)) if user.id == user_id => user,
         other => {
             state.password_changes.refund(&key, counted);
             other?;

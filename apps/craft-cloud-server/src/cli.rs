@@ -86,6 +86,14 @@ pub enum Command {
         #[command(subcommand)]
         action: AuditCommand,
     },
+    /// Clean up the admin pages' browser sessions.
+    WebSessions {
+        /// Path to config.toml. May come before or after the action.
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: WebSessionsCommand,
+    },
     /// Manage the key for two-factor secrets.
     TwoFactor {
         /// Path to config.toml. May come before or after the action.
@@ -122,6 +130,18 @@ pub enum AuditCommand {
     /// the task scheduler): the server also prunes when it writes an event, but not while no one signs in or changes anything.
     Prune {
         /// Say how many events would go and delete none.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WebSessionsCommand {
+    /// Delete the browser sessions that are over (logged out, past `[web_admin] absolute_hours`, or unused for longer than
+    /// `idle_minutes`) and say how many. The server also deletes a few at each sign-in, but not while no one signs in; run this
+    /// now and then (daily, from cron or the task scheduler) to empty the table. A session that is still valid is never touched.
+    Prune {
+        /// Say how many sessions would go and delete none.
         #[arg(long)]
         dry_run: bool,
     },
@@ -325,6 +345,11 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
             let (meta, _) = open(&config).await?;
             audit(&meta, &config, action, out).await
         }
+        Command::WebSessions { config, action } => {
+            let config = Config::load(&config_path(config)?)?;
+            let (meta, _) = open(&config).await?;
+            web_sessions(&meta, &config, action, out).await
+        }
         Command::ResetEpoch { config, username, all } => {
             let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
             if all {
@@ -379,6 +404,31 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
             Ok(())
         }
     }
+}
+
+/// Sessions one batch of `web-sessions prune` deletes.
+const WEB_SESSION_PRUNE_BATCH: u32 = 1000;
+
+/// `web-sessions prune`: the batches go on until none is left, each in a transaction of its own.
+async fn web_sessions(meta: &Meta, config: &Config, action: WebSessionsCommand, out: &mut impl Write) -> Result<(), CliError> {
+    let idle_ms = config.web_admin.idle_ms();
+    let WebSessionsCommand::Prune { dry_run } = action;
+    if dry_run {
+        let due = meta.web_sessions_count_over(now_ms(), idle_ms).await?;
+        writeln!(out, "{due} web session(s) are over; dry run, nothing deleted")?;
+        return Ok(());
+    }
+    let mut deleted = 0u64;
+    loop {
+        let batch = meta.web_sessions_prune(now_ms(), idle_ms, WEB_SESSION_PRUNE_BATCH).await?;
+        deleted = deleted.saturating_add(batch);
+        if batch < u64::from(WEB_SESSION_PRUNE_BATCH) {
+            break;
+        }
+    }
+    tracing::info!(deleted, "web sessions pruned");
+    writeln!(out, "deleted {deleted} web session(s) that were over")?;
+    Ok(())
 }
 
 /// `audit list` and `audit prune`.

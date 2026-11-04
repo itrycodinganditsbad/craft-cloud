@@ -76,6 +76,7 @@ pub fn admin_routes() -> Router<Shared> {
         .route("/admin/audit", get(admin_list))
         .route("/admin/audit/export", get(admin_export))
         .route_layer(middleware::from_fn(require_admin))
+        .route_layer(middleware::from_fn(crate::web::reject_mixed_credentials))
 }
 
 /// Writes the event of a sign-in that failed at its password, in a transaction of its own. `target` is the account the
@@ -101,24 +102,32 @@ pub(crate) async fn challenge_failed(state: &AppState, target: Option<UserId>) {
 // ---- reading parameters ----
 
 /// The query of the two lists and the export. Unknown parameters are ignored, as everywhere in the API.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub(crate) struct Params {
-    cursor: Option<String>,
+    pub(crate) cursor: Option<String>,
     before_ms: Option<i64>,
     limit: Option<u32>,
-    user: Option<String>,
-    action: Option<String>,
+    pub(crate) user: Option<String>,
+    pub(crate) action: Option<String>,
+}
+
+impl Params {
+    /// The same filters with the empty ones taken out: a form that was sent with a field left blank asks for no filter.
+    pub(crate) fn nonempty(&self) -> Params {
+        let keep = |field: &Option<String>| field.clone().filter(|text| !text.is_empty());
+        Params { cursor: keep(&self.cursor), before_ms: self.before_ms, limit: self.limit, user: keep(&self.user), action: keep(&self.action) }
+    }
 }
 
 fn bad_cursor() -> ApiError {
     ApiError::invalid("the cursor is not one this server gave")
 }
 
-fn encode_cursor(cursor: AuditCursor) -> String {
+pub(crate) fn encode_cursor(cursor: AuditCursor) -> String {
     URL_SAFE_NO_PAD.encode(cursor.to_bytes())
 }
 
-fn decode_cursor(text: &str) -> Result<AuditCursor, ApiError> {
+pub(crate) fn decode_cursor(text: &str) -> Result<AuditCursor, ApiError> {
     let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| bad_cursor())?;
     AuditCursor::from_bytes(&bytes).ok_or_else(bad_cursor)
 }
@@ -131,7 +140,7 @@ fn page_limit(limit: Option<u32>, max: u32) -> Result<u32, ApiError> {
 
 /// The `user` and `action` filters. A `user` is an account ID, an `action` one of the names or a prefix of them ending
 /// in a dot like `auth.`; anything else is `400 invalid`, so nothing typed reaches a query.
-fn filters(params: &Params) -> Result<(Option<UserId>, Option<ActionFilter>), ApiError> {
+pub(crate) fn filters(params: &Params) -> Result<(Option<UserId>, Option<ActionFilter>), ApiError> {
     let user =
         params.user.as_deref().map(|text| Uuid::parse_str(text).map(UserId).map_err(|_| ApiError::invalid("user is an account ID"))).transpose()?;
     let action = params
@@ -291,6 +300,11 @@ async fn export_pages(mut fetch: Fetch<'_>, limits: AuditExportLimits, tx: mpsc:
 /// `GET /api/v1/admin/audit/export?user&action&before_ms`: the log as NDJSON (`before_ms` also limits it, besides the fixed end).
 async fn admin_export(State(state): State<Shared>, params: Result<Query<Params>, QueryRejection>) -> Result<Response, ApiError> {
     let Query(params) = params?;
+    export_response(&state, params).await
+}
+
+/// The export as a response, for the JSON route and the web pages' download alike: the same bounds, the same last line.
+pub(crate) async fn export_response(state: &Shared, params: Params) -> Result<Response, ApiError> {
     let (user, action) = filters(&params)?;
     if params.before_ms.is_some_and(|before| before < 0) {
         return Err(ApiError::invalid("before_ms is a time in milliseconds"));
