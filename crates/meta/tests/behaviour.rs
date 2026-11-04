@@ -146,6 +146,8 @@ on_every_backend!(
     a_password_change_is_one_step,
     an_admin_reset_signs_out_every_device_unless_kept,
     concurrent_password_changes_and_sign_outs_never_fail_the_database,
+    a_sign_in_checked_against_an_old_password_creates_no_device,
+    redeems_sign_ins_and_resets_at_the_same_moment_leave_no_live_device,
 );
 
 // ---- helpers ----
@@ -2085,6 +2087,59 @@ async fn concurrent_password_changes_and_sign_outs_never_fail_the_database(meta:
             assert!(matches!(result, Ok(()) | Err(MetaError::Conflict(_) | MetaError::DeviceRevoked)), "round {round}: {result:?}");
         }
         assert_revoke_columns_agree(&meta.list_devices(ana.id).await.unwrap());
+    }
+}
+
+/// A device is created after a password sign-in only if the password that was checked is still the account's.
+async fn a_sign_in_checked_against_an_old_password_creates_no_device(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let client = DeviceClient::default();
+    let first = meta.sign_in_device(ana.id, "$argon2id$stub", "pc", &client, &token(), NOW).await.unwrap();
+    assert!(first.is_some_and(|d| d != DeviceId::generate()));
+    assert!(meta.sign_in_device(ana.id, "$argon2id$other", "pc", &client, &token(), NOW).await.unwrap().is_none(), "not the stored hash");
+    assert!(
+        meta.sign_in_device(UserId(uuid::Uuid::now_v7()), "$argon2id$stub", "pc", &client, &token(), NOW).await.unwrap().is_none(),
+        "no such user"
+    );
+    assert!(matches!(meta.sign_in_device(ana.id, "$argon2id$stub", "", &client, &token(), NOW).await, Err(MetaError::Invalid(_))));
+    // The password was checked, then reset: the account's devices are signed out and the late sign-in adds none.
+    meta.reset_password(ana.id, "$argon2id$reset", false, NOW + 1).await.unwrap();
+    assert!(meta.sign_in_device(ana.id, "$argon2id$stub", "late", &client, &token(), NOW + 2).await.unwrap().is_none());
+    let devices = meta.list_devices(ana.id).await.unwrap();
+    assert_eq!(devices.len(), 1);
+    assert!(devices.iter().all(|d| d.revoked));
+    // With the new hash it works.
+    assert!(meta.sign_in_device(ana.id, "$argon2id$reset", "new", &client, &token(), NOW + 3).await.unwrap().is_some());
+}
+
+/// Redeeming an invite or a pairing, a password sign-in and a reset at the same moment, over and over: no database
+/// error (on Postgres, the invite and the user taken in different orders would deadlock), and once the reset is
+/// done no device of the account is signed in, whichever of them came first.
+async fn redeems_sign_ins_and_resets_at_the_same_moment_leave_no_live_device(meta: &Meta) {
+    for round in 0..15 {
+        let (ana, maker, pairing, _) = paired(meta, &format!("ana{round}")).await;
+        let invite = code(INVITE_CHARS);
+        meta.create_invite(&format!("ana{round}"), &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+        let mut tasks = Vec::new();
+        for job in 0..5 {
+            let (meta, invite, pairing) = (meta.clone(), invite.hash(), pairing.hash());
+            tasks.push(tokio::spawn(async move {
+                match job {
+                    0 => meta.redeem(&invite, "invited", &token(), None, NOW + 1).await.map(|_| ()),
+                    1 => meta.redeem(&pairing, "paired", &token(), None, NOW + 1).await.map(|_| ()),
+                    2 => meta.sign_in_device(ana.id, "$argon2id$stub", "signed in", &DeviceClient::default(), &token(), NOW + 1).await.map(|_| ()),
+                    3 => meta.create_pairing(ana.id, maker, &code(PAIRING_CHARS).hash(), NOW + 1).await.map(|_| ()),
+                    _ => meta.reset_password(ana.id, "$argon2id$reset", false, NOW + 2).await.map(|_| ()),
+                }
+            }));
+        }
+        for task in tasks {
+            let result = task.await.unwrap();
+            assert!(matches!(result, Ok(()) | Err(MetaError::InvalidCode | MetaError::NotFound(_))), "round {round}: {result:?}");
+        }
+        let devices = meta.list_devices(ana.id).await.unwrap();
+        assert!(devices.iter().all(|d| d.revoked), "round {round}: {devices:?}");
+        assert_revoke_columns_agree(&devices);
     }
 }
 

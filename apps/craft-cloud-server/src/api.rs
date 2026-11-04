@@ -154,7 +154,11 @@ async fn login(
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED, "wrong username or password"));
     };
     let (token, token_hash) = new_token()?;
-    let device = state.meta.create_device_with(user.id, &req.device_name, &client, &token_hash, state.now_ms()).await?;
+    // Created only if the password just checked is still the account's: one changed meanwhile (and the devices
+    // signed out with it) must not be followed by a device that the old password let in. Answered as a wrong password.
+    let Some(device) = state.meta.sign_in_device(user.id, &user.password_hash, &req.device_name, &client, &token_hash, state.now_ms()).await? else {
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED, "wrong username or password"));
+    };
     // The username is the only personal identifier the server could log here: kept to debug.
     tracing::debug!(user = %user.username, "sign-in");
     tracing::info!(%device, "device signed in");

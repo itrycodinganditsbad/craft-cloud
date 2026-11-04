@@ -277,6 +277,40 @@ impl Meta {
         Ok(device)
     }
 
+    /// Registers a device for `user` after a password sign-in, if the password it was checked against is still the
+    /// account's: `hash` is the stored hash the caller verified. The account is locked first and the hash compared
+    /// again in the same transaction, so a password change or reset that committed while the (slow) check ran is
+    /// not followed by a device that check let in. `None`: the user is gone or the password changed meanwhile; the
+    /// caller answers as for a wrong password.
+    pub async fn sign_in_device(
+        &self,
+        user: UserId,
+        hash: &str,
+        name: &str,
+        client: &DeviceClient,
+        token_hash: &[u8; 32],
+        now_ms: i64,
+    ) -> Result<Option<DeviceId>, MetaError> {
+        check_device_name(name)?;
+        client.check()?;
+        let device = DeviceId::generate();
+        let mut w = self.begin_write().await?;
+        if !lock_user(&mut w.tx, user).await? {
+            return Ok(None);
+        }
+        let same = sqlx::query("SELECT 1 FROM users WHERE id = $1 AND password_hash = $2")
+            .bind(uuid_bytes(&user.0))
+            .bind(hash)
+            .fetch_optional(&mut *w.tx)
+            .await?;
+        if same.is_none() {
+            return Ok(None);
+        }
+        insert_device(&mut w.tx, device, user, name, client, token_hash, now_ms).await?;
+        w.commit().await?;
+        Ok(Some(device))
+    }
+
     /// The device holding this token hash, if any and not revoked.
     pub async fn device_by_token(&self, token_hash: &[u8; 32]) -> Result<Option<DeviceAuth>, MetaError> {
         let row = sqlx::query(
@@ -493,7 +527,7 @@ impl Meta {
 /// the pairings: one order for all of them, so two of them at once (a password change from one device, a sign-out of
 /// the others from another, an admin reset) wait for each other on Postgres and never deadlock. SQLite writers are
 /// serialised already.
-async fn lock_user(tx: &mut sqlx::Transaction<'static, sqlx::Any>, user: UserId) -> Result<bool, MetaError> {
+pub(crate) async fn lock_user(tx: &mut sqlx::Transaction<'static, sqlx::Any>, user: UserId) -> Result<bool, MetaError> {
     let done = sqlx::query("UPDATE users SET username = username WHERE id = $1").bind(uuid_bytes(&user.0)).execute(&mut **tx).await?;
     Ok(done.rows_affected() > 0)
 }

@@ -592,6 +592,10 @@ changes locally, then pushes local changes. These rules came out of the simulati
     steps run for `user reset-password` (all devices, reason `reset`, unless `--keep-devices`) and `device revoke-all`
     (reason `admin`) on the command line, which cannot reach the server's live connections: those end at the next ping
     (within about 30 s) and a change-feed long-poll within 60 s.
+  - **Sign-in and join under a change**: a password sign-in creates its device only if the stored hash is still the one
+    it checked (the account is locked first), and answers as for a wrong password otherwise, so a device is never
+    added after a reset or change that signed the others out. Every transaction that revokes devices, changes a
+    password, redeems an invite or makes a pairing takes the account's row first, which keeps them from deadlocking.
   - **Limits**: `password_changes` counts every try, a wrong password included, 5 per account per 15 minutes; the
     password and device-name bodies are read up to 4 KiB (the sign-in bodies stay at 1 MiB).
 - **Join codes**: a machine can also get its device token with a code instead of a password. Codes are Crockford
