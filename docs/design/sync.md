@@ -927,6 +927,16 @@ methods answer `not_found` / `invalid` (405) the same way:
 
   Calls: `status`, `login`, `logout`, `folders` (get/set synced or cloud-only), `history`, `restore`,
   `conflicts`, `pending-deletes` (approve or reject a mass-delete pause), `pause`, `resume`.
+
+  Two-factor sign-in (see [`docs/agent.md`](../agent.md)): `login` and `join` answer 401 `two_factor_required` with the
+  server's challenge when the account has it; `POST /v1/login/second-factor {challenge, totp_code | recovery_code}` finishes
+  a login, and `join` is sent again with `totp_code` or `recovery_code` (its challenge is empty: the invite isn't consumed
+  by the first try). `GET /v1/account/two-factor`, `POST .../setup`, `.../confirm`, `.../disable`, `.../recovery-codes`,
+  `POST /v1/account/password` and `POST /v1/devices/revoke-others` pass through to the server for the app's Security
+  page. The local answers keep the server's code: `two_factor_invalid` (401 at sign-in, 403 when signed in),
+  `two_factor_locked` (429 with `Retry-After`), `wrong_password`, `two_factor_pending`, `two_factor_unavailable`; a gone
+  challenge is 409 `two_factor_expired`. Only a 401 on a signed-in call means this device was signed out; a 403 or 429
+  never does. Codes, passwords and secrets are never stored and are redacted in every `Debug`.
 - **CLI**: `craft-cloud-agent login <url> | status | pin <folder> | unpin <folder> | history <file> |
   restore <file> <version> | approve-deletes | pause | resume`. Same operations as the local API, so it is
   usable and testable before any launcher work.
