@@ -195,8 +195,9 @@ impl Meta {
             Some(row) => {
                 let user = UserId(uuid_from(&row.try_get::<Vec<u8>, _>("user_id")?)?);
                 lock_user(&mut w.tx, user).await?;
-                let consumed = sqlx::query("DELETE FROM invites WHERE code_hash = $1 AND expires_ms > $2")
+                let consumed = sqlx::query("DELETE FROM invites WHERE code_hash = $1 AND user_id = $2 AND expires_ms > $3")
                     .bind(code_hash.to_vec())
+                    .bind(uuid_bytes(&user.0))
                     .bind(now_ms)
                     .execute(&mut *w.tx)
                     .await?;
@@ -223,14 +224,16 @@ impl Meta {
                 let owner =
                     sqlx::query("SELECT user_id FROM pairings WHERE code_hash = $1").bind(code_hash.to_vec()).fetch_optional(&mut *w.tx).await?;
                 let Some(owner) = owner else { return Err(MetaError::InvalidCode) };
-                lock_user(&mut w.tx, UserId(uuid_from(&owner.try_get::<Vec<u8>, _>("user_id")?)?)).await?;
+                let owner = UserId(uuid_from(&owner.try_get::<Vec<u8>, _>("user_id")?)?);
+                lock_user(&mut w.tx, owner).await?;
                 let pairing = sqlx::query(
                     "UPDATE pairings SET used_by = $1 \
-                     WHERE code_hash = $2 AND used_by IS NULL AND expires_ms > $3 \
+                     WHERE code_hash = $2 AND user_id = $3 AND used_by IS NULL AND expires_ms > $4 \
                      AND device_id IN (SELECT id FROM devices WHERE revoked = 0) RETURNING user_id",
                 )
                 .bind(uuid_bytes(device.as_uuid()))
                 .bind(code_hash.to_vec())
+                .bind(uuid_bytes(&owner.0))
                 .bind(now_ms)
                 .fetch_optional(&mut *w.tx)
                 .await?
