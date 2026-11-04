@@ -45,7 +45,7 @@ impl UserQuery {
 }
 
 /// `text` percent-encoded for a query string (everything but unreserved characters).
-fn encode(text: &str) -> String {
+pub(crate) fn encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {

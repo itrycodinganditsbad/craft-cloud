@@ -133,6 +133,12 @@ pub mod paths {
     pub const TWO_FACTOR_CONFIRM: &str = "/v1/account/two-factor/confirm";
     pub const TWO_FACTOR_DISABLE: &str = "/v1/account/two-factor/disable";
     pub const TWO_FACTOR_RECOVERY_CODES: &str = "/v1/account/two-factor/recovery-codes";
+    /// `GET` → [`crate::api::AccountInfo`]: the signed-in account (its role, and whether it has two-factor sign-in), as the
+    /// server says it.
+    pub const ACCOUNT: &str = "/v1/account";
+    /// `GET /v1/account/activity?cursor&before_ms&limit` → [`crate::api::AuditPage`]: the signed-in account's own security
+    /// events, for every account.
+    pub const ACCOUNT_ACTIVITY: &str = "/v1/account/activity";
     /// `POST` ([`super::ChangePasswordRequest`]) → 204.
     pub const ACCOUNT_PASSWORD: &str = "/v1/account/password";
     /// `POST` → [`crate::api::RevokedOthers`]: sign every other computer of the account out.
@@ -164,6 +170,13 @@ pub mod paths {
     /// [`AdminCode`](crate::api::AdminCode), the others have no body); `GET …/devices` →
     /// [`AdminDevices`](crate::api::AdminDevices). The server's status and error code are the agent's.
     pub const ADMIN_USERS: &str = "/v1/admin/users";
+    /// `GET /v1/admin/audit?cursor&before_ms&limit&user&action` → [`AuditPage`](crate::api::AuditPage): the whole security log,
+    /// newest first, filtered (an admin's).
+    pub const ADMIN_AUDIT: &str = "/v1/admin/audit";
+    /// `GET /v1/admin/audit/export?before_ms&user&action`: the log as NDJSON, streamed through (chunked, never held whole by the
+    /// agent): [`AuditEvent`](crate::api::AuditEvent) lines and a last [`AuditExportEnd`](crate::api::AuditExportEnd) line.
+    /// A stream that ends without that last line was cut off.
+    pub const ADMIN_AUDIT_EXPORT: &str = "/v1/admin/audit/export";
 }
 
 /// Binary content an app keeps out of a live document (images, audio, a font): `PUT /v1/blobs` with the bytes as the

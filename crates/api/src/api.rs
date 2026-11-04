@@ -488,6 +488,50 @@ pub struct AuditExportEnd {
     pub exported: u64,
 }
 
+/// The names of the security events, the closed list the server writes and `GET /admin/audit` filters by (`docs/design/sync.md`,
+/// "Security audit log"). A filter is one of these, or a prefix of some of them that ends in a dot, like `auth.`.
+pub const AUDIT_ACTIONS: [&str; 30] = [
+    "auth.login",
+    "auth.login_failed",
+    "auth.second_factor_failed",
+    "auth.recovery_code_used",
+    "auth.two_factor_locked",
+    "device.revoked",
+    "device.revoked_others",
+    "account.password_changed",
+    "account.two_factor_enabled",
+    "account.two_factor_disabled",
+    "account.recovery_codes_regenerated",
+    "admin.user_created",
+    "admin.user_disabled",
+    "admin.user_enabled",
+    "admin.user_removed",
+    "admin.role_changed",
+    "admin.quota_changed",
+    "admin.invite_issued",
+    "admin.invite_revoked",
+    "admin.password_reset_issued",
+    "admin.two_factor_reset",
+    "admin.device_revoked",
+    "join.invite_redeemed",
+    "join.reset_redeemed",
+    "join.pairing_redeemed",
+    "cli.password_reset",
+    "cli.two_factor_reset",
+    "cli.device_revoked",
+    "cli.devices_revoked_all",
+    "cli.user_removed",
+];
+
+/// Whether `text` is an audit filter the server takes for `action`: an event name, or a prefix ending in a dot that at least
+/// one name starts with. Anything else is refused by the server as `400 invalid`; checking here keeps it from being sent.
+pub fn valid_audit_action(text: &str) -> bool {
+    AUDIT_ACTIONS.contains(&text)
+        || (text.ends_with('.')
+            && text.bytes().all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'.')
+            && AUDIT_ACTIONS.iter().any(|a| a.starts_with(text)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,5 +569,73 @@ mod tests {
         let json = serde_json::json!({ "error": "conflict", "message": "m", "conflicts": [{ "op": 0, "kind": "root" }], "quota": { "used": 1, "limit": 2 } });
         let answer: ErrorAnswer = serde_json::from_value(json).unwrap();
         assert_eq!(answer, ErrorAnswer { error: "conflict".into(), message: "m".into() });
+    }
+
+    #[test]
+    fn admin_bodies_carry_the_second_factor_and_hide_every_secret() {
+        let confirm =
+            AdminConfirm { password: Some("admin-secret-pw".into()), totp_code: Some("918273".into()), recovery_code: Some("ABCD-EFGH".into()) };
+        let shown = format!("{confirm:?}");
+        assert!(!shown.contains("admin-secret-pw") && !shown.contains("918273") && !shown.contains("ABCD-EFGH"), "{shown}");
+        assert_eq!(shown.matches("<redacted>").count(), 3);
+        let reset = AdminPasswordReset {
+            password: Some("admin-secret-pw".into()),
+            totp_code: Some("918273".into()),
+            reset_two_factor: true,
+            ..AdminPasswordReset::default()
+        };
+        let shown = format!("{reset:?}");
+        assert!(!shown.contains("admin-secret-pw") && !shown.contains("918273") && shown.contains("reset_two_factor: true"), "{shown}");
+        let create =
+            AdminCreateUser { username: "ana".into(), role: "member".into(), totp_code: Some("918273".into()), ..AdminCreateUser::default() };
+        assert!(!format!("{create:?}").contains("918273"));
+        let update = AdminUpdateUser { recovery_code: Some("ABCD-EFGH".into()), ..AdminUpdateUser::default() };
+        assert!(!format!("{update:?}").contains("ABCD-EFGH"));
+        // Every factor field is optional and absent from a body that doesn't have it; the reset flag defaults to false.
+        assert_eq!(
+            serde_json::to_value(AdminConfirm { password: Some("p".into()), ..AdminConfirm::default() }).unwrap(),
+            serde_json::json!({ "password": "p" })
+        );
+        let reset: AdminPasswordReset = serde_json::from_value(serde_json::json!({ "password": "p" })).unwrap();
+        assert!(!reset.reset_two_factor && reset.totp_code.is_none());
+        let user: AdminUserInfo = serde_json::from_value(serde_json::json!({
+            "id": Uuid::nil(), "username": "ana", "role": "member", "created_ms": 1, "disabled_ms": null,
+            "two_factor_enabled": true, "devices_active": 0, "stored_bytes": 0, "quota_bytes": null, "invite_pending": false
+        }))
+        .unwrap();
+        assert!(user.two_factor_enabled);
+    }
+
+    #[test]
+    fn an_update_tells_a_missing_quota_from_a_null_one() {
+        let missing: AdminUpdateUser = serde_json::from_value(serde_json::json!({ "role": "admin", "password": "p" })).unwrap();
+        assert_eq!(missing.quota_bytes, None);
+        let null: AdminUpdateUser = serde_json::from_value(serde_json::json!({ "quota_bytes": null })).unwrap();
+        assert_eq!(null.quota_bytes, Some(None));
+        let set: AdminUpdateUser = serde_json::from_value(serde_json::json!({ "quota_bytes": 5_000_000 })).unwrap();
+        assert_eq!(set.quota_bytes, Some(Some(5_000_000)));
+        assert!(serde_json::from_value::<AdminUpdateUser>(serde_json::json!({ "quota_bytes": -1 })).is_err());
+    }
+
+    #[test]
+    fn audit_bodies_read_what_the_server_writes_and_ignore_what_is_newer() {
+        let details: AuditDetails = serde_json::from_str(r#"{"revoked":2,"a_later_field":"x","quota_bytes":null}"#).unwrap();
+        assert_eq!((details.revoked, details.quota_bytes), (Some(2), Some(None)));
+        let end: AuditExportEnd = serde_json::from_str(r#"{"complete":true,"exported":3}"#).unwrap();
+        assert_eq!((end.complete, end.truncated, end.exported), (Some(true), None, 3));
+        let page: AuditPage = serde_json::from_str(r#"{"events":[]}"#).unwrap();
+        assert_eq!(page.next, None);
+    }
+
+    #[test]
+    fn audit_filters_are_the_closed_list_or_a_prefix_of_it() {
+        assert_eq!(AUDIT_ACTIONS.len(), 30);
+        assert!(AUDIT_ACTIONS.iter().all(|a| valid_audit_action(a)));
+        for prefix in ["auth.", "admin.", "cli.", "join.", "device.", "account."] {
+            assert!(valid_audit_action(prefix), "{prefix}");
+        }
+        for bad in ["", "auth", "auth.log", "nope.", "AUTH.", "auth.login ", "admin.user_created.", "x' OR 1=1 --", "a.b."] {
+            assert!(!valid_audit_action(bad), "{bad:?}");
+        }
     }
 }

@@ -50,6 +50,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod admin;
+mod audit;
 pub mod blobs;
 #[cfg(feature = "fake")]
 pub mod fake;
@@ -68,11 +69,12 @@ use craft_cloud_api::local::{
 };
 
 pub use admin::UserQuery;
+pub use audit::{AuditQuery, ExportOutcome};
 pub use craft_cloud_api::DeviceId;
 pub use craft_cloud_api::api::{
-    AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser, AdminUserInfo,
-    AdminUserList, DeviceInfo, PairingState, PairingStatus, RecoveryCodes, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse,
-    TwoFactorStatus,
+    AccountInfo, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser,
+    AdminUserInfo, AdminUserList, AuditEvent, AuditPage, DeviceInfo, PairingState, PairingStatus, RecoveryCodes, RevokedOthers, TwoFactorChallenge,
+    TwoFactorSetupResponse, TwoFactorStatus,
 };
 pub use craft_cloud_api::local::{
     JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RunState, SecondFactorLoginRequest, Status, TwoFactorProofRequest, codes,
