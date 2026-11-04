@@ -3299,3 +3299,54 @@ async fn a_folder_deleted_with_a_lost_answer_and_not_restored_stays_deleted() {
     assert!(a.fs().dirs().is_empty(), "{:?}", a.fs().dirs());
     assert!(b.fs().dirs().is_empty(), "{:?}", b.fs().dirs());
 }
+
+/// A folder with a file in it, both deleted here, the answer lost, then brought back from the trash in different ways. The
+/// folder this machine deleted is never deleted a second time, whichever of the two (or both) comes back.
+async fn lost_delete_of_a_folder_with_a_file(restore: &[&str]) -> (common::Machine, common::Machine, Server, craft_cloud_meta::UserRecord) {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("d")).unwrap();
+    write(&mut a, "d/f.txt", b"keep me");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().remove_file(&path("d/f.txt")).unwrap();
+    a.fs_mut().remove_dir(&path("d")).unwrap();
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    for name in restore {
+        restore_from_trash(&server, &ana, node_named(&server, &ana, name).await).await;
+    }
+    settle(&mut [&mut a, &mut b], 6).await;
+    settle(&mut [&mut a, &mut b], 3).await;
+    (a, b, server, ana)
+}
+
+#[tokio::test]
+async fn a_non_empty_folder_restored_alone_after_a_lost_delete_answer_is_not_deleted_again() {
+    let (a, b, server, ana) = lost_delete_of_a_folder_with_a_file(&["d"]).await;
+    assert_eq!(a.fs().dirs(), vec![path("d")]);
+    assert_eq!(b.fs().dirs(), vec![path("d")]);
+    assert!(files(&a).is_empty() && files(&b).is_empty(), "the file stays in the trash");
+    let mut c = machine(&server, &ana, "studio").await;
+    c.sync_once().await.unwrap();
+    assert_eq!(c.fs().dirs(), vec![path("d")], "the server still has the folder");
+}
+
+#[tokio::test]
+async fn a_folder_and_its_file_both_restored_after_a_lost_delete_answer_come_back() {
+    let (a, b, _server, _ana) = lost_delete_of_a_folder_with_a_file(&["d", "f.txt"]).await;
+    let expected = vec![("d/f.txt".to_owned(), b"keep me".to_vec())];
+    assert_eq!(files(&a), expected);
+    assert_eq!(files(&b), expected);
+    assert_eq!(a.fs().dirs(), vec![path("d")]);
+}
+
+#[tokio::test]
+async fn only_the_file_restored_after_a_lost_delete_answer_brings_its_folder_back_too() {
+    let (a, b, _server, _ana) = lost_delete_of_a_folder_with_a_file(&["f.txt"]).await;
+    let expected = vec![("d/f.txt".to_owned(), b"keep me".to_vec())];
+    assert_eq!(files(&a), expected);
+    assert_eq!(files(&b), expected);
+    assert_eq!(a.fs().dirs(), vec![path("d")]);
+}

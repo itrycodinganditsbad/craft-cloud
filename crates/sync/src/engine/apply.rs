@@ -44,8 +44,19 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             self.state.base.remove(&id);
         }
         self.state.sent_deletes.clear();
-        // Folders whose delete was in doubt were judged by the pull, which saw whether the server changed them.
-        self.state.sent_dir_deletes.clear();
+        // The same for folders, whose deletes carry no version. A folder this machine asked to delete (the answer never
+        // recorded) that the pull saw the server report changed and live was brought back after the delete went through
+        // (or changed by another machine first): it is let go like a file whose delete went through, and arrives as it
+        // is on the server, not deleted a second time. This comes after the files above, so a folder whose tracked
+        // files were just let go no longer holds anything. A folder the feed did not mention was never touched: its
+        // delete is sent again. One that still has tracked nodes in it stays.
+        let live_dirs = std::mem::take(&mut self.state.live_dirs);
+        for id in std::mem::take(&mut self.state.sent_dir_deletes) {
+            let is_dir = matches!(self.state.base.get(&id).map(|e| &e.kind), Some(BaseKind::Dir { .. }));
+            if live_dirs.contains(&id) && is_dir && !self.state.base.values().any(|e| e.parent == Some(id)) {
+                self.state.base.remove(&id);
+            }
+        }
         // Changed or new remote nodes, parents first.
         let mut work: Vec<(usize, NodeId)> =
             self.state.remote.keys().filter(|id| **id != root).filter_map(|id| Some((self.state.remote_path(*id)?.depth(), *id))).collect();

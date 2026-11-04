@@ -610,15 +610,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                         self.state.remote.remove(&node.id);
                     } else {
                         // A folder this machine asked to delete (the answer never recorded) that the server reports
-                        // changed and live: its delete went through and it was brought back since (or another machine
-                        // changed it first). It is let go, to arrive as it is on the server, not deleted a second
-                        // time. One the feed doesn't mention was never touched: the delete is sent again. A folder
-                        // that still has tracked nodes in it stays as it is.
-                        if self.state.sent_dir_deletes.remove(&node.id)
-                            && matches!(self.state.base.get(&node.id).map(|e| &e.kind), Some(BaseKind::Dir { .. }))
-                            && !self.state.base.values().any(|e| e.parent == Some(node.id))
-                        {
-                            self.state.base.remove(&node.id);
+                        // changed and live: noted here, judged in `apply_remote` once the files it held are settled.
+                        if self.state.sent_dir_deletes.contains(&node.id) {
+                            self.state.live_dirs.insert(node.id);
                         }
                         self.state.remote.insert(node.id, RemoteNode::from_state(&node));
                     }
