@@ -75,9 +75,48 @@ ends, it is answered `401 unauthorized`, never with changes); every other reques
 unauthorized`). Devices signed out through the API end their live connections
 immediately.
 
+## Managing accounts over HTTP
+
+Accounts have a role, `admin` or `member`, and the routes under `/api/v1/admin` are for admins only (the first admin is
+still made by `init`). They are an API for a tool or a later admin app: the server brings no web page. Every change asks
+for **a fresh confirmation in its body**, the acting admin's own current password, because a device's token never
+expires and must not be enough on its own:
+
+```sh
+curl -s -X POST https://cloud.example.org/api/v1/admin/users/USER_ID/disable \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"password":"your password"}'
+```
+
+- `GET /admin/server` shows counters (accounts, signed-in devices, stored bytes, live-document bytes) and the kinds of
+  database and storage, nothing else. `GET /admin/users` lists accounts 50 at a time (`limit` up to 200, `cursor` from
+  the last answer's `next`, `query` to find a username).
+- `POST /admin/users` makes an account (role `admin` or `member`) with no password and gives an **invite**, shown once:
+  the person chooses their password when they join with it (a whole join link is included when `public_url` is set).
+  `POST /admin/users/{id}/invite` makes a new invite, but only for an account that still has no password; for one with a
+  password, make a **password reset code** (`POST …/password-reset`, good for an hour, members only). Whoever redeems
+  it in Craft Cloud chooses a new password, **every device of the account is signed out, and the computer that redeems
+  it is signed in**. Codes are only shown in the answer, never in the log.
+- `PATCH /admin/users/{id}` changes the role and/or `quota_bytes`, a limit on what that account may store that replaces
+  `stored_bytes_per_user` for it (at least 4 MiB; `null` removes it; it also holds when there is no server-wide cap; one
+  below what the account stores deletes nothing and refuses new bytes).
+- `POST …/disable` signs every device of an account out and refuses its sign-in and joins (`account_disabled`);
+  `POST …/enable` allows them again but signs nothing back in. `DELETE /admin/users/{id}` marks an account for removal:
+  it is disabled for good and leaves the list, its name stays taken, and **nothing it stored is deleted yet** (that comes with
+  garbage collection). You cannot disable or remove yourself, and the last enabled admin cannot be demoted, disabled or
+  removed (`last_admin`).
+- `GET /admin/users/{id}/devices` lists an account's devices and `DELETE …/devices/{device_id}` signs one out.
+- Resetting another **admin's** password over HTTP is refused until the server has two-factor sign-in: use the command
+  line on the host. When it arrives, the confirmation takes a `totp_code` (or `recovery_code`) as well for admins who have it.
+
+A wrong confirmation password is `403 wrong_password` (never 401); five wrong ones in 15 minutes hold the account off for
+the rest of the window. A signed-out device's live connection ends at once in the server process that did it; another
+server process on the same database, or the command line, finds out at the connection's next ping (within about 30 seconds).
+The command line stays as the way in without HTTP and enforces neither the confirmation nor `last_admin`.
+
 ## Upgrading
 
-This release adds a migration (`0007`, device sessions). The server applies it when it starts. A database it
+This release adds migrations (`0007`, device sessions, and `0008`, the admin API: reset codes, per-account quotas, the
+removal mark). The server applies it when it starts. A database it
 has migrated cannot be opened by an older server: that one refuses to start ("the database was created by a newer Craft
 Cloud"). Rolling back therefore means restoring a backup taken before the upgrade, so take one first. Upgrade the
 server first: agents and apps keep working unchanged.

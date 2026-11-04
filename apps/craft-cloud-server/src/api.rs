@@ -67,6 +67,8 @@ pub fn router(state: Shared) -> Router {
         .route("/tree", get(tree))
         .route("/changes", get(changes))
         .route("/live", get(crate::live::connect))
+        // The admin routes carry `require_admin` themselves; `require_device` below wraps them too and runs first.
+        .merge(crate::admin::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_device));
     let public = Router::new()
         .route("/info", get(info))
@@ -275,7 +277,7 @@ pub(crate) async fn read_json<T: serde::de::DeserializeOwned>(state: &AppState, 
     }
 }
 
-fn body_too_slow() -> ApiError {
+pub(crate) fn body_too_slow() -> ApiError {
     ApiError::new(StatusCode::REQUEST_TIMEOUT, codes::TIMEOUT, "the request body took too long to arrive")
 }
 

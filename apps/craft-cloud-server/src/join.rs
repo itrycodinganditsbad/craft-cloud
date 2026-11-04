@@ -113,7 +113,11 @@ async fn redeem(state: &AppState, req: &JoinRequest, client: &DeviceClient) -> R
     };
     let (token, token_hash) = new_token()?;
     let redeemed = state.meta.redeem_with(&code_hash, &req.device_name, client, &token_hash, new_password_hash.as_deref(), now_ms).await?;
-    tracing::info!(device = %redeemed.device, "device joined with a code");
+    // A reset code signed the account's other devices out: their live connections end now, not at their next request.
+    for device in &redeemed.revoked {
+        state.live.revoke(*device);
+    }
+    tracing::info!(device = %redeemed.device, revoked = redeemed.revoked.len(), "device joined with a code");
     Ok(LoginResponse { device: redeemed.device, token })
 }
 

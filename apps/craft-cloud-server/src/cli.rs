@@ -115,7 +115,7 @@ pub enum UserAction {
     },
     /// Print an invite code for an account, good once for 7 days, to join a computer with in Craft Cloud. Creates the
     /// account (without a password, chosen when the invite is redeemed) if there is none, and replaces its earlier
-    /// invite.
+    /// invite or password reset code.
     Invite {
         username: String,
         /// Revoke the account's invite instead.

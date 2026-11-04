@@ -1478,6 +1478,19 @@ on_sqlite_and_postgres!(
     revoking_a_device_records_why_once,
     an_older_client_reads_the_device_list,
     a_waiting_long_poll_of_a_signed_out_device_gets_no_changes,
+    every_admin_route_needs_an_admin,
+    every_admin_change_needs_the_admins_password,
+    wrong_confirmation_passwords_are_limited,
+    a_demoted_admin_loses_the_admin_routes_at_once,
+    the_last_admin_stays_and_nobody_disables_themselves,
+    a_disabled_account_is_shut_out_everywhere,
+    removing_an_account_signs_it_out_and_keeps_its_name,
+    the_user_list_pages_and_searches,
+    an_admin_makes_accounts_and_invites,
+    a_password_reset_code_signs_the_redeeming_computer_in,
+    the_server_overview_shows_counters_only,
+    an_admin_lists_and_revokes_a_users_devices_over_http,
+    an_admin_sets_quotas_that_hold_before_any_byte_is_stored,
 );
 
 async fn devices_of(s: &Server, token: &str) -> Vec<DeviceInfo> {
@@ -1900,4 +1913,682 @@ async fn a_waiting_long_poll_of_a_signed_out_device_gets_no_changes(s: &Server) 
     let res = tokio::time::timeout(Duration::from_secs(10), waiting).await.expect("the commit ends the wait").unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.json::<ChangeSet>().await.unwrap().seq, since + 1);
+}
+
+// ---- the admin API ----
+
+async fn add_admin(s: &Server, name: &str) {
+    s.meta.create_user(name, &hash_password(PASSWORD).unwrap(), Role::Admin, 0).await.unwrap();
+}
+
+async fn id_of(s: &Server, name: &str) -> uuid::Uuid {
+    s.meta.user_by_name(name).await.unwrap().unwrap().id.0
+}
+
+/// A call to the API; `body` is sent as JSON. `token` `None`: no sign-in.
+async fn call(s: &Server, token: Option<&str>, method: reqwest::Method, path: &str, body: Option<serde_json::Value>) -> reqwest::Response {
+    let mut req = s.client.request(method, format!("{}{path}", s.base));
+    if let Some(token) = token {
+        req = req.bearer_auth(token);
+    }
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    req.send().await.unwrap()
+}
+
+/// An admin call with the confirmation: `extra` (an object) plus the password.
+async fn admin_call(s: &Server, token: &str, method: reqwest::Method, path: &str, extra: serde_json::Value) -> reqwest::Response {
+    let mut body = extra;
+    if !body.is_object() {
+        body = json!({});
+    }
+    body["password"] = json!(PASSWORD);
+    call(s, Some(token), method, path, Some(body)).await
+}
+
+async fn get_json<T: serde::de::DeserializeOwned>(res: reqwest::Response) -> T {
+    let status = res.status();
+    let text = res.text().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{text}");
+    serde_json::from_str(&text).unwrap()
+}
+
+/// What a refused admin call answered: its status and error code.
+async fn refusal(res: reqwest::Response) -> (StatusCode, String) {
+    let (status, body) = error(res).await;
+    (status, body.error)
+}
+
+async fn every_admin_route_needs_an_admin(s: &Server) {
+    use reqwest::Method as M;
+    add_admin(s, "root").await;
+    for name in ["ana", "bob", "carl"] {
+        add_user(s, name).await;
+    }
+    s.meta.create_invite("pending", &Code::generate(INVITE_CHARS).unwrap().hash(), craft_cloud_server::state::now_ms(), INVITE_TTL_MS).await.unwrap();
+    let (root, member) = (login(s, "root").await, login(s, "ana").await);
+    let spare = login(s, "bob").await;
+    let spare_id = current_device(s, &spare).await;
+    let (ana, bob, carl, pending) = (id_of(s, "ana").await, id_of(s, "bob").await, id_of(s, "carl").await, id_of(s, "pending").await);
+    let routes = vec![
+        (M::GET, "/admin/server".to_owned(), None, StatusCode::OK),
+        (M::GET, "/admin/users".to_owned(), None, StatusCode::OK),
+        (M::POST, "/admin/users".to_owned(), Some(json!({ "username": "made", "role": "member" })), StatusCode::OK),
+        (M::PATCH, format!("/admin/users/{ana}"), Some(json!({ "quota_bytes": null })), StatusCode::OK),
+        (M::POST, format!("/admin/users/{carl}/disable"), Some(json!({})), StatusCode::NO_CONTENT),
+        (M::POST, format!("/admin/users/{carl}/enable"), Some(json!({})), StatusCode::NO_CONTENT),
+        (M::POST, format!("/admin/users/{pending}/invite"), Some(json!({})), StatusCode::OK),
+        (M::DELETE, format!("/admin/users/{pending}/invite"), Some(json!({})), StatusCode::NO_CONTENT),
+        (M::POST, format!("/admin/users/{ana}/password-reset"), Some(json!({})), StatusCode::OK),
+        (M::GET, format!("/admin/users/{ana}/devices"), None, StatusCode::OK),
+        (M::DELETE, format!("/admin/users/{bob}/devices/{spare_id}"), Some(json!({})), StatusCode::NO_CONTENT),
+        (M::DELETE, format!("/admin/users/{carl}"), Some(json!({})), StatusCode::ACCEPTED),
+    ];
+    // Every `.route(` of the admin module is in the table (nine paths): a route added without a row fails here.
+    assert_eq!(include_str!("../src/admin.rs").matches(".route(\"/admin/").count(), 9);
+    let distinct: std::collections::BTreeSet<_> = routes
+        .iter()
+        .map(|(_, p, _, _)| {
+            p.replace(&ana.to_string(), "{id}")
+                .replace(&carl.to_string(), "{id}")
+                .replace(&pending.to_string(), "{id}")
+                .replace(&bob.to_string(), "{id}")
+                .replace(&spare_id.to_string(), "{device_id}")
+        })
+        .collect();
+    assert_eq!(distinct.len(), 9, "{distinct:?}");
+
+    for (method, path, body, ok) in routes {
+        let counts = s.meta.admin_server_counts().await.unwrap();
+        let with_password = body.clone().map(|mut b| {
+            b["password"] = json!(PASSWORD);
+            b
+        });
+        // No token, a token nobody has, a revoked-looking token: unauthorized. A member: forbidden, never data.
+        let anonymous = call(s, None, method.clone(), &path, with_password.clone()).await;
+        assert_eq!(refusal(anonymous).await, (StatusCode::UNAUTHORIZED, "unauthorized".to_owned()), "{method} {path}");
+        let unknown = call(s, Some(&"x".repeat(43)), method.clone(), &path, with_password.clone()).await;
+        assert_eq!(refusal(unknown).await, (StatusCode::UNAUTHORIZED, "unauthorized".to_owned()), "{method} {path}");
+        let as_member = call(s, Some(&member), method.clone(), &path, with_password.clone()).await;
+        assert_eq!(refusal(as_member).await, (StatusCode::FORBIDDEN, "forbidden".to_owned()), "{method} {path}");
+        assert_eq!(s.meta.admin_server_counts().await.unwrap(), counts, "{method} {path}: a refused call changed something");
+        // An admin gets through.
+        let as_admin = call(s, Some(&root), method.clone(), &path, with_password).await;
+        assert_eq!(as_admin.status(), ok, "{method} {path}: {}", as_admin.text().await.unwrap());
+    }
+    // An unknown path under /admin is not found, for everyone; the wrong method on a known one is a JSON 405.
+    let (status, code) = refusal(call(s, Some(&root), M::GET, "/admin/nothing", None).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+    let (status, code) = refusal(call(s, Some(&root), M::PUT, "/admin/users", None).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::METHOD_NOT_ALLOWED, "invalid"));
+}
+
+/// The nine changes that need the admin's password, each against its own admin (wrong passwords are counted per
+/// account) and its own targets.
+async fn every_admin_change_needs_the_admins_password(s: &Server) {
+    use reqwest::Method as M;
+    let hash = hash_password(PASSWORD).unwrap();
+    for kind in 0..9 {
+        let admin = format!("adm{kind}");
+        s.meta.create_user(&admin, &hash, Role::Admin, 0).await.unwrap();
+        let token = login(s, &admin).await;
+        let target = format!("target{kind}");
+        let passwordless = kind == 5 || kind == 6;
+        if passwordless {
+            s.meta
+                .create_invite(&target, &Code::generate(INVITE_CHARS).unwrap().hash(), craft_cloud_server::state::now_ms(), INVITE_TTL_MS)
+                .await
+                .unwrap();
+        } else {
+            add_user(s, &target).await;
+        }
+        let id = id_of(s, &target).await;
+        let device =
+            if kind == 8 { Some(s.meta.create_device(craft_cloud_meta::UserId(id), "pc", &[kind as u8 + 1; 32], 0).await.unwrap()) } else { None };
+        let (method, path, extra, ok) = match kind {
+            0 => (M::POST, "/admin/users".to_owned(), json!({ "username": "made", "role": "member" }), StatusCode::OK),
+            1 => (M::PATCH, format!("/admin/users/{id}"), json!({ "role": "member" }), StatusCode::OK),
+            2 => (M::POST, format!("/admin/users/{id}/disable"), json!({}), StatusCode::NO_CONTENT),
+            3 => (M::POST, format!("/admin/users/{id}/enable"), json!({}), StatusCode::NO_CONTENT),
+            4 => (M::DELETE, format!("/admin/users/{id}"), json!({}), StatusCode::ACCEPTED),
+            5 => (M::POST, format!("/admin/users/{id}/invite"), json!({}), StatusCode::OK),
+            6 => (M::DELETE, format!("/admin/users/{id}/invite"), json!({}), StatusCode::NO_CONTENT),
+            7 => (M::POST, format!("/admin/users/{id}/password-reset"), json!({}), StatusCode::OK),
+            _ => (M::DELETE, format!("/admin/users/{id}/devices/{}", device.unwrap()), json!({}), StatusCode::NO_CONTENT),
+        };
+        let at = |body: Option<serde_json::Value>| call(s, Some(&token), method.clone(), &path, body);
+        let what = format!("{method} {path}");
+        // A missing or malformed confirmation is a 400, whatever else is wrong: never a 401 or 403.
+        let mut no_password = extra.clone();
+        no_password["unrelated"] = json!(true);
+        for bad in [
+            None,
+            Some(no_password),
+            Some(json!([])),
+            Some(json!({ "password": 5 })),
+            Some(json!({ "password": null })),
+            Some(json!({ "password": ["x"] })),
+        ] {
+            let mut bad = bad;
+            // Keep the route's own fields valid so only the confirmation is wrong.
+            if let Some(serde_json::Value::Object(map)) = bad.as_mut() {
+                for (k, v) in extra.as_object().unwrap() {
+                    map.entry(k.clone()).or_insert(v.clone());
+                }
+            }
+            let sent = format!("{bad:?}");
+            assert_eq!(refusal(at(bad).await).await, (StatusCode::BAD_REQUEST, "invalid".to_owned()), "{what} with {sent}");
+        }
+        let raw = s
+            .client
+            .request(method.clone(), format!("{}{path}", s.base))
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .body("{nope")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refusal(raw).await, (StatusCode::BAD_REQUEST, "invalid".to_owned()), "{what}: not JSON");
+        // A wrong password is a 403 and never a 401 (the agent would take that for a revoked device).
+        let mut wrong = extra.clone();
+        wrong["password"] = json!("not my password");
+        assert_eq!(refusal(at(Some(wrong)).await).await, (StatusCode::FORBIDDEN, "wrong_password".to_owned()), "{what}");
+        // A body over 4 KiB is refused before it is read in full.
+        let mut big = extra.clone();
+        big["password"] = json!("a".repeat(5000));
+        assert_eq!(refusal(at(Some(big)).await).await, (StatusCode::PAYLOAD_TOO_LARGE, "too_large".to_owned()), "{what}");
+        // A password over the length limit is a 400 and costs no try.
+        let mut long = extra.clone();
+        long["password"] = json!("a".repeat(2000));
+        assert_eq!(refusal(at(Some(long)).await).await, (StatusCode::BAD_REQUEST, "invalid".to_owned()), "{what}");
+        // And nothing was done by any of those.
+        assert!(s.meta.admin_user(craft_cloud_meta::UserId(id), 0).await.unwrap().is_some_and(|u| u.disabled_ms.is_none()), "{what}");
+        // The right password, plus a field the server doesn't know (a later release's `totp_code`): done.
+        let mut right = extra.clone();
+        right["password"] = json!(PASSWORD);
+        right["totp_code"] = json!("123456");
+        let res = at(Some(right)).await;
+        assert_eq!(res.status(), ok, "{what}: {}", res.text().await.unwrap());
+    }
+}
+
+async fn wrong_confirmation_passwords_are_limited(s: &Server) {
+    use reqwest::Method as M;
+    add_admin(s, "root").await;
+    add_user(s, "ana").await;
+    let root = login(s, "root").await;
+    let ana = id_of(s, "ana").await;
+    let path = format!("/admin/users/{ana}/enable");
+    // Right passwords are given back: many of them are fine.
+    for _ in 0..8 {
+        assert_eq!(admin_call(s, &root, M::POST, &path, json!({})).await.status(), StatusCode::NO_CONTENT);
+    }
+    // Five wrong ones are answered 403, the sixth try is held off, even with the right password, and on any admin call.
+    for _ in 0..5 {
+        let res = call(s, Some(&root), M::POST, &path, Some(json!({ "password": "wrong password!" }))).await;
+        assert_eq!(refusal(res).await, (StatusCode::FORBIDDEN, "wrong_password".to_owned()));
+    }
+    let held = admin_call(s, &root, M::POST, &path, json!({})).await;
+    assert_eq!(held.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(error(held).await.1.error, "rate_limited");
+    // The account's other uses are not locked out, and another admin is not held.
+    assert!(accepted(s, &root).await);
+    add_admin(s, "root2").await;
+    let root2 = login(s, "root2").await;
+    assert_eq!(admin_call(s, &root2, M::POST, &path, json!({})).await.status(), StatusCode::NO_CONTENT);
+}
+
+async fn a_demoted_admin_loses_the_admin_routes_at_once(s: &Server) {
+    use reqwest::Method as M;
+    add_admin(s, "root").await;
+    add_admin(s, "deputy").await;
+    let (root, deputy) = (login(s, "root").await, login(s, "deputy").await);
+    assert_eq!(call(s, Some(&deputy), M::GET, "/admin/server", None).await.status(), StatusCode::OK);
+    let id = id_of(s, "deputy").await;
+    let res = admin_call(s, &root, M::PATCH, &format!("/admin/users/{id}"), json!({ "role": "member" })).await;
+    let user: craft_cloud_proto::api::AdminUserInfo = get_json(res).await;
+    assert_eq!(user.role, "member");
+    // The same token, the very next request.
+    assert_eq!(refusal(call(s, Some(&deputy), M::GET, "/admin/server", None).await).await, (StatusCode::FORBIDDEN, "forbidden".to_owned()));
+    assert_eq!(
+        refusal(admin_call(s, &deputy, M::POST, &format!("/admin/users/{}/disable", id_of(s, "root").await), json!({})).await).await,
+        (StatusCode::FORBIDDEN, "forbidden".to_owned())
+    );
+    assert!(accepted(s, &deputy).await, "still signed in, as a member");
+    // Promoted again: back.
+    let res = admin_call(s, &root, M::PATCH, &format!("/admin/users/{id}"), json!({ "role": "admin" })).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(call(s, Some(&deputy), M::GET, "/admin/server", None).await.status(), StatusCode::OK);
+}
+
+async fn the_last_admin_stays_and_nobody_disables_themselves(s: &Server) {
+    use reqwest::Method as M;
+    add_admin(s, "root").await;
+    let root = login(s, "root").await;
+    let me = id_of(s, "root").await;
+    let me_path = format!("/admin/users/{me}");
+    let (status, code) = refusal(admin_call(s, &root, M::PATCH, &me_path, json!({ "role": "member" })).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::CONFLICT, "last_admin"));
+    for (method, path) in [(M::POST, format!("{me_path}/disable")), (M::DELETE, me_path.clone())] {
+        let (status, code) = refusal(admin_call(s, &root, method, &path, json!({})).await).await;
+        assert_eq!((status, code.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+    }
+    assert!(accepted(s, &root).await);
+    // A second admin: now an admin may step down, the other can't be disabled into an empty house.
+    add_admin(s, "deputy").await;
+    let deputy_id = id_of(s, "deputy").await;
+    let deputy = login(s, "deputy").await;
+    let res = admin_call(s, &root, M::PATCH, &me_path, json!({ "role": "member" })).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let (status, code) = refusal(admin_call(s, &deputy, M::PATCH, &format!("/admin/users/{deputy_id}"), json!({ "role": "member" })).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::CONFLICT, "last_admin"));
+    // A disabled admin doesn't count: root, promoted again, disables deputy, and is then the only admin left.
+    assert_eq!(admin_call(s, &deputy, M::PATCH, &me_path, json!({ "role": "admin" })).await.status(), StatusCode::OK);
+    assert_eq!(admin_call(s, &root, M::POST, &format!("/admin/users/{deputy_id}/disable"), json!({})).await.status(), StatusCode::NO_CONTENT);
+    let (status, code) = refusal(admin_call(s, &root, M::PATCH, &me_path, json!({ "role": "member" })).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::CONFLICT, "last_admin"), "a disabled admin is no admin left");
+}
+
+async fn a_disabled_account_is_shut_out_everywhere(s: &Server) {
+    use reqwest::Method as M;
+    add_admin(s, "root").await;
+    add_user(s, "ana").await;
+    let (root, pc, laptop) = (login(s, "root").await, login(s, "ana").await, login(s, "ana").await);
+    let ana = id_of(s, "ana").await;
+    let mut ws = live_ready(s, &pc).await;
+    let pairing = new_pairing(s, &laptop).await;
+    s.meta.create_invite("ana", &Code::generate(INVITE_CHARS).unwrap().hash(), craft_cloud_server::state::now_ms(), INVITE_TTL_MS).await.unwrap();
+
+    let res = admin_call(s, &root, M::POST, &format!("/admin/users/{ana}/disable"), json!({})).await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    // The old tokens are plain 401s, and the live connection ends at once.
+    for token in [&pc, &laptop] {
+        assert_eq!(refusal(call(s, Some(token), M::GET, "/devices", None).await).await, (StatusCode::UNAUTHORIZED, "unauthorized".to_owned()));
+        assert_eq!(refusal(call(s, Some(token), M::POST, "/pairings", None).await).await, (StatusCode::UNAUTHORIZED, "unauthorized".to_owned()));
+    }
+    assert_eq!(error_code(live_next(&mut ws).await), "unauthorized");
+    assert_eq!(live_next(&mut ws).await, None, "closed");
+    // The right password says why; a wrong one says nothing.
+    assert_eq!(refusal(login_with(s, "ana", PASSWORD).await).await, (StatusCode::FORBIDDEN, "account_disabled".to_owned()));
+    assert_eq!(refusal(login_with(s, "ana", "not her password").await).await, (StatusCode::UNAUTHORIZED, "unauthorized".to_owned()));
+    // Disabling twice is fine; the admin sees it.
+    assert_eq!(admin_call(s, &root, M::POST, &format!("/admin/users/{ana}/disable"), json!({})).await.status(), StatusCode::NO_CONTENT);
+    let list: craft_cloud_proto::api::AdminUserList = get_json(call(s, Some(&root), M::GET, "/admin/users?query=ana", None).await).await;
+    assert!(list.users[0].disabled_ms.is_some() && list.users[0].devices_active == 0);
+    // Joining: the pairing is gone, a valid code (the command line makes one) is refused as disabled, a wrong one as ever.
+    assert_eq!(refusal(join(s, &pairing.code, "pc", None).await).await, (StatusCode::NOT_FOUND, "invalid_code".to_owned()));
+    let invite = Code::generate(INVITE_CHARS).unwrap();
+    s.meta.create_invite("ana", &invite.hash(), craft_cloud_server::state::now_ms(), INVITE_TTL_MS).await.unwrap();
+    assert_eq!(refusal(join(s, invite.as_str(), "pc", None).await).await, (StatusCode::FORBIDDEN, "account_disabled".to_owned()));
+    assert_eq!(refusal(join(s, "AAAA-BBBB-CCCC-DDDD", "pc", None).await).await, (StatusCode::NOT_FOUND, "invalid_code".to_owned()));
+
+    // Enabling: she signs in again; the old tokens stay dead; the code made while she was off works as any would.
+    assert_eq!(admin_call(s, &root, M::POST, &format!("/admin/users/{ana}/enable"), json!({})).await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(refusal(call(s, Some(&pc), M::GET, "/devices", None).await).await, (StatusCode::UNAUTHORIZED, "unauthorized".to_owned()));
+    let fresh = login(s, "ana").await;
+    assert!(accepted(s, &fresh).await);
+    joined(join(s, invite.as_str(), "again", None).await).await;
+}
+
+async fn removing_an_account_signs_it_out_and_keeps_its_name(s: &Server) {
+    use reqwest::Method as M;
+    add_admin(s, "root").await;
+    add_user(s, "ana").await;
+    let (root, ana_token) = (login(s, "root").await, login(s, "ana").await);
+    let ana = id_of(s, "ana").await;
+    let res = admin_call(s, &root, M::DELETE, &format!("/admin/users/{ana}"), json!({})).await;
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    assert!(!accepted(s, &ana_token).await);
+    let list: craft_cloud_proto::api::AdminUserList = get_json(call(s, Some(&root), M::GET, "/admin/users", None).await).await;
+    assert_eq!(list.users.iter().map(|u| u.username.as_str()).collect::<Vec<_>>(), vec!["root"]);
+    assert_eq!(refusal(login_with(s, "ana", PASSWORD).await).await, (StatusCode::FORBIDDEN, "account_disabled".to_owned()));
+    // It can't be enabled, and its name stays taken.
+    let (status, code) = refusal(admin_call(s, &root, M::POST, &format!("/admin/users/{ana}/enable"), json!({})).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::CONFLICT, "conflict"));
+    let (status, code) = refusal(admin_call(s, &root, M::POST, "/admin/users", json!({ "username": "Ana", "role": "member" })).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::CONFLICT, "username_taken"));
+    assert_eq!(s.meta.admin_server_counts().await.unwrap().users, 1);
+}
+
+async fn the_user_list_pages_and_searches(s: &Server) {
+    use reqwest::Method as M;
+    add_admin(s, "root").await;
+    for name in ["ana", "bob", "a_b", "axb", "carol", "dora"] {
+        add_user(s, name).await;
+    }
+    let root = login(s, "root").await;
+    let list = |query: &str| {
+        let path = format!("/admin/users{query}");
+        let root = root.clone();
+        async move { call(s, Some(&root), M::GET, &path, None).await }
+    };
+    let names = |l: &craft_cloud_proto::api::AdminUserList| l.users.iter().map(|u| u.username.clone()).collect::<Vec<_>>();
+
+    // Pages by username, with an opaque cursor, until `next` is gone.
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let q = match &cursor {
+            Some(c) => format!("?limit=3&cursor={c}"),
+            None => "?limit=3".to_owned(),
+        };
+        let page: craft_cloud_proto::api::AdminUserList = get_json(list(&q).await).await;
+        assert!(page.users.len() <= 3);
+        seen.extend(names(&page));
+        pages += 1;
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(pages, 3, "seven accounts, three a page");
+    let mut sorted_seen = seen.clone();
+    sorted_seen.sort();
+    assert_eq!(seen, sorted_seen);
+    assert_eq!(seen.len(), 7);
+    // The default and the most.
+    let all: craft_cloud_proto::api::AdminUserList = get_json(list("").await).await;
+    assert_eq!((all.users.len(), all.next.clone()), (7, None));
+    let max: craft_cloud_proto::api::AdminUserList = get_json(list("?limit=200").await).await;
+    assert_eq!(max.users.len(), 7);
+    for bad in [
+        "?limit=201",
+        "?limit=0",
+        "?limit=-1",
+        "?limit=x",
+        "?cursor=!!!",
+        "?cursor=bm90IGEgbmFtZQ",
+        "?query=a%07b",
+        &format!("?query={}", "x".repeat(65)),
+    ] {
+        assert_eq!(refusal(list(bad).await).await, (StatusCode::BAD_REQUEST, "invalid".to_owned()), "{bad}");
+    }
+    // A search: a substring, any case, `%` and `_` as themselves, paging as the plain list does.
+    let found: craft_cloud_proto::api::AdminUserList = get_json(list("?query=A_B").await).await;
+    assert_eq!(names(&found), vec!["a_b"]);
+    let found: craft_cloud_proto::api::AdminUserList = get_json(list("?query=a").await).await;
+    assert_eq!(names(&found), vec!["a_b", "ana", "axb", "carol", "dora"]);
+    let found: craft_cloud_proto::api::AdminUserList = get_json(list("?query=%25").await).await;
+    assert!(found.users.is_empty());
+    let found: craft_cloud_proto::api::AdminUserList = get_json(list(&format!("?query={}", "x".repeat(64))).await).await;
+    assert!(found.users.is_empty());
+    let page: craft_cloud_proto::api::AdminUserList = get_json(list("?query=a&limit=2").await).await;
+    assert_eq!(names(&page), vec!["a_b", "ana"]);
+    let page: craft_cloud_proto::api::AdminUserList = get_json(list(&format!("?query=a&limit=2&cursor={}", page.next.unwrap())).await).await;
+    assert_eq!(names(&page), vec!["axb", "carol"]);
+    let empty: craft_cloud_proto::api::AdminUserList = get_json(list("?query=").await).await;
+    assert_eq!(empty.users.len(), 7, "an empty query is no query");
+    // What a row says.
+    let root_row = all.users.iter().find(|u| u.username == "root").unwrap();
+    assert_eq!((root_row.role.as_str(), root_row.two_factor_enabled, root_row.devices_active, root_row.quota_bytes), ("admin", false, 1, None));
+    assert_eq!(root_row.id, id_of(s, "root").await);
+}
+
+async fn an_admin_makes_accounts_and_invites(s: &Server) {
+    use reqwest::Method as M;
+    add_admin(s, "root").await;
+    add_user(s, "ana").await;
+    let root = login(s, "root").await;
+    // A new account: no password, an invite that is shown once, no address without `public_url`.
+    let res = admin_call(s, &root, M::POST, "/admin/users", json!({ "username": "Newbie", "role": "admin" })).await;
+    let made: craft_cloud_proto::api::AdminCreatedUser = get_json(res).await;
+    assert_eq!((made.user.username.as_str(), made.user.role.as_str(), made.user.invite_pending), ("newbie", "admin", true));
+    assert_eq!(made.invite.join_url, None);
+    assert!(made.invite.expires_ms > craft_cloud_server::state::now_ms());
+    // Taken names, in any case, bad names and bad roles.
+    for (name, role, want) in [
+        ("newbie", "member", (StatusCode::CONFLICT, "username_taken")),
+        ("ANA", "member", (StatusCode::CONFLICT, "username_taken")),
+        ("bad name", "member", (StatusCode::BAD_REQUEST, "invalid")),
+        ("", "member", (StatusCode::BAD_REQUEST, "invalid")),
+        ("fine", "owner", (StatusCode::BAD_REQUEST, "invalid")),
+        ("fine", "", (StatusCode::BAD_REQUEST, "invalid")),
+    ] {
+        let (status, code) = refusal(admin_call(s, &root, M::POST, "/admin/users", json!({ "username": name, "role": role })).await).await;
+        assert_eq!((status, code.as_str()), want, "{name:?} {role:?}");
+    }
+    let res = call(s, Some(&root), M::POST, "/admin/users", Some(json!({ "username": "fine" }))).await;
+    assert_eq!(refusal(res).await, (StatusCode::BAD_REQUEST, "invalid".to_owned()), "a missing role is a malformed body");
+    // The invite chooses the password, and the account is an admin: its token reaches the admin routes.
+    let bad = join(s, &made.invite.code, "pc", Some("short")).await;
+    assert_eq!(refusal(bad).await, (StatusCode::BAD_REQUEST, "weak_password".to_owned()));
+    assert_eq!(refusal(join(s, &made.invite.code, "pc", None).await).await, (StatusCode::BAD_REQUEST, "password_required".to_owned()));
+    let newbie = joined(join(s, &made.invite.code, "pc", Some("a password of mine")).await).await;
+    assert_eq!(call(s, Some(&newbie.token), M::GET, "/admin/server", None).await.status(), StatusCode::OK);
+    assert_eq!(
+        refusal(join(s, &made.invite.code, "again", Some("a password of mine")).await).await,
+        (StatusCode::NOT_FOUND, "invalid_code".to_owned())
+    );
+
+    // An invite for an account that has a password is refused: it would add a computer without the password.
+    let ana = id_of(s, "ana").await;
+    let (status, code) = refusal(admin_call(s, &root, M::POST, &format!("/admin/users/{ana}/invite"), json!({})).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::CONFLICT, "conflict"));
+    // For one without: issued, replaced by the next, revoked, and gone.
+    let res = admin_call(s, &root, M::POST, "/admin/users", json!({ "username": "later", "role": "member" })).await;
+    let later: craft_cloud_proto::api::AdminCreatedUser = get_json(res).await;
+    let later_path = format!("/admin/users/{}/invite", later.user.id);
+    let first: craft_cloud_proto::api::AdminCode = get_json(admin_call(s, &root, M::POST, &later_path, json!({})).await).await;
+    let second: craft_cloud_proto::api::AdminCode = get_json(admin_call(s, &root, M::POST, &later_path, json!({})).await).await;
+    assert_ne!(first.code, second.code);
+    assert_eq!(refusal(join(s, &later.invite.code, "pc", Some("a password of mine")).await).await.1, "invalid_code", "the first invite was replaced");
+    assert_eq!(refusal(join(s, &first.code, "pc", Some("a password of mine")).await).await.1, "invalid_code");
+    assert_eq!(admin_call(s, &root, M::DELETE, &later_path, json!({})).await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(refusal(join(s, &second.code, "pc", Some("a password of mine")).await).await.1, "invalid_code", "revoked");
+    let (status, code) = refusal(admin_call(s, &root, M::DELETE, &later_path, json!({})).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::NOT_FOUND, "not_found"), "nothing left to revoke");
+    let third: craft_cloud_proto::api::AdminCode = get_json(admin_call(s, &root, M::POST, &later_path, json!({})).await).await;
+    let joined_later = joined(join(s, &third.code, "pc", Some("a password of mine")).await).await;
+    assert!(accepted(s, &joined_later.token).await);
+}
+
+async fn a_password_reset_code_signs_the_redeeming_computer_in(s: &Server) {
+    use reqwest::Method as M;
+    add_admin(s, "root").await;
+    add_user(s, "ana").await;
+    let (root, pc, laptop) = (login(s, "root").await, login(s, "ana").await, login(s, "ana").await);
+    let ana = id_of(s, "ana").await;
+    let mut ws = live_ready(s, &pc).await;
+    let pairing = new_pairing(s, &laptop).await;
+    let path = format!("/admin/users/{ana}/password-reset");
+    // Making a code changes nothing yet.
+    let reset: craft_cloud_proto::api::AdminCode = get_json(admin_call(s, &root, M::POST, &path, json!({ "reset_two_factor": false })).await).await;
+    let now = craft_cloud_server::state::now_ms();
+    assert!((now + 59 * 60_000..=now + 61 * 60_000).contains(&reset.expires_ms), "an hour: {}", reset.expires_ms - now);
+    assert!(accepted(s, &pc).await && accepted(s, &laptop).await);
+    assert_eq!(login_with(s, "ana", PASSWORD).await.status(), StatusCode::OK);
+
+    // It always asks for a new password, though ana has one; a weak one is refused, and the code stays.
+    assert_eq!(refusal(join(s, &reset.code, "recovery", None).await).await, (StatusCode::BAD_REQUEST, "password_required".to_owned()));
+    assert_eq!(refusal(join(s, &reset.code, "recovery", Some("short")).await).await, (StatusCode::BAD_REQUEST, "weak_password".to_owned()));
+    let new = "a password for after";
+    let recovered = joined(join(s, &reset.code, "recovery", Some(new)).await).await;
+    // Everything else is signed out, the live connection ends at once, the pairing is gone, and this computer is in.
+    assert!(!accepted(s, &pc).await && !accepted(s, &laptop).await);
+    assert_eq!(error_code(live_next(&mut ws).await), "unauthorized");
+    assert_eq!(live_next(&mut ws).await, None, "closed");
+    assert_eq!(refusal(join(s, &pairing.code, "late", None).await).await.1, "invalid_code");
+    assert!(accepted(s, &recovered.token).await);
+    assert_eq!(login_with(s, "ana", PASSWORD).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(login_with(s, "ana", new).await.status(), StatusCode::OK);
+    let devices = devices_of(s, &recovered.token).await;
+    assert_eq!(
+        devices.iter().filter(|d| d.revoked && d.revoke_reason.as_deref() == Some("reset")).count(),
+        3,
+        "the two signed in and the one the password check made"
+    );
+    // Once.
+    assert_eq!(refusal(join(s, &reset.code, "again", Some(new)).await).await.1, "invalid_code");
+
+    // Not for an admin (no second factor exists to ask of the acting admin), not for oneself, not for nobody.
+    add_admin(s, "boss").await;
+    let boss = id_of(s, "boss").await;
+    let (status, code) = refusal(admin_call(s, &root, M::POST, &format!("/admin/users/{boss}/password-reset"), json!({})).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::FORBIDDEN, "forbidden"));
+    let me = id_of(s, "root").await;
+    let (status, code) = refusal(admin_call(s, &root, M::POST, &format!("/admin/users/{me}/password-reset"), json!({})).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+    let nobody = uuid::Uuid::now_v7();
+    let (status, code) = refusal(admin_call(s, &root, M::POST, &format!("/admin/users/{nobody}/password-reset"), json!({})).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+}
+
+async fn the_server_overview_shows_counters_only(s: &Server) {
+    use reqwest::Method as M;
+    add_admin(s, "root").await;
+    add_user(s, "ana").await;
+    let (root, ana) = (login(s, "root").await, login(s, "ana").await);
+    assert_eq!(put_chunk(s, &ana, &[3u8; 100]).await, StatusCode::NO_CONTENT);
+    let res = call(s, Some(&root), M::GET, "/admin/server", None).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = res.text().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let keys: std::collections::BTreeSet<_> = json.as_object().unwrap().keys().cloned().collect();
+    let expected: std::collections::BTreeSet<_> =
+        ["version", "users", "devices_active", "stored_bytes", "live_bytes", "storage_kind", "database_kind"].into_iter().map(String::from).collect();
+    assert_eq!(keys, expected, "{text}");
+    assert_eq!(
+        (json["users"].as_u64(), json["devices_active"].as_u64(), json["stored_bytes"].as_u64(), json["live_bytes"].as_u64()),
+        (Some(2), Some(2), Some(101), Some(0))
+    );
+    assert_eq!(json["storage_kind"], "disk");
+    assert_eq!(json["database_kind"], s.meta.database_kind());
+    assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+    // Nothing that names a place on the machine or the network.
+    let blobs = s._dirs.last().unwrap().path().display().to_string();
+    for forbidden in [blobs.as_str(), "meta.db", "postgres://", "http://", "127.0.0.1"] {
+        assert!(!text.contains(forbidden), "{forbidden} in {text}");
+    }
+}
+
+async fn an_admin_lists_and_revokes_a_users_devices_over_http(s: &Server) {
+    use reqwest::Method as M;
+    add_admin(s, "root").await;
+    add_user(s, "ana").await;
+    add_user(s, "bob").await;
+    let (root, pc, laptop, bob) = (login(s, "root").await, login(s, "ana").await, login(s, "ana").await, login(s, "bob").await);
+    let ana_id = id_of(s, "ana").await;
+    let (pc_id, bob_device) = (current_device(s, &pc).await, current_device(s, &bob).await);
+    let mut ws = live_ready(s, &pc).await;
+    assert_eq!(
+        s.client.delete(format!("{}/devices/{}", s.base, current_device(s, &laptop).await)).bearer_auth(&pc).send().await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    // All of them, the revoked one with its reason.
+    let listed: craft_cloud_proto::api::AdminDevices =
+        get_json(call(s, Some(&root), M::GET, &format!("/admin/users/{ana_id}/devices"), None).await).await;
+    assert_eq!(listed.devices.len(), 2);
+    assert_eq!(listed.devices.iter().filter(|d| d.revoked && d.revoke_reason.as_deref() == Some("user")).count(), 1);
+    assert!(listed.devices.iter().all(|d| !d.current), "none of them is the admin's own");
+    // Revoking one: the token is dead at once, the live connection ends, the reason says an admin did it.
+    let path = format!("/admin/users/{ana_id}/devices/{pc_id}");
+    assert_eq!(admin_call(s, &root, M::DELETE, &path, json!({})).await.status(), StatusCode::NO_CONTENT);
+    assert!(!accepted(s, &pc).await);
+    assert_eq!(error_code(live_next(&mut ws).await), "unauthorized");
+    let listed: craft_cloud_proto::api::AdminDevices =
+        get_json(call(s, Some(&root), M::GET, &format!("/admin/users/{ana_id}/devices"), None).await).await;
+    assert_eq!(listed.devices.iter().find(|d| d.id == pc_id).unwrap().revoke_reason.as_deref(), Some("admin"));
+    assert_eq!(admin_call(s, &root, M::DELETE, &path, json!({})).await.status(), StatusCode::NO_CONTENT, "again is fine");
+    // Another user's device, an unknown device, an unknown user: not found. Bad IDs: invalid.
+    let wrong_owner = format!("/admin/users/{ana_id}/devices/{bob_device}");
+    assert_eq!(refusal(admin_call(s, &root, M::DELETE, &wrong_owner, json!({})).await).await, (StatusCode::NOT_FOUND, "not_found".to_owned()));
+    assert!(accepted(s, &bob).await);
+    let unknown_device = format!("/admin/users/{ana_id}/devices/{}", uuid::Uuid::now_v7());
+    assert_eq!(refusal(admin_call(s, &root, M::DELETE, &unknown_device, json!({})).await).await.1, "not_found");
+    let unknown_user = format!("/admin/users/{}/devices", uuid::Uuid::now_v7());
+    assert_eq!(refusal(call(s, Some(&root), M::GET, &unknown_user, None).await).await.1, "not_found");
+    for bad in ["not-an-id", "123", "00000000-0000-0000-0000-00000000000g"] {
+        for (method, path) in [
+            (M::GET, format!("/admin/users/{bad}/devices")),
+            (M::DELETE, format!("/admin/users/{ana_id}/devices/{bad}")),
+            (M::PATCH, format!("/admin/users/{bad}")),
+            (M::POST, format!("/admin/users/{bad}/disable")),
+            (M::POST, format!("/admin/users/{bad}/enable")),
+            (M::DELETE, format!("/admin/users/{bad}")),
+            (M::POST, format!("/admin/users/{bad}/invite")),
+            (M::DELETE, format!("/admin/users/{bad}/invite")),
+            (M::POST, format!("/admin/users/{bad}/password-reset")),
+        ] {
+            let res = admin_call(s, &root, method.clone(), &path, json!({ "role": "member" })).await;
+            assert_eq!(refusal(res).await, (StatusCode::BAD_REQUEST, "invalid".to_owned()), "{method} {path}");
+        }
+    }
+    // The device of bob is untouched.
+    assert!(devices_of(s, &bob).await.iter().all(|d| !d.revoked));
+}
+
+async fn an_admin_sets_quotas_that_hold_before_any_byte_is_stored(s: &Server) {
+    use reqwest::Method as M;
+    add_admin(s, "root").await;
+    add_user(s, "ana").await;
+    let (root, ana) = (login(s, "root").await, login(s, "ana").await);
+    let ana_id = id_of(s, "ana").await;
+    let path = format!("/admin/users/{ana_id}");
+    let blobs = s._dirs.last().unwrap().path().to_owned();
+    let chunk = vec![7u8; 4 * 1024 * 1024];
+    // No quota and no cap on this server: nothing stops a chunk.
+    // Bounds: a missing field changes nothing, an empty body is invalid, null removes, a number from one chunk up.
+    for bad in [
+        json!({}),
+        json!({ "quota_bytes": 0 }),
+        json!({ "quota_bytes": 4_194_303 }),
+        json!({ "quota_bytes": -5 }),
+        json!({ "quota_bytes": "9" }),
+        json!({ "quota_bytes": 1.5 }),
+        json!({ "role": "owner" }),
+    ] {
+        let sent = bad.to_string();
+        assert_eq!(refusal(admin_call(s, &root, M::PATCH, &path, bad).await).await, (StatusCode::BAD_REQUEST, "invalid".to_owned()), "{sent}");
+    }
+    let set: craft_cloud_proto::api::AdminUserInfo = get_json(admin_call(s, &root, M::PATCH, &path, json!({ "quota_bytes": 4_194_304 })).await).await;
+    assert_eq!(set.quota_bytes, Some(4_194_304));
+    let same: craft_cloud_proto::api::AdminUserInfo = get_json(admin_call(s, &root, M::PATCH, &path, json!({ "role": "member" })).await).await;
+    assert_eq!(same.quota_bytes, Some(4_194_304), "a missing quota_bytes leaves it");
+    let huge: craft_cloud_proto::api::AdminUserInfo = get_json(admin_call(s, &root, M::PATCH, &path, json!({ "quota_bytes": i64::MAX })).await).await;
+    assert_eq!(huge.quota_bytes, Some(i64::MAX as u64));
+    assert_eq!(refusal(admin_call(s, &root, M::PATCH, &path, json!({ "quota_bytes": u64::MAX })).await).await.0, StatusCode::BAD_REQUEST);
+    get_json::<craft_cloud_proto::api::AdminUserInfo>(admin_call(s, &root, M::PATCH, &path, json!({ "quota_bytes": 4_194_304 })).await).await;
+
+    // A chunk the quota can't hold is refused in the look before storing: nothing reaches the disk.
+    let res = s.client.put(format!("{}/chunks/{}", s.base, chunk_id(&chunk))).bearer_auth(&ana).body(chunk.clone()).send().await.unwrap();
+    let (status, body) = error(res).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::INSUFFICIENT_STORAGE, "quota_exceeded"));
+    assert_eq!(body.quota, Some(craft_cloud_proto::api::QuotaUse { used: 0, limit: 4_194_304 }));
+    assert_eq!(walk(&blobs), 0, "nothing was stored");
+    assert_eq!(put_chunk(s, &ana, &[1u8; 1000]).await, StatusCode::NO_CONTENT);
+    // `null` removes it: the same chunk goes in.
+    let cleared: craft_cloud_proto::api::AdminUserInfo = get_json(admin_call(s, &root, M::PATCH, &path, json!({ "quota_bytes": null })).await).await;
+    assert_eq!(cleared.quota_bytes, None);
+    let res = s.client.put(format!("{}/chunks/{}", s.base, chunk_id(&chunk))).bearer_auth(&ana).body(chunk).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+}
+
+/// A server that knows its public address.
+async fn sqlite_disk_with_public_url(public_url: &str) -> Server {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let state = AppState::new(meta.clone(), store, vec![]).unwrap().with_public_url(Some(public_url.to_owned()));
+    start_state(state, meta, vec![db, blobs], None).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_invites_carry_the_join_link_when_the_server_knows_its_address() {
+    use reqwest::Method as M;
+    let s = sqlite_disk_with_public_url("https://cloud.example.org").await;
+    add_admin(&s, "root").await;
+    let root = login(&s, "root").await;
+    let made: craft_cloud_proto::api::AdminCreatedUser =
+        get_json(admin_call(&s, &root, M::POST, "/admin/users", json!({ "username": "newbie", "role": "member" })).await).await;
+    let link = made.invite.join_url.unwrap();
+    let parsed = craft_cloud_proto::join::JoinString::parse(&link).unwrap();
+    assert_eq!(parsed.server, "https://cloud.example.org");
+    assert_eq!(parsed.code.as_str(), made.invite.code);
+    assert!(link.starts_with("https://cloud.example.org/join/"), "{link}");
+    // The code in the link is the one that works.
+    joined(join(&s, &made.invite.code, "pc", Some("a password of mine")).await).await;
 }

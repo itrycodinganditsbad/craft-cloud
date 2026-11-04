@@ -412,3 +412,34 @@ fn the_binary_serves_what_init_created() {
     assert!(body.starts_with("HTTP/1.1 200"), "{body}");
     assert!(body.contains("\"chunker_params\":[\"fastcdc-v1\"]"), "{body}");
 }
+
+/// The command line stays the way back in without HTTP: `user invite` replaces a password reset code the admin API made
+/// (one row per account, so the reset code stops working), and makes an invite that adds a computer as before.
+#[tokio::test]
+async fn user_invite_replaces_a_password_reset_code() {
+    use craft_cloud_meta::{AdminActor, RESET_TTL_MS};
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config_path = dir.join("config.toml");
+    let c = config_path.to_str().unwrap();
+    cli(&["user", "--config", c, "add", "bob"], "bob password 1\n").await.unwrap();
+    let (meta, _) = craft_cloud_server::cli::open(&Config::load(&config_path).unwrap()).await.unwrap();
+    let ana = meta.user_by_name("ana").await.unwrap().unwrap();
+    let bob = meta.user_by_name("bob").await.unwrap().unwrap();
+    let device = meta.create_device(ana.id, "pc", &[9u8; 32], 0).await.unwrap();
+    let actor = AdminActor { user: ana.id, device, password_hash: ana.password_hash.clone() };
+    let reset = Code::generate(INVITE_CHARS).unwrap();
+    meta.admin_issue_reset(&actor, bob.id, &reset.hash(), 0, RESET_TTL_MS).await.unwrap();
+    assert_eq!(meta.invite_needs_password(&reset.hash(), 1).await.unwrap(), Some(true));
+
+    let out = cli(&["user", "--config", c, "invite", "bob"], "").await.unwrap();
+    assert!(out.contains("Invite for bob") && out.contains("adds a computer"), "{out}");
+    // The reset code is gone, and the new code is an invite: bob has a password, so it asks for none.
+    assert_eq!(meta.invite_needs_password(&reset.hash(), 1).await.unwrap(), None);
+    let code = out.lines().find_map(|l| l.strip_prefix("Code: ")).unwrap().trim().to_owned();
+    let invite = Code::parse_any(&code).unwrap();
+    assert_eq!(meta.invite_needs_password(&invite.hash(), 1).await.unwrap(), Some(false));
+    // The command line does not enforce what the HTTP API does: it can reset the last admin's password.
+    assert!(cli(&["user", "--config", c, "reset-password", "ana"], "a brand new password\n").await.unwrap().contains("password changed for ana"));
+}

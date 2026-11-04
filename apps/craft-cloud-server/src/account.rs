@@ -34,7 +34,7 @@ pub const PASSWORD_CHANGES_PER_USER: u32 = 5;
 type Shared = Arc<AppState>;
 
 /// `403 wrong_password`: the current password was wrong. Never 401, see the module's notes.
-fn wrong_password() -> ApiError {
+pub(crate) fn wrong_password() -> ApiError {
     ApiError::new(StatusCode::FORBIDDEN, codes::WRONG_PASSWORD, "the current password is wrong")
 }
 
