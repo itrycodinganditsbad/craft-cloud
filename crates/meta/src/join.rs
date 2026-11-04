@@ -204,6 +204,22 @@ impl Meta {
         w.commit().await
     }
 
+    /// How many milliseconds after `now_ms` the second factor of the account an unexpired invite or reset code under
+    /// `code_hash` is for stays locked (`None`: no such code, the account has no two-factor sign-in, or it is not locked). A
+    /// plain read, so the join route can say "locked" with the time instead of "too many tries" to someone who holds a code.
+    pub async fn join_code_locked_for(&self, code_hash: &[u8; 32], now_ms: i64) -> Result<Option<i64>, MetaError> {
+        let row = sqlx::query(
+            "SELECT t.locked_until_ms FROM invites i JOIN user_two_factor t ON t.user_id = i.user_id \
+             WHERE i.code_hash = $1 AND i.expires_ms > $2 AND t.enabled_ms IS NOT NULL",
+        )
+        .bind(code_hash.to_vec())
+        .bind(now_ms)
+        .fetch_optional(&self.pool)
+        .await?;
+        let until: Option<i64> = row.map(|row| row.try_get("locked_until_ms")).transpose()?.flatten();
+        Ok(until.filter(|until| *until > now_ms).map(|until| until - now_ms))
+    }
+
     /// Whether the invite under `code_hash` needs a new password (its account has none, or it is a reset code, which
     /// always does): `None` when no unexpired invite has that hash (it may be a pairing's, or wrong). Lets the server
     /// answer `password_required` before it spends time hashing a password.
@@ -290,17 +306,17 @@ impl Meta {
                 let purpose = Purpose::parse(&row.try_get::<String, _>("purpose")?)?;
                 let reset_two_factor: i64 = row.try_get("reset_two_factor")?;
                 lock_user(&mut w.tx, user).await?;
-                let consumed = sqlx::query(
-                    "DELETE FROM invites WHERE code_hash = $1 AND user_id = $2 AND expires_ms > $3 AND purpose = $4 AND reset_two_factor = $5",
+                let still_there = sqlx::query(
+                    "SELECT 1 FROM invites WHERE code_hash = $1 AND user_id = $2 AND expires_ms > $3 AND purpose = $4 AND reset_two_factor = $5",
                 )
                 .bind(code_hash.to_vec())
                 .bind(uuid_bytes(&user.0))
                 .bind(now_ms)
                 .bind(purpose.as_str())
                 .bind(reset_two_factor)
-                .execute(&mut *w.tx)
+                .fetch_optional(&mut *w.tx)
                 .await?;
-                if consumed.rows_affected() == 0 {
+                if still_there.is_none() {
                     // Taken, replaced or deleted (a reset) while this waited for the lock.
                     return Err(MetaError::InvalidCode);
                 }
@@ -323,10 +339,25 @@ impl Meta {
                         let Some(proof) = second_factor else { return Err(MetaError::TwoFactorRequired) };
                         let row = two_factor::load_row(&mut w.tx, user).await?.ok_or(MetaError::Corrupt("two-factor row vanished under the lock"))?;
                         if let two_factor::Checked::Wrong = two_factor::check_proof(&mut w.tx, user, &row, proof, now_ms).await? {
-                            // The invite goes back with the rollback; the wrong proof is counted on its own.
+                            // Nothing has been consumed yet: the wrong proof is counted and committed in this very
+                            // transaction, under the account's lock, and the invite stays.
                             return Err(self.refuse_proof(w, user, None, now_ms).await);
                         }
                     }
+                }
+                // Only now is the invite used up, with everything above decided under the lock.
+                let consumed = sqlx::query(
+                    "DELETE FROM invites WHERE code_hash = $1 AND user_id = $2 AND expires_ms > $3 AND purpose = $4 AND reset_two_factor = $5",
+                )
+                .bind(code_hash.to_vec())
+                .bind(uuid_bytes(&user.0))
+                .bind(now_ms)
+                .bind(purpose.as_str())
+                .bind(reset_two_factor)
+                .execute(&mut *w.tx)
+                .await?;
+                if consumed.rows_affected() == 0 {
+                    return Err(MetaError::InvalidCode);
                 }
                 match purpose {
                     Purpose::Reset => {

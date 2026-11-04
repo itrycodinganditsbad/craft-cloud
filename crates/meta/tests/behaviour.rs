@@ -195,6 +195,8 @@ on_every_backend!(
     admins_two_factor_is_checked_in_the_change_and_resets_need_it,
     the_command_line_resets_two_factor_and_the_account_shows_it,
     secrets_are_listed_and_replaced_only_if_unchanged,
+    parallel_wrong_proofs_on_one_challenge_count_exactly_five,
+    parallel_wrong_proofs_lock_for_exactly_fifteen_minutes,
 );
 
 // ---- helpers ----
@@ -4644,4 +4646,63 @@ async fn secrets_are_listed_and_replaced_only_if_unchanged(meta: &Meta) {
     assert_eq!(listed.iter().find(|s| s.user == me.user.id).unwrap().active.as_deref(), Some(b"new-cipher".as_slice()));
     // A secret that isn't the account's is never touched.
     assert!(!meta.two_factor_replace_ciphertext(UserId(uuid::Uuid::now_v7()), false, b"x", b"y").await.unwrap());
+}
+
+/// Wrong proofs are counted under the lock that checked them: of many at once on one challenge exactly five are counted (the
+/// fifth deletes it, the rest find it gone), and they all count against the account's ten.
+async fn parallel_wrong_proofs_on_one_challenge_count_exactly_five(meta: &Meta) {
+    let me = protected(meta, "ana").await;
+    let id = me.user.id;
+    let generation = gen_of(meta, "ana").await;
+    for round in 0..4 {
+        let chal = new_challenge();
+        meta.sign_in(id, ("$argon2id$stub", generation), "pc", &DeviceClient::default(), &token(), &chal, SETUP_AT + 10 + round).await.unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..14 {
+            let (meta, hash) = (meta.clone(), chal.id_hash);
+            tasks.push(tokio::spawn(async move { meta.complete_second_factor(&hash, &totp(&wrong()), &token(), SETUP_AT + 20).await.map(|_| ()) }));
+        }
+        let (mut counted, mut gone) = (0, 0);
+        for task in tasks {
+            match task.await.unwrap() {
+                Err(MetaError::TwoFactorInvalid) => counted += 1,
+                Err(MetaError::ChallengeGone) => gone += 1,
+                Err(MetaError::TwoFactorLocked { .. }) => {}
+                other => panic!("round {round}: {other:?}"),
+            }
+        }
+        assert!(meta.challenge_owner(&chal.id_hash, SETUP_AT + 21).await.unwrap().is_none(), "round {round}: five wrong proofs delete it");
+        // Locked rounds stop counting; until then exactly five per challenge, never six.
+        if round == 0 {
+            assert_eq!((counted, gone), (5, 9), "round {round}");
+        }
+        assert!(counted <= 5, "round {round}: {counted} proofs were checked against one challenge");
+        if meta.two_factor_locked_for(id, SETUP_AT + 21).await.unwrap().is_some() {
+            break;
+        }
+    }
+}
+
+/// Many wrong proofs at once, crossing ten: the lock is set by exactly the tenth, for exactly 15 minutes, and the ones after it
+/// find it locked and count nothing (so it never jumps to 30).
+async fn parallel_wrong_proofs_lock_for_exactly_fifteen_minutes(meta: &Meta) {
+    for round in 0..6 {
+        let me = protected(meta, &format!("ana{round}")).await;
+        let (id, now) = (me.user.id, SETUP_AT + 100);
+        let mut tasks = Vec::new();
+        for _ in 0..24 {
+            let meta = meta.clone();
+            tasks.push(tokio::spawn(async move { confirm_with(&meta, id, None, now).await }));
+        }
+        let (mut wrong_ones, mut locked) = (0, 0);
+        for task in tasks {
+            match task.await.unwrap() {
+                Err(MetaError::TwoFactorInvalid) => wrong_ones += 1,
+                Err(MetaError::TwoFactorLocked { .. }) => locked += 1,
+                other => panic!("round {round}: {other:?}"),
+            }
+        }
+        assert_eq!((wrong_ones, locked), (10, 14), "round {round}");
+        assert_eq!(meta.two_factor_locked_for(id, now).await.unwrap(), Some(15 * MINUTE), "round {round}: 15 minutes, not 30");
+    }
 }

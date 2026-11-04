@@ -12,9 +12,10 @@
 //!   (`last_accepted_step`, updated with `WHERE last_accepted_step < step`), so two requests with one code can't both
 //!   succeed, and a second confirmation in the same 30-second step needs the next code. Sign-in and the admin's
 //!   confirmations share that counter. A recovery code is a row updated once (`WHERE used_ms IS NULL`).
-//! - **Wrong proofs are counted outside the transaction that refused them.** The refused transaction is rolled back
-//!   (the invite stays, the challenge stays), and then [`Meta::record_failed_proof`] commits the counters and the lock in
-//!   a transaction of its own, so the counters survive the rollback. After [`LOCK_AFTER_FAILURES`] wrong proofs in a
+//! - **Wrong proofs are counted in the transaction that refused them, under the account's lock.** Every check runs before
+//!   anything is consumed, so the refusing transaction commits only the counters (the invite stays, the challenge stays,
+//!   no device), and the next request, which waited for the lock, sees the attempts and the lock this one made. After
+//!   [`LOCK_AFTER_FAILURES`] wrong proofs in a
 //!   row the second factor is locked for [`LOCK_BASE_MS`], and each wrong proof after that doubles the time up to
 //!   [`LOCK_MAX_MS`]. A lock is never for good. While it lasts every check answers [`MetaError::TwoFactorLocked`]
 //!   without counting.
@@ -58,6 +59,9 @@ pub struct UnreadableSecret;
 /// of the code, if it is right for a step in the window, else `None`. Called with the transaction open, on the
 /// ciphertext that is current under the account's lock.
 pub type TotpVerifier<'a> = dyn Fn(UserId, &[u8]) -> Result<Option<i64>, UnreadableSecret> + Send + Sync + 'a;
+
+/// Rewrites one stored ciphertext of an account: the one to store in its place, or `None` to leave it ([`Meta::two_factor_rewrite`]).
+pub type Rewrite<'a> = dyn Fn(UserId, &[u8]) -> Result<Option<Vec<u8>>, UnreadableSecret> + Send + Sync + 'a;
 
 /// A second factor a caller presents.
 pub enum Proof<'a> {
@@ -418,9 +422,9 @@ impl Meta {
         let pending = row.pending.as_deref().ok_or(MetaError::Corrupt("an open set-up has no secret"))?;
         let step = verify(user, pending).map_err(|_| MetaError::Corrupt("a stored two-factor secret can't be read"))?;
         let Some(step) = step else {
-            // The wrong code is counted outside the transaction that refuses it.
-            w.rollback().await?;
-            self.record_wrong_setup_code(user, device).await?;
+            // Nothing was changed yet: the wrong code is counted and committed in this transaction, under the lock.
+            count_wrong_setup_in(&mut w.tx, user, device).await?;
+            w.commit().await?;
             return Err(MetaError::TwoFactorInvalid);
         };
         let done = sqlx::query(
@@ -443,28 +447,6 @@ impl Meta {
         delete_join_codes(&mut w.tx, user).await?;
         w.commit().await?;
         Ok(revoked)
-    }
-
-    /// Counts a wrong code against the open set-up of `device`, in a transaction of its own; the fifth uses the set-up up.
-    async fn record_wrong_setup_code(&self, user: UserId, device: DeviceId) -> Result<(), MetaError> {
-        let mut w = self.begin_write().await?;
-        sqlx::query(
-            "UPDATE user_two_factor SET pending_attempts = pending_attempts + 1 \
-             WHERE user_id = $1 AND enabled_ms IS NULL AND pending_device = $2 AND pending_ciphertext IS NOT NULL",
-        )
-        .bind(uuid_bytes(&user.0))
-        .bind(uuid_bytes(device.as_uuid()))
-        .execute(&mut *w.tx)
-        .await?;
-        sqlx::query(
-            "UPDATE user_two_factor SET pending_ciphertext = NULL, pending_device = NULL, pending_expires_ms = NULL, pending_attempts = 0 \
-             WHERE user_id = $1 AND enabled_ms IS NULL AND pending_attempts >= $2",
-        )
-        .bind(uuid_bytes(&user.0))
-        .bind(MAX_SETUP_ATTEMPTS)
-        .execute(&mut *w.tx)
-        .await?;
-        w.commit().await
     }
 
     /// Turns `actor`'s two-factor sign-in off with `proof` (a code or a recovery code): in one transaction the secret,
@@ -693,57 +675,21 @@ impl Meta {
         Ok(Completed { user, device })
     }
 
-    /// Rolls back `w`, which refused a wrong proof, then commits the wrong proof's counters on their own: [`MetaError::TwoFactorInvalid`],
-    /// or the error that stopped the counters being written.
-    pub(crate) async fn refuse_proof(&self, w: WriteTx, user: UserId, challenge: Option<&[u8; 32]>, now_ms: i64) -> MetaError {
+    /// `w` refused a wrong proof and has changed nothing (every caller checks the proof before it consumes anything): the wrong
+    /// proof's counters are written and **committed in `w` itself**, with the account's row still locked, and the answer is
+    /// [`MetaError::TwoFactorInvalid`] (or the error that stopped the counters being written). Counting under the same lock as
+    /// the check means the next request sees the attempts and the lock this one made: no more than five wrong proofs per
+    /// challenge, and the lock set by exactly the tenth.
+    pub(crate) async fn refuse_proof(&self, mut w: WriteTx, user: UserId, challenge: Option<&[u8; 32]>, now_ms: i64) -> MetaError {
         let counted = async {
-            w.rollback().await?;
-            self.record_failed_proof(user, challenge, now_ms).await
+            count_wrong_in(&mut w.tx, user, challenge, now_ms).await?;
+            w.commit().await
         }
         .await;
         match counted {
             Ok(()) => MetaError::TwoFactorInvalid,
             Err(e) => e,
         }
-    }
-
-    /// Counts one wrong second factor of `user` in a transaction of its own: the account's wrong proofs in a row go up, and
-    /// at [`LOCK_AFTER_FAILURES`] (and every one after) the lock is set or doubled; the challenge's attempts go up too, and
-    /// the challenge is deleted at [`MAX_CHALLENGE_ATTEMPTS`]. The account's row is not locked here (the two-factor row and
-    /// then the challenge are: the order everything else takes them in), and the increments are single statements, so
-    /// requests at the same moment count each other.
-    pub(crate) async fn record_failed_proof(&self, user: UserId, challenge: Option<&[u8; 32]>, now_ms: i64) -> Result<(), MetaError> {
-        let mut w = self.begin_write().await?;
-        let counted = sqlx::query(
-            "UPDATE user_two_factor SET failed_attempts = failed_attempts + 1 WHERE user_id = $1 AND enabled_ms IS NOT NULL \
-             RETURNING failed_attempts, locked_until_ms",
-        )
-        .bind(uuid_bytes(&user.0))
-        .fetch_optional(&mut *w.tx)
-        .await?;
-        if let Some(row) = counted
-            && let Some(duration) = lock_for(row.try_get("failed_attempts")?)
-        {
-            let until = now_ms.saturating_add(duration);
-            let until = row.try_get::<Option<i64>, _>("locked_until_ms")?.map_or(until, |current| current.max(until));
-            sqlx::query("UPDATE user_two_factor SET locked_until_ms = $1 WHERE user_id = $2")
-                .bind(until)
-                .bind(uuid_bytes(&user.0))
-                .execute(&mut *w.tx)
-                .await?;
-        }
-        if let Some(challenge) = challenge {
-            sqlx::query("UPDATE login_challenges SET attempts = attempts + 1 WHERE id_hash = $1")
-                .bind(challenge.to_vec())
-                .execute(&mut *w.tx)
-                .await?;
-            sqlx::query("DELETE FROM login_challenges WHERE id_hash = $1 AND attempts >= $2")
-                .bind(challenge.to_vec())
-                .bind(MAX_CHALLENGE_ATTEMPTS)
-                .execute(&mut *w.tx)
-                .await?;
-        }
-        w.commit().await
     }
 
     /// The ciphertexts of every account's secrets (the active ones, and the open set-ups' that are not expired), for the
@@ -767,6 +713,57 @@ impl Meta {
             .collect()
     }
 
+    /// Every account's ciphertexts, the open set-ups' and the expired ones too (a plain read, for the key tools).
+    pub async fn two_factor_all_secrets(&self) -> Result<Vec<StoredSecrets>, MetaError> {
+        let rows = sqlx::query(
+            "SELECT user_id, secret_ciphertext, pending_ciphertext FROM user_two_factor \
+             WHERE secret_ciphertext IS NOT NULL OR pending_ciphertext IS NOT NULL ORDER BY user_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(StoredSecrets {
+                    user: UserId(uuid_from(&row.try_get::<Vec<u8>, _>("user_id")?)?),
+                    active: row.try_get("secret_ciphertext")?,
+                    pending: row.try_get("pending_ciphertext")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Rewrites `user`'s ciphertexts, the active secret and the set-up's both, **read fresh under the account's lock** (a
+    /// confirmation that moved a set-up's secret to the active one meanwhile is seen): `rewrite` gets each and answers the
+    /// ciphertext to store in its place, or `None` to leave it. Returns how many were rewritten and how many left. An account
+    /// that is gone, or has none, is `(0, 0)`; a ciphertext `rewrite` can't handle is an error and changes nothing.
+    pub async fn two_factor_rewrite(&self, user: UserId, rewrite: &Rewrite<'_>) -> Result<(usize, usize), MetaError> {
+        let mut w = self.begin_write().await?;
+        if !lock_user(&mut w.tx, user).await? {
+            return Ok((0, 0));
+        }
+        let row = sqlx::query("SELECT secret_ciphertext, pending_ciphertext FROM user_two_factor WHERE user_id = $1")
+            .bind(uuid_bytes(&user.0))
+            .fetch_optional(&mut *w.tx)
+            .await?;
+        let Some(row) = row else { return Ok((0, 0)) };
+        let (mut rewritten, mut kept) = (0, 0);
+        for (column, update) in [
+            ("secret_ciphertext", "UPDATE user_two_factor SET secret_ciphertext = $1 WHERE user_id = $2"),
+            ("pending_ciphertext", "UPDATE user_two_factor SET pending_ciphertext = $1 WHERE user_id = $2"),
+        ] {
+            let Some(sealed) = row.try_get::<Option<Vec<u8>>, _>(column)? else { continue };
+            match rewrite(user, &sealed).map_err(|_| MetaError::Corrupt("a stored two-factor secret can't be read"))? {
+                Some(new) => {
+                    sqlx::query(update).bind(new).bind(uuid_bytes(&user.0)).execute(&mut *w.tx).await?;
+                    rewritten += 1;
+                }
+                None => kept += 1,
+            }
+        }
+        w.commit().await?;
+        Ok((rewritten, kept))
+    }
+
     /// Replaces the ciphertext `old` of `user`'s active secret (`pending` false) or open set-up (`pending` true) by `new`, if
     /// it still is `old`; `false` when it is not (changed meanwhile). For rewriting secrets under a new key.
     pub async fn two_factor_replace_ciphertext(&self, user: UserId, pending: bool, old: &[u8], new: &[u8]) -> Result<bool, MetaError> {
@@ -783,6 +780,65 @@ impl Meta {
         w.commit().await?;
         Ok(done.rows_affected() == 1)
     }
+}
+
+/// Counts a wrong code against the open set-up of `device`, in `tx`; the fifth uses the set-up up.
+async fn count_wrong_setup_in(tx: &mut sqlx::Transaction<'static, sqlx::Any>, user: UserId, device: DeviceId) -> Result<(), MetaError> {
+    sqlx::query(
+        "UPDATE user_two_factor SET pending_attempts = pending_attempts + 1 \
+         WHERE user_id = $1 AND enabled_ms IS NULL AND pending_device = $2 AND pending_ciphertext IS NOT NULL",
+    )
+    .bind(uuid_bytes(&user.0))
+    .bind(uuid_bytes(device.as_uuid()))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE user_two_factor SET pending_ciphertext = NULL, pending_device = NULL, pending_expires_ms = NULL, pending_attempts = 0 \
+         WHERE user_id = $1 AND enabled_ms IS NULL AND pending_attempts >= $2",
+    )
+    .bind(uuid_bytes(&user.0))
+    .bind(MAX_SETUP_ATTEMPTS)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Counts one wrong second factor of `user` in `tx` (the account's row is locked by it): the wrong proofs in a row go up,
+/// and at [`LOCK_AFTER_FAILURES`] (and every one after) the lock is set or doubled; the challenge's attempts go up too, and
+/// the challenge is deleted at [`MAX_CHALLENGE_ATTEMPTS`]. Lock order: the account's row, the two-factor row, the challenge.
+async fn count_wrong_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Any>,
+    user: UserId,
+    challenge: Option<&[u8; 32]>,
+    now_ms: i64,
+) -> Result<(), MetaError> {
+    let counted = sqlx::query(
+        "UPDATE user_two_factor SET failed_attempts = failed_attempts + 1 WHERE user_id = $1 AND enabled_ms IS NOT NULL \
+         RETURNING failed_attempts, locked_until_ms",
+    )
+    .bind(uuid_bytes(&user.0))
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(row) = counted
+        && let Some(duration) = lock_for(row.try_get("failed_attempts")?)
+    {
+        let until = now_ms.saturating_add(duration);
+        let until = row.try_get::<Option<i64>, _>("locked_until_ms")?.map_or(until, |current| current.max(until));
+        sqlx::query("UPDATE user_two_factor SET locked_until_ms = $1 WHERE user_id = $2")
+            .bind(until)
+            .bind(uuid_bytes(&user.0))
+            .execute(&mut **tx)
+            .await?;
+    }
+    if let Some(challenge) = challenge {
+        sqlx::query("UPDATE login_challenges SET attempts = attempts + 1 WHERE id_hash = $1").bind(challenge.to_vec()).execute(&mut **tx).await?;
+        sqlx::query("DELETE FROM login_challenges WHERE id_hash = $1 AND attempts >= $2")
+            .bind(challenge.to_vec())
+            .bind(MAX_CHALLENGE_ATTEMPTS)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Makes `hashes` the account's recovery codes, all unused, in `tx` (the old ones, used or not, are gone).

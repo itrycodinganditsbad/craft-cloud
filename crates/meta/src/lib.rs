@@ -328,11 +328,4 @@ impl WriteTx {
         self.tx.commit().await?;
         Ok(())
     }
-
-    /// Rolls back now, and (on SQLite) lets go of the write lock, for a caller that goes on to write something that must
-    /// survive the rollback.
-    async fn rollback(self) -> Result<(), MetaError> {
-        self.tx.rollback().await?;
-        Ok(())
-    }
 }
