@@ -1,6 +1,7 @@
 //! The HTTP API end to end: a real server on a random loopback port, driven with an HTTP client. Every
-//! scenario runs on SQLite + disk, and on Postgres + S3 when `CRAFT_CLOUD_TEST_PG` and the
-//! `CRAFT_CLOUD_TEST_S3_*` variables are set (`CRAFT_CLOUD_REQUIRE_BACKENDS` turns a missing one into a failure).
+//! scenario runs on SQLite + disk, and on Postgres + disk when `CRAFT_CLOUD_TEST_PG` is set. Scenarios
+//! also run on Postgres + S3 when `CRAFT_CLOUD_TEST_PG` and the `CRAFT_CLOUD_TEST_S3_*` variables are
+//! set (`CRAFT_CLOUD_REQUIRE_BACKENDS` turns a missing backend into a failure).
 
 use std::time::{Duration, Instant};
 
@@ -107,19 +108,37 @@ async fn sqlite_disk_with(limits: Limits) -> Server {
     start_with(meta, store, vec![db, blobs], None, limits).await
 }
 
-async fn postgres_s3() -> Option<Server> {
-    let required = std::env::var_os("CRAFT_CLOUD_REQUIRE_BACKENDS").is_some();
-    let (Ok(admin_url), Ok(endpoint)) = (std::env::var("CRAFT_CLOUD_TEST_PG"), std::env::var("CRAFT_CLOUD_TEST_S3_ENDPOINT")) else {
-        assert!(!required, "CRAFT_CLOUD_REQUIRE_BACKENDS is set but CRAFT_CLOUD_TEST_PG / CRAFT_CLOUD_TEST_S3_ENDPOINT are not");
-        return None;
-    };
+async fn postgres_database() -> (Meta, PgGuard) {
     use sqlx::Connection;
+    let admin_url = std::env::var("CRAFT_CLOUD_TEST_PG").unwrap();
     let name = format!("cc_test_{}", uuid::Uuid::now_v7().simple());
     let mut conn = sqlx::PgConnection::connect(&admin_url).await.unwrap();
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&mut conn).await.unwrap();
     let guard = PgGuard { admin_url: admin_url.clone(), name: name.clone() };
     let (base, _) = admin_url.rsplit_once('/').unwrap();
     let meta = Meta::open(&format!("{base}/{name}")).await.unwrap();
+    (meta, guard)
+}
+
+async fn postgres_disk() -> Option<Server> {
+    let required = std::env::var_os("CRAFT_CLOUD_REQUIRE_BACKENDS").is_some();
+    let Ok(_) = std::env::var("CRAFT_CLOUD_TEST_PG") else {
+        assert!(!required, "CRAFT_CLOUD_REQUIRE_BACKENDS is set but CRAFT_CLOUD_TEST_PG is not");
+        return None;
+    };
+    let (meta, guard) = postgres_database().await;
+    let blobs = tempfile::tempdir().unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    Some(start(meta, store, vec![blobs], Some(guard)).await)
+}
+
+async fn postgres_s3() -> Option<Server> {
+    let required = std::env::var_os("CRAFT_CLOUD_REQUIRE_BACKENDS").is_some();
+    let (Ok(_), Ok(endpoint)) = (std::env::var("CRAFT_CLOUD_TEST_PG"), std::env::var("CRAFT_CLOUD_TEST_S3_ENDPOINT")) else {
+        assert!(!required, "CRAFT_CLOUD_REQUIRE_BACKENDS is set but CRAFT_CLOUD_TEST_PG / CRAFT_CLOUD_TEST_S3_ENDPOINT are not");
+        return None;
+    };
+    let (meta, guard) = postgres_database().await;
     let var = |n: &str| std::env::var(n).unwrap();
     let s3 = S3Config {
         bucket: var("CRAFT_CLOUD_TEST_S3_BUCKET"),
@@ -137,6 +156,12 @@ macro_rules! on_every_backend {
     ($($scenario:ident),* $(,)?) => {
         mod on_sqlite_disk {
             $( #[tokio::test(flavor = "multi_thread", worker_threads = 4)] async fn $scenario() { super::$scenario(&super::sqlite_disk().await).await; } )*
+        }
+        mod on_postgres_disk {
+            $( #[tokio::test(flavor = "multi_thread", worker_threads = 4)] async fn $scenario() {
+                let Some(server) = super::postgres_disk().await else { eprintln!("skipped: Postgres not configured"); return };
+                super::$scenario(&server).await;
+            } )*
         }
         mod on_postgres_s3 {
             $( #[tokio::test(flavor = "multi_thread", worker_threads = 4)] async fn $scenario() {
@@ -896,6 +921,7 @@ async fn the_join_page_never_looks_at_the_code(s: &Server) {
 
 /// Failed joins count per client address (behind a trusted proxy, its `X-Forwarded-For`): ten in a minute, then even
 /// the right code is refused from there, while another address still joins.
+// These cases build custom trusted-proxy state directly; the shared backend matrix covers the default server setup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_joins_are_limited_per_address() {
     let db = tempfile::tempdir().unwrap();
@@ -918,6 +944,7 @@ async fn failed_joins_are_limited_per_address() {
 
 /// Wrong codes sent all at once from one address get no more tries than sent one by one: of 40 in flight together,
 /// at most 10 reach the database, and the rest are `rate_limited`.
+// This concurrent trusted-proxy case uses the same dedicated SQLite fixture as the sequential variant above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_failed_joins_are_limited_too() {
     let db = tempfile::tempdir().unwrap();
@@ -951,7 +978,7 @@ async fn concurrent_failed_joins_are_limited_too() {
     }
 }
 
-// ---- load limits (the same on every backend, so SQLite + disk only) ----
+// ---- load limits: standalone SQLite + disk fixtures for custom limits and SQLite-specific behavior ----
 
 /// Starts a `PUT` to `path` (under `/api/v1`) whose body never finishes: the headers promise 1,000 bytes and three
 /// arrive. The connection stays open until the server answers or closes it.
@@ -980,6 +1007,7 @@ async fn status_line(stream: &mut tokio::net::TcpStream) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_json_body_that_never_finishes_is_cut_off_by_the_server() {
+    // Uses a custom one-second body limit; the shared backend matrix covers the default limit.
     use tokio::io::AsyncWriteExt;
     let limits = Limits { body_time_base: Duration::from_secs(1), body_time_per_mib: Duration::ZERO, ..Limits::default() };
     let s = sqlite_disk_with(limits).await;
@@ -1036,6 +1064,7 @@ async fn a_stalled_upload_holds_up_only_its_own_user() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_never_waits_to_record_its_devices_use() {
+    // A held `BEGIN IMMEDIATE` lock is SQLite-specific; this case cannot run on Postgres.
     use sqlx::Connection;
     let db = tempfile::tempdir().unwrap();
     let blobs = tempfile::tempdir().unwrap();
@@ -1058,6 +1087,7 @@ async fn a_request_never_waits_to_record_its_devices_use() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uploads_over_the_stored_bytes_cap_are_refused_with_the_numbers() {
+    // This case counts files in the disk blob store after rejecting an upload.
     let db = tempfile::tempdir().unwrap();
     let blobs = tempfile::tempdir().unwrap();
     let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap().with_stored_bytes_cap(Some(50));
@@ -1084,6 +1114,7 @@ fn walk(dir: &std::path::Path) -> usize {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sign_ins_beyond_the_password_check_slots_are_told_to_come_back() {
+    // Uses a one-slot semaphore to exercise a custom per-server limit.
     let s = sqlite_disk_with(Limits { password_checks: 1, ..Limits::default() }).await;
     add_user(&s, "ana").await;
     // One slot: a sign-in that follows a finished one finds it free again (the permit is given back).
@@ -1400,6 +1431,7 @@ async fn live_a_revoked_device_is_cut_off(s: &Server) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_subscriptions_are_capped_per_device() {
+    // Uses a custom live burst budget to isolate the subscription cap.
     // A budget big enough for 2 × 257 frames at once: the cap, not the budget, is what this checks.
     let db = tempfile::tempdir().unwrap();
     let blobs = tempfile::tempdir().unwrap();
