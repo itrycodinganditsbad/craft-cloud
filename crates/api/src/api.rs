@@ -37,9 +37,14 @@ pub mod codes {
     /// 401 on a signed-in route means the device was revoked, and the agent signs out on it). The local API's
     /// `login` uses the same code when the server refuses the username or password.
     pub const WRONG_PASSWORD: &str = "wrong_password";
-    /// The device is signed in but may not do this. The HTTP API doesn't use it yet; the local API refuses with it
-    /// a request that didn't come from a local program.
+    /// The device is signed in but may not do this (HTTP 403): a member calling an `/admin` route, or an admin doing
+    /// what their account may not. The local API refuses with it a request that didn't come from a local program.
     pub const FORBIDDEN: &str = "forbidden";
+    /// A sign-in or a join with the right password or code, for an account an admin disabled or marked for removal
+    /// (HTTP 403). Said only after the password or code was right, never to a guesser.
+    pub const ACCOUNT_DISABLED: &str = "account_disabled";
+    /// An admin change would leave the server without an enabled administrator (HTTP 409).
+    pub const LAST_ADMIN: &str = "last_admin";
     pub const INTERNAL: &str = "internal";
 }
 
@@ -135,6 +140,8 @@ mod tests {
     fn the_new_error_codes_are_stable() {
         assert_eq!(codes::WRONG_PASSWORD, "wrong_password");
         assert_eq!(codes::FORBIDDEN, "forbidden");
+        assert_eq!(codes::ACCOUNT_DISABLED, "account_disabled");
+        assert_eq!(codes::LAST_ADMIN, "last_admin");
     }
 
     #[test]

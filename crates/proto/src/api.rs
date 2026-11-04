@@ -167,6 +167,161 @@ pub struct RevokedOthers {
     pub revoked: u32,
 }
 
+// ---- the admin API (`/api/v1/admin/…`, an admin's device token) ----
+//
+// Every change asks for a fresh confirmation in its body: the acting admin's `password`. A device token never expires,
+// so a stolen admin token alone must not be enough. A missing or mistyped field is `400 invalid`, a wrong password `403
+// wrong_password` (never 401). A later release adds optional `totp_code` and `recovery_code` fields to the same bodies
+// for an admin with two-factor sign-in; a body without them keeps working for an admin without it, and fields a server
+// does not know are ignored, so nothing here has to change for that.
+
+/// The body of an admin change that needs nothing but the confirmation: `POST …/disable`, `POST …/enable`,
+/// `DELETE /admin/users/{id}`, `POST` and `DELETE …/invite`, `POST …/password-reset` and `DELETE …/devices/{id}`. Its
+/// `Debug` output hides the password.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminConfirm {
+    /// The acting admin's current password. Missing: `400 invalid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for AdminConfirm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminConfirm").field("password", &self.password.as_ref().map(|_| "<redacted>")).finish()
+    }
+}
+
+/// `GET /admin/server`: counters and kinds, nothing about paths, addresses or settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminServerInfo {
+    pub version: String,
+    /// Accounts that are not marked for removal.
+    pub users: u64,
+    /// Devices that are not revoked.
+    pub devices_active: u64,
+    pub stored_bytes: u64,
+    pub live_bytes: u64,
+    /// `disk`, `s3` or `memory`.
+    pub storage_kind: String,
+    /// `sqlite` or `postgres`.
+    pub database_kind: String,
+}
+
+/// An account in the admin API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminUserInfo {
+    pub id: Uuid,
+    pub username: String,
+    /// `admin` or `member`.
+    pub role: String,
+    pub created_ms: i64,
+    /// When an admin disabled it (`null`: enabled).
+    pub disabled_ms: Option<i64>,
+    /// Always `false` until the server has two-factor sign-in.
+    pub two_factor_enabled: bool,
+    /// Devices that are not revoked.
+    pub devices_active: u64,
+    pub stored_bytes: u64,
+    /// The quota an admin set for the account (`null`: the server-wide cap, if any, applies).
+    pub quota_bytes: Option<u64>,
+    /// An unexpired invite is open.
+    pub invite_pending: bool,
+}
+
+/// `GET /admin/users?cursor&limit&query`: a page of accounts by username.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminUserList {
+    pub users: Vec<AdminUserInfo>,
+    /// Opaque; give it back as `cursor` for the next page. Missing on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// `POST /admin/users`: a new account without a password, for an invite. Its `Debug` output hides the password.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminCreateUser {
+    pub username: String,
+    /// `admin` or `member`.
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for AdminCreateUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminCreateUser")
+            .field("username", &self.username)
+            .field("role", &self.role)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// A join code the admin made, shown once. `join_url` is the whole join string when the server knows its public
+/// address, and missing otherwise. Its `Debug` output hides the code and the join string.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminCode {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_url: Option<String>,
+    pub expires_ms: i64,
+}
+
+impl std::fmt::Debug for AdminCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminCode")
+            .field("code", &"<redacted>")
+            .field("join_url", &self.join_url.as_ref().map(|_| "<redacted>"))
+            .field("expires_ms", &self.expires_ms)
+            .finish()
+    }
+}
+
+/// The answer to `POST /admin/users`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminCreatedUser {
+    pub user: AdminUserInfo,
+    pub invite: AdminCode,
+}
+
+/// `PATCH /admin/users/{id}`: a new role and/or quota. At least one of them; a missing `quota_bytes` leaves the quota,
+/// `null` removes it. Its `Debug` output hides the password.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminUpdateUser {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<Option<u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+/// A field that is there, `null` or not: `Some(None)` for `null`, `Some(Some(x))` for a value (a missing field is
+/// `None`, from `#[serde(default)]`).
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+impl std::fmt::Debug for AdminUpdateUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminUpdateUser")
+            .field("role", &self.role)
+            .field("quota_bytes", &self.quota_bytes)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// `GET /admin/users/{id}/devices`: every device of the account, revoked ones with when and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminDevices {
+    pub devices: Vec<DeviceInfo>,
+}
+
 /// `POST /api/v1/chunks/missing` and its answer: which of `ids` this space doesn't have.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissingRequest {
@@ -248,6 +403,50 @@ mod tests {
         let shown = format!("{change:?}");
         assert!(!shown.contains("old-secret-pw") && !shown.contains("new-secret-pw"), "{shown}");
         assert_eq!(shown.matches("<redacted>").count(), 2);
+        let confirm = AdminConfirm { password: Some("admin-secret-pw".into()) };
+        assert!(!format!("{confirm:?}").contains("admin-secret-pw"));
+        let create = AdminCreateUser { username: "ana".into(), role: "member".into(), password: Some("admin-secret-pw".into()) };
+        assert!(!format!("{create:?}").contains("admin-secret-pw"));
+        let update = AdminUpdateUser { password: Some("admin-secret-pw".into()), ..AdminUpdateUser::default() };
+        assert!(!format!("{update:?}").contains("admin-secret-pw"));
+        let code = AdminCode { code: "ABCDEFGHJKMNPQRS".into(), join_url: Some("cloud.example.org/ABCD-EFGH-JKMN-PQRS".into()), expires_ms: 1 };
+        let shown = format!("{code:?} {:?}", AdminCreatedUser { user: sample_user(), invite: code.clone() });
+        assert!(!shown.contains("ABCDEFGH") && !shown.contains("cloud.example.org"), "{shown}");
+    }
+
+    fn sample_user() -> AdminUserInfo {
+        AdminUserInfo {
+            id: Uuid::nil(),
+            username: "ana".into(),
+            role: "member".into(),
+            created_ms: 1,
+            disabled_ms: None,
+            two_factor_enabled: false,
+            devices_active: 0,
+            stored_bytes: 0,
+            quota_bytes: None,
+            invite_pending: false,
+        }
+    }
+
+    #[test]
+    fn an_update_tells_a_missing_quota_from_a_null_one() {
+        let missing: AdminUpdateUser = serde_json::from_value(serde_json::json!({ "role": "admin", "password": "p" })).unwrap();
+        assert_eq!(missing.quota_bytes, None);
+        let null: AdminUpdateUser = serde_json::from_value(serde_json::json!({ "quota_bytes": null })).unwrap();
+        assert_eq!(null.quota_bytes, Some(None));
+        let set: AdminUpdateUser = serde_json::from_value(serde_json::json!({ "quota_bytes": 5_000_000 })).unwrap();
+        assert_eq!(set.quota_bytes, Some(Some(5_000_000)));
+        assert!(serde_json::from_value::<AdminUpdateUser>(serde_json::json!({ "quota_bytes": -1 })).is_err());
+        assert_eq!(serde_json::to_value(&set).unwrap(), serde_json::json!({ "quota_bytes": 5_000_000 }));
+    }
+
+    #[test]
+    fn an_admin_body_ignores_fields_it_does_not_know() {
+        // A later release adds `totp_code` here, and today's server reads such a body as it reads one without it.
+        let confirm: AdminConfirm = serde_json::from_value(serde_json::json!({ "password": "p", "totp_code": "123456" })).unwrap();
+        assert_eq!(confirm.password.as_deref(), Some("p"));
+        assert_eq!(serde_json::from_value::<AdminConfirm>(serde_json::json!({})).unwrap().password, None);
     }
 
     #[test]
