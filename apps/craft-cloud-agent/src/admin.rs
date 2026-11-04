@@ -13,15 +13,17 @@
 //!   API means a wrong token.
 //! - The same `Host`, `Origin` and token checks as every local call (`local_api::guard`) run first.
 
+use axum::body::Body;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::{
-    AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser, AdminUserInfo,
-    AdminUserList, codes as api_codes,
+    AccountInfo, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser,
+    AdminUserInfo, AdminUserList, AuditPage, codes as api_codes, valid_audit_action,
 };
 use craft_cloud_proto::local::{MAX_ADMIN_JSON_BYTES, paths};
 use reqwest::Method;
@@ -50,6 +52,10 @@ pub(crate) fn routes() -> Router<Api> {
     let small = || DefaultBodyLimit::max(MAX_ADMIN_JSON_BYTES);
     let user = format!("{}/{{id}}", paths::ADMIN_USERS);
     Router::new()
+        .route(paths::ACCOUNT, get(account))
+        .route(paths::ACCOUNT_ACTIVITY, get(activity))
+        .route(paths::ADMIN_AUDIT, get(audit))
+        .route(paths::ADMIN_AUDIT_EXPORT, get(audit_export))
         .route(paths::ADMIN_SERVER, get(server))
         .route(paths::ADMIN_USERS, get(list_users).post(create_user).layer(small()))
         .route(&user, axum::routing::patch(update_user).delete(remove_user).layer(small()))
@@ -210,6 +216,118 @@ async fn list_devices(State(state): State<Api>, id: Result<Path<Uuid>, PathRejec
         .into());
     }
     Ok(Json(list))
+}
+
+// ---- the account and the audit log ----
+
+/// The most events a page of the account's own activity holds, and of the admin's audit list (the server's limits).
+const ACCOUNT_MAX_PAGE: u32 = 100;
+const ADMIN_MAX_PAGE: u32 = 200;
+/// The longest cursor passed on, in bytes (the server's are a few dozen).
+const MAX_CURSOR_BYTES: usize = 256;
+
+/// `GET /v1/account`: the signed-in account as the server says it (its role, and whether it has two-factor sign-in).
+async fn account(State(state): State<Api>) -> Answer<Json<AccountInfo>> {
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.account_info().await?))
+}
+
+/// The query of the audit routes. Unknown parameters are ignored.
+#[derive(Debug, Deserialize)]
+struct AuditParams {
+    cursor: Option<String>,
+    before_ms: Option<i64>,
+    limit: Option<u32>,
+    user: Option<String>,
+    action: Option<String>,
+}
+
+fn invalid(message: &str) -> LocalError {
+    LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, message)
+}
+
+/// The query as pairs for the server, after checking what is checked here (the server checks it all again): a cursor is passed
+/// on as it came, but bounded and made of the characters of the server's own; `user` is an account ID, `action` one of the
+/// closed list or a prefix of it, `before_ms` a time, `limit` 1 to `max_limit`. `admin`: whether `user` and `action` are read
+/// (an account's own activity has neither).
+fn audit_pairs(params: &AuditParams, max_limit: u32, admin: bool, list: bool) -> Result<Vec<(&'static str, String)>, LocalError> {
+    let mut pairs = Vec::new();
+    if let Some(cursor) = params.cursor.as_deref().filter(|c| !c.is_empty()) {
+        if !list || cursor.len() > MAX_CURSOR_BYTES || !cursor.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')) {
+            return Err(invalid("the cursor is not one this server gave"));
+        }
+        pairs.push(("cursor", cursor.to_owned()));
+    }
+    if let Some(before) = params.before_ms {
+        if before < 0 {
+            return Err(invalid("before_ms is a time in milliseconds"));
+        }
+        pairs.push(("before_ms", before.to_string()));
+    }
+    if let Some(limit) = params.limit {
+        if !list || !(1..=max_limit).contains(&limit) {
+            return Err(invalid(&format!("limit is 1 to {max_limit}")));
+        }
+        pairs.push(("limit", limit.to_string()));
+    }
+    if admin {
+        if let Some(user) = params.user.as_deref().filter(|u| !u.is_empty()) {
+            let id = Uuid::parse_str(user).map_err(|_| invalid("user is an account ID"))?;
+            pairs.push(("user", id.to_string()));
+        }
+        if let Some(action) = params.action.as_deref().filter(|a| !a.is_empty()) {
+            if !valid_audit_action(action) {
+                return Err(invalid("action is an event name like auth.login, or a prefix like auth."));
+            }
+            pairs.push(("action", action.to_owned()));
+        }
+    }
+    Ok(pairs)
+}
+
+fn as_refs<'a>(pairs: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+    pairs.iter().map(|(k, v)| (*k, v.as_str())).collect()
+}
+
+/// `GET /v1/account/activity?cursor&before_ms&limit`: the account's own security events (any account; `user` and `action` are
+/// not read).
+async fn activity(State(state): State<Api>, params: Result<Query<AuditParams>, QueryRejection>) -> Answer<Json<AuditPage>> {
+    let Query(params) = params.map_err(|e| invalid(&e.body_text()))?;
+    let pairs = audit_pairs(&params, ACCOUNT_MAX_PAGE, false, true)?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.admin_get("account/activity", &as_refs(&pairs)).await?))
+}
+
+/// `GET /v1/admin/audit?cursor&before_ms&limit&user&action`: the whole log, filtered; the server refuses a member.
+async fn audit(State(state): State<Api>, params: Result<Query<AuditParams>, QueryRejection>) -> Answer<Json<AuditPage>> {
+    let Query(params) = params.map_err(|e| invalid(&e.body_text()))?;
+    let pairs = audit_pairs(&params, ADMIN_MAX_PAGE, true, true)?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.admin_get("admin/audit", &as_refs(&pairs)).await?))
+}
+
+/// `GET /v1/admin/audit/export?before_ms&user&action`: the server's NDJSON export passed through as it comes, chunk by chunk:
+/// the agent never holds more than the chunk in hand, and a connection that breaks in the middle ends this one without its
+/// last chunk, so the client sees a broken stream. The last line (`complete` or `truncated`) is the server's.
+async fn audit_export(State(state): State<Api>, params: Result<Query<AuditParams>, QueryRejection>) -> Answer<Response> {
+    let Query(params) = params.map_err(|e| invalid(&e.body_text()))?;
+    let pairs = audit_pairs(&params, ADMIN_MAX_PAGE, true, false)?;
+    let (_, transport) = server_api(&state)?;
+    let answer = transport.admin_export_stream(&as_refs(&pairs)).await?;
+    let stream = futures_util::stream::unfold(Some(answer.body), |body| async move {
+        let mut body = body?;
+        match body.next().await {
+            Ok(Some(bytes)) => Some((Ok::<_, std::io::Error>(bytes), Some(body))),
+            Ok(None) => None,
+            // The error ends the stream with it: the connection breaks, and nothing is made up for the missing end.
+            Err(e) => Some((Err(std::io::Error::other(e.to_string())), None)),
+        }
+    });
+    let mut response = Response::new(Body::from_stream(stream));
+    let headers = response.headers_mut();
+    headers.insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/x-ndjson"));
+    headers.insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 #[cfg(test)]

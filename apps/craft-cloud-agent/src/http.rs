@@ -35,7 +35,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use craft_cloud_proto::api::{
-    ChangePasswordRequest, CommitRequest, CommitResponse, DeviceInfo, ErrorBody, InfoResponse, JoinRequest, LoginRequest, LoginResponse,
+    AccountInfo, ChangePasswordRequest, CommitRequest, CommitResponse, DeviceInfo, ErrorBody, InfoResponse, JoinRequest, LoginRequest, LoginResponse,
     MAX_MISSING_IDS, MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, PairingCreated, PairingStatus, RecoveryCodes, RenameDeviceRequest,
     RevokedOthers, SecondFactorRequest, SpaceResponse, TwoFactorChallenge, TwoFactorConfirmRequest, TwoFactorProofRequest, TwoFactorSetupRequest,
     TwoFactorSetupResponse, TwoFactorStatus, codes,
@@ -61,6 +61,8 @@ pub const MAX_DEVICES: usize = 1000;
 const MAX_CODE_BYTES: usize = 64;
 /// Longest server message shown to the user, in characters.
 const MAX_MESSAGE_CHARS: usize = 300;
+/// The whole of an audit export, from connecting to the last byte (it is read as it comes, with the usual idle limit).
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// No data at all for this long fails the request.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -957,6 +959,28 @@ impl<C: Connection> HttpTransport<C> {
     /// Cancels one of the account's add-a-computer codes.
     pub async fn delete_pairing(&self, id: Uuid) -> Result<(), TransportError> {
         self.no_content(self.request(Method::DELETE, &format!("pairings/{id}"), 0)).await
+    }
+
+    /// The signed-in account (`GET /account`): its role and whether it has two-factor sign-in.
+    pub async fn account_info(&self) -> Result<AccountInfo, CallError> {
+        self.account_call(self.request(Method::GET, "account", MAX_SMALL_JSON_BYTES)).await
+    }
+
+    /// The audit export (`GET /admin/audit/export?<query>`) as the server sends it: the good answer, whose body is read as it
+    /// comes ([`AnswerBody`]), never held whole; a refusal is kept whole. The whole-request time is long (a big export over a
+    /// slow link), the idle time is the usual minute.
+    pub async fn admin_export_stream(&self, query: &[(&str, &str)]) -> Result<Answer, CallError> {
+        let mut url = self.server.endpoint("admin/audit/export");
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        let mut req = request(Method::GET, url, Some(&self.auth), 0);
+        req.timeout = EXPORT_TIMEOUT;
+        let resp = self.send(req).await?;
+        if resp.status.is_success() {
+            return Ok(resp);
+        }
+        Err(failure(resp).await)
     }
 
     /// `GET /api/v1/<path>?<query>` of the admin API (or the account's activity), read as `T`; a refusal is kept whole.

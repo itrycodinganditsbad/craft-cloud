@@ -282,4 +282,74 @@ mod tests {
         let result = copy_export(format!("{}\n", event(1)).as_bytes(), &mut Full);
         assert!(matches!(result, Err(Error::Io(ref m)) if m.contains("can't write")), "{result:?}");
     }
+
+    /// One answer from a listener of this test: the bytes it writes (the request is read first), then it closes.
+    fn serve_once(answer: Vec<u8>) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut seen = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut chunk).unwrap();
+                seen.extend_from_slice(&chunk[..n]);
+            }
+            stream.write_all(&answer).unwrap();
+        });
+        addr
+    }
+
+    fn chunk(text: &str) -> Vec<u8> {
+        format!("{:x}\r\n{text}\r\n", text.len()).into_bytes()
+    }
+
+    fn exported(answer: Vec<u8>) -> (Result<ExportOutcome, Error>, String) {
+        let addr = serve_once(answer);
+        let mut out = Vec::new();
+        let streamed = http::request_stream(addr, "token", "GET", "/v1/admin/audit/export", std::time::Duration::from_secs(5)).unwrap();
+        let result = match streamed {
+            http::Streamed::Body(body) => copy_export(body, &mut out),
+            http::Streamed::Refused(answer) => Err(crate::refusal(answer).unwrap_err()),
+        };
+        (result, String::from_utf8(out).unwrap())
+    }
+
+    /// Over a real connection: a chunked export that ends properly, one whose connection drops in the middle (no
+    /// terminating chunk: a failed export, whatever came before), and a refusal before it starts.
+    #[test]
+    fn an_export_over_a_connection_is_whole_only_when_it_ends_properly() {
+        let head = b"HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n".to_vec();
+        let mut whole = head.clone();
+        whole.extend(chunk(&format!("{}\n", event(2))));
+        whole.extend(chunk(&format!("{}\n{{\"complete\":true,\"exported\":2}}\n", event(1))));
+        whole.extend(b"0\r\n\r\n");
+        let (result, out) = exported(whole);
+        assert_eq!(result.unwrap(), ExportOutcome { events: 2, truncated: false });
+        assert_eq!(out, format!("{}\n{}\n", event(2), event(1)));
+
+        // The last line came, but the stream was cut before its terminating chunk: not whole (the end is not the server's).
+        let mut cut = head.clone();
+        cut.extend(chunk(&format!("{}\n{{\"complete\":true,\"exported\":1}}\n", event(1))));
+        let (result, _) = exported(cut);
+        assert!(matches!(result, Err(Error::Io(_))), "{result:?}");
+        // Cut off in the middle of a chunk.
+        let mut broken = head.clone();
+        broken.extend(b"ff\r\n");
+        broken.extend(event(1).as_bytes());
+        let (result, out) = exported(broken);
+        assert!(result.is_err(), "{result:?}");
+        assert!(out.is_empty(), "no half line is written: {out:?}");
+        // Whole lines but no last line, and a clean end: still no export.
+        let mut no_end = head;
+        no_end.extend(chunk(&format!("{}\n", event(1))));
+        no_end.extend(b"0\r\n\r\n");
+        let (result, _) = exported(no_end);
+        assert!(matches!(result, Err(Error::Protocol(ref m)) if m.contains("no last line")), "{result:?}");
+        // A refusal: the agent's JSON, with the server's wait.
+        let body = r#"{"error":"rate_limited","message":"too many tries"}"#;
+        let refused = format!("HTTP/1.1 429 Too Many Requests\r\nretry-after: 30\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+        let (result, _) = exported(refused.into_bytes());
+        assert!(matches!(&result, Err(e) if e.code() == Some("rate_limited") && e.retry_after_secs() == Some(30)), "{result:?}");
+    }
 }

@@ -193,6 +193,11 @@ const ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/invite"),
     ("DELETE", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/invite"),
     ("POST", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/password-reset"),
+    ("POST", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/reset-two-factor"),
+    ("GET", "/v1/account"),
+    ("GET", "/v1/account/activity"),
+    ("GET", "/v1/admin/audit"),
+    ("GET", "/v1/admin/audit/export"),
     ("GET", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/devices"),
     ("DELETE", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/devices/0192f0c4-0000-7000-8000-000000000001"),
 ];
@@ -1133,5 +1138,181 @@ async fn admin_calls_need_a_sign_in_and_small_bodies() {
     assert_eq!((code, error_code(&body).as_str()), (413, "too_large"), "{body}");
     let (code, _) = call(&api, "POST", "/v1/admin/users", "{\"username\": 5}");
     assert_eq!(code, 422, "the shape of the body is checked here too");
+    running.stop().await.0.unwrap();
+}
+
+// ---- the account, its activity and the audit log ----
+
+use craft_cloud_proto::api::{AccountInfo, AuditEvent, AuditPage};
+use craft_cloud_server::audit::AuditExportLimits;
+
+/// [`admin_server`] with the export cut as `limits` say.
+async fn admin_server_limited(limits: AuditExportLimits) -> Server {
+    let (db, blobs) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    meta.create_user("ana", &hash_password(PASSWORD).unwrap(), Role::Member, 0).await.unwrap();
+    meta.create_user("root", &hash_password(PASSWORD).unwrap(), Role::Admin, 0).await.unwrap();
+    let state = AppState::new(meta.clone(), Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![]).unwrap().with_audit_export(limits);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(craft_cloud_server::serve(state, listener, std::future::pending()));
+    Server { url, meta, _dirs: (db, blobs) }
+}
+
+fn page_of(body: &str) -> AuditPage {
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("not an audit page ({e}): {body}"))
+}
+
+/// The account, its activity, the audit list and its export pass through the agent with the server's statuses and codes: a
+/// member's `403 forbidden` is never a signed-out agent; filters are checked before they are sent; the export is the server's
+/// stream, whole, and `truncated` when the server cuts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_account_its_activity_and_the_audit_log_pass_through() {
+    let server = admin_server_limited(AuditExportLimits::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root_data = DataDir::new(dir.path().join("root"));
+    let ana_data = DataDir::new(dir.path().join("ana"));
+    let (root_run, root) = signed_in_as(&server, "root", &root_data, &dir.path().join("Root Cloud")).await;
+    let (ana_run, ana) = signed_in_as(&server, "ana", &ana_data, &dir.path().join("Ana Cloud")).await;
+    let ana_user = server.meta.user_by_name("ana").await.unwrap().unwrap();
+
+    // Some more events: the admin creates an account, disables it and enables it again (not ana: that would sign her out).
+    let (code, body) = confirmed(&root, "POST", "/v1/admin/users", PASSWORD, serde_json::json!({ "username": "bo", "role": "member" }));
+    assert_eq!(code, 200, "{body}");
+    let bo = serde_json::from_str::<craft_cloud_proto::api::AdminCreatedUser>(&body).unwrap().user.id;
+    for what in ["disable", "enable"] {
+        let (code, body) = confirmed(&root, "POST", &format!("/v1/admin/users/{bo}/{what}"), PASSWORD, serde_json::json!({}));
+        assert_eq!(code, 204, "{body}");
+    }
+
+    // The signed-in account, as the server says it.
+    let (code, body) = call(&root, "GET", "/v1/account", "");
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(serde_json::from_str::<AccountInfo>(&body).unwrap().role, "admin");
+    let (code, body) = call(&ana, "GET", "/v1/account", "");
+    assert_eq!((code, serde_json::from_str::<AccountInfo>(&body).unwrap().role.as_str()), (200, "member"));
+
+    // The admin's list: pages with a cursor given back as it came, filters, the server's own refusals.
+    let (code, body) = call(&root, "GET", "/v1/admin/audit?limit=2", "");
+    assert_eq!(code, 200, "{body}");
+    let first = page_of(&body);
+    assert_eq!(first.events.len(), 2);
+    assert!(first.events[0].at_ms >= first.events[1].at_ms, "newest first");
+    let next = first.next.clone().expect("more events than a page");
+    let (code, body) = call(&root, "GET", &format!("/v1/admin/audit?limit=2&cursor={next}"), "");
+    assert_eq!(code, 200, "{body}");
+    let second = page_of(&body);
+    assert!(second.events.iter().all(|e| first.events.iter().all(|f| f.id != e.id)), "no event twice");
+    let (code, body) = call(&root, "GET", "/v1/admin/audit?action=admin.", "");
+    assert_eq!(code, 200, "{body}");
+    let admin_events = page_of(&body).events;
+    assert!(admin_events.len() >= 3 && admin_events.iter().all(|e| e.action.starts_with("admin.")), "{admin_events:?}");
+    let (code, body) = call(&root, "GET", "/v1/admin/audit?action=auth.login", "");
+    let logins = page_of(&body).events;
+    assert!(code == 200 && logins.len() == 2 && logins.iter().all(|e| e.action == "auth.login"), "{body}");
+    let (code, body) = call(&root, "GET", &format!("/v1/admin/audit?user={}", ana_user.id.0), "");
+    assert_eq!(code, 200, "{body}");
+    let about_ana = page_of(&body).events;
+    assert!(!about_ana.is_empty() && about_ana.iter().all(|e| e.actor_user == Some(ana_user.id.0) || e.target_id == Some(ana_user.id.0)));
+    let (code, body) = call(&root, "GET", "/v1/admin/audit?before_ms=1", "");
+    assert!(code == 200 && page_of(&body).events.is_empty(), "{body}");
+    // What is wrong is said before anything is sent, or by the server (a cursor it didn't make).
+    for query in [
+        "action=nope.",
+        "action=auth.log",
+        "action=x%27%20OR%201=1",
+        "user=not-an-id",
+        "limit=0",
+        "limit=201",
+        "limit=x",
+        "before_ms=-1",
+        "cursor=a%20b",
+        "cursor=AAAA",
+    ] {
+        let (code, body) = call(&root, "GET", &format!("/v1/admin/audit?{query}"), "");
+        assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{query}: {body}");
+    }
+
+    // A member's own activity: the events about her, whatever the admin's filters say; a member can't read the log.
+    let (code, body) = call(&ana, "GET", "/v1/account/activity", "");
+    assert_eq!(code, 200, "{body}");
+    let own = page_of(&body).events;
+    assert!(!own.is_empty(), "{own:?}");
+    assert!(own.iter().all(|e| e.actor_user == Some(ana_user.id.0) || e.target_id == Some(ana_user.id.0)), "{own:?}");
+    let (code, body) =
+        call(&ana, "GET", &format!("/v1/account/activity?user={}&action=admin.", server.meta.user_by_name("root").await.unwrap().unwrap().id.0), "");
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(page_of(&body).events.len(), own.len(), "an account's activity has no admin filters");
+    let (code, body) = call(&ana, "GET", "/v1/account/activity?limit=101", "");
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+    for path in ["/v1/admin/audit", "/v1/admin/audit/export"] {
+        let (code, body) = call(&ana, "GET", path, "");
+        assert_eq!((code, error_code(&body).as_str()), (403, "forbidden"), "{path}: {body}");
+    }
+    let now = status(&ana);
+    assert!(now.signed_in && !now.removed, "a 403 doesn't sign the agent out: {now:?}");
+
+    // The export: the server's lines, then its last line; whole through the typed client, which writes as it reads.
+    let client = craft_cloud_app::Client::connect_in(root_data.path()).unwrap();
+    let all = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        let outcome = client.admin_audit_export(&craft_cloud_app::AuditQuery::default(), &mut out);
+        (outcome, out)
+    })
+    .await
+    .unwrap();
+    let (outcome, out) = all;
+    let outcome = outcome.unwrap();
+    assert!(!outcome.truncated);
+    let lines: Vec<AuditEvent> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len() as u64, outcome.events);
+    let (code, body) = call(&root, "GET", "/v1/admin/audit?limit=200", "");
+    assert_eq!(code, 200, "{body}");
+    assert!(page_of(&body).events.iter().all(|e| lines.iter().any(|l| l.id == e.id)), "the export holds every event of the list");
+    // A filtered export; a refusal before the stream; a filter that is wrong.
+    let client = craft_cloud_app::Client::connect_in(root_data.path()).unwrap();
+    let filtered = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        let query = craft_cloud_app::AuditQuery { action: Some("auth.".into()), ..Default::default() };
+        let outcome = client.admin_audit_export(&query, &mut out).unwrap();
+        (outcome, out)
+    })
+    .await
+    .unwrap();
+    assert_eq!(filtered.0.events, 2, "the two sign-ins");
+    let ana_client = craft_cloud_app::Client::connect_in(ana_data.path()).unwrap();
+    let refused = tokio::task::spawn_blocking(move || ana_client.admin_audit_export(&Default::default(), &mut Vec::new())).await.unwrap();
+    assert_eq!(refused.unwrap_err().code(), Some("forbidden"));
+    let (code, body) = call(&root, "GET", "/v1/admin/audit/export?action=nope.", "");
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+
+    // Nothing of any of it was printed.
+    let (exit, out) = root_run.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    assert!(!out.contains(PASSWORD), "{out}");
+    ana_run.stop().await.0.unwrap();
+}
+
+/// A server that holds more events than an export may: the last line is `truncated`, and the client says so (not whole).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_truncated_export_is_said_to_be() {
+    let server = admin_server_limited(AuditExportLimits { page: 1, channel: 1, max_rows: 2 }).await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("root"));
+    let (running, api) = signed_in_as(&server, "root", &data, &dir.path().join("Root Cloud")).await;
+    for name in ["bo", "cy", "di"] {
+        let (code, body) = confirmed(&api, "POST", "/v1/admin/users", PASSWORD, serde_json::json!({ "username": name, "role": "member" }));
+        assert_eq!(code, 200, "{body}");
+    }
+    let client = craft_cloud_app::Client::connect_in(data.path()).unwrap();
+    let (outcome, out) = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        (client.admin_audit_export(&Default::default(), &mut out), out)
+    })
+    .await
+    .unwrap();
+    let outcome = outcome.unwrap();
+    assert_eq!((outcome.events, outcome.truncated), (2, true));
+    assert_eq!(String::from_utf8(out).unwrap().lines().count(), 2, "the newest two, and no last line in what is written");
     running.stop().await.0.unwrap();
 }

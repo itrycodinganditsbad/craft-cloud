@@ -629,3 +629,167 @@ async fn the_command_line_joins_with_a_code_and_through_a_running_agent() {
     assert!(machine.client().status().unwrap().signed_in);
     let _ = machine.stop().await;
 }
+
+// ---- the admin pages' confirmation with a second factor ----
+
+use craft_cloud_app::{AdminConfirm, AdminPasswordReset, UserQuery};
+
+impl Server {
+    /// The same server with `root`, an administrator with the same password.
+    async fn start_with_admin() -> Self {
+        let server = Self::start().await;
+        server.meta.create_user("root", &hash_password(PASSWORD).unwrap(), Role::Admin, 0).await.unwrap();
+        server
+    }
+}
+
+impl Machine {
+    fn login_as(&self, server: &Server, user: &str) -> LoginRequest {
+        LoginRequest { user: user.into(), device_name: Some(format!("{user}-pc")), ..self.login_request(server) }
+    }
+}
+
+/// A confirmation with the password and, if given, a code (six digits) or recovery code.
+fn confirm_with(code: Option<&str>) -> AdminConfirm {
+    let mut confirm = AdminConfirm { password: Some(PASSWORD.into()), ..AdminConfirm::default() };
+    if let Some(code) = code {
+        if code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit()) {
+            confirm.totp_code = Some(code.into());
+        } else {
+            confirm.recovery_code = Some(code.into());
+        }
+    }
+    confirm
+}
+
+/// An admin whose account has two-factor sign-in confirms each change with a code too: the agent passes the code, and the
+/// server's `two_factor_invalid` (403) and `two_factor_locked` (429, with the wait) come back typed, never as a signed-out
+/// agent. A reset code with `reset_two_factor` and the reset of an account's two-factor sign-in carry their fields.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admin_with_two_factor_confirms_changes_with_a_code_through_the_agent() {
+    let server = Server::start_with_admin().await;
+    let admin = Machine::start().await;
+    let client = admin.client();
+    let c = client.clone();
+    let request = admin.login_as(&server, "root");
+    assert!(off(move || c.login(&request)).await.unwrap().signed_in);
+
+    // The account says it is an admin, without two-factor sign-in yet.
+    let c = client.clone();
+    let me = off(move || c.account()).await.unwrap();
+    assert_eq!((me.username.as_str(), me.role.as_str(), me.two_factor_enabled), ("root", "admin", false));
+    // Without it, a password is enough.
+    let ana = server.meta.user_by_name("ana").await.unwrap().unwrap();
+    let ana_id = ana.id.0;
+    let c = client.clone();
+    off(move || c.admin_disable_user(ana_id, &confirm_with(None))).await.unwrap();
+    let c = client.clone();
+    off(move || c.admin_enable_user(ana_id, &confirm_with(None))).await.unwrap();
+
+    // Two-factor sign-in on for the admin.
+    let setup = {
+        let c = client.clone();
+        off(move || c.two_factor_setup(PASSWORD)).await.unwrap()
+    };
+    let secret = totp::base32_decode(&setup.secret).unwrap();
+    let first = code_for(&secret, server.now());
+    let c = client.clone();
+    let recovery = off(move || c.two_factor_confirm(&first)).await.unwrap().recovery_codes;
+    let c = client.clone();
+    assert!(off(move || c.account()).await.unwrap().two_factor_enabled);
+
+    // A password alone, or with a wrong code: 403 `two_factor_invalid`; the agent is as it was.
+    let c = client.clone();
+    let missing = off(move || c.admin_disable_user(ana_id, &confirm_with(None))).await.unwrap_err();
+    assert_eq!(missing.code(), Some("two_factor_invalid"), "{missing:?}");
+    server.advance(30_000);
+    let right = code_for(&secret, server.now());
+    let wrong = wrong_code(&right);
+    let c = client.clone();
+    let bad = off(move || c.admin_disable_user(ana_id, &confirm_with(Some(&wrong)))).await.unwrap_err();
+    assert_eq!(bad.code(), Some("two_factor_invalid"), "{bad:?}");
+    let status = client.status().unwrap();
+    assert!(status.signed_in && !status.removed, "{status:?}");
+    assert!(!server.meta.admin_user(ana.id, 0).await.unwrap().unwrap().disabled_ms.is_some(), "nothing changed");
+    // The right code: done.
+    let c = client.clone();
+    let fresh = right.clone();
+    off(move || c.admin_disable_user(ana_id, &confirm_with(Some(&fresh)))).await.unwrap();
+    assert!(server.meta.admin_user(ana.id, 0).await.unwrap().unwrap().disabled_ms.is_some());
+    // A recovery code, in the other field, once.
+    let c = client.clone();
+    let code = recovery[0].clone();
+    off(move || c.admin_enable_user(ana_id, &confirm_with(Some(&code)))).await.unwrap();
+    assert!(server.meta.admin_user(ana.id, 0).await.unwrap().unwrap().disabled_ms.is_none());
+    let c = client.clone();
+    let code = recovery[0].clone();
+    let used = off(move || c.admin_disable_user(ana_id, &confirm_with(Some(&code)))).await.unwrap_err();
+    assert_eq!(used.code(), Some("two_factor_invalid"), "a recovery code works once: {used:?}");
+
+    // A reset code that also turns two-factor off when it is used: the fields travel.
+    server.advance(30_000);
+    let reset = AdminPasswordReset {
+        password: Some(PASSWORD.into()),
+        totp_code: Some(code_for(&secret, server.now())),
+        reset_two_factor: true,
+        ..AdminPasswordReset::default()
+    };
+    let c = client.clone();
+    let issued = off(move || c.admin_issue_reset(ana_id, &reset)).await.unwrap();
+    assert!(!issued.code.is_empty());
+
+    // The list shows who has two-factor sign-in; resetting it for an account that has it.
+    let ana_machine = Machine::start().await;
+    let ana_client = ana_machine.client();
+    let c = ana_client.clone();
+    let ana_request = ana_machine.login_as(&server, "ana");
+    // (Ana's password was not changed: the reset code is only issued.)
+    assert!(off(move || c.login(&ana_request)).await.unwrap().signed_in);
+    let c = ana_client.clone();
+    let ana_setup = off(move || c.two_factor_setup(PASSWORD)).await.unwrap();
+    let ana_secret = totp::base32_decode(&ana_setup.secret).unwrap();
+    let ana_first = code_for(&ana_secret, server.now());
+    let c = ana_client.clone();
+    off(move || c.two_factor_confirm(&ana_first)).await.unwrap();
+    let c = client.clone();
+    let listed = off(move || c.admin_users(&UserQuery { query: Some("ana".into()), ..UserQuery::default() })).await.unwrap();
+    assert!(listed.users.iter().any(|u| u.username == "ana" && u.two_factor_enabled), "{listed:?}");
+    server.advance(30_000);
+    let c = client.clone();
+    let fresh = code_for(&secret, server.now());
+    off(move || c.admin_reset_two_factor(ana_id, &confirm_with(Some(&fresh)))).await.unwrap();
+    let c = ana_client.clone();
+    let off_state = off(move || c.two_factor_status()).await;
+    // Ana's device was signed out with it: her agent is told so, as a revoked device.
+    assert!(off_state.is_err() || !off_state.unwrap().enabled);
+    let c = client.clone();
+    let listed = off(move || c.admin_users(&UserQuery { query: Some("ana".into()), ..UserQuery::default() })).await.unwrap();
+    assert!(listed.users.iter().any(|u| u.username == "ana" && !u.two_factor_enabled), "{listed:?}");
+
+    // Too many wrong codes stop the confirmation: the server's per-account limit says `429 rate_limited` first (wrong codes
+    // count like wrong passwords), and its lock `429 two_factor_locked` with the wait comes after more; either is kept as the
+    // server said it (the code, the status, the wait if there is one), and the agent stays signed in.
+    let mut stopped = None;
+    for _ in 0..12 {
+        let c = client.clone();
+        let wrong = wrong_code(&code_for(&secret, server.now()));
+        let refused = off(move || c.admin_disable_user(ana_id, &confirm_with(Some(&wrong)))).await.unwrap_err();
+        if matches!(refused.code(), Some("rate_limited" | "two_factor_locked")) {
+            stopped = Some(refused);
+            break;
+        }
+        assert_eq!(refused.code(), Some("two_factor_invalid"), "{refused:?}");
+    }
+    let stopped = stopped.expect("too many wrong codes are stopped");
+    if stopped.code() == Some("two_factor_locked") {
+        assert!(stopped.retry_after_secs().is_some_and(|secs| secs > 0), "{stopped:?}");
+    }
+    assert!(client.status().unwrap().signed_in);
+
+    let (exit, out) = admin.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    for secret in [PASSWORD, issued.code.as_str()] {
+        assert!(!out.contains(secret), "the agent printed a secret: {out}");
+    }
+    let _ = ana_machine.stop().await;
+}

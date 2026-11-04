@@ -10,9 +10,9 @@ use crate::ops::{Conflict, Op};
 
 /// What apps see of these bodies lives in `craft-cloud-api` (no postcard), re-exported here.
 pub use craft_cloud_api::api::{
-    AccountInfo, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser,
-    AdminUserInfo, AdminUserList, AuditDetails, AuditEvent, AuditExportEnd, AuditPage, DeviceInfo, ErrorAnswer, PairingState, PairingStatus,
-    RecoveryCodes, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus, codes,
+    AUDIT_ACTIONS, AccountInfo, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo,
+    AdminUpdateUser, AdminUserInfo, AdminUserList, AuditDetails, AuditEvent, AuditExportEnd, AuditPage, DeviceInfo, ErrorAnswer, PairingState,
+    PairingStatus, RecoveryCodes, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus, codes, valid_audit_action,
 };
 
 /// Protocol versions this build speaks. A client and server must share at least one.
