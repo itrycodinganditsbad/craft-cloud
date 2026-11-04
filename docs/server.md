@@ -113,13 +113,54 @@ the rest of the window. A signed-out device's live connection ends at once in th
 server process on the same database, or the command line, finds out at the connection's next ping (within about 30 seconds).
 The command line stays as the way in without HTTP and enforces neither the confirmation nor `last_admin`.
 
+## The security audit log
+
+The server keeps a log of the events that matter for who may do what, in its database: sign-ins and failed sign-ins (a
+row per account and minute, with a count), devices signed out, password changes, an administrator's changes to accounts,
+roles, quotas, invites, reset codes and devices, codes redeemed on a new computer, and what the command line does to an
+account (`user reset-password`, `device revoke`, `device revoke-all`). Reading it:
+
+- Every account sees its own events, and what was done to it, with `GET /api/v1/account/activity`.
+- Admins read all of it with `GET /api/v1/admin/audit` (filters `user`, an account ID, and `action`, an event name like
+  `auth.login` or a group like `auth.`; pages by `cursor`) and export it with `GET /api/v1/admin/audit/export`, newline
+  delimited JSON, newest first. The **last line** says whether the export is whole: `{"complete":true,"exported":n}`, or
+  `{"truncated":true,"exported":n}` when the log holds more than the 100,000 events an export carries (narrow it with
+  `user` and `action`). An export that ends without either line broke off: do not treat it as complete. Reading the log is
+  not logged.
+- On the server's host: `craft-cloud-server audit --config cc-data/config.toml list [--user NAME] [--action auth.] [--limit N]`
+  prints the newest events as text (accounts by ID, not by name).
+
+**What is in it, and what is not.** A row has a time, the IDs of the account and device that acted and of what it acted
+on, an event name, success or failure, and a few typed values (how many devices were signed out, the role before and after,
+which kind of client and which platform out of a short list). It has **no IP addresses, no file names, no device names, no
+names of accounts that do not exist, no passwords, codes, tokens or other secrets**; what a client types is never copied
+into it. Because it holds account IDs and times it is personal data about the people who use the server: tell them
+what you keep it for (finding out who changed what and who signed in or tried to), and for how long. An event keeps the ID
+of an account that was removed; the name is not stored.
+
+**How long.** Events are kept 365 days. Set `retention_days` (1 to 3650) in an optional `[audit]` section of `config.toml`:
+
+```toml
+[audit]
+retention_days = 365
+```
+
+`craft-cloud-server audit --config cc-data/config.toml prune` deletes the events older than that and prints how many
+(`--dry-run` only counts). The server also deletes expired events when it writes a new one, at most once an hour and in small
+batches that never hold up a sign-in; **a server nobody uses keeps its expired events** until `prune` runs, so run it from cron
+or the task scheduler, for example daily. There is no background task.
+
+The log is append-only in the server's code, not enforced by the database (no triggers or roles: SQLite has none). Someone
+who can write to the database can change it; keep the database file and Postgres user private.
+
 ## Upgrading
 
-This release adds migrations (`0007`, device sessions, and `0008`, the admin API: reset codes, per-account quotas, the
-removal mark). The server applies it when it starts. A database it
+This release adds migrations (`0007`, device sessions, `0008`, the admin API: reset codes, per-account quotas, the
+removal mark, and `0009`, the audit log). The server applies it when it starts. A database it
 has migrated cannot be opened by an older server: that one refuses to start ("the database was created by a newer Craft
 Cloud"). Rolling back therefore means restoring a backup taken before the upgrade, so take one first. Upgrade the
-server first: agents and apps keep working unchanged.
+server first: agents and apps keep working unchanged. A config that has the new `[audit]` section is refused by an older
+server (it rejects unknown settings), so remove the section before going back to one.
 
 ## Restoring a backup
 

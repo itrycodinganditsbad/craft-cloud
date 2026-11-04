@@ -650,6 +650,71 @@ changes locally, then pushes local changes. These rules came out of the simulati
   - **Live connections.** The process that revokes a device ends its live connections at once; another server process on
     the same Postgres database, and the command line, are noticed at the connection's next ping (about 30 s).
   - Logs carry the kind of event and the target's ID at `info`, never a username, password, code or link.
+- **Security audit log** (migration 0009): the events that matter for who may do what are rows of `audit_events`,
+  written by the change they record, in its transaction and before its commit, so a change whose event cannot be written
+  is not made (fail closed). The names are a closed list in the code: `auth.login`, `auth.login_failed`,
+  `auth.second_factor_failed`, `auth.recovery_code_used`, `auth.two_factor_locked`, `device.revoked`,
+  `device.revoked_others`, `account.password_changed`, `account.two_factor_enabled`, `account.two_factor_disabled`,
+  `account.recovery_codes_regenerated`, `admin.user_created`, `admin.user_disabled`, `admin.user_enabled`,
+  `admin.user_removed`, `admin.role_changed`, `admin.quota_changed`, `admin.invite_issued`, `admin.invite_revoked`,
+  `admin.password_reset_issued`, `admin.two_factor_reset`, `admin.device_revoked`, `join.invite_redeemed`,
+  `join.reset_redeemed`, `join.pairing_redeemed`, `cli.password_reset`, `cli.two_factor_reset`, `cli.device_revoked`,
+  `cli.devices_revoked_all` and `cli.user_removed`. A name whose change does not exist yet (two-factor sign-in,
+  `user remove`) is listed so the vocabulary a client filters by does not change; its writer arrives with that change.
+  - **Rows.** `id` (UUIDv7), `at_ms`, `actor_user` and `actor_device` (`NULL` for the command line, and for a sign-in that
+    failed: nobody proved who they were), `action`, `target_kind` (`user`, `device` or empty) and `target_id`, `outcome`
+    (`success`, or `failure` for a failed sign-in), `details`, and for aggregated rows `agg_key` and `agg_count` (the API
+    calls it `count`). There are no foreign keys: an event keeps the ID of an account that was removed, and the name is
+    gone because it was never stored.
+  - **What each operation writes.** A sign-in `auth.login` (actor: the account and its new device); a failed one
+    `auth.login_failed`. `DELETE /devices/{id}` `device.revoked`; `POST /devices/revoke-others` **one**
+    `device.revoked_others` with the count (none when no device was left); `POST /account/password` one
+    `account.password_changed` whose `revoked` counts the devices that went with it. Admin changes write their
+    `admin.*` event, a `PATCH` with a role and a quota one event for each field that changed, in one transaction; the
+    devices a disable or removal signs out are counted in its one event. Redeeming an invite, a reset code or a
+    pairing writes `join.invite_redeemed`, `join.reset_redeemed` (with `revoked`) or `join.pairing_redeemed`. The
+    command line writes `cli.password_reset`, `cli.device_revoked` and `cli.devices_revoked_all`, with no actor. **A
+    repeat or a no-op writes nothing**, since nothing changed: disabling a disabled account, signing out a device that is
+    out, giving a role or quota the account has, revoking an invite that is not there, and so a retried request after a
+    dropped connection leaves the event of its first run only. Files, uploads and live documents are not audited.
+    The admin and command line events about a device are about its **account** (`target_kind = user`) and carry the device
+    in `details`, so the account's own activity shows them.
+  - **`details` is typed.** Each event has its own few fields, each a closed list of words or a number: `client_kind`
+    (`agent`, `desktop`, `cli`) and `platform` (`windows`, `macos`, `linux`, `android`, `ios`, `other`) for a sign-in or
+    join, `reason` (as in the device list), `step` (`password`, `totp`, `recovery`, `challenge_expired`), `role_from` and
+    `role_to`, `quota_bytes` (a number, `null` when the quota was removed), `revoked` (a count) and `device` (an ID). A
+    device may call its platform any printable text of 32 bytes, an address or a file name included, so anything not in
+    the list is `other`; nothing a client typed ever reaches a row. The text is at most 2,048 bytes: if it would be more,
+    whole fields go, the least important first, and `"truncated": true` is added; bytes are never cut off, which would
+    leave invalid JSON. **No address, file name, path, device name, name of an account that does not exist, password,
+    code, challenge, token, key or e-mail address is stored anywhere in a row.**
+  - **Failed sign-ins** are one row per account, action and minute, `agg_key` = action + account + minute, written
+    after the answer is decided and in a transaction of its own: `INSERT … ON CONFLICT (agg_key) DO UPDATE SET agg_count =
+    audit_events.agg_count + 1` (the column is qualified, since a bare one is ambiguous against `excluded` on Postgres),
+    so many tries at one moment make one row that counts them all and keeps the identity, time and details of the first.
+    Tries with a name no account has share one row per minute with no account in it, so a guesser can neither put text in
+    the log nor make it grow without bound. A failure to write this row is logged (no content) and changes neither the
+    answer nor the limits on tries, which are not stored in the log at all.
+  - **Reading.** Pages are newest first by `(at_ms, id)` descending. `cursor` is that pair, opaque, and exclusive: the next
+    page starts strictly behind it, so events with one timestamp are neither repeated nor lost. The export reads 500 rows
+    per query through a channel of two pages, so a slow client slows the reading instead of filling memory; the end of the
+    log is fixed when it starts (`at_ms` up to then), at most 100,000 event rows are sent, and the reading stops when the
+    client goes away. The last line says how it ended; a database error in the middle breaks the connection (and is logged
+    without content) so that no client can take half an export for a whole one.
+  - **Append-only, in the code.** `Meta` has no function that changes or deletes a row of `audit_events` except
+    `audit_prune`, which deletes events older than the retention, and the counter of an aggregated row. A test reads the
+    sources of `craft-cloud-meta` and allows exactly those two statements. **This deviates from a design with
+    database triggers and separate roles**: SQLite has neither, so the same code runs on both databases, and an operator
+    with access to the database can still change the log. Protection against that is outside this server.
+  - **Retention.** `[audit] retention_days` (1 to 3650, default 365, the section is optional). Old events are deleted by
+    `audit prune` (`--dry-run` only counts) and by a write that finds the last complete pruning an hour or more past (kept
+    in memory, set only when a pruning deleted everything that was due), after its commit and never inside the security
+    transaction, in batches of 1,000 rows each in a transaction of its own and at most 20 batches a time. A server
+    that nobody writes to keeps expired events until `audit prune` runs: schedule it (cron, the task scheduler). There
+    is no periodic task.
+  - **Personal data.** A row holds account and device IDs and times, which is personal data. `docs/server.md` says how long
+    it is kept and why; the server stores no address.
+  - Reading the log is not itself an event.
 - **Join codes**: a machine can also get its device token with a code instead of a password. Codes are Crockford
   base32 (`0-9` and letters without I, L, O, U; on input case is ignored, O reads as 0, I and L as 1, dashes and spaces
   are dropped), shown in groups of four (`K7M4-Q9TX`), and stored only as their BLAKE3 hash (migration 0004:
@@ -748,6 +813,9 @@ methods answer `not_found` / `invalid` (405) the same way:
 | `POST /admin/users/{id}/invite`, `DELETE …/invite` | (admin, confirmation) → `{code, join_url?, expires_ms}` / 204: an invite only for an account that has no password (`conflict` otherwise); the delete ends the account's invite or reset code (`not_found` when there is none) |
 | `POST /admin/users/{id}/password-reset` | (admin, confirmation) → `{code, join_url?, expires_ms}`: a one-hour reset code for a member (another admin's, or one's own: `forbidden` and `invalid`); redeemed at `POST /join` |
 | `GET /admin/users/{id}/devices`, `DELETE …/devices/{device_id}` | (admin; the delete with confirmation) → `{devices: [device as in GET /devices]}`, revoked ones too / 204 (`revoke_reason = admin`); another user's device or an unknown user is `not_found` |
+| `GET /account/activity?cursor&before_ms&limit` | the signed-in account's own security events, newest first: `{events: [event], next?}`; the events it acted in or was the target of, with the device shown only for its own acts. `limit` 1 to 100 (default 50, otherwise `invalid`); `cursor` is opaque and exclusive and wins over `before_ms`, which only limits the first page; a cursor this server did not make is `invalid` |
+| `GET /admin/audit?cursor&before_ms&limit&user&action` | (admin) the whole log in the same form (`limit` up to 200); `user` is an account ID (events it acted in or was the target of), `action` an event name or a group ending in a dot like `auth.`; anything else is `invalid` |
+| `GET /admin/audit/export?user&action` | (admin) the same filters as NDJSON (`application/x-ndjson`, always offered as `craft-cloud-audit.ndjson`), streamed: one event per line, newest first, then one last line, `{"complete":true,"exported":n}`, or `{"truncated":true,"exported":n}` when there were more events than the export holds (100,000). A stream that ends without either line broke off and is not a whole export |
 
 **Client contract** (what the sync agent relies on):
 
