@@ -3457,3 +3457,114 @@ async fn a_folder_restored_after_a_lost_delete_answer_and_a_relist_is_not_delete
     c.sync_once().await.unwrap();
     assert_eq!(c.fs().dirs(), vec![path("e")], "the server still has the folder");
 }
+
+/// A folder delete recorded before sending but rejected before reaching the server is treated conservatively after a relist.
+#[tokio::test]
+async fn an_unsent_folder_delete_and_relist_keeps_the_live_folder() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("e")).unwrap();
+    write(&mut a, "keep.txt", b"keep");
+    settle(&mut [&mut a, &mut b], 5).await;
+
+    a.fs_mut().remove_dir(&path("e")).unwrap();
+    let before = server.meta.space_info(ana.space).await.unwrap().seq;
+    a.transport().faults.fail_next_commit.store(true, Ordering::Relaxed);
+    let error = a.sync_once().await.unwrap_err();
+    assert!(error.to_string().contains("injected before commit"), "{error}");
+    assert_eq!(server.meta.space_info(ana.space).await.unwrap().seq, before, "the failed request never reached the server");
+
+    a.transport().faults.resync_next_changes.store(true, Ordering::Relaxed);
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(a.fs().dirs(), vec![path("e")]);
+    assert_eq!(files(&a), vec![("keep.txt".to_owned(), b"keep".to_vec())]);
+    assert_eq!(files(&b), files(&a));
+    assert!(report.removed_remotely.is_empty(), "{report:?}");
+    assert_eq!(server.meta.space_info(ana.space).await.unwrap().seq, before, "no delete was sent again");
+}
+
+/// A same-epoch relist restores the live parent while keeping its deleted descendants deleted.
+#[tokio::test]
+async fn a_nested_relist_keeps_only_the_restored_parent() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("d")).unwrap();
+    a.fs_mut().mkdir(&path("d/sub")).unwrap();
+    write(&mut a, "d/sub/f.txt", b"keep me");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().remove_file(&path("d/sub/f.txt")).unwrap();
+    a.fs_mut().remove_dir(&path("d/sub")).unwrap();
+    a.fs_mut().remove_dir(&path("d")).unwrap();
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    restore_from_trash(&server, &ana, node_named(&server, &ana, "d").await).await;
+    a.transport().faults.resync_next_changes.store(true, Ordering::Relaxed);
+
+    settle(&mut [&mut a, &mut b], 6).await;
+    assert_eq!(a.fs().dirs(), vec![path("d")]);
+    assert_eq!(b.fs().dirs(), vec![path("d")]);
+    assert!(files(&a).is_empty() && files(&b).is_empty());
+    let mut c = machine(&server, &ana, "studio").await;
+    c.sync_once().await.unwrap();
+    assert_eq!(c.fs().dirs(), vec![path("d")], "the server still has only the restored parent");
+}
+
+/// A tracked child keeps an in-doubt folder in the base when a relist sees it live.
+#[tokio::test]
+async fn a_tracked_child_keeps_an_in_doubt_folder_from_release() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("d")).unwrap();
+    write(&mut a, "d/f.txt", b"original");
+    a.fs_mut().mkdir(&path("e")).unwrap();
+    write(&mut a, "e/g.txt", b"other");
+    settle(&mut [&mut a, &mut b], 5).await;
+    let folder = node_named(&server, &ana, "d").await;
+    let file = node_named(&server, &ana, "f.txt").await;
+    a.fs_mut().rename(&path("d/f.txt"), &path("e/f.txt")).unwrap();
+    a.fs_mut().remove_dir(&path("d")).unwrap();
+    a.fs_mut().rename(&path("e"), &path("d")).unwrap();
+    // Restore a checkpoint with D's delete in doubt. D's tracked file F is still at d/f.txt, inside E's local folder.
+    let mut state = a.state().clone();
+    state.sent_dir_deletes.insert(folder);
+    let mut a = common::restart(&a, state, |_| {});
+    a.transport().faults.resync_next_changes.store(true, Ordering::Relaxed);
+
+    a.sync_once().await.unwrap();
+    assert!(a.state().base.contains_key(&folder), "the folder is still tracked with its child");
+    assert!(a.state().base.contains_key(&file), "the live file is still tracked");
+    assert_eq!(files(&a), vec![("d/f.txt".to_owned(), b"original".to_vec()), ("d/g.txt".to_owned(), b"other".to_vec())]);
+    let listing = server.meta.tree(ana.space, None, 5000).await.unwrap();
+    assert!(listing.nodes.iter().any(|node| node.id == folder && !node.deleted), "folder node was deleted");
+    assert!(listing.nodes.iter().any(|node| node.id == file && !node.deleted), "tracked file node was deleted");
+}
+
+/// The local replacement becomes a conflict copy, and the restored file returns at its original path.
+#[tokio::test]
+async fn a_local_replacement_after_a_lost_delete_reply_keeps_its_content() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    write(&mut a, "f.txt", b"original");
+    a.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("f.txt")).unwrap();
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    let old = node_named(&server, &ana, "f.txt").await;
+    write(&mut a, "f.txt", b"local replacement");
+    restore_from_trash(&server, &ana, old).await;
+
+    settle(&mut [&mut a], 6).await;
+    let on_a = files(&a);
+    assert!(on_a.contains(&("f.txt".to_owned(), b"original".to_vec())), "{on_a:?}");
+    assert!(on_a.iter().any(|(p, bytes)| p.contains("(conflict, laptop, ") && bytes == b"local replacement"), "{on_a:?}");
+    let mut b = machine(&server, &ana, "desktop").await;
+    b.sync_once().await.unwrap();
+    assert_eq!(files(&b), files(&a));
+}
