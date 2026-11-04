@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::extract::rejection::{JsonRejection, PathRejection};
-use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::{AUTHORIZATION, HOST, ORIGIN};
 use axum::middleware::{self, Next};
@@ -25,7 +25,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use craft_cloud_proto::DeviceId;
-use craft_cloud_proto::api::{DeviceInfo, ErrorBody, PairingStatus, codes as api_codes};
+use craft_cloud_proto::api::{DeviceInfo, ErrorBody, HistoryResponse, PairingStatus, RestoreResponse, codes as api_codes};
 use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
 use craft_cloud_proto::local::{
     AutostartRequest, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES,
@@ -195,19 +195,23 @@ impl Control {
 #[derive(Debug)]
 pub struct LocalError {
     pub status: StatusCode,
-    pub code: &'static str,
+    pub code: String,
     pub message: String,
 }
 
 impl LocalError {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self { status, code: code.to_owned(), message: message.into() }
+    }
+
+    fn with_code(status: StatusCode, code: String, message: impl Into<String>) -> Self {
         Self { status, code, message: message.into() }
     }
 }
 
 impl IntoResponse for LocalError {
     fn into_response(self) -> Response {
-        (self.status, Json(ErrorBody { error: self.code.to_owned(), message: self.message, ..ErrorBody::default() })).into_response()
+        (self.status, Json(ErrorBody { error: self.code, message: self.message, ..ErrorBody::default() })).into_response()
     }
 }
 
@@ -217,7 +221,7 @@ impl From<AgentError> for LocalError {
         // A setup that failed after the code was spent answers as what failed, with the whole message.
         if let AgentError::JoinSetup(inner) = e {
             let inner = LocalError::from(*inner);
-            return Self::new(inner.status, inner.code, message);
+            return Self::with_code(inner.status, inner.code, message);
         }
         let (status, code) = match &e {
             AgentError::WrongPassword => (StatusCode::UNAUTHORIZED, codes::WRONG_PASSWORD),
@@ -355,12 +359,79 @@ fn router(state: Api) -> Router {
         .route(paths::PAUSE, post(pause))
         .route(paths::RESUME, post(resume))
         .route(paths::QUIT, post(quit))
+        .route(paths::FILE_HISTORY, get(file_history))
+        .route(paths::FILE_RESTORE, post(file_restore))
         .route(paths::BLOBS, axum::routing::put(put_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         .route(&format!("{}/{{hash}}", paths::BLOBS), get(get_blob))
         .fallback(|| async { LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such call") })
         .layer(DefaultBodyLimit::max(MAX_LOCAL_JSON_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
+}
+
+#[derive(serde::Deserialize)]
+struct HistoryQuery {
+    path: String,
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
+fn file_node(state: &ApiState, path: &str) -> Result<craft_cloud_proto::NodeId, LocalError> {
+    if path.is_empty() || path.starts_with('/') || path.contains('\\') || path.contains(':') || path.as_bytes().contains(&0) {
+        return Err(LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "path must be relative to the sync root"));
+    }
+    let names = path
+        .split('/')
+        .map(craft_cloud_proto::Name::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "path contains an invalid name"))?;
+    let saved =
+        DataDir::new(&state.data).load_state().map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))?;
+    let rel = craft_cloud_sync::RelPath::from_names(names);
+    let node =
+        saved.state.base_at(&rel).ok_or_else(|| LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no synced file at that path"))?;
+    if !matches!(saved.state.base.get(&node).map(|entry| &entry.kind), Some(craft_cloud_sync::BaseKind::File { .. })) {
+        return Err(LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "history is only available for files"));
+    }
+    Ok(node)
+}
+
+fn history_error(error: crate::http::HistoryCallError) -> LocalError {
+    match error {
+        crate::http::HistoryCallError::Refused { status: StatusCode::UNAUTHORIZED, body } => {
+            LocalError::new(StatusCode::CONFLICT, codes::NEEDS_YOU, body.message)
+        }
+        crate::http::HistoryCallError::Refused { status, body } => LocalError::with_code(status, body.error, body.message),
+        crate::http::HistoryCallError::Transport(craft_cloud_sync::TransportError::NotFound) => {
+            LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such file or version")
+        }
+        crate::http::HistoryCallError::Transport(craft_cloud_sync::TransportError::Unauthorized) => {
+            LocalError::new(StatusCode::CONFLICT, codes::NEEDS_YOU, "sign in again to continue")
+        }
+        crate::http::HistoryCallError::Transport(error) => AgentError::from(error).into(),
+    }
+}
+
+async fn file_history(
+    State(state): State<Api>,
+    query: Result<Query<HistoryQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<HistoryResponse>, LocalError> {
+    let Query(query) = query.map_err(|e| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, e.body_text()))?;
+    let node = file_node(&state, &query.path)?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.file_history(node, query.cursor.as_deref(), query.limit).await.map_err(history_error)?))
+}
+
+async fn file_restore(
+    State(state): State<Api>,
+    body: Result<Json<craft_cloud_proto::local::RestoreRequest>, JsonRejection>,
+) -> Result<Json<RestoreResponse>, LocalError> {
+    let Json(request) = body?;
+    let node = file_node(&state, &request.path)?;
+    let (_, transport) = server_api(&state)?;
+    let answer = transport.restore_file(node, request.version, request.expected_version).await.map_err(history_error)?;
+    state.control.request_pass();
+    Ok(Json(answer))
 }
 
 /// Equal strings, compared in time that doesn't depend on where they differ.
