@@ -657,6 +657,9 @@ methods answer `not_found` / `invalid` (405) the same way:
 | `POST /commit` | batch of version/mkdir/move/delete operations, one transaction; `409 conflict` listing every conflicting operation (a version whose manifest isn't uploaded is a `missing_manifest` conflict) |
 | `GET /nodes/{id}/history?cursor=…&limit=…` | the versions of one file of your space, newest first by `(seq, id)`, in pages (default 50, at most 200): `{versions: [{id, parent_version, epoch, seq, size, mtime_ms, device, created_ms, save, pruned}], next?}`; `next` is an opaque cursor for the next page; a folder is `invalid`, another account's or an unknown node `not_found`; a deleted file keeps its history |
 | `POST /nodes/{id}/restore` | `{version, expected_version}` → `{version, parent_version, seq, epoch}`: makes an old version's content the file's content again as a new version (see below); `409 conflict` when `expected_version` is not the current version |
+| `GET /trash?cursor=…&limit=…` | the deleted nodes of your space that were not removed from the trash, newest deletion first by `(deleted_ms, id)`, in pages (default 50, at most 200): `{items: [{id, parent, name, is_dir, size?, deleted_ms, purge_after_ms}], next?}`; `purge_after_ms` is `deleted_ms` plus `[retention] trash_days` |
+| `POST /trash/{id}/restore` | brings a node of the trash back, with its deleted folders, as one change: `{node, parent, name, renamed, seq, epoch}`; a taken name gets a conflict name (see below), a node that is not in the trash is `not_found` |
+| `DELETE /trash/{id}` | takes a node out of the trash (204): only marks it for removal, nothing is freed yet |
 | `GET /devices`, `DELETE /devices/{id}` | your devices |
 | `POST /pairings` | a new add-a-computer code from this device → `{id, code, expires_ms}` (the code shown once, normalised) |
 | `GET /pairings/{id}`, `DELETE /pairings/{id}` | one of your pairings: `{state: waiting\|used\|expired, device_name?}` / cancel it (204) |
@@ -677,6 +680,23 @@ including the conflict rules for a machine with unsynced edits of its own. A fil
 refused, so file versions and live-document state stay separate. Unknown node, foreign node, a version of
 another file and a missing manifest are all `not_found`; a deleted file, a folder and a file with a live document are
 `invalid`; a stale `expected_version` is `conflict` (409, with the conflict list as for a commit).
+
+**Trash.** The trash is the set of tombstones with the time of the deletion. `nodes.deleted_ms` is set when a node goes
+from live to deleted (not when a deleted node is deleted again) and cleared when it comes back, by an edit or by a restore
+from the trash, so the next deletion starts its time afresh; `nodes.purge_requested_ms` is set by `DELETE /trash/{id}`
+and cleared when the node comes back. Nodes deleted before the migration that added them are dated at the migration. A
+deleted node without a time (damaged data) is dated at the next read of the trash, logged without names, and never
+counts as expired. `DELETE /trash/{id}` frees nothing: versions, manifests, chunks and the tombstone stay, the change feed
+and the sequence number do not change, and the node's history stays readable; the node only leaves the trash list and can
+no longer be restored from it. (An edit that brings it back still wins, as for any deleted file.) Asking twice is fine.
+A restore from the trash brings back the node asked for and the deleted folders above it, root-most first, keeping their
+IDs; it creates no node and overwrites none. Under one write lock and in one transaction, with one sequence number:
+where a deleted folder's name is held by a live folder, that folder is used and what is below moves into it (the deleted
+folder stays deleted); where it is held by a file, or where the node's own name is held by anything, the node comes back
+as `name (conflict, <device>, <UTC date and minute>)` like the engine's conflict copies, with `, 2` to `, 100` if that is
+taken too, and a restore with no free name is `conflict` and changes nothing. The sync engine sees the restored nodes as ordinary changes to live
+nodes, possibly with a new parent or name. Restoring a *version* of a deleted file is still refused: bring the file back
+from the trash first.
 
 **Client contract** (what the sync agent relies on):
 
@@ -1078,7 +1098,7 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
 | M3b2b1 | Agent on its own: seed 112337, `run` loop, watcher, long-poll, stability window, backoff, status file | DONE (2026-10-14) |
 | M3b2b2 | Simulated network (`turmoil`): partitions, delays, dropped connections | DONE (2026-10-15) |
 | M3c | Fixes from the full repo review | DONE (2026-10-15) |
-| M4 | History, restore, trash, thinning, GC (including the chunks of uploads the stored-bytes cap refused), logical quotas, admin CLI (`user remove\|quota`, `gc`, `verify`), backup/restore | IN PROGRESS: history and restore of file versions done (server API only); the rest TODO |
+| M4 | History, restore, trash, thinning, GC (including the chunks of uploads the stored-bytes cap refused), logical quotas, admin CLI (`user remove\|quota`, `gc`, `verify`), backup/restore | IN PROGRESS: history and restore of file versions, and the trash (list, restore, mark for removal), done (server API only); the rest TODO |
 | M5 | Selective sync, large-media polish (a few chunks in flight at once), ignore rules | TODO |
 | M6 | Packaging: binaries, Docker, systemd, built-in TLS, self-hosting guide | TODO |
 | M7 | Local control API + launcher integration PR | TODO |

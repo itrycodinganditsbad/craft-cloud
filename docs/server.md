@@ -63,6 +63,23 @@ which adds a new version at the end of the file's history rather than rewinding 
 through the normal change feed. This needs no setting and no database migration, and an older server answers
 `not_found` for both paths. The agent and the apps do not use them yet.
 
+## The trash
+
+A deleted file or folder stays in the trash, and in the server's records, until it is removed for good. A signed-in
+device lists the trash (`GET /api/v1/trash`), brings a node back (`POST /api/v1/trash/{id}/restore`, which names it
+differently if its name has been taken meanwhile) or takes it out of the trash (`DELETE /api/v1/trash/{id}`). Taking
+it out only marks it: **nothing is deleted from the server yet**, no version or chunk is freed, and the node can't be
+brought back from the trash afterwards. The only setting is the number of days a deleted node waits, shown to clients as
+`purge_after_ms`; it removes nothing yet:
+
+```toml
+[retention]
+trash_days = 30   # 1 to 3650
+```
+
+The change adds two columns and an index to the metadata (migration 0009 in the proposal). An older server refuses the
+upgraded database and rejects the `[retention]` section, so take a backup before upgrading and do not roll back.
+
 ## Restoring a backup
 
 With the server stopped, restore the database and the chunk storage from the backup, then run
