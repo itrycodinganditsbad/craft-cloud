@@ -11,6 +11,8 @@ use craft_cloud_app::{DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, Pai
 use craft_cloud_proto::api::codes as api_codes;
 use craft_cloud_proto::join::JoinString;
 
+use crate::security::{SecondFactorForm, SecurityAnswer, SecurityCall, SecurityEvent, SecurityPage};
+
 /// A code that is wrong, expired or used (the server never says which).
 pub const INVALID_CODE: &str = "This code doesn't work any more. Make a new one on a signed-in computer.";
 /// The agent can't be started.
@@ -48,8 +50,12 @@ pub enum Screen {
     Joining { form: JoinForm, password: Option<PasswordForm> },
     /// An invite to a new account: its password, twice.
     PasswordNeeded(PasswordForm),
+    /// The account has two-factor sign-in: the join asks for the code ([`SecondFactorForm`]).
+    SecondFactor(SecondFactorForm),
     /// Signed in: the account, the sync, the computers.
     SignedIn(Overview),
+    /// The Security page ([`SecurityPage`]): two-factor sign-in, the password, the other computers. Boxed: it is large.
+    Security(Box<SecurityPage>),
     /// Showing an add-a-computer code.
     AddingComputer(Adding),
     /// The server refused this computer: it was removed from the account.
@@ -110,7 +116,14 @@ impl JoinForm {
             folder: Some(folder),
             device_name: (!name.is_empty()).then(|| name.to_owned()),
             password,
+            totp_code: None,
+            recovery_code: None,
         }
+    }
+
+    /// [`JoinForm::request`] with the second factor of an account that has two-factor sign-in.
+    fn request_with_factor(&self, password: Option<String>, factor: (Option<String>, Option<String>)) -> JoinRequest {
+        JoinRequest { totp_code: factor.0, recovery_code: factor.1, ..self.request(password) }
     }
 }
 
@@ -209,6 +222,16 @@ pub enum Event {
     /// [`Effect::AppAutostart`]'s outcome.
     AppAutostartSet(Result<(), String>),
 
+    /// The Security button of the signed-in view.
+    OpenSecurity,
+    /// A button of the Security page.
+    Security(SecurityEvent),
+    /// An answer to one of the page's calls.
+    SecurityAnswer(SecurityAnswer),
+    /// The code of a join that asked for one (the button, or Enter).
+    SubmitSecondFactor,
+    /// Back from the code field to the join form.
+    CancelSecondFactor,
     /// Join (the form's button, or Enter).
     SubmitJoin,
     /// The answer to "this folder has files in it: sync them too?".
@@ -255,6 +278,8 @@ pub enum Effect {
     Connect,
     /// Start the agent hidden from this app's folder and wait up to 5 s for it ([`Event::AgentStarted`]).
     StartAgent,
+    /// A call of the Security page ([`Event::SecurityAnswer`]).
+    Security(SecurityCall),
     Status,
     Join(JoinRequest),
     SetAutostart(bool),
@@ -346,6 +371,7 @@ impl Model {
     pub fn overview(&self) -> Option<&Overview> {
         match &self.screen {
             Screen::SignedIn(overview) => Some(overview),
+            Screen::Security(page) => Some(&page.overview),
             Screen::AddingComputer(adding) => Some(&adding.overview),
             _ => None,
         }
@@ -354,6 +380,7 @@ impl Model {
     fn overview_mut(&mut self) -> Option<&mut Overview> {
         match &mut self.screen {
             Screen::SignedIn(overview) => Some(overview),
+            Screen::Security(page) => Some(&mut page.overview),
             Screen::AddingComputer(adding) => Some(&mut adding.overview),
             _ => None,
         }
@@ -451,6 +478,28 @@ impl Model {
                 Vec::new()
             }
 
+            Event::OpenSecurity => {
+                let Screen::SignedIn(overview) = &self.screen else { return Vec::new() };
+                let (page, calls) = SecurityPage::open(overview.clone());
+                self.screen = Screen::Security(Box::new(page));
+                calls.into_iter().map(Effect::Security).collect()
+            }
+            Event::Security(event) => self.security(event),
+            Event::SecurityAnswer(answer) => {
+                let now_ms = self.now_ms;
+                let Screen::Security(page) = &mut self.screen else { return Vec::new() };
+                page.answer(answer, now_ms).into_iter().map(Effect::Security).collect()
+            }
+            Event::SubmitSecondFactor => self.submit_second_factor(),
+            Event::CancelSecondFactor => {
+                if let Screen::SecondFactor(form) = &self.screen {
+                    self.screen = match &form.password {
+                        Some(pw) => Screen::PasswordNeeded(pw.clone()),
+                        None => Screen::Join(form.form.clone()),
+                    };
+                }
+                Vec::new()
+            }
             Event::SubmitJoin => self.submit_join(),
             Event::SyncExistingFiles(yes) => {
                 let Screen::Join(form) = &mut self.screen else { return Vec::new() };
@@ -602,6 +651,7 @@ impl Model {
         if status.signed_in {
             match &mut self.screen {
                 Screen::SignedIn(overview) => overview.status = status,
+                Screen::Security(page) => page.overview.status = status,
                 Screen::AddingComputer(adding) => adding.overview.status = status,
                 // The join's own answer moves on from there.
                 Screen::Joining { .. } => {}
@@ -619,7 +669,7 @@ impl Model {
                     self.screen = Screen::Error(problem);
                 }
             }
-            (_, Screen::Join(_) | Screen::Joining { .. } | Screen::PasswordNeeded(_)) => {}
+            (_, Screen::Join(_) | Screen::Joining { .. } | Screen::PasswordNeeded(_) | Screen::SecondFactor(_)) => {}
             _ => self.screen = Screen::Join(JoinForm::new(&self.defaults)),
         }
         effects
@@ -650,7 +700,7 @@ impl Model {
                 self.version_problem(*v);
                 return;
             }
-            Error::Refused { .. } => false,
+            Error::Refused { .. } | Error::RefusedWith { .. } => false,
         };
         if !gone || matches!(self.screen, Screen::Starting | Screen::NotRunning(_)) || self.busy == Some(Busy::Quitting) {
             return;
@@ -676,6 +726,34 @@ impl Model {
         let request = form.request(None);
         self.screen = Screen::Joining { form: form.clone(), password: None };
         vec![Effect::Join(request)]
+    }
+
+    /// The code of a join that asked for one: the same join, with the code, goes to the agent again.
+    fn submit_second_factor(&mut self) -> Vec<Effect> {
+        let Screen::SecondFactor(second) = &mut self.screen else { return Vec::new() };
+        let factor = match second.factor() {
+            Ok(factor) => factor,
+            Err(why) => {
+                second.error = Some(why);
+                return Vec::new();
+            }
+        };
+        let request = second.form.request_with_factor(second.password.as_ref().map(|pw| pw.password.clone()), factor);
+        let (form, password) = (second.form.clone(), second.password.clone());
+        self.screen = Screen::Joining { form, password };
+        vec![Effect::Join(request)]
+    }
+
+    /// A button of the Security page.
+    fn security(&mut self, event: SecurityEvent) -> Vec<Effect> {
+        let Screen::Security(page) = &mut self.screen else { return Vec::new() };
+        if event == SecurityEvent::Close {
+            // Whatever the page showed (a secret, recovery codes) goes with it.
+            let overview = page.overview.clone();
+            self.screen = Screen::SignedIn(overview);
+            return vec![Effect::Devices];
+        }
+        page.update(event).into_iter().map(Effect::Security).collect()
     }
 
     fn submit_password(&mut self) -> Vec<Effect> {
@@ -709,7 +787,7 @@ impl Model {
             Err(e) => e,
         };
         let (code, text) = match &e {
-            Error::Refused { code, message } => (code.as_str(), message.clone()),
+            Error::Refused { code, message } | Error::RefusedWith { code, message, .. } => (code.as_str(), message.clone()),
             Error::NotRunning(_) => {
                 self.status = None;
                 self.screen = Screen::NotRunning(self.not_running(STOPPED, &e.to_string()));
@@ -724,6 +802,11 @@ impl Model {
             Screen::PasswordNeeded(pw)
         };
         self.screen = match (code, password) {
+            // The account has two-factor sign-in: the same join goes again with its code (the invite was not used up).
+            (codes::TWO_FACTOR_REQUIRED, password) => Screen::SecondFactor(SecondFactorForm::new(form, password, None)),
+            (codes::TWO_FACTOR_INVALID | codes::TWO_FACTOR_LOCKED, password) => {
+                Screen::SecondFactor(SecondFactorForm::new(form, password, Some(crate::security::explain(&e))))
+            }
             (codes::PASSWORD_REQUIRED, _) => {
                 Screen::PasswordNeeded(PasswordForm { form, password: String::new(), again: String::new(), error: None })
             }
@@ -820,7 +903,7 @@ impl Model {
 /// An error's message, for people.
 fn message(e: &Error) -> String {
     match e {
-        Error::Refused { message, .. } => message.clone(),
+        Error::Refused { message, .. } | Error::RefusedWith { message, .. } => message.clone(),
         other => other.to_string(),
     }
 }
