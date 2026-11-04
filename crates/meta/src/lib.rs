@@ -10,6 +10,7 @@
 mod blobs;
 mod codec;
 mod commit;
+mod history;
 mod join;
 mod live;
 mod schema;
@@ -24,8 +25,9 @@ use sqlx::any::{AnyConnectOptions, AnyPoolOptions};
 use sqlx::{AnyPool, ConnectOptions};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-pub use commit::CommitOutcome;
+pub use commit::{CommitOutcome, RestoreOutcome};
 pub use craft_cloud_proto::BlobKind;
+pub use history::HistoryPage;
 pub use join::{InviteFor, Redeemed};
 pub use live::{
     Appended, DEFAULT_LIVE_BYTES_PER_SPACE, LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE, MAX_LIVE_DOCS_PER_SPACE,
