@@ -497,6 +497,7 @@ async fn restore_from_trash(
         parent: outcome.parent,
         name: outcome.name,
         renamed: outcome.renamed,
+        version: outcome.version,
         seq: outcome.seq,
         epoch: outcome.epoch,
     }))

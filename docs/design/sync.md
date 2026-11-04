@@ -658,7 +658,7 @@ methods answer `not_found` / `invalid` (405) the same way:
 | `GET /nodes/{id}/history?cursor=…&limit=…` | the versions of one file of your space, newest first by `(seq, id)`, in pages (default 50, at most 200): `{versions: [{id, parent_version, epoch, seq, size, mtime_ms, device, created_ms, save, pruned}], next?}`; `next` is an opaque cursor for the next page; a folder is `invalid`, another account's or an unknown node `not_found`; a deleted file keeps its history |
 | `POST /nodes/{id}/restore` | `{version, expected_version}` → `{version, parent_version, seq, epoch}`: makes an old version's content the file's content again as a new version (see below); `409 conflict` when `expected_version` is not the current version |
 | `GET /trash?cursor=…&limit=…` | the deleted nodes of your space that were not removed from the trash, newest deletion first by `(deleted_ms, id)`, in pages (default 50, at most 200): `{items: [{id, parent, name, is_dir, size?, deleted_ms, purge_after_ms}], next?}`; `purge_after_ms` is `deleted_ms` plus `[retention] trash_days` |
-| `POST /trash/{id}/restore` | brings a node of the trash back, with its deleted folders, as one change: `{node, parent, name, renamed, seq, epoch}`; a taken name gets a conflict name (see below), a node that is not in the trash is `not_found` |
+| `POST /trash/{id}/restore` | brings a node of the trash back, with its deleted folders, as one change: `{node, parent, name, renamed, version?, seq, epoch}` (a restored file has a new version); a taken name gets a conflict name (see below), a node that is not in the trash is `not_found` |
 | `DELETE /trash/{id}` | takes a node out of the trash (204): only marks it for removal, nothing is freed yet |
 | `GET /devices`, `DELETE /devices/{id}` | your devices |
 | `POST /pairings` | a new add-a-computer code from this device → `{id, code, expires_ms}` (the code shown once, normalised) |
@@ -694,8 +694,18 @@ IDs; it creates no node and overwrites none. Under one write lock and in one tra
 where a deleted folder's name is held by a live folder, that folder is used and what is below moves into it (the deleted
 folder stays deleted); where it is held by a file, or where the node's own name is held by anything, the node comes back
 as `name (conflict, <device>, <UTC date and minute>)` like the engine's conflict copies, with `, 2` to `, 100` if that is
-taken too, and a restore with no free name is `conflict` and changes nothing. The sync engine sees the restored nodes as ordinary changes to live
-nodes, possibly with a new parent or name. Restoring a *version* of a deleted file is still refused: bring the file back
+taken too, and a restore with no free name is `conflict` and changes nothing. A restored *file* gets a **new version**: a copy of its last one (the same manifest, modification time and
+executable bit, no save record), after it, in the same change. A machine that deleted the file, whose answer it never
+heard (the server applied the delete), still names the old version in its delete; after a restore the server refuses
+that delete as a version mismatch, and the engine, which already treats a node that came back at another version as one
+whose delete went through, lets the node go and downloads the restored file as a new one. Without this the machine would
+send the delete again and delete the restored file. A folder has no version, so a deleted folder that was brought back
+looks the same as one that was never deleted; the engine therefore remembers the folder deletes it sent without hearing
+the answer (`State::sent_dir_deletes`) and, when the next pull reports such a folder changed and live, lets it go instead
+of deleting it again (a folder the feed does not mention was never touched, and its delete is sent again). A restore is
+otherwise an ordinary change to live nodes, possibly with a new parent or name. Older agents lack the folder rule: with
+one, a folder restored in the short window after a delete whose answer was lost can be deleted a second time (the folder
+is empty and can be restored again), so update agents with or soon after the server. Restoring a *version* of a deleted file is still refused: bring the file back
 from the trash first.
 
 **Client contract** (what the sync agent relies on):
