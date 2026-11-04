@@ -119,14 +119,24 @@ pub struct Completed {
     pub device: DeviceId,
 }
 
-/// A stored secret for the key tools: the ciphertexts of one account.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A stored secret for the key tools: the ciphertexts of one account. Its `Debug` output shows only their lengths.
+#[derive(Clone, PartialEq, Eq)]
 pub struct StoredSecrets {
     pub user: UserId,
     /// The ciphertext of the active secret, if two-factor sign-in is on.
     pub active: Option<Vec<u8>>,
     /// The ciphertext of an open set-up's secret, if there is one that is not expired.
     pub pending: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for StoredSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredSecrets")
+            .field("user", &self.user)
+            .field("active", &self.active.as_ref().map(|sealed| format!("<{} bytes>", sealed.len())))
+            .field("pending", &self.pending.as_ref().map(|sealed| format!("<{} bytes>", sealed.len())))
+            .finish()
+    }
 }
 
 /// The row of `user_two_factor`.
@@ -803,6 +813,15 @@ mod tests {
         assert_eq!(lock_for(16), Some(16 * 60 * 60 * 1000), "16 hours");
         assert_eq!(lock_for(17), Some(LOCK_MAX_MS), "32 hours is over a day");
         assert_eq!(lock_for(i64::MAX), Some(LOCK_MAX_MS));
+    }
+
+    #[test]
+    fn sealed_secrets_show_only_their_length() {
+        let secrets = StoredSecrets { user: UserId(uuid::Uuid::nil()), active: Some(vec![7, 8, 9]), pending: None };
+        let shown = format!("{secrets:?}");
+        assert!(shown.contains("<3 bytes>") && !shown.contains("[7"), "{shown}");
+        let device = DeviceActor { user: UserId(uuid::Uuid::nil()), device: DeviceId::generate(), password_hash: "$argon2id$secret".to_owned() };
+        assert!(!format!("{device:?}").contains("argon2id"));
     }
 
     #[test]
