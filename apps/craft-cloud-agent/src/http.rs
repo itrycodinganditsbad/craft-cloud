@@ -958,6 +958,29 @@ impl<C: Connection> HttpTransport<C> {
     pub async fn delete_pairing(&self, id: Uuid) -> Result<(), TransportError> {
         self.no_content(self.request(Method::DELETE, &format!("pairings/{id}"), 0)).await
     }
+
+    /// `GET /api/v1/<path>?<query>` of the admin API (or the account's activity), read as `T`; a refusal is kept whole.
+    pub async fn admin_get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<T, CallError> {
+        let mut url = self.server.endpoint(path);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        self.account_call(request(Method::GET, url, Some(&self.auth), MAX_SMALL_JSON_BYTES)).await
+    }
+
+    /// `method /api/v1/<path>` of the admin API with `body` (the confirmation among it), answered with a body read as `T`.
+    pub async fn admin_json<T: DeserializeOwned, B: Serialize>(&self, method: Method, path: &str, body: &B) -> Result<T, CallError> {
+        self.account_call(self.request(method, path, MAX_SMALL_JSON_BYTES).json(body)?).await
+    }
+
+    /// [`HttpTransport::admin_json`] for a call answered without a body (`204`, or `202`): the status it succeeded with.
+    pub async fn admin_empty<B: Serialize>(&self, method: Method, path: &str, body: &B) -> Result<StatusCode, CallError> {
+        let resp = self.send(self.request(method, path, MAX_SMALL_JSON_BYTES).json(body)?).await?;
+        if resp.status.is_success() {
+            return Ok(resp.status);
+        }
+        Err(failure(resp).await)
+    }
 }
 
 #[async_trait]
@@ -1108,6 +1131,22 @@ mod tests {
         let signed_in = transport.request(Method::GET, "space", 0);
         let shown = format!("{signed_in:?}");
         assert!(!shown.contains("secret-token") && shown.contains("authorization"), "{shown}");
+    }
+
+    /// An admin change carries the admin's password in its body, to the server only: no `Debug` output of the request
+    /// or of the bodies shows it.
+    #[test]
+    fn admin_confirmations_stay_out_of_debug_output() {
+        use craft_cloud_proto::api::{AdminConfirm, AdminCreateUser, AdminUpdateUser};
+        let server = ServerUrl::parse("http://127.0.0.1:1").unwrap();
+        let confirm = AdminConfirm { password: Some("admin-secret-pw".into()), totp_code: Some("918273".into()), ..AdminConfirm::default() };
+        let create =
+            AdminCreateUser { username: "ana".into(), role: "member".into(), password: Some("admin-secret-pw".into()), ..AdminCreateUser::default() };
+        let update = AdminUpdateUser { password: Some("admin-secret-pw".into()), ..AdminUpdateUser::default() };
+        let sent = request(Method::POST, server.endpoint("admin/users/x/disable"), None, 0).json(&confirm).unwrap();
+        assert!(sent.body.as_deref().is_some_and(|b| String::from_utf8_lossy(b).contains("admin-secret-pw")), "the body carries it");
+        let shown = format!("{sent:?} {confirm:?} {create:?} {update:?}");
+        assert!(!shown.contains("admin-secret-pw") && !shown.contains("918273"), "{shown}");
     }
 
     fn body(code: &str) -> ErrorBody {

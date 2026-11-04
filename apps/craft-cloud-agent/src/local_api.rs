@@ -380,7 +380,7 @@ impl Drop for LocalApi {
     }
 }
 
-type Api = Arc<ApiState>;
+pub(crate) type Api = Arc<ApiState>;
 
 fn router(state: Api) -> Router {
     Router::new()
@@ -406,6 +406,7 @@ fn router(state: Api) -> Router {
         .route(paths::PAUSE, post(pause))
         .route(paths::RESUME, post(resume))
         .route(paths::QUIT, post(quit))
+        .merge(crate::admin::routes())
         .route(paths::BLOBS, axum::routing::put(put_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         .route(&format!("{}/{{hash}}", paths::BLOBS), get(get_blob))
         .fallback(|| async { LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such call") })
@@ -621,14 +622,14 @@ async fn join(State(state): State<Api>, body: Result<Json<JoinRequest>, JsonReje
 }
 
 /// The signed-in account's server API, for the calls the local API makes itself (they touch nothing here).
-fn server_api(state: &ApiState) -> Result<(Account, HttpTransport), LocalError> {
+pub(crate) fn server_api(state: &ApiState) -> Result<(Account, HttpTransport), LocalError> {
     let account = state.control.account().ok_or(AgentError::NotSignedIn)?;
     let transport = HttpTransport::new(account.server.clone(), &account.token).map_err(AgentError::from)?;
     Ok((account, transport))
 }
 
 /// A path's ID, or `400 invalid`.
-fn path_id<T>(id: Result<Path<T>, PathRejection>) -> Result<T, LocalError> {
+pub(crate) fn path_id<T>(id: Result<Path<T>, PathRejection>) -> Result<T, LocalError> {
     id.map(|Path(id)| id).map_err(|e| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, e.body_text()))
 }
 

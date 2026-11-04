@@ -183,6 +183,18 @@ const ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/account/password"),
     ("POST", "/v1/devices/revoke-others"),
     ("PATCH", "/v1/devices/0192f0c4-0000-7000-8000-000000000000"),
+    ("GET", "/v1/admin/server"),
+    ("GET", "/v1/admin/users"),
+    ("POST", "/v1/admin/users"),
+    ("PATCH", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000"),
+    ("DELETE", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000"),
+    ("POST", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/disable"),
+    ("POST", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/enable"),
+    ("POST", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/invite"),
+    ("DELETE", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/invite"),
+    ("POST", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/password-reset"),
+    ("GET", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/devices"),
+    ("DELETE", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/devices/0192f0c4-0000-7000-8000-000000000001"),
 ];
 
 /// A user session without systemd: Linux's entry is the XDG autostart file.
@@ -861,4 +873,265 @@ async fn an_invite_to_a_new_account_asks_for_a_password_through_the_agent() {
     let joined: Status = serde_json::from_str(&body).unwrap();
     assert_eq!(joined.account.as_deref(), Some("cleo"));
     b.stop().await;
+}
+
+// ---- the admin calls (`/v1/admin/…`) ----
+
+use craft_cloud_proto::api::{AdminCode, AdminCreatedUser, AdminDevices, AdminServerInfo, AdminUserInfo, AdminUserList};
+
+/// The server with `root`, an administrator, beside `ana`, a member.
+async fn admin_server() -> Server {
+    let server = server().await;
+    server.meta.create_user("root", &hash_password(PASSWORD).unwrap(), Role::Admin, 0).await.unwrap();
+    server
+}
+
+/// Signs `run` in as `user` through its local API and waits until it is idle.
+async fn signed_in_as(server: &Server, user: &str, data: &DataDir, folder: &Path) -> (Running, LocalApiFile) {
+    let running = Running::start(data);
+    let api = api_file(data.path()).await;
+    let body = serde_json::to_string(&LoginRequest {
+        server: server.url.clone(),
+        user: user.into(),
+        password: PASSWORD.into(),
+        folder: Some(folder.display().to_string()),
+        device_name: Some(format!("{user}-pc")),
+        adopt: false,
+    })
+    .unwrap();
+    let (code, answer) = call(&api, "POST", "/v1/login", &body);
+    assert_eq!(code, 200, "{answer}");
+    eventually("signed in and idle", || status(&api).run_state == RunState::Idle).await;
+    (running, api)
+}
+
+/// A call with the confirmation `password` and the rest of the body in `fields`.
+fn confirmed(api: &LocalApiFile, method: &str, path: &str, password: &str, fields: serde_json::Value) -> (u16, String) {
+    let mut body = fields;
+    body["password"] = password.into();
+    call(api, method, path, &body.to_string())
+}
+
+/// Whether an admin disabled the account.
+async fn is_disabled(server: &Server, name: &str) -> bool {
+    let user = server.meta.user_by_name(name).await.unwrap().unwrap();
+    server.meta.admin_user(user.id, 0).await.unwrap().unwrap().disabled_ms.is_some()
+}
+
+fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files_under(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+/// Every route passes the server's answer on with its status and code: reads, the changes of an account, the codes,
+/// the devices; the confirmation is the admin's password in the body; a missing or wrong one is the server's `400
+/// invalid` and `403 wrong_password` (never 401), and too many wrong ones its `429`. Nothing of the password or of a
+/// code is kept by the agent or printed by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_calls_reach_the_servers_admin_api_and_pass_its_answers_through() {
+    let server = admin_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder = dir.path().join("Craft Cloud");
+    let (running, api) = signed_in_as(&server, "root", &data, &folder).await;
+    let ana = server.meta.user_by_name("ana").await.unwrap().unwrap();
+    let ana_path = format!("/v1/admin/users/{}", ana.id.0);
+
+    // Reads.
+    let (code, body) = call(&api, "GET", "/v1/admin/server", "");
+    assert_eq!(code, 200, "{body}");
+    let info: AdminServerInfo = serde_json::from_str(&body).unwrap();
+    assert_eq!((info.users, info.devices_active, info.storage_kind.as_str()), (2, 1, "disk"));
+    let (code, body) = call(&api, "GET", "/v1/admin/users?limit=1", "");
+    assert_eq!(code, 200, "{body}");
+    let page: AdminUserList = serde_json::from_str(&body).unwrap();
+    assert_eq!(page.users.iter().map(|u| u.username.as_str()).collect::<Vec<_>>(), ["ana"]);
+    let next = page.next.expect("a second page");
+    let (code, body) = call(&api, "GET", &format!("/v1/admin/users?limit=1&cursor={next}"), "");
+    assert_eq!(code, 200, "{body}");
+    let second: AdminUserList = serde_json::from_str(&body).unwrap();
+    assert_eq!((second.users.first().map(|u| u.username.as_str()), second.next), (Some("root"), None));
+    let (code, body) = call(&api, "GET", "/v1/admin/users?query=AN", "");
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(serde_json::from_str::<AdminUserList>(&body).unwrap().users.len(), 1);
+    let (code, body) = call(&api, "GET", "/v1/admin/users?limit=0", "");
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "the server's own refusal: {body}");
+    let (code, body) = call(&api, "GET", "/v1/admin/users?limit=x", "");
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+    let (code, body) = call(&api, "GET", &format!("{ana_path}/devices"), "");
+    assert_eq!(code, 200, "{body}");
+    assert!(serde_json::from_str::<AdminDevices>(&body).unwrap().devices.is_empty());
+
+    // A missing confirmation is the server's `invalid`; a wrong one its `wrong_password`, a 403: never a 401.
+    let (code, body) = call(&api, "POST", &format!("{ana_path}/disable"), "{}");
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+    let (code, body) = confirmed(&api, "POST", &format!("{ana_path}/disable"), "not the password", serde_json::json!({}));
+    assert_eq!((code, error_code(&body).as_str()), (403, "wrong_password"), "{body}");
+    let (code, body) = call(&api, "POST", &format!("{ana_path}/disable"), "not json");
+    assert_eq!(code, 400, "{body}");
+    assert!(!is_disabled(&server, "ana").await, "nothing changed without a right confirmation");
+    assert!(status(&api).signed_in && !status(&api).removed, "a 403 doesn't sign the agent out");
+
+    // The changes: with the confirmation, each is the server's answer.
+    let (code, body) = confirmed(&api, "POST", "/v1/admin/users", PASSWORD, serde_json::json!({ "username": "bo", "role": "member" }));
+    assert_eq!(code, 200, "{body}");
+    let created: AdminCreatedUser = serde_json::from_str(&body).unwrap();
+    assert_eq!((created.user.username.as_str(), created.user.role.as_str(), created.user.invite_pending), ("bo", "member", true));
+    let invite_code = created.invite.code.clone();
+    assert!(!invite_code.is_empty());
+    let bo_path = format!("/v1/admin/users/{}", created.user.id);
+    let (code, body) = confirmed(&api, "POST", "/v1/admin/users", PASSWORD, serde_json::json!({ "username": "bo", "role": "member" }));
+    assert_eq!((code, error_code(&body).as_str()), (409, "username_taken"), "{body}");
+    let (code, body) = confirmed(&api, "PATCH", &ana_path, PASSWORD, serde_json::json!({ "quota_bytes": 50_000_000 }));
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(serde_json::from_str::<AdminUserInfo>(&body).unwrap().quota_bytes, Some(50_000_000));
+    let (code, body) = confirmed(&api, "PATCH", &ana_path, PASSWORD, serde_json::json!({ "quota_bytes": null, "role": "admin" }));
+    assert_eq!(code, 200, "{body}");
+    let changed: AdminUserInfo = serde_json::from_str(&body).unwrap();
+    assert_eq!((changed.quota_bytes, changed.role.as_str()), (None, "admin"));
+    let (code, body) = confirmed(&api, "PATCH", &ana_path, PASSWORD, serde_json::json!({}));
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+    let (code, body) = confirmed(&api, "PATCH", &ana_path, PASSWORD, serde_json::json!({ "role": "member" }));
+    assert_eq!(code, 200, "{body}");
+    // The last administrator can't be demoted: the server's 409.
+    let root = server.meta.user_by_name("root").await.unwrap().unwrap();
+    let (code, body) = confirmed(&api, "PATCH", &format!("/v1/admin/users/{}", root.id.0), PASSWORD, serde_json::json!({ "role": "member" }));
+    assert_eq!((code, error_code(&body).as_str()), (409, "last_admin"), "{body}");
+    let (code, body) = confirmed(&api, "POST", &format!("{ana_path}/disable"), PASSWORD, serde_json::json!({}));
+    assert_eq!((code, body.as_str()), (204, ""), "{body}");
+    assert!(is_disabled(&server, "ana").await);
+    let (code, body) = confirmed(&api, "POST", &format!("{ana_path}/enable"), PASSWORD, serde_json::json!({}));
+    assert_eq!((code, body.as_str()), (204, ""), "{body}");
+    let (code, body) = confirmed(&api, "POST", &format!("{ana_path}/password-reset"), PASSWORD, serde_json::json!({}));
+    assert_eq!(code, 200, "{body}");
+    let reset: AdminCode = serde_json::from_str(&body).unwrap();
+    assert!(!reset.code.is_empty());
+    let (code, body) = confirmed(&api, "POST", &format!("{ana_path}/invite"), PASSWORD, serde_json::json!({}));
+    assert_eq!((code, error_code(&body).as_str()), (409, "conflict"), "ana has a password: the server says so: {body}");
+    let (code, body) = confirmed(&api, "POST", &format!("{bo_path}/invite"), PASSWORD, serde_json::json!({}));
+    assert_eq!(code, 200, "{body}");
+    let second_invite: AdminCode = serde_json::from_str(&body).unwrap();
+    let (code, body) = confirmed(&api, "DELETE", &format!("{bo_path}/invite"), PASSWORD, serde_json::json!({}));
+    assert_eq!((code, body.as_str()), (204, ""), "{body}");
+    let (code, body) = confirmed(&api, "DELETE", &format!("{bo_path}/invite"), PASSWORD, serde_json::json!({}));
+    assert_eq!((code, error_code(&body).as_str()), (404, "not_found"), "nothing left to revoke: {body}");
+    let unknown_device = craft_cloud_proto::DeviceId::generate();
+    let (code, body) = confirmed(&api, "DELETE", &format!("{ana_path}/devices/{unknown_device}"), PASSWORD, serde_json::json!({}));
+    assert_eq!((code, error_code(&body).as_str()), (404, "not_found"), "{body}");
+    let (code, body) = confirmed(&api, "DELETE", &bo_path, PASSWORD, serde_json::json!({}));
+    assert_eq!((code, body.as_str()), (202, ""), "the server's own status: {body}");
+    let (code, body) = call(&api, "GET", "/v1/admin/users", "");
+    assert_eq!(code, 200, "{body}");
+    assert!(serde_json::from_str::<AdminUserList>(&body).unwrap().users.iter().all(|u| u.username != "bo"), "removed accounts are out of the list");
+    let (code, body) = call(&api, "GET", "/v1/admin/users/not-an-id/devices", "");
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+
+    // Wrong passwords are counted by the server: it says when it has had enough, and that stays a 429.
+    let mut limited = None;
+    for _ in 0..8 {
+        let (code, body) = confirmed(&api, "POST", &format!("{ana_path}/disable"), "still wrong", serde_json::json!({}));
+        if code == 429 {
+            limited = Some(error_code(&body));
+            break;
+        }
+        assert_eq!((code, error_code(&body).as_str()), (403, "wrong_password"), "{body}");
+    }
+    assert_eq!(limited.as_deref(), Some("rate_limited"));
+    assert!(status(&api).signed_in && !status(&api).removed);
+
+    let (exit, out) = running.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    // Nothing of the confirmation or the codes was kept or printed (the files are read once the agent has stopped: it
+    // holds the data folder's lock while it runs).
+    let mut written = Vec::new();
+    files_under(data.path(), &mut written);
+    for file in written.iter().filter(|f| f.file_name().is_some_and(|n| n != LOCAL_API_FILE)) {
+        let text = String::from_utf8_lossy(&std::fs::read(file).unwrap()).into_owned();
+        for secret in [PASSWORD, "still wrong", invite_code.as_str(), reset.code.as_str(), second_invite.code.as_str()] {
+            assert!(!text.contains(secret), "{} holds a secret", file.display());
+        }
+    }
+    for secret in [PASSWORD, "still wrong", invite_code.as_str(), reset.code.as_str(), second_invite.code.as_str()] {
+        assert!(!out.contains(secret), "the agent printed a secret: {out}");
+    }
+}
+
+/// A member's calls are refused by the server as `403 forbidden`, and that is what the app is told; the agent is
+/// not signed out by it (a 401 would mean "this device was revoked").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_is_told_forbidden_and_stays_signed_in() {
+    let server = admin_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let (running, api) = signed_in_as(&server, "ana", &data, &dir.path().join("Craft Cloud")).await;
+    let some_id = "0192f0c4-0000-7000-8000-000000000000";
+    for (method, path) in
+        [("GET", "/v1/admin/server".to_owned()), ("GET", "/v1/admin/users".to_owned()), ("GET", format!("/v1/admin/users/{some_id}/devices"))]
+    {
+        let (code, body) = call(&api, method, &path, "");
+        assert_eq!((code, error_code(&body).as_str()), (403, "forbidden"), "{method} {path}: {body}");
+    }
+    for (method, path) in [
+        ("POST", "/v1/admin/users".to_owned()),
+        ("PATCH", format!("/v1/admin/users/{some_id}")),
+        ("POST", format!("/v1/admin/users/{some_id}/disable")),
+        ("DELETE", format!("/v1/admin/users/{some_id}")),
+    ] {
+        let fields = serde_json::json!({ "username": "x", "role": "admin", "quota_bytes": 5_000_000 });
+        let (code, body) = confirmed(&api, method, &path, PASSWORD, fields);
+        assert_eq!((code, error_code(&body).as_str()), (403, "forbidden"), "{method} {path}: {body}");
+    }
+    let now = status(&api);
+    assert!(now.signed_in && !now.removed, "{now:?}");
+    let ana = server.meta.user_by_name("ana").await.unwrap().unwrap();
+    assert_eq!(ana.role, Role::Member);
+    let (exit, out) = running.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+}
+
+/// The server's `401` for a revoked admin device is not a local `401` (which says the token is wrong): it is told as
+/// every signed-in call tells it, as something that needs the person.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_admin_device_is_told_as_needs_you() {
+    let server = admin_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let (running, api) = signed_in_as(&server, "root", &data, &dir.path().join("Craft Cloud")).await;
+    let root = server.meta.user_by_name("root").await.unwrap().unwrap();
+    for device in server.meta.list_devices(root.id).await.unwrap() {
+        server.meta.revoke_device(root.id, device.id).await.unwrap();
+    }
+    let (code, body) = call(&api, "GET", "/v1/admin/server", "");
+    assert_eq!((code, error_code(&body).as_str()), (409, codes::NEEDS_YOU), "{body}");
+    let (code, body) = confirmed(&api, "POST", "/v1/admin/users", PASSWORD, serde_json::json!({ "username": "x", "role": "member" }));
+    assert_eq!((code, error_code(&body).as_str()), (409, codes::NEEDS_YOU), "{body}");
+    running.stop().await.0.unwrap();
+}
+
+/// Signed out there is no server to ask; the bodies are small; the checks on every call are the other routes'.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_calls_need_a_sign_in_and_small_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let running = Running::start(&data);
+    let api = api_file(data.path()).await;
+    let id = "0192f0c4-0000-7000-8000-000000000000";
+    let (code, body) = call(&api, "GET", "/v1/admin/server", "");
+    assert_eq!((code, error_code(&body).as_str()), (409, codes::NOT_SIGNED_IN), "{body}");
+    let (code, body) = confirmed(&api, "POST", &format!("/v1/admin/users/{id}/disable"), PASSWORD, serde_json::json!({}));
+    assert_eq!((code, error_code(&body).as_str()), (409, codes::NOT_SIGNED_IN), "{body}");
+    let (code, body) = call(&api, "GET", "/v1/admin/users?limit=9999999999", "");
+    assert_eq!(code, 400, "a limit that is no number: {body}");
+    let long = serde_json::json!({ "username": "a".repeat(9 * 1024), "role": "member", "password": PASSWORD }).to_string();
+    let (code, body) = call(&api, "POST", "/v1/admin/users", &long);
+    assert_eq!((code, error_code(&body).as_str()), (413, "too_large"), "{body}");
+    let (code, _) = call(&api, "POST", "/v1/admin/users", "{\"username\": 5}");
+    assert_eq!(code, 422, "the shape of the body is checked here too");
+    running.stop().await.0.unwrap();
 }
