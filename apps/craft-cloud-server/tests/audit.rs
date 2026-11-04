@@ -476,6 +476,31 @@ async fn the_account_sees_only_its_own_activity(s: &Server) {
     assert_eq!((status, code.as_str()), (StatusCode::UNAUTHORIZED, "unauthorized"));
 }
 
+/// A former administrator keeps the events of what they did, but no longer sees the details of what they did to others.
+async fn a_demoted_admin_sees_no_details_of_their_acts_on_others(s: &Server) {
+    let root = add_user(s, "rootuser", Role::Admin).await;
+    add_user(s, "seconduser", Role::Admin).await;
+    let quincy = add_user(s, "quincy", Role::Member).await;
+    let q = login(s, "quincy", json!({})).await;
+    let r = login(s, "rootuser", json!({})).await;
+    let t = login(s, "seconduser", json!({})).await;
+    let path = format!("/admin/users/{quincy}/devices/{}", q.device);
+    assert_eq!(admin(s, &r.token, Method::DELETE, &path, json!({})).await.status(), StatusCode::NO_CONTENT);
+    let before = page(s, &r.token, "/account/activity").await;
+    assert!(before.events.iter().any(|e| e.action == "admin.device_revoked" && e.details.device.is_none()), "{before:?}");
+    assert_eq!(admin(s, &t.token, Method::PATCH, &format!("/admin/users/{root}"), json!({ "role": "member" })).await.status(), StatusCode::OK);
+    let mine = page(s, &r.token, "/account/activity").await;
+    let revoked = mine.events.iter().find(|e| e.action == "admin.device_revoked").unwrap();
+    assert_eq!((revoked.actor_user, revoked.target_id), (Some(root), Some(quincy)));
+    assert_eq!(revoked.details, Default::default(), "no device of someone else");
+    let text = serde_json::to_string(&mine).unwrap();
+    assert!(!text.contains(&q.device.to_string()), "{text}");
+    // An admin still sees all of it.
+    let all = page(s, &t.token, "/admin/audit").await;
+    let full = all.events.iter().find(|e| e.action == "admin.device_revoked").unwrap();
+    assert_eq!(full.details.device.map(|d| *d.as_uuid()), Some(q.device));
+}
+
 /// The admin's list and export are for administrators: a member is `403 forbidden`, no token `401`; filters, limits and the
 /// cursor are checked.
 async fn the_admin_list_is_for_admins_and_checks_its_parameters(s: &Server) {
@@ -584,6 +609,13 @@ async fn the_export_streams_ndjson_and_ends_with_complete(s: &Server) {
     // The same filters as the list.
     let (_, text) = export_text(s, &r.token, &format!("?user={quincy}&action=auth.")).await;
     assert_eq!(text.lines().count(), 13, "twelve events and the end");
+    // `before_ms` limits an export as it does a list, besides its fixed end; a negative one is refused.
+    let (_, text) = export_text(s, &r.token, "?before_ms=1").await;
+    assert_eq!(text.trim(), r#"{"complete":true,"exported":0}"#);
+    let (_, text) = export_text(s, &r.token, &format!("?before_ms={}", 1_000_000 + 5 * MINUTE)).await;
+    assert_eq!(text.lines().count(), 6, "five seeded events and the end");
+    let (status, code) = refusal(call(s, Some(&r.token), Method::GET, "/admin/audit/export?before_ms=-1", None).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
     let (_, text) = export_text(s, &r.token, "?action=admin.").await;
     assert_eq!(text.trim(), r#"{"complete":true,"exported":0}"#, "nothing to export is still complete");
 }
@@ -714,6 +746,7 @@ on_every_backend!(
     a_session_leaves_its_events_and_no_secret,
     the_account_sees_only_its_own_activity,
     the_admin_list_is_for_admins_and_checks_its_parameters,
+    a_demoted_admin_sees_no_details_of_their_acts_on_others,
     the_export_streams_ndjson_and_ends_with_complete,
     a_database_error_in_the_middle_ends_the_stream_without_a_last_line,
     a_broken_log_fails_the_changes_and_not_the_abuse_protection,

@@ -150,7 +150,7 @@ retention_days = 365
 batches that never hold up a sign-in; **a server nobody uses keeps its expired events** until `prune` runs, so run it from cron
 or the task scheduler, for example daily. There is no background task.
 
-The log is append-only in the server's code, not enforced by the database (no triggers or roles: SQLite has none). Someone
+The log is append-only in the server's code, not enforced by the database (a design choice: the same code runs on SQLite and Postgres, and SQLite has no database roles; triggers exist but are not used). Someone
 who can write to the database can change it; keep the database file and Postgres user private.
 
 ## Upgrading

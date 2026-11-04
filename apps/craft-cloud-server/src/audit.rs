@@ -132,9 +132,11 @@ fn filters(params: &Params) -> Result<(Option<UserId>, Option<ActionFilter>), Ap
     Ok((user, action))
 }
 
-/// The event as the API shows it. `own`: an account whose own activity this is, which sees the device only of its own acts.
+/// The event as the API shows it. `own`: an account whose own activity this is, which sees the device only of its own acts, and
+/// the details of an event about another account (a former administrator's past act on someone else) not at all.
 fn wire(event: AuditEvent, own: Option<UserId>) -> craft_cloud_proto::api::AuditEvent {
     let device_visible = own.is_none_or(|own| event.actor_user == Some(own));
+    let about_another = own.is_some_and(|own| event.target_kind == "user" && event.target_id.is_some_and(|t| t != own.0));
     craft_cloud_proto::api::AuditEvent {
         id: event.id,
         at_ms: event.at_ms,
@@ -145,7 +147,7 @@ fn wire(event: AuditEvent, own: Option<UserId>) -> craft_cloud_proto::api::Audit
         target_id: event.target_id,
         outcome: event.outcome.as_str().to_owned(),
         // Written by this code from closed lists; a row that does not read as such shows no details rather than failing the page.
-        details: serde_json::from_str::<AuditDetails>(&event.details).unwrap_or_default(),
+        details: if about_another { AuditDetails::default() } else { serde_json::from_str::<AuditDetails>(&event.details).unwrap_or_default() },
         count: event.count,
     }
 }
@@ -276,10 +278,14 @@ async fn export_pages(mut fetch: Fetch<'_>, limits: AuditExportLimits, tx: mpsc:
     }
 }
 
-/// `GET /api/v1/admin/audit/export?user&action`: the log as NDJSON.
+/// `GET /api/v1/admin/audit/export?user&action&before_ms`: the log as NDJSON (`before_ms` also limits it, besides the fixed end).
 async fn admin_export(State(state): State<Shared>, params: Result<Query<Params>, QueryRejection>) -> Result<Response, ApiError> {
     let Query(params) = params?;
     let (user, action) = filters(&params)?;
+    if params.before_ms.is_some_and(|before| before < 0) {
+        return Err(ApiError::invalid("before_ms is a time in milliseconds"));
+    }
+    let before_ms = params.before_ms;
     let limits = state.audit_export;
     // The end of the log is fixed now: events that arrive while the export runs are not in it.
     let until_ms = state.now_ms();
@@ -287,7 +293,7 @@ async fn admin_export(State(state): State<Shared>, params: Result<Query<Params>,
     let reader = state.clone();
     let fetch: Fetch<'static> = Box::new(move |after, rows| {
         let meta = reader.meta.clone();
-        Box::pin(async move { meta.audit_list(&AuditQuery { user, action, before_ms: None, until_ms: Some(until_ms), after, limit: rows }).await })
+        Box::pin(async move { meta.audit_list(&AuditQuery { user, action, before_ms, until_ms: Some(until_ms), after, limit: rows }).await })
     });
     tokio::spawn(export_pages(fetch, limits, tx));
     let body = Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) }));

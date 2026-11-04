@@ -704,7 +704,7 @@ changes locally, then pushes local changes. These rules came out of the simulati
   - **Append-only, in the code.** `Meta` has no function that changes or deletes a row of `audit_events` except
     `audit_prune`, which deletes events older than the retention, and the counter of an aggregated row. A test reads the
     sources of `craft-cloud-meta` and allows exactly those two statements. **This deviates from a design with
-    database triggers and separate roles**: SQLite has neither, so the same code runs on both databases, and an operator
+    database triggers and separate roles**: it is a design choice so that the same code runs on both databases (SQLite has no database roles; triggers exist but are not used), and an operator
     with access to the database can still change the log. Protection against that is outside this server.
   - **Retention.** `[audit] retention_days` (1 to 3650, default 365, the section is optional). Old events are deleted by
     `audit prune` (`--dry-run` only counts) and by a write that finds the last complete pruning an hour or more past (kept
@@ -813,9 +813,9 @@ methods answer `not_found` / `invalid` (405) the same way:
 | `POST /admin/users/{id}/invite`, `DELETE …/invite` | (admin, confirmation) → `{code, join_url?, expires_ms}` / 204: an invite only for an account that has no password (`conflict` otherwise); the delete ends the account's invite or reset code (`not_found` when there is none) |
 | `POST /admin/users/{id}/password-reset` | (admin, confirmation) → `{code, join_url?, expires_ms}`: a one-hour reset code for a member (another admin's, or one's own: `forbidden` and `invalid`); redeemed at `POST /join` |
 | `GET /admin/users/{id}/devices`, `DELETE …/devices/{device_id}` | (admin; the delete with confirmation) → `{devices: [device as in GET /devices]}`, revoked ones too / 204 (`revoke_reason = admin`); another user's device or an unknown user is `not_found` |
-| `GET /account/activity?cursor&before_ms&limit` | the signed-in account's own security events, newest first: `{events: [event], next?}`; the events it acted in or was the target of, with the device shown only for its own acts. `limit` 1 to 100 (default 50, otherwise `invalid`); `cursor` is opaque and exclusive and wins over `before_ms`, which only limits the first page; a cursor this server did not make is `invalid` |
+| `GET /account/activity?cursor&before_ms&limit` | the signed-in account's own security events, newest first: `{events: [event], next?}`; the events it acted in or was the target of, with the device shown only for its own acts, and the details only of events about itself (not of what a former administrator once did to others). `limit` 1 to 100 (default 50, otherwise `invalid`); `cursor` is opaque and exclusive and wins over `before_ms`, which only limits the first page; a cursor this server did not make is `invalid` |
 | `GET /admin/audit?cursor&before_ms&limit&user&action` | (admin) the whole log in the same form (`limit` up to 200); `user` is an account ID (events it acted in or was the target of), `action` an event name or a group ending in a dot like `auth.`; anything else is `invalid` |
-| `GET /admin/audit/export?user&action` | (admin) the same filters as NDJSON (`application/x-ndjson`, always offered as `craft-cloud-audit.ndjson`), streamed: one event per line, newest first, then one last line, `{"complete":true,"exported":n}`, or `{"truncated":true,"exported":n}` when there were more events than the export holds (100,000). A stream that ends without either line broke off and is not a whole export |
+| `GET /admin/audit/export?user&action&before_ms` | (admin) the same filters (`before_ms` must not be negative) as NDJSON (`application/x-ndjson`, always offered as `craft-cloud-audit.ndjson`), streamed: one event per line, newest first, then one last line, `{"complete":true,"exported":n}`, or `{"truncated":true,"exported":n}` when there were more events than the export holds (100,000). A stream that ends without either line broke off and is not a whole export |
 
 **Client contract** (what the sync agent relies on):
 
