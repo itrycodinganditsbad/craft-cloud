@@ -44,6 +44,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             self.state.base.remove(&id);
         }
         self.state.sent_deletes.clear();
+        // Folders whose delete was in doubt were judged by the pull, which saw whether the server changed them.
+        self.state.sent_dir_deletes.clear();
         // Changed or new remote nodes, parents first.
         let mut work: Vec<(usize, NodeId)> =
             self.state.remote.keys().filter(|id| **id != root).filter_map(|id| Some((self.state.remote_path(*id)?.depth(), *id))).collect();
