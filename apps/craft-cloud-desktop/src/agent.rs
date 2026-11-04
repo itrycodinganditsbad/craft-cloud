@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use craft_cloud_app::{
-    AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser, AdminUserInfo,
-    AdminUserList, Client, DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingStatus, RecoveryCodes, RevokedOthers, Status,
+    AccountInfo, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser,
+    AdminUserInfo, AdminUserList, Client, DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingStatus, RecoveryCodes, RevokedOthers, Status,
     TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, UserQuery, Uuid,
 };
 
@@ -48,6 +48,7 @@ pub trait Agent: Send + Sync {
     fn change_password(&self, current: &str, new: &str) -> Result<(), Error>;
     fn revoke_other_devices(&self) -> Result<RevokedOthers, Error>;
     // The admin calls: each asks the server, which decides every one.
+    fn account(&self) -> Result<AccountInfo, Error>;
     fn admin_server(&self) -> Result<AdminServerInfo, Error>;
     fn admin_users(&self, query: &UserQuery) -> Result<AdminUserList, Error>;
     fn admin_devices(&self, user: Uuid) -> Result<AdminDevices, Error>;
@@ -59,6 +60,7 @@ pub trait Agent: Send + Sync {
     fn admin_issue_invite(&self, id: Uuid, confirm: &AdminConfirm) -> Result<AdminCode, Error>;
     fn admin_revoke_invite(&self, id: Uuid, confirm: &AdminConfirm) -> Result<(), Error>;
     fn admin_issue_reset(&self, id: Uuid, request: &AdminPasswordReset) -> Result<AdminCode, Error>;
+    fn admin_reset_two_factor(&self, id: Uuid, confirm: &AdminConfirm) -> Result<(), Error>;
     fn admin_revoke_device(&self, id: Uuid, device: DeviceId, confirm: &AdminConfirm) -> Result<(), Error>;
 }
 
@@ -160,6 +162,12 @@ impl Agent for ClientAgent {
     }
     fn revoke_other_devices(&self) -> Result<RevokedOthers, Error> {
         self.with(Client::revoke_other_devices)
+    }
+    fn account(&self) -> Result<AccountInfo, Error> {
+        self.with(Client::account)
+    }
+    fn admin_reset_two_factor(&self, id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
+        self.with(|c| c.admin_reset_two_factor(id, confirm))
     }
     fn admin_server(&self) -> Result<AdminServerInfo, Error> {
         self.with(Client::admin_server)
@@ -286,6 +294,7 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         Effect::Logout { local } => Event::SignedOut(agent.logout(local)),
         Effect::Pause => Event::Answered(agent.pause()),
         Effect::Resume => Event::Answered(agent.resume()),
+        Effect::Account { session } => Event::Admin(AdminEvent::Account { session, result: agent.account() }),
         Effect::AdminServer { session } => Event::Admin(AdminEvent::Server { session, result: agent.admin_server() }),
         Effect::AdminUsers { query, ticket } => Event::Admin(AdminEvent::Users { ticket, result: agent.admin_users(&query) }),
         Effect::AdminDevices { user, ticket } => {
@@ -313,14 +322,14 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
 /// Makes the change `action` names with the admin's `confirm`ation, blocking. This is the one place where the
 /// confirmation goes into a call's body (the create and change calls carry it in their own fields).
 fn change(agent: &dyn Agent, action: &Action, confirm: AdminConfirm) -> Result<Outcome, Error> {
-    let password = confirm.password.clone();
+    let AdminConfirm { password, totp_code, recovery_code } = confirm.clone();
     match action {
         Action::CreateUser { username, role } => {
-            let request = AdminCreateUser { username: username.clone(), role: role.as_str().to_owned(), password, ..AdminCreateUser::default() };
+            let request = AdminCreateUser { username: username.clone(), role: role.as_str().to_owned(), password, totp_code, recovery_code };
             agent.admin_create_user(&request).map(Outcome::Created)
         }
         Action::UpdateUser { id, role, quota, .. } => {
-            let request = AdminUpdateUser { role: role.map(|r| r.as_str().to_owned()), quota_bytes: *quota, password, ..AdminUpdateUser::default() };
+            let request = AdminUpdateUser { role: role.map(|r| r.as_str().to_owned()), quota_bytes: *quota, password, totp_code, recovery_code };
             agent.admin_update_user(*id, &request).map(Outcome::Updated)
         }
         Action::Disable { id, .. } => agent.admin_disable_user(*id, &confirm).map(|()| Outcome::Done),
@@ -328,10 +337,11 @@ fn change(agent: &dyn Agent, action: &Action, confirm: AdminConfirm) -> Result<O
         Action::Remove { id, .. } => agent.admin_remove_user(*id, &confirm).map(|()| Outcome::Done),
         Action::IssueInvite { id, .. } => agent.admin_issue_invite(*id, &confirm).map(Outcome::Code),
         Action::RevokeInvite { id, .. } => agent.admin_revoke_invite(*id, &confirm).map(|()| Outcome::Done),
-        Action::IssueReset { id, .. } => {
-            let request = AdminPasswordReset { password, ..AdminPasswordReset::default() };
+        Action::IssueReset { id, reset_two_factor, .. } => {
+            let request = AdminPasswordReset { password, totp_code, recovery_code, reset_two_factor: *reset_two_factor };
             agent.admin_issue_reset(*id, &request).map(Outcome::Code)
         }
+        Action::ResetTwoFactor { id, .. } => agent.admin_reset_two_factor(*id, &confirm).map(|()| Outcome::Done),
         Action::RevokeDevice { id, device, .. } => agent.admin_revoke_device(*id, *device, &confirm).map(|()| Outcome::Done),
     }
 }
@@ -375,6 +385,12 @@ pub(crate) mod fake {
         pub admin_fails: Mutex<Vec<Error>>,
         /// The password each admin change was sent with.
         pub passwords: Mutex<Vec<Option<String>>>,
+        /// The code (`totp_code`, `recovery_code`) each admin change was sent with.
+        pub factors: Mutex<Vec<(Option<String>, Option<String>)>>,
+        /// Whether the admin account has two-factor sign-in (what `account` says).
+        pub two_factor: AtomicBool,
+        /// The `reset_two_factor` flag of each password reset code asked for.
+        pub resets: Mutex<Vec<bool>>,
     }
 
     fn refused(code: &str, message: &str) -> Error {
@@ -393,6 +409,9 @@ pub(crate) mod fake {
                 users: Mutex::new(Vec::new()),
                 admin_fails: Mutex::new(Vec::new()),
                 passwords: Mutex::new(Vec::new()),
+                factors: Mutex::new(Vec::new()),
+                two_factor: AtomicBool::new(false),
+                resets: Mutex::new(Vec::new()),
             }
         }
 
@@ -435,8 +454,15 @@ pub(crate) mod fake {
         }
 
         /// An admin change: the password it was sent with is kept, and a failure set up is answered first.
-        fn admin_change<T>(&self, what: &str, password: Option<String>, ok: impl FnOnce() -> T) -> Result<T, Error> {
+        fn admin_change<T>(
+            &self,
+            what: &str,
+            password: Option<String>,
+            factor: (Option<String>, Option<String>),
+            ok: impl FnOnce() -> T,
+        ) -> Result<T, Error> {
             self.passwords.lock().unwrap().push(password);
+            self.factors.lock().unwrap().push(factor);
             self.admin_call(what, || ())?;
             if let Some(e) = self.admin_fails.lock().unwrap().pop() {
                 return Err(e);
@@ -576,6 +602,19 @@ pub(crate) mod fake {
             let revoked = std::mem::take(&mut f.other_computers);
             Ok(RevokedOthers { revoked })
         }
+        fn account(&self) -> Result<AccountInfo, Error> {
+            self.answer("account", |s| AccountInfo {
+                user_id: Uuid::nil(),
+                username: s.account.clone().unwrap_or_default(),
+                role: if self.admin.load(Ordering::SeqCst) { "admin" } else { "member" }.into(),
+                created_ms: 1_780_000_000_000,
+                password_changed_ms: None,
+                two_factor_enabled: self.two_factor.load(Ordering::SeqCst),
+            })
+        }
+        fn admin_reset_two_factor(&self, _id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
+            self.admin_change("admin_reset_two_factor", confirm.password.clone(), (confirm.totp_code.clone(), confirm.recovery_code.clone()), || ())
+        }
         fn admin_server(&self) -> Result<AdminServerInfo, Error> {
             self.admin_call("admin_server", || AdminServerInfo {
                 version: "0.1.0".into(),
@@ -618,17 +657,19 @@ pub(crate) mod fake {
             })
         }
         fn admin_create_user(&self, request: &AdminCreateUser) -> Result<AdminCreatedUser, Error> {
-            self.admin_change("admin_create_user", request.password.clone(), || AdminCreatedUser {
-                user: AdminUserInfo { role: request.role.clone(), invite_pending: true, ..sample_user(&request.username, Uuid::now_v7()) },
-                invite: AdminCode {
-                    code: "K7M4Q9TXK7M4Q9TX".into(),
-                    join_url: Some("cloud.shadows.ch/K7M4-Q9TX-K7M4-Q9TX".into()),
-                    expires_ms: 1_790_600_000_000,
-                },
+            self.admin_change("admin_create_user", request.password.clone(), (request.totp_code.clone(), request.recovery_code.clone()), || {
+                AdminCreatedUser {
+                    user: AdminUserInfo { role: request.role.clone(), invite_pending: true, ..sample_user(&request.username, Uuid::now_v7()) },
+                    invite: AdminCode {
+                        code: "K7M4Q9TXK7M4Q9TX".into(),
+                        join_url: Some("cloud.shadows.ch/K7M4-Q9TX-K7M4-Q9TX".into()),
+                        expires_ms: 1_790_600_000_000,
+                    },
+                }
             })
         }
         fn admin_update_user(&self, id: Uuid, request: &AdminUpdateUser) -> Result<AdminUserInfo, Error> {
-            self.admin_change("admin_update_user", request.password.clone(), || {
+            self.admin_change("admin_update_user", request.password.clone(), (request.totp_code.clone(), request.recovery_code.clone()), || {
                 let mut user = self.user(id);
                 if let Some(role) = &request.role {
                     user.role = role.clone();
@@ -640,33 +681,34 @@ pub(crate) mod fake {
             })
         }
         fn admin_disable_user(&self, _id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
-            self.admin_change("admin_disable_user", confirm.password.clone(), || ())
+            self.admin_change("admin_disable_user", confirm.password.clone(), (confirm.totp_code.clone(), confirm.recovery_code.clone()), || ())
         }
         fn admin_enable_user(&self, _id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
-            self.admin_change("admin_enable_user", confirm.password.clone(), || ())
+            self.admin_change("admin_enable_user", confirm.password.clone(), (confirm.totp_code.clone(), confirm.recovery_code.clone()), || ())
         }
         fn admin_remove_user(&self, _id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
-            self.admin_change("admin_remove_user", confirm.password.clone(), || ())
+            self.admin_change("admin_remove_user", confirm.password.clone(), (confirm.totp_code.clone(), confirm.recovery_code.clone()), || ())
         }
         fn admin_issue_invite(&self, _id: Uuid, confirm: &AdminConfirm) -> Result<AdminCode, Error> {
-            self.admin_change("admin_issue_invite", confirm.password.clone(), || AdminCode {
-                code: "ABCDEFGHJKMNPQRS".into(),
-                join_url: Some("cloud.shadows.ch/ABCD-EFGH-JKMN-PQRS".into()),
-                expires_ms: 1_790_600_000_000,
+            self.admin_change("admin_issue_invite", confirm.password.clone(), (confirm.totp_code.clone(), confirm.recovery_code.clone()), || {
+                AdminCode {
+                    code: "ABCDEFGHJKMNPQRS".into(),
+                    join_url: Some("cloud.shadows.ch/ABCD-EFGH-JKMN-PQRS".into()),
+                    expires_ms: 1_790_600_000_000,
+                }
             })
         }
         fn admin_revoke_invite(&self, _id: Uuid, confirm: &AdminConfirm) -> Result<(), Error> {
-            self.admin_change("admin_revoke_invite", confirm.password.clone(), || ())
+            self.admin_change("admin_revoke_invite", confirm.password.clone(), (confirm.totp_code.clone(), confirm.recovery_code.clone()), || ())
         }
         fn admin_issue_reset(&self, _id: Uuid, request: &AdminPasswordReset) -> Result<AdminCode, Error> {
-            self.admin_change("admin_issue_reset", request.password.clone(), || AdminCode {
-                code: "TUVWXYZ234567ABC".into(),
-                join_url: None,
-                expires_ms: 1_790_003_600_000,
+            self.resets.lock().unwrap().push(request.reset_two_factor);
+            self.admin_change("admin_issue_reset", request.password.clone(), (request.totp_code.clone(), request.recovery_code.clone()), || {
+                AdminCode { code: "TUVWXYZ234567ABC".into(), join_url: None, expires_ms: 1_790_003_600_000 }
             })
         }
         fn admin_revoke_device(&self, _id: Uuid, _device: DeviceId, confirm: &AdminConfirm) -> Result<(), Error> {
-            self.admin_change("admin_revoke_device", confirm.password.clone(), || ())
+            self.admin_change("admin_revoke_device", confirm.password.clone(), (confirm.totp_code.clone(), confirm.recovery_code.clone()), || ())
         }
     }
 

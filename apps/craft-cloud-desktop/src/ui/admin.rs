@@ -3,15 +3,15 @@
 
 use egui::RichText;
 
-use crate::admin::{
-    Access, Action, AdminEvent, AdminScreen, CodeKind, CreateForm, Dialog, RoleChoice, ShownCode, UserList, UserView, View, format_bytes,
-};
+use crate::admin::{Action, AdminEvent, AdminScreen, CodeKind, CreateForm, Dialog, RoleChoice, ShownCode, UserList, UserView, View, format_bytes};
 use craft_cloud_app::AdminUserInfo;
 
 use crate::model::Event;
 
 /// The name of the confirmation page's password field, for [`super::security::secret_id`] and the forgetting of its text.
 pub(super) const PASSWORD_FIELD: &str = "admin-password";
+/// The name of its field for a code (from the authenticator app, or a recovery code).
+pub(super) const CODE_FIELD: &str = "admin-code";
 
 pub(super) fn show(ui: &mut egui::Ui, admin: &mut AdminScreen, now_ms: i64, events: &mut Vec<Event>) {
     let me = admin.overview.status.account.clone().unwrap_or_default();
@@ -22,9 +22,9 @@ pub(super) fn show(ui: &mut egui::Ui, admin: &mut AdminScreen, now_ms: i64, even
     if let Some(dialog) = &mut admin.dialog {
         return confirmation(ui, dialog, events);
     }
-    let access = admin.overview.access.clone();
+    let server = admin.server.clone();
     match &mut admin.view {
-        View::List => users(ui, &access, &mut admin.list, &me, events),
+        View::List => users(ui, server.as_ref(), &mut admin.list, &me, events),
         View::Create(form) => create(ui, form, events),
         View::User(view) => {
             let user = admin.list.users.iter().find(|u| u.id == view.id).cloned();
@@ -59,12 +59,15 @@ fn describe(user: &AdminUserInfo) -> String {
     if user.invite_pending {
         parts.push("invite open".to_owned());
     }
+    if user.two_factor_enabled {
+        parts.push("two-factor on".to_owned());
+    }
     parts.join(" · ")
 }
 
-fn users(ui: &mut egui::Ui, access: &Access, list: &mut UserList, me: &str, events: &mut Vec<Event>) {
+fn users(ui: &mut egui::Ui, server: Option<&craft_cloud_app::AdminServerInfo>, list: &mut UserList, me: &str, events: &mut Vec<Event>) {
     super::heading(ui, "Administration");
-    if let Access::Admin(info) = access {
+    if let Some(info) = server {
         ui.label(
             RichText::new(format!(
                 "Craft Cloud server {} · {} accounts · {} computers · {} stored ({}, {})",
@@ -231,6 +234,12 @@ fn account(ui: &mut egui::Ui, view: &mut UserView, user: Option<&AdminUserInfo>,
         if !is_me && ui.button("Remove").clicked() {
             send(events, AdminEvent::Ask(Action::Remove { id, username: username.clone() }));
         }
+        if !is_me
+            && user.two_factor_enabled
+            && ui.button("Turn two-factor off").on_hover_text("They sign in with their password alone; their computers are signed out").clicked()
+        {
+            send(events, AdminEvent::Ask(Action::ResetTwoFactor { id, username: username.clone() }));
+        }
     });
     ui.add_space(12.0);
 
@@ -240,7 +249,12 @@ fn account(ui: &mut egui::Ui, view: &mut UserView, user: Option<&AdminUserInfo>,
             send(events, AdminEvent::Ask(Action::IssueInvite { id, username: username.clone() }));
         }
         if ui.button("Password reset code").on_hover_text("Good for an hour; using it signs all their computers out").clicked() {
-            send(events, AdminEvent::Ask(Action::IssueReset { id, username: username.clone() }));
+            send(events, AdminEvent::Ask(Action::IssueReset { id, username: username.clone(), reset_two_factor: false }));
+        }
+        if user.two_factor_enabled
+            && ui.button("Reset code, two-factor off").on_hover_text("As a reset code, and using it turns their two-factor sign-in off").clicked()
+        {
+            send(events, AdminEvent::Ask(Action::IssueReset { id, username: username.clone(), reset_two_factor: true }));
         }
         // Always offered: the list says an invite is open (`invite_pending`), but not a password reset code. The server
         // answers `not_found` when none is.
@@ -298,7 +312,20 @@ fn confirmation(ui: &mut egui::Ui, dialog: &mut Dialog, events: &mut Vec<Event>)
             .hint_text("your own current password")
             .desired_width(f32::INFINITY),
     );
-    let enter = entered(&field, ui);
+    let mut enter = entered(&field, ui);
+    if dialog.needs_code {
+        ui.add_space(6.0);
+        ui.label("Code from your authenticator app, or a recovery code");
+        let code = ui.add_enabled(
+            !dialog.busy,
+            egui::TextEdit::singleline(&mut dialog.confirmation.code)
+                .id(super::security::secret_id(CODE_FIELD))
+                .password(true)
+                .hint_text("123456")
+                .desired_width(f32::INFINITY),
+        );
+        enter |= entered(&code, ui);
+    }
     ui.add_space(10.0);
     if let Some(error) = &dialog.error {
         super::error_line(ui, error);

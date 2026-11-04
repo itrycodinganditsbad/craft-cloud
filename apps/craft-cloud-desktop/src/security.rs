@@ -168,7 +168,7 @@ pub fn is_code(text: &str) -> bool {
     digits.len() == 6 && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
-fn digits(text: &str) -> String {
+pub fn digits(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 

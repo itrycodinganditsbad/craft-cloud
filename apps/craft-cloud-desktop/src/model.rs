@@ -323,7 +323,11 @@ pub enum Effect {
     QuitApp,
     /// Write (`true`) or remove the app's own start-at-login entry.
     AppAutostart(bool),
-    /// The server's counters: also how the app finds out whether the account is an admin ([`AdminEvent::Server`]).
+    /// The signed-in account, as the server says it: how the app finds out whether it is an admin ([`AdminEvent::Account`]).
+    Account {
+        session: u64,
+    },
+    /// The server's counters, for the admin pages ([`AdminEvent::Server`]).
     AdminServer {
         session: u64,
     },
@@ -586,7 +590,7 @@ impl Model {
             Event::RefreshDevices => {
                 let Some(overview) = self.overview() else { return Vec::new() };
                 // An admin check that couldn't be made at sign-in is made again.
-                let again = (overview.access == Access::Unknown).then_some(Effect::AdminServer { session: overview.session });
+                let again = (overview.access == Access::Unknown).then_some(Effect::Account { session: overview.session });
                 std::iter::once(Effect::Devices).chain(again).collect()
             }
             Event::Admin(event) => self.admin(event),
@@ -708,7 +712,7 @@ impl Model {
                     self.screen = Screen::SignedIn(overview);
                     effects.push(Effect::Devices);
                     // Whether the account is an admin, for the admin pages.
-                    effects.push(Effect::AdminServer { session });
+                    effects.push(Effect::Account { session });
                 }
             }
             return effects;
@@ -833,7 +837,7 @@ impl Model {
                 let mut effects = self.status_came(status);
                 // Start at login: the agent's entry (the app's follows it).
                 effects.extend([Effect::SetAutostart(true), Effect::Devices]);
-                effects.extend(self.overview().map(|o| Effect::AdminServer { session: o.session }));
+                effects.extend(self.overview().map(|o| Effect::Account { session: o.session }));
                 return effects;
             }
             Err(e) => e,
@@ -1469,7 +1473,7 @@ pub(crate) mod tests {
         m.update(Event::Start);
         assert_eq!(
             m.update(Event::Found(Ok(on.clone()))),
-            vec![Effect::AppAutostart(true), Effect::Devices, Effect::AdminServer { session: m.overview().unwrap().session }]
+            vec![Effect::AppAutostart(true), Effect::Devices, Effect::Account { session: m.overview().unwrap().session }]
         );
         assert!(m.update(Event::Polled(Ok(on.clone()))).is_empty());
         assert_eq!(m.update(Event::Polled(Ok(Status { autostart: Some(false), ..on }))), vec![Effect::AppAutostart(false)]);

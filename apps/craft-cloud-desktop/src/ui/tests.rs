@@ -490,7 +490,7 @@ fn admin_buttons_send_their_events() {
 
     // A code shown: Done forgets it.
     let mut model = on_admin_pages(&agent, Vec::new());
-    model.update(Event::Admin(AdminEvent::Ask(Action::IssueReset { id: ana, username: "ana".into() })));
+    model.update(Event::Admin(AdminEvent::Ask(Action::IssueReset { id: ana, username: "ana".into(), reset_two_factor: false })));
     password_typed(&mut model, "pw");
     confirm_sent(&mut model, &agent);
     let mut h = harness(model, egui::Theme::Light);
@@ -567,4 +567,75 @@ fn a_typed_password_is_not_left_in_eguis_undo_history() {
     h.state_mut().0.update(Event::Admin(AdminEvent::Close));
     h.run_steps(2);
     assert!(!remembered(&h), "once the pages are left");
+}
+
+/// The same for the confirmation's code field (a code from the app, or a recovery code), beside the password's: both are
+/// forgotten once the confirmation was sent, cancelled or left, so Undo can't bring either back into a field opened later.
+#[test]
+fn a_typed_code_is_not_left_in_eguis_undo_history() {
+    use egui::accesskit::Role;
+    use egui::text_edit::TextEditState;
+
+    let agent = admin_agent();
+    agent.two_factor.store(true, std::sync::atomic::Ordering::SeqCst);
+    let model = on_admin_pages(&agent, Vec::new());
+    assert!(matches!(model.overview().unwrap().access, crate::admin::Access::Admin { two_factor: true }));
+    let ana = id_of(&model, "ana");
+    let ids = [super::security::secret_id(super::admin::PASSWORD_FIELD), super::security::secret_id(super::admin::CODE_FIELD)];
+    let ask = |h: &mut Harness<'static, (Model, Vec<Event>)>| {
+        h.state_mut().0.update(Event::Admin(AdminEvent::Ask(Action::Disable { id: ana, username: "ana".into() })));
+        h.run_steps(3);
+    };
+    let remembered = |h: &Harness<'static, (Model, Vec<Event>)>, which: usize| {
+        TextEditState::load(&h.ctx, ids[which])
+            .is_some_and(|state| state.undoer().undo(&(egui::text::CCursorRange::default(), String::new())).is_some())
+    };
+    let typed = |h: &Harness<'static, (Model, Vec<Event>)>| {
+        let c = &h.state().0.admin_screen().unwrap().dialog.as_ref().unwrap().confirmation;
+        (c.password.clone(), c.code.clone())
+    };
+    let undo = |h: &mut Harness<'static, (Model, Vec<Event>)>, which: usize| {
+        h.get_all_by_role(Role::PasswordInput).nth(which).unwrap().focus();
+        h.run_steps(2);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        h.run_steps(3);
+    };
+
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    ask(&mut h);
+    assert_eq!(h.query_all_by_role(Role::PasswordInput).count(), 2, "a password field and a code field");
+    h.get_all_by_role(Role::PasswordInput).next().unwrap().focus();
+    h.get_all_by_role(Role::PasswordInput).next().unwrap().type_text("hunter2-secret");
+    h.run_steps(2);
+    h.get_all_by_role(Role::PasswordInput).nth(1).unwrap().focus();
+    h.get_all_by_role(Role::PasswordInput).nth(1).unwrap().type_text("918273");
+    h.run_steps(8);
+    assert_eq!(typed(&h), ("hunter2-secret".to_owned(), "918273".to_owned()));
+    assert!(TextEditState::load(&h.ctx, ids[0]).is_some() && remembered(&h, 1), "while they are typed, egui has their state");
+
+    // Sent and refused (a wrong code): both fields are empty and egui has forgotten both texts; Undo brings nothing back.
+    let effects = h.state_mut().0.update(Event::Admin(AdminEvent::Confirm));
+    assert!(matches!(effects.as_slice(), [Effect::AdminDo { .. }]));
+    h.run_steps(2);
+    assert!(!remembered(&h, 0) && !remembered(&h, 1), "once sent");
+    let refused = craft_cloud_app::Error::Refused { code: "two_factor_invalid".into(), message: "no".into() };
+    h.state_mut().0.update(Event::Admin(AdminEvent::Done(Err(refused))));
+    h.run_steps(3);
+    for which in [0, 1] {
+        undo(&mut h, which);
+        assert_eq!(typed(&h), (String::new(), String::new()), "Undo of field {which} brings nothing back");
+    }
+
+    // Typed again and cancelled: forgotten; the same change asked for again: nothing comes back.
+    h.get_all_by_role(Role::PasswordInput).nth(1).unwrap().focus();
+    h.get_all_by_role(Role::PasswordInput).nth(1).unwrap().type_text("ABCD-EFGH-JKMN-PQRS");
+    h.run_steps(8);
+    assert!(remembered(&h, 1));
+    h.state_mut().0.update(Event::Admin(AdminEvent::CancelDialog));
+    h.run_steps(2);
+    assert!(!remembered(&h, 1), "once cancelled");
+    ask(&mut h);
+    undo(&mut h, 1);
+    assert_eq!(typed(&h).1, "");
 }

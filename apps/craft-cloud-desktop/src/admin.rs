@@ -14,10 +14,13 @@
 //! - **A code is shown once** ([`ShownCode`]): an invite or a reset code is kept in the model only until the admin
 //!   dismisses it (or leaves the pages), never written anywhere, and left out of `Debug` output.
 
-use craft_cloud_app::{AdminCode, AdminCreatedUser, AdminServerInfo, AdminUserInfo, AdminUserList, DeviceId, DeviceInfo, Error, UserQuery, Uuid};
+use craft_cloud_app::{
+    AccountInfo, AdminCode, AdminCreatedUser, AdminServerInfo, AdminUserInfo, AdminUserList, DeviceId, DeviceInfo, Error, UserQuery, Uuid,
+};
 use craft_cloud_proto::api::{AdminConfirm, codes};
 
 use crate::model::{Effect, Event, Model, Overview, Screen};
+use crate::security::{digits, explain, is_code};
 
 /// A number no earlier call of the admin pages had, for matching an answer to its call: the numbers never restart, so an
 /// answer that comes late (after the pages were left and opened again, or the account signed out and in) matches
@@ -33,16 +36,17 @@ pub const PAGE_SIZE: u32 = 20;
 pub const MAX_QUOTA_GIB: f64 = 1_048_576.0;
 const GIB: f64 = 1_073_741_824.0;
 
-/// Whether the signed-in account is an admin, as the server answered the admin counters.
+/// Whether the signed-in account is an admin, as the server describes the account (`GET /account`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Access {
     /// Not asked yet, or the server couldn't be reached: no admin pages.
     #[default]
     Unknown,
-    /// The server refused the admin calls (`forbidden`).
+    /// The account is a member (or the server refused the admin calls as `forbidden`).
     Member,
-    /// The server answered: the admin pages are offered, with these counters.
-    Admin(AdminServerInfo),
+    /// The server says the account is an admin: the admin pages are offered. `two_factor`: whether the account has two-factor
+    /// sign-in, so that its confirmations ask for a code too.
+    Admin { two_factor: bool },
 }
 
 /// An account's role.
@@ -75,27 +79,40 @@ impl RoleChoice {
     }
 }
 
-/// The admin's confirmation of a change: today their current password. Its `Debug` output hides it.
+/// The admin's confirmation of a change: their current password and, when their account has two-factor sign-in, a code from
+/// the authenticator app or a recovery code (one field: six digits are a code, anything else a recovery code, as on the Security
+/// page). Its `Debug` output hides both.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Confirmation {
     pub password: String,
+    pub code: String,
 }
 
 impl std::fmt::Debug for Confirmation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Confirmation").field("password", &"<redacted>").finish()
+        f.debug_struct("Confirmation").field("password", &"<redacted>").field("code", &"<redacted>").finish()
     }
 }
 
 impl Confirmation {
-    /// Whether enough was typed to send.
-    pub fn ready(&self) -> bool {
-        !self.password.is_empty()
+    /// Whether enough was typed to send: the password, and the code where the page asks for one.
+    pub fn ready(&self, needs_code: bool) -> bool {
+        !self.password.is_empty() && (!needs_code || !self.code.trim().is_empty())
     }
 
-    /// The confirmation as the calls send it, with what was typed cleared from here.
+    /// The confirmation as the calls send it, with everything typed cleared from here.
     pub fn take(&mut self) -> AdminConfirm {
-        AdminConfirm { password: Some(std::mem::take(&mut self.password)), ..AdminConfirm::default() }
+        let password = std::mem::take(&mut self.password);
+        let code = std::mem::take(&mut self.code);
+        let code = code.trim();
+        let (totp_code, recovery_code) = if code.is_empty() {
+            (None, None)
+        } else if is_code(code) {
+            (Some(digits(code)), None)
+        } else {
+            (None, Some(code.to_owned()))
+        };
+        AdminConfirm { password: Some(password), totp_code, recovery_code }
     }
 }
 
@@ -133,7 +150,14 @@ pub enum Action {
         id: Uuid,
         username: String,
     },
+    /// A password reset code; `reset_two_factor`: redeeming it also turns the account's two-factor sign-in off.
     IssueReset {
+        id: Uuid,
+        username: String,
+        reset_two_factor: bool,
+    },
+    /// Takes the account's two-factor sign-in away and signs its computers out.
+    ResetTwoFactor {
         id: Uuid,
         username: String,
     },
@@ -157,6 +181,7 @@ impl Action {
             Self::IssueInvite { username, .. } => format!("New invite for {username}"),
             Self::RevokeInvite { username, .. } => format!("Revoke the invite of {username}"),
             Self::IssueReset { username, .. } => format!("Password reset code for {username}"),
+            Self::ResetTwoFactor { username, .. } => format!("Turn two-factor sign-in off for {username}"),
             Self::RevokeDevice { username, device_name, .. } => format!("Sign {device_name} of {username} out"),
         }
     }
@@ -184,8 +209,15 @@ impl Action {
             Self::Remove { .. } => "The account is marked for removal and its computers are signed out. Nothing it stored is deleted.".into(),
             Self::IssueInvite { .. } => "A new invite code for an account that has no password yet, shown once. It replaces the open one.".into(),
             Self::RevokeInvite { .. } => "The account's open invite or password reset code stops working.".into(),
-            Self::IssueReset { .. } => {
-                "A code good for an hour that sets a new password. Using it signs every computer of the account out. Shown once.".into()
+            Self::IssueReset { reset_two_factor, .. } => {
+                let mut text = "A code good for an hour that sets a new password. Using it signs every computer of the account out. Shown once.".to_owned();
+                if *reset_two_factor {
+                    text.push_str(" Using it also turns the account's two-factor sign-in off.");
+                }
+                text
+            }
+            Self::ResetTwoFactor { .. } => {
+                "The account no longer asks for a code at sign-in, and every computer of it is signed out. It can turn it on again on its Security page.".into()
             }
             Self::RevokeDevice { .. } => "That computer can't sync any more; its files stay there.".into(),
         }
@@ -202,6 +234,7 @@ impl Action {
             Self::IssueInvite { .. } => "Make an invite",
             Self::RevokeInvite { .. } => "Revoke",
             Self::IssueReset { .. } => "Make a reset code",
+            Self::ResetTwoFactor { .. } => "Turn two-factor off",
             Self::RevokeDevice { .. } => "Sign out",
         }
     }
@@ -221,6 +254,8 @@ pub enum Outcome {
 pub struct Dialog {
     pub action: Action,
     pub confirmation: Confirmation,
+    /// Whether the page asks for a code too (the admin's account has two-factor sign-in, or the server said so).
+    pub needs_code: bool,
     /// What went wrong with the last try, for people.
     pub error: Option<String>,
     /// The call is with the server: nothing can be sent twice.
@@ -375,6 +410,8 @@ pub struct AdminScreen {
     /// The signed-in view the pages came from and go back to.
     pub overview: Overview,
     pub list: UserList,
+    /// The server's counters, once they came.
+    pub server: Option<AdminServerInfo>,
     pub view: View,
     /// A change waiting for the admin's password.
     pub dialog: Option<Dialog>,
@@ -385,7 +422,12 @@ pub struct AdminScreen {
 /// What happened on the admin pages: clicks and the answers of the admin calls.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AdminEvent {
-    /// [`Effect::AdminServer`]'s answer.
+    /// [`Effect::Account`]'s answer: the role of the signed-in account.
+    Account {
+        session: u64,
+        result: Result<AccountInfo, Error>,
+    },
+    /// [`Effect::AdminServer`]'s answer: the counters.
     Server {
         session: u64,
         result: Result<AdminServerInfo, Error>,
@@ -443,12 +485,12 @@ impl Model {
 
     /// Whether the admin pages are offered: the server said the signed-in account is an admin.
     pub fn is_admin(&self) -> bool {
-        self.overview().is_some_and(|o| matches!(o.access, Access::Admin(_)))
+        self.overview().is_some_and(|o| matches!(o.access, Access::Admin { .. }))
     }
 
     pub(crate) fn admin(&mut self, event: AdminEvent) -> Vec<Effect> {
         match event {
-            AdminEvent::Server { session, result } => self.admin_probed(session, result),
+            AdminEvent::Account { session, result } => self.admin_probed(session, result),
             AdminEvent::Open => self.open_admin(),
             AdminEvent::Close => {
                 self.leave_admin();
@@ -461,16 +503,17 @@ impl Model {
         }
     }
 
-    /// The counters came (an admin), or the server said no (a member).
-    fn admin_probed(&mut self, session: u64, result: Result<AdminServerInfo, Error>) -> Vec<Effect> {
+    /// The account came (an admin or not), or its role can't be told.
+    fn admin_probed(&mut self, session: u64, result: Result<AccountInfo, Error>) -> Vec<Effect> {
         // An answer for an earlier sign-in (another account, maybe) says nothing about this one.
         if self.overview().map(|o| o.session) != Some(session) {
             return Vec::new();
         }
         let access = match result {
-            Ok(info) => Access::Admin(info),
+            Ok(account) if account.role == "admin" => Access::Admin { two_factor: account.two_factor_enabled },
+            Ok(_) => Access::Member,
             Err(Error::Refused { code, .. }) if code == codes::FORBIDDEN => Access::Member,
-            // Unreachable, or a server that doesn't know the admin calls: asked again at the next sign-in or refresh.
+            // Unreachable, or an agent or server that doesn't know the call: asked again at the next sign-in or refresh.
             Err(_) => return Vec::new(),
         };
         if let Some(overview) = self.overview_mut() {
@@ -484,10 +527,10 @@ impl Model {
 
     fn open_admin(&mut self) -> Vec<Effect> {
         let Screen::SignedIn(overview) = &self.screen else { return Vec::new() };
-        if !matches!(overview.access, Access::Admin(_)) {
+        if !matches!(overview.access, Access::Admin { .. }) {
             return Vec::new();
         }
-        let mut admin = AdminScreen { overview: overview.clone(), list: UserList::new(), view: View::List, dialog: None, code: None };
+        let mut admin = AdminScreen { overview: overview.clone(), list: UserList::new(), server: None, view: View::List, dialog: None, code: None };
         let effects = vec![admin.list.load(), Effect::AdminServer { session: admin.overview.session }];
         self.screen = Screen::Admin(Box::new(admin));
         effects
@@ -504,7 +547,21 @@ impl Model {
 impl AdminScreen {
     fn update(&mut self, event: AdminEvent) -> Vec<Effect> {
         match event {
-            AdminEvent::Server { .. } | AdminEvent::Open | AdminEvent::Close => Vec::new(),
+            AdminEvent::Account { .. } | AdminEvent::Open | AdminEvent::Close => Vec::new(),
+            AdminEvent::Server { session, result } => {
+                if session != self.overview.session {
+                    return Vec::new();
+                }
+                match result {
+                    Ok(info) => {
+                        self.server = Some(info);
+                        Vec::new()
+                    }
+                    // Not an admin any more, or not told: the account is looked at again.
+                    Err(e) if is_forbidden(&e) => vec![Effect::Account { session: self.overview.session }],
+                    Err(_) => Vec::new(),
+                }
+            }
             AdminEvent::Users { ticket, result } => self.users_came(ticket, result),
             AdminEvent::Devices { user, ticket, result } => {
                 let mut effects = Vec::new();
@@ -520,7 +577,7 @@ impl AdminScreen {
                         Err(e) => {
                             view.devices_error = Some(error_text(&e));
                             if is_forbidden(&e) {
-                                effects.push(Effect::AdminServer { session: self.overview.session });
+                                effects.push(Effect::Account { session: self.overview.session });
                             }
                         }
                     }
@@ -591,7 +648,7 @@ impl AdminScreen {
             }
             AdminEvent::Ask(action) => {
                 if self.dialog.is_none() {
-                    self.dialog = Some(Dialog { action, confirmation: Confirmation::default(), error: None, busy: false });
+                    self.dialog = Some(self.dialog(action));
                 }
                 Vec::new()
             }
@@ -631,7 +688,7 @@ impl AdminScreen {
             }
             Err(e) => {
                 self.list.error = Some(error_text(&e));
-                if is_forbidden(&e) { vec![Effect::AdminServer { session: self.overview.session }] } else { Vec::new() }
+                if is_forbidden(&e) { vec![Effect::Account { session: self.overview.session }] } else { Vec::new() }
             }
         }
     }
@@ -648,7 +705,7 @@ impl AdminScreen {
         }
         form.error = None;
         let action = Action::CreateUser { username, role: form.role };
-        self.dialog = Some(Dialog { action, confirmation: Confirmation::default(), error: None, busy: false });
+        self.dialog = Some(self.dialog(action));
         Vec::new()
     }
 
@@ -680,7 +737,7 @@ impl AdminScreen {
         }
         view.error = None;
         let action = Action::UpdateUser { id: view.id, username: view.username.clone(), role, quota };
-        self.dialog = Some(Dialog { action, confirmation: Confirmation::default(), error: None, busy: false });
+        self.dialog = Some(self.dialog(action));
     }
 
     fn confirm(&mut self) -> Vec<Effect> {
@@ -688,8 +745,12 @@ impl AdminScreen {
         if dialog.busy {
             return Vec::new();
         }
-        if !dialog.confirmation.ready() {
+        if dialog.confirmation.password.is_empty() {
             dialog.error = Some(NEEDS_PASSWORD.to_owned());
+            return Vec::new();
+        }
+        if !dialog.confirmation.ready(dialog.needs_code) {
+            dialog.error = Some(NEEDS_CODE.to_owned());
             return Vec::new();
         }
         dialog.error = None;
@@ -709,13 +770,17 @@ impl AdminScreen {
             Err(e) => {
                 dialog.busy = false;
                 dialog.confirmation = Confirmation::default();
+                // The server wants a code: ask for it (the account's two-factor state may have changed since sign-in).
+                if e.code() == Some(codes::TWO_FACTOR_INVALID) {
+                    dialog.needs_code = true;
+                }
                 dialog.error = Some(match (&dialog.action, &e) {
                     (Action::RevokeInvite { .. }, Error::Refused { code, .. }) if code == codes::NOT_FOUND => NO_OPEN_CODE.to_owned(),
                     _ => error_text(&e),
                 });
                 let none_open = matches!(&dialog.action, Action::RevokeInvite { .. }) && dialog.error.as_deref() == Some(NO_OPEN_CODE);
                 return if is_forbidden(&e) {
-                    vec![Effect::AdminServer { session: self.overview.session }]
+                    vec![Effect::Account { session: self.overview.session }]
                 } else if none_open {
                     // The list said an invite was open, or didn't say: look again.
                     vec![self.list.load()]
@@ -763,6 +828,12 @@ impl AdminScreen {
         effects
     }
 
+    /// A page for the confirmation of `action`: it asks for a code too when the account has two-factor sign-in.
+    fn dialog(&self, action: Action) -> Dialog {
+        let needs_code = matches!(self.overview.access, Access::Admin { two_factor: true });
+        Dialog { action, confirmation: Confirmation::default(), needs_code, error: None, busy: false }
+    }
+
     fn show_code(&mut self, username: &str, kind: CodeKind, code: AdminCode) {
         self.code = Some(ShownCode { username: username.to_owned(), kind, code: code.code, join_url: code.join_url, expires_ms: code.expires_ms });
     }
@@ -770,6 +841,8 @@ impl AdminScreen {
 
 /// The words when a revoke finds no invite or reset code open (the server's `not_found`).
 pub const NO_OPEN_CODE: &str = "This account has no open invite or password reset code.";
+/// The words the confirmation page says when the code is missing.
+pub const NEEDS_CODE: &str = "Type the code from your authenticator app (or a recovery code) to confirm";
 /// The words the confirmation page says when no password was typed.
 pub const NEEDS_PASSWORD: &str = "Type your own password to confirm";
 /// The words when a new account's name breaks the server's rules.
@@ -784,30 +857,21 @@ fn is_forbidden(e: &Error) -> bool {
     matches!(e, Error::Refused { code, .. } if code == codes::FORBIDDEN)
 }
 
-/// An admin call's error, for people: the server's refusals the admin can act on in plain words.
+/// An admin call's error, for people: the server's refusals the admin can act on in plain words (a wrong password, a wrong or
+/// locked second factor and a rate limit as the Security page says them).
 pub fn error_text(e: &Error) -> String {
-    match e {
-        Error::Refused { code, message } => match code.as_str() {
-            codes::WRONG_PASSWORD => "That password is wrong. Type your own current password.".to_owned(),
-            codes::LAST_ADMIN => "That would leave the server without an enabled admin. Make another account an admin first.".to_owned(),
-            codes::ACCOUNT_DISABLED => "Your account is disabled, so the server refuses this.".to_owned(),
-            codes::FORBIDDEN => format!("The server doesn't allow this: {}", lower_first(message)),
-            _ => message.clone(),
+    match e.code() {
+        Some(codes::WRONG_PASSWORD | codes::TWO_FACTOR_INVALID | codes::TWO_FACTOR_LOCKED | codes::RATE_LIMITED) => explain(e),
+        Some(codes::LAST_ADMIN) => "That would leave the server without an enabled admin. Make another account an admin first.".to_owned(),
+        Some(codes::ACCOUNT_DISABLED) => "Your account is disabled, so the server refuses this.".to_owned(),
+        Some(codes::FORBIDDEN) => match e {
+            Error::Refused { message, .. } | Error::RefusedWith { message, .. } => format!("The server doesn't allow this: {}", lower_first(message)),
+            other => other.to_string(),
         },
-        Error::RefusedWith { code, message, retry_after_secs: Some(secs), .. } if code == codes::RATE_LIMITED => {
-            format!("Too many tries. Wait {} and try again. {}", wait(*secs), sentence(message))
-        }
-        Error::RefusedWith { message, .. } => message.clone(),
-        other => other.to_string(),
-    }
-}
-
-/// "30 seconds", "2 minutes".
-fn wait(secs: u64) -> String {
-    match secs {
-        0..=1 => "a second".to_owned(),
-        2..=119 => format!("{secs} seconds"),
-        _ => format!("{} minutes", secs.div_ceil(60)),
+        _ => match e {
+            Error::Refused { message, .. } | Error::RefusedWith { message, .. } => message.clone(),
+            other => other.to_string(),
+        },
     }
 }
 
@@ -955,25 +1019,30 @@ mod tests {
         assert!(!model.is_admin());
         assert!(model.update(Event::Admin(AdminEvent::Open)).is_empty());
         assert!(matches!(model.screen, Screen::SignedIn(_)));
-        assert_eq!(member.asked.lock().unwrap().iter().filter(|a| *a == "admin_server").count(), 1);
+        assert_eq!(member.asked.lock().unwrap().iter().filter(|a| *a == "account").count(), 1);
 
         let boss = agent(true, 3);
         let mut model = signed_in(&boss);
         assert!(model.is_admin());
-        let Access::Admin(info) = &model.overview().unwrap().access else { panic!("{:?}", model.screen) };
-        assert_eq!((info.users, info.storage_kind.as_str()), (4, "disk"));
+        assert_eq!(model.overview().unwrap().access, Access::Admin { two_factor: false });
         let effects = model.update(Event::Admin(AdminEvent::Open));
         assert!(matches!(effects.as_slice(), [Effect::AdminUsers { .. }, Effect::AdminServer { .. }]), "{effects:?}");
         assert!(model.admin_screen().is_some());
+        // The counters come with the pages, not with the sign-in.
+        assert!(model.admin_screen().unwrap().server.is_none());
+        let mut model = on_the_pages(&boss);
+        let info = model.admin_screen().unwrap().server.clone().expect("the counters");
+        assert_eq!((info.users, info.storage_kind.as_str()), (4, "disk"));
+        let _ = &mut model;
 
         // A server that can't be reached says nothing about the role: no pages, asked again at the next refresh.
         let mut model = Model::new(JoinDefaults::default(), true, String::new());
         model.update(Event::Start);
         model.update(Event::Found(Ok(status(true))));
         let session = model.overview().unwrap().session;
-        model.update(Event::Admin(AdminEvent::Server { session, result: Err(Error::Io("reset".into())) }));
+        model.update(Event::Admin(AdminEvent::Account { session, result: Err(Error::Io("reset".into())) }));
         assert_eq!(model.overview().unwrap().access, Access::Unknown);
-        assert!(model.update(Event::RefreshDevices).contains(&Effect::AdminServer { session }));
+        assert!(model.update(Event::RefreshDevices).contains(&Effect::Account { session }));
     }
 
     /// An admin who is demoted meanwhile: the server's `forbidden` is checked against the counters, and the pages close.
@@ -1076,7 +1145,7 @@ mod tests {
         run(&mut model, &boss, ev(AdminEvent::Confirm));
         let dialog = admin(&model).dialog.as_ref().unwrap();
         assert!(!dialog.busy && dialog.confirmation.password.is_empty());
-        assert_eq!(dialog.error.as_deref(), Some("That password is wrong. Type your own current password."));
+        assert_eq!(dialog.error.as_deref(), Some("That password isn't right."));
         type_password(&mut model, "my-password");
         run(&mut model, &boss, ev(AdminEvent::Confirm));
         assert!(admin(&model).dialog.is_none());
@@ -1095,14 +1164,14 @@ mod tests {
             retry_after_secs: Some(90),
         };
         let text = error_text(&slow);
-        assert!(text.contains("Wait 90 seconds") && text.contains("Too many wrong passwords"), "{text}");
+        assert!(text.contains("Too many tries") && text.contains("90 seconds"), "{text}");
         let busy = Error::RefusedWith {
             code: codes::RATE_LIMITED.into(),
             message: "the server is busy".into(),
             two_factor: None,
             retry_after_secs: Some(600),
         };
-        assert!(error_text(&busy).contains("Wait 10 minutes"));
+        assert!(error_text(&busy).contains("10 minutes"));
         assert_eq!(error_text(&refused("invalid", "role is admin or member")), "role is admin or member");
         assert!(error_text(&Error::NotRunning("x".into())).contains("isn't running"));
 
@@ -1131,7 +1200,7 @@ mod tests {
         let effects = model.update(Event::Admin(AdminEvent::Confirm));
         let start: Starter = Arc::new(|_: &dyn crate::agent::Agent| Err(String::new()));
         let answer = call(&boss, &start, effects.into_iter().next().unwrap()).unwrap();
-        assert_eq!(model.update(answer), vec![Effect::AdminServer { session: model.overview().unwrap().session }]);
+        assert_eq!(model.update(answer), vec![Effect::Account { session: model.overview().unwrap().session }]);
         assert!(admin(&model).dialog.as_ref().unwrap().error.as_deref().is_some_and(|e| e.starts_with("The server doesn't allow this")));
         assert!(model.admin_screen().is_some(), "still an admin: the pages stay");
     }
@@ -1235,7 +1304,7 @@ mod tests {
         run(&mut model, &boss, ev(AdminEvent::OpenUser(ana.id)));
         for (action, kind, code) in [
             (Action::IssueInvite { id: ana.id, username: "user01".into() }, CodeKind::Invite, "ABCDEFGHJKMNPQRS"),
-            (Action::IssueReset { id: ana.id, username: "user01".into() }, CodeKind::PasswordReset, "TUVWXYZ234567ABC"),
+            (Action::IssueReset { id: ana.id, username: "user01".into(), reset_two_factor: false }, CodeKind::PasswordReset, "TUVWXYZ234567ABC"),
         ] {
             run(&mut model, &boss, ev(AdminEvent::Ask(action)));
             type_password(&mut model, "pw");
@@ -1289,8 +1358,9 @@ mod tests {
 
     #[test]
     fn nothing_secret_is_in_debug_output() {
-        let confirmation = Confirmation { password: "admin-secret-pw".into() };
-        assert!(!format!("{confirmation:?}").contains("admin-secret-pw"));
+        let confirmation = Confirmation { password: "admin-secret-pw".into(), code: "918273".into() };
+        let shown = format!("{confirmation:?}");
+        assert!(!shown.contains("admin-secret-pw") && !shown.contains("918273"), "{shown}");
         let code = ShownCode {
             username: "ana".into(),
             kind: CodeKind::Invite,
@@ -1302,15 +1372,14 @@ mod tests {
         assert!(!shown.contains("ABCDEFGH") && !shown.contains("c.example"), "{shown}");
     }
 
-    fn server_info() -> AdminServerInfo {
-        AdminServerInfo {
-            version: "0.1.0".into(),
-            users: 2,
-            devices_active: 1,
-            stored_bytes: 0,
-            live_bytes: 0,
-            storage_kind: "disk".into(),
-            database_kind: "sqlite".into(),
+    fn account(role: &str) -> AccountInfo {
+        AccountInfo {
+            user_id: Uuid::nil(),
+            username: "fabio".into(),
+            role: role.into(),
+            created_ms: 1,
+            password_changed_ms: None,
+            two_factor_enabled: false,
         }
     }
 
@@ -1349,23 +1418,23 @@ mod tests {
         let mut model = Model::new(JoinDefaults::default(), true, String::new());
         model.update(Event::Start);
         let probe = |effects: &[Effect]| {
-            effects.iter().find_map(|e| if let Effect::AdminServer { session } = e { Some(*session) } else { None }).expect("an admin check")
+            effects.iter().find_map(|e| if let Effect::Account { session } = e { Some(*session) } else { None }).expect("an admin check")
         };
         let first = probe(&model.update(Event::Found(Ok(status(true)))));
         model.update(Event::SignedOut(Ok(status(false))));
         let second = probe(&model.update(Event::Polled(Ok(status(true)))));
         assert_ne!(first, second);
         // The first account was an admin; its late answer doesn't make this one an admin.
-        model.update(Event::Admin(AdminEvent::Server { session: first, result: Ok(server_info()) }));
+        model.update(Event::Admin(AdminEvent::Account { session: first, result: Ok(account("admin")) }));
         assert_eq!(model.overview().unwrap().access, Access::Unknown);
         assert!(!model.is_admin());
-        model.update(Event::Admin(AdminEvent::Server { session: second, result: Err(refused(codes::FORBIDDEN, "no")) }));
+        model.update(Event::Admin(AdminEvent::Account { session: second, result: Ok(account("member")) }));
         assert_eq!(model.overview().unwrap().access, Access::Member);
         // And a late "member" answer doesn't take an admin's pages away.
-        model.update(Event::Admin(AdminEvent::Server { session: first, result: Err(refused(codes::FORBIDDEN, "no")) }));
-        model.update(Event::Admin(AdminEvent::Server { session: second, result: Ok(server_info()) }));
+        model.update(Event::Admin(AdminEvent::Account { session: first, result: Ok(account("member")) }));
+        model.update(Event::Admin(AdminEvent::Account { session: second, result: Ok(account("admin")) }));
         assert!(model.is_admin());
-        model.update(Event::Admin(AdminEvent::Server { session: first, result: Err(refused(codes::FORBIDDEN, "no")) }));
+        model.update(Event::Admin(AdminEvent::Account { session: first, result: Ok(account("member")) }));
         assert!(model.is_admin());
     }
 
@@ -1378,7 +1447,7 @@ mod tests {
         let ana = user_named(&model, "user01");
         assert!(!ana.invite_pending);
         run(&mut model, &boss, ev(AdminEvent::OpenUser(ana.id)));
-        run(&mut model, &boss, ev(AdminEvent::Ask(Action::IssueReset { id: ana.id, username: "user01".into() })));
+        run(&mut model, &boss, ev(AdminEvent::Ask(Action::IssueReset { id: ana.id, username: "user01".into(), reset_two_factor: false })));
         type_password(&mut model, "pw");
         run(&mut model, &boss, ev(AdminEvent::Confirm));
         run(&mut model, &boss, ev(AdminEvent::DismissCode));
@@ -1398,5 +1467,114 @@ mod tests {
         let effects = model.update(answer);
         assert_eq!(admin(&model).dialog.as_ref().unwrap().error.as_deref(), Some(NO_OPEN_CODE));
         assert!(matches!(effects.as_slice(), [Effect::AdminUsers { .. }]), "{effects:?}");
+    }
+
+    /// An admin whose account has two-factor sign-in confirms with a code too: one field, six digits are a code from the app and
+    /// anything else a recovery code; a missing code is not sent; everything typed leaves the model when it is sent.
+    #[test]
+    fn a_confirmation_asks_for_a_code_when_the_account_has_two_factor() {
+        let boss = agent(true, 1);
+        boss.two_factor.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut model = on_the_pages(&boss);
+        assert_eq!(model.overview().unwrap().access, Access::Admin { two_factor: true });
+        let ana = user_named(&model, "user01");
+        let type_in = |model: &mut Model, password: &str, code: &str| {
+            let d = admin_mut(model).dialog.as_mut().unwrap();
+            d.confirmation.password = password.into();
+            d.confirmation.code = code.into();
+        };
+        run(&mut model, &boss, ev(AdminEvent::Ask(Action::Disable { id: ana.id, username: "user01".into() })));
+        assert!(admin(&model).dialog.as_ref().unwrap().needs_code);
+        // A password alone, or a code alone, is not sent.
+        type_in(&mut model, "admin-secret-pw", "");
+        assert!(model.update(Event::Admin(AdminEvent::Confirm)).is_empty());
+        assert_eq!(admin(&model).dialog.as_ref().unwrap().error.as_deref(), Some(NEEDS_CODE));
+        type_in(&mut model, "", "123456");
+        assert!(model.update(Event::Admin(AdminEvent::Confirm)).is_empty());
+        assert_eq!(admin(&model).dialog.as_ref().unwrap().error.as_deref(), Some(NEEDS_PASSWORD));
+        // Six digits with spaces: a code from the app.
+        type_in(&mut model, "admin-secret-pw", " 123 456 ");
+        let effects = model.update(Event::Admin(AdminEvent::Confirm));
+        let [Effect::AdminDo { confirm, .. }] = effects.as_slice() else { panic!("{effects:?}") };
+        assert_eq!(
+            (confirm.password.as_deref(), confirm.totp_code.as_deref(), confirm.recovery_code.as_deref()),
+            (Some("admin-secret-pw"), Some("123456"), None)
+        );
+        let dialog = admin(&model).dialog.as_ref().unwrap();
+        assert!(dialog.busy && dialog.confirmation.password.is_empty() && dialog.confirmation.code.is_empty(), "{dialog:?}");
+        let shown = format!("{model:?} {effects:?}");
+        assert!(!shown.contains("admin-secret-pw") && !shown.contains("123456"), "{shown}");
+        run(&mut model, &boss, vec![]);
+        let start: Starter = Arc::new(|_: &dyn crate::agent::Agent| Err(String::new()));
+        let answer = call(&boss, &start, effects.into_iter().next().unwrap()).unwrap();
+        model.update(answer);
+        assert_eq!(boss.factors.lock().unwrap().as_slice(), [(Some("123456".to_owned()), None)]);
+        // Anything else is a recovery code, in the other field.
+        run(&mut model, &boss, ev(AdminEvent::Ask(Action::Enable { id: ana.id, username: "user01".into() })));
+        type_in(&mut model, "admin-secret-pw", "abcd-efgh-jkmn-pqrs");
+        run(&mut model, &boss, ev(AdminEvent::Confirm));
+        assert_eq!(boss.factors.lock().unwrap().last().unwrap(), &(None, Some("abcd-efgh-jkmn-pqrs".to_owned())));
+        // The password dialog of an account without it has no code field.
+        let plain = agent(true, 1);
+        let mut model = on_the_pages(&plain);
+        run(&mut model, &plain, ev(AdminEvent::Ask(Action::Disable { id: ana.id, username: "user01".into() })));
+        assert!(!admin(&model).dialog.as_ref().unwrap().needs_code);
+    }
+
+    /// The server's word on a code: a wrong one (403) is said and the page asks for the code if it didn't; a lock (429) says how
+    /// long to wait; the typed secrets are gone either way.
+    #[test]
+    fn a_wrong_or_locked_code_is_said_and_asked_for_again() {
+        let boss = agent(true, 1);
+        let mut model = on_the_pages(&boss);
+        let ana = user_named(&model, "user01");
+        assert!(!{
+            run(&mut model, &boss, ev(AdminEvent::Ask(Action::Disable { id: ana.id, username: "user01".into() })));
+            admin(&model).dialog.as_ref().unwrap().needs_code
+        });
+        boss.admin_fails.lock().unwrap().push(refused(codes::TWO_FACTOR_INVALID, "wrong code"));
+        type_password(&mut model, "pw");
+        run(&mut model, &boss, ev(AdminEvent::Confirm));
+        let dialog = admin(&model).dialog.as_ref().unwrap();
+        assert!(dialog.needs_code, "the server wants a code: the page asks for it");
+        assert!(dialog.error.as_deref().is_some_and(|e| e.contains("code isn't right")), "{:?}", dialog.error);
+        assert!(!dialog.busy && dialog.confirmation.password.is_empty() && dialog.confirmation.code.is_empty());
+        let locked =
+            Error::RefusedWith { code: codes::TWO_FACTOR_LOCKED.into(), message: "locked".into(), two_factor: None, retry_after_secs: Some(840) };
+        boss.admin_fails.lock().unwrap().push(locked.clone());
+        type_password(&mut model, "pw");
+        admin_mut(&mut model).dialog.as_mut().unwrap().confirmation.code = "123456".into();
+        run(&mut model, &boss, ev(AdminEvent::Confirm));
+        let error = admin(&model).dialog.as_ref().unwrap().error.clone().unwrap();
+        assert!(error.contains("Too many wrong codes") && error.contains("14 minutes"), "{error}");
+        assert!(error_text(&locked).contains("14 minutes"));
+    }
+
+    /// An account's two-factor sign-in is shown, and taken away with a change of its own; a reset code can turn it off when it is
+    /// used, which the call carries.
+    #[test]
+    fn two_factor_is_shown_reset_and_turned_off_by_a_reset_code() {
+        let boss = agent(true, 1);
+        boss.users.lock().unwrap()[1].two_factor_enabled = true;
+        let mut model = on_the_pages(&boss);
+        let ana = user_named(&model, "user01");
+        assert!(ana.two_factor_enabled);
+        run(&mut model, &boss, ev(AdminEvent::OpenUser(ana.id)));
+        let reset = Action::ResetTwoFactor { id: ana.id, username: "user01".into() };
+        assert!(reset.title().contains("Turn two-factor sign-in off") && reset.explain().contains("signed out"));
+        run(&mut model, &boss, ev(AdminEvent::Ask(reset)));
+        type_password(&mut model, "pw");
+        run(&mut model, &boss, ev(AdminEvent::Confirm));
+        assert!(admin(&model).dialog.is_none());
+        assert_eq!(boss.asked.lock().unwrap().iter().filter(|a| *a == "admin_reset_two_factor").count(), 1);
+        for flag in [false, true] {
+            run(&mut model, &boss, ev(AdminEvent::Ask(Action::IssueReset { id: ana.id, username: "user01".into(), reset_two_factor: flag })));
+            type_password(&mut model, "pw");
+            run(&mut model, &boss, ev(AdminEvent::Confirm));
+            assert_eq!(admin(&model).code.as_ref().map(|c| c.kind), Some(CodeKind::PasswordReset));
+            run(&mut model, &boss, ev(AdminEvent::DismissCode));
+        }
+        assert_eq!(boss.resets.lock().unwrap().as_slice(), [false, true], "the flag goes with the reset code");
+        assert!(Action::IssueReset { id: ana.id, username: "x".into(), reset_two_factor: true }.explain().contains("turns the account's two-factor"));
     }
 }
