@@ -29,11 +29,16 @@ fn secrets(screen: &crate::model::Screen) -> Vec<(&'static str, &str)> {
             Step::Home | Step::Codes { .. } | Step::SignOutOthers => Vec::new(),
         },
         Screen::SecondFactor(form) => vec![("second-factor-code", &form.code)],
+        // The admin's confirmation: only while it is open to be typed in.
+        Screen::Admin(a) if a.code.is_none() => match &a.dialog {
+            Some(d) if !d.busy => vec![(super::admin::PASSWORD_FIELD, &d.confirmation.password)],
+            _ => Vec::new(),
+        },
         _ => Vec::new(),
     }
 }
 
-const SECRET_NAMES: [&str; 10] = [
+const SECRET_NAMES: [&str; 11] = [
     "setup-password",
     "setup-code",
     "disable-password",
@@ -44,6 +49,7 @@ const SECRET_NAMES: [&str; 10] = [
     "password-new",
     "password-again",
     "second-factor-code",
+    super::admin::PASSWORD_FIELD,
 ];
 
 /// Drops what egui remembers of every secret field (its cursor and, above all, its undo history, which holds the text as it

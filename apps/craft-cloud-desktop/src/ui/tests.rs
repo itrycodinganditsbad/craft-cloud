@@ -449,7 +449,7 @@ fn admin_buttons_send_their_events() {
     let model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(ana))]);
     let mut h = harness(model, egui::Theme::Light);
     h.run_steps(2);
-    for label in ["Save changes", "Disable", "Remove", "New invite", "Password reset code", "Revoke"] {
+    for label in ["Save changes", "Disable", "Remove", "New invite", "Password reset code", "Revoke open code", "Revoke"] {
         h.get_by_label(label).click();
         h.run_steps(2);
     }
@@ -458,7 +458,14 @@ fn admin_buttons_send_their_events() {
     assert!(
         matches!(
             asked.as_slice(),
-            [Action::Disable { .. }, Action::Remove { .. }, Action::IssueInvite { .. }, Action::IssueReset { .. }, Action::RevokeDevice { .. }]
+            [
+                Action::Disable { .. },
+                Action::Remove { .. },
+                Action::IssueInvite { .. },
+                Action::IssueReset { .. },
+                Action::RevokeInvite { .. },
+                Action::RevokeDevice { .. }
+            ]
         ),
         "{events:?}"
     );
@@ -491,4 +498,73 @@ fn admin_buttons_send_their_events() {
     h.get_by_label("Done").click();
     h.run_steps(2);
     assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Admin(AdminEvent::DismissCode)]);
+}
+
+/// egui keeps a text field's undo history, which holds what was typed: for the password field it is dropped once the
+/// password was sent, or the page cancelled or left, so Undo can't bring a password back to a field opened later.
+#[test]
+fn a_typed_password_is_not_left_in_eguis_undo_history() {
+    use egui::accesskit::Role;
+    use egui::text_edit::TextEditState;
+
+    let agent = admin_agent();
+    let model = on_admin_pages(&agent, Vec::new());
+    let ana = id_of(&model, "ana");
+    let id = super::security::secret_id(super::admin::PASSWORD_FIELD);
+    let ask = |h: &mut Harness<'static, (Model, Vec<Event>)>| {
+        h.state_mut().0.update(Event::Admin(AdminEvent::Ask(Action::Disable { id: ana, username: "ana".into() })));
+        h.run_steps(3);
+    };
+    // Whether egui could still bring typed text back: its state for the field has an undo history for an empty field.
+    let remembered = |h: &Harness<'static, (Model, Vec<Event>)>| {
+        TextEditState::load(&h.ctx, id).is_some_and(|state| state.undoer().undo(&(egui::text::CCursorRange::default(), String::new())).is_some())
+    };
+    let password =
+        |h: &Harness<'static, (Model, Vec<Event>)>| h.state().0.admin_screen().unwrap().dialog.as_ref().unwrap().confirmation.password.clone();
+    let undo = |h: &mut Harness<'static, (Model, Vec<Event>)>| {
+        h.get_by_role(Role::PasswordInput).focus();
+        h.run_steps(2);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        h.run_steps(3);
+    };
+
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    assert!(!remembered(&h));
+    ask(&mut h);
+    h.get_by_role(Role::PasswordInput).focus();
+    h.get_by_role(Role::PasswordInput).type_text("hunter2-secret");
+    // Long enough for egui to settle the typing into an undo point.
+    h.run_steps(8);
+    assert_eq!(password(&h), "hunter2-secret");
+    assert!(remembered(&h), "while it is typed, egui has the field's state (the test sees what it guards against)");
+
+    // Sent, and refused as a wrong password: the dialog is open again, empty, and egui has forgotten the text.
+    let effects = h.state_mut().0.update(Event::Admin(AdminEvent::Confirm));
+    assert!(matches!(effects.as_slice(), [Effect::AdminDo { .. }]));
+    h.run_steps(2);
+    assert!(!remembered(&h), "once sent");
+    let refused = craft_cloud_app::Error::Refused { code: "wrong_password".into(), message: "no".into() };
+    h.state_mut().0.update(Event::Admin(AdminEvent::Done(Err(refused))));
+    h.run_steps(3);
+    undo(&mut h);
+    assert_eq!(password(&h), "", "Undo brings nothing back");
+
+    // Typed again and cancelled; the same change asked for again: Undo still brings nothing back.
+    h.get_by_role(Role::PasswordInput).type_text("another-secret");
+    h.run_steps(8);
+    assert!(remembered(&h));
+    h.state_mut().0.update(Event::Admin(AdminEvent::CancelDialog));
+    h.run_steps(2);
+    assert!(!remembered(&h), "once cancelled");
+    ask(&mut h);
+    undo(&mut h);
+    assert_eq!(password(&h), "");
+
+    // Left with the password typed: the same.
+    h.get_by_role(Role::PasswordInput).type_text("third-secret");
+    h.run_steps(3);
+    h.state_mut().0.update(Event::Admin(AdminEvent::Close));
+    h.run_steps(2);
+    assert!(!remembered(&h), "once the pages are left");
 }

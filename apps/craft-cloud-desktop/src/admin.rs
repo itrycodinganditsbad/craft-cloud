@@ -19,6 +19,14 @@ use craft_cloud_proto::api::{AdminConfirm, codes};
 
 use crate::model::{Effect, Event, Model, Overview, Screen};
 
+/// A number no earlier call of the admin pages had, for matching an answer to its call: the numbers never restart, so an
+/// answer that comes late (after the pages were left and opened again, or the account signed out and in) matches
+/// nothing and is ignored.
+pub(crate) fn fresh() -> u64 {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    LAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed).wrapping_add(1)
+}
+
 /// Accounts on one page of the list.
 pub const PAGE_SIZE: u32 = 20;
 /// The most a quota may be, in GiB (a petabyte: a typo, not a quota, past it).
@@ -296,7 +304,7 @@ impl UserList {
     fn load(&mut self) -> Effect {
         self.loading = true;
         self.error = None;
-        self.ticket = self.ticket.wrapping_add(1);
+        self.ticket = fresh();
         let query = UserQuery {
             cursor: self.cursors.last().cloned().flatten(),
             limit: Some(PAGE_SIZE),
@@ -332,6 +340,8 @@ pub struct UserView {
     pub error: Option<String>,
     pub devices: Option<Vec<DeviceInfo>>,
     pub devices_error: Option<String>,
+    /// The number of the devices call whose answer is wanted.
+    devices_ticket: u64,
 }
 
 impl UserView {
@@ -346,6 +356,7 @@ impl UserView {
             error: None,
             devices: None,
             devices_error: None,
+            devices_ticket: 0,
         }
     }
 }
@@ -375,7 +386,10 @@ pub struct AdminScreen {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AdminEvent {
     /// [`Effect::AdminServer`]'s answer.
-    Server(Result<AdminServerInfo, Error>),
+    Server {
+        session: u64,
+        result: Result<AdminServerInfo, Error>,
+    },
     /// [`Effect::AdminUsers`]'s answer.
     Users {
         ticket: u64,
@@ -384,6 +398,7 @@ pub enum AdminEvent {
     /// [`Effect::AdminDevices`]'s answer.
     Devices {
         user: Uuid,
+        ticket: u64,
         result: Result<Vec<DeviceInfo>, Error>,
     },
     /// [`Effect::AdminDo`]'s answer.
@@ -433,7 +448,7 @@ impl Model {
 
     pub(crate) fn admin(&mut self, event: AdminEvent) -> Vec<Effect> {
         match event {
-            AdminEvent::Server(result) => self.admin_probed(result),
+            AdminEvent::Server { session, result } => self.admin_probed(session, result),
             AdminEvent::Open => self.open_admin(),
             AdminEvent::Close => {
                 self.leave_admin();
@@ -447,7 +462,11 @@ impl Model {
     }
 
     /// The counters came (an admin), or the server said no (a member).
-    fn admin_probed(&mut self, result: Result<AdminServerInfo, Error>) -> Vec<Effect> {
+    fn admin_probed(&mut self, session: u64, result: Result<AdminServerInfo, Error>) -> Vec<Effect> {
+        // An answer for an earlier sign-in (another account, maybe) says nothing about this one.
+        if self.overview().map(|o| o.session) != Some(session) {
+            return Vec::new();
+        }
         let access = match result {
             Ok(info) => Access::Admin(info),
             Err(Error::Refused { code, .. }) if code == codes::FORBIDDEN => Access::Member,
@@ -469,7 +488,7 @@ impl Model {
             return Vec::new();
         }
         let mut admin = AdminScreen { overview: overview.clone(), list: UserList::new(), view: View::List, dialog: None, code: None };
-        let effects = vec![admin.list.load(), Effect::AdminServer];
+        let effects = vec![admin.list.load(), Effect::AdminServer { session: admin.overview.session }];
         self.screen = Screen::Admin(Box::new(admin));
         effects
     }
@@ -485,12 +504,13 @@ impl Model {
 impl AdminScreen {
     fn update(&mut self, event: AdminEvent) -> Vec<Effect> {
         match event {
-            AdminEvent::Server(_) | AdminEvent::Open | AdminEvent::Close => Vec::new(),
+            AdminEvent::Server { .. } | AdminEvent::Open | AdminEvent::Close => Vec::new(),
             AdminEvent::Users { ticket, result } => self.users_came(ticket, result),
-            AdminEvent::Devices { user, result } => {
+            AdminEvent::Devices { user, ticket, result } => {
                 let mut effects = Vec::new();
                 if let View::User(view) = &mut self.view
                     && view.id == user
+                    && view.devices_ticket == ticket
                 {
                     match result {
                         Ok(list) => {
@@ -500,7 +520,7 @@ impl AdminScreen {
                         Err(e) => {
                             view.devices_error = Some(error_text(&e));
                             if is_forbidden(&e) {
-                                effects.push(Effect::AdminServer);
+                                effects.push(Effect::AdminServer { session: self.overview.session });
                             }
                         }
                     }
@@ -553,8 +573,11 @@ impl AdminScreen {
                 if self.dialog.is_some() {
                     return Vec::new();
                 }
-                self.view = View::User(Box::new(UserView::new(user)));
-                vec![Effect::AdminDevices(id)]
+                let mut view = UserView::new(user);
+                view.devices_ticket = fresh();
+                let effect = Effect::AdminDevices { user: id, ticket: view.devices_ticket };
+                self.view = View::User(Box::new(view));
+                vec![effect]
             }
             AdminEvent::BackToList => {
                 if self.dialog.is_none() {
@@ -583,8 +606,11 @@ impl AdminScreen {
                 self.code = None;
                 Vec::new()
             }
-            AdminEvent::RefreshDevices => match &self.view {
-                View::User(view) => vec![Effect::AdminDevices(view.id)],
+            AdminEvent::RefreshDevices => match &mut self.view {
+                View::User(view) => {
+                    view.devices_ticket = fresh();
+                    vec![Effect::AdminDevices { user: view.id, ticket: view.devices_ticket }]
+                }
                 _ => Vec::new(),
             },
         }
@@ -605,7 +631,7 @@ impl AdminScreen {
             }
             Err(e) => {
                 self.list.error = Some(error_text(&e));
-                if is_forbidden(&e) { vec![Effect::AdminServer] } else { Vec::new() }
+                if is_forbidden(&e) { vec![Effect::AdminServer { session: self.overview.session }] } else { Vec::new() }
             }
         }
     }
@@ -683,8 +709,19 @@ impl AdminScreen {
             Err(e) => {
                 dialog.busy = false;
                 dialog.confirmation = Confirmation::default();
-                dialog.error = Some(error_text(&e));
-                return if is_forbidden(&e) { vec![Effect::AdminServer] } else { Vec::new() };
+                dialog.error = Some(match (&dialog.action, &e) {
+                    (Action::RevokeInvite { .. }, Error::Refused { code, .. }) if code == codes::NOT_FOUND => NO_OPEN_CODE.to_owned(),
+                    _ => error_text(&e),
+                });
+                let none_open = matches!(&dialog.action, Action::RevokeInvite { .. }) && dialog.error.as_deref() == Some(NO_OPEN_CODE);
+                return if is_forbidden(&e) {
+                    vec![Effect::AdminServer { session: self.overview.session }]
+                } else if none_open {
+                    // The list said an invite was open, or didn't say: look again.
+                    vec![self.list.load()]
+                } else {
+                    Vec::new()
+                };
             }
         };
         let action = dialog.action.clone();
@@ -701,16 +738,28 @@ impl AdminScreen {
                 if let View::User(view) = &mut self.view
                     && view.id == info.id
                 {
-                    **view = UserView { devices: view.devices.take(), devices_error: view.devices_error.take(), ..UserView::new(&info) };
+                    **view = UserView {
+                        devices: view.devices.take(),
+                        devices_error: view.devices_error.take(),
+                        devices_ticket: view.devices_ticket,
+                        ..UserView::new(&info)
+                    };
                 }
             }
             (Action::Remove { .. }, _) => self.view = View::List,
-            (Action::RevokeDevice { id, .. }, _) => effects.push(Effect::AdminDevices(*id)),
+            (Action::RevokeDevice { id, .. }, _) => {
+                if let View::User(view) = &mut self.view
+                    && view.id == *id
+                {
+                    view.devices_ticket = fresh();
+                    effects.push(Effect::AdminDevices { user: *id, ticket: view.devices_ticket });
+                }
+            }
             _ => {}
         }
         // What changed shows in the list (and the counters).
         effects.push(self.list.load());
-        effects.push(Effect::AdminServer);
+        effects.push(Effect::AdminServer { session: self.overview.session });
         effects
     }
 
@@ -719,6 +768,8 @@ impl AdminScreen {
     }
 }
 
+/// The words when a revoke finds no invite or reset code open (the server's `not_found`).
+pub const NO_OPEN_CODE: &str = "This account has no open invite or password reset code.";
 /// The words the confirmation page says when no password was typed.
 pub const NEEDS_PASSWORD: &str = "Type your own password to confirm";
 /// The words when a new account's name breaks the server's rules.
@@ -912,16 +963,17 @@ mod tests {
         let Access::Admin(info) = &model.overview().unwrap().access else { panic!("{:?}", model.screen) };
         assert_eq!((info.users, info.storage_kind.as_str()), (4, "disk"));
         let effects = model.update(Event::Admin(AdminEvent::Open));
-        assert!(matches!(effects.as_slice(), [Effect::AdminUsers { .. }, Effect::AdminServer]), "{effects:?}");
+        assert!(matches!(effects.as_slice(), [Effect::AdminUsers { .. }, Effect::AdminServer { .. }]), "{effects:?}");
         assert!(model.admin_screen().is_some());
 
         // A server that can't be reached says nothing about the role: no pages, asked again at the next refresh.
         let mut model = Model::new(JoinDefaults::default(), true, String::new());
         model.update(Event::Start);
         model.update(Event::Found(Ok(status(true))));
-        model.update(Event::Admin(AdminEvent::Server(Err(Error::Io("reset".into())))));
+        let session = model.overview().unwrap().session;
+        model.update(Event::Admin(AdminEvent::Server { session, result: Err(Error::Io("reset".into())) }));
         assert_eq!(model.overview().unwrap().access, Access::Unknown);
-        assert!(model.update(Event::RefreshDevices).contains(&Effect::AdminServer));
+        assert!(model.update(Event::RefreshDevices).contains(&Effect::AdminServer { session }));
     }
 
     /// An admin who is demoted meanwhile: the server's `forbidden` is checked against the counters, and the pages close.
@@ -1079,7 +1131,7 @@ mod tests {
         let effects = model.update(Event::Admin(AdminEvent::Confirm));
         let start: Starter = Arc::new(|_: &dyn crate::agent::Agent| Err(String::new()));
         let answer = call(&boss, &start, effects.into_iter().next().unwrap()).unwrap();
-        assert_eq!(model.update(answer), vec![Effect::AdminServer]);
+        assert_eq!(model.update(answer), vec![Effect::AdminServer { session: model.overview().unwrap().session }]);
         assert!(admin(&model).dialog.as_ref().unwrap().error.as_deref().is_some_and(|e| e.starts_with("The server doesn't allow this")));
         assert!(model.admin_screen().is_some(), "still an admin: the pages stay");
     }
@@ -1248,5 +1300,103 @@ mod tests {
         };
         let shown = format!("{code:?}");
         assert!(!shown.contains("ABCDEFGH") && !shown.contains("c.example"), "{shown}");
+    }
+
+    fn server_info() -> AdminServerInfo {
+        AdminServerInfo {
+            version: "0.1.0".into(),
+            users: 2,
+            devices_active: 1,
+            stored_bytes: 0,
+            live_bytes: 0,
+            storage_kind: "disk".into(),
+            database_kind: "sqlite".into(),
+        }
+    }
+
+    /// An answer that comes late (the pages were left and opened again; the devices were asked for twice) matches
+    /// nothing: it never overwrites newer data.
+    #[test]
+    fn answers_that_come_late_are_ignored() {
+        let boss = agent(true, 3);
+        let mut model = signed_in(&boss);
+        let first = model.update(Event::Admin(AdminEvent::Open));
+        let Some(Effect::AdminUsers { ticket: old, .. }) = first.first().cloned() else { panic!("{first:?}") };
+        model.update(Event::Admin(AdminEvent::Close));
+        run(&mut model, &boss, ev(AdminEvent::Open));
+        let current = admin(&model).list.users.clone();
+        assert_eq!(current.len(), 4);
+        let ghost = AdminUserList { users: vec![sample_user("ghost", Uuid::now_v7())], next: None };
+        model.update(Event::Admin(AdminEvent::Users { ticket: old, result: Ok(ghost) }));
+        assert_eq!(admin(&model).list.users, current, "the first page's reply is from before the pages were opened again");
+
+        // The same for a user's devices.
+        let ana = user_named(&model, "user01");
+        let asked = model.update(Event::Admin(AdminEvent::OpenUser(ana.id)));
+        let [Effect::AdminDevices { ticket: first_devices, .. }] = asked.as_slice() else { panic!("{asked:?}") };
+        run(&mut model, &boss, ev(AdminEvent::RefreshDevices));
+        let View::User(view) = &admin(&model).view else { panic!() };
+        let now = view.devices.clone();
+        assert_eq!(now.as_ref().map(Vec::len), Some(1));
+        model.update(Event::Admin(AdminEvent::Devices { user: ana.id, ticket: *first_devices, result: Ok(Vec::new()) }));
+        let View::User(view) = &admin(&model).view else { panic!() };
+        assert_eq!(view.devices, now);
+    }
+
+    /// The admin check of an earlier sign-in (another account, maybe) says nothing about the current one.
+    #[test]
+    fn an_admin_check_for_an_earlier_sign_in_is_ignored() {
+        let mut model = Model::new(JoinDefaults::default(), true, String::new());
+        model.update(Event::Start);
+        let probe = |effects: &[Effect]| {
+            effects.iter().find_map(|e| if let Effect::AdminServer { session } = e { Some(*session) } else { None }).expect("an admin check")
+        };
+        let first = probe(&model.update(Event::Found(Ok(status(true)))));
+        model.update(Event::SignedOut(Ok(status(false))));
+        let second = probe(&model.update(Event::Polled(Ok(status(true)))));
+        assert_ne!(first, second);
+        // The first account was an admin; its late answer doesn't make this one an admin.
+        model.update(Event::Admin(AdminEvent::Server { session: first, result: Ok(server_info()) }));
+        assert_eq!(model.overview().unwrap().access, Access::Unknown);
+        assert!(!model.is_admin());
+        model.update(Event::Admin(AdminEvent::Server { session: second, result: Err(refused(codes::FORBIDDEN, "no")) }));
+        assert_eq!(model.overview().unwrap().access, Access::Member);
+        // And a late "member" answer doesn't take an admin's pages away.
+        model.update(Event::Admin(AdminEvent::Server { session: first, result: Err(refused(codes::FORBIDDEN, "no")) }));
+        model.update(Event::Admin(AdminEvent::Server { session: second, result: Ok(server_info()) }));
+        assert!(model.is_admin());
+        model.update(Event::Admin(AdminEvent::Server { session: first, result: Err(refused(codes::FORBIDDEN, "no")) }));
+        assert!(model.is_admin());
+    }
+
+    /// A password reset code can be revoked like an invite: the button doesn't depend on `invite_pending` (which
+    /// doesn't say there is one), and a revoke that finds nothing open says so and looks at the list again.
+    #[test]
+    fn a_revoke_that_finds_no_open_code_says_so() {
+        let boss = agent(true, 1);
+        let mut model = on_the_pages(&boss);
+        let ana = user_named(&model, "user01");
+        assert!(!ana.invite_pending);
+        run(&mut model, &boss, ev(AdminEvent::OpenUser(ana.id)));
+        run(&mut model, &boss, ev(AdminEvent::Ask(Action::IssueReset { id: ana.id, username: "user01".into() })));
+        type_password(&mut model, "pw");
+        run(&mut model, &boss, ev(AdminEvent::Confirm));
+        run(&mut model, &boss, ev(AdminEvent::DismissCode));
+        // The reset code is open, though the list doesn't say so: it can be revoked.
+        run(&mut model, &boss, ev(AdminEvent::Ask(Action::RevokeInvite { id: ana.id, username: "user01".into() })));
+        type_password(&mut model, "pw");
+        run(&mut model, &boss, ev(AdminEvent::Confirm));
+        assert!(admin(&model).dialog.is_none());
+        assert_eq!(boss.asked.lock().unwrap().iter().filter(|a| *a == "admin_revoke_invite").count(), 1);
+        // Nothing open (the server's `not_found`): said clearly, and the list is asked again.
+        boss.admin_fails.lock().unwrap().push(refused(codes::NOT_FOUND, "not found"));
+        run(&mut model, &boss, ev(AdminEvent::Ask(Action::RevokeInvite { id: ana.id, username: "user01".into() })));
+        type_password(&mut model, "pw");
+        let effects = model.update(Event::Admin(AdminEvent::Confirm));
+        let start: Starter = Arc::new(|_: &dyn crate::agent::Agent| Err(String::new()));
+        let answer = call(&boss, &start, effects.into_iter().next().unwrap()).unwrap();
+        let effects = model.update(answer);
+        assert_eq!(admin(&model).dialog.as_ref().unwrap().error.as_deref(), Some(NO_OPEN_CODE));
+        assert!(matches!(effects.as_slice(), [Effect::AdminUsers { .. }]), "{effects:?}");
     }
 }

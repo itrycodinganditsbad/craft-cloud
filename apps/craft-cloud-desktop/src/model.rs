@@ -161,11 +161,22 @@ pub struct Overview {
     pub offer_local_sign_out: bool,
     /// Whether the server lets this account use the admin pages (asked at sign-in).
     pub access: Access,
+    /// Which sign-in this view is of: answers to the admin check made for another one are ignored.
+    pub session: u64,
 }
 
 impl Overview {
     fn new(status: Status) -> Self {
-        Self { status, devices: None, devices_error: None, removing: None, error: None, offer_local_sign_out: false, access: Access::Unknown }
+        Self {
+            status,
+            devices: None,
+            devices_error: None,
+            removing: None,
+            error: None,
+            offer_local_sign_out: false,
+            access: Access::Unknown,
+            session: crate::admin::fresh(),
+        }
     }
 }
 
@@ -313,14 +324,19 @@ pub enum Effect {
     /// Write (`true`) or remove the app's own start-at-login entry.
     AppAutostart(bool),
     /// The server's counters: also how the app finds out whether the account is an admin ([`AdminEvent::Server`]).
-    AdminServer,
+    AdminServer {
+        session: u64,
+    },
     /// A page of the user list ([`AdminEvent::Users`] with the same `ticket`).
     AdminUsers {
         query: UserQuery,
         ticket: u64,
     },
     /// A user's devices ([`AdminEvent::Devices`]).
-    AdminDevices(Uuid),
+    AdminDevices {
+        user: Uuid,
+        ticket: u64,
+    },
     /// A change, with the admin's confirmation ([`AdminEvent::Done`]). Its `Debug` output hides the password.
     AdminDo {
         action: Action,
@@ -570,7 +586,7 @@ impl Model {
             Event::RefreshDevices => {
                 let Some(overview) = self.overview() else { return Vec::new() };
                 // An admin check that couldn't be made at sign-in is made again.
-                let again = (overview.access == Access::Unknown).then_some(Effect::AdminServer);
+                let again = (overview.access == Access::Unknown).then_some(Effect::AdminServer { session: overview.session });
                 std::iter::once(Effect::Devices).chain(again).collect()
             }
             Event::Admin(event) => self.admin(event),
@@ -687,10 +703,12 @@ impl Model {
                 // The join's own answer moves on from there.
                 Screen::Joining { .. } => {}
                 _ => {
-                    self.screen = Screen::SignedIn(Overview::new(status));
+                    let overview = Overview::new(status);
+                    let session = overview.session;
+                    self.screen = Screen::SignedIn(overview);
                     effects.push(Effect::Devices);
                     // Whether the account is an admin, for the admin pages.
-                    effects.push(Effect::AdminServer);
+                    effects.push(Effect::AdminServer { session });
                 }
             }
             return effects;
@@ -814,7 +832,8 @@ impl Model {
                 self.screen = Screen::SignedIn(Overview::new(status.clone()));
                 let mut effects = self.status_came(status);
                 // Start at login: the agent's entry (the app's follows it).
-                effects.extend([Effect::SetAutostart(true), Effect::Devices, Effect::AdminServer]);
+                effects.extend([Effect::SetAutostart(true), Effect::Devices]);
+                effects.extend(self.overview().map(|o| Effect::AdminServer { session: o.session }));
                 return effects;
             }
             Err(e) => e,
@@ -1448,7 +1467,10 @@ pub(crate) mod tests {
         // At each start, matched once; again only when it changes.
         let mut m = model();
         m.update(Event::Start);
-        assert_eq!(m.update(Event::Found(Ok(on.clone()))), vec![Effect::AppAutostart(true), Effect::Devices, Effect::AdminServer]);
+        assert_eq!(
+            m.update(Event::Found(Ok(on.clone()))),
+            vec![Effect::AppAutostart(true), Effect::Devices, Effect::AdminServer { session: m.overview().unwrap().session }]
+        );
         assert!(m.update(Event::Polled(Ok(on.clone()))).is_empty());
         assert_eq!(m.update(Event::Polled(Ok(Status { autostart: Some(false), ..on }))), vec![Effect::AppAutostart(false)]);
     }

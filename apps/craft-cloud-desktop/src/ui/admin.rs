@@ -10,6 +10,9 @@ use craft_cloud_app::AdminUserInfo;
 
 use crate::model::Event;
 
+/// The name of the confirmation page's password field, for [`super::security::secret_id`] and the forgetting of its text.
+pub(super) const PASSWORD_FIELD: &str = "admin-password";
+
 pub(super) fn show(ui: &mut egui::Ui, admin: &mut AdminScreen, now_ms: i64, events: &mut Vec<Event>) {
     let me = admin.overview.status.account.clone().unwrap_or_default();
     // A code just made comes first, then the password a change asks for, then the page.
@@ -239,7 +242,9 @@ fn account(ui: &mut egui::Ui, view: &mut UserView, user: Option<&AdminUserInfo>,
         if ui.button("Password reset code").on_hover_text("Good for an hour; using it signs all their computers out").clicked() {
             send(events, AdminEvent::Ask(Action::IssueReset { id, username: username.clone() }));
         }
-        if user.invite_pending && ui.button("Revoke open code").clicked() {
+        // Always offered: the list says an invite is open (`invite_pending`), but not a password reset code. The server
+        // answers `not_found` when none is.
+        if ui.button("Revoke open code").on_hover_text("Ends the account's open invite or password reset code").clicked() {
             send(events, AdminEvent::Ask(Action::RevokeInvite { id, username: username.clone() }));
         }
     });
@@ -288,6 +293,7 @@ fn confirmation(ui: &mut egui::Ui, dialog: &mut Dialog, events: &mut Vec<Event>)
     let field = ui.add_enabled(
         !dialog.busy,
         egui::TextEdit::singleline(&mut dialog.confirmation.password)
+            .id(super::security::secret_id(PASSWORD_FIELD))
             .password(true)
             .hint_text("your own current password")
             .desired_width(f32::INFINITY),

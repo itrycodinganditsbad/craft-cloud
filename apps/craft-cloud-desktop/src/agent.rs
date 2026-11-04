@@ -286,9 +286,11 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         Effect::Logout { local } => Event::SignedOut(agent.logout(local)),
         Effect::Pause => Event::Answered(agent.pause()),
         Effect::Resume => Event::Answered(agent.resume()),
-        Effect::AdminServer => Event::Admin(AdminEvent::Server(agent.admin_server())),
+        Effect::AdminServer { session } => Event::Admin(AdminEvent::Server { session, result: agent.admin_server() }),
         Effect::AdminUsers { query, ticket } => Event::Admin(AdminEvent::Users { ticket, result: agent.admin_users(&query) }),
-        Effect::AdminDevices(user) => Event::Admin(AdminEvent::Devices { user, result: agent.admin_devices(user).map(|d| d.devices) }),
+        Effect::AdminDevices { user, ticket } => {
+            Event::Admin(AdminEvent::Devices { user, ticket, result: agent.admin_devices(user).map(|d| d.devices) })
+        }
         Effect::AdminDo { action, confirm } => Event::Admin(AdminEvent::Done(change(agent, &action, confirm))),
         // Not running is as good as stopped.
         Effect::QuitAgent => {
