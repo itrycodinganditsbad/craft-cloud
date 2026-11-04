@@ -16,7 +16,9 @@
 //!   `POST /v1/autostart` ([`AutostartRequest`]) → [`Status`]; `GET /v1/recents`, upgraded to a WebSocket of JSON
 //!   text messages: [`RecentsRequest`] in, [`RecentsEvent`] out; `GET /v1/docs`, upgraded to a WebSocket of live
 //!   documents ([`docs`]: [`DocsRequest`] and binary frames in, [`DocsEvent`] and binary frames out); `PUT /v1/blobs`
-//!   and `GET /v1/blobs/{hash}`: binary content kept out of live documents ([`blobs`]). Errors are the HTTP API's error
+//!   and `GET /v1/blobs/{hash}`: binary content kept out of live documents ([`blobs`]); the admin calls under
+//!   `/v1/admin` ([`paths::ADMIN_SERVER`], [`paths::ADMIN_USERS`]), which the agent passes on to the server's admin API
+//!   with the same bodies and answers (see `docs/agent.md`). Errors are the HTTP API's error
 //!   body ([`ErrorAnswer`](crate::api::ErrorAnswer) reads its code and message) with its codes and [`codes`].
 //! - **Versions**: [`Status::api`] is the local API version the agent speaks; a client refuses one outside
 //!   [`LOCAL_API_MIN`]..=[`LOCAL_API_MAX`] when it connects.
@@ -52,6 +54,8 @@ pub const MAX_TITLE_BYTES: usize = 256;
 pub const MAX_MACHINE_BYTES: usize = 128;
 /// Largest JSON body or WebSocket message of the local API, either way.
 pub const MAX_LOCAL_JSON_BYTES: usize = 1024 * 1024;
+/// Largest body of an admin call (the server's own limit is tiny too: a confirmation and a few fields).
+pub const MAX_ADMIN_JSON_BYTES: usize = 8 * 1024;
 
 /// Error codes of the local API (the `error` field of [`ErrorAnswer`](crate::api::ErrorAnswer)), beside the HTTP API's
 /// `invalid`, `unauthorized` (the token), `not_found`, `too_large` and `internal`.
@@ -148,6 +152,18 @@ pub mod paths {
     pub const AUTOSTART: &str = "/v1/autostart";
     /// `PUT`: a blob → [`super::blobs::Stored`]; `GET /v1/blobs/{hash}`: its bytes ([`super::blobs`]).
     pub const BLOBS: &str = "/v1/blobs";
+    /// `GET`: the server's counters and kinds (an admin's; any other account is refused with `forbidden`) →
+    /// [`AdminServerInfo`](crate::api::AdminServerInfo).
+    pub const ADMIN_SERVER: &str = "/v1/admin/server";
+    /// `GET /v1/admin/users?cursor&limit&query` → [`AdminUserList`](crate::api::AdminUserList); `POST` (an
+    /// [`AdminCreateUser`](crate::api::AdminCreateUser)) → [`AdminCreatedUser`](crate::api::AdminCreatedUser).
+    /// Under `/v1/admin/users/{id}`: `PATCH` ([`AdminUpdateUser`](crate::api::AdminUpdateUser)) → the account's
+    /// [`AdminUserInfo`](crate::api::AdminUserInfo); `DELETE`, and `POST` to `…/disable`, `…/enable`, `…/invite` and
+    /// `…/password-reset`, and `DELETE …/invite` and `…/devices/{device_id}`, each with an
+    /// [`AdminConfirm`](crate::api::AdminConfirm) (the invite and the reset code answer an
+    /// [`AdminCode`](crate::api::AdminCode), the others have no body); `GET …/devices` →
+    /// [`AdminDevices`](crate::api::AdminDevices). The server's status and error code are the agent's.
+    pub const ADMIN_USERS: &str = "/v1/admin/users";
 }
 
 /// Binary content an app keeps out of a live document (images, audio, a font): `PUT /v1/blobs` with the bytes as the

@@ -96,6 +96,8 @@ pub(crate) fn read_answer_max(stream: &mut impl Read, max: usize) -> Result<Answ
                         retry_after_secs = std::str::from_utf8(header.value).ok().and_then(|text| text.trim().parse::<u64>().ok());
                     } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
                         return Err(Error::Protocol("the agent's answer is chunked, which this client doesn't read".into()));
+                    } else if header.name.eq_ignore_ascii_case("retry-after") {
+                        retry_after_secs = std::str::from_utf8(header.value).ok().and_then(|text| text.trim().parse::<u64>().ok());
                     }
                 }
                 break (status, length, head_len, retry_after_secs);
@@ -150,6 +152,13 @@ mod tests {
         assert!(read_answer(&mut &b""[..]).is_err());
         let no_length = b"HTTP/1.1 401 Unauthorized\r\n\r\n{\"error\":\"unauthorized\"}";
         assert_eq!(read_answer(&mut &no_length[..]).unwrap().status, 401);
+        let slow = b"HTTP/1.1 429 Too Many Requests
+Retry-After: 30
+content-length: 2
+
+{}";
+        assert_eq!(read_answer(&mut &slow[..]).unwrap().retry_after_secs, Some(30));
+        assert_eq!(read_answer(&mut &no_length[..]).unwrap().retry_after_secs, None);
     }
 
     #[test]

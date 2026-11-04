@@ -13,7 +13,7 @@
 //! [`Client::set_autostart`] (a few seconds at most). **Off the UI thread**, since they wait for the server (up to
 //! 90 s): [`Client::login`], [`Client::join`], [`Client::logout`], and the add-a-computer and computer-list calls
 //! ([`Client::pairing`], [`Client::pairing_state`], [`Client::cancel_pairing`], [`Client::devices`],
-//! [`Client::remove_device`]), and opening a live document ([`live::Documents::open`], [`live::Importer::import`]: up
+//! [`Client::remove_device`]), the admin calls ([`admin`]), and opening a live document ([`live::Documents::open`], [`live::Importer::import`]: up
 //! to 30 s). A live document's own calls ([`live::Document::send`], [`live::Document::try_recv`]) don't wait for an
 //! answer.
 //!
@@ -49,6 +49,7 @@
 //! TLS: the agent is on this machine.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod admin;
 pub mod blobs;
 #[cfg(feature = "fake")]
 pub mod fake;
@@ -66,9 +67,12 @@ use craft_cloud_api::local::{
     RenameDeviceRequest, TotpRequest, paths,
 };
 
+pub use admin::UserQuery;
 pub use craft_cloud_api::DeviceId;
 pub use craft_cloud_api::api::{
-    DeviceInfo, PairingState, PairingStatus, RecoveryCodes, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus,
+    AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser, AdminUserInfo,
+    AdminUserList, DeviceInfo, PairingState, PairingStatus, RecoveryCodes, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse,
+    TwoFactorStatus,
 };
 pub use craft_cloud_api::local::{
     JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RunState, SecondFactorLoginRequest, Status, TwoFactorProofRequest, codes,
@@ -685,6 +689,96 @@ mod tests {
         let (method, path, body) = next();
         assert_eq!((method.as_str(), path), ("PATCH", format!("{}/{device}", paths::DEVICES)));
         assert_eq!(serde_json::from_str::<RenameDeviceRequest>(&body).unwrap().name, "new name");
+    }
+
+    /// The admin calls: each sends its request to its path with the confirmation in the body, and reads its answer; a
+    /// refusal comes back with the server's code, and the wait of a `Retry-After` is kept.
+    #[test]
+    fn each_admin_call_sends_its_request_and_reads_its_answer() {
+        let id = uuid::Uuid::now_v7();
+        let device = craft_cloud_api::DeviceId::generate();
+        let user = AdminUserInfo {
+            id,
+            username: "ana".into(),
+            role: "member".into(),
+            created_ms: 1,
+            disabled_ms: None,
+            two_factor_enabled: false,
+            devices_active: 1,
+            stored_bytes: 5,
+            quota_bytes: None,
+            invite_pending: false,
+        };
+        let code = AdminCode { code: "ABCDEFGHJKMNPQRS".into(), join_url: None, expires_ms: 9 };
+        let list = AdminUserList { users: vec![user.clone()], next: Some("YW5h".into()) };
+        let forbidden = json(&ErrorAnswer { error: "wrong_password".into(), message: "that is not your password".into() });
+        let script = vec![
+            (200, json(&list)),
+            (200, json(&list)),
+            (201, json(&AdminCreatedUser { user: user.clone(), invite: code.clone() })),
+            (200, json(&user)),
+            (204, String::new()),
+            (204, String::new()),
+            (202, String::new()),
+            (200, json(&code)),
+            (204, String::new()),
+            (200, json(&code)),
+            (204, String::new()),
+            (200, json(&AdminDevices { devices: Vec::new() })),
+            (204, String::new()),
+            (403, forbidden),
+        ];
+        let (_dir, agent, asked) = fake_agent(script);
+        let next = || asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        let confirm = AdminConfirm { password: Some("admin-secret-pw".into()), ..AdminConfirm::default() };
+        let password = |body: &str| serde_json::from_str::<serde_json::Value>(body).unwrap()["password"] == "admin-secret-pw";
+
+        assert_eq!(agent.admin_users(&UserQuery::default()).unwrap(), list);
+        assert_eq!(next(), ("GET".into(), "/v1/admin/users".into(), String::new()));
+        let page = UserQuery { cursor: Some("YW5h".into()), limit: Some(10), query: Some("an".into()) };
+        agent.admin_users(&page).unwrap();
+        assert_eq!(next().1, "/v1/admin/users?cursor=YW5h&limit=10&query=an");
+        let create =
+            AdminCreateUser { username: "bo".into(), role: "member".into(), password: Some("admin-secret-pw".into()), ..AdminCreateUser::default() };
+        assert_eq!(agent.admin_create_user(&create).unwrap().invite, code);
+        let (method, path, sent) = next();
+        assert_eq!((method.as_str(), path.as_str()), ("POST", "/v1/admin/users"));
+        assert!(password(&sent) && sent.contains("\"bo\""), "{sent}");
+        let update = AdminUpdateUser { quota_bytes: Some(None), password: Some("admin-secret-pw".into()), ..AdminUpdateUser::default() };
+        assert_eq!(agent.admin_update_user(id, &update).unwrap(), user);
+        let (method, path, sent) = next();
+        assert_eq!((method.as_str(), path.as_str()), ("PATCH", format!("/v1/admin/users/{id}").as_str()));
+        assert!(password(&sent) && sent.contains("\"quota_bytes\":null"), "{sent}");
+        agent.admin_disable_user(id, &confirm).unwrap();
+        assert_eq!(next().1, format!("/v1/admin/users/{id}/disable"));
+        agent.admin_enable_user(id, &confirm).unwrap();
+        assert_eq!(next().1, format!("/v1/admin/users/{id}/enable"));
+        agent.admin_remove_user(id, &confirm).unwrap();
+        let (method, path, sent) = next();
+        assert_eq!((method.as_str(), path.as_str()), ("DELETE", format!("/v1/admin/users/{id}").as_str()));
+        assert!(password(&sent));
+        assert_eq!(agent.admin_issue_invite(id, &confirm).unwrap(), code);
+        assert_eq!(next().1, format!("/v1/admin/users/{id}/invite"));
+        agent.admin_revoke_invite(id, &confirm).unwrap();
+        assert_eq!(next(), ("DELETE".into(), format!("/v1/admin/users/{id}/invite"), json(&confirm)));
+        let reset = AdminPasswordReset {
+            password: Some("admin-secret-pw".into()),
+            totp_code: Some("123456".into()),
+            reset_two_factor: true,
+            ..AdminPasswordReset::default()
+        };
+        assert_eq!(agent.admin_issue_reset(id, &reset).unwrap(), code);
+        let (_, path, sent) = next();
+        assert_eq!(path, format!("/v1/admin/users/{id}/password-reset"));
+        assert_eq!(serde_json::from_str::<AdminPasswordReset>(&sent).unwrap(), reset, "the factor and the reset flag go with it");
+        agent.admin_reset_two_factor(id, &confirm).unwrap();
+        assert_eq!(next().1, format!("/v1/admin/users/{id}/reset-two-factor"));
+        assert!(agent.admin_devices(id).unwrap().devices.is_empty());
+        assert_eq!(next(), ("GET".into(), format!("/v1/admin/users/{id}/devices"), String::new()));
+        agent.admin_revoke_device(id, device, &confirm).unwrap();
+        assert_eq!(next().1, format!("/v1/admin/users/{id}/devices/{device}"));
+        let wrong = agent.admin_disable_user(id, &confirm);
+        assert!(matches!(wrong, Err(Error::Refused { ref code, .. }) if code == "wrong_password"), "{wrong:?}");
     }
 
     /// An agent that takes the connection but never answers (hung, or something else on its port) costs a
