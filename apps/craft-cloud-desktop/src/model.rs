@@ -177,7 +177,11 @@ pub struct Trash {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrashAction {
-    Restore { path: Option<String>, parent_path: Option<String> },
+    /// `parent_path` is `None` without a path hint and empty for an item whose hint is a file in the sync root.
+    Restore {
+        path: Option<String>,
+        parent_path: Option<String>,
+    },
     Remove,
 }
 
@@ -609,6 +613,7 @@ impl Model {
                             .unwrap_or((None, None));
                         trash.notice = Some(if response.renamed {
                             match parent_path {
+                                Some(parent) if parent.is_empty() => format!("Restored as {} in the sync folder.", response.name),
                                 Some(parent) => format!("Restored as {} in {}.", response.name, parent),
                                 None => format!("Restored as {}. The destination path is unavailable.", response.name),
                             }
@@ -736,7 +741,7 @@ impl Model {
                 }
                 let Some(item) = t.page.as_ref().and_then(|p| p.items.iter().find(|item| item.id == id)) else { return Vec::new() };
                 let path = item.path.clone();
-                let parent_path = path.as_deref().and_then(|p| p.rsplit_once('/').map(|(parent, _)| parent.to_owned()));
+                let parent_path = path.as_deref().map(|p| p.rsplit_once('/').map(|(parent, _)| parent.to_owned()).unwrap_or_default());
                 self.begin_trash_action(id, TrashAction::Restore { path, parent_path })
             }
             Event::ConfirmRemoveTrash(id) => {
@@ -1506,6 +1511,134 @@ pub(crate) mod tests {
         assert!(t.error.as_deref().unwrap_or_default().contains("conflicts with the current folder contents"));
         assert!(!t.loading);
         assert!(t.action.is_none());
+    }
+
+    fn trash_restore_response(node: NodeId, name: &str, renamed: bool) -> TrashRestoreResponse {
+        TrashRestoreResponse {
+            node,
+            parent: NodeId::generate(),
+            name: name.into(),
+            renamed,
+            version: None,
+            seq: 1,
+            epoch: craft_cloud_proto::Epoch::generate(),
+        }
+    }
+
+    fn trash_ticket(m: &Model) -> u64 {
+        match &m.screen {
+            Screen::Trash(t) => t.ticket,
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn trash_restore_at_the_sync_root_says_so_even_when_renamed() {
+        let mut m = model();
+        let mut page = trash_page();
+        page.items[0].path = Some("painting.png".into());
+        let id = page.items[0].id;
+        m.screen = Screen::Trash(Trash { page: Some(page), loading: false, action: None, error: None, notice: None, confirm: None, ticket: 0 });
+        assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
+        let ticket = trash_ticket(&m);
+        m.update(Event::TrashRestored { ticket, result: Ok(trash_restore_response(id, "painting (1).png", true)) });
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert_eq!(t.notice.as_deref(), Some("Restored as painting (1).png in the sync folder."));
+    }
+
+    #[test]
+    fn trash_restore_renamed_without_path_keeps_the_unavailable_notice() {
+        let mut m = model();
+        let mut page = trash_page();
+        page.items[0].path = None;
+        let id = page.items[0].id;
+        m.screen = Screen::Trash(Trash { page: Some(page), loading: false, action: None, error: None, notice: None, confirm: None, ticket: 0 });
+        m.update(Event::RestoreTrash(id));
+        let ticket = trash_ticket(&m);
+        m.update(Event::TrashRestored { ticket, result: Ok(trash_restore_response(id, "painting (1).png", true)) });
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert_eq!(t.notice.as_deref(), Some("Restored as painting (1).png. The destination path is unavailable."));
+    }
+
+    #[test]
+    fn trash_late_page_reply_after_back_and_reopen_is_dropped() {
+        let mut m = model();
+        m.status = Some(status(true));
+        m.screen = Screen::SignedIn(Overview::new(status(true)));
+        assert_eq!(m.update(Event::OpenTrash), vec![Effect::Trash { cursor: None, ticket: 1 }]);
+        m.update(Event::BackTrash);
+        assert!(matches!(m.screen, Screen::SignedIn(_)));
+        let reopened = m.update(Event::OpenTrash);
+        let Some(Effect::Trash { ticket: fresh, .. }) = reopened.first().cloned() else { panic!("{reopened:?}") };
+        assert_ne!(fresh, 1);
+        assert!(m.update(Event::TrashPage { ticket: 1, result: Ok(trash_page()) }).is_empty());
+        assert!(matches!(&m.screen, Screen::Trash(t) if t.loading && t.page.is_none()));
+        m.update(Event::TrashPage { ticket: fresh, result: Ok(trash_page()) });
+        assert!(matches!(&m.screen, Screen::Trash(t) if !t.loading && t.page.is_some() && t.error.is_none()));
+    }
+
+    #[test]
+    fn trash_late_action_reply_after_back_and_reopen_is_dropped() {
+        let mut m = model();
+        let page = trash_page();
+        let id = page.items[0].id;
+        m.status = Some(status(true));
+        m.screen = Screen::SignedIn(Overview::new(status(true)));
+        m.update(Event::OpenTrash);
+        m.update(Event::TrashPage { ticket: 1, result: Ok(page.clone()) });
+        assert_eq!(m.update(Event::RestoreTrash(id)), vec![Effect::RestoreTrash { id, ticket: 2 }]);
+        m.update(Event::BackTrash);
+        let reopened = m.update(Event::OpenTrash);
+        let Some(Effect::Trash { ticket: fresh, .. }) = reopened.first().cloned() else { panic!("{reopened:?}") };
+        assert!(m.update(Event::TrashRestored { ticket: 2, result: Ok(trash_restore_response(id, "painting.png", false)) }).is_empty());
+        assert!(m.update(Event::TrashRemoved { ticket: 2, result: Ok(()) }).is_empty());
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert!(t.loading && t.notice.is_none());
+        m.update(Event::TrashPage { ticket: fresh, result: Ok(page) });
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert!(!t.loading && t.action.is_none() && t.page.is_some() && t.error.is_none());
+        assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
+    }
+
+    #[test]
+    fn trash_remove_failure_shows_the_error_and_frees_the_buttons() {
+        let mut m = model();
+        let page = trash_page();
+        let id = page.items[0].id;
+        m.screen = Screen::Trash(Trash { page: Some(page), loading: false, action: None, error: None, notice: None, confirm: None, ticket: 0 });
+        m.update(Event::ConfirmRemoveTrash(id));
+        assert!(matches!(m.update(Event::RemoveTrash).first(), Some(Effect::RemoveTrash { .. })));
+        let ticket = trash_ticket(&m);
+        assert!(
+            m.update(Event::TrashRemoved {
+                ticket,
+                result: Err(Error::Refused { code: api_codes::INTERNAL.into(), message: "server broke".into(), name_taken: None })
+            })
+            .is_empty()
+        );
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert!(t.error.is_some());
+        assert!(t.action.is_none() && !t.loading && t.confirm.is_none());
+        assert!(t.page.is_some());
+        assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
+    }
+
+    #[test]
+    fn trash_failed_next_page_keeps_rows_clears_loading_and_can_retry() {
+        let mut m = model();
+        m.screen = Screen::SignedIn(Overview::new(status(true)));
+        m.update(Event::OpenTrash);
+        let page = trash_page();
+        m.update(Event::TrashPage { ticket: 1, result: Ok(page.clone()) });
+        assert_eq!(m.update(Event::NextTrash), vec![Effect::Trash { cursor: Some("trash-cursor".into()), ticket: 2 }]);
+        assert!(m.update(Event::TrashPage { ticket: 2, result: Err(Error::Io("offline".into())) }).is_empty());
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert!(t.error.is_some());
+        assert!(!t.loading);
+        assert_eq!(t.page.as_ref(), Some(&page));
+        assert_eq!(m.update(Event::NextTrash), vec![Effect::Trash { cursor: Some("trash-cursor".into()), ticket: 3 }]);
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert!(t.loading && t.error.is_none());
     }
 
     #[test]

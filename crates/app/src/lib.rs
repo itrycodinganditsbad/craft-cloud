@@ -571,6 +571,30 @@ mod tests {
     }
 
     #[test]
+    fn trash_cursor_with_reserved_characters_is_percent_encoded() {
+        let (_dir, agent, asked) = fake_agent(vec![(200, json(&TrashResponse { items: vec![], next: None }))]);
+        agent.trash(Some("a+b/c=d&e f%g"), Some(25)).unwrap();
+        let (method, path, _body) = asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/v1/trash?cursor=a%2Bb/c%3Dd%26e%20f%25g&limit=25");
+        // The agent reads the query as URL-encoded pairs: decoding the value must give the cursor back.
+        let value = path.split_once("cursor=").and_then(|(_, rest)| rest.split_once('&')).map(|(value, _)| value).unwrap();
+        let mut decoded = Vec::new();
+        let bytes = value.as_bytes();
+        let mut at = 0;
+        while at < bytes.len() {
+            if bytes[at] == b'%' {
+                decoded.push(u8::from_str_radix(&value[at + 1..at + 3], 16).unwrap());
+                at += 3;
+            } else {
+                decoded.push(bytes[at]);
+                at += 1;
+            }
+        }
+        assert_eq!(String::from_utf8(decoded).unwrap(), "a+b/c=d&e f%g");
+    }
+
+    #[test]
     fn trash_restore_keeps_the_server_name_taken_detail() {
         let id = NodeId::generate();
         let refused = json(&ErrorAnswer { error: "conflict".into(), message: "no free conflict name".into(), name_taken: Some(true) });
