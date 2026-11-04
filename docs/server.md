@@ -97,10 +97,15 @@ can make one: **any signed-in computer can add more**, and turning two-factor si
   run if the key is missing, unreadable, or does not open all of them; the error names the key file the config expects.
   A server without a key and without any secrets runs, and setting it up answers `503 two_factor_unavailable`. Several
   servers on one Postgres database must all have the same key.
-- **Rotating the key.** Make a new key file, put it in `key_file` and the old one in `key_file_old`, run
-  `craft-cloud-server two-factor rekey --config cc-data/config.toml` (it rewrites every secret under the new key, one
-  account at a time, can be run again, prints only counts, and refuses without changing anything if a secret was sealed with
-  a key that is neither), then remove `key_file_old`. The server runs in the middle of a rotation, with both.
+- **Rotating the key.** A running server keeps the keys it started with, so rotate in this order: (1) make a new key file,
+  put it in `key_file` and the old one in `key_file_old`; (2) **restart every server instance on the database** with that
+  config (until then an instance still holds only the old key and goes on sealing new secrets with it); (3) run
+  `craft-cloud-server two-factor rekey --config cc-data/config.toml` (it rewrites every secret, active and set-up, under the
+  new key, one account at a time, reads each account's secrets fresh under its lock so a set-up confirmed meanwhile is not
+  missed, scans again at the end, can be run again, prints only counts, and refuses without changing anything if a secret
+  was sealed with a key that is neither); (4) remove `key_file_old` and restart **only after `rekey` has reported that every
+  secret is under the current key** (an error that says secrets are still under another key means it is not done: restart the
+  instances you missed and run it again). The server runs in the middle of a rotation, with both keys.
 - **A locked-out account.** A person who lost their authenticator and their recovery codes: `craft-cloud-server user
   --config cc-data/config.toml reset-2fa name` deletes its two-factor secret, recovery codes and sign-in challenges, lifts
   any lock, **signs every device out** (it prints how many) and deletes its open invite and add-a-computer codes. They sign

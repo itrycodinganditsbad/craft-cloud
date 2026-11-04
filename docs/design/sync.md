@@ -732,12 +732,15 @@ changes locally, then pushes local changes. These rules came out of the simulati
     config names (`[two_factor] key_file`, relative to `config.toml`), which `init` makes and the **server never makes**
     (a second server on the same Postgres database, or a restore without the key, would otherwise seal secrets
     nobody can open); the AES key is BLAKE3 `derive_key("craft-cloud 2026 totp secret v1", key)` of it. The key's name is
-    the first byte of the BLAKE3 hash of the key file, so it is a function of the key and never given to another one.
+    the first byte of the BLAKE3 hash of the key file: one of 256 values, only there to tell the current key from the old one
+    (the server refuses to start when they are equal). It does not identify a key (two different keys can share a name), and
+    the GCM authentication tag refuses a wrong key whatever the name says.
     **Fail closed**: when the database holds secrets, the server opens **every** one at start and refuses to run if the key
     is missing or one does not open, naming the file. With no secrets and no key it runs, and set-up answers `503
-    two_factor_unavailable`. **Rotation**: the new key in `key_file`, the old in `key_file_old`, then `two-factor rekey`
-    rewrites the secrets under the new one (one account at a time, repeatable, refusing when a secret has a key that is
-    neither), then `key_file_old` goes. Without the key the secrets of a backup are unusable: keep it apart from backups.
+    two_factor_unavailable`. **Rotation**: the new key in `key_file`, the old in `key_file_old`, every instance restarted with
+    both (a running server holds the keys it started with), then `two-factor rekey` rewrites the secrets under the new one
+    (one account at a time, each read fresh under the account's lock, a final scan, repeatable, refusing when a secret has a
+    key that is neither), then `key_file_old` goes, after `rekey` reported that nothing is left under another key. Without the key the secrets of a backup are unusable: keep it apart from backups.
   - **Recovery codes** are ten of 16 characters in the join codes' alphabet (80 bits, shown in groups of four), stored as
     the BLAKE3 hash of the normalised code, no pepper: 80 bits can't be searched even from a leaked database, and the codes
     work whatever happens to the key. Each works once; new ones replace all the old. A recovery code stands in for a
@@ -761,8 +764,9 @@ changes locally, then pushes local changes. These rules came out of the simulati
     five tries, once; at most five are open per account (the oldest goes); the address it was made for is only an extra
     binding (behind a proxy that hides addresses all clients share one), the secret token is what binds it. A password
     change, a reset, turning it off or on and a disable delete the account's challenges.
-  - **Wrong proofs** are committed in a transaction of their own after the one that refused them rolled back (the invite
-    stays, the challenge stays, the counters survive). Ten wrong ones in a row lock the account's second factor for 15
+  - **Wrong proofs** are counted and committed in the transaction that refused them, under the account's lock (every check
+    runs before anything is consumed, so the invite stays, the challenge stays, no device is made): the next request sees the
+    attempts and the lock, so a challenge takes five wrong proofs and no more, and the tenth sets the lock. Ten wrong ones in a row lock the account's second factor for 15
     minutes; each wrong one after a lock ran out doubles it, up to 24 hours; a right one resets it; `user reset-2fa` lifts
     it. While it lasts every path (second step, join, turning off, new recovery codes, the admin's confirmation) answers
     `429 two_factor_locked` with `Retry-After`. It is never permanent, so nobody with the bare password can lock an
