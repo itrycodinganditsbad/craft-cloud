@@ -19,7 +19,7 @@
 //! Nothing here frees anything. The index is read by the checker (`verify`) and by whatever later decides what is
 //! garbage; until it says a manifest is complete, that manifest's chunks are unknown, and unknown means kept.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use craft_cloud_proto::{BlobKind, ChunkId, Manifest, ManifestId};
 use sqlx::Row;
@@ -44,6 +44,15 @@ const COMPLETE: i64 = 1;
 /// and nothing is marked complete until the last edge is gone and the state is back to [`BUILDING`]. A run that stops
 /// halfway leaves this marker, and the next one carries on from the rows that are left.
 const RESETTING: i64 = 2;
+
+/// What the database records of a blob: its ID, the bytes it is stored as (the format byte included) and, for a
+/// manifest, the size of its file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobRecord {
+    pub id: [u8; 32],
+    pub stored_size: u64,
+    pub file_size: Option<u64>,
+}
 
 /// How far a manifest's index has come.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,29 +482,38 @@ impl Meta {
         rows.iter().map(|r| Ok(ManifestId::from_bytes(hash_from(&r.try_get::<Vec<u8>, _>("id")?)?))).collect()
     }
 
-    /// Up to `limit` recorded blobs of `kind` after `after`, in ID order.
-    pub async fn blob_ids_after(&self, kind: BlobKind, after: Option<[u8; 32]>, limit: usize) -> Result<Vec<[u8; 32]>, MetaError> {
+    /// Up to `limit` recorded blobs of `kind` after `after`, in ID order, with what the database says of their sizes.
+    pub async fn blob_records_after(&self, kind: BlobKind, after: Option<[u8; 32]>, limit: usize) -> Result<Vec<BlobRecord>, MetaError> {
         let after = after.map_or_else(|| vec![0u8; 32], |id| id.to_vec());
-        let rows = sqlx::query("SELECT id FROM blobs WHERE kind = $1 AND id > $2 ORDER BY id LIMIT $3")
+        let rows = sqlx::query("SELECT id, stored_size, file_size FROM blobs WHERE kind = $1 AND id > $2 ORDER BY id LIMIT $3")
             .bind(kind.code())
             .bind(after)
             .bind(i64::try_from(limit).map_err(|_| MetaError::Invalid("limit too large"))?)
             .fetch_all(&self.pool)
             .await?;
-        rows.iter().map(|r| hash_from(&r.try_get::<Vec<u8>, _>("id")?)).collect()
+        rows.iter()
+            .map(|r| {
+                let file_size: Option<i64> = r.try_get("file_size")?;
+                Ok(BlobRecord {
+                    id: hash_from(&r.try_get::<Vec<u8>, _>("id")?)?,
+                    stored_size: to_u64(r.try_get("stored_size")?)?,
+                    file_size: file_size.map(to_u64).transpose()?,
+                })
+            })
+            .collect()
     }
 
-    /// Which of `ids` are recorded chunks.
-    pub async fn recorded_chunks(&self, ids: &[ChunkId]) -> Result<HashSet<ChunkId>, MetaError> {
-        let mut found = HashSet::new();
+    /// Of `ids`, the recorded chunks and how many bytes each is stored as (the format byte included).
+    pub async fn recorded_chunk_sizes(&self, ids: &[ChunkId]) -> Result<HashMap<ChunkId, u64>, MetaError> {
+        let mut found = HashMap::new();
         for part in ids.chunks(ROWS_PER_STATEMENT) {
-            let sql = format!("SELECT id FROM blobs WHERE kind = $1 AND id IN ({})", placeholders(2, part.len()));
+            let sql = format!("SELECT id, stored_size FROM blobs WHERE kind = $1 AND id IN ({})", placeholders(2, part.len()));
             let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(BlobKind::Chunk.code());
             for id in part {
                 query = query.bind(id.as_bytes().to_vec());
             }
             for row in query.fetch_all(&self.pool).await? {
-                found.insert(ChunkId::from_bytes(hash_from(&row.try_get::<Vec<u8>, _>("id")?)?));
+                found.insert(ChunkId::from_bytes(hash_from(&row.try_get::<Vec<u8>, _>("id")?)?), to_u64(row.try_get("stored_size")?)?);
             }
         }
         Ok(found)

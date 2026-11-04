@@ -126,6 +126,12 @@ impl Store {
 
     /// Reads a blob and checks it. A blob whose bytes no longer match its ID is an error, never served.
     pub async fn get(&self, key: BlobKey) -> Result<Bytes, StoreError> {
+        self.get_sized(key).await.map(|(data, _)| data)
+    }
+
+    /// Like [`Store::get`], and also says how many bytes the object is stored as (the format byte included), which is
+    /// what the metadata records as the blob's stored size.
+    pub async fn get_sized(&self, key: BlobKey) -> Result<(Bytes, u64), StoreError> {
         let object = self.backend.get_raw(&key.path()).await?.ok_or(StoreError::NotFound(key))?;
         let Some((&format, _)) = object.split_first() else {
             return Err(StoreError::Corrupt { key, reason: "empty object" });
@@ -133,6 +139,7 @@ impl Store {
         if format != FORMAT_PLAIN {
             return Err(StoreError::Corrupt { key, reason: "unknown format byte" });
         }
+        let stored = u64::try_from(object.len()).unwrap_or(u64::MAX);
         let data = object.slice(1..);
         if data.len() > max_len(key.kind) {
             return Err(StoreError::Corrupt { key, reason: "larger than the limit" });
@@ -140,7 +147,7 @@ impl Store {
         if *blake3::hash(&data).as_bytes() != key.id {
             return Err(StoreError::Corrupt { key, reason: "hash mismatch" });
         }
-        Ok(data)
+        Ok((data, stored))
     }
 
     pub async fn delete(&self, key: BlobKey) -> Result<(), StoreError> {

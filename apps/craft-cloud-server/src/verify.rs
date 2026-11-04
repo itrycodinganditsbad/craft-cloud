@@ -1,8 +1,9 @@
 //! The invariant checker behind `craft-cloud-server verify`, and the index builder behind `craft-cloud-server index
 //! build`.
 //!
-//! `verify` reads and reports; it changes nothing (opening the database brings its schema up to date, as every command
-//! does, and that is all). It checks what a later garbage collector would have to trust: that every manifest's list of
+//! `verify` reads and reports; it changes nothing: the database and the storage must exist already (a wrong path is an
+//! error, not a new empty server with no problems), and a database whose schema is older is refused, not upgraded. It
+//! checks what a later garbage collector would have to trust: that every manifest's list of
 //! chunks in the database is complete and equal to the manifest object in the store, that every chunk a manifest names
 //! is recorded and its object is there and intact, and that nothing in the database names a manifest or a chunk that does
 //! not exist. Anything it cannot establish is reported, not guessed: a manifest it cannot read or whose index is not
@@ -189,7 +190,12 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Reads a manifest object and decodes it; `Err` says what is wrong with it.
 pub async fn read_manifest(store: &Store, id: &ManifestId) -> Result<Manifest, (&'static str, Option<String>)> {
-    let bytes = store.get(BlobKey::manifest(id)).await.map_err(|e| {
+    read_manifest_sized(store, id).await.map(|(manifest, _)| manifest)
+}
+
+/// Like [`read_manifest`], with the bytes the object is stored as (the format byte included).
+async fn read_manifest_sized(store: &Store, id: &ManifestId) -> Result<(Manifest, u64), (&'static str, Option<String>)> {
+    let (bytes, stored) = store.get_sized(BlobKey::manifest(id)).await.map_err(|e| {
         let (kind, detail) = store_problem(&e);
         (
             if kind == "object_missing" {
@@ -206,7 +212,7 @@ pub async fn read_manifest(store: &Store, id: &ManifestId) -> Result<Manifest, (
     if manifest.id() != *id {
         return Err(("manifest_id_mismatch", None));
     }
-    Ok(manifest)
+    Ok((manifest, stored))
 }
 
 /// Checks the database and the store against each other and reports. Changes nothing.
@@ -230,30 +236,62 @@ pub async fn verify(meta: &Meta, store: &Store, options: VerifyOptions) -> Resul
     // Every recorded manifest: its object, its index, the chunks it names.
     let mut after: Option<[u8; 32]> = None;
     loop {
-        let ids = meta.blob_ids_after(BlobKind::Manifest, after, PAGE).await?;
-        let Some(last) = ids.last().copied() else { break };
+        let records = meta.blob_records_after(BlobKind::Manifest, after, PAGE).await?;
+        let Some(last) = records.last().map(|r| r.id) else { break };
         after = Some(last);
-        for raw in ids {
+        for record in records {
+            let raw = record.id;
             report.manifests_checked += 1;
             let id = ManifestId::from_bytes(raw);
-            let manifest = match read_manifest(store, &id).await {
-                Ok(manifest) => manifest,
+            let (manifest, stored) = match read_manifest_sized(store, &id).await {
+                Ok(read) => read,
                 Err((kind, detail)) => {
                     report.add(kind, hex(&raw), detail);
                     continue;
                 }
             };
+            // What the database records of the manifest is what the object is: the bytes it is stored as, and the size
+            // of the file it describes.
+            if record.stored_size != stored {
+                report.add(
+                    "manifest_stored_size_mismatch",
+                    hex(&raw),
+                    Some(format!("the database records {} bytes, the object is {stored}", record.stored_size)),
+                );
+            }
+            if record.file_size != Some(manifest.size()) {
+                let recorded = record.file_size.map_or_else(|| "none".to_owned(), |n| n.to_string());
+                report.add(
+                    "manifest_file_size_mismatch",
+                    hex(&raw),
+                    Some(format!("the database records a file of {recorded} bytes, the manifest says {}", manifest.size())),
+                );
+            }
             if let IndexState::Complete { .. } = meta.index_state(&id).await?
                 && let EdgeCheck::Mismatch(problem) = meta.index_check(&manifest).await?
             {
                 report.add("index_mismatch", hex(&raw), Some(format!("ordinal {}: {}", problem.ordinal, problem.kind.as_str())));
             }
-            let ids: Vec<ChunkId> = manifest.chunks().iter().map(|c| c.id).collect();
-            for part in ids.chunks(500) {
-                let recorded = meta.recorded_chunks(part).await?;
-                for chunk in part {
-                    if !recorded.contains(chunk) {
+            for refs in manifest.chunks().chunks(500) {
+                let part: Vec<ChunkId> = refs.iter().map(|c| c.id).collect();
+                let recorded = meta.recorded_chunk_sizes(&part).await?;
+                for chunk in &part {
+                    if !recorded.contains_key(chunk) {
                         report.add("chunk_not_recorded", format!("{}/{}", hex(&raw), hex(chunk.as_bytes())), None);
+                    }
+                }
+                // The manifest says how long each chunk is; the database records the bytes it is stored as, one more
+                // than that (the format byte). With the chunk objects read below, this ties the length the manifest
+                // names to the bytes in the store.
+                for chunk in refs {
+                    if let Some(stored) = recorded.get(&chunk.id)
+                        && *stored != u64::from(chunk.len).saturating_add(1)
+                    {
+                        report.add(
+                            "chunk_length_mismatch",
+                            format!("{}/{}", hex(&raw), hex(chunk.id.as_bytes())),
+                            Some(format!("the manifest says {} bytes, the database records {stored} stored", chunk.len)),
+                        );
                     }
                 }
             }
@@ -263,22 +301,35 @@ pub async fn verify(meta: &Meta, store: &Store, options: VerifyOptions) -> Resul
     // Every recorded chunk's object (it also finds chunks no manifest names, which a manifest walk would not).
     let mut after: Option<[u8; 32]> = None;
     loop {
-        let ids = meta.blob_ids_after(BlobKind::Chunk, after, PAGE).await?;
-        let Some(last) = ids.last().copied() else { break };
+        let records = meta.blob_records_after(BlobKind::Chunk, after, PAGE).await?;
+        let Some(last) = records.last().map(|r| r.id) else { break };
         after = Some(last);
-        for raw in ids {
+        for record in records {
+            let raw = record.id;
             report.chunks_checked += 1;
             if !options.read_chunks {
                 continue;
             }
-            if let Err(e) = store.get(BlobKey::chunk(&ChunkId::from_bytes(raw))).await {
-                let (kind, detail) = store_problem(&e);
-                let kind = match kind {
-                    "object_missing" => "chunk_object_missing",
-                    "object_corrupt" => "chunk_object_corrupt",
-                    other => other,
-                };
-                report.add(kind, hex(&raw), detail);
+            match store.get_sized(BlobKey::chunk(&ChunkId::from_bytes(raw))).await {
+                // Read, and its hash is right: its length is what the database records.
+                Ok((_, stored)) => {
+                    if stored != record.stored_size {
+                        report.add(
+                            "chunk_stored_size_mismatch",
+                            hex(&raw),
+                            Some(format!("the database records {} bytes, the object is {stored}", record.stored_size)),
+                        );
+                    }
+                }
+                Err(e) => {
+                    let (kind, detail) = store_problem(&e);
+                    let kind = match kind {
+                        "object_missing" => "chunk_object_missing",
+                        "object_corrupt" => "chunk_object_corrupt",
+                        other => other,
+                    };
+                    report.add(kind, hex(&raw), detail);
+                }
             }
         }
     }

@@ -721,13 +721,15 @@ each from the store and checking it against its ID first; it resumes where it st
 A manifest is marked complete only after every edge was compared, ordinal by ordinal, with the manifest it was made from:
 equal counts are not enough, and repeated chunks, wrong IDs, swapped order, missing and extra edges are all found. An
 index that does not match its manifest while it is still being built is thrown away and written again; a complete index
-that is wrong is only reported. Nothing in this slice frees anything: no deletion, no claims, no collection, no retention.
+that is wrong is only reported. Throwing the edges away is itself done in batches of the same size (a marker on the index row says it is under way, so an interrupted run resumes), never in one transaction; an edge at a negative ordinal is a mismatch like any other. Nothing in this slice frees anything: no deletion, no claims, no collection, no retention.
 
-`craft-cloud-server verify [--json] [--skip-chunk-reads]` reads and reports and changes nothing (opening the database
-brings its schema up to date, as every command does). It lists problems (which make it exit with an error): a manifest
+`craft-cloud-server verify [--json] [--skip-chunk-reads]` reads and reports and changes nothing: the database and the
+storage directory must exist already (a wrong path is an error, not a new empty server with "no problems found"), and a
+database whose schema is older than the program is refused, not upgraded (start the server once to upgrade it). It lists
+problems (which make it exit with an error): a manifest
 object that is missing, damaged or not a manifest; a complete index that does not equal its manifest; edges whose manifest
 has no index row; an index row without a recorded manifest; an edge or a manifest that names a chunk that is not recorded;
-a chunk object that is missing or damaged; a version, snapshot or import snapshot that names a manifest that is not
+a chunk object that is missing or damaged; a size the database records that is not what the object has (the stored length of a chunk or manifest object, a chunk length the manifest names against the length recorded for that chunk, the file size recorded for a manifest); a version, snapshot or import snapshot that names a manifest that is not
 recorded; blob memberships without a blob. It also gives notices (which do not): manifests whose index is not complete,
 manifests no version or snapshot names, and chunks no complete manifest names. **The manifests no version or snapshot
 names are not garbage.** A live document's binary assets (images and the like, uploaded through the agent's blob

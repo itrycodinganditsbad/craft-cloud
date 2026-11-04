@@ -514,3 +514,93 @@ async fn an_index_built_after_the_fact_is_exact_and_verify_notices_until_then() 
 async fn verify_needs_a_config() {
     assert!(matches!(cli(&["verify"], "").await, Err(CliError::Usage(m)) if m.contains("--config")));
 }
+
+/// The config of `s` with its database url and its storage path replaced where given.
+fn config_with(s: &Seeded, database: Option<&std::path::Path>, storage: Option<&std::path::Path>) -> String {
+    let text = std::fs::read_to_string(&s.config).unwrap();
+    let slashed = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| match (line.trim_start(), database, storage) {
+            (l, Some(db), _) if l.starts_with("url =") => format!("url = \"sqlite:{}\"", slashed(db)),
+            (l, _, Some(path)) if l.starts_with("path =") => format!("path = \"{}\"", slashed(path)),
+            _ => line.to_owned(),
+        })
+        .collect();
+    let target = s.dir.join("wrong.toml");
+    std::fs::write(&target, lines.join("\n")).unwrap();
+    target.to_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn verify_of_a_wrong_database_path_is_an_error_and_creates_nothing() {
+    let s = seeded().await;
+    let nowhere = s.dir.join("nowhere");
+    let missing_db = nowhere.join("meta.db");
+    let config = config_with(&s, Some(&missing_db), None);
+    let err = cli(&["verify", "--config", &config], "").await.expect_err("a database that is not there must not verify");
+    assert!(!matches!(err, CliError::Inconsistent(_)), "an error, not a report: {err}");
+    assert!(!missing_db.exists() && !nowhere.exists(), "nothing is created");
+    // The same in a folder that exists: no new empty database appears in it.
+    let existing_dir_db = s.dir.join("other.db");
+    let config = config_with(&s, Some(&existing_dir_db), None);
+    assert!(cli(&["verify", "--config", &config, "--json"], "").await.is_err());
+    assert!(!existing_dir_db.exists(), "no empty database was created");
+    // A file that is not a Craft Cloud database is refused too.
+    let empty = s.dir.join("empty.db");
+    std::fs::write(&empty, b"").unwrap();
+    let config = config_with(&s, Some(&empty), None);
+    assert!(cli(&["verify", "--config", &config], "").await.is_err());
+    assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0, "and left as it was");
+}
+
+#[tokio::test]
+async fn verify_of_a_wrong_storage_path_is_an_error_and_creates_nothing() {
+    let s = seeded().await;
+    let missing = s.dir.join("no-blobs-here");
+    let config = config_with(&s, None, Some(&missing));
+    let err = cli(&["verify", "--config", &config], "").await.expect_err("storage that is not there must not verify");
+    assert!(matches!(err, CliError::Usage(_)), "{err}");
+    assert!(!missing.exists(), "the storage directory is not created");
+}
+
+#[tokio::test]
+async fn verify_reports_sizes_the_database_records_wrongly() {
+    let s = seeded().await;
+    let mut conn = raw_sqlite(&s.db_url).await;
+    let (a, b) = (s.chunks[0], s.chunks[1]);
+    // A chunk recorded as longer than the manifest says (the manifest lists it twice), and a chunk whose stored length
+    // differs from the object's.
+    sqlx::query("UPDATE blobs SET stored_size = stored_size + 7 WHERE kind = 0 AND id = $1")
+        .bind(a.as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE blobs SET stored_size = stored_size - 1 WHERE kind = 0 AND id = $1")
+        .bind(b.as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // The manifest's stored size and its file's size.
+    sqlx::query("UPDATE blobs SET stored_size = stored_size + 3, file_size = file_size + 1 WHERE kind = 1 AND id = $1")
+        .bind(s.manifest.as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // Without reading the chunk objects the database's own sizes are checked against the manifests.
+    let (json, ok) = verify_json(&s.config, &["--skip-chunk-reads"]).await;
+    assert!(!ok, "{json}");
+    let by = &json["problems"]["by_kind"];
+    assert_eq!(by["chunk_length_mismatch"], 3, "{json}");
+    assert_eq!(by["manifest_stored_size_mismatch"], 1, "{json}");
+    assert_eq!(by["manifest_file_size_mismatch"], 1, "{json}");
+    assert!(by["chunk_stored_size_mismatch"].is_null(), "the objects were not read: {json}");
+    // Reading them also compares the stored lengths with the objects.
+    let (json, ok) = verify_json(&s.config, &[]).await;
+    assert!(!ok);
+    assert_eq!(json["problems"]["by_kind"]["chunk_stored_size_mismatch"], 2, "{json}");
+    assert_eq!(json["problems"]["by_kind"]["chunk_length_mismatch"], 3, "{json}");
+    // Looking repairs nothing.
+    let (again, _) = verify_json(&s.config, &[]).await;
+    assert_eq!(again["problems"]["by_kind"], json["problems"]["by_kind"]);
+}

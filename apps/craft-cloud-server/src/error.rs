@@ -100,7 +100,7 @@ impl From<MetaError> for ApiError {
             MetaError::DocFull { .. } | MetaError::LiveFull { .. } | MetaError::TooManyDocs { .. } | MetaError::TooManyDocRows { .. } => {
                 Self::new(StatusCode::INSUFFICIENT_STORAGE, codes::QUOTA_EXCEEDED, e.to_string())
             }
-            MetaError::Db(_) | MetaError::Corrupt(_) | MetaError::UnsupportedUrl => {
+            MetaError::Db(_) | MetaError::Corrupt(_) | MetaError::Missing(_) | MetaError::UnsupportedUrl => {
                 tracing::error!(error = %e, "metadata error");
                 Self::internal()
             }

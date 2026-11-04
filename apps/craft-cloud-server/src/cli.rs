@@ -185,6 +185,23 @@ pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
     Ok((meta, store))
 }
 
+/// Like [`open`], for a command that only reads: the database and the storage must exist already, and nothing is
+/// created or upgraded. A config that points at the wrong place is an error, not a new empty server that has no problems.
+pub async fn open_existing(config: &Config) -> Result<(Meta, Store), CliError> {
+    let meta = Meta::open_existing(&config.database.url).await?;
+    let store = match (&config.storage, config.storage.s3()?) {
+        (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
+        (StorageConfig::Disk { path }, None) => {
+            if !path.is_dir() {
+                return Err(CliError::Usage(format!("the storage directory {} does not exist (is the config's path right?)", path.display())));
+            }
+            Store::new(DiskBackend::new(path)?)
+        }
+        (StorageConfig::S3 { .. }, None) => return Err(CliError::Usage("S3 storage without settings".into())),
+    };
+    Ok((meta, store))
+}
+
 /// `--config` is global, which clap can't also make required, so it is checked here.
 fn config_path(config: Option<PathBuf>) -> Result<PathBuf, CliError> {
     config.ok_or_else(|| CliError::Usage("--config <path to config.toml> is required".into()))
@@ -279,7 +296,7 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
             Ok(())
         }
         Command::Verify { config, json, skip_chunk_reads } => {
-            let (meta, store) = open(&Config::load(&config_path(config)?)?).await?;
+            let (meta, store) = open_existing(&Config::load(&config_path(config)?)?).await?;
             let report = crate::verify::verify(&meta, &store, crate::verify::VerifyOptions { read_chunks: !skip_chunk_reads }).await?;
             if json {
                 writeln!(out, "{}", report.to_json())?;
