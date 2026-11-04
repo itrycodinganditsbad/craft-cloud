@@ -305,7 +305,7 @@ struct Seeded {
     db_url: String,
     chunks: Vec<craft_cloud_proto::ChunkId>,
     manifest: craft_cloud_proto::ManifestId,
-    meta: craft_cloud_meta::Meta,
+    meta: Option<craft_cloud_meta::Meta>,
     _keep: tempfile::TempDir,
 }
 
@@ -351,7 +351,7 @@ async fn seeded() -> Seeded {
         dir,
         chunks,
         manifest: manifest.id(),
-        meta,
+        meta: Some(meta),
         _keep: keep,
     }
 }
@@ -359,6 +359,17 @@ async fn seeded() -> Seeded {
 async fn raw_sqlite(url: &str) -> sqlx::SqliteConnection {
     use sqlx::Connection;
     sqlx::SqliteConnection::connect(url).await.unwrap()
+}
+
+async fn sqlite_snapshot(url: &str, db_path: &std::path::Path) -> Vec<Option<Vec<u8>>> {
+    use sqlx::Connection;
+    let mut conn = raw_sqlite(url).await;
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&mut conn).await.unwrap();
+    conn.close().await.unwrap();
+    [db_path.to_owned(), db_path.with_extension("db-wal"), db_path.with_extension("db-shm")]
+        .into_iter()
+        .map(|path| path.exists().then(|| std::fs::read(path).unwrap()))
+        .collect()
 }
 
 fn object_path(dir: &std::path::Path, kind: &str, id: &[u8; 32]) -> std::path::PathBuf {
@@ -385,7 +396,7 @@ async fn verify_json(c: &str, extra: &[&str]) -> (serde_json::Value, bool) {
 #[tokio::test]
 async fn verify_passes_on_a_sound_server_and_changes_nothing() {
     let s = seeded().await;
-    let before = s.meta.index_edge_count().await.unwrap();
+    let before = s.meta.as_ref().unwrap().index_edge_count().await.unwrap();
     let out = cli(&["verify", "--config", &s.config], "").await.unwrap();
     assert!(out.contains("no problems found"), "{out}");
     assert!(out.contains("checked 1 manifest(s) and 2 chunk(s) (chunk objects read and hashed)"), "{out}");
@@ -397,8 +408,8 @@ async fn verify_passes_on_a_sound_server_and_changes_nothing() {
         (Some(1), Some(1), Some(true))
     );
     assert_eq!(json["problems"]["total"], 0);
-    assert_eq!(s.meta.index_edge_count().await.unwrap(), before);
-    assert_eq!(s.meta.index_edges(&s.manifest).await.unwrap().len(), 3);
+    assert_eq!(s.meta.as_ref().unwrap().index_edge_count().await.unwrap(), before);
+    assert_eq!(s.meta.as_ref().unwrap().index_edges(&s.manifest).await.unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -490,7 +501,7 @@ async fn an_index_built_after_the_fact_is_exact_and_verify_notices_until_then() 
     let out = cli(&["index", "build", "--config", &s.config, "--batch-rows", "2"], "").await.unwrap();
     assert!(out.contains("indexed 1 manifest(s)"), "{out}");
     assert_eq!(
-        s.meta.index_edges(&s.manifest).await.unwrap().iter().map(|(_, c)| *c).collect::<Vec<_>>(),
+        s.meta.as_ref().unwrap().index_edges(&s.manifest).await.unwrap().iter().map(|(_, c)| *c).collect::<Vec<_>>(),
         vec![s.chunks[0], s.chunks[1], s.chunks[0]]
     );
     let (json, ok) = verify_json(&s.config, &[]).await;
@@ -506,8 +517,8 @@ async fn an_index_built_after_the_fact_is_exact_and_verify_notices_until_then() 
     std::fs::remove_file(object_path(&s.dir, "manifests", s.manifest.as_bytes())).unwrap();
     let built = cli(&["index", "build", "--config", &s.config], "").await;
     assert!(matches!(built, Err(CliError::Inconsistent(_))), "{built:?}");
-    assert_eq!(s.meta.index_state(&s.manifest).await.unwrap(), craft_cloud_meta::IndexState::Absent);
-    assert!(s.meta.index_edges(&s.manifest).await.unwrap().is_empty());
+    assert_eq!(s.meta.as_ref().unwrap().index_state(&s.manifest).await.unwrap(), craft_cloud_meta::IndexState::Absent);
+    assert!(s.meta.as_ref().unwrap().index_edges(&s.manifest).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -552,6 +563,27 @@ async fn verify_of_a_wrong_database_path_is_an_error_and_creates_nothing() {
     let config = config_with(&s, Some(&empty), None);
     assert!(cli(&["verify", "--config", &config], "").await.is_err());
     assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0, "and left as it was");
+}
+
+#[tokio::test]
+async fn verify_refuses_older_and_newer_schemas_without_changing_the_database() {
+    let mut s = seeded().await;
+    let db_path = std::path::PathBuf::from(s.db_url.strip_prefix("sqlite:").unwrap().split('?').next().unwrap());
+    let mut conn = raw_sqlite(&s.db_url).await;
+    let current: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
+    use sqlx::Connection;
+    conn.close().await.unwrap();
+    drop(s.meta.take());
+    for (version, message) in [(current - 1, "start the server once"), (current + 1, "newer Craft Cloud")] {
+        let mut conn = raw_sqlite(&s.db_url).await;
+        sqlx::query("DELETE FROM schema_version").execute(&mut conn).await.unwrap();
+        sqlx::query("INSERT INTO schema_version (version) VALUES ($1)").bind(version).execute(&mut conn).await.unwrap();
+        conn.close().await.unwrap();
+        let before = sqlite_snapshot(&s.db_url, &db_path).await;
+        let error = cli(&["verify", "--config", &s.config], "").await.expect_err("verify must refuse a non-current schema");
+        assert!(error.to_string().contains(message), "{error}");
+        assert!(sqlite_snapshot(&s.db_url, &db_path).await == before, "verify changed the database, WAL, or SHM for schema version {version}");
+    }
 }
 
 #[tokio::test]

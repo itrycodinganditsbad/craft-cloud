@@ -3335,6 +3335,132 @@ async fn a_build_resets_a_wrong_index_in_batches_on(url: &str) {
     assert_eq!(meta.index_edges(&m.id()).await.unwrap(), edge_list(&chunks));
 }
 
+/// An edge at `i64::MAX` follows valid pages and keeps a manifest from validating without overflowing the cursor.
+async fn an_edge_at_i64_max_is_reported_on(url: &str) {
+    use craft_cloud_meta::{EdgeCheck, EdgeProblemKind};
+    let meta = Meta::open(url).await.unwrap().with_index_batch_rows(2);
+    let ana = user(&meta, "ana").await;
+    let chunks = fresh_chunks(3);
+    let m = manifest_over(&meta, &ana, &chunks).await;
+    meta.add_manifest(ana.space, &m, 100, NOW).await.unwrap();
+    meta.index_complete(&m).await.unwrap();
+    let mut conn = raw(url).await;
+    sqlx::query("INSERT INTO manifest_chunks (manifest, ordinal, chunk) VALUES ($1, $2, $3)")
+        .bind(m.id().as_bytes().to_vec())
+        .bind(i64::MAX)
+        .bind(random_chunk().as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let expected = EdgeCheck::Mismatch(craft_cloud_meta::EdgeProblem { ordinal: 3, kind: EdgeProblemKind::MissingEdge });
+    assert_eq!(meta.index_check(&m).await.unwrap(), expected);
+    assert_eq!(meta.index_check(&m).await.unwrap(), expected, "the later page is stable, with no cursor overflow");
+    let edges = meta.index_edges(&m.id()).await.unwrap();
+    assert_eq!(edges.len(), 4);
+    assert_eq!(edges.last().unwrap().0, i64::MAX as u64, "the final page contains the maximum ordinal");
+}
+
+/// A reset of 12 edges at budget 3 takes four full batches and one empty batch before returning to building state 0.
+async fn an_exact_multiple_index_reset_finishes_after_one_empty_batch_on(url: &str) {
+    use craft_cloud_meta::IndexState;
+    let meta = Meta::open(url).await.unwrap().with_index_batch_rows(3);
+    let ana = user(&meta, "ana").await;
+    let chunks = fresh_chunks(12);
+    let m = manifest_over(&meta, &ana, &chunks).await;
+    meta.add_manifest(ana.space, &m, 100, NOW).await.unwrap();
+    meta.index_complete(&m).await.unwrap();
+    let before = meta.index_edge_count().await.unwrap();
+    let mut conn = raw(url).await;
+    let changed = sqlx::query("UPDATE manifest_chunks SET chunk = $1 WHERE manifest = $2 AND ordinal = 5")
+        .bind(random_chunk().as_bytes().to_vec())
+        .bind(m.id().as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(changed.rows_affected(), 1, "the index damage must hit one existing edge");
+    sqlx::query("UPDATE manifest_index SET indexed_ordinals = 0, state = 2 WHERE manifest = $1")
+        .bind(m.id().as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    for batch in 1..=4 {
+        assert_eq!(meta.index_stage(&m).await.unwrap(), IndexState::Building { done: 0, total: 12 });
+        assert_eq!(meta.index_edge_count().await.unwrap(), before - batch * 3);
+    }
+    let state: i64 = sqlx::query_scalar("SELECT state FROM manifest_index WHERE manifest = $1")
+        .bind(m.id().as_bytes().to_vec())
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(state, 2, "four full batches leave reset state 2 until an empty batch proves completion");
+    assert_eq!(meta.index_edge_count().await.unwrap(), before - 12);
+
+    assert_eq!(meta.index_stage(&m).await.unwrap(), IndexState::Building { done: 0, total: 12 });
+    let state: i64 = sqlx::query_scalar("SELECT state FROM manifest_index WHERE manifest = $1")
+        .bind(m.id().as_bytes().to_vec())
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(state, 0);
+    assert_eq!(meta.index_edge_count().await.unwrap(), before - 12);
+    assert_eq!(meta.index_stage(&m).await.unwrap(), IndexState::Building { done: 3, total: 12 }, "the next call writes instead of looping");
+    meta.index_complete(&m).await.unwrap();
+    assert_eq!(meta.index_state(&m.id()).await.unwrap(), IndexState::Complete { total: 12 });
+    assert_eq!(meta.index_edges(&m.id()).await.unwrap(), edge_list(&chunks));
+}
+
+/// Two independent Postgres handles finish one damaged manifest reset without duplicate or missing ordinals.
+async fn concurrent_index_completes_reset_one_manifest_on(url: &str) {
+    use craft_cloud_meta::IndexState;
+    let left = Meta::open(url).await.unwrap().with_index_batch_rows(3);
+    let right = Meta::open(url).await.unwrap().with_index_batch_rows(3);
+    let ana = user(&left, "ana").await;
+    let chunks = fresh_chunks(12);
+    let m = manifest_over(&left, &ana, &chunks).await;
+    left.add_manifest(ana.space, &m, 100, NOW).await.unwrap();
+    left.index_complete(&m).await.unwrap();
+    let mut conn = raw(url).await;
+    let changed = sqlx::query("UPDATE manifest_chunks SET chunk = $1 WHERE manifest = $2 AND ordinal = 5")
+        .bind(random_chunk().as_bytes().to_vec())
+        .bind(m.id().as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(changed.rows_affected(), 1, "the index damage must hit one existing edge");
+    sqlx::query("UPDATE manifest_index SET indexed_ordinals = 0, state = 2 WHERE manifest = $1")
+        .bind(m.id().as_bytes().to_vec())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let left_manifest = m.clone();
+    let right_manifest = m.clone();
+    let left_builder = left.clone();
+    let mut first = tokio::spawn(async move { left_builder.index_complete(&left_manifest).await });
+    let mut second = tokio::spawn(async move { right.index_complete(&right_manifest).await });
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        (&mut first).await.unwrap().unwrap();
+        (&mut second).await.unwrap().unwrap();
+    })
+    .await;
+    if joined.is_err() {
+        first.abort();
+        second.abort();
+    }
+    assert!(joined.is_ok(), "concurrent index completion must finish within 30 seconds");
+
+    assert_eq!(left.index_state(&m.id()).await.unwrap(), IndexState::Complete { total: 12 });
+    assert_eq!(left.index_edges(&m.id()).await.unwrap(), edge_list(&chunks));
+    let (edges, ordinals): (i64, i64) = sqlx::query_as("SELECT COUNT(*), COUNT(DISTINCT ordinal) FROM manifest_chunks WHERE manifest = $1")
+        .bind(m.id().as_bytes().to_vec())
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!((edges, ordinals), (12, 12));
+}
+
 #[tokio::test]
 async fn an_edge_at_a_negative_ordinal_keeps_an_index_from_completing_on_sqlite() {
     let dir = tempfile::tempdir().unwrap();
@@ -3378,4 +3504,43 @@ async fn a_build_resets_a_wrong_index_in_batches_on_postgres() {
         return;
     };
     a_build_resets_a_wrong_index_in_batches_on(&url).await;
+}
+
+#[tokio::test]
+async fn an_edge_at_i64_max_is_reported_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    an_edge_at_i64_max_is_reported_on(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edge_at_i64_max_is_reported_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    an_edge_at_i64_max_is_reported_on(&url).await;
+}
+
+#[tokio::test]
+async fn an_exact_multiple_index_reset_finishes_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    an_exact_multiple_index_reset_finishes_after_one_empty_batch_on(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exact_multiple_index_reset_finishes_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    an_exact_multiple_index_reset_finishes_after_one_empty_batch_on(&url).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_index_completes_reset_one_manifest_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    concurrent_index_completes_reset_one_manifest_on(&url).await;
 }
