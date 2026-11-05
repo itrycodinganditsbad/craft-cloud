@@ -29,7 +29,6 @@ use craft_cloud_proto::api::{
     DeviceInfo, HistoryResponse, PairingStatus, RecoveryCodes, RestoreResponse, RevokedOthers, TwoFactorChallenge,
     TwoFactorSetupResponse, TwoFactorStatus, codes as api_codes,
 };
-use craft_cloud_proto::api::{DeviceInfo, ErrorAnswer, HistoryResponse, PairingStatus, RestoreResponse, codes as api_codes};
 use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
 use craft_cloud_proto::local::{
     AutostartRequest, ChangePasswordRequest, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest,

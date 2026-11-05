@@ -890,7 +890,6 @@ pub(crate) mod fake {
         fn admin_revoke_device(&self, _id: Uuid, _device: DeviceId, confirm: &AdminConfirm) -> Result<(), Error> {
             self.admin_change("admin_revoke_device", confirm.password.clone(), (confirm.totp_code.clone(), confirm.recovery_code.clone()), || ())
         }
-    }
 
         fn file_history(&self, _path: &str, _cursor: Option<&str>) -> Result<HistoryResponse, Error> {
             self.answer("file_history", |_| HistoryResponse { versions: Vec::new(), next: None })
