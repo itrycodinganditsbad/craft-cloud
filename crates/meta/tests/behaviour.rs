@@ -1914,7 +1914,7 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 11);
+    assert_eq!(versions, 13);
 }
 
 // ---- device sessions (migration 0007) ----
@@ -3072,7 +3072,11 @@ async fn migrating_from_0009_keeps_the_rows_on_sqlite() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn migrating_from_0009_keeps_the_rows_on_postgres() {
-    assert_eq!(versions, 8);
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    migrating_from_0009_keeps_the_rows(&url).await;
 }
 
 /// A file with `n` versions, one commit each (the first by create): its node and the versions, oldest first.
@@ -3321,12 +3325,12 @@ async fn the_schema_version_is_recorded_and_a_newer_database_is_refused() {
     use sqlx::Connection;
     let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
     let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(latest, 8);
+    assert_eq!(latest, 13);
     // Opening again changes nothing.
     drop(Meta::open(&url).await.unwrap());
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(rows, 8);
-    sqlx::query("INSERT INTO schema_version (version) VALUES (9)").execute(&mut conn).await.unwrap();
+    assert_eq!(rows, 13);
+    sqlx::query("INSERT INTO schema_version (version) VALUES (14)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(&url).await, Err(MetaError::Corrupt(_))), "a newer database is refused");
 }
@@ -3795,7 +3799,7 @@ async fn the_trash_migration_dates_old_deletions_at_the_migration(url: &str) {
     assert_eq!(again.entries, page.entries);
     let mut conn = raw(url).await;
     let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(latest, 8);
+    assert_eq!(latest, 13);
     let live_with_time: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE deleted = 0 AND (deleted_ms IS NOT NULL OR purge_requested_ms IS NOT NULL)")
             .fetch_one(&mut conn)
@@ -3816,7 +3820,7 @@ async fn the_trash_migration_on_postgres() {
         eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
         return;
     };
-    migrating_from_0009_keeps_the_rows(&url).await;
+    the_trash_migration_dates_old_deletions_at_the_migration(&url).await;
 }
 
 /// Drops what migration 0008 added and forgets it ran, which leaves the database as 0007 left it (with its rows).
@@ -3880,7 +3884,11 @@ async fn migrating_from_0007_keeps_the_rows_on_sqlite() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn migrating_from_0007_keeps_the_rows_on_postgres() {
-    the_trash_migration_dates_old_deletions_at_the_migration(&url).await;
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    migrating_from_0007_keeps_the_rows(&url).await;
 }
 
 /// A deleted node without a deletion time (it can't happen through this code) is stamped with the time of the read

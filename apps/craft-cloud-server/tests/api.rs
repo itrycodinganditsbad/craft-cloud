@@ -3747,17 +3747,8 @@ async fn sqlite_disk_with_trash_days(days: u32) -> Server {
     let blobs = tempfile::tempdir().unwrap();
     let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
     let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
-    let s = start_trusting(meta, store, vec![db, blobs], vec!["127.0.0.1".parse().unwrap()]).await;
-    let ana = turn_on_two_factor(&s, "ana", false).await;
-    let from = |addr: &'static str, body: serde_json::Value, path: &'static str| {
-        let req = s.client.post(format!("{}{path}", s.base)).header("x-forwarded-for", addr).json(&body);
-        async move { req.send().await.unwrap() }
-    };
-    let res = from("198.51.100.1", json!({ "username": "ana", "password": PASSWORD, "device_name": "pc" }), "/auth/login").await;
-    let challenge = error(res).await.1.two_factor.unwrap();
-    // The secret token binds the challenge, not the address: another one finishes it.
-    let res = from("203.0.113.9", json!({ "challenge": challenge.challenge, "totp_code": ana.fresh_code(&s) }), "/auth/login/second-factor").await;
-    assert_eq!(res.status(), StatusCode::OK);
+    let state = AppState::new(meta.clone(), store, vec![]).unwrap().with_trash_days(days);
+    start_state(state, meta, vec![db, blobs], None).await
 }
 
 /// Setting up, turning off and new recovery codes count wrong passwords like a password change does (5 in 15 minutes per
@@ -3867,8 +3858,6 @@ async fn two_factor_sign_in_and_join_are_audited(s: &Server) {
     for secret in secrets {
         assert!(!everything.contains(secret), "{secret}");
     }
-    let state = AppState::new(meta.clone(), store, vec![]).unwrap().with_trash_days(days);
-    start_state(state, meta, vec![db, blobs], None).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

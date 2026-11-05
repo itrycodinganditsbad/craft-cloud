@@ -589,8 +589,6 @@ mod tests {
             revoked_ms: None,
             revoke_reason: None,
         }];
-        let refused = json(&ErrorAnswer { error: "password_required".into(), message: "choose a password".into() });
-        let list = vec![DeviceInfo { id: device, name: "lptp1".into(), created_ms: 1, last_used_ms: 2, revoked: false, current: false }];
         let refused = json(&ErrorAnswer { error: "password_required".into(), message: "choose a password".into(), name_taken: None });
         let script = vec![
             (400, refused),
@@ -671,7 +669,7 @@ mod tests {
         let required =
             json(&serde_json::json!({ "error": "two_factor_required", "message": "m", "two_factor": { "challenge": "chal", "expires_ms": 9 } }));
         let locked = json(&serde_json::json!({ "error": "two_factor_locked", "message": "wait", "retry_after_secs": 840 }));
-        let plain = json(&ErrorAnswer { error: "two_factor_invalid".into(), message: "wrong".into() });
+        let plain = json(&ErrorAnswer { error: "two_factor_invalid".into(), message: "wrong".into(), name_taken: None });
         let script = vec![
             (401, required),
             (200, json(&status(true))),
@@ -776,7 +774,7 @@ mod tests {
         };
         let code = AdminCode { code: "ABCDEFGHJKMNPQRS".into(), join_url: None, expires_ms: 9 };
         let list = AdminUserList { users: vec![user.clone()], next: Some("YW5h".into()) };
-        let forbidden = json(&ErrorAnswer { error: "wrong_password".into(), message: "that is not your password".into() });
+        let forbidden = json(&ErrorAnswer { error: "wrong_password".into(), message: "that is not your password".into(), name_taken: None });
         let script = vec![
             (200, json(&list)),
             (200, json(&list)),

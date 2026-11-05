@@ -314,7 +314,7 @@ trash_days = 30   # 1 to 3650
 
 A file brought back gets a new version with its old content, so another computer's delete that was sent just before can't delete it again. Update the agents with or soon after the server: an older agent can delete a *folder* a second time if that folder was brought back right after a delete whose answer it never heard (the folder is empty and can be brought back again).
 
-The change adds two columns and an index to the metadata (migration 0009 in the proposal). An older server refuses the
+The change adds two columns and an index to the metadata (migration 0013). An older server refuses the
 upgraded database and rejects the `[retention]` section, so take a backup before upgrading and do not roll back.
 
 ## Restoring a backup
