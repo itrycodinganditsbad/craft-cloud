@@ -108,6 +108,7 @@ most 8 KiB, and need the agent to be signed in (`not_signed_in` otherwise).
 | Local call | Server call | Body, answer |
 | --- | --- | --- |
 | `GET /v1/admin/server` | `GET /admin/server` | the server's counters and kinds; a member is refused `forbidden` |
+| `GET /v1/admin/storage` | `GET /admin/storage` | bounded storage overview: totals, quota counts, top ten accounts, and manifest-index counts |
 | `GET /v1/admin/users?cursor&limit&query` | `GET /admin/users` | a page of accounts by username; `next` is the cursor of the following page; `query` finds a username containing it |
 | `POST /v1/admin/users` | `POST /admin/users` | `{username, role, password, totp_code?, recovery_code?}` → the account and its invite code |
 | `PATCH /v1/admin/users/{id}` | `PATCH /admin/users/{id}` | `{role?, quota_bytes?, password, totp_code?, recovery_code?}` → the account (`null` removes the quota) |
@@ -116,6 +117,7 @@ most 8 KiB, and need the agent to be signed in (`not_signed_in` otherwise).
 | `POST /v1/admin/users/{id}/invite`, `…/password-reset` | the same | `{password}` (a reset code: also `totp_code?`, `recovery_code?`, `reset_two_factor?`) → `{code, join_url?, expires_ms}` |
 | `DELETE /v1/admin/users/{id}/invite` | the same | `{password}` → 204 |
 | `GET /v1/admin/users/{id}/devices` | the same | every device of the account |
+| `GET /v1/admin/users/{id}/usage` | `GET /admin/users/{id}/usage` | the account's stored bytes, effective quota, and labeled trash/history estimates; unknown or removed account is `not_found` |
 | `DELETE /v1/admin/users/{id}/devices/{device_id}` | the same | `{password}` → 204 |
 | `POST /v1/admin/users/{id}/reset-two-factor` | the same | `{password, totp_code?, recovery_code?}` → 204: takes the account's two-factor sign-in away and signs its computers out |
 | `GET /v1/account` | `GET /account` | the signed-in account: `role`, `two_factor_enabled` (how the app finds out whether to show its admin pages) |

@@ -33,13 +33,15 @@ To cap what one account may store, set `stored_bytes_per_user` (in bytes; there 
 garbage collection arrives, including what a refused file stored before it was refused. A file that would go
 over it is skipped by the agent, which says so; the rest of the folder keeps syncing. Nearly full counts as
 full: with less than 4 MiB (one chunk) left, the agent pauses and says the account's storage is full.
-A cap under 4 MiB is refused when the server starts, since not even one chunk would fit. Per-user quotas on
-file sizes come later, with history.
+A cap under 4 MiB is refused when the server starts, since not even one chunk would fit. An admin may override
+the cap for an individual account as described below.
 
-Signed-in devices can read `GET /api/v1/account/usage` for the space's stored bytes, the configured cap, and labeled
+Signed-in devices can read `GET /api/v1/account/usage` for the space's stored bytes, the effective quota, and labeled
 estimates of bytes referenced only by trash or old versions. The estimates deduplicate shared blobs per space, exclude
 live-document snapshots and unrooted app assets, and are never added to stored bytes. The history estimate treats a
-version an app saved (one with a save record) as kept. An incomplete manifest index makes both estimates `null`.
+version an app saved (one with a save record) as kept. The effective quota is the account override when set, otherwise
+the configured `stored_bytes_per_user` cap; it is `null` when neither applies. An incomplete manifest index makes both
+estimates `null`.
 
 Live documents have a cap of their own: `live_bytes_per_user` (in bytes; 1 GiB, `1_073_741_824`, by default) is
 the most one account's live documents (recent-file lists and documents of files) may hold together. It counts
@@ -143,6 +145,9 @@ curl -s -X POST https://cloud.example.org/api/v1/admin/users/USER_ID/disable \
 - `GET /admin/server` shows counters (accounts, signed-in devices, stored bytes, live-document bytes) and the kinds of
   database and storage, nothing else. `GET /admin/users` lists accounts 50 at a time (`limit` up to 200, `cursor` from
   the last answer's `next`, `query` to find a username).
+- `GET /admin/storage` returns bounded storage totals, effective quota totals and near/over-quota counts, the ten
+  largest accounts, and manifest-index counts. `GET /admin/users/{id}/usage` returns one account's stored bytes,
+  effective quota, and labeled trash/history estimates; unknown and removed accounts return `404 not_found`.
 - `POST /admin/users` makes an account (role `admin` or `member`) with no password and gives an **invite**, shown once:
   the person chooses their password when they join with it (a whole join link is included when `public_url` is set).
   `POST /admin/users/{id}/invite` makes a new invite, but only for an account that still has no password; for one with a
@@ -152,7 +157,8 @@ curl -s -X POST https://cloud.example.org/api/v1/admin/users/USER_ID/disable \
   admin asked for `"reset_two_factor": true`, which turns it off with the redeem. Codes are only shown in the answer,
   never in the log.
 - `PATCH /admin/users/{id}` changes the role and/or `quota_bytes`, a limit on what that account may store that replaces
-  `stored_bytes_per_user` for it (at least 4 MiB; `null` removes it; it also holds when there is no server-wide cap; one
+  `stored_bytes_per_user` for it (at least 4 MiB; `null` removes it; effective quota is the override, else configured
+  cap, else unlimited; it also holds when there is no server-wide cap; one
   below what the account stores deletes nothing and refuses new bytes).
 - `POST …/disable` signs every device of an account out and refuses its sign-in and joins (`account_disabled`);
   `POST …/enable` allows them again but signs nothing back in. `DELETE /admin/users/{id}` marks an account for removal:
@@ -180,6 +186,8 @@ The server can serve admin pages: users, invites and reset codes, a user's devic
 plain server-rendered HTML (no script, no Node, nothing to build). They are **off by default** and only administrators can
 sign in. They do the same things as the admin API with the same confirmation (your password again for every change, and a
 code when your account has two-factor sign-in).
+The Craft Cloud desktop app also has admin storage views: a server overview with quota and manifest-index summaries,
+and per-account usage details. Both use the authenticated admin API; members do not see admin pages.
 
 ```toml
 public_url = "https://cloud.example.org"   # the address of the pages, https, no path
