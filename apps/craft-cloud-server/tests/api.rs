@@ -3404,6 +3404,23 @@ async fn setting_it_up_needs_a_key_the_server_never_makes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_challenge_works_from_another_address() {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let s = start_trusting(meta, store, vec![db, blobs], vec!["127.0.0.1".parse().unwrap()]).await;
+    let ana = turn_on_two_factor(&s, "ana", false).await;
+    let from = |addr: &'static str, body: serde_json::Value, path: &'static str| {
+        let req = s.client.post(format!("{}{path}", s.base)).header("x-forwarded-for", addr).json(&body);
+        async move { req.send().await.unwrap() }
+    };
+    let res = from("198.51.100.1", json!({ "username": "ana", "password": PASSWORD, "device_name": "pc" }), "/auth/login").await;
+    let challenge = error(res).await.1.two_factor.unwrap();
+    // The secret token binds the challenge, not the address: another one finishes it.
+    let res = from("203.0.113.9", json!({ "challenge": challenge.challenge, "totp_code": ana.fresh_code(&s) }), "/auth/login/second-factor").await;
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
 // ---- history and restore ----
 
 fn update(node: NodeId, expected: VersionId, manifest: ManifestId) -> Op {
@@ -3746,6 +3763,7 @@ async fn sqlite_disk_with_trash_days(days: u32) -> Server {
 /// Setting up, turning off and new recovery codes count wrong passwords like a password change does (5 in 15 minutes per
 /// account, then `429 rate_limited`), and take one of the server-wide password-check slots (all busy: `429` with
 /// `Retry-After: 1` and no try used).
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_two_factor_routes_count_wrong_passwords_and_wait_for_a_check_slot() {
     let s = sqlite_disk_with(Limits { password_checks: 1, ..Limits::default() }).await;
