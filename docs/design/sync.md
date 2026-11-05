@@ -648,6 +648,7 @@ methods answer `not_found` / `invalid` (405) the same way:
 |---|---|
 | `GET /info` (also unversioned at `/api/info`) | protocol versions, chunker parameter sets, limits (no auth); a client probes `/api/info` first |
 | `GET /space` | the signed-in user's space: space ID, root node ID, epoch, current seq, username |
+| `GET /account/usage` | `{stored_bytes, quota_bytes, trash_bytes, history_bytes, estimates: {index_complete, reason?}}`: stored bytes and labeled storage estimates for this device's account |
 | `POST /auth/login` | username + password + device name → device ID + token (shown once); 10 tries per account and 30 per address per 5 minutes; a wrong password and an unknown user look the same |
 | `GET /tree?after_seq=…&after_node=…&limit=…` | full listing for a first sync or a reconcile, in pages of up to 5,000 (cursor = changed seq + node ID) |
 | `GET /changes?since=N&after_seq=…&after_node=…&limit=…&wait=30` | changes after N, in pages, long-poll up to 60 s; `resync_required` if N is too old or ahead of the server |
@@ -664,6 +665,8 @@ methods answer `not_found` / `invalid` (405) the same way:
 | `POST /pairings` | a new add-a-computer code from this device → `{id, code, expires_ms}` (the code shown once, normalised) |
 | `GET /pairings/{id}`, `DELETE /pairings/{id}` | one of your pairings: `{state: waiting\|used\|expired, device_name?}` / cancel it (204) |
 | `POST /join` | code + device name (+ password for an invite to a new account) → device ID + token, as a sign-in (no auth); `invalid_code`, `password_required`, `weak_password`, `rate_limited` |
+
+**Account usage estimates.** `stored_bytes` keeps the existing unit: the stored size of the space's chunks and manifests, each once, including each format byte. `quota_bytes` is the configured `stored_bytes_per_user` cap, or `null`; PR #17's per-account override takes precedence when that branch is merged. `trash_bytes` is the stored size of blobs referenced only by versions of deleted nodes still in the space; no live node version or live-document snapshot/import snapshot may reference them. A pending `purge_requested_ms` still counts: it hides the node from the trash list but frees no data yet. `history_bytes` is the stored size of blobs referenced only by non-current versions of live nodes; no current version, trashed node or live-document snapshot/import snapshot may reference them. Both include each shared blob once per space. Unrooted manifests are not counted. Both numbers are labeled, overlapping estimates; never add either to the other or to `stored_bytes`. If any manifest belonging to the space has an incomplete reference index, both estimates are `null` and `estimates` is `{index_complete: false, reason: "index_incomplete"}`; the server does not guess.
 
 **History and restore.** Versions are never removed today, so the history lists every version of a file, and `pruned`
 is always `false`: the field is in the contract for the day versions can be thinned (a thinned version will stay
