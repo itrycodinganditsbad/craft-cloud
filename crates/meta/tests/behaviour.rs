@@ -3951,7 +3951,7 @@ async fn a_damaged_deletion_time_on_postgres() {
         eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
         return;
     };
-    migrating_from_0007_keeps_the_rows(&url).await;
+    a_deleted_node_without_a_time_is_stamped_when_read(&url).await;
 }
 
 // ---- the audit log (migration 0009) ----
@@ -6384,7 +6384,6 @@ async fn a_session_that_ends_while_a_change_waits_for_its_locks_does_not_authori
         return;
     };
     a_session_that_ends_while_a_change_waits_for_its_locks_does_not_authorise_it(&url).await;
-    a_deleted_node_without_a_time_is_stamped_when_read(&url).await;
 }
 
 /// A file that comes back from the trash gets a new current version with its last content, after the last one and
