@@ -1474,25 +1474,6 @@ async fn live_subscriptions_are_capped_per_device() {
 
 // ---- device sessions: the account, passwords and devices ----
 
-/// Postgres and disk: for the scenarios that need no blob store but must run on both databases (the S3 settings
-/// are not needed for them).
-async fn postgres_disk() -> Option<Server> {
-    let Ok(admin_url) = std::env::var("CRAFT_CLOUD_TEST_PG") else {
-        assert!(std::env::var_os("CRAFT_CLOUD_REQUIRE_BACKENDS").is_none(), "CRAFT_CLOUD_REQUIRE_BACKENDS is set but CRAFT_CLOUD_TEST_PG is not");
-        return None;
-    };
-    use sqlx::Connection;
-    let name = format!("cc_test_{}", uuid::Uuid::now_v7().simple());
-    let mut conn = sqlx::PgConnection::connect(&admin_url).await.unwrap();
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&mut conn).await.unwrap();
-    let guard = PgGuard { admin_url: admin_url.clone(), name: name.clone() };
-    let (base, _) = admin_url.rsplit_once('/').unwrap();
-    let meta = Meta::open(&format!("{base}/{name}")).await.unwrap();
-    let blobs = tempfile::tempdir().unwrap();
-    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
-    Some(start(meta, store, vec![blobs], Some(guard)).await)
-}
-
 macro_rules! on_sqlite_and_postgres {
     ($($scenario:ident),* $(,)?) => {
         mod accounts_on_sqlite {
