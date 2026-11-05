@@ -789,7 +789,7 @@ pub struct HttpTransport<C = Reqwest> {
 #[derive(Debug)]
 pub enum HistoryCallError {
     Transport(TransportError),
-    Refused { status: StatusCode, body: ErrorBody },
+    Refused { status: StatusCode, body: Box<ErrorBody> },
 }
 
 async fn history_answer<T: DeserializeOwned>(answer: Answer) -> Result<T, HistoryCallError> {
@@ -800,7 +800,7 @@ async fn history_answer<T: DeserializeOwned>(answer: Answer) -> Result<T, Histor
             .ok()
             .and_then(|bytes| serde_json::from_slice::<ErrorBody>(&bytes).ok())
             .unwrap_or_else(|| ErrorBody { error: codes::INTERNAL.into(), message: status.to_string(), ..ErrorBody::default() });
-        return Err(HistoryCallError::Refused { status, body });
+        return Err(HistoryCallError::Refused { status, body: Box::new(body) });
     }
     let bytes = body_capped(answer, MAX_SMALL_JSON_BYTES).await.map_err(HistoryCallError::Transport)?;
     serde_json::from_slice(&bytes)
@@ -887,7 +887,7 @@ impl<C: Connection> HttpTransport<C> {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<ErrorBody>(&bytes).ok())
             .unwrap_or_else(|| ErrorBody { error: codes::INTERNAL.into(), message: status.to_string(), ..ErrorBody::default() });
-        Err(HistoryCallError::Refused { status, body })
+        Err(HistoryCallError::Refused { status, body: Box::new(body) })
     }
 
     fn request(&self, method: Method, path: &str, max_body: usize) -> Request {

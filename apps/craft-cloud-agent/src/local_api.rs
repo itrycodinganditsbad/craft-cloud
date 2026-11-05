@@ -226,10 +226,10 @@ impl IntoResponse for LocalError {
         if let (Some(object), Ok(serde_json::Value::Object(more))) = (body.as_object_mut(), serde_json::to_value(&extras)) {
             object.extend(more);
         }
-        if let Some(name_taken) = self.name_taken {
-            if let Some(object) = body.as_object_mut() {
-                object.insert("name_taken".to_owned(), serde_json::Value::Bool(name_taken));
-            }
+        if let Some(name_taken) = self.name_taken
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert("name_taken".to_owned(), serde_json::Value::Bool(name_taken));
         }
         let mut response = (self.status, Json(body)).into_response();
         if let Some(secs) = self.retry_after_secs {
