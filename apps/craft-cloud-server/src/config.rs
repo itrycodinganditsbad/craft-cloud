@@ -16,6 +16,8 @@
 //! # enabled = true
 //! # idle_minutes = 480          # a browser session ends after this long unused (5 to 1440)
 //! # absolute_hours = 168        # and at the latest after this long (1 to 720)
+//! # [retention]
+//! # trash_days = 30   # how long a deleted file stays in the trash before the server may remove it (1 to 3650)
 //!
 //! [database]
 //! url = "sqlite:/var/lib/craft-cloud/meta.db"   # or postgres://user:pass@host/db
@@ -67,6 +69,8 @@ pub enum ConfigError {
          agent could not tell a full account from a file that is too big. Raise it, or remove it for no cap"
     )]
     StoredBytesCapTooSmall(u64, u32),
+    #[error("retention.trash_days = {0} is not between {MIN_TRASH_DAYS} and {MAX_TRASH_DAYS}")]
+    TrashDays(u32),
     #[error("public_url = {0:?} is not a server address like https://cloud.example.com (a host, an optional port and path, no query)")]
     PublicUrl(String),
     #[error("storage.{0} is missing (set it in the config or the {1} environment variable)")]
@@ -85,6 +89,31 @@ pub enum ConfigError {
     WebAdminNeedsProxy,
     #[error("web_admin.{0} = {1} is out of range: {2} to {3}")]
     WebAdminRange(&'static str, u32, u32, u32),
+}
+
+/// Fewest and most days a deleted node waits in the trash.
+pub const MIN_TRASH_DAYS: u32 = 1;
+pub const MAX_TRASH_DAYS: u32 = 3650;
+/// Days in the trash when `retention.trash_days` is not set.
+pub const DEFAULT_TRASH_DAYS: u32 = 30;
+
+/// `[retention]`: how long things are kept. Only the trash today; nothing is removed by it yet.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionConfig {
+    /// Days a deleted node stays in the trash before the server may remove it for good (shown as `purge_after_ms`).
+    #[serde(default = "default_trash_days")]
+    pub trash_days: u32,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self { trash_days: DEFAULT_TRASH_DAYS }
+    }
+}
+
+fn default_trash_days() -> u32 {
+    DEFAULT_TRASH_DAYS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -122,6 +151,8 @@ pub struct Config {
     /// The admin pages in the browser (`/web`). Off unless the section says `enabled = true`.
     #[serde(default)]
     pub web_admin: WebAdminConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
     pub database: DatabaseConfig,
     pub storage: StorageConfig,
     /// The key for the secrets of two-factor sign-in. Without it two-factor sign-in can't be set up (`503
@@ -327,6 +358,8 @@ impl Config {
             if !(low..=high).contains(&value) {
                 return Err(ConfigError::WebAdminRange(name, value, low, high));
             }
+        if !(MIN_TRASH_DAYS..=MAX_TRASH_DAYS).contains(&config.retention.trash_days) {
+            return Err(ConfigError::TrashDays(config.retention.trash_days));
         }
         let mut config = config;
         if let Some(url) = &config.public_url {
@@ -516,6 +549,20 @@ path = "/tmp/blobs"
             assert!(matches!(Config::parse(&format!("{DISK}\n[web_admin]\n{section}\n")), Err(ConfigError::WebAdminRange(..))), "{section}");
         }
         assert!(matches!(Config::parse(&format!("{DISK}\n[web_admin]\ncookie = 1\n")), Err(ConfigError::Parse(_))));
+    fn the_trash_period_has_a_default_and_bounds() {
+        assert_eq!(Config::parse(DISK).unwrap().retention, RetentionConfig { trash_days: 30 });
+        // A table has to come after the top-level keys, so the section goes at the end.
+        let at_end = |days: &str| Config::parse(&format!("{DISK}\n[retention]\ntrash_days = {days}\n"));
+        assert_eq!(at_end("1").unwrap().retention.trash_days, 1);
+        assert_eq!(at_end("3650").unwrap().retention.trash_days, 3650);
+        for bad in ["0", "3651", "-1", "\"30\"", "1.5"] {
+            assert!(at_end(bad).is_err(), "{bad}");
+        }
+        assert!(matches!(at_end("0"), Err(ConfigError::TrashDays(0))));
+        assert!(matches!(at_end("3651"), Err(ConfigError::TrashDays(3651))));
+        // Nothing but `trash_days` is accepted in the section, and the section may be empty.
+        assert!(matches!(Config::parse(&format!("{DISK}\n[retention]\ngc_wait_hours = 24\n")), Err(ConfigError::Parse(_))));
+        assert_eq!(Config::parse(&format!("{DISK}\n[retention]\n")).unwrap().retention.trash_days, 30);
     }
 
     #[test]

@@ -39,6 +39,9 @@ use craft_cloud_proto::api::{
     MAX_MISSING_IDS, MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, PairingCreated, PairingStatus, RecoveryCodes, RenameDeviceRequest,
     RevokedOthers, SecondFactorRequest, SpaceResponse, TwoFactorChallenge, TwoFactorConfirmRequest, TwoFactorProofRequest, TwoFactorSetupRequest,
     TwoFactorSetupResponse, TwoFactorStatus, codes,
+    CommitRequest, CommitResponse, DeviceInfo, ErrorBody, HistoryResponse, InfoResponse, JoinRequest, LoginRequest, LoginResponse, MAX_MISSING_IDS,
+    MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, PairingCreated, PairingStatus, RestoreRequest, RestoreResponse, SpaceResponse,
+    codes,
 };
 use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_PAGE_NODES};
 use craft_cloud_proto::local::MAX_MACHINE_BYTES;
@@ -785,6 +788,28 @@ pub struct HttpTransport<C = Reqwest> {
     auth: HeaderValue,
 }
 
+/// A history or restore refusal, retaining the server's HTTP status and stable error code.
+#[derive(Debug)]
+pub enum HistoryCallError {
+    Transport(TransportError),
+    Refused { status: StatusCode, body: ErrorBody },
+}
+
+async fn history_answer<T: DeserializeOwned>(answer: Answer) -> Result<T, HistoryCallError> {
+    if !answer.status.is_success() {
+        let status = answer.status;
+        let body = body_capped(answer, MAX_SMALL_JSON_BYTES)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ErrorBody>(&bytes).ok())
+            .unwrap_or_else(|| ErrorBody { error: codes::INTERNAL.into(), message: status.to_string(), ..ErrorBody::default() });
+        return Err(HistoryCallError::Refused { status, body });
+    }
+    let bytes = body_capped(answer, MAX_SMALL_JSON_BYTES).await.map_err(HistoryCallError::Transport)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| HistoryCallError::Transport(TransportError::Protocol(format!("the server's answer doesn't parse: {e}"))))
+}
+
 impl HttpTransport {
     pub fn new(server: ServerUrl, token: &DeviceToken) -> Result<Self, TransportError> {
         Self::over(Reqwest::new(&server)?, server, token)
@@ -799,6 +824,73 @@ impl<C: Connection> HttpTransport<C> {
 
     pub fn server(&self) -> &ServerUrl {
         &self.server
+    }
+
+    /// The server's newest-first history for one file node.
+    pub async fn file_history(&self, node: NodeId, cursor: Option<&str>, limit: Option<u32>) -> Result<HistoryResponse, HistoryCallError> {
+        let mut url = self.server.endpoint(&format!("nodes/{node}/history"));
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(cursor) = cursor {
+                query.append_pair("cursor", cursor);
+            }
+            if let Some(limit) = limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+        }
+        let req = request(Method::GET, url, Some(&self.auth), MAX_SMALL_JSON_BYTES);
+        let answer = self.send(req).await.map_err(HistoryCallError::Transport)?;
+        history_answer(answer).await
+    }
+
+    /// Makes a prior version the file's content as a new version.
+    pub async fn restore_file(&self, node: NodeId, version: VersionId, expected_version: VersionId) -> Result<RestoreResponse, HistoryCallError> {
+        let req = self
+            .request(Method::POST, &format!("nodes/{node}/restore"), MAX_SMALL_JSON_BYTES)
+            .json(&RestoreRequest { version, expected_version })
+            .map_err(HistoryCallError::Transport)?;
+        let answer = self.send(req).await.map_err(HistoryCallError::Transport)?;
+        history_answer(answer).await
+    }
+
+    /// The server's newest-first trash page.
+    pub async fn trash(&self, cursor: Option<&str>, limit: Option<u32>) -> Result<craft_cloud_proto::api::TrashResponse, HistoryCallError> {
+        let mut url = self.server.endpoint("trash");
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(cursor) = cursor {
+                query.append_pair("cursor", cursor);
+            }
+            if let Some(limit) = limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+        }
+        let req = request(Method::GET, url, Some(&self.auth), MAX_SMALL_JSON_BYTES);
+        let answer = self.send(req).await.map_err(HistoryCallError::Transport)?;
+        history_answer(answer).await
+    }
+
+    /// Restores a deleted node from the server's trash.
+    pub async fn restore_from_trash(&self, node: NodeId) -> Result<craft_cloud_proto::api::TrashRestoreResponse, HistoryCallError> {
+        let req = self.request(Method::POST, &format!("trash/{node}/restore"), MAX_SMALL_JSON_BYTES);
+        let answer = self.send(req).await.map_err(HistoryCallError::Transport)?;
+        history_answer(answer).await
+    }
+
+    /// Marks a deleted node out of the server's trash. This does not free stored data yet.
+    pub async fn remove_from_trash(&self, node: NodeId) -> Result<(), HistoryCallError> {
+        let req = self.request(Method::DELETE, &format!("trash/{node}"), MAX_SMALL_JSON_BYTES);
+        let answer = self.send(req).await.map_err(HistoryCallError::Transport)?;
+        if answer.status.is_success() {
+            return Ok(());
+        }
+        let status = answer.status;
+        let body = body_capped(answer, MAX_SMALL_JSON_BYTES)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ErrorBody>(&bytes).ok())
+            .unwrap_or_else(|| ErrorBody { error: codes::INTERNAL.into(), message: status.to_string(), ..ErrorBody::default() });
+        Err(HistoryCallError::Refused { status, body })
     }
 
     fn request(&self, method: Method, path: &str, max_body: usize) -> Request {

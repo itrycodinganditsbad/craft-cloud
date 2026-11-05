@@ -859,6 +859,7 @@ pub(crate) fn local_error(e: AgentError) -> AgentError {
             codes::TWO_FACTOR_INVALID => AgentError::TwoFactorInvalid(message),
             codes::TWO_FACTOR_EXPIRED => AgentError::ChallengeGone,
             codes::TWO_FACTOR_REQUIRED => AgentError::TwoFactorRequired(TwoFactorChallenge { challenge: String::new(), expires_ms: 0 }),
+        AgentError::Local(craft_cloud_app::Error::Refused { code, message, .. }) => match code.as_str() {
             codes::WRONG_PASSWORD => AgentError::WrongPassword,
             codes::NOT_SIGNED_IN => AgentError::NotSignedIn,
             codes::OFFLINE => AgentError::Offline(message),

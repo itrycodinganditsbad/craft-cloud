@@ -172,11 +172,15 @@ fn snapshot_join() {
     snapshot(model.clone(), egui::Theme::Light, "join");
     sent(&mut model, "cloud.shadows.ch/K7M4-Q9TX");
     snapshot(model.clone(), egui::Theme::Light, "joining");
-    model.update(Event::Joined(Err(craft_cloud_app::Error::Refused { code: "folder_has_files".into(), message: "has files".into() })));
+    model.update(Event::Joined(Err(craft_cloud_app::Error::Refused {
+        code: "folder_has_files".into(),
+        message: "has files".into(),
+        name_taken: None,
+    })));
     snapshot(model.clone(), egui::Theme::Light, "join-folder-has-files");
     model.update(Event::SyncExistingFiles(false));
     sent(&mut model, "cloud.shadows.ch/K7M4-Q9TX");
-    model.update(Event::Joined(Err(craft_cloud_app::Error::Refused { code: "invalid_code".into(), message: "x".into() })));
+    model.update(Event::Joined(Err(craft_cloud_app::Error::Refused { code: "invalid_code".into(), message: "x".into(), name_taken: None })));
     snapshot(model, egui::Theme::Dark, "join-invalid-code-dark");
 }
 
@@ -184,7 +188,7 @@ fn snapshot_join() {
 fn snapshot_password_needed() {
     let mut model = after(&FakeAgent::new(signed_out()), Vec::new());
     sent(&mut model, "cloud.shadows.ch/K7M4-Q9TX-K7M4-Q9TX");
-    model.update(Event::Joined(Err(craft_cloud_app::Error::Refused { code: "password_required".into(), message: "x".into() })));
+    model.update(Event::Joined(Err(craft_cloud_app::Error::Refused { code: "password_required".into(), message: "x".into(), name_taken: None })));
     if let Screen::PasswordNeeded(pw) = &mut model.screen {
         pw.password = "correct horse".into();
         pw.again = "correct house".into();
@@ -208,6 +212,147 @@ fn snapshot_signed_in() {
     snapshot(signed_in_model(offline), egui::Theme::Light, "signed-in-offline");
     let paused = Status { run_state: RunState::PausedByUser, ..signed_in() };
     snapshot(signed_in_model(paused), egui::Theme::Light, "signed-in-paused");
+}
+
+fn versions_model(loaded: bool) -> Model {
+    let mut model = signed_in_model(signed_in());
+    model.update(Event::OpenVersions);
+    model.update(Event::VersionsPath("Projects/painting.png".into()));
+    if loaded {
+        let versions = vec![
+            craft_cloud_app::HistoryVersion {
+                id: craft_cloud_app::VersionId::from_uuid(Uuid::nil()),
+                parent_version: None,
+                epoch: craft_cloud_proto::Epoch::from_uuid(Uuid::nil()),
+                seq: 9,
+                size: 42_000,
+                mtime_ms: NOW,
+                device: DeviceId::from_uuid(Uuid::nil()),
+                created_ms: NOW - 30_000,
+                save: false,
+                pruned: false,
+            },
+            craft_cloud_app::HistoryVersion {
+                id: craft_cloud_app::VersionId::from_uuid(Uuid::from_u128(1)),
+                parent_version: None,
+                epoch: craft_cloud_proto::Epoch::from_uuid(Uuid::nil()),
+                seq: 8,
+                size: 38_000,
+                mtime_ms: NOW - 60_000,
+                device: DeviceId::from_uuid(Uuid::from_u128(1)),
+                created_ms: NOW - 60_000,
+                save: true,
+                pruned: false,
+            },
+        ];
+        model.update(Event::History { ticket: 1, result: Ok(craft_cloud_app::HistoryResponse { versions, next: Some("next-page".into()) }) });
+    }
+    model
+}
+
+#[test]
+fn snapshot_versions() {
+    snapshot(versions_model(false), egui::Theme::Light, "versions-empty");
+    snapshot(versions_model(true), egui::Theme::Light, "versions-loaded");
+    let mut model = versions_model(true);
+    if let Screen::Versions(versions) = &mut model.screen {
+        versions.confirm = versions.page.as_ref().and_then(|page| page.versions.get(1)).map(|version| version.id);
+    }
+    snapshot(model, egui::Theme::Light, "versions-confirm");
+}
+
+fn trash_model(loaded: bool) -> Model {
+    let mut model = signed_in_model(signed_in());
+    let effects = model.update(Event::OpenTrash);
+    let ticket = match effects.first() {
+        Some(Effect::Trash { ticket, .. }) => *ticket,
+        _ => 0,
+    };
+    let items = if loaded {
+        vec![
+            craft_cloud_app::TrashItem {
+                id: craft_cloud_app::NodeId::from_uuid(Uuid::nil()),
+                parent: craft_cloud_app::NodeId::from_uuid(Uuid::from_u128(1)),
+                name: "painting.png".into(),
+                is_dir: false,
+                size: Some(42_000),
+                deleted_ms: NOW - 30_000,
+                purge_after_ms: NOW + 14 * 86_400_000,
+                path: Some("Projects/painting.png".into()),
+            },
+            craft_cloud_app::TrashItem {
+                id: craft_cloud_app::NodeId::from_uuid(Uuid::from_u128(2)),
+                parent: craft_cloud_app::NodeId::from_uuid(Uuid::from_u128(3)),
+                name: "Old exports".into(),
+                is_dir: true,
+                size: None,
+                deleted_ms: NOW - 86_400_000,
+                purge_after_ms: NOW + 13 * 86_400_000,
+                path: None,
+            },
+        ]
+    } else {
+        Vec::new()
+    };
+    model.update(Event::TrashPage { ticket, result: Ok(craft_cloud_app::TrashResponse { items, next: loaded.then(|| "trash-next".into()) }) });
+    model
+}
+
+#[test]
+fn snapshot_trash() {
+    snapshot(trash_model(false), egui::Theme::Light, "trash-empty");
+    snapshot(trash_model(true), egui::Theme::Light, "trash-loaded");
+    let mut model = trash_model(true);
+    let id = match &model.screen {
+        Screen::Trash(t) => t.page.as_ref().and_then(|p| p.items.first()).map(|i| i.id),
+        _ => None,
+    };
+    if let Some(id) = id {
+        model.update(Event::ConfirmRemoveTrash(id));
+        snapshot(model.clone(), egui::Theme::Light, "trash-confirm");
+        model.update(Event::CancelRemoveTrash);
+        let effect = model.update(Event::RestoreTrash(id));
+        let ticket = match effect.first() {
+            Some(Effect::RestoreTrash { ticket, .. }) => *ticket,
+            _ => 0,
+        };
+        model.update(Event::TrashRestored {
+            ticket,
+            result: Err(craft_cloud_app::Error::Refused { code: "conflict".into(), message: "name taken".into(), name_taken: Some(true) }),
+        });
+        snapshot(model.clone(), egui::Theme::Light, "trash-name-taken");
+        let restored = craft_cloud_app::TrashRestoreResponse {
+            node: id,
+            parent: craft_cloud_app::NodeId::from_uuid(Uuid::from_u128(1)),
+            name: "painting (1).png".into(),
+            renamed: true,
+            version: None,
+            seq: 2,
+            epoch: craft_cloud_proto::Epoch::from_uuid(Uuid::nil()),
+        };
+        let effect = model.update(Event::RestoreTrash(id));
+        let ticket = match effect.first() {
+            Some(Effect::RestoreTrash { ticket, .. }) => *ticket,
+            _ => 0,
+        };
+        model.update(Event::TrashRestored { ticket, result: Ok(restored) });
+        snapshot(model, egui::Theme::Light, "trash-restored");
+    } else {
+        snapshot(model, egui::Theme::Light, "trash-confirm");
+    }
+}
+
+#[test]
+fn trash_buttons_send_restore_and_confirmation_events() {
+    let mut h = harness(trash_model(true), egui::Theme::Light);
+    h.run_steps(2);
+    h.query_all_by_label("Restore").next().unwrap().click();
+    h.run_steps(2);
+    h.query_all_by_label("Remove from trash").next().unwrap().click();
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    assert!(events.iter().any(|e| matches!(e, Event::RestoreTrash(_))), "{events:?}");
+    assert!(events.contains(&Event::ConfirmRemoveTrash(craft_cloud_app::NodeId::from_uuid(Uuid::nil()))), "{events:?}");
 }
 
 #[test]

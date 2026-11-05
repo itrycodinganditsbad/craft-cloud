@@ -959,6 +959,12 @@ methods answer `not_found` / `invalid` (405) the same way:
 | `PATCH /devices/{id}` | `{name}` (at most 4 KiB, the device-name rule) → 200 with the device. Only your own devices that are not revoked, otherwise `404 not_found` |
 | `POST /devices/revoke-others` | signs out every other device of the account (and deletes their pairings) → `{revoked: n}`, 0 when there is none |
 | `DELETE /devices/{id}` | signs one of your devices out → 204; its time and reason (`user`) are kept, and a second call changes neither |
+| `GET /nodes/{id}/history?cursor=…&limit=…` | the versions of one file of your space, newest first by `(seq, id)`, in pages (default 50, at most 200): `{versions: [{id, parent_version, epoch, seq, size, mtime_ms, device, created_ms, save, pruned}], next?}`; `next` is an opaque cursor for the next page; a folder is `invalid`, another account's or an unknown node `not_found`; a deleted file keeps its history |
+| `POST /nodes/{id}/restore` | `{version, expected_version}` → `{version, parent_version, seq, epoch}`: makes an old version's content the file's content again as a new version (see below); `409 conflict` when `expected_version` is not the current version |
+| `GET /trash?cursor=…&limit=…` | the deleted nodes of your space that were not removed from the trash, newest deletion first by `(deleted_ms, id)`, in pages (default 50, at most 200): `{items: [{id, parent, name, is_dir, size?, deleted_ms, purge_after_ms}], next?}`; `purge_after_ms` is `deleted_ms` plus `[retention] trash_days` |
+| `POST /trash/{id}/restore` | brings a node of the trash back, with its deleted folders, as one change: `{node, parent, name, renamed, version?, seq, epoch}` (a restored file has a new version); a taken name gets a conflict name (see below), a node that is not in the trash is `not_found` |
+| `DELETE /trash/{id}` | takes a node out of the trash (204): only marks it for removal, nothing is freed yet |
+| `GET /devices`, `DELETE /devices/{id}` | your devices |
 | `POST /pairings` | a new add-a-computer code from this device → `{id, code, expires_ms}` (the code shown once, normalised) |
 | `GET /pairings/{id}`, `DELETE /pairings/{id}` | one of your pairings: `{state: waiting\|used\|expired, device_name?}` / cancel it (204) |
 | `POST /join` | code + device name (+ password for an invite to a new account **and always for a password reset code**, + the optional client fields of a sign-in) → device ID + token, as a sign-in (no auth); `invalid_code`, `password_required`, `weak_password`, `account_disabled`, `rate_limited`. A reset code signs every other device of the account out. Optional `totp_code` or `recovery_code`: an invite or reset code of an account with two-factor sign-in needs one (`401 two_factor_required` without, code not used up; `401 two_factor_invalid`, not given back to the address's tries), unless the reset code was made with `reset_two_factor`; a pairing code never does |
@@ -975,6 +981,49 @@ methods answer `not_found` / `invalid` (405) the same way:
 | `GET /account/activity?cursor&before_ms&limit` | the signed-in account's own security events, newest first: `{events: [event], next?}`; the events it acted in or was the target of, with the device shown only for its own acts, and the details only of events about itself (not of what a former administrator once did to others). `limit` 1 to 100 (default 50, otherwise `invalid`); `cursor` is opaque and exclusive and wins over `before_ms`, which only limits the first page; a cursor this server did not make is `invalid` |
 | `GET /admin/audit?cursor&before_ms&limit&user&action` | (admin) the whole log in the same form (`limit` up to 200); `user` is an account ID (events it acted in or was the target of), `action` an event name or a group ending in a dot like `auth.`; anything else is `invalid` |
 | `GET /admin/audit/export?user&action&before_ms` | (admin) the same filters (`before_ms` must not be negative) as NDJSON (`application/x-ndjson`, always offered as `craft-cloud-audit.ndjson`), streamed: one event per line, newest first, then one last line, `{"complete":true,"exported":n}`, or `{"truncated":true,"exported":n}` when there were more events than the export holds (100,000). A stream that ends without either line broke off and is not a whole export |
+
+**History and restore.** Versions are never removed today, so the history lists every version of a file, and `pruned`
+is always `false`: the field is in the contract for the day versions can be thinned (a thinned version will stay
+in the list with `pruned: true`, its metadata intact, and can't be restored). A restore is an ordinary `update` made
+by the server: it checks, under the same lock as a commit, that the node is a file of the caller's space that is not
+deleted and has no live document, that `version` is a version of this node, that its manifest is still in the space,
+and that `expected_version` is still the file's current version; then it records a new version with a fresh ID whose
+parent is the current version, with the manifest, modification time and executable bit of the old one, at the space's
+next sequence number. The epoch does not change (only `reset-epoch` and backup restores do that), the change feed
+reports the file like any other update, and a restore needs no quota because the manifest is already the space's.
+The new version carries **no save record**: a save record names a state of a live document, and a restore
+copies none and invents none. A restore is an ordinary new version, so agents take it in under the normal rules,
+including the conflict rules for a machine with unsynced edits of its own. A file that has a live document is
+refused, so file versions and live-document state stay separate. Unknown node, foreign node, a version of
+another file and a missing manifest are all `not_found`; a deleted file, a folder and a file with a live document are
+`invalid`; a stale `expected_version` is `conflict` (409, with the conflict list as for a commit).
+
+**Trash.** The trash is the set of tombstones with the time of the deletion. `nodes.deleted_ms` is set when a node goes
+from live to deleted (not when a deleted node is deleted again) and cleared when it comes back, by an edit or by a restore
+from the trash, so the next deletion starts its time afresh; `nodes.purge_requested_ms` is set by `DELETE /trash/{id}`
+and cleared when the node comes back. Nodes deleted before the migration that added them are dated at the migration. A
+deleted node without a time (damaged data) is dated at the next read of the trash, logged without names, and never
+counts as expired. `DELETE /trash/{id}` frees nothing: versions, manifests, chunks and the tombstone stay, the change feed
+and the sequence number do not change, and the node's history stays readable; the node only leaves the trash list and can
+no longer be restored from it. (An edit that brings it back still wins, as for any deleted file.) Asking twice is fine.
+A restore from the trash brings back the node asked for and the deleted folders above it, root-most first, keeping their
+IDs; it creates no node and overwrites none. Under one write lock and in one transaction, with one sequence number:
+where a deleted folder's name is held by a live folder, that folder is used and what is below moves into it (the deleted
+folder stays deleted); where it is held by a file, or where the node's own name is held by anything, the node comes back
+as `name (conflict, <device>, <UTC date and minute>)` like the engine's conflict copies, with `, 2` to `, 100` if that is
+taken too, and a restore with no free name is `conflict` and changes nothing. A restored *file* gets a **new version**: a copy of its last one (the same manifest, modification time and
+executable bit, no save record), after it, in the same change. A machine that deleted the file, whose answer it never
+heard (the server applied the delete), still names the old version in its delete; after a restore the server refuses
+that delete as a version mismatch, and the engine, which already treats a node that came back at another version as one
+whose delete went through, lets the node go and downloads the restored file as a new one. Without this the machine would
+send the delete again and delete the restored file. A folder has no version, so a deleted folder that was brought back
+looks the same as one that was never deleted; the engine therefore remembers the folder deletes it sent without hearing
+the answer (`State::sent_dir_deletes`) and, when the next pull reports such a folder changed and live, lets it go instead
+of deleting it again (a folder the feed does not mention was never touched, and its delete is sent again). A restore is
+otherwise an ordinary change to live nodes, possibly with a new parent or name. Older agents lack the folder rule: with
+one, a folder restored in the short window after a delete whose answer was lost can be deleted a second time (the folder
+is empty and can be restored again), so update agents with or soon after the server. Restoring a *version* of a deleted file is still refused: bring the file back
+from the trash first.
 
 **Client contract** (what the sync agent relies on):
 
@@ -1393,7 +1442,7 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
 | M3b2b1 | Agent on its own: seed 112337, `run` loop, watcher, long-poll, stability window, backoff, status file | DONE (2026-10-14) |
 | M3b2b2 | Simulated network (`turmoil`): partitions, delays, dropped connections | DONE (2026-10-15) |
 | M3c | Fixes from the full repo review | DONE (2026-10-15) |
-| M4 | History, restore, trash, thinning, GC (including the chunks of uploads the stored-bytes cap refused), logical quotas, admin CLI (`user remove\|quota`, `gc`, `verify`), backup/restore | TODO |
+| M4 | History, restore, trash, thinning, GC (including the chunks of uploads the stored-bytes cap refused), logical quotas, admin CLI (`user remove\|quota`, `gc`, `verify`), backup/restore | IN PROGRESS: history and restore of file versions, and the trash (list, restore, mark for removal), done (server API only); the rest TODO |
 | M5 | Selective sync, large-media polish (a few chunks in flight at once), ignore rules | TODO |
 | M6 | Packaging: binaries, Docker, systemd, built-in TLS, self-hosting guide | TODO |
 | M7 | Local control API + launcher integration PR | TODO |

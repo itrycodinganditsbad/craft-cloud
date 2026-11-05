@@ -3153,3 +3153,418 @@ async fn a_live_reset_doc_leaves_the_file_sync_alone() {
     assert!(!files(&a).iter().any(|(p, _)| p == "gone.txt"), "A's delete was undone");
     assert_eq!(read(&b, "a.txt"), b"v2 from the laptop");
 }
+
+// ---- restore from the trash, after a delete whose answer a machine never heard ----
+
+/// The node of the file or folder `name` the server holds (deleted or not), in the space of `user`.
+async fn node_named(server: &Server, user: &craft_cloud_meta::UserRecord, name: &str) -> craft_cloud_proto::NodeId {
+    let feed = server.meta.changes(user.space, 0, None, 5000).await.unwrap();
+    let found: Vec<_> = feed.nodes.iter().filter(|n| n.name.as_ref().is_some_and(|n| n.as_str() == name)).collect();
+    assert_eq!(found.len(), 1, "one node named {name}: {found:?}");
+    found[0].id
+}
+
+/// Brings `node` back from the trash, as the web or an admin tool would: not one of the syncing machines.
+async fn restore_from_trash(server: &Server, user: &craft_cloud_meta::UserRecord, node: craft_cloud_proto::NodeId) {
+    let token = *blake3::hash(craft_cloud_proto::NodeId::generate().as_uuid().as_bytes()).as_bytes();
+    let device = server.meta.create_device(user.id, "web", &token, 0).await.unwrap();
+    server.meta.restore_from_trash(user.space, device, node, 1_760_000_000_000).await.unwrap();
+}
+
+/// A machine deleted a file, the server applied it, the answer was lost; the file is brought back from the trash
+/// before the machine syncs again. The machine's delete must not be sent again: the file comes back, on both machines.
+#[tokio::test]
+async fn a_file_restored_after_a_lost_delete_answer_comes_back_and_is_not_deleted_again() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "f.txt", b"keep me");
+    settle(&mut [&mut a, &mut b], 5).await;
+
+    a.fs_mut().remove_file(&path("f.txt")).unwrap();
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    restore_from_trash(&server, &ana, node_named(&server, &ana, "f.txt").await).await;
+
+    settle(&mut [&mut a, &mut b], 6).await;
+    assert_eq!(files(&a), vec![("f.txt".to_owned(), b"keep me".to_vec())]);
+    assert_eq!(files(&b), files(&a));
+    // And it stays: nothing deletes it on a later pass, on either machine.
+    settle(&mut [&mut a, &mut b], 3).await;
+    assert_eq!(files(&a), vec![("f.txt".to_owned(), b"keep me".to_vec())]);
+    let c = machine(&server, &ana, "studio").await;
+    let mut c = c;
+    c.sync_once().await.unwrap();
+    assert_eq!(files(&c), files(&a));
+}
+
+/// The same, but the name was taken meanwhile by another file: the restored one comes back under a conflict name and
+/// both files reach both machines.
+#[tokio::test]
+async fn a_file_restored_under_a_conflict_name_after_a_lost_delete_answer_keeps_both_files() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    write(&mut a, "f.txt", b"the first");
+    settle(&mut [&mut a, &mut b], 5).await;
+
+    a.fs_mut().remove_file(&path("f.txt")).unwrap();
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    let old = node_named(&server, &ana, "f.txt").await;
+    // The desktop sees the delete, and its user makes a new f.txt.
+    b.sync_once().await.unwrap();
+    write(&mut b, "f.txt", b"a new file");
+    b.sync_once().await.unwrap();
+    restore_from_trash(&server, &ana, old).await;
+
+    settle(&mut [&mut a, &mut b], 6).await;
+    let on_a = files(&a);
+    assert_eq!(on_a, files(&b));
+    assert_eq!(on_a.len(), 2, "{on_a:?}");
+    assert!(on_a.contains(&("f.txt".to_owned(), b"a new file".to_vec())), "{on_a:?}");
+    let restored = on_a.iter().find(|(p, _)| p.contains("(conflict, web, ")).expect("the restored file under a conflict name");
+    assert_eq!(restored.1, b"the first");
+}
+
+/// A folder that came back from the trash is merged into a live folder of the same name: the restored file lands in
+/// it, and the machine whose delete answer was lost ends up with it, not deleted again.
+#[tokio::test]
+async fn a_file_restored_into_a_live_folder_after_a_lost_delete_answer_comes_back() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("d")).unwrap();
+    write(&mut a, "d/f.txt", b"keep me");
+    settle(&mut [&mut a, &mut b], 5).await;
+
+    a.fs_mut().remove_file(&path("d/f.txt")).unwrap();
+    a.fs_mut().remove_dir(&path("d")).unwrap();
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    let file = node_named(&server, &ana, "f.txt").await;
+    // The desktop sees both deletes; its user makes a new folder d with another file.
+    b.sync_once().await.unwrap();
+    b.fs_mut().mkdir(&path("d")).unwrap();
+    write(&mut b, "d/other.txt", b"other");
+    b.sync_once().await.unwrap();
+    restore_from_trash(&server, &ana, file).await;
+
+    settle(&mut [&mut a, &mut b], 6).await;
+    let expected = vec![("d/f.txt".to_owned(), b"keep me".to_vec()), ("d/other.txt".to_owned(), b"other".to_vec())];
+    assert_eq!(files(&a), expected);
+    assert_eq!(files(&b), expected);
+}
+
+/// A folder deleted here, the answer lost, and brought back from the trash: it is not deleted a second time.
+#[tokio::test]
+async fn a_folder_restored_after_a_lost_delete_answer_is_not_deleted_again() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("e")).unwrap();
+    settle(&mut [&mut a, &mut b], 5).await;
+
+    a.fs_mut().remove_dir(&path("e")).unwrap();
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    restore_from_trash(&server, &ana, node_named(&server, &ana, "e").await).await;
+
+    settle(&mut [&mut a, &mut b], 6).await;
+    assert_eq!(a.fs().dirs(), vec![path("e")]);
+    assert_eq!(b.fs().dirs(), vec![path("e")]);
+    let mut c = machine(&server, &ana, "studio").await;
+    c.sync_once().await.unwrap();
+    assert_eq!(c.fs().dirs(), vec![path("e")], "the server still has the folder");
+}
+
+/// A folder deleted here whose answer was lost and that nobody brought back is still deleted: the delete is not undone
+/// by the doubt about it.
+#[tokio::test]
+async fn a_folder_deleted_with_a_lost_answer_and_not_restored_stays_deleted() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("e")).unwrap();
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().remove_dir(&path("e")).unwrap();
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    settle(&mut [&mut a, &mut b], 6).await;
+    assert!(a.fs().dirs().is_empty(), "{:?}", a.fs().dirs());
+    assert!(b.fs().dirs().is_empty(), "{:?}", b.fs().dirs());
+}
+
+/// A folder with a file in it, both deleted here, the answer lost, then brought back from the trash in different ways. The
+/// folder this machine deleted is never deleted a second time, whichever of the two (or both) comes back.
+async fn lost_delete_of_a_folder_with_a_file(restore: &[&str]) -> (common::Machine, common::Machine, Server, craft_cloud_meta::UserRecord) {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("d")).unwrap();
+    write(&mut a, "d/f.txt", b"keep me");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().remove_file(&path("d/f.txt")).unwrap();
+    a.fs_mut().remove_dir(&path("d")).unwrap();
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    for name in restore {
+        restore_from_trash(&server, &ana, node_named(&server, &ana, name).await).await;
+    }
+    settle(&mut [&mut a, &mut b], 6).await;
+    settle(&mut [&mut a, &mut b], 3).await;
+    (a, b, server, ana)
+}
+
+#[tokio::test]
+async fn a_non_empty_folder_restored_alone_after_a_lost_delete_answer_is_not_deleted_again() {
+    let (a, b, server, ana) = lost_delete_of_a_folder_with_a_file(&["d"]).await;
+    assert_eq!(a.fs().dirs(), vec![path("d")]);
+    assert_eq!(b.fs().dirs(), vec![path("d")]);
+    assert!(files(&a).is_empty() && files(&b).is_empty(), "the file stays in the trash");
+    let mut c = machine(&server, &ana, "studio").await;
+    c.sync_once().await.unwrap();
+    assert_eq!(c.fs().dirs(), vec![path("d")], "the server still has the folder");
+}
+
+#[tokio::test]
+async fn a_folder_and_its_file_both_restored_after_a_lost_delete_answer_come_back() {
+    let (a, b, _server, _ana) = lost_delete_of_a_folder_with_a_file(&["d", "f.txt"]).await;
+    let expected = vec![("d/f.txt".to_owned(), b"keep me".to_vec())];
+    assert_eq!(files(&a), expected);
+    assert_eq!(files(&b), expected);
+    assert_eq!(a.fs().dirs(), vec![path("d")]);
+}
+
+#[tokio::test]
+async fn only_the_file_restored_after_a_lost_delete_answer_brings_its_folder_back_too() {
+    let (a, b, _server, _ana) = lost_delete_of_a_folder_with_a_file(&["f.txt"]).await;
+    let expected = vec![("d/f.txt".to_owned(), b"keep me".to_vec())];
+    assert_eq!(files(&a), expected);
+    assert_eq!(files(&b), expected);
+    assert_eq!(a.fs().dirs(), vec![path("d")]);
+}
+
+/// A tree of nested folders with a file at its bottom, all deleted here in one commit whose answer is lost, then
+/// brought back from the trash in different ways (by node name). Whatever comes back, nothing is deleted a second time.
+async fn lost_delete_of_a_nested_tree(
+    dirs: &[&str],
+    file: &str,
+    restore: &[&str],
+) -> (common::Machine, common::Machine, Server, craft_cloud_meta::UserRecord) {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    for dir in dirs {
+        a.fs_mut().mkdir(&path(dir)).unwrap();
+    }
+    write(&mut a, file, b"keep me");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().remove_file(&path(file)).unwrap();
+    for dir in dirs.iter().rev() {
+        a.fs_mut().remove_dir(&path(dir)).unwrap();
+    }
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    for name in restore {
+        restore_from_trash(&server, &ana, node_named(&server, &ana, name).await).await;
+    }
+    settle(&mut [&mut a, &mut b], 6).await;
+    settle(&mut [&mut a, &mut b], 3).await;
+    (a, b, server, ana)
+}
+
+/// Both machines and a fresh one have exactly the folders `dirs` and no file, and the server still has them.
+async fn assert_only_dirs(m: (common::Machine, common::Machine, Server, craft_cloud_meta::UserRecord), dirs: &[&str]) {
+    let (a, b, server, ana) = m;
+    let expected: Vec<_> = dirs.iter().map(|d| path(d)).collect();
+    assert_eq!(a.fs().dirs(), expected, "the laptop");
+    assert_eq!(b.fs().dirs(), expected, "the desktop");
+    assert!(files(&a).is_empty() && files(&b).is_empty(), "the file stays in the trash");
+    let mut c = machine(&server, &ana, "studio").await;
+    c.sync_once().await.unwrap();
+    assert_eq!(c.fs().dirs(), expected, "the server still has the folders");
+}
+
+#[tokio::test]
+async fn a_nested_folder_restored_alone_after_a_lost_delete_answer_is_not_deleted_again() {
+    let m = lost_delete_of_a_nested_tree(&["d", "d/sub"], "d/sub/f.txt", &["d"]).await;
+    assert_only_dirs(m, &["d"]).await;
+}
+
+#[tokio::test]
+async fn a_nested_folder_and_its_subfolder_restored_after_a_lost_delete_answer_come_back() {
+    let m = lost_delete_of_a_nested_tree(&["d", "d/sub"], "d/sub/f.txt", &["d", "sub"]).await;
+    assert_only_dirs(m, &["d", "d/sub"]).await;
+}
+
+#[tokio::test]
+async fn only_the_deepest_file_restored_after_a_lost_delete_answer_brings_the_whole_chain_back() {
+    let (a, b, _server, _ana) = lost_delete_of_a_nested_tree(&["d", "d/sub"], "d/sub/f.txt", &["f.txt"]).await;
+    let expected = vec![("d/sub/f.txt".to_owned(), b"keep me".to_vec())];
+    assert_eq!(files(&a), expected);
+    assert_eq!(files(&b), expected);
+    assert_eq!(a.fs().dirs(), vec![path("d"), path("d/sub")]);
+}
+
+#[tokio::test]
+async fn a_three_deep_folder_restored_alone_after_a_lost_delete_answer_is_not_deleted_again() {
+    let m = lost_delete_of_a_nested_tree(&["d", "d/a", "d/a/b"], "d/a/b/f.txt", &["d"]).await;
+    assert_only_dirs(m, &["d"]).await;
+}
+
+#[tokio::test]
+async fn a_three_deep_folder_and_its_middle_folder_restored_after_a_lost_delete_answer_come_back() {
+    let m = lost_delete_of_a_nested_tree(&["d", "d/a", "d/a/b"], "d/a/b/f.txt", &["d", "a"]).await;
+    assert_only_dirs(m, &["d", "d/a"]).await;
+}
+
+#[tokio::test]
+async fn only_the_deepest_folder_restored_after_a_lost_delete_answer_brings_its_parents_back() {
+    let m = lost_delete_of_a_nested_tree(&["d", "d/a", "d/a/b"], "d/a/b/f.txt", &["b"]).await;
+    assert_only_dirs(m, &["d", "d/a", "d/a/b"]).await;
+}
+
+/// The change feed is cut short after the lost delete answer and the restore: the machine lists the tree again, at the
+/// same epoch. A restored empty folder is in that listing, and must not be deleted a second time.
+#[tokio::test]
+async fn a_folder_restored_after_a_lost_delete_answer_and_a_relist_is_not_deleted_again() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("e")).unwrap();
+    settle(&mut [&mut a, &mut b], 5).await;
+
+    a.fs_mut().remove_dir(&path("e")).unwrap();
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    restore_from_trash(&server, &ana, node_named(&server, &ana, "e").await).await;
+    a.transport().faults.resync_next_changes.store(true, Ordering::Relaxed);
+
+    settle(&mut [&mut a, &mut b], 6).await;
+    settle(&mut [&mut a, &mut b], 3).await;
+    assert_eq!(a.fs().dirs(), vec![path("e")]);
+    assert_eq!(b.fs().dirs(), vec![path("e")]);
+    let mut c = machine(&server, &ana, "studio").await;
+    c.sync_once().await.unwrap();
+    assert_eq!(c.fs().dirs(), vec![path("e")], "the server still has the folder");
+}
+
+/// A folder delete recorded before sending but rejected before reaching the server is treated conservatively after a relist.
+#[tokio::test]
+async fn an_unsent_folder_delete_and_relist_keeps_the_live_folder() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("e")).unwrap();
+    write(&mut a, "keep.txt", b"keep");
+    settle(&mut [&mut a, &mut b], 5).await;
+
+    a.fs_mut().remove_dir(&path("e")).unwrap();
+    let before = server.meta.space_info(ana.space).await.unwrap().seq;
+    a.transport().faults.fail_next_commit.store(true, Ordering::Relaxed);
+    let error = a.sync_once().await.unwrap_err();
+    assert!(error.to_string().contains("injected before commit"), "{error}");
+    assert_eq!(server.meta.space_info(ana.space).await.unwrap().seq, before, "the failed request never reached the server");
+
+    a.transport().faults.resync_next_changes.store(true, Ordering::Relaxed);
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(a.fs().dirs(), vec![path("e")]);
+    assert_eq!(files(&a), vec![("keep.txt".to_owned(), b"keep".to_vec())]);
+    assert_eq!(files(&b), files(&a));
+    assert!(report.removed_remotely.is_empty(), "{report:?}");
+    assert_eq!(server.meta.space_info(ana.space).await.unwrap().seq, before, "no delete was sent again");
+}
+
+/// A same-epoch relist restores the live parent while keeping its deleted descendants deleted.
+#[tokio::test]
+async fn a_nested_relist_keeps_only_the_restored_parent() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("d")).unwrap();
+    a.fs_mut().mkdir(&path("d/sub")).unwrap();
+    write(&mut a, "d/sub/f.txt", b"keep me");
+    settle(&mut [&mut a, &mut b], 5).await;
+    a.fs_mut().remove_file(&path("d/sub/f.txt")).unwrap();
+    a.fs_mut().remove_dir(&path("d/sub")).unwrap();
+    a.fs_mut().remove_dir(&path("d")).unwrap();
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    restore_from_trash(&server, &ana, node_named(&server, &ana, "d").await).await;
+    a.transport().faults.resync_next_changes.store(true, Ordering::Relaxed);
+
+    settle(&mut [&mut a, &mut b], 6).await;
+    assert_eq!(a.fs().dirs(), vec![path("d")]);
+    assert_eq!(b.fs().dirs(), vec![path("d")]);
+    assert!(files(&a).is_empty() && files(&b).is_empty());
+    let mut c = machine(&server, &ana, "studio").await;
+    c.sync_once().await.unwrap();
+    assert_eq!(c.fs().dirs(), vec![path("d")], "the server still has only the restored parent");
+}
+
+/// A tracked child keeps an in-doubt folder in the base when a relist sees it live.
+#[tokio::test]
+async fn a_tracked_child_keeps_an_in_doubt_folder_from_release() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    let mut b = machine(&server, &ana, "desktop").await;
+    a.fs_mut().mkdir(&path("d")).unwrap();
+    write(&mut a, "d/f.txt", b"original");
+    a.fs_mut().mkdir(&path("e")).unwrap();
+    write(&mut a, "e/g.txt", b"other");
+    settle(&mut [&mut a, &mut b], 5).await;
+    let folder = node_named(&server, &ana, "d").await;
+    let file = node_named(&server, &ana, "f.txt").await;
+    a.fs_mut().rename(&path("d/f.txt"), &path("e/f.txt")).unwrap();
+    a.fs_mut().remove_dir(&path("d")).unwrap();
+    a.fs_mut().rename(&path("e"), &path("d")).unwrap();
+    // Restore a checkpoint with D's delete in doubt. D's tracked file F is still at d/f.txt, inside E's local folder.
+    let mut state = a.state().clone();
+    state.sent_dir_deletes.insert(folder);
+    let mut a = common::restart(&a, state, |_| {});
+    a.transport().faults.resync_next_changes.store(true, Ordering::Relaxed);
+
+    a.sync_once().await.unwrap();
+    assert!(a.state().base.contains_key(&folder), "the folder is still tracked with its child");
+    assert!(a.state().base.contains_key(&file), "the live file is still tracked");
+    assert_eq!(files(&a), vec![("d/f.txt".to_owned(), b"original".to_vec()), ("d/g.txt".to_owned(), b"other".to_vec())]);
+    let listing = server.meta.tree(ana.space, None, 5000).await.unwrap();
+    assert!(listing.nodes.iter().any(|node| node.id == folder && !node.deleted), "folder node was deleted");
+    assert!(listing.nodes.iter().any(|node| node.id == file && !node.deleted), "tracked file node was deleted");
+}
+
+/// The local replacement becomes a conflict copy, and the restored file returns at its original path.
+#[tokio::test]
+async fn a_local_replacement_after_a_lost_delete_reply_keeps_its_content() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    write(&mut a, "f.txt", b"original");
+    a.sync_once().await.unwrap();
+    a.fs_mut().remove_file(&path("f.txt")).unwrap();
+    a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
+    assert!(a.sync_once().await.is_err());
+    let old = node_named(&server, &ana, "f.txt").await;
+    write(&mut a, "f.txt", b"local replacement");
+    restore_from_trash(&server, &ana, old).await;
+
+    settle(&mut [&mut a], 6).await;
+    let on_a = files(&a);
+    assert!(on_a.contains(&("f.txt".to_owned(), b"original".to_vec())), "{on_a:?}");
+    assert!(on_a.iter().any(|(p, bytes)| p.contains("(conflict, laptop, ") && bytes == b"local replacement"), "{on_a:?}");
+    let mut b = machine(&server, &ana, "desktop").await;
+    b.sync_once().await.unwrap();
+    assert_eq!(files(&b), files(&a));
+}

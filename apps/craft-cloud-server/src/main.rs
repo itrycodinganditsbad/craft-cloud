@@ -49,6 +49,7 @@ async fn run_server(config_path: &std::path::Path) -> Result<(), String> {
         .with_public_url(config.public_url.clone())
         .with_web_admin(web)
         .with_two_factor(secrets);
+    let state = AppState::new(meta, store, config.trusted_proxies.clone()).map_err(|e| e.message)?.with_trash_days(config.retention.trash_days);
     let listener = tokio::net::TcpListener::bind(config.listen).await.map_err(|e| format!("can't listen on {}: {e}", config.listen))?;
     tracing::info!(listen = %config.listen, behind_proxy = config.behind_proxy, web_admin = config.web_admin.enabled, "Craft Cloud server running");
     let shutdown = async {

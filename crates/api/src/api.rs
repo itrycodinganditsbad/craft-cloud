@@ -63,11 +63,15 @@ pub mod codes {
 }
 
 /// What a client reads of every error answer: `error`, a stable code (one of [`codes`], or the local API's), and
-/// `message`, for people. Every other field is ignored (the full body is `craft_cloud_proto::api::ErrorBody`).
+/// `message`, for people. The local trash restore call also keeps `name_taken` when a server `conflict` includes that
+/// cause; any other server-only fields are ignored (the full body is `craft_cloud_proto::api::ErrorBody`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ErrorAnswer {
     pub error: String,
     pub message: String,
+    /// Whether the server's conflict details say that no available restored name remains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_taken: Option<bool>,
 }
 
 /// The second step of a sign-in: what `two_factor_required` carries. `challenge` is a secret, good once and until
@@ -568,7 +572,18 @@ mod tests {
     fn an_error_answer_reads_any_error_body() {
         let json = serde_json::json!({ "error": "conflict", "message": "m", "conflicts": [{ "op": 0, "kind": "root" }], "quota": { "used": 1, "limit": 2 } });
         let answer: ErrorAnswer = serde_json::from_value(json).unwrap();
-        assert_eq!(answer, ErrorAnswer { error: "conflict".into(), message: "m".into() });
+        assert_eq!(answer, ErrorAnswer { error: "conflict".into(), message: "m".into(), name_taken: None });
+    }
+
+    #[test]
+    fn an_error_answer_keeps_the_optional_trash_name_conflict() {
+        let answer: ErrorAnswer = serde_json::from_value(serde_json::json!({
+            "error": "conflict", "message": "no free conflict name", "name_taken": true
+        }))
+        .unwrap();
+        assert_eq!(answer.name_taken, Some(true));
+        let old: ErrorAnswer = serde_json::from_value(serde_json::json!({ "error": "conflict", "message": "m" })).unwrap();
+        assert_eq!(old.name_taken, None, "older agents omit the optional field");
     }
 
     #[test]
