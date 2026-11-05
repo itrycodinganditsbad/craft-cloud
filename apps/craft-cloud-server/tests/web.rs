@@ -1109,12 +1109,18 @@ async fn accounts_are_made_changed_disabled_and_removed(s: &Web) {
     assert!(signed_in(s, &sess).await);
 
     // Removal: gone from the lists, its name stays taken, nothing more can be changed.
+    let res = s.act(&sess, &path, &[("role", "member"), ("quota_mib", "10")]).await;
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
     let res = s.act(&sess, &format!("/web/users/{newbie}/remove"), &[]).await;
     assert_eq!((res.status(), location(&res).as_str()), (StatusCode::SEE_OTHER, "/web/users?notice=removed"));
     let list = s.get("/web/users?notice=removed", Some(&sess.token)).await.text().await.unwrap();
     assert!(list.contains("marked for removal") && !list.contains(&format!("/web/users/{newbie}\"")));
-    let page = s.get(&format!("/web/users/{newbie}"), Some(&sess.token)).await.text().await.unwrap();
+    let res = s.get(&format!("/web/users/{newbie}"), Some(&sess.token)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let page = res.text().await.unwrap();
     assert!(page.contains("marked for removal") && !page.contains("Enable the account"), "{page}");
+    assert!(page.contains("<dt>Quota</dt><dd>10.0 MiB</dd>"), "the removed account keeps its old quota detail: {page}");
+    assert!(!page.contains("Effective quota") && !page.contains("estimate (overlapping)"), "removed accounts have no usage query: {page}");
     let res = s.act(&sess, "/web/users", &[("username", "newbie"), ("role", "member")]).await;
     assert_eq!(res.status(), StatusCode::CONFLICT);
     let res = s.act(&sess, &format!("/web/users/{newbie}/enable"), &[]).await;
@@ -1350,6 +1356,7 @@ async fn user_controlled_text_is_escaped(s: &Web) {
     sqlx::query("UPDATE users SET username = $1 WHERE username = 'ana'").bind("<script>alert(1)</script>").execute(&mut conn).await.unwrap();
     drop(conn);
     let pages = [
+        s.get("/web", Some(&sess.token)).await,
         s.get("/web/users", Some(&sess.token)).await,
         s.get(&format!("/web/users/{}", ana.id.0), Some(&sess.token)).await,
         s.get("/web/audit", Some(&sess.token)).await,
@@ -1370,6 +1377,12 @@ async fn user_controlled_text_is_escaped(s: &Web) {
     assert!(shown.contains("&lt;script&gt;alert(&#39;d&#39;)&lt;/script&gt;"), "the device name is shown, escaped");
     assert!(shown.contains("&lt;b onmouseover=x&gt;&amp;&quot;"), "the platform is shown, escaped");
     assert!(shown.contains("&lt;script&gt;alert(2)&lt;/script&gt;"), "the search is shown back, escaped");
+    assert!(shown.contains("Storage") && shown.contains("Top accounts by stored bytes"), "the storage overview is shown");
+    assert!(shown.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "the top-account name is escaped");
+    assert!(
+        shown.contains("Effective quota") && shown.contains("Trash estimate (overlapping)") && shown.contains("History estimate (overlapping)"),
+        "the account usage is shown"
+    );
 }
 
 async fn old_sessions_are_cleaned_up_at_sign_in(s: &Web) {

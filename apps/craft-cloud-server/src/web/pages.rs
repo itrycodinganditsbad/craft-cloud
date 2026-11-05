@@ -10,7 +10,9 @@
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use craft_cloud_meta::{AdminActor, AdminUser, AdminVia, AuditEvent, AuditQuery, DeviceRecord, RESET_TTL_MS, UserId, valid_username};
+use craft_cloud_meta::{
+    AdminActor, AdminUser, AdminVia, AuditEvent, AuditQuery, DeviceRecord, RESET_TTL_MS, StorageOverview, UserId, valid_username,
+};
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::AdminCode;
 use craft_cloud_proto::join::INVITE_TTL_MS;
@@ -95,12 +97,55 @@ fn parse_user(id: &str) -> Result<UserId, WebError> {
     Uuid::parse_str(id).map(UserId).map_err(|_| WebError::not_found("account"))
 }
 
+fn storage_section(storage: &StorageOverview) -> String {
+    let mut body = heading("Storage");
+    body.push_str("<dl>");
+    let mut row = |term: &str, value: String| {
+        body.push_str(&format!("<dt>{}</dt><dd>{}</dd>", super::html::esc(term), super::html::esc(&value)));
+    };
+    row("Accounts", storage.accounts.to_string());
+    row("Stored", fmt_bytes(storage.stored_bytes));
+    row("Default quota", storage.default_quota_bytes.map_or_else(|| "none".to_owned(), fmt_bytes));
+    row("Accounts with quota override", storage.accounts_with_override.to_string());
+    row("Accounts near quota", storage.accounts_near_quota.to_string());
+    row("Accounts over quota", storage.accounts_over_quota.to_string());
+    row(
+        "Manifest index",
+        format!(
+            "{} complete, {} building, {} not indexed",
+            storage.manifest_index.complete, storage.manifest_index.building, storage.manifest_index.not_indexed
+        ),
+    );
+    body.push_str("</dl>");
+    if storage.manifest_index.building > 0 || storage.manifest_index.not_indexed > 0 {
+        body.push_str(&notice("Storage estimates are incomplete; run `craft-cloud-server index build`.", false));
+    }
+    let rows: Vec<Vec<String>> = storage
+        .top_accounts
+        .iter()
+        .map(|account| {
+            vec![
+                link(&user_href(account.id), &account.username),
+                super::html::esc(&fmt_bytes(account.stored_bytes)),
+                super::html::esc(&account.quota_bytes.map_or_else(|| "none".to_owned(), fmt_bytes)),
+            ]
+        })
+        .collect();
+    if rows.is_empty() {
+        body.push_str("<p>No accounts.</p>");
+    } else {
+        body.push_str(&table("Top accounts by stored bytes", &["Username", "Stored", "Effective quota"], &rows));
+    }
+    body
+}
+
 // ---- overview ----
 
 /// `GET /web`.
 pub(super) async fn overview(State(state): State<Shared>, request: Request) -> Result<Response, WebError> {
     let authed = authenticate(&state, request.headers()).await.map_err(WebError::for_get)?;
     let counts = state.meta.admin_server_counts().await?;
+    let storage = state.meta.admin_storage_overview().await?;
     let mut body = heading("Overview");
     body.push_str("<dl>");
     let mut row = |term: &str, value: String| {
@@ -120,6 +165,7 @@ pub(super) async fn overview(State(state): State<Shared>, request: Request) -> R
     body.push_str(" &middot; ");
     body.push_str(&link("/web/audit", "Read the audit log"));
     body.push_str("</p>");
+    body.push_str(&storage_section(&storage));
     Ok(ok_page(&authed.ctx(), "Overview", &body))
 }
 
@@ -249,6 +295,7 @@ pub(super) async fn user(State(state): State<Shared>, Path(id): Path<String>, re
     let q: NoticeQuery = read_query(&request)?;
     let found = state.meta.admin_user(target, state.now_ms()).await?.ok_or_else(|| WebError::not_found("account"))?;
     let devices = state.meta.admin_devices(target).await?;
+    let usage = if found.removed_ms.is_none() { Some(state.meta.admin_storage_estimate(target).await?) } else { None };
     let ctx = authed.ctx();
     let two_factor = asks_for_code(&state, &authed).await?;
     let base = user_href(target);
@@ -276,7 +323,27 @@ pub(super) async fn user(State(state): State<Shared>, Path(id): Path<String>, re
     row("Two-factor sign-in", if found.two_factor_enabled { "on" } else { "off" }.to_owned());
     row("Devices signed in", found.devices_active.to_string());
     row("Stored", fmt_bytes(found.stored_bytes));
-    row("Quota", found.quota_bytes.map_or_else(|| "none (the server's cap applies, if any)".to_owned(), fmt_bytes));
+    if let Some(usage) = usage {
+        row("Effective quota", usage.quota_bytes.map_or_else(|| "none".to_owned(), fmt_bytes));
+        row(
+            "Trash estimate (overlapping)",
+            if usage.reason.is_some() {
+                "estimates not available yet".to_owned()
+            } else {
+                usage.trash_bytes.map_or_else(|| "none".to_owned(), fmt_bytes)
+            },
+        );
+        row(
+            "History estimate (overlapping)",
+            if usage.reason.is_some() {
+                "estimates not available yet".to_owned()
+            } else {
+                usage.history_bytes.map_or_else(|| "none".to_owned(), fmt_bytes)
+            },
+        );
+    } else {
+        row("Quota", found.quota_bytes.map_or_else(|| "none (the server's cap applies, if any)".to_owned(), fmt_bytes));
+    }
     row("Invite", if found.invite_pending { "open".to_owned() } else { "none".to_owned() });
     body.push_str("</dl>");
 
@@ -675,5 +742,27 @@ mod tests {
         assert_eq!(notice_text(Some("<script>")), None);
         assert_eq!(notice_text(None), None);
         assert_eq!(notice_html(Some("nope")), "");
+    }
+
+    #[test]
+    fn storage_overview_escapes_top_account_names() {
+        let storage = StorageOverview {
+            accounts: 1,
+            stored_bytes: 12,
+            default_quota_bytes: Some(100),
+            accounts_with_override: 1,
+            accounts_near_quota: 0,
+            accounts_over_quota: 0,
+            top_accounts: vec![craft_cloud_meta::StorageAccount {
+                id: UserId(Uuid::nil()),
+                username: "<script>alert('x')</script>".into(),
+                stored_bytes: 12,
+                quota_bytes: Some(100),
+            }],
+            manifest_index: craft_cloud_meta::StorageIndexCounts { complete: 1, building: 0, not_indexed: 0 },
+        };
+        let html = storage_section(&storage);
+        assert!(html.contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"), "{html}");
+        assert!(!html.contains("<script>"), "{html}");
     }
 }
