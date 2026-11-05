@@ -175,7 +175,7 @@ fn snapshot_join() {
     model.update(Event::Joined(Err(craft_cloud_app::Error::Refused {
         code: "folder_has_files".into(),
         message: "has files".into(),
-        name_taken: None,, name_taken: None
+        name_taken: None,
     })));
     snapshot(model.clone(), egui::Theme::Light, "join-folder-has-files");
     model.update(Event::SyncExistingFiles(false));
@@ -939,3 +939,4 @@ fn audit_buttons_send_their_events() {
     h.run_steps(2);
     assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Audit(AuditMsg::CloseActivity)]);
 }
+
