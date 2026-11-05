@@ -179,7 +179,7 @@ async fn account_usage(State(state): State<Shared>, Extension(auth): Extension<D
     let index_complete = estimate.reason.is_none();
     Ok(Json(AccountUsage {
         stored_bytes: estimate.stored_bytes,
-        // PR #17's per-account override takes precedence once both branches are merged.
+        // A per-account quota override, once there is one, takes precedence over this cap.
         quota_bytes: state.meta.stored_bytes_cap(),
         trash_bytes: estimate.trash_bytes,
         history_bytes: estimate.history_bytes,
