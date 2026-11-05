@@ -82,6 +82,8 @@ pub(super) fn show(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: 
             && ui.button("Administration").on_hover_text("Accounts, invites, computers and the audit log").clicked()
         {
             events.push(Event::Admin(AdminEvent::Open));
+        }
+    });
     ui.horizontal(|ui| {
         if ui.button("File versions…").clicked() {
             events.push(Event::OpenVersions);

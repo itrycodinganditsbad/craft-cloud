@@ -226,6 +226,7 @@ impl Agent for ClientAgent {
     }
     fn admin_revoke_device(&self, id: Uuid, device: DeviceId, confirm: &AdminConfirm) -> Result<(), Error> {
         self.with(|c| c.admin_revoke_device(id, device, confirm))
+    }
     fn file_history(&self, path: &str, cursor: Option<&str>) -> Result<HistoryResponse, Error> {
         self.with(|c| c.file_history(path, cursor, Some(50)))
     }

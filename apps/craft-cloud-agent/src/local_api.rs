@@ -26,7 +26,8 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::{
-    ErrorAnswer, HistoryResponse, RestoreResponse, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus, codes as api_codes,
+    DeviceInfo, HistoryResponse, PairingStatus, RecoveryCodes, RestoreResponse, RevokedOthers, TwoFactorChallenge,
+    TwoFactorSetupResponse, TwoFactorStatus, codes as api_codes,
 };
 use craft_cloud_proto::api::{DeviceInfo, ErrorAnswer, HistoryResponse, PairingStatus, RestoreResponse, codes as api_codes};
 use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
