@@ -87,7 +87,9 @@ upgraded database and rejects the `[retention]` section, so take a backup before
 `craft-cloud-server verify --config cc-data/config.toml` checks the database and the blob storage against each other
 and prints what it finds; `--json` prints a machine-readable report and `--skip-chunk-reads` skips reading every chunk
 object (which hashes it, and takes as long as reading all your data). It changes nothing and exits with an error if
-it found a problem. The report also says how many manifests have a complete reference index, which is what a later
+it found a problem. It opens a SQLite database read-only: the database file and its WAL keep their bytes, also after a
+crash that left committed data in the WAL, which it reads. Opening may leave an empty `-wal` and a `-shm` file behind
+(SQLite's rebuilt index of the WAL, not data). The report also says how many manifests have a complete reference index, which is what a later
 cleanup would need before it could free anything. After upgrading, run `craft-cloud-server index build --config
 cc-data/config.toml` once: it indexes the manifests stored before the index existed, writing only that index, in small
 steps, and it can be stopped and run again. Nothing in the server frees storage yet.

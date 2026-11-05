@@ -725,7 +725,7 @@ that is wrong is only reported. Throwing the edges away is itself done in batche
 
 `craft-cloud-server verify [--json] [--skip-chunk-reads]` reads and reports and changes nothing: the database and the
 storage directory must exist already (a wrong path is an error, not a new empty server with "no problems found"), and a
-database whose schema is older than the program is refused, not upgraded (start the server once to upgrade it). It lists
+database whose schema is older than the program is refused, not upgraded (start the server once to upgrade it). A SQLite database is opened read-only (`Meta::open_existing`, `mode=ro`): the database file and the WAL keep their bytes, also when a crashed process left committed data in the WAL, which the command reads; it may leave an empty `-wal` and a `-shm` file (the rebuilt index of the WAL, not data). It lists
 problems (which make it exit with an error): a manifest
 object that is missing, damaged or not a manifest; a complete index that does not equal its manifest; edges whose manifest
 has no index row; an index row without a recorded manifest; an edge or a manifest that names a chunk that is not recorded;

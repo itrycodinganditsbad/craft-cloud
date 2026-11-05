@@ -371,6 +371,91 @@ fn sqlite_snapshot(db_path: &std::path::Path) -> (Vec<u8>, Vec<u8>) {
     (read(db_path.to_owned()), read(db_path.with_extension("db-wal")))
 }
 
+/// Runs the real `craft-cloud-server` binary with the arguments and waits for it to exit, so that every connection it
+/// opened is closed, and every write a close or a checkpoint makes is on disk, when this returns: whether it exited with
+/// success, its standard output and its standard error.
+fn run_binary(args: &[&str]) -> (bool, String, String) {
+    let output = Process::new(env!("CARGO_BIN_EXE_craft-cloud-server")).args(args).stdin(Stdio::null()).output().unwrap();
+    (output.status.success(), String::from_utf8(output.stdout).unwrap(), String::from_utf8(output.stderr).unwrap())
+}
+
+/// Not a test of its own: run as a child of the crashed-WAL tests, it commits a chunk row and ends without closing the
+/// database, which leaves the row in the WAL and in no checkpoint.
+#[test]
+fn verify_test_leave_a_chunk_in_the_wal() {
+    let Ok(url) = std::env::var("CRAFT_CLOUD_TEST_WAL_CHUNK_URL") else { return };
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let meta = craft_cloud_meta::Meta::open(&url).await.unwrap();
+        let ana = meta.user_by_name("ana").await.unwrap().unwrap();
+        let id = craft_cloud_proto::ChunkId::from_bytes(*blake3::hash(b"a chunk only the WAL knows").as_bytes());
+        meta.add_chunk(ana.space, &id, 9, 0).await.unwrap();
+        std::process::exit(0);
+    });
+}
+
+/// A database a crashed process left with a row only in its WAL: `verify` (a process of its own, finished before
+/// anything is compared) reads that row, and the database file, the WAL and the storage tree keep their bytes. With
+/// `delete_shm`, the `-shm` file the crash left is gone before the run, in a directory that can be written.
+async fn verify_of_a_crashed_wal(delete_shm: bool) {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config = dir.join("config.toml");
+    let loaded = Config::load(&config).unwrap();
+    let mut conn = raw_sqlite(&loaded.database.url).await;
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&mut conn).await.unwrap();
+    sqlx::Connection::close(conn).await.unwrap();
+    let status = Process::new(std::env::current_exe().unwrap())
+        .args(["--exact", "verify_test_leave_a_chunk_in_the_wal", "--nocapture"])
+        .env("CRAFT_CLOUD_TEST_WAL_CHUNK_URL", &loaded.database.url)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let db_path = dir.join("meta.db");
+    if delete_shm {
+        let _ = std::fs::remove_file(dir.join("meta.db-shm"));
+    }
+    let (db_before, wal_before) = sqlite_snapshot(&db_path);
+    assert!(!wal_before.is_empty(), "test requires a non-empty WAL");
+    let tree_before = tree_snapshot(&dir.join("blobs"));
+
+    let (ok, out, err) = run_binary(&["verify", "--json", "--config", config.to_str().unwrap()]);
+    assert!(!ok, "the chunk's object is not stored, so verify must find a problem: {out}{err}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}{err}"));
+    assert_eq!(report["problems"]["by_kind"]["chunk_object_missing"], 1, "verify must see the row that only the WAL holds: {out}");
+    let (db_after, wal_after) = sqlite_snapshot(&db_path);
+    assert!(db_before == db_after, "database file changed: {} -> {} bytes", db_before.len(), db_after.len());
+    assert!(wal_before == wal_after, "WAL changed: {} -> {} bytes", wal_before.len(), wal_after.len());
+    assert!(tree_before == tree_snapshot(&dir.join("blobs")), "the storage changed");
+}
+
+#[tokio::test]
+async fn verify_reads_a_crashed_wal_and_changes_no_data() {
+    verify_of_a_crashed_wal(false).await;
+}
+
+#[tokio::test]
+async fn verify_reads_a_crashed_wal_whose_shm_file_is_gone() {
+    verify_of_a_crashed_wal(true).await;
+}
+
+fn tree_snapshot(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(root: &std::path::Path, dir: &std::path::Path, out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(root, &path, out);
+            } else {
+                out.insert(path.strip_prefix(root).unwrap().to_path_buf(), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    visit(root, root, &mut out);
+    out
+}
+
 fn object_path(dir: &std::path::Path, kind: &str, id: &[u8; 32]) -> std::path::PathBuf {
     let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
     dir.join("blobs").join(kind).join(&hex[0..2]).join(&hex[2..4]).join(&hex)
@@ -581,8 +666,8 @@ async fn verify_refuses_older_and_newer_schemas_without_changing_the_database() 
         sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&mut conn).await.unwrap();
         conn.close().await.unwrap();
         let before = sqlite_snapshot(&db_path);
-        let error = cli(&["verify", "--config", &s.config], "").await.expect_err("verify must refuse a non-current schema");
-        assert!(error.to_string().contains(message), "{error}");
+        let (ok, _, error) = run_binary(&["verify", "--config", &s.config]);
+        assert!(!ok && error.contains(message), "verify must refuse a non-current schema: {error}");
         assert!(sqlite_snapshot(&db_path) == before, "verify changed the database or its WAL for schema version {version}");
     }
 }

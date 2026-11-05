@@ -134,9 +134,14 @@ impl Meta {
     }
 
     /// Connects to a database that already exists and creates nothing: a SQLite file that is not there is an error
-    /// (`mode=rw`, whatever options the URL had), not a new empty database, and a database whose schema is not the
+    /// (`mode=ro`, whatever options the URL had), not a new empty database, and a database whose schema is not the
     /// current one is refused, not upgraded. For a command that only reads, so that a wrong path is reported instead of
     /// being taken for an empty database that has no problems. `sqlite::memory:` has nothing to exist.
+    ///
+    /// A read-only SQLite connection never writes the database file or the WAL, and cannot checkpoint: closing the last
+    /// connection of a read-write one checkpoints the WAL of a crashed process into the database file and removes it,
+    /// which is a write a read-only command must not make. It still reads the WAL's committed data. Opening may leave
+    /// an empty `-wal` and a `-shm` file (SQLite's rebuilt index of the WAL, no data) when there were none.
     pub async fn open_existing(url: &str) -> Result<Self, MetaError> {
         Self::start(url, true).await
     }
@@ -152,7 +157,7 @@ impl Meta {
         };
         let url = match dialect {
             Dialect::Sqlite if existing && url.contains(":memory:") => return Err(MetaError::Missing("an in-memory database has no existing data")),
-            Dialect::Sqlite if existing => format!("{}?mode=rw", url.split_once('?').map_or(url, |(path, _)| path)),
+            Dialect::Sqlite if existing => format!("{}?mode=ro", url.split_once('?').map_or(url, |(path, _)| path)),
             Dialect::Sqlite if !url.contains('?') && !url.contains(":memory:") => format!("{url}?mode=rwc"),
             _ => url.to_owned(),
         };
