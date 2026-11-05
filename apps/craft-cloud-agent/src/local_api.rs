@@ -233,11 +233,16 @@ impl IntoResponse for LocalError {
             object.extend(more);
         }
         let mut response = (self.status, Json(body)).into_response();
+        if let Some(name_taken) = self.name_taken {
+            if let Some(object) = body.as_object_mut() {
+                object.insert("name_taken".to_owned(), serde_json::Value::Bool(name_taken));
+            }
+        }
+        let mut response = (self.status, Json(body)).into_response();
         if let Some(secs) = self.retry_after_secs {
             response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(secs));
         }
         response
-        (self.status, Json(ErrorAnswer { error: self.code, message: self.message, name_taken: self.name_taken })).into_response()
     }
 }
 
