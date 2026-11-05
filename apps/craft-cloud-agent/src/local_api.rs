@@ -197,9 +197,8 @@ impl Control {
     }
 }
 
-/// An error answer: the HTTP status, the code and message, and what a two-factor answer carries beyond them (the challenge
-/// of `two_factor_required`, the wait of a lock, also as `Retry-After`).
-/// An error answer: the HTTP status and the local API's typed error answer.
+/// An error answer: the HTTP status, the typed local API code and message, and optional details such as a two-factor
+/// challenge, a lock wait, or a trash-restore name conflict.
 #[derive(Debug)]
 pub struct LocalError {
     pub status: StatusCode,
@@ -207,21 +206,16 @@ pub struct LocalError {
     pub message: String,
     pub two_factor: Option<TwoFactorChallenge>,
     pub retry_after_secs: Option<u64>,
-}
-
-impl LocalError {
-    pub fn new(status: StatusCode, code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { status, code: code.into(), message: message.into(), two_factor: None, retry_after_secs: None }
     pub name_taken: Option<bool>,
 }
 
 impl LocalError {
-    pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code: code.to_owned(), message: message.into(), name_taken: None }
+    pub fn new(status: StatusCode, code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self { status, code: code.into(), message: message.into(), two_factor: None, retry_after_secs: None, name_taken: None }
     }
 
     fn with_code(status: StatusCode, code: String, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into(), name_taken: None }
+        Self { status, code, message: message.into(), two_factor: None, retry_after_secs: None, name_taken: None }
     }
 }
 
@@ -232,7 +226,6 @@ impl IntoResponse for LocalError {
         if let (Some(object), Ok(serde_json::Value::Object(more))) = (body.as_object_mut(), serde_json::to_value(&extras)) {
             object.extend(more);
         }
-        let mut response = (self.status, Json(body)).into_response();
         if let Some(name_taken) = self.name_taken {
             if let Some(object) = body.as_object_mut() {
                 object.insert("name_taken".to_owned(), serde_json::Value::Bool(name_taken));
