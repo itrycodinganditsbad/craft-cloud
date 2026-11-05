@@ -1233,7 +1233,6 @@ impl Model {
         };
         let (code, text) = match &e {
             Error::Refused { code, message, .. } | Error::RefusedWith { code, message, .. } => (code.as_str(), message.clone()),
-            Error::Refused { code, message, .. } => (code.as_str(), message.clone()),
             Error::NotRunning(_) => {
                 self.status = None;
                 self.screen = Screen::NotRunning(self.not_running(STOPPED, &e.to_string()));

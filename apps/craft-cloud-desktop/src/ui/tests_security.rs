@@ -278,7 +278,7 @@ fn a_join_for_an_account_with_two_factor_asks_for_the_code_and_keeps_the_invite(
         retry_after_secs: None,
     };
     agent.joins.lock().unwrap().push(Ok(signed_in()));
-    agent.joins.lock().unwrap().push(Err(Error::Refused { code: "two_factor_invalid".into(), message: "wrong".into() }));
+    agent.joins.lock().unwrap().push(Err(Error::Refused { code: "two_factor_invalid".into(), message: "wrong".into(), name_taken: None }));
     agent.joins.lock().unwrap().push(Err(required));
     let mut model = model_after(&agent, vec![]);
     let Screen::Join(form) = &mut model.screen else { panic!("{:?}", model.screen) };
@@ -563,7 +563,7 @@ fn a_typed_password_or_code_is_not_left_in_eguis_undo_history() {
     h.run_steps(2);
     assert!(!remembered(&h, "disable-password").1, "once sent: no history (a field still drawn has an empty state)");
     assert!(!remembered(&h, "disable-code").1, "once sent: no history (a field still drawn has an empty state)");
-    let refused = Error::Refused { code: "wrong_password".into(), message: "no".into() };
+    let refused = Error::Refused { code: "wrong_password".into(), message: "no".into(), name_taken: None };
     h.state_mut().0.update(Event::SecurityAnswer(crate::security::SecurityAnswer::Disable(Err(refused))));
     h.run_steps(3);
     undo(&mut h, Role::PasswordInput);

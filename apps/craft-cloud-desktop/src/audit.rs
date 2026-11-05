@@ -648,7 +648,7 @@ pub(crate) mod tests {
         model.update(Event::Audit(AuditMsg::Page { own: false, ticket: old, result: Ok(page) }));
         assert_eq!(view(&model).list.events, current, "the first call's answer matches nothing");
         // A refusal is said; `forbidden` asks the account's role again.
-        let forbidden = Error::Refused { code: "forbidden".into(), message: "Only admins".into() };
+        let forbidden = Error::Refused { code: "forbidden".into(), message: "Only admins".into(), name_taken: None };
         let Some(Effect::AuditPage { ticket, .. }) = model.update(Event::Audit(AuditMsg::Reload)).first().cloned() else { panic!() };
         let effects = model.update(Event::Audit(AuditMsg::Page { own: false, ticket, result: Err(forbidden) }));
         assert!(matches!(effects.as_slice(), [Effect::Account { .. }]), "{effects:?}");

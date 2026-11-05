@@ -509,7 +509,7 @@ pub(crate) mod fake {
     }
 
     fn refused(code: &str, message: &str) -> Error {
-        Error::Refused { code: code.into(), message: message.into() }
+        Error::Refused { code: code.into(), message: message.into(), name_taken: None }
     }
 
     impl FakeAgent {
@@ -567,7 +567,7 @@ pub(crate) mod fake {
                 return Err(Error::NotRunning("can't reach it: connection refused".into()));
             }
             if !self.admin.load(Ordering::SeqCst) {
-                return Err(Error::Refused { code: "forbidden".into(), message: "this needs an administrator".into() });
+                return Err(Error::Refused { code: "forbidden".into(), message: "this needs an administrator".into(), name_taken: None });
             }
             Ok(ok())
         }
@@ -894,13 +894,13 @@ pub(crate) mod fake {
             self.answer("file_history", |_| HistoryResponse { versions: Vec::new(), next: None })
         }
         fn restore_file(&self, _path: &str, _version: VersionId, _expected_version: VersionId) -> Result<RestoreResponse, Error> {
-            Err(Error::Refused { code: "invalid".into(), message: "not configured".into(), name_taken: None })
+            Err(Error::Refused { code: "invalid".into(), message: "not configured".into(), name_taken: None, name_taken: None })
         }
         fn trash(&self, _cursor: Option<&str>) -> Result<TrashResponse, Error> {
             self.answer("trash", |_| TrashResponse { items: Vec::new(), next: None })
         }
         fn restore_from_trash(&self, _id: NodeId) -> Result<TrashRestoreResponse, Error> {
-            Err(Error::Refused { code: "invalid".into(), message: "not configured".into(), name_taken: None })
+            Err(Error::Refused { code: "invalid".into(), message: "not configured".into(), name_taken: None, name_taken: None })
         }
         fn remove_from_trash(&self, _id: NodeId) -> Result<(), Error> {
             self.answer("remove_from_trash", |_| ())

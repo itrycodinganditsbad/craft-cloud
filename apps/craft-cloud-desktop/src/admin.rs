@@ -1009,7 +1009,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn refused(code: &str, message: &str) -> Error {
-        Error::Refused { code: code.into(), message: message.into() }
+        Error::Refused { code: code.into(), message: message.into(), name_taken: None }
     }
 
     /// The pages are for admins: the server's answer to the counters decides, and a member never gets in.

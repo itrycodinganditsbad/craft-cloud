@@ -175,12 +175,12 @@ fn snapshot_join() {
     model.update(Event::Joined(Err(craft_cloud_app::Error::Refused {
         code: "folder_has_files".into(),
         message: "has files".into(),
-        name_taken: None,
+        name_taken: None,, name_taken: None
     })));
     snapshot(model.clone(), egui::Theme::Light, "join-folder-has-files");
     model.update(Event::SyncExistingFiles(false));
     sent(&mut model, "cloud.shadows.ch/K7M4-Q9TX");
-    model.update(Event::Joined(Err(craft_cloud_app::Error::Refused { code: "invalid_code".into(), message: "x".into(), name_taken: None })));
+    model.update(Event::Joined(Err(craft_cloud_app::Error::Refused { code: "invalid_code".into(), message: "x".into(), name_taken: None, name_taken: None })));
     snapshot(model, egui::Theme::Dark, "join-invalid-code-dark");
 }
 
@@ -188,7 +188,7 @@ fn snapshot_join() {
 fn snapshot_password_needed() {
     let mut model = after(&FakeAgent::new(signed_out()), Vec::new());
     sent(&mut model, "cloud.shadows.ch/K7M4-Q9TX-K7M4-Q9TX");
-    model.update(Event::Joined(Err(craft_cloud_app::Error::Refused { code: "password_required".into(), message: "x".into(), name_taken: None })));
+    model.update(Event::Joined(Err(craft_cloud_app::Error::Refused { code: "password_required".into(), message: "x".into(), name_taken: None, name_taken: None })));
     if let Screen::PasswordNeeded(pw) = &mut model.screen {
         pw.password = "correct horse".into();
         pw.again = "correct house".into();
@@ -318,7 +318,7 @@ fn snapshot_trash() {
         };
         model.update(Event::TrashRestored {
             ticket,
-            result: Err(craft_cloud_app::Error::Refused { code: "conflict".into(), message: "name taken".into(), name_taken: Some(true) }),
+            result: Err(craft_cloud_app::Error::Refused { code: "conflict".into(), message: "name taken".into(), name_taken: Some(true), name_taken: None }),
         });
         snapshot(model.clone(), egui::Theme::Light, "trash-name-taken");
         let restored = craft_cloud_app::TrashRestoreResponse {
@@ -518,7 +518,7 @@ fn snapshot_admin_pages() {
     model.update(Event::Admin(AdminEvent::Ask(Action::Disable { id: ana, username: "ana".into() })));
     password_typed(&mut model, "not-my-password");
     snapshot(model.clone(), egui::Theme::Light, "admin-confirm");
-    let error = craft_cloud_app::Error::Refused { code: "wrong_password".into(), message: "the password is wrong".into() };
+    let error = craft_cloud_app::Error::Refused { code: "wrong_password".into(), message: "the password is wrong".into(), name_taken: None };
     agent.admin_fails.lock().unwrap().push(error);
     confirm_sent(&mut model, &agent);
     snapshot(model, egui::Theme::Light, "admin-confirm-wrong-password");
@@ -689,7 +689,7 @@ fn a_typed_password_is_not_left_in_eguis_undo_history() {
     assert!(matches!(effects.as_slice(), [Effect::AdminDo { .. }]));
     h.run_steps(2);
     assert!(!remembered(&h), "once sent");
-    let refused = craft_cloud_app::Error::Refused { code: "wrong_password".into(), message: "no".into() };
+    let refused = craft_cloud_app::Error::Refused { code: "wrong_password".into(), message: "no".into(), name_taken: None };
     h.state_mut().0.update(Event::Admin(AdminEvent::Done(Err(refused))));
     h.run_steps(3);
     undo(&mut h);
@@ -764,7 +764,7 @@ fn a_typed_code_is_not_left_in_eguis_undo_history() {
     assert!(matches!(effects.as_slice(), [Effect::AdminDo { .. }]));
     h.run_steps(2);
     assert!(!remembered(&h, 0) && !remembered(&h, 1), "once sent");
-    let refused = craft_cloud_app::Error::Refused { code: "two_factor_invalid".into(), message: "no".into() };
+    let refused = craft_cloud_app::Error::Refused { code: "two_factor_invalid".into(), message: "no".into(), name_taken: None };
     h.state_mut().0.update(Event::Admin(AdminEvent::Done(Err(refused))));
     h.run_steps(3);
     for which in [0, 1] {

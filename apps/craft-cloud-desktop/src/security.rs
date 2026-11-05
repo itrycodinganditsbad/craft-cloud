@@ -505,7 +505,7 @@ mod tests {
 
     #[test]
     fn refusals_are_explained_for_people() {
-        let refused = |code: &str| Error::Refused { code: code.into(), message: "m".into() };
+        let refused = |code: &str| Error::Refused { code: code.into(), message: "m".into(), name_taken: None };
         assert!(explain(&refused("wrong_password")).contains("password isn't right"));
         assert!(explain(&refused("two_factor_invalid")).contains("next code"));
         let locked = Error::RefusedWith { code: "two_factor_locked".into(), message: "m".into(), two_factor: None, retry_after_secs: Some(840) };
