@@ -20,6 +20,7 @@ mod schema;
 mod trash;
 mod tree;
 mod two_factor;
+mod usage;
 mod users;
 mod web;
 
@@ -47,6 +48,7 @@ pub use live::{
 };
 pub use trash::{TrashEntry, TrashPage};
 pub use tree::{MAX_PAGE_SAVE_BYTES, SpaceInfo};
+pub use usage::{StorageEstimate, StorageEstimateReason};
 pub use two_factor::{
     CHALLENGE_TTL_MS, Completed, DeviceActor, LOCK_AFTER_FAILURES, LOCK_BASE_MS, LOCK_MAX_MS, MAX_CHALLENGE_ATTEMPTS, MAX_OPEN_CHALLENGES,
     MAX_SETUP_ATTEMPTS, NewChallenge, Proof, RECOVERY_CODES, SETUP_TTL_MS, SignIn, StoredSecrets, TotpVerifier, TwoFactorInfo, UnreadableSecret,
@@ -188,6 +190,10 @@ pub struct Meta {
 }
 
 impl Meta {
+    /// The configured stored-bytes cap for one space, if any.
+    pub fn stored_bytes_cap(&self) -> Option<u64> {
+        self.stored_cap
+    }
     /// Connects and brings the schema up to date. `url` is `sqlite:path/to/meta.db` (created if missing),
     /// `sqlite::memory:`, or `postgres://user:pass@host/db`.
     pub async fn open(url: &str) -> Result<Self, MetaError> {

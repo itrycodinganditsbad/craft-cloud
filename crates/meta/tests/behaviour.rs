@@ -93,6 +93,11 @@ on_every_backend!(
     a_late_save_record_is_appended_once,
     manifests_need_their_chunks_and_are_per_space,
     stored_bytes_are_counted_once_per_space_and_capped,
+    account_usage_estimates_history_and_trash_without_adding_them,
+    account_usage_excludes_chunks_shared_with_current_version,
+    account_usage_deduplicates_per_space_and_counts_pending_purge,
+    account_usage_excludes_live_document_snapshot_blobs,
+    account_usage_leaves_saved_versions_out_of_history,
     concurrent_chunk_batches_charge_a_shared_chunk_once,
     concurrent_signups_with_one_name_give_username_taken,
     an_offline_batch_creates_a_folder_and_files_in_it,
@@ -501,6 +506,184 @@ async fn stored_bytes_are_counted_once_per_space_and_capped(meta: &Meta) {
     let m2 = Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), 6, FileHash::from_bytes([1; 32]), vec![ChunkRef { id: c1, len: 6 }]).unwrap();
     assert!(matches!(capped.add_manifest(ana.space, &m2, 30, NOW).await, Err(MetaError::QuotaExceeded { used: 90, limit: 100 })));
     assert!(!meta.has_manifest(ana.space, &m2.id()).await.unwrap());
+}
+
+async fn account_usage_estimates_history_and_trash_without_adding_them(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let dev = device(meta, &ana).await;
+    let empty = meta.storage_estimate(ana.space).await.unwrap();
+    assert_eq!((empty.stored_bytes, empty.trash_bytes, empty.history_bytes), (0, Some(0), Some(0)));
+    assert_eq!(empty.reason, None);
+    let _asset_manifest = manifest(meta, &ana, 3).await;
+    let assets = meta.storage_estimate(ana.space).await.unwrap();
+    assert_eq!((assets.trash_bytes, assets.history_bytes), (Some(0), Some(0)), "unrooted app assets are not freeable");
+
+    let (old, current) = (manifest(meta, &ana, 4).await, manifest(meta, &ana, 6).await);
+    let node = NodeId::generate();
+    let first = version(old);
+    meta.commit(ana.space, dev, &[Op::Create { node, parent: root(meta, &ana).await, name: name("file.txt"), version: first.clone() }], NOW)
+        .await
+        .unwrap();
+    let live = meta.storage_estimate(ana.space).await.unwrap();
+    assert_eq!((live.trash_bytes, live.history_bytes), (Some(0), Some(0)));
+
+    let latest = version(current);
+    meta.commit(ana.space, dev, &[Op::Update { node, expected: first.id, version: latest.clone() }], NOW).await.unwrap();
+    let historical = meta.storage_estimate(ana.space).await.unwrap();
+    assert_eq!(historical.history_bytes, Some(105), "old chunk's 5 stored bytes plus its 100-byte manifest");
+    assert_eq!(historical.trash_bytes, Some(0));
+    assert_eq!(historical.stored_bytes, meta.stored_bytes(ana.space).await.unwrap());
+
+    meta.commit(ana.space, dev, &[Op::Delete { node, expected: Some(latest.id) }], NOW).await.unwrap();
+    let trashed = meta.storage_estimate(ana.space).await.unwrap();
+    assert_eq!(trashed.trash_bytes, Some(212), "both versions' chunks and manifests belong to trash");
+    assert_eq!(trashed.history_bytes, Some(0), "trashed node history is not history estimate");
+    assert_eq!(trashed.stored_bytes, historical.stored_bytes, "labeled estimates never add to stored bytes");
+}
+
+async fn account_usage_excludes_chunks_shared_with_current_version(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let dev = device(meta, &ana).await;
+    let shared = random_chunk();
+    meta.add_chunk(ana.space, &shared, 6, NOW).await.unwrap();
+    let old =
+        Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), 5, FileHash::from_bytes([4; 32]), vec![ChunkRef { id: shared, len: 5 }]).unwrap();
+    let current =
+        Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), 5, FileHash::from_bytes([5; 32]), vec![ChunkRef { id: shared, len: 5 }]).unwrap();
+    meta.add_manifest(ana.space, &old, 100, NOW).await.unwrap();
+    meta.add_manifest(ana.space, &current, 100, NOW).await.unwrap();
+    let node = NodeId::generate();
+    let first = version(old.id());
+    meta.commit(ana.space, dev, &[Op::Create { node, parent: root(meta, &ana).await, name: name("shared.txt"), version: first.clone() }], NOW)
+        .await
+        .unwrap();
+    meta.commit(ana.space, dev, &[Op::Update { node, expected: first.id, version: version(current.id()) }], NOW).await.unwrap();
+
+    assert_eq!(meta.storage_estimate(ana.space).await.unwrap().history_bytes, Some(100), "the 6-byte chunk also belongs to the current version");
+}
+
+async fn account_usage_deduplicates_per_space_and_counts_pending_purge(meta: &Meta) {
+    let (ana, bob) = (user(meta, "ana").await, user(meta, "bob").await);
+    let (ana_device, bob_device) = (device(meta, &ana).await, device(meta, &bob).await);
+    let shared = random_chunk();
+    meta.add_chunk(ana.space, &shared, 6, NOW).await.unwrap();
+    meta.add_chunk(bob.space, &shared, 999, NOW).await.unwrap();
+
+    let make_manifest = |file_hash| {
+        Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), 5, FileHash::from_bytes(file_hash), vec![ChunkRef { id: shared, len: 5 }]).unwrap()
+    };
+    let (trash_manifest, live_manifest, bob_manifest) = (make_manifest([1; 32]), make_manifest([2; 32]), make_manifest([3; 32]));
+    for (owner, manifest) in [(&ana, &trash_manifest), (&ana, &live_manifest), (&bob, &bob_manifest)] {
+        meta.add_manifest(owner.space, manifest, 100, NOW).await.unwrap();
+    }
+
+    let (ana_trash, ana_live) = (NodeId::generate(), NodeId::generate());
+    let (trash_version, live_version) = (version(trash_manifest.id()), version(live_manifest.id()));
+    meta.commit(
+        ana.space,
+        ana_device,
+        &[
+            Op::Create { node: ana_trash, parent: root(meta, &ana).await, name: name("trash.txt"), version: trash_version.clone() },
+            Op::Create { node: ana_live, parent: root(meta, &ana).await, name: name("live.txt"), version: live_version },
+            Op::Delete { node: ana_trash, expected: Some(trash_version.id) },
+        ],
+        NOW,
+    )
+    .await
+    .unwrap();
+    let estimate = meta.storage_estimate(ana.space).await.unwrap();
+    assert_eq!(estimate.trash_bytes, Some(100), "shared chunk is also named by a live manifest");
+    assert_eq!(estimate.history_bytes, Some(0));
+    meta.request_purge(ana.space, ana_trash, NOW).await.unwrap();
+    assert_eq!(meta.storage_estimate(ana.space).await.unwrap().trash_bytes, Some(100), "pending purge still stores trash blobs");
+
+    let bob_trash = NodeId::generate();
+    let bob_version = version(bob_manifest.id());
+    meta.commit(
+        bob.space,
+        bob_device,
+        &[
+            Op::Create { node: bob_trash, parent: root(meta, &bob).await, name: name("shared.txt"), version: bob_version.clone() },
+            Op::Delete { node: bob_trash, expected: Some(bob_version.id) },
+        ],
+        NOW,
+    )
+    .await
+    .unwrap();
+    assert_eq!(meta.storage_estimate(bob.space).await.unwrap().trash_bytes, Some(106), "shared global chunk counts once in Bob's space");
+}
+
+async fn account_usage_excludes_live_document_snapshot_blobs(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let dev = device(meta, &ana).await;
+    let old = manifest(meta, &ana, 4).await;
+    let current = manifest(meta, &ana, 6).await;
+    let (node, first) = (NodeId::generate(), version(old));
+    meta.commit(ana.space, dev, &[Op::Create { node, parent: root(meta, &ana).await, name: name("document.kitdemo"), version: first.clone() }], NOW)
+        .await
+        .unwrap();
+    let doc = craft_cloud_proto::live::node_doc(ana.space, node);
+    meta.create_live_document(ana.space, doc, "document:wordcraft", node, &old, NOW).await.unwrap();
+    meta.commit(ana.space, dev, &[Op::Update { node, expected: first.id, version: version(current) }], NOW).await.unwrap();
+
+    let estimate = meta.storage_estimate(ana.space).await.unwrap();
+    assert_eq!(estimate.history_bytes, Some(0), "old version's manifest and chunk remain named by the live-document snapshot");
+}
+
+async fn account_usage_leaves_saved_versions_out_of_history(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let dev = device(meta, &ana).await;
+    let shared = random_chunk();
+    meta.add_chunk(ana.space, &shared, 6, NOW).await.unwrap();
+    let make_manifest = |file_hash| {
+        Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), 5, FileHash::from_bytes(file_hash), vec![ChunkRef { id: shared, len: 5 }]).unwrap()
+    };
+    let (saved_old, unsaved_old) = (make_manifest([7; 32]), make_manifest([8; 32]));
+    for m in [&saved_old, &unsaved_old] {
+        meta.add_manifest(ana.space, m, 100, NOW).await.unwrap();
+    }
+    let current = manifest(meta, &ana, 6).await;
+
+    // v1 (saved) and v2 (not saved) name one chunk; v3 is current. The saved version's manifest and the chunk it shares
+    // with unsaved history stay out of the estimate: only v2's own 100-byte manifest is history.
+    let (node, v1) = (NodeId::generate(), version(saved_old.id()));
+    meta.commit(ana.space, dev, &[Op::Create { node, parent: root(meta, &ana).await, name: name("saved.kitdemo"), version: v1.clone() }], NOW)
+        .await
+        .unwrap();
+    let record = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::live::node_doc(ana.space, node), frontiers: vec![(1, 5)] };
+    meta.attach_save(ana.space, node, v1.id, &record).await.unwrap();
+    let v2 = version(unsaved_old.id());
+    meta.commit(ana.space, dev, &[Op::Update { node, expected: v1.id, version: v2.clone() }], NOW).await.unwrap();
+    let v3 = version(current);
+    meta.commit(ana.space, dev, &[Op::Update { node, expected: v2.id, version: v3.clone() }], NOW).await.unwrap();
+    assert_eq!(
+        meta.storage_estimate(ana.space).await.unwrap().history_bytes,
+        Some(100),
+        "the saved version's manifest and the chunk it shares with unsaved history are kept"
+    );
+
+    // A saved version whose chunk nothing else names contributes nothing; an unsaved old version still counts in full.
+    let (exclusive_saved, exclusive_unsaved) = (manifest(meta, &ana, 4).await, manifest(meta, &ana, 4).await);
+    let (other, w1) = (NodeId::generate(), version(exclusive_saved));
+    meta.commit(ana.space, dev, &[Op::Create { node: other, parent: root(meta, &ana).await, name: name("other.kitdemo"), version: w1.clone() }], NOW)
+        .await
+        .unwrap();
+    let other_record = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::live::node_doc(ana.space, other), frontiers: vec![(1, 5)] };
+    meta.attach_save(ana.space, other, w1.id, &other_record).await.unwrap();
+    let w2 = version(exclusive_unsaved);
+    meta.commit(ana.space, dev, &[Op::Update { node: other, expected: w1.id, version: w2.clone() }], NOW).await.unwrap();
+    meta.commit(ana.space, dev, &[Op::Update { node: other, expected: w2.id, version: version(manifest(meta, &ana, 6).await) }], NOW).await.unwrap();
+    assert_eq!(
+        meta.storage_estimate(ana.space).await.unwrap().history_bytes,
+        Some(205),
+        "unsaved 100 + 105 for the second file's unsaved old version"
+    );
+
+    // In the trash a saved version still counts: purging the node removes it with the rest.
+    meta.commit(ana.space, dev, &[Op::Delete { node, expected: Some(v3.id) }], NOW).await.unwrap();
+    let trashed = meta.storage_estimate(ana.space).await.unwrap();
+    assert_eq!(trashed.history_bytes, Some(105));
+    assert_eq!(trashed.trash_bytes, Some(313), "three manifests, the shared 6-byte chunk and the current version's 7-byte chunk");
 }
 
 /// Review finding 3 of M3c: two batches racing with an overlapping chunk charge it once (on Postgres both used to

@@ -36,6 +36,11 @@ full: with less than 4 MiB (one chunk) left, the agent pauses and says the accou
 A cap under 4 MiB is refused when the server starts, since not even one chunk would fit. Per-user quotas on
 file sizes come later, with history.
 
+Signed-in devices can read `GET /api/v1/account/usage` for the space's stored bytes, the configured cap, and labeled
+estimates of bytes referenced only by trash or old versions. The estimates deduplicate shared blobs per space, exclude
+live-document snapshots and unrooted app assets, and are never added to stored bytes. The history estimate treats a
+version an app saved (one with a save record) as kept. An incomplete manifest index makes both estimates `null`.
+
 Live documents have a cap of their own: `live_bytes_per_user` (in bytes; 1 GiB, `1_073_741_824`, by default) is
 the most one account's live documents (recent-file lists and documents of files) may hold together. It counts
 every update in their logs, including the ones a snapshot has replaced: those are kept until retention rules

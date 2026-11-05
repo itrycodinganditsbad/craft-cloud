@@ -80,10 +80,13 @@ fn bearer(request: &Request) -> Option<&str> {
 pub async fn require_device(State(state): State<Arc<AppState>>, mut request: Request, next: Next) -> Result<Response, ApiError> {
     let token = bearer(&request).ok_or_else(ApiError::unauthorized)?;
     let device = state.meta.device_by_token(&token_hash(token)).await?.ok_or_else(ApiError::unauthorized)?;
-    // Off the request's path: the write may wait for the SQLite write lock, and the request needn't wait with it.
-    let touching = state.clone();
-    let (id, now) = (device.device, state.now_ms());
-    tokio::spawn(async move { touching.touch(id, now).await });
+    // Usage reads are fingerprinted as read-only; do not update the device's last-used timestamp for them.
+    if !matches!(request.uri().path(), "/api/v1/account/usage" | "/account/usage") {
+        // Off the request's path: the write may wait for the SQLite write lock, and the request needn't wait with it.
+        let touching = state.clone();
+        let (id, now) = (device.device, state.now_ms());
+        tokio::spawn(async move { touching.touch(id, now).await });
+    }
     let space = device.space;
     let epoch = state.meta.space_info(space).await?.epoch;
     request.extensions_mut().insert(device);
