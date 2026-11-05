@@ -737,6 +737,29 @@ interface as a manifest of their own) are named only by the document's state, wh
 the database holds no reference to them. Until that gap is closed (the owner decides how assets are rooted), anything that
 frees storage has to treat these manifests, and the chunks they name, as in use.
 
+**GC inventory and dry run.** `craft-cloud-server gc --dry-run [--json] --config <path>` lists each store namespace in
+pages of at most 1,000 objects and checks each page against `blobs` in one batched query. It reports recorded objects,
+orphans (store objects without a `blobs` row), and foreign keys (invalid names for that namespace). Listing errors name
+the namespace and page; they are errors, never an empty inventory. Orphans are only candidates after a first-sight grace
+period, which cannot be measured without recording state; a future collector would need two runs apart. Their size comes
+from a metadata-only stored-size read because `Store::list` does not include sizes.
+
+Recorded chunks no complete-indexed manifest names are candidates only when all indexes are complete and database checks
+report no problems. `Meta::index_audit` reads chunk rows, index states and roots under one read snapshot (Postgres uses
+`REPEATABLE READ READ ONLY`); the store listing is a separate time-point diagnostic. These content-addressed objects
+are immutable. A future collector must recheck roots before claiming because a reference can be added after this
+snapshot. Summary equality across separate audits is not a concurrency guarantee: compensating writes can preserve
+counts and examples. Incomplete indexes protect unknown dependencies. Existing reference roots are versions
+(including saved versions and trash history), live snapshots and import snapshots, as queried by `Meta::index_audit` in
+`crates/meta/src/index.rs`; this command adds no root kinds. Manifests with no version or snapshot root are never
+candidates: they are `protected: may be a live document's asset`. Chunk roots that a complete index reports as used stay
+protected. A dry run writes no rows, claims, inventory, generation, run record, store object or config. It prints
+`nothing was changed`. On SQLite the command follows the rule of `verify`: it opens the existing database, may leave an
+empty `-wal` and a `-shm` file (the WAL's rebuilt shared-memory index, not data), and changes neither the database file
+nor the WAL's bytes, which its tests compare, with a crashed process's non-empty WAL too. On PostgreSQL the tests compare a
+fingerprint of every table and the sequences. Both compare the whole store tree. Grace-period measurement, claims and
+deletion belong to a later owner-approved slice.
+
 **Client contract** (what the sync agent relies on):
 
 - Probe `GET /api/info` and refuse to sync when the protocol ranges don't overlap.

@@ -97,6 +97,18 @@ steps, and it can be stopped and run again. Nothing in the server frees storage 
 The change adds two tables to the metadata (migration 0010 in the proposal). An older server refuses the upgraded database,
 so take a backup before upgrading and do not roll back.
 
+`craft-cloud-server gc --dry-run --config cc-data/config.toml` inventories stored chunks and manifests, compares them with
+the database and prints a preview; `--json` prints schema version 1. It changes no data, on SQLite or on PostgreSQL.
+Like `verify`, it opens a SQLite database that exists already and creates nothing; opening a WAL-mode database may leave
+an empty `-wal` file and a `-shm` file behind (SQLite's rebuilt index of the WAL, not data), and the database file and
+the WAL's contents stay as they were, also after a crash that left data in the WAL. Store objects with no `blobs` row are orphan candidates, but need two runs apart to establish a future
+first-sight grace period. Recorded chunks no complete indexed manifest names are candidates only when every manifest index
+is complete and database checks pass. They come from one read-only database snapshot; the store listing is a separate,
+time-point diagnostic. A future collector must recheck roots before claiming a chunk. Current versions, saved versions,
+trash items, live snapshots and import snapshots protect their chunks. Unrooted manifests are protected because they may be live document assets. Without
+`--dry-run`, the command refuses: deleting is not implemented yet. Listing errors fail the command; they do not mean the
+store is empty. Nothing is deleted.
+
 ## Restoring a backup
 
 With the server stopped, restore the database and the chunk storage from the backup, then run
