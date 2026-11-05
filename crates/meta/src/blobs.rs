@@ -115,10 +115,15 @@ async fn charge(tx: &mut sqlx::AnyConnection, space: SpaceId, size: i64, cap: Op
         .await?;
     let total = to_u64(row.try_get("stored_bytes")?)?;
     let quota: Option<i64> = row.try_get("quota_bytes")?;
-    match quota.map(to_u64).transpose()?.or(cap) {
+    match effective_quota(quota.map(to_u64).transpose()?, cap) {
         Some(limit) if total > limit => Err(MetaError::QuotaExceeded { used: total.saturating_sub(to_u64(size)?), limit }),
         _ => Ok(()),
     }
+}
+
+/// The account's quota override, else the server-wide cap.
+pub(crate) fn effective_quota(quota: Option<u64>, cap: Option<u64>) -> Option<u64> {
+    quota.or(cap)
 }
 
 /// The bytes `space` stores.
@@ -177,7 +182,7 @@ impl Meta {
     pub async fn check_room(&self, space: SpaceId, kind: BlobKind, id: &[u8; 32], stored_size: u64) -> Result<(), MetaError> {
         let mut conn = self.pool.acquire().await?;
         let (used, quota) = stored_and_quota(&mut conn, space).await?;
-        let Some(limit) = quota.or(self.stored_cap) else { return Ok(()) };
+        let Some(limit) = effective_quota(quota, self.stored_cap) else { return Ok(()) };
         if space_has(&mut conn, space, kind, id).await? {
             return Ok(());
         }
