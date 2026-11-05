@@ -203,6 +203,9 @@ impl AppState {
     /// The state with the server's public address (`public_url`), which the admin API puts in the join links it makes.
     pub fn with_public_url(mut self, public_url: Option<String>) -> Self {
         self.public_url = public_url;
+        self
+    }
+
     /// The state with another trash period in days (`retention.trash_days`; the default is 30).
     pub fn with_trash_days(mut self, days: u32) -> Self {
         self.trash_days = days;
