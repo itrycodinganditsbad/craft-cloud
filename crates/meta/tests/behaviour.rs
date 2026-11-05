@@ -2286,7 +2286,7 @@ async fn migrating_from_0006_keeps_the_rows(url: &str) {
     assert_eq!(schema_version(url).await, 6);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 11);
+    assert_eq!(schema_version(url).await, 13);
     let old = record(&meta, &ana, live).await;
     assert_eq!(
         (old.name.as_str(), old.revoked, old.client, old.revoked_ms, old.revoke_reason),
@@ -2307,7 +2307,7 @@ async fn migrating_from_0006_keeps_the_rows(url: &str) {
     // A database from a newer Craft Cloud is still refused.
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    sqlx::query("INSERT INTO schema_version (version) VALUES (12)").execute(&mut conn).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (14)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
 }
@@ -3055,7 +3055,7 @@ async fn migrating_from_0009_keeps_the_rows(url: &str) {
     drop(conn);
     assert_eq!(schema_version(url).await, 9, "the audit log's migration stays");
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 11);
+    assert_eq!(schema_version(url).await, 13);
     assert_eq!(all_events(&meta).await.len(), audit_rows, "the audit rows are kept");
     assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().id, ana.id);
     assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 1).await.unwrap(), Some(false));
@@ -3855,7 +3855,7 @@ async fn migrating_from_0007_keeps_the_rows(url: &str) {
     assert_eq!(schema_version(url).await, 7);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 11);
+    assert_eq!(schema_version(url).await, 13);
     assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.user), Some(ana.id));
     let row = admin_view(&meta, ana.id).await;
     assert_eq!((row.disabled_ms, row.quota_bytes, row.stored_bytes, row.devices_active, row.invite_pending), (None, None, 42, 1, true));
@@ -3867,7 +3867,7 @@ async fn migrating_from_0007_keeps_the_rows(url: &str) {
 
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    sqlx::query("INSERT INTO schema_version (version) VALUES (12)").execute(&mut conn).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (14)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
 }
@@ -4654,7 +4654,7 @@ async fn migrating_from_0008_adds_the_audit_log(url: &str) {
     assert_eq!(schema_version(url).await, 8);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 11, "the audit log's migration is 9, two-factor sign-in's 10, web sessions' 11: all run");
+    assert_eq!(schema_version(url).await, 13, "the audit log's migration is 9, two-factor sign-in's 10, web sessions' 11, history index 12 and trash 13: all run");
     assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.user), Some(ana.id));
     assert!(all_events(&meta).await.is_empty(), "a new log is empty");
     meta.sign_in_device(ana.id, (&ana.password_hash, ana.auth_gen), "pc", &DeviceClient::default(), &token(), NOW).await.unwrap().unwrap();
@@ -4663,7 +4663,7 @@ async fn migrating_from_0008_adds_the_audit_log(url: &str) {
 
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    sqlx::query("INSERT INTO schema_version (version) VALUES (12)").execute(&mut conn).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (14)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
 }
@@ -6245,7 +6245,7 @@ async fn migrating_from_0010_adds_the_web_sessions(url: &str) {
     assert_eq!(schema_version(url).await, 10);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 11, "web sessions are migration 11");
+    assert_eq!(schema_version(url).await, 13, "the current schema includes history and trash after web sessions");
     assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.user), Some(root.id));
     assert_eq!(all_events(&meta).await.len(), events, "the audit rows are kept");
     let session = new_session();
@@ -6257,14 +6257,14 @@ async fn migrating_from_0010_adds_the_web_sessions(url: &str) {
     back_to_0010(url).await;
     assert_eq!(schema_version(url).await, 10);
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 11);
+    assert_eq!(schema_version(url).await, 13);
     assert!(!session_is_valid(&meta, &session, NOW + 6).await, "the table is new and empty");
     drop(meta);
 
     // A database from a newer Craft Cloud is still refused.
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    sqlx::query("INSERT INTO schema_version (version) VALUES (12)").execute(&mut conn).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (14)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
 }

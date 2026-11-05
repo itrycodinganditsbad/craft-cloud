@@ -17,8 +17,8 @@ const SQLITE: &[&str] = &[
     include_str!("../migrations/sqlite/0009_audit_events.sql"),
     include_str!("../migrations/sqlite/0010_two_factor.sql"),
     include_str!("../migrations/sqlite/0011_web_sessions.sql"),
-    include_str!("../migrations/sqlite/0008_versions_node_seq.sql"),
-    include_str!("../migrations/sqlite/0009_trash.sql"),
+    include_str!("../migrations/sqlite/0012_versions_node_seq.sql"),
+    include_str!("../migrations/sqlite/0013_trash.sql"),
 ];
 const POSTGRES: &[&str] = &[
     include_str!("../migrations/postgres/0001_init.sql"),
@@ -32,8 +32,8 @@ const POSTGRES: &[&str] = &[
     include_str!("../migrations/postgres/0009_audit_events.sql"),
     include_str!("../migrations/postgres/0010_two_factor.sql"),
     include_str!("../migrations/postgres/0011_web_sessions.sql"),
-    include_str!("../migrations/postgres/0008_versions_node_seq.sql"),
-    include_str!("../migrations/postgres/0009_trash.sql"),
+    include_str!("../migrations/postgres/0012_versions_node_seq.sql"),
+    include_str!("../migrations/postgres/0013_trash.sql"),
 ];
 
 /// Arbitrary fixed key for the Postgres advisory lock that serialises migrations between servers sharing one

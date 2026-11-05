@@ -891,19 +891,6 @@ pub(crate) mod fake {
         }
     }
 
-    /// An enabled member account that stores nothing.
-    pub fn sample_user(username: &str, id: Uuid) -> AdminUserInfo {
-        AdminUserInfo {
-            id,
-            username: username.to_owned(),
-            role: "member".into(),
-            created_ms: 1_780_000_000_000,
-            disabled_ms: None,
-            two_factor_enabled: false,
-            devices_active: 1,
-            stored_bytes: 0,
-            quota_bytes: None,
-            invite_pending: false,
         fn file_history(&self, _path: &str, _cursor: Option<&str>) -> Result<HistoryResponse, Error> {
             self.answer("file_history", |_| HistoryResponse { versions: Vec::new(), next: None })
         }
@@ -918,6 +905,22 @@ pub(crate) mod fake {
         }
         fn remove_from_trash(&self, _id: NodeId) -> Result<(), Error> {
             self.answer("remove_from_trash", |_| ())
+        }
+    }
+
+    /// An enabled member account that stores nothing.
+    pub fn sample_user(username: &str, id: Uuid) -> AdminUserInfo {
+        AdminUserInfo {
+            id,
+            username: username.to_owned(),
+            role: "member".into(),
+            created_ms: 1_780_000_000_000,
+            disabled_ms: None,
+            two_factor_enabled: false,
+            devices_active: 1,
+            stored_bytes: 0,
+            quota_bytes: None,
+            invite_pending: false,
         }
     }
 }
