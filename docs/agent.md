@@ -62,6 +62,10 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
 - Through the running agent: `pause` and `resume` syncing (a pause holds across restarts; recents keep working),
   `quit` the agent, and `devices` to list the account's machines (`devices remove <id>` takes one out; to take this
   machine out, use `logout`).
+- The desktop reads storage through the authenticated local API, `GET /v1/usage`. It asks the server for every
+  request and returns `AccountUsage` unchanged. Signed out, it returns `409 not_signed_in`; when the server cannot be
+  reached, it returns `503 offline`. The desktop shows trash and old-version values as overlapping estimates and
+  never adds them to stored bytes.
 - Recent files, per app, shared by every machine of the account (through the running agent, as an app
   sees them):
 
