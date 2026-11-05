@@ -49,6 +49,17 @@ impl Backend for CountingBackend {
         self.inner.get_raw(path).await
     }
 
+    async fn get_raw_limited(&self, path: &str, max_bytes: usize) -> Result<Option<bytes::Bytes>, StoreError> {
+        if path.starts_with("chunks/") {
+            self.chunk_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.get_raw_limited(path, max_bytes).await
+    }
+
+    async fn size_raw(&self, path: &str) -> Result<Option<u64>, StoreError> {
+        self.inner.size_raw(path).await
+    }
+
     async fn delete_raw(&self, path: &str) -> Result<(), StoreError> {
         self.inner.delete_raw(path).await
     }

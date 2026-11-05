@@ -5,7 +5,7 @@
 //! their parents as well, so a crash can't lose the entry that points at a new shard directory.
 //! A crash leaves the old object or the new one.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -105,9 +105,28 @@ impl Backend for DiskBackend {
     }
 
     async fn get_raw(&self, path: &str) -> Result<Option<Bytes>, StoreError> {
+        self.get_raw_limited(path, usize::MAX).await
+    }
+
+    async fn get_raw_limited(&self, path: &str, max_bytes: usize) -> Result<Option<Bytes>, StoreError> {
         let target = self.full_path(path);
-        blocking(move || match std::fs::read(&target) {
-            Ok(bytes) => Ok(Some(Bytes::from(bytes))),
+        blocking(move || match std::fs::File::open(&target) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take(u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX)).read_to_end(&mut bytes)?;
+                Ok(Some(Bytes::from(bytes)))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        })
+        .await
+    }
+
+    async fn size_raw(&self, path: &str) -> Result<Option<u64>, StoreError> {
+        let target = self.full_path(path);
+        blocking(move || match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_file() => Ok(Some(meta.len())),
+            Ok(_) => Ok(None),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         })

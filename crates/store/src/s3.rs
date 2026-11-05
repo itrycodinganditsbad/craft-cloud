@@ -99,8 +99,30 @@ impl Backend for S3Backend {
     }
 
     async fn get_raw(&self, path: &str) -> Result<Option<Bytes>, StoreError> {
+        self.get_raw_limited(path, usize::MAX).await
+    }
+
+    async fn get_raw_limited(&self, path: &str, max_bytes: usize) -> Result<Option<Bytes>, StoreError> {
         match self.store.get(&self.object_path(path)).await {
-            Ok(result) => Ok(Some(result.bytes().await.map_err(backend_error)?)),
+            Ok(result) => {
+                let limit = max_bytes.saturating_add(1);
+                let mut body = result.into_stream();
+                let mut bytes = Vec::with_capacity(limit.min(1024 * 1024));
+                while bytes.len() < limit {
+                    let Some(part) = body.try_next().await.map_err(backend_error)? else { break };
+                    let take = part.len().min(limit.saturating_sub(bytes.len()));
+                    bytes.extend_from_slice(&part[..take]);
+                }
+                Ok(Some(Bytes::from(bytes)))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(backend_error(e)),
+        }
+    }
+
+    async fn size_raw(&self, path: &str) -> Result<Option<u64>, StoreError> {
+        match self.store.head(&self.object_path(path)).await {
+            Ok(meta) => Ok(Some(meta.size)),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(backend_error(e)),
         }

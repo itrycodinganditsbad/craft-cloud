@@ -102,6 +102,14 @@ pub trait Backend: Send + Sync + 'static {
     async fn put_raw(&self, path: &str, data: Bytes) -> Result<(), StoreError>;
     /// `None` when there is no such object.
     async fn get_raw(&self, path: &str) -> Result<Option<Bytes>, StoreError>;
+    /// Reads at most `max_bytes` plus one byte. Backends should override this for bounded I/O.
+    async fn get_raw_limited(&self, path: &str, max_bytes: usize) -> Result<Option<Bytes>, StoreError> {
+        Ok(self.get_raw(path).await?.map(|bytes| bytes.slice(..bytes.len().min(max_bytes.saturating_add(1)))))
+    }
+    /// Stored object size without reading object contents.
+    async fn size_raw(&self, _path: &str) -> Result<Option<u64>, StoreError> {
+        Err(StoreError::Backend("backend does not support metadata-only object sizes".into()))
+    }
     /// Removing a missing object succeeds.
     async fn delete_raw(&self, path: &str) -> Result<(), StoreError>;
     /// Lists paths below `prefix`, in ascending order, strictly after `after`.
@@ -220,7 +228,8 @@ impl Store {
     /// Like [`Store::get`], and also says how many bytes the object is stored as (the format byte included), which is
     /// what the metadata records as the blob's stored size.
     pub async fn get_sized(&self, key: BlobKey) -> Result<(Bytes, u64), StoreError> {
-        let object = self.backend.get_raw(&key.path()).await?.ok_or(StoreError::NotFound(key))?;
+        let max_raw = max_len(key.kind).saturating_add(1);
+        let object = self.backend.get_raw_limited(&key.path(), max_raw).await?.ok_or(StoreError::NotFound(key))?;
         let Some((&format, _)) = object.split_first() else {
             return Err(StoreError::Corrupt { key, reason: "empty object" });
         };
@@ -236,6 +245,11 @@ impl Store {
             return Err(StoreError::Corrupt { key, reason: "hash mismatch" });
         }
         Ok((data, stored))
+    }
+
+    /// Returns stored object size without materializing the object.
+    pub async fn stored_size(&self, key: BlobKey) -> Result<u64, StoreError> {
+        self.backend.size_raw(&key.path()).await?.ok_or(StoreError::NotFound(key))
     }
 
     pub async fn delete(&self, key: BlobKey) -> Result<(), StoreError> {
@@ -313,5 +327,17 @@ mod tests {
         let key = BlobKey { kind: BlobKind::Chunk, id };
         assert_eq!(key.path(), format!("chunks/ab/cd/abcd{}", "00".repeat(30)));
         assert!(BlobKey { kind: BlobKind::Manifest, id }.path().starts_with("manifests/ab/cd/"));
+    }
+
+    #[tokio::test]
+    async fn disk_read_rejects_huge_object_without_reading_it_all() {
+        let root = tempfile::tempdir().unwrap();
+        let key = BlobKey { kind: BlobKind::Chunk, id: [7; 32] };
+        let path = root.path().join(key.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(u64::from(MAX_CHUNK_BYTES) + 1_000_000_000).unwrap();
+        let store = Store::new(disk::DiskBackend::new(root.path()).unwrap());
+        assert!(matches!(store.get_sized(key).await, Err(StoreError::Corrupt { reason: "larger than the limit", .. })));
     }
 }

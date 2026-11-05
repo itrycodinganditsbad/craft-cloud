@@ -41,6 +41,14 @@ impl Backend for MemoryBackend {
         Ok(self.lock()?.get(path).cloned())
     }
 
+    async fn get_raw_limited(&self, path: &str, max_bytes: usize) -> Result<Option<Bytes>, StoreError> {
+        Ok(self.lock()?.get(path).map(|bytes| bytes.slice(..bytes.len().min(max_bytes.saturating_add(1)))))
+    }
+
+    async fn size_raw(&self, path: &str) -> Result<Option<u64>, StoreError> {
+        Ok(self.lock()?.get(path).map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX)))
+    }
+
     async fn delete_raw(&self, path: &str) -> Result<(), StoreError> {
         self.lock()?.remove(path);
         Ok(())
