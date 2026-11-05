@@ -180,7 +180,7 @@ fn snapshot_join() {
     snapshot(model.clone(), egui::Theme::Light, "join-folder-has-files");
     model.update(Event::SyncExistingFiles(false));
     sent(&mut model, "cloud.shadows.ch/K7M4-Q9TX");
-    model.update(Event::Joined(Err(craft_cloud_app::Error::Refused { code: "invalid_code".into(), message: "x".into(), name_taken: None, name_taken: None })));
+    model.update(Event::Joined(Err(craft_cloud_app::Error::Refused { code: "invalid_code".into(), message: "x".into(), name_taken: None })));
     snapshot(model, egui::Theme::Dark, "join-invalid-code-dark");
 }
 
@@ -188,7 +188,7 @@ fn snapshot_join() {
 fn snapshot_password_needed() {
     let mut model = after(&FakeAgent::new(signed_out()), Vec::new());
     sent(&mut model, "cloud.shadows.ch/K7M4-Q9TX-K7M4-Q9TX");
-    model.update(Event::Joined(Err(craft_cloud_app::Error::Refused { code: "password_required".into(), message: "x".into(), name_taken: None, name_taken: None })));
+    model.update(Event::Joined(Err(craft_cloud_app::Error::Refused { code: "password_required".into(), message: "x".into(), name_taken: None })));
     if let Screen::PasswordNeeded(pw) = &mut model.screen {
         pw.password = "correct horse".into();
         pw.again = "correct house".into();
@@ -318,7 +318,7 @@ fn snapshot_trash() {
         };
         model.update(Event::TrashRestored {
             ticket,
-            result: Err(craft_cloud_app::Error::Refused { code: "conflict".into(), message: "name taken".into(), name_taken: Some(true), name_taken: None }),
+            result: Err(craft_cloud_app::Error::Refused { code: "conflict".into(), message: "name taken".into(), name_taken: Some(true) }),
         });
         snapshot(model.clone(), egui::Theme::Light, "trash-name-taken");
         let restored = craft_cloud_app::TrashRestoreResponse {
