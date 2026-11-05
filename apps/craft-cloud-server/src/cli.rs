@@ -91,6 +91,15 @@ pub enum Command {
         #[arg(long)]
         skip_chunk_reads: bool,
     },
+    /// Inventory the store and report possible collection candidates without changing anything.
+    Gc {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// The reference index of what each manifest names.
     Index {
         /// Path to config.toml. May come before or after the action.
@@ -164,6 +173,8 @@ pub enum CliError {
     Meta(#[from] craft_cloud_meta::MetaError),
     #[error(transparent)]
     Store(#[from] craft_cloud_store::StoreError),
+    #[error(transparent)]
+    Gc(#[from] crate::gc::GcError),
     #[error("{0}")]
     Usage(String),
     /// A check found something wrong (its report was written first).
@@ -307,6 +318,18 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                 0 => Ok(()),
                 n => Err(CliError::Inconsistent(format!("verify found {n} problem(s)"))),
             }
+        }
+        Command::Gc { dry_run: false, .. } => Err(CliError::Usage("deleting is not implemented yet; run with --dry-run".into())),
+        Command::Gc { config, dry_run: true, json } => {
+            let config = Config::load(&config_path(config)?)?;
+            let (meta, store) = open_existing(&config).await?;
+            let report = crate::gc::dry_run(&meta, &store).await?;
+            if json {
+                writeln!(out, "{}", report.to_json())?;
+            } else {
+                write!(out, "{}", report.to_text())?;
+            }
+            if report.has_problems() { Err(CliError::Inconsistent("gc dry-run found problems".into())) } else { Ok(()) }
         }
         Command::Index { config, action: IndexAction::Build { batch_rows } } => {
             let (meta, store) = open(&Config::load(&config_path(config)?)?).await?;

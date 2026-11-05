@@ -1,19 +1,624 @@
 //! The admin command line, called in-process, and the real binary started with `init` + `serve`.
 
+use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use craft_cloud_proto::join::{Code, INVITE_CHARS, JoinString};
+use craft_cloud_proto::{ChunkId, ChunkRef, ChunkerParamsId, FileHash, Manifest, Name, NewVersion, NodeId, Op, VersionId};
 use craft_cloud_server::cli::{Cli, CliError, run};
 use craft_cloud_server::config::{Config, ConfigError};
+use craft_cloud_store::{BlobKey, Store};
 
 async fn cli(args: &[&str], stdin: &str) -> Result<String, CliError> {
+    let (result, output) = cli_capture(args, stdin).await;
+    result?;
+    Ok(output)
+}
+
+async fn cli_capture(args: &[&str], stdin: &str) -> (Result<(), CliError>, String) {
     let parsed = Cli::try_parse_from(std::iter::once("craft-cloud-server").chain(args.iter().copied())).unwrap();
     let mut out = Vec::new();
-    run(parsed.command, &mut Cursor::new(stdin.as_bytes().to_vec()), &mut out).await?;
-    Ok(String::from_utf8(out).unwrap())
+    let result = run(parsed.command, &mut Cursor::new(stdin.as_bytes().to_vec()), &mut out).await;
+    (result, String::from_utf8(out).unwrap())
+}
+
+fn tree_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, out);
+            } else {
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                out.insert(relative, std::fs::read(path).unwrap());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    visit(root, root, &mut out);
+    out
+}
+
+fn config_with_database_url(text: &mut String, url: &str) {
+    let section = text.find("[database]").unwrap();
+    let url_start = section + text[section..].find("url = ").unwrap();
+    let url_end = url_start + text[url_start..].find('\n').unwrap_or(text.len() - url_start);
+    text.replace_range(url_start..url_end, &format!("url = \"{url}\""));
+}
+
+async fn checkpoint_sqlite(url: &str) {
+    let mut db = <sqlx::SqliteConnection as sqlx::Connection>::connect(url).await.unwrap();
+    sqlx::Executor::execute(&mut db, "PRAGMA wal_checkpoint(TRUNCATE)").await.unwrap();
+    sqlx::Connection::close(db).await.unwrap();
+}
+
+async fn add_gc_manifest(meta: &craft_cloud_meta::Meta, store: &Store, space: craft_cloud_proto::SpaceId, data: &[u8], hash_byte: u8) -> Manifest {
+    let id = ChunkId::from_bytes(*blake3::hash(data).as_bytes());
+    store.put(BlobKey::chunk(&id), data).await.unwrap();
+    meta.add_chunk(space, &id, u64::try_from(data.len()).unwrap() + 1, 0).await.unwrap();
+    let manifest = Manifest::new(
+        ChunkerParamsId::new("fastcdc-v1").unwrap(),
+        u64::try_from(data.len()).unwrap(),
+        FileHash::from_bytes([hash_byte; 32]),
+        vec![ChunkRef { id, len: u32::try_from(data.len()).unwrap() }],
+    )
+    .unwrap();
+    store.put(BlobKey::manifest(&manifest.id()), &manifest.encode()).await.unwrap();
+    meta.add_manifest(space, &manifest, u64::try_from(manifest.encode().len()).unwrap() + 1, 0).await.unwrap();
+    manifest
+}
+
+#[test]
+fn gc_test_leave_wal_uncheckpointed() {
+    let Ok(url) = std::env::var("CRAFT_CLOUD_TEST_WAL_URL") else { return };
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let meta = craft_cloud_meta::Meta::open(&url).await.unwrap();
+        let ana = meta.user_by_name("ana").await.unwrap().unwrap();
+        meta.reset_epoch(ana.space).await.unwrap();
+        std::process::exit(0);
+    });
+}
+
+/// Runs the real `craft-cloud-server` binary with the arguments and waits for it to exit, so that every connection it
+/// opened is closed, and every write a close or a checkpoint makes is on disk, when this returns: whether it exited with
+/// success, its standard output and its standard error.
+fn run_binary(args: &[&str]) -> (bool, String, String) {
+    let output = Process::new(env!("CARGO_BIN_EXE_craft-cloud-server")).args(args).stdin(Stdio::null()).output().unwrap();
+    (output.status.success(), String::from_utf8(output.stdout).unwrap(), String::from_utf8(output.stderr).unwrap())
+}
+
+/// What a database holds, in a form two reads can be compared by. On SQLite the bytes of the database file and of its WAL
+/// ([`sqlite_snapshot`]); on Postgres a fingerprint of every table of the schema and the value of every sequence.
+#[derive(PartialEq)]
+enum DbState {
+    Sqlite { db: Vec<u8>, wal: Vec<u8> },
+    Postgres { tables: BTreeMap<String, (i64, String)>, sequences: BTreeMap<String, Option<i64>> },
+}
+
+impl DbState {
+    /// What differs, short enough to read in a failure message (the bytes of a database are not).
+    fn difference(&self, other: &DbState) -> String {
+        match (self, other) {
+            (DbState::Sqlite { db: db1, wal: wal1 }, DbState::Sqlite { db: db2, wal: wal2 }) => {
+                let first = |a: &[u8], b: &[u8]| a.iter().zip(b).position(|(x, y)| x != y);
+                format!(
+                    "database file {} -> {} bytes (first difference at {:?}), WAL {} -> {} bytes (first difference at {:?})",
+                    db1.len(),
+                    db2.len(),
+                    first(db1, db2),
+                    wal1.len(),
+                    wal2.len(),
+                    first(wal1, wal2)
+                )
+            }
+            (DbState::Postgres { tables: t1, sequences: s1 }, DbState::Postgres { tables: t2, sequences: s2 }) => {
+                let changed: Vec<_> = t1
+                    .keys()
+                    .chain(t2.keys())
+                    .filter(|name| t1.get(*name) != t2.get(*name))
+                    .map(|name| format!("{name}: {:?} -> {:?}", t1.get(name), t2.get(name)))
+                    .collect();
+                format!("tables changed: {changed:?}; sequences equal: {}", s1 == s2)
+            }
+            _ => "different kinds of database".to_owned(),
+        }
+    }
+}
+
+/// The names of the files that differ between two snapshots of a directory tree, short enough to read.
+fn tree_difference(before: &BTreeMap<PathBuf, Vec<u8>>, after: &BTreeMap<PathBuf, Vec<u8>>) -> String {
+    let added: Vec<_> = after.keys().filter(|path| !before.contains_key(*path)).collect();
+    let removed: Vec<_> = before.keys().filter(|path| !after.contains_key(*path)).collect();
+    let changed: Vec<_> = before.iter().filter(|(path, bytes)| after.get(*path).is_some_and(|other| other != *bytes)).map(|(path, _)| path).collect();
+    format!("added {added:?}, removed {removed:?}, changed {changed:?}")
+}
+
+/// A server for the GC tests on SQLite (`postgres_url` is `None`) or on the Postgres database at the given URL, with the
+/// admin of `init`, a user `ana`, and the handles a test seeds it through.
+struct GcServer {
+    _parent: tempfile::TempDir,
+    dir: PathBuf,
+    config: String,
+    database_url: String,
+    postgres: bool,
+    storage: PathBuf,
+    meta: craft_cloud_meta::Meta,
+    store: Store,
+    user: craft_cloud_meta::UserRecord,
+}
+
+impl GcServer {
+    async fn new(postgres_url: Option<&str>) -> GcServer {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("data");
+        cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "seed"], "admin password 1\n").await.unwrap();
+        let config_path = dir.join("config.toml");
+        if let Some(url) = postgres_url {
+            let mut text = std::fs::read_to_string(&config_path).unwrap();
+            config_with_database_url(&mut text, url);
+            std::fs::write(&config_path, text).unwrap();
+        }
+        let config = Config::load(&config_path).unwrap();
+        let (meta, store) = craft_cloud_server::cli::open(&config).await.unwrap();
+        let user = meta.create_user("ana", "test-hash", craft_cloud_meta::Role::Admin, 0).await.unwrap();
+        let craft_cloud_server::config::StorageConfig::Disk { path: storage } = &config.storage else { panic!("init uses disk storage") };
+        GcServer {
+            dir,
+            config: config_path.to_str().unwrap().to_owned(),
+            database_url: config.database.url.clone(),
+            postgres: postgres_url.is_some(),
+            storage: storage.clone(),
+            meta,
+            store,
+            user,
+            _parent: parent,
+        }
+    }
+
+    async fn db_state(&self) -> DbState {
+        if !self.postgres {
+            let (db, wal) = sqlite_snapshot(&self.dir.join("meta.db"));
+            return DbState::Sqlite { db, wal };
+        }
+        let pool = sqlx::PgPool::connect(&self.database_url).await.unwrap();
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT table_name::text FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(!names.is_empty(), "the fingerprint must see the schema's tables");
+        let mut tables = BTreeMap::new();
+        for name in names {
+            let sql = format!(
+                "SELECT COUNT(*)::bigint, COALESCE(md5(string_agg(t::text, E'\\n' ORDER BY t::text)), '') FROM \"{}\" t",
+                name.replace('"', "\"\"")
+            );
+            let fingerprint: (i64, String) = sqlx::query_as(sqlx::AssertSqlSafe(sql)).fetch_one(&pool).await.unwrap();
+            tables.insert(name, fingerprint);
+        }
+        let sequences: Vec<(String, Option<i64>)> =
+            sqlx::query_as("SELECT sequencename::text, last_value FROM pg_sequences WHERE schemaname = current_schema() ORDER BY 1")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        pool.close().await;
+        DbState::Postgres { tables, sequences: sequences.into_iter().collect() }
+    }
+
+    /// Runs the command as a process of its own (see [`run_binary`]) with the database and the whole store directory
+    /// tree (names and bytes) read before it starts and after it has exited, and fails the test if either differs.
+    async fn run_unchanged(&self, args: &[&str]) -> (bool, String, String) {
+        let db_before = self.db_state().await;
+        let tree_before = tree_snapshot(&self.storage);
+        let result = run_binary(args);
+        let db_after = self.db_state().await;
+        let tree_after = tree_snapshot(&self.storage);
+        assert!(db_before == db_after, "the command changed the database: {}", db_before.difference(&db_after));
+        assert!(tree_before == tree_after, "the command changed the store: {}", tree_difference(&tree_before, &tree_after));
+        result
+    }
+
+    /// `gc --dry-run --json`, which must not change anything: its report, and whether it found no problem.
+    async fn gc_json(&self) -> (serde_json::Value, bool) {
+        let (ok, out, err) = self.run_unchanged(&["gc", "--dry-run", "--json", "--config", &self.config]).await;
+        assert!(ok || err.contains("gc dry-run found problems"), "{err}");
+        (serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}: {err}")), ok)
+    }
+
+    async fn exec(&self, sql: &'static str) {
+        if self.postgres {
+            let pool = sqlx::PgPool::connect(&self.database_url).await.unwrap();
+            sqlx::query(sql).execute(&pool).await.unwrap();
+            pool.close().await;
+        } else {
+            let mut conn = raw_sqlite(&self.database_url).await;
+            sqlx::query(sql).execute(&mut conn).await.unwrap();
+            sqlx::Connection::close(conn).await.unwrap();
+        }
+    }
+
+    async fn count(&self, sql: &'static str) -> i64 {
+        if self.postgres {
+            let pool = sqlx::PgPool::connect(&self.database_url).await.unwrap();
+            let n = sqlx::query_scalar(sql).fetch_one(&pool).await.unwrap();
+            pool.close().await;
+            n
+        } else {
+            let mut conn = raw_sqlite(&self.database_url).await;
+            let n = sqlx::query_scalar(sql).fetch_one(&mut conn).await.unwrap();
+            sqlx::Connection::close(conn).await.unwrap();
+            n
+        }
+    }
+}
+
+/// The GC dry run on every scenario the design lists, on the server it is given. Every run goes through
+/// [`GcServer::run_unchanged`], so each of them proves that it changed neither the database nor the store.
+async fn gc_scenario(s: &GcServer) {
+    let c = s.config.as_str();
+    let user = &s.user;
+
+    // An empty store: nothing recorded, nothing stored.
+    let (empty, ok) = s.gc_json().await;
+    assert!(ok, "{empty}");
+    assert_eq!(empty["schema_version"], 1);
+    assert_eq!(empty["store"]["chunk_orphans"]["count"], 0);
+    assert_eq!(empty["store"]["manifest_orphans"]["count"], 0);
+    assert_eq!(empty["store"]["foreign"]["count"], 0);
+    assert_eq!(empty["candidates"]["chunks"]["count"], 0);
+    assert_eq!(empty["nothing_was_changed"], true);
+
+    // Without --dry-run: refused, and nothing changed.
+    let (ok, out, err) = s.run_unchanged(&["gc", "--config", c]).await;
+    assert!(!ok && err.contains("deleting is not implemented yet; run with --dry-run"), "{err}");
+    assert_eq!(out, "");
+
+    // A clean store: a version's manifest and chunk, recorded, stored and named; the roots protect them.
+    let current_manifest = add_gc_manifest(&s.meta, &s.store, user.space, &[44; 12], 4).await;
+    let device = s.meta.create_device(user.id, "gc-test", &[46; 32], 0).await.unwrap();
+    let space = s.meta.space_info(user.space).await.unwrap();
+    let node = NodeId::generate();
+    let version = NewVersion {
+        id: VersionId::generate(),
+        manifest: current_manifest.id(),
+        mtime_ms: 1,
+        exec: false,
+        save: Some(craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::live::node_doc(user.space, node), frontiers: vec![] }),
+    };
+    s.meta.commit(user.space, device, &[Op::Create { node, parent: space.root, name: Name::new("root.bin").unwrap(), version }], 0).await.unwrap();
+    let (clean, ok) = s.gc_json().await;
+    assert!(ok, "{clean}");
+    assert_eq!(clean["database"]["problems"], 0);
+    assert_eq!(clean["store"]["chunk_orphans"]["count"], 0);
+    assert_eq!(clean["store"]["foreign"]["count"], 0);
+    assert_eq!(clean["candidates"]["chunks"]["count"], 0, "the current version's chunk is protected");
+    // The recorded inventory: what the database records for what the store holds (one chunk of 12 bytes and one manifest,
+    // each stored with its format byte).
+    assert_eq!(clean["store"]["chunk_recorded"]["count"], 1);
+    assert_eq!(clean["store"]["chunk_recorded"]["stored_bytes"], 13);
+    assert_eq!(clean["store"]["manifest_recorded"]["count"], 1);
+    assert_eq!(clean["store"]["manifest_recorded"]["stored_bytes"], u64::try_from(current_manifest.encode().len()).unwrap() + 1);
+    assert_eq!(clean["store"]["chunk_recorded"]["bytes_source"], "database blobs.stored_size");
+    let (_, text, _) = s.run_unchanged(&["gc", "--dry-run", "--config", c]).await;
+    assert!(text.contains("store chunks: 1 recorded, 13 stored bytes (as the database records them)"), "{text}");
+
+    // An orphan (stored, no `blobs` row, as a refused upload leaves it) and a foreign object (not a valid key).
+    let orphan_data = [41u8];
+    let orphan = ChunkId::from_bytes(*blake3::hash(&orphan_data).as_bytes());
+    s.store.put(BlobKey::chunk(&orphan), &orphan_data).await.unwrap();
+    let foreign_path = s.storage.join("chunks/ff/ff/not-a-hash");
+    std::fs::create_dir_all(foreign_path.parent().unwrap()).unwrap();
+    std::fs::write(foreign_path, b"foreign").unwrap();
+    let (ok, out, err) = s.run_unchanged(&["gc", "--dry-run", "--config", c]).await;
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("store chunks: 1 orphan(s), 2 stored bytes"), "{out}");
+    assert!(out.contains("foreign objects: 1"), "{out}");
+    assert!(out.ends_with("nothing was changed\n"), "{out}");
+    let (report, _) = s.gc_json().await;
+    assert_eq!(report["store"]["chunk_orphans"]["examples"][0], orphan.to_string());
+    assert_eq!(report["candidates"]["orphans"]["count"], 0, "an orphan is only a potential candidate");
+    assert_eq!(report["candidates"]["orphans"]["potential_count"], 1);
+
+    // A complete index and a chunk no manifest names: the one candidate. Every kind of root protects its chunks: the
+    // import snapshot, the live snapshot, a trashed file's version; and a manifest that nothing roots is protected, never
+    // a candidate, and its chunk is named by the complete index.
+    let candidate_data = [43u8];
+    let candidate = ChunkId::from_bytes(*blake3::hash(&candidate_data).as_bytes());
+    s.store.put(BlobKey::chunk(&candidate), &candidate_data).await.unwrap();
+    s.meta.add_chunk(user.space, &candidate, 2, 1).await.unwrap();
+    let import_manifest = add_gc_manifest(&s.meta, &s.store, user.space, &[45; 12], 5).await;
+    let doc = craft_cloud_proto::DocId::generate();
+    s.meta.create_live_document(user.space, doc, "document:wordcraft", node, &import_manifest.id(), 0).await.unwrap();
+    s.meta.append_live_update(user.space, doc, device, 1, b"live state", 1).await.unwrap();
+    let live_snapshot = add_gc_manifest(&s.meta, &s.store, user.space, &[50; 12], 6).await;
+    assert!(s.meta.compact_live_doc(user.space, doc, 1, &live_snapshot.id()).await.unwrap());
+    let unrooted_manifest = add_gc_manifest(&s.meta, &s.store, user.space, &[51; 12], 7).await;
+    let trash_manifest = add_gc_manifest(&s.meta, &s.store, user.space, &[52; 12], 8).await;
+    let trash_node = NodeId::generate();
+    let trash_version = VersionId::generate();
+    let trash_new_version = NewVersion { id: trash_version, manifest: trash_manifest.id(), mtime_ms: 2, exec: false, save: None };
+    s.meta
+        .commit(
+            user.space,
+            device,
+            &[Op::Create { node: trash_node, parent: space.root, name: Name::new("trash.bin").unwrap(), version: trash_new_version }],
+            2,
+        )
+        .await
+        .unwrap();
+    s.meta.commit(user.space, device, &[Op::Delete { node: trash_node, expected: Some(trash_version) }], 3).await.unwrap();
+    let (rooted, ok) = s.gc_json().await;
+    assert!(ok, "{rooted}");
+    assert_eq!(rooted["candidates"]["chunks"]["count"], 1);
+    assert_eq!(rooted["candidates"]["chunks"]["examples"], serde_json::json!([candidate.to_string()]));
+    assert_eq!(rooted["candidates"]["manifests"]["protected_count"], 1);
+    assert_eq!(rooted["candidates"]["manifests"]["count"], 0);
+    assert_eq!(rooted["database"]["verify"]["notices"]["unrooted_manifests"]["examples"][0], unrooted_manifest.id().to_string());
+    assert!(rooted["database"]["verify"]["notices"]["unrooted_manifests"]["examples"].as_array().unwrap().iter().all(|id| id
+        != &current_manifest.id().to_string()
+        && id != &import_manifest.id().to_string()
+        && id != &live_snapshot.id().to_string()
+        && id != &trash_manifest.id().to_string()));
+
+    // Manifests without an index (as an upgrade finds them): no dependency is known, every chunk is protected.
+    s.exec("DELETE FROM manifest_chunks").await;
+    s.exec("DELETE FROM manifest_index").await;
+    let (unindexed, ok) = s.gc_json().await;
+    assert!(ok, "an incomplete index is a protection, not a problem: {unindexed}");
+    assert_eq!(unindexed["index_incomplete"], true);
+    assert_eq!(unindexed["candidates"]["chunks"]["count"], 0);
+    assert_eq!(unindexed["candidates"]["chunks"]["examples"].as_array().unwrap().len(), 0);
+    assert_eq!(unindexed["candidates"]["chunks"]["protection"], "index incomplete: dependencies unknown");
+    cli(&["index", "build", "--config", c], "").await.unwrap();
+    let (rebuilt, _) = s.gc_json().await;
+    assert_eq!(rebuilt["index_incomplete"], false);
+    assert_eq!(rebuilt["candidates"]["chunks"]["examples"], serde_json::json!([candidate.to_string()]));
+
+    // An index still being built (the second edge not written yet) protects every chunk too.
+    let incomplete_data_a = [47u8; 12];
+    let incomplete_data_b = [48u8; 12];
+    let incomplete_a = ChunkId::from_bytes(*blake3::hash(&incomplete_data_a).as_bytes());
+    let incomplete_b = ChunkId::from_bytes(*blake3::hash(&incomplete_data_b).as_bytes());
+    for (id, data) in [(incomplete_a, incomplete_data_a), (incomplete_b, incomplete_data_b)] {
+        s.store.put(BlobKey::chunk(&id), &data).await.unwrap();
+        s.meta.add_chunk(user.space, &id, 13, 2).await.unwrap();
+    }
+    let incomplete_manifest = Manifest::new(
+        ChunkerParamsId::new("fastcdc-v1").unwrap(),
+        24,
+        FileHash::from_bytes([49; 32]),
+        vec![ChunkRef { id: incomplete_a, len: 12 }, ChunkRef { id: incomplete_b, len: 12 }],
+    )
+    .unwrap();
+    s.store.put(BlobKey::manifest(&incomplete_manifest.id()), &incomplete_manifest.encode()).await.unwrap();
+    s.meta
+        .clone()
+        .with_index_batch_rows(1)
+        .add_manifest(user.space, &incomplete_manifest, u64::try_from(incomplete_manifest.encode().len()).unwrap() + 1, 2)
+        .await
+        .unwrap();
+    let (building, _) = s.gc_json().await;
+    assert_eq!(building["candidates"]["chunks"]["count"], 0);
+    assert_eq!(building["candidates"]["chunks"]["examples"].as_array().unwrap().len(), 0);
+    assert_eq!(building["candidates"]["chunks"]["protection"], "index incomplete: dependencies unknown");
+
+    // A recorded chunk whose object is gone: a problem (exit code non-zero), and nothing is a candidate.
+    let missing_data = [42u8];
+    let missing = ChunkId::from_bytes(*blake3::hash(&missing_data).as_bytes());
+    s.meta.add_chunk(user.space, &missing, 2, 1).await.unwrap();
+    let (ok, report, err) = s.run_unchanged(&["gc", "--dry-run", "--json", "--config", c]).await;
+    assert!(!ok && err.contains("gc dry-run found problems"), "{err}");
+    assert!(report.contains("chunk_object_missing"), "{report}");
+    let missing_report: serde_json::Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(missing_report["candidates"]["chunks"]["count"], 0);
+    assert_eq!(missing_report["candidates"]["chunks"]["examples"].as_array().unwrap().len(), 0);
+
+    // More objects than one page (1,000): every stored object is classified exactly once, as recorded, orphan or foreign.
+    s.store.put(BlobKey::chunk(&missing), &missing_data).await.unwrap();
+    for i in 0u64..1001 {
+        let id = ChunkId::from_bytes(*blake3::hash(&i.to_le_bytes()).as_bytes());
+        let path = s.storage.join(BlobKey::chunk(&id).path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, [0u8]).unwrap();
+    }
+    let (paged, ok) = s.gc_json().await;
+    assert!(ok, "{paged}");
+    assert_eq!(paged["store"]["chunk_orphans"]["count"], 1002);
+    assert_eq!(paged["store"]["chunk_orphans"]["stored_bytes"], 1003);
+    let stored = i64::try_from(tree_snapshot(&s.storage.join("chunks")).len()).unwrap();
+    let recorded = s.count("SELECT COUNT(*) FROM blobs WHERE kind = 0").await;
+    let orphans = paged["store"]["chunk_orphans"]["count"].as_i64().unwrap();
+    let foreign = paged["store"]["foreign"]["count"].as_i64().unwrap();
+    assert!(stored > 1000, "the store must hold more than one page: {stored}");
+    // Every recorded object is stored here, so the recorded totals are the database's own, across the page boundary.
+    assert_eq!(paged["store"]["chunk_recorded"]["count"], recorded);
+    assert_eq!(
+        paged["store"]["chunk_recorded"]["stored_bytes"],
+        s.count("SELECT CAST(COALESCE(SUM(stored_size), 0) AS BIGINT) FROM blobs WHERE kind = 0").await
+    );
+    assert_eq!(paged["store"]["manifest_recorded"]["count"], s.count("SELECT COUNT(*) FROM blobs WHERE kind = 1").await);
+    assert_eq!(
+        paged["store"]["manifest_recorded"]["stored_bytes"],
+        s.count("SELECT CAST(COALESCE(SUM(stored_size), 0) AS BIGINT) FROM blobs WHERE kind = 1").await
+    );
+    assert_eq!(stored, recorded + orphans + foreign, "every stored chunk object is recorded, an orphan or foreign, exactly once");
+}
+
+#[tokio::test]
+async fn gc_dry_run_scenario_on_sqlite_changes_nothing() {
+    gc_scenario(&GcServer::new(None).await).await;
+}
+
+#[tokio::test]
+async fn gc_dry_run_scenario_on_postgres_changes_nothing() {
+    let Ok(admin_url) = std::env::var("CRAFT_CLOUD_TEST_PG") else {
+        assert!(std::env::var_os("CRAFT_CLOUD_REQUIRE_BACKENDS").is_none(), "CRAFT_CLOUD_REQUIRE_BACKENDS is set but CRAFT_CLOUD_TEST_PG is not");
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    let db_name = format!("gc_{}", uuid::Uuid::now_v7().simple());
+    let admin = sqlx::PgPool::connect(&admin_url).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db_name}"))).execute(&admin).await.unwrap();
+    let (prefix, _) = admin_url.rsplit_once('/').unwrap();
+    gc_scenario(&GcServer::new(Some(&format!("{prefix}/{db_name}"))).await).await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {db_name} WITH (FORCE)"))).execute(&admin).await.unwrap();
+    admin.close().await;
+}
+
+/// A SQLite database that a crashed process left with a WAL that holds data no checkpoint wrote to the database file.
+/// The dry run reads through it and leaves the database file and the WAL as they were; it may make a `-shm` file, as
+/// `verify` may, which is SQLite's rebuilt index of the WAL and not data.
+#[tokio::test]
+async fn gc_dry_run_on_sqlite_with_a_crashed_wal_changes_no_data() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config = dir.join("config.toml");
+    let config_path = config.to_str().unwrap();
+    let loaded = Config::load(&config).unwrap();
+    checkpoint_sqlite(&loaded.database.url).await;
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "gc_test_leave_wal_uncheckpointed", "--nocapture"])
+        .env("CRAFT_CLOUD_TEST_WAL_URL", &loaded.database.url)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let db_path = dir.join("meta.db");
+    let storage = dir.join("blobs");
+    assert!(storage.is_dir(), "the store directory of init");
+    let (db_before, wal_before) = sqlite_snapshot(&db_path);
+    let tree_before = tree_snapshot(&storage);
+    assert!(!wal_before.is_empty(), "test requires a non-empty WAL");
+
+    let (ok, out, err) = run_binary(&["gc", "--dry-run", "--json", "--config", config_path]);
+    assert!(ok, "{err}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&out).unwrap()["schema_version"], 1);
+    let (db_after, wal_after) = sqlite_snapshot(&db_path);
+    assert!(db_before == db_after, "database file changed: {} -> {} bytes", db_before.len(), db_after.len());
+    assert!(wal_before == wal_after, "WAL changed: {} -> {} bytes", wal_before.len(), wal_after.len());
+    assert!(tree_before == tree_snapshot(&storage), "the store changed");
+
+    // Without --dry-run: refused, and the same bytes.
+    let (ok, _, err) = run_binary(&["gc", "--config", config_path]);
+    assert!(!ok && err.contains("deleting is not implemented yet; run with --dry-run"), "{err}");
+    let (db_after, wal_after) = sqlite_snapshot(&db_path);
+    assert!(db_before == db_after && wal_before == wal_after, "a refused command changed the database");
+    assert!(tree_before == tree_snapshot(&storage), "a refused command changed the store");
+}
+
+/// A SQLite database with no WAL at all (checkpointed and closed): the dry run may leave an empty `-wal` and a `-shm`
+/// behind, as `verify` may, and changes no data.
+#[tokio::test]
+async fn gc_dry_run_on_a_checkpointed_sqlite_database_changes_no_data() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config = dir.join("config.toml");
+    let loaded = Config::load(&config).unwrap();
+    checkpoint_sqlite(&loaded.database.url).await;
+    let db_path = dir.join("meta.db");
+    let storage = dir.join("blobs");
+    let before = sqlite_snapshot(&db_path);
+    let tree_before = tree_snapshot(&storage);
+    assert!(before.1.is_empty(), "no WAL to start from");
+    let (ok, _, err) = run_binary(&["gc", "--dry-run", "--config", config.to_str().unwrap()]);
+    assert!(ok, "{err}");
+    assert!(before == sqlite_snapshot(&db_path), "database file or WAL changed");
+    assert!(tree_before == tree_snapshot(&storage), "the store changed");
+}
+
+#[tokio::test]
+async fn gc_chunk_candidates_use_one_database_audit_snapshot() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config = Config::load(&dir.join("config.toml")).unwrap();
+    let (meta, store) = craft_cloud_server::cli::open(&config).await.unwrap();
+    let ana = meta.user_by_name("ana").await.unwrap().unwrap();
+    for byte in 0u8..11 {
+        let data = [byte];
+        let id = ChunkId::from_bytes(*blake3::hash(&data).as_bytes());
+        store.put(BlobKey::chunk(&id), &data).await.unwrap();
+        meta.add_chunk(ana.space, &id, 2, i64::from(byte)).await.unwrap();
+    }
+    let report = craft_cloud_server::gc::dry_run(&meta, &store).await.unwrap();
+    let json = report.to_json();
+    assert_eq!(json["candidates"]["chunks"]["count"], 11);
+    assert_eq!(json["candidates"]["chunks"]["examples"].as_array().unwrap().len(), 11);
+}
+
+type StoreFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, craft_cloud_store::StoreError>> + Send + 'a>>;
+
+/// A backend that, like one written before `size_raw` existed, cannot tell an object's size without reading it.
+struct NoSizeBackend(craft_cloud_store::memory::MemoryBackend);
+
+impl craft_cloud_store::Backend for NoSizeBackend {
+    fn put_raw<'a, 'b, 'c>(&'a self, path: &'b str, data: bytes::Bytes) -> StoreFuture<'c, ()>
+    where
+        'a: 'c,
+        'b: 'c,
+        Self: 'c,
+    {
+        Box::pin(async move { craft_cloud_store::Backend::put_raw(&self.0, path, data).await })
+    }
+
+    fn get_raw<'a, 'b, 'c>(&'a self, path: &'b str) -> StoreFuture<'c, Option<bytes::Bytes>>
+    where
+        'a: 'c,
+        'b: 'c,
+        Self: 'c,
+    {
+        Box::pin(async move { craft_cloud_store::Backend::get_raw(&self.0, path).await })
+    }
+
+    fn delete_raw<'a, 'b, 'c>(&'a self, path: &'b str) -> StoreFuture<'c, ()>
+    where
+        'a: 'c,
+        'b: 'c,
+        Self: 'c,
+    {
+        Box::pin(async move { craft_cloud_store::Backend::delete_raw(&self.0, path).await })
+    }
+
+    fn list_raw<'a, 'b, 'c, 'd>(&'a self, prefix: &'b str, after: Option<&'c str>, limit: usize) -> StoreFuture<'d, Vec<String>>
+    where
+        'a: 'd,
+        'b: 'd,
+        'c: 'd,
+        Self: 'd,
+    {
+        Box::pin(async move { craft_cloud_store::Backend::list_raw(&self.0, prefix, after, limit).await })
+    }
+}
+
+/// A backend that cannot report sizes makes the dry run report a problem about the size, once, and exit non-zero. It
+/// neither crashes nor takes the object for a size of nothing and goes on.
+#[tokio::test]
+async fn gc_dry_run_reports_a_backend_that_cannot_give_sizes_as_a_problem() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config = Config::load(&dir.join("config.toml")).unwrap();
+    let (meta, _) = craft_cloud_server::cli::open(&config).await.unwrap();
+    let store = Store::new(NoSizeBackend(craft_cloud_store::memory::MemoryBackend::new()));
+    for byte in 0u8..3 {
+        let data = [byte];
+        store.put(BlobKey::chunk(&ChunkId::from_bytes(*blake3::hash(&data).as_bytes())), &data).await.unwrap();
+    }
+    let report = craft_cloud_server::gc::dry_run(&meta, &store).await.unwrap();
+    assert!(report.has_problems());
+    let json = report.to_json();
+    let error = json["store"]["listing_error"].as_str().unwrap();
+    assert!(error.contains("could not read stored size") && error.contains("metadata-only object sizes"), "{error}");
+    assert_eq!(json["store"]["chunk_orphans"]["count"], 1, "the inventory stops at the first object whose size is unknown");
+    assert!(report.to_text().contains("listing error: could not read stored size"));
 }
 
 #[tokio::test]
@@ -371,14 +976,6 @@ fn sqlite_snapshot(db_path: &std::path::Path) -> (Vec<u8>, Vec<u8>) {
     (read(db_path.to_owned()), read(db_path.with_extension("db-wal")))
 }
 
-/// Runs the real `craft-cloud-server` binary with the arguments and waits for it to exit, so that every connection it
-/// opened is closed, and every write a close or a checkpoint makes is on disk, when this returns: whether it exited with
-/// success, its standard output and its standard error.
-fn run_binary(args: &[&str]) -> (bool, String, String) {
-    let output = Process::new(env!("CARGO_BIN_EXE_craft-cloud-server")).args(args).stdin(Stdio::null()).output().unwrap();
-    (output.status.success(), String::from_utf8(output.stdout).unwrap(), String::from_utf8(output.stderr).unwrap())
-}
-
 /// Not a test of its own: run as a child of the crashed-WAL tests, it commits a chunk row and ends without closing the
 /// database, which leaves the row in the WAL and in no checkpoint.
 #[test]
@@ -438,22 +1035,6 @@ async fn verify_reads_a_crashed_wal_and_changes_no_data() {
 #[tokio::test]
 async fn verify_reads_a_crashed_wal_whose_shm_file_is_gone() {
     verify_of_a_crashed_wal(true).await;
-}
-
-fn tree_snapshot(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
-    fn visit(root: &std::path::Path, dir: &std::path::Path, out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                visit(root, &path, out);
-            } else {
-                out.insert(path.strip_prefix(root).unwrap().to_path_buf(), std::fs::read(&path).unwrap());
-            }
-        }
-    }
-    let mut out = std::collections::BTreeMap::new();
-    visit(root, root, &mut out);
-    out
 }
 
 fn object_path(dir: &std::path::Path, kind: &str, id: &[u8; 32]) -> std::path::PathBuf {

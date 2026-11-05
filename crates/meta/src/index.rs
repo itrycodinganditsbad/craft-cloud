@@ -116,6 +116,10 @@ pub enum Validation {
 /// What the database alone says about the index (the checker adds what only the store can tell).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexAudit {
+    /// Recorded chunks (`blobs` of kind chunk).
+    pub chunks: u64,
+    /// Stored bytes of chunks no manifest index edge names.
+    pub unreferenced_chunk_bytes: u64,
     /// Manifests recorded (`blobs` of kind manifest), and how many of them are in each state of the index.
     pub manifests: u64,
     pub complete: u64,
@@ -519,12 +523,35 @@ impl Meta {
         Ok(found)
     }
 
+    /// The recorded blobs among the IDs of one bounded store-list page, with the stored size the database records for each.
+    pub async fn recorded_blob_sizes(&self, kind: BlobKind, ids: &[[u8; 32]]) -> Result<std::collections::HashMap<[u8; 32], u64>, MetaError> {
+        let mut found = std::collections::HashMap::new();
+        if !ids.is_empty() {
+            let sql = format!("SELECT id, stored_size FROM blobs WHERE kind = $1 AND id IN ({})", placeholders(2, ids.len()));
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(kind.code());
+            for id in ids {
+                query = query.bind(id.to_vec());
+            }
+            for row in query.fetch_all(&self.pool).await? {
+                let size = u64::try_from(row.try_get::<i64, _>("stored_size")?).unwrap_or(0);
+                found.insert(hash_from(&row.try_get::<Vec<u8>, _>("id")?)?, size);
+            }
+        }
+        Ok(found)
+    }
+
     /// What the database says about the index, its roots and the blobs it names, in a read of one snapshot, with up to
     /// `examples` examples of each problem. Changes nothing.
     pub async fn index_audit(&self, examples: usize) -> Result<IndexAudit, MetaError> {
         let mut tx = self.read_snapshot().await?;
         let mut audit = IndexAudit::default();
         audit.manifests = scalar(&mut tx, "SELECT COUNT(*) AS n FROM blobs WHERE kind = 1").await?;
+        audit.chunks = scalar(&mut tx, "SELECT COUNT(*) AS n FROM blobs WHERE kind = 0").await?;
+        audit.unreferenced_chunk_bytes = scalar(
+            &mut tx,
+            "SELECT CAST(COALESCE(SUM(b.stored_size), 0) AS BIGINT) AS n FROM blobs b WHERE b.kind = 0 AND NOT EXISTS (SELECT 1 FROM manifest_chunks mc WHERE mc.chunk = b.id)",
+        )
+        .await?;
         audit.complete =
             scalar(&mut tx, "SELECT COUNT(*) AS n FROM blobs b JOIN manifest_index i ON i.manifest = b.id WHERE b.kind = 1 AND i.state = 1").await?;
         audit.building =
