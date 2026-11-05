@@ -46,6 +46,29 @@ pub struct SpaceResponse {
     pub username: String,
 }
 
+/// `GET /api/v1/account/usage`: stored bytes and labeled estimates for the signed-in account's space.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountUsage {
+    pub stored_bytes: u64,
+    pub quota_bytes: Option<u64>,
+    pub trash_bytes: Option<u64>,
+    pub history_bytes: Option<u64>,
+    pub estimates: UsageEstimates,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageEstimates {
+    pub index_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<UsageEstimateReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageEstimateReason {
+    IndexIncomplete,
+}
+
 /// `POST /api/v1/auth/login`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoginRequest {
@@ -375,6 +398,22 @@ mod tests {
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json, serde_json::json!({ "error": "not_found", "message": "no such chunk" }));
         assert_eq!(serde_json::from_value::<ErrorBody>(json).unwrap(), body);
+    }
+
+    #[test]
+    fn account_usage_round_trips_and_ignores_unknown_fields() {
+        let response = AccountUsage {
+            stored_bytes: 17,
+            quota_bytes: Some(99),
+            trash_bytes: None,
+            history_bytes: None,
+            estimates: UsageEstimates { index_complete: false, reason: Some(UsageEstimateReason::IndexIncomplete) },
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(serde_json::from_value::<AccountUsage>(value.clone()).unwrap(), response);
+        let mut value = value;
+        value.as_object_mut().unwrap().insert("future_field".into(), serde_json::json!(1));
+        assert_eq!(serde_json::from_value::<AccountUsage>(value).unwrap(), response);
     }
 
     #[test]

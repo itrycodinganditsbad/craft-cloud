@@ -15,9 +15,9 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router, middleware};
 use craft_cloud_meta::{BlobKind, DeviceAuth, valid_username};
 use craft_cloud_proto::api::{
-    CommitRequest, CommitResponse, DeviceInfo, HISTORY_DEFAULT_LIMIT, HistoryCursor, HistoryResponse, InfoResponse, LoginRequest, LoginResponse,
-    MAX_MISSING_IDS, MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, RestoreRequest, RestoreResponse, SpaceResponse,
-    TRASH_DEFAULT_LIMIT, TrashCursor, TrashItem, TrashResponse, TrashRestoreResponse, codes,
+    AccountUsage, CommitRequest, CommitResponse, DeviceInfo, HISTORY_DEFAULT_LIMIT, HistoryCursor, HistoryResponse, InfoResponse, LoginRequest,
+    LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, RestoreRequest, RestoreResponse, SpaceResponse,
+    TRASH_DEFAULT_LIMIT, TrashCursor, TrashItem, TrashResponse, TrashRestoreResponse, UsageEstimateReason, UsageEstimates, codes,
 };
 use craft_cloud_proto::limits::{MAX_BATCH_JSON_BYTES, MAX_BATCH_OPS, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_PAGE_NODES};
 use craft_cloud_proto::{ChangeSet, ChunkId, DeviceId, Manifest, ManifestId, NodeId, PageCursor};
@@ -63,6 +63,7 @@ pub fn router(state: Shared) -> Router {
         .route("/trash/{id}/restore", post(restore_from_trash))
         .route("/trash/{id}", delete(remove_from_trash))
         .route("/space", get(space))
+        .route("/account/usage", get(account_usage))
         .route("/tree", get(tree))
         .route("/changes", get(changes))
         .route("/live", get(crate::live::connect))
@@ -171,6 +172,19 @@ pub(crate) fn check_device_name(name: &str) -> Result<(), ApiError> {
 async fn space(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>) -> Result<Json<SpaceResponse>, ApiError> {
     let info = state.meta.space_info(auth.space).await?;
     Ok(Json(SpaceResponse { space: auth.space, root: info.root, epoch: info.epoch, seq: info.seq, username: auth.username }))
+}
+
+async fn account_usage(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>) -> Result<Json<AccountUsage>, ApiError> {
+    let estimate = state.meta.storage_estimate(auth.space).await?;
+    let index_complete = estimate.reason.is_none();
+    Ok(Json(AccountUsage {
+        stored_bytes: estimate.stored_bytes,
+        // PR #17's per-account override takes precedence once both branches are merged.
+        quota_bytes: state.meta.stored_bytes_cap(),
+        trash_bytes: estimate.trash_bytes,
+        history_bytes: estimate.history_bytes,
+        estimates: UsageEstimates { index_complete, reason: estimate.reason.map(|_| UsageEstimateReason::IndexIncomplete) },
+    }))
 }
 
 async fn list_devices(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>) -> Result<Json<Vec<DeviceInfo>>, ApiError> {

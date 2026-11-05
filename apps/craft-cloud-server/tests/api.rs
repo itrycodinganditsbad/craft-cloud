@@ -169,6 +169,7 @@ on_every_backend!(
     odd_usernames_and_device_names_are_refused,
     shutting_down_ends_long_polls,
     the_space_endpoint_and_unversioned_info,
+    account_usage_is_scoped_to_signed_in_space,
     oversized_manifests_are_refused,
     live_needs_a_device_token,
     live_hello_checks_the_version,
@@ -706,6 +707,121 @@ async fn the_space_endpoint_and_unversioned_info(s: &Server) {
     let unversioned: InfoResponse =
         s.client.get(format!("{}/api/info", s.base.trim_end_matches("/api/v1"))).send().await.unwrap().json().await.unwrap();
     assert_eq!(versioned, unversioned);
+}
+
+async fn account_usage_is_scoped_to_signed_in_space(s: &Server) {
+    add_user(s, "ana").await;
+    add_user(s, "bob").await;
+    let ana = login(s, "ana").await;
+    let bob = login(s, "bob").await;
+    s.meta.add_chunk(s.meta.user_by_name("ana").await.unwrap().unwrap().space, &chunk_id(b"ana"), 11, 1).await.unwrap();
+    s.meta.add_chunk(s.meta.user_by_name("bob").await.unwrap().unwrap().space, &chunk_id(b"bob"), 29, 1).await.unwrap();
+
+    let response = s.client.get(format!("{}/account/usage", s.base)).bearer_auth(&ana).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(json["stored_bytes"], 11);
+    assert_eq!(json["quota_bytes"], serde_json::Value::Null);
+    assert_eq!(json["trash_bytes"], 0);
+    assert_eq!(json["history_bytes"], 0);
+    assert_eq!(json["estimates"], json!({ "index_complete": true }));
+
+    let bob_usage: serde_json::Value =
+        s.client.get(format!("{}/account/usage", s.base)).bearer_auth(&bob).send().await.unwrap().json().await.unwrap();
+    assert_eq!(bob_usage["stored_bytes"], 29);
+    assert_eq!(s.client.get(format!("{}/account/usage", s.base)).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_usage_is_read_only_and_returns_configured_quota() {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let db_path = db.path().join("meta.db");
+    let meta = Meta::open(&format!("sqlite:{}", db_path.display())).await.unwrap().with_stored_bytes_cap(Some(123));
+    let server = start(meta, Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![db, blobs], None).await;
+    add_user(&server, "ana").await;
+    let token = login(&server, "ana").await;
+    let space = server.meta.user_by_name("ana").await.unwrap().unwrap().space;
+    server.meta.add_chunk(space, &chunk_id(b"usage"), 11, 1).await.unwrap();
+
+    let before = sqlite_fingerprint(&db_path);
+    let response = server.client.get(format!("{}/account/usage", server.base)).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let usage: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        usage,
+        json!({
+            "stored_bytes": 11,
+            "quota_bytes": 123,
+            "trash_bytes": 0,
+            "history_bytes": 0,
+            "estimates": { "index_complete": true }
+        })
+    );
+    assert_eq!(sqlite_fingerprint(&db_path), before, "authorized usage request changed database or WAL bytes");
+
+    let response = server.client.get(format!("{}/account/usage", server.base)).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(sqlite_fingerprint(&db_path), before, "unauthorized usage request changed database or WAL bytes");
+    server.stop();
+}
+
+fn sqlite_fingerprint(path: &std::path::Path) -> [u8; 32] {
+    let read = |path: std::path::PathBuf| if path.exists() { std::fs::read(path).unwrap() } else { Vec::new() };
+    let (database, wal) = (read(path.to_owned()), read(path.with_extension("db-wal")));
+    let mut hash = blake3::Hasher::new();
+    hash.update(&database);
+    hash.update(&wal);
+    *hash.finalize().as_bytes()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_usage_is_read_only_and_fingerprints_every_postgres_table() {
+    let Ok(admin_url) = std::env::var("CRAFT_CLOUD_TEST_PG") else { return };
+    use sqlx::Connection;
+
+    let name = format!("cc_usage_{}", uuid::Uuid::now_v7().simple());
+    let mut conn = sqlx::PgConnection::connect(&admin_url).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&mut conn).await.unwrap();
+    let guard = PgGuard { admin_url: admin_url.clone(), name: name.clone() };
+    let (base, _) = admin_url.rsplit_once('/').unwrap();
+    let database_url = format!("{base}/{name}");
+    let meta = Meta::open(&database_url).await.unwrap().with_stored_bytes_cap(Some(123));
+    let blobs = tempfile::tempdir().unwrap();
+    let server = start(meta, Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![blobs], Some(guard)).await;
+
+    add_user(&server, "ana").await;
+    let token = login(&server, "ana").await;
+    let space = server.meta.user_by_name("ana").await.unwrap().unwrap().space;
+    server.meta.add_chunk(space, &chunk_id(b"usage"), 11, 1).await.unwrap();
+    let before = postgres_fingerprint(&database_url).await;
+    let response = server.client.get(format!("{}/account/usage", server.base)).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let usage: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(usage["stored_bytes"], 11);
+    assert_eq!(usage["quota_bytes"], 123);
+    assert_eq!(postgres_fingerprint(&database_url).await, before, "usage request changed at least one Postgres table");
+    server.stop();
+}
+
+async fn postgres_fingerprint(database_url: &str) -> Vec<(String, String)> {
+    use sqlx::Connection;
+
+    let mut conn = sqlx::PgConnection::connect(database_url).await.unwrap();
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .unwrap();
+    let mut fingerprint = Vec::with_capacity(tables.len());
+    for table in tables {
+        let quoted = table.replace('"', "\"\"");
+        let sql = format!("SELECT COALESCE(json_agg(to_jsonb(t) ORDER BY t.ctid)::text, '[]') FROM \"{quoted}\" AS t");
+        let rows: String = sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).fetch_one(&mut conn).await.unwrap();
+        fingerprint.push((table, blake3::hash(rows.as_bytes()).to_hex().to_string()));
+    }
+    fingerprint
 }
 
 async fn oversized_manifests_are_refused(s: &Server) {
