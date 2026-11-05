@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use craft_cloud_app::{
-    AccountInfo, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser,
-    AdminUserInfo, AdminUserList, AuditPage, AuditQuery, Client, DeviceId, DeviceInfo, Error, ExportOutcome, HistoryResponse, JoinRequest, NodeId,
-    PairingInfo, PairingStatus, RecoveryCodes, RestoreResponse, RevokedOthers, Status, TrashResponse, TrashRestoreResponse, TwoFactorProofRequest,
-    TwoFactorSetupResponse, TwoFactorStatus, UserQuery, Uuid, VersionId,
+    AccountInfo, AccountUsage, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo,
+    AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, AuditPage, AuditQuery, Client, DeviceId, DeviceInfo, Error, ExportOutcome,
+    HistoryResponse, JoinRequest, NodeId, PairingInfo, PairingStatus, RecoveryCodes, RestoreResponse, RevokedOthers, Status, TrashResponse,
+    TrashRestoreResponse, TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, UserQuery, Uuid, VersionId,
 };
 
 use crate::admin::{Action, AdminEvent, Outcome};
@@ -57,8 +57,10 @@ pub trait Agent: Send + Sync {
     fn admin_audit(&self, query: &AuditQuery) -> Result<AuditPage, Error>;
     fn admin_audit_export(&self, query: &AuditQuery, out: &mut dyn Write) -> Result<ExportOutcome, Error>;
     fn admin_server(&self) -> Result<AdminServerInfo, Error>;
+    fn admin_storage(&self) -> Result<AdminStorageOverview, Error>;
     fn admin_users(&self, query: &UserQuery) -> Result<AdminUserList, Error>;
     fn admin_devices(&self, user: Uuid) -> Result<AdminDevices, Error>;
+    fn admin_user_usage(&self, user: Uuid) -> Result<AccountUsage, Error>;
     fn admin_create_user(&self, request: &AdminCreateUser) -> Result<AdminCreatedUser, Error>;
     fn admin_update_user(&self, id: Uuid, request: &AdminUpdateUser) -> Result<AdminUserInfo, Error>;
     fn admin_disable_user(&self, id: Uuid, confirm: &AdminConfirm) -> Result<(), Error>;
@@ -193,11 +195,17 @@ impl Agent for ClientAgent {
     fn admin_server(&self) -> Result<AdminServerInfo, Error> {
         self.with(Client::admin_server)
     }
+    fn admin_storage(&self) -> Result<AdminStorageOverview, Error> {
+        self.with(Client::admin_storage)
+    }
     fn admin_users(&self, query: &UserQuery) -> Result<AdminUserList, Error> {
         self.with(|c| c.admin_users(query))
     }
     fn admin_devices(&self, user: Uuid) -> Result<AdminDevices, Error> {
         self.with(|c| c.admin_devices(user))
+    }
+    fn admin_user_usage(&self, user: Uuid) -> Result<AccountUsage, Error> {
+        self.with(|c| c.admin_user_usage(user))
     }
     fn admin_create_user(&self, request: &AdminCreateUser) -> Result<AdminCreatedUser, Error> {
         self.with(|c| c.admin_create_user(request))
@@ -350,10 +358,12 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         Effect::Resume => Event::Answered(agent.resume()),
         Effect::Account { session } => Event::Admin(AdminEvent::Account { session, result: agent.account() }),
         Effect::AdminServer { session } => Event::Admin(AdminEvent::Server { session, result: agent.admin_server() }),
+        Effect::AdminStorage { session, ticket } => Event::Admin(AdminEvent::Storage { session, ticket, result: agent.admin_storage() }),
         Effect::AdminUsers { query, ticket } => Event::Admin(AdminEvent::Users { ticket, result: agent.admin_users(&query) }),
         Effect::AdminDevices { user, ticket } => {
             Event::Admin(AdminEvent::Devices { user, ticket, result: agent.admin_devices(user).map(|d| d.devices) })
         }
+        Effect::AdminUserUsage { user, ticket } => Event::Admin(AdminEvent::Usage { user, ticket, result: agent.admin_user_usage(user) }),
         Effect::AuditPage { own, query, ticket } => {
             let result = if own { agent.account_activity(&query) } else { agent.admin_audit(&query) };
             Event::Audit(AuditMsg::Page { own, ticket, result })
@@ -805,6 +815,35 @@ pub(crate) mod fake {
                 database_kind: "sqlite".into(),
             })
         }
+        fn admin_storage(&self) -> Result<AdminStorageOverview, Error> {
+            self.admin_call("admin_storage", || {
+                use craft_cloud_app::{AdminManifestIndex, AdminStorageAccount};
+                let users = self.users.lock().unwrap();
+                let top_accounts = users
+                    .iter()
+                    .take(3)
+                    .map(|user| AdminStorageAccount {
+                        id: user.id,
+                        username: user.username.clone(),
+                        stored_bytes: user.stored_bytes,
+                        quota_bytes: user.quota_bytes.or(Some(10 * 1_073_741_824)),
+                    })
+                    .collect();
+                // The counts follow the fake accounts; the default quota applies where an account has no
+                // override of its own, and "near" includes accounts at or over their quota, as on the server.
+                let effective = |user: &AdminUserInfo| user.quota_bytes.unwrap_or(10 * 1_073_741_824);
+                AdminStorageOverview {
+                    accounts: users.len() as u64,
+                    stored_bytes: 5_000_000_000,
+                    default_quota_bytes: Some(10 * 1_073_741_824),
+                    accounts_with_override: users.iter().filter(|user| user.quota_bytes.is_some()).count() as u64,
+                    accounts_near_quota: users.iter().filter(|user| user.stored_bytes >= effective(user) - effective(user) / 10).count() as u64,
+                    accounts_over_quota: users.iter().filter(|user| user.stored_bytes >= effective(user)).count() as u64,
+                    top_accounts,
+                    manifest_index: AdminManifestIndex { complete: 7, building: 1, not_indexed: 2 },
+                }
+            })
+        }
         fn admin_users(&self, query: &UserQuery) -> Result<AdminUserList, Error> {
             self.admin_call("admin_users", || {
                 let needle = query.query.as_deref().unwrap_or_default().to_lowercase();
@@ -833,6 +872,18 @@ pub(crate) mod fake {
                     revoked_ms: None,
                     revoke_reason: None,
                 }],
+            })
+        }
+        fn admin_user_usage(&self, user: Uuid) -> Result<AccountUsage, Error> {
+            self.admin_call("admin_user_usage", || {
+                let account = self.user(user);
+                AccountUsage {
+                    stored_bytes: account.stored_bytes,
+                    quota_bytes: account.quota_bytes.or(Some(10 * 1_073_741_824)),
+                    trash_bytes: Some(80_000_000),
+                    history_bytes: Some(240_000_000),
+                    estimates: craft_cloud_app::UsageEstimates { index_complete: true, reason: None },
+                }
             })
         }
         fn admin_create_user(&self, request: &AdminCreateUser) -> Result<AdminCreatedUser, Error> {

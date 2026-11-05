@@ -8,6 +8,12 @@ use craft_cloud_app::AdminUserInfo;
 
 use crate::model::Event;
 
+struct StorageState<'a> {
+    overview: Option<&'a craft_cloud_app::AdminStorageOverview>,
+    loading: bool,
+    error: Option<&'a str>,
+}
+
 /// The name of the confirmation page's password field, for [`super::security::secret_id`] and the forgetting of its text.
 pub(super) const PASSWORD_FIELD: &str = "admin-password";
 /// The name of its field for a code (from the authenticator app, or a recovery code).
@@ -24,7 +30,14 @@ pub(super) fn show(ui: &mut egui::Ui, admin: &mut AdminScreen, now_ms: i64, even
     }
     let server = admin.server.clone();
     match &mut admin.view {
-        View::List => users(ui, server.as_ref(), &mut admin.list, &me, events),
+        View::List => users(
+            ui,
+            server.as_ref(),
+            StorageState { overview: admin.storage.as_ref(), loading: admin.storage_loading, error: admin.storage_error.as_deref() },
+            &mut admin.list,
+            &me,
+            events,
+        ),
         View::Create(form) => create(ui, form, events),
         View::Audit(view) => super::audit::log(ui, view, now_ms, events),
         View::User(view) => {
@@ -66,7 +79,14 @@ fn describe(user: &AdminUserInfo) -> String {
     parts.join(" · ")
 }
 
-fn users(ui: &mut egui::Ui, server: Option<&craft_cloud_app::AdminServerInfo>, list: &mut UserList, me: &str, events: &mut Vec<Event>) {
+fn users(
+    ui: &mut egui::Ui,
+    server: Option<&craft_cloud_app::AdminServerInfo>,
+    storage: StorageState<'_>,
+    list: &mut UserList,
+    me: &str,
+    events: &mut Vec<Event>,
+) {
     super::heading(ui, "Administration");
     if let Some(info) = server {
         ui.label(
@@ -84,6 +104,8 @@ fn users(ui: &mut egui::Ui, server: Option<&craft_cloud_app::AdminServerInfo>, l
         );
         ui.add_space(8.0);
     }
+    storage_overview(ui, storage);
+    ui.add_space(8.0);
     ui.horizontal(|ui| {
         if ui.button("Back").clicked() {
             send(events, AdminEvent::Close);
@@ -154,6 +176,60 @@ fn users(ui: &mut egui::Ui, server: Option<&craft_cloud_app::AdminServerInfo>, l
     }
 }
 
+fn storage_overview(ui: &mut egui::Ui, state: StorageState<'_>) {
+    ui.label(RichText::new("Storage").strong());
+    if let Some(error) = state.error {
+        super::error_line(ui, error);
+        return;
+    }
+    let Some(storage) = state.overview else {
+        if state.loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Asking the server…");
+            });
+        }
+        return;
+    };
+    ui.label(format!(
+        "{} stored · {} accounts · default quota {}",
+        format_bytes(storage.stored_bytes),
+        storage.accounts,
+        storage.default_quota_bytes.map_or_else(|| "none".to_owned(), format_bytes)
+    ));
+    ui.label(format!(
+        "{} near quota · {} over quota · {} with a quota of their own",
+        storage.accounts_near_quota, storage.accounts_over_quota, storage.accounts_with_override
+    ));
+    ui.label(
+        RichText::new(format!(
+            "Manifest index: {} complete · {} building · {} not indexed",
+            storage.manifest_index.complete, storage.manifest_index.building, storage.manifest_index.not_indexed
+        ))
+        .small()
+        .weak(),
+    );
+    if storage.manifest_index.building > 0 || storage.manifest_index.not_indexed > 0 {
+        ui.label(RichText::new("Storage estimates are incomplete; run `craft-cloud-server index build`. ").small().weak());
+    }
+    if !storage.top_accounts.is_empty() {
+        ui.label(RichText::new("Top accounts").small().strong());
+        egui::Grid::new("admin-storage-top").num_columns(3).striped(true).spacing([12.0, 4.0]).show(ui, |ui| {
+            ui.label(RichText::new("Account").small().weak());
+            ui.label(RichText::new("Stored").small().weak());
+            ui.label(RichText::new("Effective quota").small().weak());
+            ui.end_row();
+            for account in &storage.top_accounts {
+                ui.label(&account.username);
+                ui.label(format_bytes(account.stored_bytes));
+                ui.label(account.quota_bytes.map_or_else(|| "none".to_owned(), format_bytes));
+                ui.end_row();
+            }
+        });
+    }
+    ui.separator();
+}
+
 fn role_choice(ui: &mut egui::Ui, role: &mut RoleChoice) {
     ui.horizontal(|ui| {
         ui.radio_value(role, RoleChoice::Member, RoleChoice::Member.label());
@@ -207,6 +283,31 @@ fn account(ui: &mut egui::Ui, view: &mut UserView, user: Option<&AdminUserInfo>,
     ui.label(RichText::new(describe(user)).small().weak());
     ui.add_space(10.0);
     let is_me = user.username == me;
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Storage usage").strong());
+        if ui.small_button("Refresh").clicked() {
+            send(events, AdminEvent::RefreshUsage);
+        }
+    });
+    if let Some(error) = &view.usage_error {
+        super::error_line(ui, error);
+    } else if let Some(usage) = &view.usage {
+        ui.label(format!("Stored: {}", format_bytes(usage.stored_bytes)));
+        ui.label(format!("Effective quota: {}", usage.quota_bytes.map_or_else(|| "none".to_owned(), format_bytes)));
+        if usage.estimates.index_complete {
+            ui.label(format!("Trash estimate (overlapping): {}", usage.trash_bytes.map_or_else(|| "not available".to_owned(), format_bytes)));
+            ui.label(format!("History estimate (overlapping): {}", usage.history_bytes.map_or_else(|| "not available".to_owned(), format_bytes)));
+        } else {
+            ui.label("estimates not available yet");
+        }
+    } else if view.usage_loading {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Asking the server…");
+        });
+    }
+    ui.add_space(8.0);
 
     if ui.button("Activity of this account").on_hover_text("The audit log, for this account").clicked() {
         events.push(Event::Audit(crate::audit::AuditMsg::OpenAudit(Some((user.id, user.username.clone())))));

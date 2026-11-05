@@ -124,6 +124,9 @@ fn snapshot(model: Model, theme: egui::Theme, name: &str) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("snapshots");
     let path = dir.join(format!("{name}.png"));
     if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+        if std::env::var("UPDATE_SNAPSHOT_ONLY").ok().is_some_and(|names| !names.split(',').any(|allowed| allowed == name)) {
+            return;
+        }
         std::fs::create_dir_all(&dir).unwrap();
         image.save(&path).unwrap();
         return;
@@ -500,6 +503,7 @@ fn snapshot_admin_pages() {
     let mut model = on_admin_pages(&agent, Vec::new());
     snapshot(model.clone(), egui::Theme::Light, "admin-users");
     snapshot(model.clone(), egui::Theme::Dark, "admin-users-dark");
+    snapshot(model.clone(), egui::Theme::Light, "admin-storage");
 
     model.update(Event::Admin(AdminEvent::NewUser));
     if let Screen::Admin(admin) = &mut model.screen
@@ -513,6 +517,20 @@ fn snapshot_admin_pages() {
     let ana = id_of(&on_admin_pages(&agent, Vec::new()), "ana");
     let mut model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(ana))]);
     snapshot(model.clone(), egui::Theme::Light, "admin-account");
+    snapshot(model.clone(), egui::Theme::Light, "admin-account-usage");
+    if let Screen::Admin(admin) = &mut model.screen
+        && let View::User(view) = &mut admin.view
+    {
+        view.usage = Some(craft_cloud_app::AccountUsage {
+            stored_bytes: 640_000_000,
+            quota_bytes: Some(5 * 1_073_741_824),
+            trash_bytes: None,
+            history_bytes: None,
+            estimates: craft_cloud_app::UsageEstimates { index_complete: false, reason: Some(craft_cloud_app::UsageEstimateReason::IndexIncomplete) },
+        });
+        view.usage_loading = false;
+    }
+    snapshot(model.clone(), egui::Theme::Light, "admin-account-usage-unavailable");
 
     // A change asks for the password; the wrong one is said in the words of the server's refusal.
     model.update(Event::Admin(AdminEvent::Ask(Action::Disable { id: ana, username: "ana".into() })));
@@ -536,6 +554,18 @@ fn snapshot_admin_pages() {
     let code = model.admin_screen().unwrap().code.clone().unwrap();
     assert_eq!((code.username.as_str(), code.kind), ("dora", CodeKind::Invite));
     snapshot(model, egui::Theme::Light, "admin-invite-code");
+}
+
+#[test]
+fn account_estimates_are_not_added_to_stored_total() {
+    let agent = admin_agent();
+    let ana = id_of(&on_admin_pages(&agent, Vec::new()), "ana");
+    let model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(ana))]);
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(4);
+    assert_eq!(h.query_all_by_label("Stored: 610 MiB").count(), 1, "estimates stay separate from stored bytes");
+    assert_eq!(h.query_all_by_label("Trash estimate (overlapping): 76.3 MiB").count(), 1);
+    assert_eq!(h.query_all_by_label("History estimate (overlapping): 229 MiB").count(), 1);
 }
 
 /// A member never sees the way in.

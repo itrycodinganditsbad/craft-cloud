@@ -15,7 +15,8 @@
 //!   dismisses it (or leaves the pages), never written anywhere, and left out of `Debug` output.
 
 use craft_cloud_app::{
-    AccountInfo, AdminCode, AdminCreatedUser, AdminServerInfo, AdminUserInfo, AdminUserList, DeviceId, DeviceInfo, Error, UserQuery, Uuid,
+    AccountInfo, AccountUsage, AdminCode, AdminCreatedUser, AdminServerInfo, AdminStorageOverview, AdminUserInfo, AdminUserList, DeviceId,
+    DeviceInfo, Error, UserQuery, Uuid,
 };
 use craft_cloud_proto::api::{AdminConfirm, codes};
 
@@ -377,6 +378,10 @@ pub struct UserView {
     pub devices_error: Option<String>,
     /// The number of the devices call whose answer is wanted.
     devices_ticket: u64,
+    pub usage: Option<AccountUsage>,
+    pub usage_error: Option<String>,
+    pub usage_loading: bool,
+    usage_ticket: u64,
 }
 
 impl UserView {
@@ -392,6 +397,10 @@ impl UserView {
             devices: None,
             devices_error: None,
             devices_ticket: 0,
+            usage: None,
+            usage_error: None,
+            usage_loading: false,
+            usage_ticket: 0,
         }
     }
 }
@@ -414,6 +423,10 @@ pub struct AdminScreen {
     pub list: UserList,
     /// The server's counters, once they came.
     pub server: Option<AdminServerInfo>,
+    pub storage: Option<AdminStorageOverview>,
+    pub storage_loading: bool,
+    pub storage_error: Option<String>,
+    storage_ticket: u64,
     pub view: View,
     /// A change waiting for the admin's password.
     pub dialog: Option<Dialog>,
@@ -434,6 +447,12 @@ pub enum AdminEvent {
         session: u64,
         result: Result<AdminServerInfo, Error>,
     },
+    /// [`Effect::AdminStorage`]'s answer.
+    Storage {
+        session: u64,
+        ticket: u64,
+        result: Result<AdminStorageOverview, Error>,
+    },
     /// [`Effect::AdminUsers`]'s answer.
     Users {
         ticket: u64,
@@ -444,6 +463,12 @@ pub enum AdminEvent {
         user: Uuid,
         ticket: u64,
         result: Result<Vec<DeviceInfo>, Error>,
+    },
+    /// [`Effect::AdminUserUsage`]'s answer.
+    Usage {
+        user: Uuid,
+        ticket: u64,
+        result: Result<AccountUsage, Error>,
     },
     /// [`Effect::AdminDo`]'s answer.
     Done(Result<Outcome, Error>),
@@ -474,6 +499,7 @@ pub enum AdminEvent {
     /// The shown code was noted: forget it.
     DismissCode,
     RefreshDevices,
+    RefreshUsage,
 }
 
 impl Model {
@@ -532,8 +558,19 @@ impl Model {
         if !matches!(overview.access, Access::Admin { .. }) {
             return Vec::new();
         }
-        let mut admin = AdminScreen { overview: overview.clone(), list: UserList::new(), server: None, view: View::List, dialog: None, code: None };
-        let effects = vec![admin.list.load(), Effect::AdminServer { session: admin.overview.session }];
+        let mut admin = AdminScreen {
+            overview: overview.clone(),
+            list: UserList::new(),
+            server: None,
+            storage: None,
+            storage_loading: false,
+            storage_error: None,
+            storage_ticket: 0,
+            view: View::List,
+            dialog: None,
+            code: None,
+        };
+        let effects = vec![admin.list.load(), Effect::AdminServer { session: admin.overview.session }, admin.load_storage()];
         self.screen = Screen::Admin(Box::new(admin));
         effects
     }
@@ -564,6 +601,23 @@ impl AdminScreen {
                     Err(_) => Vec::new(),
                 }
             }
+            AdminEvent::Storage { session, ticket, result } => {
+                if session != self.overview.session || ticket != self.storage_ticket {
+                    return Vec::new();
+                }
+                self.storage_loading = false;
+                match result {
+                    Ok(storage) => {
+                        self.storage = Some(storage);
+                        self.storage_error = None;
+                        Vec::new()
+                    }
+                    Err(error) => {
+                        self.storage_error = Some(error_text(&error));
+                        if is_forbidden(&error) { vec![Effect::Account { session: self.overview.session }] } else { Vec::new() }
+                    }
+                }
+            }
             AdminEvent::Users { ticket, result } => self.users_came(ticket, result),
             AdminEvent::Devices { user, ticket, result } => {
                 let mut effects = Vec::new();
@@ -579,6 +633,28 @@ impl AdminScreen {
                         Err(e) => {
                             view.devices_error = Some(error_text(&e));
                             if is_forbidden(&e) {
+                                effects.push(Effect::Account { session: self.overview.session });
+                            }
+                        }
+                    }
+                }
+                effects
+            }
+            AdminEvent::Usage { user, ticket, result } => {
+                let mut effects = Vec::new();
+                if let View::User(view) = &mut self.view
+                    && view.id == user
+                    && view.usage_ticket == ticket
+                {
+                    view.usage_loading = false;
+                    match result {
+                        Ok(usage) => {
+                            view.usage = Some(usage);
+                            view.usage_error = None;
+                        }
+                        Err(error) => {
+                            view.usage_error = Some(error_text(&error));
+                            if is_forbidden(&error) {
                                 effects.push(Effect::Account { session: self.overview.session });
                             }
                         }
@@ -618,7 +694,7 @@ impl AdminScreen {
                 if self.list.loading {
                     return Vec::new();
                 }
-                vec![self.list.load()]
+                vec![self.list.load(), self.load_storage()]
             }
             AdminEvent::NewUser => {
                 if self.dialog.is_none() {
@@ -634,9 +710,14 @@ impl AdminScreen {
                 }
                 let mut view = UserView::new(user);
                 view.devices_ticket = fresh();
-                let effect = Effect::AdminDevices { user: id, ticket: view.devices_ticket };
+                view.usage_ticket = fresh();
+                view.usage_loading = true;
+                let effects = vec![
+                    Effect::AdminDevices { user: id, ticket: view.devices_ticket },
+                    Effect::AdminUserUsage { user: id, ticket: view.usage_ticket },
+                ];
                 self.view = View::User(Box::new(view));
-                vec![effect]
+                effects
             }
             AdminEvent::BackToList => {
                 if self.dialog.is_none() {
@@ -672,7 +753,23 @@ impl AdminScreen {
                 }
                 _ => Vec::new(),
             },
+            AdminEvent::RefreshUsage => match &mut self.view {
+                View::User(view) => {
+                    view.usage_ticket = fresh();
+                    view.usage_loading = true;
+                    view.usage_error = None;
+                    vec![Effect::AdminUserUsage { user: view.id, ticket: view.usage_ticket }]
+                }
+                _ => Vec::new(),
+            },
         }
+    }
+
+    fn load_storage(&mut self) -> Effect {
+        self.storage_ticket = fresh();
+        self.storage_loading = true;
+        self.storage_error = None;
+        Effect::AdminStorage { session: self.overview.session, ticket: self.storage_ticket }
     }
 
     fn users_came(&mut self, ticket: u64, result: Result<AdminUserList, Error>) -> Vec<Effect> {
@@ -811,6 +908,9 @@ impl AdminScreen {
                         devices_ticket: view.devices_ticket,
                         ..UserView::new(&info)
                     };
+                    view.usage_ticket = fresh();
+                    view.usage_loading = true;
+                    effects.push(Effect::AdminUserUsage { user: view.id, ticket: view.usage_ticket });
                 }
             }
             (Action::Remove { .. }, _) => self.view = View::List,
@@ -827,6 +927,7 @@ impl AdminScreen {
         // What changed shows in the list (and the counters).
         effects.push(self.list.load());
         effects.push(Effect::AdminServer { session: self.overview.session });
+        effects.push(self.load_storage());
         effects
     }
 
@@ -1028,7 +1129,7 @@ pub(crate) mod tests {
         assert!(model.is_admin());
         assert_eq!(model.overview().unwrap().access, Access::Admin { two_factor: false });
         let effects = model.update(Event::Admin(AdminEvent::Open));
-        assert!(matches!(effects.as_slice(), [Effect::AdminUsers { .. }, Effect::AdminServer { .. }]), "{effects:?}");
+        assert!(matches!(effects.as_slice(), [Effect::AdminUsers { .. }, Effect::AdminServer { .. }, Effect::AdminStorage { .. }]), "{effects:?}");
         assert!(model.admin_screen().is_some());
         // The counters come with the pages, not with the sign-in.
         assert!(model.admin_screen().unwrap().server.is_none());
@@ -1404,14 +1505,31 @@ pub(crate) mod tests {
         // The same for a user's devices.
         let ana = user_named(&model, "user01");
         let asked = model.update(Event::Admin(AdminEvent::OpenUser(ana.id)));
-        let [Effect::AdminDevices { ticket: first_devices, .. }] = asked.as_slice() else { panic!("{asked:?}") };
+        let [Effect::AdminDevices { ticket: first_devices, .. }, Effect::AdminUserUsage { ticket: first_usage, .. }] = asked.as_slice() else {
+            panic!("{asked:?}")
+        };
         run(&mut model, &boss, ev(AdminEvent::RefreshDevices));
+        run(&mut model, &boss, ev(AdminEvent::RefreshUsage));
         let View::User(view) = &admin(&model).view else { panic!() };
         let now = view.devices.clone();
+        let usage_now = view.usage.clone();
         assert_eq!(now.as_ref().map(Vec::len), Some(1));
         model.update(Event::Admin(AdminEvent::Devices { user: ana.id, ticket: *first_devices, result: Ok(Vec::new()) }));
         let View::User(view) = &admin(&model).view else { panic!() };
         assert_eq!(view.devices, now);
+        model.update(Event::Admin(AdminEvent::Usage {
+            user: ana.id,
+            ticket: *first_usage,
+            result: Ok(craft_cloud_app::AccountUsage {
+                stored_bytes: 1,
+                quota_bytes: None,
+                trash_bytes: Some(2),
+                history_bytes: Some(3),
+                estimates: craft_cloud_app::UsageEstimates { index_complete: true, reason: None },
+            }),
+        }));
+        let View::User(view) = &admin(&model).view else { panic!() };
+        assert_eq!(view.usage, usage_now);
     }
 
     /// The admin check of an earlier sign-in (another account, maybe) says nothing about the current one.

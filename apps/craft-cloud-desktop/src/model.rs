@@ -438,6 +438,11 @@ pub enum Effect {
     AdminServer {
         session: u64,
     },
+    /// The server-wide storage overview for the admin pages.
+    AdminStorage {
+        session: u64,
+        ticket: u64,
+    },
     /// A page of the user list ([`AdminEvent::Users`] with the same `ticket`).
     AdminUsers {
         query: UserQuery,
@@ -445,6 +450,11 @@ pub enum Effect {
     },
     /// A user's devices ([`AdminEvent::Devices`]).
     AdminDevices {
+        user: Uuid,
+        ticket: u64,
+    },
+    /// One account's effective quota and overlapping storage estimates.
+    AdminUserUsage {
         user: Uuid,
         ticket: u64,
     },
