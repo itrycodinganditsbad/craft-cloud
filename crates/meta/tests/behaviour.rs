@@ -2248,6 +2248,7 @@ async fn redeems_sign_ins_and_resets_at_the_same_moment_leave_no_live_device(met
 async fn back_to_0006(url: &str) {
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    drop_history_trash_and_manifest_index(&mut conn).await;
     // What migrations 0010, 0009 and 0008 added goes first: they run again with 0007 on the next open.
     sqlx::query("DROP TABLE web_sessions").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE audit_events").execute(&mut conn).await.unwrap();
@@ -3052,6 +3053,7 @@ async fn migrating_from_0009_keeps_the_rows(url: &str) {
         (ana, invite, events.len())
     };
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    drop_history_trash_and_manifest_index(&mut conn).await;
     sqlx::query("DROP TABLE web_sessions").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE login_challenges").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE user_recovery_codes").execute(&mut conn).await.unwrap();
@@ -3753,19 +3755,39 @@ async fn raw(url: &str) -> sqlx::AnyConnection {
     sqlx::AnyConnection::connect(url).await.unwrap()
 }
 
-/// Puts the database back to the state before the trash migration: no columns, no index, one version fewer.
-async fn undo_the_trash_migration(url: &str) {
-    let mut conn = raw(url).await;
+/// Removes the last three migrations and their version rows, so older migration tests can start from the version they name.
+async fn drop_history_trash_and_manifest_index(conn: &mut sqlx::AnyConnection) {
     for statement in [
         "DROP TABLE manifest_chunks",
         "DROP TABLE manifest_index",
         "DROP INDEX nodes_trash",
         "ALTER TABLE nodes DROP COLUMN deleted_ms",
         "ALTER TABLE nodes DROP COLUMN purge_requested_ms",
-        "DELETE FROM schema_version WHERE version >= 8",
+        "DROP INDEX versions_node_seq",
+        "DELETE FROM schema_version WHERE version >= 12",
     ] {
-        sqlx::query(statement).execute(&mut conn).await.unwrap();
+        sqlx::query(statement).execute(&mut *conn).await.unwrap();
     }
+}
+
+/// Removes the trash and manifest-index migrations but retains the version-history migration.
+async fn drop_trash_and_manifest_index(conn: &mut sqlx::AnyConnection) {
+    for statement in [
+        "DROP TABLE manifest_chunks",
+        "DROP TABLE manifest_index",
+        "DROP INDEX nodes_trash",
+        "ALTER TABLE nodes DROP COLUMN deleted_ms",
+        "ALTER TABLE nodes DROP COLUMN purge_requested_ms",
+        "DELETE FROM schema_version WHERE version >= 13",
+    ] {
+        sqlx::query(statement).execute(&mut *conn).await.unwrap();
+    }
+}
+
+/// Puts the database back to the state before the trash migration: no columns, no index, one version fewer.
+async fn undo_the_trash_migration(url: &str) {
+    let mut conn = raw(url).await;
+    drop_trash_and_manifest_index(&mut conn).await;
 }
 
 fn wall_clock_ms() -> i64 {
@@ -3835,6 +3857,7 @@ async fn the_trash_migration_on_postgres() {
 async fn back_to_0007(url: &str) {
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    drop_history_trash_and_manifest_index(&mut conn).await;
     // The audit log (migration 0009) and two-factor sign-in (migration 0010) go first: they run again with 0008 on the next open.
     sqlx::query("DROP TABLE web_sessions").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE audit_events").execute(&mut conn).await.unwrap();
@@ -4644,6 +4667,7 @@ async fn a_write_prunes_old_events_after_its_commit() {
 async fn back_to_0008(url: &str) {
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    drop_history_trash_and_manifest_index(&mut conn).await;
     sqlx::query("DROP TABLE web_sessions").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE audit_events").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE login_challenges").execute(&mut conn).await.unwrap();
@@ -6240,6 +6264,7 @@ async fn a_web_actor_changes_accounts_until_its_session_ends(meta: &Meta) {
 async fn back_to_0010(url: &str) {
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    drop_history_trash_and_manifest_index(&mut conn).await;
     sqlx::query("DROP TABLE web_sessions").execute(&mut conn).await.unwrap();
     sqlx::query("DELETE FROM schema_version WHERE version >= 11").execute(&mut conn).await.unwrap();
 }
@@ -6697,7 +6722,7 @@ async fn the_index_migration_leaves_old_manifests_unindexed_on(url: &str) {
     let _ = ana;
     {
         let mut conn = raw(url).await;
-        for statement in ["DROP TABLE manifest_chunks", "DROP TABLE manifest_index", "DELETE FROM schema_version WHERE version >= 9"] {
+        for statement in ["DROP TABLE manifest_chunks", "DROP TABLE manifest_index", "DELETE FROM schema_version WHERE version >= 14"] {
             sqlx::query(statement).execute(&mut conn).await.unwrap();
         }
     }
@@ -6707,7 +6732,7 @@ async fn the_index_migration_leaves_old_manifests_unindexed_on(url: &str) {
     assert_eq!((audit.manifests, audit.complete, audit.absent, audit.building), (1, 0, 1, 0));
     let mut conn = raw(url).await;
     let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(latest, 9);
+    assert_eq!(latest, 14);
 }
 
 /// What the database alone can say is wrong, in seeded damage: orphan edges, an index row without its manifest, an edge
