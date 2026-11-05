@@ -8,8 +8,8 @@
 use std::path::Path;
 
 use craft_cloud_app::{
-    DeviceId, DeviceInfo, Error, HistoryResponse, JoinRequest, NodeId, PairingInfo, PairingState, PairingStatus, RestoreResponse, RunState,
-    Status, TrashResponse, TrashRestoreResponse, Uuid, UserQuery, VersionId, codes,
+    DeviceId, DeviceInfo, Error, HistoryResponse, JoinRequest, NodeId, PairingInfo, PairingState, PairingStatus, RestoreResponse, RunState, Status,
+    TrashResponse, TrashRestoreResponse, UserQuery, Uuid, VersionId, codes,
 };
 use craft_cloud_proto::api::AdminConfirm;
 use craft_cloud_proto::api::codes as api_codes;

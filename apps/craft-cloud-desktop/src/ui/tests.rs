@@ -939,4 +939,3 @@ fn audit_buttons_send_their_events() {
     h.run_steps(2);
     assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Audit(AuditMsg::CloseActivity)]);
 }
-

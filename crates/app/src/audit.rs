@@ -41,7 +41,8 @@ impl AuditQuery {
     /// What is wrong with the query, before anything is sent: an action that is not in the closed list, a time before 1970, a
     /// limit outside 1 to 200.
     pub fn check(&self) -> Result<(), Error> {
-        let bad = |message: &str| Error::Refused { code: craft_cloud_api::api::codes::INVALID.to_owned(), message: message.to_owned(), name_taken: None };
+        let bad =
+            |message: &str| Error::Refused { code: craft_cloud_api::api::codes::INVALID.to_owned(), message: message.to_owned(), name_taken: None };
         if self.action.as_deref().is_some_and(|a| !valid_audit_action(a)) {
             return Err(bad("action is an event name like auth.login, or a prefix like auth."));
         }

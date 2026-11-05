@@ -26,8 +26,8 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::{
-    DeviceInfo, HistoryResponse, PairingStatus, RecoveryCodes, RestoreResponse, RevokedOthers, TwoFactorChallenge,
-    TwoFactorSetupResponse, TwoFactorStatus, codes as api_codes,
+    DeviceInfo, HistoryResponse, PairingStatus, RecoveryCodes, RestoreResponse, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse,
+    TwoFactorStatus, codes as api_codes,
 };
 use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
 use craft_cloud_proto::local::{
@@ -468,14 +468,7 @@ fn history_error(error: crate::http::HistoryCallError) -> LocalError {
                 .conflicts
                 .as_ref()
                 .map(|conflicts| conflicts.iter().any(|conflict| matches!(conflict.kind, craft_cloud_proto::ConflictKind::NameTaken { .. })));
-            LocalError {
-                status,
-                code: body.error,
-                message: body.message,
-                name_taken,
-                two_factor: None,
-                retry_after_secs: None,
-            }
+            LocalError { status, code: body.error, message: body.message, name_taken, two_factor: None, retry_after_secs: None }
         }
         crate::http::HistoryCallError::Transport(craft_cloud_sync::TransportError::NotFound) => {
             LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such file or version")
