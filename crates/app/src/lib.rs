@@ -465,12 +465,11 @@ fn refusal(answer: http::Answer) -> Result<http::Answer, Error> {
                 // The wait is in the answer's JSON; the `Retry-After` header is the same wait, used when the JSON lacks it.
                 let retry_after_secs = extras.retry_after_secs.or(answer.retry_after_secs);
                 if extras.two_factor.is_none() && retry_after_secs.is_none() {
-                    Err(Error::Refused { code: body.error, message: body.message, name_taken: None })
+                    Err(Error::Refused { code: body.error, message: body.message, name_taken: body.name_taken })
                 } else {
                     Err(Error::RefusedWith { code: body.error, message: body.message, two_factor: extras.two_factor, retry_after_secs })
                 }
             }
-            Ok(body) => Err(Error::Refused { code: body.error, message: body.message, name_taken: body.name_taken }),
             Err(_) => Err(Error::Protocol(format!("HTTP {}", answer.status))),
         }
     }

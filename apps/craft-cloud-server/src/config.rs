@@ -358,6 +358,7 @@ impl Config {
             if !(low..=high).contains(&value) {
                 return Err(ConfigError::WebAdminRange(name, value, low, high));
             }
+        }
         if !(MIN_TRASH_DAYS..=MAX_TRASH_DAYS).contains(&config.retention.trash_days) {
             return Err(ConfigError::TrashDays(config.retention.trash_days));
         }
@@ -549,6 +550,9 @@ path = "/tmp/blobs"
             assert!(matches!(Config::parse(&format!("{DISK}\n[web_admin]\n{section}\n")), Err(ConfigError::WebAdminRange(..))), "{section}");
         }
         assert!(matches!(Config::parse(&format!("{DISK}\n[web_admin]\ncookie = 1\n")), Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
     fn the_trash_period_has_a_default_and_bounds() {
         assert_eq!(Config::parse(DISK).unwrap().retention, RetentionConfig { trash_days: 30 });
         // A table has to come after the top-level keys, so the section goes at the end.
