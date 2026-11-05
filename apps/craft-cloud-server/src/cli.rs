@@ -87,6 +87,29 @@ pub enum Command {
         #[command(subcommand)]
         action: AuditCommand,
     },
+    /// Check the database and the blob store against each other and report: the reference index of every manifest, the
+    /// manifests and chunks the database names against the objects in the store, and what names what. Changes nothing;
+    /// exits with an error when it finds a problem. Reads every chunk object (`--skip-chunk-reads` leaves that out).
+    Verify {
+        /// Path to config.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Check chunks against the database only; do not read their objects from the store.
+        #[arg(long)]
+        skip_chunk_reads: bool,
+    },
+    /// Inventory the store and report possible collection candidates without changing anything.
+    Gc {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Clean up the admin pages' browser sessions.
     WebSessions {
         /// Path to config.toml. May come before or after the action.
@@ -102,6 +125,14 @@ pub enum Command {
         config: Option<PathBuf>,
         #[command(subcommand)]
         action: TwoFactorAction,
+    },
+    /// The reference index of what each manifest names.
+    Index {
+        /// Path to config.toml. May come before or after the action.
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: IndexAction,
     },
     /// Manage live documents.
     Live {
@@ -164,6 +195,18 @@ pub enum TwoFactorAction {
     /// the database with the new `key_file` and `key_file_old` first (a running server holds the keys it started with), and
     /// remove `key_file_old` only after this reports that every secret is under the current key.
     Rekey,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IndexAction {
+    /// Complete the index of every manifest whose index is not complete: reads each manifest from the store, checks it
+    /// against its ID, and writes its edges in batches. Writes only that derived index. Safe to stop and run again, and to
+    /// run beside the server.
+    Build {
+        /// Edges written per database transaction (default 5000).
+        #[arg(long)]
+        batch_rows: Option<usize>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -234,8 +277,13 @@ pub enum CliError {
     Meta(#[from] craft_cloud_meta::MetaError),
     #[error(transparent)]
     Store(#[from] craft_cloud_store::StoreError),
+    #[error(transparent)]
+    Gc(#[from] crate::gc::GcError),
     #[error("{0}")]
     Usage(String),
+    /// A check found something wrong (its report was written first).
+    #[error("{0}")]
+    Inconsistent(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -250,6 +298,23 @@ pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
     let store = match (&config.storage, config.storage.s3()?) {
         (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
         (StorageConfig::Disk { path }, None) => Store::new(DiskBackend::new(path)?),
+        (StorageConfig::S3 { .. }, None) => return Err(CliError::Usage("S3 storage without settings".into())),
+    };
+    Ok((meta, store))
+}
+
+/// Like [`open`], for a command that only reads: the database and the storage must exist already, and nothing is
+/// created or upgraded. A config that points at the wrong place is an error, not a new empty server that has no problems.
+pub async fn open_existing(config: &Config) -> Result<(Meta, Store), CliError> {
+    let meta = Meta::open_existing(&config.database.url).await?;
+    let store = match (&config.storage, config.storage.s3()?) {
+        (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
+        (StorageConfig::Disk { path }, None) => {
+            if !path.is_dir() {
+                return Err(CliError::Usage(format!("the storage directory {} does not exist (is the config's path right?)", path.display())));
+            }
+            Store::new(DiskBackend::new(path)?)
+        }
         (StorageConfig::S3 { .. }, None) => return Err(CliError::Usage("S3 storage without settings".into())),
     };
     Ok((meta, store))
@@ -400,6 +465,49 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                 )?;
             }
             Ok(())
+        }
+        Command::Verify { config, json, skip_chunk_reads } => {
+            let (meta, store) = open_existing(&Config::load(&config_path(config)?)?).await?;
+            let report = crate::verify::verify(&meta, &store, crate::verify::VerifyOptions { read_chunks: !skip_chunk_reads }).await?;
+            if json {
+                writeln!(out, "{}", report.to_json())?;
+            } else {
+                write!(out, "{}", report.to_text())?;
+            }
+            match report.problem_count() {
+                0 => Ok(()),
+                n => Err(CliError::Inconsistent(format!("verify found {n} problem(s)"))),
+            }
+        }
+        Command::Gc { dry_run: false, .. } => Err(CliError::Usage("deleting is not implemented yet; run with --dry-run".into())),
+        Command::Gc { config, dry_run: true, json } => {
+            let config = Config::load(&config_path(config)?)?;
+            let (meta, store) = open_existing(&config).await?;
+            let report = crate::gc::dry_run(&meta, &store).await?;
+            if json {
+                writeln!(out, "{}", report.to_json())?;
+            } else {
+                write!(out, "{}", report.to_text())?;
+            }
+            if report.has_problems() { Err(CliError::Inconsistent("gc dry-run found problems".into())) } else { Ok(()) }
+        }
+        Command::Index { config, action: IndexAction::Build { batch_rows } } => {
+            let (meta, store) = open(&Config::load(&config_path(config)?)?).await?;
+            let meta = match batch_rows {
+                Some(0) => return Err(CliError::Usage("--batch-rows must be at least 1".into())),
+                Some(rows) => meta.with_index_batch_rows(rows),
+                None => meta,
+            };
+            let report = crate::verify::build_index(&meta, &store).await?;
+            writeln!(out, "indexed {} manifest(s)", report.indexed)?;
+            for (id, why) in &report.unreadable {
+                writeln!(out, "could not index manifest {id}: {why}")?;
+            }
+            if report.unreadable.is_empty() {
+                Ok(())
+            } else {
+                Err(CliError::Inconsistent(format!("{} manifest(s) could not be indexed", report.unreadable.len())))
+            }
         }
         Command::Live { config, action: LiveAction::ResetDoc { username, app } } => {
             let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;

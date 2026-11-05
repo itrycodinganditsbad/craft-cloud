@@ -19,6 +19,7 @@ const SQLITE: &[&str] = &[
     include_str!("../migrations/sqlite/0011_web_sessions.sql"),
     include_str!("../migrations/sqlite/0012_versions_node_seq.sql"),
     include_str!("../migrations/sqlite/0013_trash.sql"),
+    include_str!("../migrations/sqlite/0014_manifest_index.sql"),
 ];
 const POSTGRES: &[&str] = &[
     include_str!("../migrations/postgres/0001_init.sql"),
@@ -34,11 +35,43 @@ const POSTGRES: &[&str] = &[
     include_str!("../migrations/postgres/0011_web_sessions.sql"),
     include_str!("../migrations/postgres/0012_versions_node_seq.sql"),
     include_str!("../migrations/postgres/0013_trash.sql"),
+    include_str!("../migrations/postgres/0014_manifest_index.sql"),
 ];
 
 /// Arbitrary fixed key for the Postgres advisory lock that serialises migrations between servers sharing one
 /// database. Every server must use the same key; no other code takes this lock.
 const MIGRATION_LOCK_KEY: i64 = 7240318150661;
+
+/// Checks that the database has the current schema, and changes nothing: for a database that must exist already
+/// ([`Meta::open_existing`](crate::Meta::open_existing)).
+pub(crate) async fn check_current(pool: &AnyPool, dialect: Dialect) -> Result<(), MetaError> {
+    let migrations = match dialect {
+        Dialect::Sqlite => SQLITE,
+        Dialect::Postgres => POSTGRES,
+    };
+    let known = i64::try_from(migrations.len()).map_err(|_| MetaError::Invalid("too many migrations"))?;
+    let table = match dialect {
+        Dialect::Sqlite => "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
+        Dialect::Postgres => {
+            "SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'schema_version'"
+        }
+    };
+    let tables: i64 = sqlx::query(table).fetch_one(pool).await?.try_get("n")?;
+    if tables == 0 {
+        return Err(MetaError::Missing("the database holds no Craft Cloud data (is the database path right?)"));
+    }
+    let current: i64 = sqlx::query("SELECT COALESCE(MAX(version), 0) AS v FROM schema_version").fetch_one(pool).await?.try_get("v")?;
+    if current == 0 {
+        return Err(MetaError::Missing("the database holds no Craft Cloud data (is the database path right?)"));
+    }
+    if current > known {
+        return Err(MetaError::Corrupt("the database was created by a newer Craft Cloud"));
+    }
+    if current < known {
+        return Err(MetaError::Missing("the database schema is older than this program; start the server once (`serve`) to upgrade it"));
+    }
+    Ok(())
+}
 
 pub(crate) async fn migrate(pool: &AnyPool, dialect: Dialect) -> Result<(), MetaError> {
     // One connection for the whole run. The Postgres advisory lock belongs to this session, so the lock,

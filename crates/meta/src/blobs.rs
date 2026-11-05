@@ -11,10 +11,10 @@ use craft_cloud_proto::{BlobKind, ChunkId, Manifest, ManifestId, SpaceId};
 use sqlx::Row;
 
 use crate::codec::{hash_from, to_i64, to_u64, uuid_bytes};
-use crate::{Meta, MetaError};
+use crate::{Dialect, Meta, MetaError};
 
 /// How a blob's kind is stored in the `kind` columns.
-trait KindCode {
+pub(crate) trait KindCode {
     fn code(self) -> i16;
 }
 
@@ -41,7 +41,7 @@ async fn space_has(tx: &mut sqlx::AnyConnection, space: SpaceId, kind: BlobKind,
 const BATCH: usize = 500;
 
 /// `$first, $first+1, …` for `count` placeholders.
-fn placeholders(first: usize, count: usize) -> String {
+pub(crate) fn placeholders(first: usize, count: usize) -> String {
     (first..first + count).map(|n| format!("${n}")).collect::<Vec<_>>().join(", ")
 }
 
@@ -261,6 +261,9 @@ impl Meta {
         let id = manifest.id();
         let blob = Blob { kind: BlobKind::Manifest, id: id.as_bytes(), stored_size: to_i64(stored_size)?, file_size: Some(to_i64(manifest.size())?) };
         record(&mut w.tx, space, blob, now_ms, self.stored_cap).await?;
+        // The index of the manifest's chunks is kept in the same transaction (see `index`): an accepted manifest is never
+        // without an index row.
+        crate::index::register(&mut w.tx, self.dialect == Dialect::Postgres, manifest, self.index_rows).await?;
         w.commit().await
     }
 

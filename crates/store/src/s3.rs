@@ -3,9 +3,10 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::TryStreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path;
-use object_store::{ObjectStoreExt, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 use crate::{Backend, StoreError};
 
@@ -67,6 +68,29 @@ fn backend_error(e: object_store::Error) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
+/// The path of a listed key relative to the configured prefix, or `None` when the key is outside the
+/// listing prefix (`boundary`, which ends in `/`) or outside the backend's root (`root_boundary`).
+fn relative_path(full: &str, boundary: &str, root_boundary: &str) -> Option<String> {
+    if !full.starts_with(boundary) {
+        return None;
+    }
+    full.strip_prefix(root_boundary).map(str::to_owned)
+}
+
+/// `object_store` parses every listed key as a `Path`, and one key it cannot represent (an empty segment,
+/// as in `chunks//a`) fails the whole ListObjectsV2 response page it arrived in and ends the stream. Such a
+/// key cannot be reported as foreign from here, and the objects of that page are not visible either, so the
+/// listing stops with an error that says why. A key with a trailing slash (`chunks/a/`) is not an error:
+/// `object_store` strips the slash and the object appears as `chunks/a`.
+fn list_error(error: object_store::Error) -> StoreError {
+    match error {
+        object_store::Error::InvalidPath { source } => {
+            StoreError::Backend(format!("S3 listing contains a key that object_store cannot represent, so the listing cannot continue: {source}"))
+        }
+        other => backend_error(other),
+    }
+}
+
 #[async_trait]
 impl Backend for S3Backend {
     fn kind(&self) -> &'static str {
@@ -79,8 +103,30 @@ impl Backend for S3Backend {
     }
 
     async fn get_raw(&self, path: &str) -> Result<Option<Bytes>, StoreError> {
+        self.get_raw_limited(path, usize::MAX).await
+    }
+
+    async fn get_raw_limited(&self, path: &str, max_bytes: usize) -> Result<Option<Bytes>, StoreError> {
         match self.store.get(&self.object_path(path)).await {
-            Ok(result) => Ok(Some(result.bytes().await.map_err(backend_error)?)),
+            Ok(result) => {
+                let limit = max_bytes.saturating_add(1);
+                let mut body = result.into_stream();
+                let mut bytes = Vec::with_capacity(limit.min(1024 * 1024));
+                while bytes.len() < limit {
+                    let Some(part) = body.try_next().await.map_err(backend_error)? else { break };
+                    let take = part.len().min(limit.saturating_sub(bytes.len()));
+                    bytes.extend_from_slice(&part[..take]);
+                }
+                Ok(Some(Bytes::from(bytes)))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(backend_error(e)),
+        }
+    }
+
+    async fn size_raw(&self, path: &str) -> Result<Option<u64>, StoreError> {
+        match self.store.head(&self.object_path(path)).await {
+            Ok(meta) => Ok(Some(meta.size)),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(backend_error(e)),
         }
@@ -92,11 +138,90 @@ impl Backend for S3Backend {
             Err(e) => Err(backend_error(e)),
         }
     }
+
+    async fn list_raw(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<String>, StoreError> {
+        let object_prefix = self.object_path(prefix);
+        let normalized_prefix = object_prefix.as_ref().to_owned();
+        let boundary = if normalized_prefix.is_empty() { String::new() } else { format!("{normalized_prefix}/") };
+        let normalized_root = if self.prefix.is_empty() { String::new() } else { Path::from(self.prefix.as_str()).as_ref().to_owned() };
+        let root_boundary = if normalized_root.is_empty() { String::new() } else { format!("{normalized_root}/") };
+        let offset = after
+            .map(|path| {
+                let full_path = if normalized_root.is_empty() { path.to_owned() } else { format!("{normalized_root}/{path}") };
+                Path::parse(full_path).map_err(|error| StoreError::Backend(error.to_string()))
+            })
+            .transpose()?;
+        let mut stream = if let Some(offset) = &offset {
+            self.store.list_with_offset(Some(&object_prefix), offset)
+        } else {
+            self.store.list(Some(&object_prefix))
+        };
+        // ListObjectsV2 returns keys in ascending UTF-8 binary order, which is the order `list_raw` promises.
+        // The stream is read only until `limit` results are collected, then dropped, so a page costs at most
+        // the S3 requests that cover `limit` keys. A key that is not strictly greater than the one before it
+        // (a service that lists out of order, such as S3 Express directory buckets) is an error: with an
+        // unsorted listing a bounded page cannot be correct, and draining the namespace is not an option.
+        let mut paths: Vec<String> = Vec::new();
+        while paths.len() < limit {
+            let meta = match stream.try_next().await {
+                Ok(Some(meta)) => meta,
+                Ok(None) => break,
+                Err(error) => return Err(list_error(error)),
+            };
+            let Some(relative) = relative_path(meta.location.as_ref(), &boundary, &root_boundary) else {
+                continue;
+            };
+            if after.is_some_and(|cursor| relative.as_str() <= cursor) {
+                continue;
+            }
+            if paths.last().is_some_and(|previous| relative.as_str() <= previous.as_str()) {
+                return Err(StoreError::Backend("S3 listing is not in ascending key order".into()));
+            }
+            paths.push(relative);
+        }
+        Ok(paths)
+    }
 }
 
 #[cfg(test)]
 mod debug_tests {
-    use super::S3Config;
+    use super::{S3Backend, S3Config, list_error, relative_path};
+    use crate::StoreError;
+
+    #[test]
+    fn relative_path_keeps_the_prefix_boundary_exact() {
+        assert_eq!(relative_path("root/chunks/ab", "root/chunks/", "root/").as_deref(), Some("chunks/ab"));
+        assert_eq!(relative_path("root/chunksx/ab", "root/chunks/", "root/"), None);
+        assert_eq!(relative_path("chunks/ab", "chunks/", "").as_deref(), Some("chunks/ab"));
+        assert_eq!(relative_path("other/chunks/ab", "root/chunks/", "root/"), None);
+    }
+
+    #[test]
+    fn keys_object_store_cannot_parse_give_a_specific_error() {
+        let source = object_store::path::Path::parse("chunks//a").unwrap_err();
+        let message = match list_error(object_store::Error::InvalidPath { source }) {
+            StoreError::Backend(message) => message,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(message.contains("cannot represent"), "{message}");
+        // A trailing slash is normalised away by object_store, before this crate sees the key.
+        assert_eq!(object_store::path::Path::parse("chunks/a/").unwrap().as_ref(), "chunks/a");
+    }
+
+    #[test]
+    fn object_prefix_uses_object_store_path_normalization() {
+        let config = S3Config {
+            bucket: "b".into(),
+            prefix: "a//b%bar".into(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+            allow_http: false,
+        };
+        let backend = S3Backend::new(&config).unwrap();
+        assert_eq!(backend.object_path("chunks").as_ref(), "a/b%25bar/chunks");
+    }
 
     #[test]
     fn debug_output_hides_the_secret_key() {

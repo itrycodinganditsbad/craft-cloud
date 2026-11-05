@@ -278,8 +278,9 @@ who can write to the database can change it; keep the database file and Postgres
 ## Upgrading
 
 This release adds migrations (`0007`, device sessions, `0008`, the admin API: reset codes, per-account quotas, the
-removal mark, `0009`, the audit log, `0010`, two-factor sign-in: the secrets, recovery codes and sign-in challenges, and
-`0011`, the admin pages' browser sessions). The server applies them when it starts. A database it
+removal mark, `0009`, the audit log, `0010`, two-factor sign-in: the secrets, recovery codes and sign-in challenges,
+`0011`, the admin pages' browser sessions, `0012`, the history index, `0013`, the trash, and `0014`, the manifest reference
+index). The server applies them when it starts. A database it
 has migrated cannot be opened by an older server: that one refuses to start ("the database was created by a newer Craft
 Cloud"). Rolling back therefore means restoring a backup taken before the upgrade, so take one first. Upgrade the
 server first: agents and apps keep working unchanged, **except that an account that turns on two-factor sign-in can't sign in
@@ -316,6 +317,33 @@ A file brought back gets a new version with its old content, so another computer
 
 The change adds two columns and an index to the metadata (migration 0013). An older server refuses the
 upgraded database and rejects the `[retention]` section, so take a backup before upgrading and do not roll back.
+
+## Checking the storage
+
+`craft-cloud-server verify --config cc-data/config.toml` checks the database and the blob storage against each other
+and prints what it finds; `--json` prints a machine-readable report and `--skip-chunk-reads` skips reading every chunk
+object (which hashes it, and takes as long as reading all your data). It changes nothing and exits with an error if
+it found a problem. It opens a SQLite database read-only: the database file and its WAL keep their bytes, also after a
+crash that left committed data in the WAL, which it reads. Opening may leave an empty `-wal` and a `-shm` file behind
+(SQLite's rebuilt index of the WAL, not data). The report also says how many manifests have a complete reference index, which is what a later
+cleanup would need before it could free anything. After upgrading, run `craft-cloud-server index build --config
+cc-data/config.toml` once: it indexes the manifests stored before the index existed, writing only that index, in small
+steps, and it can be stopped and run again. Nothing in the server frees storage yet.
+
+The change adds two tables to the metadata (migration 0014). An older server refuses the upgraded database,
+so take a backup before upgrading and do not roll back.
+
+`craft-cloud-server gc --dry-run --config cc-data/config.toml` inventories stored chunks and manifests, compares them with
+the database and prints a preview; `--json` prints schema version 1. It changes no data, on SQLite or on PostgreSQL.
+Like `verify`, it opens a SQLite database that exists already and creates nothing; opening a WAL-mode database may leave
+an empty `-wal` file and a `-shm` file behind (SQLite's rebuilt index of the WAL, not data), and the database file and
+the WAL's contents stay as they were, also after a crash that left data in the WAL. Store objects with no `blobs` row are orphan candidates, but need two runs apart to establish a future
+first-sight grace period. Recorded chunks no complete indexed manifest names are candidates only when every manifest index
+is complete and database checks pass. They come from one read-only database snapshot; the store listing is a separate,
+time-point diagnostic. A future collector must recheck roots before claiming a chunk. Current versions, saved versions,
+trash items, live snapshots and import snapshots protect their chunks. Unrooted manifests are protected because they may be live document assets. Without
+`--dry-run`, the command refuses: deleting is not implemented yet. Listing errors fail the command; they do not mean the
+store is empty. Nothing is deleted.
 
 ## Restoring a backup
 

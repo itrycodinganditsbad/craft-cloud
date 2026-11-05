@@ -1384,6 +1384,7 @@ dependencies = [
  "blake3",
  "bytes",
  "craft-cloud-proto",
+ "futures-util",
  "object_store",
  "tempfile",
  "thiserror 2.0.21",

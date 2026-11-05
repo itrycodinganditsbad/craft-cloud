@@ -10,6 +10,7 @@ pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod gc;
 pub mod join;
 pub mod live;
 pub mod notify;
@@ -19,6 +20,7 @@ pub mod state;
 pub mod totp;
 pub mod two_factor;
 pub mod web;
+pub mod verify;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

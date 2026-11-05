@@ -1025,6 +1025,58 @@ one, a folder restored in the short window after a delete whose answer was lost 
 is empty and can be restored again), so update agents with or soon after the server. Restoring a *version* of a deleted file is still refused: bring the file back
 from the trash first.
 
+**Reference index and `verify`.** The chunks a manifest names live in its object in the store. `manifest_chunks`
+(manifest, ordinal, chunk) is a copy of that list in the database, and `manifest_index` records per manifest how many
+chunks it names, how many edges are written (ordinals 0 up to that number, never a gap) and whether the list was
+compared with the manifest (state 1) or is still being built (state 0). A manifest with no row is not indexed. The index
+is derived data and is never the authority; it exists so the database can answer "which chunks does this manifest need" and
+"which manifests use this chunk". It is written in the transaction that records a manifest (`add_manifest`), up to a budget
+of 5,000 edges per transaction; a longer manifest (up to about a million chunks) is left being built, and the upload
+handler finishes it in batches of at most that many edges before it answers, so no write lock is held for a long list.
+`craft-cloud-server index build` indexes manifests recorded before the index existed (and any left unfinished), reading
+each from the store and checking it against its ID first; it resumes where it stopped and may run beside the server.
+A manifest is marked complete only after every edge was compared, ordinal by ordinal, with the manifest it was made from:
+equal counts are not enough, and repeated chunks, wrong IDs, swapped order, missing and extra edges are all found. An
+index that does not match its manifest while it is still being built is thrown away and written again; a complete index
+that is wrong is only reported. Throwing the edges away is itself done in batches of the same size (a marker on the index row says it is under way, so an interrupted run resumes), never in one transaction; an edge at a negative ordinal is a mismatch like any other. Nothing in this slice frees anything: no deletion, no claims, no collection, no retention.
+
+`craft-cloud-server verify [--json] [--skip-chunk-reads]` reads and reports and changes nothing: the database and the
+storage directory must exist already (a wrong path is an error, not a new empty server with "no problems found"), and a
+database whose schema is older than the program is refused, not upgraded (start the server once to upgrade it). A SQLite database is opened read-only (`Meta::open_existing`, `mode=ro`): the database file and the WAL keep their bytes, also when a crashed process left committed data in the WAL, which the command reads; it may leave an empty `-wal` and a `-shm` file (the rebuilt index of the WAL, not data). It lists
+problems (which make it exit with an error): a manifest
+object that is missing, damaged or not a manifest; a complete index that does not equal its manifest; edges whose manifest
+has no index row; an index row without a recorded manifest; an edge or a manifest that names a chunk that is not recorded;
+a chunk object that is missing or damaged; a size the database records that is not what the object has (the stored length of a chunk or manifest object, a chunk length the manifest names against the length recorded for that chunk, the file size recorded for a manifest); a version, snapshot or import snapshot that names a manifest that is not
+recorded; blob memberships without a blob. It also gives notices (which do not): manifests whose index is not complete,
+manifests no version or snapshot names, and chunks no complete manifest names. **The manifests no version or snapshot
+names are not garbage.** A live document's binary assets (images and the like, uploaded through the agent's blob
+interface as a manifest of their own) are named only by the document's state, which the server stores as opaque bytes, so
+the database holds no reference to them. Until that gap is closed (the owner decides how assets are rooted), anything that
+frees storage has to treat these manifests, and the chunks they name, as in use.
+
+**GC inventory and dry run.** `craft-cloud-server gc --dry-run [--json] --config <path>` lists each store namespace in
+pages of at most 1,000 objects and checks each page against `blobs` in one batched query. It reports recorded objects,
+orphans (store objects without a `blobs` row), and foreign keys (invalid names for that namespace). Listing errors name
+the namespace and page; they are errors, never an empty inventory. Orphans are only candidates after a first-sight grace
+period, which cannot be measured without recording state; a future collector would need two runs apart. Their size comes
+from a metadata-only stored-size read because `Store::list` does not include sizes.
+
+Recorded chunks no complete-indexed manifest names are candidates only when all indexes are complete and database checks
+report no problems. `Meta::index_audit` reads chunk rows, index states and roots under one read snapshot (Postgres uses
+`REPEATABLE READ READ ONLY`); the store listing is a separate time-point diagnostic. These content-addressed objects
+are immutable. A future collector must recheck roots before claiming because a reference can be added after this
+snapshot. Summary equality across separate audits is not a concurrency guarantee: compensating writes can preserve
+counts and examples. Incomplete indexes protect unknown dependencies. Existing reference roots are versions
+(including saved versions and trash history), live snapshots and import snapshots, as queried by `Meta::index_audit` in
+`crates/meta/src/index.rs`; this command adds no root kinds. Manifests with no version or snapshot root are never
+candidates: they are `protected: may be a live document's asset`. Chunk roots that a complete index reports as used stay
+protected. A dry run writes no rows, claims, inventory, generation, run record, store object or config. It prints
+`nothing was changed`. On SQLite the command follows the rule of `verify`: it opens the existing database, may leave an
+empty `-wal` and a `-shm` file (the WAL's rebuilt shared-memory index, not data), and changes neither the database file
+nor the WAL's bytes, which its tests compare, with a crashed process's non-empty WAL too. On PostgreSQL the tests compare a
+fingerprint of every table and the sequences. Both compare the whole store tree. Grace-period measurement, claims and
+deletion belong to a later owner-approved slice.
+
 **Client contract** (what the sync agent relies on):
 
 - Probe `GET /api/info` and refuse to sync when the protocol ranges don't overlap.
