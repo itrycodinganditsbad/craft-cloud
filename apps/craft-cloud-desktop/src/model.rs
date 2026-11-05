@@ -7,7 +7,9 @@
 
 use std::path::Path;
 
-use craft_cloud_app::{DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingState, PairingStatus, RunState, Status, Uuid, codes};
+use craft_cloud_app::{
+    AccountUsage, DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingState, PairingStatus, RunState, Status, Uuid, codes,
+};
 use craft_cloud_proto::api::codes as api_codes;
 use craft_cloud_proto::join::JoinString;
 
@@ -136,6 +138,9 @@ pub struct Overview {
     /// The account's computers, once asked.
     pub devices: Option<Vec<DeviceInfo>>,
     pub devices_error: Option<String>,
+    pub usage: Option<AccountUsage>,
+    pub usage_loading: bool,
+    pub usage_error: Option<String>,
     /// The computer being removed.
     pub removing: Option<DeviceId>,
     /// What went wrong with the last action (sign out, pause), for people.
@@ -146,7 +151,17 @@ pub struct Overview {
 
 impl Overview {
     fn new(status: Status) -> Self {
-        Self { status, devices: None, devices_error: None, removing: None, error: None, offer_local_sign_out: false }
+        Self {
+            status,
+            devices: None,
+            devices_error: None,
+            usage: None,
+            usage_loading: true,
+            usage_error: None,
+            removing: None,
+            error: None,
+            offer_local_sign_out: false,
+        }
     }
 }
 
@@ -201,6 +216,10 @@ pub enum Event {
     PairingMade(Result<PairingInfo, Error>),
     PairingPolled(Result<PairingStatus, Error>),
     Devices(Result<Vec<DeviceInfo>, Error>),
+    Usage {
+        request_id: u64,
+        result: Result<AccountUsage, Error>,
+    },
     SignedOut(Result<Status, Error>),
     /// [`Effect::Pause`]'s or [`Effect::Resume`]'s answer.
     Answered(Result<Status, Error>),
@@ -222,6 +241,7 @@ pub enum Event {
     RemoveDevice(DeviceId),
     /// Ask for the computer list again.
     RefreshDevices,
+    RefreshUsage,
     SignOut,
     /// Sign out on this computer only (the server can't be reached).
     SignOutHere,
@@ -262,6 +282,7 @@ pub enum Effect {
     PairingState(Uuid),
     CancelPairing(Uuid),
     Devices,
+    Usage(u64),
     RemoveDevice(DeviceId),
     Logout {
         local: bool,
@@ -319,6 +340,7 @@ pub struct Model {
     failed_polls: u32,
     /// The app's start-at-login entry as last asked for.
     app_autostart: Option<bool>,
+    usage_request_id: u64,
 }
 
 impl Model {
@@ -339,6 +361,7 @@ impl Model {
             polling_pairing: false,
             failed_polls: 0,
             app_autostart: None,
+            usage_request_id: 0,
         }
     }
 
@@ -349,6 +372,11 @@ impl Model {
             Screen::AddingComputer(adding) => Some(&adding.overview),
             _ => None,
         }
+    }
+
+    fn next_usage_request(&mut self) -> Effect {
+        self.usage_request_id = self.usage_request_id.wrapping_add(1);
+        Effect::Usage(self.usage_request_id)
     }
 
     fn overview_mut(&mut self) -> Option<&mut Overview> {
@@ -432,6 +460,22 @@ impl Model {
                 }
                 Vec::new()
             }
+            Event::Usage { request_id, result } => {
+                if request_id != self.usage_request_id {
+                    return Vec::new();
+                }
+                if let Some(overview) = self.overview_mut() {
+                    overview.usage_loading = false;
+                    match result {
+                        Ok(usage) => {
+                            overview.usage = Some(usage);
+                            overview.usage_error = None;
+                        }
+                        Err(e) => overview.usage_error = Some(message(&e)),
+                    }
+                }
+                Vec::new()
+            }
             Event::SignedOut(result) => self.signed_out(result),
             Event::Answered(result) => {
                 self.busy = self.busy.filter(|b| *b != Busy::Pausing);
@@ -495,6 +539,15 @@ impl Model {
                 vec![Effect::RemoveDevice(id)]
             }
             Event::RefreshDevices => self.overview().map(|_| Effect::Devices).into_iter().collect(),
+            Event::RefreshUsage => {
+                let Some(overview) = self.overview_mut() else { return Vec::new() };
+                if overview.usage_loading {
+                    return Vec::new();
+                }
+                overview.usage_loading = true;
+                overview.usage_error = None;
+                vec![self.next_usage_request()]
+            }
             Event::SignOut => self.sign_out(false),
             Event::SignOutHere => self.sign_out(true),
             Event::Pause | Event::Resume => {
@@ -587,6 +640,12 @@ impl Model {
 
     /// A status from the agent: the screen follows it, and the app's start-at-login entry follows the agent's.
     fn status_came(&mut self, status: Status) -> Vec<Effect> {
+        let account_changed =
+            self.overview().is_some_and(|overview| overview.status.account != status.account || overview.status.server != status.server);
+        if !status.signed_in {
+            self.usage_request_id = self.usage_request_id.wrapping_add(1);
+        }
+        let new_usage_request = (status.signed_in && account_changed).then(|| self.next_usage_request());
         let mut effects = Vec::new();
         self.status = Some(status.clone());
         if let Some(wanted) = app_autostart_wanted(&status, self.login_entry)
@@ -601,14 +660,32 @@ impl Model {
         }
         if status.signed_in {
             match &mut self.screen {
-                Screen::SignedIn(overview) => overview.status = status,
-                Screen::AddingComputer(adding) => adding.overview.status = status,
+                Screen::SignedIn(overview) => {
+                    overview.status = status;
+                    if account_changed {
+                        overview.usage = None;
+                        overview.usage_loading = true;
+                        overview.usage_error = None;
+                    }
+                }
+                Screen::AddingComputer(adding) => {
+                    adding.overview.status = status;
+                    if account_changed {
+                        adding.overview.usage = None;
+                        adding.overview.usage_loading = true;
+                        adding.overview.usage_error = None;
+                    }
+                }
                 // The join's own answer moves on from there.
                 Screen::Joining { .. } => {}
                 _ => {
                     self.screen = Screen::SignedIn(Overview::new(status));
                     effects.push(Effect::Devices);
+                    effects.push(self.next_usage_request());
                 }
+            }
+            if let Some(effect) = new_usage_request {
+                effects.push(effect);
             }
             return effects;
         }
@@ -704,6 +781,7 @@ impl Model {
                 let mut effects = self.status_came(status);
                 // Start at login: the agent's entry (the app's follows it).
                 effects.extend([Effect::SetAutostart(true), Effect::Devices]);
+                effects.push(self.next_usage_request());
                 return effects;
             }
             Err(e) => e,
@@ -1308,7 +1386,7 @@ pub(crate) mod tests {
         // At each start, matched once; again only when it changes.
         let mut m = model();
         m.update(Event::Start);
-        assert_eq!(m.update(Event::Found(Ok(on.clone()))), vec![Effect::AppAutostart(true), Effect::Devices]);
+        assert_eq!(m.update(Event::Found(Ok(on.clone()))), vec![Effect::AppAutostart(true), Effect::Devices, Effect::Usage(1)]);
         assert!(m.update(Event::Polled(Ok(on.clone()))).is_empty());
         assert_eq!(m.update(Event::Polled(Ok(Status { autostart: Some(false), ..on }))), vec![Effect::AppAutostart(false)]);
     }
