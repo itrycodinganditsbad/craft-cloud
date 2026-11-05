@@ -35,7 +35,7 @@ file sizes come later, with history.
 
 Signed-in devices can read `GET /api/v1/account/usage` for the space's stored bytes, the configured cap, and labeled
 estimates of bytes referenced only by trash or old versions. The estimates deduplicate shared blobs per space, exclude
-live-document snapshots and unrooted app assets, and are never added to stored bytes; an incomplete manifest index
+live-document snapshots, unrooted app assets and the versions an app saved (a save record), which the history estimate treats as kept, and are never added to stored bytes; an incomplete manifest index
 makes both estimates `null`.
 
 Live documents have a cap of their own: `live_bytes_per_user` (in bytes; 1 GiB, `1_073_741_824`, by default) is

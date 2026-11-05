@@ -11,7 +11,8 @@ WITH space_manifests AS (
         MAX(CASE WHEN n.deleted = 1 THEN 1 ELSE 0 END) AS has_deleted,
         MAX(CASE WHEN n.deleted = 0 THEN 1 ELSE 0 END) AS has_live,
         MAX(CASE WHEN n.deleted = 0 AND n.version = v.id THEN 1 ELSE 0 END) AS has_current,
-        MAX(CASE WHEN n.deleted = 0 AND n.version <> v.id THEN 1 ELSE 0 END) AS has_history
+        MAX(CASE WHEN n.deleted = 0 AND n.version <> v.id THEN 1 ELSE 0 END) AS has_history,
+        MAX(CASE WHEN n.deleted = 0 AND v.save IS NOT NULL THEN 1 ELSE 0 END) AS has_saved
     FROM nodes n JOIN versions v ON v.space_id = n.space_id AND v.node = n.id
     WHERE n.space_id = $1
     GROUP BY v.manifest
@@ -23,7 +24,7 @@ WITH space_manifests AS (
     SELECT sm.manifest, b.stored_size,
         CASE WHEN vr.has_deleted = 1 AND vr.has_live = 0 AND snapshots.manifest IS NULL
              THEN 1 ELSE 0 END AS trash_only,
-        CASE WHEN vr.has_history = 1 AND vr.has_deleted = 0 AND vr.has_current = 0 AND snapshots.manifest IS NULL
+        CASE WHEN vr.has_history = 1 AND vr.has_deleted = 0 AND vr.has_current = 0 AND vr.has_saved = 0 AND snapshots.manifest IS NULL
              THEN 1 ELSE 0 END AS history_only
     FROM space_manifests sm JOIN blobs b ON b.kind = 1 AND b.id = sm.manifest
     LEFT JOIN version_roles vr ON vr.manifest = sm.manifest

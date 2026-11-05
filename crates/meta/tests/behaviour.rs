@@ -94,6 +94,7 @@ on_every_backend!(
     account_usage_excludes_chunks_shared_with_current_version,
     account_usage_deduplicates_per_space_and_counts_pending_purge,
     account_usage_excludes_live_document_snapshot_blobs,
+    account_usage_leaves_saved_versions_out_of_history,
     concurrent_chunk_batches_charge_a_shared_chunk_once,
     concurrent_signups_with_one_name_give_username_taken,
     an_offline_batch_creates_a_folder_and_files_in_it,
@@ -559,6 +560,62 @@ async fn account_usage_excludes_live_document_snapshot_blobs(meta: &Meta) {
 
     let estimate = meta.storage_estimate(ana.space).await.unwrap();
     assert_eq!(estimate.history_bytes, Some(0), "old version's manifest and chunk remain named by the live-document snapshot");
+}
+
+async fn account_usage_leaves_saved_versions_out_of_history(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let dev = device(meta, &ana).await;
+    let shared = random_chunk();
+    meta.add_chunk(ana.space, &shared, 6, NOW).await.unwrap();
+    let make_manifest = |file_hash| {
+        Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), 5, FileHash::from_bytes(file_hash), vec![ChunkRef { id: shared, len: 5 }]).unwrap()
+    };
+    let (saved_old, unsaved_old) = (make_manifest([7; 32]), make_manifest([8; 32]));
+    for m in [&saved_old, &unsaved_old] {
+        meta.add_manifest(ana.space, m, 100, NOW).await.unwrap();
+    }
+    let current = manifest(meta, &ana, 6).await;
+
+    // v1 (saved) and v2 (not saved) name one chunk; v3 is current. The saved version's manifest and the chunk it shares
+    // with unsaved history stay out of the estimate: only v2's own 100-byte manifest is history.
+    let (node, v1) = (NodeId::generate(), version(saved_old.id()));
+    meta.commit(ana.space, dev, &[Op::Create { node, parent: root(meta, &ana).await, name: name("saved.kitdemo"), version: v1.clone() }], NOW)
+        .await
+        .unwrap();
+    let record = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::live::node_doc(ana.space, node), frontiers: vec![(1, 5)] };
+    meta.attach_save(ana.space, node, v1.id, &record).await.unwrap();
+    let v2 = version(unsaved_old.id());
+    meta.commit(ana.space, dev, &[Op::Update { node, expected: v1.id, version: v2.clone() }], NOW).await.unwrap();
+    let v3 = version(current);
+    meta.commit(ana.space, dev, &[Op::Update { node, expected: v2.id, version: v3.clone() }], NOW).await.unwrap();
+    assert_eq!(
+        meta.storage_estimate(ana.space).await.unwrap().history_bytes,
+        Some(100),
+        "the saved version's manifest and the chunk it shares with unsaved history are kept"
+    );
+
+    // A saved version whose chunk nothing else names contributes nothing; an unsaved old version still counts in full.
+    let (exclusive_saved, exclusive_unsaved) = (manifest(meta, &ana, 4).await, manifest(meta, &ana, 4).await);
+    let (other, w1) = (NodeId::generate(), version(exclusive_saved));
+    meta.commit(ana.space, dev, &[Op::Create { node: other, parent: root(meta, &ana).await, name: name("other.kitdemo"), version: w1.clone() }], NOW)
+        .await
+        .unwrap();
+    let other_record = craft_cloud_proto::SaveRecord { doc: craft_cloud_proto::live::node_doc(ana.space, other), frontiers: vec![(1, 5)] };
+    meta.attach_save(ana.space, other, w1.id, &other_record).await.unwrap();
+    let w2 = version(exclusive_unsaved);
+    meta.commit(ana.space, dev, &[Op::Update { node: other, expected: w1.id, version: w2.clone() }], NOW).await.unwrap();
+    meta.commit(ana.space, dev, &[Op::Update { node: other, expected: w2.id, version: version(manifest(meta, &ana, 6).await) }], NOW).await.unwrap();
+    assert_eq!(
+        meta.storage_estimate(ana.space).await.unwrap().history_bytes,
+        Some(205),
+        "unsaved 100 + 105 for the second file's unsaved old version"
+    );
+
+    // In the trash a saved version still counts: purging the node removes it with the rest.
+    meta.commit(ana.space, dev, &[Op::Delete { node, expected: Some(v3.id) }], NOW).await.unwrap();
+    let trashed = meta.storage_estimate(ana.space).await.unwrap();
+    assert_eq!(trashed.history_bytes, Some(105));
+    assert_eq!(trashed.trash_bytes, Some(313), "three manifests, the shared 6-byte chunk and the current version's 7-byte chunk");
 }
 
 /// Review finding 3 of M3c: two batches racing with an overlapping chunk charge it once (on Postgres both used to
