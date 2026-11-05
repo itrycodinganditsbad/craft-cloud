@@ -76,14 +76,10 @@ pub use craft_cloud_api::api::{
     AdminUpdateUser, AdminUserInfo, AdminUserList, AuditEvent, AuditPage, DeviceInfo, PairingState, PairingStatus, RecoveryCodes, RevokedOthers,
     TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus, valid_audit_action,
 };
+pub use craft_cloud_api::{NodeId, VersionId};
 pub use craft_cloud_api::local::{
-    JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RunState, SecondFactorLoginRequest, Status, TwoFactorProofRequest, codes,
-pub use craft_cloud_api::NodeId;
-pub use craft_cloud_api::VersionId;
-pub use craft_cloud_api::api::{DeviceInfo, PairingState, PairingStatus};
-pub use craft_cloud_api::local::{
-    HistoryResponse, HistoryVersion, JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RestoreResponse, RunState, Status, TrashItem,
-    TrashNodeRequest, TrashResponse, TrashRestoreResponse, codes,
+    HistoryResponse, HistoryVersion, JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RestoreResponse, RunState,
+    SecondFactorLoginRequest, Status, TrashItem, TrashNodeRequest, TrashResponse, TrashRestoreResponse, TwoFactorProofRequest, codes,
 };
 pub use recents::{RecentsEvent, RecentsWatch};
 pub use uuid::Uuid;
@@ -850,6 +846,8 @@ mod tests {
         assert_eq!(next().1, format!("/v1/admin/users/{id}/devices/{device}"));
         let wrong = agent.admin_disable_user(id, &confirm);
         assert!(matches!(wrong, Err(Error::Refused { ref code, .. }) if code == "wrong_password"), "{wrong:?}");
+    }
+
     #[test]
     fn history_and_restore_use_relative_paths_and_typed_bodies() {
         let restored = RestoreResponse {
