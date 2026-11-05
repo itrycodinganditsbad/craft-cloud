@@ -94,15 +94,14 @@ pub enum Error {
     #[error("the Craft Cloud agent speaks local API version {0}, this app {LOCAL_API_MIN}-{LOCAL_API_MAX}: update the older one")]
     Version(u32),
     /// The agent refused the request: `code` is one of [`codes`] (or the HTTP API's), `message` is for people, and
-    /// `name_taken` identifies this cause in a trash-restore conflict when the server provides it.
+    /// `name_taken` identifies a trash-restore conflict when the server provides it.
     #[error("{message}")]
-    Refused { code: String, message: String },
+    Refused { code: String, message: String, name_taken: Option<bool> },
     /// A refusal that carries more: the challenge of `two_factor_required` and/or the wait of `two_factor_locked`
     /// (`retry_after_secs`). Only answers with one of those are this; every other refusal is [`Error::Refused`], so code that
     /// matches `Refused { code, .. }` goes on working. [`Error::code`] reads the code of both.
     #[error("{message}")]
     RefusedWith { code: String, message: String, two_factor: Option<TwoFactorChallenge>, retry_after_secs: Option<u64> },
-    Refused { code: String, message: String, name_taken: Option<bool> },
     /// The connection broke, or the agent didn't answer in time.
     #[error("the connection to the Craft Cloud agent broke: {0}")]
     Io(String),
@@ -466,7 +465,7 @@ fn refusal(answer: http::Answer) -> Result<http::Answer, Error> {
                 // The wait is in the answer's JSON; the `Retry-After` header is the same wait, used when the JSON lacks it.
                 let retry_after_secs = extras.retry_after_secs.or(answer.retry_after_secs);
                 if extras.two_factor.is_none() && retry_after_secs.is_none() {
-                    Err(Error::Refused { code: body.error, message: body.message })
+                    Err(Error::Refused { code: body.error, message: body.message, name_taken: None })
                 } else {
                     Err(Error::RefusedWith { code: body.error, message: body.message, two_factor: extras.two_factor, retry_after_secs })
                 }
