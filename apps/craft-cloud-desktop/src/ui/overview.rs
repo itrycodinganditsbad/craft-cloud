@@ -4,6 +4,7 @@
 use craft_cloud_app::{RunState, Status};
 use egui::RichText;
 
+use crate::admin::{Access, AdminEvent};
 use crate::model::{Busy, Event, Overview};
 
 /// What the sync is doing, in one line, and the Details when it is a problem.
@@ -69,6 +70,20 @@ pub(super) fn show(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: 
     if super::wide_button(ui, true, "Add a computer") {
         events.push(Event::AddComputer);
     }
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui.button("Security…").on_hover_text("Two-factor sign-in, your password, your other computers").clicked() {
+            events.push(Event::OpenSecurity);
+        }
+        if ui.button("Activity").on_hover_text("What happened to your account: sign-ins, password changes, computers signed out").clicked() {
+            events.push(Event::Audit(crate::audit::AuditMsg::OpenActivity));
+        }
+        if matches!(o.access, Access::Admin { .. })
+            && ui.button("Administration").on_hover_text("Accounts, invites, computers and the audit log").clicked()
+        {
+            events.push(Event::Admin(AdminEvent::Open));
+        }
+    });
     ui.add_space(14.0);
 
     super::computers::list(ui, o, now_ms, events);

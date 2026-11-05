@@ -13,7 +13,7 @@
 //! [`Client::set_autostart`] (a few seconds at most). **Off the UI thread**, since they wait for the server (up to
 //! 90 s): [`Client::login`], [`Client::join`], [`Client::logout`], and the add-a-computer and computer-list calls
 //! ([`Client::pairing`], [`Client::pairing_state`], [`Client::cancel_pairing`], [`Client::devices`],
-//! [`Client::remove_device`]), and opening a live document ([`live::Documents::open`], [`live::Importer::import`]: up
+//! [`Client::remove_device`]), the admin calls ([`admin`]), and opening a live document ([`live::Documents::open`], [`live::Importer::import`]: up
 //! to 30 s). A live document's own calls ([`live::Document::send`], [`live::Document::try_recv`]) don't wait for an
 //! answer.
 //!
@@ -49,6 +49,8 @@
 //! TLS: the agent is on this machine.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod admin;
+mod audit;
 pub mod blobs;
 #[cfg(feature = "fake")]
 pub mod fake;
@@ -61,11 +63,22 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use craft_cloud_api::api::ErrorAnswer;
-use craft_cloud_api::local::{AutostartRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_MIN, LocalApiFile, LogoutRequest, paths};
+use craft_cloud_api::local::{
+    AutostartRequest, ChangePasswordRequest, ErrorExtras, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_MIN, LocalApiFile, LogoutRequest, PasswordRequest,
+    RenameDeviceRequest, TotpRequest, paths,
+};
 
+pub use admin::UserQuery;
+pub use audit::{AuditQuery, ExportOutcome};
 pub use craft_cloud_api::DeviceId;
-pub use craft_cloud_api::api::{DeviceInfo, PairingState, PairingStatus};
-pub use craft_cloud_api::local::{JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RunState, Status, codes};
+pub use craft_cloud_api::api::{
+    AUDIT_ACTIONS, AccountInfo, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo,
+    AdminUpdateUser, AdminUserInfo, AdminUserList, AuditEvent, AuditPage, DeviceInfo, PairingState, PairingStatus, RecoveryCodes, RevokedOthers,
+    TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus, valid_audit_action,
+};
+pub use craft_cloud_api::local::{
+    JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RunState, SecondFactorLoginRequest, Status, TwoFactorProofRequest, codes,
+};
 pub use recents::{RecentsEvent, RecentsWatch};
 pub use uuid::Uuid;
 
@@ -81,12 +94,43 @@ pub enum Error {
     /// The agent refused the request: `code` is one of [`codes`] (or the HTTP API's), `message` is for people.
     #[error("{message}")]
     Refused { code: String, message: String },
+    /// A refusal that carries more: the challenge of `two_factor_required` and/or the wait of `two_factor_locked`
+    /// (`retry_after_secs`). Only answers with one of those are this; every other refusal is [`Error::Refused`], so code that
+    /// matches `Refused { code, .. }` goes on working. [`Error::code`] reads the code of both.
+    #[error("{message}")]
+    RefusedWith { code: String, message: String, two_factor: Option<TwoFactorChallenge>, retry_after_secs: Option<u64> },
     /// The connection broke, or the agent didn't answer in time.
     #[error("the connection to the Craft Cloud agent broke: {0}")]
     Io(String),
     /// The agent answered something this crate can't read.
     #[error("the Craft Cloud agent answered something unexpected: {0}")]
     Protocol(String),
+}
+
+impl Error {
+    /// The code of a refusal ([`Error::Refused`] or [`Error::RefusedWith`]); `None` for any other error.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Error::Refused { code, .. } | Error::RefusedWith { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+
+    /// The challenge of a `two_factor_required` refusal.
+    pub fn challenge(&self) -> Option<&TwoFactorChallenge> {
+        match self {
+            Error::RefusedWith { two_factor, .. } => two_factor.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// How many seconds a `two_factor_locked` (or other) refusal says to wait.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Error::RefusedWith { retry_after_secs, .. } => *retry_after_secs,
+            _ => None,
+        }
+    }
 }
 
 /// The running agent, as `local-api.json` names it.
@@ -147,6 +191,11 @@ impl Client {
         serde_json::from_slice(&answer.body).map_err(|e| Error::Protocol(e.to_string()))
     }
 
+    /// A call with a body that is answered with no body (`204`).
+    fn call_unit(&self, method: &str, path: &str, body: Option<Vec<u8>>, timeout: Duration) -> Result<(), Error> {
+        self.answer(method, path, body, timeout).map(|_| ())
+    }
+
     /// A call answered without a body (`204`).
     fn call_empty(&self, method: &str, path: &str, timeout: Duration) -> Result<(), Error> {
         self.answer(method, path, None, timeout).map(|_| ())
@@ -181,6 +230,67 @@ impl Client {
     pub fn login(&self, request: &LoginRequest) -> Result<Status, Error> {
         let body = serde_json::to_vec(request).map_err(|e| Error::Protocol(e.to_string()))?;
         self.call("POST", paths::LOGIN, Some(body), http::SLOW_TIMEOUT)
+    }
+
+    /// The second step of a sign-in that answered `Refused`/`RefusedWith { code: "two_factor_required" }`: the first step's
+    /// server, folder, computer name and `adopt` again, with the answer's challenge ([`Error::challenge`]) and a code from
+    /// the authenticator app or a recovery code. A wrong code is `two_factor_invalid` (the challenge takes five), too many
+    /// is `two_factor_locked` with [`Error::retry_after_secs`]; neither signs anything out. Waits for the server: call it off
+    /// the UI thread.
+    pub fn login_second_factor(&self, request: &SecondFactorLoginRequest) -> Result<Status, Error> {
+        let body = serde_json::to_vec(request).map_err(|e| Error::Protocol(e.to_string()))?;
+        self.call("POST", paths::LOGIN_SECOND_FACTOR, Some(body), http::SLOW_TIMEOUT)
+    }
+
+    /// Whether the signed-in account has two-factor sign-in on, how many recovery codes are left and whether a set-up is
+    /// open. Asks the server: call it off the UI thread. A server from before two-factor sign-in answers `not_found`.
+    pub fn two_factor_status(&self) -> Result<TwoFactorStatus, Error> {
+        self.call("GET", paths::TWO_FACTOR, None, http::SLOW_TIMEOUT)
+    }
+
+    /// Starts setting two-factor sign-in up with the account's password: the secret (Base32 and as an `otpauth://` URI, for
+    /// a QR code), good for 10 minutes. `wrong_password` (403) is no sign-out. The secret is shown once and never stored.
+    pub fn two_factor_setup(&self, password: &str) -> Result<TwoFactorSetupResponse, Error> {
+        let body = serde_json::to_vec(&PasswordRequest { password: password.to_owned() }).map_err(|e| Error::Protocol(e.to_string()))?;
+        self.call("POST", paths::TWO_FACTOR_SETUP, Some(body), http::SLOW_TIMEOUT)
+    }
+
+    /// Turns two-factor sign-in on with the first code; the ten recovery codes, shown once (the account's other computers
+    /// are signed out).
+    pub fn two_factor_confirm(&self, totp_code: &str) -> Result<RecoveryCodes, Error> {
+        let body = serde_json::to_vec(&TotpRequest { totp_code: totp_code.to_owned() }).map_err(|e| Error::Protocol(e.to_string()))?;
+        self.call("POST", paths::TWO_FACTOR_CONFIRM, Some(body), http::SLOW_TIMEOUT)
+    }
+
+    /// Turns two-factor sign-in off: the password and a code or a recovery code.
+    pub fn two_factor_disable(&self, request: &TwoFactorProofRequest) -> Result<(), Error> {
+        let body = serde_json::to_vec(request).map_err(|e| Error::Protocol(e.to_string()))?;
+        self.call_unit("POST", paths::TWO_FACTOR_DISABLE, Some(body), http::SLOW_TIMEOUT)
+    }
+
+    /// Ten new recovery codes (the old ones stop working): the password and a code from the authenticator app.
+    pub fn two_factor_recovery_codes(&self, password: &str, totp_code: &str) -> Result<RecoveryCodes, Error> {
+        let request = TwoFactorProofRequest { password: password.to_owned(), totp_code: Some(totp_code.to_owned()), recovery_code: None };
+        let body = serde_json::to_vec(&request).map_err(|e| Error::Protocol(e.to_string()))?;
+        self.call("POST", paths::TWO_FACTOR_RECOVERY_CODES, Some(body), http::SLOW_TIMEOUT)
+    }
+
+    /// Changes the account's password; the account's other computers are signed out.
+    pub fn change_password(&self, current_password: &str, new_password: &str) -> Result<(), Error> {
+        let request = ChangePasswordRequest { current_password: current_password.to_owned(), new_password: new_password.to_owned() };
+        let body = serde_json::to_vec(&request).map_err(|e| Error::Protocol(e.to_string()))?;
+        self.call_unit("POST", paths::ACCOUNT_PASSWORD, Some(body), http::SLOW_TIMEOUT)
+    }
+
+    /// Signs every other computer of the account out; how many were.
+    pub fn revoke_other_devices(&self) -> Result<RevokedOthers, Error> {
+        self.call("POST", paths::DEVICES_REVOKE_OTHERS, None, http::SLOW_TIMEOUT)
+    }
+
+    /// Renames one of the account's computers that isn't signed out.
+    pub fn rename_device(&self, id: DeviceId, name: &str) -> Result<DeviceInfo, Error> {
+        let body = serde_json::to_vec(&RenameDeviceRequest { name: name.to_owned() }).map_err(|e| Error::Protocol(e.to_string()))?;
+        self.call("PATCH", &format!("{}/{id}", paths::DEVICES), Some(body), http::SLOW_TIMEOUT)
     }
 
     /// Signs the agent out (the files stay). `local`: without reaching the server (the device stays valid there).
@@ -289,7 +399,16 @@ fn refusal(answer: http::Answer) -> Result<http::Answer, Error> {
         Ok(answer)
     } else {
         match serde_json::from_slice::<ErrorAnswer>(&answer.body) {
-            Ok(body) => Err(Error::Refused { code: body.error, message: body.message }),
+            Ok(body) => {
+                let extras = serde_json::from_slice::<ErrorExtras>(&answer.body).unwrap_or_default();
+                // The wait is in the answer's JSON; the `Retry-After` header is the same wait, used when the JSON lacks it.
+                let retry_after_secs = extras.retry_after_secs.or(answer.retry_after_secs);
+                if extras.two_factor.is_none() && retry_after_secs.is_none() {
+                    Err(Error::Refused { code: body.error, message: body.message })
+                } else {
+                    Err(Error::RefusedWith { code: body.error, message: body.message, two_factor: extras.two_factor, retry_after_secs })
+                }
+            }
             Err(_) => Err(Error::Protocol(format!("HTTP {}", answer.status))),
         }
     }
@@ -299,6 +418,23 @@ fn refusal(answer: http::Answer) -> Result<http::Answer, Error> {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn a_refusal_takes_its_wait_from_the_retry_after_header_when_the_json_has_none() {
+        let body = |text: &str| text.as_bytes().to_vec();
+        let only_header = http::Answer { status: 429, body: body(r#"{"error":"two_factor_locked","message":"wait"}"#), retry_after_secs: Some(900) };
+        assert_eq!(refusal(only_header).unwrap_err().retry_after_secs(), Some(900));
+        // The JSON wins when both are there.
+        let both = http::Answer {
+            status: 429,
+            body: body(r#"{"error":"two_factor_locked","message":"wait","retry_after_secs":840}"#),
+            retry_after_secs: Some(900),
+        };
+        assert_eq!(refusal(both).unwrap_err().retry_after_secs(), Some(840));
+        // Neither: a plain refusal.
+        let neither = http::Answer { status: 403, body: body(r#"{"error":"two_factor_invalid","message":"no"}"#), retry_after_secs: None };
+        assert!(matches!(refusal(neither).unwrap_err(), Error::Refused { .. }));
+    }
 
     /// What the fake agent was asked: method, path and body.
     type Asked = (String, String, String);
@@ -379,7 +515,19 @@ mod tests {
         let device = craft_cloud_api::DeviceId::generate();
         let info = PairingInfo { id, join: "c.example/K7M4-Q9TX".into(), link: "https://c.example/join/K7M4-Q9TX".into(), expires_ms: 9 };
         let used = PairingStatus { state: PairingState::Used, device_name: Some("lptp1".into()) };
-        let list = vec![DeviceInfo { id: device, name: "lptp1".into(), created_ms: 1, last_used_ms: 2, revoked: false, current: false }];
+        let list = vec![DeviceInfo {
+            id: device,
+            name: "lptp1".into(),
+            created_ms: 1,
+            last_used_ms: 2,
+            revoked: false,
+            current: false,
+            client_kind: String::new(),
+            platform: String::new(),
+            app_version: String::new(),
+            revoked_ms: None,
+            revoke_reason: None,
+        }];
         let refused = json(&ErrorAnswer { error: "password_required".into(), message: "choose a password".into() });
         let script = vec![
             (400, refused),
@@ -397,8 +545,15 @@ mod tests {
         let (_dir, agent, asked) = fake_agent(script);
         let next = || asked.recv_timeout(Duration::from_secs(5)).unwrap();
 
-        let request =
-            JoinRequest { join: "c.example/K7M4-Q9TX".into(), folder: None, device_name: Some("lptp1".into()), adopt: true, password: None };
+        let request = JoinRequest {
+            join: "c.example/K7M4-Q9TX".into(),
+            folder: None,
+            device_name: Some("lptp1".into()),
+            adopt: true,
+            password: None,
+            totp_code: None,
+            recovery_code: None,
+        };
         let refused = agent.join(&request);
         assert!(matches!(refused, Err(Error::Refused { ref code, .. }) if code == "password_required"), "{refused:?}");
         let (method, path, body) = next();
@@ -428,6 +583,204 @@ mod tests {
         let (method, path, body) = next();
         assert_eq!((method.as_str(), path.as_str()), ("POST", paths::AUTOSTART));
         assert_eq!(serde_json::from_str::<AutostartRequest>(&body).unwrap(), AutostartRequest { on: true });
+    }
+
+    /// The two-factor calls send what the local API wants and read what it answers; a refusal keeps its challenge or its wait.
+    #[test]
+    fn the_two_factor_calls_send_their_requests_and_keep_what_a_refusal_carries() {
+        let recovery = RecoveryCodes { recovery_codes: vec!["ABCD-EFGH-JKMN-PQRS".into(); 10] };
+        let setup = TwoFactorSetupResponse { secret: "JBSWY3DPEHPK3PXP".into(), otpauth_uri: "otpauth://totp/x".into(), expires_ms: 5 };
+        let state = TwoFactorStatus { enabled: true, enabled_ms: Some(3), recovery_codes_left: 9, pending: false };
+        let device = craft_cloud_api::DeviceId::generate();
+        let renamed = DeviceInfo {
+            id: device,
+            name: "new name".into(),
+            created_ms: 1,
+            last_used_ms: 2,
+            revoked: false,
+            current: false,
+            client_kind: String::new(),
+            platform: String::new(),
+            app_version: String::new(),
+            revoked_ms: None,
+            revoke_reason: None,
+        };
+        let required =
+            json(&serde_json::json!({ "error": "two_factor_required", "message": "m", "two_factor": { "challenge": "chal", "expires_ms": 9 } }));
+        let locked = json(&serde_json::json!({ "error": "two_factor_locked", "message": "wait", "retry_after_secs": 840 }));
+        let plain = json(&ErrorAnswer { error: "two_factor_invalid".into(), message: "wrong".into() });
+        let script = vec![
+            (401, required),
+            (200, json(&status(true))),
+            (429, locked),
+            (403, plain),
+            (200, json(&state)),
+            (200, json(&setup)),
+            (200, json(&recovery)),
+            (204, String::new()),
+            (200, json(&recovery)),
+            (204, String::new()),
+            (200, json(&RevokedOthers { revoked: 2 })),
+            (200, json(&renamed)),
+        ];
+        let (_dir, agent, asked) = fake_agent(script);
+        let next = || asked.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let login = LoginRequest {
+            server: "https://c.example".into(),
+            user: "ana".into(),
+            password: "pw-secret-1".into(),
+            folder: None,
+            device_name: None,
+            adopt: false,
+        };
+        let refused = agent.login(&login).unwrap_err();
+        assert_eq!(refused.code(), Some("two_factor_required"));
+        assert_eq!(refused.challenge().map(|c| (c.challenge.as_str(), c.expires_ms)), Some(("chal", 9)));
+        assert!(!format!("{refused:?}").contains("\"chal\""), "the challenge is hidden in Debug");
+        let _ = next();
+        let second = SecondFactorLoginRequest {
+            server: "https://c.example".into(),
+            user: "ana".into(),
+            folder: None,
+            device_name: None,
+            adopt: false,
+            challenge: "chal".into(),
+            totp_code: Some("123456".into()),
+            recovery_code: None,
+        };
+        assert!(agent.login_second_factor(&second).unwrap().signed_in);
+        let (method, path, body) = next();
+        assert_eq!((method.as_str(), path.as_str()), ("POST", paths::LOGIN_SECOND_FACTOR));
+        assert_eq!(serde_json::from_str::<SecondFactorLoginRequest>(&body).unwrap(), second);
+
+        // A lock keeps its wait; a plain refusal stays a plain `Refused` (code and message only).
+        let err = agent.login_second_factor(&second).unwrap_err();
+        assert_eq!((err.code(), err.retry_after_secs(), err.challenge()), (Some("two_factor_locked"), Some(840), None));
+        let _ = next();
+        let err = agent.login_second_factor(&second).unwrap_err();
+        assert!(matches!(&err, Error::Refused { code, .. } if code == "two_factor_invalid"), "{err:?}");
+        let _ = next();
+
+        assert_eq!(agent.two_factor_status().unwrap(), state);
+        assert_eq!(next(), ("GET".into(), paths::TWO_FACTOR.to_owned(), String::new()));
+        assert_eq!(agent.two_factor_setup("pw-secret-1").unwrap(), setup);
+        let (_, path, body) = next();
+        assert_eq!(
+            (path.as_str(), serde_json::from_str::<PasswordRequest>(&body).unwrap().password.as_str()),
+            (paths::TWO_FACTOR_SETUP, "pw-secret-1")
+        );
+        assert_eq!(agent.two_factor_confirm("123456").unwrap(), recovery);
+        let (_, path, body) = next();
+        assert_eq!((path.as_str(), serde_json::from_str::<TotpRequest>(&body).unwrap().totp_code.as_str()), (paths::TWO_FACTOR_CONFIRM, "123456"));
+        let off = TwoFactorProofRequest { password: "pw-secret-1".into(), totp_code: None, recovery_code: Some("ABCD-EFGH-JKMN-PQRS".into()) };
+        agent.two_factor_disable(&off).unwrap();
+        let (_, path, body) = next();
+        assert_eq!((path.as_str(), serde_json::from_str::<TwoFactorProofRequest>(&body).unwrap()), (paths::TWO_FACTOR_DISABLE, off));
+        assert_eq!(agent.two_factor_recovery_codes("pw-secret-1", "654321").unwrap(), recovery);
+        let (_, path, body) = next();
+        let sent = serde_json::from_str::<TwoFactorProofRequest>(&body).unwrap();
+        assert_eq!((path.as_str(), sent.totp_code.as_deref(), sent.recovery_code), (paths::TWO_FACTOR_RECOVERY_CODES, Some("654321"), None));
+        agent.change_password("old-secret-pw", "new-secret-pw").unwrap();
+        let (method, path, body) = next();
+        assert_eq!((method.as_str(), path.as_str()), ("POST", paths::ACCOUNT_PASSWORD));
+        assert_eq!(serde_json::from_str::<ChangePasswordRequest>(&body).unwrap().new_password, "new-secret-pw");
+        assert_eq!(agent.revoke_other_devices().unwrap(), RevokedOthers { revoked: 2 });
+        assert_eq!(next(), ("POST".into(), paths::DEVICES_REVOKE_OTHERS.to_owned(), String::new()));
+        assert_eq!(agent.rename_device(device, "new name").unwrap(), renamed);
+        let (method, path, body) = next();
+        assert_eq!((method.as_str(), path), ("PATCH", format!("{}/{device}", paths::DEVICES)));
+        assert_eq!(serde_json::from_str::<RenameDeviceRequest>(&body).unwrap().name, "new name");
+    }
+
+    /// The admin calls: each sends its request to its path with the confirmation in the body, and reads its answer; a
+    /// refusal comes back with the server's code, and the wait of a `Retry-After` is kept.
+    #[test]
+    fn each_admin_call_sends_its_request_and_reads_its_answer() {
+        let id = uuid::Uuid::now_v7();
+        let device = craft_cloud_api::DeviceId::generate();
+        let user = AdminUserInfo {
+            id,
+            username: "ana".into(),
+            role: "member".into(),
+            created_ms: 1,
+            disabled_ms: None,
+            two_factor_enabled: false,
+            devices_active: 1,
+            stored_bytes: 5,
+            quota_bytes: None,
+            invite_pending: false,
+        };
+        let code = AdminCode { code: "ABCDEFGHJKMNPQRS".into(), join_url: None, expires_ms: 9 };
+        let list = AdminUserList { users: vec![user.clone()], next: Some("YW5h".into()) };
+        let forbidden = json(&ErrorAnswer { error: "wrong_password".into(), message: "that is not your password".into() });
+        let script = vec![
+            (200, json(&list)),
+            (200, json(&list)),
+            (201, json(&AdminCreatedUser { user: user.clone(), invite: code.clone() })),
+            (200, json(&user)),
+            (204, String::new()),
+            (204, String::new()),
+            (202, String::new()),
+            (200, json(&code)),
+            (204, String::new()),
+            (200, json(&code)),
+            (204, String::new()),
+            (200, json(&AdminDevices { devices: Vec::new() })),
+            (204, String::new()),
+            (403, forbidden),
+        ];
+        let (_dir, agent, asked) = fake_agent(script);
+        let next = || asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        let confirm = AdminConfirm { password: Some("admin-secret-pw".into()), ..AdminConfirm::default() };
+        let password = |body: &str| serde_json::from_str::<serde_json::Value>(body).unwrap()["password"] == "admin-secret-pw";
+
+        assert_eq!(agent.admin_users(&UserQuery::default()).unwrap(), list);
+        assert_eq!(next(), ("GET".into(), "/v1/admin/users".into(), String::new()));
+        let page = UserQuery { cursor: Some("YW5h".into()), limit: Some(10), query: Some("an".into()) };
+        agent.admin_users(&page).unwrap();
+        assert_eq!(next().1, "/v1/admin/users?cursor=YW5h&limit=10&query=an");
+        let create =
+            AdminCreateUser { username: "bo".into(), role: "member".into(), password: Some("admin-secret-pw".into()), ..AdminCreateUser::default() };
+        assert_eq!(agent.admin_create_user(&create).unwrap().invite, code);
+        let (method, path, sent) = next();
+        assert_eq!((method.as_str(), path.as_str()), ("POST", "/v1/admin/users"));
+        assert!(password(&sent) && sent.contains("\"bo\""), "{sent}");
+        let update = AdminUpdateUser { quota_bytes: Some(None), password: Some("admin-secret-pw".into()), ..AdminUpdateUser::default() };
+        assert_eq!(agent.admin_update_user(id, &update).unwrap(), user);
+        let (method, path, sent) = next();
+        assert_eq!((method.as_str(), path.as_str()), ("PATCH", format!("/v1/admin/users/{id}").as_str()));
+        assert!(password(&sent) && sent.contains("\"quota_bytes\":null"), "{sent}");
+        agent.admin_disable_user(id, &confirm).unwrap();
+        assert_eq!(next().1, format!("/v1/admin/users/{id}/disable"));
+        agent.admin_enable_user(id, &confirm).unwrap();
+        assert_eq!(next().1, format!("/v1/admin/users/{id}/enable"));
+        agent.admin_remove_user(id, &confirm).unwrap();
+        let (method, path, sent) = next();
+        assert_eq!((method.as_str(), path.as_str()), ("DELETE", format!("/v1/admin/users/{id}").as_str()));
+        assert!(password(&sent));
+        assert_eq!(agent.admin_issue_invite(id, &confirm).unwrap(), code);
+        assert_eq!(next().1, format!("/v1/admin/users/{id}/invite"));
+        agent.admin_revoke_invite(id, &confirm).unwrap();
+        assert_eq!(next(), ("DELETE".into(), format!("/v1/admin/users/{id}/invite"), json(&confirm)));
+        let reset = AdminPasswordReset {
+            password: Some("admin-secret-pw".into()),
+            totp_code: Some("123456".into()),
+            reset_two_factor: true,
+            ..AdminPasswordReset::default()
+        };
+        assert_eq!(agent.admin_issue_reset(id, &reset).unwrap(), code);
+        let (_, path, sent) = next();
+        assert_eq!(path, format!("/v1/admin/users/{id}/password-reset"));
+        assert_eq!(serde_json::from_str::<AdminPasswordReset>(&sent).unwrap(), reset, "the factor and the reset flag go with it");
+        agent.admin_reset_two_factor(id, &confirm).unwrap();
+        assert_eq!(next().1, format!("/v1/admin/users/{id}/reset-two-factor"));
+        assert!(agent.admin_devices(id).unwrap().devices.is_empty());
+        assert_eq!(next(), ("GET".into(), format!("/v1/admin/users/{id}/devices"), String::new()));
+        agent.admin_revoke_device(id, device, &confirm).unwrap();
+        assert_eq!(next().1, format!("/v1/admin/users/{id}/devices/{device}"));
+        let wrong = agent.admin_disable_user(id, &confirm);
+        assert!(matches!(wrong, Err(Error::Refused { ref code, .. }) if code == "wrong_password"), "{wrong:?}");
     }
 
     /// An agent that takes the connection but never answers (hung, or something else on its port) costs a

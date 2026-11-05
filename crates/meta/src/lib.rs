@@ -7,6 +7,8 @@
 //! row, so commits to one space run one at a time and commits to different spaces run in parallel.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod admin;
+mod audit;
 mod blobs;
 mod codec;
 mod commit;
@@ -14,6 +16,7 @@ mod join;
 mod live;
 mod schema;
 mod tree;
+mod two_factor;
 mod users;
 
 use std::str::FromStr;
@@ -24,6 +27,11 @@ use sqlx::any::{AnyConnectOptions, AnyPoolOptions};
 use sqlx::{AnyPool, ConnectOptions};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+pub use admin::{AdminActor, AdminUser, Issued, MAX_SEARCH_BYTES, MIN_QUOTA_BYTES, RESET_TTL_MS, ServerCounts, UserPage};
+pub use audit::{
+    ActionFilter, AuditAction, AuditCursor, AuditDetails, AuditEvent, AuditFailure, AuditOutcome, AuditQuery, ClientKind, Field, MAX_DETAILS_BYTES,
+    MAX_RETENTION_DAYS, MIN_RETENTION_DAYS, OPPORTUNISTIC_PRUNE_BATCHES, Origin, PRUNE_BATCH, PRUNE_EVERY_MS, Platform, Pruned, Step, TargetKind,
+};
 pub use commit::CommitOutcome;
 pub use craft_cloud_proto::BlobKind;
 pub use join::{InviteFor, Redeemed};
@@ -32,7 +40,15 @@ pub use live::{
     MAX_LIVE_DOCUMENTS_HOLDING_UPDATES, MAX_LIVE_DOCUMENTS_PER_SPACE, MAX_LIVE_PAGE, SnapshotRef,
 };
 pub use tree::{MAX_PAGE_SAVE_BYTES, SpaceInfo};
-pub use users::{DeviceAuth, DeviceRecord, Role, UserId, UserRecord, valid_username};
+pub use two_factor::{
+    CHALLENGE_TTL_MS, Completed, DeviceActor, LOCK_AFTER_FAILURES, LOCK_BASE_MS, LOCK_MAX_MS, MAX_CHALLENGE_ATTEMPTS, MAX_OPEN_CHALLENGES,
+    MAX_SETUP_ATTEMPTS, NewChallenge, Proof, RECOVERY_CODES, SETUP_TTL_MS, SignIn, StoredSecrets, TotpVerifier, TwoFactorInfo, UnreadableSecret,
+    retry_after_secs,
+};
+pub use users::{
+    AccountRecord, CLIENT_KINDS, DeviceAuth, DeviceClient, DeviceRecord, MAX_CLIENT_FIELD_BYTES, RevokeReason, Role, UserId, UserRecord,
+    valid_username,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetaError {
@@ -77,6 +93,42 @@ pub enum MetaError {
     /// An invite to an account without a password was redeemed without a new one; nothing was changed.
     #[error("this invite needs a new password for the account")]
     PasswordRequired,
+    /// The device that asked for a change was revoked while the request ran (it is no longer signed in); nothing was
+    /// changed.
+    #[error("this device is no longer signed in")]
+    DeviceRevoked,
+    /// What the request was based on changed while it ran (the password it checked is no longer the account's);
+    /// nothing was changed and the request may be made again.
+    #[error("{0}")]
+    Conflict(&'static str),
+    /// The admin who asked may not do this (their role changed while the request ran, or the rules about resetting
+    /// another admin); nothing was changed.
+    #[error("{0}")]
+    Forbidden(&'static str),
+    /// The change would leave the server without an administrator who can sign in; nothing was changed.
+    #[error("this would leave the server without an enabled administrator")]
+    LastAdmin,
+    /// The account is disabled or marked for removal. Said only to someone who proved they hold its password or a
+    /// code of it, never to a guesser.
+    #[error("this account is disabled")]
+    AccountDisabled,
+    /// The account has two-factor sign-in and the request carried no second factor; nothing was changed (an invite or
+    /// reset code is not used up).
+    #[error("this account needs its second factor")]
+    TwoFactorRequired,
+    /// A code or recovery code was wrong, or a code that was used before; its counters were committed and nothing else
+    /// was changed.
+    #[error("the second factor is wrong")]
+    TwoFactorInvalid,
+    /// Too many wrong second factors: every check is refused until `retry_after_ms` have passed.
+    #[error("the second factor is locked after too many wrong codes")]
+    TwoFactorLocked { retry_after_ms: i64 },
+    /// A set-up of two-factor sign-in is open on another device.
+    #[error("two-factor set-up is open on another device")]
+    TwoFactorPending,
+    /// A sign-in challenge that is unknown, expired, used or no longer fit, never saying which.
+    #[error("this sign-in step doesn't work any more")]
+    ChallengeGone,
     #[error("invalid input: {0}")]
     Invalid(&'static str),
     #[error("stored data is damaged: {0}")]
@@ -113,6 +165,10 @@ pub struct Meta {
     live_held_documents_cap: u64,
     /// The most bytes all of one space's live documents may hold ([`Meta::with_live_bytes_cap`]).
     live_bytes_cap: u64,
+    /// How long audit events are kept when a write prunes them ([`Meta::with_audit_retention_days`]); `None`: a write never prunes.
+    audit_retention_ms: Option<i64>,
+    /// When the last complete pruning ran, and whether one runs now; shared by the clones.
+    prune_state: Arc<audit::PruneState>,
 }
 
 impl Meta {
@@ -169,6 +225,8 @@ impl Meta {
             live_documents_cap: MAX_LIVE_DOCUMENTS_PER_SPACE,
             live_held_documents_cap: MAX_LIVE_DOCUMENTS_HOLDING_UPDATES,
             live_bytes_cap: DEFAULT_LIVE_BYTES_PER_SPACE,
+            audit_retention_ms: None,
+            prune_state: Arc::new(audit::PruneState::new()),
         })
     }
 
@@ -224,6 +282,14 @@ impl Meta {
     pub fn with_stored_bytes_cap(mut self, cap: Option<u64>) -> Self {
         self.stored_cap = cap;
         self
+    }
+
+    /// `sqlite` or `postgres`, for the admin's server overview.
+    pub fn database_kind(&self) -> &'static str {
+        match self.dialect {
+            Dialect::Sqlite => "sqlite",
+            Dialect::Postgres => "postgres",
+        }
     }
 
     /// Whether a database connection is in use (a query under way, or a connection on its way back to the pool).

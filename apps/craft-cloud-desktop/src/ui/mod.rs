@@ -3,10 +3,14 @@
 //! I/O, so kittest draws every screen against a fake agent.
 
 mod add_computer;
+mod admin;
+mod audit;
 mod computers;
 mod join;
 mod overview;
 mod problem;
+mod second_factor;
+mod security;
 
 use egui::{Color32, RichText};
 
@@ -20,6 +24,7 @@ pub const TITLE: &str = "Craft Cloud";
 /// Draws the window for `model` at `now_ms`, and returns what its buttons asked for.
 pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
     let mut events = Vec::new();
+    security::forget_secrets(ui.ctx(), &model.screen);
     egui::CentralPanel::default().show(ui, |ui| {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(8.0);
@@ -31,8 +36,12 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
                 Screen::Join(form) => join::form(ui, form, false, &mut events),
                 Screen::Joining { form, .. } => join::form(ui, form, true, &mut events),
                 Screen::PasswordNeeded(pw) => join::password(ui, pw, &mut events),
+                Screen::SecondFactor(form) => second_factor::show(ui, form, &mut events),
+                Screen::Security(page) => security::show(ui, page, &mut events),
                 Screen::SignedIn(o) => overview::show(ui, o, busy, now_ms, autostart_problem.as_deref(), &mut events),
                 Screen::AddingComputer(adding) => add_computer::show(ui, adding, now_ms, &mut events),
+                Screen::Admin(a) => admin::show(ui, a, now_ms, &mut events),
+                Screen::Activity(a) => audit::activity(ui, a, now_ms, &mut events),
                 Screen::Removed => problem::removed(ui, busy, &mut events),
             }
             if let Some(note) = note {
@@ -99,3 +108,6 @@ pub fn ago(now_ms: i64, then_ms: i64) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_security;

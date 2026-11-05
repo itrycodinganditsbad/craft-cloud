@@ -10,11 +10,13 @@ use craft_cloud_proto::DeviceId;
 use craft_cloud_store::Store;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::audit::AuditExportLimits;
 use crate::auth::hash_password;
 use crate::error::ApiError;
 use crate::live::LiveHub;
 use crate::notify::Notifier;
 use crate::ratelimit::Limiter;
+use crate::secretbox::SecretBox;
 
 /// How much one user, or one request, may hold on the server at once. Each user's limits are their own, so a
 /// stalled or greedy client only ever slows its own account.
@@ -109,10 +111,20 @@ pub struct AppState {
     pub logins: Limiter,
     /// Failed join-code redeems per client address, in one-minute windows ([`crate::join`]).
     pub joins: Limiter,
+    /// Password change tries per account, in 15-minute windows ([`crate::account`]).
+    pub password_changes: Limiter,
+    /// Wrong second factors per account and per client address, in five-minute windows ([`crate::two_factor`]).
+    pub second_factors: Limiter,
+    /// Seals and opens the secrets of two-factor sign-in; `None`: no key is configured, so it can't be set up.
+    pub two_factor: Option<Arc<SecretBox>>,
     pub notifier: Notifier,
     /// The live service's connections and subscriptions ([`crate::live`]).
     pub live: LiveHub,
     pub limits: Limits,
+    /// How the audit export is cut into pages and bounded ([`crate::audit`]).
+    pub audit_export: AuditExportLimits,
+    /// The address computers reach the server at (`public_url` in the config), for the join links of the admin API.
+    pub public_url: Option<String>,
     /// Chunk and manifest bodies being received, per user ([`Limits::bodies_per_user`]).
     pub bodies: PerUser,
     /// Manifests being decoded and checked, per user ([`Limits::manifests_per_user`]).
@@ -135,12 +147,17 @@ impl AppState {
             trusted_proxies,
             logins: Limiter::new(Duration::from_secs(300)),
             joins: Limiter::new(Duration::from_secs(60)),
+            password_changes: Limiter::new(Duration::from_secs(900)),
+            second_factors: Limiter::new(Duration::from_secs(300)),
+            two_factor: None,
             notifier: Notifier::default(),
             live: LiveHub::default(),
             bodies: PerUser::new(limits.bodies_per_user),
             manifests: PerUser::new(limits.manifests_per_user),
             password_checks: Arc::new(Semaphore::new(limits.password_checks)),
             limits,
+            audit_export: AuditExportLimits::default(),
+            public_url: None,
             touches: Mutex::new(HashMap::new()),
             dummy_hash: hash_password("craft-cloud dummy password")?,
             clock: Arc::new(now_ms),
@@ -153,6 +170,24 @@ impl AppState {
         self.manifests = PerUser::new(limits.manifests_per_user);
         self.password_checks = Arc::new(Semaphore::new(limits.password_checks));
         self.limits = limits;
+        self
+    }
+
+    /// The state with other bounds for the audit export (tests use small ones).
+    pub fn with_audit_export(mut self, limits: AuditExportLimits) -> Self {
+        self.audit_export = limits;
+        self
+    }
+
+    /// The state with the key for two-factor secrets (`None`: none is configured and two-factor sign-in can't be set up).
+    pub fn with_two_factor(mut self, secrets: Option<SecretBox>) -> Self {
+        self.two_factor = secrets.map(Arc::new);
+        self
+    }
+
+    /// The state with the server's public address (`public_url`), which the admin API puts in the join links it makes.
+    pub fn with_public_url(mut self, public_url: Option<String>) -> Self {
+        self.public_url = public_url;
         self
     }
 

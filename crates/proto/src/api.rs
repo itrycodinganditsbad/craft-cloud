@@ -9,7 +9,11 @@ use crate::ids::{DeviceId, Epoch, NodeId, SpaceId};
 use crate::ops::{Conflict, Op};
 
 /// What apps see of these bodies lives in `craft-cloud-api` (no postcard), re-exported here.
-pub use craft_cloud_api::api::{DeviceInfo, ErrorAnswer, PairingState, PairingStatus, codes};
+pub use craft_cloud_api::api::{
+    AUDIT_ACTIONS, AccountInfo, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo,
+    AdminUpdateUser, AdminUserInfo, AdminUserList, AuditDetails, AuditEvent, AuditExportEnd, AuditPage, DeviceInfo, ErrorAnswer, PairingState,
+    PairingStatus, RecoveryCodes, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus, codes, valid_audit_action,
+};
 
 /// Protocol versions this build speaks. A client and server must share at least one.
 pub const PROTOCOL_MIN: u32 = 1;
@@ -46,13 +50,21 @@ pub struct SpaceResponse {
     pub username: String,
 }
 
-/// `POST /api/v1/auth/login`.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `POST /api/v1/auth/login`. `client_kind`, `platform` and `app_version` are optional and only shown in the device
+/// list, never a basis for a permission: `client_kind` is `agent`, `desktop` or `cli`, the others are free text of at
+/// most 32 bytes (all without control characters). A body without them works as before.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
     /// Shown in the device list, e.g. the computer's name.
     pub device_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
 }
 
 impl std::fmt::Debug for LoginRequest {
@@ -61,6 +73,9 @@ impl std::fmt::Debug for LoginRequest {
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .field("device_name", &self.device_name)
+            .field("client_kind", &self.client_kind)
+            .field("platform", &self.platform)
+            .field("app_version", &self.app_version)
             .finish()
     }
 }
@@ -97,14 +112,27 @@ impl std::fmt::Debug for PairingCreated {
 
 /// `POST /api/v1/join` (no auth): redeem an invite or an add-a-computer code (normalised or as typed) for a new
 /// device; answered with a [`LoginResponse`]. `password` is required, and only taken, for an invite to an account
-/// that has none yet. Its `Debug` output hides the code and the password.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// that has none yet. `client_kind`, `platform` and `app_version` are as in [`LoginRequest`]. `totp_code` or
+/// `recovery_code` (one of them) is the second factor of an account that has two-factor sign-in: the server answers
+/// `two_factor_required` without using the code up, and the same body is sent again with it. Its `Debug` output hides
+/// the code, the password and the second factor.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRequest {
     pub code: String,
     /// Shown in the device list, e.g. the computer's name.
     pub device_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
 }
 
 impl std::fmt::Debug for JoinRequest {
@@ -113,6 +141,109 @@ impl std::fmt::Debug for JoinRequest {
             .field("code", &"<redacted>")
             .field("device_name", &self.device_name)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("client_kind", &self.client_kind)
+            .field("platform", &self.platform)
+            .field("app_version", &self.app_version)
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// `POST /api/v1/account/password` (device auth): changes the password, answered `204`. Every other device of the
+/// account is signed out, and its open invite and pairings are deleted. A wrong `current_password` is `403
+/// wrong_password` (never 401), a `new_password` that breaks the rules `400 weak_password`. Its `Debug` output hides
+/// both passwords.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+impl std::fmt::Debug for ChangePasswordRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChangePasswordRequest").field("current_password", &"<redacted>").field("new_password", &"<redacted>").finish()
+    }
+}
+
+/// `PATCH /api/v1/devices/{id}` (device auth): renames one of the account's devices that isn't revoked; answered with
+/// its [`DeviceInfo`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameDeviceRequest {
+    pub name: String,
+}
+
+// ---- two-factor sign-in (`/api/v1/account/two-factor/…`, `/api/v1/auth/login/second-factor`) ----
+//
+// The second factor is a TOTP code (`totp_code`, six digits) or a recovery code (`recovery_code`, 16 letters and
+// digits, with dashes or without). A wrong one is `403 two_factor_invalid` on a signed-in route and `401` at sign-in and
+// join (which are not signed in); too many wrong ones lock the account's second factor for a while (`429
+// two_factor_locked` with `Retry-After`). Every type here that holds a secret hides it in `Debug`.
+
+/// `POST /account/two-factor/setup`: the account's password starts setting two-factor sign-in up. Its `Debug` output
+/// hides the password.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoFactorSetupRequest {
+    pub password: String,
+}
+
+impl std::fmt::Debug for TwoFactorSetupRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoFactorSetupRequest").field("password", &"<redacted>").finish()
+    }
+}
+
+/// `POST /account/two-factor/confirm`: the first code from the authenticator app turns two-factor sign-in on. Its
+/// `Debug` output hides the code.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoFactorConfirmRequest {
+    pub totp_code: String,
+}
+
+impl std::fmt::Debug for TwoFactorConfirmRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoFactorConfirmRequest").field("totp_code", &"<redacted>").finish()
+    }
+}
+
+/// `POST /account/two-factor/disable` and `POST /account/two-factor/recovery-codes`: the password and one second
+/// factor (`recovery-codes` takes `totp_code` only). Its `Debug` output hides all three.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoFactorProofRequest {
+    pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
+}
+
+impl std::fmt::Debug for TwoFactorProofRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoFactorProofRequest")
+            .field("password", &"<redacted>")
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// `POST /auth/login/second-factor`: the challenge `two_factor_required` gave, and one second factor. Answered with a
+/// [`LoginResponse`]. Its `Debug` output hides all of it.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecondFactorRequest {
+    pub challenge: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
+}
+
+impl std::fmt::Debug for SecondFactorRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecondFactorRequest")
+            .field("challenge", &"<redacted>")
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -160,7 +291,8 @@ pub struct QuotaUse {
 }
 
 /// Every error answer. `error` is a stable code, one of [`codes`]; `message` is for people. `conflicts` is
-/// set for `conflict`, `missing` for `missing_chunks`, `quota` for `quota_exceeded`. Clients ignore codes and JSON
+/// set for `conflict`, `missing` for `missing_chunks`, `quota` for `quota_exceeded`, `two_factor` for
+/// `two_factor_required`. Clients ignore codes and JSON
 /// fields they don't know (the server may add more later), so match on the codes you handle and treat the rest by
 /// HTTP status.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -173,6 +305,9 @@ pub struct ErrorBody {
     pub missing: Option<Vec<ChunkId>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<QuotaUse>,
+    /// Set for `two_factor_required`: the challenge to answer at `POST /auth/login/second-factor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_factor: Option<TwoFactorChallenge>,
 }
 
 /// Response header carrying the space's epoch on every signed-in request.
@@ -184,15 +319,115 @@ mod tests {
 
     #[test]
     fn secrets_stay_out_of_debug_output() {
-        let req = LoginRequest { username: "ana".into(), password: "hunter2-secret".into(), device_name: "pc".into() };
+        let req = LoginRequest { username: "ana".into(), password: "hunter2-secret".into(), device_name: "pc".into(), ..LoginRequest::default() };
         assert!(!format!("{req:?}").contains("hunter2-secret"));
         let res = LoginResponse { device: DeviceId::generate(), token: "tok-secret".into() };
         assert!(!format!("{res:?}").contains("tok-secret"));
-        let join = JoinRequest { code: "K7M4Q9TX".into(), device_name: "pc".into(), password: Some("hunter2-secret".into()) };
+        let join =
+            JoinRequest { code: "K7M4Q9TX".into(), device_name: "pc".into(), password: Some("hunter2-secret".into()), ..JoinRequest::default() };
         let shown = format!("{join:?}");
         assert!(!shown.contains("K7M4Q9TX") && !shown.contains("hunter2-secret"), "{shown}");
         let created = PairingCreated { id: Uuid::nil(), code: "K7M4Q9TX".into(), expires_ms: 1 };
         assert!(!format!("{created:?}").contains("K7M4Q9TX"));
+        let change = ChangePasswordRequest { current_password: "old-secret-pw".into(), new_password: "new-secret-pw".into() };
+        let shown = format!("{change:?}");
+        assert!(!shown.contains("old-secret-pw") && !shown.contains("new-secret-pw"), "{shown}");
+        assert_eq!(shown.matches("<redacted>").count(), 2);
+        let confirm = AdminConfirm {
+            password: Some("admin-secret-pw".into()),
+            totp_code: Some("918273".into()),
+            recovery_code: Some("RECOVERYSECRET00".into()),
+        };
+        let shown = format!("{confirm:?}");
+        assert!(!shown.contains("admin-secret-pw") && !shown.contains("918273") && !shown.contains("RECOVERYSECRET"), "{shown}");
+        let reset =
+            AdminPasswordReset { password: Some("admin-secret-pw".into()), totp_code: Some("918273".into()), ..AdminPasswordReset::default() };
+        let shown = format!("{reset:?}");
+        assert!(!shown.contains("admin-secret-pw") && !shown.contains("918273"), "{shown}");
+        let create =
+            AdminCreateUser { username: "ana".into(), role: "member".into(), password: Some("admin-secret-pw".into()), ..AdminCreateUser::default() };
+        assert!(!format!("{create:?}").contains("admin-secret-pw"));
+        let update = AdminUpdateUser { password: Some("admin-secret-pw".into()), ..AdminUpdateUser::default() };
+        assert!(!format!("{update:?}").contains("admin-secret-pw"));
+        let code = AdminCode { code: "ABCDEFGHJKMNPQRS".into(), join_url: Some("cloud.example.org/ABCD-EFGH-JKMN-PQRS".into()), expires_ms: 1 };
+        let shown = format!("{code:?} {:?}", AdminCreatedUser { user: sample_user(), invite: code.clone() });
+        assert!(!shown.contains("ABCDEFGH") && !shown.contains("cloud.example.org"), "{shown}");
+    }
+
+    #[test]
+    fn two_factor_secrets_stay_out_of_debug_output() {
+        let setup = TwoFactorSetupResponse {
+            secret: "JBSWY3DPEHPK3PXP".into(),
+            otpauth_uri: "otpauth://totp/Craft%20Cloud:ana?secret=JBSWY3DPEHPK3PXP".into(),
+            expires_ms: 5,
+        };
+        let shown = format!("{setup:?}");
+        assert!(!shown.contains("JBSWY3DP") && !shown.contains("otpauth:"), "{shown}");
+        let codes = RecoveryCodes { recovery_codes: vec!["ABCD-EFGH-JKMN-PQRS".into(), "WXYZ-0123-4567-89AB".into()] };
+        let shown = format!("{codes:?}");
+        assert!(!shown.contains("ABCD") && !shown.contains("WXYZ"), "{shown}");
+        let second =
+            SecondFactorRequest { challenge: "challenge-secret".into(), totp_code: Some("123456".into()), recovery_code: Some("RC-SECRET".into()) };
+        let shown = format!("{second:?}");
+        assert!(!shown.contains("challenge-secret") && !shown.contains("123456") && !shown.contains("RC-SECRET"), "{shown}");
+        let proof = TwoFactorProofRequest { password: "pw-secret-1".into(), totp_code: Some("654321".into()), recovery_code: None };
+        let shown = format!("{proof:?}");
+        assert!(!shown.contains("pw-secret-1") && !shown.contains("654321"), "{shown}");
+        assert!(!format!("{:?}", TwoFactorSetupRequest { password: "pw-secret-1".into() }).contains("pw-secret-1"));
+        assert!(!format!("{:?}", TwoFactorConfirmRequest { totp_code: "654321".into() }).contains("654321"));
+        let join = JoinRequest {
+            code: "K7M4Q9TX".into(),
+            totp_code: Some("111222".into()),
+            recovery_code: Some("RC-SECRET".into()),
+            ..JoinRequest::default()
+        };
+        let shown = format!("{join:?}");
+        assert!(!shown.contains("111222") && !shown.contains("RC-SECRET"), "{shown}");
+        let body = ErrorBody {
+            error: codes::TWO_FACTOR_REQUIRED.into(),
+            message: "m".into(),
+            two_factor: Some(TwoFactorChallenge { challenge: "challenge-secret".into(), expires_ms: 1 }),
+            ..ErrorBody::default()
+        };
+        assert!(!format!("{body:?}").contains("challenge-secret"));
+        // The challenge travels in the error body, and an older client that doesn't know the field ignores it.
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["two_factor"], serde_json::json!({ "challenge": "challenge-secret", "expires_ms": 1 }));
+        assert_eq!(serde_json::from_value::<ErrorBody>(json).unwrap(), body);
+    }
+
+    fn sample_user() -> AdminUserInfo {
+        AdminUserInfo {
+            id: Uuid::nil(),
+            username: "ana".into(),
+            role: "member".into(),
+            created_ms: 1,
+            disabled_ms: None,
+            two_factor_enabled: false,
+            devices_active: 0,
+            stored_bytes: 0,
+            quota_bytes: None,
+            invite_pending: false,
+        }
+    }
+
+    #[test]
+    fn an_update_tells_a_missing_quota_from_a_null_one() {
+        let missing: AdminUpdateUser = serde_json::from_value(serde_json::json!({ "role": "admin", "password": "p" })).unwrap();
+        assert_eq!(missing.quota_bytes, None);
+        let null: AdminUpdateUser = serde_json::from_value(serde_json::json!({ "quota_bytes": null })).unwrap();
+        assert_eq!(null.quota_bytes, Some(None));
+        let set: AdminUpdateUser = serde_json::from_value(serde_json::json!({ "quota_bytes": 5_000_000 })).unwrap();
+        assert_eq!(set.quota_bytes, Some(Some(5_000_000)));
+        assert!(serde_json::from_value::<AdminUpdateUser>(serde_json::json!({ "quota_bytes": -1 })).is_err());
+        assert_eq!(serde_json::to_value(&set).unwrap(), serde_json::json!({ "quota_bytes": 5_000_000 }));
+    }
+
+    #[test]
+    fn an_admin_body_ignores_fields_it_does_not_know() {
+        let confirm: AdminConfirm = serde_json::from_value(serde_json::json!({ "password": "p", "totp_code": "123456", "later": 1 })).unwrap();
+        assert_eq!((confirm.password.as_deref(), confirm.totp_code.as_deref(), confirm.recovery_code), (Some("p"), Some("123456"), None));
+        assert_eq!(serde_json::from_value::<AdminConfirm>(serde_json::json!({})).unwrap().password, None);
     }
 
     #[test]
@@ -204,9 +439,40 @@ mod tests {
         assert_eq!(waiting, PairingStatus { state: PairingState::Waiting, device_name: None });
         let join: JoinRequest = serde_json::from_value(serde_json::json!({ "code": "c", "device_name": "d" })).unwrap();
         assert_eq!(join.password, None);
+        assert_eq!((join.client_kind, join.platform, join.app_version), (None, None, None));
+        let login = LoginRequest { username: "ana".into(), password: "pw".into(), device_name: "pc".into(), ..LoginRequest::default() };
+        assert_eq!(serde_json::to_value(&login).unwrap(), serde_json::json!({ "username": "ana", "password": "pw", "device_name": "pc" }));
         assert_eq!(codes::INVALID_CODE, "invalid_code");
         assert_eq!(codes::PASSWORD_REQUIRED, "password_required");
         assert_eq!(codes::WEAK_PASSWORD, "weak_password");
+    }
+
+    #[test]
+    fn audit_bodies_have_a_plain_json_form() {
+        let details: AuditDetails = serde_json::from_str(r#"{"revoked":2,"a_later_field":"x","quota_bytes":null}"#).unwrap();
+        assert_eq!(details.revoked, Some(2));
+        assert_eq!(details.quota_bytes, Some(None));
+        assert_eq!(serde_json::to_string(&details).unwrap(), r#"{"quota_bytes":null,"revoked":2}"#);
+        assert_eq!(serde_json::from_str::<AuditDetails>("{}").unwrap(), AuditDetails::default());
+        assert_eq!(serde_json::to_string(&AuditDetails::default()).unwrap(), "{}");
+        let end = AuditExportEnd { complete: Some(true), truncated: None, exported: 3 };
+        assert_eq!(serde_json::to_string(&end).unwrap(), r#"{"complete":true,"exported":3}"#);
+        let event = AuditEvent {
+            id: Uuid::nil(),
+            at_ms: 5,
+            actor_user: None,
+            actor_device: None,
+            action: "auth.login_failed".into(),
+            target_kind: String::new(),
+            target_id: None,
+            outcome: "failure".into(),
+            details: AuditDetails { step: Some("password".into()), ..AuditDetails::default() },
+            count: 4,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["actor_user"], serde_json::Value::Null);
+        assert_eq!(json["count"], 4);
+        assert_eq!(serde_json::from_value::<AuditEvent>(json).unwrap(), event);
     }
 
     #[test]
