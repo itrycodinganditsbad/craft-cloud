@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use craft_cloud_server::cli::{Cli, Command, open};
 use craft_cloud_server::config::Config;
+use craft_cloud_server::web::WebSettings;
 use craft_cloud_server::{AppState, serve};
 
 #[tokio::main]
@@ -38,12 +39,18 @@ async fn run_server(config_path: &std::path::Path) -> Result<(), String> {
     // Fail closed: a database that holds two-factor secrets the key can't open is not served. The server never makes the key.
     let keys = craft_cloud_server::two_factor::load_keys(&config).map_err(|e| e.to_string())?;
     let secrets = craft_cloud_server::two_factor::check_startup(&meta, keys, &config, craft_cloud_server::state::now_ms()).await?;
+    // `Config::load` has checked the setup the pages need (an https public_url, a proxy in front).
+    let web = match (config.web_admin.enabled, &config.public_url) {
+        (true, Some(public_url)) => Some(WebSettings::new(public_url, config.web_admin.idle_ms(), config.web_admin.absolute_ms())?),
+        _ => None,
+    };
     let state = AppState::new(meta, store, config.trusted_proxies.clone())
         .map_err(|e| e.message)?
         .with_public_url(config.public_url.clone())
+        .with_web_admin(web)
         .with_two_factor(secrets);
     let listener = tokio::net::TcpListener::bind(config.listen).await.map_err(|e| format!("can't listen on {}: {e}", config.listen))?;
-    tracing::info!(listen = %config.listen, behind_proxy = config.behind_proxy, "Craft Cloud server running");
+    tracing::info!(listen = %config.listen, behind_proxy = config.behind_proxy, web_admin = config.web_admin.enabled, "Craft Cloud server running");
     let shutdown = async {
         wait_for_stop_signal().await;
         tracing::info!("shutting down");

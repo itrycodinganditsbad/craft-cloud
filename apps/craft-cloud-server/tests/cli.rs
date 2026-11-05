@@ -417,7 +417,7 @@ fn the_binary_serves_what_init_created() {
 /// (one row per account, so the reset code stops working), and makes an invite that adds a computer as before.
 #[tokio::test]
 async fn user_invite_replaces_a_password_reset_code() {
-    use craft_cloud_meta::{AdminActor, RESET_TTL_MS};
+    use craft_cloud_meta::{AdminActor, AdminVia, RESET_TTL_MS};
     let parent = tempfile::tempdir().unwrap();
     let dir = parent.path().join("data");
     cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
@@ -428,7 +428,7 @@ async fn user_invite_replaces_a_password_reset_code() {
     let ana = meta.user_by_name("ana").await.unwrap().unwrap();
     let bob = meta.user_by_name("bob").await.unwrap().unwrap();
     let device = meta.create_device(ana.id, "pc", &[9u8; 32], 0).await.unwrap();
-    let actor = AdminActor { user: ana.id, device, password_hash: ana.password_hash.clone(), two_factor: false };
+    let actor = AdminActor { user: ana.id, via: AdminVia::Device(device), password_hash: ana.password_hash.clone(), two_factor: false };
     let reset = Code::generate(INVITE_CHARS).unwrap();
     meta.admin_issue_reset(&actor, bob.id, &reset.hash(), false, 0, RESET_TTL_MS).await.unwrap();
     assert_eq!(meta.invite_needs_password(&reset.hash(), 1).await.unwrap(), Some(true));
@@ -1094,4 +1094,50 @@ fn healthcheck_is_ok_against_the_real_server() {
         assert!(Instant::now() < deadline, "the server never became healthy");
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[tokio::test]
+async fn web_sessions_prune_deletes_only_what_is_over() {
+    use craft_cloud_meta::{NewChallenge, NewWebSession, WebSignIn};
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config_path = dir.join("config.toml");
+    let c = config_path.to_str().unwrap();
+    let config = Config::load(&config_path).unwrap();
+    let idle = config.web_admin.idle_ms();
+    let now = craft_cloud_server::state::now_ms();
+
+    // One session per way of being over, and one that is not. (The sign-in checks the generation it is given.)
+    let (meta, _) = craft_cloud_server::cli::open(&config).await.unwrap();
+    let ana = meta.user_by_name("ana").await.unwrap().unwrap();
+    let sign_in = |at: i64, absolute_ms: i64| {
+        let (meta, ana) = (meta.clone(), ana.clone());
+        async move {
+            let session = NewWebSession { id_hash: *blake3::hash(uuid::Uuid::now_v7().as_bytes()).as_bytes(), absolute_ms };
+            let challenge =
+                NewChallenge { id_hash: *blake3::hash(uuid::Uuid::now_v7().as_bytes()).as_bytes(), client_key: "ip:127.0.0.1".to_owned() };
+            let made = meta.web_sign_in(ana.id, (&ana.password_hash, ana.auth_gen), &challenge, &session, at).await.unwrap();
+            assert_eq!(made, Some(WebSignIn::Session));
+            session
+        }
+    };
+    let day = 24 * 3_600_000;
+    let idle_one = sign_in(now - idle - 1_000, 30 * day).await;
+    let expired_one = sign_in(now - 2 * day, day).await;
+    let logged_out = sign_in(now - 1_000, day).await;
+    meta.web_logout(&logged_out.id_hash, now - 500).await.unwrap();
+    let valid = sign_in(now - 1_000, day).await;
+
+    let out = cli(&["web-sessions", "--config", c, "prune", "--dry-run"], "").await.unwrap();
+    assert_eq!(out, "3 web session(s) are over; dry run, nothing deleted\n");
+    assert!(meta.web_sessions_count_over(now, idle).await.unwrap() == 3, "a dry run deletes nothing");
+    let out = cli(&["web-sessions", "prune", "--config", c], "").await.unwrap();
+    assert_eq!(out, "deleted 3 web session(s) that were over\n");
+    assert_eq!(cli(&["web-sessions", "--config", c, "prune"], "").await.unwrap(), "deleted 0 web session(s) that were over\n");
+    assert!(meta.web_session(&valid.id_hash, now, idle).await.unwrap().is_some(), "a valid session is never touched");
+    for gone in [&idle_one, &expired_one, &logged_out] {
+        assert!(meta.web_session(&gone.id_hash, now, idle).await.unwrap().is_none());
+    }
+    assert!(matches!(cli(&["web-sessions", "prune"], "").await, Err(CliError::Usage(m)) if m.contains("--config")));
 }

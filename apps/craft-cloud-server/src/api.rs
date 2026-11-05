@@ -85,15 +85,18 @@ pub fn router(state: Shared) -> Router {
         .route("/auth/login", post(login).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
         .route("/auth/login/second-factor", post(two_factor::second_factor).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/join", post(join::join).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)));
-    Router::new()
+    let app = Router::new()
         .nest("/api/v1", public.merge(signed_in))
         // Version 1 isn't known yet when a client first asks what the server speaks.
         .route("/api/info", get(info))
         // A join link opened in a browser.
         .route("/join/{code}", get(join::join_page))
         .fallback(no_such_endpoint)
-        .method_not_allowed_fallback(wrong_method)
-        .with_state(state)
+        .method_not_allowed_fallback(wrong_method);
+    // The admin pages exist only on a server that was set up for them.
+    let app =
+        if state.web.is_some() { app.nest("/web", crate::web::routes(state.clone())).merge(crate::web::trailing_slash(state.clone())) } else { app };
+    app.with_state(state)
 }
 
 async fn no_such_endpoint() -> ApiError {
@@ -153,7 +156,9 @@ async fn login(
     }
     let user = state.meta.user_by_name(&username).await?;
     let known = user.as_ref().map(|u| u.id);
-    let hash = user.as_ref().map_or(state.dummy_hash.as_str(), |u| u.password_hash.as_str()).to_owned();
+    // An account without a password (an open invite) costs the same Argon2id check as a name nobody has, and never signs in.
+    let usable = user.as_ref().is_some_and(|u| crate::auth::usable_hash(&u.password_hash));
+    let hash = user.as_ref().filter(|_| usable).map_or(state.dummy_hash.as_str(), |u| u.password_hash.as_str()).to_owned();
     let password = req.password.clone();
     let ok = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -164,7 +169,7 @@ async fn login(
         tracing::error!(error = %e, "password check task failed");
         ApiError::internal()
     })?;
-    let (Some(user), true) = (user, ok) else {
+    let (Some(user), true) = (user, ok && usable) else {
         // Written after the answer is decided and in a transaction of its own: a log that cannot be written changes
         // neither the answer nor the limits above. A name no account has is never put in the log.
         audit::login_failed(&state, known).await;

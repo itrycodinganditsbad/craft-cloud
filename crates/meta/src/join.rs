@@ -324,10 +324,11 @@ impl Meta {
                     } else {
                         let Some(proof) = second_factor else { return Err(MetaError::TwoFactorRequired) };
                         let row = two_factor::load_row(&mut w.tx, user).await?.ok_or(MetaError::Corrupt("two-factor row vanished under the lock"))?;
-                        if let two_factor::Checked::Wrong = two_factor::check_proof(&mut w.tx, user, Some(device), &row, proof, now_ms).await? {
+                        if let two_factor::Checked::Wrong = two_factor::check_proof(&mut w.tx, user, Some(device), false, &row, proof, now_ms).await?
+                        {
                             // Nothing has been consumed yet: the wrong proof is counted and committed in this very
                             // transaction, under the account's lock, and the invite stays.
-                            return Err(self.refuse_sign_in_proof(w, user, None, proof, now_ms).await);
+                            return Err(self.refuse_sign_in_proof(w, user, None, proof, now_ms, false).await);
                         }
                     }
                 }

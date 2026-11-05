@@ -15,7 +15,7 @@
 //!   after the fact in a transaction of its own ([`Meta::audit_record_failure`]), and a failure to write it is for the
 //!   caller to log: it must never change the answer or undo the abuse protection around it.
 //! - **Append-only, in the code.** Nothing here updates or deletes a row, with two named exceptions: the counter of an
-//!   aggregated failure (one row per account, action and minute, `agg_count + 1` on a collision) and
+//!   aggregated failure (one row per account, action, client kind and minute, `agg_count + 1` on a collision) and
 //!   [`Meta::audit_prune`], which deletes events older than the retention in batches of their own, never inside the
 //!   transaction of a security change. A test reads this crate's sources and allows exactly those two statements.
 
@@ -165,7 +165,8 @@ impl AuditAction {
         match self {
             AuditAction::AuthLogin | AuditAction::JoinInviteRedeemed | AuditAction::JoinPairingRedeemed => &[ClientKind, Platform],
             AuditAction::JoinResetRedeemed => &[Revoked, TwoFactorRemoved, ClientKind, Platform],
-            AuditAction::AuthLoginFailed | AuditAction::AuthSecondFactorFailed => &[Step],
+            AuditAction::AuthLoginFailed | AuditAction::AuthSecondFactorFailed => &[ClientKind, Step],
+            AuditAction::AuthRecoveryCodeUsed => &[ClientKind],
             AuditAction::DeviceRevoked => &[Reason],
             AuditAction::DeviceRevokedOthers => &[Revoked, Reason],
             AuditAction::AdminUserCreated => &[RoleTo],
@@ -180,9 +181,7 @@ impl AuditAction {
             | AuditAction::CliTwoFactorReset
             | AuditAction::CliDevicesRevokedAll
             | AuditAction::CliUserRemoved => &[Revoked],
-            AuditAction::AuthRecoveryCodeUsed
-            | AuditAction::AuthTwoFactorLocked
-            | AuditAction::AccountTwoFactorEnabled
+            AuditAction::AccountTwoFactorEnabled
             | AuditAction::AccountTwoFactorDisabled
             | AuditAction::AccountRecoveryCodesRegenerated
             | AuditAction::AdminUserEnabled
@@ -190,6 +189,7 @@ impl AuditAction {
             | AuditAction::AdminInviteRevoked
             | AuditAction::AdminPasswordResetIssued
             | AuditAction::AdminTwoFactorReset => &[],
+            AuditAction::AuthTwoFactorLocked => &[ClientKind],
         }
     }
 }
@@ -248,12 +248,13 @@ impl Platform {
     }
 }
 
-/// The client kinds an event names (the same closed list a sign-in may name, [`crate::CLIENT_KINDS`]).
+/// The client kinds an event names. Device kinds are [`crate::CLIENT_KINDS`]; `Web` is assigned only by web sign-in code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientKind {
     Agent,
     Desktop,
     Cli,
+    Web,
 }
 
 impl ClientKind {
@@ -262,9 +263,11 @@ impl ClientKind {
             ClientKind::Agent => "agent",
             ClientKind::Desktop => "desktop",
             ClientKind::Cli => "cli",
+            ClientKind::Web => "web",
         }
     }
 
+    /// Parses device-sent kinds only. Web is assigned by the server, never accepted from a device.
     fn parse(kind: &str) -> Option<Self> {
         [ClientKind::Agent, ClientKind::Desktop, ClientKind::Cli].into_iter().find(|known| known.as_str() == kind)
     }
@@ -323,6 +326,10 @@ impl AuditDetails {
 
     pub fn step(step: Step) -> Self {
         Self { step: Some(step), ..Self::default() }
+    }
+
+    pub fn web() -> Self {
+        Self { client_kind: Some(ClientKind::Web), ..Self::default() }
     }
 
     /// The value of `field`, if it is set.
@@ -517,7 +524,7 @@ pub(crate) async fn record_in(tx: &mut sqlx::Transaction<'static, sqlx::Any>, no
     insert(tx, &event, AuditOutcome::Success, now_ms, None).await
 }
 
-/// A failed sign-in step, to be counted in the row of its minute.
+/// A failed sign-in step, counted by action, client kind and minute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditFailure {
     /// `AuthLoginFailed` or `AuthSecondFactorFailed`; any other action is `Invalid`.
@@ -695,18 +702,29 @@ impl Meta {
     }
 
     /// Writes a failed sign-in step in a transaction of its own, after the fact: one row per account (or per minute, for
-    /// names no account has), action and minute, whose `count` goes up by one with every further try. The caller logs a
+    /// names no account has), action, client kind and minute, whose `count` goes up by one with every further try. The caller logs a
     /// failure and goes on: the answer to the client and the limits around the sign-in do not depend on this.
     pub async fn audit_record_failure(&self, failure: AuditFailure, now_ms: i64) -> Result<(), MetaError> {
+        self.audit_record_failure_kind(failure, None, now_ms).await
+    }
+
+    pub async fn audit_record_web_failure(&self, failure: AuditFailure, now_ms: i64) -> Result<(), MetaError> {
+        self.audit_record_failure_kind(failure, Some(ClientKind::Web), now_ms).await
+    }
+
+    async fn audit_record_failure_kind(&self, failure: AuditFailure, kind: Option<ClientKind>, now_ms: i64) -> Result<(), MetaError> {
         if !matches!(failure.action, AuditAction::AuthLoginFailed | AuditAction::AuthSecondFactorFailed) {
             return Err(MetaError::Invalid("only failed sign-in steps are aggregated"));
         }
-        let mut event = NewEvent::new(failure.action).with(AuditDetails::step(failure.step));
+        let mut details = AuditDetails::step(failure.step);
+        details.client_kind = kind;
+        let mut event = NewEvent::new(failure.action).with(details);
         if let Some(user) = failure.target {
             event = event.on_user(user);
         }
         let who = failure.target.map_or_else(|| "-".to_owned(), |u| u.0.simple().to_string());
-        let key = format!("{}:{who}:{}", failure.action.as_str(), now_ms.div_euclid(MINUTE_MS));
+        let kind = kind.map_or("device", ClientKind::as_str);
+        let key = format!("{}:{kind}:{who}:{}", failure.action.as_str(), now_ms.div_euclid(MINUTE_MS));
         let mut w = self.begin_write().await?;
         insert(&mut w.tx, &event, AuditOutcome::Failure, now_ms, Some(key)).await?;
         w.commit().await?;
@@ -914,7 +932,8 @@ mod tests {
             keys
         };
         assert_eq!(keys(AuditAction::AuthLogin), ["client_kind", "platform"]);
-        assert_eq!(keys(AuditAction::AuthLoginFailed), ["step"]);
+        assert_eq!(keys(AuditAction::AuthLoginFailed), ["client_kind", "step"]);
+        assert_eq!(keys(AuditAction::AuthRecoveryCodeUsed), ["client_kind"]);
         assert_eq!(keys(AuditAction::AdminRoleChanged), ["role_from", "role_to"]);
         assert_eq!(keys(AuditAction::AdminQuotaChanged), ["quota_bytes"]);
         assert_eq!(keys(AuditAction::AdminUserEnabled), Vec::<String>::new());

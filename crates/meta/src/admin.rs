@@ -6,7 +6,7 @@
 //!   that is disabled, signing out a device that is out already, giving the role an account has) writes no event.
 //! - **The acting admin is checked again inside every change** ([`AdminActor`], `begin_admin`): the role the middleware
 //!   read and the password the handler verified (a slow Argon2id check) can be stale by the time the transaction runs.
-//!   The device must still be signed in, the account neither disabled nor marked for removal, the role still `admin`
+//!   The device (or the browser session) must still be signed in, the account neither disabled nor marked for removal, the role still `admin`
 //!   and the password hash still the one that was verified.
 //! - **Lock order** in every change: (1) the `last_admin` transaction lock, if the change can take away an
 //!   administrator; (2) the rows of the acting admin and of the target, in ascending ID; (3) rows derived from them
@@ -29,6 +29,7 @@ use crate::codec::{to_i64, to_u64, uuid_bytes, uuid_from};
 use crate::join::{Purpose, put_code};
 use crate::two_factor;
 use crate::users::{delete_join_codes, insert_user, lock_user, revoke_devices};
+use crate::web::session_is_live;
 use crate::{DeviceRecord, Dialect, Meta, MetaError, RevokeReason, Role, UserId, WriteTx, valid_username};
 
 /// The key of the Postgres advisory lock that serialises changes which can take an administrator away. Arbitrary and
@@ -41,12 +42,33 @@ pub const MIN_QUOTA_BYTES: u64 = MAX_CHUNK_BYTES as u64;
 /// The longest username search an admin may make, in bytes.
 pub const MAX_SEARCH_BYTES: usize = 64;
 
+/// What an admin's request came with: the device token of the JSON API, or the browser session of the web admin.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AdminVia {
+    /// The device the request came with; it must still be signed in.
+    Device(DeviceId),
+    /// The hash of the session token the request came with and the idle lifetime of sessions; the session must still be valid
+    /// when the change runs (not logged out, under the account's current `auth_gen`, inside its absolute lifetime and not idle
+    /// for `idle_ms`, all judged at the time the change is made, so a request that began before the session ended cannot
+    /// change anything after). No device acts, so the events it writes name none.
+    Web { id_hash: [u8; 32], idle_ms: i64 },
+}
+
+impl std::fmt::Debug for AdminVia {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdminVia::Device(device) => f.debug_tuple("Device").field(device).finish(),
+            AdminVia::Web { idle_ms, .. } => f.debug_struct("Web").field("id_hash", &"<redacted>").field("idle_ms", idle_ms).finish(),
+        }
+    }
+}
+
 /// The admin who asks, as the handler knew them when it verified their password.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AdminActor {
     pub user: UserId,
-    /// The device the request came with; it must still be signed in.
-    pub device: DeviceId,
+    /// How the request signed in; it must still be so.
+    pub via: AdminVia,
     /// The stored password hash the confirmation was verified against; it must still be the account's.
     pub password_hash: String,
     /// Whether the acting admin's account had two-factor sign-in on when their confirmation was checked
@@ -58,7 +80,7 @@ impl std::fmt::Debug for AdminActor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdminActor")
             .field("user", &self.user)
-            .field("device", &self.device)
+            .field("via", &self.via)
             .field("password_hash", &"<redacted>")
             .field("two_factor", &self.two_factor)
             .finish()
@@ -73,6 +95,8 @@ pub struct AdminUser {
     pub role: Role,
     pub created_ms: i64,
     pub disabled_ms: Option<i64>,
+    /// When the account was marked for removal (it is disabled too); the lists leave such accounts out, a single lookup does not.
+    pub removed_ms: Option<i64>,
     /// Two-factor sign-in is on.
     pub two_factor_enabled: bool,
     /// Devices that are not revoked.
@@ -117,7 +141,7 @@ struct Target {
     has_password: bool,
 }
 
-const USER_SELECT: &str = "SELECT u.id, u.username, u.role, u.created_ms, u.disabled_ms, s.stored_bytes, s.quota_bytes, \
+const USER_SELECT: &str = "SELECT u.id, u.username, u.role, u.created_ms, u.disabled_ms, u.removed_ms, s.stored_bytes, s.quota_bytes, \
      (SELECT COUNT(*) FROM user_two_factor t WHERE t.user_id = u.id AND t.enabled_ms IS NOT NULL) AS two_factor, \
      (SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id AND d.revoked = 0) AS devices_active, \
      (SELECT COUNT(*) FROM invites i WHERE i.user_id = u.id AND i.purpose = 'invite' AND i.expires_ms > $1) AS invites \
@@ -131,6 +155,7 @@ fn admin_user_from(row: &sqlx::any::AnyRow) -> Result<AdminUser, MetaError> {
         role: Role::parse(&row.try_get::<String, _>("role")?)?,
         created_ms: row.try_get("created_ms")?,
         disabled_ms: row.try_get("disabled_ms")?,
+        removed_ms: row.try_get("removed_ms")?,
         two_factor_enabled: row.try_get::<i64, _>("two_factor")? > 0,
         devices_active: to_u64(row.try_get("devices_active")?)?,
         stored_bytes: to_u64(row.try_get("stored_bytes")?)?,
@@ -153,7 +178,11 @@ fn escape_like(text: &str) -> String {
 
 /// An event the acting admin makes to `target`.
 fn by_admin(actor: &AdminActor, action: AuditAction, target: UserId) -> NewEvent {
-    NewEvent::new(action).by(actor.user, Some(actor.device)).on_user(target)
+    let device = match actor.via {
+        AdminVia::Device(device) => Some(device),
+        AdminVia::Web { .. } => None,
+    };
+    NewEvent::new(action).by(actor.user, device).on_user(target)
 }
 
 fn same_user(a: UserId, b: UserId) -> bool {
@@ -186,15 +215,18 @@ impl Meta {
             .fetch_optional(&mut *w.tx)
             .await?;
         let Some(row) = row else { return Err(MetaError::DeviceRevoked) };
-        let still_signed_in = sqlx::query("SELECT 1 FROM devices WHERE id = $1 AND user_id = $2 AND revoked = 0")
-            .bind(uuid_bytes(actor.device.as_uuid()))
-            .bind(uuid_bytes(&actor.user.0))
-            .fetch_optional(&mut *w.tx)
-            .await?;
-        if still_signed_in.is_none()
-            || row.try_get::<Option<i64>, _>("disabled_ms")?.is_some()
-            || row.try_get::<Option<i64>, _>("removed_ms")?.is_some()
-        {
+        let still_signed_in = match actor.via {
+            AdminVia::Device(device) => sqlx::query("SELECT 1 FROM devices WHERE id = $1 AND user_id = $2 AND revoked = 0")
+                .bind(uuid_bytes(device.as_uuid()))
+                .bind(uuid_bytes(&actor.user.0))
+                .fetch_optional(&mut *w.tx)
+                .await?
+                .is_some(),
+            // The time is read here, after every lock wait above and in the order the module describes, so a session that ended
+            // while this change waited does not authorise it.
+            AdminVia::Web { id_hash, idle_ms } => session_is_live(&mut w, actor.user, &id_hash, self.clock_ms(), idle_ms).await?,
+        };
+        if !still_signed_in || row.try_get::<Option<i64>, _>("disabled_ms")?.is_some() || row.try_get::<Option<i64>, _>("removed_ms")?.is_some() {
             return Err(MetaError::DeviceRevoked);
         }
         if Role::parse(&row.try_get::<String, _>("role")?)? != Role::Admin {

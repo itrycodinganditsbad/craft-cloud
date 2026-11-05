@@ -4,8 +4,8 @@
 //! `CRAFT_CLOUD_TEST_PG` into a failure instead of a skip.
 
 use craft_cloud_meta::{
-    AdminActor, AdminUser, BlobKind, DeviceActor, DeviceClient, DeviceRecord, InviteFor, MIN_QUOTA_BYTES, Meta, MetaError, NewChallenge, Proof,
-    RECOVERY_CODES, RESET_TTL_MS, Redeemed, RevokeReason, Role, SignIn, UnreadableSecret, UserId, UserRecord,
+    AdminActor, AdminUser, AdminVia, BlobKind, DeviceActor, DeviceClient, DeviceRecord, InviteFor, MIN_QUOTA_BYTES, Meta, MetaError, NewChallenge,
+    NewWebSession, Proof, RECOVERY_CODES, RESET_TTL_MS, Redeemed, RevokeReason, Role, SignIn, UnreadableSecret, UserId, UserRecord, WebSignIn,
 };
 use craft_cloud_proto::api::PairingState;
 use craft_cloud_proto::join::{Code, INVITE_CHARS, INVITE_TTL_MS, PAIRING_CHARS, PAIRING_TTL_MS};
@@ -202,6 +202,11 @@ on_every_backend!(
     the_lock_writes_one_event_when_it_is_set,
     a_join_writes_its_two_factor_events,
     resets_and_confirmations_write_their_events,
+    web_sessions_are_made_looked_up_expire_and_log_out,
+    a_web_session_ends_with_every_change_of_the_accounts_generation,
+    a_web_sign_in_with_two_factor_needs_its_own_challenge,
+    web_sessions_are_pruned_in_bounded_batches,
+    a_web_actor_changes_accounts_until_its_session_ends,
 );
 
 // ---- helpers ----
@@ -1835,6 +1840,7 @@ async fn upgrading_counts_what_each_space_already_stores() {
         use sqlx::Connection;
         let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
         // Before the audit log.
+        sqlx::query("DROP TABLE web_sessions").execute(&mut conn).await.unwrap();
         sqlx::query("DROP TABLE audit_events").execute(&mut conn).await.unwrap();
         sqlx::query("DROP TABLE login_challenges").execute(&mut conn).await.unwrap();
         sqlx::query("DROP TABLE user_recovery_codes").execute(&mut conn).await.unwrap();
@@ -1886,7 +1892,7 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 10);
+    assert_eq!(versions, 11);
 }
 
 // ---- device sessions (migration 0007) ----
@@ -2215,6 +2221,7 @@ async fn back_to_0006(url: &str) {
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
     // What migrations 0010, 0009 and 0008 added goes first: they run again with 0007 on the next open.
+    sqlx::query("DROP TABLE web_sessions").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE audit_events").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE login_challenges").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE user_recovery_codes").execute(&mut conn).await.unwrap();
@@ -2257,7 +2264,7 @@ async fn migrating_from_0006_keeps_the_rows(url: &str) {
     assert_eq!(schema_version(url).await, 6);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 10);
+    assert_eq!(schema_version(url).await, 11);
     let old = record(&meta, &ana, live).await;
     assert_eq!(
         (old.name.as_str(), old.revoked, old.client, old.revoked_ms, old.revoke_reason),
@@ -2278,7 +2285,7 @@ async fn migrating_from_0006_keeps_the_rows(url: &str) {
     // A database from a newer Craft Cloud is still refused.
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    sqlx::query("INSERT INTO schema_version (version) VALUES (11)").execute(&mut conn).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (12)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
 }
@@ -2385,8 +2392,16 @@ const ADMIN_HASH: &str = "$argon2id$admin";
 async fn admin_actor(meta: &Meta, username: &str) -> (UserRecord, AdminActor) {
     let u = meta.create_user(username, ADMIN_HASH, Role::Admin, NOW).await.unwrap();
     let device = device(meta, &u).await;
-    let actor = AdminActor { user: u.id, device, password_hash: ADMIN_HASH.to_owned(), two_factor: false };
+    let actor = AdminActor { user: u.id, via: AdminVia::Device(device), password_hash: ADMIN_HASH.to_owned(), two_factor: false };
     (u, actor)
+}
+
+/// The device a device-borne actor acts with.
+fn device_of(actor: &AdminActor) -> DeviceId {
+    match actor.via {
+        AdminVia::Device(device) => device,
+        AdminVia::Web { .. } => panic!("a device actor was expected"),
+    }
 }
 
 /// The generation a sign-in would read for `username` now.
@@ -2518,7 +2533,8 @@ async fn an_admin_changes_a_role_and_a_quota(meta: &Meta) {
     // The demoted admin's next change is refused: they are no admin any more.
     let result = meta.admin_update_user(&actor, ana.id, Some(Role::Member), None, NOW).await;
     assert!(matches!(result, Err(MetaError::Forbidden(_))), "{result:?}");
-    let ana_actor = AdminActor { user: ana.id, device: device(meta, &ana).await, password_hash: "$argon2id$stub".to_owned(), two_factor: false };
+    let ana_actor =
+        AdminActor { user: ana.id, via: AdminVia::Device(device(meta, &ana).await), password_hash: "$argon2id$stub".to_owned(), two_factor: false };
     meta.admin_remove_user(&ana_actor, root.id, NOW).await.unwrap();
     let result = meta.admin_update_user(&ana_actor, root.id, Some(Role::Admin), None, NOW).await;
     assert!(matches!(result, Err(MetaError::Conflict(_))), "{result:?}");
@@ -2553,7 +2569,7 @@ async fn the_acting_admins_state_is_checked_in_the_transaction(meta: &Meta) {
     assert!(matches!(issue(demoted_actor).await, Err(MetaError::Forbidden(_))));
     // A signed-out device is unauthorized.
     let (signed_out, signed_out_actor) = admin_actor(meta, "signedout").await;
-    meta.revoke_device(signed_out.id, signed_out_actor.device).await.unwrap();
+    meta.revoke_device(signed_out.id, device_of(&signed_out_actor)).await.unwrap();
     assert!(matches!(issue(signed_out_actor).await, Err(MetaError::DeviceRevoked)));
     // A password changed since it was checked is a conflict.
     let (changed, changed_actor) = admin_actor(meta, "changed").await;
@@ -2564,11 +2580,15 @@ async fn the_acting_admins_state_is_checked_in_the_transaction(meta: &Meta) {
     meta.admin_disable_user(&boss, off.id, NOW).await.unwrap();
     assert!(matches!(issue(off_actor).await, Err(MetaError::DeviceRevoked)));
     // Another account's device is not the actor's.
-    let borrowed = AdminActor { device: device(meta, &victim).await, ..boss.clone() };
+    let borrowed = AdminActor { via: AdminVia::Device(device(meta, &victim).await), ..boss.clone() };
     assert!(matches!(issue(borrowed).await, Err(MetaError::DeviceRevoked)));
     // A member who is no admin at all.
-    let member_actor =
-        AdminActor { user: victim.id, device: device(meta, &victim).await, password_hash: "$argon2id$stub".to_owned(), two_factor: false };
+    let member_actor = AdminActor {
+        user: victim.id,
+        via: AdminVia::Device(device(meta, &victim).await),
+        password_hash: "$argon2id$stub".to_owned(),
+        two_factor: false,
+    };
     assert!(matches!(meta.admin_disable_user(&member_actor, demoted.id, NOW).await, Err(MetaError::Forbidden(_))));
     assert_eq!(meta.admin_server_counts().await.unwrap().users, users_before + 4, "only the four admins made here, no account from a refused change");
     // Every kind of change checks, not only the first: one of each against a stale actor.
@@ -3004,15 +3024,16 @@ async fn migrating_from_0009_keeps_the_rows(url: &str) {
         (ana, invite, events.len())
     };
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    sqlx::query("DROP TABLE web_sessions").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE login_challenges").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE user_recovery_codes").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE user_two_factor").execute(&mut conn).await.unwrap();
     sqlx::query("ALTER TABLE invites DROP COLUMN reset_two_factor").execute(&mut conn).await.unwrap();
-    sqlx::query("DELETE FROM schema_version WHERE version = 10").execute(&mut conn).await.unwrap();
+    sqlx::query("DELETE FROM schema_version WHERE version >= 10").execute(&mut conn).await.unwrap();
     drop(conn);
     assert_eq!(schema_version(url).await, 9, "the audit log's migration stays");
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 10);
+    assert_eq!(schema_version(url).await, 11);
     assert_eq!(all_events(&meta).await.len(), audit_rows, "the audit rows are kept");
     assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().id, ana.id);
     assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 1).await.unwrap(), Some(false));
@@ -3041,6 +3062,7 @@ async fn back_to_0007(url: &str) {
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
     // The audit log (migration 0009) and two-factor sign-in (migration 0010) go first: they run again with 0008 on the next open.
+    sqlx::query("DROP TABLE web_sessions").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE audit_events").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE login_challenges").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE user_recovery_codes").execute(&mut conn).await.unwrap();
@@ -3071,7 +3093,7 @@ async fn migrating_from_0007_keeps_the_rows(url: &str) {
     assert_eq!(schema_version(url).await, 7);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 10);
+    assert_eq!(schema_version(url).await, 11);
     assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.user), Some(ana.id));
     let row = admin_view(&meta, ana.id).await;
     assert_eq!((row.disabled_ms, row.quota_bytes, row.stored_bytes, row.devices_active, row.invite_pending), (None, None, 42, 1, true));
@@ -3083,7 +3105,7 @@ async fn migrating_from_0007_keeps_the_rows(url: &str) {
 
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    sqlx::query("INSERT INTO schema_version (version) VALUES (11)").execute(&mut conn).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (12)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
 }
@@ -3219,7 +3241,7 @@ async fn every_operation_writes_exactly_its_events(meta: &Meta) {
     let e = seen.one().await;
     assert_eq!(
         (e.action, e.actor_user, e.actor_device, e.target_id),
-        (AuditAction::AdminUserCreated, Some(root.id), Some(actor.device), Some(newbie.id.0))
+        (AuditAction::AdminUserCreated, Some(root.id), Some(device_of(&actor)), Some(newbie.id.0))
     );
     assert_eq!(details(&e), json(r#"{"role_to":"member"}"#));
     // Invites: issued, revoked (a second revoke has nothing to revoke).
@@ -3304,7 +3326,7 @@ async fn every_operation_writes_exactly_its_events(meta: &Meta) {
     let e = seen.one().await;
     assert_eq!(
         (e.action, e.actor_user, e.actor_device, e.target_kind.as_str(), e.target_id),
-        (AuditAction::AdminDeviceRevoked, Some(root.id), Some(actor.device), "user", Some(ana.id.0))
+        (AuditAction::AdminDeviceRevoked, Some(root.id), Some(device_of(&actor)), "user", Some(ana.id.0))
     );
     assert_eq!(details(&e), json(&format!(r#"{{"device":"{anas}","reason":"admin"}}"#)));
     meta.admin_revoke_device(&actor, ana.id, anas, NOW).await.unwrap();
@@ -3371,7 +3393,7 @@ async fn a_refused_change_writes_no_event(meta: &Meta) {
     assert_eq!(meta.account(actor.user).await.unwrap().role, Role::Admin);
 }
 
-/// A sign-in step that failed is one row per account, action and minute, whose count goes up and whose identity, time and
+/// A sign-in step that failed is one row per account, action, client kind and minute, whose count goes up and whose identity, time and
 /// details stay those of the first try; names no account has share one row per minute; an event that is not a failed step
 /// cannot be aggregated.
 async fn failed_sign_ins_count_up_in_one_row_per_account_and_minute(meta: &Meta) {
@@ -3387,12 +3409,17 @@ async fn failed_sign_ins_count_up_in_one_row_per_account_and_minute(meta: &Meta)
         (AuditAction::AuthLoginFailed, AuditOutcome::Failure, 1, None, Some(ana.id.0))
     );
     assert_eq!((first.target_kind.as_str(), details(&first)), ("user", json(r#"{"step":"password"}"#)));
+    meta.audit_record_web_failure(login(Some(ana.id)), minute + 1_000).await.unwrap();
+    let rows = all_events(meta).await;
+    assert_eq!(rows.len(), 2, "device and web failure aggregates stay separate");
+    assert!(rows.iter().any(|event| details(event) == json(r#"{"client_kind":"web","step":"password"}"#)));
     // The same minute: the count goes up, nothing else changes.
     meta.audit_record_failure(login(Some(ana.id)), minute + 59_000).await.unwrap();
     meta.audit_record_failure(login(Some(ana.id)), minute + 59_999).await.unwrap();
     let rows = all_events(meta).await;
-    assert_eq!(rows.len(), 1);
-    assert_eq!((rows[0].id, rows[0].at_ms, rows[0].count, &rows[0].details), (first.id, minute + 1_000, 3, &first.details));
+    assert_eq!(rows.len(), 2);
+    let device_row = rows.iter().find(|event| event.id == first.id).unwrap();
+    assert_eq!((device_row.id, device_row.at_ms, device_row.count, &device_row.details), (first.id, minute + 1_000, 3, &first.details));
     // The next minute is a new row; another account, another action, another row.
     meta.audit_record_failure(login(Some(ana.id)), minute + 60_000).await.unwrap();
     meta.audit_record_failure(login(Some(bob.id)), minute + 1_000).await.unwrap();
@@ -3400,10 +3427,13 @@ async fn failed_sign_ins_count_up_in_one_row_per_account_and_minute(meta: &Meta)
         .await
         .unwrap();
     let rows = all_events(meta).await;
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 5);
     let mut counts: Vec<(&str, u64)> = rows.iter().map(|e| (e.action.as_str(), e.count)).collect();
     counts.sort_unstable();
-    assert_eq!(counts, [("auth.login_failed", 1), ("auth.login_failed", 1), ("auth.login_failed", 3), ("auth.second_factor_failed", 1)]);
+    assert_eq!(
+        counts,
+        [("auth.login_failed", 1), ("auth.login_failed", 1), ("auth.login_failed", 1), ("auth.login_failed", 3), ("auth.second_factor_failed", 1)]
+    );
     // Names nobody has: one row a minute whatever was typed, with no account in it.
     for _ in 0..4 {
         meta.audit_record_failure(login(None), minute + 2_000).await.unwrap();
@@ -3808,6 +3838,7 @@ async fn a_write_prunes_old_events_after_its_commit() {
 async fn back_to_0008(url: &str) {
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    sqlx::query("DROP TABLE web_sessions").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE audit_events").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE login_challenges").execute(&mut conn).await.unwrap();
     sqlx::query("DROP TABLE user_recovery_codes").execute(&mut conn).await.unwrap();
@@ -3833,7 +3864,7 @@ async fn migrating_from_0008_adds_the_audit_log(url: &str) {
     assert_eq!(schema_version(url).await, 8);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 10, "the audit log's migration is 9, two-factor sign-in's 10: both run");
+    assert_eq!(schema_version(url).await, 11, "the audit log's migration is 9, two-factor sign-in's 10, web sessions' 11: all run");
     assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.user), Some(ana.id));
     assert!(all_events(&meta).await.is_empty(), "a new log is empty");
     meta.sign_in_device(ana.id, (&ana.password_hash, ana.auth_gen), "pc", &DeviceClient::default(), &token(), NOW).await.unwrap().unwrap();
@@ -3842,7 +3873,7 @@ async fn migrating_from_0008_adds_the_audit_log(url: &str) {
 
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    sqlx::query("INSERT INTO schema_version (version) VALUES (11)").execute(&mut conn).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (12)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
 }
@@ -4565,10 +4596,10 @@ async fn admins_two_factor_is_checked_in_the_change_and_resets_need_it(meta: &Me
         let (u, a) = admin_actor(meta, "boss").await;
         (u, a)
     };
-    // Turn two-factor sign-in on for the acting admin "boss" (device `boss_actor.device`).
-    let actor_for = DeviceActor { user: boss_admin.id, device: boss_actor.device, password_hash: ADMIN_HASH.to_owned() };
+    // Turn two-factor sign-in on for the acting admin "boss" (device `device_of(&boss_actor)`).
+    let actor_for = DeviceActor { user: boss_admin.id, device: device_of(&boss_actor), password_hash: ADMIN_HASH.to_owned() };
     meta.two_factor_begin_setup(&actor_for, b"cipher", SETUP_AT).await.unwrap();
-    meta.two_factor_confirm(boss_admin.id, boss_actor.device, &*right(FIRST_STEP), &[code(INVITE_CHARS).hash()], SETUP_AT + 1).await.unwrap();
+    meta.two_factor_confirm(boss_admin.id, device_of(&boss_actor), &*right(FIRST_STEP), &[code(INVITE_CHARS).hash()], SETUP_AT + 1).await.unwrap();
     // A confirmation that was given when it was off, and a change after it turned on, conflict (and the other way round).
     let hash = code(INVITE_CHARS).hash();
     let result = meta.admin_issue_invite(&boss_actor, member.user.id, &hash, SETUP_AT + 2, INVITE_TTL_MS).await;
@@ -4950,7 +4981,7 @@ async fn resets_and_confirmations_write_their_events(meta: &Meta) {
     let e = seen.one().await;
     assert_eq!(
         (e.action, e.outcome, e.actor_user, e.actor_device, e.target_id),
-        (AuditAction::AdminTwoFactorReset, AuditOutcome::Success, Some(admin.user), Some(admin.device), Some(member.user.id.0))
+        (AuditAction::AdminTwoFactorReset, AuditOutcome::Success, Some(admin.user), Some(device_of(&admin)), Some(member.user.id.0))
     );
     assert_eq!(details(&e), json("{}"));
     assert_eq!(revoked.len(), 1);
@@ -5052,4 +5083,474 @@ async fn an_error_in_the_log_fails_every_two_factor_change_on_postgres() {
         return;
     };
     an_error_in_the_log_fails_every_two_factor_change(&url).await;
+}
+
+// ---- web sessions (migration 0011) ----
+
+const WEB_IDLE_MS: i64 = 8 * 60 * MINUTE;
+const WEB_ABSOLUTE_MS: i64 = 7 * 24 * 60 * MINUTE;
+
+fn new_session() -> NewWebSession {
+    NewWebSession { id_hash: token(), absolute_ms: WEB_ABSOLUTE_MS }
+}
+
+/// An administrator with a password hash the web sign-ins below check against.
+async fn web_admin(meta: &Meta, username: &str) -> UserRecord {
+    meta.create_user(username, ADMIN_HASH, Role::Admin, NOW).await.unwrap()
+}
+
+/// A web sign-in of `user` as the handler would make it after verifying the password.
+async fn web_sign_in(meta: &Meta, user: &UserRecord, session: &NewWebSession, now: i64) -> Option<WebSignIn> {
+    let generation = gen_of(meta, &user.username).await;
+    meta.web_sign_in(user.id, (&user.password_hash, generation), &new_challenge(), session, now).await.unwrap()
+}
+
+async fn session_is_valid(meta: &Meta, session: &NewWebSession, now: i64) -> bool {
+    meta.web_session(&session.id_hash, now, WEB_IDLE_MS).await.unwrap().is_some()
+}
+
+/// Only administrators get a session; it is found by its token hash, ends by idle time, by its absolute lifetime and by
+/// logout, and the sign-in is written to the log without a device.
+async fn web_sessions_are_made_looked_up_expire_and_log_out(meta: &Meta) {
+    let root = web_admin(meta, "root").await;
+    let member = user(meta, "ana").await;
+    // A member with the right password gets nothing, the same as a wrong generation or a wrong hash.
+    assert_eq!(web_sign_in(meta, &member, &new_session(), NOW).await, None);
+    let stale = meta.web_sign_in(root.id, (&root.password_hash, 99), &new_challenge(), &new_session(), NOW).await.unwrap();
+    assert_eq!(stale, None, "the password was checked against another generation");
+    let wrong_hash = meta.web_sign_in(root.id, ("$argon2id$other", root.auth_gen), &new_challenge(), &new_session(), NOW).await.unwrap();
+    assert_eq!(wrong_hash, None);
+    assert_eq!(meta.web_sessions_open(member.id, NOW, WEB_IDLE_MS).await.unwrap(), 0);
+
+    let session = new_session();
+    assert_eq!(web_sign_in(meta, &root, &session, NOW).await, Some(WebSignIn::Session));
+    let found = meta.web_session(&session.id_hash, NOW + 1, WEB_IDLE_MS).await.unwrap().unwrap();
+    assert_eq!((found.user, found.username.as_str(), found.role, found.mfa_verified_ms), (root.id, "root", Role::Admin, None));
+    assert_eq!((found.created_ms, found.last_seen_ms, found.absolute_expires_ms), (NOW, NOW, NOW + WEB_ABSOLUTE_MS));
+    assert!(meta.web_session(&token(), NOW + 1, WEB_IDLE_MS).await.unwrap().is_none(), "an unknown token");
+    let events = all_events(meta).await;
+    let login = events.iter().find(|e| e.action == AuditAction::AuthLogin).unwrap();
+    assert_eq!((login.actor_user, login.actor_device), (Some(root.id), None));
+    assert_eq!(details(login), json(r#"{"client_kind":"web"}"#));
+    assert!(DeviceClient::new(Some("web"), None, None).is_err(), "devices cannot claim web");
+
+    // Idle: valid just inside the idle time, over at it, and a use moves it.
+    assert!(session_is_valid(meta, &session, NOW + WEB_IDLE_MS - 1).await);
+    assert!(!session_is_valid(meta, &session, NOW + WEB_IDLE_MS).await);
+    meta.web_session_seen(&session.id_hash, NOW + WEB_IDLE_MS - 1).await.unwrap();
+    assert!(session_is_valid(meta, &session, NOW + 2 * WEB_IDLE_MS - 2).await, "a use starts the idle time again");
+    // The time never moves back.
+    meta.web_session_seen(&session.id_hash, NOW + 5).await.unwrap();
+    assert_eq!(meta.web_session(&session.id_hash, NOW + WEB_IDLE_MS, WEB_IDLE_MS).await.unwrap().unwrap().last_seen_ms, NOW + WEB_IDLE_MS - 1);
+
+    // Absolute: keeping it busy does not help.
+    let busy = new_session();
+    assert_eq!(web_sign_in(meta, &root, &busy, NOW).await, Some(WebSignIn::Session));
+    let mut at = NOW;
+    while at + WEB_IDLE_MS / 2 < NOW + WEB_ABSOLUTE_MS {
+        at += WEB_IDLE_MS / 2;
+        meta.web_session_seen(&busy.id_hash, at).await.unwrap();
+        assert!(session_is_valid(meta, &busy, at).await);
+    }
+    assert!(!session_is_valid(meta, &busy, NOW + WEB_ABSOLUTE_MS).await, "the absolute lifetime ends it");
+
+    // Logout ends it at once, and a second logout, or one of an unknown session, is no error.
+    let out = new_session();
+    assert_eq!(web_sign_in(meta, &root, &out, NOW + 10).await, Some(WebSignIn::Session));
+    assert!(session_is_valid(meta, &out, NOW + 11).await);
+    meta.web_logout(&out.id_hash, NOW + 12).await.unwrap();
+    meta.web_logout(&out.id_hash, NOW + 13).await.unwrap();
+    meta.web_logout(&token(), NOW + 13).await.unwrap();
+    assert!(!session_is_valid(meta, &out, NOW + 14).await);
+    meta.web_session_seen(&out.id_hash, NOW + 15).await.unwrap();
+    assert!(!session_is_valid(meta, &out, NOW + 16).await, "a use does not revive a logged-out session");
+}
+
+/// An administrator with two-factor sign-in on, and a session made with it (the sign-in's second step). `step` is the time
+/// step of the code that made the session.
+async fn web_admin_with_factor(meta: &Meta, username: &str, step: i64, now: i64) -> (UserRecord, DeviceId, NewWebSession) {
+    let me = web_admin(meta, username).await;
+    let first = device(meta, &me).await;
+    let hashes: Vec<[u8; 32]> = (0..RECOVERY_CODES).map(|_| code(INVITE_CHARS).hash()).collect();
+    let setup = DeviceActor { user: me.id, device: first, password_hash: ADMIN_HASH.to_owned() };
+    meta.two_factor_begin_setup(&setup, b"cipher-of-the-secret", now).await.unwrap();
+    meta.two_factor_confirm(me.id, first, &*right(step), &hashes, now + 1).await.unwrap();
+    let (chal, session) = (new_challenge(), new_session());
+    let generation = gen_of(meta, username).await;
+    let made = meta.web_sign_in(me.id, (ADMIN_HASH, generation), &chal, &session, now + 2).await.unwrap();
+    assert!(matches!(made, Some(WebSignIn::Challenge { .. })));
+    meta.web_complete_second_factor(&chal.id_hash, &totp(&right(step + 1)), &session, now + 3).await.unwrap();
+    assert!(session_is_valid(meta, &session, now + 4).await);
+    (me, first, session)
+}
+
+/// Every change that raises `users.auth_gen` ends the account's sessions: a password change and reset, a disable, an enable
+/// after it, a removal, and two-factor sign-in turned on, off, or reset by an admin or the command line.
+async fn a_web_session_ends_with_every_change_of_the_accounts_generation(meta: &Meta) {
+    // The acting admin has two-factor sign-in, which resetting another administrator's needs.
+    let (boss, plain) = admin_actor(meta, "boss").await;
+    let boss_device = device_of(&plain);
+    let hashes: Vec<[u8; 32]> = (0..RECOVERY_CODES).map(|_| code(INVITE_CHARS).hash()).collect();
+    let setup = DeviceActor { user: boss.id, device: boss_device, password_hash: ADMIN_HASH.to_owned() };
+    meta.two_factor_begin_setup(&setup, b"cipher-of-the-secret", NOW).await.unwrap();
+    meta.two_factor_confirm(boss.id, boss_device, &*right(FIRST_STEP), &hashes, NOW + 1).await.unwrap();
+    let actor = AdminActor { two_factor: true, ..plain };
+    let mut now = NOW + 10;
+
+    // A password reset by the command line.
+    let root = web_admin(meta, "root").await;
+    let s = new_session();
+    assert_eq!(web_sign_in(meta, &root, &s, now).await, Some(WebSignIn::Session));
+    meta.reset_password(root.id, "$argon2id$new", true, now + 1).await.unwrap();
+    assert!(!session_is_valid(meta, &s, now + 2).await, "a password reset ends the session");
+    now += 10;
+
+    // A password change by a device.
+    let (ana, ana_actor) = admin_actor(meta, "ana").await;
+    let s = new_session();
+    assert_eq!(web_sign_in(meta, &ana, &s, now).await, Some(WebSignIn::Session));
+    meta.change_password(ana.id, ADMIN_HASH, "$argon2id$changed", device_of(&ana_actor), now + 1).await.unwrap();
+    assert!(!session_is_valid(meta, &s, now + 2).await, "a password change ends the session");
+    now += 10;
+
+    // Disable ends it, and an enable afterwards does not bring it back.
+    let target = web_admin(meta, "target").await;
+    let s = new_session();
+    assert_eq!(web_sign_in(meta, &target, &s, now).await, Some(WebSignIn::Session));
+    meta.admin_disable_user(&actor, target.id, now + 1).await.unwrap();
+    assert!(!session_is_valid(meta, &s, now + 2).await, "a disabled account's session is over");
+    meta.admin_enable_user(&actor, target.id, now + 3).await.unwrap();
+    assert!(!session_is_valid(meta, &s, now + 4).await, "enabling does not revive it");
+    now += 10;
+
+    // A removal.
+    let doomed = web_admin(meta, "doomed").await;
+    let s = new_session();
+    assert_eq!(web_sign_in(meta, &doomed, &s, now).await, Some(WebSignIn::Session));
+    meta.admin_remove_user(&actor, doomed.id, now + 1).await.unwrap();
+    assert!(!session_is_valid(meta, &s, now + 2).await, "a removed account's session is over");
+    now += 10;
+
+    // Two-factor sign-in turned on: a session from before it is over (a set-up that is not confirmed changes nothing).
+    let guarded = web_admin(meta, "guarded").await;
+    let guarded_device = device(meta, &guarded).await;
+    let s = new_session();
+    assert_eq!(web_sign_in(meta, &guarded, &s, now).await, Some(WebSignIn::Session));
+    let setup = DeviceActor { user: guarded.id, device: guarded_device, password_hash: ADMIN_HASH.to_owned() };
+    meta.two_factor_begin_setup(&setup, b"cipher-of-the-secret", now + 1).await.unwrap();
+    assert!(session_is_valid(meta, &s, now + 2).await, "an open set-up is no change");
+    let hashes: Vec<[u8; 32]> = (0..RECOVERY_CODES).map(|_| code(INVITE_CHARS).hash()).collect();
+    meta.two_factor_confirm(guarded.id, guarded_device, &*right(FIRST_STEP), &hashes, now + 3).await.unwrap();
+    assert!(!session_is_valid(meta, &s, now + 4).await, "turning two-factor sign-in on ends the session");
+    now += 10;
+
+    // Turned off by the account itself.
+    let (own, own_device, s) = web_admin_with_factor(meta, "own", FIRST_STEP, now).await;
+    let setup = DeviceActor { user: own.id, device: own_device, password_hash: ADMIN_HASH.to_owned() };
+    meta.two_factor_disable(&setup, &totp(&right(FIRST_STEP + 5)), now + 10).await.unwrap();
+    assert!(!session_is_valid(meta, &s, now + 11).await, "turning two-factor sign-in off ends the session");
+    now += 20;
+
+    // Reset by an admin, and by the command line.
+    let (by_admin, _, s) = web_admin_with_factor(meta, "byadmin", FIRST_STEP, now).await;
+    meta.admin_reset_two_factor(&actor, by_admin.id, now + 10).await.unwrap();
+    assert!(!session_is_valid(meta, &s, now + 11).await, "an admin's reset ends the session");
+    now += 20;
+    let (by_cli, _, s) = web_admin_with_factor(meta, "bycli", FIRST_STEP, now).await;
+    meta.reset_two_factor(by_cli.id, now + 10).await.unwrap();
+    assert!(!session_is_valid(meta, &s, now + 11).await, "the command line's reset ends the session");
+
+    // Another account's session is untouched by all of that.
+    let bystander = web_admin(meta, "bystander").await;
+    let s = new_session();
+    assert_eq!(web_sign_in(meta, &bystander, &s, now + 30).await, Some(WebSignIn::Session));
+    meta.reset_password(root.id, "$argon2id$again", true, now + 31).await.unwrap();
+    assert!(session_is_valid(meta, &s, now + 32).await);
+}
+
+/// An admin with two-factor sign-in gets a challenge of kind `web`, which no device sign-in can use and which makes no
+/// device, and completes it with a code, once. The second factor's counters and lock are the device sign-in's.
+async fn a_web_sign_in_with_two_factor_needs_its_own_challenge(meta: &Meta) {
+    let me = web_admin(meta, "root").await;
+    let first = device(meta, &me).await;
+    let hashes: Vec<[u8; 32]> = (0..RECOVERY_CODES).map(|_| code(INVITE_CHARS).hash()).collect();
+    let setup = DeviceActor { user: me.id, device: first, password_hash: ADMIN_HASH.to_owned() };
+    meta.two_factor_begin_setup(&setup, b"cipher-of-the-secret", SETUP_AT).await.unwrap();
+    meta.two_factor_confirm(me.id, first, &*right(FIRST_STEP), &hashes, SETUP_AT + 1).await.unwrap();
+
+    let generation = gen_of(meta, "root").await;
+    let chal = new_challenge();
+    let session = new_session();
+    let made = meta.web_sign_in(me.id, (ADMIN_HASH, generation), &chal, &session, SETUP_AT + 10).await.unwrap();
+    assert_eq!(made, Some(WebSignIn::Challenge { expires_ms: SETUP_AT + 10 + 5 * MINUTE }));
+    assert!(!session_is_valid(meta, &session, SETUP_AT + 11).await, "no session without the second factor");
+    assert_eq!(live_devices(meta, &me).await, vec![first], "and no device");
+    // The challenge is seen as a web one only.
+    assert_eq!(meta.web_challenge_owner(&chal.id_hash, SETUP_AT + 11).await.unwrap(), Some((me.id, "root".to_owned())));
+    assert_eq!(meta.challenge_owner(&chal.id_hash, SETUP_AT + 11).await.unwrap(), None, "a device sign-in does not see it");
+    let as_device = meta.complete_second_factor(&chal.id_hash, &totp(&right(FIRST_STEP + 1)), &token(), SETUP_AT + 12).await;
+    assert!(matches!(as_device, Err(MetaError::ChallengeGone)), "{as_device:?}");
+    assert_eq!(live_devices(meta, &me).await, vec![first], "still no new device, and the code was not used");
+    // And the other way round.
+    let device_chal = new_challenge();
+    let made = meta.sign_in(me.id, (ADMIN_HASH, generation), "pc", &DeviceClient::default(), &token(), &device_chal, SETUP_AT + 13).await.unwrap();
+    assert!(matches!(made, Some(SignIn::Challenge { .. })));
+    let as_web = meta.web_complete_second_factor(&device_chal.id_hash, &totp(&right(FIRST_STEP + 1)), &session, SETUP_AT + 14).await;
+    assert!(matches!(as_web, Err(MetaError::ChallengeGone)), "{as_web:?}");
+    assert!(!session_is_valid(meta, &session, SETUP_AT + 15).await);
+
+    // Wrong codes are counted (four, and the fifth would delete the challenge), then the right one makes the session, once.
+    for _ in 0..4 {
+        let result = meta.web_complete_second_factor(&chal.id_hash, &totp(&wrong()), &session, SETUP_AT + 20).await;
+        assert!(matches!(result, Err(MetaError::TwoFactorInvalid)), "{result:?}");
+    }
+    let done = meta.web_complete_second_factor(&chal.id_hash, &totp(&right(FIRST_STEP + 1)), &session, SETUP_AT + 21).await.unwrap();
+    assert_eq!(done, me.id);
+    let found = meta.web_session(&session.id_hash, SETUP_AT + 22, WEB_IDLE_MS).await.unwrap().unwrap();
+    assert_eq!(found.mfa_verified_ms, Some(SETUP_AT + 21), "the session says when the second factor was given");
+    assert_eq!(live_devices(meta, &me).await, vec![first], "a web sign-in makes no device");
+    let login = all_events(meta).await.into_iter().find(|event| event.action == AuditAction::AuthLogin).unwrap();
+    assert_eq!(details(&login), json(r#"{"client_kind":"web"}"#));
+    let failed = all_events(meta).await.into_iter().find(|event| event.action == AuditAction::AuthSecondFactorFailed).unwrap();
+    assert_eq!(details(&failed), json(r#"{"client_kind":"web","step":"totp"}"#));
+    let again = meta.web_complete_second_factor(&chal.id_hash, &totp(&right(FIRST_STEP + 2)), &new_session(), SETUP_AT + 23).await;
+    assert!(matches!(again, Err(MetaError::ChallengeGone)), "once: {again:?}");
+
+    // The same time step is not accepted again (the counter is the device sign-in's and the admin confirmation's).
+    let generation = gen_of(meta, "root").await;
+    let replay = new_challenge();
+    meta.web_sign_in(me.id, (ADMIN_HASH, generation), &replay, &new_session(), SETUP_AT + 24).await.unwrap();
+    let replayed = meta.web_complete_second_factor(&replay.id_hash, &totp(&right(FIRST_STEP + 1)), &new_session(), SETUP_AT + 25).await;
+    assert!(matches!(replayed, Err(MetaError::TwoFactorInvalid)), "{replayed:?}");
+    // Wrong proofs lock the second factor for every way of using it: a device sign-in's step too.
+    for n in 0..12 {
+        let _ = confirm_with(meta, me.id, None, SETUP_AT + 30 + n).await;
+    }
+    let locked = meta.web_complete_second_factor(&replay.id_hash, &totp(&right(FIRST_STEP + 9)), &new_session(), SETUP_AT + 50).await;
+    assert!(matches!(locked, Err(MetaError::TwoFactorLocked { .. })), "{locked:?}");
+    let locked = meta.complete_second_factor(&device_chal.id_hash, &totp(&right(FIRST_STEP + 9)), &token(), SETUP_AT + 51).await;
+    assert!(matches!(locked, Err(MetaError::TwoFactorLocked { .. })), "{locked:?}");
+}
+
+/// Pruning deletes sessions that are over (logged out, expired, idle), never a valid one, and at most the batch asked for.
+async fn web_sessions_are_pruned_in_bounded_batches(meta: &Meta) {
+    let root = web_admin(meta, "root").await;
+    let late = NOW + WEB_ABSOLUTE_MS - 2 * WEB_IDLE_MS;
+    let now = NOW + WEB_ABSOLUTE_MS - WEB_IDLE_MS;
+    let keep = new_session();
+    assert_eq!(web_sign_in(meta, &root, &keep, now - MINUTE).await, Some(WebSignIn::Session));
+    for n in 0..5 {
+        assert_eq!(web_sign_in(meta, &root, &new_session(), NOW + n).await, Some(WebSignIn::Session));
+    }
+    let out = new_session();
+    assert_eq!(web_sign_in(meta, &root, &out, late).await, Some(WebSignIn::Session));
+    meta.web_logout(&out.id_hash, late + 1).await.unwrap();
+
+    assert_eq!(meta.web_sessions_count_over(now, WEB_IDLE_MS).await.unwrap(), 6, "five idle ones and the logged-out one");
+    assert_eq!(meta.web_sessions_prune(now, WEB_IDLE_MS, 4).await.unwrap(), 4, "a batch is bounded");
+    assert_eq!(meta.web_sessions_count_over(now, WEB_IDLE_MS).await.unwrap(), 2);
+    assert_eq!(meta.web_sessions_prune(now, WEB_IDLE_MS, 4).await.unwrap(), 2);
+    assert_eq!(meta.web_sessions_prune(now, WEB_IDLE_MS, 4).await.unwrap(), 0, "nothing is left to delete");
+    assert!(session_is_valid(meta, &keep, now).await, "a valid session is never pruned");
+    // Past the absolute lifetime the last one goes too.
+    let end = NOW + 2 * WEB_ABSOLUTE_MS;
+    assert_eq!(meta.web_sessions_prune(end, WEB_IDLE_MS, 100).await.unwrap(), 1);
+    assert_eq!(meta.web_sessions_count_over(end, WEB_IDLE_MS).await.unwrap(), 0);
+}
+
+/// An admin change made on a browser session is audited without a device, and a session that was logged out, or whose account
+/// changed, can no longer make one.
+async fn a_web_actor_changes_accounts_until_its_session_ends(meta: &Meta) {
+    // The store judges the session by its own clock, which follows the time each call below is made at.
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(NOW));
+    let ticking = clock.clone();
+    let meta = &meta.clone().with_clock(std::sync::Arc::new(move || ticking.load(std::sync::atomic::Ordering::SeqCst)));
+    let at_ms = |t: i64| {
+        clock.store(t, std::sync::atomic::Ordering::SeqCst);
+        t
+    };
+    let root = web_admin(meta, "root").await;
+    let session = new_session();
+    assert_eq!(web_sign_in(meta, &root, &session, NOW).await, Some(WebSignIn::Session));
+    let actor = AdminActor {
+        user: root.id,
+        via: AdminVia::Web { id_hash: session.id_hash, idle_ms: WEB_IDLE_MS },
+        password_hash: ADMIN_HASH.to_owned(),
+        two_factor: false,
+    };
+    assert!(!format!("{actor:?}").contains(&format!("{:?}", session.id_hash)), "the session's hash is not in Debug");
+    let ana = user(meta, "ana").await;
+    meta.admin_update_user(&actor, ana.id, None, Some(Some(MIN_QUOTA_BYTES)), at_ms(NOW + 1)).await.unwrap();
+    let events = all_events(meta).await;
+    let changed = events.iter().find(|e| e.action == AuditAction::AdminQuotaChanged).unwrap();
+    assert_eq!((changed.actor_user, changed.actor_device), (Some(root.id), None), "no device acted");
+    // Another account's session is not this admin's.
+    let other = web_admin(meta, "other").await;
+    let theirs = new_session();
+    assert_eq!(web_sign_in(meta, &other, &theirs, NOW).await, Some(WebSignIn::Session));
+    let borrowed = AdminActor { via: AdminVia::Web { id_hash: theirs.id_hash, idle_ms: WEB_IDLE_MS }, ..actor.clone() };
+    assert!(matches!(meta.admin_update_user(&borrowed, ana.id, None, Some(None), at_ms(NOW + 2)).await, Err(MetaError::DeviceRevoked)));
+    // A session that does not exist.
+    let unknown = AdminActor { via: AdminVia::Web { id_hash: token(), idle_ms: WEB_IDLE_MS }, ..actor.clone() };
+    assert!(matches!(meta.admin_update_user(&unknown, ana.id, None, Some(None), at_ms(NOW + 3)).await, Err(MetaError::DeviceRevoked)));
+    // Logged out: refused, and nothing changed.
+    meta.web_logout(&session.id_hash, NOW + 4).await.unwrap();
+    assert!(matches!(meta.admin_update_user(&actor, ana.id, None, Some(None), at_ms(NOW + 5)).await, Err(MetaError::DeviceRevoked)));
+    assert_eq!(admin_view(meta, ana.id).await.quota_bytes, Some(MIN_QUOTA_BYTES));
+    // A session that expired between the request's start and the change (the handler's check was passed, the transaction runs
+    // later): refused by the idle time and by the absolute lifetime, and nothing changed.
+    let slow = new_session();
+    assert_eq!(web_sign_in(meta, &root, &slow, NOW + 20).await, Some(WebSignIn::Session));
+    let slow_actor = AdminActor { via: AdminVia::Web { id_hash: slow.id_hash, idle_ms: WEB_IDLE_MS }, ..actor.clone() };
+    let idle = meta.admin_update_user(&slow_actor, ana.id, None, Some(None), at_ms(NOW + 20 + WEB_IDLE_MS)).await;
+    assert!(matches!(idle, Err(MetaError::DeviceRevoked)), "idle: {idle:?}");
+    meta.admin_update_user(&slow_actor, ana.id, None, Some(None), at_ms(NOW + 20 + WEB_IDLE_MS - 1)).await.unwrap();
+    let busy = new_session();
+    assert_eq!(web_sign_in(meta, &root, &busy, NOW + 30).await, Some(WebSignIn::Session));
+    let busy_actor = AdminActor { via: AdminVia::Web { id_hash: busy.id_hash, idle_ms: WEB_IDLE_MS }, ..actor.clone() };
+    let mut at = NOW + 30;
+    while at + WEB_IDLE_MS / 2 < NOW + 30 + WEB_ABSOLUTE_MS {
+        at += WEB_IDLE_MS / 2;
+        meta.web_session_seen(&busy.id_hash, at).await.unwrap();
+    }
+    meta.admin_update_user(&busy_actor, ana.id, None, Some(None), at_ms(at)).await.unwrap();
+    let absolute = meta.admin_update_user(&busy_actor, ana.id, None, Some(Some(MIN_QUOTA_BYTES)), at_ms(NOW + 30 + WEB_ABSOLUTE_MS)).await;
+    assert!(matches!(absolute, Err(MetaError::DeviceRevoked)), "absolute: {absolute:?}");
+    assert_eq!(admin_view(meta, ana.id).await.quota_bytes, None);
+    // A session of a changed account: the generation moved on.
+    let late = new_session();
+    assert_eq!(web_sign_in(meta, &root, &late, NOW + 6).await, Some(WebSignIn::Session));
+    let late_actor = AdminActor { via: AdminVia::Web { id_hash: late.id_hash, idle_ms: WEB_IDLE_MS }, ..actor.clone() };
+    meta.admin_update_user(&late_actor, ana.id, None, Some(None), at_ms(NOW + 7)).await.unwrap();
+    meta.reset_password(root.id, "$argon2id$new", true, NOW + 8).await.unwrap();
+    let after = meta.admin_update_user(&late_actor, ana.id, None, Some(Some(MIN_QUOTA_BYTES)), at_ms(NOW + 9)).await;
+    assert!(matches!(after, Err(MetaError::DeviceRevoked)), "{after:?}");
+    assert_eq!(admin_view(meta, ana.id).await.quota_bytes, None);
+}
+
+// ---- the migration from 0010 to 0011 ----
+
+/// Drops what migration 0011 added and forgets it ran, which leaves the database as 0010 left it (with its rows).
+async fn back_to_0010(url: &str) {
+    use sqlx::Connection;
+    let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    sqlx::query("DROP TABLE web_sessions").execute(&mut conn).await.unwrap();
+    sqlx::query("DELETE FROM schema_version WHERE version >= 11").execute(&mut conn).await.unwrap();
+}
+
+/// A database from the release before the web admin keeps its accounts, devices and audit log, gets an empty session table
+/// that works (also after the migration is rolled back and run again), and a database newer than the program is still refused.
+async fn migrating_from_0010_adds_the_web_sessions(url: &str) {
+    sqlx::any::install_default_drivers();
+    let (root, old_token, events) = {
+        let meta = Meta::open(url).await.unwrap();
+        let root = web_admin(&meta, "root").await;
+        let old_token = token();
+        meta.create_device(root.id, "old pc", &old_token, NOW).await.unwrap();
+        meta.sign_in_device(root.id, (&root.password_hash, root.auth_gen), "pc", &DeviceClient::default(), &token(), NOW).await.unwrap().unwrap();
+        let events = all_events(&meta).await.len();
+        (root, old_token, events)
+    };
+    back_to_0010(url).await;
+    assert_eq!(schema_version(url).await, 10);
+
+    let meta = Meta::open(url).await.unwrap();
+    assert_eq!(schema_version(url).await, 11, "web sessions are migration 11");
+    assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.user), Some(root.id));
+    assert_eq!(all_events(&meta).await.len(), events, "the audit rows are kept");
+    let session = new_session();
+    assert_eq!(web_sign_in(&meta, &root, &session, NOW + 5).await, Some(WebSignIn::Session));
+    assert!(session_is_valid(&meta, &session, NOW + 6).await);
+
+    // The rollback: the table goes, the version is forgotten, and opening again makes the table again.
+    drop(meta);
+    back_to_0010(url).await;
+    assert_eq!(schema_version(url).await, 10);
+    let meta = Meta::open(url).await.unwrap();
+    assert_eq!(schema_version(url).await, 11);
+    assert!(!session_is_valid(&meta, &session, NOW + 6).await, "the table is new and empty");
+    drop(meta);
+
+    // A database from a newer Craft Cloud is still refused.
+    use sqlx::Connection;
+    let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (12)").execute(&mut conn).await.unwrap();
+    drop(conn);
+    assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
+}
+
+#[tokio::test]
+async fn migrating_from_0010_adds_the_web_sessions_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    migrating_from_0010_adds_the_web_sessions(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migrating_from_0010_adds_the_web_sessions_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    migrating_from_0010_adds_the_web_sessions(&url).await;
+}
+
+// ---- a change that waits for its locks while its session ends ----
+
+/// The time a change judges its session by is read after the change has its locks: one that waited while the session went idle
+/// is refused, and changes nothing.
+async fn a_session_that_ends_while_a_change_waits_for_its_locks_does_not_authorise_it(url: &str) {
+    use sqlx::Connection;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    sqlx::any::install_default_drivers();
+    let now = Arc::new(AtomicI64::new(NOW));
+    let ticking = now.clone();
+    let meta = Meta::open(url).await.unwrap().with_clock(Arc::new(move || ticking.load(Ordering::SeqCst)));
+    let root = web_admin(&meta, "root").await;
+    let ana = user(&meta, "ana").await;
+    let session = new_session();
+    assert_eq!(web_sign_in(&meta, &root, &session, NOW).await, Some(WebSignIn::Session));
+    let actor = AdminActor {
+        user: root.id,
+        via: AdminVia::Web { id_hash: session.id_hash, idle_ms: WEB_IDLE_MS },
+        password_hash: ADMIN_HASH.to_owned(),
+        two_factor: false,
+    };
+    // Another connection holds the write lock (SQLite) or the admin's row (Postgres) until the test lets go.
+    let mut holder = sqlx::AnyConnection::connect(url).await.unwrap();
+    if url.starts_with("sqlite:") {
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut holder).await.unwrap();
+    } else {
+        sqlx::query("BEGIN").execute(&mut holder).await.unwrap();
+        sqlx::query("UPDATE users SET username = username WHERE username = 'root'").execute(&mut holder).await.unwrap();
+    }
+    let change = {
+        let (meta, actor, ana) = (meta.clone(), actor.clone(), ana.id);
+        tokio::spawn(async move { meta.admin_update_user(&actor, ana, None, Some(Some(MIN_QUOTA_BYTES)), NOW + 1).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(!change.is_finished(), "the change is waiting for the lock");
+    now.store(NOW + WEB_IDLE_MS + 5, Ordering::SeqCst);
+    sqlx::query("COMMIT").execute(&mut holder).await.unwrap();
+    let result = change.await.unwrap();
+    assert!(matches!(result, Err(MetaError::DeviceRevoked)), "{result:?}");
+    assert_eq!(admin_view(&meta, ana.id).await.quota_bytes, None, "nothing changed");
+    // The same change while the session is valid goes through.
+    now.store(NOW + 2, Ordering::SeqCst);
+    meta.admin_update_user(&actor, ana.id, None, Some(Some(MIN_QUOTA_BYTES)), NOW + 2).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_session_that_ends_while_a_change_waits_for_its_locks_does_not_authorise_it_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    a_session_that_ends_while_a_change_waits_for_its_locks_does_not_authorise_it(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_that_ends_while_a_change_waits_for_its_locks_does_not_authorise_it_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    a_session_that_ends_while_a_change_waits_for_its_locks_does_not_authorise_it(&url).await;
 }

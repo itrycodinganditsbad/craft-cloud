@@ -45,6 +45,13 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     }
 }
 
+/// Whether a stored password hash can be verified at all. An account made by an invite has no password yet (an empty hash): a
+/// sign-in must still spend a full Argon2id check on it (against the dummy hash, see [`AppState::dummy_hash`]) and then fail
+/// whatever was typed, or the answer's timing tells a pending account from an unknown name.
+pub fn usable_hash(hash: &str) -> bool {
+    PasswordHash::new(hash).is_ok()
+}
+
 /// A new device token and the hash to store for it.
 pub fn new_token() -> Result<(String, [u8; 32]), ApiError> {
     let mut raw = [0u8; 32];
@@ -130,6 +137,13 @@ mod tests {
         assert!(verify_password("correct horse", &hash));
         assert!(!verify_password("wrong horse", &hash));
         assert!(!verify_password("correct horse", "not a hash"));
+    }
+
+    #[test]
+    fn only_a_parseable_hash_is_usable() {
+        assert!(usable_hash(&hash_password("correct horse").unwrap()));
+        assert!(!usable_hash(""), "an invited account has no password yet");
+        assert!(!usable_hash("not a hash"));
     }
 
     #[test]

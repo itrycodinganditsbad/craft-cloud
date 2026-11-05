@@ -186,7 +186,7 @@ pub async fn setup(
 ) -> Result<Json<TwoFactorSetupResponse>, ApiError> {
     let req: TwoFactorSetupRequest = read_tiny(&state, request).await?;
     let secrets = state.two_factor.clone().ok_or_else(ApiError::two_factor_unavailable)?;
-    let password_hash = confirm_password(&state, &auth, req.password).await?;
+    let password_hash = confirm_password(&state, auth.user, &auth.username, req.password).await?;
     let secret = totp::generate_secret().map_err(random_failed)?;
     let sealed = secrets.seal(auth.user, secret.as_slice()).map_err(sealing_failed)?;
     let actor = DeviceActor { user: auth.user, device: auth.device, password_hash };
@@ -216,7 +216,7 @@ pub async fn confirm(State(state): State<Shared>, Extension(auth): Extension<Dev
 pub async fn disable(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>, request: Request) -> Result<StatusCode, ApiError> {
     let req: TwoFactorProofRequest = read_tiny(&state, request).await?;
     let proof = parse_proof(req.totp_code, req.recovery_code)?.ok_or_else(no_second_factor)?;
-    let password_hash = confirm_password(&state, &auth, req.password).await?;
+    let password_hash = confirm_password(&state, auth.user, &auth.username, req.password).await?;
     let now_ms = state.now_ms();
     let prepared = proof.prepare(&state, now_ms);
     let actor = DeviceActor { user: auth.user, device: auth.device, password_hash };
@@ -238,7 +238,7 @@ pub async fn recovery_codes(
         return Err(ApiError::invalid("new recovery codes are made with a code from the authenticator app (totp_code)"));
     }
     let proof = parse_proof(req.totp_code, None)?.ok_or_else(no_second_factor)?;
-    let password_hash = confirm_password(&state, &auth, req.password).await?;
+    let password_hash = confirm_password(&state, auth.user, &auth.username, req.password).await?;
     let now_ms = state.now_ms();
     let prepared = proof.prepare(&state, now_ms);
     let (answer, hashes) = shown(&new_recovery_codes()?);
@@ -258,7 +258,7 @@ fn end_live_connections(state: &AppState, devices: &[craft_cloud_proto::DeviceId
 
 /// The hash of a challenge token as the client sent it; `None` for text that is no token (it is answered like an unknown
 /// challenge).
-fn challenge_hash(challenge: &str) -> Option<[u8; 32]> {
+pub(crate) fn challenge_hash(challenge: &str) -> Option<[u8; 32]> {
     let is_token = challenge.len() == 43 && URL_SAFE_NO_PAD.decode(challenge).is_ok();
     is_token.then(|| token_hash(challenge))
 }
@@ -336,13 +336,13 @@ pub async fn second_factor(
 
 // ---- the admin's confirmation ----
 
-/// The second factor of an admin's confirmation (see [`crate::admin`]): when the admin's account has two-factor sign-in,
+/// The second factor of an admin's confirmation (see [`crate::admin`], the account is a device's or a browser session's): when the admin's account has two-factor sign-in,
 /// `proof` is checked and used up (`403 two_factor_invalid` when it is missing, wrong or a time step that was used, `429
 /// two_factor_locked` while locked), counted against [`AppState::second_factors`] for the account. Whether the account
 /// has it is read again under its lock when the proof is checked. The answer says whether it had: the change compares
 /// that with the account's state in its own transaction.
-pub(crate) async fn confirm_admin_second_factor(state: &AppState, auth: &DeviceAuth, proof: Option<ProofInput>) -> Result<bool, ApiError> {
-    let enabled = state.meta.two_factor_enabled(auth.user).await?;
+pub(crate) async fn confirm_admin_second_factor(state: &AppState, user: UserId, username: &str, proof: Option<ProofInput>) -> Result<bool, ApiError> {
+    let enabled = state.meta.two_factor_enabled(user).await?;
     if !enabled {
         // A code given to an account that has none is not looked at: the change compares the account's state again anyway.
         return Ok(false);
@@ -353,16 +353,16 @@ pub(crate) async fn confirm_admin_second_factor(state: &AppState, auth: &DeviceA
         return Err(e);
     };
     let now = tokio::time::Instant::now().into_std();
-    let key = format!("user:{}", auth.username);
+    let key = format!("user:{username}");
     let now_ms = state.now_ms();
     let Some(counted) = state.second_factors.count(&key, SECOND_FACTORS_PER_USER, now) else {
-        if let Some(locked_ms) = state.meta.two_factor_locked_for(auth.user, now_ms).await? {
+        if let Some(locked_ms) = state.meta.two_factor_locked_for(user, now_ms).await? {
             return Err(ApiError::two_factor_locked(craft_cloud_meta::retry_after_secs(locked_ms)));
         }
         return Err(ApiError::rate_limited("too many wrong codes; wait a few minutes", None));
     };
     let prepared = proof.prepare(state, now_ms);
-    match state.meta.confirm_second_factor(auth.user, Some(&prepared.proof()), now_ms).await {
+    match state.meta.confirm_second_factor(user, Some(&prepared.proof()), now_ms).await {
         Ok(had) => {
             state.second_factors.refund(&key, counted);
             Ok(had)

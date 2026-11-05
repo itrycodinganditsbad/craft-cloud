@@ -12,6 +12,11 @@
 //! # [audit]
 //! # retention_days = 365        # how long security events are kept (1 to 3650); `audit prune` deletes older ones
 //!
+//! # [web_admin]                 # the admin pages under /web, off unless enabled; needs behind_proxy and an https public_url
+//! # enabled = true
+//! # idle_minutes = 480          # a browser session ends after this long unused (5 to 1440)
+//! # absolute_hours = 168        # and at the latest after this long (1 to 720)
+//!
 //! [database]
 //! url = "sqlite:/var/lib/craft-cloud/meta.db"   # or postgres://user:pass@host/db
 //!
@@ -68,6 +73,18 @@ pub enum ConfigError {
     MissingS3Credential(&'static str, &'static str),
     #[error("audit.retention_days = {0} is out of range: keep security events for {1} to {2} days")]
     AuditRetention(u32, u32, u32),
+    #[error(
+        "web_admin.enabled = true needs public_url = \"https://host[:port]\" with no path: the browser's cookie is only sent over \
+         HTTPS, and the pages check the Origin of every form against that address"
+    )]
+    WebAdminPublicUrl,
+    #[error(
+        "web_admin.enabled = true needs behind_proxy = true: the server speaks plain HTTP, and the session cookie is marked Secure, \
+         so a TLS reverse proxy must stand in front of it"
+    )]
+    WebAdminNeedsProxy,
+    #[error("web_admin.{0} = {1} is out of range: {2} to {3}")]
+    WebAdminRange(&'static str, u32, u32, u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -102,6 +119,9 @@ pub struct Config {
     /// The security audit log. The section is optional and its defaults are safe.
     #[serde(default)]
     pub audit: AuditConfig,
+    /// The admin pages in the browser (`/web`). Off unless the section says `enabled = true`.
+    #[serde(default)]
+    pub web_admin: WebAdminConfig,
     pub database: DatabaseConfig,
     pub storage: StorageConfig,
     /// The key for the secrets of two-factor sign-in. Without it two-factor sign-in can't be set up (`503
@@ -151,6 +171,48 @@ impl Default for AuditConfig {
 
 fn default_retention_days() -> u32 {
     365
+}
+
+/// `[web_admin]`: the admin pages in the browser and the lifetimes of their sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebAdminConfig {
+    /// Serve the admin pages under `/web`. Default off: a server that was not told to speak to browsers does not. Needs
+    /// `behind_proxy = true` and an `https://` `public_url` without a path.
+    #[serde(default)]
+    pub enabled: bool,
+    /// A session ends when it was not used for this many minutes: 5 to 1440, default 480 (8 hours).
+    #[serde(default = "default_idle_minutes")]
+    pub idle_minutes: u32,
+    /// A session ends this many hours after sign-in, however busy it is: 1 to 720, default 168 (7 days).
+    #[serde(default = "default_absolute_hours")]
+    pub absolute_hours: u32,
+}
+
+impl Default for WebAdminConfig {
+    fn default() -> Self {
+        Self { enabled: false, idle_minutes: default_idle_minutes(), absolute_hours: default_absolute_hours() }
+    }
+}
+
+fn default_idle_minutes() -> u32 {
+    8 * 60
+}
+
+fn default_absolute_hours() -> u32 {
+    7 * 24
+}
+
+impl WebAdminConfig {
+    /// The idle lifetime of a session in milliseconds.
+    pub fn idle_ms(&self) -> i64 {
+        i64::from(self.idle_minutes) * 60_000
+    }
+
+    /// The absolute lifetime of a session in milliseconds.
+    pub fn absolute_ms(&self) -> i64 {
+        i64::from(self.absolute_hours) * 3_600_000
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -260,9 +322,25 @@ impl Config {
                 craft_cloud_meta::MAX_RETENTION_DAYS,
             ));
         }
+        let web = &config.web_admin;
+        for (name, value, low, high) in [("idle_minutes", web.idle_minutes, 5, 1440), ("absolute_hours", web.absolute_hours, 1, 720)] {
+            if !(low..=high).contains(&value) {
+                return Err(ConfigError::WebAdminRange(name, value, low, high));
+            }
+        }
         let mut config = config;
         if let Some(url) = &config.public_url {
             config.public_url = Some(public_url(url)?);
+        }
+        if config.web_admin.enabled {
+            // The pages' address is an origin: https, a host and maybe a port, and no path to put in front of `/web`.
+            let origin_only = config.public_url.as_deref().and_then(|url| url.strip_prefix("https://")).is_some_and(|rest| !rest.contains('/'));
+            if !origin_only {
+                return Err(ConfigError::WebAdminPublicUrl);
+            }
+            if !config.behind_proxy {
+                return Err(ConfigError::WebAdminNeedsProxy);
+            }
         }
         Ok(config)
     }
@@ -411,6 +489,33 @@ path = "/tmp/blobs"
         }
         assert!(matches!(with("[audit]\nretention_days = 0"), Err(ConfigError::AuditRetention(0, 1, 3650))));
         assert!(matches!(with("[audit]\nkeep = 5"), Err(ConfigError::Parse(_))), "unknown keys are refused");
+    }
+
+    #[test]
+    fn the_web_admin_is_off_by_default_and_checked_when_on() {
+        let c = Config::parse(DISK).unwrap();
+        assert_eq!(c.web_admin, WebAdminConfig { enabled: false, idle_minutes: 480, absolute_hours: 168 }, "off, 8 hours idle, 7 days at most");
+        assert_eq!((c.web_admin.idle_ms(), c.web_admin.absolute_ms()), (8 * 3_600_000, 7 * 24 * 3_600_000));
+        let proxied = DISK.replace("127.0.0.1:8080", "0.0.0.0:8080");
+        let with = |top: &str, section: &str| Config::parse(&format!("{top}\n{proxied}\n[web_admin]\n{section}\n"));
+        let proxy = "behind_proxy = true\ntrusted_proxies = [\"10.0.0.1\"]";
+        let good = format!("{proxy}\npublic_url = \"https://cloud.example.com\"");
+        let c = with(&good, "enabled = true\nidle_minutes = 30\nabsolute_hours = 12").unwrap();
+        assert_eq!((c.web_admin.enabled, c.web_admin.idle_minutes, c.web_admin.absolute_hours), (true, 30, 12));
+        // Each missing piece of the setup is refused with its own message.
+        assert!(matches!(with(proxy, "enabled = true"), Err(ConfigError::WebAdminPublicUrl)), "no public_url");
+        for url in ["http://cloud.example.com", "https://cloud.example.com/cloud"] {
+            let bad = format!("{proxy}\npublic_url = \"{url}\"");
+            assert!(matches!(with(&bad, "enabled = true"), Err(ConfigError::WebAdminPublicUrl)), "{url}");
+        }
+        let no_proxy = format!("public_url = \"https://cloud.example.com\"\n{DISK}\n[web_admin]\nenabled = true\n");
+        assert!(matches!(Config::parse(&no_proxy), Err(ConfigError::WebAdminNeedsProxy)));
+        // Off, none of it matters; the lifetimes are always in range; unknown keys are errors.
+        assert!(!Config::parse(&format!("{DISK}\n[web_admin]\nenabled = false\n")).unwrap().web_admin.enabled);
+        for section in ["idle_minutes = 4", "idle_minutes = 1441", "absolute_hours = 0", "absolute_hours = 721"] {
+            assert!(matches!(Config::parse(&format!("{DISK}\n[web_admin]\n{section}\n")), Err(ConfigError::WebAdminRange(..))), "{section}");
+        }
+        assert!(matches!(Config::parse(&format!("{DISK}\n[web_admin]\ncookie = 1\n")), Err(ConfigError::Parse(_))));
     }
 
     #[test]

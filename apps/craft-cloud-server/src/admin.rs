@@ -31,7 +31,7 @@ use axum::routing::{get, post};
 use axum::{Router, middleware};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use craft_cloud_meta::{AdminActor, AdminUser, DeviceAuth, Role, UserId, valid_username};
+use craft_cloud_meta::{AdminActor, AdminUser, AdminVia, DeviceAuth, Role, UserId, valid_username};
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::{
     AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser, AdminUserInfo,
@@ -50,11 +50,11 @@ use crate::state::AppState;
 type Shared = Arc<AppState>;
 
 /// Accounts one page of `GET /admin/users` holds when `limit` is not given.
-const DEFAULT_PAGE: u32 = 50;
+pub(crate) const DEFAULT_PAGE: u32 = 50;
 /// The most accounts a page may hold.
-const MAX_PAGE: u32 = 200;
+pub(crate) const MAX_PAGE: u32 = 200;
 /// The longest `query` of the user list, in bytes.
-const MAX_QUERY_BYTES: usize = craft_cloud_meta::MAX_SEARCH_BYTES;
+pub(crate) const MAX_QUERY_BYTES: usize = craft_cloud_meta::MAX_SEARCH_BYTES;
 
 /// The admin routes, all behind `require_admin`. `router` merges them into the signed-in routes, so `require_device`
 /// wraps them too and runs first.
@@ -71,6 +71,7 @@ pub fn routes() -> Router<Shared> {
         .route("/admin/users/{id}/devices", get(list_devices))
         .route("/admin/users/{id}/devices/{device_id}", axum::routing::delete(revoke_device).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route_layer(middleware::from_fn(require_admin))
+        .route_layer(middleware::from_fn(crate::web::reject_mixed_credentials))
 }
 
 // ---- helpers ----
@@ -87,14 +88,14 @@ async fn read_body<T: serde::de::DeserializeOwned>(state: &AppState, request: Re
 }
 
 /// What an admin's body gives for a confirmation: the password, and the second factor when the account has one.
-struct Confirmation {
+pub(crate) struct Confirmation {
     password: Option<String>,
     totp_code: Option<String>,
     recovery_code: Option<String>,
 }
 
 impl Confirmation {
-    fn new(password: Option<String>, totp_code: Option<String>, recovery_code: Option<String>) -> Self {
+    pub(crate) fn new(password: Option<String>, totp_code: Option<String>, recovery_code: Option<String>) -> Self {
         Self { password, totp_code, recovery_code }
     }
 }
@@ -105,12 +106,24 @@ impl Confirmation {
 /// recovery code can't serve a second change, and wrong ones are counted and can lock ([`crate::two_factor`]). A password
 /// that is wrong is told before anything about the second factor.
 async fn confirm(state: &AppState, auth: &DeviceAuth, given: Confirmation) -> Result<AdminActor, ApiError> {
+    confirm_actor(state, auth.user, &auth.username, AdminVia::Device(auth.device), given).await
+}
+
+/// [`confirm`] for any admin who acts: `via` says whether a device or a browser session does (the web pages call this with
+/// the same confirmation, the same counters and the same statuses as the JSON routes above).
+pub(crate) async fn confirm_actor(
+    state: &AppState,
+    user: UserId,
+    username: &str,
+    via: AdminVia,
+    given: Confirmation,
+) -> Result<AdminActor, ApiError> {
     let password = given.password.ok_or_else(|| ApiError::invalid("this change needs your current password in `password`"))?;
     // The shape of the second factor is checked before anything is counted.
     let proof = crate::two_factor::parse_proof(given.totp_code, given.recovery_code)?;
-    let password_hash = confirm_password(state, auth, password).await?;
-    let two_factor = crate::two_factor::confirm_admin_second_factor(state, auth, proof).await?;
-    Ok(AdminActor { user: auth.user, device: auth.device, password_hash, two_factor })
+    let password_hash = confirm_password(state, user, username, password).await?;
+    let two_factor = crate::two_factor::confirm_admin_second_factor(state, user, username, proof).await?;
+    Ok(AdminActor { user, via, password_hash, two_factor })
 }
 
 fn user_id(id: Result<Path<Uuid>, PathRejection>) -> Result<UserId, ApiError> {
@@ -118,7 +131,7 @@ fn user_id(id: Result<Path<Uuid>, PathRejection>) -> Result<UserId, ApiError> {
     Ok(UserId(id))
 }
 
-fn role_of(name: &str) -> Result<Role, ApiError> {
+pub(crate) fn role_of(name: &str) -> Result<Role, ApiError> {
     match name {
         "admin" => Ok(Role::Admin),
         "member" => Ok(Role::Member),
@@ -142,20 +155,20 @@ fn user_info(u: AdminUser) -> AdminUserInfo {
 }
 
 /// A fresh invite or reset code, as the admin gets it: shown once, never logged.
-fn new_code() -> Result<Code, ApiError> {
+pub(crate) fn new_code() -> Result<Code, ApiError> {
     Code::generate(INVITE_CHARS).map_err(|e| {
         tracing::error!(error = %e, "the system random source failed");
         ApiError::internal()
     })
 }
 
-fn admin_code(state: &AppState, code: Code, expires_ms: i64) -> AdminCode {
+pub(crate) fn admin_code(state: &AppState, code: Code, expires_ms: i64) -> AdminCode {
     let shown = code.as_str().to_owned();
     let join_url = state.public_url.as_ref().map(|server| JoinString::new(server.clone(), code).link());
     AdminCode { code: shown, join_url, expires_ms }
 }
 
-fn end_live_connections(state: &AppState, devices: &[DeviceId]) {
+pub(crate) fn end_live_connections(state: &AppState, devices: &[DeviceId]) {
     for device in devices {
         state.live.revoke(*device);
     }
@@ -186,7 +199,7 @@ struct ListQuery {
 
 /// The username a cursor stands for. A cursor is the last username of a page, in base64url: opaque to clients, and
 /// checked like any username, since it is hostile input.
-fn decode_cursor(cursor: &str) -> Result<String, ApiError> {
+pub(crate) fn decode_cursor(cursor: &str) -> Result<String, ApiError> {
     let bad = || ApiError::invalid("the cursor is not one this server gave");
     let bytes = URL_SAFE_NO_PAD.decode(cursor).map_err(|_| bad())?;
     let name = String::from_utf8(bytes).map_err(|_| bad())?;

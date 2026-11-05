@@ -248,6 +248,290 @@ impl std::fmt::Debug for SecondFactorRequest {
     }
 }
 
+// ---- the admin API (`/api/v1/admin/…`, an admin's device token) ----
+//
+// Every change asks for a fresh confirmation in its body: the acting admin's `password`. A device token never expires,
+// so a stolen admin token alone must not be enough. A missing or mistyped field is `400 invalid`, a wrong password `403
+// wrong_password` (never 401). An admin with two-factor sign-in adds `totp_code` (or `recovery_code`) to the same
+// bodies; a body without them keeps working for an admin without it, and fields a server does not know are ignored.
+
+/// The body of an admin change that needs nothing but the confirmation: `POST …/disable`, `POST …/enable`,
+/// `DELETE /admin/users/{id}`, `POST` and `DELETE …/invite`, `POST …/reset-two-factor` and `DELETE …/devices/{id}`. Its
+/// `Debug` output hides the password and the second factor.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminConfirm {
+    /// The acting admin's current password. Missing: `400 invalid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// The acting admin's code, when their account has two-factor sign-in. Missing or wrong then: `403
+    /// two_factor_invalid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    /// A recovery code instead of `totp_code`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
+}
+
+impl std::fmt::Debug for AdminConfirm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminConfirm")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// `POST /admin/users/{id}/password-reset`: the confirmation as in [`AdminConfirm`], and whether redeeming the code also
+/// turns the account's two-factor sign-in off (`reset_two_factor`, default `false`: an account that has it then needs
+/// its second factor to redeem the code). Its `Debug` output hides the password and the second factor.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminPasswordReset {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
+    #[serde(default)]
+    pub reset_two_factor: bool,
+}
+
+impl std::fmt::Debug for AdminPasswordReset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminPasswordReset")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .field("reset_two_factor", &self.reset_two_factor)
+            .finish()
+    }
+}
+
+/// `GET /admin/server`: counters and kinds, nothing about paths, addresses or settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminServerInfo {
+    pub version: String,
+    /// Accounts that are not marked for removal.
+    pub users: u64,
+    /// Devices that are not revoked.
+    pub devices_active: u64,
+    pub stored_bytes: u64,
+    pub live_bytes: u64,
+    /// `disk`, `s3` or `memory`.
+    pub storage_kind: String,
+    /// `sqlite` or `postgres`.
+    pub database_kind: String,
+}
+
+/// An account in the admin API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminUserInfo {
+    pub id: Uuid,
+    pub username: String,
+    /// `admin` or `member`.
+    pub role: String,
+    pub created_ms: i64,
+    /// When an admin disabled it (`null`: enabled).
+    pub disabled_ms: Option<i64>,
+    /// Whether the account has two-factor sign-in on.
+    pub two_factor_enabled: bool,
+    /// Devices that are not revoked.
+    pub devices_active: u64,
+    pub stored_bytes: u64,
+    /// The quota an admin set for the account (`null`: the server-wide cap, if any, applies).
+    pub quota_bytes: Option<u64>,
+    /// An unexpired invite is open.
+    pub invite_pending: bool,
+}
+
+/// `GET /admin/users?cursor&limit&query`: a page of accounts by username.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminUserList {
+    pub users: Vec<AdminUserInfo>,
+    /// Opaque; give it back as `cursor` for the next page. Missing on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// `POST /admin/users`: a new account without a password, for an invite. Its `Debug` output hides the password.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminCreateUser {
+    pub username: String,
+    /// `admin` or `member`.
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
+}
+
+impl std::fmt::Debug for AdminCreateUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminCreateUser")
+            .field("username", &self.username)
+            .field("role", &self.role)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// A join code the admin made, shown once. `join_url` is the whole join string when the server knows its public
+/// address, and missing otherwise. Its `Debug` output hides the code and the join string.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminCode {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_url: Option<String>,
+    pub expires_ms: i64,
+}
+
+impl std::fmt::Debug for AdminCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminCode")
+            .field("code", &"<redacted>")
+            .field("join_url", &self.join_url.as_ref().map(|_| "<redacted>"))
+            .field("expires_ms", &self.expires_ms)
+            .finish()
+    }
+}
+
+/// The answer to `POST /admin/users`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminCreatedUser {
+    pub user: AdminUserInfo,
+    pub invite: AdminCode,
+}
+
+/// `PATCH /admin/users/{id}`: a new role and/or quota. At least one of them; a missing `quota_bytes` leaves the quota,
+/// `null` removes it. Its `Debug` output hides the password.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminUpdateUser {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<Option<u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
+}
+
+/// A field that is there, `null` or not: `Some(None)` for `null`, `Some(Some(x))` for a value (a missing field is
+/// `None`, from `#[serde(default)]`).
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+impl std::fmt::Debug for AdminUpdateUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminUpdateUser")
+            .field("role", &self.role)
+            .field("quota_bytes", &self.quota_bytes)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// `GET /admin/users/{id}/devices`: every device of the account, revoked ones with when and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminDevices {
+    pub devices: Vec<DeviceInfo>,
+}
+
+/// The typed values of a security event (`details`). Every field is a closed list of words or a number: nothing a client
+/// typed is ever in it. Fields an event does not have are missing, and fields a later release adds are ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditDetails {
+    /// `agent`, `desktop`, `cli` or `web` (`web` means a browser session of the admin pages).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_kind: Option<String>,
+    /// `windows`, `macos`, `linux`, `android`, `ios` or `other`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    /// Why a device was signed out: `user`, `others`, `password`, `admin`, `disabled`, `two_factor`, `idle` or `reset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// How far a failed sign-in got: `password`, `totp`, `recovery` or `challenge_expired`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    /// `admin` or `member`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_to: Option<String>,
+    /// The quota an admin set: `null` when they removed it, missing when the event is not about a quota.
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<Option<u64>>,
+    /// How many devices an event signed out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked: Option<u32>,
+    /// The device an admin or the command line signed out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceId>,
+    /// Set (to `true`) when redeeming a password reset code also turned the account's two-factor sign-in off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_factor_removed: Option<bool>,
+    /// Set when the values were too long for the log and whole fields were left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+}
+
+/// One security event, as `GET /account/activity`, `GET /admin/audit` and the export show it. No address, name of a file or
+/// device, or secret is ever in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub id: Uuid,
+    pub at_ms: i64,
+    /// The account that acted; `null` for the command line, and for a sign-in that failed (nobody proved who they were).
+    pub actor_user: Option<Uuid>,
+    pub actor_device: Option<DeviceId>,
+    /// A name from the closed list in `docs/design/sync.md`, like `auth.login`.
+    pub action: String,
+    /// `user` or `device`, or empty.
+    pub target_kind: String,
+    pub target_id: Option<Uuid>,
+    /// `success` or `failure`.
+    pub outcome: String,
+    pub details: AuditDetails,
+    /// How many tries the event stands for: failed sign-ins are one event per account, client kind and minute. 1 for every other event.
+    pub count: u64,
+}
+
+/// A page of `GET /account/activity` or `GET /admin/audit`, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditPage {
+    pub events: Vec<AuditEvent>,
+    /// Opaque; give it back as `cursor` for the next (older) page. Missing on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// The last line of `GET /admin/audit/export` (the lines before it are [`AuditEvent`]s). `complete` says the export holds
+/// every event up to the moment it started; `truncated` says there were more than the export holds. A stream that ends
+/// without either line was cut off and is not a complete export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditExportEnd {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complete: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    /// The events before this line.
+    pub exported: u64,
+}
+
 /// `POST /api/v1/chunks/missing` and its answer: which of `ids` this space doesn't have.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissingRequest {

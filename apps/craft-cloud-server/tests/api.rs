@@ -1591,6 +1591,7 @@ async fn sign_ins_and_joins_may_name_their_client(s: &Server) {
     let long = "x".repeat(33);
     for bad in [
         json!({ "client_kind": "browser" }),
+        json!({ "client_kind": "web" }),
         json!({ "platform": long }),
         json!({ "app_version": long }),
         json!({ "platform": "a\nb" }),
@@ -1607,7 +1608,7 @@ async fn sign_ins_and_joins_may_name_their_client(s: &Server) {
 
     // The same for a join: with the fields it records them, a bad one is refused and the code is not used up.
     let made = new_pairing(s, &plain).await;
-    for bad in [json!({ "client_kind": "browser" }), json!({ "app_version": long })] {
+    for bad in [json!({ "client_kind": "browser" }), json!({ "client_kind": "web" }), json!({ "app_version": long })] {
         let mut body = json!({ "code": made.code, "device_name": "pc" });
         body.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
         let (status, answer) = error(s.client.post(format!("{}/join", s.base)).json(&body).send().await.unwrap()).await;

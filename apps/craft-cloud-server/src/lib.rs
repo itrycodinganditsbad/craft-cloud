@@ -18,6 +18,7 @@ pub mod secretbox;
 pub mod state;
 pub mod totp;
 pub mod two_factor;
+pub mod web;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
