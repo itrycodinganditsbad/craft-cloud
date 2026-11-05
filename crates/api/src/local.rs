@@ -13,6 +13,7 @@
 //!   `POST /v1/pairings` → [`PairingInfo`], `GET /v1/pairings/{id}` → [`PairingStatus`](crate::api::PairingStatus),
 //!   `DELETE /v1/pairings/{id}` → 204; `GET /v1/devices` → a list of [`DeviceInfo`](crate::api::DeviceInfo),
 //!   `DELETE /v1/devices/{id}` → the list after; `POST /v1/pause`, `/v1/resume` and `/v1/quit` → [`Status`];
+//!   `GET /v1/usage` → [`AccountUsage`](crate::api::AccountUsage) from the signed-in account's server;
 //!   `POST /v1/autostart` ([`AutostartRequest`]) → [`Status`]; `GET /v1/recents`, upgraded to a WebSocket of JSON
 //!   text messages: [`RecentsRequest`] in, [`RecentsEvent`] out; `GET /v1/docs`, upgraded to a WebSocket of live
 //!   documents ([`docs`]: [`DocsRequest`] and binary frames in, [`DocsEvent`] and binary frames out); `PUT /v1/blobs`
@@ -106,6 +107,8 @@ pub mod paths {
     pub const PAIRINGS: &str = "/v1/pairings";
     /// `GET`: the account's computers; `DELETE /v1/devices/{id}`: remove one (never this one).
     pub const DEVICES: &str = "/v1/devices";
+    /// `GET`: the signed-in account's stored bytes and labeled estimates, fetched from its server.
+    pub const USAGE: &str = "/v1/usage";
     /// `POST`: hold syncing (kept across restarts) → [`super::Status`].
     pub const PAUSE: &str = "/v1/pause";
     /// `POST`: sync again after a pause → [`super::Status`].

@@ -64,6 +64,7 @@ use craft_cloud_api::api::ErrorAnswer;
 use craft_cloud_api::local::{AutostartRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_MIN, LocalApiFile, LogoutRequest, paths};
 
 pub use craft_cloud_api::DeviceId;
+pub use craft_cloud_api::api::AccountUsage;
 pub use craft_cloud_api::api::{DeviceInfo, PairingState, PairingStatus};
 pub use craft_cloud_api::local::{JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RunState, Status, codes};
 pub use recents::{RecentsEvent, RecentsWatch};
@@ -219,6 +220,11 @@ impl Client {
     /// The account's computers, this one marked `current`. Asks the server: call it off the UI thread.
     pub fn devices(&self) -> Result<Vec<DeviceInfo>, Error> {
         self.call("GET", paths::DEVICES, None, http::SLOW_TIMEOUT)
+    }
+
+    /// The signed-in account's storage usage and labeled estimates. Asks the server each time.
+    pub fn usage(&self) -> Result<AccountUsage, Error> {
+        self.call("GET", paths::USAGE, None, http::SLOW_TIMEOUT)
     }
 
     /// Removes another computer from the account (its next request is refused; its files stay there), and gives the
@@ -428,6 +434,16 @@ mod tests {
         let (method, path, body) = next();
         assert_eq!((method.as_str(), path.as_str()), ("POST", paths::AUTOSTART));
         assert_eq!(serde_json::from_str::<AutostartRequest>(&body).unwrap(), AutostartRequest { on: true });
+    }
+
+    #[test]
+    fn usage_maps_unauthorized_and_uses_the_local_route() {
+        let answer = json(&ErrorAnswer { error: "unauthorized".into(), message: "not signed in".into() });
+        let (_dir, agent, asked) = fake_agent(vec![(401, answer)]);
+        let result = agent.usage();
+        assert!(matches!(result, Err(Error::Refused { ref code, .. }) if code == "unauthorized"), "{result:?}");
+        let (method, path, _) = asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((method.as_str(), path.as_str()), ("GET", paths::USAGE));
     }
 
     /// An agent that takes the connection but never answers (hung, or something else on its port) costs a

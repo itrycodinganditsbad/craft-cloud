@@ -9,7 +9,7 @@ use crate::ids::{DeviceId, Epoch, NodeId, SpaceId, VersionId};
 use crate::ops::{Conflict, Op};
 
 /// What apps see of these bodies lives in `craft-cloud-api` (no postcard), re-exported here.
-pub use craft_cloud_api::api::{DeviceInfo, ErrorAnswer, PairingState, PairingStatus, codes};
+pub use craft_cloud_api::api::{AccountUsage, DeviceInfo, ErrorAnswer, PairingState, PairingStatus, UsageEstimateReason, UsageEstimates, codes};
 
 /// Protocol versions this build speaks. A client and server must share at least one.
 pub const PROTOCOL_MIN: u32 = 1;
@@ -44,29 +44,6 @@ pub struct SpaceResponse {
     pub seq: u64,
     /// The account's username, in lowercase.
     pub username: String,
-}
-
-/// `GET /api/v1/account/usage`: stored bytes and labeled estimates for the signed-in account's space.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AccountUsage {
-    pub stored_bytes: u64,
-    pub quota_bytes: Option<u64>,
-    pub trash_bytes: Option<u64>,
-    pub history_bytes: Option<u64>,
-    pub estimates: UsageEstimates,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UsageEstimates {
-    pub index_complete: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<UsageEstimateReason>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UsageEstimateReason {
-    IndexIncomplete,
 }
 
 /// `POST /api/v1/auth/login`.
@@ -414,6 +391,20 @@ mod tests {
         let mut value = value;
         value.as_object_mut().unwrap().insert("future_field".into(), serde_json::json!(1));
         assert_eq!(serde_json::from_value::<AccountUsage>(value).unwrap(), response);
+    }
+
+    #[test]
+    fn account_usage_decodes_complete_and_incomplete_estimates() {
+        let complete: AccountUsage =
+            serde_json::from_str(r#"{"stored_bytes":11,"quota_bytes":null,"trash_bytes":0,"history_bytes":0,"estimates":{"index_complete":true}}"#)
+                .unwrap();
+        assert_eq!(complete.estimates, UsageEstimates { index_complete: true, reason: None });
+        let incomplete: AccountUsage = serde_json::from_str(
+            r#"{"stored_bytes":11,"quota_bytes":null,"trash_bytes":null,"history_bytes":null,"estimates":{"index_complete":false,"reason":"index_incomplete"}}"#,
+        ).unwrap();
+        assert_eq!(incomplete.trash_bytes, None);
+        assert_eq!(incomplete.history_bytes, None);
+        assert_eq!(incomplete.estimates.reason, Some(UsageEstimateReason::IndexIncomplete));
     }
 
     #[test]
