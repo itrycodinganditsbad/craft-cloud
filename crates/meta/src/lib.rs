@@ -17,6 +17,7 @@ mod live;
 mod schema;
 mod trash;
 mod tree;
+mod usage;
 mod users;
 
 use std::str::FromStr;
@@ -38,6 +39,7 @@ pub use live::{
 };
 pub use trash::{TrashEntry, TrashPage};
 pub use tree::{MAX_PAGE_SAVE_BYTES, SpaceInfo};
+pub use usage::{StorageEstimate, StorageEstimateReason};
 pub use users::{DeviceAuth, DeviceRecord, Role, UserId, UserRecord, valid_username};
 
 #[derive(Debug, thiserror::Error)]
@@ -127,6 +129,10 @@ pub struct Meta {
 }
 
 impl Meta {
+    /// The configured stored-bytes cap for one space, if any.
+    pub fn stored_bytes_cap(&self) -> Option<u64> {
+        self.stored_cap
+    }
     /// Connects and brings the schema up to date. `url` is `sqlite:path/to/meta.db` (created if missing),
     /// `sqlite::memory:`, or `postgres://user:pass@host/db`.
     pub async fn open(url: &str) -> Result<Self, MetaError> {
