@@ -432,6 +432,8 @@ pub fn check_health(addr: SocketAddr, timeout: Duration) -> Result<(), CliError>
         (Some(version), Some(status)) if version.starts_with("HTTP/") => Err(fail(&format!("status {}", status.chars().take(3).collect::<String>()))),
         _ => Err(fail("not an HTTP answer")),
     }
+}
+
 /// `audit list` and `audit prune`.
 async fn audit(meta: &Meta, config: &Config, action: AuditCommand, out: &mut impl Write) -> Result<(), CliError> {
     match action {
