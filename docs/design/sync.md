@@ -1014,9 +1014,10 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
 - **Names**: property tests that the validator rejects every unsafe form, and that case-fold + NFC
   uniqueness matches expectations for tricky cases (`ß`/`SS`, Turkish dotted I, combining accents).
 - **Server**: integration tests against an in-process server, **run once per backend combination**
-  (SQLite + disk always; Postgres and S3 in CI through service containers, locally when
-  `CRAFT_CLOUD_TEST_PG` / `CRAFT_CLOUD_TEST_S3_*` are set; CI sets `CRAFT_CLOUD_REQUIRE_BACKENDS` so a
-  missing backend fails instead of skipping). The S3 test server is SeaweedFS (Apache-2.0), run as a
+  (SQLite + disk always; Postgres + disk locally when `CRAFT_CLOUD_TEST_PG` is set; Postgres + S3
+  when `CRAFT_CLOUD_TEST_PG` / `CRAFT_CLOUD_TEST_S3_*` are set, including CI through service
+  containers; CI sets `CRAFT_CLOUD_REQUIRE_BACKENDS` so a missing backend fails instead of skipping).
+  The S3 test server is SeaweedFS (Apache-2.0), run as a
   container, never linked. Cases: auth, quota, batch commit
   atomicity, `missing_chunks`, GC never removes a referenced or protected chunk while commits run,
   thinning, `backup` + `restore` gives the same state with a new epoch, `resync_required`.
