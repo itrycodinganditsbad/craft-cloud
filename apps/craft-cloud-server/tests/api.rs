@@ -204,6 +204,7 @@ on_every_backend!(
     shutting_down_ends_long_polls,
     the_space_endpoint_and_unversioned_info,
     account_usage_is_scoped_to_signed_in_space,
+    admin_storage_routes_are_admin_only_and_usage_hides_removed_users,
     oversized_manifests_are_refused,
     live_needs_a_device_token,
     live_hello_checks_the_version,
@@ -766,6 +767,61 @@ async fn account_usage_is_scoped_to_signed_in_space(s: &Server) {
     assert_eq!(s.client.get(format!("{}/account/usage", s.base)).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
 }
 
+async fn admin_storage_routes_are_admin_only_and_usage_hides_removed_users(s: &Server) {
+    let admin = s.meta.create_user("admin", &hash_password(PASSWORD).unwrap(), Role::Admin, 1).await.unwrap();
+    add_user(s, "ana").await;
+    let admin_token = login(s, "admin").await;
+    let member_token = login(s, "ana").await;
+    let target = s.meta.user_by_name("ana").await.unwrap().unwrap();
+    let quota = u64::from(craft_cloud_proto::limits::MAX_CHUNK_BYTES);
+    let response = s
+        .client
+        .patch(format!("{}/admin/users/{}", s.base, target.id.0))
+        .bearer_auth(&admin_token)
+        .json(&json!({ "quota_bytes": quota, "password": PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = s.client.get(format!("{}/admin/users/{}/usage", s.base, target.id.0)).bearer_auth(&admin_token).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let usage: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(usage["quota_bytes"], quota);
+    assert_eq!(usage["stored_bytes"], 0);
+    assert_eq!(usage["estimates"]["index_complete"], true);
+
+    let response = s.client.get(format!("{}/admin/storage", s.base)).bearer_auth(&admin_token).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let overview: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(overview["accounts"], 2);
+    assert_eq!(overview["stored_bytes"], 0);
+    assert_eq!(overview["accounts_with_override"], 1);
+    assert_eq!(overview["top_accounts"][0]["username"], "admin");
+    assert_eq!(overview["top_accounts"][1]["quota_bytes"], quota);
+
+    assert_eq!(s.client.get(format!("{}/admin/storage", s.base)).bearer_auth(&member_token).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(s.client.get(format!("{}/admin/storage", s.base)).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        s.client.get(format!("{}/admin/users/{}/usage", s.base, uuid::Uuid::now_v7())).bearer_auth(&admin_token).send().await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+    let removed = s
+        .client
+        .delete(format!("{}/admin/users/{}", s.base, target.id.0))
+        .bearer_auth(&admin_token)
+        .json(&json!({ "password": PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        s.client.get(format!("{}/admin/users/{}/usage", s.base, target.id.0)).bearer_auth(&admin_token).send().await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(admin.role, Role::Admin);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn account_usage_is_read_only_and_returns_configured_quota() {
     let db = tempfile::tempdir().unwrap();
@@ -774,8 +830,11 @@ async fn account_usage_is_read_only_and_returns_configured_quota() {
     let meta = Meta::open(&format!("sqlite:{}", db_path.display())).await.unwrap().with_stored_bytes_cap(Some(123));
     let server = start(meta, Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![db, blobs], None).await;
     add_user(&server, "ana").await;
+    server.meta.create_user("admin", &hash_password(PASSWORD).unwrap(), Role::Admin, 1).await.unwrap();
     let token = login(&server, "ana").await;
+    let admin_token = login(&server, "admin").await;
     let space = server.meta.user_by_name("ana").await.unwrap().unwrap().space;
+    let target = server.meta.user_by_name("ana").await.unwrap().unwrap();
     server.meta.add_chunk(space, &chunk_id(b"usage"), 11, 1).await.unwrap();
 
     let before = sqlite_fingerprint(&db_path);
@@ -793,6 +852,20 @@ async fn account_usage_is_read_only_and_returns_configured_quota() {
         })
     );
     assert_eq!(sqlite_fingerprint(&db_path), before, "authorized usage request changed database or WAL bytes");
+
+    let response = server.client.get(format!("{}/admin/users/{}/usage", server.base, target.id.0)).bearer_auth(&admin_token).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let usage: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(usage["quota_bytes"], 123);
+    assert_eq!(sqlite_fingerprint(&db_path), before, "admin usage request changed database or WAL bytes");
+
+    let response = server.client.get(format!("{}/admin/storage", server.base)).bearer_auth(&admin_token).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let overview: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(overview["accounts"], 2);
+    assert_eq!(overview["stored_bytes"], 11);
+    assert_eq!(overview["default_quota_bytes"], 123);
+    assert_eq!(sqlite_fingerprint(&db_path), before, "admin storage request changed database or WAL bytes");
 
     let response = server.client.get(format!("{}/account/usage", server.base)).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -825,8 +898,11 @@ async fn account_usage_is_read_only_and_fingerprints_every_postgres_table() {
     let server = start(meta, Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![blobs], Some(guard)).await;
 
     add_user(&server, "ana").await;
+    server.meta.create_user("admin", &hash_password(PASSWORD).unwrap(), Role::Admin, 1).await.unwrap();
     let token = login(&server, "ana").await;
+    let admin_token = login(&server, "admin").await;
     let space = server.meta.user_by_name("ana").await.unwrap().unwrap().space;
+    let target = server.meta.user_by_name("ana").await.unwrap().unwrap();
     server.meta.add_chunk(space, &chunk_id(b"usage"), 11, 1).await.unwrap();
     let before = postgres_fingerprint(&database_url).await;
     let response = server.client.get(format!("{}/account/usage", server.base)).bearer_auth(&token).send().await.unwrap();
@@ -835,6 +911,15 @@ async fn account_usage_is_read_only_and_fingerprints_every_postgres_table() {
     assert_eq!(usage["stored_bytes"], 11);
     assert_eq!(usage["quota_bytes"], 123);
     assert_eq!(postgres_fingerprint(&database_url).await, before, "usage request changed at least one Postgres table");
+
+    let response = server.client.get(format!("{}/admin/users/{}/usage", server.base, target.id.0)).bearer_auth(&admin_token).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let usage: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(usage["quota_bytes"], 123);
+    assert_eq!(postgres_fingerprint(&database_url).await, before, "admin usage request changed at least one Postgres table");
+    let response = server.client.get(format!("{}/admin/storage", server.base)).bearer_auth(&admin_token).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(postgres_fingerprint(&database_url).await, before, "admin storage request changed at least one Postgres table");
     server.stop();
 }
 
@@ -2131,9 +2216,11 @@ async fn every_admin_route_needs_an_admin(s: &Server) {
     let (ana, bob, carl, pending) = (id_of(s, "ana").await, id_of(s, "bob").await, id_of(s, "carl").await, id_of(s, "pending").await);
     let routes = vec![
         (M::GET, "/admin/server".to_owned(), None, StatusCode::OK),
+        (M::GET, "/admin/storage".to_owned(), None, StatusCode::OK),
         (M::GET, "/admin/users".to_owned(), None, StatusCode::OK),
         (M::POST, "/admin/users".to_owned(), Some(json!({ "username": "made", "role": "member" })), StatusCode::OK),
         (M::PATCH, format!("/admin/users/{ana}"), Some(json!({ "quota_bytes": null })), StatusCode::OK),
+        (M::GET, format!("/admin/users/{ana}/usage"), None, StatusCode::OK),
         (M::POST, format!("/admin/users/{carl}/disable"), Some(json!({})), StatusCode::NO_CONTENT),
         (M::POST, format!("/admin/users/{carl}/enable"), Some(json!({})), StatusCode::NO_CONTENT),
         (M::POST, format!("/admin/users/{pending}/invite"), Some(json!({})), StatusCode::OK),
@@ -2145,8 +2232,8 @@ async fn every_admin_route_needs_an_admin(s: &Server) {
         (M::DELETE, format!("/admin/users/{bob}/devices/{spare_id}"), Some(json!({})), StatusCode::NO_CONTENT),
         (M::DELETE, format!("/admin/users/{carl}"), Some(json!({})), StatusCode::ACCEPTED),
     ];
-    // Every `.route(` of the admin module is in the table (ten paths): a route added without a row fails here.
-    assert_eq!(include_str!("../src/admin.rs").matches(".route(\"/admin/").count(), 10);
+    // Every `.route(` of the admin module is in the table (twelve paths): a route added without a row fails here.
+    assert_eq!(include_str!("../src/admin.rs").matches(".route(\"/admin/").count(), 12);
     let distinct: std::collections::BTreeSet<_> = routes
         .iter()
         .map(|(_, p, _, _)| {
@@ -2157,7 +2244,7 @@ async fn every_admin_route_needs_an_admin(s: &Server) {
                 .replace(&spare_id.to_string(), "{device_id}")
         })
         .collect();
-    assert_eq!(distinct.len(), 10, "{distinct:?}");
+    assert_eq!(distinct.len(), 12, "{distinct:?}");
 
     for (method, path, body, ok) in routes {
         let counts = s.meta.admin_server_counts().await.unwrap();

@@ -12,8 +12,8 @@
 use craft_cloud_api::local::paths;
 
 use crate::{
-    AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser, AdminUserInfo,
-    AdminUserList, Client, DeviceId, Error, Uuid, http,
+    AccountUsage, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo,
+    AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, Client, DeviceId, Error, Uuid, http,
 };
 
 /// Which accounts [`Client::admin_users`] lists: a page by username, optionally those whose name contains `query`.
@@ -70,6 +70,16 @@ impl Client {
     /// is how the app tells whether to show its admin pages.
     pub fn admin_server(&self) -> Result<AdminServerInfo, Error> {
         self.call("GET", paths::ADMIN_SERVER, None, http::SLOW_TIMEOUT)
+    }
+
+    /// The server-wide storage overview; admins only.
+    pub fn admin_storage(&self) -> Result<AdminStorageOverview, Error> {
+        self.call("GET", paths::ADMIN_STORAGE, None, http::SLOW_TIMEOUT)
+    }
+
+    /// One account's stored bytes and labeled estimates; admins only.
+    pub fn admin_user_usage(&self, id: Uuid) -> Result<AccountUsage, Error> {
+        self.call("GET", &format!("{}/{id}/usage", paths::ADMIN_USER_USAGE), None, http::SLOW_TIMEOUT)
     }
 
     /// A page of accounts by username ([`UserQuery`]); `next` of the answer is the cursor of the following page.

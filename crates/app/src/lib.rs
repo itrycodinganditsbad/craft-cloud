@@ -72,9 +72,10 @@ pub use admin::UserQuery;
 pub use audit::{AuditQuery, ExportOutcome};
 pub use craft_cloud_api::DeviceId;
 pub use craft_cloud_api::api::{
-    AUDIT_ACTIONS, AccountInfo, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo,
-    AdminUpdateUser, AdminUserInfo, AdminUserList, AuditEvent, AuditPage, DeviceInfo, PairingState, PairingStatus, RecoveryCodes, RevokedOthers,
-    TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus, valid_audit_action,
+    AUDIT_ACTIONS, AccountInfo, AccountUsage, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminManifestIndex,
+    AdminPasswordReset, AdminServerInfo, AdminStorageAccount, AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, AuditEvent,
+    AuditPage, DeviceInfo, PairingState, PairingStatus, RecoveryCodes, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus,
+    UsageEstimateReason, UsageEstimates, valid_audit_action,
 };
 pub use craft_cloud_api::local::{
     HistoryResponse, HistoryVersion, JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RestoreResponse, RunState,
@@ -842,6 +843,33 @@ mod tests {
         assert_eq!(next().1, format!("/v1/admin/users/{id}/devices/{device}"));
         let wrong = agent.admin_disable_user(id, &confirm);
         assert!(matches!(wrong, Err(Error::Refused { ref code, .. }) if code == "wrong_password"), "{wrong:?}");
+    }
+
+    #[test]
+    fn storage_admin_calls_use_the_local_admin_routes() {
+        let id = uuid::Uuid::now_v7();
+        let overview = AdminStorageOverview {
+            accounts: 1,
+            stored_bytes: 17,
+            default_quota_bytes: Some(99),
+            accounts_with_override: 0,
+            accounts_near_quota: 0,
+            accounts_over_quota: 0,
+            top_accounts: vec![AdminStorageAccount { id, username: "ana".into(), stored_bytes: 17, quota_bytes: Some(99) }],
+            manifest_index: AdminManifestIndex { complete: 3, building: 1, not_indexed: 2 },
+        };
+        let usage = AccountUsage {
+            stored_bytes: 17,
+            quota_bytes: Some(99),
+            trash_bytes: Some(4),
+            history_bytes: Some(8),
+            estimates: UsageEstimates { index_complete: true, reason: None },
+        };
+        let (_dir, agent, asked) = fake_agent(vec![(200, json(&overview)), (200, json(&usage))]);
+        assert_eq!(agent.admin_storage().unwrap(), overview);
+        assert_eq!(asked.recv_timeout(Duration::from_secs(5)).unwrap(), ("GET".into(), "/v1/admin/storage".into(), String::new()));
+        assert_eq!(agent.admin_user_usage(id).unwrap(), usage);
+        assert_eq!(asked.recv_timeout(Duration::from_secs(5)).unwrap(), ("GET".into(), format!("/v1/admin/users/{id}/usage"), String::new()));
     }
 
     #[test]

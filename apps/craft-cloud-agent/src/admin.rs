@@ -22,8 +22,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::{
-    AccountInfo, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser,
-    AdminUserInfo, AdminUserList, AuditPage, codes as api_codes, valid_audit_action,
+    AccountInfo, AccountUsage, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo,
+    AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, AuditPage, codes as api_codes, valid_audit_action,
 };
 use craft_cloud_proto::local::{MAX_ADMIN_JSON_BYTES, paths};
 use reqwest::Method;
@@ -57,8 +57,10 @@ pub(crate) fn routes() -> Router<Api> {
         .route(paths::ADMIN_AUDIT, get(audit))
         .route(paths::ADMIN_AUDIT_EXPORT, get(audit_export))
         .route(paths::ADMIN_SERVER, get(server))
+        .route(paths::ADMIN_STORAGE, get(storage))
         .route(paths::ADMIN_USERS, get(list_users).post(create_user).layer(small()))
         .route(&user, axum::routing::patch(update_user).delete(remove_user).layer(small()))
+        .route(&format!("{user}/usage"), get(user_usage))
         .route(&format!("{user}/disable"), post(disable_user).layer(small()))
         .route(&format!("{user}/enable"), post(enable_user).layer(small()))
         .route(&format!("{user}/invite"), post(issue_invite).delete(revoke_invite).layer(small()))
@@ -71,6 +73,17 @@ pub(crate) fn routes() -> Router<Api> {
 async fn server(State(state): State<Api>) -> Answer<Json<AdminServerInfo>> {
     let (_, transport) = server_api(&state)?;
     Ok(Json(transport.admin_get("admin/server", &[]).await?))
+}
+
+async fn storage(State(state): State<Api>) -> Answer<Json<AdminStorageOverview>> {
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.admin_get("admin/storage", &[]).await?))
+}
+
+async fn user_usage(State(state): State<Api>, id: Result<Path<Uuid>, PathRejection>) -> Answer<Json<AccountUsage>> {
+    let id = path_id(id)?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.admin_get(&format!("admin/users/{id}/usage"), &[]).await?))
 }
 
 #[derive(Debug, Deserialize)]

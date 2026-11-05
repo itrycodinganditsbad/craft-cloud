@@ -48,12 +48,12 @@ pub use live::{
 };
 pub use trash::{TrashEntry, TrashPage};
 pub use tree::{MAX_PAGE_SAVE_BYTES, SpaceInfo};
-pub use usage::{StorageEstimate, StorageEstimateReason};
 pub use two_factor::{
     CHALLENGE_TTL_MS, Completed, DeviceActor, LOCK_AFTER_FAILURES, LOCK_BASE_MS, LOCK_MAX_MS, MAX_CHALLENGE_ATTEMPTS, MAX_OPEN_CHALLENGES,
     MAX_SETUP_ATTEMPTS, NewChallenge, Proof, RECOVERY_CODES, SETUP_TTL_MS, SignIn, StoredSecrets, TotpVerifier, TwoFactorInfo, UnreadableSecret,
     retry_after_secs,
 };
+pub use usage::{StorageAccount, StorageEstimate, StorageEstimateReason, StorageIndexCounts, StorageOverview};
 pub use users::{
     AccountRecord, CLIENT_KINDS, DeviceAuth, DeviceClient, DeviceRecord, MAX_CLIENT_FIELD_BYTES, RevokeReason, Role, UserId, UserRecord,
     valid_username,

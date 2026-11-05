@@ -40,7 +40,7 @@ WITH space_manifests AS (
     WHERE sb.space_id = $1
     GROUP BY sb.id, b.stored_size
 )
-SELECT s.stored_bytes,
+SELECT s.stored_bytes, s.quota_bytes,
     CASE WHEN EXISTS (SELECT 1 FROM incomplete) THEN NULL ELSE
         CAST(COALESCE((SELECT SUM(stored_size) FROM classified WHERE trash_only = 1), 0) AS BIGINT) +
         CAST(COALESCE((SELECT SUM(stored_size) FROM eligible_chunks WHERE trash_only = 1), 0) AS BIGINT) END AS trash_bytes,

@@ -10,9 +10,10 @@ use crate::ops::{Conflict, Op};
 
 /// What apps see of these bodies lives in `craft-cloud-api` (no postcard), re-exported here.
 pub use craft_cloud_api::api::{
-    AUDIT_ACTIONS, AccountInfo, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo,
-    AdminUpdateUser, AdminUserInfo, AdminUserList, AuditDetails, AuditEvent, AuditExportEnd, AuditPage, DeviceInfo, ErrorAnswer, PairingState,
-    PairingStatus, RecoveryCodes, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus, codes, valid_audit_action,
+    AUDIT_ACTIONS, AccountInfo, AccountUsage, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminManifestIndex,
+    AdminPasswordReset, AdminServerInfo, AdminStorageAccount, AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, AuditDetails,
+    AuditEvent, AuditExportEnd, AuditPage, DeviceInfo, ErrorAnswer, PairingState, PairingStatus, RecoveryCodes, RevokedOthers, TwoFactorChallenge,
+    TwoFactorSetupResponse, TwoFactorStatus, UsageEstimateReason, UsageEstimates, codes, valid_audit_action,
 };
 
 /// Protocol versions this build speaks. A client and server must share at least one.
@@ -48,29 +49,6 @@ pub struct SpaceResponse {
     pub seq: u64,
     /// The account's username, in lowercase.
     pub username: String,
-}
-
-/// `GET /api/v1/account/usage`: stored bytes and labeled estimates for the signed-in account's space.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AccountUsage {
-    pub stored_bytes: u64,
-    pub quota_bytes: Option<u64>,
-    pub trash_bytes: Option<u64>,
-    pub history_bytes: Option<u64>,
-    pub estimates: UsageEstimates,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UsageEstimates {
-    pub index_complete: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<UsageEstimateReason>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UsageEstimateReason {
-    IndexIncomplete,
 }
 
 /// `POST /api/v1/auth/login`. `client_kind`, `platform` and `app_version` are optional and only shown in the device

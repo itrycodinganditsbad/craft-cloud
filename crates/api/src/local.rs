@@ -161,6 +161,8 @@ pub mod paths {
     /// `GET`: the server's counters and kinds (an admin's; any other account is refused with `forbidden`) →
     /// [`AdminServerInfo`](crate::api::AdminServerInfo).
     pub const ADMIN_SERVER: &str = "/v1/admin/server";
+    /// `GET /v1/admin/storage` → [`AdminStorageOverview`](crate::api::AdminStorageOverview).
+    pub const ADMIN_STORAGE: &str = "/v1/admin/storage";
     /// `GET /v1/admin/users?cursor&limit&query` → [`AdminUserList`](crate::api::AdminUserList); `POST` (an
     /// [`AdminCreateUser`](crate::api::AdminCreateUser)) → [`AdminCreatedUser`](crate::api::AdminCreatedUser).
     /// Under `/v1/admin/users/{id}`: `PATCH` ([`AdminUpdateUser`](crate::api::AdminUpdateUser)) → the account's
@@ -170,6 +172,8 @@ pub mod paths {
     /// [`AdminCode`](crate::api::AdminCode), the others have no body); `GET …/devices` →
     /// [`AdminDevices`](crate::api::AdminDevices). The server's status and error code are the agent's.
     pub const ADMIN_USERS: &str = "/v1/admin/users";
+    /// `GET /v1/admin/users/{id}/usage` → [`AccountUsage`](crate::api::AccountUsage).
+    pub const ADMIN_USER_USAGE: &str = "/v1/admin/users";
     /// `GET /v1/admin/audit?cursor&before_ms&limit&user&action` → [`AuditPage`](crate::api::AuditPage): the whole security log,
     /// newest first, filtered (an admin's).
     pub const ADMIN_AUDIT: &str = "/v1/admin/audit";

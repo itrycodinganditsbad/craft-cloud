@@ -284,6 +284,61 @@ pub struct AdminServerInfo {
     pub database_kind: String,
 }
 
+/// `GET /admin/storage`: server-wide storage counts and the ten largest accounts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminStorageOverview {
+    pub accounts: u64,
+    pub stored_bytes: u64,
+    pub default_quota_bytes: Option<u64>,
+    pub accounts_with_override: u64,
+    /// Accounts at or above 90% of their effective quota.
+    pub accounts_near_quota: u64,
+    /// Accounts at or above their effective quota.
+    pub accounts_over_quota: u64,
+    pub top_accounts: Vec<AdminStorageAccount>,
+    pub manifest_index: AdminManifestIndex,
+}
+
+/// One account in [`AdminStorageOverview`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminStorageAccount {
+    pub id: Uuid,
+    pub username: String,
+    pub stored_bytes: u64,
+    pub quota_bytes: Option<u64>,
+}
+
+/// Global manifest-index counts from the metadata database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminManifestIndex {
+    pub complete: u64,
+    pub building: u64,
+    pub not_indexed: u64,
+}
+
+/// `GET /account/usage` and `GET /admin/users/{id}/usage`: stored bytes and labeled estimates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountUsage {
+    pub stored_bytes: u64,
+    pub quota_bytes: Option<u64>,
+    pub trash_bytes: Option<u64>,
+    pub history_bytes: Option<u64>,
+    pub estimates: UsageEstimates,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageEstimates {
+    pub index_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<UsageEstimateReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageEstimateReason {
+    IndexIncomplete,
+}
+
 /// An account in the admin API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminUserInfo {

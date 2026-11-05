@@ -34,8 +34,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use craft_cloud_meta::{AdminActor, AdminUser, AdminVia, DeviceAuth, Role, UserId, valid_username};
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::{
-    AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo, AdminUpdateUser, AdminUserInfo,
-    AdminUserList,
+    AccountUsage, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminManifestIndex, AdminPasswordReset, AdminServerInfo,
+    AdminStorageAccount, AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, UsageEstimateReason, UsageEstimates,
 };
 use craft_cloud_proto::join::{Code, INVITE_CHARS, INVITE_TTL_MS, JoinString};
 use serde::Deserialize;
@@ -61,8 +61,10 @@ pub(crate) const MAX_QUERY_BYTES: usize = craft_cloud_meta::MAX_SEARCH_BYTES;
 pub fn routes() -> Router<Shared> {
     Router::new()
         .route("/admin/server", get(server))
+        .route("/admin/storage", get(storage))
         .route("/admin/users", get(list_users).post(create_user).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/admin/users/{id}", axum::routing::patch(update_user).delete(remove_user).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route("/admin/users/{id}/usage", get(user_usage))
         .route("/admin/users/{id}/disable", post(disable_user).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/admin/users/{id}/enable", post(enable_user).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/admin/users/{id}/invite", post(issue_invite).delete(revoke_invite).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
@@ -187,6 +189,47 @@ async fn server(State(state): State<Shared>) -> Result<Json<AdminServerInfo>, Ap
         live_bytes: counts.live_bytes,
         storage_kind: state.store.kind().to_owned(),
         database_kind: state.meta.database_kind().to_owned(),
+    }))
+}
+
+/// `GET /admin/storage`: bounded account and manifest-index counts, plus the ten largest accounts.
+async fn storage(State(state): State<Shared>) -> Result<Json<AdminStorageOverview>, ApiError> {
+    let overview = state.meta.admin_storage_overview().await?;
+    Ok(Json(AdminStorageOverview {
+        accounts: overview.accounts,
+        stored_bytes: overview.stored_bytes,
+        default_quota_bytes: overview.default_quota_bytes,
+        accounts_with_override: overview.accounts_with_override,
+        accounts_near_quota: overview.accounts_near_quota,
+        accounts_over_quota: overview.accounts_over_quota,
+        top_accounts: overview
+            .top_accounts
+            .into_iter()
+            .map(|account| AdminStorageAccount {
+                id: account.id.0,
+                username: account.username,
+                stored_bytes: account.stored_bytes,
+                quota_bytes: account.quota_bytes,
+            })
+            .collect(),
+        manifest_index: AdminManifestIndex {
+            complete: overview.manifest_index.complete,
+            building: overview.manifest_index.building,
+            not_indexed: overview.manifest_index.not_indexed,
+        },
+    }))
+}
+
+/// `GET /admin/users/{id}/usage`: the account's stored bytes and labeled estimates.
+async fn user_usage(State(state): State<Shared>, id: Result<Path<Uuid>, PathRejection>) -> Result<Json<AccountUsage>, ApiError> {
+    let estimate = state.meta.admin_storage_estimate(user_id(id)?).await?;
+    let index_complete = estimate.reason.is_none();
+    Ok(Json(AccountUsage {
+        stored_bytes: estimate.stored_bytes,
+        quota_bytes: estimate.quota_bytes,
+        trash_bytes: estimate.trash_bytes,
+        history_bytes: estimate.history_bytes,
+        estimates: UsageEstimates { index_complete, reason: estimate.reason.map(|_| UsageEstimateReason::IndexIncomplete) },
     }))
 }
 

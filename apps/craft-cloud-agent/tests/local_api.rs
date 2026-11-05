@@ -189,9 +189,11 @@ const ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/devices/revoke-others"),
     ("PATCH", "/v1/devices/0192f0c4-0000-7000-8000-000000000000"),
     ("GET", "/v1/admin/server"),
+    ("GET", "/v1/admin/storage"),
     ("GET", "/v1/admin/users"),
     ("POST", "/v1/admin/users"),
     ("PATCH", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000"),
+    ("GET", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/usage"),
     ("DELETE", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000"),
     ("POST", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/disable"),
     ("POST", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/enable"),
@@ -1071,7 +1073,9 @@ async fn an_invite_to_a_new_account_asks_for_a_password_through_the_agent() {
 
 // ---- the admin calls (`/v1/admin/…`) ----
 
-use craft_cloud_proto::api::{AdminCode, AdminCreatedUser, AdminDevices, AdminServerInfo, AdminUserInfo, AdminUserList};
+use craft_cloud_proto::api::{
+    AccountUsage, AdminCode, AdminCreatedUser, AdminDevices, AdminServerInfo, AdminStorageOverview, AdminUserInfo, AdminUserList,
+};
 
 /// The server with `root`, an administrator, beside `ana`, a member.
 async fn admin_server() -> Server {
@@ -1142,6 +1146,15 @@ async fn admin_calls_reach_the_servers_admin_api_and_pass_its_answers_through() 
     assert_eq!(code, 200, "{body}");
     let info: AdminServerInfo = serde_json::from_str(&body).unwrap();
     assert_eq!((info.users, info.devices_active, info.storage_kind.as_str()), (2, 1, "disk"));
+    let (code, body) = call(&api, "GET", "/v1/admin/storage", "");
+    assert_eq!(code, 200, "{body}");
+    let overview: AdminStorageOverview = serde_json::from_str(&body).unwrap();
+    assert_eq!(overview.accounts, 2);
+    assert_eq!(overview.stored_bytes, 0);
+    let (code, body) = call(&api, "GET", &format!("{ana_path}/usage"), "");
+    assert_eq!(code, 200, "{body}");
+    let usage: AccountUsage = serde_json::from_str(&body).unwrap();
+    assert_eq!((usage.stored_bytes, usage.quota_bytes, usage.trash_bytes, usage.history_bytes), (0, None, Some(0), Some(0)));
     let (code, body) = call(&api, "GET", "/v1/admin/users?limit=1", "");
     assert_eq!(code, 200, "{body}");
     let page: AdminUserList = serde_json::from_str(&body).unwrap();

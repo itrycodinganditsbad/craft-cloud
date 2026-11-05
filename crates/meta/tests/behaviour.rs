@@ -96,6 +96,9 @@ on_every_backend!(
     account_usage_estimates_history_and_trash_without_adding_them,
     account_usage_excludes_chunks_shared_with_current_version,
     account_usage_deduplicates_per_space_and_counts_pending_purge,
+    admin_storage_overview_is_aggregated_and_orders_ties,
+    admin_storage_overview_handles_an_empty_server,
+    admin_storage_estimates_hide_removed_and_unknown_accounts,
     account_usage_excludes_live_document_snapshot_blobs,
     account_usage_leaves_saved_versions_out_of_history,
     concurrent_chunk_batches_charge_a_shared_chunk_once,
@@ -539,6 +542,64 @@ async fn account_usage_estimates_history_and_trash_without_adding_them(meta: &Me
     assert_eq!(trashed.trash_bytes, Some(212), "both versions' chunks and manifests belong to trash");
     assert_eq!(trashed.history_bytes, Some(0), "trashed node history is not history estimate");
     assert_eq!(trashed.stored_bytes, historical.stored_bytes, "labeled estimates never add to stored bytes");
+}
+
+async fn admin_storage_overview_is_aggregated_and_orders_ties(meta: &Meta) {
+    let (_, actor) = admin_actor(meta, "root").await;
+    let mut accounts = Vec::new();
+    for index in 0..13 {
+        accounts.push(user(meta, &format!("a{index:02}")).await);
+    }
+    let cap = 10_000_000;
+    let quota = 12_000_000;
+    meta.admin_update_user(&actor, accounts[0].id, None, Some(Some(quota)), NOW).await.unwrap();
+    for (index, stored) in [quota, 8_999_999, 9_000_000, cap, 10, 10, 10, 10, 10, 10, 10, 10, 10].into_iter().enumerate() {
+        meta.add_chunk(accounts[index].space, &ChunkId::from_bytes([index as u8 + 1; 32]), stored, NOW).await.unwrap();
+    }
+
+    let report = meta.clone().with_stored_bytes_cap(Some(cap)).admin_storage_overview().await.unwrap();
+    assert_eq!(report.accounts, 14);
+    assert_eq!(report.stored_bytes, 40_000_089);
+    assert_eq!(report.default_quota_bytes, Some(cap));
+    assert_eq!(report.accounts_with_override, 1);
+    assert_eq!(report.accounts_near_quota, 3, "exactly 90% counts as near");
+    assert_eq!(report.accounts_over_quota, 2, "exactly 100% counts as over");
+    assert_eq!(
+        report.top_accounts.iter().map(|account| account.username.as_str()).collect::<Vec<_>>(),
+        ["a00", "a03", "a02", "a01", "a04", "a05", "a06", "a07", "a08", "a09"]
+    );
+    assert_eq!(report.top_accounts[0].quota_bytes, Some(quota), "account override beats cap");
+    let capped = meta.clone().with_stored_bytes_cap(Some(cap));
+    assert_eq!(capped.storage_estimate(accounts[0].space).await.unwrap().quota_bytes, Some(quota));
+    assert_eq!(capped.storage_estimate(accounts[1].space).await.unwrap().quota_bytes, Some(cap));
+    assert_eq!(meta.storage_estimate(accounts[1].space).await.unwrap().quota_bytes, None);
+    assert_eq!(report.manifest_index.complete, 0);
+    assert_eq!(report.manifest_index.building, 0);
+    assert_eq!(report.manifest_index.not_indexed, 0);
+}
+
+async fn admin_storage_overview_handles_an_empty_server(meta: &Meta) {
+    let report = meta.admin_storage_overview().await.unwrap();
+    assert_eq!(report.accounts, 0);
+    assert_eq!(report.stored_bytes, 0);
+    assert_eq!(report.accounts_with_override, 0);
+    assert_eq!(report.accounts_near_quota, 0);
+    assert_eq!(report.accounts_over_quota, 0);
+    assert!(report.top_accounts.is_empty());
+    assert_eq!(report.manifest_index.complete, 0);
+    assert_eq!(report.manifest_index.building, 0);
+    assert_eq!(report.manifest_index.not_indexed, 0);
+}
+
+async fn admin_storage_estimates_hide_removed_and_unknown_accounts(meta: &Meta) {
+    let (_, actor) = admin_actor(meta, "root").await;
+    let target = user(meta, "target").await;
+    let estimate = meta.admin_storage_estimate(target.id).await.unwrap();
+    assert_eq!(estimate.quota_bytes, None);
+    assert_eq!(estimate.stored_bytes, 0);
+    assert!(matches!(meta.admin_storage_estimate(UserId(uuid::Uuid::now_v7())).await, Err(MetaError::NotFound("user"))));
+    meta.admin_remove_user(&actor, target.id, NOW).await.unwrap();
+    assert!(matches!(meta.admin_storage_estimate(target.id).await, Err(MetaError::NotFound("user"))));
 }
 
 async fn account_usage_excludes_chunks_shared_with_current_version(meta: &Meta) {

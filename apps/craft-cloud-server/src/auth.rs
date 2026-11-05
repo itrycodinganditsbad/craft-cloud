@@ -80,8 +80,12 @@ fn bearer(request: &Request) -> Option<&str> {
 pub async fn require_device(State(state): State<Arc<AppState>>, mut request: Request, next: Next) -> Result<Response, ApiError> {
     let token = bearer(&request).ok_or_else(ApiError::unauthorized)?;
     let device = state.meta.device_by_token(&token_hash(token)).await?.ok_or_else(ApiError::unauthorized)?;
-    // Usage reads are fingerprinted as read-only; do not update the device's last-used timestamp for them.
-    if !matches!(request.uri().path(), "/api/v1/account/usage" | "/account/usage") {
+    // Usage reads and the storage overview are fingerprinted as read-only; do not update last-used timestamps for them.
+    let path = request.uri().path();
+    let admin_usage = ["/api/v1/admin/users/", "/admin/users/"]
+        .iter()
+        .any(|prefix| path.strip_prefix(prefix).and_then(|id| id.strip_suffix("/usage")).is_some_and(|id| !id.is_empty() && !id.contains('/')));
+    if !matches!(path, "/api/v1/account/usage" | "/account/usage" | "/api/v1/admin/storage" | "/admin/storage") && !admin_usage {
         // Off the request's path: the write may wait for the SQLite write lock, and the request needn't wait with it.
         let touching = state.clone();
         let (id, now) = (device.device, state.now_ms());
