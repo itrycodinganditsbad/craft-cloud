@@ -1,0 +1,20 @@
+# The build context of packaging/docker/Dockerfile is the repository root, because Cargo needs the manifests of
+# every workspace member. Nothing here may reach the image: no history, no local data, no secrets.
+.git
+.github
+target
+**/target
+/dist
+/temp
+/data
+docs
+packaging
+**/*.md
+.env
+.env.*
+**/.env
+**/.env.*
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*~
