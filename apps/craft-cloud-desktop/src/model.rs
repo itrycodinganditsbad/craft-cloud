@@ -7,10 +7,11 @@
 
 use std::path::Path;
 
-use craft_cloud_app::{DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingState, PairingStatus, RunState, Status, UserQuery, Uuid, codes};
+use craft_cloud_app::{
+    DeviceId, DeviceInfo, Error, HistoryResponse, JoinRequest, NodeId, PairingInfo, PairingState, PairingStatus, RestoreResponse, RunState,
+    Status, TrashResponse, TrashRestoreResponse, Uuid, UserQuery, VersionId, codes,
+};
 use craft_cloud_proto::api::AdminConfirm;
-use craft_cloud_app::{DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingState, PairingStatus, RunState, Status, Uuid, codes};
-use craft_cloud_app::{HistoryResponse, NodeId, RestoreResponse, TrashResponse, TrashRestoreResponse, VersionId};
 use craft_cloud_proto::api::codes as api_codes;
 use craft_cloud_proto::join::JoinString;
 
@@ -1231,7 +1232,7 @@ impl Model {
             Err(e) => e,
         };
         let (code, text) = match &e {
-            Error::Refused { code, message } | Error::RefusedWith { code, message, .. } => (code.as_str(), message.clone()),
+            Error::Refused { code, message, .. } | Error::RefusedWith { code, message, .. } => (code.as_str(), message.clone()),
             Error::Refused { code, message, .. } => (code.as_str(), message.clone()),
             Error::NotRunning(_) => {
                 self.status = None;
