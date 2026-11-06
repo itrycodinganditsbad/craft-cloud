@@ -22,6 +22,7 @@ use sqlx::Row;
 
 use crate::blobs::manifest_file_size;
 use crate::codec::{flag, hash_from, to_i64, uuid_bytes, uuid_from};
+use crate::trash::TRASH_BELOW;
 use crate::tree::space_info;
 use crate::{Dialect, Meta, MetaError};
 
@@ -441,7 +442,7 @@ impl Ctx<'_> {
     /// and what is below it moves in. Where a name is taken by a file, or the node's own name is taken by anything, the
     /// node comes back under a conflict name. Never overwrites, never creates a node. A conflict that can't be solved
     /// is an `Err(MetaError::Rejected)`, and the caller drops the transaction.
-    async fn restore_from_trash(&mut self, node: NodeId) -> Result<TrashRestoreOutcome, MetaError> {
+    async fn restore_from_trash(&mut self, node: NodeId, tree_cap: u64) -> Result<TrashRestoreOutcome, MetaError> {
         let found = sqlx::query("SELECT deleted, purge_requested_ms, is_dir FROM nodes WHERE space_id = $1 AND id = $2")
             .bind(self.space())
             .bind(uuid_bytes(node.as_uuid()))
@@ -507,10 +508,56 @@ impl Ctx<'_> {
         // server refuses that delete as a version mismatch, and the machine's engine already treats a node that came
         // back at another version as one whose delete went through.
         let version = if is_dir { None } else { Some(self.renew_version(node).await?) };
+        if is_dir {
+            self.restore_below(node, tree_cap, &device).await?;
+        }
         let placed = self.node(node).await?.ok_or(MetaError::Corrupt("a restored node vanished"))?;
         let parent = placed.parent.ok_or(MetaError::Corrupt("a restored node has no parent"))?;
         let original = up.first().map(|a| a.name.as_str()).unwrap_or_default();
         Ok(TrashRestoreOutcome { node, parent, renamed: placed.name != original, name: placed.name, version, seq: 0, epoch: self.epoch })
+    }
+
+    /// Brings back everything in the trash below the folder `top`, which is live again: its deleted children and theirs,
+    /// whenever they were deleted, parents first. A child keeps its name; one whose name another child that came back
+    /// took (a name deleted twice, the newest deletion first) gets a conflict name. A removed node, and what is only
+    /// below a removed folder, stays deleted. More than `cap` nodes: `Invalid`, and the caller drops the transaction.
+    async fn restore_below(&mut self, top: NodeId, cap: u64, device: &str) -> Result<(), MetaError> {
+        let bound = i64::try_from(MAX_TREE_DEPTH + 2).map_err(|_| MetaError::Corrupt("depth limit out of range"))?;
+        let limit = i64::try_from(cap).map_err(|_| MetaError::Corrupt("trash cap out of range"))?.saturating_add(1);
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{TRASH_BELOW} SELECT n.id, n.parent, n.name, n.is_dir FROM sub JOIN nodes n ON n.space_id = $1 AND n.id = sub.id \
+             ORDER BY sub.depth, n.deleted_ms DESC, n.id LIMIT $4"
+        )))
+        .bind(self.space())
+        .bind(uuid_bytes(top.as_uuid()))
+        .bind(bound)
+        .bind(limit)
+        .fetch_all(&mut *self.conn)
+        .await?;
+        if u64::try_from(rows.len()).map_err(|_| MetaError::Corrupt("count out of range"))? > cap {
+            return Err(MetaError::Invalid(crate::trash::TRASH_TREE_TOO_LARGE));
+        }
+        for row in &rows {
+            let id = NodeId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("id")?)?);
+            let parent = NodeId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("parent")?)?);
+            let is_dir = flag(row, "is_dir")?;
+            let own = Name::new(&row.try_get::<String, _>("name")?).map_err(|_| MetaError::Corrupt("a stored name is invalid"))?;
+            let name = match self.live_child(parent, &own).await? {
+                None => own,
+                Some(existing) => match self.free_conflict_name(parent, &own, is_dir, device).await? {
+                    Some(candidate) => candidate,
+                    None => return Err(rejected(ConflictKind::NameTaken { existing })),
+                },
+            };
+            if is_dir && let Err(kind) = self.check_placement(parent, None).await? {
+                return Err(rejected(kind));
+            }
+            self.revive(id, parent, &name).await?;
+            if !is_dir {
+                self.renew_version(id).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Gives the file `node` a new current version with the manifest, modification time and executable bit of its last
@@ -622,14 +669,14 @@ impl Meta {
     }
 
     /// Brings the node `node` of the trash back in `space`, as one change of the space (one sequence number, all or
-    /// nothing): see `Ctx::restore_from_trash` for the rules. `NotFound` for a node that is not in the trash (live,
+    /// nothing): see `Ctx::restore_from_trash` for the rules. A folder brings back what is in the trash below it too. `NotFound` for a node that is not in the trash (live,
     /// unknown, another space's, or removed from the trash); `Rejected` (`NameTaken`) when no conflict name is free.
     pub async fn restore_from_trash(&self, space: SpaceId, device: DeviceId, node: NodeId, now_ms: i64) -> Result<TrashRestoreOutcome, MetaError> {
         let mut w = self.begin_write().await?;
         let info = space_info(&mut w.tx, space, self.dialect == Dialect::Postgres).await?;
         let seq = info.seq.checked_add(1).ok_or(MetaError::Corrupt("sequence overflow"))?;
         let mut ctx = Ctx { conn: &mut w.tx, space, seq: to_i64(seq)?, epoch: info.epoch, device, now_ms, failed_restores: HashMap::new() };
-        let outcome = ctx.restore_from_trash(node).await?;
+        let outcome = ctx.restore_from_trash(node, self.trash_tree_cap).await?;
         sqlx::query("UPDATE spaces SET seq = $1 WHERE id = $2").bind(to_i64(seq)?).bind(uuid_bytes(space.as_uuid())).execute(&mut *w.tx).await?;
         w.commit().await?;
         Ok(TrashRestoreOutcome { seq, ..outcome })
