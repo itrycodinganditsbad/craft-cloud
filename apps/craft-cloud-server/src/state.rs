@@ -109,10 +109,14 @@ pub struct AppState {
     pub logins: Limiter,
     /// Failed join-code redeems per client address, in one-minute windows ([`crate::join`]).
     pub joins: Limiter,
+    /// Password change tries per account, in 15-minute windows ([`crate::account`]).
+    pub password_changes: Limiter,
     pub notifier: Notifier,
     /// The live service's connections and subscriptions ([`crate::live`]).
     pub live: LiveHub,
     pub limits: Limits,
+    /// The address computers reach the server at (`public_url` in the config), for the join links of the admin API.
+    pub public_url: Option<String>,
     /// Chunk and manifest bodies being received, per user ([`Limits::bodies_per_user`]).
     pub bodies: PerUser,
     /// Manifests being decoded and checked, per user ([`Limits::manifests_per_user`]).
@@ -135,12 +139,14 @@ impl AppState {
             trusted_proxies,
             logins: Limiter::new(Duration::from_secs(300)),
             joins: Limiter::new(Duration::from_secs(60)),
+            password_changes: Limiter::new(Duration::from_secs(900)),
             notifier: Notifier::default(),
             live: LiveHub::default(),
             bodies: PerUser::new(limits.bodies_per_user),
             manifests: PerUser::new(limits.manifests_per_user),
             password_checks: Arc::new(Semaphore::new(limits.password_checks)),
             limits,
+            public_url: None,
             touches: Mutex::new(HashMap::new()),
             dummy_hash: hash_password("craft-cloud dummy password")?,
             clock: Arc::new(now_ms),
@@ -153,6 +159,12 @@ impl AppState {
         self.manifests = PerUser::new(limits.manifests_per_user);
         self.password_checks = Arc::new(Semaphore::new(limits.password_checks));
         self.limits = limits;
+        self
+    }
+
+    /// The state with the server's public address (`public_url`), which the admin API puts in the join links it makes.
+    pub fn with_public_url(mut self, public_url: Option<String>) -> Self {
+        self.public_url = public_url;
         self
     }
 

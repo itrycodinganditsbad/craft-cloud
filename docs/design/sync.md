@@ -578,6 +578,79 @@ changes locally, then pushes local changes. These rules came out of the simulati
   database (not a supported setup) would each count their own, so twice the sign-in attempts and twice the writes.
 - **Setup**: `craft-cloud-server init` writes the config, creates the data directory and the first admin.
   Solo use is that one admin account and nothing more.
+- **Device sessions** (migration 0007): a device token has no expiry and its format is unchanged (43 characters, stored as a
+  BLAKE3 hash); what changed is what a device records and how an account ends them. A device records the `client_kind`,
+  `platform` and `app_version` it said at sign-in (display only; the agent says `agent`, its operating system and its version on every
+  sign-in and join), and, once revoked, when (`revoked_ms`) and why
+  (`revoke_reason`). The `revoked` flag is still the check: the three are set together in one transaction and only by
+  the first revoke, so a second revoke changes neither. A user keeps `password_changed_ms`, and `disabled_ms`, which the
+  admin API sets and the token check, sign-in, join and pairing read (see "Admin API and roles").
+  - **Changing the password** (`POST /account/password`) checks the current password under one of the server-wide
+    password-check slots (all busy: `429` with `Retry-After`, and the try is given back), then in one transaction sets
+    the new hash and `password_changed_ms`, revokes every other device (`revoke_reason = password`) and deletes the
+    account's open invite and all its pairings, so no code made before the change works after it; if the password
+    changed meanwhile nothing changes (`409 conflict`), and neither does it if the calling device was signed out meanwhile (`401`). Afterwards each revoked device's live connections end at once. The same two
+    steps run for `user reset-password` (all devices, reason `reset`, unless `--keep-devices`) and `device revoke-all`
+    (reason `admin`) on the command line, which cannot reach the server's live connections: those end at the next ping
+    (within about 30 s) and a change-feed long-poll within 60 s.
+  - **Sign-in and join under a change**: a password sign-in creates its device only if the stored hash is still the one
+    it checked (the account is locked first), and answers as for a wrong password otherwise, so a device is never
+    added after a reset or change that signed the others out. Every transaction that revokes devices, changes a
+    password, redeems an invite or makes a pairing takes the account's row first, which keeps them from deadlocking.
+  - **Limits**: `password_changes` counts every try, a wrong password included, 5 per account per 15 minutes; the
+    password and device-name bodies are read up to 4 KiB (the sign-in bodies stay at 1 MiB).
+- **Admin API and roles** (migration 0008): an account is an `admin` or a `member`, and every route under
+  `/api/v1/admin` is behind the `require_admin` layer, which runs after the device check and reads the role the
+  database gave for that very request (nothing is cached, so a demoted admin is out with the next request). A member
+  gets `403 forbidden`, a missing or revoked token `401`. The layer is only the first look: every change checks the
+  acting admin again inside its own transaction.
+  - **Confirmation.** A device token never expires, so a stolen admin token alone must not be enough to create an
+    admin, issue a code or sign others out. Every change (creating, changing, disabling, enabling, removing an account,
+    issuing or revoking an invite, issuing a password reset code, revoking another user's device) carries the acting
+    admin's current `password` in its JSON body, also the `DELETE` routes (at most 4 KiB). A missing or mistyped body
+    field is `400 invalid`; a wrong password is `403 wrong_password`, never 401, because the agent reads every 401 on a
+    signed-in route as a revoked device. Tries are counted per account in the password change's limiter (5 wrong
+    passwords in 15 minutes, then `429`; a right password is given back), and every check takes one of the
+    server-wide password-check slots. **Two-factor sign-in does not exist yet.** When it arrives, the same bodies get
+    optional `totp_code` and `recovery_code` fields, required of an admin who has it; servers ignore fields they do not
+    know, so clients can already send them. Until then, resetting another administrator's password through the API is
+    `403 forbidden` (the acting admin could not prove a second factor); the command line on the host is the way.
+  - **The acting admin in the transaction.** After the password check (a slow Argon2id run) the admin's role, device or
+    password can have changed. Every change locks, in this order, (1) the `last_admin` lock if it can take an
+    administrator away, (2) the user rows of the actor and the target in ascending ID, (3) the rows derived from them,
+    and then checks that the actor's device is not revoked and the account neither disabled nor marked for removal
+    (`401`), that the role is still `admin` (`403 forbidden`) and that the password hash is the one verified (`409
+    conflict`). Sign-ins, joins and pairings take the user row first too, so none of these can deadlock.
+  - **The last administrator.** Demoting, disabling or removing an admin who is the last enabled one is `409
+    last_admin`. A count cannot be locked with `FOR UPDATE`, and locking each target's row would not stop two admins
+    from each taking the other away, so every change that can reduce the admins first takes one transaction-wide lock
+    and counts after it (Postgres `pg_advisory_xact_lock` with a fixed key, SQLite the write transaction, which is
+    the same thing there). Nobody can disable or remove their own account (`400 invalid`) but may step down when
+    another admin is left. The command line does not enforce the rule or the confirmation: the operator has the files.
+  - **Disabled accounts.** Disabling signs every device out (`revoke_reason = disabled`), deletes the open invite or
+    reset code and the pairings, and sets `disabled_ms`; enabling clears it and brings back no device. A disabled
+    account's old tokens are `401 unauthorized`; sign-in and join answer `403 account_disabled`, but only after the
+    password or code was right (a wrong one is `401` or `404 invalid_code` as ever). Issuing is serialised with
+    disabling: a sign-in, a redeem, a pairing and a new device lock the user row first and look at `disabled_ms` and
+    `removed_ms` in their own transaction, so a password checked before the disable never turns into a device after
+    it, and enabling later cannot make such a device usable. **Removing** an account (`DELETE /admin/users/{id}`, `202`)
+    also sets `removed_ms`: it is disabled, left out of the lists and cannot be enabled, its username stays taken,
+    and nothing it stored is deleted (freeing it comes with garbage collection).
+  - **Codes.** `POST /admin/users` makes an account without a password (role `admin` or `member`) and a 7-day invite;
+    the person chooses the password when they redeem it. An invite for an existing account is only made for one
+    that still has no password: for an account with a password it would add a computer without asking for it, so
+    `409 conflict`, and a password reset code is the way in. A **password reset code** (`purpose = reset`, 16
+    characters, one hour, one per account like an invite, so each replaces the other) is redeemed at `POST /join`: it
+    always asks for a new password (`password_required`, `weak_password`), sets it, signs **every** device of the
+    account out (`revoke_reason = reset`), deletes its pairings, and, as every redeem does, signs the redeeming computer
+    in. Codes are shown once in the answer (with the whole join link when `public_url` is set) and never logged.
+  - **Quota.** An admin may set `quota_bytes` for one account (from one chunk, 4 MiB, to `i64::MAX`; `null` removes
+    it). The limit of a space is its quota, else `stored_bytes_per_user`, else none, and it holds in the look before a
+    chunk or manifest is stored (`check_room`, also when there is no server-wide cap) and in the count that follows.
+    A quota under what the account stores deletes nothing and refuses new bytes with `507 quota_exceeded`.
+  - **Live connections.** The process that revokes a device ends its live connections at once; another server process on
+    the same Postgres database, and the command line, are noticed at the connection's next ping (about 30 s).
+  - Logs carry the kind of event and the target's ID at `info`, never a username, password, code or link.
 - **Join codes**: a machine can also get its device token with a code instead of a password. Codes are Crockford
   base32 (`0-9` and letters without I, L, O, U; on input case is ignored, O reads as 0, I and L as 1, dashes and spaces
   are dropped), shown in groups of four (`K7M4-Q9TX`), and stored only as their BLAKE3 hash (migration 0004:
@@ -630,8 +703,9 @@ changes locally, then pushes local changes. These rules came out of the simulati
   admins who back up the bucket themselves (bucket versioning or replication); GC must stay paused until
   that bucket backup is done, or the admin keeps the bucket's own deleted-object retention longer than the
   GC grace. **Restore** sets a new epoch for every space.
-- **Admin CLI**: `init`, `serve`, `user add|reset-password|invite [--revoke]`, `device list|revoke` and `reset-epoch`
-  exist; `user remove|quota`, `gc`, `verify` (re-hash every chunk), `backup <dir>` and `restore <dir>` come with M4.
+- **Admin CLI** (the way in without HTTP: it asks for no confirmation and does not enforce `last_admin`, since whoever runs it
+  has the files): `init`, `serve`, `user add|reset-password [--keep-devices]|invite [--revoke]`, `device list|revoke|revoke-all` and
+  `reset-epoch` exist; `user remove|quota`, `gc`, `verify` (re-hash every chunk), `backup <dir>` and `restore <dir>` come with M4.
   `user invite` prints the join string and link when `public_url` is in the config, else the code and how to finish
   it; it logs that an invite was made (the username at debug only, never the code).
 - No web UI in v1. No telemetry, no update check.
@@ -641,14 +715,15 @@ the `craft-epoch` header, and commits/tree/changes carry it in the body too). Er
 `{error, message, conflicts?, missing?, quota?}` with stable codes (`conflict` 409, `missing_chunks` 409,
 `resync_required` 410, `unauthorized` 401, `rate_limited` 429, `invalid` 400, `not_found` 404, `too_large` 413,
 `timeout` 408, `quota_exceeded` 507,
-`username_taken` 409, `invalid_code` 404, `password_required` 400, `weak_password` 400, `internal` 500; the codes are constants in `craft-cloud-proto::api::codes`). Unknown routes and
+`username_taken` 409, `invalid_code` 404, `password_required` 400, `weak_password` 400, `wrong_password` 403, `forbidden` 403 (an
+admin route called by a member), `account_disabled` 403 (sign-in and join only), `last_admin` 409, `internal` 500; the codes are constants in `craft-cloud-proto::api::codes`). Unknown routes and
 methods answer `not_found` / `invalid` (405) the same way:
 
 | Call | Purpose |
 |---|---|
 | `GET /info` (also unversioned at `/api/info`) | protocol versions, chunker parameter sets, limits (no auth); a client probes `/api/info` first |
 | `GET /space` | the signed-in user's space: space ID, root node ID, epoch, current seq, username |
-| `POST /auth/login` | username + password + device name → device ID + token (shown once); 10 tries per account and 30 per address per 5 minutes; a wrong password and an unknown user look the same |
+| `POST /auth/login` | username + password + device name (+ optional `client_kind` `agent`\|`desktop`\|`cli`, `platform` and `app_version`, each at most 32 bytes, shown in the device list and never a basis for a permission; an unknown kind or a control character is `invalid`, checked before the try is counted) → device ID + token (shown once); 10 tries per account and 30 per address per 5 minutes; a wrong password and an unknown user look the same |
 | `GET /tree?after_seq=…&after_node=…&limit=…` | full listing for a first sync or a reconcile, in pages of up to 5,000 (cursor = changed seq + node ID) |
 | `GET /changes?since=N&after_seq=…&after_node=…&limit=…&wait=30` | changes after N, in pages, long-poll up to 60 s; `resync_required` if N is too old or ahead of the server |
 | `POST /chunks/missing` | which of these chunk IDs (up to 10,000) this space lacks |
@@ -656,10 +731,24 @@ methods answer `not_found` / `invalid` (405) the same way:
 | `PUT /manifests/{id}` / `GET /manifests/{id}` | one manifest (binary); the server checks the ID, the limits and that every chunk is present |
 | `POST /commit` | batch of version/mkdir/move/delete operations, one transaction; `409 conflict` listing every conflicting operation (a version whose manifest isn't uploaded is a `missing_manifest` conflict) |
 | `GET /nodes/{id}/history` / `POST /nodes/{id}/restore` | list versions / make an old one current (M4) |
-| `GET /devices`, `DELETE /devices/{id}` | your devices |
+| `GET /account` | the signed-in account, flat: `{user_id, username, role, created_ms, password_changed_ms, two_factor_enabled}` (`password_changed_ms` is `null` until the password changes through the server, `two_factor_enabled` is always `false` for now) |
+| `POST /account/password` | `{current_password, new_password}` → 204. Signs every *other* device out and deletes the account's open invite and pairings, in one transaction; the device that asked stays signed in. A wrong current password is `403 wrong_password` (never 401: see below), a new one that breaks the rules or equals the current one `400 weak_password`; 5 tries per account per 15 minutes (`429 rate_limited`); body at most 4 KiB, passwords at most 1,024 bytes |
+| `GET /devices` | your devices: `{id, name, created_ms, last_used_ms, revoked, current, client_kind, platform, app_version, revoked_ms, revoke_reason}`; the last five are new and a client may ignore them (`revoke_reason` is `user`, `others`, `password`, `admin`, `disabled`, `two_factor`, `idle` or `reset`) |
+| `PATCH /devices/{id}` | `{name}` (at most 4 KiB, the device-name rule) → 200 with the device. Only your own devices that are not revoked, otherwise `404 not_found` |
+| `POST /devices/revoke-others` | signs out every other device of the account (and deletes their pairings) → `{revoked: n}`, 0 when there is none |
+| `DELETE /devices/{id}` | signs one of your devices out → 204; its time and reason (`user`) are kept, and a second call changes neither |
 | `POST /pairings` | a new add-a-computer code from this device → `{id, code, expires_ms}` (the code shown once, normalised) |
 | `GET /pairings/{id}`, `DELETE /pairings/{id}` | one of your pairings: `{state: waiting\|used\|expired, device_name?}` / cancel it (204) |
-| `POST /join` | code + device name (+ password for an invite to a new account) → device ID + token, as a sign-in (no auth); `invalid_code`, `password_required`, `weak_password`, `rate_limited` |
+| `POST /join` | code + device name (+ password for an invite to a new account **and always for a password reset code**, + the optional client fields of a sign-in) → device ID + token, as a sign-in (no auth); `invalid_code`, `password_required`, `weak_password`, `account_disabled`, `rate_limited`. A reset code signs every other device of the account out |
+| `GET /admin/server` | (admin) `{version, users, devices_active, stored_bytes, live_bytes, storage_kind (disk\|s3\|memory), database_kind (sqlite\|postgres)}`: counters and kinds only, no path, address or setting |
+| `GET /admin/users?cursor&limit&query` | (admin) `{users: [{id, username, role, created_ms, disabled_ms, two_factor_enabled, devices_active, stored_bytes, quota_bytes, invite_pending}], next?}` by username; `limit` 1 to 200 (default 50, otherwise `invalid`); `cursor` is opaque (the last username, base64url) and `next` is missing on the last page; `query` finds usernames containing it (case-insensitive, at most 64 bytes of printable characters, `%` and `_` are ordinary characters). Accounts marked for removal are left out; `two_factor_enabled` is always `false` for now |
+| `POST /admin/users` | (admin, confirmation) `{username, role, password}` → `{user, invite: {code, join_url?, expires_ms}}`: an account with no password and a 7-day invite; `username_taken` 409 (also for an account marked for removal), `invalid` for a bad name or role |
+| `PATCH /admin/users/{id}` | (admin, confirmation) `{role?, quota_bytes?, password}` → the user. Neither field is `invalid`; a missing `quota_bytes` leaves it, `null` removes it; `last_admin` 409 |
+| `POST /admin/users/{id}/disable`, `/enable` | (admin, confirmation) → 204. Disable signs every device out and deletes the codes and pairings; not oneself (`invalid`), `last_admin`; enabling an account marked for removal is `conflict` |
+| `DELETE /admin/users/{id}` | (admin, confirmation) → 202. Marks the account for removal as above; nothing is deleted |
+| `POST /admin/users/{id}/invite`, `DELETE …/invite` | (admin, confirmation) → `{code, join_url?, expires_ms}` / 204: an invite only for an account that has no password (`conflict` otherwise); the delete ends the account's invite or reset code (`not_found` when there is none) |
+| `POST /admin/users/{id}/password-reset` | (admin, confirmation) → `{code, join_url?, expires_ms}`: a one-hour reset code for a member (another admin's, or one's own: `forbidden` and `invalid`); redeemed at `POST /join` |
+| `GET /admin/users/{id}/devices`, `DELETE …/devices/{device_id}` | (admin; the delete with confirmation) → `{devices: [device as in GET /devices]}`, revoked ones too / 204 (`revoke_reason = admin`); another user's device or an unknown user is `not_found` |
 
 **Client contract** (what the sync agent relies on):
 
@@ -672,7 +761,12 @@ methods answer `not_found` / `invalid` (405) the same way:
   `version_exists` conflicts for exactly the retried operations mean the first attempt applied.
 - A long-poll refused because 16 are already waiting on the space answers `429 rate_limited` with `Retry-After`;
   wait that long before polling again.
-- Unknown JSON fields are ignored in both directions, so later protocol versions can add fields.
+- Unknown JSON fields are ignored in both directions, so later protocol versions can add fields. The device list's client
+  fields and revoke time and reason were added that way: a body without them reads as empty.
+- **A signed-in route never answers 401 for anything but the token.** The agent reads every 401 on a signed-in route as
+  "this device was revoked" and signs out. A wrong password on a route that asks for one (`POST /account/password`) is
+  therefore `403 wrong_password`; 401 is for a missing, unknown or revoked token (a disabled account's tokens are revoked), and for
+  the sign-in and join routes. The admin routes follow the same rule: a wrong confirmation password is 403, a member is 403.
 - After an admin restores a backup they run `craft-cloud-server reset-epoch --all`; agents then reconcile.
 
 ## Agent and launcher API

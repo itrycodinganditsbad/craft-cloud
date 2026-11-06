@@ -3,7 +3,10 @@
 //! test creates and drops its own database. CI sets `CRAFT_CLOUD_REQUIRE_BACKENDS`, which turns a missing
 //! `CRAFT_CLOUD_TEST_PG` into a failure instead of a skip.
 
-use craft_cloud_meta::{BlobKind, InviteFor, Meta, MetaError, Redeemed, Role, UserRecord};
+use craft_cloud_meta::{
+    AdminActor, AdminUser, BlobKind, DeviceClient, DeviceRecord, InviteFor, MIN_QUOTA_BYTES, Meta, MetaError, RESET_TTL_MS, Redeemed, RevokeReason,
+    Role, UserId, UserRecord,
+};
 use craft_cloud_proto::api::PairingState;
 use craft_cloud_proto::join::{Code, INVITE_CHARS, INVITE_TTL_MS, PAIRING_CHARS, PAIRING_TTL_MS};
 use craft_cloud_proto::limits::MAX_PAGE_NODES;
@@ -139,6 +142,32 @@ on_every_backend!(
     concurrent_redeems_of_one_code_give_one_device,
     an_invite_to_an_account_with_a_password_needs_none,
     an_invite_to_a_new_account_needs_a_password,
+    a_device_records_its_client,
+    only_own_live_devices_are_renamed,
+    every_revoke_path_sets_flag_time_and_reason_together,
+    revoking_others_keeps_the_caller_and_ends_their_pairings,
+    a_password_change_is_one_step,
+    an_admin_reset_signs_out_every_device_unless_kept,
+    concurrent_password_changes_and_sign_outs_never_fail_the_database,
+    a_sign_in_checked_against_an_old_password_creates_no_device,
+    redeems_sign_ins_and_resets_at_the_same_moment_leave_no_live_device,
+    the_admin_list_pages_searches_and_counts,
+    a_sign_in_checked_before_a_disable_and_an_enable_creates_no_device,
+    an_admin_makes_an_account_with_a_role_and_an_invite,
+    an_admin_changes_a_role_and_a_quota,
+    the_acting_admins_state_is_checked_in_the_transaction,
+    disabling_signs_everything_out_and_enabling_brings_back_nothing,
+    issuing_access_while_an_account_is_disabled_leaves_no_usable_token,
+    invites_and_reset_codes_replace_each_other,
+    a_reset_code_sets_a_password_and_signs_everything_out,
+    a_quota_overrides_the_server_wide_cap,
+    an_admin_lists_and_revokes_a_users_devices,
+    two_demotions_at_once_keep_an_admin,
+    two_self_demotions_at_once_keep_an_admin,
+    two_disables_at_once_keep_an_admin,
+    a_demotion_and_a_disable_at_once_keep_an_admin,
+    a_removal_and_a_demotion_at_once_keep_an_admin,
+    a_self_demotion_and_a_disable_of_the_other_at_once_keep_an_admin,
 );
 
 // ---- helpers ----
@@ -291,7 +320,7 @@ async fn users_and_devices(meta: &Meta) {
     assert_eq!(meta.user_by_name("ana").await.unwrap(), Some(ana.clone()));
     assert_eq!(meta.user_by_name("bob").await.unwrap(), None);
 
-    meta.set_password_hash(ana.id, "$argon2id$new").await.unwrap();
+    meta.reset_password(ana.id, "$argon2id$new", true, NOW + 1).await.unwrap();
     assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$new");
 
     let token = [7u8; 32];
@@ -1783,6 +1812,17 @@ async fn upgrading_counts_what_each_space_already_stores() {
         sqlx::query("DROP TABLE invites").execute(&mut conn).await.unwrap();
         // And before save records.
         sqlx::query("ALTER TABLE versions DROP COLUMN save").execute(&mut conn).await.unwrap();
+        // And before the admin API (its `invites` column went with the table).
+        sqlx::query("ALTER TABLE spaces DROP COLUMN quota_bytes").execute(&mut conn).await.unwrap();
+        sqlx::query("ALTER TABLE users DROP COLUMN removed_ms").execute(&mut conn).await.unwrap();
+        sqlx::query("ALTER TABLE users DROP COLUMN auth_gen").execute(&mut conn).await.unwrap();
+        // And before device sessions.
+        for column in ["client_kind", "platform", "app_version", "revoked_ms", "revoke_reason"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE devices DROP COLUMN {column}"))).execute(&mut conn).await.unwrap();
+        }
+        for column in ["password_changed_ms", "disabled_ms"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE users DROP COLUMN {column}"))).execute(&mut conn).await.unwrap();
+        }
         sqlx::query("DELETE FROM schema_version WHERE version >= 2").execute(&mut conn).await.unwrap();
     }
     let meta = Meta::open(&url).await.unwrap();
@@ -1807,5 +1847,1157 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 6);
+    assert_eq!(versions, 8);
+}
+
+// ---- device sessions (migration 0007) ----
+
+/// A device's record, read back from the list.
+async fn record(meta: &Meta, user: &UserRecord, id: DeviceId) -> DeviceRecord {
+    meta.list_devices(user.id).await.unwrap().into_iter().find(|d| d.id == id).unwrap()
+}
+
+/// The three columns of a revoke always agree: all set or none.
+fn assert_revoke_columns_agree(devices: &[DeviceRecord]) {
+    for d in devices {
+        assert_eq!((d.revoked, d.revoked_ms.is_some(), d.revoke_reason.is_some()), (d.revoked, d.revoked, d.revoked), "{d:?}");
+    }
+}
+
+fn sorted(mut ids: Vec<DeviceId>) -> Vec<DeviceId> {
+    ids.sort_by_key(|id| *id.as_uuid());
+    ids
+}
+
+async fn a_device_records_its_client(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let plain = device(meta, &ana).await;
+    let client = DeviceClient::new(Some("agent"), Some("windows x86_64"), Some("0.19.0")).unwrap();
+    let agent = meta.create_device_with(ana.id, "studio", &client, &token(), NOW + 1).await.unwrap();
+    assert_eq!(record(meta, &ana, agent).await.client, client);
+    let old = record(meta, &ana, plain).await;
+    assert_eq!((old.client, old.revoked_ms, old.revoke_reason), (DeviceClient::default(), None, None), "no word on the client: empty");
+
+    // What a sign-in may say: a known kind or none, short free text without control characters.
+    assert_eq!(DeviceClient::new(None, None, None).unwrap(), DeviceClient::default());
+    assert!(DeviceClient::new(Some(""), Some(&"x".repeat(32)), Some(&"y".repeat(32))).is_ok());
+    let long = "x".repeat(33);
+    for (kind, platform, version) in [
+        (Some("browser"), None, None),
+        (Some("AGENT"), None, None),
+        (None, Some(long.as_str()), None),
+        (None, None, Some(long.as_str())),
+        (None, Some("a\nb"), None),
+        (None, None, Some("1.0\u{7}")),
+    ] {
+        assert!(matches!(DeviceClient::new(kind, platform, version), Err(MetaError::Invalid(_))), "{kind:?} {platform:?} {version:?}");
+    }
+    // The store checks too, for a caller that built the value by hand: nothing is created.
+    let bad = DeviceClient { kind: "browser".into(), ..DeviceClient::default() };
+    assert!(matches!(meta.create_device_with(ana.id, "x", &bad, &token(), NOW).await, Err(MetaError::Invalid(_))));
+    assert_eq!(meta.list_devices(ana.id).await.unwrap().len(), 2);
+
+    // A join says it too.
+    let (_, _, pairing, _) = paired(meta, "bob").await;
+    let desktop = DeviceClient::new(Some("desktop"), Some("macos"), Some("1.2")).unwrap();
+    let joined = meta.redeem_with(&pairing.hash(), "mac", &desktop, &token(), None, NOW + 1).await.unwrap();
+    let bob = meta.user_by_name("bob").await.unwrap().unwrap();
+    assert_eq!(record(meta, &bob, joined.device).await.client, desktop);
+}
+
+async fn only_own_live_devices_are_renamed(meta: &Meta) {
+    let (ana, bob) = (user(meta, "ana").await, user(meta, "bob").await);
+    let (mine, theirs) = (device(meta, &ana).await, device(meta, &bob).await);
+    let renamed = meta.rename_device(ana.id, mine, "studio pc").await.unwrap();
+    assert_eq!((renamed.id, renamed.name.as_str()), (mine, "studio pc"));
+    assert_eq!(record(meta, &ana, mine).await.name, "studio pc");
+    // Another account's device, and one that isn't there, are one answer.
+    assert!(matches!(meta.rename_device(ana.id, theirs, "mine now").await, Err(MetaError::NotFound(_))));
+    assert!(matches!(meta.rename_device(ana.id, DeviceId::generate(), "x").await, Err(MetaError::NotFound(_))));
+    assert_eq!(record(meta, &bob, theirs).await.name, "laptop");
+    // The name rule holds.
+    for bad in ["", "tab\there", &"n".repeat(129)] {
+        assert!(matches!(meta.rename_device(ana.id, mine, bad).await, Err(MetaError::Invalid(_))), "{bad:?}");
+    }
+    assert_eq!(record(meta, &ana, mine).await.name, "studio pc");
+    // A revoked device keeps its name.
+    meta.revoke_device_as(ana.id, mine, RevokeReason::User, NOW + 1).await.unwrap();
+    assert!(matches!(meta.rename_device(ana.id, mine, "again").await, Err(MetaError::NotFound(_))));
+    assert_eq!(record(meta, &ana, mine).await.name, "studio pc");
+}
+
+async fn every_revoke_path_sets_flag_time_and_reason_together(meta: &Meta) {
+    // One device revoked by its user, and revoked again later: the first time and reason stay.
+    let ana = user(meta, "ana").await;
+    let (a1, a2, a3, a4) = (device(meta, &ana).await, device(meta, &ana).await, device(meta, &ana).await, device(meta, &ana).await);
+    meta.revoke_device_as(ana.id, a1, RevokeReason::User, NOW + 10).await.unwrap();
+    let first = record(meta, &ana, a1).await;
+    assert_eq!((first.revoked, first.revoked_ms, first.revoke_reason), (true, Some(NOW + 10), Some(RevokeReason::User)));
+    meta.revoke_device_as(ana.id, a1, RevokeReason::Admin, NOW + 20).await.unwrap();
+    assert_eq!(record(meta, &ana, a1).await, first, "a second revoke changes nothing");
+    assert!(matches!(meta.revoke_device_as(user(meta, "bob").await.id, a1, RevokeReason::User, NOW).await, Err(MetaError::NotFound(_))));
+    // The others, but one: the device revoked before keeps its own reason, the kept one stays.
+    let revoked = meta.revoke_other_devices(ana.id, a2, RevokeReason::Others, NOW + 30).await.unwrap();
+    assert_eq!(sorted(revoked), sorted(vec![a3, a4]), "only the live others");
+    for id in [a3, a4] {
+        let d = record(meta, &ana, id).await;
+        assert_eq!((d.revoked, d.revoked_ms, d.revoke_reason), (true, Some(NOW + 30), Some(RevokeReason::Others)));
+    }
+    assert_eq!(record(meta, &ana, a1).await, first);
+    let kept = record(meta, &ana, a2).await;
+    assert_eq!((kept.revoked, kept.revoked_ms, kept.revoke_reason), (false, None, None));
+    assert!(meta.revoke_other_devices(ana.id, a2, RevokeReason::Others, NOW + 40).await.unwrap().is_empty(), "nobody left to sign out");
+    // Every device (the admin's command).
+    let bob = meta.user_by_name("bob").await.unwrap().unwrap();
+    let (b1, b2) = (device(meta, &bob).await, device(meta, &bob).await);
+    let revoked = meta.revoke_all_devices(bob.id, RevokeReason::Admin, NOW + 50).await.unwrap();
+    assert_eq!(sorted(revoked), sorted(vec![b1, b2]));
+    assert!(meta.revoke_all_devices(bob.id, RevokeReason::Admin, NOW + 60).await.unwrap().is_empty());
+    for id in [b1, b2] {
+        let d = record(meta, &bob, id).await;
+        assert_eq!((d.revoked, d.revoked_ms, d.revoke_reason), (true, Some(NOW + 50), Some(RevokeReason::Admin)));
+    }
+    // A password change and a reset.
+    let cy = user(meta, "cy").await;
+    let (c1, c2) = (device(meta, &cy).await, device(meta, &cy).await);
+    meta.change_password(cy.id, "$argon2id$stub", "$argon2id$new", c1, NOW + 70).await.unwrap();
+    let d = record(meta, &cy, c2).await;
+    assert_eq!((d.revoked, d.revoked_ms, d.revoke_reason), (true, Some(NOW + 70), Some(RevokeReason::Password)));
+    let dee = user(meta, "dee").await;
+    let d1 = device(meta, &dee).await;
+    meta.reset_password(dee.id, "$argon2id$new", false, NOW + 80).await.unwrap();
+    let d = record(meta, &dee, d1).await;
+    assert_eq!((d.revoked, d.revoked_ms, d.revoke_reason), (true, Some(NOW + 80), Some(RevokeReason::Reset)));
+    // The plain call (no clock of its own) is the user's act, with a time.
+    let eve = user(meta, "eve").await;
+    let e1 = device(meta, &eve).await;
+    meta.revoke_device(eve.id, e1).await.unwrap();
+    let d = record(meta, &eve, e1).await;
+    assert_eq!((d.revoked, d.revoke_reason), (true, Some(RevokeReason::User)));
+    assert!(d.revoked_ms.is_some_and(|ms| ms > NOW));
+    for u in [&ana, &bob, &cy, &dee, &eve] {
+        assert_revoke_columns_agree(&meta.list_devices(u.id).await.unwrap());
+    }
+}
+
+async fn revoking_others_keeps_the_caller_and_ends_their_pairings(meta: &Meta) {
+    let (ana, keep, keep_pairing, keep_id) = paired(meta, "ana").await;
+    let other = device(meta, &ana).await;
+    let other_id = meta.create_pairing(ana.id, other, &code(PAIRING_CHARS).hash(), NOW).await.unwrap();
+    let (bob, bobs, _, bobs_pairing) = paired(meta, "bob").await;
+    let revoked = meta.revoke_other_devices(ana.id, keep, RevokeReason::Others, NOW + 1).await.unwrap();
+    assert_eq!(revoked, vec![other]);
+    assert!(meta.device_active(keep).await.unwrap() && !meta.device_active(other).await.unwrap());
+    assert_eq!(meta.pairing_status(ana.id, keep_id, NOW + 2).await.unwrap(), Some((PairingState::Waiting, None)), "the caller's own stays");
+    assert_eq!(meta.pairing_status(ana.id, other_id, NOW + 2).await.unwrap(), None, "a revoked device's pairing dies");
+    redeem(meta, &keep_pairing, "pc", NOW + 3).await.unwrap();
+    // Another account is never touched.
+    assert!(meta.device_active(bobs).await.unwrap());
+    assert!(meta.pairing_status(bob.id, bobs_pairing, NOW + 2).await.unwrap().is_some());
+}
+
+async fn a_password_change_is_one_step(meta: &Meta) {
+    let (ana, keep, _, pairing_id) = paired(meta, "ana").await;
+    let other = device(meta, &ana).await;
+    let other_pairing = meta.create_pairing(ana.id, other, &code(PAIRING_CHARS).hash(), NOW).await.unwrap();
+    let invite = code(INVITE_CHARS);
+    meta.create_invite("ana", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    let (bob, bobs, _, bobs_pairing) = paired(meta, "bob").await;
+    let bobs_invite = code(INVITE_CHARS);
+    meta.create_invite("bob", &bobs_invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+
+    let account = meta.account(ana.id).await.unwrap();
+    assert_eq!((account.username.as_str(), account.role, account.created_ms, account.password_changed_ms), ("ana", Role::Member, NOW, None));
+    assert!(matches!(meta.account(UserId(uuid::Uuid::now_v7())).await, Err(MetaError::NotFound(_))));
+
+    // A password that is not the one the caller verified (it changed meanwhile): nothing at all changes.
+    let stale = meta.change_password(ana.id, "$argon2id$stale", "$argon2id$new", keep, NOW + 5).await;
+    assert!(matches!(stale, Err(MetaError::Conflict(_))), "{stale:?}");
+    assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$stub");
+    assert_eq!(meta.account(ana.id).await.unwrap().password_changed_ms, None);
+    assert!(meta.device_active(keep).await.unwrap() && meta.device_active(other).await.unwrap());
+    assert!(meta.pairing_status(ana.id, pairing_id, NOW + 6).await.unwrap().is_some());
+    assert!(meta.pairing_status(ana.id, other_pairing, NOW + 6).await.unwrap().is_some());
+    assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 6).await.unwrap(), Some(false));
+
+    // The change: new hash and time, the other device signed out, invite and pairings gone, the caller stays.
+    let revoked = meta.change_password(ana.id, "$argon2id$stub", "$argon2id$new", keep, NOW + 7).await.unwrap();
+    assert_eq!(revoked, vec![other]);
+    assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$new");
+    assert_eq!(meta.account(ana.id).await.unwrap().password_changed_ms, Some(NOW + 7));
+    assert!(meta.device_active(keep).await.unwrap() && !meta.device_active(other).await.unwrap());
+    let d = record(meta, &ana, other).await;
+    assert_eq!((d.revoked_ms, d.revoke_reason), (Some(NOW + 7), Some(RevokeReason::Password)));
+    assert_eq!(meta.pairing_status(ana.id, pairing_id, NOW + 8).await.unwrap(), None);
+    assert_eq!(meta.pairing_status(ana.id, other_pairing, NOW + 8).await.unwrap(), None);
+    assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 8).await.unwrap(), None);
+    assert!(matches!(redeem(meta, &invite, "pc", NOW + 8).await, Err(MetaError::InvalidCode)));
+    // The old hash no longer matches, so the same change again (a replayed request) does nothing.
+    assert!(matches!(meta.change_password(ana.id, "$argon2id$stub", "$argon2id$third", keep, NOW + 9).await, Err(MetaError::Conflict(_))));
+    // A caller that was signed out meanwhile changes nothing either.
+    assert!(
+        matches!(meta.change_password(ana.id, "$argon2id$new", "$argon2id$third", other, NOW + 9).await, Err(MetaError::DeviceRevoked)),
+        "revoked"
+    );
+    assert!(
+        matches!(
+            meta.change_password(ana.id, "$argon2id$new", "$argon2id$third", DeviceId::generate(), NOW + 9).await,
+            Err(MetaError::DeviceRevoked)
+        ),
+        "unknown"
+    );
+    let bobs_device = device(meta, &user(meta, "cy").await).await;
+    assert!(
+        matches!(meta.change_password(ana.id, "$argon2id$new", "$argon2id$third", bobs_device, NOW + 9).await, Err(MetaError::DeviceRevoked)),
+        "another account's"
+    );
+    assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$new");
+    // Another account is never touched.
+    assert_eq!(meta.user_by_name("bob").await.unwrap().unwrap().password_hash, "$argon2id$stub");
+    assert!(meta.device_active(bobs).await.unwrap());
+    assert!(meta.pairing_status(bob.id, bobs_pairing, NOW + 8).await.unwrap().is_some());
+    assert_eq!(meta.invite_needs_password(&bobs_invite.hash(), NOW + 8).await.unwrap(), Some(false));
+}
+
+async fn an_admin_reset_signs_out_every_device_unless_kept(meta: &Meta) {
+    let (ana, maker, _, pairing_id) = paired(meta, "ana").await;
+    let other = device(meta, &ana).await;
+    let invite = code(INVITE_CHARS);
+    meta.create_invite("ana", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    let revoked = meta.reset_password(ana.id, "$argon2id$reset", false, NOW + 1).await.unwrap();
+    assert_eq!(sorted(revoked), sorted(vec![maker, other]));
+    assert!(!meta.device_active(maker).await.unwrap() && !meta.device_active(other).await.unwrap());
+    assert_eq!(record(meta, &ana, other).await.revoke_reason, Some(RevokeReason::Reset));
+    assert_eq!(meta.pairing_status(ana.id, pairing_id, NOW + 2).await.unwrap(), None);
+    assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 2).await.unwrap(), None);
+    assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$reset");
+    assert_eq!(meta.account(ana.id).await.unwrap().password_changed_ms, Some(NOW + 1));
+
+    // `--keep-devices`: the devices stay, the password changes, and codes made before it are still deleted.
+    let (bob, bobs, _, bobs_pairing) = paired(meta, "bob").await;
+    assert!(meta.reset_password(bob.id, "$argon2id$reset", true, NOW + 3).await.unwrap().is_empty());
+    assert!(meta.device_active(bobs).await.unwrap());
+    assert_eq!(record(meta, &bob, bobs).await.revoke_reason, None);
+    assert_eq!(meta.pairing_status(bob.id, bobs_pairing, NOW + 4).await.unwrap(), None);
+    assert_eq!(meta.user_by_name("bob").await.unwrap().unwrap().password_hash, "$argon2id$reset");
+
+    // A user that isn't there changes nothing.
+    assert!(matches!(meta.reset_password(UserId(uuid::Uuid::now_v7()), "$argon2id$x", false, NOW).await, Err(MetaError::NotFound(_))));
+}
+
+/// A password change from one device, a sign-out of the others from another and an admin reset, at the same moment
+/// and over and over: each ends as a success or as a conflict or a signed-out caller, never as a database error (on
+/// Postgres, two transactions taking the same rows in different orders would deadlock and one would fail).
+async fn concurrent_password_changes_and_sign_outs_never_fail_the_database(meta: &Meta) {
+    for round in 0..15 {
+        let ana = user(meta, &format!("ana{round}")).await;
+        let (a, b) = (device(meta, &ana).await, device(meta, &ana).await);
+        let mut tasks = Vec::new();
+        for job in 0..6 {
+            let meta = meta.clone();
+            tasks.push(tokio::spawn(async move {
+                match job {
+                    0 => meta.change_password(ana.id, "$argon2id$stub", "$argon2id$one", a, NOW + 1).await.map(|_| ()),
+                    1 => meta.change_password(ana.id, "$argon2id$stub", "$argon2id$two", b, NOW + 1).await.map(|_| ()),
+                    2 => meta.revoke_other_devices(ana.id, b, RevokeReason::Others, NOW + 1).await.map(|_| ()),
+                    3 => meta.revoke_device_as(ana.id, a, RevokeReason::User, NOW + 1).await,
+                    4 => meta.reset_password(ana.id, "$argon2id$reset", false, NOW + 1).await.map(|_| ()),
+                    _ => meta.revoke_all_devices(ana.id, RevokeReason::Admin, NOW + 1).await.map(|_| ()),
+                }
+            }));
+        }
+        for task in tasks {
+            let result = task.await.unwrap();
+            assert!(matches!(result, Ok(()) | Err(MetaError::Conflict(_) | MetaError::DeviceRevoked)), "round {round}: {result:?}");
+        }
+        assert_revoke_columns_agree(&meta.list_devices(ana.id).await.unwrap());
+    }
+}
+
+/// A device is created after a password sign-in only if the password that was checked is still the account's.
+async fn a_sign_in_checked_against_an_old_password_creates_no_device(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let client = DeviceClient::default();
+    let first = meta.sign_in_device(ana.id, ("$argon2id$stub", 0), "pc", &client, &token(), NOW).await.unwrap();
+    assert!(first.is_some_and(|d| d != DeviceId::generate()));
+    assert!(meta.sign_in_device(ana.id, ("$argon2id$other", 0), "pc", &client, &token(), NOW).await.unwrap().is_none(), "not the stored hash");
+    assert!(
+        meta.sign_in_device(UserId(uuid::Uuid::now_v7()), ("$argon2id$stub", 0), "pc", &client, &token(), NOW).await.unwrap().is_none(),
+        "no such user"
+    );
+    assert!(matches!(meta.sign_in_device(ana.id, ("$argon2id$stub", 0), "", &client, &token(), NOW).await, Err(MetaError::Invalid(_))));
+    // The password was checked, then reset: the account's devices are signed out and the late sign-in adds none.
+    meta.reset_password(ana.id, "$argon2id$reset", false, NOW + 1).await.unwrap();
+    assert!(meta.sign_in_device(ana.id, ("$argon2id$stub", 0), "late", &client, &token(), NOW + 2).await.unwrap().is_none());
+    let devices = meta.list_devices(ana.id).await.unwrap();
+    assert_eq!(devices.len(), 1);
+    assert!(devices.iter().all(|d| d.revoked));
+    // With the new hash it works.
+    assert!(meta.sign_in_device(ana.id, ("$argon2id$reset", gen_of(meta, "ana").await), "new", &client, &token(), NOW + 3).await.unwrap().is_some());
+}
+
+/// Redeeming an invite or a pairing, a password sign-in and a reset at the same moment, over and over: no database
+/// error (on Postgres, the invite and the user taken in different orders would deadlock), and once the reset is
+/// done no device of the account is signed in, whichever of them came first.
+async fn redeems_sign_ins_and_resets_at_the_same_moment_leave_no_live_device(meta: &Meta) {
+    for round in 0..15 {
+        let (ana, maker, pairing, _) = paired(meta, &format!("ana{round}")).await;
+        let invite = code(INVITE_CHARS);
+        meta.create_invite(&format!("ana{round}"), &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+        let mut tasks = Vec::new();
+        for job in 0..5 {
+            let (meta, invite, pairing) = (meta.clone(), invite.hash(), pairing.hash());
+            tasks.push(tokio::spawn(async move {
+                match job {
+                    0 => meta.redeem(&invite, "invited", &token(), None, NOW + 1).await.map(|_| ()),
+                    1 => meta.redeem(&pairing, "paired", &token(), None, NOW + 1).await.map(|_| ()),
+                    2 => {
+                        meta.sign_in_device(ana.id, ("$argon2id$stub", 0), "signed in", &DeviceClient::default(), &token(), NOW + 1).await.map(|_| ())
+                    }
+                    3 => meta.create_pairing(ana.id, maker, &code(PAIRING_CHARS).hash(), NOW + 1).await.map(|_| ()),
+                    _ => meta.reset_password(ana.id, "$argon2id$reset", false, NOW + 2).await.map(|_| ()),
+                }
+            }));
+        }
+        for task in tasks {
+            let result = task.await.unwrap();
+            assert!(matches!(result, Ok(()) | Err(MetaError::InvalidCode | MetaError::NotFound(_))), "round {round}: {result:?}");
+        }
+        let devices = meta.list_devices(ana.id).await.unwrap();
+        assert!(devices.iter().all(|d| d.revoked), "round {round}: {devices:?}");
+        assert_revoke_columns_agree(&devices);
+    }
+}
+
+// ---- the migration from 0006 to 0007 ----
+
+/// Drops what migration 0007 added and forgets it ran, which leaves the database as 0006 left it (with its rows).
+async fn back_to_0006(url: &str) {
+    use sqlx::Connection;
+    let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    // What migration 0008 added goes first: it runs again with 0007 on the next open.
+    sqlx::query("ALTER TABLE invites DROP COLUMN purpose").execute(&mut conn).await.unwrap();
+    sqlx::query("ALTER TABLE spaces DROP COLUMN quota_bytes").execute(&mut conn).await.unwrap();
+    sqlx::query("ALTER TABLE users DROP COLUMN removed_ms").execute(&mut conn).await.unwrap();
+    sqlx::query("ALTER TABLE users DROP COLUMN auth_gen").execute(&mut conn).await.unwrap();
+    for column in ["client_kind", "platform", "app_version", "revoked_ms", "revoke_reason"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE devices DROP COLUMN {column}"))).execute(&mut conn).await.unwrap();
+    }
+    for column in ["password_changed_ms", "disabled_ms"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE users DROP COLUMN {column}"))).execute(&mut conn).await.unwrap();
+    }
+    sqlx::query("DELETE FROM schema_version WHERE version >= 7").execute(&mut conn).await.unwrap();
+}
+
+async fn schema_version(url: &str) -> i64 {
+    use sqlx::Connection;
+    let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap()
+}
+
+/// Existing users and devices (live and revoked) survive the migration, read with empty client fields and no revoke
+/// time or reason, still work (a live one is found by its token, a revoked one is not), and take the new columns;
+/// a database newer than the program is refused.
+async fn migrating_from_0006_keeps_the_rows(url: &str) {
+    sqlx::any::install_default_drivers();
+    let (ana, live, revoked, old_token) = {
+        let meta = Meta::open(url).await.unwrap();
+        let ana = user(&meta, "ana").await;
+        let old_token = token();
+        let live = meta.create_device(ana.id, "old pc", &old_token, NOW).await.unwrap();
+        let revoked = device(&meta, &ana).await;
+        meta.revoke_device(ana.id, revoked).await.unwrap();
+        (ana, live, revoked, old_token)
+    };
+    back_to_0006(url).await;
+    assert_eq!(schema_version(url).await, 6);
+
+    let meta = Meta::open(url).await.unwrap();
+    assert_eq!(schema_version(url).await, 8);
+    let old = record(&meta, &ana, live).await;
+    assert_eq!(
+        (old.name.as_str(), old.revoked, old.client, old.revoked_ms, old.revoke_reason),
+        ("old pc", false, DeviceClient::default(), None, None)
+    );
+    let gone = record(&meta, &ana, revoked).await;
+    assert_eq!((gone.revoked, gone.client, gone.revoked_ms, gone.revoke_reason), (true, DeviceClient::default(), None, None));
+    assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.device), Some(live));
+    assert_eq!(meta.account(ana.id).await.unwrap().password_changed_ms, None);
+    // The new columns take values.
+    let client = DeviceClient::new(Some("cli"), Some("linux"), Some("1")).unwrap();
+    let fresh = meta.create_device_with(ana.id, "new", &client, &token(), NOW + 1).await.unwrap();
+    assert_eq!(record(&meta, &ana, fresh).await.client, client);
+    meta.change_password(ana.id, "$argon2id$stub", "$argon2id$new", fresh, NOW + 2).await.unwrap();
+    assert_eq!(meta.account(ana.id).await.unwrap().password_changed_ms, Some(NOW + 2));
+    assert_eq!(record(&meta, &ana, live).await.revoke_reason, Some(RevokeReason::Password));
+
+    // A database from a newer Craft Cloud is still refused.
+    use sqlx::Connection;
+    let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (9)").execute(&mut conn).await.unwrap();
+    drop(conn);
+    assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
+}
+
+#[tokio::test]
+async fn migrating_from_0006_keeps_the_rows_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    migrating_from_0006_keeps_the_rows(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migrating_from_0006_keeps_the_rows_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    migrating_from_0006_keeps_the_rows(&url).await;
+}
+
+// ---- a failure in the middle of a transaction ----
+
+/// A trigger that makes every delete from `pairings` fail, which is the step after the password and the devices
+/// were already written in `change_password` and `reset_password`. Test only: the migrations carry no trigger.
+async fn break_pairing_deletes(url: &str, postgres: bool) {
+    use sqlx::Connection;
+    let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    let statements: &[&str] = if postgres {
+        &[
+            "CREATE FUNCTION cc_test_boom() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'boom'; END $$ LANGUAGE plpgsql",
+            "CREATE TRIGGER cc_test_boom BEFORE DELETE ON pairings FOR EACH STATEMENT EXECUTE FUNCTION cc_test_boom()",
+        ]
+    } else {
+        &["CREATE TRIGGER cc_test_boom BEFORE DELETE ON pairings BEGIN SELECT RAISE(ABORT, 'boom'); END"]
+    };
+    for statement in statements {
+        sqlx::query(sqlx::AssertSqlSafe((*statement).to_owned())).execute(&mut conn).await.unwrap();
+    }
+}
+
+async fn mend_pairing_deletes(url: &str) {
+    use sqlx::Connection;
+    let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    sqlx::query("DROP TRIGGER cc_test_boom ON pairings").execute(&mut conn).await.ok();
+    sqlx::query("DROP TRIGGER cc_test_boom").execute(&mut conn).await.ok();
+    sqlx::query("DROP FUNCTION cc_test_boom()").execute(&mut conn).await.ok();
+}
+
+/// A step that fails after others were written undoes them all: the hash, the time, the devices, the pairings and
+/// the invite are as they were, for a password change and for an admin reset; once the step works, the same call
+/// goes through.
+async fn a_failure_in_the_middle_changes_nothing(url: &str, postgres: bool) {
+    let meta = Meta::open(url).await.unwrap();
+    let (ana, keep, _, pairing_id) = paired(&meta, "ana").await;
+    let other = device(&meta, &ana).await;
+    let other_pairing = meta.create_pairing(ana.id, other, &code(PAIRING_CHARS).hash(), NOW).await.unwrap();
+    let invite = code(INVITE_CHARS);
+    meta.create_invite("ana", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    break_pairing_deletes(url, postgres).await;
+
+    let invite_hash = invite.hash();
+    let unchanged = || async {
+        assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$stub");
+        assert_eq!(meta.account(ana.id).await.unwrap().password_changed_ms, None);
+        let devices = meta.list_devices(ana.id).await.unwrap();
+        assert!(devices.iter().all(|d| !d.revoked && d.revoked_ms.is_none() && d.revoke_reason.is_none()), "{devices:?}");
+        assert!(meta.pairing_status(ana.id, pairing_id, NOW + 1).await.unwrap().is_some());
+        assert!(meta.pairing_status(ana.id, other_pairing, NOW + 1).await.unwrap().is_some());
+        assert_eq!(meta.invite_needs_password(&invite_hash, NOW + 1).await.unwrap(), Some(false));
+    };
+    let failed = meta.change_password(ana.id, "$argon2id$stub", "$argon2id$new", keep, NOW + 2).await;
+    assert!(matches!(failed, Err(MetaError::Db(_))), "{failed:?}");
+    unchanged().await;
+    let failed = meta.reset_password(ana.id, "$argon2id$new", false, NOW + 2).await;
+    assert!(matches!(failed, Err(MetaError::Db(_))), "{failed:?}");
+    unchanged().await;
+    let failed = meta.revoke_other_devices(ana.id, keep, RevokeReason::Others, NOW + 2).await;
+    assert!(matches!(failed, Err(MetaError::Db(_))), "{failed:?}");
+    unchanged().await;
+
+    mend_pairing_deletes(url).await;
+    assert_eq!(meta.change_password(ana.id, "$argon2id$stub", "$argon2id$new", keep, NOW + 3).await.unwrap(), vec![other]);
+}
+
+#[tokio::test]
+async fn a_failure_in_the_middle_changes_nothing_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    a_failure_in_the_middle_changes_nothing(&format!("sqlite:{}", dir.path().join("meta.db").display()), false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failure_in_the_middle_changes_nothing_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    a_failure_in_the_middle_changes_nothing(&url, true).await;
+}
+
+// ---- the admin API (migration 0008) ----
+
+const ADMIN_HASH: &str = "$argon2id$admin";
+
+/// An admin account with a device, and the actor an admin request on its behalf would carry.
+async fn admin_actor(meta: &Meta, username: &str) -> (UserRecord, AdminActor) {
+    let u = meta.create_user(username, ADMIN_HASH, Role::Admin, NOW).await.unwrap();
+    let device = device(meta, &u).await;
+    let actor = AdminActor { user: u.id, device, password_hash: ADMIN_HASH.to_owned() };
+    (u, actor)
+}
+
+/// The generation a sign-in would read for `username` now.
+async fn gen_of(meta: &Meta, username: &str) -> i64 {
+    meta.user_by_name(username).await.unwrap().unwrap().auth_gen
+}
+
+async fn admin_view(meta: &Meta, user: UserId) -> AdminUser {
+    meta.admin_user(user, NOW).await.unwrap().unwrap()
+}
+
+async fn users_page(meta: &Meta, after: Option<&str>, search: Option<&str>, limit: u32) -> (Vec<String>, Option<String>) {
+    let page = meta.admin_list_users(after, search, limit, NOW).await.unwrap();
+    (page.users.into_iter().map(|u| u.username).collect(), page.next_after)
+}
+
+async fn the_admin_list_pages_searches_and_counts(meta: &Meta) {
+    let (_, actor) = admin_actor(meta, "root").await;
+    for name in ["ana", "bob", "a_b", "axb", "carol"] {
+        user(meta, name).await;
+    }
+    // By username, in pages; the last page has no continuation.
+    let (first, next) = users_page(meta, None, None, 3).await;
+    assert_eq!(first.len(), 3);
+    let (second, next2) = users_page(meta, next.as_deref(), None, 3).await;
+    assert_eq!(second.len(), 3);
+    assert_eq!(next2, None);
+    let mut all: Vec<_> = first.into_iter().chain(second).collect();
+    let mut sorted_all = all.clone();
+    sorted_all.sort();
+    assert_eq!(all, sorted_all, "pages follow one order");
+    all.dedup();
+    assert_eq!(all.len(), 6, "no account twice, none missing");
+    assert_eq!(users_page(meta, None, None, 6).await.1, None, "exactly a full page has no continuation");
+    // A search finds a substring, ignores case, and takes `%` and `_` literally.
+    assert_eq!(users_page(meta, None, Some("A_B"), 50).await.0, vec!["a_b"]);
+    assert_eq!(users_page(meta, None, Some("a"), 50).await.0, vec!["a_b", "ana", "axb", "carol"]);
+    assert_eq!(users_page(meta, None, Some("%"), 50).await.0, Vec::<String>::new());
+    assert_eq!(users_page(meta, None, Some("_"), 50).await.0, vec!["a_b"]);
+    assert_eq!(users_page(meta, None, Some("zzz"), 50).await.0, Vec::<String>::new());
+    // A search pages too.
+    let (one, next) = users_page(meta, None, Some("a"), 1).await;
+    assert_eq!(one, vec!["a_b"]);
+    assert_eq!(users_page(meta, next.as_deref(), Some("a"), 2).await.0, vec!["ana", "axb"]);
+    assert!(matches!(meta.admin_list_users(None, Some(&"x".repeat(65)), 10, NOW).await, Err(MetaError::Invalid(_))));
+    meta.admin_list_users(None, Some(&"x".repeat(64)), 10, NOW).await.unwrap();
+
+    // What a row says.
+    let ana = meta.user_by_name("ana").await.unwrap().unwrap();
+    let dev = device(meta, &ana).await;
+    meta.add_chunk(ana.space, &random_chunk(), 70, NOW).await.unwrap();
+    meta.create_invite("ana", &code(INVITE_CHARS).hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    let row = admin_view(meta, ana.id).await;
+    assert_eq!((row.role, row.devices_active, row.stored_bytes, row.quota_bytes, row.invite_pending), (Role::Member, 1, 70, None, true));
+    meta.revoke_device(ana.id, dev).await.unwrap();
+    assert_eq!(admin_view(meta, ana.id).await.devices_active, 0);
+    // An expired invite is not pending.
+    assert!(!meta.admin_user(ana.id, NOW + INVITE_TTL_MS).await.unwrap().unwrap().invite_pending);
+    // A reset code is not an invite.
+    let bob = meta.user_by_name("bob").await.unwrap().unwrap();
+    meta.admin_issue_reset(&actor, bob.id, &code(INVITE_CHARS).hash(), NOW, RESET_TTL_MS).await.unwrap();
+    assert!(!admin_view(meta, bob.id).await.invite_pending);
+
+    // The counters: accounts, live devices, bytes.
+    let counts = meta.admin_server_counts().await.unwrap();
+    assert_eq!((counts.users, counts.devices_active, counts.stored_bytes, counts.live_bytes), (6, 1, 70, 0), "only root's device is live");
+    meta.admin_remove_user(&actor, ana.id, NOW).await.unwrap();
+    assert_eq!(meta.admin_server_counts().await.unwrap().users, 5);
+    assert!(!users_page(meta, None, None, 50).await.0.contains(&"ana".to_owned()), "a removed account is not listed");
+    assert!(meta.admin_user(ana.id, NOW).await.unwrap().is_some(), "but it can still be looked up");
+}
+
+async fn an_admin_makes_an_account_with_a_role_and_an_invite(meta: &Meta) {
+    let (_, actor) = admin_actor(meta, "root").await;
+    let invite = code(INVITE_CHARS);
+    let (made, issued) = meta.admin_create_user(&actor, "Newbie", Role::Admin, &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    assert_eq!((made.username.as_str(), made.role, made.devices_active, made.invite_pending), ("newbie", Role::Admin, 0, true));
+    assert_eq!(issued.expires_ms, NOW + INVITE_TTL_MS);
+    // A name that exists, in any case, any role, is taken, and nothing is changed.
+    for name in ["newbie", "NEWBIE", "root"] {
+        let again = meta.admin_create_user(&actor, name, Role::Member, &code(INVITE_CHARS).hash(), NOW, INVITE_TTL_MS).await;
+        assert!(matches!(again, Err(MetaError::UsernameTaken)), "{name}: {again:?}");
+    }
+    assert!(matches!(
+        meta.admin_create_user(&actor, "bad name", Role::Member, &code(INVITE_CHARS).hash(), NOW, INVITE_TTL_MS).await,
+        Err(MetaError::Invalid(_))
+    ));
+    // It has no password: the invite asks for one, and sets it. The account keeps its role and has its own space.
+    assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 1).await.unwrap(), Some(true));
+    assert!(matches!(meta.redeem(&invite.hash(), "pc", &token(), None, NOW + 1).await, Err(MetaError::PasswordRequired)));
+    let joined = meta.redeem(&invite.hash(), "pc", &token(), Some("$argon2id$chosen"), NOW + 2).await.unwrap();
+    assert_eq!(joined.user, made.id);
+    let record = meta.user_by_name("newbie").await.unwrap().unwrap();
+    assert_eq!((record.role, record.password_hash.as_str()), (Role::Admin, "$argon2id$chosen"));
+    assert!(meta.space_info(record.space).await.is_ok());
+    assert!(!admin_view(meta, made.id).await.invite_pending);
+}
+
+async fn an_admin_changes_a_role_and_a_quota(meta: &Meta) {
+    let (root, actor) = admin_actor(meta, "root").await;
+    let ana = user(meta, "ana").await;
+    // Nothing to change is invalid.
+    assert!(matches!(meta.admin_update_user(&actor, ana.id, None, None, NOW).await, Err(MetaError::Invalid(_))));
+    let promoted = meta.admin_update_user(&actor, ana.id, Some(Role::Admin), None, NOW).await.unwrap();
+    assert_eq!((promoted.role, promoted.quota_bytes), (Role::Admin, None));
+    // Role and quota together; a missing quota leaves it, `Some(None)` removes it.
+    let both = meta.admin_update_user(&actor, ana.id, Some(Role::Member), Some(Some(MIN_QUOTA_BYTES)), NOW).await.unwrap();
+    assert_eq!((both.role, both.quota_bytes), (Role::Member, Some(MIN_QUOTA_BYTES)));
+    let role_only = meta.admin_update_user(&actor, ana.id, Some(Role::Member), None, NOW).await.unwrap();
+    assert_eq!(role_only.quota_bytes, Some(MIN_QUOTA_BYTES), "a missing quota leaves it");
+    let cleared = meta.admin_update_user(&actor, ana.id, None, Some(None), NOW).await.unwrap();
+    assert_eq!(cleared.quota_bytes, None);
+    // Bounds: a chunk up to i64::MAX.
+    for bad in [0, 1, MIN_QUOTA_BYTES - 1, i64::MAX as u64 + 1, u64::MAX] {
+        let result = meta.admin_update_user(&actor, ana.id, None, Some(Some(bad)), NOW).await;
+        assert!(matches!(result, Err(MetaError::Invalid(_))), "{bad}: {result:?}");
+    }
+    for good in [MIN_QUOTA_BYTES, i64::MAX as u64] {
+        assert_eq!(meta.admin_update_user(&actor, ana.id, None, Some(Some(good)), NOW).await.unwrap().quota_bytes, Some(good));
+    }
+    // Unknown users, and accounts marked for removal.
+    assert!(matches!(meta.admin_update_user(&actor, UserId(uuid::Uuid::now_v7()), Some(Role::Admin), None, NOW).await, Err(MetaError::NotFound(_))));
+    // The last administrator can't be demoted, even by themselves; with another one they can.
+    let result = meta.admin_update_user(&actor, root.id, Some(Role::Member), None, NOW).await;
+    assert!(matches!(result, Err(MetaError::LastAdmin)), "{result:?}");
+    assert_eq!(admin_view(meta, root.id).await.role, Role::Admin, "and nothing was changed");
+    meta.admin_update_user(&actor, ana.id, Some(Role::Admin), None, NOW).await.unwrap();
+    meta.admin_update_user(&actor, root.id, Some(Role::Member), None, NOW).await.unwrap();
+    // The demoted admin's next change is refused: they are no admin any more.
+    let result = meta.admin_update_user(&actor, ana.id, Some(Role::Member), None, NOW).await;
+    assert!(matches!(result, Err(MetaError::Forbidden(_))), "{result:?}");
+    let ana_actor = AdminActor { user: ana.id, device: device(meta, &ana).await, password_hash: "$argon2id$stub".to_owned() };
+    meta.admin_remove_user(&ana_actor, root.id, NOW).await.unwrap();
+    let result = meta.admin_update_user(&ana_actor, root.id, Some(Role::Admin), None, NOW).await;
+    assert!(matches!(result, Err(MetaError::Conflict(_))), "{result:?}");
+}
+
+/// The acting admin's state is read again inside each change (the role and the password check the handler did can be
+/// stale by then): a demotion, a sign-out, a password change or a disable since lets nothing through, and nothing is
+/// changed.
+async fn the_acting_admins_state_is_checked_in_the_transaction(meta: &Meta) {
+    let (_, boss) = admin_actor(meta, "boss").await;
+    let victim = user(meta, "victim").await;
+    let issue = |actor: AdminActor| {
+        let meta = meta.clone();
+        async move {
+            meta.admin_create_user(
+                &actor,
+                &format!("made{}", uuid::Uuid::now_v7().simple()),
+                Role::Member,
+                &code(INVITE_CHARS).hash(),
+                NOW,
+                INVITE_TTL_MS,
+            )
+            .await
+            .map(|_| ())
+        }
+    };
+    let users_before = meta.admin_server_counts().await.unwrap().users;
+
+    // A member (a demoted admin) is forbidden.
+    let (demoted, demoted_actor) = admin_actor(meta, "demoted").await;
+    meta.admin_update_user(&boss, demoted.id, Some(Role::Member), None, NOW).await.unwrap();
+    assert!(matches!(issue(demoted_actor).await, Err(MetaError::Forbidden(_))));
+    // A signed-out device is unauthorized.
+    let (signed_out, signed_out_actor) = admin_actor(meta, "signedout").await;
+    meta.revoke_device(signed_out.id, signed_out_actor.device).await.unwrap();
+    assert!(matches!(issue(signed_out_actor).await, Err(MetaError::DeviceRevoked)));
+    // A password changed since it was checked is a conflict.
+    let (changed, changed_actor) = admin_actor(meta, "changed").await;
+    meta.reset_password(changed.id, "$argon2id$other", true, NOW).await.unwrap();
+    assert!(matches!(issue(changed_actor).await, Err(MetaError::Conflict(_))));
+    // A disabled admin is unauthorized (their devices are revoked, and the check says it even for a device kept).
+    let (off, off_actor) = admin_actor(meta, "off").await;
+    meta.admin_disable_user(&boss, off.id, NOW).await.unwrap();
+    assert!(matches!(issue(off_actor).await, Err(MetaError::DeviceRevoked)));
+    // Another account's device is not the actor's.
+    let borrowed = AdminActor { device: device(meta, &victim).await, ..boss.clone() };
+    assert!(matches!(issue(borrowed).await, Err(MetaError::DeviceRevoked)));
+    // A member who is no admin at all.
+    let member_actor = AdminActor { user: victim.id, device: device(meta, &victim).await, password_hash: "$argon2id$stub".to_owned() };
+    assert!(matches!(meta.admin_disable_user(&member_actor, demoted.id, NOW).await, Err(MetaError::Forbidden(_))));
+    assert_eq!(meta.admin_server_counts().await.unwrap().users, users_before + 4, "only the four admins made here, no account from a refused change");
+    // Every kind of change checks, not only the first: one of each against a stale actor.
+    let (stale_user, stale_actor) = admin_actor(meta, "stale").await;
+    meta.admin_update_user(&boss, stale_user.id, Some(Role::Member), None, NOW).await.unwrap();
+    assert!(matches!(meta.admin_update_user(&stale_actor, victim.id, Some(Role::Admin), None, NOW).await, Err(MetaError::Forbidden(_))));
+    assert!(matches!(meta.admin_disable_user(&stale_actor, victim.id, NOW).await, Err(MetaError::Forbidden(_))));
+    assert!(matches!(meta.admin_enable_user(&stale_actor, victim.id).await, Err(MetaError::Forbidden(_))));
+    assert!(matches!(meta.admin_remove_user(&stale_actor, victim.id, NOW).await, Err(MetaError::Forbidden(_))));
+    let hash = code(INVITE_CHARS).hash();
+    assert!(matches!(meta.admin_issue_invite(&stale_actor, victim.id, &hash, NOW, INVITE_TTL_MS).await, Err(MetaError::Forbidden(_))));
+    assert!(matches!(meta.admin_revoke_invite(&stale_actor, victim.id).await, Err(MetaError::Forbidden(_))));
+    assert!(matches!(meta.admin_issue_reset(&stale_actor, victim.id, &hash, NOW, RESET_TTL_MS).await, Err(MetaError::Forbidden(_))));
+    let victims_device = device(meta, &victim).await;
+    assert!(matches!(meta.admin_revoke_device(&stale_actor, victim.id, victims_device, NOW).await, Err(MetaError::Forbidden(_))));
+    assert!(meta.device_active(victims_device).await.unwrap());
+    assert_eq!(admin_view(meta, victim.id).await.role, Role::Member);
+}
+
+/// A disabled account has nothing: its devices are signed out (with the reason), its codes gone, and no token, sign-in,
+/// join or pairing works; enabling it brings back the account but never a device.
+async fn disabling_signs_everything_out_and_enabling_brings_back_nothing(meta: &Meta) {
+    let (root, actor) = admin_actor(meta, "root").await;
+    let (ana, maker, pairing, pairing_id) = paired(meta, "ana").await;
+    let other = device(meta, &ana).await;
+    let other_token = token();
+    let third = meta.create_device(ana.id, "third", &other_token, NOW).await.unwrap();
+    let invite = code(INVITE_CHARS);
+    meta.create_invite("ana", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+
+    // Not oneself.
+    assert!(matches!(meta.admin_disable_user(&actor, root.id, NOW).await, Err(MetaError::Invalid(_))));
+    assert!(matches!(meta.admin_remove_user(&actor, root.id, NOW).await, Err(MetaError::Invalid(_))));
+    let revoked = meta.admin_disable_user(&actor, ana.id, NOW + 1).await.unwrap();
+    assert_eq!(sorted(revoked), sorted(vec![maker, other, third]));
+    let view = admin_view(meta, ana.id).await;
+    assert_eq!((view.disabled_ms, view.devices_active, view.invite_pending), (Some(NOW + 1), 0, false));
+    assert_eq!(meta.device_by_token(&other_token).await.unwrap(), None);
+    for d in meta.list_devices(ana.id).await.unwrap() {
+        assert_eq!((d.revoked, d.revoked_ms, d.revoke_reason), (true, Some(NOW + 1), Some(RevokeReason::Disabled)));
+    }
+    assert_eq!(meta.pairing_status(ana.id, pairing_id, NOW + 2).await.unwrap(), None);
+    // Disabling again is harmless.
+    assert!(meta.admin_disable_user(&actor, ana.id, NOW + 5).await.unwrap().is_empty());
+    assert_eq!(admin_view(meta, ana.id).await.disabled_ms, Some(NOW + 1), "the first time stays");
+
+    // Nothing gets in: a sign-in that checked the right password, a device, a code the command line makes, a pairing.
+    let sign_in = meta.sign_in_device(ana.id, ("$argon2id$stub", gen_of(meta, "ana").await), "pc", &DeviceClient::default(), &token(), NOW + 3).await;
+    assert!(matches!(sign_in, Err(MetaError::AccountDisabled)), "{sign_in:?}");
+    assert!(matches!(meta.create_device(ana.id, "pc", &token(), NOW + 3).await, Err(MetaError::AccountDisabled)));
+    let late_invite = code(INVITE_CHARS);
+    meta.create_invite("ana", &late_invite.hash(), NOW + 3, INVITE_TTL_MS).await.unwrap();
+    assert!(matches!(redeem(meta, &late_invite, "pc", NOW + 4).await, Err(MetaError::AccountDisabled)));
+    assert!(matches!(redeem(meta, &pairing, "pc", NOW + 4).await, Err(MetaError::InvalidCode)), "its pairing is gone");
+    assert!(meta.create_pairing(ana.id, maker, &code(PAIRING_CHARS).hash(), NOW + 4).await.is_err());
+    assert_eq!(meta.list_devices(ana.id).await.unwrap().len(), 3, "no device was made");
+
+    // Enabling: sign-in works again; what was signed out stays signed out.
+    meta.admin_enable_user(&actor, ana.id).await.unwrap();
+    assert_eq!(admin_view(meta, ana.id).await.disabled_ms, None);
+    assert!(meta.list_devices(ana.id).await.unwrap().iter().all(|d| d.revoked));
+    assert_eq!(meta.device_by_token(&other_token).await.unwrap(), None);
+    assert!(
+        meta.sign_in_device(ana.id, ("$argon2id$stub", gen_of(meta, "ana").await), "pc", &DeviceClient::default(), &token(), NOW + 6)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // The code made while the account was disabled works now, as an invite made for an enabled account would.
+    redeem(meta, &late_invite, "pc2", NOW + 7).await.unwrap();
+
+    // Marked for removal: disabled, not listed, signed out, can't be enabled, and the name stays taken.
+    let (bob, bobs, _, _) = paired(meta, "bob").await;
+    assert_eq!(meta.admin_remove_user(&actor, bob.id, NOW + 8).await.unwrap(), vec![bobs]);
+    let removed = admin_view(meta, bob.id).await;
+    assert_eq!((removed.disabled_ms, removed.devices_active), (Some(NOW + 8), 0));
+    assert!(matches!(meta.admin_enable_user(&actor, bob.id).await, Err(MetaError::Conflict(_))));
+    assert!(matches!(meta.create_user("bob", "x", Role::Member, NOW).await, Err(MetaError::UsernameTaken)));
+    assert!(matches!(
+        meta.admin_create_user(&actor, "bob", Role::Member, &code(INVITE_CHARS).hash(), NOW, INVITE_TTL_MS).await,
+        Err(MetaError::UsernameTaken)
+    ));
+    assert!(matches!(meta.admin_issue_reset(&actor, bob.id, &code(INVITE_CHARS).hash(), NOW, RESET_TTL_MS).await, Err(MetaError::Conflict(_))));
+    let sign_in = meta.sign_in_device(bob.id, ("$argon2id$stub", gen_of(meta, "bob").await), "pc", &DeviceClient::default(), &token(), NOW + 9).await;
+    assert!(matches!(sign_in, Err(MetaError::AccountDisabled)), "{sign_in:?}");
+    assert!(meta.admin_remove_user(&actor, bob.id, NOW + 10).await.unwrap().is_empty(), "removing again is harmless");
+    assert_eq!(meta.admin_server_counts().await.unwrap().users, 2);
+}
+
+/// A sign-in, a join with an invite, a join with a pairing, a new pairing and a plain device, all at the moment an
+/// admin disables the account: each either finishes before and is signed out by the disable, or finds the account
+/// disabled. Either way no device that is signed in is left, and enabling afterwards brings none back.
+async fn issuing_access_while_an_account_is_disabled_leaves_no_usable_token(meta: &Meta) {
+    let (_, actor) = admin_actor(meta, "root").await;
+    for round in 0..12 {
+        let name = format!("ana{round}");
+        let (ana, maker, pairing, _) = paired(meta, &name).await;
+        let invite = code(INVITE_CHARS);
+        meta.create_invite(&name, &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+        let mut tasks = Vec::new();
+        for job in 0..6 {
+            let (meta, actor, invite, pairing) = (meta.clone(), actor.clone(), invite.hash(), pairing.hash());
+            tasks.push(tokio::spawn(async move {
+                match job {
+                    0 => meta.redeem(&invite, "invited", &token(), None, NOW + 1).await.map(|_| ()),
+                    1 => meta.redeem(&pairing, "paired", &token(), None, NOW + 1).await.map(|_| ()),
+                    2 => {
+                        meta.sign_in_device(ana.id, ("$argon2id$stub", 0), "signed in", &DeviceClient::default(), &token(), NOW + 1).await.map(|_| ())
+                    }
+                    3 => meta.create_pairing(ana.id, maker, &code(PAIRING_CHARS).hash(), NOW + 1).await.map(|_| ()),
+                    4 => meta.create_device(ana.id, "plain", &token(), NOW + 1).await.map(|_| ()),
+                    _ => meta.admin_disable_user(&actor, ana.id, NOW + 2).await.map(|_| ()),
+                }
+            }));
+        }
+        for task in tasks {
+            let result = task.await.unwrap();
+            assert!(
+                matches!(
+                    result,
+                    Ok(()) | Err(MetaError::InvalidCode | MetaError::NotFound(_) | MetaError::AccountDisabled | MetaError::DeviceRevoked)
+                ),
+                "round {round}: {result:?}"
+            );
+        }
+        meta.admin_enable_user(&actor, ana.id).await.unwrap();
+        let devices = meta.list_devices(ana.id).await.unwrap();
+        assert!(devices.iter().all(|d| d.revoked), "round {round}: {devices:?}");
+        assert_revoke_columns_agree(&devices);
+    }
+}
+
+/// A sign-in reads the hash and generation, verifies the password (slowly), and asks to create the device. A disable and
+/// an enable in between leave the hash as it was but not the generation: the device is not created. So are a password
+/// change and a removal. The interleaving is played out by calling the API in that order.
+async fn a_sign_in_checked_before_a_disable_and_an_enable_creates_no_device(meta: &Meta) {
+    let (_, actor) = admin_actor(meta, "root").await;
+    let ana = user(meta, "ana").await;
+    let bob = user(meta, "bob").await;
+    let client = DeviceClient::default();
+    for (name, id) in [("ana", ana.id), ("bob", bob.id)] {
+        let read = meta.user_by_name(name).await.unwrap().unwrap();
+        if name == "ana" {
+            meta.admin_disable_user(&actor, id, NOW).await.unwrap();
+            meta.admin_enable_user(&actor, id).await.unwrap();
+        } else {
+            meta.admin_remove_user(&actor, id, NOW).await.unwrap();
+        }
+        let late = meta.sign_in_device(id, (&read.password_hash, read.auth_gen), "pc", &client, &token(), NOW + 1).await;
+        match name {
+            "ana" => assert!(matches!(late, Ok(None)), "{late:?}"),
+            _ => assert!(matches!(late, Ok(None) | Err(MetaError::AccountDisabled)), "{late:?}"),
+        }
+        assert!(meta.list_devices(id).await.unwrap().is_empty(), "{name}: no device was made");
+    }
+    // A sign-in that read the state after the enable goes through.
+    let fresh = meta.user_by_name("ana").await.unwrap().unwrap();
+    assert!(fresh.auth_gen >= 2);
+    assert!(meta.sign_in_device(ana.id, (&fresh.password_hash, fresh.auth_gen), "pc", &client, &token(), NOW + 2).await.unwrap().is_some());
+    // A password change moves the generation too.
+    let before = gen_of(meta, "ana").await;
+    meta.reset_password(ana.id, "$argon2id$new", true, NOW + 3).await.unwrap();
+    assert!(gen_of(meta, "ana").await > before);
+}
+
+async fn invites_and_reset_codes_replace_each_other(meta: &Meta) {
+    let (root, actor) = admin_actor(meta, "root").await;
+    let (fresh, _) = meta.admin_create_user(&actor, "fresh", Role::Member, &code(INVITE_CHARS).hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    let ana = user(meta, "ana").await;
+    let (first, second, reset) = (code(INVITE_CHARS), code(INVITE_CHARS), code(INVITE_CHARS));
+
+    // An invite only for an account without a password; it replaces the open one, and can be revoked.
+    meta.admin_issue_invite(&actor, fresh.id, &first.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    meta.admin_issue_invite(&actor, fresh.id, &second.hash(), NOW + 1, INVITE_TTL_MS).await.unwrap();
+    assert_eq!(meta.invite_needs_password(&first.hash(), NOW + 2).await.unwrap(), None);
+    assert_eq!(meta.invite_needs_password(&second.hash(), NOW + 2).await.unwrap(), Some(true));
+    let conflict = meta.admin_issue_invite(&actor, ana.id, &code(INVITE_CHARS).hash(), NOW, INVITE_TTL_MS).await;
+    assert!(matches!(conflict, Err(MetaError::Conflict(_))), "an account with a password gets none: {conflict:?}");
+    assert_eq!(meta.invite_needs_password(&second.hash(), NOW + 2).await.unwrap(), Some(true));
+    meta.admin_revoke_invite(&actor, fresh.id).await.unwrap();
+    assert_eq!(meta.invite_needs_password(&second.hash(), NOW + 2).await.unwrap(), None);
+    assert!(matches!(meta.admin_revoke_invite(&actor, fresh.id).await, Err(MetaError::NotFound(_))), "nothing left to revoke");
+    assert!(matches!(meta.admin_revoke_invite(&actor, UserId(uuid::Uuid::now_v7())).await, Err(MetaError::NotFound(_))));
+
+    // A reset code replaces an invite and the other way round, and the account has one row either way.
+    let invite = code(INVITE_CHARS);
+    meta.create_invite("ana", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+    meta.admin_issue_reset(&actor, ana.id, &reset.hash(), NOW + 1, RESET_TTL_MS).await.unwrap();
+    assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 2).await.unwrap(), None);
+    assert_eq!(meta.invite_needs_password(&reset.hash(), NOW + 2).await.unwrap(), Some(true), "a reset always needs a password, though ana has one");
+    let invite_again = code(INVITE_CHARS);
+    meta.create_invite("ana", &invite_again.hash(), NOW + 3, INVITE_TTL_MS).await.unwrap();
+    assert_eq!(meta.invite_needs_password(&reset.hash(), NOW + 4).await.unwrap(), None, "the command line's invite replaces a reset code");
+    assert_eq!(meta.invite_needs_password(&invite_again.hash(), NOW + 4).await.unwrap(), Some(false));
+    meta.admin_issue_reset(&actor, ana.id, &reset.hash(), NOW + 5, RESET_TTL_MS).await.unwrap();
+    meta.admin_revoke_invite(&actor, ana.id).await.unwrap();
+    assert_eq!(meta.invite_needs_password(&reset.hash(), NOW + 6).await.unwrap(), None, "a revoke ends a reset code too");
+
+    // Not oneself, and not another admin.
+    assert!(matches!(meta.admin_issue_reset(&actor, root.id, &reset.hash(), NOW, RESET_TTL_MS).await, Err(MetaError::Invalid(_))));
+    let (boss, _) = admin_actor(meta, "boss").await;
+    let result = meta.admin_issue_reset(&actor, boss.id, &reset.hash(), NOW, RESET_TTL_MS).await;
+    assert!(matches!(result, Err(MetaError::Forbidden(_))), "{result:?}");
+    assert_eq!(meta.invite_needs_password(&reset.hash(), NOW + 6).await.unwrap(), None);
+    // Not a disabled account.
+    meta.admin_disable_user(&actor, ana.id, NOW).await.unwrap();
+    assert!(matches!(meta.admin_issue_reset(&actor, ana.id, &reset.hash(), NOW, RESET_TTL_MS).await, Err(MetaError::Conflict(_))));
+    assert!(matches!(
+        meta.admin_issue_reset(&actor, UserId(uuid::Uuid::now_v7()), &reset.hash(), NOW, RESET_TTL_MS).await,
+        Err(MetaError::NotFound(_))
+    ));
+}
+
+async fn a_reset_code_sets_a_password_and_signs_everything_out(meta: &Meta) {
+    let (_, actor) = admin_actor(meta, "root").await;
+    let (ana, maker, pairing, pairing_id) = paired(meta, "ana").await;
+    let other = device(meta, &ana).await;
+    let reset = code(INVITE_CHARS);
+    meta.admin_issue_reset(&actor, ana.id, &reset.hash(), NOW, RESET_TTL_MS).await.unwrap();
+    // Nothing changes until it is redeemed.
+    assert!(meta.device_active(maker).await.unwrap());
+    assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$stub");
+
+    // A reset without a new password is refused, and the code stays.
+    assert!(matches!(meta.redeem(&reset.hash(), "pc", &token(), None, NOW + 1).await, Err(MetaError::PasswordRequired)));
+    assert!(matches!(meta.redeem(&reset.hash(), "pc", &token(), Some(""), NOW + 1).await, Err(MetaError::PasswordRequired)));
+    assert!(meta.device_active(maker).await.unwrap());
+    // With one: the password changes (though the account had one), every device is signed out, the pairings are gone,
+    // and the redeeming computer is the one device signed in.
+    let new_token = token();
+    let joined = meta.redeem(&reset.hash(), "recovery pc", &new_token, Some("$argon2id$fresh"), NOW + 2).await.unwrap();
+    assert_eq!(sorted(joined.revoked.clone()), sorted(vec![maker, other]));
+    assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().password_hash, "$argon2id$fresh");
+    assert_eq!(meta.account(ana.id).await.unwrap().password_changed_ms, Some(NOW + 2));
+    let devices = meta.list_devices(ana.id).await.unwrap();
+    for d in &devices {
+        if d.id == joined.device {
+            assert!(!d.revoked);
+        } else {
+            assert_eq!((d.revoked, d.revoke_reason), (true, Some(RevokeReason::Reset)));
+        }
+    }
+    assert_revoke_columns_agree(&devices);
+    assert_eq!(meta.device_by_token(&new_token).await.unwrap().map(|a| a.device), Some(joined.device));
+    assert_eq!(meta.pairing_status(ana.id, pairing_id, NOW + 3).await.unwrap(), None);
+    assert!(matches!(redeem(meta, &pairing, "late", NOW + 3).await, Err(MetaError::InvalidCode)));
+    // Once only.
+    assert!(matches!(meta.redeem(&reset.hash(), "again", &token(), Some("$argon2id$x"), NOW + 4).await, Err(MetaError::InvalidCode)));
+
+    // It lasts an hour.
+    let late = code(INVITE_CHARS);
+    meta.admin_issue_reset(&actor, ana.id, &late.hash(), NOW + 10, RESET_TTL_MS).await.unwrap();
+    let result = meta.redeem(&late.hash(), "late", &token(), Some("$argon2id$x"), NOW + 10 + RESET_TTL_MS).await;
+    assert!(matches!(result, Err(MetaError::InvalidCode)), "{result:?}");
+    assert_eq!(RESET_TTL_MS, 3_600_000);
+    meta.redeem(&late.hash(), "in time", &token(), Some("$argon2id$x"), NOW + 10 + RESET_TTL_MS - 1).await.unwrap();
+
+    // Disabling the account deletes the reset code it still held.
+    let disabled_code = code(INVITE_CHARS);
+    meta.admin_issue_reset(&actor, ana.id, &disabled_code.hash(), NOW + 20, RESET_TTL_MS).await.unwrap();
+    meta.admin_disable_user(&actor, ana.id, NOW + 21).await.unwrap();
+    assert_eq!(meta.invite_needs_password(&disabled_code.hash(), NOW + 22).await.unwrap(), None, "disabling deletes it");
+}
+
+/// The quota of a space is its limit when set, with or without the server-wide cap, in the look before the bytes are
+/// stored and in the count that follows.
+async fn a_quota_overrides_the_server_wide_cap(meta: &Meta) {
+    let (_, actor) = admin_actor(meta, "root").await;
+    let ana = user(meta, "ana").await;
+    let bob = user(meta, "bob").await;
+    let quota = MIN_QUOTA_BYTES;
+    meta.admin_update_user(&actor, ana.id, None, Some(Some(quota)), NOW).await.unwrap();
+    let (c1, c2, c3) = (random_chunk(), random_chunk(), random_chunk());
+
+    // No cap at all: the quota still holds, and a space without one is unlimited.
+    meta.check_room(ana.space, BlobKind::Chunk, c1.as_bytes(), quota).await.unwrap();
+    let over = meta.check_room(ana.space, BlobKind::Chunk, c1.as_bytes(), quota + 1).await;
+    assert!(matches!(over, Err(MetaError::QuotaExceeded { used: 0, limit }) if limit == quota), "{over:?}");
+    meta.check_room(bob.space, BlobKind::Chunk, c1.as_bytes(), quota * 10).await.unwrap();
+    meta.add_chunk(ana.space, &c1, quota - 10, NOW).await.unwrap();
+    let over = meta.add_chunk(ana.space, &c2, 11, NOW).await;
+    assert!(matches!(over, Err(MetaError::QuotaExceeded { limit, .. }) if limit == quota), "{over:?}");
+    assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), quota - 10, "nothing was recorded");
+    assert!(matches!(meta.add_chunks(ana.space, &[(c2, 6), (c3, 6)], NOW).await, Err(MetaError::QuotaExceeded { .. })));
+    meta.add_chunks(ana.space, &[(c2, 5), (c3, 5)], NOW).await.unwrap();
+    assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), quota);
+    meta.add_chunk(bob.space, &c1, quota * 3, NOW).await.unwrap();
+    // What the space has already costs nothing to look at.
+    meta.check_room(ana.space, BlobKind::Chunk, c1.as_bytes(), quota * 5).await.unwrap();
+
+    // A cap larger than the quota: the quota wins. A cap smaller than the quota: the quota wins, too (it is the
+    // account's limit, whichever way it differs).
+    let big_cap = meta.clone().with_stored_bytes_cap(Some(quota * 100));
+    assert!(matches!(big_cap.check_room(ana.space, BlobKind::Chunk, random_chunk().as_bytes(), 1).await, Err(MetaError::QuotaExceeded { .. })));
+    assert!(matches!(big_cap.add_chunk(ana.space, &random_chunk(), 1, NOW).await, Err(MetaError::QuotaExceeded { .. })));
+    let small_cap = meta.clone().with_stored_bytes_cap(Some(100));
+    meta.admin_update_user(&actor, bob.id, None, Some(Some(quota * 10)), NOW).await.unwrap();
+    small_cap.check_room(bob.space, BlobKind::Chunk, random_chunk().as_bytes(), quota).await.unwrap();
+    small_cap.add_chunk(bob.space, &random_chunk(), quota, NOW).await.unwrap();
+    // Removing the quota gives the cap back; a quota under the use deletes nothing and refuses new bytes.
+    meta.admin_update_user(&actor, ana.id, None, Some(None), NOW).await.unwrap();
+    big_cap.add_chunk(ana.space, &random_chunk(), 1, NOW).await.unwrap();
+    assert!(matches!(small_cap.add_chunk(ana.space, &random_chunk(), 1, NOW).await, Err(MetaError::QuotaExceeded { .. })));
+    meta.admin_update_user(&actor, bob.id, None, Some(Some(MIN_QUOTA_BYTES)), NOW).await.unwrap();
+    assert!(meta.stored_bytes(bob.space).await.unwrap() > MIN_QUOTA_BYTES);
+    assert!(matches!(meta.add_chunk(bob.space, &random_chunk(), 1, NOW).await, Err(MetaError::QuotaExceeded { .. })));
+}
+
+async fn an_admin_lists_and_revokes_a_users_devices(meta: &Meta) {
+    let (_, actor) = admin_actor(meta, "root").await;
+    let (ana, maker, _, pairing_id) = paired(meta, "ana").await;
+    let bob = user(meta, "bob").await;
+    let bobs = device(meta, &bob).await;
+    let other = device(meta, &ana).await;
+    meta.revoke_device(ana.id, other).await.unwrap();
+    // Every device, revoked ones with their reason.
+    let listed = meta.admin_devices(ana.id).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed.iter().find(|d| d.id == other).unwrap().revoke_reason, Some(RevokeReason::User));
+    assert!(matches!(meta.admin_devices(UserId(uuid::Uuid::now_v7())).await, Err(MetaError::NotFound(_))));
+
+    meta.admin_revoke_device(&actor, ana.id, maker, NOW + 1).await.unwrap();
+    let revoked = record(meta, &ana, maker).await;
+    assert_eq!((revoked.revoked, revoked.revoked_ms, revoked.revoke_reason), (true, Some(NOW + 1), Some(RevokeReason::Admin)));
+    assert_eq!(meta.pairing_status(ana.id, pairing_id, NOW + 2).await.unwrap(), None, "its pairing dies with it");
+    // Again: the first time and reason stay. Another user's device, an unknown device or user: not found, nothing changed.
+    meta.admin_revoke_device(&actor, ana.id, maker, NOW + 5).await.unwrap();
+    assert_eq!(record(meta, &ana, maker).await.revoked_ms, Some(NOW + 1));
+    assert_eq!(record(meta, &ana, other).await.revoke_reason, Some(RevokeReason::User));
+    assert!(matches!(meta.admin_revoke_device(&actor, ana.id, bobs, NOW).await, Err(MetaError::NotFound(_))));
+    assert!(matches!(meta.admin_revoke_device(&actor, ana.id, DeviceId::generate(), NOW).await, Err(MetaError::NotFound(_))));
+    assert!(matches!(meta.admin_revoke_device(&actor, UserId(uuid::Uuid::now_v7()), bobs, NOW).await, Err(MetaError::NotFound(_))));
+    assert!(meta.device_active(bobs).await.unwrap());
+}
+
+// Two admins at the same moment, each taking the other (or oneself) away: whatever the order, one enabled admin is
+// left, and no statement fails inside the database (on Postgres, rows taken in different orders would deadlock).
+
+#[derive(Clone, Copy, Debug)]
+enum Act {
+    Demote(usize),
+    Disable(usize),
+    Remove(usize),
+}
+
+/// Runs `acts` (who acts, what) at the same moment on a survivor and a new admin; exactly one enabled admin must be
+/// left, and the second change of two must fail with a reason the rules give. Returns the admin left.
+async fn race_two_admins(meta: &Meta, round: usize, survivor: (UserRecord, AdminActor), acts: [(usize, Act); 2]) -> (UserRecord, AdminActor) {
+    let fresh = admin_actor(meta, &format!("fresh{round}")).await;
+    let both = [survivor, fresh];
+    let mut tasks = Vec::new();
+    for (who, act) in acts {
+        let (meta, actor) = (meta.clone(), both[who].1.clone());
+        let target = both[match act {
+            Act::Demote(t) | Act::Disable(t) | Act::Remove(t) => t,
+        }]
+        .0
+        .id;
+        tasks.push(tokio::spawn(async move {
+            match act {
+                Act::Demote(_) => meta.admin_update_user(&actor, target, Some(Role::Member), None, NOW).await.map(|_| ()),
+                Act::Disable(_) => meta.admin_disable_user(&actor, target, NOW).await.map(|_| ()),
+                Act::Remove(_) => meta.admin_remove_user(&actor, target, NOW).await.map(|_| ()),
+            }
+        }));
+    }
+    for (task, (_, act)) in tasks.into_iter().zip(acts) {
+        let result = task.await.unwrap();
+        assert!(
+            matches!(result, Ok(()) | Err(MetaError::LastAdmin | MetaError::Forbidden(_) | MetaError::DeviceRevoked | MetaError::Invalid(_))),
+            "round {round}, {act:?}: {result:?}"
+        );
+    }
+    let page = meta.admin_list_users(None, None, 200, NOW).await.unwrap();
+    let left: Vec<_> = page.users.iter().filter(|u| u.role == Role::Admin && u.disabled_ms.is_none()).collect();
+    assert_eq!(left.len(), 1, "round {round}, {acts:?}: {left:?}");
+    let left = left[0].id;
+    let [a, b] = both;
+    if a.0.id == left { a } else { b }
+}
+
+async fn two_admins_racing_keep_one(meta: &Meta, combos: &[[(usize, Act); 2]]) {
+    let mut survivor = admin_actor(meta, "first").await;
+    for round in 0..8 {
+        for (i, combo) in combos.iter().enumerate() {
+            survivor = race_two_admins(meta, round * 10 + i, survivor, *combo).await;
+        }
+    }
+}
+
+async fn two_demotions_at_once_keep_an_admin(meta: &Meta) {
+    two_admins_racing_keep_one(meta, &[[(0, Act::Demote(1)), (1, Act::Demote(0))]]).await;
+}
+
+/// Each admin steps down at the same moment: their rows are different, so only the `last_admin` lock keeps one of them.
+async fn two_self_demotions_at_once_keep_an_admin(meta: &Meta) {
+    two_admins_racing_keep_one(meta, &[[(0, Act::Demote(0)), (1, Act::Demote(1))]]).await;
+}
+
+async fn two_disables_at_once_keep_an_admin(meta: &Meta) {
+    two_admins_racing_keep_one(meta, &[[(0, Act::Disable(1)), (1, Act::Disable(0))]]).await;
+}
+
+async fn a_demotion_and_a_disable_at_once_keep_an_admin(meta: &Meta) {
+    two_admins_racing_keep_one(meta, &[[(0, Act::Demote(1)), (1, Act::Disable(0))], [(0, Act::Disable(1)), (1, Act::Demote(0))]]).await;
+}
+
+async fn a_removal_and_a_demotion_at_once_keep_an_admin(meta: &Meta) {
+    two_admins_racing_keep_one(meta, &[[(0, Act::Remove(1)), (1, Act::Demote(0))], [(0, Act::Demote(1)), (1, Act::Remove(0))]]).await;
+}
+
+async fn a_self_demotion_and_a_disable_of_the_other_at_once_keep_an_admin(meta: &Meta) {
+    two_admins_racing_keep_one(meta, &[[(0, Act::Demote(0)), (0, Act::Disable(1))], [(1, Act::Demote(1)), (1, Act::Disable(0))]]).await;
+}
+
+// ---- the migration from 0007 to 0008 ----
+
+/// Drops what migration 0008 added and forgets it ran, which leaves the database as 0007 left it (with its rows).
+async fn back_to_0007(url: &str) {
+    use sqlx::Connection;
+    let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    sqlx::query("ALTER TABLE invites DROP COLUMN purpose").execute(&mut conn).await.unwrap();
+    sqlx::query("ALTER TABLE spaces DROP COLUMN quota_bytes").execute(&mut conn).await.unwrap();
+    sqlx::query("ALTER TABLE users DROP COLUMN removed_ms").execute(&mut conn).await.unwrap();
+    sqlx::query("ALTER TABLE users DROP COLUMN auth_gen").execute(&mut conn).await.unwrap();
+    sqlx::query("DELETE FROM schema_version WHERE version >= 8").execute(&mut conn).await.unwrap();
+}
+
+/// A database from the release before the admin API keeps its accounts, devices and invites: an old invite reads as an
+/// invite and still works, no space has a quota and no user a removal mark, and the new calls work on it.
+async fn migrating_from_0007_keeps_the_rows(url: &str) {
+    sqlx::any::install_default_drivers();
+    let (ana, old_token, invite) = {
+        let meta = Meta::open(url).await.unwrap();
+        let ana = user(&meta, "ana").await;
+        let old_token = token();
+        meta.create_device(ana.id, "old pc", &old_token, NOW).await.unwrap();
+        meta.add_chunk(ana.space, &random_chunk(), 42, NOW).await.unwrap();
+        let invite = code(INVITE_CHARS);
+        meta.create_invite("ana", &invite.hash(), NOW, INVITE_TTL_MS).await.unwrap();
+        (ana, old_token, invite)
+    };
+    back_to_0007(url).await;
+    assert_eq!(schema_version(url).await, 7);
+
+    let meta = Meta::open(url).await.unwrap();
+    assert_eq!(schema_version(url).await, 8);
+    assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.user), Some(ana.id));
+    let row = admin_view(&meta, ana.id).await;
+    assert_eq!((row.disabled_ms, row.quota_bytes, row.stored_bytes, row.devices_active, row.invite_pending), (None, None, 42, 1, true));
+    assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 1).await.unwrap(), Some(false), "an old invite is an invite");
+    let (_, actor) = admin_actor(&meta, "root").await;
+    meta.admin_update_user(&actor, ana.id, None, Some(Some(MIN_QUOTA_BYTES)), NOW).await.unwrap();
+    meta.admin_disable_user(&actor, ana.id, NOW).await.unwrap();
+    assert_eq!(meta.device_by_token(&old_token).await.unwrap(), None);
+
+    use sqlx::Connection;
+    let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (9)").execute(&mut conn).await.unwrap();
+    drop(conn);
+    assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
+}
+
+#[tokio::test]
+async fn migrating_from_0007_keeps_the_rows_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    migrating_from_0007_keeps_the_rows(&format!("sqlite:{}", dir.path().join("meta.db").display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migrating_from_0007_keeps_the_rows_on_postgres() {
+    let Some((url, _guard)) = postgres_database().await else {
+        eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set");
+        return;
+    };
+    migrating_from_0007_keeps_the_rows(&url).await;
 }

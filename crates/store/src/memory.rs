@@ -32,6 +32,10 @@ impl MemoryBackend {
 
 #[async_trait]
 impl Backend for MemoryBackend {
+    fn kind(&self) -> &'static str {
+        "memory"
+    }
+
     async fn put_raw(&self, path: &str, data: Bytes) -> Result<(), StoreError> {
         self.lock()?.insert(path.to_owned(), data);
         Ok(())

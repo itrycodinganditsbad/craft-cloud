@@ -36,6 +36,11 @@ impl ApiError {
         e
     }
 
+    /// `403 forbidden`: signed in, but not allowed to do this.
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, codes::FORBIDDEN, message)
+    }
+
     pub fn invalid(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, codes::INVALID, message)
     }
@@ -95,6 +100,11 @@ impl From<MetaError> for ApiError {
             MetaError::NotFound(what) => Self::not_found(what),
             MetaError::InvalidCode => Self::invalid_code(),
             MetaError::PasswordRequired => Self::password_required(),
+            MetaError::DeviceRevoked => Self::unauthorized(),
+            MetaError::Forbidden(message) => Self::forbidden(message),
+            MetaError::LastAdmin => Self::new(StatusCode::CONFLICT, codes::LAST_ADMIN, e.to_string()),
+            MetaError::AccountDisabled => Self::new(StatusCode::FORBIDDEN, codes::ACCOUNT_DISABLED, "this account is disabled; ask an administrator"),
+            MetaError::Conflict(message) => Self::new(StatusCode::CONFLICT, codes::CONFLICT, message),
             MetaError::UsernameTaken => Self::new(StatusCode::CONFLICT, codes::USERNAME_TAKEN, "the username is taken"),
             MetaError::QuotaExceeded { used, limit } => Self::quota_exceeded(used, limit),
             MetaError::DocFull { .. } | MetaError::LiveFull { .. } | MetaError::TooManyDocs { .. } | MetaError::TooManyDocRows { .. } => {
@@ -166,5 +176,24 @@ impl IntoResponse for ApiError {
             response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(secs));
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_change_that_lost_a_race_is_a_conflict_and_a_signed_out_caller_is_unauthorized() {
+        let conflict = ApiError::from(MetaError::Conflict("changed meanwhile"));
+        assert_eq!((conflict.status, conflict.code), (StatusCode::CONFLICT, codes::CONFLICT));
+        let revoked = ApiError::from(MetaError::DeviceRevoked);
+        assert_eq!((revoked.status, revoked.code), (StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED));
+        let forbidden = ApiError::from(MetaError::Forbidden("no"));
+        assert_eq!((forbidden.status, forbidden.code), (StatusCode::FORBIDDEN, codes::FORBIDDEN));
+        let last = ApiError::from(MetaError::LastAdmin);
+        assert_eq!((last.status, last.code), (StatusCode::CONFLICT, codes::LAST_ADMIN));
+        let disabled = ApiError::from(MetaError::AccountDisabled);
+        assert_eq!((disabled.status, disabled.code), (StatusCode::FORBIDDEN, codes::ACCOUNT_DISABLED));
     }
 }
