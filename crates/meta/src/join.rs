@@ -18,7 +18,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::codec::{uuid_bytes, uuid_from};
-use crate::users::{check_device_name, insert_device, insert_user};
+use crate::users::{DeviceClient, check_device_name, insert_device, insert_user, lock_user};
 use crate::{Meta, MetaError, Role, UserId, valid_username};
 
 /// The account an invite is for, from [`Meta::create_invite`].
@@ -86,6 +86,8 @@ impl Meta {
         let id = Uuid::now_v7();
         let expires_ms = now_ms.checked_add(PAIRING_TTL_MS).ok_or(MetaError::Invalid("the clock is out of range"))?;
         let mut w = self.begin_write().await?;
+        // Users first, as a sign-out does: a pairing is never made for a device a sign-out just revoked.
+        lock_user(&mut w.tx, user).await?;
         sqlx::query("DELETE FROM pairings WHERE expires_ms <= $1").bind(now_ms).execute(&mut *w.tx).await?;
         sqlx::query("DELETE FROM pairings WHERE device_id = $1").bind(uuid_bytes(device.as_uuid())).execute(&mut *w.tx).await?;
         let done = sqlx::query(
@@ -164,17 +166,45 @@ impl Meta {
         new_password_hash: Option<&str>,
         now_ms: i64,
     ) -> Result<Redeemed, MetaError> {
+        self.redeem_with(code_hash, device_name, &DeviceClient::default(), token_hash, new_password_hash, now_ms).await
+    }
+
+    /// [`Meta::redeem`] for a device that says what client it is.
+    pub async fn redeem_with(
+        &self,
+        code_hash: &[u8; 32],
+        device_name: &str,
+        client: &DeviceClient,
+        token_hash: &[u8; 32],
+        new_password_hash: Option<&str>,
+        now_ms: i64,
+    ) -> Result<Redeemed, MetaError> {
         check_device_name(device_name)?;
+        client.check()?;
         let device = DeviceId::generate();
         let mut w = self.begin_write().await?;
-        let invite = sqlx::query("DELETE FROM invites WHERE code_hash = $1 AND expires_ms > $2 RETURNING user_id")
+        // The account's row is locked before the invite is consumed (see `lock_user`): a password reset takes the
+        // user and then deletes the invite, so taking them the other way round could deadlock on Postgres. The invite
+        // is found with a plain read first, and consumed under the lock with its conditions checked again.
+        let found = sqlx::query("SELECT user_id FROM invites WHERE code_hash = $1 AND expires_ms > $2")
             .bind(code_hash.to_vec())
             .bind(now_ms)
             .fetch_optional(&mut *w.tx)
             .await?;
-        let user = match invite {
+        let user = match found {
             Some(row) => {
                 let user = UserId(uuid_from(&row.try_get::<Vec<u8>, _>("user_id")?)?);
+                lock_user(&mut w.tx, user).await?;
+                let consumed = sqlx::query("DELETE FROM invites WHERE code_hash = $1 AND user_id = $2 AND expires_ms > $3")
+                    .bind(code_hash.to_vec())
+                    .bind(uuid_bytes(&user.0))
+                    .bind(now_ms)
+                    .execute(&mut *w.tx)
+                    .await?;
+                if consumed.rows_affected() == 0 {
+                    // Taken, replaced or deleted (a reset) while this waited for the lock.
+                    return Err(MetaError::InvalidCode);
+                }
                 let current: String = sqlx::query("SELECT password_hash FROM users WHERE id = $1")
                     .bind(uuid_bytes(&user.0))
                     .fetch_optional(&mut *w.tx)
@@ -189,13 +219,21 @@ impl Meta {
                 user
             }
             None => {
+                // The same for a pairing: its account is locked before the device is added, so a reset that revokes
+                // the devices of the account cannot miss one that is being added.
+                let owner =
+                    sqlx::query("SELECT user_id FROM pairings WHERE code_hash = $1").bind(code_hash.to_vec()).fetch_optional(&mut *w.tx).await?;
+                let Some(owner) = owner else { return Err(MetaError::InvalidCode) };
+                let owner = UserId(uuid_from(&owner.try_get::<Vec<u8>, _>("user_id")?)?);
+                lock_user(&mut w.tx, owner).await?;
                 let pairing = sqlx::query(
                     "UPDATE pairings SET used_by = $1 \
-                     WHERE code_hash = $2 AND used_by IS NULL AND expires_ms > $3 \
+                     WHERE code_hash = $2 AND user_id = $3 AND used_by IS NULL AND expires_ms > $4 \
                      AND device_id IN (SELECT id FROM devices WHERE revoked = 0) RETURNING user_id",
                 )
                 .bind(uuid_bytes(device.as_uuid()))
                 .bind(code_hash.to_vec())
+                .bind(uuid_bytes(&owner.0))
                 .bind(now_ms)
                 .fetch_optional(&mut *w.tx)
                 .await?
@@ -203,7 +241,7 @@ impl Meta {
                 UserId(uuid_from(&pairing.try_get::<Vec<u8>, _>("user_id")?)?)
             }
         };
-        insert_device(&mut w.tx, device, user, device_name, token_hash, now_ms).await?;
+        insert_device(&mut w.tx, device, user, device_name, client, token_hash, now_ms).await?;
         w.commit().await?;
         Ok(Redeemed { user, device })
     }

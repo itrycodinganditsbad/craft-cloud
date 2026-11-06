@@ -55,6 +55,33 @@ invite replaces the old one, and `user invite --revoke name` ends it. Every late
 that is signed in (`craft-cloud-agent add-computer`, see [`agent.md`](agent.md)). Codes that don't work are refused alike (wrong,
 expired or used), and an address that tries ten in a minute is held off for the rest of it.
 
+## Devices, passwords and signing out
+
+An account's devices (computers and apps) each hold a token that does not expire. Accounts end them like this:
+
+- A person changes their own password in a Craft Cloud app that offers it (`POST /api/v1/account/password`). That signs
+  out every other device of the account, deletes its open invite and add-a-computer codes, and keeps the device
+  that asked. Five tries (wrong passwords count) are allowed per account every 15 minutes.
+- `craft-cloud-server user --config cc-data/config.toml reset-password name` sets a new password (read from standard
+  input), **signs out every device of the account** and deletes its open invite and add-a-computer codes: a token that
+  was stolen does not survive the reset. It prints how many devices were signed out. Add `--keep-devices` to leave the
+  devices signed in (the old behaviour); the codes are deleted either way.
+- `craft-cloud-server device --config cc-data/config.toml revoke-all name` signs out every device of an account
+  without touching the password. `device revoke name DEVICE_ID` signs out one; `device list name` shows them.
+
+The command line runs in its own process, so it cannot reach the server's open connections. A signed-out device's live
+connection ends at its next ping (within about 30 seconds), and a change-feed long-poll within 60 seconds (when it
+ends, it is answered `401 unauthorized`, never with changes); every other request is refused at once (`401
+unauthorized`). Devices signed out through the API end their live connections
+immediately.
+
+## Upgrading
+
+This release adds a migration (`0007`, device sessions). The server applies it when it starts. A database it
+has migrated cannot be opened by an older server: that one refuses to start ("the database was created by a newer Craft
+Cloud"). Rolling back therefore means restoring a backup taken before the upgrade, so take one first. Upgrade the
+server first: agents and apps keep working unchanged.
+
 ## Restoring a backup
 
 With the server stopped, restore the database and the chunk storage from the backup, then run

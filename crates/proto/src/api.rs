@@ -9,7 +9,7 @@ use crate::ids::{DeviceId, Epoch, NodeId, SpaceId};
 use crate::ops::{Conflict, Op};
 
 /// What apps see of these bodies lives in `craft-cloud-api` (no postcard), re-exported here.
-pub use craft_cloud_api::api::{DeviceInfo, ErrorAnswer, PairingState, PairingStatus, codes};
+pub use craft_cloud_api::api::{AccountInfo, DeviceInfo, ErrorAnswer, PairingState, PairingStatus, codes};
 
 /// Protocol versions this build speaks. A client and server must share at least one.
 pub const PROTOCOL_MIN: u32 = 1;
@@ -46,13 +46,21 @@ pub struct SpaceResponse {
     pub username: String,
 }
 
-/// `POST /api/v1/auth/login`.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `POST /api/v1/auth/login`. `client_kind`, `platform` and `app_version` are optional and only shown in the device
+/// list, never a basis for a permission: `client_kind` is `agent`, `desktop` or `cli`, the others are free text of at
+/// most 32 bytes (all without control characters). A body without them works as before.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
     /// Shown in the device list, e.g. the computer's name.
     pub device_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
 }
 
 impl std::fmt::Debug for LoginRequest {
@@ -61,6 +69,9 @@ impl std::fmt::Debug for LoginRequest {
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .field("device_name", &self.device_name)
+            .field("client_kind", &self.client_kind)
+            .field("platform", &self.platform)
+            .field("app_version", &self.app_version)
             .finish()
     }
 }
@@ -97,14 +108,21 @@ impl std::fmt::Debug for PairingCreated {
 
 /// `POST /api/v1/join` (no auth): redeem an invite or an add-a-computer code (normalised or as typed) for a new
 /// device; answered with a [`LoginResponse`]. `password` is required, and only taken, for an invite to an account
-/// that has none yet. Its `Debug` output hides the code and the password.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// that has none yet. `client_kind`, `platform` and `app_version` are as in [`LoginRequest`]. Its `Debug` output hides
+/// the code and the password.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRequest {
     pub code: String,
     /// Shown in the device list, e.g. the computer's name.
     pub device_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
 }
 
 impl std::fmt::Debug for JoinRequest {
@@ -113,8 +131,40 @@ impl std::fmt::Debug for JoinRequest {
             .field("code", &"<redacted>")
             .field("device_name", &self.device_name)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("client_kind", &self.client_kind)
+            .field("platform", &self.platform)
+            .field("app_version", &self.app_version)
             .finish()
     }
+}
+
+/// `POST /api/v1/account/password` (device auth): changes the password, answered `204`. Every other device of the
+/// account is signed out, and its open invite and pairings are deleted. A wrong `current_password` is `403
+/// wrong_password` (never 401), a `new_password` that breaks the rules `400 weak_password`. Its `Debug` output hides
+/// both passwords.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+impl std::fmt::Debug for ChangePasswordRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChangePasswordRequest").field("current_password", &"<redacted>").field("new_password", &"<redacted>").finish()
+    }
+}
+
+/// `PATCH /api/v1/devices/{id}` (device auth): renames one of the account's devices that isn't revoked; answered with
+/// its [`DeviceInfo`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameDeviceRequest {
+    pub name: String,
+}
+
+/// `POST /api/v1/devices/revoke-others` (device auth): how many other devices were signed out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokedOthers {
+    pub revoked: u32,
 }
 
 /// `POST /api/v1/chunks/missing` and its answer: which of `ids` this space doesn't have.
@@ -184,15 +234,20 @@ mod tests {
 
     #[test]
     fn secrets_stay_out_of_debug_output() {
-        let req = LoginRequest { username: "ana".into(), password: "hunter2-secret".into(), device_name: "pc".into() };
+        let req = LoginRequest { username: "ana".into(), password: "hunter2-secret".into(), device_name: "pc".into(), ..LoginRequest::default() };
         assert!(!format!("{req:?}").contains("hunter2-secret"));
         let res = LoginResponse { device: DeviceId::generate(), token: "tok-secret".into() };
         assert!(!format!("{res:?}").contains("tok-secret"));
-        let join = JoinRequest { code: "K7M4Q9TX".into(), device_name: "pc".into(), password: Some("hunter2-secret".into()) };
+        let join =
+            JoinRequest { code: "K7M4Q9TX".into(), device_name: "pc".into(), password: Some("hunter2-secret".into()), ..JoinRequest::default() };
         let shown = format!("{join:?}");
         assert!(!shown.contains("K7M4Q9TX") && !shown.contains("hunter2-secret"), "{shown}");
         let created = PairingCreated { id: Uuid::nil(), code: "K7M4Q9TX".into(), expires_ms: 1 };
         assert!(!format!("{created:?}").contains("K7M4Q9TX"));
+        let change = ChangePasswordRequest { current_password: "old-secret-pw".into(), new_password: "new-secret-pw".into() };
+        let shown = format!("{change:?}");
+        assert!(!shown.contains("old-secret-pw") && !shown.contains("new-secret-pw"), "{shown}");
+        assert_eq!(shown.matches("<redacted>").count(), 2);
     }
 
     #[test]
@@ -204,6 +259,9 @@ mod tests {
         assert_eq!(waiting, PairingStatus { state: PairingState::Waiting, device_name: None });
         let join: JoinRequest = serde_json::from_value(serde_json::json!({ "code": "c", "device_name": "d" })).unwrap();
         assert_eq!(join.password, None);
+        assert_eq!((join.client_kind, join.platform, join.app_version), (None, None, None));
+        let login = LoginRequest { username: "ana".into(), password: "pw".into(), device_name: "pc".into(), ..LoginRequest::default() };
+        assert_eq!(serde_json::to_value(&login).unwrap(), serde_json::json!({ "username": "ana", "password": "pw", "device_name": "pc" }));
         assert_eq!(codes::INVALID_CODE, "invalid_code");
         assert_eq!(codes::PASSWORD_REQUIRED, "password_required");
         assert_eq!(codes::WEAK_PASSWORD, "weak_password");
