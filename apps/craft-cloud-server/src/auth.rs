@@ -15,6 +15,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use craft_cloud_meta::{DeviceAuth, Role};
 use craft_cloud_proto::api::EPOCH_HEADER;
 
 use crate::error::ApiError;
@@ -84,6 +85,19 @@ pub async fn require_device(State(state): State<Arc<AppState>>, mut request: Req
         response.headers_mut().insert(EPOCH_HEADER, value);
     }
     Ok(response)
+}
+
+/// Lets only an admin through, after [`require_device`] (it reads the device that layer put in the request extensions).
+/// The role is the one `device_by_token` read from the database for this request, never cached, so a demoted admin
+/// loses access with the next request. It is only the first check: every admin change checks the role again inside
+/// its transaction.
+pub async fn require_admin(request: Request, next: Next) -> Result<Response, ApiError> {
+    match request.extensions().get::<DeviceAuth>() {
+        Some(device) if device.role == Role::Admin => Ok(next.run(request).await),
+        Some(_) => Err(ApiError::forbidden("this needs an administrator account")),
+        // Not reachable behind `require_device`; a request without a device is not signed in.
+        None => Err(ApiError::unauthorized()),
+    }
 }
 
 impl AppState {

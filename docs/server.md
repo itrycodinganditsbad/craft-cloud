@@ -55,6 +55,113 @@ invite replaces the old one, and `user invite --revoke name` ends it. Every late
 that is signed in (`craft-cloud-agent add-computer`, see [`agent.md`](agent.md)). Codes that don't work are refused alike (wrong,
 expired or used), and an address that tries ten in a minute is held off for the rest of it.
 
+## Devices, passwords and signing out
+
+An account's devices (computers and apps) each hold a token that does not expire. Accounts end them like this:
+
+- A person changes their own password in a Craft Cloud app that offers it (`POST /api/v1/account/password`). That signs
+  out every other device of the account, deletes its open invite and add-a-computer codes, and keeps the device
+  that asked. Five tries (wrong passwords count) are allowed per account every 15 minutes.
+- `craft-cloud-server user --config cc-data/config.toml reset-password name` sets a new password (read from standard
+  input), **signs out every device of the account** and deletes its open invite and add-a-computer codes: a token that
+  was stolen does not survive the reset. It prints how many devices were signed out. Add `--keep-devices` to leave the
+  devices signed in (the old behaviour); the codes are deleted either way.
+- `craft-cloud-server device --config cc-data/config.toml revoke-all name` signs out every device of an account
+  without touching the password. `device revoke name DEVICE_ID` signs out one; `device list name` shows them.
+
+The command line runs in its own process, so it cannot reach the server's open connections. A signed-out device's live
+connection ends at its next ping (within about 30 seconds), and a change-feed long-poll within 60 seconds (when it
+ends, it is answered `401 unauthorized`, never with changes); every other request is refused at once (`401
+unauthorized`). Devices signed out through the API end their live connections
+immediately.
+
+## Managing accounts over HTTP
+
+Accounts have a role, `admin` or `member`, and the routes under `/api/v1/admin` are for admins only (the first admin is
+still made by `init`). They are an API for a tool or a later admin app: the server brings no web page. Every change asks
+for **a fresh confirmation in its body**, the acting admin's own current password, because a device's token never
+expires and must not be enough on its own:
+
+```sh
+curl -s -X POST https://cloud.example.org/api/v1/admin/users/USER_ID/disable \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"password":"your password"}'
+```
+
+- `GET /admin/server` shows counters (accounts, signed-in devices, stored bytes, live-document bytes) and the kinds of
+  database and storage, nothing else. `GET /admin/users` lists accounts 50 at a time (`limit` up to 200, `cursor` from
+  the last answer's `next`, `query` to find a username).
+- `POST /admin/users` makes an account (role `admin` or `member`) with no password and gives an **invite**, shown once:
+  the person chooses their password when they join with it (a whole join link is included when `public_url` is set).
+  `POST /admin/users/{id}/invite` makes a new invite, but only for an account that still has no password; for one with a
+  password, make a **password reset code** (`POST …/password-reset`, good for an hour, members only). Whoever redeems
+  it in Craft Cloud chooses a new password, **every device of the account is signed out, and the computer that redeems
+  it is signed in**. Codes are only shown in the answer, never in the log.
+- `PATCH /admin/users/{id}` changes the role and/or `quota_bytes`, a limit on what that account may store that replaces
+  `stored_bytes_per_user` for it (at least 4 MiB; `null` removes it; it also holds when there is no server-wide cap; one
+  below what the account stores deletes nothing and refuses new bytes).
+- `POST …/disable` signs every device of an account out and refuses its sign-in and joins (`account_disabled`);
+  `POST …/enable` allows them again but signs nothing back in. `DELETE /admin/users/{id}` marks an account for removal:
+  it is disabled for good and leaves the list, its name stays taken, and **nothing it stored is deleted yet** (that comes with
+  garbage collection). You cannot disable or remove yourself, and the last enabled admin cannot be demoted, disabled or
+  removed (`last_admin`).
+- `GET /admin/users/{id}/devices` lists an account's devices and `DELETE …/devices/{device_id}` signs one out.
+- Resetting another **admin's** password over HTTP is refused until the server has two-factor sign-in: use the command
+  line on the host. When it arrives, the confirmation takes a `totp_code` (or `recovery_code`) as well for admins who have it.
+
+A wrong confirmation password is `403 wrong_password` (never 401); five wrong ones in 15 minutes hold the account off for
+the rest of the window. A signed-out device's live connection ends at once in the server process that did it; another
+server process on the same database, or the command line, finds out at the connection's next ping (within about 30 seconds).
+The command line stays as the way in without HTTP and enforces neither the confirmation nor `last_admin`.
+
+## The security audit log
+
+The server keeps a log of the events that matter for who may do what, in its database: sign-ins and failed sign-ins (a
+row per account and minute, with a count), devices signed out, password changes, an administrator's changes to accounts,
+roles, quotas, invites, reset codes and devices, codes redeemed on a new computer, and what the command line does to an
+account (`user reset-password`, `device revoke`, `device revoke-all`). Reading it:
+
+- Every account sees its own events, and what was done to it, with `GET /api/v1/account/activity`.
+- Admins read all of it with `GET /api/v1/admin/audit` (filters `user`, an account ID, and `action`, an event name like
+  `auth.login` or a group like `auth.`; pages by `cursor`) and export it with `GET /api/v1/admin/audit/export`, newline
+  delimited JSON, newest first. The **last line** says whether the export is whole: `{"complete":true,"exported":n}`, or
+  `{"truncated":true,"exported":n}` when the log holds more than the 100,000 events an export carries (narrow it with
+  `user` and `action`). An export that ends without either line broke off: do not treat it as complete. Reading the log is
+  not logged.
+- On the server's host: `craft-cloud-server audit --config cc-data/config.toml list [--user NAME] [--action auth.] [--limit N]`
+  prints the newest events as text (accounts by ID, not by name).
+
+**What is in it, and what is not.** A row has a time, the IDs of the account and device that acted and of what it acted
+on, an event name, success or failure, and a few typed values (how many devices were signed out, the role before and after,
+which kind of client and which platform out of a short list). It has **no IP addresses, no file names, no device names, no
+names of accounts that do not exist, no passwords, codes, tokens or other secrets**; what a client types is never copied
+into it. Because it holds account IDs and times it is personal data about the people who use the server: tell them
+what you keep it for (finding out who changed what and who signed in or tried to), and for how long. An event keeps the ID
+of an account that was removed; the name is not stored.
+
+**How long.** Events are kept 365 days. Set `retention_days` (1 to 3650) in an optional `[audit]` section of `config.toml`:
+
+```toml
+[audit]
+retention_days = 365
+```
+
+`craft-cloud-server audit --config cc-data/config.toml prune` deletes the events older than that and prints how many
+(`--dry-run` only counts). The server also deletes expired events when it writes a new one, at most once an hour and in small
+batches that never hold up a sign-in; **a server nobody uses keeps its expired events** until `prune` runs, so run it from cron
+or the task scheduler, for example daily. There is no background task.
+
+The log is append-only in the server's code, not enforced by the database (a design choice: the same code runs on SQLite and Postgres, and SQLite has no database roles; triggers exist but are not used). Someone
+who can write to the database can change it; keep the database file and Postgres user private.
+
+## Upgrading
+
+This release adds migrations (`0007`, device sessions, `0008`, the admin API: reset codes, per-account quotas, the
+removal mark, and `0009`, the audit log). The server applies it when it starts. A database it
+has migrated cannot be opened by an older server: that one refuses to start ("the database was created by a newer Craft
+Cloud"). Rolling back therefore means restoring a backup taken before the upgrade, so take one first. Upgrade the
+server first: agents and apps keep working unchanged. A config that has the new `[audit]` section is refused by an older
+server (it rejects unknown settings), so remove the section before going back to one.
+
 ## Restoring a backup
 
 With the server stopped, restore the database and the chunk storage from the backup, then run

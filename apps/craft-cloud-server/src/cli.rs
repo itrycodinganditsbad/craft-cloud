@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use craft_cloud_meta::{Meta, Role, valid_username};
+use craft_cloud_meta::{ActionFilter, AuditQuery, Meta, Origin, RevokeReason, Role, valid_username};
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::join::{Code, INVITE_CHARS, INVITE_TTL_MS, JoinString};
 use craft_cloud_store::Store;
@@ -77,6 +77,14 @@ pub enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Read and prune the security audit log.
+    Audit {
+        /// Path to config.toml. May come before or after the action.
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: AuditCommand,
+    },
     /// Manage live documents.
     Live {
         /// Path to config.toml. May come before or after the action.
@@ -84,6 +92,29 @@ pub enum Command {
         config: Option<PathBuf>,
         #[command(subcommand)]
         action: LiveAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuditCommand {
+    /// Print the newest security events, newest first, as text. An event names accounts by ID, never by name.
+    List {
+        /// Only events this account acted in or was the target of.
+        #[arg(long)]
+        user: Option<String>,
+        /// Only this event (like auth.login) or a group of them (like auth.).
+        #[arg(long)]
+        action: Option<String>,
+        /// How many events at most (1 to 200).
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Delete the events older than `[audit] retention_days` and say how many. Run it now and then (daily, from cron or
+    /// the task scheduler): the server also prunes when it writes an event, but not while no one signs in or changes anything.
+    Prune {
+        /// Say how many events would go and delete none.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -103,11 +134,19 @@ pub enum UserAction {
         #[arg(long)]
         admin: bool,
     },
-    /// Set a new password, read from standard input.
-    ResetPassword { username: String },
+    /// Set a new password, read from standard input. Every device of the account is signed out and its open invite
+    /// and add-a-computer codes are deleted, so a stolen device or code does not outlive the old password; with
+    /// `--keep-devices` the devices stay signed in. A device's live connection ends at its next ping (about 30
+    /// seconds) and a change-feed long-poll within 60 seconds, since the server runs in another process.
+    ResetPassword {
+        username: String,
+        /// Leave the account's devices signed in.
+        #[arg(long)]
+        keep_devices: bool,
+    },
     /// Print an invite code for an account, good once for 7 days, to join a computer with in Craft Cloud. Creates the
     /// account (without a password, chosen when the invite is redeemed) if there is none, and replaces its earlier
-    /// invite.
+    /// invite or password reset code.
     Invite {
         username: String,
         /// Revoke the account's invite instead.
@@ -118,8 +157,18 @@ pub enum UserAction {
 
 #[derive(Debug, Subcommand)]
 pub enum DeviceAction {
-    List { username: String },
-    Revoke { username: String, device: DeviceId },
+    List {
+        username: String,
+    },
+    Revoke {
+        username: String,
+        device: DeviceId,
+    },
+    /// Sign out every device of an account. Live connections end at their next ping (about 30 seconds), change-feed
+    /// long-polls within 60 seconds.
+    RevokeAll {
+        username: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -138,8 +187,11 @@ pub enum CliError {
 
 /// Opens the database and blob storage a config names.
 pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
-    let meta =
-        Meta::open(&config.database.url).await?.with_stored_bytes_cap(config.stored_bytes_per_user).with_live_bytes_cap(config.live_bytes_per_user);
+    let meta = Meta::open(&config.database.url)
+        .await?
+        .with_stored_bytes_cap(config.stored_bytes_per_user)
+        .with_live_bytes_cap(config.live_bytes_per_user)
+        .with_audit_retention_days(config.audit.retention_days);
     let store = match (&config.storage, config.storage.s3()?) {
         (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
         (StorageConfig::Disk { path }, None) => Store::new(DiskBackend::new(path)?),
@@ -197,12 +249,17 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                     let user = meta.create_user(&username, &hash, role, now_ms()).await?;
                     writeln!(out, "added {} ({})", user.username, if admin { "admin" } else { "member" })?;
                 }
-                UserAction::ResetPassword { username } => {
+                UserAction::ResetPassword { username, keep_devices } => {
                     let user = user_id(&meta, &username).await?;
                     let password = read_password(input)?;
                     let hash = hash_password(&password).map_err(|e| CliError::Usage(e.message))?;
-                    meta.set_password_hash(user.id, &hash).await?;
-                    writeln!(out, "password changed for {}", user.username)?;
+                    let revoked = meta.reset_password(user.id, &hash, keep_devices, now_ms()).await?;
+                    tracing::info!(revoked = revoked.len(), "password reset");
+                    if keep_devices {
+                        writeln!(out, "password changed for {}; the devices stay signed in", user.username)?;
+                    } else {
+                        writeln!(out, "password changed for {}; signed out {} device(s)", user.username, revoked.len())?;
+                    }
                 }
             }
             Ok(())
@@ -218,11 +275,22 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                 }
                 DeviceAction::Revoke { username, device } => {
                     let user = user_id(&meta, &username).await?;
-                    meta.revoke_device(user.id, device).await?;
+                    meta.revoke_device_by(user.id, device, RevokeReason::Admin, Origin::Cli, now_ms()).await?;
                     writeln!(out, "revoked {device}")?;
+                }
+                DeviceAction::RevokeAll { username } => {
+                    let user = user_id(&meta, &username).await?;
+                    let revoked = meta.revoke_all_devices(user.id, RevokeReason::Admin, now_ms()).await?;
+                    tracing::info!(revoked = revoked.len(), "all devices revoked");
+                    writeln!(out, "revoked {} device(s) of {}", revoked.len(), user.username)?;
                 }
             }
             Ok(())
+        }
+        Command::Audit { config, action } => {
+            let config = Config::load(&config_path(config)?)?;
+            let (meta, _) = open(&config).await?;
+            audit(&meta, &config, action, out).await
         }
         Command::ResetEpoch { config, username, all } => {
             let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
@@ -257,6 +325,60 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
             Ok(())
         }
     }
+}
+
+/// `audit list` and `audit prune`.
+async fn audit(meta: &Meta, config: &Config, action: AuditCommand, out: &mut impl Write) -> Result<(), CliError> {
+    match action {
+        AuditCommand::List { user, action, limit } => {
+            if !(1..=200).contains(&limit) {
+                return Err(CliError::Usage("--limit is 1 to 200".into()));
+            }
+            let user = match user {
+                Some(name) => Some(user_id(meta, &name).await?.id),
+                None => None,
+            };
+            let action = match action {
+                Some(text) => Some(
+                    ActionFilter::parse(&text)
+                        .ok_or_else(|| CliError::Usage("--action is an event name like auth.login, or a group like auth.".into()))?,
+                ),
+                None => None,
+            };
+            let events = meta.audit_list(&AuditQuery { user, action, limit, ..AuditQuery::default() }).await?;
+            let id = |id: Option<uuid::Uuid>| id.map_or_else(|| "-".to_owned(), |id| id.to_string());
+            for e in &events {
+                // Only closed words, IDs and numbers: nothing here is a secret or a name anyone typed.
+                writeln!(
+                    out,
+                    "{}  {}  {}  actor={}  device={}  target={}:{}  count={}  {}",
+                    e.at_ms,
+                    e.action.as_str(),
+                    e.outcome.as_str(),
+                    id(e.actor_user.map(|u| u.0)),
+                    id(e.actor_device.map(|d| *d.as_uuid())),
+                    if e.target_kind.is_empty() { "-" } else { e.target_kind.as_str() },
+                    id(e.target_id),
+                    e.count,
+                    e.details,
+                )?;
+            }
+            writeln!(out, "{} event(s)", events.len())?;
+        }
+        AuditCommand::Prune { dry_run } => {
+            let days = config.audit.retention_days;
+            let before = now_ms().saturating_sub(i64::from(days).saturating_mul(24 * 60 * 60 * 1000));
+            if dry_run {
+                let due = meta.audit_count_before(before).await?;
+                writeln!(out, "{due} audit event(s) are older than {days} days; dry run, nothing deleted")?;
+            } else {
+                let deleted = meta.audit_prune(before).await?;
+                tracing::info!(deleted, "audit events pruned");
+                writeln!(out, "deleted {deleted} audit event(s) older than {days} days")?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `user invite`: makes the invite and prints how to use it. The code is printed only here, never logged.

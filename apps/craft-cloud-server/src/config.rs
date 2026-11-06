@@ -9,6 +9,9 @@
 //! # live_bytes_per_user = 1_073_741_824         # cap on what one account's live documents hold, in bytes (1 GiB)
 //! # public_url = "https://cloud.example.com"    # where computers reach the server; `user invite` prints it
 //!
+//! # [audit]
+//! # retention_days = 365        # how long security events are kept (1 to 3650); `audit prune` deletes older ones
+//!
 //! [database]
 //! url = "sqlite:/var/lib/craft-cloud/meta.db"   # or postgres://user:pass@host/db
 //!
@@ -59,6 +62,8 @@ pub enum ConfigError {
     PublicUrl(String),
     #[error("storage.{0} is missing (set it in the config or the {1} environment variable)")]
     MissingS3Credential(&'static str, &'static str),
+    #[error("audit.retention_days = {0} is out of range: keep security events for {1} to {2} days")]
+    AuditRetention(u32, u32, u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -90,12 +95,35 @@ pub struct Config {
     /// trailing slash. Unset: `user invite` prints the bare code and says to put the address in front.
     #[serde(default)]
     pub public_url: Option<String>,
+    /// The security audit log. The section is optional and its defaults are safe.
+    #[serde(default)]
+    pub audit: AuditConfig,
     pub database: DatabaseConfig,
     pub storage: StorageConfig,
 }
 
 fn default_live_bytes() -> u64 {
     craft_cloud_meta::DEFAULT_LIVE_BYTES_PER_SPACE
+}
+
+/// `[audit]`: how the security audit log is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditConfig {
+    /// Days a security event is kept: `audit prune` deletes older ones, and a write does so now and then (at most once an
+    /// hour). 1 to 3650, default 365. A server that no one writes to keeps expired events until `audit prune` runs.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self { retention_days: default_retention_days() }
+    }
+}
+
+fn default_retention_days() -> u32 {
+    365
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -185,6 +213,13 @@ impl Config {
             && cap < u64::from(MAX_CHUNK_BYTES)
         {
             return Err(ConfigError::StoredBytesCapTooSmall(cap, MAX_CHUNK_BYTES));
+        }
+        if !(craft_cloud_meta::MIN_RETENTION_DAYS..=craft_cloud_meta::MAX_RETENTION_DAYS).contains(&config.audit.retention_days) {
+            return Err(ConfigError::AuditRetention(
+                config.audit.retention_days,
+                craft_cloud_meta::MIN_RETENTION_DAYS,
+                craft_cloud_meta::MAX_RETENTION_DAYS,
+            ));
         }
         let mut config = config;
         if let Some(url) = &config.public_url {
@@ -321,6 +356,22 @@ path = "/tmp/blobs"
         // Without a proxy there is nothing to ignore.
         let no_proxy = format!("ignore_forwarded_for = true\n{DISK}");
         assert!(matches!(Config::parse(&no_proxy), Err(ConfigError::IgnoreForwardedForMisplaced)));
+    }
+
+    #[test]
+    fn the_audit_section_is_optional_and_checked() {
+        assert_eq!(Config::parse(DISK).unwrap().audit.retention_days, 365, "a year by default");
+        let with = |section: &str| Config::parse(&format!("{DISK}\n{section}\n"));
+        assert_eq!(with("[audit]").unwrap().audit.retention_days, 365);
+        assert_eq!(with("[audit]\nretention_days = 30").unwrap().audit.retention_days, 30);
+        for days in [1, 3650] {
+            assert_eq!(with(&format!("[audit]\nretention_days = {days}")).unwrap().audit.retention_days, days);
+        }
+        for days in ["0", "3651", "-1", "\"30\"", "1.5"] {
+            assert!(with(&format!("[audit]\nretention_days = {days}")).is_err(), "{days}");
+        }
+        assert!(matches!(with("[audit]\nretention_days = 0"), Err(ConfigError::AuditRetention(0, 1, 3650))));
+        assert!(matches!(with("[audit]\nkeep = 5"), Err(ConfigError::Parse(_))), "unknown keys are refused");
     }
 
     #[test]

@@ -1105,8 +1105,32 @@ pub(crate) mod tests {
         let Screen::SignedIn(o) = &m.screen else { panic!() };
         assert_eq!(o.status.account.as_deref(), Some("fabio"));
         let devices = vec![
-            DeviceInfo { id: DeviceId::generate(), name: "lptp1".into(), created_ms: 1, last_used_ms: 2, revoked: false, current: true },
-            DeviceInfo { id: DeviceId::generate(), name: "BEAST".into(), created_ms: 1, last_used_ms: 3, revoked: false, current: false },
+            DeviceInfo {
+                id: DeviceId::generate(),
+                name: "lptp1".into(),
+                created_ms: 1,
+                last_used_ms: 2,
+                revoked: false,
+                current: true,
+                client_kind: String::new(),
+                platform: String::new(),
+                app_version: String::new(),
+                revoked_ms: None,
+                revoke_reason: None,
+            },
+            DeviceInfo {
+                id: DeviceId::generate(),
+                name: "BEAST".into(),
+                created_ms: 1,
+                last_used_ms: 3,
+                revoked: false,
+                current: false,
+                client_kind: String::new(),
+                platform: String::new(),
+                app_version: String::new(),
+                revoked_ms: None,
+                revoke_reason: None,
+            },
         ];
         m.update(Event::Devices(Ok(devices.clone())));
         // This computer can't be removed from here; another one can, once at a time.
