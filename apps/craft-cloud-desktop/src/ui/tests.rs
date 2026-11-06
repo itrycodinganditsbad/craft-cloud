@@ -6,6 +6,7 @@
 //! [`TOLERANCE`] in a channel.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use craft_cloud_app::{DeviceId, DeviceInfo, PairingInfo, RunState, Status, Uuid};
 use egui_kittest::Harness;
@@ -89,9 +90,28 @@ fn devices() -> Vec<DeviceInfo> {
     ]
 }
 
+/// The one wgpu instance, adapter, device and queue every test renders with. Tests run on parallel threads, and
+/// creating and dropping a D3D12 device (WARP) per harness at the same time crashed the test process with an access
+/// violation. Each harness still gets a renderer of its own on the shared device. It is never dropped, so no device is
+/// torn down while other threads render.
+fn shared_wgpu() -> eframe::egui_wgpu::WgpuSetup {
+    static SHARED: OnceLock<eframe::egui_wgpu::WgpuSetupExisting> = OnceLock::new();
+    let shared = SHARED.get_or_init(|| {
+        let state =
+            egui_kittest::wgpu::create_render_state(egui_kittest::wgpu::default_wgpu_setup(), eframe::egui_wgpu::RendererOptions::PREDICTABLE);
+        eframe::egui_wgpu::WgpuSetupExisting {
+            instance: state.instance.clone(),
+            adapter: state.adapter.clone(),
+            device: state.device.clone(),
+            queue: state.queue.clone(),
+        }
+    });
+    eframe::egui_wgpu::WgpuSetup::Existing(shared.clone())
+}
+
 /// The harness: the window drawn for the model, its events kept.
 fn harness(model: Model, theme: egui::Theme) -> Harness<'static, (Model, Vec<Event>)> {
-    Harness::builder().with_size(egui::Vec2::from(WINDOW_SIZE)).with_theme(theme).wgpu().build_ui_state(
+    Harness::builder().with_size(egui::Vec2::from(WINDOW_SIZE)).with_theme(theme).wgpu_setup(shared_wgpu()).build_ui_state(
         |ui, (model, events): &mut (Model, Vec<Event>)| {
             events.extend(show(ui, model, NOW));
         },
