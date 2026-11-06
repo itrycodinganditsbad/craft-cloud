@@ -517,13 +517,16 @@ impl Ctx<'_> {
         Ok(TrashRestoreOutcome { node, parent, renamed: placed.name != original, name: placed.name, version, seq: 0, epoch: self.epoch })
     }
 
-    /// Brings back everything in the trash below the folder `top`, which is live again: its deleted children and theirs,
-    /// whenever they were deleted, parents first. A child keeps its name; one whose name another child that came back
-    /// took (a name deleted twice, the newest deletion first) gets a conflict name. A removed node, and what is only
-    /// below a removed folder, stays deleted. More than `cap` nodes: `Invalid`, and the caller drops the transaction.
+    /// Brings back what is in the trash below the folder `top`, which is live again: its deleted children and theirs,
+    /// whenever they were deleted, at most `cap` of them, shallowest first (then newest deletion first, then by ID), so a
+    /// node never comes back without its folder. The rest stays in the trash; its folder is live or still in the trash
+    /// under a live one, so it is listed on its own and a further restore brings it back. A child keeps its name; one
+    /// whose name another child that came back took (a name deleted twice, the newest deletion first) gets a conflict
+    /// name. A removed node, and what is only below a removed folder, stays deleted. The work done row by row under the
+    /// space's write lock is bounded by `cap`.
     async fn restore_below(&mut self, top: NodeId, cap: u64, device: &str) -> Result<(), MetaError> {
         let bound = i64::try_from(MAX_TREE_DEPTH + 2).map_err(|_| MetaError::Corrupt("depth limit out of range"))?;
-        let limit = i64::try_from(cap).map_err(|_| MetaError::Corrupt("trash cap out of range"))?.saturating_add(1);
+        let limit = i64::try_from(cap).map_err(|_| MetaError::Corrupt("trash cap out of range"))?;
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "{TRASH_BELOW} SELECT n.id, n.parent, n.name, n.is_dir FROM sub JOIN nodes n ON n.space_id = $1 AND n.id = sub.id \
              ORDER BY sub.depth, n.deleted_ms DESC, n.id LIMIT $4"
@@ -534,9 +537,6 @@ impl Ctx<'_> {
         .bind(limit)
         .fetch_all(&mut *self.conn)
         .await?;
-        if u64::try_from(rows.len()).map_err(|_| MetaError::Corrupt("count out of range"))? > cap {
-            return Err(MetaError::Invalid(crate::trash::TRASH_TREE_TOO_LARGE));
-        }
         for row in &rows {
             let id = NodeId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("id")?)?);
             let parent = NodeId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("parent")?)?);
