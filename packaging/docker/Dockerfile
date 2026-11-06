@@ -9,8 +9,8 @@
 # Every base image is pinned by the digest of its multi-arch index; the tag in the comment is for humans. Update
 # the tag and the digest together (see "Docker" in docs/server.md).
 
-# rust:1.94-trixie (the workspace's rust-version; glibc 2.41 like the runtime image below)
-ARG RUST_IMAGE=rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c
+# rust:1.95-trixie (egui 0.36 needs Rust 1.95; glibc 2.41 like the runtime image below)
+ARG RUST_IMAGE=rust:1.95-trixie@sha256:f49565f188ee00bc2a18dd418183f2c5f23ef7d6e691890517ed341a598f67c3
 # debian:trixie-slim (only used to create the data directory with its owner and mode)
 ARG DEBIAN_IMAGE=debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
 # gcr.io/distroless/cc-debian13:nonroot (glibc, libgcc and CA certificates; no shell, no package manager; uid 65532)
