@@ -178,6 +178,43 @@ async fn a_first_sync_goes_both_ways() {
     assert_eq!(a.files(), b.files());
 }
 
+/// Deleting a folder with files in it and restoring it from the trash: the folder and everything that was in the trash
+/// below it, also a file deleted on its own before, come back to the disk of both computers by their normal pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_restored_from_the_trash_comes_back_with_its_files() {
+    let server = server().await;
+    let a = Agent::signed_in(&server, "desktop").await;
+    a.write("dir1/child.txt", "deleted with the folder");
+    a.write("dir1/early.txt", "deleted first");
+    a.write("dir1/sub/deep.txt", "deep");
+    a.write("keep.txt", "stays");
+    assert_eq!(a.sync().await, Exit::Done);
+    let b = Agent::signed_in(&server, "laptop").await;
+    assert_eq!(b.sync().await, Exit::Done);
+    assert_eq!(b.files().len(), 4);
+
+    std::fs::remove_file(a.path("dir1/early.txt")).unwrap();
+    assert_eq!(a.sync().await, Exit::Done);
+    std::fs::remove_dir_all(a.path("dir1")).unwrap();
+    assert_eq!(a.sync().await, Exit::Done);
+    assert_eq!(b.sync().await, Exit::Done);
+    assert_eq!(a.files(), ["keep.txt"]);
+    assert_eq!(b.files(), ["keep.txt"]);
+
+    let ana = server.meta.user_by_name("ana").await.unwrap().unwrap();
+    let listed = server.meta.trash(ana.space, None, 200, 0).await.unwrap().entries;
+    assert_eq!(listed.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["dir1"], "the folder is listed alone");
+    let device = server.meta.list_devices(ana.id).await.unwrap().into_iter().find(|d| d.name == "desktop").unwrap().id;
+    server.meta.restore_from_trash(ana.space, device, listed[0].id, 0).await.unwrap();
+
+    for agent in [&a, &b] {
+        assert_eq!(agent.sync().await, Exit::Done);
+        assert_eq!(agent.files(), ["dir1/child.txt", "dir1/early.txt", "dir1/sub/deep.txt", "keep.txt"]);
+        assert_eq!(agent.read("dir1/sub/deep.txt").as_deref(), Some("deep"));
+        assert_eq!(agent.read("dir1/early.txt").as_deref(), Some("deleted first"));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn big_files_travel_in_chunks_and_keep_their_exec_bit() {
     let server = server().await;
