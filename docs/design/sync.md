@@ -580,7 +580,8 @@ changes locally, then pushes local changes. These rules came out of the simulati
   Solo use is that one admin account and nothing more.
 - **Device sessions** (migration 0007): a device token has no expiry and its format is unchanged (43 characters, stored as a
   BLAKE3 hash); what changed is what a device records and how an account ends them. A device records the `client_kind`,
-  `platform` and `app_version` it said at sign-in (display only), and, once revoked, when (`revoked_ms`) and why
+  `platform` and `app_version` it said at sign-in (display only; the agent says `agent`, its operating system and its version on every
+  sign-in and join), and, once revoked, when (`revoked_ms`) and why
   (`revoke_reason`). The `revoked` flag is still the check: the three are set together in one transaction and only by
   the first revoke, so a second revoke changes neither. A user keeps `password_changed_ms`. `users.disabled_ms` is created
   for a later release and nothing reads it yet.
