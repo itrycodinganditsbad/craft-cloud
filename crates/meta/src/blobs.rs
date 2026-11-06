@@ -104,17 +104,18 @@ pub(crate) async fn record(tx: &mut sqlx::AnyConnection, space: SpaceId, blob: B
     charge(tx, space, size, cap).await
 }
 
-/// Adds `size` to the space's stored bytes, refusing (`QuotaExceeded`) when that goes over `cap`. On Postgres the
-/// update locks the space's row until the transaction ends, so two uploads to one space can't both slip under.
+/// Adds `size` to the space's stored bytes, refusing (`QuotaExceeded`) when that goes over the space's limit: its own
+/// quota (set by an admin), else `cap`. On Postgres the update locks the space's row until the transaction ends, so two
+/// uploads to one space can't both slip under.
 async fn charge(tx: &mut sqlx::AnyConnection, space: SpaceId, size: i64, cap: Option<u64>) -> Result<(), MetaError> {
-    let total: i64 = sqlx::query("UPDATE spaces SET stored_bytes = stored_bytes + $1 WHERE id = $2 RETURNING stored_bytes")
+    let row = sqlx::query("UPDATE spaces SET stored_bytes = stored_bytes + $1 WHERE id = $2 RETURNING stored_bytes, quota_bytes")
         .bind(size)
         .bind(uuid_bytes(space.as_uuid()))
         .fetch_one(&mut *tx)
-        .await?
-        .try_get("stored_bytes")?;
-    let total = to_u64(total)?;
-    match cap {
+        .await?;
+    let total = to_u64(row.try_get("stored_bytes")?)?;
+    let quota: Option<i64> = row.try_get("quota_bytes")?;
+    match quota.map(to_u64).transpose()?.or(cap) {
         Some(limit) if total > limit => Err(MetaError::QuotaExceeded { used: total.saturating_sub(to_u64(size)?), limit }),
         _ => Ok(()),
     }
@@ -122,9 +123,18 @@ async fn charge(tx: &mut sqlx::AnyConnection, space: SpaceId, size: i64, cap: Op
 
 /// The bytes `space` stores.
 async fn stored_bytes(conn: &mut sqlx::AnyConnection, space: SpaceId) -> Result<u64, MetaError> {
-    let row = sqlx::query("SELECT stored_bytes FROM spaces WHERE id = $1").bind(uuid_bytes(space.as_uuid())).fetch_optional(&mut *conn).await?;
+    Ok(stored_and_quota(conn, space).await?.0)
+}
+
+/// The bytes `space` stores, and the quota an admin set for it (`None`: the server-wide cap, if any, applies).
+async fn stored_and_quota(conn: &mut sqlx::AnyConnection, space: SpaceId) -> Result<(u64, Option<u64>), MetaError> {
+    let row = sqlx::query("SELECT stored_bytes, quota_bytes FROM spaces WHERE id = $1")
+        .bind(uuid_bytes(space.as_uuid()))
+        .fetch_optional(&mut *conn)
+        .await?;
     let row = row.ok_or(MetaError::NotFound("space"))?;
-    to_u64(row.try_get("stored_bytes")?)
+    let quota: Option<i64> = row.try_get("quota_bytes")?;
+    Ok((to_u64(row.try_get("stored_bytes")?)?, quota.map(to_u64).transpose()?))
 }
 
 /// The file size recorded for a manifest this space has, if it has it.
@@ -157,19 +167,20 @@ impl Meta {
         stored_bytes(&mut conn, space).await
     }
 
-    /// Whether `space` has room for a blob of `stored_size` bytes under the cap ([`Meta::with_stored_bytes_cap`]):
+    /// Whether `space` has room for a blob of `stored_size` bytes under its limit: the quota an admin set for the
+    /// space, else the cap ([`Meta::with_stored_bytes_cap`]), else none (so a quota holds without a cap):
     /// `QuotaExceeded` if it doesn't have the blob yet and taking it would go over. A cheap look before the bytes are
     /// stored, so a space over its cap can't fill the disk with blobs that are then refused; recording the blob
     /// checks again, under the write lock. Two uploads under the cap can both pass this look and one then be refused
     /// after its bytes are stored: at most a few unrecorded blobs per account (bounded by its body slots), which GC
     /// (M4) sweeps.
     pub async fn check_room(&self, space: SpaceId, kind: BlobKind, id: &[u8; 32], stored_size: u64) -> Result<(), MetaError> {
-        let Some(limit) = self.stored_cap else { return Ok(()) };
         let mut conn = self.pool.acquire().await?;
+        let (used, quota) = stored_and_quota(&mut conn, space).await?;
+        let Some(limit) = quota.or(self.stored_cap) else { return Ok(()) };
         if space_has(&mut conn, space, kind, id).await? {
             return Ok(());
         }
-        let used = stored_bytes(&mut conn, space).await?;
         if used.saturating_add(stored_size) > limit { Err(MetaError::QuotaExceeded { used, limit }) } else { Ok(()) }
     }
 

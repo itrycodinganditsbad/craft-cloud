@@ -1,4 +1,6 @@
-//! The HTTP API, under `/api/v1`. Everything but `info`, `auth/login` and `join` needs a device token. `GET /live`
+//! The HTTP API, under `/api/v1`. Everything but `info`, `auth/login`, `auth/login/second-factor` and `join` needs a device
+//! token. The account and its devices' routes (`account`, `account/password`, renaming and signing out devices) are in
+//! [`crate::account`], two-factor sign-in's in [`crate::two_factor`]. `GET /live`
 //! becomes the live service's WebSocket ([`crate::live`]); join codes (`pairings`, `join`, and the `/join/{code}` page
 //! outside the API) are in [`crate::join`].
 
@@ -13,7 +15,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router, middleware};
-use craft_cloud_meta::{BlobKind, DeviceAuth, valid_username};
+use craft_cloud_meta::{BlobKind, DeviceAuth, DeviceClient, DeviceRecord, NewChallenge, Origin, RevokeReason, SignIn, valid_username};
 use craft_cloud_proto::api::{
     CommitRequest, CommitResponse, DeviceInfo, InfoResponse, LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse,
     PROTOCOL_MAX, PROTOCOL_MIN, SpaceResponse, codes,
@@ -23,23 +25,28 @@ use craft_cloud_proto::{ChangeSet, ChunkId, DeviceId, Manifest, ManifestId, Node
 use craft_cloud_store::{BlobKey, StoreError};
 use serde::Deserialize;
 
+use crate::account;
+use crate::audit;
 use crate::auth::{new_token, require_device, verify_password};
 use crate::error::ApiError;
 use crate::join;
 use crate::ratelimit::{client_ip, ip_key};
 use crate::state::AppState;
+use crate::two_factor;
 
 /// Chunker parameter sets the server accepts.
 pub const CHUNKER_PARAMS: &[&str] = &["fastcdc-v1"];
 /// Login attempts per account and per client address in five minutes.
-const LOGINS_PER_USER: u32 = 10;
-const LOGINS_PER_IP: u32 = 30;
+pub(crate) const LOGINS_PER_USER: u32 = 10;
+pub(crate) const LOGINS_PER_IP: u32 = 30;
 /// Longest change-feed long-poll.
 const MAX_WAIT_SECS: u64 = 60;
 /// `Retry-After` for a refused long-poll.
 const WAITERS_RETRY_SECS: u32 = 5;
 /// Small JSON bodies (login, join and missing-chunk queries).
 pub(crate) const SMALL_JSON_BYTES: usize = 1024 * 1024;
+/// Tiny JSON bodies (a password change, a device's new name): a few short strings, so far less than a small body.
+pub(crate) const TINY_JSON_BYTES: usize = 4 * 1024;
 /// `Retry-After` for a sign-in refused because every password check slot is busy.
 pub(crate) const PASSWORD_RETRY_SECS: u32 = 1;
 
@@ -47,8 +54,17 @@ type Shared = Arc<AppState>;
 
 pub fn router(state: Shared) -> Router {
     let signed_in = Router::new()
+        .route("/account", get(account::get_account))
+        .route("/account/password", post(account::change_password).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route("/account/activity", get(audit::account_activity))
+        .route("/account/two-factor", get(two_factor::get_status))
+        .route("/account/two-factor/setup", post(two_factor::setup).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route("/account/two-factor/confirm", post(two_factor::confirm).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route("/account/two-factor/disable", post(two_factor::disable).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route("/account/two-factor/recovery-codes", post(two_factor::recovery_codes).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/devices", get(list_devices))
-        .route("/devices/{id}", delete(revoke_device))
+        .route("/devices/revoke-others", post(account::revoke_others))
+        .route("/devices/{id}", delete(revoke_device).patch(account::rename_device).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/pairings", post(join::create_pairing))
         .route("/pairings/{id}", get(join::pairing_status).delete(join::delete_pairing))
         .route("/chunks/missing", post(missing_chunks).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
@@ -60,10 +76,14 @@ pub fn router(state: Shared) -> Router {
         .route("/tree", get(tree))
         .route("/changes", get(changes))
         .route("/live", get(crate::live::connect))
+        // The admin routes carry `require_admin` themselves; `require_device` below wraps them too and runs first.
+        .merge(crate::admin::routes())
+        .merge(audit::admin_routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_device));
     let public = Router::new()
         .route("/info", get(info))
         .route("/auth/login", post(login).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
+        .route("/auth/login/second-factor", post(two_factor::second_factor).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/join", post(join::join).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)));
     Router::new()
         .nest("/api/v1", public.merge(signed_in))
@@ -109,6 +129,7 @@ async fn login(
         return Err(ApiError::invalid("usernames are 1-64 letters, digits, '.', '_' or '-'"));
     }
     check_device_name(&req.device_name)?;
+    let client = device_client(req.client_kind.as_deref(), req.platform.as_deref(), req.app_version.as_deref())?;
     // tokio's clock: the system's monotonic clock in the server, the simulated one in a simulation.
     let now = tokio::time::Instant::now().into_std();
     let ip = client_ip(peer, &headers, &state.trusted_proxies);
@@ -131,6 +152,7 @@ async fn login(
         return Err(ApiError::invalid("passwords are at most 1024 bytes"));
     }
     let user = state.meta.user_by_name(&username).await?;
+    let known = user.as_ref().map(|u| u.id);
     let hash = user.as_ref().map_or(state.dummy_hash.as_str(), |u| u.password_hash.as_str()).to_owned();
     let password = req.password.clone();
     let ok = tokio::task::spawn_blocking(move || {
@@ -143,10 +165,28 @@ async fn login(
         ApiError::internal()
     })?;
     let (Some(user), true) = (user, ok) else {
+        // Written after the answer is decided and in a transaction of its own: a log that cannot be written changes
+        // neither the answer nor the limits above. A name no account has is never put in the log.
+        audit::login_failed(&state, known).await;
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED, "wrong username or password"));
     };
     let (token, token_hash) = new_token()?;
-    let device = state.meta.create_device(user.id, &req.device_name, &token_hash, state.now_ms()).await?;
+    // A challenge is made only if the account needs a second factor; the token the client gets for it is a secret of its own.
+    let (challenge_token, challenge_hash) = new_token()?;
+    let challenge = NewChallenge { id_hash: challenge_hash, client_key: ip_key(ip) };
+    // Created only if the password just checked is still the account's: one changed meanwhile (and the devices
+    // signed out with it) must not be followed by a device that the old password let in. Answered as a wrong password. The
+    // account's two-factor state is read under the same lock: with it on, there is a challenge and no device.
+    let signed_in =
+        state.meta.sign_in(user.id, (&user.password_hash, user.auth_gen), &req.device_name, &client, &token_hash, &challenge, state.now_ms()).await?;
+    let device = match signed_in {
+        None => return Err(ApiError::new(StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED, "wrong username or password")),
+        Some(SignIn::Device(device)) => device,
+        Some(SignIn::Challenge { expires_ms }) => {
+            tracing::info!("sign-in needs a second factor");
+            return Err(ApiError::two_factor_required(challenge_token, expires_ms));
+        }
+    };
     // The username is the only personal identifier the server could log here: kept to debug.
     tracing::debug!(user = %user.username, "sign-in");
     tracing::info!(%device, "device signed in");
@@ -162,6 +202,29 @@ pub(crate) fn check_device_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// The client fields of a sign-in or join, checked before anything is counted: an unknown `client_kind`, a field over
+/// 32 bytes or a control character is `400 invalid`. The fields are only shown in the device list.
+pub(crate) fn device_client(kind: Option<&str>, platform: Option<&str>, app_version: Option<&str>) -> Result<DeviceClient, ApiError> {
+    Ok(DeviceClient::new(kind, platform, app_version)?)
+}
+
+/// A device as the API shows it; `current` is the device making the request.
+pub(crate) fn device_info(d: DeviceRecord, current: DeviceId) -> DeviceInfo {
+    DeviceInfo {
+        current: d.id == current,
+        id: d.id,
+        name: d.name,
+        created_ms: d.created_ms,
+        last_used_ms: d.last_used_ms,
+        revoked: d.revoked,
+        client_kind: d.client.kind,
+        platform: d.client.platform,
+        app_version: d.client.app_version,
+        revoked_ms: d.revoked_ms,
+        revoke_reason: d.revoke_reason.map(|r| r.as_str().to_owned()),
+    }
+}
+
 async fn space(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>) -> Result<Json<SpaceResponse>, ApiError> {
     let info = state.meta.space_info(auth.space).await?;
     Ok(Json(SpaceResponse { space: auth.space, root: info.root, epoch: info.epoch, seq: info.seq, username: auth.username }))
@@ -169,19 +232,7 @@ async fn space(State(state): State<Shared>, Extension(auth): Extension<DeviceAut
 
 async fn list_devices(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>) -> Result<Json<Vec<DeviceInfo>>, ApiError> {
     let devices = state.meta.list_devices(auth.user).await?;
-    Ok(Json(
-        devices
-            .into_iter()
-            .map(|d| DeviceInfo {
-                current: d.id == auth.device,
-                id: d.id,
-                name: d.name,
-                created_ms: d.created_ms,
-                last_used_ms: d.last_used_ms,
-                revoked: d.revoked,
-            })
-            .collect(),
-    ))
+    Ok(Json(devices.into_iter().map(|d| device_info(d, auth.device)).collect()))
 }
 
 async fn revoke_device(
@@ -190,7 +241,7 @@ async fn revoke_device(
     id: Result<Path<DeviceId>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
     let Path(id) = id?;
-    state.meta.revoke_device(auth.user, id).await?;
+    state.meta.revoke_device_by(auth.user, id, RevokeReason::User, Origin::Device(auth.device), state.now_ms()).await?;
     // Its live connections end now, not at their next request.
     state.live.revoke(id);
     Ok(StatusCode::NO_CONTENT)
@@ -252,7 +303,7 @@ pub(crate) async fn read_json<T: serde::de::DeserializeOwned>(state: &AppState, 
     }
 }
 
-fn body_too_slow() -> ApiError {
+pub(crate) fn body_too_slow() -> ApiError {
     ApiError::new(StatusCode::REQUEST_TIMEOUT, codes::TIMEOUT, "the request body took too long to arrive")
 }
 
@@ -409,6 +460,19 @@ async fn tree(
     Ok(Json(state.meta.tree(auth.space, cursor(q.after_seq, q.after_node)?, q.limit.unwrap_or(MAX_PAGE_NODES)).await?))
 }
 
+/// Resolves when `device` is revoked (or some revocations were missed, so that it must be looked up).
+async fn revoked(revocations: &mut tokio::sync::broadcast::Receiver<DeviceId>, device: DeviceId) {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match revocations.recv().await {
+            Ok(revoked) if revoked == device => return,
+            Ok(_) => {}
+            Err(RecvError::Lagged(_)) => return,
+            Err(RecvError::Closed) => std::future::pending::<()>().await,
+        }
+    }
+}
+
 // The paging fields are written out here rather than flattened from `PageQuery`: serde's `flatten` buffers
 // values as strings, so numbers in a query string would never parse.
 #[derive(Debug, Deserialize)]
@@ -441,14 +505,29 @@ async fn changes(
         // Subscribe before reading the sequence number, so a commit in between still wakes us.
         let mut updates = state.notifier.subscribe(auth.space);
         let mut stopping = state.notifier.shutdown_signal();
+        // Listening for revocations first, then looking the device up: a revoke before the lookup is seen by it, one
+        // after it ends the wait, so none is missed between the sign-in check and the wait.
+        let mut revocations = state.live.revocations();
+        if !state.meta.device_active(auth.device).await? {
+            return Err(ApiError::unauthorized());
+        }
         if state.meta.space_info(auth.space).await?.seq == q.since {
             let deadline = Duration::from_secs(q.wait.min(MAX_WAIT_SECS));
-            // Whichever comes first: a commit, the deadline, or the server shutting down.
+            // Whichever comes first: a commit, the deadline, the server shutting down, or this device signed out.
             tokio::select! {
                 _ = tokio::time::timeout(deadline, updates.wait_for(|seq| *seq > q.since)) => {}
                 _ = stopping.wait_for(|stop| *stop) => {}
+                () = revoked(&mut revocations, auth.device) => {}
             }
         }
     }
-    Ok(Json(state.meta.changes(auth.space, q.since, cursor, q.limit.unwrap_or(MAX_PAGE_NODES)).await?))
+    let changes = state.meta.changes(auth.space, q.since, cursor, q.limit.unwrap_or(MAX_PAGE_NODES)).await?;
+    // A long-poll looks the device up once more after the fetch, the last thing before the answer: a device signed
+    // out while it waited or while the change set was read (by the API, or by the command line in another process,
+    // which wakes nothing) gets no change feed. A revoke that commits after this lookup is a sign-out that happened
+    // after the answer was decided.
+    if slot.is_some() && !state.meta.device_active(auth.device).await? {
+        return Err(ApiError::unauthorized());
+    }
+    Ok(Json(changes))
 }
