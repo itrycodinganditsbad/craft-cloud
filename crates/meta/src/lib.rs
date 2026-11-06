@@ -10,9 +10,12 @@
 mod blobs;
 mod codec;
 mod commit;
+mod history;
+mod index;
 mod join;
 mod live;
 mod schema;
+mod trash;
 mod tree;
 mod users;
 
@@ -24,13 +27,16 @@ use sqlx::any::{AnyConnectOptions, AnyPoolOptions};
 use sqlx::{AnyPool, ConnectOptions};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-pub use commit::CommitOutcome;
+pub use commit::{CommitOutcome, RestoreOutcome, TrashRestoreOutcome};
 pub use craft_cloud_proto::BlobKind;
+pub use history::HistoryPage;
+pub use index::{BlobRecord, EdgeCheck, EdgeProblem, EdgeProblemKind, Finding, INDEX_BATCH_ROWS, IndexAudit, IndexState, Validation};
 pub use join::{InviteFor, Redeemed};
 pub use live::{
     Appended, DEFAULT_LIVE_BYTES_PER_SPACE, LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE, MAX_LIVE_DOCS_PER_SPACE,
     MAX_LIVE_DOCUMENTS_HOLDING_UPDATES, MAX_LIVE_DOCUMENTS_PER_SPACE, MAX_LIVE_PAGE, SnapshotRef,
 };
+pub use trash::{TrashEntry, TrashPage};
 pub use tree::{MAX_PAGE_SAVE_BYTES, SpaceInfo};
 pub use users::{DeviceAuth, DeviceRecord, Role, UserId, UserRecord, valid_username};
 
@@ -81,10 +87,19 @@ pub enum MetaError {
     Invalid(&'static str),
     #[error("stored data is damaged: {0}")]
     Corrupt(&'static str),
+    /// A database that was to exist already ([`Meta::open_existing`]) is not there or not ready; nothing was created.
+    #[error("{0}")]
+    Missing(&'static str),
 }
 
 /// How long a SQLite connection waits for a lock another connection or program holds before giving up.
 pub const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The most deleted items below one folder that restoring or removing the folder from the trash takes with it in one
+/// call, shallowest first. What is beyond stays in the trash and, once its folder is live or removed from the trash,
+/// appears in the trash list on its own, to be restored or removed by a further call. The bound keeps the work done
+/// under the space's write lock by one call small.
+pub const MAX_TRASH_TREE_NODES: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dialect {
@@ -113,12 +128,34 @@ pub struct Meta {
     live_held_documents_cap: u64,
     /// The most bytes all of one space's live documents may hold ([`Meta::with_live_bytes_cap`]).
     live_bytes_cap: u64,
+    /// Edges of the reference index one transaction writes ([`Meta::with_index_batch_rows`]).
+    index_rows: usize,
+    /// The most deleted items below one folder that restoring or removing the folder from the trash takes with it
+    /// ([`Meta::with_trash_tree_cap`]).
+    trash_tree_cap: u64,
 }
 
 impl Meta {
     /// Connects and brings the schema up to date. `url` is `sqlite:path/to/meta.db` (created if missing),
     /// `sqlite::memory:`, or `postgres://user:pass@host/db`.
     pub async fn open(url: &str) -> Result<Self, MetaError> {
+        Self::start(url, false).await
+    }
+
+    /// Connects to a database that already exists and creates nothing: a SQLite file that is not there is an error
+    /// (`mode=ro`, whatever options the URL had), not a new empty database, and a database whose schema is not the
+    /// current one is refused, not upgraded. For a command that only reads, so that a wrong path is reported instead of
+    /// being taken for an empty database that has no problems. `sqlite::memory:` has nothing to exist.
+    ///
+    /// A read-only SQLite connection never writes the database file or the WAL, and cannot checkpoint: closing the last
+    /// connection of a read-write one checkpoints the WAL of a crashed process into the database file and removes it,
+    /// which is a write a read-only command must not make. It still reads the WAL's committed data. Opening may leave
+    /// an empty `-wal` and a `-shm` file (SQLite's rebuilt index of the WAL, no data) when there were none.
+    pub async fn open_existing(url: &str) -> Result<Self, MetaError> {
+        Self::start(url, true).await
+    }
+
+    async fn start(url: &str, existing: bool) -> Result<Self, MetaError> {
         sqlx::any::install_default_drivers();
         let dialect = if url.starts_with("sqlite:") {
             Dialect::Sqlite
@@ -128,6 +165,8 @@ impl Meta {
             return Err(MetaError::UnsupportedUrl);
         };
         let url = match dialect {
+            Dialect::Sqlite if existing && url.contains(":memory:") => return Err(MetaError::Missing("an in-memory database has no existing data")),
+            Dialect::Sqlite if existing => format!("{}?mode=ro", url.split_once('?').map_or(url, |(path, _)| path)),
             Dialect::Sqlite if !url.contains('?') && !url.contains(":memory:") => format!("{url}?mode=rwc"),
             _ => url.to_owned(),
         };
@@ -154,10 +193,14 @@ impl Meta {
             Dialect::Postgres => pool_options,
         };
         let pool = pool_options.connect_with(options).await?;
-        if dialect == Dialect::Sqlite && !url.contains(":memory:") {
-            sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
+        if existing {
+            schema::check_current(&pool, dialect).await?;
+        } else {
+            if dialect == Dialect::Sqlite && !url.contains(":memory:") {
+                sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
+            }
+            schema::migrate(&pool, dialect).await?;
         }
-        schema::migrate(&pool, dialect).await?;
         Ok(Self {
             pool,
             dialect,
@@ -169,7 +212,16 @@ impl Meta {
             live_documents_cap: MAX_LIVE_DOCUMENTS_PER_SPACE,
             live_held_documents_cap: MAX_LIVE_DOCUMENTS_HOLDING_UPDATES,
             live_bytes_cap: DEFAULT_LIVE_BYTES_PER_SPACE,
+            index_rows: INDEX_BATCH_ROWS,
+            trash_tree_cap: MAX_TRASH_TREE_NODES,
         })
+    }
+
+    /// The store with another cap on the deleted items below one folder that restoring or removing the folder from the
+    /// trash takes with it in one call (the default is [`MAX_TRASH_TREE_NODES`]); the rest stays in the trash. For tests.
+    pub fn with_trash_tree_cap(mut self, cap: u64) -> Self {
+        self.trash_tree_cap = cap;
+        self
     }
 
     /// The store with another cap on the bytes of updates one live document's log may hold (the default is
