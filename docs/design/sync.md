@@ -655,11 +655,122 @@ methods answer `not_found` / `invalid` (405) the same way:
 | `PUT /chunks/{id}` / `GET /chunks/{id}` | one chunk, max 4 MiB, checked by the server; you can only download chunks your space uploaded |
 | `PUT /manifests/{id}` / `GET /manifests/{id}` | one manifest (binary); the server checks the ID, the limits and that every chunk is present |
 | `POST /commit` | batch of version/mkdir/move/delete operations, one transaction; `409 conflict` listing every conflicting operation (a version whose manifest isn't uploaded is a `missing_manifest` conflict) |
-| `GET /nodes/{id}/history` / `POST /nodes/{id}/restore` | list versions / make an old one current (M4) |
+| `GET /nodes/{id}/history?cursor=…&limit=…` | the versions of one file of your space, newest first by `(seq, id)`, in pages (default 50, at most 200): `{versions: [{id, parent_version, epoch, seq, size, mtime_ms, device, created_ms, save, pruned}], next?}`; `next` is an opaque cursor for the next page; a folder is `invalid`, another account's or an unknown node `not_found`; a deleted file keeps its history |
+| `POST /nodes/{id}/restore` | `{version, expected_version}` → `{version, parent_version, seq, epoch}`: makes an old version's content the file's content again as a new version (see below); `409 conflict` when `expected_version` is not the current version |
+| `GET /trash?cursor=…&limit=…` | the deleted nodes of your space that were not removed from the trash and whose folder is not in the trash itself (those are listed through the folder), newest deletion first by `(deleted_ms, id)`, in pages (default 50, at most 200): `{items: [{id, parent, name, is_dir, size?, deleted_ms, purge_after_ms}], next?}`; `purge_after_ms` is `deleted_ms` plus `[retention] trash_days` |
+| `POST /trash/{id}/restore` | brings a node of the trash back, with its deleted folders and, for a folder, all that is in the trash below it, as one change: `{node, parent, name, renamed, version?, seq, epoch}` (a restored file has a new version); a taken name gets a conflict name (see below), a node that is not in the trash is `not_found` |
+| `DELETE /trash/{id}` | takes a node out of the trash (204), and, for a folder, all that is in the trash below it: only marks them for removal, nothing is freed yet; up to 10,000 items below a folder at once, shallowest first; the rest is then listed and goes by a further call |
 | `GET /devices`, `DELETE /devices/{id}` | your devices |
 | `POST /pairings` | a new add-a-computer code from this device → `{id, code, expires_ms}` (the code shown once, normalised) |
 | `GET /pairings/{id}`, `DELETE /pairings/{id}` | one of your pairings: `{state: waiting\|used\|expired, device_name?}` / cancel it (204) |
 | `POST /join` | code + device name (+ password for an invite to a new account) → device ID + token, as a sign-in (no auth); `invalid_code`, `password_required`, `weak_password`, `rate_limited` |
+
+**History and restore.** Versions are never removed today, so the history lists every version of a file, and `pruned`
+is always `false`: the field is in the contract for the day versions can be thinned (a thinned version will stay
+in the list with `pruned: true`, its metadata intact, and can't be restored). A restore is an ordinary `update` made
+by the server: it checks, under the same lock as a commit, that the node is a file of the caller's space that is not
+deleted and has no live document, that `version` is a version of this node, that its manifest is still in the space,
+and that `expected_version` is still the file's current version; then it records a new version with a fresh ID whose
+parent is the current version, with the manifest, modification time and executable bit of the old one, at the space's
+next sequence number. The epoch does not change (only `reset-epoch` and backup restores do that), the change feed
+reports the file like any other update, and a restore needs no quota because the manifest is already the space's.
+The new version carries **no save record**: a save record names a state of a live document, and a restore
+copies none and invents none. A restore is an ordinary new version, so agents take it in under the normal rules,
+including the conflict rules for a machine with unsynced edits of its own. A file that has a live document is
+refused, so file versions and live-document state stay separate. Unknown node, foreign node, a version of
+another file and a missing manifest are all `not_found`; a deleted file, a folder and a file with a live document are
+`invalid`; a stale `expected_version` is `conflict` (409, with the conflict list as for a commit).
+
+**Trash.** The trash is the set of tombstones with the time of the deletion. `nodes.deleted_ms` is set when a node goes
+from live to deleted (not when a deleted node is deleted again) and cleared when it comes back, by an edit or by a restore
+from the trash, so the next deletion starts its time afresh; `nodes.purge_requested_ms` is set by `DELETE /trash/{id}`
+and cleared when the node comes back. Nodes deleted before the migration that added them are dated at the migration. A
+deleted node without a time (damaged data) is dated at the next read of the trash, logged without names, and never
+counts as expired. `DELETE /trash/{id}` frees nothing: versions, manifests, chunks and the tombstone stay, the change feed
+and the sequence number do not change, and the node's history stays readable; the node only leaves the trash list and can
+no longer be restored from it. (An edit that brings it back still wins, as for any deleted file.) Asking twice is fine.
+A node is *in the trash* when it is deleted and not marked by `purge_requested_ms`. The list shows a node only if its
+parent is not in the trash, so a deleted folder stands for everything below it. (A folder can only be deleted once it is
+empty, so what is below it was deleted before it, in the same change or earlier; the rule does not depend on the times.)
+A restore from the trash brings back the node asked for and the deleted folders above it, root-most first, keeping their
+IDs; for a folder it also brings back every node below it that is in the trash, recursively, whenever it was deleted
+(a file deleted on its own earlier inside the folder comes back with it); a node marked for removal, and what hangs
+only from it, stays deleted. Each of them is revived like a single restore (new version for a file, `deleted_ms` and
+the mark cleared, `changed_seq` set); a node below the folder keeps its name, except that of two deleted nodes of one
+name in one folder the one deleted last keeps it and the other gets a conflict name. A removal of a folder marks
+everything in the trash below it the same way. Both take at most 10,000 nodes below the folder per call, in the order
+depth, then newest deletion first, then ID, so a node never comes back or is marked without its folder; there is no error
+for more. What is beyond has its folder live (restore) or marked (removal), or hangs under a folder that does, so it is
+listed on its own and a further call takes it, bounded the same way. A restore also makes the per-row work under the write
+lock at most that many nodes. It creates no node and overwrites none. Under one write lock and in one transaction, with one sequence number:
+where a deleted folder's name is held by a live folder, that folder is used and what is below moves into it (the deleted
+folder stays deleted); where it is held by a file, or where the node's own name is held by anything, the node comes back
+as `name (conflict, <device>, <UTC date and minute>)` like the engine's conflict copies, with `, 2` to `, 100` if that is
+taken too, and a restore with no free name is `conflict` and changes nothing. A restored *file* gets a **new version**: a copy of its last one (the same manifest, modification time and
+executable bit, no save record), after it, in the same change. A machine that deleted the file, whose answer it never
+heard (the server applied the delete), still names the old version in its delete; after a restore the server refuses
+that delete as a version mismatch, and the engine, which already treats a node that came back at another version as one
+whose delete went through, lets the node go and downloads the restored file as a new one. Without this the machine would
+send the delete again and delete the restored file. A folder has no version, so a deleted folder that was brought back
+looks the same as one that was never deleted; the engine therefore remembers the folder deletes it sent without hearing
+the answer (`State::sent_dir_deletes`) and, when the next pull reports such a folder changed and live, lets it go instead
+of deleting it again (a folder the feed does not mention was never touched, and its delete is sent again). A restore is
+otherwise an ordinary change to live nodes, possibly with a new parent or name. Older agents lack the folder rule: with
+one, a folder restored in the short window after a delete whose answer was lost can be deleted a second time (the folder
+is empty and can be restored again), so update agents with or soon after the server. Restoring a *version* of a deleted file is still refused: bring the file back
+from the trash first.
+
+**Reference index and `verify`.** The chunks a manifest names live in its object in the store. `manifest_chunks`
+(manifest, ordinal, chunk) is a copy of that list in the database, and `manifest_index` records per manifest how many
+chunks it names, how many edges are written (ordinals 0 up to that number, never a gap) and whether the list was
+compared with the manifest (state 1) or is still being built (state 0). A manifest with no row is not indexed. The index
+is derived data and is never the authority; it exists so the database can answer "which chunks does this manifest need" and
+"which manifests use this chunk". It is written in the transaction that records a manifest (`add_manifest`), up to a budget
+of 5,000 edges per transaction; a longer manifest (up to about a million chunks) is left being built, and the upload
+handler finishes it in batches of at most that many edges before it answers, so no write lock is held for a long list.
+`craft-cloud-server index build` indexes manifests recorded before the index existed (and any left unfinished), reading
+each from the store and checking it against its ID first; it resumes where it stopped and may run beside the server.
+A manifest is marked complete only after every edge was compared, ordinal by ordinal, with the manifest it was made from:
+equal counts are not enough, and repeated chunks, wrong IDs, swapped order, missing and extra edges are all found. An
+index that does not match its manifest while it is still being built is thrown away and written again; a complete index
+that is wrong is only reported. Throwing the edges away is itself done in batches of the same size (a marker on the index row says it is under way, so an interrupted run resumes), never in one transaction; an edge at a negative ordinal is a mismatch like any other. Nothing in this slice frees anything: no deletion, no claims, no collection, no retention.
+
+`craft-cloud-server verify [--json] [--skip-chunk-reads]` reads and reports and changes nothing: the database and the
+storage directory must exist already (a wrong path is an error, not a new empty server with "no problems found"), and a
+database whose schema is older than the program is refused, not upgraded (start the server once to upgrade it). A SQLite database is opened read-only (`Meta::open_existing`, `mode=ro`): the database file and the WAL keep their bytes, also when a crashed process left committed data in the WAL, which the command reads; it may leave an empty `-wal` and a `-shm` file (the rebuilt index of the WAL, not data). It lists
+problems (which make it exit with an error): a manifest
+object that is missing, damaged or not a manifest; a complete index that does not equal its manifest; edges whose manifest
+has no index row; an index row without a recorded manifest; an edge or a manifest that names a chunk that is not recorded;
+a chunk object that is missing or damaged; a size the database records that is not what the object has (the stored length of a chunk or manifest object, a chunk length the manifest names against the length recorded for that chunk, the file size recorded for a manifest); a version, snapshot or import snapshot that names a manifest that is not
+recorded; blob memberships without a blob. It also gives notices (which do not): manifests whose index is not complete,
+manifests no version or snapshot names, and chunks no complete manifest names. **The manifests no version or snapshot
+names are not garbage.** A live document's binary assets (images and the like, uploaded through the agent's blob
+interface as a manifest of their own) are named only by the document's state, which the server stores as opaque bytes, so
+the database holds no reference to them. Until that gap is closed (the owner decides how assets are rooted), anything that
+frees storage has to treat these manifests, and the chunks they name, as in use.
+
+**GC inventory and dry run.** `craft-cloud-server gc --dry-run [--json] --config <path>` lists each store namespace in
+pages of at most 1,000 objects and checks each page against `blobs` in one batched query. It reports recorded objects,
+orphans (store objects without a `blobs` row), and foreign keys (invalid names for that namespace). Listing errors name
+the namespace and page; they are errors, never an empty inventory. Orphans are only candidates after a first-sight grace
+period, which cannot be measured without recording state; a future collector would need two runs apart. Their size comes
+from a metadata-only stored-size read because `Store::list` does not include sizes.
+
+Recorded chunks no complete-indexed manifest names are candidates only when all indexes are complete and database checks
+report no problems. `Meta::index_audit` reads chunk rows, index states and roots under one read snapshot (Postgres uses
+`REPEATABLE READ READ ONLY`); the store listing is a separate time-point diagnostic. These content-addressed objects
+are immutable. A future collector must recheck roots before claiming because a reference can be added after this
+snapshot. Summary equality across separate audits is not a concurrency guarantee: compensating writes can preserve
+counts and examples. Incomplete indexes protect unknown dependencies. Existing reference roots are versions
+(including saved versions and trash history), live snapshots and import snapshots, as queried by `Meta::index_audit` in
+`crates/meta/src/index.rs`; this command adds no root kinds. Manifests with no version or snapshot root are never
+candidates: they are `protected: may be a live document's asset`. Chunk roots that a complete index reports as used stay
+protected. A dry run writes no rows, claims, inventory, generation, run record, store object or config. It prints
+`nothing was changed`. On SQLite the command follows the rule of `verify`: it opens the existing database, may leave an
+empty `-wal` and a `-shm` file (the WAL's rebuilt shared-memory index, not data), and changes neither the database file
+nor the WAL's bytes, which its tests compare, with a crashed process's non-empty WAL too. On PostgreSQL the tests compare a
+fingerprint of every table and the sequences. Both compare the whole store tree. Grace-period measurement, claims and
+deletion belong to a later owner-approved slice.
 
 **Client contract** (what the sync agent relies on):
 
@@ -1061,7 +1172,7 @@ M3b2 is split in two. **M3b2a** hardens the engine and the real disk; **M3b2b** 
 | M3b2b1 | Agent on its own: seed 112337, `run` loop, watcher, long-poll, stability window, backoff, status file | DONE (2026-10-14) |
 | M3b2b2 | Simulated network (`turmoil`): partitions, delays, dropped connections | DONE (2026-10-15) |
 | M3c | Fixes from the full repo review | DONE (2026-10-15) |
-| M4 | History, restore, trash, thinning, GC (including the chunks of uploads the stored-bytes cap refused), logical quotas, admin CLI (`user remove\|quota`, `gc`, `verify`), backup/restore | TODO |
+| M4 | History, restore, trash, thinning, GC (including the chunks of uploads the stored-bytes cap refused), logical quotas, admin CLI (`user remove\|quota`, `gc`, `verify`), backup/restore | IN PROGRESS: history and restore of file versions, and the trash (list, restore, mark for removal), done (server API only); the rest TODO |
 | M5 | Selective sync, large-media polish (a few chunks in flight at once), ignore rules | TODO |
 | M6 | Packaging: binaries, Docker, systemd, built-in TLS, self-hosting guide | TODO |
 | M7 | Local control API + launcher integration PR | TODO |

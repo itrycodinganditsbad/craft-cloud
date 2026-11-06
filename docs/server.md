@@ -55,6 +55,65 @@ invite replaces the old one, and `user invite --revoke name` ends it. Every late
 that is signed in (`craft-cloud-agent add-computer`, see [`agent.md`](agent.md)). Codes that don't work are refused alike (wrong,
 expired or used), and an address that tries ten in a minute is held off for the rest of it.
 
+## Version history
+
+The server keeps every version of every file; nothing is thinned or removed yet. A signed-in device can list a file's
+versions (`GET /api/v1/nodes/{id}/history`) and make an old one current again (`POST /api/v1/nodes/{id}/restore`),
+which adds a new version at the end of the file's history rather than rewinding it, so other computers pick it up
+through the normal change feed. This needs no setting and no database migration, and an older server answers
+`not_found` for both paths. The agent and the apps do not use them yet.
+
+## The trash
+
+A deleted file or folder stays in the trash, and in the server's records, until it is removed for good. A signed-in
+device lists the trash (`GET /api/v1/trash`), brings a node back (`POST /api/v1/trash/{id}/restore`, which names it
+differently if its name has been taken meanwhile) or takes it out of the trash (`DELETE /api/v1/trash/{id}`). Taking
+it out only marks it: **nothing is deleted from the server yet**, no version or chunk is freed, and the node can't be
+brought back from the trash afterwards. A folder in the trash is listed alone: everything that is in the trash below it
+(deleted and not removed from the trash) comes back with it when you bring the folder back, and goes with it when you
+take the folder out, **also a file that was deleted on its own, earlier, inside that folder**. Those items are listed
+only through the folder. A folder brings back, or takes out, up to 10,000 items below it at once, the shallowest first; if
+there are more, the rest then appears in the trash list on its own (its folder is live again or out of the trash), and
+you bring it back or remove it by a further call. The only setting is the number of days a deleted node waits, shown to clients as
+`purge_after_ms`; it removes nothing yet:
+
+```toml
+[retention]
+trash_days = 30   # 1 to 3650
+```
+
+A file brought back gets a new version with its old content, so another computer's delete that was sent just before can't delete it again. Update the agents with or soon after the server: an older agent can delete a *folder* a second time if that folder was brought back right after a delete whose answer it never heard (the folder is empty and can be brought back again).
+
+The change adds two columns and an index to the metadata (migration 0009 in the proposal). An older server refuses the
+upgraded database and rejects the `[retention]` section, so take a backup before upgrading and do not roll back.
+
+## Checking the storage
+
+`craft-cloud-server verify --config cc-data/config.toml` checks the database and the blob storage against each other
+and prints what it finds; `--json` prints a machine-readable report and `--skip-chunk-reads` skips reading every chunk
+object (which hashes it, and takes as long as reading all your data). It changes nothing and exits with an error if
+it found a problem. It opens a SQLite database read-only: the database file and its WAL keep their bytes, also after a
+crash that left committed data in the WAL, which it reads. Opening may leave an empty `-wal` and a `-shm` file behind
+(SQLite's rebuilt index of the WAL, not data). The report also says how many manifests have a complete reference index, which is what a later
+cleanup would need before it could free anything. After upgrading, run `craft-cloud-server index build --config
+cc-data/config.toml` once: it indexes the manifests stored before the index existed, writing only that index, in small
+steps, and it can be stopped and run again. Nothing in the server frees storage yet.
+
+The change adds two tables to the metadata (migration 0010 in the proposal). An older server refuses the upgraded database,
+so take a backup before upgrading and do not roll back.
+
+`craft-cloud-server gc --dry-run --config cc-data/config.toml` inventories stored chunks and manifests, compares them with
+the database and prints a preview; `--json` prints schema version 1. It changes no data, on SQLite or on PostgreSQL.
+Like `verify`, it opens a SQLite database that exists already and creates nothing; opening a WAL-mode database may leave
+an empty `-wal` file and a `-shm` file behind (SQLite's rebuilt index of the WAL, not data), and the database file and
+the WAL's contents stay as they were, also after a crash that left data in the WAL. Store objects with no `blobs` row are orphan candidates, but need two runs apart to establish a future
+first-sight grace period. Recorded chunks no complete indexed manifest names are candidates only when every manifest index
+is complete and database checks pass. They come from one read-only database snapshot; the store listing is a separate,
+time-point diagnostic. A future collector must recheck roots before claiming a chunk. Current versions, saved versions,
+trash items, live snapshots and import snapshots protect their chunks. Unrooted manifests are protected because they may be live document assets. Without
+`--dry-run`, the command refuses: deleting is not implemented yet. Listing errors fail the command; they do not mean the
+store is empty. Nothing is deleted.
+
 ## Restoring a backup
 
 With the server stopped, restore the database and the chunk storage from the backup, then run
