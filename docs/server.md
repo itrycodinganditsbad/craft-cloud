@@ -77,8 +77,9 @@ it out only marks it: **nothing is deleted from the server yet**, no version or 
 brought back from the trash afterwards. A folder in the trash is listed alone: everything that is in the trash below it
 (deleted and not removed from the trash) comes back with it when you bring the folder back, and goes with it when you
 take the folder out, **also a file that was deleted on its own, earlier, inside that folder**. Those items are listed
-only through the folder. A folder with more than 10,000 such items below it is refused (`invalid`) for both, and nothing
-changes; bring back or remove the folders inside it first. The only setting is the number of days a deleted node waits, shown to clients as
+only through the folder. A folder brings back, or takes out, up to 10,000 items below it at once, the shallowest first; if
+there are more, the rest then appears in the trash list on its own (its folder is live again or out of the trash), and
+you bring it back or remove it by a further call. The only setting is the number of days a deleted node waits, shown to clients as
 `purge_after_ms`; it removes nothing yet:
 
 ```toml
