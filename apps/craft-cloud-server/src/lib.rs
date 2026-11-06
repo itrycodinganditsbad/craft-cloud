@@ -12,6 +12,7 @@ pub mod live;
 pub mod notify;
 pub mod ratelimit;
 pub mod state;
+pub mod verify;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

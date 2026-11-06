@@ -33,6 +33,11 @@ full: with less than 4 MiB (one chunk) left, the agent pauses and says the accou
 A cap under 4 MiB is refused when the server starts, since not even one chunk would fit. Per-user quotas on
 file sizes come later, with history.
 
+Signed-in devices can read `GET /api/v1/account/usage` for the space's stored bytes, the configured cap, and labeled
+estimates of bytes referenced only by trash or old versions. The estimates deduplicate shared blobs per space, exclude
+live-document snapshots and unrooted app assets, and are never added to stored bytes. The history estimate treats a
+version an app saved (one with a save record) as kept. An incomplete manifest index makes both estimates `null`.
+
 Live documents have a cap of their own: `live_bytes_per_user` (in bytes; 1 GiB, `1_073_741_824`, by default) is
 the most one account's live documents (recent-file lists and documents of files) may hold together. It counts
 every update in their logs, including the ones a snapshot has replaced: those are kept until retention rules
@@ -54,6 +59,53 @@ to have the whole join string printed; without it, `invite` prints the code and 
 invite replaces the old one, and `user invite --revoke name` ends it. Every later computer joins with a code from one
 that is signed in (`craft-cloud-agent add-computer`, see [`agent.md`](agent.md)). Codes that don't work are refused alike (wrong,
 expired or used), and an address that tries ten in a minute is held off for the rest of it.
+
+## Version history
+
+The server keeps every version of every file; nothing is thinned or removed yet. A signed-in device can list a file's
+versions (`GET /api/v1/nodes/{id}/history`) and make an old one current again (`POST /api/v1/nodes/{id}/restore`),
+which adds a new version at the end of the file's history rather than rewinding it, so other computers pick it up
+through the normal change feed. This needs no setting and no database migration, and an older server answers
+`not_found` for both paths. The agent and the apps do not use them yet.
+
+## The trash
+
+A deleted file or folder stays in the trash, and in the server's records, until it is removed for good. A signed-in
+device lists the trash (`GET /api/v1/trash`), brings a node back (`POST /api/v1/trash/{id}/restore`, which names it
+differently if its name has been taken meanwhile) or takes it out of the trash (`DELETE /api/v1/trash/{id}`). Taking
+it out only marks it: **nothing is deleted from the server yet**, no version or chunk is freed, and the node can't be
+brought back from the trash afterwards. A folder in the trash is listed alone: everything that is in the trash below it
+(deleted and not removed from the trash) comes back with it when you bring the folder back, and goes with it when you
+take the folder out, **also a file that was deleted on its own, earlier, inside that folder**. Those items are listed
+only through the folder. A folder brings back, or takes out, up to 10,000 items below it at once, the shallowest first; if
+there are more, the rest then appears in the trash list on its own (its folder is live again or out of the trash), and
+you bring it back or remove it by a further call. The only setting is the number of days a deleted node waits, shown to clients as
+`purge_after_ms`; it removes nothing yet:
+
+```toml
+[retention]
+trash_days = 30   # 1 to 3650
+```
+
+A file brought back gets a new version with its old content, so another computer's delete that was sent just before can't delete it again. Update the agents with or soon after the server: an older agent can delete a *folder* a second time if that folder was brought back right after a delete whose answer it never heard (the folder is empty and can be brought back again).
+
+The change adds two columns and an index to the metadata (migration 0009 in the proposal). An older server refuses the
+upgraded database and rejects the `[retention]` section, so take a backup before upgrading and do not roll back.
+
+## Checking the storage
+
+`craft-cloud-server verify --config cc-data/config.toml` checks the database and the blob storage against each other
+and prints what it finds; `--json` prints a machine-readable report and `--skip-chunk-reads` skips reading every chunk
+object (which hashes it, and takes as long as reading all your data). It changes nothing and exits with an error if
+it found a problem. It opens a SQLite database read-only: the database file and its WAL keep their bytes, also after a
+crash that left committed data in the WAL, which it reads. Opening may leave an empty `-wal` and a `-shm` file behind
+(SQLite's rebuilt index of the WAL, not data). The report also says how many manifests have a complete reference index, which is what a later
+cleanup would need before it could free anything. After upgrading, run `craft-cloud-server index build --config
+cc-data/config.toml` once: it indexes the manifests stored before the index existed, writing only that index, in small
+steps, and it can be stopped and run again. Nothing in the server frees storage yet.
+
+The change adds two tables to the metadata (migration 0010 in the proposal). An older server refuses the upgraded database,
+so take a backup before upgrading and do not roll back.
 
 ## Restoring a backup
 

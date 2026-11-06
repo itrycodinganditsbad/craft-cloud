@@ -122,6 +122,8 @@ pub struct AppState {
     pub(crate) touches: Mutex<HashMap<DeviceId, i64>>,
     /// Verified against when the username doesn't exist, so both cases cost the same.
     pub dummy_hash: String,
+    /// Days a deleted node stays in the trash before the server may remove it (`retention.trash_days`).
+    pub trash_days: u32,
     /// The time of day for everything a request records (a device's last use, a stored blob, a commit).
     clock: Clock,
 }
@@ -143,6 +145,7 @@ impl AppState {
             limits,
             touches: Mutex::new(HashMap::new()),
             dummy_hash: hash_password("craft-cloud dummy password")?,
+            trash_days: 30,
             clock: Arc::new(now_ms),
         })
     }
@@ -153,6 +156,12 @@ impl AppState {
         self.manifests = PerUser::new(limits.manifests_per_user);
         self.password_checks = Arc::new(Semaphore::new(limits.password_checks));
         self.limits = limits;
+        self
+    }
+
+    /// The state with another trash period in days (`retention.trash_days`; the default is 30).
+    pub fn with_trash_days(mut self, days: u32) -> Self {
+        self.trash_days = days;
         self
     }
 

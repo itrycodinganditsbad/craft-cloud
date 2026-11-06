@@ -159,12 +159,18 @@ on_every_backend!(
     a_client_ahead_of_the_server_must_resync,
     overlong_usernames_are_refused_before_rate_limiting,
     the_change_feed_pages,
+    the_history_of_a_file_pages_newest_first_for_its_owner_only,
+    restoring_an_old_version_makes_a_new_one,
+    parallel_restores_against_one_head_let_one_win,
+    the_trash_lists_restores_and_removes_over_http,
+    a_deleted_folder_comes_back_and_goes_with_what_was_deleted_in_it,
     every_rejection_is_a_json_error,
     one_request_cant_list_unbounded_missing_chunks,
     long_polls_are_capped_per_space,
     odd_usernames_and_device_names_are_refused,
     shutting_down_ends_long_polls,
     the_space_endpoint_and_unversioned_info,
+    account_usage_is_scoped_to_signed_in_space,
     oversized_manifests_are_refused,
     live_needs_a_device_token,
     live_hello_checks_the_version,
@@ -702,6 +708,121 @@ async fn the_space_endpoint_and_unversioned_info(s: &Server) {
     let unversioned: InfoResponse =
         s.client.get(format!("{}/api/info", s.base.trim_end_matches("/api/v1"))).send().await.unwrap().json().await.unwrap();
     assert_eq!(versioned, unversioned);
+}
+
+async fn account_usage_is_scoped_to_signed_in_space(s: &Server) {
+    add_user(s, "ana").await;
+    add_user(s, "bob").await;
+    let ana = login(s, "ana").await;
+    let bob = login(s, "bob").await;
+    s.meta.add_chunk(s.meta.user_by_name("ana").await.unwrap().unwrap().space, &chunk_id(b"ana"), 11, 1).await.unwrap();
+    s.meta.add_chunk(s.meta.user_by_name("bob").await.unwrap().unwrap().space, &chunk_id(b"bob"), 29, 1).await.unwrap();
+
+    let response = s.client.get(format!("{}/account/usage", s.base)).bearer_auth(&ana).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(json["stored_bytes"], 11);
+    assert_eq!(json["quota_bytes"], serde_json::Value::Null);
+    assert_eq!(json["trash_bytes"], 0);
+    assert_eq!(json["history_bytes"], 0);
+    assert_eq!(json["estimates"], json!({ "index_complete": true }));
+
+    let bob_usage: serde_json::Value =
+        s.client.get(format!("{}/account/usage", s.base)).bearer_auth(&bob).send().await.unwrap().json().await.unwrap();
+    assert_eq!(bob_usage["stored_bytes"], 29);
+    assert_eq!(s.client.get(format!("{}/account/usage", s.base)).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_usage_is_read_only_and_returns_configured_quota() {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let db_path = db.path().join("meta.db");
+    let meta = Meta::open(&format!("sqlite:{}", db_path.display())).await.unwrap().with_stored_bytes_cap(Some(123));
+    let server = start(meta, Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![db, blobs], None).await;
+    add_user(&server, "ana").await;
+    let token = login(&server, "ana").await;
+    let space = server.meta.user_by_name("ana").await.unwrap().unwrap().space;
+    server.meta.add_chunk(space, &chunk_id(b"usage"), 11, 1).await.unwrap();
+
+    let before = sqlite_fingerprint(&db_path);
+    let response = server.client.get(format!("{}/account/usage", server.base)).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let usage: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        usage,
+        json!({
+            "stored_bytes": 11,
+            "quota_bytes": 123,
+            "trash_bytes": 0,
+            "history_bytes": 0,
+            "estimates": { "index_complete": true }
+        })
+    );
+    assert_eq!(sqlite_fingerprint(&db_path), before, "authorized usage request changed database or WAL bytes");
+
+    let response = server.client.get(format!("{}/account/usage", server.base)).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(sqlite_fingerprint(&db_path), before, "unauthorized usage request changed database or WAL bytes");
+    server.stop();
+}
+
+fn sqlite_fingerprint(path: &std::path::Path) -> [u8; 32] {
+    let read = |path: std::path::PathBuf| if path.exists() { std::fs::read(path).unwrap() } else { Vec::new() };
+    let (database, wal) = (read(path.to_owned()), read(path.with_extension("db-wal")));
+    let mut hash = blake3::Hasher::new();
+    hash.update(&database);
+    hash.update(&wal);
+    *hash.finalize().as_bytes()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_usage_is_read_only_and_fingerprints_every_postgres_table() {
+    let Ok(admin_url) = std::env::var("CRAFT_CLOUD_TEST_PG") else { return };
+    use sqlx::Connection;
+
+    let name = format!("cc_usage_{}", uuid::Uuid::now_v7().simple());
+    let mut conn = sqlx::PgConnection::connect(&admin_url).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&mut conn).await.unwrap();
+    let guard = PgGuard { admin_url: admin_url.clone(), name: name.clone() };
+    let (base, _) = admin_url.rsplit_once('/').unwrap();
+    let database_url = format!("{base}/{name}");
+    let meta = Meta::open(&database_url).await.unwrap().with_stored_bytes_cap(Some(123));
+    let blobs = tempfile::tempdir().unwrap();
+    let server = start(meta, Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![blobs], Some(guard)).await;
+
+    add_user(&server, "ana").await;
+    let token = login(&server, "ana").await;
+    let space = server.meta.user_by_name("ana").await.unwrap().unwrap().space;
+    server.meta.add_chunk(space, &chunk_id(b"usage"), 11, 1).await.unwrap();
+    let before = postgres_fingerprint(&database_url).await;
+    let response = server.client.get(format!("{}/account/usage", server.base)).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let usage: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(usage["stored_bytes"], 11);
+    assert_eq!(usage["quota_bytes"], 123);
+    assert_eq!(postgres_fingerprint(&database_url).await, before, "usage request changed at least one Postgres table");
+    server.stop();
+}
+
+async fn postgres_fingerprint(database_url: &str) -> Vec<(String, String)> {
+    use sqlx::Connection;
+
+    let mut conn = sqlx::PgConnection::connect(database_url).await.unwrap();
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .unwrap();
+    let mut fingerprint = Vec::with_capacity(tables.len());
+    for table in tables {
+        let quoted = table.replace('"', "\"\"");
+        let sql = format!("SELECT COALESCE(json_agg(to_jsonb(t) ORDER BY t.ctid)::text, '[]') FROM \"{quoted}\" AS t");
+        let rows: String = sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).fetch_one(&mut conn).await.unwrap();
+        fingerprint.push((table, blake3::hash(rows.as_bytes()).to_hex().to_string()));
+    }
+    fingerprint
 }
 
 async fn oversized_manifests_are_refused(s: &Server) {
@@ -1429,4 +1550,475 @@ async fn live_subscriptions_are_capped_per_device() {
     live_send(&mut ws, ClientFrame::Unsubscribe { doc: recents_doc(space, &AppName::new("app0").unwrap()) }).await;
     live_quiet(&mut ws).await;
     assert_eq!(live_subscribe(&mut other, doc, 0).await, vec![ServerFrame::Subscribed { doc, head: 0 }]);
+}
+
+// ---- history and restore ----
+
+fn update(node: NodeId, expected: VersionId, manifest: ManifestId) -> Op {
+    Op::Update { node, expected, version: NewVersion { id: VersionId::generate(), manifest, mtime_ms: 7, exec: false, save: None } }
+}
+
+async fn history_page(s: &Server, token: &str, node: NodeId, query: &str) -> reqwest::Response {
+    s.client.get(format!("{}/nodes/{node}/history{query}", s.base)).bearer_auth(token).send().await.unwrap()
+}
+
+async fn restore_request(s: &Server, token: &str, node: NodeId, body: serde_json::Value) -> reqwest::Response {
+    s.client.post(format!("{}/nodes/{node}/restore", s.base)).bearer_auth(token).json(&body).send().await.unwrap()
+}
+
+/// A file of `contents.len()` versions, one per entry: its node, the version IDs and manifests, oldest first.
+async fn file_with_history(s: &Server, token: &str, contents: &[&[u8]]) -> (NodeId, Vec<VersionId>, Vec<ManifestId>) {
+    let r = root(s, token).await;
+    let node = NodeId::generate();
+    let mut manifests = Vec::new();
+    for data in contents {
+        manifests.push(upload(s, token, data).await);
+    }
+    let first = create(node, r, &format!("history-{node}.txt"), manifests[0]);
+    let Op::Create { version, .. } = &first else { panic!("a create") };
+    let mut versions = vec![version.id];
+    assert_eq!(commit(s, token, &[first]).await.status(), StatusCode::OK);
+    for manifest in &manifests[1..] {
+        let op = update(node, *versions.last().unwrap(), *manifest);
+        let Op::Update { version, .. } = &op else { panic!("an update") };
+        versions.push(version.id);
+        assert_eq!(commit(s, token, &[op]).await.status(), StatusCode::OK);
+    }
+    (node, versions, manifests)
+}
+
+async fn the_history_of_a_file_pages_newest_first_for_its_owner_only(s: &Server) {
+    use craft_cloud_proto::api::HistoryResponse;
+    add_user(s, "ana").await;
+    add_user(s, "bob").await;
+    let (ana, bob) = (login(s, "ana").await, login(s, "bob").await);
+    let tag = uuid::Uuid::now_v7();
+    let contents: Vec<Vec<u8>> = (0..5).map(|i| format!("history {tag} {i}").into_bytes()).collect();
+    let refs: Vec<&[u8]> = contents.iter().map(Vec::as_slice).collect();
+    let (node, versions, _) = file_with_history(s, &ana, &refs).await;
+
+    let all: HistoryResponse = history_page(s, &ana, node, "").await.json().await.unwrap();
+    assert_eq!(all.next, None);
+    assert_eq!(all.versions.iter().map(|v| v.id).collect::<Vec<_>>(), versions.iter().rev().copied().collect::<Vec<_>>());
+    assert!(all.versions.iter().all(|v| !v.pruned && !v.save && v.size == contents[0].len() as u64));
+    assert_eq!(all.versions[4].parent_version, None);
+    assert_eq!(all.versions[0].parent_version, Some(versions[3]));
+    assert_eq!(all.versions.iter().map(|v| v.seq).collect::<Vec<_>>(), vec![5, 4, 3, 2, 1]);
+
+    // Pages of two follow each other through `next`.
+    let (mut seen, mut query, mut pages) = (Vec::new(), "?limit=2".to_owned(), 0);
+    loop {
+        let page: HistoryResponse = history_page(s, &ana, node, &query).await.json().await.unwrap();
+        seen.extend(page.versions.iter().map(|v| v.id));
+        pages += 1;
+        match page.next {
+            Some(next) => query = format!("?limit=2&cursor={next}"),
+            None => break,
+        }
+    }
+    assert_eq!((pages, seen), (3, all.versions.iter().map(|v| v.id).collect::<Vec<_>>()));
+
+    // Bad paging is `invalid`.
+    for bad in ["?limit=0", "?limit=201", "?limit=-1", "?cursor=nonsense", "?cursor=1", "?cursor=%201.00000000-0000-0000-0000-000000000000"] {
+        let (status, body) = error(history_page(s, &ana, node, bad).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "{bad}");
+    }
+    assert_eq!(history_page(s, &ana, node, "?limit=200").await.status(), StatusCode::OK);
+
+    // Other accounts, unknown nodes and folders; a missing or wrong token.
+    let (status, body) = error(history_page(s, &bob, node, "").await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"), "another account's file");
+    let (status, body) = error(history_page(s, &ana, NodeId::generate(), "").await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+    let (status, body) = error(history_page(s, &ana, root(s, &ana).await, "").await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "a folder");
+    assert_eq!(history_page(s, "not-a-token", node, "").await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(s.client.get(format!("{}/nodes/{node}/history", s.base)).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    let (status, body) = error(s.client.get(format!("{}/nodes/not-a-uuid/history", s.base)).bearer_auth(&ana).send().await.unwrap()).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+
+    // A deleted file keeps its history.
+    let del = Op::Delete { node, expected: Some(*versions.last().unwrap()) };
+    assert_eq!(commit(s, &ana, &[del]).await.status(), StatusCode::OK);
+    let kept: HistoryResponse = history_page(s, &ana, node, "").await.json().await.unwrap();
+    assert_eq!(kept.versions.len(), 5);
+}
+
+async fn restoring_an_old_version_makes_a_new_one(s: &Server) {
+    use craft_cloud_proto::api::{HistoryResponse, RestoreResponse};
+    add_user(s, "ana").await;
+    add_user(s, "bob").await;
+    let (ana, bob) = (login(s, "ana").await, login(s, "bob").await);
+    let tag = uuid::Uuid::now_v7();
+    let (first, second, third) = (format!("first {tag}").into_bytes(), format!("second {tag}").into_bytes(), format!("third {tag}").into_bytes());
+    let (node, versions, _) = file_with_history(s, &ana, &[&first, &second, &third]).await;
+    let before: SpaceResponse = space_of(s, &ana).await;
+
+    // Another account can neither read nor restore it.
+    let body = json!({ "version": versions[0], "expected_version": versions[2] });
+    let (status, error_body) = error(restore_request(s, &bob, node, body.clone()).await).await;
+    assert_eq!((status, error_body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+    assert_eq!(restore_request(s, "not-a-token", node, body.clone()).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(space_of(s, &ana).await.seq, before.seq, "refused restores change nothing");
+
+    let res = restore_request(s, &ana, node, body.clone()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let done: RestoreResponse = res.json().await.unwrap();
+    assert_eq!((done.parent_version, done.seq, done.epoch), (versions[2], before.seq + 1, before.epoch));
+    assert!(!versions.contains(&done.version));
+
+    // It is an ordinary change: in the feed, with the old content, and the old versions stay.
+    let feed: ChangeSet =
+        s.client.get(format!("{}/changes?since={}", s.base, before.seq)).bearer_auth(&ana).send().await.unwrap().json().await.unwrap();
+    let node_state = feed.nodes.iter().find(|n| n.id == node).unwrap();
+    let NodeKind::File(state) = &node_state.kind else { panic!("a file") };
+    assert_eq!((state.version, state.save.clone(), state.size), (done.version, None, first.len() as u64));
+    assert_eq!(download(s, &ana, &state.manifest).await, first);
+    let history: HistoryResponse = history_page(s, &ana, node, "").await.json().await.unwrap();
+    assert_eq!(history.versions.len(), 4);
+    assert_eq!((history.versions[0].id, history.versions[0].parent_version), (done.version, Some(versions[2])));
+
+    // The old `expected_version` is stale now: 409 with the conflict list, nothing changes.
+    let (status, stale) = error(restore_request(s, &ana, node, body).await).await;
+    assert_eq!((status, stale.error.as_str()), (StatusCode::CONFLICT, "conflict"));
+    assert_eq!(stale.conflicts.as_ref().map(Vec::len), Some(1));
+    assert_eq!(space_of(s, &ana).await.seq, before.seq + 1);
+
+    // A version that is not this file's: 404. Garbage bodies: 400.
+    let unknown = json!({ "version": VersionId::generate(), "expected_version": done.version });
+    let (status, body) = error(restore_request(s, &ana, node, unknown).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+    let (other, other_versions, _) = file_with_history(s, &ana, &[format!("other {tag}").as_bytes()]).await;
+    assert_ne!(other, node);
+    let foreign = json!({ "version": other_versions[0], "expected_version": done.version });
+    let (status, body) = error(restore_request(s, &ana, node, foreign).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"), "a version of another file");
+    for bad in [json!({}), json!({ "version": "x", "expected_version": "y" }), json!({ "version": versions[0] })] {
+        let (status, body) = error(restore_request(s, &ana, node, bad).await).await;
+        assert!(status.is_client_error() && body.error == "invalid", "{status} {}", body.error);
+    }
+    let folder = root(s, &ana).await;
+    let (status, body) = error(restore_request(s, &ana, folder, json!({ "version": versions[0], "expected_version": versions[0] })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "a folder");
+
+    // A deleted file is not restored from here.
+    let seq = space_of(s, &ana).await.seq;
+    assert_eq!(commit(s, &ana, &[Op::Delete { node, expected: Some(done.version) }]).await.status(), StatusCode::OK);
+    let (status, body) = error(restore_request(s, &ana, node, json!({ "version": versions[0], "expected_version": done.version })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "a deleted file");
+    assert_eq!(space_of(s, &ana).await.seq, seq + 1, "only the delete");
+}
+
+async fn parallel_restores_against_one_head_let_one_win(s: &Server) {
+    use craft_cloud_proto::api::RestoreResponse;
+    add_user(s, "ana").await;
+    let ana = login(s, "ana").await;
+    let tag = uuid::Uuid::now_v7();
+    let contents: Vec<Vec<u8>> = (0..3).map(|i| format!("parallel {tag} {i}").into_bytes()).collect();
+    let refs: Vec<&[u8]> = contents.iter().map(Vec::as_slice).collect();
+    let (node, versions, _) = file_with_history(s, &ana, &refs).await;
+    let before = space_of(s, &ana).await.seq;
+    let mut tasks = Vec::new();
+    for i in 0..6 {
+        let (client, url, token) = (s.client.clone(), format!("{}/nodes/{node}/restore", s.base), ana.clone());
+        let body = json!({ "version": versions[i % 2], "expected_version": versions[2] });
+        tasks.push(tokio::spawn(async move { client.post(url).bearer_auth(token).json(&body).send().await.unwrap() }));
+    }
+    let (mut won, mut conflicted) = (Vec::new(), 0);
+    for task in tasks {
+        let res = task.await.unwrap();
+        match res.status() {
+            StatusCode::OK => won.push(res.json::<RestoreResponse>().await.unwrap()),
+            StatusCode::CONFLICT => conflicted += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!((won.len(), conflicted), (1, 5));
+    assert_eq!(space_of(s, &ana).await.seq, before + 1);
+}
+
+// ---- the trash ----
+
+const DAY_MS: i64 = 86_400_000;
+
+async fn trash_page(s: &Server, token: &str, query: &str) -> reqwest::Response {
+    s.client.get(format!("{}/trash{query}", s.base)).bearer_auth(token).send().await.unwrap()
+}
+
+async fn trash_restore(s: &Server, token: &str, node: NodeId) -> reqwest::Response {
+    s.client.post(format!("{}/trash/{node}/restore", s.base)).bearer_auth(token).send().await.unwrap()
+}
+
+async fn trash_remove(s: &Server, token: &str, node: NodeId) -> reqwest::Response {
+    s.client.delete(format!("{}/trash/{node}", s.base)).bearer_auth(token).send().await.unwrap()
+}
+
+/// Uploads `data` and makes it the file `node` in `parent`: its first version.
+async fn new_file(s: &Server, token: &str, parent: NodeId, file_name: &str, data: &[u8]) -> (NodeId, VersionId) {
+    let node = NodeId::generate();
+    let manifest = upload(s, token, data).await;
+    let op = create(node, parent, file_name, manifest);
+    let Op::Create { version, .. } = &op else { panic!("a create") };
+    let id = version.id;
+    assert_eq!(commit(s, token, &[op]).await.status(), StatusCode::OK);
+    (node, id)
+}
+
+async fn delete_node(s: &Server, token: &str, node: NodeId, version: VersionId) {
+    assert_eq!(commit(s, token, &[Op::Delete { node, expected: Some(version) }]).await.status(), StatusCode::OK);
+}
+
+async fn the_trash_lists_restores_and_removes_over_http(s: &Server) {
+    use craft_cloud_proto::api::{HistoryResponse, TrashResponse, TrashRestoreResponse};
+    add_user(s, "ana").await;
+    add_user(s, "bob").await;
+    let (ana, bob) = (login(s, "ana").await, login(s, "bob").await);
+    let r = root(s, &ana).await;
+    let tag = uuid::Uuid::now_v7();
+
+    let empty: TrashResponse = trash_page(s, &ana, "").await.json().await.unwrap();
+    assert_eq!((empty.items.len(), empty.next), (0, None));
+    let mut files = Vec::new();
+    for i in 0..3 {
+        let data = format!("trash {tag} {i}").into_bytes();
+        let (node, version) = new_file(s, &ana, r, &format!("t{i}.txt"), &data).await;
+        delete_node(s, &ana, node, version).await;
+        files.push((node, version, data));
+    }
+
+    // Newest deletion first, with the time the server will wait (30 days by default).
+    let all: TrashResponse = trash_page(s, &ana, "").await.json().await.unwrap();
+    assert_eq!(all.items.len(), 3);
+    assert!(all.items.iter().all(|i| i.parent == r && !i.is_dir && i.purge_after_ms == i.deleted_ms + 30 * DAY_MS && i.deleted_ms > 0));
+    assert!(all.items.windows(2).all(|w| (w[0].deleted_ms, w[0].id.to_string()) > (w[1].deleted_ms, w[1].id.to_string())), "newest first");
+    assert_eq!(all.items.iter().find(|i| i.id == files[1].0).unwrap().size, Some(files[1].2.len() as u64));
+    let (mut seen, mut query) = (Vec::new(), "?limit=2".to_owned());
+    loop {
+        let page: TrashResponse = trash_page(s, &ana, &query).await.json().await.unwrap();
+        seen.extend(page.items.iter().map(|i| i.id));
+        match page.next {
+            Some(next) => query = format!("?limit=2&cursor={next}"),
+            None => break,
+        }
+    }
+    assert_eq!(seen, all.items.iter().map(|i| i.id).collect::<Vec<_>>());
+    for bad in ["?limit=0", "?limit=201", "?cursor=nonsense", "?cursor=%201.00000000-0000-0000-0000-000000000000"] {
+        let (status, body) = error(trash_page(s, &ana, bad).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "{bad}");
+    }
+
+    // Nobody else sees, restores or removes it; no token, no trash.
+    let theirs: TrashResponse = trash_page(s, &bob, "").await.json().await.unwrap();
+    assert!(theirs.items.is_empty());
+    for res in [trash_restore(s, &bob, files[0].0).await, trash_remove(s, &bob, files[0].0).await] {
+        let (status, body) = error(res).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+    }
+    assert_eq!(trash_page(s, "not-a-token", "").await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(s.client.post(format!("{}/trash/{}/restore", s.base, files[0].0)).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(s.client.delete(format!("{}/trash/{}", s.base, files[0].0)).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // A restore is one change: the file is live again with its content.
+    let before = space_of(s, &ana).await;
+    let res = trash_restore(s, &ana, files[0].0).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let done: TrashRestoreResponse = res.json().await.unwrap();
+    assert_eq!(
+        (done.node, done.parent, done.name.as_str(), done.renamed, done.seq, done.epoch),
+        (files[0].0, r, "t0.txt", false, before.seq + 1, before.epoch)
+    );
+    let feed: ChangeSet =
+        s.client.get(format!("{}/changes?since={}", s.base, before.seq)).bearer_auth(&ana).send().await.unwrap().json().await.unwrap();
+    let state = feed.nodes.iter().find(|n| n.id == files[0].0).unwrap();
+    assert!(!state.deleted);
+    let NodeKind::File(file) = &state.kind else { panic!("a file") };
+    assert_eq!(download(s, &ana, &file.manifest).await, files[0].2);
+    let after: TrashResponse = trash_page(s, &ana, "").await.json().await.unwrap();
+    assert_eq!(after.items.len(), 2);
+    // Not in the trash any more, and not there at all.
+    for node in [files[0].0, NodeId::generate(), r] {
+        let (status, body) = error(trash_restore(s, &ana, node).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"), "{node}");
+        let (status, body) = error(trash_remove(s, &ana, node).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"), "{node}");
+    }
+    let (status, body) = error(s.client.post(format!("{}/trash/not-a-uuid/restore", s.base)).bearer_auth(&ana).send().await.unwrap()).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+
+    // The name was taken meanwhile: the restore goes around it and says so, and the new file is untouched.
+    let (taken, _) = new_file(s, &ana, r, "t1.txt", format!("squatter {tag}").as_bytes()).await;
+    let done: TrashRestoreResponse = trash_restore(s, &ana, files[1].0).await.json().await.unwrap();
+    assert!(done.renamed && done.name.starts_with("t1 (conflict, laptop, ") && done.name.ends_with(").txt"), "{}", done.name);
+    let tree: ChangeSet = s.client.get(format!("{}/tree", s.base)).bearer_auth(&ana).send().await.unwrap().json().await.unwrap();
+    let names: Vec<_> =
+        tree.nodes.iter().filter(|n| n.id == taken || n.id == files[1].0).map(|n| n.name.as_ref().unwrap().as_str().to_owned()).collect();
+    assert!(names.contains(&"t1.txt".to_owned()) && names.contains(&done.name), "{names:?}");
+
+    // Removing from the trash only marks it: the history and the content are still there, nothing changes in the feed.
+    let seq = space_of(s, &ana).await.seq;
+    assert_eq!(trash_remove(s, &ana, files[2].0).await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(trash_remove(s, &ana, files[2].0).await.status(), StatusCode::NO_CONTENT, "asking again is the same");
+    assert_eq!(space_of(s, &ana).await.seq, seq);
+    let left: TrashResponse = trash_page(s, &ana, "").await.json().await.unwrap();
+    assert!(left.items.is_empty());
+    let history: HistoryResponse = history_page(s, &ana, files[2].0, "").await.json().await.unwrap();
+    assert_eq!(history.versions.len(), 1);
+    assert_eq!(download(s, &ana, &manifest_for(&files[2].2).id()).await, files[2].2);
+    let (status, body) = error(trash_restore(s, &ana, files[2].0).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+    // The restore of a version refuses a deleted file, and points to the trash.
+    let (status, body) = error(restore_request(s, &ana, files[2].0, json!({ "version": files[2].1, "expected_version": files[2].1 })).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+    assert!(body.message.contains("/trash/"), "{}", body.message);
+}
+
+/// A deleted folder is listed alone and is restored (or removed) with everything of it that is in the trash, also a
+/// file that was deleted on its own before.
+async fn a_deleted_folder_comes_back_and_goes_with_what_was_deleted_in_it(s: &Server) {
+    use craft_cloud_proto::api::{TrashResponse, TrashRestoreResponse};
+    add_user(s, "ana").await;
+    let ana = login(s, "ana").await;
+    let r = root(s, &ana).await;
+    let (dir1, sub1, dir2, sub2) = (NodeId::generate(), NodeId::generate(), NodeId::generate(), NodeId::generate());
+    for (name, dir, sub) in [("dir1", dir1, sub1), ("dir2", dir2, sub2)] {
+        let ops = [
+            Op::Mkdir { node: dir, parent: r, name: Name::new(name).unwrap() },
+            Op::Mkdir { node: sub, parent: dir, name: Name::new("sub").unwrap() },
+        ];
+        assert_eq!(commit(s, &ana, &ops).await.status(), StatusCode::OK);
+    }
+    let mut kids = Vec::new();
+    for (dir, sub) in [(dir1, sub1), (dir2, sub2)] {
+        let (early, early_v) = new_file(s, &ana, dir, "early.txt", b"deleted on its own first").await;
+        delete_node(s, &ana, early, early_v).await;
+        let (child, child_v) = new_file(s, &ana, dir, "child.txt", b"deleted with the folder").await;
+        let (deep, deep_v) = new_file(s, &ana, sub, "deep.txt", b"deep").await;
+        let ops = [
+            Op::Delete { node: child, expected: Some(child_v) },
+            Op::Delete { node: deep, expected: Some(deep_v) },
+            Op::Delete { node: sub, expected: None },
+            Op::Delete { node: dir, expected: None },
+        ];
+        assert_eq!(commit(s, &ana, &ops).await.status(), StatusCode::OK);
+        kids.push([early, child, deep, sub]);
+    }
+    let listed: TrashResponse = trash_page(s, &ana, "").await.json().await.unwrap();
+    let mut ids: Vec<_> = listed.items.iter().map(|i| i.id).collect();
+    ids.sort();
+    let mut tops = vec![dir1, dir2];
+    tops.sort();
+    assert_eq!(ids, tops, "only the folders are listed");
+
+    // Restoring one folder brings all that was in the trash below it, and nothing of the other.
+    let before = space_of(s, &ana).await;
+    let done: TrashRestoreResponse = trash_restore(s, &ana, dir1).await.json().await.unwrap();
+    assert_eq!((done.node, done.name.as_str(), done.renamed, done.seq), (dir1, "dir1", false, before.seq + 1));
+    let tree: ChangeSet = s.client.get(format!("{}/tree", s.base)).bearer_auth(&ana).send().await.unwrap().json().await.unwrap();
+    let live: Vec<_> = tree.nodes.iter().map(|n| n.id).collect();
+    for node in kids[0].iter().chain([&dir1]) {
+        assert!(live.contains(node), "{node} is live again");
+    }
+    for node in kids[1].iter().chain([&dir2]) {
+        assert!(!live.contains(node), "{node} is still deleted");
+    }
+
+    // Removing the other folder takes what is below it out of the trash too.
+    assert_eq!(trash_remove(s, &ana, dir2).await.status(), StatusCode::NO_CONTENT);
+    let left: TrashResponse = trash_page(s, &ana, "").await.json().await.unwrap();
+    assert!(left.items.is_empty(), "{:?}", left.items);
+    for node in kids[1] {
+        let (status, body) = error(trash_restore(s, &ana, node).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"), "{node}");
+    }
+}
+
+/// A server with another `retention.trash_days` (SQLite and disk).
+async fn sqlite_disk_with_trash_days(days: u32) -> Server {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let state = AppState::new(meta.clone(), store, vec![]).unwrap().with_trash_days(days);
+    start_state(state, meta, vec![db, blobs], None).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_purge_time_follows_the_configured_trash_days() {
+    use craft_cloud_proto::api::TrashResponse;
+    let s = sqlite_disk_with_trash_days(7).await;
+    add_user(&s, "ana").await;
+    let ana = login(&s, "ana").await;
+    let r = root(&s, &ana).await;
+    let (node, version) = new_file(&s, &ana, r, "week.txt", b"seven days").await;
+    delete_node(&s, &ana, node, version).await;
+    let page: TrashResponse = trash_page(&s, &ana, "").await.json().await.unwrap();
+    assert_eq!(page.items[0].purge_after_ms - page.items[0].deleted_ms, 7 * DAY_MS);
+}
+
+// ---- the reference index ----
+
+/// A server whose metadata writes only a few index edges per transaction (SQLite and disk).
+async fn sqlite_disk_with_index_budget(rows: usize) -> Server {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap().with_index_batch_rows(rows);
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let state = AppState::new(meta.clone(), store, vec![]).unwrap();
+    start_state(state, meta, vec![db, blobs], None).await
+}
+
+/// A manifest of `n` chunks (the first one twice), their data distinct; uploaded chunks first.
+async fn upload_many(s: &Server, token: &str, n: usize, tag: &str) -> (Manifest, Vec<ChunkId>) {
+    let datas: Vec<Vec<u8>> = (0..n).map(|i| format!("index {tag} {i} {}", uuid::Uuid::now_v7()).into_bytes()).collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.push(0);
+    for data in &datas {
+        assert_eq!(put_chunk(s, token, data).await, StatusCode::NO_CONTENT);
+    }
+    let refs: Vec<ChunkRef> = order.iter().map(|i| ChunkRef { id: chunk_id(&datas[*i]), len: u32::try_from(datas[*i].len()).unwrap() }).collect();
+    let size = refs.iter().map(|r| u64::from(r.len)).sum();
+    let manifest = Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), size, FileHash::from_bytes([9; 32]), refs.clone()).unwrap();
+    (manifest, refs.iter().map(|r| r.id).collect())
+}
+
+/// A manifest accepted is indexed, exactly and completely, before the upload is acknowledged: a short one in the
+/// transaction that records it, a longer one (past the server's budget per transaction) in the batches the handler
+/// finishes. Uploading it again, or as another account, changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uploaded_manifest_is_indexed_before_the_upload_is_acknowledged() {
+    use craft_cloud_meta::IndexState;
+    let s = sqlite_disk_with_index_budget(3).await;
+    add_user(&s, "ana").await;
+    add_user(&s, "bob").await;
+    let (ana, bob) = (login(&s, "ana").await, login(&s, "bob").await);
+    for (n, label) in [(2usize, "short"), (9, "long")] {
+        let (manifest, chunks) = upload_many(&s, &ana, n, label).await;
+        assert_eq!(put_manifest(&s, &ana, &manifest).await.status(), StatusCode::NO_CONTENT, "{label}");
+        assert_eq!(s.meta.index_state(&manifest.id()).await.unwrap(), IndexState::Complete { total: n as u64 + 1 }, "{label}");
+        let edges = s.meta.index_edges(&manifest.id()).await.unwrap();
+        assert_eq!(edges.iter().map(|(_, c)| *c).collect::<Vec<_>>(), chunks, "{label}: in order, the first chunk at both its places");
+        // Again, and as another account (which has to upload the chunks too).
+        let before = s.meta.index_edge_count().await.unwrap();
+        assert_eq!(put_manifest(&s, &ana, &manifest).await.status(), StatusCode::NO_CONTENT);
+        for chunk in manifest.chunks() {
+            let data = s.client.get(format!("{}/chunks/{}", s.base, chunk.id)).bearer_auth(&ana).send().await.unwrap().bytes().await.unwrap();
+            assert_eq!(
+                s.client.put(format!("{}/chunks/{}", s.base, chunk.id)).bearer_auth(&bob).body(data.to_vec()).send().await.unwrap().status(),
+                StatusCode::NO_CONTENT
+            );
+        }
+        assert_eq!(put_manifest(&s, &bob, &manifest).await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(s.meta.index_edge_count().await.unwrap(), before, "{label}: nothing written twice");
+    }
+    // A manifest naming a chunk the account lacks is refused, and leaves no index behind.
+    let (manifest, _) = upload_many(&s, &ana, 2, "refused").await;
+    let lacking = {
+        let mut refs = manifest.chunks().to_vec();
+        refs.push(ChunkRef { id: chunk_id(b"never uploaded"), len: 14 });
+        let size = refs.iter().map(|r| u64::from(r.len)).sum();
+        Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), size, FileHash::from_bytes([8; 32]), refs).unwrap()
+    };
+    let (status, body) = error(put_manifest(&s, &ana, &lacking).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::CONFLICT, "missing_chunks"));
+    assert_eq!(s.meta.index_state(&lacking.id()).await.unwrap(), IndexState::Absent);
 }
