@@ -776,6 +776,39 @@ async fn a_failed_pass_keeps_the_deletes_the_user_was_shown() {
     assert_eq!((exit, summary.removed_remotely), (Exit::Done, 12), "{summary:?}");
 }
 
+/// The agent tells the server what it is when it signs in and when it joins, so the account's device list shows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn login_and_join_send_the_agents_device_details() {
+    use craft_cloud_agent::cli::JoinArgs;
+    use craft_cloud_proto::join::{Code, INVITE_CHARS, INVITE_TTL_MS, JoinString};
+    let server = server().await;
+    let ana = server.meta.user_by_name("ana").await.unwrap().unwrap();
+    async fn details(server: &Server, user: craft_cloud_meta::UserId, name: &str) -> (String, String, String) {
+        let devices = server.meta.list_devices(user).await.unwrap();
+        let device = devices.into_iter().find(|d| d.name == name).unwrap_or_else(|| panic!("no device {name}"));
+        (device.client.kind, device.client.platform, device.client.app_version)
+    }
+    let expected = ("agent".to_owned(), std::env::consts::OS.to_owned(), env!("CARGO_PKG_VERSION").to_owned());
+
+    let a = Agent::signed_in(&server, "desk").await;
+    assert_eq!(details(&server, ana.id, "desk").await, expected, "after login");
+    drop(a);
+
+    let invite = Code::generate(INVITE_CHARS).unwrap();
+    let now = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()).unwrap();
+    server.meta.create_invite("ana", &invite.hash(), now, INVITE_TTL_MS).await.unwrap();
+    let b = Agent::new();
+    let args = JoinArgs {
+        join: JoinString::new(server.url.clone(), invite).link(),
+        folder: Some(b.folder.clone()),
+        device_name: Some("laptop".into()),
+        adopt: false,
+        autostart: false,
+    };
+    cli::join(&b.data, &args, None, &mut Vec::new()).await.unwrap();
+    assert_eq!(details(&server, ana.id, "laptop").await, expected, "after join");
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn login_makes_the_agent_folder_owner_only() {
