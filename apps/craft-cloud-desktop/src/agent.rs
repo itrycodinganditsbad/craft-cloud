@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use craft_cloud_app::{Client, DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingStatus, Status, Uuid};
+use craft_cloud_app::{AccountUsage, Client, DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingStatus, Status, Uuid};
 
 use crate::model::{Effect, Event};
 
@@ -28,6 +28,7 @@ pub trait Agent: Send + Sync {
     fn pairing_state(&self, id: Uuid) -> Result<PairingStatus, Error>;
     fn cancel_pairing(&self, id: Uuid) -> Result<(), Error>;
     fn devices(&self) -> Result<Vec<DeviceInfo>, Error>;
+    fn usage(&self) -> Result<AccountUsage, Error>;
     fn remove_device(&self, id: DeviceId) -> Result<Vec<DeviceInfo>, Error>;
     fn pause(&self) -> Result<Status, Error>;
     fn resume(&self) -> Result<Status, Error>;
@@ -97,6 +98,9 @@ impl Agent for ClientAgent {
     }
     fn devices(&self) -> Result<Vec<DeviceInfo>, Error> {
         self.with(Client::devices)
+    }
+    fn usage(&self) -> Result<AccountUsage, Error> {
+        self.with(Client::usage)
     }
     fn remove_device(&self, id: DeviceId) -> Result<Vec<DeviceInfo>, Error> {
         self.with(|c| c.remove_device(id))
@@ -198,6 +202,7 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
             return None;
         }
         Effect::Devices => Event::Devices(agent.devices()),
+        Effect::Usage(request_id) => Event::Usage { request_id, result: agent.usage() },
         Effect::RemoveDevice(id) => Event::Devices(agent.remove_device(id)),
         Effect::Logout { local } => Event::SignedOut(agent.logout(local)),
         Effect::Pause => Event::Answered(agent.pause()),
@@ -223,12 +228,19 @@ pub(crate) mod fake {
         pub gone: AtomicBool,
         /// What `join` answers, in turn (then the status).
         pub joins: Mutex<Vec<Result<Status, Error>>>,
+        pub usage_result: Mutex<Option<Result<AccountUsage, Error>>>,
         pub asked: Mutex<Vec<String>>,
     }
 
     impl FakeAgent {
         pub fn new(status: Status) -> Self {
-            Self { status: Mutex::new(status), gone: AtomicBool::new(false), joins: Mutex::new(Vec::new()), asked: Mutex::new(Vec::new()) }
+            Self {
+                status: Mutex::new(status),
+                gone: AtomicBool::new(false),
+                joins: Mutex::new(Vec::new()),
+                usage_result: Mutex::new(None),
+                asked: Mutex::new(Vec::new()),
+            }
         }
 
         fn answer<T>(&self, what: &str, ok: impl FnOnce(&Status) -> T) -> Result<T, Error> {
@@ -271,6 +283,19 @@ pub(crate) mod fake {
         }
         fn devices(&self) -> Result<Vec<DeviceInfo>, Error> {
             self.answer("devices", |_| Vec::new())
+        }
+        fn usage(&self) -> Result<AccountUsage, Error> {
+            self.answer("usage", |_| ())?;
+            if let Some(result) = self.usage_result.lock().unwrap().clone() {
+                return result;
+            }
+            Ok(AccountUsage {
+                stored_bytes: 0,
+                quota_bytes: None,
+                trash_bytes: Some(0),
+                history_bytes: Some(0),
+                estimates: craft_cloud_proto::api::UsageEstimates { index_complete: true, reason: None },
+            })
         }
         fn remove_device(&self, _id: DeviceId) -> Result<Vec<DeviceInfo>, Error> {
             self.answer("remove_device", |_| Vec::new())

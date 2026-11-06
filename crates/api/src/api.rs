@@ -76,6 +76,29 @@ pub struct DeviceInfo {
     pub current: bool,
 }
 
+/// `GET /api/v1/account/usage`: stored bytes and labeled estimates for the signed-in account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountUsage {
+    pub stored_bytes: u64,
+    pub quota_bytes: Option<u64>,
+    pub trash_bytes: Option<u64>,
+    pub history_bytes: Option<u64>,
+    pub estimates: UsageEstimates,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageEstimates {
+    pub index_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<UsageEstimateReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageEstimateReason {
+    IndexIncomplete,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

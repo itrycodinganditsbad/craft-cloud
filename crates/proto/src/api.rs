@@ -5,11 +5,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::hash::ChunkId;
-use crate::ids::{DeviceId, Epoch, NodeId, SpaceId};
+use crate::ids::{DeviceId, Epoch, NodeId, SpaceId, VersionId};
 use crate::ops::{Conflict, Op};
 
 /// What apps see of these bodies lives in `craft-cloud-api` (no postcard), re-exported here.
-pub use craft_cloud_api::api::{DeviceInfo, ErrorAnswer, PairingState, PairingStatus, codes};
+pub use craft_cloud_api::api::{AccountUsage, DeviceInfo, ErrorAnswer, PairingState, PairingStatus, UsageEstimateReason, UsageEstimates, codes};
 
 /// Protocol versions this build speaks. A client and server must share at least one.
 pub const PROTOCOL_MIN: u32 = 1;
@@ -145,6 +145,166 @@ pub struct SaveAttach {
     pub save: crate::SaveRecord,
 }
 
+/// Versions in one `GET /api/v1/nodes/{id}/history` page when `limit` is not given.
+pub const HISTORY_DEFAULT_LIMIT: u32 = 50;
+/// Most versions in one history page; a larger `limit` is `invalid`.
+pub const HISTORY_MAX_LIMIT: u32 = 200;
+
+/// Where the next history page starts: after this `(seq, version)` in the newest-first order. On the wire it is an
+/// opaque string; clients pass back the `next` they were given and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryCursor {
+    pub seq: u64,
+    pub version: VersionId,
+}
+
+impl std::fmt::Display for HistoryCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.seq, self.version)
+    }
+}
+
+/// A history cursor that does not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BadHistoryCursor;
+
+impl std::fmt::Display for BadHistoryCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not a history cursor")
+    }
+}
+
+impl std::error::Error for BadHistoryCursor {}
+
+impl std::str::FromStr for HistoryCursor {
+    type Err = BadHistoryCursor;
+
+    /// Only the exact form [`Display`](std::fmt::Display) writes is accepted, so one cursor has one spelling.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (seq, version) = s.split_once('.').ok_or(BadHistoryCursor)?;
+        let cursor = HistoryCursor { seq: seq.parse().map_err(|_| BadHistoryCursor)?, version: version.parse().map_err(|_| BadHistoryCursor)? };
+        if cursor.to_string() == s { Ok(cursor) } else { Err(BadHistoryCursor) }
+    }
+}
+
+/// One version of a file in its history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryVersion {
+    pub id: VersionId,
+    pub parent_version: Option<VersionId>,
+    pub epoch: Epoch,
+    /// The space's change sequence number of the commit that made this version.
+    pub seq: u64,
+    pub size: u64,
+    pub mtime_ms: i64,
+    /// The device that committed it.
+    pub device: DeviceId,
+    pub created_ms: i64,
+    /// Whether a save record (a Craft app's live-document save) hangs on this version.
+    pub save: bool,
+    /// Thinned out of the history: its row stays, but it can't be restored. Always `false` until thinning exists.
+    pub pruned: bool,
+}
+
+/// `GET /api/v1/nodes/{id}/history?cursor&limit`: the versions of a file, newest first by `(seq, id)`. `next` is the
+/// `cursor` of the following page, absent on the last.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryResponse {
+    pub versions: Vec<HistoryVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// `POST /api/v1/nodes/{id}/restore`: make `version` the file's content again as a new version. `expected_version`
+/// must still be the file's current version, else the answer is `conflict`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreRequest {
+    pub version: VersionId,
+    pub expected_version: VersionId,
+}
+
+/// A restore that applied: the new version, which follows `parent_version` (the one that was current).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreResponse {
+    pub version: VersionId,
+    pub parent_version: VersionId,
+    pub seq: u64,
+    pub epoch: Epoch,
+}
+
+/// Items in one `GET /api/v1/trash` page when `limit` is not given.
+pub const TRASH_DEFAULT_LIMIT: u32 = 50;
+/// Most items in one trash page; a larger `limit` is `invalid`.
+pub const TRASH_MAX_LIMIT: u32 = 200;
+
+/// Where the next trash page starts: after this `(deleted_ms, node)` in the newest-deleted-first order. Opaque on the
+/// wire, like [`HistoryCursor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrashCursor {
+    pub deleted_ms: i64,
+    pub node: NodeId,
+}
+
+impl std::fmt::Display for TrashCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.deleted_ms, self.node)
+    }
+}
+
+impl std::str::FromStr for TrashCursor {
+    type Err = BadHistoryCursor;
+
+    /// Only the exact form [`Display`](std::fmt::Display) writes is accepted.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (deleted_ms, node) = s.split_once('.').ok_or(BadHistoryCursor)?;
+        let cursor = TrashCursor { deleted_ms: deleted_ms.parse().map_err(|_| BadHistoryCursor)?, node: node.parse().map_err(|_| BadHistoryCursor)? };
+        if cursor.to_string() == s { Ok(cursor) } else { Err(BadHistoryCursor) }
+    }
+}
+
+/// One deleted node in the trash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashItem {
+    pub id: NodeId,
+    /// The folder it was in when it was deleted (itself deleted, perhaps).
+    pub parent: NodeId,
+    pub name: String,
+    pub is_dir: bool,
+    /// The size of a file's last version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    pub deleted_ms: i64,
+    /// `deleted_ms` plus the server's `retention.trash_days`: when the server may remove the node for good. Nothing is
+    /// removed yet, so this is a promise of the earliest time, not an event.
+    pub purge_after_ms: i64,
+}
+
+/// `GET /api/v1/trash?cursor&limit`: the deleted nodes of your space that were not removed from the trash, newest
+/// deletion first by `(deleted_ms, id)`. `next` is the `cursor` of the following page, absent on the last.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashResponse {
+    pub items: Vec<TrashItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// `POST /api/v1/trash/{id}/restore`: the node is back. `parent` and `name` say where, which differs from where it was
+/// when a folder of its path was merged into a live folder of the same name, or when `renamed` is set: the name was
+/// taken, so the node got a conflict name like the sync engine makes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashRestoreResponse {
+    pub node: NodeId,
+    pub parent: NodeId,
+    pub name: String,
+    pub renamed: bool,
+    /// For a file, its new current version: a copy of its last one (the same content), so a delete sent against the old
+    /// version, whose answer a machine never heard, can't delete it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<VersionId>,
+    pub seq: u64,
+    pub epoch: Epoch,
+}
+
 /// A commit that applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitResponse {
@@ -218,6 +378,36 @@ mod tests {
     }
 
     #[test]
+    fn account_usage_round_trips_and_ignores_unknown_fields() {
+        let response = AccountUsage {
+            stored_bytes: 17,
+            quota_bytes: Some(99),
+            trash_bytes: None,
+            history_bytes: None,
+            estimates: UsageEstimates { index_complete: false, reason: Some(UsageEstimateReason::IndexIncomplete) },
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(serde_json::from_value::<AccountUsage>(value.clone()).unwrap(), response);
+        let mut value = value;
+        value.as_object_mut().unwrap().insert("future_field".into(), serde_json::json!(1));
+        assert_eq!(serde_json::from_value::<AccountUsage>(value).unwrap(), response);
+    }
+
+    #[test]
+    fn account_usage_decodes_complete_and_incomplete_estimates() {
+        let complete: AccountUsage =
+            serde_json::from_str(r#"{"stored_bytes":11,"quota_bytes":null,"trash_bytes":0,"history_bytes":0,"estimates":{"index_complete":true}}"#)
+                .unwrap();
+        assert_eq!(complete.estimates, UsageEstimates { index_complete: true, reason: None });
+        let incomplete: AccountUsage = serde_json::from_str(
+            r#"{"stored_bytes":11,"quota_bytes":null,"trash_bytes":null,"history_bytes":null,"estimates":{"index_complete":false,"reason":"index_incomplete"}}"#,
+        ).unwrap();
+        assert_eq!(incomplete.trash_bytes, None);
+        assert_eq!(incomplete.history_bytes, None);
+        assert_eq!(incomplete.estimates.reason, Some(UsageEstimateReason::IndexIncomplete));
+    }
+
+    #[test]
     fn a_quota_answer_says_how_much_is_used() {
         let body = ErrorBody {
             error: codes::QUOTA_EXCEEDED.into(),
@@ -235,6 +425,42 @@ mod tests {
         let json = serde_json::json!({ "error": "something_new", "message": "m", "retry_in": 3 });
         let body: ErrorBody = serde_json::from_value(json).unwrap();
         assert_eq!(body.error, "something_new");
+    }
+
+    #[test]
+    fn history_cursors_have_one_spelling() {
+        let cursor = HistoryCursor { seq: 7, version: VersionId::generate() };
+        assert_eq!(cursor.to_string().parse::<HistoryCursor>(), Ok(cursor));
+        let text = cursor.to_string();
+        for bad in
+            ["", "7", "7.", ".x", "x.y", "+7.00000000-0000-0000-0000-000000000000", &text.to_uppercase(), &format!("{text}x"), &format!(" {text}")]
+        {
+            assert_eq!(bad.parse::<HistoryCursor>(), Err(BadHistoryCursor), "{bad:?}");
+        }
+        assert_eq!("-1.00000000-0000-0000-0000-000000000000".parse::<HistoryCursor>(), Err(BadHistoryCursor));
+    }
+
+    #[test]
+    fn trash_cursors_have_one_spelling() {
+        let cursor = TrashCursor { deleted_ms: 1_760_000_000_000, node: NodeId::generate() };
+        assert_eq!(cursor.to_string().parse::<TrashCursor>(), Ok(cursor));
+        let text = cursor.to_string();
+        for bad in ["", "7", "7.", ".x", "x.y", &format!("+{text}"), &text.to_uppercase(), &format!("{text}x"), &format!(" {text}")] {
+            assert_eq!(bad.parse::<TrashCursor>(), Err(BadHistoryCursor), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn history_and_restore_bodies_have_a_plain_json_form() {
+        let restore: RestoreRequest = serde_json::from_value(serde_json::json!({
+            "version": "01a12b0b-9fca-73db-b82d-c7c33683601e",
+            "expected_version": "01a12b0b-9fca-73db-b82d-c7c33683601f",
+            "unknown": 1
+        }))
+        .unwrap();
+        assert_ne!(restore.version, restore.expected_version);
+        let last = HistoryResponse { versions: vec![], next: None };
+        assert_eq!(serde_json::to_value(&last).unwrap(), serde_json::json!({ "versions": [] }));
     }
 
     #[test]

@@ -24,6 +24,7 @@ const PATIENCE: Duration = Duration::from_secs(30);
 struct Server {
     url: String,
     meta: Meta,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
     _dirs: (tempfile::TempDir, tempfile::TempDir),
 }
 
@@ -34,8 +35,8 @@ async fn server() -> Server {
     let state = AppState::new(meta.clone(), Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(craft_cloud_server::serve(state, listener, std::future::pending()));
-    Server { url, meta, _dirs: (db, blobs) }
+    let task = tokio::spawn(craft_cloud_server::serve(state, listener, std::future::pending()));
+    Server { url, meta, task, _dirs: (db, blobs) }
 }
 
 fn quick() -> RunOptions {
@@ -172,6 +173,7 @@ const ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/pairings/0192f0c4-0000-7000-8000-000000000000"),
     ("DELETE", "/v1/pairings/0192f0c4-0000-7000-8000-000000000000"),
     ("GET", "/v1/devices"),
+    ("GET", "/v1/usage"),
     ("DELETE", "/v1/devices/0192f0c4-0000-7000-8000-000000000000"),
     ("POST", "/v1/autostart"),
 ];
@@ -520,6 +522,53 @@ async fn signed_in(server: &Server, data: &DataDir, folder: &Path) -> (Running, 
     assert_eq!(code, 200, "{body}");
     eventually("signed in and idle", || status(&api).run_state == RunState::Idle).await;
     (running, api)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn usage_reads_through_to_the_server_without_caching() {
+    let server = server().await;
+    let data = DataDir::new(tempfile::tempdir().unwrap().keep());
+    let folder = tempfile::tempdir().unwrap();
+    let (_running, api) = signed_in(&server, &data, folder.path()).await;
+    let account = data.load_account().unwrap().unwrap();
+    let transport = craft_cloud_agent::http::HttpTransport::new(account.server.clone(), &account.token).unwrap();
+    std::fs::write(folder.path().join("usage-first.bin"), b"first payload").unwrap();
+    reaches_the_server(&server, "usage-first.bin").await;
+    let server_first = transport.usage().await.unwrap();
+    let (code, body) = call(&api, "GET", "/v1/usage", "");
+    assert_eq!(code, 200, "{body}");
+    let local_first: craft_cloud_proto::api::AccountUsage = serde_json::from_str(&body).unwrap();
+    assert_eq!(local_first, server_first, "the local API passes nonzero numbers through unchanged");
+    assert!(local_first.stored_bytes > 0);
+
+    std::fs::write(folder.path().join("usage-second.bin"), b"a different payload for fresh usage").unwrap();
+    reaches_the_server(&server, "usage-second.bin").await;
+    let server_second = transport.usage().await.unwrap();
+    let (code, body) = call(&api, "GET", "/v1/usage", "");
+    assert_eq!(code, 200, "{body}");
+    let local_second: craft_cloud_proto::api::AccountUsage = serde_json::from_str(&body).unwrap();
+    assert_eq!(local_second, server_second, "a second request sees server changes; no cache");
+    assert!(local_second.stored_bytes > local_first.stored_bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn usage_refuses_signed_out_and_reports_server_unreachable() {
+    let server = server().await;
+    let data = DataDir::new(tempfile::tempdir().unwrap().keep());
+    let running = Running::start(&data);
+    let api = api_file(data.path()).await;
+    let (code, body) = call(&api, "GET", "/v1/usage", "");
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(error_code(&body), codes::NOT_SIGNED_IN);
+    let _ = running.stop().await;
+
+    let folder = tempfile::tempdir().unwrap();
+    let (running, api) = signed_in(&server, &data, folder.path()).await;
+    server.task.abort();
+    let (code, body) = call(&api, "GET", "/v1/usage", "");
+    assert_eq!(code, 503, "{body}");
+    assert_eq!(error_code(&body), codes::OFFLINE);
+    drop(running);
 }
 
 async fn reaches_the_server(server: &Server, name: &str) {

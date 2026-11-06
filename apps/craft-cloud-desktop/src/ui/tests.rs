@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use craft_cloud_app::{AccountUsage, Error};
 use craft_cloud_app::{DeviceId, DeviceInfo, PairingInfo, RunState, Status, Uuid};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
@@ -180,6 +181,116 @@ fn signed_in_model(status: Status) -> Model {
     let mut model = after(&FakeAgent::new(status), Vec::new());
     model.update(Event::Devices(Ok(devices())));
     model
+}
+
+fn usage(stored_bytes: u64, quota_bytes: Option<u64>, complete: bool) -> AccountUsage {
+    AccountUsage {
+        stored_bytes,
+        quota_bytes,
+        trash_bytes: complete.then_some(20),
+        history_bytes: complete.then_some(30),
+        estimates: craft_cloud_proto::api::UsageEstimates {
+            index_complete: complete,
+            reason: (!complete).then_some(craft_cloud_proto::api::UsageEstimateReason::IndexIncomplete),
+        },
+    }
+}
+
+#[test]
+fn snapshot_storage_states() {
+    let with_quota = signed_in_with_usage(Ok(usage(11, Some(100), true)));
+    snapshot(with_quota, egui::Theme::Light, "storage-with-quota");
+
+    let no_quota = signed_in_with_usage(Ok(usage(11, None, true)));
+    snapshot(no_quota, egui::Theme::Light, "storage-no-quota");
+
+    let estimates_unavailable = signed_in_with_usage(Ok(usage(11, Some(100), false)));
+    snapshot(estimates_unavailable, egui::Theme::Light, "storage-estimates-unavailable");
+
+    let error = signed_in_with_usage(Err(Error::Refused { code: "offline".into(), message: "can't reach the server".into() }));
+    snapshot(error, egui::Theme::Light, "storage-error");
+}
+
+fn signed_in_with_usage(result: Result<AccountUsage, Error>) -> Model {
+    let agent = FakeAgent::new(signed_in());
+    *agent.usage_result.lock().unwrap() = Some(result);
+    after(&agent, Vec::new())
+}
+
+#[test]
+fn storage_refresh_requests_a_fresh_server_answer() {
+    let mut model = signed_in_model(signed_in());
+    assert_eq!(model.update(Event::RefreshUsage), vec![Effect::Usage(2)]);
+    let Screen::SignedIn(overview) = model.screen else { panic!("signed-in screen expected") };
+    assert!(overview.usage_loading);
+    assert_eq!(overview.usage_error, None);
+}
+
+#[test]
+fn storage_refresh_click_sends_a_request_and_loading_blocks_duplicates() {
+    let mut h = harness(signed_in_model(signed_in()), egui::Theme::Light);
+    h.run_steps(2);
+    h.query_all_by_label("Refresh").next().unwrap().click();
+    h.run_steps(2);
+    let (model, events) = h.state_mut();
+    assert!(events.contains(&Event::RefreshUsage));
+    assert_eq!(model.update(Event::RefreshUsage), vec![Effect::Usage(2)]);
+    assert!(model.update(Event::RefreshUsage).is_empty(), "already loading blocks repeat request");
+}
+
+#[test]
+fn stale_refresh_answer_cannot_replace_a_newer_answer() {
+    let mut model = Model::new(defaults(), true, String::new());
+    let first = model
+        .update(Event::Found(Ok(signed_in())))
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::Usage(id) => Some(id),
+            _ => None,
+        })
+        .expect("signed-in overview asks for usage");
+    model.update(Event::Usage { request_id: first, result: Ok(usage(11, None, true)) });
+    let second = model
+        .update(Event::RefreshUsage)
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::Usage(id) => Some(id),
+            _ => None,
+        })
+        .expect("refresh asks again");
+    model.update(Event::Usage { request_id: second, result: Ok(usage(25, None, true)) });
+    model.update(Event::Usage { request_id: first, result: Err(Error::Refused { code: "offline".into(), message: "old error".into() }) });
+    let Screen::SignedIn(overview) = &model.screen else { panic!("signed-in screen expected") };
+    assert!(!overview.usage_loading);
+    assert_eq!(overview.usage_error, None);
+    assert_eq!(overview.usage.as_ref().map(|value| value.stored_bytes), Some(25));
+}
+
+#[test]
+fn usage_answer_from_previous_sign_in_cannot_replace_new_account_state() {
+    let mut model = Model::new(defaults(), true, String::new());
+    let old_request = model
+        .update(Event::Found(Ok(signed_in())))
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::Usage(id) => Some(id),
+            _ => None,
+        })
+        .expect("signed-in overview asks for usage");
+    model.update(Event::Polled(Ok(signed_out())));
+    let new_request = model
+        .update(Event::Polled(Ok(signed_in())))
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::Usage(id) => Some(id),
+            _ => None,
+        })
+        .expect("new sign-in asks for usage");
+    model.update(Event::Usage { request_id: new_request, result: Ok(usage(20, None, true)) });
+    model.update(Event::Usage { request_id: old_request, result: Ok(usage(999, None, true)) });
+    let Screen::SignedIn(overview) = &model.screen else { panic!("signed-in screen expected") };
+    assert!(!overview.usage_loading);
+    assert_eq!(overview.usage.as_ref().map(|value| value.stored_bytes), Some(20));
 }
 
 #[test]
