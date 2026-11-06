@@ -1027,6 +1027,11 @@ impl<C: Connection> HttpTransport<C> {
         Ok(list)
     }
 
+    /// The account's stored bytes and labeled estimates, fetched without caching.
+    pub async fn usage(&self) -> Result<craft_cloud_proto::api::AccountUsage, TransportError> {
+        json(self.send(self.request(Method::GET, "account/usage", MAX_SMALL_JSON_BYTES)).await?, MAX_SMALL_JSON_BYTES).await
+    }
+
     /// A new add-a-computer code from this device (replacing its open one).
     pub async fn create_pairing(&self) -> Result<PairingCreated, TransportError> {
         let created: PairingCreated = json(self.send(self.request(Method::POST, "pairings", 0)).await?, MAX_SMALL_JSON_BYTES).await?;

@@ -661,6 +661,20 @@ mod tests {
     }
 
     #[test]
+    fn account_usage_decodes_complete_and_incomplete_estimates() {
+        let complete: AccountUsage =
+            serde_json::from_str(r#"{"stored_bytes":11,"quota_bytes":null,"trash_bytes":0,"history_bytes":0,"estimates":{"index_complete":true}}"#)
+                .unwrap();
+        assert_eq!(complete.estimates, UsageEstimates { index_complete: true, reason: None });
+        let incomplete: AccountUsage = serde_json::from_str(
+            r#"{"stored_bytes":11,"quota_bytes":null,"trash_bytes":null,"history_bytes":null,"estimates":{"index_complete":false,"reason":"index_incomplete"}}"#,
+        ).unwrap();
+        assert_eq!(incomplete.trash_bytes, None);
+        assert_eq!(incomplete.history_bytes, None);
+        assert_eq!(incomplete.estimates.reason, Some(UsageEstimateReason::IndexIncomplete));
+    }
+
+    #[test]
     fn a_quota_answer_says_how_much_is_used() {
         let body = ErrorBody {
             error: codes::QUOTA_EXCEEDED.into(),

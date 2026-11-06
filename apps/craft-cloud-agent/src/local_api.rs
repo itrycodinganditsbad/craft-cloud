@@ -26,8 +26,8 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::{
-    DeviceInfo, HistoryResponse, PairingStatus, RecoveryCodes, RestoreResponse, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse,
-    TwoFactorStatus, codes as api_codes,
+    AccountUsage, DeviceInfo, HistoryResponse, PairingStatus, RecoveryCodes, RestoreResponse, RevokedOthers, TwoFactorChallenge,
+    TwoFactorSetupResponse, TwoFactorStatus, codes as api_codes,
 };
 use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
 use craft_cloud_proto::local::{
@@ -412,6 +412,7 @@ fn router(state: Api) -> Router {
         .route(paths::PAIRINGS, post(create_pairing))
         .route(&format!("{}/{{id}}", paths::PAIRINGS), get(pairing_status).delete(delete_pairing))
         .route(paths::DEVICES, get(devices))
+        .route(paths::USAGE, get(usage))
         .route(&format!("{}/{{id}}", paths::DEVICES), delete(remove_device).patch(rename_device).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route(paths::AUTOSTART, post(set_autostart))
         .route(paths::PAUSE, post(pause))
@@ -820,6 +821,12 @@ async fn delete_pairing(State(state): State<Api>, id: Result<Path<uuid::Uuid>, P
 async fn devices(State(state): State<Api>) -> Result<Json<Vec<DeviceInfo>>, LocalError> {
     let (_, transport) = server_api(&state)?;
     Ok(Json(transport.devices().await.map_err(AgentError::from)?))
+}
+
+/// `GET /v1/usage`: asks the signed-in account's server each time; nothing is cached.
+async fn usage(State(state): State<Api>) -> Result<Json<AccountUsage>, LocalError> {
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.usage().await.map_err(AgentError::from)?))
 }
 
 /// Removes (revokes) another computer of the account; answered with the list as it is then. This computer can't be

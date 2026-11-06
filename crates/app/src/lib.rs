@@ -335,6 +335,11 @@ impl Client {
         self.call("GET", paths::DEVICES, None, http::SLOW_TIMEOUT)
     }
 
+    /// The signed-in account's storage usage and labeled estimates. Asks the server each time.
+    pub fn usage(&self) -> Result<AccountUsage, Error> {
+        self.call("GET", paths::USAGE, None, http::SLOW_TIMEOUT)
+    }
+
     /// Removes another computer from the account (its next request is refused; its files stay there), and gives the
     /// list after. This computer is `Refused { code: "cannot_remove_self" }`: that is [`Client::logout`]. Asks the
     /// server: call it off the UI thread.
@@ -979,6 +984,16 @@ mod tests {
         let (_dir, agent, _asked) = fake_agent(vec![(409, refused)]);
         let result = agent.restore_from_trash(id);
         assert!(matches!(result, Err(Error::Refused { ref code, name_taken: Some(true), .. }) if code == "conflict"), "{result:?}");
+    }
+
+    #[test]
+    fn usage_maps_unauthorized_and_uses_the_local_route() {
+        let answer = json(&ErrorAnswer { error: "unauthorized".into(), message: "not signed in".into(), name_taken: None });
+        let (_dir, agent, asked) = fake_agent(vec![(401, answer)]);
+        let result = agent.usage();
+        assert!(matches!(result, Err(Error::Refused { ref code, .. }) if code == "unauthorized"), "{result:?}");
+        let (method, path, _) = asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((method.as_str(), path.as_str()), ("GET", paths::USAGE));
     }
 
     /// An agent that takes the connection but never answers (hung, or something else on its port) costs a
