@@ -994,7 +994,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                     None => stop_open = false,
                 },
                 command = commands.recv(), if commands_open => match command {
-                    Some(Command::Login(_, reply) | Command::Join(_, reply)) => {
+                    Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::LoginSecondFactor(_, reply)) => {
                         let _ = reply.send(Err(crate::cli::already_signed_in(&account)));
                     }
                     // Signed out on the server first (an unreachable server changes nothing, and syncing goes on); then
@@ -1178,7 +1178,7 @@ async fn wait_needing_you(
                         let _ = reply.send(Err(e));
                     }
                 },
-                Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
+                Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::LoginSecondFactor(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
                     let _ = reply.send(Err(AgentError::NeedsYou(reason.to_owned())));
                 }
                 Some(Command::Quit(reply)) => {
@@ -1227,6 +1227,20 @@ async fn wait_for_sign_in(
                         return SignedOut::SignedIn;
                     }
                 }
+                Some(Command::LoginSecondFactor(request, reply)) => {
+                    let args = LoginArgs {
+                        url: request.server.clone(),
+                        user: request.user.clone(),
+                        folder: request.folder.as_ref().map(std::path::PathBuf::from),
+                        device_name: request.device_name.clone(),
+                        adopt: request.adopt,
+                    };
+                    let factor = crate::http::Factor { totp_code: request.totp_code.clone(), recovery_code: request.recovery_code.clone() };
+                    let result = crate::cli::login_second_factor_locked(data, &args, &request.challenge, &factor).await;
+                    if signed_in(result, "signed in", control, reply, out) {
+                        return SignedOut::SignedIn;
+                    }
+                }
                 Some(Command::Join(request, reply)) => {
                     let args = JoinArgs {
                         join: request.join.clone(),
@@ -1236,7 +1250,9 @@ async fn wait_for_sign_in(
                         // The caller asks for it with `POST /v1/autostart` once joined.
                         autostart: false,
                     };
-                    let result = crate::cli::join_locked(data, &args, request.password.as_deref()).await;
+                    let factor = (request.totp_code.is_some() || request.recovery_code.is_some())
+                        .then(|| crate::http::Factor { totp_code: request.totp_code.clone(), recovery_code: request.recovery_code.clone() });
+                    let result = crate::cli::join_locked(data, &args, request.password.as_deref(), factor.as_ref()).await;
                     if signed_in(result, "joined", control, reply, out) {
                         return SignedOut::SignedIn;
                     }

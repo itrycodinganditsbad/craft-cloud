@@ -3,6 +3,7 @@
 //! (`craft-cloud-agent run`), which it reaches through `craft-cloud-app` and starts when none answers.
 //!
 //! - [`model`]: the state and every way between its screens, pure (unit-tested against a fake agent).
+//! - [`security`]: the Security page and the code a join asks for (two-factor sign-in).
 //! - [`agent`]: the agent's calls behind a trait, run off the UI thread.
 //! - [`start_agent`]: starting the agent from this app's folder.
 //! - [`single_instance`]: one app per user; a second start brings the first window forward.
@@ -14,6 +15,7 @@ pub mod agent;
 pub mod app;
 pub mod autostart;
 pub mod model;
+pub mod security;
 pub mod single_instance;
 pub mod start_agent;
 pub mod tray;
