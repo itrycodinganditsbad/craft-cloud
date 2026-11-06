@@ -151,8 +151,10 @@ pub enum MetaError {
 /// How long a SQLite connection waits for a lock another connection or program holds before giving up.
 pub const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The most deleted items below one folder that restoring or removing the folder from the trash takes with it. A
-/// folder with more is refused as a whole, so a restore or a removal is never partial.
+/// The most deleted items below one folder that restoring or removing the folder from the trash takes with it in one
+/// call, shallowest first. What is beyond stays in the trash and, once its folder is live or removed from the trash,
+/// appears in the trash list on its own, to be restored or removed by a further call. The bound keeps the work done
+/// under the space's write lock by one call small.
 pub const MAX_TRASH_TREE_NODES: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,8 +301,7 @@ impl Meta {
     }
 
     /// The store with another cap on the deleted items below one folder that restoring or removing the folder from the
-    /// trash takes with it (the default is [`MAX_TRASH_TREE_NODES`]); a folder with more is refused with
-    /// [`MetaError::Invalid`] and nothing is changed. For tests.
+    /// trash takes with it in one call (the default is [`MAX_TRASH_TREE_NODES`]); the rest stays in the trash. For tests.
     pub fn with_trash_tree_cap(mut self, cap: u64) -> Self {
         self.trash_tree_cap = cap;
         self
