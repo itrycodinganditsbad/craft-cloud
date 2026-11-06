@@ -69,6 +69,14 @@ pub(super) fn show(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: 
     if super::wide_button(ui, true, "Add a computer") {
         events.push(Event::AddComputer);
     }
+    ui.horizontal(|ui| {
+        if ui.button("File versions…").clicked() {
+            events.push(Event::OpenVersions);
+        }
+        if ui.button("Trash…").clicked() {
+            events.push(Event::OpenTrash);
+        }
+    });
     ui.add_space(14.0);
 
     super::computers::list(ui, o, now_ms, events);
