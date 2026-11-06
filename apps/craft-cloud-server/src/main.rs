@@ -35,7 +35,7 @@ async fn run_server(config_path: &std::path::Path) -> Result<(), String> {
         tracing::warn!("ignore_forwarded_for is set: every client shares one address for sign-in rate limits");
     }
     let (meta, store) = open(&config).await.map_err(|e| e.to_string())?;
-    let state = AppState::new(meta, store, config.trusted_proxies.clone()).map_err(|e| e.message)?;
+    let state = AppState::new(meta, store, config.trusted_proxies.clone()).map_err(|e| e.message)?.with_trash_days(config.retention.trash_days);
     let listener = tokio::net::TcpListener::bind(config.listen).await.map_err(|e| format!("can't listen on {}: {e}", config.listen))?;
     tracing::info!(listen = %config.listen, behind_proxy = config.behind_proxy, "Craft Cloud server running");
     let shutdown = async {

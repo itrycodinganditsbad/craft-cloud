@@ -55,6 +55,38 @@ invite replaces the old one, and `user invite --revoke name` ends it. Every late
 that is signed in (`craft-cloud-agent add-computer`, see [`agent.md`](agent.md)). Codes that don't work are refused alike (wrong,
 expired or used), and an address that tries ten in a minute is held off for the rest of it.
 
+## Version history
+
+The server keeps every version of every file; nothing is thinned or removed yet. A signed-in device can list a file's
+versions (`GET /api/v1/nodes/{id}/history`) and make an old one current again (`POST /api/v1/nodes/{id}/restore`),
+which adds a new version at the end of the file's history rather than rewinding it, so other computers pick it up
+through the normal change feed. This needs no setting and no database migration, and an older server answers
+`not_found` for both paths. The agent and the apps do not use them yet.
+
+## The trash
+
+A deleted file or folder stays in the trash, and in the server's records, until it is removed for good. A signed-in
+device lists the trash (`GET /api/v1/trash`), brings a node back (`POST /api/v1/trash/{id}/restore`, which names it
+differently if its name has been taken meanwhile) or takes it out of the trash (`DELETE /api/v1/trash/{id}`). Taking
+it out only marks it: **nothing is deleted from the server yet**, no version or chunk is freed, and the node can't be
+brought back from the trash afterwards. A folder in the trash is listed alone: everything that is in the trash below it
+(deleted and not removed from the trash) comes back with it when you bring the folder back, and goes with it when you
+take the folder out, **also a file that was deleted on its own, earlier, inside that folder**. Those items are listed
+only through the folder. A folder brings back, or takes out, up to 10,000 items below it at once, the shallowest first; if
+there are more, the rest then appears in the trash list on its own (its folder is live again or out of the trash), and
+you bring it back or remove it by a further call. The only setting is the number of days a deleted node waits, shown to clients as
+`purge_after_ms`; it removes nothing yet:
+
+```toml
+[retention]
+trash_days = 30   # 1 to 3650
+```
+
+A file brought back gets a new version with its old content, so another computer's delete that was sent just before can't delete it again. Update the agents with or soon after the server: an older agent can delete a *folder* a second time if that folder was brought back right after a delete whose answer it never heard (the folder is empty and can be brought back again).
+
+The change adds two columns and an index to the metadata (migration 0009 in the proposal). An older server refuses the
+upgraded database and rejects the `[retention]` section, so take a backup before upgrading and do not roll back.
+
 ## Restoring a backup
 
 With the server stopped, restore the database and the chunk storage from the backup, then run
