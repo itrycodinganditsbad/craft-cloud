@@ -89,6 +89,11 @@ pub enum StoreError {
 /// Moves raw bytes. Implementations don't check anything; [`Store`] does.
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
+    /// What kind of storage this is, for the admin's server overview (`disk`, `s3` or `memory`). A backend that
+    /// doesn't say is `other`. Never a path, an address or a setting.
+    fn kind(&self) -> &'static str {
+        "other"
+    }
     /// Writes the object atomically: a reader sees the old object, the new one, or none, never a mix.
     async fn put_raw(&self, path: &str, data: Bytes) -> Result<(), StoreError>;
     /// `None` when there is no such object.
@@ -106,6 +111,11 @@ pub struct Store {
 impl Store {
     pub fn new(backend: impl Backend) -> Self {
         Self { backend: Arc::new(backend) }
+    }
+
+    /// The backend's kind (`disk`, `s3`, `memory` or `other`).
+    pub fn kind(&self) -> &'static str {
+        self.backend.kind()
     }
 
     /// Stores `data` under `key` after checking its size and hash. Storing a blob that is already there

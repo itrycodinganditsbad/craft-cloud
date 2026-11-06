@@ -69,6 +69,10 @@ pub(super) fn show(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: 
     if super::wide_button(ui, true, "Add a computer") {
         events.push(Event::AddComputer);
     }
+    ui.add_space(4.0);
+    if ui.button("Security…").on_hover_text("Two-factor sign-in, your password, your other computers").clicked() {
+        events.push(Event::OpenSecurity);
+    }
     ui.add_space(14.0);
 
     super::computers::list(ui, o, now_ms, events);

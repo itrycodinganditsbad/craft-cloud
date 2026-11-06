@@ -15,6 +15,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use craft_cloud_meta::{DeviceAuth, Role};
 use craft_cloud_proto::api::EPOCH_HEADER;
 
 use crate::error::ApiError;
@@ -42,6 +43,13 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
         Ok(parsed) => Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok(),
         Err(_) => false,
     }
+}
+
+/// Whether a stored password hash can be verified at all. An account made by an invite has no password yet (an empty hash): a
+/// sign-in must still spend a full Argon2id check on it (against the dummy hash, see [`AppState::dummy_hash`]) and then fail
+/// whatever was typed, or the answer's timing tells a pending account from an unknown name.
+pub fn usable_hash(hash: &str) -> bool {
+    PasswordHash::new(hash).is_ok()
 }
 
 /// A new device token and the hash to store for it.
@@ -86,6 +94,19 @@ pub async fn require_device(State(state): State<Arc<AppState>>, mut request: Req
     Ok(response)
 }
 
+/// Lets only an admin through, after [`require_device`] (it reads the device that layer put in the request extensions).
+/// The role is the one `device_by_token` read from the database for this request, never cached, so a demoted admin
+/// loses access with the next request. It is only the first check: every admin change checks the role again inside
+/// its transaction.
+pub async fn require_admin(request: Request, next: Next) -> Result<Response, ApiError> {
+    match request.extensions().get::<DeviceAuth>() {
+        Some(device) if device.role == Role::Admin => Ok(next.run(request).await),
+        Some(_) => Err(ApiError::forbidden("this needs an administrator account")),
+        // Not reachable behind `require_device`; a request without a device is not signed in.
+        None => Err(ApiError::unauthorized()),
+    }
+}
+
 impl AppState {
     /// Updates the device's `last used` time, at most once a minute (every write takes the SQLite write lock).
     async fn touch(&self, device: craft_cloud_proto::DeviceId, now: i64) {
@@ -116,6 +137,13 @@ mod tests {
         assert!(verify_password("correct horse", &hash));
         assert!(!verify_password("wrong horse", &hash));
         assert!(!verify_password("correct horse", "not a hash"));
+    }
+
+    #[test]
+    fn only_a_parseable_hash_is_usable() {
+        assert!(usable_hash(&hash_password("correct horse").unwrap()));
+        assert!(!usable_hash(""), "an invited account has no password yet");
+        assert!(!usable_hash("not a hash"));
     }
 
     #[test]

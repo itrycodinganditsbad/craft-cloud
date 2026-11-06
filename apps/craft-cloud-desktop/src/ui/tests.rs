@@ -77,7 +77,19 @@ fn after(agent: &FakeAgent, events: Vec<Event>) -> Model {
 
 fn devices() -> Vec<DeviceInfo> {
     vec![
-        DeviceInfo { id: DeviceId::generate(), name: "lptp1".into(), created_ms: 0, last_used_ms: NOW - 5_000, revoked: false, current: true },
+        DeviceInfo {
+            id: DeviceId::generate(),
+            name: "lptp1".into(),
+            created_ms: 0,
+            last_used_ms: NOW - 5_000,
+            revoked: false,
+            current: true,
+            client_kind: String::new(),
+            platform: String::new(),
+            app_version: String::new(),
+            revoked_ms: None,
+            revoke_reason: None,
+        },
         DeviceInfo {
             id: DeviceId::generate(),
             name: "BEAST".into(),
@@ -85,6 +97,11 @@ fn devices() -> Vec<DeviceInfo> {
             last_used_ms: NOW - 3 * 3_600_000,
             revoked: false,
             current: false,
+            client_kind: String::new(),
+            platform: String::new(),
+            app_version: String::new(),
+            revoked_ms: None,
+            revoke_reason: None,
         },
     ]
 }
