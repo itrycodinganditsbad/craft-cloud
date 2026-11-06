@@ -494,6 +494,25 @@ pub fn check_compatible(info: &InfoResponse) -> Result<(), TransportError> {
     Ok(())
 }
 
+/// The most bytes the server takes of a device's `platform` or `app_version`.
+const MAX_DEVICE_DETAIL_BYTES: usize = 32;
+
+/// What this agent says about itself when it signs in or joins: `agent`, the operating system and the crate's
+/// version, for the account's device list (display only). The server takes at most 32 bytes without control
+/// characters per field, so a longer value is cut at a character boundary rather than refused.
+fn device_details() -> (Option<String>, Option<String>, Option<String>) {
+    fn limited(text: &str) -> String {
+        text.chars()
+            .filter(|c| !c.is_control())
+            .scan(0usize, |len, c| {
+                *len += c.len_utf8();
+                (*len <= MAX_DEVICE_DETAIL_BYTES).then_some(c)
+            })
+            .collect()
+    }
+    (Some("agent".to_owned()), Some(limited(std::env::consts::OS)), Some(limited(env!("CARGO_PKG_VERSION"))))
+}
+
 /// Signs in and creates a device. `Unauthorized` means a wrong username or password.
 pub async fn login(server: &ServerUrl, username: &str, password: &str, device_name: &str) -> Result<LoginResponse, TransportError> {
     login_over(&Reqwest::new(server)?, server, username, password, device_name).await
@@ -507,8 +526,15 @@ pub async fn login_over<C: Connection>(
     password: &str,
     device_name: &str,
 ) -> Result<LoginResponse, TransportError> {
-    let body =
-        LoginRequest { username: username.to_owned(), password: password.to_owned(), device_name: device_name.to_owned(), ..LoginRequest::default() };
+    let (client_kind, platform, app_version) = device_details();
+    let body = LoginRequest {
+        username: username.to_owned(),
+        password: password.to_owned(),
+        device_name: device_name.to_owned(),
+        client_kind,
+        platform,
+        app_version,
+    };
     let req = request(Method::POST, server.endpoint("auth/login"), None, 0).json(&body)?;
     json(connection.send(req).await?, MAX_SMALL_JSON_BYTES).await
 }
@@ -624,8 +650,15 @@ pub async fn login_step_over<C: Connection>(
     password: &str,
     device_name: &str,
 ) -> Result<LoginStep, CallError> {
-    let body =
-        LoginRequest { username: username.to_owned(), password: password.to_owned(), device_name: device_name.to_owned(), ..LoginRequest::default() };
+    let (client_kind, platform, app_version) = device_details();
+    let body = LoginRequest {
+        username: username.to_owned(),
+        password: password.to_owned(),
+        device_name: device_name.to_owned(),
+        client_kind,
+        platform,
+        app_version,
+    };
     let req = request(Method::POST, server.endpoint("auth/login"), None, 0).json(&body)?;
     let resp = connection.send(req).await?;
     if resp.status.is_success() {
@@ -730,13 +763,16 @@ pub async fn join_over_with<C: Connection>(
     password: Option<&str>,
     factor: Option<&Factor>,
 ) -> Result<LoginResponse, JoinError> {
+    let (client_kind, platform, app_version) = device_details();
     let body = JoinRequest {
         code: code.to_owned(),
         device_name: device_name.to_owned(),
         password: password.map(str::to_owned),
         totp_code: factor.and_then(|f| f.totp_code.clone()),
         recovery_code: factor.and_then(|f| f.recovery_code.clone()),
-        ..JoinRequest::default()
+        client_kind,
+        platform,
+        app_version,
     };
     let req = request(Method::POST, server.endpoint("join"), None, 0).json(&body).map_err(JoinError::Transport)?;
     let resp = connection.send(req).await.map_err(JoinError::Transport)?;
