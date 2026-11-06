@@ -59,6 +59,18 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
   and `--adopt` as for `login`) signs it in. An admin's invite (`user invite`, in [`server.md`](server.md)) works the same way; for a new
   account, `join` asks for its password twice on standard input. A code that doesn't work says so, without saying
   why: make a new one.
+- An account with two-factor sign-in (turned on in the app's Security page; see "Two-factor sign-in" in
+  [`server.md`](server.md)) asks for a second step at `login` and at `join`: after the password, the command prints
+  `This account has two-factor sign-in. Type the code from your authenticator app (or a recovery code):` and reads one line
+  from standard input, so a script gives the password line and then the code line. The code is never an argument and
+  is never stored; a wrong one may be typed again twice (the server itself allows five wrong codes per sign-in). Six digits
+  are a code from the app; anything else is taken as a recovery code, which works once. Too many wrong codes lock the
+  account's second step for a while: the command says how long, and the lock does not sign anything out. For a `join` that
+  needs a code the invite isn't used up until the code is right. A running agent (`run`) does the same through its local
+  API; the Craft Cloud app asks for the code in its own window.
+- Rolling this out: update the server first, then the agents and the app. An agent from before two-factor sign-in can't
+  complete a sign-in for an account that has it, and it reports that as a wrong password; update the agent, nothing is
+  broken. The app on a server that doesn't know two-factor sign-in says so on its Security page instead of failing.
 - Through the running agent: `pause` and `resume` syncing (a pause holds across restarts; recents keep working),
   `quit` the agent, and `devices` to list the account's machines (`devices remove <id>` takes one out; to take this
   machine out, use `logout`).

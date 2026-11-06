@@ -174,6 +174,15 @@ const ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/devices"),
     ("DELETE", "/v1/devices/0192f0c4-0000-7000-8000-000000000000"),
     ("POST", "/v1/autostart"),
+    ("POST", "/v1/login/second-factor"),
+    ("GET", "/v1/account/two-factor"),
+    ("POST", "/v1/account/two-factor/setup"),
+    ("POST", "/v1/account/two-factor/confirm"),
+    ("POST", "/v1/account/two-factor/disable"),
+    ("POST", "/v1/account/two-factor/recovery-codes"),
+    ("POST", "/v1/account/password"),
+    ("POST", "/v1/devices/revoke-others"),
+    ("PATCH", "/v1/devices/0192f0c4-0000-7000-8000-000000000000"),
 ];
 
 /// A user session without systemd: Linux's entry is the XDG autostart file.
@@ -694,6 +703,8 @@ impl Machine {
             device_name: Some("lptp1".into()),
             adopt,
             password: password.map(str::to_owned),
+            totp_code: None,
+            recovery_code: None,
         })
         .unwrap()
     }

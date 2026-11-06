@@ -69,6 +69,10 @@ fn backend_error(e: object_store::Error) -> StoreError {
 
 #[async_trait]
 impl Backend for S3Backend {
+    fn kind(&self) -> &'static str {
+        "s3"
+    }
+
     async fn put_raw(&self, path: &str, data: Bytes) -> Result<(), StoreError> {
         self.store.put(&self.object_path(path), PutPayload::from(data)).await.map_err(backend_error)?;
         Ok(())
