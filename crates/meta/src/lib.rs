@@ -97,6 +97,10 @@ pub enum MetaError {
 /// How long a SQLite connection waits for a lock another connection or program holds before giving up.
 pub const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The most deleted items below one folder that restoring or removing the folder from the trash takes with it. A
+/// folder with more is refused as a whole, so a restore or a removal is never partial.
+pub const MAX_TRASH_TREE_NODES: u64 = 10_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dialect {
     Sqlite,
@@ -126,6 +130,9 @@ pub struct Meta {
     live_bytes_cap: u64,
     /// Edges of the reference index one transaction writes ([`Meta::with_index_batch_rows`]).
     index_rows: usize,
+    /// The most deleted items below one folder that restoring or removing the folder from the trash takes with it
+    /// ([`Meta::with_trash_tree_cap`]).
+    trash_tree_cap: u64,
 }
 
 impl Meta {
@@ -210,7 +217,16 @@ impl Meta {
             live_held_documents_cap: MAX_LIVE_DOCUMENTS_HOLDING_UPDATES,
             live_bytes_cap: DEFAULT_LIVE_BYTES_PER_SPACE,
             index_rows: INDEX_BATCH_ROWS,
+            trash_tree_cap: MAX_TRASH_TREE_NODES,
         })
+    }
+
+    /// The store with another cap on the deleted items below one folder that restoring or removing the folder from the
+    /// trash takes with it (the default is [`MAX_TRASH_TREE_NODES`]); a folder with more is refused with
+    /// [`MetaError::Invalid`] and nothing is changed. For tests.
+    pub fn with_trash_tree_cap(mut self, cap: u64) -> Self {
+        self.trash_tree_cap = cap;
+        self
     }
 
     /// The store with another cap on the bytes of updates one live document's log may hold (the default is

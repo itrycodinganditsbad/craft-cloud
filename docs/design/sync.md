@@ -658,9 +658,9 @@ methods answer `not_found` / `invalid` (405) the same way:
 | `POST /commit` | batch of version/mkdir/move/delete operations, one transaction; `409 conflict` listing every conflicting operation (a version whose manifest isn't uploaded is a `missing_manifest` conflict) |
 | `GET /nodes/{id}/history?cursor=…&limit=…` | the versions of one file of your space, newest first by `(seq, id)`, in pages (default 50, at most 200): `{versions: [{id, parent_version, epoch, seq, size, mtime_ms, device, created_ms, save, pruned}], next?}`; `next` is an opaque cursor for the next page; a folder is `invalid`, another account's or an unknown node `not_found`; a deleted file keeps its history |
 | `POST /nodes/{id}/restore` | `{version, expected_version}` → `{version, parent_version, seq, epoch}`: makes an old version's content the file's content again as a new version (see below); `409 conflict` when `expected_version` is not the current version |
-| `GET /trash?cursor=…&limit=…` | the deleted nodes of your space that were not removed from the trash, newest deletion first by `(deleted_ms, id)`, in pages (default 50, at most 200): `{items: [{id, parent, name, is_dir, size?, deleted_ms, purge_after_ms}], next?}`; `purge_after_ms` is `deleted_ms` plus `[retention] trash_days` |
-| `POST /trash/{id}/restore` | brings a node of the trash back, with its deleted folders, as one change: `{node, parent, name, renamed, version?, seq, epoch}` (a restored file has a new version); a taken name gets a conflict name (see below), a node that is not in the trash is `not_found` |
-| `DELETE /trash/{id}` | takes a node out of the trash (204): only marks it for removal, nothing is freed yet |
+| `GET /trash?cursor=…&limit=…` | the deleted nodes of your space that were not removed from the trash and whose folder is not in the trash itself (those are listed through the folder), newest deletion first by `(deleted_ms, id)`, in pages (default 50, at most 200): `{items: [{id, parent, name, is_dir, size?, deleted_ms, purge_after_ms}], next?}`; `purge_after_ms` is `deleted_ms` plus `[retention] trash_days` |
+| `POST /trash/{id}/restore` | brings a node of the trash back, with its deleted folders and, for a folder, all that is in the trash below it, as one change: `{node, parent, name, renamed, version?, seq, epoch}` (a restored file has a new version); a taken name gets a conflict name (see below), a node that is not in the trash is `not_found` |
+| `DELETE /trash/{id}` | takes a node out of the trash (204), and, for a folder, all that is in the trash below it: only marks them for removal, nothing is freed yet; more than 10,000 below a folder is `invalid` and changes nothing |
 | `GET /devices`, `DELETE /devices/{id}` | your devices |
 | `POST /pairings` | a new add-a-computer code from this device → `{id, code, expires_ms}` (the code shown once, normalised) |
 | `GET /pairings/{id}`, `DELETE /pairings/{id}` | one of your pairings: `{state: waiting\|used\|expired, device_name?}` / cancel it (204) |
@@ -692,8 +692,17 @@ deleted node without a time (damaged data) is dated at the next read of the tras
 counts as expired. `DELETE /trash/{id}` frees nothing: versions, manifests, chunks and the tombstone stay, the change feed
 and the sequence number do not change, and the node's history stays readable; the node only leaves the trash list and can
 no longer be restored from it. (An edit that brings it back still wins, as for any deleted file.) Asking twice is fine.
+A node is *in the trash* when it is deleted and not marked by `purge_requested_ms`. The list shows a node only if its
+parent is not in the trash, so a deleted folder stands for everything below it. (A folder can only be deleted once it is
+empty, so what is below it was deleted before it, in the same change or earlier; the rule does not depend on the times.)
 A restore from the trash brings back the node asked for and the deleted folders above it, root-most first, keeping their
-IDs; it creates no node and overwrites none. Under one write lock and in one transaction, with one sequence number:
+IDs; for a folder it also brings back every node below it that is in the trash, recursively, whenever it was deleted
+(a file deleted on its own earlier inside the folder comes back with it); a node marked for removal, and what hangs
+only from it, stays deleted. Each of them is revived like a single restore (new version for a file, `deleted_ms` and
+the mark cleared, `changed_seq` set); a node below the folder keeps its name, except that of two deleted nodes of one
+name in one folder the one deleted last keeps it and the other gets a conflict name. A removal of a folder marks
+everything in the trash below it the same way. Both are refused as a whole with `invalid` above 10,000 nodes below the
+folder. It creates no node and overwrites none. Under one write lock and in one transaction, with one sequence number:
 where a deleted folder's name is held by a live folder, that folder is used and what is below moves into it (the deleted
 folder stays deleted); where it is held by a file, or where the node's own name is held by anything, the node comes back
 as `name (conflict, <device>, <UTC date and minute>)` like the engine's conflict copies, with `, 2` to `, 100` if that is

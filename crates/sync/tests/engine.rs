@@ -3171,6 +3171,23 @@ async fn restore_from_trash(server: &Server, user: &craft_cloud_meta::UserRecord
     server.meta.restore_from_trash(user.space, device, node, 1_760_000_000_000).await.unwrap();
 }
 
+/// Takes `node` out of the trash (marks it for removal), as the web or an admin tool would.
+async fn remove_from_trash(server: &Server, user: &craft_cloud_meta::UserRecord, node: craft_cloud_proto::NodeId) {
+    server.meta.request_purge(user.space, node, 1_760_000_000_000).await.unwrap();
+}
+
+/// Brings the nodes named in `steps` back from the trash, in order; a name with a `-` in front is taken out of the trash
+/// instead (and with it what is below it). Restoring a folder brings back all that is in the trash below it, so a test
+/// that wants a folder alone removes the rest first.
+async fn trash_steps(server: &Server, user: &craft_cloud_meta::UserRecord, steps: &[&str]) {
+    for step in steps {
+        match step.strip_prefix('-') {
+            Some(name) => remove_from_trash(server, user, node_named(server, user, name).await).await,
+            None => restore_from_trash(server, user, node_named(server, user, step).await).await,
+        }
+    }
+}
+
 /// A machine deleted a file, the server applied it, the answer was lost; the file is brought back from the trash
 /// before the machine syncs again. The machine's delete must not be sent again: the file comes back, on both machines.
 #[tokio::test]
@@ -3314,9 +3331,7 @@ async fn lost_delete_of_a_folder_with_a_file(restore: &[&str]) -> (common::Machi
     a.fs_mut().remove_dir(&path("d")).unwrap();
     a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
     assert!(a.sync_once().await.is_err());
-    for name in restore {
-        restore_from_trash(&server, &ana, node_named(&server, &ana, name).await).await;
-    }
+    trash_steps(&server, &ana, restore).await;
     settle(&mut [&mut a, &mut b], 6).await;
     settle(&mut [&mut a, &mut b], 3).await;
     (a, b, server, ana)
@@ -3324,7 +3339,7 @@ async fn lost_delete_of_a_folder_with_a_file(restore: &[&str]) -> (common::Machi
 
 #[tokio::test]
 async fn a_non_empty_folder_restored_alone_after_a_lost_delete_answer_is_not_deleted_again() {
-    let (a, b, server, ana) = lost_delete_of_a_folder_with_a_file(&["d"]).await;
+    let (a, b, server, ana) = lost_delete_of_a_folder_with_a_file(&["-f.txt", "d"]).await;
     assert_eq!(a.fs().dirs(), vec![path("d")]);
     assert_eq!(b.fs().dirs(), vec![path("d")]);
     assert!(files(&a).is_empty() && files(&b).is_empty(), "the file stays in the trash");
@@ -3333,9 +3348,10 @@ async fn a_non_empty_folder_restored_alone_after_a_lost_delete_answer_is_not_del
     assert_eq!(c.fs().dirs(), vec![path("d")], "the server still has the folder");
 }
 
+/// A folder restored brings back the file that was deleted with it, which is not deleted a second time either.
 #[tokio::test]
-async fn a_folder_and_its_file_both_restored_after_a_lost_delete_answer_come_back() {
-    let (a, b, _server, _ana) = lost_delete_of_a_folder_with_a_file(&["d", "f.txt"]).await;
+async fn a_folder_restored_after_a_lost_delete_answer_comes_back_with_its_file() {
+    let (a, b, _server, _ana) = lost_delete_of_a_folder_with_a_file(&["d"]).await;
     let expected = vec![("d/f.txt".to_owned(), b"keep me".to_vec())];
     assert_eq!(files(&a), expected);
     assert_eq!(files(&b), expected);
@@ -3373,9 +3389,7 @@ async fn lost_delete_of_a_nested_tree(
     }
     a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
     assert!(a.sync_once().await.is_err());
-    for name in restore {
-        restore_from_trash(&server, &ana, node_named(&server, &ana, name).await).await;
-    }
+    trash_steps(&server, &ana, restore).await;
     settle(&mut [&mut a, &mut b], 6).await;
     settle(&mut [&mut a, &mut b], 3).await;
     (a, b, server, ana)
@@ -3395,13 +3409,13 @@ async fn assert_only_dirs(m: (common::Machine, common::Machine, Server, craft_cl
 
 #[tokio::test]
 async fn a_nested_folder_restored_alone_after_a_lost_delete_answer_is_not_deleted_again() {
-    let m = lost_delete_of_a_nested_tree(&["d", "d/sub"], "d/sub/f.txt", &["d"]).await;
+    let m = lost_delete_of_a_nested_tree(&["d", "d/sub"], "d/sub/f.txt", &["-sub", "d"]).await;
     assert_only_dirs(m, &["d"]).await;
 }
 
 #[tokio::test]
 async fn a_nested_folder_and_its_subfolder_restored_after_a_lost_delete_answer_come_back() {
-    let m = lost_delete_of_a_nested_tree(&["d", "d/sub"], "d/sub/f.txt", &["d", "sub"]).await;
+    let m = lost_delete_of_a_nested_tree(&["d", "d/sub"], "d/sub/f.txt", &["-f.txt", "d"]).await;
     assert_only_dirs(m, &["d", "d/sub"]).await;
 }
 
@@ -3416,19 +3430,19 @@ async fn only_the_deepest_file_restored_after_a_lost_delete_answer_brings_the_wh
 
 #[tokio::test]
 async fn a_three_deep_folder_restored_alone_after_a_lost_delete_answer_is_not_deleted_again() {
-    let m = lost_delete_of_a_nested_tree(&["d", "d/a", "d/a/b"], "d/a/b/f.txt", &["d"]).await;
+    let m = lost_delete_of_a_nested_tree(&["d", "d/a", "d/a/b"], "d/a/b/f.txt", &["-a", "d"]).await;
     assert_only_dirs(m, &["d"]).await;
 }
 
 #[tokio::test]
 async fn a_three_deep_folder_and_its_middle_folder_restored_after_a_lost_delete_answer_come_back() {
-    let m = lost_delete_of_a_nested_tree(&["d", "d/a", "d/a/b"], "d/a/b/f.txt", &["d", "a"]).await;
+    let m = lost_delete_of_a_nested_tree(&["d", "d/a", "d/a/b"], "d/a/b/f.txt", &["-b", "d"]).await;
     assert_only_dirs(m, &["d", "d/a"]).await;
 }
 
 #[tokio::test]
 async fn only_the_deepest_folder_restored_after_a_lost_delete_answer_brings_its_parents_back() {
-    let m = lost_delete_of_a_nested_tree(&["d", "d/a", "d/a/b"], "d/a/b/f.txt", &["b"]).await;
+    let m = lost_delete_of_a_nested_tree(&["d", "d/a", "d/a/b"], "d/a/b/f.txt", &["-f.txt", "b"]).await;
     assert_only_dirs(m, &["d", "d/a", "d/a/b"]).await;
 }
 
@@ -3501,7 +3515,7 @@ async fn a_nested_relist_keeps_only_the_restored_parent() {
     a.fs_mut().remove_dir(&path("d")).unwrap();
     a.transport().faults.lose_commit_reply.store(true, Ordering::Relaxed);
     assert!(a.sync_once().await.is_err());
-    restore_from_trash(&server, &ana, node_named(&server, &ana, "d").await).await;
+    trash_steps(&server, &ana, &["-sub", "d"]).await;
     a.transport().faults.resync_next_changes.store(true, Ordering::Relaxed);
 
     settle(&mut [&mut a, &mut b], 6).await;
