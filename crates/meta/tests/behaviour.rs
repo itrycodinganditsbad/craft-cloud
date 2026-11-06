@@ -2697,7 +2697,7 @@ async fn folder_with_deleted_files(meta: &Meta, u: &UserRecord, dev: DeviceId, f
     (dir, files)
 }
 
-fn sorted(mut ids: Vec<NodeId>) -> Vec<NodeId> {
+fn sorted_nodes(mut ids: Vec<NodeId>) -> Vec<NodeId> {
     ids.sort();
     ids
 }
@@ -2711,7 +2711,7 @@ async fn a_folder_restore_takes_at_most_the_cap_below_it(meta: &Meta) {
     let small = meta.clone().with_trash_tree_cap(3);
     let (dir, files) = folder_with_deleted_files(meta, &u, dev, "flat", 5, NOW).await;
     let (exact, exact_files) = folder_with_deleted_files(meta, &u, dev, "exact", 3, NOW + 100).await;
-    assert_eq!(sorted(trash_ids(meta, &u).await), sorted(vec![dir, exact]));
+    assert_eq!(sorted_nodes(trash_ids(meta, &u).await), sorted_nodes(vec![dir, exact]));
 
     let before = meta.space_info(u.space).await.unwrap();
     let done = small.restore_from_trash(u.space, dev, dir, NOW).await.unwrap();
@@ -2723,9 +2723,9 @@ async fn a_folder_restore_takes_at_most_the_cap_below_it(meta: &Meta) {
     for f in &files[..2] {
         assert!(live_name(meta, &u, *f).await.2, "the oldest two stay in the trash");
     }
-    assert_eq!(sorted(trash_ids(meta, &u).await), sorted(vec![exact, files[0], files[1]]), "the rest is listed on its own");
+    assert_eq!(sorted_nodes(trash_ids(meta, &u).await), sorted_nodes(vec![exact, files[0], files[1]]), "the rest is listed on its own");
     small.restore_from_trash(u.space, dev, files[1], NOW).await.unwrap();
-    assert_eq!(sorted(trash_ids(meta, &u).await), sorted(vec![exact, files[0]]));
+    assert_eq!(sorted_nodes(trash_ids(meta, &u).await), sorted_nodes(vec![exact, files[0]]));
 
     small.restore_from_trash(u.space, dev, exact, NOW).await.unwrap();
     for f in &exact_files {
@@ -2771,7 +2771,7 @@ async fn removing_a_folder_takes_at_most_the_cap_below_it(meta: &Meta) {
     let before = meta.space_info(u.space).await.unwrap();
     small.request_purge(u.space, dir, NOW + 50).await.unwrap();
     assert_eq!(meta.space_info(u.space).await.unwrap().seq, before.seq, "no change of the space");
-    assert_eq!(sorted(trash_ids(meta, &u).await), sorted(vec![files[0], files[1]]));
+    assert_eq!(sorted_nodes(trash_ids(meta, &u).await), sorted_nodes(vec![files[0], files[1]]));
     for f in &files[2..] {
         assert!(matches!(meta.restore_from_trash(u.space, dev, *f, NOW).await, Err(MetaError::NotFound(_))), "removed with the folder");
     }
