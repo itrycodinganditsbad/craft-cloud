@@ -118,7 +118,9 @@ on_every_backend!(
     a_folder_restore_brings_back_everything_in_the_trash_below_it,
     a_folder_restore_gives_children_of_one_name_a_conflict_name,
     removing_a_folder_from_the_trash_takes_what_is_below_it,
-    a_folder_with_too_much_below_it_is_refused_whole,
+    a_folder_restore_takes_at_most_the_cap_below_it,
+    a_folder_restore_leaves_the_rest_listed_through_its_own_folder,
+    removing_a_folder_takes_at_most_the_cap_below_it,
     only_nodes_in_the_trash_can_be_restored_or_removed,
     removing_from_the_trash_frees_nothing,
     a_trash_restore_and_a_commit_for_the_same_name_agree,
@@ -2474,7 +2476,7 @@ async fn a_folder_restore_gives_children_of_one_name_a_conflict_name(meta: &Meta
 }
 
 /// Removing a folder from the trash removes what is in the trash below it too, so nothing stays listed or restorable
-/// alone; a folder with more below it than the cap is refused whole, for a restore and for a removal.
+/// alone (up to the cap, see below).
 async fn removing_a_folder_from_the_trash_takes_what_is_below_it(meta: &Meta) {
     let u = user(meta, "ana").await;
     let dev = device(meta, &u).await;
@@ -2497,43 +2499,117 @@ async fn removing_a_folder_from_the_trash_takes_what_is_below_it(meta: &Meta) {
     }
 }
 
-async fn folder_with_deleted_children(meta: &Meta, u: &UserRecord, dev: DeviceId, folder_name: &str, children: usize, base: i64) -> NodeId {
+/// A folder `name` in the root with `count` files, the file `i` deleted at `base + 1 + i` and the folder at `base + 20`:
+/// the folder and its files, the newest deletion last.
+async fn folder_with_deleted_files(meta: &Meta, u: &UserRecord, dev: DeviceId, folder_name: &str, count: i64, base: i64) -> (NodeId, Vec<NodeId>) {
     let r = root(meta, u).await;
     let dir = folder(meta, u, dev, r, folder_name, base).await;
-    for i in 0..children {
+    let mut files = Vec::new();
+    for i in 0..count {
         let (f, v) = file_in(meta, u, dev, dir, &format!("f{i}.txt"), base).await;
-        delete_file(meta, u, dev, f, v.id, base + 1).await;
+        delete_file(meta, u, dev, f, v.id, base + 1 + i).await;
+        files.push(f);
     }
-    delete_folder(meta, u, dev, dir, base + 2).await;
-    dir
+    delete_folder(meta, u, dev, dir, base + 20).await;
+    (dir, files)
 }
 
-async fn a_folder_with_too_much_below_it_is_refused_whole(meta: &Meta) {
+fn sorted(mut ids: Vec<NodeId>) -> Vec<NodeId> {
+    ids.sort();
+    ids
+}
+
+/// A folder brings back at most the cap of what is in the trash below it, the newest deletions first among equals in
+/// depth; the rest stays in the trash, is listed on its own (its folder is live) and comes back by a further restore. A
+/// folder with exactly the cap below it brings everything.
+async fn a_folder_restore_takes_at_most_the_cap_below_it(meta: &Meta) {
     let u = user(meta, "ana").await;
     let dev = device(meta, &u).await;
     let small = meta.clone().with_trash_tree_cap(3);
-    let big = folder_with_deleted_children(meta, &u, dev, "big", 4, NOW).await;
-    let exact = folder_with_deleted_children(meta, &u, dev, "exact", 3, NOW + 10).await;
+    let (dir, files) = folder_with_deleted_files(meta, &u, dev, "flat", 5, NOW).await;
+    let (exact, exact_files) = folder_with_deleted_files(meta, &u, dev, "exact", 3, NOW + 100).await;
+    assert_eq!(sorted(trash_ids(meta, &u).await), sorted(vec![dir, exact]));
+
     let before = meta.space_info(u.space).await.unwrap();
+    let done = small.restore_from_trash(u.space, dev, dir, NOW).await.unwrap();
+    assert_eq!((done.node, done.seq), (dir, before.seq + 1), "one change of the space");
+    assert!(!live_name(meta, &u, dir).await.2);
+    for f in &files[2..] {
+        assert!(!live_name(meta, &u, *f).await.2, "the three newest deletions came back");
+    }
+    for f in &files[..2] {
+        assert!(live_name(meta, &u, *f).await.2, "the oldest two stay in the trash");
+    }
+    assert_eq!(sorted(trash_ids(meta, &u).await), sorted(vec![exact, files[0], files[1]]), "the rest is listed on its own");
+    small.restore_from_trash(u.space, dev, files[1], NOW).await.unwrap();
+    assert_eq!(sorted(trash_ids(meta, &u).await), sorted(vec![exact, files[0]]));
 
-    // Over the cap: refused, nothing marked, nothing restored.
-    assert!(matches!(small.restore_from_trash(u.space, dev, big, NOW).await, Err(MetaError::Invalid(_))));
-    assert!(matches!(small.request_purge(u.space, big, NOW).await, Err(MetaError::Invalid(_))));
-    assert_eq!(meta.space_info(u.space).await.unwrap().seq, before.seq);
-    let mut listed = trash_ids(meta, &u).await;
-    listed.sort();
-    let mut both = vec![big, exact];
-    both.sort();
-    assert_eq!(listed, both, "both folders are still in the trash");
-    assert!(live_name(meta, &u, big).await.2);
-
-    // At the cap: restored (so nothing of `big` was marked before: it restores in full under the default cap).
     small.restore_from_trash(u.space, dev, exact, NOW).await.unwrap();
-    assert!(!live_name(meta, &u, exact).await.2);
-    meta.restore_from_trash(u.space, dev, big, NOW).await.unwrap();
+    for f in &exact_files {
+        assert!(!live_name(meta, &u, *f).await.2, "exactly the cap brings everything");
+    }
+    assert_eq!(trash_ids(meta, &u).await, vec![files[0]]);
+}
+
+/// Of the nodes below a folder the shallow ones come first, and what is left is listed only if its own folder is not in
+/// the trash: a left-over folder is listed, what is in it is hidden behind it until it is restored.
+async fn a_folder_restore_leaves_the_rest_listed_through_its_own_folder(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    let small = meta.clone().with_trash_tree_cap(1);
+    let dir = folder(meta, &u, dev, r, "dir", NOW).await;
+    let a = folder(meta, &u, dev, dir, "a", NOW).await;
+    let (a1, a1v) = file_in(meta, &u, dev, a, "a1.txt", NOW).await;
+    let (b, bv) = file_in(meta, &u, dev, dir, "b.txt", NOW).await;
+    delete_file(meta, &u, dev, a1, a1v.id, NOW + 1).await;
+    delete_folder(meta, &u, dev, a, NOW + 2).await;
+    delete_file(meta, &u, dev, b, bv.id, NOW + 3).await;
+    delete_folder(meta, &u, dev, dir, NOW + 4).await;
+    assert_eq!(trash_ids(meta, &u).await, vec![dir]);
+
+    small.restore_from_trash(u.space, dev, dir, NOW).await.unwrap();
+    assert!(!live_name(meta, &u, dir).await.2 && !live_name(meta, &u, b).await.2, "the folder and its newest child");
+    assert!(live_name(meta, &u, a).await.2 && live_name(meta, &u, a1).await.2);
+    assert_eq!(trash_ids(meta, &u).await, vec![a], "the folder is listed, what is in it is not");
+    small.restore_from_trash(u.space, dev, a, NOW).await.unwrap();
+    assert!(!live_name(meta, &u, a).await.2 && !live_name(meta, &u, a1).await.2);
     assert!(trash_ids(meta, &u).await.is_empty());
-    let feed = meta.changes(u.space, 0, None, MAX_PAGE_NODES).await.unwrap();
-    assert!(feed.nodes.iter().all(|n| !n.deleted), "every node came back");
+}
+
+/// Removing a folder marks it and at most the cap below it, shallowest first; the rest is listed on its own (its folder
+/// is no longer in the trash) and goes by a further removal.
+async fn removing_a_folder_takes_at_most_the_cap_below_it(meta: &Meta) {
+    let u = user(meta, "ana").await;
+    let dev = device(meta, &u).await;
+    let r = root(meta, &u).await;
+    let small = meta.clone().with_trash_tree_cap(3);
+    let (dir, files) = folder_with_deleted_files(meta, &u, dev, "flat", 5, NOW).await;
+    let before = meta.space_info(u.space).await.unwrap();
+    small.request_purge(u.space, dir, NOW + 50).await.unwrap();
+    assert_eq!(meta.space_info(u.space).await.unwrap().seq, before.seq, "no change of the space");
+    assert_eq!(sorted(trash_ids(meta, &u).await), sorted(vec![files[0], files[1]]));
+    for f in &files[2..] {
+        assert!(matches!(meta.restore_from_trash(u.space, dev, *f, NOW).await, Err(MetaError::NotFound(_))), "removed with the folder");
+    }
+    small.request_purge(u.space, files[0], NOW + 51).await.unwrap();
+    small.request_purge(u.space, files[1], NOW + 51).await.unwrap();
+    assert!(trash_ids(meta, &u).await.is_empty());
+
+    // A left-over folder is listed and what is in it stays hidden behind it.
+    let tree = folder(meta, &u, dev, r, "tree", NOW + 100).await;
+    let a = folder(meta, &u, dev, tree, "a", NOW + 100).await;
+    let (a1, a1v) = file_in(meta, &u, dev, a, "a1.txt", NOW + 100).await;
+    let (b, bv) = file_in(meta, &u, dev, tree, "b.txt", NOW + 100).await;
+    delete_file(meta, &u, dev, a1, a1v.id, NOW + 101).await;
+    delete_folder(meta, &u, dev, a, NOW + 102).await;
+    delete_file(meta, &u, dev, b, bv.id, NOW + 103).await;
+    delete_folder(meta, &u, dev, tree, NOW + 104).await;
+    meta.clone().with_trash_tree_cap(1).request_purge(u.space, tree, NOW + 105).await.unwrap();
+    assert_eq!(trash_ids(meta, &u).await, vec![a], "only the left-over folder is listed");
+    meta.clone().with_trash_tree_cap(1).request_purge(u.space, a, NOW + 106).await.unwrap();
+    assert!(trash_ids(meta, &u).await.is_empty());
+    assert!(matches!(meta.restore_from_trash(u.space, dev, a1, NOW).await, Err(MetaError::NotFound(_))));
 }
 
 /// When every conflict name is taken too, the restore is refused as a conflict and the space is exactly as it was: no
