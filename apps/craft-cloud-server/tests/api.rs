@@ -163,6 +163,7 @@ on_every_backend!(
     restoring_an_old_version_makes_a_new_one,
     parallel_restores_against_one_head_let_one_win,
     the_trash_lists_restores_and_removes_over_http,
+    a_deleted_folder_comes_back_and_goes_with_what_was_deleted_in_it,
     every_rejection_is_a_json_error,
     one_request_cant_list_unbounded_missing_chunks,
     long_polls_are_capped_per_space,
@@ -1869,6 +1870,66 @@ async fn the_trash_lists_restores_and_removes_over_http(s: &Server) {
     let (status, body) = error(restore_request(s, &ana, files[2].0, json!({ "version": files[2].1, "expected_version": files[2].1 })).await).await;
     assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
     assert!(body.message.contains("/trash/"), "{}", body.message);
+}
+
+/// A deleted folder is listed alone and is restored (or removed) with everything of it that is in the trash, also a
+/// file that was deleted on its own before.
+async fn a_deleted_folder_comes_back_and_goes_with_what_was_deleted_in_it(s: &Server) {
+    use craft_cloud_proto::api::{TrashResponse, TrashRestoreResponse};
+    add_user(s, "ana").await;
+    let ana = login(s, "ana").await;
+    let r = root(s, &ana).await;
+    let (dir1, sub1, dir2, sub2) = (NodeId::generate(), NodeId::generate(), NodeId::generate(), NodeId::generate());
+    for (name, dir, sub) in [("dir1", dir1, sub1), ("dir2", dir2, sub2)] {
+        let ops = [
+            Op::Mkdir { node: dir, parent: r, name: Name::new(name).unwrap() },
+            Op::Mkdir { node: sub, parent: dir, name: Name::new("sub").unwrap() },
+        ];
+        assert_eq!(commit(s, &ana, &ops).await.status(), StatusCode::OK);
+    }
+    let mut kids = Vec::new();
+    for (dir, sub) in [(dir1, sub1), (dir2, sub2)] {
+        let (early, early_v) = new_file(s, &ana, dir, "early.txt", b"deleted on its own first").await;
+        delete_node(s, &ana, early, early_v).await;
+        let (child, child_v) = new_file(s, &ana, dir, "child.txt", b"deleted with the folder").await;
+        let (deep, deep_v) = new_file(s, &ana, sub, "deep.txt", b"deep").await;
+        let ops = [
+            Op::Delete { node: child, expected: Some(child_v) },
+            Op::Delete { node: deep, expected: Some(deep_v) },
+            Op::Delete { node: sub, expected: None },
+            Op::Delete { node: dir, expected: None },
+        ];
+        assert_eq!(commit(s, &ana, &ops).await.status(), StatusCode::OK);
+        kids.push([early, child, deep, sub]);
+    }
+    let listed: TrashResponse = trash_page(s, &ana, "").await.json().await.unwrap();
+    let mut ids: Vec<_> = listed.items.iter().map(|i| i.id).collect();
+    ids.sort();
+    let mut tops = vec![dir1, dir2];
+    tops.sort();
+    assert_eq!(ids, tops, "only the folders are listed");
+
+    // Restoring one folder brings all that was in the trash below it, and nothing of the other.
+    let before = space_of(s, &ana).await;
+    let done: TrashRestoreResponse = trash_restore(s, &ana, dir1).await.json().await.unwrap();
+    assert_eq!((done.node, done.name.as_str(), done.renamed, done.seq), (dir1, "dir1", false, before.seq + 1));
+    let tree: ChangeSet = s.client.get(format!("{}/tree", s.base)).bearer_auth(&ana).send().await.unwrap().json().await.unwrap();
+    let live: Vec<_> = tree.nodes.iter().map(|n| n.id).collect();
+    for node in kids[0].iter().chain([&dir1]) {
+        assert!(live.contains(node), "{node} is live again");
+    }
+    for node in kids[1].iter().chain([&dir2]) {
+        assert!(!live.contains(node), "{node} is still deleted");
+    }
+
+    // Removing the other folder takes what is below it out of the trash too.
+    assert_eq!(trash_remove(s, &ana, dir2).await.status(), StatusCode::NO_CONTENT);
+    let left: TrashResponse = trash_page(s, &ana, "").await.json().await.unwrap();
+    assert!(left.items.is_empty(), "{:?}", left.items);
+    for node in kids[1] {
+        let (status, body) = error(trash_restore(s, &ana, node).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"), "{node}");
+    }
 }
 
 /// A server with another `retention.trash_days` (SQLite and disk).

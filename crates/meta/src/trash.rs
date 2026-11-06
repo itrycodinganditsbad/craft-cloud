@@ -4,14 +4,22 @@
 //! with the time of the deletion. Bringing a node back is [`Meta::restore_from_trash`] in `commit.rs`, because it
 //! shares the commit path's rules for names. Removing a node from the trash here only marks it: nothing is freed,
 //! so versions, chunks and the tombstone stay as they were.
+//!
+//! A node is in the trash when it is deleted and its removal was not asked for. What is below a folder in the trash
+//! is listed only through the folder (the folder's restore and removal take it along), whenever it was deleted.
 
 use craft_cloud_proto::api::{TRASH_MAX_LIMIT, TrashCursor};
+use craft_cloud_proto::limits::MAX_TREE_DEPTH;
 use craft_cloud_proto::{NodeId, SpaceId};
 use sqlx::Row;
 
 use crate::codec::{flag, to_u64, uuid_bytes, uuid_from};
 use crate::tree::space_info;
 use crate::{Dialect, Meta, MetaError};
+
+/// Why a folder with too many deleted items below it is refused (`invalid`), for a restore and for a removal.
+pub(crate) const TRASH_TREE_TOO_LARGE: &str =
+    "this folder holds too many deleted items to restore or remove at once; do it for the folders inside it first";
 
 /// A deleted node in the trash.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +44,15 @@ pub struct TrashPage {
     pub repaired: u64,
 }
 
+/// The deleted nodes below the node `$2` of space `$1` that are in the trash, found through nodes that are in the trash
+/// themselves (a folder that was removed from the trash hides what is below it); `depth` is 1 for a child. `$3` bounds
+/// the depth. A statement continues after it with `$4` and up.
+pub(crate) const TRASH_BELOW: &str = "WITH RECURSIVE sub(id, depth) AS (\
+         SELECT id, 1 FROM nodes WHERE space_id = $1 AND parent = $2 AND deleted = 1 AND purge_requested_ms IS NULL \
+         UNION ALL \
+         SELECT n.id, sub.depth + 1 FROM nodes n JOIN sub ON n.parent = sub.id \
+         WHERE n.space_id = $1 AND n.deleted = 1 AND n.purge_requested_ms IS NULL AND sub.depth < $3) ";
+
 impl Meta {
     /// One page of the trash of `space`: its deleted nodes that were not removed from the trash, newest deletion
     /// first by `(deleted_ms, id)`, after `after` (exclusive). `Invalid` for a `limit` outside 1 to
@@ -58,6 +75,7 @@ impl Meta {
             "SELECT n.id, n.parent, n.name, n.is_dir, n.deleted_ms, v.size AS v_size \
              FROM nodes n LEFT JOIN versions v ON v.space_id = n.space_id AND v.id = n.version \
              WHERE n.space_id = $1 AND n.deleted = 1 AND n.purge_requested_ms IS NULL AND (n.deleted_ms, n.id) < ($2, $3) \
+             AND NOT EXISTS (SELECT 1 FROM nodes p WHERE p.space_id = n.space_id AND p.id = n.parent AND p.deleted = 1 AND p.purge_requested_ms IS NULL) \
              ORDER BY n.deleted_ms DESC, n.id DESC LIMIT $4",
         )
         .bind(uuid_bytes(space.as_uuid()))
@@ -111,12 +129,13 @@ impl Meta {
     /// Takes the deleted node `node` out of the trash: it is no longer listed and can't be restored from the trash.
     /// Only marks it (`purge_requested_ms`): no version, chunk or tombstone is touched, so the change feed and the
     /// sequence number stay as they are. Asking again changes nothing. `NotFound` when `node` is not a deleted node of
-    /// `space` in the trash.
+    /// `space` in the trash. Removing a folder marks the nodes in the trash below it too (all, whenever they were
+    /// deleted); `Invalid` and nothing marked when there are more than [`Meta::with_trash_tree_cap`] of them.
     pub async fn request_purge(&self, space: SpaceId, node: NodeId, now_ms: i64) -> Result<(), MetaError> {
         let mut w = self.begin_write().await?;
         // On Postgres this row lock orders the mark with commits and restores of the space.
         space_info(&mut w.tx, space, self.dialect == Dialect::Postgres).await?;
-        let row = sqlx::query("SELECT deleted, purge_requested_ms FROM nodes WHERE space_id = $1 AND id = $2")
+        let row = sqlx::query("SELECT deleted, purge_requested_ms, is_dir FROM nodes WHERE space_id = $1 AND id = $2")
             .bind(uuid_bytes(space.as_uuid()))
             .bind(uuid_bytes(node.as_uuid()))
             .fetch_optional(&mut *w.tx)
@@ -127,6 +146,31 @@ impl Meta {
         }
         if row.try_get::<Option<i64>, _>("purge_requested_ms")?.is_some() {
             return Ok(());
+        }
+        if flag(&row, "is_dir")? {
+            // What is in the trash below the folder goes with it, or it would stay hidden and unmarked. A folder with
+            // more than the cap is refused whole.
+            let bound = i64::try_from(MAX_TREE_DEPTH + 2).map_err(|_| MetaError::Corrupt("depth limit out of range"))?;
+            let cap = i64::try_from(self.trash_tree_cap).map_err(|_| MetaError::Corrupt("trash cap out of range"))?;
+            let counted = sqlx::query(sqlx::AssertSqlSafe(format!("{TRASH_BELOW} SELECT COUNT(*) AS c FROM (SELECT id FROM sub LIMIT $4) AS below")))
+                .bind(uuid_bytes(space.as_uuid()))
+                .bind(uuid_bytes(node.as_uuid()))
+                .bind(bound)
+                .bind(cap.saturating_add(1))
+                .fetch_one(&mut *w.tx)
+                .await?;
+            if counted.try_get::<i64, _>("c")? > cap {
+                return Err(MetaError::Invalid(TRASH_TREE_TOO_LARGE));
+            }
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "{TRASH_BELOW} UPDATE nodes SET purge_requested_ms = $4 WHERE space_id = $1 AND id IN (SELECT id FROM sub)"
+            )))
+            .bind(uuid_bytes(space.as_uuid()))
+            .bind(uuid_bytes(node.as_uuid()))
+            .bind(bound)
+            .bind(now_ms)
+            .execute(&mut *w.tx)
+            .await?;
         }
         sqlx::query("UPDATE nodes SET purge_requested_ms = $1 WHERE space_id = $2 AND id = $3")
             .bind(now_ms)
