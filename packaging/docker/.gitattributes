@@ -1,0 +1,2 @@
+# Scripts and configs are mounted into Linux containers and must keep LF line endings.
+* text eol=lf
