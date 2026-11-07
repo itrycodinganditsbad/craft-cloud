@@ -1578,6 +1578,13 @@ fn snapshot_computers_in_the_smallest_window() {
     snapshot_sized(editing, egui::Theme::Dark, "computers-renaming-smallest-dark", MIN_WINDOW_SIZE);
 }
 
+/// A table wider than the window shows its sideways scroll bar without a hover. In the smallest window the bar is below
+/// the page's fold, so this one is drawn in a window of the smallest width and a height that shows it.
+#[test]
+fn snapshot_computers_table_shows_its_scroll_bar() {
+    snapshot_sized(computers_model(), egui::Theme::Dark, "computers-scroll-bar-640-dark", [640.0, 640.0]);
+}
+
 #[test]
 fn missing_details_show_a_dash_and_only_an_older_version_gets_the_tag() {
     let mut h = harness(computers_model(), egui::Theme::Light);

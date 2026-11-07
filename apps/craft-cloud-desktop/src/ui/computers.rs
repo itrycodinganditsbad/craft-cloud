@@ -89,6 +89,9 @@ fn table(ui: &mut egui::Ui, o: &mut Overview, active: &[DeviceInfo], now_ms: i64
     let mut renaming = o.renaming.take();
     egui::Frame::new().stroke(t.hairline()).fill(t.bg).show(ui, |ui| {
         ui.set_width(ui.available_width());
+        // A solid bar, drawn whenever the table is wider than the window (the floating one shows on hover only, so
+        // nothing told that the last columns were out of view).
+        ui.spacing_mut().scroll = egui::style::ScrollStyle { foreground_color: true, ..egui::style::ScrollStyle::solid() };
         egui::ScrollArea::horizontal().id_salt("computers-scroll").auto_shrink([false, true]).show(ui, |ui| {
             ui.set_min_width(TABLE_MIN_WIDTH);
             egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
