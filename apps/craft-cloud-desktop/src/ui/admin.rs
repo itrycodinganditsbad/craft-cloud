@@ -269,7 +269,13 @@ fn storage_status(ui: &mut egui::Ui, state: &StorageState<'_>) -> bool {
 
 /// A table in an area of its own that scrolls sideways, so a narrow window never clips it.
 fn scroll_x<R>(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::ScrollArea::horizontal().id_salt(id).auto_shrink([false, true]).show(ui, add).inner
+    // A solid bar, drawn whenever the table is wider than the window (the floating one shows on hover only, so nothing
+    // told that the last columns were out of view).
+    ui.scope(|ui| {
+        ui.spacing_mut().scroll = egui::style::ScrollStyle { foreground_color: true, ..egui::style::ScrollStyle::solid() };
+        egui::ScrollArea::horizontal().id_salt(id).auto_shrink([false, true]).show(ui, add).inner
+    })
+    .inner
 }
 
 fn accounts(

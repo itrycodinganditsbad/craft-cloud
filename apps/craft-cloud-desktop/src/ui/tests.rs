@@ -806,6 +806,8 @@ fn snapshot_admin_storage() {
         "admin-storage-capacity-over",
     );
     snapshot_sized(storage_tab(&agent, disk_with_capacity), egui::Theme::Light, "admin-storage-smallest-light", MIN_WINDOW_SIZE);
+    // The table's sideways scroll bar is visible without a hover (below the fold in the smallest window, so a taller one).
+    snapshot_sized(storage_tab(&agent, disk_with_capacity), egui::Theme::Light, "admin-storage-scroll-bar-640-light", [640.0, 800.0]);
 }
 
 /// What the storage block says, as text: the numbers, the warning, and the hints where a number is missing.
