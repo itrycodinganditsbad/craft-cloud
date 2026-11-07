@@ -6,6 +6,7 @@ mod add_computer;
 mod admin;
 mod audit;
 mod computers;
+mod confirm;
 mod join;
 pub mod kit;
 mod overview;
@@ -36,6 +37,7 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
         return events;
     }
     security::forget_secrets(ui.ctx(), &model.screen);
+    stash_names(ui.ctx(), model);
     // The signed-in pages sit between a header with the tabs and a footer strip; the other screens fill the window.
     let shell = shell::Shell::of(model);
     let frame = if let Some(shell) = &shell {
@@ -46,6 +48,8 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
         egui::Frame::central_panel(ui.style())
     };
     egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+        // The kit's scroll bars are solid: the bar shows whenever the page overflows and takes its own room, so it never
+        // covers the content's right edge.
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(8.0);
             let busy = model.busy;
@@ -70,9 +74,26 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
                 ui.add_space(12.0);
                 ui.label(RichText::new(note).small().weak());
             }
+            ui.add_space(8.0);
         });
     });
     events
+}
+
+/// What names the IDs of the page being drawn: the model's, and the accounts of the admin's list.
+fn stash_names(ctx: &egui::Context, model: &Model) {
+    let mut names = model.names.clone();
+    if let Screen::Admin(admin) = &model.screen {
+        for user in &admin.list.users {
+            names.learn_account(user.id, &user.username);
+        }
+    }
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("craft-cloud-names"), names));
+}
+
+/// The names the page can use for IDs (see [`stash_names`]).
+fn names(ui: &egui::Ui) -> crate::names::Names {
+    ui.data(|d| d.get_temp::<crate::names::Names>(egui::Id::new("craft-cloud-names"))).unwrap_or_default()
 }
 
 fn starting(ui: &mut egui::Ui) {

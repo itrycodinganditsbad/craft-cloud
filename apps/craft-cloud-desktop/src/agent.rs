@@ -369,6 +369,10 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
             Event::Admin(AdminEvent::Devices { user, ticket, result: agent.admin_devices(user).map(|d| d.devices) })
         }
         Effect::AdminUserUsage { user, ticket } => Event::Admin(AdminEvent::Usage { user, ticket, result: agent.admin_user_usage(user) }),
+        Effect::Recent { session } => Event::Recent {
+            session,
+            result: agent.account_activity(&AuditQuery { limit: Some(crate::model::RECENT_ACTIVITY), ..AuditQuery::default() }),
+        },
         Effect::AuditPage { own, query, ticket } => {
             let result = if own { agent.account_activity(&query) } else { agent.admin_audit(&query) };
             Event::Audit(AuditMsg::Page { own, ticket, result })

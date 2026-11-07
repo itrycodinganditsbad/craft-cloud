@@ -16,7 +16,7 @@ use egui_kittest::kittest::Queryable;
 use super::*;
 use crate::agent::fake::FakeAgent;
 use crate::agent::{Agent, Starter, call};
-use crate::model::{Effect, JoinDefaults, Model, Screen, Tab};
+use crate::model::{Effect, JoinDefaults, Model, Screen, Tab, TrashKind};
 
 /// The time the screens are drawn at.
 const NOW: i64 = 1_790_000_000_000;
@@ -518,7 +518,7 @@ fn trash_buttons_send_restore_and_confirmation_events() {
     h.run_steps(2);
     h.query_all_by_label("Restore").next().unwrap().click();
     h.run_steps(2);
-    h.query_all_by_label("Remove from trash").next().unwrap().click();
+    h.query_all_by_label("Remove").next().unwrap().click();
     h.run_steps(2);
     let events = std::mem::take(&mut h.state_mut().1);
     assert!(events.iter().any(|e| matches!(e, Event::RestoreTrash(_))), "{events:?}");
@@ -1329,4 +1329,177 @@ fn snapshot_a_long_account_line() {
     assert!(model.is_admin());
     snapshot(model.clone(), egui::Theme::Light, "tab-overview-long-account-light");
     snapshot_sized(model, egui::Theme::Dark, "tab-overview-long-account-narrow-dark", [760.0, 480.0]);
+}
+
+/// The overview with its computers (named `lptp1` and `BEAST`) and the newest activity.
+fn overview_with_recent() -> (Model, Vec<DeviceInfo>) {
+    let mut model = overview_model();
+    let list = devices();
+    model.update(Event::Devices(Ok(list.clone())));
+    let session = model.overview().expect("the overview").session;
+    let mut events = audit_events();
+    events.truncate(5);
+    for (n, event) in events.iter_mut().enumerate() {
+        event.actor_device = list.get(n % 2).map(|d| d.id);
+    }
+    model.update(Event::Recent { session, result: Ok(craft_cloud_app::AuditPage { events, next: None }) });
+    (model, list)
+}
+
+/// "02 / Recent activity" under the cells: the newest events with the computers' names, and a muted line without events or when
+/// they couldn't be loaded.
+#[test]
+fn snapshot_recent_activity() {
+    let (model, _) = overview_with_recent();
+    snapshot_sized(model.clone(), egui::Theme::Light, "overview-recent-light", [WINDOW_SIZE[0], 1100.0]);
+    snapshot_sized(model.clone(), egui::Theme::Dark, "overview-recent-dark", [WINDOW_SIZE[0], 1100.0]);
+    // At the smallest window and maximized.
+    snapshot_sized(model.clone(), egui::Theme::Light, "overview-recent-smallest-light", MIN_WINDOW_SIZE);
+    snapshot_sized(model, egui::Theme::Dark, "overview-recent-maximized-dark", [1600.0, 900.0]);
+    let mut empty = overview_model();
+    let session = empty.overview().expect("the overview").session;
+    empty.update(Event::Recent { session, result: Ok(craft_cloud_app::AuditPage { events: Vec::new(), next: None }) });
+    snapshot_sized(empty, egui::Theme::Light, "overview-recent-empty", [WINDOW_SIZE[0], 900.0]);
+    let mut failed = overview_model();
+    failed.update(Event::Recent { session, result: Err(Error::Io("the server didn't answer".into())) });
+    snapshot_sized(failed, egui::Theme::Light, "overview-recent-failed", [WINDOW_SIZE[0], 900.0]);
+}
+
+/// The page scrolls when it is taller than the window, and its bar sits beside the content, not over its right edge.
+#[test]
+fn snapshot_overview_scroll_bar_beside_the_content() {
+    let (model, _) = overview_with_recent();
+    snapshot_sized(model, egui::Theme::Light, "overview-scrolling-960", WINDOW_SIZE);
+}
+
+/// "All activity ↗" and the computers link switch tabs.
+#[test]
+fn the_overviews_links_open_the_tabs() {
+    let (model, _) = overview_with_recent();
+    let mut h = harness_sized(model, egui::Theme::Light, [WINDOW_SIZE[0], 1100.0]);
+    h.run_steps(3);
+    h.get_by_label("All activity ↗").click();
+    h.run_steps(2);
+    h.get_by_label("Computers ↗").click();
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    assert_eq!(events, [Event::Tab(Tab::Activity), Event::Tab(Tab::Computers)]);
+}
+
+/// The activity page names the computers and the account instead of showing their IDs.
+#[test]
+fn snapshot_activity_with_names() {
+    let member = FakeAgent::new(signed_in());
+    let list = devices();
+    let me = Uuid::from_u128(0x0123_4567_89ab_cdef_0000_0000_0000_0000);
+    let mut events = audit_events();
+    for (n, event) in events.iter_mut().enumerate() {
+        event.actor_user = event.actor_user.map(|_| me);
+        // The last one comes from a computer that was removed: its ID stays short.
+        event.actor_device = Some(if n == 5 { DeviceId::generate() } else { list[n % 2].id });
+    }
+    *member.audit_events.lock().unwrap() = events;
+    let mut model = after(&member, vec![Event::Devices(Ok(list))]);
+    let session = model.overview().expect("the overview").session;
+    model.update(Event::Admin(AdminEvent::Account {
+        session,
+        result: Ok(craft_cloud_proto::api::AccountInfo {
+            user_id: me,
+            username: "fabio".into(),
+            role: "member".into(),
+            created_ms: 0,
+            password_changed_ms: None,
+            two_factor_enabled: false,
+        }),
+    }));
+    let start = no_start();
+    let mut pending = model.update(Event::Audit(AuditMsg::OpenActivity));
+    while let Some(effect) = pending.pop() {
+        if let Some(answer) = call(&member, &start, effect) {
+            pending.extend(model.update(answer));
+        }
+    }
+    assert!(model.activity_screen().is_some());
+    snapshot_sized(model, egui::Theme::Light, "activity-names", [WINDOW_SIZE[0], 900.0]);
+}
+
+/// The trash as a table, with the kind filter and the search field narrowing the loaded list.
+#[test]
+fn snapshot_trash_table_with_filter_and_search() {
+    let mut model = trash_model(true);
+    snapshot(model.clone(), egui::Theme::Dark, "trash-table-dark");
+    model.update(Event::TrashKind(TrashKind::Files));
+    snapshot(model.clone(), egui::Theme::Light, "trash-filter-files");
+    model.update(Event::TrashKind(TrashKind::All));
+    model.update(Event::TrashSearch("old".into()));
+    snapshot(model.clone(), egui::Theme::Light, "trash-search");
+    model.update(Event::TrashSearch("zzz".into()));
+    snapshot(model, egui::Theme::Light, "trash-search-no-match");
+}
+
+fn confirming_trash() -> Model {
+    let mut model = trash_model(true);
+    let id = match &model.screen {
+        Screen::Trash(t) => t.page.as_ref().and_then(|p| p.items.first()).map(|i| i.id),
+        _ => None,
+    };
+    model.update(Event::ConfirmRemoveTrash(id.expect("an item")));
+    model
+}
+
+fn confirming_restore() -> Model {
+    let mut versions = versions_model(true);
+    if let Screen::Versions(v) = &mut versions.screen {
+        v.confirm = v.page.as_ref().and_then(|page| page.versions.get(1)).map(|version| version.id);
+    }
+    versions
+}
+
+/// The inline confirmations, in the dark appearance (the light ones are `trash-confirm` and `versions-confirm`).
+#[test]
+fn snapshot_inline_confirmations() {
+    snapshot(confirming_trash(), egui::Theme::Dark, "trash-confirm-dark");
+    snapshot(confirming_restore(), egui::Theme::Dark, "versions-confirm-dark");
+}
+
+/// Esc cancels an open confirmation, and the keyboard focus is inside it from the start (on Cancel, the safe choice).
+#[test]
+fn escape_cancels_the_inline_confirmations() {
+    let mut h = harness(confirming_trash(), egui::Theme::Light);
+    h.run_steps(4);
+    assert!(h.get_by_label("Cancel").is_focused(), "the focus moves into the panel");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(std::mem::take(&mut h.state_mut().1).contains(&Event::CancelRemoveTrash));
+
+    let mut h = harness(confirming_restore(), egui::Theme::Light);
+    h.run_steps(4);
+    assert!(h.get_by_label("Cancel").is_focused());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(std::mem::take(&mut h.state_mut().1).contains(&Event::CancelRestore));
+}
+
+/// Cancel and the confirming button send their events.
+#[test]
+fn the_inline_confirmation_buttons_send_their_events() {
+    let mut h = harness_sized(confirming_trash(), egui::Theme::Light, [WINDOW_SIZE[0], 1100.0]);
+    h.run_steps(3);
+    // The table's rows have a Remove each; the panel has one more (the last on the page).
+    let removes: Vec<_> = h.query_all_by_label("Remove").collect();
+    assert_eq!(removes.len(), 3, "two rows and the panel's");
+    removes[2].click();
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    assert!(events.contains(&Event::RemoveTrash), "{events:?}");
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert!(std::mem::take(&mut h.state_mut().1).contains(&Event::CancelRemoveTrash));
+}
+
+/// The first run's form in the smallest window overflows: its scroll bar is there and the Join button can be reached.
+#[test]
+fn snapshot_first_run_in_the_smallest_window_scrolls() {
+    let model = after(&FakeAgent::new(signed_out()), Vec::new());
+    snapshot_sized(model, egui::Theme::Light, "join-smallest", MIN_WINDOW_SIZE);
 }

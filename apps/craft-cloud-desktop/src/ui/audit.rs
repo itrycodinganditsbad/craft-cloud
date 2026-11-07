@@ -6,7 +6,14 @@ use egui::RichText;
 use crate::admin::AdminEvent;
 use crate::audit::{ActivityScreen, AuditList, AuditMsg, AuditView, ExportState, action_label, details_line, filter_choices, filter_label, who_line};
 use crate::model::Event;
+use crate::names::Names;
 use craft_cloud_proto::api::AuditEvent;
+
+/// A line saying something to look at, not an error: the warning colour.
+fn warn_line(ui: &mut egui::Ui, text: &str) {
+    let color = super::kit::Tokens::get(ui.ctx()).warn;
+    ui.add(egui::Label::new(RichText::new(text).color(color)).wrap());
+}
 
 fn send(events: &mut Vec<Event>, msg: AuditMsg) {
     events.push(Event::Audit(msg));
@@ -14,6 +21,7 @@ fn send(events: &mut Vec<Event>, msg: AuditMsg) {
 
 /// The events of a page: what happened, how long ago, and its details.
 fn rows(ui: &mut egui::Ui, list: &AuditList, now_ms: i64) {
+    let names = super::names(ui);
     if let Some(error) = &list.error {
         super::error_line(ui, error);
         ui.add_space(6.0);
@@ -27,11 +35,11 @@ fn rows(ui: &mut egui::Ui, list: &AuditList, now_ms: i64) {
         ui.label("Nothing was recorded.");
     }
     for event in &list.events {
-        event_row(ui, event, now_ms);
+        event_row(ui, event, now_ms, &names);
     }
 }
 
-fn event_row(ui: &mut egui::Ui, event: &AuditEvent, now_ms: i64) {
+fn event_row(ui: &mut egui::Ui, event: &AuditEvent, now_ms: i64, names: &Names) {
     ui.push_id(event.id, |ui| {
         let label = RichText::new(action_label(&event.action)).strong();
         ui.add(egui::Label::new(if event.outcome == "failure" { label.color(ui.visuals().error_fg_color) } else { label }).wrap());
@@ -42,8 +50,8 @@ fn event_row(ui: &mut egui::Ui, event: &AuditEvent, now_ms: i64) {
             line.push_str(&details);
         }
         ui.add(egui::Label::new(RichText::new(line).small().weak()).wrap());
-        // Who did it and what it was about, with the whole IDs on hover.
-        let (who, full) = who_line(event);
+        // Who did it and what it was about, by name where the name is known, with the whole IDs on hover.
+        let (who, full) = who_line(event, names);
         ui.add(egui::Label::new(RichText::new(who).small().weak()).wrap().sense(egui::Sense::hover())).on_hover_text(full);
         ui.separator();
     });
@@ -68,6 +76,8 @@ fn paging(ui: &mut egui::Ui, list: &AuditList, previous: AuditMsg, next: AuditMs
 /// The admin's audit log.
 pub(super) fn log(ui: &mut egui::Ui, view: &mut AuditView, now_ms: i64, events: &mut Vec<Event>) {
     super::heading(ui, "Audit log");
+    // Controls of a row are as high as a button, so a field, a menu and a button line up.
+    ui.spacing_mut().interact_size.y = super::kit::CONTROL_H;
     ui.horizontal(|ui| {
         if ui.add(super::kit::Button::new("Back to the accounts")).clicked() {
             events.push(Event::Admin(AdminEvent::BackToList));
@@ -129,7 +139,7 @@ pub(super) fn log(ui: &mut egui::Ui, view: &mut AuditView, now_ms: i64, events: 
     });
     match &view.export {
         ExportState::Done { path, outcome } if outcome.truncated => {
-            super::error_line(
+            warn_line(
                 ui,
                 &format!(
                     "Only the newest {} events were saved to {path}: the log holds more than an export can. Narrow the filters to get the rest.",

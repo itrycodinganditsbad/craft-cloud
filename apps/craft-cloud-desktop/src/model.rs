@@ -8,8 +8,8 @@
 use std::path::Path;
 
 use craft_cloud_app::{
-    AccountUsage, DeviceId, DeviceInfo, Error, HistoryResponse, JoinRequest, NodeId, PairingInfo, PairingState, PairingStatus, RestoreResponse,
-    RunState, Status, TrashResponse, TrashRestoreResponse, UserQuery, Uuid, VersionId, codes,
+    AccountUsage, AuditEvent, AuditPage, DeviceId, DeviceInfo, Error, HistoryResponse, JoinRequest, NodeId, PairingInfo, PairingState, PairingStatus,
+    RestoreResponse, RunState, Status, TrashResponse, TrashRestoreResponse, UserQuery, Uuid, VersionId, codes,
 };
 use craft_cloud_proto::api::AdminConfirm;
 use craft_cloud_proto::api::codes as api_codes;
@@ -17,6 +17,7 @@ use craft_cloud_proto::join::JoinString;
 
 use crate::admin::{Access, Action, AdminEvent, AdminScreen};
 use crate::audit::{ActivityScreen, AuditMsg};
+use crate::names::Names;
 use crate::security::{SecondFactorForm, SecurityAnswer, SecurityCall, SecurityEvent, SecurityPage, Step as SecurityStep};
 
 /// A code that is wrong, expired or used (the server never says which).
@@ -217,7 +218,23 @@ pub struct Overview {
     pub access: Access,
     /// Which sign-in this view is of: answers to the admin check made for another one are ignored.
     pub session: u64,
+    /// The newest events of the account's activity, for the home page.
+    pub recent: Recent,
 }
+
+/// The home page's short list of the account's newest activity.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Recent {
+    /// Asked for, not answered yet.
+    Loading,
+    /// The newest events, newest first (at most [`RECENT_ACTIVITY`]).
+    Loaded(Vec<AuditEvent>),
+    /// The server couldn't tell.
+    Failed(String),
+}
+
+/// How many events the home page's recent activity shows.
+pub const RECENT_ACTIVITY: u32 = 5;
 
 /// File history and restore state.
 #[derive(Debug, Clone, PartialEq)]
@@ -243,6 +260,66 @@ pub struct Trash {
     pub notice: Option<String>,
     pub confirm: Option<NodeId>,
     pub ticket: u64,
+    /// Which kind of item the list shows (a filter of the loaded items; nothing is asked of the server).
+    pub kind: TrashKind,
+    /// What the name or the path of a shown item contains (any case).
+    pub search: String,
+}
+
+/// The trash list's kind filter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TrashKind {
+    #[default]
+    All,
+    Folders,
+    Files,
+}
+
+impl Trash {
+    /// A trash list, nothing loaded.
+    pub fn new() -> Self {
+        Self {
+            page: None,
+            loading: false,
+            action: None,
+            error: None,
+            notice: None,
+            confirm: None,
+            ticket: 0,
+            kind: TrashKind::All,
+            search: String::new(),
+        }
+    }
+
+    /// The loaded items that pass the kind filter and the search.
+    pub fn visible(&self) -> Vec<&craft_cloud_app::TrashItem> {
+        let needle = self.search.trim().to_lowercase();
+        self.page
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter(|i| match self.kind {
+                TrashKind::All => true,
+                TrashKind::Folders => i.is_dir,
+                TrashKind::Files => !i.is_dir,
+            })
+            .filter(|i| {
+                needle.is_empty() || i.name.to_lowercase().contains(&needle) || i.path.as_deref().is_some_and(|p| p.to_lowercase().contains(&needle))
+            })
+            .collect()
+    }
+
+    /// How many loaded items there are: all, folders, files.
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let items = self.page.as_ref().map_or(&[][..], |p| p.items.as_slice());
+        let folders = items.iter().filter(|i| i.is_dir).count();
+        (items.len(), folders, items.len() - folders)
+    }
+}
+
+impl Default for Trash {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -269,6 +346,7 @@ impl Overview {
             error: None,
             access: Access::Unknown,
             session: crate::admin::fresh(),
+            recent: Recent::Loading,
         }
     }
 }
@@ -348,6 +426,11 @@ pub enum Event {
         request_id: u64,
         result: Result<AccountUsage, Error>,
     },
+    /// [`Effect::Recent`]'s answer: the newest events of the account's activity.
+    Recent {
+        session: u64,
+        result: Result<AuditPage, Error>,
+    },
     SignedOut(Result<Status, Error>),
     /// [`Effect::Pause`]'s or [`Effect::Resume`]'s answer.
     Answered(Result<Status, Error>),
@@ -383,6 +466,10 @@ pub enum Event {
     CancelRestore,
     RestoreVersion,
     LoadTrash,
+    /// The trash list's kind filter.
+    TrashKind(TrashKind),
+    /// The trash list's search field, as typed.
+    TrashSearch(String),
     NextTrash,
     BackTrash,
     RestoreTrash(NodeId),
@@ -489,6 +576,10 @@ pub enum Effect {
     Account {
         session: u64,
     },
+    /// The newest events of the account's activity, for the home page ([`Event::Recent`]).
+    Recent {
+        session: u64,
+    },
     /// The server's counters, for the admin pages ([`AdminEvent::Server`]).
     AdminServer {
         session: u64,
@@ -573,6 +664,8 @@ pub struct Model {
     pub sign_out_error: Option<String>,
     /// Signing out failed because the server can't be reached: offer to forget the account here only.
     pub offer_local_sign_out: bool,
+    /// The names of the computers and accounts the pages have met, for the IDs events and versions carry.
+    pub names: Names,
     defaults: JoinDefaults,
     polling: bool,
     polling_pairing: bool,
@@ -611,6 +704,7 @@ impl Model {
             trash_ticket: 0,
             usage_request_id: 0,
             access: Access::Unknown,
+            names: Names::default(),
         }
     }
 
@@ -638,7 +732,7 @@ impl Model {
         overview.access = self.access.clone();
         let session = overview.session;
         self.screen = Screen::SignedIn(overview);
-        vec![Effect::Devices, Effect::Account { session }, self.next_usage_request()]
+        vec![Effect::Devices, Effect::Account { session }, self.next_usage_request(), Effect::Recent { session }]
     }
 
     /// The tab of the page shown, in the signed-in window.
@@ -782,6 +876,9 @@ impl Model {
             }
             Event::PairingPolled(result) => self.pairing_polled(result),
             Event::Devices(result) => {
+                if let Ok(list) = &result {
+                    self.names.learn_computers(list);
+                }
                 if let Some(overview) = self.overview_mut() {
                     overview.removing = None;
                     match result {
@@ -914,6 +1011,15 @@ impl Model {
                     }
                 }
             }
+            Event::Recent { session, result } => {
+                if let Some(overview) = self.overview_mut().filter(|o| o.session == session) {
+                    overview.recent = match result {
+                        Ok(page) => Recent::Loaded(page.events.into_iter().take(RECENT_ACTIVITY as usize).collect()),
+                        Err(e) => Recent::Failed(message(&e)),
+                    };
+                }
+                Vec::new()
+            }
             Event::Usage { request_id, result } => {
                 if request_id != self.usage_request_id {
                     return Vec::new();
@@ -1010,8 +1116,20 @@ impl Model {
                 if !matches!(self.screen, Screen::SignedIn(_)) {
                     return Vec::new();
                 }
-                self.screen = Screen::Trash(Trash { page: None, loading: false, action: None, error: None, notice: None, confirm: None, ticket: 0 });
+                self.screen = Screen::Trash(Trash::new());
                 self.request_trash(None)
+            }
+            Event::TrashKind(kind) => {
+                if let Screen::Trash(t) = &mut self.screen {
+                    t.kind = kind;
+                }
+                Vec::new()
+            }
+            Event::TrashSearch(search) => {
+                if let Screen::Trash(t) = &mut self.screen {
+                    t.search = search;
+                }
+                Vec::new()
             }
             Event::LoadTrash => self.request_trash(None),
             Event::NextTrash => {
@@ -1311,6 +1429,7 @@ impl Model {
                     // Whether the account is an admin, for the admin pages.
                     effects.push(Effect::Account { session });
                     effects.push(self.next_usage_request());
+                    effects.push(Effect::Recent { session });
                 }
             }
             if let Some(effect) = new_usage_request {
@@ -1439,6 +1558,7 @@ impl Model {
                 // Start at login: the agent's entry (the app's follows it).
                 effects.extend([Effect::SetAutostart(true), Effect::Devices]);
                 effects.extend(self.overview().map(|o| Effect::Account { session: o.session }));
+                effects.extend(self.overview().map(|o| Effect::Recent { session: o.session }));
                 effects.push(self.next_usage_request());
                 return effects;
             }
@@ -1818,7 +1938,7 @@ pub(crate) mod tests {
         let mut m = model();
         let page = trash_page();
         let id = page.items[0].id;
-        m.screen = Screen::Trash(Trash { page: Some(page), loading: false, action: None, error: None, notice: None, confirm: None, ticket: 0 });
+        m.screen = Screen::Trash(Trash { page: Some(page), ticket: 0, ..Trash::new() });
         assert!(m.update(Event::RemoveTrash).is_empty());
         assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
         let ticket = match &m.screen {
@@ -1844,7 +1964,7 @@ pub(crate) mod tests {
         let mut page = trash_page();
         page.items[0].path = None;
         let id = page.items[0].id;
-        m.screen = Screen::Trash(Trash { page: Some(page), loading: false, action: None, error: None, notice: None, confirm: None, ticket: 0 });
+        m.screen = Screen::Trash(Trash { page: Some(page), ticket: 0, ..Trash::new() });
         assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
         let ticket = match &m.screen {
             Screen::Trash(t) => t.ticket,
@@ -1874,7 +1994,7 @@ pub(crate) mod tests {
         let mut m = model();
         let page = trash_page();
         let id = page.items[0].id;
-        m.screen = Screen::Trash(Trash { page: Some(page), loading: false, action: None, error: None, notice: None, confirm: None, ticket: 0 });
+        m.screen = Screen::Trash(Trash { page: Some(page), ticket: 0, ..Trash::new() });
         assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
         let ticket = match &m.screen {
             Screen::Trash(t) => t.ticket,
@@ -1918,7 +2038,7 @@ pub(crate) mod tests {
         let mut page = trash_page();
         page.items[0].path = Some("painting.png".into());
         let id = page.items[0].id;
-        m.screen = Screen::Trash(Trash { page: Some(page), loading: false, action: None, error: None, notice: None, confirm: None, ticket: 0 });
+        m.screen = Screen::Trash(Trash { page: Some(page), ticket: 0, ..Trash::new() });
         assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
         let ticket = trash_ticket(&m);
         m.update(Event::TrashRestored { ticket, result: Ok(trash_restore_response(id, "painting (1).png", true)) });
@@ -1932,7 +2052,7 @@ pub(crate) mod tests {
         let mut page = trash_page();
         page.items[0].path = None;
         let id = page.items[0].id;
-        m.screen = Screen::Trash(Trash { page: Some(page), loading: false, action: None, error: None, notice: None, confirm: None, ticket: 0 });
+        m.screen = Screen::Trash(Trash { page: Some(page), ticket: 0, ..Trash::new() });
         m.update(Event::RestoreTrash(id));
         let ticket = trash_ticket(&m);
         m.update(Event::TrashRestored { ticket, result: Ok(trash_restore_response(id, "painting (1).png", true)) });
@@ -2012,7 +2132,7 @@ pub(crate) mod tests {
         let mut m = model();
         let page = trash_page();
         let id = page.items[0].id;
-        m.screen = Screen::Trash(Trash { page: Some(page), loading: false, action: None, error: None, notice: None, confirm: None, ticket: 0 });
+        m.screen = Screen::Trash(Trash { page: Some(page), ticket: 0, ..Trash::new() });
         m.update(Event::ConfirmRemoveTrash(id));
         assert!(matches!(m.update(Event::RemoveTrash).first(), Some(Effect::RemoveTrash { .. })));
         let ticket = trash_ticket(&m);
@@ -2750,7 +2870,13 @@ pub(crate) mod tests {
         m.update(Event::Start);
         assert_eq!(
             m.update(Event::Found(Ok(on.clone()))),
-            vec![Effect::AppAutostart(true), Effect::Devices, Effect::Account { session: m.overview().unwrap().session }, Effect::Usage(1)]
+            vec![
+                Effect::AppAutostart(true),
+                Effect::Devices,
+                Effect::Account { session: m.overview().unwrap().session },
+                Effect::Usage(1),
+                Effect::Recent { session: m.overview().unwrap().session }
+            ]
         );
         assert!(m.update(Event::Polled(Ok(on.clone()))).is_empty());
         assert_eq!(m.update(Event::Polled(Ok(Status { autostart: Some(false), ..on }))), vec![Effect::AppAutostart(false)]);
@@ -2848,7 +2974,7 @@ pub(crate) mod tests {
         let ticket = m.trash_ticket;
         let effects = m.update(Event::Tab(Tab::Overview));
         assert!(matches!(m.screen, Screen::SignedIn(_)));
-        assert!(matches!(effects.as_slice(), [Effect::Devices, Effect::Account { .. }, Effect::Usage(_)]), "{effects:?}");
+        assert!(matches!(effects.as_slice(), [Effect::Devices, Effect::Account { .. }, Effect::Usage(_), Effect::Recent { .. }]), "{effects:?}");
         assert_eq!(m.trash_ticket, ticket + 1);
         // From the security page to trash: the page's secrets go and the trash is asked for.
         m.update(Event::Tab(Tab::Security));
@@ -2885,5 +3011,146 @@ pub(crate) mod tests {
         // Signed out, nothing is remembered for the next account.
         m.update(Event::Polled(Ok(status(false))));
         assert_eq!(m.access, Access::Unknown);
+    }
+    fn trash_item(n: u128, name: &str, is_dir: bool, path: Option<&str>) -> craft_cloud_app::TrashItem {
+        craft_cloud_app::TrashItem {
+            id: NodeId::from_uuid(Uuid::from_u128(n)),
+            parent: NodeId::from_uuid(Uuid::nil()),
+            name: name.into(),
+            is_dir,
+            size: Some(10),
+            deleted_ms: 0,
+            purge_after_ms: 0,
+            path: path.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn the_trash_list_is_filtered_by_kind_and_searched_by_name_or_path_in_any_case() {
+        let mut m = model();
+        let items = vec![
+            trash_item(1, "Sketch.PSD", false, Some("art/Sketch.PSD")),
+            trash_item(2, "Old exports", true, None),
+            trash_item(3, "notes.txt", false, Some("Projects/notes.txt")),
+        ];
+        m.screen = Screen::Trash(Trash { page: Some(TrashResponse { items, next: None }), ..Trash::new() });
+        let names = |m: &Model| match &m.screen {
+            Screen::Trash(t) => t.visible().iter().map(|i| i.name.clone()).collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        assert_eq!(names(&m), ["Sketch.PSD", "Old exports", "notes.txt"]);
+        let Screen::Trash(t) = &m.screen else { panic!("trash") };
+        assert_eq!(t.counts(), (3, 1, 2));
+        m.update(Event::TrashKind(TrashKind::Files));
+        assert_eq!(names(&m), ["Sketch.PSD", "notes.txt"]);
+        m.update(Event::TrashKind(TrashKind::Folders));
+        assert_eq!(names(&m), ["Old exports"]);
+        // The search looks at the path too, ignores the case and the spaces around, and works with the kind.
+        m.update(Event::TrashKind(TrashKind::All));
+        m.update(Event::TrashSearch("  projects/ ".into()));
+        assert_eq!(names(&m), ["notes.txt"]);
+        m.update(Event::TrashSearch("SKETCH".into()));
+        assert_eq!(names(&m), ["Sketch.PSD"]);
+        m.update(Event::TrashKind(TrashKind::Folders));
+        assert!(names(&m).is_empty(), "a folder that doesn't match is hidden");
+        m.update(Event::TrashSearch(String::new()));
+        m.update(Event::TrashKind(TrashKind::All));
+        assert_eq!(names(&m).len(), 3);
+        // The counts don't follow the search: they say what is loaded.
+        m.update(Event::TrashSearch("zzz".into()));
+        let Screen::Trash(t) = &m.screen else { panic!("trash") };
+        assert_eq!((t.visible().len(), t.counts()), (0, (3, 1, 2)));
+    }
+
+    #[test]
+    fn the_filter_does_nothing_off_the_trash_page_and_survives_a_reload() {
+        let mut m = signed_in();
+        assert!(m.update(Event::TrashKind(TrashKind::Files)).is_empty());
+        assert!(m.update(Event::TrashSearch("x".into())).is_empty());
+        m.update(Event::Tab(Tab::Trash));
+        m.update(Event::TrashSearch("x".into()));
+        m.update(Event::LoadTrash);
+        assert!(matches!(&m.screen, Screen::Trash(t) if t.search == "x"), "a refresh keeps what was typed");
+    }
+
+    #[test]
+    fn cancelling_a_removal_closes_the_confirmation_and_sends_nothing() {
+        let mut m = model();
+        let page = trash_page();
+        let id = page.items[0].id;
+        m.screen = Screen::Trash(Trash { page: Some(page), ..Trash::new() });
+        m.update(Event::ConfirmRemoveTrash(id));
+        assert!(matches!(&m.screen, Screen::Trash(t) if t.confirm == Some(id)));
+        assert!(m.update(Event::CancelRemoveTrash).is_empty());
+        assert!(matches!(&m.screen, Screen::Trash(t) if t.confirm.is_none()));
+        // With nothing to confirm, the remove button does nothing.
+        assert!(m.update(Event::RemoveTrash).is_empty());
+    }
+
+    #[test]
+    fn the_devices_answer_teaches_the_names_wherever_the_page_is() {
+        let mut m = signed_in();
+        let device = DeviceInfo {
+            id: DeviceId::generate(),
+            name: "BEAST".into(),
+            created_ms: 0,
+            last_used_ms: 0,
+            revoked: false,
+            current: false,
+            client_kind: String::new(),
+            platform: String::new(),
+            app_version: String::new(),
+            revoked_ms: None,
+            revoke_reason: None,
+        };
+        // On a page without the signed-in view (versions) the names are kept all the same.
+        m.update(Event::Tab(Tab::Versions));
+        assert!(m.overview().is_none());
+        m.update(Event::Devices(Ok(vec![device.clone()])));
+        assert_eq!(m.names.computer(device.id).text, "BEAST");
+        // The computer leaves the list: its name stays for the older entries.
+        m.update(Event::Devices(Ok(Vec::new())));
+        assert_eq!(m.names.computer(device.id).text, "BEAST");
+        assert!(!m.names.computer(DeviceId::generate()).known);
+    }
+
+    #[test]
+    fn the_account_answer_teaches_the_accounts_own_name() {
+        let mut m = signed_in();
+        let session = m.overview().unwrap().session;
+        let id = Uuid::from_u128(77);
+        m.update(Event::Admin(AdminEvent::Account {
+            session,
+            result: Ok(craft_cloud_proto::api::AccountInfo {
+                user_id: id,
+                username: "ana".into(),
+                role: "member".into(),
+                created_ms: 0,
+                password_changed_ms: None,
+                two_factor_enabled: false,
+            }),
+        }));
+        assert_eq!(m.names.account(id).text, "ana");
+    }
+
+    #[test]
+    fn the_recent_activity_loads_with_the_overview_and_keeps_the_newest_five() {
+        let mut m = signed_in();
+        let o = m.overview().unwrap();
+        assert_eq!(o.recent, Recent::Loading);
+        let session = o.session;
+        let events: Vec<_> = (0..8).map(|n| crate::agent::fake::FakeAgent::sample_event(n, "auth.login")).collect();
+        // An answer for another sign-in is ignored.
+        m.update(Event::Recent { session: session + 1, result: Ok(AuditPage { events: events.clone(), next: None }) });
+        assert_eq!(m.overview().unwrap().recent, Recent::Loading);
+        m.update(Event::Recent { session, result: Ok(AuditPage { events: events.clone(), next: Some("more".into()) }) });
+        assert!(matches!(&m.overview().unwrap().recent, Recent::Loaded(list) if list.len() == 5 && list[0].id == events[0].id));
+        m.update(Event::Recent { session, result: Err(Error::Io("down".into())) });
+        assert!(matches!(&m.overview().unwrap().recent, Recent::Failed(_)));
+        // A fresh overview asks again.
+        m.update(Event::Tab(Tab::Trash));
+        let effects = m.update(Event::Tab(Tab::Overview));
+        assert!(effects.iter().any(|e| matches!(e, Effect::Recent { .. })), "{effects:?}");
+        assert_eq!(m.overview().unwrap().recent, Recent::Loading);
     }
 }

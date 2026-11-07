@@ -541,6 +541,9 @@ impl Model {
         if self.overview().map(|o| o.session) != Some(session) {
             return Vec::new();
         }
+        if let Ok(account) = &result {
+            self.names.learn_account(account.user_id, &account.username);
+        }
         let access = match result {
             Ok(account) if account.role == "admin" => Access::Admin { two_factor: account.two_factor_enabled },
             Ok(_) => Access::Member,

@@ -21,6 +21,7 @@ pub mod app;
 pub mod audit;
 pub mod autostart;
 pub mod model;
+pub mod names;
 pub mod security;
 pub mod single_instance;
 pub mod start_agent;

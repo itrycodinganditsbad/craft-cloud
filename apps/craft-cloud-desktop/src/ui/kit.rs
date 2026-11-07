@@ -246,7 +246,7 @@ pub fn apply(ctx: &Context) {
     ctx.all_styles_mut(|style| {
         style.spacing.button_padding = egui::vec2(16.0, 4.0);
         // Solid scroll bars take their own room instead of floating over the content's right edge.
-        style.spacing.scroll = egui::style::ScrollStyle::solid();
+        style.spacing.scroll = egui::style::ScrollStyle { foreground_color: true, bar_width: 8.0, ..egui::style::ScrollStyle::solid() };
         style.text_styles = [
             (TextStyle::Heading, FontId::new(HEADING_SIZE, display())),
             (TextStyle::Body, FontId::new(14.0, FontFamily::Proportional)),
@@ -562,6 +562,62 @@ pub fn numbered(number: usize, title: &str) -> String {
 pub fn section_label(ui: &mut Ui, text: &str) -> Response {
     let t = Tokens::get(ui.ctx());
     mono_label(ui, text, LABEL_SIZE, mono(), t.muted)
+}
+
+/// A table cell's two lines: `primary` in the medium weight over `secondary` in the muted colour, each cut off with "…"
+/// (and whole as hover text) when it doesn't fit, and the pair centred vertically in a cell `cell_height` high.
+pub fn two_lines(ui: &mut Ui, cell_height: f32, primary: &str, secondary: Option<&str>) {
+    let t = Tokens::get(ui.ctx());
+    let first = FontId::new(14.0, medium());
+    let second = FontId::new(12.0, FontFamily::Proportional);
+    let content = ui.fonts_mut(|f| f.row_height(&first) + secondary.map_or(0.0, |_| 2.0 + f.row_height(&second)));
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.add_space(((cell_height - content) / 2.0).max(0.0));
+        ui.add(egui::Label::new(RichText::new(primary).font(first).color(t.ink_strong)).truncate().selectable(false));
+        if let Some(secondary) = secondary {
+            ui.add(egui::Label::new(RichText::new(secondary).font(second).color(t.muted)).truncate().selectable(false));
+        }
+    });
+}
+
+/// A row of a page: `label` (a section label) on the left and what `right` adds (right to left: the rightmost first) on
+/// the right, all centred vertically in a row as high as a button.
+pub fn label_row(ui: &mut Ui, label: &str, right: impl FnOnce(&mut Ui)) {
+    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        section_label(ui, label);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
+    });
+}
+
+/// The width [`section_label`] takes for `text`.
+pub fn section_label_width(ui: &Ui, text: &str) -> f32 {
+    label_galley(ui, text, LABEL_SIZE, mono()).size().x
+}
+
+/// A caption: upper-case mono at 11 px in the muted colour (the footer's status line).
+pub fn caption(ui: &mut Ui, text: &str) -> Response {
+    let t = Tokens::get(ui.ctx());
+    mono_label(ui, text, 11.0, mono(), t.muted)
+}
+
+/// A folder or a file drawn as an outline, `side` points wide, in the accent ink for a folder and the ink for a file.
+pub fn item_icon(ui: &mut Ui, folder: bool, side: f32) -> Response {
+    let t = Tokens::get(ui.ctx());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        // The mockups' 24 x 24 outlines: a folder `M3 7h6l2 2h10v10H3z`, a file `M6 3h8l4 4v14H6z`.
+        let points: &[(f32, f32)] = if folder {
+            &[(3.0, 7.0), (9.0, 7.0), (11.0, 9.0), (21.0, 9.0), (21.0, 19.0), (3.0, 19.0)]
+        } else {
+            &[(6.0, 3.0), (14.0, 3.0), (18.0, 7.0), (18.0, 21.0), (6.0, 21.0)]
+        };
+        let scale = side / 24.0;
+        let points: Vec<egui::Pos2> = points.iter().map(|(x, y)| rect.min + egui::vec2(x * scale, y * scale)).collect();
+        let color = if folder { t.accent_ink } else { t.ink };
+        ui.painter().add(egui::Shape::closed_line(points, Stroke::new(1.5, color)));
+    }
+    response
 }
 
 /// A line across the available width in the hairline colour.

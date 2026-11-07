@@ -2,20 +2,37 @@
 
 use egui::RichText;
 
+use super::confirm;
+use super::kit::{self, Column, Tokens, Tone};
+use crate::admin::format_bytes;
 use crate::model::{Event, Versions};
 
+/// The height of a row of the versions table.
+const ROW_H: f32 = 60.0;
+/// The width of the Load versions button, so the path field can take the rest of the row.
+const LOAD_W: f32 = 170.0;
+
 pub(super) fn show(ui: &mut egui::Ui, versions: &mut Versions, now_ms: i64, events: &mut Vec<Event>) {
+    let t = Tokens::get(ui.ctx());
+    let names = super::names(ui);
+    let idle = !versions.loading && !versions.restoring;
     super::heading(ui, "File versions");
-    ui.add_space(8.0);
-    ui.label("Path inside the sync folder");
+    kit::section_label(ui, &kit::numbered(1, "Path inside the sync folder"));
+    ui.add_space(6.0);
     let mut path = versions.path.clone();
-    let response = ui.add_enabled_ui(!versions.restoring, |ui| ui.add(super::kit::text_edit(&mut path).hint_text("Projects/file.txt"))).inner;
-    if response.changed() {
-        events.push(Event::VersionsPath(path));
-    }
-    if super::wide_button(ui, !versions.loading && !versions.restoring, "Load versions") {
-        events.push(Event::LoadVersions);
-    }
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - LOAD_W - ui.spacing().item_spacing.x).max(120.0);
+        let response =
+            ui.add_enabled_ui(!versions.restoring, |ui| ui.add(kit::text_edit(&mut path).hint_text("Projects/file.txt").desired_width(width))).inner;
+        if response.changed() {
+            events.push(Event::VersionsPath(path.clone()));
+        }
+        let load = kit::Button::new("Load versions").primary().min_size(egui::vec2(LOAD_W, kit::CONTROL_H));
+        if ui.add_enabled(idle, load).clicked() {
+            events.push(Event::LoadVersions);
+        }
+    });
+    ui.add_space(8.0);
     if versions.loading {
         ui.horizontal(|ui| {
             ui.spinner();
@@ -29,43 +46,72 @@ pub(super) fn show(ui: &mut egui::Ui, versions: &mut Versions, now_ms: i64, even
         ui.label(RichText::new(notice).color(super::good(ui)));
     }
     if let Some(page) = &versions.page {
-        ui.add_space(8.0);
-        for version in &page.versions {
-            let current = Some(version.id) == versions.current_version;
-            super::kit::card(ui, None, |ui| {
-                ui.label(RichText::new(if current { "Current version" } else { "Saved version" }).strong());
-                ui.label(format!("{} · {} · {} bytes", date(version.created_ms), super::ago(now_ms, version.created_ms), version.size));
-                ui.label(format!("Device {}", version.device));
-                if version.pruned {
-                    ui.label("This version can no longer be restored");
-                } else if !current
-                    && ui.add_enabled(!versions.loading && !versions.restoring, super::kit::Button::new("Restore this version")).clicked()
-                {
-                    events.push(Event::ConfirmRestore(version.id));
-                }
-            });
-            ui.add_space(4.0);
-        }
         if page.versions.is_empty() {
             ui.label("No versions found.");
-        }
-        if page.next.is_some() && super::wide_button(ui, !versions.loading && !versions.restoring, "More versions") {
-            events.push(Event::NextVersions);
-        }
-    }
-    if let Some(version) = versions.confirm {
-        egui::Window::new("Restore version?").collapsible(false).resizable(false).show(ui.ctx(), |ui| {
-            ui.label("This makes the selected version the current file. Sync will update this computer.");
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!versions.restoring && !versions.loading, super::kit::Button::new("Restore this version")).clicked() {
-                    events.push(Event::RestoreVersion);
-                }
-                if ui.add(super::kit::Button::new("Cancel")).clicked() {
-                    events.push(Event::CancelRestore);
+        } else {
+            let columns = [
+                Column::flex("Saved", 200.0).weighted(2.0),
+                Column::fixed("Kind", 110.0),
+                Column::fixed("Size", 110.0),
+                Column::flex("Computer", 140.0),
+                Column::fixed("", 220.0),
+            ];
+            kit::table(ui, "versions", &columns, page.versions.len(), ROW_H, |ui, row, column| {
+                let Some(version) = page.versions.get(row) else { return };
+                let current = Some(version.id) == versions.current_version;
+                match column {
+                    0 => kit::two_lines(ui, ROW_H, &date(version.created_ms), Some(&super::ago(now_ms, version.created_ms))),
+                    1 => {
+                        if current {
+                            kit::tag(ui, "Current", Tone::Good);
+                        } else {
+                            kit::tag(ui, "Saved", Tone::Neutral);
+                        }
+                    }
+                    2 => {
+                        ui.label(RichText::new(format_bytes(version.size)).monospace());
+                    }
+                    3 => {
+                        let computer = names.computer(version.device);
+                        let color = if computer.known { t.ink } else { t.muted };
+                        ui.add(egui::Label::new(RichText::new(&computer.text).color(color)).truncate().selectable(false))
+                            .on_hover_text(&computer.full);
+                    }
+                    _ => {
+                        if version.pruned {
+                            ui.label(RichText::new("can no longer be restored").color(t.muted));
+                        } else if !current && ui.add_enabled(idle, kit::Button::new("Restore this version")).clicked() {
+                            events.push(Event::ConfirmRestore(version.id));
+                        }
+                    }
                 }
             });
-            let _ = version;
-        });
+        }
+        if page.next.is_some() {
+            ui.add_space(8.0);
+            if ui.add_enabled(idle, kit::Button::new("More versions")).clicked() {
+                events.push(Event::NextVersions);
+            }
+        }
+    }
+    match versions.confirm {
+        Some(version) => {
+            ui.add_space(12.0);
+            let panel = confirm::Panel {
+                key: egui::Id::new(("restore-version", version.to_string())),
+                title: "Restore this version?",
+                text: "This makes the selected version the current file. Sync will update this computer.",
+                confirm: "Restore this version",
+                danger: false,
+                enabled: idle,
+            };
+            match confirm::show(ui, &panel) {
+                confirm::Answer::Confirmed => events.push(Event::RestoreVersion),
+                confirm::Answer::Cancelled => events.push(Event::CancelRestore),
+                confirm::Answer::Open => {}
+            }
+        }
+        None => confirm::idle(ui),
     }
 }
 

@@ -14,6 +14,7 @@ use craft_cloud_proto::api::AuditEvent;
 
 use crate::admin::{AdminScreen, View, error_text, fresh, is_forbidden};
 use crate::model::{Effect, Model, Overview, Screen};
+use crate::names::{Named, Names};
 
 /// Events on one page.
 pub const PAGE_SIZE: u32 = 25;
@@ -446,14 +447,16 @@ pub fn short_id(id: impl std::fmt::Display) -> String {
 
 /// Who did it and what it was about, in a line, and the same with the whole IDs for hover: the account that acted (or "command
 /// line" for the server's own commands, "unknown" for a failed sign-in, where nobody proved who they were), the account or computer
-/// it concerned, and the computer a sign-out or admin act names in its details.
-pub fn who_line(event: &AuditEvent) -> (String, String) {
+/// it concerned, and the computer a sign-out or admin act names in its details. Accounts and computers `names` knows are shown by
+/// name; the others by a short ID.
+pub fn who_line(event: &AuditEvent, names: &Names) -> (String, String) {
     let mut line = Vec::new();
     let mut full = Vec::new();
     match (event.actor_user, event.action.starts_with("cli.")) {
         (Some(user), _) => {
-            line.push(format!("by {}", short_id(user)));
-            full.push(format!("by account {user}"));
+            let who = names.account(user);
+            line.push(format!("by {}", who.text));
+            full.push(format!("by {}", who.full.replace('\n', " ")));
         }
         (None, true) => {
             line.push("by the command line".to_owned());
@@ -465,17 +468,25 @@ pub fn who_line(event: &AuditEvent) -> (String, String) {
         }
     }
     if let Some(device) = event.actor_device {
-        line.push(format!("on computer {}", short_id(device)));
-        full.push(format!("on computer {device}"));
+        let computer = names.computer(device);
+        line.push(format!("on computer {}", computer.text));
+        full.push(format!("on {}", computer.full.replace('\n', " ")));
     }
     if let Some(target) = event.target_id {
         let kind = if event.target_kind.is_empty() || event.target_kind == "user" { "account" } else { event.target_kind.as_str() };
-        line.push(format!("about {kind} {}", short_id(target)));
-        full.push(format!("about {kind} {target}"));
+        let about = if kind == "account" { names.account(target) } else { names.computer(target) };
+        let about = if kind == "account" || kind == "device" {
+            about
+        } else {
+            Named { text: short_id(target), full: format!("{kind} {target}"), known: false }
+        };
+        line.push(format!("about {kind} {}", about.text));
+        full.push(format!("about {}", about.full.replace('\n', " ")));
     }
     if let Some(device) = event.details.device {
-        line.push(format!("computer {}", short_id(device)));
-        full.push(format!("computer {device}"));
+        let computer = names.computer(device);
+        line.push(format!("computer {}", computer.text));
+        full.push(computer.full.replace('\n', " "));
     }
     (line.join(" · "), full.join("\n"))
 }
@@ -759,28 +770,59 @@ pub(crate) mod tests {
         e.actor_user = Some(user);
         e.target_kind = "user".into();
         e.target_id = Some(other);
-        let (line, full) = who_line(&e);
+        let (line, full) = who_line(&e, &Names::default());
         assert_eq!(line, "by 01234567 · about account fedcba98");
         assert!(full.contains(&user.to_string()) && full.contains(&other.to_string()), "{full}");
         // A computer in the details; a computer that acted.
         let device = craft_cloud_app::DeviceId::generate();
         e.details.device = Some(device);
         e.actor_device = Some(device);
-        let (line, full) = who_line(&e);
+        let (line, full) = who_line(&e, &Names::default());
         assert!(line.contains(&format!("on computer {}", short_id(device))) && line.contains(&format!("computer {}", short_id(device))), "{line}");
         assert!(full.contains(&device.to_string()));
         // Nobody: the command line, or an unproven sign-in.
         let cli = FakeAgent::sample_event(2, "cli.password_reset");
-        assert_eq!(who_line(&cli).0, "by the command line");
+        assert_eq!(who_line(&cli, &Names::default()).0, "by the command line");
         let failed = FakeAgent::sample_event(3, "auth.login_failed");
-        assert_eq!(who_line(&failed).0, "by unknown");
-        assert!(who_line(&failed).1.contains("nobody had proved"));
+        assert_eq!(who_line(&failed, &Names::default()).0, "by unknown");
+        assert!(who_line(&failed, &Names::default()).1.contains("nobody had proved"));
         // A target of another kind keeps its kind.
         let mut gone = FakeAgent::sample_event(4, "device.revoked");
         gone.actor_user = Some(user);
         gone.target_kind = "device".into();
         gone.target_id = Some(other);
-        assert_eq!(who_line(&gone).0, "by 01234567 · about device fedcba98");
+        assert_eq!(who_line(&gone, &Names::default()).0, "by 01234567 · about device fedcba98");
+    }
+
+    #[test]
+    fn known_accounts_and_computers_are_named_in_the_line_and_on_hover() {
+        let user = Uuid::from_u128(1);
+        let device = craft_cloud_app::DeviceId::generate();
+        let mut names = Names::default();
+        names.learn_account(user, "fabio");
+        names.learn_computers(&[craft_cloud_app::DeviceInfo {
+            id: device,
+            name: "BEAST".into(),
+            created_ms: 0,
+            last_used_ms: 0,
+            revoked: false,
+            current: false,
+            client_kind: String::new(),
+            platform: String::new(),
+            app_version: String::new(),
+            revoked_ms: None,
+            revoke_reason: None,
+        }]);
+        let mut e = FakeAgent::sample_event(1, "auth.login");
+        e.actor_user = Some(user);
+        e.actor_device = Some(device);
+        let (line, full) = who_line(&e, &names);
+        assert_eq!(line, "by fabio · on computer BEAST");
+        assert!(full.contains(&user.to_string()) && full.contains(&device.to_string()), "{full}");
+        // A computer nobody knows (removed) stays a short ID.
+        let gone = craft_cloud_app::DeviceId::generate();
+        e.actor_device = Some(gone);
+        assert_eq!(who_line(&e, &names).0, format!("by fabio · on computer {}", short_id(gone)));
     }
 
     #[test]
