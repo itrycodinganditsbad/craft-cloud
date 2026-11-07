@@ -1688,3 +1688,4 @@ fn snapshot_security_pages() {
     let mut password = after(&on, events(()));
     password.update(Event::Security(crate::security::SecurityEvent::StartPassword));
     snapshot(password, egui::Theme::Light, "security-password-light");
+}

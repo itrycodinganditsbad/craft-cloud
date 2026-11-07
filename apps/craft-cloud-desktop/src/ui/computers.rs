@@ -44,7 +44,11 @@ pub(super) fn page(ui: &mut egui::Ui, o: &mut Overview, now_ms: i64, events: &mu
         if ui.add(super::kit::Button::new("Add a computer").primary()).clicked() {
             events.push(Event::AddComputer);
         }
-        if ui.add_enabled(others, super::kit::Button::new("Sign out other computers")).on_hover_text("Asks once more; this computer stays signed in").clicked() {
+        if ui
+            .add_enabled(others, super::kit::Button::new("Sign out other computers"))
+            .on_hover_text("Asks once more; this computer stays signed in")
+            .clicked()
+        {
             events.push(Event::SignOutOtherComputers);
         }
         if ui.add(super::kit::Button::new("Refresh")).clicked() {
@@ -58,7 +62,9 @@ pub(super) fn page(ui: &mut egui::Ui, o: &mut Overview, now_ms: i64, events: &mu
         });
     } else {
         title(ui);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| buttons(ui, events));
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| buttons(ui, events));
+        });
     }
     if let Some(error) = &o.devices_error {
         super::error_line(ui, error);

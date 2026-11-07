@@ -755,7 +755,7 @@ pub(crate) mod fake {
             let f = self.factor.lock().unwrap();
             Ok(TwoFactorStatus {
                 enabled: f.enabled,
-                enabled_ms: f.enabled.then_some(1_000),
+                enabled_ms: f.enabled.then_some(1_789_900_000_000),
                 recovery_codes_left: if f.enabled { 10 } else { 0 },
                 pending: f.pending,
             })
