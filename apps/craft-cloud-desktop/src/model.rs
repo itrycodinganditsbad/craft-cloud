@@ -205,6 +205,8 @@ pub const MAX_DEVICE_NAME_BYTES: usize = 128;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rename {
     pub id: DeviceId,
+    /// Which try this is: an answer closes the field only when it is for the latest one sent.
+    pub ticket: u64,
     /// What the text field holds.
     pub name: String,
     /// The name was sent and the answer is awaited.
@@ -259,6 +261,8 @@ pub struct Overview {
     pub removing: Option<DeviceId>,
     /// The computer being renamed on the Computers page: its row is a text field.
     pub renaming: Option<Rename>,
+    /// The last [`Rename::ticket`] given.
+    pub rename_tickets: u64,
     /// What went wrong with the last action (pause), for people.
     pub error: Option<String>,
     /// Whether the server lets this account use the admin pages (asked at sign-in).
@@ -391,6 +395,7 @@ impl Overview {
             usage_error: None,
             removing: None,
             renaming: None,
+            rename_tickets: 0,
             error: None,
             access: Access::Unknown,
             session: crate::admin::fresh(),
@@ -534,8 +539,8 @@ pub enum Event {
     CancelRename,
     /// Rename: send the typed name.
     SaveRename,
-    /// The answer to a rename of this computer: its [`DeviceInfo`] now.
-    Renamed(DeviceId, Result<DeviceInfo, Error>),
+    /// The answer to a rename of this computer (the [`Rename::ticket`] it was sent with): its [`DeviceInfo`] now.
+    Renamed(DeviceId, u64, Result<DeviceInfo, Error>),
     /// "Sign out other computers" on the Computers page: opens the Security page at its sign-out step.
     SignOutOtherComputers,
     /// Ask for the computer list again.
@@ -617,6 +622,7 @@ pub enum Effect {
     RenameDevice {
         id: DeviceId,
         name: String,
+        ticket: u64,
     },
     Logout {
         local: bool,
@@ -850,6 +856,10 @@ impl Model {
         };
         let Screen::SignedIn(overview) = &mut self.screen else { return effects };
         overview.page = if tab == Tab::Computers { OverviewPage::Computers } else { OverviewPage::Home };
+        // A name being typed is dropped with the page; one on its way keeps its ticket.
+        if overview.renaming.as_ref().is_some_and(|r| !r.busy) {
+            overview.renaming = None;
+        }
         effects.extend(match tab {
             Tab::Overview | Tab::Computers => Vec::new(),
             Tab::Versions => self.update(Event::OpenVersions),
@@ -1131,7 +1141,14 @@ impl Model {
             Event::SecurityAnswer(answer) => {
                 let now_ms = self.now_ms;
                 let Screen::Security(page) = &mut self.screen else { return Vec::new() };
-                page.answer(answer, now_ms).into_iter().map(Effect::Security).collect()
+                // These sign the account's other computers out: the list the page shows is stale after them.
+                let signs_out =
+                    matches!(&answer, SecurityAnswer::SignOutOthers(Ok(_)) | SecurityAnswer::ChangePassword(Ok(_)) | SecurityAnswer::Disable(Ok(_)));
+                let mut effects: Vec<Effect> = page.answer(answer, now_ms).into_iter().map(Effect::Security).collect();
+                if signs_out {
+                    effects.push(Effect::Devices);
+                }
+                effects
             }
             Event::SubmitSecondFactor => self.submit_second_factor(),
             Event::CancelSecondFactor => {
@@ -1336,7 +1353,7 @@ impl Model {
                     return Vec::new();
                 }
                 if let Some(device) = overview.devices.iter().flatten().find(|d| d.id == id && !d.revoked) {
-                    overview.renaming = Some(Rename { id, name: device.name.clone(), busy: false, error: None });
+                    overview.renaming = Some(Rename { id, ticket: 0, name: device.name.clone(), busy: false, error: None });
                 }
                 Vec::new()
             }
@@ -1366,22 +1383,28 @@ impl Model {
                 }
                 rename.error = None;
                 rename.busy = true;
-                vec![Effect::RenameDevice { id, name }]
-            }
-            Event::Renamed(id, result) => {
-                let Some(overview) = self.overview_mut() else { return Vec::new() };
-                if overview.renaming.as_ref().is_none_or(|r| r.id != id) {
-                    return Vec::new();
+                overview.rename_tickets = overview.rename_tickets.wrapping_add(1);
+                let ticket = overview.rename_tickets;
+                if let Some(rename) = overview.renaming.as_mut() {
+                    rename.ticket = ticket;
                 }
+                vec![Effect::RenameDevice { id, name, ticket }]
+            }
+            Event::Renamed(id, ticket, result) => {
+                let Some(overview) = self.overview_mut() else { return Vec::new() };
+                let current = overview.renaming.as_ref().is_some_and(|r| r.id == id && r.ticket == ticket);
                 match result {
                     Ok(renamed) => {
+                        // The server's answer is the computer's name now, whether its field is still open or not.
                         if let Some(device) = overview.devices.iter_mut().flatten().find(|d| d.id == renamed.id) {
                             *device = renamed;
                         }
-                        overview.renaming = None;
+                        if current {
+                            overview.renaming = None;
+                        }
                     }
                     Err(e) => {
-                        if let Some(rename) = overview.renaming.as_mut() {
+                        if current && let Some(rename) = overview.renaming.as_mut() {
                             rename.busy = false;
                             rename.error = Some(message(&e));
                         }
@@ -3355,12 +3378,12 @@ pub(crate) mod tests {
         assert_eq!(renaming(&m).map(|r| (r.id, r.name)), Some((other.id, "BEAST".to_owned())));
         type_name(&mut m, "  Studio PC \t");
         let effects = m.update(Event::SaveRename);
-        assert_eq!(effects, vec![Effect::RenameDevice { id: other.id, name: "Studio PC".into() }]);
+        assert_eq!(effects, vec![Effect::RenameDevice { id: other.id, name: "Studio PC".into(), ticket: 1 }]);
         assert!(renaming(&m).is_some_and(|r| r.busy));
         // Nothing goes twice while the answer is awaited.
         assert!(m.update(Event::SaveRename).is_empty());
         let renamed = DeviceInfo { name: "Studio PC".into(), ..other.clone() };
-        m.update(Event::Renamed(other.id, Ok(renamed.clone())));
+        m.update(Event::Renamed(other.id, 1, Ok(renamed.clone())));
         assert_eq!(renaming(&m), None);
         let list = m.overview().and_then(|o| o.devices.clone()).unwrap_or_default();
         assert_eq!(list, vec![this, renamed], "the order stays, the row is the server's");
@@ -3371,7 +3394,7 @@ pub(crate) mod tests {
         let (mut m, this, _) = with_two_computers();
         m.update(Event::StartRename(this.id));
         type_name(&mut m, "Office");
-        assert_eq!(m.update(Event::SaveRename), vec![Effect::RenameDevice { id: this.id, name: "Office".into() }]);
+        assert_eq!(m.update(Event::SaveRename), vec![Effect::RenameDevice { id: this.id, name: "Office".into(), ticket: 1 }]);
     }
 
     #[test]
@@ -3411,7 +3434,7 @@ pub(crate) mod tests {
         type_name(&mut m, "Studio PC");
         m.update(Event::SaveRename);
         let refused = Error::Refused { code: "not_found".into(), message: "no such computer in this cloud".into(), name_taken: None };
-        m.update(Event::Renamed(other.id, Err(refused)));
+        m.update(Event::Renamed(other.id, 1, Err(refused)));
         let rename = renaming(&m);
         let seen = rename.as_ref().map(|r| (r.busy, r.error.as_deref(), r.name.as_str()));
         assert_eq!(seen, Some((false, Some("no such computer in this cloud"), "Studio PC")));
@@ -3419,7 +3442,7 @@ pub(crate) mod tests {
         assert_eq!(list.get(1).map(|d| d.name.as_str()), Some("BEAST"));
         // Tried again, and the agent can't be reached: the same.
         assert_eq!(m.update(Event::SaveRename).len(), 1);
-        m.update(Event::Renamed(other.id, Err(Error::NotRunning("can't reach it".into()))));
+        m.update(Event::Renamed(other.id, 2, Err(Error::NotRunning("can't reach it".into()))));
         assert!(renaming(&m).is_some_and(|r| !r.busy && r.error.is_some()));
     }
 
@@ -3438,8 +3461,16 @@ pub(crate) mod tests {
         m.update(Event::CancelRename);
         assert!(renaming(&m).is_some_and(|r| r.busy));
         // An answer for another computer is ignored; so is a rename of a computer that isn't listed.
-        m.update(Event::Renamed(DeviceId::generate(), Ok(computer("x", false))));
+        m.update(Event::Renamed(DeviceId::generate(), 1, Ok(computer("x", false))));
         assert!(renaming(&m).is_some());
+        // The answer of a busy rename reaches the list even when its field is gone or it is another try's.
+        let late = DeviceInfo { name: "Late".into(), ..other.clone() };
+        m.update(Event::Renamed(other.id, 99, Ok(late.clone())));
+        assert!(renaming(&m).is_some_and(|r| r.busy), "another try's answer leaves the field");
+        let list = m.overview().and_then(|o| o.devices.clone()).unwrap_or_default();
+        assert_eq!(list.get(1), Some(&late));
+        m.update(Event::Renamed(other.id, 1, Ok(late)));
+        assert_eq!(renaming(&m), None);
         let mut unknown = signed_in();
         assert!(unknown.update(Event::StartRename(DeviceId::generate())).is_empty());
         assert_eq!(unknown.overview().and_then(|o| o.renaming.clone()), None);
@@ -3479,5 +3510,37 @@ pub(crate) mod tests {
         assert!(!is_older_version("nightly", "0.1.0"));
         assert!(!is_older_version("0.0.x", "0.1.0"));
         assert!(!is_older_version("0.0.9", "unknown"));
+    }
+
+    #[test]
+    fn leaving_the_computers_tab_drops_a_typed_name_but_not_one_on_its_way() {
+        let (mut m, _, other) = with_two_computers();
+        m.update(Event::Tab(Tab::Computers));
+        m.update(Event::StartRename(other.id));
+        m.update(Event::Tab(Tab::Overview));
+        assert_eq!(renaming(&m), None);
+        m.update(Event::Tab(Tab::Computers));
+        m.update(Event::StartRename(other.id));
+        type_name(&mut m, "Another");
+        m.update(Event::SaveRename);
+        m.update(Event::Tab(Tab::Overview));
+        assert!(renaming(&m).is_some_and(|r| r.busy));
+    }
+
+    #[test]
+    fn the_security_pages_list_is_asked_again_after_the_other_computers_were_signed_out() {
+        use crate::security::SecurityAnswer;
+        let (mut m, _, _) = with_two_computers();
+        m.update(Event::OpenSecurity);
+        let done = craft_cloud_app::RevokedOthers { revoked: 1 };
+        let effects = m.update(Event::SecurityAnswer(SecurityAnswer::SignOutOthers(Ok(done))));
+        assert!(effects.contains(&Effect::Devices), "{effects:?}");
+        let effects = m.update(Event::SecurityAnswer(SecurityAnswer::ChangePassword(Ok(()))));
+        assert!(effects.contains(&Effect::Devices), "{effects:?}");
+        let effects = m.update(Event::SecurityAnswer(SecurityAnswer::Disable(Ok(()))));
+        assert!(effects.contains(&Effect::Devices), "{effects:?}");
+        let refused = Error::Refused { code: "wrong_password".into(), message: "no".into(), name_taken: None };
+        let effects = m.update(Event::SecurityAnswer(SecurityAnswer::ChangePassword(Err(refused))));
+        assert!(!effects.contains(&Effect::Devices), "{effects:?}");
     }
 }

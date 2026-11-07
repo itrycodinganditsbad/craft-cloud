@@ -356,7 +356,7 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         Effect::Devices => Event::Devices(agent.devices()),
         Effect::Usage(request_id) => Event::Usage { request_id, result: agent.usage() },
         Effect::RemoveDevice(id) => Event::Devices(agent.remove_device(id)),
-        Effect::RenameDevice { id, name } => Event::Renamed(id, agent.rename_device(id, &name)),
+        Effect::RenameDevice { id, name, ticket } => Event::Renamed(id, ticket, agent.rename_device(id, &name)),
         Effect::History { path, cursor, ticket } => Event::History { ticket, result: agent.file_history(&path, cursor.as_deref()) },
         Effect::Restore { path, version, expected_version, ticket } => {
             Event::Restored { ticket, result: agent.restore_file(&path, version, expected_version) }

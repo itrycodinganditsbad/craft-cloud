@@ -85,6 +85,7 @@ pub(super) fn page(ui: &mut egui::Ui, o: &mut Overview, now_ms: i64, events: &mu
 fn table(ui: &mut egui::Ui, o: &mut Overview, active: &[DeviceInfo], now_ms: i64, events: &mut Vec<Event>) {
     let t = Tokens::get(ui.ctx());
     let (online, removing) = (o.status.online, o.removing);
+    let rename_open = o.renaming.is_some();
     let mut renaming = o.renaming.take();
     egui::Frame::new().stroke(t.hairline()).fill(t.bg).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -98,7 +99,7 @@ fn table(ui: &mut egui::Ui, o: &mut Overview, active: &[DeviceInfo], now_ms: i64
                     ui.end_row();
                     for device in active {
                         let editing = renaming.as_mut().filter(|r| r.id == device.id);
-                        row(ui, device, editing, online, removing, now_ms, events);
+                        row(ui, device, editing, (online, removing, rename_open), now_ms, events);
                         ui.end_row();
                     }
                 });
@@ -113,8 +114,7 @@ fn row(
     ui: &mut egui::Ui,
     device: &DeviceInfo,
     mut editing: Option<&mut Rename>,
-    online: bool,
-    removing: Option<DeviceId>,
+    (online, removing, rename_open): (bool, Option<DeviceId>, bool),
     now_ms: i64,
     events: &mut Vec<Event>,
 ) {
@@ -136,7 +136,8 @@ fn row(
                         response.request_focus();
                         ui.data_mut(|d| d.insert_temp(focused, true));
                     }
-                    if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    // egui drops the focus on Escape before the field reports it, so a field that lost it this frame counts.
+                    if (response.has_focus() || response.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         events.push(Event::CancelRename);
                     } else if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         events.push(Event::SaveRename);
@@ -146,7 +147,8 @@ fn row(
                     }
                 });
                 if device.current {
-                    super::kit::tag(ui, "This computer", Tone::Accent);
+                    // In a column of its own the tag keeps its height beside a taller field.
+                    ui.vertical(|ui| super::kit::tag(ui, "This computer", Tone::Accent));
                 }
             });
         }
@@ -160,7 +162,8 @@ fn row(
                     }
                 });
                 if device.current {
-                    super::kit::tag(ui, "This computer", Tone::Accent);
+                    // In a column of its own the tag keeps its height beside a taller field.
+                    ui.vertical(|ui| super::kit::tag(ui, "This computer", Tone::Accent));
                 }
             });
         }
@@ -203,7 +206,7 @@ fn row(
             }
         }
         None => {
-            if ui.add(super::kit::Button::new("Rename")).on_hover_text(format!("Give {} another name", device.name)).clicked() {
+            if ui.add_enabled(!rename_open, super::kit::Button::new("Rename")).on_hover_text(format!("Give {} another name", device.name)).clicked() {
                 events.push(Event::StartRename(device.id));
             }
             if !device.current {

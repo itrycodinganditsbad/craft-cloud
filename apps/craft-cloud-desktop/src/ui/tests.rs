@@ -1646,7 +1646,7 @@ fn rename_is_found_by_its_label_and_sends_the_events_of_a_rename() {
     for event in events {
         pending.extend(h.state_mut().0.update(event));
     }
-    assert_eq!(pending, vec![Effect::RenameDevice { id: ids[1], name: "Build box".into() }]);
+    assert_eq!(pending, vec![Effect::RenameDevice { id: ids[1], name: "Build box".into(), ticket: 1 }]);
     while let Some(effect) = pending.pop() {
         if let Some(answer) = call(&agent, &start, effect) {
             pending.extend(h.state_mut().0.update(answer));
@@ -1688,4 +1688,43 @@ fn snapshot_security_pages() {
     let mut password = after(&on, events(()));
     password.update(Event::Security(crate::security::SecurityEvent::StartPassword));
     snapshot(password, egui::Theme::Light, "security-password-light");
+}
+
+#[test]
+fn escape_cancels_a_rename_and_the_other_rows_wait_while_one_is_open() {
+    let mut model = computers_model();
+    let ids = computers_with_details_ids(&model);
+    model.update(Event::StartRename(ids[1]));
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(4);
+    // The field took the keyboard when the row opened: Escape is Cancel.
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    let events = std::mem::take(&mut h.state_mut().1);
+    assert!(events.contains(&Event::CancelRename), "{events:?}");
+    // Another row's Rename is off while this one is open.
+    for rename in h.get_all_by_label("Rename") {
+        rename.click();
+    }
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    assert!(!events.iter().any(|e| matches!(e, Event::StartRename(_))), "{events:?}");
+}
+
+#[test]
+fn the_security_pages_sign_out_button_is_off_without_another_computer() {
+    let alone = FakeAgent::new(signed_in());
+    let events = vec![Event::Devices(Ok(computers_with_details().into_iter().take(1).collect())), Event::OpenSecurity];
+    let mut h = harness(after(&alone, events), egui::Theme::Light);
+    h.run_steps(3);
+    h.get_by_label("Sign out other computers…").click();
+    h.run_steps(2);
+    assert!(h.state_mut().1.is_empty(), "disabled");
+    let with_others = FakeAgent::new(signed_in());
+    let events = vec![Event::Devices(Ok(computers_with_details())), Event::OpenSecurity];
+    let mut h = harness(after(&with_others, events), egui::Theme::Light);
+    h.run_steps(3);
+    h.get_by_label("Sign out other computers…").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Security(crate::security::SecurityEvent::StartSignOutOthers)]);
 }

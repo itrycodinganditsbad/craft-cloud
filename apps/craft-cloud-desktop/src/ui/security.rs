@@ -342,7 +342,8 @@ fn computers_cell(ui: &mut egui::Ui, overview: &crate::model::Overview, events: 
                 }
             }
             ui.add(egui::Label::new(RichText::new("Lost a computer? Sign out the others; this one stays signed in.").small().color(t.muted)).wrap());
-            if ui.add(super::kit::Button::new("Sign out other computers…")).clicked() {
+            let others = overview.devices.iter().flatten().any(|d| !d.revoked && !d.current);
+            if ui.add_enabled(others, super::kit::Button::new("Sign out other computers…")).clicked() {
                 send(events, SecurityEvent::StartSignOutOthers);
             }
         },
