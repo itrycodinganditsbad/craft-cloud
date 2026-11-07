@@ -198,6 +198,51 @@ pub enum OverviewPage {
     Computers,
 }
 
+/// The longest name a computer can have, in bytes (the server's limit).
+pub const MAX_DEVICE_NAME_BYTES: usize = 128;
+
+/// A computer's new name being typed on the Computers page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rename {
+    pub id: DeviceId,
+    /// What the text field holds.
+    pub name: String,
+    /// The name was sent and the answer is awaited.
+    pub busy: bool,
+    /// What was wrong with the last try, for people.
+    pub error: Option<String>,
+}
+
+/// The name to send for a computer, from what was typed: trimmed, 1 to [`MAX_DEVICE_NAME_BYTES`] bytes, no control characters
+/// (what the server checks too). The error says what to change.
+pub fn check_device_name(typed: &str) -> Result<String, &'static str> {
+    let name = typed.trim();
+    if name.is_empty() {
+        Err("Type a name for this computer.")
+    } else if name.len() > MAX_DEVICE_NAME_BYTES {
+        Err("That name is too long. Use at most 128 bytes.")
+    } else if name.chars().any(char::is_control) {
+        Err("A name can't hold control characters.")
+    } else {
+        Ok(name.to_owned())
+    }
+}
+
+/// Whether the client version `theirs` is older than `own`. Only dotted numbers are compared (`0.1.0`, an optional `-pre` or
+/// `+build` suffix ignored); a version that isn't, or that is equal, is not "older", so the app never claims what it can't know.
+pub fn is_older_version(theirs: &str, own: &str) -> bool {
+    fn parse(version: &str) -> Option<Vec<u64>> {
+        let numbers = version.trim().split(['-', '+']).next()?;
+        let parts: Vec<u64> = numbers.split('.').map(|part| part.parse().ok()).collect::<Option<_>>()?;
+        (!parts.is_empty() && parts.len() <= 4).then_some(parts)
+    }
+    let (Some(mut theirs), Some(mut own)) = (parse(theirs), parse(own)) else { return false };
+    let len = theirs.len().max(own.len());
+    theirs.resize(len, 0);
+    own.resize(len, 0);
+    theirs < own
+}
+
 /// The signed-in view.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Overview {
@@ -212,6 +257,8 @@ pub struct Overview {
     pub usage_error: Option<String>,
     /// The computer being removed.
     pub removing: Option<DeviceId>,
+    /// The computer being renamed on the Computers page: its row is a text field.
+    pub renaming: Option<Rename>,
     /// What went wrong with the last action (pause), for people.
     pub error: Option<String>,
     /// Whether the server lets this account use the admin pages (asked at sign-in).
@@ -343,6 +390,7 @@ impl Overview {
             usage_loading: true,
             usage_error: None,
             removing: None,
+            renaming: None,
             error: None,
             access: Access::Unknown,
             session: crate::admin::fresh(),
@@ -480,6 +528,16 @@ pub enum Event {
     /// Done or Cancel on the add-a-computer view.
     CloseAdding,
     RemoveDevice(DeviceId),
+    /// Rename: the row of this computer becomes a text field.
+    StartRename(DeviceId),
+    /// Rename: leave the row as it was.
+    CancelRename,
+    /// Rename: send the typed name.
+    SaveRename,
+    /// The answer to a rename of this computer: its [`DeviceInfo`] now.
+    Renamed(DeviceId, Result<DeviceInfo, Error>),
+    /// "Sign out other computers" on the Computers page: opens the Security page at its sign-out step.
+    SignOutOtherComputers,
     /// Ask for the computer list again.
     RefreshDevices,
     RefreshUsage,
@@ -556,6 +614,10 @@ pub enum Effect {
     },
     Usage(u64),
     RemoveDevice(DeviceId),
+    RenameDevice {
+        id: DeviceId,
+        name: String,
+    },
     Logout {
         local: bool,
     },
@@ -883,6 +945,10 @@ impl Model {
                     overview.removing = None;
                     match result {
                         Ok(list) => {
+                            // A computer that is gone can't be renamed any more.
+                            if overview.renaming.as_ref().is_some_and(|r| !list.iter().any(|d| d.id == r.id && !d.revoked)) {
+                                overview.renaming = None;
+                            }
                             overview.devices = Some(list);
                             overview.devices_error = None;
                         }
@@ -1263,6 +1329,76 @@ impl Model {
                 }
                 overview.removing = Some(id);
                 vec![Effect::RemoveDevice(id)]
+            }
+            Event::StartRename(id) => {
+                let Some(overview) = self.overview_mut() else { return Vec::new() };
+                if overview.renaming.as_ref().is_some_and(|r| r.busy) {
+                    return Vec::new();
+                }
+                if let Some(device) = overview.devices.iter().flatten().find(|d| d.id == id && !d.revoked) {
+                    overview.renaming = Some(Rename { id, name: device.name.clone(), busy: false, error: None });
+                }
+                Vec::new()
+            }
+            Event::CancelRename => {
+                if let Some(overview) = self.overview_mut()
+                    && overview.renaming.as_ref().is_some_and(|r| !r.busy)
+                {
+                    overview.renaming = None;
+                }
+                Vec::new()
+            }
+            Event::SaveRename => {
+                let Some(overview) = self.overview_mut() else { return Vec::new() };
+                let Some(rename) = overview.renaming.as_mut().filter(|r| !r.busy) else { return Vec::new() };
+                let name = match check_device_name(&rename.name) {
+                    Ok(name) => name,
+                    Err(why) => {
+                        rename.error = Some(why.to_owned());
+                        return Vec::new();
+                    }
+                };
+                let id = rename.id;
+                // Nothing to send when the name is the one it has.
+                if overview.devices.iter().flatten().any(|d| d.id == id && d.name == name) {
+                    overview.renaming = None;
+                    return Vec::new();
+                }
+                rename.error = None;
+                rename.busy = true;
+                vec![Effect::RenameDevice { id, name }]
+            }
+            Event::Renamed(id, result) => {
+                let Some(overview) = self.overview_mut() else { return Vec::new() };
+                if overview.renaming.as_ref().is_none_or(|r| r.id != id) {
+                    return Vec::new();
+                }
+                match result {
+                    Ok(renamed) => {
+                        if let Some(device) = overview.devices.iter_mut().flatten().find(|d| d.id == renamed.id) {
+                            *device = renamed;
+                        }
+                        overview.renaming = None;
+                    }
+                    Err(e) => {
+                        if let Some(rename) = overview.renaming.as_mut() {
+                            rename.busy = false;
+                            rename.error = Some(message(&e));
+                        }
+                    }
+                }
+                Vec::new()
+            }
+            Event::SignOutOtherComputers => {
+                if !matches!(self.screen, Screen::SignedIn(_)) {
+                    return Vec::new();
+                }
+                if let Some(overview) = self.overview_mut() {
+                    overview.renaming = None;
+                }
+                let mut effects = self.update(Event::OpenSecurity);
+                effects.extend(self.security(SecurityEvent::StartSignOutOthers));
+                effects
             }
             Event::RefreshDevices => {
                 let Some(overview) = self.overview() else { return Vec::new() };
@@ -3048,6 +3184,41 @@ pub(crate) mod tests {
         }
     }
 
+
+    fn computer(name: &str, current: bool) -> DeviceInfo {
+        DeviceInfo {
+            id: DeviceId::generate(),
+            name: name.into(),
+            created_ms: 1_790_000_000_000,
+            last_used_ms: 1_790_000_000_000,
+            revoked: false,
+            current,
+            client_kind: "agent".into(),
+            platform: "Windows".into(),
+            app_version: "0.1.0".into(),
+            revoked_ms: None,
+            revoke_reason: None,
+        }
+    }
+
+    /// A signed-in model that knows two computers: this one and another.
+    fn with_two_computers() -> (Model, DeviceInfo, DeviceInfo) {
+        let mut m = signed_in();
+        let (this, other) = (computer("lptp1", true), computer("BEAST", false));
+        m.update(Event::Devices(Ok(vec![this.clone(), other.clone()])));
+        (m, this, other)
+    }
+
+    fn renaming(m: &Model) -> Option<Rename> {
+        m.overview().and_then(|o| o.renaming.clone())
+    }
+
+    fn type_name(m: &mut Model, name: &str) {
+        if let Some(r) = m.overview_mut().and_then(|o| o.renaming.as_mut()) {
+            r.name = name.to_owned();
+        }
+    }
+
     #[test]
     fn the_trash_list_is_filtered_by_kind_and_searched_by_name_or_path_in_any_case() {
         let mut m = model();
@@ -3175,5 +3346,138 @@ pub(crate) mod tests {
         let effects = m.update(Event::Tab(Tab::Overview));
         assert!(effects.iter().any(|e| matches!(e, Effect::Recent { .. })), "{effects:?}");
         assert_eq!(m.overview().unwrap().recent, Recent::Loading);
+    }
+
+    #[test]
+    fn a_rename_sends_the_trimmed_name_and_the_list_takes_the_answer() {
+        let (mut m, this, other) = with_two_computers();
+        assert!(m.update(Event::StartRename(other.id)).is_empty());
+        assert_eq!(renaming(&m).map(|r| (r.id, r.name)), Some((other.id, "BEAST".to_owned())));
+        type_name(&mut m, "  Studio PC \t");
+        let effects = m.update(Event::SaveRename);
+        assert_eq!(effects, vec![Effect::RenameDevice { id: other.id, name: "Studio PC".into() }]);
+        assert!(renaming(&m).is_some_and(|r| r.busy));
+        // Nothing goes twice while the answer is awaited.
+        assert!(m.update(Event::SaveRename).is_empty());
+        let renamed = DeviceInfo { name: "Studio PC".into(), ..other.clone() };
+        m.update(Event::Renamed(other.id, Ok(renamed.clone())));
+        assert_eq!(renaming(&m), None);
+        let list = m.overview().and_then(|o| o.devices.clone()).unwrap_or_default();
+        assert_eq!(list, vec![this, renamed], "the order stays, the row is the server's");
+    }
+
+    #[test]
+    fn this_computer_can_be_renamed_too() {
+        let (mut m, this, _) = with_two_computers();
+        m.update(Event::StartRename(this.id));
+        type_name(&mut m, "Office");
+        assert_eq!(m.update(Event::SaveRename), vec![Effect::RenameDevice { id: this.id, name: "Office".into() }]);
+    }
+
+    #[test]
+    fn a_name_the_server_would_refuse_is_not_sent() {
+        let (mut m, _, other) = with_two_computers();
+        m.update(Event::StartRename(other.id));
+        for (typed, why) in [
+            ("", "Type a name for this computer."),
+            ("   ", "Type a name for this computer."),
+            ("a\u{7}b", "A name can't hold control characters."),
+            (&"x".repeat(MAX_DEVICE_NAME_BYTES + 1), "That name is too long. Use at most 128 bytes."),
+        ] {
+            type_name(&mut m, typed);
+            assert!(m.update(Event::SaveRename).is_empty(), "{typed:?}");
+            let rename = renaming(&m);
+            assert_eq!(rename.as_ref().and_then(|r| r.error.as_deref()), Some(why), "{typed:?}");
+            assert!(rename.is_some_and(|r| !r.busy));
+        }
+        // The longest name still goes (128 bytes, counted in bytes: "é" is two).
+        type_name(&mut m, &"é".repeat(64));
+        assert_eq!(m.update(Event::SaveRename).len(), 1);
+    }
+
+    #[test]
+    fn saving_the_name_it_has_sends_nothing() {
+        let (mut m, _, other) = with_two_computers();
+        m.update(Event::StartRename(other.id));
+        type_name(&mut m, " BEAST ");
+        assert!(m.update(Event::SaveRename).is_empty());
+        assert_eq!(renaming(&m), None);
+    }
+
+    #[test]
+    fn a_refused_rename_keeps_the_field_with_the_reason_and_can_be_tried_again() {
+        let (mut m, _, other) = with_two_computers();
+        m.update(Event::StartRename(other.id));
+        type_name(&mut m, "Studio PC");
+        m.update(Event::SaveRename);
+        let refused = Error::Refused { code: "not_found".into(), message: "no such computer in this cloud".into(), name_taken: None };
+        m.update(Event::Renamed(other.id, Err(refused)));
+        let rename = renaming(&m);
+        let seen = rename.as_ref().map(|r| (r.busy, r.error.as_deref(), r.name.as_str()));
+        assert_eq!(seen, Some((false, Some("no such computer in this cloud"), "Studio PC")));
+        let list = m.overview().and_then(|o| o.devices.clone()).unwrap_or_default();
+        assert_eq!(list.get(1).map(|d| d.name.as_str()), Some("BEAST"));
+        // Tried again, and the agent can't be reached: the same.
+        assert_eq!(m.update(Event::SaveRename).len(), 1);
+        m.update(Event::Renamed(other.id, Err(Error::NotRunning("can't reach it".into()))));
+        assert!(renaming(&m).is_some_and(|r| !r.busy && r.error.is_some()));
+    }
+
+    #[test]
+    fn cancel_leaves_the_row_as_it_was_but_not_while_a_name_is_on_its_way() {
+        let (mut m, _, other) = with_two_computers();
+        m.update(Event::StartRename(other.id));
+        type_name(&mut m, "Studio PC");
+        m.update(Event::CancelRename);
+        assert_eq!(renaming(&m), None);
+        let list = m.overview().and_then(|o| o.devices.clone()).unwrap_or_default();
+        assert_eq!(list.get(1).map(|d| d.name.as_str()), Some("BEAST"));
+        m.update(Event::StartRename(other.id));
+        type_name(&mut m, "Another");
+        m.update(Event::SaveRename);
+        m.update(Event::CancelRename);
+        assert!(renaming(&m).is_some_and(|r| r.busy));
+        // An answer for another computer is ignored; so is a rename of a computer that isn't listed.
+        m.update(Event::Renamed(DeviceId::generate(), Ok(computer("x", false))));
+        assert!(renaming(&m).is_some());
+        let mut unknown = signed_in();
+        assert!(unknown.update(Event::StartRename(DeviceId::generate())).is_empty());
+        assert_eq!(unknown.overview().and_then(|o| o.renaming.clone()), None);
+    }
+
+    #[test]
+    fn a_computer_that_is_gone_from_the_list_ends_its_rename() {
+        let (mut m, this, other) = with_two_computers();
+        m.update(Event::StartRename(other.id));
+        m.update(Event::Devices(Ok(vec![this])));
+        assert_eq!(renaming(&m), None);
+    }
+
+    #[test]
+    fn sign_out_other_computers_opens_the_security_page_at_its_question() {
+        let (mut m, _, _) = with_two_computers();
+        m.update(Event::Tab(Tab::Computers));
+        let effects = m.update(Event::SignOutOtherComputers);
+        assert!(effects.contains(&Effect::Security(SecurityCall::Status)), "{effects:?}");
+        let Screen::Security(page) = &m.screen else { panic!("{:?}", m.screen) };
+        assert_eq!(page.step, crate::security::Step::SignOutOthers);
+        // Only from the signed-in page.
+        let mut out = model();
+        assert!(out.update(Event::SignOutOtherComputers).is_empty());
+    }
+
+    #[test]
+    fn only_a_version_that_is_surely_older_is_called_older() {
+        assert!(is_older_version("0.0.9", "0.1.0"));
+        assert!(is_older_version("0.1", "0.1.1"));
+        assert!(is_older_version("0.1.0-pre", "0.2.0"));
+        assert!(is_older_version("1.9.9", "1.10.0"), "numbers, not text");
+        assert!(!is_older_version("0.1.0", "0.1.0"));
+        assert!(!is_older_version("0.1.0.0", "0.1"));
+        assert!(!is_older_version("0.2.0", "0.1.0"));
+        assert!(!is_older_version("", "0.1.0"), "nothing was sent");
+        assert!(!is_older_version("nightly", "0.1.0"));
+        assert!(!is_older_version("0.0.x", "0.1.0"));
+        assert!(!is_older_version("0.0.9", "unknown"));
     }
 }

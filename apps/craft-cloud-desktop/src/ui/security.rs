@@ -3,6 +3,7 @@
 
 use egui::RichText;
 
+use super::kit::{Tokens, Tone};
 use crate::model::Event;
 use crate::security::{CodesWhy, SecurityEvent, SecurityPage, Step, TwoFactorInfo};
 
@@ -78,10 +79,12 @@ fn password_field(ui: &mut egui::Ui, name: &str, label: &str, text: &mut String)
 
 pub(super) fn show(ui: &mut egui::Ui, page: &mut SecurityPage, events: &mut Vec<Event>) {
     super::heading(ui, "Security");
-    let (busy, error, note) = (page.busy, page.error.clone(), page.note.clone());
-    let info = page.info.clone();
+    if matches!(page.step, Step::Home) {
+        return home(ui, page, events);
+    }
+    let (busy, error) = (page.busy, page.error.clone());
     match &mut page.step {
-        Step::Home => home(ui, &info, busy, note.as_deref(), error.as_deref(), events),
+        Step::Home => {}
         Step::SetupPassword { password } => {
             ui.label(
                 "Two-factor sign-in asks for a code from an app on your phone (Aegis, 1Password, Google Authenticator…) as well as your password.",
@@ -201,65 +204,147 @@ fn footer(ui: &mut egui::Ui, busy: bool, error: Option<&str>, button: &str, ente
     }
 }
 
-fn home(ui: &mut egui::Ui, info: &TwoFactorInfo, busy: bool, note: Option<&str>, error: Option<&str>, events: &mut Vec<Event>) {
-    if let Some(note) = note {
+/// The width from which the home page's three cells sit side by side.
+const SIDE_BY_SIDE: f32 = 840.0;
+
+/// The page's start: the two-factor state and its actions, the password, and the computers signed in.
+fn home(ui: &mut egui::Ui, page: &SecurityPage, events: &mut Vec<Event>) {
+    let (busy, info) = (page.busy, &page.info);
+    if let Some(note) = page.note.as_deref() {
         ui.label(RichText::new(note).color(super::good(ui)));
         ui.add_space(8.0);
     }
-    if let Some(error) = error {
+    if let Some(error) = page.error.as_deref() {
         super::error_line(ui, error);
         ui.add_space(8.0);
     }
-    super::kit::section_label(ui, "Two-factor sign-in");
-    match info {
-        TwoFactorInfo::Loading => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Asking the server…");
-            });
-        }
-        TwoFactorInfo::Unsupported => {
-            ui.label(crate::security::UNSUPPORTED);
-            ui.label(RichText::new("Ask whoever runs your Craft Cloud server to update it.").small().weak());
-        }
-        TwoFactorInfo::Failed(why) => {
-            super::error_line(ui, why);
-            if ui.add(super::kit::Button::new("Try again")).clicked() {
-                send(events, SecurityEvent::Refresh);
-            }
-        }
-        TwoFactorInfo::Known(status) if status.enabled => {
-            ui.label(format!("On. {} recovery codes left.", status.recovery_codes_left));
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!busy, super::kit::Button::new("Turn off…")).clicked() {
-                    send(events, SecurityEvent::StartDisable);
-                }
-                if ui.add_enabled(!busy, super::kit::Button::new("New recovery codes…")).clicked() {
-                    send(events, SecurityEvent::StartRegenerate);
-                }
-            });
-        }
-        TwoFactorInfo::Known(status) => {
-            ui.label("Off. Anyone who knows your password can sign in.");
-            if status.pending {
-                ui.label(RichText::new("A set-up was started and isn't finished.").small().weak());
-            }
-            ui.add_space(4.0);
-            if ui.add_enabled(!busy, super::kit::Button::new("Set up two-factor sign-in…")).clicked() {
-                send(events, SecurityEvent::StartSetup);
-            }
-        }
+    if ui.available_width() >= SIDE_BY_SIDE {
+        ui.columns(3, |columns| {
+            let [first, second, third] = columns else { return };
+            two_factor_cell(first, info, busy, events);
+            password_cell(second, events);
+            computers_cell(third, &page.overview, events);
+        });
+    } else {
+        two_factor_cell(ui, info, busy, events);
+        ui.add_space(12.0);
+        password_cell(ui, events);
+        ui.add_space(12.0);
+        computers_cell(ui, &page.overview, events);
     }
-    ui.add_space(14.0);
-    ui.separator();
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        if ui.add(super::kit::Button::new("Change password…")).clicked() {
-            send(events, SecurityEvent::StartPassword);
-        }
-        if ui.add(super::kit::Button::new("Sign out other computers…")).clicked() {
-            send(events, SecurityEvent::StartSignOutOthers);
-        }
-    });
+}
+
+fn two_factor_cell(ui: &mut egui::Ui, info: &TwoFactorInfo, busy: bool, events: &mut Vec<Event>) {
+    let t = Tokens::get(ui.ctx());
+    super::overview::cell(
+        ui,
+        "01",
+        Tone::Good,
+        |ui| {
+            super::kit::section_label(ui, "Two-factor sign-in");
+        },
+        |ui| match info {
+            TwoFactorInfo::Loading => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Asking the server…");
+                });
+            }
+            TwoFactorInfo::Unsupported => {
+                ui.label(crate::security::UNSUPPORTED);
+                ui.label(RichText::new("Ask whoever runs your Craft Cloud server to update it.").small().weak());
+            }
+            TwoFactorInfo::Failed(why) => {
+                super::error_line(ui, why);
+                if ui.add(super::kit::Button::new("Try again")).clicked() {
+                    send(events, SecurityEvent::Refresh);
+                }
+            }
+            TwoFactorInfo::Known(status) if status.enabled => {
+                super::kit::tag(ui, "On", Tone::Good);
+                ui.label(format!("On. {} recovery codes left.", status.recovery_codes_left));
+                if let Some(at) = status.enabled_ms.filter(|at| *at > 0) {
+                    ui.label(RichText::new(format!("Turned on {}", super::trash::date(at))).small().color(t.muted));
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(!busy, super::kit::Button::new("New recovery codes…")).clicked() {
+                        send(events, SecurityEvent::StartRegenerate);
+                    }
+                    if ui.add_enabled(!busy, super::kit::Button::new("Turn off…").danger()).clicked() {
+                        send(events, SecurityEvent::StartDisable);
+                    }
+                });
+            }
+            TwoFactorInfo::Known(status) => {
+                super::kit::tag(ui, "Off", Tone::Neutral);
+                ui.label("Off. Anyone who knows your password can sign in.");
+                if status.pending {
+                    ui.label(RichText::new("A set-up was started and isn't finished.").small().weak());
+                }
+                if ui.add_enabled(!busy, super::kit::Button::new("Set up two-factor sign-in…").primary()).clicked() {
+                    send(events, SecurityEvent::StartSetup);
+                }
+            }
+        },
+    );
+}
+
+fn password_cell(ui: &mut egui::Ui, events: &mut Vec<Event>) {
+    super::overview::cell(
+        ui,
+        "02",
+        Tone::Accent,
+        |ui| {
+            super::kit::section_label(ui, "Password");
+        },
+        |ui| {
+            ui.add(egui::Label::new("Changing your password signs your other computers out.").wrap());
+            if ui.add(super::kit::Button::new("Change password…")).clicked() {
+                send(events, SecurityEvent::StartPassword);
+            }
+        },
+    );
+}
+
+/// The computers signed in, from the list the Computers tab keeps, and the way to sign the others out.
+fn computers_cell(ui: &mut egui::Ui, overview: &crate::model::Overview, events: &mut Vec<Event>) {
+    let t = Tokens::get(ui.ctx());
+    super::overview::cell(
+        ui,
+        "03",
+        Tone::Warn,
+        |ui| {
+            super::kit::section_label(ui, "Signed-in computers");
+        },
+        |ui| {
+            match &overview.devices {
+                None => {
+                    ui.label(RichText::new("The Computers tab lists them.").small().color(t.muted));
+                }
+                Some(devices) => {
+                    for device in devices.iter().filter(|d| !d.revoked) {
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&device.name).strong());
+                                if device.current {
+                                    super::kit::tag(ui, "This computer", Tone::Accent);
+                                }
+                            });
+                            let platform = if device.platform.trim().is_empty() { "—" } else { device.platform.trim() };
+                            let line = if device.created_ms > 0 {
+                                format!("{platform} · signed in {}", super::trash::date(device.created_ms))
+                            } else {
+                                platform.to_owned()
+                            };
+                            ui.label(RichText::new(line).small().color(t.muted));
+                        });
+                    }
+                }
+            }
+            ui.add(egui::Label::new(RichText::new("Lost a computer? Sign out the others; this one stays signed in.").small().color(t.muted)).wrap());
+            if ui.add(super::kit::Button::new("Sign out other computers…")).clicked() {
+                send(events, SecurityEvent::StartSignOutOthers);
+            }
+        },
+    );
 }
