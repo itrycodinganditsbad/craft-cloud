@@ -713,3 +713,23 @@ fn a_typed_join_code_is_not_left_in_eguis_undo_history() {
     h.run_steps(2);
     assert_eq!(remembered(&h, "second-factor-code"), (false, false), "once the screen is left");
 }
+
+#[test]
+fn a_join_password_keeps_its_text_while_it_is_typed() {
+    use egui::accesskit::Role;
+    let form = crate::model::JoinForm { step: crate::model::JoinStep::Account, ..Default::default() };
+    let mut model = Model::new(defaults(), true, String::new());
+    model.screen = Screen::Join(form);
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(3);
+    h.get_by_role(Role::PasswordInput).focus();
+    h.get_by_role(Role::PasswordInput).type_text("hunter2-secret");
+    h.run_steps(8);
+    // Several more frames: `forget_secrets` runs every frame and must leave a field that holds typed text alone.
+    h.run_steps(5);
+    match &h.state().0.screen {
+        Screen::Join(form) => assert_eq!(form.password, "hunter2-secret"),
+        other => panic!("{other:?}"),
+    }
+    assert!(remembered(&h, super::join::PASSWORD_FIELD).0, "while typed, egui keeps the field's state");
+}
