@@ -89,24 +89,21 @@ fn body(ui: &mut egui::Ui, form: &mut JoinForm, joining: bool, events: &mut Vec<
 
         if signing_in {
             let label = kit::section_label(ui, "Server");
-            let field = egui::TextEdit::singleline(&mut form.server).hint_text("cloud.example.com").desired_width(f32::INFINITY);
+            let field = kit::text_edit(&mut form.server).hint_text("cloud.example.com").desired_width(f32::INFINITY);
             enter |= submitted(ui.add(field).labelled_by(label.id));
             ui.add_space(4.0);
 
             let label = kit::section_label(ui, "Username");
-            enter |= submitted(ui.add(egui::TextEdit::singleline(&mut form.user).desired_width(f32::INFINITY)).labelled_by(label.id));
+            enter |= submitted(ui.add(kit::text_edit(&mut form.user).desired_width(f32::INFINITY)).labelled_by(label.id));
             ui.add_space(4.0);
 
             let label = kit::section_label(ui, "Password");
-            let field = egui::TextEdit::singleline(&mut form.password)
-                .id(super::security::secret_id(PASSWORD_FIELD))
-                .password(true)
-                .desired_width(f32::INFINITY);
+            let field = kit::text_edit(&mut form.password).id(super::security::secret_id(PASSWORD_FIELD)).password(true).desired_width(f32::INFINITY);
             enter |= submitted(ui.add(field).labelled_by(label.id));
             ui.label(RichText::new("If your account has two-factor sign-in, the next step asks for the code.").small().weak());
         } else {
             let label = kit::section_label(ui, "Join string");
-            let field = egui::TextEdit::singleline(&mut form.join).hint_text("cloud.example.com/K7M4-Q9TX").desired_width(f32::INFINITY);
+            let field = kit::text_edit(&mut form.join).hint_text("cloud.example.com/K7M4-Q9TX").desired_width(f32::INFINITY);
             enter |= submitted(ui.add(field).labelled_by(label.id));
             ui.label(RichText::new("An invite, or a code from a computer that is signed in. Pasting the link works too.").small().weak());
         }
@@ -116,7 +113,7 @@ fn body(ui: &mut egui::Ui, form: &mut JoinForm, joining: bool, events: &mut Vec<
         ui.horizontal(|ui| {
             let width = (ui.available_width() - 90.0).max(120.0);
             let before = form.folder.clone();
-            ui.add(egui::TextEdit::singleline(&mut form.folder).desired_width(width));
+            ui.add(kit::text_edit(&mut form.folder).desired_width(width));
             if form.folder != before {
                 form.ask_adopt = false;
             }
@@ -127,7 +124,7 @@ fn body(ui: &mut egui::Ui, form: &mut JoinForm, joining: bool, events: &mut Vec<
         ui.add_space(6.0);
 
         kit::section_label(ui, "This computer's name");
-        ui.add(egui::TextEdit::singleline(&mut form.device_name).hint_text("this computer's name").desired_width(f32::INFINITY));
+        ui.add(kit::text_edit(&mut form.device_name).hint_text("this computer's name").desired_width(f32::INFINITY));
         ui.add_space(8.0);
     });
 
@@ -226,11 +223,11 @@ pub(super) fn password(ui: &mut egui::Ui, pw: &mut PasswordForm, events: &mut Ve
     ui.label("This invite is for a new account. Choose its password: you need it to sign in on the server.");
     ui.add_space(10.0);
     ui.label("Password");
-    let first = egui::TextEdit::singleline(&mut pw.password).id(super::security::secret_id(INVITE_PASSWORD_FIELD));
+    let first = kit::text_edit(&mut pw.password).id(super::security::secret_id(INVITE_PASSWORD_FIELD));
     ui.add(first.password(true).desired_width(f32::INFINITY));
     ui.add_space(6.0);
     ui.label("The same password again");
-    let second = egui::TextEdit::singleline(&mut pw.again).id(super::security::secret_id(INVITE_AGAIN_FIELD));
+    let second = kit::text_edit(&mut pw.again).id(super::security::secret_id(INVITE_AGAIN_FIELD));
     let again = ui.add(second.password(true).desired_width(f32::INFINITY));
     let enter = again.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
     ui.add_space(12.0);
