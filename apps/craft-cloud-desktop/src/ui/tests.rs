@@ -661,16 +661,24 @@ fn buttons_send_their_events() {
     // One Remove: this computer has none.
     assert_eq!(h.query_all_by_label("Remove").count(), 1);
 
-    // The last step: Change… and Continue.
+    // The last step: Change… and Sign in.
     let mut h = harness(on_step(JoinStep::Folder), egui::Theme::Light);
     h.run_steps(2);
     h.get_by_label("Change…").click();
     h.run_steps(2);
-    h.get_by_label("Continue").click();
+    // The last step's main button says what it does: "Sign in" in sign-in mode.
+    assert_eq!(h.query_all_by_label("Continue").count(), 0);
+    h.get_by_label("Sign in").click();
     h.run_steps(2);
     let (model, events) = h.state_mut();
     assert_eq!(events.as_slice(), [Event::ChangeFolder, Event::JoinNext]);
     assert_eq!(model.update(Event::ChangeFolder), vec![Effect::PickFolder("/home/fabio/Craft Cloud".into())]);
+    let mut model = on_step(JoinStep::Folder);
+    model.update(Event::SetJoinMode(crate::model::JoinMode::JoinString));
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    assert_eq!(h.query_all_by_label("Sign in").count(), 0);
+    let _ = h.get_by_label("Join");
     // The account step: Back, and the switch.
     let mut h = harness(on_step(JoinStep::Account), egui::Theme::Light);
     h.run_steps(2);

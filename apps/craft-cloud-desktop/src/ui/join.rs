@@ -170,9 +170,9 @@ pub(super) fn note(ui: &mut egui::Ui, text: &str) {
     ui.add(egui::Label::new(RichText::new(text).size(13.0).color(Tokens::get(ui.ctx()).muted)));
 }
 
-/// Back (outlined, when `back` is given) and Continue (primary, filling the row) on one row. `enter` is Enter pressed in a
+/// Back (outlined, when `back` is given) and the primary button `label` (Continue; Sign in or Join on the last page), filling the row, on one row. `enter` is Enter pressed in a
 /// field of the page.
-pub(super) fn nav_row(ui: &mut egui::Ui, back: Option<Event>, enter: bool, next: Event, events: &mut Vec<Event>) {
+pub(super) fn nav_row(ui: &mut egui::Ui, back: Option<Event>, enter: bool, label: &str, next: Event, events: &mut Vec<Event>) {
     ui.horizontal(|ui| {
         if let Some(back) = back
             && ui.add(kit::Button::new("Back").large()).clicked()
@@ -180,7 +180,7 @@ pub(super) fn nav_row(ui: &mut egui::Ui, back: Option<Event>, enter: bool, next:
             events.push(back);
         }
         let size = egui::vec2(ui.available_width(), kit::CONTROL_H_LARGE);
-        if ui.add_sized(size, kit::Button::new("Continue").primary().large().min_size(size)).clicked() || enter {
+        if ui.add_sized(size, kit::Button::new(label).primary().large().min_size(size)).clicked() || enter {
             events.push(next);
         }
     });
@@ -209,9 +209,7 @@ pub(super) fn form(ui: &mut egui::Ui, form: &mut JoinForm, joining: bool, run: &
                 "Sign in with the account your admin made for you. A join string from another computer works too.",
             ),
             JoinStep::Account => ("Account", "Join your Craft Cloud", "Paste the join string you were given. Signing in with an account works too."),
-            JoinStep::Folder => {
-                ("Folder", "Folder and name", "Where your files live on this computer, and what this computer is called. Continue signs you in.")
-            }
+            JoinStep::Folder => ("Folder", "Folder and name", "Where your files live on this computer, and what this computer is called."),
         };
         head(ui, run, name, title, lead);
         let mut enter = false;
@@ -250,7 +248,12 @@ pub(super) fn form(ui: &mut egui::Ui, form: &mut JoinForm, joining: bool, run: &
         if back.is_some() && escape(ui) {
             events.push(Event::JoinBack);
         }
-        nav_row(ui, back, enter, Event::JoinNext, events);
+        let label = match (step, signing_in) {
+            (JoinStep::Folder, true) => "Sign in",
+            (JoinStep::Folder, false) => "Join",
+            _ => "Continue",
+        };
+        nav_row(ui, back, enter, label, Event::JoinNext, events);
     });
 }
 
@@ -349,6 +352,6 @@ pub(super) fn password(ui: &mut egui::Ui, pw: &mut PasswordForm, run: &FirstRun,
         if escape(ui) {
             events.push(Event::CancelPassword);
         }
-        nav_row(ui, Some(Event::CancelPassword), enter, Event::SubmitPassword, events);
+        nav_row(ui, Some(Event::CancelPassword), enter, "Join", Event::SubmitPassword, events);
     });
 }

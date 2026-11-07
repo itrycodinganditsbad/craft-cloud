@@ -35,6 +35,6 @@ pub(super) fn show(ui: &mut egui::Ui, form: &mut SecondFactorForm, run: &FirstRu
         if join::escape(ui) {
             events.push(Event::CancelSecondFactor);
         }
-        join::nav_row(ui, Some(Event::CancelSecondFactor), enter, Event::SubmitSecondFactor, events);
+        join::nav_row(ui, Some(Event::CancelSecondFactor), enter, if signing_in { "Sign in" } else { "Join" }, Event::SubmitSecondFactor, events);
     });
 }
