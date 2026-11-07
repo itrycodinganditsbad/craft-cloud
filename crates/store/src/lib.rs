@@ -228,6 +228,8 @@ fn decode_zstd(key: BlobKey, compressed: &[u8]) -> Result<Bytes, StoreError> {
     if data.len() > max {
         return Err(StoreError::Corrupt { key, reason: "larger than the limit" });
     }
+    // `read_to_end` grows the buffer by doubling; don't hold the spare half for as long as the blob is served.
+    data.shrink_to_fit();
     Ok(Bytes::from(data))
 }
 

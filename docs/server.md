@@ -31,7 +31,8 @@ checked against its ID as before, and downloads are the original bytes. `compres
 turns it off for new uploads; blobs already compressed stay compressed and are still read.
 
 **Before going back to an older server version:** a server from before compression refuses compressed blobs, and a
-blob once stored compressed stays that way (nothing converts it back). Going back is only possible if
+blob once stored compressed stays that way (nothing converts it back, except that the same blob uploaded again
+with `compression = "none"` is written plain). Going back is only possible if
 `compression = "none"` was set before the first upload under the newer version. Otherwise, stay on a version that
 reads compressed blobs.
 
