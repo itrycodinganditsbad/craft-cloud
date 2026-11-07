@@ -729,6 +729,67 @@ fn snapshot_admin_pages() {
     snapshot(model, egui::Theme::Light, "admin-invite-code");
 }
 
+/// The admin pages in the smallest window, with a long account name, in the dark, and the pages that wait for a password.
+#[test]
+fn snapshot_admin_pages_sizes() {
+    let agent = admin_agent();
+    agent.users.lock().unwrap().push(account_with("a-very-long-account-name-that-keeps-going-and-going.example", &|u| {
+        u.role = "admin".into();
+        u.two_factor_enabled = true;
+        u.devices_active = 12;
+        u.stored_bytes = 4_800_000_000;
+        u.quota_bytes = Some(5 * 1_073_741_824);
+    }));
+    let model = on_admin_pages(&agent, Vec::new());
+    snapshot_sized(model.clone(), egui::Theme::Light, "admin-users-long-name", [960.0, 1000.0]);
+    snapshot_sized(model, egui::Theme::Light, "admin-users-smallest-light", MIN_WINDOW_SIZE);
+
+    let long = id_of(&on_admin_pages(&agent, Vec::new()), "a-very-long-account-name-that-keeps-going-and-going.example");
+    let ana = id_of(&on_admin_pages(&agent, Vec::new()), "ana");
+    snapshot(on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(long))]), egui::Theme::Light, "admin-account-long-name");
+    let account = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(ana))]);
+    snapshot(account.clone(), egui::Theme::Dark, "admin-account-dark");
+    snapshot_sized(account, egui::Theme::Light, "admin-account-smallest-light", MIN_WINDOW_SIZE);
+
+    let mut model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::NewUser)]);
+    if let Screen::Admin(admin) = &mut model.screen
+        && let View::Create(form) = &mut admin.view
+    {
+        form.username = "dora".into();
+    }
+    snapshot_sized(model, egui::Theme::Light, "admin-new-account-smallest-light", MIN_WINDOW_SIZE);
+
+    // A removal confirms with the red outlined button, and the code page of an invite in the smallest window.
+    let mut model = on_admin_pages(&agent, Vec::new());
+    model.update(Event::Admin(AdminEvent::Ask(Action::Remove { id: ana, username: "ana".into() })));
+    snapshot(model, egui::Theme::Light, "admin-confirm-remove");
+    let mut model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::NewUser)]);
+    if let Screen::Admin(admin) = &mut model.screen
+        && let View::Create(form) = &mut admin.view
+    {
+        form.username = "dora".into();
+    }
+    model.update(Event::Admin(AdminEvent::SubmitCreate));
+    password_typed(&mut model, "admin-secret-pw");
+    confirm_sent(&mut model, &agent);
+    snapshot_sized(model, egui::Theme::Light, "admin-invite-code-smallest-light", MIN_WINDOW_SIZE);
+}
+
+fn account_with(name: &str, f: &dyn Fn(&mut AdminUserInfo)) -> AdminUserInfo {
+    let mut user = sample_user(name, Uuid::now_v7());
+    f(&mut user);
+    user
+}
+
+#[test]
+fn a_code_is_shown_in_groups_of_four_and_a_date_with_its_time() {
+    assert_eq!(super::admin::grouped("K7M4Q9TXAB"), "K7M4-Q9TX-AB");
+    assert_eq!(super::admin::grouped("K7M4-Q9TX"), "K7M4-Q9TX");
+    assert_eq!(super::admin::grouped(""), "");
+    assert_eq!(super::admin::date(0), "1970-01-01");
+    assert_eq!(super::admin::date_time(86_400_000 + 3_600_000 * 16 + 60_000 * 40), "1970-01-02 16:40 UTC");
+}
+
 /// The model on the Storage tab, with the server's storage overview changed by `f` (the fake sends none of the room's
 /// numbers, as an older server does).
 fn storage_tab(agent: &FakeAgent, f: impl FnOnce(&mut craft_cloud_app::AdminStorageOverview)) -> Model {
@@ -913,7 +974,9 @@ fn the_storage_block_warns_from_ninety_percent() {
         let mut h = harness(model, egui::Theme::Light);
         h.run_steps(3);
         let count = |h: &Harness<'static, (Model, Vec<Event>)>, label: &str| h.query_all_by_label(label).count();
-        assert_eq!(count(&h, "Near capacity"), usize::from(near), "{stored}");
+        // From a full room on the header says "Over capacity" (red), from the warning share "Near capacity".
+        assert_eq!(count(&h, "Near capacity"), usize::from(near && stored < 1000), "{stored}");
+        assert_eq!(count(&h, "Over capacity"), usize::from(stored >= 1000), "{stored}");
         assert_eq!(count(&h, &format!("capacity {} %", stored / 10)), 2 * usize::from(near), "{stored}: the all storage line and the store");
         assert_eq!(count(&h, "OK"), 2 * usize::from(!near), "{stored}");
         assert_eq!(count(&h, &format!("{} % used", stored / 10)), 2, "{stored}: the bars have a label");
@@ -959,14 +1022,59 @@ fn the_landing_tabs_send_their_events() {
     let agent = admin_agent();
     let mut h = harness(on_admin_pages(&agent, Vec::new()), egui::Theme::Light);
     h.run_steps(2);
+    // The segment of the part that is shown sends nothing.
+    h.get_by_label("Accounts").click();
+    h.run_steps(2);
     h.get_by_label("Storage").click();
+    h.run_steps(2);
+    h.get_by_label("Audit log").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Admin(AdminEvent::Show(Section::Storage)), Event::Audit(AuditMsg::OpenAudit(None))]);
+    let mut h = harness(storage_tab(&agent, |_| {}), egui::Theme::Light);
     h.run_steps(2);
     h.get_by_label("Accounts").click();
     h.run_steps(2);
-    assert_eq!(
-        std::mem::take(&mut h.state_mut().1),
-        [Event::Admin(AdminEvent::Show(Section::Storage)), Event::Admin(AdminEvent::Show(Section::Accounts))]
-    );
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Admin(AdminEvent::Show(Section::Accounts))]);
+}
+
+/// The audit log opens inside the admin pages: the switcher stays over it with Audit log chosen, and the other segments
+/// leave it.
+#[test]
+fn the_audit_log_keeps_the_switcher() {
+    let agent = admin_agent();
+    let mut model = audit_model(&agent, Vec::new());
+    let mut h = harness(model.clone(), egui::Theme::Light);
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("Audit log").count(), 2, "the chosen segment, and the log's own heading");
+    h.get_by_label("Storage").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Admin(AdminEvent::Show(Section::Storage))]);
+    // The event leaves the log for the part it names.
+    model.update(Event::Admin(AdminEvent::Show(Section::Storage)));
+    let admin = model.admin_screen().unwrap();
+    assert_eq!((admin.section, matches!(admin.view, View::List)), (Section::Storage, true));
+}
+
+/// "Use default" removes the account's own quota through the usual confirmation; it is off while there is none.
+#[test]
+fn use_default_asks_to_remove_the_quota() {
+    let agent = admin_agent();
+    let ana = id_of(&on_admin_pages(&agent, Vec::new()), "ana");
+    let mut h = tall_harness(on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(ana))]), egui::Theme::Light);
+    h.run_steps(3);
+    h.get_by_label("Use default").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Admin(AdminEvent::SubmitEdit)]);
+    let Screen::Admin(admin) = &h.state().0.screen else { panic!("{:?}", h.state().0.screen) };
+    let View::User(view) = &admin.view else { panic!("{:?}", admin.view) };
+    assert_eq!(view.quota, "", "the field is emptied: the change removes the quota");
+    // An account without its own quota has nothing to remove.
+    let fabio = id_of(&on_admin_pages(&agent, Vec::new()), "fabio");
+    let mut h = tall_harness(on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(fabio))]), egui::Theme::Light);
+    h.run_steps(3);
+    h.get_by_label("Use default").click();
+    h.run_steps(2);
+    assert!(h.state().1.is_empty());
 }
 
 #[test]
@@ -976,9 +1084,9 @@ fn account_estimates_are_not_added_to_stored_total() {
     let model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(ana))]);
     let mut h = harness(model, egui::Theme::Light);
     h.run_steps(4);
-    assert_eq!(h.query_all_by_label("Stored: 610 MiB").count(), 1, "estimates stay separate from stored bytes");
-    assert_eq!(h.query_all_by_label("Trash estimate (overlapping): 76.3 MiB").count(), 1);
-    assert_eq!(h.query_all_by_label("History estimate (overlapping): 229 MiB").count(), 1);
+    assert_eq!(h.query_all_by_label("610").count(), 1, "the stored figure is the account's own bytes, without the estimates");
+    assert_eq!(h.query_all_by_label("about 76.3 MiB").count(), 1);
+    assert_eq!(h.query_all_by_label("about 229 MiB").count(), 1);
 }
 
 /// A member never sees the Admin tab.
@@ -1012,7 +1120,7 @@ fn admin_buttons_send_their_events() {
     h.run_steps(2);
     h.get_by_label("New account").click();
     h.run_steps(2);
-    h.get_by_label("Search").click();
+    h.get_by_label("Find").click();
     h.run_steps(2);
     h.get_by_label("Refresh").click();
     h.run_steps(2);
@@ -1039,7 +1147,7 @@ fn admin_buttons_send_their_events() {
     let model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(ana))]);
     let mut h = tall_harness(model, egui::Theme::Light);
     h.run_steps(2);
-    for label in ["Save changes", "Disable", "Remove", "New invite", "Password reset code", "Revoke open code", "Revoke"] {
+    for label in ["Save", "Disable", "Remove", "New invite", "Reset code", "Revoke open code", "Revoke"] {
         // The page is taller than the window now that the header and the footer take their share: scroll to the button.
         h.get_by_label(label).scroll_to_me();
         h.run_steps(5);
@@ -1368,7 +1476,8 @@ fn audit_buttons_send_their_events() {
     let model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(ana))]);
     let mut h = harness(model, egui::Theme::Light);
     h.run_steps(2);
-    h.get_by_label("Activity of this account").click();
+    // The title row's button, after the header's Activity tab.
+    h.get_all_by_label("Activity").nth(1).unwrap().click();
     h.run_steps(2);
     assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Audit(AuditMsg::OpenAudit(Some((ana, "ana".into()))))]);
     // The Activity tab is for everyone; the Overview tab leaves the activity page.
