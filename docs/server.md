@@ -25,6 +25,19 @@ For a non-loopback `--listen`, `init` also needs `--behind-proxy` and the proxy'
 
 For Postgres or S3, edit `[database]` and `[storage]` in `config.toml`.
 
+The server compresses what it stores with zstd where that saves at least 5% (text, code and many project files
+shrink a lot; photos, video and archives are stored as they are). Computers and apps never notice: every blob is
+checked against its ID as before, and downloads are the original bytes. `compression = "none"` in `[storage]`
+turns it off for new uploads; blobs already compressed stay compressed and are still read.
+
+**Before going back to an older server version:** a server from before compression refuses compressed blobs, and a
+blob once stored compressed stays that way (nothing converts it back). Going back is only possible if
+`compression = "none"` was set before the first upload under the newer version. Otherwise, stay on a version that
+reads compressed blobs.
+
+Quotas (`stored_bytes_per_user` below) count each blob at its original size, so turning compression on or off
+doesn't change what an account is charged.
+
 To cap what one account may store, set `stored_bytes_per_user` (in bytes; there is no cap by default) in
 `config.toml`. It counts every chunk and manifest an account uploaded once, and nothing frees space until
 garbage collection arrives, including what a refused file stored before it was refused. A file that would go

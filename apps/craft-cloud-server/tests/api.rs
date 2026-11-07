@@ -951,6 +951,36 @@ async fn concurrent_failed_joins_are_limited_too() {
     }
 }
 
+/// A compressible file goes through the real upload path, lands on disk compressed (format byte 1, smaller than the
+/// file), and downloads unchanged. Agents and apps never see the difference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compressible_uploads_are_stored_compressed_and_download_unchanged() {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let blobs_path = blobs.path().to_owned();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    let s = start(meta, Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![db, blobs], None).await;
+    add_user(&s, "ana").await;
+    let token = login(&s, "ana").await;
+    let data: Vec<u8> = (0..20_000u32)
+        .flat_map(|i| {
+            format!(
+                "line {} of a text file
+",
+                i % 97
+            )
+            .into_bytes()
+        })
+        .collect();
+    let id = upload(&s, &token, &data).await;
+
+    let chunk_file = blobs_path.join(craft_cloud_store::BlobKey::chunk(&chunk_id(&data)).path());
+    let raw = std::fs::read(&chunk_file).unwrap();
+    assert_eq!(raw[0], 1, "stored as zstd");
+    assert!(raw.len() < data.len() / 4, "{} bytes on disk for {} bytes", raw.len(), data.len());
+    assert_eq!(download(&s, &token, &id).await, data);
+}
+
 // ---- load limits (the same on every backend, so SQLite + disk only) ----
 
 /// Starts a `PUT` to `path` (under `/api/v1`) whose body never finishes: the headers promise 1,000 bytes and three

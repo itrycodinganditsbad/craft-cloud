@@ -4,8 +4,10 @@
 //! and its size must be within the protocol limits. Backends only move bytes: [`disk`] (atomic writes with
 //! fsync), [`s3`] (any S3-compatible service) and [`memory`] (tests).
 //!
-//! Each stored object is one format byte followed by the blob. Format 0 is plain bytes; other values are
-//! reserved for compression or encryption and are refused today.
+//! Each stored object is one format byte followed by the blob. Format 0 is plain bytes; format 1 is one zstd
+//! stream of the blob, written when [`Compression::Zstd`] makes it at least 5% smaller. Other values are reserved
+//! (encryption) and are refused. A blob's ID is always the BLAKE3 of its plain bytes, so how it is stored never
+//! touches deduplication, and both formats are read whatever [`Compression`] says.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod disk;
@@ -22,6 +24,33 @@ use craft_cloud_proto::{ChunkId, ManifestId};
 
 /// Format byte for plain, uncompressed, unencrypted blobs.
 const FORMAT_PLAIN: u8 = 0;
+
+/// Format byte for blobs stored as one zstd stream of their plain bytes.
+const FORMAT_ZSTD: u8 = 1;
+
+/// zstd's own default level: fast enough not to slow uploads down, and most of what higher levels gain.
+const ZSTD_LEVEL: i32 = 3;
+
+/// Blobs shorter than this are stored plain without trying: the few bytes compression could save aren't worth it.
+const MIN_COMPRESS_LEN: usize = 4 * 1024;
+
+/// Compressing a blob from this size up runs on a blocking thread, off the async runtime.
+const BLOCKING_LEN: usize = 64 * 1024;
+
+/// The largest zstd window a stored stream may ask for when it is read (2^23 bytes = 8 MiB). Level 3 never uses more
+/// than 2 MiB, and blobs are at most 4 MiB, so this only bounds what a damaged or planted object can make the
+/// decoder allocate.
+const ZSTD_WINDOW_LOG_MAX: u32 = 23;
+
+/// How [`Store::put`] writes blobs. Reading understands every format either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Compression {
+    /// zstd (level 3) for blobs of 4 KiB and up, kept only when it saves at least 5%; plain otherwise.
+    #[default]
+    Zstd,
+    /// Always plain: what a server before compression can read.
+    None,
+}
 
 /// The folder (or key prefix) a kind of blob lives under: chunks and manifests live in separate namespaces.
 fn dir(kind: BlobKind) -> &'static str {
@@ -101,11 +130,19 @@ pub trait Backend: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct Store {
     backend: Arc<dyn Backend>,
+    compression: Compression,
 }
 
 impl Store {
+    /// A store that compresses with zstd ([`Compression::Zstd`]).
     pub fn new(backend: impl Backend) -> Self {
-        Self { backend: Arc::new(backend) }
+        Self { backend: Arc::new(backend), compression: Compression::default() }
+    }
+
+    /// The same store, writing blobs as `compression` says.
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
     }
 
     /// Stores `data` under `key` after checking its size and hash. Storing a blob that is already there
@@ -118,9 +155,16 @@ impl Store {
         if *blake3::hash(data).as_bytes() != key.id {
             return Err(StoreError::HashMismatch(key));
         }
-        let mut object = Vec::with_capacity(data.len().saturating_add(1));
-        object.push(FORMAT_PLAIN);
-        object.extend_from_slice(data);
+        let object = match self.compression {
+            Compression::Zstd if data.len() >= BLOCKING_LEN => {
+                let owned = data.to_vec();
+                tokio::task::spawn_blocking(move || encode_zstd(&owned).unwrap_or_else(|| plain(&owned)))
+                    .await
+                    .map_err(|e| StoreError::Backend(format!("compression task failed: {e}")))?
+            }
+            Compression::Zstd if data.len() >= MIN_COMPRESS_LEN => encode_zstd(data).unwrap_or_else(|| plain(data)),
+            Compression::Zstd | Compression::None => plain(data),
+        };
         self.backend.put_raw(&key.path(), Bytes::from(object)).await
     }
 
@@ -130,10 +174,14 @@ impl Store {
         let Some((&format, _)) = object.split_first() else {
             return Err(StoreError::Corrupt { key, reason: "empty object" });
         };
-        if format != FORMAT_PLAIN {
-            return Err(StoreError::Corrupt { key, reason: "unknown format byte" });
-        }
-        let data = object.slice(1..);
+        let data = match format {
+            FORMAT_PLAIN => object.slice(1..),
+            // Always on a blocking thread: a small stream can stand for a blob of up to 4 MiB.
+            FORMAT_ZSTD => tokio::task::spawn_blocking(move || decode_zstd(key, object.get(1..).unwrap_or_default()))
+                .await
+                .map_err(|e| StoreError::Backend(format!("decompression task failed: {e}")))??,
+            _ => return Err(StoreError::Corrupt { key, reason: "unknown format byte" }),
+        };
         if data.len() > max_len(key.kind) {
             return Err(StoreError::Corrupt { key, reason: "larger than the limit" });
         }
@@ -146,6 +194,41 @@ impl Store {
     pub async fn delete(&self, key: BlobKey) -> Result<(), StoreError> {
         self.backend.delete_raw(&key.path()).await
     }
+}
+
+/// The object for `data` stored plain.
+fn plain(data: &[u8]) -> Vec<u8> {
+    let mut object = Vec::with_capacity(data.len().saturating_add(1));
+    object.push(FORMAT_PLAIN);
+    object.extend_from_slice(data);
+    object
+}
+
+/// The object for `data` compressed with zstd, or `None` when that doesn't save at least 5% (or zstd fails, which
+/// leaves the plain object as a safe answer).
+fn encode_zstd(data: &[u8]) -> Option<Vec<u8>> {
+    let mut object = Vec::with_capacity(data.len() / 2 + 64);
+    object.push(FORMAT_ZSTD);
+    zstd::stream::copy_encode(data, &mut object, ZSTD_LEVEL).ok()?;
+    let compressed = object.len().saturating_sub(1) as u64;
+    // At most 95% of the original: compressed * 20 <= len * 19, in u64 so it can't overflow.
+    (compressed.saturating_mul(20) <= (data.len() as u64).saturating_mul(19)).then_some(object)
+}
+
+/// A zstd stream's plain bytes, refusing to produce more than the largest blob of the key's kind, so a damaged or
+/// planted object can't fill memory.
+fn decode_zstd(key: BlobKey, compressed: &[u8]) -> Result<Bytes, StoreError> {
+    use std::io::Read;
+    let max = max_len(key.kind);
+    let damaged = |_| StoreError::Corrupt { key, reason: "undecodable compressed data" };
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(compressed).map_err(damaged)?;
+    decoder.window_log_max(ZSTD_WINDOW_LOG_MAX).map_err(damaged)?;
+    let mut data = Vec::new();
+    decoder.take(max as u64 + 1).read_to_end(&mut data).map_err(damaged)?;
+    if data.len() > max {
+        return Err(StoreError::Corrupt { key, reason: "larger than the limit" });
+    }
+    Ok(Bytes::from(data))
 }
 
 #[cfg(test)]

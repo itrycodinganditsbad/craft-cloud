@@ -16,6 +16,7 @@
 //! kind = "disk"
 //! path = "/var/lib/craft-cloud/blobs"
 //! # kind = "s3", bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http
+//! # compression = "zstd"   # or "none": store blobs plain (what a server before compression can read)
 //! ```
 //!
 //! The server speaks plain HTTP. It refuses to listen anywhere but loopback unless `behind_proxy = true`,
@@ -128,6 +129,8 @@ pub fn redact_url(url: &str) -> String {
 pub enum StorageConfig {
     Disk {
         path: PathBuf,
+        #[serde(default)]
+        compression: Compression,
     },
     S3 {
         bucket: String,
@@ -143,7 +146,30 @@ pub enum StorageConfig {
         secret_access_key: Option<Secret>,
         #[serde(default)]
         allow_http: bool,
+        #[serde(default)]
+        compression: Compression,
     },
+}
+
+/// How blobs are written to storage (`compression` in `[storage]`). Reading understands both either way, so turning
+/// it off later leaves compressed blobs readable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compression {
+    /// zstd where it saves at least 5% (the default).
+    #[default]
+    Zstd,
+    /// Every blob plain.
+    None,
+}
+
+impl From<Compression> for craft_cloud_store::Compression {
+    fn from(compression: Compression) -> Self {
+        match compression {
+            Compression::Zstd => craft_cloud_store::Compression::Zstd,
+            Compression::None => craft_cloud_store::Compression::None,
+        }
+    }
 }
 
 fn default_region() -> String {
@@ -218,10 +244,17 @@ fn describe_toml_error(text: &str, e: &toml::de::Error) -> String {
 }
 
 impl StorageConfig {
+    /// How blobs are written, whichever backend holds them.
+    pub fn compression(&self) -> Compression {
+        match self {
+            StorageConfig::Disk { compression, .. } | StorageConfig::S3 { compression, .. } => *compression,
+        }
+    }
+
     /// The S3 settings, with credentials from the config or else the standard `AWS_ACCESS_KEY_ID` /
     /// `AWS_SECRET_ACCESS_KEY` environment variables. `None` for disk storage.
     pub fn s3(&self) -> Result<Option<S3Config>, ConfigError> {
-        let StorageConfig::S3 { bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http } = self else {
+        let StorageConfig::S3 { bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http, .. } = self else {
             return Ok(None);
         };
         let access_key_id = match access_key_id {
@@ -264,7 +297,7 @@ path = "/tmp/blobs"
         let c = Config::parse(DISK).unwrap();
         assert_eq!(c.listen, "127.0.0.1:8080".parse().unwrap());
         assert!(!c.behind_proxy && c.trusted_proxies.is_empty());
-        assert_eq!(c.storage, StorageConfig::Disk { path: "/tmp/blobs".into() });
+        assert_eq!(c.storage, StorageConfig::Disk { path: "/tmp/blobs".into(), compression: Compression::Zstd });
         assert_eq!(c.storage.s3().unwrap(), None);
         assert_eq!(c.public_url, None);
     }
@@ -321,6 +354,32 @@ path = "/tmp/blobs"
         // Without a proxy there is nothing to ignore.
         let no_proxy = format!("ignore_forwarded_for = true\n{DISK}");
         assert!(matches!(Config::parse(&no_proxy), Err(ConfigError::IgnoreForwardedForMisplaced)));
+    }
+
+    #[test]
+    fn compression_is_zstd_unless_turned_off() {
+        assert_eq!(Config::parse(DISK).unwrap().storage.compression(), Compression::Zstd);
+        let with = |value: &str| {
+            Config::parse(&format!(
+                "{DISK}compression = {value}
+"
+            ))
+        };
+        assert_eq!(with("\"zstd\"").unwrap().storage.compression(), Compression::Zstd);
+        assert_eq!(with("\"none\"").unwrap().storage.compression(), Compression::None);
+        assert_eq!(craft_cloud_store::Compression::from(Compression::None), craft_cloud_store::Compression::None);
+        let Err(ConfigError::Parse(message)) = with("\"gzip\"") else { panic!("an unknown compression must be refused") };
+        assert!(message.contains("gzip") && message.contains("zstd") && message.contains("none"), "{message}");
+        assert!(message.contains("line"), "{message}");
+        let s3 = "listen = \"127.0.0.1:9000\"
+[database]
+url = \"sqlite:/tmp/m.db\"
+[storage]
+kind = \"s3\"
+bucket = \"b\"
+compression = \"none\"
+";
+        assert_eq!(Config::parse(s3).unwrap().storage.compression(), Compression::None);
     }
 
     #[test]

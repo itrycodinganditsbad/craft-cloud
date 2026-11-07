@@ -16,6 +16,7 @@ object_store.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

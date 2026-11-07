@@ -142,10 +142,10 @@ pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
         Meta::open(&config.database.url).await?.with_stored_bytes_cap(config.stored_bytes_per_user).with_live_bytes_cap(config.live_bytes_per_user);
     let store = match (&config.storage, config.storage.s3()?) {
         (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
-        (StorageConfig::Disk { path }, None) => Store::new(DiskBackend::new(path)?),
+        (StorageConfig::Disk { path, .. }, None) => Store::new(DiskBackend::new(path)?),
         (StorageConfig::S3 { .. }, None) => return Err(CliError::Usage("S3 storage without settings".into())),
     };
-    Ok((meta, store))
+    Ok((meta, store.with_compression(config.storage.compression().into())))
 }
 
 /// `--config` is global, which clap can't also make required, so it is checked here.

@@ -68,6 +68,45 @@ async fn reset_epoch_all_resets_every_space() {
     }
 }
 
+/// The config's `compression` reaches the store `open` builds: zstd by default, plain with `"none"`, and what was
+/// stored compressed still reads after compression is turned off.
+#[tokio::test]
+async fn storage_compression_follows_the_config() {
+    use craft_cloud_proto::ChunkId;
+    use craft_cloud_store::BlobKey;
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(
+        &["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"],
+        "admin password 1
+",
+    )
+    .await
+    .unwrap();
+    let config_path = dir.join("config.toml");
+    let compressible = |tag: &str| format!("{tag}: the same line again and again. ").repeat(500).into_bytes();
+    let key = |data: &[u8]| BlobKey::chunk(&ChunkId::from_bytes(*blake3::hash(data).as_bytes()));
+    let format_on_disk = |key: BlobKey| std::fs::read(dir.join("blobs").join(key.path())).unwrap()[0];
+
+    let (_, store) = craft_cloud_server::cli::open(&Config::load(&config_path).unwrap()).await.unwrap();
+    let zstd = compressible("zstd");
+    store.put(key(&zstd), &zstd).await.unwrap();
+    assert_eq!(format_on_disk(key(&zstd)), 1, "compressed by default");
+
+    // `init` writes `[storage]` last, so an appended line lands in it.
+    let mut text = std::fs::read_to_string(&config_path).unwrap();
+    text.push_str(
+        "compression = \"none\"
+",
+    );
+    std::fs::write(&config_path, text).unwrap();
+    let (_, store) = craft_cloud_server::cli::open(&Config::load(&config_path).unwrap()).await.unwrap();
+    let plain = compressible("none");
+    store.put(key(&plain), &plain).await.unwrap();
+    assert_eq!(format_on_disk(key(&plain)), 0, "plain with compression = \"none\"");
+    assert_eq!(store.get(key(&zstd)).await.unwrap(), zstd, "compressed blobs still read");
+}
+
 /// `live reset-doc` empties a full recents document, which takes appends again.
 #[tokio::test]
 async fn live_reset_doc_empties_a_full_document() {
