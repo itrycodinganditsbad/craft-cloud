@@ -171,6 +171,30 @@ pub enum Action {
 }
 
 impl Action {
+    /// The account the change is about (the new account's name for a creation).
+    pub fn username(&self) -> &str {
+        match self {
+            Self::CreateUser { username, .. }
+            | Self::UpdateUser { username, .. }
+            | Self::Disable { username, .. }
+            | Self::Enable { username, .. }
+            | Self::Remove { username, .. }
+            | Self::IssueInvite { username, .. }
+            | Self::RevokeInvite { username, .. }
+            | Self::IssueReset { username, .. }
+            | Self::ResetTwoFactor { username, .. }
+            | Self::RevokeDevice { username, .. } => username,
+        }
+    }
+
+    /// Whether the change ends or removes something: its confirming button is the red outlined one.
+    pub fn destructive(&self) -> bool {
+        matches!(
+            self,
+            Self::Disable { .. } | Self::Remove { .. } | Self::RevokeInvite { .. } | Self::ResetTwoFactor { .. } | Self::RevokeDevice { .. }
+        )
+    }
+
     /// The confirmation page's title.
     pub fn title(&self) -> String {
         match self {
@@ -610,6 +634,10 @@ impl AdminScreen {
             AdminEvent::Account { .. } | AdminEvent::Open | AdminEvent::Close => Vec::new(),
             AdminEvent::Show(section) => {
                 self.section = section;
+                // The audit log opens inside these pages with the switcher over it: a segment leaves it.
+                if matches!(self.view, View::Audit(_)) && self.dialog.is_none() {
+                    self.view = View::List;
+                }
                 Vec::new()
             }
             AdminEvent::Server { session, result } => {
