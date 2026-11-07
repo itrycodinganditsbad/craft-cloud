@@ -513,7 +513,11 @@ impl Model {
 
     /// Whether the admin pages are offered: the server said the signed-in account is an admin.
     pub fn is_admin(&self) -> bool {
-        self.overview().is_some_and(|o| matches!(o.access, Access::Admin { .. }))
+        match self.overview() {
+            Some(o) => matches!(o.access, Access::Admin { .. }),
+            // Versions and trash don't carry the signed-in view: the last check says.
+            None => matches!(self.screen, Screen::Versions(_) | Screen::Trash(_)) && matches!(self.access, Access::Admin { .. }),
+        }
     }
 
     pub(crate) fn admin(&mut self, event: AdminEvent) -> Vec<Effect> {
@@ -547,6 +551,7 @@ impl Model {
         if let Some(overview) = self.overview_mut() {
             overview.access = access.clone();
         }
+        self.access = access.clone();
         if access == Access::Member {
             self.leave_admin();
         }

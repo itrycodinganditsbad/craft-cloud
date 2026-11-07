@@ -262,8 +262,4 @@ fn home(ui: &mut egui::Ui, info: &TwoFactorInfo, busy: bool, note: Option<&str>,
             send(events, SecurityEvent::StartSignOutOthers);
         }
     });
-    ui.add_space(14.0);
-    if super::wide_button(ui, true, "Back") {
-        send(events, SecurityEvent::Close);
-    }
 }

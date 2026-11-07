@@ -6,9 +6,6 @@ use crate::model::{Event, Versions};
 
 pub(super) fn show(ui: &mut egui::Ui, versions: &mut Versions, now_ms: i64, events: &mut Vec<Event>) {
     super::heading(ui, "File versions");
-    if ui.add(super::kit::Button::new("Back")).clicked() {
-        events.push(Event::BackVersions);
-    }
     ui.add_space(8.0);
     ui.label("Path inside the sync folder");
     let mut path = versions.path.clone();

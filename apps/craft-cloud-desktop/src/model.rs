@@ -156,9 +156,52 @@ impl std::fmt::Debug for PasswordForm {
     }
 }
 
+/// The pages of the signed-in window, as the header's tabs list them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Overview,
+    /// File version history ([`Screen::Versions`]).
+    Versions,
+    Trash,
+    /// The account's computers, in full ([`OverviewPage::Computers`]).
+    Computers,
+    Security,
+    /// The account's own activity ([`Screen::Activity`]).
+    Activity,
+    /// The admin pages; offered to an admin only.
+    Admin,
+}
+
+impl Tab {
+    /// The tab's name in the header.
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Overview => "Overview",
+            Tab::Versions => "Versions",
+            Tab::Trash => "Trash",
+            Tab::Computers => "Computers",
+            Tab::Security => "Security",
+            Tab::Activity => "Activity",
+            Tab::Admin => "Admin",
+        }
+    }
+}
+
+/// What [`Screen::SignedIn`] shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OverviewPage {
+    /// The sync, the storage and a short list of the computers.
+    #[default]
+    Home,
+    /// All the computers, with Remove and Add a computer.
+    Computers,
+}
+
 /// The signed-in view.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Overview {
+    /// Which page of the signed-in view is shown.
+    pub page: OverviewPage,
     pub status: Status,
     /// The account's computers, once asked.
     pub devices: Option<Vec<DeviceInfo>>,
@@ -217,6 +260,7 @@ pub enum TrashAction {
 impl Overview {
     fn new(status: Status) -> Self {
         Self {
+            page: OverviewPage::Home,
             status,
             devices: None,
             devices_error: None,
@@ -379,6 +423,8 @@ pub enum Event {
     CloseRequested,
     /// Linux: the tray process quit Craft Cloud (it stopped the agent): the window ends too.
     Exit,
+    /// A tab of the header: leaves the page shown for that one.
+    Tab(Tab),
     /// Something on the admin pages, or the answer to one of their calls ([`crate::admin`]).
     Admin(AdminEvent),
     /// Something on the audit pages (the admin's log, or the account's own activity), or an answer to one of their calls.
@@ -535,6 +581,9 @@ pub struct Model {
     versions_ticket: u64,
     trash_ticket: u64,
     usage_request_id: u64,
+    /// What the last admin check said for the sign-in. The pages that don't carry the signed-in view (versions, trash)
+    /// read it for the header's Admin tab, and a view made when they are left starts with it.
+    pub(crate) access: Access,
 }
 
 impl Model {
@@ -558,6 +607,7 @@ impl Model {
             versions_ticket: 0,
             trash_ticket: 0,
             usage_request_id: 0,
+            access: Access::Unknown,
         }
     }
 
@@ -580,10 +630,66 @@ impl Model {
             self.screen = Screen::Starting;
             return Vec::new();
         };
-        let overview = Overview::new(status);
+        let mut overview = Overview::new(status);
+        // Asked again below; until it is answered the tabs keep what was known.
+        overview.access = self.access.clone();
         let session = overview.session;
         self.screen = Screen::SignedIn(overview);
         vec![Effect::Devices, Effect::Account { session }, self.next_usage_request()]
+    }
+
+    /// The tab of the page shown, in the signed-in window.
+    pub fn tab(&self) -> Option<Tab> {
+        match &self.screen {
+            Screen::SignedIn(o) => Some(match o.page {
+                OverviewPage::Home => Tab::Overview,
+                OverviewPage::Computers => Tab::Computers,
+            }),
+            Screen::AddingComputer(_) => Some(Tab::Computers),
+            Screen::Versions(_) => Some(Tab::Versions),
+            Screen::Trash(_) => Some(Tab::Trash),
+            Screen::Security(_) => Some(Tab::Security),
+            Screen::Activity(_) => Some(Tab::Activity),
+            Screen::Admin(_) => Some(Tab::Admin),
+            _ => None,
+        }
+    }
+
+    /// The header's tabs: all the pages, the admin pages for an admin only.
+    pub fn tabs(&self) -> Vec<Tab> {
+        let all = [Tab::Overview, Tab::Versions, Tab::Trash, Tab::Computers, Tab::Security, Tab::Activity, Tab::Admin];
+        all.into_iter().filter(|t| *t != Tab::Admin || self.is_admin()).collect()
+    }
+
+    /// A tab of the header: the page shown is left as its own way back would (a computer code still waiting is
+    /// cancelled, what the security page showed dropped, the tickets of versions and trash answers moved on), then the
+    /// tab's page is opened as the button that opened it did.
+    fn open_tab(&mut self, tab: Tab) -> Vec<Effect> {
+        let Some(current) = self.tab() else { return Vec::new() };
+        let adding = matches!(self.screen, Screen::AddingComputer(_));
+        if (current == tab && !adding) || (tab == Tab::Admin && !self.is_admin()) {
+            return Vec::new();
+        }
+        let mut effects = match &self.screen {
+            Screen::Versions(_) => self.update(Event::BackVersions),
+            Screen::Trash(_) => self.update(Event::BackTrash),
+            Screen::Security(_) => self.security(SecurityEvent::Close),
+            Screen::Activity(_) => self.audit(AuditMsg::CloseActivity),
+            Screen::Admin(_) => self.admin(AdminEvent::Close),
+            Screen::AddingComputer(_) => self.update(Event::CloseAdding),
+            _ => Vec::new(),
+        };
+        let Screen::SignedIn(overview) = &mut self.screen else { return effects };
+        overview.page = if tab == Tab::Computers { OverviewPage::Computers } else { OverviewPage::Home };
+        effects.extend(match tab {
+            Tab::Overview | Tab::Computers => Vec::new(),
+            Tab::Versions => self.update(Event::OpenVersions),
+            Tab::Trash => self.update(Event::OpenTrash),
+            Tab::Security => self.update(Event::OpenSecurity),
+            Tab::Activity => self.audit(AuditMsg::OpenActivity),
+            Tab::Admin => self.admin(AdminEvent::Open),
+        });
+        effects
     }
 
     fn next_usage_request(&mut self) -> Effect {
@@ -1033,6 +1139,7 @@ impl Model {
                 let again = (overview.access == Access::Unknown).then_some(Effect::Account { session: overview.session });
                 std::iter::once(Effect::Devices).chain(again).collect()
             }
+            Event::Tab(tab) => self.open_tab(tab),
             Event::Admin(event) => self.admin(event),
             Event::Audit(msg) => self.audit(msg),
             Event::RefreshUsage => {
@@ -1140,6 +1247,7 @@ impl Model {
             self.overview().is_some_and(|overview| overview.status.account != status.account || overview.status.server != status.server);
         if !status.signed_in {
             self.usage_request_id = self.usage_request_id.wrapping_add(1);
+            self.access = Access::Unknown;
         }
         let new_usage_request = (status.signed_in && account_changed).then(|| self.next_usage_request());
         let mut effects = Vec::new();
@@ -2582,5 +2690,127 @@ pub(crate) mod tests {
         assert_eq!(first_sentence("can't reach it. Try later"), "Can't reach it.");
         assert_eq!(first_sentence("no dot here"), "No dot here");
         assert_eq!(sentence(""), "");
+    }
+
+    /// A signed-in model whose admin check said admin.
+    fn signed_in_admin() -> Model {
+        let mut m = signed_in();
+        m.overview_mut().unwrap().access = Access::Admin { two_factor: false };
+        m.access = Access::Admin { two_factor: false };
+        assert!(m.is_admin());
+        m
+    }
+
+    #[test]
+    fn the_tabs_list_the_pages_and_the_admin_pages_for_an_admin_only() {
+        let member = [Tab::Overview, Tab::Versions, Tab::Trash, Tab::Computers, Tab::Security, Tab::Activity];
+        assert_eq!(signed_in().tabs(), member);
+        let mut admin = member.to_vec();
+        admin.push(Tab::Admin);
+        assert_eq!(signed_in_admin().tabs(), admin);
+        assert_eq!(model().tab(), None, "no tabs before sign-in");
+        assert_eq!(signed_in().tab(), Some(Tab::Overview));
+    }
+
+    #[test]
+    fn a_tab_asks_for_what_the_button_it_replaces_asked_for() {
+        let cases = [
+            (Tab::Versions, Event::OpenVersions),
+            (Tab::Trash, Event::OpenTrash),
+            (Tab::Security, Event::OpenSecurity),
+            (Tab::Activity, Event::Audit(AuditMsg::OpenActivity)),
+        ];
+        for (tab, old) in cases {
+            let (mut by_tab, mut by_button) = (signed_in(), signed_in());
+            let (got, want) = (by_tab.update(Event::Tab(tab)), by_button.update(old));
+            if tab == Tab::Activity {
+                // The tickets of the pages' answers count up over the whole run.
+                assert!(matches!(got.as_slice(), [Effect::AuditPage { own: true, .. }]) && got.len() == want.len(), "{got:?}");
+            } else {
+                assert_eq!(got, want, "{tab:?}");
+            }
+            assert_eq!(by_tab.tab(), Some(tab));
+            assert_eq!(std::mem::discriminant(&by_tab.screen), std::mem::discriminant(&by_button.screen), "{tab:?}");
+        }
+        let (mut by_tab, mut by_button) = (signed_in_admin(), signed_in_admin());
+        let effects = by_tab.update(Event::Tab(Tab::Admin));
+        assert!(!effects.is_empty());
+        assert_eq!(effects.len(), by_button.update(Event::Admin(AdminEvent::Open)).len());
+        assert_eq!(by_tab.tab(), Some(Tab::Admin));
+    }
+
+    #[test]
+    fn a_member_has_no_admin_tab_and_the_event_does_nothing() {
+        let mut m = signed_in();
+        assert!(m.update(Event::Tab(Tab::Admin)).is_empty());
+        assert!(matches!(m.screen, Screen::SignedIn(_)));
+        // Not from another page either.
+        m.update(Event::Tab(Tab::Trash));
+        assert!(m.update(Event::Tab(Tab::Admin)).is_empty());
+        assert!(matches!(m.screen, Screen::Trash(_)));
+    }
+
+    #[test]
+    fn the_overview_and_computers_tabs_swap_the_page_without_asking_for_anything() {
+        let mut m = signed_in();
+        assert!(m.update(Event::Tab(Tab::Computers)).is_empty());
+        assert!(matches!(&m.screen, Screen::SignedIn(o) if o.page == OverviewPage::Computers));
+        assert_eq!(m.tab(), Some(Tab::Computers));
+        assert!(m.update(Event::Tab(Tab::Computers)).is_empty(), "the tab shown does nothing");
+        assert!(m.update(Event::Tab(Tab::Overview)).is_empty());
+        assert!(matches!(&m.screen, Screen::SignedIn(o) if o.page == OverviewPage::Home));
+        // The computers page keeps its events: Add a computer and back.
+        m.update(Event::Tab(Tab::Computers));
+        assert_eq!(m.update(Event::AddComputer), vec![Effect::Pairing]);
+        assert_eq!(m.tab(), Some(Tab::Computers));
+        assert_eq!(m.update(Event::Tab(Tab::Computers)), vec![Effect::Devices], "the tab closes the code page");
+        assert!(matches!(&m.screen, Screen::SignedIn(o) if o.page == OverviewPage::Computers));
+    }
+
+    #[test]
+    fn a_tab_leaves_the_page_the_way_its_back_button_did() {
+        // From trash: the answers still on their way are dropped, and the overview asks again for what it shows.
+        let mut m = signed_in();
+        m.update(Event::Tab(Tab::Trash));
+        let ticket = m.trash_ticket;
+        let effects = m.update(Event::Tab(Tab::Overview));
+        assert!(matches!(m.screen, Screen::SignedIn(_)));
+        assert!(matches!(effects.as_slice(), [Effect::Devices, Effect::Account { .. }, Effect::Usage(_)]), "{effects:?}");
+        assert_eq!(m.trash_ticket, ticket + 1);
+        // From the security page to trash: the page's secrets go and the trash is asked for.
+        m.update(Event::Tab(Tab::Security));
+        let effects = m.update(Event::Tab(Tab::Trash));
+        assert!(matches!(m.screen, Screen::Trash(_)));
+        assert_eq!(effects.first(), Some(&Effect::Devices));
+        assert!(effects.iter().any(|e| matches!(e, Effect::Trash { .. })), "{effects:?}");
+        // From versions to the activity page.
+        m.update(Event::Tab(Tab::Versions));
+        let effects = m.update(Event::Tab(Tab::Activity));
+        assert!(matches!(m.screen, Screen::Activity(_)));
+        assert!(effects.iter().any(|e| matches!(e, Effect::AuditPage { own: true, .. })), "{effects:?}");
+        // A wait for a computer's code is cancelled by leaving it.
+        let mut m = signed_in();
+        m.update(Event::AddComputer);
+        let info = PairingInfo { id: Uuid::nil(), join: "x".into(), link: "x".into(), expires_ms: 1 };
+        m.update(Event::PairingMade(Ok(info)));
+        let effects = m.update(Event::Tab(Tab::Security));
+        assert!(effects.contains(&Effect::CancelPairing(Uuid::nil())), "{effects:?}");
+        assert!(matches!(m.screen, Screen::Security(_)));
+    }
+
+    #[test]
+    fn the_admin_tab_is_still_there_from_trash_and_versions() {
+        let mut m = signed_in_admin();
+        m.update(Event::Tab(Tab::Trash));
+        assert!(m.is_admin());
+        assert!(m.tabs().contains(&Tab::Admin));
+        let effects = m.update(Event::Tab(Tab::Admin));
+        assert!(matches!(m.screen, Screen::Admin(_)), "{:?}", m.screen);
+        assert!(!effects.is_empty());
+        m.update(Event::Tab(Tab::Versions));
+        assert!(m.tabs().contains(&Tab::Admin));
+        // Signed out, nothing is remembered for the next account.
+        m.update(Event::Polled(Ok(status(false))));
+        assert_eq!(m.access, Access::Unknown);
     }
 }

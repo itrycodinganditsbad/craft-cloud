@@ -80,7 +80,7 @@ fn main() -> ExitCode {
         .with_title(ui::TITLE)
         .with_app_id("craft-cloud")
         .with_inner_size(ui::WINDOW_SIZE)
-        .with_min_inner_size([360.0, 420.0])
+        .with_min_inner_size(ui::MIN_WINDOW_SIZE)
         .with_visible(!hidden);
     if let Ok((width, height, rgba)) = tray::rgba(tray::APP_ICON) {
         viewport = viewport.with_icon(egui::IconData { rgba, width, height });

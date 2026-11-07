@@ -107,9 +107,6 @@ fn users(
     storage_overview(ui, storage);
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        if ui.add(super::kit::Button::new("Back")).clicked() {
-            send(events, AdminEvent::Close);
-        }
         if ui.add(super::kit::Button::new("New account")).clicked() {
             send(events, AdminEvent::NewUser);
         }

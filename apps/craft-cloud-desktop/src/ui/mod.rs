@@ -12,6 +12,7 @@ mod overview;
 mod problem;
 mod second_factor;
 mod security;
+mod shell;
 mod trash;
 mod versions;
 
@@ -22,7 +23,9 @@ use self::kit::Tokens;
 use crate::model::{Event, Model, Screen};
 
 /// The window's size at the start (it can be resized).
-pub const WINDOW_SIZE: [f32; 2] = [420.0, 560.0];
+pub const WINDOW_SIZE: [f32; 2] = [960.0, 640.0];
+/// The smallest the window can be made: the header's tabs wrap onto a second line there.
+pub const MIN_WINDOW_SIZE: [f32; 2] = [640.0, 480.0];
 /// The window's title, and the tray's tooltip.
 pub const TITLE: &str = "Craft Cloud";
 
@@ -33,7 +36,16 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
         return events;
     }
     security::forget_secrets(ui.ctx(), &model.screen);
-    egui::CentralPanel::default().show(ui, |ui| {
+    // The signed-in pages sit between a header with the tabs and a footer strip; the other screens fill the window.
+    let shell = shell::Shell::of(model);
+    let frame = if let Some(shell) = &shell {
+        shell::header(ui, shell, &mut events);
+        shell::footer(ui, shell, &mut events);
+        egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(24, 16))
+    } else {
+        egui::Frame::central_panel(ui.style())
+    };
+    egui::CentralPanel::default().frame(frame).show(ui, |ui| {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(8.0);
             let busy = model.busy;
@@ -94,9 +106,12 @@ fn problem_line(reason: &str) -> String {
     crate::model::first_sentence(reason)
 }
 
+/// The widest a [`wide_button`] gets, so it stays a button in a wide window.
+const WIDE_BUTTON_MAX: f32 = 420.0;
+
 /// A main button, wide.
 fn wide_button(ui: &mut egui::Ui, enabled: bool, text: &str) -> bool {
-    let size = egui::vec2(ui.available_width(), kit::CONTROL_H);
+    let size = egui::vec2(ui.available_width().min(WIDE_BUTTON_MAX), kit::CONTROL_H);
     ui.add_enabled_ui(enabled, |ui| ui.add_sized(size, kit::Button::new(text).primary().min_size(size))).inner.clicked()
 }
 

@@ -493,9 +493,9 @@ fn the_overview_has_a_security_button_and_the_page_its_buttons() {
     let model = model_after(&FakeAgent::new(signed_in()), vec![]);
     let mut h = harness(model, egui::Theme::Light);
     h.run_steps(2);
-    h.get_by_label("Security…").click();
+    h.get_by_label("Security").click();
     h.run_steps(2);
-    assert!(h.state().1.contains(&Event::OpenSecurity), "{:?}", h.state().1);
+    assert!(h.state().1.contains(&Event::Tab(crate::model::Tab::Security)), "{:?}", h.state().1);
 
     let agent = FakeAgent::new(signed_in());
     let mut h = harness(security_model(&agent, vec![]), egui::Theme::Light);
@@ -504,12 +504,13 @@ fn the_overview_has_a_security_button_and_the_page_its_buttons() {
     h.run_steps(2);
     h.get_by_label("Change password…").click();
     h.run_steps(2);
-    h.get_by_label("Back").click();
+    // The Overview tab leaves the page; the page has no Back of its own.
+    h.get_by_label("Overview").click();
     h.run_steps(2);
     let events = &h.state().1;
     assert!(events.contains(&Event::Security(SecurityEvent::StartSetup)), "{events:?}");
     assert!(events.contains(&Event::Security(SecurityEvent::StartPassword)), "{events:?}");
-    assert!(events.contains(&Event::Security(SecurityEvent::Close)), "{events:?}");
+    assert!(events.contains(&Event::Tab(crate::model::Tab::Overview)), "{events:?}");
 }
 
 // ---- what egui remembers of what was typed ----

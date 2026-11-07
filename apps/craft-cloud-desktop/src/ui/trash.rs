@@ -6,9 +6,6 @@ use crate::model::{Event, Trash};
 
 pub(super) fn show(ui: &mut egui::Ui, trash: &mut Trash, now_ms: i64, events: &mut Vec<Event>) {
     super::heading(ui, "Trash");
-    if ui.add(super::kit::Button::new("Back")).clicked() {
-        events.push(Event::BackTrash);
-    }
     if super::wide_button(ui, !trash.loading && trash.action.is_none(), "Refresh") {
         events.push(Event::LoadTrash);
     }

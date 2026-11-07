@@ -16,7 +16,7 @@ use egui_kittest::kittest::Queryable;
 use super::*;
 use crate::agent::fake::FakeAgent;
 use crate::agent::{Agent, Starter, call};
-use crate::model::{Effect, JoinDefaults, Model, Screen};
+use crate::model::{Effect, JoinDefaults, Model, Screen, Tab};
 
 /// The time the screens are drawn at.
 const NOW: i64 = 1_790_000_000_000;
@@ -136,7 +136,12 @@ pub(super) fn shared_wgpu() -> eframe::egui_wgpu::WgpuSetup {
 
 /// The harness: the window drawn for the model, its events kept.
 fn harness(model: Model, theme: egui::Theme) -> Harness<'static, (Model, Vec<Event>)> {
-    Harness::builder().with_size(egui::Vec2::from(WINDOW_SIZE)).with_theme(theme).wgpu_setup(shared_wgpu()).build_ui_state(
+    harness_sized(model, theme, WINDOW_SIZE)
+}
+
+/// [`harness`] for a window of another size.
+fn harness_sized(model: Model, theme: egui::Theme, size: [f32; 2]) -> Harness<'static, (Model, Vec<Event>)> {
+    Harness::builder().with_size(egui::Vec2::from(size)).with_theme(theme).wgpu_setup(shared_wgpu()).build_ui_state(
         |ui, (model, events): &mut (Model, Vec<Event>)| {
             events.extend(show(ui, model, NOW));
         },
@@ -157,7 +162,12 @@ fn tall_harness(model: Model, theme: egui::Theme) -> Harness<'static, (Model, Ve
 
 /// Draws `model` and compares it with the snapshot `name`.
 fn snapshot(model: Model, theme: egui::Theme, name: &str) {
-    let mut h = harness(model, theme);
+    snapshot_sized(model, theme, name, WINDOW_SIZE);
+}
+
+/// [`snapshot`] of a window of another size.
+fn snapshot_sized(model: Model, theme: egui::Theme, name: &str, size: [f32; 2]) {
+    let mut h = harness_sized(model, theme, size);
     h.run_steps(4);
     let image = h.render().unwrap();
     compare(image, name);
@@ -556,10 +566,17 @@ fn buttons_send_their_events() {
     h.run_steps(2);
     h.get_by_label("Pause").click();
     h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    assert!(events.contains(&Event::AddComputer) && events.contains(&Event::Pause), "{events:?}");
+    // The overview lists the computers; Remove is on the Computers tab.
+    assert_eq!(h.query_all_by_label("Remove").count(), 0);
+    let mut computers = signed_in_model(signed_in());
+    computers.update(Event::Tab(Tab::Computers));
+    let mut h = harness(computers, egui::Theme::Light);
+    h.run_steps(2);
     h.get_by_label("Remove").click();
     h.run_steps(2);
     let events = std::mem::take(&mut h.state_mut().1);
-    assert!(events.contains(&Event::AddComputer) && events.contains(&Event::Pause), "{events:?}");
     assert!(events.iter().any(|e| matches!(e, Event::RemoveDevice(_))), "{events:?}");
     // One Remove: this computer has none.
     assert_eq!(h.query_all_by_label("Remove").count(), 1);
@@ -725,16 +742,17 @@ fn account_estimates_are_not_added_to_stored_total() {
     assert_eq!(h.query_all_by_label("History estimate (overlapping): 229 MiB").count(), 1);
 }
 
-/// A member never sees the way in.
+/// A member never sees the Admin tab.
 #[test]
-fn a_member_has_no_administration_button() {
+fn a_member_has_no_admin_tab() {
     let agent = admin_agent();
     agent.admin.store(false, std::sync::atomic::Ordering::SeqCst);
     let model = after(&agent, vec![Event::Devices(Ok(devices()))]);
     assert!(!model.is_admin());
     let mut h = harness(model, egui::Theme::Light);
     h.run_steps(2);
-    assert_eq!(h.query_all_by_label("Administration").count(), 0);
+    assert_eq!(h.query_all_by_label("Admin").count(), 0);
+    assert_eq!(h.query_all_by_label("Activity").count(), 1, "everyone has the other tabs");
 }
 
 /// The admin pages' buttons send the events they stand for.
@@ -744,9 +762,9 @@ fn admin_buttons_send_their_events() {
     let model = after(&agent, vec![Event::Devices(Ok(devices()))]);
     let mut h = tall_harness(model, egui::Theme::Light);
     h.run_steps(2);
-    h.get_by_label("Administration").click();
+    h.get_by_label("Admin").click();
     h.run_steps(2);
-    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Admin(AdminEvent::Open)]);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Tab(Tab::Admin)]);
 
     let model = on_admin_pages(&agent, Vec::new());
     let ana = id_of(&model, "ana");
@@ -763,7 +781,8 @@ fn admin_buttons_send_their_events() {
     assert_eq!(h.query_all_by_label("Manage").count(), 4);
     h.query_all_by_label("Manage").nth(1).unwrap().click();
     h.run_steps(2);
-    h.get_by_label("Back").click();
+    // The Overview tab is the way out; the list has no Back of its own.
+    h.get_by_label("Overview").click();
     h.run_steps(2);
     let events = std::mem::take(&mut h.state_mut().1);
     assert_eq!(
@@ -773,7 +792,7 @@ fn admin_buttons_send_their_events() {
             Event::Admin(AdminEvent::Search),
             Event::Admin(AdminEvent::Reload),
             Event::Admin(AdminEvent::OpenUser(ana)),
-            Event::Admin(AdminEvent::Close),
+            Event::Tab(Tab::Overview),
         ]
     );
 
@@ -782,6 +801,9 @@ fn admin_buttons_send_their_events() {
     let mut h = tall_harness(model, egui::Theme::Light);
     h.run_steps(2);
     for label in ["Save changes", "Disable", "Remove", "New invite", "Password reset code", "Revoke open code", "Revoke"] {
+        // The page is taller than the window now that the header and the footer take their share: scroll to the button.
+        h.get_by_label(label).scroll_to_me();
+        h.run_steps(5);
         h.get_by_label(label).click();
         h.run_steps(2);
     }
@@ -1110,19 +1132,98 @@ fn audit_buttons_send_their_events() {
     h.get_by_label("Activity of this account").click();
     h.run_steps(2);
     assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Audit(AuditMsg::OpenAudit(Some((ana, "ana".into()))))]);
-    // The signed-in view has an Activity button for everyone; the activity page goes back.
+    // The Activity tab is for everyone; the Overview tab leaves the activity page.
     let member = FakeAgent::new(signed_in());
     let model = after(&member, vec![Event::Devices(Ok(devices()))]);
     let mut h = harness(model, egui::Theme::Light);
     h.run_steps(2);
-    assert_eq!(h.query_all_by_label("Administration").count(), 0);
+    assert_eq!(h.query_all_by_label("Admin").count(), 0);
     h.get_by_label("Activity").click();
     h.run_steps(2);
-    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Audit(AuditMsg::OpenActivity)]);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Tab(Tab::Activity)]);
     let model = after(&member, vec![Event::Devices(Ok(devices())), Event::Audit(AuditMsg::OpenActivity)]);
     let mut h = harness(model, egui::Theme::Light);
     h.run_steps(2);
-    h.get_by_label("Back").click();
+    h.get_by_label("Overview").click();
     h.run_steps(2);
-    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Audit(AuditMsg::CloseActivity)]);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Tab(Tab::Overview)]);
+}
+
+// ---- the tabs ----
+
+/// The overview of an account with 1.3 GiB of 5 GiB, a trash and old versions, and two computers.
+fn overview_model() -> Model {
+    let usage = AccountUsage {
+        stored_bytes: 1_395_864_371,
+        quota_bytes: Some(5 * 1_073_741_824),
+        trash_bytes: Some(124_780_544),
+        history_bytes: Some(349_175_808),
+        estimates: craft_cloud_proto::api::UsageEstimates { index_complete: true, reason: None },
+    };
+    let mut model = signed_in_with_usage(Ok(usage));
+    model.update(Event::Devices(Ok(devices())));
+    model
+}
+
+/// Every tab's page, in the light and in the dark appearance.
+#[test]
+fn snapshot_tabs() {
+    let member = FakeAgent::new(signed_in());
+    *member.audit_events.lock().unwrap() = audit_events();
+    let mut computers = overview_model();
+    computers.update(Event::Tab(Tab::Computers));
+    let pages = [
+        ("overview", overview_model()),
+        ("versions", versions_model(true)),
+        ("trash", trash_model(true)),
+        ("computers", computers),
+        ("security", after(&FakeAgent::new(signed_in()), vec![Event::Devices(Ok(devices())), Event::OpenSecurity])),
+        ("activity", after(&member, vec![Event::Devices(Ok(devices())), Event::Tab(Tab::Activity)])),
+        ("admin", on_admin_pages(&admin_agent(), Vec::new())),
+    ];
+    for (name, model) in pages {
+        let expected = match name {
+            "overview" => Tab::Overview,
+            "versions" => Tab::Versions,
+            "trash" => Tab::Trash,
+            "computers" => Tab::Computers,
+            "security" => Tab::Security,
+            "activity" => Tab::Activity,
+            _ => Tab::Admin,
+        };
+        assert_eq!(model.tab(), Some(expected), "{name}");
+        snapshot(model.clone(), egui::Theme::Light, &format!("tab-{name}-light"));
+        snapshot(model, egui::Theme::Dark, &format!("tab-{name}-dark"));
+    }
+}
+
+/// The tab bar draws the pages' names, the chosen one among them, and a click sends the tab.
+#[test]
+fn the_header_has_the_tabs_the_account_line_and_the_footer_its_buttons() {
+    let mut h = harness(overview_model(), egui::Theme::Light);
+    h.run_steps(2);
+    for label in ["Overview", "Versions", "Trash", "Computers", "Security", "Activity"] {
+        assert_eq!(h.query_all_by_label(label).count(), 1, "{label}");
+    }
+    assert_eq!(h.query_all_by_label("Admin").count(), 0);
+    h.get_by_label("Trash").click();
+    h.run_steps(2);
+    h.get_by_label("Sign out").click();
+    h.run_steps(2);
+    h.get_by_label("Quit").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Tab(Tab::Trash), Event::SignOut, Event::Quit]);
+    // The footer and the header stay on the other pages.
+    let mut h = harness(trash_model(true), egui::Theme::Light);
+    h.run_steps(2);
+    assert_eq!(h.query_all_by_label("Sign out").count(), 1);
+    assert_eq!(h.query_all_by_label("Overview").count(), 1);
+}
+
+/// In the smallest window the header's tabs have a row of their own and the overview's cells sit one under the other.
+#[test]
+fn snapshot_smallest_window() {
+    snapshot_sized(overview_model(), egui::Theme::Light, "tab-overview-smallest-light", MIN_WINDOW_SIZE);
+    let admin = on_admin_pages(&admin_agent(), Vec::new());
+    snapshot_sized(admin, egui::Theme::Dark, "tab-admin-smallest-dark", MIN_WINDOW_SIZE);
 }

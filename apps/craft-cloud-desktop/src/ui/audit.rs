@@ -162,9 +162,6 @@ pub(super) fn activity(ui: &mut egui::Ui, screen: &mut ActivityScreen, now_ms: i
     );
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        if ui.add(super::kit::Button::new("Back")).clicked() {
-            send(events, AuditMsg::CloseActivity);
-        }
         if ui.add_enabled(!screen.list.loading, super::kit::Button::new("Refresh")).clicked() {
             send(events, AuditMsg::ActivityReload);
         }
