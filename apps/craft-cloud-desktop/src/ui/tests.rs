@@ -93,8 +93,8 @@ fn devices() -> Vec<DeviceInfo> {
 /// The one wgpu instance, adapter, device and queue every test renders with. Tests run on parallel threads, and
 /// creating and dropping a D3D12 device (WARP) per harness at the same time crashed the test process with an access
 /// violation. Each harness still gets a renderer of its own on the shared device. It is never dropped, so no device is
-/// torn down while other threads render.
-fn shared_wgpu() -> eframe::egui_wgpu::WgpuSetup {
+/// torn down while other threads render. Every kittest harness of the app, in any test module, must render with it.
+pub(super) fn shared_wgpu() -> eframe::egui_wgpu::WgpuSetup {
     static SHARED: OnceLock<eframe::egui_wgpu::WgpuSetupExisting> = OnceLock::new();
     let shared = SHARED.get_or_init(|| {
         let state =
