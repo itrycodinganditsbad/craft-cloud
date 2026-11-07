@@ -5,7 +5,7 @@
 use craft_cloud_app::{DeviceId, DeviceInfo};
 use egui::RichText;
 
-use super::kit::{Tokens, Tone};
+use super::kit::{Column, JoinedCell, Part, Tokens, Tone};
 use crate::model::{Event, Overview, Rename};
 
 /// This app's version: the agent and the app are built from one version, so a computer reporting an older one is behind.
@@ -14,17 +14,15 @@ const OWN_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// What a cell shows for a detail the computer didn't send (an older agent leaves them out).
 const NO_DETAIL: &str = "—";
 
-/// The width the table keeps; a narrower window scrolls it sideways inside its own frame.
-const TABLE_MIN_WIDTH: f32 = 820.0;
-
 /// The width from which the title and the buttons share a row.
 const HEADER_ONE_ROW: f32 = 720.0;
 
-/// The least height of a row: two lines of a name, and the buttons.
-const ROW_HEIGHT: f32 = 44.0;
+/// The narrowest the Computer column gets (a long name ends with "…").
+const COMPUTER_MIN_WIDTH: f32 = 280.0;
 
-/// The width of the rename field.
-const RENAME_FIELD_WIDTH: f32 = 220.0;
+/// The height of a row: a name over its date, or the rename field under its label. One height for both, so opening the
+/// rename field doesn't move the rows below it.
+const ROW_HEIGHT: f32 = 64.0;
 
 /// The width from which the two notes under the table sit side by side.
 const NOTES_SIDE_BY_SIDE: f32 = 560.0;
@@ -78,140 +76,130 @@ pub(super) fn page(ui: &mut egui::Ui, o: &mut Overview, now_ms: i64, events: &mu
     }
     ui.add_space(8.0);
     table(ui, o, &active, now_ms, events);
-    ui.add_space(12.0);
+    ui.add_space(16.0);
     notes(ui);
 }
 
 fn table(ui: &mut egui::Ui, o: &mut Overview, active: &[DeviceInfo], now_ms: i64, events: &mut Vec<Event>) {
-    let t = Tokens::get(ui.ctx());
     let (online, removing) = (o.status.online, o.removing);
     let rename_open = o.renaming.is_some();
-    let mut renaming = o.renaming.take();
-    egui::Frame::new().stroke(t.hairline()).fill(t.bg).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        // A solid bar, drawn whenever the table is wider than the window (the floating one shows on hover only, so
-        // nothing told that the last columns were out of view).
-        ui.spacing_mut().scroll = egui::style::ScrollStyle { foreground_color: true, ..egui::style::ScrollStyle::solid() };
-        egui::ScrollArea::horizontal().id_salt("computers-scroll").auto_shrink([false, true]).show(ui, |ui| {
-            ui.set_min_width(TABLE_MIN_WIDTH);
-            egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
-                egui::Grid::new("computers").num_columns(6).striped(true).min_row_height(ROW_HEIGHT).spacing([20.0, 6.0]).show(ui, |ui| {
-                    for head in ["Computer", "Kind", "Platform", "Version", "Last seen", ""] {
-                        super::kit::section_label(ui, head);
-                    }
-                    ui.end_row();
-                    for device in active {
-                        let editing = renaming.as_mut().filter(|r| r.id == device.id);
-                        row(ui, device, editing, (online, removing, rename_open), now_ms, events);
-                        ui.end_row();
-                    }
-                });
-            });
-        });
+    // The error of a rename sits under the table, so the row keeps its height.
+    let rename_error = o.renaming.as_ref().and_then(|r| r.error.clone());
+    let columns = [
+        Column::flex("Computer", COMPUTER_MIN_WIDTH),
+        Column::fixed("Kind", 84.0),
+        Column::fixed("Platform", 104.0),
+        Column::fixed("Version", 136.0),
+        Column::fixed("Last seen", 124.0),
+        Column::fixed("", 214.0),
+    ];
+    let renaming = &mut o.renaming;
+    super::kit::table(ui, "computers", &columns, active.len(), ROW_HEIGHT, |ui, row, column| {
+        let Some(device) = active.get(row) else { return };
+        let editing = renaming.as_mut().filter(|r| r.id == device.id);
+        cell(ui, device, column, editing, (online, removing, rename_open), now_ms, events);
     });
-    o.renaming = renaming;
+    if let Some(error) = rename_error {
+        ui.add_space(6.0);
+        super::error_line(ui, &error);
+    }
 }
 
-/// One computer's row. `editing` is its rename, when its name is being changed.
-fn row(
+/// One cell of a computer's row. `editing` is its rename, when its name is being changed.
+fn cell(
     ui: &mut egui::Ui,
     device: &DeviceInfo,
-    mut editing: Option<&mut Rename>,
+    column: usize,
+    editing: Option<&mut Rename>,
     (online, removing, rename_open): (bool, Option<DeviceId>, bool),
     now_ms: i64,
     events: &mut Vec<Event>,
 ) {
     let t = Tokens::get(ui.ctx());
-    let focused = egui::Id::new(("rename-focused", device.id));
-
-    // Computer
-    match editing.as_deref_mut() {
-        Some(rename) => {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_max_width(RENAME_FIELD_WIDTH);
-                    super::kit::section_label(ui, "Rename this computer");
-                    let field =
-                        super::kit::text_edit(&mut rename.name).id(egui::Id::new(("rename-field", device.id))).desired_width(RENAME_FIELD_WIDTH);
-                    let response = ui.add_enabled(!rename.busy, field);
-                    // The field has the keyboard when the row opens, once.
-                    if !ui.data(|d| d.get_temp::<bool>(focused).unwrap_or(false)) {
-                        response.request_focus();
-                        ui.data_mut(|d| d.insert_temp(focused, true));
-                    }
-                    // egui drops the focus on Escape before the field reports it, so a field that lost it this frame counts.
-                    if (response.has_focus() || response.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        events.push(Event::CancelRename);
-                    } else if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        events.push(Event::SaveRename);
-                    }
-                    if let Some(error) = &rename.error {
-                        super::error_line(ui, error);
-                    }
-                });
-                if device.current {
-                    // In a column of its own the tag keeps its height beside a taller field.
-                    ui.vertical(|ui| super::kit::tag(ui, "This computer", Tone::Accent));
-                }
-            });
+    match column {
+        0 => match editing {
+            Some(rename) => rename_field(ui, device, rename, events),
+            None => {
+                let focused = egui::Id::new(("rename-focused", device.id));
+                ui.data_mut(|d| d.remove::<bool>(focused));
+                let name = if device.current { format!("{} (this computer)", device.name) } else { device.name.clone() };
+                let date = (device.created_ms > 0).then(|| format!("signed in {}", super::trash::date(device.created_ms)));
+                super::kit::two_lines(ui, ROW_HEIGHT, &name, date.as_deref());
+            }
+        },
+        1 => {
+            let kind = device.client_kind.trim();
+            if kind.is_empty() {
+                ui.label(RichText::new(NO_DETAIL).color(t.faint));
+            } else {
+                ui.label(RichText::new(kind.to_uppercase()).monospace().size(12.0).extra_letter_spacing(1.0));
+            }
         }
-        None => {
-            ui.data_mut(|d| d.remove::<bool>(focused));
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(&device.name).strong());
-                    if device.created_ms > 0 {
-                        ui.label(RichText::new(format!("signed in {}", super::trash::date(device.created_ms))).small().color(t.muted));
-                    }
-                });
-                if device.current {
-                    // In a column of its own the tag keeps its height beside a taller field.
-                    ui.vertical(|ui| super::kit::tag(ui, "This computer", Tone::Accent));
-                }
-            });
+        2 => detail(ui, &platform_label(&device.platform), false),
+        3 => {
+            if crate::model::is_older_version(&device.app_version, OWN_VERSION) {
+                ui.label(RichText::new(&device.app_version).monospace().color(t.warn));
+                super::kit::tag(ui, "Older", Tone::Warn).on_hover_text(format!("This app is {OWN_VERSION}"));
+            } else {
+                detail(ui, &device.app_version, true);
+            }
         }
+        4 => {
+            if device.current {
+                if online {
+                    super::kit::tag(ui, "Online", Tone::Good);
+                } else {
+                    super::kit::tag(ui, "Offline", Tone::Neutral);
+                }
+            } else {
+                super::kit::truncated(ui, super::ago(now_ms, device.last_used_ms));
+            }
+        }
+        _ => actions(ui, device, editing, (removing, rename_open), events),
     }
+}
 
-    // Kind, Platform, Version
-    detail(ui, &capitalised(&device.client_kind), false);
-    detail(ui, &device.platform, false);
-    ui.horizontal(|ui| {
-        if crate::model::is_older_version(&device.app_version, OWN_VERSION) {
-            ui.label(RichText::new(&device.app_version).monospace().color(t.warn));
-            super::kit::tag(ui, "Older", Tone::Warn).on_hover_text(format!("This app is {OWN_VERSION}"));
-        } else {
-            detail(ui, &device.app_version, true);
+/// The rename field in the Computer column: a label over a field that fills the column.
+fn rename_field(ui: &mut egui::Ui, device: &DeviceInfo, rename: &mut Rename, events: &mut Vec<Event>) {
+    let focused = egui::Id::new(("rename-focused", device.id));
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        super::kit::section_label_fit(ui, "Rename this computer", ui.available_width());
+        let field = super::kit::text_edit(&mut rename.name).id(egui::Id::new(("rename-field", device.id))).desired_width(ui.available_width());
+        let response = ui.add_enabled(!rename.busy, field);
+        // The field has the keyboard when the row opens, once.
+        if !ui.data(|d| d.get_temp::<bool>(focused).unwrap_or(false)) {
+            response.request_focus();
+            ui.data_mut(|d| d.insert_temp(focused, true));
+        }
+        // egui drops the focus on Escape before the field reports it, so a field that lost it this frame counts.
+        if (response.has_focus() || response.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            events.push(Event::CancelRename);
+        } else if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            events.push(Event::SaveRename);
         }
     });
+}
 
-    // Last seen
-    if device.current {
-        ui.horizontal(|ui| {
-            if online {
-                super::kit::tag(ui, "Online", Tone::Good);
-            } else {
-                super::kit::tag(ui, "Offline", Tone::Neutral);
-            }
-        });
-    } else {
-        ui.label(super::ago(now_ms, device.last_used_ms));
-    }
-
-    // Actions
-    ui.horizontal(|ui| match editing {
+/// The last column: Rename and Remove, or Cancel and Save while the name is being changed (the rightmost is added first).
+fn actions(
+    ui: &mut egui::Ui,
+    device: &DeviceInfo,
+    editing: Option<&mut Rename>,
+    (removing, rename_open): (Option<DeviceId>, bool),
+    events: &mut Vec<Event>,
+) {
+    match editing {
         Some(rename) => {
-            if ui.add_enabled(!rename.busy, super::kit::Button::new("Cancel")).clicked() {
-                events.push(Event::CancelRename);
-            }
             let save = super::kit::Button::new(if rename.busy { "Saving…" } else { "Save" }).primary();
             if ui.add_enabled(!rename.busy, save).clicked() {
                 events.push(Event::SaveRename);
             }
+            if ui.add_enabled(!rename.busy, super::kit::Button::new("Cancel")).clicked() {
+                events.push(Event::CancelRename);
+            }
         }
         None => {
-            if ui.add_enabled(!rename_open, super::kit::Button::new("Rename")).on_hover_text(format!("Give {} another name", device.name)).clicked() {
-                events.push(Event::StartRename(device.id));
-            }
             if !device.current {
                 let this = removing == Some(device.id);
                 let button = super::kit::Button::new(if this { "Removing…" } else { "Remove" }).danger();
@@ -220,8 +208,11 @@ fn row(
                     events.push(Event::RemoveDevice(device.id));
                 }
             }
+            if ui.add_enabled(!rename_open, super::kit::Button::new("Rename")).on_hover_text(format!("Give {} another name", device.name)).clicked() {
+                events.push(Event::StartRename(device.id));
+            }
         }
-    });
+    }
 }
 
 /// A detail cell: the text in the muted colour, or a dash when the computer didn't send it.
@@ -233,37 +224,47 @@ fn detail(ui: &mut egui::Ui, text: &str, mono: bool) {
     } else if mono {
         ui.label(RichText::new(text).monospace().color(t.muted));
     } else {
-        ui.label(RichText::new(text).color(t.muted));
+        super::kit::truncated(ui, RichText::new(text).color(t.muted));
     }
 }
 
-/// `text` with a capital first letter (`agent` is `Agent`).
-fn capitalised(text: &str) -> String {
-    let mut chars = text.chars();
-    chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
+/// The platform as people write it: `windows` is `Windows`, `macos` is `macOS`, `linux` is `Linux`; anything else as the
+/// computer sent it, and nothing (shown as a dash) when it sent nothing.
+pub(super) fn platform_label(platform: &str) -> String {
+    let platform = platform.trim();
+    match platform.to_ascii_lowercase().as_str() {
+        "windows" => "Windows".to_owned(),
+        "macos" => "macOS".to_owned(),
+        "linux" => "Linux".to_owned(),
+        _ => platform.to_owned(),
+    }
 }
 
-/// What Add a computer and Remove do, in two notes.
+/// What Add a computer and Remove do, in one strip of two cells.
 fn notes(ui: &mut egui::Ui) {
-    let add = |ui: &mut egui::Ui| {
-        super::kit::card(ui, Some("Add a computer"), |ui| {
-            ui.add(egui::Label::new("Make a one-time code here and type it on the other computer. It is valid for 10 minutes.").wrap());
-        });
-    };
-    let remove = |ui: &mut egui::Ui| {
-        super::kit::card(ui, Some("Removing a computer"), |ui| {
-            ui.add(egui::Label::new("It is signed out at once. Its files stay on its disk; nothing is deleted there.").wrap());
-        });
-    };
-    if ui.available_width() >= NOTES_SIDE_BY_SIDE {
-        ui.columns(2, |columns| {
-            let [left, right] = columns else { return };
-            add(left);
-            remove(right);
-        });
-    } else {
-        add(ui);
-        ui.add_space(8.0);
-        remove(ui);
+    let cells = [JoinedCell::new("01", Tone::Accent, "Add a computer"), JoinedCell::new("02", Tone::Warn, "Removing a computer")];
+    super::kit::joined_cells(ui, "computers-notes", &cells, NOTES_SIDE_BY_SIDE, |ui, i, part| {
+        if part != Part::Body {
+            return;
+        }
+        let text = match i {
+            0 => "Make a one-time code here and type it on the other computer. It is valid for 10 minutes.",
+            _ => "It is signed out at once. Its files stay on its disk; nothing is deleted there.",
+        };
+        ui.add(egui::Label::new(text).wrap());
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::platform_label;
+
+    #[test]
+    fn platforms_are_written_as_people_write_them() {
+        assert_eq!(platform_label("windows"), "Windows");
+        assert_eq!(platform_label(" macos "), "macOS");
+        assert_eq!(platform_label("Linux"), "Linux");
+        assert_eq!(platform_label("freebsd"), "freebsd");
+        assert_eq!(platform_label("  "), "");
     }
 }

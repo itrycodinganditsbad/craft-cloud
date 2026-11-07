@@ -32,7 +32,7 @@ const SHORT_LIST: usize = 4;
 /// The height of a row of the recent activity table.
 const ACTIVITY_ROW_H: f32 = 48.0;
 
-pub(super) fn show(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: i64, autostart_problem: Option<&str>, events: &mut Vec<Event>) {
+pub(super) fn show(ui: &mut egui::Ui, o: &mut Overview, busy: Option<Busy>, now_ms: i64, autostart_problem: Option<&str>, events: &mut Vec<Event>) {
     match o.page {
         OverviewPage::Home => home(ui, o, busy, now_ms, autostart_problem, events),
         OverviewPage::Computers => super::computers::page(ui, o, now_ms, events),
