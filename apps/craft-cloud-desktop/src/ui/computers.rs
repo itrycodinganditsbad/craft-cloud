@@ -87,11 +87,11 @@ fn table(ui: &mut egui::Ui, o: &mut Overview, active: &[DeviceInfo], now_ms: i64
     let rename_error = o.renaming.as_ref().and_then(|r| r.error.clone());
     let columns = [
         Column::flex("Computer", COMPUTER_MIN_WIDTH),
-        Column::fixed("Kind", 84.0),
-        Column::fixed("Platform", 104.0),
-        Column::fixed("Version", 136.0),
-        Column::fixed("Last seen", 124.0),
-        Column::fixed("", 214.0),
+        Column::fixed("Kind", 72.0),
+        Column::fixed("Platform", 98.0),
+        Column::fixed("Version", 126.0),
+        Column::fixed("Last seen", 118.0),
+        Column::fixed("", 190.0),
     ];
     let renaming = &mut o.renaming;
     super::kit::table(ui, "computers", &columns, active.len(), ROW_HEIGHT, |ui, row, column| {

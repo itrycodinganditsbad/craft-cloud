@@ -1592,7 +1592,7 @@ fn missing_details_show_a_dash_and_only_an_older_version_gets_the_tag() {
     // Kind, platform and version of the computer that sent nothing.
     assert_eq!(h.query_all_by_label("—").count(), 3);
     assert_eq!(h.query_all_by_label("Older").count(), 1);
-    assert_eq!(h.query_all_by_label("This computer").count(), 1);
+    assert_eq!(h.query_all_by_label("Studio PC (this computer)").count(), 1);
     assert_eq!(h.query_all_by_label("Online").count(), 1);
     assert!(h.query_by_label("signed in 1970-01-01").is_none(), "no date is not 1970");
 }
@@ -1687,14 +1687,61 @@ fn sign_out_other_computers_is_a_button_of_the_page_and_off_without_another_comp
 fn snapshot_security_pages() {
     let on = FakeAgent::new(signed_in());
     on.factor.lock().unwrap().enabled = true;
+    *on.audit_events.lock().unwrap() = audit_events();
     let events = |_: ()| vec![Event::Devices(Ok(computers_with_details())), Event::OpenSecurity];
-    snapshot(after(&on, events(())), egui::Theme::Light, "security-two-factor-on-light");
-    snapshot(after(&on, events(())), egui::Theme::Dark, "security-two-factor-on-dark");
+    snapshot_sized(after(&on, events(())), egui::Theme::Light, "security-two-factor-on-light", [WINDOW_SIZE[0], 900.0]);
+    snapshot_sized(after(&on, events(())), egui::Theme::Dark, "security-two-factor-on-dark", [WINDOW_SIZE[0], 900.0]);
     let off = FakeAgent::new(signed_in());
     snapshot_sized(after(&off, events(())), egui::Theme::Light, "security-two-factor-off-smallest-light", MIN_WINDOW_SIZE);
+    // The password form is in its cell: a typed form that was refused says why.
     let mut password = after(&on, events(()));
-    password.update(Event::Security(crate::security::SecurityEvent::StartPassword));
-    snapshot(password, egui::Theme::Light, "security-password-light");
+    if let Screen::Security(page) = &mut password.screen {
+        page.password = crate::security::PasswordFields {
+            current: "the old one".into(),
+            new: "a brand new password".into(),
+            again: "another brand new one".into(),
+        };
+    }
+    password.update(Event::Security(crate::security::SecurityEvent::SubmitPassword));
+    snapshot_sized(password, egui::Theme::Light, "security-password-light", [WINDOW_SIZE[0], 900.0]);
+    // The sign-out of the other computers is asked under the cells.
+    let mut confirm = after(&on, events(()));
+    confirm.update(Event::Security(crate::security::SecurityEvent::StartSignOutOthers));
+    snapshot_sized(confirm, egui::Theme::Light, "security-sign-out-others-light", [WINDOW_SIZE[0], 1100.0]);
+}
+
+/// The security activity under the cells: the newest sign-ins and account changes only, with a muted line without events or
+/// when they couldn't be loaded.
+#[test]
+fn snapshot_security_activity() {
+    use crate::security::{SecurityActivity, SecurityAnswer};
+    let on = FakeAgent::new(signed_in());
+    on.factor.lock().unwrap().enabled = true;
+    let events = vec![Event::Devices(Ok(computers_with_details())), Event::OpenSecurity];
+    let mut loaded = after(&on, events.clone());
+    let known = match &loaded.screen {
+        Screen::Security(page) => page.overview.devices.clone().unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let mut list = audit_events();
+    for (n, event) in list.iter_mut().enumerate() {
+        event.actor_device = known.get(n % 2).map(|d| d.id);
+    }
+    loaded.update(Event::SecurityAnswer(SecurityAnswer::Activity(Ok(craft_cloud_app::AuditPage { events: list, next: None }))));
+    let Screen::Security(page) = &loaded.screen else { panic!("the Security page") };
+    let SecurityActivity::Loaded(shown) = &page.activity else { panic!("{:?}", page.activity) };
+    // The admin's changes are not about the account's security.
+    assert_eq!(shown.len(), 4, "{shown:?}");
+    assert!(shown.iter().all(|e| crate::security::is_security_action(&e.action)));
+    snapshot_sized(loaded.clone(), egui::Theme::Light, "security-activity-light", [WINDOW_SIZE[0], 1000.0]);
+    snapshot_sized(loaded.clone(), egui::Theme::Dark, "security-activity-dark", [WINDOW_SIZE[0], 1000.0]);
+    snapshot_sized(loaded, egui::Theme::Light, "security-activity-smallest-light", [MIN_WINDOW_SIZE[0], 1100.0]);
+    let mut empty = after(&on, events.clone());
+    empty.update(Event::SecurityAnswer(SecurityAnswer::Activity(Ok(craft_cloud_app::AuditPage { events: Vec::new(), next: None }))));
+    snapshot_sized(empty, egui::Theme::Light, "security-activity-empty", [WINDOW_SIZE[0], 800.0]);
+    let mut failed = after(&on, events);
+    failed.update(Event::SecurityAnswer(SecurityAnswer::Activity(Err(Error::Io("the server didn't answer".into())))));
+    snapshot_sized(failed, egui::Theme::Light, "security-activity-failed", [WINDOW_SIZE[0], 800.0]);
 }
 
 #[test]
@@ -1724,14 +1771,14 @@ fn the_security_pages_sign_out_button_is_off_without_another_computer() {
     let events = vec![Event::Devices(Ok(computers_with_details().into_iter().take(1).collect())), Event::OpenSecurity];
     let mut h = harness(after(&alone, events), egui::Theme::Light);
     h.run_steps(3);
-    h.get_by_label("Sign out other computers…").click();
+    h.get_by_label("Sign out other computers").click();
     h.run_steps(2);
     assert!(h.state_mut().1.is_empty(), "disabled");
     let with_others = FakeAgent::new(signed_in());
     let events = vec![Event::Devices(Ok(computers_with_details())), Event::OpenSecurity];
     let mut h = harness(after(&with_others, events), egui::Theme::Light);
     h.run_steps(3);
-    h.get_by_label("Sign out other computers…").click();
+    h.get_by_label("Sign out other computers").click();
     h.run_steps(2);
     assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Security(crate::security::SecurityEvent::StartSignOutOthers)]);
 }

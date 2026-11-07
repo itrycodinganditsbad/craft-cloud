@@ -398,6 +398,7 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
             SecurityCall::RecoveryCodes { password, code } => SecurityAnswer::RecoveryCodes(agent.two_factor_recovery_codes(&password, &code)),
             SecurityCall::ChangePassword { current, new } => SecurityAnswer::ChangePassword(agent.change_password(&current, &new)),
             SecurityCall::SignOutOthers => SecurityAnswer::SignOutOthers(agent.revoke_other_devices()),
+            SecurityCall::Activity => SecurityAnswer::Activity(agent.account_activity(&crate::security::activity_query())),
         }),
         Effect::OpenFolder(_)
         | Effect::QuitApp

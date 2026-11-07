@@ -3212,7 +3212,6 @@ pub(crate) mod tests {
         }
     }
 
-
     fn computer(name: &str, current: bool) -> DeviceInfo {
         DeviceInfo {
             id: DeviceId::generate(),

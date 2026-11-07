@@ -243,29 +243,72 @@ fn the_password_and_the_other_computers() {
     let agent = FakeAgent::new(signed_in());
     agent.factor.lock().unwrap().other_computers = 2;
     let mut model = on_security(&agent);
-    feed(&mut model, &agent, Event::Security(SecurityEvent::StartPassword));
     let set = |model: &mut Model, cur: &str, new: &str, again: &str| {
-        type_into(model, |step| {
-            if let Step::Password { current, new: n, again: a } = step {
-                *current = cur.into();
-                *n = new.into();
-                *a = again.into();
-            }
-        });
+        let fields = &mut page(model).password;
+        fields.current = cur.into();
+        fields.new = new.into();
+        fields.again = again.into();
     };
     set(&mut model, PASSWORD, "a brand new password", "another one");
-    feed(&mut model, &agent, Event::Security(SecurityEvent::Submit));
+    feed(&mut model, &agent, Event::Security(SecurityEvent::SubmitPassword));
     assert_eq!(page(&mut model).error.as_deref(), Some("The two new passwords aren't the same."));
     set(&mut model, PASSWORD, "short", "short");
-    feed(&mut model, &agent, Event::Security(SecurityEvent::Submit));
+    feed(&mut model, &agent, Event::Security(SecurityEvent::SubmitPassword));
     assert_eq!(page(&mut model).error.as_deref(), Some("passwords are 8 to 1024 bytes"));
     set(&mut model, PASSWORD, "a brand new password", "a brand new password");
-    feed(&mut model, &agent, Event::Security(SecurityEvent::Submit));
+    feed(&mut model, &agent, Event::Security(SecurityEvent::SubmitPassword));
     assert!(page(&mut model).note.as_deref().is_some_and(|n| n.starts_with("Password changed")));
     feed(&mut model, &agent, Event::Security(SecurityEvent::StartSignOutOthers));
     feed(&mut model, &agent, Event::Security(SecurityEvent::Submit));
     assert_eq!(page(&mut model).note.as_deref(), Some("Signed 2 other computers out."));
     assert!(!format!("{:?}", model.screen).contains("brand new"));
+}
+
+#[test]
+fn the_password_form_checks_what_was_typed_and_locks_while_a_call_is_under_way() {
+    let agent = FakeAgent::new(signed_in());
+    let mut model = on_security(&agent);
+    // Nothing typed: nothing is sent, and the page says what is missing.
+    assert!(model.update(Event::Security(SecurityEvent::SubmitPassword)).is_empty());
+    assert_eq!(page(&mut model).error.as_deref(), Some("Type your current password and the new one."));
+    let fields = &mut page(&mut model).password;
+    fields.current = PASSWORD.into();
+    fields.new = "a brand new password".into();
+    fields.again = "a brand new password".into();
+    let effects = model.update(Event::Security(SecurityEvent::SubmitPassword));
+    assert!(matches!(effects.as_slice(), [Effect::Security(crate::security::SecurityCall::ChangePassword { .. })]), "{effects:?}");
+    // The typed passwords moved into the call: the form is empty, and a second click while the call is under way sends nothing.
+    assert_eq!(page(&mut model).password, crate::security::PasswordFields::default());
+    assert!(page(&mut model).busy);
+    page(&mut model).password.current = "x".into();
+    assert!(model.update(Event::Security(SecurityEvent::SubmitPassword)).is_empty());
+    assert!(!format!("{:?}", model.screen).contains("brand new"));
+}
+
+#[test]
+fn the_security_activity_lists_only_what_is_about_signing_in_and_the_account() {
+    use crate::security::{SecurityActivity, SecurityAnswer, is_security_action};
+    for action in ["auth.login", "auth.login_failed", "account.password_changed", "device.revoked_others", "device.revoked"] {
+        assert!(is_security_action(action), "{action}");
+    }
+    for action in ["admin.quota_changed", "join.pairing_redeemed", "cli.password_reset", "admin.device_revoked"] {
+        assert!(!is_security_action(action), "{action}");
+    }
+    let agent = FakeAgent::new(signed_in());
+    let mut model = on_security(&agent);
+    // The page asked for the account's activity when it opened.
+    assert!(agent.asked.lock().unwrap().iter().any(|a| a == "account_activity"));
+    let events = ["admin.quota_changed", "auth.login", "join.pairing_redeemed", "account.password_changed"]
+        .iter()
+        .enumerate()
+        .map(|(n, action)| FakeAgent::sample_event(n as u64, action))
+        .collect();
+    model.update(Event::SecurityAnswer(SecurityAnswer::Activity(Ok(craft_cloud_app::AuditPage { events, next: None }))));
+    let SecurityActivity::Loaded(shown) = &page(&mut model).activity else { panic!("not loaded") };
+    assert_eq!(shown.iter().map(|e| e.action.as_str()).collect::<Vec<_>>(), ["auth.login", "account.password_changed"]);
+    // A failed call is said, and nothing breaks.
+    model.update(Event::SecurityAnswer(SecurityAnswer::Activity(Err(Error::Io("down".into())))));
+    assert!(matches!(page(&mut model).activity, SecurityActivity::Failed(_)));
 }
 
 #[test]
@@ -522,16 +565,16 @@ fn the_overview_has_a_security_button_and_the_page_its_buttons() {
     let agent = FakeAgent::new(signed_in());
     let mut h = harness(security_model(&agent, vec![]), egui::Theme::Light);
     h.run_steps(2);
-    h.get_by_label("Set up two-factor sign-in…").click();
+    h.get_by_label("Set up two-factor sign-in").click();
     h.run_steps(2);
-    h.get_by_label("Change password…").click();
+    h.get_by_label("Change password").click();
     h.run_steps(2);
     // The Overview tab leaves the page; the page has no Back of its own.
     h.get_by_label("Overview").click();
     h.run_steps(2);
     let events = &h.state().1;
     assert!(events.contains(&Event::Security(SecurityEvent::StartSetup)), "{events:?}");
-    assert!(events.contains(&Event::Security(SecurityEvent::StartPassword)), "{events:?}");
+    assert!(events.contains(&Event::Security(SecurityEvent::SubmitPassword)), "{events:?}");
     assert!(events.contains(&Event::Tab(crate::model::Tab::Overview)), "{events:?}");
 }
 
