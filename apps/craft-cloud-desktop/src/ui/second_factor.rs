@@ -24,7 +24,7 @@ pub(super) fn show(ui: &mut egui::Ui, form: &mut SecondFactorForm, events: &mut 
     }
     let signing_in = form.form.mode == JoinMode::SignIn;
     let note = if signing_in {
-        "A recovery code works once. After five wrong codes you have to wait before trying again."
+        "A recovery code works once. After five wrong codes this sign-in ends and you sign in again."
     } else {
         "A recovery code works once. Your invite or code isn't used up until this works."
     };

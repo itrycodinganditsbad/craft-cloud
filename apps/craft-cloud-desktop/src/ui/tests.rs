@@ -663,9 +663,28 @@ fn buttons_send_their_events() {
     assert_eq!(model.update(Event::ChangeFolder), vec![Effect::PickFolder("/home/fabio/Craft Cloud".into())]);
 }
 
+/// The sign-in's fields are found by the words above them, as a screen reader finds them.
+#[test]
+fn the_sign_in_fields_are_found_by_their_labels() {
+    use egui::accesskit::Role;
+    let mut h = harness(sign_in_typed(), egui::Theme::Light);
+    h.run_steps(2);
+    for (role, label) in [(Role::TextInput, "Server"), (Role::TextInput, "Username"), (Role::PasswordInput, "Password")] {
+        let _ = h.get_by_role_and_label(role, label);
+    }
+    let mut model = sign_in_typed();
+    model.update(Event::SetJoinMode(crate::model::JoinMode::JoinString));
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    let _ = h.get_by_role_and_label(Role::TextInput, "Join string");
+}
+
 #[test]
 fn times_and_addresses_read_as_people_say_them() {
     assert_eq!(host("https://cloud.shadows.ch/"), "cloud.shadows.ch");
+    assert_eq!(host("HTTPS://Cloud.Shadows.ch/"), "Cloud.Shadows.ch");
+    assert_eq!(host("Http://127.0.0.1:18080"), "127.0.0.1:18080");
+    assert_eq!(host("htt"), "htt");
     assert_eq!(host("http://127.0.0.1:8080"), "127.0.0.1:8080");
     assert_eq!(ago(NOW, NOW - 10_000), "just now");
     assert_eq!(ago(NOW, NOW - 120_000), "2 min ago");

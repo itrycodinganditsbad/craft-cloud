@@ -40,7 +40,7 @@ pub const PASSWORD_AGAIN: &str = "Type your password again to sync the folder's 
 /// The server's answer to a password carried no challenge.
 pub const NO_CHALLENGE: &str = "The server didn't ask for a code the way it should. Try signing in again.";
 /// The challenge of a sign-in ran out.
-pub const CHALLENGE_EXPIRED: &str = "The sign-in took too long. Sign in again.";
+pub const CHALLENGE_EXPIRED: &str = "This sign-in can't go on any more (it took too long or had too many wrong codes). Sign in again.";
 /// The two new passwords differ.
 pub const PASSWORDS_DIFFER: &str = "The two passwords aren't the same";
 /// No new password was typed.
@@ -135,6 +135,8 @@ pub struct JoinForm {
     pub password: String,
     /// Sign-in: the server's challenge between the password and the second factor, kept while the code is asked for.
     pub challenge: Option<String>,
+    /// When the challenge ends (milliseconds since the Unix epoch, as the server said), while there is one.
+    pub challenge_expires_ms: i64,
     pub folder: String,
     pub device_name: String,
     /// What went wrong with the last try, for people.
@@ -155,6 +157,7 @@ impl std::fmt::Debug for JoinForm {
             .field("user", &self.user)
             .field("password", &"<redacted>")
             .field("challenge", &self.challenge.as_ref().map(|_| "<redacted>"))
+            .field("challenge_expires_ms", &self.challenge_expires_ms)
             .field("folder", &self.folder)
             .field("device_name", &self.device_name)
             .field("error", &self.error)
@@ -162,6 +165,25 @@ impl std::fmt::Debug for JoinForm {
             .field("adopt_for", &self.adopt_for)
             .finish()
     }
+}
+
+/// Whether `address` (`host[:port][/path]`, no scheme) names this computer.
+fn is_loopback_host(address: &str) -> bool {
+    let authority = address.split('/').next().unwrap_or_default();
+    let authority = authority.rsplit('@').next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+        || host.parse::<std::net::Ipv6Addr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether a challenge that ends at `expires_ms` lasts longer than a wait of `retry_after_secs` (unknown: yes).
+fn wait_fits(retry_after_secs: Option<u64>, expires_ms: i64, now_ms: i64) -> bool {
+    let left_ms = u64::try_from(expires_ms.saturating_sub(now_ms)).unwrap_or(0);
+    retry_after_secs.is_none_or(|secs| secs.saturating_mul(1000) < left_ms)
 }
 
 /// One step of the first start's rail: what is known of it so far.
@@ -198,10 +220,17 @@ impl JoinForm {
         (folder, (!name.is_empty()).then(|| name.to_owned()), adopt)
     }
 
-    /// The server's address for the agent: as typed, with `https://` when it has no scheme (as in a join string).
+    /// The server's address for the agent: as typed, with a scheme when it has none: `http://` for a server on this computer
+    /// (`localhost`, `127.x.x.x`, `[::1]`: the only ones the agent takes without TLS), `https://` for every other.
     fn server_address(&self) -> String {
         let typed = self.server.trim();
-        if typed.contains("://") { typed.to_owned() } else { format!("https://{typed}") }
+        if typed.contains("://") {
+            typed.to_owned()
+        } else if is_loopback_host(typed) {
+            format!("http://{typed}")
+        } else {
+            format!("https://{typed}")
+        }
     }
 
     /// The first step of a sign-in; `password` is the one typed (taken out of the form by the caller).
@@ -1762,6 +1791,7 @@ impl Model {
             (codes::TWO_FACTOR_REQUIRED, _) if signing_in => match e.challenge() {
                 Some(c) => {
                     form.challenge = Some(c.challenge.clone());
+                    form.challenge_expires_ms = c.expires_ms;
                     Screen::SecondFactor(SecondFactorForm::new(form, None, None))
                 }
                 None => {
@@ -1775,6 +1805,11 @@ impl Model {
             }
             // The account has two-factor sign-in: the same join goes again with its code (the invite was not used up).
             (codes::TWO_FACTOR_REQUIRED, password) => Screen::SecondFactor(SecondFactorForm::new(form, password, None)),
+            // A lock outlasts the challenge: a sign-in starts over then, and says how long to wait.
+            (codes::TWO_FACTOR_LOCKED, _) if signing_in && !wait_fits(e.retry_after_secs(), form.challenge_expires_ms, self.now_ms) => {
+                form.error = Some(crate::security::explain(&e));
+                Screen::Join(form)
+            }
             (codes::TWO_FACTOR_INVALID | codes::TWO_FACTOR_LOCKED, password) => {
                 form.challenge = challenge;
                 Screen::SecondFactor(SecondFactorForm::new(form, password, Some(crate::security::explain(&e))))
@@ -1797,6 +1832,18 @@ impl Model {
                 return vec![Effect::Status];
             }
             (_, Some(pw)) => back_to_password(pw, text),
+            // The agent says `offline` for anything that kept the server from answering, a busy server (429) included, and
+            // its message says which: a sign-in shows it. A second step goes on with its challenge while that lasts.
+            (codes::OFFLINE, None) if signing_in => {
+                let said = if text.trim().is_empty() { crate::security::explain(&e) } else { text };
+                if challenge.is_some() && form.challenge_expires_ms > self.now_ms {
+                    form.challenge = challenge;
+                    Screen::SecondFactor(SecondFactorForm::new(form, None, Some(said)))
+                } else {
+                    form.error = Some(said);
+                    Screen::Join(form)
+                }
+            }
             (_, None) => {
                 form.error = Some(if signing_in { crate::security::explain(&e) } else { text });
                 Screen::Join(form)
@@ -2698,11 +2745,81 @@ pub(crate) mod tests {
         let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
         second.code = "123456".into();
         m.update(Event::SubmitSecondFactor);
-        let locked =
-            Error::RefusedWith { code: codes::TWO_FACTOR_LOCKED.into(), message: "locked".into(), two_factor: None, retry_after_secs: Some(840) };
-        m.update(Event::LoggedIn(Err(locked)));
+        let locked = |secs| Error::RefusedWith {
+            code: codes::TWO_FACTOR_LOCKED.into(),
+            message: "locked".into(),
+            two_factor: None,
+            retry_after_secs: Some(secs),
+        };
+        // The challenge (5 ms left here) ends before the lock does: back to the form, with the wait said, nothing kept.
+        m.update(Event::LoggedIn(Err(locked(840))));
+        let f = form(&mut m);
+        assert_eq!(f.error.as_deref(), Some("Too many wrong codes. Try again in 14 minutes."));
+        assert!(f.challenge.is_none() && f.password.is_empty());
+        // A wait that is over before the challenge is: the code field stays, with the wait.
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        let long_lived = Error::RefusedWith {
+            code: codes::TWO_FACTOR_REQUIRED.into(),
+            message: "needs a code".into(),
+            two_factor: Some(craft_cloud_app::TwoFactorChallenge { challenge: "challenge-secret".into(), expires_ms: 300_000 }),
+            retry_after_secs: None,
+        };
+        m.update(Event::LoggedIn(Err(long_lived)));
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        second.code = "123456".into();
+        m.update(Event::SubmitSecondFactor);
+        m.update(Event::LoggedIn(Err(locked(30))));
         let Screen::SecondFactor(second) = &m.screen else { panic!("{:?}", m.screen) };
-        assert_eq!(second.error.as_deref(), Some("Too many wrong codes. Try again in 14 minutes."));
+        assert_eq!(second.error.as_deref(), Some("Too many wrong codes. Try again in 30 seconds."));
+        assert_eq!(second.form.challenge.as_deref(), Some("challenge-secret"));
+    }
+
+    #[test]
+    fn a_busy_server_during_the_second_step_keeps_the_challenge_while_it_lives() {
+        // The agent answers a server's 429 as `offline`; its message says what happened.
+        let busy = || refused("offline", "the server is busy: too many sign-in attempts");
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(two_factor_required())));
+        m.now_ms = 1;
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        second.code = "123456".into();
+        m.update(Event::SubmitSecondFactor);
+        m.update(Event::LoggedIn(Err(busy())));
+        let Screen::SecondFactor(second) = &m.screen else { panic!("{:?}", m.screen) };
+        assert_eq!(second.error.as_deref(), Some("the server is busy: too many sign-in attempts"));
+        assert_eq!(second.form.challenge.as_deref(), Some("challenge-secret"));
+        // Past the challenge's end (5 ms): back to the form.
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!() };
+        second.code = "123456".into();
+        m.update(Event::SubmitSecondFactor);
+        m.now_ms = 10;
+        m.update(Event::LoggedIn(Err(busy())));
+        let f = form(&mut m);
+        assert_eq!(f.error.as_deref(), Some("the server is busy: too many sign-in attempts"));
+        assert!(f.challenge.is_none());
+    }
+
+    #[test]
+    fn a_server_without_a_scheme_is_https_unless_it_is_this_computer() {
+        for (typed, sent) in [
+            ("cloud.shadows.ch", "https://cloud.shadows.ch"),
+            ("cloud.shadows.ch:8443/cloud", "https://cloud.shadows.ch:8443/cloud"),
+            ("localhost:18080", "http://localhost:18080"),
+            ("LOCALHOST", "http://LOCALHOST"),
+            ("127.0.0.1:18080", "http://127.0.0.1:18080"),
+            ("127.3.4.5", "http://127.3.4.5"),
+            ("[::1]:18080", "http://[::1]:18080"),
+            ("192.168.1.5:18080", "https://192.168.1.5:18080"),
+            ("localhost.example.com", "https://localhost.example.com"),
+            ("127.0.0.1.example.com", "https://127.0.0.1.example.com"),
+            ("http://nas.local:18080", "http://nas.local:18080"),
+        ] {
+            let mut m = on_sign_in_form();
+            form(&mut m).server = typed.into();
+            assert_eq!(login_request(&m.update(Event::SubmitJoin)).server, sent, "{typed}");
+        }
     }
 
     #[test]
@@ -2733,7 +2850,7 @@ pub(crate) mod tests {
         for (error, said) in [
             (refused("wrong_password", "wrong user name or password"), "That password isn't right."),
             (rate_limited, "Too many tries. Try again in 2 minutes."),
-            (refused("offline", "connection refused"), "Can't reach the server. Try again when this computer is online."),
+            (refused("offline", "the server is busy: too many sign-in attempts"), "the server is busy: too many sign-in attempts"),
         ] {
             let mut m = on_sign_in_form();
             m.update(Event::SubmitJoin);

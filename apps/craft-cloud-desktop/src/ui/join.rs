@@ -9,6 +9,9 @@ use crate::model::{Event, JoinForm, JoinMode, PasswordForm};
 
 /// The id name of the sign-in's password field (see `security::forget_secrets`).
 pub(super) const PASSWORD_FIELD: &str = "join-password";
+/// The id names of an invite's two password fields.
+pub(super) const INVITE_PASSWORD_FIELD: &str = "join-invite-password";
+pub(super) const INVITE_AGAIN_FIELD: &str = "join-invite-again";
 
 /// The join form; while `joining`, shown as sent (nothing can be changed or sent again).
 pub(super) fn form(ui: &mut egui::Ui, form: &mut JoinForm, joining: bool, events: &mut Vec<Event>) {
@@ -24,26 +27,26 @@ pub(super) fn form(ui: &mut egui::Ui, form: &mut JoinForm, joining: bool, events
         ui.add_space(6.0);
 
         if signing_in {
-            kit::section_label(ui, "Server");
+            let label = kit::section_label(ui, "Server");
             let field = egui::TextEdit::singleline(&mut form.server).hint_text("cloud.example.com").desired_width(f32::INFINITY);
-            enter |= submitted(ui.add(field));
+            enter |= submitted(ui.add(field).labelled_by(label.id));
             ui.add_space(4.0);
 
-            kit::section_label(ui, "Username");
-            enter |= submitted(ui.add(egui::TextEdit::singleline(&mut form.user).desired_width(f32::INFINITY)));
+            let label = kit::section_label(ui, "Username");
+            enter |= submitted(ui.add(egui::TextEdit::singleline(&mut form.user).desired_width(f32::INFINITY)).labelled_by(label.id));
             ui.add_space(4.0);
 
-            kit::section_label(ui, "Password");
+            let label = kit::section_label(ui, "Password");
             let field = egui::TextEdit::singleline(&mut form.password)
                 .id(super::security::secret_id(PASSWORD_FIELD))
                 .password(true)
                 .desired_width(f32::INFINITY);
-            enter |= submitted(ui.add(field));
+            enter |= submitted(ui.add(field).labelled_by(label.id));
             ui.label(RichText::new("If your account has two-factor sign-in, the next step asks for the code.").small().weak());
         } else {
-            kit::section_label(ui, "Join string");
+            let label = kit::section_label(ui, "Join string");
             let field = egui::TextEdit::singleline(&mut form.join).hint_text("cloud.example.com/K7M4-Q9TX").desired_width(f32::INFINITY);
-            enter |= submitted(ui.add(field));
+            enter |= submitted(ui.add(field).labelled_by(label.id));
             ui.label(RichText::new("An invite, or a code from a computer that is signed in. Pasting the link works too.").small().weak());
         }
         ui.add_space(6.0);
@@ -142,10 +145,12 @@ pub(super) fn password(ui: &mut egui::Ui, pw: &mut PasswordForm, events: &mut Ve
     ui.label("This invite is for a new account. Choose its password: you need it to sign in on the server.");
     ui.add_space(10.0);
     ui.label("Password");
-    ui.add(egui::TextEdit::singleline(&mut pw.password).password(true).desired_width(f32::INFINITY));
+    let first = egui::TextEdit::singleline(&mut pw.password).id(super::security::secret_id(INVITE_PASSWORD_FIELD));
+    ui.add(first.password(true).desired_width(f32::INFINITY));
     ui.add_space(6.0);
     ui.label("The same password again");
-    let again = ui.add(egui::TextEdit::singleline(&mut pw.again).password(true).desired_width(f32::INFINITY));
+    let second = egui::TextEdit::singleline(&mut pw.again).id(super::security::secret_id(INVITE_AGAIN_FIELD));
+    let again = ui.add(second.password(true).desired_width(f32::INFINITY));
     let enter = again.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
     ui.add_space(12.0);
     if let Some(error) = &pw.error {

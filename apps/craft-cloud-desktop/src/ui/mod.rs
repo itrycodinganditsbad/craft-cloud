@@ -143,7 +143,10 @@ fn good(ui: &egui::Ui) -> Color32 {
 
 /// The server's address without its scheme, as people say it: `cloud.shadows.ch`.
 pub fn host(server: &str) -> &str {
-    server.strip_prefix("https://").or_else(|| server.strip_prefix("http://")).unwrap_or(server).trim_end_matches('/')
+    let rest = ["https://", "http://"]
+        .iter()
+        .find_map(|scheme| server.get(..scheme.len()).filter(|start| start.eq_ignore_ascii_case(scheme)).and_then(|_| server.get(scheme.len()..)));
+    rest.unwrap_or(server).trim_end_matches('/')
 }
 
 /// How long ago `then_ms` was, at `now_ms`: "just now", "5 min ago", "3 h ago", "2 days ago".
