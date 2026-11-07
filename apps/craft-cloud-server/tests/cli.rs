@@ -167,7 +167,7 @@ impl GcServer {
         let config = Config::load(&config_path).unwrap();
         let (meta, store) = craft_cloud_server::cli::open(&config).await.unwrap();
         let user = meta.create_user("ana", "test-hash", craft_cloud_meta::Role::Admin, 0).await.unwrap();
-        let craft_cloud_server::config::StorageConfig::Disk { path: storage } = &config.storage else { panic!("init uses disk storage") };
+        let craft_cloud_server::config::StorageConfig::Disk { path: storage, .. } = &config.storage else { panic!("init uses disk storage") };
         GcServer {
             dir,
             config: config_path.to_str().unwrap().to_owned(),
@@ -935,6 +935,30 @@ async fn init_needs_behind_proxy_for_a_public_address() {
     let config = Config::load(&dir.join("config.toml")).unwrap();
     assert!(config.behind_proxy);
     assert_eq!(config.trusted_proxies, vec!["10.0.0.1".parse::<std::net::IpAddr>().unwrap()]);
+}
+
+#[tokio::test]
+async fn init_writes_the_capacity_it_is_given_and_refuses_a_bad_one() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    let dir_s = dir.to_str().unwrap();
+
+    // Without --capacity none is set, as before the option existed.
+    let plain = parent.path().join("plain");
+    cli(&["init", "--dir", plain.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    assert_eq!(Config::load(&plain.join("config.toml")).unwrap().storage.capacity(), None);
+
+    // A bad size is refused, names the flag, and leaves nothing behind.
+    for bad in ["lots", "1", "1.25 TB", "0 GB", "1 XB"] {
+        let refused = cli(&["init", "--dir", dir_s, "--admin", "ana", "--capacity", bad], "admin password 1\n").await;
+        assert!(matches!(refused, Err(CliError::Usage(ref m)) if m.contains("--capacity")), "{bad}: {refused:?}");
+        assert!(!dir.exists(), "{bad}");
+    }
+
+    cli(&["init", "--dir", dir_s, "--admin", "ana", "--capacity", "1.5 TiB"], "admin password 1\n").await.unwrap();
+    let config = Config::load(&dir.join("config.toml")).unwrap();
+    assert_eq!(config.storage.capacity(), Some(3 << 39));
+    assert!(matches!(config.storage, craft_cloud_server::config::StorageConfig::Disk { .. }));
 }
 
 #[cfg(unix)]

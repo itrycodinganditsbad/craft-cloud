@@ -25,7 +25,8 @@
 //! [storage]
 //! kind = "disk"
 //! path = "/var/lib/craft-cloud/blobs"
-//! # kind = "s3", bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http
+//! # capacity = "1 TiB"          # what the store may hold, for the admin's storage overview (needed for S3 to show a size)
+//! # kind = "s3", bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http, capacity
 //!
 //! [two_factor]                  # optional: without it, two-factor sign-in can't be set up
 //! key_file = "two-factor.key"   # 32 random bytes, made by `init`; relative to this file
@@ -276,8 +277,14 @@ pub fn redact_url(url: &str) -> String {
 pub enum StorageConfig {
     Disk {
         path: PathBuf,
+        /// How much the store may hold, for the admin's storage overview. Unset: none is shown (the overview has the disk's own size besides).
+        #[serde(default)]
+        capacity: Option<Capacity>,
     },
     S3 {
+        /// How much the bucket may hold, for the admin's storage overview. S3 has no size to ask for, so unset: none is shown.
+        #[serde(default)]
+        capacity: Option<Capacity>,
         bucket: String,
         #[serde(default)]
         prefix: String,
@@ -292,6 +299,63 @@ pub enum StorageConfig {
         #[serde(default)]
         allow_http: bool,
     },
+}
+
+/// A size in bytes written as `"1 TiB"`: a whole number or one with one decimal, then B, KB, MB, GB, TB (powers of 1000)
+/// or KiB, MiB, GiB, TiB (powers of 1024), in any case, with or without a space. At least one byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capacity(pub u64);
+
+impl Capacity {
+    /// Reads `text` as a size, or says what is wrong with it.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let bad = || {
+            format!(
+                "storage.capacity = {text:?} is not a size like \"1 TiB\" or \"500 GB\" (a number with at most one decimal, then B, KB, MB, GB, TB, KiB, MiB, GiB or TiB)"
+            )
+        };
+        let trimmed = text.trim();
+        let split = trimmed.find(|c: char| !(c.is_ascii_digit() || c == '.')).ok_or_else(bad)?;
+        let (number, unit) = trimmed.split_at(split);
+        let multiplier: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+            "b" => 1,
+            "kb" => 1_000,
+            "mb" => 1_000_000,
+            "gb" => 1_000_000_000,
+            "tb" => 1_000_000_000_000,
+            "kib" => 1 << 10,
+            "mib" => 1 << 20,
+            "gib" => 1 << 30,
+            "tib" => 1 << 40,
+            _ => return Err(bad()),
+        };
+        let (whole, tenth) = match number.split_once('.') {
+            Some((whole, tenth)) if tenth.len() == 1 => (whole, tenth),
+            Some(_) => return Err(bad()),
+            None => (number, "0"),
+        };
+        if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) || !tenth.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad());
+        }
+        let whole: u64 = whole.parse().map_err(|_| bad())?;
+        let tenth: u64 = tenth.parse().map_err(|_| bad())?;
+        // The decimal is a tenth of the unit, rounded down to a byte.
+        let bytes = whole
+            .checked_mul(multiplier)
+            .and_then(|b| b.checked_add(multiplier / 10 * tenth + (multiplier % 10) * tenth / 10))
+            .ok_or_else(|| format!("storage.capacity = {text:?} is too big (the most is about 16 EiB)"))?;
+        if bytes == 0 {
+            return Err(format!("storage.capacity = {text:?} is empty: give the size the store may hold, like \"1 TiB\""));
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl<'de> Deserialize<'de> for Capacity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
 }
 
 fn default_region() -> String {
@@ -404,10 +468,17 @@ fn describe_toml_error(text: &str, e: &toml::de::Error) -> String {
 }
 
 impl StorageConfig {
+    /// The size the config says the store may hold, in bytes.
+    pub fn capacity(&self) -> Option<u64> {
+        match self {
+            StorageConfig::Disk { capacity, .. } | StorageConfig::S3 { capacity, .. } => capacity.map(|c| c.0),
+        }
+    }
+
     /// The S3 settings, with credentials from the config or else the standard `AWS_ACCESS_KEY_ID` /
     /// `AWS_SECRET_ACCESS_KEY` environment variables. `None` for disk storage.
     pub fn s3(&self) -> Result<Option<S3Config>, ConfigError> {
-        let StorageConfig::S3 { bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http } = self else {
+        let StorageConfig::S3 { bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http, .. } = self else {
             return Ok(None);
         };
         let access_key_id = match access_key_id {
@@ -450,9 +521,77 @@ path = "/tmp/blobs"
         let c = Config::parse(DISK).unwrap();
         assert_eq!(c.listen, "127.0.0.1:8080".parse().unwrap());
         assert!(!c.behind_proxy && c.trusted_proxies.is_empty());
-        assert_eq!(c.storage, StorageConfig::Disk { path: "/tmp/blobs".into() });
+        assert_eq!(c.storage, StorageConfig::Disk { path: "/tmp/blobs".into(), capacity: None });
         assert_eq!(c.storage.s3().unwrap(), None);
         assert_eq!(c.public_url, None);
+    }
+
+    #[test]
+    fn the_capacity_is_optional_and_reads_sizes() {
+        assert_eq!(Config::parse(DISK).unwrap().storage.capacity(), None, "a config from before the option still loads");
+        let with = |value: &str| {
+            Config::parse(&DISK.replace(
+                "path = \"/tmp/blobs\"",
+                &format!(
+                    "path = \"/tmp/blobs\"
+capacity = {value}"
+                ),
+            ))
+        };
+        let bytes = |value: &str| with(value).unwrap().storage.capacity();
+        assert_eq!(bytes("\"1 TiB\""), Some(1 << 40));
+        assert_eq!(bytes("\"1TiB\""), Some(1 << 40));
+        assert_eq!(bytes("\"500 gb\""), Some(500_000_000_000));
+        assert_eq!(bytes("\"2 TB\""), Some(2_000_000_000_000));
+        assert_eq!(bytes("\"1.5 TB\""), Some(1_500_000_000_000));
+        assert_eq!(bytes("\"0.5 GiB\""), Some(1 << 29));
+        assert_eq!(bytes("\"1.5 KiB\""), Some(1536));
+        assert_eq!(bytes("\"64 B\""), Some(64));
+        assert_eq!(bytes("\"3 KB\""), Some(3000));
+        assert_eq!(bytes("\"2 MiB\""), Some(2 << 20));
+        assert_eq!(bytes("\"1 MB\""), Some(1_000_000));
+        assert_eq!(bytes("\"1 KiB\""), Some(1024));
+        assert_eq!(bytes("\"1 GB\""), Some(1_000_000_000));
+        assert_eq!(bytes("\"1 GiB\""), Some(1 << 30));
+        for bad in [
+            "\"\"",
+            "\"1\"",
+            "\"TiB\"",
+            "\"1 XB\"",
+            "\"1.25 TB\"",
+            "\"1. TB\"",
+            "\".5 TB\"",
+            "\"-1 TB\"",
+            "\"1e3 GB\"",
+            "\"0 B\"",
+            "\"0.0 TB\"",
+            "\"99999999 TiB\"",
+            "1000",
+            "true",
+        ] {
+            assert!(matches!(with(bad), Err(ConfigError::Parse(_))), "{bad}");
+        }
+        let shown = with("\"1 XB\"").unwrap_err().to_string();
+        assert!(shown.contains("storage.capacity") && shown.contains("1 XB") && shown.contains("line"), "{shown}");
+        // S3 takes it too; without it S3 shows no size.
+        let s3 = "listen = \"127.0.0.1:8080\"
+[database]
+url = \"sqlite:/tmp/meta.db\"
+[storage]
+kind = \"s3\"
+bucket = \"b\"
+";
+        assert_eq!(Config::parse(s3).unwrap().storage.capacity(), None);
+        assert_eq!(
+            Config::parse(&format!(
+                "{s3}capacity = \"10 TB\"
+"
+            ))
+            .unwrap()
+            .storage
+            .capacity(),
+            Some(10_000_000_000_000)
+        );
     }
 
     #[test]

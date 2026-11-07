@@ -1200,6 +1200,8 @@ async fn admin_calls_reach_the_servers_admin_api_and_pass_its_answers_through() 
     let overview: AdminStorageOverview = serde_json::from_str(&body).unwrap();
     assert_eq!(overview.accounts, 2);
     assert_eq!(overview.stored_bytes, 0);
+    // The room the server reports travels through the agent as well.
+    assert_eq!(overview.store_kind.as_deref(), Some("disk"));
     let (code, body) = call(&api, "GET", &format!("{ana_path}/usage"), "");
     assert_eq!(code, 200, "{body}");
     let usage: AccountUsage = serde_json::from_str(&body).unwrap();
