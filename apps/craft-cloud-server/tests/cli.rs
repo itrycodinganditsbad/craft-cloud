@@ -949,7 +949,7 @@ async fn init_writes_the_capacity_it_is_given_and_refuses_a_bad_one() {
     assert_eq!(Config::load(&plain.join("config.toml")).unwrap().storage.capacity(), None);
 
     // A bad size is refused, names the flag, and leaves nothing behind.
-    for bad in ["lots", "1", "1.25 TB", "0 GB", "1 XB"] {
+    for bad in ["lots", "1.5", "1.25 TB", "0 GB", "1 XB"] {
         let refused = cli(&["init", "--dir", dir_s, "--admin", "ana", "--capacity", bad], "admin password 1\n").await;
         assert!(matches!(refused, Err(CliError::Usage(ref m)) if m.contains("--capacity")), "{bad}: {refused:?}");
         assert!(!dir.exists(), "{bad}");

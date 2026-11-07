@@ -30,7 +30,8 @@ For Postgres or S3, edit `[database]` and `[storage]` in `config.toml`.
 The admin's storage overview (`GET /admin/storage`, shown by the Craft Cloud app) tells how much room the server has.
 Say how much the blob store may hold with `capacity` in `[storage]`, as a size such as `"1 TiB"` or `"500 GB"`: a whole
 number or one with one decimal (`"1.5 TB"`), then `B`, `KB`, `MB`, `GB`, `TB` (powers of 1000) or `KiB`, `MiB`, `GiB`, `TiB`
-(powers of 1024). Anything else, and zero, stops the server from starting with a message that names the setting.
+(powers of 1024). A plain positive integer is a number of bytes, as for `stored_bytes_per_user`. Anything else, and
+zero, stops the server from starting with a message that names the setting.
 
 ```toml
 [storage]

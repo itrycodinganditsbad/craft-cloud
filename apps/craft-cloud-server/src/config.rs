@@ -302,7 +302,8 @@ pub enum StorageConfig {
 }
 
 /// A size in bytes written as `"1 TiB"`: a whole number or one with one decimal, then B, KB, MB, GB, TB (powers of 1000)
-/// or KiB, MiB, GiB, TiB (powers of 1024), in any case, with or without a space. At least one byte.
+/// or KiB, MiB, GiB, TiB (powers of 1024), in any case, with or without a space. Or a plain positive integer, in bytes.
+/// At least one byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capacity(pub u64);
 
@@ -315,6 +316,15 @@ impl Capacity {
             )
         };
         let trimmed = text.trim();
+        // A plain whole number is bytes.
+        if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            let bytes: u64 = trimmed.parse().map_err(|_| format!("storage.capacity = {text:?} is too big (the most is about 16 EiB)"))?;
+            return if bytes == 0 {
+                Err(format!("storage.capacity = {text:?} is empty: give the size the store may hold, like \"1 TiB\""))
+            } else {
+                Ok(Self(bytes))
+            };
+        }
         let split = trimmed.find(|c: char| !(c.is_ascii_digit() || c == '.')).ok_or_else(bad)?;
         let (number, unit) = trimmed.split_at(split);
         let multiplier: u64 = match unit.trim().to_ascii_lowercase().as_str() {
@@ -353,8 +363,27 @@ impl Capacity {
 
 impl<'de> Deserialize<'de> for Capacity {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        Self::parse(&text).map_err(serde::de::Error::custom)
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Capacity;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a size like \"1 TiB\" or a number of bytes")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Capacity, E> {
+                Capacity::parse(text).map_err(E::custom)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, bytes: u64) -> Result<Capacity, E> {
+                Capacity::parse(&bytes.to_string()).map_err(E::custom)
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, bytes: i64) -> Result<Capacity, E> {
+                Capacity::parse(&bytes.to_string()).map_err(E::custom)
+            }
+        }
+        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -540,6 +569,9 @@ capacity = {value}"
         };
         let bytes = |value: &str| with(value).unwrap().storage.capacity();
         assert_eq!(bytes("\"1 TiB\""), Some(1 << 40));
+        assert_eq!(bytes("1000"), Some(1000), "an integer is bytes");
+        assert_eq!(bytes("\"1000\""), Some(1000));
+        assert_eq!(bytes("1_099_511_627_776"), Some(1 << 40));
         assert_eq!(bytes("\"1TiB\""), Some(1 << 40));
         assert_eq!(bytes("\"500 gb\""), Some(500_000_000_000));
         assert_eq!(bytes("\"2 TB\""), Some(2_000_000_000_000));
@@ -555,7 +587,11 @@ capacity = {value}"
         assert_eq!(bytes("\"1 GiB\""), Some(1 << 30));
         for bad in [
             "\"\"",
-            "\"1\"",
+            "\"1.5\"",
+            "0",
+            "-5",
+            "1.5",
+            "\"-5\"",
             "\"TiB\"",
             "\"1 XB\"",
             "\"1.25 TB\"",
@@ -566,7 +602,6 @@ capacity = {value}"
             "\"0 B\"",
             "\"0.0 TB\"",
             "\"99999999 TiB\"",
-            "1000",
             "true",
         ] {
             assert!(matches!(with(bad), Err(ConfigError::Parse(_))), "{bad}");

@@ -1350,6 +1350,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hmac",
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",

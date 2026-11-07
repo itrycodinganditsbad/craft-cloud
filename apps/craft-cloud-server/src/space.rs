@@ -71,11 +71,17 @@ impl StorageInfo {
 pub fn sqlite_file(url: &str) -> Option<PathBuf> {
     let rest = url.strip_prefix("sqlite:")?;
     let rest = rest.strip_prefix("//").unwrap_or(rest);
-    let path = rest.split('?').next().unwrap_or_default();
-    if path.is_empty() || path == ":memory:" || path.starts_with(":memory:") {
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    // `mode=memory` makes any name an in-memory database.
+    if query.split('&').any(|pair| pair.split_once('=').is_some_and(|(key, value)| key == "mode" && value == "memory")) {
         return None;
     }
-    Some(PathBuf::from(path))
+    if path.is_empty() || path.starts_with(":memory:") {
+        return None;
+    }
+    // As sqlx reads it: the path is percent-decoded, so a `?` or `#` can be in a file name.
+    let decoded = percent_encoding::percent_decode_str(path).decode_utf8().ok()?;
+    Some(PathBuf::from(decoded.as_ref()))
 }
 
 /// Total and available bytes of the filesystem holding `dir`.
@@ -86,12 +92,13 @@ fn filesystem(dir: &Path) -> (Option<u64>, Option<u64>) {
         tracing::debug!(dir = %dir.display(), "the directory to measure is not there");
         return (None, None);
     }
-    let total = fs4::total_space(dir);
-    let free = fs4::available_space(dir);
-    if let Some(e) = total.as_ref().err().or(free.as_ref().err()) {
-        tracing::debug!(dir = %dir.display(), error = %e, "can't read the size of a filesystem");
+    match fs4::statvfs(dir) {
+        Ok(stats) => (Some(stats.total_space()), Some(stats.available_space())),
+        Err(e) => {
+            tracing::debug!(dir = %dir.display(), error = %e, "can't read the size of a filesystem");
+            (None, None)
+        }
     }
-    (total.ok(), free.ok())
 }
 
 /// The database file's size plus its write-ahead log and shared-memory file when they exist. `None` when the main
@@ -118,7 +125,16 @@ mod tests {
         assert_eq!(sqlite_file("sqlite:meta.db"), Some(PathBuf::from("meta.db")));
         assert_eq!(sqlite_file("sqlite:///var/lib/meta.db?mode=rwc"), Some(PathBuf::from("/var/lib/meta.db")));
         assert_eq!(sqlite_file("sqlite:C:/cc/meta.db"), Some(PathBuf::from("C:/cc/meta.db")));
-        for none in ["sqlite::memory:", "sqlite:", "postgres://u:p@host/db", "mysql://x"] {
+        assert_eq!(sqlite_file("sqlite:/srv/a%20b/meta.db"), Some(PathBuf::from("/srv/a b/meta.db")));
+        assert_eq!(sqlite_file("sqlite:/srv/a%3Fb.db?mode=rwc"), Some(PathBuf::from("/srv/a?b.db")));
+        for none in [
+            "sqlite:meta.db?mode=memory",
+            "sqlite:meta.db?cache=shared&mode=memory",
+            "sqlite::memory:",
+            "sqlite:",
+            "postgres://u:p@host/db",
+            "mysql://x",
+        ] {
             assert_eq!(sqlite_file(none), None, "{none}");
         }
     }
