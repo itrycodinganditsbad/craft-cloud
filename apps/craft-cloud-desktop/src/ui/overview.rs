@@ -82,7 +82,10 @@ fn cell(ui: &mut egui::Ui, number: &str, tone: Tone, right: impl FnOnce(&mut egu
         egui::Frame::new().inner_margin(egui::Margin::same(16)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 10.0;
-            body(ui);
+            // `ui.columns` lays its columns out top-down *justified*, and egui then justifies wrapped label text too (the
+            // words spread to the full width, a long unbreakable path stretches letter by letter). A plain top-down layout
+            // keeps text left-aligned; what should fill the width (the wide button) sizes itself.
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), body);
         });
     });
 }

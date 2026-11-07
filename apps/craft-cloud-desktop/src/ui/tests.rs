@@ -1228,6 +1228,19 @@ fn snapshot_smallest_window() {
     snapshot_sized(admin, egui::Theme::Dark, "tab-admin-smallest-dark", MIN_WINDOW_SIZE);
 }
 
+/// A long warning with an unbreakable path in the sync cell stays left-aligned: the cells sit in `ui.columns`, whose
+/// justified layout once spread the words and, on a long path, single letters across the line.
+#[test]
+fn snapshot_overview_long_autostart_warning() {
+    let mut model = overview_model();
+    model.autostart_problem = Some(format!(
+        "This computer won't sync after a restart: starting at login couldn't be turned on (this agent uses its own data folder ({}): only the agent with the default data folder starts at login, so its entry is left as it is)",
+        r"C:\Users\Mattis\AppData\Local\Temp\craft-cloud-codex-ui2-20261107\profile-A\agent"
+    ));
+    snapshot_sized(model.clone(), egui::Theme::Dark, "tab-overview-long-warning-960-dark", WINDOW_SIZE);
+    snapshot_sized(model, egui::Theme::Dark, "tab-overview-long-warning-640-dark", MIN_WINDOW_SIZE);
+}
+
 /// The footer's Sign out works on the pages that don't carry the signed-in view, too.
 #[test]
 fn the_footers_sign_out_works_on_trash_and_versions() {
