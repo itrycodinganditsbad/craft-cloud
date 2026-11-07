@@ -608,7 +608,7 @@ fn times_and_addresses_read_as_people_say_them() {
 
 // ---- the admin pages ----
 
-use crate::admin::{Action, AdminEvent, CodeKind, RoleChoice, View};
+use crate::admin::{Action, AdminEvent, CodeKind, RoleChoice, Section, View};
 use crate::agent::fake::sample_user;
 use craft_cloud_app::AdminUserInfo;
 
@@ -677,7 +677,6 @@ fn snapshot_admin_pages() {
     let mut model = on_admin_pages(&agent, Vec::new());
     snapshot(model.clone(), egui::Theme::Light, "admin-users");
     snapshot(model.clone(), egui::Theme::Dark, "admin-users-dark");
-    snapshot(model.clone(), egui::Theme::Light, "admin-storage");
 
     model.update(Event::Admin(AdminEvent::NewUser));
     if let Screen::Admin(admin) = &mut model.screen
@@ -728,6 +727,144 @@ fn snapshot_admin_pages() {
     let code = model.admin_screen().unwrap().code.clone().unwrap();
     assert_eq!((code.username.as_str(), code.kind), ("dora", CodeKind::Invite));
     snapshot(model, egui::Theme::Light, "admin-invite-code");
+}
+
+/// The model on the Storage tab, with the server's storage overview changed by `f` (the fake sends none of the room's
+/// numbers, as an older server does).
+fn storage_tab(agent: &FakeAgent, f: impl FnOnce(&mut craft_cloud_app::AdminStorageOverview)) -> Model {
+    let mut model = on_admin_pages(agent, vec![Event::Admin(AdminEvent::Show(Section::Storage))]);
+    let Screen::Admin(admin) = &mut model.screen else { panic!("{:?}", model.screen) };
+    assert_eq!(admin.section, Section::Storage);
+    let mut overview = admin.storage.clone().unwrap();
+    f(&mut overview);
+    admin.storage = Some(overview);
+    model
+}
+
+const GIB: u64 = 1 << 30;
+
+fn disk_with_capacity(o: &mut craft_cloud_app::AdminStorageOverview) {
+    o.store_kind = Some("disk".into());
+    o.capacity_bytes = Some(20 * GIB);
+    o.store_fs_total_bytes = Some(500 * GIB);
+    o.store_fs_free_bytes = Some(300 * GIB);
+    o.server_fs_total_bytes = Some(80 * GIB);
+    o.server_fs_free_bytes = Some(74 * GIB);
+    o.database_bytes = Some(2 * GIB);
+}
+
+fn s3(o: &mut craft_cloud_app::AdminStorageOverview) {
+    o.store_kind = Some("s3".into());
+}
+
+#[test]
+fn snapshot_admin_storage() {
+    let agent = admin_agent();
+    let disk = storage_tab(&agent, disk_with_capacity);
+    snapshot(disk.clone(), egui::Theme::Light, "admin-storage");
+    snapshot(disk, egui::Theme::Dark, "admin-storage-dark");
+    snapshot(
+        storage_tab(&agent, |o| {
+            disk_with_capacity(o);
+            o.capacity_bytes = None;
+        }),
+        egui::Theme::Light,
+        "admin-storage-disk-no-capacity",
+    );
+    // 4.7 GiB stored of 5 GiB is past the warning share.
+    snapshot(
+        storage_tab(&agent, |o| {
+            s3(o);
+            o.capacity_bytes = Some(5 * GIB);
+            o.database_bytes = Some(GIB);
+            o.server_fs_total_bytes = Some(80 * GIB);
+            o.server_fs_free_bytes = Some(70 * GIB);
+        }),
+        egui::Theme::Dark,
+        "admin-storage-s3-near-dark",
+    );
+    snapshot(storage_tab(&agent, s3), egui::Theme::Light, "admin-storage-s3-no-capacity");
+    snapshot(storage_tab(&agent, |_| {}), egui::Theme::Light, "admin-storage-old-server");
+    // Postgres: the store's numbers are there, the server's disk and the database's size are not.
+    snapshot(
+        storage_tab(&agent, |o| {
+            disk_with_capacity(o);
+            o.server_fs_total_bytes = None;
+            o.server_fs_free_bytes = None;
+            o.database_bytes = None;
+        }),
+        egui::Theme::Light,
+        "admin-storage-postgres",
+    );
+    snapshot_sized(storage_tab(&agent, disk_with_capacity), egui::Theme::Light, "admin-storage-smallest-light", MIN_WINDOW_SIZE);
+}
+
+/// What the storage block says, as text: the numbers, the warning, and the hints where a number is missing.
+#[test]
+fn the_storage_block_says_what_it_knows_and_hints_at_what_it_does_not() {
+    let agent = admin_agent();
+    let count = |model: Model, label: &str| {
+        let mut h = harness(model, egui::Theme::Light);
+        h.run_steps(3);
+        h.query_all_by_label(label).count()
+    };
+    let hint = "Capacity not set: add capacity to the [storage] section of the server's configuration to see how full the store is. An S3 store has no size of its own.";
+    // A disk store with capacity: stored of the capacity, free; no warning, no hint.
+    let model = storage_tab(&agent, disk_with_capacity);
+    assert_eq!(count(model.clone(), "Near capacity"), 0);
+    assert_eq!(count(model.clone(), "OK"), 2, "the server disk and the store");
+    assert_eq!(count(model.clone(), hint), 0);
+    assert_eq!(count(model, "stored of 20 GiB · 15.3 GiB free"), 1, "the capacity less what is stored, as the disk has more room");
+    // S3 without capacity: the hint, a dash for the store's numbers, and nothing near.
+    let model = storage_tab(&agent, s3);
+    assert_eq!(count(model.clone(), hint), 1);
+    assert_eq!(count(model.clone(), "Near capacity") + count(model.clone(), "OK"), 0);
+    assert_eq!(count(model, "stored · no size to measure it against"), 1);
+    // An old server: no numbers, no wrong ones.
+    let model = storage_tab(&agent, |_| {});
+    assert_eq!(count(model.clone(), "This server doesn't report its room: it may be older, or the disk could not be read."), 1);
+    assert_eq!(count(model, "database size not reported"), 1);
+    // S3 with capacity: against the capacity set.
+    let model = storage_tab(&agent, |o| {
+        s3(o);
+        o.capacity_bytes = Some(10 * GIB);
+    });
+    assert_eq!(count(model.clone(), "stored of 10 GiB · 5.3 GiB free"), 1);
+    assert_eq!(count(model, "OK"), 1, "the store; the server disk has no numbers");
+}
+
+/// The warning starts at 90 %: 899 of 1000 bytes is "OK", 900 is a warning.
+#[test]
+fn the_storage_block_warns_from_ninety_percent() {
+    let agent = admin_agent();
+    for (stored, near) in [(899, false), (900, true), (1000, true)] {
+        let model = storage_tab(&agent, |o| {
+            s3(o);
+            o.stored_bytes = stored;
+            o.capacity_bytes = Some(1000);
+        });
+        let mut h = harness(model, egui::Theme::Light);
+        h.run_steps(3);
+        assert_eq!(h.query_all_by_label("Near capacity").count(), usize::from(near), "{stored}");
+        assert_eq!(h.query_all_by_label(&format!("{} %", stored / 10)).count(), usize::from(near), "{stored}");
+        assert_eq!(h.query_all_by_label("OK").count(), usize::from(!near), "{stored}");
+    }
+}
+
+/// The tabs of the landing page send their events.
+#[test]
+fn the_landing_tabs_send_their_events() {
+    let agent = admin_agent();
+    let mut h = harness(on_admin_pages(&agent, Vec::new()), egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_label("Storage").click();
+    h.run_steps(2);
+    h.get_by_label("Accounts").click();
+    h.run_steps(2);
+    assert_eq!(
+        std::mem::take(&mut h.state_mut().1),
+        [Event::Admin(AdminEvent::Show(Section::Storage)), Event::Admin(AdminEvent::Show(Section::Accounts))]
+    );
 }
 
 #[test]
@@ -1226,6 +1363,10 @@ fn snapshot_smallest_window() {
     snapshot_sized(overview_model(), egui::Theme::Light, "tab-overview-smallest-light", MIN_WINDOW_SIZE);
     let admin = on_admin_pages(&admin_agent(), Vec::new());
     snapshot_sized(admin, egui::Theme::Dark, "tab-admin-smallest-dark", MIN_WINDOW_SIZE);
+    let agent = admin_agent();
+    let ana = id_of(&on_admin_pages(&agent, Vec::new()), "ana");
+    let account = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(ana))]);
+    snapshot_sized(account, egui::Theme::Light, "admin-account-smallest-light", MIN_WINDOW_SIZE);
 }
 
 /// A long warning with an unbreakable path in the sync cell stays left-aligned: the cells sit in `ui.columns`, whose

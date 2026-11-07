@@ -415,6 +415,14 @@ pub enum View {
     Audit(Box<crate::audit::AuditView>),
 }
 
+/// Which part of the admin landing page is shown: the accounts, or the server's storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Section {
+    #[default]
+    Accounts,
+    Storage,
+}
+
 /// The admin pages.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdminScreen {
@@ -428,6 +436,8 @@ pub struct AdminScreen {
     pub storage_error: Option<String>,
     storage_ticket: u64,
     pub view: View,
+    /// The part of the list page that is shown.
+    pub section: Section,
     /// A change waiting for the admin's password.
     pub dialog: Option<Dialog>,
     /// A code just made, until it is dismissed.
@@ -473,6 +483,8 @@ pub enum AdminEvent {
     /// [`Effect::AdminDo`]'s answer.
     Done(Result<Outcome, Error>),
 
+    /// The Accounts or Storage tab of the list page.
+    Show(Section),
     /// The Administration button.
     Open,
     /// Back to the signed-in view.
@@ -575,6 +587,7 @@ impl Model {
             storage_error: None,
             storage_ticket: 0,
             view: View::List,
+            section: Section::Accounts,
             dialog: None,
             code: None,
         };
@@ -595,6 +608,10 @@ impl AdminScreen {
     fn update(&mut self, event: AdminEvent) -> Vec<Effect> {
         match event {
             AdminEvent::Account { .. } | AdminEvent::Open | AdminEvent::Close => Vec::new(),
+            AdminEvent::Show(section) => {
+                self.section = section;
+                Vec::new()
+            }
             AdminEvent::Server { session, result } => {
                 if session != self.overview.session {
                     return Vec::new();
@@ -1040,6 +1057,137 @@ pub fn format_bytes(bytes: u64) -> String {
     let number = if unit == 0 || value >= 100.0 { format!("{value:.0}") } else { format!("{value:.1}") };
     let number = if number.contains('.') { number.trim_end_matches('0').trim_end_matches('.').to_owned() } else { number };
     format!("{number} {}", UNITS.get(unit).copied().unwrap_or("B"))
+}
+
+/// The share of a store, a disk or the capacity, in percent, from which the pages warn. It is the server's own line for an
+/// account that is near its quota (`accounts_near_quota`).
+pub const WARN_PERCENT: u64 = 90;
+
+/// How much of something is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Room {
+    pub used: u64,
+    pub total: u64,
+}
+
+impl Room {
+    /// The share used, in whole percent (0 for a room without a size); it can pass 100.
+    pub fn percent(self) -> u64 {
+        if self.total == 0 {
+            return 0;
+        }
+        u64::try_from(u128::from(self.used) * 100 / u128::from(self.total)).unwrap_or(u64::MAX)
+    }
+
+    /// The share used, 0.0 to 1.0, for a bar.
+    pub fn fraction(self) -> f32 {
+        if self.total == 0 { 0.0 } else { (self.used as f64 / self.total as f64).clamp(0.0, 1.0) as f32 }
+    }
+
+    /// Whether at least [`WARN_PERCENT`] is used. A room without a size is never near.
+    pub fn near(self) -> bool {
+        self.total > 0 && u128::from(self.used) * 100 >= u128::from(self.total) * u128::from(WARN_PERCENT)
+    }
+
+    /// Whether all of it is used.
+    pub fn full(self) -> bool {
+        self.total > 0 && self.used >= self.total
+    }
+}
+
+/// What the overview says about the one store the server has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreRoom {
+    /// A disk store: the used and total bytes of its filesystem. `capacity` is the size the admin set, if any.
+    Filesystem { kind: String, room: Room, capacity: Option<u64> },
+    /// A store that has only the capacity the admin set (S3), or a disk whose filesystem could not be read.
+    Capacity { kind: String, room: Room },
+    /// A store with no size to show (S3 or memory without `capacity` in `[storage]`).
+    NoCapacity { kind: String },
+    /// An older server that doesn't say, or a disk with no numbers at all.
+    Unknown,
+}
+
+impl StoreRoom {
+    /// The room that is measured, if there is one.
+    pub fn room(&self) -> Option<Room> {
+        match self {
+            Self::Filesystem { room, .. } | Self::Capacity { room, .. } => Some(*room),
+            Self::NoCapacity { .. } | Self::Unknown => None,
+        }
+    }
+}
+
+/// The server storage block of the admin pages, worked out from [`AdminStorageOverview`]. Every number the server left out
+/// (an older server, Postgres, S3's filesystem) is `None` here and shown as missing, never as zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageBlock {
+    /// What the accounts have stored (the overview's `stored_bytes`).
+    pub stored: u64,
+    /// What it is measured against: the capacity set, else the store's filesystem.
+    pub capacity: Option<u64>,
+    /// What is left of it.
+    pub free: Option<u64>,
+    /// The filesystem of the server's own data, with the database's size.
+    pub server_disk: Option<Room>,
+    pub database_bytes: Option<u64>,
+    pub store: StoreRoom,
+}
+
+/// A filesystem's used and total bytes from its total and free bytes; `None` if either is missing or the total is 0.
+fn filesystem(total: Option<u64>, free: Option<u64>) -> Option<Room> {
+    let (total, free) = (total?, free?);
+    (total > 0).then(|| Room { used: total.saturating_sub(free), total })
+}
+
+impl StorageBlock {
+    pub fn of(overview: &AdminStorageOverview) -> Self {
+        let stored = overview.stored_bytes;
+        // A capacity of 0 can't be (the server refuses it): it reads as not set rather than as a division by nothing.
+        let capacity = overview.capacity_bytes.filter(|capacity| *capacity > 0);
+        let store_fs = filesystem(overview.store_fs_total_bytes, overview.store_fs_free_bytes);
+        let kind = overview.store_kind.clone().unwrap_or_default();
+        let store = match (kind.as_str(), store_fs, capacity) {
+            // Only a disk store has a filesystem of its own to read.
+            ("disk" | "", Some(room), capacity) => StoreRoom::Filesystem { kind: "disk".into(), room, capacity },
+            ("disk", None, Some(total)) => StoreRoom::Capacity { kind: kind.clone(), room: Room { used: stored, total } },
+            ("" | "disk", None, None) => StoreRoom::Unknown,
+            (_, _, Some(total)) => StoreRoom::Capacity { kind: kind.clone(), room: Room { used: stored, total } },
+            (_, _, None) => StoreRoom::NoCapacity { kind: kind.clone() },
+        };
+        let total = capacity.or(match &store {
+            StoreRoom::Filesystem { room, .. } => Some(room.total),
+            _ => None,
+        });
+        // Free is what is left of the capacity; a disk can be fuller than that (other data on it), so the smaller one counts.
+        let on_disk = match &store {
+            StoreRoom::Filesystem { room, .. } => Some(room.total.saturating_sub(room.used)),
+            _ => None,
+        };
+        let free = match (capacity.map(|capacity| capacity.saturating_sub(stored)), on_disk) {
+            (Some(left), Some(on_disk)) => Some(left.min(on_disk)),
+            (Some(left), None) => Some(left),
+            (None, on_disk) => on_disk,
+        };
+        Self {
+            stored,
+            capacity: total,
+            free,
+            server_disk: filesystem(overview.server_fs_total_bytes, overview.server_fs_free_bytes),
+            database_bytes: overview.database_bytes,
+            store,
+        }
+    }
+
+    /// What the stored bytes are of, if there is a size to measure them against.
+    pub fn all(&self) -> Option<Room> {
+        self.capacity.map(|total| Room { used: self.stored, total })
+    }
+
+    /// How many of the rows (the server disk, the store) are at or past the warning share.
+    pub fn near_count(&self) -> usize {
+        [self.server_disk, self.store.room()].into_iter().flatten().filter(|room| room.near()).count()
+    }
 }
 
 impl From<AdminEvent> for Event {
@@ -1704,5 +1852,132 @@ pub(crate) mod tests {
         }
         assert_eq!(boss.resets.lock().unwrap().as_slice(), [false, true], "the flag goes with the reset code");
         assert!(Action::IssueReset { id: ana.id, username: "x".into(), reset_two_factor: true }.explain().contains("turns the account's two-factor"));
+    }
+}
+
+#[cfg(test)]
+mod storage_block_tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    fn overview(f: impl FnOnce(&mut AdminStorageOverview)) -> StorageBlock {
+        let mut overview = AdminStorageOverview { stored_bytes: 100 * GIB, ..Default::default() };
+        f(&mut overview);
+        StorageBlock::of(&overview)
+    }
+
+    #[test]
+    fn a_disk_store_with_capacity_is_measured_against_the_capacity() {
+        let block = overview(|o| {
+            o.store_kind = Some("disk".into());
+            o.capacity_bytes = Some(400 * GIB);
+            o.store_fs_total_bytes = Some(1000 * GIB);
+            o.store_fs_free_bytes = Some(600 * GIB);
+            o.server_fs_total_bytes = Some(80 * GIB);
+            o.server_fs_free_bytes = Some(70 * GIB);
+            o.database_bytes = Some(GIB);
+        });
+        assert_eq!(block.all(), Some(Room { used: 100 * GIB, total: 400 * GIB }));
+        assert_eq!(block.free, Some(300 * GIB), "what is left of the capacity");
+        assert_eq!(
+            block.store,
+            StoreRoom::Filesystem { kind: "disk".into(), room: Room { used: 400 * GIB, total: 1000 * GIB }, capacity: Some(400 * GIB) }
+        );
+        assert_eq!(block.server_disk, Some(Room { used: 10 * GIB, total: 80 * GIB }));
+        assert_eq!(block.database_bytes, Some(GIB));
+    }
+
+    #[test]
+    fn a_disk_that_is_fuller_than_its_capacity_says_free_by_the_disk() {
+        let block = overview(|o| {
+            o.store_kind = Some("disk".into());
+            o.capacity_bytes = Some(400 * GIB);
+            o.store_fs_total_bytes = Some(1000 * GIB);
+            o.store_fs_free_bytes = Some(50 * GIB);
+        });
+        assert_eq!(block.free, Some(50 * GIB));
+    }
+
+    #[test]
+    fn a_disk_store_without_capacity_is_measured_against_its_filesystem() {
+        let block = overview(|o| {
+            o.store_kind = Some("disk".into());
+            o.store_fs_total_bytes = Some(1000 * GIB);
+            o.store_fs_free_bytes = Some(600 * GIB);
+        });
+        assert_eq!(block.capacity, Some(1000 * GIB));
+        assert_eq!(block.free, Some(600 * GIB));
+        assert_eq!(block.all(), Some(Room { used: 100 * GIB, total: 1000 * GIB }));
+        assert!(matches!(block.store, StoreRoom::Filesystem { capacity: None, .. }));
+    }
+
+    #[test]
+    fn an_s3_store_with_capacity_is_stored_against_the_capacity() {
+        let block = overview(|o| {
+            o.store_kind = Some("s3".into());
+            o.capacity_bytes = Some(200 * GIB);
+        });
+        assert_eq!(block.store, StoreRoom::Capacity { kind: "s3".into(), room: Room { used: 100 * GIB, total: 200 * GIB } });
+        assert_eq!((block.capacity, block.free), (Some(200 * GIB), Some(100 * GIB)));
+    }
+
+    #[test]
+    fn an_s3_store_without_capacity_has_no_size_and_no_free() {
+        let block = overview(|o| o.store_kind = Some("s3".into()));
+        assert_eq!(block.store, StoreRoom::NoCapacity { kind: "s3".into() });
+        assert_eq!((block.capacity, block.free, block.all()), (None, None, None));
+        assert_eq!(block.stored, 100 * GIB, "what is stored is still known");
+        assert_eq!(block.near_count(), 0);
+    }
+
+    #[test]
+    fn an_old_server_leaves_everything_unknown() {
+        let block = overview(|_| {});
+        assert_eq!(block.store, StoreRoom::Unknown);
+        assert_eq!((block.capacity, block.free, block.server_disk, block.database_bytes), (None, None, None, None));
+        assert_eq!(block.near_count(), 0);
+    }
+
+    #[test]
+    fn postgres_has_no_database_size_or_server_disk() {
+        let block = overview(|o| {
+            o.store_kind = Some("disk".into());
+            o.store_fs_total_bytes = Some(1000 * GIB);
+            o.store_fs_free_bytes = Some(600 * GIB);
+        });
+        assert_eq!((block.server_disk, block.database_bytes), (None, None));
+        assert!(block.store.room().is_some(), "the store's own numbers stay");
+    }
+
+    #[test]
+    fn a_filesystem_with_only_half_its_numbers_or_none_in_size_is_left_out() {
+        let block = overview(|o| {
+            o.store_kind = Some("disk".into());
+            o.store_fs_total_bytes = Some(1000 * GIB);
+            o.server_fs_total_bytes = Some(0);
+            o.server_fs_free_bytes = Some(0);
+            o.capacity_bytes = Some(0);
+        });
+        assert_eq!(block.store, StoreRoom::Unknown, "no free bytes, and a capacity of 0 is not one");
+        assert_eq!((block.server_disk, block.capacity), (None, None));
+    }
+
+    #[test]
+    fn the_warning_starts_at_ninety_percent() {
+        let room = |used| Room { used, total: 1000 };
+        assert!(!room(899).near());
+        assert!(room(900).near());
+        assert!(room(1000).near() && room(1000).full());
+        assert!(room(1500).near() && room(1500).full());
+        assert_eq!((room(899).percent(), room(900).percent(), room(1500).percent()), (89, 90, 150));
+        assert!(!Room { used: 5, total: 0 }.near(), "no size, no warning");
+        assert_eq!(Room { used: 5, total: 0 }.percent(), 0);
+        assert!(Room { used: u64::MAX, total: u64::MAX }.near(), "no overflow at the top");
+        let block = overview(|o| {
+            o.store_kind = Some("s3".into());
+            o.capacity_bytes = Some(110 * GIB);
+        });
+        assert_eq!(block.near_count(), 1, "100 of 110 GiB is 90 %");
     }
 }
