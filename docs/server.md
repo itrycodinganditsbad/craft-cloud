@@ -25,6 +25,32 @@ For a non-loopback `--listen`, `init` also needs `--behind-proxy` and the proxy'
 
 For Postgres or S3, edit `[database]` and `[storage]` in `config.toml`.
 
+### Storage capacity
+
+The admin's storage overview (`GET /admin/storage`, shown by the Craft Cloud app) tells how much room the server has.
+Say how much the blob store may hold with `capacity` in `[storage]`, as a size such as `"1 TiB"` or `"500 GB"`: a whole
+number or one with one decimal (`"1.5 TB"`), then `B`, `KB`, `MB`, `GB`, `TB` (powers of 1000) or `KiB`, `MiB`, `GiB`, `TiB`
+(powers of 1024). A plain positive integer is a number of bytes, as for `stored_bytes_per_user`. Anything else, and
+zero, stops the server from starting with a message that names the setting.
+
+```toml
+[storage]
+kind = "disk"
+path = "/var/lib/craft-cloud/blobs"
+capacity = "1 TiB"
+```
+
+- `init` makes a disk store and takes the size as `--capacity "1 TiB"` (it asks nothing: its only input is the password
+  on standard input, so it can run in a script). Without `--capacity` none is written. For an S3 store, which `init` does
+  not make, add `capacity` to `[storage]` by hand: S3 has no size to ask for, so the capacity you set is the only size the
+  overview can show for it. A server without `capacity` starts as before and shows no capacity.
+- For a disk store the overview also has the total and free bytes of the filesystem that holds the store's directory.
+  For the server's own data (the SQLite file) it has the total and free bytes of its filesystem and the size of the
+  database, including its `-wal` and `-shm` files. With Postgres it has none of these: the database server's disk is not
+  the server's to measure. "Free" is what the server's own user may still use.
+- The numbers are read when the overview is asked for, with a filesystem query each and without scanning the stored
+  data. The capacity is information only: the server does not refuse uploads when the store is full or past the capacity.
+
 `init` also makes `two-factor.key` next to `config.toml` and names it in the config (`[two_factor] key_file`). It is the key
 for two-factor sign-in (below). **Back it up, apart from your database backups.**
 
@@ -146,7 +172,7 @@ curl -s -X POST https://cloud.example.org/api/v1/admin/users/USER_ID/disable \
   database and storage, nothing else. `GET /admin/users` lists accounts 50 at a time (`limit` up to 200, `cursor` from
   the last answer's `next`, `query` to find a username).
 - `GET /admin/storage` returns bounded storage totals, effective quota totals and near/over-quota counts, the ten
-  largest accounts, and manifest-index counts. `GET /admin/users/{id}/usage` returns one account's stored bytes,
+  largest accounts, manifest-index counts, and the room the server has (see "Storage capacity"). `GET /admin/users/{id}/usage` returns one account's stored bytes,
   effective quota, and labeled trash/history estimates; unknown and removed accounts return `404 not_found`.
 - `POST /admin/users` makes an account (role `admin` or `member`) with no password and gives an **invite**, shown once:
   the person chooses their password when they join with it (a whole join link is included when `public_url` is set).
@@ -303,7 +329,9 @@ with `[two_factor] key_file` in `config.toml` (32 random bytes, owner-only) befo
 that has the new `[audit]` or `[web_admin]` section is refused by an older server (it rejects unknown settings), so remove the section before
 going back to one. To turn the admin pages on after the upgrade: take the backup, start the new server (it migrates), then add
 `[web_admin]` as described above and restart behind the proxy. Several servers on one Postgres database must all run this
-release before any of them is given `[web_admin]`, as for every migration.
+release before any of them is given `[web_admin]`, as for every migration. Likewise a config with `capacity` in `[storage]`
+is refused by an older server, so remove the line before going back to one. The new fields of `GET /admin/storage` are
+optional: an older app reads a newer server's answer, and a newer app reads an older server's, without them.
 ## Version history
 
 The server keeps every version of every file; nothing is thinned or removed yet. A signed-in device can list a file's

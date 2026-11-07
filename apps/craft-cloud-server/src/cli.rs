@@ -45,6 +45,11 @@ pub enum Command {
         /// The reverse proxy's address, whose `X-Forwarded-For` is believed (repeat for several proxies).
         #[arg(long = "trusted-proxy")]
         trusted_proxies: Vec<IpAddr>,
+        /// What the blob store may hold, like "1 TiB" or "500 GB" (B, KB, MB, GB, TB, KiB, MiB, GiB, TiB). Written to the
+        /// config as `[storage] capacity`; the admin's storage overview shows it. Without it none is set (a disk store's
+        /// overview still shows its filesystem's size). `init` makes a disk store; for S3, set `capacity` in the config.
+        #[arg(long)]
+        capacity: Option<String>,
     },
     /// Run the server.
     Serve {
@@ -297,7 +302,7 @@ pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
         .with_audit_retention_days(config.audit.retention_days);
     let store = match (&config.storage, config.storage.s3()?) {
         (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
-        (StorageConfig::Disk { path }, None) => Store::new(DiskBackend::new(path)?),
+        (StorageConfig::Disk { path, .. }, None) => Store::new(DiskBackend::new(path)?),
         (StorageConfig::S3 { .. }, None) => return Err(CliError::Usage("S3 storage without settings".into())),
     };
     Ok((meta, store))
@@ -309,7 +314,7 @@ pub async fn open_existing(config: &Config) -> Result<(Meta, Store), CliError> {
     let meta = Meta::open_existing(&config.database.url).await?;
     let store = match (&config.storage, config.storage.s3()?) {
         (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
-        (StorageConfig::Disk { path }, None) => {
+        (StorageConfig::Disk { path, .. }, None) => {
             if !path.is_dir() {
                 return Err(CliError::Usage(format!("the storage directory {} does not exist (is the config's path right?)", path.display())));
             }
@@ -347,8 +352,8 @@ async fn user_id(meta: &Meta, username: &str) -> Result<craft_cloud_meta::UserRe
 /// Runs every command except `serve` (which `main` runs, since it never returns).
 pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Write) -> Result<(), CliError> {
     match command {
-        Command::Init { dir, admin, listen, behind_proxy, trusted_proxies } => {
-            init(&dir, &admin, &listen, (behind_proxy, &trusted_proxies), input, out).await
+        Command::Init { dir, admin, listen, behind_proxy, trusted_proxies, capacity } => {
+            init(&dir, &admin, &listen, (behind_proxy, &trusted_proxies), capacity.as_deref(), input, out).await
         }
         Command::Serve { .. } => Err(CliError::Usage("serve is run by main".into())),
         Command::Healthcheck { addr } => {
@@ -687,6 +692,7 @@ async fn init(
     admin: &str,
     listen: &str,
     proxy: (bool, &[IpAddr]),
+    capacity: Option<&str>,
     input: &mut impl BufRead,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -705,13 +711,22 @@ async fn init(
     let dir = std::path::absolute(dir)?;
     let db = without_verbatim_prefix(&dir.join("meta.db").display().to_string()).to_owned();
     let blobs = without_verbatim_prefix(&dir.join("blobs").display().to_string()).to_owned();
+    // Checked here so a bad size is named as `--capacity`, then written as the admin typed it.
+    let capacity_line = match capacity {
+        Some(text) => {
+            crate::config::Capacity::parse(text).map_err(|e| CliError::Usage(e.replace("storage.capacity", "--capacity")))?;
+            format!("capacity = {}\n", toml_string(text.trim()))
+        }
+        None => String::new(),
+    };
     let trusted: Vec<String> = trusted_proxies.iter().map(|ip| format!("\"{ip}\"")).collect();
     let config_text = format!(
-        "listen = \"{listen}\"\nbehind_proxy = {behind_proxy}\ntrusted_proxies = [{}]\n\n[database]\nurl = {}\n\n[storage]\nkind = \"disk\"\npath = {}\n\n\
+        "listen = \"{listen}\"\nbehind_proxy = {behind_proxy}\ntrusted_proxies = [{}]\n\n[database]\nurl = {}\n\n[storage]\nkind = \"disk\"\npath = {}\n{}\n\
          [two_factor]\nkey_file = \"{KEY_FILE_NAME}\"\n",
         trusted.join(", "),
         toml_string(&format!("sqlite:{db}")),
         toml_string(&blobs),
+        capacity_line,
     );
     let config = Config::parse(&config_text)?;
     let password = read_password(input)?;

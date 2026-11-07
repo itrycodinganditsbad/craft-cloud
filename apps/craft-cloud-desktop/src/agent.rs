@@ -865,6 +865,7 @@ pub(crate) mod fake {
                     accounts_over_quota: users.iter().filter(|user| user.stored_bytes >= effective(user)).count() as u64,
                     top_accounts,
                     manifest_index: AdminManifestIndex { complete: 7, building: 1, not_indexed: 2 },
+                    ..Default::default()
                 }
             })
         }

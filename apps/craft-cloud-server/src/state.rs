@@ -17,6 +17,7 @@ use crate::live::LiveHub;
 use crate::notify::Notifier;
 use crate::ratelimit::Limiter;
 use crate::secretbox::SecretBox;
+use crate::space::StorageInfo;
 
 /// How much one user, or one request, may hold on the server at once. Each user's limits are their own, so a
 /// stalled or greedy client only ever slows its own account.
@@ -140,6 +141,8 @@ pub struct AppState {
     pub dummy_hash: String,
     /// Days a deleted node stays in the trash before the server may remove it (`retention.trash_days`).
     pub trash_days: u32,
+    /// Where to measure the room the server has, and the `capacity` the admin set (the admin's storage overview).
+    pub storage_info: StorageInfo,
     /// The time of day for everything a request records (a device's last use, a stored blob, a commit).
     clock: Clock,
 }
@@ -169,6 +172,7 @@ impl AppState {
             touches: Mutex::new(HashMap::new()),
             dummy_hash: hash_password("craft-cloud dummy password")?,
             trash_days: 30,
+            storage_info: StorageInfo::default(),
             clock: Arc::new(now_ms),
         })
     }
@@ -209,6 +213,12 @@ impl AppState {
     /// The state with another trash period in days (`retention.trash_days`; the default is 30).
     pub fn with_trash_days(mut self, days: u32) -> Self {
         self.trash_days = days;
+        self
+    }
+
+    /// The state with the places to measure and the configured capacity (`[storage] capacity`). The default measures nothing.
+    pub fn with_storage_info(mut self, info: StorageInfo) -> Self {
+        self.storage_info = info;
         self
     }
 
