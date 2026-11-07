@@ -11,11 +11,16 @@ use crate::model::{Busy, Event, Model, Tab};
 pub(super) struct Shell {
     tab: Tab,
     tabs: Vec<Tab>,
+    /// The tabs can't be used now: a call or a one-time code of the page would be lost.
+    locked: bool,
     /// `fabio · cloud.shadows.ch`.
     account: String,
     /// `Online · Up to date`.
     state: String,
     busy: Option<Busy>,
+    /// What went wrong with the last Sign out, and whether to offer signing out on this computer only.
+    sign_out_error: Option<String>,
+    offer_local: bool,
 }
 
 impl Shell {
@@ -32,26 +37,42 @@ impl Shell {
         };
         let state =
             status.map(|s| format!("{} · {}", if s.online { "Online" } else { "Offline" }, super::overview::sync_line(s).0)).unwrap_or_default();
-        Some(Self { tab, tabs: model.tabs(), account, state, busy: model.busy })
+        Some(Self {
+            tab,
+            tabs: model.tabs(),
+            locked: model.tabs_locked(),
+            account,
+            state,
+            busy: model.busy,
+            sign_out_error: model.sign_out_error.clone(),
+            offer_local: model.offer_local_sign_out,
+        })
     }
 }
 
-/// The width from which the header is one row; below it the tabs have a row of their own, which scrolls if they don't fit.
-const ONE_ROW: f32 = 900.0;
+/// The room the wordmark takes in the header, and the gaps around the account line.
+const WORDMARK_ROOM: f32 = 140.0 + 8.0 + 16.0;
+/// The least room worth giving the account line beside the tabs; with less the tabs get a row of their own.
+const MIN_ACCOUNT_ROOM: f32 = 90.0;
 
-/// The header bar: the wordmark, the account line and the tabs.
+/// The header bar: the wordmark, the account line and the tabs. The account line is cut off with an ellipsis rather than
+/// pushing a tab out of the window; when even that leaves it too little room, the tabs have a row of their own, which
+/// scrolls if they don't fit.
 pub(super) fn header(ui: &mut egui::Ui, shell: &Shell, events: &mut Vec<Event>) {
     let t = Tokens::get(ui.ctx());
     let frame = egui::Frame::new().fill(t.bg).inner_margin(Margin::symmetric(20, 8));
     egui::Panel::top("header").frame(frame).show(ui, |ui| {
-        if ui.available_width() >= ONE_ROW {
+        let tabs_width: f32 = shell.tabs.iter().map(|tab| kit::tab_width(ui, tab.label()) + 4.0).sum();
+        let room = ui.available_width() - WORDMARK_ROOM - tabs_width;
+        if room >= MIN_ACCOUNT_ROOM {
             ui.horizontal(|ui| {
-                title(ui, shell);
+                title(ui, shell, room);
                 ui.add_space(16.0);
                 tabs(ui, shell, events);
             });
         } else {
-            ui.horizontal(|ui| title(ui, shell));
+            let row = ui.available_width() - WORDMARK_ROOM;
+            ui.horizontal(|ui| title(ui, shell, row));
             egui::ScrollArea::horizontal().id_salt("header-tabs").scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(
                 ui,
                 |ui| {
@@ -62,23 +83,30 @@ pub(super) fn header(ui: &mut egui::Ui, shell: &Shell, events: &mut Vec<Event>) 
     });
 }
 
-/// The wordmark and the account line.
-fn title(ui: &mut egui::Ui, shell: &Shell) {
+/// The wordmark and the account line, which gets at most `room`.
+fn title(ui: &mut egui::Ui, shell: &Shell, room: f32) {
     kit::wordmark(ui, 22.0);
     ui.add_space(8.0);
-    kit::section_label(ui, &shell.account);
+    kit::section_label_fit(ui, &shell.account, room);
 }
 
 fn tabs(ui: &mut egui::Ui, shell: &Shell, events: &mut Vec<Event>) {
     ui.spacing_mut().item_spacing.x = 4.0;
-    for tab in &shell.tabs {
-        if kit::tab(ui, tab.label(), *tab == shell.tab).clicked() {
-            events.push(Event::Tab(*tab));
+    ui.add_enabled_ui(!shell.locked, |ui| {
+        for tab in &shell.tabs {
+            let response = kit::tab(ui, tab.label(), *tab == shell.tab);
+            if response.clicked() {
+                events.push(Event::Tab(*tab));
+            }
+            if shell.locked {
+                response.on_disabled_hover_text("Finish or close what the page shows first");
+            }
         }
-    }
+    });
 }
 
-/// The footer strip: the agent's state on the left, Sign out and Quit on the right.
+/// The footer strip: the agent's state on the left, Sign out and Quit on the right; above it, what went wrong with the
+/// last Sign out.
 pub(super) fn footer(ui: &mut egui::Ui, shell: &Shell, events: &mut Vec<Event>) {
     let t = Tokens::get(ui.ctx());
     let frame = egui::Frame::new().fill(t.bg).inner_margin(Margin::symmetric(20, 8));
@@ -99,4 +127,13 @@ pub(super) fn footer(ui: &mut egui::Ui, shell: &Shell, events: &mut Vec<Event>) 
             });
         });
     });
+    if let Some(error) = &shell.sign_out_error {
+        let frame = egui::Frame::new().fill(t.bg).inner_margin(Margin::symmetric(20, 8));
+        egui::Panel::bottom("sign-out-problem").frame(frame).show(ui, |ui| {
+            super::error_line(ui, error);
+            if shell.offer_local && ui.add_enabled(shell.busy.is_none(), kit::Button::new("Sign out on this computer only")).clicked() {
+                events.push(Event::SignOutHere);
+            }
+        });
+    }
 }

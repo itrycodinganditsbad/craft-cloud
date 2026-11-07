@@ -9,7 +9,7 @@ pub(super) fn show(ui: &mut egui::Ui, versions: &mut Versions, now_ms: i64, even
     ui.add_space(8.0);
     ui.label("Path inside the sync folder");
     let mut path = versions.path.clone();
-    let response = ui.add_enabled_ui(!versions.restoring, |ui| ui.add(egui::TextEdit::singleline(&mut path).hint_text("Projects/file.txt"))).inner;
+    let response = ui.add_enabled_ui(!versions.restoring, |ui| ui.add(super::kit::text_edit(&mut path).hint_text("Projects/file.txt"))).inner;
     if response.changed() {
         events.push(Event::VersionsPath(path));
     }

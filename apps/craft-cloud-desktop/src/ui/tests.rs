@@ -1227,3 +1227,93 @@ fn snapshot_smallest_window() {
     let admin = on_admin_pages(&admin_agent(), Vec::new());
     snapshot_sized(admin, egui::Theme::Dark, "tab-admin-smallest-dark", MIN_WINDOW_SIZE);
 }
+
+/// The footer's Sign out works on the pages that don't carry the signed-in view, too.
+#[test]
+fn the_footers_sign_out_works_on_trash_and_versions() {
+    for model in [trash_model(true), versions_model(true)] {
+        let mut h = harness(model, egui::Theme::Light);
+        h.run_steps(2);
+        h.get_by_label("Sign out").click();
+        h.run_steps(2);
+        let (model, events) = h.state_mut();
+        assert_eq!(std::mem::take(events), [Event::SignOut]);
+        assert_eq!(model.update(Event::SignOut), vec![Effect::Logout { local: false }]);
+    }
+}
+
+/// A failed Sign out is said on every page, with the offer to sign out on this computer only.
+#[test]
+fn a_failed_sign_out_is_said_on_the_security_page_and_offers_this_computer_only() {
+    let mut model = after(&FakeAgent::new(signed_in()), vec![Event::Devices(Ok(devices())), Event::OpenSecurity]);
+    model.update(Event::SignOut);
+    let why = "can't reach the server to sign this device out";
+    model.update(Event::SignedOut(Err(craft_cloud_app::Error::Refused { code: "offline".into(), message: why.into(), name_taken: None })));
+    assert!(matches!(model.screen, Screen::Security(_)));
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    let shown = h.state().0.sign_out_error.clone().unwrap();
+    assert_eq!(h.query_all_by_label(&shown).count(), 1, "{shown}");
+    h.get_by_label("Sign out on this computer only").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::SignOutHere]);
+    // The Computers page has them too.
+    let mut model = overview_model();
+    model.update(Event::Tab(Tab::Computers));
+    model.update(Event::SignOut);
+    model.update(Event::SignedOut(Err(craft_cloud_app::Error::Refused { code: "offline".into(), message: why.into(), name_taken: None })));
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    assert_eq!(h.query_all_by_label("Sign out on this computer only").count(), 1);
+}
+
+/// While a change waits for the server's answer, or a one-time code is shown, the admin pages keep the window: the tabs
+/// don't leave them.
+#[test]
+fn the_tabs_wait_while_the_admin_pages_hold_an_answer_or_a_code() {
+    let agent = admin_agent();
+    let ana = id_of(&on_admin_pages(&agent, Vec::new()), "ana");
+    let mut model = on_admin_pages(&agent, Vec::new());
+    model.update(Event::Admin(AdminEvent::Ask(Action::Disable { id: ana, username: "ana".into() })));
+    password_typed(&mut model, "pw");
+    assert!(!model.tabs_locked(), "a dialog waiting for typing is not a call");
+    let effects = model.update(Event::Admin(AdminEvent::Confirm));
+    assert!(matches!(effects.as_slice(), [Effect::AdminDo { .. }]));
+    assert!(model.tabs_locked());
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_label("Overview").click();
+    h.run_steps(2);
+    let (model, events) = h.state_mut();
+    assert!(events.is_empty(), "a disabled tab sends nothing: {events:?}");
+    assert!(model.update(Event::Tab(Tab::Overview)).is_empty());
+    assert!(model.admin_screen().is_some());
+
+    let mut model = on_admin_pages(&agent, Vec::new());
+    model.update(Event::Admin(AdminEvent::Ask(Action::IssueReset { id: ana, username: "ana".into(), reset_two_factor: false })));
+    password_typed(&mut model, "pw");
+    confirm_sent(&mut model, &agent);
+    assert!(model.admin_screen().unwrap().code.is_some());
+    assert!(model.tabs_locked());
+    assert!(model.update(Event::Tab(Tab::Trash)).is_empty());
+    assert!(model.admin_screen().unwrap().code.is_some(), "the code is still there");
+    model.update(Event::Admin(AdminEvent::DismissCode));
+    assert!(!model.tabs_locked());
+}
+
+/// A long account line is cut off with an ellipsis so that no tab leaves the window.
+#[test]
+fn snapshot_a_long_account_line() {
+    let status = Status {
+        account: Some("a-rather-long-user-name".into()),
+        server: Some("https://cloud.a-rather-long-server-name.example.org".into()),
+        ..signed_in()
+    };
+    let mut model = signed_in_model(status);
+    model.update(Event::Devices(Ok(devices())));
+    model.overview_mut().unwrap().access = crate::admin::Access::Admin { two_factor: false };
+    model.access = crate::admin::Access::Admin { two_factor: false };
+    assert!(model.is_admin());
+    snapshot(model.clone(), egui::Theme::Light, "tab-overview-long-account-light");
+    snapshot_sized(model, egui::Theme::Dark, "tab-overview-long-account-narrow-dark", [760.0, 480.0]);
+}

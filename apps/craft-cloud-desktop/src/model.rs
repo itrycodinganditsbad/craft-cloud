@@ -17,7 +17,7 @@ use craft_cloud_proto::join::JoinString;
 
 use crate::admin::{Access, Action, AdminEvent, AdminScreen};
 use crate::audit::{ActivityScreen, AuditMsg};
-use crate::security::{SecondFactorForm, SecurityAnswer, SecurityCall, SecurityEvent, SecurityPage};
+use crate::security::{SecondFactorForm, SecurityAnswer, SecurityCall, SecurityEvent, SecurityPage, Step as SecurityStep};
 
 /// A code that is wrong, expired or used (the server never says which).
 pub const INVALID_CODE: &str = "This code doesn't work any more. Make a new one on a signed-in computer.";
@@ -211,10 +211,8 @@ pub struct Overview {
     pub usage_error: Option<String>,
     /// The computer being removed.
     pub removing: Option<DeviceId>,
-    /// What went wrong with the last action (sign out, pause), for people.
+    /// What went wrong with the last action (pause), for people.
     pub error: Option<String>,
-    /// Signing out failed because the server can't be reached: offer to forget the account here only.
-    pub offer_local_sign_out: bool,
     /// Whether the server lets this account use the admin pages (asked at sign-in).
     pub access: Access,
     /// Which sign-in this view is of: answers to the admin check made for another one are ignored.
@@ -269,7 +267,6 @@ impl Overview {
             usage_error: None,
             removing: None,
             error: None,
-            offer_local_sign_out: false,
             access: Access::Unknown,
             session: crate::admin::fresh(),
         }
@@ -572,6 +569,10 @@ pub struct Model {
     pub log_path: String,
     /// A small note about the app itself (its own start-at-login entry couldn't be written).
     pub note: Option<String>,
+    /// What went wrong with the last Sign out, for people; shown on every page of the signed-in window.
+    pub sign_out_error: Option<String>,
+    /// Signing out failed because the server can't be reached: offer to forget the account here only.
+    pub offer_local_sign_out: bool,
     defaults: JoinDefaults,
     polling: bool,
     polling_pairing: bool,
@@ -599,6 +600,8 @@ impl Model {
             busy: None,
             log_path,
             note: None,
+            sign_out_error: None,
+            offer_local_sign_out: false,
             defaults,
             polling: false,
             polling_pairing: false,
@@ -661,13 +664,23 @@ impl Model {
         all.into_iter().filter(|t| *t != Tab::Admin || self.is_admin()).collect()
     }
 
+    /// Whether the page shown can't be left by a tab now: a call of the security page is under way or it shows one-time
+    /// recovery codes, or the admin pages wait for a call's answer or show a one-time code. Leaving would drop what the
+    /// answer or the screen holds.
+    pub fn tabs_locked(&self) -> bool {
+        match &self.screen {
+            Screen::Security(page) => page.busy || matches!(page.step, SecurityStep::Codes { .. }),
+            Screen::Admin(admin) => admin.code.is_some() || admin.dialog.as_ref().is_some_and(|d| d.busy),
+            _ => false,
+        }
+    }
+
     /// A tab of the header: the page shown is left as its own way back would (a computer code still waiting is
     /// cancelled, what the security page showed dropped, the tickets of versions and trash answers moved on), then the
     /// tab's page is opened as the button that opened it did.
     fn open_tab(&mut self, tab: Tab) -> Vec<Effect> {
         let Some(current) = self.tab() else { return Vec::new() };
-        let adding = matches!(self.screen, Screen::AddingComputer(_));
-        if (current == tab && !adding) || (tab == Tab::Admin && !self.is_admin()) {
+        if current == tab || self.tabs_locked() || (tab == Tab::Admin && !self.is_admin()) {
             return Vec::new();
         }
         let mut effects = match &self.screen {
@@ -1247,6 +1260,10 @@ impl Model {
             self.overview().is_some_and(|overview| overview.status.account != status.account || overview.status.server != status.server);
         if !status.signed_in {
             self.usage_request_id = self.usage_request_id.wrapping_add(1);
+        }
+        // What the admin check said belongs to the account it was made for.
+        let other_account = self.status.as_ref().is_some_and(|old| old.account != status.account || old.server != status.server);
+        if !status.signed_in || other_account {
             self.access = Access::Unknown;
         }
         let new_usage_request = (status.signed_in && account_changed).then(|| self.next_usage_request());
@@ -1502,9 +1519,12 @@ impl Model {
         if self.busy.is_some() {
             return Vec::new();
         }
-        let Some(overview) = self.overview_mut() else { return Vec::new() };
-        overview.error = None;
-        overview.offer_local_sign_out = false;
+        // From every page of the signed-in window, the footer's Sign out included.
+        if self.tab().is_none() {
+            return Vec::new();
+        }
+        self.sign_out_error = None;
+        self.offer_local_sign_out = false;
         self.busy = Some(Busy::SigningOut);
         vec![Effect::Logout { local }]
     }
@@ -1594,14 +1614,11 @@ impl Model {
             Err(e) => {
                 let offline = matches!(&e, Error::Refused { code, .. } if code == codes::OFFLINE);
                 let text = message(&e);
-                match &mut self.screen {
-                    Screen::SignedIn(overview) => {
-                        overview.error = Some(text);
-                        overview.offer_local_sign_out = offline;
-                    }
-                    Screen::AddingComputer(adding) => adding.overview.error = Some(text),
-                    Screen::Error(problem) => problem.details = format!("{}\n\nSigning out failed: {text}", problem.details),
-                    _ => {}
+                if let Screen::Error(problem) = &mut self.screen {
+                    problem.details = format!("{}\n\nSigning out failed: {text}", problem.details);
+                } else if self.tab().is_some() {
+                    self.sign_out_error = Some(text);
+                    self.offer_local_sign_out = offline;
                 }
                 Vec::new()
             }
@@ -2615,9 +2632,63 @@ pub(crate) mod tests {
         assert_eq!(m.update(Event::SignOut), vec![Effect::Logout { local: false }]);
         assert!(m.update(Event::SignOut).is_empty());
         m.update(Event::SignedOut(Err(refused(codes::OFFLINE, "can't reach the server to sign this device out"))));
-        let o = m.overview().unwrap();
-        assert!(o.offer_local_sign_out && o.error.is_some());
+        assert!(m.offer_local_sign_out && m.sign_out_error.is_some());
         assert_eq!(m.update(Event::SignOutHere), vec![Effect::Logout { local: true }]);
+    }
+
+    /// The footer's Sign out is there on every page of the signed-in window, and so are its problem and the offer.
+    #[test]
+    fn sign_out_works_from_every_page_and_its_problem_is_kept_there() {
+        for tab in [Tab::Versions, Tab::Trash, Tab::Security, Tab::Activity, Tab::Computers] {
+            let mut m = signed_in();
+            m.update(Event::Tab(tab));
+            assert_eq!(m.tab(), Some(tab));
+            assert_eq!(m.update(Event::SignOut), vec![Effect::Logout { local: false }], "{tab:?}");
+            assert_eq!(m.busy, Some(Busy::SigningOut));
+            assert!(m.update(Event::SignOut).is_empty(), "{tab:?}: once at a time");
+            m.update(Event::SignedOut(Err(refused(codes::OFFLINE, "can't reach the server to sign this device out"))));
+            assert_eq!(m.busy, None);
+            assert!(m.sign_out_error.is_some() && m.offer_local_sign_out, "{tab:?}");
+            assert_eq!(m.update(Event::SignOutHere), vec![Effect::Logout { local: true }], "{tab:?}");
+            // A new try clears the problem.
+            m.update(Event::SignedOut(Err(refused("other", "no"))));
+            assert!(!m.offer_local_sign_out);
+            m.update(Event::SignOut);
+            assert!(m.sign_out_error.is_none(), "{tab:?}");
+        }
+        assert!(model().update(Event::SignOut).is_empty(), "not signed in");
+    }
+
+    #[test]
+    fn a_tab_does_not_leave_the_security_page_while_it_works_or_shows_recovery_codes() {
+        let mut m = signed_in();
+        m.update(Event::Tab(Tab::Security));
+        assert!(!m.tabs_locked());
+        let Screen::Security(page) = &mut m.screen else { panic!() };
+        page.busy = true;
+        assert!(m.tabs_locked());
+        assert!(m.update(Event::Tab(Tab::Trash)).is_empty());
+        assert_eq!(m.tab(), Some(Tab::Security));
+        let Screen::Security(page) = &mut m.screen else { panic!() };
+        page.busy = false;
+        page.step = SecurityStep::Codes { codes: vec!["AAAA-BBBB".into()], why: crate::security::CodesWhy::TurnedOn };
+        assert!(m.tabs_locked());
+        assert!(m.update(Event::Tab(Tab::Overview)).is_empty());
+        assert_eq!(m.tab(), Some(Tab::Security));
+        // Done with the codes: the page is free again.
+        m.update(Event::Security(SecurityEvent::Home));
+        assert!(!m.tabs_locked());
+        m.update(Event::Tab(Tab::Overview));
+        assert_eq!(m.tab(), Some(Tab::Overview));
+    }
+
+    #[test]
+    fn the_admin_check_is_forgotten_when_the_account_changes() {
+        let mut m = signed_in_admin();
+        assert!(m.is_admin());
+        let other = Status { account: Some("ana".into()), ..status(true) };
+        m.update(Event::Polled(Ok(other)));
+        assert_eq!(m.access, Access::Unknown);
     }
 
     /// Quit stops the agent, then the app; the close button only hides the window when there is a tray.
@@ -2763,8 +2834,10 @@ pub(crate) mod tests {
         m.update(Event::Tab(Tab::Computers));
         assert_eq!(m.update(Event::AddComputer), vec![Effect::Pairing]);
         assert_eq!(m.tab(), Some(Tab::Computers));
-        assert_eq!(m.update(Event::Tab(Tab::Computers)), vec![Effect::Devices], "the tab closes the code page");
-        assert!(matches!(&m.screen, Screen::SignedIn(o) if o.page == OverviewPage::Computers));
+        assert!(m.update(Event::Tab(Tab::Computers)).is_empty(), "the tab shown does nothing, the code page and its wait stay");
+        assert!(matches!(m.screen, Screen::AddingComputer(_)));
+        assert_eq!(m.update(Event::Tab(Tab::Overview)), vec![Effect::Devices], "another tab leaves it");
+        assert!(matches!(&m.screen, Screen::SignedIn(o) if o.page == OverviewPage::Home));
     }
 
     #[test]

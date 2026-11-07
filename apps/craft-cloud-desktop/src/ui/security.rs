@@ -71,7 +71,7 @@ pub(super) fn forget_secrets(ctx: &egui::Context, screen: &crate::model::Screen)
 /// A password field.
 fn password_field(ui: &mut egui::Ui, name: &str, label: &str, text: &mut String) -> egui::Response {
     ui.label(label);
-    let response = ui.add(egui::TextEdit::singleline(text).id(secret_id(name)).password(true).desired_width(f32::INFINITY));
+    let response = ui.add(super::kit::text_edit(text).id(secret_id(name)).password(true).desired_width(f32::INFINITY));
     ui.add_space(6.0);
     response
 }
@@ -110,7 +110,7 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut SecurityPage, events: &mut Vec<
             });
             ui.add_space(10.0);
             ui.label("2. Type the six digits the app shows now.");
-            let response = ui.add(egui::TextEdit::singleline(code).id(secret_id("setup-code")).hint_text("123456").desired_width(160.0));
+            let response = ui.add(super::kit::text_edit(code).id(secret_id("setup-code")).hint_text("123456").desired_width(160.0));
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(6.0);
             footer(ui, busy, error.as_deref(), "Turn on", enter, events);
@@ -146,7 +146,7 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut SecurityPage, events: &mut Vec<
             ui.add_space(8.0);
             password_field(ui, "disable-password", "Your password", password);
             ui.label(if *recovery { "A recovery code" } else { "The six digits from the app" });
-            let response = ui.add(egui::TextEdit::singleline(code).id(secret_id("disable-code")).desired_width(f32::INFINITY));
+            let response = ui.add(super::kit::text_edit(code).id(secret_id("disable-code")).desired_width(f32::INFINITY));
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui.add(super::kit::Button::new(if *recovery { "Use a code from the app" } else { "Use a recovery code instead" })).clicked() {
                 send(events, SecurityEvent::ToggleRecovery);
@@ -159,7 +159,7 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut SecurityPage, events: &mut Vec<
             ui.add_space(8.0);
             password_field(ui, "regenerate-password", "Your password", password);
             ui.label("The six digits from the app");
-            let response = ui.add(egui::TextEdit::singleline(code).id(secret_id("regenerate-code")).desired_width(160.0));
+            let response = ui.add(super::kit::text_edit(code).id(secret_id("regenerate-code")).desired_width(160.0));
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(6.0);
             footer(ui, busy, error.as_deref(), "Make new codes", enter, events);

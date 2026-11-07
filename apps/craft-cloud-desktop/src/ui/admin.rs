@@ -121,7 +121,7 @@ fn users(
 
     ui.horizontal(|ui| {
         let width = (ui.available_width() - 130.0).max(120.0);
-        let field = ui.add(egui::TextEdit::singleline(&mut list.search).hint_text("Search accounts").desired_width(width));
+        let field = ui.add(super::kit::text_edit(&mut list.search).hint_text("Search accounts").desired_width(width));
         if ui.add(super::kit::Button::new("Search")).clicked() || entered(&field, ui) {
             send(events, AdminEvent::Search);
         }
@@ -237,7 +237,7 @@ fn role_choice(ui: &mut egui::Ui, role: &mut RoleChoice) {
 fn create(ui: &mut egui::Ui, form: &mut CreateForm, events: &mut Vec<Event>) {
     super::heading(ui, "New account");
     ui.label("Name");
-    let name = ui.add(egui::TextEdit::singleline(&mut form.username).hint_text("ana").desired_width(f32::INFINITY));
+    let name = ui.add(super::kit::text_edit(&mut form.username).hint_text("ana").desired_width(f32::INFINITY));
     let enter = entered(&name, ui);
     ui.add_space(8.0);
     ui.label("Role");
@@ -315,7 +315,7 @@ fn account(ui: &mut egui::Ui, view: &mut UserView, user: Option<&AdminUserInfo>,
     role_choice(ui, &mut view.role);
     ui.horizontal(|ui| {
         ui.label("Quota (GiB)");
-        ui.add(egui::TextEdit::singleline(&mut view.quota).hint_text("none").desired_width(100.0));
+        ui.add(super::kit::text_edit(&mut view.quota).hint_text("none").desired_width(100.0));
     });
     if let Some(error) = &view.error {
         super::error_line(ui, error);
@@ -424,7 +424,7 @@ fn confirmation(ui: &mut egui::Ui, dialog: &mut Dialog, events: &mut Vec<Event>)
     ui.label("Your password");
     let field = ui.add_enabled(
         !dialog.busy,
-        egui::TextEdit::singleline(&mut dialog.confirmation.password)
+        super::kit::text_edit(&mut dialog.confirmation.password)
             .id(super::security::secret_id(PASSWORD_FIELD))
             .password(true)
             .hint_text("your own current password")
@@ -436,7 +436,7 @@ fn confirmation(ui: &mut egui::Ui, dialog: &mut Dialog, events: &mut Vec<Event>)
         ui.label("Code from your authenticator app, or a recovery code");
         let code = ui.add_enabled(
             !dialog.busy,
-            egui::TextEdit::singleline(&mut dialog.confirmation.code)
+            super::kit::text_edit(&mut dialog.confirmation.code)
                 .id(super::security::secret_id(CODE_FIELD))
                 .password(true)
                 .hint_text("123456")

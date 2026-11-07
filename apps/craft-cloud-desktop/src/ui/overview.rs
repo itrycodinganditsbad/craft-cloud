@@ -60,12 +60,8 @@ fn home(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: i64, autost
         computers_cell(ui, o, now_ms, events);
     }
     ui.add_space(14.0);
-
     if let Some(error) = &o.error {
         super::error_line(ui, error);
-        if o.offer_local_sign_out && ui.add_enabled(busy.is_none(), super::kit::Button::new("Sign out on this computer only")).clicked() {
-            events.push(Event::SignOutHere);
-        }
     }
 }
 
