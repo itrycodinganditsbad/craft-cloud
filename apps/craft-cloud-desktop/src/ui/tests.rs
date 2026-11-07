@@ -16,7 +16,7 @@ use egui_kittest::kittest::Queryable;
 use super::*;
 use crate::agent::fake::FakeAgent;
 use crate::agent::{Agent, Starter, call};
-use crate::model::{Effect, JoinDefaults, Model, Screen, Tab, TrashKind};
+use crate::model::{Effect, JoinDefaults, JoinStep, Model, Screen, Tab, TrashKind};
 
 /// The time the screens are drawn at.
 const NOW: i64 = 1_790_000_000_000;
@@ -219,7 +219,7 @@ fn snapshot_not_running() {
 /// a Unix path, isn't a full path on Windows, so the form's own check is left to the model's tests).
 fn sent(model: &mut Model, join: &str) {
     let Screen::Join(form) = &model.screen else { panic!("{:?}", model.screen) };
-    let form = crate::model::JoinForm { join: join.into(), mode: crate::model::JoinMode::JoinString, ..form.clone() };
+    let form = crate::model::JoinForm { join: join.into(), mode: crate::model::JoinMode::JoinString, step: JoinStep::Folder, ..form.clone() };
     model.screen = Screen::Joining { form, password: None };
 }
 
@@ -254,23 +254,31 @@ fn sign_in_typed() -> Model {
 
 fn signing_in(model: &mut Model) {
     let Screen::Join(form) = &model.screen else { panic!("{:?}", model.screen) };
-    let form = crate::model::JoinForm { password: String::new(), ..form.clone() };
+    let form = crate::model::JoinForm { password: String::new(), step: JoinStep::Folder, ..form.clone() };
     model.screen = Screen::Joining { form, password: None };
 }
 
 #[test]
 fn snapshot_sign_in() {
-    let mut model = sign_in_typed();
-    snapshot(model.clone(), egui::Theme::Light, "sign-in");
-    snapshot(model.clone(), egui::Theme::Dark, "sign-in-dark");
-    snapshot_sized(model.clone(), egui::Theme::Light, "sign-in-smallest", MIN_WINDOW_SIZE);
-    snapshot_sized(model.clone(), egui::Theme::Dark, "sign-in-smallest-dark", MIN_WINDOW_SIZE);
+    // Every step, in the window's first size and the smallest, and the account step in the dark.
+    for (step, name) in [(JoinStep::Server, "step-server"), (JoinStep::Account, "step-account"), (JoinStep::Folder, "step-folder")] {
+        snapshot(on_step(step), egui::Theme::Light, name);
+        snapshot_sized(on_step(step), egui::Theme::Light, &format!("{name}-smallest"), MIN_WINDOW_SIZE);
+    }
+    snapshot(on_step(JoinStep::Account), egui::Theme::Dark, "step-account-dark");
+    snapshot(on_step(JoinStep::Folder), egui::Theme::Dark, "step-folder-dark");
+    snapshot_sized(on_step(JoinStep::Account), egui::Theme::Dark, "step-account-smallest-dark", MIN_WINDOW_SIZE);
     // Switching keeps the folder and the name; the join string form.
+    let mut model = on_step(JoinStep::Account);
     model.update(Event::SetJoinMode(crate::model::JoinMode::JoinString));
     let Screen::Join(form) = &mut model.screen else { panic!("{:?}", model.screen) };
     form.join = "cloud.shadows.ch/K7M4-Q9TX".into();
     snapshot(model.clone(), egui::Theme::Light, "join-string");
-    snapshot(model, egui::Theme::Dark, "join-string-dark");
+    snapshot(model.clone(), egui::Theme::Dark, "join-string-dark");
+    // A join string names its own server.
+    let Screen::Join(form) = &mut model.screen else { panic!("{:?}", model.screen) };
+    form.step = JoinStep::Server;
+    snapshot(model, egui::Theme::Light, "step-server-join-string");
     let mut model = sign_in_typed();
     signing_in(&mut model);
     snapshot(model, egui::Theme::Light, "signing-in");
@@ -289,6 +297,7 @@ fn snapshot_sign_in_second_factor_and_errors() {
     assert!(matches!(model.screen, Screen::SecondFactor(_)), "{:?}", model.screen);
     snapshot(model.clone(), egui::Theme::Light, "sign-in-second-factor");
     snapshot(model.clone(), egui::Theme::Dark, "sign-in-second-factor-dark");
+    snapshot_sized(model.clone(), egui::Theme::Light, "sign-in-second-factor-smallest", MIN_WINDOW_SIZE);
     if let Screen::SecondFactor(second) = &mut model.screen {
         second.code = "123456".into();
     }
@@ -321,7 +330,8 @@ fn snapshot_password_needed() {
         pw.again = "correct house".into();
     }
     model.update(Event::SubmitPassword);
-    snapshot(model, egui::Theme::Light, "password-needed");
+    snapshot(model.clone(), egui::Theme::Light, "password-needed");
+    snapshot_sized(model, egui::Theme::Light, "password-needed-smallest", MIN_WINDOW_SIZE);
 }
 
 fn signed_in_model(status: Status) -> Model {
@@ -651,30 +661,76 @@ fn buttons_send_their_events() {
     // One Remove: this computer has none.
     assert_eq!(h.query_all_by_label("Remove").count(), 1);
 
-    let mut h = harness(after(&FakeAgent::new(signed_out()), Vec::new()), egui::Theme::Light);
+    // The last step: Change… and Continue.
+    let mut h = harness(on_step(JoinStep::Folder), egui::Theme::Light);
     h.run_steps(2);
     h.get_by_label("Change…").click();
     h.run_steps(2);
-    // "Sign in" is the switch's and the main button's label: the main button is the last.
-    h.get_all_by_label("Sign in").last().expect("the main button").click();
+    h.get_by_label("Continue").click();
+    h.run_steps(2);
+    let (model, events) = h.state_mut();
+    assert_eq!(events.as_slice(), [Event::ChangeFolder, Event::JoinNext]);
+    assert_eq!(model.update(Event::ChangeFolder), vec![Effect::PickFolder("/home/fabio/Craft Cloud".into())]);
+    // The account step: Back, and the switch.
+    let mut h = harness(on_step(JoinStep::Account), egui::Theme::Light);
     h.run_steps(2);
     h.get_by_label("Join string").click();
     h.run_steps(2);
-    let (model, events) = h.state_mut();
-    assert_eq!(events.as_slice(), [Event::ChangeFolder, Event::SubmitJoin, Event::SetJoinMode(crate::model::JoinMode::JoinString)]);
-    assert_eq!(model.update(Event::ChangeFolder), vec![Effect::PickFolder("/home/fabio/Craft Cloud".into())]);
+    h.get_by_label("Back").click();
+    h.run_steps(2);
+    assert_eq!(h.state_mut().1.as_slice(), [Event::SetJoinMode(crate::model::JoinMode::JoinString), Event::JoinBack]);
+    // The first step has Continue and no Back.
+    let mut h = harness(on_step(JoinStep::Server), egui::Theme::Light);
+    h.run_steps(2);
+    assert_eq!(h.query_all_by_label("Back").count(), 0);
+    h.get_by_label("Continue").click();
+    h.run_steps(2);
+    assert_eq!(h.state_mut().1.as_slice(), [Event::JoinNext]);
+}
+
+/// The first start's form on `step`, with a server, a user name and a password typed.
+fn on_step(step: JoinStep) -> Model {
+    let mut model = sign_in_typed();
+    let Screen::Join(form) = &mut model.screen else { panic!("{:?}", model.screen) };
+    form.step = step;
+    model
+}
+
+/// Esc goes back a step and Enter goes on, from a field.
+#[test]
+fn escape_goes_back_and_enter_goes_on() {
+    let mut h = harness(on_step(JoinStep::Account), egui::Theme::Light);
+    h.run_steps(2);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert_eq!(h.state_mut().1.as_slice(), [Event::JoinBack]);
+    let mut h = harness(on_step(JoinStep::Server), egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Server").focus();
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert_eq!(h.state_mut().1.as_slice(), [Event::JoinNext]);
 }
 
 /// The sign-in's fields are found by the words above them, as a screen reader finds them.
 #[test]
 fn the_sign_in_fields_are_found_by_their_labels() {
     use egui::accesskit::Role;
-    let mut h = harness(sign_in_typed(), egui::Theme::Light);
+    let mut h = harness(on_step(JoinStep::Server), egui::Theme::Light);
     h.run_steps(2);
-    for (role, label) in [(Role::TextInput, "Server"), (Role::TextInput, "Username"), (Role::PasswordInput, "Password")] {
+    let _ = h.get_by_role_and_label(Role::TextInput, "Server");
+    let mut h = harness(on_step(JoinStep::Account), egui::Theme::Light);
+    h.run_steps(2);
+    for (role, label) in [(Role::TextInput, "Username"), (Role::PasswordInput, "Password")] {
         let _ = h.get_by_role_and_label(role, label);
     }
-    let mut model = sign_in_typed();
+    let mut h = harness(on_step(JoinStep::Folder), egui::Theme::Light);
+    h.run_steps(2);
+    for label in ["Folder", "This computer's name"] {
+        let _ = h.get_by_role_and_label(Role::TextInput, label);
+    }
+    let mut model = on_step(JoinStep::Account);
     model.update(Event::SetJoinMode(crate::model::JoinMode::JoinString));
     let mut h = harness(model, egui::Theme::Light);
     h.run_steps(2);
