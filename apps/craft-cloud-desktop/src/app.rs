@@ -134,6 +134,11 @@ impl eframe::App for App {
         }
     }
 
+    /// The page's own colour, not eframe's translucent grey: see [`crate::ui::kit::clear_color`].
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        crate::ui::kit::clear_color(visuals)
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let events = crate::ui::show(ui, &mut self.model, crate::now_ms());
         let ctx = ui.ctx().clone();

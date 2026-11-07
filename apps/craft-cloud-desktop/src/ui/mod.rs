@@ -126,4 +126,7 @@ pub fn ago(now_ms: i64, then_ms: i64) -> String {
 mod tests;
 
 #[cfg(test)]
+mod tests_kit;
+
+#[cfg(test)]
 mod tests_security;

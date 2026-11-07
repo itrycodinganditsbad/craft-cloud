@@ -1,6 +1,7 @@
 //! The window's look, as a small kit the screens draw with: colour [`Tokens`] for the dark and the light appearance,
 //! [`apply`] (fonts, visuals, spacing), and a few widgets: [`Button`] (outlined, primary or danger), [`icon_button`],
-//! [`tag`], [`section_label`], [`card`], [`table_row`], [`headline`] and [`wordmark`].
+//! [`tag`], [`badge`], [`text_edit`], [`tab`], [`segmented`], [`text_link`], [`section_label`], [`card`], [`table`] (and the
+//! older [`table_row`]), [`joined_cells`], [`headline`] and [`wordmark`].
 //!
 //! The look is hard edges, 1 px hairlines instead of shadows, Archivo for headlines, Inter for text and Geist Mono for
 //! labels and buttons. Nothing outside this module hard-codes a colour: read [`Tokens::get`].
@@ -133,10 +134,21 @@ pub enum Tone {
     Bad,
 }
 
-/// The height of buttons and text fields.
-pub const CONTROL_H: f32 = 22.0;
-/// Size of labels, tags and buttons (Geist Mono).
-const LABEL_SIZE: f32 = 10.0;
+/// The height of buttons and text fields (the mockups' main, security and trash screens use 36 to 40; 40 is the default).
+pub const CONTROL_H: f32 = 40.0;
+/// The height of the large controls of the first run ([`Button::large`], [`text_edit_large`]).
+pub const CONTROL_H_LARGE: f32 = 44.0;
+/// The height of a tab of the page bar.
+const TAB_H: f32 = 32.0;
+/// The size of a page's title, and of the first run's.
+pub const HEADING_SIZE: f32 = 30.0;
+pub const HEADING_SIZE_LARGE: f32 = 34.0;
+/// Size of labels, tabs and buttons (Geist Mono).
+const LABEL_SIZE: f32 = 12.0;
+/// Size of tags (Geist Mono).
+const TAG_SIZE: f32 = 11.0;
+/// The gap between a control's border and its keyboard focus ring.
+const FOCUS_GAP: f32 = 2.0;
 
 /// Inter 500.
 pub fn medium() -> FontFamily {
@@ -232,10 +244,12 @@ pub fn apply(ctx: &Context) {
     ctx.set_visuals_of(egui::Theme::Dark, visuals(&Tokens::DARK));
     ctx.set_visuals_of(egui::Theme::Light, visuals(&Tokens::LIGHT));
     ctx.all_styles_mut(|style| {
-        style.spacing.button_padding = egui::vec2(8.0, 2.0);
+        style.spacing.button_padding = egui::vec2(16.0, 4.0);
+        // Solid scroll bars take their own room instead of floating over the content's right edge.
+        style.spacing.scroll = egui::style::ScrollStyle::solid();
         style.text_styles = [
-            (TextStyle::Heading, FontId::new(19.0, display())),
-            (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
+            (TextStyle::Heading, FontId::new(HEADING_SIZE, display())),
+            (TextStyle::Body, FontId::new(14.0, FontFamily::Proportional)),
             (TextStyle::Button, FontId::new(13.0, FontFamily::Proportional)),
             (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
             (TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace)),
@@ -243,6 +257,15 @@ pub fn apply(ctx: &Context) {
         .into();
     });
     ctx.data_mut(|d| d.insert_temp(Id::new("craft-cloud-kit-applied"), true));
+}
+
+/// What the window is cleared with before anything is drawn, as eframe's `App::clear_color` wants it (`visuals` is the
+/// appearance being shown). eframe's default is a translucent dark grey (12, 12, 12, 180). egui's panels reserve a 1 px
+/// gap for their separator line, and the line is drawn in the hairline colour, which is translucent: over eframe's default
+/// clear colour it came out near-black in the light appearance. kittest's renderer does not go through eframe, which is why
+/// the snapshots never showed it. Clearing with the panel fill makes the hairline blend over the page's own colour.
+pub fn clear_color(visuals: &Visuals) -> [f32; 4] {
+    visuals.panel_fill.to_normalized_gamma_f32()
 }
 
 /// Whether `ctx` has been set up by [`apply`].
@@ -280,9 +303,10 @@ fn mono_label(ui: &mut Ui, text: &str, size: f32, family: FontFamily, color: Col
     response
 }
 
-/// The border that shows keyboard focus on a button.
+/// The border that shows keyboard focus on a control: 2 px wide, [`FOCUS_GAP`] outside the control's own border, so it never
+/// blends with a red or a strong border.
 fn focus_ring(ui: &Ui, rect: egui::Rect, t: &Tokens) {
-    ui.painter().rect_stroke(rect, CornerRadius::ZERO, Stroke::new(2.0, t.accent_ink), egui::StrokeKind::Outside);
+    ui.painter().rect_stroke(rect.expand(FOCUS_GAP), CornerRadius::ZERO, Stroke::new(2.0, t.accent_ink), egui::StrokeKind::Outside);
 }
 
 /// How a [`Button`] looks.
@@ -317,6 +341,12 @@ impl Button {
     /// A button that deletes or ends something: the "bad" colour.
     pub fn danger(mut self) -> Self {
         self.kind = Kind::Danger;
+        self
+    }
+
+    /// The large variant of the first run: [`CONTROL_H_LARGE`] high.
+    pub fn large(mut self) -> Self {
+        self.min_size.y = self.min_size.y.max(CONTROL_H_LARGE);
         self
     }
 
@@ -425,13 +455,102 @@ pub fn icon_button(ui: &mut Ui, label: &str, icon: Icon) -> Response {
     response.on_hover_text(label)
 }
 
-/// A small outlined badge in upper-case mono, coloured by `tone`: "Online", "Paused", "Admin".
+/// A small outlined badge in upper-case mono, coloured by `tone`: "Online", "Paused", "Admin". It keeps its natural size
+/// (about 20 px high, 3 x 6 px padding) wherever it is put: it is allocated at exactly that size, so a table cell, a
+/// right-to-left layout or a wrapped row never stretches it, and a row's centring layout centres it vertically.
 pub fn tag(ui: &mut Ui, text: &str, tone: Tone) -> Response {
     let t = Tokens::get(ui.ctx());
     let color = t.tone(tone);
     let tint = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 20);
-    let frame = egui::Frame::new().stroke(Stroke::new(1.0, color)).fill(tint).inner_margin(egui::Margin::symmetric(6, 2));
-    frame.show(ui, |ui| mono_label(ui, text, LABEL_SIZE, mono(), color)).inner
+    let galley = label_galley(ui, text, TAG_SIZE, mono());
+    let size = galley.size() + egui::vec2(12.0, 6.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.rect(rect, CornerRadius::ZERO, tint, Stroke::new(1.0, color), egui::StrokeKind::Inside);
+        painter.galley(rect.center() - galley.size() / 2.0, galley, color);
+    }
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
+    response
+}
+
+/// A tab of a page bar: upper-case mono in regular weight, muted until hovered, the chosen one inverted. Draws no border
+/// (the keyboard focus ring aside); `selected` is only the look, the caller knows which page is shown. When the bar is
+/// disabled the chosen tab stays readable, outlined in the ink colour, while the others go faint.
+pub fn tab(ui: &mut Ui, text: &str, selected: bool) -> Response {
+    let t = Tokens::get(ui.ctx());
+    let enabled = ui.is_enabled();
+    let galley = label_galley(ui, text, LABEL_SIZE, mono());
+    let size = (galley.size() + egui::vec2(16.0, 12.0)).max(egui::vec2(0.0, TAB_H));
+    let (rect, response) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+    if ui.is_rect_visible(rect) {
+        let hot = enabled && (response.hovered() || response.is_pointer_button_down_on());
+        let (fill, color, border) = match (selected, enabled, hot) {
+            (true, true, _) => (t.invert_bg, t.invert_fg, Color32::TRANSPARENT),
+            (true, false, _) => (Color32::TRANSPARENT, t.ink_strong, t.ink),
+            (false, true, true) => (t.sunken, t.ink_strong, Color32::TRANSPARENT),
+            (false, true, false) => (Color32::TRANSPARENT, t.muted, Color32::TRANSPARENT),
+            (false, false, _) => (Color32::TRANSPARENT, t.faint, Color32::TRANSPARENT),
+        };
+        let painter = ui.painter();
+        painter.rect(rect, CornerRadius::ZERO, fill, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+        painter.galley(rect.center() - galley.size() / 2.0, galley, color);
+        if response.has_focus() {
+            focus_ring(ui, rect, &t);
+        }
+    }
+    response.widget_info(|| WidgetInfo::selected(WidgetType::Button, enabled, selected, text));
+    response
+}
+
+/// A single-line text field as high as a [`Button`], its text centred. egui has no style for a field's height, so the
+/// screens build theirs with this instead of `egui::TextEdit::singleline`.
+pub fn text_edit(text: &mut dyn egui::TextBuffer) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(text).min_size(egui::vec2(0.0, CONTROL_H)).vertical_align(egui::Align::Center)
+}
+
+/// Like [`text_edit`], [`CONTROL_H_LARGE`] high (the first run).
+pub fn text_edit_large(text: &mut dyn egui::TextBuffer) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(text).min_size(egui::vec2(0.0, CONTROL_H_LARGE)).vertical_align(egui::Align::Center)
+}
+
+/// The width a [`tab`] of `text` takes.
+pub fn tab_width(ui: &Ui, text: &str) -> f32 {
+    label_galley(ui, text, LABEL_SIZE, mono()).size().x + 16.0
+}
+
+/// A [`section_label`] on one line at most `max_width` wide: what doesn't fit is cut off with an ellipsis, and the whole
+/// text is the tooltip.
+pub fn section_label_fit(ui: &mut Ui, text: &str, max_width: f32) -> Response {
+    let t = Tokens::get(ui.ctx());
+    let format = egui::TextFormat {
+        font_id: FontId::new(LABEL_SIZE, mono()),
+        extra_letter_spacing: LABEL_SIZE * 0.09,
+        color: Color32::PLACEHOLDER,
+        ..Default::default()
+    };
+    let mut job = egui::text::LayoutJob::single_section(text.to_uppercase(), format);
+    job.wrap = egui::text::TextWrapping { max_width: max_width.max(0.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+    let galley = ui.painter().layout_job(job);
+    let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    ui.painter().galley(rect.min, galley, t.muted);
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
+    response.on_hover_text(text)
+}
+
+/// A small filled mark in upper-case mono, coloured by `tone`: the number of a section (`01`). Natural size, like [`tag`].
+pub fn badge(ui: &mut Ui, text: &str, tone: Tone) -> Response {
+    let t = Tokens::get(ui.ctx());
+    let galley = label_galley(ui, text, LABEL_SIZE, mono_bold());
+    let size = galley.size() + egui::vec2(14.0, 6.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::ZERO, t.tone(tone));
+        painter.galley(rect.center() - galley.size() / 2.0, galley, t.invert_fg);
+    }
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
+    response
 }
 
 /// The text of a section label: `01 / Title`.
@@ -486,15 +605,426 @@ pub fn table_row<R>(ui: &mut Ui, add_cells: impl FnOnce(&mut Ui) -> R) -> R {
     inner
 }
 
+/// A link in upper-case mono in the accent ink (`Computers ↗`, `Sign out`), `size` points high: it turns to the ink
+/// colour when hovered and shows the keyboard focus ring. It is a button for screen readers.
+pub fn text_link(ui: &mut Ui, text: &str, size: f32) -> Response {
+    let t = Tokens::get(ui.ctx());
+    let enabled = ui.is_enabled();
+    let galley = label_galley(ui, text, size, mono());
+    let pad = egui::vec2(0.0, 4.0);
+    let (rect, response) = ui.allocate_exact_size(galley.size() + 2.0 * pad, if enabled { Sense::click() } else { Sense::hover() });
+    if ui.is_rect_visible(rect) {
+        let color = if !enabled {
+            t.faint
+        } else if response.hovered() || response.is_pointer_button_down_on() {
+            t.ink_strong
+        } else {
+            t.accent_ink
+        };
+        ui.painter().galley(rect.center() - galley.size() / 2.0, galley, color);
+        if response.has_focus() {
+            focus_ring(ui, rect, &t);
+        }
+    }
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, text));
+    if enabled { response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { response }
+}
+
+/// One choice of a [`segmented`] control.
+#[derive(Clone, Copy, Debug)]
+pub struct Segment<'a> {
+    pub text: &'a str,
+    /// A number shown dimmed after the text ("All 3").
+    pub count: Option<usize>,
+    pub enabled: bool,
+}
+
+impl<'a> Segment<'a> {
+    pub fn new(text: &'a str) -> Self {
+        Self { text, count: None, enabled: true }
+    }
+
+    pub fn count(mut self, count: usize) -> Self {
+        self.count = Some(count);
+        self
+    }
+
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+}
+
+/// A segmented control: one 1 px frame with a divider between the segments and no gaps; the `selected` segment is
+/// inverted, a disabled one is faint. Every segment takes keyboard focus (Tab, then Enter or Space) and shows the focus
+/// ring; screen readers get a radio group called `label` of radio buttons with their selected state. Returns the index
+/// of the segment clicked, if any (the caller changes `selected`).
+pub fn segmented(ui: &mut Ui, label: &str, segments: &[Segment<'_>], selected: usize) -> Option<usize> {
+    let t = Tokens::get(ui.ctx());
+    let group_id = ui.make_persistent_id(("segmented", label));
+    let galleys: Vec<Arc<egui::Galley>> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let (fg, count) = segment_colors(&t, s.enabled, i == selected, false);
+            let mut job = egui::text::LayoutJob::default();
+            let format = |color| egui::TextFormat {
+                font_id: FontId::new(LABEL_SIZE, mono()),
+                extra_letter_spacing: LABEL_SIZE * 0.09,
+                color,
+                ..Default::default()
+            };
+            job.append(&s.text.to_uppercase(), 0.0, format(fg));
+            if let Some(n) = s.count {
+                job.append(&format!(" {n}"), 0.0, format(count));
+            }
+            ui.painter().layout_job(job)
+        })
+        .collect();
+    let widths: Vec<f32> = galleys.iter().map(|g| g.size().x + 28.0).collect();
+    let total: f32 = widths.iter().sum::<f32>() + 1.0;
+    let (frame, group) = ui.allocate_exact_size(egui::vec2(total, CONTROL_H), Sense::hover());
+    group.widget_info(|| WidgetInfo::labeled(WidgetType::RadioGroup, true, label));
+    let mut clicked = None;
+    let mut focused = None;
+    let mut x = frame.left() + 1.0;
+    for (i, segment) in segments.iter().enumerate() {
+        let (Some(width), Some(galley)) = (widths.get(i).copied(), galleys.get(i)) else { continue };
+        let rect = egui::Rect::from_min_size(egui::pos2(x, frame.top() + 1.0), egui::vec2(width, CONTROL_H - 2.0));
+        x += width;
+        let enabled = segment.enabled && ui.is_enabled();
+        let response = ui.interact(rect, group_id.with(i), if enabled { Sense::click() } else { Sense::hover() });
+        response.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, enabled, i == selected, segment.text));
+        if ui.is_rect_visible(rect) {
+            let hot = enabled && (response.hovered() || response.is_pointer_button_down_on());
+            let on = i == selected;
+            let fill = match (on, hot) {
+                (true, _) => t.invert_bg,
+                (false, true) => t.sunken,
+                (false, false) => Color32::TRANSPARENT,
+            };
+            let (fg, _) = segment_colors(&t, enabled, on, hot);
+            let painter = ui.painter();
+            painter.rect_filled(rect, CornerRadius::ZERO, fill);
+            painter.galley(rect.center() - galley.size() / 2.0, galley.clone(), fg);
+            if i + 1 < segments.len() {
+                painter.vline(rect.right(), frame.y_range(), Stroke::new(1.0, t.line_strong));
+            }
+        }
+        if response.has_focus() {
+            focused = Some(rect);
+        }
+        if response.clicked() && enabled {
+            clicked = Some(i);
+        }
+    }
+    if ui.is_rect_visible(frame) {
+        ui.painter().rect_stroke(frame, CornerRadius::ZERO, Stroke::new(1.0, t.line_strong), egui::StrokeKind::Inside);
+        if let Some(rect) = focused {
+            focus_ring(ui, rect, &t);
+        }
+    }
+    clicked
+}
+
+/// The text colour of a segment, and of its count.
+fn segment_colors(t: &Tokens, enabled: bool, on: bool, hot: bool) -> (Color32, Color32) {
+    match (on, enabled, hot) {
+        (true, true, _) => (t.invert_fg, t.invert_fg.gamma_multiply(0.7)),
+        (true, false, _) | (false, false, _) => (t.faint, t.faint),
+        (false, true, true) => (t.ink_strong, t.muted),
+        (false, true, false) => (t.muted, t.faint),
+    }
+}
+
+/// How a [`table`] column gets its width.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Width {
+    /// Exactly this wide.
+    Fixed(f32),
+    /// At least `min` wide; what the table has beyond its columns' minimums is shared between the flexible columns by
+    /// `weight`.
+    Flex { min: f32, weight: f32 },
+}
+
+/// A column of a [`table`].
+#[derive(Clone, Copy, Debug)]
+pub struct Column<'a> {
+    pub title: &'a str,
+    pub width: Width,
+}
+
+impl<'a> Column<'a> {
+    pub fn fixed(title: &'a str, width: f32) -> Self {
+        Self { title, width: Width::Fixed(width) }
+    }
+
+    pub fn flex(title: &'a str, min: f32) -> Self {
+        Self { title, width: Width::Flex { min, weight: 1.0 } }
+    }
+
+    /// A flexible column that takes `weight` shares of the spare room (a plain [`flex`](Self::flex) takes one).
+    pub fn weighted(mut self, weight: f32) -> Self {
+        if let Width::Flex { min, .. } = self.width {
+            self.width = Width::Flex { min, weight };
+        }
+        self
+    }
+}
+
+/// The room around a table cell's content, left and right.
+const CELL_PAD: f32 = 16.0;
+/// The height of a table's header row.
+const TABLE_HEADER_H: f32 = 40.0;
+
+/// The widths of `columns` in a table `total` wide (never below the fixed widths plus the flexible minimums).
+pub fn column_widths(columns: &[Column<'_>], total: f32) -> Vec<f32> {
+    let base: f32 = columns
+        .iter()
+        .map(|c| match c.width {
+            Width::Fixed(w) => w,
+            Width::Flex { min, .. } => min,
+        })
+        .sum();
+    let weights: f32 = columns.iter().map(|c| if let Width::Flex { weight, .. } = c.width { weight } else { 0.0 }).sum();
+    let extra = (total - base).max(0.0);
+    columns
+        .iter()
+        .map(|c| match c.width {
+            Width::Fixed(w) => w,
+            Width::Flex { min, weight } if weights > 0.0 => min + extra * weight / weights,
+            Width::Flex { min, .. } => min,
+        })
+        .collect()
+}
+
+/// The least width of a table with `columns`.
+pub fn table_min_width(columns: &[Column<'_>]) -> f32 {
+    column_widths(columns, 0.0).iter().sum()
+}
+
+/// A table the mockups' way: a header row of upper-case mono labels and `rows` rows of `row_height`, a 1 px hairline
+/// under the header and every row (no stripes), a hairline frame around, as wide as the space it is given. Columns are
+/// fixed or flexible with a minimum; when the space is below their minimums the table scrolls sideways in a scroll area of
+/// its own, with a solid bar. `cell(ui, row, column)` fills one cell: the cell's `ui` centres what it holds vertically and
+/// is clipped to the cell; the last column is right-aligned for actions, so add its rightmost widget first. For a name
+/// over a muted path use one [`egui::Label`] of two formatted lines, or [`truncated`] for one line that ends with "…"
+/// (and is shown whole as its hover text).
+pub fn table(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    columns: &[Column<'_>],
+    rows: usize,
+    row_height: f32,
+    mut cell: impl FnMut(&mut Ui, usize, usize),
+) {
+    let t = Tokens::get(ui.ctx());
+    let id = ui.id().with(("table", id_salt));
+    let width = ui.available_width().max(table_min_width(columns));
+    let widths = column_widths(columns, width);
+    let height = TABLE_HEADER_H + rows as f32 * row_height;
+    let last = columns.len().saturating_sub(1);
+    let layout = |c: usize| {
+        if c == last { egui::Layout::right_to_left(egui::Align::Center) } else { egui::Layout::left_to_right(egui::Align::Center) }
+    };
+    egui::ScrollArea::horizontal().id_salt(id.with("scroll")).auto_shrink([false, true]).show(ui, |ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+        let painter = ui.painter().clone();
+        let mut x = rect.left();
+        for (c, column) in columns.iter().enumerate() {
+            let w = widths.get(c).copied().unwrap_or_default();
+            let cell_rect = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, TABLE_HEADER_H));
+            x += w;
+            let builder = egui::UiBuilder::new().id_salt((id, "head", c)).max_rect(cell_rect.shrink2(egui::vec2(CELL_PAD, 0.0))).layout(layout(c));
+            let mut child = ui.new_child(builder);
+            child.set_clip_rect(cell_rect.intersect(ui.clip_rect()));
+            if !column.title.is_empty() {
+                section_label(&mut child, column.title);
+            }
+        }
+        painter.hline(rect.x_range(), rect.top() + TABLE_HEADER_H - 0.5, t.hairline());
+        for row in 0..rows {
+            let top = rect.top() + TABLE_HEADER_H + row as f32 * row_height;
+            let mut x = rect.left();
+            for (c, w) in widths.iter().enumerate() {
+                let cell_rect = egui::Rect::from_min_size(egui::pos2(x, top), egui::vec2(*w, row_height));
+                x += w;
+                let builder = egui::UiBuilder::new().id_salt((id, row, c)).max_rect(cell_rect.shrink2(egui::vec2(CELL_PAD, 0.0))).layout(layout(c));
+                let mut child = ui.new_child(builder);
+                child.set_clip_rect(cell_rect.intersect(ui.clip_rect()));
+                child.spacing_mut().item_spacing.x = 10.0;
+                cell(&mut child, row, c);
+            }
+            if row + 1 < rows {
+                painter.hline(rect.x_range(), top + row_height - 0.5, t.hairline());
+            }
+        }
+        painter.rect_stroke(rect, CornerRadius::ZERO, t.hairline(), egui::StrokeKind::Inside);
+    });
+}
+
+/// One line of text that ends with "…" when it doesn't fit, and is shown whole as its hover text.
+pub fn truncated(ui: &mut Ui, text: impl Into<egui::WidgetText>) -> Response {
+    ui.add(egui::Label::new(text).truncate().selectable(false))
+}
+
+/// One cell of [`joined_cells`]: the badge (`01`) and the label on the right of its header strip.
+#[derive(Clone, Copy, Debug)]
+pub struct JoinedCell<'a> {
+    pub badge: &'a str,
+    pub tone: Tone,
+    /// The mono label on the right of the header strip.
+    pub label: &'a str,
+    /// The label is a link (`Computers ↗`): the call returns whether it was clicked.
+    pub link: bool,
+}
+
+impl<'a> JoinedCell<'a> {
+    pub fn new(badge: &'a str, tone: Tone, label: &'a str) -> Self {
+        Self { badge, tone, label, link: false }
+    }
+
+    pub fn link(mut self) -> Self {
+        self.link = true;
+        self
+    }
+}
+
+/// Which part of a [`joined_cells`] cell is being drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// The cell's content, from the top.
+    Body,
+    /// What sits at the bottom of the cell whatever the body's height (the actions).
+    Footer,
+}
+
+/// The height of a joined cell's header strip, the room above and below its body, and the gap before its footer.
+const JOINED_HEADER_H: f32 = 44.0;
+const JOINED_PAD_Y: f32 = 20.0;
+const JOINED_PAD_X: f32 = 16.0;
+const JOINED_GAP: f32 = 14.0;
+
+/// How many columns `cells` cells get in `width`: one below `stack_below`, otherwise a row.
+pub fn joined_columns(cells: usize, width: f32, stack_below: f32) -> usize {
+    if width < stack_below { 1 } else { cells.max(1) }
+}
+
+/// N cells that share hairlines: no gaps, every cell of a row as high as the highest, each with a header strip (a filled
+/// badge on the left, a mono label on the right), a left-aligned body, and a footer at the bottom of the cell. They stack
+/// into one column when `ui` is narrower than `stack_below`.
+///
+/// `add(ui, i, part)` draws the [`Part::Body`] and then the [`Part::Footer`] of cell `i` (with nothing drawn the footer
+/// takes no room). Heights are measured while drawing and kept for the next frame, so a change of content takes one more
+/// pass (the call asks for it). Returns, per cell, whether its header label was clicked (see [`JoinedCell::link`]).
+pub fn joined_cells(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    cells: &[JoinedCell<'_>],
+    stack_below: f32,
+    mut add: impl FnMut(&mut Ui, usize, Part),
+) -> Vec<bool> {
+    let t = Tokens::get(ui.ctx());
+    let id = ui.id().with(("joined-cells", id_salt));
+    let width = ui.available_width().floor();
+    let columns = joined_columns(cells.len(), width, stack_below);
+    let cell_w = (width / columns as f32).floor();
+    let stored: Vec<[f32; 2]> = ui.data(|d| d.get_temp(id)).unwrap_or_default();
+    let mut measured = vec![[0.0_f32; 2]; cells.len()];
+    let mut clicked = vec![false; cells.len()];
+    let top = ui.cursor().top();
+    let left = ui.cursor().left();
+    let mut grid_bottom = top;
+    // The rows share their hairline: no gap between them.
+    let item_spacing = std::mem::replace(&mut ui.spacing_mut().item_spacing.y, 0.0);
+    for (row, chunk) in cells.chunks(columns).enumerate() {
+        let first = row * columns;
+        let y = ui.cursor().top();
+        let stored_h = (first..first + chunk.len()).map(|i| stored.get(i).map_or(0.0, |s| s[0])).fold(0.0, f32::max);
+        for (k, cell) in chunk.iter().enumerate() {
+            let i = first + k;
+            let x = left + k as f32 * cell_w;
+            let inner = egui::Rect::from_min_size(egui::pos2(x + JOINED_PAD_X, y), egui::vec2(cell_w - 2.0 * JOINED_PAD_X, JOINED_HEADER_H));
+            let mut head = ui
+                .new_child(egui::UiBuilder::new().id_salt((id, i, "badge")).max_rect(inner).layout(egui::Layout::left_to_right(egui::Align::Center)));
+            badge(&mut head, cell.badge, cell.tone);
+            let mut label = ui
+                .new_child(egui::UiBuilder::new().id_salt((id, i, "label")).max_rect(inner).layout(egui::Layout::right_to_left(egui::Align::Center)));
+            if cell.link {
+                if let Some(slot) = clicked.get_mut(i) {
+                    *slot = text_link(&mut label, cell.label, LABEL_SIZE).clicked();
+                }
+            } else {
+                section_label(&mut label, cell.label);
+            }
+            let body_rect = egui::Rect::from_min_size(
+                egui::pos2(x + JOINED_PAD_X, y + JOINED_HEADER_H + JOINED_PAD_Y),
+                egui::vec2(cell_w - 2.0 * JOINED_PAD_X, 10_000.0),
+            );
+            let mut body =
+                ui.new_child(egui::UiBuilder::new().id_salt((id, i, "body")).max_rect(body_rect).layout(egui::Layout::top_down(egui::Align::Min)));
+            body.spacing_mut().item_spacing.y = JOINED_GAP;
+            add(&mut body, i, Part::Body);
+            let body_bottom = body.min_rect().bottom().max(body_rect.top());
+            let stored_footer = stored.get(i).map_or(0.0, |s| s[1]);
+            let footer_top = (y + stored_h.max(0.0) - JOINED_PAD_Y - stored_footer).max(body_bottom + JOINED_GAP);
+            let footer_rect = egui::Rect::from_min_size(egui::pos2(x + JOINED_PAD_X, footer_top), egui::vec2(cell_w - 2.0 * JOINED_PAD_X, 10_000.0));
+            let mut footer = ui
+                .new_child(egui::UiBuilder::new().id_salt((id, i, "footer")).max_rect(footer_rect).layout(egui::Layout::top_down(egui::Align::Min)));
+            footer.spacing_mut().item_spacing.y = item_spacing;
+            add(&mut footer, i, Part::Footer);
+            let footer_h = footer.min_rect().height();
+            // The cell's own height, whatever the row's: the body, the gap, the footer.
+            let natural = body_bottom + if footer_h > 0.0 { JOINED_GAP + footer_h } else { 0.0 } + JOINED_PAD_Y - y;
+            if let Some(slot) = measured.get_mut(i) {
+                *slot = [natural, footer_h];
+            }
+        }
+        let row_h = (first..first + chunk.len()).map(|i| measured.get(i).map_or(0.0, |m| m[0])).fold(JOINED_HEADER_H + 2.0 * JOINED_PAD_Y, f32::max);
+        let painter = ui.painter();
+        for k in 0..chunk.len() {
+            let x = left + k as f32 * cell_w;
+            painter.hline(x..=x + cell_w, y + JOINED_HEADER_H - 0.5, t.hairline());
+            painter.vline(x + cell_w - 0.5, y..=y + row_h, t.hairline());
+            painter.hline(x..=x + cell_w, y + row_h - 0.5, t.hairline());
+        }
+        grid_bottom = y + row_h;
+        ui.allocate_space(egui::vec2(cell_w * columns as f32, row_h));
+    }
+    ui.spacing_mut().item_spacing.y = item_spacing;
+    let bottom = grid_bottom;
+    let right = left + cell_w * columns as f32;
+    ui.painter().hline(left..=right, top + 0.5, t.hairline());
+    ui.painter().vline(left + 0.5, top..=bottom, t.hairline());
+    // Equal heights need the highest cell of a row known before the row is drawn: use last frame's, and draw once more
+    // when this frame's differ.
+    let changed = stored.len() != measured.len() || stored.iter().zip(&measured).any(|(a, b)| (a[0] - b[0]).abs() > 0.5 || (a[1] - b[1]).abs() > 0.5);
+    if changed {
+        ui.data_mut(|d| d.insert_temp(id, measured));
+        ui.ctx().request_discard("joined cells measured");
+        ui.ctx().request_repaint();
+    }
+    clicked
+}
+
 /// The text of a headline, `size` points in the display face.
 pub fn headline_text(text: &str, size: f32) -> RichText {
     RichText::new(text).family(display()).size(size).extra_letter_spacing(-0.02 * size)
 }
 
-/// A screen's headline, in the display face at the heading size.
+/// A screen's headline, in the display face at the heading size ([`HEADING_SIZE`]).
 pub fn headline(ui: &mut Ui, text: &str) -> Response {
+    headline_sized(ui, text, HEADING_SIZE)
+}
+
+/// The first run's headline ([`HEADING_SIZE_LARGE`]).
+pub fn headline_large(ui: &mut Ui, text: &str) -> Response {
+    headline_sized(ui, text, HEADING_SIZE_LARGE)
+}
+
+fn headline_sized(ui: &mut Ui, text: &str, size: f32) -> Response {
     let t = Tokens::get(ui.ctx());
-    ui.add(egui::Label::new(headline_text(text, 19.0).color(t.ink_strong)).selectable(false))
+    ui.add(egui::Label::new(headline_text(text, size).color(t.ink_strong)).selectable(false))
 }
 
 /// "Craft" followed by " Cloud" in the accent ink, in the display face.

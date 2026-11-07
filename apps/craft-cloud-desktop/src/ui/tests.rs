@@ -137,11 +137,27 @@ fn harness(model: Model, theme: egui::Theme) -> Harness<'static, (Model, Vec<Eve
     )
 }
 
+/// The harness in a window tall enough for a whole page without scrolling: kittest clicks only what is on screen, and the
+/// kit's controls are taller than they were.
+fn tall_harness(model: Model, theme: egui::Theme) -> Harness<'static, (Model, Vec<Event>)> {
+    Harness::builder().with_size(egui::vec2(WINDOW_SIZE[0], 1400.0)).with_theme(theme).wgpu_setup(shared_wgpu()).build_ui_state(
+        |ui, (model, events): &mut (Model, Vec<Event>)| {
+            events.extend(show(ui, model, NOW));
+        },
+        (model, Vec::new()),
+    )
+}
+
 /// Draws `model` and compares it with the snapshot `name`.
 fn snapshot(model: Model, theme: egui::Theme, name: &str) {
     let mut h = harness(model, theme);
     h.run_steps(4);
     let image = h.render().unwrap();
+    compare(image, name);
+}
+
+/// Compares `image` with the snapshot `name` (or writes it with `UPDATE_SNAPSHOTS=1`).
+pub(super) fn compare(image: image::RgbaImage, name: &str) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("snapshots");
     let path = dir.join(format!("{name}.png"));
     if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
@@ -527,7 +543,7 @@ fn snapshot_removed_and_error() {
 /// Clicks reach the model as the events they stand for.
 #[test]
 fn buttons_send_their_events() {
-    let mut h = harness(signed_in_model(signed_in()), egui::Theme::Light);
+    let mut h = tall_harness(signed_in_model(signed_in()), egui::Theme::Light);
     h.run_steps(2);
     h.get_by_label("Add a computer").click();
     h.run_steps(2);
@@ -719,7 +735,7 @@ fn a_member_has_no_administration_button() {
 fn admin_buttons_send_their_events() {
     let agent = admin_agent();
     let model = after(&agent, vec![Event::Devices(Ok(devices()))]);
-    let mut h = harness(model, egui::Theme::Light);
+    let mut h = tall_harness(model, egui::Theme::Light);
     h.run_steps(2);
     h.get_by_label("Administration").click();
     h.run_steps(2);
@@ -728,7 +744,7 @@ fn admin_buttons_send_their_events() {
     let model = on_admin_pages(&agent, Vec::new());
     let ana = id_of(&model, "ana");
     let fabio = id_of(&model, "fabio");
-    let mut h = harness(model, egui::Theme::Light);
+    let mut h = tall_harness(model, egui::Theme::Light);
     h.run_steps(2);
     h.get_by_label("New account").click();
     h.run_steps(2);
@@ -756,7 +772,7 @@ fn admin_buttons_send_their_events() {
 
     // Ana is enabled and has a computer: the buttons ask for the password of their change.
     let model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(ana))]);
-    let mut h = harness(model, egui::Theme::Light);
+    let mut h = tall_harness(model, egui::Theme::Light);
     h.run_steps(2);
     for label in ["Save changes", "Disable", "Remove", "New invite", "Password reset code", "Revoke open code", "Revoke"] {
         h.get_by_label(label).click();
@@ -781,7 +797,7 @@ fn admin_buttons_send_their_events() {
     assert!(events.contains(&Event::Admin(AdminEvent::SubmitEdit)));
     // Your own account has no Disable or Remove.
     let model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(fabio))]);
-    let mut h = harness(model, egui::Theme::Light);
+    let mut h = tall_harness(model, egui::Theme::Light);
     h.run_steps(2);
     assert_eq!(h.query_all_by_label("Disable").count() + h.query_all_by_label("Remove").count(), 0);
 
@@ -789,7 +805,7 @@ fn admin_buttons_send_their_events() {
     let mut model = on_admin_pages(&agent, Vec::new());
     model.update(Event::Admin(AdminEvent::Ask(Action::Enable { id: ana, username: "ana".into() })));
     password_typed(&mut model, "pw");
-    let mut h = harness(model, egui::Theme::Light);
+    let mut h = tall_harness(model, egui::Theme::Light);
     h.run_steps(2);
     h.get_by_label("Enable").click();
     h.run_steps(2);
@@ -802,7 +818,7 @@ fn admin_buttons_send_their_events() {
     model.update(Event::Admin(AdminEvent::Ask(Action::IssueReset { id: ana, username: "ana".into(), reset_two_factor: false })));
     password_typed(&mut model, "pw");
     confirm_sent(&mut model, &agent);
-    let mut h = harness(model, egui::Theme::Light);
+    let mut h = tall_harness(model, egui::Theme::Light);
     h.run_steps(2);
     h.get_by_label("Done").click();
     h.run_steps(2);
