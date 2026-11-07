@@ -573,6 +573,19 @@ impl Model {
         }
     }
 
+    /// Leaves a page for a fresh overview, which asks again for everything it shows: the computers, the admin
+    /// check and the storage usage. Without the last two the view would wait for answers nobody asked for.
+    fn back_to_overview(&mut self) -> Vec<Effect> {
+        let Some(status) = self.status.clone().filter(|s| s.signed_in) else {
+            self.screen = Screen::Starting;
+            return Vec::new();
+        };
+        let overview = Overview::new(status);
+        let session = overview.session;
+        self.screen = Screen::SignedIn(overview);
+        vec![Effect::Devices, Effect::Account { session }, self.next_usage_request()]
+    }
+
     fn next_usage_request(&mut self) -> Effect {
         self.usage_request_id = self.usage_request_id.wrapping_add(1);
         Effect::Usage(self.usage_request_id)
@@ -891,10 +904,8 @@ impl Model {
             }
             Event::BackTrash => {
                 if matches!(self.screen, Screen::Trash(_)) {
-                    self.screen =
-                        self.status.clone().filter(|s| s.signed_in).map(|s| Screen::SignedIn(Overview::new(s))).unwrap_or_else(|| Screen::Starting);
                     self.trash_ticket = self.trash_ticket.saturating_add(1);
-                    return self.overview().map(|_| Effect::Devices).into_iter().collect();
+                    return self.back_to_overview();
                 }
                 Vec::new()
             }
@@ -968,10 +979,8 @@ impl Model {
             }
             Event::BackVersions => {
                 if let Screen::Versions(_) = self.screen {
-                    self.screen =
-                        self.status.clone().filter(|s| s.signed_in).map(|s| Screen::SignedIn(Overview::new(s))).unwrap_or_else(|| Screen::Starting);
                     self.versions_ticket = self.versions_ticket.saturating_add(1);
-                    return self.overview().map(|_| Effect::Devices).into_iter().collect();
+                    return self.back_to_overview();
                 }
                 Vec::new()
             }
@@ -1804,6 +1813,33 @@ pub(crate) mod tests {
         m.update(Event::TrashRestored { ticket, result: Ok(trash_restore_response(id, "painting (1).png", true)) });
         let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
         assert_eq!(t.notice.as_deref(), Some("Restored as painting (1).png. The destination path is unavailable."));
+    }
+
+    #[test]
+    fn back_from_trash_or_versions_asks_again_for_usage_and_admin_access() {
+        for (open, back) in [(Event::OpenTrash, Event::BackTrash), (Event::OpenVersions, Event::BackVersions)] {
+            let mut m = model();
+            m.status = Some(status(true));
+            m.screen = Screen::SignedIn(Overview::new(status(true)));
+            m.update(open);
+            let effects = m.update(back);
+            let overview = m.overview().expect("back on the overview");
+            assert!(overview.usage_loading, "{effects:?}");
+            let session = overview.session;
+            assert!(effects.contains(&Effect::Devices), "{effects:?}");
+            assert!(effects.contains(&Effect::Account { session }), "{effects:?}");
+            let Some(&Effect::Usage(id)) = effects.iter().find(|e| matches!(e, Effect::Usage(_))) else { panic!("{effects:?}") };
+            let usage = craft_cloud_app::AccountUsage {
+                stored_bytes: 1,
+                quota_bytes: None,
+                trash_bytes: None,
+                history_bytes: None,
+                estimates: craft_cloud_app::UsageEstimates { index_complete: true, reason: None },
+            };
+            m.update(Event::Usage { request_id: id, result: Ok(usage) });
+            let overview = m.overview().unwrap();
+            assert!(!overview.usage_loading && overview.usage.is_some(), "the overview doesn't stay loading");
+        }
     }
 
     #[test]
