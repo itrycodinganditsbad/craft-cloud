@@ -98,13 +98,13 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut SecurityPage, events: &mut Vec<
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.add(egui::Label::new(RichText::new(secret.as_str()).monospace().size(16.0).strong()).selectable(true));
-                if ui.small_button("Copy").clicked() {
+                if ui.add(super::kit::Button::new("Copy")).clicked() {
                     ui.ctx().copy_text(secret.clone());
                 }
             });
             ui.collapsing("The setup link", |ui| {
                 ui.add(egui::Label::new(RichText::new(uri.as_str()).monospace().small()).selectable(true).wrap());
-                if ui.small_button("Copy link").clicked() {
+                if ui.add(super::kit::Button::new("Copy link")).clicked() {
                     ui.ctx().copy_text(uri.clone());
                 }
             });
@@ -133,7 +133,7 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut SecurityPage, events: &mut Vec<
                 }
             });
             ui.add_space(8.0);
-            if ui.button("Copy all").clicked() {
+            if ui.add(super::kit::Button::new("Copy all")).clicked() {
                 ui.ctx().copy_text(codes.join("\n"));
             }
             ui.add_space(10.0);
@@ -148,7 +148,7 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut SecurityPage, events: &mut Vec<
             ui.label(if *recovery { "A recovery code" } else { "The six digits from the app" });
             let response = ui.add(egui::TextEdit::singleline(code).id(secret_id("disable-code")).desired_width(f32::INFINITY));
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.small_button(if *recovery { "Use a code from the app" } else { "Use a recovery code instead" }).clicked() {
+            if ui.add(super::kit::Button::new(if *recovery { "Use a code from the app" } else { "Use a recovery code instead" })).clicked() {
                 send(events, SecurityEvent::ToggleRecovery);
             }
             ui.add_space(6.0);
@@ -196,7 +196,7 @@ fn footer(ui: &mut egui::Ui, busy: bool, error: Option<&str>, button: &str, ente
         send(events, SecurityEvent::Submit);
     }
     ui.add_space(4.0);
-    if ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked() {
+    if ui.add_enabled(!busy, super::kit::Button::new("Cancel")).clicked() {
         send(events, SecurityEvent::Home);
     }
 }
@@ -210,7 +210,7 @@ fn home(ui: &mut egui::Ui, info: &TwoFactorInfo, busy: bool, note: Option<&str>,
         super::error_line(ui, error);
         ui.add_space(8.0);
     }
-    ui.label(RichText::new("Two-factor sign-in").strong());
+    super::kit::section_label(ui, "Two-factor sign-in");
     match info {
         TwoFactorInfo::Loading => {
             ui.horizontal(|ui| {
@@ -224,7 +224,7 @@ fn home(ui: &mut egui::Ui, info: &TwoFactorInfo, busy: bool, note: Option<&str>,
         }
         TwoFactorInfo::Failed(why) => {
             super::error_line(ui, why);
-            if ui.button("Try again").clicked() {
+            if ui.add(super::kit::Button::new("Try again")).clicked() {
                 send(events, SecurityEvent::Refresh);
             }
         }
@@ -232,10 +232,10 @@ fn home(ui: &mut egui::Ui, info: &TwoFactorInfo, busy: bool, note: Option<&str>,
             ui.label(format!("On. {} recovery codes left.", status.recovery_codes_left));
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.add_enabled(!busy, egui::Button::new("Turn off…")).clicked() {
+                if ui.add_enabled(!busy, super::kit::Button::new("Turn off…")).clicked() {
                     send(events, SecurityEvent::StartDisable);
                 }
-                if ui.add_enabled(!busy, egui::Button::new("New recovery codes…")).clicked() {
+                if ui.add_enabled(!busy, super::kit::Button::new("New recovery codes…")).clicked() {
                     send(events, SecurityEvent::StartRegenerate);
                 }
             });
@@ -246,7 +246,7 @@ fn home(ui: &mut egui::Ui, info: &TwoFactorInfo, busy: bool, note: Option<&str>,
                 ui.label(RichText::new("A set-up was started and isn't finished.").small().weak());
             }
             ui.add_space(4.0);
-            if ui.add_enabled(!busy, egui::Button::new("Set up two-factor sign-in…")).clicked() {
+            if ui.add_enabled(!busy, super::kit::Button::new("Set up two-factor sign-in…")).clicked() {
                 send(events, SecurityEvent::StartSetup);
             }
         }
@@ -255,10 +255,10 @@ fn home(ui: &mut egui::Ui, info: &TwoFactorInfo, busy: bool, note: Option<&str>,
     ui.separator();
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        if ui.button("Change password…").clicked() {
+        if ui.add(super::kit::Button::new("Change password…")).clicked() {
             send(events, SecurityEvent::StartPassword);
         }
-        if ui.button("Sign out other computers…").clicked() {
+        if ui.add(super::kit::Button::new("Sign out other computers…")).clicked() {
             send(events, SecurityEvent::StartSignOutOthers);
         }
     });

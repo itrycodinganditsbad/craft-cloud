@@ -7,6 +7,7 @@ mod admin;
 mod audit;
 mod computers;
 mod join;
+pub mod kit;
 mod overview;
 mod problem;
 mod second_factor;
@@ -15,6 +16,8 @@ mod trash;
 mod versions;
 
 use egui::{Color32, RichText};
+
+use self::kit::Tokens;
 
 use crate::model::{Event, Model, Screen};
 
@@ -26,6 +29,9 @@ pub const TITLE: &str = "Craft Cloud";
 /// Draws the window for `model` at `now_ms`, and returns what its buttons asked for.
 pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
     let mut events = Vec::new();
+    if !kit::ensure(ui.ctx()) {
+        return events;
+    }
     security::forget_secrets(ui.ctx(), &model.screen);
     egui::CentralPanel::default().show(ui, |ui| {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -58,7 +64,7 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
 }
 
 fn starting(ui: &mut egui::Ui) {
-    heading(ui, "Craft Cloud");
+    wordmark(ui);
     ui.horizontal(|ui| {
         ui.spinner();
         ui.label("Starting Craft Cloud…");
@@ -67,13 +73,19 @@ fn starting(ui: &mut egui::Ui) {
 
 /// A screen's heading.
 fn heading(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).heading().strong());
+    kit::headline(ui, text);
+    ui.add_space(10.0);
+}
+
+/// A screen's heading that is the product's name.
+fn wordmark(ui: &mut egui::Ui) {
+    kit::wordmark(ui, 19.0);
     ui.add_space(10.0);
 }
 
 /// A line saying what went wrong.
 fn error_line(ui: &mut egui::Ui, text: &str) {
-    let color = ui.visuals().error_fg_color;
+    let color = Tokens::get(ui.ctx()).bad;
     ui.add(egui::Label::new(RichText::new(text).color(color)).wrap());
 }
 
@@ -84,13 +96,13 @@ fn problem_line(reason: &str) -> String {
 
 /// A main button, wide.
 fn wide_button(ui: &mut egui::Ui, enabled: bool, text: &str) -> bool {
-    let size = egui::vec2(ui.available_width(), 30.0);
-    ui.add_enabled_ui(enabled, |ui| ui.add_sized(size, egui::Button::new(RichText::new(text).strong()))).inner.clicked()
+    let size = egui::vec2(ui.available_width(), kit::CONTROL_H);
+    ui.add_enabled_ui(enabled, |ui| ui.add_sized(size, kit::Button::new(text).primary().min_size(size))).inner.clicked()
 }
 
 /// The good-news colour (synced, joined).
 fn good(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode { Color32::from_rgb(120, 200, 140) } else { Color32::from_rgb(30, 120, 60) }
+    Tokens::get(ui.ctx()).good
 }
 
 /// The server's address without its scheme, as people say it: `cloud.shadows.ch`.

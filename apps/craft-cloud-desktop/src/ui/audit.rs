@@ -55,11 +55,11 @@ fn paging(ui: &mut egui::Ui, list: &AuditList, previous: AuditMsg, next: AuditMs
         return;
     }
     ui.horizontal(|ui| {
-        if ui.add_enabled(list.has_previous() && !list.loading, egui::Button::new("Previous")).clicked() {
+        if ui.add_enabled(list.has_previous() && !list.loading, super::kit::Button::new("Previous")).clicked() {
             send(events, previous);
         }
         ui.label(format!("Page {}", list.page()));
-        if ui.add_enabled(list.next.is_some() && !list.loading, egui::Button::new("Next")).clicked() {
+        if ui.add_enabled(list.next.is_some() && !list.loading, super::kit::Button::new("Next")).clicked() {
             send(events, next);
         }
     });
@@ -69,10 +69,10 @@ fn paging(ui: &mut egui::Ui, list: &AuditList, previous: AuditMsg, next: AuditMs
 pub(super) fn log(ui: &mut egui::Ui, view: &mut AuditView, now_ms: i64, events: &mut Vec<Event>) {
     super::heading(ui, "Audit log");
     ui.horizontal(|ui| {
-        if ui.button("Back to the accounts").clicked() {
+        if ui.add(super::kit::Button::new("Back to the accounts")).clicked() {
             events.push(Event::Admin(AdminEvent::BackToList));
         }
-        if ui.add_enabled(!view.list.loading, egui::Button::new("Refresh")).clicked() {
+        if ui.add_enabled(!view.list.loading, super::kit::Button::new("Refresh")).clicked() {
             send(events, AuditMsg::Reload);
         }
     });
@@ -98,7 +98,7 @@ pub(super) fn log(ui: &mut egui::Ui, view: &mut AuditView, now_ms: i64, events: 
     if let Some((_, name)) = &view.filter.user {
         ui.horizontal(|ui| {
             ui.label(format!("Only events about {name}"));
-            if ui.small_button("Show everyone").clicked() {
+            if ui.add(super::kit::Button::new("Show everyone")).clicked() {
                 send(events, AuditMsg::ClearUser);
             }
         });
@@ -108,7 +108,7 @@ pub(super) fn log(ui: &mut egui::Ui, view: &mut AuditView, now_ms: i64, events: 
     // The export.
     ui.horizontal(|ui| {
         let idle = !matches!(view.export, ExportState::Picking { .. } | ExportState::Running { .. });
-        if ui.add_enabled(idle, egui::Button::new("Export…")).on_hover_text("Save what these filters show, all of it, as a file").clicked() {
+        if ui.add_enabled(idle, super::kit::Button::new("Export…")).on_hover_text("Save what these filters show, all of it, as a file").clicked() {
             send(events, AuditMsg::Export);
         }
         match &view.export {
@@ -121,7 +121,7 @@ pub(super) fn log(ui: &mut egui::Ui, view: &mut AuditView, now_ms: i64, events: 
                 ui.label("Saving…");
             }
             ExportState::Done { .. } | ExportState::Failed(_) => {
-                if ui.small_button("OK").clicked() {
+                if ui.add(super::kit::Button::new("OK")).clicked() {
                     send(events, AuditMsg::DismissExport);
                 }
             }
@@ -162,10 +162,10 @@ pub(super) fn activity(ui: &mut egui::Ui, screen: &mut ActivityScreen, now_ms: i
     );
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        if ui.button("Back").clicked() {
+        if ui.add(super::kit::Button::new("Back")).clicked() {
             send(events, AuditMsg::CloseActivity);
         }
-        if ui.add_enabled(!screen.list.loading, egui::Button::new("Refresh")).clicked() {
+        if ui.add_enabled(!screen.list.loading, super::kit::Button::new("Refresh")).clicked() {
             send(events, AuditMsg::ActivityReload);
         }
     });

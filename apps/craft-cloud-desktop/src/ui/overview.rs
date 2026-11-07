@@ -27,9 +27,13 @@ pub(super) fn show(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: 
     let who = status.account.as_deref().unwrap_or("Signed in");
     let server = status.server.as_deref().map(super::host).unwrap_or_default();
     super::heading(ui, &format!("{who} on {server}"));
-    let online = if status.online { RichText::new("Online").color(super::good(ui)) } else { RichText::new("Offline").weak() };
+
     ui.horizontal(|ui| {
-        ui.label(online);
+        if status.online {
+            super::kit::tag(ui, "Online", super::kit::Tone::Good);
+        } else {
+            super::kit::tag(ui, "Offline", super::kit::Tone::Neutral);
+        }
         if let Some(at) = status.last_sync_ms {
             ui.label(RichText::new(format!("· last sync {}", super::ago(now_ms, at))).weak());
         }
@@ -50,7 +54,7 @@ pub(super) fn show(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: 
     if let Some(problem) = autostart_problem {
         ui.add_space(6.0);
         super::error_line(ui, problem);
-        if ui.button("Try again").clicked() {
+        if ui.add(super::kit::Button::new("Try again")).clicked() {
             events.push(Event::RetryAutostart);
         }
     }
@@ -58,12 +62,12 @@ pub(super) fn show(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: 
     ui.add_space(12.0);
 
     ui.horizontal(|ui| {
-        if ui.button("Open folder").clicked() {
+        if ui.add(super::kit::Button::new("Open folder").primary()).clicked() {
             events.push(Event::OpenFolder);
         }
         let paused = status.run_state == RunState::PausedByUser;
         let (text, event) = if paused { ("Resume", Event::Resume) } else { ("Pause", Event::Pause) };
-        if ui.add_enabled(busy.is_none(), egui::Button::new(text)).clicked() {
+        if ui.add_enabled(busy.is_none(), super::kit::Button::new(text)).clicked() {
             events.push(event);
         }
     });
@@ -73,23 +77,27 @@ pub(super) fn show(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: 
     }
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        if ui.button("Security…").on_hover_text("Two-factor sign-in, your password, your other computers").clicked() {
+        if ui.add(super::kit::Button::new("Security…")).on_hover_text("Two-factor sign-in, your password, your other computers").clicked() {
             events.push(Event::OpenSecurity);
         }
-        if ui.button("Activity").on_hover_text("What happened to your account: sign-ins, password changes, computers signed out").clicked() {
+        if ui
+            .add(super::kit::Button::new("Activity"))
+            .on_hover_text("What happened to your account: sign-ins, password changes, computers signed out")
+            .clicked()
+        {
             events.push(Event::Audit(crate::audit::AuditMsg::OpenActivity));
         }
         if matches!(o.access, Access::Admin { .. })
-            && ui.button("Administration").on_hover_text("Accounts, invites, computers and the audit log").clicked()
+            && ui.add(super::kit::Button::new("Administration")).on_hover_text("Accounts, invites, computers and the audit log").clicked()
         {
             events.push(Event::Admin(AdminEvent::Open));
         }
     });
     ui.horizontal(|ui| {
-        if ui.button("File versions…").clicked() {
+        if ui.add(super::kit::Button::new("File versions…")).clicked() {
             events.push(Event::OpenVersions);
         }
-        if ui.button("Trash…").clicked() {
+        if ui.add(super::kit::Button::new("Trash…")).clicked() {
             events.push(Event::OpenTrash);
         }
     });
@@ -100,27 +108,28 @@ pub(super) fn show(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: 
 
     if let Some(error) = &o.error {
         super::error_line(ui, error);
-        if o.offer_local_sign_out && ui.add_enabled(busy.is_none(), egui::Button::new("Sign out on this computer only")).clicked() {
+        if o.offer_local_sign_out && ui.add_enabled(busy.is_none(), super::kit::Button::new("Sign out on this computer only")).clicked() {
             events.push(Event::SignOutHere);
         }
         ui.add_space(8.0);
     }
     ui.separator();
     ui.horizontal(|ui| {
-        if ui.add_enabled(busy.is_none(), egui::Button::new("Sign out")).on_hover_text("The files stay on this computer").clicked() {
+        if ui.add_enabled(busy.is_none(), super::kit::Button::new("Sign out")).on_hover_text("The files stay on this computer").clicked() {
             events.push(Event::SignOut);
         }
-        if ui.add_enabled(busy != Some(Busy::Quitting), egui::Button::new("Quit")).on_hover_text("Stops syncing until the next login").clicked() {
+        if ui.add_enabled(busy != Some(Busy::Quitting), super::kit::Button::new("Quit")).on_hover_text("Stops syncing until the next login").clicked()
+        {
             events.push(Event::Quit);
         }
     });
 }
 
 fn storage(ui: &mut egui::Ui, o: &Overview, events: &mut Vec<Event>) {
-    ui.group(|ui| {
+    super::kit::card(ui, None, |ui| {
         ui.horizontal(|ui| {
-            ui.strong("Storage");
-            if ui.add_enabled(!o.usage_loading, egui::Button::new("Refresh")).clicked() {
+            super::kit::section_label(ui, "Storage");
+            if ui.add_enabled(!o.usage_loading, super::kit::Button::new("Refresh")).clicked() {
                 events.push(Event::RefreshUsage);
             }
         });

@@ -6,7 +6,7 @@ use crate::model::{Event, Versions};
 
 pub(super) fn show(ui: &mut egui::Ui, versions: &mut Versions, now_ms: i64, events: &mut Vec<Event>) {
     super::heading(ui, "File versions");
-    if ui.button("Back").clicked() {
+    if ui.add(super::kit::Button::new("Back")).clicked() {
         events.push(Event::BackVersions);
     }
     ui.add_space(8.0);
@@ -35,13 +35,15 @@ pub(super) fn show(ui: &mut egui::Ui, versions: &mut Versions, now_ms: i64, even
         ui.add_space(8.0);
         for version in &page.versions {
             let current = Some(version.id) == versions.current_version;
-            ui.group(|ui| {
+            super::kit::card(ui, None, |ui| {
                 ui.label(RichText::new(if current { "Current version" } else { "Saved version" }).strong());
                 ui.label(format!("{} · {} · {} bytes", date(version.created_ms), super::ago(now_ms, version.created_ms), version.size));
                 ui.label(format!("Device {}", version.device));
                 if version.pruned {
                     ui.label("This version can no longer be restored");
-                } else if !current && ui.add_enabled(!versions.loading && !versions.restoring, egui::Button::new("Restore this version")).clicked() {
+                } else if !current
+                    && ui.add_enabled(!versions.loading && !versions.restoring, super::kit::Button::new("Restore this version")).clicked()
+                {
                     events.push(Event::ConfirmRestore(version.id));
                 }
             });
@@ -58,10 +60,10 @@ pub(super) fn show(ui: &mut egui::Ui, versions: &mut Versions, now_ms: i64, even
         egui::Window::new("Restore version?").collapsible(false).resizable(false).show(ui.ctx(), |ui| {
             ui.label("This makes the selected version the current file. Sync will update this computer.");
             ui.horizontal(|ui| {
-                if ui.add_enabled(!versions.restoring && !versions.loading, egui::Button::new("Restore this version")).clicked() {
+                if ui.add_enabled(!versions.restoring && !versions.loading, super::kit::Button::new("Restore this version")).clicked() {
                     events.push(Event::RestoreVersion);
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.add(super::kit::Button::new("Cancel")).clicked() {
                     events.push(Event::CancelRestore);
                 }
             });

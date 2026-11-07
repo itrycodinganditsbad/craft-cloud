@@ -32,7 +32,7 @@ pub(super) fn show(ui: &mut egui::Ui, form: &mut SecondFactorForm, events: &mut 
         events.push(Event::SubmitSecondFactor);
     }
     ui.add_space(4.0);
-    if ui.button("Back").clicked() {
+    if ui.add(super::kit::Button::new("Back")).clicked() {
         events.push(Event::CancelSecondFactor);
     }
 }

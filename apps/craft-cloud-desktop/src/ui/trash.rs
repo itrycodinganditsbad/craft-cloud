@@ -6,7 +6,7 @@ use crate::model::{Event, Trash};
 
 pub(super) fn show(ui: &mut egui::Ui, trash: &mut Trash, now_ms: i64, events: &mut Vec<Event>) {
     super::heading(ui, "Trash");
-    if ui.button("Back").clicked() {
+    if ui.add(super::kit::Button::new("Back")).clicked() {
         events.push(Event::BackTrash);
     }
     if super::wide_button(ui, !trash.loading && trash.action.is_none(), "Refresh") {
@@ -26,7 +26,7 @@ pub(super) fn show(ui: &mut egui::Ui, trash: &mut Trash, now_ms: i64, events: &m
     }
     if let Some(page) = &trash.page {
         for item in &page.items {
-            ui.group(|ui| {
+            super::kit::card(ui, None, |ui| {
                 ui.label(RichText::new(&item.name).strong());
                 if let Some(path) = &item.path {
                     ui.label(path);
@@ -39,10 +39,10 @@ pub(super) fn show(ui: &mut egui::Ui, trash: &mut Trash, now_ms: i64, events: &m
                 ui.label(format!("Deleted {} · {}", super::ago(now_ms, item.deleted_ms), date(item.deleted_ms)));
                 ui.label(format!("Removed for good after {}", date(item.purge_after_ms)));
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(!trash.loading && trash.action.is_none(), egui::Button::new("Restore")).clicked() {
+                    if ui.add_enabled(!trash.loading && trash.action.is_none(), super::kit::Button::new("Restore")).clicked() {
                         events.push(Event::RestoreTrash(item.id));
                     }
-                    if ui.add_enabled(!trash.loading && trash.action.is_none(), egui::Button::new("Remove from trash")).clicked() {
+                    if ui.add_enabled(!trash.loading && trash.action.is_none(), super::kit::Button::new("Remove from trash").danger()).clicked() {
                         events.push(Event::ConfirmRemoveTrash(item.id));
                     }
                 });
@@ -66,10 +66,10 @@ pub(super) fn show(ui: &mut egui::Ui, trash: &mut Trash, now_ms: i64, events: &m
         egui::Window::new("Remove from trash?").collapsible(false).resizable(false).show(ui.ctx(), |ui| {
             ui.label("This item can no longer be restored from the trash.");
             ui.horizontal(|ui| {
-                if ui.add_enabled(!trash.loading && trash.action.is_none(), egui::Button::new("Remove from trash")).clicked() {
+                if ui.add_enabled(!trash.loading && trash.action.is_none(), super::kit::Button::new("Remove from trash").danger()).clicked() {
                     events.push(Event::RemoveTrash);
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.add(super::kit::Button::new("Cancel")).clicked() {
                     events.push(Event::CancelRemoveTrash);
                 }
             });

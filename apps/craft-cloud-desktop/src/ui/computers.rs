@@ -6,8 +6,8 @@ use crate::model::{Event, Overview};
 
 pub(super) fn list(ui: &mut egui::Ui, o: &Overview, now_ms: i64, events: &mut Vec<Event>) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Computers").strong());
-        if ui.small_button("Refresh").clicked() {
+        super::kit::section_label(ui, "Computers");
+        if ui.add(super::kit::Button::new("Refresh")).clicked() {
             events.push(Event::RefreshDevices);
         }
     });
@@ -33,7 +33,7 @@ pub(super) fn list(ui: &mut egui::Ui, o: &Overview, now_ms: i64, events: &mut Ve
                 ui.label("");
             } else {
                 let removing = o.removing == Some(device.id);
-                let button = egui::Button::new(if removing { "Removing…" } else { "Remove" });
+                let button = super::kit::Button::new(if removing { "Removing…" } else { "Remove" }).danger();
                 let response = ui.add_enabled(o.removing.is_none(), button).on_hover_text("It can't sync any more; its files stay there");
                 if response.clicked() {
                     events.push(Event::RemoveDevice(device.id));

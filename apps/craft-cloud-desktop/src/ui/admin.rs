@@ -107,16 +107,16 @@ fn users(
     storage_overview(ui, storage);
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        if ui.button("Back").clicked() {
+        if ui.add(super::kit::Button::new("Back")).clicked() {
             send(events, AdminEvent::Close);
         }
-        if ui.button("New account").clicked() {
+        if ui.add(super::kit::Button::new("New account")).clicked() {
             send(events, AdminEvent::NewUser);
         }
-        if ui.add_enabled(!list.loading, egui::Button::new("Refresh")).clicked() {
+        if ui.add_enabled(!list.loading, super::kit::Button::new("Refresh")).clicked() {
             send(events, AdminEvent::Reload);
         }
-        if ui.button("Audit log").on_hover_text("Sign-ins, changes and what admins did").clicked() {
+        if ui.add(super::kit::Button::new("Audit log")).on_hover_text("Sign-ins, changes and what admins did").clicked() {
             events.push(Event::Audit(crate::audit::AuditMsg::OpenAudit(None)));
         }
     });
@@ -125,10 +125,10 @@ fn users(
     ui.horizontal(|ui| {
         let width = (ui.available_width() - 130.0).max(120.0);
         let field = ui.add(egui::TextEdit::singleline(&mut list.search).hint_text("Search accounts").desired_width(width));
-        if ui.button("Search").clicked() || entered(&field, ui) {
+        if ui.add(super::kit::Button::new("Search")).clicked() || entered(&field, ui) {
             send(events, AdminEvent::Search);
         }
-        if !list.applied.is_empty() && ui.button("Clear").clicked() {
+        if !list.applied.is_empty() && ui.add(super::kit::Button::new("Clear")).clicked() {
             send(events, AdminEvent::ClearSearch);
         }
     });
@@ -155,7 +155,7 @@ fn users(
                     ui.add(egui::Label::new(RichText::new(describe(&user)).small().weak()).wrap());
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Manage").clicked() {
+                    if ui.add(super::kit::Button::new("Manage")).clicked() {
                         send(events, AdminEvent::OpenUser(user.id));
                     }
                 });
@@ -165,11 +165,11 @@ fn users(
     }
     if list.has_previous() || list.next.is_some() {
         ui.horizontal(|ui| {
-            if ui.add_enabled(list.has_previous() && !list.loading, egui::Button::new("Previous")).clicked() {
+            if ui.add_enabled(list.has_previous() && !list.loading, super::kit::Button::new("Previous")).clicked() {
                 send(events, AdminEvent::PreviousPage);
             }
             ui.label(format!("Page {}", list.page()));
-            if ui.add_enabled(list.next.is_some() && !list.loading, egui::Button::new("Next")).clicked() {
+            if ui.add_enabled(list.next.is_some() && !list.loading, super::kit::Button::new("Next")).clicked() {
                 send(events, AdminEvent::NextPage);
             }
         });
@@ -177,7 +177,7 @@ fn users(
 }
 
 fn storage_overview(ui: &mut egui::Ui, state: StorageState<'_>) {
-    ui.label(RichText::new("Storage").strong());
+    super::kit::section_label(ui, "Storage");
     if let Some(error) = state.error {
         super::error_line(ui, error);
         return;
@@ -213,7 +213,7 @@ fn storage_overview(ui: &mut egui::Ui, state: StorageState<'_>) {
         ui.label(RichText::new("Storage estimates are incomplete; run `craft-cloud-server index build`. ").small().weak());
     }
     if !storage.top_accounts.is_empty() {
-        ui.label(RichText::new("Top accounts").small().strong());
+        super::kit::section_label(ui, "Top accounts");
         egui::Grid::new("admin-storage-top").num_columns(3).striped(true).spacing([12.0, 4.0]).show(ui, |ui| {
             ui.label(RichText::new("Account").small().weak());
             ui.label(RichText::new("Stored").small().weak());
@@ -265,14 +265,14 @@ fn create(ui: &mut egui::Ui, form: &mut CreateForm, events: &mut Vec<Event>) {
         send(events, AdminEvent::SubmitCreate);
     }
     ui.add_space(4.0);
-    if ui.button("Cancel").clicked() {
+    if ui.add(super::kit::Button::new("Cancel")).clicked() {
         send(events, AdminEvent::BackToList);
     }
 }
 
 fn account(ui: &mut egui::Ui, view: &mut UserView, user: Option<&AdminUserInfo>, me: &str, now_ms: i64, events: &mut Vec<Event>) {
     super::heading(ui, &view.username);
-    if ui.button("Back to the accounts").clicked() {
+    if ui.add(super::kit::Button::new("Back to the accounts")).clicked() {
         send(events, AdminEvent::BackToList);
     }
     ui.add_space(8.0);
@@ -285,8 +285,8 @@ fn account(ui: &mut egui::Ui, view: &mut UserView, user: Option<&AdminUserInfo>,
     let is_me = user.username == me;
 
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Storage usage").strong());
-        if ui.small_button("Refresh").clicked() {
+        super::kit::section_label(ui, "Storage usage");
+        if ui.add(super::kit::Button::new("Refresh")).clicked() {
             send(events, AdminEvent::RefreshUsage);
         }
     });
@@ -309,12 +309,12 @@ fn account(ui: &mut egui::Ui, view: &mut UserView, user: Option<&AdminUserInfo>,
     }
     ui.add_space(8.0);
 
-    if ui.button("Activity of this account").on_hover_text("The audit log, for this account").clicked() {
+    if ui.add(super::kit::Button::new("Activity of this account")).on_hover_text("The audit log, for this account").clicked() {
         events.push(Event::Audit(crate::audit::AuditMsg::OpenAudit(Some((user.id, user.username.clone())))));
     }
     ui.add_space(8.0);
 
-    ui.label(RichText::new("Role and quota").strong());
+    super::kit::section_label(ui, "Role and quota");
     role_choice(ui, &mut view.role);
     ui.horizontal(|ui| {
         ui.label("Quota (GiB)");
@@ -323,60 +323,71 @@ fn account(ui: &mut egui::Ui, view: &mut UserView, user: Option<&AdminUserInfo>,
     if let Some(error) = &view.error {
         super::error_line(ui, error);
     }
-    if ui.button("Save changes").clicked() {
+    if ui.add(super::kit::Button::new("Save changes")).clicked() {
         send(events, AdminEvent::SubmitEdit);
     }
     ui.add_space(12.0);
 
-    ui.label(RichText::new("Account").strong());
+    super::kit::section_label(ui, "Account");
     let id = user.id;
     let username = user.username.clone();
     ui.horizontal_wrapped(|ui| {
         if is_me {
             ui.label(RichText::new("You can't disable or remove your own account here.").small().weak());
         } else if user.disabled_ms.is_some() {
-            if ui.button("Enable").clicked() {
+            if ui.add(super::kit::Button::new("Enable")).clicked() {
                 send(events, AdminEvent::Ask(Action::Enable { id, username: username.clone() }));
             }
-        } else if ui.button("Disable").clicked() {
+        } else if ui.add(super::kit::Button::new("Disable")).clicked() {
             send(events, AdminEvent::Ask(Action::Disable { id, username: username.clone() }));
         }
-        if !is_me && ui.button("Remove").clicked() {
+        if !is_me && ui.add(super::kit::Button::new("Remove").danger()).clicked() {
             send(events, AdminEvent::Ask(Action::Remove { id, username: username.clone() }));
         }
         if !is_me
             && user.two_factor_enabled
-            && ui.button("Turn two-factor off").on_hover_text("They sign in with their password alone; their computers are signed out").clicked()
+            && ui
+                .add(super::kit::Button::new("Turn two-factor off"))
+                .on_hover_text("They sign in with their password alone; their computers are signed out")
+                .clicked()
         {
             send(events, AdminEvent::Ask(Action::ResetTwoFactor { id, username: username.clone() }));
         }
     });
     ui.add_space(12.0);
 
-    ui.label(RichText::new("Invites and codes").strong());
+    super::kit::section_label(ui, "Invites and codes");
     ui.horizontal_wrapped(|ui| {
-        if ui.button("New invite").on_hover_text("For an account that has no password yet").clicked() {
+        if ui.add(super::kit::Button::new("New invite")).on_hover_text("For an account that has no password yet").clicked() {
             send(events, AdminEvent::Ask(Action::IssueInvite { id, username: username.clone() }));
         }
-        if ui.button("Password reset code").on_hover_text("Good for an hour; using it signs all their computers out").clicked() {
+        if ui.add(super::kit::Button::new("Password reset code")).on_hover_text("Good for an hour; using it signs all their computers out").clicked()
+        {
             send(events, AdminEvent::Ask(Action::IssueReset { id, username: username.clone(), reset_two_factor: false }));
         }
         if user.two_factor_enabled
-            && ui.button("Reset code, two-factor off").on_hover_text("As a reset code, and using it turns their two-factor sign-in off").clicked()
+            && ui
+                .add(super::kit::Button::new("Reset code, two-factor off"))
+                .on_hover_text("As a reset code, and using it turns their two-factor sign-in off")
+                .clicked()
         {
             send(events, AdminEvent::Ask(Action::IssueReset { id, username: username.clone(), reset_two_factor: true }));
         }
         // Always offered: the list says an invite is open (`invite_pending`), but not a password reset code. The server
         // answers `not_found` when none is.
-        if ui.button("Revoke open code").on_hover_text("Ends the account's open invite or password reset code").clicked() {
+        if ui
+            .add(super::kit::Button::new("Revoke open code").danger())
+            .on_hover_text("Ends the account's open invite or password reset code")
+            .clicked()
+        {
             send(events, AdminEvent::Ask(Action::RevokeInvite { id, username: username.clone() }));
         }
     });
     ui.add_space(12.0);
 
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Computers").strong());
-        if ui.small_button("Refresh").clicked() {
+        super::kit::section_label(ui, "Computers");
+        if ui.add(super::kit::Button::new("Refresh")).clicked() {
             send(events, AdminEvent::RefreshDevices);
         }
     });
@@ -399,7 +410,7 @@ fn account(ui: &mut egui::Ui, view: &mut UserView, user: Option<&AdminUserInfo>,
         for device in devices.iter().filter(|d| !d.revoked) {
             ui.label(&device.name);
             ui.label(RichText::new(format!("last seen {}", super::ago(now_ms, device.last_used_ms))).weak());
-            if ui.button("Revoke").on_hover_text("It can't sync any more; its files stay there").clicked() {
+            if ui.add(super::kit::Button::new("Revoke").danger()).on_hover_text("It can't sync any more; its files stay there").clicked() {
                 let action = Action::RevokeDevice { id, username: username.clone(), device: device.id, device_name: device.name.clone() };
                 send(events, AdminEvent::Ask(action));
             }
@@ -452,7 +463,7 @@ fn confirmation(ui: &mut egui::Ui, dialog: &mut Dialog, events: &mut Vec<Event>)
         send(events, AdminEvent::Confirm);
     }
     ui.add_space(4.0);
-    if ui.button("Cancel").clicked() {
+    if ui.add(super::kit::Button::new("Cancel")).clicked() {
         send(events, AdminEvent::CancelDialog);
     }
 }
@@ -479,7 +490,7 @@ fn shown_code(ui: &mut egui::Ui, code: &ShownCode, now_ms: i64, events: &mut Vec
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.add(egui::Label::new(RichText::new(&code.code).monospace().size(18.0).strong()).selectable(true));
-        if ui.small_button("Copy").clicked() {
+        if ui.add(super::kit::Button::new("Copy")).clicked() {
             ui.ctx().copy_text(code.code.clone());
         }
     });
@@ -488,7 +499,7 @@ fn shown_code(ui: &mut egui::Ui, code: &ShownCode, now_ms: i64, events: &mut Vec
         ui.label("Or the whole join string:");
         ui.horizontal(|ui| {
             ui.add(egui::Label::new(RichText::new(url).monospace()).selectable(true).wrap());
-            if ui.small_button("Copy").clicked() {
+            if ui.add(super::kit::Button::new("Copy")).clicked() {
                 ui.ctx().copy_text(url.clone());
             }
         });
