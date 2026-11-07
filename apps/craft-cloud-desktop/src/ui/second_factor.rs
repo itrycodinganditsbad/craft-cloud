@@ -34,7 +34,7 @@ pub(super) fn show(ui: &mut egui::Ui, form: &mut SecondFactorForm, events: &mut 
         super::error_line(ui, error);
         ui.add_space(8.0);
     }
-    if super::wide_button(ui, true, if signing_in { "Sign in" } else { "Join" }) || enter {
+    if super::join::main_button(ui, if signing_in { "Sign in" } else { "Join" }) || enter {
         events.push(Event::SubmitSecondFactor);
     }
     ui.add_space(4.0);

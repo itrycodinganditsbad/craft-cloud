@@ -263,6 +263,8 @@ fn snapshot_sign_in() {
     let mut model = sign_in_typed();
     snapshot(model.clone(), egui::Theme::Light, "sign-in");
     snapshot(model.clone(), egui::Theme::Dark, "sign-in-dark");
+    snapshot_sized(model.clone(), egui::Theme::Light, "sign-in-smallest", MIN_WINDOW_SIZE);
+    snapshot_sized(model.clone(), egui::Theme::Dark, "sign-in-smallest-dark", MIN_WINDOW_SIZE);
     // Switching keeps the folder and the name; the join string form.
     model.update(Event::SetJoinMode(crate::model::JoinMode::JoinString));
     let Screen::Join(form) = &mut model.screen else { panic!("{:?}", model.screen) };
