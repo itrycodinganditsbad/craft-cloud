@@ -1051,6 +1051,45 @@ async fn a_second_computer_joins_with_a_code_from_the_first() {
     let _ = running.stop().await;
 }
 
+/// Renaming this computer is kept here too (the status, the saved account), so the app's title agrees with the computers
+/// list; renaming another computer changes nothing here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renaming_this_computer_updates_its_own_status_but_another_one_does_not() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder: PathBuf = dir.path().join("Craft Cloud");
+    let (running, a) = signed_in(&server, &data, &folder).await;
+    let before = status(&a).machine.unwrap();
+
+    let pairing = new_pairing(&a);
+    let b = Machine::signed_out().await;
+    let (code, body) = b.join(&pairing.join, false, None);
+    assert_eq!(code, 200, "{body}");
+    let both = devices(&a);
+    let me = both.iter().find(|d| d.current).unwrap();
+    let other = both.iter().find(|d| !d.current).unwrap();
+
+    // Another computer: the server has the name, this agent's status and account keep theirs.
+    let (code, body) = call(&a, "PATCH", &format!("/v1/devices/{}", other.id), r#"{"name":"the other one"}"#);
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(status(&a).machine.as_deref(), Some(before.as_str()));
+    assert_eq!(data.load_account().unwrap().unwrap().device_name, before);
+
+    // This computer: the status and the saved account say the new name at once.
+    let (code, body) = call(&a, "PATCH", &format!("/v1/devices/{}", me.id), r#"{"name":"my new name"}"#);
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(status(&a).machine.as_deref(), Some("my new name"));
+    assert_eq!(data.load_account().unwrap().unwrap().device_name, "my new name");
+    assert!(devices(&a).iter().any(|d| d.current && d.name == "my new name"));
+    // A refused rename (an empty name) leaves the name as it is.
+    let (code, _) = call(&a, "PATCH", &format!("/v1/devices/{}", me.id), r#"{"name":""}"#);
+    assert_ne!(code, 200);
+    assert_eq!(status(&a).machine.as_deref(), Some("my new name"));
+    b.stop().await;
+    let _ = running.stop().await;
+}
+
 /// What can be checked before the code is spent is checked first: a folder with files and no `adopt` leaves the code
 /// usable. What can only fail after it (a marker for another space in the folder) removes the new device again and
 /// says to make a new code.

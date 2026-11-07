@@ -58,6 +58,9 @@ pub enum Command {
     Resume(oneshot::Sender<Result<(), AgentError>>),
     /// Finish the pass under way and stop the agent. Answered at once.
     Quit(oneshot::Sender<Result<(), AgentError>>),
+    /// This computer was renamed on the server: keep the new name in the saved account, the status and the live hub.
+    /// Another computer's id changes nothing.
+    RenameDevice(DeviceId, String, oneshot::Sender<Result<(), AgentError>>),
     /// Run a sync pass soon (an app opened a file that isn't uploaded yet, to make it live). Not answered.
     SyncSoon,
 }
@@ -702,6 +705,15 @@ async fn rename_device(
         }
         other => account_call_error(other),
     })?;
+    // The server has the new name. This computer's own name is kept here too (the agent owns the saved account), so the
+    // status and the hub say the same. A rename of another computer changes nothing here.
+    if state.control.account().is_some_and(|account| account.device == renamed.id) {
+        let (tx, rx) = oneshot::channel();
+        // An agent that is stopping has nothing left to update.
+        if state.control.commands.send(Command::RenameDevice(renamed.id, renamed.name.clone(), tx)).await.is_ok() {
+            let _ = rx.await;
+        }
+    }
     Ok(Json(renamed))
 }
 

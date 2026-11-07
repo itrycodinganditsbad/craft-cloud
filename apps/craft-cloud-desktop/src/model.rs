@@ -1393,8 +1393,13 @@ impl Model {
             Event::Renamed(id, ticket, result) => {
                 let Some(overview) = self.overview_mut() else { return Vec::new() };
                 let current = overview.renaming.as_ref().is_some_and(|r| r.id == id && r.ticket == ticket);
+                let mut effects = Vec::new();
                 match result {
                     Ok(renamed) => {
+                        // This computer's own name is also the agent's status (the overview's title): ask for it again.
+                        if renamed.current {
+                            effects.push(Effect::Status);
+                        }
                         // The server's answer is the computer's name now, whether its field is still open or not.
                         if let Some(device) = overview.devices.iter_mut().flatten().find(|d| d.id == renamed.id) {
                             *device = renamed;
@@ -1410,7 +1415,7 @@ impl Model {
                         }
                     }
                 }
-                Vec::new()
+                effects
             }
             Event::SignOutOtherComputers => {
                 if !matches!(self.screen, Screen::SignedIn(_)) {
@@ -3383,7 +3388,8 @@ pub(crate) mod tests {
         // Nothing goes twice while the answer is awaited.
         assert!(m.update(Event::SaveRename).is_empty());
         let renamed = DeviceInfo { name: "Studio PC".into(), ..other.clone() };
-        m.update(Event::Renamed(other.id, 1, Ok(renamed.clone())));
+        // Another computer's name is not the agent's status: only the list changes.
+        assert!(m.update(Event::Renamed(other.id, 1, Ok(renamed.clone()))).is_empty());
         assert_eq!(renaming(&m), None);
         let list = m.overview().and_then(|o| o.devices.clone()).unwrap_or_default();
         assert_eq!(list, vec![this, renamed], "the order stays, the row is the server's");
@@ -3395,6 +3401,23 @@ pub(crate) mod tests {
         m.update(Event::StartRename(this.id));
         type_name(&mut m, "Office");
         assert_eq!(m.update(Event::SaveRename), vec![Effect::RenameDevice { id: this.id, name: "Office".into(), ticket: 1 }]);
+    }
+
+    #[test]
+    fn renaming_this_computer_asks_for_the_status_again() {
+        let (mut m, this, _) = with_two_computers();
+        m.update(Event::StartRename(this.id));
+        type_name(&mut m, "Office");
+        m.update(Event::SaveRename);
+        let renamed = DeviceInfo { name: "Office".into(), ..this.clone() };
+        // The overview's title is the agent's status, which changed with the name.
+        assert_eq!(m.update(Event::Renamed(this.id, 1, Ok(renamed.clone()))), vec![Effect::Status]);
+        assert_eq!(m.overview().and_then(|o| o.devices.clone()).and_then(|d| d.first().map(|d| d.name.clone())).as_deref(), Some("Office"));
+        // A refused rename changes nothing, so nothing is asked.
+        m.update(Event::StartRename(this.id));
+        type_name(&mut m, "Home");
+        m.update(Event::SaveRename);
+        assert!(m.update(Event::Renamed(this.id, 2, Err(refused("invalid", "no")))).is_empty());
     }
 
     #[test]
