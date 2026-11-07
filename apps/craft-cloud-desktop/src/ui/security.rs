@@ -29,6 +29,8 @@ fn secrets(screen: &crate::model::Screen) -> Vec<(&'static str, &str)> {
             Step::Home | Step::Codes { .. } | Step::SignOutOthers => Vec::new(),
         },
         Screen::SecondFactor(form) => vec![("second-factor-code", &form.code)],
+        // The first start's password: only while the form is open to be typed in (not while a sign-in is with the agent).
+        Screen::Join(form) => vec![(super::join::PASSWORD_FIELD, &form.password)],
         // The admin's confirmation: only while it is open to be typed in.
         Screen::Admin(a) if a.code.is_none() => match &a.dialog {
             Some(d) if !d.busy => {
@@ -40,7 +42,7 @@ fn secrets(screen: &crate::model::Screen) -> Vec<(&'static str, &str)> {
     }
 }
 
-const SECRET_NAMES: [&str; 12] = [
+const SECRET_NAMES: [&str; 13] = [
     "setup-password",
     "setup-code",
     "disable-password",
@@ -51,6 +53,7 @@ const SECRET_NAMES: [&str; 12] = [
     "password-new",
     "password-again",
     "second-factor-code",
+    super::join::PASSWORD_FIELD,
     super::admin::PASSWORD_FIELD,
     super::admin::CODE_FIELD,
 ];

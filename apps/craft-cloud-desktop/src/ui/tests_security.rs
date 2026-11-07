@@ -283,6 +283,7 @@ fn a_join_for_an_account_with_two_factor_asks_for_the_code_and_keeps_the_invite(
     let mut model = model_after(&agent, vec![]);
     let Screen::Join(form) = &mut model.screen else { panic!("{:?}", model.screen) };
     form.join = "cloud.shadows.ch/K7M4-Q9TX".into();
+    form.mode = crate::model::JoinMode::JoinString;
     form.folder = absolute_folder();
     let mut sent = Vec::new();
     let start = no_start();
@@ -330,6 +331,7 @@ fn a_join_for_an_account_with_two_factor_asks_for_the_code_and_keeps_the_invite(
     let mut again = model_after(&agent, vec![]);
     if let Screen::Join(form) = &mut again.screen {
         form.join = "cloud.shadows.ch/K7M4-Q9TX".into();
+        form.mode = crate::model::JoinMode::JoinString;
         form.folder = absolute_folder();
     }
     agent.joins.lock().unwrap().push(Err(Error::RefusedWith {
@@ -393,6 +395,7 @@ fn snapshot_second_factor() {
     let mut model = model_after(&agent, vec![]);
     if let Screen::Join(form) = &mut model.screen {
         form.join = "cloud.shadows.ch/K7M4-Q9TX".into();
+        form.mode = crate::model::JoinMode::JoinString;
         form.folder = absolute_folder();
     }
     feed(&mut model, &agent, Event::SubmitJoin);

@@ -219,7 +219,7 @@ fn snapshot_not_running() {
 /// a Unix path, isn't a full path on Windows, so the form's own check is left to the model's tests).
 fn sent(model: &mut Model, join: &str) {
     let Screen::Join(form) = &model.screen else { panic!("{:?}", model.screen) };
-    let form = crate::model::JoinForm { join: join.into(), ..form.clone() };
+    let form = crate::model::JoinForm { join: join.into(), mode: crate::model::JoinMode::JoinString, ..form.clone() };
     model.screen = Screen::Joining { form, password: None };
 }
 
@@ -239,6 +239,74 @@ fn snapshot_join() {
     sent(&mut model, "cloud.shadows.ch/K7M4-Q9TX");
     model.update(Event::Joined(Err(craft_cloud_app::Error::Refused { code: "invalid_code".into(), message: "x".into(), name_taken: None })));
     snapshot(model, egui::Theme::Dark, "join-invalid-code-dark");
+}
+
+/// The first screen with a server, a user name and a password typed; "sent" as the model sends it (the password leaves the form).
+fn sign_in_typed() -> Model {
+    let mut model = after(&FakeAgent::new(signed_out()), Vec::new());
+    let Screen::Join(form) = &mut model.screen else { panic!("{:?}", model.screen) };
+    assert_eq!(form.mode, crate::model::JoinMode::SignIn);
+    form.server = "cloud.shadows.ch".into();
+    form.user = "fabio".into();
+    form.password = "correct horse battery".into();
+    model
+}
+
+fn signing_in(model: &mut Model) {
+    let Screen::Join(form) = &model.screen else { panic!("{:?}", model.screen) };
+    let form = crate::model::JoinForm { password: String::new(), ..form.clone() };
+    model.screen = Screen::Joining { form, password: None };
+}
+
+#[test]
+fn snapshot_sign_in() {
+    let mut model = sign_in_typed();
+    snapshot(model.clone(), egui::Theme::Light, "sign-in");
+    snapshot(model.clone(), egui::Theme::Dark, "sign-in-dark");
+    // Switching keeps the folder and the name; the join string form.
+    model.update(Event::SetJoinMode(crate::model::JoinMode::JoinString));
+    let Screen::Join(form) = &mut model.screen else { panic!("{:?}", model.screen) };
+    form.join = "cloud.shadows.ch/K7M4-Q9TX".into();
+    snapshot(model.clone(), egui::Theme::Light, "join-string");
+    snapshot(model, egui::Theme::Dark, "join-string-dark");
+    let mut model = sign_in_typed();
+    signing_in(&mut model);
+    snapshot(model, egui::Theme::Light, "signing-in");
+}
+
+#[test]
+fn snapshot_sign_in_second_factor_and_errors() {
+    let mut model = sign_in_typed();
+    signing_in(&mut model);
+    model.update(Event::LoggedIn(Err(craft_cloud_app::Error::RefusedWith {
+        code: "two_factor_required".into(),
+        message: "needs a code".into(),
+        two_factor: Some(craft_cloud_app::TwoFactorChallenge { challenge: "c".into(), expires_ms: 1 }),
+        retry_after_secs: None,
+    })));
+    assert!(matches!(model.screen, Screen::SecondFactor(_)), "{:?}", model.screen);
+    snapshot(model.clone(), egui::Theme::Light, "sign-in-second-factor");
+    snapshot(model.clone(), egui::Theme::Dark, "sign-in-second-factor-dark");
+    if let Screen::SecondFactor(second) = &mut model.screen {
+        second.code = "123456".into();
+    }
+    model.update(Event::SubmitSecondFactor);
+    model.update(Event::LoggedIn(Err(craft_cloud_app::Error::RefusedWith {
+        code: "two_factor_locked".into(),
+        message: "locked".into(),
+        two_factor: None,
+        retry_after_secs: Some(840),
+    })));
+    snapshot(model, egui::Theme::Light, "sign-in-locked");
+
+    let mut model = sign_in_typed();
+    signing_in(&mut model);
+    model.update(Event::LoggedIn(Err(craft_cloud_app::Error::Refused {
+        code: "wrong_password".into(),
+        message: "wrong user name or password".into(),
+        name_taken: None,
+    })));
+    snapshot(model, egui::Theme::Light, "sign-in-wrong-password");
 }
 
 #[test]
@@ -585,10 +653,13 @@ fn buttons_send_their_events() {
     h.run_steps(2);
     h.get_by_label("Change…").click();
     h.run_steps(2);
-    h.get_by_label("Join").click();
+    // "Sign in" is the switch's and the main button's label: the main button is the last.
+    h.get_all_by_label("Sign in").last().expect("the main button").click();
+    h.run_steps(2);
+    h.get_by_label("Join string").click();
     h.run_steps(2);
     let (model, events) = h.state_mut();
-    assert_eq!(events.as_slice(), [Event::ChangeFolder, Event::SubmitJoin]);
+    assert_eq!(events.as_slice(), [Event::ChangeFolder, Event::SubmitJoin, Event::SetJoinMode(crate::model::JoinMode::JoinString)]);
     assert_eq!(model.update(Event::ChangeFolder), vec![Effect::PickFolder("/home/fabio/Craft Cloud".into())]);
 }
 

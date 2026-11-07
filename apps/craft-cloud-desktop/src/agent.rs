@@ -14,8 +14,9 @@ use std::time::Duration;
 use craft_cloud_app::{
     AccountInfo, AccountUsage, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo,
     AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, AuditPage, AuditQuery, Client, DeviceId, DeviceInfo, Error, ExportOutcome,
-    HistoryResponse, JoinRequest, NodeId, PairingInfo, PairingStatus, RecoveryCodes, RestoreResponse, RevokedOthers, Status, TrashResponse,
-    TrashRestoreResponse, TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, UserQuery, Uuid, VersionId,
+    HistoryResponse, JoinRequest, LoginRequest, NodeId, PairingInfo, PairingStatus, RecoveryCodes, RestoreResponse, RevokedOthers,
+    SecondFactorLoginRequest, Status, TrashResponse, TrashRestoreResponse, TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, UserQuery,
+    Uuid, VersionId,
 };
 
 use crate::admin::{Action, AdminEvent, Outcome};
@@ -32,6 +33,8 @@ pub trait Agent: Send + Sync {
     fn connect(&self) -> Result<Status, Error>;
     fn status(&self) -> Result<Status, Error>;
     fn join(&self, request: &JoinRequest) -> Result<Status, Error>;
+    fn login(&self, request: &LoginRequest) -> Result<Status, Error>;
+    fn login_second_factor(&self, request: &SecondFactorLoginRequest) -> Result<Status, Error>;
     fn logout(&self, local: bool) -> Result<Status, Error>;
     fn pairing(&self) -> Result<PairingInfo, Error>;
     fn pairing_state(&self, id: Uuid) -> Result<PairingStatus, Error>;
@@ -126,6 +129,12 @@ impl Agent for ClientAgent {
     }
     fn join(&self, request: &JoinRequest) -> Result<Status, Error> {
         self.with(|c| c.join(request))
+    }
+    fn login(&self, request: &LoginRequest) -> Result<Status, Error> {
+        self.with(|c| c.login(request))
+    }
+    fn login_second_factor(&self, request: &SecondFactorLoginRequest) -> Result<Status, Error> {
+        self.with(|c| c.login_second_factor(request))
     }
     fn logout(&self, local: bool) -> Result<Status, Error> {
         self.with(|c| c.logout(local))
@@ -340,6 +349,8 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         Effect::StartAgent => Event::AgentStarted(start(agent)),
         Effect::Status => Event::Polled(agent.status()),
         Effect::Join(request) => Event::Joined(agent.join(&request)),
+        Effect::Login(request) => Event::LoggedIn(agent.login(&request)),
+        Effect::LoginSecondFactor(request) => Event::LoggedIn(agent.login_second_factor(&request)),
         Effect::SetAutostart(on) => Event::AutostartSet(agent.set_autostart(on)),
         Effect::Pairing => Event::PairingMade(agent.pairing()),
         Effect::PairingState(id) => Event::PairingPolled(agent.pairing_state(id)),
@@ -503,6 +514,10 @@ pub(crate) mod fake {
         pub gone: AtomicBool,
         /// What `join` answers, in turn (then the status).
         pub joins: Mutex<Vec<Result<Status, Error>>>,
+        /// The sign-in requests (the first step, then the second) that came, and what each answers first instead of the usual
+        /// (`joins` is taken from first).
+        pub logins: Mutex<Vec<craft_cloud_app::LoginRequest>>,
+        pub second_logins: Mutex<Vec<craft_cloud_app::SecondFactorLoginRequest>>,
         pub usage_result: Mutex<Option<Result<AccountUsage, Error>>>,
         pub asked: Mutex<Vec<String>>,
         pub factor: Mutex<FakeFactor>,
@@ -538,6 +553,8 @@ pub(crate) mod fake {
                 status: Mutex::new(status),
                 gone: AtomicBool::new(false),
                 joins: Mutex::new(Vec::new()),
+                logins: Mutex::new(Vec::new()),
+                second_logins: Mutex::new(Vec::new()),
                 usage_result: Mutex::new(None),
                 asked: Mutex::new(Vec::new()),
                 factor: Mutex::new(FakeFactor::default()),
@@ -673,6 +690,34 @@ pub(crate) mod fake {
             self.answer("join", |_| ())?;
             let next = self.joins.lock().unwrap().pop();
             next.unwrap_or_else(|| Ok(self.status.lock().unwrap().clone()))
+        }
+        fn login(&self, request: &LoginRequest) -> Result<Status, Error> {
+            self.answer("login", |_| ())?;
+            self.logins.lock().unwrap().push(request.clone());
+            if let Some(next) = self.joins.lock().unwrap().pop() {
+                return next;
+            }
+            if request.password != PASSWORD {
+                return Err(refused("wrong_password", "wrong user name or password"));
+            }
+            if self.factor.lock().unwrap().enabled {
+                return Err(Error::RefusedWith {
+                    code: "two_factor_required".into(),
+                    message: "this account has two-factor sign-in".into(),
+                    two_factor: Some(craft_cloud_app::TwoFactorChallenge { challenge: "challenge-1".into(), expires_ms: 1_790_000_300_000 }),
+                    retry_after_secs: None,
+                });
+            }
+            Ok(self.status.lock().unwrap().clone())
+        }
+        fn login_second_factor(&self, request: &SecondFactorLoginRequest) -> Result<Status, Error> {
+            self.answer("login_second_factor", |_| ())?;
+            self.second_logins.lock().unwrap().push(request.clone());
+            if let Some(next) = self.joins.lock().unwrap().pop() {
+                return next;
+            }
+            self.check_code(request.totp_code.as_deref().or(request.recovery_code.as_deref()))?;
+            Ok(self.status.lock().unwrap().clone())
         }
         fn logout(&self, _local: bool) -> Result<Status, Error> {
             self.answer("logout", Status::clone)

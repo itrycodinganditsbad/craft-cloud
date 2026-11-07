@@ -1,9 +1,9 @@
-//! The code a join asks for when the account has two-factor sign-in: the six digits from the authenticator app, or a recovery
+//! The code a join or a sign-in asks for when the account has two-factor sign-in: the six digits from the authenticator app, or a recovery
 //! code instead.
 
 use egui::RichText;
 
-use crate::model::Event;
+use crate::model::{Event, JoinMode};
 use crate::security::SecondFactorForm;
 
 pub(super) fn show(ui: &mut egui::Ui, form: &mut SecondFactorForm, events: &mut Vec<Event>) {
@@ -22,13 +22,19 @@ pub(super) fn show(ui: &mut egui::Ui, form: &mut SecondFactorForm, events: &mut 
         form.code.clear();
         form.error = None;
     }
-    ui.label(RichText::new("A recovery code works once. Your invite or code isn't used up until this works.").small().weak());
+    let signing_in = form.form.mode == JoinMode::SignIn;
+    let note = if signing_in {
+        "A recovery code works once. After five wrong codes you have to wait before trying again."
+    } else {
+        "A recovery code works once. Your invite or code isn't used up until this works."
+    };
+    ui.label(RichText::new(note).small().weak());
     ui.add_space(10.0);
     if let Some(error) = &form.error {
         super::error_line(ui, error);
         ui.add_space(8.0);
     }
-    if super::wide_button(ui, true, "Join") || enter {
+    if super::wide_button(ui, true, if signing_in { "Sign in" } else { "Join" }) || enter {
         events.push(Event::SubmitSecondFactor);
     }
     ui.add_space(4.0);
