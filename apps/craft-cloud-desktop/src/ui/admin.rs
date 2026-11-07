@@ -5,8 +5,8 @@ use egui::RichText;
 
 use super::kit::{self, Tokens, Tone};
 use crate::admin::{
-    Action, AdminEvent, AdminScreen, CodeKind, CreateForm, Dialog, RoleChoice, Room, Section, ShownCode, StorageBlock, StoreRoom, UserList, UserView,
-    View, format_bytes,
+    Action, AdminEvent, AdminScreen, Basis, CodeKind, CreateForm, Dialog, RoleChoice, Room, Section, ShownCode, StorageBlock, StoreRoom, UserList,
+    UserView, View, Warning, format_bytes,
 };
 use craft_cloud_app::AdminUserInfo;
 
@@ -96,7 +96,9 @@ fn panel<R>(ui: &mut egui::Ui, title: Option<&str>, right: impl FnOnce(&mut egui
 /// A bar of `width` points: `room`'s share filled, with a tick at the warning share. No room: an empty track.
 fn bar(ui: &mut egui::Ui, room: Option<Room>, width: f32) {
     let t = Tokens::get(ui.ctx());
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width.max(20.0), 6.0), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width.max(20.0), 6.0), egui::Sense::hover());
+    let label = room.map_or_else(|| "no size".to_owned(), |room| format!("{} % used", room.percent()));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ProgressIndicator, true, &label));
     let painter = ui.painter();
     painter.rect_filled(rect, egui::CornerRadius::ZERO, t.line);
     if let Some(room) = room {
@@ -151,6 +153,18 @@ fn room_state(ui: &mut egui::Ui, room: Option<Room>) {
     }
 }
 
+/// The tags of a store's state: "OK", or what is near and how far.
+fn warning_tags(ui: &mut egui::Ui, warnings: &[Warning]) {
+    ui.horizontal(|ui| {
+        if warnings.is_empty() {
+            kit::tag(ui, "OK", Tone::Good);
+        }
+        for warning in warnings {
+            kit::tag(ui, &warning.text(), if warning.room.full() { Tone::Bad } else { Tone::Warn });
+        }
+    });
+}
+
 /// The admin landing page: the Accounts, Storage and Audit log tabs over the part that is shown.
 fn landing(
     ui: &mut egui::Ui,
@@ -178,12 +192,18 @@ fn landing(
         }
         if let Some(info) = server {
             ui.add_space(8.0);
-            kit::section_label(ui, &format!("Server {} · {} · {}", info.version, info.storage_kind, info.database_kind));
+            kit::section_label(
+                ui,
+                &format!(
+                    "Server {} · {} accounts · {} computers · {} · {}",
+                    info.version, info.users, info.devices_active, info.storage_kind, info.database_kind
+                ),
+            );
         }
     });
     ui.add_space(12.0);
     match section {
-        Section::Accounts => accounts(ui, storage, list, me, events),
+        Section::Accounts => accounts(ui, storage, server, list, me, events),
         Section::Storage => storage_page(ui, storage),
     }
 }
@@ -197,19 +217,35 @@ fn stat(ui: &mut egui::Ui, label: &str, value: &str, note: &str) {
     });
 }
 
-fn stat_cells(ui: &mut egui::Ui, storage: &craft_cloud_app::AdminStorageOverview) {
-    ui.columns(4, |cols| {
-        let [a, b, c, d] = cols else { return };
-        stat(a, "Stored", &format_bytes(storage.stored_bytes), "files of all accounts");
-        let quota = storage.default_quota_bytes.map_or_else(|| "none".to_owned(), format_bytes);
-        stat(
-            b,
-            "Total accounts",
-            &storage.accounts.to_string(),
-            &format!("default quota: {quota} · {} with their own", storage.accounts_with_override),
-        );
-        stat(c, "Near quota", &storage.accounts_near_quota.to_string(), "at 90 % of their quota or more");
-        stat(d, "Over quota", &storage.accounts_over_quota.to_string(), "at or past their quota: uploads refused");
+/// The cells with the counts. The storage call has all four; without it (it failed, or is still asking) the server's own
+/// counters give what they know: what is stored and how many accounts.
+fn stat_cells(ui: &mut egui::Ui, storage: Option<&craft_cloud_app::AdminStorageOverview>, server: Option<&craft_cloud_app::AdminServerInfo>) {
+    let stored = storage.map(|s| s.stored_bytes).or(server.map(|s| s.stored_bytes));
+    let accounts = storage.map(|s| s.accounts).or(server.map(|s| s.users));
+    let (Some(stored), Some(accounts)) = (stored, accounts) else { return };
+    let accounts_note = match storage {
+        Some(storage) => {
+            let quota = storage.default_quota_bytes.map_or_else(|| "none".to_owned(), format_bytes);
+            format!("default quota: {quota} · {} with their own", storage.accounts_with_override)
+        }
+        None => "on this server".to_owned(),
+    };
+    ui.columns(if storage.is_some() { 4 } else { 2 }, |cols| {
+        let mut cells = cols.iter_mut();
+        if let Some(cell) = cells.next() {
+            stat(cell, "Stored", &format_bytes(stored), "files of all accounts");
+        }
+        if let Some(cell) = cells.next() {
+            stat(cell, "Total accounts", &accounts.to_string(), &accounts_note);
+        }
+        if let Some(storage) = storage {
+            if let Some(cell) = cells.next() {
+                stat(cell, "Near quota", &storage.accounts_near_quota.to_string(), "at 90 % of their quota or more");
+            }
+            if let Some(cell) = cells.next() {
+                stat(cell, "Over quota", &storage.accounts_over_quota.to_string(), "at or past their quota: uploads refused");
+            }
+        }
     });
 }
 
@@ -236,11 +272,17 @@ fn scroll_x<R>(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui) -> R
     egui::ScrollArea::horizontal().id_salt(id).auto_shrink([false, true]).show(ui, add).inner
 }
 
-fn accounts(ui: &mut egui::Ui, storage: StorageState<'_>, list: &mut UserList, me: &str, events: &mut Vec<Event>) {
-    if storage_status(ui, &storage)
-        && let Some(overview) = storage.overview
-    {
-        stat_cells(ui, overview);
+fn accounts(
+    ui: &mut egui::Ui,
+    storage: StorageState<'_>,
+    server: Option<&craft_cloud_app::AdminServerInfo>,
+    list: &mut UserList,
+    me: &str,
+    events: &mut Vec<Event>,
+) {
+    storage_status(ui, &storage);
+    if storage.overview.is_some() || server.is_some() {
+        stat_cells(ui, storage.overview, server);
         ui.add_space(12.0);
     }
     ui.horizontal_wrapped(|ui| {
@@ -297,15 +339,19 @@ fn accounts(ui: &mut egui::Ui, storage: StorageState<'_>, list: &mut UserList, m
     }
 }
 
-/// The state of an account as a tag.
+/// The state of an account as tags: each that applies (a disabled account can have an invite open too), else "Active".
 fn account_state(ui: &mut egui::Ui, user: &AdminUserInfo) {
-    if user.disabled_ms.is_some() {
-        kit::tag(ui, "Disabled", Tone::Bad);
-    } else if user.invite_pending {
-        kit::tag(ui, "Invite open", Tone::Warn);
-    } else {
-        kit::tag(ui, "Active", Tone::Good);
-    }
+    ui.horizontal(|ui| {
+        if user.disabled_ms.is_some() {
+            kit::tag(ui, "Disabled", Tone::Bad);
+        }
+        if user.invite_pending {
+            kit::tag(ui, "Invite open", Tone::Warn);
+        }
+        if user.disabled_ms.is_none() && !user.invite_pending {
+            kit::tag(ui, "Active", Tone::Good);
+        }
+    });
 }
 
 fn role_tag(ui: &mut egui::Ui, user: &AdminUserInfo) {
@@ -410,9 +456,14 @@ fn storage_page(ui: &mut egui::Ui, state: StorageState<'_>) {
 }
 
 /// "01 / Server storage": all storage as one number and a bar, and a row for the server's disk and one for the store.
+///
+/// A disk store is measured by its filesystem (real bytes). What the accounts have stored counts per account, so it can pass
+/// the disk's size; it is only the measure for a store with a capacity and no disk to read (S3), and then it is said to be an
+/// upper bound. A set capacity on a disk is a second measure with a warning of its own.
 fn server_storage(ui: &mut egui::Ui, block: &StorageBlock) {
     let near = block.near_count();
     let title = kit::numbered(1, "Server storage");
+    let warnings = block.store.warnings();
     panel(
         ui,
         Some(&title),
@@ -427,15 +478,43 @@ fn server_storage(ui: &mut egui::Ui, block: &StorageBlock) {
                 ui.set_width(ui.available_width());
                 kit::section_label(ui, "All storage");
                 ui.horizontal_wrapped(|ui| {
-                    big(ui, &format_bytes(block.stored), 30.0);
-                    ui.add_space(4.0);
-                    match (block.capacity, block.free) {
-                        (Some(capacity), Some(free)) => ui.label(format!("stored of {} · {} free", format_bytes(capacity), format_bytes(free))),
-                        (Some(capacity), None) => ui.label(format!("stored of {}", format_bytes(capacity))),
-                        (None, _) => ui.label(RichText::new("stored · no size to measure it against").weak()),
-                    };
+                    match (block.basis, block.all) {
+                        (Basis::Disk, Some(room)) => {
+                            big(ui, &format_bytes(room.used), 30.0);
+                            ui.add_space(4.0);
+                            ui.label(format!("used of {} · {} free", format_bytes(room.total), format_bytes(room.total.saturating_sub(room.used))));
+                        }
+                        (Basis::Accounts, Some(room)) => {
+                            big(ui, &format_bytes(room.used), 30.0);
+                            ui.add_space(4.0);
+                            ui.label(format!(
+                                "stored by the accounts, of {} · {} left (counted per account: an upper bound)",
+                                format_bytes(room.total),
+                                format_bytes(room.total.saturating_sub(room.used))
+                            ));
+                        }
+                        _ => {
+                            big(ui, &format_bytes(block.stored), 30.0);
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("stored by the accounts · no size to measure it against").weak());
+                        }
+                    }
+                    if block.all.is_some() {
+                        ui.add_space(4.0);
+                        warning_tags(ui, &warnings);
+                    }
                 });
-                bar(ui, block.all(), ui.available_width());
+                bar(ui, block.all, ui.available_width());
+                if let (Basis::Disk, Some(capacity)) = (block.basis, block.capacity) {
+                    small_weak(
+                        ui,
+                        format!(
+                            "capacity set: {} · the accounts' files total {}, counted per account",
+                            format_bytes(capacity),
+                            format_bytes(block.stored)
+                        ),
+                    );
+                }
             });
             kit::hairline(ui);
             scroll_x(ui, "admin-room-scroll", |ui| {
@@ -446,7 +525,7 @@ fn server_storage(ui: &mut egui::Ui, block: &StorageBlock) {
                         }
                         ui.end_row();
                         server_disk_row(ui, block);
-                        store_row(ui, &block.store);
+                        store_row(ui, &block.store, &warnings);
                     });
                 });
             });
@@ -455,19 +534,24 @@ fn server_storage(ui: &mut egui::Ui, block: &StorageBlock) {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 4.0;
                 match &block.store {
-                    StoreRoom::NoCapacity { .. } => small_weak(
+                    StoreRoom::NoCapacity { kind } if kind == "s3" => small_weak(
                         ui,
                         "Capacity not set: add capacity to the [storage] section of the server's configuration to see how full the store is. \
                          An S3 store has no size of its own.",
                     ),
+                    StoreRoom::NoCapacity { .. } => small_weak(
+                        ui,
+                        "Capacity not set: add capacity to the [storage] section of the server's configuration to see how full the store is.",
+                    ),
+                    StoreRoom::NoNumbers { .. } => small_weak(ui, "The server sent no size for the disk that holds the store."),
                     StoreRoom::Unknown => small_weak(ui, "This server doesn't report its room: it may be older, or the disk could not be read."),
-                    _ => {}
+                    StoreRoom::Filesystem { .. } | StoreRoom::Capacity { .. } => {}
                 }
                 small_weak(
                     ui,
                     format!(
                         "A disk reports its own size; S3 shows the capacity set in the server's configuration. The yellow mark and the percentage \
-                         warn at {} %. Accounts' files are counted as they are stored for each account.",
+                         warn at {} %. Accounts' files are counted per account, so they can add up to more than the store holds.",
                         crate::admin::WARN_PERCENT
                     ),
                 );
@@ -485,13 +569,14 @@ fn name_cell(ui: &mut egui::Ui, name: &str, note: &str) {
     });
 }
 
-fn room_cells(ui: &mut egui::Ui, room: Option<Room>) {
+/// A row's bar, its numbers and its state (`state` draws the tags).
+fn room_cells(ui: &mut egui::Ui, room: Option<Room>, state: impl FnOnce(&mut egui::Ui)) {
     bar(ui, room, 150.0);
     match room {
         Some(room) => ui.label(format!("{} / {}", format_bytes(room.used), format_bytes(room.total))),
         None => ui.label(RichText::new("–").weak()),
     };
-    room_state(ui, room);
+    state(ui);
 }
 
 fn server_disk_row(ui: &mut egui::Ui, block: &StorageBlock) {
@@ -501,28 +586,31 @@ fn server_disk_row(ui: &mut egui::Ui, block: &StorageBlock) {
     };
     name_cell(ui, "Server disk", &note);
     kit::tag(ui, "Disk", Tone::Neutral);
-    room_cells(ui, block.server_disk);
+    room_cells(ui, block.server_disk, |ui| room_state(ui, block.server_disk));
     ui.end_row();
 }
 
-fn store_row(ui: &mut egui::Ui, store: &StoreRoom) {
-    let (kind, note) = match store {
-        StoreRoom::Filesystem { kind, capacity: Some(set), .. } => {
-            (Some(kind.as_str()), format!("filesystem of the store · capacity {} set", format_bytes(*set)))
-        }
-        StoreRoom::Filesystem { kind, capacity: None, .. } => (Some(kind.as_str()), "filesystem of the store".to_owned()),
-        StoreRoom::Capacity { kind, room } => (Some(kind.as_str()), format!("stored against the capacity {} set", format_bytes(room.total))),
-        StoreRoom::NoCapacity { kind } => (Some(kind.as_str()), "capacity not set".to_owned()),
-        StoreRoom::Unknown => (None, "not reported".to_owned()),
+fn store_row(ui: &mut egui::Ui, store: &StoreRoom, warnings: &[Warning]) {
+    let note = match store {
+        StoreRoom::Filesystem { capacity: Some(set), .. } => format!("filesystem of the store · capacity set: {}", format_bytes(set.total)),
+        StoreRoom::Filesystem { capacity: None, .. } => "filesystem of the store".to_owned(),
+        StoreRoom::Capacity { room, .. } => format!("accounts' total against the capacity set: {}", format_bytes(room.total)),
+        StoreRoom::NoCapacity { .. } => "capacity not set".to_owned(),
+        StoreRoom::NoNumbers { .. } => "no size reported".to_owned(),
+        StoreRoom::Unknown => "not reported".to_owned(),
     };
     name_cell(ui, "Blob store", &note);
-    match kind {
+    match store.kind() {
         Some(kind) => {
             kit::tag(ui, kind, if kind == "s3" { Tone::Accent } else { Tone::Neutral });
         }
         None => dash(ui),
     }
-    room_cells(ui, store.room());
+    let room = store.room();
+    room_cells(ui, room, |ui| match room {
+        Some(_) => warning_tags(ui, warnings),
+        None => dash(ui),
+    });
     ui.end_row();
 }
 

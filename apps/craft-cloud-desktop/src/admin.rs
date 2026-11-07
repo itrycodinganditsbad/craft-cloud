@@ -1095,39 +1095,110 @@ impl Room {
     }
 }
 
+/// What a store's room is measured against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// The bytes the store's filesystem has used, of its size.
+    Disk,
+    /// What the accounts have stored, of the capacity the admin set.
+    Capacity,
+}
+
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disk => "disk",
+            Self::Capacity => "capacity",
+        }
+    }
+}
+
+/// A room at or past the warning share, and what it is a room of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Warning {
+    pub source: Source,
+    pub room: Room,
+}
+
+impl Warning {
+    /// "disk 92 %", "capacity 120 %".
+    pub fn text(self) -> String {
+        format!("{} {} %", self.source.label(), self.room.percent())
+    }
+}
+
 /// What the overview says about the one store the server has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreRoom {
-    /// A disk store: the used and total bytes of its filesystem. `capacity` is the size the admin set, if any.
-    Filesystem { kind: String, room: Room, capacity: Option<u64> },
-    /// A store that has only the capacity the admin set (S3), or a disk whose filesystem could not be read.
+    /// A disk store: the used and total bytes of its filesystem, and, if the admin set a capacity, what the accounts have
+    /// stored of it.
+    Filesystem { kind: String, room: Room, capacity: Option<Room> },
+    /// A store that has only the capacity the admin set (S3), or a disk whose filesystem could not be read: what the accounts
+    /// have stored of it.
     Capacity { kind: String, room: Room },
     /// A store with no size to show (S3 or memory without `capacity` in `[storage]`).
     NoCapacity { kind: String },
-    /// An older server that doesn't say, or a disk with no numbers at all.
+    /// A disk store the server sent no numbers for.
+    NoNumbers { kind: String },
+    /// An older server that doesn't say what its store is.
     Unknown,
 }
 
 impl StoreRoom {
-    /// The room that is measured, if there is one.
+    /// The room that is measured, if there is one: the filesystem's for a disk, else the capacity's.
     pub fn room(&self) -> Option<Room> {
         match self {
             Self::Filesystem { room, .. } | Self::Capacity { room, .. } => Some(*room),
-            Self::NoCapacity { .. } | Self::Unknown => None,
+            Self::NoCapacity { .. } | Self::NoNumbers { .. } | Self::Unknown => None,
         }
     }
+
+    /// The kind the server named, if it did.
+    pub fn kind(&self) -> Option<&str> {
+        match self {
+            Self::Filesystem { kind, .. } | Self::Capacity { kind, .. } | Self::NoCapacity { kind } | Self::NoNumbers { kind } => {
+                Some(kind.as_str()).filter(|kind| !kind.is_empty())
+            }
+            Self::Unknown => None,
+        }
+    }
+
+    /// The rooms at or past the warning share: a disk's filesystem, and the stored bytes against a capacity.
+    pub fn warnings(&self) -> Vec<Warning> {
+        let rooms = match self {
+            Self::Filesystem { room, capacity, .. } => vec![(Source::Disk, Some(*room)), (Source::Capacity, *capacity)],
+            Self::Capacity { room, .. } => vec![(Source::Capacity, Some(*room))],
+            Self::NoCapacity { .. } | Self::NoNumbers { .. } | Self::Unknown => Vec::new(),
+        };
+        rooms.into_iter().filter_map(|(source, room)| room.filter(|room| room.near()).map(|room| Warning { source, room })).collect()
+    }
+}
+
+/// What the "all storage" line is a measure of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Basis {
+    /// The store's filesystem: real bytes on the disk.
+    Disk,
+    /// What the accounts have stored, of the capacity set. It counts per account (a chunk two accounts share counts twice,
+    /// and so do uploads that were refused), so it is an upper bound of what the store holds.
+    Accounts,
+    /// Nothing to measure it against.
+    Unmeasured,
 }
 
 /// The server storage block of the admin pages, worked out from [`AdminStorageOverview`]. Every number the server left out
 /// (an older server, Postgres, S3's filesystem) is `None` here and shown as missing, never as zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageBlock {
-    /// What the accounts have stored (the overview's `stored_bytes`).
+    /// What the accounts have stored, counted per account (the overview's `stored_bytes`).
     pub stored: u64,
-    /// What it is measured against: the capacity set, else the store's filesystem.
-    pub capacity: Option<u64>,
+    /// The room of the "all storage" line, and what it measures.
+    pub all: Option<Room>,
+    pub basis: Basis,
     /// What is left of it.
     pub free: Option<u64>,
+    /// The capacity the admin set, if any.
+    pub capacity: Option<u64>,
     /// The filesystem of the server's own data, with the database's size.
     pub server_disk: Option<Room>,
     pub database_bytes: Option<u64>,
@@ -1145,48 +1216,37 @@ impl StorageBlock {
         let stored = overview.stored_bytes;
         // A capacity of 0 can't be (the server refuses it): it reads as not set rather than as a division by nothing.
         let capacity = overview.capacity_bytes.filter(|capacity| *capacity > 0);
+        let against_capacity = capacity.map(|total| Room { used: stored, total });
         let store_fs = filesystem(overview.store_fs_total_bytes, overview.store_fs_free_bytes);
         let kind = overview.store_kind.clone().unwrap_or_default();
-        let store = match (kind.as_str(), store_fs, capacity) {
+        let store = match (kind.as_str(), store_fs, against_capacity) {
             // Only a disk store has a filesystem of its own to read.
             ("disk" | "", Some(room), capacity) => StoreRoom::Filesystem { kind: "disk".into(), room, capacity },
-            ("disk", None, Some(total)) => StoreRoom::Capacity { kind: kind.clone(), room: Room { used: stored, total } },
-            ("" | "disk", None, None) => StoreRoom::Unknown,
-            (_, _, Some(total)) => StoreRoom::Capacity { kind: kind.clone(), room: Room { used: stored, total } },
+            ("disk", None, None) => StoreRoom::NoNumbers { kind: kind.clone() },
+            ("", None, None) => StoreRoom::Unknown,
+            (_, _, Some(room)) => StoreRoom::Capacity { kind: kind.clone(), room },
             (_, _, None) => StoreRoom::NoCapacity { kind: kind.clone() },
         };
-        let total = capacity.or(match &store {
-            StoreRoom::Filesystem { room, .. } => Some(room.total),
-            _ => None,
-        });
-        // Free is what is left of the capacity; a disk can be fuller than that (other data on it), so the smaller one counts.
-        let on_disk = match &store {
-            StoreRoom::Filesystem { room, .. } => Some(room.total.saturating_sub(room.used)),
-            _ => None,
-        };
-        let free = match (capacity.map(|capacity| capacity.saturating_sub(stored)), on_disk) {
-            (Some(left), Some(on_disk)) => Some(left.min(on_disk)),
-            (Some(left), None) => Some(left),
-            (None, on_disk) => on_disk,
+        let (all, basis) = match &store {
+            StoreRoom::Filesystem { room, .. } => (Some(*room), Basis::Disk),
+            StoreRoom::Capacity { room, .. } => (Some(*room), Basis::Accounts),
+            _ => (None, Basis::Unmeasured),
         };
         Self {
             stored,
-            capacity: total,
-            free,
+            all,
+            basis,
+            free: all.map(|room| room.total.saturating_sub(room.used)),
+            capacity,
             server_disk: filesystem(overview.server_fs_total_bytes, overview.server_fs_free_bytes),
             database_bytes: overview.database_bytes,
             store,
         }
     }
 
-    /// What the stored bytes are of, if there is a size to measure them against.
-    pub fn all(&self) -> Option<Room> {
-        self.capacity.map(|total| Room { used: self.stored, total })
-    }
-
-    /// How many of the rows (the server disk, the store) are at or past the warning share.
+    /// How many of the rows (the server disk, the store) have a room at or past the warning share.
     pub fn near_count(&self) -> usize {
-        [self.server_disk, self.store.room()].into_iter().flatten().filter(|room| room.near()).count()
+        usize::from(self.server_disk.is_some_and(Room::near)) + usize::from(!self.store.warnings().is_empty())
     }
 }
 
@@ -1867,100 +1927,150 @@ mod storage_block_tests {
         StorageBlock::of(&overview)
     }
 
+    fn disk(o: &mut AdminStorageOverview, total: u64, free: u64) {
+        o.store_kind = Some("disk".into());
+        o.store_fs_total_bytes = Some(total * GIB);
+        o.store_fs_free_bytes = Some(free * GIB);
+    }
+
+    fn texts(block: &StorageBlock) -> Vec<String> {
+        block.store.warnings().into_iter().map(Warning::text).collect()
+    }
+
     #[test]
-    fn a_disk_store_with_capacity_is_measured_against_the_capacity() {
+    fn a_disk_store_is_measured_by_its_filesystem_and_the_capacity_is_a_second_measure() {
         let block = overview(|o| {
-            o.store_kind = Some("disk".into());
+            disk(o, 1000, 600);
             o.capacity_bytes = Some(400 * GIB);
-            o.store_fs_total_bytes = Some(1000 * GIB);
-            o.store_fs_free_bytes = Some(600 * GIB);
             o.server_fs_total_bytes = Some(80 * GIB);
             o.server_fs_free_bytes = Some(70 * GIB);
             o.database_bytes = Some(GIB);
         });
-        assert_eq!(block.all(), Some(Room { used: 100 * GIB, total: 400 * GIB }));
-        assert_eq!(block.free, Some(300 * GIB), "what is left of the capacity");
+        assert_eq!((block.all, block.basis, block.free), (Some(Room { used: 400 * GIB, total: 1000 * GIB }), Basis::Disk, Some(600 * GIB)));
+        assert_eq!(block.capacity, Some(400 * GIB));
         assert_eq!(
             block.store,
-            StoreRoom::Filesystem { kind: "disk".into(), room: Room { used: 400 * GIB, total: 1000 * GIB }, capacity: Some(400 * GIB) }
+            StoreRoom::Filesystem {
+                kind: "disk".into(),
+                room: Room { used: 400 * GIB, total: 1000 * GIB },
+                capacity: Some(Room { used: 100 * GIB, total: 400 * GIB })
+            }
         );
         assert_eq!(block.server_disk, Some(Room { used: 10 * GIB, total: 80 * GIB }));
         assert_eq!(block.database_bytes, Some(GIB));
+        assert_eq!((texts(&block), block.near_count()), (Vec::<String>::new(), 0));
     }
 
     #[test]
-    fn a_disk_that_is_fuller_than_its_capacity_says_free_by_the_disk() {
-        let block = overview(|o| {
-            o.store_kind = Some("disk".into());
-            o.capacity_bytes = Some(400 * GIB);
-            o.store_fs_total_bytes = Some(1000 * GIB);
-            o.store_fs_free_bytes = Some(50 * GIB);
-        });
-        assert_eq!(block.free, Some(50 * GIB));
-    }
-
-    #[test]
-    fn a_disk_store_without_capacity_is_measured_against_its_filesystem() {
-        let block = overview(|o| {
-            o.store_kind = Some("disk".into());
-            o.store_fs_total_bytes = Some(1000 * GIB);
-            o.store_fs_free_bytes = Some(600 * GIB);
-        });
-        assert_eq!(block.capacity, Some(1000 * GIB));
-        assert_eq!(block.free, Some(600 * GIB));
-        assert_eq!(block.all(), Some(Room { used: 100 * GIB, total: 1000 * GIB }));
+    fn a_disk_store_without_capacity_has_the_filesystem_only() {
+        let block = overview(|o| disk(o, 1000, 600));
+        assert_eq!((block.all, block.basis, block.capacity), (Some(Room { used: 400 * GIB, total: 1000 * GIB }), Basis::Disk, None));
         assert!(matches!(block.store, StoreRoom::Filesystem { capacity: None, .. }));
     }
 
     #[test]
-    fn an_s3_store_with_capacity_is_stored_against_the_capacity() {
+    fn a_disk_near_its_capacity_warns_with_the_capacity_and_a_full_one_says_so() {
+        let near = overview(|o| {
+            disk(o, 1000, 600);
+            o.capacity_bytes = Some(110 * GIB);
+        });
+        assert_eq!(texts(&near), ["capacity 90 %"]);
+        assert_eq!(near.near_count(), 1);
+        let over = overview(|o| {
+            disk(o, 1000, 600);
+            o.capacity_bytes = Some(80 * GIB);
+        });
+        assert_eq!(texts(&over), ["capacity 125 %"], "stored passes the capacity: a warning, never a bar past its end");
+        assert!(over.store.warnings().iter().all(|w| w.room.full()));
+    }
+
+    #[test]
+    fn a_nearly_full_filesystem_warns_with_the_disk() {
+        let block = overview(|o| disk(o, 1000, 92));
+        assert_eq!(texts(&block), ["disk 90 %"]);
+        assert_eq!(block.near_count(), 1);
+        let both = overview(|o| {
+            disk(o, 100, 5);
+            o.capacity_bytes = Some(100 * GIB);
+        });
+        assert_eq!(texts(&both), ["disk 95 %", "capacity 100 %"]);
+        assert_eq!(both.near_count(), 1, "one store, two reasons");
+    }
+
+    #[test]
+    fn stored_over_the_filesystem_is_not_a_warning_of_the_filesystem() {
+        // Chunks that accounts share count once on the disk and once for each account.
+        let block = overview(|o| disk(o, 50, 40));
+        assert_eq!(block.all, Some(Room { used: 10 * GIB, total: 50 * GIB }));
+        assert!(texts(&block).is_empty());
+        assert_eq!(block.stored, 100 * GIB, "the per-account sum is still known");
+    }
+
+    #[test]
+    fn an_s3_store_is_the_accounts_total_against_the_capacity() {
         let block = overview(|o| {
             o.store_kind = Some("s3".into());
             o.capacity_bytes = Some(200 * GIB);
         });
         assert_eq!(block.store, StoreRoom::Capacity { kind: "s3".into(), room: Room { used: 100 * GIB, total: 200 * GIB } });
-        assert_eq!((block.capacity, block.free), (Some(200 * GIB), Some(100 * GIB)));
+        assert_eq!((block.basis, block.free), (Basis::Accounts, Some(100 * GIB)));
+        let near = overview(|o| {
+            o.store_kind = Some("s3".into());
+            o.capacity_bytes = Some(110 * GIB);
+        });
+        assert_eq!(texts(&near), ["capacity 90 %"]);
+        assert_eq!(near.near_count(), 1);
+        let over = overview(|o| {
+            o.store_kind = Some("s3".into());
+            o.capacity_bytes = Some(50 * GIB);
+        });
+        assert_eq!((texts(&over), over.free), (vec!["capacity 200 %".to_owned()], Some(0)), "no negative free");
     }
 
     #[test]
-    fn an_s3_store_without_capacity_has_no_size_and_no_free() {
-        let block = overview(|o| o.store_kind = Some("s3".into()));
-        assert_eq!(block.store, StoreRoom::NoCapacity { kind: "s3".into() });
-        assert_eq!((block.capacity, block.free, block.all()), (None, None, None));
-        assert_eq!(block.stored, 100 * GIB, "what is stored is still known");
-        assert_eq!(block.near_count(), 0);
+    fn an_s3_or_memory_store_without_capacity_has_no_size_and_no_free() {
+        for kind in ["s3", "memory", "other"] {
+            let block = overview(|o| o.store_kind = Some(kind.into()));
+            assert_eq!(block.store, StoreRoom::NoCapacity { kind: kind.into() });
+            assert_eq!((block.all, block.free, block.basis, block.near_count()), (None, None, Basis::Unmeasured, 0));
+            assert_eq!(block.store.kind(), Some(kind));
+        }
     }
 
     #[test]
     fn an_old_server_leaves_everything_unknown() {
         let block = overview(|_| {});
         assert_eq!(block.store, StoreRoom::Unknown);
-        assert_eq!((block.capacity, block.free, block.server_disk, block.database_bytes), (None, None, None, None));
+        assert_eq!((block.all, block.free, block.server_disk, block.database_bytes, block.store.kind()), (None, None, None, None, None));
         assert_eq!(block.near_count(), 0);
     }
 
     #[test]
-    fn postgres_has_no_database_size_or_server_disk() {
-        let block = overview(|o| {
+    fn a_disk_store_without_numbers_stays_a_disk() {
+        let block = overview(|o| o.store_kind = Some("disk".into()));
+        assert_eq!(block.store, StoreRoom::NoNumbers { kind: "disk".into() });
+        assert_eq!((block.store.kind(), block.all), (Some("disk"), None));
+        // Half a filesystem is none, and a capacity of 0 is not one.
+        let half = overview(|o| {
             o.store_kind = Some("disk".into());
             o.store_fs_total_bytes = Some(1000 * GIB);
-            o.store_fs_free_bytes = Some(600 * GIB);
+            o.capacity_bytes = Some(0);
         });
-        assert_eq!((block.server_disk, block.database_bytes), (None, None));
-        assert!(block.store.room().is_some(), "the store's own numbers stay");
+        assert_eq!(half.store, StoreRoom::NoNumbers { kind: "disk".into() });
+        assert_eq!(half.capacity, None);
+        // A disk whose filesystem can't be read still has its capacity.
+        let capacity = overview(|o| {
+            o.store_kind = Some("disk".into());
+            o.capacity_bytes = Some(200 * GIB);
+        });
+        assert_eq!((capacity.basis, capacity.all), (Basis::Accounts, Some(Room { used: 100 * GIB, total: 200 * GIB })));
     }
 
     #[test]
-    fn a_filesystem_with_only_half_its_numbers_or_none_in_size_is_left_out() {
-        let block = overview(|o| {
-            o.store_kind = Some("disk".into());
-            o.store_fs_total_bytes = Some(1000 * GIB);
-            o.server_fs_total_bytes = Some(0);
-            o.server_fs_free_bytes = Some(0);
-            o.capacity_bytes = Some(0);
-        });
-        assert_eq!(block.store, StoreRoom::Unknown, "no free bytes, and a capacity of 0 is not one");
-        assert_eq!((block.server_disk, block.capacity), (None, None));
+    fn postgres_has_no_database_size_or_server_disk() {
+        let block = overview(|o| disk(o, 1000, 600));
+        assert_eq!((block.server_disk, block.database_bytes), (None, None));
+        assert!(block.store.room().is_some(), "the store's own numbers stay");
     }
 
     #[test]
@@ -1971,13 +2081,14 @@ mod storage_block_tests {
         assert!(room(1000).near() && room(1000).full());
         assert!(room(1500).near() && room(1500).full());
         assert_eq!((room(899).percent(), room(900).percent(), room(1500).percent()), (89, 90, 150));
+        assert_eq!(room(1500).fraction(), 1.0, "a bar never passes its end");
         assert!(!Room { used: 5, total: 0 }.near(), "no size, no warning");
         assert_eq!(Room { used: 5, total: 0 }.percent(), 0);
         assert!(Room { used: u64::MAX, total: u64::MAX }.near(), "no overflow at the top");
-        let block = overview(|o| {
-            o.store_kind = Some("s3".into());
-            o.capacity_bytes = Some(110 * GIB);
+        let server = overview(|o| {
+            o.server_fs_total_bytes = Some(100 * GIB);
+            o.server_fs_free_bytes = Some(10 * GIB);
         });
-        assert_eq!(block.near_count(), 1, "100 of 110 GiB is 90 %");
+        assert_eq!(server.near_count(), 1, "the server's own disk counts");
     }
 }

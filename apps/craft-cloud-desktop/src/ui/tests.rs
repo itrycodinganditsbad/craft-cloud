@@ -796,6 +796,15 @@ fn snapshot_admin_storage() {
         egui::Theme::Light,
         "admin-storage-postgres",
     );
+    // The accounts' total passes the capacity set: a warning and a full bar, not a number past the bar's end.
+    snapshot(
+        storage_tab(&agent, |o| {
+            disk_with_capacity(o);
+            o.capacity_bytes = Some(4 * GIB);
+        }),
+        egui::Theme::Light,
+        "admin-storage-capacity-over",
+    );
     snapshot_sized(storage_tab(&agent, disk_with_capacity), egui::Theme::Light, "admin-storage-smallest-light", MIN_WINDOW_SIZE);
 }
 
@@ -808,32 +817,88 @@ fn the_storage_block_says_what_it_knows_and_hints_at_what_it_does_not() {
         h.run_steps(3);
         h.query_all_by_label(label).count()
     };
-    let hint = "Capacity not set: add capacity to the [storage] section of the server's configuration to see how full the store is. An S3 store has no size of its own.";
-    // A disk store with capacity: stored of the capacity, free; no warning, no hint.
+    let hint = "Capacity not set: add capacity to the [storage] section of the server's configuration to see how full the store is.";
+    let s3_hint = format!("{hint} An S3 store has no size of its own.");
+    // A disk store with capacity: the filesystem's numbers, the capacity as a line of its own; no warning, no hint.
     let model = storage_tab(&agent, disk_with_capacity);
     assert_eq!(count(model.clone(), "Near capacity"), 0);
-    assert_eq!(count(model.clone(), "OK"), 2, "the server disk and the store");
-    assert_eq!(count(model.clone(), hint), 0);
-    assert_eq!(count(model, "stored of 20 GiB · 15.3 GiB free"), 1, "the capacity less what is stored, as the disk has more room");
+    assert_eq!(count(model.clone(), "OK"), 3, "the all storage line, the server disk and the store");
+    assert_eq!(count(model.clone(), &s3_hint), 0);
+    assert_eq!(count(model.clone(), "used of 500 GiB · 300 GiB free"), 1, "the disk's own numbers, not the accounts' total");
+    assert_eq!(count(model, "capacity set: 20 GiB · the accounts' files total 4.7 GiB, counted per account"), 1);
     // S3 without capacity: the hint, a dash for the store's numbers, and nothing near.
     let model = storage_tab(&agent, s3);
-    assert_eq!(count(model.clone(), hint), 1);
+    assert_eq!(count(model.clone(), &s3_hint), 1);
     assert_eq!(count(model.clone(), "Near capacity") + count(model.clone(), "OK"), 0);
-    assert_eq!(count(model, "stored · no size to measure it against"), 1);
+    assert_eq!(count(model, "stored by the accounts · no size to measure it against"), 1);
+    // A memory store without capacity: the hint, without the sentence about S3.
+    let model = storage_tab(&agent, |o| o.store_kind = Some("memory".into()));
+    assert_eq!(count(model.clone(), hint), 1);
+    assert_eq!(count(model, &s3_hint), 0);
     // An old server: no numbers, no wrong ones.
     let model = storage_tab(&agent, |_| {});
     assert_eq!(count(model.clone(), "This server doesn't report its room: it may be older, or the disk could not be read."), 1);
     assert_eq!(count(model, "database size not reported"), 1);
-    // S3 with capacity: against the capacity set.
+    // A disk the new server sent no numbers for: still a disk, no "older" hint.
+    let model = storage_tab(&agent, |o| o.store_kind = Some("disk".into()));
+    assert_eq!(count(model.clone(), "The server sent no size for the disk that holds the store."), 1);
+    assert_eq!(count(model.clone(), "This server doesn't report its room: it may be older, or the disk could not be read."), 0);
+    assert_eq!(count(model, "disk"), 1, "the store is still a disk");
+    // S3 with capacity: the accounts' total against the capacity set, said to be an upper bound.
     let model = storage_tab(&agent, |o| {
         s3(o);
         o.capacity_bytes = Some(10 * GIB);
     });
-    assert_eq!(count(model.clone(), "stored of 10 GiB · 5.3 GiB free"), 1);
-    assert_eq!(count(model, "OK"), 1, "the store; the server disk has no numbers");
+    assert_eq!(count(model.clone(), "stored by the accounts, of 10 GiB · 5.3 GiB left (counted per account: an upper bound)"), 1);
+    assert_eq!(count(model, "OK"), 2, "the all storage line and the store; the server disk has no numbers");
 }
 
-/// The warning starts at 90 %: 899 of 1000 bytes is "OK", 900 is a warning.
+/// A disk is warned about by its filesystem and by the capacity set, each by name; the accounts' total passing the disk's
+/// size (a chunk two accounts share is counted twice) is no warning of the disk.
+#[test]
+fn a_disk_store_warns_with_the_disk_or_the_capacity() {
+    let agent = admin_agent();
+    let count = |model: Model, label: &str| {
+        let mut h = harness(model, egui::Theme::Light);
+        h.run_steps(3);
+        h.query_all_by_label(label).count()
+    };
+    // 460 of 500 GiB used on the disk: the disk is near, the capacity is not.
+    let model = storage_tab(&agent, |o| {
+        disk_with_capacity(o);
+        o.store_fs_free_bytes = Some(40 * GIB);
+    });
+    assert_eq!(count(model.clone(), "Near capacity"), 1);
+    assert_eq!(count(model.clone(), "disk 92 %"), 2, "the all storage line and the store's row");
+    assert_eq!(count(model.clone(), "92 % used"), 2, "the bars say it too");
+    assert_eq!(count(model, "capacity 23 %"), 0);
+    // 4.7 GiB stored of a capacity of 5 GiB: the capacity is near, the disk is not.
+    let model = storage_tab(&agent, |o| {
+        disk_with_capacity(o);
+        o.capacity_bytes = Some(5 * GIB);
+    });
+    assert_eq!(count(model.clone(), "Near capacity"), 1);
+    assert_eq!(count(model.clone(), "capacity 93 %"), 2);
+    assert_eq!(count(model, "disk 40 %"), 0);
+    // Stored passes the capacity: a warning, whatever the bar can show.
+    let model = storage_tab(&agent, |o| {
+        disk_with_capacity(o);
+        o.capacity_bytes = Some(4 * GIB);
+    });
+    assert_eq!(count(model.clone(), "capacity 116 %"), 2);
+    assert_eq!(count(model, "capacity set: 4 GiB · the accounts' files total 4.7 GiB, counted per account"), 1);
+    // Stored passes the filesystem's size: not a warning of the disk, and the line says the disk's own numbers.
+    let model = storage_tab(&agent, |o| {
+        disk_with_capacity(o);
+        o.capacity_bytes = None;
+        o.store_fs_total_bytes = Some(2 * GIB);
+        o.store_fs_free_bytes = Some(GIB + GIB / 2);
+    });
+    assert_eq!(count(model.clone(), "Near capacity"), 0);
+    assert_eq!(count(model, "used of 2 GiB · 1.5 GiB free"), 1);
+}
+
+/// The warning starts at 90 %: 899 of 1000 bytes is "OK", 900 is a warning, and 1000 is full.
 #[test]
 fn the_storage_block_warns_from_ninety_percent() {
     let agent = admin_agent();
@@ -845,10 +910,45 @@ fn the_storage_block_warns_from_ninety_percent() {
         });
         let mut h = harness(model, egui::Theme::Light);
         h.run_steps(3);
-        assert_eq!(h.query_all_by_label("Near capacity").count(), usize::from(near), "{stored}");
-        assert_eq!(h.query_all_by_label(&format!("{} %", stored / 10)).count(), usize::from(near), "{stored}");
-        assert_eq!(h.query_all_by_label("OK").count(), usize::from(!near), "{stored}");
+        let count = |h: &Harness<'static, (Model, Vec<Event>)>, label: &str| h.query_all_by_label(label).count();
+        assert_eq!(count(&h, "Near capacity"), usize::from(near), "{stored}");
+        assert_eq!(count(&h, &format!("capacity {} %", stored / 10)), 2 * usize::from(near), "{stored}: the all storage line and the store");
+        assert_eq!(count(&h, "OK"), 2 * usize::from(!near), "{stored}");
+        assert_eq!(count(&h, &format!("{} % used", stored / 10)), 2, "{stored}: the bars have a label");
     }
+}
+
+/// An account that is disabled and has an invite open says both.
+#[test]
+fn an_account_says_every_state_it_is_in() {
+    let agent = admin_agent();
+    let mut model = on_admin_pages(&agent, Vec::new());
+    let Screen::Admin(admin) = &mut model.screen else { panic!("{:?}", model.screen) };
+    let ana = admin.list.users.iter_mut().find(|u| u.username == "ana").unwrap();
+    ana.disabled_ms = Some(1_789_000_000_000);
+    ana.invite_pending = true;
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("Disabled").count(), 2, "ben and ana");
+    assert_eq!(h.query_all_by_label("Invite open").count(), 2, "cleo.m and ana");
+    assert_eq!(h.query_all_by_label("Active").count(), 1, "fabio");
+}
+
+/// Without the storage overview the server's own counters still give the accounts, what they store and the computers.
+#[test]
+fn the_counters_stay_when_the_storage_call_fails() {
+    let agent = admin_agent();
+    let mut model = on_admin_pages(&agent, Vec::new());
+    let Screen::Admin(admin) = &mut model.screen else { panic!("{:?}", model.screen) };
+    admin.storage = None;
+    admin.storage_error = Some("The server said no".into());
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("Server 0.1.0 · 4 accounts · 3 computers · disk · sqlite").count(), 1);
+    assert_eq!(h.query_all_by_label("Stored").count(), 1);
+    assert_eq!(h.query_all_by_label("Total accounts").count(), 1);
+    assert_eq!(h.query_all_by_label("Near quota").count(), 0, "those come from the storage call");
+    assert_eq!(h.query_all_by_label("The server said no").count(), 1);
 }
 
 /// The tabs of the landing page send their events.
