@@ -10,6 +10,9 @@
 //! - [`single_instance`]: one app per user; a second start brings the first window forward.
 //! - [`ui`]: the window, a view of the model; [`app`]: the app on eframe.
 //! - [`tray`]: the tray icon where there is one; [`autostart`]: the app's own start-at-login entry.
+//!
+//! The app bundles font data (Archivo, Inter and Geist Mono, `assets/fonts/`) under the SIL Open Font License 1.1,
+//! unmodified; the texts sit beside the files and go in the package's `LICENSES.txt`.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod admin;

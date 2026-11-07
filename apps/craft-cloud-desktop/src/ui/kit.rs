@@ -202,8 +202,9 @@ fn visuals(t: &Tokens) -> Visuals {
     v.window_shadow = egui::epaint::Shadow::NONE;
     v.popup_shadow = egui::epaint::Shadow { offset: [0, 4], blur: 12, spread: 0, color: Color32::from_black_alpha(if t.dark { 140 } else { 36 }) };
     v.hyperlink_color = t.accent_ink;
-    v.selection.bg_fill = t.accent;
-    v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    // Selected text keeps its colour on a translucent blue; the stroke is the focused text field's border.
+    v.selection.bg_fill = Color32::from_rgba_unmultiplied(t.accent.r(), t.accent.g(), t.accent.b(), 90);
+    v.selection.stroke = Stroke::new(1.0, t.accent_ink);
     v.warn_fg_color = t.warn;
     v.error_fg_color = t.bad;
     v.widgets.noninteractive.bg_stroke = t.hairline();
@@ -235,7 +236,7 @@ pub fn apply(ctx: &Context) {
         style.text_styles = [
             (TextStyle::Heading, FontId::new(19.0, display())),
             (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
-            (TextStyle::Button, FontId::new(LABEL_SIZE, mono_bold())),
+            (TextStyle::Button, FontId::new(13.0, FontFamily::Proportional)),
             (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
             (TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace)),
         ]
@@ -262,9 +263,26 @@ pub fn ensure(ctx: &Context) -> bool {
     false
 }
 
-/// Upper-case mono text with letter spacing: labels, tags, buttons.
-fn label_text(text: &str, size: f32, family: FontFamily) -> RichText {
-    RichText::new(text.to_uppercase()).family(family).size(size).extra_letter_spacing(size * 0.09)
+/// Upper-case text in `family` with letter spacing, laid out in the placeholder colour (painted in the colour given at
+/// paint time).
+fn label_galley(ui: &Ui, text: &str, size: f32, family: FontFamily) -> Arc<egui::Galley> {
+    let format =
+        egui::TextFormat { font_id: FontId::new(size, family), extra_letter_spacing: size * 0.09, color: Color32::PLACEHOLDER, ..Default::default() };
+    ui.painter().layout_job(egui::text::LayoutJob::single_section(text.to_uppercase(), format))
+}
+
+/// A label in upper-case mono. Screen readers get `text` as written, not upper-cased.
+fn mono_label(ui: &mut Ui, text: &str, size: f32, family: FontFamily, color: Color32) -> Response {
+    let galley = label_galley(ui, text, size, family);
+    let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    ui.painter().galley(rect.min, galley, color);
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
+    response
+}
+
+/// The border that shows keyboard focus on a button.
+fn focus_ring(ui: &Ui, rect: egui::Rect, t: &Tokens) {
+    ui.painter().rect_stroke(rect, CornerRadius::ZERO, Stroke::new(2.0, t.accent_ink), egui::StrokeKind::Outside);
 }
 
 /// How a [`Button`] looks.
@@ -320,28 +338,30 @@ impl Widget for Button {
         let t = Tokens::get(ui.ctx());
         let kind = if self.selected { Kind::Primary } else { self.kind };
         let enabled = ui.is_enabled();
-        let label = self.text.clone();
-        let inner = ui.scope(|ui| {
-            let w = &mut ui.visuals_mut().widgets;
-            let (fill, hover_fill, border, hover_border, text, hover_text) = match kind {
-                Kind::Outlined => (t.bg, t.sunken, t.line_strong, t.ink, t.ink, t.ink_strong),
-                Kind::Primary => (t.invert_bg, t.invert_bg.gamma_multiply(0.86), t.invert_bg, t.invert_bg, t.invert_fg, t.invert_fg),
-                Kind::Danger => (t.bg, t.sunken, t.bad, t.bad, t.bad, t.bad),
+        let galley = label_galley(ui, &self.text, LABEL_SIZE, mono_bold());
+        let padding = ui.spacing().button_padding;
+        let size = (galley.size() + 2.0 * padding).max(self.min_size);
+        let (rect, response) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+        if ui.is_rect_visible(rect) {
+            let hot = enabled && (response.hovered() || response.is_pointer_button_down_on());
+            let (fill, border, text) = match (enabled, kind, hot) {
+                (false, Kind::Primary, _) => (t.sunken, t.line, t.faint),
+                (false, _, _) => (t.bg, t.line, t.faint),
+                (true, Kind::Outlined, false) => (t.bg, t.line_strong, t.ink),
+                (true, Kind::Outlined, true) => (t.sunken, t.ink, t.ink_strong),
+                (true, Kind::Primary, false) => (t.invert_bg, t.invert_bg, t.invert_fg),
+                (true, Kind::Primary, true) => (t.invert_bg.gamma_multiply(0.86), t.invert_bg, t.invert_fg),
+                (true, Kind::Danger, false) => (t.bg, t.bad, t.bad),
+                (true, Kind::Danger, true) => (t.sunken, t.bad, t.bad),
             };
-            for (state, f, b, c) in [
-                (&mut w.inactive, fill, border, text),
-                (&mut w.hovered, hover_fill, hover_border, hover_text),
-                (&mut w.active, hover_fill, hover_border, hover_text),
-            ] {
-                state.weak_bg_fill = f;
-                state.bg_fill = f;
-                state.bg_stroke = Stroke::new(1.0, b);
-                state.fg_stroke = Stroke::new(1.0, c);
+            let painter = ui.painter();
+            painter.rect(rect, CornerRadius::ZERO, fill, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+            painter.galley(rect.center() - galley.size() / 2.0, galley, text);
+            if response.has_focus() {
+                focus_ring(ui, rect, &t);
             }
-            ui.add(egui::Button::new(label_text(&self.text, LABEL_SIZE, mono_bold())).min_size(self.min_size))
-        });
-        let response = inner.inner;
-        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &label));
+        }
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &self.text));
         response
     }
 }
@@ -373,6 +393,10 @@ pub fn icon_button(ui: &mut Ui, label: &str, icon: Icon) -> Response {
         };
         let painter = ui.painter();
         painter.rect(rect, CornerRadius::ZERO, fill, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+        if response.has_focus() {
+            focus_ring(ui, rect, &t);
+        }
+        let painter = ui.painter();
         let c = rect.center();
         let stroke = Stroke::new(1.5, color);
         let r = 5.0;
@@ -407,9 +431,7 @@ pub fn tag(ui: &mut Ui, text: &str, tone: Tone) -> Response {
     let color = t.tone(tone);
     let tint = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 20);
     let frame = egui::Frame::new().stroke(Stroke::new(1.0, color)).fill(tint).inner_margin(egui::Margin::symmetric(6, 2));
-    let response = frame.show(ui, |ui| ui.add(egui::Label::new(label_text(text, LABEL_SIZE, mono()).color(color)).selectable(false))).response;
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
-    response
+    frame.show(ui, |ui| mono_label(ui, text, LABEL_SIZE, mono(), color)).inner
 }
 
 /// The text of a section label: `01 / Title`.
@@ -420,7 +442,7 @@ pub fn numbered(number: usize, title: &str) -> String {
 /// A section's label: upper-case mono in the muted colour, `01 / Title` when given a number through [`numbered`].
 pub fn section_label(ui: &mut Ui, text: &str) -> Response {
     let t = Tokens::get(ui.ctx());
-    ui.add(egui::Label::new(label_text(text, LABEL_SIZE, mono()).color(t.muted)).selectable(false))
+    mono_label(ui, text, LABEL_SIZE, mono(), t.muted)
 }
 
 /// A line across the available width in the hairline colour.
@@ -475,13 +497,13 @@ pub fn headline(ui: &mut Ui, text: &str) -> Response {
     ui.add(egui::Label::new(headline_text(text, 19.0).color(t.ink_strong)).selectable(false))
 }
 
-/// "Craft" followed by "Cloud" in the accent ink, in the display face.
+/// "Craft" followed by " Cloud" in the accent ink, in the display face.
 pub fn wordmark(ui: &mut Ui, size: f32) -> Response {
     let t = Tokens::get(ui.ctx());
     let mut job = egui::text::LayoutJob::default();
     let format = |color| egui::TextFormat { font_id: FontId::new(size, display()), color, extra_letter_spacing: -0.03 * size, ..Default::default() };
     job.append("Craft", 0.0, format(t.ink_strong));
-    job.append("Cloud", 0.0, format(t.accent_ink));
+    job.append(" Cloud", 0.0, format(t.accent_ink));
     let response = ui.add(egui::Label::new(job).selectable(false));
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, "Craft Cloud"));
     response

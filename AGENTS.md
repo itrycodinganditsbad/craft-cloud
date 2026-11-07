@@ -85,7 +85,9 @@ talks to, any vendor's cloud.
   Named exceptions, for no other crate: for what Loro (the live documents' CRDT) needs, MPL-2.0 for `im`, `bitmaps`
   and `sized-chunks`, used as published and never modified or copied from, and BSL-1.0 (the Boost licence) for
   `xxhash-rust`; for the Craft Cloud app's window (eframe), BSL-1.0 for `clipboard-win` and `error-code` (the
-  Windows clipboard), and OFL-1.1 and the Ubuntu Font Licence (data only) for the fonts in `epaint_default_fonts`.
+  Windows clipboard), and OFL-1.1 and the Ubuntu Font Licence (data only) for the fonts in `epaint_default_fonts`; OFL-1.1 font data
+  is also bundled, unmodified, in the Craft Cloud app: Archivo, Inter and Geist Mono (`apps/craft-cloud-desktop/assets/fonts/`,
+  their OFL texts beside them and in `LICENSES.txt`).
   Adding one means checking its license and every transitive license. `cargo xtask licenses` (part of
   `cargo xtask ci` and CI) checks every crate in the build against this list; a data-only licence is allowed
   only for the crates named in `xtask/src/licenses.rs`.
