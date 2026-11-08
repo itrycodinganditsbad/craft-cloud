@@ -102,9 +102,13 @@ pub async fn recompress(
                         report.kept += 1;
                     }
                     if !dry_run {
-                        // The object is replaced already: a failure here only leaves the size unknown or stale.
-                        if let Err(e) = meta.set_physical(row.kind, &row.id, done.after, level).await {
-                            tracing::warn!(error = %e, "couldn't record a blob's stored size");
+                        // The object is replaced already: a failure here only leaves the size unknown or stale. The row
+                        // is changed only if it still holds the size this pass read: an upload that replaced the
+                        // object meanwhile recorded its own size and level.
+                        match meta.set_physical_if(row.kind, &row.id, done.before, done.after, level).await {
+                            Ok(true) => {}
+                            Ok(false) => tracing::debug!("a blob's recorded size changed during the pass; left as the upload recorded it"),
+                            Err(e) => tracing::warn!(error = %e, "couldn't record a blob's stored size"),
                         }
                     }
                 }
@@ -166,27 +170,55 @@ fn percent(part: u64, whole: u64) -> f64 {
     if whole == 0 { 0.0 } else { part as f64 * 100.0 / whole as f64 }
 }
 
-/// Fills in the stored size of every blob that has none, by asking the store for the object's length. Returns how
-/// many it filled in and how many have no object.
-pub async fn measure(meta: &Meta, store: &Store, out: &mut impl Write) -> Result<(u64, u64), CliError> {
-    let (mut filled, mut missing) = (0u64, 0u64);
+/// What `store measure` did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MeasureReport {
+    /// Blobs whose stored size was filled in.
+    pub filled: u64,
+    /// Rows whose object is missing from the store.
+    pub missing: u64,
+    /// Blobs whose length could not be read or whose size could not be recorded. They are left as they were.
+    pub failed: u64,
+    /// The first of the failures, as `kind/id: reason`.
+    pub failures: Vec<String>,
+}
+
+/// Fills in the stored size of every blob that has none, by asking the store for the object's length. A blob that
+/// fails is counted and listed, and the pass goes on with the next one.
+pub async fn measure(meta: &Meta, store: &Store, out: &mut impl Write) -> Result<MeasureReport, CliError> {
+    let mut report = MeasureReport::default();
     let mut after = None;
     loop {
         let page = meta.blob_page(after, PAGE).await?;
         let Some(last) = page.last() else { break };
         after = Some((last.kind, last.id));
         for row in page.iter().filter(|row| row.physical_size.is_none()) {
-            match store.object_len(key_of(row.kind, row.id)).await? {
-                Some(len) => {
-                    meta.set_measured_size(row.kind, &row.id, len).await?;
-                    filled += 1;
+            let key = key_of(row.kind, row.id);
+            let result = match store.object_len(key).await {
+                Ok(Some(len)) => meta.set_measured_size(row.kind, &row.id, len).await.map(|()| true).map_err(|e| e.to_string()),
+                Ok(None) => Ok(false),
+                Err(e) => Err(e.to_string()),
+            };
+            match result {
+                Ok(true) => report.filled += 1,
+                Ok(false) => report.missing += 1,
+                Err(e) => {
+                    report.failed += 1;
+                    if report.failures.len() < LISTED_ERRORS {
+                        report.failures.push(format!("{}: {e}", key.path()));
+                    }
                 }
-                None => missing += 1,
             }
         }
     }
-    writeln!(out, "measured {filled} blobs, {missing} have no object")?;
-    Ok((filled, missing))
+    writeln!(out, "measured {} blobs, {} have no object, {} failed", report.filled, report.missing, report.failed)?;
+    for failure in &report.failures {
+        writeln!(out, "left alone, not measured: {failure}")?;
+    }
+    if report.failed as usize > report.failures.len() {
+        writeln!(out, "… and {} more", report.failed as usize - report.failures.len())?;
+    }
+    Ok(report)
 }
 
 /// What one level would save on the sample, and how fast it compresses.

@@ -505,10 +505,29 @@ async fn physical_sizes_are_unknown_until_recorded_and_totals_say_so(meta: &Meta
     meta.set_physical(BlobKind::Chunk, new.as_bytes(), 500, 19).await.unwrap();
     let row = meta.blob_from(BlobKind::Chunk, new.as_bytes()).await.unwrap().unwrap();
     assert_eq!((row.physical_size, row.level), (Some(500), Some(19)));
+    // A rewrite records its result only if the row still holds the size it started from. An upload that replaced the
+    // object between the rewrite's read and its record has recorded its own size and level: that stays.
+    assert!(!meta.set_physical_if(BlobKind::Chunk, new.as_bytes(), 777, 100, 19).await.unwrap());
+    let row = meta.blob_from(BlobKind::Chunk, new.as_bytes()).await.unwrap().unwrap();
+    assert_eq!((row.physical_size, row.level), (Some(500), Some(19)));
+    assert!(meta.set_physical_if(BlobKind::Chunk, new.as_bytes(), 500, 450, 22).await.unwrap());
+    let row = meta.blob_from(BlobKind::Chunk, new.as_bytes()).await.unwrap().unwrap();
+    assert_eq!((row.physical_size, row.level), (Some(450), Some(22)));
+    // The interleaving itself: the pass read 450, an upload at level 3 recorded 700, then the pass records.
+    meta.set_physical(BlobKind::Chunk, new.as_bytes(), 700, 3).await.unwrap();
+    assert!(!meta.set_physical_if(BlobKind::Chunk, new.as_bytes(), 450, 300, 19).await.unwrap());
+    let row = meta.blob_from(BlobKind::Chunk, new.as_bytes()).await.unwrap().unwrap();
+    assert_eq!((row.physical_size, row.level), (Some(700), Some(3)));
+    // A row with no size yet is taken (nothing was recorded that could be lost), and an absent row changes nothing.
+    let unmeasured = random_chunk();
+    meta.add_chunk(ana.space, &unmeasured, 10, NOW).await.unwrap();
+    assert!(meta.set_physical_if(BlobKind::Chunk, unmeasured.as_bytes(), 9, 8, 5).await.unwrap());
+    assert!(!meta.set_physical_if(BlobKind::Manifest, &[9u8; 32], 1, 1, 1).await.unwrap());
+    meta.set_physical(BlobKind::Chunk, new.as_bytes(), 500, 19).await.unwrap();
     // Unknown blobs and absent rows are no error and change nothing; the logical size is never touched.
     meta.set_physical(BlobKind::Manifest, &[9u8; 32], 5, 1).await.unwrap();
-    assert_eq!(meta.storage_totals().await.unwrap().blobs, 2);
-    assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), 4000);
+    assert_eq!(meta.storage_totals().await.unwrap().blobs, 3);
+    assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), 4010);
     // A chunk uploaded again keeps its row (and the size recorded last stays).
     meta.add_chunk(ana.space, &new, 3000, NOW).await.unwrap();
     assert_eq!(meta.blob_from(BlobKind::Chunk, new.as_bytes()).await.unwrap().unwrap().physical_size, Some(500));

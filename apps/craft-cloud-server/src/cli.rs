@@ -590,7 +590,10 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                     }
                 }
                 StoreAction::Measure => {
-                    storage_tools::measure(&meta, &store, out).await?;
+                    let report = storage_tools::measure(&meta, &store, out).await?;
+                    if report.failed > 0 {
+                        return Err(CliError::Usage(format!("{} blob(s) could not be measured and were left as they are", report.failed)));
+                    }
                 }
             }
             Ok(())
