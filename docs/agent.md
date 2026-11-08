@@ -251,7 +251,9 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
   on meanwhile (other spaces, the local API, stopping), and the call is answered when the session is closed (after 50
   seconds at most). A pass that was queued behind another pass when its space was closed (or the agent began to stop) is
   not run. Another change of the same space meanwhile is refused with `409` ("this space is being changed, try again in a
-  moment"). Signing out removes the team spaces' states too; their folders, markers and files stay.
+  moment"). Turning on a space that has no session or pass here does not wait for another space's pass; if the space's own
+  last pass has not ended after 50 seconds the answer is "this space is still finishing its last pass, try again in a
+  moment". If the agent stops while a space is being turned off, the space stays off. Signing out removes the team spaces' states too; their folders, markers and files stay.
 - **A first sync merges, and says what that means.** Without a saved state, nothing is known to have been deleted, so
   nothing is deleted on either side. A file that teammates deleted on the server meanwhile, and that is still in the
   folder, is uploaded again. A file that exists on both sides with different content is not overwritten: the local one is

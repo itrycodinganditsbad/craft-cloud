@@ -1291,6 +1291,81 @@ async fn accepting_and_turning_the_sync_on_at_once_works_after_one_failed_discov
     assert_eq!(*front.spaces_404.lock().unwrap(), 0, "the failed discovery happened");
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// The third review round of P1-5
+
+/// F1: turning a space on does not wait for another space's long pass: the pass thread is busy with space A, and space B,
+/// which has no session and no pass, is turned on at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_on_a_space_is_not_held_up_by_a_long_pass_of_another_space() {
+    let (t, front, _task) = team_via_front(SpaceRole::Editor, Front::default()).await;
+    let a = t.space;
+    let b = t.world.space("Archive").await;
+    t.world.invite_ben(b, SpaceRole::Editor).await;
+    for space in [a, b] {
+        let ben = &t.ben;
+        eventually("the invitation is listed", || async move { ben.space(space).await.is_some_and(|s| s.state == "invited") }).await;
+        t.ben.accept(space).await;
+    }
+    let a_folder = t.ben.sync_on(a).await;
+    eventually("nothing runs", || async { t.ben.status().await.spaces.iter().all(|s| s.run_state == SpaceRun::Idle) }).await;
+
+    // A's pass hangs; the pass thread is busy with it.
+    front.stall.store(true, Ordering::SeqCst);
+    write(&a_folder, "big.txt", "a long first sync, say");
+    eventually("A's pass is running", || async { t.ben.status().await.spaces.iter().any(|s| s.space == a && s.run_state == SpaceRun::Syncing) })
+        .await;
+    let dir = t.ben.data.path().to_owned();
+    let on = tokio::task::spawn_blocking(move || {
+        Client::connect_in(&dir).and_then(|c| c.set_space_sync(b, &SpaceSyncRequest { on: true, folder: None, adopt: false }))
+    });
+    let answered = tokio::time::timeout(Duration::from_secs(10), on).await;
+    front.stall.store(false, Ordering::SeqCst);
+    let info = answered.expect("space B is turned on while A's pass runs").unwrap().unwrap();
+    assert_eq!(info.sync, SpaceSync::On, "{info:?}");
+}
+
+/// F2: the agent stops while a space is being turned off (its pass has not let go yet): the space stays off at the next start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_space_being_turned_off_when_the_agent_stops_stays_off() {
+    let (mut t, front, _task) = team_via_front(SpaceRole::Editor, Front::default()).await;
+    let space = t.space;
+    let (_, ben_folder) = both_syncing(&t).await;
+    write(&ben_folder, "first.txt", "first");
+    eventually("the first file went up", || async { t.ben.status().await.spaces.iter().any(|s| s.last_sync_ms.is_some()) }).await;
+    eventually("nothing runs", || async { t.ben.status().await.spaces.iter().all(|s| s.run_state == SpaceRun::Idle) }).await;
+
+    front.stall.store(true, Ordering::SeqCst);
+    write(&ben_folder, "busy.txt", "never answered");
+    eventually("the space's pass is running", || async {
+        t.ben.status().await.spaces.iter().any(|s| s.space == space && s.run_state == SpaceRun::Syncing)
+    })
+    .await;
+    let dir = t.ben.data.path().to_owned();
+    let off = tokio::task::spawn_blocking(move || {
+        Client::connect_in(&dir).and_then(|c| c.set_space_sync(space, &SpaceSyncRequest { on: false, folder: None, adopt: false }))
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!off.is_finished(), "turning the space off waits for its pass");
+
+    // A stop waits for the running pass (the personal space is idle, so the loop does not wait for a second stop); the
+    // space's turn-off is applied when the spaces task ends, before the pass lets go.
+    let mut running = t.ben.running.take().unwrap();
+    let _ = running.stop.send(());
+    let thread = running.thread.take().unwrap();
+    let ended = tokio::spawn(async move { tokio::task::spawn_blocking(move || thread.join().unwrap()).await.unwrap() });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    front.stall.store(false, Ordering::SeqCst);
+    let (exit, out) = tokio::time::timeout(Duration::from_secs(30), ended).await.expect("the loop ends once the pass has").unwrap();
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    drop(off);
+
+    t.ben.run();
+    eventually("the space is listed", || async { t.ben.space(space).await.is_some() }).await;
+    let info = t.ben.space(space).await.unwrap();
+    assert_eq!(info.sync, SpaceSync::Off, "the space that was being turned off stays off: {info:?}");
+}
+
 /// The members, usage, name and leaving of a team space, and the administrator's calls, go through the local API to the
 /// server: the server decides who may do what, and the agent keeps the folder when the account leaves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
