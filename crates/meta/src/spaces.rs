@@ -67,6 +67,9 @@ pub struct UserSpace {
     /// `None` until the invitation is accepted.
     pub root: Option<NodeId>,
     pub epoch: Option<Epoch>,
+    /// When the account accepted its membership (milliseconds). A member who is removed and invited again gets a new one;
+    /// `None` for a personal space and for an invitation.
+    pub joined_ms: Option<i64>,
 }
 
 /// A team space as the administrator's list shows it: counts, never content.
@@ -581,6 +584,7 @@ impl Meta {
                 members: 1,
                 root: Some(NodeId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("root")?)?)),
                 epoch: Some(Epoch::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("epoch")?)?)),
+                joined_ms: None,
             });
         }
         let teams = sqlx::query(
@@ -594,7 +598,8 @@ impl Meta {
         tx.commit().await?;
         for row in &teams {
             let role = parse_role(&row.try_get::<String, _>("role")?)?;
-            let invited = row.try_get::<Option<i64>, _>("accepted_ms")?.is_none();
+            let joined_ms = row.try_get::<Option<i64>, _>("accepted_ms")?;
+            let invited = joined_ms.is_none();
             let archived = row.try_get::<Option<i64>, _>("archived_ms")?.is_some();
             if archived && invited {
                 continue;
@@ -610,6 +615,7 @@ impl Meta {
                 members: to_u64(row.try_get("members")?)?,
                 root: if invited { None } else { Some(NodeId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("root")?)?)) },
                 epoch: if invited { None } else { Some(Epoch::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("epoch")?)?)) },
+                joined_ms,
             });
         }
         Ok(out)

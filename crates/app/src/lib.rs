@@ -1065,6 +1065,7 @@ mod tests {
             members: 2,
             root: Some(NodeId::generate()),
             epoch: None,
+            joined_ms: None,
         };
         let no_such_call = json(&ErrorAnswer { error: "not_found".into(), message: "no such call".into(), name_taken: None });
         let no_invitation = json(&ErrorAnswer { error: "not_found".into(), message: "server: not found".into(), name_taken: None });
