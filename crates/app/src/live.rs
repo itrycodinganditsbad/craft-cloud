@@ -69,8 +69,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the reader waits for data before it looks whether it is to stop.
 const IDLE_WAKE: Duration = Duration::from_millis(250);
 
-/// What happens to an open document.
+/// What happens to an open document. New events are added without a breaking change: match with a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// A change from another machine or another app on this one: import it as it is.
     Update(Vec<u8>),
@@ -242,7 +243,7 @@ impl Shared {
                 Ok(DocsEvent::Error { id: Some(id), seq: None, code, message }) => {
                     self.answer(id, Answer::Refused(Error::Refused { code, message, name_taken: None }))
                 }
-                Ok(DocsEvent::Error { id: None, .. }) | Err(_) => {}
+                Ok(DocsEvent::Error { id: None, .. }) | Ok(_) | Err(_) => {}
             },
             Message::Binary(bytes) => {
                 let Some((kind, id, body)) = decode_binary(&bytes) else { return };
@@ -583,9 +584,13 @@ impl Document {
     /// Hands the agent a change (a Loro update, at most 1 MiB) this app made while the account could not change the space and
     /// kept (the agent refused it with `read_only`), because the app ends before it could send it again: the agent keeps it in
     /// the document's journal and sends it to the server once the account may write (a viewer's changes are never sent).
-    /// Not acked, and not answered. Send them in order, before closing the document or dropping the connection.
-    pub fn hold(&self, update: &[u8]) -> Result<(), Error> {
-        self.shared.send_binary(HELD, self.id, update)
+    /// Acked like an update ([`Event::Acked`] with the number returned) once the agent has it on disk, or refused (`error`
+    /// as for an update; `not_found` when the space stopped syncing). Send them in order, and wait for the acks before closing
+    /// the document or dropping the connection: the agent may not have read a frame that is still on its way.
+    pub fn hold(&self, update: &[u8]) -> Result<u64, Error> {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        self.shared.send_binary(HELD, self.id, update)?;
+        Ok(seq)
     }
 
     /// Sends this app's presence (at most 4 KiB, at most 20 a second; more are dropped).

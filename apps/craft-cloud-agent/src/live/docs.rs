@@ -397,6 +397,9 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
             let Some((kind, id, body)) = decode_binary(&bytes) else { return Ok(false) };
             let Some((key, hub)) = link.hub_of(id) else {
                 // No hub for it: signed out, or never opened (or its space stopped syncing); a kind an app sends is let be.
+                if kind == HELD {
+                    crate::runlog::note(format_args!("a change an app handed over was dropped: no hub follows its document any more"));
+                }
                 return Ok(kind == UPDATE || kind == PRESENCE || kind == IMPORT || kind == HELD);
             };
             let refuse = |seq: Option<u64>, message: String| DocsEvent::Error { id: Some(id), seq, code: api_codes::TOO_LARGE.into(), message };
@@ -418,10 +421,12 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                     DocsCall::Presence { conn: link.conn, id, bytes: body.to_vec() }
                 }
                 HELD => {
+                    let seq = link.seqs.entry(id).or_insert(0);
+                    *seq += 1;
                     if body.is_empty() || body.len() > MAX_UPDATE_BYTES {
-                        return Ok(true);
+                        return Ok(send_json(socket, &refuse(Some(*seq), format!("a held change is 1 to {MAX_UPDATE_BYTES} bytes"))).await);
                     }
-                    DocsCall::Hold { conn: link.conn, id, bytes: body.to_vec() }
+                    DocsCall::Hold { conn: link.conn, id, seq: *seq, bytes: body.to_vec() }
                 }
                 IMPORT => {
                     if body.len() > MAX_SNAPSHOT_BYTES {
@@ -433,9 +438,17 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                 }
                 _ => return Ok(false),
             };
-            let update_seq = if let DocsCall::Update { seq, .. } = &call { Some(*seq) } else { None };
-            let ephemeral = matches!(call, DocsCall::Presence { .. } | DocsCall::Hold { .. });
-            if link.call(&hub, key, call).await? || ephemeral {
+            let update_seq = if let DocsCall::Update { seq, .. } | DocsCall::Hold { seq, .. } = &call { Some(*seq) } else { None };
+            let ephemeral = matches!(call, DocsCall::Presence { .. });
+            let held = matches!(call, DocsCall::Hold { .. });
+            if link.call(&hub, key, call).await? {
+                return Ok(true);
+            }
+            if held {
+                // Nothing keeps it now (the space stopped syncing): said in the log, without names.
+                crate::runlog::note(format_args!("a change an app handed over was dropped: the space of its document stopped syncing"));
+            }
+            if ephemeral {
                 return Ok(true);
             }
             // The space's hub has stopped (it stopped syncing): the change was not kept, and the app is told.

@@ -275,24 +275,78 @@ fn a_document_of_a_space_that_stops_is_not_sent_into_a_dead_hub() {
     assert_eq!(a.poll().status.queued, 1, "the change stays in the window");
 }
 
-/// An update the agent answers with `not_found` (its hub was gone before the document heard) is not sent again.
+/// An update the agent answers with `not_found` (its hub was gone before the document heard): not sent again on that link. The
+/// document is opened again after a pause, and the change goes up once, on the new link.
 #[test]
-fn a_refusal_not_found_is_never_retried() {
+fn a_refusal_not_found_opens_the_document_again_and_the_change_goes_up_once() {
     let hub = Hub::new();
     hub.team();
     let path = team_path(&hub, "n.txt");
     let ana_pc = hub.machine_as("ana-pc", "ana").unwrap();
+    let ben_pc = hub.machine_as("ben-pc", "ben").unwrap();
     let mut a = open::<App>(&ana_pc, &path, Notes::new("n", &[]));
+    let mut b = open::<App>(&ben_pc, &path, Notes::default());
     ana_pc.refuse_next("not_found", 1);
     change(&mut a, |m| m.with_item(0, "lost?")).unwrap();
-    until(&mut [&mut a], "the session knows it is not followed", |s| s.first().is_some_and(|a| a.status().stopped));
+    until(&mut [&mut a, &mut b], "the session knows it is not followed", |s| s.first().is_some_and(|a| a.status().stopped));
     let error = a.status().error.clone().unwrap_or_default();
     assert!(error.contains("no longer follows"), "{error}");
     assert_eq!(a.status().badge(), Badge::Stopped);
-    settle(&mut [&mut a], Duration::from_millis(1500));
-    assert_eq!(ana_pc.update_frames(), 1, "sent once, never again");
-    assert_eq!(a.poll().status.queued, 1, "the change stays in the window");
-    assert_eq!(a.model().texts(), vec!["lost?"]);
+    until(&mut [&mut a, &mut b], "the document is followed again and the change reaches ben", |s| {
+        s.first().is_some_and(|a| !a.status().stopped && a.status().queued == 0) && s.get(1).is_some_and(|b| b.model().texts() == ["lost?"])
+    });
+    settle(&mut [&mut a, &mut b], Duration::from_millis(1200));
+    assert_eq!(ana_pc.update_frames(), 2, "sent on the old link, and once more on the new one");
+    assert_eq!(hub.updates("n.txt"), 1);
+}
+
+/// A team space that stops syncing and syncs again: the open document is told, nothing is sent while it is stopped, and once
+/// the space is back the session opens the document again by itself, so the changes made meanwhile go up.
+#[test]
+fn a_space_that_stops_and_syncs_again_is_followed_again_and_the_queue_goes_up() {
+    let hub = Hub::new();
+    hub.team();
+    let path = team_path(&hub, "again.txt");
+    let ana_pc = hub.machine_as("ana-pc", "ana").unwrap();
+    let ben_pc = hub.machine_as("ben-pc", "ben").unwrap();
+    let mut a = open::<App>(&ana_pc, &path, Notes::new("again", &[]));
+    let mut b = open::<App>(&ben_pc, &path, Notes::default());
+    hub.stop_team();
+    until(&mut [&mut a, &mut b], "both are told", |s| s.iter().all(|x| x.status().stopped));
+    assert!(a.status().error.clone().unwrap_or_default().contains("no longer follows"), "{:?}", a.status().error);
+    change(&mut a, |m| m.with_item(0, "typed while stopped")).unwrap();
+    settle(&mut [&mut a, &mut b], Duration::from_millis(700));
+    assert_eq!(ana_pc.update_frames(), 0, "nothing is sent while it is stopped");
+    assert_eq!(a.poll().status.queued, 1);
+    assert_eq!(a.status().badge(), Badge::Stopped);
+
+    hub.start_team();
+    until(&mut [&mut a, &mut b], "the queue went up and reached ben", |s| {
+        s.iter().all(|x| !x.status().stopped)
+            && s.first().is_some_and(|a| a.status().queued == 0)
+            && s.get(1).is_some_and(|b| b.model().texts() == ["typed while stopped"])
+    });
+    assert!(change(&mut a, |m| m.with_item(1, "and after")).is_ok(), "editing goes on");
+}
+
+/// `reconnect_now` after a stop opens the document at once, without waiting out the pause.
+#[test]
+fn reconnect_now_after_a_stop_opens_the_document_at_once() {
+    let hub = Hub::new();
+    hub.team();
+    let path = team_path(&hub, "now.txt");
+    let ana_pc = hub.machine_as("ana-pc", "ana").unwrap();
+    let mut a = open::<App>(&ana_pc, &path, Notes::new("now", &[]));
+    hub.stop_team();
+    until(&mut [&mut a], "it is told", |s| s.first().is_some_and(|a| a.status().stopped));
+    change(&mut a, |m| m.with_item(0, "waiting")).unwrap();
+    // Let the pauses between tries grow.
+    settle(&mut [&mut a], Duration::from_millis(3500));
+    hub.start_team();
+    a.reconnect_now();
+    let started = Instant::now();
+    until(&mut [&mut a], "it is followed again", |s| s.first().is_some_and(|a| !a.status().stopped && a.status().queued == 0));
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
 }
 
 /// `session.blobs()` is bound to the document's space: in a team space the other member gets the blob; the unbound
@@ -328,6 +382,12 @@ fn blobs_are_bound_to_the_documents_space() {
     let e = climbing.put(b"nowhere").unwrap_err();
     assert!(e.to_string().contains("invalid"), "{e}");
 
+    // An absolute path in the personal folder is the personal space's, as for the agent.
+    let in_personal = AgentBlobs(ana_pc.client().blobs().for_path(&format!("{}/b.txt", hub.personal_folder())));
+    let mine = in_personal.put(b"mine, by an absolute path").unwrap();
+    assert_eq!(&*unbound.get(&mine).unwrap(), b"mine, by an absolute path");
+    assert!(ben_blobs.get(&mine).is_err());
+
     // A viewer's put into the team space is the same refusal as a change to the document.
     hub.set_read_only("ben", true);
     assert_eq!(ben_blobs.put(b"a viewer's picture"), Err(KitError::ViewOnly));
@@ -360,10 +420,17 @@ fn an_unbound_blob_store_in_a_team_space_is_warned_about() {
     assert_eq!(a.warnings().len(), 2, "a second reason is a second warning");
     assert!(a.warnings()[1].contains("another document"), "{}", a.warnings()[1]);
 
+    // The same file under another spelling is this document's store.
+    let spelled = AgentBlobs(ana_pc.client().blobs().for_path(&format!("{}/./sub/../w.txt", hub.team_folder())));
+    assert!(a.check_blobs(&spelled));
+    assert_eq!(a.warnings().len(), 2, "no new warning");
+
     // A personal space: the plain constructor is right, and nothing is said.
     let plain = Hub::new();
     let pc = plain.machine("pc").unwrap();
     let mut p = open::<App>(&pc, "w.txt", Notes::new("w", &[]));
     assert!(p.check_blobs(&AgentBlobs(pc.client().blobs())));
+    // (A store made for another file of the account's personal space is not a problem there.)
+    assert!(p.check_blobs(&AgentBlobs(pc.client().blobs().for_path("another.txt"))));
     assert!(p.warnings().is_empty());
 }
