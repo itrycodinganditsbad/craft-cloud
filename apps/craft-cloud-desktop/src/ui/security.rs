@@ -48,11 +48,18 @@ fn secrets(screen: &crate::model::Screen) -> Vec<(&'static str, &str)> {
             }
             _ => Vec::new(),
         },
+        // The confirmation of "Make a team space from this folder": only while the form is open to be typed in.
+        Screen::SignedIn(o) => match &o.make_space {
+            Some(m) if !m.busy && !m.resume => {
+                vec![(super::make_space::PASSWORD_FIELD, &m.confirmation.password), (super::make_space::CODE_FIELD, &m.confirmation.code)]
+            }
+            _ => Vec::new(),
+        },
         _ => Vec::new(),
     }
 }
 
-const SECRET_NAMES: [&str; 15] = [
+const SECRET_NAMES: [&str; 17] = [
     "setup-password",
     "setup-code",
     "disable-password",
@@ -68,6 +75,8 @@ const SECRET_NAMES: [&str; 15] = [
     super::join::INVITE_AGAIN_FIELD,
     super::admin::PASSWORD_FIELD,
     super::admin::CODE_FIELD,
+    super::make_space::PASSWORD_FIELD,
+    super::make_space::CODE_FIELD,
 ];
 
 /// Drops what egui remembers of every secret field (its cursor and, above all, its undo history, which holds the text as it

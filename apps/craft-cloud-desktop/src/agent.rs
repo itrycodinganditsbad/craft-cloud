@@ -15,14 +15,15 @@ use craft_cloud_app::{
     AccountInfo, AccountUsage, AddSpaceMember, AdminCode, AdminCompression, AdminConfirm, AdminCreateSpace, AdminCreateUser, AdminCreatedUser,
     AdminDevices, AdminPasswordReset, AdminServerInfo, AdminSetCompressionLevel, AdminSetSpaceOwner, AdminSpaceInfo, AdminSpaceList,
     AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, ApproveDeletesAnswer, AuditPage, AuditQuery, ChangeSpaceMember, Client,
-    ConflictsResponse, DeviceId, DeviceInfo, Error, ExportOutcome, FolderUsageResponse, HistoryResponse, JoinRequest, LoginRequest, NodeId,
-    PairingInfo, PairingStatus, RecentEntry, RecoveryCodes, RestoreResponse, RevokedOthers, SecondFactorLoginRequest, SpaceConfirm, SpaceId,
-    SpaceInfo, SpaceList, SpaceMember, SpaceMembers, SpaceSyncRequest, SpaceUsage, Status, TrashResponse, TrashRestoreResponse,
-    TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, UpdateSpace, UserQuery, Uuid, VersionId,
+    ConflictsResponse, DeviceId, DeviceInfo, Error, ExportOutcome, FolderUsageResponse, FromFolderRequest, FromFolderStatus, HistoryResponse,
+    JoinRequest, LoginRequest, NodeId, PairingInfo, PairingStatus, RecentEntry, RecoveryCodes, RestoreResponse, RevokedOthers,
+    SecondFactorLoginRequest, SpaceConfirm, SpaceId, SpaceInfo, SpaceList, SpaceMember, SpaceMembers, SpaceSyncRequest, SpaceUsage, Status,
+    TrashResponse, TrashRestoreResponse, TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, UpdateSpace, UserQuery, Uuid, VersionId,
 };
 
 use crate::admin::{Action, AdminEvent, Outcome};
 use crate::audit::AuditMsg;
+use crate::make_space::{MakeSpaceCall, MakeSpaceMsg};
 use crate::model::{Effect, Event};
 use crate::security::{SecurityAnswer, SecurityCall};
 use crate::spaces::{SpacesCall, SpacesMsg};
@@ -112,6 +113,9 @@ pub trait Agent: Send + Sync {
     fn admin_archive_space(&self, id: SpaceId, confirm: &SpaceConfirm) -> Result<(), Error>;
     fn admin_unarchive_space(&self, id: SpaceId, confirm: &SpaceConfirm) -> Result<(), Error>;
     fn admin_set_space_owner(&self, id: SpaceId, request: &AdminSetSpaceOwner) -> Result<(), Error>;
+    /// Starts making a team space from a folder of the personal folder (an administrator's call; the work goes on in the agent and
+    /// shows in its status).
+    fn make_space_from_folder(&self, request: &FromFolderRequest) -> Result<FromFolderStatus, Error>;
 }
 
 /// The agent through `craft_cloud_app::Client`. It finds the agent again whenever a call finds it gone (the agent
@@ -351,6 +355,9 @@ impl Agent for ClientAgent {
     fn admin_create_space(&self, request: &AdminCreateSpace) -> Result<AdminSpaceInfo, Error> {
         self.with(|c| c.admin_create_space(request))
     }
+    fn make_space_from_folder(&self, request: &FromFolderRequest) -> Result<FromFolderStatus, Error> {
+        self.with(|c| c.make_space_from_folder(request))
+    }
     fn admin_archive_space(&self, id: SpaceId, confirm: &SpaceConfirm) -> Result<(), Error> {
         self.with(|c| c.admin_archive_space(id, confirm))
     }
@@ -428,6 +435,7 @@ impl Link {
                 Effect::Conflicts { ticket, .. } => Event::Conflicts { ticket, result: Err(error) },
                 Effect::FolderUsage { ticket, .. } => Event::FolderUsage { ticket, result: Err(error) },
                 Effect::Spaces(call) => Event::Spaces(spaces_failed(&call, error)),
+                Effect::MakeSpace(MakeSpaceCall::Start { ticket, .. }) => Event::MakeSpace(MakeSpaceMsg::Started { ticket, result: Err(error) }),
                 Effect::AdminSpaces { ticket, .. } => Event::Admin(AdminEvent::Spaces { ticket, result: Err(error) }),
                 Effect::AdminFindAccount { ticket, .. } => Event::Admin(AdminEvent::AccountFound { ticket, result: Err(error) }),
                 Effect::AdminDo { .. } => Event::Admin(AdminEvent::Done(Err(error))),
@@ -512,6 +520,9 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         Effect::AdminSpaces { query, ticket } => Event::Admin(AdminEvent::Spaces { ticket, result: agent.admin_spaces(&query) }),
         Effect::AdminFindAccount { name, ticket } => Event::Admin(AdminEvent::AccountFound { ticket, result: find_account(agent, &name) }),
         Effect::Spaces(call) => Event::Spaces(spaces_call(agent, call)),
+        Effect::MakeSpace(MakeSpaceCall::Start { request, ticket }) => {
+            Event::MakeSpace(MakeSpaceMsg::Started { ticket, result: agent.make_space_from_folder(&request) })
+        }
         // Not running is as good as stopped.
         Effect::QuitAgent => {
             let _ = agent.quit();
@@ -736,7 +747,7 @@ pub(crate) mod fake {
     //! A fake agent: a signed-in or signed-out status, answers set per call, and a switch that makes it go away.
 
     use super::*;
-    use craft_cloud_app::{SpaceRole, SpaceRun, SpaceSync};
+    use craft_cloud_app::{FromFolderStep, SpaceRole, SpaceRun, SpaceSync};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// What the fake agent's team space calls work on: the spaces the agent lists, their members and usage, and the
@@ -766,6 +777,8 @@ pub(crate) mod fake {
         pub log: Vec<String>,
         /// What each call of `update_space` was sent.
         pub updates: Vec<(SpaceId, UpdateSpace)>,
+        /// The requests to make a team space from a folder, in order.
+        pub from_folder: Vec<FromFolderRequest>,
     }
 
     /// A team space as the agent lists it: `state` is `active` or `invited`.
@@ -1660,6 +1673,35 @@ pub(crate) mod fake {
                 }
                 Ok(())
             })
+        }
+        fn make_space_from_folder(&self, request: &FromFolderRequest) -> Result<FromFolderStatus, Error> {
+            // A run that goes on with its space needs no confirmation; a new one is an administrator's change.
+            if request.confirm.password.is_some() {
+                self.admin_change(
+                    &format!("make_space:{}", request.name),
+                    request.confirm.password.clone(),
+                    (request.confirm.totp_code.clone(), request.confirm.recovery_code.clone()),
+                    || (),
+                )?;
+            }
+            self.team("make_space_from_folder", |t| {
+                t.from_folder.push(request.clone());
+                Ok(())
+            })?;
+            let status = FromFolderStatus {
+                folder: request.folder.clone(),
+                name: request.name.clone(),
+                step: FromFolderStep::SettingUp,
+                space: Some(SpaceId::generate()),
+                team_folder: None,
+                done: 0,
+                total: 0,
+                failed_at: None,
+                message: None,
+                kept: 0,
+            };
+            self.status.lock().unwrap().from_folder = Some(status.clone());
+            Ok(status)
         }
         fn admin_set_space_owner(&self, id: SpaceId, request: &AdminSetSpaceOwner) -> Result<(), Error> {
             self.admin_change(

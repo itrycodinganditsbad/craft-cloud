@@ -7,7 +7,8 @@ use egui::RichText;
 
 use super::kit::{self, Column, Tokens};
 use crate::admin::format_bytes;
-use crate::model::Folders;
+use crate::make_space::MakeSpaceMsg;
+use crate::model::{Event, Overview};
 
 /// The height of a row of the two tables.
 const ROW_H: f32 = 40.0;
@@ -36,6 +37,9 @@ pub struct FolderRow {
     pub label: String,
     pub bytes: u64,
     pub files: u64,
+    /// The folder's name in the personal folder, for a row that is one real folder ("Make a team space from this folder" is
+    /// offered on it); none for the top level's loose files and for the rows that sum several folders.
+    pub folder: Option<String>,
 }
 
 /// The rows of the folders table: the largest folders by name (the agent sorts them), then "Other" for every folder beyond
@@ -49,6 +53,7 @@ pub fn folder_rows(data: &FolderUsageResponse) -> Vec<FolderRow> {
             label: if f.name.is_empty() { "Top level (not in a folder)".to_owned() } else { f.name.clone() },
             bytes: f.bytes,
             files: f.files,
+            folder: (!f.name.is_empty()).then(|| f.name.clone()),
         })
         .collect();
     let rest = data.folders.iter().skip(SHOWN_FOLDERS);
@@ -61,14 +66,18 @@ pub fn folder_rows(data: &FolderUsageResponse) -> Vec<FolderRow> {
     }
     if folders > 0 {
         let label = if folders == 1 { "Other (1 folder)".to_owned() } else { format!("Other ({folders} folders)") };
-        rows.push(FolderRow { label, bytes, files });
+        rows.push(FolderRow { label, bytes, files, folder: None });
     }
     rows
 }
 
 /// The section: its label, what the numbers are, and the two tables (or why there are none).
-pub(super) fn section(ui: &mut egui::Ui, number: usize, folders: &Folders) {
+pub(super) fn section(ui: &mut egui::Ui, number: usize, o: &Overview, events: &mut Vec<Event>) {
     let t = Tokens::get(ui.ctx());
+    let folders = &o.folders;
+    // An administrator may make a team space from a folder (the row gets a button); anyone else sees none.
+    let offer = matches!(o.access, crate::admin::Access::Admin { .. });
+    let can_start = o.can_make_space();
     kit::label_row(ui, &kit::numbered(number, "On this computer"), |_| {});
     ui.add_space(8.0);
     if folders.loading && folders.data.is_none() {
@@ -96,12 +105,12 @@ pub(super) fn section(ui: &mut egui::Ui, number: usize, folders: &Folders) {
     if ui.available_width() >= SIDE_BY_SIDE {
         ui.columns(2, |columns| {
             if let [left, right] = columns {
-                folder_table(left, data);
+                folder_table(left, data, offer.then_some(can_start), events);
                 kind_table(right, data);
             }
         });
     } else {
-        folder_table(ui, data);
+        folder_table(ui, data, offer.then_some(can_start), events);
         ui.add_space(12.0);
         kind_table(ui, data);
     }
@@ -125,11 +134,25 @@ fn size_parts(value: u64) -> (String, String) {
     }
 }
 
-fn folder_table(ui: &mut egui::Ui, data: &FolderUsageResponse) {
+/// The folders table. `offer`: `Some(enabled)` adds the last column with "Team space…" on each folder's row (an administrator's
+/// call; disabled while the form is open or the agent is at work), `None` leaves it out.
+fn folder_table(ui: &mut egui::Ui, data: &FolderUsageResponse, offer: Option<bool>, events: &mut Vec<Event>) {
     let rows = folder_rows(data);
-    let columns = [Column::flex("Folder", 110.0), Column::fixed("Share", 70.0), Column::fixed("Size", 80.0), Column::fixed("Files", 56.0)];
+    let mut columns = vec![Column::flex("Folder", 110.0), Column::fixed("Share", 70.0), Column::fixed("Size", 80.0), Column::fixed("Files", 56.0)];
+    if offer.is_some() {
+        columns.push(Column::fixed("", 132.0));
+    }
     kit::table(ui, "folders-table", &columns, rows.len(), ROW_H, |ui, row, column| {
         let Some(r) = rows.get(row) else { return };
+        if column == 4 {
+            if let (Some(enabled), Some(folder)) = (offer, &r.folder) {
+                let button = ui.add_enabled(enabled, kit::Button::new("Team space…"));
+                if button.on_hover_text(format!("Make a team space from “{folder}”")).clicked() {
+                    events.push(Event::MakeSpace(MakeSpaceMsg::Open(folder.clone())));
+                }
+            }
+            return;
+        }
         cell(ui, column, &r.label, r.bytes, r.files, data.total_bytes);
     });
 }
@@ -189,7 +212,7 @@ mod tests {
         let many = (0..SHOWN_FOLDERS + 2).map(|n| folder(&format!("f{n}"), 10)).collect();
         let rows = folder_rows(&usage(many, Some(OtherFolders { folders: 5, bytes: 7, files: 9 })));
         assert_eq!(rows.len(), SHOWN_FOLDERS + 1);
-        assert_eq!(rows.last(), Some(&FolderRow { label: "Other (7 folders)".into(), bytes: 27, files: 11 }));
+        assert_eq!(rows.last(), Some(&FolderRow { label: "Other (7 folders)".into(), bytes: 27, files: 11, folder: None }));
         let one = folder_rows(&usage((0..SHOWN_FOLDERS + 1).map(|n| folder(&format!("f{n}"), 1)).collect(), None));
         assert_eq!(one.last().map(|r| r.label.as_str()), Some("Other (1 folder)"));
     }

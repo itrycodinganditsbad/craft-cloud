@@ -12,6 +12,7 @@ mod files;
 mod folders;
 mod join;
 pub mod kit;
+mod make_space;
 mod overview;
 mod problem;
 mod second_factor;
@@ -196,6 +197,9 @@ mod tests;
 
 #[cfg(test)]
 mod tests_kit;
+
+#[cfg(test)]
+mod tests_make_space;
 
 #[cfg(test)]
 mod tests_security;

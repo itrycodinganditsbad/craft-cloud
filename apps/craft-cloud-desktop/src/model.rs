@@ -19,6 +19,7 @@ use craft_cloud_proto::join::JoinString;
 use crate::admin::{Access, Action, AdminEvent, AdminScreen};
 use crate::audit::{ActivityScreen, AuditMsg};
 use crate::files::{ConflictList, Files, FilesView, Place, RecentFile};
+use crate::make_space::{MakeSpace, MakeSpaceCall, MakeSpaceMsg};
 use crate::names::Names;
 use crate::security::{SecondFactorForm, SecurityAnswer, SecurityCall, SecurityEvent, SecurityPage, Step as SecurityStep};
 use crate::spaces::{SharedScreen, SpacesCall, SpacesMsg};
@@ -508,6 +509,10 @@ pub struct Overview {
     pub folders: Folders,
     /// How many invitations to team spaces wait for an answer (for the tag in the header and on the home page).
     pub invitations: usize,
+    /// The open form of "Make a team space from this folder" ([`crate::make_space`]).
+    pub make_space: Option<MakeSpace>,
+    /// The notice of the agent's work that was dismissed ([`crate::make_space::dismissal_key`]).
+    pub from_folder_dismissed: Option<String>,
 }
 
 /// The number of conflict copies the agent listed.
@@ -662,6 +667,8 @@ impl Overview {
             conflicts_ticket: crate::admin::fresh(),
             folders: Folders::default(),
             invitations: 0,
+            make_space: None,
+            from_folder_dismissed: None,
         }
     }
 
@@ -933,6 +940,8 @@ pub enum Event {
     Audit(AuditMsg),
     /// Something on the Shared tab, or the answer to one of its calls ([`crate::spaces`]).
     Spaces(SpacesMsg),
+    /// The form of "Make a team space from this folder", and its call's answer.
+    MakeSpace(MakeSpaceMsg),
 }
 
 /// What to do.
@@ -1090,6 +1099,8 @@ pub enum Effect {
     },
     /// A call of the Shared tab ([`SpacesMsg`]).
     Spaces(SpacesCall),
+    /// A call of "Make a team space from this folder" ([`MakeSpaceMsg`]).
+    MakeSpace(MakeSpaceCall),
 }
 
 /// Whether the app should start at login, in the tray, given the agent's status: while signed in with the agent
@@ -2113,6 +2124,7 @@ impl Model {
             Event::Admin(event) => self.admin(event),
             Event::Audit(msg) => self.audit(msg),
             Event::Spaces(msg) => self.spaces(msg),
+            Event::MakeSpace(msg) => self.make_space(msg),
             Event::RefreshUsage => {
                 let Some(overview) = self.overview_mut() else { return Vec::new() };
                 if overview.usage_loading {

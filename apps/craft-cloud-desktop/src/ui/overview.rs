@@ -62,7 +62,7 @@ pub(super) fn show(ui: &mut egui::Ui, o: &mut Overview, busy: Option<Busy>, now_
     }
 }
 
-fn home(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: i64, autostart_problem: Option<&str>, events: &mut Vec<Event>) {
+fn home(ui: &mut egui::Ui, o: &mut Overview, busy: Option<Busy>, now_ms: i64, autostart_problem: Option<&str>, events: &mut Vec<Event>) {
     // The label row: the section, this computer's name, and Refresh (of the storage figures).
     super::kit::label_row(ui, &super::kit::numbered(1, "This computer"), |ui| {
         if ui.add_enabled(!o.usage_loading, super::kit::Button::new("Refresh")).clicked() {
@@ -110,9 +110,12 @@ fn home(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: i64, autost
         ui.add_space(8.0);
         super::error_line(ui, error);
     }
+    // The agent's work of making a team space from a folder, and the form that starts it.
+    super::make_space::show_notice(ui, o, events);
+    super::make_space::show_form(ui, o, events);
     ui.add_space(20.0);
     if o.folders.open {
-        super::folders::section(ui, 2, &o.folders);
+        super::folders::section(ui, 2, o, events);
         ui.add_space(20.0);
     }
     recent_activity(ui, o, now_ms, events);
