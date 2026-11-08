@@ -2334,8 +2334,8 @@ async fn every_admin_route_needs_an_admin(s: &Server) {
         (M::DELETE, format!("/admin/users/{bob}/devices/{spare_id}"), Some(json!({})), StatusCode::NO_CONTENT),
         (M::DELETE, format!("/admin/users/{carl}"), Some(json!({})), StatusCode::ACCEPTED),
     ];
-    // Every `.route(` of the admin module is in the table (twelve paths): a route added without a row fails here.
-    assert_eq!(include_str!("../src/admin.rs").matches(".route(\"/admin/").count(), 12);
+    // Every `.route(` of the admin module is in the table (thirteen paths): a route added without a row fails here.
+    assert_eq!(include_str!("../src/admin.rs").matches(".route(\"/admin/").count(), 13);
     let distinct: std::collections::BTreeSet<_> = routes
         .iter()
         .map(|(_, p, _, _)| {

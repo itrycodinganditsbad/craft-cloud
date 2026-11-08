@@ -230,7 +230,7 @@ async fn storage(State(state): State<Shared>) -> Result<Json<AdminStorageOvervie
         server_fs_total_bytes: measured.server_fs_total,
         server_fs_free_bytes: measured.server_fs_free,
         database_bytes: measured.database_bytes,
-        compression: Some(compression_view(&state).await?),
+        compression: Some(compression_view(&state, true).await?),
     }))
 }
 
@@ -240,10 +240,10 @@ const TOTALS_TTL_MS: i64 = 30_000;
 
 /// The compression part of the overview: the settings in force and what they save, from the recorded sizes and the last
 /// `store estimate`. `none` in the config shows as the algorithm and wins over the level.
-async fn compression_view(state: &AppState) -> Result<AdminCompression, ApiError> {
+async fn compression_view(state: &AppState, cached: bool) -> Result<AdminCompression, ApiError> {
     let now = state.now_ms();
-    let cached = state.compression_totals.lock().ok().and_then(|slot| *slot).filter(|(at, _)| now.saturating_sub(*at) < TOTALS_TTL_MS && *at <= now);
-    let totals = match cached {
+    let kept = state.compression_totals.lock().ok().and_then(|slot| *slot).filter(|(at, _)| cached && now.saturating_sub(*at) < TOTALS_TTL_MS && *at <= now);
+    let totals = match kept {
         Some((_, totals)) => totals,
         None => {
             let totals = state.meta.storage_totals().await?;
@@ -315,7 +315,7 @@ async fn set_compression(
     state.meta.admin_set_compression_level(&actor, state.store.level(), req.level, state.now_ms()).await?;
     state.store.set_level(req.level);
     tracing::info!(actor = %auth.device, level = req.level, "admin: compression level changed");
-    Ok(Json(compression_view(&state).await?))
+    Ok(Json(compression_view(&state, false).await?))
 }
 
 /// `GET /admin/users/{id}/usage`: the account's stored bytes and labeled estimates.

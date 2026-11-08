@@ -698,12 +698,8 @@ async fn storage_compression_follows_the_config() {
     store.put(key(&zstd), &zstd).await.unwrap();
     assert_eq!(format_on_disk(key(&zstd)), 1, "compressed by default");
 
-    // `init` writes `[storage]` last, so an appended line lands in it.
-    let mut text = std::fs::read_to_string(&config_path).unwrap();
-    text.push_str(
-        "compression = \"none\"
-",
-    );
+    // `[storage]` is not the last section (`init` can end with another): the line goes right under its header.
+    let text = std::fs::read_to_string(&config_path).unwrap().replace("[storage]\n", "[storage]\ncompression = \"none\"\n");
     std::fs::write(&config_path, text).unwrap();
     let (_, store) = craft_cloud_server::cli::open(&Config::load(&config_path).unwrap()).await.unwrap();
     let plain = compressible("none");

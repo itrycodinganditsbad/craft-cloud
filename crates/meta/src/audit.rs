@@ -889,7 +889,7 @@ mod tests {
             assert_eq!(AuditAction::parse(action.as_str()), Some(action));
             assert!(action.as_str().bytes().all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'.'));
         }
-        assert_eq!(seen.len(), 30);
+        assert_eq!(seen.len(), 31);
         assert_eq!(AuditAction::parse("auth.login "), None);
         assert_eq!(AuditAction::parse("AUTH.LOGIN"), None);
     }
@@ -900,7 +900,7 @@ mod tests {
         let auth = ActionFilter::parse("auth.").unwrap();
         assert_eq!(auth.actions().len(), 5);
         assert!(auth.actions().iter().all(|a| a.as_str().starts_with("auth.")));
-        assert_eq!(ActionFilter::parse("admin.").unwrap().actions().len(), 11);
+        assert_eq!(ActionFilter::parse("admin.").unwrap().actions().len(), 12);
         for bad in ["", "auth", "au.", "auth.%", "auth._", "nope.", "AUTH.", "auth.login'", "auth. ", "auth.logi", "'; DROP TABLE x; --"] {
             assert_eq!(ActionFilter::parse(bad), None, "{bad:?}");
         }

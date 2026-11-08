@@ -840,7 +840,7 @@ mod tests {
 
     #[test]
     fn audit_filters_are_the_closed_list_or_a_prefix_of_it() {
-        assert_eq!(AUDIT_ACTIONS.len(), 30);
+        assert_eq!(AUDIT_ACTIONS.len(), 31);
         assert!(AUDIT_ACTIONS.iter().all(|a| valid_audit_action(a)));
         for prefix in ["auth.", "admin.", "cli.", "join.", "device.", "account."] {
             assert!(valid_audit_action(prefix), "{prefix}");
