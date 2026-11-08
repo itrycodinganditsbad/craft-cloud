@@ -869,7 +869,7 @@ pub fn truncated(ui: &mut Ui, text: impl Into<egui::WidgetText>) -> Response {
 }
 
 /// One cell of [`joined_cells`]: the badge (`01`) and the label on the right of its header strip. An empty badge draws
-/// none (see [`JoinedCell::plain`]).
+/// none and puts the label at the left (see [`JoinedCell::plain`]).
 #[derive(Clone, Copy, Debug)]
 pub struct JoinedCell<'a> {
     pub badge: &'a str,
@@ -885,7 +885,7 @@ impl<'a> JoinedCell<'a> {
         Self { badge, tone, label, link: false }
     }
 
-    /// A cell without the numbered badge: only the label in its header strip.
+    /// A cell without the numbered badge: only the label, at the left of its header strip.
     pub fn plain(tone: Tone, label: &'a str) -> Self {
         Self::new("", tone, label)
     }
@@ -956,8 +956,13 @@ pub fn joined_cells(
             if !cell.badge.is_empty() {
                 badge(&mut head, cell.badge, cell.tone);
             }
-            let mut label = ui
-                .new_child(egui::UiBuilder::new().id_salt((id, i, "label")).max_rect(inner).layout(egui::Layout::right_to_left(egui::Align::Center)));
+            // With a badge the label sits on the right of the strip; without one it starts at the left, as a stat's label.
+            let label_layout = if cell.badge.is_empty() {
+                egui::Layout::left_to_right(egui::Align::Center)
+            } else {
+                egui::Layout::right_to_left(egui::Align::Center)
+            };
+            let mut label = ui.new_child(egui::UiBuilder::new().id_salt((id, i, "label")).max_rect(inner).layout(label_layout));
             if cell.link {
                 if let Some(slot) = clicked.get_mut(i) {
                     *slot = text_link(&mut label, cell.label, LABEL_SIZE).clicked();
