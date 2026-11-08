@@ -1466,8 +1466,11 @@ mod tests {
             token: crate::http::DeviceToken::new("tok".into()),
             spaces: Vec::new(),
         };
+        let project = dir.path().join("Craft Cloud").join("Project");
+        std::fs::create_dir_all(&project).unwrap();
+        let at_project = |step| FromFolderStatus { folder: project.display().to_string(), ..status(step) };
         for step in [FromFolderStep::Creating, FromFolderStep::Copying, FromFolderStep::Trashing] {
-            write_journal(&data, personal, &status(step));
+            write_journal(&data, personal, &at_project(step));
             restore(&control, &data, &account);
             let shown = control.from_folder().unwrap();
             assert_eq!((shown.step, shown.failed_at), (FromFolderStep::Interrupted, Some(step)), "{step:?}");
@@ -1475,6 +1478,11 @@ mod tests {
             // The journal says it too, so the next start reports the same.
             assert_eq!(read_journal(&data, personal).map(|s| s.step), Some(FromFolderStep::Interrupted));
         }
+        // Stopped in the middle of deleting, with the old folder gone by now: there is nothing left to finish.
+        write_journal(&data, personal, &at_project(FromFolderStep::Trashing));
+        std::fs::remove_dir_all(&project).unwrap();
+        restore(&control, &data, &account);
+        assert_eq!(control.from_folder().map(|s| (s.step, s.failed_at)), Some((FromFolderStep::Done, None)));
         // Finished and failed work is shown as it was.
         write_journal(&data, personal, &status(FromFolderStep::Done));
         restore(&control, &data, &account);
