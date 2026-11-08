@@ -17,6 +17,10 @@ struct StorageState<'a> {
     overview: Option<&'a craft_cloud_app::AdminStorageOverview>,
     loading: bool,
     error: Option<&'a str>,
+    /// The compression level picked and not yet confirmed.
+    level_pick: Option<u8>,
+    /// The time the page is drawn at, for the server's uptime and the age of its checks.
+    now_ms: i64,
 }
 
 /// The name of the confirmation page's password field, for [`super::security::secret_id`] and the forgetting of its text.
@@ -48,7 +52,13 @@ pub(super) fn show(ui: &mut egui::Ui, admin: &mut AdminScreen, now_ms: i64, even
             ui,
             admin.section,
             server.as_ref(),
-            StorageState { overview: admin.storage.as_ref(), loading: admin.storage_loading, error: admin.storage_error.as_deref() },
+            StorageState {
+                overview: admin.storage.as_ref(),
+                loading: admin.storage_loading,
+                error: admin.storage_error.as_deref(),
+                level_pick: admin.level_pick,
+                now_ms,
+            },
             &mut admin.list,
             &me,
             events,
@@ -305,6 +315,7 @@ fn landing(
     me: &str,
     events: &mut Vec<Event>,
 ) {
+    let now_ms = storage.now_ms;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 12.0;
         switcher(ui, if section == Section::Accounts { 0 } else { 1 }, events);
@@ -323,8 +334,8 @@ fn landing(
     });
     ui.add_space(18.0);
     match section {
-        Section::Accounts => accounts(ui, storage, server, list, me, events),
-        Section::Storage => storage_page(ui, storage),
+        Section::Accounts => accounts(ui, storage, server, list, me, now_ms, events),
+        Section::Storage => storage_page(ui, storage, events),
     }
 }
 
@@ -424,12 +435,16 @@ fn accounts(
     server: Option<&craft_cloud_app::AdminServerInfo>,
     list: &mut UserList,
     me: &str,
+    now_ms: i64,
     events: &mut Vec<Event>,
 ) {
     storage_status(ui, &storage);
     if storage.overview.is_some() || server.is_some() {
         stat_cells(ui, storage.overview, server);
         ui.add_space(18.0);
+    }
+    if let Some(server) = server {
+        health(ui, server, now_ms);
     }
     // The label at the left and the search at the right of one row; in a narrow window the search wraps under the label.
     // The search stays a button as well as Enter: the list is the server's page of 20, found by the server's query, so
@@ -583,13 +598,73 @@ fn accounts_table(ui: &mut egui::Ui, users: &[AdminUserInfo], me: &str, events: 
 }
 
 /// The Storage tab: what the server has room for, the biggest accounts and how complete the estimates are.
-fn storage_page(ui: &mut egui::Ui, state: StorageState<'_>) {
+/// The server's health under the counters: how long it has been up, whether the database and the blob store answer, and
+/// whether it refuses uploads. A field an older server does not send shows nothing; with none of them, no row.
+fn health(ui: &mut egui::Ui, server: &craft_cloud_app::AdminServerInfo, now_ms: i64) {
+    let refusing = server.refusing_uploads == Some(true);
+    if server.started_ms.is_none() && server.database_ok.is_none() && server.store_ok.is_none() && !refusing {
+        return;
+    }
+    kit::section_label(ui, "Server health");
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+        if let Some(started) = server.started_ms {
+            kit::tag(ui, &format!("Up {}", uptime(now_ms.saturating_sub(started))), Tone::Neutral);
+        }
+        match server.database_ok {
+            Some(true) => {
+                kit::tag(ui, "Database ok", Tone::Good);
+            }
+            Some(false) => {
+                kit::tag(ui, "Database not answering", Tone::Bad);
+            }
+            None => {}
+        }
+        match (server.store_ok, server.store_check_ms) {
+            (Some(true), Some(at)) => {
+                kit::tag(ui, &format!("Store ok · checked {}", super::ago(now_ms, at)), Tone::Good);
+            }
+            (Some(true), None) => {
+                kit::tag(ui, "Store ok", Tone::Good);
+            }
+            (Some(false), Some(at)) => {
+                kit::tag(ui, &format!("Store not answering · checked {}", super::ago(now_ms, at)), Tone::Bad);
+            }
+            (Some(false), None) => {
+                kit::tag(ui, "Store not answering", Tone::Bad);
+            }
+            (None, _) => {}
+        }
+        if refusing {
+            kit::tag(ui, "Refusing uploads", Tone::Bad);
+        }
+    });
+    ui.add_space(18.0);
+}
+
+/// How long a server has been up: "5 min", "3 h 20 min", "2 d 4 h".
+pub(super) fn uptime(ms: i64) -> String {
+    let minutes = ms.max(0) / 60_000;
+    match minutes {
+        0..1 => "under a minute".to_owned(),
+        1..60 => format!("{minutes} min"),
+        60..1_440 => format!("{} h {} min", minutes / 60, minutes % 60),
+        _ => format!("{} d {} h", minutes / 1_440, minutes % 1_440 / 60),
+    }
+}
+
+fn storage_page(ui: &mut egui::Ui, state: StorageState<'_>, events: &mut Vec<Event>) {
     if !storage_status(ui, &state) {
         return;
     }
     let Some(storage) = state.overview else { return };
     let block = StorageBlock::of(storage);
     server_storage(ui, &block);
+    if let Some(compression) = &storage.compression {
+        ui.add_space(18.0);
+        compression_panel(ui, compression, state.level_pick, events);
+    }
     if !storage.top_accounts.is_empty() {
         ui.add_space(18.0);
         kit::section_label(ui, "Top accounts");
@@ -621,6 +696,127 @@ fn storage_page(ui: &mut egui::Ui, state: StorageState<'_>) {
     if storage.manifest_index.building > 0 || storage.manifest_index.not_indexed > 0 {
         small_weak(ui, "Storage estimates are incomplete; run `craft-cloud-server index build`.");
     }
+}
+
+/// A share in permille as percent with one decimal: 1234 is "123.4 %".
+fn permille(value: u32) -> String {
+    format!("{}.{} %", value / 10, value % 10)
+}
+
+/// "02 / Compression": how blobs are stored, what that saves, the level control and the last estimate.
+fn compression_panel(ui: &mut egui::Ui, c: &craft_cloud_app::AdminCompression, pick: Option<u8>, events: &mut Vec<Event>) {
+    let off = c.algorithm == "none";
+    let title = kit::numbered(2, "Compression");
+    panel(
+        ui,
+        Some(&title),
+        |ui| {
+            if off {
+                kit::tag(ui, "Off", Tone::Neutral);
+            } else {
+                kit::tag(ui, &format!("{} level {}", c.algorithm, c.level), Tone::Accent);
+            }
+        },
+        |ui| {
+            kv(ui, "Algorithm", |ui| {
+                ui.label(RichText::new(if c.algorithm.is_empty() { "–" } else { c.algorithm.as_str() }).monospace());
+            });
+            if !off {
+                kv(ui, "Level in use", |ui| {
+                    let origin = match c.admin_level {
+                        Some(_) => "set by an admin".to_owned(),
+                        None => "from the config".to_owned(),
+                    };
+                    ui.label(RichText::new(format!("{} · {origin}", c.level)).monospace());
+                });
+            }
+            kv(ui, "Logical size, all blobs", |ui| {
+                ui.label(RichText::new(format!("{} · {} blobs", format_bytes(c.logical_bytes), c.blobs)).monospace());
+            });
+            kv(ui, "Stored size of the known part", |ui| {
+                ui.label(RichText::new(format!("{} of {}", format_bytes(c.known_physical_bytes), format_bytes(c.known_logical_bytes))).monospace());
+            });
+            kv(ui, "Saving", |ui| {
+                ui.label(RichText::new(c.saving_permille.map_or_else(|| "–".to_owned(), permille)).monospace());
+            });
+            kv(ui, "Known share of the data", |ui| {
+                ui.label(RichText::new(permille(c.known_permille)).monospace());
+            });
+            section(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                if off {
+                    small_weak(ui, "Set by the server config: compression = \"none\" stores blobs plain, so there is no level to change here.");
+                } else {
+                    level_control(ui, c, pick, events);
+                }
+                if c.known_permille < 1000 {
+                    small_weak(
+                        ui,
+                        "Blobs stored before sizes were recorded have no stored size yet, so the saving is a rough number for the known part. \
+                         `craft-cloud-server store measure` fills them in.",
+                    );
+                }
+                ui.add_space(8.0);
+                match &c.estimate {
+                    Some(estimate) => estimate_table(ui, estimate),
+                    None => small_weak(ui, "No estimate yet: `craft-cloud-server store estimate` samples what other levels would save."),
+                }
+            });
+        },
+    );
+}
+
+/// The level control: a menu of 1 to 19 and the button that asks for the admin's password.
+fn level_control(ui: &mut egui::Ui, c: &craft_cloud_app::AdminCompression, pick: Option<u8>, events: &mut Vec<Event>) {
+    let shown = pick.unwrap_or(c.level);
+    kit::section_label(ui, "Level for new files");
+    ui.horizontal_wrapped(|ui| {
+        egui::ComboBox::from_id_salt("compression-level").selected_text(format!("Level {shown}")).width(140.0).show_ui(ui, |ui| {
+            for level in crate::admin::LEVELS {
+                if ui.selectable_label(level == shown, format!("Level {level}")).clicked() {
+                    send(events, AdminEvent::PickLevel(level));
+                }
+            }
+        });
+        let changed = shown != c.level;
+        if ui.add_enabled(changed, kit::Button::new("Change level").primary()).clicked() {
+            send(events, AdminEvent::Ask(Action::SetCompression { level: shown }));
+        }
+    });
+    small_weak(ui, "A change needs your password. It applies to files stored from now on; files already stored are not rewritten.");
+}
+
+/// The last estimate: when it ran, on how much, and what each level would save.
+fn estimate_table(ui: &mut egui::Ui, estimate: &craft_cloud_app::AdminCompressionEstimate) {
+    kit::section_label(ui, "Last estimate");
+    small_weak(
+        ui,
+        format!(
+            "{} · a sample of {} blobs, {} · as stored now it saves {}",
+            date(estimate.at_ms),
+            estimate.sampled_blobs,
+            format_bytes(estimate.sampled_bytes),
+            permille(estimate.current_saving_permille)
+        ),
+    );
+    if estimate.levels.is_empty() {
+        return;
+    }
+    let columns = [Column::fixed("Level", 80.0), Column::flex("Would save", 100.0), Column::fixed("Speed per core", 140.0)];
+    kit::table(ui, "admin-compression-estimate", &columns, estimate.levels.len(), 32.0, |ui, row, column| {
+        let Some(level) = estimate.levels.get(row) else { return };
+        match column {
+            0 => {
+                ui.label(RichText::new(level.level.to_string()).monospace());
+            }
+            1 => {
+                ui.label(RichText::new(permille(level.saving_permille)).monospace());
+            }
+            _ => {
+                ui.label(RichText::new(format!("{} KiB/s", level.kib_per_second)).monospace());
+            }
+        }
+    });
 }
 
 /// "01 / Server storage": all storage as one number and a bar, and a row for the server's disk and one for the store.
@@ -1325,7 +1521,11 @@ fn computers(ui: &mut egui::Ui, view: &UserView, user: &AdminUserInfo, now_ms: i
 
 /// The password a change asks for, in a panel under a breadcrumb.
 fn confirmation(ui: &mut egui::Ui, dialog: &mut Dialog, events: &mut Vec<Event>) {
-    breadcrumb(ui, &format!("Admin / Accounts / {} / Confirm", dialog.action.username()));
+    if dialog.action.username().is_empty() {
+        breadcrumb(ui, "Admin / Storage / Compression / Confirm");
+    } else {
+        breadcrumb(ui, &format!("Admin / Accounts / {} / Confirm", dialog.action.username()));
+    }
     big_headline(ui, &dialog.action.title());
     ui.add_space(18.0);
     ui.scope(|ui| {

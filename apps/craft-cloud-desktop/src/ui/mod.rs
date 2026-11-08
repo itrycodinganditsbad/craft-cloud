@@ -9,6 +9,7 @@ mod audit;
 mod computers;
 mod confirm;
 mod files;
+mod folders;
 mod join;
 pub mod kit;
 mod overview;

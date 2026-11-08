@@ -1,17 +1,44 @@
-//! The recent files of every Craft app, on every computer of the account, with Open for the ones that are in the synced folder here.
+//! The recent files of every Craft app, on every computer of the account, with Open for the ones that are in the synced folder here;
+//! and, beside them, the conflict copies in the synced folder, with Open and Show original.
 
 use egui::RichText;
 
 use super::kit::{self, Column, Segment, Tokens, Tone};
-use crate::files::{Files, Place, app_label};
+use crate::admin::format_bytes;
+use crate::files::{ConflictFile, Files, FilesView, Place, app_label};
 use crate::model::Event;
 
 /// The height of a row of the files table.
 const ROW_H: f32 = 64.0;
 
 pub(super) fn show(ui: &mut egui::Ui, files: &Files, now_ms: i64, events: &mut Vec<Event>) {
-    let t = Tokens::get(ui.ctx());
     super::heading(ui, "Files");
+    views(ui, files, events);
+    ui.add_space(8.0);
+    match files.view {
+        FilesView::Recent => recent(ui, files, now_ms, events),
+        FilesView::Conflicts => conflicts(ui, files, now_ms, events),
+    }
+}
+
+/// The switch between the recent files and the conflict copies; the copies' count shows once they are listed.
+fn views(ui: &mut egui::Ui, files: &Files, events: &mut Vec<Event>) {
+    let copies = Segment::new("Conflict copies");
+    let copies = match &files.conflicts.list {
+        Some(list) => copies.count(list.files.len()),
+        None => copies,
+    };
+    let segments = [Segment::new("Recent files"), copies];
+    let selected = usize::from(files.view == FilesView::Conflicts);
+    match kit::segmented(ui, "Files view", &segments, selected) {
+        Some(0) if selected != 0 => events.push(Event::FilesView(FilesView::Recent)),
+        Some(1) if selected != 1 => events.push(Event::FilesView(FilesView::Conflicts)),
+        _ => {}
+    }
+}
+
+fn recent(ui: &mut egui::Ui, files: &Files, now_ms: i64, events: &mut Vec<Event>) {
+    let t = Tokens::get(ui.ctx());
     kit::label_row(ui, &kit::numbered(1, "Recent files, every app and computer"), |ui| {
         if ui.add_enabled(!files.loading, kit::Button::new("Refresh")).clicked() {
             events.push(Event::LoadFiles);
@@ -96,6 +123,101 @@ pub(super) fn show(ui: &mut egui::Ui, files: &Files, now_ms: i64, events: &mut V
             .small()
             .color(t.muted),
     );
+}
+
+/// The conflict copies: one row each with its original, computer, time and size, Open and Show original.
+fn conflicts(ui: &mut egui::Ui, files: &Files, now_ms: i64, events: &mut Vec<Event>) {
+    let t = Tokens::get(ui.ctx());
+    let state = &files.conflicts;
+    kit::label_row(ui, &kit::numbered(1, "Conflict copies on this computer"), |ui| {
+        if ui.add_enabled(!files.loading && !state.loading, kit::Button::new("Refresh")).clicked() {
+            events.push(Event::LoadFiles);
+        }
+    });
+    ui.add_space(8.0);
+    if state.loading {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Looking for conflict copies…");
+        });
+    }
+    if let Some(error) = &state.error {
+        super::error_line(ui, &format!("Conflict copies aren't available right now. {error}"));
+    }
+    if let Some(error) = &state.open_error {
+        super::error_line(ui, error);
+    }
+    let Some(list) = &state.list else { return };
+    if list.files.is_empty() {
+        ui.label(
+            RichText::new(
+                "No conflict copies. When two computers change the same file at the same time, Craft Cloud keeps both and the copy shows up here.",
+            )
+            .color(t.muted),
+        );
+    } else {
+        let columns = [
+            Column::flex("Copy", 100.0).weighted(2.0),
+            Column::fixed("Computer, time", 138.0),
+            Column::fixed("Size", 76.0),
+            Column::fixed("", 236.0),
+        ];
+        kit::table(ui, "conflicts", &columns, list.files.len(), ROW_H, |ui, row, column| {
+            let Some(file) = list.files.get(row) else { return };
+            match column {
+                0 => {
+                    kit::item_icon(ui, false, 20.0);
+                    kit::two_lines(ui, ROW_H, file.name(), Some(&looks_like(file)));
+                }
+                1 => {
+                    let when = file.made_at().unwrap_or_else(|| super::ago(now_ms, file.copy.mtime_ms));
+                    kit::two_lines(ui, ROW_H, file.copy.device.as_deref().unwrap_or("—"), Some(&when));
+                }
+                2 => {
+                    ui.label(RichText::new(format_bytes(file.copy.size)).monospace());
+                }
+                _ => {
+                    let open = ui.add_enabled(file.place.reason().is_none(), kit::Button::new("Open").primary());
+                    let open = match file.place.reason() {
+                        Some(reason) => open.on_disabled_hover_text(reason),
+                        None => open,
+                    };
+                    if open.clicked() {
+                        events.push(Event::OpenConflictCopy(file.copy.path.clone()));
+                    }
+                    let show = ui.add_enabled(file.original == Some(Place::Here), kit::Button::new("Show original"));
+                    let show = match file.original {
+                        Some(Place::Here) => show,
+                        Some(place) => show.on_disabled_hover_text(place.reason().unwrap_or("The original isn't here")),
+                        None => show.on_disabled_hover_text("The copy's name doesn't say which file it is a copy of"),
+                    };
+                    if show.clicked() {
+                        events.push(Event::ShowConflictOriginal(file.copy.path.clone()));
+                    }
+                }
+            }
+        });
+        if list.truncated {
+            ui.add_space(4.0);
+            ui.label(RichText::new(format!("Showing the newest {}", list.files.len())).small().color(t.muted));
+        }
+    }
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(
+            "A file is listed when its name looks like the copy Craft Cloud keeps when two computers change a file at the same time, so a file you named that way yourself shows up too. The list reflects the last finished sync pass. Open starts the copy in its default program; Show original opens the folder of the file it is a copy of. Nothing here is deleted.",
+        )
+        .small()
+        .color(t.muted),
+    );
+}
+
+/// A conflict copy's second line: what the name says it is, and of which file.
+fn looks_like(file: &ConflictFile) -> String {
+    match &file.copy.original_path {
+        Some(original) => format!("Looks like a conflict copy of {original}"),
+        None => "Looks like a conflict copy".to_owned(),
+    }
 }
 
 /// The app filter ("All 3 / PhotoCraft 1 / WordCraft 2", the apps that have files) and the search field.

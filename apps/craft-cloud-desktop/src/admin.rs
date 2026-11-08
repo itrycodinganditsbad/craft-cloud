@@ -15,8 +15,8 @@
 //!   dismisses it (or leaves the pages), never written anywhere, and left out of `Debug` output.
 
 use craft_cloud_app::{
-    AccountInfo, AccountUsage, AdminCode, AdminCreatedUser, AdminServerInfo, AdminStorageOverview, AdminUserInfo, AdminUserList, DeviceId,
-    DeviceInfo, Error, UserQuery, Uuid,
+    AccountInfo, AccountUsage, AdminCode, AdminCompression, AdminCreatedUser, AdminServerInfo, AdminStorageOverview, AdminUserInfo, AdminUserList,
+    DeviceId, DeviceInfo, Error, UserQuery, Uuid,
 };
 use craft_cloud_proto::api::{AdminConfirm, codes};
 
@@ -168,12 +168,20 @@ pub enum Action {
         device: DeviceId,
         device_name: String,
     },
+    /// The zstd level the server compresses new writes at (1 to 19).
+    SetCompression {
+        level: u8,
+    },
 }
 
+/// The lowest and highest compression level the server takes.
+pub const LEVELS: std::ops::RangeInclusive<u8> = 1..=19;
+
 impl Action {
-    /// The account the change is about (the new account's name for a creation).
+    /// The account the change is about (the new account's name for a creation); empty for a change of the server.
     pub fn username(&self) -> &str {
         match self {
+            Self::SetCompression { .. } => "",
             Self::CreateUser { username, .. }
             | Self::UpdateUser { username, .. }
             | Self::Disable { username, .. }
@@ -208,6 +216,7 @@ impl Action {
             Self::IssueReset { username, .. } => format!("Password reset code for {username}"),
             Self::ResetTwoFactor { username, .. } => format!("Turn two-factor sign-in off for {username}"),
             Self::RevokeDevice { username, device_name, .. } => format!("Sign {device_name} of {username} out"),
+            Self::SetCompression { level } => format!("Compress new files at level {level}"),
         }
     }
 
@@ -245,6 +254,11 @@ impl Action {
                 "The account no longer asks for a code at sign-in, and every computer of it is signed out. It can turn it on again on its Security page.".into()
             }
             Self::RevokeDevice { .. } => "That computer can't sync any more; its files stay there.".into(),
+            Self::SetCompression { .. } => {
+                "New files are stored at this level at once and it is kept over restarts. Files already stored are not rewritten. A higher level \
+                 saves more space and takes more time on the server."
+                    .into()
+            }
         }
     }
 
@@ -261,6 +275,7 @@ impl Action {
             Self::IssueReset { .. } => "Make a reset code",
             Self::ResetTwoFactor { .. } => "Turn two-factor off",
             Self::RevokeDevice { .. } => "Sign out",
+            Self::SetCompression { .. } => "Set the level",
         }
     }
 }
@@ -271,6 +286,8 @@ pub enum Outcome {
     Created(AdminCreatedUser),
     Updated(AdminUserInfo),
     Code(AdminCode),
+    /// The compression part of the storage overview after a level change.
+    Compression(Box<AdminCompression>),
     Done,
 }
 
@@ -474,6 +491,8 @@ pub struct AdminScreen {
     pub storage_loading: bool,
     pub storage_error: Option<String>,
     storage_ticket: u64,
+    /// The compression level picked on the Storage part, before it is confirmed (`None`: the level in use).
+    pub level_pick: Option<u8>,
     pub view: View,
     /// The part of the list page that is shown.
     pub section: Section,
@@ -552,6 +571,8 @@ pub enum AdminEvent {
     BackToList,
     /// Go on from the account's role and quota to the password.
     SubmitEdit,
+    /// The Storage part's compression level control.
+    PickLevel(u8),
     /// Ask for the password of a change.
     Ask(Action),
     /// Send the change with the password typed.
@@ -647,6 +668,7 @@ impl Model {
             storage_loading: false,
             storage_error: None,
             storage_ticket: 0,
+            level_pick: None,
             view: View::List,
             section: Section::Accounts,
             dialog: None,
@@ -822,6 +844,12 @@ impl AdminScreen {
             }
             AdminEvent::SubmitEdit => {
                 self.submit_edit();
+                Vec::new()
+            }
+            AdminEvent::PickLevel(level) => {
+                if LEVELS.contains(&level) {
+                    self.level_pick = Some(level);
+                }
                 Vec::new()
             }
             AdminEvent::Ask(action) => {
@@ -1007,6 +1035,13 @@ impl AdminScreen {
                     view.usage_loading = true;
                     effects.push(Effect::AdminUserUsage { user: view.id, ticket: view.usage_ticket });
                 }
+            }
+            (Action::SetCompression { .. }, Outcome::Compression(compression)) => {
+                // The answer is the new compression part: shown at once, and the overview is asked for again below.
+                if let Some(storage) = &mut self.storage {
+                    storage.compression = Some(compression);
+                }
+                self.level_pick = None;
             }
             (Action::Remove { .. }, _) => self.view = View::List,
             (Action::RevokeDevice { id, .. }, _) => {

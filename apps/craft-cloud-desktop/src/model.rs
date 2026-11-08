@@ -8,9 +8,9 @@
 use std::path::{Path, PathBuf};
 
 use craft_cloud_app::{
-    AccountUsage, AuditEvent, AuditPage, DeviceId, DeviceInfo, Error, HistoryResponse, JoinRequest, LoginRequest, NodeId, PairingInfo, PairingState,
-    PairingStatus, RestoreResponse, RunState, SecondFactorLoginRequest, Status, TrashResponse, TrashRestoreResponse, UserQuery, Uuid, VersionId,
-    codes,
+    AccountUsage, AuditEvent, AuditPage, DeviceId, DeviceInfo, Error, FolderUsageResponse, HistoryResponse, JoinRequest, LoginRequest, NodeId,
+    PairingInfo, PairingState, PairingStatus, RestoreResponse, RunState, SecondFactorLoginRequest, Status, TrashResponse, TrashRestoreResponse,
+    UserQuery, Uuid, VersionId, codes,
 };
 use craft_cloud_proto::api::AdminConfirm;
 use craft_cloud_proto::api::codes as api_codes;
@@ -18,7 +18,7 @@ use craft_cloud_proto::join::JoinString;
 
 use crate::admin::{Access, Action, AdminEvent, AdminScreen};
 use crate::audit::{ActivityScreen, AuditMsg};
-use crate::files::{Files, Place, RecentFile};
+use crate::files::{ConflictList, Files, FilesView, Place, RecentFile};
 use crate::names::Names;
 use crate::security::{SecondFactorForm, SecurityAnswer, SecurityCall, SecurityEvent, SecurityPage, Step as SecurityStep};
 
@@ -494,6 +494,33 @@ pub struct Overview {
     pub recent: Recent,
     /// The filters of that table (they narrow the events that are loaded).
     pub recent_filter: crate::filter::ActivityFilter,
+    /// How many conflict copies the synced folder has, once the agent said (for the home page's tag).
+    pub conflicts: Option<ConflictSummary>,
+    /// Which answer to [`Effect::Conflicts`] is the current one.
+    pub(crate) conflicts_ticket: u64,
+    /// The sizes of the synced folder here, by folder and by kind.
+    pub folders: Folders,
+}
+
+/// The number of conflict copies the agent listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictSummary {
+    pub count: usize,
+    /// There are more than the agent lists.
+    pub truncated: bool,
+}
+
+/// The home page's "On this computer": the local logical sizes of the synced folder, asked for when the section is opened.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Folders {
+    /// Whether the section is shown.
+    pub open: bool,
+    pub data: Option<FolderUsageResponse>,
+    pub loading: bool,
+    /// Why the sizes couldn't be had.
+    pub error: Option<String>,
+    /// Which answer is the current one.
+    pub ticket: u64,
 }
 
 /// The home page's short list of the account's newest activity.
@@ -623,7 +650,27 @@ impl Overview {
             session: crate::admin::fresh(),
             recent: Recent::Loading,
             recent_filter: crate::filter::ActivityFilter::default(),
+            conflicts: None,
+            conflicts_ticket: crate::admin::fresh(),
+            folders: Folders::default(),
         }
+    }
+
+    /// The effect that asks for the conflict copies again, and makes its answer the current one.
+    fn ask_conflicts(&mut self) -> Effect {
+        self.conflicts_ticket = crate::admin::fresh();
+        Effect::Conflicts { root: self.status.folder.clone(), ticket: self.conflicts_ticket }
+    }
+
+    /// The effect that asks for the folder sizes, once at a time.
+    fn ask_folders(&mut self) -> Option<Effect> {
+        if self.folders.loading {
+            return None;
+        }
+        self.folders.ticket = crate::admin::fresh();
+        self.folders.loading = true;
+        self.folders.error = None;
+        Some(Effect::FolderUsage { ticket: self.folders.ticket })
     }
 }
 
@@ -756,6 +803,26 @@ pub enum Event {
         ticket: u64,
         result: Result<Vec<RecentFile>, Error>,
     },
+    /// [`Effect::Conflicts`]'s answer, for the Files page or the home page's tag.
+    Conflicts {
+        ticket: u64,
+        result: Result<ConflictList, Error>,
+    },
+    /// [`Effect::FolderUsage`]'s answer.
+    FolderUsage {
+        ticket: u64,
+        result: Result<FolderUsageResponse, Error>,
+    },
+    /// The Files page's switch between the recent files and the conflict copies.
+    FilesView(FilesView),
+    /// The home page's "n conflict copies": the Files page on its conflict copies.
+    OpenConflicts,
+    /// Open the conflict copy at this path (relative to the synced folder) with the OS's default program.
+    OpenConflictCopy(String),
+    /// Show the folder of the file this conflict copy (at this path) is a copy of.
+    ShowConflictOriginal(String),
+    /// The home page's "On this computer" section opens or closes.
+    ToggleFolders,
     /// Open the file of this app's list at this path (relative to the synced folder) with the OS's default program.
     OpenRecent {
         app: String,
@@ -921,6 +988,15 @@ pub enum Effect {
     /// The recent files of every app, placed against the synced folder `root` ([`Event::Recents`]).
     Recents {
         root: Option<String>,
+        ticket: u64,
+    },
+    /// The conflict copies in the synced folder `root`, placed against it ([`Event::Conflicts`]).
+    Conflicts {
+        root: Option<String>,
+        ticket: u64,
+    },
+    /// The local sizes of the synced folder by folder and kind ([`Event::FolderUsage`]).
+    FolderUsage {
         ticket: u64,
     },
     /// End the app (the agent keeps running unless [`Effect::QuitAgent`] came first).
@@ -1097,7 +1173,10 @@ impl Model {
         overview.access = self.access.clone();
         let session = overview.session;
         self.screen = Screen::SignedIn(overview);
-        vec![Effect::Devices, Effect::Account { session }, self.next_usage_request(), Effect::Recent { session }]
+        let conflicts = self.overview_mut().map(Overview::ask_conflicts);
+        let mut effects = vec![Effect::Devices, Effect::Account { session }, self.next_usage_request(), Effect::Recent { session }];
+        effects.extend(conflicts);
+        effects
     }
 
     /// The first start's rail and the step current in it (0 to 2), on the screens of the first start. The code of a
@@ -1178,7 +1257,7 @@ impl Model {
     /// Whether the page shown has a search field now (Ctrl+F goes to it).
     pub fn has_search(&self) -> bool {
         match &self.screen {
-            Screen::Files(files) => files.list.as_ref().is_some_and(|list| !list.is_empty()),
+            Screen::Files(files) => files.view == FilesView::Recent && files.list.as_ref().is_some_and(|list| !list.is_empty()),
             Screen::Trash(trash) => trash.page.is_some(),
             Screen::SignedIn(o) => o.page == OverviewPage::Home && matches!(&o.recent, Recent::Loaded(events) if !events.is_empty()),
             Screen::Security(page) => {
@@ -1656,6 +1735,67 @@ impl Model {
                 }
                 Vec::new()
             }
+            Event::Conflicts { ticket, result } => {
+                match &mut self.screen {
+                    Screen::Files(files) => {
+                        if files.conflicts.ticket == ticket {
+                            files.conflicts.loading = false;
+                            match result {
+                                Ok(list) => {
+                                    files.conflicts.list = Some(list);
+                                    files.conflicts.error = None;
+                                }
+                                Err(e) => files.conflicts.error = Some(message(&e)),
+                            }
+                        }
+                    }
+                    _ => {
+                        // The home page only wants the count; a list it couldn't get is no news worth a line.
+                        if let Some(overview) = self.overview_mut().filter(|o| o.conflicts_ticket == ticket) {
+                            overview.conflicts = result.ok().map(|list| ConflictSummary { count: list.files.len(), truncated: list.truncated });
+                        }
+                    }
+                }
+                Vec::new()
+            }
+            Event::FolderUsage { ticket, result } => {
+                if let Screen::SignedIn(overview) = &mut self.screen
+                    && overview.folders.ticket == ticket
+                {
+                    overview.folders.loading = false;
+                    match result {
+                        Ok(data) => {
+                            overview.folders.data = Some(data);
+                            overview.folders.error = None;
+                        }
+                        Err(e) => overview.folders.error = Some(message(&e)),
+                    }
+                }
+                Vec::new()
+            }
+            Event::ToggleFolders => {
+                let Screen::SignedIn(overview) = &mut self.screen else { return Vec::new() };
+                if overview.page != OverviewPage::Home {
+                    return Vec::new();
+                }
+                overview.folders.open = !overview.folders.open;
+                if overview.folders.open && overview.folders.data.is_none() { overview.ask_folders().into_iter().collect() } else { Vec::new() }
+            }
+            Event::FilesView(view) => {
+                if let Screen::Files(files) = &mut self.screen {
+                    files.view = view;
+                }
+                Vec::new()
+            }
+            Event::OpenConflicts => {
+                let effects = self.update(Event::Tab(Tab::Files));
+                if let Screen::Files(files) = &mut self.screen {
+                    files.view = FilesView::Conflicts;
+                }
+                effects
+            }
+            Event::OpenConflictCopy(path) => self.open_conflict(&path, false),
+            Event::ShowConflictOriginal(path) => self.open_conflict(&path, true),
             Event::OpenRecent { app, path } => self.open_recent(&app, &path),
             Event::ShowRecent { app, path } => self.show_recent(&app, &path),
             Event::FileChecked(result) => match result {
@@ -1931,7 +2071,12 @@ impl Model {
                 }
                 overview.usage_loading = true;
                 overview.usage_error = None;
-                vec![self.next_usage_request()]
+                // The sizes by folder and the conflict copies come from the agent's saved state, so they are read again with the usage.
+                let conflicts = overview.ask_conflicts();
+                let folders = if overview.folders.open { overview.ask_folders() } else { None };
+                let mut effects = vec![self.next_usage_request(), conflicts];
+                effects.extend(folders);
+                effects
             }
             Event::SignOut => self.sign_out(false),
             Event::SignOutHere => self.sign_out(true),
@@ -2109,6 +2254,7 @@ impl Model {
                     effects.push(Effect::Account { session });
                     effects.push(self.next_usage_request());
                     effects.push(Effect::Recent { session });
+                    effects.extend(self.overview_mut().map(Overview::ask_conflicts));
                 }
             }
             if let Some(effect) = new_usage_request {
@@ -2485,7 +2631,49 @@ impl Model {
         files.loading = true;
         files.error = None;
         files.open_error = None;
-        vec![Effect::Recents { root, ticket: files.ticket }]
+        files.conflicts.ticket = crate::admin::fresh();
+        files.conflicts.loading = true;
+        files.conflicts.error = None;
+        files.conflicts.open_error = None;
+        vec![Effect::Recents { root: root.clone(), ticket: files.ticket }, Effect::Conflicts { root, ticket: files.conflicts.ticket }]
+    }
+
+    /// Opens a conflict copy with the OS's default program, or (`original`) the folder of the file it is a copy of, if that is
+    /// in the synced folder here: the path is joined to the folder and checked again ([`crate::files::resolve`]) however the
+    /// list placed it. Otherwise the page says why not.
+    fn open_conflict(&mut self, path: &str, original: bool) -> Vec<Effect> {
+        let root = self.status.as_ref().and_then(|s| s.folder.clone());
+        let Screen::Files(files) = &mut self.screen else { return Vec::new() };
+        let Some(file) = files.conflicts.list.iter().flat_map(|list| list.files.iter()).find(|f| f.copy.path == path) else { return Vec::new() };
+        let (place, target, what) = match (original, &file.copy.original_path, file.original) {
+            (false, _, _) => (file.place, file.copy.path.clone(), "open this file"),
+            (true, Some(original_path), Some(place)) => (place, original_path.clone(), "show the original"),
+            (true, ..) => {
+                files.conflicts.open_error = Some("This copy's name doesn't say which file it is a copy of.".into());
+                return Vec::new();
+            }
+        };
+        files.conflicts.open_error = None;
+        let outcome = match (place, root) {
+            (Place::Here, Some(root)) if original => match target.rsplit_once('/') {
+                // The folder the original is in; the synced folder itself for one at the top.
+                Some((parent, _)) => crate::files::resolve(Path::new(&root), parent).map(|full| full.to_string_lossy().into_owned()),
+                None => Ok(root),
+            }
+            .map(Effect::OpenFolder),
+            (Place::Here, Some(root)) => {
+                crate::files::resolve(Path::new(&root), &target).map(|full| Effect::OpenFile(full.to_string_lossy().into_owned()))
+            }
+            (Place::Here, None) => Err(Place::NotYet),
+            (place, _) => Err(place),
+        };
+        match outcome {
+            Ok(effect) => vec![effect],
+            Err(place) => {
+                files.conflicts.open_error = place.reason().map(|why| format!("Can't {what}: {why}."));
+                Vec::new()
+            }
+        }
     }
 
     /// Opens a recent file with the OS's default program, if it is in the synced folder here: the path is checked again by
@@ -4281,7 +4469,8 @@ pub(crate) mod tests {
                 Effect::Devices,
                 Effect::Account { session: m.overview().unwrap().session },
                 Effect::Usage(1),
-                Effect::Recent { session: m.overview().unwrap().session }
+                Effect::Recent { session: m.overview().unwrap().session },
+                Effect::Conflicts { root: Some("/home/ana/Craft Cloud".into()), ticket: m.overview().unwrap().conflicts_ticket }
             ]
         );
         assert!(m.update(Event::Polled(Ok(on.clone()))).is_empty());
@@ -4330,6 +4519,9 @@ pub(crate) mod tests {
             if tab == Tab::Activity {
                 // The tickets of the pages' answers count up over the whole run.
                 assert!(matches!(got.as_slice(), [Effect::AuditPage { own: true, .. }]) && got.len() == want.len(), "{got:?}");
+            } else if tab == Tab::Files {
+                // The conflict copies' ticket is a fresh number, too.
+                assert!(matches!(got.as_slice(), [Effect::Recents { .. }, Effect::Conflicts { .. }]) && got.len() == want.len(), "{got:?}");
             } else {
                 assert_eq!(got, want, "{tab:?}");
             }
@@ -4381,7 +4573,13 @@ pub(crate) mod tests {
         let ticket = m.trash_ticket;
         let effects = m.update(Event::Tab(Tab::Overview));
         assert!(matches!(m.screen, Screen::SignedIn(_)));
-        assert!(matches!(effects.as_slice(), [Effect::Devices, Effect::Account { .. }, Effect::Usage(_), Effect::Recent { .. }]), "{effects:?}");
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Devices, Effect::Account { .. }, Effect::Usage(_), Effect::Recent { .. }, Effect::Conflicts { .. }]
+            ),
+            "{effects:?}"
+        );
         assert_eq!(m.trash_ticket, ticket + 1);
         // From the security page to trash: the page's secrets go and the trash is asked for.
         m.update(Event::Tab(Tab::Security));
@@ -4622,9 +4820,125 @@ pub(crate) mod tests {
     fn files_loaded() -> Model {
         let mut m = signed_in();
         let effects = m.update(Event::Tab(Tab::Files));
-        let [Effect::Recents { ticket, .. }] = effects.as_slice() else { panic!("{effects:?}") };
+        let [Effect::Recents { ticket, .. }, Effect::Conflicts { .. }] = effects.as_slice() else { panic!("{effects:?}") };
         assert!(m.update(Event::Recents { ticket: *ticket, result: Ok(files_list()) }).is_empty());
         m
+    }
+
+    fn conflict_copy(path: &str, original: Option<&str>) -> craft_cloud_app::ConflictCopy {
+        craft_cloud_app::ConflictCopy {
+            path: path.into(),
+            original_path: original.map(Into::into),
+            device: Some("BEAST".into()),
+            at: Some("2026-10-12 14:03".into()),
+            at_utc: false,
+            at_ms: None,
+            size: 2048,
+            mtime_ms: 1_000,
+        }
+    }
+
+    /// The Files page with its conflict copies answered: the list, placed by `place`.
+    fn conflicts_loaded(copies: Vec<craft_cloud_app::ConflictCopy>, truncated: bool, place: impl Fn(&str) -> Place) -> Model {
+        let mut m = files_loaded();
+        let ticket = files_page(&m).conflicts.ticket;
+        let list = crate::files::conflicts(craft_cloud_app::ConflictsResponse { copies, truncated }, place);
+        assert!(m.update(Event::Conflicts { ticket, result: Ok(list) }).is_empty());
+        m
+    }
+
+    #[test]
+    fn conflict_copies_load_with_the_recents_and_a_stale_answer_is_ignored() {
+        let mut m = files_loaded();
+        assert!(files_page(&m).conflicts.loading && files_page(&m).conflicts.list.is_none());
+        m.update(Event::Conflicts { ticket: 1, result: Ok(Default::default()) });
+        assert!(files_page(&m).conflicts.loading, "another ticket's answer is ignored");
+        let ticket = files_page(&m).conflicts.ticket;
+        m.update(Event::Conflicts { ticket, result: Err(Error::NotRunning("gone".into())) });
+        let state = &files_page(&m).conflicts;
+        assert!(!state.loading && state.list.is_none() && state.error.is_some());
+        assert_eq!(files_page(&m).view, FilesView::Recent);
+        m.update(Event::FilesView(FilesView::Conflicts));
+        assert_eq!(files_page(&m).view, FilesView::Conflicts);
+    }
+
+    #[test]
+    fn a_conflict_copy_opens_only_when_it_is_here_and_the_original_is_shown_by_its_folder() {
+        let place = |path: &str| if path.starts_with("gone/") { Place::NotYet } else { Place::Here };
+        let copies = vec![
+            conflict_copy("Letters/a (conflict).docx", Some("Letters/a.docx")),
+            conflict_copy("top (conflict).txt", Some("top.txt")),
+            conflict_copy("gone/b (conflict).txt", Some("gone/b.txt")),
+            conflict_copy("odd.txt", None),
+            conflict_copy("tool (conflict).exe", Some("tool.exe")),
+        ];
+        let mut m = conflicts_loaded(copies, false, place);
+        let root = std::path::Path::new("/home/ana/Craft Cloud");
+        let open = m.update(Event::OpenConflictCopy("Letters/a (conflict).docx".into()));
+        assert_eq!(open, vec![Effect::OpenFile(root.join("Letters").join("a (conflict).docx").to_string_lossy().into_owned())]);
+        let show = m.update(Event::ShowConflictOriginal("Letters/a (conflict).docx".into()));
+        assert_eq!(show, vec![Effect::OpenFolder(root.join("Letters").to_string_lossy().into_owned())]);
+        let top = m.update(Event::ShowConflictOriginal("top (conflict).txt".into()));
+        assert_eq!(top, vec![Effect::OpenFolder("/home/ana/Craft Cloud".into())], "an original at the top is in the synced folder itself");
+        for (event, why) in [
+            (Event::OpenConflictCopy("gone/b (conflict).txt".into()), "Not on this computer yet"),
+            (Event::ShowConflictOriginal("gone/b (conflict).txt".into()), "Not on this computer yet"),
+            (Event::OpenConflictCopy("tool (conflict).exe".into()), "Programs and scripts"),
+            (Event::ShowConflictOriginal("odd.txt".into()), "doesn't say which file"),
+        ] {
+            assert!(m.update(event.clone()).is_empty(), "{event:?}");
+            assert!(
+                files_page(&m).conflicts.open_error.as_deref().is_some_and(|e| e.contains(why)),
+                "{event:?}: {:?}",
+                files_page(&m).conflicts.open_error
+            );
+        }
+        assert!(m.update(Event::OpenConflictCopy("not/in/the/list.txt".into())).is_empty());
+    }
+
+    #[test]
+    fn the_overview_counts_conflict_copies_and_its_link_opens_them() {
+        let mut m = signed_in();
+        let ticket = m.overview().map(|o| o.conflicts_ticket).unwrap_or(0);
+        let list = crate::files::conflicts(
+            craft_cloud_app::ConflictsResponse { copies: vec![conflict_copy("a (c).txt", Some("a.txt")); 3], truncated: true },
+            |_| Place::Here,
+        );
+        m.update(Event::Conflicts { ticket: ticket + 1, result: Ok(list.clone()) });
+        assert_eq!(m.overview().and_then(|o| o.conflicts), None, "a stale answer is ignored");
+        m.update(Event::Conflicts { ticket, result: Ok(list) });
+        assert_eq!(m.overview().and_then(|o| o.conflicts), Some(ConflictSummary { count: 3, truncated: true }));
+        let effects = m.update(Event::OpenConflicts);
+        assert!(matches!(effects.as_slice(), [Effect::Recents { .. }, Effect::Conflicts { .. }]), "{effects:?}");
+        assert_eq!(files_page(&m).view, FilesView::Conflicts);
+        // Refreshing the overview asks again; an error leaves no tag.
+        let mut m = signed_in();
+        m.overview_mut().unwrap().usage_loading = false;
+        let refresh = m.update(Event::RefreshUsage);
+        let Some(Effect::Conflicts { ticket, .. }) = refresh.iter().find(|e| matches!(e, Effect::Conflicts { .. })) else { panic!("{refresh:?}") };
+        m.update(Event::Conflicts { ticket: *ticket, result: Err(Error::NotRunning("gone".into())) });
+        assert_eq!(m.overview().and_then(|o| o.conflicts), None);
+    }
+
+    #[test]
+    fn the_folder_sizes_load_when_the_section_opens() {
+        let mut m = signed_in();
+        assert!(m.update(Event::ToggleFolders).iter().all(|e| matches!(e, Effect::FolderUsage { .. })));
+        let ticket = m.overview().map(|o| o.folders.ticket).unwrap_or(0);
+        assert!(m.overview().is_some_and(|o| o.folders.open && o.folders.loading));
+        let data = craft_cloud_app::FolderUsageResponse { total_bytes: 5, total_files: 1, ..Default::default() };
+        m.update(Event::FolderUsage { ticket: ticket + 1, result: Ok(data.clone()) });
+        assert!(m.overview().is_some_and(|o| o.folders.data.is_none()), "a stale answer is ignored");
+        m.update(Event::FolderUsage { ticket, result: Ok(data.clone()) });
+        assert_eq!(m.overview().and_then(|o| o.folders.data.clone()), Some(data));
+        // Closed and opened again, it has its numbers and asks for nothing; Refresh asks again while it is open.
+        assert!(m.update(Event::ToggleFolders).is_empty());
+        assert!(m.update(Event::ToggleFolders).is_empty());
+        m.overview_mut().unwrap().usage_loading = false;
+        let refresh = m.update(Event::RefreshUsage);
+        assert!(refresh.iter().any(|e| matches!(e, Effect::FolderUsage { .. })), "{refresh:?}");
+        m.update(Event::FolderUsage { ticket: m.overview().map(|o| o.folders.ticket).unwrap_or(0), result: Err(Error::NotRunning("gone".into())) });
+        assert!(m.overview().is_some_and(|o| o.folders.error.is_some() && !o.folders.loading));
     }
 
     fn files_page(m: &Model) -> &Files {
@@ -4639,7 +4953,10 @@ pub(crate) mod tests {
         let overview = m.update(Event::Found(Ok(status(true))));
         assert!(!overview.iter().any(|e| matches!(e, Effect::Recents { .. })), "{overview:?}");
         let effects = m.update(Event::Tab(Tab::Files));
-        assert_eq!(effects, vec![Effect::Recents { root: Some("/home/ana/Craft Cloud".into()), ticket: 1 }]);
+        assert!(
+            matches!(effects.as_slice(), [Effect::Recents { root: Some(root), ticket: 1 }, Effect::Conflicts { root: Some(same), .. }] if root == same && root == "/home/ana/Craft Cloud"),
+            "{effects:?}"
+        );
         assert!(files_page(&m).loading && files_page(&m).list.is_none());
         assert_eq!(m.tab(), Some(Tab::Files));
     }
@@ -4655,7 +4972,8 @@ pub(crate) mod tests {
         assert!(!files_page(&m).loading);
         assert_eq!(files_page(&m).list.as_ref().map(Vec::len), Some(3));
         // Refresh asks again, with a new ticket.
-        assert_eq!(m.update(Event::LoadFiles), vec![Effect::Recents { root: Some("/home/ana/Craft Cloud".into()), ticket: 2 }]);
+        let again = m.update(Event::LoadFiles);
+        assert!(matches!(again.as_slice(), [Effect::Recents { ticket: 2, .. }, Effect::Conflicts { .. }]), "{again:?}");
         // Leaving the page drops an answer that is still on its way.
         m.update(Event::Tab(Tab::Overview));
         assert!(m.update(Event::Recents { ticket: 2, result: Ok(Vec::new()) }).is_empty());
@@ -5094,7 +5412,7 @@ pub(crate) mod tests {
         let Screen::Files(files) = &mut m.screen else { panic!() };
         files.loading = false;
         let effects = m.update(Event::RefreshPage);
-        assert!(matches!(effects.as_slice(), [Effect::Recents { .. }]), "{effects:?}");
+        assert!(matches!(effects.as_slice(), [Effect::Recents { .. }, Effect::Conflicts { .. }]), "{effects:?}");
         assert!(model().update(Event::RefreshPage).is_empty(), "not signed in");
     }
 

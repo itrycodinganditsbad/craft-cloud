@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use craft_cloud_app::RecentEntry;
+use craft_cloud_app::{ConflictCopy, ConflictsResponse, RecentEntry};
 
 /// The Craft apps whose recent files the page asks for: the lower-case name an app uses for its list, and its name in the
 /// suite.
@@ -336,9 +336,78 @@ pub fn merge(
     }
 }
 
+/// One conflict copy: what the agent lists, whether the copy can be opened on this computer, and whether the file it is a copy
+/// of is here (`None` when the copy's name doesn't say which file that is).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictFile {
+    pub copy: ConflictCopy,
+    pub place: Place,
+    pub original: Option<Place>,
+}
+
+impl ConflictFile {
+    /// The copy's file name for the first line: the last part of its path.
+    pub fn name(&self) -> &str {
+        self.copy.path.rsplit('/').next().unwrap_or(&self.copy.path)
+    }
+
+    /// When the copy was made, as the agent knows it: the minute in its name (marked when it is UTC), or `None` when the name
+    /// has none and the page falls back to the copy's modification time.
+    pub fn made_at(&self) -> Option<String> {
+        let at = self.copy.at.as_deref()?;
+        Some(if self.copy.at_utc { format!("{at} UTC") } else { at.to_owned() })
+    }
+}
+
+/// The conflict copies the agent listed, placed on this computer, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConflictList {
+    pub files: Vec<ConflictFile>,
+    /// There are more copies than the agent lists (it leaves out the oldest).
+    pub truncated: bool,
+}
+
+/// The agent's conflict copies, each placed against the synced folder by `place` (see [`place`]).
+pub fn conflicts(response: ConflictsResponse, place: impl Fn(&str) -> Place) -> ConflictList {
+    let files = response
+        .copies
+        .into_iter()
+        .map(|copy| ConflictFile { place: place(&copy.path), original: copy.original_path.as_deref().map(&place), copy })
+        .collect();
+    ConflictList { files, truncated: response.truncated }
+}
+
+/// What the Files page lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FilesView {
+    /// The shared recent files of every app.
+    #[default]
+    Recent,
+    /// The conflict copies in the synced folder.
+    Conflicts,
+}
+
+/// The conflict copies of the Files page: asked for with the recents, shown by their own segment.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Conflicts {
+    /// The list, once asked.
+    pub list: Option<ConflictList>,
+    pub loading: bool,
+    /// Why the list couldn't be had.
+    pub error: Option<String>,
+    /// Which answer is the current one.
+    pub ticket: u64,
+    /// Why the last Open or Show original didn't work.
+    pub open_error: Option<String>,
+}
+
 /// The Files page.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Files {
+    /// Which list is shown.
+    pub view: FilesView,
+    /// The conflict copies.
+    pub conflicts: Conflicts,
     /// The merged list, once asked.
     pub list: Option<Vec<RecentFile>>,
     pub loading: bool,

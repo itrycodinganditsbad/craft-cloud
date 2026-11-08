@@ -18,11 +18,26 @@ pub fn sync_line(status: &Status) -> (String, Option<String>) {
         RunState::Syncing => ("Syncing…".into(), None),
         RunState::Retrying { message } if !status.online => (format!("Can't reach {server} — trying again"), Some(message.clone())),
         RunState::Retrying { message } => ("Syncing failed — trying again".into(), Some(message.clone())),
+        // The server itself is full: not the account's quota, so the line says whose room has run out and who can fix it.
+        RunState::Paused { reason } if server_is_full(reason) => {
+            ("The server is full. Uploads wait until its admin frees space".into(), Some(reason.clone()))
+        }
         RunState::Paused { reason } => (super::problem_line(reason), Some(reason.clone())),
         RunState::PausedByUser => ("Paused: nothing syncs until you resume".into(), None),
         RunState::Stopping => ("Stopping…".into(), None),
         RunState::SignedOut => ("Not signed in".into(), None),
     }
+}
+
+/// Whether a pause says the server is full (the agent's words for `server_full`, which are not the account's quota).
+fn server_is_full(reason: &str) -> bool {
+    reason.contains("The server is full")
+}
+
+/// "1 conflict copy", "3 conflict copies" ("1000+" when the agent left older ones out).
+fn conflicts_text(count: usize, truncated: bool) -> String {
+    let plus = if truncated { "+" } else { "" };
+    if count == 1 && !truncated { "1 conflict copy".to_owned() } else { format!("{count}{plus} conflict copies") }
 }
 
 /// The width from which the home page's three cells sit side by side.
@@ -58,7 +73,7 @@ fn home(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: i64, autost
     let clicked = super::kit::joined_cells(ui, "overview-cells", &cells, SIDE_BY_SIDE, |ui, i, part| match (i, part) {
         (0, Part::Body) => sync_body(ui, o, now_ms, autostart_problem, events),
         (0, Part::Footer) => sync_footer(ui, o, busy, events),
-        (1, Part::Body) => storage_body(ui, o),
+        (1, Part::Body) => storage_body(ui, o, events),
         (2, Part::Body) => computers_body(ui, o, now_ms, events),
         (2, Part::Footer) => {
             let size = egui::vec2(ui.available_width(), super::kit::CONTROL_H);
@@ -76,6 +91,10 @@ fn home(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: i64, autost
         super::error_line(ui, error);
     }
     ui.add_space(20.0);
+    if o.folders.open {
+        super::folders::section(ui, 2, &o.folders);
+        ui.add_space(20.0);
+    }
     recent_activity(ui, o, now_ms, events);
     ui.add_space(14.0);
 }
@@ -109,6 +128,12 @@ fn sync_body(ui: &mut egui::Ui, o: &Overview, now_ms: i64, autostart_problem: Op
     }
     if let Some(at) = status.last_sync_ms {
         ui.label(RichText::new(format!("Last sync {}", super::ago(now_ms, at))).color(t.muted));
+    }
+    if let Some(conflicts) = o.conflicts.filter(|c| c.count > 0) {
+        let link = super::kit::text_link(ui, &format!("{} ↗", conflicts_text(conflicts.count, conflicts.truncated)), 12.0);
+        if link.on_hover_text("Files that look like the copy kept when two computers changed a file at once").clicked() {
+            events.push(Event::OpenConflicts);
+        }
     }
     if let Some(folder) = &status.folder {
         // The folder's well: its icon and the path on one line, cut off with an ellipsis (the whole path on hover).
@@ -144,7 +169,7 @@ fn sync_footer(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, events: &mut
     });
 }
 
-fn storage_body(ui: &mut egui::Ui, o: &Overview) {
+fn storage_body(ui: &mut egui::Ui, o: &Overview, events: &mut Vec<Event>) {
     if o.usage_loading {
         ui.horizontal(|ui| {
             ui.spinner();
@@ -155,6 +180,10 @@ fn storage_body(ui: &mut egui::Ui, o: &Overview) {
         ui.label(RichText::new("Details").small().weak()).on_hover_text(error);
     } else if let Some(usage) = &o.usage {
         usage_lines(ui, usage);
+    }
+    let text = if o.folders.open { "Hide folders and kinds" } else { "On this computer ↗" };
+    if super::kit::text_link(ui, text, 12.0).clicked() {
+        events.push(Event::ToggleFolders);
     }
 }
 
@@ -218,7 +247,7 @@ fn computers_body(ui: &mut egui::Ui, o: &Overview, now_ms: i64, events: &mut Vec
 fn recent_activity(ui: &mut egui::Ui, o: &Overview, now_ms: i64, events: &mut Vec<Event>) {
     let t = Tokens::get(ui.ctx());
     let names = super::names(ui);
-    super::kit::label_row(ui, &super::kit::numbered(2, "Recent activity"), |ui| {
+    super::kit::label_row(ui, &super::kit::numbered(if o.folders.open { 3 } else { 2 }, "Recent activity"), |ui| {
         if super::kit::text_link(ui, "All activity ↗", 12.0).clicked() {
             events.push(Event::Tab(Tab::Activity));
         }
@@ -397,6 +426,25 @@ mod tests {
         device.platform.clear();
         device.app_version = "  ".into();
         assert_eq!(device_meta(&device), "agent · — · —");
+    }
+
+    #[test]
+    fn a_full_server_is_said_as_the_servers_not_the_accounts() {
+        let full = RunState::Paused { reason: "server: The server is full; the admin needs to free space or raise its capacity".into() };
+        let (line, details) = sync_line(&status(true, full));
+        assert!(line.starts_with("The server is full") && !line.contains("account") && !line.contains("quota"), "{line}");
+        assert!(details.is_some_and(|d| d.contains("raise its capacity")));
+        let quota = RunState::Paused {
+            reason: "server: the account's storage on the server is full or nearly (10 of 10 bytes used); the admin can allow more".into(),
+        };
+        assert!(sync_line(&status(true, quota)).0.contains("account"));
+    }
+
+    #[test]
+    fn conflict_copies_are_counted_in_words() {
+        assert_eq!(conflicts_text(1, false), "1 conflict copy");
+        assert_eq!(conflicts_text(3, false), "3 conflict copies");
+        assert_eq!(conflicts_text(1000, true), "1000+ conflict copies");
     }
 
     #[test]

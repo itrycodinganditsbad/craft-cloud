@@ -378,7 +378,8 @@ fn signed_in_with_usage(result: Result<AccountUsage, Error>) -> Model {
 #[test]
 fn storage_refresh_requests_a_fresh_server_answer() {
     let mut model = signed_in_model(signed_in());
-    assert_eq!(model.update(Event::RefreshUsage), vec![Effect::Usage(2)]);
+    let effects = model.update(Event::RefreshUsage);
+    assert!(matches!(effects.as_slice(), [Effect::Usage(2), Effect::Conflicts { .. }]), "{effects:?}");
     let Screen::SignedIn(overview) = model.screen else { panic!("signed-in screen expected") };
     assert!(overview.usage_loading);
     assert_eq!(overview.usage_error, None);
@@ -392,7 +393,8 @@ fn storage_refresh_click_sends_a_request_and_loading_blocks_duplicates() {
     h.run_steps(2);
     let (model, events) = h.state_mut();
     assert!(events.contains(&Event::RefreshUsage));
-    assert_eq!(model.update(Event::RefreshUsage), vec![Effect::Usage(2)]);
+    let effects = model.update(Event::RefreshUsage);
+    assert!(matches!(effects.as_slice(), [Effect::Usage(2), Effect::Conflicts { .. }]), "{effects:?}");
     assert!(model.update(Event::RefreshUsage).is_empty(), "already loading blocks repeat request");
 }
 
@@ -2585,4 +2587,329 @@ fn snapshot_zoomed_in() {
     h.run_steps(4);
     let image = h.render().unwrap();
     compare(image, "tab-overview-zoom-125-light");
+}
+
+// ---- conflict copies, folder sizes, compression, server health, a full server ----
+
+fn conflict_copy(path: &str, original: Option<&str>, device: &str, at: &str, size: u64) -> craft_cloud_app::ConflictCopy {
+    craft_cloud_app::ConflictCopy {
+        path: path.into(),
+        original_path: original.map(Into::into),
+        device: Some(device.into()),
+        at: Some(at.into()),
+        at_utc: false,
+        at_ms: None,
+        size,
+        mtime_ms: NOW - 3_600_000,
+    }
+}
+
+/// Four copies: one that can be opened, two that are not here yet, one whose name says nothing.
+fn conflict_list(truncated: bool) -> crate::files::ConflictList {
+    let copies = vec![
+        conflict_copy(
+            "Letters/quarterly-letter (conflict BEAST 2026-10-12 14-03).docx",
+            Some("Letters/quarterly-letter.docx"),
+            "BEAST",
+            "2026-10-12 14:03",
+            48_200,
+        ),
+        conflict_copy(
+            "art/2026/poster-draft (conflict studio-mac 2026-10-11 09-41).psd",
+            Some("art/2026/poster-draft.psd"),
+            "studio-mac",
+            "2026-10-11 09:41",
+            73_400_000,
+        ),
+        conflict_copy("notes (conflict BEAST 2026-10-09 18-20).txt", Some("notes.txt"), "BEAST", "2026-10-09 18:20", 1_300),
+        conflict_copy("old (conflict).txt", None, "", "", 12),
+    ];
+    let mut list = crate::files::conflicts(craft_cloud_app::ConflictsResponse { copies, truncated }, |path| {
+        if path.starts_with("Letters/") { Place::Here } else { Place::NotYet }
+    });
+    // The fourth has neither a computer nor a minute in its name.
+    if let Some(last) = list.files.last_mut() {
+        last.copy.device = None;
+        last.copy.at = None;
+    }
+    list
+}
+
+/// The Files page on its conflict copies, once the agent answered (`None`: it could not).
+fn conflicts_model(list: Option<crate::files::ConflictList>) -> Model {
+    let mut model = files_model(Some(files_list()));
+    let ticket = match &model.screen {
+        Screen::Files(files) => files.conflicts.ticket,
+        _ => 0,
+    };
+    let result = list.ok_or_else(|| Error::NotRunning("can't reach it: connection refused".into()));
+    model.update(Event::Conflicts { ticket, result });
+    model.update(Event::FilesView(crate::files::FilesView::Conflicts));
+    model
+}
+
+#[test]
+fn snapshot_conflict_copies() {
+    snapshot(conflicts_model(Some(conflict_list(false))), egui::Theme::Light, "conflicts-list");
+    snapshot(conflicts_model(Some(conflict_list(false))), egui::Theme::Dark, "conflicts-list-dark");
+    snapshot_sized(conflicts_model(Some(conflict_list(true))), egui::Theme::Light, "conflicts-truncated-smallest", crate::ui::MIN_WINDOW_SIZE);
+    snapshot(conflicts_model(Some(crate::files::ConflictList::default())), egui::Theme::Light, "conflicts-empty");
+    snapshot(conflicts_model(None), egui::Theme::Light, "conflicts-failed");
+    let mut problem = conflicts_model(Some(conflict_list(false)));
+    problem.update(Event::OpenConflictCopy("art/2026/poster-draft (conflict studio-mac 2026-10-11 09-41).psd".into()));
+    snapshot(problem, egui::Theme::Light, "conflicts-open-problem");
+}
+
+/// Open and Show original work for the copy that is here; the others are disabled and send nothing. The switch sends its view.
+#[test]
+fn the_conflict_buttons_send_open_and_show_original() {
+    let mut h = harness(conflicts_model(Some(conflict_list(false))), egui::Theme::Light);
+    h.run_steps(2);
+    for button in h.query_all_by_label("Open").chain(h.query_all_by_label("Show original")) {
+        button.click();
+    }
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    let copy = "Letters/quarterly-letter (conflict BEAST 2026-10-12 14-03).docx".to_owned();
+    assert_eq!(events.iter().filter(|e| matches!(e, Event::OpenConflictCopy(_))).collect::<Vec<_>>(), [&Event::OpenConflictCopy(copy.clone())]);
+    assert_eq!(events.iter().filter(|e| matches!(e, Event::ShowConflictOriginal(_))).collect::<Vec<_>>(), [&Event::ShowConflictOriginal(copy)]);
+    h.get_by_label("Recent files").click();
+    h.run_steps(2);
+    assert!(std::mem::take(&mut h.state_mut().1).contains(&Event::FilesView(crate::files::FilesView::Recent)));
+}
+
+fn overview_with_conflicts(count: usize, truncated: bool) -> Model {
+    let mut model = overview_model();
+    let ticket = model.overview().map_or(0, |o| o.conflicts_ticket);
+    let copies = (0..count).map(|n| conflict_copy(&format!("f{n} (conflict).txt"), Some("f.txt"), "BEAST", "2026-10-12 14:03", 1)).collect();
+    let list = crate::files::conflicts(craft_cloud_app::ConflictsResponse { copies, truncated }, |_| Place::Here);
+    model.update(Event::Conflicts { ticket, result: Ok(list) });
+    model
+}
+
+fn folder_sizes() -> craft_cloud_app::FolderUsageResponse {
+    use craft_cloud_app::{FileKind, FolderUsage, KindUsage, OtherFolders};
+    let sizes = [
+        (FileKind::Image, 640_000_000, 412),
+        (FileKind::Video, 410_000_000, 6),
+        (FileKind::Document, 120_000_000, 230),
+        (FileKind::Code, 90_000, 31),
+    ];
+    let kinds = FileKind::ALL
+        .iter()
+        .map(|kind| {
+            let (bytes, files) = sizes.iter().find(|(k, ..)| k == kind).map_or((0, 0), |(_, bytes, files)| (*bytes, *files));
+            KindUsage { kind: *kind, bytes, files }
+        })
+        .collect();
+    craft_cloud_app::FolderUsageResponse {
+        total_bytes: 1_170_090_000,
+        total_files: 679,
+        folders: vec![
+            FolderUsage { name: "Photos".into(), bytes: 640_000_000, files: 412 },
+            FolderUsage { name: "Film".into(), bytes: 410_000_000, files: 6 },
+            FolderUsage { name: "Letters".into(), bytes: 100_000_000, files: 200 },
+            FolderUsage { name: String::new(), bytes: 20_090_000, files: 61 },
+        ],
+        other: Some(OtherFolders { folders: 3, bytes: 10_000_000, files: 12 }),
+        kinds,
+    }
+}
+
+fn overview_with_folders(result: Result<craft_cloud_app::FolderUsageResponse, Error>) -> Model {
+    let mut model = overview_with_conflicts(3, false);
+    model.update(Event::ToggleFolders);
+    let ticket = model.overview().map_or(0, |o| o.folders.ticket);
+    model.update(Event::FolderUsage { ticket, result });
+    model
+}
+
+#[test]
+fn snapshot_overview_insights() {
+    snapshot(overview_with_conflicts(1, false), egui::Theme::Light, "overview-conflicts");
+    // Tall windows: the section sits under the three cells.
+    snapshot_sized(overview_with_folders(Ok(folder_sizes())), egui::Theme::Light, "overview-folders", [960.0, 1150.0]);
+    snapshot_sized(overview_with_folders(Ok(folder_sizes())), egui::Theme::Dark, "overview-folders-dark", [960.0, 1150.0]);
+    snapshot_sized(overview_with_folders(Ok(folder_sizes())), egui::Theme::Light, "overview-folders-smallest", [640.0, 1900.0]);
+    let failed = overview_with_folders(Err(Error::NotRunning("can't reach it: connection refused".into())));
+    snapshot_sized(failed, egui::Theme::Light, "overview-folders-failed", [960.0, 900.0]);
+    let paused = Status {
+        run_state: RunState::Paused { reason: "server: The server is full; the admin needs to free space or raise its capacity".into() },
+        ..signed_in()
+    };
+    snapshot(signed_in_model(paused.clone()), egui::Theme::Light, "overview-server-full");
+    snapshot_sized(signed_in_model(paused), egui::Theme::Dark, "overview-server-full-smallest-dark", crate::ui::MIN_WINDOW_SIZE);
+}
+
+#[test]
+fn the_overview_links_send_their_events() {
+    let mut h = harness(overview_with_conflicts(3, false), egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_label("3 conflict copies ↗").click();
+    h.get_by_label("On this computer ↗").click();
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    assert!(events.contains(&Event::OpenConflicts) && events.contains(&Event::ToggleFolders), "{events:?}");
+    let mut none = harness(overview_with_conflicts(0, false), egui::Theme::Light);
+    none.run_steps(2);
+    assert!(none.query_by_label_contains("conflict cop").is_none());
+}
+
+/// The model on the Storage tab with the compression part set as `f` has it.
+fn compression_tab(agent: &FakeAgent, f: impl FnOnce(&mut craft_cloud_app::AdminCompression)) -> Model {
+    storage_tab(agent, |o| {
+        disk_with_capacity(o);
+        let mut c = craft_cloud_app::AdminCompression {
+            algorithm: "zstd".into(),
+            level: 3,
+            config_level: 3,
+            admin_level: None,
+            min_saving_percent: 5,
+            blobs: 12_400,
+            logical_bytes: 48 * GIB,
+            known_blobs: 11_000,
+            known_logical_bytes: 40 * GIB,
+            known_physical_bytes: 22 * GIB,
+            known_permille: 833,
+            saving_permille: Some(450),
+            estimate: Some(craft_cloud_app::AdminCompressionEstimate {
+                at_ms: NOW - 3 * 86_400_000,
+                sampled_blobs: 400,
+                sampled_bytes: 3 * GIB,
+                current_saving_permille: 440,
+                levels: [(1, 380, 520_000), (3, 450, 310_000), (9, 510, 90_000), (19, 560, 4_000)]
+                    .into_iter()
+                    .map(|(level, saving_permille, kib_per_second)| craft_cloud_app::AdminCompressionLevelEstimate {
+                        level,
+                        saving_permille,
+                        kib_per_second,
+                    })
+                    .collect(),
+            }),
+        };
+        f(&mut c);
+        o.compression = Some(Box::new(c));
+    })
+}
+
+#[test]
+fn snapshot_admin_compression() {
+    let agent = admin_agent();
+    snapshot_sized(compression_tab(&agent, |_| {}), egui::Theme::Light, "admin-compression", [900.0, 1500.0]);
+    snapshot_sized(compression_tab(&agent, |c| c.admin_level = Some(9)), egui::Theme::Dark, "admin-compression-dark", [900.0, 1500.0]);
+    snapshot_sized(compression_tab(&agent, |_| {}), egui::Theme::Light, "admin-compression-smallest", [640.0, 1700.0]);
+    snapshot_sized(
+        compression_tab(&agent, |c| {
+            c.algorithm = "none".into();
+            c.saving_permille = None;
+            c.estimate = None;
+            c.known_permille = 0;
+        }),
+        egui::Theme::Light,
+        "admin-compression-config-none",
+        [900.0, 1300.0],
+    );
+    let mut picked = compression_tab(&agent, |_| {});
+    picked.update(Event::Admin(AdminEvent::PickLevel(9)));
+    picked.update(Event::Admin(AdminEvent::Ask(Action::SetCompression { level: 9 })));
+    snapshot(picked, egui::Theme::Light, "admin-confirm-compression");
+}
+
+/// The level is picked, asked for with the password and sent; the answer replaces the compression part (the server audits the
+/// change). A wrong password is shown and nothing changes.
+#[test]
+fn the_compression_level_is_changed_with_the_password() {
+    let agent = admin_agent();
+    let mut model = compression_tab(&agent, |_| {});
+    assert!(model.update(Event::Admin(AdminEvent::PickLevel(0))).is_empty(), "outside 1 to 19 is not picked");
+    assert!(model.update(Event::Admin(AdminEvent::PickLevel(20))).is_empty());
+    assert_eq!(model.admin_screen().unwrap().level_pick, None);
+    model.update(Event::Admin(AdminEvent::PickLevel(9)));
+    model.update(Event::Admin(AdminEvent::Ask(Action::SetCompression { level: 9 })));
+    // No password: nothing is sent.
+    assert!(model.update(Event::Admin(AdminEvent::Confirm)).is_empty());
+    assert!(agent.compression_levels.lock().unwrap().is_empty());
+    agent.admin_fails.lock().unwrap().push(Error::Refused { code: "wrong_password".into(), message: "wrong".into(), name_taken: None });
+    password_typed(&mut model, "not it");
+    confirm_sent(&mut model, &agent);
+    assert!(model.admin_screen().unwrap().dialog.as_ref().is_some_and(|d| d.error.is_some() && !d.busy));
+    assert!(agent.compression_levels.lock().unwrap().is_empty());
+    password_typed(&mut model, crate::agent::fake::PASSWORD);
+    confirm_sent(&mut model, &agent);
+    assert_eq!(*agent.compression_levels.lock().unwrap(), [9]);
+    assert_eq!(agent.passwords.lock().unwrap().last(), Some(&Some(crate::agent::fake::PASSWORD.to_owned())));
+    let admin = model.admin_screen().unwrap();
+    assert!(admin.dialog.is_none() && admin.level_pick.is_none());
+}
+
+/// The control sends the picked level; with compression off by the config it is not there.
+#[test]
+fn the_compression_control_sends_its_events() {
+    let agent = admin_agent();
+    let mut model = compression_tab(&agent, |_| {});
+    model.update(Event::Admin(AdminEvent::PickLevel(7)));
+    let mut h = harness_sized(model, egui::Theme::Light, [900.0, 1500.0]);
+    h.run_steps(3);
+    h.get_by_label("Change level").click();
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    assert!(events.contains(&Event::Admin(AdminEvent::Ask(Action::SetCompression { level: 7 }))), "{events:?}");
+    let off = compression_tab(&agent, |c| c.algorithm = "none".into());
+    let mut h = harness_sized(off, egui::Theme::Light, [900.0, 1500.0]);
+    h.run_steps(3);
+    assert!(h.query_by_label("Change level").is_none());
+}
+
+fn health_page(f: impl FnOnce(&mut craft_cloud_app::AdminServerInfo)) -> Model {
+    let agent = admin_agent();
+    let mut model = on_admin_pages(&agent, Vec::new());
+    let Screen::Admin(admin) = &mut model.screen else { panic!("{:?}", model.screen) };
+    let mut server = admin.server.clone().unwrap();
+    f(&mut server);
+    admin.server = Some(server);
+    model
+}
+
+#[test]
+fn snapshot_admin_health() {
+    let healthy = |s: &mut craft_cloud_app::AdminServerInfo| {
+        s.started_ms = Some(NOW - (3 * 86_400_000 + 4 * 3_600_000 + 60_000));
+        s.database_ok = Some(true);
+        s.store_ok = Some(true);
+        s.store_check_ms = Some(NOW - 20_000);
+        s.refusing_uploads = Some(false);
+    };
+    snapshot(health_page(healthy), egui::Theme::Light, "admin-health");
+    snapshot(
+        health_page(|s| {
+            healthy(s);
+            s.store_ok = Some(false);
+            s.refusing_uploads = Some(true);
+        }),
+        egui::Theme::Dark,
+        "admin-health-refusing-dark",
+    );
+    snapshot_sized(
+        health_page(|s| {
+            healthy(s);
+            s.refusing_uploads = Some(true);
+        }),
+        egui::Theme::Light,
+        "admin-health-smallest",
+        crate::ui::MIN_WINDOW_SIZE,
+    );
+}
+
+#[test]
+fn an_old_server_shows_no_health_row_and_uptime_is_told_in_words() {
+    for model in [health_page(|_| {}), health_page(|s| s.refusing_uploads = Some(false))] {
+        let mut h = harness(model, egui::Theme::Light);
+        h.run_steps(2);
+        assert!(h.query_by_label("SERVER HEALTH").is_none() && h.query_by_label("Server health").is_none());
+    }
+    assert_eq!(super::admin::uptime(30_000), "under a minute");
+    assert_eq!(super::admin::uptime(5 * 60_000), "5 min");
+    assert_eq!(super::admin::uptime(3 * 3_600_000 + 20 * 60_000), "3 h 20 min");
+    assert_eq!(super::admin::uptime(2 * 86_400_000 + 4 * 3_600_000), "2 d 4 h");
+    assert_eq!(super::admin::uptime(-5), "under a minute");
 }

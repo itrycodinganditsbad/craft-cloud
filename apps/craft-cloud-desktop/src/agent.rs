@@ -12,11 +12,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use craft_cloud_app::{
-    AccountInfo, AccountUsage, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo,
-    AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, AuditPage, AuditQuery, Client, DeviceId, DeviceInfo, Error, ExportOutcome,
-    HistoryResponse, JoinRequest, LoginRequest, NodeId, PairingInfo, PairingStatus, RecentEntry, RecoveryCodes, RestoreResponse, RevokedOthers,
-    SecondFactorLoginRequest, Status, TrashResponse, TrashRestoreResponse, TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, UserQuery,
-    Uuid, VersionId,
+    AccountInfo, AccountUsage, AdminCode, AdminCompression, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset,
+    AdminServerInfo, AdminSetCompressionLevel, AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, AuditPage, AuditQuery, Client,
+    ConflictsResponse, DeviceId, DeviceInfo, Error, ExportOutcome, FolderUsageResponse, HistoryResponse, JoinRequest, LoginRequest, NodeId,
+    PairingInfo, PairingStatus, RecentEntry, RecoveryCodes, RestoreResponse, RevokedOthers, SecondFactorLoginRequest, Status, TrashResponse,
+    TrashRestoreResponse, TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, UserQuery, Uuid, VersionId,
 };
 
 use crate::admin::{Action, AdminEvent, Outcome};
@@ -64,6 +64,8 @@ pub trait Agent: Send + Sync {
     fn admin_audit_export(&self, query: &AuditQuery, out: &mut dyn Write) -> Result<ExportOutcome, Error>;
     fn admin_server(&self) -> Result<AdminServerInfo, Error>;
     fn admin_storage(&self) -> Result<AdminStorageOverview, Error>;
+    /// Sets the level new writes are compressed at (1 to 19); answers with the compression part of the storage overview.
+    fn admin_set_compression_level(&self, request: &AdminSetCompressionLevel) -> Result<AdminCompression, Error>;
     fn admin_users(&self, query: &UserQuery) -> Result<AdminUserList, Error>;
     fn admin_devices(&self, user: Uuid) -> Result<AdminDevices, Error>;
     fn admin_user_usage(&self, user: Uuid) -> Result<AccountUsage, Error>;
@@ -85,6 +87,10 @@ pub trait Agent: Send + Sync {
     /// `app`'s recent files now, newest first: the list the account's computers share. Opens the agent's recents
     /// connection for the one answer and closes it again.
     fn recents(&self, app: &str) -> Result<Vec<RecentEntry>, Error>;
+    /// The conflict copies in the synced folder, as the agent's last finished sync pass left them.
+    fn conflicts(&self) -> Result<ConflictsResponse, Error>;
+    /// The local logical sizes of the synced folder, by top-level folder and by kind.
+    fn folder_usage(&self) -> Result<FolderUsageResponse, Error>;
 }
 
 /// The agent through `craft_cloud_app::Client`. It finds the agent again whenever a call finds it gone (the agent
@@ -219,6 +225,9 @@ impl Agent for ClientAgent {
     fn admin_storage(&self) -> Result<AdminStorageOverview, Error> {
         self.with(Client::admin_storage)
     }
+    fn admin_set_compression_level(&self, request: &AdminSetCompressionLevel) -> Result<AdminCompression, Error> {
+        self.with(|c| c.admin_set_compression_level(request))
+    }
     fn admin_users(&self, query: &UserQuery) -> Result<AdminUserList, Error> {
         self.with(|c| c.admin_users(query))
     }
@@ -272,6 +281,12 @@ impl Agent for ClientAgent {
     }
     fn recents(&self, app: &str) -> Result<Vec<RecentEntry>, Error> {
         self.with(|c| c.recents(app))
+    }
+    fn conflicts(&self) -> Result<ConflictsResponse, Error> {
+        self.with(Client::conflicts)
+    }
+    fn folder_usage(&self) -> Result<FolderUsageResponse, Error> {
+        self.with(Client::folder_usage)
     }
 }
 
@@ -338,6 +353,8 @@ impl Link {
                 Effect::RemoveTrash { ticket, .. } => Event::TrashRemoved { ticket, result: Err(error) },
                 Effect::Recents { ticket, .. } => Event::Recents { ticket, result: Err(error) },
                 Effect::CheckFile { .. } => Event::FileChecked(Err(crate::files::Place::NotYet)),
+                Effect::Conflicts { ticket, .. } => Event::Conflicts { ticket, result: Err(error) },
+                Effect::FolderUsage { ticket, .. } => Event::FolderUsage { ticket, result: Err(error) },
                 _ => Event::Polled(Err(error)),
             };
             let _ = self.tx.send(event);
@@ -393,6 +410,8 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         Effect::CheckFile { root, path } => {
             Event::FileChecked(crate::files::check(Some(std::path::Path::new(&root)), &path).map(|full| full.to_string_lossy().into_owned()))
         }
+        Effect::Conflicts { root, ticket } => Event::Conflicts { ticket, result: conflict_files(agent, root.as_deref().map(std::path::Path::new)) },
+        Effect::FolderUsage { ticket } => Event::FolderUsage { ticket, result: agent.folder_usage() },
         Effect::Logout { local } => Event::SignedOut(agent.logout(local)),
         Effect::Pause => Event::Answered(agent.pause()),
         Effect::Resume => Event::Answered(agent.resume()),
@@ -452,6 +471,12 @@ fn recent_files(agent: &dyn Agent, root: Option<&std::path::Path>) -> Result<Vec
         }
     }
     crate::files::merge(lists, |path| crate::files::place(root, path))
+}
+
+/// The conflict copies the agent lists, each placed against the synced folder `root` ([`crate::files::conflicts`]).
+fn conflict_files(agent: &dyn Agent, root: Option<&std::path::Path>) -> Result<crate::files::ConflictList, Error> {
+    let response = agent.conflicts()?;
+    Ok(crate::files::conflicts(response, |path| crate::files::place(root, path)))
 }
 
 /// Writes the audit export to `path`: first to a file of its own in the same folder, created for this export alone (it must not
@@ -523,6 +548,10 @@ fn change(agent: &dyn Agent, action: &Action, confirm: AdminConfirm) -> Result<O
         }
         Action::ResetTwoFactor { id, .. } => agent.admin_reset_two_factor(*id, &confirm).map(|()| Outcome::Done),
         Action::RevokeDevice { id, device, .. } => agent.admin_revoke_device(*id, *device, &confirm).map(|()| Outcome::Done),
+        Action::SetCompression { level } => {
+            let request = AdminSetCompressionLevel { level: *level, password, totp_code, recovery_code };
+            agent.admin_set_compression_level(&request).map(|compression| Outcome::Compression(Box::new(compression)))
+        }
     }
 }
 
@@ -585,6 +614,10 @@ pub(crate) mod fake {
         /// The recent files of each app (by the name of its list), and the apps whose list is refused.
         pub recent_files: Mutex<Vec<(String, Vec<RecentEntry>)>>,
         pub recents_refused: Mutex<Vec<String>>,
+        /// What `conflicts` and `folder_usage` answer (`None`: nothing found), and what `admin_set_compression_level` was sent.
+        pub conflict_copies: Mutex<Option<Result<craft_cloud_app::ConflictsResponse, Error>>>,
+        pub folder_sizes: Mutex<Option<Result<craft_cloud_app::FolderUsageResponse, Error>>>,
+        pub compression_levels: Mutex<Vec<u8>>,
         /// The computers `devices` lists, and what `rename_device` changes in them.
         pub devices: Mutex<Vec<DeviceInfo>>,
         /// The (computer, name) of each rename asked for, and failures a rename answers instead of succeeding (from the end).
@@ -620,6 +653,9 @@ pub(crate) mod fake {
                 export_fails: Mutex::new(Vec::new()),
                 recent_files: Mutex::new(Vec::new()),
                 recents_refused: Mutex::new(Vec::new()),
+                conflict_copies: Mutex::new(None),
+                folder_sizes: Mutex::new(None),
+                compression_levels: Mutex::new(Vec::new()),
                 devices: Mutex::new(Vec::new()),
                 renames: Mutex::new(Vec::new()),
                 rename_fails: Mutex::new(Vec::new()),
@@ -953,6 +989,22 @@ pub(crate) mod fake {
                 ..AdminServerInfo::default()
             })
         }
+        fn admin_set_compression_level(&self, request: &AdminSetCompressionLevel) -> Result<AdminCompression, Error> {
+            self.admin_change(
+                "admin_set_compression_level",
+                request.password.clone(),
+                (request.totp_code.clone(), request.recovery_code.clone()),
+                || {
+                    self.compression_levels.lock().unwrap().push(request.level);
+                    AdminCompression {
+                        algorithm: "zstd".into(),
+                        level: request.level,
+                        admin_level: Some(request.level),
+                        ..AdminCompression::default()
+                    }
+                },
+            )
+        }
         fn admin_storage(&self) -> Result<AdminStorageOverview, Error> {
             self.admin_call("admin_storage", || {
                 use craft_cloud_app::{AdminManifestIndex, AdminStorageAccount};
@@ -1101,6 +1153,14 @@ pub(crate) mod fake {
                 return Err(refused("quota_exceeded", "this list can't be followed"));
             }
             Ok(self.recent_files.lock().unwrap().iter().find(|(a, _)| a == app).map(|(_, list)| list.clone()).unwrap_or_default())
+        }
+        fn conflicts(&self) -> Result<craft_cloud_app::ConflictsResponse, Error> {
+            self.answer("conflicts", |_| ())?;
+            self.conflict_copies.lock().unwrap().clone().unwrap_or_else(|| Ok(craft_cloud_app::ConflictsResponse::default()))
+        }
+        fn folder_usage(&self) -> Result<craft_cloud_app::FolderUsageResponse, Error> {
+            self.answer("folder_usage", |_| ())?;
+            self.folder_sizes.lock().unwrap().clone().unwrap_or_else(|| Ok(craft_cloud_app::FolderUsageResponse::default()))
         }
     }
 
