@@ -619,7 +619,7 @@ impl Session {
     /// removed by another process (the command line, a second server on the database) stops sending and receiving within
     /// that time instead of at the next ping.
     pub async fn fresh(&mut self) -> Look {
-        if self.verified.elapsed() < self.state.limits.live_recheck {
+        if self.trusted_since().elapsed() < self.state.limits.live_recheck {
             return Look::Confirmed;
         }
         if self.unconfirmed.is_some_and(|u| u.last.elapsed() < self.state.limits.live_retry) {
@@ -630,14 +630,35 @@ impl Session {
 
     /// Whether the connection is past [`Limits::live_recheck`] with a look that failed: it relays and accepts nothing.
     pub fn blocked(&self) -> bool {
-        self.unconfirmed.is_some() && self.verified.elapsed() >= self.state.limits.live_recheck
+        self.unconfirmed.is_some() && self.trusted_since().elapsed() >= self.state.limits.live_recheck
+    }
+
+    /// When the older of the two confirmations, the device's and the access's, was made. Relaying trusts a connection for
+    /// [`Limits::live_recheck`] from here: a frame that read only the access (the device came from the cache) must not
+    /// extend the device's trust.
+    fn trusted_since(&self) -> Instant {
+        self.verified.min(self.device_verified)
+    }
+
+    /// [`Session::check_identity`] for a look that a signal asked for (the space's members changed, a revocation was
+    /// missed). If it cannot be made, the remaining trust is withdrawn at once: the connection relays and accepts nothing
+    /// until a look works, instead of going on for up to [`Limits::live_recheck`] after a change made in this process.
+    pub async fn signalled(&mut self) -> Look {
+        let look = self.check_identity().await;
+        if look == Look::Unconfirmed {
+            let now = Instant::now();
+            let expired = now.checked_sub(self.state.limits.live_recheck).unwrap_or(now);
+            self.verified = self.verified.min(expired);
+            self.device_verified = self.device_verified.min(expired);
+        }
+        look
     }
 
     /// When the next look is due, if the last one failed: the connection loop makes it, so a database that stays
     /// unreadable ends the connection even when nothing else happens on it.
     pub fn retry_at(&self) -> Option<Instant> {
         let unconfirmed = self.unconfirmed?;
-        Some((unconfirmed.last + self.state.limits.live_retry).max(self.verified + self.state.limits.live_recheck))
+        Some((unconfirmed.last + self.state.limits.live_retry).max(self.trusted_since() + self.state.limits.live_recheck))
     }
 
     /// The device, trusted for [`Limits::live_recheck`]: a write from a device signed out by another process is refused
@@ -658,7 +679,7 @@ impl Session {
     pub async fn revoked(&mut self, heard: Result<DeviceId, broadcast::error::RecvError>) -> Option<ServerFrame> {
         match heard {
             Ok(device) => (device == self.device).then(|| ServerFrame::error(codes::UNAUTHORIZED, "this device was signed out", None, None)),
-            Err(broadcast::error::RecvError::Lagged(_)) => match self.check_identity().await {
+            Err(broadcast::error::RecvError::Lagged(_)) => match self.signalled().await {
                 Look::Ended(frame) => Some(frame),
                 Look::Confirmed | Look::Unconfirmed => None,
             },
@@ -1273,7 +1294,7 @@ async fn send_page<S: Sink<Message> + Unpin>(socket: &mut S, session: &mut Sessi
                 }
                 () = async { match debounce.due() { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {
                     debounce.ran(Instant::now());
-                    if let Look::Ended(ended) = session.check_identity().await {
+                    if let Look::Ended(ended) = session.signalled().await {
                         return Sent::Ended(ended);
                     }
                 }
@@ -1386,7 +1407,7 @@ async fn serve(mut socket: WebSocket, mut session: Session, streams: Streams) {
             }
             () = async { match debounce.due() { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {
                 debounce.ran(Instant::now());
-                if let Look::Ended(frame) = session.check_identity().await {
+                if let Look::Ended(frame) = session.signalled().await {
                     access_changed |= is_access_changed(&frame);
                     let _ = send(&mut socket, &frame).await;
                     break;
@@ -2524,5 +2545,87 @@ mod tests {
         assert_eq!(code, ACCESS_CHANGED);
         assert!(session.lost, "the connection ends with it");
         assert_eq!(owner.meta.live_doc(space, doc).await.unwrap().unwrap().base, 0);
+    }
+
+    // ---- the second review: device trust, signals that cannot look, pages while unconfirmed, patience ----
+
+    /// A write that read only the access (the device came from the cache) must not extend the device's trust for relaying:
+    /// a device signed out by another process (no signal) stops receiving `live_recheck` after its last real look at the
+    /// device, not after the write.
+    #[tokio::test]
+    async fn a_write_does_not_extend_the_trust_in_the_device() {
+        let limits = crate::state::Limits { live_recheck: Duration::from_millis(400), ..Default::default() };
+        let (_db, owner, member, space, mut session) = breakable_team(limits).await;
+        let doc = recents_doc(space, &app());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        owner.meta.revoke_device(member.user.id, session.device).await.unwrap();
+        // The device is still trusted (250 ms of 400): the write is taken, and its look at the access renews that trust.
+        let reply = session.handle(ClientFrame::Update { doc, client_seq: 1, bytes: b"x".to_vec() }).await;
+        assert!(matches!(reply.frames.as_slice(), [ServerFrame::Ack { .. }]), "{:?}", reply.frames);
+        // 500 ms after the device's last real look, 250 ms after the write: nothing may be relayed to a signed-out device.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let Look::Ended(ServerFrame::Error { code, .. }) = session.fresh().await else { panic!("the signed-out device is still trusted") };
+        assert_eq!(code, codes::UNAUTHORIZED);
+    }
+
+    /// A signal (the space's members changed) whose look cannot be made withdraws the trust at once: the connection is
+    /// blocked, relays nothing and accepts no presence, though the time of its last look is far from over.
+    #[tokio::test]
+    async fn a_signalled_look_that_fails_withdraws_the_trust_at_once() {
+        let limits = crate::state::Limits { live_recheck: Duration::from_secs(3600), live_retry: Duration::from_millis(40), ..Default::default() };
+        let (mut db, _owner, member, space, mut session) = breakable_team(limits).await;
+        let doc = recents_doc(space, &app());
+        let mut heard = member.state.live.listen_presence(space);
+        db.break_table("space_members").await;
+        assert!(!session.blocked());
+        assert_eq!(session.signalled().await, Look::Unconfirmed);
+        assert!(session.blocked(), "no more trust for an hour");
+        session.handle(ClientFrame::Presence { doc, bytes: vec![1] }).await;
+        assert!(heard.try_recv().is_err(), "no presence accepted");
+        assert_eq!(session.fresh().await, Look::Unconfirmed);
+    }
+
+    /// The patience clause: one failed look is counted per retry time, so a long retry time never reaches three failures,
+    /// but the connection still ends once `live_patience` has passed since the first.
+    #[tokio::test]
+    async fn a_connection_that_cannot_be_confirmed_for_the_patience_time_ends() {
+        let limits = crate::state::Limits {
+            live_recheck: Duration::from_millis(30),
+            live_retry: Duration::from_secs(3600),
+            live_patience: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let (mut db, _owner, _member, _space, mut session) = breakable_team(limits).await;
+        db.break_table("space_members").await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(session.check_identity().await, Look::Unconfirmed, "the first failure");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let Look::Ended(ServerFrame::Error { code, .. }) = session.check_identity().await else { panic!("still waiting") };
+        assert_eq!(code, codes::INTERNAL);
+    }
+
+    /// A page whose connection stops being trusted while it is sent (the access cannot be read) is not sent on: it ends
+    /// with `internal` after the frames the trust covered, far from the page's end.
+    #[tokio::test]
+    async fn a_page_is_not_sent_on_while_the_access_cannot_be_confirmed() {
+        // A retry time that never comes: only the first failed look can end the page, not a count of failures.
+        let limits = crate::state::Limits { live_recheck: Duration::from_millis(60), live_retry: Duration::from_secs(3600), ..Default::default() };
+        let (mut db, _owner, member, space, mut session) = breakable_team(limits).await;
+        let doc = recents_doc(space, &app());
+        let (mut members, mut revocations, mut debounce, mut stopping) = (
+            Some(member.state.notifier.subscribe_members(space)),
+            member.state.live.revocations(),
+            Debounce::default(),
+            member.state.notifier.shutdown_signal(),
+        );
+        db.break_table("space_members").await;
+        let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut sink = slow_sink(Duration::from_millis(20), taken.clone());
+        let mut interrupts = Interrupts { members: &mut members, revocations: &mut revocations, debounce: &mut debounce, stopping: &mut stopping };
+        let sent = tokio::time::timeout(Duration::from_secs(20), send_page(&mut sink, &mut session, &page_of(doc, 100), &mut interrupts))
+            .await
+            .expect("the page was never given up");
+        assert!(matches!(&sent, Sent::Ended(ServerFrame::Error { code, .. }) if code == codes::INTERNAL), "{sent:?}");
+        assert!(taken.load(Ordering::Relaxed) < 50, "{} frames", taken.load(Ordering::Relaxed));
     }
 }
