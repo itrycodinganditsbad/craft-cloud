@@ -324,6 +324,7 @@ impl From<AgentError> for LocalError {
             AgentError::NotSignedIn => (StatusCode::CONFLICT, codes::NOT_SIGNED_IN),
             AgentError::Offline(_) | AgentError::LogoutOffline(_) => (StatusCode::SERVICE_UNAVAILABLE, codes::OFFLINE),
             AgentError::Usage(m) if m.starts_with("already signed in") => (StatusCode::CONFLICT, codes::ALREADY_SIGNED_IN),
+            AgentError::Usage(m) if m == crate::spaces::CHANGING => (StatusCode::CONFLICT, codes::CONFLICT),
             AgentError::Usage(_) => (StatusCode::BAD_REQUEST, api_codes::INVALID),
             other if other.exit() == Exit::NeedsYou => (StatusCode::CONFLICT, codes::NEEDS_YOU),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL),
@@ -1045,6 +1046,7 @@ mod tests {
         assert_eq!(code(AgentError::LogoutOffline("x".into())), codes::OFFLINE);
         assert_eq!(code(AgentError::Usage("already signed in as ana".into())), codes::ALREADY_SIGNED_IN);
         assert_eq!(code(AgentError::Usage("not a URL".into())), api_codes::INVALID);
+        assert_eq!(code(AgentError::Usage(crate::spaces::CHANGING.into())), codes::CONFLICT);
         assert_eq!(code(AgentError::Revoked), codes::NEEDS_YOU);
         assert_eq!(code(AgentError::InvalidCode), codes::INVALID_CODE);
         assert_eq!(code(AgentError::PasswordRequired), codes::PASSWORD_REQUIRED);

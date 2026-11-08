@@ -7,6 +7,9 @@
 //! instead of resuming, held deletions of a team space are approved from the command line and the local API, a second stop
 //! ends at once with a silent server, an archived space stays readable, pausing rests the long-polls, and one `404` for the
 //! list does not end team spaces.
+//! Second review round: turning a space off forgets its state, access lost and regained while the agent is stopped merges, a
+//! space being turned off does not hold the spaces task up (a second stop, other calls, a queued pass), and a failed discovery
+//! is retried for those waiting for the list.
 //! Every wait is for a condition, with a timeout; the loops get short timings so the tests stay quick.
 
 use std::net::SocketAddr;
@@ -543,7 +546,7 @@ struct Front {
     seen: Mutex<Vec<(String, bool)>>,
     /// Answers `/api/v1/spaces` with `404` this many more times, then goes on as usual (a proxy during a restart).
     spaces_404: Mutex<u32>,
-    /// Never answers while set: the connection stays open and silent.
+    /// Does not answer while set: the connection stays open and silent, and the request goes on once it is cleared.
     stall: AtomicBool,
     /// Waits this long (milliseconds) before forwarding each request.
     delay_ms: AtomicU64,
@@ -574,8 +577,9 @@ async fn forward(State((upstream, front, client)): State<FrontState>, request: R
     if named && parts.uri.query().is_some_and(|q| q.contains("wait=")) {
         front.polls.fetch_add(1, Ordering::SeqCst);
     }
-    if front.stall.load(Ordering::SeqCst) {
-        std::future::pending::<()>().await;
+    // A request that arrives while `stall` is set (or is held by it) waits until it is cleared.
+    while front.stall.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let delay = front.delay_ms.load(Ordering::SeqCst);
     if delay > 0 {
@@ -811,10 +815,11 @@ async fn turning_a_space_off_waits_for_its_pass_and_the_old_state_is_not_written
     })
     .await;
     t.ben.sync_off(space).await;
-    let after_off = std::fs::read(t.ben.data.path().join("spaces").join(space.to_string()).join("state.json")).ok();
+    // Off forgets the state, and the call is answered only when the running pass has ended: the pass cannot write the state
+    // after it (a call answered early would leave a state behind, or see one written afterwards).
+    assert!(t.ben.space_state(space).is_none(), "the state is gone when the call is answered");
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    let later = std::fs::read(t.ben.data.path().join("spaces").join(space.to_string()).join("state.json")).ok();
-    assert_eq!(after_off, later, "no pass of the old folder writes its state after the space is off");
+    assert!(t.ben.space_state(space).is_none(), "no pass of the old folder writes its state after the space is off");
 
     // On in another folder: the state it starts from is not the old folder's.
     front.delay_ms.store(0, Ordering::SeqCst);
@@ -1059,4 +1064,229 @@ async fn one_404_for_the_list_does_not_end_the_team_spaces() {
     }
     write(&ana_folder, "two.txt", "2");
     eventually("the sync goes on", || has_file(ben_folder.clone(), "two.txt", "2")).await;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The second review round of P1-5
+
+/// N1: turning a space off forgets its state, so turning it on again in the same folder is a first sync: what was deleted
+/// here, or on the server, while it was off is not deleted on the other side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_a_space_off_forgets_its_state_so_turning_it_on_again_deletes_nothing() {
+    let t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    let (ana_folder, ben_folder) = both_syncing(&t).await;
+    for i in 0..6 {
+        write(&ana_folder, &format!("f{i}.txt"), &format!("content {i}"));
+    }
+    eventually("ben has the files", || async { names(&ben_folder).len() == 6 }).await;
+
+    t.ben.sync_off(space).await;
+    assert!(t.ben.space_state(space).is_none(), "turning the sync off forgets the saved state");
+    // While it is off, ben deletes one file here as from a local copy, and ana deletes another one on the server.
+    std::fs::remove_file(ben_folder.join("f0.txt")).unwrap();
+    std::fs::remove_file(ana_folder.join("f1.txt")).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(read(&ben_folder, "f1.txt").as_deref(), Some("content 1"), "ana's delete does not reach a space that is off");
+
+    // On again in the same folder: nothing is deleted on either side. What each side deleted comes back from the other.
+    let again = t.ben.sync_on(space).await;
+    assert_eq!(again, ben_folder);
+    eventually("ben's deleted file comes back from the server", || has_file(ben_folder.clone(), "f0.txt", "content 0")).await;
+    eventually("ana's deleted file is put back on the server", || has_file(ana_folder.clone(), "f1.txt", "content 1")).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(names(&ana_folder).len(), 6, "nothing was deleted on the server: {:?}", names(&ana_folder));
+    assert_eq!(names(&ben_folder).len(), 6, "nor here: {:?}", names(&ben_folder));
+}
+
+/// H4, the agent was down for the whole loss of access: the member is removed and invited again while it is stopped, a file
+/// is deleted on each side, and the agent is started. The server's stamp of the membership differs from the one the saved state
+/// was made under, so the state is not used: nothing is deleted on either side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn access_lost_and_regained_while_the_agent_is_stopped_merges_and_deletes_nothing() {
+    let mut t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    let (ana_folder, ben_folder) = both_syncing(&t).await;
+    for i in 0..4 {
+        write(&ana_folder, &format!("f{i}.txt"), &format!("content {i}"));
+    }
+    eventually("ben has the files", || async { names(&ben_folder).len() == 4 }).await;
+    let (exit, out) = t.ben.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+
+    // Ben is removed and invited again while his agent is not running. (The stamps given here differ from the one the server
+    // gave when he first accepted, which is the real time.)
+    t.world.meta.remove_member(&SpaceActor::Cli, space, t.world.ben.id, 1).await.unwrap();
+    t.world.invite_ben(space, SpaceRole::Editor).await;
+    t.world.meta.accept_invitation(t.world.ben.id, None, space, 2).await.unwrap();
+    std::fs::remove_file(ben_folder.join("f0.txt")).unwrap();
+    std::fs::remove_file(ana_folder.join("f1.txt")).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    t.ben.run();
+    eventually("the file ben deleted comes back from the server", || has_file(ben_folder.clone(), "f0.txt", "content 0")).await;
+    eventually("the file ana deleted is put back on the server", || has_file(ana_folder.clone(), "f1.txt", "content 1")).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(names(&ana_folder).len(), 4, "nothing was deleted on the server: {:?}", names(&ana_folder));
+    assert_eq!(names(&ben_folder).len(), 4, "nor here: {:?}", names(&ben_folder));
+}
+
+/// N2: turning a space off while its pass is queued behind a slow pass of the personal space does not hold the spaces task up:
+/// a second stop ends the loop at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_stop_does_not_wait_for_a_space_that_is_being_turned_off() {
+    let (mut t, front, _task) = team_via_front(SpaceRole::Editor, Front::default()).await;
+    let space = t.space;
+    let (_, ben_folder) = both_syncing(&t).await;
+    write(&ben_folder, "first.txt", "first");
+    eventually("the first file went up", || async { t.ben.status().await.spaces.iter().any(|s| s.last_sync_ms.is_some()) }).await;
+
+    // The personal pass hangs, and the team space's pass waits for its turn behind it.
+    front.stall.store(true, Ordering::SeqCst);
+    write(&t.ben.personal, "stuck-too.txt", "never answered");
+    eventually("the personal pass is running", || async { t.ben.status().await.run_state == craft_cloud_app::RunState::Syncing }).await;
+    write(&ben_folder, "stuck.txt", "never answered");
+    eventually("the team space's pass is queued", || async {
+        t.ben.status().await.spaces.iter().any(|s| s.space == space && s.run_state == SpaceRun::Syncing)
+    })
+    .await;
+    // Turning the space off waits for that pass to let go of it: the call stays open.
+    let dir = t.ben.data.path().to_owned();
+    let off = tokio::task::spawn_blocking(move || {
+        Client::connect_in(&dir).and_then(|c| c.set_space_sync(space, &SpaceSyncRequest { on: false, folder: None, adopt: false }))
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!off.is_finished(), "the change waits for the space's session to close");
+
+    let mut running = t.ben.running.take().unwrap();
+    let _ = running.stop.send(());
+    let _ = running.stop.send(());
+    let thread = running.thread.take().unwrap();
+    let started = Instant::now();
+    let ended = tokio::time::timeout(Duration::from_secs(8), tokio::task::spawn_blocking(move || thread.join().unwrap())).await;
+    front.stall.store(false, Ordering::SeqCst);
+    let (exit, out) = ended.expect("the loop ends within seconds of the second stop, though a space is being turned off").unwrap();
+    assert!(started.elapsed() < Duration::from_secs(8));
+    assert_eq!(exit.unwrap(), Exit::Failed, "{out}");
+    drop(off);
+}
+
+/// N2: a pass of a space that was queued before the space was turned off does not run afterwards, and turning the space off
+/// does not hold up the answer to anything else. Here the pass waits behind a slow personal pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_pass_of_a_space_that_was_turned_off_does_not_run() {
+    let (t, front, _task) = team_via_front(SpaceRole::Editor, Front::default()).await;
+    let space = t.space;
+    let (ana_folder, ben_folder) = both_syncing(&t).await;
+    write(&ben_folder, "first.txt", "first");
+    eventually("the first file reached ana", || has_file(ana_folder.clone(), "first.txt", "first")).await;
+
+    // Nothing is running (a pass after the first file looks at it again after the stability window), so the personal pass
+    // takes the first turn.
+    eventually("nothing runs", || async {
+        let status = t.ben.status().await;
+        status.run_state == craft_cloud_app::RunState::Idle && status.spaces.iter().all(|s| s.run_state == SpaceRun::Idle)
+    })
+    .await;
+    // The personal pass hangs, and the team space's pass waits behind it.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    eventually("still nothing runs", || async { t.ben.status().await.spaces.iter().all(|s| s.run_state == SpaceRun::Idle) }).await;
+    front.stall.store(true, Ordering::SeqCst);
+    write(&t.ben.personal, "slow.txt", "slow");
+    // The personal pass runs and no pass of the team space does: the personal pass holds the turn.
+    eventually("the personal pass is running and the team space's is not", || async {
+        let status = t.ben.status().await;
+        status.run_state == craft_cloud_app::RunState::Syncing && status.spaces.iter().all(|s| s.run_state == SpaceRun::Idle)
+    })
+    .await;
+    write(&ben_folder, "queued.txt", "written before the space was turned off");
+    eventually("the team space's pass is queued", || async {
+        t.ben.status().await.spaces.iter().any(|s| s.space == space && s.run_state == SpaceRun::Syncing)
+    })
+    .await;
+    // The change waits for the pass to let go; other calls are answered meanwhile.
+    let dir = t.ben.data.path().to_owned();
+    let off = tokio::task::spawn_blocking(move || {
+        Client::connect_in(&dir).and_then(|c| c.set_space_sync(space, &SpaceSyncRequest { on: false, folder: None, adopt: false }))
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!off.is_finished(), "the change waits for the space's session to close");
+    let started = Instant::now();
+    assert!(t.ben.spaces().await.is_some());
+    assert!(started.elapsed() < Duration::from_secs(5), "the local API is not held up by a space that is being turned off");
+    front.stall.store(false, Ordering::SeqCst);
+    let info = off.await.unwrap().unwrap();
+    assert_eq!(info.sync, SpaceSync::Off, "{info:?}");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(read(&ana_folder, "queued.txt"), None, "the pass queued before the space was turned off did not run");
+    assert_eq!(read(&ben_folder, "queued.txt").as_deref(), Some("written before the space was turned off"));
+}
+
+/// M1, the pass thread: a second stop ends the loop while a team pass is queued behind a slow pass; the queued pass never
+/// starts, even when the slow pass ends later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_team_pass_queued_when_the_second_stop_comes_never_starts() {
+    let (mut t, front, _task) = team_via_front(SpaceRole::Editor, Front::default()).await;
+    let space = t.space;
+    let (ana_folder, ben_folder) = both_syncing(&t).await;
+    write(&ben_folder, "first.txt", "first");
+    eventually("the first file reached ana", || has_file(ana_folder.clone(), "first.txt", "first")).await;
+
+    // Nothing is running (a pass after the first file looks at it again after the stability window), so the personal pass
+    // takes the first turn.
+    eventually("nothing runs", || async {
+        let status = t.ben.status().await;
+        status.run_state == craft_cloud_app::RunState::Idle && status.spaces.iter().all(|s| s.run_state == SpaceRun::Idle)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    eventually("still nothing runs", || async { t.ben.status().await.spaces.iter().all(|s| s.run_state == SpaceRun::Idle) }).await;
+    front.stall.store(true, Ordering::SeqCst);
+    write(&t.ben.personal, "slow.txt", "slow");
+    // The personal pass runs and no pass of the team space does: the personal pass holds the turn.
+    eventually("the personal pass is running and the team space's is not", || async {
+        let status = t.ben.status().await;
+        status.run_state == craft_cloud_app::RunState::Syncing && status.spaces.iter().all(|s| s.run_state == SpaceRun::Idle)
+    })
+    .await;
+    write(&ben_folder, "queued.txt", "never to be uploaded");
+    eventually("the team space's pass is queued", || async {
+        t.ben.status().await.spaces.iter().any(|s| s.space == space && s.run_state == SpaceRun::Syncing)
+    })
+    .await;
+    let mut running = t.ben.running.take().unwrap();
+    let _ = running.stop.send(());
+    let _ = running.stop.send(());
+    let thread = running.thread.take().unwrap();
+    let (exit, out) = tokio::time::timeout(Duration::from_secs(8), tokio::task::spawn_blocking(move || thread.join().unwrap()))
+        .await
+        .expect("the loop ends within seconds of the second stop")
+        .unwrap();
+    assert_eq!(exit.unwrap(), Exit::Failed, "{out}");
+    // The slow pass ends by itself later; the queued pass must not take its turn.
+    front.stall.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_eq!(read(&ana_folder, "queued.txt"), None, "the queued pass did not start after the second stop");
+}
+
+/// A discovery that fails while someone waits for the list is tried again within seconds, and they wait for that: an
+/// invitation accepted here and the sync turned on at once finds the space in the list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accepting_and_turning_the_sync_on_at_once_works_after_one_failed_discovery() {
+    // Ben's agent looks at the list only when asked (the periodic look is far off), so the one failure is the look the accept
+    // asks for.
+    let world = world().await;
+    let (url, front, _task) = front(&world.url, Front::default()).await;
+    let mut ben = Person::signed_in(&url, "ben").await;
+    let space = world.space("Studio").await;
+    world.invite_ben(space, SpaceRole::Editor).await;
+    ben.run_with(RunOptions { poll_wait: Duration::from_secs(30), ..quick() });
+    let t = Team { ana: Person::signed_in(&world.url, "ana").await, ben, world, space };
+    eventually("the invitation is listed", || async { t.ben.space(space).await.is_some_and(|s| s.state == "invited") }).await;
+    *front.spaces_404.lock().unwrap() = 1;
+    t.ben.api(move |c| c.accept_space(space)).await.unwrap();
+    // No wait for the list in between: the agent has found the space, or the answer to the accept waited until it did.
+    let info = t.ben.api(move |c| c.set_space_sync(space, &SpaceSyncRequest { on: true, folder: None, adopt: false })).await;
+    assert!(info.is_ok_and(|i| i.sync == SpaceSync::On), "the sync could be turned on right after the accept");
+    assert_eq!(*front.spaces_404.lock().unwrap(), 0, "the failed discovery happened");
 }

@@ -204,8 +204,20 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
   data folder; the personal space's files stay where they were. The state records the space and the canonical folder it
   was made for, and is used for that pair only: for any other folder (the space moved, or turned off and on elsewhere,
   and back) the space starts afresh as a first sync, merging the folder with the space and deleting nothing on either
-  side. Moving a space that syncs, or turning it off, ends its session and waits for its running pass before anything
-  else changes. Signing out removes the team spaces' states too; their folders, markers and files stay.
+  side. The same goes when the server's stamp of the account's membership (`joined_ms` in `GET /spaces`, new each time
+  someone is removed and invited again) differs from the one the state was made under, which also covers an agent that was
+  not running while access was lost and regained; a server that gives no stamp is not compared. Turning a space off
+  forgets its state, so turning it on again, in the same folder or another, is a first sync too. Moving a space that
+  syncs, or turning it off, ends its session and waits for its running pass before anything else changes; the agent goes
+  on meanwhile (other spaces, the local API, stopping), and the call is answered when the session is closed (after 50
+  seconds at most). A pass that was queued behind another pass when its space was closed (or the agent began to stop) is
+  not run. Another change of the same space meanwhile is refused with `409` ("this space is being changed, try again in a
+  moment"). Signing out removes the team spaces' states too; their folders, markers and files stay.
+- **A first sync merges, and says what that means.** Without a saved state, nothing is known to have been deleted, so
+  nothing is deleted on either side. A file that teammates deleted on the server meanwhile, and that is still in the
+  folder, is uploaded again. A file that exists on both sides with different content is not overwritten: the local one is
+  moved aside as a conflict copy and the server's version takes its path (the local file no longer sits at its path). A
+  file only here goes up, a file only on the server comes down, and equal files are adopted.
 - **Off by default.** An accepted space does not sync until `POST /v1/spaces/{id}/sync` with `{"on": true}` (optionally
   `folder`, an absolute path that lies outside every synced folder and the data folder, and `adopt` for a folder that already
   has files: what differs from the space's becomes conflict copies, nothing is deleted).
@@ -216,13 +228,15 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
   A missing or different one stops that space with "the server is too old for team spaces": a server that ignored the header
   would otherwise answer about the personal space.
 - **Read-only.** A role of viewer, or an archived space, puts the space's engine in read-only mode (see the sync design,
-  "Read-only spaces"); `read_only` in the space's entry says so.
+  "Read-only spaces"); `read_only` in the space's entry says so. The server lists an archived space with the member's
+  stored role (an editor stays `editor`) although their access is capped at viewer; read `archived`, not `role` alone, to
+  know whether the member may write.
 - **Losing access.** A space the server no longer lists, or answers `404`, stops syncing and shows
   `run_state: {"kind": "no_access"}` with "You no longer have access to <name>. Your local copy is kept and no longer
   syncs." Nothing in its folder is touched or deleted. Its saved sync state is dropped, so if the account is added again the
-  folder is merged with the space afresh (as a first sync): no local file is deleted or replaced, a file deleted here
-  meanwhile is not deleted on the server, one deleted on the server meanwhile is not deleted here, and a file that differs
-  on both sides is kept twice (one as a conflict copy). A member of an archived space has not lost access: the space stays
+  folder is merged with the space afresh (a first sync, above): no local file is deleted, a file deleted here meanwhile is
+  not deleted on the server, one deleted on the server meanwhile is not deleted here (and goes up again), and a file that
+  differs on both sides is kept twice (one as a conflict copy). A member of an archived space has not lost access: the space stays
   listed (`archived: true`) and syncs read-only.
 
 | Local call | Answer |
