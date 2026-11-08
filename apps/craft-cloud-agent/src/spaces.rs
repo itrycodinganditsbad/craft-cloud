@@ -1263,7 +1263,7 @@ impl Manager {
             Phase::Idle => SpaceRun::Idle,
             Phase::Syncing => SpaceRun::Syncing,
             Phase::Retrying { message, .. } => SpaceRun::Retrying { message },
-            Phase::Paused { reason, .. } => SpaceRun::Paused { reason },
+            Phase::Paused { reason, reason_code, .. } => SpaceRun::Paused { reason, reason_code },
             Phase::Stopping => SpaceRun::Idle,
         })
     }

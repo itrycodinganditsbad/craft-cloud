@@ -1408,6 +1408,12 @@ async fn the_members_usage_name_and_leaving_of_a_space_and_the_admin_calls_are_p
     eventually("ben no longer syncs the space", || async { t.ben.space(space).await.is_none_or(|s| s.sync != SpaceSync::On) }).await;
     let now = t.ana.api(move |c| c.space_members(space)).await.unwrap().members;
     assert!(now.iter().all(|m| m.username != "ben"), "{now:?}");
+    let state_before = t.ana.space_state(space);
+    assert!(state_before.is_some(), "ana's space has a saved state");
     let last = t.ana.api(move |c| c.leave_space(space)).await.unwrap_err();
     assert!(matches!(&last, craft_cloud_app::Error::Refused { code, .. } if code == "last_owner"), "{last:?}");
+    // The server refused first, so nothing changed here: still syncing, its state untouched.
+    let info = t.ana.space(space).await.unwrap();
+    assert_eq!(info.sync, SpaceSync::On, "{info:?}");
+    assert!(t.ana.space_state(space).is_some(), "the saved state was not forgotten");
 }

@@ -162,6 +162,7 @@ fn reason_code_for(e: &AgentError) -> Option<String> {
     match e {
         AgentError::Server(craft_cloud_sync::TransportError::ServerFull) => Some(craft_cloud_proto::api::codes::SERVER_FULL.to_owned()),
         AgentError::Server(craft_cloud_sync::TransportError::QuotaExceeded { .. }) => Some(craft_cloud_proto::api::codes::QUOTA_EXCEEDED.to_owned()),
+        AgentError::Server(craft_cloud_sync::TransportError::ReadOnly) => Some(craft_cloud_proto::api::codes::READ_ONLY.to_owned()),
         _ => None,
     }
 }

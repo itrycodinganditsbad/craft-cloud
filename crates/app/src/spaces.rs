@@ -97,8 +97,9 @@ impl Client {
         self.answer("DELETE", &format!("{}/{user}", space_path(id, "members")), None, http::SLOW_TIMEOUT).map(|_| ()).map_err(too_old)
     }
 
-    /// Leaves a team space: this account is no longer a member (any role may; the last owner may not). Syncing of the space
-    /// on this computer ends and the folder stays, as a plain folder of files.
+    /// Leaves a team space: this account is no longer a member (any role may; the last owner may not). The server goes first: a
+    /// refusal changes nothing on this computer. After it the space is lost to the agent: the sync ends and the folder stays, with
+    /// its files, as a plain folder.
     pub fn leave_space(&self, id: SpaceId) -> Result<(), Error> {
         self.answer("POST", &space_path(id, "leave"), None, http::SLOW_TIMEOUT).map(|_| ()).map_err(too_old)
     }

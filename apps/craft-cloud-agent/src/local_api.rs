@@ -947,7 +947,7 @@ fn personal_space(control: &Control, account: &Account) -> SpaceInfo {
         sync: SpaceSync::On,
         run_state: Some(match status.run_state {
             RunState::Retrying { message } => SpaceRun::Retrying { message },
-            RunState::Paused { reason, .. } => SpaceRun::Paused { reason },
+            RunState::Paused { reason, reason_code } => SpaceRun::Paused { reason, reason_code },
             RunState::PausedByUser => SpaceRun::PausedByUser,
             RunState::Syncing => SpaceRun::Syncing,
             RunState::SignedOut | RunState::Idle | RunState::Stopping => SpaceRun::Idle,
@@ -1029,12 +1029,47 @@ async fn approve_space_deletes(
         let setting = account.spaces.iter().find(|s| s.space == id && s.sync);
         let Some(setting) = setting else { return Ok(None) };
         let mut out = Vec::new();
-        let (_, _, approved) = crate::cli::approve_team(&data, setting, &approve, &mut out)?;
-        Ok::<_, AgentError>(Some(ApproveDeletesAnswer { approved, message: String::from_utf8_lossy(&out).trim().to_owned() }))
+        let (_, summary, approved) = crate::cli::approve_team(&data, setting, &approve, &mut out)?;
+        Ok::<_, AgentError>(Some(held_answer(&summary, approved, String::from_utf8_lossy(&out).trim())))
     })
     .await
     .map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))??;
     answer.map(Json).ok_or_else(|| LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such team space syncing on this computer"))
+}
+
+/// The answer to an approve-deletes call from what the pass last found: the waiting set with its paths (the first
+/// [`MAX_HELD_ENTRIES`], at most [`MAX_HELD_BYTES`] of paths), the deletions held behind a link, and the command line's words.
+pub(crate) fn held_answer(summary: &crate::account::PassSummary, approved: bool, words: &str) -> ApproveDeletesAnswer {
+    use craft_cloud_proto::local::{HeldEntry, HeldLink, MAX_HELD_BYTES, MAX_HELD_ENTRIES};
+    let all = summary
+        .pending_deletes
+        .iter()
+        .map(|p| (p, "server"))
+        .chain(summary.pending_local_deletes.iter().map(|p| (p, "here")));
+    let (mut entries, mut bytes, mut total) = (Vec::new(), 0usize, 0u64);
+    for (path, side) in all {
+        total += 1;
+        if entries.len() < MAX_HELD_ENTRIES && bytes.saturating_add(path.len()) <= MAX_HELD_BYTES {
+            bytes += path.len();
+            entries.push(HeldEntry { path: path.clone(), side: side.to_owned() });
+        }
+    }
+    let truncated = (entries.len() as u64) < total;
+    let held_total = summary.held_deletes.len() as u64;
+    let held: Vec<HeldLink> =
+        summary.held_deletes.iter().take(100).map(|(path, links)| HeldLink { path: path.clone(), links: links.iter().take(5).cloned().collect() }).collect();
+    // The words are for the command line; an app reads the fields above.
+    let mut message = words.to_owned();
+    if message.len() > 16 * 1024 {
+        let mut end = 16 * 1024;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        message.push_str("
+…");
+    }
+    ApproveDeletesAnswer { approved, message, set: summary.pending_set(), total, truncated, entries, held_set: summary.held_set(), held_total, held }
 }
 
 /// Registers this agent to start at login, or removes the entry; the status after says which.
@@ -1074,6 +1109,37 @@ async fn quit(State(state): State<Api>) -> Result<Json<Status>, LocalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The answer to a look at held deletions lists up to the cap, counts them all, names the set and says it was cut; the
+    /// words are cut too, and a short list is whole.
+    #[test]
+    fn a_held_answer_is_capped_counted_and_names_its_set() {
+        use crate::account::PassSummary;
+        let many = PassSummary {
+            pending_deletes: (0..1500).map(|n| format!("Shots/{n:05}.psd")).collect(),
+            pending_local_deletes: (0..1000).map(|n| format!("Local/{n:05}.txt")).collect(),
+            held_deletes: vec![("Linked/a.txt".into(), vec!["Links/one".into(), "Links/two".into()])],
+            ..PassSummary::default()
+        };
+        let words = "x".repeat(40_000);
+        let answer = held_answer(&many, false, &words);
+        assert_eq!((answer.total, answer.entries.len(), answer.truncated), (2500, 1000, true));
+        assert!(answer.entries.iter().all(|e| e.side == "server"), "the first 1000 are the server's");
+        assert!(answer.set.as_deref().is_some_and(|s| s.len() == 12), "{:?}", answer.set);
+        assert!(answer.message.len() < 17 * 1024 && answer.message.ends_with('…'));
+        assert_eq!((answer.held_total, answer.held.len()), (1, 1));
+        assert!(serde_json::to_vec(&answer).unwrap().len() < 200 * 1024, "far under the local API's limit");
+        let few = PassSummary { pending_deletes: vec!["a".into()], pending_local_deletes: vec!["b".into()], ..PassSummary::default() };
+        let answer = held_answer(&few, true, "ok");
+        assert_eq!((answer.approved, answer.total, answer.truncated, answer.entries.len()), (true, 2, false, 2));
+        assert_eq!(answer.entries.iter().map(|e| e.side.as_str()).collect::<Vec<_>>(), ["server", "here"]);
+        let none = held_answer(&PassSummary::default(), false, "nothing was waiting for approval");
+        assert_eq!((none.set, none.total, none.held_total), (None, 0, 0));
+        // The bytes of paths are capped too.
+        let long = PassSummary { pending_deletes: (0..400).map(|n| format!("{n:04}{}", "d".repeat(4000))).collect(), ..PassSummary::default() };
+        let answer = held_answer(&long, false, "");
+        assert!(answer.truncated && answer.entries.len() < 400 && answer.total == 400);
+    }
 
     #[test]
     fn secrets_compare_whole() {

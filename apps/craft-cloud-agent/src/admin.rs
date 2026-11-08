@@ -27,7 +27,7 @@ use craft_cloud_proto::api::{
     AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, AuditPage, ChangeSpaceMember, SpaceConfirm, SpaceMember, SpaceMembers,
     SpaceUsage, UpdateSpace, codes as api_codes, valid_audit_action,
 };
-use craft_cloud_proto::local::{MAX_ADMIN_JSON_BYTES, SpaceSyncRequest, paths};
+use craft_cloud_proto::local::{MAX_ADMIN_JSON_BYTES, codes, paths};
 use reqwest::Method;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -43,9 +43,20 @@ impl From<CallError> for LocalError {
     /// A refusal keeps the server's status, code and message and its `Retry-After` (never a 401: that is a revoked device,
     /// told as every signed-in call tells it); anything else is what the sync paths make of it.
     fn from(e: CallError) -> Self {
+        // A route the server doesn't have (`404 no such endpoint`, a server from before team spaces) isn't a missing thing but a
+        // server that needs an update: `409 server_too_old`, which the app says in words.
+        if let CallError::Refused(refusal) = &e
+            && refusal.status == 404
+            && refusal.message == SERVER_NO_ROUTE
+        {
+            return LocalError::new(StatusCode::CONFLICT, codes::SERVER_TOO_OLD, crate::spaces::NEEDS_UPDATE);
+        }
         AgentError::from(e).into()
     }
 }
+
+/// What the server answers for a route it doesn't have.
+const SERVER_NO_ROUTE: &str = "no such endpoint";
 
 type Answer<T> = Result<T, LocalError>;
 
@@ -127,16 +138,14 @@ async fn remove_space_member(State(state): State<Api>, ids: Result<Path<(SpaceId
     Ok(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::NO_CONTENT))
 }
 
-/// `POST /v1/spaces/{id}/leave`: the account's own `DELETE …/members/{its id}`. Syncing of the space on this computer is
-/// turned off first and its folder stays; the agent looks at its list again afterwards, which no longer has the space.
+/// `POST /v1/spaces/{id}/leave`: the account's own `DELETE …/members/{its id}`. The server goes first: if it refuses (the last
+/// owner, a rate limit, no connection) nothing changes here, and the space keeps syncing. Once the account is no longer a member
+/// the agent's list no longer has the space, and its lost-access path ends the sync and keeps the folder and its files (what
+/// leaving promises); the agent looks at its list again at once.
 async fn leave_space(State(state): State<Api>, id: Result<Path<SpaceId>, PathRejection>) -> Answer<StatusCode> {
     let id = path_id(id)?;
     let (_, transport) = server_api(&state)?;
     let me = transport.account_info().await?.user_id;
-    if let Some(spaces) = state.control.spaces_handle() {
-        // A space that doesn't sync here is already as it should be; a refusal changes nothing about leaving.
-        let _ = spaces.sync(id, SpaceSyncRequest { on: false, folder: None, adopt: false }).await;
-    }
     transport.admin_empty(Method::DELETE, &format!("spaces/{id}/members/{me}"), &SpaceConfirm::default()).await?;
     if let Some(spaces) = state.control.spaces_handle() {
         spaces.refresh().await;
@@ -526,6 +535,23 @@ mod tests {
 
     fn refused(status: u16, code: &str, retry: Option<u64>) -> LocalError {
         LocalError::from(CallError::Refused(Refusal { status, error: code.into(), message: "m".into(), two_factor: None, retry_after_secs: retry }))
+    }
+
+    /// A route a server from before team spaces doesn't have is a server that needs an update, not a missing thing; a 404
+    /// with another message (a space that isn't there) is still `not_found`.
+    #[test]
+    fn a_route_the_server_does_not_have_says_the_server_needs_an_update() {
+        let old = LocalError::from(CallError::Refused(Refusal {
+            status: 404,
+            error: "not_found".into(),
+            message: "no such endpoint".into(),
+            two_factor: None,
+            retry_after_secs: None,
+        }));
+        assert_eq!((old.status, old.code.as_str()), (StatusCode::CONFLICT, codes::SERVER_TOO_OLD));
+        assert_eq!(old.message, crate::spaces::NEEDS_UPDATE);
+        let gone = refused(404, "not_found", None);
+        assert_eq!((gone.status, gone.code.as_str()), (StatusCode::NOT_FOUND, "not_found"));
     }
 
     #[test]

@@ -84,7 +84,7 @@ pub use craft_cloud_api::api::{
     SpaceMember, SpaceMembers, SpaceRole, SpaceUsage, UpdateSpace,
 };
 pub use craft_cloud_api::local::{
-    ApproveDeletesAnswer, ApproveDeletesRequest, SpaceInfo, SpaceList, SpaceRun, SpaceStatus, SpaceSync, SpaceSyncRequest,
+    ApproveDeletesAnswer, ApproveDeletesRequest, HeldEntry, HeldLink, SpaceInfo, SpaceList, SpaceRun, SpaceStatus, SpaceSync, SpaceSyncRequest,
 };
 pub use craft_cloud_api::local::{
     ConflictCopy, ConflictsResponse, FileKind, FolderUsage, FolderUsageResponse, HistoryResponse, HistoryVersion, JoinRequest, LoginRequest,
@@ -1173,7 +1173,7 @@ mod tests {
             (200, json(&item)),
             (204, String::new()),
             (200, json(&SpaceInfo { sync: SpaceSync::On, ..info.clone() })),
-            (200, json(&ApproveDeletesAnswer { approved: true, message: "the running agent will carry out these deletions".into() })),
+            (200, json(&ApproveDeletesAnswer { approved: true, message: "the running agent will carry out these deletions".into(), ..Default::default() })),
             (404, no_invitation),
             (404, no_such_call),
         ];

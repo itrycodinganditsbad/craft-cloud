@@ -116,6 +116,9 @@ pub mod codes {
     /// Never sent by an agent: what a client reports when the agent answers a call it doesn't know (`not_found` for
     /// the call itself), as one from before that call answers it. Update Craft Cloud.
     pub const AGENT_TOO_OLD: &str = "agent_too_old";
+    /// The server doesn't know the call (it answered `404 no such endpoint`: it is from before team spaces, or the admin API
+    /// call): the server needs an update (HTTP 409).
+    pub const SERVER_TOO_OLD: &str = "server_too_old";
 }
 
 /// The paths of the local API.
@@ -213,7 +216,8 @@ pub mod paths {
     /// [`SpaceMembers`](crate::api::SpaceMembers); `POST …/members` ([`AddSpaceMember`](crate::api::AddSpaceMember)) and
     /// `PATCH …/members/{user}` ([`ChangeSpaceMember`](crate::api::ChangeSpaceMember)) → the [`SpaceMember`](crate::api::SpaceMember);
     /// `DELETE …/members/{user}` → 204; `GET …/usage` → [`SpaceUsage`](crate::api::SpaceUsage); and `POST …/leave` → 204, the
-    /// account's own `DELETE …/members/{its id}`, after which the agent looks at its list again (the local copy is kept).
+    /// account's own `DELETE …/members/{its id}` (the server first; a refusal changes nothing here), after which the agent looks at
+    /// its list again and the space is lost to it: the sync ends and the local copy is kept.
     pub const SPACES: &str = "/v1/spaces";
     /// The administrator's team space calls, passed on to the server like [`ADMIN_USERS`]: `GET /v1/admin/spaces?cursor&limit&query` →
     /// [`AdminSpaceList`](crate::api::AdminSpaceList); `POST` ([`AdminCreateSpace`](crate::api::AdminCreateSpace)) →
@@ -643,6 +647,9 @@ pub enum SpaceRun {
     /// Stopped until someone puts something right (the folder is gone, say).
     Paused {
         reason: String,
+        /// The cause as a code an app may act on (`server_full`, `quota_exceeded`, `read_only`), where there is one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason_code: Option<String>,
     },
     /// Syncing is paused by the user for every space.
     PausedByUser,
@@ -664,7 +671,7 @@ impl std::fmt::Debug for SpaceRun {
             Self::Idle => f.write_str("Idle"),
             Self::Syncing => f.write_str("Syncing"),
             Self::Retrying { message } => f.debug_struct("Retrying").field("message", message).finish(),
-            Self::Paused { reason } => f.debug_struct("Paused").field("reason", reason).finish(),
+            Self::Paused { reason, reason_code } => f.debug_struct("Paused").field("reason", reason).field("reason_code", reason_code).finish(),
             Self::PausedByUser => f.write_str("PausedByUser"),
             Self::NoAccess { .. } => f.debug_struct("NoAccess").finish_non_exhaustive(),
             Self::Unavailable { message } => f.debug_struct("Unavailable").field("message", message).finish(),
@@ -763,17 +770,77 @@ pub struct ApproveDeletesRequest {
     pub set: Option<String>,
 }
 
-/// The answer to [`ApproveDeletesRequest`]: whether an approval was handed to the agent, and what the command line
-/// would have said. Its `Debug` output leaves out the words, which list file names.
+/// The most paths one [`ApproveDeletesAnswer`] lists, and the most bytes of paths (so the answer stays far under
+/// [`MAX_LOCAL_JSON_BYTES`] however many files were deleted).
+pub const MAX_HELD_ENTRIES: usize = 1000;
+pub const MAX_HELD_BYTES: usize = 512 * 1024;
+
+/// One deletion waiting for approval: `side` is `server` (it will be deleted on the server) or `here` (on this computer).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldEntry {
+    pub path: String,
+    pub side: String,
+}
+
+impl std::fmt::Debug for HeldEntry {
+    /// The path is a file name: left out.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldEntry").field("side", &self.side).finish_non_exhaustive()
+    }
+}
+
+/// A deletion held behind a link: the path, and the links that may be it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldLink {
+    pub path: String,
+    pub links: Vec<String>,
+}
+
+impl std::fmt::Debug for HeldLink {
+    /// The path and the links are file names: left out.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldLink").finish_non_exhaustive()
+    }
+}
+
+/// The answer to [`ApproveDeletesRequest`]: whether an approval was handed to the agent, what the command line would
+/// have said (cut at 16 KiB here), and the same as data:
+/// - `set` names the deletions waiting for approval (a hash of exactly them), `total` counts them and `entries` lists up to
+///   [`MAX_HELD_ENTRIES`] of them (`truncated` says there are more). Approve with that `set`: only that set is approved, and a
+///   set that changed meanwhile approves nothing and is listed again.
+/// - `held` lists (up to 100) deletions held behind a link, `held_total` counts them, `held_set` names them. They are released
+///   only by naming `held_set`, which an app doesn't do: the command line does.
+///
+/// Every field after `message` is left out by an older agent and read as nothing. The `Debug` output leaves out the lists and
+/// the words, which are file names.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ApproveDeletesAnswer {
     pub approved: bool,
     pub message: String,
+    #[serde(default)]
+    pub set: Option<String>,
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub entries: Vec<HeldEntry>,
+    #[serde(default)]
+    pub held_set: Option<String>,
+    #[serde(default)]
+    pub held_total: u64,
+    #[serde(default)]
+    pub held: Vec<HeldLink>,
 }
 
 impl std::fmt::Debug for ApproveDeletesAnswer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ApproveDeletesAnswer").field("approved", &self.approved).finish_non_exhaustive()
+        f.debug_struct("ApproveDeletesAnswer")
+            .field("approved", &self.approved)
+            .field("total", &self.total)
+            .field("truncated", &self.truncated)
+            .field("held_total", &self.held_total)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1485,7 +1552,7 @@ mod tests {
         let status = SpaceStatus { space, run_state: info.run_state.clone().unwrap(), last_sync_ms: None, read_only: false };
         let shown = format!("{status:?}");
         assert!(!shown.contains("Studio"), "the status leaves the name out too: {shown}");
-        let answer = ApproveDeletesAnswer { approved: true, message: "delete on the server: Studio/plan.txt".into() };
+        let answer = ApproveDeletesAnswer { approved: true, message: "delete on the server: Studio/plan.txt".into(), ..Default::default() };
         assert!(!format!("{answer:?}").contains("plan.txt"));
         let older: Status = serde_json::from_value(serde_json::json!({
             "api": 1, "signed_in": true, "online": true, "run_state": { "kind": "idle" }
