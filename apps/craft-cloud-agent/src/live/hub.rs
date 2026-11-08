@@ -195,6 +195,9 @@ pub enum HubError {
     Failed(String),
     #[error("the agent stopped following recents (signed out, or stopping)")]
     Gone,
+    /// The account may not change the space (a viewer, or an archived space).
+    #[error("this space is read-only for you: nothing was kept")]
+    ReadOnly,
 }
 
 /// An app's list as its followers see it: the entries, and whether its push stopped ([`Replica::push_stopped`]).
@@ -218,14 +221,14 @@ enum Request {
     Pause(bool, oneshot::Sender<()>),
     /// A docs connection's request (answered on its own channel).
     Docs(DocsCall),
-    /// The agent's list says the account may (`false`) or may not (`true`) change the space.
-    Access(bool),
 }
 
 /// How the local API reaches the hub. Cheap to clone.
 #[derive(Clone)]
 pub struct HubHandle {
     tx: mpsc::Sender<Request>,
+    /// What the agent's list of spaces says of the role: read-only or not. The hub reads the newest value.
+    access: Arc<watch::Sender<bool>>,
 }
 
 /// A synced team space's hub, and the folder whose paths are its documents' ([`crate::local_api::Control::route_path`]).
@@ -272,12 +275,9 @@ impl HubHandle {
     }
 
     /// Tells the hub what the agent's list of spaces says about the account's role: a viewer (or an archived space) may not
-    /// change the space. Not waited for. Needs a running tokio runtime.
+    /// change the space. Not waited for; the newest value is the one the hub acts on.
     pub fn set_read_only(&self, read_only: bool) {
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let _ = tx.send(Request::Access(read_only)).await;
-        });
+        self.access.send_replace(read_only);
     }
 }
 
@@ -287,25 +287,51 @@ impl HubHandle {
 pub struct Hub {
     handle: HubHandle,
     stop: Option<oneshot::Sender<()>>,
+    /// Told (closed) when the hub's thread has ended and let go of the space's folder.
+    ended: Option<oneshot::Receiver<()>>,
 }
+
+/// The file in a space's live folder that one hub holds for as long as it runs: two hubs never share the folder.
+pub const HUB_LOCK: &str = ".lock";
 
 impl Hub {
     /// Opens the account's documents and starts the hub, with its live connection held if `paused` (see
-    /// [`HubHandle::set_paused`]). `control` hears whether the live connection is up.
+    /// [`HubHandle::set_paused`]). `control` hears whether the live connection is up. A space's live folder belongs to one
+    /// hub at a time: while another hub (one that was stopped and has not finished) holds it, this is an error.
     pub fn start(config: HubConfig, control: Control, paused: bool) -> std::io::Result<Self> {
         let dir = config.data.path().join("live").join(config.space.to_string());
+        std::fs::create_dir_all(&dir)?;
+        let (lock, warning) = crate::lock::acquire(&dir.join(HUB_LOCK)).map_err(|e| std::io::Error::other(e.to_string()))?;
+        if let Some(warning) = warning {
+            crate::runlog::note(format_args!("{warning}"));
+        }
         let replica = Replica::open(DiskStore::open(&dir)?, config.space, super::replica::random_peers())?;
         let (tx, rx) = mpsc::channel(64);
         let (stop, stopped) = oneshot::channel();
+        let (access, access_rx) = watch::channel(config.read_only);
+        let (end_tx, end_rx) = oneshot::channel::<()>();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        std::thread::Builder::new()
-            .name("craft-cloud-live".into())
-            .spawn(move || runtime.block_on(run(config, replica, rx, control, stopped, paused)))?;
-        Ok(Self { handle: HubHandle { tx }, stop: Some(stop) })
+        std::thread::Builder::new().name("craft-cloud-live".into()).spawn(move || {
+            // (Dropped in this order: the folder is let go of before the end is told.)
+            let _end = end_tx;
+            let _lock = lock;
+            runtime.block_on(run(config, replica, rx, control, stopped, paused, access_rx));
+        })?;
+        Ok(Self { handle: HubHandle { tx, access: Arc::new(access) }, stop: Some(stop), ended: Some(end_rx) })
     }
 
     pub fn handle(&self) -> HubHandle {
         self.handle.clone()
+    }
+
+    /// Stops the hub and returns what resolves once its thread has ended: its documents are written and the space's folder is
+    /// free for the next hub.
+    pub fn stop(mut self) -> oneshot::Receiver<()> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        // (A sender that is gone resolves at once.)
+        self.ended.take().unwrap_or_else(|| oneshot::channel().1)
     }
 }
 
@@ -556,6 +582,11 @@ struct State {
     people_not_before: Instant,
     /// Accounts presence named that were not in the list when last looked at (asked about once per list).
     strangers: BTreeSet<Uuid>,
+    /// Since when the link has been up (none while it is down): `access_changed` backs off further each time unless the link
+    /// had stayed up for [`ACCESS_STABLE`].
+    up_since: Option<Instant>,
+    /// How many `access_changed` in a row (a link that stayed up for a while ends the row).
+    access_strikes: u32,
 }
 
 /// What the tasks the hub starts say when they are done.
@@ -565,6 +596,15 @@ enum Inner {
 
 /// How soon after the first `access_changed` the hub asks again (the second one, and later, wait as any reconnect does).
 const ACCESS_RETRY: Duration = Duration::from_millis(200);
+/// How long a link must stay up for the pauses after `access_changed` to start over.
+const ACCESS_STABLE: Duration = Duration::from_secs(60);
+
+/// The pause before the link is made again after the `strikes`-th `access_changed` in a row: the first is quick (the answer
+/// is the new role), each next one doubles, up to the longest reconnect pause.
+fn access_wait(strikes: u32) -> Duration {
+    ACCESS_RETRY.saturating_mul(1u32 << strikes.min(12)).min(RETRY_MAX)
+}
+
 /// The least time between two looks at who is in the space.
 const PEOPLE_EVERY: Duration = Duration::from_secs(5);
 
@@ -1340,6 +1380,7 @@ impl State {
         }
         self.replica.disconnected();
         self.set_online(false);
+        self.up_since = None;
         self.new_generation();
     }
 
@@ -1367,6 +1408,34 @@ impl State {
         Ok(entry)
     }
 
+    /// The agent's list of spaces says the account may (`false`) or may not (`true`) change the space. Lifting the lock sends
+    /// what the gate held back; a connection opened as a viewer is made again at once, so the server's word (the role in
+    /// `welcome_space`) is the new one. Frames to send.
+    async fn set_access(&mut self, read_only: bool) -> Vec<ClientFrame> {
+        let mut frames = self.replica.set_read_only(read_only);
+        if !read_only && self.replica.role() == Some(craft_cloud_proto::api::SpaceRole::Viewer) && self.socket.is_some() {
+            if let Some(socket) = self.socket.take() {
+                socket.close().await;
+            }
+            self.drop_socket();
+            self.retry_at = Instant::now();
+            self.delay = RETRY_FIRST;
+            frames.clear();
+        }
+        self.say_unsent();
+        frames
+    }
+
+    /// The hub is stopping: every document an app has open in it is told the agent stopped following it (a team space that
+    /// stops syncing), so an app does not go on typing into a document nothing keeps.
+    fn tell_stopped(&mut self) {
+        let opens: Vec<(ConnId, DocId)> = self.docs.conns.iter().flat_map(|(conn, c)| c.handles.values().map(|d| (*conn, *d))).collect();
+        for (conn, doc) in opens {
+            let (_, waiting) = self.replica.document_status(doc).unwrap_or((false, 0));
+            let _ = self.tell(conn, DocOut::Status { doc, online: false, waiting, deleted: false, stopped: true });
+        }
+    }
+
     async fn handle(&mut self, request: Request) {
         match request {
             // The run loop's to handle (it owns the dialing).
@@ -1374,20 +1443,6 @@ impl State {
             Request::Docs(call) => {
                 let frames = self.docs_call(call);
                 self.send(frames).await;
-            }
-            Request::Access(read_only) => {
-                self.replica.set_read_only(read_only);
-                // The connection was opened as a viewer and the account may write now: connected again at once, so the
-                // server's word (the role in `welcome_space`) is the new one, and what was unacked goes up.
-                if !read_only && self.replica.role() == Some(craft_cloud_proto::api::SpaceRole::Viewer) && self.socket.is_some() {
-                    if let Some(socket) = self.socket.take() {
-                        socket.close().await;
-                    }
-                    self.drop_socket();
-                    self.retry_at = Instant::now();
-                    self.delay = RETRY_FIRST;
-                }
-                self.say_unsent();
             }
             Request::Follow { app, reply } => {
                 if !self.lists.contains_key(&app) && self.lists.len() >= MAX_SUBSCRIPTIONS {
@@ -1402,6 +1457,11 @@ impl State {
                 self.send(frames).await;
             }
             Request::Add { app, entry, reply } => {
+                // A viewer's entry could never go up: refused, not kept to be acked.
+                if self.replica.read_only() {
+                    let _ = reply.send(Err(HubError::ReadOnly));
+                    return;
+                }
                 if !self.lists.contains_key(&app) && self.lists.len() >= MAX_SUBSCRIPTIONS {
                     let _ = reply.send(Err(HubError::Invalid(format!("the agent follows at most {MAX_SUBSCRIPTIONS} apps' recents"))));
                     return;
@@ -1440,6 +1500,7 @@ async fn run(
     control: Control,
     mut stop: oneshot::Receiver<()>,
     paused: bool,
+    mut access: watch::Receiver<bool>,
 ) {
     let lookup = if config.team {
         NodeLookup { data: config.data.space_dir(config.space), team: Some((config.space, config.folder.clone())), seen: None, state: None }
@@ -1485,6 +1546,8 @@ async fn run(
         people_busy: false,
         people_not_before: Instant::now(),
         strangers: BTreeSet::new(),
+        up_since: None,
+        access_strikes: 0,
     };
     state.say_unsent();
     state.settle();
@@ -1505,6 +1568,9 @@ async fn run(
         let writer_gone = state.socket.as_ref().map(|s| s.gone.clone());
         tokio::select! {
             _ = &mut stop => {
+                if state.config.team {
+                    state.tell_stopped();
+                }
                 if let Some(socket) = state.socket.take() {
                     socket.close().await;
                 }
@@ -1524,6 +1590,7 @@ async fn run(
                             socket.close().await;
                         }
                         state.replica.disconnected();
+                        state.up_since = None;
                         state.new_generation();
                         // Offline before the caller hears it, so the status it reads next says so.
                         state.set_online(false);
@@ -1578,6 +1645,11 @@ async fn run(
                     let _ = order.reply.send(answer);
                 }
             }
+            Ok(()) = access.changed() => {
+                let read_only = *access.borrow_and_update();
+                let frames = state.set_access(read_only).await;
+                state.send(frames).await;
+            }
             Some(done) = blob_rx.recv() => {
                 let frames = state.blob_done(done);
                 state.send(frames).await;
@@ -1603,11 +1675,13 @@ async fn run(
                         if state.replica.is_up() {
                             state.delay = RETRY_FIRST;
                             state.said = None;
+                            state.up_since.get_or_insert_with(Instant::now);
                         }
                         state.send(frames).await;
                         state.say_unsent();
                     }
                     Err(e) => {
+                        let stable = state.up_since.is_some_and(|since| since.elapsed() >= ACCESS_STABLE);
                         if let Some(socket) = state.socket.take() {
                             socket.close().await;
                         }
@@ -1617,8 +1691,12 @@ async fn run(
                             // member. The agent's list of spaces is looked at too. (A server that says it again and again is
                             // asked less and less often, as for any other failure.)
                             LinkError::AccessChanged(_) => {
-                                let wait = (state.delay <= RETRY_FIRST).then_some(ACCESS_RETRY);
-                                state.back_off(wait);
+                                if stable {
+                                    state.access_strikes = 0;
+                                }
+                                let wait = access_wait(state.access_strikes);
+                                state.access_strikes = state.access_strikes.saturating_add(1);
+                                state.back_off(Some(if state.access_strikes > 1 { jitter(wait) } else { wait }));
                                 state.look_at_spaces();
                             }
                             LinkError::Mismatch(m) => {
@@ -1724,6 +1802,50 @@ mod tests {
     use super::*;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+
+    /// The pauses after `access_changed` in a row double up to the longest reconnect pause.
+    #[test]
+    fn access_changed_backs_off_further_each_time() {
+        assert_eq!(access_wait(0), ACCESS_RETRY);
+        assert_eq!(access_wait(1), ACCESS_RETRY * 2);
+        assert_eq!(access_wait(3), ACCESS_RETRY * 8);
+        assert_eq!(access_wait(40), RETRY_MAX);
+        assert!((0..20).all(|n| access_wait(n) <= access_wait(n + 1)));
+    }
+
+    fn config(dir: &std::path::Path, space: SpaceId) -> HubConfig {
+        HubConfig {
+            data: DataDir::new(dir.to_owned()),
+            space,
+            server: ServerUrl::parse("http://127.0.0.1:9").unwrap(),
+            token: DeviceToken::new("x".repeat(43)),
+            machine: "pc".into(),
+            folder: dir.join("folder"),
+            record_delay: Duration::ZERO,
+            session_grace: Duration::from_secs(1),
+            announce_delay: Duration::ZERO,
+            team: true,
+            username: "ana".into(),
+            read_only: false,
+        }
+    }
+
+    /// Two hubs never share a space's live folder: while one runs, or has been stopped and has not ended, another cannot start
+    /// there; once it has ended, the next one does (and finds what the first wrote).
+    #[tokio::test]
+    async fn a_space_has_one_hub_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let (space, other) = (SpaceId::generate(), SpaceId::generate());
+        let first = Hub::start(config(dir.path(), space), Control::new(tx.clone()), true).unwrap();
+        assert!(Hub::start(config(dir.path(), space), Control::new(tx.clone()), true).is_err(), "the folder is the first hub's");
+        let elsewhere = Hub::start(config(dir.path(), other), Control::new(tx.clone()), true).unwrap();
+        drop(elsewhere);
+        let ended = first.stop();
+        tokio::time::timeout(Duration::from_secs(10), ended).await.expect("the hub ends").ok();
+        let second = Hub::start(config(dir.path(), space), Control::new(tx), true).expect("the folder is free once the first hub ended");
+        drop(second.stop());
+    }
 
     /// A connection whose close never completes.
     struct Stuck;

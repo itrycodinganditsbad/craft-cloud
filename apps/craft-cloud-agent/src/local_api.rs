@@ -812,6 +812,41 @@ fn blob_error(e: BlobError) -> LocalError {
     }
 }
 
+/// `path` with its `.` and `..` names resolved (lexically, as the folders are compared); a path that climbs above its root keeps
+/// the root. An empty result stays empty.
+pub(crate) fn normalized(path: &str) -> String {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for part in std::path::Path::new(path).components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() && !out.has_root() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod blob_path_tests {
+    use super::normalized;
+
+    #[test]
+    fn a_blob_path_is_taken_apart_before_it_is_bound() {
+        let base = std::env::temp_dir();
+        let written = base.join("a").join("b").join("..").join("c").join(".").join("d");
+        assert_eq!(normalized(&written.to_string_lossy()), base.join("a").join("c").join("d").to_string_lossy());
+        // `A/../B/f` is B's.
+        let sneaky = base.join("team-a").join("..").join("team-b").join("f.png");
+        assert_eq!(normalized(&sneaky.to_string_lossy()), base.join("team-b").join("f.png").to_string_lossy());
+        assert_eq!(normalized("a/../../b"), std::path::Path::new("..").join("b").to_string_lossy());
+    }
+}
+
 /// The query of the blob calls: `for` names the file the blob belongs to.
 #[derive(serde::Deserialize)]
 struct BlobQuery {
@@ -832,6 +867,8 @@ fn blob_space(
     let Query(query) = query.map_err(|e| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, e.body_text()))?;
     let transport = HttpTransport::new(account.server.clone(), &account.token).map_err(AgentError::from)?;
     let Some(path) = query.for_path else { return Ok((account.space, transport)) };
+    // Taken apart first: `A/../B/f` is B's, whatever the app wrote.
+    let path = normalized(&path);
     if let Some(team) = state.control.route_path(&path) {
         if write && state.control.space_read_only(team.space) {
             return Err(LocalError::new(StatusCode::FORBIDDEN, api_codes::READ_ONLY, "this team space is read-only for you: the blob was not kept"));

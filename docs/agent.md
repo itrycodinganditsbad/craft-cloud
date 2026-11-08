@@ -265,7 +265,11 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
   only; the document opens with them in `waiting`). An app that opens with `identity: true` is told who is there (see
   `docs/design/live.md`); one that does not gets what it always got. The agent's log and its debug output carry space and
   account IDs, never names. Ctrl-C with an idle personal space and a team pass that hangs (a server that does not answer)
-  waits for that pass; a second Ctrl-C, read meanwhile, ends the wait.
+  waits for that pass; a second Ctrl-C, read meanwhile, ends the wait. A space's live folder (`live/<space>/`) belongs to one hub
+  at a time (a lock file, `.lock`): a hub that replaces one that was stopped (sync turned off and on, a folder moved) starts
+  when the old one has ended, so no change an app was told was kept is overwritten. When a team space stops syncing, the
+  documents an app has open in it are told `status {stopped}` and a later change to one is answered `error {not_found}`;
+  the app's documents in other spaces go on. A viewer's recents `add` is refused with `read_only`.
 
 | Local call | Answer |
 | --- | --- |

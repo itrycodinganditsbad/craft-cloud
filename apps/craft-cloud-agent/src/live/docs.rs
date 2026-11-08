@@ -83,6 +83,36 @@ struct Link {
 }
 
 impl Link {
+    fn new(conn: ConnId) -> Self {
+        Self {
+            conn,
+            hubs: Vec::new(),
+            from_hub: None,
+            to_conn: None,
+            seqs: HashMap::new(),
+            opens: HashMap::new(),
+            docs: HashMap::new(),
+            open_docs: HashMap::new(),
+        }
+    }
+
+    /// Routes the open number `id` to the hub `key`; false when the number is in use on this connection (it is never routed
+    /// twice: the first open keeps its hub).
+    fn begin_open(&mut self, id: u64, key: Key) -> bool {
+        if self.opens.contains_key(&id) {
+            return false;
+        }
+        self.opens.insert(id, key);
+        true
+    }
+
+    /// The open `id` was refused, or answered `not_live`: its number is free again (a number that opened a document is not).
+    fn end_open(&mut self, id: u64) {
+        if !self.open_docs.contains_key(&id) {
+            self.opens.remove(&id);
+        }
+    }
+
     /// The hub for `key`, joined on first use (the personal hub: signed in after the app connected, it is there now). `None`
     /// when there is no such hub (signed out, or the space doesn't sync here).
     async fn hub(&mut self, api: &ApiState, key: Key) -> Option<HubHandle> {
@@ -142,16 +172,7 @@ impl Link {
 }
 
 async fn serve(mut socket: WebSocket, api: Arc<ApiState>) {
-    let mut link = Link {
-        conn: NEXT_CONN.fetch_add(1, Ordering::Relaxed),
-        hubs: Vec::new(),
-        from_hub: None,
-        to_conn: None,
-        seqs: HashMap::new(),
-        opens: HashMap::new(),
-        docs: HashMap::new(),
-        open_docs: HashMap::new(),
-    };
+    let mut link = Link::new(NEXT_CONN.fetch_add(1, Ordering::Relaxed));
     link.hub(&api, None).await;
     let end = loop {
         tokio::select! {
@@ -175,10 +196,8 @@ async fn serve(mut socket: WebSocket, api: Arc<ApiState>) {
                                 link.open_docs.insert(*id, *doc);
                             }
                         }
-                        // Not a live document: its number is free again.
-                        DocOut::NotLive { id, .. } => {
-                            link.opens.remove(id);
-                        }
+                        // Not a live document, or the open was refused: its number is free again.
+                        DocOut::NotLive { id, .. } | DocOut::Refused { id: Some(id), seq: None, .. } => link.end_open(*id),
                         _ => {}
                     }
                     if !send_out(&mut socket, out).await {
@@ -213,33 +232,37 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
             };
             match request {
                 DocsRequest::Open { id, path, app, file_hash, identity } => {
-                    if link.opens.len() >= MAX_OPENS && !link.opens.contains_key(&id) {
-                        let event = DocsEvent::Error {
-                            id: Some(id),
-                            seq: None,
-                            code: api_codes::TOO_LARGE.into(),
-                            message: "too many documents open".into(),
+                    if link.opens.contains_key(&id) || link.opens.len() >= MAX_OPENS {
+                        let (code, message) = if link.opens.contains_key(&id) {
+                            (api_codes::INVALID, "that number is in use on this connection")
+                        } else {
+                            (api_codes::TOO_LARGE, "too many documents open")
                         };
+                        let event = DocsEvent::Error { id: Some(id), seq: None, code: code.into(), message: message.into() };
                         return Ok(send_json(socket, &event).await);
                     }
                     // An absolute path inside a synced team folder is that space's; any other is the personal space's.
                     let key = api.control.route_path(&path).map(|team| team.space);
                     let not_live = |reason, message: &str| DocsEvent::NotLive { id, reason, message: Some(message.into()) };
-                    match link.hub(api, key).await {
-                        Some(hub) => {
-                            link.opens.entry(id).or_insert(key);
-                            let call = DocsCall::Open { conn: link.conn, id, path, app, file_hash, identity };
-                            if link.call(&hub, key, call).await? {
-                                Ok(true)
-                            } else {
-                                Ok(send_json(socket, &not_live(NotLiveReason::Offline, "the space stopped syncing on this computer")).await)
-                            }
+                    // (A handle this connection kept of a hub that has stopped since fails once; the space may have a new hub.)
+                    for attempt in 0..2 {
+                        let Some(hub) = link.hub(api, key).await else {
+                            return Ok(match key {
+                                Some(_) => send_json(socket, &not_live(NotLiveReason::Offline, "the space doesn't sync on this computer")).await,
+                                None => send_json(socket, &not_live(NotLiveReason::NotSignedIn, "the Craft Cloud agent isn't signed in")).await,
+                            });
+                        };
+                        link.begin_open(id, key);
+                        let call =
+                            DocsCall::Open { conn: link.conn, id, path: path.clone(), app: app.clone(), file_hash: file_hash.clone(), identity };
+                        if link.call(&hub, key, call).await? {
+                            return Ok(true);
                         }
-                        None if key.is_some() => {
-                            Ok(send_json(socket, &not_live(NotLiveReason::Offline, "the space doesn't sync on this computer")).await)
+                        if attempt == 1 {
+                            break;
                         }
-                        None => Ok(send_json(socket, &not_live(NotLiveReason::NotSignedIn, "the Craft Cloud agent isn't signed in")).await),
                     }
+                    Ok(send_json(socket, &not_live(NotLiveReason::Offline, "the space stopped syncing on this computer")).await)
                 }
                 DocsRequest::Close { doc } => match link.hub_of_doc(doc) {
                     Some((key, hub)) => {
@@ -255,12 +278,24 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                 },
                 // In order with the connection's changes: the hub keeps it once the changes it covers are in.
                 DocsRequest::Saved { doc, hash, frontiers } => match link.hub_of_doc(doc) {
-                    Some((key, hub)) => link.call(&hub, key, DocsCall::Saved { conn: link.conn, doc, hash, frontiers }).await.map(|_| true),
+                    Some((key, hub)) => {
+                        if link.call(&hub, key, DocsCall::Saved { conn: link.conn, doc, hash, frontiers }).await? {
+                            Ok(true)
+                        } else {
+                            Ok(send_json(socket, &stopped_event(None, None)).await)
+                        }
+                    }
                     None => Ok(true),
                 },
                 // At once, before the app writes the file: the sync waits for that save's record.
                 DocsRequest::Saving { doc, hash } => match link.hub_of_doc(doc) {
-                    Some((key, hub)) => link.call(&hub, key, DocsCall::Saving { conn: link.conn, doc, hash }).await.map(|_| true),
+                    Some((key, hub)) => {
+                        if link.call(&hub, key, DocsCall::Saving { conn: link.conn, doc, hash }).await? {
+                            Ok(true)
+                        } else {
+                            Ok(send_json(socket, &stopped_event(None, None)).await)
+                        }
+                    }
                     None => Ok(true),
                 },
             }
@@ -296,11 +331,22 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                 }
                 _ => return Ok(false),
             };
-            link.call(&hub, key, call).await.map(|_| true)
+            let update_seq = if let DocsCall::Update { seq, .. } = &call { Some(*seq) } else { None };
+            let ephemeral = matches!(call, DocsCall::Presence { .. });
+            if link.call(&hub, key, call).await? || ephemeral {
+                return Ok(true);
+            }
+            // The space's hub has stopped (it stopped syncing): the change was not kept, and the app is told.
+            Ok(send_json(socket, &stopped_event(Some(id), update_seq)).await)
         }
         Message::Ping(_) | Message::Pong(_) => Ok(true),
         Message::Close(_) => Ok(false),
     }
+}
+
+/// What an app is told when it sends to a document of a space whose hub has stopped (nothing is kept).
+fn stopped_event(id: Option<u64>, seq: Option<u64>) -> DocsEvent {
+    DocsEvent::Error { id, seq, code: api_codes::NOT_FOUND.into(), message: "the space stopped syncing on this computer: nothing was kept".into() }
 }
 
 /// Sends one of the hub's messages to the app; false when the app is gone (or too slow).
@@ -346,4 +392,33 @@ async fn send_json(socket: &mut WebSocket, event: &DocsEvent) -> bool {
 async fn send_binary(socket: &mut WebSocket, kind: u8, id: u64, bytes: &[u8]) -> bool {
     let frame = encode_binary(kind, id, bytes);
     matches!(tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Binary(frame.into()))).await, Ok(Ok(())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An open number is routed once: a second open under it is refused before it can change the route, a refused or
+    /// `not_live` open frees its number, and a number that opened a document stays.
+    #[test]
+    fn open_numbers_are_routed_once_and_freed_when_refused() {
+        let (team, other) = (Some(SpaceId::generate()), Some(SpaceId::generate()));
+        let mut link = Link::new(1);
+        assert!(link.begin_open(5, team));
+        assert!(!link.begin_open(5, other), "in use");
+        assert_eq!(link.opens.get(&5), Some(&team), "the first route stays");
+        link.end_open(5);
+        assert!(link.begin_open(5, None), "a refused open frees its number");
+        assert_eq!(link.opens.get(&5), Some(&None));
+        let doc = DocId::generate();
+        link.open_docs.insert(5, doc);
+        link.end_open(5);
+        assert!(link.opens.contains_key(&5), "a number that opened a document is kept until it is closed");
+    }
+
+    #[test]
+    fn a_stopped_space_answers_with_an_error_naming_the_change() {
+        let event = stopped_event(Some(3), Some(7));
+        assert!(matches!(event, DocsEvent::Error { id: Some(3), seq: Some(7), ref code, .. } if code == api_codes::NOT_FOUND));
+    }
 }

@@ -1632,9 +1632,24 @@ impl<S: DocStore> Replica<S> {
         self.role
     }
 
-    /// The agent's list says the account may not change the space (a viewer, or an archived space), or no longer says so.
-    pub fn set_read_only(&mut self, read_only: bool) {
+    /// The agent's list of spaces says the account may not change the space (a viewer, or an archived space), or no longer says so.
+    /// When that lifts the lock on a link that is up, what the gate held back (frames the replica counted as sent) goes out:
+    /// every document's unacked updates are sent again. Frames to send.
+    pub fn set_read_only(&mut self, read_only: bool) -> Vec<ClientFrame> {
+        let was = self.read_only();
         self.locked = read_only;
+        if !was || self.read_only() || self.link != Link::Up {
+            return Vec::new();
+        }
+        let mut frames = Vec::new();
+        for (id, doc) in &mut self.docs {
+            // What was sent into the gate was never sent.
+            doc.sent.clear();
+            if doc.sub == Sub::Live && doc.joined {
+                frames.extend(send_pending(*id, doc));
+            }
+        }
+        frames
     }
 
     /// Whether the account may not change the space: the agent's list says so, or the connection's role is viewer. Local
@@ -4580,6 +4595,35 @@ mod tests {
         r.on_frame(welcome_space(space, SpaceRole::Editor)).unwrap();
         assert!(r.on_frame(ServerFrame::error(codes::READ_ONLY, "no", None, None)).is_ok());
         assert!(r.read_only() && r.is_up(), "the link stays");
+    }
+
+    /// The agent's list says viewer while the connection's role is editor: an add is held back by the gate, which the replica
+    /// had counted as sent. When the list says editor again the update is sent again at once, without a new connection, and the
+    /// entry is acked as any other.
+    #[test]
+    fn lifting_the_lock_sends_again_what_the_gate_held_back() {
+        let space = SpaceId::generate();
+        let doc = recents_doc(space, &app());
+        let mut r = Replica::open(MemStore::default(), space, peers()).unwrap();
+        r.require_spaces();
+        r.follow(&app());
+        r.connected();
+        r.on_frame(welcome_space(space, SpaceRole::Editor)).unwrap();
+        r.on_frame(ServerFrame::Subscribed { doc, head: 0 }).unwrap();
+        assert!(r.set_read_only(true).is_empty(), "locking sends nothing");
+        let held = r.add(&app(), [1; 16], entry("a.txt", 1)).unwrap();
+        assert_eq!(held.len(), 1, "the replica sent it");
+        assert!(r.gate(held).is_empty(), "and the gate held it back");
+        assert_eq!(r.waiting(), 1);
+        let again = r.set_read_only(false);
+        assert!(matches!(again.as_slice(), [ClientFrame::Update { client_seq: 1, .. }]), "{again:?}");
+        r.on_frame(ServerFrame::Ack { doc, client_seq: 1, seq: 1 }).unwrap();
+        assert_eq!(r.waiting(), 0);
+        // Unlocking when nothing was locked sends nothing; nor does a lock lifted on a link that is down.
+        assert!(r.set_read_only(false).is_empty());
+        r.set_read_only(true);
+        r.disconnected();
+        assert!(r.set_read_only(false).is_empty());
     }
 
     /// Presence with the sending account is handed to the apps with it; a server on protocol 2 sends plain presence.

@@ -35,7 +35,6 @@ use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use craft_cloud_proto::SpaceId;
 use craft_cloud_proto::api::codes as api_codes;
 use craft_cloud_proto::live::AppName;
 use craft_cloud_proto::local::{MAX_LOCAL_JSON_BYTES, RecentsEvent, RecentsRequest, codes};
@@ -77,6 +76,7 @@ fn error(id: Option<u64>, e: &HubError) -> RecentsEvent {
         HubError::Invalid(_) => api_codes::INVALID,
         HubError::Failed(_) => api_codes::INTERNAL,
         HubError::Gone => codes::NOT_SIGNED_IN,
+        HubError::ReadOnly => api_codes::READ_ONLY,
     };
     RecentsEvent::Error { id, code: code.into(), message: e.to_string() }
 }
@@ -97,13 +97,15 @@ async fn serve(mut socket: WebSocket, hub: HubHandle, api: Arc<ApiState>) {
                     Err(e) => Some(RecentsEvent::Error { id: None, code: api_codes::INVALID.into(), message: format!("not a recents request: {e}") }),
                     Ok(RecentsRequest::Subscribe { app, space }) => match AppName::new(&app) {
                         Err(e) => Some(RecentsEvent::Error { id: None, code: api_codes::INVALID.into(), message: e.to_string() }),
-                        // A team space's list comes from that space's own hub, which must sync on this computer.
-                        Ok(_) if space.is_some_and(|space| api.control.team_hub(space).is_none()) => Some(RecentsEvent::Error {
-                            id: None,
-                            code: api_codes::NOT_FOUND.into(),
-                            message: "that space doesn't sync on this computer".into(),
-                        }),
-                        Ok(name) => match team_or_personal(&api, &hub, space).follow(name).await {
+                        // A team space's list comes from that space's own hub, which must sync on this computer (looked up once:
+                        // never the personal hub's list under the team's name).
+                        Ok(name) => match space.map_or(Some(hub.clone()), |space| api.control.team_hub(space).map(|team| team.handle)) {
+                            None => Some(RecentsEvent::Error {
+                                id: None,
+                                code: api_codes::NOT_FOUND.into(),
+                                message: "that space doesn't sync on this computer".into(),
+                            }),
+                            Some(target) => match target.follow(name).await {
                             Err(e) => Some(error(None, &e)),
                             Ok(mut list) => {
                                 let out = out.clone();
@@ -124,6 +126,7 @@ async fn serve(mut socket: WebSocket, hub: HubHandle, api: Arc<ApiState>) {
                                 });
                                 None
                             }
+                            },
                         },
                     },
                     Ok(RecentsRequest::Add { id, app, mut entry }) => match AppName::new(&app) {
@@ -170,11 +173,6 @@ async fn serve(mut socket: WebSocket, hub: HubHandle, api: Arc<ApiState>) {
         }
     }
     let _ = socket.send(Message::Close(None)).await;
-}
-
-/// The hub of team space `space` (it syncs here: checked by the caller), or the personal hub.
-fn team_or_personal(api: &ApiState, personal: &HubHandle, space: Option<SpaceId>) -> HubHandle {
-    space.and_then(|space| api.control.team_hub(space)).map_or_else(|| personal.clone(), |team| team.handle)
 }
 
 /// Sends one event within [`SEND_TIMEOUT`]; false when the connection is done (or the client too slow to read).

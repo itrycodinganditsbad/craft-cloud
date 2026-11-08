@@ -2042,6 +2042,11 @@ async fn a_viewer_opens_read_only_and_what_it_types_is_neither_kept_nor_sent() {
     let path = ben_folder.join("plan.txt").display().to_string();
     let refused = t.ben.api(move |c| c.blobs().put_for(b"image bytes", &path)).await.unwrap_err();
     assert!(matches!(&refused, craft_cloud_app::Error::Refused { code, .. } if code == "read_only"), "{refused:?}");
+
+    // So is a recents entry for a file of the space: it could never go up, so it is not kept to be acked.
+    let path = ben_folder.join("plan.txt").display().to_string();
+    let refused = t.ben.api(move |c| c.add_recent("wordcraft", NewRecent { path, title: None, saved: false })).await.unwrap_err();
+    assert!(matches!(&refused, craft_cloud_app::Error::Refused { code, .. } if code == "read_only"), "{refused:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2161,6 +2166,83 @@ async fn a_change_waiting_in_a_journal_survives_a_revocation_and_goes_up_when_th
     })
     .await;
     eventually("nothing waits any more", || async { again.pump().iter().any(|e| matches!(e, Event::Status { waiting: 0, .. })) }).await;
+    // And the app's own changes are taken again.
+    let seq = again.append(", and edited on");
+    eventually("the app's change is acked", || async { again.pump().contains(&Event::Acked(seq)) }).await;
+    eventually("it reaches ana", || async {
+        ana.pump();
+        ana.text() == "the plan, written offline, and edited on"
+    })
+    .await;
+}
+
+/// A space's live folder is one hub's at a time: sync turned off and on while changes wait in a journal (the old hub is still
+/// closing when the space is turned on again) loses none of them, also across a restart of the agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_a_space_off_and_on_with_changes_waiting_loses_none() {
+    let (mut t, ana_folder, ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let space = t.space;
+    let (_docs_ana, ana) = app_opens(&t.ana, ana_folder.join("plan.txt"), "the plan", false, 11).await;
+    let (docs_ben, ben) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 12).await;
+    t.ben.api(|c| c.pause()).await.unwrap();
+    eventually("ben's document is offline", || async { ben.pump().iter().any(|e| matches!(e, Event::Status { online: false, .. })) }).await;
+    for n in 1..=3 {
+        let seq = ben.append(&format!(" [{n}]"));
+        eventually("the agent keeps the change", || async { ben.pump().contains(&Event::Acked(seq)) }).await;
+    }
+    drop((docs_ben, ben));
+
+    // Off and at once on again, in the same folder, and the hub of the first run is still ending.
+    t.ben.sync_off(space).await;
+    t.ben.sync_on_in(space, &ben_folder).await;
+    t.ben.api(|c| c.resume()).await.unwrap();
+    let (_docs_again, again) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 13).await;
+    let seq = again.append(" [4]");
+    eventually("the new hub takes a change", || async { again.pump().contains(&Event::Acked(seq)) }).await;
+
+    // The agent is stopped and started again (what was acked and not yet written is either in the journal or in the document).
+    let (exit, out) = t.ben.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    t.ben.run();
+    eventually("every change reaches ana", || async {
+        ana.pump();
+        let text = ana.text();
+        (1..=4).all(|n| text.contains(&format!("[{n}]")))
+    })
+    .await;
+}
+
+/// An app with documents of two spaces open is told when one space stops syncing: the document is `stopped`, a change to it is
+/// refused with `not_found` (not dropped), and the other space's document goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_app_is_told_when_the_space_of_an_open_document_stops_syncing() {
+    let (t, ana_folder, ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let space = t.space;
+    write(&t.ben.personal, "mine.txt", "my own");
+    let (_docs_ana, _ana) = app_opens(&t.ana, ana_folder.join("plan.txt"), "the plan", false, 11).await;
+    let client = t.ben.client();
+    let (team_path, personal_path) = (ben_folder.join("plan.txt"), t.ben.personal.join("mine.txt"));
+    let (docs_ben, team_doc, personal_doc) = off(move || {
+        let docs = client.documents().unwrap();
+        let team = AppDoc::new(live(open_doc(&docs, &team_path, "unused", false)), 21);
+        let personal = AppDoc::new(live(open_doc(&docs, &personal_path, "my own", false)), 22);
+        (docs, team, personal)
+    })
+    .await;
+    t.ben.sync_off(space).await;
+    eventually("the team document is told it is stopped", || async {
+        team_doc.pump().iter().any(|e| matches!(e, Event::Status { stopped: true, .. }))
+    })
+    .await;
+    let seq = team_doc.append(", typed after the space stopped");
+    eventually("the change is refused, not dropped", || async {
+        team_doc.pump().iter().any(|e| matches!(e, Event::Refused { seq: s, code, .. } if *s == seq && code == "not_found"))
+    })
+    .await;
+    // The personal document is not affected.
+    let seq = personal_doc.append(" + more");
+    eventually("the personal document takes changes", || async { personal_doc.pump().contains(&Event::Acked(seq)) }).await;
+    drop(docs_ben);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2252,6 +2334,10 @@ async fn a_blob_put_for_a_team_file_lands_in_the_space_and_another_members_agent
     // And a path in no synced folder is refused.
     let outside = t.ben.dir.path().join("elsewhere.txt").display().to_string();
     let refused = t.ben.api(move |c| c.blobs().put_for(b"x", &outside)).await.unwrap_err();
+    assert!(matches!(&refused, craft_cloud_app::Error::Refused { code, .. } if code == "invalid"), "{refused:?}");
+    // A path that climbs out of the team folder is not the team space's, whatever it starts with.
+    let climbing = ben_folder.join("..").join("elsewhere.txt").display().to_string();
+    let refused = t.ben.api(move |c| c.blobs().put_for(b"x", &climbing)).await.unwrap_err();
     assert!(matches!(&refused, craft_cloud_app::Error::Refused { code, .. } if code == "invalid"), "{refused:?}");
 }
 
