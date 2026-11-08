@@ -163,6 +163,7 @@ fn snapshot_the_work_done() {
     shots(&model, "make-space-done");
     let mut kept = status_at(FromFolderStep::Done);
     kept.kept = 2;
+    kept.message = Some("1 file changed after the copy and is not in the team space as it is now; 1 file could not be deleted because a program holds it: it is in the team space, and you can delete it yourself.".into());
     set_status(&mut model, kept);
     shot(&model, egui::Theme::Light, "make-space-done-kept", NORMAL);
 }

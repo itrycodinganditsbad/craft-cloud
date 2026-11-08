@@ -198,12 +198,11 @@ pub fn notice(status: &FromFolderStatus, dismissed: Option<&str>) -> Option<Noti
                 "“{name}” is a team space now, and its files are in the folder beside your own. “{folder}” was deleted from this computer \
                  and is in the trash on the server, where you can restore it."
             );
-            if status.kept > 0 {
+            if let Some(said) = status.message.as_deref().filter(|m| !m.is_empty()) {
+                // The agent says what stayed in the old folder, and why.
                 text = format!(
-                    "“{name}” is a team space now. {} file{} stayed in “{folder}”: changed after the copy, or of a kind that doesn't sync. \
-                     The rest is in the trash on the server.",
-                    status.kept,
-                    if status.kept == 1 { "" } else { "s" }
+                    "“{name}” is a team space now. {} The other files of “{folder}” were deleted from this computer and are in the trash on the server.",
+                    sentence(said)
                 );
             }
             Notice { tone: Tone::Good, title: "The team space is ready".into(), text, progress: None, retry: false, dismiss: true, open_shared: true }
@@ -593,8 +592,9 @@ mod tests {
         assert_eq!(n.tone, Tone::Good);
         assert!(n.text.contains("trash on the server") && n.open_shared && n.dismiss && !n.retry, "{n:?}");
         status.kept = 2;
+        status.message = Some("2 files changed after the copy and are not in the team space as they are now.".into());
         let kept = notice(&status, None).unwrap();
-        assert!(kept.text.contains("2 files stayed in “Shots”"), "{}", kept.text);
+        assert!(kept.text.contains("2 files changed after the copy") && kept.text.contains("other files of “Shots”"), "{}", kept.text);
         let key = dismissal_key(&status);
         assert!(notice(&status, Some(&key)).is_none());
         // Another run's notice is shown again.
