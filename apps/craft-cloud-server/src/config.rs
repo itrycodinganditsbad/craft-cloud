@@ -512,6 +512,11 @@ path = "/tmp/blobs"
         assert_eq!(Config::parse(DISK).unwrap().live_bytes_per_user, 1 << 30, "1 GiB by default");
         assert_eq!(Config::parse(&format!("live_bytes_per_user = 5_000_000\n{DISK}")).unwrap().live_bytes_per_user, 5_000_000);
         assert!(matches!(Config::parse(&format!("live_bytes_per_user = -1\n{DISK}")), Err(ConfigError::Parse(_))));
+        // A team space has a cap of its own (4 GiB by default) in the optional [spaces] section.
+        assert_eq!(Config::parse(DISK).unwrap().spaces.team_live_bytes, 4 << 30, "4 GiB by default");
+        assert_eq!(Config::parse(&format!("{DISK}\n[spaces]\nteam_live_bytes = 7_000_000\n")).unwrap().spaces.team_live_bytes, 7_000_000);
+        assert!(matches!(Config::parse(&format!("{DISK}\n[spaces]\nteam_live_bytes = -1\n")), Err(ConfigError::Parse(_))));
+        assert!(matches!(Config::parse(&format!("{DISK}\n[spaces]\nteam_stored = 1\n")), Err(ConfigError::Parse(_))), "unknown keys are refused");
     }
 
     #[test]

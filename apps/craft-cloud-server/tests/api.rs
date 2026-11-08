@@ -1404,12 +1404,13 @@ async fn live_quiet(ws: &mut Ws) {
 /// A connection past `hello`.
 async fn live_ready(s: &Server, token: &str) -> Ws {
     let mut ws = open_live(s, Some(token)).await.unwrap();
-    live_send(&mut ws, ClientFrame::Hello { min: LIVE_PROTOCOL_MIN, max: LIVE_PROTOCOL_MAX }).await;
+    // An agent of protocol 2, which is what these scenarios are about (protocol 3 is in `team_live.rs`).
+    live_send(&mut ws, ClientFrame::Hello { min: LIVE_PROTOCOL_MIN, max: LIVE_DOCUMENTS_PROTOCOL }).await;
     let epoch = space_of(s, token).await.epoch;
     assert_eq!(
         live_next(&mut ws).await,
         Some(ServerFrame::Welcome { protocol: LIVE_DOCUMENTS_PROTOCOL, epoch }),
-        "protocol 2 for now, with the space's epoch"
+        "protocol 2, with the space's epoch"
     );
     ws
 }
