@@ -24,6 +24,11 @@ pub enum TransportError {
     /// admin has freed space or raised the capacity.
     #[error("The server is full; the admin needs to free space or raise its capacity")]
     ServerFull,
+    /// The server refused a write because the account's role in this space doesn't allow one (`403 read_only`: a
+    /// viewer, or a space that was archived). Nothing was stored. The engine switches the space to read-only mode
+    /// ([`Engine::set_read_only`](crate::Engine::set_read_only)) and keeps every local change.
+    #[error("this space is read-only for you: your role in it doesn't allow changes")]
+    ReadOnly,
     /// The change feed can't continue from our sequence number; list the whole tree.
     #[error("the change feed needs a full listing")]
     ResyncRequired,

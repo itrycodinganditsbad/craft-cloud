@@ -44,7 +44,7 @@ async fn run_server(config_path: &std::path::Path) -> Result<(), String> {
         (true, Some(public_url)) => Some(WebSettings::new(public_url, config.web_admin.idle_ms(), config.web_admin.absolute_ms())?),
         _ => None,
     };
-    let storage_info = craft_cloud_server::space::StorageInfo::from_config(&config);
+    let storage_info = craft_cloud_server::storage_info::StorageInfo::from_config(&config);
     let state = AppState::new(meta, store, config.trusted_proxies.clone())
         .map_err(|e| e.message)?
         .with_public_url(config.public_url.clone())

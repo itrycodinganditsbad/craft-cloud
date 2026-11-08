@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::ids::DeviceId;
+use crate::ids::{DeviceId, Epoch, NodeId, SpaceId};
 
 /// Stable error codes, the `error` field of an error answer ([`ErrorAnswer`]).
 pub mod codes {
@@ -50,6 +50,11 @@ pub mod codes {
     pub const ACCOUNT_DISABLED: &str = "account_disabled";
     /// An admin change would leave the server without an enabled administrator (HTTP 409).
     pub const LAST_ADMIN: &str = "last_admin";
+    /// A change to a team space's members would leave it without an owner (HTTP 409).
+    pub const LAST_OWNER: &str = "last_owner";
+    /// The account is a member of the team space but its role does not allow this (HTTP 403): a viewer writing, an editor
+    /// removing from the trash. The agent switches that space to read-only on it. Never 401, which reads as "signed out".
+    pub const READ_ONLY: &str = "read_only";
     /// A password sign-in (or the redeeming of an invite or reset code for an account with two-factor sign-in) was
     /// right, but needs a second factor (HTTP 401, no token). The answer's `two_factor` carries the challenge.
     pub const TWO_FACTOR_REQUIRED: &str = "two_factor_required";
@@ -644,7 +649,7 @@ pub struct AuditDetails {
     /// How far a failed sign-in got: `password`, `totp`, `recovery` or `challenge_expired`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<String>,
-    /// `admin` or `member`.
+    /// `admin` or `member` for an account's role, `viewer`, `editor` or `owner` for a role in a team space.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -666,6 +671,9 @@ pub struct AuditDetails {
     /// Set (to `true`) when redeeming a password reset code also turned the account's two-factor sign-in off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub two_factor_removed: Option<bool>,
+    /// The account a team space event is about (the invited, changed or removed member, or the first owner).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<Uuid>,
     /// Set when the values were too long for the log and whole fields were left out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
@@ -714,9 +722,199 @@ pub struct AuditExportEnd {
     pub exported: u64,
 }
 
+/// What an account may do in a team space, from least to most: a viewer reads, an editor also writes, an owner also
+/// manages the members. The order is the permission order, so `role >= SpaceRole::Editor` reads as "may write".
+/// A personal space's owner has `Owner` in it implicitly. The words are the ones the `space_members` table and the
+/// API use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpaceRole {
+    Viewer,
+    Editor,
+    Owner,
+}
+
+impl SpaceRole {
+    /// Every role, least permission first.
+    pub const ALL: [SpaceRole; 3] = [SpaceRole::Viewer, SpaceRole::Editor, SpaceRole::Owner];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpaceRole::Viewer => "viewer",
+            SpaceRole::Editor => "editor",
+            SpaceRole::Owner => "owner",
+        }
+    }
+
+    /// The role with this exact word.
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|role| role.as_str() == word)
+    }
+
+    /// Whether the role may change files (commit, restore, upload).
+    pub fn may_write(self) -> bool {
+        self >= SpaceRole::Editor
+    }
+}
+
+/// The confirmation an administrator's change carries: the password, and the second factor when the account has one (see
+/// [`AdminConfirm`]). The space routes flatten it into their bodies, where an owner acting by their own role leaves it out.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceConfirm {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
+}
+
+impl std::fmt::Debug for SpaceConfirm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpaceConfirm")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// One space in `GET /spaces`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceListItem {
+    pub id: SpaceId,
+    /// `personal` or `team`.
+    pub kind: String,
+    /// The team space's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub role: SpaceRole,
+    /// `active`, or `invited` for an invitation not yet accepted.
+    pub state: String,
+    pub archived: bool,
+    pub created_ms: i64,
+    /// Accepted members.
+    pub members: u64,
+    /// Not given for an invitation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<Epoch>,
+}
+
+/// `GET /spaces`: the personal space first, then the team spaces by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceList {
+    pub spaces: Vec<SpaceListItem>,
+}
+
+/// A member of a team space, or an account invited to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceMember {
+    pub user: Uuid,
+    pub username: String,
+    pub role: SpaceRole,
+    /// `active` or `invited`.
+    pub state: String,
+    /// The palette index (0 to 11) the account is shown in, the same on every machine.
+    pub colour: u8,
+}
+
+/// `GET /spaces/{id}/members`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceMembers {
+    pub members: Vec<SpaceMember>,
+}
+
+/// `POST /spaces/{id}/members`: invite an account. An owner leaves the confirmation out; an administrator who is not an
+/// owner gives it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddSpaceMember {
+    pub username: String,
+    pub role: SpaceRole,
+    #[serde(flatten)]
+    pub confirm: SpaceConfirm,
+}
+
+/// `PATCH /spaces/{id}/members/{user}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeSpaceMember {
+    pub role: SpaceRole,
+    #[serde(flatten)]
+    pub confirm: SpaceConfirm,
+}
+
+/// `GET /spaces/{id}/usage`: as `/account/usage` for the space, with what its live documents hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceUsage {
+    pub stored_bytes: u64,
+    pub quota_bytes: Option<u64>,
+    pub trash_bytes: Option<u64>,
+    pub history_bytes: Option<u64>,
+    pub live_bytes: u64,
+    pub estimates: UsageEstimates,
+}
+
+/// `PATCH /spaces/{id}`: a new name (an owner, or an administrator with the confirmation) and/or a new limit (an
+/// administrator, with the confirmation; `null` removes the space's own limit).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateSpace {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<Option<u64>>,
+    #[serde(flatten)]
+    pub confirm: SpaceConfirm,
+}
+
+/// `POST /spaces/{id}/archive` and `/unarchive` with the owner's password, or an administrator's confirmation.
+pub type SpaceArchive = SpaceConfirm;
+
+/// `POST /admin/spaces`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminCreateSpace {
+    pub name: String,
+    /// The first owner's account ID: added as an accepted owner.
+    pub owner: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<u64>,
+    #[serde(flatten)]
+    pub confirm: SpaceConfirm,
+}
+
+/// `PUT /admin/spaces/{id}/owner`: make an account an accepted owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminSetSpaceOwner {
+    pub user: Uuid,
+    #[serde(flatten)]
+    pub confirm: SpaceConfirm,
+}
+
+/// A team space in the administrator's list: counts and sizes, never content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminSpaceInfo {
+    pub id: SpaceId,
+    pub name: String,
+    pub created_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_ms: Option<i64>,
+    pub members: u64,
+    pub owners: u64,
+    pub stored_bytes: u64,
+    pub quota_bytes: Option<u64>,
+}
+
+/// `GET /admin/spaces`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminSpaceList {
+    pub spaces: Vec<AdminSpaceInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
 /// The names of the security events, the closed list the server writes and `GET /admin/audit` filters by (`docs/design/sync.md`,
 /// "Security audit log"). A filter is one of these, or a prefix of some of them that ends in a dot, like `auth.`.
-pub const AUDIT_ACTIONS: [&str; 31] = [
+pub const AUDIT_ACTIONS: [&str; 45] = [
     "auth.login",
     "auth.login_failed",
     "auth.second_factor_failed",
@@ -748,6 +946,20 @@ pub const AUDIT_ACTIONS: [&str; 31] = [
     "cli.device_revoked",
     "cli.devices_revoked_all",
     "cli.user_removed",
+    "space.created",
+    "space.renamed",
+    "space.archived",
+    "space.unarchived",
+    "space.quota_changed",
+    "space.member_invited",
+    "space.member_joined",
+    "space.member_declined",
+    "space.member_role_changed",
+    "space.member_removed",
+    "space.member_left",
+    "cli.space_created",
+    "cli.space_member_changed",
+    "cli.space_archived",
 ];
 
 /// Whether `text` is an audit filter the server takes for `action`: an event name, or a prefix ending in a dot that at least
@@ -778,6 +990,8 @@ mod tests {
         assert_eq!(codes::FORBIDDEN, "forbidden");
         assert_eq!(codes::ACCOUNT_DISABLED, "account_disabled");
         assert_eq!(codes::LAST_ADMIN, "last_admin");
+        assert_eq!(codes::LAST_OWNER, "last_owner");
+        assert_eq!(codes::READ_ONLY, "read_only");
     }
 
     #[test]
@@ -866,10 +1080,23 @@ mod tests {
     }
 
     #[test]
+    fn space_roles_are_ordered_by_permission_and_keep_their_words() {
+        assert!(SpaceRole::Viewer < SpaceRole::Editor && SpaceRole::Editor < SpaceRole::Owner);
+        assert!(!SpaceRole::Viewer.may_write() && SpaceRole::Editor.may_write() && SpaceRole::Owner.may_write());
+        for role in SpaceRole::ALL {
+            assert_eq!(SpaceRole::parse(role.as_str()), Some(role));
+            assert_eq!(serde_json::to_string(&role).unwrap(), format!("\"{}\"", role.as_str()));
+        }
+        for bad in ["", "Viewer", "admin", "owner "] {
+            assert_eq!(SpaceRole::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
     fn audit_filters_are_the_closed_list_or_a_prefix_of_it() {
-        assert_eq!(AUDIT_ACTIONS.len(), 31);
+        assert_eq!(AUDIT_ACTIONS.len(), 45);
         assert!(AUDIT_ACTIONS.iter().all(|a| valid_audit_action(a)));
-        for prefix in ["auth.", "admin.", "cli.", "join.", "device.", "account."] {
+        for prefix in ["auth.", "admin.", "cli.", "join.", "device.", "account.", "space."] {
             assert!(valid_audit_action(prefix), "{prefix}");
         }
         for bad in ["", "auth", "auth.log", "nope.", "AUTH.", "auth.login ", "admin.user_created.", "x' OR 1=1 --", "a.b."] {

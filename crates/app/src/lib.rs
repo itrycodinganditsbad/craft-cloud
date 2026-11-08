@@ -57,6 +57,7 @@ pub mod fake;
 mod http;
 pub mod live;
 mod recents;
+mod spaces;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -78,13 +79,17 @@ pub use craft_cloud_api::api::{
     PairingStatus, RecoveryCodes, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus, UsageEstimateReason, UsageEstimates,
     valid_audit_action,
 };
+pub use craft_cloud_api::api::{SpaceListItem, SpaceRole};
+pub use craft_cloud_api::local::{
+    ApproveDeletesAnswer, ApproveDeletesRequest, SpaceInfo, SpaceList, SpaceRun, SpaceStatus, SpaceSync, SpaceSyncRequest,
+};
 pub use craft_cloud_api::local::{
     ConflictCopy, ConflictsResponse, FileKind, FolderUsage, FolderUsageResponse, HistoryResponse, HistoryVersion, JoinRequest, LoginRequest,
     NewRecent, PairingInfo, RecentEntry, RestoreResponse, RunState, SecondFactorLoginRequest, Status, TrashItem, TrashNodeRequest, TrashResponse,
     TrashRestoreResponse, TwoFactorProofRequest, codes,
 };
 pub use craft_cloud_api::local::{KindUsage, OtherFolders};
-pub use craft_cloud_api::{NodeId, VersionId};
+pub use craft_cloud_api::{NodeId, SpaceId, VersionId};
 pub use recents::{RecentsEvent, RecentsWatch};
 pub use uuid::Uuid;
 
@@ -586,6 +591,7 @@ mod tests {
             autostart: Some(signed_in),
             last_sync_ms: None,
             removed: false,
+            spaces: Vec::new(),
         }
     }
 
@@ -1125,5 +1131,67 @@ mod tests {
         std::fs::write(dir.path().join(LOCAL_API_FILE), file.to_string()).unwrap();
         let Err(Error::NotRunning(why)) = Client::connect_in(dir.path()) else { panic!("connected to nothing") };
         assert!(!why.contains("its agent stopped"), "told by the pid: {why}");
+    }
+    /// The space calls send their requests to their paths and read the agent's answers; an older agent's "no such call" is
+    /// `agent_too_old`, while the server's own `not_found` (no such invitation) passes through.
+    #[test]
+    fn space_calls_send_their_requests_and_an_older_agent_is_too_old() {
+        let space = SpaceId::generate();
+        let info = SpaceInfo {
+            space,
+            kind: "team".into(),
+            name: Some("Studio".into()),
+            role: SpaceRole::Editor,
+            state: "active".into(),
+            archived: false,
+            folder: Some("/home/ana/Craft Cloud Shared/Studio".into()),
+            sync: SpaceSync::Off,
+            run_state: None,
+            last_sync_ms: None,
+            read_only: false,
+        };
+        let item = SpaceListItem {
+            id: space,
+            kind: "team".into(),
+            name: Some("Studio".into()),
+            role: SpaceRole::Editor,
+            state: "active".into(),
+            archived: false,
+            created_ms: 1,
+            members: 2,
+            root: Some(NodeId::generate()),
+            epoch: None,
+        };
+        let no_such_call = json(&ErrorAnswer { error: "not_found".into(), message: "no such call".into(), name_taken: None });
+        let no_invitation = json(&ErrorAnswer { error: "not_found".into(), message: "server: not found".into(), name_taken: None });
+        let script = vec![
+            (200, json(&SpaceList { spaces: vec![info.clone()] })),
+            (200, json(&item)),
+            (204, String::new()),
+            (200, json(&SpaceInfo { sync: SpaceSync::On, ..info.clone() })),
+            (200, json(&ApproveDeletesAnswer { approved: true, message: "the running agent will carry out these deletions".into() })),
+            (404, no_invitation),
+            (404, no_such_call),
+        ];
+        let (_dir, agent, asked) = fake_agent(script);
+        let next = || asked.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        assert_eq!(agent.spaces().unwrap().spaces, vec![info.clone()]);
+        assert_eq!(next(), ("GET".to_owned(), "/v1/spaces".to_owned(), String::new()));
+        assert_eq!(agent.accept_space(space).unwrap(), item);
+        assert_eq!(next(), ("POST".to_owned(), format!("/v1/spaces/{space}/accept"), String::new()));
+        agent.decline_space(space).unwrap();
+        assert_eq!(next(), ("POST".to_owned(), format!("/v1/spaces/{space}/decline"), String::new()));
+        let on = agent.set_space_sync(space, &SpaceSyncRequest { on: true, folder: None, adopt: true }).unwrap();
+        assert_eq!(on.sync, SpaceSync::On);
+        assert_eq!(next(), ("POST".to_owned(), format!("/v1/spaces/{space}/sync"), r#"{"on":true,"adopt":true}"#.to_owned()));
+        let approved = agent.approve_space_deletes(space, Some("3f9a0b1c2d3e")).unwrap();
+        assert!(approved.approved);
+        assert_eq!(next(), ("POST".to_owned(), format!("/v1/spaces/{space}/approve-deletes"), r#"{"set":"3f9a0b1c2d3e"}"#.to_owned()));
+        let gone = agent.decline_space(space).unwrap_err();
+        assert!(matches!(&gone, Error::Refused { code, .. } if code == "not_found"), "the server's answer passes through: {gone:?}");
+        next();
+        let old = agent.spaces().unwrap_err();
+        assert!(matches!(&old, Error::Refused { code, .. } if code == codes::AGENT_TOO_OLD), "{old:?}");
     }
 }

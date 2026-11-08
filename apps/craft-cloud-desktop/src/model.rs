@@ -2903,6 +2903,7 @@ pub(crate) mod tests {
             autostart: Some(signed_in),
             last_sync_ms: None,
             removed: false,
+            spaces: Vec::new(),
         }
     }
 

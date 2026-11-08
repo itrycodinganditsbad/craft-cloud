@@ -19,7 +19,7 @@ use crate::live::LiveHub;
 use crate::notify::Notifier;
 use crate::ratelimit::Limiter;
 use crate::secretbox::SecretBox;
-use crate::space::StorageInfo;
+use crate::storage_info::StorageInfo;
 
 /// How much one user, or one request, may hold on the server at once. Each user's limits are their own, so a
 /// stalled or greedy client only ever slows its own account.
@@ -116,6 +116,8 @@ pub struct AppState {
     pub joins: Limiter,
     /// Password change tries per account, in 15-minute windows ([`crate::account`]).
     pub password_changes: Limiter,
+    /// Invitations to team spaces per account, in one-minute windows ([`crate::spaces`]).
+    pub space_invites: Limiter,
     /// Wrong second factors per account and per client address, in five-minute windows ([`crate::two_factor`]).
     pub second_factors: Limiter,
     /// Sign-in attempts to the admin pages per client address and per account, in five-minute windows ([`crate::web`]).
@@ -173,6 +175,7 @@ impl AppState {
             logins: Limiter::new(Duration::from_secs(300)),
             joins: Limiter::new(Duration::from_secs(60)),
             password_changes: Limiter::new(Duration::from_secs(900)),
+            space_invites: Limiter::new(Duration::from_secs(60)),
             second_factors: Limiter::new(Duration::from_secs(300)),
             web_logins: Limiter::new(Duration::from_secs(300)),
             web: None,

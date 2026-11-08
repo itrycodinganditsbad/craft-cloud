@@ -2201,8 +2201,8 @@ async fn upgrading_counts_what_each_space_already_stores() {
     };
     {
         // The database as it was before stored bytes were counted.
-        use sqlx::Connection;
-        let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        let mut conn = raw(&url).await;
+        undo_team_spaces(&mut conn).await;
         // Before the audit log.
         sqlx::query("DROP TABLE web_sessions").execute(&mut conn).await.unwrap();
         sqlx::query("DROP TABLE audit_events").execute(&mut conn).await.unwrap();
@@ -2269,7 +2269,7 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 15);
+    assert_eq!(versions, 16);
 }
 
 // ---- device sessions (migration 0007) ----
@@ -2642,7 +2642,7 @@ async fn migrating_from_0006_keeps_the_rows(url: &str) {
     assert_eq!(schema_version(url).await, 6);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 15);
+    assert_eq!(schema_version(url).await, 16);
     let old = record(&meta, &ana, live).await;
     assert_eq!(
         (old.name.as_str(), old.revoked, old.client, old.revoked_ms, old.revoke_reason),
@@ -3412,7 +3412,7 @@ async fn migrating_from_0009_keeps_the_rows(url: &str) {
     drop(conn);
     assert_eq!(schema_version(url).await, 9, "the audit log's migration stays");
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 15);
+    assert_eq!(schema_version(url).await, 16);
     assert_eq!(all_events(&meta).await.len(), audit_rows, "the audit rows are kept");
     assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().id, ana.id);
     assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 1).await.unwrap(), Some(false));
@@ -3682,11 +3682,11 @@ async fn the_schema_version_is_recorded_and_a_newer_database_is_refused() {
     use sqlx::Connection;
     let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
     let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(latest, 15);
+    assert_eq!(latest, 16);
     // Opening again changes nothing.
     drop(Meta::open(&url).await.unwrap());
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(rows, 15);
+    assert_eq!(rows, 16);
     sqlx::query("INSERT INTO schema_version (version) VALUES (16)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(&url).await, Err(MetaError::Corrupt(_))), "a newer database is refused");
@@ -4366,8 +4366,44 @@ async fn raw(url: &str) -> sqlx::AnyConnection {
     sqlx::AnyConnection::connect(url).await.unwrap()
 }
 
+/// Undoes migration 0016 (team spaces): the `spaces` table goes back to its shape in 0015, which older migration tests start
+/// from. The version row is the caller's to delete. SQLite rebuilds the table, as the migration did.
+async fn undo_team_spaces(conn: &mut sqlx::AnyConnection) {
+    let sqlite = sqlx::query("SELECT 1 FROM sqlite_master LIMIT 1").execute(&mut *conn).await.is_ok();
+    let statements: &[&str] = if sqlite {
+        &[
+            "PRAGMA foreign_keys = OFF",
+            "DROP TABLE space_members",
+            "CREATE TABLE spaces_old (id BLOB PRIMARY KEY, owner BLOB NOT NULL UNIQUE REFERENCES users (id), epoch BLOB NOT NULL, seq BIGINT NOT NULL,              oldest_seq BIGINT NOT NULL, root BLOB NOT NULL, stored_bytes BIGINT NOT NULL DEFAULT 0, live_bytes BIGINT NOT NULL DEFAULT 0, quota_bytes BIGINT)",
+            "INSERT INTO spaces_old SELECT id, owner, epoch, seq, oldest_seq, root, stored_bytes, live_bytes, quota_bytes FROM spaces",
+            "DROP TABLE spaces",
+            "ALTER TABLE spaces_old RENAME TO spaces",
+            "PRAGMA foreign_keys = ON",
+        ]
+    } else {
+        &[
+            "DROP TABLE space_members",
+            "DROP INDEX spaces_personal_owner",
+            "DROP INDEX spaces_team_name",
+            "ALTER TABLE spaces DROP CONSTRAINT spaces_owner_by_kind",
+            "ALTER TABLE spaces DROP CONSTRAINT spaces_name_by_kind",
+            "ALTER TABLE spaces DROP COLUMN kind",
+            "ALTER TABLE spaces DROP COLUMN name",
+            "ALTER TABLE spaces DROP COLUMN name_fold",
+            "ALTER TABLE spaces DROP COLUMN created_ms",
+            "ALTER TABLE spaces DROP COLUMN archived_ms",
+            "ALTER TABLE spaces ALTER COLUMN owner SET NOT NULL",
+            "ALTER TABLE spaces ADD CONSTRAINT spaces_owner_key UNIQUE (owner)",
+        ]
+    };
+    for statement in statements.iter().copied() {
+        sqlx::query(statement).execute(&mut *conn).await.unwrap();
+    }
+}
+
 /// Removes the last three migrations and their version rows, so older migration tests can start from the version they name.
 async fn drop_history_trash_and_manifest_index(conn: &mut sqlx::AnyConnection) {
+    undo_team_spaces(conn).await;
     for statement in [
         "DROP TABLE manifest_chunks",
         "DROP TABLE manifest_index",
@@ -4386,6 +4422,7 @@ async fn drop_history_trash_and_manifest_index(conn: &mut sqlx::AnyConnection) {
 
 /// Removes the trash and manifest-index migrations but retains the version-history migration.
 async fn drop_trash_and_manifest_index(conn: &mut sqlx::AnyConnection) {
+    undo_team_spaces(conn).await;
     for statement in [
         "DROP TABLE manifest_chunks",
         "DROP TABLE manifest_index",
@@ -4446,7 +4483,7 @@ async fn the_trash_migration_dates_old_deletions_at_the_migration(url: &str) {
     assert_eq!(again.entries, page.entries);
     let mut conn = raw(url).await;
     let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(latest, 15);
+    assert_eq!(latest, 16);
     let live_with_time: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE deleted = 0 AND (deleted_ms IS NOT NULL OR purge_requested_ms IS NOT NULL)")
             .fetch_one(&mut conn)
@@ -4507,7 +4544,7 @@ async fn migrating_from_0007_keeps_the_rows(url: &str) {
     assert_eq!(schema_version(url).await, 7);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 15);
+    assert_eq!(schema_version(url).await, 16);
     assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.user), Some(ana.id));
     let row = admin_view(&meta, ana.id).await;
     assert_eq!((row.disabled_ms, row.quota_bytes, row.stored_bytes, row.devices_active, row.invite_pending), (None, None, 42, 1, true));
@@ -5328,7 +5365,7 @@ async fn migrating_from_0008_adds_the_audit_log(url: &str) {
     assert_eq!(schema_version(url).await, 8);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 15, "all migrations after the audit log run");
+    assert_eq!(schema_version(url).await, 16, "all migrations after the audit log run");
     assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.user), Some(ana.id));
     assert!(all_events(&meta).await.is_empty(), "a new log is empty");
     meta.sign_in_device(ana.id, (&ana.password_hash, ana.auth_gen), "pc", &DeviceClient::default(), &token(), NOW).await.unwrap().unwrap();
@@ -6920,7 +6957,7 @@ async fn migrating_from_0010_adds_the_web_sessions(url: &str) {
     assert_eq!(schema_version(url).await, 10);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 15, "the current schema includes history, trash and the reference index after web sessions");
+    assert_eq!(schema_version(url).await, 16, "the current schema includes history, trash and the reference index after web sessions");
     assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.user), Some(root.id));
     assert_eq!(all_events(&meta).await.len(), events, "the audit rows are kept");
     let session = new_session();
@@ -6932,7 +6969,7 @@ async fn migrating_from_0010_adds_the_web_sessions(url: &str) {
     back_to_0010(url).await;
     assert_eq!(schema_version(url).await, 10);
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 15);
+    assert_eq!(schema_version(url).await, 16);
     assert!(!session_is_valid(&meta, &session, NOW + 6).await, "the table is new and empty");
     drop(meta);
 
@@ -7355,6 +7392,7 @@ async fn the_index_migration_leaves_old_manifests_unindexed_on(url: &str) {
     let _ = ana;
     {
         let mut conn = raw(url).await;
+        undo_team_spaces(&mut conn).await;
         for statement in [
             "DROP TABLE manifest_chunks",
             "DROP TABLE manifest_index",
@@ -7372,7 +7410,7 @@ async fn the_index_migration_leaves_old_manifests_unindexed_on(url: &str) {
     assert_eq!((audit.manifests, audit.complete, audit.absent, audit.building), (1, 0, 1, 0));
     let mut conn = raw(url).await;
     let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(latest, 15);
+    assert_eq!(latest, 16);
 }
 
 /// What the database alone can say is wrong, in seeded damage: orphan edges, an index row without its manifest, an edge
@@ -8005,6 +8043,7 @@ async fn migrating_from_0014_leaves_stored_sizes_unknown() {
     }
     {
         let mut conn = raw(&url).await;
+        undo_team_spaces(&mut conn).await;
         for statement in [
             "ALTER TABLE blobs DROP COLUMN physical_size",
             "ALTER TABLE blobs DROP COLUMN compress_level",
@@ -8016,7 +8055,7 @@ async fn migrating_from_0014_leaves_stored_sizes_unknown() {
     }
     assert_eq!(schema_version(&url).await, 14);
     let meta = Meta::open(&url).await.unwrap();
-    assert_eq!(schema_version(&url).await, 15);
+    assert_eq!(schema_version(&url).await, 16);
     let rows = meta.blob_page(None, 10).await.unwrap();
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|r| r.physical_size.is_none() && r.level.is_none()), "unknown, not zero: {rows:?}");

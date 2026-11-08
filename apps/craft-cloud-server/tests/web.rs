@@ -152,6 +152,7 @@ on_sqlite_and_postgres!(
     an_account_without_a_password_never_signs_in,
     the_slash_path_has_the_same_headers_and_policy,
     a_change_that_outlives_its_session_is_refused,
+    disabling_or_removing_over_the_pages_wakes_the_spaces_long_polls,
 );
 
 // ---- helpers ----
@@ -1557,4 +1558,34 @@ async fn a_change_that_outlives_its_session_is_refused(s: &Web) {
     stream.read_to_string(&mut answer).await.unwrap();
     assert!(answer.starts_with("HTTP/1.1 401"), "{answer}");
     assert!(s.meta.admin_user(vic.id, s.at()).await.unwrap().unwrap().disabled_ms.is_none(), "nothing changed");
+}
+
+/// Disabling or removing an account over the pages ends the long-polls it has on its team spaces at once, as the JSON routes do.
+async fn disabling_or_removing_over_the_pages_wakes_the_spaces_long_polls(s: &Web) {
+    use craft_cloud_meta::SpaceActor;
+    use craft_cloud_proto::SpaceName;
+    use craft_cloud_proto::api::SpaceRole;
+    s.add_admin("root").await;
+    let owner = s.add_user("own", Role::Member).await;
+    let (away, gone) = (s.add_user("away", Role::Member).await, s.add_user("gone", Role::Member).await);
+    let space = s.meta.create_team_space(&SpaceActor::Cli, &SpaceName::new("Studio").unwrap(), owner.id, None, 0).await.unwrap();
+    for member in [&away, &gone] {
+        s.meta.invite_member(&SpaceActor::Cli, space, member.id, SpaceRole::Viewer, 0).await.unwrap();
+    }
+    let boss = s.sign_in("root").await;
+    for (name, verb, id) in [("away", "disable", away.id.0), ("gone", "remove", gone.id.0)] {
+        let device = s.device(name).await;
+        let poll = {
+            let (client, url) = (s.client.clone(), s.url("/api/v1/changes?since=0&wait=30"));
+            tokio::spawn(async move { client.get(url).bearer_auth(device).header("craft-space", space.to_string()).send().await.unwrap() })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(!poll.is_finished(), "{name}: the long-poll waits");
+        assert_eq!(s.act(&boss, &format!("/web/users/{id}/{verb}"), &[]).await.status(), StatusCode::SEE_OTHER);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), poll)
+            .await
+            .unwrap_or_else(|_| panic!("{name}: the waiter was not woken"))
+            .unwrap();
+        assert!(matches!(res.status(), StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN), "{name}: {}", res.status());
+    }
 }

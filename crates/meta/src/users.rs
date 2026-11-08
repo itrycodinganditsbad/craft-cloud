@@ -195,6 +195,14 @@ pub struct DeviceAuth {
     pub username: String,
 }
 
+impl DeviceAuth {
+    /// The account's own (personal) space, for the routes that are about the account and never take a `craft-space`
+    /// header. A space-scoped handler takes its space from the server's `SpaceAccess` instead, never from here.
+    pub fn personal_space(&self) -> SpaceId {
+        self.space
+    }
+}
+
 /// Usernames: 1–64 bytes of ASCII letters, digits, `.`, `_`, `-`. They are stored in lowercase, so names that differ
 /// only in ASCII case are the same name.
 pub fn valid_username(name: &str) -> bool {
@@ -702,11 +710,12 @@ pub(crate) async fn insert_user(
             sqlx::Error::Database(ref db) if db.is_unique_violation() => MetaError::UsernameTaken,
             other => MetaError::Db(other),
         })?;
-    sqlx::query("INSERT INTO spaces (id, owner, epoch, seq, oldest_seq, root) VALUES ($1, $2, $3, 0, 0, $4)")
+    sqlx::query("INSERT INTO spaces (id, owner, epoch, seq, oldest_seq, root, created_ms) VALUES ($1, $2, $3, 0, 0, $4, $5)")
         .bind(uuid_bytes(space.as_uuid()))
         .bind(uuid_bytes(&user.0))
         .bind(uuid_bytes(Epoch::generate().as_uuid()))
         .bind(uuid_bytes(root.as_uuid()))
+        .bind(now_ms)
         .execute(&mut **tx)
         .await?;
     sqlx::query(

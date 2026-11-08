@@ -37,6 +37,9 @@ fn too_big(size: u64, limit: u64) -> String {
 
 impl<F: Fs, T: Transport> Engine<F, T> {
     pub(super) async fn push(&mut self, report: &mut Report) -> Result<(), SyncError> {
+        if self.read_only {
+            return self.push_read_only(report).await;
+        }
         let root = self.state.root.ok_or_else(|| SyncError::Corrupt("no root".into()))?;
         let (local, mut unseen) = self.scan(report)?;
         // Inside a folder that couldn't be listed, or at or below a link, nothing is known, so nothing tracked there
@@ -664,7 +667,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 let result = self.transport.commit(&only_ops).await;
                 // Applied or refused as a whole, the batch's deletes are no longer in doubt; any other answer leaves
                 // them written down.
-                if matches!(result, Ok(_) | Err(TransportError::Rejected(_))) {
+                if matches!(result, Ok(_) | Err(TransportError::Rejected(_) | TransportError::ReadOnly)) {
                     for (node, _) in &deletes {
                         self.state.sent_deletes.remove(node);
                     }
@@ -675,6 +678,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 match result {
                     Ok(_) => {
                         for (_, effect) in batch.drain(..) {
+                            if let Effect::File { id, .. } | Effect::Update { id, .. } = &effect {
+                                self.committed_files.insert(*id);
+                            }
                             self.record(effect, report);
                         }
                         if queue.is_empty()

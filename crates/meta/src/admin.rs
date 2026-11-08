@@ -200,7 +200,7 @@ impl Meta {
     /// Starts the write transaction of a change the admin `actor` makes (to `target`, if it has one): takes the
     /// locks in the order the module describes and checks the actor again. `reduces_admins`: the change can take an
     /// administrator away, so it takes the `last_admin` lock first.
-    async fn begin_admin(&self, actor: &AdminActor, target: Option<UserId>, reduces_admins: bool) -> Result<WriteTx, MetaError> {
+    pub(crate) async fn begin_admin(&self, actor: &AdminActor, target: Option<UserId>, reduces_admins: bool) -> Result<WriteTx, MetaError> {
         let mut w = self.begin_write().await?;
         // SQLite: the write transaction already serialises every change, so nothing more is needed there.
         if reduces_admins && self.dialect == Dialect::Postgres {

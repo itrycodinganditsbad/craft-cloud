@@ -17,7 +17,7 @@
 //!   ~35 KB/s). A stalled connection fails after a minute either way.
 //! - **Answers map onto [`TransportError`]** by the server's error codes first ([`codes`]), then by status:
 //!   a refused batch with its conflicts, missing chunks, `resync_required` and `quota_exceeded` (with how much the
-//!   account stores and may store) by code; 401 is `Unauthorized`,
+//!   account stores and may store) and `read_only` (the account's role in the space doesn't allow the write: a viewer) by code; 401 is `Unauthorized`,
 //!   404 `NotFound`; 408, 429, 5xx, connection failures and timeouts are `Unavailable` (try again later);
 //!   anything else, and any answer that doesn't parse, is `Protocol` (another 4xx says "the server or a proxy
 //!   refused the request (HTTP <code>)": a reverse proxy in front of the server may be the one refusing).
@@ -37,14 +37,14 @@ use bytes::{Bytes, BytesMut};
 use craft_cloud_proto::api::{
     AccountInfo, ChangePasswordRequest, CommitRequest, CommitResponse, DeviceInfo, ErrorBody, HistoryResponse, InfoResponse, JoinRequest,
     LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, PairingCreated, PairingStatus,
-    RecoveryCodes, RenameDeviceRequest, RestoreRequest, RestoreResponse, RevokedOthers, SecondFactorRequest, SpaceResponse, TwoFactorChallenge,
-    TwoFactorConfirmRequest, TwoFactorProofRequest, TwoFactorSetupRequest, TwoFactorSetupResponse, TwoFactorStatus, codes,
+    RecoveryCodes, RenameDeviceRequest, RestoreRequest, RestoreResponse, RevokedOthers, SecondFactorRequest, SpaceList, SpaceListItem, SpaceResponse,
+    TwoFactorChallenge, TwoFactorConfirmRequest, TwoFactorProofRequest, TwoFactorSetupRequest, TwoFactorSetupResponse, TwoFactorStatus, codes,
 };
 use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_PAGE_NODES};
 use craft_cloud_proto::local::MAX_MACHINE_BYTES;
-use craft_cloud_proto::{ChangeSet, ChunkId, DeviceId, ManifestId, NodeId, Op, PageCursor, SaveRecord, VersionId};
+use craft_cloud_proto::{ChangeSet, ChunkId, DeviceId, ManifestId, NodeId, Op, PageCursor, SaveRecord, SpaceId, VersionId};
 use craft_cloud_sync::{Transport, TransportError};
-use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT};
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER, USER_AGENT};
 use reqwest::{Client, Method, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -442,6 +442,7 @@ fn error_for(status: StatusCode, body: Option<ErrorBody>) -> TransportError {
             return TransportError::MissingChunks(missing.clone());
         }
         (Some(codes::RESYNC_REQUIRED), _) => return TransportError::ResyncRequired,
+        (Some(codes::READ_ONLY), _) => return TransportError::ReadOnly,
         (Some(codes::QUOTA_EXCEEDED), Some(ErrorBody { quota: Some(quota), .. })) => {
             return TransportError::QuotaExceeded { used: quota.used, limit: quota.limit };
         }
@@ -821,6 +822,29 @@ pub struct HttpTransport<C = Reqwest> {
     connection: C,
     server: ServerUrl,
     auth: HeaderValue,
+    /// The team space every request works on (`craft-space`); `None`: the account's personal space, as before. Every
+    /// answer that the server's space layer gives must echo it ([`TOO_OLD_FOR_TEAM_SPACES`]).
+    space: Option<HeaderValue>,
+}
+
+/// What the agent says when a server answers a request for a team space without echoing the space, or with another one:
+/// it is a server from before team spaces (it ignored the `craft-space` header and answered about the personal space).
+/// The space stops syncing with this message, so two trees are never mixed.
+pub const TOO_OLD_FOR_TEAM_SPACES: &str = "the server is too old for team spaces; ask the administrator to update it";
+
+/// Whether an answer to a request for team space `asked` carries the echo the server's space layer adds to every answer
+/// it produces (`craft-space` with the space it worked on). Checked on the answers that the layer or the handler behind it
+/// gives (success, `403`, `404`, `409`, `410`); a `400`, `401` or `429` can come from before the layer (or from a proxy in
+/// front of the server) and carries none.
+fn echoed(asked: &HeaderValue, answer: &Answer) -> Result<(), TransportError> {
+    let layered = answer.status.is_success() || matches!(answer.status.as_u16(), 403 | 404 | 409 | 410);
+    if !layered {
+        return Ok(());
+    }
+    match answer.headers.get(HeaderName::from_static("craft-space")) {
+        Some(echo) if echo.as_bytes().eq_ignore_ascii_case(asked.as_bytes()) => Ok(()),
+        _ => Err(TransportError::Protocol(TOO_OLD_FOR_TEAM_SPACES.into())),
+    }
 }
 
 /// A history or restore refusal, retaining the server's HTTP status and stable error code.
@@ -854,7 +878,15 @@ impl HttpTransport {
 impl<C: Connection> HttpTransport<C> {
     /// The API over another connection (a simulated network, in tests). `server` names the endpoints.
     pub fn over(connection: C, server: ServerUrl, token: &DeviceToken) -> Result<Self, TransportError> {
-        Ok(Self { connection, server, auth: token.bearer()? })
+        Ok(Self { connection, server, auth: token.bearer()?, space: None })
+    }
+
+    /// The same API for one space: every request names it in the `craft-space` header. Without it, the account's personal
+    /// space, which is also what a server from before team spaces answers about.
+    pub fn bound_to(mut self, space: SpaceId) -> Result<Self, TransportError> {
+        let value = HeaderValue::from_str(&space.to_string()).map_err(|_| TransportError::Protocol("a space ID that can't be sent".into()))?;
+        self.space = Some(value);
+        Ok(self)
     }
 
     pub fn server(&self) -> &ServerUrl {
@@ -932,8 +964,15 @@ impl<C: Connection> HttpTransport<C> {
         request(method, self.server.endpoint(path), Some(&self.auth), max_body)
     }
 
-    async fn send(&self, req: Request) -> Result<Answer, TransportError> {
-        self.connection.send(req).await
+    async fn send(&self, mut req: Request) -> Result<Answer, TransportError> {
+        if let Some(space) = &self.space {
+            req.headers.insert(HeaderName::from_static("craft-space"), space.clone());
+        }
+        let answer = self.connection.send(req).await?;
+        if let Some(space) = &self.space {
+            echoed(space, &answer)?;
+        }
+        Ok(answer)
     }
 
     fn page_request(&self, path: &str, since: Option<u64>, after: Option<PageCursor>) -> Request {
@@ -1054,6 +1093,22 @@ impl<C: Connection> HttpTransport<C> {
     /// Revokes a device of this account (this one, to sign out).
     pub async fn revoke(&self, device: DeviceId) -> Result<(), TransportError> {
         self.no_content(self.request(Method::DELETE, &format!("devices/{device}"), 0)).await
+    }
+
+    /// `GET /spaces`: the personal space and the team spaces of the account, invitations among them. A server from before
+    /// team spaces answers `404` here (a refusal with that status, or `NotFound`).
+    pub async fn spaces(&self) -> Result<SpaceList, CallError> {
+        self.account_call(self.request(Method::GET, "spaces", MAX_SMALL_JSON_BYTES)).await
+    }
+
+    /// `POST /spaces/{id}/accept`: the space as `GET /spaces` lists it.
+    pub async fn accept_space(&self, space: SpaceId) -> Result<SpaceListItem, CallError> {
+        self.account_call(self.request(Method::POST, &format!("spaces/{space}/accept"), MAX_SMALL_JSON_BYTES)).await
+    }
+
+    /// `POST /spaces/{id}/decline`.
+    pub async fn decline_space(&self, space: SpaceId) -> Result<(), CallError> {
+        self.account_unit(self.request(Method::POST, &format!("spaces/{space}/decline"), MAX_SMALL_JSON_BYTES)).await
     }
 
     /// The account's devices, this one marked `current`.
@@ -1317,6 +1372,9 @@ mod tests {
         let missing = ErrorBody { missing: Some(vec![ChunkId::from_bytes([1; 32])]), ..body(codes::MISSING_CHUNKS) };
         assert_eq!(error_for(StatusCode::CONFLICT, Some(missing)), TransportError::MissingChunks(vec![ChunkId::from_bytes([1; 32])]));
         assert_eq!(error_for(StatusCode::GONE, Some(body(codes::RESYNC_REQUIRED))), TransportError::ResyncRequired);
+        // A viewer's write: told apart from every other refusal, so the engine keeps the space read-only.
+        assert_eq!(error_for(StatusCode::FORBIDDEN, Some(body(codes::READ_ONLY))), TransportError::ReadOnly);
+        assert!(matches!(error_for(StatusCode::FORBIDDEN, Some(body(codes::FORBIDDEN))), TransportError::Protocol(_)));
         let full = ErrorBody { quota: Some(craft_cloud_proto::api::QuotaUse { used: 9, limit: 10 }), ..body(codes::QUOTA_EXCEEDED) };
         assert_eq!(error_for(StatusCode::INSUFFICIENT_STORAGE, Some(full)), TransportError::QuotaExceeded { used: 9, limit: 10 });
         // Without the numbers it is only a server error: tried again later.
@@ -1370,8 +1428,8 @@ mod tests {
             max_missing_ids: MAX_MISSING_IDS as u32,
         };
         assert!(check_compatible(&info).is_ok());
-        info.protocol_min = 2;
-        info.protocol_max = 3;
+        info.protocol_min = PROTOCOL_MAX + 1;
+        info.protocol_max = PROTOCOL_MAX + 2;
         assert!(check_compatible(&info).is_err());
         info.protocol_min = 1;
         info.chunker_params = vec!["other".into()];

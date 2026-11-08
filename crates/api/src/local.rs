@@ -21,7 +21,9 @@
 //!   documents ([`docs`]: [`DocsRequest`] and binary frames in, [`DocsEvent`] and binary frames out); `PUT /v1/blobs`
 //!   and `GET /v1/blobs/{hash}`: binary content kept out of live documents ([`blobs`]); the admin calls under
 //!   `/v1/admin` ([`paths::ADMIN_SERVER`], [`paths::ADMIN_USERS`]), which the agent passes on to the server's admin API
-//!   with the same bodies and answers (see `docs/agent.md`). Errors are the HTTP API's error
+//!   with the same bodies and answers (see `docs/agent.md`); `GET /v1/spaces` → [`SpaceList`] and, under
+//!   `/v1/spaces/{id}`, `POST …/accept`, `…/decline` (passed on to the server) and `…/sync` ([`SpaceSyncRequest`]): the
+//!   team spaces of the account and what this computer does with them. Errors are the HTTP API's error
 //!   body ([`ErrorAnswer`](crate::api::ErrorAnswer) reads its code and message) with its codes and [`codes`].
 //! - **Versions**: [`Status::api`] is the local API version the agent speaks; a client refuses one outside
 //!   [`LOCAL_API_MIN`]..=[`LOCAL_API_MAX`] when it connects.
@@ -31,7 +33,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{DeviceId, Epoch, NodeId, VersionId};
+use crate::api::SpaceRole;
+use crate::ids::{DeviceId, Epoch, NodeId, SpaceId, VersionId};
 use crate::limits::MAX_TREE_DEPTH;
 use crate::name::Name;
 
@@ -200,6 +203,12 @@ pub mod paths {
     pub const CONFLICTS: &str = "/v1/conflicts";
     /// `GET` → [`super::FolderUsageResponse`]: local logical bytes by top-level folder and kind, from the agent's saved state.
     pub const USAGE_FOLDERS: &str = "/v1/usage/folders";
+    /// `GET` → [`super::SpaceList`]: the personal space and the team spaces of the account, invitations among them, with
+    /// what this computer does with each. Under `/v1/spaces/{id}`: `POST …/accept` → the space as the server lists it
+    /// ([`SpaceListItem`](crate::api::SpaceListItem)), `POST …/decline` → 204 (both passed on to the server), and
+    /// `POST …/sync` ([`super::SpaceSyncRequest`]) → the space as [`super::SpaceInfo`], and `POST …/approve-deletes`
+    /// ([`super::ApproveDeletesRequest`]) → [`super::ApproveDeletesAnswer`].
+    pub const SPACES: &str = "/v1/spaces";
 }
 
 /// One version in a file's newest-first history.
@@ -590,6 +599,171 @@ pub struct Status {
     /// admin): nothing syncs until it signs out and joins again. Its files stay.
     #[serde(default)]
     pub removed: bool,
+    /// The team spaces this computer syncs, or lost access to, one entry each (the fields above describe the personal
+    /// space). An older agent says nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spaces: Vec<SpaceStatus>,
+}
+
+/// What this computer does about one space, in [`SpaceInfo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceSync {
+    /// The space syncs to a folder on this computer.
+    On,
+    /// It doesn't (a team space starts so on every computer: the person chooses).
+    Off,
+    /// It can't: the server is too old for team spaces, or this computer lost access to the space.
+    Unavailable,
+}
+
+/// How the sync of one team space is going, in [`SpaceStatus`] and [`SpaceInfo`]: [`RunState`] for a space, and the two
+/// ways a space stops that a whole agent doesn't. The `Debug` output leaves out the words of `NoAccess`, which name the
+/// space.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SpaceRun {
+    Idle,
+    Syncing,
+    /// The last pass failed for a reason that may pass by itself; it is tried again.
+    Retrying {
+        message: String,
+    },
+    /// Stopped until someone puts something right (the folder is gone, say).
+    Paused {
+        reason: String,
+    },
+    /// Syncing is paused by the user for every space.
+    PausedByUser,
+    /// The account no longer has access (it was removed, or the invitation withdrawn; an archived space is not this: its members
+    /// keep read access). The local copy is
+    /// kept and no longer syncs; if access comes back it syncs again. `message` says so in words.
+    NoAccess {
+        message: String,
+    },
+    /// The server can't do team spaces yet (it needs an update).
+    Unavailable {
+        message: String,
+    },
+}
+
+impl std::fmt::Debug for SpaceRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle => f.write_str("Idle"),
+            Self::Syncing => f.write_str("Syncing"),
+            Self::Retrying { message } => f.debug_struct("Retrying").field("message", message).finish(),
+            Self::Paused { reason } => f.debug_struct("Paused").field("reason", reason).finish(),
+            Self::PausedByUser => f.write_str("PausedByUser"),
+            Self::NoAccess { .. } => f.debug_struct("NoAccess").finish_non_exhaustive(),
+            Self::Unavailable { message } => f.debug_struct("Unavailable").field("message", message).finish(),
+        }
+    }
+}
+
+/// One synced team space in [`Status::spaces`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceStatus {
+    pub space: SpaceId,
+    pub run_state: SpaceRun,
+    /// When the last pass that didn't fail finished (milliseconds since the Unix epoch).
+    #[serde(default)]
+    pub last_sync_ms: Option<i64>,
+    /// The account is a viewer here (or the space is archived): the folder follows the space, and nothing of this
+    /// computer goes up.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// One space in `GET /v1/spaces`: the server's view of it (its name, the account's role, whether it is an invitation)
+/// and this computer's (the folder, whether it syncs, how that goes). The `Debug` output leaves out the name and the
+/// folder.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceInfo {
+    pub space: SpaceId,
+    /// `personal` or `team`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub role: SpaceRole,
+    /// `active`, or `invited` for an invitation not yet accepted.
+    pub state: String,
+    #[serde(default)]
+    pub archived: bool,
+    /// The folder on this computer (absolute): where the space syncs, or would.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    pub sync: SpaceSync,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_state: Option<SpaceRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_ms: Option<i64>,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+impl std::fmt::Debug for SpaceInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpaceInfo")
+            .field("space", &self.space)
+            .field("kind", &self.kind)
+            .field("role", &self.role)
+            .field("state", &self.state)
+            .field("archived", &self.archived)
+            .field("sync", &self.sync)
+            .field("run_state", &self.run_state)
+            .field("read_only", &self.read_only)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `GET /v1/spaces`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SpaceList {
+    pub spaces: Vec<SpaceInfo>,
+}
+
+/// `POST /v1/spaces/{id}/sync`: turn the sync of a team space on or off on this computer. `folder` (absolute) picks
+/// another folder than the default one beside the personal folder; the folder must not lie inside another synced folder or
+/// the agent's data folder. A folder that already has files in it is synced only with `adopt` (files that differ from
+/// the space's become conflict copies; nothing is deleted).
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SpaceSyncRequest {
+    pub on: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub adopt: bool,
+}
+
+impl std::fmt::Debug for SpaceSyncRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpaceSyncRequest").field("on", &self.on).field("adopt", &self.adopt).finish_non_exhaustive()
+    }
+}
+
+/// `POST /v1/spaces/{id}/approve-deletes`: approve the deletions of a team space that the mass-delete guard holds back, as
+/// `craft-cloud-agent sync --approve-deletes --space` does (it writes the space's `approval.json`, which the running agent
+/// takes). With a `set` (the identifier the waiting list was shown with) only that set is approved if it is the one waiting;
+/// without, the set is approved if it is the one last shown by this call (the first call lists it and approves nothing).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ApproveDeletesRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set: Option<String>,
+}
+
+/// The answer to [`ApproveDeletesRequest`]: whether an approval was handed to the agent, and what the command line
+/// would have said. Its `Debug` output leaves out the words, which list file names.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproveDeletesAnswer {
+    pub approved: bool,
+    pub message: String,
+}
+
+impl std::fmt::Debug for ApproveDeletesAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApproveDeletesAnswer").field("approved", &self.approved).finish_non_exhaustive()
+    }
 }
 
 /// `POST /v1/login`: what `craft-cloud-agent login` asks for. The password goes to the agent and from there to the
@@ -1246,6 +1420,7 @@ mod tests {
             autostart: None,
             last_sync_ms: Some(1_790_000_000_000),
             removed: false,
+            spaces: Vec::new(),
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["run_state"], serde_json::json!({ "kind": "signed_out" }));
@@ -1267,8 +1442,47 @@ mod tests {
         assert_eq!(older.autostart, None, "an older agent says nothing about autostart");
         assert_eq!(older.last_sync_ms, None, "nor about the last sync");
         assert!(!older.removed);
+        assert!(older.spaces.is_empty(), "nor about team spaces");
         let login: LoginRequest = serde_json::from_value(serde_json::json!({ "server": "s", "user": "u", "password": "p", "extra": 1 })).unwrap();
         assert!(!login.adopt && login.folder.is_none(), "missing optional fields default; unknown ones are ignored");
+    }
+
+    #[test]
+    fn spaces_have_a_plain_form_and_their_debug_output_names_nothing() {
+        let space = SpaceId::generate();
+        let info = SpaceInfo {
+            space,
+            kind: "team".into(),
+            name: Some("Studio".into()),
+            role: SpaceRole::Viewer,
+            state: "active".into(),
+            archived: false,
+            folder: Some("/home/ana/Craft Cloud Shared/Studio".into()),
+            sync: SpaceSync::On,
+            run_state: Some(SpaceRun::NoAccess { message: "You no longer have access to Studio. Your local copy is kept.".into() }),
+            last_sync_ms: None,
+            read_only: true,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["sync"], "on");
+        assert_eq!(json["run_state"]["kind"], "no_access");
+        assert!(json.get("last_sync_ms").is_none());
+        assert_eq!(serde_json::from_value::<SpaceInfo>(json).unwrap(), info);
+        let shown = format!("{info:?}");
+        assert!(!shown.contains("Studio") && !shown.contains("Craft Cloud Shared"), "{shown}");
+        assert!(shown.contains("NoAccess"), "the variant is still named: {shown}");
+        let status = SpaceStatus { space, run_state: info.run_state.clone().unwrap(), last_sync_ms: None, read_only: false };
+        let shown = format!("{status:?}");
+        assert!(!shown.contains("Studio"), "the status leaves the name out too: {shown}");
+        let answer = ApproveDeletesAnswer { approved: true, message: "delete on the server: Studio/plan.txt".into() };
+        assert!(!format!("{answer:?}").contains("plan.txt"));
+        let older: Status = serde_json::from_value(serde_json::json!({
+            "api": 1, "signed_in": true, "online": true, "run_state": { "kind": "idle" }
+        }))
+        .unwrap();
+        assert!(older.spaces.is_empty());
+        let request: SpaceSyncRequest = serde_json::from_value(serde_json::json!({ "on": true })).unwrap();
+        assert_eq!(request, SpaceSyncRequest { on: true, folder: None, adopt: false });
     }
 
     #[test]

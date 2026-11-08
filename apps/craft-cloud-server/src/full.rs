@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::error::ApiError;
-use crate::space::StorageInfo;
+use crate::storage_info::StorageInfo;
 
 /// The free space a disk store keeps when `min_free` is not set.
 pub const DEFAULT_MIN_FREE: u64 = 1 << 30;

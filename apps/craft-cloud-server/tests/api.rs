@@ -124,7 +124,7 @@ async fn sqlite_disk_measured(capacity: Option<u64>) -> Server {
     let db_file = db.path().join("meta.db");
     let meta = Meta::open(&format!("sqlite:{}", db_file.display())).await.unwrap();
     let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
-    let info = craft_cloud_server::space::StorageInfo::new(capacity, Some(blobs.path().to_owned()), Some(db_file));
+    let info = craft_cloud_server::storage_info::StorageInfo::new(capacity, Some(blobs.path().to_owned()), Some(db_file));
     let state = AppState::new(meta.clone(), store, vec![]).unwrap().with_storage_info(info);
     start_state(state, meta, vec![db, blobs], None).await
 }
@@ -380,7 +380,7 @@ fn create(node: NodeId, parent: NodeId, name: &str, manifest: ManifestId) -> Op 
 
 async fn info_needs_no_sign_in(s: &Server) {
     let info: InfoResponse = s.client.get(format!("{}/info", s.base)).send().await.unwrap().json().await.unwrap();
-    assert_eq!((info.protocol_min, info.protocol_max), (1, 1));
+    assert_eq!((info.protocol_min, info.protocol_max), (1, 2));
     assert_eq!(info.chunker_params, vec!["fastcdc-v1".to_owned()]);
     assert_eq!(info.max_chunk_bytes, 4 * 1024 * 1024);
 }
@@ -4493,7 +4493,7 @@ async fn a_disk_store_whose_directory_is_gone_is_not_ok() {
     let db_file = db.path().join("meta.db");
     let meta = Meta::open(&format!("sqlite:{}", db_file.display())).await.unwrap();
     let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
-    let info = craft_cloud_server::space::StorageInfo::new(None, Some(blobs.path().to_owned()), Some(db_file));
+    let info = craft_cloud_server::storage_info::StorageInfo::new(None, Some(blobs.path().to_owned()), Some(db_file));
     let state = AppState::new(meta.clone(), store, vec![]).unwrap().with_storage_info(info);
     let blobs_path = blobs.path().to_owned();
     let s = start_state(state, meta, vec![db], None).await;

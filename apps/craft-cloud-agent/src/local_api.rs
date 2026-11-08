@@ -31,9 +31,10 @@ use craft_cloud_proto::api::{
 };
 use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
 use craft_cloud_proto::local::{
-    AutostartRequest, ChangePasswordRequest, ConflictsResponse, FolderUsageResponse, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA,
-    LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES, PairingInfo, PasswordRequest, RenameDeviceRequest, RunState,
-    SecondFactorLoginRequest, Status, TotpRequest, TwoFactorProofRequest, codes, paths,
+    ApproveDeletesAnswer, ApproveDeletesRequest, AutostartRequest, ChangePasswordRequest, ConflictsResponse, FolderUsageResponse, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX,
+    LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES, PairingInfo, PasswordRequest, RenameDeviceRequest, RunState,
+    SecondFactorLoginRequest, SpaceInfo, SpaceList, SpaceRun, SpaceStatus, SpaceSync, SpaceSyncRequest, Status, TotpRequest, TwoFactorProofRequest,
+    codes, paths,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -45,6 +46,7 @@ use crate::autostart::{self, Roots};
 use crate::cli::{AgentError, Exit};
 use crate::http::HttpTransport;
 use crate::live::app_blobs::{self, BlobError};
+use crate::spaces::SpacesHandle;
 
 /// What the local API asks the `run` loop to do, with where to send the outcome.
 pub enum Command {
@@ -79,6 +81,11 @@ struct Shared {
     last_sync_ms: Option<i64>,
     /// The last pass found this device refused by the server.
     removed: bool,
+    /// The team spaces, as the spaces task last saw them (`GET /v1/spaces`, after the personal space), and the ones that sync
+    /// or lost access (`GET /v1/status`).
+    spaces: Vec<SpaceInfo>,
+    space_status: Vec<SpaceStatus>,
+    spaces_handle: Option<SpacesHandle>,
 }
 
 /// The loop's side of the local API: the status it reports, and the commands it receives. Cheap to clone.
@@ -94,8 +101,18 @@ pub struct Control {
 impl Control {
     /// A control for a loop that receives its commands from `commands`' other end.
     pub fn new(commands: mpsc::Sender<Command>) -> Self {
-        let shared =
-            Shared { account: None, run_state: RunState::SignedOut, online: false, hub: None, autostart: None, last_sync_ms: None, removed: false };
+        let shared = Shared {
+            account: None,
+            run_state: RunState::SignedOut,
+            online: false,
+            hub: None,
+            autostart: None,
+            last_sync_ms: None,
+            removed: false,
+            spaces: Vec::new(),
+            space_status: Vec::new(),
+            spaces_handle: None,
+        };
         let autostart_refusal = "this agent doesn't handle starting at login here".to_owned();
         Self { shared: Arc::new(Mutex::new(shared)), commands, autostart: None, autostart_refusal }
     }
@@ -140,8 +157,27 @@ impl Control {
                 s.online = false;
                 s.last_sync_ms = None;
                 s.removed = false;
+                s.spaces.clear();
+                s.space_status.clear();
             }
         });
+    }
+
+    /// What the spaces task sees: the team spaces (for `GET /v1/spaces`) and the status of those that sync.
+    pub fn set_spaces(&self, spaces: Vec<SpaceInfo>, status: Vec<SpaceStatus>) {
+        self.with(|s| {
+            s.spaces = spaces;
+            s.space_status = status;
+        });
+    }
+
+    /// The spaces task's handle, while signed in.
+    pub fn set_spaces_handle(&self, handle: Option<SpacesHandle>) {
+        self.with(|s| s.spaces_handle = handle);
+    }
+
+    pub fn spaces_handle(&self) -> Option<SpacesHandle> {
+        self.with(|s| s.spaces_handle.clone())
     }
 
     /// Whether the server refused this device at the last pass (it was removed from the account).
@@ -196,6 +232,7 @@ impl Control {
             autostart: s.autostart,
             last_sync_ms: s.last_sync_ms,
             removed: s.account.is_some() && s.removed,
+            spaces: if s.account.is_some() { s.space_status.clone() } else { Vec::new() },
         })
     }
 }
@@ -419,6 +456,11 @@ fn router(state: Api) -> Router {
         .route(paths::USAGE_FOLDERS, get(usage_folders))
         .route(paths::CONFLICTS, get(conflicts))
         .route(&format!("{}/{{id}}", paths::DEVICES), delete(remove_device).patch(rename_device).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route(paths::SPACES, get(spaces))
+        .route(&format!("{}/{{id}}/accept", paths::SPACES), post(accept_space))
+        .route(&format!("{}/{{id}}/decline", paths::SPACES), post(decline_space))
+        .route(&format!("{}/{{id}}/sync", paths::SPACES), post(sync_space).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route(&format!("{}/{{id}}/approve-deletes", paths::SPACES), post(approve_space_deletes).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route(paths::AUTOSTART, post(set_autostart))
         .route(paths::PAUSE, post(pause))
         .route(paths::RESUME, post(resume))
@@ -888,6 +930,110 @@ async fn remove_device(State(state): State<Api>, id: Result<Path<DeviceId>, Path
         other => AgentError::from(other).into(),
     })?;
     Ok(Json(transport.devices().await.map_err(AgentError::from)?))
+}
+
+/// The personal space as `GET /v1/spaces` lists it: always syncing (to the account's folder), the account its owner.
+fn personal_space(control: &Control, account: &Account) -> SpaceInfo {
+    let status = control.status();
+    SpaceInfo {
+        space: account.space,
+        kind: "personal".into(),
+        name: None,
+        role: craft_cloud_proto::api::SpaceRole::Owner,
+        state: "active".into(),
+        archived: false,
+        folder: Some(account.folder.display().to_string()),
+        sync: SpaceSync::On,
+        run_state: Some(match status.run_state {
+            RunState::Retrying { message } => SpaceRun::Retrying { message },
+            RunState::Paused { reason, .. } => SpaceRun::Paused { reason },
+            RunState::PausedByUser => SpaceRun::PausedByUser,
+            RunState::Syncing => SpaceRun::Syncing,
+            RunState::SignedOut | RunState::Idle | RunState::Stopping => SpaceRun::Idle,
+        }),
+        last_sync_ms: status.last_sync_ms,
+        read_only: false,
+    }
+}
+
+/// `GET /v1/spaces`: the personal space, then the team spaces (invitations among them) as the agent last saw the server's list.
+async fn spaces(State(state): State<Api>) -> Result<Json<SpaceList>, LocalError> {
+    let account = state.control.account().ok_or(AgentError::NotSignedIn)?;
+    let mut list = vec![personal_space(&state.control, &account)];
+    list.extend(state.control.with(|s| s.spaces.clone()));
+    Ok(Json(SpaceList { spaces: list }))
+}
+
+/// `POST /v1/spaces/{id}/accept`: passed on to the server; the agent looks at its list again before it answers.
+async fn accept_space(
+    State(state): State<Api>,
+    id: Result<Path<craft_cloud_proto::SpaceId>, PathRejection>,
+) -> Result<Json<craft_cloud_proto::api::SpaceListItem>, LocalError> {
+    let id = path_id(id)?;
+    let (_, transport) = server_api(&state)?;
+    let accepted = transport.accept_space(id).await?;
+    if let Some(spaces) = state.control.spaces_handle() {
+        spaces.refresh().await;
+    }
+    Ok(Json(accepted))
+}
+
+/// `POST /v1/spaces/{id}/decline`: passed on to the server.
+async fn decline_space(State(state): State<Api>, id: Result<Path<craft_cloud_proto::SpaceId>, PathRejection>) -> Result<StatusCode, LocalError> {
+    let id = path_id(id)?;
+    let (_, transport) = server_api(&state)?;
+    transport.decline_space(id).await?;
+    if let Some(spaces) = state.control.spaces_handle() {
+        spaces.refresh().await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/spaces/{id}/sync`: turns the sync of a team space on this computer on or off.
+async fn sync_space(
+    State(state): State<Api>,
+    id: Result<Path<craft_cloud_proto::SpaceId>, PathRejection>,
+    body: Result<Json<SpaceSyncRequest>, JsonRejection>,
+) -> Result<Json<SpaceInfo>, LocalError> {
+    let id = path_id(id)?;
+    let Json(request) = body?;
+    let spaces = state.control.spaces_handle().ok_or(AgentError::NotSignedIn)?;
+    Ok(Json(spaces.sync(id, request).await?))
+}
+
+/// `POST /v1/spaces/{id}/approve-deletes`: hands the approval of a synced team space's waiting deletions to this agent
+/// (`spaces/<id>/approval.json`), by the rules of `sync --approve-deletes --space`: with a `set`, that set if it is the
+/// one waiting; without, the set the previous call listed.
+async fn approve_space_deletes(
+    State(state): State<Api>,
+    id: Result<Path<craft_cloud_proto::SpaceId>, PathRejection>,
+    body: Result<Json<ApproveDeletesRequest>, JsonRejection>,
+) -> Result<Json<ApproveDeletesAnswer>, LocalError> {
+    let id = path_id(id)?;
+    let Json(request) = body?;
+    let approve = match request.set.as_deref().map(str::trim) {
+        None => crate::cli::Approve::Listed,
+        Some("") => {
+            return Err(LocalError::new(
+                StatusCode::BAD_REQUEST,
+                api_codes::INVALID,
+                "the set is empty; leave it out to approve the set last listed",
+            ));
+        }
+        Some(set) => crate::cli::Approve::Set(set.to_ascii_lowercase()),
+    };
+    let data = DataDir::new(&state.data);
+    let answer = tokio::task::spawn_blocking(move || {
+        let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
+        let setting = account.spaces.iter().find(|s| s.space == id && s.sync);
+        let Some(setting) = setting else { return Ok(None) };
+        let mut out = Vec::new();
+        let (_, _, approved) = crate::cli::approve_team(&data, setting, &approve, &mut out)?;
+        Ok::<_, AgentError>(Some(ApproveDeletesAnswer { approved, message: String::from_utf8_lossy(&out).trim().to_owned() }))
+    })
+    .await
+    .map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))??;
+    answer.map(Json).ok_or_else(|| LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such team space syncing on this computer"))
 }
 
 /// Registers this agent to start at login, or removes the entry; the status after says which.

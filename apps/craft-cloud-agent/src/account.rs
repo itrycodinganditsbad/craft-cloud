@@ -28,6 +28,8 @@ use crate::http::{DeviceToken, ServerUrl};
 
 pub const ACCOUNT_FILE: &str = "account.json";
 pub const STATE_FILE: &str = "state.json";
+/// The data folder's folder of the team spaces' own state, one folder per space.
+pub const SPACES_DIR: &str = "spaces";
 /// What the `run` loop is doing ([`LoopStatus`]), next to `state.json`.
 pub const STATUS_FILE: &str = "status.json";
 /// An approval handed to the running loop ([`Approval`]).
@@ -86,6 +88,28 @@ pub struct Account {
     pub space: SpaceId,
     pub root: NodeId,
     pub token: DeviceToken,
+    /// The team spaces this computer knows (appended in a later format of the same file: an agent from before team
+    /// spaces ignores it, and a file without it has none). Left out of the file while there is none, so an installation
+    /// that never saw a team space keeps its `account.json` byte for byte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spaces: Vec<SpaceSetting>,
+}
+
+/// What this computer remembers of one team space (`account.json`, `spaces`): where it syncs, whether it does, and what
+/// the server last called it. Its state lives in `spaces/<id>/state.json` of the data folder.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceSetting {
+    pub space: SpaceId,
+    /// The space's folder (absolute); it keeps its name when the space is renamed on the server.
+    pub folder: PathBuf,
+    /// Whether the space syncs on this computer. A team space starts with syncing off.
+    pub sync: bool,
+    /// The name the server last gave the space, to say which one lost access when the server no longer lists it.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The space's root, as the server listed it: what the folder's marker names.
+    #[serde(default)]
+    pub root: Option<NodeId>,
 }
 
 /// How a pass ended.
@@ -111,6 +135,11 @@ pub struct PassSummary {
     pub created_dirs: usize,
     pub conflict_copies: Vec<String>,
     pub refused: usize,
+    /// Whether the pass ran in read-only mode: the space is read-only for this account (a viewer), nothing was sent,
+    /// and what is only here is listed in `skipped` with the reason.
+    pub read_only: bool,
+    /// Files and folders deleted here that the server still has, put back (read-only mode only).
+    pub restored: Vec<String>,
     /// Entries that didn't sync, with the reason.
     pub skipped: Vec<(String, String)>,
     /// Deletions on the server waiting for approval.
@@ -142,6 +171,8 @@ impl PassSummary {
             created_dirs: report.created_dirs.len(),
             conflict_copies: paths(&report.conflict_copies),
             refused: report.refused.len(),
+            read_only: report.read_only,
+            restored: paths(&report.restored),
             skipped: report.skipped.clone(),
             pending_deletes: paths(&report.pending_deletes),
             pending_local_deletes: paths(&report.pending_local_deletes),
@@ -272,6 +303,10 @@ pub struct SavedState {
     /// `run` loop only while no pass runs (a pass writes `false`: passes run only when not paused).
     #[serde(default)]
     pub paused: bool,
+    /// A team space's state only: the canonical folder it was made for. A state is used only for the folder it names
+    /// (see [`DataDir::load_state_for`]); the personal space's state has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<PathBuf>,
 }
 
 /// `status.json`: what the `run` loop is doing, written atomically on every change and as a heartbeat, for `status`
@@ -389,6 +424,11 @@ impl DataDir {
         &self.0
     }
 
+    /// The place of a team space's own `state.json` and `status.json`: `spaces/<space id>/` (not created).
+    pub fn space_dir(&self, space: SpaceId) -> DataDir {
+        DataDir(self.0.join(SPACES_DIR).join(space.to_string()))
+    }
+
     fn file(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
@@ -439,6 +479,20 @@ impl DataDir {
         Ok(load(&self.file(STATE_FILE), STATE_SCHEMA)?.unwrap_or(SavedState { schema: STATE_SCHEMA, ..SavedState::default() }))
     }
 
+    /// A team space's saved state for `folder`: the state only if it was made for this space and this folder (compared
+    /// as canonical paths), else a fresh one. A state remembers what the folder it syncs holds; used for another folder it
+    /// would find that folder's files missing and delete them on the server. The `bool` says the saved state was set
+    /// aside because it belongs elsewhere.
+    pub fn load_state_for(&self, space: SpaceId, folder: &Path) -> Result<(SavedState, bool), AccountError> {
+        let saved = self.load_state()?;
+        let here = fs::canonicalize(folder).ok();
+        let ours = saved.state.space.is_none_or(|s| s == space) && saved.folder.is_some() && saved.folder == here;
+        if ours || (saved.state.space.is_none() && saved.last_pass.is_none() && saved.folder.is_none()) {
+            return Ok((saved, false));
+        }
+        Ok((SavedState { schema: STATE_SCHEMA, ..SavedState::default() }, true))
+    }
+
     pub fn save_state(&self, saved: &SavedState) -> Result<(), AccountError> {
         self.create()?;
         save(&self.file(STATE_FILE), saved)
@@ -446,6 +500,24 @@ impl DataDir {
 
     pub fn remove_state(&self) -> Result<(), AccountError> {
         remove(&self.file(STATE_FILE))
+    }
+
+    /// Removes the saved state of every team space (`spaces/<id>/state.json`), as signing out does for the personal one.
+    /// Their folders, markers and files are not touched.
+    pub fn remove_space_states(&self) -> Result<(), AccountError> {
+        let dir = self.0.join(SPACES_DIR);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io_at(&dir)(e)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(io_at(&dir))?;
+            if entry.path().is_dir() {
+                DataDir(entry.path()).remove_state()?;
+            }
+        }
+        Ok(())
     }
 
     /// Removes the temporary files a crash left while `account.json`, `state.json`, `status.json`, `approval.json` or
@@ -739,6 +811,7 @@ mod tests {
             space: SpaceId::generate(),
             root: NodeId::generate(),
             token: DeviceToken::new("tok".into()),
+            spaces: Vec::new(),
         }
     }
 
@@ -762,6 +835,32 @@ mod tests {
         assert_eq!(data.load_account().unwrap(), None);
         // No temporary files left behind.
         assert_eq!(fs::read_dir(data.path()).unwrap().count(), 0);
+    }
+
+    /// An `account.json` from before team spaces has no `spaces` and is written back without one; team spaces round-trip,
+    /// and each has its own place for state.
+    #[test]
+    fn team_spaces_are_appended_to_the_account_and_left_out_while_there_are_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path().join("data"));
+        let mut acc = account(dir.path());
+        data.save_account(&acc).unwrap();
+        let written = fs::read_to_string(dir.path().join("data/account.json")).unwrap();
+        assert!(!written.contains("spaces"), "{written}");
+        assert_eq!(data.load_account().unwrap().unwrap().spaces, Vec::new());
+        let setting = SpaceSetting {
+            space: SpaceId::generate(),
+            folder: dir.path().join("Craft Cloud Shared").join("Studio"),
+            sync: false,
+            name: Some("Studio".into()),
+            root: Some(NodeId::generate()),
+        };
+        acc.spaces.push(setting.clone());
+        data.save_account(&acc).unwrap();
+        assert_eq!(data.load_account().unwrap().unwrap().spaces, vec![setting.clone()]);
+        let sub = data.space_dir(setting.space);
+        assert_eq!(sub.path(), dir.path().join("data").join("spaces").join(setting.space.to_string()));
+        assert_eq!(sub.load_state().unwrap().state.space, None, "no state yet");
     }
 
     /// Only the data folder is owner-only: missing folders above it are made as any program makes them.
@@ -901,6 +1000,58 @@ mod tests {
         saved.last_pass = Some(LastPass { finished_ms: 7, outcome: Outcome::Failed("x".into()), summary: None });
         data.save_state(&saved).unwrap();
         assert_eq!(data.load_state().unwrap(), saved);
+    }
+
+    /// A team space's state is used for the space and the folder it was made for, and for nothing else: another folder, another
+    /// space, or a state that records no folder (one from before it did) starts afresh. A missing state is a fresh one.
+    #[test]
+    fn a_team_state_is_used_only_for_its_space_and_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path().join("data"));
+        let (a, b) = (dir.path().join("A"), dir.path().join("B"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let space = SpaceId::generate();
+        assert_eq!(data.load_state_for(space, &a).unwrap(), (SavedState { schema: STATE_SCHEMA, ..SavedState::default() }, false));
+        let mut saved = SavedState { schema: STATE_SCHEMA, folder: fs::canonicalize(&a).ok(), ..SavedState::default() };
+        saved.state.space = Some(space);
+        saved.state.seq = 9;
+        data.save_state(&saved).unwrap();
+        assert_eq!(data.load_state_for(space, &a).unwrap(), (saved.clone(), false), "the folder it was made for");
+        let (other, set_aside) = data.load_state_for(space, &b).unwrap();
+        assert!(set_aside && other.state.seq == 0 && other.state.space.is_none(), "another folder starts afresh");
+        let (other, set_aside) = data.load_state_for(SpaceId::generate(), &a).unwrap();
+        assert!(set_aside && other.state.space.is_none(), "another space starts afresh");
+        let (gone, set_aside) = data.load_state_for(space, &dir.path().join("missing")).unwrap();
+        assert!(set_aside && gone.state.seq == 0, "a folder that can't be found is not the one");
+        // A state from before the folder was recorded is not trusted either.
+        saved.folder = None;
+        data.save_state(&saved).unwrap();
+        assert!(data.load_state_for(space, &a).unwrap().1);
+        // The folder is written only when there is one: the personal space's state is as it was.
+        let personal = SavedState { schema: STATE_SCHEMA, ..SavedState::default() };
+        assert!(!serde_json::to_string(&personal).unwrap().contains("folder"));
+    }
+
+    /// Signing out removes every team space's state and leaves the rest of their folders alone.
+    #[test]
+    fn the_states_of_all_team_spaces_can_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path());
+        data.remove_space_states().unwrap();
+        let (one, two) = (SpaceId::generate(), SpaceId::generate());
+        for space in [one, two] {
+            data.space_dir(space).save_state(&SavedState { schema: STATE_SCHEMA, ..SavedState::default() }).unwrap();
+        }
+        data.space_dir(one).give_approval("set", &[], 1).unwrap();
+        data.save_state(&SavedState { schema: STATE_SCHEMA, ..SavedState::default() }).unwrap();
+        data.remove_space_states().unwrap();
+        for space in [one, two] {
+            assert!(!data.space_dir(space).path().join(STATE_FILE).exists());
+        }
+        assert!(data.space_dir(one).path().join(APPROVAL_FILE).is_file(), "nothing else goes");
+        assert!(data.path().join(STATE_FILE).is_file(), "nor the personal state");
+        data.remove_space_states().unwrap();
     }
 
     /// Held deletes an older agent saved are still read, as the link's path, and keep holding: fix round 3 wrote the

@@ -258,6 +258,7 @@ impl Hub {
                     autostart: None,
                     last_sync_ms: None,
                     removed: false,
+                    spaces: Vec::new(),
                 };
                 respond_json(&mut stream, 200, &status);
             }

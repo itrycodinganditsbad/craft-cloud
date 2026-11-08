@@ -2209,3 +2209,68 @@ async fn verify_reports_sizes_the_database_records_wrongly() {
     let (again, _) = verify_json(&s.config, &[]).await;
     assert_eq!(again["problems"]["by_kind"], json["problems"]["by_kind"]);
 }
+
+#[tokio::test]
+async fn space_commands_create_list_add_archive_and_reset_one_epoch() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(&["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"], "admin password 1\n").await.unwrap();
+    let config_path = dir.join("config.toml");
+    let c = config_path.to_str().unwrap();
+    cli(&["user", "--config", c, "add", "bob"], "bob password 1\n").await.unwrap();
+    cli(&["user", "--config", c, "add", "cy"], "cy password 111\n").await.unwrap();
+
+    // Create: the owner is a member from the start; a name is unique in any case; an unknown owner and a bad name are usage errors.
+    let out = cli(&["space", "--config", c, "create", "Straße", "--owner", "bob"], "").await.unwrap();
+    assert!(out.contains("owned by bob"), "{out}");
+    assert!(matches!(cli(&["space", "--config", c, "create", "STRASSE", "--owner", "bob"], "").await, Err(CliError::Meta(_))));
+    assert!(matches!(cli(&["space", "--config", c, "create", "Other", "--owner", "nobody"], "").await, Err(CliError::Usage(_))));
+    assert!(matches!(cli(&["space", "--config", c, "create", "  ", "--owner", "bob"], "").await, Err(CliError::Usage(_))));
+
+    // List and members, by name in any case.
+    let list = cli(&["space", "--config", c, "list"], "").await.unwrap();
+    assert!(list.contains("1 member(s), 1 owner(s)") && list.trim_end().ends_with("Straße"), "{list}");
+    let members = cli(&["space", "--config", c, "members", "strasse"], "").await.unwrap();
+    assert_eq!(members, "bob  owner  member\n");
+    assert!(matches!(cli(&["space", "--config", c, "members", "nothing here"], "").await, Err(CliError::Usage(_))));
+
+    // Add: accepted at once; adding again sets the role.
+    cli(&["space", "--config", c, "add", "Straße", "cy", "--role", "viewer"], "").await.unwrap();
+    assert_eq!(cli(&["space", "--config", c, "members", "Straße"], "").await.unwrap(), "bob  owner  member\ncy  viewer  member\n");
+    cli(&["space", "--config", c, "add", "Straße", "cy", "--role", "editor"], "").await.unwrap();
+    assert!(cli(&["space", "--config", c, "members", "Straße"], "").await.unwrap().contains("cy  editor  member"));
+    assert!(matches!(cli(&["space", "--config", c, "add", "Straße", "cy", "--role", "boss"], "").await, Err(CliError::Usage(_))));
+    assert!(matches!(cli(&["space", "--config", c, "add", "Straße", "nobody"], "").await, Err(CliError::Usage(_))));
+
+    // Archive: marked in the list, a second call changes nothing.
+    cli(&["space", "--config", c, "archive", "Straße"], "").await.unwrap();
+    cli(&["space", "--config", c, "archive", "Straße"], "").await.unwrap();
+    assert!(cli(&["space", "--config", c, "list"], "").await.unwrap().contains("(archived)"));
+
+    // reset-epoch --space resets that space only, and is an exclusive target.
+    let (meta, _) = craft_cloud_server::cli::open(&Config::load(&config_path).unwrap()).await.unwrap();
+    let name = craft_cloud_proto::SpaceName::new("Straße").unwrap();
+    let space = meta.team_space_by_name(&name).await.unwrap().unwrap();
+    let others: Vec<_> = meta.all_spaces().await.unwrap().into_iter().filter(|s| *s != space).collect();
+    let mut before = vec![meta.space_info(space).await.unwrap().epoch];
+    for other in &others {
+        before.push(meta.space_info(*other).await.unwrap().epoch);
+    }
+    let out = cli(&["reset-epoch", "--config", c, "--space", &space.to_string()], "").await.unwrap();
+    assert!(out.contains(&format!("for space {space}")), "{out}");
+    assert_ne!(meta.space_info(space).await.unwrap().epoch, before[0]);
+    for (other, old) in others.iter().zip(&before[1..]) {
+        assert_eq!(meta.space_info(*other).await.unwrap().epoch, *old, "another space kept its epoch");
+    }
+    assert!(matches!(
+        cli(&["reset-epoch", "--config", c, "--space", &craft_cloud_proto::SpaceId::generate().to_string()], "").await,
+        Err(CliError::Meta(_))
+    ));
+    assert!(Cli::try_parse_from(["craft-cloud-server", "reset-epoch", "--config", c, "--space", &space.to_string(), "--all"]).is_err());
+
+    // The events, once each, by the command line: created, two member changes (add + role change), archived once.
+    let audit = cli(&["audit", "--config", c, "list", "--action", "cli."], "").await.unwrap();
+    assert_eq!(audit.matches("cli.space_created").count(), 1, "{audit}");
+    assert_eq!(audit.matches("cli.space_member_changed").count(), 2, "{audit}");
+    assert_eq!(audit.matches("cli.space_archived").count(), 1, "{audit}");
+}

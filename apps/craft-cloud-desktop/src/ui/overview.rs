@@ -392,6 +392,7 @@ mod tests {
             autostart: Some(true),
             last_sync_ms: None,
             removed: false,
+            spaces: Vec::new(),
         }
     }
 

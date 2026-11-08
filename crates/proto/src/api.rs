@@ -10,16 +10,18 @@ use crate::ops::{Conflict, Op};
 
 /// What apps see of these bodies lives in `craft-cloud-api` (no postcard), re-exported here.
 pub use craft_cloud_api::api::{
-    AUDIT_ACTIONS, AccountInfo, AccountUsage, AdminCode, AdminCompression, AdminCompressionEstimate, AdminCompressionLevelEstimate, AdminConfirm,
-    AdminCreateUser, AdminCreatedUser, AdminDevices, AdminManifestIndex, AdminPasswordReset, AdminServerInfo, AdminSetCompressionLevel,
-    AdminStorageAccount, AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, AuditDetails, AuditEvent, AuditExportEnd, AuditPage,
-    DeviceInfo, ErrorAnswer, PairingState, PairingStatus, RecoveryCodes, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus,
-    UsageEstimateReason, UsageEstimates, codes, valid_audit_action,
+    AUDIT_ACTIONS, AccountInfo, AccountUsage, AddSpaceMember, AdminCode, AdminCompression, AdminCompressionEstimate, AdminCompressionLevelEstimate,
+    AdminConfirm, AdminCreateSpace, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminManifestIndex, AdminPasswordReset, AdminServerInfo,
+    AdminSetCompressionLevel, AdminSetSpaceOwner, AdminSpaceInfo, AdminSpaceList, AdminStorageAccount, AdminStorageOverview, AdminUpdateUser,
+    AdminUserInfo, AdminUserList, AuditDetails, AuditEvent, AuditExportEnd, AuditPage, ChangeSpaceMember, DeviceInfo, ErrorAnswer, PairingState,
+    PairingStatus, RecoveryCodes, RevokedOthers, SpaceConfirm, SpaceList, SpaceListItem, SpaceMember, SpaceMembers, SpaceRole, SpaceUsage,
+    TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus, UpdateSpace, UsageEstimateReason, UsageEstimates, codes, valid_audit_action,
 };
 
-/// Protocol versions this build speaks. A client and server must share at least one.
+/// Protocol versions this build speaks. A client and server must share at least one. Version 2 adds the `craft-space`
+/// header and its echo ([`SPACE_HEADER`]) and the team-space routes; version 1 clients keep working unchanged.
 pub const PROTOCOL_MIN: u32 = 1;
-pub const PROTOCOL_MAX: u32 = 1;
+pub const PROTOCOL_MAX: u32 = 2;
 
 /// Most chunk IDs in one `POST /chunks/missing`.
 pub const MAX_MISSING_IDS: usize = 10_000;
@@ -50,6 +52,15 @@ pub struct SpaceResponse {
     pub seq: u64,
     /// The account's username, in lowercase.
     pub username: String,
+    /// `personal` or `team` (appended: an older server leaves it out).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The team space's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The caller's role in the space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<SpaceRole>,
 }
 
 /// `POST /api/v1/auth/login`. `client_kind`, `platform` and `app_version` are optional and only shown in the device
@@ -492,6 +503,10 @@ pub struct ErrorBody {
 
 /// Response header carrying the space's epoch on every signed-in request.
 pub const EPOCH_HEADER: &str = "craft-epoch";
+
+/// Request header naming the space a space-scoped request works on (a space UUID; absent: the device's personal space).
+/// Every answer of a space-scoped route echoes it with the space the server worked on, also when the request had none.
+pub const SPACE_HEADER: &str = "craft-space";
 
 #[cfg(test)]
 mod tests {
