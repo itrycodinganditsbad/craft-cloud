@@ -230,7 +230,7 @@ async fn storage(State(state): State<Shared>) -> Result<Json<AdminStorageOvervie
         server_fs_total_bytes: measured.server_fs_total,
         server_fs_free_bytes: measured.server_fs_free,
         database_bytes: measured.database_bytes,
-        compression: Some(compression_view(&state, true).await?),
+        compression: Some(Box::new(compression_view(&state, true).await?)),
     }))
 }
 

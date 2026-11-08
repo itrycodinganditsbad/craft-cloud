@@ -891,7 +891,7 @@ mod tests {
             server_fs_total_bytes: Some(1 << 38),
             server_fs_free_bytes: Some(1 << 37),
             database_bytes: Some(123_456),
-            compression: Some(compression.clone()),
+            compression: Some(Box::new(compression.clone())),
         };
         let usage = AccountUsage {
             stored_bytes: 17,

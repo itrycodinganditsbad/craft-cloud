@@ -4419,5 +4419,5 @@ fn the_overview_reads_with_and_without_the_compression_part() {
     let mut new = old;
     new["compression"] = json!({ "algorithm": "zstd", "level": 3, "unknown_future_field": 1 });
     let typed: AdminStorageOverview = serde_json::from_value(new).unwrap();
-    assert_eq!(typed.compression, Some(AdminCompression { algorithm: "zstd".into(), level: 3, ..AdminCompression::default() }));
+    assert_eq!(typed.compression, Some(Box::new(AdminCompression { algorithm: "zstd".into(), level: 3, ..AdminCompression::default() })));
 }

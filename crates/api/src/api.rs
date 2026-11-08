@@ -327,9 +327,9 @@ pub struct AdminStorageOverview {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_bytes: Option<u64>,
     /// How blobs are stored and what that saves (see [`AdminCompression`]). Left out by a server from before compression
-    /// settings, and then `None`.
+    /// settings, and then `None`. Boxed: the overview travels inside the app's event type, which clippy keeps small.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compression: Option<AdminCompression>,
+    pub compression: Option<Box<AdminCompression>>,
 }
 
 /// Compression of stored blobs, in [`AdminStorageOverview`]. Percentages are whole permille (tenths of a percent), so the
