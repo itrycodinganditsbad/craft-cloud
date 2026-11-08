@@ -4,7 +4,7 @@
 shows every edit on the other as it is made, works offline, and never makes conflict copies of its own saves. The
 app's whole change is one adapter. Everything else (talking to the Craft Cloud agent, the Loro document,
 reconnecting, binary content, undo while live) is in the kit. `craft-cloud-egui` adds Craft Cloud's piece of the
-window: the account line, the shared recent files and the document's badge.
+window: the account line, the shared recent files, the document's badge and who else is in the document.
 
 The demo app in this repository (`apps/craft-cloud-kit-demo`, never packaged) is a complete example: a rich-text
 story and a layer tree; its adapter is about 150 lines of `model.rs`, its hook one function of `ui.rs`. The
@@ -79,7 +79,8 @@ impl LiveDocument for DemoApp {
   value derived from what it repairs (never `ElemId::new()` or the clock), so two machines' repairs are one.
 - Property values ([`Value`]) are numbers, strings, bytes and chunk references, at most 256 KiB each. Binary
   content never goes into the document: put it in a [`BlobStore`] ([`AgentBlobs`] is the agent's) and keep the
-  [`ChunkRef`].
+  [`ChunkRef`]. For documents that may be in a team space build the agent's store with `session.blobs()` (see
+  "Team spaces" below).
 
 ## Opening
 
@@ -218,18 +219,53 @@ back. Saving clears `changed_outside`.
 `session.set_presence(Some(bytes))` shows this app's cursor or selection to the others (the bytes are the app's,
 at most 4 KiB less 8); `session.peers()` is theirs, dropped 10 s after they go quiet. Drawing them is the app's.
 
+## Team spaces
+
+A file in a team space's folder is opened as any other: the app passes the path it has (an absolute path inside the
+synced team folder; the agent routes a document by its path), and the session is live between the space's members.
+Editing, undo and saving need no change. Three things are new and additive; an app that uses none of them behaves as it
+did.
+
+- **Who is there.** `session.people()` lists the people of the document's space who are in the document: yourself first,
+  then by name, each a `Person { name, colour, is_self, peers }`. `colour` is the account's palette colour
+  (`PaletteColour`, with a `light` and a `dark` sRGB value; use the one for the background it is drawn on), the same for
+  an account in every window and on every machine. `peers` are the Loro peers of that account's windows in this document
+  (the keys of `session.peers()`), so an app can draw a cursor in its owner's colour. A person is here while they send
+  presence (`set_presence`, dropped after `PRESENCE_TTL` quiet) or are yourself; your own other windows are you. The list is
+  empty while the agent hasn't said who is in the space and for an agent from before team spaces. The kit asks the agent for
+  identity itself and still hands the app its peers' own bytes (`peers()` is unchanged); the names come from the agent, and
+  an account's presence is its account's word, not the app's bytes. `craft_cloud_egui::people_badge(ui, &session.people())`
+  draws them (initials in their colours, at most four, then "+N"; names on hover).
+- **Viewers.** A member who may only read a team space's documents (a viewer, or the space is archived) opens them
+  read-only: `status().viewer` is true, the badge says "Read-only", `can_undo()` is false, and `local_change`, `undo` and
+  `redo` refuse with `KitError::ViewOnly` (the same path as a document of a newer app, `KitError::ReadOnly`, which `viewer`
+  does not set). Nothing is sent, and `save_point` refuses (`KitError::NoRecord`), so the app saves its own model without a
+  record. A role lowered while the document is open shows when the agent refuses a change with `read_only`: the session
+  becomes a viewer then, the refused change is never sent again (unlike a refusal for a full disk, which goes again), and the
+  changes made before stay in the window. Open the document again to find out whether the role changed.
+- **Binary values.** `session.blobs()` is the agent's blob store bound to the document's file, so its blobs go to the
+  document's space and every member gets them back. Use it where an app wrote `AgentBlobs(client.blobs())`; that keeps blobs
+  in the account's personal space, where the other members get `blob_not_found`. Call `session.check_blobs(&store)` once
+  where the app builds its store: in a team space an agent store that isn't bound to the document adds a text to
+  `session.warnings()` (once per session) and returns false. Behind it, `client.blobs().for_path(path)` is the bound store of
+  `craft-cloud-app`, and `Blobs::put_for`/`get_for` name the path on every call.
+
 ## Craft Cloud's piece of the window
 
 `craft_cloud_egui::CloudWatch::start(app, connect, wake)` keeps the agent's state and the app's recents current off
 the UI thread; `account_line(ui, &watch.state())` and `recents(ui, watch.entries(), now)` draw them (a click returns
-the path); `watch.add_recent(path, saved)` puts a file on every machine's list.
+the path); `watch.add_recent(path, saved)` puts a file on every machine's list. `badge(ui, session.status())` is the
+document's state and `people_badge(ui, &session.people())` who else is in it.
 
 ## Testing the adapter
 
 With the `fake` feature, `craft_cloud_kit::testing::{Hub, Fake}` is an agent in the test's own process: machines of
 one account on a shared hub, with `set_online`, `restart` and `start`, `drop_connections`, and an old-agent mode.
 Two sessions on two fakes test merges, undo and reconnects with no server; the demo's tests drive two windows that
-way with kittest.
+way with kittest. For a team space, `hub.team()` makes the hub's space one, `hub.machine_as(name, account)` adds a machine
+of another account (the members), `hub.set_read_only(account, true)` makes an account a viewer, and
+`hub.remove_member(account)` takes one out of the space; the fake then lists the members, stamps presence with the sender,
+names the space in `opened` and keeps `?for=` blobs in the team space.
 
 ## Costs to know
 

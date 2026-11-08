@@ -2,7 +2,8 @@
 //!
 //! - [`account_line`]: who is signed in where, and whether Craft Cloud is online (or not running);
 //! - [`recents`]: the app's recent files, shared by every machine of the account, newest first (a click opens one);
-//! - [`badge`]: a live document's state (live, waiting N, read-only, offline), next to its title.
+//! - [`badge`]: a live document's state (live, waiting N, read-only, offline), next to its title;
+//! - [`people_badge`]: who is in the document (initials in their colours, light or dark), next to the badge.
 //!
 //! The widgets only draw what they are given. [`CloudWatch`] keeps it current off the UI thread (the agent's status
 //! every few seconds, the recents as they change) and wakes the UI when it changed (`request_repaint`).
@@ -14,7 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use craft_cloud_app::{Client, NewRecent, RecentEntry, RecentsEvent, RecentsWatch, RunState, Status};
-use craft_cloud_kit::Badge;
+use craft_cloud_kit::{Badge, Person};
 use egui::{Color32, RichText, Ui};
 
 /// How often [`CloudWatch`] asks the agent how it stands.
@@ -139,6 +140,7 @@ pub fn badge(ui: &mut Ui, status: &craft_cloud_kit::Status) {
             Color32::from_rgb(0x40, 0x60, 0xb0),
             match &status.read_only {
                 Some(ro) if !ro.app.is_empty() => format!("Made with a newer version (layout {}): update the app to edit it", ro.version),
+                _ if status.viewer => "You can look at this document but not change it: your role in its team space is viewer, or the space is archived".to_owned(),
                 _ => "This document can't be edited by this app".to_owned(),
             },
         ),
@@ -153,6 +155,54 @@ pub fn badge(ui: &mut Ui, status: &craft_cloud_kit::Status) {
         ),
     };
     ui.colored_label(color, badge_text(b)).on_hover_text(hover);
+}
+
+/// How many people [`people_badge`] shows before it counts the rest.
+pub const PEOPLE_SHOWN: usize = 4;
+
+/// Two letters at most to tell an account by: the first letters of its first two words, or the first two letters of a
+/// single word.
+fn initials(name: &str) -> String {
+    let words: Vec<&str> = name.split(|c: char| c.is_whitespace() || matches!(c, '-' | '_' | '.')).filter(|w| !w.is_empty()).collect();
+    let letters: Vec<char> = match words.as_slice() {
+        [] => Vec::new(),
+        [one] => one.chars().take(2).collect(),
+        [first, second, ..] => first.chars().take(1).chain(second.chars().take(1)).collect(),
+    };
+    letters.iter().flat_map(|c| c.to_uppercase()).collect()
+}
+
+/// A person's colour for the current background.
+fn person_colour(ui: &Ui, person: &Person) -> Color32 {
+    let rgb = if ui.visuals().dark_mode { person.colour.dark } else { person.colour.light };
+    Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+}
+
+/// Who is in a live document ([`craft_cloud_kit::Session::people`]): each person's initials in their colour, at most
+/// [`PEOPLE_SHOWN`], then "+N" for the rest. The names are on hover ("you" after your own). Draws nothing for an empty
+/// list (an agent that doesn't say who is there).
+pub fn people_badge(ui: &mut Ui, people: &[Person]) {
+    if people.is_empty() {
+        return;
+    }
+    ui.horizontal(|ui| {
+        for person in people.iter().take(PEOPLE_SHOWN) {
+            let colour = person_colour(ui, person);
+            let hover = if person.is_self { format!("{} (you)", person.name) } else { person.name.clone() };
+            egui::Frame::new()
+                .stroke(egui::Stroke::new(1.0, colour))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::symmetric(5, 1))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(initials(&person.name)).strong().color(colour)).on_hover_text(hover);
+                });
+        }
+        let rest = people.len().saturating_sub(PEOPLE_SHOWN);
+        if rest > 0 {
+            let names: Vec<&str> = people.iter().skip(PEOPLE_SHOWN).map(|p| p.name.as_str()).collect();
+            ui.weak(format!("+{rest}")).on_hover_text(names.join(", "));
+        }
+    });
 }
 
 /// Keeps an [`AgentState`] and an app's recents current, off the UI thread.
