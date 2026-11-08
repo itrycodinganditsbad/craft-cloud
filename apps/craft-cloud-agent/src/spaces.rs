@@ -32,6 +32,10 @@
 //!   to have been deleted. A file that was deleted on the server meanwhile and is still in the folder is uploaded again. A
 //!   file that exists on both sides with different content is not overwritten: the local one is moved aside as a conflict
 //!   copy and the server's version takes its path.
+//! - **A state is trusted only when nothing doubtful happened to it**: the setting's `generation` (saved in `account.json`) is
+//!   raised before a state is retired or a new folder's marker is written, and a state made under another generation is not
+//!   used; a state that can't be removed fails the turn-off; and a session whose folder now leads somewhere else (a link
+//!   pointed at another folder) is dropped with its state before the next pass.
 //! - **One pass at a time**: passes of the spaces run one after another on a thread of their own, and take turns with the
 //!   personal space's passes ([`PassGate`]). A pass that is queued when its space is closed (turned off, moved to another
 //!   folder, lost) or the agent stops is not run; the running pass finishes. A second change of a space that is still

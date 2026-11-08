@@ -215,6 +215,14 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
   moment"). Turning on a space that has no session or pass here does not wait for another space's pass; if the space's own
   last pass has not ended after 50 seconds the answer is "this space is still finishing its last pass, try again in a
   moment". If the agent stops while a space is being turned off, the space stays off. Signing out removes the team spaces' states too; their folders, markers and files stay.
+- **A state is trusted only when nothing doubtful happened to it.** Each team space's setting in `account.json` has a
+  `generation` (left out while 0), and `state.json` records the generation it was made under; a state under another
+  generation is not used. The generation is raised and saved before a state is retired (turning the space off, losing
+  access) and before a new folder's marker is written, so a state that survives its removal, or a crash between the marker
+  and the removal, is never trusted again. If the state cannot be removed (something holds the file), turning the space off
+  fails with that error instead of reporting success. Before every pass the session also compares the folder's canonical path
+  and ID with those it opened on: a link or junction pointed at another folder meanwhile ends the session, drops the state and
+  starts the space afresh there as a first sync.
 - **A first sync merges, and says what that means.** Without a saved state, nothing is known to have been deleted, so
   nothing is deleted on either side. A file that teammates deleted on the server meanwhile, and that is still in the
   folder, is uploaded again. A file that exists on both sides with different content is not overwritten: the local one is
