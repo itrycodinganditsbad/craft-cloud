@@ -73,6 +73,10 @@ pub enum Command {
         /// still wait). With `=<set>` (the set the list was printed with): only if that set is the one waiting.
         #[arg(long, value_name = "SET", num_args = 0..=1, require_equals = true, value_parser = set_name)]
         approve_deletes: Option<Option<String>>,
+        /// With `--approve-deletes`: approve the waiting deletions of this team space (its ID or its name) instead of the
+        /// personal space's. The running agent carries them out.
+        #[arg(long, value_name = "SPACE", requires = "approve_deletes")]
+        space: Option<String>,
     },
     /// Keep the folder in sync until stopped (Ctrl-C): sync whenever something changes here or on the server, and
     /// at least every 10 minutes. Ctrl-C lets a running pass finish; a second Ctrl-C stops at once. Exits 0 at once,
@@ -494,7 +498,8 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
             }
             Ok(Exit::Done)
         }
-        Command::Sync { approve_deletes } => Ok(sync(&data, Approve::from_flag(approve_deletes), out).await?.0),
+        Command::Sync { approve_deletes, space: Some(space) } => approve_team_deletes(&data, &space, &Approve::from_flag(approve_deletes), out),
+        Command::Sync { approve_deletes, space: None } => Ok(sync(&data, Approve::from_flag(approve_deletes), out).await?.0),
         Command::Run { .. } => {
             let (stop, stops) = tokio::sync::mpsc::unbounded_channel();
             let signals = tokio::spawn(forward_stop_signals(stop));
@@ -1564,6 +1569,12 @@ fn approve_for_loop(data: &DataDir, approve: &Approve, out: &mut impl Write) -> 
     if !data.load_status()?.is_some_and(|s| s.running(now_ms())) {
         return Ok(None);
     }
+    approve_waiting(data, approve, out).map(|(exit, summary, _)| Some((exit, summary)))
+}
+
+/// The approval itself, for the state in `data` (the data folder, or a team space's folder in it): the rules of
+/// [`approve_for_loop`] without asking whether a loop runs. The `bool` is whether an approval was handed over.
+pub(crate) fn approve_waiting(data: &DataDir, approve: &Approve, out: &mut impl Write) -> Result<(Exit, PassSummary, bool), AgentError> {
     let waiting = data.load_state()?.last_pass.and_then(|l| l.summary).map(|s| s.pending_only()).unwrap_or_default();
     // The set of deletes held behind a link goes only when named.
     if let Approve::Set(named) = approve
@@ -1578,7 +1589,7 @@ fn approve_for_loop(data: &DataDir, approve: &Approve, out: &mut impl Write) -> 
         for (path, links) in &waiting.held_deletes {
             say!(out, "  delete on the server: {} (held while any of {} is a link)", path, links.join(", "))?;
         }
-        return Ok(Some((Exit::Done, waiting)));
+        return Ok((Exit::Done, waiting, true));
     }
     // The bare flag never releases a hold: say how to, rather than "nothing was waiting".
     let held = waiting.held_set().filter(|_| *approve == Approve::Listed);
@@ -1589,22 +1600,22 @@ fn approve_for_loop(data: &DataDir, approve: &Approve, out: &mut impl Write) -> 
         if let Approve::Set(named) = approve
             && waiting.approvable()
         {
-            return wrong_set(data, named, &waiting, out).map(Some);
+            return wrong_set(data, named, &waiting, out).map(|(exit, summary)| (exit, summary, false));
         }
         if held.is_none() {
             say!(out, "nothing was waiting for approval")?;
         }
-        return Ok(Some((Exit::Done, waiting)));
+        return Ok((Exit::Done, waiting, false));
     };
     if let Approve::Set(named) = approve {
         if *named != set {
-            return wrong_set(data, named, &waiting, out).map(Some);
+            return wrong_set(data, named, &waiting, out).map(|(exit, summary)| (exit, summary, false));
         }
     } else if data.load_shown()?.is_none_or(|shown| shown.set != set) {
         print_waiting(out, &waiting)?;
         data.save_shown(&set, now_ms())?;
         say!(out, "nothing approved: these deletions changed since `status` listed them (or it didn't); check them, then run this again")?;
-        return Ok(Some((Exit::NeedsApproval, waiting)));
+        return Ok((Exit::NeedsApproval, waiting, false));
     }
     data.give_approval(&set, &waiting.pending_nodes, now_ms())?;
     say!(out, "the running agent will carry out these deletions (set {set}):")?;
@@ -1614,7 +1625,52 @@ fn approve_for_loop(data: &DataDir, approve: &Approve, out: &mut impl Write) -> 
     for path in &waiting.pending_local_deletes {
         say!(out, "  delete here: {path}")?;
     }
-    Ok(Some((Exit::Done, waiting)))
+    Ok((Exit::Done, waiting, true))
+}
+
+/// `sync --approve-deletes --space <ID or name>`: the waiting deletions of a team space go to the running agent, by the
+/// rules of [`approve_for_loop`] (the space's own `state.json`, `shown.json` and `approval.json` in `spaces/<id>/`). A team
+/// space syncs only while `run` runs, so without a running agent there is nobody to hand the approval to.
+fn approve_team_deletes(data: &DataDir, space: &str, approve: &Approve, out: &mut impl Write) -> Result<Exit, AgentError> {
+    let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
+    let setting = find_team_space(&account.spaces, space)?;
+    if !data.load_status()?.is_some_and(|s| s.running(now_ms())) {
+        return Err(AgentError::Usage(
+            "team spaces sync only while `craft-cloud-agent run` is running; there is no running agent to approve for".into(),
+        ));
+    }
+    approve_team(data, setting, approve, out).map(|(exit, _, _)| exit)
+}
+
+/// The team space the user means by its ID or its name (as the server last called it, ignoring case).
+fn find_team_space<'a>(spaces: &'a [crate::account::SpaceSetting], text: &str) -> Result<&'a crate::account::SpaceSetting, AgentError> {
+    let text = text.trim();
+    if let Ok(id) = text.parse::<craft_cloud_proto::SpaceId>() {
+        return spaces.iter().find(|s| s.space == id).ok_or_else(|| AgentError::Usage(format!("no team space {id} on this computer")));
+    }
+    let mut named = spaces.iter().filter(|s| s.name.as_deref().is_some_and(|n| n.to_lowercase() == text.to_lowercase()));
+    match (named.next(), named.next()) {
+        (Some(only), None) => Ok(only),
+        (Some(_), Some(_)) => Err(AgentError::Usage("several team spaces have that name; give the space's ID".into())),
+        (None, _) => Err(AgentError::Usage("no team space of that name or ID on this computer".into())),
+    }
+}
+
+/// The approval of a team space's waiting deletions (see [`approve_waiting`]), for the state saved for its folder: a state
+/// made for another folder has nothing waiting. The `bool` is whether an approval was handed over.
+pub(crate) fn approve_team(
+    data: &DataDir,
+    setting: &crate::account::SpaceSetting,
+    approve: &Approve,
+    out: &mut impl Write,
+) -> Result<(Exit, PassSummary, bool), AgentError> {
+    let state = data.space_dir(setting.space);
+    let (saved, set_aside) = state.load_state_for(setting.space, &setting.folder)?;
+    if set_aside || saved.state.space.is_none() {
+        say!(out, "nothing was waiting for approval")?;
+        return Ok((Exit::Done, PassSummary::default(), false));
+    }
+    approve_waiting(&state, approve, out)
 }
 
 /// A signed-in folder ready for passes: its account, the engine on the real disk and the HTTP API, and the folder's
@@ -1632,6 +1688,8 @@ pub struct Session {
     /// The last pass's outcome, also written with every checkpoint (so it is shared with the checkpoint closure).
     last_pass: std::sync::Arc<std::sync::Mutex<Option<LastPass>>>,
     _folder_lock: Lock,
+    /// A team space's folder as `state.json` records it (canonical); `None` for the personal space.
+    state_folder: Option<PathBuf>,
     /// The stability window's looks, shared with the `run` loop (`None`: a one-off `sync` trusts every file).
     stability: Option<Stability>,
     /// When the earliest look at a file still changing is due, after the last pass (if it finished).
@@ -1676,7 +1734,16 @@ impl Session {
         check_apart(root_data, &account.folder)?;
         root::check(&account.folder, &RootMarker { space: account.space, root: account.root })?;
         let folder_lock = hold_folder(&account.folder)?;
-        let mut saved = data.load_state()?;
+        // A team space's state is used only for the folder it was made for; otherwise the folder starts afresh (a first sync:
+        // what is there and what the server has are merged, and nothing is deleted on either side).
+        let (mut saved, set_aside) = if bound { data.load_state_for(account.space, &account.folder)? } else { (data.load_state()?, false) };
+        if set_aside {
+            crate::runlog::note(format_args!(
+                "the saved state of team space {} was made for another folder: starting afresh, nothing is deleted",
+                account.space
+            ));
+        }
+        let state_folder = if bound { std::fs::canonicalize(&account.folder).ok() } else { None };
         if saved.state.space.is_some_and(|s| s != account.space) {
             return Err(AgentError::OtherAccountState(data.path().join(crate::account::STATE_FILE)));
         }
@@ -1697,10 +1764,10 @@ impl Session {
         // `state.json` is also written at the pass's checkpoints, so a crash or a kill loses at most what the pass did
         // since the last one (the last pass's outcome stays as it was until this one ends).
         let last_pass = std::sync::Arc::new(std::sync::Mutex::new(saved.last_pass));
-        let (checkpoint_data, checkpoint_last) = (data.clone(), last_pass.clone());
+        let (checkpoint_data, checkpoint_last, checkpoint_folder) = (data.clone(), last_pass.clone(), state_folder.clone());
         engine.on_checkpoint(move |state| {
             let last_pass = checkpoint_last.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-            let saved = SavedState { schema: STATE_SCHEMA, state: state.clone(), last_pass, paused: false };
+            let saved = SavedState { schema: STATE_SCHEMA, state: state.clone(), last_pass, paused: false, folder: checkpoint_folder.clone() };
             checkpoint_data.save_state(&saved).map_err(|e| std::io::Error::other(e.to_string()))
         });
         Ok(Self {
@@ -1711,6 +1778,7 @@ impl Session {
             engine,
             last_pass,
             _folder_lock: folder_lock,
+            state_folder,
             stability,
             recheck_in: None,
         })
@@ -1800,7 +1868,13 @@ impl Session {
         };
         let last = LastPass { finished_ms: now_ms(), outcome, summary: summary.clone() };
         *self.last_pass.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(last.clone());
-        let saved = SavedState { schema: STATE_SCHEMA, state: self.engine.state().clone(), last_pass: Some(last), paused: false };
+        let saved = SavedState {
+            schema: STATE_SCHEMA,
+            state: self.engine.state().clone(),
+            last_pass: Some(last),
+            paused: false,
+            folder: self.state_folder.clone(),
+        };
         self.data.save_state(&saved)?;
         result?;
         Ok(summary.unwrap_or_default())
@@ -2047,6 +2121,8 @@ pub(crate) async fn revoke_device(account: &Account) -> Result<(), AgentError> {
 pub(crate) fn forget_account(data: &DataDir) -> Result<(), AgentError> {
     data.remove_account()?;
     data.remove_state()?;
+    // The team spaces' states too: one kept would be reused if the same folder is chosen after a later sign-in.
+    data.remove_space_states()?;
     Ok(())
 }
 
@@ -2110,23 +2186,46 @@ mod tests {
     }
 
     #[test]
+    fn a_team_space_is_found_by_its_id_or_its_name() {
+        use crate::account::SpaceSetting;
+        let setting = |name: &str| SpaceSetting {
+            space: craft_cloud_proto::SpaceId::generate(),
+            folder: PathBuf::from("/x"),
+            sync: true,
+            name: Some(name.into()),
+            root: None,
+        };
+        let (studio, plans, twin) = (setting("Studio"), setting("Plans"), setting("plans"));
+        let spaces = vec![studio.clone(), plans.clone()];
+        assert_eq!(find_team_space(&spaces, &studio.space.to_string()).unwrap().space, studio.space);
+        assert_eq!(find_team_space(&spaces, " STUDIO ").unwrap().space, studio.space, "a name, whatever the case");
+        assert!(matches!(find_team_space(&spaces, "Nothing"), Err(AgentError::Usage(_))));
+        assert!(matches!(find_team_space(&spaces, &craft_cloud_proto::SpaceId::generate().to_string()), Err(AgentError::Usage(_))));
+        let spaces = vec![studio, plans, twin];
+        assert!(matches!(find_team_space(&spaces, "Plans"), Err(AgentError::Usage(m)) if m.contains("ID")), "two of that name: the ID is needed");
+    }
+
+    #[test]
     fn the_cli_parses() {
         let cli = Cli::try_parse_from(["craft-cloud-agent", "login", "https://c.example", "--user", "ana", "--adopt", "--data-dir", "d"]).unwrap();
         assert_eq!(cli.data_dir.as_deref(), Some(Path::new("d")));
         assert!(matches!(cli.command, Command::Login(LoginArgs { adopt: true, ref user, .. }) if user == "ana"));
         let cli = Cli::try_parse_from(["craft-cloud-agent", "sync", "--approve-deletes"]).unwrap();
-        let Command::Sync { approve_deletes } = cli.command else { panic!("{:?}", cli.command) };
+        let Command::Sync { approve_deletes, .. } = cli.command else { panic!("{:?}", cli.command) };
         assert_eq!(Approve::from_flag(approve_deletes), Approve::Listed);
         let cli = Cli::try_parse_from(["craft-cloud-agent", "sync", "--approve-deletes=3F9A0b1c2d3e"]).unwrap();
-        let Command::Sync { approve_deletes } = cli.command else { panic!("{:?}", cli.command) };
+        let Command::Sync { approve_deletes, .. } = cli.command else { panic!("{:?}", cli.command) };
         assert_eq!(Approve::from_flag(approve_deletes), Approve::Set("3f9a0b1c2d3e".into()));
         let cli = Cli::try_parse_from(["craft-cloud-agent", "sync"]).unwrap();
-        let Command::Sync { approve_deletes } = cli.command else { panic!("{:?}", cli.command) };
+        let Command::Sync { approve_deletes, .. } = cli.command else { panic!("{:?}", cli.command) };
         assert_eq!(Approve::from_flag(approve_deletes), Approve::Nothing);
         for empty in ["--approve-deletes=", "--approve-deletes= "] {
             let e = Cli::try_parse_from(["craft-cloud-agent", "sync", empty]).unwrap_err();
             assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation, "{empty:?} is a usage error: {e}");
         }
+        let cli = Cli::try_parse_from(["craft-cloud-agent", "sync", "--approve-deletes", "--space", "Studio"]).unwrap();
+        assert!(matches!(cli.command, Command::Sync { space: Some(ref space), .. } if space == "Studio"));
+        assert!(Cli::try_parse_from(["craft-cloud-agent", "sync", "--space", "Studio"]).is_err(), "--space needs --approve-deletes");
         assert!(Cli::try_parse_from(["craft-cloud-agent", "login", "https://c.example"]).is_err(), "--user is required");
     }
 

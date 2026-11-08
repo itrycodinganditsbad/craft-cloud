@@ -198,7 +198,8 @@ pub mod paths {
     /// `GET` → [`super::SpaceList`]: the personal space and the team spaces of the account, invitations among them, with
     /// what this computer does with each. Under `/v1/spaces/{id}`: `POST …/accept` → the space as the server lists it
     /// ([`SpaceListItem`](crate::api::SpaceListItem)), `POST …/decline` → 204 (both passed on to the server), and
-    /// `POST …/sync` ([`super::SpaceSyncRequest`]) → the space as [`super::SpaceInfo`].
+    /// `POST …/sync` ([`super::SpaceSyncRequest`]) → the space as [`super::SpaceInfo`], and `POST …/approve-deletes`
+    /// ([`super::ApproveDeletesRequest`]) → [`super::ApproveDeletesAnswer`].
     pub const SPACES: &str = "/v1/spaces";
 }
 
@@ -466,8 +467,9 @@ pub enum SpaceSync {
 }
 
 /// How the sync of one team space is going, in [`SpaceStatus`] and [`SpaceInfo`]: [`RunState`] for a space, and the two
-/// ways a space stops that a whole agent doesn't.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// ways a space stops that a whole agent doesn't. The `Debug` output leaves out the words of `NoAccess`, which name the
+/// space.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum SpaceRun {
     Idle,
@@ -482,7 +484,8 @@ pub enum SpaceRun {
     },
     /// Syncing is paused by the user for every space.
     PausedByUser,
-    /// The account no longer has access (it was removed, the invitation withdrawn, the space archived). The local copy is
+    /// The account no longer has access (it was removed, or the invitation withdrawn; an archived space is not this: its members
+    /// keep read access). The local copy is
     /// kept and no longer syncs; if access comes back it syncs again. `message` says so in words.
     NoAccess {
         message: String,
@@ -491,6 +494,20 @@ pub enum SpaceRun {
     Unavailable {
         message: String,
     },
+}
+
+impl std::fmt::Debug for SpaceRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle => f.write_str("Idle"),
+            Self::Syncing => f.write_str("Syncing"),
+            Self::Retrying { message } => f.debug_struct("Retrying").field("message", message).finish(),
+            Self::Paused { reason } => f.debug_struct("Paused").field("reason", reason).finish(),
+            Self::PausedByUser => f.write_str("PausedByUser"),
+            Self::NoAccess { .. } => f.debug_struct("NoAccess").finish_non_exhaustive(),
+            Self::Unavailable { message } => f.debug_struct("Unavailable").field("message", message).finish(),
+        }
+    }
 }
 
 /// One synced team space in [`Status::spaces`].
@@ -571,6 +588,30 @@ pub struct SpaceSyncRequest {
 impl std::fmt::Debug for SpaceSyncRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpaceSyncRequest").field("on", &self.on).field("adopt", &self.adopt).finish_non_exhaustive()
+    }
+}
+
+/// `POST /v1/spaces/{id}/approve-deletes`: approve the deletions of a team space that the mass-delete guard holds back, as
+/// `craft-cloud-agent sync --approve-deletes --space` does (it writes the space's `approval.json`, which the running agent
+/// takes). With a `set` (the identifier the waiting list was shown with) only that set is approved if it is the one waiting;
+/// without, the set is approved if it is the one last shown by this call (the first call lists it and approves nothing).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ApproveDeletesRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set: Option<String>,
+}
+
+/// The answer to [`ApproveDeletesRequest`]: whether an approval was handed to the agent, and what the command line
+/// would have said. Its `Debug` output leaves out the words, which list file names.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproveDeletesAnswer {
+    pub approved: bool,
+    pub message: String,
+}
+
+impl std::fmt::Debug for ApproveDeletesAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApproveDeletesAnswer").field("approved", &self.approved).finish_non_exhaustive()
     }
 }
 
@@ -1259,7 +1300,7 @@ mod tests {
             archived: false,
             folder: Some("/home/ana/Craft Cloud Shared/Studio".into()),
             sync: SpaceSync::On,
-            run_state: Some(SpaceRun::NoAccess { message: "You no longer have access".into() }),
+            run_state: Some(SpaceRun::NoAccess { message: "You no longer have access to Studio. Your local copy is kept.".into() }),
             last_sync_ms: None,
             read_only: true,
         };
@@ -1270,6 +1311,12 @@ mod tests {
         assert_eq!(serde_json::from_value::<SpaceInfo>(json).unwrap(), info);
         let shown = format!("{info:?}");
         assert!(!shown.contains("Studio") && !shown.contains("Craft Cloud Shared"), "{shown}");
+        assert!(shown.contains("NoAccess"), "the variant is still named: {shown}");
+        let status = SpaceStatus { space, run_state: info.run_state.clone().unwrap(), last_sync_ms: None, read_only: false };
+        let shown = format!("{status:?}");
+        assert!(!shown.contains("Studio"), "the status leaves the name out too: {shown}");
+        let answer = ApproveDeletesAnswer { approved: true, message: "delete on the server: Studio/plan.txt".into() };
+        assert!(!format!("{answer:?}").contains("plan.txt"));
         let older: Status = serde_json::from_value(serde_json::json!({
             "api": 1, "signed_in": true, "online": true, "run_state": { "kind": "idle" }
         }))

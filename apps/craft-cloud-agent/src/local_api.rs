@@ -31,9 +31,10 @@ use craft_cloud_proto::api::{
 };
 use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
 use craft_cloud_proto::local::{
-    AutostartRequest, ChangePasswordRequest, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest,
-    MAX_LOCAL_JSON_BYTES, PairingInfo, PasswordRequest, RenameDeviceRequest, RunState, SecondFactorLoginRequest, SpaceInfo, SpaceList, SpaceRun,
-    SpaceStatus, SpaceSync, SpaceSyncRequest, Status, TotpRequest, TwoFactorProofRequest, codes, paths,
+    ApproveDeletesAnswer, ApproveDeletesRequest, AutostartRequest, ChangePasswordRequest, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX,
+    LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES, PairingInfo, PasswordRequest, RenameDeviceRequest, RunState,
+    SecondFactorLoginRequest, SpaceInfo, SpaceList, SpaceRun, SpaceStatus, SpaceSync, SpaceSyncRequest, Status, TotpRequest, TwoFactorProofRequest,
+    codes, paths,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -454,6 +455,7 @@ fn router(state: Api) -> Router {
         .route(&format!("{}/{{id}}/accept", paths::SPACES), post(accept_space))
         .route(&format!("{}/{{id}}/decline", paths::SPACES), post(decline_space))
         .route(&format!("{}/{{id}}/sync", paths::SPACES), post(sync_space).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route(&format!("{}/{{id}}/approve-deletes", paths::SPACES), post(approve_space_deletes).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route(paths::AUTOSTART, post(set_autostart))
         .route(paths::PAUSE, post(pause))
         .route(paths::RESUME, post(resume))
@@ -951,6 +953,41 @@ async fn sync_space(
     let Json(request) = body?;
     let spaces = state.control.spaces_handle().ok_or(AgentError::NotSignedIn)?;
     Ok(Json(spaces.sync(id, request).await?))
+}
+
+/// `POST /v1/spaces/{id}/approve-deletes`: hands the approval of a synced team space's waiting deletions to this agent
+/// (`spaces/<id>/approval.json`), by the rules of `sync --approve-deletes --space`: with a `set`, that set if it is the
+/// one waiting; without, the set the previous call listed.
+async fn approve_space_deletes(
+    State(state): State<Api>,
+    id: Result<Path<craft_cloud_proto::SpaceId>, PathRejection>,
+    body: Result<Json<ApproveDeletesRequest>, JsonRejection>,
+) -> Result<Json<ApproveDeletesAnswer>, LocalError> {
+    let id = path_id(id)?;
+    let Json(request) = body?;
+    let approve = match request.set.as_deref().map(str::trim) {
+        None => crate::cli::Approve::Listed,
+        Some("") => {
+            return Err(LocalError::new(
+                StatusCode::BAD_REQUEST,
+                api_codes::INVALID,
+                "the set is empty; leave it out to approve the set last listed",
+            ));
+        }
+        Some(set) => crate::cli::Approve::Set(set.to_ascii_lowercase()),
+    };
+    let data = DataDir::new(&state.data);
+    let answer = tokio::task::spawn_blocking(move || {
+        let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
+        let setting = account.spaces.iter().find(|s| s.space == id && s.sync);
+        let Some(setting) = setting else { return Ok(None) };
+        let mut out = Vec::new();
+        let (_, _, approved) = crate::cli::approve_team(&data, setting, &approve, &mut out)?;
+        Ok::<_, AgentError>(Some(ApproveDeletesAnswer { approved, message: String::from_utf8_lossy(&out).trim().to_owned() }))
+    })
+    .await
+    .map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))??;
+    answer.map(Json).ok_or_else(|| LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such team space syncing on this computer"))
 }
 
 /// Registers this agent to start at login, or removes the entry; the status after says which.

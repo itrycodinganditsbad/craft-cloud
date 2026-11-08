@@ -80,10 +80,12 @@ pub use craft_cloud_api::api::{
 };
 pub use craft_cloud_api::api::{SpaceListItem, SpaceRole};
 pub use craft_cloud_api::local::{
+    ApproveDeletesAnswer, ApproveDeletesRequest, SpaceInfo, SpaceList, SpaceRun, SpaceStatus, SpaceSync, SpaceSyncRequest,
+};
+pub use craft_cloud_api::local::{
     HistoryResponse, HistoryVersion, JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RestoreResponse, RunState,
     SecondFactorLoginRequest, Status, TrashItem, TrashNodeRequest, TrashResponse, TrashRestoreResponse, TwoFactorProofRequest, codes,
 };
-pub use craft_cloud_api::local::{SpaceInfo, SpaceList, SpaceRun, SpaceStatus, SpaceSync, SpaceSyncRequest};
 pub use craft_cloud_api::{NodeId, SpaceId, VersionId};
 pub use recents::{RecentsEvent, RecentsWatch};
 pub use uuid::Uuid;
@@ -1071,6 +1073,7 @@ mod tests {
             (200, json(&item)),
             (204, String::new()),
             (200, json(&SpaceInfo { sync: SpaceSync::On, ..info.clone() })),
+            (200, json(&ApproveDeletesAnswer { approved: true, message: "the running agent will carry out these deletions".into() })),
             (404, no_invitation),
             (404, no_such_call),
         ];
@@ -1086,6 +1089,9 @@ mod tests {
         let on = agent.set_space_sync(space, &SpaceSyncRequest { on: true, folder: None, adopt: true }).unwrap();
         assert_eq!(on.sync, SpaceSync::On);
         assert_eq!(next(), ("POST".to_owned(), format!("/v1/spaces/{space}/sync"), r#"{"on":true,"adopt":true}"#.to_owned()));
+        let approved = agent.approve_space_deletes(space, Some("3f9a0b1c2d3e")).unwrap();
+        assert!(approved.approved);
+        assert_eq!(next(), ("POST".to_owned(), format!("/v1/spaces/{space}/approve-deletes"), r#"{"set":"3f9a0b1c2d3e"}"#.to_owned()));
         let gone = agent.decline_space(space).unwrap_err();
         assert!(matches!(&gone, Error::Refused { code, .. } if code == "not_found"), "the server's answer passes through: {gone:?}");
         next();

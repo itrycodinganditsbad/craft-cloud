@@ -5,7 +5,7 @@
 
 use craft_cloud_api::SpaceId;
 use craft_cloud_api::api::SpaceListItem;
-use craft_cloud_api::local::{SpaceInfo, SpaceList, SpaceSyncRequest, paths};
+use craft_cloud_api::local::{ApproveDeletesAnswer, ApproveDeletesRequest, SpaceInfo, SpaceList, SpaceSyncRequest, paths};
 
 use crate::{Client, Error, codes, http};
 
@@ -50,5 +50,15 @@ impl Client {
     pub fn set_space_sync(&self, id: SpaceId, request: &SpaceSyncRequest) -> Result<SpaceInfo, Error> {
         let body = serde_json::to_vec(request).map_err(|e| Error::Protocol(e.to_string()))?;
         self.call("POST", &space_path(id, "sync"), Some(body), http::SLOW_TIMEOUT).map_err(too_old)
+    }
+
+    /// Approves the deletions the mass-delete guard holds back in a team space, as `craft-cloud-agent sync
+    /// --approve-deletes --space` does. With `set`, only that set (the identifier the list was shown with) and only if it is
+    /// the one waiting; without, the set the previous call of this kind listed (the first call lists and approves nothing).
+    /// The running agent carries the approved deletions out in its next pass. `approved` in the answer says whether an
+    /// approval was handed over.
+    pub fn approve_space_deletes(&self, id: SpaceId, set: Option<&str>) -> Result<ApproveDeletesAnswer, Error> {
+        let body = serde_json::to_vec(&ApproveDeletesRequest { set: set.map(str::to_owned) }).map_err(|e| Error::Protocol(e.to_string()))?;
+        self.call("POST", &space_path(id, "approve-deletes"), Some(body), http::COMMAND_TIMEOUT).map_err(too_old)
     }
 }

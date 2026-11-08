@@ -1100,9 +1100,10 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
         }
         drop(watching);
         drop(requests);
-        // The team spaces stop with the account: a running pass finishes, then their folders are let go of.
+        // The team spaces stop with the account: a running pass finishes, then their folders are let go of (after a second
+        // stop at once: nothing queued starts, and the pass thread is not waited for, as the personal one is not).
         control.set_spaces_handle(None);
-        spaces.stop().await;
+        spaces.stop(matches!(end, End::Exit(Exit::Failed))).await;
         control.set_spaces(Vec::new(), Vec::new());
         // Recents stop with the account: their followers are told, and what they were given is on disk.
         control.set_hub(None);

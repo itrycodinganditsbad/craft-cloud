@@ -303,6 +303,10 @@ pub struct SavedState {
     /// `run` loop only while no pass runs (a pass writes `false`: passes run only when not paused).
     #[serde(default)]
     pub paused: bool,
+    /// A team space's state only: the canonical folder it was made for. A state is used only for the folder it names
+    /// (see [`DataDir::load_state_for`]); the personal space's state has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<PathBuf>,
 }
 
 /// `status.json`: what the `run` loop is doing, written atomically on every change and as a heartbeat, for `status`
@@ -469,6 +473,20 @@ impl DataDir {
         Ok(load(&self.file(STATE_FILE), STATE_SCHEMA)?.unwrap_or(SavedState { schema: STATE_SCHEMA, ..SavedState::default() }))
     }
 
+    /// A team space's saved state for `folder`: the state only if it was made for this space and this folder (compared
+    /// as canonical paths), else a fresh one. A state remembers what the folder it syncs holds; used for another folder it
+    /// would find that folder's files missing and delete them on the server. The `bool` says the saved state was set
+    /// aside because it belongs elsewhere.
+    pub fn load_state_for(&self, space: SpaceId, folder: &Path) -> Result<(SavedState, bool), AccountError> {
+        let saved = self.load_state()?;
+        let here = fs::canonicalize(folder).ok();
+        let ours = saved.state.space.is_none_or(|s| s == space) && saved.folder.is_some() && saved.folder == here;
+        if ours || (saved.state.space.is_none() && saved.last_pass.is_none() && saved.folder.is_none()) {
+            return Ok((saved, false));
+        }
+        Ok((SavedState { schema: STATE_SCHEMA, ..SavedState::default() }, true))
+    }
+
     pub fn save_state(&self, saved: &SavedState) -> Result<(), AccountError> {
         self.create()?;
         save(&self.file(STATE_FILE), saved)
@@ -476,6 +494,24 @@ impl DataDir {
 
     pub fn remove_state(&self) -> Result<(), AccountError> {
         remove(&self.file(STATE_FILE))
+    }
+
+    /// Removes the saved state of every team space (`spaces/<id>/state.json`), as signing out does for the personal one.
+    /// Their folders, markers and files are not touched.
+    pub fn remove_space_states(&self) -> Result<(), AccountError> {
+        let dir = self.0.join(SPACES_DIR);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io_at(&dir)(e)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(io_at(&dir))?;
+            if entry.path().is_dir() {
+                DataDir(entry.path()).remove_state()?;
+            }
+        }
+        Ok(())
     }
 
     /// Removes the temporary files a crash left while `account.json`, `state.json`, `status.json`, `approval.json` or
@@ -958,6 +994,58 @@ mod tests {
         saved.last_pass = Some(LastPass { finished_ms: 7, outcome: Outcome::Failed("x".into()), summary: None });
         data.save_state(&saved).unwrap();
         assert_eq!(data.load_state().unwrap(), saved);
+    }
+
+    /// A team space's state is used for the space and the folder it was made for, and for nothing else: another folder, another
+    /// space, or a state that records no folder (one from before it did) starts afresh. A missing state is a fresh one.
+    #[test]
+    fn a_team_state_is_used_only_for_its_space_and_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path().join("data"));
+        let (a, b) = (dir.path().join("A"), dir.path().join("B"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let space = SpaceId::generate();
+        assert_eq!(data.load_state_for(space, &a).unwrap(), (SavedState { schema: STATE_SCHEMA, ..SavedState::default() }, false));
+        let mut saved = SavedState { schema: STATE_SCHEMA, folder: fs::canonicalize(&a).ok(), ..SavedState::default() };
+        saved.state.space = Some(space);
+        saved.state.seq = 9;
+        data.save_state(&saved).unwrap();
+        assert_eq!(data.load_state_for(space, &a).unwrap(), (saved.clone(), false), "the folder it was made for");
+        let (other, set_aside) = data.load_state_for(space, &b).unwrap();
+        assert!(set_aside && other.state.seq == 0 && other.state.space.is_none(), "another folder starts afresh");
+        let (other, set_aside) = data.load_state_for(SpaceId::generate(), &a).unwrap();
+        assert!(set_aside && other.state.space.is_none(), "another space starts afresh");
+        let (gone, set_aside) = data.load_state_for(space, &dir.path().join("missing")).unwrap();
+        assert!(set_aside && gone.state.seq == 0, "a folder that can't be found is not the one");
+        // A state from before the folder was recorded is not trusted either.
+        saved.folder = None;
+        data.save_state(&saved).unwrap();
+        assert!(data.load_state_for(space, &a).unwrap().1);
+        // The folder is written only when there is one: the personal space's state is as it was.
+        let personal = SavedState { schema: STATE_SCHEMA, ..SavedState::default() };
+        assert!(!serde_json::to_string(&personal).unwrap().contains("folder"));
+    }
+
+    /// Signing out removes every team space's state and leaves the rest of their folders alone.
+    #[test]
+    fn the_states_of_all_team_spaces_can_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path());
+        data.remove_space_states().unwrap();
+        let (one, two) = (SpaceId::generate(), SpaceId::generate());
+        for space in [one, two] {
+            data.space_dir(space).save_state(&SavedState { schema: STATE_SCHEMA, ..SavedState::default() }).unwrap();
+        }
+        data.space_dir(one).give_approval("set", &[], 1).unwrap();
+        data.save_state(&SavedState { schema: STATE_SCHEMA, ..SavedState::default() }).unwrap();
+        data.remove_space_states().unwrap();
+        for space in [one, two] {
+            assert!(!data.space_dir(space).path().join(STATE_FILE).exists());
+        }
+        assert!(data.space_dir(one).path().join(APPROVAL_FILE).is_file(), "nothing else goes");
+        assert!(data.path().join(STATE_FILE).is_file(), "nor the personal state");
+        data.remove_space_states().unwrap();
     }
 
     /// Held deletes an older agent saved are still read, as the link's path, and keep holding: fix round 3 wrote the

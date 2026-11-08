@@ -3,10 +3,15 @@
 //! lowered to viewer makes the folder read-only; a removed member keeps the local copy, which stops syncing and is reported;
 //! a renamed space keeps its folder; folder names clash and are made safe; an answer without the space's echo is refused;
 //! an old server shows no team spaces and is never sent the `craft-space` header; and a Phase 1 data folder starts unchanged.
+//! Review round: a state belongs to its folder (moving a space, turning it off and on, signing out), regained access merges
+//! instead of resuming, held deletions of a team space are approved from the command line and the local API, a second stop
+//! ends at once with a silent server, an archived space stays readable, pausing rests the long-polls, and one `404` for the
+//! list does not end team spaces.
 //! Every wait is for a condition, with a timeout; the loops get short timings so the tests stay quick.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -208,6 +213,8 @@ impl Person {
 
     async fn accept(&self, id: SpaceId) {
         self.api(move |c| c.accept_space(id)).await.unwrap();
+        // The agent looks at its list again before the call answers, but a look that failed under load leaves the old list.
+        eventually("the accepted space is listed as active", || async { self.space(id).await.is_some_and(|s| s.state == "active") }).await;
     }
 
     /// Turns the sync of a team space on and returns where it syncs.
@@ -220,6 +227,42 @@ impl Person {
     async fn status(&self) -> craft_cloud_app::Status {
         self.api(|c| c.status()).await.unwrap()
     }
+
+    /// Turns the sync of a team space on, in `folder`.
+    async fn sync_on_in(&self, id: SpaceId, folder: &Path) -> SpaceInfo {
+        let folder = folder.display().to_string();
+        let info = self.api(move |c| c.set_space_sync(id, &SpaceSyncRequest { on: true, folder: Some(folder), adopt: false })).await.unwrap();
+        assert_eq!(info.sync, SpaceSync::On, "{info:?}");
+        info
+    }
+
+    /// Turns the sync of a team space off.
+    async fn sync_off(&self, id: SpaceId) {
+        let info = self.api(move |c| c.set_space_sync(id, &SpaceSyncRequest { on: false, folder: None, adopt: false })).await.unwrap();
+        assert_eq!(info.sync, SpaceSync::Off, "{info:?}");
+    }
+
+    /// The saved state file of a team space, as JSON, if there is one.
+    fn space_state(&self, id: SpaceId) -> Option<serde_json::Value> {
+        let text = std::fs::read_to_string(self.data.path().join("spaces").join(id.to_string()).join("state.json")).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+}
+
+/// The files directly in `folder`, by name (hidden ones, the agent's own, left out).
+fn names(folder: &Path) -> Vec<String> {
+    let mut found: Vec<String> = std::fs::read_dir(folder)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| !n.starts_with('.'))
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    found
 }
 
 /// Waits until `cond` holds, failing after [`PATIENCE`].
@@ -263,11 +306,25 @@ async fn team(role: SpaceRole) -> Team {
     Team { world, ana, ben, space }
 }
 
+/// As [`team`], with ben's computer reaching the server through a front that can misbehave.
+async fn team_via_front(role: SpaceRole, behaviour: Front) -> (Team, Arc<Front>, tokio::task::JoinHandle<()>) {
+    let world = world().await;
+    let (url, front, task) = front(&world.url, behaviour).await;
+    let (mut ana, mut ben) = (Person::signed_in(&world.url, "ana").await, Person::signed_in(&url, "ben").await);
+    let space = world.space("Studio").await;
+    world.invite_ben(space, role).await;
+    ana.run();
+    ben.run();
+    (Team { world, ana, ben, space }, front, task)
+}
+
 /// Ben accepts, and both turn the space's sync on. Returns ana's and ben's team folders.
 async fn both_syncing(t: &Team) -> (PathBuf, PathBuf) {
     let space = t.space;
     eventually("the invitation is listed", || async move { t.ben.space(space).await.is_some_and(|s| s.state == "invited") }).await;
     t.ben.accept(space).await;
+    // Ana's agent may not have looked at the server's list yet (the space was made just before it started).
+    eventually("ana's agent lists the space", || async move { t.ana.space(space).await.is_some_and(|s| s.state == "active") }).await;
     let (ana_folder, ben_folder) = (t.ana.sync_on(space).await, t.ben.sync_on(space).await);
     (ana_folder, ben_folder)
 }
@@ -294,6 +351,7 @@ async fn an_invitation_is_accepted_in_the_local_api_and_the_team_folder_syncs_bo
     assert!(t.ben.status().await.spaces.is_empty(), "a space that doesn't sync has no status entry");
 
     // Turned on: the folder appears with the root marker, and the team space syncs both ways.
+    eventually("ana's agent lists the space", || async { t.ana.space(space).await.is_some_and(|s| s.state == "active") }).await;
     let (ana_folder, ben_folder) = (t.ana.sync_on(space).await, t.ben.sync_on(space).await);
     assert_eq!(ben_folder, planned);
     assert!(ben_folder.join(".craft-cloud/root.json").is_file());
@@ -483,6 +541,14 @@ struct Front {
     no_echo: bool,
     /// Every path asked, and whether it carried `craft-space`.
     seen: Mutex<Vec<(String, bool)>>,
+    /// Answers `/api/v1/spaces` with `404` this many more times, then goes on as usual (a proxy during a restart).
+    spaces_404: Mutex<u32>,
+    /// Never answers while set: the connection stays open and silent.
+    stall: AtomicBool,
+    /// Waits this long (milliseconds) before forwarding each request.
+    delay_ms: AtomicU64,
+    /// The long-polls of a team space asked so far.
+    polls: AtomicUsize,
 }
 
 async fn front(upstream: &str, behaviour: Front) -> (String, Arc<Front>, tokio::task::JoinHandle<()>) {
@@ -503,7 +569,30 @@ async fn forward(State((upstream, front, client)): State<FrontState>, request: R
     let (parts, body) = request.into_parts();
     let path = parts.uri.path().to_owned();
     let space_header = HeaderName::from_static("craft-space");
-    front.seen.lock().unwrap().push((path.clone(), parts.headers.contains_key(&space_header)));
+    let named = parts.headers.contains_key(&space_header);
+    front.seen.lock().unwrap().push((path.clone(), named));
+    if named && parts.uri.query().is_some_and(|q| q.contains("wait=")) {
+        front.polls.fetch_add(1, Ordering::SeqCst);
+    }
+    if front.stall.load(Ordering::SeqCst) {
+        std::future::pending::<()>().await;
+    }
+    let delay = front.delay_ms.load(Ordering::SeqCst);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
+    let refuse = path == "/api/v1/spaces" && {
+        let mut left = front.spaces_404.lock().unwrap();
+        let refuse = *left > 0;
+        *left = left.saturating_sub(1);
+        refuse
+    };
+    if refuse {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("{\"error\":\"not_found\",\"message\":\"no such route\"}"))
+            .unwrap();
+    }
     if front.old && path == "/api/v1/spaces" {
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -613,4 +702,361 @@ async fn a_phase_1_data_folder_starts_unchanged() {
     assert!(!ben.data.path().join("spaces").exists(), "no folder for team spaces' state without a team space");
     assert!(ben.data.path().join("state.json").is_file());
     let _: SocketAddr = "127.0.0.1:1".parse().unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The review round of P1-5
+
+/// H3: a state made for one folder is never used for another. A space that synced to A, then to an empty B (which also
+/// received what was added on the server later), turned back to A: A has the marker of the space, but B's state must not
+/// decide what A is missing. The files B got and A never had are not deleted on the server. Signing out forgets the states.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_state_made_for_one_folder_is_not_used_for_another() {
+    let t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    let (ana_folder, a) = both_syncing(&t).await;
+    for i in 0..6 {
+        write(&ana_folder, &format!("f{i}.txt"), &format!("content {i}"));
+    }
+    eventually("ben's first folder has the files", || has_file(a.clone(), "f5.txt", "content 5")).await;
+
+    // Off, and on in an empty folder B: it fills with everything, and with what is added on the server later.
+    t.ben.sync_off(space).await;
+    let b = t.ben.dir.path().join("Elsewhere");
+    t.ben.sync_on_in(space, &b).await;
+    eventually("the second folder has the files", || has_file(b.clone(), "f5.txt", "content 5")).await;
+    write(&ana_folder, "later.txt", "added later");
+    eventually("the second folder has what came later", || has_file(b.clone(), "later.txt", "added later")).await;
+    assert_eq!(read(&a, "later.txt"), None, "the first folder is not synced meanwhile");
+
+    // Off, and on in A again: A has the space's marker, and B's state is not used for it.
+    t.ben.sync_off(space).await;
+    t.ben.sync_on_in(space, &a).await;
+    eventually("A catches up", || has_file(a.clone(), "later.txt", "added later")).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(names(&ana_folder).len(), 7, "nothing was deleted on the server: {:?}", names(&ana_folder));
+    assert_eq!(read(&ana_folder, "later.txt").as_deref(), Some("added later"));
+    assert_eq!(names(&a).len(), 7, "nor in A: {:?}", names(&a));
+    assert_eq!(names(&b).len(), 7, "nor in B: {:?}", names(&b));
+    let state = t.ben.space_state(space).unwrap();
+    assert_eq!(state["folder"].as_str().map(PathBuf::from), std::fs::canonicalize(&a).ok(), "the state names the folder it is for");
+
+    // Signing out forgets the states of the team spaces, as it does the personal one; the folders and files stay.
+    let (_ana, mut ben) = (t.ana, t.ben);
+    let (exit, out) = ben.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    cli::logout(&ben.data, true, &mut Vec::new()).await.unwrap();
+    assert!(ben.space_state(space).is_none(), "the team space's state is gone");
+    assert!(!ben.data.path().join("state.json").exists());
+    assert_eq!(names(&a).len(), 7);
+    assert_eq!(names(&b).len(), 7);
+    assert!(a.join(".craft-cloud/root.json").is_file() && b.join(".craft-cloud/root.json").is_file(), "the markers stay");
+}
+
+/// H1: moving a space that is syncing to another folder stops syncing the old one at once and starts the new folder from
+/// a fresh state: nothing the old folder held is taken for a deletion in the new one, before or after a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn moving_a_syncing_space_to_another_folder_syncs_the_new_folder_and_deletes_nothing() {
+    let t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    let (ana_folder, a) = both_syncing(&t).await;
+    for i in 0..8 {
+        write(&ana_folder, &format!("doc{i}.txt"), &format!("document {i}"));
+    }
+    eventually("ben has the eight files", || has_file(a.clone(), "doc7.txt", "document 7")).await;
+
+    // The person moves the space to an empty folder while it syncs.
+    let b = t.ben.dir.path().join("Moved");
+    let info = t.ben.sync_on_in(space, &b).await;
+    assert_eq!(info.folder.as_deref().map(PathBuf::from), Some(b.clone()));
+    eventually("the new folder fills", || async { names(&b).len() == 8 }).await;
+
+    // From now on the new folder is the one that syncs; the old one is left as it is.
+    write(&a, "left-behind.txt", "written in the old folder");
+    write(&ana_folder, "new.txt", "written by ana");
+    eventually("the new folder gets ana's later file", || has_file(b.clone(), "new.txt", "written by ana")).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(read(&ana_folder, "left-behind.txt"), None, "the old folder no longer goes up");
+    assert_eq!(read(&a, "new.txt"), None, "and gets nothing");
+
+    // A restart opens the new folder with the state made for it.
+    let (_ana, mut ben) = (t.ana, t.ben);
+    let (exit, out) = ben.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    ben.run();
+    write(&ana_folder, "after.txt", "after the restart");
+    eventually("the restarted agent syncs the new folder", || has_file(b.clone(), "after.txt", "after the restart")).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(names(&ana_folder).len(), 10, "nothing was deleted on the server: {:?}", names(&ana_folder));
+    assert_eq!(names(&b).len(), 10, "{:?}", names(&b));
+}
+
+/// H2: turning a space off waits for its running pass to end, so the pass cannot write the old folder's state after the
+/// space is set up for another folder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_a_space_off_waits_for_its_pass_and_the_old_state_is_not_written_after() {
+    let (t, front, _task) = team_via_front(SpaceRole::Editor, Front::default()).await;
+    let space = t.space;
+    let (ana_folder, a) = both_syncing(&t).await;
+    for i in 0..4 {
+        write(&ana_folder, &format!("f{i}.txt"), "content");
+    }
+    eventually("ben has the files", || async { names(&a).len() == 4 }).await;
+
+    // Every request takes a while now, so a pass lasts several seconds.
+    front.delay_ms.store(400, Ordering::SeqCst);
+    write(&a, "busy.txt", "ben's new file");
+    eventually("a pass of the space is running", || async {
+        t.ben.status().await.spaces.iter().any(|s| s.space == space && s.run_state == SpaceRun::Syncing)
+    })
+    .await;
+    t.ben.sync_off(space).await;
+    let after_off = std::fs::read(t.ben.data.path().join("spaces").join(space.to_string()).join("state.json")).ok();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let later = std::fs::read(t.ben.data.path().join("spaces").join(space.to_string()).join("state.json")).ok();
+    assert_eq!(after_off, later, "no pass of the old folder writes its state after the space is off");
+
+    // On in another folder: the state it starts from is not the old folder's.
+    front.delay_ms.store(0, Ordering::SeqCst);
+    let b = t.ben.dir.path().join("Elsewhere");
+    t.ben.sync_on_in(space, &b).await;
+    eventually("the new folder fills", || async { names(&b).len() >= 4 }).await;
+    eventually("the state is the new folder's", || async {
+        t.ben.space_state(space).is_some_and(|s| s["folder"].as_str().map(PathBuf::from) == std::fs::canonicalize(&b).ok())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    for i in 0..4 {
+        assert_eq!(read(&ana_folder, &format!("f{i}.txt")).as_deref(), Some("content"), "nothing was deleted on the server");
+        assert_eq!(read(&b, &format!("f{i}.txt")).as_deref(), Some("content"), "nor in the new folder");
+    }
+}
+
+/// H4: access comes back after it was lost. Meanwhile ben deleted a file here and ana deleted one on the server, both
+/// edited a third, and ben made a new one. Nothing ben has is deleted or replaced, his delete is not sent, hers does not
+/// remove his file, the two edits are both kept, and his new file goes up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn regained_access_merges_and_never_deletes_for_what_happened_meanwhile() {
+    let t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    let (ana_folder, ben_folder) = both_syncing(&t).await;
+    for (name, content) in
+        [("keep.txt", "kept"), ("ben-deletes.txt", "ben removes this"), ("ana-deletes.txt", "ana removes this"), ("both.txt", "base")]
+    {
+        write(&ana_folder, name, content);
+    }
+    eventually("ben has everything", || async { names(&ben_folder).len() == 4 }).await;
+
+    t.world.meta.remove_member(&SpaceActor::Cli, space, t.world.ben.id, 1).await.unwrap();
+    eventually("the space reports no access", || async {
+        t.ben.status().await.spaces.iter().any(|s| s.space == space && matches!(s.run_state, SpaceRun::NoAccess { .. }))
+    })
+    .await;
+    eventually("its saved state is dropped", || async { t.ben.space_state(space).is_none() }).await;
+
+    // While access is lost: deletes on both sides, an edit on both, a new file here.
+    std::fs::remove_file(ben_folder.join("ben-deletes.txt")).unwrap();
+    std::fs::remove_file(ana_folder.join("ana-deletes.txt")).unwrap();
+    write(&ana_folder, "both.txt", "ana's edit");
+    write(&ben_folder, "both.txt", "ben's edit");
+    write(&ben_folder, "ben-new.txt", "ben's new file");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(read(&ana_folder, "ben-deletes.txt").as_deref(), Some("ben removes this"), "ben's delete did not go up");
+
+    // Access is given again.
+    t.world.invite_ben(space, SpaceRole::Editor).await;
+    eventually("the invitation is listed again", || async { t.ben.space(space).await.is_some_and(|s| s.state == "invited") }).await;
+    t.ben.accept(space).await;
+    eventually("the folders are merged", || async {
+        read(&ana_folder, "ben-new.txt").as_deref() == Some("ben's new file")
+            && read(&ben_folder, "ben-deletes.txt").as_deref() == Some("ben removes this")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Ben's own deleted file came back from the server; ana's delete did not remove ben's file.
+    assert_eq!(read(&ana_folder, "ben-deletes.txt").as_deref(), Some("ben removes this"), "still on the server");
+    assert_eq!(read(&ben_folder, "ana-deletes.txt").as_deref(), Some("ana removes this"), "ana's delete did not remove ben's file");
+    assert_eq!(read(&ana_folder, "keep.txt").as_deref(), Some("kept"));
+    // The two edits are both kept: one under the name, one as a conflict copy.
+    let both: Vec<String> = names(&ben_folder).into_iter().filter(|n| n.contains("both")).collect();
+    let contents: Vec<String> = both.iter().filter_map(|n| read(&ben_folder, n)).collect();
+    assert!(contents.contains(&"ana's edit".to_owned()) && contents.contains(&"ben's edit".to_owned()), "{both:?} {contents:?}");
+}
+
+/// The deletions a team space holds back (a mass delete) are approved from the command line, with the space's name, and
+/// from the local API; the running agent then carries them out. (Ana's guard holds her deletes back; once they are on the
+/// server, ben's guard holds them back on his side, and he approves too.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_deletions_of_a_team_space_are_approved_from_the_command_line_and_the_local_api() {
+    let t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    let (ana_folder, ben_folder) = both_syncing(&t).await;
+    for i in 0..30 {
+        write(&ana_folder, &format!("f{i:02}.txt"), "content");
+    }
+    eventually("ben has the thirty files", || async { names(&ben_folder).len() == 30 }).await;
+    let waiting_set = |person: &Person| {
+        person.data.space_dir(space).load_state().ok().and_then(|s| s.last_pass).and_then(|l| l.summary).and_then(|s| s.pending_set())
+    };
+    let approve = |person: &Person, args: Vec<String>| {
+        let data = person.data.path().to_owned();
+        async move {
+            let mut argv = vec!["craft-cloud-agent".to_owned(), "--data-dir".to_owned(), data.display().to_string(), "sync".to_owned()];
+            argv.extend(args);
+            let cli = <cli::Cli as clap::Parser>::try_parse_from(argv).unwrap();
+            let mut out = Vec::new();
+            let exit = cli::run(cli, &mut std::io::empty(), &mut out).await;
+            (exit, String::from_utf8_lossy(&out).into_owned())
+        }
+    };
+    let args = |list: &[&str]| list.iter().map(|a| (*a).to_owned()).collect::<Vec<String>>();
+
+    // Ana deletes twenty-five: her guard holds them back, and ben keeps his files.
+    for i in 0..25 {
+        std::fs::remove_file(ana_folder.join(format!("f{i:02}.txt"))).unwrap();
+    }
+    eventually("ana's agent holds the deletions", || async { waiting_set(&t.ana).is_some() }).await;
+    let set = waiting_set(&t.ana).unwrap();
+    assert_eq!(names(&ben_folder).len(), 30);
+
+    // A space that isn't there is refused.
+    let (unknown, _) = approve(&t.ana, args(&["--approve-deletes", "--space", "Nowhere"])).await;
+    assert!(matches!(unknown, Err(AgentError::Usage(_))), "{unknown:?}");
+    // The bare flag lists first (nothing showed the set before), and approves nothing.
+    let (first, out) = approve(&t.ana, args(&["--approve-deletes", "--space", "studio"])).await;
+    assert_eq!(first.unwrap(), Exit::NeedsApproval, "{out}");
+    assert!(out.contains("nothing approved"), "{out}");
+    assert!(!t.ana.data.space_dir(space).path().join("approval.json").exists());
+    // A set that isn't the one waiting approves nothing either.
+    let (wrong, out) = approve(&t.ana, args(&["--approve-deletes=0000000000", "--space", "Studio"])).await;
+    assert_eq!(wrong.unwrap(), Exit::NeedsApproval, "{out}");
+    assert_eq!(names(&ben_folder).len(), 30);
+    // The set itself, with the space named by its ID.
+    let (given, out) = approve(&t.ana, vec![format!("--approve-deletes={set}"), "--space".into(), space.to_string()]).await;
+    assert_eq!(given.unwrap(), Exit::Done, "{out}");
+    assert!(out.contains("will carry out these deletions"), "{out}");
+    // On the server now; ben's guard holds them, and he approves them his way.
+    eventually("ben's agent holds the deletions", || async { waiting_set(&t.ben).is_some() }).await;
+    let ben_set = waiting_set(&t.ben).unwrap();
+    assert_eq!(names(&ben_folder).len(), 30);
+    let (given, out) = approve(&t.ben, vec![format!("--approve-deletes={ben_set}"), "--space".into(), "Studio".into()]).await;
+    assert_eq!(given.unwrap(), Exit::Done, "{out}");
+    eventually("the approved deletions reach ben", || async { names(&ben_folder).len() == 5 }).await;
+
+    // The second round goes through the local API: twenty new files, eighteen of them deleted.
+    for i in 0..20 {
+        write(&ana_folder, &format!("g{i:02}.txt"), "more");
+    }
+    eventually("ben has them", || async { names(&ben_folder).len() == 25 }).await;
+    for i in 0..18 {
+        std::fs::remove_file(ana_folder.join(format!("g{i:02}.txt"))).unwrap();
+    }
+    eventually("ana's agent holds the next deletions", || async { waiting_set(&t.ana).is_some() }).await;
+    let set = waiting_set(&t.ana).unwrap();
+    let wrong = t.ana.api(move |c| c.approve_space_deletes(space, Some("0000000000"))).await.unwrap();
+    assert!(!wrong.approved && wrong.message.contains("nothing approved"), "{wrong:?}");
+    let answer = t.ana.api(move |c| c.approve_space_deletes(space, Some(&set))).await.unwrap();
+    assert!(answer.approved, "{answer:?}");
+    eventually("ben's agent holds them", || async { waiting_set(&t.ben).is_some() }).await;
+    let ben_set = waiting_set(&t.ben).unwrap();
+    assert_eq!(names(&ben_folder).len(), 25);
+    let answer = t.ben.api(move |c| c.approve_space_deletes(space, Some(&ben_set))).await.unwrap();
+    assert!(answer.approved, "{answer:?}");
+    eventually("the deletions approved through the local API are carried out", || async { names(&ben_folder).len() == 7 }).await;
+    // A space that doesn't sync here is not found.
+    let missing = t.ana.api(|c| c.approve_space_deletes(SpaceId::generate(), None)).await.unwrap_err();
+    assert!(matches!(&missing, craft_cloud_app::Error::Refused { code, .. } if code == "not_found"), "{missing:?}");
+}
+
+/// M1: a second stop ends the loop at once even when the server is silent and a pass of a team space is queued behind
+/// another pass: no queued team pass starts, and the thread of the team passes is not waited for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_stop_does_not_wait_for_the_team_spaces_with_a_silent_server() {
+    let (mut t, front, _task) = team_via_front(SpaceRole::Editor, Front::default()).await;
+    let (_, ben_folder) = both_syncing(&t).await;
+    write(&ben_folder, "first.txt", "first");
+    eventually("the first file went up", || async { t.ben.status().await.spaces.iter().any(|s| s.last_sync_ms.is_some()) }).await;
+
+    front.stall.store(true, Ordering::SeqCst);
+    write(&ben_folder, "stuck.txt", "never answered");
+    write(&t.ben.personal, "stuck-too.txt", "never answered");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut running = t.ben.running.take().unwrap();
+    let _ = running.stop.send(());
+    let _ = running.stop.send(());
+    let thread = running.thread.take().unwrap();
+    let started = Instant::now();
+    let ended = tokio::time::timeout(Duration::from_secs(8), tokio::task::spawn_blocking(move || thread.join().unwrap())).await;
+    front.stall.store(false, Ordering::SeqCst);
+    let (exit, out) = ended.expect("the loop ends within seconds of the second stop, though the server is silent").unwrap();
+    assert!(started.elapsed() < Duration::from_secs(8));
+    assert_eq!(exit.unwrap(), Exit::Failed, "{out}");
+}
+
+/// M2: a member of an archived space keeps read access: the space stays listed (marked archived), syncs read-only and is not
+/// reported as lost; nothing of the member's goes up until it is unarchived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_of_an_archived_space_keeps_a_read_only_copy() {
+    let t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    let (ana_folder, ben_folder) = both_syncing(&t).await;
+    write(&ana_folder, "plan.txt", "the plan");
+    eventually("ben has the plan", || has_file(ben_folder.clone(), "plan.txt", "the plan")).await;
+
+    let owner = SpaceActor::User { user: t.world.ana.id, device: None };
+    t.world.meta.set_space_archived(&owner, space, true, 1).await.unwrap();
+    eventually("ben's space is read-only and archived", || async {
+        t.ben.space(space).await.is_some_and(|s| s.archived && s.read_only && s.sync == SpaceSync::On)
+    })
+    .await;
+    write(&ben_folder, "mine.txt", "written while archived");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let info = t.ben.space(space).await.unwrap();
+    assert!(!matches!(info.run_state, Some(SpaceRun::NoAccess { .. })), "not reported as lost: {info:?}");
+    assert_eq!((info.sync, info.role), (SpaceSync::On, SpaceRole::Editor), "{info:?}");
+    assert_eq!(read(&ana_folder, "mine.txt"), None, "nothing goes up meanwhile");
+    assert_eq!(read(&ben_folder, "plan.txt").as_deref(), Some("the plan"), "and nothing is lost here");
+
+    t.world.meta.set_space_archived(&owner, space, false, 2).await.unwrap();
+    eventually("what was kept goes up once it is unarchived", || has_file(ana_folder.clone(), "mine.txt", "written while archived")).await;
+}
+
+/// L3: pausing rests the long-polls of the team spaces, resuming starts them again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pausing_rests_the_team_spaces_long_polls() {
+    let (t, front, _task) = team_via_front(SpaceRole::Editor, Front::default()).await;
+    let _ = both_syncing(&t).await;
+    eventually("the team space long-polls", || async { front.polls.load(Ordering::SeqCst) >= 3 }).await;
+
+    t.ben.api(|c| c.pause()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let resting = front.polls.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(front.polls.load(Ordering::SeqCst), resting, "no long-poll is asked while paused");
+
+    t.ben.api(|c| c.resume()).await.unwrap();
+    eventually("the long-poll starts again", || async { front.polls.load(Ordering::SeqCst) > resting }).await;
+}
+
+/// L4: one `404` for the list of spaces from a server that speaks team spaces does not end them: the space goes on
+/// syncing and is not shown as unavailable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_404_for_the_list_does_not_end_the_team_spaces() {
+    let (t, front, _task) = team_via_front(SpaceRole::Editor, Front::default()).await;
+    let space = t.space;
+    let (ana_folder, ben_folder) = both_syncing(&t).await;
+    write(&ana_folder, "one.txt", "1");
+    eventually("synced", || has_file(ben_folder.clone(), "one.txt", "1")).await;
+
+    *front.spaces_404.lock().unwrap() = 1;
+    eventually("the 404 was answered", || async { *front.spaces_404.lock().unwrap() == 0 }).await;
+    // Looked at for a while after it: the space keeps syncing.
+    for _ in 0..8 {
+        let info = t.ben.space(space).await.unwrap();
+        assert_eq!(info.sync, SpaceSync::On, "{info:?}");
+        assert!(!matches!(info.run_state, Some(SpaceRun::Unavailable { .. } | SpaceRun::NoAccess { .. })), "{info:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    write(&ana_folder, "two.txt", "2");
+    eventually("the sync goes on", || has_file(ben_folder.clone(), "two.txt", "2")).await;
 }

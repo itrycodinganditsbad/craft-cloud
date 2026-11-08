@@ -25,6 +25,10 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
   `run`'s output: `sync --approve-deletes=<set>` approves exactly that set if it is the one waiting, without
   `status` first, and otherwise shows the waiting set, approves nothing and exits 2. A plain `sync` says the
   agent is already running.
+- A team space's held deletions are approved with `sync --approve-deletes[=<set>] --space <id or name>` (the same rules,
+  with the space's own list and `spaces/<id>/approval.json`; it needs the running agent), or by the local API's
+  `POST /v1/spaces/{id}/approve-deletes`. Each computer approves its own side: deletions made on one computer wait for
+  its approval, and again on the others when they arrive.
 - A delete held back because a link appeared that may be the file, moved with its folder ("held while … is a
   link", or "held while any of … is a link" when several links appeared with that name), comes with a set of
   its own. If you really deleted the file and none of the links listed is it, `sync --approve-deletes=<set>`
@@ -197,7 +201,11 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
   the space is renamed on the server. Each folder has its own root marker (`.craft-cloud/root.json`).
 - **State.** `account.json` gains `spaces: [{space, folder, sync, name, root}]` (left out while there are none, so a data
   folder from before team spaces is not rewritten). Each synced team space keeps `spaces/<space id>/state.json` in the
-  data folder; the personal space's files stay where they were.
+  data folder; the personal space's files stay where they were. The state records the space and the canonical folder it
+  was made for, and is used for that pair only: for any other folder (the space moved, or turned off and on elsewhere,
+  and back) the space starts afresh as a first sync, merging the folder with the space and deleting nothing on either
+  side. Moving a space that syncs, or turning it off, ends its session and waits for its running pass before anything
+  else changes. Signing out removes the team spaces' states too; their folders, markers and files stay.
 - **Off by default.** An accepted space does not sync until `POST /v1/spaces/{id}/sync` with `{"on": true}` (optionally
   `folder`, an absolute path that lies outside every synced folder and the data folder, and `adopt` for a folder that already
   has files: what differs from the space's becomes conflict copies, nothing is deleted).
@@ -211,8 +219,11 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
   "Read-only spaces"); `read_only` in the space's entry says so.
 - **Losing access.** A space the server no longer lists, or answers `404`, stops syncing and shows
   `run_state: {"kind": "no_access"}` with "You no longer have access to <name>. Your local copy is kept and no longer
-  syncs." Nothing in its folder is touched or deleted, and its state is kept. If the account is added again the sync starts
-  again and reconciles without replacing or deleting a local file.
+  syncs." Nothing in its folder is touched or deleted. Its saved sync state is dropped, so if the account is added again the
+  folder is merged with the space afresh (as a first sync): no local file is deleted or replaced, a file deleted here
+  meanwhile is not deleted on the server, one deleted on the server meanwhile is not deleted here, and a file that differs
+  on both sides is kept twice (one as a conflict copy). A member of an archived space has not lost access: the space stays
+  listed (`archived: true`) and syncs read-only.
 
 | Local call | Answer |
 | --- | --- |
@@ -220,6 +231,7 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
 | `POST /v1/spaces/{id}/accept` | the server's answer: the space as it lists it |
 | `POST /v1/spaces/{id}/decline` | 204 |
 | `POST /v1/spaces/{id}/sync` | `{on, folder?, adopt?}` → the space as `GET /v1/spaces` lists it |
+| `POST /v1/spaces/{id}/approve-deletes` | `{set?}` → `{approved, message}`: approves the deletions the mass-delete guard holds back in a synced team space (`spaces/<id>/approval.json`), as `craft-cloud-agent sync --approve-deletes[=<set>] --space <id or name>` does. With a `set` only that set, if it is the one waiting; without, the set the previous call listed |
 | `GET /v1/status` | gains `spaces: [{space, run_state, last_sync_ms?, read_only}]`, one per synced space or one that lost access; the top-level fields describe the personal space |
 
 Accept and decline are passed on to the server, which decides; its refusals keep their status and code. An agent from before
