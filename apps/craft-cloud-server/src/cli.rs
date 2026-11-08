@@ -257,8 +257,14 @@ pub enum IndexAction {
 pub enum LiveAction {
     /// Empty a user's recents document of an app (one that is full: `quota_exceeded`), or, given a document's ID
     /// instead of an app, that live document of a file. Its log and its snapshot go; every machine then sends its whole
-    /// document up again, so nothing any machine holds is lost.
-    ResetDoc { username: String, app: String },
+    /// document up again, so nothing any machine holds is lost. With `--space` (a team space's ID or name) the document
+    /// is the team space's: `username` must be one of its members.
+    ResetDoc {
+        username: String,
+        app: String,
+        #[arg(long)]
+        space: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -338,6 +344,7 @@ pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
         .await?
         .with_stored_bytes_cap(config.stored_bytes_per_user)
         .with_live_bytes_cap(config.live_bytes_per_user)
+        .with_team_live_bytes_cap(config.spaces.team_live_bytes)
         .with_audit_retention_days(config.audit.retention_days);
     let store = match (&config.storage, config.storage.s3()?) {
         (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
@@ -630,19 +637,30 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                 Err(CliError::Inconsistent(format!("{} manifest(s) could not be indexed", report.unreadable.len())))
             }
         }
-        Command::Live { config, action: LiveAction::ResetDoc { username, app } } => {
+        Command::Live { config, action: LiveAction::ResetDoc { username, app, space } } => {
             let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
             let user = user_id(&meta, &username).await?;
+            // The user's own space, or the team space `--space` names (which the user must be able to read).
+            let (space, whose) = match space {
+                None => (user.space, user.username.clone()),
+                Some(text) => {
+                    let space = resolve_space(&meta, &text).await?;
+                    if meta.space_access(user.id, space).await?.is_none() {
+                        return Err(CliError::Usage(format!("{} is not a member of that space", user.username)));
+                    }
+                    (space, format!("the space {text}"))
+                }
+            };
             if let Ok(id) = app.parse::<uuid::Uuid>() {
                 let doc = craft_cloud_proto::DocId::from_uuid(id);
-                meta.reset_live_doc(user.space, doc).await?;
-                writeln!(out, "emptied the live document {doc} of {}; every machine sends its own again when it next connects", user.username)?;
+                meta.reset_live_doc(space, doc).await?;
+                writeln!(out, "emptied the live document {doc} of {whose}; every machine sends its own again when it next connects")?;
                 return Ok(());
             }
             let app = craft_cloud_proto::live::AppName::new(&app).map_err(|e| CliError::Usage(e.to_string()))?;
-            let doc = craft_cloud_proto::live::recents_doc(user.space, &app);
-            meta.reset_live_doc(user.space, doc).await?;
-            writeln!(out, "emptied the {app} recents of {}; every machine sends its own again when it next connects", user.username)?;
+            let doc = craft_cloud_proto::live::recents_doc(space, &app);
+            meta.reset_live_doc(space, doc).await?;
+            writeln!(out, "emptied the {app} recents of {whose}; every machine sends its own again when it next connects")?;
             Ok(())
         }
     }

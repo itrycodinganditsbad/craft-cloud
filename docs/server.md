@@ -43,6 +43,9 @@ version an app saved (one with a save record) as kept. The effective quota is th
 the configured `stored_bytes_per_user` cap; it is `null` when neither applies. An incomplete manifest index makes both
 estimates `null`.
 
+Live documents of a team space have a cap of their own, `team_live_bytes` in a `[spaces]` section (4 GiB, `4_294_967_296`,
+by default), counted as `live_bytes_per_user` is below. A server that does not know team spaces refuses the unknown section, so add it only after upgrading.
+
 Live documents have a cap of their own: `live_bytes_per_user` (in bytes; 1 GiB, `1_073_741_824`, by default) is
 the most one account's live documents (recent-file lists and documents of files) may hold together. It counts
 every update in their logs, including the ones a snapshot has replaced: those are kept until retention rules

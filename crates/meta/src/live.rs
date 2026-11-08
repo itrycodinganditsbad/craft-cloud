@@ -89,6 +89,8 @@ pub const MAX_LIVE_DOCUMENTS_HOLDING_UPDATES: u64 = 10_000;
 /// (they are kept until retention): 1 GiB. Over it, every append is refused with [`MetaError::QuotaExceeded`]
 /// (`quota_exceeded`). The server's `live_bytes_per_user` sets it.
 pub const DEFAULT_LIVE_BYTES_PER_SPACE: u64 = 1024 * 1024 * 1024;
+/// The same cap for a team space: 4 GiB. The server's `[spaces] team_live_bytes` sets it.
+pub const DEFAULT_TEAM_LIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// What an append did ([`Meta::append_live_update_counted`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -556,16 +558,17 @@ impl Meta {
         }
         // Every row of every live document of the space, compacted ones too, counts towards its live bytes (kept until
         // retention): over the cap, nothing is stored. A repeat was acked above.
-        let live: i64 = sqlx::query("UPDATE spaces SET live_bytes = live_bytes + $1 WHERE id = $2 RETURNING live_bytes")
+        let row = sqlx::query("UPDATE spaces SET live_bytes = live_bytes + $1 WHERE id = $2 RETURNING live_bytes, kind")
             .bind(size)
             .bind(space_key.clone())
             .fetch_one(&mut *w.tx)
-            .await?
-            .try_get("live_bytes")?;
-        let live = to_u64(live)?;
-        if live > self.live_bytes_cap {
+            .await?;
+        let live = to_u64(row.try_get("live_bytes")?)?;
+        // A team space has a cap of its own: its content belongs to the space, not to one account.
+        let cap = if row.try_get::<String, _>("kind")? == "team" { self.team_live_bytes_cap } else { self.live_bytes_cap };
+        if live > cap {
             w.tx.rollback().await?;
-            return Err(MetaError::LiveFull { used: live.saturating_sub(to_u64(size)?), limit: self.live_bytes_cap });
+            return Err(MetaError::LiveFull { used: live.saturating_sub(to_u64(size)?), limit: cap });
         }
         sqlx::query("INSERT INTO live_updates (space_id, doc, seq, bytes, device, client_seq, created_ms) VALUES ($1, $2, $3, $4, $5, $6, $7)")
             .bind(space_key)
