@@ -2556,3 +2556,33 @@ fn the_activity_filters_send_their_edits() {
     let sent = std::mem::take(&mut h.state_mut().1);
     assert!(sent.iter().any(|e| matches!(e, Event::RecentFilter(FilterEdit::Search(text)) if text.contains("role"))), "{sent:?}");
 }
+
+/// Ctrl+Plus, Ctrl+= , Ctrl+Minus and Ctrl+0 send the zoom steps, on a signed-in page and on the first start alike; egui's own
+/// zoom keys are off, so the scale stays with the model.
+#[test]
+fn the_zoom_keys_send_their_steps() {
+    use crate::model::ZoomStep;
+    for model in [overview_model(), Model::new(defaults(), true, String::new())] {
+        let mut h = harness(model, egui::Theme::Light);
+        h.run_steps(2);
+        for key in [egui::Key::Plus, egui::Key::Equals, egui::Key::Minus, egui::Key::Num0] {
+            h.key_press_modifiers(egui::Modifiers::COMMAND, key);
+            h.run_steps(2);
+        }
+        assert_eq!(
+            std::mem::take(&mut h.state_mut().1),
+            [Event::Zoom(ZoomStep::In), Event::Zoom(ZoomStep::In), Event::Zoom(ZoomStep::Out), Event::Zoom(ZoomStep::Reset)]
+        );
+        assert_eq!(h.ctx.zoom_factor(), 1.0, "egui does not zoom by itself");
+    }
+}
+
+/// The overview at an interface scale of 125 % (the window keeps its size, so the page has less room in points).
+#[test]
+fn snapshot_zoomed_in() {
+    let mut h = harness(overview_model(), egui::Theme::Light);
+    h.ctx.set_zoom_factor(1.25);
+    h.run_steps(4);
+    let image = h.render().unwrap();
+    compare(image, "tab-overview-zoom-125-light");
+}

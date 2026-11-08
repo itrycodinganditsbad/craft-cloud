@@ -364,6 +364,19 @@ impl std::fmt::Debug for PasswordForm {
     }
 }
 
+/// The least, the most and the usual interface scale, in tenths: 80 % to 160 %, in steps of 10 %.
+pub const ZOOM_MIN: u8 = 8;
+pub const ZOOM_MAX: u8 = 16;
+pub const ZOOM_DEFAULT: u8 = 10;
+
+/// A step of the interface scale (Ctrl+Plus, Ctrl+Minus, Ctrl+0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoomStep {
+    In,
+    Out,
+    Reset,
+}
+
 /// The pages of the signed-in window, as the header's tabs list them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -797,6 +810,8 @@ pub enum Event {
     TabNumber(usize),
     /// Ctrl+R: what the page's Refresh does, on a page that has one.
     RefreshPage,
+    /// Ctrl+Plus, Ctrl+Minus or Ctrl+0: the interface scale.
+    Zoom(ZoomStep),
     /// An edit of the filters of the overview's Recent activity.
     RecentFilter(crate::filter::FilterEdit),
     /// An edit of the filters of the Security page's activity.
@@ -1015,6 +1030,9 @@ pub struct Model {
     versions_ticket: u64,
     trash_ticket: u64,
     files_ticket: u64,
+    /// The interface scale in tenths (10: 100 %), between [`ZOOM_MIN`] and [`ZOOM_MAX`]. It lasts for the session: the app
+    /// keeps no settings of its own, and eframe's storage is not built in.
+    zoom_tenths: u8,
     /// The last [`Rename::ticket`] given. It belongs to the model, not to an overview, so that an answer that was on its
     /// way when the overview was replaced can't match a rename of the new one.
     rename_ticket: u64,
@@ -1047,6 +1065,7 @@ impl Model {
             versions_ticket: 0,
             trash_ticket: 0,
             files_ticket: 0,
+            zoom_tenths: ZOOM_DEFAULT,
             rename_ticket: 0,
             usage_request_id: 0,
             access: Access::Unknown,
@@ -1093,6 +1112,11 @@ impl Model {
             _ => return None,
         };
         Some((current, form.rail_at(current)))
+    }
+
+    /// The interface scale for `ctx.set_zoom_factor`: 0.8 to 1.6.
+    pub fn zoom_factor(&self) -> f32 {
+        f32::from(self.zoom_tenths) / 10.0
     }
 
     /// The tab of the page shown, in the signed-in window.
@@ -1874,6 +1898,14 @@ impl Model {
                 Some(tab) => self.update(Event::Tab(tab)),
                 None => Vec::new(),
             },
+            Event::Zoom(step) => {
+                self.zoom_tenths = match step {
+                    ZoomStep::In => self.zoom_tenths.saturating_add(1).min(ZOOM_MAX),
+                    ZoomStep::Out => self.zoom_tenths.saturating_sub(1).max(ZOOM_MIN),
+                    ZoomStep::Reset => ZOOM_DEFAULT,
+                };
+                Vec::new()
+            }
             Event::RecentFilter(edit) => {
                 if let Screen::SignedIn(overview) = &mut self.screen {
                     overview.recent_filter.edit(edit);
@@ -5119,5 +5151,30 @@ pub(crate) mod tests {
         assert!(!m.has_search(), "its events are not loaded");
         m.update(Event::SecurityAnswer(SecurityAnswer::Activity(Ok(AuditPage { events: vec![event_of("auth.login", None)], next: None }))));
         assert!(m.has_search());
+    }
+
+    #[test]
+    fn the_zoom_steps_by_a_tenth_between_80_and_160_percent_and_resets() {
+        let mut m = model();
+        assert_eq!(m.zoom_factor(), 1.0);
+        for _ in 0..20 {
+            m.update(Event::Zoom(ZoomStep::In));
+        }
+        assert_eq!(m.zoom_factor(), 1.6, "no more than 160 %");
+        m.update(Event::Zoom(ZoomStep::Out));
+        assert_eq!(m.zoom_factor(), 1.5);
+        m.update(Event::Zoom(ZoomStep::Reset));
+        assert_eq!(m.zoom_factor(), 1.0);
+        for _ in 0..20 {
+            assert!(m.update(Event::Zoom(ZoomStep::Out)).is_empty());
+        }
+        assert_eq!(m.zoom_factor(), 0.8, "no less than 80 %");
+        m.update(Event::Zoom(ZoomStep::In));
+        assert_eq!(m.zoom_factor(), 0.9);
+        // On every screen, signed in or not, and a step changes nothing else.
+        let mut signed = signed_in();
+        let before = signed.screen.clone();
+        signed.update(Event::Zoom(ZoomStep::In));
+        assert_eq!((signed.zoom_factor(), signed.screen == before), (1.1, true));
     }
 }

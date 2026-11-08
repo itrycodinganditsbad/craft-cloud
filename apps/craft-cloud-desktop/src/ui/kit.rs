@@ -241,6 +241,8 @@ fn visuals(t: &Tokens) -> Visuals {
 /// system (egui's default theme preference), which this leaves alone.
 pub fn apply(ctx: &Context) {
     install_fonts(ctx);
+    // The window zooms on Ctrl+Plus, Ctrl+Minus and Ctrl+0 itself (`ui::shortcuts`), in the steps and between the limits it keeps.
+    ctx.options_mut(|options| options.zoom_with_keyboard = false);
     ctx.set_visuals_of(egui::Theme::Dark, visuals(&Tokens::DARK));
     ctx.set_visuals_of(egui::Theme::Light, visuals(&Tokens::LIGHT));
     ctx.all_styles_mut(|style| {

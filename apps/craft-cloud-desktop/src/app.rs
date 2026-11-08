@@ -68,12 +68,22 @@ impl App {
         let mut app = Self { model, link, outside: outside.1, to_self: outside.0, shown, closing: false, host };
         let first = app.model.update(Event::Start);
         app.carry_out(first, ctx);
+        app.zoom(ctx);
         app
     }
 
     fn handle(&mut self, event: Event, ctx: &egui::Context) {
         let effects = self.model.update(event);
         self.carry_out(effects, ctx);
+        self.zoom(ctx);
+    }
+
+    /// The window's scale follows the model's (Ctrl+Plus, Ctrl+Minus, Ctrl+0).
+    fn zoom(&self, ctx: &egui::Context) {
+        let wanted = self.model.zoom_factor();
+        if (ctx.zoom_factor() - wanted).abs() > f32::EPSILON {
+            ctx.set_zoom_factor(wanted);
+        }
     }
 
     fn carry_out(&mut self, effects: Vec<Effect>, ctx: &egui::Context) {
