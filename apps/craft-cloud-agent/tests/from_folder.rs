@@ -1314,3 +1314,36 @@ async fn a_team_subfolder_swapped_for_a_link_is_not_written_through() {
     assert_eq!(files_under(&other), BTreeMap::from([("010.psd".to_owned(), b"somebody else's file".to_vec())]), "the other folder is untouched");
     untouched(&project, &files);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_team_file_edited_after_the_copy_is_kept_and_the_old_version_goes_beside_it() {
+    let (w, ana, project, files) = ana_with_project().await;
+    hook::set(ana.data.path(), Some(Hook::Fail(FromFolderStep::Syncing)));
+    ana.make(&project, "Edited there").await.unwrap();
+    let failed = ana.until(FromFolderStep::Failed).await;
+    let team = PathBuf::from(failed.team_folder.clone().unwrap());
+    // Someone edits the file in the team folder; meanwhile the old folder's file changed too.
+    std::fs::write(team.join("brief.txt"), b"edited in the team space").unwrap();
+    std::fs::write(project.join("brief.txt"), b"a newer version here").unwrap();
+    hook::set(ana.data.path(), None);
+    ana.make_with(&project, "Edited there", None).await.unwrap();
+    let status = done(&ana).await;
+    // The team version stays; the old version is beside it under a conflict name; the old file is not deleted.
+    assert_eq!(std::fs::read(team.join("brief.txt")).unwrap(), b"edited in the team space");
+    let beside: Vec<String> = std::fs::read_dir(&team)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("brief") && n != "brief.txt")
+        .collect();
+    assert_eq!(beside.len(), 1, "{beside:?}");
+    assert_eq!(std::fs::read(team.join(&beside[0])).unwrap(), b"a newer version here");
+    assert_eq!(std::fs::read(project.join("brief.txt")).unwrap(), b"a newer version here", "the old file stays");
+    assert_eq!(status.kept, 1, "{status:?}");
+    assert!(status.message.as_deref().is_some_and(|m| m.contains("edited in the team space")), "{status:?}");
+    // Every other file went.
+    let mut left = files_under(&project);
+    left.remove("brief.txt");
+    assert!(left.is_empty(), "{left:?}");
+    let _ = w;
+}
