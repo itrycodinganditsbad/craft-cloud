@@ -1195,6 +1195,9 @@ async fn admin_calls_reach_the_servers_admin_api_and_pass_its_answers_through() 
     assert_eq!(code, 200, "{body}");
     let info: AdminServerInfo = serde_json::from_str(&body).unwrap();
     assert_eq!((info.users, info.devices_active, info.storage_kind.as_str()), (2, 1, "disk"));
+    // The health fields pass through the agent typed.
+    assert_eq!((info.database_ok, info.store_ok, info.refusing_uploads), (Some(true), Some(true), Some(false)));
+    assert!(info.started_ms.is_some() && info.store_check_ms.is_some(), "{info:?}");
     let (code, body) = call(&api, "GET", "/v1/admin/storage", "");
     assert_eq!(code, 200, "{body}");
     let overview: AdminStorageOverview = serde_json::from_str(&body).unwrap();

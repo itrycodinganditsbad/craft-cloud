@@ -145,6 +145,10 @@ pub struct AppState {
     pub storage_info: StorageInfo,
     /// Refuses new uploads while the server is full (`[storage] refuse_when_full`); `None`: off, the default.
     pub full: Option<crate::full::FullGuard>,
+    /// When the server started, in milliseconds since the Unix epoch (the admin's overview).
+    pub started_ms: i64,
+    /// The blob store's last health probe, kept for 30 seconds ([`crate::health`]).
+    pub store_health: crate::health::StoreHealth,
     /// The time of day for everything a request records (a device's last use, a stored blob, a commit).
     clock: Clock,
 }
@@ -176,6 +180,8 @@ impl AppState {
             trash_days: 30,
             storage_info: StorageInfo::default(),
             full: None,
+            started_ms: now_ms(),
+            store_health: crate::health::StoreHealth::default(),
             clock: Arc::new(now_ms),
         })
     }

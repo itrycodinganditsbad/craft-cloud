@@ -2778,8 +2778,23 @@ async fn the_server_overview_shows_counters_only(s: &Server) {
     let text = res.text().await.unwrap();
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
     let keys: std::collections::BTreeSet<_> = json.as_object().unwrap().keys().cloned().collect();
-    let expected: std::collections::BTreeSet<_> =
-        ["version", "users", "devices_active", "stored_bytes", "live_bytes", "storage_kind", "database_kind"].into_iter().map(String::from).collect();
+    let expected: std::collections::BTreeSet<_> = [
+        "version",
+        "users",
+        "devices_active",
+        "stored_bytes",
+        "live_bytes",
+        "storage_kind",
+        "database_kind",
+        "started_ms",
+        "database_ok",
+        "store_ok",
+        "store_check_ms",
+        "refusing_uploads",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
     assert_eq!(keys, expected, "{text}");
     assert_eq!(
         (json["users"].as_u64(), json["devices_active"].as_u64(), json["stored_bytes"].as_u64(), json["live_bytes"].as_u64()),
@@ -4379,4 +4394,52 @@ async fn a_full_server_answers_a_large_body_with_server_full_or_closes_the_conne
         Ok(res) => assert_eq!(error(res).await.1.error, "server_full"),
         Err(e) => assert!(e.is_request() || e.is_body() || e.is_connect(), "{e}"),
     }
+}
+
+// ---- the server's health in the admin overview ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_server_overview_says_how_the_server_is() {
+    use std::sync::atomic::AtomicU64;
+    let before = craft_cloud_server::state::now_ms();
+    let policy = craft_cloud_server::full::Policy { capacity: Some(100), min_free: None };
+    let s = sqlite_disk_refusing(policy, std::sync::Arc::new(AtomicU64::new(u64::MAX))).await;
+    add_user(&s, "ana").await;
+    add_admin(&s, "root").await;
+    let ana = login(&s, "ana").await;
+    let root = login(&s, "root").await;
+    let overview = |root: String| {
+        let (client, url) = (s.client.clone(), format!("{}/admin/server", s.base));
+        async move { client.get(url).bearer_auth(root).send().await.unwrap().json::<serde_json::Value>().await.unwrap() }
+    };
+    let info = overview(root.clone()).await;
+    assert!(info["started_ms"].as_i64().unwrap() >= before - 1000 && info["started_ms"].as_i64().unwrap() <= craft_cloud_server::state::now_ms());
+    assert_eq!(
+        (info["database_ok"].as_bool(), info["store_ok"].as_bool(), info["refusing_uploads"].as_bool()),
+        (Some(true), Some(true), Some(false))
+    );
+    assert!(info["store_check_ms"].as_i64().unwrap() >= before, "{info}");
+    // The typed body reads it.
+    let typed: craft_cloud_proto::api::AdminServerInfo = serde_json::from_value(info.clone()).unwrap();
+    assert_eq!((typed.store_ok, typed.refusing_uploads, typed.database_ok), (Some(true), Some(false), Some(true)));
+    // Fill the server: the overview says it refuses.
+    assert_eq!(put_chunk(&s, &ana, &[1u8; 60]).await, StatusCode::NO_CONTENT);
+    assert_eq!(put_chunk(&s, &ana, &[2u8; 60]).await, StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(overview(root).await["refusing_uploads"].as_bool(), Some(true));
+    // A body from before the fields reads, with nothing in them.
+    let mut old = info;
+    for key in ["started_ms", "database_ok", "store_ok", "store_check_ms", "refusing_uploads"] {
+        old.as_object_mut().unwrap().remove(key);
+    }
+    let typed: craft_cloud_proto::api::AdminServerInfo = serde_json::from_value(old).unwrap();
+    assert_eq!((typed.started_ms, typed.database_ok, typed.store_ok, typed.store_check_ms, typed.refusing_uploads), (None, None, None, None, None));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_that_does_not_refuse_says_so_in_the_overview() {
+    let s = sqlite_disk().await;
+    add_admin(&s, "root").await;
+    let root = login(&s, "root").await;
+    let info: serde_json::Value = s.client.get(format!("{}/admin/server", s.base)).bearer_auth(&root).send().await.unwrap().json().await.unwrap();
+    assert_eq!(info["refusing_uploads"].as_bool(), Some(false));
 }

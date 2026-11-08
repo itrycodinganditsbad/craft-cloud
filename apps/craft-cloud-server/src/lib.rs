@@ -12,6 +12,7 @@ pub mod config;
 pub mod error;
 pub mod full;
 pub mod gc;
+pub mod health;
 pub mod join;
 pub mod live;
 pub mod notify;
