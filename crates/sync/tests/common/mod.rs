@@ -107,6 +107,9 @@ pub struct Faults {
     /// The machine dies right after the n-th commit from now applies on the server, before its answer arrives
     /// (0 = never): that commit's reply is lost, and every call after it fails.
     pub die_on_commit: AtomicU64,
+    /// The n-th commit from now on (1 = the next) and every one after it is refused with `ReadOnly`, as when the account's
+    /// role was lowered in between (0 = never). Nothing is stored by a refused commit.
+    pub refuse_commits_from: AtomicU64,
     /// How many chunks this device downloaded (counted, not a fault).
     pub chunk_downloads: AtomicU64,
     /// How many chunks this device uploaded (counted, not a fault).
@@ -273,6 +276,11 @@ impl Transport for Local {
         self.write_gate().await?;
         if self.faults.fail_next_commit.swap(false, Ordering::Relaxed) {
             return Err(TransportError::Unavailable("injected before commit".into()));
+        }
+        match self.faults.refuse_commits_from.load(Ordering::Relaxed) {
+            0 => {}
+            1 => return Err(TransportError::ReadOnly),
+            n => self.faults.refuse_commits_from.store(n - 1, Ordering::Relaxed),
         }
         if self.faults.bad_conflict_index.load(Ordering::Relaxed) {
             return Err(TransportError::Rejected(vec![Conflict { op: ops.len() + 5, kind: ConflictKind::NoSuchNode }]));

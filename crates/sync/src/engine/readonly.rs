@@ -14,12 +14,13 @@
 //!
 //! Everything that stays only here is listed in [`Report::skipped`] with the reason, on every pass.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use craft_cloud_proto::NodeId;
+use craft_cloud_proto::{FileHash, NodeId};
 
-use crate::fs::{Fs, FsKind};
-use crate::state::BaseKind;
+use crate::fs::{FileMeta, Fs, FsKind};
+use crate::path::RelPath;
+use crate::state::{BaseEntry, BaseKind};
 use crate::transport::Transport;
 
 use super::{Engine, Local, Report, SyncError, per_node};
@@ -31,6 +32,11 @@ pub const READ_ONLY_EDITED: &str = "edited here, not uploaded: this space is rea
 
 impl<F: Fs, T: Transport> Engine<F, T> {
     /// The push of read-only mode: puts back what was deleted here and lists what stays local. Sends nothing.
+    ///
+    /// Known limit, kept on purpose: `finish_push` (which records the links the push saw and forgets where nodes were
+    /// before they moved) never runs in this mode, so right after the role is raised to editor the first push may hold
+    /// back a delete of a user's that it would have sent a pass later. A delete held is never a lost file; it is sent
+    /// by a following pass, once that push has finished.
     pub(super) async fn push_read_only(&mut self, report: &mut Report) -> Result<(), SyncError> {
         let before = report.restored.len();
         self.restore_deleted(report).await?;
@@ -59,26 +65,46 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 continue;
             }
             let result = self.restore_one(id, report).await;
-            if per_node(result, report)? {
+            // `Ok(true)`: something that is not the node sits where it was (a folder's place held by a file or a link):
+            // left alone, and what was below it waits. An error skips it the same way.
+            let held = match result {
+                Ok(held) => held,
+                other => per_node(other.map(drop), report)?,
+            };
+            if held {
                 skipped.insert(id);
             }
         }
         Ok(())
     }
 
-    async fn restore_one(&mut self, id: NodeId, report: &mut Report) -> Result<(), SyncError> {
+    /// Puts back one node that is gone from here. Returns whether the node's own place is held by something else that
+    /// stays (the nodes below it are then left alone too).
+    async fn restore_one(&mut self, id: NodeId, report: &mut Report) -> Result<bool, SyncError> {
         let (Some(entry), Some(remote), Some(path)) =
             (self.state.base.get(&id).cloned(), self.state.remote.get(&id).cloned(), self.state.base_path(id))
         else {
-            return Ok(());
+            return Ok(false);
         };
-        // Anything there (the file, a link, another file) is left alone: only what is gone comes back.
-        if self.stat(&path)?.is_some() {
-            return Ok(());
+        // Anything there (the file, a link, another file) is left alone: only what is gone comes back. A folder's place
+        // held by anything but a folder holds back what was in it: a file or a link there is the user's, and the
+        // server's files go nowhere near it.
+        if let Some(here) = self.stat(&path)? {
+            return Ok(matches!(entry.kind, BaseKind::Dir { .. }) && !matches!(here, FsKind::Dir { .. }));
+        }
+        // `stat` of a path below a file or a link says "nothing there": looked at before anything is made or moved
+        // aside, or the file or link would be taken for something in the way.
+        if self.held_above(&path)? {
+            return Ok(true);
         }
         match (&entry.kind, &remote.file) {
             (BaseKind::Dir { .. }, None) => {
+                self.refuse_link_toward(&path)?;
+                let made = report.created_dirs.len();
                 self.make_dirs(&path, report)?;
+                // Reported once, as restored (not as a folder the pass made as well).
+                let mut kept = report.created_dirs.drain(made..).filter(|dir| *dir != path).collect();
+                report.created_dirs.append(&mut kept);
                 report.restored.push(path);
             }
             (BaseKind::File { .. }, Some(file)) => {
@@ -93,25 +119,41 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             // A node can't change kind; treat it as damaged state and leave it.
             _ => {}
         }
-        Ok(())
+        Ok(false)
+    }
+
+    /// Whether a folder above `path` is not a folder here (a file, or a link or other entry): nothing below it is put
+    /// back, and nothing is moved aside to make room.
+    fn held_above(&self, path: &RelPath) -> Result<bool, SyncError> {
+        let Some(parent) = path.parent() else { return Ok(false) };
+        let mut current = RelPath::root();
+        for name in parent.names() {
+            current = current.join(name);
+            if matches!(self.stat(&current)?, Some(FsKind::File(_) | FsKind::Other)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Lists, in [`Report::skipped`], every file that exists only here: edited tracked files and untracked files
-    /// (new ones and conflict copies). The list is given in full when the set of such files (or a reason) differs from the
+    /// (new ones and conflict copies). A tracked file that was swapped for another tracked file counts as missing here
+    /// ([`Local::Missing`]), so it is put back and not listed (a listing gap only: both files stay). The list is given in full when the set of such files (or a reason) differs from the
     /// one the last pass gave, and left out otherwise, so a quiet viewer's folder produces a quiet report.
     fn list_local_only(&mut self, report: &mut Report) -> Result<(), SyncError> {
         let (local, unseen) = self.scan(report)?;
         let index = self.state.base_index();
         let mut found: BTreeSet<(String, &'static str)> = BTreeSet::new();
+        let mut looked_at: BTreeMap<RelPath, (FileMeta, FileHash, bool)> = BTreeMap::new();
         for (path, kind) in &local {
-            if !matches!(kind, FsKind::File(_)) || unseen.unknown.iter().any(|u| path.starts_with(u)) {
+            let FsKind::File(meta) = kind else { continue };
+            if unseen.unknown.iter().any(|u| path.starts_with(u)) {
                 continue;
             }
-            let reason = match index.get(path).and_then(|id| self.state.base.get(id)) {
+            let reason = match index.get(path).and_then(|id| self.state.base.get(id)).cloned() {
                 None => READ_ONLY_NEW,
                 Some(entry) => {
-                    let edited = self.local_state(entry, path)? == Local::Modified && !self.holds_base_content(entry, path);
-                    if !edited {
+                    if !self.edited_here(&entry, path, *meta, &mut looked_at)? {
                         continue;
                     }
                     READ_ONLY_EDITED
@@ -119,10 +161,42 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             };
             found.insert((path.to_string(), reason));
         }
+        self.read_only_verdicts = looked_at;
         if found != self.local_only_listed {
             report.skipped.extend(found.iter().map(|(path, reason)| (path.clone(), (*reason).to_owned())));
             self.local_only_listed = found;
         }
         Ok(())
+    }
+
+    /// Whether the tracked file at `path` holds something other than what both sides agreed on. A different size says so
+    /// without reading the file; the same size needs its content hashed, and the answer is kept for as long as the file
+    /// (its size, time and ID) and the agreed content stay the same, so a quiet viewer's pass does not read every edited
+    /// file again. Kept answers are carried in `looked_at`, which replaces the cache after the pass (files that went
+    /// are forgotten).
+    fn edited_here(
+        &self,
+        entry: &BaseEntry,
+        path: &RelPath,
+        meta: FileMeta,
+        looked_at: &mut BTreeMap<RelPath, (FileMeta, FileHash, bool)>,
+    ) -> Result<bool, SyncError> {
+        if self.local_state(entry, path)? != Local::Modified {
+            return Ok(false);
+        }
+        let BaseKind::File { size, hash, .. } = &entry.kind else { return Ok(false) };
+        if meta.size != *size {
+            return Ok(true);
+        }
+        if let Some((seen, base, edited)) = self.read_only_verdicts.get(path)
+            && *seen == meta
+            && base == hash
+        {
+            looked_at.insert(path.clone(), (meta, *hash, *edited));
+            return Ok(*edited);
+        }
+        let edited = !self.holds_base_content(entry, path);
+        looked_at.insert(path.clone(), (meta, *hash, edited));
+        Ok(edited)
     }
 }

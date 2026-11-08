@@ -260,6 +260,90 @@ async fn a_role_lowered_to_viewer_stops_uploads_cleanly_and_keeps_every_edit() {
     assert_eq!(read(&t.ana, "new.txt").unwrap(), b"mine");
 }
 
+/// Review 1 of P1-4: a file or a link where a tracked folder was is the user's. Nothing that was in the folder is put
+/// back through it, and nothing is moved aside to make room.
+#[tokio::test]
+async fn a_file_or_a_link_where_a_folder_was_is_left_alone_with_everything_below() {
+    for link in [false, true] {
+        let mut t = seeded().await;
+        t.viewer.set_read_only(true);
+        t.viewer.fs_mut().remove_file(&path("Shots/a.psd")).unwrap();
+        t.viewer.fs_mut().remove_dir(&path("Shots")).unwrap();
+        if link {
+            t.viewer.fs_mut().make_link(&path("Shots")).unwrap();
+        } else {
+            write(&mut t.viewer, "Shots", b"my file, where the folder was");
+        }
+        for _ in 0..3 {
+            let report = t.viewer.sync_once().await.unwrap();
+            assert!(report.conflict_copies.is_empty(), "link {link}: nothing moved aside: {report:?}");
+            assert!(report.restored.is_empty() && report.created_dirs.is_empty(), "link {link}: {report:?}");
+        }
+        let at = t.viewer.fs().stat(&path("Shots")).unwrap().unwrap();
+        if link {
+            assert!(matches!(at, craft_cloud_sync::FsKind::Other), "the link is still there: {at:?}");
+        } else {
+            assert_eq!(read(&t.viewer, "Shots").unwrap(), b"my file, where the folder was");
+        }
+        assert_eq!(files(&t.viewer).iter().filter(|(p, _)| p.starts_with("Shots/")).count(), 0, "nothing was put back below it");
+        assert_eq!(writes(&t.viewer), 0);
+        assert_eq!(read(&t.ana, "Shots/a.psd").unwrap(), b"layers", "the server's copy is as it was");
+    }
+}
+
+/// Review 5: a folder put back is reported once, as restored.
+#[tokio::test]
+async fn a_restored_folder_is_counted_once() {
+    let mut t = seeded().await;
+    t.viewer.set_read_only(true);
+    t.viewer.fs_mut().remove_file(&path("Shots/a.psd")).unwrap();
+    t.viewer.fs_mut().remove_dir(&path("Shots")).unwrap();
+    let report = t.viewer.sync_once().await.unwrap();
+    assert!(report.restored.contains(&path("Shots")), "{report:?}");
+    assert!(report.created_dirs.is_empty(), "{report:?}");
+}
+
+/// Review 2: a quiet viewer's pass reads an edited file at most once while it stays as it is, and not at all when its
+/// size differs from the agreed content.
+#[tokio::test]
+async fn edited_files_are_not_read_again_every_pass() {
+    let mut t = seeded().await;
+    t.viewer.set_read_only(true);
+    // A different size: found out without reading the file.
+    t.viewer.fs_mut().write(&path("doc.txt"), b"a much longer edit than the base", false, 1).unwrap();
+    // The same size (6 bytes), saved later: read once, then remembered.
+    t.viewer.fs_mut().write(&path("Shots/a.psd"), b"LAYERS", false, 1).unwrap();
+    let reads = |m: &craft_cloud_sync::MemFs| (m.reads_of(&path("doc.txt")), m.reads_of(&path("Shots/a.psd")));
+    let first = t.viewer.sync_once().await.unwrap();
+    assert_eq!(kept(&first, READ_ONLY_EDITED).len(), 2, "{first:?}");
+    let after_first = reads(t.viewer.fs());
+    for _ in 0..5 {
+        let again = t.viewer.sync_once().await.unwrap();
+        assert!(again.skipped.is_empty(), "{again:?}");
+    }
+    assert_eq!(reads(t.viewer.fs()), after_first, "no file is read again while it stays as it is");
+    assert!(after_first.1 <= 2, "the same size is read once or twice, not every pass: {after_first:?}");
+}
+
+/// Review 3: a refusal that comes after earlier batches were committed keeps what they did in the report.
+#[tokio::test]
+async fn a_refusal_in_a_later_batch_keeps_the_earlier_batches_in_the_report() {
+    let mut t = team().await;
+    t.server.set_role(t.space, &t.ben, SpaceRole::Editor).await;
+    for i in 0..1_100 {
+        write(&mut t.viewer, &format!("f{i:04}.txt"), format!("file {i}").as_bytes());
+    }
+    // The first batch (1000 operations) goes up; the account is a viewer by the time the second is sent.
+    t.viewer.transport().faults.refuse_commits_from.store(2, Ordering::Relaxed);
+    let report = t.viewer.sync_once().await.unwrap();
+    assert!(report.read_only && t.viewer.is_read_only(), "{report:?}");
+    assert_eq!(report.uploaded.len(), craft_cloud_proto::limits::MAX_BATCH_OPS, "the committed batch is reported: {report:?}");
+    assert_eq!(kept(&report, READ_ONLY_NEW).len(), 100, "the rest stays here, listed: {report:?}");
+    // What the server has is exactly what was reported.
+    let seen = t.ana.sync_once().await.unwrap();
+    assert_eq!(seen.downloaded.len(), craft_cloud_proto::limits::MAX_BATCH_OPS, "{seen:?}");
+}
+
 /// Random edits, new files and deletes on a viewer's folder, and random edits on the owner's, over many seeds: the viewer
 /// never makes a write call, nothing it wrote reaches the server, and nothing it wrote is lost from its disk.
 #[tokio::test]

@@ -380,6 +380,12 @@ pub struct Engine<F: Fs, T: Transport> {
     /// The files only here that the last read-only pass listed (path and reason); a pass lists them again only when this
     /// changes. Cleared when the mode ends.
     local_only_listed: BTreeSet<(String, &'static str)>,
+    /// What read-only mode last found out about tracked files of the same size as the agreed content: whether they hold
+    /// something else, by the file's size, time and ID and the agreed content, so an unchanged file is read once.
+    read_only_verdicts: BTreeMap<RelPath, (FileMeta, FileHash, bool)>,
+    /// The files whose new content a commit of the running push took, so a push cut short by a refusal reports as uploaded
+    /// only those (content sent for the rest was not committed).
+    committed_files: BTreeSet<NodeId>,
 }
 
 /// What Craft apps saved from live documents, as the agent learnt it from them (`craft_cloud_proto::SaveRecord`).
@@ -458,6 +464,8 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             unknown_since: HashMap::new(),
             read_only: false,
             local_only_listed: BTreeSet::new(),
+            read_only_verdicts: BTreeMap::new(),
+            committed_files: BTreeSet::new(),
         })
     }
 
@@ -475,6 +483,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         self.read_only = read_only;
         if !read_only {
             self.local_only_listed.clear();
+            self.read_only_verdicts.clear();
         }
     }
 
@@ -593,11 +602,15 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         self.checkpoint()?;
         // A first write the server refuses ends the push with nothing stored: the engine switches to read-only mode and
         // the same pass goes on in it, so the local changes are reported as kept and nothing is retried.
-        let before_push = report.clone();
+        self.committed_files.clear();
         match self.push(&mut report).await {
             Err(SyncError::Transport(TransportError::ReadOnly)) => {
                 self.read_only = true;
-                report = before_push;
+                // What the refused push did before the refusal stays in the report: batches committed before the role
+                // changed, and conflict copies already moved aside. Content sent for files no commit took is not
+                // reported as uploaded (it stays here, and is listed as kept).
+                let committed: BTreeSet<RelPath> = self.committed_files.iter().filter_map(|id| self.state.base_path(*id)).collect();
+                report.uploaded.retain(|path| committed.contains(path));
                 self.push(&mut report).await?;
             }
             other => other?,

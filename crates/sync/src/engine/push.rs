@@ -678,6 +678,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 match result {
                     Ok(_) => {
                         for (_, effect) in batch.drain(..) {
+                            if let Effect::File { id, .. } | Effect::Update { id, .. } = &effect {
+                                self.committed_files.insert(*id);
+                            }
                             self.record(effect, report);
                         }
                         if queue.is_empty()

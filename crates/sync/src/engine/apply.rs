@@ -266,7 +266,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     }
 
     /// Fails as a filesystem error on the node (it is skipped and waits) if taking `to` would act on a link.
-    fn refuse_link_toward(&self, to: &RelPath) -> Result<(), SyncError> {
+    pub(super) fn refuse_link_toward(&self, to: &RelPath) -> Result<(), SyncError> {
         match self.link_toward(to)? {
             Some(link) => Err(io_err(&link, std::io::Error::other(OTHER_REASON))),
             None => Ok(()),
