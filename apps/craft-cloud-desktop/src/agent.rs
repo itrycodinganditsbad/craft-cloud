@@ -833,6 +833,7 @@ pub(crate) mod fake {
                 live_bytes: 120_000,
                 storage_kind: "disk".into(),
                 database_kind: "sqlite".into(),
+                ..AdminServerInfo::default()
             })
         }
         fn admin_storage(&self) -> Result<AdminStorageOverview, Error> {
