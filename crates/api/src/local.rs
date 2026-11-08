@@ -541,8 +541,14 @@ pub enum RunState {
     Syncing,
     /// The last pass failed for a reason that may pass by itself; it is tried again.
     Retrying { message: String },
-    /// Stopped until someone puts something right.
-    Paused { reason: String },
+    /// Stopped until someone puts something right. `reason_code` names the cause where it is one an app may want to
+    /// treat on its own (`server_full`, `quota_exceeded`: the [`crate::api::codes`] of the same name), so it need not
+    /// match the words of `reason`; absent for other causes, and from an older agent.
+    Paused {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason_code: Option<String>,
+    },
     /// Paused by the user (`POST /v1/pause`), until `POST /v1/resume`, also after a restart: no sync passes and no
     /// live connection; the local API and apps' recents on this machine keep working. Not a problem to put right,
     /// unlike [`RunState::Paused`].
@@ -1246,6 +1252,14 @@ mod tests {
         assert_eq!(serde_json::from_value::<Status>(json).unwrap(), status);
         let paused = serde_json::to_value(RunState::PausedByUser).unwrap();
         assert_eq!(paused, serde_json::json!({ "kind": "paused_by_user" }));
+        // A pause names its cause by code where there is one; an older agent sends none, and none is not written.
+        let coded = RunState::Paused { reason: "full".into(), reason_code: Some("server_full".into()) };
+        let json = serde_json::to_value(&coded).unwrap();
+        assert_eq!(json, serde_json::json!({ "kind": "paused", "reason": "full", "reason_code": "server_full" }));
+        assert_eq!(serde_json::from_value::<RunState>(json).unwrap(), coded);
+        let plain = RunState::Paused { reason: "x".into(), reason_code: None };
+        assert_eq!(serde_json::to_value(&plain).unwrap(), serde_json::json!({ "kind": "paused", "reason": "x" }));
+        assert_eq!(serde_json::from_value::<RunState>(serde_json::json!({ "kind": "paused", "reason": "x" })).unwrap(), plain);
         let older: Status = serde_json::from_value(serde_json::json!({
             "api": 1, "signed_in": false, "online": false, "run_state": { "kind": "signed_out" }
         }))

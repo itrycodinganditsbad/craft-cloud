@@ -19,10 +19,10 @@ pub fn sync_line(status: &Status) -> (String, Option<String>) {
         RunState::Retrying { message } if !status.online => (format!("Can't reach {server} — trying again"), Some(message.clone())),
         RunState::Retrying { message } => ("Syncing failed — trying again".into(), Some(message.clone())),
         // The server itself is full: not the account's quota, so the line says whose room has run out and who can fix it.
-        RunState::Paused { reason } if server_is_full(reason) => {
+        RunState::Paused { reason, .. } if server_is_full(reason) => {
             ("The server is full. Uploads wait until its admin frees space".into(), Some(reason.clone()))
         }
-        RunState::Paused { reason } => (super::problem_line(reason), Some(reason.clone())),
+        RunState::Paused { reason, .. } => (super::problem_line(reason), Some(reason.clone())),
         RunState::PausedByUser => ("Paused: nothing syncs until you resume".into(), None),
         RunState::Stopping => ("Stopping…".into(), None),
         RunState::SignedOut => ("Not signed in".into(), None),
@@ -430,12 +430,13 @@ mod tests {
 
     #[test]
     fn a_full_server_is_said_as_the_servers_not_the_accounts() {
-        let full = RunState::Paused { reason: "server: The server is full; the admin needs to free space or raise its capacity".into() };
+        let full = RunState::Paused { reason: "server: The server is full; the admin needs to free space or raise its capacity".into(), reason_code: None };
         let (line, details) = sync_line(&status(true, full));
         assert!(line.starts_with("The server is full") && !line.contains("account") && !line.contains("quota"), "{line}");
         assert!(details.is_some_and(|d| d.contains("raise its capacity")));
         let quota = RunState::Paused {
             reason: "server: the account's storage on the server is full or nearly (10 of 10 bytes used); the admin can allow more".into(),
+            reason_code: None,
         };
         assert!(sync_line(&status(true, quota)).0.contains("account"));
     }

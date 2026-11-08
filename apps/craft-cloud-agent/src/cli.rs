@@ -1932,8 +1932,8 @@ fn describe_loop(state: &LoopState) -> String {
         LoopState::Idle => "idle, waiting for changes".into(),
         LoopState::Syncing => "syncing".into(),
         LoopState::Retrying { next_try_ms, message } => format!("offline, retrying at {}: {message}", show_time(*next_try_ms)),
-        LoopState::Paused { reason, next_check_ms: Some(at) } => format!("paused: {reason} (looked at again at {})", show_time(*at)),
-        LoopState::Paused { reason, next_check_ms: None } => {
+        LoopState::Paused { reason, next_check_ms: Some(at), .. } => format!("paused: {reason} (looked at again at {})", show_time(*at)),
+        LoopState::Paused { reason, next_check_ms: None, .. } => {
             format!("paused: {reason} (stop it with Ctrl-C, put this right, then start `craft-cloud-agent run` again)")
         }
         LoopState::Stopping => "stopping after the running pass".into(),

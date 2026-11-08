@@ -90,7 +90,7 @@ min_free = "1 GiB"          # disk only; the free space to keep, default 1 GiB
 - `min_free` without `refuse_when_full`, `min_free` on S3 and `refuse_when_full` on S3 without `capacity` are refused when
   the server starts, since they would do nothing.
 - The agent turns `server_full` into a pause: "The server is full; the admin needs to free space or raise its capacity",
-  and looks again every 10 minutes. An agent from before this release does not know the code and treats the HTTP 507
+  and looks again every 10 minutes. The local API's status carries the cause as a code too (`run_state`: `paused` with `reason_code`: `server_full`, or `quota_exceeded` for an account over its quota), which an app can match instead of the words. An agent from before this release does not know the code and treats the HTTP 507
   as a server error: it shows the server's message as an error and tries again with growing pauses, up to 5 minutes. Nothing
   is lost either way. A config with `refuse_when_full` or `min_free` is refused by an older server (it rejects unknown
   settings), so remove the lines before going back to one.

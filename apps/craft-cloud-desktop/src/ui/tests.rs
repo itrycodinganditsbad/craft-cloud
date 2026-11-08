@@ -741,12 +741,16 @@ fn snapshot_adding_a_computer() {
 
 #[test]
 fn snapshot_removed_and_error() {
-    let removed = Status { removed: true, run_state: RunState::Paused { reason: "the server no longer accepts this device".into() }, ..signed_in() };
+    let removed = Status {
+        removed: true,
+        run_state: RunState::Paused { reason: "the server no longer accepts this device".into(), reason_code: None },
+        ..signed_in()
+    };
     let model = after(&FakeAgent::new(removed), Vec::new());
     assert_eq!(model.screen, Screen::Removed);
     snapshot(model, egui::Theme::Light, "removed");
     let damaged = Status {
-        run_state: RunState::Paused { reason: "/home/fabio/.local/share/craft-cloud-agent/account.json is damaged (expected value at line 1 column 2); move it away. Then sign in again".into() },
+        run_state: RunState::Paused { reason: "/home/fabio/.local/share/craft-cloud-agent/account.json is damaged (expected value at line 1 column 2); move it away. Then sign in again".into(), reason_code: None },
         ..signed_out()
     };
     snapshot(after(&FakeAgent::new(damaged), Vec::new()), egui::Theme::Light, "error");
@@ -2734,7 +2738,10 @@ fn snapshot_overview_insights() {
     let failed = overview_with_folders(Err(Error::NotRunning("can't reach it: connection refused".into())));
     snapshot_sized(failed, egui::Theme::Light, "overview-folders-failed", [960.0, 900.0]);
     let paused = Status {
-        run_state: RunState::Paused { reason: "server: The server is full; the admin needs to free space or raise its capacity".into() },
+        run_state: RunState::Paused {
+            reason: "server: The server is full; the admin needs to free space or raise its capacity".into(),
+            reason_code: None,
+        },
         ..signed_in()
     };
     snapshot(signed_in_model(paused.clone()), egui::Theme::Light, "overview-server-full");

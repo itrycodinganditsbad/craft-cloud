@@ -2263,7 +2263,7 @@ impl Model {
             return effects;
         }
         match (&status.run_state, &self.screen) {
-            (RunState::Paused { reason }, _) => {
+            (RunState::Paused { reason, .. }, _) => {
                 let problem = Problem { line: first_sentence(reason), details: reason.clone(), action: ProblemAction::ForgetAccount };
                 if !matches!(&self.screen, Screen::Error(p) if *p == problem) {
                     self.screen = Screen::Error(problem);
@@ -4258,8 +4258,11 @@ pub(crate) mod tests {
     #[test]
     fn a_removed_computer_says_so_and_joins_again() {
         let mut m = signed_in();
-        let removed =
-            Status { removed: true, run_state: RunState::Paused { reason: "the server no longer accepts this device".into() }, ..status(true) };
+        let removed = Status {
+            removed: true,
+            run_state: RunState::Paused { reason: "the server no longer accepts this device".into(), reason_code: None },
+            ..status(true)
+        };
         m.update(Event::Polled(Ok(removed)));
         assert_eq!(m.screen, Screen::Removed);
         assert_eq!(m.update(Event::ForgetAccount), vec![Effect::Logout { local: true }]);
@@ -4276,7 +4279,7 @@ pub(crate) mod tests {
         let mut m = model();
         m.update(Event::Start);
         let reason = "/home/ana/.local/share/craft-cloud-agent/account.json is damaged (expected value at line 1); move it away. Then sign in again";
-        m.update(Event::Found(Ok(Status { run_state: RunState::Paused { reason: reason.into() }, ..status(false) })));
+        m.update(Event::Found(Ok(Status { run_state: RunState::Paused { reason: reason.into(), reason_code: None }, ..status(false) })));
         let Screen::Error(problem) = &m.screen else { panic!("{:?}", m.screen) };
         assert_eq!(problem.line, "/home/ana/.local/share/craft-cloud-agent/account.json is damaged (expected value at line 1); move it away.");
         assert_eq!(problem.details, reason);
