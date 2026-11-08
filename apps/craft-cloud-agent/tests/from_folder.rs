@@ -243,7 +243,11 @@ impl Person {
             if let Some(status) = status.clone().filter(|s| s.step == step) {
                 return status;
             }
-            assert!(Instant::now() < deadline, "timed out waiting until the work is at {step:?}; it is at {status:?} (before: {last:?})");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting until the work is at {step:?}; it is at {status:?} saying {:?} (before: {last:?})",
+                status.as_ref().map(|s| s.message.clone())
+            );
             last = status;
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -1425,4 +1429,114 @@ async fn a_quarantine_that_cannot_be_read_is_not_taken_for_empty() {
     let shown = ana.work().await.expect("the work is still reported");
     assert_eq!((shown.step, shown.failed_at), (FromFolderStep::Failed, Some(FromFolderStep::Trashing)), "{shown:?}");
     assert!(shown.message.as_deref().is_some_and(|m| m.contains("Move them back yourself")), "{shown:?}");
+}
+
+/// A team edit made in the instant before the copy touches the old team file.
+fn edit_in_the_team_space(dest: &Path) {
+    if dest.file_name().is_some_and(|n| n == "brief.txt") {
+        std::fs::write(dest, b"edited in the team space meanwhile").unwrap();
+    }
+}
+
+/// The names in `folder` that start with `prefix` and are not `exact`.
+fn names_beside(folder: &Path, prefix: &str, exact: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(folder)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(prefix) && n != exact)
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_team_edit_made_while_the_old_file_is_copied_is_not_overwritten() {
+    let (_w, ana, project, _files) = ana_with_project().await;
+    hook::set(ana.data.path(), Some(Hook::Fail(FromFolderStep::Syncing)));
+    ana.make(&project, "Meanwhile").await.unwrap();
+    let failed = ana.until(FromFolderStep::Failed).await;
+    let team = PathBuf::from(failed.team_folder.clone().unwrap());
+    // The old file changes; the copy is under way (the new version read in full) when somebody edits the team file.
+    std::fs::write(project.join("brief.txt"), b"a newer version here").unwrap();
+    hook::set_before_replace(ana.data.path(), Some(edit_in_the_team_space));
+    hook::set(ana.data.path(), None);
+    ana.make_with(&project, "Meanwhile", None).await.unwrap();
+    let status = done(&ana).await;
+    hook::set_before_replace(ana.data.path(), None);
+    assert_eq!(std::fs::read(team.join("brief.txt")).unwrap(), b"edited in the team space meanwhile", "the edit is not overwritten");
+    let beside = names_beside(&team, "brief", "brief.txt");
+    assert_eq!(beside.len(), 1, "{beside:?}");
+    assert_eq!(std::fs::read(team.join(&beside[0])).unwrap(), b"a newer version here");
+    assert_eq!(std::fs::read(project.join("brief.txt")).unwrap(), b"a newer version here", "the old file stays");
+    assert_eq!(status.kept, 1, "{status:?}");
+    assert!(status.message.as_deref().is_some_and(|m| m.contains("edited in the team space")), "{status:?}");
+    // Nothing of the move aside is left in the team folder's hidden folder.
+    let left: Vec<_> =
+        std::fs::read_dir(team.join(".craft-cloud").join("tmp")).map(|d| d.flatten().map(|e| e.file_name()).collect()).unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_in_the_middle_of_the_copy_does_not_make_the_jobs_own_files_look_like_team_edits() {
+    let (w, mut ana, project, files) = ana_with_project().await;
+    // A kill saves nothing at the end: only what the copy saved as it went counts.
+    hook::set_lose_unsaved(ana.data.path(), true);
+    hook::set_save_every(ana.data.path(), Some(Duration::ZERO));
+    hook::set_copy_delay(ana.data.path(), Some(Duration::from_millis(100)));
+    ana.make(&project, "Killed").await.unwrap();
+    let mut team = None;
+    for _ in 0..600 {
+        if let Some(folder) = ana.work().await.and_then(|s| s.team_folder)
+            && !files_under(Path::new(&folder)).is_empty()
+        {
+            team = Some(PathBuf::from(folder));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let team = team.expect("a file reached the team folder");
+    let _ = ana.crash().await;
+    hook::set_copy_delay(ana.data.path(), None);
+    hook::set_lose_unsaved(ana.data.path(), false);
+    // Every old file changes meanwhile; the agent starts again and is asked again.
+    let mut changed = BTreeMap::new();
+    for (rel, data) in &files {
+        let mut data = data.clone();
+        data.extend_from_slice(b" and changed");
+        write(&project, rel, &data);
+        changed.insert(rel.clone(), data);
+    }
+    ana.run();
+    ana.ready().await;
+    ana.make_with(&project, "Killed", None).await.unwrap();
+    let status = done(&ana).await;
+    // The files the first run wrote are replaced by the new versions: no conflict copies, nothing said to be edited in the team.
+    assert_eq!(status.kept, 0, "{status:?}");
+    assert!(status.message.as_deref().is_none_or(|m| !m.contains("edited in the team space")), "{status:?}");
+    team_holds(&w, &status, &changed).await;
+    assert_eq!(files_under(&team), changed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_does_not_add_another_identical_conflict_copy() {
+    let (_w, ana, project, _files) = ana_with_project().await;
+    hook::set(ana.data.path(), Some(Hook::Fail(FromFolderStep::Syncing)));
+    ana.make(&project, "Twice").await.unwrap();
+    let failed = ana.until(FromFolderStep::Failed).await;
+    let team = PathBuf::from(failed.team_folder.clone().unwrap());
+    std::fs::write(team.join("brief.txt"), b"edited in the team space").unwrap();
+    std::fs::write(project.join("brief.txt"), b"a newer version here").unwrap();
+    // The second try puts the old version beside the edit and fails later; the third copies again.
+    ana.make_with(&project, "Twice", None).await.unwrap();
+    ana.until(FromFolderStep::Failed).await;
+    assert_eq!(names_beside(&team, "brief", "brief.txt").len(), 1);
+    hook::set(ana.data.path(), None);
+    ana.make_with(&project, "Twice", None).await.unwrap();
+    let status = done(&ana).await;
+    let beside = names_beside(&team, "brief", "brief.txt");
+    assert_eq!(beside.len(), 1, "no second copy of the same version beside the same edit: {beside:?}");
+    assert_eq!(std::fs::read(team.join(&beside[0])).unwrap(), b"a newer version here");
+    assert_eq!(std::fs::read(team.join("brief.txt")).unwrap(), b"edited in the team space");
+    assert_eq!(status.kept, 1, "{status:?}");
 }

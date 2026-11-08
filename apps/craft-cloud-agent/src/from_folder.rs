@@ -196,6 +196,51 @@ pub mod hook {
         AFTER.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|(path, _)| path == data).map(|(_, f)| *f)
     }
 
+    static REPLACES: Mutex<Vec<(PathBuf, Callback)>> = Mutex::new(Vec::new());
+    static SAVES: Mutex<Vec<(PathBuf, Duration)>> = Mutex::new(Vec::new());
+
+    /// Calls `f` with the path of a team file the copy is about to replace by a newer version of its own, after the new version was
+    /// read in full and before the old one is touched (the moment a team edit could be made).
+    pub fn set_before_replace(data: &Path, f: Option<Callback>) {
+        let mut hooks = REPLACES.lock().unwrap_or_else(PoisonError::into_inner);
+        hooks.retain(|(path, _)| path != data);
+        if let Some(f) = f {
+            hooks.push((data.to_owned(), f));
+        }
+    }
+
+    pub(super) fn before_replace(data: &Path) -> Option<Callback> {
+        REPLACES.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|(path, _)| path == data).map(|(_, f)| *f)
+    }
+
+    /// How often the copy saves what it wrote (default: every second); `Duration::ZERO` saves after every file.
+    pub fn set_save_every(data: &Path, every: Option<Duration>) {
+        let mut saves = SAVES.lock().unwrap_or_else(PoisonError::into_inner);
+        saves.retain(|(path, _)| path != data);
+        if let Some(every) = every {
+            saves.push((data.to_owned(), every));
+        }
+    }
+
+    pub(super) fn save_every(data: &Path) -> Option<Duration> {
+        SAVES.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|(path, _)| path == data).map(|(_, d)| *d)
+    }
+
+    static LOSES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Makes the copy of this agent not save what it wrote when it ends, as a kill would not: only what it saved as it went is kept.
+    pub fn set_lose_unsaved(data: &Path, on: bool) {
+        let mut loses = LOSES.lock().unwrap_or_else(PoisonError::into_inner);
+        loses.retain(|path| path != data);
+        if on {
+            loses.push(data.to_owned());
+        }
+    }
+
+    pub(super) fn lose_unsaved(data: &Path) -> bool {
+        LOSES.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|path| path == data)
+    }
+
     static LINKS: Mutex<Vec<(PathBuf, io::ErrorKind)>> = Mutex::new(Vec::new());
 
     /// Makes every hard link made below `under` fail with an error of this kind (`Unsupported` is what a volume without hard links
@@ -895,20 +940,27 @@ impl Job {
     /// Step 4: every file into the team folder. Returns what was copied.
     async fn copy(&mut self, team_folder: &Path) -> Result<Vec<Copied>, Stop> {
         let (scan_dirs, files, root, team) = (self.scan.dirs.clone(), self.scan.files.clone(), self.scan.root.clone(), team_folder.to_owned());
-        let delay = hook::copy_delay(self.data.path());
+        let hooks = CopyHooks {
+            delay: hook::copy_delay(self.data.path()),
+            before_replace: hook::before_replace(self.data.path()),
+            save_every: hook::save_every(self.data.path()).unwrap_or(WRITTEN_SAVE_EVERY),
+        };
         let device = self.account.device_name.clone();
         let record = self.status.space.map(|space| self.data.space_dir(space).path().join(WRITTEN_FILE));
         let written = Arc::new(Mutex::new(record.as_deref().map(load_written).unwrap_or_default()));
         let shared = written.clone();
+        let saved_to = record.clone();
         let result = self
             .blocking(move |done, cancel, control| {
-                copy_all(&root, &team, &scan_dirs, &files, &done, delay, &device, &shared, &|| {
+                copy_all(&root, &team, &scan_dirs, &files, &done, hooks, &device, &shared, saved_to.as_deref(), &|| {
                     cancel.load(Ordering::SeqCst) || control.spaces_handle().is_none()
                 })
             })
             .await;
         // What was written is kept whether the copy came to an end or not.
-        if let Some(record) = record {
+        if let Some(record) = record
+            && !hook::lose_unsaved(self.data.path())
+        {
             save_written(&record, &written.lock().unwrap_or_else(PoisonError::into_inner));
         }
         result
@@ -1247,9 +1299,33 @@ enum Landing {
     /// The file is in the team folder as it is in the old folder.
     Placed(ManifestId),
     /// The team folder's file was edited there since this job wrote it: it stays as it is, and the old folder's version went
-    /// beside it as the conflict copy with this name.
-    Beside(ManifestId, String),
+    /// beside it as the conflict copy with this name; the last is the manifest of the team file that was there (when it could be read).
+    Beside(ManifestId, String, Option<ManifestId>),
 }
+
+/// How often the copy saves what it wrote while it goes on (a crash then loses at most this much of the record).
+const WRITTEN_SAVE_EVERY: Duration = Duration::from_secs(1);
+
+/// The record key under which the conflict copy made for `key`'s path is noted (a NUL cannot be in a path, so it is no file's key).
+fn beside_key(key: &str) -> String {
+    format!("\0beside\0{key}")
+}
+
+/// The conflict copy noted for a path: the team version it was made beside, the old version it holds, and its name.
+fn beside_note(seen: &ManifestId, mine: &ManifestId, name: &str) -> String {
+    format!("{seen}|{mine}|{name}")
+}
+
+/// What the copy's hooks and timing are (see [`hook`]).
+#[derive(Clone, Copy)]
+struct CopyHooks {
+    delay: Option<Duration>,
+    before_replace: Option<hook::Callback>,
+    save_every: Duration,
+}
+
+/// The extension of a team file the copy moved aside, and of the note beside it that names where it belongs.
+const ASIDE_EXT: &str = "cc-aside";
 
 /// The file in the team space's own folder (in the data folder) that records, for each path, the manifest this job last wrote there:
 /// what tells a team file of this job's own (which a newer old version may replace) from one somebody edited.
@@ -1279,12 +1355,18 @@ fn copy_all(
     dirs: &[(Vec<std::ffi::OsString>, Vec<String>)],
     files: &[FileEntry],
     done: &AtomicU64,
-    delay: Option<Duration>,
+    hooks: CopyHooks,
     device: &str,
     written: &Mutex<Written>,
+    record: Option<&Path>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<Copied>, CopyStop> {
-    let tmp = team.join(AGENT_DIR).join("tmp");
+    // The team folder as it is now: it and every folder written into must stay what they are (no link, the same folder), and
+    // everything is written through this resolved path, never through the one the agent was given.
+    std::fs::create_dir_all(team).map_err(|e| io_failed(team, &e))?;
+    let team_real = std::fs::canonicalize(team).map_err(|e| io_failed(team, &e))?;
+    let team_chain = chain_of(&team_real, &team_real);
+    let tmp = team_real.join(AGENT_DIR).join("tmp");
     std::fs::create_dir_all(&tmp).map_err(|e| io_failed(&tmp, &e))?;
     // Leftovers of an earlier try.
     if let Ok(entries) = std::fs::read_dir(&tmp) {
@@ -1294,48 +1376,96 @@ fn copy_all(
             }
         }
     }
-    // The team folder as it is now: it and every folder written into must stay what they are (no link, the same folder).
-    let team_real = std::fs::canonicalize(team).map_err(|e| io_failed(team, &e))?;
-    let team_chain = chain_of(&team_real, &team_real);
+    recover_asides(&tmp, &team_real, written, cancelled);
     for (os, _) in dirs {
-        let dir = join(team, os);
-        if !chain_intact(&team_chain) || !ancestors_are_real(team, os) {
+        let dir = join(&team_real, os);
+        if !chain_intact(&team_chain) || !ancestors_are_real(&team_real, os) {
             return Err(unsafe_destination());
         }
         std::fs::create_dir_all(&dir).map_err(|e| io_failed(&dir, &e))?;
-        if !components_are_real(team, os) {
+        if !components_are_real(&team_real, os) {
             return Err(unsafe_destination());
         }
     }
     let mut copied = Vec::with_capacity(files.len());
+    let mut last_save = Instant::now();
     for entry in files {
         if cancelled() {
             return Err(CopyStop::Interrupted);
         }
         let source = join(root, &entry.os);
-        let dest = join(team, &entry.os);
+        let dest = join(&team_real, &entry.os);
         let key = entry.names.join("/");
-        let ours = written.lock().unwrap_or_else(PoisonError::into_inner).get(&key).cloned();
+        let (ours, beside) = {
+            let known = written.lock().unwrap_or_else(PoisonError::into_inner);
+            (known.get(&key).cloned(), known.get(&beside_key(&key)).cloned())
+        };
         let mut attempt = 0;
         let landing = loop {
             attempt += 1;
-            let guard = || chain_intact(&team_chain) && ancestors_are_real(team, &entry.os);
-            match copy_file(&source, &dest, &tmp, delay, ours.as_deref(), device, &guard, cancelled)? {
+            let guard = || chain_intact(&team_chain) && ancestors_are_real(&team_real, &entry.os);
+            let known = Known { ours: ours.as_deref(), beside: beside.as_deref(), key: &key };
+            match copy_file(&source, &dest, &tmp, hooks, known, device, &guard, cancelled)? {
                 Some(landing) => break landing,
                 None if attempt < 4 => std::thread::sleep(Duration::from_millis(300)),
                 None => return Err(CopyStop::Failed(format!("{} keeps changing while it is copied; nothing was deleted", source.display()))),
             }
         };
-        match landing {
-            Landing::Placed(manifest) => {
-                written.lock().unwrap_or_else(PoisonError::into_inner).insert(key, manifest.to_string());
-                copied.push(Copied { entry: entry.clone(), manifest, team_edit: None });
+        {
+            let mut known = written.lock().unwrap_or_else(PoisonError::into_inner);
+            match landing {
+                Landing::Placed(manifest) => {
+                    known.insert(key, manifest.to_string());
+                    copied.push(Copied { entry: entry.clone(), manifest, team_edit: None });
+                }
+                Landing::Beside(manifest, name, seen) => {
+                    if let Some(seen) = seen {
+                        known.insert(beside_key(&key), beside_note(&seen, &manifest, &name));
+                    }
+                    copied.push(Copied { entry: entry.clone(), manifest, team_edit: Some(name) });
+                }
             }
-            Landing::Beside(manifest, name) => copied.push(Copied { entry: entry.clone(), manifest, team_edit: Some(name) }),
+        }
+        // What was written is saved as it goes, so a crash does not make this job's own files look like team edits.
+        if let Some(record) = record
+            && last_save.elapsed() >= hooks.save_every
+        {
+            save_written(record, &written.lock().unwrap_or_else(PoisonError::into_inner));
+            last_save = Instant::now();
         }
         done.fetch_add(1, Ordering::Relaxed);
     }
     Ok(copied)
+}
+
+/// Puts back the team files an earlier copy moved aside and did not finish with (a crash between moving the old file aside and
+/// landing the new one): to their place if it is free; if something is there now, the aside file goes if it is this job's own old
+/// content, and is kept next to it (under a `.cc-kept` name) if it is anything else.
+fn recover_asides(tmp: &Path, team_real: &Path, written: &Mutex<Written>, cancelled: &dyn Fn() -> bool) {
+    let Ok(entries) = std::fs::read_dir(tmp) else { return };
+    for entry in entries.flatten() {
+        let note = entry.path();
+        let name = note.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let Some(stem) = name.strip_suffix(&format!(".{ASIDE_EXT}.path")) else { continue };
+        let aside = tmp.join(format!("{stem}.{ASIDE_EXT}"));
+        let Ok(names) = std::fs::read_to_string(&note) else { continue };
+        if !aside.exists() {
+            let _ = std::fs::remove_file(&note);
+            continue;
+        }
+        let os: Vec<std::ffi::OsString> = names.split('/').map(std::ffi::OsString::from).collect();
+        let place = join(team_real, &os);
+        if names.is_empty() || !ancestors_are_real(team_real, &os) {
+            continue;
+        }
+        let ours = written.lock().unwrap_or_else(PoisonError::into_inner).get(&names).cloned();
+        let free = matches!(std::fs::symlink_metadata(&place), Err(e) if e.kind() == io::ErrorKind::NotFound);
+        let own_old = !free && matches!(chunk_file(&aside, cancelled, |_| Ok(())), Ok((m, _)) if Some(m.to_string()) == ours);
+        let result = if own_old { std::fs::remove_file(&aside) } else { put_back(&aside, &place) };
+        if result.is_ok() {
+            let _ = std::fs::remove_file(&note);
+        }
+    }
 }
 
 /// The destination of a copy, as it is when the copy starts.
@@ -1345,29 +1475,68 @@ enum Dest {
     File(Option<ManifestId>),
 }
 
+/// What identifies a file's state without reading it: its file ID, size and modification time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStat {
+    id: Option<u64>,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl FileStat {
+    fn of(path: &Path, meta: &std::fs::Metadata) -> Self {
+        Self { id: identity(path, meta), len: meta.len(), modified: meta.modified().ok() }
+    }
+}
+
+/// A team file as it was read at the start of its copy: the manifest of its content and its [`FileStat`].
+#[derive(Clone, Copy)]
+struct Read {
+    manifest: ManifestId,
+    stat: Option<FileStat>,
+}
+
+/// What the record knows of one path.
+#[derive(Clone, Copy)]
+struct Known<'a> {
+    /// The manifest this job last wrote there.
+    ours: Option<&'a str>,
+    /// The conflict copy made beside an edit there ([`beside_note`]).
+    beside: Option<&'a str>,
+    /// The path, as the record names it.
+    key: &'a str,
+}
+
 /// Copies one file into the team folder. A file that is not there is put there (never over a name that was taken meanwhile). A file
-/// that already has exactly the old file's content stays. A file the job wrote itself (`ours` is the manifest it recorded) is replaced
-/// by the newer old file. Any other file there was edited in the team folder: it stays as it is, and the old file's version is put
-/// beside it as a conflict copy. `None`: the old file changed while it was read; the copy was thrown away.
+/// that already has exactly the old file's content stays. A file the job wrote itself (`known.ours` is the manifest it recorded) is
+/// replaced by the newer old file, but never blindly: it is moved aside first, looked at, and only content that is still the job's
+/// own is replaced. Any other file there was edited in the team folder: it stays as it is, and the old file's version is put beside
+/// it as a conflict copy (once: a conflict copy already made for the same two versions is not made again). `None`: the old file
+/// changed while it was read; the copy was thrown away.
 #[allow(clippy::too_many_arguments)]
 fn copy_file(
     source: &Path,
     dest: &Path,
     tmp: &Path,
-    delay: Option<Duration>,
-    ours: Option<&str>,
+    hooks: CopyHooks,
+    known: Known<'_>,
     device: &str,
     guard: &dyn Fn() -> bool,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Option<Landing>, CopyStop> {
+    let delay = hooks.delay;
     if !guard() {
         return Err(unsafe_destination());
     }
     let failed_at = |path: &Path, e: &dyn std::fmt::Display| CopyStop::Failed(format!("{}: {e}", path.display()));
     let before = std::fs::metadata(source).map_err(|e| io_failed(source, &e))?;
+    let mut dest_stat = None;
     let state = match std::fs::symlink_metadata(dest) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Dest::Absent,
-        Ok(m) if m.is_file() && !is_link(&m) => Dest::File(chunk_file(dest, cancelled, |_| Ok(())).ok().map(|(m, _)| m)),
+        Ok(m) if m.is_file() && !is_link(&m) => {
+            dest_stat = Some(FileStat::of(dest, &m));
+            Dest::File(chunk_file(dest, cancelled, |_| Ok(())).ok().map(|(m, _)| m))
+        }
         _ => return Err(CopyStop::Failed(format!("{}: something other than a file is there", dest.display()))),
     };
     let temp = tmp.join(format!("{}.{COPY_EXT}", random_hex(12).map_err(|e| CopyStop::Failed(e.to_string()))?));
@@ -1412,33 +1581,159 @@ fn copy_file(
                 })?;
                 Ok(Some(Landing::Placed(manifest)))
             }
-            Dest::File(Some(have)) if ours == Some(have.to_string().as_str()) => {
-                // An older copy this job wrote itself: replaced.
-                put_in_place(&temp, dest).map_err(CopyStop::Failed)?;
-                Ok(Some(Landing::Placed(manifest)))
-            }
-            Dest::File(_) => {
-                // Edited in the team folder (or not known to be this job's): it stays, and this version goes beside it.
-                let original = dest.file_name().and_then(|n| n.to_str()).and_then(|n| Name::new(n).ok());
-                let Some(original) = original else {
-                    return Err(CopyStop::Failed(format!("{}: the name can't be used for a conflict copy", dest.display())));
-                };
-                for counter in 1..=50 {
-                    let name = craft_cloud_proto::conflict_name(&original, false, device, crate::cli::conflict_stamp(), counter)
-                        .map_err(|e| CopyStop::Failed(e.to_string()))?;
-                    match land_noreplace(&temp, &dest.with_file_name(name.as_str())) {
-                        Ok(()) => return Ok(Some(Landing::Beside(manifest, name.as_str().to_owned()))),
-                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                        Err(e) => return Err(io_failed(dest, &e)),
-                    }
+            Dest::File(Some(have)) if known.ours == Some(have.to_string().as_str()) => {
+                // An older copy this job wrote itself: replaced, if it still is that.
+                if let Some(hook) = hooks.before_replace {
+                    hook(dest);
                 }
-                Err(CopyStop::Failed(format!("{}: too many conflict copies are there", dest.display())))
+                let read = Read { manifest: have, stat: dest_stat };
+                replace_own(&temp, dest, tmp, &manifest, read, known, device, cancelled).map(Some)
+            }
+            Dest::File(seen) => {
+                // Edited in the team folder (or not known to be this job's): it stays, and this version goes beside it.
+                land_beside(&temp, dest, &manifest, seen, known, device).map(Some)
             }
         }
     })();
     // A copy that was put in place is gone from `temp`; anything else is cleaned up.
     let _ = std::fs::remove_file(&temp);
     result
+}
+
+/// Puts the finished copy `temp` beside the team file `dest` as a conflict copy (never over anything), unless one with the same
+/// content was made beside the same team version already.
+fn land_beside(
+    temp: &Path,
+    dest: &Path,
+    manifest: &ManifestId,
+    seen: Option<ManifestId>,
+    known: Known<'_>,
+    device: &str,
+) -> Result<Landing, CopyStop> {
+    if let (Some(seen), Some(note)) = (seen.as_ref(), known.beside) {
+        let mut parts = note.splitn(3, '|');
+        if let (Some(then), Some(mine), Some(name)) = (parts.next(), parts.next(), parts.next())
+            && then == seen.to_string()
+            && mine == manifest.to_string()
+            && std::fs::symlink_metadata(dest.with_file_name(name)).is_ok_and(|m| m.is_file())
+        {
+            return Ok(Landing::Beside(*manifest, name.to_owned(), Some(*seen)));
+        }
+    }
+    let original = dest.file_name().and_then(|n| n.to_str()).and_then(|n| Name::new(n).ok());
+    let Some(original) = original else {
+        return Err(CopyStop::Failed(format!("{}: the name can't be used for a conflict copy", dest.display())));
+    };
+    for counter in 1..=50 {
+        let name = craft_cloud_proto::conflict_name(&original, false, device, crate::cli::conflict_stamp(), counter)
+            .map_err(|e| CopyStop::Failed(e.to_string()))?;
+        match land_noreplace(temp, &dest.with_file_name(name.as_str())) {
+            Ok(()) => return Ok(Landing::Beside(*manifest, name.as_str().to_owned(), seen)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(io_failed(dest, &e)),
+        }
+    }
+    Err(CopyStop::Failed(format!("{}: too many conflict copies are there", dest.display())))
+}
+
+/// Replaces the job's own older team file `dest` by the finished copy `temp` without ever overwriting what somebody wrote there
+/// meanwhile: the old file is moved aside first (a rename, with a note beside it that says where it belongs, so a crash is put right
+/// at the next start), the moved file is checked (read again unless it plainly is the file that was read at the start: the same
+/// file ID, size and time), and only if it still is the content the job wrote does the new copy land (by a link that fails on a
+/// taken name). Anything else was edited: it is put back (never over anything) and the new copy goes beside it.
+#[allow(clippy::too_many_arguments)]
+fn replace_own(
+    temp: &Path,
+    dest: &Path,
+    tmp: &Path,
+    manifest: &ManifestId,
+    read: Read,
+    known: Known<'_>,
+    device: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Landing, CopyStop> {
+    let id = random_hex(12).map_err(|e| CopyStop::Failed(e.to_string()))?;
+    let aside = tmp.join(format!("{id}.{ASIDE_EXT}"));
+    let note = tmp.join(format!("{id}.{ASIDE_EXT}.path"));
+    write_atomic(&note, known.key.as_bytes(), false).map_err(|e| io_failed(&note, &e))?;
+    let mut moved = Err(io::Error::from(io::ErrorKind::NotFound));
+    for _ in 0..RENAME_TRIES {
+        moved = std::fs::rename(dest, &aside);
+        match &moved {
+            // Another program holds the file for a moment (the team pass reading it): waited for.
+            Err(e) if e.kind() != io::ErrorKind::NotFound => std::thread::sleep(Duration::from_millis(250)),
+            _ => break,
+        }
+    }
+    match moved {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Gone meanwhile (deleted in the team space): there is nothing to protect, the new copy lands on the free name.
+            let _ = std::fs::remove_file(&note);
+            return match land_noreplace(temp, dest) {
+                Ok(()) => Ok(Landing::Placed(*manifest)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => land_beside(temp, dest, manifest, None, known, device),
+                Err(e) => Err(io_failed(dest, &e)),
+            };
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&note);
+            return Err(io_failed(dest, &e));
+        }
+    }
+    // The team file is absent from its place from here until the new copy lands, and the team pass that reads it then fails: so
+    // what was moved is read again only when it is not plainly the file that was read at the start (the same file ID, size and
+    // modification time); then the content is the one that was read.
+    let plainly_the_same = read.stat.is_some()
+        && std::fs::symlink_metadata(&aside).is_ok_and(|m| m.is_file() && !is_link(&m) && Some(FileStat::of(&aside, &m)) == read.stat);
+    let moved_content = if plainly_the_same { Ok(read.manifest) } else { chunk_file(&aside, cancelled, |_| Ok(())).map(|(m, _)| m) };
+    let own = matches!(&moved_content, Ok(m) if Some(m.to_string().as_str()) == known.ours);
+    let put_aside_back = || match put_back(&aside, dest) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&note);
+            Ok(())
+        }
+        // It stays in the team folder's own hidden folder, with its note: the next start puts it back.
+        Err(e) => Err(CopyStop::Failed(format!(
+            "{}: the file that was moved aside could not be put back ({e}); it is kept in {}",
+            dest.display(),
+            aside.display()
+        ))),
+    };
+    if own {
+        match land_noreplace(temp, dest) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&aside);
+                let _ = std::fs::remove_file(&note);
+                Ok(Landing::Placed(*manifest))
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // A file took the name in this instant: the job's own old copy is dropped, the new version goes beside what is there.
+                let _ = std::fs::remove_file(&aside);
+                let _ = std::fs::remove_file(&note);
+                land_beside(temp, dest, manifest, None, known, device)
+            }
+            Err(e) => {
+                put_aside_back()?;
+                Err(io_failed(dest, &e))
+            }
+        }
+    } else {
+        let seen = moved_content.as_ref().ok().copied();
+        match &moved_content {
+            Err(CopyStop::Interrupted) => {
+                put_aside_back()?;
+                return Err(CopyStop::Interrupted);
+            }
+            Err(CopyStop::Failed(why)) => {
+                put_aside_back()?;
+                return Err(CopyStop::Failed(why.clone()));
+            }
+            Ok(_) => {}
+        }
+        put_aside_back()?;
+        land_beside(temp, dest, manifest, seen, known, device)
+    }
 }
 
 /// What the copy says when the team folder, or a folder in it, is not the real folder it was.
@@ -1510,25 +1805,6 @@ fn land_noreplace(temp: &Path, dest: &Path) -> io::Result<()> {
         Err(e) if hard_links_unsupported(&e) => rename_if_absent(temp, dest),
         Err(e) => Err(e),
     }
-}
-
-/// Renames the finished copy over its place; another program that holds the destination for a moment (the team pass reading
-/// an older copy) is waited for.
-fn put_in_place(temp: &Path, dest: &Path) -> Result<(), String> {
-    let mut last = None;
-    for _ in 0..RENAME_TRIES {
-        match std::fs::rename(temp, dest) {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound && !temp.exists() => {
-                return Err(format!("{}: the copy was removed under the work", temp.display()));
-            }
-            Err(e) => {
-                last = Some(e);
-                std::thread::sleep(Duration::from_millis(250));
-            }
-        }
-    }
-    Err(format!("{}: {}", dest.display(), last.map_or_else(|| "can't be put in place".to_owned(), |e| e.to_string())))
 }
 
 /// Whether every copied file of the old folder is as it was copied: same manifest of its content now. `Ok(false)` when not.
@@ -2312,6 +2588,45 @@ mod tests {
         assert!(matches!(out, Deleted::Changed), "kept, and not stranded in the quarantine: {out:?}");
         assert_eq!(std::fs::read(root.join("a.txt").join("inside.txt")).unwrap(), b"in the folder");
         assert!(!quarantine.exists() || std::fs::read_dir(&quarantine).unwrap().count() == 0);
+    }
+
+    #[test]
+    fn an_old_file_moved_aside_by_a_crash_is_put_right_at_the_next_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let team = std::fs::canonicalize(dir.path()).unwrap();
+        let tmp = team.join(AGENT_DIR).join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let aside = |id: &str, key: &str, content: &[u8]| {
+            std::fs::write(tmp.join(format!("{id}.{ASIDE_EXT}")), content).unwrap();
+            std::fs::write(tmp.join(format!("{id}.{ASIDE_EXT}.path")), key).unwrap();
+        };
+        let manifest_of = |content: &[u8]| {
+            let path = tmp.join("probe");
+            std::fs::write(&path, content).unwrap();
+            let (m, _) = chunk_file(&path, &|| false, |_| Ok(())).map_err(|_| ()).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            m.to_string()
+        };
+        let written = Mutex::new(Written::from([
+            ("own.txt".to_owned(), manifest_of(b"the job's old copy")),
+            ("Dir/edit.txt".to_owned(), manifest_of(b"what the job wrote")),
+        ]));
+        // The crash came after the file was moved aside and before the new one landed: its place is free, the file goes back.
+        aside("a1", "Dir/lost.txt", b"must come back");
+        std::fs::create_dir_all(team.join("Dir")).unwrap();
+        // The new copy landed, the crash came before the cleanup: the job's own old content is dropped.
+        aside("a2", "own.txt", b"the job's old copy");
+        std::fs::write(team.join("own.txt"), b"the new copy").unwrap();
+        // Something else is there and the moved file is an edit: both stay, the edit under a kept name.
+        aside("a3", "Dir/edit.txt", b"somebody's edit");
+        std::fs::write(team.join("Dir").join("edit.txt"), b"what is there now").unwrap();
+        recover_asides(&tmp, &team, &written, &|| false);
+        assert_eq!(std::fs::read(team.join("Dir").join("lost.txt")).unwrap(), b"must come back");
+        assert_eq!(std::fs::read(team.join("own.txt")).unwrap(), b"the new copy");
+        assert_eq!(std::fs::read(team.join("Dir").join("edit.txt")).unwrap(), b"what is there now");
+        assert_eq!(std::fs::read(team.join("Dir").join("edit.txt.cc-kept")).unwrap(), b"somebody's edit");
+        let left: Vec<_> = std::fs::read_dir(&tmp).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]
