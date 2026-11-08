@@ -222,6 +222,9 @@ fn recent_activity(ui: &mut egui::Ui, o: &Overview, now_ms: i64, events: &mut Ve
         if super::kit::text_link(ui, "All activity ↗", 12.0).clicked() {
             events.push(Event::Tab(Tab::Activity));
         }
+        if super::kit::text_link(ui, "Recent files ↗", 12.0).clicked() {
+            events.push(Event::Tab(Tab::Files));
+        }
     });
     ui.add_space(8.0);
     match &o.recent {

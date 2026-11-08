@@ -16,6 +16,7 @@ use egui_kittest::kittest::Queryable;
 use super::*;
 use crate::agent::fake::FakeAgent;
 use crate::agent::{Agent, Starter, call};
+use crate::files::{Place, RecentFile};
 use crate::model::{Effect, JoinDefaults, Model, Screen, Tab, TrashKind};
 
 /// The time the screens are drawn at.
@@ -523,6 +524,108 @@ fn trash_buttons_send_restore_and_confirmation_events() {
     let events = std::mem::take(&mut h.state_mut().1);
     assert!(events.iter().any(|e| matches!(e, Event::RestoreTrash(_))), "{events:?}");
     assert!(events.contains(&Event::ConfirmRemoveTrash(craft_cloud_app::NodeId::from_uuid(Uuid::nil()))), "{events:?}");
+}
+
+fn recent(app: &str, path: &str, title: &str, machine: &str, ago_ms: i64, place: Place) -> RecentFile {
+    RecentFile {
+        app: app.into(),
+        entry: craft_cloud_app::RecentEntry {
+            node: None,
+            path: path.into(),
+            title: title.into(),
+            opened_ms: NOW - ago_ms,
+            saved_ms: None,
+            machine: machine.into(),
+        },
+        place,
+    }
+}
+
+fn files_list() -> Vec<RecentFile> {
+    vec![
+        recent("wordcraft", "Letters/quarterly-letter.docx", "quarterly-letter.docx", "lptp1", 20 * 60_000, Place::Here),
+        recent("photocraft", "art/2026/cover.psd", "cover.psd", "BEAST", 2 * 3_600_000, Place::NotYet),
+        recent("filmcraft", "film/trailer.fcproj", "trailer.fcproj", "studio-mac", 5 * 3_600_000, Place::NotYet),
+        recent("photocraft", "art/2026/poster-draft.psd", "poster-draft.psd", "lptp1", 26 * 3_600_000, Place::Here),
+        recent("vectorcraft", "brand/logo.vcraft", "logo.vcraft", "BEAST", 4 * 86_400_000, Place::Outside),
+    ]
+}
+
+/// The Files page after its answer: the list, or (`None`) the agent not answering.
+fn files_model(list: Option<Vec<RecentFile>>) -> Model {
+    let mut model = signed_in_model(signed_in());
+    let effects = model.update(Event::Tab(Tab::Files));
+    let ticket = match effects.first() {
+        Some(Effect::Recents { ticket, .. }) => *ticket,
+        _ => 0,
+    };
+    let result = list.ok_or_else(|| Error::NotRunning("can't reach it: connection refused".into()));
+    model.update(Event::Recents { ticket, result });
+    model
+}
+
+#[test]
+fn snapshot_files() {
+    snapshot(files_model(Some(files_list())), egui::Theme::Light, "files-loaded");
+    snapshot(files_model(Some(files_list())), egui::Theme::Dark, "files-loaded-dark");
+    snapshot_sized(files_model(Some(files_list())), egui::Theme::Light, "files-small", crate::ui::MIN_WINDOW_SIZE);
+    snapshot(files_model(Some(Vec::new())), egui::Theme::Light, "files-empty");
+    snapshot(files_model(None), egui::Theme::Light, "files-failed");
+    let mut filtered = files_model(Some(files_list()));
+    filtered.update(Event::FilesApp(Some("photocraft".into())));
+    snapshot(filtered.clone(), egui::Theme::Light, "files-filtered");
+    filtered.update(Event::FilesSearch("poster".into()));
+    snapshot(filtered, egui::Theme::Light, "files-searched");
+    let mut nothing = files_model(Some(files_list()));
+    nothing.update(Event::FilesSearch("no such file".into()));
+    snapshot(nothing, egui::Theme::Light, "files-no-match");
+    let mut problem = files_model(Some(files_list()));
+    problem.update(Event::OpenRecent { app: "photocraft".into(), path: "art/2026/cover.psd".into() });
+    snapshot(problem, egui::Theme::Light, "files-open-problem");
+    let mut loading = signed_in_model(signed_in());
+    loading.update(Event::Tab(Tab::Files));
+    snapshot(loading, egui::Theme::Light, "files-loading");
+}
+
+/// Open is a working button only for a file that is here; the others send nothing. The filter sends its app.
+#[test]
+fn the_files_buttons_send_open_and_the_filter() {
+    let mut h = harness(files_model(Some(files_list())), egui::Theme::Light);
+    h.run_steps(2);
+    let opens: Vec<_> = h.query_all_by_label("Open").collect();
+    assert_eq!(opens.len(), 5);
+    for open in opens {
+        open.click();
+    }
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    let sent: Vec<&Event> = events.iter().filter(|e| matches!(e, Event::OpenRecent { .. })).collect();
+    assert_eq!(
+        sent,
+        [
+            &Event::OpenRecent { app: "wordcraft".into(), path: "Letters/quarterly-letter.docx".into() },
+            &Event::OpenRecent { app: "photocraft".into(), path: "art/2026/poster-draft.psd".into() },
+        ],
+        "only the files that are here"
+    );
+    // The first is the filter's segment (the tags of the rows come after it).
+    h.query_all_by_label("PhotoCraft").next().unwrap().click();
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    assert!(events.contains(&Event::FilesApp(Some("photocraft".into()))), "{events:?}");
+    h.get_by_label("Refresh").click();
+    h.run_steps(2);
+    assert!(std::mem::take(&mut h.state_mut().1).contains(&Event::LoadFiles));
+}
+
+/// The overview's "Recent files" link opens the Files tab.
+#[test]
+fn the_overview_links_to_the_files() {
+    let mut h = harness(overview_model(), egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_label("Recent files ↗").click();
+    h.run_steps(2);
+    assert!(std::mem::take(&mut h.state_mut().1).contains(&Event::Tab(Tab::Files)));
 }
 
 #[test]
@@ -1175,6 +1278,7 @@ fn snapshot_tabs() {
     let pages = [
         ("overview", overview_model()),
         ("versions", versions_model(true)),
+        ("files", files_model(Some(files_list()))),
         ("trash", trash_model(true)),
         ("computers", computers),
         ("security", after(&FakeAgent::new(signed_in()), vec![Event::Devices(Ok(devices())), Event::OpenSecurity])),
@@ -1185,6 +1289,7 @@ fn snapshot_tabs() {
         let expected = match name {
             "overview" => Tab::Overview,
             "versions" => Tab::Versions,
+            "files" => Tab::Files,
             "trash" => Tab::Trash,
             "computers" => Tab::Computers,
             "security" => Tab::Security,
@@ -1202,7 +1307,7 @@ fn snapshot_tabs() {
 fn the_header_has_the_tabs_the_account_line_and_the_footer_its_buttons() {
     let mut h = harness(overview_model(), egui::Theme::Light);
     h.run_steps(2);
-    for label in ["Overview", "Versions", "Trash", "Computers", "Security", "Activity"] {
+    for label in ["Overview", "Files", "Versions", "Trash", "Computers", "Security", "Activity"] {
         assert_eq!(h.query_all_by_label(label).count(), 1, "{label}");
     }
     assert_eq!(h.query_all_by_label("Admin").count(), 0);

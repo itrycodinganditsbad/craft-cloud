@@ -14,8 +14,8 @@ use std::time::Duration;
 use craft_cloud_app::{
     AccountInfo, AccountUsage, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo,
     AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, AuditPage, AuditQuery, Client, DeviceId, DeviceInfo, Error, ExportOutcome,
-    HistoryResponse, JoinRequest, NodeId, PairingInfo, PairingStatus, RecoveryCodes, RestoreResponse, RevokedOthers, Status, TrashResponse,
-    TrashRestoreResponse, TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, UserQuery, Uuid, VersionId,
+    HistoryResponse, JoinRequest, NodeId, PairingInfo, PairingStatus, RecentEntry, RecoveryCodes, RestoreResponse, RevokedOthers, Status,
+    TrashResponse, TrashRestoreResponse, TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, UserQuery, Uuid, VersionId,
 };
 
 use crate::admin::{Action, AdminEvent, Outcome};
@@ -77,6 +77,9 @@ pub trait Agent: Send + Sync {
     fn trash(&self, cursor: Option<&str>) -> Result<TrashResponse, Error>;
     fn restore_from_trash(&self, id: NodeId) -> Result<TrashRestoreResponse, Error>;
     fn remove_from_trash(&self, id: NodeId) -> Result<(), Error>;
+    /// `app`'s recent files now, newest first: the list the account's computers share. Opens the agent's recents
+    /// connection for the one answer and closes it again.
+    fn recents(&self, app: &str) -> Result<Vec<RecentEntry>, Error>;
 }
 
 /// The agent through `craft_cloud_app::Client`. It finds the agent again whenever a call finds it gone (the agent
@@ -253,6 +256,9 @@ impl Agent for ClientAgent {
     fn remove_from_trash(&self, id: NodeId) -> Result<(), Error> {
         self.with(|c| c.remove_from_trash(id))
     }
+    fn recents(&self, app: &str) -> Result<Vec<RecentEntry>, Error> {
+        self.with(|c| c.recents(app))
+    }
 }
 
 /// Starts the agent and waits for it ([`crate::start_agent::start_and_wait`]), for [`Effect::StartAgent`].
@@ -316,6 +322,7 @@ impl Link {
                 Effect::Trash { ticket, .. } => Event::TrashPage { ticket, result: Err(error) },
                 Effect::RestoreTrash { ticket, .. } => Event::TrashRestored { ticket, result: Err(error) },
                 Effect::RemoveTrash { ticket, .. } => Event::TrashRemoved { ticket, result: Err(error) },
+                Effect::Recents { ticket, .. } => Event::Recents { ticket, result: Err(error) },
                 _ => Event::Polled(Err(error)),
             };
             let _ = self.tx.send(event);
@@ -329,7 +336,13 @@ impl Link {
 fn is_call(effect: &Effect) -> bool {
     !matches!(
         effect,
-        Effect::OpenFolder(_) | Effect::QuitApp | Effect::QuitTray | Effect::AppAutostart(_) | Effect::PickFolder(_) | Effect::PickExportFile { .. }
+        Effect::OpenFolder(_)
+            | Effect::OpenFile(_)
+            | Effect::QuitApp
+            | Effect::QuitTray
+            | Effect::AppAutostart(_)
+            | Effect::PickFolder(_)
+            | Effect::PickExportFile { .. }
     )
 }
 
@@ -358,6 +371,7 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         Effect::Trash { cursor, ticket } => Event::TrashPage { ticket, result: agent.trash(cursor.as_deref()) },
         Effect::RestoreTrash { id, ticket } => Event::TrashRestored { ticket, result: agent.restore_from_trash(id) },
         Effect::RemoveTrash { id, ticket } => Event::TrashRemoved { ticket, result: agent.remove_from_trash(id) },
+        Effect::Recents { root, ticket } => Event::Recents { ticket, result: recent_files(agent, root.as_deref().map(std::path::Path::new)) },
         Effect::Logout { local } => Event::SignedOut(agent.logout(local)),
         Effect::Pause => Event::Answered(agent.pause()),
         Effect::Resume => Event::Answered(agent.resume()),
@@ -394,12 +408,28 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
             SecurityCall::SignOutOthers => SecurityAnswer::SignOutOthers(agent.revoke_other_devices()),
         }),
         Effect::OpenFolder(_)
+        | Effect::OpenFile(_)
         | Effect::QuitApp
         | Effect::QuitTray
         | Effect::AppAutostart(_)
         | Effect::PickFolder(_)
         | Effect::PickExportFile { .. } => return None,
     })
+}
+
+/// The recent files of every app of the suite ([`crate::files::APPS`]), asked for one after the other, each placed against the
+/// synced folder `root`. When the agent can't be reached the first list says so and the rest aren't asked for.
+fn recent_files(agent: &dyn Agent, root: Option<&std::path::Path>) -> Result<Vec<crate::files::RecentFile>, Error> {
+    let mut lists = Vec::new();
+    for (app, _) in crate::files::APPS {
+        let list = agent.recents(app);
+        let gone = matches!(list, Err(Error::NotRunning(_) | Error::Io(_) | Error::Protocol(_) | Error::Version(_)));
+        lists.push((app.to_owned(), list));
+        if gone {
+            break;
+        }
+    }
+    crate::files::merge(lists, |path| crate::files::place(root, path))
 }
 
 /// Writes the audit export to `path`: first to a file of its own in the same folder, created for this export alone (it must not
@@ -526,6 +556,9 @@ pub(crate) mod fake {
         /// An export that the server cuts at its limit; and failures an export answers instead of succeeding.
         pub export_truncated: Mutex<bool>,
         pub export_fails: Mutex<Vec<Error>>,
+        /// The recent files of each app (by the name of its list), and the apps whose list is refused.
+        pub recent_files: Mutex<Vec<(String, Vec<RecentEntry>)>>,
+        pub recents_refused: Mutex<Vec<String>>,
     }
 
     fn refused(code: &str, message: &str) -> Error {
@@ -552,6 +585,8 @@ pub(crate) mod fake {
                 audit_queries: Mutex::new(Vec::new()),
                 export_truncated: Mutex::new(false),
                 export_fails: Mutex::new(Vec::new()),
+                recent_files: Mutex::new(Vec::new()),
+                recents_refused: Mutex::new(Vec::new()),
             }
         }
 
@@ -980,6 +1015,13 @@ pub(crate) mod fake {
         fn remove_from_trash(&self, _id: NodeId) -> Result<(), Error> {
             self.answer("remove_from_trash", |_| ())
         }
+        fn recents(&self, app: &str) -> Result<Vec<RecentEntry>, Error> {
+            self.answer("recents", |_| ())?;
+            if self.recents_refused.lock().unwrap().iter().any(|a| a == app) {
+                return Err(refused("quota_exceeded", "this list can't be followed"));
+            }
+            Ok(self.recent_files.lock().unwrap().iter().find(|(a, _)| a == app).map(|(_, list)| list.clone()).unwrap_or_default())
+        }
     }
 
     /// An enabled member account that stores nothing.
@@ -1043,6 +1085,51 @@ mod tests {
         let tick = model.update(Event::Tick { now_ms: 4_000 });
         settle(&mut model, &agent, tick);
         assert!(matches!(model.screen, Screen::SignedIn(_)), "{:?}", model.screen);
+    }
+
+    /// The Files page against the fake: every app's list is asked for, merged newest first and placed against the
+    /// synced folder; a list the agent refuses is skipped, and an agent that is gone is an error at the first list.
+    #[test]
+    fn the_files_page_gets_the_lists_of_every_app_placed_on_this_computer() {
+        use crate::files::Place;
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("here.docx"), b"x").unwrap();
+        let agent = FakeAgent::new(Status { folder: Some(folder.path().display().to_string()), ..signed_in() });
+        let entry = |path: &str, opened_ms| craft_cloud_app::RecentEntry {
+            node: None,
+            path: path.into(),
+            title: String::new(),
+            opened_ms,
+            saved_ms: None,
+            machine: "BEAST".into(),
+        };
+        *agent.recent_files.lock().unwrap() = vec![
+            ("wordcraft".into(), vec![entry("here.docx", 20), entry("missing.docx", 10)]),
+            ("photocraft".into(), vec![entry("../escape.psd", 30)]),
+        ];
+        *agent.recents_refused.lock().unwrap() = vec!["soundcraft".into()];
+        let mut model = Model::new(crate::model::JoinDefaults::default(), true, "run.log".into());
+        let first = model.update(Event::Start);
+        settle(&mut model, &agent, first);
+        let open = model.update(Event::Tab(crate::model::Tab::Files));
+        settle(&mut model, &agent, open);
+        let Screen::Files(files) = &model.screen else { panic!("{:?}", model.screen) };
+        assert!(files.error.is_none() && !files.loading, "{files:?}");
+        let got: Vec<(&str, &str, Place)> = files.list.iter().flatten().map(|f| (f.app.as_str(), f.entry.path.as_str(), f.place)).collect();
+        assert_eq!(
+            got,
+            [("photocraft", "../escape.psd", Place::Outside), ("wordcraft", "here.docx", Place::Here), ("wordcraft", "missing.docx", Place::NotYet)]
+        );
+        let asked = agent.asked.lock().unwrap().iter().filter(|a| *a == "recents").count();
+        assert_eq!(asked, crate::files::APPS.len(), "each app's list once");
+
+        agent.gone.store(true, Ordering::SeqCst);
+        agent.asked.lock().unwrap().clear();
+        let again = model.update(Event::LoadFiles);
+        settle(&mut model, &agent, again);
+        let Screen::Files(files) = &model.screen else { panic!("{:?}", model.screen) };
+        assert!(files.error.is_some(), "{files:?}");
+        assert_eq!(agent.asked.lock().unwrap().iter().filter(|a| *a == "recents").count(), 1, "the rest aren't asked once the agent is gone");
     }
 
     /// The link runs a call on a thread, wakes the UI, and hands the answer over; other effects come back at once.

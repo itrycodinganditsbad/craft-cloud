@@ -20,6 +20,7 @@ pub mod agent;
 pub mod app;
 pub mod audit;
 pub mod autostart;
+pub mod files;
 pub mod model;
 pub mod names;
 pub mod security;

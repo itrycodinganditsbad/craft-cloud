@@ -17,6 +17,7 @@ use craft_cloud_proto::join::JoinString;
 
 use crate::admin::{Access, Action, AdminEvent, AdminScreen};
 use crate::audit::{ActivityScreen, AuditMsg};
+use crate::files::{Files, Place, RecentFile};
 use crate::names::Names;
 use crate::security::{SecondFactorForm, SecurityAnswer, SecurityCall, SecurityEvent, SecurityPage, Step as SecurityStep};
 
@@ -67,6 +68,8 @@ pub enum Screen {
     Versions(Versions),
     /// Deleted files and folders awaiting retention expiry.
     Trash(Trash),
+    /// The recent files of every Craft app, on every computer of the account.
+    Files(Files),
     /// Showing an add-a-computer code.
     AddingComputer(Adding),
     /// The admin pages (an admin's only): the users, one user, a new account, the audit log.
@@ -163,6 +166,8 @@ pub enum Tab {
     Overview,
     /// File version history ([`Screen::Versions`]).
     Versions,
+    /// The recent files of every app ([`Screen::Files`]).
+    Files,
     Trash,
     /// The account's computers, in full ([`OverviewPage::Computers`]).
     Computers,
@@ -179,6 +184,7 @@ impl Tab {
         match self {
             Tab::Overview => "Overview",
             Tab::Versions => "Versions",
+            Tab::Files => "Files",
             Tab::Trash => "Trash",
             Tab::Computers => "Computers",
             Tab::Security => "Security",
@@ -458,10 +464,31 @@ pub enum Event {
     OpenFolder,
     OpenVersions,
     OpenTrash,
+    /// The Files tab: asks for the recent files of every app.
+    OpenFiles,
+    /// The Files page's Refresh.
+    LoadFiles,
+    /// The Files page's app filter (`None`: all apps).
+    FilesApp(Option<String>),
+    /// The Files page's search field, as typed.
+    FilesSearch(String),
+    /// [`Effect::Recents`]'s answer.
+    Recents {
+        ticket: u64,
+        result: Result<Vec<RecentFile>, Error>,
+    },
+    /// Open the file of this app's list at this path (relative to the synced folder) with the OS's default program.
+    OpenRecent {
+        app: String,
+        path: String,
+    },
+    /// [`Effect::OpenFile`]'s outcome: why the OS couldn't be asked, if it couldn't.
+    FileOpened(Result<(), String>),
     VersionsPath(String),
     LoadVersions,
     NextVersions,
     BackVersions,
+    BackFiles,
     ConfirmRestore(VersionId),
     CancelRestore,
     RestoreVersion,
@@ -568,6 +595,14 @@ pub enum Effect {
     PickFolder(String),
     /// Open the synced folder in the file manager.
     OpenFolder(String),
+    /// Open this file (the full path, checked by [`crate::files::resolve`]) with the OS's default program
+    /// ([`Event::FileOpened`]).
+    OpenFile(String),
+    /// The recent files of every app, placed against the synced folder `root` ([`Event::Recents`]).
+    Recents {
+        root: Option<String>,
+        ticket: u64,
+    },
     /// End the app (the agent keeps running unless [`Effect::QuitAgent`] came first).
     QuitApp,
     /// Write (`true`) or remove the app's own start-at-login entry.
@@ -674,6 +709,7 @@ pub struct Model {
     app_autostart: Option<bool>,
     versions_ticket: u64,
     trash_ticket: u64,
+    files_ticket: u64,
     usage_request_id: u64,
     /// What the last admin check said for the sign-in. The pages that don't carry the signed-in view (versions, trash)
     /// read it for the header's Admin tab, and a view made when they are left starts with it.
@@ -702,6 +738,7 @@ impl Model {
             app_autostart: None,
             versions_ticket: 0,
             trash_ticket: 0,
+            files_ticket: 0,
             usage_request_id: 0,
             access: Access::Unknown,
             names: Names::default(),
@@ -745,6 +782,7 @@ impl Model {
             Screen::AddingComputer(_) => Some(Tab::Computers),
             Screen::Versions(_) => Some(Tab::Versions),
             Screen::Trash(_) => Some(Tab::Trash),
+            Screen::Files(_) => Some(Tab::Files),
             Screen::Security(_) => Some(Tab::Security),
             Screen::Activity(_) => Some(Tab::Activity),
             Screen::Admin(_) => Some(Tab::Admin),
@@ -754,7 +792,7 @@ impl Model {
 
     /// The header's tabs: all the pages, the admin pages for an admin only.
     pub fn tabs(&self) -> Vec<Tab> {
-        let all = [Tab::Overview, Tab::Versions, Tab::Trash, Tab::Computers, Tab::Security, Tab::Activity, Tab::Admin];
+        let all = [Tab::Overview, Tab::Files, Tab::Versions, Tab::Trash, Tab::Computers, Tab::Security, Tab::Activity, Tab::Admin];
         all.into_iter().filter(|t| *t != Tab::Admin || self.is_admin()).collect()
     }
 
@@ -780,6 +818,7 @@ impl Model {
         let mut effects = match &self.screen {
             Screen::Versions(_) => self.update(Event::BackVersions),
             Screen::Trash(_) => self.update(Event::BackTrash),
+            Screen::Files(_) => self.update(Event::BackFiles),
             Screen::Security(_) => self.security(SecurityEvent::Close),
             Screen::Activity(_) => self.audit(AuditMsg::CloseActivity),
             Screen::Admin(_) => self.admin(AdminEvent::Close),
@@ -792,6 +831,7 @@ impl Model {
             Tab::Overview | Tab::Computers => Vec::new(),
             Tab::Versions => self.update(Event::OpenVersions),
             Tab::Trash => self.update(Event::OpenTrash),
+            Tab::Files => self.update(Event::OpenFiles),
             Tab::Security => self.update(Event::OpenSecurity),
             Tab::Activity => self.audit(AuditMsg::OpenActivity),
             Tab::Admin => self.admin(AdminEvent::Open),
@@ -1128,6 +1168,59 @@ impl Model {
             Event::TrashSearch(search) => {
                 if let Screen::Trash(t) = &mut self.screen {
                     t.search = search;
+                }
+                Vec::new()
+            }
+            Event::OpenFiles => {
+                if !matches!(self.screen, Screen::SignedIn(_)) {
+                    return Vec::new();
+                }
+                self.screen = Screen::Files(Files::default());
+                self.request_files()
+            }
+            Event::LoadFiles => self.request_files(),
+            Event::FilesApp(app) => {
+                if let Screen::Files(f) = &mut self.screen {
+                    f.app = app;
+                }
+                Vec::new()
+            }
+            Event::FilesSearch(search) => {
+                if let Screen::Files(f) = &mut self.screen {
+                    f.search = search;
+                }
+                Vec::new()
+            }
+            Event::BackFiles => {
+                if matches!(self.screen, Screen::Files(_)) {
+                    self.files_ticket = self.files_ticket.saturating_add(1);
+                    return self.back_to_overview();
+                }
+                Vec::new()
+            }
+            Event::Recents { ticket, result } => {
+                let Screen::Files(files) = &mut self.screen else { return Vec::new() };
+                if files.ticket != ticket {
+                    return Vec::new();
+                }
+                files.loading = false;
+                match result {
+                    Ok(list) => {
+                        files.list = Some(list);
+                        files.error = None;
+                        // A filter for an app that has no files any more would show nothing and offer no way back.
+                        if files.app.is_some() && !files.counts().1.iter().any(|(app, _)| Some(app) == files.app.as_ref()) {
+                            files.app = None;
+                        }
+                    }
+                    Err(e) => files.error = Some(message(&e)),
+                }
+                Vec::new()
+            }
+            Event::OpenRecent { app, path } => self.open_recent(&app, &path),
+            Event::FileOpened(result) => {
+                if let (Screen::Files(files), Err(why)) = (&mut self.screen, result) {
+                    files.open_error = Some(format!("Couldn't open the file: {why}"));
                 }
                 Vec::new()
             }
@@ -1671,6 +1764,43 @@ impl Model {
         versions.loading = true;
         versions.error = None;
         vec![Effect::History { path: path.to_owned(), cursor, ticket: versions.ticket }]
+    }
+
+    fn request_files(&mut self) -> Vec<Effect> {
+        let root = self.status.as_ref().and_then(|s| s.folder.clone());
+        let Screen::Files(files) = &mut self.screen else { return Vec::new() };
+        if files.loading {
+            return Vec::new();
+        }
+        self.files_ticket = self.files_ticket.saturating_add(1);
+        files.ticket = self.files_ticket;
+        files.loading = true;
+        files.error = None;
+        files.open_error = None;
+        vec![Effect::Recents { root, ticket: files.ticket }]
+    }
+
+    /// Opens a recent file with the OS's default program, if it is in the synced folder here: the path is joined to the
+    /// folder and checked again ([`crate::files::resolve`]) however the list placed it. Otherwise the page says why not.
+    fn open_recent(&mut self, app: &str, path: &str) -> Vec<Effect> {
+        let root = self.status.as_ref().and_then(|s| s.folder.clone());
+        let Screen::Files(files) = &mut self.screen else { return Vec::new() };
+        let Some(file) = files.list.iter().flatten().find(|f| f.app == app && f.entry.path == path) else { return Vec::new() };
+        let place = file.place;
+        let path = file.entry.path.clone();
+        files.open_error = None;
+        let outcome = match (place, root) {
+            (Place::Here, Some(root)) => crate::files::resolve(Path::new(&root), &path),
+            (Place::Here, None) => Err(Place::NotYet),
+            (place, _) => Err(place),
+        };
+        match outcome {
+            Ok(full) => vec![Effect::OpenFile(full.to_string_lossy().into_owned())],
+            Err(place) => {
+                files.open_error = place.reason().map(|why| format!("Can't open this file: {why}."));
+                Vec::new()
+            }
+        }
     }
 
     fn request_trash(&mut self, cursor: Option<String>) -> Vec<Effect> {
@@ -2760,7 +2890,7 @@ pub(crate) mod tests {
     /// The footer's Sign out is there on every page of the signed-in window, and so are its problem and the offer.
     #[test]
     fn sign_out_works_from_every_page_and_its_problem_is_kept_there() {
-        for tab in [Tab::Versions, Tab::Trash, Tab::Security, Tab::Activity, Tab::Computers] {
+        for tab in [Tab::Files, Tab::Versions, Tab::Trash, Tab::Security, Tab::Activity, Tab::Computers] {
             let mut m = signed_in();
             m.update(Event::Tab(tab));
             assert_eq!(m.tab(), Some(tab));
@@ -2923,7 +3053,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_tabs_list_the_pages_and_the_admin_pages_for_an_admin_only() {
-        let member = [Tab::Overview, Tab::Versions, Tab::Trash, Tab::Computers, Tab::Security, Tab::Activity];
+        let member = [Tab::Overview, Tab::Files, Tab::Versions, Tab::Trash, Tab::Computers, Tab::Security, Tab::Activity];
         assert_eq!(signed_in().tabs(), member);
         let mut admin = member.to_vec();
         admin.push(Tab::Admin);
@@ -2935,6 +3065,7 @@ pub(crate) mod tests {
     #[test]
     fn a_tab_asks_for_what_the_button_it_replaces_asked_for() {
         let cases = [
+            (Tab::Files, Event::OpenFiles),
             (Tab::Versions, Event::OpenVersions),
             (Tab::Trash, Event::OpenTrash),
             (Tab::Security, Event::OpenSecurity),
@@ -3175,5 +3306,179 @@ pub(crate) mod tests {
         let effects = m.update(Event::Tab(Tab::Overview));
         assert!(effects.iter().any(|e| matches!(e, Effect::Recent { .. })), "{effects:?}");
         assert_eq!(m.overview().unwrap().recent, Recent::Loading);
+    }
+
+    fn recent_file(app: &str, path: &str, title: &str, opened_ms: i64, place: Place) -> RecentFile {
+        RecentFile {
+            app: app.into(),
+            entry: craft_cloud_app::RecentEntry {
+                node: None,
+                path: path.into(),
+                title: title.into(),
+                opened_ms,
+                saved_ms: None,
+                machine: "BEAST".into(),
+            },
+            place,
+        }
+    }
+
+    fn files_list() -> Vec<RecentFile> {
+        vec![
+            recent_file("wordcraft", "Letters/letter.docx", "Letter", 30, Place::Here),
+            recent_file("photocraft", "art/cover.psd", "cover.psd", 20, Place::NotYet),
+            recent_file("wordcraft", "memo.docx", "Memo", 10, Place::Here),
+        ]
+    }
+
+    /// The Files page after its list came.
+    fn files_loaded() -> Model {
+        let mut m = signed_in();
+        let effects = m.update(Event::Tab(Tab::Files));
+        let [Effect::Recents { ticket, .. }] = effects.as_slice() else { panic!("{effects:?}") };
+        assert!(m.update(Event::Recents { ticket: *ticket, result: Ok(files_list()) }).is_empty());
+        m
+    }
+
+    fn files_page(m: &Model) -> &Files {
+        let Screen::Files(files) = &m.screen else { panic!("{:?}", m.screen) };
+        files
+    }
+
+    #[test]
+    fn the_files_page_asks_for_the_recent_files_when_it_opens_and_not_on_the_overview() {
+        let mut m = model();
+        m.update(Event::Start);
+        let overview = m.update(Event::Found(Ok(status(true))));
+        assert!(!overview.iter().any(|e| matches!(e, Effect::Recents { .. })), "{overview:?}");
+        let effects = m.update(Event::Tab(Tab::Files));
+        assert_eq!(effects, vec![Effect::Recents { root: Some("/home/ana/Craft Cloud".into()), ticket: 1 }]);
+        assert!(files_page(&m).loading && files_page(&m).list.is_none());
+        assert_eq!(m.tab(), Some(Tab::Files));
+    }
+
+    #[test]
+    fn recent_files_load_once_at_a_time_and_stale_answers_are_ignored() {
+        let mut m = signed_in();
+        m.update(Event::Tab(Tab::Files));
+        assert!(m.update(Event::LoadFiles).is_empty(), "one at a time");
+        assert!(m.update(Event::Recents { ticket: 9, result: Ok(files_list()) }).is_empty());
+        assert!(files_page(&m).loading && files_page(&m).list.is_none(), "another ticket's answer is ignored");
+        m.update(Event::Recents { ticket: 1, result: Ok(files_list()) });
+        assert!(!files_page(&m).loading);
+        assert_eq!(files_page(&m).list.as_ref().map(Vec::len), Some(3));
+        // Refresh asks again, with a new ticket.
+        assert_eq!(m.update(Event::LoadFiles), vec![Effect::Recents { root: Some("/home/ana/Craft Cloud".into()), ticket: 2 }]);
+        // Leaving the page drops an answer that is still on its way.
+        m.update(Event::Tab(Tab::Overview));
+        assert!(m.update(Event::Recents { ticket: 2, result: Ok(Vec::new()) }).is_empty());
+        assert!(matches!(m.screen, Screen::SignedIn(_)));
+    }
+
+    #[test]
+    fn recent_files_that_cant_be_had_are_a_problem_and_an_empty_list_is_not() {
+        let mut m = signed_in();
+        m.update(Event::Tab(Tab::Files));
+        m.update(Event::Recents { ticket: 1, result: Err(Error::NotRunning("connection refused".into())) });
+        let files = files_page(&m);
+        assert!(!files.loading && files.list.is_none() && files.error.as_deref().is_some_and(|e| e.contains("connection refused")), "{files:?}");
+        m.update(Event::LoadFiles);
+        assert!(files_page(&m).error.is_none(), "asking again clears it");
+        m.update(Event::Recents { ticket: 2, result: Ok(Vec::new()) });
+        let files = files_page(&m);
+        assert!(files.error.is_none() && files.list.as_deref() == Some(&[][..]));
+    }
+
+    #[test]
+    fn the_files_filter_and_search_narrow_the_loaded_list_without_asking_again() {
+        let mut m = files_loaded();
+        assert_eq!(files_page(&m).counts(), (3, vec![("photocraft".into(), 1), ("wordcraft".into(), 2)]));
+        assert!(m.update(Event::FilesApp(Some("wordcraft".into()))).is_empty());
+        assert_eq!(files_page(&m).visible().len(), 2);
+        assert!(m.update(Event::FilesSearch("LETTERS/".into())).is_empty());
+        let names: Vec<&str> = files_page(&m).visible().iter().map(|f| f.name()).collect();
+        assert_eq!(names, ["Letter"], "the path is searched too");
+        m.update(Event::FilesApp(None));
+        m.update(Event::FilesSearch("cover".into()));
+        assert_eq!(files_page(&m).visible().len(), 1);
+        // A refresh that no longer has the filtered app's files shows all again.
+        m.update(Event::FilesSearch(String::new()));
+        m.update(Event::FilesApp(Some("photocraft".into())));
+        m.update(Event::LoadFiles);
+        m.update(Event::Recents { ticket: 2, result: Ok(vec![recent_file("wordcraft", "memo.docx", "Memo", 1, Place::Here)]) });
+        assert_eq!(files_page(&m).app, None);
+        assert_eq!(files_page(&m).visible().len(), 1);
+    }
+
+    #[test]
+    fn open_asks_the_os_for_a_file_that_is_here_inside_the_synced_folder() {
+        let mut m = files_loaded();
+        let want = Path::new("/home/ana/Craft Cloud").join("Letters").join("letter.docx").to_string_lossy().into_owned();
+        let effects = m.update(Event::OpenRecent { app: "wordcraft".into(), path: "Letters/letter.docx".into() });
+        assert_eq!(effects, vec![Effect::OpenFile(want)]);
+        assert!(files_page(&m).open_error.is_none());
+        // Whatever the OS says of it comes back.
+        assert!(m.update(Event::FileOpened(Ok(()))).is_empty());
+        assert!(files_page(&m).open_error.is_none());
+        assert!(m.update(Event::FileOpened(Err("xdg-open didn't start: not found".into()))).is_empty());
+        assert_eq!(files_page(&m).open_error.as_deref(), Some("Couldn't open the file: xdg-open didn't start: not found"));
+    }
+
+    #[test]
+    fn open_refuses_a_file_that_is_not_here_and_says_why() {
+        let mut m = files_loaded();
+        assert!(m.update(Event::OpenRecent { app: "photocraft".into(), path: "art/cover.psd".into() }).is_empty());
+        assert_eq!(files_page(&m).open_error.as_deref(), Some("Can't open this file: Not on this computer yet."));
+        // Nothing is asked of the OS for a file the list doesn't have.
+        assert!(m.update(Event::OpenRecent { app: "wordcraft".into(), path: "art/cover.psd".into() }).is_empty());
+        assert!(m.update(Event::OpenRecent { app: "wordcraft".into(), path: "/etc/passwd".into() }).is_empty());
+    }
+
+    /// A path from the network that gets past the list's placing (a list placed before the folder changed, or a bug) is
+    /// checked again at Open: a root escape, an absolute path, a drive letter and a program are all refused.
+    #[test]
+    fn open_checks_the_path_again_and_refuses_a_root_escape() {
+        for (path, why) in [
+            ("../outside.docx", "Outside the synced folder"),
+            ("a/../../outside.docx", "Outside the synced folder"),
+            ("/etc/passwd", "Outside the synced folder"),
+            ("C:/Windows/win.ini", "Outside the synced folder"),
+            ("..\\outside.docx", "Outside the synced folder"),
+            ("tools/setup.exe", "Programs and scripts aren't opened from here"),
+        ] {
+            let mut m = signed_in();
+            m.update(Event::Tab(Tab::Files));
+            m.update(Event::Recents { ticket: 1, result: Ok(vec![recent_file("wordcraft", path, "x", 1, Place::Here)]) });
+            let effects = m.update(Event::OpenRecent { app: "wordcraft".into(), path: path.into() });
+            assert!(effects.is_empty(), "{path}: {effects:?}");
+            assert_eq!(files_page(&m).open_error.as_deref(), Some(format!("Can't open this file: {why}.").as_str()), "{path}");
+        }
+        // Placed outside, as a program or not here, a file is not opened whatever its path looks like.
+        for place in [Place::Outside, Place::Program, Place::NotYet] {
+            let mut m = signed_in();
+            m.update(Event::Tab(Tab::Files));
+            m.update(Event::Recents { ticket: 1, result: Ok(vec![recent_file("wordcraft", "ok.docx", "x", 1, place)]) });
+            assert!(m.update(Event::OpenRecent { app: "wordcraft".into(), path: "ok.docx".into() }).is_empty(), "{place:?}");
+            assert!(files_page(&m).open_error.is_some());
+        }
+        // No synced folder known: nothing to open it from.
+        let mut m = signed_in();
+        m.update(Event::Tab(Tab::Files));
+        m.update(Event::Recents { ticket: 1, result: Ok(files_list()) });
+        m.status = Some(Status { folder: None, ..status(true) });
+        assert!(m.update(Event::OpenRecent { app: "wordcraft".into(), path: "memo.docx".into() }).is_empty());
+        assert!(files_page(&m).open_error.is_some());
+    }
+
+    #[test]
+    fn a_new_load_clears_the_open_problem_and_the_page_is_left_by_any_tab() {
+        let mut m = files_loaded();
+        m.update(Event::FileOpened(Err("no opener".into())));
+        m.update(Event::LoadFiles);
+        assert!(files_page(&m).open_error.is_none());
+        let effects = m.update(Event::Tab(Tab::Computers));
+        assert!(effects.contains(&Effect::Devices), "{effects:?}");
+        assert_eq!(m.tab(), Some(Tab::Computers));
+        assert!(m.update(Event::OpenRecent { app: "wordcraft".into(), path: "memo.docx".into() }).is_empty(), "not on the page any more");
     }
 }

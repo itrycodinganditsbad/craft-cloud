@@ -32,6 +32,9 @@ pub struct App {
 pub trait Host {
     /// Opens `folder` in the file manager.
     fn open_folder(&self, folder: &str);
+    /// Opens the file at `path` (checked by [`crate::files::resolve`]) with the OS's default program; why not, if it can't be
+    /// asked.
+    fn open_file(&self, path: &str) -> Result<(), String>;
     /// Writes (`true`) or removes the app's own start-at-login entry.
     fn set_autostart(&self, on: bool) -> Result<(), String>;
     /// Shows the OS's folder picker at `start`, off the UI thread; the answer is sent to `answer` (then `wake`).
@@ -78,6 +81,12 @@ impl App {
             match self.link.perform(effect) {
                 None => {}
                 Some(Effect::OpenFolder(folder)) => self.host.open_folder(&folder),
+                Some(Effect::OpenFile(path)) => {
+                    let opened = self.host.open_file(&path);
+                    if opened.is_err() {
+                        self.handle(Event::FileOpened(opened), ctx);
+                    }
+                }
                 Some(Effect::QuitTray) => self.host.quit_tray(),
                 Some(Effect::QuitApp) => {
                     self.closing = true;
@@ -175,6 +184,10 @@ impl Host for System {
         open_folder(folder);
     }
 
+    fn open_file(&self, path: &str) -> Result<(), String> {
+        open_file(path)
+    }
+
     fn set_autostart(&self, on: bool) -> Result<(), String> {
         crate::autostart::set_for_this_app(on)
     }
@@ -204,14 +217,24 @@ impl Host for System {
 /// Opens `folder` in the file manager (`explorer`, `open`, `xdg-open`), in a process of its own that nothing waits
 /// for.
 pub fn open_folder(folder: &str) {
-    let opener = if cfg!(windows) {
+    let _ = crate::start_agent::spawn_detached(std::path::Path::new(opener()), &[folder]);
+}
+
+/// Opens `path`, a file, with the OS's default program (the same opener as [`open_folder`]), in a process of its own that
+/// nothing waits for. The caller has checked the path ([`crate::files::resolve`]); an error is the opener not starting.
+pub fn open_file(path: &str) -> Result<(), String> {
+    crate::start_agent::spawn_detached(std::path::Path::new(opener()), &[path]).map_err(|e| format!("{} didn't start: {e}", opener()))
+}
+
+/// The OS's own opener (`explorer`, `open`, `xdg-open`).
+fn opener() -> &'static str {
+    if cfg!(windows) {
         "explorer"
     } else if cfg!(target_vendor = "apple") {
         "open"
     } else {
         "xdg-open"
-    };
-    let _ = crate::start_agent::spawn_detached(std::path::Path::new(opener), &[folder]);
+    }
 }
 
 /// Runs `future` to its end on this thread (the folder picker's, which has nothing else to do meanwhile).
