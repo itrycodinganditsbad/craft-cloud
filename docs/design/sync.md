@@ -95,7 +95,11 @@ can point into the synced folder, and saves are atomic.
   has the same manifest. Limits: files up to 256 GiB, at most 2^20 chunks per manifest. `file_hash` is the BLAKE3 of the whole file, checked after assembly.
 - **Chunk**: up to 4 MiB of bytes. Its **ID is opaque** in the protocol: today the BLAKE3 of the plaintext,
   later possibly a keyed hash for end-to-end encryption, without a protocol redesign. Stored chunks carry a
-  format byte (plain today; room for compression or encryption).
+  format byte: 0 plain, 1 zstd (level 3 by default, 1 to 19 settable, written when it saves at least 5%, also settable, on a blob of 4 KiB or
+  more; turned off for new writes by `compression = "none"` in `[storage]`, read either way; the level is part of the
+  stream, so a stored object tells nothing but its format, and `store recompress` can rewrite it at another level). The ID stays the BLAKE3 of the plain
+  bytes, so deduplication and the protocol don't change; a compressed blob is unpacked with a cap at the kind's
+  size limit and checked like a plain one. Other values are reserved (encryption) and refused.
 - **Chunker parameters** are fixed and named: `fastcdc-v1` = gear table from BLAKE3 key derivation with
   the context `craft-cloud 2026-10-11 fastcdc-v1 gear table`, masks on the top hash bits (21 before the
   average, 19 after), min 256 KiB, avg 1 MiB, max 4 MiB, normalisation level 1. Every version records its parameter set. Changing parameters means a new
@@ -1611,7 +1615,7 @@ From the reviews of M3c, less what their fix rounds did:
 
 Hosted service; collaboration and sharing; locking; a web UI for users' files (the administrators' pages, see "Web admin and browser sessions", are in); mobile; virtual files and on-demand download;
 end-to-end encryption (not built, but chunk IDs are opaque and stored chunks have a format byte so it can
-come later); per-chunk compression (same format byte); a packed small-chunk upload endpoint (one request per
+come later); compression on the wire (blobs are compressed only where they are stored); a packed small-chunk upload endpoint (one request per
 chunk until measurements say otherwise); compatibility with any other sync service.
 
 ## Open questions

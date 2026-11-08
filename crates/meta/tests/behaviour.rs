@@ -148,6 +148,9 @@ on_every_backend!(
     a_failed_restore_walk_is_not_repeated_for_every_operation,
     big_manifests_are_checked_in_batches,
     the_tree_and_the_feed_come_in_pages,
+    physical_sizes_are_unknown_until_recorded_and_totals_say_so,
+    blobs_are_walked_in_pages_and_picked_by_id,
+    server_values_are_set_and_replaced,
     usernames_are_unique_ignoring_ascii_case,
     all_spaces_lists_every_users_space,
     live_documents_number_their_updates_per_space,
@@ -476,6 +479,78 @@ async fn manifests_need_their_chunks_and_are_per_space(meta: &Meta) {
 
 fn random_chunk() -> ChunkId {
     ChunkId::from_bytes(*blake3::hash(uuid::Uuid::now_v7().as_bytes()).as_bytes())
+}
+
+async fn physical_sizes_are_unknown_until_recorded_and_totals_say_so(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let (old, new) = (random_chunk(), random_chunk());
+    meta.add_chunk(ana.space, &old, 1000, NOW).await.unwrap();
+    meta.add_chunk(ana.space, &new, 3000, NOW).await.unwrap();
+    // Nothing is known about either yet: unknown, not zero, and the totals say none of it is known.
+    let rows = meta.blob_page(None, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.physical_size.is_none() && r.level.is_none()));
+    let totals = meta.storage_totals().await.unwrap();
+    assert_eq!((totals.blobs, totals.logical_bytes, totals.known_blobs, totals.known_logical_bytes, totals.known_physical_bytes), (2, 4000, 0, 0, 0));
+
+    meta.set_physical(BlobKind::Chunk, new.as_bytes(), 600, 3).await.unwrap();
+    let totals = meta.storage_totals().await.unwrap();
+    assert_eq!((totals.known_blobs, totals.known_logical_bytes, totals.known_physical_bytes, totals.logical_bytes), (1, 3000, 600, 4000));
+    let row = meta.blob_from(BlobKind::Chunk, new.as_bytes()).await.unwrap().unwrap();
+    assert_eq!((row.id, row.stored_size, row.physical_size, row.level), (*new.as_bytes(), 3000, Some(600), Some(3)));
+    // A measured size leaves the level alone; recording again replaces both.
+    meta.set_measured_size(BlobKind::Chunk, old.as_bytes(), 900).await.unwrap();
+    let row = meta.blob_from(BlobKind::Chunk, old.as_bytes()).await.unwrap().unwrap();
+    assert_eq!((row.physical_size, row.level), (Some(900), None));
+    meta.set_physical(BlobKind::Chunk, new.as_bytes(), 500, 19).await.unwrap();
+    let row = meta.blob_from(BlobKind::Chunk, new.as_bytes()).await.unwrap().unwrap();
+    assert_eq!((row.physical_size, row.level), (Some(500), Some(19)));
+    // Unknown blobs and absent rows are no error and change nothing; the logical size is never touched.
+    meta.set_physical(BlobKind::Manifest, &[9u8; 32], 5, 1).await.unwrap();
+    assert_eq!(meta.storage_totals().await.unwrap().blobs, 2);
+    assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), 4000);
+    // A chunk uploaded again keeps its row (and the size recorded last stays).
+    meta.add_chunk(ana.space, &new, 3000, NOW).await.unwrap();
+    assert_eq!(meta.blob_from(BlobKind::Chunk, new.as_bytes()).await.unwrap().unwrap().physical_size, Some(500));
+}
+
+async fn blobs_are_walked_in_pages_and_picked_by_id(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    assert!(meta.blob_page(None, 10).await.unwrap().is_empty());
+    assert!(meta.blob_from(BlobKind::Chunk, &[0u8; 32]).await.unwrap().is_none());
+    let mut ids: Vec<ChunkId> = (0..7).map(|_| random_chunk()).collect();
+    for id in &ids {
+        meta.add_chunk(ana.space, id, 100, NOW).await.unwrap();
+    }
+    ids.sort_by_key(|id| *id.as_bytes());
+    // Pages of 3 walk all of them once, in ID order.
+    let mut walked = Vec::new();
+    let mut after = None;
+    loop {
+        let page = meta.blob_page(after, 3).await.unwrap();
+        let Some(last) = page.last() else { break };
+        after = Some((last.kind, last.id));
+        assert!(page.len() <= 3);
+        walked.extend(page.iter().map(|r| r.id));
+    }
+    assert_eq!(walked, ids.iter().map(|id| *id.as_bytes()).collect::<Vec<_>>());
+    // Picking by ID: the first at or after, and the first of the kind when there is none after.
+    let first = *ids[0].as_bytes();
+    let last = *ids[6].as_bytes();
+    assert_eq!(meta.blob_from(BlobKind::Chunk, &[0u8; 32]).await.unwrap().unwrap().id, first);
+    assert_eq!(meta.blob_from(BlobKind::Chunk, &last).await.unwrap().unwrap().id, last);
+    assert_eq!(meta.blob_from(BlobKind::Chunk, &[0xffu8; 32]).await.unwrap().unwrap().id, first, "wraps around");
+    assert!(meta.blob_from(BlobKind::Manifest, &[0u8; 32]).await.unwrap().is_none(), "kinds are separate");
+}
+
+async fn server_values_are_set_and_replaced(meta: &Meta) {
+    assert_eq!(meta.server_value("compression_estimate").await.unwrap(), None);
+    meta.set_server_value("compression_estimate", "{\"a\":1}", 10).await.unwrap();
+    assert_eq!(meta.server_value("compression_estimate").await.unwrap(), Some(("{\"a\":1}".to_owned(), 10)));
+    meta.set_server_value("compression_estimate", "two", 20).await.unwrap();
+    meta.set_server_value("other", "x", 30).await.unwrap();
+    assert_eq!(meta.server_value("compression_estimate").await.unwrap(), Some(("two".to_owned(), 20)));
+    assert_eq!(meta.server_value("other").await.unwrap(), Some(("x".to_owned(), 30)));
 }
 
 async fn stored_bytes_are_counted_once_per_space_and_capped(meta: &Meta) {
@@ -2147,6 +2222,10 @@ async fn upgrading_counts_what_each_space_already_stores() {
         for column in ["password_changed_ms", "disabled_ms"] {
             sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE users DROP COLUMN {column}"))).execute(&mut conn).await.unwrap();
         }
+        // And before stored sizes were tracked.
+        sqlx::query("ALTER TABLE blobs DROP COLUMN physical_size").execute(&mut conn).await.unwrap();
+        sqlx::query("ALTER TABLE blobs DROP COLUMN compress_level").execute(&mut conn).await.unwrap();
+        sqlx::query("DROP TABLE server_state").execute(&mut conn).await.unwrap();
         sqlx::query("DELETE FROM schema_version WHERE version >= 2").execute(&mut conn).await.unwrap();
     }
     let meta = Meta::open(&url).await.unwrap();
@@ -2171,7 +2250,7 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 14);
+    assert_eq!(versions, 15);
 }
 
 // ---- device sessions (migration 0007) ----

@@ -22,6 +22,7 @@ pub mod totp;
 pub mod two_factor;
 pub mod verify;
 pub mod web;
+pub mod storage_tools;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
