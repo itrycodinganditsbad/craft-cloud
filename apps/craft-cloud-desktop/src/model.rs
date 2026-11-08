@@ -8,8 +8,9 @@
 use std::path::{Path, PathBuf};
 
 use craft_cloud_app::{
-    AccountUsage, AuditEvent, AuditPage, DeviceId, DeviceInfo, Error, HistoryResponse, JoinRequest, NodeId, PairingInfo, PairingState, PairingStatus,
-    RestoreResponse, RunState, Status, TrashResponse, TrashRestoreResponse, UserQuery, Uuid, VersionId, codes,
+    AccountUsage, AuditEvent, AuditPage, DeviceId, DeviceInfo, Error, HistoryResponse, JoinRequest, LoginRequest, NodeId, PairingInfo, PairingState,
+    PairingStatus, RestoreResponse, RunState, SecondFactorLoginRequest, Status, TrashResponse, TrashRestoreResponse, UserQuery, Uuid, VersionId,
+    codes,
 };
 use craft_cloud_proto::api::AdminConfirm;
 use craft_cloud_proto::api::codes as api_codes;
@@ -31,6 +32,16 @@ pub const STOPPED: &str = "Craft Cloud's background service stopped";
 pub const REMOVED: &str = "This computer was removed from your cloud — Join again";
 /// Start at login couldn't be turned on after a join (the join stands).
 pub const NO_SYNC_AFTER_RESTART: &str = "This computer won't sync after a restart: starting at login couldn't be turned on";
+/// A sign-in needs its fields.
+pub const SERVER_EMPTY: &str = "Type the server's address";
+pub const USER_EMPTY: &str = "Type your user name";
+pub const SIGN_IN_PASSWORD_EMPTY: &str = "Type your password";
+/// The password of a sign-in is not kept: after "this folder has files in it" it is typed again.
+pub const PASSWORD_AGAIN: &str = "Type your password again to sync the folder's files";
+/// The server's answer to a password carried no challenge.
+pub const NO_CHALLENGE: &str = "The server didn't ask for a code the way it should. Try signing in again.";
+/// The challenge of a sign-in ran out.
+pub const CHALLENGE_EXPIRED: &str = "This sign-in can't go on any more (it took too long or had too many wrong codes). Sign in again.";
 /// The two new passwords differ.
 pub const PASSWORDS_DIFFER: &str = "The two passwords aren't the same";
 /// No new password was typed.
@@ -102,11 +113,75 @@ pub enum ProblemAction {
     None,
 }
 
+/// How the first-start screen joins: with the account's name and password, or with a join string.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JoinMode {
+    /// Server, user name and password (and the second factor when the account has one).
+    #[default]
+    SignIn,
+    /// An invite, or the code of a computer that is signed in.
+    JoinString,
+}
+
+/// The page of the first start's form: one of the three steps of the rail.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JoinStep {
+    /// 01: the server's address (a sign-in; a join string names its server itself).
+    #[default]
+    Server,
+    /// 02: user name and password, or the join string.
+    Account,
+    /// 03: the folder and this computer's name; its Continue signs in or joins.
+    Folder,
+}
+
+impl JoinStep {
+    /// Where the step stands in the rail (0 to 2).
+    pub fn index(self) -> usize {
+        match self {
+            Self::Server => 0,
+            Self::Account => 1,
+            Self::Folder => 2,
+        }
+    }
+
+    fn next(self) -> Option<Self> {
+        match self {
+            Self::Server => Some(Self::Account),
+            Self::Account => Some(Self::Folder),
+            Self::Folder => None,
+        }
+    }
+
+    fn prev(self) -> Option<Self> {
+        match self {
+            Self::Server => None,
+            Self::Account => Some(Self::Server),
+            Self::Folder => Some(Self::Account),
+        }
+    }
+}
+
 /// The join form, as typed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct JoinForm {
+    /// The page being shown. The sign-in or join is made from the last one; a problem with an earlier step's field puts
+    /// the form back on that step.
+    pub step: JoinStep,
+    pub mode: JoinMode,
     /// The join string (or the link) as typed or pasted.
     pub join: String,
+    /// Sign-in: the server's address as typed (`https://` is assumed when it has no scheme).
+    pub server: String,
+    /// Sign-in: the account's user name.
+    pub user: String,
+    /// Sign-in: the account's password. Only held while it is typed: it is taken out of the form when the request is
+    /// made, and cleared when the mode changes.
+    pub password: String,
+    /// Sign-in: the server's challenge between the password and the second factor, kept while the code is asked for.
+    pub challenge: Option<String>,
+    /// When the challenge ends (milliseconds since the Unix epoch, as the server said), while there is one.
+    pub challenge_expires_ms: i64,
     pub folder: String,
     pub device_name: String,
     /// What went wrong with the last try, for people.
@@ -118,6 +193,65 @@ pub struct JoinForm {
     pub adopt_for: Option<String>,
 }
 
+impl std::fmt::Debug for JoinForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinForm")
+            .field("step", &self.step)
+            .field("mode", &self.mode)
+            .field("join", &"<redacted>")
+            .field("server", &self.server)
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("challenge", &self.challenge.as_ref().map(|_| "<redacted>"))
+            .field("challenge_expires_ms", &self.challenge_expires_ms)
+            .field("folder", &self.folder)
+            .field("device_name", &self.device_name)
+            .field("error", &self.error)
+            .field("ask_adopt", &self.ask_adopt)
+            .field("adopt_for", &self.adopt_for)
+            .finish()
+    }
+}
+
+/// Whether `address` (`host[:port][/path]`, no scheme) names this computer.
+fn is_loopback_host(address: &str) -> bool {
+    let authority = address.split('/').next().unwrap_or_default();
+    let authority = authority.rsplit('@').next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+        || host.parse::<std::net::Ipv6Addr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether a challenge that ends at `expires_ms` lasts longer than a wait of `retry_after_secs` (unknown: yes).
+fn wait_fits(retry_after_secs: Option<u64>, expires_ms: i64, now_ms: i64) -> bool {
+    let left_ms = u64::try_from(expires_ms.saturating_sub(now_ms)).unwrap_or(0);
+    retry_after_secs.is_none_or(|secs| secs.saturating_mul(1000) < left_ms)
+}
+
+/// Where a step of the first start's rail stands: the steps are strictly in sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RailState {
+    /// Passed.
+    Done,
+    /// The one being asked for.
+    Current,
+    /// Still to come.
+    Later,
+}
+
+/// One step of the first start's rail: what is known of it so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RailStep {
+    pub title: &'static str,
+    /// What is known (or what the step is for, while it is not).
+    pub detail: String,
+    pub state: RailState,
+}
+
 impl JoinForm {
     fn new(defaults: &JoinDefaults) -> Self {
         Self { folder: defaults.folder.clone(), device_name: defaults.device_name.clone(), ..Self::default() }
@@ -126,22 +260,92 @@ impl JoinForm {
     /// The request for the agent: the join string as read (a link, spaces and lower case put right), the folder, the
     /// name (the agent's default when empty), and `adopt` if the user agreed to it for this folder.
     fn request(&self, password: Option<String>) -> JoinRequest {
-        let folder = self.folder.trim().to_owned();
-        let name = self.device_name.trim();
-        JoinRequest {
-            join: self.join.clone(),
-            adopt: self.adopt_for.as_deref() == Some(folder.as_str()),
-            folder: Some(folder),
-            device_name: (!name.is_empty()).then(|| name.to_owned()),
-            password,
-            totp_code: None,
-            recovery_code: None,
-        }
+        let (folder, device_name, adopt) = self.destination();
+        JoinRequest { join: self.join.clone(), adopt, folder: Some(folder), device_name, password, totp_code: None, recovery_code: None }
     }
 
     /// [`JoinForm::request`] with the second factor of an account that has two-factor sign-in.
     fn request_with_factor(&self, password: Option<String>, factor: (Option<String>, Option<String>)) -> JoinRequest {
         JoinRequest { totp_code: factor.0, recovery_code: factor.1, ..self.request(password) }
+    }
+
+    /// The folder, the computer's name (`None`: the agent's default) and whether the user agreed to sync the folder's files.
+    fn destination(&self) -> (String, Option<String>, bool) {
+        let folder = self.folder.trim().to_owned();
+        let name = self.device_name.trim();
+        let adopt = self.adopt_for.as_deref() == Some(folder.as_str());
+        (folder, (!name.is_empty()).then(|| name.to_owned()), adopt)
+    }
+
+    /// The server's address for the agent: as typed, with a scheme when it has none: `http://` for a server on this computer
+    /// (`localhost`, `127.x.x.x`, `[::1]`: the only ones the agent takes without TLS), `https://` for every other.
+    fn server_address(&self) -> String {
+        let typed = self.server.trim();
+        if typed.contains("://") {
+            typed.to_owned()
+        } else if is_loopback_host(typed) {
+            format!("http://{typed}")
+        } else {
+            format!("https://{typed}")
+        }
+    }
+
+    /// The first step of a sign-in; `password` is the one typed (taken out of the form by the caller).
+    fn login_request(&self, password: String) -> LoginRequest {
+        let (folder, device_name, adopt) = self.destination();
+        LoginRequest { server: self.server_address(), user: self.user.trim().to_owned(), password, folder: Some(folder), device_name, adopt }
+    }
+
+    /// The second step of a sign-in, with the code; `None` without a challenge.
+    fn second_step_request(&self, factor: (Option<String>, Option<String>)) -> Option<SecondFactorLoginRequest> {
+        let (folder, device_name, adopt) = self.destination();
+        Some(SecondFactorLoginRequest {
+            server: self.server_address(),
+            user: self.user.trim().to_owned(),
+            folder: Some(folder),
+            device_name,
+            adopt,
+            challenge: self.challenge.clone()?,
+            totp_code: factor.0,
+            recovery_code: factor.1,
+        })
+    }
+
+    /// The rail with the form's own step current.
+    pub fn rail(&self) -> [RailStep; 3] {
+        self.rail_at(self.step.index())
+    }
+
+    /// The three steps of the first start with what is known of each; the steps before `current` are done, the ones after it
+    /// are to come, whatever was typed. No probe of the server is made, so the server is shown as typed (or as the join
+    /// string names it), never as "reachable".
+    pub fn rail_at(&self, current: usize) -> [RailStep; 3] {
+        let state = |n: usize| match n.cmp(&current) {
+            std::cmp::Ordering::Less => RailState::Done,
+            std::cmp::Ordering::Equal => RailState::Current,
+            std::cmp::Ordering::Greater => RailState::Later,
+        };
+        let parsed = JoinString::parse(&self.join).ok();
+        let (server, account) = match self.mode {
+            JoinMode::SignIn => {
+                let server = self.server.trim();
+                let user = self.user.trim();
+                ((!server.is_empty()).then(|| crate::ui::host(server).to_owned()), (!user.is_empty()).then(|| user.to_owned()))
+            }
+            JoinMode::JoinString => {
+                (parsed.as_ref().map(|p| crate::ui::host(&p.server).to_owned()), parsed.as_ref().map(|_| "Join string".to_owned()))
+            }
+        };
+        let folder = self.folder.trim();
+        [
+            RailStep { title: "Server", state: state(0), detail: server.unwrap_or_else(|| "Where your Craft Cloud lives".into()) },
+            RailStep { title: "Account", state: state(1), detail: account.unwrap_or_else(|| "Sign in, or use a join string".into()) },
+            RailStep {
+                title: "Folder and name",
+                state: state(2),
+                detail: if folder.is_empty() { "Where your files live on this computer".into() } else { folder.to_owned() },
+            },
+        ]
     }
 }
 
@@ -454,6 +658,8 @@ pub enum Event {
     /// [`Effect::Status`]'s answer.
     Polled(Result<Status, Error>),
     Joined(Result<Status, Error>),
+    /// [`Effect::Login`]'s and [`Effect::LoginSecondFactor`]'s answer.
+    LoggedIn(Result<Status, Error>),
     AutostartSet(Result<Status, Error>),
     PairingMade(Result<PairingInfo, Error>),
     PairingPolled(Result<PairingStatus, Error>),
@@ -505,8 +711,15 @@ pub enum Event {
     SubmitSecondFactor,
     /// Back from the code field to the join form.
     CancelSecondFactor,
-    /// Join (the form's button, or Enter).
+    /// Join or sign in (the form's button, or Enter).
     SubmitJoin,
+    /// Continue (the button, or Enter) on a step of the first start: checks the step's fields and moves on; on the last step
+    /// it signs in or joins like [`Event::SubmitJoin`].
+    JoinNext,
+    /// Back (the button, or Esc) to the step before; nothing typed is lost.
+    JoinBack,
+    /// The form's switch between Sign in and Join string.
+    SetJoinMode(JoinMode),
     /// The answer to "this folder has files in it: sync them too?".
     SyncExistingFiles(bool),
     SubmitPassword,
@@ -620,6 +833,10 @@ pub enum Effect {
     Security(SecurityCall),
     Status,
     Join(JoinRequest),
+    /// The first step of a sign-in with a password ([`Event::LoggedIn`]).
+    Login(LoginRequest),
+    /// The second step of a sign-in, with the code ([`Event::LoggedIn`]).
+    LoginSecondFactor(SecondFactorLoginRequest),
     SetAutostart(bool),
     Pairing,
     PairingState(Uuid),
@@ -853,6 +1070,20 @@ impl Model {
         vec![Effect::Devices, Effect::Account { session }, self.next_usage_request(), Effect::Recent { session }]
     }
 
+    /// The first start's rail and the step current in it (0 to 2), on the screens of the first start. The code of a
+    /// two-factor sign-in and an invite's new password belong to the account step; the join in progress after them as well.
+    pub fn first_run_rail(&self) -> Option<(usize, [RailStep; 3])> {
+        let (form, current) = match &self.screen {
+            Screen::Join(form) => (form, form.step.index()),
+            Screen::Joining { form, password: None } => (form, form.step.index()),
+            Screen::Joining { form, password: Some(_) } => (form, JoinStep::Account.index()),
+            Screen::PasswordNeeded(pw) => (&pw.form, JoinStep::Account.index()),
+            Screen::SecondFactor(second) => (&second.form, JoinStep::Account.index()),
+            _ => return None,
+        };
+        Some((current, form.rail_at(current)))
+    }
+
     /// The tab of the page shown, in the signed-in window.
     pub fn tab(&self) -> Option<Tab> {
         match &self.screen {
@@ -976,7 +1207,7 @@ impl Model {
                     }
                 }
             }
-            Event::Joined(result) => self.joined(result),
+            Event::Joined(result) | Event::LoggedIn(result) => self.joined(result),
             Event::AutostartSet(Ok(status)) => {
                 self.autostart_problem = (status.autostart == Some(false)).then(|| NO_SYNC_AFTER_RESTART.to_owned());
                 self.status_came(status)
@@ -1208,12 +1439,39 @@ impl Model {
                 if let Screen::SecondFactor(form) = &self.screen {
                     self.screen = match &form.password {
                         Some(pw) => Screen::PasswordNeeded(pw.clone()),
-                        None => Screen::Join(form.form.clone()),
+                        None => {
+                            // A sign-in's password is not kept: it is typed again on the account step.
+                            let step = if form.form.mode == JoinMode::SignIn { JoinStep::Account } else { form.form.step };
+                            Screen::Join(JoinForm { challenge: None, password: String::new(), step, ..form.form.clone() })
+                        }
                     };
                 }
                 Vec::new()
             }
             Event::SubmitJoin => self.submit_join(),
+            Event::JoinNext => self.join_next(),
+            Event::JoinBack => {
+                if let Screen::Join(form) = &mut self.screen
+                    && let Some(step) = form.step.prev()
+                {
+                    form.step = step;
+                    form.error = None;
+                    form.ask_adopt = false;
+                }
+                Vec::new()
+            }
+            Event::SetJoinMode(mode) => {
+                if let Screen::Join(form) = &mut self.screen
+                    && form.mode != mode
+                {
+                    // The folder and the computer's name stay; what belonged to the other way does not.
+                    form.mode = mode;
+                    form.password.clear();
+                    form.error = None;
+                    form.ask_adopt = false;
+                }
+                Vec::new()
+            }
             Event::SyncExistingFiles(yes) => {
                 let Screen::Join(form) = &mut self.screen else { return Vec::new() };
                 form.ask_adopt = false;
@@ -1221,6 +1479,12 @@ impl Model {
                     return Vec::new();
                 }
                 form.adopt_for = Some(form.folder.trim().to_owned());
+                if form.mode == JoinMode::SignIn && form.password.is_empty() {
+                    // The password went with the first try and is not kept.
+                    form.error = Some(PASSWORD_AGAIN.to_owned());
+                    form.step = JoinStep::Account;
+                    return Vec::new();
+                }
                 self.submit_join()
             }
             Event::SubmitPassword => self.submit_password(),
@@ -1764,23 +2028,88 @@ impl Model {
         self.screen = Screen::NotRunning(self.not_running(STOPPED, &e.to_string()));
     }
 
+    /// Continue on the step the form shows: its fields are checked (with the messages of the whole form), then the next step
+    /// is shown; the last step signs in or joins.
+    fn join_next(&mut self) -> Vec<Effect> {
+        let Screen::Join(form) = &mut self.screen else { return Vec::new() };
+        form.error = None;
+        let problem = match form.step {
+            // A join string names its server itself.
+            JoinStep::Server if form.mode == JoinMode::SignIn && form.server.trim().is_empty() => Some(SERVER_EMPTY.to_owned()),
+            JoinStep::Account if form.mode == JoinMode::SignIn => {
+                if form.user.trim().is_empty() {
+                    Some(USER_EMPTY.to_owned())
+                } else if form.password.is_empty() {
+                    Some(SIGN_IN_PASSWORD_EMPTY.to_owned())
+                } else {
+                    None
+                }
+            }
+            JoinStep::Account => JoinString::parse(&form.join).err().map(|e| sentence(&e.to_string())),
+            _ => None,
+        };
+        if problem.is_some() {
+            form.error = problem;
+            return Vec::new();
+        }
+        match form.step.next() {
+            Some(step) => {
+                form.step = step;
+                Vec::new()
+            }
+            None => self.submit_join(),
+        }
+    }
+
     fn submit_join(&mut self) -> Vec<Effect> {
         let Screen::Join(form) = &mut self.screen else { return Vec::new() };
         form.error = None;
+        if form.mode == JoinMode::SignIn {
+            return self.submit_sign_in();
+        }
         match JoinString::parse(&form.join) {
             Ok(parsed) => form.join = parsed.join(),
             Err(e) => {
                 form.error = Some(sentence(&e.to_string()));
+                form.step = JoinStep::Account;
                 return Vec::new();
             }
         }
         if !Path::new(form.folder.trim()).is_absolute() {
             form.error = Some(FOLDER_NOT_ABSOLUTE.to_owned());
+            form.step = JoinStep::Folder;
             return Vec::new();
         }
         let request = form.request(None);
         self.screen = Screen::Joining { form: form.clone(), password: None };
         vec![Effect::Join(request)]
+    }
+
+    /// The password sign-in: the fields are checked, then the password leaves the form with the request.
+    fn submit_sign_in(&mut self) -> Vec<Effect> {
+        let Screen::Join(form) = &mut self.screen else { return Vec::new() };
+        // The message, and the step that has the field it is about.
+        let problem = if form.server.trim().is_empty() {
+            Some((SERVER_EMPTY, JoinStep::Server))
+        } else if form.user.trim().is_empty() {
+            Some((USER_EMPTY, JoinStep::Account))
+        } else if form.password.is_empty() {
+            Some((SIGN_IN_PASSWORD_EMPTY, JoinStep::Account))
+        } else if !Path::new(form.folder.trim()).is_absolute() {
+            Some((FOLDER_NOT_ABSOLUTE, JoinStep::Folder))
+        } else {
+            None
+        };
+        if let Some((problem, step)) = problem {
+            form.error = Some(problem.to_owned());
+            form.step = step;
+            return Vec::new();
+        }
+        let password = std::mem::take(&mut form.password);
+        let request = form.login_request(password);
+        form.challenge = None;
+        self.screen = Screen::Joining { form: form.clone(), password: None };
+        vec![Effect::Login(request)]
     }
 
     /// The code of a join that asked for one: the same join, with the code, goes to the agent again.
@@ -1793,6 +2122,16 @@ impl Model {
                 return Vec::new();
             }
         };
+        if second.form.mode == JoinMode::SignIn {
+            // The password is not asked for again: the challenge stands for it.
+            let Some(request) = second.form.second_step_request(factor) else {
+                second.error = Some(NO_CHALLENGE.to_owned());
+                return Vec::new();
+            };
+            let form = second.form.clone();
+            self.screen = Screen::Joining { form, password: None };
+            return vec![Effect::LoginSecondFactor(request)];
+        }
         let request = second.form.request_with_factor(second.password.as_ref().map(|pw| pw.password.clone()), factor);
         let (form, password) = (second.form.clone(), second.password.clone());
         self.screen = Screen::Joining { form, password };
@@ -1831,6 +2170,9 @@ impl Model {
     fn joined(&mut self, result: Result<Status, Error>) -> Vec<Effect> {
         let Screen::Joining { form, password } = &self.screen else { return Vec::new() };
         let (mut form, password) = (form.clone(), password.clone());
+        let signing_in = form.mode == JoinMode::SignIn;
+        // The challenge is kept only for a second step that is still asked for.
+        let challenge = form.challenge.take();
         let e = match result {
             Ok(status) => {
                 self.screen = Screen::SignedIn(Overview::new(status.clone()));
@@ -1860,9 +2202,31 @@ impl Model {
             Screen::PasswordNeeded(pw)
         };
         self.screen = match (code, password) {
+            // A sign-in's password was right and the account has two-factor sign-in: the code goes with the challenge.
+            (codes::TWO_FACTOR_REQUIRED, _) if signing_in => match e.challenge() {
+                Some(c) => {
+                    form.challenge = Some(c.challenge.clone());
+                    form.challenge_expires_ms = c.expires_ms;
+                    Screen::SecondFactor(SecondFactorForm::new(form, None, None))
+                }
+                None => {
+                    form.error = Some(NO_CHALLENGE.to_owned());
+                    Screen::Join(form)
+                }
+            },
+            (codes::TWO_FACTOR_EXPIRED, _) if signing_in => {
+                form.error = Some(CHALLENGE_EXPIRED.to_owned());
+                Screen::Join(form)
+            }
             // The account has two-factor sign-in: the same join goes again with its code (the invite was not used up).
             (codes::TWO_FACTOR_REQUIRED, password) => Screen::SecondFactor(SecondFactorForm::new(form, password, None)),
+            // A lock outlasts the challenge: a sign-in starts over then, and says how long to wait.
+            (codes::TWO_FACTOR_LOCKED, _) if signing_in && !wait_fits(e.retry_after_secs(), form.challenge_expires_ms, self.now_ms) => {
+                form.error = Some(crate::security::explain(&e));
+                Screen::Join(form)
+            }
             (codes::TWO_FACTOR_INVALID | codes::TWO_FACTOR_LOCKED, password) => {
+                form.challenge = challenge;
                 Screen::SecondFactor(SecondFactorForm::new(form, password, Some(crate::security::explain(&e))))
             }
             (codes::PASSWORD_REQUIRED, _) => {
@@ -1883,11 +2247,33 @@ impl Model {
                 return vec![Effect::Status];
             }
             (_, Some(pw)) => back_to_password(pw, text),
+            // The agent says `offline` for anything that kept the server from answering, a busy server (429) included, and
+            // its message says which: a sign-in shows it. A second step goes on with its challenge while that lasts.
+            (codes::OFFLINE, None) if signing_in => {
+                let said = if text.trim().is_empty() { crate::security::explain(&e) } else { text };
+                if challenge.is_some() && form.challenge_expires_ms > self.now_ms {
+                    form.challenge = challenge;
+                    Screen::SecondFactor(SecondFactorForm::new(form, None, Some(said)))
+                } else {
+                    form.error = Some(said);
+                    Screen::Join(form)
+                }
+            }
             (_, None) => {
-                form.error = Some(text);
+                form.error = Some(if signing_in { crate::security::explain(&e) } else { text });
                 Screen::Join(form)
             }
         };
+        // What the problem is about is on the account step: a sign-in's password has to be typed again (it is not kept), and
+        // a join string that doesn't work is changed there. For the rest (the folder has files) the step stays.
+        if let Screen::Join(form) = &mut self.screen
+            && form.error.is_some()
+            && !form.ask_adopt
+            && form.step == JoinStep::Folder
+            && (form.mode == JoinMode::SignIn || form.error.as_deref() == Some(INVALID_CODE))
+        {
+            form.step = JoinStep::Account;
+        }
         Vec::new()
     }
 
@@ -2708,7 +3094,522 @@ pub(crate) mod tests {
         assert_eq!(m.update(Event::Start), vec![Effect::Connect]);
         m.update(Event::Found(Ok(status(false))));
         assert!(matches!(m.screen, Screen::Join(_)), "{:?}", m.screen);
+        // The tests below this one are about the join string; the sign-in has `on_sign_in_form`.
+        m.update(Event::SetJoinMode(JoinMode::JoinString));
         m
+    }
+
+    /// A model past the start, on the sign-in form (the first screen) with a server, a user name and a password typed.
+    fn on_sign_in_form() -> Model {
+        let mut m = model();
+        m.update(Event::Start);
+        m.update(Event::Found(Ok(status(false))));
+        let f = form(&mut m);
+        assert_eq!(f.mode, JoinMode::SignIn, "sign-in is the first choice");
+        f.server = "cloud.shadows.ch".into();
+        f.user = "fabio".into();
+        f.password = "correct horse battery".into();
+        m
+    }
+
+    fn login_request(effects: &[Effect]) -> LoginRequest {
+        match effects {
+            [Effect::Login(request)] => request.clone(),
+            other => panic!("no login: {other:?}"),
+        }
+    }
+
+    fn second_step(effects: &[Effect]) -> SecondFactorLoginRequest {
+        match effects {
+            [Effect::LoginSecondFactor(request)] => request.clone(),
+            other => panic!("no second step: {other:?}"),
+        }
+    }
+
+    fn two_factor_required() -> Error {
+        Error::RefusedWith {
+            code: codes::TWO_FACTOR_REQUIRED.into(),
+            message: "needs a code".into(),
+            two_factor: Some(craft_cloud_app::TwoFactorChallenge { challenge: "challenge-secret".into(), expires_ms: 5 }),
+            retry_after_secs: None,
+        }
+    }
+
+    #[test]
+    fn a_sign_in_sends_the_password_once_and_does_not_keep_it() {
+        let mut m = on_sign_in_form();
+        let request = login_request(&m.update(Event::SubmitJoin));
+        assert_eq!(
+            (request.server.as_str(), request.user.as_str(), request.password.as_str()),
+            ("https://cloud.shadows.ch", "fabio", "correct horse battery")
+        );
+        assert_eq!(request.folder.as_deref(), Some(defaults().folder.as_str()));
+        assert_eq!(request.device_name.as_deref(), Some("lptp1"));
+        assert!(!request.adopt);
+        let Screen::Joining { form: shown, password: None } = &m.screen else { panic!("{:?}", m.screen) };
+        assert!(shown.password.is_empty(), "the password left the form with the request");
+        assert!(!format!("{:?}", m.screen).contains("correct horse"));
+        // It can't be sent twice.
+        assert!(m.update(Event::SubmitJoin).is_empty());
+        // Signed in: the signed-in view, as a join does.
+        let effects = m.update(Event::LoggedIn(Ok(status(true))));
+        assert!(matches!(m.screen, Screen::SignedIn(_)), "{:?}", m.screen);
+        assert!(effects.contains(&Effect::SetAutostart(true)), "{effects:?}");
+    }
+
+    #[test]
+    fn a_sign_in_with_a_field_missing_says_so_and_keeps_what_was_typed() {
+        for (clear, said) in [("server", SERVER_EMPTY), ("user", USER_EMPTY), ("password", SIGN_IN_PASSWORD_EMPTY)] {
+            let mut m = on_sign_in_form();
+            let f = form(&mut m);
+            match clear {
+                "server" => f.server = "  ".into(),
+                "user" => f.user.clear(),
+                _ => f.password.clear(),
+            }
+            assert!(m.update(Event::SubmitJoin).is_empty());
+            assert_eq!(form(&mut m).error.as_deref(), Some(said));
+        }
+        let mut m = on_sign_in_form();
+        form(&mut m).folder = "relative/folder".into();
+        assert!(m.update(Event::SubmitJoin).is_empty());
+        let f = form(&mut m);
+        assert_eq!(f.error.as_deref(), Some(FOLDER_NOT_ABSOLUTE));
+        assert_eq!(f.password, "correct horse battery", "nothing was sent, so nothing was taken");
+        // A scheme the user typed stays.
+        let mut m = on_sign_in_form();
+        form(&mut m).server = " http://127.0.0.1:18080/ ".into();
+        assert_eq!(login_request(&m.update(Event::SubmitJoin)).server, "http://127.0.0.1:18080/");
+    }
+
+    #[test]
+    fn a_sign_in_with_two_factor_asks_for_the_code_and_then_signs_in() {
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        assert!(m.update(Event::LoggedIn(Err(two_factor_required()))).is_empty());
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        assert_eq!(second.form.challenge.as_deref(), Some("challenge-secret"));
+        assert!(second.form.password.is_empty() && second.password.is_none());
+        let shown = format!("{:?}", m.screen);
+        assert!(!shown.contains("challenge-secret") && !shown.contains("correct horse"), "{shown}");
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!() };
+        // A code that is not six digits is said before anything is sent.
+        second.code = "12".into();
+        assert!(m.update(Event::SubmitSecondFactor).is_empty());
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!() };
+        second.code = "654 321".into();
+        let request = second_step(&m.update(Event::SubmitSecondFactor));
+        assert_eq!(
+            (request.server.as_str(), request.user.as_str(), request.challenge.as_str()),
+            ("https://cloud.shadows.ch", "fabio", "challenge-secret")
+        );
+        assert_eq!((request.totp_code.as_deref(), request.recovery_code.as_deref()), (Some("654321"), None));
+        assert_eq!(request.folder.as_deref(), Some(defaults().folder.as_str()));
+        m.update(Event::LoggedIn(Ok(status(true))));
+        assert!(matches!(m.screen, Screen::SignedIn(_)), "{:?}", m.screen);
+    }
+
+    #[test]
+    fn a_wrong_code_keeps_the_challenge_for_the_next_try_and_a_recovery_code_works() {
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(two_factor_required())));
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        second.code = "111111".into();
+        m.update(Event::SubmitSecondFactor);
+        m.update(Event::LoggedIn(Err(refused(codes::TWO_FACTOR_INVALID, "wrong"))));
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        assert!(second.error.as_deref().is_some_and(|e| e.contains("isn't right")), "{:?}", second.error);
+        assert!(second.code.is_empty());
+        assert_eq!(second.form.challenge.as_deref(), Some("challenge-secret"));
+        second.recovery = true;
+        second.code = "ABCD-EFGH-JKMN-PQRS".into();
+        let request = second_step(&m.update(Event::SubmitSecondFactor));
+        assert_eq!(request.challenge, "challenge-secret");
+        assert_eq!((request.recovery_code.as_deref(), request.totp_code.as_deref()), (Some("ABCD-EFGH-JKMN-PQRS"), None));
+    }
+
+    #[test]
+    fn a_locked_second_step_says_how_long_to_wait() {
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(two_factor_required())));
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        second.code = "123456".into();
+        m.update(Event::SubmitSecondFactor);
+        let locked = |secs| Error::RefusedWith {
+            code: codes::TWO_FACTOR_LOCKED.into(),
+            message: "locked".into(),
+            two_factor: None,
+            retry_after_secs: Some(secs),
+        };
+        // The challenge (5 ms left here) ends before the lock does: back to the form, with the wait said, nothing kept.
+        m.update(Event::LoggedIn(Err(locked(840))));
+        let f = form(&mut m);
+        assert_eq!(f.error.as_deref(), Some("Too many wrong codes. Try again in 14 minutes."));
+        assert!(f.challenge.is_none() && f.password.is_empty());
+        // A wait that is over before the challenge is: the code field stays, with the wait.
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        let long_lived = Error::RefusedWith {
+            code: codes::TWO_FACTOR_REQUIRED.into(),
+            message: "needs a code".into(),
+            two_factor: Some(craft_cloud_app::TwoFactorChallenge { challenge: "challenge-secret".into(), expires_ms: 300_000 }),
+            retry_after_secs: None,
+        };
+        m.update(Event::LoggedIn(Err(long_lived)));
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        second.code = "123456".into();
+        m.update(Event::SubmitSecondFactor);
+        m.update(Event::LoggedIn(Err(locked(30))));
+        let Screen::SecondFactor(second) = &m.screen else { panic!("{:?}", m.screen) };
+        assert_eq!(second.error.as_deref(), Some("Too many wrong codes. Try again in 30 seconds."));
+        assert_eq!(second.form.challenge.as_deref(), Some("challenge-secret"));
+    }
+
+    #[test]
+    fn a_busy_server_during_the_second_step_keeps_the_challenge_while_it_lives() {
+        // The agent answers a server's 429 as `offline`; its message says what happened.
+        let busy = || refused("offline", "the server is busy: too many sign-in attempts");
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(two_factor_required())));
+        m.now_ms = 1;
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        second.code = "123456".into();
+        m.update(Event::SubmitSecondFactor);
+        m.update(Event::LoggedIn(Err(busy())));
+        let Screen::SecondFactor(second) = &m.screen else { panic!("{:?}", m.screen) };
+        assert_eq!(second.error.as_deref(), Some("the server is busy: too many sign-in attempts"));
+        assert_eq!(second.form.challenge.as_deref(), Some("challenge-secret"));
+        // Past the challenge's end (5 ms): back to the form.
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!() };
+        second.code = "123456".into();
+        m.update(Event::SubmitSecondFactor);
+        m.now_ms = 10;
+        m.update(Event::LoggedIn(Err(busy())));
+        let f = form(&mut m);
+        assert_eq!(f.error.as_deref(), Some("the server is busy: too many sign-in attempts"));
+        assert!(f.challenge.is_none());
+    }
+
+    #[test]
+    fn a_server_without_a_scheme_is_https_unless_it_is_this_computer() {
+        for (typed, sent) in [
+            ("cloud.shadows.ch", "https://cloud.shadows.ch"),
+            ("cloud.shadows.ch:8443/cloud", "https://cloud.shadows.ch:8443/cloud"),
+            ("localhost:18080", "http://localhost:18080"),
+            ("LOCALHOST", "http://LOCALHOST"),
+            ("127.0.0.1:18080", "http://127.0.0.1:18080"),
+            ("127.3.4.5", "http://127.3.4.5"),
+            ("[::1]:18080", "http://[::1]:18080"),
+            ("192.168.1.5:18080", "https://192.168.1.5:18080"),
+            ("localhost.example.com", "https://localhost.example.com"),
+            ("127.0.0.1.example.com", "https://127.0.0.1.example.com"),
+            ("http://nas.local:18080", "http://nas.local:18080"),
+        ] {
+            let mut m = on_sign_in_form();
+            form(&mut m).server = typed.into();
+            assert_eq!(login_request(&m.update(Event::SubmitJoin)).server, sent, "{typed}");
+        }
+    }
+
+    #[test]
+    fn an_expired_challenge_goes_back_to_the_form_without_a_password() {
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(two_factor_required())));
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        second.code = "123456".into();
+        m.update(Event::SubmitSecondFactor);
+        m.update(Event::LoggedIn(Err(refused(codes::TWO_FACTOR_EXPIRED, "gone"))));
+        let f = form(&mut m);
+        assert_eq!(f.error.as_deref(), Some(CHALLENGE_EXPIRED));
+        assert!(f.challenge.is_none() && f.password.is_empty() && f.user == "fabio");
+    }
+
+    #[test]
+    fn a_challenge_missing_from_the_answer_is_said() {
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(refused(codes::TWO_FACTOR_REQUIRED, "needs a code"))));
+        assert_eq!(form(&mut m).error.as_deref(), Some(NO_CHALLENGE));
+    }
+
+    #[test]
+    fn sign_in_refusals_are_explained_and_leave_no_password() {
+        let rate_limited = Error::RefusedWith { code: "rate_limited".into(), message: "m".into(), two_factor: None, retry_after_secs: Some(120) };
+        for (error, said) in [
+            (refused("wrong_password", "wrong user name or password"), "That password isn't right."),
+            (rate_limited, "Too many tries. Try again in 2 minutes."),
+            (refused("offline", "the server is busy: too many sign-in attempts"), "the server is busy: too many sign-in attempts"),
+        ] {
+            let mut m = on_sign_in_form();
+            m.update(Event::SubmitJoin);
+            m.update(Event::LoggedIn(Err(error)));
+            let f = form(&mut m);
+            assert_eq!(f.error.as_deref(), Some(said));
+            assert!(f.password.is_empty());
+            assert_eq!((f.server.as_str(), f.user.as_str()), ("cloud.shadows.ch", "fabio"), "what was typed stays");
+        }
+        // Said as the agent says it when there is no better text.
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(refused("usage", "cloud.shadows.ch is not a URL"))));
+        assert_eq!(form(&mut m).error.as_deref(), Some("cloud.shadows.ch is not a URL"));
+    }
+
+    #[test]
+    fn a_sign_in_to_a_folder_with_files_asks_and_then_needs_the_password_again() {
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(refused(codes::FOLDER_HAS_FILES, "has files"))));
+        let f = form(&mut m);
+        assert!(f.ask_adopt && f.password.is_empty());
+        // Sync them: the password is not kept, so it is asked for again, and then goes with `adopt`.
+        assert!(m.update(Event::SyncExistingFiles(true)).is_empty());
+        let f = form(&mut m);
+        assert_eq!(f.error.as_deref(), Some(PASSWORD_AGAIN));
+        assert!(!f.ask_adopt);
+        f.password = "correct horse battery".into();
+        let request = login_request(&m.update(Event::SubmitJoin));
+        assert!(request.adopt);
+        // Another folder is asked about again.
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(refused(codes::FOLDER_HAS_FILES, "has files"))));
+        m.update(Event::SyncExistingFiles(false));
+        form(&mut m).password = "x".into();
+        assert!(!login_request(&m.update(Event::SubmitJoin)).adopt);
+    }
+
+    #[test]
+    fn going_back_from_the_code_drops_the_challenge() {
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(two_factor_required())));
+        m.update(Event::CancelSecondFactor);
+        let f = form(&mut m);
+        assert!(f.challenge.is_none() && f.password.is_empty());
+        assert_eq!((f.server.as_str(), f.user.as_str()), ("cloud.shadows.ch", "fabio"));
+    }
+
+    #[test]
+    fn switching_between_sign_in_and_join_string_keeps_the_folder_and_drops_the_password() {
+        let mut m = on_sign_in_form();
+        let f = form(&mut m);
+        f.folder = "/data/cloud".into();
+        f.device_name = "studio".into();
+        f.error = Some("old".into());
+        m.update(Event::SetJoinMode(JoinMode::JoinString));
+        let f = form(&mut m);
+        assert_eq!((f.mode, f.folder.as_str(), f.device_name.as_str()), (JoinMode::JoinString, "/data/cloud", "studio"));
+        assert!(f.password.is_empty() && f.error.is_none());
+        assert_eq!(f.user, "fabio", "the sign-in's other fields are kept for the way back");
+        m.update(Event::SetJoinMode(JoinMode::SignIn));
+        assert_eq!(form(&mut m).folder, "/data/cloud");
+        // Only on the form.
+        let mut m = signed_in();
+        assert!(m.update(Event::SetJoinMode(JoinMode::JoinString)).is_empty());
+    }
+
+    #[test]
+    fn the_rail_shows_what_is_known_and_never_a_probe() {
+        let mut m = on_sign_in_form();
+        let steps = form(&mut m).rail();
+        assert_eq!((steps[0].title, steps[0].detail.as_str()), ("Server", "cloud.shadows.ch"));
+        assert_eq!(steps[1].detail.as_str(), "fabio");
+        assert_eq!(steps[2].detail, defaults().folder);
+        let f = form(&mut m);
+        f.server.clear();
+        f.user.clear();
+        f.folder.clear();
+        let steps = f.rail();
+        assert_eq!(steps[0].detail, "Where your Craft Cloud lives");
+        assert_eq!(steps[2].detail, "Where your files live on this computer");
+        m.update(Event::SetJoinMode(JoinMode::JoinString));
+        form(&mut m).join = "https://cloud.shadows.ch/join/k7m4-q9tx".into();
+        let steps = form(&mut m).rail();
+        assert_eq!((steps[0].detail.as_str(), steps[1].detail.as_str()), ("cloud.shadows.ch", "Join string"));
+    }
+
+    fn states(m: &Model) -> Vec<RailState> {
+        let (_, rail) = m.first_run_rail().expect("a screen of the first start");
+        rail.iter().map(|s| s.state).collect()
+    }
+
+    const DONE: RailState = RailState::Done;
+    const NOW: RailState = RailState::Current;
+    const LATER: RailState = RailState::Later;
+
+    /// Continue on the sign-in form three times: the sign-in is sent.
+    fn signed_in_through_the_steps(m: &mut Model) {
+        for _ in 0..3 {
+            m.update(Event::JoinNext);
+        }
+    }
+
+    #[test]
+    fn the_steps_go_forward_one_page_at_a_time_and_the_rail_follows_in_sequence() {
+        let mut m = on_sign_in_form();
+        assert_eq!(form(&mut m).step, JoinStep::Server, "the first start begins at the server");
+        // Typed values never move the rail: only the step does.
+        assert_eq!(states(&m), [NOW, LATER, LATER]);
+        assert!(m.update(Event::JoinNext).is_empty());
+        assert_eq!((form(&mut m).step, form(&mut m).error.clone()), (JoinStep::Account, None));
+        assert_eq!(states(&m), [DONE, NOW, LATER]);
+        assert!(m.update(Event::JoinNext).is_empty());
+        assert_eq!(form(&mut m).step, JoinStep::Folder);
+        assert_eq!(states(&m), [DONE, DONE, NOW]);
+        // The last step's Continue signs in exactly as SubmitJoin does.
+        let request = login_request(&m.update(Event::JoinNext));
+        assert_eq!(
+            (request.server.as_str(), request.user.as_str(), request.password.as_str()),
+            ("https://cloud.shadows.ch", "fabio", "correct horse battery")
+        );
+        assert!(matches!(m.screen, Screen::Joining { .. }), "{:?}", m.screen);
+        // Nothing is sent twice, and a step button does nothing then.
+        assert!(m.update(Event::JoinNext).is_empty() && m.update(Event::JoinBack).is_empty());
+    }
+
+    #[test]
+    fn a_step_is_not_left_forward_with_its_field_missing() {
+        let mut m = on_sign_in_form();
+        form(&mut m).server = "  ".into();
+        assert!(m.update(Event::JoinNext).is_empty());
+        let f = form(&mut m);
+        assert_eq!((f.step, f.error.as_deref()), (JoinStep::Server, Some(SERVER_EMPTY)));
+        f.server = "cloud.shadows.ch".into();
+        m.update(Event::JoinNext);
+        assert_eq!((form(&mut m).step, form(&mut m).error.clone()), (JoinStep::Account, None), "the message goes with a fixed field");
+
+        form(&mut m).user.clear();
+        m.update(Event::JoinNext);
+        assert_eq!((form(&mut m).step, form(&mut m).error.as_deref()), (JoinStep::Account, Some(USER_EMPTY)));
+        let f = form(&mut m);
+        f.user = "fabio".into();
+        f.password.clear();
+        m.update(Event::JoinNext);
+        assert_eq!((form(&mut m).step, form(&mut m).error.as_deref()), (JoinStep::Account, Some(SIGN_IN_PASSWORD_EMPTY)));
+        assert_eq!(states(&m), [DONE, NOW, LATER], "an error keeps the current step current");
+
+        // The join string is read on the account step, with the message of the whole form.
+        let mut m = on_join_form();
+        form(&mut m).step = JoinStep::Account;
+        form(&mut m).join = "not a code".into();
+        m.update(Event::JoinNext);
+        assert_eq!(form(&mut m).step, JoinStep::Account);
+        assert!(form(&mut m).error.is_some());
+        form(&mut m).join = "cloud.shadows.ch/K7M4-Q9TX".into();
+        m.update(Event::JoinNext);
+        assert_eq!((form(&mut m).step, form(&mut m).error.clone()), (JoinStep::Folder, None));
+        // The last step checks the folder and stays.
+        form(&mut m).folder = "relative/folder".into();
+        assert!(m.update(Event::JoinNext).is_empty());
+        assert_eq!((form(&mut m).step, form(&mut m).error.as_deref()), (JoinStep::Folder, Some(FOLDER_NOT_ABSOLUTE)));
+        assert_eq!(states(&m), [DONE, DONE, NOW]);
+    }
+
+    #[test]
+    fn a_join_string_does_not_need_a_server_address_on_the_first_step() {
+        let mut m = on_join_form();
+        assert_eq!(form(&mut m).step, JoinStep::Server);
+        assert!(form(&mut m).server.is_empty());
+        m.update(Event::JoinNext);
+        assert_eq!((form(&mut m).step, form(&mut m).error.clone()), (JoinStep::Account, None));
+    }
+
+    #[test]
+    fn back_goes_to_the_step_before_and_keeps_what_was_typed() {
+        let mut m = on_sign_in_form();
+        m.update(Event::JoinNext);
+        m.update(Event::JoinNext);
+        form(&mut m).folder = "/data/cloud".into();
+        form(&mut m).device_name = "studio".into();
+        m.update(Event::JoinBack);
+        assert_eq!(form(&mut m).step, JoinStep::Account);
+        assert_eq!(states(&m), [DONE, NOW, LATER]);
+        let f = form(&mut m);
+        assert_eq!((f.password.as_str(), f.user.as_str(), f.server.as_str()), ("correct horse battery", "fabio", "cloud.shadows.ch"));
+        m.update(Event::JoinBack);
+        assert_eq!(form(&mut m).step, JoinStep::Server);
+        // There is nothing before the first step.
+        assert!(m.update(Event::JoinBack).is_empty());
+        assert_eq!(form(&mut m).step, JoinStep::Server);
+        m.update(Event::JoinNext);
+        m.update(Event::JoinNext);
+        let f = form(&mut m);
+        assert_eq!((f.folder.as_str(), f.device_name.as_str()), ("/data/cloud", "studio"));
+    }
+
+    #[test]
+    fn a_problem_puts_the_form_on_the_step_whose_field_it_is_about() {
+        // The password is gone after a try: a wrong one is typed again on the account step.
+        let mut m = on_sign_in_form();
+        signed_in_through_the_steps(&mut m);
+        m.update(Event::LoggedIn(Err(refused("wrong_password", "wrong user name or password"))));
+        let f = form(&mut m);
+        assert_eq!(f.step, JoinStep::Account);
+        assert!(f.error.is_some() && f.password.is_empty());
+        assert_eq!(states(&m), [DONE, NOW, LATER], "never every step done after an error");
+        // The folder has files: the question is on the folder step.
+        let mut m = on_sign_in_form();
+        signed_in_through_the_steps(&mut m);
+        m.update(Event::LoggedIn(Err(refused(codes::FOLDER_HAS_FILES, "has files"))));
+        let f = form(&mut m);
+        assert_eq!((f.step, f.ask_adopt), (JoinStep::Folder, true));
+        // Agreeing needs the password again (it is not kept): the account step.
+        m.update(Event::SyncExistingFiles(true));
+        let f = form(&mut m);
+        assert_eq!((f.step, f.error.as_deref()), (JoinStep::Account, Some(PASSWORD_AGAIN)));
+    }
+
+    #[test]
+    fn the_code_and_the_new_password_are_pages_of_the_account_step() {
+        let mut m = on_sign_in_form();
+        signed_in_through_the_steps(&mut m);
+        m.update(Event::LoggedIn(Err(two_factor_required())));
+        assert!(matches!(m.screen, Screen::SecondFactor(_)), "{:?}", m.screen);
+        assert_eq!(m.first_run_rail().map(|(n, _)| n), Some(1));
+        assert_eq!(states(&m), [DONE, NOW, LATER]);
+        // Back from the code is the account step, with the password to type again; the other values are kept.
+        m.update(Event::CancelSecondFactor);
+        let f = form(&mut m);
+        assert_eq!((f.step, f.user.as_str(), f.server.as_str()), (JoinStep::Account, "fabio", "cloud.shadows.ch"));
+        assert!(f.password.is_empty() && f.challenge.is_none());
+
+        // An invite that wants a new password.
+        let mut m = on_join_form();
+        form(&mut m).join = "cloud.shadows.ch/K7M4-Q9TX-K7M4-Q9TX".into();
+        form(&mut m).step = JoinStep::Folder;
+        m.update(Event::JoinNext);
+        m.update(Event::Joined(Err(refused(codes::PASSWORD_REQUIRED, "x"))));
+        assert!(matches!(m.screen, Screen::PasswordNeeded(_)), "{:?}", m.screen);
+        assert_eq!(states(&m), [DONE, NOW, LATER]);
+        m.update(Event::CancelPassword);
+        assert_eq!(form(&mut m).step, JoinStep::Folder, "Back from the password is the page it came from");
+    }
+
+    #[test]
+    fn the_step_buttons_only_work_on_the_join_form() {
+        let mut m = signed_in();
+        assert!(m.update(Event::JoinNext).is_empty() && m.update(Event::JoinBack).is_empty());
+        assert!(matches!(m.screen, Screen::SignedIn(_)));
+        assert!(m.first_run_rail().is_none());
+    }
+
+    #[test]
+    fn secrets_of_the_form_stay_out_of_debug_output() {
+        let f = JoinForm {
+            password: "pw-secret-1".into(),
+            challenge: Some("challenge-secret".into()),
+            join: "cloud.shadows.ch/K7M4-Q9TX".into(),
+            user: "fabio".into(),
+            ..JoinForm::default()
+        };
+        let shown = format!("{f:?}");
+        assert!(!shown.contains("pw-secret") && !shown.contains("challenge-secret") && !shown.contains("K7M4"), "{shown}");
+        assert!(shown.contains("fabio"));
     }
 
     fn signed_in() -> Model {

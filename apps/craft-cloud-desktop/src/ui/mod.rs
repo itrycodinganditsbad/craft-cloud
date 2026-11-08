@@ -41,10 +41,20 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
     stash_names(ui.ctx(), model);
     // The signed-in pages sit between a header with the tabs and a footer strip; the other screens fill the window.
     let shell = shell::Shell::of(model);
+    // The first start has its own frame: a header, a footer with the step, and a sidebar of the steps in a wide window.
+    let first_run = model.first_run_rail().map(|(current, rail)| join::FirstRun::new(current, rail, ui.available_width()));
     let frame = if let Some(shell) = &shell {
         shell::header(ui, shell, &mut events);
         shell::footer(ui, shell, &mut events);
         egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(24, 16))
+    } else if let Some(run) = &first_run {
+        join::header(ui);
+        join::footer(ui, run);
+        if run.beside {
+            join::sidebar(ui, run);
+        }
+        // The pages keep their own margins, so the scroll bar sits at the window's edge.
+        egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::ZERO)
     } else {
         egui::Frame::central_panel(ui.style())
     };
@@ -58,10 +68,10 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
             match &mut model.screen {
                 Screen::Starting => starting(ui),
                 Screen::NotRunning(p) | Screen::Error(p) => problem::screen(ui, p, busy, &mut events),
-                Screen::Join(form) => join::form(ui, form, false, &mut events),
-                Screen::Joining { form, .. } => join::form(ui, form, true, &mut events),
-                Screen::PasswordNeeded(pw) => join::password(ui, pw, &mut events),
-                Screen::SecondFactor(form) => second_factor::show(ui, form, &mut events),
+                Screen::Join(form) => with_first_run(&first_run, |run| join::form(ui, form, false, run, &mut events)),
+                Screen::Joining { form, .. } => with_first_run(&first_run, |run| join::form(ui, form, true, run, &mut events)),
+                Screen::PasswordNeeded(pw) => with_first_run(&first_run, |run| join::password(ui, pw, run, &mut events)),
+                Screen::SecondFactor(form) => with_first_run(&first_run, |run| second_factor::show(ui, form, run, &mut events)),
                 Screen::Security(page) => security::show(ui, page, now_ms, &mut events),
                 Screen::SignedIn(o) => overview::show(ui, o, busy, now_ms, autostart_problem.as_deref(), &mut events),
                 Screen::AddingComputer(adding) => add_computer::show(ui, adding, now_ms, &mut events),
@@ -80,6 +90,13 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
         });
     });
     events
+}
+
+/// Draws a page of the first start with its frame's facts (the model gives them for exactly those screens).
+fn with_first_run(run: &Option<join::FirstRun>, draw: impl FnOnce(&join::FirstRun)) {
+    if let Some(run) = run {
+        draw(run);
+    }
 }
 
 /// What names the IDs of the page being drawn: the model's, and the accounts of the admin's list.
@@ -145,7 +162,10 @@ fn good(ui: &egui::Ui) -> Color32 {
 
 /// The server's address without its scheme, as people say it: `cloud.shadows.ch`.
 pub fn host(server: &str) -> &str {
-    server.strip_prefix("https://").or_else(|| server.strip_prefix("http://")).unwrap_or(server).trim_end_matches('/')
+    let rest = ["https://", "http://"]
+        .iter()
+        .find_map(|scheme| server.get(..scheme.len()).filter(|start| start.eq_ignore_ascii_case(scheme)).and_then(|_| server.get(scheme.len()..)));
+    rest.unwrap_or(server).trim_end_matches('/')
 }
 
 /// How long ago `then_ms` was, at `now_ms`: "just now", "5 min ago", "3 h ago", "2 days ago".
