@@ -218,9 +218,28 @@ on_every_backend!(
     the_account_activity_shows_events_about_the_account,
     review_fixes_of_the_routes_hold,
     a_member_who_is_removed_and_invited_again_is_listed_with_a_new_joined_stamp,
+    the_admin_list_counts_only_owners_who_can_sign_in,
 );
 
 // ---- scenarios ----
+
+/// The administrator's list says 0 owners for a space whose owners are disabled or marked for removal: nobody can manage it.
+async fn the_admin_list_counts_only_owners_who_can_sign_in(w: &World) {
+    let (ana, eve) = (w.user("ana").id.0, w.user("eve").id.0);
+    for (name, owner) in [("Alpha", ana), ("Beta", eve)] {
+        let res = w.call("boss", Method::POST, "/admin/spaces", Some(World::confirmed(json!({ "name": name, "owner": owner })))).await;
+        assert_eq!(res.json::<AdminSpaceInfo>().await.unwrap().owners, 1);
+    }
+    let owners = || async {
+        let list: AdminSpaceList = w.call("boss", Method::GET, "/admin/spaces", None).await.json().await.unwrap();
+        list.spaces.iter().map(|s| (s.name.clone(), s.owners)).collect::<Vec<_>>()
+    };
+    assert_eq!(owners().await, [("Alpha".to_owned(), 1), ("Beta".to_owned(), 1)]);
+    w.set_user_column("ana", "disabled_ms").await;
+    assert_eq!(owners().await, [("Alpha".to_owned(), 0), ("Beta".to_owned(), 1)]);
+    w.set_user_column("eve", "removed_ms").await;
+    assert_eq!(owners().await, [("Alpha".to_owned(), 0), ("Beta".to_owned(), 0)]);
+}
 
 async fn an_admin_creates_and_lists_spaces(w: &World) {
     let (ana, eve) = (w.user("ana").id.0, w.user("eve").id.0);
