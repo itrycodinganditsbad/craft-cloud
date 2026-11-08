@@ -44,6 +44,13 @@
 //! - **Presence**: `presence {doc, bytes}` both ways, at most [`MAX_PRESENCE_BYTES`] and [`PRESENCE_PER_SEC`] a second
 //!   per document per device, relayed to the document's other subscribers and never stored.
 //!
+//! From protocol [`LIVE_SPACES_PROTOCOL`] on (team spaces, `docs/design/collaboration.md`): the connection's space is
+//! named on the upgrade by the `craft-space` header (none: the personal space), the server answers `hello` with
+//! `welcome_space {protocol, epoch, space, role}` instead of `welcome`, relays presence as `presence_from {doc, bytes,
+//! user}` (the account is the server's, never the sender's), refuses a viewer's `create`, `update` and `snapshot` with
+//! `error {read_only}`, and never asks a viewer's device to `compact`. A connection on protocol 2 sees the frames of
+//! protocol 2 and nothing else.
+//!
 //! Limits ([`MAX_UPDATE_BYTES`], [`MAX_SUBSCRIPTIONS`], [`MAX_FRAME_BYTES`], [`MAX_SNAPSHOT_BYTES`]) are checked when a
 //! frame is decoded and again by the server; over them the answer is `too_large` or `rate_limited`, like the HTTP API.
 //!
@@ -57,15 +64,22 @@
 
 use serde::{Deserialize, Serialize};
 
+use craft_cloud_api::api::SpaceRole;
+use uuid::Uuid;
+
 use crate::ManifestId;
 use crate::ids::{DeviceId, DocId, Epoch, NodeId, SpaceId};
 
 /// Live protocol versions this build speaks. An agent and a server must share at least one.
 pub const LIVE_PROTOCOL_MIN: u32 = 1;
-pub const LIVE_PROTOCOL_MAX: u32 = 2;
+pub const LIVE_PROTOCOL_MAX: u32 = 3;
 /// The protocol that adds documents linked to files, snapshots, compaction and presence. A connection on an older one
 /// carries recents only.
 pub const LIVE_DOCUMENTS_PROTOCOL: u32 = 2;
+/// The protocol that adds team spaces: the space on the upgrade (`craft-space` header), `welcome_space` instead of
+/// `welcome`, `presence_from` instead of `presence`, and `read_only` refusals. A connection on protocol 2 is the
+/// personal space and sees exactly the frames of protocol 2.
+pub const LIVE_SPACES_PROTOCOL: u32 = 3;
 
 /// Largest update, in bytes; largest snapshot of a document (an import, or a compaction), in bytes (it travels through
 /// the chunk API, never in a frame); largest presence message (Loro's ephemeral state: a cursor, a selection, a machine
@@ -304,6 +318,12 @@ pub enum ServerFrame {
     Snapshot { doc: DocId, base: u64, manifest: ManifestId },
     /// Another device's presence in a subscribed document, as it sent it.
     Presence { doc: DocId, bytes: Vec<u8> },
+    /// `welcome` on protocol [`LIVE_SPACES_PROTOCOL`]: as [`ServerFrame::Welcome`], plus the space the connection works on
+    /// (the one the upgrade named, or the personal space) and the caller's role in it when the connection was opened.
+    WelcomeSpace { protocol: u32, epoch: Epoch, space: SpaceId, role: SpaceRole },
+    /// `presence` on protocol [`LIVE_SPACES_PROTOCOL`]: as [`ServerFrame::Presence`], plus the account that sent it,
+    /// stamped by the server (whatever the bytes say).
+    PresenceFrom { doc: DocId, bytes: Vec<u8>, user: Uuid },
     // Frames that are only appended to on the wire go above this line; see [`ClientFrame::CreateDocument`].
     /// `create {doc, node, app, snapshot}` done: `kept` says whether this snapshot is the document's (else another
     /// machine's import was there first, and this one is to be dropped). On the wire: `created {doc}` with `kept`
@@ -434,7 +454,7 @@ impl ServerFrame {
             ServerFrame::Error { code, message, .. } if code.len() > MAX_CODE_BYTES || message.len() > MAX_MESSAGE_BYTES => {
                 Err(FrameError::Invalid("an error's code or message is too long"))
             }
-            ServerFrame::Presence { bytes, .. } => presence_ok(bytes),
+            ServerFrame::Presence { bytes, .. } | ServerFrame::PresenceFrom { bytes, .. } => presence_ok(bytes),
             _ => Ok(()),
         }
     }
@@ -487,6 +507,10 @@ impl std::fmt::Debug for ServerFrame {
             ServerFrame::Compact { doc, upto } => write!(f, "Compact({doc}, upto {upto})"),
             ServerFrame::Snapshot { doc, base, manifest } => write!(f, "Snapshot({doc}, base {base}, manifest {manifest})"),
             ServerFrame::Presence { doc, bytes } => write!(f, "Presence({doc}, {} bytes)", bytes.len()),
+            ServerFrame::WelcomeSpace { protocol, epoch, space, role } => {
+                write!(f, "WelcomeSpace({protocol}, epoch {epoch}, space {space}, {})", role.as_str())
+            }
+            ServerFrame::PresenceFrom { doc, bytes, user } => write!(f, "PresenceFrom({doc}, {} bytes, from {user})", bytes.len()),
             ServerFrame::CreatedDocument { doc, kept } => write!(f, "CreatedDocument({doc}, kept {kept})"),
         }
     }
@@ -622,7 +646,8 @@ mod tests {
     fn versions_are_negotiated_to_the_highest_shared() {
         assert_eq!(shared_version(1, 1), Some(1));
         assert_eq!(shared_version(1, 5), Some(LIVE_PROTOCOL_MAX));
-        assert_eq!(shared_version(2, 5), Some(LIVE_DOCUMENTS_PROTOCOL));
+        assert_eq!(shared_version(2, 5), Some(LIVE_SPACES_PROTOCOL));
+        assert_eq!(shared_version(2, 2), Some(LIVE_DOCUMENTS_PROTOCOL));
         assert_eq!(shared_version(LIVE_PROTOCOL_MAX + 1, LIVE_PROTOCOL_MAX + 4), None);
         assert_eq!(shared_version(0, 0), None);
         assert_eq!(shared_version(3, 1), None, "an empty range");
@@ -782,6 +807,126 @@ mod tests {
         assert!(p.encode().is_err());
     }
 
+    /// Every frame of protocol 2, byte for byte: appending the frames of protocol 3 moved none of them.
+    #[test]
+    fn protocol_two_frames_are_pinned() {
+        let doc = doc7();
+        let id = |bytes: &mut Vec<u8>| bytes.extend([16].iter().chain([7u8; 16].iter()));
+        let manifest = ManifestId::from_bytes([0xab; 32]);
+        let mut manifest_text = vec![64];
+        manifest_text.extend("ab".repeat(32).bytes());
+        let with_id = |tag: u8, tail: &[u8]| {
+            let mut bytes = vec![tag];
+            id(&mut bytes);
+            bytes.extend(tail);
+            bytes
+        };
+        // Client frames, by variant index.
+        assert_eq!(ClientFrame::Hello { min: 1, max: 2 }.encode().unwrap(), vec![0, 1, 2]);
+        assert_eq!(
+            ClientFrame::Create { doc, kind: DocKind::Recents { app: app("wordcraft") } }.encode().unwrap(),
+            with_id(1, &[&[0, 9][..], b"wordcraft"].concat())
+        );
+        assert_eq!(ClientFrame::Subscribe { doc, after: 7, at: None }.encode().unwrap(), with_id(2, &[7, 0]));
+        let mut at = vec![7, 1];
+        at.extend(update_hash(b"u"));
+        assert_eq!(ClientFrame::Subscribe { doc, after: 7, at: Some(update_hash(b"u")) }.encode().unwrap(), with_id(2, &at));
+        assert_eq!(ClientFrame::Unsubscribe { doc }.encode().unwrap(), with_id(3, &[]));
+        assert_eq!(ClientFrame::Update { doc, client_seq: 5, bytes: vec![0xaa, 0xbb] }.encode().unwrap(), with_id(4, &[5, 2, 0xaa, 0xbb]));
+        assert_eq!(ClientFrame::Snapshot { doc, upto: 1001, manifest }.encode().unwrap(), with_id(5, &[&[0xe9, 0x07][..], &manifest_text].concat()));
+        assert_eq!(ClientFrame::Presence { doc, bytes: vec![9, 8] }.encode().unwrap(), with_id(6, &[2, 9, 8]));
+        assert_eq!(ClientFrame::SubscribeLog { doc, after: 3, at: None }.encode().unwrap(), with_id(7, &[3, 0]));
+        // Server frames.
+        let epoch = Epoch::from_uuid(uuid::Uuid::from_bytes([3; 16]));
+        let mut want = vec![0, 2, 16];
+        want.extend([3; 16]);
+        assert_eq!(ServerFrame::Welcome { protocol: 2, epoch }.encode().unwrap(), want);
+        assert_eq!(ServerFrame::Created { doc }.encode().unwrap(), with_id(1, &[]));
+        let device = DeviceId::from_uuid(uuid::Uuid::from_bytes([2; 16]));
+        let mut tail = vec![9, 2, 0xaa, 0xbb, 16];
+        tail.extend([2; 16]);
+        assert_eq!(ServerFrame::Update { doc, seq: 9, bytes: vec![0xaa, 0xbb], device }.encode().unwrap(), with_id(2, &tail));
+        assert_eq!(ServerFrame::Subscribed { doc, head: 9 }.encode().unwrap(), with_id(3, &[9]));
+        assert_eq!(ServerFrame::Ack { doc, client_seq: 3, seq: 10 }.encode().unwrap(), with_id(4, &[3, 10]));
+        let mut error = vec![5, 9];
+        error.extend(b"not_found");
+        error.extend([2, b'n', b'o', 1]);
+        id(&mut error);
+        error.extend([0]);
+        assert_eq!(ServerFrame::error("not_found", "no", Some(doc), None).encode().unwrap(), error);
+        assert_eq!(ServerFrame::Compact { doc, upto: 1001 }.encode().unwrap(), with_id(6, &[0xe9, 0x07]));
+        assert_eq!(ServerFrame::Snapshot { doc, base: 1001, manifest }.encode().unwrap(), with_id(7, &[&[0xe9, 0x07][..], &manifest_text].concat()));
+        assert_eq!(ServerFrame::Presence { doc, bytes: vec![9, 8] }.encode().unwrap(), with_id(8, &[2, 9, 8]));
+        let mut kept = with_id(1, &[]);
+        kept.push(1);
+        assert_eq!(ServerFrame::CreatedDocument { doc, kept: true }.encode().unwrap(), kept);
+    }
+
+    /// The frames protocol 3 adds are appended after `presence`: the first free indices.
+    #[test]
+    fn protocol_three_frames_round_trip_and_are_pinned() {
+        let doc = doc7();
+        let epoch = Epoch::from_uuid(uuid::Uuid::from_bytes([3; 16]));
+        let space = SpaceId::from_uuid(uuid::Uuid::from_bytes([4; 16]));
+        let user = uuid::Uuid::from_bytes([5; 16]);
+        for role in SpaceRole::ALL {
+            let frame = ServerFrame::WelcomeSpace { protocol: 3, epoch, space, role };
+            assert_eq!(ServerFrame::decode(&frame.encode().unwrap()).unwrap(), frame);
+        }
+        let mut want = vec![9, 3, 16];
+        want.extend([3; 16]);
+        want.push(16);
+        want.extend([4; 16]);
+        want.push(1);
+        assert_eq!(ServerFrame::WelcomeSpace { protocol: 3, epoch, space, role: SpaceRole::Editor }.encode().unwrap(), want);
+        let frame = ServerFrame::PresenceFrom { doc, bytes: vec![1, 2, 3], user };
+        assert_eq!(ServerFrame::decode(&frame.encode().unwrap()).unwrap(), frame);
+        let mut want = vec![10, 16];
+        want.extend([7; 16]);
+        want.extend([3, 1, 2, 3, 16]);
+        want.extend([5; 16]);
+        assert_eq!(frame.encode().unwrap(), want);
+        // The limits of a presence message hold for the new frame too.
+        assert!(ServerFrame::PresenceFrom { doc, bytes: vec![1; MAX_PRESENCE_BYTES], user }.encode().is_ok());
+        assert!(ServerFrame::PresenceFrom { doc, bytes: vec![1; MAX_PRESENCE_BYTES + 1], user }.encode().is_err());
+        assert!(ServerFrame::PresenceFrom { doc, bytes: vec![], user }.encode().is_err());
+        let raw = postcard::to_stdvec(&ServerFrame::PresenceFrom { doc, bytes: vec![1; MAX_PRESENCE_BYTES + 1], user }).unwrap();
+        assert!(matches!(ServerFrame::decode(&raw), Err(FrameError::Invalid(_))));
+        // Bytes after the frame, and a role past the three, are refused.
+        let mut bad = want.clone();
+        bad.push(0);
+        assert!(ServerFrame::decode(&bad).is_err());
+        let mut role = vec![9, 3, 16];
+        role.extend([3; 16]);
+        role.push(16);
+        role.extend([4; 16]);
+        role.push(3);
+        assert!(ServerFrame::decode(&role).is_err());
+    }
+
+    /// Protocol 2 and 3 meet in both directions: a new agent (1-3) and an old server (1-2) agree on 2, an old agent
+    /// (1-2) and a new server (1-3) agree on 2, two new peers on 3.
+    #[test]
+    fn versions_two_and_three_negotiate_both_ways() {
+        // The server's side: `shared_version(agent min, agent max)` against this build's range (1-3).
+        assert_eq!(shared_version(1, 2), Some(2), "an old agent on a new server");
+        assert_eq!(shared_version(1, 3), Some(3));
+        assert_eq!(shared_version(3, 3), Some(3));
+        assert_eq!(shared_version(1, 1), Some(1));
+        // The agent's side: an old server (range 1-2) answers `welcome {2}` to a new agent's `hello {1, 3}`, which the
+        // agent accepts as inside its own range; protocol 3 is out of reach of the old server's own range.
+        let accepts = |answer: u32| (LIVE_PROTOCOL_MIN..=LIVE_PROTOCOL_MAX).contains(&answer);
+        assert!(accepts(2) && accepts(3));
+        assert!(!accepts(4));
+        let old_server = |min: u32, max: u32| {
+            let high = max.min(2);
+            (min <= max && high >= min.max(1)).then_some(high)
+        };
+        assert_eq!(old_server(LIVE_PROTOCOL_MIN, LIVE_PROTOCOL_MAX), Some(2));
+        assert_eq!(old_server(3, 3), None, "an agent that needs 3 cannot use an old server");
+        assert_eq!(LIVE_SPACES_PROTOCOL, LIVE_PROTOCOL_MAX);
+    }
+
     #[test]
     fn debug_output_never_shows_document_bytes() {
         let doc = DocId::generate();
@@ -789,6 +934,7 @@ mod tests {
             format!("{:?}", ClientFrame::Update { doc, client_seq: 1, bytes: b"secret".to_vec() }),
             format!("{:?}", ClientFrame::Presence { doc, bytes: b"secret".to_vec() }),
             format!("{:?}", ServerFrame::Presence { doc, bytes: b"secret".to_vec() }),
+            format!("{:?}", ServerFrame::PresenceFrom { doc, bytes: b"secret".to_vec(), user: uuid::Uuid::nil() }),
         ];
         for shown in frames {
             assert!(!shown.contains("secret") && shown.contains("6 bytes"), "{shown}");

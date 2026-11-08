@@ -139,6 +139,8 @@ fn down_text(frame: &ServerFrame) -> String {
         ServerFrame::Compact { upto, .. } => format!("compact upto {upto}"),
         ServerFrame::Snapshot { base, manifest, .. } => format!("snapshot base {base} (manifest {manifest})"),
         ServerFrame::Presence { bytes, .. } => format!("presence ({} bytes)", bytes.len()),
+        ServerFrame::WelcomeSpace { protocol, .. } => format!("welcome space {protocol}"),
+        ServerFrame::PresenceFrom { bytes, .. } => format!("presence from ({} bytes)", bytes.len()),
         ServerFrame::CreatedDocument { kept, .. } => format!("created, kept {kept}"),
     }
 }

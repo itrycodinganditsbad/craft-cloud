@@ -7,10 +7,12 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod api;
+pub mod colour;
 pub mod ids;
 pub mod limits;
 pub mod local;
 pub mod name;
 
+pub use colour::{PALETTE, PALETTE_LEN, PaletteColour, member_colour, palette_colour};
 pub use ids::{DeviceId, DocId, Epoch, NodeId, SpaceId, VersionId};
 pub use name::{FoldKey, MAX_SPACE_NAME_CHARS, Name, NameError, SpaceName, SpaceNameError, UNICODE_VERSION, fold_search};
