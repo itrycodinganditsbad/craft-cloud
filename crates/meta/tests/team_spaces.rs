@@ -219,7 +219,7 @@ fn blob(pg: bool, tag: u8, n: u8, len: usize) -> String {
 
 // ---- the migration ----
 
-const SQLITE_0014: [&str; 14] = [
+const SQLITE_0014: [&str; 15] = [
     include_str!("../migrations/sqlite/0001_init.sql"),
     include_str!("../migrations/sqlite/0002_stored_bytes.sql"),
     include_str!("../migrations/sqlite/0003_live.sql"),
@@ -234,9 +234,10 @@ const SQLITE_0014: [&str; 14] = [
     include_str!("../migrations/sqlite/0012_versions_node_seq.sql"),
     include_str!("../migrations/sqlite/0013_trash.sql"),
     include_str!("../migrations/sqlite/0014_manifest_index.sql"),
+    include_str!("../migrations/sqlite/0015_physical_size.sql"),
 ];
 
-const POSTGRES_0014: [&str; 14] = [
+const POSTGRES_0014: [&str; 15] = [
     include_str!("../migrations/postgres/0001_init.sql"),
     include_str!("../migrations/postgres/0002_stored_bytes.sql"),
     include_str!("../migrations/postgres/0003_live.sql"),
@@ -251,9 +252,11 @@ const POSTGRES_0014: [&str; 14] = [
     include_str!("../migrations/postgres/0012_versions_node_seq.sql"),
     include_str!("../migrations/postgres/0013_trash.sql"),
     include_str!("../migrations/postgres/0014_manifest_index.sql"),
+    include_str!("../migrations/postgres/0015_physical_size.sql"),
 ];
 
-/// A database at schema version 14 with rows in every kind of table that holds user data: two accounts with devices,
+/// A database at schema version 15 (the names say 0014, which they were made for: team spaces came after the manifest index; the
+/// stored sizes of 0015 came before them on this stack) with rows in every kind of table that holds user data: two accounts with devices,
 /// their spaces with a folder, a file with a version, a deleted file, blobs, live documents with updates, an audit event,
 /// an invite and the manifest index.
 async fn database_at_0014(url: &str, pg: bool) -> AnyPool {
