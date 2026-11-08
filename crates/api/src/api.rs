@@ -284,8 +284,12 @@ pub struct AdminServerInfo {
     pub database_kind: String,
 }
 
-/// `GET /admin/storage`: server-wide storage counts and the ten largest accounts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `GET /admin/storage`: server-wide storage counts and the ten largest accounts, and how much room the server has.
+///
+/// The `Option` fields at the end are the room: each is left out of the JSON when the server has no number for it, and
+/// reads as `None` when an older server did not send it, so a client and a server of different versions keep working.
+/// The numbers are cheap to get (one filesystem query each, no scan of the stored data) and are read when asked.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminStorageOverview {
     pub accounts: u64,
     pub stored_bytes: u64,
@@ -297,6 +301,31 @@ pub struct AdminStorageOverview {
     pub accounts_over_quota: u64,
     pub top_accounts: Vec<AdminStorageAccount>,
     pub manifest_index: AdminManifestIndex,
+    /// Where the blobs are: `disk`, `s3` or `memory` (as `storage_kind` of [`AdminServerInfo`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_kind: Option<String>,
+    /// What the admin says the store may hold (`capacity` in the server's `[storage]` section). `None`: not set. It is
+    /// the only size an S3 store has; for a disk store the filesystem's own numbers are below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_bytes: Option<u64>,
+    /// Total size of the filesystem that holds a disk store. `None` for S3 and memory, or when it can't be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_fs_total_bytes: Option<u64>,
+    /// Bytes still available to the server on that filesystem (what the server's own user may use, which can be less
+    /// than the unused bytes on a disk that reserves room for another user).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_fs_free_bytes: Option<u64>,
+    /// Total size of the filesystem that holds the server's own data: the SQLite file. `None` for Postgres (the
+    /// database server's disk is not this server's to measure), or when it can't be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_fs_total_bytes: Option<u64>,
+    /// Bytes still available to the server on that filesystem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_fs_free_bytes: Option<u64>,
+    /// Size of the SQLite database on disk: the main file plus its `-wal` and `-shm` files when they exist. `None` for
+    /// Postgres.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_bytes: Option<u64>,
 }
 
 /// One account in [`AdminStorageOverview`].
@@ -309,7 +338,7 @@ pub struct AdminStorageAccount {
 }
 
 /// Global manifest-index counts from the metadata database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminManifestIndex {
     pub complete: u64,
     pub building: u64,

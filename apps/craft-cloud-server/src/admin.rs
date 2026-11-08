@@ -192,9 +192,13 @@ async fn server(State(state): State<Shared>) -> Result<Json<AdminServerInfo>, Ap
     }))
 }
 
-/// `GET /admin/storage`: bounded account and manifest-index counts, plus the ten largest accounts.
+/// `GET /admin/storage`: bounded account and manifest-index counts, plus the ten largest accounts, and the room the
+/// server has (filesystem numbers, the database's size and the configured capacity).
 async fn storage(State(state): State<Shared>) -> Result<Json<AdminStorageOverview>, ApiError> {
     let overview = state.meta.admin_storage_overview().await?;
+    let info = state.storage_info.clone();
+    // Filesystem queries block. If the task fails, the numbers are left out.
+    let measured = tokio::task::spawn_blocking(move || info.measure()).await.unwrap_or_default();
     Ok(Json(AdminStorageOverview {
         accounts: overview.accounts,
         stored_bytes: overview.stored_bytes,
@@ -217,6 +221,13 @@ async fn storage(State(state): State<Shared>) -> Result<Json<AdminStorageOvervie
             building: overview.manifest_index.building,
             not_indexed: overview.manifest_index.not_indexed,
         },
+        store_kind: Some(state.store.kind().to_owned()),
+        capacity_bytes: state.storage_info.capacity(),
+        store_fs_total_bytes: measured.store_fs_total,
+        store_fs_free_bytes: measured.store_fs_free,
+        server_fs_total_bytes: measured.server_fs_total,
+        server_fs_free_bytes: measured.server_fs_free,
+        database_bytes: measured.database_bytes,
     }))
 }
 

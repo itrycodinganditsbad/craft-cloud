@@ -22,10 +22,12 @@ clap.workspace = true
 craft-cloud-meta.workspace = true
 craft-cloud-proto.workspace = true
 craft-cloud-store.workspace = true
+fs4.workspace = true
 # The audit export's body is a stream of pages.
 futures-util.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
+percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true

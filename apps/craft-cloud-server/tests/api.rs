@@ -117,6 +117,67 @@ async fn sqlite_disk_with(limits: Limits) -> Server {
     start_with(meta, store, vec![db, blobs], None, limits).await
 }
 
+/// A SQLite and disk server that knows where to measure (`capacity`: the configured size, if any).
+async fn sqlite_disk_measured(capacity: Option<u64>) -> Server {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let db_file = db.path().join("meta.db");
+    let meta = Meta::open(&format!("sqlite:{}", db_file.display())).await.unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let info = craft_cloud_server::space::StorageInfo::new(capacity, Some(blobs.path().to_owned()), Some(db_file));
+    let state = AppState::new(meta.clone(), store, vec![]).unwrap().with_storage_info(info);
+    start_state(state, meta, vec![db, blobs], None).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_storage_overview_says_how_much_room_a_disk_store_and_the_database_have() {
+    for capacity in [Some(1u64 << 40), None] {
+        let s = sqlite_disk_measured(capacity).await;
+        add_admin(&s, "root").await;
+        let token = login(&s, "root").await;
+        let response = s.client.get(format!("{}/admin/storage", s.base)).bearer_auth(&token).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let overview: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(overview["store_kind"], "disk");
+        assert_eq!(overview.get("capacity_bytes").and_then(|v| v.as_u64()), capacity, "left out when not set");
+        let total = overview["store_fs_total_bytes"].as_u64().unwrap();
+        assert!(total > 0 && overview["store_fs_free_bytes"].as_u64().unwrap() <= total);
+        assert!(overview["server_fs_total_bytes"].as_u64().unwrap() > 0);
+        assert!(overview["server_fs_free_bytes"].is_u64());
+        assert!(overview["database_bytes"].as_u64().unwrap() > 0, "the SQLite file has a schema and an account");
+        // The typed body reads it too, and an older body without the fields still reads.
+        let typed: craft_cloud_proto::api::AdminStorageOverview = serde_json::from_value(overview.clone()).unwrap();
+        assert_eq!(typed.capacity_bytes, capacity);
+        let mut old = overview;
+        for key in [
+            "store_kind",
+            "capacity_bytes",
+            "store_fs_total_bytes",
+            "store_fs_free_bytes",
+            "server_fs_total_bytes",
+            "server_fs_free_bytes",
+            "database_bytes",
+        ] {
+            old.as_object_mut().unwrap().remove(key);
+        }
+        let typed: craft_cloud_proto::api::AdminStorageOverview = serde_json::from_value(old).unwrap();
+        assert_eq!((typed.store_kind, typed.capacity_bytes, typed.database_bytes), (None, None, None));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_that_was_not_told_where_to_measure_leaves_the_numbers_out() {
+    let s = sqlite_disk().await;
+    add_admin(&s, "root").await;
+    let token = login(&s, "root").await;
+    let response = s.client.get(format!("{}/admin/storage", s.base)).bearer_auth(&token).send().await.unwrap();
+    let overview: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(overview["store_kind"], "disk");
+    for key in ["capacity_bytes", "store_fs_total_bytes", "store_fs_free_bytes", "server_fs_total_bytes", "server_fs_free_bytes", "database_bytes"] {
+        assert!(overview.get(key).is_none(), "{key}");
+    }
+}
+
 async fn postgres_database() -> (Meta, PgGuard) {
     use sqlx::Connection;
     let admin_url = std::env::var("CRAFT_CLOUD_TEST_PG").unwrap();

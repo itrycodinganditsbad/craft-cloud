@@ -862,6 +862,13 @@ mod tests {
             accounts_over_quota: 0,
             top_accounts: vec![AdminStorageAccount { id, username: "ana".into(), stored_bytes: 17, quota_bytes: Some(99) }],
             manifest_index: AdminManifestIndex { complete: 3, building: 1, not_indexed: 2 },
+            store_kind: Some("disk".into()),
+            capacity_bytes: Some(1 << 40),
+            store_fs_total_bytes: Some(2 << 40),
+            store_fs_free_bytes: Some(1 << 39),
+            server_fs_total_bytes: Some(1 << 38),
+            server_fs_free_bytes: Some(1 << 37),
+            database_bytes: Some(123_456),
         };
         let usage = AccountUsage {
             stored_bytes: 17,
