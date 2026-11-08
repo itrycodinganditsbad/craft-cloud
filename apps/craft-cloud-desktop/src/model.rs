@@ -479,6 +479,8 @@ pub struct Overview {
     pub session: u64,
     /// The newest events of the account's activity, for the home page.
     pub recent: Recent,
+    /// The filters of that table (they narrow the events that are loaded).
+    pub recent_filter: crate::filter::ActivityFilter,
 }
 
 /// The home page's short list of the account's newest activity.
@@ -607,6 +609,7 @@ impl Overview {
             access: Access::Unknown,
             session: crate::admin::fresh(),
             recent: Recent::Loading,
+            recent_filter: crate::filter::ActivityFilter::default(),
         }
     }
 }
@@ -794,6 +797,10 @@ pub enum Event {
     TabNumber(usize),
     /// Ctrl+R: what the page's Refresh does, on a page that has one.
     RefreshPage,
+    /// An edit of the filters of the overview's Recent activity.
+    RecentFilter(crate::filter::FilterEdit),
+    /// An edit of the filters of the Security page's activity.
+    SecurityActivityFilter(crate::filter::FilterEdit),
     SignOut,
     /// Sign out on this computer only (the server can't be reached).
     SignOutHere,
@@ -1149,6 +1156,11 @@ impl Model {
         match &self.screen {
             Screen::Files(files) => files.list.as_ref().is_some_and(|list| !list.is_empty()),
             Screen::Trash(trash) => trash.page.is_some(),
+            Screen::SignedIn(o) => o.page == OverviewPage::Home && matches!(&o.recent, Recent::Loaded(events) if !events.is_empty()),
+            Screen::Security(page) => {
+                matches!(page.step, SecurityStep::Home | SecurityStep::SignOutOthers)
+                    && matches!(&page.activity, crate::security::SecurityActivity::Loaded(events) if !events.is_empty())
+            }
             Screen::Admin(admin) => {
                 admin.code.is_none()
                     && admin.dialog.is_none()
@@ -1862,6 +1874,18 @@ impl Model {
                 Some(tab) => self.update(Event::Tab(tab)),
                 None => Vec::new(),
             },
+            Event::RecentFilter(edit) => {
+                if let Screen::SignedIn(overview) = &mut self.screen {
+                    overview.recent_filter.edit(edit);
+                }
+                Vec::new()
+            }
+            Event::SecurityActivityFilter(edit) => {
+                if let Screen::Security(page) = &mut self.screen {
+                    page.activity_filter.edit(edit);
+                }
+                Vec::new()
+            }
             Event::RefreshPage => match self.refresh_event() {
                 Some(refresh) => self.update(refresh),
                 None => Vec::new(),
@@ -5065,5 +5089,35 @@ pub(crate) mod tests {
         let mut admin = signed_in_admin();
         admin.update(Event::Tab(Tab::Admin));
         assert!(admin.has_search(), "the accounts' search");
+    }
+
+    fn event_of(action: &str, device: Option<DeviceId>) -> AuditEvent {
+        AuditEvent { actor_device: device, ..crate::agent::fake::FakeAgent::sample_event(1, action) }
+    }
+
+    #[test]
+    fn the_activity_filters_belong_to_their_page_and_ctrl_f_finds_them_once_events_are_shown() {
+        use crate::filter::{ActivityKind, FilterEdit};
+        let mut m = signed_in();
+        assert!(!m.has_search(), "nothing is loaded");
+        let session = m.overview().unwrap().session;
+        m.update(Event::Recent { session, result: Ok(AuditPage { events: vec![event_of("auth.login", None)], next: None }) });
+        assert!(m.has_search());
+        m.update(Event::RecentFilter(FilterEdit::Kind(ActivityKind::Admin)));
+        m.update(Event::RecentFilter(FilterEdit::Search("x".into())));
+        let filter = m.overview().unwrap().recent_filter.clone();
+        assert_eq!((filter.kind, filter.search.as_str()), (ActivityKind::Admin, "x"));
+        // The other table is not touched, and the event does nothing on a page without the table.
+        m.update(Event::Tab(Tab::Security));
+        let Screen::Security(page) = &mut m.screen else { panic!() };
+        assert!(page.activity_filter.is_off());
+        m.update(Event::SecurityActivityFilter(FilterEdit::Kind(ActivityKind::Account)));
+        m.update(Event::RecentFilter(FilterEdit::Clear));
+        let Screen::Security(page) = &m.screen else { panic!() };
+        assert_eq!(page.activity_filter.kind, ActivityKind::Account);
+        assert_eq!(page.overview.recent_filter.kind, ActivityKind::Admin, "the overview's filters were not cleared from the other page");
+        assert!(!m.has_search(), "its events are not loaded");
+        m.update(Event::SecurityAnswer(SecurityAnswer::Activity(Ok(AuditPage { events: vec![event_of("auth.login", None)], next: None }))));
+        assert!(m.has_search());
     }
 }

@@ -238,9 +238,19 @@ fn recent_activity(ui: &mut egui::Ui, o: &Overview, now_ms: i64, events: &mut Ve
             ui.label(RichText::new("Nothing was recorded yet.").color(t.muted));
         }
         Recent::Loaded(list) => {
+            for edit in super::activity_filter::controls(ui, "recent", &o.recent_filter, list, &names) {
+                events.push(Event::RecentFilter(edit));
+            }
+            let visible = o.recent_filter.visible(list);
+            if visible.is_empty() {
+                if let Some(edit) = super::activity_filter::nothing_matches(ui) {
+                    events.push(Event::RecentFilter(edit));
+                }
+                return;
+            }
             let columns = [Column::fixed("When", 160.0), Column::flex("What", 240.0), Column::fixed("Computer", 160.0)];
-            super::kit::table(ui, "recent-activity", &columns, list.len(), ACTIVITY_ROW_H, |ui, row, column| {
-                let Some(event) = list.get(row) else { return };
+            super::kit::table(ui, "recent-activity", &columns, visible.len(), ACTIVITY_ROW_H, |ui, row, column| {
+                let Some(event) = visible.get(row).copied() else { return };
                 match column {
                     0 => {
                         ui.label(RichText::new(super::ago(now_ms, event.at_ms)).monospace());

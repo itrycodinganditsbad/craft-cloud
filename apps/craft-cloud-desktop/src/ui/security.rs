@@ -213,7 +213,7 @@ const FACT_ROW_H: f32 = 40.0;
 /// The page's start: the two-factor state and its actions, the password form, the computers signed in, and under them the
 /// newest security events. While the sign-out of the other computers is asked for, its confirmation sits under the cells.
 fn home(ui: &mut egui::Ui, page: &mut SecurityPage, now_ms: i64, events: &mut Vec<Event>) {
-    let SecurityPage { overview, info, step, password, activity, error, note, busy, .. } = page;
+    let SecurityPage { overview, info, step, password, activity, activity_filter, error, note, busy, .. } = page;
     let busy = *busy;
     super::kit::section_label(ui, &super::kit::numbered(1, "Your account"));
     ui.add_space(6.0);
@@ -275,7 +275,7 @@ fn home(ui: &mut egui::Ui, page: &mut SecurityPage, now_ms: i64, events: &mut Ve
         super::confirm::idle(ui);
     }
     ui.add_space(20.0);
-    security_activity(ui, activity, now_ms, events);
+    security_activity(ui, activity, activity_filter, now_ms, events);
     ui.add_space(14.0);
 }
 
@@ -465,7 +465,13 @@ fn computers_footer(ui: &mut egui::Ui, overview: &crate::model::Overview, asking
 
 /// "02 / Security activity": a label row with a link to the Activity tab, and the newest sign-ins and account changes in a
 /// When / Event / Computer / Result table; a muted line says when there are none or they couldn't be loaded.
-fn security_activity(ui: &mut egui::Ui, activity: &SecurityActivity, now_ms: i64, events: &mut Vec<Event>) {
+fn security_activity(
+    ui: &mut egui::Ui,
+    activity: &SecurityActivity,
+    filter: &crate::filter::ActivityFilter,
+    now_ms: i64,
+    events: &mut Vec<Event>,
+) {
     let t = Tokens::get(ui.ctx());
     let names = super::names(ui);
     super::kit::label_row(ui, &super::kit::numbered(2, "Security activity"), |ui| {
@@ -485,10 +491,20 @@ fn security_activity(ui: &mut egui::Ui, activity: &SecurityActivity, now_ms: i64
             ui.label(RichText::new("No sign-ins or account changes were recorded yet.").color(t.muted));
         }
         SecurityActivity::Loaded(list) => {
+            for edit in super::activity_filter::controls(ui, "security", filter, list, &names) {
+                events.push(Event::SecurityActivityFilter(edit));
+            }
+            let visible = filter.visible(list);
+            if visible.is_empty() {
+                if let Some(edit) = super::activity_filter::nothing_matches(ui) {
+                    events.push(Event::SecurityActivityFilter(edit));
+                }
+                return;
+            }
             let columns =
                 [Column::fixed("When", 160.0), Column::flex("Event", 240.0), Column::fixed("Computer", 160.0), Column::fixed("Result", 120.0)];
-            super::kit::table(ui, "security-activity", &columns, list.len(), ACTIVITY_ROW_H, |ui, row, column| {
-                let Some(event) = list.get(row) else { return };
+            super::kit::table(ui, "security-activity", &columns, visible.len(), ACTIVITY_ROW_H, |ui, row, column| {
+                let Some(event) = visible.get(row).copied() else { return };
                 match column {
                     0 => {
                         ui.label(RichText::new(super::ago(now_ms, event.at_ms)).monospace());

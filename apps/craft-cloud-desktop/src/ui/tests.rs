@@ -2492,3 +2492,67 @@ fn the_first_nine_tabs_have_a_shortcut_to_name() {
     assert!(named[..9].iter().enumerate().all(|(i, s)| s.as_deref().is_some_and(|s| s.ends_with(&(i + 1).to_string()))), "{named:?}");
     assert_eq!(named[9], None);
 }
+
+use crate::filter::{ActivityKind, FilterEdit};
+
+/// The Security page with the newest events, each by one of the two computers `computers_with_details` lists.
+fn security_with_activity() -> (Model, Vec<DeviceInfo>) {
+    use crate::security::SecurityAnswer;
+    let on = FakeAgent::new(signed_in());
+    on.factor.lock().unwrap().enabled = true;
+    let mut model = after(&on, vec![Event::Devices(Ok(computers_with_details())), Event::OpenSecurity]);
+    let known = match &model.screen {
+        Screen::Security(page) => page.overview.devices.clone().unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let mut list = audit_events();
+    for (n, event) in list.iter_mut().enumerate() {
+        event.actor_device = known.get(n % 2).map(|d| d.id);
+    }
+    model.update(Event::SecurityAnswer(SecurityAnswer::Activity(Ok(craft_cloud_app::AuditPage { events: list, next: None }))));
+    (model, known)
+}
+
+/// The filters of the activity tables narrow the loaded events: by kind, by computer and by a word.
+#[test]
+fn snapshot_filtered_activity() {
+    let (mut recent, computers) = overview_with_recent();
+    recent.update(Event::RecentFilter(FilterEdit::Kind(ActivityKind::Admin)));
+    snapshot_sized(recent.clone(), egui::Theme::Light, "overview-recent-filtered-light", [WINDOW_SIZE[0], 1100.0]);
+    // One computer's events, of every kind.
+    recent.update(Event::RecentFilter(FilterEdit::Kind(ActivityKind::All)));
+    recent.update(Event::RecentFilter(FilterEdit::Computer(computers.get(1).map(|d| d.id))));
+    snapshot_sized(recent.clone(), egui::Theme::Dark, "overview-recent-filtered-dark", [WINDOW_SIZE[0], 1100.0]);
+    // Kind and computer together leave nothing here, and a word on top of that too.
+    recent.update(Event::RecentFilter(FilterEdit::Kind(ActivityKind::Admin)));
+    recent.update(Event::RecentFilter(FilterEdit::Search("nothing like this".into())));
+    snapshot_sized(recent, egui::Theme::Light, "overview-recent-no-match-light", [WINDOW_SIZE[0], 1100.0]);
+
+    let (mut security, known) = security_with_activity();
+    security.update(Event::SecurityActivityFilter(FilterEdit::Computer(known.first().map(|d| d.id))));
+    security.update(Event::SecurityActivityFilter(FilterEdit::Search("sign".into())));
+    snapshot_sized(security, egui::Theme::Light, "security-activity-filtered-light", [WINDOW_SIZE[0], 1000.0]);
+}
+
+/// The filter controls send their edits, and a table that filters everything out offers to clear them.
+#[test]
+fn the_activity_filters_send_their_edits() {
+    use egui::accesskit::Role;
+    let (mut model, _) = overview_with_recent();
+    model.update(Event::RecentFilter(FilterEdit::Search("zzz".into())));
+    let mut h = harness_sized(model, egui::Theme::Light, [WINDOW_SIZE[0], 1100.0]);
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("Filters the loaded events").count(), 1);
+    h.get_by_label("Clear filters").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::RecentFilter(FilterEdit::Clear)]);
+
+    let (model, _) = overview_with_recent();
+    let mut h = harness_sized(model, egui::Theme::Light, [WINDOW_SIZE[0], 1100.0]);
+    h.run_steps(3);
+    h.get_by_role(Role::TextInput).focus();
+    h.get_by_role(Role::TextInput).type_text("role");
+    h.run_steps(3);
+    let sent = std::mem::take(&mut h.state_mut().1);
+    assert!(sent.iter().any(|e| matches!(e, Event::RecentFilter(FilterEdit::Search(text)) if text.contains("role"))), "{sent:?}");
+}

@@ -128,6 +128,8 @@ pub struct SecurityPage {
     pub password: PasswordFields,
     /// The newest security events of the account.
     pub activity: SecurityActivity,
+    /// The filters of the activity table (they narrow the events that are loaded).
+    pub activity_filter: crate::filter::ActivityFilter,
     /// What went wrong with the last try, for people.
     pub error: Option<String>,
     /// What the last action did ("Password changed").
@@ -285,6 +287,7 @@ impl SecurityPage {
                 step: Step::Home,
                 password: PasswordFields::default(),
                 activity: SecurityActivity::Loading,
+                activity_filter: crate::filter::ActivityFilter::default(),
                 error: None,
                 note: None,
                 busy: false,

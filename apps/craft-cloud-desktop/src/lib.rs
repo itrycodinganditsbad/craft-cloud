@@ -21,6 +21,7 @@ pub mod app;
 pub mod audit;
 pub mod autostart;
 pub mod files;
+pub mod filter;
 pub mod model;
 pub mod names;
 pub mod security;

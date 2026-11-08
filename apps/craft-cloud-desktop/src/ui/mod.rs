@@ -2,6 +2,7 @@
 //! returns the [`Event`]s its buttons sent, for [`Model::update`]. It reads no clock (the time comes in) and does no
 //! I/O, so kittest draws every screen against a fake agent.
 
+mod activity_filter;
 mod add_computer;
 mod admin;
 mod audit;
