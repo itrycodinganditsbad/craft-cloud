@@ -82,6 +82,43 @@ mod tests {
         assert_eq!(member_colour(Uuid::nil()), 1);
     }
 
+    /// Golden values: the same account has the same colour on every machine and in every release. A change here recolours
+    /// every member everywhere.
+    #[test]
+    fn colours_of_known_accounts_are_pinned() {
+        let known = [
+            (Uuid::nil(), 1u8),
+            (Uuid::from_bytes([7; 16]), 10),
+            (Uuid::from_bytes([0xff; 16]), 0),
+            (Uuid::from_u128(1), 0),
+            (Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef), 3),
+        ];
+        let got: Vec<u8> = known.iter().map(|(user, _)| member_colour(*user)).collect();
+        let want: Vec<u8> = known.iter().map(|(_, colour)| *colour).collect();
+        assert_eq!(got, want);
+    }
+
+    /// The twelve colours, value for value.
+    #[test]
+    fn the_palette_values_are_pinned() {
+        let want: [(&str, [u8; 3], [u8; 3]); PALETTE_LEN] = [
+            ("red", [0xc6, 0x28, 0x28], [0xef, 0x7a, 0x7a]),
+            ("orange", [0xd8, 0x4b, 0x0c], [0xff, 0x9a, 0x5c]),
+            ("amber", [0xa8, 0x6a, 0x00], [0xf5, 0xc0, 0x4a]),
+            ("lime", [0x5a, 0x7d, 0x0a], [0xb5, 0xd9, 0x5a]),
+            ("green", [0x1b, 0x7a, 0x3e], [0x6e, 0xd1, 0x8f]),
+            ("teal", [0x0b, 0x7a, 0x75], [0x5e, 0xd4, 0xcc]),
+            ("cyan", [0x08, 0x77, 0xa6], [0x5c, 0xc8, 0xf0]),
+            ("blue", [0x1f, 0x4f, 0xc4], [0x7f, 0xa6, 0xff]),
+            ("indigo", [0x4a, 0x3a, 0xc8], [0xa0, 0x98, 0xff]),
+            ("purple", [0x8a, 0x2f, 0xb8], [0xcf, 0x93, 0xf0]),
+            ("pink", [0xc2, 0x1f, 0x7a], [0xf5, 0x8a, 0xc4]),
+            ("slate", [0x4a, 0x5a, 0x6a], [0xa8, 0xb6, 0xc4]),
+        ];
+        let got: Vec<_> = PALETTE.iter().map(|c| (c.name, c.light, c.dark)).collect();
+        assert_eq!(got, want.to_vec());
+    }
+
     #[test]
     fn the_palette_has_twelve_distinct_colours() {
         let names: std::collections::BTreeSet<_> = PALETTE.iter().map(|c| c.name).collect();
