@@ -1904,6 +1904,15 @@ impl AppDoc {
         self.doc.send(&self.loro.export(ExportMode::updates(&before)).unwrap()).unwrap()
     }
 
+    /// Types at the end and hands the change to the agent as a held one (an app that ends with it unsent).
+    fn append_held(&self, s: &str) {
+        let before = self.loro.oplog_vv();
+        let t = self.loro.get_text("text");
+        t.insert(t.len_unicode(), s).unwrap();
+        self.loro.commit();
+        self.doc.hold(&self.loro.export(ExportMode::updates(&before)).unwrap()).unwrap();
+    }
+
     /// Types at the end and sends the whole history (for a document whose earlier changes the agent refused).
     fn append_all(&self, s: &str) -> u64 {
         let t = self.loro.get_text("text");
@@ -2098,6 +2107,44 @@ async fn a_role_changed_while_connected_is_acted_on_in_both_directions() {
         ana.text().contains(&format!("<{last}>"))
     })
     .await;
+}
+
+/// The agent tells every open document of a space when the account's right to change it changes, both ways, with no new
+/// open. A viewer's app that ends with changes it could not send hands them to the agent: they are kept, never sent while
+/// the account is a viewer, and go up when the role is raised, with no app open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_role_is_pushed_to_open_documents_and_what_a_viewers_app_hands_over_goes_up_when_it_may_write() {
+    let (t, ana_folder, ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let (space, ben_id) = (t.space, t.world.ben.id);
+    let (_docs_ana, ana) = app_opens(&t.ana, ana_folder.join("plan.txt"), "the plan", false, 11).await;
+    let (docs_ben, ben) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 12).await;
+    assert!(!ben.doc.read_only());
+
+    // Lowered: the open document is told, and it did not try anything.
+    t.world.meta.change_member_role(&SpaceActor::Cli, space, ben_id, SpaceRole::Viewer, 1).await.unwrap();
+    eventually("the open document is told it is read-only", || async { ben.pump().contains(&Event::Role { read_only: true }) }).await;
+
+    // The app ends with a change it could not send. The agent keeps it and, as long as the account is a viewer, never sends it.
+    ben.append_held(", written as a viewer");
+    drop(docs_ben);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    ana.pump();
+    assert_eq!(ana.text(), "the plan", "nothing of it reached the server");
+
+    // Raised with no app open: the held change goes up.
+    t.world.meta.change_member_role(&SpaceActor::Cli, space, ben_id, SpaceRole::Editor, 2).await.unwrap();
+    eventually("ana shows what the viewer's app handed over", || async {
+        ana.pump();
+        ana.text() == "the plan, written as a viewer"
+    })
+    .await;
+
+    // Opened again, the document is writable, and the told role follows the next change too.
+    let (_docs_again, again) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 13).await;
+    assert!(!again.doc.read_only());
+    assert_eq!(again.text(), "the plan, written as a viewer");
+    t.world.meta.change_member_role(&SpaceActor::Cli, space, ben_id, SpaceRole::Viewer, 3).await.unwrap();
+    eventually("the second document is told too", || async { again.pump().contains(&Event::Role { read_only: true }) }).await;
 }
 
 /// Journals with unacked updates survive a revocation: removed while offline with a change that was never acked, the account
