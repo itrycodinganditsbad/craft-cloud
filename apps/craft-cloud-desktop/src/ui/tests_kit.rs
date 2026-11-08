@@ -195,3 +195,11 @@ fn the_hairline_is_translucent_so_the_clear_colour_matters() {
     assert!(kit::Tokens::LIGHT.hairline().color.a() < 255);
     assert!(kit::Tokens::DARK.hairline().color.a() < 255);
 }
+
+#[test]
+fn a_plain_joined_cell_has_no_badge() {
+    let cell = JoinedCell::plain(Tone::Good, "Files");
+    assert!(cell.badge.is_empty());
+    assert_eq!(cell.label, "Files");
+    assert!(!cell.link);
+}

@@ -868,7 +868,8 @@ pub fn truncated(ui: &mut Ui, text: impl Into<egui::WidgetText>) -> Response {
     ui.add(egui::Label::new(text).truncate().selectable(false))
 }
 
-/// One cell of [`joined_cells`]: the badge (`01`) and the label on the right of its header strip.
+/// One cell of [`joined_cells`]: the badge (`01`) and the label on the right of its header strip. An empty badge draws
+/// none (see [`JoinedCell::plain`]).
 #[derive(Clone, Copy, Debug)]
 pub struct JoinedCell<'a> {
     pub badge: &'a str,
@@ -882,6 +883,11 @@ pub struct JoinedCell<'a> {
 impl<'a> JoinedCell<'a> {
     pub fn new(badge: &'a str, tone: Tone, label: &'a str) -> Self {
         Self { badge, tone, label, link: false }
+    }
+
+    /// A cell without the numbered badge: only the label in its header strip.
+    pub fn plain(tone: Tone, label: &'a str) -> Self {
+        Self::new("", tone, label)
     }
 
     pub fn link(mut self) -> Self {
@@ -947,7 +953,9 @@ pub fn joined_cells(
             let inner = egui::Rect::from_min_size(egui::pos2(x + JOINED_PAD_X, y), egui::vec2(cell_w - 2.0 * JOINED_PAD_X, JOINED_HEADER_H));
             let mut head = ui
                 .new_child(egui::UiBuilder::new().id_salt((id, i, "badge")).max_rect(inner).layout(egui::Layout::left_to_right(egui::Align::Center)));
-            badge(&mut head, cell.badge, cell.tone);
+            if !cell.badge.is_empty() {
+                badge(&mut head, cell.badge, cell.tone);
+            }
             let mut label = ui
                 .new_child(egui::UiBuilder::new().id_salt((id, i, "label")).max_rect(inner).layout(egui::Layout::right_to_left(egui::Align::Center)));
             if cell.link {
