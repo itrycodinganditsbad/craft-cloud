@@ -269,6 +269,14 @@ curl -s -X POST https://cloud.example.org/api/v1/admin/users/USER_ID/disable \
 - `GET /admin/storage` returns bounded storage totals, effective quota totals and near/over-quota counts, the ten
   largest accounts, manifest-index counts, and the room the server has (see "Storage capacity"). `GET /admin/users/{id}/usage` returns one account's stored bytes,
   effective quota, and labeled trash/history estimates; unknown and removed accounts return `404 not_found`.
+- `GET /admin/storage` also has a `compression` part, and `PUT /admin/storage/compression` with `{"level": 1 to 19, "password": …}`
+  sets the level new blobs are compressed at, without a restart. The config file stays the source of truth for the
+  algorithm: `compression = "none"` wins over any level (the overview shows `none`, and the level an admin set is kept
+  for when it is switched back). Otherwise an admin's level wins over `compression_level` in the file, is kept in the
+  database, and is taken again at every start. It changes only what is written from now on; use `store recompress` for what
+  is stored. Each change is an `admin.compression_changed` event with both levels. Another server process on the same
+  database takes the new level at its next start. The totals in the overview are summed over the blobs table and kept for 30
+  seconds.
 - `POST /admin/users` makes an account (role `admin` or `member`) with no password and gives an **invite**, shown once:
   the person chooses their password when they join with it (a whole join link is included when `public_url` is set).
   `POST /admin/users/{id}/invite` makes a new invite, but only for an account that still has no password; for one with a
