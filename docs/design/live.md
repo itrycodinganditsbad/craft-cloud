@@ -98,7 +98,7 @@ Errors use stable codes (`forbidden`, `wrong_password`, `already_signed_in`, `no
 disconnected, and the crate reconnects.
 
 **Server live endpoint** (agent ↔ server): `GET /api/v1/live` upgraded to a WebSocket, signed in with the device
-token like every call (at most 4 connections per device). Binary frames encoded with postcard (compact, no base64
+token like every call (at most 4 connections per device and space, 32 per device in all). Binary frames encoded with postcard (compact, no base64
 for opaque updates; variants are only ever appended, anything new is negotiated at `hello`), types in
 `craft-cloud-proto`:
 - `hello {min, max}` → `welcome {protocol, epoch}` (the space's epoch), or `error protocol_mismatch`. Protocol 2 adds
@@ -110,6 +110,20 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
   role}` instead of `welcome` and relays presence as `presence_from {doc, bytes, user}` instead of `presence`, `user`
   being the sending account, stamped by the server. Both are appended to the server's frames; every frame of
   protocol 2 keeps its bytes (golden tests pin them), and a connection that negotiates 2 sees exactly the old frames.
+- **Team spaces** (protocol 3, `docs/design/collaboration.md`). The upgrade names the space with the `craft-space`
+  header; a non-member is refused with `404` before the upgrade, and a team space is served to a connection that
+  reaches protocol 3 only (one that negotiates 2 is answered `protocol_mismatch`). The role is read at the upgrade and
+  again at `hello`, and sent in `welcome_space`. Per frame: `create`, `update` and `snapshot` need an editor and are
+  answered `error {read_only}` (naming the document, and the update) from a viewer, whose connection stays;
+  `subscribe` and `subscribe_log` need a viewer, `presence` and `unsubscribe` only the membership. The two kinds of
+  write are checked against the database when the frame arrives, so a change made by another process is respected at
+  once; a connection whose account is no longer a member, or whose role is not the one it was opened with, is closed
+  with `error {access_changed}` and a WebSocket close with code 4403 and reason `access_changed`. In this process that
+  happens at once (a membership, role, archive, disable or removal signal; within a second in the tests), for a change
+  made elsewhere at the next ping (30 s) at the latest. An archived space is read-only (every member is a viewer).
+  A viewer is never asked to `compact`. The caps are per space: the live bytes of a team space are
+  `[spaces] team_live_bytes` (4 GiB by default; a personal space keeps `live_bytes_per_user`), the documents and rows
+  counts are the ones of a personal space, per space.
 - `create {doc, kind}` → `created {doc}`; idempotent. Kinds: `recents:<app>`, whose ID is derived from the account and
   the app, so two machines that create it offline make the same one; and `document {node, app}`, a file of the synced
   folder, whose ID is `node_doc(space, node)` (BLAKE3 of both with a domain of its own, as a UUIDv8), so two machines
@@ -186,7 +200,8 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
 - Quota: once a document's log holds 16 MiB (about 30,000 recents adds), every later append is refused with
   `quota_exceeded` (one-way: the update that crosses the cap is the last one stored). The agent keeps every unacked
   update, retries with a pause growing to about 64 s, and says the document is full.
-  `craft-cloud-server live reset-doc <user> <app>` (or, for a document of a file, `<user> <document ID>`) empties the
+  `craft-cloud-server live reset-doc <user> <app>` (or, for a document of a file, `<user> <document ID>`; with
+  `--space <ID or name>`, the team space's document, `<user>` being one of its members) empties the
   log, drops the snapshot and the import, and raises the space's live generation in the same transaction, so every
   live connection ends at its next ping and every agent starts over and pushes what the log lacks. The file sync's
   epoch is untouched, so it never sees a reset. Nothing a machine holds is lost. Only the log above the snapshot
