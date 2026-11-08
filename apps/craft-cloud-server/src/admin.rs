@@ -242,12 +242,13 @@ const TOTALS_TTL_MS: i64 = 30_000;
 /// `store estimate`. `none` in the config shows as the algorithm and wins over the level.
 async fn compression_view(state: &AppState, cached: bool) -> Result<AdminCompression, ApiError> {
     let now = state.now_ms();
-    let kept = state.compression_totals.lock().ok().and_then(|slot| *slot).filter(|(at, _)| cached && now.saturating_sub(*at) < TOTALS_TTL_MS && *at <= now);
+    let kept =
+        state.compression_totals.lock().ok().and_then(|slot| *slot).filter(|(at, _)| cached && now.saturating_sub(*at) < TOTALS_TTL_MS && *at <= now);
     let totals = match kept {
         Some((_, totals)) => totals,
         None => {
             let totals = state.meta.storage_totals().await?;
-            if let Ok(mut slot) = state.compression_totals.lock() {
+            if cached && let Ok(mut slot) = state.compression_totals.lock() {
                 *slot = Some((now, totals));
             }
             totals

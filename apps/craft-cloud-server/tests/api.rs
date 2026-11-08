@@ -2346,7 +2346,7 @@ async fn every_admin_route_needs_an_admin(s: &Server) {
                 .replace(&spare_id.to_string(), "{device_id}")
         })
         .collect();
-    assert_eq!(distinct.len(), 12, "{distinct:?}");
+    assert_eq!(distinct.len(), 13, "{distinct:?}");
 
     for (method, path, body, ok) in routes {
         let counts = s.meta.admin_server_counts().await.unwrap();
