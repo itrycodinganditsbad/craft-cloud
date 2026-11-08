@@ -414,7 +414,9 @@ impl PresenceBudget {
 
 /// One docs connection: where its messages go, and the documents it has open (by its own numbers).
 struct DocsConn {
-    out: mpsc::Sender<DocOut>,
+    /// `None` once the connection didn't take a message (it doesn't read, or it is gone): nothing is sent to it any
+    /// more, but its handles stay until the connection's own `DocsCall::Gone`, in order after its changes.
+    out: Option<mpsc::Sender<DocOut>>,
     handles: BTreeMap<u64, DocId>,
     /// The numbers opened with `identity`.
     identity: BTreeSet<u64>,
@@ -684,13 +686,17 @@ impl State {
         self.control.look_at_spaces();
     }
 
-    /// Sends `message` to docs connection `conn`; one that can't take it (it doesn't read, or it is gone) is dropped.
+    /// Sends `message` to docs connection `conn`. One that can't take it (it doesn't read, or it is gone) gets nothing
+    /// more, and its sender is dropped so that its socket ends. Its handles stay: changes it queued before are still
+    /// to be taken in, and `DocsCall::Gone` (always the last call of a connection) cleans up after them.
     fn tell(&mut self, conn: ConnId, message: DocOut) -> Vec<ClientFrame> {
-        let Some(c) = self.docs.conns.get(&conn) else { return Vec::new() };
-        if c.out.try_send(message).is_ok() {
-            return Vec::new();
+        let Some(c) = self.docs.conns.get_mut(&conn) else { return Vec::new() };
+        if let Some(out) = &c.out
+            && out.try_send(message).is_err()
+        {
+            c.out = None;
         }
-        self.gone(conn)
+        Vec::new()
     }
 
     /// The opens of `doc`: every connection and number it is open as.
@@ -1172,7 +1178,7 @@ impl State {
     fn docs_call(&mut self, call: DocsCall) -> Vec<ClientFrame> {
         match call {
             DocsCall::Connect { conn, out } => {
-                self.docs.conns.insert(conn, DocsConn { out, handles: BTreeMap::new(), identity: BTreeSet::new(), presence: HashMap::new() });
+                self.docs.conns.insert(conn, DocsConn { out: Some(out), handles: BTreeMap::new(), identity: BTreeSet::new(), presence: HashMap::new() });
                 Vec::new()
             }
             DocsCall::Open { conn, id, path, app, file_hash, identity } => self.open(conn, id, &path, &app, Wish { file_hash, identity }),
