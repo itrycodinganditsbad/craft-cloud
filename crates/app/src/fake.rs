@@ -15,10 +15,16 @@
 //! saved files' records still go (a proxy that blocks WebSockets).
 //!
 //! Team spaces: [`Hub::machine_as`] makes a machine of another account on the same hub, and [`Hub::team`] makes the hub's
-//! space a team space (its documents say their `space`, `?for=` blobs are the space's and everyone's, a blob put without it
-//! stays in the account's personal space). An app that opens a document with `identity` hears the hub's accounts as
-//! `members` and the other accounts' presence as kind 5. [`Hub::set_read_only`] makes an account a viewer (its updates are
-//! refused with `read_only`, and the documents it opens say so), [`Hub::remove_member`] takes it out of the member list.
+//! space a team space whose folder is [`Hub::team_folder`]. As in the agent, a document is routed by its path (an absolute
+//! path inside the team folder is the team space's, any other is its account's personal space, and the personal spaces of
+//! two accounts are apart), and `?for=<path>` routes a blob the same way (a relative path is personal, an absolute path in
+//! no synced folder is `400 invalid`, a viewer's put to the team space `403 read_only`). Every document says its `space`.
+//! An app that opens a document with `identity` hears the space's accounts as `members` and the other accounts'
+//! presence as kind 5. [`Hub::set_read_only`] makes an account a viewer of the team space (its updates are refused with
+//! `read_only`, the documents it opens say so, apps are told with `role` when it changes, and changes an app hands over with
+//! [`HELD`] are kept until the account may write again), [`Hub::remove_member`] takes it out of the member list, and
+//! [`Hub::stop_team`] is the team space ceasing to sync on the machine (open documents say `stopped`, updates are answered
+//! `not_found`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -30,7 +36,7 @@ use std::time::Duration;
 use craft_cloud_api::api::SpaceRole;
 use craft_cloud_api::limits::{MAX_BLOB_BYTES, MAX_PRESENCE_BYTES, MAX_UPDATE_BYTES};
 use craft_cloud_api::local::blobs::{Stored, hex, parse_hex};
-use craft_cloud_api::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, PRESENCE_FROM, STATE, UPDATE, decode_binary, encode_binary};
+use craft_cloud_api::local::docs::{HELD, IMPORT, MAX_BINARY_BYTES, PRESENCE, PRESENCE_FROM, STATE, UPDATE, decode_binary, encode_binary};
 use craft_cloud_api::local::{
     DocMember, DocState, DocsEvent, DocsRequest, LOCAL_API_MAX, MAX_LOCAL_JSON_BYTES, NotLiveReason, RunState, SpaceInfo, SpaceList, SpaceSync,
     Status, paths,
@@ -72,6 +78,8 @@ struct Inner {
     read_only: HashSet<Uuid>,
     /// Accounts taken out of the team space's member list ([`Hub::remove_member`]).
     gone: HashSet<Uuid>,
+    /// The team space doesn't sync on the machines any more ([`Hub::stop_team`]).
+    team_stopped: bool,
 }
 
 /// Whose blobs: an account's personal space, or the team space.
@@ -113,6 +121,8 @@ struct MachineDoc {
     hub_seen: usize,
     /// Positions in `log` of this machine's updates the hub doesn't have yet.
     pending: VecDeque<usize>,
+    /// Changes an app handed over as a viewer ([`HELD`]): kept here, sent when the account may write.
+    held: Vec<Vec<u8>>,
 }
 
 struct Machine {
@@ -132,6 +142,8 @@ struct Machine {
     /// Saves made here that haven't gone up yet (offline): each path's file record on this machine until they do.
     file_pending: HashMap<String, Version>,
     account: Account,
+    /// The update frames apps sent to this machine, kept or not ([`Fake::update_frames`]).
+    update_frames: usize,
 }
 
 /// A live document's frontiers: `(peer, counter)` heads.
@@ -200,6 +212,7 @@ impl Hub {
                     refuse: VecDeque::new(),
                     file_pending: HashMap::new(),
                     account: Account { user: account_user(account), name: account.to_owned() },
+                    update_frames: 0,
                 },
             );
             members_changed(&inner);
@@ -225,16 +238,22 @@ impl Hub {
     /// the old one there.
     pub fn replace(&self, path: &str, import: Option<Vec<u8>>) {
         let mut inner = lock(&self.inner);
-        match import {
-            Some(import) => {
-                inner.docs.insert(path.to_owned(), HubDoc { id: DocId::generate(), import, log: Vec::new() });
-            }
-            None => {
-                inner.docs.remove(path);
+        let mut keys: Vec<String> = inner.docs.keys().filter(|k| key_path(k) == path).cloned().collect();
+        if keys.is_empty() {
+            keys.push(format!("{}\0{path}", account_user("fake")));
+        }
+        for key in keys {
+            match &import {
+                Some(import) => {
+                    inner.docs.insert(key, HubDoc { id: DocId::generate(), import: import.clone(), log: Vec::new() });
+                }
+                None => {
+                    inner.docs.remove(&key);
+                }
             }
         }
         for m in inner.machines.values_mut() {
-            m.docs.retain(|_, d| d.path != path);
+            m.docs.retain(|_, d| key_path(&d.path) != path);
         }
     }
 
@@ -247,15 +266,70 @@ impl Hub {
         space
     }
 
+    /// The team space's folder on every machine: an absolute path. A document opened by a path inside it is the team space's;
+    /// any other path (a relative one) is the account's personal space's.
+    pub fn team_folder(&self) -> String {
+        team_folder()
+    }
+
     /// Makes `account` a viewer of the team space (or an editor again): its updates are refused with `read_only` from now
-    /// on, as the agent does when the role is too low, and the documents it opens say `read_only`.
+    /// on, as the agent does when the role is too low, and the documents it opens say `read_only`. The apps with a team
+    /// document open hear it as `role`. When the account may write again, the changes apps handed over ([`HELD`]) go up.
     pub fn set_read_only(&self, account: &str, on: bool) {
         let user = account_user(account);
         let mut inner = lock(&self.inner);
-        if on {
-            inner.read_only.insert(user);
-        } else {
-            inner.read_only.remove(&user);
+        let changed = if on { inner.read_only.insert(user) } else { inner.read_only.remove(&user) };
+        if !changed {
+            return;
+        }
+        let mut told = Vec::new();
+        for (mid, m) in &mut inner.machines {
+            if m.account.user != user {
+                continue;
+            }
+            for (cid, c) in &m.conns {
+                let mut docs: Vec<DocId> = c.open.values().map(|o| o.doc).collect();
+                docs.sort_unstable();
+                docs.dedup();
+                for doc in docs {
+                    if m.docs.get(&doc).is_some_and(|d| is_team_key(&d.path)) {
+                        told.push((*mid, *cid, doc));
+                    }
+                }
+            }
+            if !on {
+                for d in m.docs.values_mut().filter(|d| is_team_key(&d.path)) {
+                    for held in std::mem::take(&mut d.held) {
+                        d.log.push((Origin::Remote, held));
+                        d.pending.push_back(d.log.len() - 1);
+                    }
+                }
+            }
+        }
+        for (mid, cid, doc) in told {
+            tell(&inner, mid, cid, &DocsEvent::Role { doc, read_only: on });
+        }
+        sync(&mut inner);
+    }
+
+    /// The team space stops syncing on every machine (turned off, the folder moved, access lost): the apps with one of its
+    /// documents open are told `stopped`, a later update is answered `not_found` and nothing is kept, and opening one of its
+    /// files says `not_live`.
+    pub fn stop_team(&self) {
+        let mut inner = lock(&self.inner);
+        inner.team_stopped = true;
+        for (mid, m) in &inner.machines {
+            for (cid, c) in &m.conns {
+                let mut docs: Vec<DocId> = c.open.values().map(|o| o.doc).collect();
+                docs.sort_unstable();
+                docs.dedup();
+                for doc in docs {
+                    if let Some(d) = m.docs.get(&doc).filter(|d| is_team_key(&d.path)) {
+                        let status = DocsEvent::Status { doc, online: false, waiting: d.pending.len() as u64, deleted: false, stopped: true };
+                        tell(&inner, *mid, *cid, &status);
+                    }
+                }
+            }
         }
     }
 
@@ -284,18 +358,30 @@ impl Hub {
     /// Another program writes `path`'s file (no save record): every machine's apps hear it has none.
     pub fn edit_outside(&self, path: &str) {
         let mut inner = lock(&self.inner);
-        inner.files.insert(path.to_owned(), None);
+        let mut keys: Vec<String> = inner.docs.keys().filter(|k| key_path(k) == path).cloned().collect();
+        if keys.is_empty() {
+            keys.push(format!("{}\0{path}", account_user("fake")));
+        }
+        for key in keys {
+            inner.files.insert(key, None);
+        }
         sync(&mut inner);
     }
 
     /// The record of `path`'s file on the server: the live document's version a Craft app saved it from.
     pub fn file(&self, path: &str) -> Option<Vec<(u64, u32)>> {
-        lock(&self.inner).files.get(path).cloned().flatten()
+        lock(&self.inner).files.iter().find(|(k, _)| key_path(k) == path).and_then(|(_, v)| v.clone())
+    }
+
+    /// How many changes apps handed over as viewers ([`HELD`]) the machines hold for the document at `path`, not sent yet.
+    pub fn held(&self, path: &str) -> usize {
+        let inner = lock(&self.inner);
+        inner.machines.values().flat_map(|m| m.docs.values()).filter(|d| key_path(&d.path) == path).map(|d| d.held.len()).sum()
     }
 
     /// How many updates the hub holds of the document at `path` (0 when it has none).
     pub fn updates(&self, path: &str) -> usize {
-        lock(&self.inner).docs.get(path).map_or(0, |d| d.log.len())
+        lock(&self.inner).docs.iter().filter(|(k, _)| key_path(k) == path).map(|(_, d)| d.log.len()).sum()
     }
 
     fn serve(&self, machine: usize, mut stream: TcpStream) {
@@ -310,11 +396,11 @@ impl Hub {
         // `?for=<path>` on a blob call: the call is for that file's space.
         let for_path = match request.path.split_once('?') {
             Some((route, query)) => {
-                let bound = query.split('&').any(|pair| pair.starts_with("for="));
+                let bound = query.split('&').find_map(|pair| pair.strip_prefix("for=")).map(percent_decode);
                 request.path = route.to_owned();
                 bound
             }
-            None => false,
+            None => None,
         };
         if too_old && request.path.starts_with(paths::BLOBS) {
             respond_error(&mut stream, 404, "not_found", "no such call");
@@ -353,13 +439,13 @@ impl Hub {
             ("PUT", paths::BLOBS) | ("GET", _) if too_old && (request.path == paths::BLOBS || blob_get.is_some()) => {
                 respond_error(&mut stream, 404, "not_found", "no such call");
             }
-            ("PUT", paths::BLOBS) => match self.put_blob(machine, &request.body, for_path) {
+            ("PUT", paths::BLOBS) => match self.put_blob(machine, &request.body, for_path.as_deref()) {
                 Ok(stored) => respond_json(&mut stream, 200, &stored),
                 Err((status, code, message)) => respond_error(&mut stream, status, code, &message),
             },
             ("GET", _) if blob_get.is_some() => {
                 let hash = blob_get.as_deref().and_then(parse_hex);
-                match hash.map(|h| self.get_blob(machine, &h, for_path)) {
+                match hash.map(|h| self.get_blob(machine, &h, for_path.as_deref())) {
                     Some(Ok(bytes)) => respond(&mut stream, 200, "application/octet-stream", &bytes),
                     Some(Err((status, code, message))) => respond_error(&mut stream, status, code, &message),
                     None => respond_error(&mut stream, 400, "invalid", "not a blob's name"),
@@ -395,27 +481,28 @@ impl Hub {
         SpaceList { spaces }
     }
 
-    fn put_blob(&self, machine: usize, bytes: &[u8], for_path: bool) -> Result<Stored, (u16, &'static str, String)> {
+    fn put_blob(&self, machine: usize, bytes: &[u8], for_path: Option<&str>) -> Result<Stored, (u16, &'static str, String)> {
         if bytes.is_empty() || bytes.len() > MAX_BLOB_BYTES {
             return Err((413, "too_large", format!("a blob is 1 byte to {MAX_BLOB_BYTES} bytes")));
         }
         let hash = fake_hash(bytes);
         let mut inner = lock(&self.inner);
-        let team = inner.team.is_some();
+        let space = blob_route(&inner, machine, for_path)?;
+        // A viewer may not put into the team space.
+        if space == BlobSpace::Team && inner.machines.get(&machine).is_some_and(|m| inner.read_only.contains(&m.account.user)) {
+            return Err((403, "read_only", "this space is read-only for you".into()));
+        }
         let Some(m) = inner.machines.get_mut(&machine) else { return Err((500, "internal", "no machine".into())) };
-        let key = (blob_space(m, for_path && team), hash);
+        let key = (space, hash);
         m.blobs.insert(key, bytes.to_vec());
         m.pending_blobs.push(key);
         sync(&mut inner);
         Ok(Stored { hash, len: bytes.len() as u64 })
     }
 
-    fn get_blob(&self, machine: usize, hash: &[u8; 32], for_path: bool) -> Result<Vec<u8>, (u16, &'static str, String)> {
+    fn get_blob(&self, machine: usize, hash: &[u8; 32], for_path: Option<&str>) -> Result<Vec<u8>, (u16, &'static str, String)> {
         let mut inner = lock(&self.inner);
-        let team = inner.team.is_some();
-        let Some(space) = inner.machines.get(&machine).map(|m| blob_space(m, for_path && team)) else {
-            return Err((500, "internal", "no machine".into()));
-        };
+        let space = blob_route(&inner, machine, for_path)?;
         let key = (space, *hash);
         let hub_copy = inner.blobs.get(&key).cloned();
         let Some(m) = inner.machines.get_mut(&machine) else { return Err((500, "internal", "no machine".into())) };
@@ -504,7 +591,8 @@ impl Hub {
                         c.identity.insert(id);
                     }
                 }
-                open(&mut inner, machine, conn, id, &path);
+                let key = doc_key(&inner, machine, &path);
+                open(&mut inner, machine, conn, id, &key);
             }
             DocsRequest::Close { doc } => {
                 if let Some(c) = inner.machines.get_mut(&machine).and_then(|m| m.conns.get_mut(&conn)) {
@@ -512,6 +600,15 @@ impl Hub {
                 }
             }
             DocsRequest::Saved { doc, hash, frontiers } => {
+                let stopped = inner.team_stopped && inner.machines.get(&machine).and_then(|m| m.docs.get(&doc)).is_some_and(|d| is_team_key(&d.path));
+                if stopped {
+                    return tell(
+                        &inner,
+                        machine,
+                        conn,
+                        &DocsEvent::Error { id: None, seq: None, code: "not_found".into(), message: "the space stopped syncing on this computer".into() },
+                    );
+                }
                 let Some(m) = inner.machines.get_mut(&machine) else { return };
                 m.saves.push((doc, hash, frontiers.clone()));
                 // The file is written and goes up at once (offline: once the machine is back). (The fake reads no
@@ -542,9 +639,35 @@ impl Hub {
                 inner.docs.entry(path.clone()).or_insert_with(|| HubDoc { id: new_id, import: body.to_vec(), log: Vec::new() });
                 open(&mut inner, machine, conn, id, &path);
             }
+            HELD => {
+                // What an app that ends hands over (it made it as a viewer and kept it): the account's changes, not acked.
+                let Some(doc) = inner.machines.get(&machine).and_then(|m| m.conns.get(&conn)).and_then(|c| c.open.get(&id)).map(|o| o.doc) else {
+                    return;
+                };
+                let team_doc = inner.machines.get(&machine).and_then(|m| m.docs.get(&doc)).is_some_and(|d| is_team_key(&d.path));
+                let viewer = team_doc && inner.machines.get(&machine).is_some_and(|m| inner.read_only.contains(&m.account.user));
+                if (team_doc && inner.team_stopped) || body.is_empty() || body.len() > MAX_UPDATE_BYTES {
+                    return;
+                }
+                let Some(d) = inner.machines.get_mut(&machine).and_then(|m| m.docs.get_mut(&doc)) else { return };
+                if viewer {
+                    d.held.push(body.to_vec());
+                    return;
+                }
+                d.log.push((Origin::Conn(conn), body.to_vec()));
+                d.pending.push_back(d.log.len() - 1);
+                sync(&mut inner);
+            }
             UPDATE => {
-                let viewer = inner.machines.get(&machine).is_some_and(|m| inner.read_only.contains(&m.account.user));
+                let team_doc = inner
+                    .machines
+                    .get(&machine)
+                    .and_then(|m| m.conns.get(&conn).and_then(|c| c.open.get(&id)).and_then(|o| m.docs.get(&o.doc)))
+                    .is_some_and(|d| is_team_key(&d.path));
+                let viewer = team_doc && inner.machines.get(&machine).is_some_and(|m| inner.read_only.contains(&m.account.user));
+                let stopped = team_doc && inner.team_stopped;
                 let Some(m) = inner.machines.get_mut(&machine) else { return };
+                m.update_frames += 1;
                 let Some(c) = m.conns.get_mut(&conn) else { return };
                 let Some(opened) = c.open.get_mut(&id) else { return };
                 opened.seq += 1;
@@ -552,6 +675,11 @@ impl Hub {
                 if body.is_empty() || body.len() > MAX_UPDATE_BYTES {
                     let message = format!("an update is 1 byte to {MAX_UPDATE_BYTES} bytes");
                     return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "too_large".into(), message });
+                }
+                // The space stopped syncing here: nothing is kept.
+                if stopped {
+                    let message = "the space stopped syncing on this computer: nothing was kept".to_owned();
+                    return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "not_found".into(), message });
                 }
                 // A viewer's update is refused, and kept nowhere.
                 if viewer {
@@ -579,6 +707,10 @@ impl Hub {
                 };
                 let from_online = inner.machines.get(&machine).is_some_and(|m| m.online);
                 let Some(sender) = inner.machines.get(&machine).map(|m| m.account.user) else { return };
+                let team_doc = inner.machines.get(&machine).and_then(|m| m.docs.get(&doc)).is_some_and(|d| is_team_key(&d.path));
+                if team_doc && inner.team_stopped {
+                    return;
+                }
                 // The account's frame for apps that asked who sent it: `[16 bytes account ID][the app's bytes]`.
                 let stamped = [sender.as_bytes().as_slice(), body].concat();
                 for (mid, m) in &inner.machines {
@@ -586,7 +718,7 @@ impl Hub {
                         continue;
                     }
                     // (A member taken out of the space neither sends nor hears.)
-                    if inner.team.is_some() && (inner.gone.contains(&sender) || inner.gone.contains(&m.account.user)) {
+                    if team_doc && (inner.gone.contains(&sender) || inner.gone.contains(&m.account.user)) {
                         continue;
                     }
                     for (cid, c) in &m.conns {
@@ -613,13 +745,16 @@ impl Hub {
 
 /// Opens the document at `path` on `machine` for `conn` under `id` (the machine takes the hub's copy if it has none).
 fn open(inner: &mut Inner, machine: usize, conn: u64, id: u64, path: &str) {
+    if inner.team_stopped && is_team_key(path) {
+        return tell(inner, machine, conn, &DocsEvent::NotLive { id, reason: NotLiveReason::Offline, message: None });
+    }
     let hub_doc = inner.docs.get(path).map(|d| (d.id, d.import.clone()));
     let Some(m) = inner.machines.get_mut(&machine) else { return };
     let known = m.docs.iter().find(|(_, d)| d.path == path).map(|(doc, _)| *doc);
     let doc = match (known, hub_doc) {
         (Some(doc), _) => doc,
         (None, Some((doc, import))) if m.online => {
-            m.docs.insert(doc, MachineDoc { path: path.to_owned(), import, log: Vec::new(), hub_seen: 0, pending: VecDeque::new() });
+            m.docs.insert(doc, MachineDoc { path: path.to_owned(), import, log: Vec::new(), hub_seen: 0, pending: VecDeque::new(), held: Vec::new() });
             doc
         }
         (None, None) if m.online => {
@@ -636,7 +771,10 @@ fn open(inner: &mut Inner, machine: usize, conn: u64, id: u64, path: &str) {
     // Edited outside Craft unless some machine's app saved that content (the server's versions keep every record).
     let file_hash = inner.machines.get(&machine).and_then(|m| m.conns.get(&conn)).and_then(|c| c.apps.get(&id)).and_then(Clone::clone);
     let changed_outside = file_hash.map(|h| !inner.machines.values().any(|m| m.saves.iter().any(|(d, saved, _)| *d == doc && *saved == h)));
-    let (space, read_only) = (inner.team, inner.machines.get(&machine).is_some_and(|m| inner.read_only.contains(&m.account.user)));
+    let user = inner.machines.get(&machine).map(|m| m.account.user).unwrap_or_default();
+    let team_doc = is_team_key(path);
+    let space = Some(if team_doc { inner.team.unwrap_or_else(|| SpaceId::from_uuid(user)) } else { SpaceId::from_uuid(user) });
+    let read_only = team_doc && inner.read_only.contains(&user);
     let Some(m) = inner.machines.get_mut(&machine) else { return };
     let online = m.online;
     let Some(d) = m.docs.get(&doc) else { return };
@@ -673,17 +811,100 @@ fn account_user(name: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-/// The space a blob call of `machine` is for: the team space's with `team`, else the account's personal space.
-fn blob_space(machine: &Machine, team: bool) -> BlobSpace {
-    if team { BlobSpace::Team } else { BlobSpace::Personal(machine.account.user) }
+/// The team space's folder, the same on every machine (an absolute path).
+fn team_folder() -> String {
+    std::env::temp_dir().join("craft-cloud-fake-team").to_string_lossy().into_owned()
+}
+
+/// A path's parts, with `.` and `..` taken out; none when it climbs above its root.
+fn segments(path: &str) -> Option<Vec<String>> {
+    let mut parts: Vec<String> = Vec::new();
+    for part in path.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other.to_owned()),
+        }
+    }
+    Some(parts)
+}
+
+/// The rest of `path` below the team folder, when it is an absolute path inside it (`.` and `..` taken out first).
+fn in_team_folder(path: &str) -> Option<String> {
+    if !std::path::Path::new(path).is_absolute() {
+        return None;
+    }
+    let parts = segments(path)?;
+    let folder = segments(&team_folder())?;
+    let rest = parts.strip_prefix(folder.as_slice())?;
+    Some(rest.join("/"))
+}
+
+/// The key a document of `path` is kept under on the hub: the team space's, or the account's personal space's (the
+/// personal spaces of two accounts are apart).
+fn doc_key(inner: &Inner, machine: usize, path: &str) -> String {
+    if inner.team.is_some()
+        && let Some(rest) = in_team_folder(path)
+    {
+        return format!("team\0{rest}");
+    }
+    let user = inner.machines.get(&machine).map(|m| m.account.user).unwrap_or_default();
+    format!("{user}\0{path}")
+}
+
+/// Whether a document key is the team space's.
+fn is_team_key(key: &str) -> bool {
+    key.starts_with("team\0")
+}
+
+/// The path part of a document key.
+fn key_path(key: &str) -> &str {
+    key.split_once('\0').map_or(key, |(_, path)| path)
+}
+
+/// The space a blob call of `machine` is for, from its `for` path as the agent routes it: none is the account's personal space,
+/// as is a relative path; an absolute path inside the team folder is the team space's; any other is `400 invalid` (it is in no
+/// synced folder, or it climbs out of one).
+fn blob_route(inner: &Inner, machine: usize, for_path: Option<&str>) -> Result<BlobSpace, (u16, &'static str, String)> {
+    let user = inner.machines.get(&machine).map(|m| m.account.user).unwrap_or_default();
+    let Some(path) = for_path else { return Ok(BlobSpace::Personal(user)) };
+    if !std::path::Path::new(path).is_absolute() {
+        return Ok(BlobSpace::Personal(user));
+    }
+    if inner.team.is_some() && !inner.gone.contains(&user) && in_team_folder(path).is_some() {
+        return Ok(BlobSpace::Team);
+    }
+    Err((400, "invalid", "that path is in no synced folder".into()))
+}
+
+/// `%XX` escapes undone (the value of a query's `for=`).
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        let hex = |at: usize| bytes.get(at).and_then(|c| (*c as char).to_digit(16));
+        if b == b'%'
+            && let (Some(hi), Some(lo)) = (hex(i + 1), hex(i + 2))
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The members of the space of a document, for the account `for_user`: in a team space the accounts of the hub's
 /// machines that were not removed, else the account alone.
-fn members_of(inner: &Inner, for_user: Uuid) -> Vec<DocMember> {
+fn members_of(inner: &Inner, for_user: Uuid, team_doc: bool) -> Vec<DocMember> {
     let mut users: Vec<(Uuid, String)> = Vec::new();
     for m in inner.machines.values() {
-        let counts = if inner.team.is_some() { !inner.gone.contains(&m.account.user) } else { m.account.user == for_user };
+        let counts = if team_doc { !inner.gone.contains(&m.account.user) } else { m.account.user == for_user };
         if counts && !users.iter().any(|(u, _)| *u == m.account.user) {
             users.push((m.account.user, m.account.name.clone()));
         }
@@ -694,8 +915,9 @@ fn members_of(inner: &Inner, for_user: Uuid) -> Vec<DocMember> {
 
 /// Sends the members to the document opened as `id` on `conn`.
 fn send_members(inner: &Inner, machine: usize, conn: u64, id: u64) {
-    let Some(user) = inner.machines.get(&machine).map(|m| m.account.user) else { return };
-    tell(inner, machine, conn, &DocsEvent::Members { id, members: members_of(inner, user) });
+    let Some(m) = inner.machines.get(&machine) else { return };
+    let team_doc = m.conns.get(&conn).and_then(|c| c.open.get(&id)).and_then(|o| m.docs.get(&o.doc)).is_some_and(|d| is_team_key(&d.path));
+    tell(inner, machine, conn, &DocsEvent::Members { id, members: members_of(inner, m.account.user, team_doc) });
 }
 
 /// The member list changed: every document opened with `identity` hears it.
@@ -836,6 +1058,11 @@ impl Fake {
         sync(&mut inner);
     }
 
+    /// How many update frames apps sent to this machine in all, kept or refused (to tell a change sent again from one sent once).
+    pub fn update_frames(&self) -> usize {
+        lock(&self.hub.inner).machines.get(&self.id).map_or(0, |m| m.update_frames)
+    }
+
     /// The account this machine is signed in as.
     pub fn account(&self) -> String {
         lock(&self.hub.inner).machines.get(&self.id).map(|m| m.account.name.clone()).unwrap_or_default()
@@ -897,7 +1124,7 @@ impl Fake {
     /// How many of this machine's updates of the document at `path` the hub doesn't have yet.
     pub fn waiting(&self, path: &str) -> usize {
         let inner = lock(&self.hub.inner);
-        inner.machines.get(&self.id).map_or(0, |m| m.docs.values().filter(|d| d.path == path).map(|d| d.pending.len()).sum())
+        inner.machines.get(&self.id).map_or(0, |m| m.docs.values().filter(|d| key_path(&d.path) == path).map(|d| d.pending.len()).sum())
     }
 }
 

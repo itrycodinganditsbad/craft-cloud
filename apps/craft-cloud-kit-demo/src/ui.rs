@@ -96,7 +96,12 @@ impl Demo {
     /// Opens `rel` (relative to the synced folder `folder`) as `machine`, live through `agent` (opened off this
     /// thread; `wake` is called when it is open or something comes).
     pub fn open(agent: Option<Agent>, folder: &Path, rel: &str, machine: &str, wake: impl Fn() + Send + Sync + Clone + 'static) -> Self {
-        let file = folder.join(rel);
+        Self::open_file(agent, folder.join(rel), rel, machine, wake)
+    }
+
+    /// Opens the file at `file` live under the path `rel` the agent knows it by (an absolute path inside a team space's synced
+    /// folder, for a document of a team space; the path relative to the synced folder otherwise).
+    pub fn open_file(agent: Option<Agent>, file: PathBuf, rel: &str, machine: &str, wake: impl Fn() + Send + Sync + Clone + 'static) -> Self {
         let (doc, bytes, message) = match read_file(&file) {
             Ok((doc, bytes)) => (doc, bytes, String::new()),
             Err(e) => (DemoDoc::default(), Vec::new(), e),

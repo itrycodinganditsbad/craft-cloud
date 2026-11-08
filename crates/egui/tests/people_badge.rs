@@ -23,7 +23,7 @@ const PINK: PaletteColour = PaletteColour { name: "pink", light: [0xc2, 0x1f, 0x
 const SLATE: PaletteColour = PaletteColour { name: "slate", light: [0x4a, 0x5a, 0x6a], dark: [0xa8, 0xb6, 0xc4] };
 
 fn person(name: &str, colour: PaletteColour, is_self: bool) -> Person {
-    Person { name: name.to_owned(), colour, is_self, peers: Vec::new() }
+    Person::new(name, colour, is_self, Vec::new())
 }
 
 /// Three people, then six (two more than are shown).
@@ -79,13 +79,13 @@ fn the_people_badge_in_light_and_dark() {
     for (theme, name) in [(egui::Theme::Light, "people-badge-light"), (egui::Theme::Dark, "people-badge-dark")] {
         let mut h = draw(theme);
         h.run_steps(4);
-        // Initials: two words give one letter each, one word gives two letters; the rest are counted.
-        for initials in ["AN", "BO", "CL", "DM"] {
-            assert!(h.query_all_by_label(initials).count() >= 1, "{initials} in {name}");
+        // What a screen reader says: each pill is the person's name ("(you)" after your own), "+N" the names behind it.
+        for named in ["ana (you)", "Ben Okafor", "cara-lee", "dmitri"] {
+            assert!(h.query_all_by_label(named).count() >= 1, "{named} in {name}");
         }
-        assert!(h.query_by_label("+2").is_some(), "the two not shown are counted in {name}");
+        assert!(h.query_by_label("2 more: Eva, fatima_k").is_some(), "the two not shown are counted, with their names, in {name}");
         assert_eq!(PEOPLE_SHOWN, 4);
-        for hidden in ["EV", "FA"] {
+        for hidden in ["Eva", "fatima_k"] {
             assert!(h.query_by_label(hidden).is_none(), "only {PEOPLE_SHOWN} are shown in {name}");
         }
         let image = h.render().unwrap();
@@ -98,5 +98,5 @@ fn the_people_badge_in_light_and_dark() {
 fn nobody_draws_nothing() {
     let mut h = Harness::new_ui(|ui| people_badge(ui, &[]));
     h.run();
-    assert!(h.query_by_label("+1").is_none());
+    assert!(h.query_all_by_label_contains("more").count() == 0);
 }
