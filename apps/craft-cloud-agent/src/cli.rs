@@ -1690,6 +1690,8 @@ pub struct Session {
     _folder_lock: Lock,
     /// A team space's folder as `state.json` records it (canonical); `None` for the personal space.
     state_folder: Option<PathBuf>,
+    /// The folder the session was opened on (a team space's), to notice a link that leads elsewhere later.
+    opened_on: Option<crate::disk::FolderIdentity>,
     /// The server's stamp of the account's membership of a team space that `state.json` records (see
     /// [`SavedState::joined_ms`]); `None` for the personal space.
     joined_ms: Option<i64>,
@@ -1784,6 +1786,7 @@ impl Session {
                 SavedState { schema: STATE_SCHEMA, state: state.clone(), last_pass, paused: false, folder: checkpoint_folder.clone(), joined_ms };
             checkpoint_data.save_state(&saved).map_err(|e| std::io::Error::other(e.to_string()))
         });
+        let opened_on = bound.then(|| crate::disk::folder_identity(&account.folder)).flatten();
         Ok(Self {
             data: data.clone(),
             root: root_data.clone(),
@@ -1792,6 +1795,7 @@ impl Session {
             engine,
             last_pass,
             _folder_lock: folder_lock,
+            opened_on,
             state_folder,
             joined_ms,
             stability,
@@ -1802,6 +1806,14 @@ impl Session {
     /// The server's stamp of the account's membership that this session's state was opened under (team spaces only).
     pub fn joined_ms(&self) -> Option<i64> {
         self.joined_ms
+    }
+
+    /// A team space's folder now leads to another folder than the one the session was opened on (a link was pointed
+    /// elsewhere, or the folder was replaced): what the session remembers is not about this folder. A folder that can't be
+    /// looked at is not "moved" (the pass says what is wrong with it).
+    pub fn folder_moved(&self) -> bool {
+        let now = self.bound.then(|| crate::disk::folder_identity(&self.account.folder)).flatten();
+        matches!((&self.opened_on, now), (Some(then), Some(now)) if *then != now)
     }
 
     pub fn account(&self) -> &Account {

@@ -394,9 +394,20 @@ fn pass_thread(
         }) {
             sessions.retain(|(id, _)| *id != space);
         }
-        let index = match sessions.iter().position(|(id, _)| *id == space) {
-            Some(index) => Ok(index),
-            None => Session::open_team(&data, &account, &job.setting, job.joined_ms, Some(job.stability.clone())).map(|session| {
+        // The folder may lead somewhere else than when the session opened (a link pointed at another folder): the session's
+        // state is about the old one, so it is dropped and the space starts afresh there, as a first sync.
+        let mut moved = None;
+        if sessions.iter().any(|(id, s)| *id == space && s.folder_moved()) {
+            sessions.retain(|(id, _)| *id != space);
+            crate::runlog::note(format_args!("the folder of team space {space} leads somewhere else now: starting afresh, nothing is deleted"));
+            if let Err(e) = data.space_dir(space).remove_state() {
+                moved = Some(AgentError::from(e));
+            }
+        }
+        let index = match (moved, sessions.iter().position(|(id, _)| *id == space)) {
+            (Some(e), _) => Err(e),
+            (None, Some(index)) => Ok(index),
+            (None, None) => Session::open_team(&data, &account, &job.setting, job.joined_ms, Some(job.stability.clone())).map(|session| {
                 sessions.push((space, session));
                 sessions.len() - 1
             }),

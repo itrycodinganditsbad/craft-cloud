@@ -1365,3 +1365,59 @@ async fn a_space_being_turned_off_when_the_agent_stops_stays_off() {
     let info = t.ben.space(space).await.unwrap();
     assert_eq!(info.sync, SpaceSync::Off, "the space that was being turned off stays off: {info:?}");
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The fourth review round of P1-5 (items 3 to 5 of the independent review)
+
+/// Makes `link` a symlink (Unix) or junction (Windows) to the folder `target`.
+fn link_dir(link: &Path, target: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    {
+        let made = std::process::Command::new("cmd.exe").args(["/d", "/c", "mklink", "/J"]).arg(link).arg(target).output().unwrap();
+        assert!(made.status.success(), "{made:?}");
+    }
+}
+
+/// Removes the link `link` made by [`link_dir`], not what it leads to.
+fn unlink_dir(link: &Path) {
+    #[cfg(unix)]
+    std::fs::remove_file(link).unwrap();
+    #[cfg(windows)]
+    std::fs::remove_dir(link).unwrap();
+}
+
+/// Item 3: a team space syncs through a link to folder A. While its session is open, the link is pointed at folder B, which
+/// carries the same space's marker but not A's files. The session notices before the next pass and starts afresh in B (a
+/// first sync): the files A had are not taken for deleted in B, and nothing is deleted on the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_link_pointed_at_another_folder_while_syncing_deletes_nothing() {
+    let t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    eventually("the invitation is listed", || async { t.ben.space(space).await.is_some_and(|s| s.state == "invited") }).await;
+    t.ben.accept(space).await;
+    eventually("ana's agent lists the space", || async { t.ana.space(space).await.is_some_and(|s| s.state == "active") }).await;
+    let ana_folder = t.ana.sync_on(space).await;
+    let (a, b, link) = (t.ben.dir.path().join("A"), t.ben.dir.path().join("B"), t.ben.dir.path().join("Link"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    link_dir(&link, &a);
+    t.ben.sync_on_in(space, &link).await;
+    for i in 0..6 {
+        write(&ana_folder, &format!("f{i}.txt"), &format!("content {i}"));
+    }
+    eventually("the folder behind the link has the files", || async { names(&a).len() == 6 }).await;
+    eventually("nothing runs", || async { t.ben.status().await.spaces.iter().all(|s| s.run_state == SpaceRun::Idle) }).await;
+
+    // Folder B carries the space's marker (as an older folder of the space would) but none of the files.
+    std::fs::create_dir_all(b.join(".craft-cloud")).unwrap();
+    std::fs::copy(a.join(".craft-cloud/root.json"), b.join(".craft-cloud/root.json")).unwrap();
+    unlink_dir(&link);
+    link_dir(&link, &b);
+    write(&ana_folder, "poke.txt", "asks for a pass");
+    eventually("the folder behind the link now has everything", || async { names(&b).len() == 7 }).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(names(&ana_folder).len(), 7, "nothing was deleted on the server: {:?}", names(&ana_folder));
+    assert_eq!(names(&a).len(), 6, "the old folder is left as it is");
+}
