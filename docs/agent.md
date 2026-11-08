@@ -114,7 +114,7 @@ most 8 KiB, and need the agent to be signed in (`not_signed_in` otherwise).
 
 | Local call | Server call | Body, answer |
 | --- | --- | --- |
-| `GET /v1/admin/server` | `GET /admin/server` | the server's counters and kinds; a member is refused `forbidden` |
+| `GET /v1/admin/server` | `GET /admin/server` | the server's counters and kinds, and its health (`started_ms`, `database_ok`, `store_ok`, `store_check_ms`, `refusing_uploads`, all optional); a member is refused `forbidden` |
 | `GET /v1/admin/storage` | `GET /admin/storage` | bounded storage overview: totals, quota counts, top ten accounts, manifest-index counts, and the room the server has (optional fields) |
 | `GET /v1/admin/users?cursor&limit&query` | `GET /admin/users` | a page of accounts by username; `next` is the cursor of the following page; `query` finds a username containing it |
 | `POST /v1/admin/users` | `POST /admin/users` | `{username, role, password, totp_code?, recovery_code?}` → the account and its invite code |

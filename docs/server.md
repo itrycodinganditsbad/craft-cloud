@@ -213,7 +213,15 @@ curl -s -X POST https://cloud.example.org/api/v1/admin/users/USER_ID/disable \
 ```
 
 - `GET /admin/server` shows counters (accounts, signed-in devices, stored bytes, live-document bytes) and the kinds of
-  database and storage, nothing else. `GET /admin/users` lists accounts 50 at a time (`limit` up to 200, `cursor` from
+  database and storage, and how the server is: `started_ms` (when it started), `database_ok` (true whenever the call is
+  answered, since it is answered from the database), `store_ok` with `store_check_ms` (when it was checked) and
+  `refusing_uploads` (see "A full server"), and nothing else. The store check asks the blob store for the size of one
+  object that never exists and expects "no such object" within 2 seconds. It writes nothing, so it needs no write
+  permission and leaves nothing behind, and it proves the store is reachable with working credentials, not that a write
+  would succeed (a full disk shows as `refusing_uploads`). A store that fails or stays silent is reported as `store_ok:
+  false`, not as an error of the call. The answer is kept for 30 seconds, so reloading the admin page does not hit S3
+  each time. The new fields are optional: an older app reads a newer server's answer, and a newer app an older server's.
+  `GET /admin/users` lists accounts 50 at a time (`limit` up to 200, `cursor` from
   the last answer's `next`, `query` to find a username).
 - `GET /admin/storage` returns bounded storage totals, effective quota totals and near/over-quota counts, the ten
   largest accounts, manifest-index counts, and the room the server has (see "Storage capacity"). `GET /admin/users/{id}/usage` returns one account's stored bytes,

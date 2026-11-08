@@ -181,6 +181,13 @@ pub(crate) fn end_live_connections(state: &AppState, devices: &[DeviceId]) {
 /// `GET /admin/server`: counters and kinds only.
 async fn server(State(state): State<Shared>) -> Result<Json<AdminServerInfo>, ApiError> {
     let counts = state.meta.admin_server_counts().await?;
+    // Answering at all with the counts is the database being fine. The store's probe and the full state never fail
+    // the page: a store that is down is `store_ok: false`.
+    let store = state.store_health.check(&state.store, state.now_ms()).await;
+    let refusing_uploads = match &state.full {
+        Some(guard) => guard.status(&state.meta).await.unwrap_or_else(|_| guard.refusing()),
+        None => false,
+    };
     Ok(Json(AdminServerInfo {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         users: counts.users,
@@ -189,6 +196,11 @@ async fn server(State(state): State<Shared>) -> Result<Json<AdminServerInfo>, Ap
         live_bytes: counts.live_bytes,
         storage_kind: state.store.kind().to_owned(),
         database_kind: state.meta.database_kind().to_owned(),
+        started_ms: Some(state.started_ms),
+        database_ok: Some(true),
+        store_ok: Some(store.ok),
+        store_check_ms: Some(store.checked_ms),
+        refusing_uploads: Some(refusing_uploads),
     }))
 }
 
