@@ -395,6 +395,8 @@ pub struct UserView {
     pub role: RoleChoice,
     /// The quota field, in GiB (empty: none).
     pub quota: String,
+    /// What the role field showed when the page was opened or last saved, to tell whether it was changed.
+    pub role_shown: RoleChoice,
     /// What the quota field showed when the page was opened or last saved, to tell whether it was changed.
     pub quota_shown: String,
     pub error: Option<String>,
@@ -415,6 +417,7 @@ impl UserView {
             id: user.id,
             username: user.username.clone(),
             role: RoleChoice::of(&user.role),
+            role_shown: RoleChoice::of(&user.role),
             quota_shown: quota.clone(),
             quota,
             error: None,
@@ -426,6 +429,18 @@ impl UserView {
             usage_loading: false,
             usage_ticket: 0,
         }
+    }
+
+    /// Whether the role or the quota field holds a change that was not saved.
+    pub fn is_dirty(&self) -> bool {
+        self.role != self.role_shown || self.quota.trim() != self.quota_shown.trim()
+    }
+
+    /// The fields as they were when the page was opened or last saved: what Discard does.
+    fn discard_edits(&mut self) {
+        self.role = self.role_shown;
+        self.quota = self.quota_shown.clone();
+        self.error = None;
     }
 }
 
@@ -466,6 +481,16 @@ pub struct AdminScreen {
     pub dialog: Option<Dialog>,
     /// A code just made, until it is dismissed.
     pub code: Option<ShownCode>,
+    /// What the admin asked for while an account's page held unsaved edits, until Discard or Keep editing answers it.
+    pub leaving: Option<Box<Event>>,
+}
+
+impl AdminScreen {
+    /// Whether an account's page holds role or quota edits that were not saved. While a save is under way the fields are
+    /// the ones being sent, so they don't count.
+    pub fn has_unsaved_edits(&self) -> bool {
+        self.dialog.as_ref().is_none_or(|d| !d.busy) && matches!(&self.view, View::User(view) if view.is_dirty())
+    }
 }
 
 /// What happened on the admin pages: clicks and the answers of the admin calls.
@@ -536,6 +561,10 @@ pub enum AdminEvent {
     DismissCode,
     RefreshDevices,
     RefreshUsage,
+    /// "Discard" on the question about unsaved edits: the fields go back to what was saved and what was asked for goes on.
+    DiscardEdits,
+    /// "Keep editing": what was asked for is dropped.
+    KeepEditing,
 }
 
 impl Model {
@@ -563,6 +592,14 @@ impl Model {
             AdminEvent::Close => {
                 self.leave_admin();
                 Vec::new()
+            }
+            AdminEvent::DiscardEdits => {
+                let Screen::Admin(admin) = &mut self.screen else { return Vec::new() };
+                let Some(asked) = admin.leaving.take() else { return Vec::new() };
+                if let View::User(view) = &mut admin.view {
+                    view.discard_edits();
+                }
+                self.update(*asked)
             }
             event => {
                 let Screen::Admin(admin) = &mut self.screen else { return Vec::new() };
@@ -614,6 +651,7 @@ impl Model {
             section: Section::Accounts,
             dialog: None,
             code: None,
+            leaving: None,
         };
         let effects = vec![admin.list.load(), Effect::AdminServer { session: admin.overview.session }, admin.load_storage()];
         self.screen = Screen::Admin(Box::new(admin));
@@ -631,7 +669,11 @@ impl Model {
 impl AdminScreen {
     fn update(&mut self, event: AdminEvent) -> Vec<Effect> {
         match event {
-            AdminEvent::Account { .. } | AdminEvent::Open | AdminEvent::Close => Vec::new(),
+            AdminEvent::Account { .. } | AdminEvent::Open | AdminEvent::Close | AdminEvent::DiscardEdits => Vec::new(),
+            AdminEvent::KeepEditing => {
+                self.leaving = None;
+                Vec::new()
+            }
             AdminEvent::Show(section) => {
                 self.section = section;
                 // The audit log opens inside these pages with the switcher over it: a segment leaves it.
@@ -1291,7 +1333,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::agent::fake::{FakeAgent, sample_user};
     use crate::agent::{Starter, call};
-    use crate::model::{JoinDefaults, tests::status};
+    use crate::audit::AuditMsg;
+    use crate::model::{JoinDefaults, Tab, tests::status};
 
     /// An agent signed in as `fabio`, an admin (or not), with `others` more accounts after fabio's own.
     pub(crate) fn agent(admin: bool, others: usize) -> FakeAgent {
@@ -1940,6 +1983,137 @@ pub(crate) mod tests {
         }
         assert_eq!(boss.resets.lock().unwrap().as_slice(), [false, true], "the flag goes with the reset code");
         assert!(Action::IssueReset { id: ana.id, username: "x".into(), reset_two_factor: true }.explain().contains("turns the account's two-factor"));
+    }
+
+    /// The model on the account page of `user01`, and a way to type into its fields.
+    fn on_an_account(agent: &FakeAgent) -> (Model, Uuid) {
+        let mut model = on_the_pages(agent);
+        let id = user_named(&model, "user01").id;
+        run(&mut model, agent, ev(AdminEvent::OpenUser(id)));
+        (model, id)
+    }
+
+    fn type_into_the_account(model: &mut Model, role: RoleChoice, quota: &str) {
+        if let View::User(view) = &mut admin_mut(model).view {
+            view.role = role;
+            view.quota = quota.into();
+        }
+    }
+
+    /// Role and quota edits that are typed and not saved are told from a page that shows what is saved.
+    #[test]
+    fn typed_role_and_quota_edits_make_the_account_page_dirty_until_they_are_saved_or_undone() {
+        let boss = agent(true, 2);
+        let (mut model, _) = on_an_account(&boss);
+        assert!(!admin(&model).has_unsaved_edits());
+        type_into_the_account(&mut model, RoleChoice::Member, "  ");
+        assert!(!admin(&model).has_unsaved_edits(), "blanks are no edit");
+        type_into_the_account(&mut model, RoleChoice::Admin, "");
+        assert!(admin(&model).has_unsaved_edits(), "a role");
+        type_into_the_account(&mut model, RoleChoice::Member, "7");
+        assert!(admin(&model).has_unsaved_edits(), "a quota");
+        type_into_the_account(&mut model, RoleChoice::Member, "");
+        assert!(!admin(&model).has_unsaved_edits(), "typed back to what was saved");
+        // A save makes the page what the server answered: clean.
+        type_into_the_account(&mut model, RoleChoice::Member, "3");
+        model.update(Event::Admin(AdminEvent::SubmitEdit));
+        type_password(&mut model, "pw");
+        run(&mut model, &boss, ev(AdminEvent::Confirm));
+        let View::User(view) = &admin(&model).view else { panic!("not on the account") };
+        assert_eq!((view.quota.as_str(), view.quota_shown.as_str()), ("3", "3"));
+        assert!(!admin(&model).has_unsaved_edits());
+        // The edit being sent is no unsaved edit, but one waiting for the password is.
+        type_into_the_account(&mut model, RoleChoice::Member, "4");
+        model.update(Event::Admin(AdminEvent::SubmitEdit));
+        assert!(admin(&model).has_unsaved_edits());
+        type_password(&mut model, "pw");
+        let effects = model.update(Event::Admin(AdminEvent::Confirm));
+        assert!(matches!(effects.as_slice(), [Effect::AdminDo { .. }]));
+        assert!(!admin(&model).has_unsaved_edits(), "being sent");
+    }
+
+    /// A tab, another account, the list, the audit log, Sign out and Quit all wait for the answer while edits are unsaved.
+    #[test]
+    fn leaving_an_account_page_with_unsaved_edits_asks_first() {
+        let boss = agent(true, 2);
+        let (mut model, id) = on_an_account(&boss);
+        let other = user_named(&model, "user02").id;
+        let ana = user_named(&model, "user01").username;
+        // Clean: everything goes through.
+        model.update(Event::Tab(Tab::Overview));
+        assert_eq!(model.tab(), Some(Tab::Overview));
+        let (mut model, _) = on_an_account(&boss);
+        type_into_the_account(&mut model, RoleChoice::Admin, "");
+        model.window_visible = false;
+        let leaving = [
+            Event::Tab(Tab::Trash),
+            Event::Tab(Tab::Overview),
+            Event::SignOut,
+            Event::SignOutHere,
+            Event::Quit,
+            Event::Admin(AdminEvent::BackToList),
+            Event::Admin(AdminEvent::Close),
+            Event::Admin(AdminEvent::OpenUser(other)),
+            Event::Audit(AuditMsg::OpenAudit(Some((id, ana)))),
+        ];
+        for event in leaving {
+            assert!(model.update(event.clone()).is_empty(), "{event:?} waits");
+            assert!(matches!(model.screen, Screen::Admin(_)), "{event:?} stays on the page");
+            assert_eq!(admin(&model).leaving.as_deref(), Some(&event));
+            assert!(model.window_visible, "the question is seen");
+            model.window_visible = false;
+        }
+        // Things that keep the page, and the page's own tab, are not questions.
+        admin_mut(&mut model).leaving = None;
+        for event in [Event::Tab(Tab::Admin), Event::Admin(AdminEvent::OpenUser(id)), Event::Admin(AdminEvent::RefreshUsage), Event::Pause] {
+            model.update(event);
+            assert!(admin(&model).leaving.is_none());
+        }
+    }
+
+    /// Keep editing drops what was asked for and leaves the fields as typed; Discard sets them back and carries it out.
+    #[test]
+    fn keep_editing_stays_and_discard_goes_on_to_what_was_asked() {
+        let boss = agent(true, 2);
+        let (mut model, id) = on_an_account(&boss);
+        type_into_the_account(&mut model, RoleChoice::Admin, "9");
+        assert!(model.update(Event::Tab(Tab::Trash)).is_empty());
+        run(&mut model, &boss, ev(AdminEvent::KeepEditing));
+        assert!(admin(&model).leaving.is_none() && admin(&model).has_unsaved_edits());
+        let View::User(view) = &admin(&model).view else { panic!() };
+        assert_eq!((view.role, view.quota.as_str()), (RoleChoice::Admin, "9"));
+        // Discard with nothing asked for does nothing.
+        assert!(model.update(Event::Admin(AdminEvent::DiscardEdits)).is_empty());
+        assert!(admin(&model).has_unsaved_edits());
+
+        model.update(Event::Tab(Tab::Trash));
+        run(&mut model, &boss, ev(AdminEvent::DiscardEdits));
+        assert_eq!(model.tab(), Some(Tab::Trash), "the tab was opened");
+
+        // Back to the account: the edits are gone with the page, and the other asks (the list) go through too.
+        let (mut model, id2) = on_an_account(&boss);
+        assert_eq!(id, id2);
+        type_into_the_account(&mut model, RoleChoice::Admin, "9");
+        model.update(Event::Admin(AdminEvent::BackToList));
+        run(&mut model, &boss, ev(AdminEvent::DiscardEdits));
+        assert!(matches!(admin(&model).view, View::List));
+        run(&mut model, &boss, ev(AdminEvent::OpenUser(id)));
+        let View::User(view) = &admin(&model).view else { panic!() };
+        assert!(!view.is_dirty());
+    }
+
+    /// A page that waits for a password or a call, or shows a code, is not asked about: those have their own rules.
+    #[test]
+    fn a_page_that_is_locked_does_not_ask() {
+        let boss = agent(true, 2);
+        let (mut model, _) = on_an_account(&boss);
+        type_into_the_account(&mut model, RoleChoice::Admin, "");
+        model.update(Event::Admin(AdminEvent::SubmitEdit));
+        type_password(&mut model, "pw");
+        model.update(Event::Admin(AdminEvent::Confirm));
+        assert!(model.tabs_locked());
+        assert!(model.update(Event::Quit).is_empty());
+        assert!(admin(&model).leaving.is_none(), "a save under way answers by itself");
     }
 }
 

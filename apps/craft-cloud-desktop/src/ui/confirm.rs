@@ -22,6 +22,8 @@ pub(super) struct Panel<'a> {
     pub title: &'a str,
     pub text: &'a str,
     pub confirm: &'a str,
+    /// The words of the button that leaves things as they are.
+    pub cancel: &'a str,
     /// The confirming button is red and outlined (a removal) instead of the primary one.
     pub danger: bool,
     /// Whether the confirming button can be used (not while a call is under way).
@@ -69,7 +71,7 @@ pub(super) fn show(ui: &mut egui::Ui, panel: &Panel<'_>) -> Answer {
             ui.set_width(ui.available_width());
             let button = kit::Button::new(panel.confirm);
             let button = if panel.danger { button.danger() } else { button.primary() };
-            let cancel = kit::Button::new("Cancel");
+            let cancel = kit::Button::new(panel.cancel);
             let width = cancel.width(ui) + ui.spacing().item_spacing.x + button.width(ui);
             // Left to right, so that Tab goes Cancel, then the confirmation, as they are drawn.
             kit::trailing(ui, width, |ui| {

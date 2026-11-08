@@ -262,6 +262,7 @@ fn home(ui: &mut egui::Ui, page: &mut SecurityPage, now_ms: i64, events: &mut Ve
             title: "Sign out other computers",
             text: "Every other computer of your account is signed out. Their files stay there; they join again to sync.",
             confirm: "Sign them out",
+            cancel: "Cancel",
             danger: true,
             enabled: !busy,
         };

@@ -102,6 +102,7 @@ pub(super) fn show(ui: &mut egui::Ui, versions: &mut Versions, now_ms: i64, even
                 title: "Restore this version?",
                 text: "This makes the selected version the current file. Sync will update this computer.",
                 confirm: "Restore this version",
+                cancel: "Cancel",
                 danger: false,
                 enabled: idle,
             };

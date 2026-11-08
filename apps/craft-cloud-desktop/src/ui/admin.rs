@@ -62,7 +62,31 @@ pub(super) fn show(ui: &mut egui::Ui, admin: &mut AdminScreen, now_ms: i64, even
         View::User(view) => {
             let user = admin.list.users.iter().find(|u| u.id == view.id).cloned();
             account(ui, view, user.as_ref(), &me, now_ms, events);
+            discard_question(ui, view.id, admin.leaving.is_some(), events);
         }
+    }
+}
+
+/// The question under an account's page when something that would drop its unsaved role or quota edits was asked for.
+fn discard_question(ui: &mut egui::Ui, id: craft_cloud_app::Uuid, asking: bool, events: &mut Vec<Event>) {
+    if !asking {
+        super::confirm::idle(ui);
+        return;
+    }
+    ui.add_space(12.0);
+    let panel = super::confirm::Panel {
+        key: egui::Id::new(("discard-account-edits", id)),
+        title: "Discard the unsaved changes?",
+        text: "The role or quota you changed on this page hasn't been saved.",
+        confirm: "Discard",
+        cancel: "Keep editing",
+        danger: true,
+        enabled: true,
+    };
+    match super::confirm::show(ui, &panel) {
+        super::confirm::Answer::Confirmed => send(events, AdminEvent::DiscardEdits),
+        super::confirm::Answer::Cancelled => send(events, AdminEvent::KeepEditing),
+        super::confirm::Answer::Open => {}
     }
 }
 

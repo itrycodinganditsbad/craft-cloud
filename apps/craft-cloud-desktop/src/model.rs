@@ -1172,6 +1172,9 @@ impl Model {
     }
 
     pub fn update(&mut self, event: Event) -> Vec<Effect> {
+        if self.asks_to_discard(&event) {
+            return Vec::new();
+        }
         match event {
             Event::Start => {
                 self.screen = Screen::Starting;
@@ -1889,6 +1892,32 @@ impl Model {
                 }
             }
         }
+    }
+
+    /// Whether `event` would drop role or quota edits of an account's admin page that were not saved. It is then not carried
+    /// out: the page asks "Discard the unsaved changes?" and [`AdminEvent::DiscardEdits`] carries it out afterwards, while
+    /// [`AdminEvent::KeepEditing`] drops it. The window is shown for the question (a Quit from the tray comes with it hidden).
+    fn asks_to_discard(&mut self, event: &Event) -> bool {
+        let locked = self.tabs_locked();
+        let current = self.tab();
+        let Screen::Admin(admin) = &self.screen else { return false };
+        let no_dialog = admin.dialog.is_none();
+        let leaves = match event {
+            Event::Tab(tab) => Some(*tab) != current && !locked,
+            Event::SignOut | Event::SignOutHere | Event::Quit => !locked,
+            Event::Admin(AdminEvent::Close) => true,
+            Event::Admin(AdminEvent::BackToList) | Event::Audit(AuditMsg::OpenAudit(_)) => no_dialog,
+            Event::Admin(AdminEvent::OpenUser(id)) => no_dialog && !matches!(&admin.view, crate::admin::View::User(view) if view.id == *id),
+            _ => false,
+        };
+        if !leaves || !admin.has_unsaved_edits() {
+            return false;
+        }
+        if let Screen::Admin(admin) = &mut self.screen {
+            admin.leaving = Some(Box::new(event.clone()));
+        }
+        self.window_visible = true;
+        true
     }
 
     /// Every 2 s: the agent's status (one call at a time), and an open add-a-computer code's state.

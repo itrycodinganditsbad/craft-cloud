@@ -119,6 +119,7 @@ pub(super) fn show(ui: &mut egui::Ui, trash: &mut Trash, now_ms: i64, events: &m
                 title: &format!("Remove {name}?"),
                 text: "This item can no longer be restored from the trash.",
                 confirm: "Remove",
+                cancel: "Cancel",
                 danger: true,
                 enabled: idle,
             };
