@@ -102,6 +102,8 @@ pub struct Control {
     shared: Arc<Mutex<Shared>>,
     /// The task of the work of making a team space from a folder (not part of what the status copies).
     from_job: Arc<Mutex<Option<FromFolderJob>>>,
+    /// Counts the sessions: it changes when one ends, so a call that was under way sees that its session is over.
+    session: Arc<std::sync::atomic::AtomicU64>,
     commands: mpsc::Sender<Command>,
     /// Where the start-at-login entry goes (`None`: `autostart` is refused, with `autostart_refusal`).
     autostart: Option<Roots>,
@@ -125,7 +127,7 @@ impl Control {
             from_folder: None,
         };
         let autostart_refusal = "this agent doesn't handle starting at login here".to_owned();
-        Self { shared: Arc::new(Mutex::new(shared)), from_job: Arc::default(), commands, autostart: None, autostart_refusal }
+        Self { shared: Arc::new(Mutex::new(shared)), from_job: Arc::default(), session: Arc::default(), commands, autostart: None, autostart_refusal }
     }
 
     /// The control with the start-at-login entry at `roots`, for the agent with data folder `data`. The entry is
@@ -199,6 +201,16 @@ impl Control {
 
     pub fn set_from_folder(&self, status: Option<FromFolderStatus>) {
         self.with(|s| s.from_folder = status);
+    }
+
+    /// Which session this is (see [`Control::bump_session`]).
+    pub fn session_id(&self) -> u64 {
+        self.session.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A session ended: whatever was started under the number before is over.
+    pub fn bump_session(&self) {
+        self.session.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn set_from_folder_job(&self, job: Option<FromFolderJob>) {

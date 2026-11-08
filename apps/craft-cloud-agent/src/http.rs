@@ -901,6 +901,13 @@ impl<C: Connection> HttpTransport<C> {
         Ok(self)
     }
 
+    /// The server's clock in milliseconds since the Unix epoch, from the `Date` header of a plain answer (`None` when it says none).
+    pub async fn server_clock_ms(&self) -> Option<i64> {
+        let req = request(Method::GET, self.server.endpoint("info"), None, 0);
+        let answer = self.connection.send(req).await.ok()?;
+        parse_http_date_ms(answer.headers.get(reqwest::header::DATE)?.to_str().ok()?)
+    }
+
     /// Tells the transport which space's chunks it may claim (`None`: none), for [`Transport::claim_chunks`]. A space the server
     /// refused a claim for stays refused (told again before every pass, it is not asked again) until another one, or none, is named.
     pub fn set_claim_from(&self, from: Option<SpaceId>) {
@@ -1325,6 +1332,27 @@ impl<C: Connection> Transport for HttpTransport<C> {
     }
 }
 
+/// `Sun, 06 Nov 1994 08:49:37 GMT` (the form of an HTTP `Date` header) as milliseconds since the Unix epoch.
+pub(crate) fn parse_http_date_ms(text: &str) -> Option<i64> {
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    let [_, day, month, year, time, zone] = parts.as_slice() else { return None };
+    if *zone != "GMT" {
+        return None;
+    }
+    let month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].iter().position(|m| m == month)? as i64 + 1;
+    let (day, year): (i64, i64) = (day.parse().ok()?, year.parse().ok()?);
+    let mut clock = time.split(':');
+    let (h, m, s): (i64, i64, i64) = (clock.next()?.parse().ok()?, clock.next()?.parse().ok()?, clock.next()?.parse().ok()?);
+    // Days since 1970-01-01 of a civil date (the proleptic Gregorian calendar).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 24 + h) * 60 + m) * 60_000 + s * 1000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1348,6 +1376,15 @@ mod tests {
             }
         );
         assert!(!shown.contains("chal-secret"), "{shown}");
+    }
+
+    #[test]
+    fn an_http_date_is_read_as_milliseconds_since_the_epoch() {
+        assert_eq!(parse_http_date_ms("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(parse_http_date_ms("Sun, 06 Nov 1994 08:49:37 GMT"), Some(784_111_777_000));
+        assert_eq!(parse_http_date_ms("Mon, 29 Feb 2016 23:59:59 GMT"), Some(1_456_790_399_000));
+        assert_eq!(parse_http_date_ms("yesterday"), None);
+        assert_eq!(parse_http_date_ms("Sun, 06 Nov 1994 08:49:37 PST"), None);
     }
 
     #[test]
