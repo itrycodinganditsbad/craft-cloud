@@ -939,6 +939,11 @@ pub enum RecentsEvent {
 /// space's active members with their names and palette colours) after `opened` and whenever the list changes; an app
 /// that doesn't ask gets only [`PRESENCE`] frames and no `members`.
 ///
+/// The agent tells every app with a document open in a space when the account's right to change it changes, as
+/// `role {doc, read_only}` (both ways; the apps that asked for identity and those that did not alike): `opened.read_only`
+/// is as of the open, `role` follows it. An app that holds changes it made as a viewer sends them again when `role` says
+/// `read_only: false`, and, if it ends first, hands them to the agent as [`docs::HELD`] frames.
+///
 /// An app that doesn't read for 10 s is dropped; its documents stay with the agent.
 pub mod docs {
     /// Binary frame kinds.
@@ -949,6 +954,12 @@ pub mod docs {
     /// Presence with the sender's identity, for an app that opened the document with `identity: true`:
     /// `[u8 5][u64 id, big-endian][16 bytes account ID][the app's bytes]`. An app that did not ask gets [`PRESENCE`].
     pub const PRESENCE_FROM: u8 = 5;
+    /// A change the app made while the agent refused its changes (`read_only`) and holds on to until the account may write
+    /// again, sent by an app that ends with such changes unsent: `[u8 6][u64 id, big-endian][a Loro update]`, one frame
+    /// per update, in order. The agent puts it into the document's journal as it does an update, but the gate keeps it from
+    /// the server while the space is read-only; it goes up with the first connection of an account that may write. Never
+    /// acked; if the account may write already it is an update that is not acked.
+    pub const HELD: u8 = 6;
     /// The bytes of an account ID in a [`PRESENCE_FROM`] frame.
     pub const USER_BYTES: usize = 16;
     /// The header of a binary frame: kind and id.
@@ -1129,6 +1140,10 @@ pub enum DocsEvent {
         #[serde(default)]
         stopped: bool,
     },
+    /// The account's right to change the space of an open document changed (`read_only`: a viewer, or the space is archived;
+    /// both ways, also when it ends). `opened.read_only` is as of the open; this follows it, so an app that kept changes
+    /// the agent refused can send them again once it says `false`.
+    Role { doc: crate::ids::DocId, read_only: bool },
     /// The file of an open document, as it is on this machine's disk now: the live document's frontiers a Craft app
     /// saved it from (the record of that save, this machine's or the server's version's), or none when no record is
     /// known (edited outside Craft, not synced yet). Sent after `opened` and whenever it changes (the app saved, the
@@ -1459,6 +1474,12 @@ mod tests {
         let (kind, id, body) = docs::decode_binary(&frame).unwrap();
         assert_eq!((kind, id), (5, 9));
         assert_eq!(body.split_at(docs::USER_BYTES), (user.as_bytes().as_slice(), b"cursor".as_slice()));
+        // A change an app hands over, and the role that follows `opened`.
+        assert_eq!(docs::HELD, 6);
+        let role = DocsEvent::Role { doc: crate::ids::DocId::generate(), read_only: false };
+        let json = serde_json::to_value(&role).unwrap();
+        assert_eq!(json["type"], serde_json::json!("role"));
+        assert_eq!(serde_json::from_value::<DocsEvent>(json).unwrap(), role);
     }
 
     /// A recents subscription may name a team space; without one it is the personal list, on the wire as before.

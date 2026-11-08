@@ -269,7 +269,12 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
   at a time (a lock file, `.lock`): a hub that replaces one that was stopped (sync turned off and on, a folder moved) starts
   when the old one has ended, so no change an app was told was kept is overwritten. When a team space stops syncing, the
   documents an app has open in it are told `status {stopped}` and a later change to one is answered `error {not_found}`;
-  the app's documents in other spaces go on. A viewer's recents `add` is refused with `read_only`.
+  the app's documents in other spaces go on. A viewer's recents `add` is refused with `read_only`. A role change is told to the apps: every open document of the space gets `role {doc, read_only}` when the account's right to change
+  the space changes (both ways; `opened.read_only` is as of the open), so an app that kept a refused change can send it
+  again. An app that ends while it still holds such changes hands them over as binary kind 6 (`held`, one update per frame, in
+  order): the agent puts them into the document's journal like an update (the other apps with the document open get them)
+  but never acks them and never sends them while the account may not write; they go up with the first connection of an
+  account that may write, with no app open.
 
 | Local call | Answer |
 | --- | --- |
@@ -280,7 +285,7 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
 | `POST /v1/spaces/{id}/approve-deletes` | `{set?}` → `{approved, message}`: approves the deletions the mass-delete guard holds back in a synced team space (`spaces/<id>/approval.json`), as `craft-cloud-agent sync --approve-deletes[=<set>] --space <id or name>` does. With a `set` only that set, if it is the one waiting; without, the set the previous call listed |
 | `GET /v1/status` | gains `spaces: [{space, run_state, last_sync_ms?, read_only}]`, one per synced space or one that lost access; the top-level fields describe the personal space |
 | `GET /v1/recents` (WebSocket) | `subscribe {app, space?}` follows a team space's list (it must sync here, else `not_found`); an `add` with an absolute path inside a team folder goes to that space's list; `entries` names the `space` |
-| `GET /v1/docs` (WebSocket) | `open` gains `identity`; `opened` gains `read_only` and `space`; new binary kind 5 (presence with the sender) and text message `members` |
+| `GET /v1/docs` (WebSocket) | `open` gains `identity`; `opened` gains `read_only` and `space`; new binary kind 5 (presence with the sender), kind 6 (held changes from an app) and text messages `members` and `role` |
 | `PUT /v1/blobs?for=<path>`, `GET /v1/blobs/{hash}?for=<path>` | the blob of the space of the file at `path` (a team space's, read by every member's agent); without `for`, the personal space |
 
 Accept and decline are passed on to the server, which decides; its refusals keep their status and code. An agent from before
