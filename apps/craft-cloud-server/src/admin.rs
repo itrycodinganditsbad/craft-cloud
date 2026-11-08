@@ -183,7 +183,7 @@ async fn server(State(state): State<Shared>) -> Result<Json<AdminServerInfo>, Ap
     let counts = state.meta.admin_server_counts().await?;
     // Answering at all with the counts is the database being fine. The store's probe and the full state never fail
     // the page: a store that is down is `store_ok: false`.
-    let store = state.store_health.check(&state.store, state.now_ms()).await;
+    let store = state.store_health.check(&state.store, state.storage_info.store_dir(), state.now_ms()).await;
     let refusing_uploads = match &state.full {
         Some(guard) => guard.status(&state.meta).await.unwrap_or_else(|_| guard.refusing()),
         None => false,

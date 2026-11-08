@@ -216,7 +216,8 @@ curl -s -X POST https://cloud.example.org/api/v1/admin/users/USER_ID/disable \
   database and storage, and how the server is: `started_ms` (when it started), `database_ok` (true whenever the call is
   answered, since it is answered from the database), `store_ok` with `store_check_ms` (when it was checked) and
   `refusing_uploads` (see "A full server"), and nothing else. The store check asks the blob store for the size of one
-  object that never exists and expects "no such object" within 2 seconds. It writes nothing, so it needs no write
+  object that never exists and expects "no such object" within 2 seconds (for a disk store it also checks that the
+  store's directory is there, since a store without its directory says "no such object" for everything). It writes nothing, so it needs no write
   permission and leaves nothing behind, and it proves the store is reachable with working credentials, not that a write
   would succeed (a full disk shows as `refusing_uploads`). A store that fails or stays silent is reported as `store_ok:
   false`, not as an error of the call. The answer is kept for 30 seconds, so reloading the admin page does not hit S3

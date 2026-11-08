@@ -48,6 +48,11 @@ impl StorageInfo {
         self.capacity
     }
 
+    /// The disk store's directory; `None` for S3 and memory.
+    pub fn store_dir(&self) -> Option<&Path> {
+        self.store_dir.as_deref()
+    }
+
     /// Total and free bytes of the filesystem that holds the disk store; `(None, None)` for S3 and memory, or when it
     /// can't be read. Blocking.
     pub fn store_filesystem(&self) -> (Option<u64>, Option<u64>) {
