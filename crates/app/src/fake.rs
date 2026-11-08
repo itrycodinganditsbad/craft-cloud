@@ -28,14 +28,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use craft_cloud_api::api::SpaceRole;
-use craft_cloud_api::{DocId, SpaceId, member_colour};
 use craft_cloud_api::limits::{MAX_BLOB_BYTES, MAX_PRESENCE_BYTES, MAX_UPDATE_BYTES};
 use craft_cloud_api::local::blobs::{Stored, hex, parse_hex};
 use craft_cloud_api::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, PRESENCE_FROM, STATE, UPDATE, decode_binary, encode_binary};
 use craft_cloud_api::local::{
-    DocMember, DocState, DocsEvent, DocsRequest, LOCAL_API_MAX, MAX_LOCAL_JSON_BYTES, NotLiveReason, RunState, SpaceInfo, SpaceList, SpaceSync, Status,
-    paths,
+    DocMember, DocState, DocsEvent, DocsRequest, LOCAL_API_MAX, MAX_LOCAL_JSON_BYTES, NotLiveReason, RunState, SpaceInfo, SpaceList, SpaceSync,
+    Status, paths,
 };
+use craft_cloud_api::{DocId, SpaceId, member_colour};
 use tungstenite::protocol::{Role, WebSocketConfig};
 use tungstenite::{Message, WebSocket};
 use uuid::Uuid;
