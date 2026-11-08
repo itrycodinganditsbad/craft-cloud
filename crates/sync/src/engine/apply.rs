@@ -891,7 +891,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     }
 
     /// Creates `dir` and any missing folders above it, moving aside anything in the way.
-    fn make_dirs(&mut self, dir: &RelPath, report: &mut Report) -> Result<(), SyncError> {
+    pub(super) fn make_dirs(&mut self, dir: &RelPath, report: &mut Report) -> Result<(), SyncError> {
         let mut current = RelPath::root();
         for name in dir.names() {
             current = current.join(name);
@@ -923,7 +923,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
 
     /// Makes sure nothing sits at `path`, not even a name that differs only by case: whatever is there is
     /// moved aside as a conflict copy.
-    fn ensure_free(&mut self, path: &RelPath, report: &mut Report) -> Result<(), SyncError> {
+    pub(super) fn ensure_free(&mut self, path: &RelPath, report: &mut Report) -> Result<(), SyncError> {
         // Checked before anything is made or moved aside.
         self.refuse_link_toward(path)?;
         if let Some(parent) = path.parent() {
@@ -1079,6 +1079,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// When the agent can't tell yet which save is newer, the file waits ([`LiveWinner::Wait`]); after
     /// `save_order_wait_ms` of that, `None` (a conflict copy). A winner is never guessed.
     fn live_winner(&mut self, id: NodeId, file: &FileState, at: &RelPath) -> Result<Option<(LiveWinner, Option<FsKind>)>, SyncError> {
+        // Where nothing can go up, "ours goes over theirs" is not on offer: both versions are kept as a conflict copy.
+        if self.read_only {
+            return Ok(None);
+        }
         let checked = self.stat(at)?;
         let hash = self.content_hash(at);
         // Our content is a Craft save whose record is on its way: never a conflict copy, it waits for the record.
@@ -1125,7 +1129,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         Some(LiveWinner::Wait)
     }
 
-    fn holds_base_content(&self, entry: &BaseEntry, at: &RelPath) -> bool {
+    pub(super) fn holds_base_content(&self, entry: &BaseEntry, at: &RelPath) -> bool {
         match &entry.kind {
             BaseKind::File { hash, .. } => self.content_hash(at) == Some(*hash),
             BaseKind::Dir { .. } => false,

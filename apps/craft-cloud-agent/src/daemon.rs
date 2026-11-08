@@ -140,13 +140,17 @@ fn pass_end(result: &Result<PassSummary, AgentError>, recheck_in: Option<Duratio
 /// Which pauses look again by themselves: a folder or marker that is missing (a drive not mounted yet), folders
 /// that lie inside one another, or another agent on the folder can be put right at any moment and checking is
 /// harmless, so every minute; a server that speaks another protocol or refuses requests is fixed by an update, and an
-/// account whose storage on the server is full by the admin allowing more, so every ten minutes; a revoked device,
+/// account whose storage on the server is full by the admin allowing more, a space that turned read-only for the account by an owner raising its role, so every ten minutes; a revoked device,
 /// damaged or newer saved files, another account's state and damaged data from the server never fix themselves, so
 /// the loop waits until it is stopped.
 fn recheck_for(e: &AgentError) -> Recheck {
     match e {
         AgentError::Root(_) | AgentError::DataInFolder { .. } | AgentError::Lock(_) => Recheck::Soon,
-        AgentError::Server(craft_cloud_sync::TransportError::Protocol(_) | craft_cloud_sync::TransportError::QuotaExceeded { .. }) => Recheck::Slowly,
+        AgentError::Server(
+            craft_cloud_sync::TransportError::Protocol(_)
+            | craft_cloud_sync::TransportError::QuotaExceeded { .. }
+            | craft_cloud_sync::TransportError::ReadOnly,
+        ) => Recheck::Slowly,
         _ => Recheck::Never,
     }
 }
@@ -1341,6 +1345,7 @@ fn summary_to_show(summary: &PassSummary, last_held: &mut Option<String>) -> (Op
 fn summary_worth_showing(s: &PassSummary) -> bool {
     s.downloaded + s.uploaded + s.removed_locally + s.removed_remotely + s.moved_locally + s.moved_remotely + s.created_dirs + s.refused > 0
         || !s.conflict_copies.is_empty()
+        || !s.restored.is_empty()
         || !s.skipped.is_empty()
         || !s.held_deletes.is_empty()
         || s.needs_approval()

@@ -248,7 +248,7 @@ impl AgentError {
             | AgentError::Lock(LockError::Busy(_) | LockError::NotAFile(_))
             | AgentError::Revoked
             | AgentError::OtherAccountState(_)
-            | AgentError::Server(TransportError::Protocol(_) | TransportError::QuotaExceeded { .. })
+            | AgentError::Server(TransportError::Protocol(_) | TransportError::QuotaExceeded { .. } | TransportError::ReadOnly)
             | AgentError::Sync(SyncError::Corrupt(_))
             | AgentError::Account(AccountError::Newer { .. } | AccountError::Damaged { .. })
             | AgentError::NeedsYou(_) => Exit::NeedsYou,
@@ -1792,6 +1792,15 @@ pub(crate) fn print_summary(out: &mut impl Write, s: &PassSummary) -> Result<(),
     } else {
         say!(out, "synced: {}", done.join(", "))?;
     }
+    if s.read_only {
+        say!(out, "this space is read-only for you: nothing is uploaded, and what you change here stays on this computer")?;
+    }
+    if !s.restored.is_empty() {
+        say!(out, "deleted here, downloaded again (the space is read-only for you):")?;
+        for path in &s.restored {
+            say!(out, "  {path}")?;
+        }
+    }
     if !s.conflict_copies.is_empty() {
         say!(out, "conflict copies (both versions kept):")?;
         for path in &s.conflict_copies {
@@ -2144,6 +2153,9 @@ mod tests {
             (SyncError::Transport(TransportError::Protocol("a refusal naming no operation".into())), Exit::NeedsYou),
             // Only with no room left at all: a file that doesn't fit while others still may is skipped instead.
             (SyncError::Transport(TransportError::QuotaExceeded { used: 10, limit: 10 }), Exit::NeedsYou),
+            // The engine keeps a read-only space read-only by itself; one that gets this far (another caller of the
+            // transport) is a state the user is told about, not retried.
+            (SyncError::Transport(TransportError::ReadOnly), Exit::NeedsYou),
             (SyncError::Io { path: "an interrupted download".into(), source: std::io::Error::other("x") }, Exit::Failed),
             (SyncError::Corrupt("chunk x of a.txt is damaged".into()), Exit::NeedsYou),
             (SyncError::Checkpoint(std::io::Error::other("disk full")), Exit::Failed),
@@ -2159,7 +2171,8 @@ mod tests {
                     | TransportError::Unauthorized
                     | TransportError::Unavailable(_)
                     | TransportError::Protocol(_)
-                    | TransportError::QuotaExceeded { .. },
+                    | TransportError::QuotaExceeded { .. }
+                    | TransportError::ReadOnly,
                 )
                 | SyncError::Io { .. }
                 | SyncError::Corrupt(_)
