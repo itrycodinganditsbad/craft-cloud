@@ -90,6 +90,8 @@ struct Sim {
     log: Vec<String>,
     /// Ben is removed from the space (his agent is stopped) until the owner invites him again.
     ben_removed: bool,
+    /// Ben is an editor again on the server and his agent's list still says viewer.
+    stale_lock: bool,
     /// `read_only` errors the server sent an agent (must stay zero: an agent that knows it may not write sends nothing, and
     /// one whose role changed meanwhile is told `access_changed` first).
     read_only_errors: u64,
@@ -216,10 +218,12 @@ impl Sim {
         self.say(format!("ana makes ben a {}", role.as_str()));
         self.w.meta.change_member_role(&SpaceActor::Cli, space, ben, role, 1).await.unwrap();
         // His agent's list of spaces may say so already (or not yet: then the server's `access_changed` tells it).
-        if self.rng.chance(50)
-            && let Some(replica) = self.w.machines[BEN].replica.as_mut()
-        {
-            replica.set_read_only(role == SpaceRole::Viewer);
+        if role == SpaceRole::Viewer || self.rng.chance(50) {
+            self.lock(BEN, role == SpaceRole::Viewer);
+            self.stale_lock = false;
+        } else {
+            // The list lags: the agent still says viewer, the server says editor. It is lifted later, at random.
+            self.stale_lock = true;
         }
     }
 
@@ -364,7 +368,12 @@ impl Sim {
             }
             96..=97 => self.flip_ben().await,
             98 if self.rng.chance(50) => self.ben_leaves_or_returns().await,
-            _ => {}
+            _ => {
+                if self.stale_lock && !self.ben_removed && self.rng.chance(20) {
+                    self.stale_lock = false;
+                    self.lock(BEN, false);
+                }
+            }
         }
     }
 
@@ -379,9 +388,9 @@ impl Sim {
 
     /// What the agent's list of spaces says of the account's role: the viewer's agent is told before its first write.
     fn lock(&mut self, m: usize, read_only: bool) {
-        if let Some(replica) = self.w.machines[m].replica.as_mut() {
-            replica.set_read_only(read_only);
-        }
+        // Lifting a lock sends again what the gate held back.
+        let frames = self.w.machines[m].replica.as_mut().map(|replica| replica.set_read_only(read_only)).unwrap_or_default();
+        self.w.send(m, frames);
     }
 
     /// Everyone comes back as they should be, and everything is delivered until nothing moves.
@@ -461,6 +470,7 @@ async fn run(seed: u64) -> Vec<String> {
         trace,
         log: Vec::new(),
         ben_removed: false,
+        stale_lock: false,
         read_only_errors: 0,
     };
     sim.lock(CARL, true);

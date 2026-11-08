@@ -89,6 +89,8 @@ pub const SHARED_FOLDER: &str = "Craft Cloud Shared";
 pub const TEAM_PROTOCOL: u32 = 2;
 /// What a team space that is not synced here is told when the server is too old.
 pub const NEEDS_UPDATE: &str = "the server needs an update for team spaces";
+/// The longest the next hub of a space waits for the hub it replaces to end (and let go of the space's live folder).
+const HUB_END_WAIT: Duration = Duration::from_secs(10);
 /// The longest a hub is given to take a pause or a resume.
 const HUB_ANSWER: Duration = Duration::from_secs(5);
 /// The longest a local API call waits for the spaces task to answer.
@@ -377,6 +379,8 @@ enum Ev {
     Pass(Box<Done>),
     /// The wait for a space's session to close ended, for the change asked under this number.
     Closed(u64, Closure),
+    /// A stopped hub of the space has ended (or the wait for it ran out): the next hub may start.
+    HubEnded(SpaceId),
     /// The pass thread found that a space's folder leads somewhere else than its session was opened on, and dropped the
     /// session: the space's generation is raised and saved before its next pass.
     FolderMoved(SpaceId),
@@ -683,6 +687,9 @@ struct Team {
     hub: Option<Hub>,
     /// The read-only state the hub was last told.
     hub_read_only: bool,
+    /// Hubs of the space that were stopped and have not ended yet: the next one starts after them, so two never share the
+    /// space's live folder.
+    stopping: u32,
 }
 
 /// A change of a space's sync that waits for its session to close.
@@ -721,6 +728,9 @@ struct Manager {
     waiting_next: Vec<oneshot::Sender<()>>,
     /// The last discovery failure that was noted, so a server that stays down is noted once.
     noted: Option<String>,
+    /// A look at the list was asked for while one was under way (it may have started before the change that asks): one more
+    /// follows it.
+    again: bool,
     events: mpsc::UnboundedReceiver<Ev>,
     events_tx: mpsc::UnboundedSender<Ev>,
     jobs: std::sync::mpsc::Sender<ToThread>,
@@ -788,6 +798,7 @@ impl Manager {
                 last_sync_ms: None,
                 hub: None,
                 hub_read_only: false,
+                stopping: 0,
             })
             .collect();
         Self {
@@ -804,6 +815,7 @@ impl Manager {
             waiting: Vec::new(),
             waiting_next: Vec::new(),
             noted: None,
+            again: false,
             events,
             events_tx,
             jobs,
@@ -918,7 +930,7 @@ impl Manager {
                         self.waiting.push(done);
                         self.start_discovery();
                     }
-                    (true, None) => {}
+                    (true, None) => self.again = true,
                     (false, None) => self.start_discovery(),
                 }
             }
@@ -994,6 +1006,15 @@ impl Manager {
             Ev::Listed(looked) => self.listed(looked),
             Ev::Pass(done) => self.pass_done(*done, now),
             Ev::Closed(id, closed) => self.closed(id, closed),
+            Ev::HubEnded(space) => {
+                if let Some(index) = self.teams.iter().position(|t| t.setting.space == space) {
+                    if let Some(team) = self.teams.get_mut(index) {
+                        team.stopping = team.stopping.saturating_sub(1);
+                    }
+                    self.sync_hub(index);
+                    self.publish_hubs();
+                }
+            }
             Ev::FolderMoved(space) => {
                 if let Err(e) = self.raise_generation(space) {
                     crate::runlog::note(format_args!(
@@ -1135,6 +1156,9 @@ impl Manager {
             }
             Looked::Failed(why) => self.discovery_failed(&why),
         }
+        if std::mem::take(&mut self.again) {
+            self.start_discovery();
+        }
         // Whoever waits for the list (an accepted invitation is to be found in it) is not told a list that is out of date: a
         // discovery that failed is tried again within seconds, and they wait for that, up to a bound.
         let now = self.now();
@@ -1194,6 +1218,7 @@ impl Manager {
                     last_sync_ms: None,
                     hub: None,
                     hub_read_only: false,
+                    stopping: 0,
                 }),
             }
         }
@@ -1267,8 +1292,11 @@ impl Manager {
     /// deleted: they and their journals stay in `live/<space>/`), and told when the role changes.
     fn sync_hub(&mut self, index: usize) {
         let (data, account, options, control, paused) = (self.data.clone(), self.account.clone(), self.options, self.control.clone(), self.paused);
+        let events = self.events_tx.clone();
         let Some(team) = self.teams.get_mut(index) else { return };
         match (team.active.is_some(), team.hub.is_some()) {
+            // The hub this one replaces has not ended: the space's live folder is still its (`Ev::HubEnded` comes back here).
+            (true, false) if team.stopping > 0 => {}
             (true, false) => {
                 let config = HubConfig {
                     data,
@@ -1292,7 +1320,7 @@ impl Manager {
                     Err(e) => crate::runlog::note(format_args!("live documents of team space {} are off: {e}", team.setting.space)),
                 }
             }
-            (false, true) => team.hub = None,
+            (false, true) => stop_hub(team, &events),
             _ => {}
         }
         if let Some(hub) = &team.hub
@@ -1456,9 +1484,10 @@ impl Manager {
     /// nothing of the space writes its state any more once it is closed). The task is told by [`Ev::Closed`], `false` if
     /// that didn't happen within [`CLOSE_WAIT`].
     fn close_session(&mut self, id: u64, space: SpaceId, forget: bool) {
+        let events = self.events_tx.clone();
         if let Some(team) = self.teams.iter_mut().find(|t| t.setting.space == space) {
             team.active = None;
-            team.hub = None;
+            stop_hub(team, &events);
         }
         self.publish_hubs();
         let (ack, closed) = oneshot::channel();
@@ -1584,6 +1613,19 @@ impl Manager {
 /// The last pass summary a team space's own `state.json` holds, if that state is for the space's folder.
 fn active_summary(state_dir: &DataDir, setting: &SpaceSetting) -> Option<PassSummary> {
     state_dir.load_state_for(setting.space, &setting.folder, None, setting.generation).ok().and_then(|(s, _)| s.last_pass).and_then(|l| l.summary)
+}
+
+/// Stops a team's hub. The next hub of the space starts when this one has ended (at most [`HUB_END_WAIT`] later): it writes its
+/// documents and closes its connection first, and must not do that while another hub works in the same folder.
+fn stop_hub(team: &mut Team, events: &mpsc::UnboundedSender<Ev>) {
+    let Some(hub) = team.hub.take() else { return };
+    let ended = hub.stop();
+    team.stopping += 1;
+    let (space, events) = (team.setting.space, events.clone());
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(HUB_END_WAIT, ended).await;
+        let _ = events.send(Ev::HubEnded(space));
+    });
 }
 
 /// The parts of a synced team space: scheduler, folder watcher, long-poll.

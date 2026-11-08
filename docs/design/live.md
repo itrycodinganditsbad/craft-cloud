@@ -175,6 +175,9 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
   the answer is the new role in `welcome_space`, or `404`. If the role allows writing again, the journals' updates go up on
   that connection; if the account is a viewer, they stay and the agent says so once (a count, no names; the document opens
   with them in `waiting`). A removed account's link stops with the space's sync, and nothing in `live/<space>/` is deleted.
+  When the agent's list of spaces lifts the read-only mark on a link that is up, the updates the gate held back are sent
+  again at once. A repeated `access_changed` is answered with longer and longer pauses (the first is 200 ms, each next one
+  doubles) unless the link had stayed up for a minute.
   The caps are per space: the live bytes of a team space are
   `[spaces] team_live_bytes` (4 GiB by default; a personal space keeps `live_bytes_per_user`), the documents and rows
   counts are the ones of a personal space, per space.
