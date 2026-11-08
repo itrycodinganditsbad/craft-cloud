@@ -31,10 +31,10 @@ use craft_cloud_proto::api::{
 };
 use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
 use craft_cloud_proto::local::{
-    ApproveDeletesAnswer, ApproveDeletesRequest, AutostartRequest, ChangePasswordRequest, ConflictsResponse, FolderUsageResponse, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX,
-    LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES, PairingInfo, PasswordRequest, RenameDeviceRequest, RunState,
-    SecondFactorLoginRequest, SpaceInfo, SpaceList, SpaceRun, SpaceStatus, SpaceSync, SpaceSyncRequest, Status, TotpRequest, TwoFactorProofRequest,
-    codes, paths,
+    ApproveDeletesAnswer, ApproveDeletesRequest, AutostartRequest, ChangePasswordRequest, ConflictsResponse, FolderUsageResponse, JoinRequest,
+    LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES, PairingInfo, PasswordRequest,
+    RenameDeviceRequest, RunState, SecondFactorLoginRequest, SpaceInfo, SpaceList, SpaceRun, SpaceStatus, SpaceSync, SpaceSyncRequest, Status,
+    TotpRequest, TwoFactorProofRequest, codes, paths,
 };
 use tokio::sync::{mpsc, oneshot};
 

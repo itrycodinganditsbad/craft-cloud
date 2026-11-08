@@ -252,7 +252,9 @@ impl AgentError {
             | AgentError::Lock(LockError::Busy(_) | LockError::NotAFile(_))
             | AgentError::Revoked
             | AgentError::OtherAccountState(_)
-            | AgentError::Server(TransportError::Protocol(_) | TransportError::QuotaExceeded { .. } | TransportError::ServerFull | TransportError::ReadOnly)
+            | AgentError::Server(
+                TransportError::Protocol(_) | TransportError::QuotaExceeded { .. } | TransportError::ServerFull | TransportError::ReadOnly,
+            )
             | AgentError::Sync(SyncError::Corrupt(_))
             | AgentError::Account(AccountError::Newer { .. } | AccountError::Damaged { .. })
             | AgentError::NeedsYou(_) => Exit::NeedsYou,
