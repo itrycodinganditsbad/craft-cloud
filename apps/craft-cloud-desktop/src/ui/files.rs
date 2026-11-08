@@ -185,9 +185,10 @@ fn conflicts(ui: &mut egui::Ui, files: &Files, now_ms: i64, events: &mut Vec<Eve
                     if open.clicked() {
                         events.push(Event::OpenConflictCopy(file.copy.path.clone()));
                     }
-                    let show = ui.add_enabled(file.original == Some(Place::Here), kit::Button::new("Show original"));
+                    // The original's folder is shown also when the original is not a kind of file that is opened from the page.
+                    let show = ui.add_enabled(matches!(file.original, Some(Place::Here | Place::NotOpenable)), kit::Button::new("Show original"));
                     let show = match file.original {
-                        Some(Place::Here) => show,
+                        Some(Place::Here | Place::NotOpenable) => show,
                         Some(place) => show.on_disabled_hover_text(place.reason().unwrap_or("The original isn't here")),
                         None => show.on_disabled_hover_text("The copy's name doesn't say which file it is a copy of"),
                     };

@@ -1813,7 +1813,13 @@ impl Model {
                 Ok(full) => vec![Effect::OpenFile(full)],
                 Err(place) => {
                     if let Screen::Files(files) = &mut self.screen {
-                        files.open_error = place.reason().map(|why| format!("Can't open this file: {why}."));
+                        let why = place.reason().map(|why| format!("Can't open this file: {why}."));
+                        // The page says it where the Open was clicked: with the conflict copies, or the recent files.
+                        if files.view == FilesView::Conflicts {
+                            files.conflicts.open_error = why;
+                        } else {
+                            files.open_error = why;
+                        }
                     }
                     Vec::new()
                 }
@@ -2650,8 +2656,11 @@ impl Model {
     }
 
     /// Opens a conflict copy with the OS's default program, or (`original`) the folder of the file it is a copy of, if that is
-    /// in the synced folder here: the path is joined to the folder and checked again ([`crate::files::resolve`]) however the
-    /// list placed it. Otherwise the page says why not.
+    /// in the synced folder here: the path is joined to the folder and checked again however the list placed it. A copy is
+    /// checked as a recent file is ([`crate::files::resolve`], then on the disk as it is at this moment by
+    /// [`Effect::CheckFile`], and what that checks is opened). The original is shown by its folder, whatever kind of file it is
+    /// (so it may be one that isn't opened from the page), and the folder gets only the checks of a path
+    /// ([`crate::files::resolve_folder`]: no escape, no bundle). Otherwise the page says why not.
     fn open_conflict(&mut self, path: &str, original: bool) -> Vec<Effect> {
         let root = self.status.as_ref().and_then(|s| s.folder.clone());
         let Screen::Files(files) = &mut self.screen else { return Vec::new() };
@@ -2665,18 +2674,16 @@ impl Model {
             }
         };
         files.conflicts.open_error = None;
-        let outcome = match (place, root) {
-            (Place::Here, Some(root)) if original => match target.rsplit_once('/') {
+        let outcome = match (original, place, root) {
+            (true, Place::Here | Place::NotOpenable, Some(root)) => match target.rsplit_once('/') {
                 // The folder the original is in; the synced folder itself for one at the top.
-                Some((parent, _)) => crate::files::resolve(Path::new(&root), parent).map(|full| full.to_string_lossy().into_owned()),
+                Some((parent, _)) => crate::files::resolve_folder(Path::new(&root), parent).map(|full| full.to_string_lossy().into_owned()),
                 None => Ok(root),
             }
             .map(Effect::OpenFolder),
-            (Place::Here, Some(root)) => {
-                crate::files::resolve(Path::new(&root), &target).map(|full| Effect::OpenFile(full.to_string_lossy().into_owned()))
-            }
-            (Place::Here, None) => Err(Place::NotYet),
-            (place, _) => Err(place),
+            (false, Place::Here, Some(root)) => crate::files::resolve(Path::new(&root), &target).map(|_| Effect::CheckFile { root, path: target }),
+            (true, Place::Here | Place::NotOpenable, None) | (false, Place::Here, None) => Err(Place::NotYet),
+            (_, place, _) => Err(place),
         };
         match outcome {
             Ok(effect) => vec![effect],
@@ -4901,18 +4908,33 @@ pub(crate) mod tests {
 
     #[test]
     fn a_conflict_copy_opens_only_when_it_is_here_and_the_original_is_shown_by_its_folder() {
-        let place = |path: &str| if path.starts_with("gone/") { Place::NotYet } else { Place::Here };
+        let place = |path: &str| {
+            if path.starts_with("gone/") {
+                Place::NotYet
+            } else if path.ends_with(".exe") {
+                Place::NotOpenable
+            } else {
+                Place::Here
+            }
+        };
         let copies = vec![
             conflict_copy("Letters/a (conflict).docx", Some("Letters/a.docx")),
             conflict_copy("top (conflict).txt", Some("top.txt")),
             conflict_copy("gone/b (conflict).txt", Some("gone/b.txt")),
             conflict_copy("odd.txt", None),
             conflict_copy("tool (conflict).exe", Some("tool.exe")),
+            conflict_copy("Photos.2024/a (conflict).png", Some("Photos.2024/a.png")),
+            conflict_copy("Plain folder/in.sh (conflict).txt", Some("Plain folder/in.sh")),
+            conflict_copy("Tool.app/readme (conflict).txt", Some("Tool.app/readme.txt")),
+            conflict_copy("up/../x (conflict).txt", Some("up/../x.txt")),
         ];
         let mut m = conflicts_loaded(copies, false, place);
         let root = std::path::Path::new("/home/ana/Craft Cloud");
         let open = m.update(Event::OpenConflictCopy("Letters/a (conflict).docx".into()));
-        assert_eq!(open, vec![Effect::OpenFile(root.join("Letters").join("a (conflict).docx").to_string_lossy().into_owned())]);
+        // The disk is looked at again at the click, and what that finds is what is opened (the model never opens the joined path).
+        assert_eq!(open, vec![Effect::CheckFile { root: "/home/ana/Craft Cloud".into(), path: "Letters/a (conflict).docx".into() }]);
+        let checked = root.join("Letters").join("a (conflict).docx").to_string_lossy().into_owned();
+        assert_eq!(m.update(Event::FileChecked(Ok(checked.clone()))), vec![Effect::OpenFile(checked)]);
         let show = m.update(Event::ShowConflictOriginal("Letters/a (conflict).docx".into()));
         assert_eq!(show, vec![Effect::OpenFolder(root.join("Letters").to_string_lossy().into_owned())]);
         let top = m.update(Event::ShowConflictOriginal("top (conflict).txt".into()));
@@ -4920,7 +4942,8 @@ pub(crate) mod tests {
         for (event, why) in [
             (Event::OpenConflictCopy("gone/b (conflict).txt".into()), "Not on this computer yet"),
             (Event::ShowConflictOriginal("gone/b (conflict).txt".into()), "Not on this computer yet"),
-            (Event::OpenConflictCopy("tool (conflict).exe".into()), "Programs and scripts"),
+            (Event::OpenConflictCopy("tool (conflict).exe".into()), "Open it from its folder"),
+            (Event::OpenConflictCopy("Tool.app/readme (conflict).txt".into()), "Open it from its folder"),
             (Event::ShowConflictOriginal("odd.txt".into()), "doesn't say which file"),
         ] {
             assert!(m.update(event.clone()).is_empty(), "{event:?}");
@@ -4931,6 +4954,36 @@ pub(crate) mod tests {
             );
         }
         assert!(m.update(Event::OpenConflictCopy("not/in/the/list.txt".into())).is_empty());
+        // The second look finding the copy gone, or something else, is said on the conflict copies' page.
+        m.update(Event::FilesView(FilesView::Conflicts));
+        assert!(m.update(Event::FileChecked(Err(Place::NotYet))).is_empty());
+        assert_eq!(files_page(&m).conflicts.open_error.as_deref(), Some("Can't open this file: Not on this computer yet."));
+        assert!(files_page(&m).open_error.is_none());
+    }
+
+    /// Show original takes the original's folder with the checks of a path only: a folder called `Photos.2024` or a file that
+    /// is a program is fine to show, a bundle or an escape is not.
+    #[test]
+    fn show_original_checks_the_folder_as_a_path_not_as_a_program() {
+        let place = |path: &str| if path.ends_with(".sh") { Place::NotOpenable } else { Place::Here };
+        let copies = vec![
+            conflict_copy("Photos.2024/a (conflict).png", Some("Photos.2024/a.png")),
+            conflict_copy("Plain folder/in.sh (conflict).txt", Some("Plain folder/in.sh")),
+            conflict_copy("Tool.app/readme (conflict).txt", Some("Tool.app/readme.txt")),
+            conflict_copy("up/../x (conflict).txt", Some("up/../x.txt")),
+            conflict_copy("Noext/README (conflict)", Some("Noext/README")),
+        ];
+        let mut m = conflicts_loaded(copies, false, place);
+        let root = std::path::Path::new("/home/ana/Craft Cloud");
+        let shown = |folder: &str| vec![Effect::OpenFolder(root.join(folder).to_string_lossy().into_owned())];
+        assert_eq!(m.update(Event::ShowConflictOriginal("Photos.2024/a (conflict).png".into())), shown("Photos.2024"));
+        assert_eq!(m.update(Event::ShowConflictOriginal("Plain folder/in.sh (conflict).txt".into())), shown("Plain folder"));
+        assert_eq!(m.update(Event::ShowConflictOriginal("Noext/README (conflict)".into())), shown("Noext"));
+        for (copy, why) in [("Tool.app/readme (conflict).txt", "Open it from its folder"), ("up/../x (conflict).txt", "Outside the synced folder")] {
+            assert!(m.update(Event::ShowConflictOriginal(copy.into())).is_empty(), "{copy}");
+            let error = files_page(&m).conflicts.open_error.clone();
+            assert!(error.as_deref().is_some_and(|e| e.starts_with("Can't show the original") && e.contains(why)), "{copy}: {error:?}");
+        }
     }
 
     #[test]
