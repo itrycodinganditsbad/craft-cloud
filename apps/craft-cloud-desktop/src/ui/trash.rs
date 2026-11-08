@@ -148,7 +148,7 @@ fn filters(ui: &mut egui::Ui, trash: &Trash, events: &mut Vec<Event>) {
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let mut search = trash.search.clone();
-            if ui.add(kit::text_edit(&mut search).hint_text("Name or path").desired_width(220.0)).changed() {
+            if ui.add(kit::text_edit(&mut search).id(super::shortcuts::search_id()).hint_text("Name or path").desired_width(220.0)).changed() {
                 events.push(Event::TrashSearch(search));
             }
             kit::section_label(ui, "Search");

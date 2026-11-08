@@ -379,7 +379,7 @@ fn search_row(ui: &mut egui::Ui, list: &mut UserList, events: &mut Vec<Event>, r
             kit::section_label(ui, "Search");
         }
         1 => {
-            let field = ui.add(kit::text_edit(&mut list.search).hint_text("Account name").desired_width(220.0));
+            let field = ui.add(kit::text_edit(&mut list.search).id(super::shortcuts::search_id()).hint_text("Account name").desired_width(220.0));
             if entered(&field, ui) {
                 send(events, AdminEvent::Search);
             }

@@ -110,7 +110,7 @@ fn filters(ui: &mut egui::Ui, files: &Files, events: &mut Vec<Event>) {
     let beside = ui.available_width() >= segments_width + search_width;
     let mut search_field = |ui: &mut egui::Ui| {
         let mut search = files.search.clone();
-        if ui.add(kit::text_edit(&mut search).hint_text("Name or path").desired_width(220.0)).changed() {
+        if ui.add(kit::text_edit(&mut search).id(super::shortcuts::search_id()).hint_text("Name or path").desired_width(220.0)).changed() {
             events.push(Event::FilesSearch(search));
         }
         kit::section_label(ui, "Search");

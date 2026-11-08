@@ -145,13 +145,15 @@ fn title(ui: &mut egui::Ui, shell: &Shell, room: f32) {
 fn tabs(ui: &mut egui::Ui, shell: &Shell, events: &mut Vec<Event>) {
     ui.spacing_mut().item_spacing.x = 4.0;
     ui.add_enabled_ui(!shell.locked, |ui| {
-        for tab in &shell.tabs {
+        for (index, tab) in shell.tabs.iter().enumerate() {
             let response = kit::tab(ui, tab.label(), *tab == shell.tab);
             if response.clicked() {
                 events.push(Event::Tab(*tab));
             }
             if shell.locked {
                 response.on_disabled_hover_text(LOCKED_HOVER);
+            } else if let Some(shortcut) = super::shortcuts::tab_shortcut(ui.ctx(), index) {
+                response.on_hover_text(format!("{} ({shortcut})", tab.label()));
             }
         }
     });

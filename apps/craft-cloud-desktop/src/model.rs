@@ -790,6 +790,10 @@ pub enum Event {
     /// Ask for the computer list again.
     RefreshDevices,
     RefreshUsage,
+    /// Ctrl+1 to Ctrl+9: the visible tab at this place in the header (from 1).
+    TabNumber(usize),
+    /// Ctrl+R: what the page's Refresh does, on a page that has one.
+    RefreshPage,
     SignOut,
     /// Sign out on this computer only (the server can't be reached).
     SignOutHere,
@@ -1115,6 +1119,42 @@ impl Model {
         match &self.screen {
             Screen::Security(page) => page.busy || matches!(page.step, SecurityStep::Codes { .. }),
             Screen::Admin(admin) => admin.code.is_some() || admin.dialog.as_ref().is_some_and(|d| d.busy),
+            _ => false,
+        }
+    }
+
+    /// The event of the Refresh button of the page shown, if the page has one.
+    fn refresh_event(&self) -> Option<Event> {
+        match &self.screen {
+            Screen::SignedIn(o) => Some(match o.page {
+                OverviewPage::Home => Event::RefreshUsage,
+                OverviewPage::Computers => Event::RefreshDevices,
+            }),
+            Screen::Trash(_) => Some(Event::LoadTrash),
+            Screen::Files(_) => Some(Event::LoadFiles),
+            Screen::Activity(_) => Some(Event::Audit(AuditMsg::ActivityReload)),
+            // A code or the password page covers the page, and the new account's form has no Refresh.
+            Screen::Admin(admin) if admin.code.is_none() && admin.dialog.is_none() => match admin.view {
+                crate::admin::View::List => Some(Event::Admin(AdminEvent::Reload)),
+                crate::admin::View::Audit(_) => Some(Event::Audit(AuditMsg::Reload)),
+                crate::admin::View::User(_) => Some(Event::Admin(AdminEvent::RefreshUsage)),
+                crate::admin::View::Create(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether the page shown has a search field now (Ctrl+F goes to it).
+    pub fn has_search(&self) -> bool {
+        match &self.screen {
+            Screen::Files(files) => files.list.as_ref().is_some_and(|list| !list.is_empty()),
+            Screen::Trash(trash) => trash.page.is_some(),
+            Screen::Admin(admin) => {
+                admin.code.is_none()
+                    && admin.dialog.is_none()
+                    && matches!(admin.view, crate::admin::View::List)
+                    && admin.section == crate::admin::Section::Accounts
+            }
             _ => false,
         }
     }
@@ -1818,6 +1858,14 @@ impl Model {
                 std::iter::once(Effect::Devices).chain(again).collect()
             }
             Event::Tab(tab) => self.open_tab(tab),
+            Event::TabNumber(number) => match number.checked_sub(1).and_then(|index| self.tabs().get(index).copied()) {
+                Some(tab) => self.update(Event::Tab(tab)),
+                None => Vec::new(),
+            },
+            Event::RefreshPage => match self.refresh_event() {
+                Some(refresh) => self.update(refresh),
+                None => Vec::new(),
+            },
             Event::Admin(event) => self.admin(event),
             Event::Audit(msg) => self.audit(msg),
             Event::RefreshUsage => {
@@ -4918,5 +4966,104 @@ pub(crate) mod tests {
         let refused = Error::Refused { code: "wrong_password".into(), message: "no".into(), name_taken: None };
         let effects = m.update(Event::SecurityAnswer(SecurityAnswer::ChangePassword(Err(refused))));
         assert!(!effects.contains(&Effect::Devices), "{effects:?}");
+    }
+
+    /// Ctrl+1 to Ctrl+9 count the tabs that are visible, in the header's order.
+    #[test]
+    fn a_tab_number_goes_to_the_visible_tab_at_that_place() {
+        let mut m = signed_in();
+        let order = m.tabs();
+        for (index, tab) in order.iter().enumerate() {
+            m.update(Event::TabNumber(index + 1));
+            assert_eq!(m.tab(), Some(*tab), "number {}", index + 1);
+        }
+        // A member has seven tabs: the places after them are nothing, and so is 0.
+        let before = m.tab();
+        for number in [0, order.len() + 1, 9, usize::MAX] {
+            assert!(m.update(Event::TabNumber(number)).is_empty(), "{number}");
+            assert_eq!(m.tab(), before);
+        }
+        // An admin's Admin tab is the eighth; the hidden one is skipped for a member, so the numbers don't shift.
+        let mut admin = signed_in_admin();
+        assert_eq!(admin.tabs().last(), Some(&Tab::Admin));
+        admin.update(Event::TabNumber(8));
+        assert_eq!(admin.tab(), Some(Tab::Admin));
+        let mut member = signed_in();
+        member.update(Event::TabNumber(8));
+        assert_eq!(member.tab(), Some(Tab::Overview));
+        // The same tab again is no new load.
+        assert!(member.update(Event::TabNumber(1)).is_empty());
+        // Not signed in: no tabs.
+        assert!(model().update(Event::TabNumber(1)).is_empty());
+    }
+
+    /// A page that can't be left by a tab can't be left by a number either.
+    #[test]
+    fn a_tab_number_waits_while_the_tabs_are_locked() {
+        let mut m = signed_in();
+        m.update(Event::Tab(Tab::Security));
+        let Screen::Security(page) = &mut m.screen else { panic!() };
+        page.step = SecurityStep::Codes { codes: vec!["AAAA-BBBB".into()], why: crate::security::CodesWhy::TurnedOn };
+        assert!(m.update(Event::TabNumber(1)).is_empty());
+        assert_eq!(m.tab(), Some(Tab::Security));
+        m.update(Event::Security(SecurityEvent::Home));
+        m.update(Event::TabNumber(1));
+        assert_eq!(m.tab(), Some(Tab::Overview));
+    }
+
+    /// Ctrl+R does what the page's Refresh button does, and nothing where there is none.
+    #[test]
+    fn refresh_page_is_the_refresh_button_of_the_page_shown() {
+        let mut m = signed_in();
+        assert_eq!(m.refresh_event(), Some(Event::RefreshUsage));
+        m.update(Event::Tab(Tab::Computers));
+        assert_eq!(m.refresh_event(), Some(Event::RefreshDevices));
+        assert!(m.update(Event::RefreshPage).contains(&Effect::Devices));
+        for (tab, want) in [
+            (Tab::Files, Some(Event::LoadFiles)),
+            (Tab::Trash, Some(Event::LoadTrash)),
+            (Tab::Activity, Some(Event::Audit(AuditMsg::ActivityReload))),
+            (Tab::Versions, None),
+            (Tab::Security, None),
+        ] {
+            m.update(Event::Tab(tab));
+            assert_eq!(m.refresh_event(), want, "{tab:?}");
+        }
+        // On the Files page it asks the agent again (once it is not loading).
+        m.update(Event::Tab(Tab::Files));
+        let Screen::Files(files) = &mut m.screen else { panic!() };
+        files.loading = false;
+        let effects = m.update(Event::RefreshPage);
+        assert!(matches!(effects.as_slice(), [Effect::Recents { .. }]), "{effects:?}");
+        assert!(model().update(Event::RefreshPage).is_empty(), "not signed in");
+    }
+
+    #[test]
+    fn refresh_page_on_the_admin_pages_follows_the_part_shown() {
+        let mut m = signed_in_admin();
+        m.update(Event::Tab(Tab::Admin));
+        assert_eq!(m.refresh_event(), Some(Event::Admin(AdminEvent::Reload)));
+        let Screen::Admin(admin) = &mut m.screen else { panic!() };
+        admin.view = crate::admin::View::Create(Default::default());
+        assert_eq!(m.refresh_event(), None);
+    }
+
+    /// Ctrl+F has a field to go to on the pages that show one.
+    #[test]
+    fn only_pages_with_a_search_field_have_one() {
+        let mut m = files_loaded();
+        assert!(m.has_search());
+        m.update(Event::Tab(Tab::Trash));
+        assert!(!m.has_search(), "the trash list is not loaded yet");
+        let Screen::Trash(trash) = &mut m.screen else { panic!() };
+        trash.page = Some(TrashResponse { items: Vec::new(), next: None });
+        assert!(m.has_search());
+        for tab in [Tab::Overview, Tab::Computers, Tab::Security, Tab::Versions] {
+            m.update(Event::Tab(tab));
+            assert!(!m.has_search(), "{tab:?}");
+        }
+        let mut admin = signed_in_admin();
+        admin.update(Event::Tab(Tab::Admin));
+        assert!(admin.has_search(), "the accounts' search");
     }
 }

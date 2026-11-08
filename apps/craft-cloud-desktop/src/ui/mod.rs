@@ -15,6 +15,7 @@ mod problem;
 mod second_factor;
 mod security;
 mod shell;
+mod shortcuts;
 mod trash;
 mod versions;
 
@@ -37,6 +38,7 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
     if !kit::ensure(ui.ctx()) {
         return events;
     }
+    events.extend(shortcuts::read(ui.ctx(), model));
     security::forget_secrets(ui.ctx(), &model.screen);
     stash_names(ui.ctx(), model);
     // The signed-in pages sit between a header with the tabs and a footer strip; the other screens fill the window.

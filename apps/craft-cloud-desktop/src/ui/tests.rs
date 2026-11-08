@@ -2407,3 +2407,88 @@ fn the_security_pages_sign_out_button_is_off_without_another_computer() {
     h.run_steps(2);
     assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Security(crate::security::SecurityEvent::StartSignOutOthers)]);
 }
+
+/// The account page of `ana`, with a role edit typed and a tab asked for, so that the page asks before dropping the edit.
+fn discarding_account_edits() -> Model {
+    let agent = admin_agent();
+    let ana = id_of(&on_admin_pages(&agent, Vec::new()), "ana");
+    let mut model = on_admin_pages(&agent, vec![Event::Admin(AdminEvent::OpenUser(ana))]);
+    if let Screen::Admin(admin) = &mut model.screen {
+        if let View::User(view) = &mut admin.view {
+            view.role = RoleChoice::Admin;
+            view.quota = "12".into();
+        }
+        admin.leaving = Some(Box::new(Event::Tab(Tab::Trash)));
+    }
+    model
+}
+
+#[test]
+fn snapshot_unsaved_account_edits_question() {
+    snapshot(discarding_account_edits(), egui::Theme::Dark, "admin-account-discard-dark");
+}
+
+/// The question about unsaved edits answers with Discard and Keep editing, and Esc is Keep editing.
+#[test]
+fn the_question_about_unsaved_account_edits_sends_its_answers() {
+    let ask = |key: Option<egui::Key>, label: Option<&str>| {
+        let mut h = tall_harness(discarding_account_edits(), egui::Theme::Light);
+        h.run_steps(4);
+        assert!(h.get_by_label("Keep editing").is_focused(), "the safe choice has the focus");
+        assert_eq!(h.query_all_by_label("Discard the unsaved changes?").count(), 1);
+        if let Some(key) = key {
+            h.key_press(key);
+        }
+        if let Some(label) = label {
+            h.get_by_label(label).click();
+        }
+        h.run_steps(3);
+        std::mem::take(&mut h.state_mut().1)
+    };
+    assert!(ask(Some(egui::Key::Escape), None).contains(&Event::Admin(AdminEvent::KeepEditing)));
+    assert!(ask(None, Some("Keep editing")).contains(&Event::Admin(AdminEvent::KeepEditing)));
+    assert!(ask(None, Some("Discard")).contains(&Event::Admin(AdminEvent::DiscardEdits)));
+}
+
+/// Ctrl+4 (Cmd+4 on macOS) and Ctrl+R reach the model as the events that go to the fourth tab and refresh the page.
+#[test]
+fn the_shortcuts_send_the_tab_and_refresh_events() {
+    let mut h = harness(overview_model(), egui::Theme::Light);
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num4);
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::R);
+    h.run_steps(2);
+    // Plain keys and other combinations are nothing.
+    h.key_press(egui::Key::Num2);
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::Num2);
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::TabNumber(4), Event::RefreshPage]);
+}
+
+/// Ctrl+F puts the cursor in the page's search field, on a page that has one.
+#[test]
+fn ctrl_f_focuses_the_search_field_where_there_is_one() {
+    use egui::accesskit::Role;
+    let mut h = harness(trash_model(true), egui::Theme::Light);
+    h.run_steps(3);
+    assert!(!h.get_by_role(Role::TextInput).is_focused());
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F);
+    h.run_steps(3);
+    assert!(h.get_by_role(Role::TextInput).is_focused());
+    // The overview has no search field to go to: nothing takes the focus.
+    let mut h = harness(overview_model(), egui::Theme::Light);
+    h.run_steps(3);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F);
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_role(Role::TextInput).count(), 0);
+}
+
+/// The first nine tabs have a shortcut to name in their hover text, written as the OS writes it; the tenth has none.
+#[test]
+fn the_first_nine_tabs_have_a_shortcut_to_name() {
+    let ctx = egui::Context::default();
+    let named: Vec<Option<String>> = (0..10).map(|index| shortcuts::tab_shortcut(&ctx, index)).collect();
+    assert!(named[..9].iter().enumerate().all(|(i, s)| s.as_deref().is_some_and(|s| s.ends_with(&(i + 1).to_string()))), "{named:?}");
+    assert_eq!(named[9], None);
+}
