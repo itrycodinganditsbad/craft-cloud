@@ -1707,6 +1707,7 @@ fn put_back(held: &Path, place: &Path) -> io::Result<()> {
 }
 
 /// How a file's deletion came out.
+#[derive(Debug)]
 enum Deleted {
     Gone,
     Changed,
@@ -1779,32 +1780,36 @@ fn delete_batch(
     batch
 }
 
-/// The place in the quarantine a file is moved into: a folder of its own, `<name>.ccq`, that is made new for it (so the move can never
-/// replace anything) and holds the file under its own name.
-fn wrapper_of(quarantine: &Path, os: &[std::ffi::OsString]) -> PathBuf {
-    let mut wrapper = join(quarantine, os);
-    let mut name = wrapper.file_name().map(std::ffi::OsString::from).unwrap_or_default();
-    name.push(".ccq");
-    wrapper.set_file_name(name);
-    wrapper
-}
-
-/// Takes the file at `path` out of the old folder into the brand-new folder `wrapper`: the folder is made first (it fails if the name
-/// is taken, so nothing is ever replaced there) and the file is then renamed into it in one step, whatever is at `path` at that
-/// moment (a file a program saved there meanwhile comes along and is not the verified one, which the read afterwards finds).
-fn take_aside(path: &Path, wrapper: &Path, held: &Path, between: Option<hook::Callback>) -> io::Result<()> {
-    if let Some(parent) = wrapper.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Takes the file at `path` out of the old folder into a brand-new folder of the quarantine, `<quarantine>/<slot>/<P>/<N>`: the
+/// slot folder is made first (it fails if the name is taken, so nothing is ever replaced there) and the file is then renamed to
+/// the same relative place inside it in one step, whatever is at `path` at that moment (a file a program saved there meanwhile comes
+/// along and is not the verified one, which the checks afterwards find). The file keeps its own name, so a name at the limit of the
+/// volume still fits, and no name a person gave a file or folder can be in the way. Returns the slot and where the file now is.
+fn take_aside(quarantine: &Path, os: &[std::ffi::OsString], path: &Path, between: Option<hook::Callback>) -> io::Result<(PathBuf, PathBuf)> {
+    for _ in 0..8 {
+        let slot = quarantine.join(random_hex(8)?);
+        match std::fs::create_dir(&slot) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+        let held = join(&slot, os);
+        if let Some(parent) = held.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            remove_empty_tree(&slot);
+            return Err(e);
+        }
+        if let Some(hook) = between {
+            hook(path);
+        }
+        if let Err(e) = std::fs::rename(path, &held) {
+            remove_empty_tree(&slot);
+            return Err(e);
+        }
+        return Ok((slot, held));
     }
-    std::fs::create_dir(wrapper)?;
-    if let Some(hook) = between {
-        hook(path);
-    }
-    if let Err(e) = std::fs::rename(path, held) {
-        let _ = std::fs::remove_dir(wrapper);
-        return Err(e);
-    }
-    Ok(())
+    Err(io::Error::other("no free place in the quarantine"))
 }
 
 fn delete_one(root: &Path, quarantine: &Path, chain: &Chain, item: &Copied, cancelled: &dyn Fn() -> bool, hooks: Hooks) -> Deleted {
@@ -1815,41 +1820,61 @@ fn delete_one(root: &Path, quarantine: &Path, chain: &Chain, item: &Copied, canc
     if !ancestors_are_real(root, &item.entry.os) {
         return Deleted::Changed;
     }
-    let unchanged = std::fs::symlink_metadata(&path)
-        .is_ok_and(|m| m.is_file() && !is_link(&m) && m.len() == item.entry.size && m.modified().ok() == item.entry.modified);
+    let meta = std::fs::symlink_metadata(&path);
+    let unchanged = meta.as_ref().is_ok_and(|m| m.is_file() && !is_link(m) && m.len() == item.entry.size && m.modified().ok() == item.entry.modified);
     if !unchanged {
         // Gone (the person deleted it) is not "kept"; anything else there is.
-        return if std::fs::symlink_metadata(&path).is_err() { Deleted::Gone } else { Deleted::Changed };
+        return if meta.is_err() { Deleted::Gone } else { Deleted::Changed };
     }
-    let wrapper = wrapper_of(quarantine, &item.entry.os);
-    let Some(name) = path.file_name() else { return Deleted::Locked };
-    let held = wrapper.join(name);
-    // A taken wrapper (what a failed put-back left) is never reused: the file stays where it is.
-    if take_aside(&path, &wrapper, &held, hooks.between).is_err() {
-        return Deleted::Locked;
+    let expected = meta.ok().and_then(|m| identity(&path, &m));
+    let Ok((slot, held)) = take_aside(quarantine, &item.entry.os, &path, hooks.between) else { return Deleted::Locked };
+    // What was moved must be the file that was looked at: a regular file with its identity. A folder, a link or another file that
+    // took its name in the last moment goes straight back (never over anything) and counts as changed.
+    let it_is_the_file =
+        std::fs::symlink_metadata(&held).is_ok_and(|m| m.is_file() && !is_link(&m) && (expected.is_none() || identity(&held, &m) == expected));
+    if !it_is_the_file {
+        if put_back(&held, &path).is_err() {
+            return Deleted::Stranded;
+        }
+        remove_empty_tree(&slot);
+        return Deleted::Changed;
     }
     if let Some(hook) = hooks.after {
         hook(&held);
     }
     let same = matches!(chunk_file(&held, cancelled, |_| Ok(())), Ok((m, _)) if m == item.manifest);
     if same && std::fs::remove_file(&held).is_ok() {
-        let _ = std::fs::remove_dir(&wrapper);
+        remove_empty_tree(&slot);
         return Deleted::Gone;
     }
     if put_back(&held, &path).is_err() {
         return Deleted::Stranded;
     }
-    let _ = std::fs::remove_dir(&wrapper);
+    remove_empty_tree(&slot);
     if same { Deleted::Locked } else { Deleted::Changed }
 }
 
 /// Puts back everything a crash (or a put-back that failed) left in the quarantine of this personal folder, whichever job it was:
 /// every file goes back to its place (the folders above it are made again) or next to it, never over anything. Returns the
-/// quarantine folders that still hold files.
+/// quarantine folders that still hold files, or the quarantine's own folder when it can't be read at all (a drive that is not there
+/// yet, access denied): what is in it is not known, so it is not taken for empty.
 fn recover_quarantine_all(account: &Account) -> Vec<PathBuf> {
     let mut stranded = Vec::new();
     let base = quarantine_base(account);
-    let Ok(entries) = std::fs::read_dir(&base) else { return stranded };
+    let entries = match std::fs::read_dir(&base) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // None there, unless the personal folder itself can't be looked at.
+            if matches!(std::fs::symlink_metadata(&account.folder), Err(e) if e.kind() != io::ErrorKind::NotFound) {
+                stranded.push(base);
+            }
+            return stranded;
+        }
+        Err(_) => {
+            stranded.push(base);
+            return stranded;
+        }
+    };
     let personal = std::fs::canonicalize(&account.folder).unwrap_or_else(|_| account.folder.clone());
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1866,11 +1891,26 @@ fn recover_quarantine_all(account: &Account) -> Vec<PathBuf> {
     stranded
 }
 
-/// Whether the quarantine folder `dir` is empty (and removed, with its marker) after its files were put back. A marker that is
-/// missing, empty or not sound leaves the folder untouched and reported.
+/// Whether `dir` holds a file anywhere below it (or can't be read, which is not taken for empty).
+fn holds_files(dir: &Path) -> bool {
+    let mut stack = vec![dir.to_owned()];
+    while let Some(here) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&here) else { return true };
+        for entry in entries.flatten() {
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(entry.path()),
+                _ => return true,
+            }
+        }
+    }
+    false
+}
+
+/// Whether the quarantine folder `dir` is empty (and removed, with its marker) after its files were put back. Its files lie at
+/// `<slot>/<path in the old folder>`; the slot is dropped and the rest goes back below the old folder. A marker that is missing,
+/// empty or not sound leaves the folder untouched and reported, and so does a file that is not at such a place.
 fn recover_one(dir: &Path, personal: &Path) -> bool {
-    let has_files = std::fs::read_dir(dir).is_ok_and(|mut e| e.next().is_some());
-    if !has_files {
+    if !holds_files(dir) {
         remove_empty_tree(dir);
         let _ = std::fs::remove_file(marker_of(dir));
         return true;
@@ -1879,26 +1919,19 @@ fn recover_one(dir: &Path, personal: &Path) -> bool {
     let mut clean = true;
     let mut stack = vec![dir.to_owned()];
     while let Some(here) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&here) else { continue };
+        let Ok(entries) = std::fs::read_dir(&here) else {
+            clean = false;
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
                 stack.push(path);
             } else if let Ok(rel) = path.strip_prefix(dir) {
-                // A file in its own `<name>.ccq` folder goes back to where the folder stood, under its name.
-                let place_rel = match (rel.parent(), rel.file_name()) {
-                    (Some(parent), Some(file))
-                        if parent.file_name().is_some_and(|w| {
-                            let mut want = file.to_os_string();
-                            want.push(".ccq");
-                            w == want
-                        }) =>
-                    {
-                        parent.parent().unwrap_or(Path::new("")).join(file)
-                    }
-                    _ => rel.to_owned(),
-                };
-                if put_back(&path, &root.join(place_rel)).is_err() {
+                let mut parts = rel.components();
+                parts.next();
+                let inside: PathBuf = parts.collect();
+                if inside.as_os_str().is_empty() || put_back(&path, &root.join(inside)).is_err() {
                     clean = false;
                 }
             } else {
@@ -2193,16 +2226,13 @@ mod tests {
         assert!(!hard_links_unsupported(&io::Error::from(io::ErrorKind::AlreadyExists)));
     }
 
-    #[test]
-    fn a_file_is_not_moved_onto_what_a_failed_put_back_left_in_the_quarantine() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("Old");
-        let quarantine = dir.path().join("q");
+    /// An old folder `Old` holding `a.txt` with this content, a quarantine beside it, the file's item and the folder's chain.
+    fn old_folder_with_a_file(dir: &Path, content: &[u8]) -> (PathBuf, PathBuf, Chain, Copied) {
+        let root = dir.join("Old");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("a.txt"), b"the new file").unwrap();
-        // A leftover waits where this file would be taken to.
-        std::fs::create_dir_all(quarantine.join("a.txt.ccq")).unwrap();
-        std::fs::write(quarantine.join("a.txt.ccq").join("a.txt"), b"the leftover").unwrap();
+        // The quarantine folder exists (the batch made it, with its marker, before anything is taken aside).
+        std::fs::create_dir_all(dir.join("q")).unwrap();
+        std::fs::write(root.join("a.txt"), content).unwrap();
         let (manifest, size) = chunk_file(&root.join("a.txt"), &|| false, |_| Ok(())).map_err(|_| ()).unwrap();
         let meta = std::fs::metadata(root.join("a.txt")).unwrap();
         let item = Copied {
@@ -2210,12 +2240,22 @@ mod tests {
             manifest,
             team_edit: None,
         };
-        let chain = chain_of(&std::fs::canonicalize(&root).unwrap(), &std::fs::canonicalize(dir.path()).unwrap());
-        let root = std::fs::canonicalize(&root).unwrap();
+        let chain = chain_of(&std::fs::canonicalize(&root).unwrap(), &std::fs::canonicalize(dir).unwrap());
+        (std::fs::canonicalize(&root).unwrap(), dir.join("q"), chain, item)
+    }
+
+    #[test]
+    fn a_leftover_in_the_quarantine_is_never_in_the_way_of_a_file_taken_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, quarantine, chain, item) = old_folder_with_a_file(dir.path(), b"the new file");
+        // A leftover (what a failed put-back keeps) lies in a slot of its own, with the same relative name.
+        std::fs::create_dir_all(quarantine.join("0123456789abcdef")).unwrap();
+        std::fs::write(quarantine.join("0123456789abcdef").join("a.txt"), b"the leftover").unwrap();
         let out = delete_one(&root, &quarantine, &chain, &item, &|| false, Hooks::default());
-        assert!(matches!(out, Deleted::Locked));
-        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"the new file");
-        assert_eq!(std::fs::read(quarantine.join("a.txt.ccq").join("a.txt")).unwrap(), b"the leftover");
+        assert!(matches!(out, Deleted::Gone));
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(std::fs::read(quarantine.join("0123456789abcdef").join("a.txt")).unwrap(), b"the leftover", "the leftover is untouched");
+        assert_eq!(std::fs::read_dir(&quarantine).unwrap().count(), 1, "the file's own slot is gone");
     }
 
     /// What an editor does: writes a temporary file and renames it over the original.
@@ -2228,24 +2268,50 @@ mod tests {
     #[test]
     fn a_file_saved_at_the_old_place_while_the_original_is_taken_aside_is_not_lost() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("Old");
-        let quarantine = dir.path().join("q");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("a.txt"), b"A, as it was verified").unwrap();
-        let (manifest, size) = chunk_file(&root.join("a.txt"), &|| false, |_| Ok(())).map_err(|_| ()).unwrap();
-        let meta = std::fs::metadata(root.join("a.txt")).unwrap();
-        let item = Copied {
-            entry: FileEntry { os: vec!["a.txt".into()], names: vec!["a.txt".into()], size, modified: meta.modified().ok() },
-            manifest,
-            team_edit: None,
-        };
-        let chain = chain_of(&std::fs::canonicalize(&root).unwrap(), &std::fs::canonicalize(dir.path()).unwrap());
-        let root = std::fs::canonicalize(&root).unwrap();
+        let (root, quarantine, chain, item) = old_folder_with_a_file(dir.path(), b"A, as it was verified");
         // Between the steps of taking the file aside, B is saved at its place.
         let out = delete_one(&root, &quarantine, &chain, &item, &|| false, Hooks { between: Some(save_b_over), after: None });
-        assert!(matches!(out, Deleted::Changed), "B is not what was verified");
+        assert!(matches!(out, Deleted::Changed), "B is not what was verified: {out:?}");
         assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"B, saved by an editor in between", "B is back where it was saved");
-        assert!(!quarantine.join("a.txt.ccq").exists(), "nothing is left in the quarantine");
+        assert!(!quarantine.exists() || std::fs::read_dir(&quarantine).unwrap().count() == 0, "nothing is left in the quarantine");
+    }
+
+    /// The old file is replaced by another file with the very same content, as a program that saves a copy and renames it does.
+    fn replace_by_a_copy(path: &Path) {
+        let temp = path.with_extension("copy-temp");
+        std::fs::copy(path, &temp).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::rename(&temp, path).unwrap();
+    }
+
+    #[test]
+    fn what_was_moved_aside_is_checked_to_be_the_file_that_was_looked_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, quarantine, chain, item) = old_folder_with_a_file(dir.path(), b"same content");
+        // Another file with the same content took the name at the last moment: it is not the verified file, and goes back.
+        let hooks = Hooks { between: Some(replace_by_a_copy), after: None };
+        let out = delete_one(&root, &quarantine, &chain, &item, &|| false, hooks);
+        assert!(matches!(out, Deleted::Changed), "kept, not deleted: {out:?}");
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"same content");
+        assert!(!quarantine.exists() || std::fs::read_dir(&quarantine).unwrap().count() == 0);
+    }
+
+    /// A folder takes the file's name.
+    fn replace_by_a_folder(path: &Path) {
+        std::fs::remove_file(path).unwrap();
+        std::fs::create_dir(path).unwrap();
+        std::fs::write(path.join("inside.txt"), b"in the folder").unwrap();
+    }
+
+    #[test]
+    fn a_folder_that_took_the_files_name_is_put_back_where_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, quarantine, chain, item) = old_folder_with_a_file(dir.path(), b"a file");
+        let hooks = Hooks { between: Some(replace_by_a_folder), after: None };
+        let out = delete_one(&root, &quarantine, &chain, &item, &|| false, hooks);
+        assert!(matches!(out, Deleted::Changed), "kept, and not stranded in the quarantine: {out:?}");
+        assert_eq!(std::fs::read(root.join("a.txt").join("inside.txt")).unwrap(), b"in the folder");
+        assert!(!quarantine.exists() || std::fs::read_dir(&quarantine).unwrap().count() == 0);
     }
 
     #[test]

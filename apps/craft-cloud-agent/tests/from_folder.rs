@@ -950,7 +950,11 @@ async fn work_stopped_after_the_old_folder_was_removed_finishes_as_done() {
 
 // ---- the second review round ----
 
-/// A quarantine folder with `files` (relative path, content) for the old folder `root`, as a crashed deletion leaves it.
+/// The slot of the quarantine a crashed deletion left a file in (a folder of its own for each file).
+const SLOT: &str = "0123456789abcdef";
+
+/// A quarantine folder with `files` (relative path, content) for the old folder `root`, as a crashed deletion leaves it: each file
+/// at `<slot>/<its path in the old folder>`.
 fn leave_in_quarantine(personal: &Path, _key: &str, root: &Path, files: &[(&str, &[u8])]) -> PathBuf {
     let dir = quarantine_of(personal, root);
     std::fs::create_dir_all(&dir).unwrap();
@@ -958,7 +962,7 @@ fn leave_in_quarantine(personal: &Path, _key: &str, root: &Path, files: &[(&str,
     name.push(".root");
     std::fs::write(dir.with_file_name(name), root.to_string_lossy().as_bytes()).unwrap();
     for (rel, data) in files {
-        write(&dir, rel, data);
+        write(&dir, &format!("{SLOT}/{rel}"), data);
     }
     dir
 }
@@ -993,7 +997,7 @@ async fn a_file_that_cannot_be_put_back_is_reported_with_its_folder_and_tried_ag
     let status = ana.work().await.expect("the leftover is reported");
     assert_eq!((status.step, status.failed_at), (FromFolderStep::Failed, Some(FromFolderStep::Trashing)), "{status:?}");
     assert!(status.message.as_deref().is_some_and(|m| m.contains(&dir.display().to_string())), "{status:?}");
-    assert_eq!(std::fs::read(dir.join("Blocked/lost.psd")).unwrap(), b"kept safe", "the file is still in the quarantine");
+    assert_eq!(std::fs::read(dir.join(SLOT).join("Blocked/lost.psd")).unwrap(), b"kept safe", "the file is still in the quarantine");
     // The way is cleared and the agent starts again: the file goes back, and nothing is reported.
     let _ = ana.crash().await;
     std::fs::remove_file(project.join("Blocked")).unwrap();
@@ -1200,7 +1204,7 @@ async fn a_quarantine_with_an_empty_or_unsound_marker_is_left_alone_and_reported
     let _ = ana.crash().await;
     let canonical = std::fs::canonicalize(&project).unwrap();
     let dir = quarantine_of(&ana.personal, &canonical);
-    write(&dir, "Shots/a.psd", b"must not go anywhere else");
+    write(&dir, &format!("{SLOT}/Shots/a.psd"), b"must not go anywhere else");
     let mut name = dir.file_name().unwrap().to_owned();
     name.push(".root");
     let marker = dir.with_file_name(name);
@@ -1211,7 +1215,7 @@ async fn a_quarantine_with_an_empty_or_unsound_marker_is_left_alone_and_reported
         ana.ready().await;
         let status = ana.work().await.expect("the quarantine is reported");
         assert_eq!((status.step, status.failed_at), (FromFolderStep::Failed, Some(FromFolderStep::Trashing)), "{text:?}: {status:?}");
-        assert_eq!(std::fs::read(dir.join("Shots/a.psd")).unwrap(), b"must not go anywhere else", "{text:?}");
+        assert_eq!(std::fs::read(dir.join(SLOT).join("Shots/a.psd")).unwrap(), b"must not go anywhere else", "{text:?}");
         assert!(!here.join("Shots").exists() && !here.join("relative").exists(), "{text:?}: nothing was written outside");
         let _ = ana.crash().await;
     }
@@ -1367,4 +1371,58 @@ async fn on_a_volume_without_hard_links_a_changed_file_still_goes_back() {
     }
     assert_eq!(files_under(&project), grown, "every file is back, with what was written after the check");
     team_holds(&w, &status, &files).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_whose_name_is_at_the_limit_is_taken_aside_and_deleted_like_any_other() {
+    let w = world().await;
+    let mut ana = Person::signed_in(&w.url, "ana").await;
+    let folder = ana.personal.join("Long");
+    // 253 characters: more than the quarantine could hold if it added anything to the name.
+    let long = format!("{}.txt", "n".repeat(249));
+    assert_eq!(long.len(), 253);
+    let mut files = BTreeMap::new();
+    for (name, data) in [(long.as_str(), b"a long name".to_vec()), ("short.txt", b"a short one".to_vec())] {
+        write(&folder, name, &data);
+        files.insert(name.to_owned(), data);
+    }
+    ana.run();
+    ana.ready().await;
+    personal_has(&w, "Long", &files).await;
+    ana.make(&folder, "Long names").await.unwrap();
+    let status = done(&ana).await;
+    assert_eq!((status.kept, status.message.clone()), (0, None), "{status:?}");
+    team_holds_dirs(&w, &status, &files, false).await;
+    assert!(!folder.exists(), "the old folder went, the long name with it");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quarantine_that_cannot_be_read_is_not_taken_for_empty() {
+    let (_w, mut ana, project, _files) = ana_with_project().await;
+    let personal = ana_personal(&ana).await;
+    let _ = ana.crash().await;
+    // The quarantine's place is a file: reading it as a folder fails with something other than "not found".
+    let base = ana.personal.join(".craft-cloud").join("from-folder");
+    std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+    std::fs::write(&base, b"not a folder").unwrap();
+    // The old folder is gone, and the journal still carries the message about files that could not be put back.
+    let status = FromFolderStatus {
+        folder: project.display().to_string() + "-gone",
+        name: "Stale".into(),
+        step: FromFolderStep::Failed,
+        space: Some(SpaceId::generate()),
+        team_folder: None,
+        done: 0,
+        total: 0,
+        failed_at: Some(FromFolderStep::Trashing),
+        message: Some("Some files could not be put back into the old folder and are kept in X. Move them back yourself; the agent tries again at its next start.".into()),
+        kept: 0,
+    };
+    let journal = serde_json::json!({ "schema": 1, "personal": personal, "status": status });
+    std::fs::write(ana.data.path().join("from-folder.json"), serde_json::to_vec(&journal).unwrap()).unwrap();
+    ana.run();
+    ana.ready().await;
+    let shown = ana.work().await.expect("the work is still reported");
+    assert_eq!((shown.step, shown.failed_at), (FromFolderStep::Failed, Some(FromFolderStep::Trashing)), "{shown:?}");
+    assert!(shown.message.as_deref().is_some_and(|m| m.contains("Move them back yourself")), "{shown:?}");
 }
