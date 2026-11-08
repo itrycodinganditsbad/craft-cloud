@@ -95,8 +95,9 @@ can point into the synced folder, and saves are atomic.
   has the same manifest. Limits: files up to 256 GiB, at most 2^20 chunks per manifest. `file_hash` is the BLAKE3 of the whole file, checked after assembly.
 - **Chunk**: up to 4 MiB of bytes. Its **ID is opaque** in the protocol: today the BLAKE3 of the plaintext,
   later possibly a keyed hash for end-to-end encryption, without a protocol redesign. Stored chunks carry a
-  format byte: 0 plain, 1 zstd (level 3, written when it saves at least 5% on a blob of 4 KiB or more; turned off
-  for new writes by `compression = "none"` in `[storage]`, read either way). The ID stays the BLAKE3 of the plain
+  format byte: 0 plain, 1 zstd (level 3 by default, 1 to 19 settable, written when it saves at least 5%, also settable, on a blob of 4 KiB or
+  more; turned off for new writes by `compression = "none"` in `[storage]`, read either way; the level is part of the
+  stream, so a stored object tells nothing but its format, and `store recompress` can rewrite it at another level). The ID stays the BLAKE3 of the plain
   bytes, so deduplication and the protocol don't change; a compressed blob is unpacked with a cap at the kind's
   size limit and checked like a plain one. Other values are reserved (encryption) and refused.
 - **Chunker parameters** are fixed and named: `fastcdc-v1` = gear table from BLAKE3 key derivation with
