@@ -80,14 +80,19 @@ pub(super) fn show(ui: &mut egui::Ui, trash: &mut Trash, now_ms: i64, events: &m
                         ui.label(RichText::new(date(item.purge_after_ms)).color(t.muted));
                     }
                     _ => {
-                        // Right to left: the last one added is the leftmost.
-                        let remove = ui.add_enabled(idle, kit::Button::new("Remove").danger()).on_hover_text("Remove from trash for good");
-                        if remove.clicked() {
-                            events.push(Event::ConfirmRemoveTrash(item.id));
-                        }
-                        if ui.add_enabled(idle, kit::Button::new("Restore").primary()).clicked() {
-                            events.push(Event::RestoreTrash(item.id));
-                        }
+                        // Left to right in the cell's own right-to-left layout, so Tab goes Restore, then Remove.
+                        let restore = kit::Button::new("Restore").primary();
+                        let remove = kit::Button::new("Remove").danger();
+                        let width = restore.width(ui) + ui.spacing().item_spacing.x + remove.width(ui);
+                        kit::trailing(ui, width, |ui| {
+                            if ui.add_enabled(idle, restore).clicked() {
+                                events.push(Event::RestoreTrash(item.id));
+                            }
+                            let remove = ui.add_enabled(idle, remove).on_hover_text("Remove from trash for good");
+                            if remove.clicked() {
+                                events.push(Event::ConfirmRemoveTrash(item.id));
+                            }
+                        });
                     }
                 }
             });

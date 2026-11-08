@@ -67,11 +67,14 @@ pub(super) fn show(ui: &mut egui::Ui, panel: &Panel<'_>) -> Answer {
         });
         egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 0, bottom: 16 }).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), kit::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
-                let button = kit::Button::new(panel.confirm);
-                let button = if panel.danger { button.danger() } else { button.primary() };
+            let button = kit::Button::new(panel.confirm);
+            let button = if panel.danger { button.danger() } else { button.primary() };
+            let cancel = kit::Button::new("Cancel");
+            let width = cancel.width(ui) + ui.spacing().item_spacing.x + button.width(ui);
+            // Left to right, so that Tab goes Cancel, then the confirmation, as they are drawn.
+            kit::trailing(ui, width, |ui| {
+                let cancel = ui.add(cancel);
                 let confirm = ui.add_enabled(panel.enabled, button);
-                let cancel = ui.add(kit::Button::new("Cancel"));
                 if confirm.clicked() {
                     answer = Answer::Confirmed;
                 }
