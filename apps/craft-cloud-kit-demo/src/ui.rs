@@ -410,7 +410,10 @@ impl Demo {
                 Mode::Opening(_) => {
                     ui.weak("opening live…");
                 }
-                Mode::Live(session) => craft_cloud_egui::badge(ui, session.status()),
+                Mode::Live(session) => {
+                    craft_cloud_egui::badge(ui, session.status());
+                    craft_cloud_egui::people_badge(ui, &session.people());
+                }
                 Mode::Local(why) => {
                     ui.weak(format!("plain file: {why}"));
                 }
@@ -464,6 +467,9 @@ impl Demo {
         if let Some(ro) = self.session().and_then(|s| s.status().read_only.clone()) {
             ui.colored_label(Color32::from_rgb(0x40, 0x60, 0xb0), format!("Made with a newer kitdemo (layout {}): update it to edit.", ro.version));
         }
+        if self.session().is_some_and(|s| s.status().viewer) {
+            ui.colored_label(Color32::from_rgb(0x40, 0x60, 0xb0), "You can look at this document but not change it.");
+        }
         if let Some(w) = &mut self.watch {
             let entries = w.entries().to_vec();
             ui.collapsing("Recent files", |ui| {
@@ -477,7 +483,7 @@ impl Demo {
 
     fn story(&mut self, ui: &mut Ui) {
         let label = ui.label(egui::RichText::new("Story").strong());
-        let editable = !matches!(self.mode, Mode::Opening(_)) && self.session().is_none_or(|s| s.status().read_only.is_none());
+        let editable = !matches!(self.mode, Mode::Opening(_)) && self.session().is_none_or(|s| s.status().read_only.is_none() && !s.status().viewer);
         ui.horizontal(|ui| {
             let range = self.cursor.map(|(a, b)| a.min(b)..a.max(b));
             if ui.add_enabled(editable && range.as_ref().is_some_and(|r| !r.is_empty()), egui::Button::new("Bold")).clicked()
@@ -527,7 +533,7 @@ impl Demo {
 
     fn layers(&mut self, ui: &mut Ui) {
         ui.label(egui::RichText::new("Layers").strong());
-        let editable = !matches!(self.mode, Mode::Opening(_)) && self.session().is_none_or(|s| s.status().read_only.is_none());
+        let editable = !matches!(self.mode, Mode::Opening(_)) && self.session().is_none_or(|s| s.status().read_only.is_none() && !s.status().viewer);
         ui.add_enabled_ui(editable, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Add layer").clicked() {

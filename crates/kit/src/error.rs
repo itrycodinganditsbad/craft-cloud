@@ -7,6 +7,10 @@ pub enum KitError {
     /// The document was made by a newer version of the app (or by another app): it is shown, but nothing is sent.
     #[error("this document needs a newer {app} (made with layout {version}); it opens read-only")]
     ReadOnly { app: String, version: u32 },
+    /// The account may only look at this document (a viewer of its team space, or the space is archived): local
+    /// changes and undo are refused, and nothing is sent. Saving the file works as for any read-only document.
+    #[error("you can only view this document: your role in its Craft Cloud space doesn't allow changes")]
+    ViewOnly,
     /// More than the queue holds is waiting for the agent: no more changes until it is back.
     #[error("{0} bytes of changes are waiting for Craft Cloud; reconnect before changing more")]
     Stalled(usize),

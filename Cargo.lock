@@ -1271,6 +1271,7 @@ dependencies = [
  "craft-cloud-kit",
  "egui",
  "egui_kittest",
+ "image",
 ]
 
 [[package]]
