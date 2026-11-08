@@ -429,8 +429,7 @@ async fn compression_none_is_a_setting_the_pass_respects_in_the_cli() {
     assert!(storage_tools::last_estimate(&meta).await.unwrap().is_some());
 
     // "none" in the config wins: the pass would write compressed objects, so it refuses.
-    let mut text = std::fs::read_to_string(&config_path).unwrap();
-    text.push_str("compression = \"none\"\n");
+    let text = std::fs::read_to_string(&config_path).unwrap().replace("[storage]\n", "[storage]\ncompression = \"none\"\n");
     std::fs::write(&config_path, text).unwrap();
     let (refused, _) = run(vec!["store".into(), "--config".into(), c.clone(), "recompress".into(), "--level".into(), "19".into()]).await;
     assert!(matches!(refused, Err(craft_cloud_server::cli::CliError::Usage(m)) if m.contains("none")));
