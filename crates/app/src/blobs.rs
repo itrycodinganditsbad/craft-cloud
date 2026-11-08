@@ -24,6 +24,8 @@ pub const GET_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Debug, Clone)]
 pub struct Blobs {
     client: Client,
+    /// The file whose space every call goes to ([`Blobs::for_path`]); none: the personal space.
+    bound: Option<String>,
 }
 
 /// What an agent from before blobs answers.
@@ -53,7 +55,20 @@ fn too_old(e: Error) -> Error {
 
 impl Blobs {
     pub(crate) fn new(client: Client) -> Self {
-        Self { client }
+        Self { client, bound: None }
+    }
+
+    /// This store, bound to the space of the file at `path` (absolute, inside a synced folder, as a live document of a
+    /// team space is opened): [`Blobs::put`] and [`Blobs::get`] on the result go to that space, as [`Blobs::put_for`]
+    /// and [`Blobs::get_for`] do for every call. A path in the personal folder, or a relative one, is the personal
+    /// space's, as the agent routes it.
+    pub fn for_path(&self, path: &str) -> Self {
+        Self { client: self.client.clone(), bound: Some(path.to_owned()) }
+    }
+
+    /// The file this store is bound to ([`Blobs::for_path`]); none for a store of the personal space.
+    pub fn bound_path(&self) -> Option<&str> {
+        self.bound.as_deref()
     }
 
     /// Whether the agent knows `/v1/blobs`, asked once per client with a cheap `GET` of a name no blob has (an agent
@@ -77,7 +92,7 @@ impl Blobs {
     /// Keeps `bytes` (1 byte to [`MAX_BLOB_BYTES`]) and names them. Answered once they are on the agent's disk. An
     /// agent too old for blobs is found out before a byte of them is sent ([`codes::AGENT_TOO_OLD`]).
     pub fn put(&self, bytes: &[u8]) -> Result<Stored, Error> {
-        self.put_inner(bytes, None)
+        self.put_inner(bytes, self.bound.as_deref())
     }
 
     /// [`Blobs::put`] for a document of the file at `path` (absolute, inside a synced folder): the blob goes to that file's
@@ -107,7 +122,7 @@ impl Blobs {
 
     /// The bytes named `hash`, of `len` bytes (checked).
     pub fn get(&self, hash: &[u8; 32], len: u64) -> Result<Vec<u8>, Error> {
-        self.get_inner(hash, len, None)
+        self.get_inner(hash, len, self.bound.as_deref())
     }
 
     /// [`Blobs::get`] from the space of the file at `path` ([`Blobs::put_for`]).
