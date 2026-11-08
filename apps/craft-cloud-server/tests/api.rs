@@ -4265,3 +4265,74 @@ async fn an_uploaded_manifest_is_indexed_before_the_upload_is_acknowledged() {
     assert_eq!((status, body.error.as_str()), (StatusCode::CONFLICT, "missing_chunks"));
     assert_eq!(s.meta.index_state(&lacking.id()).await.unwrap(), IndexState::Absent);
 }
+
+// ---- a full server ----
+
+/// A SQLite and disk server that refuses uploads by `policy`, reading the disk's free space from `free` (total 1 MiB).
+async fn sqlite_disk_refusing(policy: craft_cloud_server::full::Policy, free: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Server {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let probe: craft_cloud_server::full::Probe = std::sync::Arc::new(move || (Some(1 << 20), Some(free.load(std::sync::atomic::Ordering::SeqCst))));
+    let guard = craft_cloud_server::full::FullGuard::with_probe(policy, probe);
+    let state = AppState::new(meta.clone(), store, vec![]).unwrap().with_full_guard(Some(guard));
+    start_state(state, meta, vec![db, blobs], None).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_over_its_capacity_takes_no_new_uploads_by_default_it_does() {
+    // Off by default: a configured capacity is information only.
+    let s = sqlite_disk_measured(Some(10)).await;
+    add_user(&s, "ana").await;
+    let ana = login(&s, "ana").await;
+    assert_eq!(put_chunk(&s, &ana, &[1u8; 60]).await, StatusCode::NO_CONTENT);
+    assert_eq!(put_chunk(&s, &ana, &[2u8; 60]).await, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_at_its_capacity_refuses_new_chunks_and_manifests_but_still_reads() {
+    use std::sync::atomic::AtomicU64;
+    let policy = craft_cloud_server::full::Policy { capacity: Some(100), min_free: None };
+    let s = sqlite_disk_refusing(policy, std::sync::Arc::new(AtomicU64::new(u64::MAX))).await;
+    add_user(&s, "ana").await;
+    let ana = login(&s, "ana").await;
+    assert_eq!(put_chunk(&s, &ana, &[1u8; 60]).await, StatusCode::NO_CONTENT);
+    // 61 stored, 61 more would pass 100.
+    let res = s.client.put(format!("{}/chunks/{}", s.base, chunk_id(&[2u8; 60]))).bearer_auth(&ana).body(vec![2u8; 60]).send().await.unwrap();
+    let (status, body) = error(res).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::INSUFFICIENT_STORAGE, "server_full"));
+    assert!(body.quota.is_none(), "not the account's quota");
+    assert_eq!(body.server.unwrap().capacity_bytes, Some(100));
+    assert!(!body.message.contains("account"), "{}", body.message);
+    // A manifest is refused too (the chunk it names is the first one, which is stored).
+    let m = manifest_for(&[1u8; 60]);
+    let res = put_manifest(&s, &ana, &m).await;
+    // 61 + 61 + the manifest's bytes is over 100: refused.
+    assert_eq!(error(res).await.1.error, "server_full");
+    // Reads, the admin's calls and the change feed stay open.
+    let got = s.client.get(format!("{}/chunks/{}", s.base, chunk_id(&[1u8; 60]))).bearer_auth(&ana).send().await.unwrap();
+    assert_eq!(got.status(), StatusCode::OK);
+    assert_eq!(got.bytes().await.unwrap().as_ref(), &[1u8; 60][..]);
+    assert_eq!(s.client.get(format!("{}/space", s.base)).bearer_auth(&ana).send().await.unwrap().status(), StatusCode::OK);
+    add_admin(&s, "root").await;
+    let root = login(&s, "root").await;
+    assert_eq!(s.client.get(format!("{}/admin/server", s.base)).bearer_auth(&root).send().await.unwrap().status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_disk_down_to_its_reserve_refuses_new_uploads() {
+    use std::sync::atomic::AtomicU64;
+    let policy = craft_cloud_server::full::Policy { capacity: None, min_free: Some(1000) };
+    // 1050 free: a chunk of 99 bytes (100 counted) leaves 950, under the reserve.
+    let s = sqlite_disk_refusing(policy, std::sync::Arc::new(AtomicU64::new(1050))).await;
+    add_user(&s, "ana").await;
+    let ana = login(&s, "ana").await;
+    let res = s.client.put(format!("{}/chunks/{}", s.base, chunk_id(&[3u8; 99]))).bearer_auth(&ana).body(vec![3u8; 99]).send().await.unwrap();
+    let (status, body) = error(res).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::INSUFFICIENT_STORAGE, "server_full"));
+    let room = body.server.unwrap();
+    assert_eq!((room.free_bytes, room.total_bytes, room.capacity_bytes), (Some(1050), Some(1 << 20), None));
+    // A chunk that leaves the reserve whole goes up.
+    assert_eq!(put_chunk(&s, &ana, &[4u8; 49]).await, StatusCode::NO_CONTENT);
+}

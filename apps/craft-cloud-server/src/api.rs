@@ -327,6 +327,11 @@ pub(crate) async fn read_json<T: serde::de::DeserializeOwned>(state: &AppState, 
     }
 }
 
+/// The body size a request declares (`Content-Length`), 0 when it declares none.
+fn declared_len(request: &Request) -> u64 {
+    request.headers().get(axum::http::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
 pub(crate) fn body_too_slow() -> ApiError {
     ApiError::new(StatusCode::REQUEST_TIMEOUT, codes::TIMEOUT, "the request body took too long to arrive")
 }
@@ -341,14 +346,18 @@ async fn put_chunk(
     let id = parse_chunk_id(&id)?;
     // Held until the chunk is stored: the user's buffered bodies are bounded.
     let _body = state.bodies.acquire(auth.user).await?;
+    // A full server says so before the body is read, by what the request declares, and again with the real size.
+    state.check_server_room(declared_len(&request)).await?;
     let body = read_body(&state, request, MAX_CHUNK_BYTES as usize).await?;
     if body.is_empty() {
         return Err(ApiError::invalid("a chunk can't be empty"));
     }
+    state.check_server_room(body.len() as u64 + 1).await?;
     // A space at its cap doesn't get to store bytes it would then be refused for.
     state.meta.check_room(auth.space, BlobKind::Chunk, id.as_bytes(), body.len() as u64 + 1).await?;
     // Bytes first, record second: the database never points at a blob that isn't stored.
     state.store.put(BlobKey::chunk(&id), &body).await?;
+    state.note_stored(body.len() as u64 + 1);
     state.meta.add_chunk(auth.space, &id, body.len() as u64 + 1, state.now_ms()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -379,6 +388,7 @@ async fn put_manifest(
     // bounded; then, with the body in, one of the user's manifest slots for the real work (decoding and checking a
     // big manifest). A body that is slow to arrive holds only its own user's body slot, and only until its time is up.
     let _body = state.bodies.acquire(auth.user).await?;
+    state.check_server_room(declared_len(&request)).await?;
     let body = read_body(&state, request, MAX_MANIFEST_BYTES).await?;
     let _work = state.manifests.acquire(auth.user).await?;
     let manifest = Manifest::decode(&body).map_err(|e| ApiError::invalid(format!("bad manifest: {e}")))?;
@@ -400,8 +410,10 @@ async fn put_manifest(
         }
         return Err(err);
     }
+    state.check_server_room(body.len() as u64 + 1).await?;
     state.meta.check_room(auth.space, BlobKind::Manifest, id.as_bytes(), body.len() as u64 + 1).await?;
     state.store.put(BlobKey::manifest(&id), &body).await?;
+    state.note_stored(body.len() as u64 + 1);
     state.meta.add_manifest(auth.space, &manifest, body.len() as u64 + 1, state.now_ms()).await?;
     // The index of its chunks is complete before the upload is acknowledged: a manifest of up to the index budget was indexed
     // in the transaction above, a longer one is finished here in batches (and by `index build` if this is cut short).

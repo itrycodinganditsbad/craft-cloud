@@ -3024,6 +3024,25 @@ async fn an_account_with_no_room_left_stops_the_pass() {
 }
 
 #[tokio::test]
+async fn a_server_that_is_full_stops_the_pass_with_its_own_message_not_the_accounts() {
+    let server = Server::new().await;
+    let ana = server.user("ana").await;
+    let mut a = machine(&server, &ana, "laptop").await;
+    write(&mut a, "one.txt", b"one");
+    write(&mut a, "two.txt", b"two");
+    a.transport().faults.server_full.store(true, Ordering::Relaxed);
+    let full = a.sync_once().await;
+    assert!(matches!(&full, Err(craft_cloud_sync::SyncError::Transport(craft_cloud_sync::TransportError::ServerFull))), "{full:?}");
+    let shown = full.unwrap_err().to_string();
+    assert!(shown.contains("The server is full") && !shown.contains("account"), "{shown}");
+    assert_eq!(a.transport().faults.chunk_uploads.load(Ordering::Relaxed), 1, "the pass ended at the first refusal, no file was skipped one by one");
+    // Space freed: the next pass uploads both.
+    a.transport().faults.server_full.store(false, Ordering::Relaxed);
+    let report = a.sync_once().await.unwrap();
+    assert_eq!(report.uploaded.len(), 2, "{report:?}");
+}
+
+#[tokio::test]
 async fn a_nearly_full_account_counts_as_full() {
     // 400 bytes of room left: less than one chunk, so the account counts as full and the pass stops, instead of
     // every new file being read and refused on every pass.

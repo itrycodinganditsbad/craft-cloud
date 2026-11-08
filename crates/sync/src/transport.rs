@@ -19,6 +19,11 @@ pub enum TransportError {
     /// less than a chunk's worth is ([`Config::quota_floor`](crate::Config::quota_floor)).
     #[error("the account's storage on the server is full or nearly ({used} of {limit} bytes used); the admin can allow more")]
     QuotaExceeded { used: u64, limit: u64 },
+    /// The server itself is full and refuses every new upload (`server_full`; the admin set `refuse_when_full`). Not the
+    /// account's quota: no file would fit, whatever its size, so the engine ends the pass and the agent pauses until the
+    /// admin has freed space or raised the capacity.
+    #[error("The server is full; the admin needs to free space or raise its capacity")]
+    ServerFull,
     /// The change feed can't continue from our sequence number; list the whole tree.
     #[error("the change feed needs a full listing")]
     ResyncRequired,

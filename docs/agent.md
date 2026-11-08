@@ -18,7 +18,10 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
   often, at least every 5 minutes. When the server can't be reached it tries again with growing pauses, up to 5 minutes.
   If something needs you (the folder or its marker is missing, the device was signed out) it pauses and
   `status` says why; a missing folder or marker is looked at again every minute, and syncing goes on by
-  itself once it is back. Ctrl-C lets a running pass finish and stops; a second Ctrl-C stops at once.
+  itself once it is back. When the server itself is full (its admin turned on `refuse_when_full` and the server's disk
+  or capacity is used up) the agent pauses with "The server is full; the admin needs to free space or raise its
+  capacity" (never the account's storage message, which means the account's own quota) and looks again every 10
+  minutes; nothing is lost, and syncing goes on once the admin has freed space. Ctrl-C lets a running pass finish and stops; a second Ctrl-C stops at once.
 - While `run` runs, `sync --approve-deletes` from another terminal hands the approval to it: exactly the
   deletions `status` listed. If more came since, it lists them instead, approves nothing and exits 2; check
   the list and run it again. Every list of waiting deletions comes with its set (`set 3f9a…`), also in

@@ -451,9 +451,24 @@ pub struct QuotaUse {
     pub limit: u64,
 }
 
+/// What the server knows of its own room, with `server_full`. Each number is left out when the server has none (a
+/// store on S3 has no filesystem to measure; no `capacity` is set).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerRoom {
+    /// Bytes still available on the store's filesystem (disk store only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+    /// Total size of the store's filesystem (disk store only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    /// What the admin said the store may hold (`capacity`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_bytes: Option<u64>,
+}
+
 /// Every error answer. `error` is a stable code, one of [`codes`]; `message` is for people. `conflicts` is
-/// set for `conflict`, `missing` for `missing_chunks`, `quota` for `quota_exceeded`, `two_factor` for
-/// `two_factor_required`. Clients ignore codes and JSON
+/// set for `conflict`, `missing` for `missing_chunks`, `quota` for `quota_exceeded`, `server` for `server_full`,
+/// `two_factor` for `two_factor_required`. Clients ignore codes and JSON
 /// fields they don't know (the server may add more later), so match on the codes you handle and treat the rest by
 /// HTTP status.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -466,6 +481,9 @@ pub struct ErrorBody {
     pub missing: Option<Vec<ChunkId>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<QuotaUse>,
+    /// Set for `server_full`: what the server knows of its room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<ServerRoom>,
     /// Set for `two_factor_required`: the challenge to answer at `POST /auth/login/second-factor`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub two_factor: Option<TwoFactorChallenge>,
@@ -685,6 +703,22 @@ mod tests {
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["quota"], serde_json::json!({ "used": 9, "limit": 10 }));
         assert_eq!(serde_json::from_value::<ErrorBody>(json).unwrap(), body);
+    }
+
+    #[test]
+    fn a_server_full_answer_says_what_the_server_knows_of_its_room() {
+        let body = ErrorBody {
+            error: codes::SERVER_FULL.into(),
+            message: "m".into(),
+            server: Some(ServerRoom { free_bytes: Some(5), total_bytes: Some(100), capacity_bytes: None }),
+            ..ErrorBody::default()
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["server"], serde_json::json!({ "free_bytes": 5, "total_bytes": 100 }), "unknown numbers are left out");
+        assert_eq!(serde_json::from_value::<ErrorBody>(json).unwrap(), body);
+        // An answer without the field (an older server, or another code) reads.
+        let plain: ErrorBody = serde_json::from_value(serde_json::json!({ "error": codes::SERVER_FULL, "message": "m" })).unwrap();
+        assert_eq!(plain.server, None);
     }
 
     #[test]

@@ -28,6 +28,10 @@ pub mod codes {
     /// A chunk or manifest would take the account over the bytes the server lets it store (HTTP 507); `quota` says
     /// how much it stores and may store.
     pub const QUOTA_EXCEEDED: &str = "quota_exceeded";
+    /// The server itself is full and refuses new uploads (HTTP 507; the admin set `refuse_when_full`): its disk is
+    /// down to the reserve, or its store holds as much as the admin said it may. Not the account's quota; `server`
+    /// says what the server knows of its room. Older clients don't know the code and see a server error (HTTP 507).
+    pub const SERVER_FULL: &str = "server_full";
     /// `join`: the code is wrong, expired or used (never which).
     pub const INVALID_CODE: &str = "invalid_code";
     /// `join`: an invite to an account without a password needs one; send it again with `password`.

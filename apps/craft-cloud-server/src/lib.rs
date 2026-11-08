@@ -10,6 +10,7 @@ pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod full;
 pub mod gc;
 pub mod join;
 pub mod live;

@@ -49,7 +49,42 @@ capacity = "1 TiB"
   database, including its `-wal` and `-shm` files. With Postgres it has none of these: the database server's disk is not
   the server's to measure. "Free" is what the server's own user may still use.
 - The numbers are read when the overview is asked for, with a filesystem query each and without scanning the stored
-  data. The capacity is information only: the server does not refuse uploads when the store is full or past the capacity.
+  data. By default the capacity is information only: the server does not refuse uploads when the store is full or past
+  the capacity. To make it refuse, see "A full server" below.
+
+### A full server
+
+A disk that fills up makes uploads fail halfway, and a store past its capacity has nothing to say about it. Turn on
+`refuse_when_full` in `[storage]` and the server instead refuses new uploads in good time, with a clear answer, while
+everything else keeps working:
+
+```toml
+[storage]
+kind = "disk"
+path = "/var/lib/craft-cloud/blobs"
+capacity = "1 TiB"          # optional on disk, required for S3
+refuse_when_full = true     # default false
+min_free = "1 GiB"          # disk only; the free space to keep, default 1 GiB
+```
+
+- It is off by default, and an upgrade changes nothing until you set it. With it on, a new chunk or manifest (which is
+  also how a live document's snapshot goes up) is refused when the store's filesystem would be left with less than
+  `min_free` (disk only), or when the bytes stored would pass `capacity` (disk or S3, when `capacity` is set). The
+  answer is `507 server_full`, with the free space, the total and the capacity as far as the server knows them. It is
+  not `quota_exceeded`, which is one account's own limit.
+- Reads, downloads, deletes, the trash, garbage collection, live document updates (they live in the database) and the
+  admin's calls are never refused, so you can free space while the server is full. Changes to the database itself
+  (a sign-in, a commit) still work; a SQLite file on a full disk still can fail on its own.
+- The stored total and the free space are read at most every 5 seconds, and the bytes the server wrote itself since are
+  added in between, so the check costs next to nothing; a refusal ends within about 5 seconds of space being freed.
+  The log says at `warn` when the server starts refusing and when it stops, with the reason and no file names.
+- `min_free` without `refuse_when_full`, `min_free` on S3 and `refuse_when_full` on S3 without `capacity` are refused when
+  the server starts, since they would do nothing.
+- The agent turns `server_full` into a pause: "The server is full; the admin needs to free space or raise its capacity",
+  and looks again every 10 minutes. An agent from before this release does not know the code and treats the HTTP 507
+  as a server error: it shows the server's message as an error and tries again with growing pauses, up to 5 minutes. Nothing
+  is lost either way. A config with `refuse_when_full` or `min_free` is refused by an older server (it rejects unknown
+  settings), so remove the lines before going back to one.
 
 `init` also makes `two-factor.key` next to `config.toml` and names it in the config (`[two_factor] key_file`). It is the key
 for two-factor sign-in (below). **Back it up, apart from your database backups.**

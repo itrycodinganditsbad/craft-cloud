@@ -48,6 +48,12 @@ impl StorageInfo {
         self.capacity
     }
 
+    /// Total and free bytes of the filesystem that holds the disk store; `(None, None)` for S3 and memory, or when it
+    /// can't be read. Blocking.
+    pub fn store_filesystem(&self) -> (Option<u64>, Option<u64>) {
+        self.store_dir.as_deref().map_or((None, None), filesystem)
+    }
+
     /// Reads the filesystem numbers and the database's size. Blocking: call it off the async threads.
     pub fn measure(&self) -> Measured {
         let mut measured = Measured::default();
