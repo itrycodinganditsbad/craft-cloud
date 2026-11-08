@@ -1132,6 +1132,13 @@ deletion belong to a later owner-approved slice.
   Calls: `status`, `login`, `logout`, `folders` (get/set synced or cloud-only), `history`, `restore`,
   `conflicts`, `pending-deletes` (approve or reject a mass-delete pause), `pause`, `resume`.
 
+  `GET /v1/conflicts` is implemented: `{copies: [{path, original_path?, device?, at?, at_utc, at_ms?, size, mtime_ms}],
+  truncated}`, newest first, at most 1000, read from the saved state. A synced file is listed when its name parses as a
+  conflict copy's (`parse_conflict_name`, the inverse of the builder above) and a file with the original's name sits
+  beside it, or when the last pass reported it. `GET /v1/usage/folders` is added beside it:
+  `{total_bytes, total_files, folders: [{name, bytes, files}] (top 50), other?, kinds: [{kind, bytes, files}]}` in local
+  logical bytes, not the server's stored bytes. See [`docs/agent.md`](../agent.md) for the details and their limits.
+
   Two-factor sign-in (see [`docs/agent.md`](../agent.md)): `login` and `join` answer 401 `two_factor_required` with the
   server's challenge when the account has it; `POST /v1/login/second-factor {challenge, totp_code | recovery_code}` finishes
   a login, and `join` is sent again with `totp_code` or `recovery_code` (its challenge is empty: the invite isn't consumed

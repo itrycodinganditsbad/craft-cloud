@@ -31,9 +31,9 @@ use craft_cloud_proto::api::{
 };
 use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
 use craft_cloud_proto::local::{
-    AutostartRequest, ChangePasswordRequest, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest,
-    MAX_LOCAL_JSON_BYTES, PairingInfo, PasswordRequest, RenameDeviceRequest, RunState, SecondFactorLoginRequest, Status, TotpRequest,
-    TwoFactorProofRequest, codes, paths,
+    AutostartRequest, ChangePasswordRequest, ConflictsResponse, FolderUsageResponse, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA,
+    LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES, PairingInfo, PasswordRequest, RenameDeviceRequest, RunState,
+    SecondFactorLoginRequest, Status, TotpRequest, TwoFactorProofRequest, codes, paths,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -413,6 +413,8 @@ fn router(state: Api) -> Router {
         .route(&format!("{}/{{id}}", paths::PAIRINGS), get(pairing_status).delete(delete_pairing))
         .route(paths::DEVICES, get(devices))
         .route(paths::USAGE, get(usage))
+        .route(paths::USAGE_FOLDERS, get(usage_folders))
+        .route(paths::CONFLICTS, get(conflicts))
         .route(&format!("{}/{{id}}", paths::DEVICES), delete(remove_device).patch(rename_device).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route(paths::AUTOSTART, post(set_autostart))
         .route(paths::PAUSE, post(pause))
@@ -827,6 +829,38 @@ async fn devices(State(state): State<Api>) -> Result<Json<Vec<DeviceInfo>>, Loca
 async fn usage(State(state): State<Api>) -> Result<Json<AccountUsage>, LocalError> {
     let (_, transport) = server_api(&state)?;
     Ok(Json(transport.usage().await.map_err(AgentError::from)?))
+}
+
+/// The saved sync state, read off the async threads. The state file is replaced atomically and read without any lock, so
+/// this never waits for a pass.
+async fn saved_state(state: &ApiState) -> Result<crate::account::SavedState, LocalError> {
+    let data = DataDir::new(&state.data);
+    tokio::task::spawn_blocking(move || data.load_state())
+        .await
+        .map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))?
+        .map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))
+}
+
+/// `GET /v1/conflicts`: the conflict copies in the synced folder, from the saved state. Signed out is `409 not_signed_in`,
+/// as for the other calls about the account's files.
+async fn conflicts(State(state): State<Api>) -> Result<Json<ConflictsResponse>, LocalError> {
+    state.control.account().ok_or(AgentError::NotSignedIn)?;
+    let saved = saved_state(&state).await?;
+    let list = tokio::task::spawn_blocking(move || crate::local_state::conflicts(&saved))
+        .await
+        .map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))?;
+    Ok(Json(list))
+}
+
+/// `GET /v1/usage/folders`: local logical bytes by top-level folder and kind, from the saved state (not the server's
+/// stored bytes, which are `GET /v1/usage`).
+async fn usage_folders(State(state): State<Api>) -> Result<Json<FolderUsageResponse>, LocalError> {
+    state.control.account().ok_or(AgentError::NotSignedIn)?;
+    let saved = saved_state(&state).await?;
+    let usage = tokio::task::spawn_blocking(move || crate::local_state::folder_usage(&saved))
+        .await
+        .map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))?;
+    Ok(Json(usage))
 }
 
 /// Removes (revokes) another computer of the account; answered with the list as it is then. This computer can't be

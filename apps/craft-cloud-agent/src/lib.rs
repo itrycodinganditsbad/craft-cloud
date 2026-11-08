@@ -20,6 +20,7 @@ pub mod doc;
 pub mod http;
 pub mod live;
 pub mod local_api;
+pub mod local_state;
 pub mod lock;
 pub mod root;
 pub mod runlog;

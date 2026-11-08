@@ -14,6 +14,8 @@
 //!   `DELETE /v1/pairings/{id}` → 204; `GET /v1/devices` → a list of [`DeviceInfo`](crate::api::DeviceInfo),
 //!   `DELETE /v1/devices/{id}` → the list after; `POST /v1/pause`, `/v1/resume` and `/v1/quit` → [`Status`];
 //!   `GET /v1/usage` → [`AccountUsage`](crate::api::AccountUsage) from the signed-in account's server;
+//!   `GET /v1/usage/folders` → [`FolderUsageResponse`] and `GET /v1/conflicts` → [`ConflictsResponse`], both from the
+//!   agent's saved sync state;
 //!   `POST /v1/autostart` ([`AutostartRequest`]) → [`Status`]; `GET /v1/recents`, upgraded to a WebSocket of JSON
 //!   text messages: [`RecentsRequest`] in, [`RecentsEvent`] out; `GET /v1/docs`, upgraded to a WebSocket of live
 //!   documents ([`docs`]: [`DocsRequest`] and binary frames in, [`DocsEvent`] and binary frames out); `PUT /v1/blobs`
@@ -192,6 +194,10 @@ pub mod paths {
     pub const TRASH: &str = "/v1/trash";
     pub const TRASH_RESTORE: &str = "/v1/trash/restore";
     pub const TRASH_REMOVE: &str = "/v1/trash/remove";
+    /// `GET` → [`super::ConflictsResponse`]: the conflict copies in the synced folder, from the agent's saved state.
+    pub const CONFLICTS: &str = "/v1/conflicts";
+    /// `GET` → [`super::FolderUsageResponse`]: local logical bytes by top-level folder and kind, from the agent's saved state.
+    pub const USAGE_FOLDERS: &str = "/v1/usage/folders";
 }
 
 /// One version in a file's newest-first history.
@@ -284,6 +290,143 @@ pub struct TrashRestoreResponse {
     pub version: Option<VersionId>,
     pub seq: u64,
     pub epoch: Epoch,
+}
+
+/// Most conflict copies `GET /v1/conflicts` lists.
+pub const MAX_CONFLICT_COPIES: usize = 1000;
+
+/// Most folders `GET /v1/usage/folders` lists by name; the rest are summed in `other`.
+pub const MAX_USAGE_FOLDERS: usize = 50;
+
+/// One conflict copy found in the synced folder.
+///
+/// `original_path`, `device` and `at` are `None` for a copy the last pass reported whose name does not follow the
+/// conflict naming. `Debug` leaves the paths out (they are file names).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictCopy {
+    /// The copy, relative to the sync root, `/`-separated.
+    pub path: String,
+    /// The file it is a copy of, when its name says so (a stem shortened to fit the 255-byte name limit stays shortened).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_path: Option<String>,
+    /// The computer whose version the copy holds, as the name has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// The minute it was found, `YYYY-MM-DD HH:MM`, in the local time of the computer that made the copy unless `at_utc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    /// `at` is UTC (that computer could not read its offset).
+    #[serde(default)]
+    pub at_utc: bool,
+    /// `at` in milliseconds since the Unix epoch, only when `at_utc`: a local time has no offset in the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<i64>,
+    /// Logical size in bytes of the copy as this computer last synced it.
+    pub size: u64,
+    /// The copy's modification time (milliseconds since the Unix epoch) as this computer last synced it.
+    pub mtime_ms: i64,
+}
+
+impl std::fmt::Debug for ConflictCopy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConflictCopy").field("size", &self.size).field("at_ms", &self.at_ms).finish_non_exhaustive()
+    }
+}
+
+/// `GET /v1/conflicts`: the conflict copies in the synced folder, newest first.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ConflictsResponse {
+    pub copies: Vec<ConflictCopy>,
+    /// There are more than [`MAX_CONFLICT_COPIES`]; the oldest are left out.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl std::fmt::Debug for ConflictsResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConflictsResponse").field("copies", &self.copies.len()).field("truncated", &self.truncated).finish()
+    }
+}
+
+/// Local logical bytes and file count of one top-level folder (`name` is `""` for the files directly in the sync root).
+/// `Debug` leaves the name out.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderUsage {
+    pub name: String,
+    pub bytes: u64,
+    pub files: u64,
+}
+
+impl std::fmt::Debug for FolderUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FolderUsage").field("bytes", &self.bytes).field("files", &self.files).finish_non_exhaustive()
+    }
+}
+
+/// What the folders beyond [`MAX_USAGE_FOLDERS`] add up to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OtherFolders {
+    /// How many folders are summed here.
+    pub folders: u64,
+    pub bytes: u64,
+    pub files: u64,
+}
+
+/// The kind classes of `GET /v1/usage/folders`, picked by file extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileKind {
+    Image,
+    Video,
+    Audio,
+    Document,
+    #[serde(rename = "model_3d")]
+    Model3d,
+    Archive,
+    /// Source code, markup and plain text.
+    Code,
+    Other,
+}
+
+impl FileKind {
+    /// Every kind, in the order the response lists them.
+    pub const ALL: [FileKind; 8] = [Self::Image, Self::Video, Self::Audio, Self::Document, Self::Model3d, Self::Archive, Self::Code, Self::Other];
+}
+
+/// Local logical bytes and file count of one kind class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KindUsage {
+    pub kind: FileKind,
+    pub bytes: u64,
+    pub files: u64,
+}
+
+/// `GET /v1/usage/folders`: the sizes of the files this computer has synced, by top-level folder and by kind.
+///
+/// These are **local logical bytes** (the sizes of the files in the synced folder as the last pass recorded them), not
+/// the server's stored bytes: they ignore chunk sharing, history and trash,
+/// by its full size. Only files count; empty folders add nothing. `Debug` leaves the folder names out.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FolderUsageResponse {
+    pub total_bytes: u64,
+    pub total_files: u64,
+    /// The largest folders (by bytes, then name), at most [`MAX_USAGE_FOLDERS`].
+    pub folders: Vec<FolderUsage>,
+    /// The rest, when there are more folders than that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other: Option<OtherFolders>,
+    /// Every kind class, in the order of [`FileKind::ALL`], also those with no files.
+    pub kinds: Vec<KindUsage>,
+}
+
+impl std::fmt::Debug for FolderUsageResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FolderUsageResponse")
+            .field("total_bytes", &self.total_bytes)
+            .field("total_files", &self.total_files)
+            .field("folders", &self.folders.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Binary content an app keeps out of a live document (images, audio, a font): `PUT /v1/blobs` with the bytes as the

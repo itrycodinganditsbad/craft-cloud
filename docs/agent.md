@@ -182,3 +182,39 @@ live on this machine. A missing hint does not fail the request.
 A successful restore asks the agent for a normal sync pass; it never writes files directly. Removing an item only
 marks it out of the trash. It cannot be restored from the trash afterward, but stored space is not freed yet. Server
 HTTP status and error code are preserved; a server `401 unauthorized` becomes local `409 needs_you`.
+
+## Local API: conflict copies and folder sizes
+
+Both calls answer from the agent's saved sync state (`state.json`) alone. They do not ask the server, do not wait for a
+pass (the state file is replaced atomically and read without a lock), and show what the last finished pass recorded.
+Signed out they answer `409 not_signed_in`, like `GET /v1/usage`. Paths are relative to the synced folder and `/`-separated.
+
+| Method and path | Success |
+|---|---|
+| `GET /v1/conflicts` | `200` with `{copies, truncated}` |
+| `GET /v1/usage/folders` | `200` with `{total_bytes, total_files, folders, other?, kinds}` |
+
+**Conflict copies.** `copies` holds `{path, original_path?, device?, at?, at_utc, at_ms?, size, mtime_ms}`, newest first (by
+the minute in the name, then its counter), at most 1000; `truncated` is true when older ones were left out. A synced
+file is listed when its name is one the engine makes (`name (conflict, <device>, YYYY-MM-DD HH-MM[Z][, n]).ext`, see
+`docs/design/sync.md`) **and** a file with the original's name sits beside it, or when the last finished pass reported
+it as a copy it made. For a reported copy whose name does not follow the pattern, `original_path`, `device` and `at` are
+left out. `at` is `YYYY-MM-DD HH:MM` in the local time of the computer that made the copy; `at_utc` says it is UTC (that
+computer could not read its offset), and only then is `at_ms` given, since a local time has no offset in the name.
+`size` and `mtime_ms` are the copy's as this computer last synced it. Notes:
+
+- A user's own file can match the pattern and have a sibling of that name, so the list can show a file that is not a
+  conflict copy. The name cannot tell; the desktop words it as "looks like a conflict copy".
+- A copy whose original was deleted or renamed since is missed, unless the last pass made it. Copies of folders are not
+  listed. A stem shortened to fit the 255-byte name limit has no sibling under its shortened name, so such a copy
+  shows only while the last pass reported it.
+- Copies are kept (a conflict keeps both versions); this call only lists them. Removing a copy is deleting the file.
+
+**Folder sizes.** `total_bytes` and `folders[].bytes` are **local logical bytes**: the sizes of the files this computer
+has synced, as the last pass recorded them. They are not the server's stored bytes (`GET /v1/usage`), which count each
+chunk once and include history and trash. `folders` has one entry `{name, bytes, files}` per top-level folder (the first
+path component; the files directly in the synced folder count under `""`), the largest first (by bytes, then name), at
+most 50. When there are more, `other` is `{folders, bytes, files}` for the rest. `kinds` always lists all eight classes
+in the order `image`, `video`, `audio`, `document`, `model_3d`, `archive`, `code`, `other` with `{kind, bytes, files}`;
+the class comes from the file's extension (case-insensitive; no extension or an unlisted one is `other`; `code` includes
+markup and plain text). Only files count, so empty folders add nothing.
