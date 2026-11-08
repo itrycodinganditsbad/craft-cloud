@@ -140,7 +140,9 @@ pub fn badge(ui: &mut Ui, status: &craft_cloud_kit::Status) {
             Color32::from_rgb(0x40, 0x60, 0xb0),
             match &status.read_only {
                 Some(ro) if !ro.app.is_empty() => format!("Made with a newer version (layout {}): update the app to edit it", ro.version),
-                _ if status.viewer => "You can look at this document but not change it: your role in its team space is viewer, or the space is archived".to_owned(),
+                _ if status.viewer => {
+                    "You can look at this document but not change it: your role in its team space is viewer, or the space is archived".to_owned()
+                }
                 _ => "This document can't be edited by this app".to_owned(),
             },
         ),
@@ -189,13 +191,9 @@ pub fn people_badge(ui: &mut Ui, people: &[Person]) {
         for person in people.iter().take(PEOPLE_SHOWN) {
             let colour = person_colour(ui, person);
             let hover = if person.is_self { format!("{} (you)", person.name) } else { person.name.clone() };
-            egui::Frame::new()
-                .stroke(egui::Stroke::new(1.0, colour))
-                .corner_radius(8)
-                .inner_margin(egui::Margin::symmetric(5, 1))
-                .show(ui, |ui| {
-                    ui.label(RichText::new(initials(&person.name)).strong().color(colour)).on_hover_text(hover);
-                });
+            egui::Frame::new().stroke(egui::Stroke::new(1.0, colour)).corner_radius(8).inner_margin(egui::Margin::symmetric(5, 1)).show(ui, |ui| {
+                ui.label(RichText::new(initials(&person.name)).strong().color(colour)).on_hover_text(hover);
+            });
         }
         let rest = people.len().saturating_sub(PEOPLE_SHOWN);
         if rest > 0 {
