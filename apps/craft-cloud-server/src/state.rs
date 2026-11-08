@@ -52,6 +52,14 @@ pub struct Limits {
     /// How long a live connection trusts its last look at its account's access before it relays updates or presence, or
     /// accepts presence (a removal made by another process is found within this time).
     pub live_recheck: Duration,
+    /// A look at a connection's account that failed (the database could not be read) is repeated this often; the answer
+    /// is never taken as "still allowed". The connection relays nothing and accepts no presence meanwhile…
+    pub live_retry: Duration,
+    /// …and ends with an `internal` error (not `access_changed`) once this many looks in a row failed
+    /// ([`crate::live::LOOKUP_FAILURES_MAX`]) or this long has passed since the first.
+    pub live_patience: Duration,
+    /// All the frames of one catch-up page together must be sent within this long, or the connection ends.
+    pub live_page_send: Duration,
 }
 
 impl Default for Limits {
@@ -70,6 +78,9 @@ impl Default for Limits {
             presence_per_sec: craft_cloud_proto::live::PRESENCE_PER_SEC,
             live_ping: crate::live::PING_EVERY,
             live_recheck: crate::live::RECHECK_EVERY,
+            live_retry: crate::live::LOOKUP_RETRY,
+            live_patience: crate::live::LOOKUP_PATIENCE,
+            live_page_send: crate::live::PAGE_SEND_TIMEOUT,
         }
     }
 }

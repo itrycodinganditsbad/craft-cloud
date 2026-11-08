@@ -14,7 +14,7 @@ use craft_cloud_proto::api::{AdminSpaceInfo, LoginResponse, SPACE_HEADER, SpaceR
 use craft_cloud_proto::live::{
     ACCESS_CHANGED, ACCESS_CHANGED_CLOSE, AppName, ClientFrame, DocKind, PROTOCOL_MISMATCH, ServerFrame, node_doc, recents_doc,
 };
-use craft_cloud_proto::{DocId, ManifestId, NodeId, SpaceId};
+use craft_cloud_proto::{DeviceId, DocId, ManifestId, NodeId, SpaceId};
 use craft_cloud_server::AppState;
 use craft_cloud_server::auth::hash_password;
 use craft_cloud_server::state::Limits;
@@ -37,6 +37,9 @@ struct World {
     base: String,
     client: Client,
     meta: Meta,
+    state: Arc<AppState>,
+    /// The database's URL: a second connection to it breaks and mends a table ([`World::rename_table`]).
+    db_url: String,
     users: Vec<(&'static str, UserRecord, String)>,
     _dirs: Vec<tempfile::TempDir>,
     _pg: Option<PgGuard>,
@@ -73,7 +76,7 @@ fn limits() -> Limits {
 /// a change made in this process, or the check of a frame or of the connection's next relay. A connection trusts its last
 /// look at its account for a fifth of a second.
 fn slow_limits() -> Limits {
-    Limits { compact_updates: 3, live_recheck: Duration::from_millis(200), ..Limits::default() }
+    Limits { compact_updates: 3, live_recheck: Duration::from_millis(200), live_retry: Duration::from_millis(100), ..Limits::default() }
 }
 
 fn app() -> AppName {
@@ -181,6 +184,14 @@ impl World {
         &self.users.iter().find(|(n, ..)| *n == name).unwrap().2
     }
 
+    /// Renames a table through a second connection to the database: every lookup that reads it fails (the database cannot
+    /// be read, as far as the server can tell) until it is renamed back.
+    async fn rename_table(&self, from: &str, to: &str) {
+        use sqlx::Connection;
+        let mut conn = sqlx::AnyConnection::connect(&self.db_url).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE {from} RENAME TO {to}"))).execute(&mut conn).await.unwrap();
+    }
+
     async fn call(&self, who: &str, method: Method, path: &str, body: Option<Value>) -> reqwest::Response {
         let mut request = self.client.request(method, format!("{}{path}", self.base)).bearer_auth(self.token(who));
         if let Some(body) = body {
@@ -266,7 +277,7 @@ async fn subscribe(ws: &mut Ws, doc: DocId, after: u64) -> Vec<(u64, Vec<u8>)> {
     }
 }
 
-async fn build(meta: Meta, dirs: Vec<tempfile::TempDir>, pg: Option<PgGuard>, limits: Limits) -> World {
+async fn build(meta: Meta, db_url: String, dirs: Vec<tempfile::TempDir>, pg: Option<PgGuard>, limits: Limits) -> World {
     let blobs = tempfile::tempdir().unwrap();
     let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
     let mut dirs = dirs;
@@ -296,14 +307,14 @@ async fn build(meta: Meta, dirs: Vec<tempfile::TempDir>, pg: Option<PgGuard>, li
         let login: LoginResponse = login.json().await.unwrap();
         users.push((name, record, login.token));
     }
-    World { base, client, meta, users, _dirs: dirs, _pg: pg }
+    World { base, client, meta, state, db_url, users, _dirs: dirs, _pg: pg }
 }
 
 async fn sqlite_disk(limits: Limits) -> World {
     let db = tempfile::tempdir().unwrap();
     let url = format!("sqlite:{}?mode=rwc", db.path().join("meta.db").display());
     let meta = Meta::open(&url).await.unwrap();
-    build(meta, vec![db], None, limits).await
+    build(meta, url, vec![db], None, limits).await
 }
 
 async fn postgres_disk(limits: Limits) -> Option<World> {
@@ -319,7 +330,7 @@ async fn postgres_disk(limits: Limits) -> Option<World> {
     let (base, _) = admin_url.rsplit_once('/').unwrap();
     let url = format!("{base}/{name}");
     let meta = Meta::open(&url).await.unwrap();
-    Some(build(meta, vec![], Some(guard), limits).await)
+    Some(build(meta, url, vec![], Some(guard), limits).await)
 }
 
 /// A scenario that does not finish in two minutes has hung: fail it instead of holding the build queue.
@@ -370,6 +381,7 @@ on_every_backend!(
     a_write_is_checked_against_the_database_before_any_ping,
     a_removal_made_elsewhere_stops_updates_and_presence_both_ways,
     a_device_revoked_elsewhere_cannot_write,
+    a_connection_whose_access_cannot_be_read_relays_nothing_and_ends,
 );
 
 // ---- the scenarios ----
@@ -850,4 +862,31 @@ async fn a_protocol_two_agent_sees_the_frames_it_always_saw(w: &World) {
     assert_eq!(w.open("eve", Some(space)).await.err(), Some(StatusCode::NOT_FOUND));
     assert_eq!(w.open("eve", Some(SpaceId::generate())).await.err(), Some(StatusCode::NOT_FOUND));
     assert!(w.open("eve", None).await.is_ok());
+}
+
+/// The database cannot be read (here: the members table is renamed away behind the server's back). A connection past its
+/// time of trust is not told it is fine: it is sent no update, and since the look keeps failing it ends with a server
+/// error (`internal`), not with `access_changed` and 4403.
+async fn a_connection_whose_access_cannot_be_read_relays_nothing_and_ends(w: &World) {
+    let space = w.create("Studio", "ana").await;
+    w.join(space, "ana", "ben", "editor").await;
+    let mut ana = w.ready_as("ana", space, SpaceRole::Owner).await;
+    let mut ben = w.ready_as("ben", space, SpaceRole::Editor).await;
+    let doc = w.follow(&mut ana, space).await;
+    w.follow(&mut ben, space).await;
+    // While the database can be read an update reaches ben.
+    send(&mut ana, ClientFrame::Update { doc, client_seq: 1, bytes: b"before".to_vec() }).await;
+    assert!(matches!(frame(&mut ana).await, ServerFrame::Ack { .. }));
+    assert!(matches!(frame(&mut ben).await, ServerFrame::Update { seq: 1, .. }));
+
+    w.rename_table("space_members", "space_members_away").await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // An update appended and announced meanwhile (by a writer that does not read the members, as another process does).
+    w.meta.append_live_update(space, doc, DeviceId::generate(), 1, b"secret", NOW).await.unwrap();
+    w.state.live.publish(space, doc);
+    let (frames, closed, _) = until_closed(&mut ben, Duration::from_secs(10)).await;
+    w.rename_table("space_members_away", "space_members").await;
+    assert_eq!(frames.len(), 1, "no update: {frames:?}");
+    assert_eq!(error_code(&frames[0]).0, "internal");
+    assert!(closed.is_none_or(|(code, _)| code != ACCESS_CHANGED_CLOSE), "not access_changed");
 }

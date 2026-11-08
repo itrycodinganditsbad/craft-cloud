@@ -126,7 +126,15 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
   connection trusts its last look at the account (and its device) for 5 s: before it relays updates or presence, or
   accepts presence, it looks again, so a member removed by another process stops receiving and sending within that
   time; a device signed out by another process cannot write after it either. A change of a space's members makes each
-  of its connections look at once, then at most once a second. A device may follow 256 documents in one space and 1024
+  of its connections look at once, then at most once a second. A look that fails (the database cannot be read) confirms
+  nothing: the last confirmation stays, so past the 5 s the connection relays no update or presence and accepts no
+  presence, the look is repeated every second, and a connection whose look failed three times in a row (or 15 s after
+  the first failure) ends with `error {internal}` and a plain close (not 4403: nothing is known about the access); the
+  agent connects again. A catch-up page is sent frame by frame while the connection also listens to the signals above
+  (a revoked member, a revoked device, shutdown) and reads the access again between frames once the 5 s have passed,
+  and the frames of one page must all be out within two minutes: a reader that does not read cannot hold a revoked
+  connection. An answer to a `compact` that finds the access gone inside its transaction ends the connection like any
+  other loss of access (`error {access_changed}`, close 4403). A device may follow 256 documents in one space and 1024
   in all. The caps are per space: the live bytes of a team space are
   `[spaces] team_live_bytes` (4 GiB by default; a personal space keeps `live_bytes_per_user`), the documents and rows
   counts are the ones of a personal space, per space.
