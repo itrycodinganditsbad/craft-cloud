@@ -305,3 +305,24 @@ pub async fn save_estimate(meta: &Meta, estimate: &Estimate, now_ms: i64) -> Res
     meta.set_server_value(ESTIMATE_KEY, &json, now_ms).await?;
     Ok(())
 }
+
+/// The compression settings the server started with (the config file's), kept for the admin's storage overview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressionSettings {
+    /// `compression = "none"`: nothing is written compressed, whatever the level.
+    pub none: bool,
+    /// The config file's level.
+    pub config_level: u8,
+    pub min_saving_percent: u8,
+}
+
+impl CompressionSettings {
+    /// The settings a store was built with.
+    pub fn of(store: &Store) -> Self {
+        Self {
+            none: store.compression() == craft_cloud_store::Compression::None,
+            config_level: store.level(),
+            min_saving_percent: store.min_saving(),
+        }
+    }
+}

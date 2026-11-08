@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
+
+use crate::storage_tools::CompressionSettings;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use craft_cloud_meta::{Meta, UserId};
@@ -143,12 +145,17 @@ pub struct AppState {
     pub trash_days: u32,
     /// Where to measure the room the server has, and the `capacity` the admin set (the admin's storage overview).
     pub storage_info: StorageInfo,
+    /// The compression settings of the config file, for the admin's storage overview ([`CompressionSettings`]).
+    pub compression: CompressionSettings,
+    /// The overview's compression totals, kept for a short while: they sum the whole blobs table.
+    pub(crate) compression_totals: Mutex<Option<(i64, craft_cloud_meta::StorageTotals)>>,
     /// The time of day for everything a request records (a device's last use, a stored blob, a commit).
     clock: Clock,
 }
 
 impl AppState {
     pub fn new(meta: Meta, store: Store, trusted_proxies: Vec<IpAddr>) -> Result<Self, ApiError> {
+        let compression = CompressionSettings::of(&store);
         let limits = Limits::default();
         Ok(Self {
             meta,
@@ -172,6 +179,8 @@ impl AppState {
             touches: Mutex::new(HashMap::new()),
             dummy_hash: hash_password("craft-cloud dummy password")?,
             trash_days: 30,
+            compression,
+            compression_totals: Mutex::new(None),
             storage_info: StorageInfo::default(),
             clock: Arc::new(now_ms),
         })
@@ -217,6 +226,17 @@ impl AppState {
     }
 
     /// The state with the places to measure and the configured capacity (`[storage] capacity`). The default measures nothing.
+    /// Takes the level an admin set while the server ran (kept in the database) over the config's, for new writes. The
+    /// config's `compression = "none"` still wins: the store then writes nothing compressed whatever the level.
+    pub async fn load_compression_level(&self) -> Result<(), craft_cloud_meta::MetaError> {
+        if let Some((value, _)) = self.meta.server_value(crate::storage_tools::LEVEL_KEY).await?
+            && let Ok(level) = value.parse::<u8>()
+        {
+            self.store.set_level(level);
+        }
+        Ok(())
+    }
+
     pub fn with_storage_info(mut self, info: StorageInfo) -> Self {
         self.storage_info = info;
         self
