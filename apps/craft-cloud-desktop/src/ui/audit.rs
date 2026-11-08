@@ -73,13 +73,15 @@ fn paging(ui: &mut egui::Ui, list: &AuditList, previous: AuditMsg, next: AuditMs
     });
 }
 
-/// The admin's audit log.
-pub(super) fn log(ui: &mut egui::Ui, view: &mut AuditView, now_ms: i64, events: &mut Vec<Event>) {
-    super::heading(ui, "Audit log");
+/// The admin's audit log. `in_switcher`: the admin pages' switcher shows it, and gives the heading and the way back itself.
+pub(super) fn log(ui: &mut egui::Ui, view: &mut AuditView, now_ms: i64, in_switcher: bool, events: &mut Vec<Event>) {
+    if !in_switcher {
+        super::heading(ui, "Audit log");
+    }
     // Controls of a row are as high as a button, so a field, a menu and a button line up.
     ui.spacing_mut().interact_size.y = super::kit::CONTROL_H;
     ui.horizontal(|ui| {
-        if ui.add(super::kit::Button::new("Back to the accounts")).clicked() {
+        if !in_switcher && ui.add(super::kit::Button::new("Back to the accounts")).clicked() {
             events.push(Event::Admin(AdminEvent::BackToList));
         }
         if ui.add_enabled(!view.list.loading, super::kit::Button::new("Refresh")).clicked() {

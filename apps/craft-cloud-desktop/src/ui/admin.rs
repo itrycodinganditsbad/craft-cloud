@@ -39,7 +39,7 @@ pub(super) fn show(ui: &mut egui::Ui, admin: &mut AdminScreen, now_ms: i64, even
             events,
         ),
         View::Create(form) => create(ui, form, events),
-        View::Audit(view) => super::audit::log(ui, view, now_ms, events),
+        View::Audit(view) => super::audit::log(ui, view, now_ms, false, events),
         View::User(view) => {
             let user = admin.list.users.iter().find(|u| u.id == view.id).cloned();
             account(ui, view, user.as_ref(), &me, now_ms, events);
