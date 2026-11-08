@@ -4336,3 +4336,47 @@ async fn a_disk_down_to_its_reserve_refuses_new_uploads() {
     // A chunk that leaves the reserve whole goes up.
     assert_eq!(put_chunk(&s, &ana, &[4u8; 49]).await, StatusCode::NO_CONTENT);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_server_still_takes_what_the_account_already_has_and_a_too_big_body_is_not_a_full_server() {
+    use std::sync::atomic::AtomicU64;
+    let policy = craft_cloud_server::full::Policy { capacity: Some(100), min_free: None };
+    let s = sqlite_disk_refusing(policy, std::sync::Arc::new(AtomicU64::new(u64::MAX))).await;
+    add_user(&s, "ana").await;
+    add_admin(&s, "root").await;
+    let (ana, root) = (login(&s, "ana").await, login(&s, "root").await);
+    assert_eq!(put_chunk(&s, &ana, &[1u8; 60]).await, StatusCode::NO_CONTENT);
+    assert_eq!(put_chunk(&s, &ana, &[2u8; 60]).await, StatusCode::INSUFFICIENT_STORAGE, "a new chunk no longer fits");
+    // The same chunk again adds nothing: accepted, though the server is full.
+    assert_eq!(put_chunk(&s, &ana, &[1u8; 60]).await, StatusCode::NO_CONTENT);
+    // A body over the limit is 413 whatever the server's state, and doesn't change what the overview says.
+    let overview = |token: String| {
+        let (client, url) = (s.client.clone(), format!("{}/admin/server", s.base));
+        async move { client.get(url).bearer_auth(token).send().await.unwrap().json::<serde_json::Value>().await.unwrap() }
+    };
+    let before = overview(root.clone()).await["refusing_uploads"].as_bool();
+    let big = vec![5u8; 5 * 1024 * 1024];
+    let res = s.client.put(format!("{}/chunks/{}", s.base, chunk_id(&big))).bearer_auth(&ana).body(big).send().await;
+    match res {
+        Ok(res) => assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE),
+        Err(e) => assert!(e.is_request() || e.is_body() || e.is_connect(), "{e}"),
+    }
+    assert_eq!(overview(root).await["refusing_uploads"].as_bool(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_server_answers_a_large_body_with_server_full_or_closes_the_connection() {
+    use std::sync::atomic::AtomicU64;
+    let policy = craft_cloud_server::full::Policy { capacity: Some(100), min_free: None };
+    let s = sqlite_disk_refusing(policy, std::sync::Arc::new(AtomicU64::new(u64::MAX))).await;
+    add_user(&s, "ana").await;
+    let ana = login(&s, "ana").await;
+    let big = vec![6u8; 4 * 1024 * 1024];
+    let res = s.client.put(format!("{}/chunks/{}", s.base, chunk_id(&big))).bearer_auth(&ana).body(big).send().await;
+    // Normally the 507 arrives; a client still sending when the server answers may instead see the connection closed,
+    // which the agent treats as a network error (documented).
+    match res {
+        Ok(res) => assert_eq!(error(res).await.1.error, "server_full"),
+        Err(e) => assert!(e.is_request() || e.is_body() || e.is_connect(), "{e}"),
+    }
+}

@@ -78,6 +78,15 @@ min_free = "1 GiB"          # disk only; the free space to keep, default 1 GiB
 - The stored total and the free space are read at most every 5 seconds, and the bytes the server wrote itself since are
   added in between, so the check costs next to nothing; a refusal ends within about 5 seconds of space being freed.
   The log says at `warn` when the server starts refusing and when it stops, with the reason and no file names.
+- `capacity` is a soft limit: uploads that are in flight at the same moment are each checked against the numbers as they
+  were, so the store can pass it by up to the bodies in flight (at most 8 per account, 4 MiB each for chunks). The stored
+  total is the sum of what every account stored, and a chunk two accounts both uploaded counts for both, so refusing can
+  start before the store's physical size reaches `capacity`. The filesystem reserve, which is measured, has no such gap.
+- A chunk or manifest the account already has is accepted again while the server is full: it adds nothing. A request
+  that declares a body over the size limit is answered `413`, never `server_full`. If the free space can't be read
+  within 2 seconds (a dead network mount, say), the reserve is not checked until it can be, and the log says so once. With
+  a large body in flight a client can see its connection closed by the early refusal instead of the `507` itself; an
+  agent then treats it as a network error and retries, which is safe.
 - `min_free` without `refuse_when_full`, `min_free` on S3 and `refuse_when_full` on S3 without `capacity` are refused when
   the server starts, since they would do nothing.
 - The agent turns `server_full` into a pause: "The server is full; the admin needs to free space or raise its capacity",

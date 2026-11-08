@@ -60,17 +60,31 @@ struct Cache {
     free: Option<u64>,
 }
 
+/// How long the free-space read may take before the filesystem counts as unknown (a dead network mount would
+/// otherwise hold every upload).
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Warnings that refusing started are at most this far apart, however close to the threshold the server sits.
+const WARN_EVERY: Duration = Duration::from_secs(60);
+
 pub struct FullGuard {
     policy: Policy,
     probe: Probe,
     /// How long the cached numbers count as current ([`REFRESH`]; tests use others).
     refresh: Duration,
+    probe_timeout: Duration,
     cache: Mutex<Cache>,
     /// Bytes this server stored since the numbers in the cache were read.
     written: AtomicU64,
+    /// Whether a smallest upload would be refused now. Set from the real numbers only, never from what a request
+    /// declares, so no client can make the server say it is full.
     refusing: AtomicBool,
-    /// The size of the last upload that was refused, which [`FullGuard::status`] asks about again.
-    refused: AtomicU64,
+    /// A free-space read is running (it may be stuck on a dead mount); no second one is started meanwhile.
+    probing: Arc<AtomicBool>,
+    /// The free space was unknown at the last read, and that was said in the log.
+    unknown_logged: AtomicBool,
+    /// When the log last said refusing started, and whether it has not yet said it stopped.
+    warned: std::sync::Mutex<(Option<Instant>, bool)>,
 }
 
 impl FullGuard {
@@ -86,10 +100,13 @@ impl FullGuard {
             policy,
             probe,
             refresh: REFRESH,
+            probe_timeout: PROBE_TIMEOUT,
             cache: Mutex::new(Cache::default()),
             written: AtomicU64::new(0),
             refusing: AtomicBool::new(false),
-            refused: AtomicU64::new(0),
+            probing: Arc::new(AtomicBool::new(false)),
+            unknown_logged: AtomicBool::new(false),
+            warned: std::sync::Mutex::new((None, false)),
         }
     }
 
@@ -99,7 +116,13 @@ impl FullGuard {
         self
     }
 
-    /// Whether the server refused the last upload it was asked about, or would refuse one now ([`FullGuard::status`]).
+    /// The guard waiting `timeout` for the free-space read instead of [`PROBE_TIMEOUT`] (tests).
+    pub fn with_probe_timeout(mut self, timeout: Duration) -> Self {
+        self.probe_timeout = timeout;
+        self
+    }
+
+    /// Whether the server would refuse even the smallest upload, as of the last time the numbers were looked at.
     pub fn refusing(&self) -> bool {
         self.refusing.load(Ordering::Relaxed)
     }
@@ -112,61 +135,106 @@ impl FullGuard {
         }
     }
 
-    /// Whether the server is refusing uploads now (for the admin's overview): it would still refuse the upload it last
-    /// refused, or, if it has refused none, one of a single byte. Reads the numbers if they are stale, so it turns false
-    /// soon after space was freed even when no upload has come since.
+    /// Whether the server is refusing uploads now (for the admin's overview). Reads the numbers if they are stale, so it
+    /// turns false soon after space was freed even when no upload has come since.
     pub async fn status(&self, meta: &Meta) -> Result<bool, ApiError> {
-        let asked = if self.refusing() { self.refused.load(Ordering::Relaxed).max(1) } else { 1 };
-        Ok(self.evaluate(meta, asked).await?.is_some())
+        self.evaluate(meta, 0).await?;
+        Ok(self.refusing())
     }
 
-    /// Counts bytes the server stored, until the numbers are read again.
+    /// Counts bytes the server stored, until the numbers are read again. Called once the upload is recorded in the
+    /// database: a read of the stored total that came between the write and the record then still has them counted here,
+    /// and one that came after has them in the total (counted twice for up to one refresh, which errs toward refusing).
     pub fn note_written(&self, bytes: u64) {
         self.written.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// `Some(room)` when an upload of `incoming` bytes would be refused.
+    /// `Some(room)` when an upload of `incoming` bytes would be refused. Also keeps `refusing` (for a one-byte upload).
     async fn evaluate(&self, meta: &Meta, incoming: u64) -> Result<Option<ServerRoom>, ApiError> {
         let mut cache = self.cache.lock().await;
         if cache.read_at.is_none_or(|at| at.elapsed() >= self.refresh) {
-            // Reset first: a write that lands while the numbers are read is then counted twice, never lost.
+            // Reset first: bytes stored while the numbers are read may then be counted twice, which errs toward refusing.
             self.written.store(0, Ordering::Relaxed);
             cache.stored = meta.admin_server_counts().await?.stored_bytes;
             if self.policy.min_free.is_some() {
-                let probe = self.probe.clone();
-                (cache.total, cache.free) = tokio::task::spawn_blocking(move || probe()).await.unwrap_or((None, None));
+                (cache.total, cache.free) = self.read_filesystem().await;
             }
             cache.read_at = Some(Instant::now());
         }
-        let added = self.written.load(Ordering::Relaxed).saturating_add(incoming);
-        let reason = if self.policy.capacity.is_some_and(|capacity| cache.stored.saturating_add(added) > capacity) {
-            Some(Reason::Capacity)
-        } else if let (Some(min_free), Some(free)) = (self.policy.min_free, cache.free)
-            && free.saturating_sub(added) < min_free
-        {
-            Some(Reason::FreeSpace)
-        } else {
-            None
-        };
-        let room = ServerRoom { free_bytes: cache.free, total_bytes: cache.total, capacity_bytes: self.policy.capacity };
+        let written = self.written.load(Ordering::Relaxed);
+        let (stored, total, free) = (cache.stored, cache.total, cache.free);
         drop(cache);
-        if reason.is_some() {
-            self.refused.store(incoming, Ordering::Relaxed);
-        }
-        self.note_state(reason);
-        Ok(reason.map(|_| room))
+        let reason_for = |incoming: u64| {
+            let added = written.saturating_add(incoming);
+            if self.policy.capacity.is_some_and(|capacity| stored.saturating_add(added) > capacity) {
+                Some(Reason::Capacity)
+            } else if let (Some(min_free), Some(free)) = (self.policy.min_free, free)
+                && free.saturating_sub(added) < min_free
+            {
+                Some(Reason::FreeSpace)
+            } else {
+                None
+            }
+        };
+        self.note_state(reason_for(1));
+        let room = ServerRoom { free_bytes: free, total_bytes: total, capacity_bytes: self.policy.capacity };
+        Ok(reason_for(incoming).map(|_| room))
     }
 
-    /// Logs when refusing starts or stops.
+    /// The store's filesystem: total and free bytes, or unknown when the read fails or takes longer than the timeout.
+    async fn read_filesystem(&self) -> (Option<u64>, Option<u64>) {
+        let known = if self.probing.swap(true, Ordering::SeqCst) {
+            // The last read is still stuck: don't pile up threads behind a dead mount.
+            None
+        } else {
+            let (probe, probing) = (self.probe.clone(), self.probing.clone());
+            let read = tokio::task::spawn_blocking(move || {
+                let numbers = probe();
+                probing.store(false, Ordering::SeqCst);
+                numbers
+            });
+            match tokio::time::timeout(self.probe_timeout, read).await {
+                Ok(Ok(numbers)) => Some(numbers),
+                _ => None,
+            }
+        };
+        let numbers = known.unwrap_or((None, None));
+        // Said once while it lasts: a reserve that can't be checked is not checked.
+        if numbers.1.is_none() {
+            if !self.unknown_logged.swap(true, Ordering::Relaxed) {
+                tracing::warn!("can't read the free space of the store's filesystem: the `min_free` reserve is not checked until it can be");
+            }
+        } else {
+            self.unknown_logged.store(false, Ordering::Relaxed);
+        }
+        numbers
+    }
+
+    /// Logs when refusing starts or stops. A start is said at most once a minute, and a stop only after a start was said.
     fn note_state(&self, reason: Option<Reason>) {
         let was = self.refusing.swap(reason.is_some(), Ordering::Relaxed);
-        match (was, reason) {
-            (false, Some(Reason::Capacity)) => tracing::warn!("the server is full: it holds as much as `capacity` allows; refusing new uploads"),
-            (false, Some(Reason::FreeSpace)) => {
-                tracing::warn!("the server is full: free space is down to the `min_free` reserve; refusing new uploads")
+        if was == reason.is_some() {
+            return;
+        }
+        let mut warned = self.warned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match reason {
+            Some(reason) => {
+                if warned.0.is_none_or(|at| at.elapsed() >= WARN_EVERY) {
+                    *warned = (Some(Instant::now()), true);
+                    match reason {
+                        Reason::Capacity => tracing::warn!("the server is full: it holds as much as `capacity` allows; refusing new uploads"),
+                        Reason::FreeSpace => {
+                            tracing::warn!("the server is full: free space is down to the `min_free` reserve; refusing new uploads")
+                        }
+                    }
+                }
             }
-            (true, None) => tracing::warn!("the server has room again; accepting uploads"),
-            _ => {}
+            None => {
+                if warned.1 {
+                    warned.1 = false;
+                    tracing::warn!("the server has room again; accepting uploads");
+                }
+            }
         }
     }
 }
@@ -219,5 +287,30 @@ mod tests {
         let meta = meta().await;
         let guard = FullGuard::with_probe(Policy { capacity: None, min_free: Some(u64::MAX) }, Arc::new(|| (None, None)));
         assert!(guard.check(&meta, 1 << 40).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn what_a_request_declares_never_makes_the_server_say_it_is_full() {
+        let meta = meta().await;
+        let guard = FullGuard::with_probe(Policy { capacity: Some(100), min_free: None }, Arc::new(|| (None, None)));
+        assert!(guard.check(&meta, u64::MAX).await.is_err(), "that upload is refused");
+        assert!(!guard.refusing(), "but a one-byte upload would fit, so the server is not full");
+        assert!(!guard.status(&meta).await.unwrap());
+        assert!(guard.check(&meta, 100).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_free_space_read_that_takes_too_long_counts_as_unknown() {
+        let meta = meta().await;
+        // A dead mount: the read outlasts the timeout, and the reserve is then not checked (not refused for).
+        let slow: Probe = Arc::new(|| {
+            std::thread::sleep(Duration::from_millis(400));
+            (Some(1000), Some(0))
+        });
+        let guard = FullGuard::with_probe(Policy { capacity: None, min_free: Some(500) }, slow).with_probe_timeout(Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        assert!(guard.check(&meta, 1).await.is_ok());
+        assert!(started.elapsed() < Duration::from_millis(300), "{:?}", started.elapsed());
+        assert!(!guard.refusing());
     }
 }
