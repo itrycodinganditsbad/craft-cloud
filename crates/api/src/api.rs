@@ -800,6 +800,11 @@ pub struct SpaceListItem {
     pub root: Option<NodeId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<Epoch>,
+    /// When the account accepted its membership of a team space (milliseconds). Someone who is removed and invited again
+    /// gets a new one, so a client can tell that its access was interrupted. Not given for a personal space or an
+    /// invitation, nor by older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined_ms: Option<i64>,
 }
 
 /// `GET /spaces`: the personal space first, then the team spaces by name.

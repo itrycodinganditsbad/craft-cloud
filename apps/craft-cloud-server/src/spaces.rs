@@ -155,6 +155,7 @@ fn item(space: UserSpace) -> SpaceListItem {
         members: space.members,
         root: space.root,
         epoch: space.epoch,
+        joined_ms: space.joined_ms,
     }
 }
 

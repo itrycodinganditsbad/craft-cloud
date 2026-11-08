@@ -5,7 +5,9 @@
 //!   have happened (an invitation accepted or declined here, a space that answered `404`). A server that speaks
 //!   protocol 1, or has no `/spaces`, has no team spaces: the personal space syncs as before, the agent asks about the
 //!   server's version only (ten times less often), and a team space it remembers shows as unavailable. Nothing sends the
-//!   `craft-space` header to such a server. A failed discovery changes nothing.
+//!   `craft-space` header to such a server. A failed discovery changes nothing; when someone waits for the list (an invitation
+//!   accepted or declined here, the sync turned on) it is tried again after a few seconds, for up to [`REFRESH_BOUND`], before
+//!   they are released with the old list.
 //! - **Folders**: a team space syncs to `Craft Cloud Shared/<name>/` beside the personal folder. The name goes through the
 //!   node name rules (anything a file name can't hold becomes `_`), a name that is taken (by another space or by a folder
 //!   already there) gets ` (2)`, ` (3)`. The folder is chosen when the space is first seen and kept when the space is
@@ -20,15 +22,27 @@
 //!   for that pair only. For any other folder the space starts afresh, as a first sync: what is there and what the server
 //!   has are merged, and nothing is deleted on either side. Changing a space's folder, or turning it off, first closes its
 //!   session and waits until the pass thread has let go of it, so no pass for the old folder can write a state after the
-//!   new folder is set up.
+//!   new folder is set up. The state also records the server's stamp of the account's membership (`joined_ms` in
+//!   `GET /spaces`, new when someone is removed and invited again): a state made under another stamp is not used either,
+//!   which covers an agent that was not running while access was lost and regained. A server without the stamp is not
+//!   compared. Turning a space off forgets its state: turned on again, in the same folder or another, it is a first sync.
+//!   Waiting for a session to close never holds up the task: other spaces, the local API and stopping go on, and the caller
+//!   is answered when the session is closed (or after [`CLOSE_WAIT`]).
+//! - **A first sync merges** (a fresh state, whatever the reason): nothing is deleted on either side, because nothing is known
+//!   to have been deleted. A file that was deleted on the server meanwhile and is still in the folder is uploaded again. A
+//!   file that exists on both sides with different content is not overwritten: the local one is moved aside as a conflict
+//!   copy and the server's version takes its path.
 //! - **One pass at a time**: passes of the spaces run one after another on a thread of their own, and take turns with the
-//!   personal space's passes ([`PassGate`]).
+//!   personal space's passes ([`PassGate`]). A pass that is queued when its space is closed (turned off, moved to another
+//!   folder, lost) or the agent stops is not run; the running pass finishes. A second change of a space that is still
+//!   being closed is refused ([`CHANGING`], `409` in the local API).
 //! - **Losing access**: a space that is no longer listed (or answers `404`) stops syncing and is marked
 //!   [`SpaceRun::NoAccess`]. Nothing in its folder is touched. Its sync state is dropped once its session is closed, so if
 //!   access comes back the folder starts afresh and is merged with the space like a first sync: no local file is deleted
 //!   or replaced (a file that differs on both sides keeps both, one as a conflict copy), what was deleted here meanwhile is
 //!   not deleted on the server, and what was deleted on the server meanwhile is not deleted here. An archived space is not
-//!   lost: its members keep read access, so it stays listed and its engine is read-only.
+//!   lost: its members keep read access, so it stays listed and its engine is read-only. (The server lists it with the stored
+//!   role, an editor stays `editor`, although access is capped at viewer: the agent goes by `archived`.)
 //! - **Mass-delete approval**: a team space's held deletions are approved through `spaces/<id>/approval.json`, which
 //!   `sync --approve-deletes --space` and `POST /v1/spaces/{id}/approve-deletes` write.
 //! - **Read-only**: a role of viewer (or an archived space) puts the space's engine in read-only mode before its first
@@ -36,7 +50,6 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -68,6 +81,14 @@ const ANSWER_WAIT: Duration = Duration::from_secs(60);
 /// The longest the task waits for a space's session to be closed before it changes the folder (shorter than
 /// [`ANSWER_WAIT`], so the caller is answered).
 const CLOSE_WAIT: Duration = Duration::from_secs(50);
+/// What a change of a space's sync is told when another change of the same space waits for its session to close (the local
+/// API answers `409`).
+pub const CHANGING: &str = "this space is being changed, try again in a moment";
+/// How soon a discovery that failed is tried again while someone waits for it.
+const DISCOVERY_RETRY: Duration = Duration::from_secs(3);
+/// The longest those waiting for a discovery are kept waiting for one that works (they are released after that, with the old
+/// list).
+const REFRESH_BOUND: Duration = Duration::from_secs(15);
 /// The longest folder name made from a space's name, in characters.
 const MAX_FOLDER_CHARS: usize = 100;
 
@@ -273,6 +294,9 @@ struct Job {
     /// The role is viewer (or the space is archived): the engine is told before its first write.
     read_only: bool,
     approve: Vec<NodeId>,
+    /// The server's stamp of the account's membership (see [`SpaceListItem::joined_ms`]) that the saved state must have been
+    /// made under.
+    joined_ms: Option<i64>,
     /// Which running of the space's sync asked (see [`Active::run`]), so a result that comes after the sync was stopped or
     /// moved to another folder is not taken for the current one's.
     run: u64,
@@ -312,16 +336,25 @@ enum Ev {
     /// A discovery ended.
     Listed(Looked),
     Pass(Box<Done>),
+    /// The wait for a space's session to close ended (`true`: it is closed), for the change asked under this number.
+    Closed(u64, bool),
+}
+
+/// The runnings of the sync ([`Active::run`]) that are current: a queued pass of any other is not started.
+type Live = Arc<Mutex<BTreeSet<u64>>>;
+
+fn live_set(live: &Live) -> MutexGuard<'_, BTreeSet<u64>> {
+    live.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The thread of the team spaces' passes: a session per space, each opened by its first pass, ended when it needs the user
-/// or the space is closed. Runs a pass while it holds the turn ([`PassGate`]); once `abandon` is set (the agent stops at
-/// once) a pass that gets its turn is not started.
+/// or the space is closed. Runs a pass while it holds the turn ([`PassGate`]); a pass whose space was closed since it was
+/// queued (turned off, moved, lost, or the agent is stopping) is not run.
 fn pass_thread(
     data: DataDir,
     account: Account,
     gate: PassGate,
-    abandon: Arc<AtomicBool>,
+    live: Live,
     jobs: std::sync::mpsc::Receiver<ToThread>,
     events: mpsc::UnboundedSender<Ev>,
 ) {
@@ -343,16 +376,25 @@ fn pass_thread(
         };
         let space = job.setting.space;
         let _turn = gate.hold();
-        if abandon.load(Ordering::SeqCst) {
-            return;
+        // The space was closed (turned off, moved to another folder, lost) after this pass was queued: it is not run. The
+        // result is reported all the same, so the task knows the thread is free.
+        if !live_set(&live).contains(&job.run) {
+            let done = Done { space, run: job.run, result: Ok(PassSummary::default()), last_pass: None, seq: None, recheck_in: None };
+            if events.send(Ev::Pass(Box::new(done))).is_err() {
+                return;
+            }
+            continue;
         }
-        // A session is for one folder: the space's folder may have changed since it opened.
-        if sessions.iter().any(|(id, s)| *id == space && s.account().folder != job.setting.folder) {
+        // A session is for one folder and one membership: the space's folder may have changed since it opened, or the account
+        // may have been removed from the space and invited again (its state is then not used, see `load_state_for`).
+        if sessions.iter().any(|(id, s)| {
+            *id == space && (s.account().folder != job.setting.folder || s.joined_ms().zip(job.joined_ms).is_some_and(|(a, b)| a != b))
+        }) {
             sessions.retain(|(id, _)| *id != space);
         }
         let index = match sessions.iter().position(|(id, _)| *id == space) {
             Some(index) => Ok(index),
-            None => Session::open_team(&data, &account, &job.setting, Some(job.stability.clone())).map(|session| {
+            None => Session::open_team(&data, &account, &job.setting, job.joined_ms, Some(job.stability.clone())).map(|session| {
                 sessions.push((space, session));
                 sessions.len() - 1
             }),
@@ -376,7 +418,7 @@ fn pass_thread(
         let session = sessions.iter().find(|(id, _)| *id == space).map(|(_, s)| s);
         let last_pass = session
             .and_then(Session::last_pass)
-            .or_else(|| data.space_dir(space).load_state_for(space, &job.setting.folder).ok().and_then(|(s, _)| s.last_pass));
+            .or_else(|| data.space_dir(space).load_state_for(space, &job.setting.folder, job.joined_ms).ok().and_then(|(s, _)| s.last_pass));
         let seq = session.filter(|s| s.state().space.is_some()).map(|s| s.state().seq);
         let recheck_in = session.and_then(Session::recheck_in);
         if events.send(Ev::Pass(Box::new(Done { space, run: job.run, result, last_pass, seq, recheck_in }))).is_err() {
@@ -516,6 +558,8 @@ struct Active {
     approved: Vec<NodeId>,
     /// What the long-poll is started again with.
     polling: Polling,
+    /// Where the pass thread looks up whether [`Active::run`] is still current; this running is taken out when it ends.
+    live: Live,
 }
 
 /// What a long-poll of a team space is made of.
@@ -545,6 +589,7 @@ impl Active {
 
 impl Drop for Active {
     fn drop(&mut self) {
+        live_set(&self.live).remove(&self.run);
         self.stop_poll();
     }
 }
@@ -557,6 +602,23 @@ struct Team {
     lost: bool,
     read_only: bool,
     last_sync_ms: Option<i64>,
+}
+
+/// A change of a space's sync that waits for its session to close.
+struct Pending {
+    id: u64,
+    space: SpaceId,
+    request: SpaceSyncRequest,
+    reply: oneshot::Sender<Result<SpaceInfo, AgentError>>,
+}
+
+/// What applying a change of a space's sync came to.
+enum Applied {
+    Done(Box<SpaceInfo>),
+    /// The space's session must be closed first (and its saved state forgotten with `forget`).
+    NeedsClose {
+        forget: bool,
+    },
 }
 
 struct Manager {
@@ -582,8 +644,14 @@ struct Manager {
     events_tx: mpsc::UnboundedSender<Ev>,
     jobs: std::sync::mpsc::Sender<ToThread>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// Set by a second stop: the pass thread starts no pass that was queued.
-    abandon: Arc<AtomicBool>,
+    /// The current runnings of the spaces' syncs (see [`Active::live`]).
+    live: Live,
+    /// Turning a space off or moving it waits for its session to close, apart from the task: those under way.
+    pending: Vec<Pending>,
+    /// The last number given to a change in `pending`.
+    changes: u64,
+    /// When those waiting for a discovery stop being kept waiting for one that works.
+    refresh_until: Option<Ms>,
     /// The last number given to a running of a space's sync ([`Active::run`]).
     runs: u64,
     /// The space whose pass runs now.
@@ -611,11 +679,11 @@ impl Manager {
         let (events_tx, events) = mpsc::unbounded_channel();
         let (jobs, jobs_rx) = std::sync::mpsc::channel();
         let (thread_data, thread_account, thread_events) = (data.clone(), account.clone(), events_tx.clone());
-        let abandon = Arc::new(AtomicBool::new(false));
-        let thread_abandon = abandon.clone();
+        let live = Live::default();
+        let thread_live = live.clone();
         let thread = std::thread::Builder::new()
             .name("craft-cloud-spaces".into())
-            .spawn(move || pass_thread(thread_data, thread_account, gate, thread_abandon, jobs_rx, thread_events))
+            .spawn(move || pass_thread(thread_data, thread_account, gate, thread_live, jobs_rx, thread_events))
             .ok();
         let teams = account
             .spaces
@@ -640,7 +708,10 @@ impl Manager {
             events_tx,
             jobs,
             thread,
-            abandon,
+            live,
+            pending: Vec::new(),
+            changes: 0,
+            refresh_until: None,
             runs: 0,
             in_flight: None,
             turn: 0,
@@ -677,7 +748,7 @@ impl Manager {
                         at_once = true;
                         break;
                     }
-                    Some(msg) => self.message(msg).await,
+                    Some(msg) => self.message(msg),
                 },
                 event = self.events.recv() => {
                     if let Some(event) = event {
@@ -699,10 +770,7 @@ impl Manager {
         if let Some(discovery) = self.discovery.take() {
             discovery.abort();
         }
-        let Self { jobs, thread, abandon, .. } = self;
-        if at_once {
-            abandon.store(true, Ordering::SeqCst);
-        }
+        let Self { jobs, thread, .. } = self;
         drop(jobs);
         if let Some(thread) = thread
             && !at_once
@@ -711,11 +779,14 @@ impl Manager {
         }
     }
 
-    async fn message(&mut self, msg: Msg) {
+    fn message(&mut self, msg: Msg) {
         match msg {
             Msg::Refresh(done) => {
                 // A discovery already under way may have started before the change that asks for this one: the answer
                 // waits for the one after it.
+                if done.is_some() && self.refresh_until.is_none() {
+                    self.refresh_until = Some(self.now().saturating_add(ms(REFRESH_BOUND)));
+                }
                 match (self.discovery.is_some(), done) {
                     (true, Some(done)) => self.waiting_next.push(done),
                     (false, Some(done)) => {
@@ -726,10 +797,7 @@ impl Manager {
                     (false, None) => self.start_discovery(),
                 }
             }
-            Msg::Sync(space, request, reply) => {
-                let answer = self.set_sync(space, &request).await;
-                let _ = reply.send(answer);
-            }
+            Msg::Sync(space, request, reply) => self.set_sync(space, request, reply),
             Msg::Paused(paused) => {
                 self.paused = paused;
                 // The long-polls rest while syncing is paused, as the personal one does, and start again on resume.
@@ -787,6 +855,7 @@ impl Manager {
             Ev::Gone => self.next_discovery = 0,
             Ev::Listed(looked) => self.listed(looked),
             Ev::Pass(done) => self.pass_done(*done, now),
+            Ev::Closed(id, closed) => self.closed(id, closed),
         }
     }
 
@@ -838,6 +907,7 @@ impl Manager {
             let mut start: Option<(usize, Box<Job>)> = None;
             let paused = self.paused;
             let busy = self.in_flight.is_some();
+            let joined_ms = self.teams.get(index).and_then(|t| self.item_of(t.setting.space)).and_then(|i| i.joined_ms);
             let Some(team) = self.teams.get_mut(index) else { continue };
             let read_only = team.read_only;
             let setting = team.setting.clone();
@@ -852,7 +922,8 @@ impl Manager {
                 Next::RunPass if !busy => {
                     active.scheduler.pass_started();
                     let approve = std::mem::take(&mut active.approved);
-                    start = Some((index, Box::new(Job { setting, stability: active.stability.clone(), read_only, approve, run: active.run })));
+                    start =
+                        Some((index, Box::new(Job { setting, stability: active.stability.clone(), read_only, approve, joined_ms, run: active.run })));
                 }
                 Next::RunPass => {}
                 Next::CheckApproval => {
@@ -903,6 +974,7 @@ impl Manager {
     /// A discovery ended: the teams are brought in line with what it found, and whoever waited for it is told.
     fn listed(&mut self, looked: Looked) {
         self.discovery = None;
+        let failed = matches!(looked, Looked::Failed(_));
         match looked {
             Looked::Listed(list) => {
                 self.noted = None;
@@ -917,11 +989,22 @@ impl Manager {
             }
             Looked::Failed(why) => self.discovery_failed(&why),
         }
+        // Whoever waits for the list (an accepted invitation is to be found in it) is not told a list that is out of date: a
+        // discovery that failed is tried again within seconds, and they wait for that, up to a bound.
+        let now = self.now();
+        if failed && self.refresh_until.is_some_and(|until| now < until) && !(self.waiting.is_empty() && self.waiting_next.is_empty()) {
+            let later = std::mem::take(&mut self.waiting_next);
+            self.waiting.extend(later);
+            self.next_discovery = now.saturating_add(ms(DISCOVERY_RETRY));
+            return;
+        }
+        self.refresh_until = None;
         for done in self.waiting.drain(..) {
             let _ = done.send(());
         }
         if !self.waiting_next.is_empty() {
             self.waiting = std::mem::take(&mut self.waiting_next);
+            self.refresh_until = Some(now.saturating_add(ms(REFRESH_BOUND)));
             self.start_discovery();
         }
     }
@@ -977,13 +1060,16 @@ impl Manager {
             None => team.lost,
         };
         let read_only = listed.as_ref().and_then(Option::as_ref).is_some_and(|i| i.role == SpaceRole::Viewer || i.archived);
-        let want = team.setting.sync && supported && !lost && !self.stopping;
+        let joined_ms = listed.as_ref().and_then(Option::as_ref).and_then(|i| i.joined_ms);
+        // A space whose session is being closed (turned off, moved) is not started again before that is done.
+        let changing = self.pending.iter().any(|p| p.space == space);
+        let want = team.setting.sync && supported && !lost && !self.stopping && !changing;
         // Access was just lost: the saved state goes, once the session is closed, so that if access comes back the folder
         // is merged with the space afresh (what was deleted on either side meanwhile is not deleted on the other).
         let newly_lost = lost && !team.lost;
         let timing = self.options.timing;
         let (options, events, now, paused) = (self.options, self.events_tx.clone(), self.now(), self.paused);
-        let (data, account) = (self.data.clone(), self.account.clone());
+        let (data, account, live) = (self.data.clone(), self.account.clone(), self.live.clone());
         self.runs += 1;
         let run = self.runs;
         let Some(team) = self.teams.get_mut(index) else { return };
@@ -998,7 +1084,7 @@ impl Manager {
         team.read_only = read_only;
         match (want, team.active.is_some()) {
             (true, false) => {
-                team.active = start_active(&data, &account, &team.setting, timing, options, events, now, run, paused);
+                team.active = start_active(&data, &account, &team.setting, joined_ms, timing, options, events, now, (run, live), paused);
             }
             (false, true) => {
                 team.active = None;
@@ -1011,8 +1097,46 @@ impl Manager {
         }
     }
 
-    /// Turns the sync of a team space on or off here.
-    async fn set_sync(&mut self, space: SpaceId, request: &SpaceSyncRequest) -> Result<SpaceInfo, AgentError> {
+    /// Turns the sync of a team space on or off here. Turning it off, or moving it to another folder, first closes the
+    /// space's session; the task does not wait for that (other spaces, a stop and the local API go on), and the caller is
+    /// answered once it is done or [`CLOSE_WAIT`] has passed ([`Manager::closed`]).
+    fn set_sync(&mut self, space: SpaceId, request: SpaceSyncRequest, reply: oneshot::Sender<Result<SpaceInfo, AgentError>>) {
+        if self.pending.iter().any(|p| p.space == space) {
+            let _ = reply.send(Err(AgentError::Usage(CHANGING.into())));
+            return;
+        }
+        match self.apply_sync(space, &request, None) {
+            Ok(Applied::Done(info)) => {
+                let _ = reply.send(Ok(*info));
+            }
+            Ok(Applied::NeedsClose { forget }) => {
+                self.changes += 1;
+                let id = self.changes;
+                self.pending.push(Pending { id, space, request, reply });
+                self.close_session(id, space, forget);
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+            }
+        }
+    }
+
+    /// The wait for a session to close ended: the change that waited for it is applied and its caller answered.
+    fn closed(&mut self, id: u64, closed: bool) {
+        let Some(index) = self.pending.iter().position(|p| p.id == id) else { return };
+        let Pending { space, request, reply, .. } = self.pending.remove(index);
+        let answer = match self.apply_sync(space, &request, Some(closed)) {
+            Ok(Applied::Done(info)) => Ok(*info),
+            Ok(Applied::NeedsClose { .. }) => Err(AgentError::Usage("the space's session could not be closed; try again in a moment".into())),
+            Err(e) => Err(e),
+        };
+        let _ = reply.send(answer);
+    }
+
+    /// Applies turning a space's sync on or off. `closed` is `None` before the space's session was closed, and afterwards
+    /// whether it was closed within the wait; a change that needs the session closed first answers
+    /// [`Applied::NeedsClose`] while it is `None`.
+    fn apply_sync(&mut self, space: SpaceId, request: &SpaceSyncRequest, closed: Option<bool>) -> Result<Applied, AgentError> {
         let not_found = || AgentError::Server(TransportError::NotFound);
         let known = self.account.spaces.iter().position(|s| s.space == space);
         let item = self.item_of(space).cloned();
@@ -1024,9 +1148,13 @@ impl Manager {
         }
         if !request.on {
             let index = known.ok_or_else(not_found)?;
-            // The session ends before the setting says off, so a pass that is running finishes first; if it takes longer
-            // than the wait, turning the sync on again waits for it then.
-            let _ = self.close_session(space).await;
+            // The session ends before the setting says off, so a pass that is running finishes first (if it takes longer
+            // than the wait, turning the sync on again waits for it then). Its saved state is forgotten: turned on again,
+            // in this folder or another, the space starts afresh as a first sync, so what was deleted here or on the server
+            // while it was off is not deleted on the other side.
+            if closed.is_none() {
+                return Ok(Applied::NeedsClose { forget: true });
+            }
             if let Some(setting) = self.account.spaces.get_mut(index) {
                 setting.sync = false;
             }
@@ -1053,8 +1181,12 @@ impl Manager {
             // after that.
             let running = self.teams.iter().any(|t| t.setting.space == space && t.active.is_some());
             let unchanged = running && known.and_then(|i| self.account.spaces.get(i)).is_some_and(|s| s.sync && s.folder == folder);
-            if !unchanged && !self.close_session(space).await {
-                return Err(AgentError::Usage("a pass of this space is still running; try again in a moment".into()));
+            if !unchanged {
+                match closed {
+                    None => return Ok(Applied::NeedsClose { forget: false }),
+                    Some(false) => return Err(AgentError::Usage("a pass of this space is still running; try again in a moment".into())),
+                    Some(true) => {}
+                }
             }
             set_up_folder(&self.data, &folder, space, root, request.adopt)?;
             let setting = SpaceSetting { space, folder, sync: true, name: item.name.clone(), root: Some(root) };
@@ -1069,21 +1201,27 @@ impl Manager {
         }
         self.data.save_account(&self.account)?;
         self.settled();
-        self.info_of(space).ok_or_else(not_found)
+        self.info_of(space).map(|info| Applied::Done(Box::new(info))).ok_or_else(not_found)
     }
 
-    /// Stops the space's sync here and waits until the pass thread has closed its session (a pass that was running has ended
-    /// and nothing of the space writes its state any more). `false`: it didn't happen within [`CLOSE_WAIT`].
-    async fn close_session(&mut self, space: SpaceId) -> bool {
+    /// Stops the space's sync here and asks the pass thread to close its session (a pass that was running has ended and
+    /// nothing of the space writes its state any more once it is closed). The task is told by [`Ev::Closed`], `false` if
+    /// that didn't happen within [`CLOSE_WAIT`].
+    fn close_session(&mut self, id: u64, space: SpaceId, forget: bool) {
         if let Some(team) = self.teams.iter_mut().find(|t| t.setting.space == space) {
             team.active = None;
         }
         let (ack, closed) = oneshot::channel();
-        if self.jobs.send(ToThread::Close { space, forget: false, ack: Some(ack) }).is_err() {
-            return true;
+        let events = self.events_tx.clone();
+        if self.jobs.send(ToThread::Close { space, forget, ack: Some(ack) }).is_err() {
+            let _ = events.send(Ev::Closed(id, true));
+            return;
         }
-        // A thread that has ended drops the acknowledgement: nothing runs then either.
-        tokio::time::timeout(CLOSE_WAIT, closed).await.is_ok()
+        tokio::spawn(async move {
+            // A thread that has ended drops the acknowledgement: nothing runs then either.
+            let in_time = tokio::time::timeout(CLOSE_WAIT, closed).await.is_ok();
+            let _ = events.send(Ev::Closed(id, in_time));
+        });
     }
 
     /// A team folder must not lie inside another synced folder (or the other way round), nor the agent's data folder.
@@ -1188,7 +1326,7 @@ impl Manager {
 
 /// The last pass summary a team space's own `state.json` holds, if that state is for the space's folder.
 fn active_summary(state_dir: &DataDir, setting: &SpaceSetting) -> Option<PassSummary> {
-    state_dir.load_state_for(setting.space, &setting.folder).ok().and_then(|(s, _)| s.last_pass).and_then(|l| l.summary)
+    state_dir.load_state_for(setting.space, &setting.folder, None).ok().and_then(|(s, _)| s.last_pass).and_then(|l| l.summary)
 }
 
 /// The parts of a synced team space: scheduler, folder watcher, long-poll.
@@ -1197,16 +1335,21 @@ fn start_active(
     data: &DataDir,
     account: &Account,
     setting: &SpaceSetting,
+    joined_ms: Option<i64>,
     timing: crate::schedule::Timing,
     options: RunOptions,
     events: mpsc::UnboundedSender<Ev>,
     now: Ms,
-    run: u64,
+    (run, live): (u64, Live),
     paused: bool,
 ) -> Option<Active> {
     let space = setting.space;
     let transport = HttpTransport::new(account.server.clone(), &account.token).and_then(|t| t.bound_to(space)).ok()?;
-    let since = data.space_dir(space).load_state_for(space, &setting.folder).ok().and_then(|(saved, _)| saved.state.space.map(|_| saved.state.seq));
+    let since = data
+        .space_dir(space)
+        .load_state_for(space, &setting.folder, joined_ms)
+        .ok()
+        .and_then(|(saved, _)| saved.state.space.map(|_| saved.state.seq));
     let (since_tx, _) = watch::channel(since);
     let polling = Polling { transport, space, events: events.clone(), options };
     let mut scheduler = Scheduler::new(timing, now, random);
@@ -1242,7 +1385,9 @@ fn start_active(
         since: since_tx,
         approved: Vec::new(),
         polling,
+        live: live.clone(),
     };
+    live_set(&live).insert(run);
     if !paused {
         active.start_poll();
     }
@@ -1288,6 +1433,7 @@ mod tests {
             members: 2,
             root: (state == "active").then(NodeId::generate),
             epoch: (state == "active").then(Epoch::generate),
+            joined_ms: (state == "active").then_some(1),
         }
     }
 

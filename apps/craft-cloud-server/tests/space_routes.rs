@@ -217,6 +217,7 @@ on_every_backend!(
     a_removed_member_ends_a_long_poll,
     the_account_activity_shows_events_about_the_account,
     review_fixes_of_the_routes_hold,
+    a_member_who_is_removed_and_invited_again_is_listed_with_a_new_joined_stamp,
 );
 
 // ---- scenarios ----
@@ -673,4 +674,31 @@ async fn review_fixes_of_the_routes_hold(w: &World) {
         StatusCode::BAD_REQUEST,
         "no confirmation: the limit asks for it"
     );
+}
+
+/// `GET /spaces` gives an accepted member the time they joined: it stays the same while they are a member (a role change does
+/// not move it) and is new when they are removed and invited again, so an agent can tell that its access was interrupted.
+/// A personal space and an invitation have none.
+async fn a_member_who_is_removed_and_invited_again_is_listed_with_a_new_joined_stamp(w: &World) {
+    let space = w.create("Studio", "ana").await;
+    let stamp = |list: Vec<SpaceListItem>| list.iter().find(|s| s.id == space).and_then(|s| s.joined_ms);
+    let invite = w.call("ana", Method::POST, &format!("/spaces/{space}/members"), Some(json!({ "username": "ben", "role": "editor" }))).await;
+    assert_eq!(invite.status(), StatusCode::OK);
+    assert_eq!(stamp(w.spaces("ben").await), None, "an invitation has none");
+    let accepted = w.call("ben", Method::POST, &format!("/spaces/{space}/accept"), None).await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let first = stamp(w.spaces("ben").await).expect("an accepted member has one");
+    assert!(w.spaces("ben").await.iter().filter(|s| s.kind == "personal").all(|s| s.joined_ms.is_none()), "a personal space has none");
+
+    let role = w.call("ana", Method::PATCH, &format!("/spaces/{space}/members/{}", w.user("ben").id.0), Some(json!({ "role": "viewer" }))).await;
+    assert_eq!(role.status(), StatusCode::OK);
+    assert_eq!(stamp(w.spaces("ben").await), Some(first), "a role change does not move it");
+
+    let removed = w.call("ana", Method::DELETE, &format!("/spaces/{space}/members/{}", w.user("ben").id.0), None).await;
+    assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+    assert_eq!(stamp(w.spaces("ben").await), None, "no longer a member");
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    w.join(space, "ana", "ben", "editor").await;
+    let second = stamp(w.spaces("ben").await).expect("a member again");
+    assert!(second > first, "invited and accepted again: a new stamp ({first} then {second})");
 }

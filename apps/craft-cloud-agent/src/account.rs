@@ -307,6 +307,11 @@ pub struct SavedState {
     /// (see [`DataDir::load_state_for`]); the personal space's state has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<PathBuf>,
+    /// A team space's state only: the server's stamp of the account's membership when the state was made
+    /// (`SpaceListItem::joined_ms`). A state made under another stamp (the member was removed and invited again meanwhile)
+    /// is not used. `None`: the server gave none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined_ms: Option<i64>,
 }
 
 /// `status.json`: what the `run` loop is doing, written atomically on every change and as a heartbeat, for `status`
@@ -481,12 +486,21 @@ impl DataDir {
 
     /// A team space's saved state for `folder`: the state only if it was made for this space and this folder (compared
     /// as canonical paths), else a fresh one. A state remembers what the folder it syncs holds; used for another folder it
-    /// would find that folder's files missing and delete them on the server. The `bool` says the saved state was set
-    /// aside because it belongs elsewhere.
-    pub fn load_state_for(&self, space: SpaceId, folder: &Path) -> Result<(SavedState, bool), AccountError> {
+    /// would find that folder's files missing and delete them on the server. `joined_ms` is the server's current stamp of
+    /// the account's membership: a state made under a different one is set aside too, since the access was interrupted
+    /// and the folder and the server changed meanwhile without this state seeing it. A server that gives no stamp (an older
+    /// one) is not compared; a state without one, while the server gives one, is not trusted. The `bool` says the saved
+    /// state was set aside because it belongs elsewhere.
+    pub fn load_state_for(&self, space: SpaceId, folder: &Path, joined_ms: Option<i64>) -> Result<(SavedState, bool), AccountError> {
         let saved = self.load_state()?;
         let here = fs::canonicalize(folder).ok();
-        let ours = saved.state.space.is_none_or(|s| s == space) && saved.folder.is_some() && saved.folder == here;
+        let same_membership = match (joined_ms, saved.joined_ms) {
+            (Some(now), Some(then)) => now == then,
+            // The server gives a stamp and the state has none: it was made before the membership was stamped.
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        let ours = saved.state.space.is_none_or(|s| s == space) && saved.folder.is_some() && saved.folder == here && same_membership;
         if ours || (saved.state.space.is_none() && saved.last_pass.is_none() && saved.folder.is_none()) {
             return Ok((saved, false));
         }
@@ -1012,22 +1026,34 @@ mod tests {
         fs::create_dir_all(&a).unwrap();
         fs::create_dir_all(&b).unwrap();
         let space = SpaceId::generate();
-        assert_eq!(data.load_state_for(space, &a).unwrap(), (SavedState { schema: STATE_SCHEMA, ..SavedState::default() }, false));
+        assert_eq!(data.load_state_for(space, &a, None).unwrap(), (SavedState { schema: STATE_SCHEMA, ..SavedState::default() }, false));
         let mut saved = SavedState { schema: STATE_SCHEMA, folder: fs::canonicalize(&a).ok(), ..SavedState::default() };
         saved.state.space = Some(space);
         saved.state.seq = 9;
         data.save_state(&saved).unwrap();
-        assert_eq!(data.load_state_for(space, &a).unwrap(), (saved.clone(), false), "the folder it was made for");
-        let (other, set_aside) = data.load_state_for(space, &b).unwrap();
+        assert_eq!(data.load_state_for(space, &a, None).unwrap(), (saved.clone(), false), "the folder it was made for");
+        let (other, set_aside) = data.load_state_for(space, &b, None).unwrap();
         assert!(set_aside && other.state.seq == 0 && other.state.space.is_none(), "another folder starts afresh");
-        let (other, set_aside) = data.load_state_for(SpaceId::generate(), &a).unwrap();
+        let (other, set_aside) = data.load_state_for(SpaceId::generate(), &a, None).unwrap();
         assert!(set_aside && other.state.space.is_none(), "another space starts afresh");
-        let (gone, set_aside) = data.load_state_for(space, &dir.path().join("missing")).unwrap();
+        let (gone, set_aside) = data.load_state_for(space, &dir.path().join("missing"), None).unwrap();
         assert!(set_aside && gone.state.seq == 0, "a folder that can't be found is not the one");
         // A state from before the folder was recorded is not trusted either.
         saved.folder = None;
         data.save_state(&saved).unwrap();
-        assert!(data.load_state_for(space, &a).unwrap().1);
+        assert!(data.load_state_for(space, &a, None).unwrap().1);
+        // The server's stamp of the membership: a state made under another one is not used; without a stamp on either side
+        // (an older server, a state from before stamps) nothing is compared.
+        saved.folder = fs::canonicalize(&a).ok();
+        saved.joined_ms = Some(100);
+        data.save_state(&saved).unwrap();
+        assert!(!data.load_state_for(space, &a, Some(100)).unwrap().1, "the same membership");
+        assert!(data.load_state_for(space, &a, Some(200)).unwrap().1, "removed and invited again meanwhile");
+        assert!(!data.load_state_for(space, &a, None).unwrap().1, "a server without stamps");
+        saved.joined_ms = None;
+        data.save_state(&saved).unwrap();
+        assert!(data.load_state_for(space, &a, Some(200)).unwrap().1, "a state without a stamp is not trusted when the server gives one");
+        assert!(!data.load_state_for(space, &a, None).unwrap().1, "and is used with a server that gives none");
         // The folder is written only when there is one: the personal space's state is as it was.
         let personal = SavedState { schema: STATE_SCHEMA, ..SavedState::default() };
         assert!(!serde_json::to_string(&personal).unwrap().contains("folder"));
