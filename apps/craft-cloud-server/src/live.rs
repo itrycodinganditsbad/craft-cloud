@@ -1008,7 +1008,8 @@ struct Streams {
     presence: broadcast::Receiver<PresenceNote>,
     /// Devices revoked through the API.
     revocations: broadcast::Receiver<DeviceId>,
-    /// Changes of the space's members, roles and life cycle: the account's access is read again at once.
+    /// Changes of the space's members, roles and life cycle: the account's access is read again at once (a device signed
+    /// out meanwhile, as when an account is disabled, is reported as that first).
     members: watch::Receiver<u64>,
     /// Accounts disabled or marked for removal.
     users: broadcast::Receiver<Uuid>,
@@ -1057,8 +1058,8 @@ async fn serve(mut socket: WebSocket, mut session: Session, streams: Streams) {
                 if changed.is_err() {
                     break;
                 }
-                if let Some(frame) = session.check_access().await {
-                    access_changed = true;
+                if let Some(frame) = session.check().await {
+                    access_changed |= is_access_changed(&frame);
                     let _ = send(&mut socket, &frame).await;
                     break;
                 }
@@ -1070,8 +1071,8 @@ async fn serve(mut socket: WebSocket, mut session: Session, streams: Streams) {
                     Err(broadcast::error::RecvError::Lagged(_)) => true,
                     Err(broadcast::error::RecvError::Closed) => false,
                 };
-                if ours && let Some(frame) = session.check_access().await {
-                    access_changed = true;
+                if ours && let Some(frame) = session.check().await {
+                    access_changed |= is_access_changed(&frame);
                     let _ = send(&mut socket, &frame).await;
                     break;
                 }
