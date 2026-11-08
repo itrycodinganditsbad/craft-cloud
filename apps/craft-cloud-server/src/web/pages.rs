@@ -511,6 +511,7 @@ pub(super) async fn disable_user(State(state): State<Shared>, Path(id): Path<Str
     let actor = actor(&state, &authed, &form).await?;
     let revoked = state.meta.admin_disable_user(&actor, target, state.now_ms()).await?;
     end_live_connections(&state, &revoked);
+    crate::spaces::wake_spaces_of(&state, target).await;
     tracing::info!(target = %target.0, revoked = revoked.len(), "admin (web): account disabled");
     Ok(redirect(&format!("{}?notice=disabled", user_href(target))))
 }
@@ -532,6 +533,7 @@ pub(super) async fn remove_user(State(state): State<Shared>, Path(id): Path<Stri
     let actor = actor(&state, &authed, &form).await?;
     let revoked = state.meta.admin_remove_user(&actor, target, state.now_ms()).await?;
     end_live_connections(&state, &revoked);
+    crate::spaces::wake_spaces_of(&state, target).await;
     tracing::info!(target = %target.0, revoked = revoked.len(), "admin (web): account marked for removal");
     Ok(redirect("/web/users?notice=removed"))
 }

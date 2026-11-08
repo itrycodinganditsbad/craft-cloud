@@ -123,6 +123,12 @@ fn user_actor(auth: &DeviceAuth) -> SpaceActor {
 /// the confirmation; a member who is neither is `read_only`, and anyone else gets the answer for a space that is not there.
 async fn actor_for(state: &AppState, auth: &DeviceAuth, space: SpaceId, confirm: SpaceConfirm) -> Result<SpaceActor, ApiError> {
     let role = state.meta.space_member_role(auth.user, space).await?;
+    // An administrator who sends the confirmation acts as an administrator, also in a space they own: the change is then
+    // audited and confirmed as an administrator's (an owner's own change carries no password).
+    let confirmed = confirm.password.is_some() || confirm.totp_code.is_some() || confirm.recovery_code.is_some();
+    if auth.role == Role::Admin && confirmed {
+        return admin_actor(state, auth, confirm).await;
+    }
     if role == Some(SpaceRole::Owner) {
         return Ok(user_actor(auth));
     }
@@ -195,7 +201,9 @@ fn count_invite(state: &AppState, user: UserId) -> Result<(), ApiError> {
         Ok(())
     } else {
         let wait = state.space_invites.retry_after(&key, now);
-        Err(ApiError::rate_limited("too many invitations; wait a minute", Some(u32::try_from(wait.as_secs().max(1)).unwrap_or(60))))
+        // Rounded up: told to wait 1 s when 1.4 s are left, a client would be refused again.
+        let secs = wait.as_secs().saturating_add(u64::from(wait.subsec_nanos() > 0)).max(1);
+        Err(ApiError::rate_limited("too many invitations; wait a minute", Some(u32::try_from(secs).unwrap_or(60))))
     }
 }
 
@@ -345,6 +353,12 @@ async fn update_space(
     }
     let name = req.name.as_deref().map(space_name).transpose()?;
     let now = state.now_ms();
+    // Checked before anything is written, so a bad limit cannot follow a rename that already committed.
+    if let Some(Some(quota)) = req.quota_bytes
+        && !(craft_cloud_meta::MIN_QUOTA_BYTES..=i64::MAX as u64).contains(&quota)
+    {
+        return Err(ApiError::invalid("quota_bytes is at least one chunk (4194304) and at most 9223372036854775807"));
+    }
     if let Some(quota) = req.quota_bytes {
         if auth.role != Role::Admin {
             // A member learns that this is not theirs to change; anyone else learns nothing about the space.

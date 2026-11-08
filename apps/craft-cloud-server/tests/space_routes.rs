@@ -216,6 +216,7 @@ on_every_backend!(
     an_admin_names_an_owner,
     a_removed_member_ends_a_long_poll,
     the_account_activity_shows_events_about_the_account,
+    review_fixes_of_the_routes_hold,
 );
 
 // ---- scenarios ----
@@ -614,4 +615,60 @@ async fn the_account_activity_shows_events_about_the_account(w: &World) {
     assert!(eve.iter().all(|a| !a.starts_with("space.")), "{eve:?}");
     // The owner sees what she did.
     assert!(page("ana").await.contains(&"space.member_invited".to_owned()));
+}
+
+/// The review of the routes (P1-3): a refused limit leaves the rename undone, the invitation limit's Retry-After is never
+/// short, an invitation to an archived space is not one, an administrator who owns a space acts as one when confirming.
+async fn review_fixes_of_the_routes_hold(w: &World) {
+    let space = w.create("Studio", "ana").await;
+    let other = w.create("Other", "eve").await;
+    let patch = |who: &'static str, body: Value| async move { w.call(who, Method::PATCH, &format!("/spaces/{space}"), Some(body)).await };
+
+    // A name together with a limit that is refused changes neither.
+    assert_eq!(patch("boss", World::confirmed(json!({ "name": "Renamed", "quota_bytes": 5 }))).await.status(), StatusCode::BAD_REQUEST);
+    let listed: AdminSpaceList = w.call("boss", Method::GET, "/admin/spaces?query=studio", None).await.json().await.unwrap();
+    assert_eq!(listed.spaces.len(), 1, "the rename did not commit");
+    assert!(w.events("space.").await.iter().all(|e| e != "space.renamed" && e != "space.quota_changed"));
+    // A name shaped like a space ID is refused (on create and on rename).
+    let id_like = "0194a2d0-1c3e-7b5a-9d41-2f6e8a7b3c10";
+    assert_eq!(patch("ana", json!({ "name": id_like })).await.status(), StatusCode::BAD_REQUEST);
+    let res = w.call("boss", Method::POST, "/admin/spaces", Some(World::confirmed(json!({ "name": id_like, "owner": w.user("ana").id.0 })))).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // The Retry-After of the invitation limit is whole seconds rounded up, at least one.
+    let path = format!("/spaces/{other}/members");
+    for i in 0..30 {
+        w.call("eve", Method::POST, &path, Some(json!({ "username": format!("nobody{i}"), "role": "viewer" }))).await;
+    }
+    let res = w.call("eve", Method::POST, &path, Some(json!({ "username": "ben", "role": "viewer" }))).await;
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    let wait: u64 = res.headers().get("retry-after").unwrap().to_str().unwrap().parse().unwrap();
+    assert!((1..=60).contains(&wait), "{wait}");
+
+    // An invitation to an archived space: neither listed nor accepted nor declined.
+    let invite = w.call("ana", Method::POST, &format!("/spaces/{space}/members"), Some(json!({ "username": "cy", "role": "viewer" }))).await;
+    assert_eq!(invite.status(), StatusCode::OK);
+    let archived = w.call("ana", Method::POST, &format!("/spaces/{space}/archive"), Some(json!({ "password": PASSWORD }))).await;
+    assert_eq!(archived.status(), StatusCode::NO_CONTENT);
+    assert!(w.spaces("cy").await.iter().all(|s| s.id != space));
+    for verb in ["accept", "decline"] {
+        let res = w.call("cy", Method::POST, &format!("/spaces/{space}/{verb}"), None).await;
+        assert_eq!(error(res).await, (StatusCode::NOT_FOUND, "not_found".into()), "{verb}");
+    }
+    // An owner of the archived space is capped at viewer: the change is `read_only`, not `forbidden`.
+    assert_eq!(error(patch("ana", json!({ "name": "Nope" })).await).await, (StatusCode::FORBIDDEN, "read_only".into()));
+    let unarchived = w.call("ana", Method::POST, &format!("/spaces/{space}/unarchive"), Some(json!({ "password": PASSWORD }))).await;
+    assert_eq!(unarchived.status(), StatusCode::NO_CONTENT);
+
+    // An administrator who owns a space and confirms acts as an administrator; without the confirmation, as the owner.
+    let own = w.create("Boss", "boss").await;
+    let own_patch = |body: Value| async move { w.call("boss", Method::PATCH, &format!("/spaces/{own}"), Some(body)).await };
+    assert_eq!(own_patch(json!({ "name": "Boss own" })).await.status(), StatusCode::OK, "an owner renames without a password");
+    assert_eq!(own_patch(World::confirmed(json!({ "name": "Boss other" }))).await.status(), StatusCode::OK);
+    assert_eq!(own_patch(World::confirmed(json!({ "quota_bytes": 8 * MIB }))).await.status(), StatusCode::OK);
+    assert_eq!(
+        error(own_patch(json!({ "quota_bytes": 8 * MIB * 2 })).await).await.0,
+        StatusCode::BAD_REQUEST,
+        "no confirmation: the limit asks for it"
+    );
 }

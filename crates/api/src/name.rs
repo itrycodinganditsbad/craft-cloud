@@ -105,6 +105,9 @@ pub enum SpaceNameError {
     ControlChar { ch: char },
     #[error("the name starts or ends with a space")]
     EdgeSpace,
+    /// A name shaped like a space ID would be taken for one wherever a space is named by ID or by name (the command line).
+    #[error("the name looks like a space ID")]
+    LooksLikeId,
 }
 
 /// A team space's display name: NFC-normalised, 1 to [`MAX_SPACE_NAME_CHARS`] characters, no control characters, and
@@ -130,6 +133,9 @@ impl SpaceName {
         }
         if nfc.starts_with(char::is_whitespace) || nfc.ends_with(char::is_whitespace) {
             return Err(SpaceNameError::EdgeSpace);
+        }
+        if uuid::Uuid::try_parse(&nfc).is_ok() {
+            return Err(SpaceNameError::LooksLikeId);
         }
         Ok(Self(nfc))
     }
@@ -162,6 +168,12 @@ impl From<SpaceName> for String {
     fn from(name: SpaceName) -> Self {
         name.0
     }
+}
+
+/// The caseless form of search text for team space names: trimmed, folded as names are, but not validated as a name (a
+/// search may be a single letter, or text no name could start with).
+pub fn fold_search(text: &str) -> FoldKey {
+    FoldKey(fold(text.trim()))
 }
 
 /// Canonical caseless form: NFD, Unicode full case folding, then NFC.
@@ -290,6 +302,9 @@ mod tests {
         assert_eq!(SpaceName::new(" a"), Err(SpaceNameError::EdgeSpace));
         assert_eq!(SpaceName::new("a "), Err(SpaceNameError::EdgeSpace));
         assert_eq!(SpaceName::new("   "), Err(SpaceNameError::EdgeSpace));
+        // A name shaped like a space ID would be taken for one by `space create` / `space add <space>`.
+        assert_eq!(SpaceName::new("0194a2d0-1c3e-7b5a-9d41-2f6e8a7b3c10"), Err(SpaceNameError::LooksLikeId));
+        assert!(SpaceName::new("0194a2d0-studio").is_ok());
         assert_eq!(SpaceName::new("Straße").unwrap().fold_key(), SpaceName::new("STRASSE").unwrap().fold_key());
     }
 

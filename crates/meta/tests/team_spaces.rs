@@ -106,12 +106,57 @@ on_every_backend!(
     members_come_and_go_with_their_events,
     the_command_line_and_admins_create_and_manage_spaces,
     the_last_owner_stays,
+    review_fixes_of_the_routes_hold,
     concurrent_changes_never_leave_a_space_without_an_owner,
     guarded_writes_check_the_role_in_their_own_transaction,
     concurrent_guarded_uploads_do_not_deadlock,
 );
 
 // ---- helpers ----
+
+/// The review of the routes (P1-3): a role too low inside the transaction is `ReadOnly`, an invitation to an archived space
+/// is no invitation, the command line accepts a pending invitation, and the administrator's search is not a name.
+async fn review_fixes_of_the_routes_hold(db: &Db) {
+    let meta = &db.meta;
+    let (ana, ben, cy) = (user(meta, "ana").await, user(meta, "ben").await, user(meta, "cy").await);
+    let space = team(meta, "Studio", &ana).await;
+    join(meta, space, &ana, &ben, SpaceRole::Editor).await;
+
+    // A role that is too low: an editor and an owner of an archived space (capped at viewer) are `ReadOnly`, not
+    // `Forbidden`; an account with no access at all still learns nothing.
+    assert!(matches!(meta.rename_team_space(&by(&ben), space, &team_name("Other"), NOW + 5).await, Err(MetaError::ReadOnly)));
+    meta.set_space_archived(&by(&ana), space, true, NOW + 6).await.unwrap();
+    assert!(matches!(meta.rename_team_space(&by(&ana), space, &team_name("Other"), NOW + 7).await, Err(MetaError::ReadOnly)));
+    assert!(matches!(meta.rename_team_space(&by(&cy), space, &team_name("Other"), NOW + 7).await, Err(MetaError::NotFound("space"))));
+    meta.set_space_archived(&by(&ana), space, false, NOW + 8).await.unwrap();
+
+    // An invitation to an archived space can be neither accepted nor declined (it is not listed either): no such space.
+    meta.invite_member(&by(&ana), space, cy.id, SpaceRole::Viewer, NOW + 9).await.unwrap();
+    meta.set_space_archived(&by(&ana), space, true, NOW + 10).await.unwrap();
+    assert!(matches!(meta.accept_invitation(cy.id, None, space, NOW + 11).await, Err(MetaError::NotFound("space"))));
+    assert!(matches!(meta.decline_invitation(cy.id, None, space, NOW + 11).await, Err(MetaError::NotFound("space"))));
+    assert_eq!(meta.space_access(cy.id, space).await.unwrap(), None, "nothing was accepted");
+    meta.set_space_archived(&by(&ana), space, false, NOW + 12).await.unwrap();
+
+    // The command line sets a role and accepts a pending invitation in one step (whoever runs it has the files).
+    let pending = meta.list_members(space).await.unwrap().into_iter().find(|m| m.user == cy.id).unwrap();
+    assert!(!pending.accepted());
+    let done = meta.change_member_role(&SpaceActor::Cli, space, cy.id, SpaceRole::Viewer, NOW + 13).await.unwrap();
+    assert!(done.accepted());
+    assert_eq!(meta.space_access(cy.id, space).await.unwrap(), Some(SpaceRole::Viewer));
+    // Again: nothing to change, nothing written.
+    let before = space_events(meta).await.len();
+    meta.change_member_role(&SpaceActor::Cli, space, cy.id, SpaceRole::Viewer, NOW + 14).await.unwrap();
+    assert_eq!(space_events(meta).await.len(), before);
+
+    // The administrator's search is folded text, not a name: one letter and padded text work.
+    assert_eq!(meta.admin_list_spaces(None, Some("  STU "), 10).await.unwrap().spaces.len(), 1);
+    assert_eq!(meta.admin_list_spaces(None, Some("u"), 10).await.unwrap().spaces.len(), 1);
+    assert!(meta.admin_list_spaces(None, Some("0194a2d0-1c3e-7b5a-9d41-2f6e8a7b3c10"), 10).await.unwrap().spaces.is_empty());
+    assert!(matches!(meta.admin_list_spaces(None, Some(&"x".repeat(65)), 10).await, Err(MetaError::Invalid(_))));
+    // A name shaped like a space ID is refused, so a space is never named like another.
+    assert!(SpaceName::new("0194a2d0-1c3e-7b5a-9d41-2f6e8a7b3c10").is_err());
+}
 
 async fn user(meta: &Meta, name: &str) -> UserRecord {
     meta.create_user(name, "$argon2id$stub", Role::Member, NOW).await.unwrap()
@@ -624,10 +669,10 @@ async fn members_come_and_go_with_their_events(db: &Db) {
     assert!(matches!(meta.decline_invitation(ben.id, None, space, NOW + 6).await, Err(MetaError::NotFound("invitation"))));
     assert_eq!(space_events(meta).await.len(), before + 1);
 
-    // An editor may not manage the members.
-    assert!(matches!(meta.invite_member(&by(&ben), space, cy.id, SpaceRole::Viewer, NOW + 7).await, Err(MetaError::Forbidden(_))));
-    assert!(matches!(meta.change_member_role(&by(&ben), space, ben.id, SpaceRole::Owner, NOW + 7).await, Err(MetaError::Forbidden(_))));
-    assert!(matches!(meta.remove_member(&by(&ben), space, ana.id, NOW + 7).await, Err(MetaError::Forbidden(_))));
+    // An editor may not manage the members: a member whose role is too low is `ReadOnly` (403 `read_only`).
+    assert!(matches!(meta.invite_member(&by(&ben), space, cy.id, SpaceRole::Viewer, NOW + 7).await, Err(MetaError::ReadOnly)));
+    assert!(matches!(meta.change_member_role(&by(&ben), space, ben.id, SpaceRole::Owner, NOW + 7).await, Err(MetaError::ReadOnly)));
+    assert!(matches!(meta.remove_member(&by(&ben), space, ana.id, NOW + 7).await, Err(MetaError::ReadOnly)));
 
     // Decline deletes the invitation, and the account can be invited again.
     meta.invite_member(&owner, space, cy.id, SpaceRole::Viewer, NOW + 8).await.unwrap();
@@ -821,7 +866,9 @@ async fn concurrent_changes_never_leave_a_space_without_an_owner(db: &Db) {
         let t2 = tokio::spawn(attempt(m2, actor2, a.id, how, barrier));
         let (r1, r2) = (t1.await.unwrap(), t2.await.unwrap());
         let ok = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
-        let refused = |r: &Result<(), MetaError>| matches!(r, Err(MetaError::LastOwner | MetaError::Forbidden(_) | MetaError::NotFound(_)));
+        let refused = |r: &Result<(), MetaError>| {
+            matches!(r, Err(MetaError::LastOwner | MetaError::Forbidden(_) | MetaError::ReadOnly | MetaError::NotFound(_)))
+        };
         assert!(ok == 1 && (refused(&r1) || refused(&r2)), "round {round} ({how}): {r1:?} / {r2:?}");
         let owners = meta.list_members(space).await.unwrap().into_iter().filter(|m| m.role == SpaceRole::Owner && m.accepted()).count();
         assert_eq!(owners, 1, "round {round} ({how}): {r1:?} / {r2:?}");

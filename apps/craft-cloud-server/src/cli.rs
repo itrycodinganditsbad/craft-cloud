@@ -438,11 +438,12 @@ async fn space_command(meta: &Meta, action: SpaceAction, out: &mut impl Write) -
                 None => {
                     meta.invite_member(&SpaceActor::Cli, space, user.id, role, now_ms()).await?;
                 }
-                // Already in the space: the command sets the role instead (an invitation stays one until the account accepts).
+                // Already in the space: the command sets the role instead, and accepts a pending invitation (whoever runs the
+                // command line has the files).
                 Some(member) => {
                     meta.change_member_role(&SpaceActor::Cli, space, user.id, role, now_ms()).await?;
                     if !member.accepted() {
-                        writeln!(out, "{} was only invited so far", user.username)?;
+                        writeln!(out, "{} had only been invited so far; the invitation is accepted now", user.username)?;
                     }
                 }
             }

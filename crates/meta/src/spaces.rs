@@ -342,7 +342,11 @@ impl Meta {
     /// (never made, withdrawn, declined, or accepted already) is `NotFound("invitation")` and writes nothing.
     pub async fn accept_invitation(&self, user: UserId, device: Option<DeviceId>, space: SpaceId, now_ms: i64) -> Result<SpaceRole, MetaError> {
         let actor = SpaceActor::User { user, device };
-        let (mut w, _) = self.begin_space_change(&actor, space, None, Need::Row).await?;
+        let (mut w, locked) = self.begin_space_change(&actor, space, None, Need::Row).await?;
+        // An archived space is not listed to an invitee (it is read-only for everyone): the answer is the one for no space.
+        if locked.archived {
+            return Err(MetaError::NotFound("space"));
+        }
         let row =
             sqlx::query("UPDATE space_members SET accepted_ms = $1 WHERE space_id = $2 AND user_id = $3 AND accepted_ms IS NULL RETURNING role")
                 .bind(now_ms)
@@ -362,7 +366,10 @@ impl Meta {
     /// nothing; a member who has accepted leaves with [`Meta::leave_space`].
     pub async fn decline_invitation(&self, user: UserId, device: Option<DeviceId>, space: SpaceId, now_ms: i64) -> Result<(), MetaError> {
         let actor = SpaceActor::User { user, device };
-        let (mut w, _) = self.begin_space_change(&actor, space, None, Need::Row).await?;
+        let (mut w, locked) = self.begin_space_change(&actor, space, None, Need::Row).await?;
+        if locked.archived {
+            return Err(MetaError::NotFound("space"));
+        }
         let done = sqlx::query("DELETE FROM space_members WHERE space_id = $1 AND user_id = $2 AND accepted_ms IS NULL")
             .bind(uuid_bytes(space.as_uuid()))
             .bind(uuid_bytes(&user.0))
@@ -377,7 +384,8 @@ impl Meta {
     }
 
     /// Gives a member (or an invitation) another role, and returns the row. The role it has already is no change and
-    /// writes no event. Lowering the last accepted owner is [`MetaError::LastOwner`]. A target without a row is
+    /// writes no event, except that the command line also accepts a pending invitation (whoever runs it has the files, as
+    /// with [`Meta::invite_member`]). Lowering the last accepted owner is [`MetaError::LastOwner`]. A target without a row is
     /// `NotFound("member")`.
     pub async fn change_member_role(
         &self,
@@ -389,14 +397,16 @@ impl Meta {
     ) -> Result<Member, MetaError> {
         let (mut w, _) = self.begin_space_change(actor, space, Some(target), Need::Owner).await?;
         let current = member_row(&mut w, space, target).await?.ok_or(MetaError::NotFound("member"))?;
-        if current.role == role {
+        let accept_now = matches!(actor, SpaceActor::Cli) && !current.accepted();
+        if current.role == role && !accept_now {
             return Ok(current);
         }
-        if current.role == SpaceRole::Owner && current.accepted() {
+        if current.role == SpaceRole::Owner && role != SpaceRole::Owner && current.accepted() {
             keep_an_owner(&mut w, space).await?;
         }
-        sqlx::query("UPDATE space_members SET role = $1 WHERE space_id = $2 AND user_id = $3")
+        sqlx::query("UPDATE space_members SET role = $1, accepted_ms = COALESCE(accepted_ms, $2) WHERE space_id = $3 AND user_id = $4")
             .bind(role.as_str())
+            .bind(accept_now.then_some(now_ms))
             .bind(uuid_bytes(space.as_uuid()))
             .bind(uuid_bytes(&target.0))
             .execute(&mut *w.tx)
@@ -404,7 +414,7 @@ impl Meta {
         let details = AuditDetails { user: Some(target), space_role_from: Some(current.role), space_role_to: Some(role), ..AuditDetails::default() };
         record_in(&mut w.tx, now_ms, event_for(actor, AuditAction::SpaceMemberRoleChanged, space)?.with(details)).await?;
         self.commit_audited(w, now_ms).await?;
-        Ok(Member { role, ..current })
+        Ok(Member { role, accepted_ms: current.accepted_ms.or(accept_now.then_some(now_ms)), ..current })
     }
 
     /// Removes a member, or withdraws an invitation. Nothing in the space is deleted. Removing the last accepted owner is
@@ -619,8 +629,10 @@ impl Meta {
     pub async fn admin_list_spaces(&self, after: Option<&str>, search: Option<&str>, limit: u32) -> Result<SpacePage, MetaError> {
         let pattern = match search.filter(|s| !s.is_empty()) {
             Some(text) => {
-                let name = SpaceName::new(text).map_err(|_| MetaError::Invalid("the search is not text a space's name can have"))?;
-                format!("%{}%", escape_like(name.fold_key().as_str()))
+                if text.len() > crate::MAX_SEARCH_BYTES {
+                    return Err(MetaError::Invalid("the search is too long"));
+                }
+                format!("%{}%", escape_like(craft_cloud_proto::fold_search(text).as_str()))
             }
             None => "%".to_owned(),
         };
@@ -762,7 +774,7 @@ impl Meta {
                     let role = member.filter(Member::accepted).map(|member| if capped { member.role.min(SpaceRole::Viewer) } else { member.role });
                     match role {
                         Some(SpaceRole::Owner) => {}
-                        Some(_) => return Err(MetaError::Forbidden("only an owner of the space may do this")),
+                        Some(_) => return Err(MetaError::ReadOnly),
                         None => return Err(MetaError::NotFound("space")),
                     }
                 }
