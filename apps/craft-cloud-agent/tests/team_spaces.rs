@@ -1421,3 +1421,74 @@ async fn a_folder_link_pointed_at_another_folder_while_syncing_deletes_nothing()
     assert_eq!(names(&ana_folder).len(), 7, "nothing was deleted on the server: {:?}", names(&ana_folder));
     assert_eq!(names(&a).len(), 6, "the old folder is left as it is");
 }
+
+/// A file that can't be deleted while this lives: held open without delete sharing (Windows), or in a read-only folder (Unix).
+struct Held {
+    _file: std::fs::File,
+    #[cfg(unix)]
+    dir: PathBuf,
+}
+
+impl Held {
+    fn new(path: &Path) -> Self {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Share read and write, not delete.
+            Self { _file: std::fs::OpenOptions::new().read(true).share_mode(1 | 2).open(path).unwrap() }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = path.parent().unwrap().to_owned();
+            let file = std::fs::File::open(path).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            Self { _file: file, dir }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// Item 4: turning a space off when its saved state can't be removed (something holds the file) is not acknowledged as done:
+/// the call fails with the error. The setting's generation was raised and saved first, so the state that survived is never
+/// trusted again: after a restart, files deleted here meanwhile are not deleted on the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_state_that_cannot_be_removed_fails_the_turn_off_and_is_never_trusted_again() {
+    let mut t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    let (ana_folder, a) = both_syncing(&t).await;
+    for i in 0..6 {
+        write(&ana_folder, &format!("f{i}.txt"), &format!("content {i}"));
+    }
+    eventually("ben has the files", || async { names(&a).len() == 6 }).await;
+    eventually("nothing runs", || async { t.ben.status().await.spaces.iter().all(|s| s.run_state == SpaceRun::Idle) }).await;
+    let state_path = t.ben.data.path().join("spaces").join(space.to_string()).join("state.json");
+    assert!(state_path.is_file());
+
+    let held = Held::new(&state_path);
+    let off = t.ben.api(move |c| c.set_space_sync(space, &SpaceSyncRequest { on: false, folder: None, adopt: false })).await;
+    assert!(off.is_err(), "the state could not be removed: the turn-off is not acknowledged: {off:?}");
+    assert!(state_path.is_file(), "the state survived");
+    let account = t.ben.data.load_account().unwrap().unwrap();
+    assert_eq!(account.spaces.iter().find(|s| s.space == space).map(|s| s.generation), Some(1), "the generation was raised and saved");
+
+    // The agent stops while the file is still held (nothing replaces it), then files are deleted here.
+    let (exit, out) = t.ben.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    drop(held);
+    assert!(state_path.is_file(), "the old state is still there");
+    for i in 0..3 {
+        std::fs::remove_file(a.join(format!("f{i}.txt"))).unwrap();
+    }
+    t.ben.run();
+    eventually("the files deleted here come back from the server", || async { names(&a).len() == 6 }).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(names(&ana_folder).len(), 6, "nothing was deleted on the server: {:?}", names(&ana_folder));
+}

@@ -191,6 +191,7 @@ pub fn reconcile(settings: &[SpaceSetting], listed: &[SpaceListItem], shared: Op
                 sync: false,
                 name: Some(name),
                 root: item.root,
+                generation: 0,
             });
         }
     }
@@ -311,7 +312,7 @@ enum ToThread {
     Close {
         space: SpaceId,
         forget: bool,
-        ack: Option<oneshot::Sender<()>>,
+        ack: Option<oneshot::Sender<Result<(), String>>>,
     },
 }
 
@@ -338,8 +339,18 @@ enum Ev {
     /// A discovery ended.
     Listed(Looked),
     Pass(Box<Done>),
-    /// The wait for a space's session to close ended (`true`: it is closed), for the change asked under this number.
-    Closed(u64, bool),
+    /// The wait for a space's session to close ended, for the change asked under this number.
+    Closed(u64, Closure),
+}
+
+/// How the wait for a space's session to close ended.
+enum Closure {
+    /// The session is closed (and the state forgotten if that was asked).
+    Closed,
+    /// The pass thread did not let go within [`CLOSE_WAIT`].
+    TimedOut,
+    /// The session is closed but its saved state could not be removed.
+    NotForgotten(String),
 }
 
 /// The runnings of the sync ([`Active::run`]) that are current: a queued pass of any other is not started.
@@ -366,11 +377,12 @@ fn pass_thread(
         let job = match job {
             ToThread::Close { space, forget, ack } => {
                 sessions.retain(|(id, _)| *id != space);
-                if forget && let Err(e) = data.space_dir(space).remove_state() {
+                let forgotten = if forget { data.space_dir(space).remove_state().map_err(|e| e.to_string()) } else { Ok(()) };
+                if let Err(e) = &forgotten {
                     crate::runlog::note(format_args!("can't forget the saved state of team space {space}: {e}"));
                 }
                 if let Some(ack) = ack {
-                    let _ = ack.send(());
+                    let _ = ack.send(forgotten);
                 }
                 continue;
             }
@@ -429,9 +441,12 @@ fn pass_thread(
             sessions.retain(|(id, _)| *id != space);
         }
         let session = sessions.iter().find(|(id, _)| *id == space).map(|(_, s)| s);
-        let last_pass = session
-            .and_then(Session::last_pass)
-            .or_else(|| data.space_dir(space).load_state_for(space, &job.setting.folder, job.joined_ms).ok().and_then(|(s, _)| s.last_pass));
+        let last_pass = session.and_then(Session::last_pass).or_else(|| {
+            data.space_dir(space)
+                .load_state_for(space, &job.setting.folder, job.joined_ms, job.setting.generation)
+                .ok()
+                .and_then(|(s, _)| s.last_pass)
+        });
         let seq = session.filter(|s| s.state().space.is_some()).map(|s| s.state().seq);
         let recheck_in = session.and_then(Session::recheck_in);
         if events.send(Ev::Pass(Box::new(Done { space, run: job.run, result, last_pass, seq, recheck_in }))).is_err() {
@@ -1091,6 +1106,9 @@ impl Manager {
         // Access was just lost: the saved state goes, once the session is closed, so that if access comes back the folder
         // is merged with the space afresh (what was deleted on either side meanwhile is not deleted on the other).
         let newly_lost = lost && !team.lost;
+        if newly_lost && let Err(e) = self.raise_generation(space) {
+            crate::runlog::note(format_args!("can't remember that team space {space} was lost: {e}"));
+        }
         let timing = self.options.timing;
         let (options, events, now, paused) = (self.options, self.events_tx.clone(), self.now(), self.paused);
         let (data, account, live) = (self.data.clone(), self.account.clone(), self.live.clone());
@@ -1146,10 +1164,17 @@ impl Manager {
     }
 
     /// The wait for a session to close ended: the change that waited for it is applied and its caller answered.
-    fn closed(&mut self, id: u64, closed: bool) {
+    fn closed(&mut self, id: u64, closure: Closure) {
         let Some(index) = self.pending.iter().position(|p| p.id == id) else { return };
         let Pending { space, request, reply, .. } = self.pending.remove(index);
-        let answer = match self.apply_sync(space, &request, Some(closed)) {
+        // A state that could not be removed is not acknowledged as gone: the change fails, with the error. (The generation
+        // was raised and saved before, so that state is not used again either way.)
+        if let Closure::NotForgotten(why) = &closure {
+            self.settled();
+            let _ = reply.send(Err(AgentError::Usage(format!("the saved state of this space could not be removed: {why}"))));
+            return;
+        }
+        let answer = match self.apply_sync(space, &request, Some(matches!(closure, Closure::Closed))) {
             Ok(Applied::Done(info)) => Ok(*info),
             Ok(Applied::NeedsClose { .. }) => Err(AgentError::Usage("the space's session could not be closed; try again in a moment".into())),
             Err(e) => Err(e),
@@ -1177,6 +1202,10 @@ impl Manager {
             // in this folder or another, the space starts afresh as a first sync, so what was deleted here or on the server
             // while it was off is not deleted on the other side.
             if closed.is_none() {
+                // The old state is made unusable before it is removed: a generation raised and saved first, so a state that
+                // survives its removal (a file that can't be deleted, a crash in between) is not trusted when the space is
+                // turned on again.
+                self.raise_generation(space)?;
                 return Ok(Applied::NeedsClose { forget: true });
             }
             if let Some(setting) = self.account.spaces.get_mut(index) {
@@ -1215,7 +1244,8 @@ impl Manager {
                 }
             }
             set_up_folder(&self.data, &folder, space, root, request.adopt)?;
-            let setting = SpaceSetting { space, folder, sync: true, name: item.name.clone(), root: Some(root) };
+            let generation = known.and_then(|i| self.account.spaces.get(i)).map_or(0, |s| s.generation);
+            let setting = SpaceSetting { space, folder, sync: true, name: item.name.clone(), root: Some(root), generation };
             match known {
                 Some(index) => {
                     if let Some(slot) = self.account.spaces.get_mut(index) {
@@ -1230,6 +1260,15 @@ impl Manager {
         self.info_of(space).map(|info| Applied::Done(Box::new(info))).ok_or_else(not_found)
     }
 
+    /// Raises the generation of the space's setting and saves it, so a state made under the old one is not used again.
+    fn raise_generation(&mut self, space: SpaceId) -> Result<(), AgentError> {
+        if let Some(setting) = self.account.spaces.iter_mut().find(|s| s.space == space) {
+            setting.generation = setting.generation.saturating_add(1);
+            self.data.save_account(&self.account)?;
+        }
+        Ok(())
+    }
+
     /// Stops the space's sync here and asks the pass thread to close its session (a pass that was running has ended and
     /// nothing of the space writes its state any more once it is closed). The task is told by [`Ev::Closed`], `false` if
     /// that didn't happen within [`CLOSE_WAIT`].
@@ -1240,13 +1279,17 @@ impl Manager {
         let (ack, closed) = oneshot::channel();
         let events = self.events_tx.clone();
         if self.jobs.send(ToThread::Close { space, forget, ack: Some(ack) }).is_err() {
-            let _ = events.send(Ev::Closed(id, true));
+            let _ = events.send(Ev::Closed(id, Closure::Closed));
             return;
         }
         tokio::spawn(async move {
             // A thread that has ended drops the acknowledgement: nothing runs then either.
-            let in_time = tokio::time::timeout(CLOSE_WAIT, closed).await.is_ok();
-            let _ = events.send(Ev::Closed(id, in_time));
+            let closure = match tokio::time::timeout(CLOSE_WAIT, closed).await {
+                Ok(Ok(Err(why))) => Closure::NotForgotten(why),
+                Ok(_) => Closure::Closed,
+                Err(_) => Closure::TimedOut,
+            };
+            let _ = events.send(Ev::Closed(id, closure));
         });
     }
 
@@ -1352,7 +1395,7 @@ impl Manager {
 
 /// The last pass summary a team space's own `state.json` holds, if that state is for the space's folder.
 fn active_summary(state_dir: &DataDir, setting: &SpaceSetting) -> Option<PassSummary> {
-    state_dir.load_state_for(setting.space, &setting.folder, None).ok().and_then(|(s, _)| s.last_pass).and_then(|l| l.summary)
+    state_dir.load_state_for(setting.space, &setting.folder, None, setting.generation).ok().and_then(|(s, _)| s.last_pass).and_then(|l| l.summary)
 }
 
 /// The parts of a synced team space: scheduler, folder watcher, long-poll.
@@ -1373,7 +1416,7 @@ fn start_active(
     let transport = HttpTransport::new(account.server.clone(), &account.token).and_then(|t| t.bound_to(space)).ok()?;
     let since = data
         .space_dir(space)
-        .load_state_for(space, &setting.folder, joined_ms)
+        .load_state_for(space, &setting.folder, joined_ms, setting.generation)
         .ok()
         .and_then(|(saved, _)| saved.state.space.map(|_| saved.state.seq));
     let (since_tx, _) = watch::channel(since);

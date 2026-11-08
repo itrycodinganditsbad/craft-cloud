@@ -1665,7 +1665,7 @@ pub(crate) fn approve_team(
     out: &mut impl Write,
 ) -> Result<(Exit, PassSummary, bool), AgentError> {
     let state = data.space_dir(setting.space);
-    let (saved, set_aside) = state.load_state_for(setting.space, &setting.folder, None)?;
+    let (saved, set_aside) = state.load_state_for(setting.space, &setting.folder, None, setting.generation)?;
     if set_aside || saved.state.space.is_none() {
         say!(out, "nothing was waiting for approval")?;
         return Ok((Exit::Done, PassSummary::default(), false));
@@ -1695,6 +1695,8 @@ pub struct Session {
     /// The server's stamp of the account's membership of a team space that `state.json` records (see
     /// [`SavedState::joined_ms`]); `None` for the personal space.
     joined_ms: Option<i64>,
+    /// The generation of the space's setting that `state.json` is made under (see [`crate::account::SpaceSetting::generation`]).
+    generation: u64,
     /// The stability window's looks, shared with the `run` loop (`None`: a one-off `sync` trusts every file).
     stability: Option<Stability>,
     /// When the earliest look at a file still changing is due, after the last pass (if it finished).
@@ -1713,7 +1715,7 @@ impl Session {
             data.clean_tmp()?;
         }
         let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
-        Self::open_in(data, data, account, false, None, stability)
+        Self::open_in(data, data, account, false, (None, 0), stability)
     }
 
     /// Opens a team space's folder for passes: as [`Session::open`], with the space's own state in `spaces/<id>/`, its
@@ -1734,7 +1736,7 @@ impl Session {
         state.create()?;
         state.clean_tmp()?;
         let team = Account { folder: setting.folder.clone(), space: setting.space, root, spaces: Vec::new(), ..account.clone() };
-        Self::open_in(data, &state, team, true, joined_ms, stability)
+        Self::open_in(data, &state, team, true, (joined_ms, setting.generation), stability)
     }
 
     fn open_in(
@@ -1742,7 +1744,7 @@ impl Session {
         data: &DataDir,
         account: Account,
         bound: bool,
-        joined_ms: Option<i64>,
+        (joined_ms, generation): (Option<i64>, u64),
         stability: Option<Stability>,
     ) -> Result<Self, AgentError> {
         check_apart(root_data, &account.folder)?;
@@ -1751,10 +1753,10 @@ impl Session {
         // A team space's state is used only for the folder it was made for; otherwise the folder starts afresh (a first sync:
         // what is there and what the server has are merged, and nothing is deleted on either side).
         let (mut saved, set_aside) =
-            if bound { data.load_state_for(account.space, &account.folder, joined_ms)? } else { (data.load_state()?, false) };
+            if bound { data.load_state_for(account.space, &account.folder, joined_ms, generation)? } else { (data.load_state()?, false) };
         if set_aside {
             crate::runlog::note(format_args!(
-                "the saved state of team space {} was made for another folder: starting afresh, nothing is deleted",
+                "the saved state of team space {} was made for another folder, membership or generation: starting afresh, nothing is deleted",
                 account.space
             ));
         }
@@ -1782,8 +1784,15 @@ impl Session {
         let (checkpoint_data, checkpoint_last, checkpoint_folder) = (data.clone(), last_pass.clone(), state_folder.clone());
         engine.on_checkpoint(move |state| {
             let last_pass = checkpoint_last.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-            let saved =
-                SavedState { schema: STATE_SCHEMA, state: state.clone(), last_pass, paused: false, folder: checkpoint_folder.clone(), joined_ms };
+            let saved = SavedState {
+                schema: STATE_SCHEMA,
+                state: state.clone(),
+                last_pass,
+                paused: false,
+                folder: checkpoint_folder.clone(),
+                joined_ms,
+                generation,
+            };
             checkpoint_data.save_state(&saved).map_err(|e| std::io::Error::other(e.to_string()))
         });
         let opened_on = bound.then(|| crate::disk::folder_identity(&account.folder)).flatten();
@@ -1798,6 +1807,7 @@ impl Session {
             opened_on,
             state_folder,
             joined_ms,
+            generation,
             stability,
             recheck_in: None,
         })
@@ -1907,6 +1917,7 @@ impl Session {
             paused: false,
             folder: self.state_folder.clone(),
             joined_ms: self.joined_ms,
+            generation: self.generation,
         };
         self.data.save_state(&saved)?;
         result?;
@@ -2227,6 +2238,7 @@ mod tests {
             sync: true,
             name: Some(name.into()),
             root: None,
+            generation: 0,
         };
         let (studio, plans, twin) = (setting("Studio"), setting("Plans"), setting("plans"));
         let spaces = vec![studio.clone(), plans.clone()];
