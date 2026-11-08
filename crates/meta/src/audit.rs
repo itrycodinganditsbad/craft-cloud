@@ -19,7 +19,8 @@
 //!   [`Meta::audit_prune`], which deletes events older than the retention in batches of their own, never inside the
 //!   transaction of a security change. A test reads this crate's sources and allows exactly those two statements.
 
-use craft_cloud_proto::DeviceId;
+use craft_cloud_proto::api::SpaceRole;
+use craft_cloud_proto::{DeviceId, SpaceId};
 use serde_json::{Map, Value};
 use sqlx::Row;
 use uuid::Uuid;
@@ -81,11 +82,24 @@ pub enum AuditAction {
     CliDeviceRevoked,
     CliDevicesRevokedAll,
     CliUserRemoved,
+    SpaceCreated,
+    SpaceRenamed,
+    SpaceArchived,
+    SpaceUnarchived,
+    SpaceQuotaChanged,
+    SpaceMemberInvited,
+    SpaceMemberJoined,
+    SpaceMemberDeclined,
+    SpaceMemberRoleChanged,
+    SpaceMemberRemoved,
+    SpaceMemberLeft,
+    CliSpaceCreated,
+    CliSpaceMemberChanged,
 }
 
 impl AuditAction {
     /// Every action, in the order the documentation lists them.
-    pub const ALL: [AuditAction; 30] = [
+    pub const ALL: [AuditAction; 43] = [
         AuditAction::AuthLogin,
         AuditAction::AuthLoginFailed,
         AuditAction::AuthSecondFactorFailed,
@@ -116,6 +130,19 @@ impl AuditAction {
         AuditAction::CliDeviceRevoked,
         AuditAction::CliDevicesRevokedAll,
         AuditAction::CliUserRemoved,
+        AuditAction::SpaceCreated,
+        AuditAction::SpaceRenamed,
+        AuditAction::SpaceArchived,
+        AuditAction::SpaceUnarchived,
+        AuditAction::SpaceQuotaChanged,
+        AuditAction::SpaceMemberInvited,
+        AuditAction::SpaceMemberJoined,
+        AuditAction::SpaceMemberDeclined,
+        AuditAction::SpaceMemberRoleChanged,
+        AuditAction::SpaceMemberRemoved,
+        AuditAction::SpaceMemberLeft,
+        AuditAction::CliSpaceCreated,
+        AuditAction::CliSpaceMemberChanged,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -150,6 +177,19 @@ impl AuditAction {
             AuditAction::CliDeviceRevoked => "cli.device_revoked",
             AuditAction::CliDevicesRevokedAll => "cli.devices_revoked_all",
             AuditAction::CliUserRemoved => "cli.user_removed",
+            AuditAction::SpaceCreated => "space.created",
+            AuditAction::SpaceRenamed => "space.renamed",
+            AuditAction::SpaceArchived => "space.archived",
+            AuditAction::SpaceUnarchived => "space.unarchived",
+            AuditAction::SpaceQuotaChanged => "space.quota_changed",
+            AuditAction::SpaceMemberInvited => "space.member_invited",
+            AuditAction::SpaceMemberJoined => "space.member_joined",
+            AuditAction::SpaceMemberDeclined => "space.member_declined",
+            AuditAction::SpaceMemberRoleChanged => "space.member_role_changed",
+            AuditAction::SpaceMemberRemoved => "space.member_removed",
+            AuditAction::SpaceMemberLeft => "space.member_left",
+            AuditAction::CliSpaceCreated => "cli.space_created",
+            AuditAction::CliSpaceMemberChanged => "cli.space_member_changed",
         }
     }
 
@@ -190,6 +230,12 @@ impl AuditAction {
             | AuditAction::AdminPasswordResetIssued
             | AuditAction::AdminTwoFactorReset => &[],
             AuditAction::AuthTwoFactorLocked => &[ClientKind],
+            AuditAction::SpaceCreated | AuditAction::CliSpaceCreated => &[User, QuotaBytes],
+            AuditAction::SpaceRenamed | AuditAction::SpaceArchived | AuditAction::SpaceUnarchived | AuditAction::SpaceMemberLeft => &[],
+            AuditAction::SpaceQuotaChanged => &[QuotaBytes],
+            AuditAction::SpaceMemberInvited => &[User, SpaceRoleTo],
+            AuditAction::SpaceMemberJoined | AuditAction::SpaceMemberDeclined | AuditAction::SpaceMemberRemoved => &[User],
+            AuditAction::SpaceMemberRoleChanged | AuditAction::CliSpaceMemberChanged => &[User, SpaceRoleFrom, SpaceRoleTo],
         }
     }
 }
@@ -208,6 +254,11 @@ pub enum Field {
     Device,
     /// A reset code redeemed for an account that had two-factor sign-in turned it off.
     TwoFactorRemoved,
+    /// The account a team space event is about.
+    User,
+    /// A role in a team space, written as `role_from` / `role_to` like an account's server role.
+    SpaceRoleFrom,
+    SpaceRoleTo,
 }
 
 /// The platforms an event names. A device may call its platform any printable text; only these reach the log.
@@ -308,6 +359,10 @@ pub struct AuditDetails {
     pub device: Option<DeviceId>,
     /// Redeeming a reset code also took the account's two-factor sign-in away (only ever set to `true`).
     pub two_factor_removed: bool,
+    /// The account a team space event is about (the member, or the first owner).
+    pub user: Option<UserId>,
+    pub space_role_from: Option<SpaceRole>,
+    pub space_role_to: Option<SpaceRole>,
 }
 
 impl AuditDetails {
@@ -345,6 +400,9 @@ impl AuditDetails {
             Field::Revoked => self.revoked.map(Value::from),
             Field::Device => self.device.map(|v| Value::from(v.to_string())),
             Field::TwoFactorRemoved => self.two_factor_removed.then_some(Value::Bool(true)),
+            Field::User => self.user.map(|v| Value::from(v.0.to_string())),
+            Field::SpaceRoleFrom => self.space_role_from.map(|v| Value::from(v.as_str())),
+            Field::SpaceRoleTo => self.space_role_to.map(|v| Value::from(v.as_str())),
         }
     }
 
@@ -360,6 +418,9 @@ impl AuditDetails {
             Field::Revoked => "revoked",
             Field::Device => "device",
             Field::TwoFactorRemoved => "two_factor_removed",
+            Field::User => "user",
+            Field::SpaceRoleFrom => "role_from",
+            Field::SpaceRoleTo => "role_to",
         }
     }
 
@@ -423,6 +484,7 @@ impl AuditOutcome {
 pub enum TargetKind {
     User,
     Device,
+    Space,
 }
 
 impl TargetKind {
@@ -430,6 +492,7 @@ impl TargetKind {
         match self {
             TargetKind::User => "user",
             TargetKind::Device => "device",
+            TargetKind::Space => "space",
         }
     }
 }
@@ -468,6 +531,11 @@ impl NewEvent {
 
     pub fn on_user(mut self, user: UserId) -> Self {
         self.target = Some((TargetKind::User, user.0));
+        self
+    }
+
+    pub fn on_space(mut self, space: SpaceId) -> Self {
+        self.target = Some((TargetKind::Space, *space.as_uuid()));
         self
     }
 
@@ -619,7 +687,7 @@ pub struct AuditEvent {
     pub actor_user: Option<UserId>,
     pub actor_device: Option<DeviceId>,
     pub action: AuditAction,
-    /// `user`, `device`, or empty.
+    /// `user`, `device`, `space`, or empty.
     pub target_kind: String,
     pub target_id: Option<Uuid>,
     pub outcome: AuditOutcome,
@@ -876,7 +944,7 @@ mod tests {
             assert_eq!(AuditAction::parse(action.as_str()), Some(action));
             assert!(action.as_str().bytes().all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'.'));
         }
-        assert_eq!(seen.len(), 30);
+        assert_eq!(seen.len(), 43);
         assert_eq!(AuditAction::parse("auth.login "), None);
         assert_eq!(AuditAction::parse("AUTH.LOGIN"), None);
     }
@@ -924,6 +992,9 @@ mod tests {
             revoked: Some(3),
             device: Some(DeviceId::from_uuid(Uuid::nil())),
             two_factor_removed: true,
+            user: Some(UserId(Uuid::nil())),
+            space_role_from: Some(SpaceRole::Viewer),
+            space_role_to: Some(SpaceRole::Owner),
         };
         let keys = |action: AuditAction| -> Vec<String> {
             let value: Value = serde_json::from_str(&all.to_json(action)).unwrap();
@@ -940,6 +1011,12 @@ mod tests {
         assert_eq!(keys(AuditAction::CliDeviceRevoked), ["device", "reason"]);
         assert_eq!(keys(AuditAction::JoinResetRedeemed), ["client_kind", "platform", "revoked", "two_factor_removed"]);
         assert_eq!(keys(AuditAction::AccountTwoFactorEnabled), Vec::<String>::new());
+        assert_eq!(keys(AuditAction::SpaceCreated), ["quota_bytes", "user"]);
+        assert_eq!(keys(AuditAction::SpaceMemberInvited), ["role_to", "user"]);
+        assert_eq!(keys(AuditAction::SpaceMemberRoleChanged), ["role_from", "role_to", "user"]);
+        assert_eq!(keys(AuditAction::CliSpaceMemberChanged), ["role_from", "role_to", "user"]);
+        assert_eq!(keys(AuditAction::SpaceMemberRemoved), ["user"]);
+        assert_eq!(keys(AuditAction::SpaceRenamed), Vec::<String>::new());
         assert_eq!(all.to_json(AuditAction::AdminQuotaChanged), r#"{"quota_bytes":null}"#);
         assert_eq!(AuditDetails::revoked(2).to_json(AuditAction::AdminUserDisabled), r#"{"revoked":2}"#);
         assert_eq!(AuditDetails::default().to_json(AuditAction::AdminInviteIssued), "{}");

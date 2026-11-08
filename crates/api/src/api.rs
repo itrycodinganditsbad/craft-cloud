@@ -46,6 +46,8 @@ pub mod codes {
     pub const ACCOUNT_DISABLED: &str = "account_disabled";
     /// An admin change would leave the server without an enabled administrator (HTTP 409).
     pub const LAST_ADMIN: &str = "last_admin";
+    /// A change to a team space's members would leave it without an owner (HTTP 409).
+    pub const LAST_OWNER: &str = "last_owner";
     /// A password sign-in (or the redeeming of an invite or reset code for an account with two-factor sign-in) was
     /// right, but needs a second factor (HTTP 401, no token). The answer's `two_factor` carries the challenge.
     pub const TWO_FACTOR_REQUIRED: &str = "two_factor_required";
@@ -482,7 +484,7 @@ pub struct AuditDetails {
     /// How far a failed sign-in got: `password`, `totp`, `recovery` or `challenge_expired`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<String>,
-    /// `admin` or `member`.
+    /// `admin` or `member` for an account's role, `viewer`, `editor` or `owner` for a role in a team space.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -499,6 +501,9 @@ pub struct AuditDetails {
     /// Set (to `true`) when redeeming a password reset code also turned the account's two-factor sign-in off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub two_factor_removed: Option<bool>,
+    /// The account a team space event is about (the invited, changed or removed member, or the first owner).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<Uuid>,
     /// Set when the values were too long for the log and whole fields were left out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
@@ -547,9 +552,44 @@ pub struct AuditExportEnd {
     pub exported: u64,
 }
 
+/// What an account may do in a team space, from least to most: a viewer reads, an editor also writes, an owner also
+/// manages the members. The order is the permission order, so `role >= SpaceRole::Editor` reads as "may write".
+/// A personal space's owner has `Owner` in it implicitly. The words are the ones the `space_members` table and the
+/// API use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpaceRole {
+    Viewer,
+    Editor,
+    Owner,
+}
+
+impl SpaceRole {
+    /// Every role, least permission first.
+    pub const ALL: [SpaceRole; 3] = [SpaceRole::Viewer, SpaceRole::Editor, SpaceRole::Owner];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpaceRole::Viewer => "viewer",
+            SpaceRole::Editor => "editor",
+            SpaceRole::Owner => "owner",
+        }
+    }
+
+    /// The role with this exact word.
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|role| role.as_str() == word)
+    }
+
+    /// Whether the role may change files (commit, restore, upload).
+    pub fn may_write(self) -> bool {
+        self >= SpaceRole::Editor
+    }
+}
+
 /// The names of the security events, the closed list the server writes and `GET /admin/audit` filters by (`docs/design/sync.md`,
 /// "Security audit log"). A filter is one of these, or a prefix of some of them that ends in a dot, like `auth.`.
-pub const AUDIT_ACTIONS: [&str; 30] = [
+pub const AUDIT_ACTIONS: [&str; 43] = [
     "auth.login",
     "auth.login_failed",
     "auth.second_factor_failed",
@@ -580,6 +620,19 @@ pub const AUDIT_ACTIONS: [&str; 30] = [
     "cli.device_revoked",
     "cli.devices_revoked_all",
     "cli.user_removed",
+    "space.created",
+    "space.renamed",
+    "space.archived",
+    "space.unarchived",
+    "space.quota_changed",
+    "space.member_invited",
+    "space.member_joined",
+    "space.member_declined",
+    "space.member_role_changed",
+    "space.member_removed",
+    "space.member_left",
+    "cli.space_created",
+    "cli.space_member_changed",
 ];
 
 /// Whether `text` is an audit filter the server takes for `action`: an event name, or a prefix ending in a dot that at least
@@ -610,6 +663,7 @@ mod tests {
         assert_eq!(codes::FORBIDDEN, "forbidden");
         assert_eq!(codes::ACCOUNT_DISABLED, "account_disabled");
         assert_eq!(codes::LAST_ADMIN, "last_admin");
+        assert_eq!(codes::LAST_OWNER, "last_owner");
     }
 
     #[test]
@@ -698,10 +752,23 @@ mod tests {
     }
 
     #[test]
+    fn space_roles_are_ordered_by_permission_and_keep_their_words() {
+        assert!(SpaceRole::Viewer < SpaceRole::Editor && SpaceRole::Editor < SpaceRole::Owner);
+        assert!(!SpaceRole::Viewer.may_write() && SpaceRole::Editor.may_write() && SpaceRole::Owner.may_write());
+        for role in SpaceRole::ALL {
+            assert_eq!(SpaceRole::parse(role.as_str()), Some(role));
+            assert_eq!(serde_json::to_string(&role).unwrap(), format!("\"{}\"", role.as_str()));
+        }
+        for bad in ["", "Viewer", "admin", "owner "] {
+            assert_eq!(SpaceRole::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
     fn audit_filters_are_the_closed_list_or_a_prefix_of_it() {
-        assert_eq!(AUDIT_ACTIONS.len(), 30);
+        assert_eq!(AUDIT_ACTIONS.len(), 43);
         assert!(AUDIT_ACTIONS.iter().all(|a| valid_audit_action(a)));
-        for prefix in ["auth.", "admin.", "cli.", "join.", "device.", "account."] {
+        for prefix in ["auth.", "admin.", "cli.", "join.", "device.", "account.", "space."] {
             assert!(valid_audit_action(prefix), "{prefix}");
         }
         for bad in ["", "auth", "auth.log", "nope.", "AUTH.", "auth.login ", "admin.user_created.", "x' OR 1=1 --", "a.b."] {

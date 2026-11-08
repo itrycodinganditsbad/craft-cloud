@@ -292,8 +292,9 @@ who can write to the database can change it; keep the database file and Postgres
 
 This release adds migrations (`0007`, device sessions, `0008`, the admin API: reset codes, per-account quotas, the
 removal mark, `0009`, the audit log, `0010`, two-factor sign-in: the secrets, recovery codes and sign-in challenges,
-`0011`, the admin pages' browser sessions, `0012`, the history index, `0013`, the trash, and `0014`, the manifest reference
-index). The server applies them when it starts. A database it
+`0011`, the admin pages' browser sessions, `0012`, the history index, `0013`, the trash, `0014`, the manifest reference
+index, and `0015`, team spaces: the kind, name and archive mark of a space, and its members; on SQLite it rebuilds the `spaces` table
+in one transaction with a foreign-key check). The server applies them when it starts. A database it
 has migrated cannot be opened by an older server: that one refuses to start ("the database was created by a newer Craft
 Cloud"). Rolling back therefore means restoring a backup taken before the upgrade, so take one first. Upgrade the
 server first: agents and apps keep working unchanged, **except that an account that turns on two-factor sign-in can't sign in

@@ -666,10 +666,15 @@ changes locally, then pushes local changes. These rules came out of the simulati
   `admin.user_removed`, `admin.role_changed`, `admin.quota_changed`, `admin.invite_issued`, `admin.invite_revoked`,
   `admin.password_reset_issued`, `admin.two_factor_reset`, `admin.device_revoked`, `join.invite_redeemed`,
   `join.reset_redeemed`, `join.pairing_redeemed`, `cli.password_reset`, `cli.two_factor_reset`, `cli.device_revoked`,
-  `cli.devices_revoked_all` and `cli.user_removed`. A name whose change does not exist yet (`user remove`) is listed so
-  the vocabulary a client filters by does not change; its writer arrives with that change.
+  `cli.devices_revoked_all`, `cli.user_removed`, and the team space events (`target_kind = space`, the space's ID as
+  `target_id`): `space.created`, `space.renamed`, `space.archived`, `space.unarchived`, `space.quota_changed`,
+  `space.member_invited`, `space.member_joined`, `space.member_declined`, `space.member_role_changed`,
+  `space.member_removed`, `space.member_left`, `cli.space_created` and `cli.space_member_changed`
+  (see the collaboration design). A name whose change does not exist yet (`user remove`, the renaming,
+  archiving and quota changes of a space) is listed so the vocabulary a client filters by does not change; its writer
+  arrives with that change.
   - **Rows.** `id` (UUIDv7), `at_ms`, `actor_user` and `actor_device` (`NULL` for the command line, and for a sign-in that
-    failed: nobody proved who they were), `action`, `target_kind` (`user`, `device` or empty) and `target_id`, `outcome`
+    failed: nobody proved who they were), `action`, `target_kind` (`user`, `device`, `space` or empty) and `target_id`, `outcome`
     (`success`, or `failure` for a failed sign-in), `details`, and for aggregated rows `agg_key` and `agg_count` (the API
     calls it `count`). There are no foreign keys: an event keeps the ID of an account that was removed, and the name is
     gone because it was never stored.
@@ -689,7 +694,7 @@ changes locally, then pushes local changes. These rules came out of the simulati
   - **`details` is typed.** Each event has its own few fields, each a closed list of words or a number: `client_kind`
     (`agent`, `desktop`, `cli`, `web`) and `platform` (`windows`, `macos`, `linux`, `android`, `ios`, `other`) for a sign-in or
     join, `reason` (as in the device list), `step` (`password`, `totp`, `recovery`, `challenge_expired`), `role_from` and
-    `role_to`, `quota_bytes` (a number, `null` when the quota was removed), `revoked` (a count), `device` (an ID) and `two_factor_removed` (`true`, only on `join.reset_redeemed`). A
+    `role_to` (an account's role, or a role in a team space: `viewer`, `editor`, `owner`), `user` (the account a team space event is about, by ID), `quota_bytes` (a number, `null` when the quota was removed), `revoked` (a count), `device` (an ID) and `two_factor_removed` (`true`, only on `join.reset_redeemed`). A
     device may call its platform any printable text of 32 bytes, an address or a file name included, so anything not in
     the list is `other`; `web` means a browser session of the admin pages and cannot be named by a device. Nothing a client typed ever reaches a row. The text is at most 2,048 bytes: if it would be more,
     whole fields go, the least important first, and `"truncated": true` is added; bytes are never cut off, which would

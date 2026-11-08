@@ -17,6 +17,7 @@ mod index;
 mod join;
 mod live;
 mod schema;
+mod spaces;
 mod trash;
 mod tree;
 mod two_factor;
@@ -46,6 +47,7 @@ pub use live::{
     Appended, DEFAULT_LIVE_BYTES_PER_SPACE, LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE, MAX_LIVE_DOCS_PER_SPACE,
     MAX_LIVE_DOCUMENTS_HOLDING_UPDATES, MAX_LIVE_DOCUMENTS_PER_SPACE, MAX_LIVE_PAGE, SnapshotRef,
 };
+pub use spaces::{Member, SpaceActor};
 pub use trash::{TrashEntry, TrashPage};
 pub use tree::{MAX_PAGE_SAVE_BYTES, SpaceInfo};
 pub use two_factor::{
@@ -118,6 +120,9 @@ pub enum MetaError {
     /// The change would leave the server without an administrator who can sign in; nothing was changed.
     #[error("this would leave the server without an enabled administrator")]
     LastAdmin,
+    /// The change would leave a team space without an accepted owner; nothing was changed.
+    #[error("this would leave the team space without an owner")]
+    LastOwner,
     /// The account is disabled or marked for removal. Said only to someone who proved they hold its password or a
     /// code of it, never to a guesser.
     #[error("this account is disabled")]
