@@ -102,14 +102,31 @@ fn filters(ui: &mut egui::Ui, files: &Files, events: &mut Vec<Event>) {
         }
         kit::section_label(ui, "Search");
     };
+    // The segments when they fit the window's width, else a menu of the same choices (a dozen apps don't fit 640 points).
+    let segments_fit = segments_width <= ui.available_width();
     let mut picked = None;
-    if beside {
-        ui.horizontal(|ui| {
+    let mut choose = |ui: &mut egui::Ui| {
+        if segments_fit {
             picked = kit::segmented(ui, "App", &segments, selected);
+            return;
+        }
+        let name = |segment: &Segment<'_>| segment.count.map_or_else(|| segment.text.to_owned(), |n| format!("{} ({n})", segment.text));
+        let shown = segments.get(selected).map(name).unwrap_or_default();
+        egui::ComboBox::from_id_salt("files-app").selected_text(shown).width(220.0).show_ui(ui, |ui| {
+            for (i, segment) in segments.iter().enumerate() {
+                if ui.selectable_label(i == selected, name(segment)).clicked() && i != selected {
+                    picked = Some(i);
+                }
+            }
+        });
+    };
+    if beside && segments_fit {
+        ui.horizontal(|ui| {
+            choose(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), &mut search_field);
         });
     } else {
-        picked = kit::segmented(ui, "App", &segments, selected);
+        choose(ui);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), &mut search_field);

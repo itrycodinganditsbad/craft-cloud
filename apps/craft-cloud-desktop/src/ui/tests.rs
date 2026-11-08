@@ -551,6 +551,16 @@ fn files_list() -> Vec<RecentFile> {
     ]
 }
 
+/// The app filter doesn't fit the smallest window with many apps: it turns into a menu instead of running out of it.
+#[test]
+fn snapshot_files_with_many_apps_at_the_smallest_width() {
+    let mut list = files_list();
+    for (n, app) in ["designcraft", "pdfcraft", "effectcraft", "gridcraft", "deckcraft"].into_iter().enumerate() {
+        list.push(recent(app, &format!("work/{app}-file"), &format!("{app}-file"), "lptp1", (n as i64 + 6) * 86_400_000, Place::Here));
+    }
+    snapshot_sized(files_model(Some(list)), egui::Theme::Light, "files-many-apps-640", crate::ui::MIN_WINDOW_SIZE);
+}
+
 /// The Files page after its answer: the list, or (`None`) the agent not answering.
 fn files_model(list: Option<Vec<RecentFile>>) -> Model {
     let mut model = signed_in_model(signed_in());
