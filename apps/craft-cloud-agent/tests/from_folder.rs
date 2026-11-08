@@ -1291,3 +1291,26 @@ async fn a_folder_that_cannot_be_looked_at_is_not_taken_for_gone() {
     assert_eq!((shown.step, shown.failed_at), (FromFolderStep::Interrupted, Some(FromFolderStep::Trashing)), "{shown:?}");
     let _ = project;
 }
+
+// ---- the independent review: the copy's destination ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_team_subfolder_swapped_for_a_link_is_not_written_through() {
+    let (_w, ana, project, files) = ana_with_project().await;
+    hook::set(ana.data.path(), Some(Hook::Fail(FromFolderStep::Syncing)));
+    ana.make(&project, "Linked team").await.unwrap();
+    let failed = ana.until(FromFolderStep::Failed).await;
+    let team = PathBuf::from(failed.team_folder.clone().unwrap());
+    // Another project with a file of the same name lies elsewhere; the team folder's `Shots` becomes a link to it.
+    let other = ana.dir.path().join("OtherProject");
+    write(&other, "010.psd", b"somebody else's file");
+    std::fs::remove_dir_all(team.join("Shots")).unwrap();
+    make_link(&team.join("Shots"), &other);
+    hook::set(ana.data.path(), None);
+    ana.make_with(&project, "Linked team", None).await.unwrap();
+    let stopped = ana.until(FromFolderStep::Failed).await;
+    assert_eq!(stopped.failed_at, Some(FromFolderStep::Copying), "{stopped:?}");
+    assert!(stopped.message.as_deref().is_some_and(|m| m.contains("moved or replaced by a link")), "{stopped:?}");
+    assert_eq!(files_under(&other), BTreeMap::from([("010.psd".to_owned(), b"somebody else's file".to_vec())]), "the other folder is untouched");
+    untouched(&project, &files);
+}

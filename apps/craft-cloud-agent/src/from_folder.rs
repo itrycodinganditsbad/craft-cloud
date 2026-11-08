@@ -1208,9 +1208,18 @@ fn copy_all(
             }
         }
     }
+    // The team folder as it is now: it and every folder written into must stay what they are (no link, the same folder).
+    let team_real = std::fs::canonicalize(team).map_err(|e| io_failed(team, &e))?;
+    let team_chain = chain_of(&team_real, &team_real);
     for (os, _) in dirs {
         let dir = join(team, os);
+        if !chain_intact(&team_chain) || !ancestors_are_real(team, os) {
+            return Err(unsafe_destination());
+        }
         std::fs::create_dir_all(&dir).map_err(|e| io_failed(&dir, &e))?;
+        if !components_are_real(team, os) {
+            return Err(unsafe_destination());
+        }
     }
     let mut copied = Vec::with_capacity(files.len());
     for entry in files {
@@ -1222,7 +1231,8 @@ fn copy_all(
         let mut attempt = 0;
         let manifest = loop {
             attempt += 1;
-            match copy_file(&source, &dest, &tmp, delay, cancelled)? {
+            let guard = || chain_intact(&team_chain) && ancestors_are_real(team, &entry.os);
+            match copy_file(&source, &dest, &tmp, delay, &guard, cancelled)? {
                 Some(manifest) => break manifest,
                 None if attempt < 4 => std::thread::sleep(Duration::from_millis(300)),
                 None => return Err(CopyStop::Failed(format!("{} keeps changing while it is copied; nothing was deleted", source.display()))),
@@ -1237,7 +1247,17 @@ fn copy_all(
 /// Copies one file into place unless the destination already has exactly its content: the destination is read and its manifest
 /// compared with the source's (size and time are not trusted). `None`: the source changed while it was read; the copy was thrown
 /// away.
-fn copy_file(source: &Path, dest: &Path, tmp: &Path, delay: Option<Duration>, cancelled: &dyn Fn() -> bool) -> Result<Option<ManifestId>, CopyStop> {
+fn copy_file(
+    source: &Path,
+    dest: &Path,
+    tmp: &Path,
+    delay: Option<Duration>,
+    guard: &dyn Fn() -> bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<ManifestId>, CopyStop> {
+    if !guard() {
+        return Err(unsafe_destination());
+    }
     let failed_at = |path: &Path, e: &dyn std::fmt::Display| CopyStop::Failed(format!("{}: {e}", path.display()));
     let before = std::fs::metadata(source).map_err(|e| io_failed(source, &e))?;
     let in_place =
@@ -1269,12 +1289,65 @@ fn copy_file(source: &Path, dest: &Path, tmp: &Path, delay: Option<Duration>, ca
         drop(out);
         // The permissions (the executable bit) go with the file.
         std::fs::set_permissions(&temp, before.permissions()).map_err(|e| failed_at(&temp, &e))?;
-        put_in_place(&temp, dest).map_err(CopyStop::Failed)?;
+        // Looked at once more right before the file lands.
+        if !guard() {
+            return Err(unsafe_destination());
+        }
+        if std::fs::symlink_metadata(dest).is_ok() {
+            // An older copy of this job's own (see `in_place`): replaced.
+            put_in_place(&temp, dest).map_err(CopyStop::Failed)?;
+        } else {
+            land_noreplace(&temp, dest).map_err(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    CopyStop::Failed(format!("{}: a file appeared there while it was copied; try again", dest.display()))
+                } else {
+                    io_failed(dest, &e)
+                }
+            })?;
+        }
         Ok(Some(manifest))
     })();
     // A copy that was put in place is gone from `temp`; anything else is cleaned up.
     let _ = std::fs::remove_file(&temp);
     result
+}
+
+/// What the copy says when the team folder, or a folder in it, is not the real folder it was.
+fn unsafe_destination() -> CopyStop {
+    CopyStop::Failed(
+        "the team folder, or a folder in it, was moved or replaced by a link while the files were copied; nothing more was written there".into(),
+    )
+}
+
+/// Whether every folder of `os` below `root` (the last one too) is a real folder now (no link of any kind).
+fn components_are_real(root: &Path, os: &[std::ffi::OsString]) -> bool {
+    let mut at = root.to_owned();
+    for name in os {
+        at.push(name);
+        if !std::fs::symlink_metadata(&at).is_ok_and(|m| m.is_dir() && !is_link(&m)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Puts the finished copy in a place that is free: a hard link (which fails when the name is taken) and then the temporary name goes.
+/// A name that is taken is an `AlreadyExists` error, never an overwrite.
+fn land_noreplace(temp: &Path, dest: &Path) -> io::Result<()> {
+    match std::fs::hard_link(temp, dest) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(temp);
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+        // No hard links on this volume: the move that replaces only a name that is absent (looked at just before).
+        Err(_) => {
+            if std::fs::symlink_metadata(dest).is_ok() {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+            }
+            std::fs::rename(temp, dest)
+        }
+    }
 }
 
 /// Renames the finished copy over its place; another program that holds the destination for a moment (the team pass reading
