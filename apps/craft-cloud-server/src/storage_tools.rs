@@ -16,6 +16,9 @@ use crate::cli::CliError;
 /// The `server_state` key of the last estimate.
 pub const ESTIMATE_KEY: &str = "compression_estimate";
 
+/// The `server_state` key of the level an admin set while the server runs.
+pub const LEVEL_KEY: &str = "compression_level";
+
 /// How many blobs `store recompress` and `store measure` read from the database at a time.
 const PAGE: usize = 500;
 
@@ -290,7 +293,7 @@ pub fn print_estimate(estimate: &Estimate, out: &mut impl Write) -> std::io::Res
 }
 
 /// The last estimate and when it was made (ms), if the admin ran one.
-pub async fn last_estimate(meta: &Meta) -> Result<Option<(Estimate, i64)>, CliError> {
+pub async fn last_estimate(meta: &Meta) -> Result<Option<(Estimate, i64)>, craft_cloud_meta::MetaError> {
     let Some((json, at)) = meta.server_value(ESTIMATE_KEY).await? else { return Ok(None) };
     // A value written by a newer or older server that does not parse is no estimate, not an error.
     Ok(serde_json::from_str(&json).ok().map(|estimate| (estimate, at)))

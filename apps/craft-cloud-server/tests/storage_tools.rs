@@ -408,7 +408,8 @@ async fn compression_none_is_a_setting_the_pass_respects_in_the_cli() {
         meta.set_physical(BlobKind::Chunk, &key.id, written.physical_len, written.level).await.unwrap();
     }
 
-    let (dry, out) = run(vec!["store".into(), "--config".into(), c.clone(), "recompress".into(), "--level".into(), "19".into(), "--dry-run".into()]).await;
+    let (dry, out) =
+        run(vec!["store".into(), "--config".into(), c.clone(), "recompress".into(), "--level".into(), "19".into(), "--dry-run".into()]).await;
     dry.unwrap();
     assert!(out.contains("would rewrite 3") && out.contains("dry run"), "{out}");
     let (done, out) = run(vec!["store".into(), "recompress".into(), "--level".into(), "19".into(), "--config".into(), c.clone()]).await;
@@ -420,7 +421,9 @@ async fn compression_none_is_a_setting_the_pass_respects_in_the_cli() {
     let (bad_level, _) = run(vec!["store".into(), "--config".into(), c.clone(), "recompress".into(), "--level".into(), "25".into()]).await;
     assert!(bad_level.is_err());
 
-    let (est, out) = run(vec!["store".into(), "--config".into(), c.clone(), "estimate".into(), "--sample".into(), "10".into(), "--levels".into(), "1,19".into()]).await;
+    let (est, out) =
+        run(vec!["store".into(), "--config".into(), c.clone(), "estimate".into(), "--sample".into(), "10".into(), "--levels".into(), "1,19".into()])
+            .await;
     est.unwrap();
     assert!(out.contains("level  saving") && out.contains("kept for the admin overview"), "{out}");
     assert!(storage_tools::last_estimate(&meta).await.unwrap().is_some());
