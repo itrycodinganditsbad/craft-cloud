@@ -192,11 +192,13 @@ pub fn people_badge(ui: &mut Ui, people: &[Person]) {
         for person in people.iter().take(PEOPLE_SHOWN) {
             let colour = person_colour(ui, person);
             let name = if person.is_self { format!("{} (you)", person.name) } else { person.name.clone() };
-            let pill =
-                egui::Frame::new().stroke(egui::Stroke::new(1.0, colour)).corner_radius(8).inner_margin(egui::Margin::symmetric(5, 1)).show(ui, |ui| {
+            let pill = egui::Frame::new().stroke(egui::Stroke::new(1.0, colour)).corner_radius(8).inner_margin(egui::Margin::symmetric(5, 1)).show(
+                ui,
+                |ui| {
                     let label = ui.label(RichText::new(initials(&person.name)).strong().color(colour));
                     label.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, name.clone()));
-                });
+                },
+            );
             pill.response.on_hover_text(&name);
         }
         let rest = people.len().saturating_sub(PEOPLE_SHOWN);
