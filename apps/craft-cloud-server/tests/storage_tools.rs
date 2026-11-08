@@ -455,8 +455,11 @@ impl Backend for FailsLenOf {
     async fn get_raw(&self, path: &str) -> Result<Option<Bytes>, StoreError> {
         self.inner.get_raw(path).await
     }
-    async fn len_raw(&self, path: &str) -> Result<Option<u64>, StoreError> {
-        if path == self.path { Err(StoreError::Backend("simulated failure".into())) } else { self.inner.len_raw(path).await }
+    async fn size_raw(&self, path: &str) -> Result<Option<u64>, StoreError> {
+        if path == self.path { Err(StoreError::Backend("simulated failure".into())) } else { self.inner.size_raw(path).await }
+    }
+    async fn list_raw(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<String>, StoreError> {
+        self.inner.list_raw(prefix, after, limit).await
     }
     async fn delete_raw(&self, path: &str) -> Result<(), StoreError> {
         self.inner.delete_raw(path).await

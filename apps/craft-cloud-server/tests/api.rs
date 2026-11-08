@@ -4417,9 +4417,11 @@ async fn concurrent_level_changes_leave_the_store_at_the_stored_level() {
     let s = start(meta, store.clone(), vec![db, blobs], None).await;
     add_admin(&s, "root").await;
     let root = login(&s, "root").await;
-    for round in 0..4u8 {
-        let puts = (1..=8u8).map(|n| {
-            let level = round * 4 + n;
+    // As many at once as there are password-check slots: more would be told to come back later.
+    let at_once = u8::try_from(s.password_checks.available_permits().clamp(2, 8)).unwrap();
+    for round in 0..6u8 {
+        let puts = (1..=at_once).map(|n| {
+            let level = (round * at_once + n) % 19 + 1;
             call(&s, Some(&root), M::PUT, "/admin/storage/compression", Some(json!({ "level": level, "password": PASSWORD })))
         });
         for response in futures_util::future::join_all(puts).await {
