@@ -6,7 +6,9 @@
 //!   That is a convenience, not a check: the server decides every call again, and a refusal is shown as the server's.
 //! - **Pages**: the users (a paged list with search), one user (role and quota, disable, enable, remove, invite and
 //!   reset code, the user's devices), and a new account (name and role; its quota is set afterwards, on the user's
-//!   page, as a change of its own).
+//!   page, as a change of its own). The Team spaces part lists the server's team spaces (a paged list with search), makes a
+//!   new one (name, first owner, limit) and has a page per space (limit, archive and bring back, name an owner). The owner
+//!   is typed as an account name and looked up before the confirmation, so a mistyped name doesn't use up a code.
 //! - **Every change asks for the admin's password afresh** in a confirmation ([`Dialog`], holding a [`Confirmation`]):
 //!   its text goes into the call as the body's `password` and is cleared from the model at once. Whatever else the
 //!   server comes to want of a confirmation (a second factor's code) is another field of [`Confirmation`] and of
@@ -15,8 +17,8 @@
 //!   dismisses it (or leaves the pages), never written anywhere, and left out of `Debug` output.
 
 use craft_cloud_app::{
-    AccountInfo, AccountUsage, AdminCode, AdminCompression, AdminCreatedUser, AdminServerInfo, AdminStorageOverview, AdminUserInfo, AdminUserList,
-    DeviceId, DeviceInfo, Error, UserQuery, Uuid,
+    AccountInfo, AccountUsage, AdminCode, AdminCompression, AdminCreatedUser, AdminServerInfo, AdminSpaceInfo, AdminSpaceList, AdminStorageOverview,
+    AdminUserInfo, AdminUserList, DeviceId, DeviceInfo, Error, SpaceId, UserQuery, Uuid,
 };
 use craft_cloud_proto::api::{AdminConfirm, codes};
 
@@ -172,6 +174,34 @@ pub enum Action {
     SetCompression {
         level: u8,
     },
+    /// A new team space with its first owner (an account that was looked up), and a limit if one was typed.
+    CreateSpace {
+        name: String,
+        owner: Uuid,
+        owner_name: String,
+        quota: Option<u64>,
+    },
+    /// A new limit for a team space (`None` removes it).
+    SetSpaceLimit {
+        id: SpaceId,
+        name: String,
+        quota: Option<u64>,
+    },
+    ArchiveSpace {
+        id: SpaceId,
+        name: String,
+    },
+    UnarchiveSpace {
+        id: SpaceId,
+        name: String,
+    },
+    /// An account made an accepted owner of a team space (the other owners stay).
+    SetSpaceOwner {
+        id: SpaceId,
+        name: String,
+        owner: Uuid,
+        owner_name: String,
+    },
 }
 
 /// The lowest and highest compression level the server takes.
@@ -181,7 +211,12 @@ impl Action {
     /// The account the change is about (the new account's name for a creation); empty for a change of the server.
     pub fn username(&self) -> &str {
         match self {
-            Self::SetCompression { .. } => "",
+            Self::SetCompression { .. }
+            | Self::CreateSpace { .. }
+            | Self::SetSpaceLimit { .. }
+            | Self::ArchiveSpace { .. }
+            | Self::UnarchiveSpace { .. }
+            | Self::SetSpaceOwner { .. } => "",
             Self::CreateUser { username, .. }
             | Self::UpdateUser { username, .. }
             | Self::Disable { username, .. }
@@ -199,7 +234,12 @@ impl Action {
     pub fn destructive(&self) -> bool {
         matches!(
             self,
-            Self::Disable { .. } | Self::Remove { .. } | Self::RevokeInvite { .. } | Self::ResetTwoFactor { .. } | Self::RevokeDevice { .. }
+            Self::Disable { .. }
+                | Self::Remove { .. }
+                | Self::RevokeInvite { .. }
+                | Self::ResetTwoFactor { .. }
+                | Self::RevokeDevice { .. }
+                | Self::ArchiveSpace { .. }
         )
     }
 
@@ -217,6 +257,11 @@ impl Action {
             Self::ResetTwoFactor { username, .. } => format!("Turn two-factor sign-in off for {username}"),
             Self::RevokeDevice { username, device_name, .. } => format!("Sign {device_name} of {username} out"),
             Self::SetCompression { level } => format!("Compress new files at level {level}"),
+            Self::CreateSpace { name, .. } => format!("Create team space {name}"),
+            Self::SetSpaceLimit { name, .. } => format!("Change the limit of {name}"),
+            Self::ArchiveSpace { name, .. } => format!("Archive {name}"),
+            Self::UnarchiveSpace { name, .. } => format!("Bring {name} back"),
+            Self::SetSpaceOwner { name, owner_name, .. } => format!("Name {owner_name} an owner of {name}"),
         }
     }
 
@@ -259,10 +304,45 @@ impl Action {
                  saves more space and takes more time on the server."
                     .into()
             }
+            Self::CreateSpace { owner_name, quota, .. } => {
+                let limit = match quota {
+                    Some(bytes) => format!(" Its limit is {}.", format_bytes(*bytes)),
+                    None => " It has no limit of its own.".to_owned(),
+                };
+                format!(
+                    "{owner_name} becomes its owner at once and invites the other members. Nobody else gets access to the files, administrators \
+                     included.{limit}"
+                )
+            }
+            Self::SetSpaceLimit { quota, .. } => match quota {
+                Some(bytes) => format!("The limit becomes {}. Uploads past it are refused.", format_bytes(*bytes)),
+                None => "The space's own limit is removed.".to_owned(),
+            },
+            Self::ArchiveSpace { .. } => {
+                "Every member, owners included, can only read it while it is archived. Nothing is deleted. It leaves the lists of all but its owners."
+                    .into()
+            }
+            Self::UnarchiveSpace { .. } => "Members can change files in it again, as their roles allow.".into(),
+            Self::SetSpaceOwner { owner_name, .. } => format!(
+                "{owner_name} becomes an owner at once, without an invitation to accept, whether they are a member, invited or neither. Use this \
+                 when the owners are gone. Other owners stay owners."
+            ),
         }
     }
 
     /// The label of the confirm button.
+    /// Whether the change is of a team space (the list of team spaces is asked for again after it).
+    pub fn is_space_change(&self) -> bool {
+        matches!(
+            self,
+            Self::CreateSpace { .. }
+                | Self::SetSpaceLimit { .. }
+                | Self::ArchiveSpace { .. }
+                | Self::UnarchiveSpace { .. }
+                | Self::SetSpaceOwner { .. }
+        )
+    }
+
     pub fn button(&self) -> &'static str {
         match self {
             Self::CreateUser { .. } => "Create account",
@@ -276,6 +356,11 @@ impl Action {
             Self::ResetTwoFactor { .. } => "Turn two-factor off",
             Self::RevokeDevice { .. } => "Sign out",
             Self::SetCompression { .. } => "Set the level",
+            Self::CreateSpace { .. } => "Create team space",
+            Self::SetSpaceLimit { .. } => "Save the limit",
+            Self::ArchiveSpace { .. } => "Archive the space",
+            Self::UnarchiveSpace { .. } => "Bring the space back",
+            Self::SetSpaceOwner { .. } => "Name this owner",
         }
     }
 }
@@ -288,6 +373,8 @@ pub enum Outcome {
     Code(AdminCode),
     /// The compression part of the storage overview after a level change.
     Compression(Box<AdminCompression>),
+    /// The team space as the list shows it, after it was made or its limit changed.
+    Space(Box<AdminSpaceInfo>),
     Done,
 }
 
@@ -403,6 +490,123 @@ pub struct CreateForm {
     pub error: Option<String>,
 }
 
+/// The list of team spaces (the Team spaces part): one page, the search that made it, and the cursors back to the first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpaceList {
+    /// The search field, as typed.
+    pub search: String,
+    /// The search the shown page was asked with.
+    pub applied: String,
+    pub spaces: Vec<AdminSpaceInfo>,
+    /// How each page up to this one was asked for: `cursors[0]` is `None`, the last is this page's.
+    pub cursors: Vec<Option<String>>,
+    pub next: Option<String>,
+    pub loading: bool,
+    pub loaded: bool,
+    pub error: Option<String>,
+    ticket: u64,
+}
+
+impl SpaceList {
+    fn new() -> Self {
+        Self {
+            search: String::new(),
+            applied: String::new(),
+            spaces: Vec::new(),
+            cursors: vec![None],
+            next: None,
+            loading: false,
+            loaded: false,
+            error: None,
+            ticket: 0,
+        }
+    }
+
+    pub fn page(&self) -> usize {
+        self.cursors.len()
+    }
+
+    pub fn has_previous(&self) -> bool {
+        self.cursors.len() > 1
+    }
+
+    /// Asks for the current page.
+    fn load(&mut self) -> Effect {
+        self.loading = true;
+        self.error = None;
+        self.ticket = fresh();
+        let query = UserQuery {
+            cursor: self.cursors.last().cloned().flatten(),
+            limit: Some(PAGE_SIZE),
+            query: (!self.applied.is_empty()).then(|| self.applied.clone()),
+        };
+        Effect::AdminSpaces { query, ticket: self.ticket }
+    }
+
+    fn find(&self, id: SpaceId) -> Option<&AdminSpaceInfo> {
+        self.spaces.iter().find(|s| s.id == id)
+    }
+}
+
+/// What an owner lookup is for, until its answer comes.
+#[derive(Debug, Clone, PartialEq)]
+enum OwnerLookup {
+    Create { name: String, quota: Option<u64> },
+    Owner { id: SpaceId, name: String },
+}
+
+/// The form for a new team space.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreateSpaceForm {
+    pub name: String,
+    /// The first owner's account name.
+    pub owner: String,
+    /// The limit in MiB (empty: none).
+    pub limit: String,
+    pub error: Option<String>,
+    /// The number of the owner lookup that is under way.
+    checking: Option<u64>,
+}
+
+impl CreateSpaceForm {
+    /// Whether the owner is being looked up.
+    pub fn is_checking(&self) -> bool {
+        self.checking.is_some()
+    }
+}
+
+/// One team space's page: its limit, archive and owner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpaceView {
+    pub id: SpaceId,
+    /// The space as the list showed it last.
+    pub space: AdminSpaceInfo,
+    /// The limit field, in MiB (empty: none).
+    pub limit: String,
+    /// The account name typed to name an owner.
+    pub owner: String,
+    pub error: Option<String>,
+    checking: Option<u64>,
+}
+
+impl SpaceView {
+    fn new(space: &AdminSpaceInfo) -> Self {
+        Self {
+            id: space.id,
+            space: space.clone(),
+            limit: space.quota_bytes.map(limit_text).unwrap_or_default(),
+            owner: String::new(),
+            error: None,
+            checking: None,
+        }
+    }
+
+    /// Whether the owner is being looked up.
+    pub fn is_checking(&self) -> bool {
+        self.checking.is_some()
+    }
+}
+
 /// One account's page: its role and quota to change, and its devices.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserView {
@@ -467,6 +671,10 @@ pub enum View {
     List,
     Create(CreateForm),
     User(Box<UserView>),
+    /// The form for a new team space.
+    CreateSpace(CreateSpaceForm),
+    /// One team space's page.
+    Space(Box<SpaceView>),
     /// The security audit log ([`crate::audit`]).
     Audit(Box<crate::audit::AuditView>),
 }
@@ -477,6 +685,8 @@ pub enum Section {
     #[default]
     Accounts,
     Storage,
+    /// The server's team spaces.
+    Spaces,
 }
 
 /// The admin pages.
@@ -485,6 +695,8 @@ pub struct AdminScreen {
     /// The signed-in view the pages came from and go back to.
     pub overview: Overview,
     pub list: UserList,
+    /// The server's team spaces (the Team spaces part).
+    pub spaces: SpaceList,
     /// The server's counters, once they came.
     pub server: Option<AdminServerInfo>,
     pub storage: Option<AdminStorageOverview>,
@@ -502,6 +714,8 @@ pub struct AdminScreen {
     pub code: Option<ShownCode>,
     /// What the admin asked for while an account's page held unsaved edits, until Discard or Keep editing answers it.
     pub leaving: Option<Box<Event>>,
+    /// What the owner lookup that is under way is for.
+    owner_lookup: Option<OwnerLookup>,
 }
 
 impl AdminScreen {
@@ -550,13 +764,39 @@ pub enum AdminEvent {
     },
     /// [`Effect::AdminDo`]'s answer.
     Done(Result<Outcome, Error>),
+    /// [`Effect::AdminSpaces`]'s answer.
+    Spaces {
+        ticket: u64,
+        result: Result<AdminSpaceList, Error>,
+    },
+    /// [`Effect::AdminFindAccount`]'s answer: the account with exactly that name, if there is one.
+    AccountFound {
+        ticket: u64,
+        result: Result<Option<AdminUserInfo>, Error>,
+    },
 
-    /// The Accounts or Storage tab of the list page.
+    /// The Accounts, Storage or Team spaces part of the list page.
     Show(Section),
     /// The Administration button.
     Open,
     /// Back to the signed-in view.
     Close,
+    /// Search for the text in the search field of the Team spaces part.
+    SearchSpaces,
+    ClearSpacesSearch,
+    NextSpaces,
+    PreviousSpaces,
+    /// The New team space button.
+    NewSpace,
+    /// Go on from the new team space's form to the owner's lookup and the password.
+    SubmitSpace,
+    OpenSpace(SpaceId),
+    /// Back to the list of team spaces from a space's page or the form.
+    BackToSpaces,
+    /// Go on from the limit field of a space's page to the password.
+    SubmitLimit,
+    /// Go on from the owner field of a space's page to the lookup and the password.
+    SubmitOwner,
     /// Search for the text in the search field.
     Search,
     ClearSearch,
@@ -652,7 +892,8 @@ impl Model {
         if access == Access::Member {
             self.leave_admin();
         }
-        Vec::new()
+        // The agent answered: the invitations to team spaces are counted too (for the tag in the header).
+        self.ask_spaces()
     }
 
     fn open_admin(&mut self) -> Vec<Effect> {
@@ -663,6 +904,7 @@ impl Model {
         let mut admin = AdminScreen {
             overview: overview.clone(),
             list: UserList::new(),
+            spaces: SpaceList::new(),
             server: None,
             storage: None,
             storage_loading: false,
@@ -674,6 +916,7 @@ impl Model {
             dialog: None,
             code: None,
             leaving: None,
+            owner_lookup: None,
         };
         let effects = vec![admin.list.load(), Effect::AdminServer { session: admin.overview.session }, admin.load_storage()];
         self.screen = Screen::Admin(Box::new(admin));
@@ -692,6 +935,62 @@ impl AdminScreen {
     fn update(&mut self, event: AdminEvent) -> Vec<Effect> {
         match event {
             AdminEvent::Account { .. } | AdminEvent::Open | AdminEvent::Close | AdminEvent::DiscardEdits => Vec::new(),
+            AdminEvent::Spaces { ticket, result } => self.spaces_came(ticket, result),
+            AdminEvent::AccountFound { ticket, result } => self.account_found(ticket, result),
+            AdminEvent::SearchSpaces => {
+                self.spaces.applied = self.spaces.search.trim().to_owned();
+                self.spaces.search = self.spaces.applied.clone();
+                self.spaces.cursors = vec![None];
+                vec![self.spaces.load()]
+            }
+            AdminEvent::ClearSpacesSearch => {
+                self.spaces.search.clear();
+                self.spaces.applied.clear();
+                self.spaces.cursors = vec![None];
+                vec![self.spaces.load()]
+            }
+            AdminEvent::NextSpaces => match self.spaces.next.clone() {
+                Some(next) if !self.spaces.loading => {
+                    self.spaces.cursors.push(Some(next));
+                    vec![self.spaces.load()]
+                }
+                _ => Vec::new(),
+            },
+            AdminEvent::PreviousSpaces => {
+                if self.spaces.has_previous() && !self.spaces.loading {
+                    self.spaces.cursors.pop();
+                    vec![self.spaces.load()]
+                } else {
+                    Vec::new()
+                }
+            }
+            AdminEvent::NewSpace => {
+                if self.dialog.is_none() {
+                    self.view = View::CreateSpace(CreateSpaceForm::default());
+                }
+                Vec::new()
+            }
+            AdminEvent::SubmitSpace => self.submit_space(),
+            AdminEvent::OpenSpace(id) => {
+                let Some(space) = self.spaces.find(id) else { return Vec::new() };
+                if self.dialog.is_some() {
+                    return Vec::new();
+                }
+                self.view = View::Space(Box::new(SpaceView::new(space)));
+                Vec::new()
+            }
+            AdminEvent::BackToSpaces => {
+                if self.dialog.is_none() {
+                    self.view = View::List;
+                    self.section = Section::Spaces;
+                }
+                Vec::new()
+            }
+            AdminEvent::SubmitLimit => {
+                self.submit_limit();
+                Vec::new()
+            }
+            AdminEvent::SubmitOwner => self.submit_owner(),
             AdminEvent::KeepEditing => {
                 self.leaving = None;
                 Vec::new()
@@ -701,6 +1000,10 @@ impl AdminScreen {
                 // The audit log opens inside these pages with the switcher over it: a segment leaves it.
                 if matches!(self.view, View::Audit(_)) && self.dialog.is_none() {
                     self.view = View::List;
+                }
+                // The team spaces are asked for when their part is first shown.
+                if section == Section::Spaces && !self.spaces.loaded && !self.spaces.loading {
+                    return vec![self.spaces.load()];
                 }
                 Vec::new()
             }
@@ -808,6 +1111,12 @@ impl AdminScreen {
                 }
             }
             AdminEvent::Reload => {
+                if self.section == Section::Spaces {
+                    if self.spaces.loading {
+                        return Vec::new();
+                    }
+                    return vec![self.spaces.load()];
+                }
                 if self.list.loading {
                     return Vec::new();
                 }
@@ -1044,6 +1353,20 @@ impl AdminScreen {
                 self.level_pick = None;
             }
             (Action::Remove { .. }, _) => self.view = View::List,
+            (Action::CreateSpace { .. }, _) => {
+                self.view = View::List;
+                self.section = Section::Spaces;
+                self.spaces.cursors = vec![None];
+                self.spaces.search.clear();
+                self.spaces.applied.clear();
+            }
+            (Action::SetSpaceLimit { .. }, Outcome::Space(info)) => {
+                if let View::Space(view) = &mut self.view
+                    && view.id == info.id
+                {
+                    **view = SpaceView { owner: std::mem::take(&mut view.owner), ..SpaceView::new(&info) };
+                }
+            }
             (Action::RevokeDevice { id, .. }, _) => {
                 if let View::User(view) = &mut self.view
                     && view.id == *id
@@ -1055,9 +1378,157 @@ impl AdminScreen {
             _ => {}
         }
         // What changed shows in the list (and the counters).
+        if action.is_space_change() {
+            effects.push(self.spaces.load());
+            return effects;
+        }
         effects.push(self.list.load());
         effects.push(Effect::AdminServer { session: self.overview.session });
         effects.push(self.load_storage());
+        effects
+    }
+
+    fn spaces_came(&mut self, ticket: u64, result: Result<AdminSpaceList, Error>) -> Vec<Effect> {
+        if ticket != self.spaces.ticket {
+            return Vec::new();
+        }
+        self.spaces.loading = false;
+        match result {
+            Ok(list) => {
+                self.spaces.loaded = true;
+                self.spaces.error = None;
+                self.spaces.spaces = list.spaces;
+                self.spaces.next = list.next;
+                // A space's page shows what the list says now.
+                if let View::Space(view) = &mut self.view
+                    && let Some(info) = self.spaces.spaces.iter().find(|s| s.id == view.id)
+                {
+                    view.space = info.clone();
+                }
+                Vec::new()
+            }
+            Err(e) => {
+                self.spaces.error = Some(error_text(&e));
+                if is_forbidden(&e) { vec![Effect::Account { session: self.overview.session }] } else { Vec::new() }
+            }
+        }
+    }
+
+    /// The new team space's form: its fields are checked, and the owner is looked up before the password is asked for.
+    fn submit_space(&mut self) -> Vec<Effect> {
+        let View::CreateSpace(form) = &mut self.view else { return Vec::new() };
+        if self.dialog.is_some() || form.checking.is_some() {
+            return Vec::new();
+        }
+        let name = match craft_cloud_proto::SpaceName::new(&form.name) {
+            Ok(name) => name.as_str().to_owned(),
+            Err(e) => {
+                form.error = Some(format!("That name won't do: {e}."));
+                return Vec::new();
+            }
+        };
+        let owner = form.owner.trim().to_owned();
+        if !valid_username(&owner) {
+            form.error = Some(BAD_USERNAME.to_owned());
+            return Vec::new();
+        }
+        let quota = match parse_limit_mib(&form.limit) {
+            Ok(quota) => quota,
+            Err(why) => {
+                form.error = Some(why);
+                return Vec::new();
+            }
+        };
+        form.error = None;
+        let ticket = fresh();
+        form.checking = Some(ticket);
+        self.owner_lookup = Some(OwnerLookup::Create { name, quota });
+        vec![Effect::AdminFindAccount { name: owner, ticket }]
+    }
+
+    fn submit_limit(&mut self) {
+        let View::Space(view) = &mut self.view else { return };
+        if self.dialog.is_some() {
+            return;
+        }
+        let quota = match parse_limit_mib(&view.limit) {
+            Ok(quota) => quota,
+            Err(why) => {
+                view.error = Some(why);
+                return;
+            }
+        };
+        if quota == view.space.quota_bytes {
+            view.error = Some("Nothing to change.".to_owned());
+            return;
+        }
+        view.error = None;
+        let action = Action::SetSpaceLimit { id: view.id, name: view.space.name.clone(), quota };
+        self.dialog = Some(self.dialog(action));
+    }
+
+    fn submit_owner(&mut self) -> Vec<Effect> {
+        let View::Space(view) = &mut self.view else { return Vec::new() };
+        if self.dialog.is_some() || view.checking.is_some() {
+            return Vec::new();
+        }
+        let owner = view.owner.trim().to_owned();
+        if !valid_username(&owner) {
+            view.error = Some(BAD_USERNAME.to_owned());
+            return Vec::new();
+        }
+        view.error = None;
+        let ticket = fresh();
+        view.checking = Some(ticket);
+        self.owner_lookup = Some(OwnerLookup::Owner { id: view.id, name: view.space.name.clone() });
+        vec![Effect::AdminFindAccount { name: owner, ticket }]
+    }
+
+    /// The owner typed was looked up: an account with exactly that name goes on to the password; none says so and uses up no code.
+    fn account_found(&mut self, ticket: u64, result: Result<Option<AdminUserInfo>, Error>) -> Vec<Effect> {
+        // Which form or page asked; an answer to a lookup that was left is dropped.
+        let asked = match &mut self.view {
+            View::CreateSpace(form) if form.checking == Some(ticket) => {
+                form.checking = None;
+                true
+            }
+            View::Space(view) if view.checking == Some(ticket) => {
+                view.checking = None;
+                true
+            }
+            _ => false,
+        };
+        if !asked {
+            return Vec::new();
+        }
+        let lookup = self.owner_lookup.take();
+        let mut effects = Vec::new();
+        let mut failure = None;
+        let mut action = None;
+        match (result, lookup) {
+            (Ok(Some(account)), Some(OwnerLookup::Create { name, quota })) => {
+                action = Some(Action::CreateSpace { name, owner: account.id, owner_name: account.username, quota });
+            }
+            (Ok(Some(account)), Some(OwnerLookup::Owner { id, name })) => {
+                action = Some(Action::SetSpaceOwner { id, name, owner: account.id, owner_name: account.username });
+            }
+            (Ok(Some(_)), None) => {}
+            (Ok(None), _) => failure = Some(NO_SUCH_OWNER.to_owned()),
+            (Err(e), _) => {
+                failure = Some(error_text(&e));
+                if is_forbidden(&e) {
+                    effects.push(Effect::Account { session: self.overview.session });
+                }
+            }
+        }
+        match &mut self.view {
+            View::CreateSpace(form) => form.error = failure,
+            View::Space(view) => view.error = failure,
+            _ => {}
+        }
+        if let Some(action) = action {
+            self.dialog = Some(self.dialog(action));
+        }
         effects
     }
 
@@ -1070,6 +1541,33 @@ impl AdminScreen {
     fn show_code(&mut self, username: &str, kind: CodeKind, code: AdminCode) {
         self.code = Some(ShownCode { username: username.to_owned(), kind, code: code.code, join_url: code.join_url, expires_ms: code.expires_ms });
     }
+}
+
+/// The words when the owner typed for a team space is no account.
+pub const NO_SUCH_OWNER: &str = "No account has that name";
+/// The words when a team space's limit is typed wrong.
+pub const BAD_LIMIT: &str = "A limit is a number of MiB, at least 4, like 512 or 20480 (empty: no limit)";
+
+/// A team space's limit typed in MiB (`512`; empty: none). The server's least is 4 MiB.
+pub fn parse_limit_mib(text: &str) -> Result<Option<u64>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let mib: u64 = text.parse().map_err(|_| BAD_LIMIT.to_owned())?;
+    if mib < 4 {
+        return Err(BAD_LIMIT.to_owned());
+    }
+    // A petabyte at most: a typo, not a limit, past it.
+    if mib > 1_073_741_824 {
+        return Err("A limit is at most 1073741824 MiB".to_owned());
+    }
+    Ok(Some(mib * 1_048_576))
+}
+
+/// A team space's limit as the limit field shows it: MiB.
+pub fn limit_text(bytes: u64) -> String {
+    (bytes / 1_048_576).to_string()
 }
 
 /// The words when a revoke finds no invite or reset code open (the server's `not_found`).
@@ -1093,6 +1591,10 @@ pub(crate) fn is_forbidden(e: &Error) -> bool {
 /// An admin call's error, for people: the server's refusals the admin can act on in plain words (a wrong password, a wrong or
 /// locked second factor and a rate limit as the Security page says them).
 pub fn error_text(e: &Error) -> String {
+    // An agent from before team spaces: one message, whatever it said.
+    if e.code() == Some(craft_cloud_app::codes::AGENT_TOO_OLD) {
+        return crate::spaces::TOO_OLD.to_owned();
+    }
     match e.code() {
         Some(codes::WRONG_PASSWORD | codes::TWO_FACTOR_INVALID | codes::TWO_FACTOR_LOCKED | codes::RATE_LIMITED) => explain(e),
         Some(codes::LAST_ADMIN) => "That would leave the server without an enabled admin. Make another account an admin first.".to_owned(),
@@ -2362,5 +2864,294 @@ mod storage_block_tests {
             o.server_fs_free_bytes = Some(10 * GIB);
         });
         assert_eq!(server.near_count(), 1, "the server's own disk counts");
+    }
+}
+
+#[cfg(test)]
+mod tests_spaces {
+    //! The Team spaces part of the admin pages: the list, the new-space form, a space's page, the confirmation, an old agent.
+
+    use super::tests::{admin, admin_mut, agent, ev, on_the_pages, refused, run, type_password};
+    use super::*;
+    use crate::agent::fake::{FakeAgent, admin_space};
+    use crate::model::Model;
+
+    /// An admin agent with `spaces` team spaces on the server (and accounts `user01`…).
+    fn agent_with_spaces(spaces: usize) -> FakeAgent {
+        let boss = agent(true, 3);
+        boss.team.lock().unwrap().admin_spaces = (1..=spaces).map(|n| admin_space(&format!("Space {n:02}"), 2, n as u64 * 1_048_576, None)).collect();
+        boss
+    }
+
+    fn on_spaces(boss: &FakeAgent) -> Model {
+        let mut model = on_the_pages(boss);
+        run(&mut model, boss, ev(AdminEvent::Show(Section::Spaces)));
+        model
+    }
+
+    fn type_form(model: &mut Model, name: &str, owner: &str, limit: &str) {
+        if let View::CreateSpace(form) = &mut admin_mut(model).view {
+            (form.name, form.owner, form.limit) = (name.to_owned(), owner.to_owned(), limit.to_owned());
+        } else {
+            panic!("not on the new team space form");
+        }
+    }
+
+    fn form_error(model: &Model) -> Option<String> {
+        match &admin(model).view {
+            View::CreateSpace(form) => form.error.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_team_spaces_part_is_asked_for_when_first_shown_then_paged_and_searched() {
+        let boss = agent_with_spaces(25);
+        let model = on_the_pages(&boss);
+        assert!(!admin(&model).spaces.loaded, "not asked until the part is shown");
+        assert!(!boss.team.lock().unwrap().log.iter().any(|c| c == "admin_spaces"));
+        let effects = model.clone().update(Event::Admin(AdminEvent::Show(Section::Spaces)));
+        assert!(
+            matches!(effects.as_slice(), [Effect::AdminSpaces { query, .. }] if query.limit == Some(PAGE_SIZE) && query.cursor.is_none()),
+            "{effects:?}"
+        );
+        let mut model = on_spaces(&boss);
+        let list = &admin(&model).spaces;
+        assert_eq!((list.spaces.len(), list.page(), list.next.as_deref()), (PAGE_SIZE as usize, 1, Some("20")));
+        // Showing the part again asks for nothing; Refresh does.
+        assert!(model.update(Event::Admin(AdminEvent::Show(Section::Spaces))).is_empty());
+        assert!(matches!(model.clone().update(Event::Admin(AdminEvent::Reload)).as_slice(), [Effect::AdminSpaces { .. }]));
+        run(&mut model, &boss, ev(AdminEvent::Reload));
+        run(&mut model, &boss, ev(AdminEvent::NextSpaces));
+        let list = &admin(&model).spaces;
+        assert_eq!((list.spaces.len(), list.page(), list.next.clone()), (5, 2, None));
+        assert!(model.update(Event::Admin(AdminEvent::NextSpaces)).is_empty(), "no page after the last");
+        run(&mut model, &boss, ev(AdminEvent::PreviousSpaces));
+        assert_eq!(admin(&model).spaces.page(), 1);
+        // A search starts over from the first page and asks the server by name.
+        admin_mut(&mut model).spaces.search = " space 2 ".into();
+        run(&mut model, &boss, ev(AdminEvent::SearchSpaces));
+        let list = &admin(&model).spaces;
+        assert_eq!((list.applied.as_str(), list.spaces.len()), ("space 2", 6), "Space 02 and Space 20 to 25");
+        run(&mut model, &boss, ev(AdminEvent::ClearSpacesSearch));
+        assert_eq!((admin(&model).spaces.applied.as_str(), admin(&model).spaces.spaces.len()), ("", 20));
+        // The accounts' part is as it was.
+        assert!(admin(&model).list.loaded);
+    }
+
+    #[test]
+    fn a_new_team_space_checks_the_fields_and_looks_the_owner_up_before_asking_for_the_password() {
+        let boss = agent_with_spaces(0);
+        let mut model = on_spaces(&boss);
+        run(&mut model, &boss, ev(AdminEvent::NewSpace));
+        // Name, owner and limit are checked first.
+        type_form(&mut model, "", "user01", "");
+        assert!(model.update(Event::Admin(AdminEvent::SubmitSpace)).is_empty());
+        assert!(form_error(&model).is_some_and(|e| e.starts_with("That name won't do")));
+        type_form(&mut model, "Studio", "not a name!", "");
+        assert!(model.update(Event::Admin(AdminEvent::SubmitSpace)).is_empty());
+        assert_eq!(form_error(&model).as_deref(), Some(BAD_USERNAME));
+        for bad in ["3", "abc", "-5", "1.5"] {
+            type_form(&mut model, "Studio", "user01", bad);
+            assert!(model.update(Event::Admin(AdminEvent::SubmitSpace)).is_empty(), "{bad}");
+            assert_eq!(form_error(&model).as_deref(), Some(BAD_LIMIT), "{bad}");
+        }
+        assert!(admin(&model).dialog.is_none());
+        // An owner that is no account: said, and the password was never asked for (no code is used up).
+        type_form(&mut model, "Studio", "nobody", "512");
+        run(&mut model, &boss, ev(AdminEvent::SubmitSpace));
+        assert_eq!(form_error(&model).as_deref(), Some(NO_SUCH_OWNER));
+        assert!(admin(&model).dialog.is_none());
+        assert!(boss.passwords.lock().unwrap().is_empty());
+        // The lookup finds the account by its exact name, in any case.
+        type_form(&mut model, "Studio", "USER01", "512");
+        let effects = model.update(Event::Admin(AdminEvent::SubmitSpace));
+        assert!(matches!(effects.as_slice(), [Effect::AdminFindAccount { name, .. }] if name == "USER01"), "{effects:?}");
+        assert!(matches!(&admin(&model).view, View::CreateSpace(form) if form.is_checking()));
+        assert!(model.update(Event::Admin(AdminEvent::SubmitSpace)).is_empty(), "one lookup at a time");
+        let mut model = on_spaces(&boss);
+        run(&mut model, &boss, ev(AdminEvent::NewSpace));
+        type_form(&mut model, "Studio", "USER01", "512");
+        run(&mut model, &boss, ev(AdminEvent::SubmitSpace));
+        let dialog = admin(&model).dialog.clone().expect("the password page");
+        assert_eq!(dialog.action.title(), "Create team space Studio");
+        assert!(dialog.action.explain().contains("user01") && dialog.action.explain().contains("512 MiB"), "{}", dialog.action.explain());
+        assert_eq!(dialog.action.button(), "Create team space");
+        assert!(!dialog.action.destructive() && dialog.action.is_space_change());
+        // The password goes into the call once and is cleared from the model.
+        type_password(&mut model, "correct horse battery");
+        run(&mut model, &boss, ev(AdminEvent::Confirm));
+        assert_eq!(boss.passwords.lock().unwrap().as_slice(), [Some("correct horse battery".to_owned())]);
+        assert!(admin(&model).dialog.is_none());
+        let a = admin(&model);
+        assert!(matches!(a.view, View::List) && a.section == Section::Spaces);
+        assert_eq!(a.spaces.spaces.iter().map(|s| (s.name.as_str(), s.quota_bytes)).collect::<Vec<_>>(), [("Studio", Some(512 << 20))]);
+        assert!(format!("{:?}", a).find("correct horse").is_none(), "no password is kept");
+    }
+
+    #[test]
+    fn a_wrong_password_keeps_the_page_and_two_factor_asks_for_a_code() {
+        let boss = agent_with_spaces(0);
+        boss.two_factor.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut model = on_spaces(&boss);
+        run(&mut model, &boss, ev(AdminEvent::NewSpace));
+        type_form(&mut model, "Studio", "user01", "");
+        run(&mut model, &boss, ev(AdminEvent::SubmitSpace));
+        let dialog = admin(&model).dialog.clone().unwrap();
+        assert!(dialog.needs_code, "the account has two-factor sign-in");
+        assert!(dialog.action.explain().contains("no limit"));
+        type_password(&mut model, "wrong");
+        boss.admin_fails.lock().unwrap().push(refused("wrong_password", "the password is wrong"));
+        admin_mut(&mut model).dialog.as_mut().unwrap().confirmation.code = "123456".into();
+        run(&mut model, &boss, ev(AdminEvent::Confirm));
+        let dialog = admin(&model).dialog.clone().expect("still asking");
+        assert!(!dialog.busy && dialog.error.is_some(), "{dialog:?}");
+        assert_eq!(boss.factors.lock().unwrap().last(), Some(&(Some("123456".to_owned()), None)));
+        assert!(admin(&model).spaces.spaces.is_empty(), "nothing was made");
+    }
+
+    #[test]
+    fn a_space_page_changes_the_limit_archives_brings_back_and_names_an_owner() {
+        let boss = agent_with_spaces(3);
+        let mut model = on_spaces(&boss);
+        let id = admin(&model).spaces.spaces[1].id;
+        run(&mut model, &boss, ev(AdminEvent::OpenSpace(id)));
+        let View::Space(view) = &admin(&model).view else { panic!("{:?}", admin(&model).view) };
+        assert_eq!((view.id, view.space.name.as_str(), view.limit.as_str()), (id, "Space 02", ""));
+        // The limit: checked, then asked for with the password; an empty field removes it.
+        let set_limit = |model: &mut Model, text: &str| {
+            if let View::Space(view) = &mut admin_mut(model).view {
+                view.limit = text.to_owned();
+            }
+        };
+        set_limit(&mut model, "2");
+        assert!(model.update(Event::Admin(AdminEvent::SubmitLimit)).is_empty());
+        assert!(matches!(&admin(&model).view, View::Space(v) if v.error.as_deref() == Some(BAD_LIMIT)));
+        set_limit(&mut model, "");
+        assert!(model.update(Event::Admin(AdminEvent::SubmitLimit)).is_empty());
+        assert!(matches!(&admin(&model).view, View::Space(v) if v.error.as_deref() == Some("Nothing to change.")), "it has no limit already");
+        set_limit(&mut model, "16");
+        run(&mut model, &boss, ev(AdminEvent::SubmitLimit));
+        let dialog = admin(&model).dialog.clone().unwrap();
+        assert_eq!((dialog.action.title().as_str(), dialog.action.button()), ("Change the limit of Space 02", "Save the limit"));
+        assert!(dialog.action.explain().contains("16 MiB"));
+        type_password(&mut model, "pw");
+        run(&mut model, &boss, ev(AdminEvent::Confirm));
+        let View::Space(view) = &admin(&model).view else { panic!() };
+        assert_eq!((view.space.quota_bytes, view.limit.as_str()), (Some(16 << 20), "16"));
+        assert_eq!(admin(&model).spaces.spaces[1].quota_bytes, Some(16 << 20), "the list shows it too");
+        // Archive: a red confirmation; after it the page says archived and offers to bring it back.
+        run(&mut model, &boss, ev(AdminEvent::Ask(Action::ArchiveSpace { id, name: "Space 02".into() })));
+        let dialog = admin(&model).dialog.clone().unwrap();
+        assert!(dialog.action.destructive() && dialog.action.explain().contains("can only read it"));
+        type_password(&mut model, "pw");
+        run(&mut model, &boss, ev(AdminEvent::Confirm));
+        let View::Space(view) = &admin(&model).view else { panic!() };
+        assert!(view.space.archived_ms.is_some(), "the page follows the list");
+        run(&mut model, &boss, ev(AdminEvent::Ask(Action::UnarchiveSpace { id, name: "Space 02".into() })));
+        type_password(&mut model, "pw");
+        run(&mut model, &boss, ev(AdminEvent::Confirm));
+        let View::Space(view) = &admin(&model).view else { panic!() };
+        assert!(view.space.archived_ms.is_none());
+        // Naming an owner: the account is looked up first; a mistyped name uses up no password.
+        let set_owner = |model: &mut Model, text: &str| {
+            if let View::Space(view) = &mut admin_mut(model).view {
+                view.owner = text.to_owned();
+            }
+        };
+        let used = boss.passwords.lock().unwrap().len();
+        set_owner(&mut model, "nobody");
+        run(&mut model, &boss, ev(AdminEvent::SubmitOwner));
+        assert!(matches!(&admin(&model).view, View::Space(v) if v.error.as_deref() == Some(NO_SUCH_OWNER)));
+        assert!(admin(&model).dialog.is_none());
+        assert_eq!(boss.passwords.lock().unwrap().len(), used);
+        set_owner(&mut model, "user02");
+        run(&mut model, &boss, ev(AdminEvent::SubmitOwner));
+        let dialog = admin(&model).dialog.clone().unwrap();
+        assert_eq!(dialog.action.title(), "Name user02 an owner of Space 02");
+        assert_eq!(dialog.action.button(), "Name this owner");
+        assert!(dialog.action.explain().contains("Other owners stay owners"));
+        type_password(&mut model, "pw");
+        run(&mut model, &boss, ev(AdminEvent::Confirm));
+        let View::Space(view) = &admin(&model).view else { panic!() };
+        assert_eq!((view.space.owners, view.space.members), (2, 3));
+        // Back to the list of team spaces.
+        run(&mut model, &boss, ev(AdminEvent::BackToSpaces));
+        assert!(matches!(admin(&model).view, View::List) && admin(&model).section == Section::Spaces);
+    }
+
+    #[test]
+    fn a_limit_is_typed_in_mib_and_never_below_four() {
+        assert_eq!(parse_limit_mib(""), Ok(None));
+        assert_eq!(parse_limit_mib("  "), Ok(None));
+        assert_eq!(parse_limit_mib("4"), Ok(Some(4 << 20)));
+        assert_eq!(parse_limit_mib(" 20480 "), Ok(Some(20 << 30)));
+        for bad in ["3", "0", "-1", "1.5", "12 GiB", "abc"] {
+            assert_eq!(parse_limit_mib(bad), Err(BAD_LIMIT.to_owned()), "{bad}");
+        }
+        assert!(parse_limit_mib("1073741825").is_err());
+        assert_eq!(limit_text(16 << 20), "16");
+    }
+
+    #[test]
+    fn a_member_is_refused_by_the_server_and_the_role_is_looked_at_again() {
+        // The pages are an admin's; a call that comes back `forbidden` says the role changed.
+        let boss = agent_with_spaces(2);
+        let mut model = on_spaces(&boss);
+        boss.admin.store(false, std::sync::atomic::Ordering::SeqCst);
+        run(&mut model, &boss, ev(AdminEvent::Reload));
+        assert!(model.admin_screen().is_none(), "the account check found a member: out of the admin pages: {:?}", model.screen);
+    }
+
+    #[test]
+    fn an_old_agent_answers_the_team_space_pages_with_one_message() {
+        let boss = agent_with_spaces(2);
+        boss.team.lock().unwrap().too_old = true;
+        let model = on_spaces(&boss);
+        assert_eq!(admin(&model).spaces.error.as_deref(), Some("Update Craft Cloud on this computer to use team spaces"));
+        assert!(admin(&model).spaces.spaces.is_empty());
+        // A change that comes back too old says so on the password page.
+        let mut model = on_the_pages(&boss);
+        run(&mut model, &boss, ev(AdminEvent::Show(Section::Spaces)));
+        run(&mut model, &boss, ev(AdminEvent::NewSpace));
+        type_form(&mut model, "Studio", "user01", "");
+        run(&mut model, &boss, ev(AdminEvent::SubmitSpace));
+        type_password(&mut model, "pw");
+        run(&mut model, &boss, ev(AdminEvent::Confirm));
+        assert_eq!(
+            admin(&model).dialog.as_ref().and_then(|d| d.error.clone()).as_deref(),
+            Some("Update Craft Cloud on this computer to use team spaces")
+        );
+    }
+
+    #[test]
+    fn the_space_actions_say_what_they_are_and_what_they_do() {
+        let (id, owner) = (SpaceId::generate(), Uuid::from_u128(7));
+        let create = Action::CreateSpace { name: "Studio".into(), owner, owner_name: "ana".into(), quota: Some(512 << 20) };
+        let limit = Action::SetSpaceLimit { id, name: "Studio".into(), quota: None };
+        let archive = Action::ArchiveSpace { id, name: "Studio".into() };
+        let unarchive = Action::UnarchiveSpace { id, name: "Studio".into() };
+        let name = Action::SetSpaceOwner { id, name: "Studio".into(), owner, owner_name: "ana".into() };
+        assert_eq!(
+            [&create, &limit, &archive, &unarchive, &name].map(|a| a.title()),
+            ["Create team space Studio", "Change the limit of Studio", "Archive Studio", "Bring Studio back", "Name ana an owner of Studio"]
+        );
+        assert_eq!(limit.explain(), "The space's own limit is removed.");
+        assert!(create.explain().starts_with("ana becomes its owner at once"));
+        assert_eq!([&create, &limit, &archive, &unarchive, &name].map(|a| a.destructive()), [false, false, true, false, false]);
+        assert!([&create, &limit, &archive, &unarchive, &name].iter().all(|a| a.is_space_change() && a.username().is_empty()));
+        assert!(!Action::Disable { id: Uuid::nil(), username: "x".into() }.is_space_change());
+    }
+
+    #[test]
+    fn nothing_secret_is_in_the_debug_output_of_a_space_change() {
+        let boss = agent_with_spaces(1);
+        let mut model = on_spaces(&boss);
+        let id = admin(&model).spaces.spaces[0].id;
+        run(&mut model, &boss, ev(AdminEvent::OpenSpace(id)));
+        run(&mut model, &boss, ev(AdminEvent::Ask(Action::ArchiveSpace { id, name: "Space 01".into() })));
+        type_password(&mut model, "hunter2-secret");
+        let shown = format!("{:?}", admin(&model));
+        assert!(!shown.contains("hunter2-secret"), "{shown}");
     }
 }

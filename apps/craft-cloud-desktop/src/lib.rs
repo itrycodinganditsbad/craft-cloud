@@ -3,7 +3,7 @@
 //! (`craft-cloud-agent run`), which it reaches through `craft-cloud-app` and starts when none answers.
 //!
 //! - [`model`]: the state and every way between its screens, pure (unit-tested against a fake agent); [`admin`]: the
-//!   admin pages' part of it.
+//!   admin pages' part of it; [`spaces`]: the Shared tab (team spaces, invitations, members).
 //! - [`security`]: the Security page and the code a join asks for (two-factor sign-in).
 //! - [`agent`]: the agent's calls behind a trait, run off the UI thread.
 //! - [`start_agent`]: starting the agent from this app's folder.
@@ -26,6 +26,7 @@ pub mod model;
 pub mod names;
 pub mod security;
 pub mod single_instance;
+pub mod spaces;
 pub mod start_agent;
 pub mod tray;
 pub mod ui;

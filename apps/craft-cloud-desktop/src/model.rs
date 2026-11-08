@@ -21,6 +21,7 @@ use crate::audit::{ActivityScreen, AuditMsg};
 use crate::files::{ConflictList, Files, FilesView, Place, RecentFile};
 use crate::names::Names;
 use crate::security::{SecondFactorForm, SecurityAnswer, SecurityCall, SecurityEvent, SecurityPage, Step as SecurityStep};
+use crate::spaces::{SharedScreen, SpacesCall, SpacesMsg};
 
 /// A code that is wrong, expired or used (the server never says which).
 pub const INVALID_CODE: &str = "This code doesn't work any more. Make a new one on a signed-in computer.";
@@ -81,6 +82,8 @@ pub enum Screen {
     Trash(Trash),
     /// The recent files of every Craft app, on every computer of the account.
     Files(Files),
+    /// The Shared tab: the team spaces of the account ([`crate::spaces`]). Boxed: it is large.
+    Shared(Box<SharedScreen>),
     /// Showing an add-a-computer code.
     AddingComputer(Adding),
     /// The admin pages (an admin's only): the users, one user, a new account, the audit log.
@@ -385,6 +388,8 @@ pub enum Tab {
     Versions,
     /// The recent files of every app ([`Screen::Files`]).
     Files,
+    /// The team spaces of the account ([`Screen::Shared`]).
+    Shared,
     Trash,
     /// The account's computers, in full ([`OverviewPage::Computers`]).
     Computers,
@@ -402,6 +407,7 @@ impl Tab {
             Tab::Overview => "Overview",
             Tab::Versions => "Versions",
             Tab::Files => "Files",
+            Tab::Shared => "Shared",
             Tab::Trash => "Trash",
             Tab::Computers => "Computers",
             Tab::Security => "Security",
@@ -500,6 +506,8 @@ pub struct Overview {
     pub(crate) conflicts_ticket: u64,
     /// The sizes of the synced folder here, by folder and by kind.
     pub folders: Folders,
+    /// How many invitations to team spaces wait for an answer (for the tag in the header and on the home page).
+    pub invitations: usize,
 }
 
 /// The number of conflict copies the agent listed.
@@ -653,6 +661,7 @@ impl Overview {
             conflicts: None,
             conflicts_ticket: crate::admin::fresh(),
             folders: Folders::default(),
+            invitations: 0,
         }
     }
 
@@ -922,6 +931,8 @@ pub enum Event {
     Admin(AdminEvent),
     /// Something on the audit pages (the admin's log, or the account's own activity), or an answer to one of their calls.
     Audit(AuditMsg),
+    /// Something on the Shared tab, or the answer to one of its calls ([`crate::spaces`]).
+    Spaces(SpacesMsg),
 }
 
 /// What to do.
@@ -1034,6 +1045,17 @@ pub enum Effect {
         query: UserQuery,
         ticket: u64,
     },
+    /// A page of the server's team spaces ([`AdminEvent::Spaces`] with the same `ticket`).
+    AdminSpaces {
+        query: UserQuery,
+        ticket: u64,
+    },
+    /// The account called exactly `name`, if there is one ([`AdminEvent::AccountFound`] with the same `ticket`): the owner a
+    /// team space is given.
+    AdminFindAccount {
+        name: String,
+        ticket: u64,
+    },
     /// A user's devices ([`AdminEvent::Devices`]).
     AdminDevices {
         user: Uuid,
@@ -1066,6 +1088,8 @@ pub enum Effect {
         action: Action,
         confirm: AdminConfirm,
     },
+    /// A call of the Shared tab ([`SpacesMsg`]).
+    Spaces(SpacesCall),
 }
 
 /// Whether the app should start at login, in the tray, given the agent's status: while signed in with the agent
@@ -1166,6 +1190,7 @@ impl Model {
             Screen::AddingComputer(adding) => Some(&adding.overview),
             Screen::Admin(admin) => Some(&admin.overview),
             Screen::Activity(activity) => Some(&activity.overview),
+            Screen::Shared(shared) => Some(&shared.overview),
             _ => None,
         }
     }
@@ -1218,6 +1243,7 @@ impl Model {
             Screen::Versions(_) => Some(Tab::Versions),
             Screen::Trash(_) => Some(Tab::Trash),
             Screen::Files(_) => Some(Tab::Files),
+            Screen::Shared(_) => Some(Tab::Shared),
             Screen::Security(_) => Some(Tab::Security),
             Screen::Activity(_) => Some(Tab::Activity),
             Screen::Admin(_) => Some(Tab::Admin),
@@ -1227,7 +1253,7 @@ impl Model {
 
     /// The header's tabs: all the pages, the admin pages for an admin only.
     pub fn tabs(&self) -> Vec<Tab> {
-        let all = [Tab::Overview, Tab::Files, Tab::Versions, Tab::Trash, Tab::Computers, Tab::Security, Tab::Activity, Tab::Admin];
+        let all = [Tab::Overview, Tab::Files, Tab::Shared, Tab::Versions, Tab::Trash, Tab::Computers, Tab::Security, Tab::Activity, Tab::Admin];
         all.into_iter().filter(|t| *t != Tab::Admin || self.is_admin()).collect()
     }
 
@@ -1251,13 +1277,15 @@ impl Model {
             }),
             Screen::Trash(_) => Some(Event::LoadTrash),
             Screen::Files(_) => Some(Event::LoadFiles),
+            Screen::Shared(_) => Some(Event::Spaces(SpacesMsg::Reload)),
             Screen::Activity(_) => Some(Event::Audit(AuditMsg::ActivityReload)),
             // A code or the password page covers the page, and the new account's form has no Refresh.
             Screen::Admin(admin) if admin.code.is_none() && admin.dialog.is_none() => match admin.view {
                 crate::admin::View::List => Some(Event::Admin(AdminEvent::Reload)),
                 crate::admin::View::Audit(_) => Some(Event::Audit(AuditMsg::Reload)),
                 crate::admin::View::User(_) => Some(Event::Admin(AdminEvent::RefreshUsage)),
-                crate::admin::View::Create(_) => None,
+                crate::admin::View::Create(_) | crate::admin::View::CreateSpace(_) => None,
+                crate::admin::View::Space(_) => Some(Event::Admin(AdminEvent::Reload)),
             },
             _ => None,
         }
@@ -1277,7 +1305,7 @@ impl Model {
                 admin.code.is_none()
                     && admin.dialog.is_none()
                     && matches!(admin.view, crate::admin::View::List)
-                    && admin.section == crate::admin::Section::Accounts
+                    && admin.section != crate::admin::Section::Storage
             }
             _ => false,
         }
@@ -1295,6 +1323,7 @@ impl Model {
             Screen::Versions(_) => self.update(Event::BackVersions),
             Screen::Trash(_) => self.update(Event::BackTrash),
             Screen::Files(_) => self.update(Event::BackFiles),
+            Screen::Shared(_) => self.spaces(SpacesMsg::Close),
             Screen::Security(_) => self.security(SecurityEvent::Close),
             Screen::Activity(_) => self.audit(AuditMsg::CloseActivity),
             Screen::Admin(_) => self.admin(AdminEvent::Close),
@@ -1312,6 +1341,7 @@ impl Model {
             Tab::Versions => self.update(Event::OpenVersions),
             Tab::Trash => self.update(Event::OpenTrash),
             Tab::Files => self.update(Event::OpenFiles),
+            Tab::Shared => self.spaces(SpacesMsg::Open),
             Tab::Security => self.update(Event::OpenSecurity),
             Tab::Activity => self.audit(AuditMsg::OpenActivity),
             Tab::Admin => self.admin(AdminEvent::Open),
@@ -1331,6 +1361,7 @@ impl Model {
             Screen::AddingComputer(adding) => Some(&mut adding.overview),
             Screen::Admin(admin) => Some(&mut admin.overview),
             Screen::Activity(activity) => Some(&mut activity.overview),
+            Screen::Shared(shared) => Some(&mut shared.overview),
             _ => None,
         }
     }
@@ -2081,6 +2112,7 @@ impl Model {
             },
             Event::Admin(event) => self.admin(event),
             Event::Audit(msg) => self.audit(msg),
+            Event::Spaces(msg) => self.spaces(msg),
             Event::RefreshUsage => {
                 let Some(overview) = self.overview_mut() else { return Vec::new() };
                 if overview.usage_loading {
@@ -2136,6 +2168,7 @@ impl Model {
                 Screen::Join(form) => vec![Effect::PickFolder(form.folder.clone())],
                 _ => Vec::new(),
             },
+            Event::FolderPicked(picked) if matches!(self.screen, Screen::Shared(_)) => self.spaces(SpacesMsg::FolderPicked(picked)),
             Event::FolderPicked(picked) => {
                 if let (Screen::Join(form), Some(folder)) = (&mut self.screen, picked) {
                     form.folder = folder;
@@ -2259,6 +2292,7 @@ impl Model {
                 Screen::Security(page) => page.overview.status = status,
                 Screen::Admin(admin) => admin.overview.status = status,
                 Screen::Activity(activity) => activity.overview.status = status,
+                Screen::Shared(shared) => shared.overview.status = status,
                 // The join's own answer moves on from there.
                 Screen::Joining { .. } => {}
                 Screen::Versions(_) | Screen::Trash(_) | Screen::Files(_) => {}
@@ -4517,7 +4551,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_tabs_list_the_pages_and_the_admin_pages_for_an_admin_only() {
-        let member = [Tab::Overview, Tab::Files, Tab::Versions, Tab::Trash, Tab::Computers, Tab::Security, Tab::Activity];
+        let member = [Tab::Overview, Tab::Files, Tab::Shared, Tab::Versions, Tab::Trash, Tab::Computers, Tab::Security, Tab::Activity];
         assert_eq!(signed_in().tabs(), member);
         let mut admin = member.to_vec();
         admin.push(Tab::Admin);
@@ -5457,19 +5491,19 @@ pub(crate) mod tests {
             m.update(Event::TabNumber(index + 1));
             assert_eq!(m.tab(), Some(*tab), "number {}", index + 1);
         }
-        // A member has seven tabs: the places after them are nothing, and so is 0.
+        // A member has eight tabs: the places after them are nothing, and so is 0.
         let before = m.tab();
         for number in [0, order.len() + 1, 9, usize::MAX] {
             assert!(m.update(Event::TabNumber(number)).is_empty(), "{number}");
             assert_eq!(m.tab(), before);
         }
-        // An admin's Admin tab is the eighth; the hidden one is skipped for a member, so the numbers don't shift.
+        // An admin's Admin tab is the ninth; the hidden one is skipped for a member, so the numbers don't shift.
         let mut admin = signed_in_admin();
         assert_eq!(admin.tabs().last(), Some(&Tab::Admin));
-        admin.update(Event::TabNumber(8));
+        admin.update(Event::TabNumber(9));
         assert_eq!(admin.tab(), Some(Tab::Admin));
         let mut member = signed_in();
-        member.update(Event::TabNumber(8));
+        member.update(Event::TabNumber(9));
         assert_eq!(member.tab(), Some(Tab::Overview));
         // The same tab again is no new load.
         assert!(member.update(Event::TabNumber(1)).is_empty());

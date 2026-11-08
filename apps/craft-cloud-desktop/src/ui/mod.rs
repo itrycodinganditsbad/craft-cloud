@@ -18,6 +18,7 @@ mod second_factor;
 mod security;
 mod shell;
 mod shortcuts;
+mod spaces;
 mod trash;
 mod versions;
 
@@ -84,6 +85,7 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
                 Screen::Versions(versions) => self::versions::show(ui, versions, now_ms, &mut events),
                 Screen::Trash(trash) => self::trash::show(ui, trash, now_ms, &mut events),
                 Screen::Files(files) => self::files::show(ui, files, now_ms, &mut events),
+                Screen::Shared(shared) => self::spaces::show(ui, shared, now_ms, &mut events),
                 Screen::Removed => problem::removed(ui, busy, &mut events),
             }
             if let Some(note) = note {
@@ -197,3 +199,6 @@ mod tests_kit;
 
 #[cfg(test)]
 mod tests_security;
+
+#[cfg(test)]
+mod tests_spaces;

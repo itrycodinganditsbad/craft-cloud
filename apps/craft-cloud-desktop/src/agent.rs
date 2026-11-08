@@ -12,17 +12,20 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use craft_cloud_app::{
-    AccountInfo, AccountUsage, AdminCode, AdminCompression, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset,
-    AdminServerInfo, AdminSetCompressionLevel, AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, AuditPage, AuditQuery, Client,
+    AccountInfo, AccountUsage, AddSpaceMember, AdminCode, AdminCompression, AdminConfirm, AdminCreateSpace, AdminCreateUser, AdminCreatedUser,
+    AdminDevices, AdminPasswordReset, AdminServerInfo, AdminSetCompressionLevel, AdminSetSpaceOwner, AdminSpaceInfo, AdminSpaceList,
+    AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, ApproveDeletesAnswer, AuditPage, AuditQuery, ChangeSpaceMember, Client,
     ConflictsResponse, DeviceId, DeviceInfo, Error, ExportOutcome, FolderUsageResponse, HistoryResponse, JoinRequest, LoginRequest, NodeId,
-    PairingInfo, PairingStatus, RecentEntry, RecoveryCodes, RestoreResponse, RevokedOthers, SecondFactorLoginRequest, Status, TrashResponse,
-    TrashRestoreResponse, TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, UserQuery, Uuid, VersionId,
+    PairingInfo, PairingStatus, RecentEntry, RecoveryCodes, RestoreResponse, RevokedOthers, SecondFactorLoginRequest, SpaceConfirm, SpaceId,
+    SpaceInfo, SpaceList, SpaceMember, SpaceMembers, SpaceSyncRequest, SpaceUsage, Status, TrashResponse, TrashRestoreResponse,
+    TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, UpdateSpace, UserQuery, Uuid, VersionId,
 };
 
 use crate::admin::{Action, AdminEvent, Outcome};
 use crate::audit::AuditMsg;
 use crate::model::{Effect, Event};
 use crate::security::{SecurityAnswer, SecurityCall};
+use crate::spaces::{SpacesCall, SpacesMsg};
 
 /// How often the clock ticks (and the status is asked for).
 pub const TICK: Duration = Duration::from_secs(2);
@@ -91,6 +94,24 @@ pub trait Agent: Send + Sync {
     fn conflicts(&self) -> Result<ConflictsResponse, Error>;
     /// The local logical sizes of the synced folder, by top-level folder and by kind.
     fn folder_usage(&self) -> Result<FolderUsageResponse, Error>;
+    /// The team spaces of the account (the personal space left to the status), invitations among them.
+    fn spaces(&self) -> Result<SpaceList, Error>;
+    fn accept_space(&self, id: SpaceId) -> Result<(), Error>;
+    fn decline_space(&self, id: SpaceId) -> Result<(), Error>;
+    fn set_space_sync(&self, id: SpaceId, request: &SpaceSyncRequest) -> Result<SpaceInfo, Error>;
+    fn approve_space_deletes(&self, id: SpaceId, set: Option<&str>) -> Result<ApproveDeletesAnswer, Error>;
+    fn space_members(&self, id: SpaceId) -> Result<SpaceMembers, Error>;
+    fn add_space_member(&self, id: SpaceId, request: &AddSpaceMember) -> Result<SpaceMember, Error>;
+    fn change_space_member(&self, id: SpaceId, user: Uuid, request: &ChangeSpaceMember) -> Result<SpaceMember, Error>;
+    fn remove_space_member(&self, id: SpaceId, user: Uuid) -> Result<(), Error>;
+    fn leave_space(&self, id: SpaceId) -> Result<(), Error>;
+    fn space_usage(&self, id: SpaceId) -> Result<SpaceUsage, Error>;
+    fn update_space(&self, id: SpaceId, request: &UpdateSpace) -> Result<AdminSpaceInfo, Error>;
+    fn admin_spaces(&self, query: &UserQuery) -> Result<AdminSpaceList, Error>;
+    fn admin_create_space(&self, request: &AdminCreateSpace) -> Result<AdminSpaceInfo, Error>;
+    fn admin_archive_space(&self, id: SpaceId, confirm: &SpaceConfirm) -> Result<(), Error>;
+    fn admin_unarchive_space(&self, id: SpaceId, confirm: &SpaceConfirm) -> Result<(), Error>;
+    fn admin_set_space_owner(&self, id: SpaceId, request: &AdminSetSpaceOwner) -> Result<(), Error>;
 }
 
 /// The agent through `craft_cloud_app::Client`. It finds the agent again whenever a call finds it gone (the agent
@@ -288,6 +309,57 @@ impl Agent for ClientAgent {
     fn folder_usage(&self) -> Result<FolderUsageResponse, Error> {
         self.with(Client::folder_usage)
     }
+    fn spaces(&self) -> Result<SpaceList, Error> {
+        self.with(Client::spaces)
+    }
+    fn accept_space(&self, id: SpaceId) -> Result<(), Error> {
+        self.with(|c| c.accept_space(id)).map(|_| ())
+    }
+    fn decline_space(&self, id: SpaceId) -> Result<(), Error> {
+        self.with(|c| c.decline_space(id))
+    }
+    fn set_space_sync(&self, id: SpaceId, request: &SpaceSyncRequest) -> Result<SpaceInfo, Error> {
+        self.with(|c| c.set_space_sync(id, request))
+    }
+    fn approve_space_deletes(&self, id: SpaceId, set: Option<&str>) -> Result<ApproveDeletesAnswer, Error> {
+        self.with(|c| c.approve_space_deletes(id, set))
+    }
+    fn space_members(&self, id: SpaceId) -> Result<SpaceMembers, Error> {
+        self.with(|c| c.space_members(id))
+    }
+    fn add_space_member(&self, id: SpaceId, request: &AddSpaceMember) -> Result<SpaceMember, Error> {
+        self.with(|c| c.add_space_member(id, request))
+    }
+    fn change_space_member(&self, id: SpaceId, user: Uuid, request: &ChangeSpaceMember) -> Result<SpaceMember, Error> {
+        self.with(|c| c.change_space_member(id, user, request))
+    }
+    fn remove_space_member(&self, id: SpaceId, user: Uuid) -> Result<(), Error> {
+        self.with(|c| c.remove_space_member(id, user))
+    }
+    fn leave_space(&self, id: SpaceId) -> Result<(), Error> {
+        self.with(|c| c.leave_space(id))
+    }
+    fn space_usage(&self, id: SpaceId) -> Result<SpaceUsage, Error> {
+        self.with(|c| c.space_usage(id))
+    }
+    fn update_space(&self, id: SpaceId, request: &UpdateSpace) -> Result<AdminSpaceInfo, Error> {
+        self.with(|c| c.update_space(id, request))
+    }
+    fn admin_spaces(&self, query: &UserQuery) -> Result<AdminSpaceList, Error> {
+        self.with(|c| c.admin_spaces(query))
+    }
+    fn admin_create_space(&self, request: &AdminCreateSpace) -> Result<AdminSpaceInfo, Error> {
+        self.with(|c| c.admin_create_space(request))
+    }
+    fn admin_archive_space(&self, id: SpaceId, confirm: &SpaceConfirm) -> Result<(), Error> {
+        self.with(|c| c.admin_archive_space(id, confirm))
+    }
+    fn admin_unarchive_space(&self, id: SpaceId, confirm: &SpaceConfirm) -> Result<(), Error> {
+        self.with(|c| c.admin_unarchive_space(id, confirm))
+    }
+    fn admin_set_space_owner(&self, id: SpaceId, request: &AdminSetSpaceOwner) -> Result<(), Error> {
+        self.with(|c| c.admin_set_space_owner(id, request))
+    }
 }
 
 /// Starts the agent and waits for it ([`crate::start_agent::start_and_wait`]), for [`Effect::StartAgent`].
@@ -355,6 +427,10 @@ impl Link {
                 Effect::CheckFile { .. } => Event::FileChecked(Err(crate::files::Place::NotYet)),
                 Effect::Conflicts { ticket, .. } => Event::Conflicts { ticket, result: Err(error) },
                 Effect::FolderUsage { ticket, .. } => Event::FolderUsage { ticket, result: Err(error) },
+                Effect::Spaces(call) => Event::Spaces(spaces_failed(&call, error)),
+                Effect::AdminSpaces { ticket, .. } => Event::Admin(AdminEvent::Spaces { ticket, result: Err(error) }),
+                Effect::AdminFindAccount { ticket, .. } => Event::Admin(AdminEvent::AccountFound { ticket, result: Err(error) }),
+                Effect::AdminDo { .. } => Event::Admin(AdminEvent::Done(Err(error))),
                 _ => Event::Polled(Err(error)),
             };
             let _ = self.tx.send(event);
@@ -433,6 +509,9 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         }
         Effect::AuditExport { query, path, ticket } => Event::Audit(AuditMsg::Exported { ticket, result: export_to_file(agent, &query, &path) }),
         Effect::AdminDo { action, confirm } => Event::Admin(AdminEvent::Done(change(agent, &action, confirm))),
+        Effect::AdminSpaces { query, ticket } => Event::Admin(AdminEvent::Spaces { ticket, result: agent.admin_spaces(&query) }),
+        Effect::AdminFindAccount { name, ticket } => Event::Admin(AdminEvent::AccountFound { ticket, result: find_account(agent, &name) }),
+        Effect::Spaces(call) => Event::Spaces(spaces_call(agent, call)),
         // Not running is as good as stopped.
         Effect::QuitAgent => {
             let _ = agent.quit();
@@ -456,6 +535,65 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         | Effect::PickFolder(_)
         | Effect::PickExportFile { .. } => return None,
     })
+}
+
+/// The answer of a call of the Shared tab that could not even be started (no thread): the error, so that nothing waits for it.
+fn spaces_failed(call: &SpacesCall, error: Error) -> SpacesMsg {
+    match call {
+        SpacesCall::List { ticket } => SpacesMsg::Listed { ticket: *ticket, result: Err(error) },
+        SpacesCall::Usage { space, ticket } => SpacesMsg::Usage { space: *space, ticket: *ticket, result: Err(error) },
+        SpacesCall::Accept { space, ticket } => SpacesMsg::Accepted { space: *space, ticket: *ticket, result: Err(error) },
+        SpacesCall::Decline { space, ticket } => SpacesMsg::Declined { space: *space, ticket: *ticket, result: Err(error) },
+        SpacesCall::Sync { space, ticket, .. } => SpacesMsg::SyncSet { space: *space, ticket: *ticket, result: Err(error) },
+        SpacesCall::Members { space, ticket } => SpacesMsg::Members { space: *space, ticket: *ticket, result: Err(error) },
+        SpacesCall::AddMember { space, ticket, .. } => SpacesMsg::MemberAdded { space: *space, ticket: *ticket, result: Err(error) },
+        SpacesCall::ChangeMember { space, ticket, .. } => SpacesMsg::MemberChanged { space: *space, ticket: *ticket, result: Err(error) },
+        SpacesCall::RemoveMember { space, ticket, .. } => SpacesMsg::MemberRemoved { space: *space, ticket: *ticket, result: Err(error) },
+        SpacesCall::Leave { space, ticket } => SpacesMsg::Left { space: *space, ticket: *ticket, result: Err(error) },
+        SpacesCall::Rename { space, ticket, .. } => SpacesMsg::Renamed { space: *space, ticket: *ticket, result: Err(error) },
+        SpacesCall::LookAtDeletes { space, ticket } | SpacesCall::ApproveDeletes { space, ticket, .. } => {
+            SpacesMsg::Deletes { space: *space, ticket: *ticket, result: Err(error) }
+        }
+    }
+}
+
+/// The account called exactly `name` (any case), from the server's list of accounts: the owner a team space is given. The
+/// list is searched by name, so the account is among the first page unless more than a page of names contain it.
+fn find_account(agent: &dyn Agent, name: &str) -> Result<Option<AdminUserInfo>, Error> {
+    let query = UserQuery { cursor: None, limit: Some(200), query: Some(name.to_owned()) };
+    let list = agent.admin_users(&query)?;
+    Ok(list.users.into_iter().find(|u| u.username.eq_ignore_ascii_case(name)))
+}
+
+/// Makes one call of the Shared tab, blocking, and gives its answer as the message the page expects.
+fn spaces_call(agent: &dyn Agent, call: SpacesCall) -> SpacesMsg {
+    match call {
+        SpacesCall::List { ticket } => SpacesMsg::Listed { ticket, result: agent.spaces() },
+        SpacesCall::Usage { space, ticket } => SpacesMsg::Usage { space, ticket, result: agent.space_usage(space) },
+        SpacesCall::Accept { space, ticket } => SpacesMsg::Accepted { space, ticket, result: agent.accept_space(space) },
+        SpacesCall::Decline { space, ticket } => SpacesMsg::Declined { space, ticket, result: agent.decline_space(space) },
+        SpacesCall::Sync { space, request, ticket } => SpacesMsg::SyncSet { space, ticket, result: agent.set_space_sync(space, &request) },
+        SpacesCall::Members { space, ticket } => SpacesMsg::Members { space, ticket, result: agent.space_members(space).map(|m| m.members) },
+        SpacesCall::AddMember { space, request, ticket } => SpacesMsg::MemberAdded { space, ticket, result: agent.add_space_member(space, &request) },
+        SpacesCall::ChangeMember { space, user, role, ticket } => {
+            let request = ChangeSpaceMember { role, confirm: SpaceConfirm::default() };
+            SpacesMsg::MemberChanged { space, ticket, result: agent.change_space_member(space, user, &request) }
+        }
+        SpacesCall::RemoveMember { space, user, ticket } => {
+            SpacesMsg::MemberRemoved { space, ticket, result: agent.remove_space_member(space, user) }
+        }
+        SpacesCall::Leave { space, ticket } => SpacesMsg::Left { space, ticket, result: agent.leave_space(space) },
+        SpacesCall::Rename { space, name, ticket } => {
+            let request = UpdateSpace { name: Some(name), quota_bytes: None, confirm: SpaceConfirm::default() };
+            SpacesMsg::Renamed { space, ticket, result: agent.update_space(space, &request).map(|info| info.name) }
+        }
+        SpacesCall::LookAtDeletes { space, ticket } => {
+            SpacesMsg::Deletes { space, ticket, result: agent.approve_space_deletes(space, Some(crate::spaces::LOOK)) }
+        }
+        SpacesCall::ApproveDeletes { space, set, ticket } => {
+            SpacesMsg::Deletes { space, ticket, result: agent.approve_space_deletes(space, Some(&set)) }
+        }
+    }
 }
 
 /// The recent files of every app of the suite ([`crate::files::APPS`]), asked for one after the other, each placed against the
@@ -552,6 +690,29 @@ fn change(agent: &dyn Agent, action: &Action, confirm: AdminConfirm) -> Result<O
             let request = AdminSetCompressionLevel { level: *level, password, totp_code, recovery_code };
             agent.admin_set_compression_level(&request).map(|compression| Outcome::Compression(Box::new(compression)))
         }
+        Action::CreateSpace { name, owner, quota, .. } => {
+            let request = AdminCreateSpace {
+                name: name.clone(),
+                owner: *owner,
+                quota_bytes: *quota,
+                confirm: SpaceConfirm { password, totp_code, recovery_code },
+            };
+            agent.admin_create_space(&request).map(|info| Outcome::Space(Box::new(info)))
+        }
+        Action::SetSpaceLimit { id, quota, .. } => {
+            let request = UpdateSpace { name: None, quota_bytes: Some(*quota), confirm: SpaceConfirm { password, totp_code, recovery_code } };
+            agent.update_space(*id, &request).map(|info| Outcome::Space(Box::new(info)))
+        }
+        Action::ArchiveSpace { id, .. } => {
+            agent.admin_archive_space(*id, &SpaceConfirm { password, totp_code, recovery_code }).map(|()| Outcome::Done)
+        }
+        Action::UnarchiveSpace { id, .. } => {
+            agent.admin_unarchive_space(*id, &SpaceConfirm { password, totp_code, recovery_code }).map(|()| Outcome::Done)
+        }
+        Action::SetSpaceOwner { id, owner, .. } => {
+            let request = AdminSetSpaceOwner { user: *owner, confirm: SpaceConfirm { password, totp_code, recovery_code } };
+            agent.admin_set_space_owner(*id, &request).map(|()| Outcome::Done)
+        }
     }
 }
 
@@ -560,7 +721,71 @@ pub(crate) mod fake {
     //! A fake agent: a signed-in or signed-out status, answers set per call, and a switch that makes it go away.
 
     use super::*;
+    use craft_cloud_app::{SpaceRole, SpaceRun, SpaceSync};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// What the fake agent's team space calls work on: the spaces the agent lists, their members and usage, and the
+    /// administrator's list of team spaces.
+    #[derive(Debug, Default)]
+    pub struct TeamFake {
+        pub spaces: Vec<SpaceInfo>,
+        pub members: Vec<(SpaceId, Vec<SpaceMember>)>,
+        pub usage: Vec<(SpaceId, SpaceUsage)>,
+        pub admin_spaces: Vec<AdminSpaceInfo>,
+        /// Every team call answers the agent's "no such call", as an agent from before team spaces does.
+        pub too_old: bool,
+        /// Failures the next team calls answer instead of succeeding (from the end).
+        pub fails: Vec<Error>,
+        /// The deletions the mass-delete guard holds back: the first approve call lists them, the next approves them.
+        pub held: Vec<String>,
+        pub approved_deletes: usize,
+        /// The set each approve call named (`None`: none).
+        pub deletes_sets: Vec<Option<String>>,
+        /// The sync requests that came, in order.
+        pub syncs: Vec<(SpaceId, SpaceSyncRequest)>,
+        /// The folder that has files in it (a sync into it needs `adopt`).
+        pub folder_with_files: Option<String>,
+        /// A log of the team calls (`name:space`).
+        pub log: Vec<String>,
+        /// What each call of `update_space` was sent.
+        pub updates: Vec<(SpaceId, UpdateSpace)>,
+    }
+
+    /// A team space as the agent lists it: `state` is `active` or `invited`.
+    pub fn team_space(name: &str, role: SpaceRole, state: &str) -> SpaceInfo {
+        SpaceInfo {
+            space: SpaceId::generate(),
+            kind: "team".into(),
+            name: Some(name.to_owned()),
+            role,
+            state: state.into(),
+            archived: false,
+            folder: (state != "invited").then(|| format!("/home/fabio/Craft Cloud Shared/{name}")),
+            sync: SpaceSync::Off,
+            run_state: None,
+            last_sync_ms: None,
+            read_only: false,
+        }
+    }
+
+    /// A member of a team space.
+    pub fn team_member(username: &str, role: SpaceRole, state: &str, n: u128) -> SpaceMember {
+        SpaceMember { user: Uuid::from_u128(0x7000 + n), username: username.to_owned(), role, state: state.into(), colour: (n % 12) as u8 }
+    }
+
+    /// A team space as the administrator's list shows it.
+    pub fn admin_space(name: &str, members: u64, stored: u64, quota: Option<u64>) -> AdminSpaceInfo {
+        AdminSpaceInfo {
+            id: SpaceId::generate(),
+            name: name.to_owned(),
+            created_ms: 1_780_000_000_000,
+            archived_ms: None,
+            members,
+            owners: 1,
+            stored_bytes: stored,
+            quota_bytes: quota,
+        }
+    }
 
     /// The password, code and recovery code the fake's account takes.
     pub const PASSWORD: &str = "correct horse battery";
@@ -623,6 +848,8 @@ pub(crate) mod fake {
         /// The (computer, name) of each rename asked for, and failures a rename answers instead of succeeding (from the end).
         pub renames: Mutex<Vec<(DeviceId, String)>>,
         pub rename_fails: Mutex<Vec<Error>>,
+        /// The team spaces the fake agent lists and works on.
+        pub team: Mutex<TeamFake>,
     }
 
     fn refused(code: &str, message: &str) -> Error {
@@ -659,6 +886,7 @@ pub(crate) mod fake {
                 devices: Mutex::new(Vec::new()),
                 renames: Mutex::new(Vec::new()),
                 rename_fails: Mutex::new(Vec::new()),
+                team: Mutex::new(TeamFake::default()),
             }
         }
 
@@ -754,6 +982,21 @@ pub(crate) mod fake {
             let events: Vec<_> = all.iter().skip(from).take(limit).cloned().collect();
             let next = (from + limit < all.len()).then(|| (from + limit).to_string());
             AuditPage { events, next }
+        }
+
+        /// A team call: answered as an agent from before team spaces answers it when `too_old` is set, else by `f` on the
+        /// team state (after a failure set up).
+        fn team<T>(&self, what: &str, f: impl FnOnce(&mut TeamFake) -> Result<T, Error>) -> Result<T, Error> {
+            self.answer(what, |_| ())?;
+            let mut team = self.team.lock().unwrap();
+            team.log.push(what.to_owned());
+            if team.too_old {
+                return Err(refused("agent_too_old", "the Craft Cloud agent on this computer is too old for team spaces: update Craft Cloud"));
+            }
+            if let Some(e) = team.fails.pop() {
+                return Err(e);
+            }
+            f(&mut team)
         }
 
         fn user(&self, id: Uuid) -> AdminUserInfo {
@@ -1161,6 +1404,236 @@ pub(crate) mod fake {
         fn folder_usage(&self) -> Result<craft_cloud_app::FolderUsageResponse, Error> {
             self.answer("folder_usage", |_| ())?;
             self.folder_sizes.lock().unwrap().clone().unwrap_or_else(|| Ok(craft_cloud_app::FolderUsageResponse::default()))
+        }
+        fn spaces(&self) -> Result<SpaceList, Error> {
+            self.team("spaces", |t| Ok(SpaceList { spaces: t.spaces.clone() }))
+        }
+        fn accept_space(&self, id: SpaceId) -> Result<(), Error> {
+            self.team(&format!("accept:{id}"), |t| {
+                let Some(space) = t.spaces.iter_mut().find(|s| s.space == id && s.state == "invited") else {
+                    return Err(refused("not_found", "server: not found"));
+                };
+                space.state = "active".into();
+                space.folder = Some(format!("/home/fabio/Craft Cloud Shared/{}", space.name.clone().unwrap_or_default()));
+                Ok(())
+            })
+        }
+        fn decline_space(&self, id: SpaceId) -> Result<(), Error> {
+            self.team(&format!("decline:{id}"), |t| {
+                let before = t.spaces.len();
+                t.spaces.retain(|s| !(s.space == id && s.state == "invited"));
+                if t.spaces.len() == before { Err(refused("not_found", "server: not found")) } else { Ok(()) }
+            })
+        }
+        fn set_space_sync(&self, id: SpaceId, request: &SpaceSyncRequest) -> Result<SpaceInfo, Error> {
+            self.team(&format!("sync:{id}"), |t| {
+                t.syncs.push((id, request.clone()));
+                let folder_with_files = t.folder_with_files.clone();
+                let Some(space) = t.spaces.iter_mut().find(|s| s.space == id) else {
+                    return Err(refused("not_found", "no such team space"));
+                };
+                if request.on {
+                    let folder = request.folder.clone().or_else(|| space.folder.clone());
+                    if folder.is_some() && folder == folder_with_files && !request.adopt {
+                        return Err(refused("folder_has_files", "that folder has files in it; sync it with adopt"));
+                    }
+                    space.folder = folder;
+                    space.sync = SpaceSync::On;
+                    space.run_state = Some(SpaceRun::Idle);
+                } else {
+                    space.sync = SpaceSync::Off;
+                    space.run_state = None;
+                }
+                Ok(space.clone())
+            })
+        }
+        fn approve_space_deletes(&self, id: SpaceId, set: Option<&str>) -> Result<ApproveDeletesAnswer, Error> {
+            self.team(&format!("deletes:{id}"), |t| {
+                t.deletes_sets.push(set.map(str::to_owned));
+                if t.held.is_empty() {
+                    return Ok(ApproveDeletesAnswer { approved: false, message: "nothing was waiting for approval".into() });
+                }
+                // As the agent does: the set that is waiting is approved only when it is named; any other name lists it.
+                let lines = t.held.iter().map(|path| format!("  delete on the server: {path}")).collect::<Vec<_>>().join("\n");
+                if set == Some("abc123") {
+                    t.approved_deletes += t.held.len();
+                    t.held.clear();
+                    Ok(ApproveDeletesAnswer { approved: true, message: format!("the running agent will carry out these deletions (set abc123):\n{lines}") })
+                } else {
+                    Ok(ApproveDeletesAnswer {
+                        approved: false,
+                        message: format!(
+                            "waiting for approval, set abc123 (check the list above, then approve its set):\n{lines}\nnothing approved: set {} isn't a set waiting now",
+                            set.unwrap_or("-")
+                        ),
+                    })
+                }
+            })
+        }
+        fn space_members(&self, id: SpaceId) -> Result<SpaceMembers, Error> {
+            self.team(&format!("members:{id}"), |t| {
+                Ok(SpaceMembers { members: t.members.iter().find(|(s, _)| *s == id).map(|(_, m)| m.clone()).unwrap_or_default() })
+            })
+        }
+        fn add_space_member(&self, id: SpaceId, request: &AddSpaceMember) -> Result<SpaceMember, Error> {
+            self.team(&format!("invite:{id}:{}", request.username), |t| {
+                if request.username == "nobody" {
+                    return Err(refused("not_found", "no such account"));
+                }
+                let list = match t.members.iter_mut().find(|(s, _)| *s == id) {
+                    Some((_, list)) => list,
+                    None => {
+                        t.members.push((id, Vec::new()));
+                        &mut t.members.last_mut().ok_or_else(|| refused("internal", "no list"))?.1
+                    }
+                };
+                let member = team_member(&request.username, request.role, "invited", 100 + list.len() as u128);
+                list.push(member.clone());
+                Ok(member)
+            })
+        }
+        fn change_space_member(&self, id: SpaceId, user: Uuid, request: &ChangeSpaceMember) -> Result<SpaceMember, Error> {
+            self.team(&format!("role:{id}:{user}"), |t| {
+                let member = t
+                    .members
+                    .iter_mut()
+                    .find(|(s, _)| *s == id)
+                    .and_then(|(_, list)| list.iter_mut().find(|m| m.user == user))
+                    .ok_or_else(|| refused("not_found", "no such member"))?;
+                member.role = request.role;
+                Ok(member.clone())
+            })
+        }
+        fn remove_space_member(&self, id: SpaceId, user: Uuid) -> Result<(), Error> {
+            self.team(&format!("remove:{id}:{user}"), |t| {
+                let list = t.members.iter_mut().find(|(s, _)| *s == id).map(|(_, l)| l).ok_or_else(|| refused("not_found", "no such member"))?;
+                let before = list.len();
+                list.retain(|m| m.user != user);
+                if list.len() == before { Err(refused("not_found", "no such member")) } else { Ok(()) }
+            })
+        }
+        fn leave_space(&self, id: SpaceId) -> Result<(), Error> {
+            self.team(&format!("leave:{id}"), |t| {
+                let Some(space) = t.spaces.iter_mut().find(|s| s.space == id) else { return Err(refused("not_found", "no such team space")) };
+                // As the real agent leaves it: not syncing any more, the folder kept, the account no longer a member (the list is
+                // asked again and no longer has it).
+                space.sync = SpaceSync::Off;
+                t.spaces.retain(|s| s.space != id);
+                Ok(())
+            })
+        }
+        fn space_usage(&self, id: SpaceId) -> Result<SpaceUsage, Error> {
+            self.team(&format!("usage:{id}"), |t| {
+                Ok(t.usage.iter().find(|(s, _)| *s == id).map(|(_, u)| u.clone()).unwrap_or(SpaceUsage {
+                    stored_bytes: 0,
+                    quota_bytes: None,
+                    trash_bytes: None,
+                    history_bytes: None,
+                    live_bytes: 0,
+                    estimates: craft_cloud_app::UsageEstimates { index_complete: true, reason: None },
+                }))
+            })
+        }
+        fn update_space(&self, id: SpaceId, request: &UpdateSpace) -> Result<AdminSpaceInfo, Error> {
+            self.passwords.lock().unwrap().push(request.confirm.password.clone());
+            self.factors.lock().unwrap().push((request.confirm.totp_code.clone(), request.confirm.recovery_code.clone()));
+            if request.quota_bytes.is_some() {
+                self.admin_call(&format!("limit:{id}"), || ())?;
+                if let Some(e) = self.admin_fails.lock().unwrap().pop() {
+                    return Err(e);
+                }
+            }
+            self.team(&format!("update:{id}"), |t| {
+                t.updates.push((id, request.clone()));
+                let named = t.spaces.iter().find(|s| s.space == id).and_then(|s| s.name.clone());
+                if let Some(name) = &request.name
+                    && let Some(space) = t.spaces.iter_mut().find(|s| s.space == id)
+                {
+                    space.name = Some(name.clone());
+                }
+                let info = match t.admin_spaces.iter_mut().find(|s| s.id == id) {
+                    Some(info) => info,
+                    None => {
+                        t.admin_spaces.push(AdminSpaceInfo { id, ..admin_space(&named.unwrap_or_default(), 1, 0, None) });
+                        t.admin_spaces.last_mut().ok_or_else(|| refused("internal", "no list"))?
+                    }
+                };
+                if let Some(name) = &request.name {
+                    info.name = name.clone();
+                }
+                if let Some(quota) = request.quota_bytes {
+                    info.quota_bytes = quota;
+                }
+                Ok(info.clone())
+            })
+        }
+        fn admin_spaces(&self, query: &UserQuery) -> Result<AdminSpaceList, Error> {
+            self.admin_call("admin_spaces", || ())?;
+            self.team("admin_spaces", |t| {
+                let needle = query.query.clone().unwrap_or_default().to_lowercase();
+                let all: Vec<AdminSpaceInfo> = t.admin_spaces.iter().filter(|s| s.name.to_lowercase().contains(&needle)).cloned().collect();
+                let from = query.cursor.as_deref().and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+                let limit = query.limit.unwrap_or(50) as usize;
+                let spaces: Vec<_> = all.iter().skip(from).take(limit).cloned().collect();
+                let next = (from + limit < all.len()).then(|| (from + limit).to_string());
+                Ok(AdminSpaceList { spaces, next })
+            })
+        }
+        fn admin_create_space(&self, request: &AdminCreateSpace) -> Result<AdminSpaceInfo, Error> {
+            self.admin_change(
+                &format!("create_space:{}", request.name),
+                request.confirm.password.clone(),
+                (request.confirm.totp_code.clone(), request.confirm.recovery_code.clone()),
+                || (),
+            )?;
+            self.team("create_space", |t| {
+                let info = admin_space(&request.name, 1, 0, request.quota_bytes);
+                t.admin_spaces.push(info.clone());
+                Ok(info)
+            })
+        }
+        fn admin_archive_space(&self, id: SpaceId, confirm: &SpaceConfirm) -> Result<(), Error> {
+            self.admin_change(
+                &format!("archive_space:{id}"),
+                confirm.password.clone(),
+                (confirm.totp_code.clone(), confirm.recovery_code.clone()),
+                || (),
+            )?;
+            self.team("archive_space", |t| {
+                if let Some(info) = t.admin_spaces.iter_mut().find(|s| s.id == id) {
+                    info.archived_ms = Some(1_790_000_000_000);
+                }
+                Ok(())
+            })
+        }
+        fn admin_unarchive_space(&self, id: SpaceId, confirm: &SpaceConfirm) -> Result<(), Error> {
+            self.admin_change(
+                &format!("unarchive_space:{id}"),
+                confirm.password.clone(),
+                (confirm.totp_code.clone(), confirm.recovery_code.clone()),
+                || (),
+            )?;
+            self.team("unarchive_space", |t| {
+                if let Some(info) = t.admin_spaces.iter_mut().find(|s| s.id == id) {
+                    info.archived_ms = None;
+                }
+                Ok(())
+            })
+        }
+        fn admin_set_space_owner(&self, id: SpaceId, request: &AdminSetSpaceOwner) -> Result<(), Error> {
+            self.admin_change(
+                &format!("space_owner:{id}:{}", request.user),
+                request.confirm.password.clone(),
+                (request.confirm.totp_code.clone(), request.confirm.recovery_code.clone()),
+                || (),
+            )?;
+            self.team("space_owner", |t| {
+                if let Some(info) = t.admin_spaces.iter_mut().find(|s| s.id == id) {
+                    info.owners += 1;
+                    info.members += 1;
+                }
+                Ok(())
+            })
         }
     }
 

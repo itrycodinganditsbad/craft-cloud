@@ -1,15 +1,16 @@
 //! The admin pages: the users (search, pages), a new account, one account (role, quota, disable, invites, devices),
 //! the password a change asks for, and the code a change made, shown once. The Accounts, Storage and Audit log parts
-//! share one switcher (a segmented control); the audit log opens inside these pages with the switcher over it.
+//! share one switcher (a segmented control); the audit log opens inside these pages with the switcher over it. The Team spaces
+//! part lists the server's team spaces, with a form for a new one and a page for each.
 
 use egui::{Align, Layout, RichText};
 
 use super::kit::{self, Column, JoinedCell, Part, Segment, Tokens, Tone};
 use crate::admin::{
-    Action, AdminEvent, AdminScreen, Basis, CodeKind, CreateForm, Dialog, RoleChoice, Room, Section, ShownCode, StorageBlock, StoreRoom, UserList,
-    UserView, View, Warning, format_bytes,
+    Action, AdminEvent, AdminScreen, Basis, CodeKind, CreateForm, CreateSpaceForm, Dialog, RoleChoice, Room, Section, ShownCode, SpaceList,
+    SpaceView, StorageBlock, StoreRoom, UserList, UserView, View, Warning, format_bytes,
 };
-use craft_cloud_app::AdminUserInfo;
+use craft_cloud_app::{AdminSpaceInfo, AdminUserInfo};
 
 use crate::model::Event;
 
@@ -60,15 +61,18 @@ pub(super) fn show(ui: &mut egui::Ui, admin: &mut AdminScreen, now_ms: i64, even
                 now_ms,
             },
             &mut admin.list,
+            &mut admin.spaces,
             &me,
             events,
         ),
         View::Create(form) => create(ui, form, events),
+        View::CreateSpace(form) => create_space(ui, form, events),
+        View::Space(view) => space_page(ui, view, events),
         View::Audit(view) => {
             // Refresh sits beside the switcher, as it does on the other two parts.
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
-                switcher(ui, 2, events);
+                switcher(ui, 3, events);
                 if ui.add_enabled(!view.list.loading, kit::Button::new("Refresh")).clicked() {
                     events.push(Event::Audit(crate::audit::AuditMsg::Reload));
                 }
@@ -294,11 +298,12 @@ fn warning_tags(ui: &mut egui::Ui, warnings: &[Warning]) {
 /// The switcher of the admin pages: Accounts, Storage and Audit log as one segmented control. `selected` is the index of
 /// the part that is shown; a click on another part sends the event that shows it.
 fn switcher(ui: &mut egui::Ui, selected: usize, events: &mut Vec<Event>) {
-    let segments = [Segment::new("Accounts"), Segment::new("Storage"), Segment::new("Audit log")];
+    let segments = [Segment::new("Accounts"), Segment::new("Storage"), Segment::new("Team spaces"), Segment::new("Audit log")];
     match kit::segmented(ui, "Admin section", &segments, selected) {
         Some(i) if i != selected => match i {
             0 => send(events, AdminEvent::Show(Section::Accounts)),
             1 => send(events, AdminEvent::Show(Section::Storage)),
+            2 => send(events, AdminEvent::Show(Section::Spaces)),
             _ => events.push(Event::Audit(crate::audit::AuditMsg::OpenAudit(None))),
         },
         _ => {}
@@ -306,20 +311,33 @@ fn switcher(ui: &mut egui::Ui, selected: usize, events: &mut Vec<Event>) {
 }
 
 /// The admin landing page: the switcher over the part that is shown.
+#[allow(clippy::too_many_arguments)]
 fn landing(
     ui: &mut egui::Ui,
     section: Section,
     server: Option<&craft_cloud_app::AdminServerInfo>,
     storage: StorageState<'_>,
     list: &mut UserList,
+    spaces: &mut SpaceList,
     me: &str,
     events: &mut Vec<Event>,
 ) {
     let now_ms = storage.now_ms;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 12.0;
-        switcher(ui, if section == Section::Accounts { 0 } else { 1 }, events);
-        if ui.add_enabled(!list.loading, kit::Button::new("Refresh")).clicked() {
+        switcher(
+            ui,
+            if section == Section::Accounts {
+                0
+            } else if section == Section::Storage {
+                1
+            } else {
+                2
+            },
+            events,
+        );
+        let busy = if section == Section::Spaces { spaces.loading } else { list.loading };
+        if ui.add_enabled(!busy, kit::Button::new("Refresh")).clicked() {
             send(events, AdminEvent::Reload);
         }
         if let Some(info) = server {
@@ -336,6 +354,7 @@ fn landing(
     match section {
         Section::Accounts => accounts(ui, storage, server, list, me, now_ms, events),
         Section::Storage => storage_page(ui, storage, events),
+        Section::Spaces => team_spaces(ui, spaces, events),
     }
 }
 
@@ -1103,6 +1122,332 @@ fn create(ui: &mut egui::Ui, form: &mut CreateForm, events: &mut Vec<Event>) {
     );
 }
 
+// ---- the Team spaces part ----
+
+/// The state of a team space as tags: Archived, or Active.
+fn space_state(ui: &mut egui::Ui, space: &AdminSpaceInfo) {
+    ui.horizontal(|ui| {
+        if space.archived_ms.is_some() {
+            kit::tag(ui, "Archived", Tone::Neutral);
+        } else {
+            kit::tag(ui, "Active", Tone::Good);
+        }
+        if space.owners == 0 {
+            kit::tag(ui, "No owner", Tone::Bad);
+        }
+    });
+}
+
+/// The search row of the team spaces: its label, the field, Find, Clear (while a search is applied) and New team space.
+fn spaces_search_row(ui: &mut egui::Ui, list: &mut SpaceList, events: &mut Vec<Event>, rtl: bool) {
+    let mut piece = |ui: &mut egui::Ui, n: usize| match n {
+        0 => {
+            kit::section_label(ui, "Search");
+        }
+        1 => {
+            let field = ui.add(kit::text_edit(&mut list.search).id(super::shortcuts::search_id()).hint_text("Space name").desired_width(220.0));
+            if entered(&field, ui) {
+                send(events, AdminEvent::SearchSpaces);
+            }
+        }
+        2 => {
+            if ui.add(kit::Button::new("Find")).clicked() {
+                send(events, AdminEvent::SearchSpaces);
+            }
+        }
+        3 => {
+            if !list.applied.is_empty() && ui.add(kit::Button::new("Clear")).clicked() {
+                send(events, AdminEvent::ClearSpacesSearch);
+            }
+        }
+        _ => {
+            if ui.add(kit::Button::new("New team space").primary()).clicked() {
+                send(events, AdminEvent::NewSpace);
+            }
+        }
+    };
+    if rtl {
+        for n in (0..5).rev() {
+            piece(ui, n);
+        }
+    } else {
+        for n in 0..5 {
+            piece(ui, n);
+        }
+    }
+}
+
+/// The Team spaces part of the landing page: the server's team spaces, a page of them, found by name.
+fn team_spaces(ui: &mut egui::Ui, list: &mut SpaceList, events: &mut Vec<Event>) {
+    let title = kit::numbered(1, "Team spaces on this server");
+    if ui.available_width() >= 760.0 {
+        kit::label_row(ui, &title, |ui| spaces_search_row(ui, list, events, true));
+    } else {
+        kit::section_label(ui, &title);
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| spaces_search_row(ui, list, events, false));
+    }
+    ui.add_space(8.0);
+    if let Some(error) = &list.error {
+        super::error_line(ui, error);
+        ui.add_space(6.0);
+    }
+    if list.loading && !list.loaded {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Asking the server…");
+        });
+    } else if list.spaces.is_empty() && list.loaded && list.error.is_none() {
+        ui.label(if list.applied.is_empty() {
+            "No team spaces yet. Make one with New team space: it gets a first owner, who invites the other members."
+        } else {
+            "No team space has that in its name."
+        });
+    }
+    if !list.spaces.is_empty() {
+        let spaces = list.spaces.clone();
+        spaces_table(ui, &spaces, events);
+    }
+    if list.has_previous() || list.next.is_some() {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.add_enabled(list.has_previous() && !list.loading, kit::Button::new("Previous")).clicked() {
+                send(events, AdminEvent::PreviousSpaces);
+            }
+            ui.label(format!("Page {}", list.page()));
+            if ui.add_enabled(list.next.is_some() && !list.loading, kit::Button::new("Next")).clicked() {
+                send(events, AdminEvent::NextSpaces);
+            }
+        });
+    }
+}
+
+fn spaces_table(ui: &mut egui::Ui, spaces: &[AdminSpaceInfo], events: &mut Vec<Event>) {
+    let t = Tokens::get(ui.ctx());
+    let columns = [
+        Column::flex("Space", 150.0).weighted(2.0),
+        Column::fixed("Owners", 80.0),
+        Column::fixed("Members", 90.0),
+        Column::flex("Used of limit", 160.0).weighted(1.4),
+        Column::fixed("State", 196.0),
+        Column::fixed("", 110.0),
+    ];
+    kit::table(ui, "admin-spaces", &columns, spaces.len(), ROW_H, |ui, row, column| {
+        let Some(space) = spaces.get(row) else { return };
+        match column {
+            0 => {
+                kit::truncated(ui, RichText::new(&space.name).strong());
+            }
+            1 => {
+                ui.label(RichText::new(space.owners.to_string()).monospace());
+            }
+            2 => {
+                ui.label(RichText::new(space.members.to_string()).monospace());
+            }
+            3 => {
+                let width = ui.available_width();
+                let line = 18.0;
+                let block = if space.quota_bytes.is_some() { line + 6.0 + 4.0 } else { line };
+                ui.vertical(|ui| {
+                    ui.set_width(width);
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    ui.add_space((((ROW_H - block) / 2.0) - 6.0).max(0.0).floor());
+                    ui.allocate_ui_with_layout(egui::vec2(width, line), Layout::left_to_right(Align::Center), |ui| {
+                        ui.label(RichText::new(format_bytes(space.stored_bytes)).monospace());
+                        match space.quota_bytes {
+                            Some(quota) => {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.label(RichText::new(format!("of {}", format_bytes(quota))).color(t.muted));
+                                });
+                            }
+                            None => {
+                                ui.label(RichText::new("· no limit").color(t.muted));
+                            }
+                        }
+                    });
+                    if let Some(quota) = space.quota_bytes {
+                        bar_sized(ui, Some(Room { used: space.stored_bytes, total: quota }), width, 4.0, false);
+                    }
+                });
+            }
+            4 => space_state(ui, space),
+            _ => {
+                if ui.add(kit::Button::new("Manage")).clicked() {
+                    send(events, AdminEvent::OpenSpace(space.id));
+                }
+            }
+        }
+    });
+}
+
+/// "Admin / Team spaces / Studio" with "Team spaces" a link back to the list.
+fn spaces_breadcrumb(ui: &mut egui::Ui, last: &str, events: &mut Vec<Event>) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        kit::section_label(ui, "Admin /");
+        if kit::text_link(ui, "Team spaces", 12.0).on_hover_text("Back to the team spaces").clicked() {
+            send(events, AdminEvent::BackToSpaces);
+        }
+        kit::section_label(ui, &format!("/ {last}"));
+    });
+    ui.add_space(4.0);
+}
+
+/// The form for a new team space: its name, its first owner (an account name) and a limit.
+fn create_space(ui: &mut egui::Ui, form: &mut CreateSpaceForm, events: &mut Vec<Event>) {
+    spaces_breadcrumb(ui, "New", events);
+    big_headline(ui, "New team space");
+    ui.add_space(18.0);
+    ui.scope(|ui| {
+        ui.set_max_width(NARROW_PANEL);
+        let title = kit::numbered(1, "Name, owner and limit");
+        panel(
+            ui,
+            Some(&title),
+            |_| {},
+            |ui| {
+                section(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    kit::section_label(ui, "Name");
+                    let name = ui.add(kit::text_edit_large(&mut form.name).hint_text("Studio").desired_width(f32::INFINITY));
+                    let mut enter = entered(&name, ui);
+                    ui.add_space(8.0);
+                    kit::section_label(ui, "First owner (account name)");
+                    let owner = ui.add(kit::text_edit_large(&mut form.owner).hint_text("ana").desired_width(f32::INFINITY));
+                    enter |= entered(&owner, ui);
+                    ui.add_space(8.0);
+                    kit::section_label(ui, "Limit in MiB (at least 4, empty for none)");
+                    let limit = ui.add(kit::text_edit_large(&mut form.limit).hint_text("20480").desired_width(f32::INFINITY));
+                    enter |= entered(&limit, ui);
+                    small_weak(
+                        ui,
+                        "The owner joins at once and invites the other members. Nobody else gets access to the files, administrators included.",
+                    );
+                    if let Some(error) = &form.error {
+                        ui.add_space(4.0);
+                        super::error_line(ui, error);
+                    }
+                    ui.add_space(14.0);
+                    if form.is_checking() {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Looking the owner up…");
+                        });
+                    } else if full_button(ui, "Continue", ButtonStyle::Primary, kit::CONTROL_H_LARGE).clicked() || enter {
+                        send(events, AdminEvent::SubmitSpace);
+                    }
+                    if full_button(ui, "Cancel", ButtonStyle::Outlined, kit::CONTROL_H_LARGE).clicked() {
+                        send(events, AdminEvent::BackToSpaces);
+                    }
+                });
+            },
+        );
+    });
+}
+
+/// One team space's page: what it holds, its limit, archive and owner.
+fn space_page(ui: &mut egui::Ui, view: &mut SpaceView, events: &mut Vec<Event>) {
+    let t = Tokens::get(ui.ctx());
+    spaces_breadcrumb(ui, &view.space.name, events);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        big_headline(ui, &view.space.name);
+        space_state(ui, &view.space);
+    });
+    ui.add_space(18.0);
+    let archived = view.space.archived_ms.is_some();
+    let title = kit::numbered(1, "Space");
+    ui.scope(|ui| {
+        ui.set_max_width(NARROW_PANEL);
+        panel(ui, Some(&title), |_| {}, |ui| {
+            kv(ui, "Members", |ui| {
+                ui.label(RichText::new(view.space.members.to_string()).monospace());
+            });
+            kv(ui, "Owners", |ui| {
+                ui.label(RichText::new(view.space.owners.to_string()).monospace());
+            });
+            kv(ui, "Stored", |ui| {
+                ui.label(RichText::new(format_bytes(view.space.stored_bytes)).monospace());
+            });
+            kv(ui, "Limit", |ui| {
+                ui.label(RichText::new(view.space.quota_bytes.map_or_else(|| "none".to_owned(), format_bytes)).monospace());
+            });
+            kv(ui, "Created", |ui| {
+                ui.label(RichText::new(date(view.space.created_ms)).monospace());
+            });
+            section(ui, |ui| {
+                if view.space.owners == 0 {
+                    ui.add(egui::Label::new(RichText::new("Nobody who can sign in owns this space: name an owner below.").color(t.bad)).wrap());
+                }
+                small_weak(ui, "Owners invite and remove members and change their roles from the Craft Cloud app.");
+            });
+        });
+        ui.add_space(18.0);
+        let title = kit::numbered(2, "Limit");
+        panel(ui, Some(&title), |_| {}, |ui| {
+            section(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                kit::section_label(ui, "Limit in MiB (at least 4)");
+                let field = ui.add(kit::text_edit_large(&mut view.limit).hint_text("none").desired_width(f32::INFINITY));
+                let enter = entered(&field, ui);
+                small_weak(ui, "Empty removes the limit. Uploads past it are refused.");
+                ui.add_space(6.0);
+                if ui.add(kit::Button::new("Save the limit").primary()).clicked() || enter {
+                    send(events, AdminEvent::SubmitLimit);
+                }
+            });
+        });
+        ui.add_space(18.0);
+        let title = kit::numbered(3, "Archive");
+        panel(ui, Some(&title), |_| {}, |ui| {
+            section(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                if archived {
+                    small_weak(ui, "Members can only read it while it is archived. Bringing it back lets them change files again, as their roles allow.");
+                    if ui.add(kit::Button::new("Bring the space back")).clicked() {
+                        send(events, AdminEvent::Ask(Action::UnarchiveSpace { id: view.id, name: view.space.name.clone() }));
+                    }
+                } else {
+                    small_weak(
+                        ui,
+                        "Every member, owners included, can only read it while it is archived. Nothing is deleted. It leaves the lists of all but its owners.",
+                    );
+                    if ui.add(kit::Button::new("Archive the space").danger()).clicked() {
+                        send(events, AdminEvent::Ask(Action::ArchiveSpace { id: view.id, name: view.space.name.clone() }));
+                    }
+                }
+            });
+        });
+        ui.add_space(18.0);
+        let title = kit::numbered(4, "Owner");
+        panel(ui, Some(&title), |_| {}, |ui| {
+            section(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                kit::section_label(ui, "Account name");
+                let field = ui.add(kit::text_edit_large(&mut view.owner).hint_text("ana").desired_width(f32::INFINITY));
+                let enter = entered(&field, ui);
+                small_weak(
+                    ui,
+                    "The account becomes an owner at once, without an invitation to accept, whether it is a member, invited or neither. Use this when \
+                     the owners are gone. Other owners stay owners.",
+                );
+                if let Some(error) = &view.error {
+                    super::error_line(ui, error);
+                }
+                ui.add_space(6.0);
+                if view.is_checking() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Looking the account up…");
+                    });
+                } else if ui.add(kit::Button::new("Name this owner").primary()).clicked() || enter {
+                    send(events, AdminEvent::SubmitOwner);
+                }
+            });
+        });
+    });
+}
+
 /// The date of `ms` (UTC) as 2026-11-14.
 pub(super) fn date(ms: i64) -> String {
     let days = ms.div_euclid(86_400_000) + 719_468;
@@ -1521,7 +1866,9 @@ fn computers(ui: &mut egui::Ui, view: &UserView, user: &AdminUserInfo, now_ms: i
 
 /// The password a change asks for, in a panel under a breadcrumb.
 fn confirmation(ui: &mut egui::Ui, dialog: &mut Dialog, events: &mut Vec<Event>) {
-    if dialog.action.username().is_empty() {
+    if dialog.action.is_space_change() {
+        breadcrumb(ui, "Admin / Team spaces / Confirm");
+    } else if dialog.action.username().is_empty() {
         breadcrumb(ui, "Admin / Storage / Compression / Confirm");
     } else {
         breadcrumb(ui, &format!("Admin / Accounts / {} / Confirm", dialog.action.username()));

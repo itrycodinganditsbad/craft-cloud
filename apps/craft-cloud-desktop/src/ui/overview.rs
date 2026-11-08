@@ -73,6 +73,18 @@ fn home(ui: &mut egui::Ui, o: &Overview, busy: Option<Busy>, now_ms: i64, autost
         }
     });
     ui.add_space(8.0);
+    // Invitations to team spaces wait for an answer on the Shared tab.
+    if o.invitations > 0 {
+        ui.horizontal(|ui| {
+            let text =
+                if o.invitations == 1 { "1 invitation to a team space".to_owned() } else { format!("{} invitations to team spaces", o.invitations) };
+            super::kit::tag(ui, &text, Tone::Accent);
+            if super::kit::text_link(ui, "Shared ↗", 12.0).clicked() {
+                events.push(Event::Tab(Tab::Shared));
+            }
+        });
+        ui.add_space(8.0);
+    }
     let cells = [
         JoinedCell::new("01", Tone::Accent, "Sync"),
         JoinedCell::new("02", Tone::Warn, "Storage"),

@@ -19,6 +19,8 @@ pub(super) struct Shell {
     host: Option<String>,
     /// `Online · Up to date`.
     state: String,
+    /// How many invitations to team spaces wait: the Shared tab says so.
+    invitations: usize,
     busy: Option<Busy>,
     /// What went wrong with the last Sign out, and whether to offer signing out on this computer only.
     sign_out_error: Option<String>,
@@ -45,10 +47,30 @@ impl Shell {
             account,
             host,
             state,
+            invitations: model.overview().map_or(0, |o| o.invitations),
             busy: model.busy,
             sign_out_error: model.sign_out_error.clone(),
             offer_local: model.offer_local_sign_out,
         })
+    }
+}
+
+impl Shell {
+    /// A tab's name in the header: the Shared tab says how many invitations wait.
+    fn label(&self, tab: Tab) -> String {
+        match tab {
+            Tab::Shared if self.invitations > 0 => format!("{} · {}", tab.label(), self.invitations),
+            _ => tab.label().to_owned(),
+        }
+    }
+
+    /// What the tab's hover text calls it.
+    fn hover(&self, tab: Tab) -> String {
+        match tab {
+            Tab::Shared if self.invitations == 1 => "Shared: 1 invitation waits".to_owned(),
+            Tab::Shared if self.invitations > 1 => format!("Shared: {} invitations wait", self.invitations),
+            _ => tab.label().to_owned(),
+        }
     }
 }
 
@@ -80,7 +102,7 @@ pub(super) fn header(ui: &mut egui::Ui, shell: &Shell, events: &mut Vec<Event>) 
         let mut mark = ui.new_child(block(origin.x + 20.0, 400.0, origin.y, HEADER_H, centred));
         kit::wordmark(&mut mark, 22.0);
         let mark_w = mark.min_rect().width() + 40.0;
-        let tabs_width: f32 = shell.tabs.iter().map(|tab| kit::tab_width(ui, tab.label()) + 4.0).sum();
+        let tabs_width: f32 = shell.tabs.iter().map(|tab| kit::tab_width(ui, &shell.label(*tab)) + 4.0).sum();
         let nav_w = tabs_width + 2.0 * BLOCK_PAD;
         let line = t.hairline();
         let painter = ui.painter().clone();
@@ -145,14 +167,15 @@ fn tabs(ui: &mut egui::Ui, shell: &Shell, events: &mut Vec<Event>) {
     ui.spacing_mut().item_spacing.x = 4.0;
     ui.add_enabled_ui(!shell.locked, |ui| {
         for (index, tab) in shell.tabs.iter().enumerate() {
-            let response = kit::tab(ui, tab.label(), *tab == shell.tab);
+            let label = shell.label(*tab);
+            let response = kit::tab(ui, &label, *tab == shell.tab);
             if response.clicked() {
                 events.push(Event::Tab(*tab));
             }
             if shell.locked {
                 response.on_disabled_hover_text(LOCKED_HOVER);
             } else if let Some(shortcut) = super::shortcuts::tab_shortcut(ui.ctx(), index) {
-                response.on_hover_text(format!("{} ({shortcut})", tab.label()));
+                response.on_hover_text(format!("{} ({shortcut})", shell.hover(*tab)));
             }
         }
     });
