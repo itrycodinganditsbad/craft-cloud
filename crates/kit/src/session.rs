@@ -504,7 +504,7 @@ impl<D: LiveDocument> Session<D> {
             Err(e) => return not_running(e),
         };
         let file_hash = file_bytes.map(|b| *blake3::hash(b).as_bytes());
-        let opened = match docs.open_with(path, D::APP, &OpenOptions { file_hash }) {
+        let opened = match docs.open_with(path, D::APP, &OpenOptions { file_hash, identity: false }) {
             Ok(o) => o,
             Err(craft_cloud_app::Error::Refused { code, message, .. }) => return Err(KitError::Agent(format!("{code}: {message}"))),
             Err(e) => return not_running(e),
@@ -1003,6 +1003,8 @@ impl<D: LiveDocument> Session<D> {
                     self.status.stopped = stopped || self.refused.is_some() || self.status.replaced;
                 }
                 Event::File(frontiers) => self.file_version = frontiers,
+                // (The kit does not ask for identity yet.)
+                Event::PresenceFrom { .. } | Event::Members(_) => {}
                 Event::Closed(why) => closed = Some(why),
             }
         }

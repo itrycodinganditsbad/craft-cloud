@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use craft_cloud_api::SpaceId;
 use craft_cloud_api::api::ErrorAnswer as ErrorBody;
 use craft_cloud_api::local::{MAX_LOCAL_JSON_BYTES, NewRecent, RecentEntry, RecentsEvent as Wire, RecentsRequest, codes, paths};
 use tungstenite::client::IntoClientRequest;
@@ -96,7 +97,7 @@ fn send(socket: &mut Socket, request: &RecentsRequest) -> Result<(), Error> {
 }
 
 /// Opens the WebSocket to the agent `client` names; with `follow`, subscribes to `app` and returns the first list.
-fn open(client: &Client, app: &str, follow: bool) -> Result<(Socket, (Vec<RecentEntry>, bool)), Error> {
+fn open(client: &Client, app: &str, space: Option<SpaceId>, follow: bool) -> Result<(Socket, (Vec<RecentEntry>, bool)), Error> {
     let stream = TcpStream::connect_timeout(&client.addr(), CONNECT_TIMEOUT).map_err(|e| Error::NotRunning(format!("can't reach it: {e}")))?;
     stream.set_read_timeout(Some(OPEN_TIMEOUT)).map_err(|e| Error::Io(e.to_string()))?;
     stream.set_write_timeout(Some(OPEN_TIMEOUT)).map_err(|e| Error::Io(e.to_string()))?;
@@ -118,7 +119,7 @@ fn open(client: &Client, app: &str, follow: bool) -> Result<(Socket, (Vec<Recent
     };
     let mut first = (Vec::new(), false);
     if follow {
-        send(&mut socket, &RecentsRequest::Subscribe { app: app.to_owned() })?;
+        send(&mut socket, &RecentsRequest::Subscribe { app: app.to_owned(), space })?;
         let deadline = Instant::now() + OPEN_TIMEOUT;
         loop {
             match read_event(&mut socket)? {
@@ -149,8 +150,8 @@ fn unavailable(e: &Error) -> bool {
 
 impl RecentsWatch {
     /// Connects; with `follow`, subscribes and waits for the first list. Fails if no agent answers now.
-    pub(crate) fn open(client: &Client, app: &str, follow: bool) -> Result<Self, Error> {
-        let (socket, (first, push_stopped)) = open(client, app, follow)?;
+    pub(crate) fn open(client: &Client, app: &str, space: Option<SpaceId>, follow: bool) -> Result<Self, Error> {
+        let (socket, (first, push_stopped)) = open(client, app, space, follow)?;
         let latest = Arc::new(Mutex::new(first));
         let stopped = Arc::new(AtomicBool::new(push_stopped));
         let (events_tx, events) = mpsc::channel();
@@ -158,6 +159,7 @@ impl RecentsWatch {
         let link = Link {
             dir: client.dir().to_owned(),
             app: app.to_owned(),
+            space,
             follow,
             latest: latest.clone(),
             stopped: stopped.clone(),
@@ -224,6 +226,7 @@ impl Drop for RecentsWatch {
 struct Link {
     dir: PathBuf,
     app: String,
+    space: Option<SpaceId>,
     follow: bool,
     latest: Arc<Mutex<Vec<RecentEntry>>>,
     stopped: Arc<AtomicBool>,
@@ -261,7 +264,7 @@ impl Link {
             if !self.wait(pause) {
                 return;
             }
-            match Client::connect_in(&self.dir).and_then(|client| open(&client, &self.app, true)) {
+            match Client::connect_in(&self.dir).and_then(|client| open(&client, &self.app, self.space, true)) {
                 Ok((s, (entries, push_stopped))) => {
                     pause = RETRY_FIRST;
                     let _ = self.events.send(RecentsEvent::Available);

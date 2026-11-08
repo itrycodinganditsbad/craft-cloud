@@ -251,6 +251,22 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
   differs on both sides is kept twice (one as a conflict copy). A member of an archived space has not lost access: the space stays
   listed (`archived: true`) and syncs read-only.
 
+- **Live documents in team spaces.** Each synced team space also has a live link of its own (the server's live protocol 3,
+  `docs/design/live.md`), started and stopped with the space's sync; the agent speaks protocol 3 when the server offers
+  it and protocol 2 otherwise, and a server whose live service cannot serve a team space (a `404` for the link) is asked
+  again only after ten minutes, while the space's files sync on and its documents open as plain files (`not_live`,
+  `offline`). A document is routed by the path the app opens: an absolute path inside a synced team folder is the space's,
+  any other path the personal space's. For a viewer (or an archived space) `opened` says `read_only: true`; an update the
+  app sends is refused with `read_only` and kept nowhere. When the account's access changes while connected (a role
+  raised or lowered, the account removed) the server ends the link with `access_changed`; the agent connects again once
+  and learns the new role, or that it is no longer a member, in which case the space's link stops with the space.
+  Changes that were never acked stay in the document's journal under `live/<space>/` through all of this: they go up when
+  the account may write again, and while it may not, they stay on this computer (the agent's log says how many, by space ID
+  only; the document opens with them in `waiting`). An app that opens with `identity: true` is told who is there (see
+  `docs/design/live.md`); one that does not gets what it always got. The agent's log and its debug output carry space and
+  account IDs, never names. Ctrl-C with an idle personal space and a team pass that hangs (a server that does not answer)
+  waits for that pass; a second Ctrl-C, read meanwhile, ends the wait.
+
 | Local call | Answer |
 | --- | --- |
 | `GET /v1/spaces` | `{spaces: [{space, kind, name?, role, state, archived, folder?, sync, run_state?, last_sync_ms?, read_only}]}`: the personal space first, then the team spaces, invitations (`state: "invited"`, no folder) among them. `sync` is `on`, `off` or `unavailable` |
@@ -259,6 +275,9 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
 | `POST /v1/spaces/{id}/sync` | `{on, folder?, adopt?}` → the space as `GET /v1/spaces` lists it |
 | `POST /v1/spaces/{id}/approve-deletes` | `{set?}` → `{approved, message}`: approves the deletions the mass-delete guard holds back in a synced team space (`spaces/<id>/approval.json`), as `craft-cloud-agent sync --approve-deletes[=<set>] --space <id or name>` does. With a `set` only that set, if it is the one waiting; without, the set the previous call listed |
 | `GET /v1/status` | gains `spaces: [{space, run_state, last_sync_ms?, read_only}]`, one per synced space or one that lost access; the top-level fields describe the personal space |
+| `GET /v1/recents` (WebSocket) | `subscribe {app, space?}` follows a team space's list (it must sync here, else `not_found`); an `add` with an absolute path inside a team folder goes to that space's list; `entries` names the `space` |
+| `GET /v1/docs` (WebSocket) | `open` gains `identity`; `opened` gains `read_only` and `space`; new binary kind 5 (presence with the sender) and text message `members` |
+| `PUT /v1/blobs?for=<path>`, `GET /v1/blobs/{hash}?for=<path>` | the blob of the space of the file at `path` (a team space's, read by every member's agent); without `for`, the personal space |
 
 Accept and decline are passed on to the server, which decides; its refusals keep their status and code. An agent from before
 team spaces answers these calls with `not_found` ("no such call"), which `craft-cloud-app` reports as `agent_too_old`.

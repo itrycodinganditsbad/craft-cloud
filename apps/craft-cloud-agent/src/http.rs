@@ -1099,6 +1099,11 @@ impl<C: Connection> HttpTransport<C> {
         self.account_call(self.request(Method::GET, "spaces", MAX_SMALL_JSON_BYTES)).await
     }
 
+    /// `GET /spaces/{id}/members`: the members of a team space (invited accounts among them, marked by their state).
+    pub async fn space_members(&self, space: SpaceId) -> Result<craft_cloud_proto::api::SpaceMembers, CallError> {
+        self.account_call(self.request(Method::GET, &format!("spaces/{space}/members"), MAX_SMALL_JSON_BYTES)).await
+    }
+
     /// `POST /spaces/{id}/accept`: the space as `GET /spaces` lists it.
     pub async fn accept_space(&self, space: SpaceId) -> Result<SpaceListItem, CallError> {
         self.account_call(self.request(Method::POST, &format!("spaces/{space}/accept"), MAX_SMALL_JSON_BYTES)).await

@@ -873,9 +873,16 @@ pub struct NewRecent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum RecentsRequest {
-    /// Send `app`'s list now and after every change.
-    Subscribe { app: String },
-    /// Add a file to `app`'s list; answered `added` (or `error`) with the same `id`.
+    /// Send `app`'s list now and after every change. With a `space`, the list of that team space (it must sync on this
+    /// computer); without, the personal list as before.
+    Subscribe {
+        app: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<SpaceId>,
+    },
+    /// Add a file to `app`'s list; answered `added` (or `error`) with the same `id`. An absolute `entry.path` inside a
+    /// synced team folder goes to that space's list (and is kept relative to the folder); any other path is the
+    /// personal list's, as before.
     Add { id: u64, app: String, entry: NewRecent },
 }
 
@@ -891,6 +898,9 @@ pub enum RecentsEvent {
         entries: Vec<RecentEntry>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         push_stopped: bool,
+        /// The team space the list belongs to; absent for the personal list (and from an older agent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<SpaceId>,
     },
     /// The `add` with this `id` is kept (written to disk; it reaches the server when it can).
     Added { id: u64, entry: RecentEntry },
@@ -921,6 +931,14 @@ pub enum RecentsEvent {
 /// - A binary [`PRESENCE`] from the app is relayed to the document's other machines and apps (at most 4 KiB).
 /// - `close {doc}`: the app is done with it (the agent keeps it).
 ///
+/// **Team spaces** (live protocol 3): the agent routes a document by the path the app opens (an absolute path inside a
+/// synced team folder goes to that space's live link; a relative path is the personal space's). `opened` then names the
+/// `space`, and says `read_only: true` for a viewer: an update the app sends to a read-only document is refused with
+/// `error {id, seq, code: "read_only"}`, the agent's copy is unchanged, and nothing is sent to the server. An app that
+/// opens with `identity: true` gets other accounts' presence as [`PRESENCE_FROM`] frames and a `members` message (the
+/// space's active members with their names and palette colours) after `opened` and whenever the list changes; an app
+/// that doesn't ask gets only [`PRESENCE`] frames and no `members`.
+///
 /// An app that doesn't read for 10 s is dropped; its documents stay with the agent.
 pub mod docs {
     /// Binary frame kinds.
@@ -928,6 +946,11 @@ pub mod docs {
     pub const UPDATE: u8 = 2;
     pub const PRESENCE: u8 = 3;
     pub const IMPORT: u8 = 4;
+    /// Presence with the sender's identity, for an app that opened the document with `identity: true`:
+    /// `[u8 5][u64 id, big-endian][16 bytes account ID][the app's bytes]`. An app that did not ask gets [`PRESENCE`].
+    pub const PRESENCE_FROM: u8 = 5;
+    /// The bytes of an account ID in a [`PRESENCE_FROM`] frame.
+    pub const USER_BYTES: usize = 16;
     /// The header of a binary frame: kind and id.
     pub const HEADER_BYTES: usize = 9;
     /// Largest binary frame (a state or an import: a snapshot), either way.
@@ -964,6 +987,10 @@ pub enum DocsRequest {
         app: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         file_hash: Option<String>,
+        /// The app wants to know who is there: other accounts' presence comes as [`docs::PRESENCE_FROM`] frames and a
+        /// `members` message follows `opened`. Without it (the default, and an older app) only [`docs::PRESENCE`] frames.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        identity: bool,
     },
     /// The app is done with the document.
     Close { doc: crate::ids::DocId },
@@ -1071,6 +1098,13 @@ pub enum DocsEvent {
         state: DocState,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         changed_outside: Option<bool>,
+        /// The account may not change this document (a viewer of its team space, or the space is archived): its updates
+        /// are refused with `read_only` and the agent's copy stays as it is. Absent from an older agent.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        read_only: bool,
+        /// The space the document belongs to (the personal space's ID, or a team space's). Absent from an older agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<SpaceId>,
     },
     /// The file has never been live: send its content as a binary import frame.
     NeedsImport { id: u64 },
@@ -1104,6 +1138,10 @@ pub enum DocsEvent {
         #[serde(default)]
         frontiers: Option<Vec<(u64, u32)>>,
     },
+    /// Who is in the space of the document opened as `id`: the active members, sent after `opened` and whenever the list
+    /// changes, only to an app that opened the document with `identity: true`. In a personal space the list is the
+    /// account alone.
+    Members { id: u64, members: Vec<DocMember> },
     /// A request or a binary frame was refused (`id` and `seq` name it when they can). `code` is one of
     /// [`crate::api::codes`] or [`codes`].
     Error {
@@ -1114,6 +1152,32 @@ pub enum DocsEvent {
         code: String,
         message: String,
     },
+}
+
+/// A member of the space of an open document, as `members` lists it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocMember {
+    /// The account's ID (what [`docs::PRESENCE_FROM`] frames name).
+    pub user: uuid::Uuid,
+    /// The account's username.
+    pub name: String,
+    /// The palette index (0 to 11) the account is shown in ([`crate::colour`]), the same on every machine.
+    pub colour: u8,
+    /// This is the account the agent is signed in as.
+    #[serde(rename = "self", default)]
+    pub is_self: bool,
+}
+
+impl std::fmt::Debug for DocMember {
+    /// Names the account by its ID: a username never reaches a debug print or a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DocMember")
+            .field("user", &self.user)
+            .field("name", &format_args!("<{} bytes>", self.name.len()))
+            .field("colour", &self.colour)
+            .field("is_self", &self.is_self)
+            .finish()
+    }
 }
 
 /// `path` as a recent file's path: `/`-separated names relative to the synced folder, each a valid [`Name`]
@@ -1149,12 +1213,12 @@ mod tests {
     /// A list's event says when its push stopped; without the field (an older agent) it hasn't.
     #[test]
     fn a_list_says_when_its_push_stopped() {
-        let stopped = RecentsEvent::Entries { app: "wordcraft".into(), entries: Vec::new(), push_stopped: true };
+        let stopped = RecentsEvent::Entries { app: "wordcraft".into(), entries: Vec::new(), push_stopped: true, space: None };
         let json = serde_json::to_string(&stopped).unwrap();
         assert!(json.contains("\"push_stopped\":true"), "{json}");
         assert_eq!(serde_json::from_str::<RecentsEvent>(&json).unwrap(), stopped);
         let older: RecentsEvent = serde_json::from_str(r#"{"type":"entries","app":"wordcraft","entries":[]}"#).unwrap();
-        assert_eq!(older, RecentsEvent::Entries { app: "wordcraft".into(), entries: Vec::new(), push_stopped: false });
+        assert_eq!(older, RecentsEvent::Entries { app: "wordcraft".into(), entries: Vec::new(), push_stopped: false, space: None });
         let plain = serde_json::to_string(&older).unwrap();
         assert!(!plain.contains("push_stopped"), "{plain}");
     }
@@ -1335,16 +1399,81 @@ mod tests {
         assert_eq!(docs::decode_binary(&frame[..8]), None, "too short for a header");
         assert_eq!(docs::decode_binary(&[]), None);
         let open: DocsRequest = serde_json::from_value(serde_json::json!({ "type": "open", "id": 1, "path": "a.txt", "app": "wordcraft" })).unwrap();
-        assert_eq!(open, DocsRequest::Open { id: 1, path: "a.txt".into(), app: "wordcraft".into(), file_hash: None });
-        let plain =
-            serde_json::to_value(DocsEvent::Opened { id: 1, doc: crate::ids::DocId::generate(), state: DocState::default(), changed_outside: None })
-                .unwrap();
+        assert_eq!(open, DocsRequest::Open { id: 1, path: "a.txt".into(), app: "wordcraft".into(), file_hash: None, identity: false });
+        let plain = serde_json::to_value(DocsEvent::Opened {
+            id: 1,
+            doc: crate::ids::DocId::generate(),
+            state: DocState::default(),
+            changed_outside: None,
+            read_only: false,
+            space: None,
+        })
+        .unwrap();
         assert!(plain.get("changed_outside").is_none(), "none: no field (as an older agent sends it)");
+        assert!(plain.get("read_only").is_none() && plain.get("space").is_none(), "the team fields are left out when they say nothing");
         let not_live = serde_json::to_value(DocsEvent::NotLive { id: 1, reason: NotLiveReason::NotSynced, message: None }).unwrap();
         assert_eq!(not_live, serde_json::json!({ "type": "not_live", "id": 1, "reason": "not_synced", "message": null }));
         let status: DocsEvent =
             serde_json::from_value(serde_json::json!({ "type": "status", "doc": uuid::Uuid::nil(), "online": true, "waiting": 2 })).unwrap();
         assert!(matches!(status, DocsEvent::Status { online: true, waiting: 2, deleted: false, .. }));
+    }
+
+    /// Team spaces on the documents socket: `identity` is asked for, `read_only` and the space come with `opened`, the member
+    /// list names accounts (`self` on the wire), and nothing a debug print shows has a name in it.
+    #[test]
+    fn the_docs_messages_for_team_spaces() {
+        let identity: DocsRequest =
+            serde_json::from_value(serde_json::json!({ "type": "open", "id": 1, "path": "a.txt", "app": "wordcraft", "identity": true })).unwrap();
+        assert!(matches!(identity, DocsRequest::Open { identity: true, .. }));
+        assert!(serde_json::to_value(&identity).unwrap().get("identity").is_some());
+        let space = SpaceId::generate();
+        let opened = DocsEvent::Opened {
+            id: 1,
+            doc: crate::ids::DocId::generate(),
+            state: DocState::default(),
+            changed_outside: None,
+            read_only: true,
+            space: Some(space),
+        };
+        let json = serde_json::to_value(&opened).unwrap();
+        assert_eq!(json.get("read_only"), Some(&serde_json::json!(true)));
+        assert_eq!(json.get("space"), Some(&serde_json::json!(space)));
+        assert_eq!(serde_json::from_value::<DocsEvent>(json).unwrap(), opened);
+        // An older agent's `opened` has neither.
+        let old: DocsEvent = serde_json::from_value(serde_json::json!({
+            "type": "opened", "id": 1, "doc": crate::ids::DocId::generate(), "state": { "online": true, "waiting": 0 }
+        }))
+        .unwrap();
+        assert!(matches!(old, DocsEvent::Opened { read_only: false, space: None, .. }));
+        let user = uuid::Uuid::from_bytes([7; 16]);
+        let members = DocsEvent::Members { id: 3, members: vec![DocMember { user, name: "ana".into(), colour: 4, is_self: true }] };
+        let json = serde_json::to_value(&members).unwrap();
+        assert_eq!(json["members"][0]["self"], serde_json::json!(true), "the wire word is `self`");
+        assert_eq!(json["members"][0]["name"], serde_json::json!("ana"));
+        assert_eq!(serde_json::from_value::<DocsEvent>(json).unwrap(), members);
+        let shown = format!("{members:?}");
+        assert!(!shown.contains("ana"), "a name never reaches a debug print: {shown}");
+        // The binary frame of presence with an identity.
+        assert_eq!(docs::PRESENCE_FROM, 5);
+        let frame = docs::encode_binary(docs::PRESENCE_FROM, 9, &[user.as_bytes().as_slice(), b"cursor"].concat());
+        let (kind, id, body) = docs::decode_binary(&frame).unwrap();
+        assert_eq!((kind, id), (5, 9));
+        assert_eq!(body.split_at(docs::USER_BYTES), (user.as_bytes().as_slice(), b"cursor".as_slice()));
+    }
+
+    /// A recents subscription may name a team space; without one it is the personal list, on the wire as before.
+    #[test]
+    fn a_recents_subscription_may_name_a_space() {
+        let personal: RecentsRequest = serde_json::from_value(serde_json::json!({ "type": "subscribe", "app": "wordcraft" })).unwrap();
+        assert_eq!(personal, RecentsRequest::Subscribe { app: "wordcraft".into(), space: None });
+        assert!(serde_json::to_value(&personal).unwrap().get("space").is_none());
+        let space = SpaceId::generate();
+        let team = RecentsRequest::Subscribe { app: "wordcraft".into(), space: Some(space) };
+        assert_eq!(serde_json::from_value::<RecentsRequest>(serde_json::to_value(&team).unwrap()).unwrap(), team);
+        let list = RecentsEvent::Entries { app: "wordcraft".into(), entries: Vec::new(), push_stopped: false, space: Some(space) };
+        assert_eq!(serde_json::to_value(&list).unwrap()["space"], serde_json::json!(space));
+        let personal_list = RecentsEvent::Entries { app: "wordcraft".into(), entries: Vec::new(), push_stopped: false, space: None };
+        assert!(serde_json::to_value(&personal_list).unwrap().get("space").is_none(), "an older client sees what it saw");
     }
 
     #[test]

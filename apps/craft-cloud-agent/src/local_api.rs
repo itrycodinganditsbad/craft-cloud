@@ -72,6 +72,8 @@ struct Shared {
     online: bool,
     /// The live hub, while signed in.
     hub: Option<crate::live::HubHandle>,
+    /// The hubs of the team spaces that sync here, with their folders.
+    team_hubs: Vec<crate::live::TeamHub>,
     /// Whether the agent starts at login, as last looked at (`None`: not known, or not handled here).
     autostart: Option<bool>,
     /// When the last pass that didn't fail finished, while signed in.
@@ -103,6 +105,7 @@ impl Control {
             run_state: RunState::SignedOut,
             online: false,
             hub: None,
+            team_hubs: Vec::new(),
             autostart: None,
             last_sync_ms: None,
             removed: false,
@@ -156,6 +159,7 @@ impl Control {
                 s.removed = false;
                 s.spaces.clear();
                 s.space_status.clear();
+                s.team_hubs.clear();
             }
         });
     }
@@ -208,6 +212,50 @@ impl Control {
 
     pub fn hub(&self) -> Option<crate::live::HubHandle> {
         self.with(|s| s.hub.clone())
+    }
+
+    /// The hubs of the team spaces that sync on this computer (the spaces task keeps this up to date).
+    pub fn set_team_hubs(&self, hubs: Vec<crate::live::TeamHub>) {
+        self.with(|s| s.team_hubs = hubs);
+    }
+
+    /// The hub of team space `space`, if it syncs here.
+    pub fn team_hub(&self, space: craft_cloud_proto::SpaceId) -> Option<crate::live::TeamHub> {
+        self.with(|s| s.team_hubs.iter().find(|t| t.space == space).cloned())
+    }
+
+    /// The team spaces that sync on this computer, with their folders.
+    pub fn team_folders(&self) -> Vec<(craft_cloud_proto::SpaceId, PathBuf)> {
+        self.with(|s| s.team_hubs.iter().map(|t| (t.space, t.folder.clone())).collect())
+    }
+
+    /// The hub of the team space whose folder holds the absolute `path` (the innermost one); none for a relative path (the
+    /// personal folder's), or one that is in no synced team folder.
+    pub fn route_path(&self, path: &str) -> Option<crate::live::TeamHub> {
+        let given = std::path::Path::new(path);
+        if !given.is_absolute() {
+            return None;
+        }
+        self.with(|s| s.team_hubs.iter().filter(|t| given.starts_with(&t.folder)).max_by_key(|t| t.folder.components().count()).cloned())
+    }
+
+    /// Whether the team space `space` is read-only for the account, as the agent's list last said.
+    pub fn space_read_only(&self, space: craft_cloud_proto::SpaceId) -> bool {
+        self.with(|s| s.spaces.iter().any(|i| i.space == space && i.read_only))
+    }
+
+    /// Asks for a sync pass of a team space soon (never waits).
+    pub fn request_space_pass(&self, space: craft_cloud_proto::SpaceId) {
+        if let Some(spaces) = self.spaces_handle() {
+            spaces.sync_soon(space);
+        }
+    }
+
+    /// Asks the spaces task to look at the server's list of spaces now (never waits).
+    pub fn look_at_spaces(&self) {
+        if let Some(spaces) = self.spaces_handle() {
+            spaces.look_soon();
+        }
     }
 
     /// The account signed in, if any.
@@ -764,38 +812,80 @@ fn blob_error(e: BlobError) -> LocalError {
     }
 }
 
-/// `PUT /v1/blobs`: keeps the body as a blob, answers its name, and uploads it (now if it can, later otherwise).
+/// The query of the blob calls: `for` names the file the blob belongs to.
+#[derive(serde::Deserialize)]
+struct BlobQuery {
+    /// An absolute path inside a synced folder: the blob goes to (or is read from) the space that folder belongs to.
+    #[serde(rename = "for", default)]
+    for_path: Option<String>,
+}
+
+/// The space a blob call works in and the transport that reaches it: the personal space, or (with `for`) the team space
+/// whose synced folder holds the path. A path that is in no synced folder is refused; a read-only team space is refused for
+/// a put.
+fn blob_space(
+    state: &ApiState,
+    account: &Account,
+    query: Result<Query<BlobQuery>, axum::extract::rejection::QueryRejection>,
+    write: bool,
+) -> Result<(craft_cloud_proto::SpaceId, HttpTransport), LocalError> {
+    let Query(query) = query.map_err(|e| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, e.body_text()))?;
+    let transport = HttpTransport::new(account.server.clone(), &account.token).map_err(AgentError::from)?;
+    let Some(path) = query.for_path else { return Ok((account.space, transport)) };
+    if let Some(team) = state.control.route_path(&path) {
+        if write && state.control.space_read_only(team.space) {
+            return Err(LocalError::new(StatusCode::FORBIDDEN, api_codes::READ_ONLY, "this team space is read-only for you: the blob was not kept"));
+        }
+        let transport = transport.bound_to(team.space).map_err(AgentError::from)?;
+        return Ok((team.space, transport));
+    }
+    // The personal folder (an absolute path inside it, or a relative one), as without `for`.
+    let given = std::path::Path::new(&path);
+    if !given.is_absolute() || given.starts_with(&account.folder) {
+        return Ok((account.space, transport));
+    }
+    Err(LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "that path isn't inside a synced folder"))
+}
+
+/// `PUT /v1/blobs`: keeps the body as a blob, answers its name, and uploads it (now if it can, later otherwise). With
+/// `?for=<path>` the blob belongs to the space of the file at that path.
 async fn put_blob(
     State(state): State<Api>,
+    query: Result<Query<BlobQuery>, axum::extract::rejection::QueryRejection>,
     body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Result<Json<Stored>, LocalError> {
     let body = body.map_err(|e| LocalError::new(e.status(), api_codes::TOO_LARGE, e.body_text()))?;
     let account = state.control.account().ok_or(AgentError::NotSignedIn)?;
-    let dir = app_blobs::dir(&state.data, account.space);
+    let (space, transport) = blob_space(&state, &account, query, true)?;
+    let dir = app_blobs::dir(&state.data, space);
     let put_dir = dir.clone();
     let stored = tokio::task::spawn_blocking(move || app_blobs::put(&put_dir, &body))
         .await
         .map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))?
         .map_err(blob_error)?;
-    if let Ok(transport) = HttpTransport::new(account.server.clone(), &account.token) {
-        tokio::spawn(async move {
-            // This one, and any put while offline before it. Offline, they wait for the next try.
-            app_blobs::upload_pending(&dir, &transport).await;
-        });
-    }
+    tokio::spawn(async move {
+        // This one, and any put while offline before it. Offline, they wait for the next try.
+        app_blobs::upload_pending(&dir, &transport).await;
+    });
     Ok(Json(stored))
 }
 
-/// `GET /v1/blobs/{hash}`: the blob's bytes, downloaded first if this machine doesn't have them.
-async fn get_blob(State(state): State<Api>, hash: Result<Path<String>, PathRejection>) -> Result<Response, LocalError> {
+/// `GET /v1/blobs/{hash}`: the blob's bytes, downloaded first if this machine doesn't have them. With `?for=<path>` from
+/// the space of the file at that path.
+async fn get_blob(
+    State(state): State<Api>,
+    hash: Result<Path<String>, PathRejection>,
+    query: Result<Query<BlobQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Response, LocalError> {
     let hash = parse_hex(&path_id(hash)?).ok_or_else(|| blob_error(BlobError::BadName))?;
     let account = state.control.account().ok_or(AgentError::NotSignedIn)?;
-    let transport = HttpTransport::new(account.server.clone(), &account.token).ok();
-    let bytes = app_blobs::get(app_blobs::dir(&state.data, account.space), hash, transport.as_ref()).await.map_err(blob_error)?;
+    let (space, transport) = blob_space(&state, &account, query, false)?;
+    let bytes = app_blobs::get(app_blobs::dir(&state.data, space), hash, Some(&transport)).await.map_err(blob_error)?;
     Ok(([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
 }
 
-/// Uploads, every [`app_blobs::RETRY_EVERY`], the blobs put while the server couldn't be reached.
+/// Uploads, every [`app_blobs::RETRY_EVERY`], the blobs put while the server couldn't be reached (the personal space's, and
+/// those of the team spaces that sync here).
 async fn retry_blobs(control: Control, data: PathBuf) {
     let mut every = tokio::time::interval(app_blobs::RETRY_EVERY);
     loop {
@@ -803,6 +893,13 @@ async fn retry_blobs(control: Control, data: PathBuf) {
         let Some(account) = control.account() else { continue };
         let Ok(transport) = HttpTransport::new(account.server.clone(), &account.token) else { continue };
         app_blobs::upload_pending(&app_blobs::dir(&data, account.space), &transport).await;
+        for (space, _) in control.team_folders() {
+            if control.space_read_only(space) {
+                continue;
+            }
+            let Ok(bound) = transport.clone().bound_to(space) else { continue };
+            app_blobs::upload_pending(&app_blobs::dir(&data, space), &bound).await;
+        }
     }
 }
 

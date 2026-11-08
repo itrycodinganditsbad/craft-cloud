@@ -152,7 +152,7 @@ impl Sim {
                         app.doc.import(&bytes).unwrap();
                     }
                 }
-                DocEvent::Presence(..) => {}
+                DocEvent::Presence(..) | DocEvent::PresenceFrom(..) => {}
             }
         }
     }

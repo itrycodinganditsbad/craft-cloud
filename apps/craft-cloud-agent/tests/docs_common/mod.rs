@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use craft_cloud_agent::live::replica::{DocEvent, Opening, Peers, Replica};
 use craft_cloud_agent::live::store::MemStore;
-use craft_cloud_meta::{DeviceAuth, Meta, Role, UserId};
+use craft_cloud_meta::{DeviceAuth, Meta, Role, SpaceActor, UserId};
+use craft_cloud_proto::api::SpaceRole;
 use craft_cloud_proto::live::{AppName, ClientFrame, ServerFrame};
 use craft_cloud_proto::{ChunkId, ChunkRef, ChunkerParamsId, DocId, FileHash, Manifest, Name, NewVersion, NodeId, Op, SpaceId, VersionId};
 use craft_cloud_server::AppState;
@@ -43,6 +44,11 @@ pub struct Conn {
 }
 
 pub struct Machine {
+    /// The space its replica works on: the account's personal space, or a team space.
+    pub space: SpaceId,
+    /// Its account's role in that space when the connection was opened.
+    pub role: SpaceRole,
+    pub personal: bool,
     pub store: MemStore,
     pub replica: Option<Replica<MemStore>>,
     pub auth: DeviceAuth,
@@ -77,6 +83,8 @@ pub struct World {
     pub machines: Vec<Machine>,
     root: NodeId,
     files: u32,
+    /// The team space of a team world ([`World::team`]) and its root.
+    pub team: Option<(SpaceId, NodeId)>,
 }
 
 impl World {
@@ -88,7 +96,64 @@ impl World {
         let user = meta.create_user("ana", "$argon2id$stub", Role::Member, 0).await.unwrap();
         let state = Arc::new(AppState::new(meta.clone(), Store::new(MemoryBackend::new()), vec![]).unwrap().with_limits(limits));
         let root = meta.space_info(user.space).await.unwrap().root;
-        Self { state, meta, space: user.space, user: user.id, machines: Vec::new(), root, files: 0 }
+        Self { state, meta, space: user.space, user: user.id, machines: Vec::new(), root, files: 0, team: None }
+    }
+
+    /// A team space `Studio` owned by the world's account. Accounts join it with [`World::member`].
+    pub async fn team(&mut self) -> SpaceId {
+        let name = craft_cloud_proto::SpaceName::new("Studio").unwrap();
+        let space = self.meta.create_team_space(&SpaceActor::Cli, &name, self.user, None, 0).await.unwrap();
+        let root = self.meta.space_info(space).await.unwrap().root;
+        self.team = Some((space, root));
+        space
+    }
+
+    /// A new account that is a member of the team space as `role`; its first machine (a device of its own) works on the team
+    /// space. Returns the machine's index.
+    pub async fn member(&mut self, username: &str, role: SpaceRole) -> usize {
+        let (space, _) = self.team.expect("a team world");
+        let user = self.meta.create_user(username, "$argon2id$stub", Role::Member, 0).await.unwrap();
+        self.meta.invite_member(&SpaceActor::Cli, space, user.id, role, 0).await.unwrap();
+        self.team_machine(user.id, space).await
+    }
+
+    /// A machine of the world's own account on the team space.
+    pub async fn owner_machine(&mut self) -> usize {
+        let (space, _) = self.team.expect("a team world");
+        self.team_machine(self.user, space).await
+    }
+
+    async fn team_machine(&mut self, user: UserId, space: SpaceId) -> usize {
+        let i = self.machines.len();
+        let mut token = [0u8; 32];
+        token[0] = 200;
+        token[1] = i as u8;
+        self.meta.create_device(user, &format!("m{i}"), &token, 0).await.unwrap();
+        let auth = self.meta.device_by_token(&token).await.unwrap().unwrap();
+        let role = self.meta.space_access(user, space).await.unwrap().expect("a member");
+        let store = MemStore::default();
+        let base = (1000 * (i as u64 + 1)) << 20;
+        let mut replica = Replica::open(store.clone(), space, peers(base)).unwrap();
+        replica.require_spaces();
+        self.machines.push(Machine {
+            space,
+            role,
+            personal: false,
+            store,
+            replica: Some(replica),
+            auth,
+            conn: None,
+            up: VecDeque::new(),
+            down: VecDeque::new(),
+            events: Vec::new(),
+            said: Vec::new(),
+            heard: Vec::new(),
+            said_up: Vec::new(),
+            runs: 1,
+            base,
+            old_server: false,
+        });
+        i
     }
 
     /// A new machine of the account (not connected yet).
@@ -101,6 +166,9 @@ impl World {
         let base = (1000 * (i as u64 + 1)) << 20;
         let replica = Replica::open(store.clone(), self.space, peers(base)).unwrap();
         self.machines.push(Machine {
+            space: self.space,
+            role: SpaceRole::Owner,
+            personal: true,
             store,
             replica: Some(replica),
             auth,
@@ -120,27 +188,38 @@ impl World {
 
     /// A new file of the account's space, as the file sync would have uploaded it.
     pub async fn file(&mut self) -> NodeId {
+        self.file_in(self.space, self.root).await
+    }
+
+    /// A new file of the team space, as the file sync would have uploaded it.
+    pub async fn team_file(&mut self) -> NodeId {
+        let (space, root) = self.team.expect("a team world");
+        self.file_in(space, root).await
+    }
+
+    async fn file_in(&mut self, space: SpaceId, root: NodeId) -> NodeId {
         self.files += 1;
         let name = format!("file{}.txt", self.files);
         let chunk = ChunkId::from_bytes(*blake3::hash(name.as_bytes()).as_bytes());
-        self.meta.add_chunk(self.space, &chunk, 11, 0).await.unwrap();
+        self.meta.add_chunk(space, &chunk, 11, 0).await.unwrap();
         let manifest =
             Manifest::new(ChunkerParamsId::new("fastcdc-v1").unwrap(), 10, FileHash::from_bytes([1; 32]), vec![ChunkRef { id: chunk, len: 10 }])
                 .unwrap();
-        self.meta.add_manifest(self.space, &manifest, 100, 0).await.unwrap();
+        self.meta.add_manifest(space, &manifest, 100, 0).await.unwrap();
         let node = NodeId::generate();
         let version = NewVersion { id: VersionId::generate(), manifest: manifest.id(), mtime_ms: 0, exec: false, save: None };
         let device = self.machines.first().map_or_else(craft_cloud_proto::DeviceId::generate, |m| m.auth.device);
-        self.meta.commit(self.space, device, &[Op::Create { node, parent: self.root, name: Name::new(&name).unwrap(), version }], 0).await.unwrap();
+        self.meta.commit(space, device, &[Op::Create { node, parent: root, name: Name::new(&name).unwrap(), version }], 0).await.unwrap();
         node
     }
 
     pub fn connect(&mut self, m: usize) {
         let state = self.state.clone();
         let machine = &mut self.machines[m];
-        let notes = state.live.listen(machine.auth.space);
-        let presence = state.live.listen_presence(machine.auth.space);
-        machine.conn = Some(Conn { session: Session::new(state, &machine.auth), notes, presence });
+        let notes = state.live.listen(machine.space);
+        let presence = state.live.listen_presence(machine.space);
+        let session = Session::in_space(state, &machine.auth, machine.space, machine.role, machine.personal);
+        machine.conn = Some(Conn { session, notes, presence });
         let hello = machine.replica().connected();
         machine.up.extend(hello);
     }
@@ -164,7 +243,10 @@ impl World {
         machine.replica = None;
         machine.runs += 1;
         let base = machine.base ^ (machine.runs << 40);
-        let mut replica = Replica::open(machine.store.clone(), self.space, peers(base)).unwrap();
+        let mut replica = Replica::open(machine.store.clone(), machine.space, peers(base)).unwrap();
+        if !machine.personal {
+            replica.require_spaces();
+        }
         machine.said.extend(replica.take_notes());
         machine.replica = Some(replica);
     }
@@ -177,10 +259,15 @@ impl World {
         self.crash(m);
     }
 
-    /// Hands frames from the agent to its connection's queue.
+    /// Hands frames from the agent to its connection's queue (without those that write, while its account may not change the
+    /// space: the agent's own guard).
     pub fn send(&mut self, m: usize, frames: Vec<ClientFrame>) {
         let machine = &mut self.machines[m];
         if machine.conn.is_some() {
+            let frames = match machine.replica.as_ref() {
+                Some(replica) => replica.gate(frames),
+                None => frames,
+            };
             machine.up.extend(frames);
         }
     }
@@ -188,6 +275,11 @@ impl World {
     /// The chunk API of the account's space, as the agents reach it (for snapshots).
     pub fn blobs(&self) -> blobs::ServerBlobs {
         blobs::ServerBlobs { state: self.state.clone(), space: self.space }
+    }
+
+    /// The chunk API of the space machine `m` works on.
+    pub fn blobs_of(&self, m: usize) -> blobs::ServerBlobs {
+        blobs::ServerBlobs { state: self.state.clone(), space: self.machines[m].space }
     }
 
     /// `bytes` uploaded as a snapshot of `doc`, as an agent uploads one: the manifest that names it.
@@ -207,8 +299,8 @@ impl World {
     /// comes next.
     pub async fn step(&mut self) -> bool {
         let mut moved = false;
-        let api = self.blobs();
         for machine in &mut self.machines {
+            let api = blobs::ServerBlobs { state: self.state.clone(), space: machine.space };
             let Some(conn) = machine.conn.as_mut() else { continue };
             if let Some(replica) = machine.replica.as_mut() {
                 for up in replica.take_uploads() {
@@ -220,6 +312,12 @@ impl World {
                 }
             }
             while let Some(mut frame) = machine.up.pop_front() {
+                // Nothing that writes is sent while the account may not change the space.
+                if let Some(replica) = machine.replica.as_ref()
+                    && replica.gate(vec![frame.clone()]).is_empty()
+                {
+                    continue;
+                }
                 moved = true;
                 if machine.old_server
                     && let ClientFrame::Hello { min, .. } = frame

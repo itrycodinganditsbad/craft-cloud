@@ -43,12 +43,17 @@ per app connection for live sessions. `run` serves it while signed out too. Call
   right found as `run` starts (a damaged or newer `account.json`, a damaged token) keeps the agent up, signed out with
   `run_state` `paused` and the reason; every call but `logout` (which forgets the account here) and `quit` is answered
   `needs_you` until then;
-- `GET /v1/recents` (WebSocket: subscribe per app, add an entry `{path, title?, saved}`, receive the list on change);
+- `GET /v1/recents` (WebSocket: subscribe per app, add an entry `{path, title?, saved}`, receive the list on change).
+  In team spaces (protocol 3, below) `subscribe {app, space?}` names a team space that syncs on this computer and gets that
+  space's own list (`entries` then names the `space`; a space that does not sync here is answered `error {not_found}`);
+  without `space` it is the personal list as before. An `add` whose `path` is an absolute path inside a synced team folder
+  goes to that space's list (kept relative to the folder); any other path is the personal list's;
 - `GET /v1/docs` (WebSocket: live documents). Control messages are JSON text frames, document bytes binary frames of
-  `[u8 kind][u64 id, big-endian][bytes]` (kinds: 1 state, 2 update, 3 presence, 4 import), so nothing is base64; `id`
+  `[u8 kind][u64 id, big-endian][bytes]` (kinds: 1 state, 2 update, 3 presence, 4 import, 5 presence with identity), so
+  nothing is base64; `id`
   is the number the app gave the document in its `open`, and one connection may open many documents:
-  - `open {id, path, app}` (`path` relative to the synced folder, or absolute inside it; `app` a lowercase app name)
-    → `opened {id, doc, state: {online, waiting, bytes}}` followed by the binary state (a Loro snapshot) and then, as
+  - `open {id, path, app, identity?}` (`path` relative to the synced folder, or absolute inside it; `app` a lowercase app name)
+    → `opened {id, doc, state: {online, waiting, bytes}, read_only?, space?}` followed by the binary state (a Loro snapshot) and then, as
     binary updates, the updates still waiting for their history and this machine's own not yet acked; or
     `needs_import {id}` (the file has never been live: the app sends a binary import, a Loro snapshot, and then gets
     `opened`; the state is the import the server kept, which may be another machine's); or `not_live {id, reason,
@@ -60,7 +65,20 @@ per app connection for live sessions. `run` serves it while signed out too. Call
     that has been live on this machine opens offline from the agent's copy;
   - a binary update from the app (its own change, at most 1 MiB) → `ack {id, seq}` once it is on the agent's disk
     (`seq` counts the app's updates of that document on this connection, from 1), or `error {id, seq, code,
-    message}` when the agent refused it (`invalid`: Loro doesn't take it; `too_large`); the agent's copy is as it was;
+    message}` when the agent refused it (`invalid`: Loro doesn't take it; `too_large`; `read_only`: the account may not
+    change the document); the agent's copy is as it was;
+  - **team spaces**: an absolute `path` inside a synced team folder is routed to that space's own live link, any other path
+    to the personal space's. `opened` names the `space` (every document, the personal space's too) and says
+    `read_only: true` for a viewer, or in an archived space, as of the open (an agent from before team spaces says neither).
+    An update an app sends to a read-only document is refused with `error {id, seq, code: "read_only"}`, nothing of it is
+    kept, and nothing is sent to the server. A space that stops syncing on this computer answers a later `open` of its
+    files with `not_live {offline}`; the app's other documents go on. An app that opens with `identity: true` gets other
+    accounts' presence (and the account's own other machines') as binary kind 5
+    `[u8 5][u64 id][16 bytes account ID][the app's bytes]` instead of kind 3, the account being the server's word whatever
+    the bytes say, and a text message `members {id, members: [{user, name, colour, self}]}` after `opened` and whenever the
+    list changes (the space's active members; `colour` is the palette index 0 to 11 of `craft-cloud-api`'s `colour`
+    module; in a personal space the list is the account alone; it is read from `GET /spaces/{id}/members`, and again when
+    presence names an account not in it). An app that does not ask gets kind 3 only and no `members`;
   - from the agent: remote changes as binary updates, other machines' and apps' presence as binary presence (as
     sent), and `status {doc, online, waiting, deleted, stopped}` when that changes (`deleted`: the file was deleted,
     here or on another machine; the document still works, and a later open of the path is a new node and a new
@@ -80,7 +98,7 @@ per app connection for live sessions. `run` serves it while signed out too. Call
     messages queue up past 1,024 in the agent); its documents stay with the agent. An app that goes away mid-import
     leaves nothing on the server (the import goes up only once whole); the next app to open the file is asked.
 
-- `PUT /v1/blobs` (the body: 1 byte to 64 MiB of binary content an app keeps out of a live document) → `{hash, len}`
+- `PUT /v1/blobs[?for=<path>]` (the body: 1 byte to 64 MiB of binary content an app keeps out of a live document) → `{hash, len}`
   once the bytes are on the agent's disk (`live/<space>/blobs/<hash>`, with a `<hash>.pending` mark written first);
   `hash` is the BLAKE3 hash of the manifest the bytes cut into with `fastcdc-v1`, so the same bytes have the same
   name everywhere. The bytes go up through the chunk API (the chunks the server lacks, then the manifest, the
@@ -88,7 +106,12 @@ per app connection for live sessions. `run` serves it while signed out too. Call
   30 s; the mark goes once they are up. `GET /v1/blobs/{hash}` → the bytes: from the agent's disk (checked against
   the name on every read; a damaged copy is dropped and fetched again), or downloaded (every chunk checked, the whole
   against the manifest) and kept. `blob_not_found` when the account has no such blob, `offline` when it isn't here
-  and the server can't be reached. An agent from before blobs answers both with the local API's `not_found` for an
+  and the server can't be reached. With `?for=<absolute path of the document's file>`, on `PUT` and on `GET` alike, the
+  blob belongs to the space of the synced folder that holds the path: a team space's blob is kept in
+  `live/<team space>/blobs/`, goes up through that space's chunk API (charged to the space), and every member's agent reads
+  it with the same `for` (a path in no synced folder is `400 invalid`; a `PUT` for a space the account may not change is
+  `403 read_only`). Without `for`, or with a relative path or one in the personal folder, the personal space as before; an
+  agent from before team spaces ignores `for`. An agent from before blobs answers both with the local API's `not_found` for an
   unknown call, which `craft-cloud-app` reports as `agent_too_old` (blob calls only: everything else works as
   before).
 
@@ -101,7 +124,9 @@ disconnected, and the crate reconnects.
 token like every call (at most 4 connections per device and space, 32 per device in all). Binary frames encoded with postcard (compact, no base64
 for opaque updates; variants are only ever appended, anything new is negotiated at `hello`), types in
 `craft-cloud-proto`:
-- `hello {min, max}` → `welcome {protocol, epoch}` (the space's epoch), or `error protocol_mismatch`. Protocol 2 adds
+- `hello {min, max}` → `welcome {protocol, epoch}` (the space's epoch), or `error protocol_mismatch`. The agent says
+  `hello {1, 3}`: a server that knows 2 at most answers protocol 2 and the agent goes on as it did; one that knows 3
+  answers `welcome_space` (also for the personal space, with role `owner`). Protocol 2 adds
   documents of files, snapshots, compaction and presence; a connection on protocol 1 (an agent from before them, or
   a new agent and an older server) carries recents only, and is sent a compacted log whole. A new agent with an older
   server keeps recents and says live documents need a newer server; a document live on it already keeps its changes
@@ -139,7 +164,18 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
   once the 5 s have passed, and the frames of one page must all be out within two minutes: a reader that does not read cannot hold a revoked
   connection. An answer to a `compact` that finds the access gone inside its transaction ends the connection like any
   other loss of access (`error {access_changed}`, close 4403). A device may follow 256 documents in one space and 1024
-  in all. The caps are per space: the live bytes of a team space are
+  in all. **The agent** keeps one link per synced team space, each with the `craft-space`
+  header of its own and its own hub, documents and journals (`live/<space>/`), next to the personal link. A team link takes
+  `welcome_space` for its own space only: a plain `welcome` (a server that does not serve the space) or another space ends
+  it as a mismatch, and so does a `404` for the upgrade (not a member now, or a server whose live service has no team
+  spaces): it is asked again after ten minutes, and the agent's list of spaces is looked at at once. Its role comes from
+  `welcome_space` and from the agent's list (a viewer, or an archived space): while the account may not change the space the
+  agent refuses the apps' changes and sends nothing that writes (`create`, `update`, `snapshot`); what was unacked stays in
+  the journals. `error {access_changed}`, or the close code 4403, ends the connection and the agent asks again at once, once:
+  the answer is the new role in `welcome_space`, or `404`. If the role allows writing again, the journals' updates go up on
+  that connection; if the account is a viewer, they stay and the agent says so once (a count, no names; the document opens
+  with them in `waiting`). A removed account's link stops with the space's sync, and nothing in `live/<space>/` is deleted.
+  The caps are per space: the live bytes of a team space are
   `[spaces] team_live_bytes` (4 GiB by default; a personal space keeps `live_bytes_per_user`), the documents and rows
   counts are the ones of a personal space, per space.
 - `create {doc, kind}` → `created {doc}`; idempotent. Kinds: `recents:<app>`, whose ID is derived from the account and

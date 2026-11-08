@@ -10,6 +10,17 @@
 //! and to the document's other apps on this machine every change one of them makes. A document's status (online, how
 //! many changes wait, whether its file was deleted) goes to its apps when it changes. Nothing the hub sends an app ever
 //! waits for the app: a connection whose queue is full is dropped.
+//!
+//! **One hub per space.** The personal space has one, and every synced team space has one of its own (`team` in
+//! [`HubConfig`]): its own thread, replica, documents on disk in `live/<space>/` and WebSocket, opened with the space in
+//! the `craft-space` header. The local API routes a document to the hub whose folder holds its path
+//! ([`crate::local_api::Control::route_path`]). A team hub speaks live protocol 3 only (a server that answers with
+//! protocol 2 can't serve the space: the hub waits ten minutes before it asks again), reads the account's role from
+//! `welcome_space`, refuses an app's changes to a read-only space (`read_only`) and never sends what writes while the role
+//! is viewer; what was unacked stays in the journals, goes up if the role allows it again, and is said once if it doesn't.
+//! When the server says the account's access changed (`access_changed`, close code 4403), the connection ends and the next
+//! one finds the new role, or `404` for an account that is no longer a member (the agent's list of spaces then stops
+//! the hub; its documents and journals stay on disk).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -17,13 +28,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use craft_cloud_proto::DocId;
-use craft_cloud_proto::live::{AppName, ClientFrame, MAX_SNAPSHOT_BYTES, MAX_SUBSCRIPTIONS, PRESENCE_PER_SEC, ServerFrame};
-use craft_cloud_proto::local::{DocState, MAX_MACHINE_BYTES, MAX_TITLE_BYTES, NewRecent, NotLiveReason, RecentEntry, recent_path};
+use craft_cloud_proto::colour::member_colour;
+use craft_cloud_proto::live::{ACCESS_CHANGED_CLOSE, AppName, ClientFrame, MAX_SNAPSHOT_BYTES, MAX_SUBSCRIPTIONS, PRESENCE_PER_SEC, ServerFrame};
+use craft_cloud_proto::local::{DocMember, DocState, MAX_MACHINE_BYTES, MAX_TITLE_BYTES, NewRecent, NotLiveReason, RecentEntry, recent_path};
 use craft_cloud_proto::{NodeId, SpaceId};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
 
 use super::blobs::{Upload, download, upload};
 use super::link::{DialError, LiveSocket, dial};
@@ -35,7 +48,7 @@ use crate::local_api::Control;
 use craft_cloud_proto::ManifestId;
 
 /// What the hub needs to know about the account.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HubConfig {
     pub data: DataDir,
     pub space: SpaceId,
@@ -51,6 +64,20 @@ pub struct HubConfig {
     pub session_grace: Duration,
     /// Tests: how late the hub reads every save announcement (a hub busy elsewhere).
     pub announce_delay: Duration,
+    /// The hub of a team space: the upgrade names `space`, only live protocol 3 is accepted, the files' state is the space's
+    /// own `state.json`, and the hub says nothing about the agent being online (that is the personal hub's).
+    pub team: bool,
+    /// The account's username, for the member list of a personal space (the list is the account alone).
+    pub username: String,
+    /// The agent's list says the account may not change the space (a viewer, or an archived space).
+    pub read_only: bool,
+}
+
+impl std::fmt::Debug for HubConfig {
+    /// The space and its kind only: no username, computer name or folder (which can be named after the space) in a debug print.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HubConfig").field("space", &self.space).field("team", &self.team).field("read_only", &self.read_only).finish_non_exhaustive()
+    }
 }
 
 /// How long an open of a file that isn't uploaded yet waits for its node (a sync pass is started for it).
@@ -70,7 +97,16 @@ pub type ConnId = u64;
 pub enum DocOut {
     /// The document opened as `id` is live: its state (a snapshot, then updates still waiting for their history), and
     /// whether the file the app read was edited outside Craft.
-    Opened { id: u64, doc: DocId, state: DocState, changed_outside: Option<bool>, snapshot: Vec<u8>, waiting: Vec<Vec<u8>> },
+    Opened {
+        id: u64,
+        doc: DocId,
+        state: DocState,
+        changed_outside: Option<bool>,
+        read_only: bool,
+        space: SpaceId,
+        snapshot: Vec<u8>,
+        waiting: Vec<Vec<u8>>,
+    },
     /// Send the file's content as an import.
     NeedsImport { id: u64 },
     /// The file opens as a plain file.
@@ -81,8 +117,12 @@ pub enum DocOut {
     Refused { id: Option<u64>, seq: Option<u64>, code: &'static str, message: String },
     /// A change from another machine or app.
     Update { id: u64, bytes: Arc<Vec<u8>> },
-    /// Presence from another machine or app.
+    /// Presence from another machine or app (an app that did not ask for identity).
     Presence { id: u64, bytes: Arc<Vec<u8>> },
+    /// Presence with the sending account (an app that opened the document with `identity`).
+    PresenceFrom { id: u64, user: Uuid, bytes: Arc<Vec<u8>> },
+    /// Who is in the document's space (an app that opened the document with `identity`).
+    Members { id: u64, members: Arc<Vec<DocMember>> },
     /// How the document stands now.
     Status { doc: DocId, online: bool, waiting: u64, deleted: bool, stopped: bool },
     /// The record of the document's file as it is on disk now (the live document's frontiers it was saved from).
@@ -104,6 +144,8 @@ pub enum DocsCall {
         app: String,
         /// The hash (hex) of the file's bytes as the app read them.
         file_hash: Option<String>,
+        /// The app wants other accounts' identity: presence with the sender, and the member list.
+        identity: bool,
     },
     /// The app is about to write `doc`'s file with content `hash` (hex); its record follows.
     Saving {
@@ -176,12 +218,29 @@ enum Request {
     Pause(bool, oneshot::Sender<()>),
     /// A docs connection's request (answered on its own channel).
     Docs(DocsCall),
+    /// The agent's list says the account may (`false`) or may not (`true`) change the space.
+    Access(bool),
 }
 
 /// How the local API reaches the hub. Cheap to clone.
 #[derive(Clone)]
 pub struct HubHandle {
     tx: mpsc::Sender<Request>,
+}
+
+/// A synced team space's hub, and the folder whose paths are its documents' ([`crate::local_api::Control::route_path`]).
+#[derive(Clone)]
+pub struct TeamHub {
+    pub space: SpaceId,
+    pub folder: PathBuf,
+    pub handle: HubHandle,
+}
+
+impl std::fmt::Debug for TeamHub {
+    /// (The folder's name can be the space's: it is left out.)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TeamHub").field("space", &self.space).finish_non_exhaustive()
+    }
 }
 
 impl HubHandle {
@@ -210,6 +269,15 @@ impl HubHandle {
     /// Hands a docs connection's request to the hub (its answers come on the connection's channel).
     pub async fn docs(&self, call: DocsCall) -> Result<(), HubError> {
         self.tx.send(Request::Docs(call)).await.map_err(|_| HubError::Gone)
+    }
+
+    /// Tells the hub what the agent's list of spaces says about the account's role: a viewer (or an archived space) may not
+    /// change the space. Not waited for. Needs a running tokio runtime.
+    pub fn set_read_only(&self, read_only: bool) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(Request::Access(read_only)).await;
+        });
     }
 }
 
@@ -252,7 +320,10 @@ impl Drop for Hub {
 
 /// Finds a file's node in the sync state (`state.json`, read again only when it changed).
 struct NodeLookup {
+    /// Where `state.json` is: the data folder, or a team space's own folder under it.
     data: DataDir,
+    /// A team space and its folder: its state is used for that pair only (as the engine does).
+    team: Option<(SpaceId, PathBuf)>,
     seen: Option<(std::time::SystemTime, u64)>,
     state: Option<craft_cloud_sync::State>,
 }
@@ -264,7 +335,10 @@ impl NodeLookup {
         let stamp = std::fs::metadata(&file).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
         if stamp != self.seen {
             self.seen = stamp;
-            self.state = self.data.load_state().ok().map(|s| s.state);
+            self.state = match &self.team {
+                Some((space, folder)) => self.data.load_state_for(*space, folder, None).ok().map(|(s, _)| s.state),
+                None => self.data.load_state().ok().map(|s| s.state),
+            };
         }
         self.state.as_ref()
     }
@@ -316,6 +390,8 @@ impl PresenceBudget {
 struct DocsConn {
     out: mpsc::Sender<DocOut>,
     handles: BTreeMap<u64, DocId>,
+    /// The numbers opened with `identity`.
+    identity: BTreeSet<u64>,
     presence: HashMap<u64, PresenceBudget>,
 }
 
@@ -328,6 +404,13 @@ struct Lookup {
     until: Instant,
 }
 
+/// What an open asked for besides the document: the hash of the file's bytes, and identity.
+#[derive(Debug, Default, Clone)]
+struct Wish {
+    file_hash: Option<String>,
+    identity: bool,
+}
+
 /// The hub's documents of files: connections, opens waiting, imports asked for, and the status each was last told.
 #[derive(Default)]
 struct Docs {
@@ -338,8 +421,8 @@ struct Docs {
     importer: BTreeMap<DocId, (ConnId, u64)>,
     lookups: Vec<Lookup>,
     told: BTreeMap<DocId, (bool, u64, bool, bool)>,
-    /// Opens not answered yet: the hash (hex) of the file each read.
-    opens: HashMap<(ConnId, u64), Option<String>>,
+    /// Opens not answered yet: the hash (hex) of the file each read, and whether it wants identity.
+    opens: HashMap<(ConnId, u64), Wish>,
     /// Each open document's file as last looked at: its length and modification time then, its content's hash, and
     /// the record its apps were last told.
     files: HashMap<DocId, FileSeen>,
@@ -462,7 +545,28 @@ struct State {
     docs: Docs,
     /// What apps on this machine saved (for whether a file opened was edited outside Craft).
     saves: super::saves::SaveBook,
+    /// Answers of the tasks the hub starts besides blobs (who the account is, who is in the space).
+    inner: mpsc::UnboundedSender<Inner>,
+    /// The account's ID, once the server said (for the member list and for presence between apps on this machine).
+    me: Option<Uuid>,
+    /// The space's active members as the apps with identity see them, once known.
+    people: Option<Arc<Vec<DocMember>>>,
+    /// The list is being asked for, or may not be asked for again before then.
+    people_busy: bool,
+    people_not_before: Instant,
+    /// Accounts presence named that were not in the list when last looked at (asked about once per list).
+    strangers: BTreeSet<Uuid>,
 }
+
+/// What the tasks the hub starts say when they are done.
+enum Inner {
+    People { me: Option<Uuid>, members: Option<Vec<craft_cloud_proto::api::SpaceMember>>, why: Option<String> },
+}
+
+/// How soon after the first `access_changed` the hub asks again (the second one, and later, wait as any reconnect does).
+const ACCESS_RETRY: Duration = Duration::from_millis(200);
+/// The least time between two looks at who is in the space.
+const PEOPLE_EVERY: Duration = Duration::from_secs(5);
 
 /// A refusal sent to an app.
 fn refusal(id: Option<u64>, seq: Option<u64>, code: &'static str, message: impl Into<String>) -> DocOut {
@@ -475,6 +579,18 @@ impl State {
         self.retry_at = Instant::now() + wait.unwrap_or_else(|| jitter(self.delay));
         self.delay = self.delay.saturating_mul(2).min(RETRY_MAX);
     }
+    /// Says (once) that changes kept for a read-only space are not sent: a role that was lowered, or an access that came back as
+    /// a viewer's, leaves what was unacked in the journals.
+    fn say_unsent(&mut self) {
+        let waiting = self.replica.waiting();
+        if self.replica.read_only() && waiting > 0 {
+            self.say(format!(
+                "{waiting} live change(s) made in space {} stay on this machine and are not sent: the account may not change it now",
+                self.config.space
+            ));
+        }
+    }
+
     /// Tells the user `line` once (not again until something else was said).
     fn say(&mut self, line: String) {
         if self.said.as_ref() != Some(&line) {
@@ -502,8 +618,30 @@ impl State {
         if let Err(e) = self.replica.flush() {
             self.say(format!("the live documents couldn't be written to disk: {e}"));
         }
-        self.control.set_online(self.replica.is_up());
+        self.set_online(self.replica.is_up());
         frames
+    }
+
+    /// Tells the local API whether the agent reaches the server: only the personal hub's link says so (a team space's link that
+    /// is down is that space's run state).
+    fn set_online(&self, online: bool) {
+        if !self.config.team {
+            self.control.set_online(online);
+        }
+    }
+
+    /// Asks for a sync pass of this hub's space soon (a file that isn't uploaded yet, a save record).
+    fn pass_soon(&self) {
+        if self.config.team {
+            self.control.request_space_pass(self.config.space);
+        } else {
+            self.control.request_pass();
+        }
+    }
+
+    /// Asks the agent to look at its list of spaces now (the server said the account's access changed).
+    fn look_at_spaces(&self) {
+        self.control.look_at_spaces();
     }
 
     /// Sends `message` to docs connection `conn`; one that can't take it (it doesn't read, or it is gone) is dropped.
@@ -546,7 +684,7 @@ impl State {
                 DocEvent::Remote(doc, bytes) => {
                     // The sync waits to learn which of two saves is newer: ask it to look again now.
                     if self.docs.asked.remove(&doc) {
-                        self.control.request_pass();
+                        self.pass_soon();
                     }
                     let bytes = Arc::new(bytes);
                     for (conn, id) in self.handles_of(doc) {
@@ -559,9 +697,96 @@ impl State {
                         frames.extend(self.tell(conn, DocOut::Presence { id, bytes: bytes.clone() }));
                     }
                 }
+                DocEvent::PresenceFrom(doc, user, bytes) => {
+                    // Somebody the member list doesn't have: it is looked at again.
+                    if self.people.as_ref().is_none_or(|p| !p.iter().any(|m| m.user == user)) && self.strangers.insert(user) {
+                        self.want_people();
+                    }
+                    let bytes = Arc::new(bytes);
+                    for (conn, id) in self.handles_of(doc) {
+                        frames.extend(self.tell_presence(conn, id, Some(user), bytes.clone()));
+                    }
+                }
             }
         }
         frames
+    }
+
+    /// Presence `bytes` from `user` (the account it came from, if known) to the open `id` of `conn`: with the sender for an
+    /// app that opened the document with `identity`, as plain presence for any other.
+    fn tell_presence(&mut self, conn: ConnId, id: u64, user: Option<Uuid>, bytes: Arc<Vec<u8>>) -> Vec<ClientFrame> {
+        let identity = self.docs.conns.get(&conn).is_some_and(|c| c.identity.contains(&id));
+        match user {
+            Some(user) if identity => self.tell(conn, DocOut::PresenceFrom { id, user, bytes }),
+            _ => self.tell(conn, DocOut::Presence { id, bytes }),
+        }
+    }
+
+    /// Looks at who the account is and who is in the space (at most one look at a time, and not again within
+    /// [`PEOPLE_EVERY`]); the answer comes as [`Inner::People`].
+    fn want_people(&mut self) {
+        if self.people_busy || Instant::now() < self.people_not_before {
+            return;
+        }
+        self.people_busy = true;
+        self.people_not_before = Instant::now() + PEOPLE_EVERY;
+        let (server, token, space, team, known) =
+            (self.config.server.clone(), self.config.token.clone(), self.config.space, self.config.team, self.me);
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            let said = match HttpTransport::new(server, &token) {
+                Ok(transport) => {
+                    let me = match known {
+                        Some(me) => Ok(me),
+                        None => transport.account_info().await.map(|info| info.user_id),
+                    };
+                    match me {
+                        Ok(me) if team => match transport.space_members(space).await {
+                            Ok(list) => Inner::People { me: Some(me), members: Some(list.members), why: None },
+                            Err(e) => Inner::People { me: Some(me), members: None, why: Some(e.to_string()) },
+                        },
+                        Ok(me) => Inner::People { me: Some(me), members: None, why: None },
+                        Err(e) => Inner::People { me: None, members: None, why: Some(e.to_string()) },
+                    }
+                }
+                Err(e) => Inner::People { me: None, members: None, why: Some(e.to_string()) },
+            };
+            let _ = inner.send(said);
+        });
+    }
+
+    /// The answer to [`State::want_people`]: the member list as apps see it. Told to the apps with identity if it changed.
+    fn people_known(&mut self, me: Option<Uuid>, members: Option<Vec<craft_cloud_proto::api::SpaceMember>>, why: Option<String>) {
+        self.people_busy = false;
+        if let Some(why) = why {
+            self.say(format!("couldn't read who is in space {}: {why}", self.config.space));
+        }
+        if me.is_some() {
+            self.me = me;
+        }
+        let Some(me) = self.me else { return };
+        let list: Vec<DocMember> = match members {
+            // Members that are active; an account that is only invited is not there yet.
+            Some(members) => members
+                .into_iter()
+                .filter(|m| m.state == "active")
+                .map(|m| DocMember { user: m.user, name: m.username, colour: member_colour(m.user), is_self: m.user == me })
+                .collect(),
+            None if self.config.team => return,
+            // A personal space: the account alone.
+            None => vec![DocMember { user: me, name: self.config.username.clone(), colour: member_colour(me), is_self: true }],
+        };
+        let list = Arc::new(list);
+        self.strangers.clear();
+        if self.people.as_ref() == Some(&list) {
+            return;
+        }
+        self.people = Some(list.clone());
+        let opens: Vec<(ConnId, u64)> =
+            self.docs.conns.iter().flat_map(|(conn, c)| c.identity.iter().filter(|id| c.handles.contains_key(id)).map(|id| (*conn, *id))).collect();
+        for (conn, id) in opens {
+            let _ = self.tell(conn, DocOut::Members { id, members: list.clone() });
+        }
     }
 
     /// The first open waiting for `doc` is asked for its import; with none left, the join is given up on.
@@ -584,15 +809,26 @@ impl State {
         let Some((snapshot, waiting)) = self.replica.document_state(doc) else {
             return self.tell(conn, DocOut::NotLive { id, reason: NotLiveReason::Offline, message: "the document can't be read here".into() });
         };
-        let file_hash = self.docs.opens.remove(&(conn, id)).flatten();
-        let changed_outside = file_hash.and_then(|hash| self.changed_outside(doc, &hash));
+        let wish = self.docs.opens.remove(&(conn, id)).unwrap_or_default();
+        let changed_outside = wish.file_hash.and_then(|hash| self.changed_outside(doc, &hash));
         let Some(c) = self.docs.conns.get_mut(&conn) else { return Vec::new() };
         c.handles.insert(id, doc);
+        if wish.identity {
+            c.identity.insert(id);
+        }
         self.replica.set_open(doc, true);
         self.sessions_changed(&[doc]);
         let (online, waiting_n) = self.replica.document_status(doc).unwrap_or((false, 0));
         let state = DocState { online, waiting: waiting_n, bytes: snapshot.len() as u64, updates: waiting.len() as u64 };
-        let mut frames = self.tell(conn, DocOut::Opened { id, doc, state, changed_outside, snapshot, waiting });
+        let (read_only, space) = (self.replica.read_only(), self.config.space);
+        let mut frames = self.tell(conn, DocOut::Opened { id, doc, state, changed_outside, read_only, space, snapshot, waiting });
+        if wish.identity {
+            // Who is in the space: now if it is known, and when it is.
+            match self.people.clone() {
+                Some(members) => frames.extend(self.tell(conn, DocOut::Members { id, members })),
+                None => self.want_people(),
+            }
+        }
         // The file's record, to this open now (and to the others if it changed).
         let frontiers = self.file_record(doc);
         frames.extend(self.tell(conn, DocOut::File { doc, frontiers }));
@@ -701,7 +937,7 @@ impl State {
             self.say(format!("a save record couldn't be kept: {e}"));
             return;
         }
-        self.control.request_pass();
+        self.pass_soon();
         if let Some(seen) = self.docs.files.get_mut(&doc) {
             seen.told = None;
         }
@@ -793,7 +1029,7 @@ impl State {
     }
 
     /// An app opens `path` as `id`.
-    fn open(&mut self, conn: ConnId, id: u64, path: &str, app: &str, file_hash: Option<String>) -> Vec<ClientFrame> {
+    fn open(&mut self, conn: ConnId, id: u64, path: &str, app: &str, wish: Wish) -> Vec<ClientFrame> {
         let not_live = |reason, message: &str| DocOut::NotLive { id, reason, message: message.to_owned() };
         let Some(c) = self.docs.conns.get(&conn) else { return Vec::new() };
         if c.handles.contains_key(&id)
@@ -816,12 +1052,12 @@ impl State {
             Ok(m) if m.is_file() => {}
             _ => return self.tell(conn, not_live(NotLiveReason::NotInFolder, "there is no such file in the synced folder")),
         }
-        self.docs.opens.insert((conn, id), file_hash);
+        self.docs.opens.insert((conn, id), wish);
         match self.lookup.file_node(&rel) {
             Some(node) => self.open_node(conn, id, node, &app),
             None => {
                 // Not uploaded yet: a pass for it, and a few seconds for its node.
-                self.control.request_pass();
+                self.pass_soon();
                 self.docs.lookups.push(Lookup { conn, id, path: rel, app, until: Instant::now() + NODE_WAIT });
                 Vec::new()
             }
@@ -896,10 +1132,10 @@ impl State {
     fn docs_call(&mut self, call: DocsCall) -> Vec<ClientFrame> {
         match call {
             DocsCall::Connect { conn, out } => {
-                self.docs.conns.insert(conn, DocsConn { out, handles: BTreeMap::new(), presence: HashMap::new() });
+                self.docs.conns.insert(conn, DocsConn { out, handles: BTreeMap::new(), identity: BTreeSet::new(), presence: HashMap::new() });
                 Vec::new()
             }
-            DocsCall::Open { conn, id, path, app, file_hash } => self.open(conn, id, &path, &app, file_hash),
+            DocsCall::Open { conn, id, path, app, file_hash, identity } => self.open(conn, id, &path, &app, Wish { file_hash, identity }),
             DocsCall::Saved { conn, doc, hash, frontiers } => self.saved(conn, doc, hash, frontiers),
             DocsCall::Saving { conn, doc, hash } => {
                 if !self.config.announce_delay.is_zero() {
@@ -930,6 +1166,19 @@ impl State {
                 let Some(doc) = self.docs.conns.get(&conn).and_then(|c| c.handles.get(&id)).copied() else {
                     return self.tell(conn, refusal(Some(id), Some(seq), craft_cloud_proto::api::codes::NOT_FOUND, "that document isn't open here"));
                 };
+                // A viewer's (or an archived space's) change is refused, and the agent's copy stays as it was: nothing of it
+                // reaches the journal or the server.
+                if self.replica.read_only() {
+                    return self.tell(
+                        conn,
+                        refusal(
+                            Some(id),
+                            Some(seq),
+                            craft_cloud_proto::api::codes::READ_ONLY,
+                            "this space is read-only for you: the change was not kept",
+                        ),
+                    );
+                }
                 match self.replica.local_update(doc, &bytes) {
                     Ok(mut frames) => {
                         frames.extend(self.tell(conn, DocOut::Ack { id, seq }));
@@ -962,9 +1211,10 @@ impl State {
                 }
                 let mut frames = self.replica.presence(doc, &bytes);
                 let bytes = Arc::new(bytes);
+                let me = self.me;
                 for (other, other_id) in self.handles_of(doc) {
                     if (other, other_id) != (conn, id) {
-                        frames.extend(self.tell(other, DocOut::Presence { id: other_id, bytes: bytes.clone() }));
+                        frames.extend(self.tell_presence(other, other_id, me, bytes.clone()));
                     }
                 }
                 frames
@@ -1057,6 +1307,8 @@ impl State {
         if self.socket.is_none() {
             return true;
         }
+        // Nothing that writes goes to a space the account may not change.
+        let frames = self.replica.gate(frames);
         let mut encoded = Vec::with_capacity(frames.len());
         for frame in frames {
             // Behind an upload of its document: it goes once that is done.
@@ -1087,7 +1339,7 @@ impl State {
             self.back_off(None);
         }
         self.replica.disconnected();
-        self.control.set_online(false);
+        self.set_online(false);
         self.new_generation();
     }
 
@@ -1122,6 +1374,20 @@ impl State {
             Request::Docs(call) => {
                 let frames = self.docs_call(call);
                 self.send(frames).await;
+            }
+            Request::Access(read_only) => {
+                self.replica.set_read_only(read_only);
+                // The connection was opened as a viewer and the account may write now: connected again at once, so the
+                // server's word (the role in `welcome_space`) is the new one, and what was unacked goes up.
+                if !read_only && self.replica.role() == Some(craft_cloud_proto::api::SpaceRole::Viewer) && self.socket.is_some() {
+                    if let Some(socket) = self.socket.take() {
+                        socket.close().await;
+                    }
+                    self.drop_socket();
+                    self.retry_at = Instant::now();
+                    self.delay = RETRY_FIRST;
+                }
+                self.say_unsent();
             }
             Request::Follow { app, reply } => {
                 if !self.lists.contains_key(&app) && self.lists.len() >= MAX_SUBSCRIPTIONS {
@@ -1175,9 +1441,18 @@ async fn run(
     mut stop: oneshot::Receiver<()>,
     paused: bool,
 ) {
-    let lookup = NodeLookup { data: config.data.clone(), seen: None, state: None };
+    let lookup = if config.team {
+        NodeLookup { data: config.data.space_dir(config.space), team: Some((config.space, config.folder.clone())), seen: None, state: None }
+    } else {
+        NodeLookup { data: config.data.clone(), team: None, seen: None, state: None }
+    };
     let (blob_tx, mut blob_rx) = mpsc::unbounded_channel();
-    let transport = HttpTransport::new(config.server.clone(), &config.token).ok().map(Arc::new);
+    let (inner_tx, mut inner_rx) = mpsc::unbounded_channel::<Inner>();
+    // (A team space's chunks go to that space.)
+    let transport = HttpTransport::new(config.server.clone(), &config.token)
+        .and_then(|t| if config.team { t.bound_to(config.space) } else { Ok(t) })
+        .ok()
+        .map(Arc::new);
     let blobs = Blobs { transport, done: blob_tx, generation: 0, uploading: BTreeMap::new(), held: BTreeMap::new() };
     let saves = super::saves::SaveBook::new(config.data.path(), config.space);
     // Documents apps had open before the agent (re)started: their files may hold saves whose records come on reconnect.
@@ -1185,6 +1460,11 @@ async fn run(
     saves.restore_sessions();
     // The sync engine's questions: which of two saves of a document is newer (this copy's operations say).
     let (_orders, mut orders) = super::saves::Orders::serve(config.data.path(), config.space);
+    let mut replica = replica;
+    if config.team {
+        replica.require_spaces();
+    }
+    replica.set_read_only(config.read_only);
     let mut state = State {
         saves,
         config,
@@ -1199,7 +1479,14 @@ async fn run(
         delay: RETRY_FIRST,
         paused,
         docs: Docs::default(),
+        inner: inner_tx,
+        me: None,
+        people: None,
+        people_busy: false,
+        people_not_before: Instant::now(),
+        strangers: BTreeSet::new(),
     };
+    state.say_unsent();
     state.settle();
     let mut dialing: Option<tokio::task::JoinHandle<Result<LiveSocket, DialError>>> = None;
     let mut last_heard = Instant::now();
@@ -1211,7 +1498,8 @@ async fn run(
     loop {
         if state.socket.is_none() && dialing.is_none() && !state.paused && Instant::now() >= state.retry_at {
             let (server, token) = (state.config.server.clone(), state.config.token.clone());
-            dialing = Some(tokio::spawn(async move { dial(&server, &token).await }));
+            let space = state.config.team.then_some(state.config.space);
+            dialing = Some(tokio::spawn(async move { dial(&server, &token, space).await }));
         }
         let (up, retry_at) = (state.socket.is_some(), state.retry_at);
         let writer_gone = state.socket.as_ref().map(|s| s.gone.clone());
@@ -1238,7 +1526,7 @@ async fn run(
                         state.replica.disconnected();
                         state.new_generation();
                         // Offline before the caller hears it, so the status it reads next says so.
-                        state.control.set_online(false);
+                        state.set_online(false);
                     } else {
                         // Dialed at once: nothing was wrong with the connection.
                         state.retry_at = Instant::now();
@@ -1258,6 +1546,14 @@ async fn run(
                         last_heard = Instant::now();
                         let hello = state.replica.connected();
                         state.send(hello).await;
+                    }
+                    // A team space the server doesn't serve to this account (no longer a member, or a server from before live team
+                    // spaces): the agent's list of spaces is looked at, and the link asks again only after a long pause. The
+                    // documents and journals stay on disk.
+                    Ok(Err(DialError::Refused(404))) if state.config.team => {
+                        state.say(format!("the server has no live link for space {} (not a member now, or an older server)", state.config.space));
+                        state.look_at_spaces();
+                        state.back_off(Some(RETRY_MISMATCH));
                     }
                     Ok(Err(e)) => {
                         state.say(format!("recents stay on this machine for now: {e}"));
@@ -1286,6 +1582,7 @@ async fn run(
                 let frames = state.blob_done(done);
                 state.send(frames).await;
             }
+            Some(Inner::People { me, members, why }) = inner_rx.recv() => state.people_known(me, members, why),
             // The writer gave up (the server took nothing for the send timeout): the connection is gone.
             () = async { match &writer_gone { Some(gone) => gone.notified().await, None => std::future::pending().await } } => {
                 state.drop_socket();
@@ -1296,6 +1593,9 @@ async fn run(
                     Some(Ok(Message::Binary(bytes))) => ServerFrame::decode(&bytes).map_err(|e| LinkError::Retry(format!("a live frame doesn't decode: {e}"))),
                     Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
                     Some(Ok(Message::Text(_))) => Err(LinkError::Retry("the server sent a text frame".into())),
+                    Some(Ok(Message::Close(Some(frame)))) if u16::from(frame.code) == ACCESS_CHANGED_CLOSE => {
+                        Err(LinkError::AccessChanged("the server closed the connection: the account's access changed".into()))
+                    }
                     Some(Ok(Message::Close(_)) | Err(_)) | None => Err(LinkError::Retry("the live connection closed".into())),
                 };
                 match frame.and_then(|frame| state.replica.on_frame(frame)) {
@@ -1305,16 +1605,27 @@ async fn run(
                             state.said = None;
                         }
                         state.send(frames).await;
+                        state.say_unsent();
                     }
                     Err(e) => {
                         if let Some(socket) = state.socket.take() {
                             socket.close().await;
                         }
                         state.drop_socket();
-                        state.back_off(None);
-                        if let LinkError::Mismatch(m) = &e {
-                            state.say(format!("recents stay on this machine: {m}"));
-                            state.back_off(Some(RETRY_MISMATCH));
+                        match &e {
+                            // Asked again at once, once: the next answer is the new role, or that the account is no longer a
+                            // member. The agent's list of spaces is looked at too. (A server that says it again and again is
+                            // asked less and less often, as for any other failure.)
+                            LinkError::AccessChanged(_) => {
+                                let wait = (state.delay <= RETRY_FIRST).then_some(ACCESS_RETRY);
+                                state.back_off(wait);
+                                state.look_at_spaces();
+                            }
+                            LinkError::Mismatch(m) => {
+                                state.say(format!("recents stay on this machine: {m}"));
+                                state.back_off(Some(RETRY_MISMATCH));
+                            }
+                            LinkError::Retry(_) => state.back_off(None),
                         }
                     }
                 }

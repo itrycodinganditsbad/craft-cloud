@@ -773,6 +773,9 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             record_delay: options.record_delay,
             session_grace: options.session_grace,
             announce_delay: options.announce_delay,
+            team: false,
+            username: account.username.clone(),
+            read_only: false,
         };
         let hub = match Hub::start(hub_config, control.clone(), user_paused) {
             Ok(hub) => Some(hub),
@@ -1104,7 +1107,27 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
         // stop at once: nothing queued starts, and the pass thread is not waited for, as the personal one is not). Only the
         // second stop asks for that; a loop that ends because its pass thread is gone also exits with `Failed`.
         control.set_spaces_handle(None);
-        spaces.stop(stops > 1).await;
+        // A first stop waits here for a team pass that is under way, which can take as long as the server does not answer;
+        // signals are read meanwhile, and a second one ends the wait.
+        let spaces_handle = spaces.handle();
+        let stopping_spaces = spaces.stop(stops > 1);
+        tokio::pin!(stopping_spaces);
+        loop {
+            tokio::select! {
+                () = &mut stopping_spaces => break,
+                signal = stop.recv(), if stop_open => match signal {
+                    Some(()) => {
+                        stops += 1;
+                        if stops == 2 {
+                            say(out, "stopping at once");
+                            spaces_handle.stop_now();
+                        }
+                    }
+                    None => stop_open = false,
+                },
+            }
+        }
+        control.set_team_hubs(Vec::new());
         control.set_spaces(Vec::new(), Vec::new());
         // Recents stop with the account: their followers are told, and what they were given is on disk.
         control.set_hub(None);
