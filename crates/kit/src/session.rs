@@ -1463,7 +1463,9 @@ impl<D: LiveDocument> Session<D> {
                 })
             })
             .collect();
-        people.sort_by(|a, b| b.is_self.cmp(&a.is_self).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())).then_with(|| a.name.cmp(&b.name)));
+        people.sort_by(|a, b| {
+            b.is_self.cmp(&a.is_self).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())).then_with(|| a.name.cmp(&b.name))
+        });
         people
     }
 
