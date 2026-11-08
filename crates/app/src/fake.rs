@@ -606,7 +606,12 @@ impl Hub {
                         &inner,
                         machine,
                         conn,
-                        &DocsEvent::Error { id: None, seq: None, code: "not_found".into(), message: "the space stopped syncing on this computer".into() },
+                        &DocsEvent::Error {
+                            id: None,
+                            seq: None,
+                            code: "not_found".into(),
+                            message: "the space stopped syncing on this computer".into(),
+                        },
                     );
                 }
                 let Some(m) = inner.machines.get_mut(&machine) else { return };
@@ -754,7 +759,8 @@ fn open(inner: &mut Inner, machine: usize, conn: u64, id: u64, path: &str) {
     let doc = match (known, hub_doc) {
         (Some(doc), _) => doc,
         (None, Some((doc, import))) if m.online => {
-            m.docs.insert(doc, MachineDoc { path: path.to_owned(), import, log: Vec::new(), hub_seen: 0, pending: VecDeque::new(), held: Vec::new() });
+            m.docs
+                .insert(doc, MachineDoc { path: path.to_owned(), import, log: Vec::new(), hub_seen: 0, pending: VecDeque::new(), held: Vec::new() });
             doc
         }
         (None, None) if m.online => {
