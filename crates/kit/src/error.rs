@@ -1,8 +1,9 @@
 //! What can go wrong in the kit. Nothing here panics: a Loro error, a hostile or broken document, a lost agent all
 //! become a [`KitError`], and the app keeps its model.
 
-/// Why a kit call failed.
+/// Why a kit call failed. New variants are added without a breaking change: match with a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum KitError {
     /// The document was made by a newer version of the app (or by another app): it is shown, but nothing is sent.
     #[error("this document needs a newer {app} (made with layout {version}); it opens read-only")]

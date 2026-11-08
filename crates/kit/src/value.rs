@@ -82,6 +82,12 @@ pub trait BlobStore: Send + Sync {
     fn space_bound(&self) -> Option<bool> {
         None
     }
+
+    /// The file a bound store ([`BlobStore::space_bound`] is `Some(true)`) is bound to; none otherwise.
+    /// [`crate::Session::check_blobs`] compares it with the document's own path.
+    fn bound_path(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// The agent's blob store, through `craft-cloud-app`. An agent too old for blobs answers [`KitError::Agent`] with
@@ -104,11 +110,17 @@ impl BlobStore for AgentBlobs {
     fn space_bound(&self) -> Option<bool> {
         Some(self.0.bound_path().is_some())
     }
+
+    fn bound_path(&self) -> Option<&str> {
+        self.0.bound_path()
+    }
 }
 
-/// An agent's refusal, its code kept in the message (`agent_too_old: …`).
+/// An agent's refusal, its code kept in the message (`agent_too_old: …`). A viewer's put into a team space (`read_only`) is
+/// [`KitError::ViewOnly`], as a change to the document is.
 fn agent_error(e: craft_cloud_app::Error) -> KitError {
     match e {
+        craft_cloud_app::Error::Refused { code, .. } if code == "read_only" => KitError::ViewOnly,
         craft_cloud_app::Error::Refused { code, message, .. } => KitError::Agent(format!("{code}: {message}")),
         other => KitError::from(other),
     }
