@@ -14,7 +14,7 @@ use crate::codec::{hash_from, to_i64, to_u64, uuid_bytes};
 use crate::{Meta, MetaError};
 
 /// How a blob's kind is stored in the `kind` columns.
-trait KindCode {
+pub(crate) trait KindCode {
     fn code(self) -> i16;
 }
 

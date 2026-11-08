@@ -13,6 +13,7 @@ mod commit;
 mod join;
 mod live;
 mod schema;
+mod storage;
 mod tree;
 mod users;
 
@@ -27,6 +28,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 pub use commit::CommitOutcome;
 pub use craft_cloud_proto::BlobKind;
 pub use join::{InviteFor, Redeemed};
+pub use storage::{BlobRow, StorageTotals};
 pub use live::{
     Appended, DEFAULT_LIVE_BYTES_PER_SPACE, LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE, MAX_LIVE_DOCS_PER_SPACE,
     MAX_LIVE_DOCUMENTS_HOLDING_UPDATES, MAX_LIVE_DOCUMENTS_PER_SPACE, MAX_LIVE_PAGE, SnapshotRef,
