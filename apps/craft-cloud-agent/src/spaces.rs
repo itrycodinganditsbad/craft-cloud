@@ -1243,7 +1243,11 @@ impl Manager {
                     Some(false) => return Err(AgentError::Usage(STILL_FINISHING.into())),
                 }
             }
-            set_up_folder(&self.data, &folder, space, root, request.adopt)?;
+            // Setting up a folder that has no marker yet installs one and starts the space's state afresh. The old state is
+            // made unusable (the generation raised and saved) before the marker is written, so a crash between the marker and
+            // the removal of the state leaves a state that is never trusted for this folder.
+            let data = self.data.clone();
+            set_up_folder(&data, &folder, space, root, request.adopt, || self.raise_generation(space))?;
             let generation = known.and_then(|i| self.account.spaces.get(i)).map_or(0, |s| s.generation);
             let setting = SpaceSetting { space, folder, sync: true, name: item.name.clone(), root: Some(root), generation };
             match known {
@@ -1463,10 +1467,31 @@ fn start_active(
     Some(active)
 }
 
+/// For tests: the folder at which the next set-up stops right after its marker is written, as if the agent had crashed there.
+#[doc(hidden)]
+pub static STOP_AFTER_MARKER: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Whether the set-up of `folder` is to stop now (once; see [`STOP_AFTER_MARKER`]).
+fn stop_after_marker(folder: &Path) -> bool {
+    let mut armed = STOP_AFTER_MARKER.lock().unwrap_or_else(PoisonError::into_inner);
+    if armed.as_deref() == Some(folder) {
+        *armed = None;
+        return true;
+    }
+    false
+}
+
 /// Makes `folder` the folder of `space`, whose root is `root`: a new or empty folder gets the space's marker; one with
 /// files is taken only with `adopt` (what differs from the space's becomes conflict copies, nothing is deleted); one that
 /// already has this space's marker is taken as it is; another space's marker refuses it.
-fn set_up_folder(data: &DataDir, folder: &Path, space: SpaceId, root: NodeId, adopt: bool) -> Result<(), AgentError> {
+fn set_up_folder(
+    data: &DataDir,
+    folder: &Path,
+    space: SpaceId,
+    root: NodeId,
+    adopt: bool,
+    invalidate_state: impl FnOnce() -> Result<(), AgentError>,
+) -> Result<(), AgentError> {
     let marker = RootMarker { space, root };
     let existing = if folder.is_dir() { root::read(folder)? } else { None };
     match existing {
@@ -1477,8 +1502,12 @@ fn set_up_folder(data: &DataDir, folder: &Path, space: SpaceId, root: NodeId, ad
     if folder.is_dir() && crate::cli::has_files(folder)? && !adopt {
         return Err(AgentError::FolderHasFiles(folder.to_owned()));
     }
+    invalidate_state()?;
     std::fs::create_dir_all(folder).map_err(|source| AgentError::Io { path: folder.to_owned(), source })?;
     root::write(folder, &marker)?;
+    if stop_after_marker(folder) {
+        return Err(AgentError::Usage("stopped after the marker was written (test hook)".into()));
+    }
     // A fresh folder starts from a fresh state: what a state remembers of an older folder must not decide what this one
     // is missing.
     data.space_dir(space).remove_state()?;

@@ -1492,3 +1492,38 @@ async fn a_state_that_cannot_be_removed_fails_the_turn_off_and_is_never_trusted_
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(names(&ana_folder).len(), 6, "nothing was deleted on the server: {:?}", names(&ana_folder));
 }
+
+/// Item 5: a team folder is wiped and recreated at the same path; setting it up installs the space's marker and stops right
+/// there (as a crash would), before the old state is removed. The old state must not be trusted for the new folder after a
+/// restart: the files it knew are not taken for deleted, and the folder is filled from the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_after_the_marker_is_installed_does_not_revive_the_old_state() {
+    let mut t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    let (ana_folder, a) = both_syncing(&t).await;
+    for i in 0..6 {
+        write(&ana_folder, &format!("f{i}.txt"), &format!("content {i}"));
+    }
+    eventually("ben has the files", || async { names(&a).len() == 6 }).await;
+    eventually("nothing runs", || async { t.ben.status().await.spaces.iter().all(|s| s.run_state == SpaceRun::Idle) }).await;
+    t.ben.api(|c| c.pause()).await.unwrap();
+
+    // The folder is wiped and made again, empty; the person turns the sync on for it, and the set-up stops after the marker.
+    std::fs::remove_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&a).unwrap();
+    *craft_cloud_agent::spaces::STOP_AFTER_MARKER.lock().unwrap() = Some(a.clone());
+    let again = t.ben.api(move |c| c.set_space_sync(space, &SpaceSyncRequest { on: true, folder: None, adopt: false })).await;
+    assert!(again.is_err(), "the set-up stopped after the marker: {again:?}");
+    assert!(a.join(".craft-cloud/root.json").is_file(), "the marker was written");
+    assert!(t.ben.space_state(space).is_some(), "the old state was not removed yet");
+
+    // The agent restarts; the old state must not decide what the new folder is missing.
+    let (exit, out) = t.ben.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    t.ben.run();
+    t.ben.ready().await;
+    t.ben.api(|c| c.resume()).await.unwrap();
+    eventually("the folder is filled from the server", || async { names(&a).len() == 6 }).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(names(&ana_folder).len(), 6, "nothing was deleted on the server: {:?}", names(&ana_folder));
+}
