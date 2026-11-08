@@ -55,7 +55,14 @@ pub(super) fn show(ui: &mut egui::Ui, admin: &mut AdminScreen, now_ms: i64, even
         ),
         View::Create(form) => create(ui, form, events),
         View::Audit(view) => {
-            switcher(ui, 2, events);
+            // Refresh sits beside the switcher, as it does on the other two parts.
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                switcher(ui, 2, events);
+                if ui.add_enabled(!view.list.loading, kit::Button::new("Refresh")).clicked() {
+                    events.push(Event::Audit(crate::audit::AuditMsg::Reload));
+                }
+            });
             ui.add_space(12.0);
             super::audit::log(ui, view, now_ms, true, events);
         }

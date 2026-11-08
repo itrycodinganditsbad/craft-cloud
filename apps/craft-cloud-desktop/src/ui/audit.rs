@@ -73,22 +73,25 @@ fn paging(ui: &mut egui::Ui, list: &AuditList, previous: AuditMsg, next: AuditMs
     });
 }
 
-/// The admin's audit log. `in_switcher`: the admin pages' switcher shows it, and gives the heading and the way back itself.
+/// The admin's audit log. `in_switcher`: the admin pages' switcher shows it, and gives the heading, the way back and Refresh itself.
 pub(super) fn log(ui: &mut egui::Ui, view: &mut AuditView, now_ms: i64, in_switcher: bool, events: &mut Vec<Event>) {
     if !in_switcher {
         super::heading(ui, "Audit log");
     }
     // Controls of a row are as high as a button, so a field, a menu and a button line up.
     ui.spacing_mut().interact_size.y = super::kit::CONTROL_H;
-    ui.horizontal(|ui| {
-        if !in_switcher && ui.add(super::kit::Button::new("Back to the accounts")).clicked() {
-            events.push(Event::Admin(AdminEvent::BackToList));
-        }
-        if ui.add_enabled(!view.list.loading, super::kit::Button::new("Refresh")).clicked() {
-            send(events, AuditMsg::Reload);
-        }
-    });
-    ui.add_space(8.0);
+    // In the switcher the page draws Refresh beside the switcher itself.
+    if !in_switcher {
+        ui.horizontal(|ui| {
+            if ui.add(super::kit::Button::new("Back to the accounts")).clicked() {
+                events.push(Event::Admin(AdminEvent::BackToList));
+            }
+            if ui.add_enabled(!view.list.loading, super::kit::Button::new("Refresh")).clicked() {
+                send(events, AuditMsg::Reload);
+            }
+        });
+        ui.add_space(8.0);
+    }
 
     // The filters: an event (the server's closed list, by group or by name) and the account the page was opened for.
     ui.horizontal(|ui| {
