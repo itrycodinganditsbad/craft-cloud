@@ -32,6 +32,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 reqwest.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true

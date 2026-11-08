@@ -2,13 +2,14 @@
 //! runs; Postgres with S3 runs when `CRAFT_CLOUD_TEST_PG` and the `CRAFT_CLOUD_TEST_S3_*` variables are set
 //! (`CRAFT_CLOUD_REQUIRE_BACKENDS` turns a missing one into a failure).
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use craft_cloud_meta::{BlobKind, BlobRow, Meta, Role};
 use craft_cloud_proto::SpaceId;
 use craft_cloud_server::storage_tools::{self, ESTIMATE_KEY};
 use craft_cloud_store::disk::DiskBackend;
 use craft_cloud_store::s3::{S3Backend, S3Config};
-use craft_cloud_store::{Backend, BlobKey, Compression, Store};
+use craft_cloud_store::{Backend, BlobKey, Compression, Store, StoreError};
 
 struct Env {
     meta: Meta,
@@ -317,13 +318,13 @@ async fn old_rows_are_unknown_until_measured(env: Env) {
     assert_eq!(totals.logical_bytes, old_data.len() as u64 + new_data.len() as u64 + 2);
 
     // `store measure` fills in the old one from the object, without changing its level (still unknown).
-    let (filled, missing) = storage_tools::measure(&env.meta, &env.store, &mut Vec::new()).await.unwrap();
-    assert_eq!((filled, missing), (1, 0));
+    let report = storage_tools::measure(&env.meta, &env.store, &mut Vec::new()).await.unwrap();
+    assert_eq!((report.filled, report.missing, report.failed), (1, 0, 0));
     let old_row = rows(&env).await.into_iter().find(|r| r.id == old_key.id).unwrap();
     assert_eq!((old_row.physical_size, old_row.level), (Some(raw(&env, old_key).await.len() as u64), None));
     assert_eq!(env.meta.storage_totals().await.unwrap().known_blobs, 2);
     // Nothing left to measure.
-    assert_eq!(storage_tools::measure(&env.meta, &env.store, &mut Vec::new()).await.unwrap(), (0, 0));
+    assert_eq!(storage_tools::measure(&env.meta, &env.store, &mut Vec::new()).await.unwrap(), storage_tools::MeasureReport::default());
 
     // An old row is also filled in by a recompress pass (it is unknown, so it is not skipped).
     let other = add_old(&env, &wordy("other old", 100 * 1024)).await;
@@ -438,4 +439,56 @@ async fn compression_none_is_a_setting_the_pass_respects_in_the_cli() {
     measured.unwrap();
     assert!(out.contains("measured 0 blobs"), "{out}");
     assert_eq!(Compression::None, craft_cloud_server::config::Config::load(&config_path).unwrap().storage.compression().into());
+}
+
+/// A disk backend whose length query fails for one object, like a backend with a transient error on that path.
+struct FailsLenOf {
+    inner: DiskBackend,
+    path: String,
+}
+
+#[async_trait]
+impl Backend for FailsLenOf {
+    async fn put_raw(&self, path: &str, data: Bytes) -> Result<(), StoreError> {
+        self.inner.put_raw(path, data).await
+    }
+    async fn get_raw(&self, path: &str) -> Result<Option<Bytes>, StoreError> {
+        self.inner.get_raw(path).await
+    }
+    async fn len_raw(&self, path: &str) -> Result<Option<u64>, StoreError> {
+        if path == self.path { Err(StoreError::Backend("simulated failure".into())) } else { self.inner.len_raw(path).await }
+    }
+    async fn delete_raw(&self, path: &str) -> Result<(), StoreError> {
+        self.inner.delete_raw(path).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn measure_goes_on_past_a_blob_it_cannot_measure_and_reports_it() {
+    let env = sqlite_disk().await;
+    let mut keys = Vec::new();
+    for n in 0..3 {
+        keys.push(add_old(&env, &wordy(&format!("measure {n}"), 64 * 1024)).await);
+    }
+    // The object of the one that sorts first fails; the others come after it and must still be measured.
+    let mut sorted = keys.clone();
+    sorted.sort_by_key(|key| key.id);
+    let broken = sorted[0];
+    let dir = env._dirs[1].path().to_owned();
+    let flaky = Store::new(FailsLenOf { inner: DiskBackend::new(&dir).unwrap(), path: broken.path() });
+
+    let mut printed = Vec::new();
+    let report = storage_tools::measure(&env.meta, &flaky, &mut printed).await.unwrap();
+    assert_eq!((report.filled, report.missing, report.failed), (2, 0, 1), "{report:?}");
+    assert_eq!(report.failures.len(), 1);
+    assert!(report.failures[0].contains(&broken.path()) && report.failures[0].contains("simulated failure"), "{report:?}");
+    let printed = String::from_utf8(printed).unwrap();
+    assert!(printed.contains("1 failed") && printed.contains("left alone, not measured"), "{printed}");
+    let rows = rows(&env).await;
+    for row in &rows {
+        assert_eq!(row.physical_size.is_some(), row.id != broken.id, "{row:?}");
+    }
+    // A pass that finds nothing wrong measures the one that was left.
+    let report = storage_tools::measure(&env.meta, &env.store, &mut Vec::new()).await.unwrap();
+    assert_eq!((report.filled, report.missing, report.failed), (1, 0, 0), "{report:?}");
 }

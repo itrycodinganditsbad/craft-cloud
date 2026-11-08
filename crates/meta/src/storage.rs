@@ -78,6 +78,33 @@ impl Meta {
         w.commit().await
     }
 
+    /// Like [`set_physical`](Self::set_physical), for a rewrite of the object: records the new size and level only
+    /// when the row still holds `expected_physical` (the size the rewrite started from) or no size. An upload that
+    /// replaced the object meanwhile has recorded its own size, and this leaves that alone. Returns whether the row
+    /// was changed.
+    pub async fn set_physical_if(
+        &self,
+        kind: BlobKind,
+        id: &[u8; 32],
+        expected_physical: u64,
+        physical_size: u64,
+        level: u8,
+    ) -> Result<bool, MetaError> {
+        let mut w = self.begin_write().await?;
+        let done = sqlx::query(
+            "UPDATE blobs SET physical_size = $1, compress_level = $2 WHERE kind = $3 AND id = $4 AND (physical_size IS NULL OR physical_size = $5)",
+        )
+        .bind(to_i64(physical_size)?)
+        .bind(i64::from(level))
+        .bind(kind.code())
+        .bind(id.to_vec())
+        .bind(to_i64(expected_physical)?)
+        .execute(&mut *w.tx)
+        .await?;
+        w.commit().await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     /// Records only the physical size of a blob (a measurement), leaving the level it was written at as it is.
     pub async fn set_measured_size(&self, kind: BlobKind, id: &[u8; 32], physical_size: u64) -> Result<(), MetaError> {
         let mut w = self.begin_write().await?;
