@@ -72,10 +72,11 @@ pub use admin::UserQuery;
 pub use audit::{AuditQuery, ExportOutcome};
 pub use craft_cloud_api::DeviceId;
 pub use craft_cloud_api::api::{
-    AUDIT_ACTIONS, AccountInfo, AccountUsage, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminManifestIndex,
-    AdminPasswordReset, AdminServerInfo, AdminStorageAccount, AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, AuditEvent,
-    AuditPage, DeviceInfo, PairingState, PairingStatus, RecoveryCodes, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus,
-    UsageEstimateReason, UsageEstimates, valid_audit_action,
+    AUDIT_ACTIONS, AccountInfo, AccountUsage, AdminCode, AdminCompression, AdminCompressionEstimate, AdminCompressionLevelEstimate, AdminConfirm,
+    AdminCreateUser, AdminCreatedUser, AdminDevices, AdminManifestIndex, AdminPasswordReset, AdminServerInfo, AdminSetCompressionLevel,
+    AdminStorageAccount, AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, AuditEvent, AuditPage, DeviceInfo, PairingState,
+    PairingStatus, RecoveryCodes, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus, UsageEstimateReason, UsageEstimates,
+    valid_audit_action,
 };
 pub use craft_cloud_api::local::{
     HistoryResponse, HistoryVersion, JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RestoreResponse, RunState,
@@ -853,6 +854,27 @@ mod tests {
     #[test]
     fn storage_admin_calls_use_the_local_admin_routes() {
         let id = uuid::Uuid::now_v7();
+        let compression = AdminCompression {
+            algorithm: "zstd".into(),
+            level: 19,
+            config_level: 3,
+            admin_level: Some(19),
+            min_saving_percent: 5,
+            blobs: 10,
+            logical_bytes: 1000,
+            known_blobs: 8,
+            known_logical_bytes: 800,
+            known_physical_bytes: 200,
+            known_permille: 800,
+            saving_permille: Some(750),
+            estimate: Some(AdminCompressionEstimate {
+                at_ms: 5,
+                sampled_blobs: 4,
+                sampled_bytes: 4000,
+                current_saving_permille: 700,
+                levels: vec![AdminCompressionLevelEstimate { level: 19, saving_permille: 800, kib_per_second: 5000 }],
+            }),
+        };
         let overview = AdminStorageOverview {
             accounts: 1,
             stored_bytes: 17,
@@ -869,6 +891,7 @@ mod tests {
             server_fs_total_bytes: Some(1 << 38),
             server_fs_free_bytes: Some(1 << 37),
             database_bytes: Some(123_456),
+            compression: Some(compression.clone()),
         };
         let usage = AccountUsage {
             stored_bytes: 17,
@@ -877,9 +900,15 @@ mod tests {
             history_bytes: Some(8),
             estimates: UsageEstimates { index_complete: true, reason: None },
         };
-        let (_dir, agent, asked) = fake_agent(vec![(200, json(&overview)), (200, json(&usage))]);
+        let (_dir, agent, asked) = fake_agent(vec![(200, json(&overview)), (200, json(&compression)), (200, json(&usage))]);
         assert_eq!(agent.admin_storage().unwrap(), overview);
         assert_eq!(asked.recv_timeout(Duration::from_secs(5)).unwrap(), ("GET".into(), "/v1/admin/storage".into(), String::new()));
+        let set = AdminSetCompressionLevel { level: 19, password: Some("admin-secret-pw".into()), ..AdminSetCompressionLevel::default() };
+        assert_eq!(agent.admin_set_compression_level(&set).unwrap(), compression);
+        let (method, path, sent) = asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((method.as_str(), path.as_str()), ("PUT", "/v1/admin/storage/compression"));
+        assert_eq!(serde_json::from_str::<AdminSetCompressionLevel>(&sent).unwrap(), set, "the level and the password go with it");
+        assert!(!format!("{set:?}").contains("admin-secret-pw"), "the password stays out of Debug");
         assert_eq!(agent.admin_user_usage(id).unwrap(), usage);
         assert_eq!(asked.recv_timeout(Duration::from_secs(5)).unwrap(), ("GET".into(), format!("/v1/admin/users/{id}/usage"), String::new()));
     }
