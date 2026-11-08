@@ -233,8 +233,8 @@ fn home(ui: &mut egui::Ui, page: &mut SecurityPage, now_ms: i64, events: &mut Ve
     super::kit::joined_cells(ui, "security-cells", &cells, SIDE_BY_SIDE, |ui, i, part| match (i, part) {
         (0, Part::Body) => two_factor_body(ui, info, events),
         (0, Part::Footer) => two_factor_footer(ui, info, busy, events),
-        (1, Part::Body) => password_body(ui, password, password_error, busy, events),
-        (1, Part::Footer) => password_footer(ui, busy, events),
+        (1, Part::Body) => password_body(ui, password, password_error, busy, asking_sign_out, events),
+        (1, Part::Footer) => password_footer(ui, busy, asking_sign_out, events),
         (2, Part::Body) => computers_body(ui, overview, now_ms),
         (2, Part::Footer) => computers_footer(ui, overview, asking_sign_out, events),
         _ => {}
@@ -360,21 +360,27 @@ fn two_factor_footer(ui: &mut egui::Ui, info: &TwoFactorInfo, busy: bool, events
 }
 
 /// The three fields of the password form, each under its label, and what went wrong with the last try.
-fn password_body(ui: &mut egui::Ui, fields: &mut PasswordFields, error: Option<&str>, busy: bool, events: &mut Vec<Event>) {
+/// Why the password form is off while the sign-out of the other computers is asked for: the question replaces what was
+/// typed, so a submit would do nothing and starting it clears the fields.
+const ASKING_HOVER: &str = "Answer the question about signing out the other computers first";
+
+fn password_body(ui: &mut egui::Ui, fields: &mut PasswordFields, error: Option<&str>, busy: bool, asking: bool, events: &mut Vec<Event>) {
     let t = Tokens::get(ui.ctx());
     ui.add(egui::Label::new(RichText::new("Changing your password signs your other computers out.").size(13.0).color(t.muted)).wrap());
     let field = |ui: &mut egui::Ui, name: &str, label: &str, text: &mut String| {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
             super::kit::section_label(ui, label);
-            ui.add_enabled(!busy, super::kit::text_edit(text).id(secret_id(name)).password(true).desired_width(f32::INFINITY))
+            let response =
+                ui.add_enabled(!busy && !asking, super::kit::text_edit(text).id(secret_id(name)).password(true).desired_width(f32::INFINITY));
+            if asking { response.on_disabled_hover_text(ASKING_HOVER) } else { response }
         })
         .inner
     };
     field(ui, "password-current", "Current password", &mut fields.current);
     field(ui, "password-new", "New password", &mut fields.new);
     let again = field(ui, "password-again", "Repeat new password", &mut fields.again);
-    if again.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+    if !asking && again.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
         send(events, SecurityEvent::SubmitPassword);
     }
     if let Some(error) = error {
@@ -382,10 +388,12 @@ fn password_body(ui: &mut egui::Ui, fields: &mut PasswordFields, error: Option<&
     }
 }
 
-fn password_footer(ui: &mut egui::Ui, busy: bool, events: &mut Vec<Event>) {
+fn password_footer(ui: &mut egui::Ui, busy: bool, asking: bool, events: &mut Vec<Event>) {
     let size = egui::vec2(ui.available_width(), super::kit::CONTROL_H);
     let label = if busy { "Changing…" } else { "Change password" };
-    if ui.add_enabled(!busy, super::kit::Button::new(label).primary().min_size(size)).clicked() {
+    let button = ui.add_enabled(!busy && !asking, super::kit::Button::new(label).primary().min_size(size));
+    let button = if asking { button.on_disabled_hover_text(ASKING_HOVER) } else { button };
+    if button.clicked() {
         send(events, SecurityEvent::SubmitPassword);
     }
 }

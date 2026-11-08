@@ -285,6 +285,23 @@ fn the_password_form_checks_what_was_typed_and_locks_while_a_call_is_under_way()
     assert!(!format!("{:?}", model.screen).contains("brand new"));
 }
 
+/// While the sign-out of the other computers is asked for, the password form is off: a submit would be a silent no-op and
+/// starting the question clears what was typed.
+#[test]
+fn the_password_form_is_off_while_the_sign_out_of_the_others_is_asked() {
+    let agent = FakeAgent::new(signed_in());
+    let mut model = on_security(&agent);
+    model.update(Event::Security(SecurityEvent::StartSignOutOthers));
+    assert_eq!(page(&mut model).step, crate::security::Step::SignOutOthers);
+    page(&mut model).password.current = "typed".into();
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(3);
+    h.get_by_label("Change password").click();
+    h.run_steps(2);
+    assert!(h.state().1.is_empty(), "{:?}", h.state().1);
+    assert_eq!(page(&mut h.state_mut().0).password.current, "typed");
+}
+
 #[test]
 fn the_security_activity_lists_only_what_is_about_signing_in_and_the_account() {
     use crate::security::{SecurityActivity, SecurityAnswer, is_security_action};
