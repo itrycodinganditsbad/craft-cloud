@@ -17,9 +17,10 @@ use axum::routing::{MethodRouter, delete, get, post, put};
 use axum::{Json, Router, middleware};
 use craft_cloud_meta::{BlobKind, DeviceAuth, DeviceClient, DeviceRecord, NewChallenge, Origin, RevokeReason, SignIn, valid_username};
 use craft_cloud_proto::api::{
-    AccountUsage, CommitRequest, CommitResponse, DeviceInfo, HISTORY_DEFAULT_LIMIT, HistoryCursor, HistoryResponse, InfoResponse, LoginRequest,
-    LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, RestoreRequest, RestoreResponse, SpaceResponse,
-    SpaceRole, TRASH_DEFAULT_LIMIT, TrashCursor, TrashItem, TrashResponse, TrashRestoreResponse, UsageEstimateReason, UsageEstimates, codes,
+    AccountUsage, ClaimRequest, ClaimResponse, CommitRequest, CommitResponse, DeviceInfo, HISTORY_DEFAULT_LIMIT, HistoryCursor, HistoryResponse,
+    InfoResponse, LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, RestoreRequest,
+    RestoreResponse, SpaceResponse, SpaceRole, TRASH_DEFAULT_LIMIT, TrashCursor, TrashItem, TrashResponse, TrashRestoreResponse, UsageEstimateReason,
+    UsageEstimates, codes,
 };
 use craft_cloud_proto::limits::{MAX_BATCH_JSON_BYTES, MAX_BATCH_OPS, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_PAGE_NODES};
 use craft_cloud_proto::{ChangeSet, ChunkId, DeviceId, Manifest, ManifestId, NodeId, PageCursor};
@@ -108,6 +109,7 @@ fn space_routes(state: &Shared) -> Router<Shared> {
     use SpaceRole::{Editor, Owner, Viewer};
     Router::new()
         .route("/chunks/missing", gated(state, Editor, post(missing_chunks)).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
+        .route("/chunks/claim", gated(state, Editor, post(claim_chunks)).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
         .route(
             "/chunks/{id}",
             gated(state, Viewer, get(get_chunk)).merge(gated(state, Editor, put(put_chunk))).layer(DefaultBodyLimit::max(MAX_CHUNK_BYTES as usize)),
@@ -318,6 +320,22 @@ async fn missing_chunks(
         return Err(ApiError::invalid(format!("ask about at most {MAX_MISSING_IDS} chunks at once")));
     }
     Ok(Json(MissingResponse { missing: state.meta.missing_chunks(access.space, &req.ids).await? }))
+}
+
+/// `POST /chunks/claim`: the chunks of `from_space` that the working space lacks are added to it, without their bytes (see
+/// [`Meta::claim_chunks`]). The write is guarded like an upload, so an editor removed meanwhile is refused.
+async fn claim_chunks(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
+    request: Request,
+) -> Result<Json<ClaimResponse>, ApiError> {
+    let req: ClaimRequest = read_json(&state, request, SMALL_JSON_BYTES).await?;
+    if req.ids.len() > MAX_MISSING_IDS {
+        return Err(ApiError::invalid(format!("claim at most {MAX_MISSING_IDS} chunks at once")));
+    }
+    let claim = access.meta(&state, auth.user).claim_chunks(auth.user, access.space, req.from_space, &req.ids).await?;
+    Ok(Json(ClaimResponse { claimed: claim.claimed, missing: claim.missing }))
 }
 
 fn parse_chunk_id(id: &str) -> Result<ChunkId, ApiError> {

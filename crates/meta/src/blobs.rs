@@ -11,7 +11,7 @@ use craft_cloud_proto::{BlobKind, ChunkId, Manifest, ManifestId, SpaceId};
 use sqlx::Row;
 
 use crate::codec::{hash_from, to_i64, to_u64, uuid_bytes};
-use crate::{Dialect, Meta, MetaError};
+use crate::{Dialect, Meta, MetaError, UserId};
 
 /// How a blob's kind is stored in the `kind` columns.
 pub(crate) trait KindCode {
@@ -62,6 +62,15 @@ async fn missing_in_space(conn: &mut sqlx::AnyConnection, space: SpaceId, kind: 
         }
     }
     Ok(unique.into_iter().filter(|id| !present.contains(*id)).copied().collect())
+}
+
+/// The result of [`Meta::claim_chunks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    /// What the target space has of the asked IDs afterwards.
+    pub claimed: Vec<ChunkId>,
+    /// What neither space has.
+    pub missing: Vec<ChunkId>,
 }
 
 /// One blob to record: what it is, how many bytes it is stored as, and (for a manifest) the size of its file.
@@ -243,6 +252,67 @@ impl Meta {
             }
         }
         w.commit().await
+    }
+
+    /// Adds to `target` the chunks of `ids` that `from` has and `target` has not yet, charging their logical stored size to
+    /// `target` like an upload (`QuotaExceeded` refuses the whole claim and records nothing). `user` must have at least read access
+    /// to `from`, else the answer is `NotFound("space")`, the same as for a space that does not exist. The caller's role in
+    /// `target` is checked by the [`Meta::guarded`] handle, as for an upload. No bytes move: a blob is stored once.
+    ///
+    /// Returns what `target` has afterwards of `ids` (`claimed`: added now or held before, which the caller could download from
+    /// `target` anyway) and what neither space has (`missing`), each once, in the order given. A claim again changes nothing.
+    /// Chunks are inserted in ID order, so two overlapping claims wait on each other's rows in one order.
+    pub async fn claim_chunks(&self, user: UserId, target: SpaceId, from: SpaceId, ids: &[ChunkId]) -> Result<Claim, MetaError> {
+        let mut seen = HashSet::with_capacity(ids.len());
+        let unique: Vec<[u8; 32]> = ids.iter().map(|id| *id.as_bytes()).filter(|id| seen.insert(*id)).collect();
+        let mut w = self.begin_write().await?;
+        self.check_guard(&mut w.tx, target).await?;
+        if crate::spaces::access_on(&mut w.tx, user, from).await?.is_none() {
+            return Err(MetaError::NotFound("space"));
+        }
+        let absent = missing_in_space(&mut w.tx, target, BlobKind::Chunk, &unique).await?;
+        let missing_there: HashSet<[u8; 32]> = missing_in_space(&mut w.tx, from, BlobKind::Chunk, &absent).await?.into_iter().collect();
+        let in_source: HashSet<[u8; 32]> = absent.iter().filter(|id| !missing_there.contains(*id)).copied().collect();
+
+        let mut take: Vec<[u8; 32]> = in_source.iter().copied().collect();
+        take.sort();
+        for part in take.chunks(BATCH) {
+            let rows = (0..part.len()).map(|i| format!("(${}, ${}, ${})", i * 3 + 1, i * 3 + 2, i * 3 + 3)).collect::<Vec<_>>().join(", ");
+            let mut owned = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO space_blobs (space_id, kind, id) VALUES {rows} ON CONFLICT DO NOTHING RETURNING id"
+            )));
+            for id in part {
+                owned = owned.bind(uuid_bytes(target.as_uuid())).bind(BlobKind::Chunk.code()).bind(id.to_vec());
+            }
+            let mut new: Vec<[u8; 32]> = Vec::new();
+            for row in owned.fetch_all(&mut *w.tx).await? {
+                new.push(hash_from(&row.try_get::<Vec<u8>, _>("id")?)?);
+            }
+            if !new.is_empty() {
+                // Postgres sums BIGINT as NUMERIC, which the `Any` driver can't read: cast back.
+                let sql = format!(
+                    "SELECT CAST(COALESCE(SUM(stored_size), 0) AS BIGINT) AS total FROM blobs WHERE kind = $1 AND id IN ({})",
+                    placeholders(2, new.len())
+                );
+                let mut sum = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(BlobKind::Chunk.code());
+                for id in &new {
+                    sum = sum.bind(id.to_vec());
+                }
+                let size: i64 = sum.fetch_one(&mut *w.tx).await?.try_get("total")?;
+                charge(&mut w.tx, target, size, self.stored_cap).await?;
+            }
+        }
+        w.commit().await?;
+        let absent: HashSet<[u8; 32]> = absent.into_iter().collect();
+        let (mut claimed, mut missing) = (Vec::new(), Vec::new());
+        for id in unique {
+            if !absent.contains(&id) || in_source.contains(&id) {
+                claimed.push(ChunkId::from_bytes(id));
+            } else {
+                missing.push(ChunkId::from_bytes(id));
+            }
+        }
+        Ok(Claim { claimed, missing })
     }
 
     /// Records that `space` uploaded the manifest. Every chunk it lists must already be in the space;

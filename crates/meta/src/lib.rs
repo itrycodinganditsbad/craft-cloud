@@ -39,6 +39,7 @@ pub use audit::{
     ActionFilter, AuditAction, AuditCursor, AuditDetails, AuditEvent, AuditFailure, AuditOutcome, AuditQuery, ClientKind, Field, MAX_DETAILS_BYTES,
     MAX_RETENTION_DAYS, MIN_RETENTION_DAYS, OPPORTUNISTIC_PRUNE_BATCHES, Origin, PRUNE_BATCH, PRUNE_EVERY_MS, Platform, Pruned, Step, TargetKind,
 };
+pub use blobs::Claim;
 pub use commit::{CommitOutcome, RestoreOutcome, TrashRestoreOutcome};
 pub use craft_cloud_proto::BlobKind;
 pub use history::HistoryPage;

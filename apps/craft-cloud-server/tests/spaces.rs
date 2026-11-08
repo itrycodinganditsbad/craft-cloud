@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use craft_cloud_meta::{Meta, Role, SpaceActor, UserRecord};
-use craft_cloud_proto::api::{EPOCH_HEADER, ErrorBody, InfoResponse, LoginResponse, SPACE_HEADER, SpaceResponse, SpaceRole};
+use craft_cloud_proto::api::{ClaimResponse, EPOCH_HEADER, ErrorBody, InfoResponse, LoginResponse, SPACE_HEADER, SpaceResponse, SpaceRole};
 use craft_cloud_proto::{ChunkId, NodeId, SpaceId, SpaceName};
 use craft_cloud_server::AppState;
 use craft_cloud_server::auth::hash_password;
@@ -195,6 +195,10 @@ on_every_backend!(
     every_route_in_a_personal_space,
     viewers_read_and_cannot_write,
     a_chunk_of_one_space_is_not_readable_through_another,
+    claim_needs_an_editor_of_the_target_and_read_access_to_the_source,
+    claim_adds_only_what_the_source_has_and_is_idempotent,
+    claim_is_charged_to_the_target_and_refused_over_its_limit,
+    claim_is_bounded,
     a_long_poll_on_a_team_space_ends_with_404_when_the_member_is_removed,
     live_documents_of_a_team_space_wait_for_live_protocol_3,
     an_old_protocol_client_sees_the_server_it_always_saw,
@@ -459,6 +463,142 @@ async fn a_chunk_of_one_space_is_not_readable_through_another(w: &World) {
     };
     assert_eq!(missing(None).await, 0);
     assert_eq!(missing(Some(w.team)).await, 1);
+}
+
+// ---- POST /chunks/claim ----
+
+/// Records a chunk for `space` the way an upload does, with a stored size of `size` bytes (the bytes are not in the blob store:
+/// a claim moves none, so only the records matter).
+async fn record(w: &World, space: SpaceId, tag: u8, size: u64) -> ChunkId {
+    let id = ChunkId::from_bytes([tag; 32]);
+    w.meta.add_chunk(space, &id, size, NOW).await.unwrap();
+    id
+}
+
+async fn claim(w: &World, who: &str, target: Option<SpaceId>, from: SpaceId, ids: &[ChunkId]) -> reqwest::Response {
+    w.send(who, Method::POST, "/chunks/claim", target, Body::Json(json!({ "from_space": from, "ids": ids }))).await
+}
+
+async fn claimed(res: reqwest::Response) -> ClaimResponse {
+    assert_eq!(res.status(), StatusCode::OK);
+    res.json().await.unwrap()
+}
+
+async fn has(w: &World, space: SpaceId, id: ChunkId) -> bool {
+    w.meta.missing_chunks(space, &[id]).await.unwrap().is_empty()
+}
+
+async fn claim_needs_an_editor_of_the_target_and_read_access_to_the_source(w: &World) {
+    let personal = w.user("ana").space;
+    let a = record(w, personal, 1, 10).await;
+    let other = [ChunkId::from_bytes([200; 32])];
+    // A viewer of the target is read-only, though the source is readable; so is an editor of an archived target.
+    assert_eq!(seen(claim(w, "cy", Some(w.team), w.user("cy").space, &[a]).await).await.0, Seen::ReadOnly);
+    assert_eq!(seen(claim(w, "ben", Some(w.archived), w.user("ben").space, &other).await).await.0, Seen::ReadOnly);
+    // Not a member, only invited, removed, disabled, signed out: the answers of every other team route.
+    for (who, expected) in
+        [("eve", Seen::NoSpace), ("dee", Seen::NoSpace), ("gus", Seen::NoSpace), ("fay", Seen::Unauthorized), ("hal", Seen::Unauthorized)]
+    {
+        let res = claim(w, who, Some(w.team), w.user(who).space, &other).await;
+        assert_eq!(seen(res).await.0, expected, "{who} as target member");
+    }
+    // An editor without access to the source: the answer for a space that does not exist, byte for byte.
+    let unknown = claim(w, "ben", Some(w.team), SpaceId::generate(), &[a]).await;
+    let refused = claim(w, "ben", Some(w.team), personal, &[a]).await;
+    assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    assert_eq!(refused.status(), unknown.status());
+    assert_eq!(refused.headers().get(SPACE_HEADER), unknown.headers().get(SPACE_HEADER), "same echo");
+    assert_eq!(refused.text().await.unwrap(), unknown.text().await.unwrap(), "same body");
+    // Also for a team space of which the caller is only invited.
+    assert_eq!(claim(w, "dee", None, w.team, &[a]).await.status(), StatusCode::NOT_FOUND);
+    assert!(!has(w, w.team, a).await, "nothing was added by a refused claim");
+
+    // A viewer of the source may use it: claiming from the team space into the caller's own space works for cy.
+    let in_team = record(w, w.team, 2, 10).await;
+    let got = claimed(claim(w, "cy", None, w.team, &[in_team]).await).await;
+    assert_eq!((got.claimed, got.missing), (vec![in_team], vec![]));
+    assert!(has(w, w.user("cy").space, in_team).await);
+    // The archived space is readable as a source (its roles are capped at viewer, not removed).
+    let old = record(w, w.archived, 3, 10).await;
+    assert_eq!(claimed(claim(w, "ben", None, w.archived, &[old]).await).await.claimed, vec![old]);
+
+    // A member removed from the source loses the claim from the next request on, and the target with it.
+    let ben = w.user("ben");
+    assert_eq!(claimed(claim(w, "ben", None, w.team, &[in_team]).await).await.claimed, vec![in_team]);
+    w.meta.remove_member(&SpaceActor::Cli, w.team, ben.id, NOW + 10).await.unwrap();
+    assert_eq!(claim(w, "ben", None, w.team, &[in_team]).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(seen(claim(w, "ben", Some(w.team), ben.space, &other).await).await.0, Seen::NoSpace);
+}
+
+async fn claim_adds_only_what_the_source_has_and_is_idempotent(w: &World) {
+    let personal = w.user("ana").space;
+    let (a, b) = (record(w, personal, 10, 30).await, record(w, personal, 11, 40).await);
+    let (nowhere, held) = (ChunkId::from_bytes([12; 32]), record(w, w.team, 13, 50).await);
+    let before = w.meta.stored_bytes(w.team).await.unwrap();
+    // Duplicates once, in the order given; a chunk the target holds already is `claimed` (it could download it), a chunk
+    // neither has is `missing`.
+    let ids = [b, nowhere, a, b, held];
+    let got = claimed(claim(w, "ana", Some(w.team), personal, &ids).await).await;
+    assert_eq!((got.claimed, got.missing), (vec![b, a, held], vec![nowhere]));
+    assert!(has(w, w.team, a).await && has(w, w.team, b).await && !has(w, w.team, nowhere).await);
+    assert_eq!(w.meta.stored_bytes(w.team).await.unwrap(), before + 70, "charged once for what was added");
+    // Again: the same answer, nothing more charged.
+    let again = claimed(claim(w, "ana", Some(w.team), personal, &ids).await).await;
+    assert_eq!((again.claimed, again.missing), (vec![b, a, held], vec![nowhere]));
+    assert_eq!(w.meta.stored_bytes(w.team).await.unwrap(), before + 70);
+    // The source is not changed by being a source.
+    assert_eq!(w.meta.stored_bytes(personal).await.unwrap(), 70);
+    // Nothing flows the other way, and a chunk only a space the caller cannot read has stays missing: ben (an editor of the
+    // team space, no access to ana's personal space) asks the team space itself about a chunk only the personal space has.
+    let only_personal = record(w, personal, 15, 5).await;
+    let ben_view = claimed(claim(w, "ben", Some(w.team), w.team, &[only_personal, a]).await).await;
+    assert_eq!((ben_view.claimed, ben_view.missing), (vec![a], vec![only_personal]), "from the space itself: what it has, and nothing else");
+    assert!(!has(w, w.team, only_personal).await);
+    // From the team space into the personal space of its owner.
+    let only_team = record(w, w.team, 14, 5).await;
+    let back = claimed(claim(w, "ana", None, w.team, &[only_team, a]).await).await;
+    assert_eq!((back.claimed, back.missing), (vec![only_team, a], vec![]), "the personal space takes the chunk and already holds the other");
+    assert!(has(w, personal, only_team).await);
+}
+
+async fn claim_is_charged_to_the_target_and_refused_over_its_limit(w: &World) {
+    let personal = w.user("ana").space;
+    let ids = [record(w, personal, 20, 100).await, record(w, personal, 21, 100).await, record(w, personal, 22, 100).await];
+    let pool = w.raw().await;
+    sqlx::query("UPDATE spaces SET quota_bytes = 250 WHERE id = $1").bind(w.team.as_uuid().as_bytes().to_vec()).execute(&pool).await.unwrap();
+    let before = w.meta.stored_bytes(w.team).await.unwrap();
+    // 300 logical bytes do not fit under 250: refused whole, nothing recorded.
+    let res = claim(w, "ana", Some(w.team), personal, &ids).await;
+    assert_eq!(res.status(), StatusCode::INSUFFICIENT_STORAGE);
+    let body: ErrorBody = res.json().await.unwrap();
+    assert_eq!(body.error, "quota_exceeded");
+    assert_eq!(body.quota.map(|q| q.limit), Some(250));
+    assert_eq!(w.meta.stored_bytes(w.team).await.unwrap(), before);
+    for id in ids {
+        assert!(!has(w, w.team, id).await);
+    }
+    // Two fit; the third is refused afterwards; the source's own charge is untouched.
+    assert_eq!(claimed(claim(w, "ana", Some(w.team), personal, &ids[..2]).await).await.claimed, ids[..2].to_vec());
+    assert_eq!(claim(w, "ana", Some(w.team), personal, &ids[2..]).await.status(), StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(w.meta.stored_bytes(w.team).await.unwrap(), before + 200);
+    // A chunk the target holds is not charged again.
+    assert_eq!(claimed(claim(w, "ana", Some(w.team), personal, &ids[..2]).await).await.claimed, ids[..2].to_vec());
+    assert_eq!(w.meta.stored_bytes(personal).await.unwrap(), 300);
+}
+
+async fn claim_is_bounded(w: &World) {
+    let personal = w.user("ana").space;
+    let ids = |n: usize| (0..n).map(|i| ChunkId::from_bytes(*blake3::hash(&(i as u64).to_le_bytes()).as_bytes())).collect::<Vec<_>>();
+    let res = claim(w, "ana", Some(w.team), personal, &ids(craft_cloud_proto::api::MAX_MISSING_IDS + 1)).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: ErrorBody = res.json().await.unwrap();
+    assert_eq!(body.error, "invalid");
+    let got = claimed(claim(w, "ana", Some(w.team), personal, &ids(craft_cloud_proto::api::MAX_MISSING_IDS)).await).await;
+    assert_eq!((got.claimed.len(), got.missing.len()), (0, craft_cloud_proto::api::MAX_MISSING_IDS));
+    // Empty is fine; a body without `from_space` is a client error and changes nothing.
+    assert_eq!(claimed(claim(w, "ana", Some(w.team), personal, &[]).await).await.claimed.len(), 0);
+    let bad = w.send("ana", Method::POST, "/chunks/claim", Some(w.team), Body::Json(json!({ "ids": [] }))).await;
+    assert!(bad.status().is_client_error());
 }
 
 async fn a_long_poll_on_a_team_space_ends_with_404_when_the_member_is_removed(w: &World) {

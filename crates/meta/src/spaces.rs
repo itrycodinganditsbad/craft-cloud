@@ -792,7 +792,7 @@ impl Meta {
 }
 
 /// [`Meta::space_access`] on a given connection (also a write transaction's).
-async fn access_on(conn: &mut sqlx::AnyConnection, user: UserId, space: SpaceId) -> Result<Option<SpaceRole>, MetaError> {
+pub(crate) async fn access_on(conn: &mut sqlx::AnyConnection, user: UserId, space: SpaceId) -> Result<Option<SpaceRole>, MetaError> {
     let row = sqlx::query(
         "SELECT s.kind, s.owner, s.archived_ms, m.role, m.accepted_ms, u.disabled_ms, u.removed_ms \
          FROM spaces s JOIN users u ON u.id = $1 LEFT JOIN space_members m ON m.space_id = s.id AND m.user_id = u.id \

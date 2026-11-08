@@ -272,6 +272,24 @@ pub struct MissingResponse {
     pub missing: Vec<ChunkId>,
 }
 
+/// `POST /api/v1/chunks/claim`: add to the working space (the `craft-space` header) the chunks that `from_space` has, without
+/// uploading their bytes. The caller needs at least read access to `from_space` and the role of an editor in the working space.
+/// At most [`MAX_MISSING_IDS`] IDs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimRequest {
+    pub from_space: SpaceId,
+    pub ids: Vec<ChunkId>,
+}
+
+/// The answer to a claim: `claimed` are the IDs the working space has now (added by this call, or held before), `missing` the ones
+/// neither space has, which the client uploads. Every asked ID is in exactly one of the two; a source space the caller may not read
+/// is `404 not_found`, as for a space that does not exist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimResponse {
+    pub claimed: Vec<ChunkId>,
+    pub missing: Vec<ChunkId>,
+}
+
 /// `POST /api/v1/commit`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitRequest {
