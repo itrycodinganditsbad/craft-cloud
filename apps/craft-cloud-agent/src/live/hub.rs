@@ -180,11 +180,12 @@ pub enum DocsCall {
         id: u64,
         bytes: Vec<u8>,
     },
-    /// A change the app made as a viewer and hands over because it ends: kept in the document's journal (not acked), sent
+    /// A change the app made as a viewer and hands over because it ends: kept in the document's journal (acked once on disk), sent
     /// to the server only once the account may write.
     Hold {
         conn: ConnId,
         id: u64,
+        seq: u64,
         bytes: Vec<u8>,
     },
     Close {
@@ -1288,14 +1289,16 @@ impl State {
                     }
                 }
             }
-            DocsCall::Hold { conn, id, bytes } => {
+            DocsCall::Hold { conn, id, seq, bytes } => {
                 let Some(doc) = self.docs.conns.get(&conn).and_then(|c| c.handles.get(&id)).copied() else { return Vec::new() };
                 // Not refused as an update is when the space is read-only: this is what the app could not send, kept in the
-                // journal (the gate keeps it from the server until the account may write). Not acked: the app is leaving.
+                // journal (the gate keeps it from the server until the account may write). Acked when it is on disk, so an app
+                // that ends can wait for it before it closes the connection.
                 match self.replica.local_update(doc, &bytes) {
                     Ok(frames) => {
                         let bytes = Arc::new(bytes);
                         let mut frames = frames;
+                        frames.extend(self.tell(conn, DocOut::Ack { id, seq }));
                         for (other, other_id) in self.handles_of(doc) {
                             if (other, other_id) != (conn, id) {
                                 frames.extend(self.tell(other, DocOut::Update { id: other_id, bytes: bytes.clone() }));
@@ -1305,7 +1308,7 @@ impl State {
                     }
                     Err(_) => {
                         self.say("a change an app handed over couldn't be kept".to_owned());
-                        Vec::new()
+                        self.tell(conn, refusal(Some(id), Some(seq), craft_cloud_proto::api::codes::INTERNAL, "the change couldn't be kept"))
                     }
                 }
             }

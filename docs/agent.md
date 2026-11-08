@@ -273,7 +273,7 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
   the space changes (both ways; `opened.read_only` is as of the open), so an app that kept a refused change can send it
   again. An app that ends while it still holds such changes hands them over as binary kind 6 (`held`, one update per frame, in
   order): the agent puts them into the document's journal like an update (the other apps with the document open get them)
-  but never acks them and never sends them while the account may not write; they go up with the first connection of an
+  acks each once it is on disk (an app that ends waits for that before it closes) and never sends them while the account may not write; they go up with the first connection of an
   account that may write, with no app open.
 
 | Local call | Answer |

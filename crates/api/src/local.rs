@@ -956,9 +956,10 @@ pub mod docs {
     pub const PRESENCE_FROM: u8 = 5;
     /// A change the app made while the agent refused its changes (`read_only`) and holds on to until the account may write
     /// again, sent by an app that ends with such changes unsent: `[u8 6][u64 id, big-endian][a Loro update]`, one frame
-    /// per update, in order. The agent puts it into the document's journal as it does an update, but the gate keeps it from
-    /// the server while the space is read-only; it goes up with the first connection of an account that may write. Never
-    /// acked; if the account may write already it is an update that is not acked.
+    /// per update, in order, numbered like updates. The agent puts it into the document's journal as it does an update, but
+    /// the gate keeps it from the server while the space is read-only; it goes up with the first connection of an account
+    /// that may write. Acked (`ack {id, seq}`) once it is on disk, so an app that ends can wait for that before it closes;
+    /// refused like an update (`not_found` when the space stopped syncing).
     pub const HELD: u8 = 6;
     /// The bytes of an account ID in a [`PRESENCE_FROM`] frame.
     pub const USER_BYTES: usize = 16;
@@ -1095,9 +1096,11 @@ pub enum NotLiveReason {
     Resetting,
 }
 
-/// A control message from the agent on the docs WebSocket ([`docs`]).
+/// A control message from the agent on the docs WebSocket ([`docs`]). New messages are added without a breaking change: match
+/// with a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
+#[non_exhaustive]
 pub enum DocsEvent {
     /// The document is live: its state follows as a binary frame of `state.bytes` bytes. `changed_outside`, for an
     /// open that named its `file_hash`: whether no Craft app's save of this document (this machine's records, or the
