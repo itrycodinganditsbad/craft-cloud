@@ -11,8 +11,7 @@ use axum::extract::{Path, Request, State};
 use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use craft_cloud_meta::{SpaceActor, SpaceSummary, UserId, valid_username};
-use craft_cloud_proto::api::SpaceRole;
+use craft_cloud_meta::{SpaceActor, SpaceOwner, SpaceSummary, UserId, valid_username};
 use craft_cloud_proto::{SpaceId, SpaceName};
 use serde::Deserialize;
 use uuid::Uuid;
@@ -71,6 +70,16 @@ fn state_text(space: &SpaceSummary) -> String {
     space.archived_ms.map_or_else(|| "active".to_owned(), |ms| format!("archived {}", fmt_time(ms)))
 }
 
+/// An owner as a list shows them: the account, and its state when it cannot sign in (it then has no access to the space).
+fn owner_html(owner: &SpaceOwner) -> String {
+    let state = match (owner.removed_ms, owner.disabled_ms) {
+        (Some(_), _) => " (marked for removal)",
+        (None, Some(_)) => " (disabled)",
+        (None, None) => "",
+    };
+    format!("{}{}", link(&user_href(owner.user), &owner.username), super::html::esc(state))
+}
+
 /// The limit a form asks for: whole MiB, or none (`Some(None)` removes it). Neither is `None`; both is a mistake.
 fn quota_from(form: &ActionForm) -> Result<Option<Option<u64>>, WebError> {
     match (form.quota_mib.trim(), form.remove_quota.is_empty()) {
@@ -126,19 +135,18 @@ pub(super) async fn spaces(State(state): State<Shared>, request: Request) -> Res
     body.push_str("<form method=\"get\" action=\"/web/spaces\" class=\"search\" role=\"search\">");
     body.push_str(&field("search", "query", "Find a space by name", "search", search.unwrap_or_default(), "maxlength=\"64\""));
     body.push_str("<p class=\"field\"><button type=\"submit\">Search</button></p></form>");
+    // The owners of the whole page in one query.
+    let ids: Vec<SpaceId> = page_of.spaces.iter().map(|space| space.id).collect();
+    let owners = state.meta.space_owners(&ids).await?;
     let mut rows = Vec::with_capacity(page_of.spaces.len());
     for space in &page_of.spaces {
-        let owners: Vec<String> = state
-            .meta
-            .list_members(space.id)
-            .await?
-            .into_iter()
-            .filter(|m| m.accepted() && m.role == SpaceRole::Owner)
-            .map(|m| link(&user_href(m.user), &m.username))
-            .collect();
+        let mut cell: Vec<String> = owners.iter().filter(|owner| owner.space == space.id).map(owner_html).collect();
+        if space.owners == 0 {
+            cell.push(super::html::esc("no active owner"));
+        }
         rows.push(vec![
             link(&space_href(space.id), &space.name),
-            if owners.is_empty() { "-".to_owned() } else { owners.join(", ") },
+            cell.join(", "),
             space.members.to_string(),
             super::html::esc(&format!("{} of {}", fmt_bytes(space.stored_bytes), quota_text(space.quota_bytes))),
             super::html::esc(&state_text(space)),
@@ -194,8 +202,9 @@ pub(super) async fn create_space(State(state): State<Shared>, request: Request) 
         Some(None) => return Err(WebError::invalid("A new space has no limit to remove; leave the field empty.")),
         Some(Some(bytes)) => Some(bytes),
     };
-    let admin = actor(&state, &authed, &form).await?;
+    // The owner is looked up before the confirmation, so a mistyped name does not use up a code (the store checks it again).
     let owner = owner_named(&state, &form).await?;
+    let admin = actor(&state, &authed, &form).await?;
     let space = state.meta.create_team_space(&SpaceActor::Admin(admin), &name, owner, quota, state.now_ms()).await?;
     tracing::info!(%space, "admin (web): team space created");
     Ok(redirect(&format!("{}?notice=created", space_href(space))))
@@ -214,6 +223,7 @@ pub(super) async fn space(State(state): State<Shared>, Path(id): Path<String>, r
         Err(e) => return Err(e.into()),
     };
     let members = state.meta.list_members(id).await?;
+    let owners = state.meta.space_owners(&[id]).await?;
     let ctx = authed.ctx();
     let two_factor = asks_for_code(&state, &authed).await?;
     let base = space_href(id);
@@ -231,12 +241,12 @@ pub(super) async fn space(State(state): State<Shared>, Path(id): Path<String>, r
     row("Created", fmt_time(found.created_ms));
     row("State", state_text(&found));
     row("Members", found.members.to_string());
-    row("Owners", found.owners.to_string());
+    row("Owners who can sign in", found.owners.to_string());
     row("Stored", fmt_bytes(found.stored_bytes));
     row("Limit", quota_text(found.quota_bytes));
     body.push_str("</dl>");
     if found.owners == 0 {
-        body.push_str(&notice("This space has no owner. Name one below so that someone can invite the members.", true));
+        body.push_str(&notice("This space has no owner who can sign in, so nobody can manage it. Name one below.", true));
     }
 
     body.push_str("<h2>Members</h2>");
@@ -246,10 +256,15 @@ pub(super) async fn space(State(state): State<Shared>, Path(id): Path<String>, r
         let rows: Vec<Vec<String>> = members
             .iter()
             .map(|m| {
+                let account = owners.iter().find(|owner| owner.user == m.user).map_or("", |owner| match (owner.removed_ms, owner.disabled_ms) {
+                    (Some(_), _) => ", account marked for removal",
+                    (None, Some(_)) => ", account disabled",
+                    (None, None) => "",
+                });
                 vec![
                     link(&user_href(m.user), &m.username),
                     super::html::esc(m.role.as_str()),
-                    super::html::esc(&if m.accepted() { "member".to_owned() } else { "invited".to_owned() }),
+                    super::html::esc(&format!("{}{account}", if m.accepted() { "member" } else { "invited" })),
                 ]
             })
             .collect();
@@ -333,8 +348,8 @@ pub(super) async fn unarchive(State(state): State<Shared>, Path(id): Path<String
 pub(super) async fn set_owner(State(state): State<Shared>, Path(id): Path<String>, request: Request) -> Result<Response, WebError> {
     let (authed, form) = begin(&state, request).await?;
     let id = parse_space(&id)?;
-    let admin = actor(&state, &authed, &form).await?;
     let owner = owner_named(&state, &form).await?;
+    let admin = actor(&state, &authed, &form).await?;
     state.meta.set_owner_accepted(&admin, id, owner, state.now_ms()).await?;
     crate::spaces::changed(&state, id);
     tracing::info!(space = %id, "admin (web): team space owner named");

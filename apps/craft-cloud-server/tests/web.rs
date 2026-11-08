@@ -160,6 +160,7 @@ on_sqlite_and_postgres!(
     team_space_changes_are_audited_with_the_web_session_and_wake_the_long_polls,
     an_admin_with_two_factor_confirms_a_team_space_with_a_code,
     team_space_names_are_escaped,
+    a_space_whose_owners_cannot_sign_in_is_shown_as_having_none,
 );
 
 // ---- helpers ----
@@ -1871,19 +1872,17 @@ async fn team_space_changes_are_audited_with_the_web_session_and_wake_the_long_p
     let space = s.meta.admin_list_spaces(None, None, 10).await.unwrap().spaces.remove(0).id;
     let base = format!("/web/spaces/{}", space.as_uuid());
 
-    // The owner's long-poll on the space is woken by a change of the space.
+    // The owner's long-poll on the space is woken by every change of the space the page makes.
     let device = s.device("own").await;
-    let poll = {
-        let (client, url) = (s.client.clone(), s.url("/api/v1/changes?since=0&wait=30"));
-        tokio::spawn(async move { client.get(url).bearer_auth(device).header("craft-space", space.to_string()).send().await.unwrap() })
-    };
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    assert!(!poll.is_finished(), "the long-poll waits");
-    assert_eq!(s.act(&boss, &format!("{base}/archive"), &[]).await.status(), StatusCode::SEE_OTHER);
-    tokio::time::timeout(std::time::Duration::from_secs(5), poll).await.expect("the archive woke the waiter").unwrap();
-
-    for (what, extra) in [("quota", vec![("quota_mib", "16")]), ("unarchive", vec![]), ("owner", vec![("owner", "heir")])] {
+    for (what, extra) in [("archive", vec![]), ("quota", vec![("quota_mib", "16")]), ("unarchive", vec![]), ("owner", vec![("owner", "heir")])] {
+        let poll = {
+            let (client, url, device) = (s.client.clone(), s.url("/api/v1/changes?since=0&wait=30"), device.clone());
+            tokio::spawn(async move { client.get(url).bearer_auth(device).header("craft-space", space.to_string()).send().await.unwrap() })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(!poll.is_finished(), "{what}: the long-poll waits");
         assert_eq!(s.act(&boss, &format!("{base}/{what}"), &extra).await.status(), StatusCode::SEE_OTHER, "{what}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), poll).await.unwrap_or_else(|_| panic!("{what}: the waiter was not woken")).unwrap();
     }
     // Repeating a change that changes nothing writes no second event.
     assert_eq!(s.act(&boss, &format!("{base}/unarchive"), &[]).await.status(), StatusCode::SEE_OTHER);
@@ -1941,6 +1940,57 @@ async fn an_admin_with_two_factor_confirms_a_team_space_with_a_code(s: &Web) {
     let recovery = tf.recovery.first().unwrap().clone();
     assert_eq!(s.act(&sess, &format!("{base}/unarchive"), &[("recovery_code", &recovery)]).await.status(), StatusCode::SEE_OTHER);
     assert_eq!(s.act(&sess, &archive, &[("recovery_code", &recovery)]).await.status(), StatusCode::FORBIDDEN, "a recovery code serves once");
+
+    // A mistyped owner is refused before the confirmation is looked at: the recovery code is not used up by it.
+    s.add_user("heir", Role::Member).await;
+    let spare = tf.recovery.get(1).unwrap().clone();
+    for (path, fields) in [
+        ("/web/spaces".to_owned(), vec![("name", "Fresh"), ("owner", "her")]),
+        ("/web/spaces".to_owned(), vec![("name", "Fresh"), ("owner", "a b")]),
+        (format!("{base}/owner"), vec![("owner", "her")]),
+        (format!("{base}/owner"), vec![("owner", "")]),
+    ] {
+        let mut fields = fields.clone();
+        fields.push(("recovery_code", &spare));
+        let status = s.act(&sess, &path, &fields).await.status();
+        assert!(matches!(status, StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST), "{path}: {status}");
+    }
+    assert_eq!(s.act(&sess, &format!("{base}/owner"), &[("owner", "heir"), ("recovery_code", &spare)]).await.status(), StatusCode::SEE_OTHER);
+}
+
+/// An owner whose account is disabled or marked for removal has no access: the pages say so, count no owner, and warn.
+async fn a_space_whose_owners_cannot_sign_in_is_shown_as_having_none(s: &Web) {
+    s.add_admin("root").await;
+    let (own, gone) = (s.add_user("own", Role::Member).await, s.add_user("gone", Role::Member).await);
+    s.add_user("heir", Role::Member).await;
+    let (one, two) = (cli_space(s, "Studio", &own).await, cli_space(s, "Press", &gone).await);
+    let boss = s.sign_in("root").await;
+    let (one_page, two_page) = (format!("/web/spaces/{}", one.as_uuid()), format!("/web/spaces/{}", two.as_uuid()));
+    let html = s.get(&one_page, Some(&boss.token)).await.text().await.unwrap();
+    assert!(html.contains("<dt>Owners who can sign in</dt><dd>1</dd>") && !html.contains("no owner who can sign in"), "{html}");
+    assert!(!s.get("/web/spaces", Some(&boss.token)).await.text().await.unwrap().contains("(disabled)"));
+
+    assert_eq!(s.act(&boss, &format!("/web/users/{}/disable", own.id.0), &[]).await.status(), StatusCode::SEE_OTHER);
+    assert_eq!(s.act(&boss, &format!("/web/users/{}/remove", gone.id.0), &[]).await.status(), StatusCode::SEE_OTHER);
+    let list = s.get("/web/spaces", Some(&boss.token)).await.text().await.unwrap();
+    assert!(list.contains(">own</a> (disabled)") && list.contains(">gone</a> (marked for removal)"), "{list}");
+    assert_eq!(list.matches("no active owner").count(), 2, "{list}");
+    for page in [&one_page, &two_page] {
+        let html = s.get(page, Some(&boss.token)).await.text().await.unwrap();
+        assert!(
+            html.contains("<dt>Owners who can sign in</dt><dd>0</dd>") && html.contains("no owner who can sign in, so nobody can manage it"),
+            "{html}"
+        );
+        assert!(html.contains("account disabled") || html.contains("account marked for removal"), "{html}");
+    }
+
+    // Naming an owner brings the space back: the warning goes and the new owner is listed.
+    assert_eq!(s.act(&boss, &format!("{one_page}/owner"), &[("owner", "heir")]).await.status(), StatusCode::SEE_OTHER);
+    let html = s.get(&one_page, Some(&boss.token)).await.text().await.unwrap();
+    assert!(html.contains("<dt>Owners who can sign in</dt><dd>1</dd>") && !html.contains("no owner who can sign in"), "{html}");
+    assert!(html.contains("account disabled"), "the old owner is still shown, with its state");
+    let list = s.get("/web/spaces", Some(&boss.token)).await.text().await.unwrap();
+    assert_eq!(list.matches("no active owner").count(), 1, "{list}");
 }
 
 async fn team_space_names_are_escaped(s: &Web) {
