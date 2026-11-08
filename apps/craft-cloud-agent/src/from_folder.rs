@@ -125,6 +125,21 @@ pub mod hook {
     static HOOKS: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
     static STALLS: Mutex<Vec<(PathBuf, Duration)>> = Mutex::new(Vec::new());
     static AFTER: Mutex<Vec<(PathBuf, Callback)>> = Mutex::new(Vec::new());
+    static BETWEEN: Mutex<Vec<(PathBuf, Callback)>> = Mutex::new(Vec::new());
+
+    /// Calls `f` with the path of each file after its quarantine place was made and before the file is moved into it (the moment a
+    /// program could save a new file at the old path).
+    pub fn set_between_steps(data: &Path, f: Option<Callback>) {
+        let mut hooks = BETWEEN.lock().unwrap_or_else(PoisonError::into_inner);
+        hooks.retain(|(path, _)| path != data);
+        if let Some(f) = f {
+            hooks.push((data.to_owned(), f));
+        }
+    }
+
+    pub(super) fn between_steps(data: &Path) -> Option<Callback> {
+        BETWEEN.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|(path, _)| path == data).map(|(_, f)| *f)
+    }
 
     static BATCHES: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
     static DELAYS: Mutex<Vec<(PathBuf, Duration)>> = Mutex::new(Vec::new());
@@ -1003,7 +1018,7 @@ impl Job {
     async fn trash(&mut self, space: SpaceId, copied: Vec<Copied>) -> Result<(), Stop> {
         let root = self.scan.root.clone();
         let quarantine = quarantine_dir(&self.account, &root);
-        let hook_after = hook::after_quarantine(self.data.path());
+        let hooks = Hooks { after: hook::after_quarantine(self.data.path()), between: hook::between_steps(self.data.path()) };
         let batch_size = hook::trash_batch(self.data.path()).unwrap_or(TRASH_BATCH).max(1);
         let mut stats = TrashStats::default();
         let mut at = 0usize;
@@ -1033,7 +1048,7 @@ impl Job {
                         &items,
                         &done,
                         &|| cancel.load(Ordering::SeqCst) || control.spaces_handle().is_none(),
-                        hook_after,
+                        hooks,
                     ))
                 })
                 .await?;
@@ -1459,6 +1474,13 @@ enum Deleted {
     Replaced,
 }
 
+/// The test hooks of a deletion (see [`hook`]).
+#[derive(Clone, Copy, Default)]
+struct Hooks {
+    after: Option<hook::Callback>,
+    between: Option<hook::Callback>,
+}
+
 /// What a batch of deletions came to.
 struct Batch {
     processed: usize,
@@ -1478,7 +1500,7 @@ fn delete_batch(
     items: &[Copied],
     done: &AtomicU64,
     cancelled: &dyn Fn() -> bool,
-    after_quarantine: Option<hook::Callback>,
+    hooks: Hooks,
 ) -> Batch {
     let started = Instant::now();
     let mut batch = Batch { processed: 0, stats: TrashStats::default(), replaced: false };
@@ -1497,7 +1519,7 @@ fn delete_batch(
         if cancelled() || started.elapsed() > TRASH_RECHECK {
             break;
         }
-        match delete_one(root, quarantine, chain, item, cancelled, after_quarantine) {
+        match delete_one(root, quarantine, chain, item, cancelled, hooks) {
             Deleted::Gone => {}
             Deleted::Changed => batch.stats.changed += 1,
             Deleted::Locked => batch.stats.locked += 1,
@@ -1513,14 +1535,35 @@ fn delete_batch(
     batch
 }
 
-fn delete_one(
-    root: &Path,
-    quarantine: &Path,
-    chain: &Chain,
-    item: &Copied,
-    cancelled: &dyn Fn() -> bool,
-    after_quarantine: Option<hook::Callback>,
-) -> Deleted {
+/// The place in the quarantine a file is moved into: a folder of its own, `<name>.ccq`, that is made new for it (so the move can never
+/// replace anything) and holds the file under its own name.
+fn wrapper_of(quarantine: &Path, os: &[std::ffi::OsString]) -> PathBuf {
+    let mut wrapper = join(quarantine, os);
+    let mut name = wrapper.file_name().map(std::ffi::OsString::from).unwrap_or_default();
+    name.push(".ccq");
+    wrapper.set_file_name(name);
+    wrapper
+}
+
+/// Takes the file at `path` out of the old folder into the brand-new folder `wrapper`: the folder is made first (it fails if the name
+/// is taken, so nothing is ever replaced there) and the file is then renamed into it in one step, whatever is at `path` at that
+/// moment (a file a program saved there meanwhile comes along and is not the verified one, which the read afterwards finds).
+fn take_aside(path: &Path, wrapper: &Path, held: &Path, between: Option<hook::Callback>) -> io::Result<()> {
+    if let Some(parent) = wrapper.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(wrapper)?;
+    if let Some(hook) = between {
+        hook(path);
+    }
+    if let Err(e) = std::fs::rename(path, held) {
+        let _ = std::fs::remove_dir(wrapper);
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn delete_one(root: &Path, quarantine: &Path, chain: &Chain, item: &Copied, cancelled: &dyn Fn() -> bool, hooks: Hooks) -> Deleted {
     if !chain_intact(chain) {
         return Deleted::Replaced;
     }
@@ -1534,31 +1577,25 @@ fn delete_one(
         // Gone (the person deleted it) is not "kept"; anything else there is.
         return if std::fs::symlink_metadata(&path).is_err() { Deleted::Gone } else { Deleted::Changed };
     }
-    let held = join(quarantine, &item.entry.os);
-    // Something already waits there (a file a failed put-back left): it is never replaced, and this file stays where it is.
-    if std::fs::symlink_metadata(&held).is_ok() {
+    let wrapper = wrapper_of(quarantine, &item.entry.os);
+    let Some(name) = path.file_name() else { return Deleted::Locked };
+    let held = wrapper.join(name);
+    // A taken wrapper (what a failed put-back left) is never reused: the file stays where it is.
+    if take_aside(&path, &wrapper, &held, hooks.between).is_err() {
         return Deleted::Locked;
     }
-    if let Some(parent) = held.parent()
-        && std::fs::create_dir_all(parent).is_err()
-    {
-        return Deleted::Locked;
-    }
-    // Taken out of the old folder in one step that never replaces: from here on nothing that writes to the old place touches this
-    // file's name, and a program that holds it open is told by the move failing (or follows it here, which the read below sees).
-    if move_noreplace(&path, &held).is_err() {
-        return Deleted::Locked;
-    }
-    if let Some(hook) = after_quarantine {
+    if let Some(hook) = hooks.after {
         hook(&held);
     }
     let same = matches!(chunk_file(&held, cancelled, |_| Ok(())), Ok((m, _)) if m == item.manifest);
     if same && std::fs::remove_file(&held).is_ok() {
+        let _ = std::fs::remove_dir(&wrapper);
         return Deleted::Gone;
     }
     if put_back(&held, &path).is_err() {
         return Deleted::Stranded;
     }
+    let _ = std::fs::remove_dir(&wrapper);
     if same { Deleted::Locked } else { Deleted::Changed }
 }
 
@@ -1604,7 +1641,20 @@ fn recover_one(dir: &Path, personal: &Path) -> bool {
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
                 stack.push(path);
             } else if let Ok(rel) = path.strip_prefix(dir) {
-                if put_back(&path, &root.join(rel)).is_err() {
+                // A file in its own `<name>.ccq` folder goes back to where the folder stood, under its name.
+                let place_rel = match (rel.parent(), rel.file_name()) {
+                    (Some(parent), Some(file))
+                        if parent.file_name().is_some_and(|w| {
+                            let mut want = file.to_os_string();
+                            want.push(".ccq");
+                            w == want
+                        }) =>
+                    {
+                        parent.parent().unwrap_or(Path::new("")).join(file)
+                    }
+                    _ => rel.to_owned(),
+                };
+                if put_back(&path, &root.join(place_rel)).is_err() {
                     clean = false;
                 }
             } else {
@@ -1863,18 +1913,45 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("a.txt"), b"the new file").unwrap();
         // A leftover waits where this file would be taken to.
-        std::fs::create_dir_all(&quarantine).unwrap();
-        std::fs::write(quarantine.join("a.txt"), b"the leftover").unwrap();
+        std::fs::create_dir_all(quarantine.join("a.txt.ccq")).unwrap();
+        std::fs::write(quarantine.join("a.txt.ccq").join("a.txt"), b"the leftover").unwrap();
         let (manifest, size) = chunk_file(&root.join("a.txt"), &|| false, |_| Ok(())).map_err(|_| ()).unwrap();
         let meta = std::fs::metadata(root.join("a.txt")).unwrap();
         let item =
             Copied { entry: FileEntry { os: vec!["a.txt".into()], names: vec!["a.txt".into()], size, modified: meta.modified().ok() }, manifest };
         let chain = chain_of(&std::fs::canonicalize(&root).unwrap(), &std::fs::canonicalize(dir.path()).unwrap());
         let root = std::fs::canonicalize(&root).unwrap();
-        let out = delete_one(&root, &quarantine, &chain, &item, &|| false, None);
+        let out = delete_one(&root, &quarantine, &chain, &item, &|| false, Hooks::default());
         assert!(matches!(out, Deleted::Locked));
         assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"the new file");
-        assert_eq!(std::fs::read(quarantine.join("a.txt")).unwrap(), b"the leftover");
+        assert_eq!(std::fs::read(quarantine.join("a.txt.ccq").join("a.txt")).unwrap(), b"the leftover");
+    }
+
+    /// What an editor does: writes a temporary file and renames it over the original.
+    fn save_b_over(path: &Path) {
+        let temp = path.with_extension("editor-temp");
+        std::fs::write(&temp, b"B, saved by an editor in between").unwrap();
+        std::fs::rename(&temp, path).unwrap();
+    }
+
+    #[test]
+    fn a_file_saved_at_the_old_place_while_the_original_is_taken_aside_is_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Old");
+        let quarantine = dir.path().join("q");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"A, as it was verified").unwrap();
+        let (manifest, size) = chunk_file(&root.join("a.txt"), &|| false, |_| Ok(())).map_err(|_| ()).unwrap();
+        let meta = std::fs::metadata(root.join("a.txt")).unwrap();
+        let item =
+            Copied { entry: FileEntry { os: vec!["a.txt".into()], names: vec!["a.txt".into()], size, modified: meta.modified().ok() }, manifest };
+        let chain = chain_of(&std::fs::canonicalize(&root).unwrap(), &std::fs::canonicalize(dir.path()).unwrap());
+        let root = std::fs::canonicalize(&root).unwrap();
+        // Between the steps of taking the file aside, B is saved at its place.
+        let out = delete_one(&root, &quarantine, &chain, &item, &|| false, Hooks { between: Some(save_b_over), after: None });
+        assert!(matches!(out, Deleted::Changed), "B is not what was verified");
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"B, saved by an editor in between", "B is back where it was saved");
+        assert!(!quarantine.join("a.txt.ccq").exists(), "nothing is left in the quarantine");
     }
 
     #[test]
