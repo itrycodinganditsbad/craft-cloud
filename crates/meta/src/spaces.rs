@@ -33,7 +33,9 @@ use crate::{Dialect, MIN_QUOTA_BYTES, Meta, MetaError, UserId, WriteTx};
 #[derive(Debug, Clone)]
 pub enum SpaceActor {
     /// A signed-in account, acting by its role in the space (checked in the transaction). `device` is the device the
-    /// request came with; it must still be signed in.
+    /// request came with; it must still be signed in. `None` is for the command line's tests and callers that have no
+    /// device (no session is checked); the JSON routes always pass the request's device, and no route of the space API takes
+    /// a browser session (the admin pages' own routes carry theirs in [`AdminVia::Web`]).
     User { user: UserId, device: Option<DeviceId> },
     /// An administrator, checked again in the transaction as for every admin change.
     Admin(AdminActor),
@@ -85,8 +87,9 @@ fn parse_role(word: &str) -> Result<SpaceRole, MetaError> {
 }
 
 /// The event of a change `actor` makes. The command line has no actor, and its events have names of their own:
-/// `cli.space_created` for a creation, `cli.space_member_changed` for every change to the members.
-fn event_for(actor: &SpaceActor, action: AuditAction, space: SpaceId) -> NewEvent {
+/// `cli.space_created` for a creation, `cli.space_member_changed` for an invitation, a role change or a removal. It makes
+/// no other change (a member's own acts are theirs), and `Corrupt` says so if one is ever asked of it.
+fn event_for(actor: &SpaceActor, action: AuditAction, space: SpaceId) -> Result<NewEvent, MetaError> {
     let event = match actor {
         SpaceActor::User { user, device } => NewEvent::new(action).by(*user, *device),
         SpaceActor::Admin(admin) => {
@@ -98,10 +101,13 @@ fn event_for(actor: &SpaceActor, action: AuditAction, space: SpaceId) -> NewEven
         }
         SpaceActor::Cli => NewEvent::new(match action {
             AuditAction::SpaceCreated => AuditAction::CliSpaceCreated,
-            _ => AuditAction::CliSpaceMemberChanged,
+            AuditAction::SpaceMemberInvited | AuditAction::SpaceMemberRoleChanged | AuditAction::SpaceMemberRemoved => {
+                AuditAction::CliSpaceMemberChanged
+            }
+            _ => return Err(MetaError::Corrupt("the command line makes no such change")),
         }),
     };
-    event.on_space(space)
+    Ok(event.on_space(space))
 }
 
 impl Meta {
@@ -219,8 +225,8 @@ impl Meta {
         .execute(&mut *w.tx)
         .await?;
         insert_member(&mut w, space, owner, SpaceRole::Owner, actor_user(actor), now_ms, true).await?;
-        let details = AuditDetails { user: Some(owner), quota_bytes: quota_bytes.map(Some), ..AuditDetails::default() };
-        record_in(&mut w.tx, now_ms, event_for(actor, AuditAction::SpaceCreated, space).with(details)).await?;
+        let details = AuditDetails { user: Some(owner), quota_bytes: Some(quota_bytes), ..AuditDetails::default() };
+        record_in(&mut w.tx, now_ms, event_for(actor, AuditAction::SpaceCreated, space)?.with(details)).await?;
         self.commit_audited(w, now_ms).await?;
         Ok(space)
     }
@@ -239,7 +245,7 @@ impl Meta {
         }
         insert_member(&mut w, space, target, role, actor_user(actor), now_ms, matches!(actor, SpaceActor::Cli)).await?;
         let details = AuditDetails { user: Some(target), space_role_to: Some(role), ..AuditDetails::default() };
-        record_in(&mut w.tx, now_ms, event_for(actor, AuditAction::SpaceMemberInvited, space).with(details)).await?;
+        record_in(&mut w.tx, now_ms, event_for(actor, AuditAction::SpaceMemberInvited, space)?.with(details)).await?;
         let member = member_row(&mut w, space, target).await?.ok_or(MetaError::Corrupt("a new member is missing"))?;
         self.commit_audited(w, now_ms).await?;
         Ok(member)
@@ -260,7 +266,7 @@ impl Meta {
                 .ok_or(MetaError::NotFound("invitation"))?;
         let role = parse_role(&row.try_get::<String, _>("role")?)?;
         let details = AuditDetails { user: Some(user), ..AuditDetails::default() };
-        record_in(&mut w.tx, now_ms, event_for(&actor, AuditAction::SpaceMemberJoined, space).with(details)).await?;
+        record_in(&mut w.tx, now_ms, event_for(&actor, AuditAction::SpaceMemberJoined, space)?.with(details)).await?;
         self.commit_audited(w, now_ms).await?;
         Ok(role)
     }
@@ -279,7 +285,7 @@ impl Meta {
             return Err(MetaError::NotFound("invitation"));
         }
         let details = AuditDetails { user: Some(user), ..AuditDetails::default() };
-        record_in(&mut w.tx, now_ms, event_for(&actor, AuditAction::SpaceMemberDeclined, space).with(details)).await?;
+        record_in(&mut w.tx, now_ms, event_for(&actor, AuditAction::SpaceMemberDeclined, space)?.with(details)).await?;
         self.commit_audited(w, now_ms).await
     }
 
@@ -309,7 +315,7 @@ impl Meta {
             .execute(&mut *w.tx)
             .await?;
         let details = AuditDetails { user: Some(target), space_role_from: Some(current.role), space_role_to: Some(role), ..AuditDetails::default() };
-        record_in(&mut w.tx, now_ms, event_for(actor, AuditAction::SpaceMemberRoleChanged, space).with(details)).await?;
+        record_in(&mut w.tx, now_ms, event_for(actor, AuditAction::SpaceMemberRoleChanged, space)?.with(details)).await?;
         self.commit_audited(w, now_ms).await?;
         Ok(Member { role, ..current })
     }
@@ -330,7 +336,7 @@ impl Meta {
         }
         delete_member(&mut w, space, target).await?;
         let details = AuditDetails { user: Some(target), ..AuditDetails::default() };
-        record_in(&mut w.tx, now_ms, event_for(actor, AuditAction::SpaceMemberRemoved, space).with(details)).await?;
+        record_in(&mut w.tx, now_ms, event_for(actor, AuditAction::SpaceMemberRemoved, space)?.with(details)).await?;
         self.commit_audited(w, now_ms).await
     }
 
@@ -344,7 +350,7 @@ impl Meta {
             keep_an_owner(&mut w, space).await?;
         }
         delete_member(&mut w, space, user).await?;
-        record_in(&mut w.tx, now_ms, event_for(&actor, AuditAction::SpaceMemberLeft, space)).await?;
+        record_in(&mut w.tx, now_ms, event_for(&actor, AuditAction::SpaceMemberLeft, space)?).await?;
         self.commit_audited(w, now_ms).await
     }
 
@@ -403,6 +409,14 @@ impl Meta {
             Some(row) if row.try_get::<String, _>("kind")? == "team" => Locked { archived: row.try_get::<Option<i64>, _>("archived_ms")?.is_some() },
             _ => return Err(MetaError::NotFound("space")),
         };
+        if let (SpaceActor::User { user, .. }, false) = (actor, owner_only) {
+            // Accepting, declining and leaving are the caller's own rows: an account with no row at all learns nothing about
+            // the space (the answer is the one for a space that does not exist), and only the wrong state of its own row is
+            // `NotFound("invitation")` or `NotFound("member")`.
+            if member_row(&mut w, space, *user).await?.is_none() {
+                return Err(MetaError::NotFound("space"));
+            }
+        }
         if let (SpaceActor::User { user, .. }, true) = (actor, owner_only) {
             // Under the space's lock, so a role lowered by a change that committed meanwhile is respected.
             let role = match member_row(&mut w, space, *user).await? {

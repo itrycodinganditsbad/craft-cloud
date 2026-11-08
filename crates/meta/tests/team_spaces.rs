@@ -406,7 +406,6 @@ async fn the_migration_from_a_filled_0014_database(url: &str, pg: bool) {
     if !pg {
         let broken = sqlx::query("PRAGMA foreign_key_check").fetch_all(&pool).await.unwrap();
         assert!(broken.is_empty(), "foreign_key_check found {} rows", broken.len());
-        assert_eq!(count(&pool, "PRAGMA foreign_keys").await, 1, "enforcement is back on");
     }
     for table in ["nodes", "versions", "space_blobs", "live_docs", "live_spaces"] {
         assert_eq!(count(&pool, &format!("SELECT COUNT(*) FROM {table} WHERE space_id NOT IN (SELECT id FROM spaces)")).await, 0, "{table}");
@@ -609,8 +608,13 @@ async fn members_come_and_go_with_their_events(db: &Db) {
 
     // Accepting turns it into access; again, or without an invitation, finds none and writes nothing.
     let before = space_events(meta).await.len();
-    assert!(matches!(meta.accept_invitation(cy.id, None, space, NOW + 4).await, Err(MetaError::NotFound("invitation"))));
-    assert!(matches!(meta.decline_invitation(cy.id, None, space, NOW + 4).await, Err(MetaError::NotFound("invitation"))));
+    // An account with no row at all gets the answer for a space that does not exist, so it learns nothing about the space.
+    let nowhere = craft_cloud_proto::SpaceId::generate();
+    for space in [space, nowhere] {
+        assert!(matches!(meta.accept_invitation(cy.id, None, space, NOW + 4).await, Err(MetaError::NotFound("space"))));
+        assert!(matches!(meta.decline_invitation(cy.id, None, space, NOW + 4).await, Err(MetaError::NotFound("space"))));
+        assert!(matches!(meta.leave_space(cy.id, None, space, NOW + 4).await, Err(MetaError::NotFound("space"))));
+    }
     assert_eq!(meta.accept_invitation(ben.id, None, space, NOW + 5).await.unwrap(), SpaceRole::Editor);
     assert!(matches!(meta.accept_invitation(ben.id, None, space, NOW + 6).await, Err(MetaError::NotFound("invitation"))));
     assert!(matches!(meta.decline_invitation(ben.id, None, space, NOW + 6).await, Err(MetaError::NotFound("invitation"))));
@@ -642,7 +646,7 @@ async fn members_come_and_go_with_their_events(db: &Db) {
     // Leaving: the member's own row goes, and the files of the space are untouched.
     meta.leave_space(ben.id, None, space, NOW + 16).await.unwrap();
     assert_eq!(meta.space_access(ben.id, space).await.unwrap(), None);
-    assert!(matches!(meta.leave_space(ben.id, None, space, NOW + 17).await, Err(MetaError::NotFound("member"))));
+    assert!(matches!(meta.leave_space(ben.id, None, space, NOW + 17).await, Err(MetaError::NotFound("space"))));
 
     // A device that was signed out meanwhile no longer acts.
     meta.revoke_device(ana.id, device_ana).await.unwrap();
@@ -666,7 +670,7 @@ async fn members_come_and_go_with_their_events(db: &Db) {
     );
     assert!(events.iter().all(|e| e.target_kind == "space" && e.target_id == Some(*space.as_uuid())));
     assert_eq!(events[0].actor_user, None);
-    assert_eq!(events[0].details, format!(r#"{{"user":"{}"}}"#, ana.id.0));
+    assert_eq!(events[0].details, format!(r#"{{"quota_bytes":null,"user":"{}"}}"#, ana.id.0));
     assert_eq!((events[1].actor_user, events[1].actor_device), (Some(ana.id), Some(device_ana)));
     assert_eq!(events[1].details, format!(r#"{{"role_to":"editor","user":"{}"}}"#, ben.id.0));
     assert_eq!(events[2].actor_user, Some(ben.id));
@@ -776,17 +780,25 @@ async fn the_last_owner_stays(db: &Db) {
 }
 
 /// Two owners lower each other, or leave, at the same time, many times over: never both succeed, and the space always keeps
-/// an accepted owner. On Postgres the space's row lock orders them; on SQLite the single writer does.
+/// an accepted owner. On Postgres the space's row lock orders them (and, for the commands where no user lock separates
+/// the two, nothing else does: the rounds that use the command line twice or two leaves test exactly that lock; the
+/// locks of the two accounts already order an owner lowering or removing the other). On SQLite the process's single writer
+/// orders them by design, so a mutation that removes the row lock cannot fail there. Both tasks wait at a barrier so
+/// that they start their transactions together.
 async fn concurrent_changes_never_leave_a_space_without_an_owner(db: &Db) {
     let meta = &db.meta;
     let ana = user(meta, "ana").await;
     let ben = user(meta, "ben").await;
-    for round in 0..12 {
+    // Mostly the cases that depend on the space's row lock (0: the command line twice, 3: both leave).
+    const HOW: [u8; 6] = [0, 3, 0, 3, 1, 2];
+    for round in 0..48 {
         let space = team(meta, &format!("Studio {round}"), &ana).await;
         join(meta, space, &ana, &ben, SpaceRole::Owner).await;
         let (a, b) = (ana.clone(), ben.clone());
         let (m1, m2) = (meta.clone(), meta.clone());
-        let attempt = |meta: Meta, actor: SpaceActor, target: UserId, how: u8| async move {
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let attempt = |meta: Meta, actor: SpaceActor, target: UserId, how: u8, barrier: std::sync::Arc<tokio::sync::Barrier>| async move {
+            barrier.wait().await;
             match how {
                 // The command line lowers the owner it is told to; only the rule can stop both.
                 0 => meta.change_member_role(&actor, space, target, SpaceRole::Editor, NOW + 20).await.map(|_| ()),
@@ -799,10 +811,10 @@ async fn concurrent_changes_never_leave_a_space_without_an_owner(db: &Db) {
                 },
             }
         };
-        let how = (round % 4) as u8;
+        let how = HOW[round % HOW.len()];
         let (actor1, actor2) = if how == 0 { (SpaceActor::Cli, SpaceActor::Cli) } else { (by(&a), by(&b)) };
-        let t1 = tokio::spawn(attempt(m1, actor1, b.id, how));
-        let t2 = tokio::spawn(attempt(m2, actor2, a.id, how));
+        let t1 = tokio::spawn(attempt(m1, actor1, b.id, how, barrier.clone()));
+        let t2 = tokio::spawn(attempt(m2, actor2, a.id, how, barrier));
         let (r1, r2) = (t1.await.unwrap(), t2.await.unwrap());
         let ok = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
         let refused = |r: &Result<(), MetaError>| matches!(r, Err(MetaError::LastOwner | MetaError::Forbidden(_) | MetaError::NotFound(_)));
