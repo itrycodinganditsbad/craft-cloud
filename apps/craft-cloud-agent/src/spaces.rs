@@ -84,6 +84,8 @@ const CLOSE_WAIT: Duration = Duration::from_secs(50);
 /// What a change of a space's sync is told when another change of the same space waits for its session to close (the local
 /// API answers `409`).
 pub const CHANGING: &str = "this space is being changed, try again in a moment";
+/// What turning a space on is told when the space's last pass did not end within [`CLOSE_WAIT`].
+const STILL_FINISHING: &str = "this space is still finishing its last pass, try again in a moment";
 /// How soon a discovery that failed is tried again while someone waits for it.
 const DISCOVERY_RETRY: Duration = Duration::from_secs(3);
 /// The longest those waiting for a discovery are kept waiting for one that works (they are released after that, with the old
@@ -767,6 +769,17 @@ impl Manager {
         for team in &mut self.teams {
             team.active = None;
         }
+        // A space being turned off when the agent stops stays off: its `Close` (which forgets the state) is queued already.
+        let mut turned_off = false;
+        for pending in std::mem::take(&mut self.pending).into_iter().filter(|p| !p.request.on) {
+            if let Some(setting) = self.account.spaces.iter_mut().find(|s| s.space == pending.space) {
+                setting.sync = false;
+                turned_off = true;
+            }
+        }
+        if turned_off && let Err(e) = self.data.save_account(&self.account) {
+            crate::runlog::note(format_args!("can't remember the team spaces: {e}"));
+        }
         if let Some(discovery) = self.discovery.take() {
             discovery.abort();
         }
@@ -1178,14 +1191,16 @@ impl Manager {
             self.check_folder(space, &folder)?;
             // A sync that goes on in the same folder is left running. Otherwise its session is closed first, and the pass
             // thread has let go of it before the new folder is set up: a pass for the old folder must not write its state
-            // after that.
+            // after that. The wait is only for a space that has a session here or a pass under way: nothing else of the space
+            // can write its state, any older `Close` of it is ahead in the thread's queue of whatever the thread does for
+            // another space, and the thread may be busy with that for minutes.
             let running = self.teams.iter().any(|t| t.setting.space == space && t.active.is_some());
             let unchanged = running && known.and_then(|i| self.account.spaces.get(i)).is_some_and(|s| s.sync && s.folder == folder);
             if !unchanged {
                 match closed {
-                    None => return Ok(Applied::NeedsClose { forget: false }),
-                    Some(false) => return Err(AgentError::Usage("a pass of this space is still running; try again in a moment".into())),
-                    Some(true) => {}
+                    None if running || self.in_flight == Some(space) => return Ok(Applied::NeedsClose { forget: false }),
+                    None | Some(true) => {}
+                    Some(false) => return Err(AgentError::Usage(STILL_FINISHING.into())),
                 }
             }
             set_up_folder(&self.data, &folder, space, root, request.adopt)?;
