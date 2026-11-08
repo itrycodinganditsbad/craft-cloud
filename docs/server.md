@@ -202,7 +202,7 @@ allow the call is `403 read_only`. The server reads the role from the database o
   removed account is one answer, `404 not_found`.
 - `PATCH /spaces/{id}` renames (an owner) and changes the space's limit (an administrator: `quota_bytes`, `null` removes it).
   `POST /spaces/{id}/archive` and `…/unarchive` are the owner's, with their password. An archived space is read-only for every
-  member and leaves their lists except the owners'; nothing is deleted.
+  member and stays in their lists with `archived: true` (an invitation to it is not listed); nothing is deleted.
 - An administrator's changes carry the same confirmation as the account routes above (password, and the second factor when on):
   `POST /admin/spaces` (`name`, `owner`, `quota_bytes`), `GET /admin/spaces` (`limit`, `cursor`, `query`),
   `POST /admin/spaces/{id}/archive` and `…/unarchive`, and `PUT /admin/spaces/{id}/owner` (makes an account an accepted

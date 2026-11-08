@@ -505,7 +505,9 @@ async fn a_space_is_renamed_limited_and_archived(w: &World) {
     assert_eq!(archive("eve", Some(json!({ "password": PASSWORD }))).await.status(), StatusCode::NOT_FOUND);
     assert_eq!(archive("ana", Some(json!({ "password": PASSWORD }))).await.status(), StatusCode::NO_CONTENT);
     assert_eq!(archive("ana", Some(json!({ "password": PASSWORD }))).await.status(), StatusCode::NO_CONTENT, "archived already: no change");
-    assert!(w.spaces("ben").await.iter().all(|s| s.id != space), "gone from a member's list");
+    let member_view = w.spaces("ben").await;
+    let seen = member_view.iter().find(|s| s.id == space).expect("an archived space stays in an accepted member's list");
+    assert!(seen.archived && seen.root.is_some() && seen.state == "active", "marked archived, still theirs to read: {seen:?}");
     let owner_view = w.spaces("ana").await;
     assert!(owner_view.iter().find(|s| s.id == space).unwrap().archived, "listed for an owner, marked");
     let write = w

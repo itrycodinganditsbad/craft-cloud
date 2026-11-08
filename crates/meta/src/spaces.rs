@@ -559,8 +559,9 @@ impl Meta {
     }
 
     /// The spaces `user` can see, for `GET /spaces`: their personal space first, then the team spaces they are a member of
-    /// or invited to, by name. A pending invitation has no root and no epoch yet. An archived space is listed for its owners
-    /// only; an invitation to an archived space is not listed.
+    /// or invited to, by name. A pending invitation has no root and no epoch yet. An archived space is listed for every
+    /// accepted member (with `archived`; its access is capped at viewer, so it is theirs to read); an invitation to an
+    /// archived space is not listed.
     pub async fn user_spaces(&self, user: UserId) -> Result<Vec<UserSpace>, MetaError> {
         let mut tx = self.read_snapshot().await?;
         let mut out = Vec::new();
@@ -595,7 +596,7 @@ impl Meta {
             let role = parse_role(&row.try_get::<String, _>("role")?)?;
             let invited = row.try_get::<Option<i64>, _>("accepted_ms")?.is_none();
             let archived = row.try_get::<Option<i64>, _>("archived_ms")?.is_some();
-            if archived && (invited || role != SpaceRole::Owner) {
+            if archived && invited {
                 continue;
             }
             out.push(UserSpace {
