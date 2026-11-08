@@ -323,6 +323,7 @@ impl Link {
                 Effect::RestoreTrash { ticket, .. } => Event::TrashRestored { ticket, result: Err(error) },
                 Effect::RemoveTrash { ticket, .. } => Event::TrashRemoved { ticket, result: Err(error) },
                 Effect::Recents { ticket, .. } => Event::Recents { ticket, result: Err(error) },
+                Effect::CheckFile { .. } => Event::FileChecked(Err(crate::files::Place::NotYet)),
                 _ => Event::Polled(Err(error)),
             };
             let _ = self.tx.send(event);
@@ -372,6 +373,9 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         Effect::RestoreTrash { id, ticket } => Event::TrashRestored { ticket, result: agent.restore_from_trash(id) },
         Effect::RemoveTrash { id, ticket } => Event::TrashRemoved { ticket, result: agent.remove_from_trash(id) },
         Effect::Recents { root, ticket } => Event::Recents { ticket, result: recent_files(agent, root.as_deref().map(std::path::Path::new)) },
+        Effect::CheckFile { root, path } => {
+            Event::FileChecked(crate::files::check(Some(std::path::Path::new(&root)), &path).map(|full| full.to_string_lossy().into_owned()))
+        }
         Effect::Logout { local } => Event::SignedOut(agent.logout(local)),
         Effect::Pause => Event::Answered(agent.pause()),
         Effect::Resume => Event::Answered(agent.resume()),

@@ -3,7 +3,7 @@
 use egui::RichText;
 
 use super::kit::{self, Column, Segment, Tokens, Tone};
-use crate::files::{Files, app_label};
+use crate::files::{Files, Place, app_label};
 use crate::model::Event;
 
 /// The height of a row of the files table.
@@ -46,7 +46,7 @@ pub(super) fn show(ui: &mut egui::Ui, files: &Files, now_ms: i64, events: &mut V
             Column::fixed("App", 120.0),
             Column::fixed("Computer", 100.0),
             Column::fixed("Changed", 100.0),
-            Column::fixed("", 90.0),
+            Column::fixed("", 170.0),
         ];
         kit::table(ui, "files", &columns, visible.len(), ROW_H, |ui, row, column| {
             let Some(file) = visible.get(row) else { return };
@@ -65,21 +65,34 @@ pub(super) fn show(ui: &mut egui::Ui, files: &Files, now_ms: i64, events: &mut V
                     ui.label(super::ago(now_ms, file.when_ms()));
                 }
                 _ => {
-                    let open = ui.add_enabled(file.place.reason().is_none(), kit::Button::new("Open").primary());
-                    let open = match file.place.reason() {
-                        Some(reason) => open.on_disabled_hover_text(reason),
-                        None => open,
-                    };
-                    if open.clicked() {
-                        events.push(Event::OpenRecent { app: file.app.clone(), path: file.entry.path.clone() });
-                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let open = ui.add_enabled(file.place.reason().is_none(), kit::Button::new("Open").primary());
+                        let open = match file.place.reason() {
+                            Some(reason) => open.on_disabled_hover_text(reason),
+                            None => open,
+                        };
+                        if open.clicked() {
+                            events.push(Event::OpenRecent { app: file.app.clone(), path: file.entry.path.clone() });
+                        }
+                        // A file that is here can always be shown in its folder, also one that isn't opened from the page.
+                        let here = matches!(file.place, Place::Here | Place::NotOpenable);
+                        let show = ui.add_enabled(here, kit::Button::new("Folder"));
+                        let show = if here {
+                            show.on_hover_text("Show in folder")
+                        } else {
+                            show.on_disabled_hover_text("Show in folder: not on this computer")
+                        };
+                        if show.clicked() {
+                            events.push(Event::ShowRecent { app: file.app.clone(), path: file.entry.path.clone() });
+                        }
+                    });
                 }
             }
         });
     }
     ui.add_space(8.0);
     ui.label(
-        RichText::new("The list is Craft Cloud's shared recents: a file opened in an app on one computer shows up on the others. Open starts the file in its default program.")
+        RichText::new("The list is Craft Cloud's shared recents: a file opened in an app on one computer shows up on the others. Open starts the file in its default program; Folder shows the file in its folder.")
             .small()
             .color(t.muted),
     );

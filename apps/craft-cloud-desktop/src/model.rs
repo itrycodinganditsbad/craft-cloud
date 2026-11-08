@@ -5,7 +5,7 @@
 //!
 //! The window is a view of [`Model::screen`]; text fields edit its forms in place, buttons send events.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use craft_cloud_app::{
     AccountUsage, AuditEvent, AuditPage, DeviceId, DeviceInfo, Error, HistoryResponse, JoinRequest, NodeId, PairingInfo, PairingState, PairingStatus,
@@ -482,6 +482,13 @@ pub enum Event {
         app: String,
         path: String,
     },
+    /// Show the file of this app's list at this path (relative to the synced folder) in its folder, in the file manager.
+    ShowRecent {
+        app: String,
+        path: String,
+    },
+    /// [`Effect::CheckFile`]'s answer: the path to open (links followed, as it was checked), or why the file can't be opened.
+    FileChecked(Result<String, Place>),
     /// [`Effect::OpenFile`]'s outcome: why the OS couldn't be asked, if it couldn't.
     FileOpened(Result<(), String>),
     VersionsPath(String),
@@ -595,8 +602,13 @@ pub enum Effect {
     PickFolder(String),
     /// Open the synced folder in the file manager.
     OpenFolder(String),
-    /// Open this file (the full path, checked by [`crate::files::resolve`]) with the OS's default program
-    /// ([`Event::FileOpened`]).
+    /// Look at the file `path` (relative to the synced folder `root`) on the disk once more, now that it is to be opened
+    /// ([`crate::files::check`]; [`Event::FileChecked`]). A call off the UI thread, since it reads the disk.
+    CheckFile {
+        root: String,
+        path: String,
+    },
+    /// Open this file (the path [`Effect::CheckFile`] gave) with the OS's default program ([`Event::FileOpened`]).
     OpenFile(String),
     /// The recent files of every app, placed against the synced folder `root` ([`Event::Recents`]).
     Recents {
@@ -1218,6 +1230,16 @@ impl Model {
                 Vec::new()
             }
             Event::OpenRecent { app, path } => self.open_recent(&app, &path),
+            Event::ShowRecent { app, path } => self.show_recent(&app, &path),
+            Event::FileChecked(result) => match result {
+                Ok(full) => vec![Effect::OpenFile(full)],
+                Err(place) => {
+                    if let Screen::Files(files) = &mut self.screen {
+                        files.open_error = place.reason().map(|why| format!("Can't open this file: {why}."));
+                    }
+                    Vec::new()
+                }
+            },
             Event::FileOpened(result) => {
                 if let (Screen::Files(files), Err(why)) = (&mut self.screen, result) {
                     files.open_error = Some(format!("Couldn't open the file: {why}"));
@@ -1780,8 +1802,10 @@ impl Model {
         vec![Effect::Recents { root, ticket: files.ticket }]
     }
 
-    /// Opens a recent file with the OS's default program, if it is in the synced folder here: the path is joined to the
-    /// folder and checked again ([`crate::files::resolve`]) however the list placed it. Otherwise the page says why not.
+    /// Opens a recent file with the OS's default program, if it is in the synced folder here: the path is checked again by
+    /// its text ([`crate::files::resolve`]) however the list placed it, then on the disk as it is at this moment
+    /// ([`Effect::CheckFile`]: the list may be old, and a file may have been swapped for a link since), and the path that
+    /// check gives is the one opened. Otherwise the page says why not.
     fn open_recent(&mut self, app: &str, path: &str) -> Vec<Effect> {
         let root = self.status.as_ref().and_then(|s| s.folder.clone());
         let Screen::Files(files) = &mut self.screen else { return Vec::new() };
@@ -1790,14 +1814,42 @@ impl Model {
         let path = file.entry.path.clone();
         files.open_error = None;
         let outcome = match (place, root) {
-            (Place::Here, Some(root)) => crate::files::resolve(Path::new(&root), &path),
+            (Place::Here, Some(root)) => crate::files::resolve(Path::new(&root), &path).map(|_| root),
             (Place::Here, None) => Err(Place::NotYet),
             (place, _) => Err(place),
         };
         match outcome {
-            Ok(full) => vec![Effect::OpenFile(full.to_string_lossy().into_owned())],
+            Ok(root) => vec![Effect::CheckFile { root, path }],
             Err(place) => {
                 files.open_error = place.reason().map(|why| format!("Can't open this file: {why}."));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Shows a recent file that is here in the file manager, by opening the folder it is in (the synced folder for a file at
+    /// its top). A file that can't be opened can be shown; one that isn't here, or whose folder is a bundle, can't.
+    fn show_recent(&mut self, app: &str, path: &str) -> Vec<Effect> {
+        let root = self.status.as_ref().and_then(|s| s.folder.clone());
+        let Screen::Files(files) = &mut self.screen else { return Vec::new() };
+        let Some(file) = files.list.iter().flatten().find(|f| f.app == app && f.entry.path == path) else { return Vec::new() };
+        files.open_error = None;
+        let (place, path) = (file.place, file.entry.path.clone());
+        let folder = match (place, root) {
+            (Place::Here | Place::NotOpenable, Some(root)) => match path.rsplit_once('/') {
+                Some((parent, _)) => crate::files::resolve_folder(Path::new(&root), parent),
+                None => match crate::files::resolve_folder(Path::new(&root), &path) {
+                    Err(Place::Outside) => Err(Place::Outside),
+                    _ => Ok(PathBuf::from(&root)),
+                },
+            },
+            (Place::Here | Place::NotOpenable, None) => Err(Place::NotYet),
+            (place, _) => Err(place),
+        };
+        match folder {
+            Ok(folder) => vec![Effect::OpenFolder(folder.to_string_lossy().into_owned())],
+            Err(place) => {
+                files.open_error = place.reason().map(|why| format!("Can't show this file: {why}."));
                 Vec::new()
             }
         }
@@ -3413,15 +3465,60 @@ pub(crate) mod tests {
     #[test]
     fn open_asks_the_os_for_a_file_that_is_here_inside_the_synced_folder() {
         let mut m = files_loaded();
-        let want = Path::new("/home/ana/Craft Cloud").join("Letters").join("letter.docx").to_string_lossy().into_owned();
         let effects = m.update(Event::OpenRecent { app: "wordcraft".into(), path: "Letters/letter.docx".into() });
-        assert_eq!(effects, vec![Effect::OpenFile(want)]);
+        assert_eq!(effects, vec![Effect::CheckFile { root: "/home/ana/Craft Cloud".into(), path: "Letters/letter.docx".into() }]);
+        assert!(files_page(&m).open_error.is_none());
+        // The disk is looked at again at the click, and the path that check gives is the one opened.
+        let checked = "/home/ana/Craft Cloud/Letters/letter.docx".to_owned();
+        assert_eq!(m.update(Event::FileChecked(Ok(checked.clone()))), vec![Effect::OpenFile(checked)]);
         assert!(files_page(&m).open_error.is_none());
         // Whatever the OS says of it comes back.
         assert!(m.update(Event::FileOpened(Ok(()))).is_empty());
         assert!(files_page(&m).open_error.is_none());
         assert!(m.update(Event::FileOpened(Err("xdg-open didn't start: not found".into()))).is_empty());
         assert_eq!(files_page(&m).open_error.as_deref(), Some("Couldn't open the file: xdg-open didn't start: not found"));
+    }
+
+    #[test]
+    fn open_does_not_start_a_file_the_second_look_refuses() {
+        for (place, why) in [
+            (Place::NotYet, "Not on this computer yet"),
+            (Place::Outside, "Outside the synced folder"),
+            (Place::NotOpenable, "Open it from its folder"),
+        ] {
+            let mut m = files_loaded();
+            m.update(Event::OpenRecent { app: "wordcraft".into(), path: "Letters/letter.docx".into() });
+            assert!(m.update(Event::FileChecked(Err(place))).is_empty(), "{place:?}");
+            assert_eq!(files_page(&m).open_error.as_deref(), Some(format!("Can't open this file: {why}.").as_str()));
+        }
+    }
+
+    #[test]
+    fn show_in_folder_opens_the_folder_of_a_file_that_is_here() {
+        let mut m = files_loaded();
+        let folder = Path::new("/home/ana/Craft Cloud").join("Letters").to_string_lossy().into_owned();
+        assert_eq!(m.update(Event::ShowRecent { app: "wordcraft".into(), path: "Letters/letter.docx".into() }), vec![Effect::OpenFolder(folder)]);
+        assert_eq!(
+            m.update(Event::ShowRecent { app: "wordcraft".into(), path: "memo.docx".into() }),
+            vec![Effect::OpenFolder("/home/ana/Craft Cloud".into())],
+            "a file at the top of the synced folder shows that folder"
+        );
+        // Not here: nothing to show.
+        assert!(m.update(Event::ShowRecent { app: "photocraft".into(), path: "art/cover.psd".into() }).is_empty());
+        assert_eq!(files_page(&m).open_error.as_deref(), Some("Can't show this file: Not on this computer yet."));
+        // A file the page won't open can still be shown, unless its folder is a bundle or leaves the synced folder.
+        let mut m = signed_in();
+        m.update(Event::Tab(Tab::Files));
+        let list = vec![
+            recent_file("wordcraft", "tools/setup.exe", "setup", 3, Place::NotOpenable),
+            recent_file("wordcraft", "Tool.app/readme.txt", "readme", 2, Place::NotOpenable),
+            recent_file("wordcraft", "../x.txt", "x", 1, Place::Here),
+        ];
+        m.update(Event::Recents { ticket: 1, result: Ok(list) });
+        let shown = Path::new("/home/ana/Craft Cloud").join("tools").to_string_lossy().into_owned();
+        assert_eq!(m.update(Event::ShowRecent { app: "wordcraft".into(), path: "tools/setup.exe".into() }), vec![Effect::OpenFolder(shown)]);
+        assert!(m.update(Event::ShowRecent { app: "wordcraft".into(), path: "Tool.app/readme.txt".into() }).is_empty());
+        assert!(m.update(Event::ShowRecent { app: "wordcraft".into(), path: "../x.txt".into() }).is_empty());
     }
 
     #[test]
@@ -3444,7 +3541,9 @@ pub(crate) mod tests {
             ("/etc/passwd", "Outside the synced folder"),
             ("C:/Windows/win.ini", "Outside the synced folder"),
             ("..\\outside.docx", "Outside the synced folder"),
-            ("tools/setup.exe", "Programs and scripts aren't opened from here"),
+            ("tools/setup.exe", "Open it from its folder"),
+            ("tools/README", "Open it from its folder"),
+            ("Tool.app/readme.txt", "Open it from its folder"),
         ] {
             let mut m = signed_in();
             m.update(Event::Tab(Tab::Files));
@@ -3454,7 +3553,7 @@ pub(crate) mod tests {
             assert_eq!(files_page(&m).open_error.as_deref(), Some(format!("Can't open this file: {why}.").as_str()), "{path}");
         }
         // Placed outside, as a program or not here, a file is not opened whatever its path looks like.
-        for place in [Place::Outside, Place::Program, Place::NotYet] {
+        for place in [Place::Outside, Place::NotOpenable, Place::NotYet] {
             let mut m = signed_in();
             m.update(Event::Tab(Tab::Files));
             m.update(Event::Recents { ticket: 1, result: Ok(vec![recent_file("wordcraft", "ok.docx", "x", 1, place)]) });
