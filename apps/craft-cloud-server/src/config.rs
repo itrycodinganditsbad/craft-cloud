@@ -367,7 +367,9 @@ path = "/tmp/blobs"
         let c = Config::parse(DISK).unwrap();
         assert_eq!(c.listen, "127.0.0.1:8080".parse().unwrap());
         assert!(!c.behind_proxy && c.trusted_proxies.is_empty());
-        assert_eq!(c.storage, StorageConfig::Disk {
+        assert_eq!(
+            c.storage,
+            StorageConfig::Disk {
                 path: "/tmp/blobs".into(),
                 compression: Compression::Zstd,
                 compression_level: CompressionLevel(3),
@@ -462,16 +464,31 @@ compression = \"none\"
     fn the_compression_level_and_min_saving_have_defaults_and_ranges() {
         let c = Config::parse(DISK).unwrap();
         assert_eq!((c.storage.compression_level(), c.storage.compression_min_saving()), (3, 5));
-        let with = |lines: &str| Config::parse(&format!("{DISK}{lines}
-"));
+        let with = |lines: &str| {
+            Config::parse(&format!(
+                "{DISK}{lines}
+"
+            ))
+        };
         assert_eq!(with("compression_level = 1").unwrap().storage.compression_level(), 1);
         assert_eq!(with("compression_level = 19").unwrap().storage.compression_level(), 19);
         assert_eq!(with("compression_min_saving = 50").unwrap().storage.compression_min_saving(), 50);
         // The level and "none" are independent settings: "none" is read as "none" whatever the level.
-        let both = with("compression = \"none\"
-compression_level = 19").unwrap();
+        let both = with(
+            "compression = \"none\"
+compression_level = 19",
+        )
+        .unwrap();
         assert_eq!((both.storage.compression(), both.storage.compression_level()), (Compression::None, 19));
-        for bad in ["compression_level = 0", "compression_level = 20", "compression_level = 22", "compression_level = -3", "compression_level = 3.5", "compression_level = \"high\"", "compression_level = 300"] {
+        for bad in [
+            "compression_level = 0",
+            "compression_level = 20",
+            "compression_level = 22",
+            "compression_level = -3",
+            "compression_level = 3.5",
+            "compression_level = \"high\"",
+            "compression_level = 300",
+        ] {
             let Err(ConfigError::Parse(message)) = with(bad) else { panic!("{bad} must be refused") };
             assert!(message.contains("line"), "{bad}: {message}");
         }

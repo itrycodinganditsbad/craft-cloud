@@ -96,18 +96,22 @@ impl Meta {
         let mut conn = self.pool.acquire().await?;
         let limit = i64::try_from(limit.min(10_000)).map_err(|_| MetaError::Invalid("page too large"))?;
         let rows = match after {
-            None => sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {BLOB_COLUMNS} FROM blobs ORDER BY kind, id LIMIT $1")))
+            None => {
+                sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {BLOB_COLUMNS} FROM blobs ORDER BY kind, id LIMIT $1")))
+                    .bind(limit)
+                    .fetch_all(&mut *conn)
+                    .await?
+            }
+            Some((kind, id)) => {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SELECT {BLOB_COLUMNS} FROM blobs WHERE kind > $1 OR (kind = $1 AND id > $2) ORDER BY kind, id LIMIT $3"
+                )))
+                .bind(kind.code())
+                .bind(id.to_vec())
                 .bind(limit)
                 .fetch_all(&mut *conn)
-                .await?,
-            Some((kind, id)) => sqlx::query(sqlx::AssertSqlSafe(format!(
-                "SELECT {BLOB_COLUMNS} FROM blobs WHERE kind > $1 OR (kind = $1 AND id > $2) ORDER BY kind, id LIMIT $3"
-            )))
-            .bind(kind.code())
-            .bind(id.to_vec())
-            .bind(limit)
-            .fetch_all(&mut *conn)
-            .await?,
+                .await?
+            }
         };
         rows.iter().map(blob_row).collect()
     }
