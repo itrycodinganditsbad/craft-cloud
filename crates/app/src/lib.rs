@@ -78,9 +78,11 @@ pub use craft_cloud_api::api::{
     UsageEstimateReason, UsageEstimates, valid_audit_action,
 };
 pub use craft_cloud_api::local::{
-    HistoryResponse, HistoryVersion, JoinRequest, LoginRequest, NewRecent, PairingInfo, RecentEntry, RestoreResponse, RunState,
-    SecondFactorLoginRequest, Status, TrashItem, TrashNodeRequest, TrashResponse, TrashRestoreResponse, TwoFactorProofRequest, codes,
+    ConflictCopy, ConflictsResponse, FileKind, FolderUsage, FolderUsageResponse, HistoryResponse, HistoryVersion, JoinRequest, LoginRequest,
+    NewRecent, PairingInfo, RecentEntry, RestoreResponse, RunState, SecondFactorLoginRequest, Status, TrashItem, TrashNodeRequest, TrashResponse,
+    TrashRestoreResponse, TwoFactorProofRequest, codes,
 };
+pub use craft_cloud_api::local::{KindUsage, OtherFolders};
 pub use craft_cloud_api::{NodeId, VersionId};
 pub use recents::{RecentsEvent, RecentsWatch};
 pub use uuid::Uuid;
@@ -338,6 +340,21 @@ impl Client {
     /// The signed-in account's storage usage and labeled estimates. Asks the server each time.
     pub fn usage(&self) -> Result<AccountUsage, Error> {
         self.call("GET", paths::USAGE, None, http::SLOW_TIMEOUT)
+    }
+
+    /// The conflict copies in the synced folder, newest first (at most 1000, then `truncated`). Answered by the agent
+    /// from its saved state, with no call to the server, but it reads the whole saved state: call it off the UI thread. A name can match the conflict naming
+    /// without being a copy, so the list asks for a file with the original's name beside it (see `docs/agent.md`).
+    /// Signed out is `Refused { code: "not_signed_in" }`.
+    pub fn conflicts(&self) -> Result<ConflictsResponse, Error> {
+        self.call("GET", paths::CONFLICTS, None, http::SLOW_TIMEOUT)
+    }
+
+    /// The local logical bytes of the synced files by top-level folder and by kind, from the agent's saved state: not
+    /// the server's stored bytes ([`Client::usage`]). Reads the whole saved state: call it off the UI thread. Signed out is
+    /// `Refused { code: "not_signed_in" }`.
+    pub fn folder_usage(&self) -> Result<FolderUsageResponse, Error> {
+        self.call("GET", paths::USAGE_FOLDERS, None, http::SLOW_TIMEOUT)
     }
 
     /// Removes another computer from the account (its next request is refused; its files stay there), and gives the
@@ -915,6 +932,49 @@ mod tests {
                 expected_version: expected,
             }
         );
+    }
+
+    #[test]
+    fn conflicts_and_folder_usage_use_their_local_routes() {
+        let copies = ConflictsResponse {
+            copies: vec![ConflictCopy {
+                path: "Art/a (conflict, pc, 2026-10-11 14-03).txt".into(),
+                original_path: Some("Art/a.txt".into()),
+                device: Some("pc".into()),
+                at: Some("2026-10-11 14:03".into()),
+                at_utc: false,
+                at_ms: None,
+                size: 7,
+                mtime_ms: 99,
+            }],
+            truncated: true,
+        };
+        let usage = FolderUsageResponse {
+            total_bytes: 12,
+            total_files: 2,
+            folders: vec![FolderUsage { name: "Art".into(), bytes: 12, files: 2 }],
+            other: Some(OtherFolders { folders: 3, bytes: 4, files: 5 }),
+            kinds: FileKind::ALL.iter().map(|kind| KindUsage { kind: *kind, bytes: 0, files: 0 }).collect(),
+        };
+        let (_dir, agent, asked) = fake_agent(vec![(200, json(&copies)), (200, json(&usage))]);
+        assert_eq!(agent.conflicts().unwrap(), copies);
+        let (method, path, body) = asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((method.as_str(), path.as_str()), ("GET", paths::CONFLICTS));
+        assert!(body.is_empty());
+        assert_eq!(agent.folder_usage().unwrap(), usage);
+        let (method, path, _) = asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((method.as_str(), path.as_str()), ("GET", paths::USAGE_FOLDERS));
+        // The debug output carries counts and sizes, never a file or folder name.
+        let shown = format!("{copies:?} {usage:?} {:?}", usage.folders);
+        assert!(!shown.contains("Art") && !shown.contains("conflict"), "{shown}");
+    }
+
+    #[test]
+    fn conflicts_maps_signed_out() {
+        let answer = json(&ErrorAnswer { error: "not_signed_in".into(), message: "sign in".into(), name_taken: None });
+        let (_dir, agent, _asked) = fake_agent(vec![(409, answer)]);
+        let result = agent.conflicts();
+        assert!(matches!(result, Err(Error::Refused { ref code, .. }) if code == "not_signed_in"), "{result:?}");
     }
 
     #[test]

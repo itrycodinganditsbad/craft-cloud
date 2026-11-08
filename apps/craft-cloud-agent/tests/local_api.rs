@@ -1608,3 +1608,165 @@ async fn a_truncated_export_is_said_to_be() {
     assert_eq!(String::from_utf8(out).unwrap().lines().count(), 2, "the newest two, and no last line in what is written");
     running.stop().await.0.unwrap();
 }
+
+/// The copies the agent lists, through the local API.
+fn conflict_list(api: &LocalApiFile) -> craft_cloud_proto::local::ConflictsResponse {
+    let (code, body) = call(api, "GET", "/v1/conflicts", "");
+    assert_eq!(code, 200, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+fn folder_sizes(api: &LocalApiFile) -> craft_cloud_proto::local::FolderUsageResponse {
+    let (code, body) = call(api, "GET", "/v1/usage/folders", "");
+    assert_eq!(code, 200, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+/// Waits until the agent has the file in its saved state (history is answered only for such a file).
+async fn in_saved_state(api: &LocalApiFile, path: &str) {
+    let query = format!("/v1/files/history?path={}", path.replace('/', "%2F").replace(' ', "%20"));
+    eventually(&format!("{path} is in the saved state"), || call(api, "GET", &query, "").0 == 200).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn conflict_routes_refuse_signed_out() {
+    let data = DataDir::new(tempfile::tempdir().unwrap().keep());
+    let running = Running::start(&data);
+    let api = api_file(data.path()).await;
+    for path in ["/v1/conflicts", "/v1/usage/folders"] {
+        let (code, body) = call(&api, "GET", path, "");
+        assert_eq!((code, error_code(&body).as_str()), (409, codes::NOT_SIGNED_IN), "{path}: {body}");
+    }
+    let _ = running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conflict_made_by_two_computers_is_listed() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder = dir.path().join("Craft Cloud");
+    let (running, api) = signed_in(&server, &data, &folder).await;
+    assert_eq!(conflict_list(&api), Default::default());
+
+    std::fs::create_dir(folder.join("Notes")).unwrap();
+    std::fs::write(folder.join("Notes/doc.txt"), "base").unwrap();
+    reaches_the_server(&server, "doc.txt").await;
+
+    // A second computer joins, edits the file, and loses the race against this one.
+    let other = DataDir::new(dir.path().join("other-data"));
+    let other_folder = dir.path().join("Other Cloud");
+    let args = cli::LoginArgs {
+        url: server.url.clone(),
+        user: "ana".into(),
+        folder: Some(other_folder.clone()),
+        device_name: Some("desktop".into()),
+        adopt: false,
+    };
+    cli::login(&other, &args, PASSWORD, &mut Vec::new()).await.unwrap();
+    cli::sync(&other, false, &mut Vec::new()).await.unwrap();
+    assert_eq!(std::fs::read_to_string(other_folder.join("Notes/doc.txt")).unwrap(), "base");
+    std::fs::write(other_folder.join("Notes/doc.txt"), "edited on the other computer!").unwrap();
+    std::fs::write(folder.join("Notes/doc.txt"), "edited here").unwrap();
+    eventually("the edit made here is on the server", || {
+        let (code, body) = call(&api, "GET", "/v1/files/history?path=Notes%2Fdoc.txt&limit=5", "");
+        code == 200 && serde_json::from_str::<HistoryResponse>(&body).is_ok_and(|page| page.versions.len() >= 2)
+    })
+    .await;
+    let (_, summary) = cli::sync(&other, false, &mut Vec::new()).await.unwrap();
+    assert_eq!(summary.conflict_copies.len(), 1, "{summary:?}");
+    let copy = summary.conflict_copies[0].clone();
+    assert!(copy.starts_with("Notes/doc (conflict, desktop, ") && copy.ends_with(").txt"), "{copy}");
+
+    // It reaches this computer through the change feed and shows up in the list.
+    eventually("the copy is listed", || !conflict_list(&api).copies.is_empty()).await;
+    let list = conflict_list(&api);
+    assert!(!list.truncated);
+    assert_eq!(list.copies.len(), 1, "{list:?}");
+    let found = &list.copies[0];
+    assert_eq!(found.path, copy);
+    assert_eq!(found.original_path.as_deref(), Some("Notes/doc.txt"));
+    assert_eq!(found.device.as_deref(), Some("desktop"));
+    assert!(found.at.is_some());
+    assert_eq!(found.size, "edited on the other computer!".len() as u64);
+
+    // The same through the app's client; the folder sizes count both files under Notes.
+    let client = craft_cloud_app::Client::connect_in(data.path()).unwrap();
+    let (listed, sizes) = tokio::task::spawn_blocking(move || (client.conflicts().unwrap(), client.folder_usage().unwrap())).await.unwrap();
+    assert_eq!(listed, list);
+    let notes = sizes.folders.iter().find(|f| f.name == "Notes").expect("Notes is listed");
+    assert_eq!(notes.files, 2);
+    assert_eq!(notes.bytes, "edited on the other computer!".len() as u64 + "edited here".len() as u64);
+    running.stop().await.0.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lookalike_without_an_original_is_not_a_conflict_copy() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder = dir.path().join("Craft Cloud");
+    let (running, api) = signed_in(&server, &data, &folder).await;
+    let ghost = "ghost (conflict, pc, 2026-10-11 14-03).txt";
+    let copy = "kept (conflict, pc, 2026-10-11 14-03).txt";
+    for (name, content) in [(ghost, "no original"), (copy, "has one"), ("kept.txt", "the original")] {
+        std::fs::write(folder.join(name), content).unwrap();
+    }
+    for name in [ghost, copy, "kept.txt"] {
+        in_saved_state(&api, name).await;
+    }
+    let list = conflict_list(&api);
+    let paths: Vec<&str> = list.copies.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(paths, [copy], "{list:?}");
+    assert_eq!(list.copies[0].original_path.as_deref(), Some("kept.txt"));
+    running.stop().await.0.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_conflict_list_is_capped_at_1000() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder = dir.path().join("Craft Cloud");
+    let (running, api) = signed_in(&server, &data, &folder).await;
+    std::fs::write(folder.join("a.txt"), "x").unwrap();
+    for n in 2..=1002 {
+        std::fs::write(folder.join(format!("a (conflict, pc, 2026-10-11 14-03, {n}).txt")), "y").unwrap();
+    }
+    eventually("the list is full", || conflict_list(&api).truncated).await;
+    let list = conflict_list(&api);
+    assert_eq!(list.copies.len(), 1000);
+    assert_eq!(list.copies.first().map(|c| c.path.as_str()), Some("a (conflict, pc, 2026-10-11 14-03, 1002).txt"));
+    running.stop().await.0.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn folder_usage_sums_local_logical_bytes_by_folder_and_kind() {
+    use craft_cloud_proto::local::FileKind;
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder = dir.path().join("Craft Cloud");
+    let (running, api) = signed_in(&server, &data, &folder).await;
+    assert_eq!(folder_sizes(&api).total_files, 0);
+    for (path, size) in [("root.txt", 5usize), ("Art/a.png", 100), ("Art/deep/b.PNG", 50), ("Art/c.mp4", 1000), ("Docs/d.pdf", 20), ("Docs/noext", 3)]
+    {
+        let file = folder.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, vec![b'x'; size]).unwrap();
+    }
+    eventually("all six files are in the saved state", || folder_sizes(&api).total_files == 6).await;
+    let usage = folder_sizes(&api);
+    assert_eq!(usage.total_bytes, 1178);
+    let folders: Vec<(&str, u64, u64)> = usage.folders.iter().map(|f| (f.name.as_str(), f.bytes, f.files)).collect();
+    assert_eq!(folders, [("Art", 1150, 3), ("Docs", 23, 2), ("", 5, 1)]);
+    assert_eq!(usage.other, None);
+    let kind = |k| usage.kinds.iter().find(|u| u.kind == k).map(|u| (u.bytes, u.files)).unwrap();
+    assert_eq!(kind(FileKind::Image), (150, 2));
+    assert_eq!(kind(FileKind::Video), (1000, 1));
+    assert_eq!(kind(FileKind::Document), (20, 1));
+    assert_eq!(kind(FileKind::Code), (5, 1));
+    assert_eq!(kind(FileKind::Other), (3, 1));
+    assert_eq!(kind(FileKind::Audio), (0, 0));
+    running.stop().await.0.unwrap();
+}
