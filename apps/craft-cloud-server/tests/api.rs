@@ -979,6 +979,14 @@ async fn compressible_uploads_are_stored_compressed_and_download_unchanged() {
     assert_eq!(raw[0], 1, "stored as zstd");
     assert!(raw.len() < data.len() / 4, "{} bytes on disk for {} bytes", raw.len(), data.len());
     assert_eq!(download(&s, &token, &id).await, data);
+
+    // The database knows both sizes: the logical one quotas count, and what the object takes on disk.
+    let row = s.meta.blob_from(craft_cloud_meta::BlobKind::Chunk, &[0u8; 32]).await.unwrap().unwrap();
+    assert_eq!(row.id, *chunk_id(&data).as_bytes());
+    assert_eq!((row.stored_size, row.physical_size, row.level), (data.len() as u64 + 1, Some(raw.len() as u64), Some(3)));
+    let totals = s.meta.storage_totals().await.unwrap();
+    assert_eq!(totals.blobs, totals.known_blobs, "every upload records its stored size");
+    assert!(totals.known_physical_bytes < totals.known_logical_bytes / 2);
 }
 
 // ---- load limits (the same on every backend, so SQLite + disk only) ----
