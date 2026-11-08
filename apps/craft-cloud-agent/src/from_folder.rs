@@ -92,10 +92,6 @@ fn read_journal(data: &DataDir, personal: SpaceId) -> Option<FromFolderStatus> {
     read_saved(data, personal).map(|j| j.status)
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok().and_then(|d| i64::try_from(d.as_millis()).ok()).unwrap_or(0)
-}
-
 /// Writes the journal, keeping the start time it has.
 fn write_journal(data: &DataDir, personal: SpaceId, status: &FromFolderStatus) {
     let started_ms = read_saved(data, personal).and_then(|j| j.started_ms);
@@ -239,6 +235,16 @@ pub fn restore(control: &Control, data: &DataDir, account: &Account) {
         control.set_from_folder(Some(status));
         return;
     }
+    // What could not be put back before has been put back now: the old message no longer holds.
+    if status.step == FromFolderStep::Failed && status.message.as_deref().is_some_and(|m| m.starts_with(STRANDED_LEAD)) {
+        status.step = FromFolderStep::Interrupted;
+        status.message = Some(
+            "The files that could not be put back were put back. Ask again to finish; the files still in the old folder are checked once more \
+             before they are deleted."
+                .to_owned(),
+        );
+        write_journal(data, account.space, &status);
+    }
     let trashing = status.step == FromFolderStep::Trashing || status.failed_at == Some(FromFolderStep::Trashing);
     // Stopped after the old folder was removed, before "done" was written: there is nothing left to finish.
     if trashing && status.step != FromFolderStep::Done && is_gone(&status.folder) {
@@ -307,9 +313,10 @@ async fn hold_at(data: &DataDir, step: FromFolderStep, alive: &(dyn Fn() -> bool
 /// agent's, and if it is not it writes nothing (no journal, no status, no job) and answers that the agent is not signed in.
 pub(crate) async fn start(start: Start, request: FromFolderRequest) -> Result<FromFolderStatus, LocalError> {
     let Start { control, data } = start;
+    // The session number first: a session that ends after it makes every later look say so.
+    let session = control.session_id();
     let account = control.account().ok_or(AgentError::NotSignedIn)?;
     let spaces = control.spaces_handle().ok_or(AgentError::NotSignedIn)?;
-    let session = control.session_id();
     let alive = || control.session_id() == session && control.account().is_some_and(|a| a.space == account.space && a.device == account.device);
     let ended = || LocalError::from(AgentError::NotSignedIn);
     if control.from_folder().is_some_and(|s| s.running()) {
@@ -369,15 +376,15 @@ pub(crate) async fn start(start: Start, request: FromFolderRequest) -> Result<Fr
         }
         // The server's clock just before the call, kept in the journal: a space is taken to be the one a crashed call made only if
         // the server made it after this. Once a call was sent the time is never written again.
-        let fresh = transport.server_clock_ms().await.unwrap_or_else(now_ms);
+        let fresh = transport.server_clock_ms().await;
         if !alive() {
             return Err(ended());
         }
-        let started = if crashed_creating { started_before.unwrap_or(fresh) } else { fresh };
+        let started = started_time(crashed_creating, started_before, fresh);
         if !control.begin_from_folder(status.clone()) {
             return Err(busy());
         }
-        write_journal_started(&data, account.space, &status, Some(started));
+        write_journal_started(&data, account.space, &status, started);
         let created = create_space(&transport, &name, &request).await;
         hold_at(&data, FromFolderStep::Creating, &alive).await;
         // The session ended while the server was asked: nothing of this call is written under the next one. (A space the
@@ -416,8 +423,20 @@ pub(crate) async fn start(start: Start, request: FromFolderRequest) -> Result<Fr
     control.set_from_folder(Some(status.clone()));
     let cancel = Arc::new(AtomicBool::new(false));
     let job = Job { control: control.clone(), data, account, spaces, status: status.clone(), scan, cancel: cancel.clone() };
-    control.set_from_folder_job(Some(crate::local_api::FromFolderJob { cancel, task: tokio::spawn(job.run()) }));
+    let task = tokio::spawn(job.run());
+    // Registered only if the session is still the one the call began in (checked under the lock `end_session` takes the job with).
+    if !control.register_from_folder_job(session, crate::local_api::FromFolderJob { cancel: cancel.clone(), task }) {
+        cancel.store(true, Ordering::SeqCst);
+        return Err(ended());
+    }
     Ok(status)
+}
+
+/// The server's time the journal keeps for a creation: a crashed creation tried again keeps the one it has (a retry never rewrites it
+/// once a call was sent); otherwise the server's clock just read. No server time (no `Date` header) is no time: nothing is adopted
+/// later (the agent's own clock is never used).
+fn started_time(crashed_creating: bool, before: Option<i64>, fresh: Option<i64>) -> Option<i64> {
+    if crashed_creating { before.or(fresh) } else { fresh }
 }
 
 /// Puts the status and the journal back to what an earlier try left (`None`: nothing).
@@ -1296,8 +1315,41 @@ fn quarantine_base(account: &Account) -> PathBuf {
     account.folder.join(AGENT_DIR).join("from-folder")
 }
 
-/// The file in a quarantine folder that names the old folder its files came from.
-const ROOT_FILE: &str = "root.txt";
+/// The marker beside a quarantine folder (`<key>.root`, outside the folder, which mirrors the old folder's tree and so can hold any
+/// file name) that names the old folder its files came from.
+fn marker_of(quarantine: &Path) -> PathBuf {
+    let mut name = quarantine.file_name().map(std::ffi::OsString::from).unwrap_or_default();
+    name.push(".root");
+    quarantine.with_file_name(name)
+}
+
+/// Makes sure the marker of `quarantine` names `root`, written atomically. False when it cannot be had: nothing is then moved into
+/// the quarantine, because nothing could be put back from it.
+fn marker_ready(quarantine: &Path, root: &Path) -> bool {
+    let text = root.to_string_lossy().into_owned();
+    // A root that is not text would be written changed: it is refused.
+    if root.to_str().is_none() {
+        return false;
+    }
+    let marker = marker_of(quarantine);
+    if std::fs::create_dir_all(quarantine).is_err() {
+        return false;
+    }
+    if std::fs::read_to_string(&marker).is_ok_and(|have| have == text) {
+        return true;
+    }
+    write_atomic(&marker, text.as_bytes(), true).is_ok() && std::fs::read_to_string(&marker).is_ok_and(|have| have == text)
+}
+
+/// The old folder a quarantine folder's marker names, if the marker is sound: an absolute path without `.` or `..`, inside the
+/// personal folder (and not it), and the one the quarantine folder's name was made from.
+fn marker_root(quarantine: &Path, personal: &Path) -> Option<PathBuf> {
+    let root = PathBuf::from(std::fs::read_to_string(marker_of(quarantine)).ok()?);
+    let plain = root.components().all(|c| !matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir));
+    let key: String = blake3::hash(root.to_string_lossy().as_bytes()).to_hex().chars().take(16).collect();
+    let named = quarantine.file_name().is_some_and(|n| n == std::ffi::OsStr::new(&key));
+    (root.is_absolute() && plain && root != personal && root.starts_with(personal) && named).then_some(root)
+}
 
 /// Whether `path` is a link of any kind (a symlink, a junction or any other reparse point).
 fn is_link(meta: &std::fs::Metadata) -> bool {
@@ -1314,29 +1366,15 @@ fn is_link(meta: &std::fs::Metadata) -> bool {
     false
 }
 
-/// What tells one folder from another that was put in its place: the device and file number (Unix), or the creation time
-/// (Windows, where the file index is not reachable without unsafe code; the resolved path is compared as well).
-fn identity(meta: &std::fs::Metadata) -> (u64, u64) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        (meta.dev(), meta.ino())
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        (meta.creation_time(), 0)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = meta;
-        (0, 0)
-    }
+/// What tells one folder from another that was put in its place: the file ID the sync uses for it (device and inode on Unix, the NTFS
+/// file ID and volume serial on Windows), `None` when it cannot be read.
+fn identity(path: &Path, meta: &std::fs::Metadata) -> Option<u64> {
+    crate::disk::local_id(meta, path)
 }
 
 /// The old folder and every folder above it up to the personal folder, as they were when it was scanned: the resolved path and the
 /// identity of each.
-type Chain = Vec<(PathBuf, (u64, u64))>;
+type Chain = Vec<(PathBuf, Option<u64>)>;
 
 /// Records the chain of `root` up to `personal` (both resolved).
 fn chain_of(root: &Path, personal: &Path) -> Chain {
@@ -1344,7 +1382,7 @@ fn chain_of(root: &Path, personal: &Path) -> Chain {
     let mut at = Some(root.to_owned());
     while let Some(path) = at {
         if let Ok(meta) = std::fs::symlink_metadata(&path) {
-            chain.push((path.clone(), identity(&meta)));
+            chain.push((path.clone(), identity(&path, &meta)));
         }
         at = if path == personal { None } else { path.parent().map(Path::to_owned) };
     }
@@ -1356,7 +1394,7 @@ fn chain_of(root: &Path, personal: &Path) -> Chain {
 fn chain_intact(chain: &Chain) -> bool {
     !chain.is_empty()
         && chain.iter().all(|(path, id)| {
-            std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !is_link(&m) && identity(&m) == *id)
+            std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !is_link(&m) && identity(path, &m) == *id)
                 && std::fs::canonicalize(path).is_ok_and(|resolved| resolved == *path)
         })
 }
@@ -1448,9 +1486,12 @@ fn delete_batch(
         batch.replaced = true;
         return batch;
     }
-    // The marker that says where this quarantine's files belong.
-    if std::fs::create_dir_all(quarantine).is_ok() && !quarantine.join(ROOT_FILE).exists() {
-        let _ = std::fs::write(quarantine.join(ROOT_FILE), root.to_string_lossy().as_bytes());
+    // Without the marker that says where this quarantine's files belong nothing could be put back from it: nothing goes in, and every
+    // file of the batch stays where it is.
+    if !marker_ready(quarantine, root) {
+        batch.stats.locked += items.len() as u64;
+        batch.processed = items.len();
+        return batch;
     }
     for item in items {
         if cancelled() || started.elapsed() > TRASH_RECHECK {
@@ -1526,19 +1567,34 @@ fn delete_one(
 /// quarantine folders that still hold files.
 fn recover_quarantine_all(account: &Account) -> Vec<PathBuf> {
     let mut stranded = Vec::new();
-    let Ok(entries) = std::fs::read_dir(quarantine_base(account)) else { return stranded };
+    let base = quarantine_base(account);
+    let Ok(entries) = std::fs::read_dir(&base) else { return stranded };
+    let personal = std::fs::canonicalize(&account.folder).unwrap_or_else(|_| account.folder.clone());
     for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|t| t.is_dir()) && !recover_one(&entry.path()) {
-            stranded.push(entry.path());
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            if !recover_one(&path, &personal) {
+                stranded.push(path);
+            }
+        } else if path.extension().is_some_and(|e| e == "root") && !path.with_extension("").exists() {
+            // A marker whose quarantine folder is gone.
+            let _ = std::fs::remove_file(&path);
         }
     }
-    let _ = std::fs::remove_dir(quarantine_base(account));
+    let _ = std::fs::remove_dir(&base);
     stranded
 }
 
-/// Whether the quarantine folder `dir` is empty (and removed) after its files were put back.
-fn recover_one(dir: &Path) -> bool {
-    let root = std::fs::read_to_string(dir.join(ROOT_FILE)).ok().map(PathBuf::from);
+/// Whether the quarantine folder `dir` is empty (and removed, with its marker) after its files were put back. A marker that is
+/// missing, empty or not sound leaves the folder untouched and reported.
+fn recover_one(dir: &Path, personal: &Path) -> bool {
+    let has_files = std::fs::read_dir(dir).is_ok_and(|mut e| e.next().is_some());
+    if !has_files {
+        remove_empty_tree(dir);
+        let _ = std::fs::remove_file(marker_of(dir));
+        return true;
+    }
+    let Some(root) = marker_root(dir, personal) else { return false };
     let mut clean = true;
     let mut stack = vec![dir.to_owned()];
     while let Some(here) = stack.pop() {
@@ -1547,33 +1603,34 @@ fn recover_one(dir: &Path) -> bool {
             let path = entry.path();
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
                 stack.push(path);
-            } else if path == dir.join(ROOT_FILE) {
-                continue;
-            } else if let (Some(root), Ok(rel)) = (&root, path.strip_prefix(dir)) {
+            } else if let Ok(rel) = path.strip_prefix(dir) {
                 if put_back(&path, &root.join(rel)).is_err() {
                     clean = false;
                 }
             } else {
-                // No marker: nothing says where it belongs.
                 clean = false;
             }
         }
     }
     if clean {
         remove_empty_tree(dir);
+        if !dir.exists() {
+            let _ = std::fs::remove_file(marker_of(dir));
+        }
     }
     clean
 }
 
+/// How the message about files that could not be put back starts.
+const STRANDED_LEAD: &str = "Some files could not be put back into the old folder and are kept in ";
+
 /// What to tell the person when files could not be put back out of a quarantine folder.
 fn stranded_words(dirs: &[PathBuf]) -> String {
     let dir = dirs.first().map(|d| d.display().to_string()).unwrap_or_default();
-    format!(
-        "Some files could not be put back into the old folder and are kept in {dir}. Move them back yourself; the agent tries again at its next start."
-    )
+    format!("{STRANDED_LEAD}{dir}. Move them back yourself; the agent tries again at its next start.")
 }
 
-/// Removes `dir` and the folders in it that are empty (the marker file counts as empty).
+/// Removes `dir` and the folders in it that are empty.
 fn remove_empty_tree(dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -1581,10 +1638,6 @@ fn remove_empty_tree(dir: &Path) {
                 remove_empty_tree(&entry.path());
             }
         }
-    }
-    let leftovers = std::fs::read_dir(dir).map(|e| e.flatten().filter(|e| e.file_name() != ROOT_FILE).count()).unwrap_or(1);
-    if leftovers == 0 {
-        let _ = std::fs::remove_file(dir.join(ROOT_FILE));
     }
     let _ = std::fs::remove_dir(dir);
 }
@@ -1613,6 +1666,9 @@ fn finish_old(root: &Path, dirs: &[(Vec<std::ffi::OsString>, Vec<String>)], quar
         }
     }
     remove_empty_tree(quarantine);
+    if !quarantine.exists() {
+        let _ = std::fs::remove_file(marker_of(quarantine));
+    }
     if let Some(parent) = quarantine.parent() {
         let _ = std::fs::remove_dir(parent);
     }
@@ -1830,5 +1886,17 @@ mod tests {
         assert!(words.contains("3 other files stayed"), "{words}");
         assert_eq!(kept.kept(), 3, "the files the sync never carries are not counted");
         assert_eq!(TrashStats::default().words(0), None);
+    }
+
+    #[test]
+    fn the_start_time_is_the_servers_or_none_and_a_retry_keeps_the_one_it_has() {
+        // A new creation takes the server's clock, or none when the server did not say (never the agent's own).
+        assert_eq!(started_time(false, None, Some(5)), Some(5));
+        assert_eq!(started_time(false, Some(1), Some(5)), Some(5));
+        assert_eq!(started_time(false, None, None), None);
+        // A crashed creation tried again keeps what it has; a retry never moves it forward.
+        assert_eq!(started_time(true, Some(1), Some(5)), Some(1));
+        assert_eq!(started_time(true, None, Some(5)), Some(5));
+        assert_eq!(started_time(true, None, None), None);
     }
 }

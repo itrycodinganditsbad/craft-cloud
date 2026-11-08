@@ -213,6 +213,18 @@ impl Control {
         self.session.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Registers the job of a call that began in `session`, unless that session has ended meanwhile (then it is handed back as
+    /// refused: `end_session` could not have found it).
+    pub fn register_from_folder_job(&self, session: u64, job: FromFolderJob) -> bool {
+        let mut slot = self.from_job.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.session_id() != session {
+            job.task.abort();
+            return false;
+        }
+        *slot = Some(job);
+        true
+    }
+
     pub fn set_from_folder_job(&self, job: Option<FromFolderJob>) {
         *self.from_job.lock().unwrap_or_else(PoisonError::into_inner) = job;
     }

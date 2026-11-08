@@ -704,7 +704,7 @@ async fn the_team_folder_takes_a_free_name_and_the_mass_delete_guard_sees_the_ol
 // ---- the review round ----
 
 /// Writes a journal as a crashed call would have left it, for `folder` and `name`.
-fn crashed_creating_journal(ana: &Person, personal: SpaceId, folder: &Path, name: &str, started_ms: i64) {
+fn crashed_creating_journal(ana: &Person, personal: SpaceId, folder: &Path, name: &str, started_ms: Option<i64>) {
     let status = FromFolderStatus {
         folder: std::fs::canonicalize(folder).unwrap().display().to_string(),
         name: name.to_owned(),
@@ -912,7 +912,7 @@ async fn a_space_made_by_someone_else_is_not_adopted_after_a_crash() {
     // The same name, this account as owner, but another member too: not ours.
     let shared = w.meta.create_team_space(&SpaceActor::Cli, &name("Studio"), w.ana.id, None, now_ms()).await.unwrap();
     w.meta.invite_member(&SpaceActor::Cli, shared, cy.id, craft_cloud_app::SpaceRole::Editor, now_ms()).await.unwrap();
-    crashed_creating_journal(&ana, personal, &project, "Studio", now_ms() - 60_000);
+    crashed_creating_journal(&ana, personal, &project, "Studio", Some(now_ms() - 60_000));
     let refused = ana.make(&project, "Studio").await.unwrap_err();
     assert_eq!(refused.code(), Some("conflict"), "{refused:?}");
     // A refused retry does not move the start time the journal holds.
@@ -920,13 +920,13 @@ async fn a_space_made_by_someone_else_is_not_adopted_after_a_crash() {
     assert!(kept["started_ms"].as_i64().is_some_and(|t| t < now_ms() - 30_000), "{kept}");
     // One made long before the call started is not ours either.
     w.meta.create_team_space(&SpaceActor::Cli, &name("Old one"), w.ana.id, None, now_ms() - 3_600_000).await.unwrap();
-    crashed_creating_journal(&ana, personal, &project, "Old one", now_ms());
+    crashed_creating_journal(&ana, personal, &project, "Old one", Some(now_ms()));
     let refused = ana.make(&project, "Old one").await.unwrap_err();
     assert_eq!(refused.code(), Some("conflict"), "{refused:?}");
     untouched(&project, &files);
     // One made after the call started, alone, empty: the one the crashed call made.
     let mine = w.meta.create_team_space(&SpaceActor::Cli, &name("Mine"), w.ana.id, None, now_ms()).await.unwrap();
-    crashed_creating_journal(&ana, personal, &project, "Mine", now_ms() - 60_000);
+    crashed_creating_journal(&ana, personal, &project, "Mine", Some(now_ms() - 60_000));
     let adopted = ana.make(&project, "Mine").await.unwrap();
     assert_eq!(adopted.space, Some(mine));
     done(&ana).await;
@@ -951,10 +951,12 @@ async fn work_stopped_after_the_old_folder_was_removed_finishes_as_done() {
 // ---- the second review round ----
 
 /// A quarantine folder with `files` (relative path, content) for the old folder `root`, as a crashed deletion leaves it.
-fn leave_in_quarantine(personal: &Path, key: &str, root: &Path, files: &[(&str, &[u8])]) -> PathBuf {
-    let dir = personal.join(".craft-cloud").join("from-folder").join(key);
+fn leave_in_quarantine(personal: &Path, _key: &str, root: &Path, files: &[(&str, &[u8])]) -> PathBuf {
+    let dir = quarantine_of(personal, root);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("root.txt"), root.to_string_lossy().as_bytes()).unwrap();
+    let mut name = dir.file_name().unwrap().to_owned();
+    name.push(".root");
+    std::fs::write(dir.with_file_name(name), root.to_string_lossy().as_bytes()).unwrap();
     for (rel, data) in files {
         write(&dir, rel, data);
     }
@@ -1144,4 +1146,148 @@ async fn the_work_of_a_session_ends_with_it_even_in_the_middle_of_a_slow_copy() 
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(files_under(&big), files);
+}
+
+// ---- the third review round ----
+
+/// The quarantine folder `key` of the old folder `root` is named after (as the agent names it).
+fn quarantine_of(personal: &Path, root: &Path) -> PathBuf {
+    let key: String = blake3::hash(root.to_string_lossy().as_bytes()).to_hex().chars().take(16).collect();
+    personal.join(".craft-cloud").join("from-folder").join(key)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_called_root_txt_is_moved_and_deleted_like_any_other() {
+    let w = world().await;
+    let mut ana = Person::signed_in(&w.url, "ana").await;
+    let folder = ana.personal.join("Notes");
+    let mut files = BTreeMap::new();
+    for (name, data) in [("root.txt", b"my own file".to_vec()), ("a.txt", b"another".to_vec())] {
+        write(&folder, name, &data);
+        files.insert(name.to_owned(), data);
+    }
+    ana.run();
+    ana.ready().await;
+    personal_has(&w, "Notes", &files).await;
+    ana.make(&folder, "Notes team").await.unwrap();
+    let status = done(&ana).await;
+    assert_eq!((status.kept, status.message.clone()), (0, None), "{status:?}");
+    team_holds_dirs(&w, &status, &files, false).await;
+    assert!(!folder.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nothing_is_moved_aside_when_the_marker_cannot_be_written() {
+    let (_w, ana, project, files) = ana_with_project().await;
+    // A folder stands where the marker file should be: it can't be written.
+    let marker = quarantine_of(&ana.personal, &std::fs::canonicalize(&project).unwrap());
+    let mut name = marker.file_name().unwrap().to_owned();
+    name.push(".root");
+    let blocker = marker.with_file_name(name);
+    std::fs::create_dir_all(&blocker).unwrap();
+    std::fs::write(blocker.join("in the way"), b"x").unwrap();
+    ana.make(&project, "No marker").await.unwrap();
+    let status = done(&ana).await;
+    // Every file stayed where it was, and said so; the quarantine got nothing.
+    assert_eq!(status.kept, files.len() as u64, "{status:?}");
+    assert_eq!(files_under(&project), files);
+    assert!(!marker.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quarantine_with_an_empty_or_unsound_marker_is_left_alone_and_reported() {
+    let (_w, mut ana, project, _files) = ana_with_project().await;
+    let _ = ana.crash().await;
+    let canonical = std::fs::canonicalize(&project).unwrap();
+    let dir = quarantine_of(&ana.personal, &canonical);
+    write(&dir, "Shots/a.psd", b"must not go anywhere else");
+    let mut name = dir.file_name().unwrap().to_owned();
+    name.push(".root");
+    let marker = dir.with_file_name(name);
+    let here = std::env::current_dir().unwrap();
+    for text in ["", "relative/place", "C:\\elsewhere\\Craft"] {
+        std::fs::write(&marker, text).unwrap();
+        ana.run();
+        ana.ready().await;
+        let status = ana.work().await.expect("the quarantine is reported");
+        assert_eq!((status.step, status.failed_at), (FromFolderStep::Failed, Some(FromFolderStep::Trashing)), "{text:?}: {status:?}");
+        assert_eq!(std::fs::read(dir.join("Shots/a.psd")).unwrap(), b"must not go anywhere else", "{text:?}");
+        assert!(!here.join("Shots").exists() && !here.join("relative").exists(), "{text:?}: nothing was written outside");
+        let _ = ana.crash().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_old_message_about_files_that_could_not_be_put_back_goes_when_they_are() {
+    let (_w, mut ana, project, _files) = ana_with_project().await;
+    let personal = ana_personal(&ana).await;
+    let _ = ana.crash().await;
+    let status = FromFolderStatus {
+        folder: std::fs::canonicalize(&project).unwrap().display().to_string(),
+        name: "Stale".into(),
+        step: FromFolderStep::Failed,
+        space: Some(SpaceId::generate()),
+        team_folder: None,
+        done: 0,
+        total: 0,
+        failed_at: Some(FromFolderStep::Trashing),
+        message: Some("Some files could not be put back into the old folder and are kept in X. Move them back yourself; the agent tries again at its next start.".into()),
+        kept: 0,
+    };
+    let journal = serde_json::json!({ "schema": 1, "personal": personal, "status": status });
+    std::fs::write(ana.data.path().join("from-folder.json"), serde_json::to_vec(&journal).unwrap()).unwrap();
+    ana.run();
+    ana.ready().await;
+    let shown = ana.work().await.unwrap();
+    assert_eq!(shown.step, FromFolderStep::Interrupted, "{shown:?}");
+    assert!(shown.message.as_deref().is_some_and(|m| !m.contains("Move them back yourself")), "{shown:?}");
+}
+
+/// The personal space ID of the account on this computer.
+async fn ana_personal(ana: &Person) -> SpaceId {
+    let list = ana.api(|c| c.spaces()).await.unwrap();
+    list.spaces.into_iter().find(|s| s.kind == "personal").unwrap().space
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_journal_with_no_server_time_adopts_nothing() {
+    let (w, ana, project, files) = ana_with_project().await;
+    let name = |n: &str| SpaceName::new(n).unwrap();
+    w.meta.create_team_space(&SpaceActor::Cli, &name("Orphan"), w.ana.id, None, now_ms()).await.unwrap();
+    crashed_creating_journal(&ana, w.ana.space, &project, "Orphan", None);
+    let refused = ana.make(&project, "Orphan").await.unwrap_err();
+    assert_eq!(refused.code(), Some("conflict"), "{refused:?}");
+    untouched(&project, &files);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_that_cannot_be_looked_at_is_not_taken_for_gone() {
+    let (_w, mut ana, project, _files) = ana_with_project().await;
+    let _ = ana.crash().await;
+    // Not "not found": the path can't even be looked at (a NUL in it).
+    let status = FromFolderStatus {
+        folder: "/bad\0path".into(),
+        name: "Unreachable".into(),
+        step: FromFolderStep::Trashing,
+        space: Some(SpaceId::generate()),
+        team_folder: None,
+        done: 0,
+        total: 0,
+        failed_at: None,
+        message: None,
+        kept: 0,
+    };
+    let journal = serde_json::json!({ "schema": 1, "personal": SpaceId::generate(), "status": status });
+    // The journal must be this account's: read the personal space from a running agent first.
+    ana.run();
+    ana.ready().await;
+    let personal = ana_personal(&ana).await;
+    let _ = ana.crash().await;
+    let journal = serde_json::json!({ "schema": 1, "personal": personal, "status": journal["status"] });
+    std::fs::write(ana.data.path().join("from-folder.json"), serde_json::to_vec(&journal).unwrap()).unwrap();
+    ana.run();
+    ana.ready().await;
+    let shown = ana.work().await.unwrap();
+    assert_eq!((shown.step, shown.failed_at), (FromFolderStep::Interrupted, Some(FromFolderStep::Trashing)), "{shown:?}");
+    let _ = project;
 }

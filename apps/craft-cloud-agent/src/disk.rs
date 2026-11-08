@@ -315,7 +315,7 @@ pub fn folder_identity(dir: &Path) -> Option<FolderIdentity> {
 
 /// The ID of the file or folder at `path`, whose metadata (not following links) is `md`.
 #[cfg(unix)]
-fn local_id(md: &Metadata, _path: &Path) -> Option<u64> {
+pub(crate) fn local_id(md: &Metadata, _path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     Some(fold_file_id(FileId::new_inode(md.dev(), md.ino())))
 }
@@ -323,12 +323,12 @@ fn local_id(md: &Metadata, _path: &Path) -> Option<u64> {
 /// The ID of the file or folder at `path`. Windows metadata doesn't carry the file ID on stable Rust, so the
 /// `file-id` crate opens the entry (no data access, every share flag: it never blocks an app).
 #[cfg(windows)]
-fn local_id(_md: &Metadata, path: &Path) -> Option<u64> {
+pub(crate) fn local_id(_md: &Metadata, path: &Path) -> Option<u64> {
     file_id::get_file_id(path).ok().map(fold_file_id)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn local_id(_md: &Metadata, path: &Path) -> Option<u64> {
+pub(crate) fn local_id(_md: &Metadata, path: &Path) -> Option<u64> {
     file_id::get_file_id(path).ok().map(fold_file_id)
 }
 
