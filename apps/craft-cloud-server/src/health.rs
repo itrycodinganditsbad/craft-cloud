@@ -38,9 +38,20 @@ pub struct StoreHealth {
 impl StoreHealth {
     /// The last probe if it is younger than [`CACHE_FOR`], else a new one at `now_ms`. Never an error: a store that
     /// fails is `ok: false`.
-    pub async fn check(&self, store: &Store, now_ms: i64) -> StoreCheck {
+    ///
+    /// `root` is the disk store's directory: a store whose directory is gone answers "no such object" for every key, so
+    /// the probe also checks that the directory is there. `None` for S3 and memory.
+    pub async fn check(&self, store: &Store, root: Option<&std::path::Path>, now_ms: i64) -> StoreCheck {
         let key = BlobKey::chunk(&ChunkId::from_bytes([0; 32]));
-        self.run(store.stored_size(key), now_ms, CACHE_FOR, PROBE_TIMEOUT).await
+        let probe = async {
+            if let Some(root) = root
+                && !tokio::fs::metadata(root).await.is_ok_and(|meta| meta.is_dir())
+            {
+                return Err(StoreError::Backend("the store's directory is not there".into()));
+            }
+            store.stored_size(key).await
+        };
+        self.run(probe, now_ms, CACHE_FOR, PROBE_TIMEOUT).await
     }
 
     /// [`StoreHealth::check`] with the question as a future, and the times as arguments (the tests' seam). `probe` is
@@ -82,7 +93,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_store_that_says_no_such_object_is_fine() {
-        let check = StoreHealth::default().check(&Store::new(MemoryBackend::default()), 7).await;
+        let check = StoreHealth::default().check(&Store::new(MemoryBackend::default()), None, 7).await;
         assert_eq!(check, StoreCheck { ok: true, checked_ms: 7 });
     }
 

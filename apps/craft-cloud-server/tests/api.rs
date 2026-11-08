@@ -4423,7 +4423,8 @@ async fn the_server_overview_says_how_the_server_is() {
     let typed: craft_cloud_proto::api::AdminServerInfo = serde_json::from_value(info.clone()).unwrap();
     assert_eq!((typed.store_ok, typed.refusing_uploads, typed.database_ok), (Some(true), Some(false), Some(true)));
     // Fill the server: the overview says it refuses.
-    assert_eq!(put_chunk(&s, &ana, &[1u8; 60]).await, StatusCode::NO_CONTENT);
+    // 100 stored: not even one more byte fits, which is what "refusing" means in the overview.
+    assert_eq!(put_chunk(&s, &ana, &[1u8; 99]).await, StatusCode::NO_CONTENT);
     assert_eq!(put_chunk(&s, &ana, &[2u8; 60]).await, StatusCode::INSUFFICIENT_STORAGE);
     assert_eq!(overview(root).await["refusing_uploads"].as_bool(), Some(true));
     // A body from before the fields reads, with nothing in them.
@@ -4442,4 +4443,26 @@ async fn a_server_that_does_not_refuse_says_so_in_the_overview() {
     let root = login(&s, "root").await;
     let info: serde_json::Value = s.client.get(format!("{}/admin/server", s.base)).bearer_auth(&root).send().await.unwrap().json().await.unwrap();
     assert_eq!(info["refusing_uploads"].as_bool(), Some(false));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_disk_store_whose_directory_is_gone_is_not_ok() {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let db_file = db.path().join("meta.db");
+    let meta = Meta::open(&format!("sqlite:{}", db_file.display())).await.unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let info = craft_cloud_server::space::StorageInfo::new(None, Some(blobs.path().to_owned()), Some(db_file));
+    let state = AppState::new(meta.clone(), store, vec![]).unwrap().with_storage_info(info);
+    let blobs_path = blobs.path().to_owned();
+    let s = start_state(state, meta, vec![db], None).await;
+    add_admin(&s, "root").await;
+    let root = login(&s, "root").await;
+    std::fs::remove_dir_all(&blobs_path).unwrap();
+    drop(blobs);
+    let res = s.client.get(format!("{}/admin/server", s.base)).bearer_auth(&root).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "never an error page");
+    let info: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(info["store_ok"].as_bool(), Some(false), "{info}");
+    assert_eq!(info["database_ok"].as_bool(), Some(true));
 }

@@ -305,8 +305,8 @@ pub struct AdminServerInfo {
     /// When that probe ran, in milliseconds since the Unix epoch. The server keeps its answer for 30 seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_check_ms: Option<i64>,
-    /// Whether the server refuses new uploads now because it is full (`refuse_when_full` is on and the disk or the
-    /// capacity is used up). `false` when the setting is off.
+    /// Whether the server refuses new uploads now because it is full (`refuse_when_full` is on and even a smallest upload
+    /// would not fit: the disk is at its reserve or the store at its capacity). `false` when the setting is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusing_uploads: Option<bool>,
 }
