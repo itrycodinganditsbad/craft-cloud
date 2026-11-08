@@ -2740,7 +2740,7 @@ fn snapshot_overview_insights() {
     let paused = Status {
         run_state: RunState::Paused {
             reason: "server: The server is full; the admin needs to free space or raise its capacity".into(),
-            reason_code: None,
+            reason_code: Some("server_full".into()),
         },
         ..signed_in()
     };

@@ -19,7 +19,7 @@ pub fn sync_line(status: &Status) -> (String, Option<String>) {
         RunState::Retrying { message } if !status.online => (format!("Can't reach {server} — trying again"), Some(message.clone())),
         RunState::Retrying { message } => ("Syncing failed — trying again".into(), Some(message.clone())),
         // The server itself is full: not the account's quota, so the line says whose room has run out and who can fix it.
-        RunState::Paused { reason, .. } if server_is_full(reason) => {
+        RunState::Paused { reason, reason_code } if server_is_full(reason, reason_code.as_deref()) => {
             ("The server is full. Uploads wait until its admin frees space".into(), Some(reason.clone()))
         }
         RunState::Paused { reason, .. } => (super::problem_line(reason), Some(reason.clone())),
@@ -29,9 +29,17 @@ pub fn sync_line(status: &Status) -> (String, Option<String>) {
     }
 }
 
-/// Whether a pause says the server is full (the agent's words for `server_full`, which are not the account's quota).
-fn server_is_full(reason: &str) -> bool {
-    reason.contains("The server is full")
+/// The start of the agent's words for a pause by `server_full` ("The server is full; the admin needs to free space or raise
+/// its capacity"). An agent from before the code (`reason_code`) existed says it in these words alone.
+const SERVER_FULL_WORDS: &str = "The server is full";
+
+/// Whether a pause says the server is full, which is not the account's quota: by the agent's `reason_code` when it gives one
+/// (`server_full`, and not `quota_exceeded` or any other code), else by its words ([`SERVER_FULL_WORDS`]).
+fn server_is_full(reason: &str, reason_code: Option<&str>) -> bool {
+    match reason_code {
+        Some(code) => code == craft_cloud_proto::api::codes::SERVER_FULL,
+        None => reason.contains(SERVER_FULL_WORDS),
+    }
 }
 
 /// "1 conflict copy", "3 conflict copies" ("1000+" when the agent left older ones out).
@@ -430,15 +438,30 @@ mod tests {
 
     #[test]
     fn a_full_server_is_said_as_the_servers_not_the_accounts() {
-        let full = RunState::Paused { reason: "server: The server is full; the admin needs to free space or raise its capacity".into(), reason_code: None };
-        let (line, details) = sync_line(&status(true, full));
-        assert!(line.starts_with("The server is full") && !line.contains("account") && !line.contains("quota"), "{line}");
-        assert!(details.is_some_and(|d| d.contains("raise its capacity")));
-        let quota = RunState::Paused {
-            reason: "server: the account's storage on the server is full or nearly (10 of 10 bytes used); the admin can allow more".into(),
-            reason_code: None,
-        };
-        assert!(sync_line(&status(true, quota)).0.contains("account"));
+        let words = "server: The server is full; the admin needs to free space or raise its capacity";
+        assert!(words.contains(SERVER_FULL_WORDS));
+        // From an agent with the code, and from an older one that has only the words.
+        for reason_code in [Some("server_full".to_owned()), None] {
+            let full = RunState::Paused { reason: words.into(), reason_code };
+            let (line, details) = sync_line(&status(true, full));
+            assert!(line.starts_with("The server is full") && !line.contains("account") && !line.contains("quota"), "{line}");
+            assert!(details.is_some_and(|d| d.contains("raise its capacity")));
+        }
+        let quota_words = "server: the account's storage on the server is full or nearly (10 of 10 bytes used); the admin can allow more";
+        for reason_code in [Some("quota_exceeded".to_owned()), None] {
+            let quota = RunState::Paused { reason: quota_words.into(), reason_code };
+            assert!(sync_line(&status(true, quota)).0.contains("account"));
+        }
+    }
+
+    /// The code decides when there is one: its words may change, and a code that is not `server_full` is not it.
+    #[test]
+    fn the_code_is_matched_before_the_words() {
+        assert!(server_is_full("whatever the agent says now", Some("server_full")));
+        assert!(!server_is_full("The server is full; the admin needs to free space", Some("quota_exceeded")));
+        assert!(!server_is_full("The server is full; the admin needs to free space", Some("something_new")));
+        assert!(server_is_full("server: The server is full; the admin needs to free space", None));
+        assert!(!server_is_full("the folder is missing", None));
     }
 
     #[test]
