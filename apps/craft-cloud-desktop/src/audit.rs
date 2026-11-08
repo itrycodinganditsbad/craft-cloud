@@ -418,6 +418,20 @@ pub fn action_label(action: &str) -> &str {
         "cli.device_revoked" => "Computer signed out on the server",
         "cli.devices_revoked_all" => "Every computer signed out on the server",
         "cli.user_removed" => "Account removed on the server",
+        "space.created" => "Team space created",
+        "space.renamed" => "Team space renamed",
+        "space.archived" => "Team space archived",
+        "space.unarchived" => "Team space brought back",
+        "space.quota_changed" => "Team space limit changed",
+        "space.member_invited" => "Invited to a team space",
+        "space.member_joined" => "Joined a team space",
+        "space.member_declined" => "Declined an invitation to a team space",
+        "space.member_role_changed" => "Role in a team space changed",
+        "space.member_removed" => "Removed from a team space",
+        "space.member_left" => "Left a team space",
+        "cli.space_created" => "Team space created on the server",
+        "cli.space_member_changed" => "Team space member changed on the server",
+        "cli.space_archived" => "Team space archived on the server",
         other => other,
     }
 }
@@ -430,6 +444,7 @@ pub fn filter_label(filter: &str) -> String {
         "account." => "Account changes".to_owned(),
         "admin." => "Admin changes".to_owned(),
         "join." => "Joining".to_owned(),
+        "space." => "Team spaces".to_owned(),
         "cli." => "Server command line".to_owned(),
         name => action_label(name).to_owned(),
     }
@@ -437,7 +452,7 @@ pub fn filter_label(filter: &str) -> String {
 
 /// The groups of the filter, then every name: the closed list the server filters by.
 pub fn filter_choices() -> Vec<&'static str> {
-    let mut choices = vec!["auth.", "device.", "account.", "admin.", "join.", "cli."];
+    let mut choices = vec!["auth.", "device.", "account.", "admin.", "join.", "space.", "cli."];
     choices.extend(craft_cloud_app::AUDIT_ACTIONS);
     choices
 }
@@ -622,7 +637,7 @@ pub(crate) mod tests {
         assert_eq!(view(&model).filter.action, None);
         // Every choice the page offers is one the server takes.
         assert!(filter_choices().iter().all(|c| craft_cloud_app::valid_audit_action(c)));
-        assert_eq!(filter_choices().len(), 37);
+        assert_eq!(filter_choices().len(), 52);
         assert_eq!(action_label("auth.login"), "Signed in");
         assert_eq!(action_label("something.new"), "something.new");
         assert_eq!(filter_label("auth."), "Sign-ins");
@@ -636,6 +651,8 @@ pub(crate) mod tests {
             assert_ne!(action_label(action), action, "{action} shows raw");
         }
         assert_eq!(action_label("admin.compression_changed"), "Compression level changed");
+        assert_eq!(action_label("space.member_invited"), "Invited to a team space");
+        assert_eq!(filter_label("space."), "Team spaces");
     }
 
     #[test]

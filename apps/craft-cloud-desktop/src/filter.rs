@@ -24,11 +24,13 @@ pub enum ActivityKind {
     Account,
     /// `admin.` and `cli.`: what an admin or the server's command line did.
     Admin,
+    /// `space.`: team spaces created, renamed, archived, and their members invited, changed, removed or gone.
+    TeamSpaces,
 }
 
 impl ActivityKind {
     /// The choices, in the order the menu lists them.
-    pub const ALL: [ActivityKind; 5] = [Self::All, Self::SignIn, Self::Computers, Self::Account, Self::Admin];
+    pub const ALL: [ActivityKind; 6] = [Self::All, Self::SignIn, Self::Computers, Self::Account, Self::TeamSpaces, Self::Admin];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -37,6 +39,7 @@ impl ActivityKind {
             Self::Computers => "Computers",
             Self::Account => "Account",
             Self::Admin => "Admin",
+            Self::TeamSpaces => "Team spaces",
         }
     }
 
@@ -49,6 +52,7 @@ impl ActivityKind {
             Self::Computers => group(&["device.", "join."]),
             Self::Account => group(&["account."]),
             Self::Admin => group(&["admin.", "cli."]),
+            Self::TeamSpaces => group(&["space."]),
         }
     }
 }
