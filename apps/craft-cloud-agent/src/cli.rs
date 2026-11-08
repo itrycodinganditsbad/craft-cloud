@@ -1160,7 +1160,7 @@ fn hold_folder(folder: &Path) -> Result<Lock, AgentError> {
 }
 
 /// Whether `folder` holds anything besides the agent's own folder.
-fn has_files(folder: &Path) -> Result<bool, AgentError> {
+pub(crate) fn has_files(folder: &Path) -> Result<bool, AgentError> {
     for entry in std::fs::read_dir(folder).map_err(io_at(folder))? {
         let entry = entry.map_err(io_at(folder))?;
         if entry.file_name() != AGENT_DIR {
@@ -1197,7 +1197,7 @@ fn resolved(path: &Path) -> PathBuf {
 
 /// Whether one of the two paths lies inside the other (or they are the same), as the OS resolves them. Names are
 /// compared ignoring case on Windows and macOS, whose filesystems usually do.
-fn nested(a: &Path, b: &Path) -> bool {
+pub(crate) fn nested(a: &Path, b: &Path) -> bool {
     let (a, b) = (folded(&resolved(a)), folded(&resolved(b)));
     a.starts_with(&b) || b.starts_with(&a)
 }
@@ -1234,7 +1234,7 @@ fn check_private_place(data: &DataDir, local_app_data: Option<&Path>) -> Result<
 
 /// Refuses a synced folder and a data folder that lie inside one another: the data folder holds the device token,
 /// which would then be synced (or the synced folder would sync the agent's own state).
-fn check_apart(data: &DataDir, folder: &Path) -> Result<(), AgentError> {
+pub(crate) fn check_apart(data: &DataDir, folder: &Path) -> Result<(), AgentError> {
     if nested(data.path(), folder) {
         return Err(AgentError::DataInFolder { data: resolved(data.path()), folder: resolved(folder) });
     }
@@ -1430,6 +1430,7 @@ async fn set_up(data: &DataDir, server: &ServerUrl, signed_in: LoginResponse, pr
             space: marker.space,
             root: marker.root,
             token,
+            spaces: Vec::new(),
         };
         data.remove_state()?;
         data.save_account(&account)?;
@@ -1620,7 +1621,12 @@ fn approve_for_loop(data: &DataDir, approve: &Approve, out: &mut impl Write) -> 
 /// lock. The caller holds the data folder's lock for as long as the session lives. One-off `sync` opens one for one
 /// pass; the `run` loop keeps one for many (so the stability window's looks carry over between passes).
 pub struct Session {
+    /// Where `state.json` is: the data folder, or a team space's own folder in it (`spaces/<id>/`).
     data: DataDir,
+    /// The agent's data folder (the synced folder must lie apart from it).
+    root: DataDir,
+    /// The space is a team space: the transport is bound to it, and the server must speak team spaces.
+    bound: bool,
     account: Account,
     engine: Engine<DiskFs, HttpTransport>,
     /// The last pass's outcome, also written with every checkpoint (so it is shared with the checkpoint closure).
@@ -1644,7 +1650,30 @@ impl Session {
             data.clean_tmp()?;
         }
         let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
-        check_apart(data, &account.folder)?;
+        Self::open_in(data, data, account, false, stability)
+    }
+
+    /// Opens a team space's folder for passes: as [`Session::open`], with the space's own state in `spaces/<id>/`, its
+    /// root marker, and a transport bound to the space (every request names it, every answer must echo it). `account`
+    /// is the signed-in account; the space's folder and root are `setting`'s.
+    pub fn open_team(
+        data: &DataDir,
+        account: &Account,
+        setting: &crate::account::SpaceSetting,
+        stability: Option<Stability>,
+    ) -> Result<Self, AgentError> {
+        let root = setting
+            .root
+            .ok_or_else(|| AgentError::NeedsYou("the server hasn't said where this team space starts yet; it is asked again soon".into()))?;
+        let state = data.space_dir(setting.space);
+        state.create()?;
+        state.clean_tmp()?;
+        let team = Account { folder: setting.folder.clone(), space: setting.space, root, spaces: Vec::new(), ..account.clone() };
+        Self::open_in(data, &state, team, true, stability)
+    }
+
+    fn open_in(root_data: &DataDir, data: &DataDir, account: Account, bound: bool, stability: Option<Stability>) -> Result<Self, AgentError> {
+        check_apart(root_data, &account.folder)?;
         root::check(&account.folder, &RootMarker { space: account.space, root: account.root })?;
         let folder_lock = hold_folder(&account.folder)?;
         let mut saved = data.load_state()?;
@@ -1660,10 +1689,11 @@ impl Session {
         }
         fs.clean_tmp().map_err(io_at(&fs.tmp_dir()))?;
         let transport = HttpTransport::new(account.server.clone(), &account.token)?;
+        let transport = if bound { transport.bound_to(account.space)? } else { transport };
         let config = Config::new(account.device_name.clone(), account.device);
         let mut engine = Engine::new(fs, transport, std::mem::take(&mut saved.state), config, conflict_stamp)?;
         // What Craft apps saved from live documents (their local API's `saved`): see `live::saves`.
-        engine.set_save_records(std::sync::Arc::new(crate::live::saves::SaveBook::new(data.path(), account.space)));
+        engine.set_save_records(std::sync::Arc::new(crate::live::saves::SaveBook::new(root_data.path(), account.space)));
         // `state.json` is also written at the pass's checkpoints, so a crash or a kill loses at most what the pass did
         // since the last one (the last pass's outcome stays as it was until this one ends).
         let last_pass = std::sync::Arc::new(std::sync::Mutex::new(saved.last_pass));
@@ -1673,11 +1703,26 @@ impl Session {
             let saved = SavedState { schema: STATE_SCHEMA, state: state.clone(), last_pass, paused: false };
             checkpoint_data.save_state(&saved).map_err(|e| std::io::Error::other(e.to_string()))
         });
-        Ok(Self { data: data.clone(), account, engine, last_pass, _folder_lock: folder_lock, stability, recheck_in: None })
+        Ok(Self {
+            data: data.clone(),
+            root: root_data.clone(),
+            bound,
+            account,
+            engine,
+            last_pass,
+            _folder_lock: folder_lock,
+            stability,
+            recheck_in: None,
+        })
     }
 
     pub fn account(&self) -> &Account {
         &self.account
+    }
+
+    /// Tells the engine the account is a viewer here (or not): see `Engine::set_read_only`.
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.engine.set_read_only(read_only);
     }
 
     /// The engine's state (its `seq` is where the change feed was read to).
@@ -1703,7 +1748,7 @@ impl Session {
     /// saved, whether the pass finished or not. The folder and its marker are checked first: the folder may have
     /// gone since the session opened (a drive unmounted while the loop runs).
     pub async fn pass(&mut self, approve: Vec<NodeId>) -> Result<PassSummary, AgentError> {
-        check_apart(&self.data, &self.account.folder)?;
+        check_apart(&self.root, &self.account.folder)?;
         root::check(&self.account.folder, &RootMarker { space: self.account.space, root: self.account.root })?;
         if !approve.is_empty() {
             self.engine.approve_deletes_of(approve);
@@ -1712,7 +1757,15 @@ impl Session {
         // The server is asked what it speaks before every pass (it may have been updated since the last one); a
         // mismatch fails the pass like any other server answer, so it is saved and shown by `status`.
         let compatible = match http::info(&self.account.server).await {
-            Ok(info) => http::check_compatible(&info),
+            Ok(info) => http::check_compatible(&info).and_then(|()| {
+                // A team space is only ever asked of a server that does team spaces: no `craft-space` header goes to an
+                // older one.
+                if self.bound && info.protocol_max < crate::spaces::TEAM_PROTOCOL {
+                    Err(TransportError::Protocol(crate::spaces::NEEDS_UPDATE.into()))
+                } else {
+                    Ok(())
+                }
+            }),
             Err(e) => Err(e),
         };
         let started = self.stability.as_ref().map(Stability::now);

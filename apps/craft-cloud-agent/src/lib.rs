@@ -25,4 +25,5 @@ pub mod root;
 pub mod runlog;
 pub mod schedule;
 pub mod settle;
+pub mod spaces;
 pub mod watch;

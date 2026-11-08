@@ -35,6 +35,7 @@ fn signed_in() -> Status {
         autostart: Some(true),
         last_sync_ms: Some(NOW - 120_000),
         removed: false,
+        spaces: Vec::new(),
     }
 }
 

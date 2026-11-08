@@ -37,8 +37,8 @@ use bytes::{Bytes, BytesMut};
 use craft_cloud_proto::api::{
     AccountInfo, ChangePasswordRequest, CommitRequest, CommitResponse, DeviceInfo, ErrorBody, HistoryResponse, InfoResponse, JoinRequest,
     LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, PairingCreated, PairingStatus,
-    RecoveryCodes, RenameDeviceRequest, RestoreRequest, RestoreResponse, RevokedOthers, SecondFactorRequest, SpaceResponse, TwoFactorChallenge,
-    TwoFactorConfirmRequest, TwoFactorProofRequest, TwoFactorSetupRequest, TwoFactorSetupResponse, TwoFactorStatus, codes,
+    RecoveryCodes, RenameDeviceRequest, RestoreRequest, RestoreResponse, RevokedOthers, SecondFactorRequest, SpaceList, SpaceListItem, SpaceResponse,
+    TwoFactorChallenge, TwoFactorConfirmRequest, TwoFactorProofRequest, TwoFactorSetupRequest, TwoFactorSetupResponse, TwoFactorStatus, codes,
 };
 use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_PAGE_NODES};
 use craft_cloud_proto::local::MAX_MACHINE_BYTES;
@@ -820,8 +820,29 @@ pub struct HttpTransport<C = Reqwest> {
     connection: C,
     server: ServerUrl,
     auth: HeaderValue,
-    /// The team space every request works on (`craft-space`); `None`: the account's personal space, as before.
+    /// The team space every request works on (`craft-space`); `None`: the account's personal space, as before. Every
+    /// answer that the server's space layer gives must echo it ([`TOO_OLD_FOR_TEAM_SPACES`]).
     space: Option<HeaderValue>,
+}
+
+/// What the agent says when a server answers a request for a team space without echoing the space, or with another one:
+/// it is a server from before team spaces (it ignored the `craft-space` header and answered about the personal space).
+/// The space stops syncing with this message, so two trees are never mixed.
+pub const TOO_OLD_FOR_TEAM_SPACES: &str = "the server is too old for team spaces; ask the administrator to update it";
+
+/// Whether an answer to a request for team space `asked` carries the echo the server's space layer adds to every answer
+/// it produces (`craft-space` with the space it worked on). Checked on the answers that the layer or the handler behind it
+/// gives (success, `403`, `404`, `409`, `410`); a `400`, `401` or `429` can come from before the layer (or from a proxy in
+/// front of the server) and carries none.
+fn echoed(asked: &HeaderValue, answer: &Answer) -> Result<(), TransportError> {
+    let layered = answer.status.is_success() || matches!(answer.status.as_u16(), 403 | 404 | 409 | 410);
+    if !layered {
+        return Ok(());
+    }
+    match answer.headers.get(HeaderName::from_static("craft-space")) {
+        Some(echo) if echo.as_bytes().eq_ignore_ascii_case(asked.as_bytes()) => Ok(()),
+        _ => Err(TransportError::Protocol(TOO_OLD_FOR_TEAM_SPACES.into())),
+    }
 }
 
 /// A history or restore refusal, retaining the server's HTTP status and stable error code.
@@ -945,7 +966,11 @@ impl<C: Connection> HttpTransport<C> {
         if let Some(space) = &self.space {
             req.headers.insert(HeaderName::from_static("craft-space"), space.clone());
         }
-        self.connection.send(req).await
+        let answer = self.connection.send(req).await?;
+        if let Some(space) = &self.space {
+            echoed(space, &answer)?;
+        }
+        Ok(answer)
     }
 
     fn page_request(&self, path: &str, since: Option<u64>, after: Option<PageCursor>) -> Request {
@@ -1066,6 +1091,22 @@ impl<C: Connection> HttpTransport<C> {
     /// Revokes a device of this account (this one, to sign out).
     pub async fn revoke(&self, device: DeviceId) -> Result<(), TransportError> {
         self.no_content(self.request(Method::DELETE, &format!("devices/{device}"), 0)).await
+    }
+
+    /// `GET /spaces`: the personal space and the team spaces of the account, invitations among them. A server from before
+    /// team spaces answers `404` here (a refusal with that status, or `NotFound`).
+    pub async fn spaces(&self) -> Result<SpaceList, CallError> {
+        self.account_call(self.request(Method::GET, "spaces", MAX_SMALL_JSON_BYTES)).await
+    }
+
+    /// `POST /spaces/{id}/accept`: the space as `GET /spaces` lists it.
+    pub async fn accept_space(&self, space: SpaceId) -> Result<SpaceListItem, CallError> {
+        self.account_call(self.request(Method::POST, &format!("spaces/{space}/accept"), MAX_SMALL_JSON_BYTES)).await
+    }
+
+    /// `POST /spaces/{id}/decline`.
+    pub async fn decline_space(&self, space: SpaceId) -> Result<(), CallError> {
+        self.account_unit(self.request(Method::POST, &format!("spaces/{space}/decline"), MAX_SMALL_JSON_BYTES)).await
     }
 
     /// The account's devices, this one marked `current`.

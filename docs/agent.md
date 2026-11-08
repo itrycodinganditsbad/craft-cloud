@@ -182,3 +182,45 @@ live on this machine. A missing hint does not fail the request.
 A successful restore asks the agent for a normal sync pass; it never writes files directly. Removing an item only
 marks it out of the trash. It cannot be restored from the trash afterward, but stored space is not freed yet. Server
 HTTP status and error code are preserved; a server `401 unauthorized` becomes local `409 needs_you`.
+
+## Team spaces
+
+The running agent syncs the personal space as ever, and any team space the person turns on. Everything below is off for
+a server that speaks HTTP protocol 1 (before team spaces): the agent asks that server about its version only, sends no
+`craft-space` header, and lists no team space.
+
+- **Which spaces.** `GET /spaces` is asked at the start, then every two long-poll waits, and at once after an invitation is
+  accepted or declined here or a space answers `404`. A failed look changes nothing.
+- **Folders.** A team space syncs to `Craft Cloud Shared/<name>/`, a folder beside the personal one (so synced folders never
+  nest). The name is the space's name with what a file name can't hold made `_`; a name that is taken, by another space or
+  by a folder that is already there, gets ` (2)`, ` (3)`. The folder is chosen when the space is first seen and kept when
+  the space is renamed on the server. Each folder has its own root marker (`.craft-cloud/root.json`).
+- **State.** `account.json` gains `spaces: [{space, folder, sync, name, root}]` (left out while there are none, so a data
+  folder from before team spaces is not rewritten). Each synced team space keeps `spaces/<space id>/state.json` in the
+  data folder; the personal space's files stay where they were.
+- **Off by default.** An accepted space does not sync until `POST /v1/spaces/{id}/sync` with `{"on": true}` (optionally
+  `folder`, an absolute path that lies outside every synced folder and the data folder, and `adopt` for a folder that already
+  has files: what differs from the space's becomes conflict copies, nothing is deleted).
+- **One engine per space.** Each synced space has its own session (state, root, marker, guards), scheduler, folder watcher
+  and long-poll, over a transport bound to the space. Passes run one at a time across all spaces. A problem in one space
+  never pauses another or the personal space. `pause`, `resume` and `quit` apply to every space.
+- **The echo.** Every answer for a team space must carry `craft-space` with that space (success, `403`, `404`, `409`, `410`).
+  A missing or different one stops that space with "the server is too old for team spaces": a server that ignored the header
+  would otherwise answer about the personal space.
+- **Read-only.** A role of viewer, or an archived space, puts the space's engine in read-only mode (see the sync design,
+  "Read-only spaces"); `read_only` in the space's entry says so.
+- **Losing access.** A space the server no longer lists, or answers `404`, stops syncing and shows
+  `run_state: {"kind": "no_access"}` with "You no longer have access to <name>. Your local copy is kept and no longer
+  syncs." Nothing in its folder is touched or deleted, and its state is kept. If the account is added again the sync starts
+  again and reconciles without replacing or deleting a local file.
+
+| Local call | Answer |
+| --- | --- |
+| `GET /v1/spaces` | `{spaces: [{space, kind, name?, role, state, archived, folder?, sync, run_state?, last_sync_ms?, read_only}]}`: the personal space first, then the team spaces, invitations (`state: "invited"`, no folder) among them. `sync` is `on`, `off` or `unavailable` |
+| `POST /v1/spaces/{id}/accept` | the server's answer: the space as it lists it |
+| `POST /v1/spaces/{id}/decline` | 204 |
+| `POST /v1/spaces/{id}/sync` | `{on, folder?, adopt?}` → the space as `GET /v1/spaces` lists it |
+| `GET /v1/status` | gains `spaces: [{space, run_state, last_sync_ms?, read_only}]`, one per synced space or one that lost access; the top-level fields describe the personal space |
+
+Accept and decline are passed on to the server, which decides; its refusals keep their status and code. An agent from before
+team spaces answers these calls with `not_found` ("no such call"), which `craft-cloud-app` reports as `agent_too_old`.

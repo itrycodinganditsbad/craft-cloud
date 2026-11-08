@@ -28,6 +28,8 @@ use crate::http::{DeviceToken, ServerUrl};
 
 pub const ACCOUNT_FILE: &str = "account.json";
 pub const STATE_FILE: &str = "state.json";
+/// The data folder's folder of the team spaces' own state, one folder per space.
+pub const SPACES_DIR: &str = "spaces";
 /// What the `run` loop is doing ([`LoopStatus`]), next to `state.json`.
 pub const STATUS_FILE: &str = "status.json";
 /// An approval handed to the running loop ([`Approval`]).
@@ -86,6 +88,28 @@ pub struct Account {
     pub space: SpaceId,
     pub root: NodeId,
     pub token: DeviceToken,
+    /// The team spaces this computer knows (appended in a later format of the same file: an agent from before team
+    /// spaces ignores it, and a file without it has none). Left out of the file while there is none, so an installation
+    /// that never saw a team space keeps its `account.json` byte for byte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spaces: Vec<SpaceSetting>,
+}
+
+/// What this computer remembers of one team space (`account.json`, `spaces`): where it syncs, whether it does, and what
+/// the server last called it. Its state lives in `spaces/<id>/state.json` of the data folder.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceSetting {
+    pub space: SpaceId,
+    /// The space's folder (absolute); it keeps its name when the space is renamed on the server.
+    pub folder: PathBuf,
+    /// Whether the space syncs on this computer. A team space starts with syncing off.
+    pub sync: bool,
+    /// The name the server last gave the space, to say which one lost access when the server no longer lists it.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The space's root, as the server listed it: what the folder's marker names.
+    #[serde(default)]
+    pub root: Option<NodeId>,
 }
 
 /// How a pass ended.
@@ -388,6 +412,11 @@ impl DataDir {
 
     pub fn path(&self) -> &Path {
         &self.0
+    }
+
+    /// The place of a team space's own `state.json` and `status.json`: `spaces/<space id>/` (not created).
+    pub fn space_dir(&self, space: SpaceId) -> DataDir {
+        DataDir(self.0.join(SPACES_DIR).join(space.to_string()))
     }
 
     fn file(&self, name: &str) -> PathBuf {
@@ -740,6 +769,7 @@ mod tests {
             space: SpaceId::generate(),
             root: NodeId::generate(),
             token: DeviceToken::new("tok".into()),
+            spaces: Vec::new(),
         }
     }
 
@@ -763,6 +793,32 @@ mod tests {
         assert_eq!(data.load_account().unwrap(), None);
         // No temporary files left behind.
         assert_eq!(fs::read_dir(data.path()).unwrap().count(), 0);
+    }
+
+    /// An `account.json` from before team spaces has no `spaces` and is written back without one; team spaces round-trip,
+    /// and each has its own place for state.
+    #[test]
+    fn team_spaces_are_appended_to_the_account_and_left_out_while_there_are_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path().join("data"));
+        let mut acc = account(dir.path());
+        data.save_account(&acc).unwrap();
+        let written = fs::read_to_string(dir.path().join("data/account.json")).unwrap();
+        assert!(!written.contains("spaces"), "{written}");
+        assert_eq!(data.load_account().unwrap().unwrap().spaces, Vec::new());
+        let setting = SpaceSetting {
+            space: SpaceId::generate(),
+            folder: dir.path().join("Craft Cloud Shared").join("Studio"),
+            sync: false,
+            name: Some("Studio".into()),
+            root: Some(NodeId::generate()),
+        };
+        acc.spaces.push(setting.clone());
+        data.save_account(&acc).unwrap();
+        assert_eq!(data.load_account().unwrap().unwrap().spaces, vec![setting.clone()]);
+        let sub = data.space_dir(setting.space);
+        assert_eq!(sub.path(), dir.path().join("data").join("spaces").join(setting.space.to_string()));
+        assert_eq!(sub.load_state().unwrap().state.space, None, "no state yet");
     }
 
     /// Only the data folder is owner-only: missing folders above it are made as any program makes them.
