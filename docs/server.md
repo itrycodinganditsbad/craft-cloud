@@ -216,12 +216,18 @@ allow the call is `403 read_only`. The server reads the role from the database o
 
 ## The admin pages in the browser
 
-The server can serve admin pages: users, invites and reset codes, a user's devices, the audit log and its download, in
+The server can serve admin pages: users, invites and reset codes, a user's devices, team spaces, the audit log and its download, in
 plain server-rendered HTML (no script, no Node, nothing to build). They are **off by default** and only administrators can
 sign in. They do the same things as the admin API with the same confirmation (your password again for every change, and a
 code when your account has two-factor sign-in).
 The Craft Cloud desktop app also has admin storage views: a server overview with quota and manifest-index summaries,
 and per-account usage details. Both use the authenticated admin API; members do not see admin pages.
+
+The **Team spaces** page lists the team spaces (name, owners, members, use against the limit, active or archived) with a search
+and paging like the accounts page, makes a space with its first owner, and has a page for each space: its members and roles (read
+only), its limit, archive and unarchive, and naming an owner. Every change asks for the same confirmation as the others, acts as
+the signed-in administrator in the audit log (no device), and wakes the space's long-polls like the admin API's routes. Members
+of a space are managed by its owners in the Craft Cloud app, not here.
 
 ```toml
 public_url = "https://cloud.example.org"   # the address of the pages, https, no path

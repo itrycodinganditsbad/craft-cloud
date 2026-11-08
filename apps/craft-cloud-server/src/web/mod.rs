@@ -33,6 +33,7 @@
 
 mod html;
 mod pages;
+mod team;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -664,6 +665,12 @@ pub fn routes(state: Shared) -> Router<Shared> {
         .route("/users/{id}/password-reset", post(pages::issue_reset))
         .route("/users/{id}/reset-two-factor", post(pages::reset_two_factor))
         .route("/users/{id}/devices/{device}/revoke", post(pages::revoke_device))
+        .route("/spaces", get(team::spaces).post(team::create_space))
+        .route("/spaces/{id}", get(team::space))
+        .route("/spaces/{id}/quota", post(team::set_quota))
+        .route("/spaces/{id}/archive", post(team::archive))
+        .route("/spaces/{id}/unarchive", post(team::unarchive))
+        .route("/spaces/{id}/owner", post(team::set_owner))
         .route("/audit", get(pages::audit))
         .route("/audit/export", get(pages::audit_export))
         .fallback(no_such_page)

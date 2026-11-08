@@ -27,21 +27,25 @@ use crate::state::AppState;
 
 /// Events one page of the audit log holds.
 const AUDIT_PAGE: u32 = 50;
-const MIB: u64 = 1024 * 1024;
+pub(super) const MIB: u64 = 1024 * 1024;
 
 /// Every field any form of the pages has; a form sends the few it needs and the rest stay empty.
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub(super) struct ActionForm {
-    csrf: String,
-    password: String,
-    totp_code: String,
-    recovery_code: String,
-    username: String,
-    role: String,
-    quota_mib: String,
-    remove_quota: String,
-    reset_two_factor: String,
+    pub(super) csrf: String,
+    pub(super) password: String,
+    pub(super) totp_code: String,
+    pub(super) recovery_code: String,
+    pub(super) username: String,
+    pub(super) role: String,
+    pub(super) quota_mib: String,
+    pub(super) remove_quota: String,
+    pub(super) reset_two_factor: String,
+    /// A team space's name (the Team spaces page).
+    pub(super) name: String,
+    /// The account name of a team space's owner (the Team spaces page).
+    pub(super) owner: String,
 }
 
 impl std::fmt::Debug for ActionForm {
@@ -80,7 +84,7 @@ fn notice_html(key: Option<&str>) -> String {
     notice_text(key).map(|text| notice(text, false)).unwrap_or_default()
 }
 
-fn ok_page(ctx: &Ctx, title: &str, body: &str) -> Response {
+pub(super) fn ok_page(ctx: &Ctx, title: &str, body: &str) -> Response {
     html_response(StatusCode::OK, &page(Some(ctx), title, body))
 }
 
@@ -89,7 +93,7 @@ fn user_href(id: UserId) -> String {
 }
 
 /// Whether the admin's own account has two-factor sign-in, which decides whether the forms ask for a code.
-async fn asks_for_code(state: &AppState, authed: &Authed) -> Result<bool, WebError> {
+pub(super) async fn asks_for_code(state: &AppState, authed: &Authed) -> Result<bool, WebError> {
     Ok(state.meta.two_factor_enabled(authed.session.user).await?)
 }
 
@@ -162,6 +166,8 @@ pub(super) async fn overview(State(state): State<Shared>, request: Request) -> R
     row("Second factor at sign-in", authed.session.mfa_verified_ms.map_or_else(|| "not asked".to_owned(), fmt_time));
     body.push_str("</dl><p>");
     body.push_str(&link("/web/users", "Manage users"));
+    body.push_str(" &middot; ");
+    body.push_str(&link("/web/spaces", "Manage team spaces"));
     body.push_str(" &middot; ");
     body.push_str(&link("/web/audit", "Read the audit log"));
     body.push_str("</p>");
@@ -247,7 +253,7 @@ pub(super) async fn users(State(state): State<Shared>, request: Request) -> Resu
 }
 
 /// The cursor of the JSON list (the last username of a page, in base64url), which `decode_cursor` reads back.
-fn base64_cursor(username: &str) -> String {
+pub(super) fn base64_cursor(username: &str) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(username.as_bytes())
 }
@@ -409,7 +415,7 @@ pub(super) async fn user(State(state): State<Shared>, Path(id): Path<String>, re
 // ---- changes ----
 
 /// The start of every change: the session, the form, its CSRF token, in that order.
-async fn begin(state: &AppState, request: Request) -> Result<(Authed, ActionForm), WebError> {
+pub(super) async fn begin(state: &AppState, request: Request) -> Result<(Authed, ActionForm), WebError> {
     let authed = authenticate(state, request.headers()).await?;
     let form: ActionForm = read_form(state, request).await?;
     authed.check_csrf(&form.csrf)?;
@@ -418,7 +424,7 @@ async fn begin(state: &AppState, request: Request) -> Result<(Authed, ActionForm
 
 /// The acting admin after their confirmation, which is the JSON routes' ([`confirm_actor`]): `400` for a missing password,
 /// `403` for a wrong password or code, `429` for the limits.
-async fn actor(state: &AppState, authed: &Authed, form: &ActionForm) -> Result<AdminActor, WebError> {
+pub(super) async fn actor(state: &AppState, authed: &Authed, form: &ActionForm) -> Result<AdminActor, WebError> {
     let some = |text: &str| if text.is_empty() { None } else { Some(text.to_owned()) };
     let given = Confirmation::new(some(&form.password), some(&form.totp_code), some(&form.recovery_code));
     let via = AdminVia::Web { id_hash: authed.hash, idle_ms: state.web.as_ref().map_or(0, |web| web.idle_ms) };
