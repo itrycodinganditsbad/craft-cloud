@@ -1637,7 +1637,7 @@ mod tests {
         run(&mut model, &agent, msg(SpacesMsg::Retry));
         assert_eq!(shared(&model).find(id).unwrap().sync, SpaceSync::On);
         assert!(shared(&model).retry.is_none() && shared(&model).offer.is_none());
-        assert_eq!(agent.team.lock().unwrap().syncs.len(), 2, "the request went out twice");
+        assert_eq!(agent.team.lock().unwrap().syncs.len(), 1, "the refused request was not carried out; the retry was");
         // Stopping: the words show on the space's page, and Try again stops it.
         agent.team.lock().unwrap().fails.push(changing());
         run(&mut model, &agent, msg(SpacesMsg::SyncOff(id)));
