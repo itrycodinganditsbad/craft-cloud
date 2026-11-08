@@ -127,6 +127,8 @@ pub enum DocOut {
     Members { id: u64, members: Arc<Vec<DocMember>> },
     /// How the document stands now.
     Status { doc: DocId, online: bool, waiting: u64, deleted: bool, stopped: bool },
+    /// The account may (`read_only: false`) or may not change the document's space any more (a role change, an archive).
+    Role { doc: DocId, read_only: bool },
     /// The record of the document's file as it is on disk now (the live document's frontiers it was saved from).
     File { doc: DocId, frontiers: Option<Vec<(u64, u32)>> },
 }
@@ -174,6 +176,13 @@ pub enum DocsCall {
         bytes: Vec<u8>,
     },
     Presence {
+        conn: ConnId,
+        id: u64,
+        bytes: Vec<u8>,
+    },
+    /// A change the app made as a viewer and hands over because it ends: kept in the document's journal (not acked), sent
+    /// to the server only once the account may write.
+    Hold {
         conn: ConnId,
         id: u64,
         bytes: Vec<u8>,
@@ -451,6 +460,8 @@ struct Docs {
     importer: BTreeMap<DocId, (ConnId, u64)>,
     lookups: Vec<Lookup>,
     told: BTreeMap<DocId, (bool, u64, bool, bool)>,
+    /// Whether the apps were last told the space is read-only for the account (none: not looked at yet).
+    told_role: Option<bool>,
     /// Opens not answered yet: the hash (hex) of the file each read, and whether it wants identity.
     opens: HashMap<(ConnId, u64), Wish>,
     /// Each open document's file as last looked at: its length and modification time then, its content's hash, and
@@ -1173,6 +1184,17 @@ impl State {
             docs
         };
         self.docs.told.retain(|doc, _| open.contains(doc));
+        // The right to change the space: told to every open document when it changes (`opened` said it as of the open).
+        let read_only = self.replica.read_only();
+        if self.docs.told_role.replace(read_only).is_some_and(|before| before != read_only) {
+            for doc in &open {
+                let mut conns: Vec<ConnId> = self.handles_of(*doc).into_iter().map(|(conn, _)| conn).collect();
+                conns.dedup();
+                for conn in conns {
+                    let _ = self.tell(conn, DocOut::Role { doc: *doc, read_only });
+                }
+            }
+        }
         for doc in open {
             let (online, waiting) = self.replica.document_status(doc).unwrap_or((false, 0));
             let deleted = self.replica.document_node(doc).is_some_and(|node| !self.lookup.has_file(node));
@@ -1263,6 +1285,27 @@ impl State {
                     Err(LocalError::Io(e)) => {
                         let message = format!("the change couldn't be written to disk: {e}");
                         self.tell(conn, refusal(Some(id), Some(seq), craft_cloud_proto::api::codes::INTERNAL, message))
+                    }
+                }
+            }
+            DocsCall::Hold { conn, id, bytes } => {
+                let Some(doc) = self.docs.conns.get(&conn).and_then(|c| c.handles.get(&id)).copied() else { return Vec::new() };
+                // Not refused as an update is when the space is read-only: this is what the app could not send, kept in the
+                // journal (the gate keeps it from the server until the account may write). Not acked: the app is leaving.
+                match self.replica.local_update(doc, &bytes) {
+                    Ok(frames) => {
+                        let bytes = Arc::new(bytes);
+                        let mut frames = frames;
+                        for (other, other_id) in self.handles_of(doc) {
+                            if (other, other_id) != (conn, id) {
+                                frames.extend(self.tell(other, DocOut::Update { id: other_id, bytes: bytes.clone() }));
+                            }
+                        }
+                        frames
+                    }
+                    Err(_) => {
+                        self.say("a change an app handed over couldn't be kept".to_owned());
+                        Vec::new()
                     }
                 }
             }
