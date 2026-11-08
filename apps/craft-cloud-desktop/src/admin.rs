@@ -1595,6 +1595,9 @@ pub fn error_text(e: &Error) -> String {
     if e.code() == Some(craft_cloud_app::codes::AGENT_TOO_OLD) {
         return crate::spaces::TOO_OLD.to_owned();
     }
+    if e.code() == Some(craft_cloud_app::codes::SERVER_TOO_OLD) {
+        return crate::spaces::SERVER_TOO_OLD.to_owned();
+    }
     match e.code() {
         Some(codes::WRONG_PASSWORD | codes::TWO_FACTOR_INVALID | codes::TWO_FACTOR_LOCKED | codes::RATE_LIMITED) => explain(e),
         Some(codes::LAST_ADMIN) => "That would leave the server without an enabled admin. Make another account an admin first.".to_owned(),

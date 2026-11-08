@@ -541,7 +541,9 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
 fn spaces_failed(call: &SpacesCall, error: Error) -> SpacesMsg {
     match call {
         SpacesCall::List { ticket } => SpacesMsg::Listed { ticket: *ticket, result: Err(error) },
-        SpacesCall::Usage { space, ticket } => SpacesMsg::Usage { space: *space, ticket: *ticket, result: Err(error) },
+        SpacesCall::UsageOf { spaces, ticket } => {
+            SpacesMsg::UsageOf { ticket: *ticket, results: spaces.iter().map(|s| (*s, Err(error.clone()))).collect() }
+        }
         SpacesCall::Accept { space, ticket } => SpacesMsg::Accepted { space: *space, ticket: *ticket, result: Err(error) },
         SpacesCall::Decline { space, ticket } => SpacesMsg::Declined { space: *space, ticket: *ticket, result: Err(error) },
         SpacesCall::Sync { space, ticket, .. } => SpacesMsg::SyncSet { space: *space, ticket: *ticket, result: Err(error) },
@@ -569,7 +571,20 @@ fn find_account(agent: &dyn Agent, name: &str) -> Result<Option<AdminUserInfo>, 
 fn spaces_call(agent: &dyn Agent, call: SpacesCall) -> SpacesMsg {
     match call {
         SpacesCall::List { ticket } => SpacesMsg::Listed { ticket, result: agent.spaces() },
-        SpacesCall::Usage { space, ticket } => SpacesMsg::Usage { space, ticket, result: agent.space_usage(space) },
+        SpacesCall::UsageOf { spaces, ticket } => {
+            // One after the other, on this thread: a list of many spaces is not many requests at once. A call that finds the agent or
+            // server too old ends the look.
+            let mut results = Vec::new();
+            for space in spaces {
+                let result = agent.space_usage(space);
+                let stop = result.as_ref().is_err_and(crate::spaces::is_old);
+                results.push((space, result));
+                if stop {
+                    break;
+                }
+            }
+            SpacesMsg::UsageOf { ticket, results }
+        }
         SpacesCall::Accept { space, ticket } => SpacesMsg::Accepted { space, ticket, result: agent.accept_space(space) },
         SpacesCall::Decline { space, ticket } => SpacesMsg::Declined { space, ticket, result: agent.decline_space(space) },
         SpacesCall::Sync { space, request, ticket } => SpacesMsg::SyncSet { space, ticket, result: agent.set_space_sync(space, &request) },
@@ -738,6 +753,8 @@ pub(crate) mod fake {
         pub fails: Vec<Error>,
         /// The deletions the mass-delete guard holds back: the first approve call lists them, the next approves them.
         pub held: Vec<String>,
+        /// Deletions held behind a link (they are not in the set to approve).
+        pub held_links: Vec<String>,
         pub approved_deletes: usize,
         /// The set each approve call named (`None`: none).
         pub deletes_sets: Vec<Option<String>>,
@@ -1450,22 +1467,46 @@ pub(crate) mod fake {
         fn approve_space_deletes(&self, id: SpaceId, set: Option<&str>) -> Result<ApproveDeletesAnswer, Error> {
             self.team(&format!("deletes:{id}"), |t| {
                 t.deletes_sets.push(set.map(str::to_owned));
+                let linked: Vec<craft_cloud_app::HeldLink> =
+                    t.held_links.iter().map(|path| craft_cloud_app::HeldLink { path: path.clone(), links: vec!["Links/one".into()] }).collect();
+                let held_total = linked.len() as u64;
                 if t.held.is_empty() {
-                    return Ok(ApproveDeletesAnswer { approved: false, message: "nothing was waiting for approval".into() });
+                    let message = if held_total > 0 { "held, not deleted on the server" } else { "nothing was waiting for approval" };
+                    return Ok(ApproveDeletesAnswer { approved: false, message: message.into(), held_total, held: linked, ..Default::default() });
                 }
-                // As the agent does: the set that is waiting is approved only when it is named; any other name lists it.
-                let lines = t.held.iter().map(|path| format!("  delete on the server: {path}")).collect::<Vec<_>>().join("\n");
+                // As the agent does: the set that is waiting is approved only when it is named; any other name lists it. The list
+                // is cut at the agent's cap.
+                let total = t.held.len() as u64;
+                let entries: Vec<craft_cloud_app::HeldEntry> = t
+                    .held
+                    .iter()
+                    .take(craft_cloud_proto::local::MAX_HELD_ENTRIES)
+                    .map(|path| craft_cloud_app::HeldEntry { path: path.clone(), side: "server".into() })
+                    .collect();
+                let truncated = entries.len() as u64 != total;
                 if set == Some("abc123") {
                     t.approved_deletes += t.held.len();
                     t.held.clear();
-                    Ok(ApproveDeletesAnswer { approved: true, message: format!("the running agent will carry out these deletions (set abc123):\n{lines}") })
+                    Ok(ApproveDeletesAnswer {
+                        approved: true,
+                        message: "the running agent will carry out these deletions (set abc123)".into(),
+                        set: Some("abc123".into()),
+                        total,
+                        truncated,
+                        entries,
+                        ..Default::default()
+                    })
                 } else {
                     Ok(ApproveDeletesAnswer {
                         approved: false,
-                        message: format!(
-                            "waiting for approval, set abc123 (check the list above, then approve its set):\n{lines}\nnothing approved: set {} isn't a set waiting now",
-                            set.unwrap_or("-")
-                        ),
+                        message: format!("waiting for approval, set abc123; nothing approved: set {} isn't a set waiting now", set.unwrap_or("-")),
+                        set: Some("abc123".into()),
+                        total,
+                        truncated,
+                        entries,
+                        held_set: (held_total > 0).then(|| "feed00".to_owned()),
+                        held_total,
+                        held: linked,
                     })
                 }
             })

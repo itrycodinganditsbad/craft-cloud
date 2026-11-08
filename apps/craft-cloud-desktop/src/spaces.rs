@@ -17,13 +17,15 @@
 //!   page that was left, is dropped.
 
 use craft_cloud_app::{
-    AddSpaceMember, ApproveDeletesAnswer, Error, SpaceConfirm, SpaceId, SpaceInfo, SpaceList, SpaceMember, SpaceRole, SpaceRun, SpaceSync,
+    AddSpaceMember, ApproveDeletesAnswer, Error, HeldEntry, SpaceConfirm, SpaceId, SpaceInfo, SpaceList, SpaceMember, SpaceRole, SpaceRun, SpaceSync,
     SpaceSyncRequest, SpaceUsage, Uuid, codes,
 };
 
 use crate::admin::{Room, error_text, fresh};
 use crate::model::{Effect, Event, Model, Overview, Screen};
 
+/// The most spaces whose usage one look asks for.
+const MAX_USAGE_ASKED: usize = 100;
 /// What every team call of an agent from before team spaces ends in.
 pub const TOO_OLD: &str = "Update Craft Cloud on this computer to use team spaces";
 /// The folder under which team spaces get their folders by default, beside the personal one.
@@ -34,6 +36,8 @@ pub const INVITE_EMPTY: &str = "Type the account name of the person to invite";
 const MAX_ACCOUNT_NAME: usize = 64;
 /// What the page says when a role may not see a part.
 pub const READ_ONLY_BANNER: &str = "You can read this space but not change it. What you change here stays on this computer and doesn't go up.";
+/// What the page says to the last owner who wants to leave.
+pub const LAST_OWNER: &str = "You are the last owner. Name another owner first.";
 /// What the page says of an archived space.
 pub const ARCHIVED_BANNER: &str = "This space is archived: everyone, owners included, can only read it. Nothing is deleted.";
 /// What the page says of a space the account lost access to.
@@ -49,12 +53,31 @@ pub fn is_changing(e: &Error) -> bool {
 
 /// The words of a call that failed: the agent's refusal as the admin pages say it, or [`TOO_OLD`] for an old agent.
 fn words(e: &Error) -> String {
-    if is_too_old(e) { TOO_OLD.to_owned() } else { error_text(e) }
+    if is_too_old(e) {
+        TOO_OLD.to_owned()
+    } else if is_server_too_old(e) {
+        SERVER_TOO_OLD.to_owned()
+    } else {
+        error_text(e)
+    }
 }
+
+/// What the page says when the agent reached a server that doesn't have team spaces (`409 server_too_old`).
+pub const SERVER_TOO_OLD: &str = "The server doesn't support team spaces yet. Ask its administrator to update it.";
 
 /// Whether the agent answered that it doesn't know a team call.
 pub fn is_too_old(e: &Error) -> bool {
     e.code() == Some(codes::AGENT_TOO_OLD)
+}
+
+/// Whether the agent says the server doesn't have the call (a server from before team spaces).
+pub fn is_server_too_old(e: &Error) -> bool {
+    e.code() == Some(codes::SERVER_TOO_OLD)
+}
+
+/// Whether team spaces can't be had at all: the agent or the server is too old.
+pub fn is_old(e: &Error) -> bool {
+    is_too_old(e) || is_server_too_old(e)
 }
 
 /// How a space looks in a row or a banner.
@@ -104,6 +127,10 @@ pub fn state_tags(info: &SpaceInfo) -> Vec<(&'static str, Look)> {
         (SpaceSync::Unavailable, _) => tags.push(("Unavailable", Look::Warn)),
         (SpaceSync::On, Some(SpaceRun::Syncing)) => tags.push(("Syncing", Look::Good)),
         (SpaceSync::On, Some(SpaceRun::Retrying { .. })) => tags.push(("Retrying", Look::Warn)),
+        // The code decides when there is one; its words may change.
+        (SpaceSync::On, Some(SpaceRun::Paused { reason_code: Some(code), .. })) if code == "server_full" => tags.push(("Server full", Look::Bad)),
+        (SpaceSync::On, Some(SpaceRun::Paused { reason_code: Some(code), .. })) if code == "quota_exceeded" => tags.push(("Over the limit", Look::Bad)),
+        (SpaceSync::On, Some(SpaceRun::Paused { reason_code: Some(code), .. })) if code == "read_only" => tags.push(("Read only", Look::Warn)),
         (SpaceSync::On, Some(SpaceRun::Paused { .. })) => tags.push(("Needs you", Look::Bad)),
         (SpaceSync::On, Some(SpaceRun::PausedByUser)) => tags.push(("Paused", Look::Neutral)),
         (SpaceSync::On, _) => tags.push(("Synced", Look::Good)),
@@ -200,11 +227,37 @@ pub enum Deletes {
     Idle,
     /// Nothing is held back (said after a look).
     NoneHeld,
-    /// These are held back, as the set `set` the agent named: the question "approve them?" is open. Only that set is approved.
-    Asking { set: String, lines: Vec<String> },
-    /// Approved: the agent carries them out in a moment.
-    Approved(usize),
+    /// These are held back, as the set `set` the agent named (a hash of exactly them): the question "approve them?" is open.
+    /// Only that set is approved; one that changed meanwhile approves nothing and is listed again.
+    Asking(HeldList),
+    /// Nothing waits for approval, but this many deletions are held behind a link: only the command line releases them.
+    Linked(u64),
+    /// Approved: the agent carries them out in a moment (this many).
+    Approved(u64),
 }
+
+/// What the agent listed of the deletions waiting for approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldList {
+    pub set: String,
+    /// How many deletions the set holds.
+    pub total: u64,
+    /// The agent listed only the first of them.
+    pub truncated: bool,
+    /// The deletions listed (at most `MAX_HELD_ENTRIES`).
+    pub entries: Vec<HeldEntry>,
+    /// Deletions held behind a link too (not in the set).
+    pub linked: u64,
+}
+
+impl HeldList {
+    /// `Showing 1000 of 2500`, or nothing when the whole list is shown.
+    pub fn shown_note(&self) -> Option<String> {
+        self.truncated.then(|| format!("Showing {} of {}", self.entries.len(), self.total))
+    }
+}
+
+
 
 /// The text field and the role of "Invite by account name".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,13 +332,16 @@ pub struct SharedScreen {
     pub error: Option<String>,
     /// The agent is from before team spaces: the page says so and offers nothing.
     pub too_old: bool,
+    /// The server is from before team spaces: the page says so and offers nothing.
+    pub server_old: bool,
     /// What each space stores, as it was asked for.
     pub used: Vec<(SpaceId, Used)>,
     pub view: View,
     pub offer: Option<SyncOffer>,
     pub doing: Option<Doing>,
-    /// What "Try again" sends, after a change was refused as still under way.
-    pub retry: Option<SpacesMsg>,
+    /// What "Try again" sends, with the space it is for, after a change of that space was refused as still under way. It belongs
+    /// to that refusal only: any other click or error drops it.
+    pub retry: Option<(SpaceId, SpacesMsg)>,
     /// What went wrong with the last action on the list, for people.
     pub error_action: Option<String>,
     /// What the last action did, for people (a small note under the title).
@@ -294,16 +350,20 @@ pub struct SharedScreen {
     pub ticket: u64,
     list_ticket: u64,
     members_ticket: u64,
+    usage_ticket: u64,
+    /// The next list answer is followed by a look at what the spaces store (the tab opened, Refresh), not after every change.
+    want_usage: bool,
 }
 
 impl SharedScreen {
-    fn new(overview: Overview) -> Self {
+    pub(crate) fn new(overview: Overview) -> Self {
         Self {
             overview,
             spaces: None,
             loading: false,
             error: None,
             too_old: false,
+            server_old: false,
             used: Vec::new(),
             view: View::List,
             offer: None,
@@ -314,7 +374,50 @@ impl SharedScreen {
             ticket: 0,
             list_ticket: 0,
             members_ticket: 0,
+            usage_ticket: 0,
+            want_usage: false,
         }
+    }
+
+    /// Whether "Try again" is for the space whose page is shown (or, on the list, for a change made there).
+    pub fn retry_here(&self) -> bool {
+        match (&self.retry, self.page()) {
+            (Some((space, _)), Some(page)) => *space == page.space,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether the page or list shown is the one the retry was offered on.
+    fn retry_target_ok(&self, space: SpaceId) -> bool {
+        self.page().is_none_or(|p| p.space == space)
+    }
+
+    fn clear_retry(&mut self) {
+        self.retry = None;
+        if let Some(offer) = &mut self.offer {
+            offer.retry = false;
+        }
+    }
+
+    /// The account's own name, as the agent's status says it.
+    fn me(&self) -> &str {
+        self.overview.status.account.as_deref().unwrap_or_default()
+    }
+
+    /// Whether `user` is the account itself.
+    fn is_me(&self, page: &SpacePage, user: Uuid) -> bool {
+        let me = self.me();
+        page.members.list.iter().flatten().any(|m| m.user == user && m.username.eq_ignore_ascii_case(me))
+    }
+
+    /// Whether the account is the only accepted owner of the shown space, by the members loaded.
+    pub fn is_last_owner(&self) -> bool {
+        let Some(page) = self.page() else { return false };
+        let me = self.me();
+        let owners: Vec<&SpaceMember> =
+            page.members.list.iter().flatten().filter(|m| m.role == SpaceRole::Owner && m.state != "invited").collect();
+        owners.len() == 1 && owners.iter().any(|m| m.username.eq_ignore_ascii_case(me))
     }
 
     /// The team spaces that are invitations, in the order the server listed them.
@@ -378,8 +481,9 @@ pub enum SpacesCall {
     List {
         ticket: u64,
     },
-    Usage {
-        space: SpaceId,
+    /// What these spaces store, asked one after the other on one thread.
+    UsageOf {
+        spaces: Vec<SpaceId>,
         ticket: u64,
     },
     Accept {
@@ -425,7 +529,7 @@ pub enum SpacesCall {
         ticket: u64,
     },
     /// Lists what is held back. It names a set that is never waiting, so the agent approves nothing (it lists the waiting
-    /// set instead and says its name).
+    /// set instead, with its name and its paths).
     LookAtDeletes {
         space: SpaceId,
         ticket: u64,
@@ -446,10 +550,9 @@ pub enum SpacesMsg {
         ticket: u64,
         result: Result<SpaceList, Error>,
     },
-    Usage {
-        space: SpaceId,
+UsageOf {
         ticket: u64,
-        result: Result<SpaceUsage, Error>,
+        results: Vec<(SpaceId, Result<SpaceUsage, Error>)>,
     },
     Accepted {
         space: SpaceId,
@@ -551,27 +654,31 @@ pub enum SpacesMsg {
     Retry,
 }
 
+impl SpacesMsg {
+    /// Whether this is the answer to a call (not a click).
+    pub fn is_answer(&self) -> bool {
+        matches!(
+            self,
+            SpacesMsg::Listed { .. }
+                | SpacesMsg::UsageOf { .. }
+                | SpacesMsg::Accepted { .. }
+                | SpacesMsg::Declined { .. }
+                | SpacesMsg::SyncSet { .. }
+                | SpacesMsg::Members { .. }
+                | SpacesMsg::MemberAdded { .. }
+                | SpacesMsg::MemberChanged { .. }
+                | SpacesMsg::MemberRemoved { .. }
+                | SpacesMsg::Left { .. }
+                | SpacesMsg::Renamed { .. }
+                | SpacesMsg::Deletes { .. }
+        )
+    }
+}
+
 impl From<SpacesMsg> for Event {
     fn from(msg: SpacesMsg) -> Self {
         Event::Spaces(msg)
     }
-}
-
-/// The deletions an agent's `approve-deletes` answer lists, one per line (`delete on the server: path`, `delete here: path`).
-pub fn held_deletions(message: &str) -> Vec<String> {
-    message
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("delete on the server:") || line.starts_with("delete here:"))
-        .map(str::to_owned)
-        .collect()
-}
-
-/// The set a listing of held deletions names (`waiting for approval, set 3f9a0b1c (check the list…`), if it names one.
-pub fn waiting_set(message: &str) -> Option<String> {
-    let rest = message.split_once("waiting for approval, set ")?.1;
-    let set: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
-    (!set.is_empty()).then_some(set)
 }
 
 /// The set name a look at the held deletions sends: no set is ever called that, so the agent lists and approves nothing.
@@ -608,11 +715,13 @@ impl Model {
         match &mut self.screen {
             Screen::Shared(shared) => {
                 shared.loading = true;
+                shared.want_usage = true;
                 shared.list_ticket = fresh();
                 vec![Effect::Spaces(SpacesCall::List { ticket: shared.list_ticket })]
             }
+            // The count of invitations: numbered with the sign-in's session, so that an answer for another account is dropped.
             _ => match self.overview() {
-                Some(_) => vec![Effect::Spaces(SpacesCall::List { ticket: 0 })],
+                Some(o) => vec![Effect::Spaces(SpacesCall::List { ticket: o.session })],
                 None => Vec::new(),
             },
         }
@@ -642,22 +751,23 @@ impl Model {
         self.ask_spaces()
     }
 
-    /// The agent's list: it sets the count of invitations wherever the signed-in view is, and the Shared tab's own list.
+    /// The agent's list: it sets the count of invitations wherever the signed-in view is, and the Shared tab's own list. The
+    /// count's answer carries the sign-in's session as its number: an answer for another sign-in is dropped.
     fn listed(&mut self, ticket: u64, result: Result<SpaceList, Error>) -> Vec<Effect> {
         if let Screen::Shared(shared) = &mut self.screen {
-            if ticket != shared.list_ticket {
-                // The overview's own look, or an older one.
-                if ticket == 0
-                    && let Ok(list) = &result
-                {
-                    shared.overview.invitations = count_invitations(list);
-                }
-                return Vec::new();
+            if ticket == shared.list_ticket {
+                return shared.list_came(result);
             }
-            return shared.list_came(result);
+            if ticket == shared.overview.session
+                && let Ok(list) = &result
+            {
+                shared.overview.invitations = count_invitations(list);
+            }
+            return Vec::new();
         }
         if let Ok(list) = &result
             && let Some(overview) = self.overview_mut()
+            && overview.session == ticket
         {
             overview.invitations = count_invitations(list);
         }
@@ -666,9 +776,14 @@ impl Model {
 }
 
 impl SharedScreen {
-    /// Marks the screen as having no team spaces to show: the agent is too old.
-    fn too_old(&mut self) {
-        self.too_old = true;
+    /// Marks the screen as having no team spaces to show: the agent or the server is too old (`e` says which).
+    fn too_old(&mut self, e: &Error) {
+        if is_server_too_old(e) {
+            self.server_old = true;
+        } else {
+            self.too_old = true;
+        }
+        self.clear_retry();
         self.loading = false;
         self.doing = None;
         self.offer = None;
@@ -681,6 +796,7 @@ impl SharedScreen {
         match result {
             Ok(list) => {
                 self.too_old = false;
+                self.server_old = false;
                 self.error = None;
                 self.overview.invitations = count_invitations(&list);
                 let team: Vec<SpaceInfo> = list.spaces.into_iter().filter(|s| s.kind == "team").collect();
@@ -698,18 +814,31 @@ impl SharedScreen {
                 {
                     self.view = View::List;
                 }
+                // What the spaces store is asked for when the tab opens or is refreshed, one space after the other on one thread:
+                // not once per space, and not after every change.
                 let mut effects = Vec::new();
-                for info in team.iter().filter(|s| s.state != "invited" && !matches!(s.run_state, Some(SpaceRun::NoAccess { .. }))) {
-                    if !self.used.iter().any(|(id, _)| *id == info.space) {
-                        self.used.push((info.space, Used::Loading));
+                if std::mem::take(&mut self.want_usage) {
+                    let asked: Vec<SpaceId> = team
+                        .iter()
+                        .filter(|s| s.state != "invited" && !matches!(s.run_state, Some(SpaceRun::NoAccess { .. })))
+                        .map(|s| s.space)
+                        .take(MAX_USAGE_ASKED)
+                        .collect();
+                    for space in &asked {
+                        if !self.used.iter().any(|(id, _)| id == space) {
+                            self.used.push((*space, Used::Loading));
+                        }
                     }
-                    effects.push(Effect::Spaces(SpacesCall::Usage { space: info.space, ticket: self.list_ticket }));
+                    if !asked.is_empty() {
+                        self.usage_ticket = fresh();
+                        effects.push(Effect::Spaces(SpacesCall::UsageOf { spaces: asked, ticket: self.usage_ticket }));
+                    }
                 }
                 self.spaces = Some(team);
                 effects
             }
-            Err(e) if is_too_old(&e) => {
-                self.too_old();
+            Err(e) if is_old(&e) => {
+                self.too_old(&e);
                 Vec::new()
             }
             Err(e) => {
@@ -736,25 +865,31 @@ impl SharedScreen {
     }
 
     fn update(&mut self, msg: SpacesMsg) -> Vec<Effect> {
+        // "Try again" belongs to the refusal it was offered with: any other click drops it.
+        if !msg.is_answer() && !matches!(msg, SpacesMsg::Retry | SpacesMsg::DismissNotice | SpacesMsg::OfferChoose | SpacesMsg::FolderPicked(_)) {
+            self.clear_retry();
+        }
         match msg {
             SpacesMsg::Open | SpacesMsg::Close | SpacesMsg::Listed { .. } => Vec::new(),
-            SpacesMsg::Usage { space, ticket, result } => {
-                // Asked with the list's number: an answer for an older list is dropped.
-                if ticket != self.list_ticket {
+            SpacesMsg::UsageOf { ticket, results } => {
+                // An answer for an older look is dropped.
+                if ticket != self.usage_ticket {
                     return Vec::new();
                 }
-                let used = match result {
-                    Ok(usage) => Used::Known(usage),
-                    Err(e) => {
-                        if is_too_old(&e) {
-                            self.too_old();
+                for (space, result) in results {
+                    let used = match result {
+                        Ok(usage) => Used::Known(usage),
+                        Err(e) => {
+                            if is_old(&e) {
+                                self.too_old(&e);
+                            }
+                            Used::Failed
                         }
-                        Used::Failed
+                    };
+                    match self.used.iter_mut().find(|(id, _)| *id == space) {
+                        Some(entry) => entry.1 = used,
+                        None => self.used.push((space, used)),
                     }
-                };
-                match self.used.iter_mut().find(|(id, _)| *id == space) {
-                    Some(entry) => entry.1 = used,
-                    None => self.used.push((space, used)),
                 }
                 Vec::new()
             }
@@ -764,6 +899,7 @@ impl SharedScreen {
                 }
                 self.error_action = None;
                 self.notice = None;
+                self.want_usage = true;
                 let mut effects = vec![self.reload()];
                 if let Some(space) = self.page().map(|p| p.space) {
                     effects.push(self.ask_members(space));
@@ -781,7 +917,9 @@ impl SharedScreen {
                 if !joined {
                     return Vec::new();
                 }
-                vec![self.ask_members(space)]
+                // The members and what this space stores are asked for the opened space only.
+                self.usage_ticket = fresh();
+                vec![self.ask_members(space), Effect::Spaces(SpacesCall::UsageOf { spaces: vec![space], ticket: self.usage_ticket })]
             }
             SpacesMsg::BackToList => {
                 if self.doing.is_none() {
@@ -795,7 +933,7 @@ impl SharedScreen {
                 Vec::new()
             }
             SpacesMsg::Retry => match self.retry.take() {
-                Some(again) if self.doing.is_none() => self.update(again),
+                Some((space, again)) if self.doing.is_none() && self.retry_target_ok(space) => self.update(again),
                 _ => Vec::new(),
             },
             SpacesMsg::Accept(space) => self.accept(space),
@@ -877,10 +1015,9 @@ impl SharedScreen {
                         page.members.error = None;
                     }
                     Err(e) => {
-                        let too_old = is_too_old(&e);
                         page.members.error = Some(words(&e));
-                        if too_old {
-                            self.too_old();
+                        if is_old(&e) {
+                            self.too_old(&e);
                         }
                     }
                 }
@@ -888,6 +1025,9 @@ impl SharedScreen {
             }
             SpacesMsg::StartRename => {
                 let Some(space) = self.page().map(|p| p.space) else { return Vec::new() };
+                if !self.may_rename(space) {
+                    return Vec::new();
+                }
                 let name = self.find(space).map(space_name).unwrap_or_default();
                 if let Some(page) = self.page_mut() {
                     page.rename = Some(name);
@@ -964,7 +1104,7 @@ impl SharedScreen {
                 }
             }
             SpacesMsg::AskRemove(user) => {
-                if self.doing.is_some() {
+                if self.doing.is_some() || self.page().is_none_or(|p| self.is_me(p, user)) {
                     return Vec::new();
                 }
                 if let Some(page) = self.page_mut() {
@@ -1004,6 +1144,14 @@ impl SharedScreen {
             }
             SpacesMsg::AskLeave => {
                 if self.doing.is_some() {
+                    return Vec::new();
+                }
+                // The server refuses the last owner's leave; the page says so before asking.
+                if self.is_last_owner() {
+                    if let Some(page) = self.page_mut() {
+                        page.leaving = false;
+                        page.error = Some(LAST_OWNER.to_owned());
+                    }
                     return Vec::new();
                 }
                 if let Some(page) = self.page_mut() {
@@ -1073,8 +1221,9 @@ impl SharedScreen {
 
     /// A call of the list failed.
     fn action_failed(&mut self, e: Error) -> Vec<Effect> {
-        if is_too_old(&e) {
-            self.too_old();
+        self.clear_retry();
+        if is_old(&e) {
+            self.too_old(&e);
         } else {
             self.error_action = Some(words(&e));
         }
@@ -1092,8 +1241,9 @@ impl SharedScreen {
 
     /// A call of a space's page failed.
     fn page_failed(&mut self, e: Error) -> Vec<Effect> {
-        if is_too_old(&e) {
-            self.too_old();
+        self.clear_retry();
+        if is_old(&e) {
+            self.too_old(&e);
             return Vec::new();
         }
         let text = words(&e);
@@ -1217,12 +1367,14 @@ impl SharedScreen {
                 vec![self.reload()]
             }
             Err(e) => {
-                if is_too_old(&e) {
-                    self.too_old();
+                if is_old(&e) {
+                    self.too_old(&e);
                     return Vec::new();
                 }
                 if is_changing(&e) {
-                    self.retry = Some(if self.offer.is_some() { SpacesMsg::OfferSync } else { SpacesMsg::SyncOff(space) });
+                    // The refusal is this space's: "Try again" is offered for it, and for nothing else.
+                    self.clear_retry();
+                    self.retry = Some((space, if self.offer.is_some() { SpacesMsg::OfferSync } else { SpacesMsg::SyncOff(space) }));
                     if let Some(offer) = &mut self.offer {
                         offer.busy = false;
                         offer.retry = true;
@@ -1231,6 +1383,7 @@ impl SharedScreen {
                     }
                     return self.page_failed_text(CHANGING.to_owned());
                 }
+                self.clear_retry();
                 if let Some(offer) = &mut self.offer {
                     offer.busy = false;
                     if e.code() == Some(codes::FOLDER_HAS_FILES) {
@@ -1249,12 +1402,20 @@ impl SharedScreen {
         }
     }
 
+    /// Only an owner renames, and not a space that is archived or lost (the server refuses it too).
+    fn may_rename(&self, space: SpaceId) -> bool {
+        self.is_owner(space) && self.find(space).is_some_and(|s| !s.archived)
+    }
+
     fn save_rename(&mut self) -> Vec<Effect> {
         if self.doing.is_some() {
             return Vec::new();
         }
         let Some(page) = self.page() else { return Vec::new() };
         let (space, Some(typed)) = (page.space, page.rename.clone()) else { return Vec::new() };
+        if !self.may_rename(space) {
+            return Vec::new();
+        }
         let current = self.find(space).map(space_name).unwrap_or_default();
         let name = match craft_cloud_proto::SpaceName::new(&typed) {
             Ok(name) => name.as_str().to_owned(),
@@ -1308,8 +1469,9 @@ impl SharedScreen {
     }
 
     fn invite_failed(&mut self, e: Error) -> Vec<Effect> {
-        if is_too_old(&e) {
-            self.too_old();
+        self.clear_retry();
+        if is_old(&e) {
+            self.too_old(&e);
             return Vec::new();
         }
         let text = words(&e);
@@ -1326,7 +1488,8 @@ impl SharedScreen {
         let Some(page) = self.page() else { return Vec::new() };
         let space = page.space;
         let unchanged = page.members.list.iter().flatten().any(|m| m.user == user && m.role == role);
-        if !self.is_owner(space) || unchanged {
+        // The account's own row has no role to change here (and none to remove): leaving is Leave's.
+        if !self.is_owner(space) || unchanged || self.is_me(page, user) {
             return Vec::new();
         }
         if let Some(page) = self.page_mut() {
@@ -1343,7 +1506,7 @@ impl SharedScreen {
         }
         let Some(page) = self.page() else { return Vec::new() };
         let (space, Some(user)) = (page.space, page.removing) else { return Vec::new() };
-        if !self.is_owner(space) {
+        if !self.is_owner(space) || self.is_me(page, user) {
             return Vec::new();
         }
         self.doing = Some(Doing::Removing(user));
@@ -1356,7 +1519,7 @@ impl SharedScreen {
             return Vec::new();
         }
         let Some(page) = self.page() else { return Vec::new() };
-        if !page.leaving {
+        if !page.leaving || self.is_last_owner() {
             return Vec::new();
         }
         let space = page.space;
@@ -1391,8 +1554,8 @@ impl SharedScreen {
             return Vec::new();
         }
         let Some(page) = self.page() else { return Vec::new() };
-        let Deletes::Asking { set, .. } = &page.deletes else { return Vec::new() };
-        let (space, set) = (page.space, set.clone());
+        let Deletes::Asking(list) = &page.deletes else { return Vec::new() };
+        let (space, set) = (page.space, list.set.clone());
         self.doing = Some(Doing::ApprovingDeletes);
         let ticket = self.next_ticket();
         vec![Effect::Spaces(SpacesCall::ApproveDeletes { space, set, ticket })]
@@ -1408,34 +1571,33 @@ impl SharedScreen {
         }
         match result {
             Ok(answer) => {
-                let held = held_deletions(&answer.message);
-                let set = waiting_set(&answer.message);
                 let Some(page) = self.page_mut() else { return Vec::new() };
                 page.error = None;
                 page.deletes = if approving && answer.approved {
-                    Deletes::Approved(held.len())
-                } else if held.is_empty() {
-                    if approving {
-                        page.error =
-                            Some("The held deletions changed since they were listed, so nothing was approved. Look at them again.".to_owned());
-                    }
-                    Deletes::NoneHeld
-                } else if let Some(set) = set {
-                    if approving {
-                        // What was listed changed since: nothing was approved, and the new list is asked about again.
-                        page.error =
-                            Some("The held deletions changed since they were listed, so nothing was approved. Look at them again.".to_owned());
-                    }
-                    Deletes::Asking { set, lines: held }
+                    Deletes::Approved(answer.total)
                 } else {
-                    page.error = Some("The agent listed held deletions without naming them as a set, so they can't be approved here. Approve them with `craft-cloud-agent sync --approve-deletes`.".to_owned());
-                    Deletes::Idle
+                    if approving {
+                        // What was listed changed since: nothing was approved, and what waits now is asked about again.
+                        page.error = Some("The held deletions changed since they were listed, so nothing was approved. Look at them again.".to_owned());
+                    }
+                    match answer.set {
+                        Some(set) if answer.total > 0 => Deletes::Asking(HeldList {
+                            set,
+                            total: answer.total,
+                            truncated: answer.truncated,
+                            entries: answer.entries,
+                            linked: answer.held_total,
+                        }),
+                        _ if answer.held_total > 0 => Deletes::Linked(answer.held_total),
+                        _ => Deletes::NoneHeld,
+                    }
                 };
                 Vec::new()
             }
             Err(e) => {
-                if is_too_old(&e) {
-                    self.too_old();
+                self.clear_retry();
+                if is_old(&e) {
+                    self.too_old(&e);
                     return Vec::new();
                 }
                 // A space that doesn't sync here has nothing to approve: the agent says "no such team space syncing".
@@ -1572,7 +1734,7 @@ mod tests {
         use SpaceRole::{Editor, Viewer};
         assert_eq!(tag(SpaceSync::On, Some(SpaceRun::Syncing), Editor, false, false), [("Syncing", Look::Good)]);
         assert_eq!(tag(SpaceSync::On, Some(SpaceRun::Retrying { message: "x".into() }), Editor, false, false), [("Retrying", Look::Warn)]);
-        assert_eq!(tag(SpaceSync::On, Some(SpaceRun::Paused { reason: "x".into() }), Editor, false, false), [("Needs you", Look::Bad)]);
+        assert_eq!(tag(SpaceSync::On, Some(SpaceRun::Paused { reason: "x".into(), reason_code: None }), Editor, false, false), [("Needs you", Look::Bad)]);
         assert_eq!(tag(SpaceSync::On, Some(SpaceRun::PausedByUser), Editor, false, false), [("Paused", Look::Neutral)]);
         assert_eq!(tag(SpaceSync::Off, None, Editor, false, false), [("Not syncing here", Look::Neutral)]);
         assert_eq!(tag(SpaceSync::On, Some(SpaceRun::Idle), Viewer, false, true), [("Read only", Look::Warn), ("Synced", Look::Good)]);
@@ -1815,9 +1977,10 @@ mod tests {
         // The first look lists what is held back and approves nothing.
         run(&mut model, &agent, msg(SpacesMsg::CheckDeletes));
         let deletes = shared(&model).page().unwrap().deletes.clone();
-        let Deletes::Asking { set, lines } = deletes else { panic!("{deletes:?}") };
-        assert_eq!((set.as_str(), lines.len()), ("abc123", 3));
-        assert!(lines[0].starts_with("delete on the server: Shots/a.psd"));
+        let Deletes::Asking(list) = deletes else { panic!("{deletes:?}") };
+        assert_eq!((list.set.as_str(), list.total, list.entries.len(), list.truncated), ("abc123", 3, 3, false));
+        assert_eq!((list.entries[0].path.as_str(), list.entries[0].side.as_str()), ("Shots/a.psd", "server"));
+        assert_eq!(list.shown_note(), None);
         assert_eq!(agent.team.lock().unwrap().approved_deletes, 0, "listing approves nothing");
         // The person says no: nothing is approved and the deletions stay held.
         model.update(Event::Spaces(SpacesMsg::CancelDeletes));
@@ -1827,7 +1990,7 @@ mod tests {
         run(&mut model, &agent, msg(SpacesMsg::CheckDeletes));
         run(&mut model, &agent, msg(SpacesMsg::CancelDeletes));
         run(&mut model, &agent, msg(SpacesMsg::CheckDeletes));
-        assert!(matches!(shared(&model).page().unwrap().deletes, Deletes::Asking { .. }));
+        assert!(matches!(shared(&model).page().unwrap().deletes, Deletes::Asking(_)));
         assert_eq!(agent.team.lock().unwrap().approved_deletes, 0);
         // Yes: the call that names the listed set approves it.
         let asked = agent.team.lock().unwrap().deletes_sets.clone();
@@ -1852,20 +2015,29 @@ mod tests {
         run(&mut model, &agent, msg(SpacesMsg::OpenSpace(id)));
         let effects = model.update(Event::Spaces(SpacesMsg::CheckDeletes));
         let Some(Effect::Spaces(SpacesCall::LookAtDeletes { ticket, .. })) = effects.first().cloned() else { panic!("{effects:?}") };
-        let listed = ApproveDeletesAnswer { approved: false, message: "waiting for approval, set a1\n  delete on the server: a.txt\n".into() };
+        let listed = ApproveDeletesAnswer {
+            set: Some("a1".into()),
+            total: 1,
+            entries: vec![HeldEntry { path: "a.txt".into(), side: "server".into() }],
+            ..Default::default()
+        };
         model.update(Event::Spaces(SpacesMsg::Deletes { space: id, ticket, result: Ok(listed) }));
         let effects = model.update(Event::Spaces(SpacesMsg::ConfirmDeletes));
         let Some(Effect::Spaces(SpacesCall::ApproveDeletes { ticket, set, .. })) = effects.first().cloned() else { panic!("{effects:?}") };
         assert_eq!(set, "a1", "the set that was listed, not whatever is waiting later");
         // The agent says the set changed: nothing approved, the new list is asked about again.
         let changed = ApproveDeletesAnswer {
-            approved: false,
-            message: "waiting for approval, set b2\n  delete on the server: a.txt\n  delete here: b.txt\nnothing approved: these deletions changed"
-                .into(),
+            set: Some("b2".into()),
+            total: 2,
+            entries: vec![
+                HeldEntry { path: "a.txt".into(), side: "server".into() },
+                HeldEntry { path: "b.txt".into(), side: "here".into() },
+            ],
+            ..Default::default()
         };
         model.update(Event::Spaces(SpacesMsg::Deletes { space: id, ticket, result: Ok(changed) }));
         let page = shared(&model).page().unwrap();
-        assert!(matches!(&page.deletes, Deletes::Asking { set, lines } if set == "b2" && lines.len() == 2), "{:?}", page.deletes);
+        assert!(matches!(&page.deletes, Deletes::Asking(list) if list.set == "b2" && list.entries.len() == 2), "{:?}", page.deletes);
         assert!(page.error.as_deref().is_some_and(|e| e.contains("nothing was approved")), "{:?}", page.error);
         // A space the agent doesn't sync answers its own words, which are shown.
         model.update(Event::Spaces(SpacesMsg::CancelDeletes));
@@ -1880,23 +2052,45 @@ mod tests {
         assert_eq!((&page.deletes, page.error.as_deref()), (&Deletes::Idle, Some("no such team space syncing on this computer")));
     }
 
+    /// More deletions than the agent lists: the count is the whole, the list is the first of them, and the note says so; the
+    /// approval is still by the set, so it covers exactly what the count says.
     #[test]
-    fn the_waiting_set_is_read_from_the_listing() {
-        assert_eq!(
-            waiting_set("waiting for approval, set 3f9a0b1c (check the list, then run this again):\n  delete here: x"),
-            Some("3f9a0b1c".into())
-        );
-        assert_eq!(waiting_set("waiting for approval, set abc123"), Some("abc123".into()));
-        assert_eq!(waiting_set("nothing was waiting for approval"), None);
-        assert_eq!(waiting_set("waiting for approval, set "), None);
+    fn a_long_list_of_held_deletes_shows_the_count_and_what_was_listed() {
+        let studio = with_sync(team_space("Studio", SpaceRole::Editor, "active"), SpaceRun::Idle);
+        let id = studio.space;
+        let agent = agent_with(vec![studio]);
+        agent.team.lock().unwrap().held = (0..1500).map(|n| format!("Shots/{n:04}.psd")).collect();
+        let mut model = on_shared(&agent);
+        run(&mut model, &agent, msg(SpacesMsg::OpenSpace(id)));
+        run(&mut model, &agent, msg(SpacesMsg::CheckDeletes));
+        let Deletes::Asking(list) = shared(&model).page().unwrap().deletes.clone() else { panic!() };
+        assert_eq!((list.total, list.entries.len(), list.truncated), (1500, 1000, true));
+        assert_eq!(list.shown_note().as_deref(), Some("Showing 1000 of 1500"));
+        run(&mut model, &agent, msg(SpacesMsg::ConfirmDeletes));
+        assert_eq!(shared(&model).page().unwrap().deletes, Deletes::Approved(1500));
+        assert_eq!(agent.team.lock().unwrap().approved_deletes, 1500);
     }
 
+    /// Deletions held behind a link are not "none": the page counts them and says which command releases them; they are never
+    /// approved from here.
     #[test]
-    fn held_deletions_are_read_from_the_agents_lines() {
-        let message = "held, not deleted on the server: x\n  held.txt (held while any of l is a link)\nwaiting for approval, set 3f9a (check the list):\n  delete on the server: a/b.txt\n  delete here: c.txt\nnothing approved";
-        assert_eq!(held_deletions(message), ["delete on the server: a/b.txt", "delete here: c.txt"]);
-        assert!(held_deletions("nothing was waiting for approval").is_empty());
-        assert!(held_deletions("").is_empty());
+    fn deletes_held_behind_a_link_are_counted_and_never_approved_here() {
+        let studio = with_sync(team_space("Studio", SpaceRole::Editor, "active"), SpaceRun::Idle);
+        let id = studio.space;
+        let agent = agent_with(vec![studio]);
+        agent.team.lock().unwrap().held_links = vec!["Linked/a.txt".into(), "Linked/b.txt".into()];
+        let mut model = on_shared(&agent);
+        run(&mut model, &agent, msg(SpacesMsg::OpenSpace(id)));
+        run(&mut model, &agent, msg(SpacesMsg::CheckDeletes));
+        assert_eq!(shared(&model).page().unwrap().deletes, Deletes::Linked(2));
+        assert!(model.update(Event::Spaces(SpacesMsg::ConfirmDeletes)).is_empty(), "nothing to approve");
+        // Both kinds at once: the question is for the set, with the held ones noted.
+        agent.team.lock().unwrap().held = vec!["x.txt".into()];
+        run(&mut model, &agent, msg(SpacesMsg::CheckDeletes));
+        let Deletes::Asking(list) = shared(&model).page().unwrap().deletes.clone() else { panic!() };
+        assert_eq!((list.total, list.linked), (1, 2));
+        run(&mut model, &agent, msg(SpacesMsg::ConfirmDeletes));
+        assert_eq!(agent.team.lock().unwrap().deletes_sets.last().cloned().flatten().as_deref(), Some("abc123"), "never the link set");
     }
 
     #[test]
@@ -1984,12 +2178,12 @@ mod tests {
         let page = shared(&model);
         assert_eq!(page.page().unwrap().invite.error.as_deref(), Some("no such account"));
         assert!(page.doing.is_none(), "the buttons are free again");
-        // The last owner can't be demoted: the server's words show, and the list is asked again.
-        agent.team.lock().unwrap().fails.push(refused("last_owner", "a space keeps at least one owner"));
-        let fabio = Uuid::from_u128(0x7001);
+        // A role change the server refuses: its words show, and the list is asked again.
+        agent.team.lock().unwrap().fails.push(refused("read_only", "your role in this space does not allow changes"));
+        let ben = Uuid::from_u128(0x7002);
         let asked = calls_of(&agent, "members:");
-        run(&mut model, &agent, msg(SpacesMsg::SetRole { user: fabio, role: SpaceRole::Editor }));
-        assert_eq!(shared(&model).page().unwrap().error.as_deref(), Some("a space keeps at least one owner"));
+        run(&mut model, &agent, msg(SpacesMsg::SetRole { user: ben, role: SpaceRole::Viewer }));
+        assert_eq!(shared(&model).page().unwrap().error.as_deref(), Some("your role in this space does not allow changes"));
         assert_eq!(calls_of(&agent, "members:"), asked + 1, "the server's list is the truth");
         // A removal that fails closes its question.
         agent.team.lock().unwrap().fails.push(refused("read_only", "your role in this space does not allow changes"));
@@ -2003,6 +2197,23 @@ mod tests {
     #[test]
     fn leaving_asks_first_and_the_local_copy_stays() {
         let (agent, mut model, id) = on_owned_space();
+        // The only owner can't leave: the page says so before asking anything, and sends nothing.
+        let before = log(&agent).len();
+        model.update(Event::Spaces(SpacesMsg::AskLeave));
+        let page = shared(&model).page().unwrap();
+        assert_eq!((page.leaving, page.error.as_deref()), (false, Some("You are the last owner. Name another owner first.")));
+        assert!(shared(&model).is_last_owner());
+        assert!(model.update(Event::Spaces(SpacesMsg::ConfirmLeave)).is_empty());
+        assert_eq!(log(&agent).len(), before);
+        // Another owner is named (by someone with the right): the members are loaded again and the question opens.
+        {
+            let mut team = agent.team.lock().unwrap();
+            if let Some((_, list)) = team.members.iter_mut().find(|(s, _)| *s == id) {
+                list[1].role = SpaceRole::Owner;
+            }
+        }
+        run(&mut model, &agent, msg(SpacesMsg::Reload));
+        assert!(!shared(&model).is_last_owner());
         let before = log(&agent).len();
         model.update(Event::Spaces(SpacesMsg::AskLeave));
         assert!(shared(&model).page().unwrap().leaving);
@@ -2010,12 +2221,13 @@ mod tests {
         assert!(!shared(&model).page().unwrap().leaving);
         assert_eq!(log(&agent).len(), before, "nothing is sent until the person confirms");
         assert!(model.update(Event::Spaces(SpacesMsg::ConfirmLeave)).is_empty(), "no question open: nothing to confirm");
-        // The last owner may not leave: the server says so; the page stays.
-        agent.team.lock().unwrap().fails.push(refused("last_owner", "a space keeps at least one owner"));
+        // A refusal of the server (a rate limit, no connection) keeps the page and the sync: nothing was changed.
+        agent.team.lock().unwrap().fails.push(refused("rate_limited", "too many requests"));
         model.update(Event::Spaces(SpacesMsg::AskLeave));
         run(&mut model, &agent, msg(SpacesMsg::ConfirmLeave));
         let page = shared(&model);
-        assert_eq!(page.page().map(|p| (p.leaving, p.error.clone())), Some((false, Some("a space keeps at least one owner".into()))));
+        assert_eq!(page.page().map(|p| (p.leaving, p.error.is_some())), Some((false, true)));
+        assert_eq!(page.find(id).unwrap().sync, SpaceSync::On, "still syncing");
         // Another try works: back on the list, which no longer has the space, and a note says the folder stays.
         model.update(Event::Spaces(SpacesMsg::AskLeave));
         run(&mut model, &agent, msg(SpacesMsg::ConfirmLeave));
@@ -2024,6 +2236,187 @@ mod tests {
         assert!(page.find(id).is_none());
         assert!(page.notice.as_deref().is_some_and(|n| n.contains("You left Studio") && n.contains("folder stays")), "{:?}", page.notice);
         assert_eq!(calls_of(&agent, "leave:"), 2);
+    }
+
+    /// The account's own row has no role to change and nothing to remove: the model refuses both (leaving is Leave's).
+    #[test]
+    fn an_owner_cannot_change_or_remove_their_own_row() {
+        let (agent, mut model, id) = on_owned_space();
+        let fabio = Uuid::from_u128(0x7001);
+        let before = log(&agent).len();
+        assert!(model.update(Event::Spaces(SpacesMsg::SetRole { user: fabio, role: SpaceRole::Editor })).is_empty());
+        assert!(model.update(Event::Spaces(SpacesMsg::AskRemove(fabio))).is_empty());
+        assert_eq!(shared(&model).page().unwrap().removing, None);
+        assert!(model.update(Event::Spaces(SpacesMsg::ConfirmRemove)).is_empty());
+        assert_eq!(log(&agent).len(), before);
+        // Another member's row still works.
+        assert!(!model.update(Event::Spaces(SpacesMsg::SetRole { user: Uuid::from_u128(0x7002), role: SpaceRole::Viewer })).is_empty());
+        let _ = id;
+    }
+
+    /// Rename is the owners'; the model refuses it for anyone else and for an archived space, not only the page.
+    #[test]
+    fn rename_is_refused_for_a_non_owner_and_for_an_archived_space() {
+        let docs = with_sync(team_space("Docs", SpaceRole::Editor, "active"), SpaceRun::Idle);
+        let mut old = team_space("Old", SpaceRole::Owner, "active");
+        old.archived = true;
+        let (docs_id, old_id) = (docs.space, old.space);
+        let agent = agent_with(vec![docs, old]);
+        let mut model = on_shared(&agent);
+        let before = log(&agent).len();
+        for id in [docs_id, old_id] {
+            run(&mut model, &agent, msg(SpacesMsg::OpenSpace(id)));
+            assert!(model.update(Event::Spaces(SpacesMsg::StartRename)).is_empty());
+            assert_eq!(shared(&model).page().unwrap().rename, None);
+            // Even with the field set and a save sent, nothing goes out.
+            if let Some(page) = shared_mut(&mut model).page_mut() {
+                page.rename = Some("Another".into());
+            }
+            assert!(model.update(Event::Spaces(SpacesMsg::SaveRename)).is_empty());
+            run(&mut model, &agent, msg(SpacesMsg::BackToList));
+        }
+        assert_eq!(calls_of(&agent, "update:"), 0, "{:?}", log(&agent).len() - before);
+    }
+
+    /// The review's scenario: "Try again" belongs to the refusal it came with. A refusal for space A, then B's page and an
+    /// unrelated error there: Try again is gone, and clicking it would do nothing (it never stops A's sync).
+    #[test]
+    fn try_again_belongs_to_its_own_refusal_and_nothing_else() {
+        let a = with_sync(team_space("A", SpaceRole::Owner, "active"), SpaceRun::Idle);
+        let b = team_space("B", SpaceRole::Owner, "active");
+        let (a_id, b_id) = (a.space, b.space);
+        let agent = agent_with(vec![a, b]);
+        let changing = || Error::Refused { code: "conflict".into(), message: "this space is being changed, try again in a moment".into(), name_taken: None };
+        let mut model = on_shared(&agent);
+        run(&mut model, &agent, msg(SpacesMsg::OpenSpace(a_id)));
+        agent.team.lock().unwrap().fails.push(changing());
+        run(&mut model, &agent, msg(SpacesMsg::SyncOff(a_id)));
+        assert!(shared(&model).retry_here(), "offered on A's page");
+        // Navigation drops it.
+        run(&mut model, &agent, msg(SpacesMsg::BackToList));
+        assert!(shared(&model).retry.is_none());
+        // Again, then B's page with an unrelated error: no link, and Retry sends nothing.
+        run(&mut model, &agent, msg(SpacesMsg::OpenSpace(a_id)));
+        agent.team.lock().unwrap().fails.push(changing());
+        run(&mut model, &agent, msg(SpacesMsg::SyncOff(a_id)));
+        assert!(shared(&model).retry.is_some());
+        run(&mut model, &agent, msg(SpacesMsg::OpenSpace(b_id)));
+        assert!(shared(&model).retry.is_none(), "opening another space drops it");
+        run(&mut model, &agent, msg(SpacesMsg::StartRename));
+        if let Some(page) = shared_mut(&mut model).page_mut() {
+            page.rename = Some("A taken name".into());
+        }
+        agent.team.lock().unwrap().fails.push(refused("conflict", "a team space with that name exists"));
+        run(&mut model, &agent, msg(SpacesMsg::SaveRename));
+        assert!(!shared(&model).retry_here());
+        let syncs_before = agent.team.lock().unwrap().syncs.len();
+        assert!(model.update(Event::Spaces(SpacesMsg::Retry)).is_empty());
+        assert_eq!(agent.team.lock().unwrap().syncs.len(), syncs_before, "A's sync was not touched");
+        assert_eq!(shared(&model).find(a_id).unwrap().sync, SpaceSync::On);
+        // Any other click or error also drops it: a refusal, then a different error for the same space.
+        run(&mut model, &agent, msg(SpacesMsg::BackToList));
+        run(&mut model, &agent, msg(SpacesMsg::OpenSpace(a_id)));
+        agent.team.lock().unwrap().fails.push(changing());
+        run(&mut model, &agent, msg(SpacesMsg::SyncOff(a_id)));
+        agent.team.lock().unwrap().fails.push(refused("rate_limited", "too many requests"));
+        run(&mut model, &agent, msg(SpacesMsg::AskLeave));
+        run(&mut model, &agent, msg(SpacesMsg::ConfirmLeave));
+        assert!(shared(&model).retry.is_none(), "any other click drops it");
+        // The list: a declined invitation that fails after A's refusal does not offer A's retry.
+        assert!(model.update(Event::Spaces(SpacesMsg::Retry)).is_empty());
+    }
+
+    /// Another account on the agent: the Shared tab starts afresh (no spaces, members or answers of the old one).
+    #[test]
+    fn another_account_resets_the_shared_tab_and_drops_late_answers() {
+        let (agent, mut model, id) = on_owned_space();
+        let old_ticket = shared(&model).ticket;
+        let mut other = status(true);
+        other.account = Some("ben".into());
+        let effects = model.update(Event::Polled(Ok(other)));
+        let page = shared(&model);
+        assert!(page.spaces.is_none() && page.page().is_none() && page.used.is_empty(), "nothing of fabio's remains");
+        assert_eq!(page.overview.status.account.as_deref(), Some("ben"));
+        assert!(effects.iter().any(|e| matches!(e, Effect::Spaces(SpacesCall::List { .. }))), "{effects:?}");
+        // Answers of the old account that were in flight come to nothing.
+        assert!(model.update(Event::Spaces(SpacesMsg::Members { space: id, ticket: 1, result: Ok(Vec::new()) })).is_empty());
+        assert!(model.update(Event::Spaces(SpacesMsg::Accepted { space: id, ticket: old_ticket, result: Ok(()) })).is_empty());
+        assert!(shared(&model).offer.is_none());
+        let session = shared(&model).overview.session;
+        // A count for another sign-in's session is dropped; the right one counts.
+        let invited = SpaceList { spaces: vec![team_space("Brand", SpaceRole::Editor, "invited")] };
+        model.update(Event::Spaces(SpacesMsg::Listed { ticket: session + 1000, result: Ok(invited.clone()) }));
+        assert_eq!(shared(&model).overview.invitations, 0);
+        model.update(Event::Spaces(SpacesMsg::Listed { ticket: session, result: Ok(invited) }));
+        assert_eq!(shared(&model).overview.invitations, 1);
+        let _ = agent;
+    }
+
+    /// What the spaces store is asked for once per look, one space after the other, and not after every change.
+    #[test]
+    fn usage_is_asked_once_per_look_and_not_after_every_change() {
+        let spaces: Vec<SpaceInfo> = (0..6).map(|n| team_space(&format!("Space {n}"), SpaceRole::Editor, "active")).collect();
+        let first = spaces[0].space;
+        let agent = agent_with(spaces);
+        let mut model = signed_in(&agent);
+        let effects = model.update(Event::Tab(Tab::Shared));
+        let Some(Effect::Spaces(SpacesCall::List { ticket })) = effects.first().cloned() else { panic!("{effects:?}") };
+        let list = SpaceList { spaces: agent.team.lock().unwrap().spaces.clone() };
+        let effects = model.update(Event::Spaces(SpacesMsg::Listed { ticket, result: Ok(list.clone()) }));
+        assert!(matches!(effects.as_slice(), [Effect::Spaces(SpacesCall::UsageOf { spaces, .. })] if spaces.len() == 6), "one call for all: {effects:?}");
+        // A change that reloads the list asks nothing more of the spaces.
+        agent.team.lock().unwrap().spaces[0].sync = SpaceSync::On;
+        let reload = model.update(Event::Spaces(SpacesMsg::SyncOff(first)));
+        let _ = reload;
+        let effects = model.update(Event::Spaces(SpacesMsg::Reload));
+        let Some(Effect::Spaces(SpacesCall::List { ticket })) = effects.first().cloned() else { panic!("{effects:?}") };
+        let effects = model.update(Event::Spaces(SpacesMsg::Listed { ticket, result: Ok(list) }));
+        assert_eq!(effects.len(), 1, "Refresh looks at the usage again");
+        // Run through the fake: six spaces are six calls, one after the other.
+        let mut model = on_shared(&agent);
+        let _ = &mut model;
+        assert_eq!(calls_of(&agent, "usage:"), 6);
+    }
+
+    /// A server from before team spaces is said so, once, and nothing else is offered; an agent too old is its own message.
+    #[test]
+    fn a_server_that_needs_an_update_ends_in_one_message() {
+        let agent = agent_with(vec![team_space("Studio", SpaceRole::Editor, "active")]);
+        agent.team.lock().unwrap().fails.push(Error::Refused {
+            code: "server_too_old".into(),
+            message: "the server needs an update for team spaces".into(),
+            name_taken: None,
+        });
+        let mut model = signed_in(&agent);
+        agent.team.lock().unwrap().fails.push(Error::Refused {
+            code: "server_too_old".into(),
+            message: "the server needs an update for team spaces".into(),
+            name_taken: None,
+        });
+        run(&mut model, &agent, vec![Event::Tab(Tab::Shared)]);
+        let page = shared(&model);
+        assert!(page.server_old && !page.too_old && page.spaces.is_none() && page.error.is_none());
+        assert_eq!(words(&refused("server_too_old", "x")), SERVER_TOO_OLD);
+        assert_eq!(crate::admin::error_text(&refused("server_too_old", "x")), SERVER_TOO_OLD);
+        assert_ne!(SERVER_TOO_OLD, TOO_OLD);
+        // The invitation count asked at sign-in says nothing for it.
+        assert_eq!(model.overview().map(|o| o.invitations), Some(0));
+    }
+
+    /// The code of a pause decides how a space is tagged; its words may change.
+    #[test]
+    fn a_pause_with_a_code_is_tagged_by_the_code() {
+        let tag = |code: Option<&str>| {
+            let mut info = team_space("S", SpaceRole::Editor, "active");
+            info.sync = SpaceSync::On;
+            info.run_state = Some(SpaceRun::Paused { reason: "words that may change".into(), reason_code: code.map(str::to_owned) });
+            state_tags(&info)
+        };
+        assert_eq!(tag(Some("server_full")), [("Server full", Look::Bad)]);
+        assert_eq!(tag(Some("quota_exceeded")), [("Over the limit", Look::Bad)]);
+        assert_eq!(tag(Some("read_only")), [("Read only", Look::Warn)]);
+        assert_eq!(tag(Some("something_new")), [("Needs you", Look::Bad)]);
+        assert_eq!(tag(None), [("Needs you", Look::Bad)]);
     }
 
     #[test]
@@ -2124,7 +2517,7 @@ mod tests {
         assert!(model.update(Event::Spaces(SpacesMsg::Listed { ticket: 1, result: Ok(SpaceList::default()) })).is_empty());
         assert!(shared(&model).spaces.is_some(), "the old answer didn't empty the list");
         assert!(model.update(Event::Spaces(SpacesMsg::Members { space: id, ticket: 1, result: Ok(Vec::new()) })).is_empty());
-        assert!(model.update(Event::Spaces(SpacesMsg::Usage { space: id, ticket: 1, result: Err(Error::Io("x".into())) })).is_empty());
+        assert!(model.update(Event::Spaces(SpacesMsg::UsageOf { ticket: 1, results: vec![(id, Err(Error::Io("x".into())))] })).is_empty());
         // The tab left: an answer that comes after goes nowhere (and doesn't bring the tab back).
         model.update(Event::Tab(Tab::Overview));
         assert!(model.shared_screen().is_none());

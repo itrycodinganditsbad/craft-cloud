@@ -2260,6 +2260,8 @@ impl Model {
         }
         let new_usage_request = (status.signed_in && account_changed).then(|| self.next_usage_request());
         let mut effects = Vec::new();
+        let access_now = self.access.clone();
+        let mut reset_shared = false;
         self.status = Some(status.clone());
         if let Some(wanted) = app_autostart_wanted(&status, self.login_entry)
             && self.app_autostart != Some(wanted)
@@ -2292,7 +2294,17 @@ impl Model {
                 Screen::Security(page) => page.overview.status = status,
                 Screen::Admin(admin) => admin.overview.status = status,
                 Screen::Activity(activity) => activity.overview.status = status,
-                Screen::Shared(shared) => shared.overview.status = status,
+                Screen::Shared(shared) => {
+                    if account_changed {
+                        // Another account: nothing of the old one's spaces, members or answers in flight stays.
+                        let mut overview = Overview::new(status);
+                        overview.access = access_now.clone();
+                        **shared = SharedScreen::new(overview);
+                        reset_shared = true;
+                    } else {
+                        shared.overview.status = status;
+                    }
+                }
                 // The join's own answer moves on from there.
                 Screen::Joining { .. } => {}
                 Screen::Versions(_) | Screen::Trash(_) | Screen::Files(_) => {}
@@ -2310,6 +2322,9 @@ impl Model {
             }
             if let Some(effect) = new_usage_request {
                 effects.push(effect);
+            }
+            if reset_shared {
+                effects.extend(self.ask_spaces());
             }
             return effects;
         }

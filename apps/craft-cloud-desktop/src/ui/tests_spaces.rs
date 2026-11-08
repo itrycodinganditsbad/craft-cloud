@@ -196,7 +196,7 @@ fn snapshot_a_syncing_space_with_held_deletes() {
     let mut model = open(&w.agent, w.studio);
     shot(&model, egui::Theme::Light, "shared-space-editor", [WINDOW_SIZE[0], 900.0]);
     run(&mut model, &w.agent, vec![Event::Spaces(SpacesMsg::CheckDeletes)]);
-    assert!(matches!(model.shared_screen().and_then(|s| s.page()).map(|p| p.deletes.clone()), Some(Deletes::Asking { .. })));
+    assert!(matches!(model.shared_screen().and_then(|s| s.page()).map(|p| p.deletes.clone()), Some(Deletes::Asking(_))));
     shots(&model, "shared-space-deletes");
 }
 
@@ -278,7 +278,7 @@ fn an_owners_page_has_the_owner_controls_and_the_buttons_send_their_events() {
     for label in ["Rename", "Invite", "Leave this space", "Open folder"] {
         assert!(h.query_by_label(label).is_some(), "{label}");
     }
-    assert_eq!(h.query_all_by_label("Remove").count(), 4, "one per member");
+    assert_eq!(h.query_all_by_label("Remove").count(), 3, "one per member but the account itself");
     h.get_by_label("Invite").click();
     assert!(events_of(&mut h).contains(&Event::Spaces(SpacesMsg::SubmitInvite)));
     h.get_by_label("Rename").click();

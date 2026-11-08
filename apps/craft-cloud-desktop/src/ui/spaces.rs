@@ -9,7 +9,7 @@ use super::confirm;
 use super::kit::{self, Column, Tokens, Tone};
 use crate::model::Event;
 use crate::spaces::{
-    ARCHIVED_BANNER, Deletes, Doing, Look, NO_ACCESS_BANNER, READ_ONLY_BANNER, SharedScreen, SpacePage, SpacesMsg, SyncOffer, TOO_OLD, Used,
+    ARCHIVED_BANNER, Deletes, Doing, Look, NO_ACCESS_BANNER, READ_ONLY_BANNER, SERVER_TOO_OLD, SharedScreen, SpacePage, SpacesMsg, SyncOffer, TOO_OLD, Used,
     folder_line, role_label, space_name, state_tags,
 };
 
@@ -33,9 +33,9 @@ fn tone(look: Look) -> Tone {
 }
 
 pub(super) fn show(ui: &mut egui::Ui, shared: &mut SharedScreen, now_ms: i64, events: &mut Vec<Event>) {
-    if shared.too_old {
+    if shared.too_old || shared.server_old {
         super::heading(ui, "Shared");
-        too_old(ui);
+        too_old(ui, shared.too_old);
         return;
     }
     let me = shared.overview.status.account.clone().unwrap_or_default();
@@ -52,7 +52,7 @@ pub(super) fn show(ui: &mut egui::Ui, shared: &mut SharedScreen, now_ms: i64, ev
             let offer = shared.offer.clone().filter(|o| o.space == space);
             let busy = shared.doing.clone();
             let notice = shared.notice.clone();
-            let retry = shared.retry.is_some();
+            let retry = shared.retry_here();
             let Some(page) = shared.page_mut() else { return };
             space_page(ui, &info, page, &used, owner, offer.as_ref(), busy.as_ref(), notice.as_deref(), retry, &me, now_ms, events);
         }
@@ -60,19 +60,17 @@ pub(super) fn show(ui: &mut egui::Ui, shared: &mut SharedScreen, now_ms: i64, ev
 }
 
 /// What an agent that doesn't know team spaces gets: one line, and nothing to click.
-fn too_old(ui: &mut egui::Ui) {
+fn too_old(ui: &mut egui::Ui, agent: bool) {
     let t = Tokens::get(ui.ctx());
+    let (line, why) = if agent {
+        (TOO_OLD, "The Craft Cloud program on this computer is older than this window. Install the same version of both.")
+    } else {
+        (SERVER_TOO_OLD, "Your own files sync as before; only team spaces need the newer server.")
+    };
     kit::card(ui, Some("Team spaces"), |ui| {
-        ui.add(egui::Label::new(RichText::new(TOO_OLD).color(t.ink_strong)).wrap());
+        ui.add(egui::Label::new(RichText::new(line).color(t.ink_strong)).wrap());
         ui.add_space(4.0);
-        ui.add(
-            egui::Label::new(
-                RichText::new("The Craft Cloud program on this computer is older than this window. Install the same version of both.")
-                    .small()
-                    .color(t.muted),
-            )
-            .wrap(),
-        );
+        ui.add(egui::Label::new(RichText::new(why).small().color(t.muted)).wrap());
     });
 }
 
@@ -98,7 +96,7 @@ fn list(ui: &mut egui::Ui, shared: &SharedScreen, events: &mut Vec<Event>) {
     }
     if let Some(error) = &shared.error_action {
         super::error_line(ui, error);
-        if shared.retry.is_some() && kit::text_link(ui, "Try again", 11.0).clicked() {
+        if shared.retry_here() && kit::text_link(ui, "Try again", 11.0).clicked() {
             send(events, SpacesMsg::Retry);
         }
         ui.add_space(6.0);
@@ -360,7 +358,7 @@ fn space_page(
         ui.add_space(6.0);
     }
     // The confirmations share one focus slot: with none open the next one to open takes the focus.
-    if page.removing.is_none() && !page.leaving && !matches!(page.deletes, Deletes::Asking { .. }) {
+    if page.removing.is_none() && !page.leaving && !matches!(page.deletes, Deletes::Asking(_)) {
         confirm::idle(ui);
     }
     ui.scope(|ui| {
@@ -579,13 +577,20 @@ fn deletes_panel(ui: &mut egui::Ui, page: &SpacePage, doing: Option<&Doing>, eve
         let checking = matches!(doing, Some(Doing::CheckingDeletes));
         let approving = matches!(doing, Some(Doing::ApprovingDeletes));
         match &page.deletes {
-            Deletes::Asking { lines, .. } => {
-                let count = lines.len();
-                for line in lines.iter().take(5) {
-                    ui.label(RichText::new(line).monospace().small().color(t.ink));
+            Deletes::Asking(list) => {
+                let count = list.total;
+                // Every path the agent listed, in a scroll area; the note says when the agent listed only the first of them.
+                egui::ScrollArea::vertical().id_salt("held-deletes").max_height(180.0).auto_shrink([false, true]).show(ui, |ui| {
+                    for entry in &list.entries {
+                        let side = if entry.side == "here" { "delete here" } else { "delete on the server" };
+                        ui.label(RichText::new(format!("{side}: {}", entry.path)).monospace().small().color(t.ink));
+                    }
+                });
+                if let Some(note) = list.shown_note() {
+                    ui.label(RichText::new(note).small().color(t.muted));
                 }
-                if count > 5 {
-                    ui.label(RichText::new(format!("… and {} more", count - 5)).small().color(t.muted));
+                if list.linked > 0 {
+                    ui.label(RichText::new(format!("{} more are held behind a link; `craft-cloud-agent status` lists them.", list.linked)).small().color(t.muted));
                 }
                 ui.add_space(4.0);
                 let text = if count == 1 {
@@ -594,7 +599,7 @@ fn deletes_panel(ui: &mut egui::Ui, page: &SpacePage, doing: Option<&Doing>, eve
                     format!("{count} deletions are held back. Approve them?")
                 };
                 let panel = confirm::Panel {
-                    key: egui::Id::new(("approve-deletes", count)),
+                    key: egui::Id::new(("approve-deletes", list.set.clone())),
                     title: "Approve the held deletes?",
                     text: &text,
                     confirm: "Approve deletes",
@@ -611,6 +616,14 @@ fn deletes_panel(ui: &mut egui::Ui, page: &SpacePage, doing: Option<&Doing>, eve
                     busy_line(ui, "Approving…");
                 }
                 return;
+            }
+            Deletes::Linked(count) => {
+                let text = if *count == 1 {
+                    "1 deletion is held behind a link. Only `craft-cloud-agent sync --approve-deletes` releases it.".to_owned()
+                } else {
+                    format!("{count} deletions are held behind a link. Only `craft-cloud-agent sync --approve-deletes` releases them.")
+                };
+                ui.add(egui::Label::new(RichText::new(text).color(t.warn)).wrap());
             }
             Deletes::NoneHeld => {
                 ui.label("No deletions are being held back.");
@@ -696,6 +709,8 @@ fn role_picker(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, ro
 }
 
 fn members_table(ui: &mut egui::Ui, members: &[SpaceMember], owner: bool, doing: Option<&Doing>, me: &str, events: &mut Vec<Event>) {
+    // The account's own row has no role picker and no Remove: leaving is Leave's.
+    let mine = |member: &SpaceMember| member.username.eq_ignore_ascii_case(me);
     let t = Tokens::get(ui.ctx());
     let columns = [Column::flex("Account", 100.0).weighted(2.0), Column::fixed("Role", 124.0), Column::fixed("State", 84.0), Column::fixed("", 96.0)];
     kit::table(ui, "space-members", &columns, members.len(), MEMBER_ROW_H, |ui, row, column| {
@@ -703,12 +718,12 @@ fn members_table(ui: &mut egui::Ui, members: &[SpaceMember], owner: bool, doing:
         match column {
             0 => {
                 kit::truncated(ui, RichText::new(&member.username).strong());
-                if member.username == me {
+                if mine(member) {
                     ui.label(RichText::new("(you)").color(t.muted));
                 }
             }
             1 => {
-                if owner {
+                if owner && !mine(member) {
                     let mut role = member.role;
                     if role_picker(ui, ("member-role", member.user), &mut role) {
                         send(events, SpacesMsg::SetRole { user: member.user, role });
@@ -725,7 +740,7 @@ fn members_table(ui: &mut egui::Ui, members: &[SpaceMember], owner: bool, doing:
                 }
             }
             _ => {
-                if owner && ui.add_enabled(doing.is_none(), kit::Button::new("Remove")).clicked() {
+                if owner && !mine(member) && ui.add_enabled(doing.is_none(), kit::Button::new("Remove")).clicked() {
                     send(events, SpacesMsg::AskRemove(member.user));
                 }
             }
