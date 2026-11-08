@@ -240,15 +240,30 @@ did.
   read-only: `status().viewer` is true, the badge says "Read-only", `can_undo()` is false, and `local_change`, `undo` and
   `redo` refuse with `KitError::ViewOnly` (the same path as a document of a newer app, `KitError::ReadOnly`, which `viewer`
   does not set). Nothing is sent, and `save_point` refuses (`KitError::NoRecord`), so the app saves its own model without a
-  record. A role lowered while the document is open shows when the agent refuses a change with `read_only`: the session
-  becomes a viewer then, the refused change is never sent again (unlike a refusal for a full disk, which goes again), and the
-  changes made before stay in the window. Open the document again to find out whether the role changed.
+  record. A role that changes while the document is open is told by the agent (`role`, both ways): the session flips
+  `viewer` at once, and a refusal with `read_only` for a change sent just before also makes it one. The refused change is
+  never sent again (unlike a refusal for a full disk, which goes again) and stays queued, unsent; when the role is raised
+  the queue goes up at once, with no new open. If the app ends first, dropping the session hands the queue to the agent,
+  which keeps it and sends it once the account may write (best effort: when the agent is not there, the changes are in
+  the window and, once saved, in the file only).
+- **A space that stops syncing** (turned off, the folder moved, access lost): the agent tells the open document it stopped
+  following it (`status().stopped`, badge Stopped), nothing is sent, and a change the agent answers with `not_found` is
+  not sent again either; the changes stay in the window, so save the document. `reconnect_now()` opens it again if the
+  space is back.
 - **Binary values.** `session.blobs()` is the agent's blob store bound to the document's file, so its blobs go to the
   document's space and every member gets them back. Use it where an app wrote `AgentBlobs(client.blobs())`; that keeps blobs
   in the account's personal space, where the other members get `blob_not_found`. Call `session.check_blobs(&store)` once
   where the app builds its store: in a team space an agent store that isn't bound to the document adds a text to
-  `session.warnings()` (once per session) and returns false. Behind it, `client.blobs().for_path(path)` is the bound store of
-  `craft-cloud-app`, and `Blobs::put_for`/`get_for` name the path on every call.
+  `session.warnings()` (once per session) and returns false, as does a store bound to another document's file (an app that
+  builds one store and uses it for every document). `check_blobs` asks the agent once whether the space is a team space:
+  call it where the store is built, not on the UI thread; if the agent can't answer, the store is not trusted. A team document
+  is opened by an absolute path inside the space's synced folder (the agent routes by path); a store bound to a relative path
+  keeps blobs in the personal space. A viewer's put into a team space is `KitError::ViewOnly`. Behind it,
+  `client.blobs().for_path(path)` is the bound store of `craft-cloud-app`, and `Blobs::put_for`/`get_for` name the path on every
+  call.
+
+`KitError` and `Person` are `#[non_exhaustive]` from this release (match `KitError` with a wildcard arm; make a `Person` with
+`Person::new`), so later additions are not breaking; `Status` stays exhaustive and gained the field `viewer`.
 
 ## Craft Cloud's piece of the window
 
