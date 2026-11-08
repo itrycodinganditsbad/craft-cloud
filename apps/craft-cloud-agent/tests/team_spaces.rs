@@ -1472,12 +1472,13 @@ async fn a_state_that_cannot_be_removed_fails_the_turn_off_and_is_never_trusted_
     let state_path = t.ben.data.path().join("spaces").join(space.to_string()).join("state.json");
     assert!(state_path.is_file());
 
+    let generation = |t: &Team| t.ben.data.load_account().unwrap().unwrap().spaces.iter().find(|s| s.space == space).map(|s| s.generation);
+    let before = generation(&t).unwrap();
     let held = Held::new(&state_path);
     let off = t.ben.api(move |c| c.set_space_sync(space, &SpaceSyncRequest { on: false, folder: None, adopt: false })).await;
     assert!(off.is_err(), "the state could not be removed: the turn-off is not acknowledged: {off:?}");
     assert!(state_path.is_file(), "the state survived");
-    let account = t.ben.data.load_account().unwrap().unwrap();
-    assert_eq!(account.spaces.iter().find(|s| s.space == space).map(|s| s.generation), Some(1), "the generation was raised and saved");
+    assert_eq!(generation(&t), Some(before + 1), "the generation was raised and saved");
 
     // The agent stops while the file is still held (nothing replaces it), then files are deleted here.
     let (exit, out) = t.ben.stop().await;
