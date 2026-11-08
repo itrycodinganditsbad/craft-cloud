@@ -51,25 +51,29 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, State};
 use axum::response::Response;
-use craft_cloud_meta::DeviceAuth;
-use craft_cloud_proto::api::codes;
+use craft_cloud_meta::{DeviceAuth, UserId};
+use craft_cloud_proto::api::{SpaceRole, codes};
 use craft_cloud_proto::live::{
-    AppName, ClientFrame, DOCUMENT_KIND_PREFIX, DocKind, LIVE_DOCUMENTS_PROTOCOL, MAX_FRAME_BYTES, MAX_SUBSCRIPTIONS, MAX_UPDATE_BYTES,
-    PROTOCOL_MISMATCH, ServerFrame, node_doc, shared_version, update_hash,
+    ACCESS_CHANGED, ACCESS_CHANGED_CLOSE, AppName, ClientFrame, DOCUMENT_KIND_PREFIX, DocKind, LIVE_DOCUMENTS_PROTOCOL, LIVE_PROTOCOL_MAX,
+    LIVE_PROTOCOL_MIN, LIVE_SPACES_PROTOCOL, MAX_FRAME_BYTES, MAX_SUBSCRIPTIONS, MAX_UPDATE_BYTES, PROTOCOL_MISMATCH, ServerFrame, node_doc,
+    shared_version, update_hash,
 };
 use craft_cloud_proto::{DeviceId, DocId, Epoch, ManifestId, NodeId, SpaceId};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::time::Instant;
+use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::space::SpaceAccess;
 use crate::state::{AppState, Limits};
 
-/// Live connections one device may hold at once (a reconnect may overlap the old connection for a moment).
+/// Live connections one device may hold at once to one space (a reconnect may overlap the old connection for a moment).
 pub const MAX_CONNECTIONS_PER_DEVICE: usize = 4;
+/// …and to all its spaces together.
+pub const MAX_CONNECTIONS_PER_DEVICE_TOTAL: usize = 32;
 /// Updates (and creates) a connection may send at once before it is refilled…
 pub const UPDATE_BURST: u32 = 400;
 /// …at this many per second.
@@ -81,8 +85,8 @@ pub const PUMP_PAGE: u32 = 256;
 pub const PUMP_BYTES: u64 = 4 * 1024 * 1024;
 /// The agent must say `hello` this soon after connecting.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-/// The server pings this often…
-const PING_EVERY: Duration = Duration::from_secs(30);
+/// The server pings this often (by default; [`Limits::live_ping`])…
+pub const PING_EVERY: Duration = Duration::from_secs(30);
 /// …and closes a connection it heard nothing from (not even a pong) for this long.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// A frame the agent doesn't read within this long closes the connection.
@@ -103,6 +107,9 @@ pub struct PresenceNote {
     pub bytes: Arc<Vec<u8>>,
     /// The session it came from (not sent back to it).
     pub from: u64,
+    /// The account of the session it came from, as the server knows it: relayed as `presence_from {user}` on protocol 3,
+    /// whatever the bytes say.
+    pub user: Uuid,
 }
 
 /// One document's compaction: the request out (to which session and device, for which `upto`, since when), and the
@@ -119,9 +126,11 @@ struct Compaction {
 pub struct LiveHub {
     spaces: Mutex<HashMap<SpaceId, broadcast::Sender<DocId>>>,
     presence: Mutex<HashMap<SpaceId, broadcast::Sender<PresenceNote>>>,
-    connections: Mutex<HashMap<DeviceId, usize>>,
+    connections: Mutex<Connections>,
     subscriptions: Mutex<HashMap<DeviceId, usize>>,
     revoked: broadcast::Sender<DeviceId>,
+    /// An account whose access changed everywhere (disabled, marked for removal): each of its connections looks again.
+    revoked_users: broadcast::Sender<Uuid>,
     compactions: Mutex<HashMap<(SpaceId, DocId), Compaction>>,
     /// Each device's presence budget per document, across its connections.
     presence_budgets: Mutex<HashMap<(DeviceId, DocId), Budget>>,
@@ -138,6 +147,7 @@ impl Default for LiveHub {
             connections: Mutex::default(),
             subscriptions: Mutex::default(),
             revoked: broadcast::channel(64).0,
+            revoked_users: broadcast::channel(64).0,
             compactions: Mutex::default(),
             presence_budgets: Mutex::default(),
         }
@@ -147,15 +157,54 @@ impl Default for LiveHub {
 /// Sessions are numbered, so a presence message isn't sent back to the one it came from.
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
-/// One of a device's live connections; frees its slot when dropped.
+/// The process's registry of open live connections: how many each device holds to each space, and in all. (Another
+/// server process on the same database has its own; the limits are per process, like the rest of the hub.)
+#[derive(Default)]
+struct Connections {
+    per_space: HashMap<(DeviceId, SpaceId), usize>,
+    per_device: HashMap<DeviceId, usize>,
+}
+
+impl Connections {
+    /// Takes a place for `device` in `space`; false when it holds [`MAX_CONNECTIONS_PER_DEVICE`] to that space or
+    /// [`MAX_CONNECTIONS_PER_DEVICE_TOTAL`] in all.
+    fn take(&mut self, device: DeviceId, space: SpaceId) -> bool {
+        let total = self.per_device.get(&device).copied().unwrap_or(0);
+        let here = self.per_space.get(&(device, space)).copied().unwrap_or(0);
+        if here >= MAX_CONNECTIONS_PER_DEVICE || total >= MAX_CONNECTIONS_PER_DEVICE_TOTAL {
+            return false;
+        }
+        self.per_space.insert((device, space), here + 1);
+        self.per_device.insert(device, total + 1);
+        true
+    }
+
+    fn release(&mut self, device: DeviceId, space: SpaceId) {
+        if let Some(here) = self.per_space.get_mut(&(device, space)) {
+            *here = here.saturating_sub(1);
+            if *here == 0 {
+                self.per_space.remove(&(device, space));
+            }
+        }
+        if let Some(total) = self.per_device.get_mut(&device) {
+            *total = total.saturating_sub(1);
+            if *total == 0 {
+                self.per_device.remove(&device);
+            }
+        }
+    }
+}
+
+/// One of a device's live connections to a space; frees its place when dropped.
 pub struct ConnectionSlot {
     hub: Arc<AppState>,
     device: DeviceId,
+    space: SpaceId,
 }
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        release(&self.hub.live.connections, self.device, 1);
+        self.hub.live.connections.lock().unwrap_or_else(PoisonError::into_inner).release(self.device, self.space);
     }
 }
 
@@ -181,6 +230,23 @@ fn take(counts: &Mutex<HashMap<DeviceId, usize>>, device: DeviceId, max: usize) 
 }
 
 impl LiveHub {
+    /// Registers a connection of `device` to `space`, or `None` when the device holds too many.
+    pub fn open_connection(&self, state: &Arc<AppState>, device: DeviceId, space: SpaceId) -> Option<ConnectionSlot> {
+        let taken = self.connections.lock().unwrap_or_else(PoisonError::into_inner).take(device, space);
+        taken.then(|| ConnectionSlot { hub: state.clone(), device, space })
+    }
+
+    /// `user`'s access may have changed everywhere (the account was disabled or marked for removal): each of its live
+    /// connections looks again and ends if its access is gone. Connections of other accounts are untouched.
+    pub fn revoke_user(&self, user: UserId) {
+        let _ = self.revoked_users.send(user.0);
+    }
+
+    /// A receiver of the accounts [`LiveHub::revoke_user`] names from now on.
+    pub fn user_revocations(&self) -> broadcast::Receiver<Uuid> {
+        self.revoked_users.subscribe()
+    }
+
     /// `device` was revoked: its live connections end. (One revoked by another process, the admin CLI, is found by the
     /// check every connection makes at each ping.)
     pub fn revoke(&self, device: DeviceId) {
@@ -325,15 +391,6 @@ struct Subscription {
     import: bool,
 }
 
-/// The newest live protocol this server answers `hello` with. Protocol 3 (team spaces) is in the wire format already but
-/// the server does not serve it yet, so it answers a newer agent with protocol 2, exactly as before.
-const SERVER_LIVE_MAX: u32 = LIVE_DOCUMENTS_PROTOCOL;
-
-/// The protocol a `hello` naming `min` to `max` gets: the highest both speak, within what the server serves.
-fn negotiate(min: u32, max: u32) -> Option<u32> {
-    shared_version(min, max).map(|protocol| protocol.min(SERVER_LIVE_MAX)).filter(|protocol| *protocol >= min)
-}
-
 /// What [`Session::handle`] answers.
 #[derive(Debug, Default)]
 pub struct Reply {
@@ -347,6 +404,13 @@ pub struct Session {
     state: Arc<AppState>,
     space: SpaceId,
     device: DeviceId,
+    /// The device's account: presence is stamped with it, and its access to the space is read again as it changes.
+    user: UserId,
+    /// The account's role in the space when the connection was opened (`Owner` in its own personal space). The
+    /// connection ends when it changes ([`Session::check_access`]).
+    role: SpaceRole,
+    /// Whether the space is the account's own personal space (not a team space).
+    personal: bool,
     welcomed: bool,
     /// The live protocol agreed at `hello` (0 before).
     protocol: u32,
@@ -379,16 +443,19 @@ impl Session {
     /// A session for the signed-in device `auth`. The caller listens to the space ([`LiveHub::listen`]) before the
     /// session reads anything, and hands it what it hears ([`Session::note`], [`Session::lagged`]).
     pub fn new(state: Arc<AppState>, auth: &DeviceAuth) -> Self {
-        Self::in_space(state, auth.device, auth.personal_space())
+        Self::in_space(state, auth, auth.personal_space(), SpaceRole::Owner, true)
     }
 
-    /// A session of `device` on `space`, which the caller has checked the device's account may use.
-    pub fn in_space(state: Arc<AppState>, device: DeviceId, space: SpaceId) -> Self {
+    /// A session of the device `auth` on `space`, where the space layer found its account to have `role`.
+    pub fn in_space(state: Arc<AppState>, auth: &DeviceAuth, space: SpaceId, role: SpaceRole, personal: bool) -> Self {
         let budget = Budget::new(&state.limits);
         Self {
             state,
             space,
-            device,
+            device: auth.device,
+            user: auth.user,
+            role,
+            personal,
             welcomed: false,
             protocol: 0,
             id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
@@ -405,31 +472,115 @@ impl Session {
         self.protocol >= LIVE_DOCUMENTS_PROTOCOL
     }
 
+    /// Whether the connection speaks team spaces (protocol 3 on): `welcome_space`, `presence_from`.
+    fn spaces(&self) -> bool {
+        self.protocol >= LIVE_SPACES_PROTOCOL
+    }
+
+    /// The server's side of `hello`: the space's epoch and, in a team space, the account's role read again (it may have
+    /// changed since the upgrade), and the frame that tells the agent: `welcome`, or `welcome_space` on protocol 3.
+    async fn hello(&mut self, protocol: u32) -> Result<ServerFrame, Reply> {
+        let closing = |code: &str, message: String| Reply { frames: vec![ServerFrame::error(code, message, None, None)], close: true };
+        if !self.personal {
+            match self.state.meta.space_access(self.user, self.space).await {
+                Ok(Some(role)) => self.role = role,
+                Ok(None) => return Err(closing(ACCESS_CHANGED, "you no longer have access to this space".to_owned())),
+                Err(e) => {
+                    let e = ApiError::from(e);
+                    return Err(closing(e.code, e.message));
+                }
+            }
+        }
+        let epoch = match self.state.meta.live_epoch(self.space).await {
+            Ok(epoch) => epoch,
+            Err(e) => {
+                let e = ApiError::from(e);
+                return Err(closing(e.code, e.message));
+            }
+        };
+        self.epoch = Some(epoch);
+        Ok(if self.spaces() || protocol >= LIVE_SPACES_PROTOCOL {
+            ServerFrame::WelcomeSpace { protocol, epoch, space: self.space, role: self.role }
+        } else {
+            ServerFrame::Welcome { protocol, epoch }
+        })
+    }
+
+    /// Whether the account may still do what it did when the connection opened: `Some(the frame to end with)` when it is
+    /// no longer a member, when its role changed (a role lowered, the space archived, the space unarchived) or when the
+    /// account was disabled or marked for removal. The agent connects again and gets the role it has now, or a refusal.
+    /// Read from the database, never from a cache. A database that cannot be read ends nothing: the next check asks again.
+    async fn check_access(&mut self) -> Option<ServerFrame> {
+        let now = self.state.meta.space_access(self.user, self.space).await.ok()?;
+        (now != Some(self.role)).then(|| ServerFrame::error(ACCESS_CHANGED, "your access to this space changed; connect again", None, None))
+    }
+
+    /// The role a frame needs, in a team space: `create`, `update` and `snapshot` need an editor; `subscribe` and
+    /// `subscribe_log` a viewer (a read that starts a catch-up). Presence and `unsubscribe` need only the membership the
+    /// connection was opened with, which the ping and a change of the space's members re-check.
+    fn role_needed(frame: &ClientFrame) -> Option<SpaceRole> {
+        match frame {
+            ClientFrame::Create { .. } | ClientFrame::CreateDocument { .. } | ClientFrame::Update { .. } | ClientFrame::Snapshot { .. } => {
+                Some(SpaceRole::Editor)
+            }
+            ClientFrame::Subscribe { .. } | ClientFrame::SubscribeLog { .. } => Some(SpaceRole::Viewer),
+            ClientFrame::Hello { .. } | ClientFrame::Unsubscribe { .. } | ClientFrame::Presence { .. } => None,
+        }
+    }
+
+    /// The role check of one frame in a team space, before anything else is done with it: the account's access is read
+    /// from the database now (so a change made by another process, the command line, is respected at once, not at the
+    /// next ping); a connection whose access is not the one it was opened with ends, and a viewer's write is refused with
+    /// `read_only` and changes nothing. `None` lets the frame through.
+    async fn gate(&mut self, frame: &ClientFrame) -> Option<Reply> {
+        if self.personal {
+            return None;
+        }
+        let need = Self::role_needed(frame)?;
+        if let Some(ended) = self.check_access().await {
+            return Some(Reply { frames: vec![ended], close: true });
+        }
+        if self.role >= need {
+            return None;
+        }
+        let (doc, client_seq) = match frame {
+            ClientFrame::Create { doc, .. }
+            | ClientFrame::CreateDocument { doc, .. }
+            | ClientFrame::Snapshot { doc, .. }
+            | ClientFrame::Subscribe { doc, .. }
+            | ClientFrame::SubscribeLog { doc, .. } => (Some(*doc), None),
+            ClientFrame::Update { doc, client_seq, .. } => (Some(*doc), Some(*client_seq)),
+            ClientFrame::Hello { .. } | ClientFrame::Unsubscribe { .. } | ClientFrame::Presence { .. } => (None, None),
+        };
+        Some(Reply { frames: vec![refused(crate::space::read_only(), doc, client_seq)], close: false })
+    }
+
     /// Handles one frame from the agent.
     pub async fn handle(&mut self, frame: ClientFrame) -> Reply {
         let one = |frame| Reply { frames: vec![frame], close: false };
         if !self.welcomed {
             return match frame {
-                ClientFrame::Hello { min, max } => match negotiate(min, max) {
-                    Some(protocol) => match self.state.meta.live_epoch(self.space).await {
-                        Ok(epoch) => {
+                ClientFrame::Hello { min, max } => match shared_version(min, max) {
+                    // A team space has a role per frame, which protocol 2 has no way to say: a connection to one that does not
+                    // reach protocol 3 is refused, like a version nobody shares.
+                    Some(protocol) if protocol < LIVE_SPACES_PROTOCOL && !self.personal => Reply {
+                        frames: vec![ServerFrame::error(PROTOCOL_MISMATCH, "team spaces need live protocol 3: update the agent", None, None)],
+                        close: true,
+                    },
+                    Some(protocol) => match self.hello(protocol).await {
+                        Ok(frame) => {
                             self.welcomed = true;
                             self.protocol = protocol;
-                            self.epoch = Some(epoch);
-                            one(ServerFrame::Welcome { protocol, epoch })
+                            one(frame)
                         }
-                        Err(e) => {
-                            let e = ApiError::from(e);
-                            Reply { frames: vec![ServerFrame::error(e.code, e.message, None, None)], close: true }
-                        }
+                        Err(reply) => reply,
                     },
                     None => Reply {
                         frames: vec![ServerFrame::error(
                             PROTOCOL_MISMATCH,
                             format!(
                                 "the server speaks live protocol {}-{}, the agent {min}-{max}: update the older one",
-                                craft_cloud_proto::live::LIVE_PROTOCOL_MIN,
-                                SERVER_LIVE_MAX
+                                LIVE_PROTOCOL_MIN, LIVE_PROTOCOL_MAX
                             ),
                             None,
                             None,
@@ -439,6 +590,9 @@ impl Session {
                 },
                 _ => Reply { frames: vec![ServerFrame::error(codes::INVALID, "say hello first", None, None)], close: true },
             };
+        }
+        if let Some(reply) = self.gate(&frame).await {
+            return reply;
         }
         match frame {
             ClientFrame::Hello { .. } => one(ServerFrame::error(codes::INVALID, "hello was said already", None, None)),
@@ -536,13 +690,20 @@ impl Session {
         if !self.state.live.spend_presence(self.device, doc, self.state.limits.presence_per_sec) || !self.budget.spend() {
             return;
         }
-        self.state.live.publish_presence(self.space, PresenceNote { doc, bytes: Arc::new(bytes), from: self.id });
+        // The account is the server's: whatever the bytes say, the others are told who sent them.
+        self.state.live.publish_presence(self.space, PresenceNote { doc, bytes: Arc::new(bytes), from: self.id, user: self.user.0 });
     }
 
     /// Another connection's presence message: the frame for this one's agent, if it follows the document.
     pub fn relay(&self, note: &PresenceNote) -> Option<ServerFrame> {
-        (self.documents() && note.from != self.id && self.subscriptions.contains_key(&note.doc))
-            .then(|| ServerFrame::Presence { doc: note.doc, bytes: note.bytes.as_ref().clone() })
+        (self.documents() && note.from != self.id && self.subscriptions.contains_key(&note.doc)).then(|| {
+            let bytes = note.bytes.as_ref().clone();
+            if self.spaces() {
+                ServerFrame::PresenceFrom { doc: note.doc, bytes, user: note.user }
+            } else {
+                ServerFrame::Presence { doc: note.doc, bytes }
+            }
+        })
     }
 
     /// The `compact` to ask this session's agent for, if the log above the snapshot is long (`upto - base` updates,
@@ -550,7 +711,8 @@ impl Session {
     fn maybe_compact(&mut self, doc: DocId, upto: u64, base: u64, above: u64) -> Option<ServerFrame> {
         let limits = &self.state.limits;
         let long = upto.saturating_sub(base) > limits.compact_updates || above > limits.compact_bytes;
-        if !self.documents() || !long || self.asked.get(&doc).is_some_and(|asked| *asked >= upto) {
+        // A viewer could not upload the snapshot (it cannot write), so it is never asked.
+        if !self.documents() || !self.role.may_write() || !long || self.asked.get(&doc).is_some_and(|asked| *asked >= upto) {
             return None;
         }
         if !self.state.live.ask_compaction(self.space, doc, self.id, self.device, limits) {
@@ -693,12 +855,18 @@ impl Session {
     }
 
     /// The check every connection makes at each ping: `Some(the frame to close with)` when the connection must end. A
-    /// device revoked by another process (the admin CLI) is found here, at the latest one ping later; so is a space
+    /// device revoked by another process (the admin CLI) is found here, at the latest one ping later; so is a change of
+    /// the account's access to the space ([`Session::check_access`]) and a space
     /// whose live epoch changed (a restore from a backup, or a `live reset-doc`) while the connection was open: the agent
     /// connects again and learns the new one in `welcome`.
     pub async fn check(&mut self) -> Option<ServerFrame> {
         if !self.state.meta.device_active(self.device).await.unwrap_or(true) {
             return Some(ServerFrame::error(codes::UNAUTHORIZED, "this device was signed out", None, None));
+        }
+        // The account's access, read again: a change made by another process (two servers on one database) or by the
+        // command line is found here, at the latest one ping later.
+        if let Some(ended) = self.check_access().await {
+            return Some(ended);
         }
         if let Some(epoch) = self.epoch
             && let Ok(now) = self.state.meta.live_epoch(self.space).await
@@ -779,18 +947,17 @@ pub async fn connect(
     Extension(access): Extension<SpaceAccess>,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Result<Response, ApiError> {
-    // Live documents of a team space need live protocol 3 (the role per frame, the space in the welcome), which a later
-    // change brings. Until then the upgrade answers a team space as it does a space the caller has no access to, so a viewer
-    // can never write through a protocol that has no role in it. An agent does not ask: it opens no live connection for a
-    // team space on live protocol 2.
-    if !access.personal {
-        return Err(ApiError::not_found("space"));
-    }
     let upgrade = upgrade.map_err(|e| ApiError::new(e.status(), codes::INVALID, e.body_text()))?;
-    if !take(&state.live.connections, auth.device, MAX_CONNECTIONS_PER_DEVICE) {
-        return Err(ApiError::rate_limited(format!("a device may hold at most {MAX_CONNECTIONS_PER_DEVICE} live connections"), Some(5)));
-    }
-    let slot = ConnectionSlot { hub: state.clone(), device: auth.device };
+    // The space layer found the caller a member of the space (a non-member was refused with 404 before this) and read its
+    // role. A team space is served on live protocol 3 only: `hello` refuses a connection that does not reach it.
+    let Some(slot) = state.live.open_connection(&state, auth.device, access.space) else {
+        return Err(ApiError::rate_limited(
+            format!(
+                "a device may hold at most {MAX_CONNECTIONS_PER_DEVICE} live connections to a space and {MAX_CONNECTIONS_PER_DEVICE_TOTAL} in all"
+            ),
+            Some(5),
+        ));
+    };
     // Listening for revocations before the device is looked up once more, and before the upgrade: a revoke between
     // the sign-in check and here is seen by the lookup, one after it by the receiver, so none is missed.
     let revocations = state.live.revocations();
@@ -803,7 +970,12 @@ pub async fn connect(
         // Listening before the session reads anything, so no update falls between a read and the notification.
         let notes = state.live.listen(access.space);
         let presence = state.live.listen_presence(access.space);
-        serve(socket, Session::in_space(state, auth.device, access.space), notes, presence, revocations).await;
+        // …and to changes of the space's members, before `hello` reads the role: a change before it is read there, one
+        // after it is heard here.
+        let members = state.notifier.subscribe_members(access.space);
+        let users = state.live.user_revocations();
+        let session = Session::in_space(state, &auth, access.space, access.role, access.personal);
+        serve(socket, session, Streams { notes, presence, revocations, members, users }).await;
     }))
 }
 
@@ -828,18 +1000,35 @@ async fn send_all(socket: &mut WebSocket, frames: &[ServerFrame]) -> bool {
     true
 }
 
+/// What a connection listens to besides its agent.
+struct Streams {
+    /// Documents of the space that got an update.
+    notes: broadcast::Receiver<DocId>,
+    /// Presence messages of the space.
+    presence: broadcast::Receiver<PresenceNote>,
+    /// Devices revoked through the API.
+    revocations: broadcast::Receiver<DeviceId>,
+    /// Changes of the space's members, roles and life cycle: the account's access is read again at once.
+    members: watch::Receiver<u64>,
+    /// Accounts disabled or marked for removal.
+    users: broadcast::Receiver<Uuid>,
+}
+
+/// Whether `frame` ends a connection because the account's access changed.
+fn is_access_changed(frame: &ServerFrame) -> bool {
+    matches!(frame, ServerFrame::Error { code, .. } if code == ACCESS_CHANGED)
+}
+
 /// The connection loop: frames in, frames out, the log pumped while a document has news, pings, and an end on
-/// shutdown, silence or a broken connection.
-async fn serve(
-    mut socket: WebSocket,
-    mut session: Session,
-    mut notes: broadcast::Receiver<DocId>,
-    mut presence: broadcast::Receiver<PresenceNote>,
-    mut revocations: broadcast::Receiver<DeviceId>,
-) {
+/// shutdown, silence, a broken connection or a change of the account's access.
+async fn serve(mut socket: WebSocket, mut session: Session, streams: Streams) {
+    let Streams { mut notes, mut presence, mut revocations, mut members, mut users } = streams;
     let mut stopping = session.state.notifier.shutdown_signal();
     let mut last_heard = Instant::now();
-    let mut ping = tokio::time::interval_at(Instant::now() + PING_EVERY, PING_EVERY);
+    // Set when the connection ends because the account's access changed: the close frame says so.
+    let mut access_changed = false;
+    let ping_every = session.state.limits.live_ping;
+    let mut ping = tokio::time::interval_at(Instant::now() + ping_every, ping_every);
     let hello_by = Instant::now() + HELLO_TIMEOUT;
     loop {
         let quiet_until = if session.welcomed { last_heard + IDLE_TIMEOUT } else { hello_by };
@@ -858,7 +1047,32 @@ async fn serve(
                     Ok(frame) => session.handle(frame).await,
                     Err(e) => Reply { frames: vec![ServerFrame::error(codes::INVALID, e.to_string(), None, None)], close: true },
                 };
+                access_changed |= reply.frames.iter().any(is_access_changed);
                 if !send_all(&mut socket, &reply.frames).await || reply.close {
+                    break;
+                }
+            }
+            changed = members.changed() => {
+                // The sender lives as long as the server; if it is gone the server is stopping.
+                if changed.is_err() {
+                    break;
+                }
+                if let Some(frame) = session.check_access().await {
+                    access_changed = true;
+                    let _ = send(&mut socket, &frame).await;
+                    break;
+                }
+            }
+            user = users.recv() => {
+                let ours = match user {
+                    Ok(user) => user == session.user.0,
+                    // Missed some: look again.
+                    Err(broadcast::error::RecvError::Lagged(_)) => true,
+                    Err(broadcast::error::RecvError::Closed) => false,
+                };
+                if ours && let Some(frame) = session.check_access().await {
+                    access_changed = true;
+                    let _ = send(&mut socket, &frame).await;
                     break;
                 }
             }
@@ -894,6 +1108,7 @@ async fn serve(
             }
             _ = ping.tick() => {
                 if let Some(frame) = session.check().await {
+                    access_changed |= is_access_changed(&frame);
                     let _ = send(&mut socket, &frame).await;
                     break;
                 }
@@ -916,7 +1131,8 @@ async fn serve(
             },
         }
     }
-    let _ = socket.send(Message::Close(None)).await;
+    let close = access_changed.then(|| CloseFrame { code: ACCESS_CHANGED_CLOSE, reason: ACCESS_CHANGED.into() });
+    let _ = socket.send(Message::Close(close)).await;
 }
 
 #[cfg(test)]
@@ -927,15 +1143,14 @@ mod tests {
     use craft_cloud_store::Store;
     use craft_cloud_store::memory::MemoryBackend;
 
-    /// Until protocol 3 is served, a newer agent gets protocol 2 and an agent that needs 3 gets a mismatch.
+    /// The server answers a `hello` with the highest protocol both speak, up to 3.
     #[test]
-    fn the_server_answers_at_most_protocol_two_for_now() {
-        assert_eq!(negotiate(1, 1), Some(1));
-        assert_eq!(negotiate(1, 2), Some(2));
-        assert_eq!(negotiate(1, 3), Some(2));
-        assert_eq!(negotiate(2, 9), Some(2));
-        assert_eq!(negotiate(3, 3), None);
-        assert_eq!(negotiate(4, 9), None);
+    fn the_server_answers_the_highest_shared_protocol() {
+        assert_eq!(shared_version(1, 1), Some(1));
+        assert_eq!(shared_version(1, 2), Some(2), "an agent of protocol 2 gets the old frames");
+        assert_eq!(shared_version(1, 3), Some(LIVE_SPACES_PROTOCOL));
+        assert_eq!(shared_version(3, 3), Some(3));
+        assert_eq!(shared_version(4, 9), None);
     }
 
     /// A session of a fresh account's device, past `hello`, with its recents document for `wordcraft` made.

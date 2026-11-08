@@ -47,6 +47,8 @@ pub struct Limits {
     pub compact_timeout: Duration,
     /// Presence messages one connection may send per document per second (more are dropped).
     pub presence_per_sec: u32,
+    /// How often a live connection is pinged, and its account's access and device read again.
+    pub live_ping: Duration,
 }
 
 impl Default for Limits {
@@ -63,6 +65,7 @@ impl Default for Limits {
             compact_bytes: craft_cloud_proto::live::COMPACT_BYTES,
             compact_timeout: crate::live::COMPACT_TIMEOUT,
             presence_per_sec: craft_cloud_proto::live::PRESENCE_PER_SEC,
+            live_ping: crate::live::PING_EVERY,
         }
     }
 }

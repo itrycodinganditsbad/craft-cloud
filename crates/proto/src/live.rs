@@ -102,6 +102,12 @@ pub const MAX_CODE_BYTES: usize = 64;
 
 /// Error code: the agent and the server share no live protocol version (the connection is closed).
 pub const PROTOCOL_MISMATCH: &str = "protocol_mismatch";
+/// Error code, and the reason of the WebSocket close that follows it: the account's access to the connection's space
+/// changed (removed, role changed, space archived, account disabled). The agent connects again and learns the new role,
+/// or a refusal.
+pub const ACCESS_CHANGED: &str = "access_changed";
+/// The WebSocket close code that carries [`ACCESS_CHANGED`] as its reason (the range for applications).
+pub const ACCESS_CHANGED_CLOSE: u16 = 4403;
 
 /// An app's machine name, as in `recents:<app>`: 1 to 32 bytes of lowercase ASCII letters, digits and `-`, starting
 /// with a letter (`wordcraft`, `photocraft`).

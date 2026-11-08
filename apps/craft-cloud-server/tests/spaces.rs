@@ -196,7 +196,7 @@ on_every_backend!(
     viewers_read_and_cannot_write,
     a_chunk_of_one_space_is_not_readable_through_another,
     a_long_poll_on_a_team_space_ends_with_404_when_the_member_is_removed,
-    live_documents_of_a_team_space_wait_for_live_protocol_3,
+    live_documents_of_a_team_space_are_served_to_its_members,
     an_old_protocol_client_sees_the_server_it_always_saw,
 );
 
@@ -480,7 +480,7 @@ async fn a_long_poll_on_a_team_space_ends_with_404_when_the_member_is_removed(w:
     assert_eq!((seen, status, echo), (Seen::NoSpace, StatusCode::NOT_FOUND, Some(w.team.to_string())));
 }
 
-async fn live_documents_of_a_team_space_wait_for_live_protocol_3(w: &World) {
+async fn live_documents_of_a_team_space_are_served_to_its_members(w: &World) {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let open = |who: &'static str, space: Option<SpaceId>| async move {
         let mut request = format!("{}/live", w.base.replacen("http://", "ws://", 1)).into_client_request().unwrap();
@@ -497,10 +497,11 @@ async fn live_documents_of_a_team_space_wait_for_live_protocol_3(w: &World) {
     // The personal space works as before, with and without the header.
     assert_eq!(open("ana", None).await, StatusCode::SWITCHING_PROTOCOLS);
     assert_eq!(open("ana", Some(w.user("ana").space)).await, StatusCode::SWITCHING_PROTOCOLS);
-    // A team space is not served on live protocol 2, to a viewer or an owner: the answer is the one for no access.
+    // A team space is served to its members, whatever their role (a viewer reads; the role per frame is in `team_live.rs`)…
     for who in ["ana", "ben", "cy"] {
-        assert_eq!(open(who, Some(w.team)).await, StatusCode::NOT_FOUND, "{who}");
+        assert_eq!(open(who, Some(w.team)).await, StatusCode::SWITCHING_PROTOCOLS, "{who}");
     }
+    // …and a stranger gets the answer for a space that does not exist, before the upgrade.
     assert_eq!(open("eve", Some(w.team)).await, StatusCode::NOT_FOUND);
 }
 
