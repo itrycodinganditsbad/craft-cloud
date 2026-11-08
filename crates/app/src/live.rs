@@ -43,7 +43,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use craft_cloud_api::api::ErrorAnswer as ErrorBody;
-use craft_cloud_api::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, PRESENCE_FROM, STATE, UPDATE, USER_BYTES, decode_binary, encode_binary};
+use craft_cloud_api::local::docs::{HELD, IMPORT, MAX_BINARY_BYTES, PRESENCE, PRESENCE_FROM, STATE, UPDATE, USER_BYTES, decode_binary, encode_binary};
 use craft_cloud_api::local::{DocState, DocsEvent, DocsRequest, MAX_LOCAL_JSON_BYTES, paths};
 use craft_cloud_api::{DocId, SpaceId};
 use tungstenite::client::IntoClientRequest;
@@ -91,6 +91,10 @@ pub enum Event {
     /// its file was deleted (the document still works; a later open of the path is a new file), and whether the agent
     /// stopped following it until it restarts (Loro failed on it twice; changes made meanwhile are kept).
     Status { online: bool, waiting: u64, deleted: bool, stopped: bool },
+    /// The account may (`read_only: false`) or may not change the document's space any more: a role change or an archive
+    /// while the document is open (`Document::read_only` is as of the open). An app that kept changes the agent refused
+    /// sends them again on `false`.
+    Role { read_only: bool },
     /// The document's file on this machine's disk now: the live document's frontiers (`(peer, counter)` heads) a Craft
     /// app saved it from, or none when no save record is known for it (see `DocsEvent::File`).
     File(Option<Vec<(u64, u32)>>),
@@ -211,6 +215,12 @@ impl Shared {
                     lock(&self.opening).insert(id, Head { doc, state, changed_outside, read_only, space });
                 }
                 Ok(DocsEvent::Members { id, members }) => self.route(id, Event::Members(members)),
+                Ok(DocsEvent::Role { doc, read_only }) => {
+                    let ids = lock(&self.numbers).get(&doc).cloned().unwrap_or_default();
+                    for id in ids {
+                        self.route(id, Event::Role { read_only });
+                    }
+                }
                 Ok(DocsEvent::NeedsImport { id }) => self.answer(id, Answer::NeedsImport),
                 Ok(DocsEvent::NotLive { id, reason, .. }) => self.answer(id, Answer::NotLive(reason)),
                 Ok(DocsEvent::Ack { id, seq }) => self.route(id, Event::Acked(seq)),
@@ -566,6 +576,14 @@ impl Document {
     pub fn saving(&self, hash: [u8; 32]) -> Result<(), Error> {
         let hex = hash.iter().map(|x| format!("{x:02x}")).collect::<String>();
         self.shared.send_json(&DocsRequest::Saving { doc: self.head.doc, hash: hex })
+    }
+
+    /// Hands the agent a change (a Loro update, at most 1 MiB) this app made while the account could not change the space and
+    /// kept (the agent refused it with `read_only`), because the app ends before it could send it again: the agent keeps it in
+    /// the document's journal and sends it to the server once the account may write (a viewer's changes are never sent).
+    /// Not acked, and not answered. Send them in order, before closing the document or dropping the connection.
+    pub fn hold(&self, update: &[u8]) -> Result<(), Error> {
+        self.shared.send_binary(HELD, self.id, update)
     }
 
     /// Sends this app's presence (at most 4 KiB, at most 20 a second; more are dropped).

@@ -25,7 +25,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::{IntoResponse, Response};
 use craft_cloud_proto::api::codes as api_codes;
 use craft_cloud_proto::live::{MAX_PRESENCE_BYTES, MAX_SNAPSHOT_BYTES, MAX_UPDATE_BYTES};
-use craft_cloud_proto::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, PRESENCE_FROM, STATE, UPDATE, decode_binary, encode_binary};
+use craft_cloud_proto::local::docs::{HELD, IMPORT, MAX_BINARY_BYTES, PRESENCE, PRESENCE_FROM, STATE, UPDATE, decode_binary, encode_binary};
 use craft_cloud_proto::local::{DocsEvent, DocsRequest, MAX_LOCAL_JSON_BYTES, NotLiveReason};
 use craft_cloud_proto::{DocId, SpaceId};
 use tokio::sync::mpsc;
@@ -397,7 +397,7 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
             let Some((kind, id, body)) = decode_binary(&bytes) else { return Ok(false) };
             let Some((key, hub)) = link.hub_of(id) else {
                 // No hub for it: signed out, or never opened (or its space stopped syncing); a kind an app sends is let be.
-                return Ok(kind == UPDATE || kind == PRESENCE || kind == IMPORT);
+                return Ok(kind == UPDATE || kind == PRESENCE || kind == IMPORT || kind == HELD);
             };
             let refuse = |seq: Option<u64>, message: String| DocsEvent::Error { id: Some(id), seq, code: api_codes::TOO_LARGE.into(), message };
             let call = match kind {
@@ -417,6 +417,12 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                     }
                     DocsCall::Presence { conn: link.conn, id, bytes: body.to_vec() }
                 }
+                HELD => {
+                    if body.is_empty() || body.len() > MAX_UPDATE_BYTES {
+                        return Ok(true);
+                    }
+                    DocsCall::Hold { conn: link.conn, id, bytes: body.to_vec() }
+                }
                 IMPORT => {
                     if body.len() > MAX_SNAPSHOT_BYTES {
                         let event = refuse(None, format!("an import is at most {MAX_SNAPSHOT_BYTES} bytes"));
@@ -428,7 +434,7 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                 _ => return Ok(false),
             };
             let update_seq = if let DocsCall::Update { seq, .. } = &call { Some(*seq) } else { None };
-            let ephemeral = matches!(call, DocsCall::Presence { .. });
+            let ephemeral = matches!(call, DocsCall::Presence { .. } | DocsCall::Hold { .. });
             if link.call(&hub, key, call).await? || ephemeral {
                 return Ok(true);
             }
@@ -474,6 +480,7 @@ async fn send_out(socket: &mut WebSocket, out: DocOut) -> Result<(), Unsent> {
         DocOut::Status { doc, online, waiting, deleted, stopped } => {
             send_json(socket, &DocsEvent::Status { doc, online, waiting, deleted, stopped }).await
         }
+        DocOut::Role { doc, read_only } => send_json(socket, &DocsEvent::Role { doc, read_only }).await,
         DocOut::File { doc, frontiers } => send_json(socket, &DocsEvent::File { doc, frontiers }).await,
     }
 }

@@ -49,7 +49,7 @@ per app connection for live sessions. `run` serves it while signed out too. Call
   without `space` it is the personal list as before. An `add` whose `path` is an absolute path inside a synced team folder
   goes to that space's list (kept relative to the folder); any other path is the personal list's;
 - `GET /v1/docs` (WebSocket: live documents). Control messages are JSON text frames, document bytes binary frames of
-  `[u8 kind][u64 id, big-endian][bytes]` (kinds: 1 state, 2 update, 3 presence, 4 import, 5 presence with identity), so
+  `[u8 kind][u64 id, big-endian][bytes]` (kinds: 1 state, 2 update, 3 presence, 4 import, 5 presence with identity, 6 held update), so
   nothing is base64; `id`
   is the number the app gave the document in its `open`, and one connection may open many documents:
   - `open {id, path, app, identity?}` (`path` relative to the synced folder, or absolute inside it; `app` a lowercase app name)
@@ -72,7 +72,11 @@ per app connection for live sessions. `run` serves it while signed out too. Call
     `read_only: true` for a viewer, or in an archived space, as of the open (an agent from before team spaces says neither).
     An update an app sends to a read-only document is refused with `error {id, seq, code: "read_only"}`, nothing of it is
     kept, and nothing is sent to the server. A space that stops syncing on this computer answers a later `open` of its
-    files with `not_live {offline}`; the app's other documents go on. An app that opens with `identity: true` gets other
+    files with `not_live {offline}`; the app's other documents go on. `role {doc, read_only}` follows `opened`: the agent
+    tells every app with a document of the space open when the account's right to change it changes, both ways, whether
+    or not the app asked for identity. An app that ends holding changes it made as a viewer and kept sends them as binary
+    kind 6 (`[u8 6][u64 id][a Loro update]`, in order, never acked): the agent journals them like an update, but they go
+    to the server only once the account may write (no app needs to be open then). An app that opens with `identity: true` gets other
     accounts' presence (and the account's own other machines') as binary kind 5
     `[u8 5][u64 id][16 bytes account ID][the app's bytes]` instead of kind 3, the account being the server's word whatever
     the bytes say, and a text message `members {id, members: [{user, name, colour, self}]}` after `opened` and whenever the

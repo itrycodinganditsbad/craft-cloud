@@ -23,8 +23,8 @@ pub struct PaletteColour {
 /// The twelve colours, by palette index. Fixed: a change would recolour every member everywhere.
 pub const PALETTE: [PaletteColour; PALETTE_LEN] = [
     PaletteColour { name: "red", light: [0xc6, 0x28, 0x28], dark: [0xef, 0x7a, 0x7a] },
-    PaletteColour { name: "orange", light: [0xd8, 0x4b, 0x0c], dark: [0xff, 0x9a, 0x5c] },
-    PaletteColour { name: "amber", light: [0xa8, 0x6a, 0x00], dark: [0xf5, 0xc0, 0x4a] },
+    PaletteColour { name: "orange", light: [0xb8, 0x4c, 0x00], dark: [0xff, 0x9a, 0x5c] },
+    PaletteColour { name: "amber", light: [0x9a, 0x60, 0x00], dark: [0xf5, 0xc0, 0x4a] },
     PaletteColour { name: "lime", light: [0x5a, 0x7d, 0x0a], dark: [0xb5, 0xd9, 0x5a] },
     PaletteColour { name: "green", light: [0x1b, 0x7a, 0x3e], dark: [0x6e, 0xd1, 0x8f] },
     PaletteColour { name: "teal", light: [0x0b, 0x7a, 0x75], dark: [0x5e, 0xd4, 0xcc] },
@@ -103,8 +103,8 @@ mod tests {
     fn the_palette_values_are_pinned() {
         let want: [(&str, [u8; 3], [u8; 3]); PALETTE_LEN] = [
             ("red", [0xc6, 0x28, 0x28], [0xef, 0x7a, 0x7a]),
-            ("orange", [0xd8, 0x4b, 0x0c], [0xff, 0x9a, 0x5c]),
-            ("amber", [0xa8, 0x6a, 0x00], [0xf5, 0xc0, 0x4a]),
+            ("orange", [0xb8, 0x4c, 0x00], [0xff, 0x9a, 0x5c]),
+            ("amber", [0x9a, 0x60, 0x00], [0xf5, 0xc0, 0x4a]),
             ("lime", [0x5a, 0x7d, 0x0a], [0xb5, 0xd9, 0x5a]),
             ("green", [0x1b, 0x7a, 0x3e], [0x6e, 0xd1, 0x8f]),
             ("teal", [0x0b, 0x7a, 0x75], [0x5e, 0xd4, 0xcc]),
@@ -117,6 +117,31 @@ mod tests {
         ];
         let got: Vec<_> = PALETTE.iter().map(|c| (c.name, c.light, c.dark)).collect();
         assert_eq!(got, want.to_vec());
+    }
+
+    /// Every colour is text a person reads: at least 4.5:1 (WCAG AA) on egui's light panel (#f8f8f8) and white for the light
+    /// value, and on its dark panel (#1b1b1b) and black for the dark one.
+    #[test]
+    fn every_colour_reads_as_text_on_its_background() {
+        fn luminance(rgb: [u8; 3]) -> f64 {
+            let lin = |c: u8| {
+                let c = f64::from(c) / 255.0;
+                if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2])
+        }
+        let contrast = |a: [u8; 3], b: [u8; 3]| {
+            let (la, lb) = (luminance(a), luminance(b));
+            (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+        };
+        for c in PALETTE {
+            for bg in [[0xf8; 3], [0xff; 3]] {
+                assert!(contrast(c.light, bg) >= 4.5, "{} light on {bg:?}: {}", c.name, contrast(c.light, bg));
+            }
+            for bg in [[0x1b; 3], [0x00; 3]] {
+                assert!(contrast(c.dark, bg) >= 4.5, "{} dark on {bg:?}: {}", c.name, contrast(c.dark, bg));
+            }
+        }
     }
 
     #[test]
