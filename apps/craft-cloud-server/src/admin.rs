@@ -34,8 +34,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use craft_cloud_meta::{AdminActor, AdminUser, AdminVia, DeviceAuth, Role, UserId, valid_username};
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::{
-    AccountUsage, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminManifestIndex, AdminPasswordReset, AdminServerInfo,
-    AdminStorageAccount, AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, UsageEstimateReason, UsageEstimates,
+    AccountUsage, AdminCode, AdminCompression, AdminCompressionEstimate, AdminCompressionLevelEstimate, AdminConfirm, AdminCreateUser,
+    AdminCreatedUser, AdminDevices, AdminManifestIndex, AdminPasswordReset, AdminServerInfo, AdminSetCompressionLevel, AdminStorageAccount,
+    AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, UsageEstimateReason, UsageEstimates,
 };
 use craft_cloud_proto::join::{Code, INVITE_CHARS, INVITE_TTL_MS, JoinString};
 use serde::Deserialize;
@@ -62,6 +63,7 @@ pub fn routes() -> Router<Shared> {
     Router::new()
         .route("/admin/server", get(server))
         .route("/admin/storage", get(storage))
+        .route("/admin/storage/compression", axum::routing::put(set_compression).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/admin/users", get(list_users).post(create_user).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/admin/users/{id}", axum::routing::patch(update_user).delete(remove_user).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/admin/users/{id}/usage", get(user_usage))
@@ -240,7 +242,97 @@ async fn storage(State(state): State<Shared>) -> Result<Json<AdminStorageOvervie
         server_fs_total_bytes: measured.server_fs_total,
         server_fs_free_bytes: measured.server_fs_free,
         database_bytes: measured.database_bytes,
+        compression: Some(Box::new(compression_view(&state, true).await?)),
     }))
+}
+
+/// How long the overview keeps the totals over the blobs table: they sum every row, which a busy overview must not do for
+/// each request.
+const TOTALS_TTL_MS: i64 = 30_000;
+
+/// The compression part of the overview: the settings in force and what they save, from the recorded sizes and the last
+/// `store estimate`. `none` in the config shows as the algorithm and wins over the level.
+async fn compression_view(state: &AppState, cached: bool) -> Result<AdminCompression, ApiError> {
+    let now = state.now_ms();
+    let kept =
+        state.compression_totals.lock().ok().and_then(|slot| *slot).filter(|(at, _)| cached && now.saturating_sub(*at) < TOTALS_TTL_MS && *at <= now);
+    let totals = match kept {
+        Some((_, totals)) => totals,
+        None => {
+            let totals = state.meta.storage_totals().await?;
+            if cached && let Ok(mut slot) = state.compression_totals.lock() {
+                *slot = Some((now, totals));
+            }
+            totals
+        }
+    };
+    let admin_level = state
+        .meta
+        .server_value(crate::storage_tools::LEVEL_KEY)
+        .await?
+        .and_then(|(value, _)| value.parse::<u8>().ok())
+        .filter(|level| (craft_cloud_store::MIN_ZSTD_LEVEL..=craft_cloud_store::MAX_ZSTD_LEVEL).contains(level));
+    let estimate = crate::storage_tools::last_estimate(&state.meta).await?.map(|(estimate, at_ms)| AdminCompressionEstimate {
+        at_ms,
+        sampled_blobs: estimate.sampled_blobs,
+        sampled_bytes: estimate.sampled_bytes,
+        current_saving_permille: permille(estimate.current_saving_percent),
+        levels: estimate
+            .levels
+            .iter()
+            .map(|l| AdminCompressionLevelEstimate {
+                level: l.level,
+                saving_permille: permille(l.saving_percent),
+                kib_per_second: (l.mib_per_second.max(0.0) * 1024.0) as u64,
+            })
+            .collect(),
+    });
+    let ratio = |part: u64, whole: u64| u32::try_from(u128::from(part) * 1000 / u128::from(whole.max(1))).unwrap_or(1000);
+    Ok(AdminCompression {
+        algorithm: if state.compression.none { "none" } else { "zstd" }.to_owned(),
+        level: state.store.level(),
+        config_level: state.compression.config_level,
+        admin_level,
+        min_saving_percent: state.compression.min_saving_percent,
+        blobs: totals.blobs,
+        logical_bytes: totals.logical_bytes,
+        known_blobs: totals.known_blobs,
+        known_logical_bytes: totals.known_logical_bytes,
+        known_physical_bytes: totals.known_physical_bytes,
+        known_permille: ratio(totals.known_logical_bytes, totals.logical_bytes).min(1000),
+        saving_permille: (totals.known_logical_bytes > 0)
+            .then(|| 1000u32.saturating_sub(ratio(totals.known_physical_bytes, totals.known_logical_bytes))),
+        estimate,
+    })
+}
+
+/// A percentage as permille, clamped to 0 to 1000.
+fn permille(percent: f64) -> u32 {
+    (percent * 10.0).round().clamp(0.0, 1000.0) as u32
+}
+
+/// `PUT /admin/storage/compression`: the level new writes are compressed at, 1 to 19. Needs the admin's password like every
+/// change, is audited (`admin.compression_changed`), is kept in the database and applies at once to this server's new
+/// writes (another server process on the same database takes it at its next start). `compression = "none"` in the config
+/// still wins: the level is kept, and nothing is compressed. Answers with the compression part of the overview.
+async fn set_compression(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    request: Request,
+) -> Result<Json<AdminCompression>, ApiError> {
+    let req: AdminSetCompressionLevel = read_body(&state, request).await?;
+    if !(craft_cloud_store::MIN_ZSTD_LEVEL..=craft_cloud_store::MAX_ZSTD_LEVEL).contains(&req.level) {
+        return Err(ApiError::invalid(format!("level is {} to {}", craft_cloud_store::MIN_ZSTD_LEVEL, craft_cloud_store::MAX_ZSTD_LEVEL)));
+    }
+    let actor = confirm(&state, &auth, Confirmation::new(req.password, req.totp_code, req.recovery_code)).await?;
+    {
+        // Commit and apply as one step: two changes at once must leave the store at the level the database ends with.
+        let _changing = state.compression_change.lock().await;
+        state.meta.admin_set_compression_level(&actor, state.store.level(), req.level, state.now_ms()).await?;
+        state.store.set_level(req.level);
+    }
+    tracing::info!(actor = %auth.device, level = req.level, "admin: compression level changed");
+    Ok(Json(compression_view(&state, false).await?))
 }
 
 /// `GET /admin/users/{id}/usage`: the account's stored bytes and labeled estimates.

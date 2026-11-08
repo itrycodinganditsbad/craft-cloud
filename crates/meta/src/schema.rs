@@ -20,6 +20,7 @@ const SQLITE: &[&str] = &[
     include_str!("../migrations/sqlite/0012_versions_node_seq.sql"),
     include_str!("../migrations/sqlite/0013_trash.sql"),
     include_str!("../migrations/sqlite/0014_manifest_index.sql"),
+    include_str!("../migrations/sqlite/0015_physical_size.sql"),
 ];
 const POSTGRES: &[&str] = &[
     include_str!("../migrations/postgres/0001_init.sql"),
@@ -36,6 +37,7 @@ const POSTGRES: &[&str] = &[
     include_str!("../migrations/postgres/0012_versions_node_seq.sql"),
     include_str!("../migrations/postgres/0013_trash.sql"),
     include_str!("../migrations/postgres/0014_manifest_index.sql"),
+    include_str!("../migrations/postgres/0015_physical_size.sql"),
 ];
 
 /// Arbitrary fixed key for the Postgres advisory lock that serialises migrations between servers sharing one

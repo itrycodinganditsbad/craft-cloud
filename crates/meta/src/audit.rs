@@ -68,6 +68,7 @@ pub enum AuditAction {
     AdminUserRemoved,
     AdminRoleChanged,
     AdminQuotaChanged,
+    AdminCompressionChanged,
     AdminInviteIssued,
     AdminInviteRevoked,
     AdminPasswordResetIssued,
@@ -85,7 +86,7 @@ pub enum AuditAction {
 
 impl AuditAction {
     /// Every action, in the order the documentation lists them.
-    pub const ALL: [AuditAction; 30] = [
+    pub const ALL: [AuditAction; 31] = [
         AuditAction::AuthLogin,
         AuditAction::AuthLoginFailed,
         AuditAction::AuthSecondFactorFailed,
@@ -103,6 +104,7 @@ impl AuditAction {
         AuditAction::AdminUserRemoved,
         AuditAction::AdminRoleChanged,
         AuditAction::AdminQuotaChanged,
+        AuditAction::AdminCompressionChanged,
         AuditAction::AdminInviteIssued,
         AuditAction::AdminInviteRevoked,
         AuditAction::AdminPasswordResetIssued,
@@ -137,6 +139,7 @@ impl AuditAction {
             AuditAction::AdminUserRemoved => "admin.user_removed",
             AuditAction::AdminRoleChanged => "admin.role_changed",
             AuditAction::AdminQuotaChanged => "admin.quota_changed",
+            AuditAction::AdminCompressionChanged => "admin.compression_changed",
             AuditAction::AdminInviteIssued => "admin.invite_issued",
             AuditAction::AdminInviteRevoked => "admin.invite_revoked",
             AuditAction::AdminPasswordResetIssued => "admin.password_reset_issued",
@@ -172,6 +175,7 @@ impl AuditAction {
             AuditAction::AdminUserCreated => &[RoleTo],
             AuditAction::AdminRoleChanged => &[RoleFrom, RoleTo],
             AuditAction::AdminQuotaChanged => &[QuotaBytes],
+            AuditAction::AdminCompressionChanged => &[LevelFrom, LevelTo],
             AuditAction::AdminDeviceRevoked => &[Device, Reason],
             AuditAction::CliDeviceRevoked => &[Device, Reason],
             AuditAction::AccountPasswordChanged
@@ -204,6 +208,9 @@ pub enum Field {
     RoleFrom,
     RoleTo,
     QuotaBytes,
+    /// The compression level before and after a change.
+    LevelFrom,
+    LevelTo,
     Revoked,
     Device,
     /// A reset code redeemed for an account that had two-factor sign-in turned it off.
@@ -304,6 +311,8 @@ pub struct AuditDetails {
     pub role_to: Option<Role>,
     /// `Some(None)`: the quota was removed.
     pub quota_bytes: Option<Option<u64>>,
+    pub level_from: Option<u8>,
+    pub level_to: Option<u8>,
     pub revoked: Option<u32>,
     pub device: Option<DeviceId>,
     /// Redeeming a reset code also took the account's two-factor sign-in away (only ever set to `true`).
@@ -342,6 +351,8 @@ impl AuditDetails {
             Field::RoleFrom => self.role_from.map(|v| Value::from(v.as_str())),
             Field::RoleTo => self.role_to.map(|v| Value::from(v.as_str())),
             Field::QuotaBytes => self.quota_bytes.map(|v| v.map_or(Value::Null, Value::from)),
+            Field::LevelFrom => self.level_from.map(Value::from),
+            Field::LevelTo => self.level_to.map(Value::from),
             Field::Revoked => self.revoked.map(Value::from),
             Field::Device => self.device.map(|v| Value::from(v.to_string())),
             Field::TwoFactorRemoved => self.two_factor_removed.then_some(Value::Bool(true)),
@@ -357,6 +368,8 @@ impl AuditDetails {
             Field::RoleFrom => "role_from",
             Field::RoleTo => "role_to",
             Field::QuotaBytes => "quota_bytes",
+            Field::LevelFrom => "level_from",
+            Field::LevelTo => "level_to",
             Field::Revoked => "revoked",
             Field::Device => "device",
             Field::TwoFactorRemoved => "two_factor_removed",
@@ -876,7 +889,7 @@ mod tests {
             assert_eq!(AuditAction::parse(action.as_str()), Some(action));
             assert!(action.as_str().bytes().all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'.'));
         }
-        assert_eq!(seen.len(), 30);
+        assert_eq!(seen.len(), 31);
         assert_eq!(AuditAction::parse("auth.login "), None);
         assert_eq!(AuditAction::parse("AUTH.LOGIN"), None);
     }
@@ -887,7 +900,7 @@ mod tests {
         let auth = ActionFilter::parse("auth.").unwrap();
         assert_eq!(auth.actions().len(), 5);
         assert!(auth.actions().iter().all(|a| a.as_str().starts_with("auth.")));
-        assert_eq!(ActionFilter::parse("admin.").unwrap().actions().len(), 11);
+        assert_eq!(ActionFilter::parse("admin.").unwrap().actions().len(), 12);
         for bad in ["", "auth", "au.", "auth.%", "auth._", "nope.", "AUTH.", "auth.login'", "auth. ", "auth.logi", "'; DROP TABLE x; --"] {
             assert_eq!(ActionFilter::parse(bad), None, "{bad:?}");
         }
@@ -921,6 +934,8 @@ mod tests {
             role_from: Some(Role::Member),
             role_to: Some(Role::Admin),
             quota_bytes: Some(None),
+            level_from: Some(3),
+            level_to: Some(19),
             revoked: Some(3),
             device: Some(DeviceId::from_uuid(Uuid::nil())),
             two_factor_removed: true,
@@ -935,6 +950,7 @@ mod tests {
         assert_eq!(keys(AuditAction::AuthLoginFailed), ["client_kind", "step"]);
         assert_eq!(keys(AuditAction::AuthRecoveryCodeUsed), ["client_kind"]);
         assert_eq!(keys(AuditAction::AdminRoleChanged), ["role_from", "role_to"]);
+        assert_eq!(keys(AuditAction::AdminCompressionChanged), ["level_from", "level_to"]);
         assert_eq!(keys(AuditAction::AdminQuotaChanged), ["quota_bytes"]);
         assert_eq!(keys(AuditAction::AdminUserEnabled), Vec::<String>::new());
         assert_eq!(keys(AuditAction::CliDeviceRevoked), ["device", "reason"]);

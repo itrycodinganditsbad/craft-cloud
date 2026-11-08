@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
+
+use crate::storage_tools::CompressionSettings;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use craft_cloud_meta::{Meta, UserId};
@@ -149,12 +151,20 @@ pub struct AppState {
     pub started_ms: i64,
     /// The blob store's last health probe, kept for 30 seconds ([`crate::health`]).
     pub store_health: crate::health::StoreHealth,
+    /// The compression settings of the config file, for the admin's storage overview ([`CompressionSettings`]).
+    pub compression: CompressionSettings,
+    /// The overview's compression totals, kept for a short while: they sum the whole blobs table.
+    pub(crate) compression_totals: Mutex<Option<(i64, craft_cloud_meta::StorageTotals)>>,
+    /// Held while an admin's compression level is committed and applied to the store, so that concurrent changes leave
+    /// the store at the level the database ends with ([`crate::admin`]).
+    pub(crate) compression_change: tokio::sync::Mutex<()>,
     /// The time of day for everything a request records (a device's last use, a stored blob, a commit).
     clock: Clock,
 }
 
 impl AppState {
     pub fn new(meta: Meta, store: Store, trusted_proxies: Vec<IpAddr>) -> Result<Self, ApiError> {
+        let compression = CompressionSettings::of(&store);
         let limits = Limits::default();
         Ok(Self {
             meta,
@@ -178,6 +188,9 @@ impl AppState {
             touches: Mutex::new(HashMap::new()),
             dummy_hash: hash_password("craft-cloud dummy password")?,
             trash_days: 30,
+            compression,
+            compression_totals: Mutex::new(None),
+            compression_change: tokio::sync::Mutex::new(()),
             storage_info: StorageInfo::default(),
             full: None,
             started_ms: now_ms(),
@@ -226,6 +239,19 @@ impl AppState {
     }
 
     /// The state with the places to measure and the configured capacity (`[storage] capacity`). The default measures nothing.
+    /// Takes the level an admin set while the server ran (kept in the database) over the config's, for new writes. The
+    /// config's `compression = "none"` still wins: the store then writes nothing compressed whatever the level.
+    pub async fn load_compression_level(&self) -> Result<(), craft_cloud_meta::MetaError> {
+        if let Some((value, _)) = self.meta.server_value(crate::storage_tools::LEVEL_KEY).await? {
+            // The same range the overview shows: a stored value outside it (a hand-edited row) is ignored, not clamped.
+            match value.parse::<u8>().ok().filter(|l| (craft_cloud_store::MIN_ZSTD_LEVEL..=craft_cloud_store::MAX_ZSTD_LEVEL).contains(l)) {
+                Some(level) => self.store.set_level(level),
+                None => tracing::warn!(value = %value, "the stored compression level is not 1 to 19 and is ignored"),
+            }
+        }
+        Ok(())
+    }
+
     pub fn with_storage_info(mut self, info: StorageInfo) -> Self {
         self.storage_info = info;
         self

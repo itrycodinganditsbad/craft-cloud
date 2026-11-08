@@ -12,8 +12,8 @@
 use craft_cloud_api::local::paths;
 
 use crate::{
-    AccountUsage, AdminCode, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo,
-    AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, Client, DeviceId, Error, Uuid, http,
+    AccountUsage, AdminCode, AdminCompression, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset, AdminServerInfo,
+    AdminSetCompressionLevel, AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, Client, DeviceId, Error, Uuid, http,
 };
 
 /// Which accounts [`Client::admin_users`] lists: a page by username, optionally those whose name contains `query`.
@@ -75,6 +75,13 @@ impl Client {
     /// The server-wide storage overview; admins only.
     pub fn admin_storage(&self) -> Result<AdminStorageOverview, Error> {
         self.call("GET", paths::ADMIN_STORAGE, None, http::SLOW_TIMEOUT)
+    }
+
+    /// Sets the level new writes are compressed at (1 to 19) and returns the compression the server now reports.
+    /// `request.password` is the acting admin's current password. The server's config can still switch compression off, which
+    /// wins over any level.
+    pub fn admin_set_compression_level(&self, request: &AdminSetCompressionLevel) -> Result<AdminCompression, Error> {
+        self.call("PUT", paths::ADMIN_STORAGE_COMPRESSION, Some(body(request)?), http::SLOW_TIMEOUT)
     }
 
     /// One account's stored bytes and labeled estimates; admins only.

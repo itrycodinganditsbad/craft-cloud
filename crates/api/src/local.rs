@@ -168,6 +168,8 @@ pub mod paths {
     pub const ADMIN_SERVER: &str = "/v1/admin/server";
     /// `GET /v1/admin/storage` → [`AdminStorageOverview`](crate::api::AdminStorageOverview).
     pub const ADMIN_STORAGE: &str = "/v1/admin/storage";
+    /// `PUT`: the level new writes are compressed at.
+    pub const ADMIN_STORAGE_COMPRESSION: &str = "/v1/admin/storage/compression";
     /// `GET /v1/admin/users?cursor&limit&query` → [`AdminUserList`](crate::api::AdminUserList); `POST` (an
     /// [`AdminCreateUser`](crate::api::AdminCreateUser)) → [`AdminCreatedUser`](crate::api::AdminCreatedUser).
     /// Under `/v1/admin/users/{id}`: `PATCH` ([`AdminUpdateUser`](crate::api::AdminUpdateUser)) → the account's

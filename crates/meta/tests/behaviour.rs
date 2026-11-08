@@ -148,6 +148,9 @@ on_every_backend!(
     a_failed_restore_walk_is_not_repeated_for_every_operation,
     big_manifests_are_checked_in_batches,
     the_tree_and_the_feed_come_in_pages,
+    physical_sizes_are_unknown_until_recorded_and_totals_say_so,
+    blobs_are_walked_in_pages_and_picked_by_id,
+    server_values_are_set_and_replaced,
     usernames_are_unique_ignoring_ascii_case,
     all_spaces_lists_every_users_space,
     live_documents_number_their_updates_per_space,
@@ -476,6 +479,97 @@ async fn manifests_need_their_chunks_and_are_per_space(meta: &Meta) {
 
 fn random_chunk() -> ChunkId {
     ChunkId::from_bytes(*blake3::hash(uuid::Uuid::now_v7().as_bytes()).as_bytes())
+}
+
+async fn physical_sizes_are_unknown_until_recorded_and_totals_say_so(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    let (old, new) = (random_chunk(), random_chunk());
+    meta.add_chunk(ana.space, &old, 1000, NOW).await.unwrap();
+    meta.add_chunk(ana.space, &new, 3000, NOW).await.unwrap();
+    // Nothing is known about either yet: unknown, not zero, and the totals say none of it is known.
+    let rows = meta.blob_page(None, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.physical_size.is_none() && r.level.is_none()));
+    let totals = meta.storage_totals().await.unwrap();
+    assert_eq!((totals.blobs, totals.logical_bytes, totals.known_blobs, totals.known_logical_bytes, totals.known_physical_bytes), (2, 4000, 0, 0, 0));
+
+    meta.set_physical(BlobKind::Chunk, new.as_bytes(), 600, 3).await.unwrap();
+    let totals = meta.storage_totals().await.unwrap();
+    assert_eq!((totals.known_blobs, totals.known_logical_bytes, totals.known_physical_bytes, totals.logical_bytes), (1, 3000, 600, 4000));
+    let row = meta.blob_from(BlobKind::Chunk, new.as_bytes()).await.unwrap().unwrap();
+    assert_eq!((row.id, row.stored_size, row.physical_size, row.level), (*new.as_bytes(), 3000, Some(600), Some(3)));
+    // A measured size leaves the level alone; recording again replaces both.
+    meta.set_measured_size(BlobKind::Chunk, old.as_bytes(), 900).await.unwrap();
+    let row = meta.blob_from(BlobKind::Chunk, old.as_bytes()).await.unwrap().unwrap();
+    assert_eq!((row.physical_size, row.level), (Some(900), None));
+    meta.set_physical(BlobKind::Chunk, new.as_bytes(), 500, 19).await.unwrap();
+    let row = meta.blob_from(BlobKind::Chunk, new.as_bytes()).await.unwrap().unwrap();
+    assert_eq!((row.physical_size, row.level), (Some(500), Some(19)));
+    // A rewrite records its result only if the row still holds the size it started from. An upload that replaced the
+    // object between the rewrite's read and its record has recorded its own size and level: that stays.
+    assert!(!meta.set_physical_if(BlobKind::Chunk, new.as_bytes(), 777, 100, 19).await.unwrap());
+    let row = meta.blob_from(BlobKind::Chunk, new.as_bytes()).await.unwrap().unwrap();
+    assert_eq!((row.physical_size, row.level), (Some(500), Some(19)));
+    assert!(meta.set_physical_if(BlobKind::Chunk, new.as_bytes(), 500, 450, 22).await.unwrap());
+    let row = meta.blob_from(BlobKind::Chunk, new.as_bytes()).await.unwrap().unwrap();
+    assert_eq!((row.physical_size, row.level), (Some(450), Some(22)));
+    // The interleaving itself: the pass read 450, an upload at level 3 recorded 700, then the pass records.
+    meta.set_physical(BlobKind::Chunk, new.as_bytes(), 700, 3).await.unwrap();
+    assert!(!meta.set_physical_if(BlobKind::Chunk, new.as_bytes(), 450, 300, 19).await.unwrap());
+    let row = meta.blob_from(BlobKind::Chunk, new.as_bytes()).await.unwrap().unwrap();
+    assert_eq!((row.physical_size, row.level), (Some(700), Some(3)));
+    // A row with no size yet is taken (nothing was recorded that could be lost), and an absent row changes nothing.
+    let unmeasured = random_chunk();
+    meta.add_chunk(ana.space, &unmeasured, 10, NOW).await.unwrap();
+    assert!(meta.set_physical_if(BlobKind::Chunk, unmeasured.as_bytes(), 9, 8, 5).await.unwrap());
+    assert!(!meta.set_physical_if(BlobKind::Manifest, &[9u8; 32], 1, 1, 1).await.unwrap());
+    meta.set_physical(BlobKind::Chunk, new.as_bytes(), 500, 19).await.unwrap();
+    // Unknown blobs and absent rows are no error and change nothing; the logical size is never touched.
+    meta.set_physical(BlobKind::Manifest, &[9u8; 32], 5, 1).await.unwrap();
+    assert_eq!(meta.storage_totals().await.unwrap().blobs, 3);
+    assert_eq!(meta.stored_bytes(ana.space).await.unwrap(), 4010);
+    // A chunk uploaded again keeps its row (and the size recorded last stays).
+    meta.add_chunk(ana.space, &new, 3000, NOW).await.unwrap();
+    assert_eq!(meta.blob_from(BlobKind::Chunk, new.as_bytes()).await.unwrap().unwrap().physical_size, Some(500));
+}
+
+async fn blobs_are_walked_in_pages_and_picked_by_id(meta: &Meta) {
+    let ana = user(meta, "ana").await;
+    assert!(meta.blob_page(None, 10).await.unwrap().is_empty());
+    assert!(meta.blob_from(BlobKind::Chunk, &[0u8; 32]).await.unwrap().is_none());
+    let mut ids: Vec<ChunkId> = (0..7).map(|_| random_chunk()).collect();
+    for id in &ids {
+        meta.add_chunk(ana.space, id, 100, NOW).await.unwrap();
+    }
+    ids.sort_by_key(|id| *id.as_bytes());
+    // Pages of 3 walk all of them once, in ID order.
+    let mut walked = Vec::new();
+    let mut after = None;
+    loop {
+        let page = meta.blob_page(after, 3).await.unwrap();
+        let Some(last) = page.last() else { break };
+        after = Some((last.kind, last.id));
+        assert!(page.len() <= 3);
+        walked.extend(page.iter().map(|r| r.id));
+    }
+    assert_eq!(walked, ids.iter().map(|id| *id.as_bytes()).collect::<Vec<_>>());
+    // Picking by ID: the first at or after, and the first of the kind when there is none after.
+    let first = *ids[0].as_bytes();
+    let last = *ids[6].as_bytes();
+    assert_eq!(meta.blob_from(BlobKind::Chunk, &[0u8; 32]).await.unwrap().unwrap().id, first);
+    assert_eq!(meta.blob_from(BlobKind::Chunk, &last).await.unwrap().unwrap().id, last);
+    assert_eq!(meta.blob_from(BlobKind::Chunk, &[0xffu8; 32]).await.unwrap().unwrap().id, first, "wraps around");
+    assert!(meta.blob_from(BlobKind::Manifest, &[0u8; 32]).await.unwrap().is_none(), "kinds are separate");
+}
+
+async fn server_values_are_set_and_replaced(meta: &Meta) {
+    assert_eq!(meta.server_value("compression_estimate").await.unwrap(), None);
+    meta.set_server_value("compression_estimate", "{\"a\":1}", 10).await.unwrap();
+    assert_eq!(meta.server_value("compression_estimate").await.unwrap(), Some(("{\"a\":1}".to_owned(), 10)));
+    meta.set_server_value("compression_estimate", "two", 20).await.unwrap();
+    meta.set_server_value("other", "x", 30).await.unwrap();
+    assert_eq!(meta.server_value("compression_estimate").await.unwrap(), Some(("two".to_owned(), 20)));
+    assert_eq!(meta.server_value("other").await.unwrap(), Some(("x".to_owned(), 30)));
 }
 
 async fn stored_bytes_are_counted_once_per_space_and_capped(meta: &Meta) {
@@ -2147,6 +2241,10 @@ async fn upgrading_counts_what_each_space_already_stores() {
         for column in ["password_changed_ms", "disabled_ms"] {
             sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE users DROP COLUMN {column}"))).execute(&mut conn).await.unwrap();
         }
+        // And before stored sizes were tracked.
+        sqlx::query("ALTER TABLE blobs DROP COLUMN physical_size").execute(&mut conn).await.unwrap();
+        sqlx::query("ALTER TABLE blobs DROP COLUMN compress_level").execute(&mut conn).await.unwrap();
+        sqlx::query("DROP TABLE server_state").execute(&mut conn).await.unwrap();
         sqlx::query("DELETE FROM schema_version WHERE version >= 2").execute(&mut conn).await.unwrap();
     }
     let meta = Meta::open(&url).await.unwrap();
@@ -2171,7 +2269,7 @@ async fn concurrent_opens_migrate_once_on_postgres() {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(versions, 14);
+    assert_eq!(versions, 15);
 }
 
 // ---- device sessions (migration 0007) ----
@@ -2544,7 +2642,7 @@ async fn migrating_from_0006_keeps_the_rows(url: &str) {
     assert_eq!(schema_version(url).await, 6);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 14);
+    assert_eq!(schema_version(url).await, 15);
     let old = record(&meta, &ana, live).await;
     assert_eq!(
         (old.name.as_str(), old.revoked, old.client, old.revoked_ms, old.revoke_reason),
@@ -2565,7 +2663,7 @@ async fn migrating_from_0006_keeps_the_rows(url: &str) {
     // A database from a newer Craft Cloud is still refused.
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    sqlx::query("INSERT INTO schema_version (version) VALUES (15)").execute(&mut conn).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (16)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
 }
@@ -3314,7 +3412,7 @@ async fn migrating_from_0009_keeps_the_rows(url: &str) {
     drop(conn);
     assert_eq!(schema_version(url).await, 9, "the audit log's migration stays");
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 14);
+    assert_eq!(schema_version(url).await, 15);
     assert_eq!(all_events(&meta).await.len(), audit_rows, "the audit rows are kept");
     assert_eq!(meta.user_by_name("ana").await.unwrap().unwrap().id, ana.id);
     assert_eq!(meta.invite_needs_password(&invite.hash(), NOW + 1).await.unwrap(), Some(false));
@@ -3584,12 +3682,12 @@ async fn the_schema_version_is_recorded_and_a_newer_database_is_refused() {
     use sqlx::Connection;
     let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
     let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(latest, 14);
+    assert_eq!(latest, 15);
     // Opening again changes nothing.
     drop(Meta::open(&url).await.unwrap());
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(rows, 14);
-    sqlx::query("INSERT INTO schema_version (version) VALUES (15)").execute(&mut conn).await.unwrap();
+    assert_eq!(rows, 15);
+    sqlx::query("INSERT INTO schema_version (version) VALUES (16)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(&url).await, Err(MetaError::Corrupt(_))), "a newer database is refused");
 }
@@ -4276,6 +4374,9 @@ async fn drop_history_trash_and_manifest_index(conn: &mut sqlx::AnyConnection) {
         "DROP INDEX nodes_trash",
         "ALTER TABLE nodes DROP COLUMN deleted_ms",
         "ALTER TABLE nodes DROP COLUMN purge_requested_ms",
+        "ALTER TABLE blobs DROP COLUMN physical_size",
+        "ALTER TABLE blobs DROP COLUMN compress_level",
+        "DROP TABLE server_state",
         "DROP INDEX versions_node_seq",
         "DELETE FROM schema_version WHERE version >= 12",
     ] {
@@ -4290,6 +4391,9 @@ async fn drop_trash_and_manifest_index(conn: &mut sqlx::AnyConnection) {
         "DROP TABLE manifest_index",
         "DROP INDEX nodes_trash",
         "ALTER TABLE nodes DROP COLUMN deleted_ms",
+        "ALTER TABLE blobs DROP COLUMN physical_size",
+        "ALTER TABLE blobs DROP COLUMN compress_level",
+        "DROP TABLE server_state",
         "ALTER TABLE nodes DROP COLUMN purge_requested_ms",
         "DELETE FROM schema_version WHERE version >= 13",
     ] {
@@ -4342,7 +4446,7 @@ async fn the_trash_migration_dates_old_deletions_at_the_migration(url: &str) {
     assert_eq!(again.entries, page.entries);
     let mut conn = raw(url).await;
     let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(latest, 14);
+    assert_eq!(latest, 15);
     let live_with_time: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE deleted = 0 AND (deleted_ms IS NOT NULL OR purge_requested_ms IS NOT NULL)")
             .fetch_one(&mut conn)
@@ -4403,7 +4507,7 @@ async fn migrating_from_0007_keeps_the_rows(url: &str) {
     assert_eq!(schema_version(url).await, 7);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 14);
+    assert_eq!(schema_version(url).await, 15);
     assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.user), Some(ana.id));
     let row = admin_view(&meta, ana.id).await;
     assert_eq!((row.disabled_ms, row.quota_bytes, row.stored_bytes, row.devices_active, row.invite_pending), (None, None, 42, 1, true));
@@ -4415,7 +4519,7 @@ async fn migrating_from_0007_keeps_the_rows(url: &str) {
 
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    sqlx::query("INSERT INTO schema_version (version) VALUES (15)").execute(&mut conn).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (16)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
 }
@@ -4616,6 +4720,23 @@ async fn every_operation_writes_exactly_its_events(meta: &Meta) {
     let e = seen.one().await;
     assert_eq!((e.action, details(&e)), (AuditAction::AdminQuotaChanged, json(r#"{"quota_bytes":null}"#)), "removing the quota says so");
     meta.admin_update_user(&actor, ana.id, None, Some(None), NOW).await.unwrap();
+    assert!(seen.actions().await.is_empty());
+
+    // The server-wide compression level: one event with both levels and no target. The same level again writes none (the
+    // value is stored anyway); outside 1 to 19 is refused; a stale confirmation changes nothing.
+    meta.admin_set_compression_level(&actor, 3, 19, NOW).await.unwrap();
+    let e = seen.one().await;
+    assert_eq!(
+        (e.action, e.actor_user, e.target_id, details(&e)),
+        (AuditAction::AdminCompressionChanged, Some(root.id), None, json(r#"{"level_from":3,"level_to":19}"#))
+    );
+    meta.admin_set_compression_level(&actor, 19, 19, NOW).await.unwrap();
+    assert!(seen.actions().await.is_empty());
+    assert!(matches!(meta.admin_set_compression_level(&actor, 19, 20, NOW).await, Err(MetaError::Invalid(_))));
+    assert!(matches!(meta.admin_set_compression_level(&actor, 19, 0, NOW).await, Err(MetaError::Invalid(_))));
+    let stale = AdminActor { password_hash: "$argon2id$old".to_owned(), ..actor.clone() };
+    assert!(matches!(meta.admin_set_compression_level(&stale, 19, 5, NOW).await, Err(MetaError::Conflict(_))));
+    assert_eq!(meta.server_value("compression_level").await.unwrap().map(|v| v.0), Some("19".to_owned()));
     assert!(seen.actions().await.is_empty());
 
     // A reset code, and its redemption: the devices it signs out are counted in the one event.
@@ -5207,7 +5328,7 @@ async fn migrating_from_0008_adds_the_audit_log(url: &str) {
     assert_eq!(schema_version(url).await, 8);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 14, "all migrations after the audit log run");
+    assert_eq!(schema_version(url).await, 15, "all migrations after the audit log run");
     assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.user), Some(ana.id));
     assert!(all_events(&meta).await.is_empty(), "a new log is empty");
     meta.sign_in_device(ana.id, (&ana.password_hash, ana.auth_gen), "pc", &DeviceClient::default(), &token(), NOW).await.unwrap().unwrap();
@@ -5216,7 +5337,7 @@ async fn migrating_from_0008_adds_the_audit_log(url: &str) {
 
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    sqlx::query("INSERT INTO schema_version (version) VALUES (15)").execute(&mut conn).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (16)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
 }
@@ -6799,7 +6920,7 @@ async fn migrating_from_0010_adds_the_web_sessions(url: &str) {
     assert_eq!(schema_version(url).await, 10);
 
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 14, "the current schema includes history, trash and the reference index after web sessions");
+    assert_eq!(schema_version(url).await, 15, "the current schema includes history, trash and the reference index after web sessions");
     assert_eq!(meta.device_by_token(&old_token).await.unwrap().map(|a| a.user), Some(root.id));
     assert_eq!(all_events(&meta).await.len(), events, "the audit rows are kept");
     let session = new_session();
@@ -6811,14 +6932,14 @@ async fn migrating_from_0010_adds_the_web_sessions(url: &str) {
     back_to_0010(url).await;
     assert_eq!(schema_version(url).await, 10);
     let meta = Meta::open(url).await.unwrap();
-    assert_eq!(schema_version(url).await, 14);
+    assert_eq!(schema_version(url).await, 15);
     assert!(!session_is_valid(&meta, &session, NOW + 6).await, "the table is new and empty");
     drop(meta);
 
     // A database from a newer Craft Cloud is still refused.
     use sqlx::Connection;
     let mut conn = sqlx::AnyConnection::connect(url).await.unwrap();
-    sqlx::query("INSERT INTO schema_version (version) VALUES (15)").execute(&mut conn).await.unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (16)").execute(&mut conn).await.unwrap();
     drop(conn);
     assert!(matches!(Meta::open(url).await, Err(MetaError::Corrupt(_))));
 }
@@ -7234,7 +7355,14 @@ async fn the_index_migration_leaves_old_manifests_unindexed_on(url: &str) {
     let _ = ana;
     {
         let mut conn = raw(url).await;
-        for statement in ["DROP TABLE manifest_chunks", "DROP TABLE manifest_index", "DELETE FROM schema_version WHERE version >= 14"] {
+        for statement in [
+            "DROP TABLE manifest_chunks",
+            "DROP TABLE manifest_index",
+            "ALTER TABLE blobs DROP COLUMN physical_size",
+            "ALTER TABLE blobs DROP COLUMN compress_level",
+            "DROP TABLE server_state",
+            "DELETE FROM schema_version WHERE version >= 14",
+        ] {
             sqlx::query(statement).execute(&mut conn).await.unwrap();
         }
     }
@@ -7244,7 +7372,7 @@ async fn the_index_migration_leaves_old_manifests_unindexed_on(url: &str) {
     assert_eq!((audit.manifests, audit.complete, audit.absent, audit.building), (1, 0, 1, 0));
     let mut conn = raw(url).await;
     let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version").fetch_one(&mut conn).await.unwrap();
-    assert_eq!(latest, 14);
+    assert_eq!(latest, 15);
 }
 
 /// What the database alone can say is wrong, in seeded damage: orphan edges, an index row without its manifest, an edge
@@ -7859,4 +7987,43 @@ async fn concurrent_index_completes_reset_one_manifest_on_postgres() {
         return;
     };
     concurrent_index_completes_reset_one_manifest_on(&url).await;
+}
+
+/// A database from before stored sizes were tracked keeps its blobs, with the size unknown (never zero or guessed), and the
+/// physical sizes recorded afterwards stay.
+#[tokio::test]
+async fn migrating_from_0014_leaves_stored_sizes_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}", dir.path().join("meta.db").display());
+    let (chunk, other) = (random_chunk(), random_chunk());
+    {
+        let meta = Meta::open(&url).await.unwrap();
+        let ana = user(&meta, "ana").await;
+        meta.add_chunk(ana.space, &chunk, 500, NOW).await.unwrap();
+        meta.add_chunk(ana.space, &other, 700, NOW).await.unwrap();
+        meta.set_physical(BlobKind::Chunk, other.as_bytes(), 100, 3).await.unwrap();
+    }
+    {
+        let mut conn = raw(&url).await;
+        for statement in [
+            "ALTER TABLE blobs DROP COLUMN physical_size",
+            "ALTER TABLE blobs DROP COLUMN compress_level",
+            "DROP TABLE server_state",
+            "DELETE FROM schema_version WHERE version >= 15",
+        ] {
+            sqlx::query(statement).execute(&mut conn).await.unwrap();
+        }
+    }
+    assert_eq!(schema_version(&url).await, 14);
+    let meta = Meta::open(&url).await.unwrap();
+    assert_eq!(schema_version(&url).await, 15);
+    let rows = meta.blob_page(None, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.physical_size.is_none() && r.level.is_none()), "unknown, not zero: {rows:?}");
+    assert_eq!(meta.stored_bytes(meta.all_spaces().await.unwrap()[0]).await.unwrap(), 1200, "the logical sizes are as they were");
+    let totals = meta.storage_totals().await.unwrap();
+    assert_eq!((totals.blobs, totals.known_blobs), (2, 0));
+    meta.set_physical(BlobKind::Chunk, chunk.as_bytes(), 90, 3).await.unwrap();
+    assert_eq!(meta.storage_totals().await.unwrap().known_blobs, 1);
+    assert_eq!(meta.server_value("compression_level").await.unwrap(), None, "the table is there and empty");
 }

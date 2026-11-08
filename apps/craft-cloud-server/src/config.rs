@@ -29,6 +29,9 @@
 //! # kind = "s3", bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http, capacity
 //! # refuse_when_full = true     # refuse new uploads when the disk is down to min_free, or the store holds `capacity` (default off)
 //! # min_free = "1 GiB"          # disk only, with refuse_when_full: the free space to keep (default 1 GiB)
+//! # compression = "zstd"   # or "none": store blobs plain (what a server before compression can read)
+//! # compression_level = 3       # zstd level of new writes, 1 to 19 (an admin can change it while the server runs)
+//! # compression_min_saving = 5  # keep a compressed blob only when it is at least this many percent smaller (1 to 50)
 //!
 //! [two_factor]                  # optional: without it, two-factor sign-in can't be set up
 //! key_file = "two-factor.key"   # 32 random bytes, made by `init`; relative to this file
@@ -299,6 +302,12 @@ pub enum StorageConfig {
         /// The free space to keep on the store's filesystem while `refuse_when_full` is on. Default 1 GiB.
         #[serde(default, deserialize_with = "min_free_size")]
         min_free: Option<Capacity>,
+        #[serde(default)]
+        compression: Compression,
+        #[serde(default)]
+        compression_level: CompressionLevel,
+        #[serde(default)]
+        compression_min_saving: MinSaving,
     },
     S3 {
         /// How much the bucket may hold, for the admin's storage overview. S3 has no size to ask for, so unset: none is shown.
@@ -323,6 +332,12 @@ pub enum StorageConfig {
         secret_access_key: Option<Secret>,
         #[serde(default)]
         allow_http: bool,
+        #[serde(default)]
+        compression: Compression,
+        #[serde(default)]
+        compression_level: CompressionLevel,
+        #[serde(default)]
+        compression_min_saving: MinSaving,
     },
 }
 
@@ -418,6 +433,73 @@ impl serde::de::Visitor<'_> for SizeVisitor {
 
     fn visit_i64<E: serde::de::Error>(self, bytes: i64) -> Result<Capacity, E> {
         Capacity::parse_as(&bytes.to_string(), self.0).map_err(E::custom)
+    }
+}
+
+/// The zstd level of new writes (`compression_level` in `[storage]`): 1 to 19, 3 by default. 20 to 22 are refused:
+/// they use windows the store's reader does not accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressionLevel(pub u8);
+
+impl Default for CompressionLevel {
+    fn default() -> Self {
+        Self(craft_cloud_store::DEFAULT_ZSTD_LEVEL)
+    }
+}
+
+impl<'de> Deserialize<'de> for CompressionLevel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let n = i64::deserialize(deserializer)?;
+        match u8::try_from(n) {
+            Ok(level) if (craft_cloud_store::MIN_ZSTD_LEVEL..=craft_cloud_store::MAX_ZSTD_LEVEL).contains(&level) => Ok(Self(level)),
+            _ => Err(serde::de::Error::custom(format!(
+                "compression_level = {n} is not a zstd level this server writes: use a whole number from {} to {}",
+                craft_cloud_store::MIN_ZSTD_LEVEL,
+                craft_cloud_store::MAX_ZSTD_LEVEL
+            ))),
+        }
+    }
+}
+
+/// How much smaller a compressed blob must be to be kept (`compression_min_saving` in `[storage]`): 1 to 50 percent,
+/// 5 by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinSaving(pub u8);
+
+impl Default for MinSaving {
+    fn default() -> Self {
+        Self(craft_cloud_store::DEFAULT_MIN_SAVING_PERCENT)
+    }
+}
+
+impl<'de> Deserialize<'de> for MinSaving {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let n = i64::deserialize(deserializer)?;
+        match u8::try_from(n) {
+            Ok(percent) if (1..=50).contains(&percent) => Ok(Self(percent)),
+            _ => Err(serde::de::Error::custom(format!("compression_min_saving = {n} is not a percentage from 1 to 50"))),
+        }
+    }
+}
+
+/// How blobs are written to storage (`compression` in `[storage]`). Reading understands both either way, so turning
+/// it off later leaves compressed blobs readable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compression {
+    /// zstd where it saves at least 5% (the default).
+    #[default]
+    Zstd,
+    /// Every blob plain.
+    None,
+}
+
+impl From<Compression> for craft_cloud_store::Compression {
+    fn from(compression: Compression) -> Self {
+        match compression {
+            Compression::Zstd => craft_cloud_store::Compression::Zstd,
+            Compression::None => craft_cloud_store::Compression::None,
+        }
     }
 }
 
@@ -558,6 +640,27 @@ impl StorageConfig {
         }
     }
 
+    /// How blobs are written, whichever backend holds them.
+    pub fn compression(&self) -> Compression {
+        match self {
+            StorageConfig::Disk { compression, .. } | StorageConfig::S3 { compression, .. } => *compression,
+        }
+    }
+
+    /// The zstd level new writes use unless an admin changed it while the server runs.
+    pub fn compression_level(&self) -> u8 {
+        match self {
+            StorageConfig::Disk { compression_level, .. } | StorageConfig::S3 { compression_level, .. } => compression_level.0,
+        }
+    }
+
+    /// How much smaller (percent) a compressed blob must be to be kept.
+    pub fn compression_min_saving(&self) -> u8 {
+        match self {
+            StorageConfig::Disk { compression_min_saving, .. } | StorageConfig::S3 { compression_min_saving, .. } => compression_min_saving.0,
+        }
+    }
+
     /// The S3 settings, with credentials from the config or else the standard `AWS_ACCESS_KEY_ID` /
     /// `AWS_SECRET_ACCESS_KEY` environment variables. `None` for disk storage.
     pub fn s3(&self) -> Result<Option<S3Config>, ConfigError> {
@@ -604,7 +707,18 @@ path = "/tmp/blobs"
         let c = Config::parse(DISK).unwrap();
         assert_eq!(c.listen, "127.0.0.1:8080".parse().unwrap());
         assert!(!c.behind_proxy && c.trusted_proxies.is_empty());
-        assert_eq!(c.storage, StorageConfig::Disk { path: "/tmp/blobs".into(), capacity: None, refuse_when_full: false, min_free: None });
+        assert_eq!(
+            c.storage,
+            StorageConfig::Disk {
+                path: "/tmp/blobs".into(),
+                capacity: None,
+                refuse_when_full: false,
+                min_free: None,
+                compression: Compression::Zstd,
+                compression_level: CompressionLevel(3),
+                compression_min_saving: MinSaving(5)
+            }
+        );
         assert_eq!(c.storage.s3().unwrap(), None);
         assert_eq!(c.public_url, None);
     }
@@ -872,6 +986,83 @@ min_free = 0"
         // Nothing but `trash_days` is accepted in the section, and the section may be empty.
         assert!(matches!(Config::parse(&format!("{DISK}\n[retention]\ngc_wait_hours = 24\n")), Err(ConfigError::Parse(_))));
         assert_eq!(Config::parse(&format!("{DISK}\n[retention]\n")).unwrap().retention.trash_days, 30);
+    }
+
+    #[test]
+    fn compression_is_zstd_unless_turned_off() {
+        assert_eq!(Config::parse(DISK).unwrap().storage.compression(), Compression::Zstd);
+        let with = |value: &str| {
+            Config::parse(&format!(
+                "{DISK}compression = {value}
+"
+            ))
+        };
+        assert_eq!(with("\"zstd\"").unwrap().storage.compression(), Compression::Zstd);
+        assert_eq!(with("\"none\"").unwrap().storage.compression(), Compression::None);
+        assert_eq!(craft_cloud_store::Compression::from(Compression::None), craft_cloud_store::Compression::None);
+        let Err(ConfigError::Parse(message)) = with("\"gzip\"") else { panic!("an unknown compression must be refused") };
+        assert!(message.contains("gzip") && message.contains("zstd") && message.contains("none"), "{message}");
+        assert!(message.contains("line"), "{message}");
+        let s3 = "listen = \"127.0.0.1:9000\"
+[database]
+url = \"sqlite:/tmp/m.db\"
+[storage]
+kind = \"s3\"
+bucket = \"b\"
+compression = \"none\"
+";
+        assert_eq!(Config::parse(s3).unwrap().storage.compression(), Compression::None);
+    }
+
+    #[test]
+    fn the_compression_level_and_min_saving_have_defaults_and_ranges() {
+        let c = Config::parse(DISK).unwrap();
+        assert_eq!((c.storage.compression_level(), c.storage.compression_min_saving()), (3, 5));
+        let with = |lines: &str| {
+            Config::parse(&format!(
+                "{DISK}{lines}
+"
+            ))
+        };
+        assert_eq!(with("compression_level = 1").unwrap().storage.compression_level(), 1);
+        assert_eq!(with("compression_level = 19").unwrap().storage.compression_level(), 19);
+        assert_eq!(with("compression_min_saving = 50").unwrap().storage.compression_min_saving(), 50);
+        // The level and "none" are independent settings: "none" is read as "none" whatever the level.
+        let both = with(
+            "compression = \"none\"
+compression_level = 19",
+        )
+        .unwrap();
+        assert_eq!((both.storage.compression(), both.storage.compression_level()), (Compression::None, 19));
+        for bad in [
+            "compression_level = 0",
+            "compression_level = 20",
+            "compression_level = 22",
+            "compression_level = -3",
+            "compression_level = 3.5",
+            "compression_level = \"high\"",
+            "compression_level = 300",
+        ] {
+            let Err(ConfigError::Parse(message)) = with(bad) else { panic!("{bad} must be refused") };
+            assert!(message.contains("line"), "{bad}: {message}");
+        }
+        let Err(ConfigError::Parse(message)) = with("compression_level = 25") else { panic!("refused") };
+        assert!(message.contains("1 to 19") && message.contains("25"), "{message}");
+        for bad in ["compression_min_saving = 0", "compression_min_saving = 51", "compression_min_saving = -1"] {
+            let Err(ConfigError::Parse(message)) = with(bad) else { panic!("{bad} must be refused") };
+            assert!(message.contains("line") && message.contains("1 to 50"), "{bad}: {message}");
+        }
+        let s3 = "listen = \"127.0.0.1:9000\"
+[database]
+url = \"sqlite:/tmp/m.db\"
+[storage]
+kind = \"s3\"
+bucket = \"b\"
+compression_level = 9
+compression_min_saving = 10
+";
+        let c = Config::parse(s3).unwrap();
+        assert_eq!((c.storage.compression_level(), c.storage.compression_min_saving()), (9, 10));
     }
 
     #[test]

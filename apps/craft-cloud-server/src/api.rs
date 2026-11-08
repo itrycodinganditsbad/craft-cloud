@@ -336,6 +336,14 @@ pub(crate) fn body_too_slow() -> ApiError {
     ApiError::new(StatusCode::REQUEST_TIMEOUT, codes::TIMEOUT, "the request body took too long to arrive")
 }
 
+/// Keeps what the object really takes on the backend next to the blob's logical size. A statistic, not data: when it
+/// can't be written, the upload still succeeded and the size just stays unknown (or as it was).
+async fn record_physical(state: &Shared, kind: BlobKind, id: &[u8; 32], written: craft_cloud_store::Written) {
+    if let Err(e) = state.meta.set_physical(kind, id, written.physical_len, written.level).await {
+        tracing::warn!(error = %e, "couldn't record a blob's stored size");
+    }
+}
+
 async fn put_chunk(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
@@ -367,11 +375,12 @@ async fn put_chunk(
     // A space at its cap doesn't get to store bytes it would then be refused for.
     state.meta.check_room(auth.space, BlobKind::Chunk, id.as_bytes(), body.len() as u64 + 1).await?;
     // Bytes first, record second: the database never points at a blob that isn't stored.
-    state.store.put(BlobKey::chunk(&id), &body).await?;
+    let written = state.store.put(BlobKey::chunk(&id), &body).await?;
     state.meta.add_chunk(auth.space, &id, body.len() as u64 + 1, state.now_ms()).await?;
     if !known {
         state.note_stored(body.len() as u64 + 1);
     }
+    record_physical(&state, BlobKind::Chunk, id.as_bytes(), written).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -435,7 +444,7 @@ async fn put_manifest(
         state.check_server_room(body.len() as u64 + 1).await?;
     }
     state.meta.check_room(auth.space, BlobKind::Manifest, id.as_bytes(), body.len() as u64 + 1).await?;
-    state.store.put(BlobKey::manifest(&id), &body).await?;
+    let written = state.store.put(BlobKey::manifest(&id), &body).await?;
     state.meta.add_manifest(auth.space, &manifest, body.len() as u64 + 1, state.now_ms()).await?;
     if !known {
         state.note_stored(body.len() as u64 + 1);
@@ -443,6 +452,7 @@ async fn put_manifest(
     // The index of its chunks is complete before the upload is acknowledged: a manifest of up to the index budget was indexed
     // in the transaction above, a longer one is finished here in batches (and by `index build` if this is cut short).
     state.meta.index_complete(&manifest).await?;
+    record_physical(&state, BlobKind::Manifest, id.as_bytes(), written).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

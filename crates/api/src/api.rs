@@ -353,6 +353,112 @@ pub struct AdminStorageOverview {
     /// Postgres.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_bytes: Option<u64>,
+    /// How blobs are stored and what that saves (see [`AdminCompression`]). Left out by a server from before compression
+    /// settings, and then `None`. Boxed: the overview travels inside the app's event type, which clippy keeps small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<Box<AdminCompression>>,
+}
+
+/// Compression of stored blobs, in [`AdminStorageOverview`]. Percentages are whole permille (tenths of a percent), so the
+/// type stays comparable; `saving_permille: Some(412)` is 41.2 %.
+///
+/// What the settings are: `algorithm` comes from the config file and cannot be changed through the API. `"none"` wins over
+/// any level: nothing is compressed then, whatever `level` says. The level is the config file's (`config_level`) unless an
+/// admin changed it at runtime (`admin_level`), which applies to new writes only.
+///
+/// What it saves: `known_*` count only the blobs whose stored size the server has recorded (blobs written before sizes were
+/// tracked have none until they are uploaded again, recompressed or measured with `store measure`), and `known_permille` says
+/// how much of the data (by logical size) that is, so a small share is a rough number, and `saving_permille` is `None` when
+/// nothing is known.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminCompression {
+    /// `zstd` or `none`, from the config file.
+    #[serde(default)]
+    pub algorithm: String,
+    /// The level new writes use now (meaningless when `algorithm` is `none`).
+    #[serde(default)]
+    pub level: u8,
+    /// The level in the config file.
+    #[serde(default)]
+    pub config_level: u8,
+    /// The level an admin set at runtime, which wins over the config file's. `None`: none set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_level: Option<u8>,
+    /// A compressed blob is kept only when it is at least this many percent smaller.
+    #[serde(default)]
+    pub min_saving_percent: u8,
+    /// Blobs the server stores.
+    #[serde(default)]
+    pub blobs: u64,
+    /// Their logical size: what quotas count.
+    #[serde(default)]
+    pub logical_bytes: u64,
+    /// Blobs whose stored size is known, and the logical and physical size of those.
+    #[serde(default)]
+    pub known_blobs: u64,
+    #[serde(default)]
+    pub known_logical_bytes: u64,
+    #[serde(default)]
+    pub known_physical_bytes: u64,
+    /// The share of the data (by logical size) whose stored size is known, in permille.
+    #[serde(default)]
+    pub known_permille: u32,
+    /// What compression saves over the known blobs, in permille of their logical size. `None`: nothing is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saving_permille: Option<u32>,
+    /// The last `store estimate` run: what other levels would save. `None`: none was run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<AdminCompressionEstimate>,
+}
+
+/// The result of the last `craft-cloud-server store estimate` and when it ran. It is a sample, not the whole store.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminCompressionEstimate {
+    #[serde(default)]
+    pub at_ms: i64,
+    #[serde(default)]
+    pub sampled_blobs: u64,
+    #[serde(default)]
+    pub sampled_bytes: u64,
+    /// What the sampled blobs save as they are stored now, in permille.
+    #[serde(default)]
+    pub current_saving_permille: u32,
+    #[serde(default)]
+    pub levels: Vec<AdminCompressionLevelEstimate>,
+}
+
+/// One level of an [`AdminCompressionEstimate`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminCompressionLevelEstimate {
+    pub level: u8,
+    /// What the level would save on the sample, in permille.
+    pub saving_permille: u32,
+    /// How fast one core compresses at the level, in KiB of plain data per second.
+    pub kib_per_second: u64,
+}
+
+/// `PUT /admin/storage/compression`: the level new writes are compressed at (1 to 19), kept in the database and applied at
+/// once. Needs the acting admin's current password like every admin change. Its `Debug` output hides the password.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminSetCompressionLevel {
+    pub level: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
+}
+
+impl std::fmt::Debug for AdminSetCompressionLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminSetCompressionLevel")
+            .field("level", &self.level)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// One account in [`AdminStorageOverview`].
@@ -546,6 +652,11 @@ pub struct AuditDetails {
     /// The quota an admin set: `null` when they removed it, missing when the event is not about a quota.
     #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub quota_bytes: Option<Option<u64>>,
+    /// The compression level an admin changed from and to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level_from: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level_to: Option<u8>,
     /// How many devices an event signed out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked: Option<u32>,
@@ -605,7 +716,7 @@ pub struct AuditExportEnd {
 
 /// The names of the security events, the closed list the server writes and `GET /admin/audit` filters by (`docs/design/sync.md`,
 /// "Security audit log"). A filter is one of these, or a prefix of some of them that ends in a dot, like `auth.`.
-pub const AUDIT_ACTIONS: [&str; 30] = [
+pub const AUDIT_ACTIONS: [&str; 31] = [
     "auth.login",
     "auth.login_failed",
     "auth.second_factor_failed",
@@ -623,6 +734,7 @@ pub const AUDIT_ACTIONS: [&str; 30] = [
     "admin.user_removed",
     "admin.role_changed",
     "admin.quota_changed",
+    "admin.compression_changed",
     "admin.invite_issued",
     "admin.invite_revoked",
     "admin.password_reset_issued",
@@ -755,7 +867,7 @@ mod tests {
 
     #[test]
     fn audit_filters_are_the_closed_list_or_a_prefix_of_it() {
-        assert_eq!(AUDIT_ACTIONS.len(), 30);
+        assert_eq!(AUDIT_ACTIONS.len(), 31);
         assert!(AUDIT_ACTIONS.iter().all(|a| valid_audit_action(a)));
         for prefix in ["auth.", "admin.", "cli.", "join.", "device.", "account."] {
             assert!(valid_audit_action(prefix), "{prefix}");

@@ -54,6 +54,7 @@ async fn run_server(config_path: &std::path::Path) -> Result<(), String> {
         .with_storage_info(storage_info.clone())
         .with_full_guard(config.storage.full_policy().map(|policy| craft_cloud_server::full::FullGuard::new(policy, &storage_info)));
     let listener = tokio::net::TcpListener::bind(config.listen).await.map_err(|e| format!("can't listen on {}: {e}", config.listen))?;
+    state.load_compression_level().await.map_err(|e| e.to_string())?;
     tracing::info!(listen = %config.listen, behind_proxy = config.behind_proxy, web_admin = config.web_admin.enabled, "Craft Cloud server running");
     let shutdown = async {
         wait_for_stop_signal().await;

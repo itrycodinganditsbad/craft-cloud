@@ -284,6 +284,7 @@ on_every_backend!(
     an_invite_to_a_new_account_sets_its_password,
     an_invite_to_an_account_with_a_password_asks_none,
     the_join_page_never_looks_at_the_code,
+    the_overview_reports_compression_and_an_admin_changes_the_level,
 );
 
 // ---- helpers ----
@@ -1252,6 +1253,44 @@ async fn concurrent_failed_joins_are_limited_too() {
         let made = new_pairing(&s, &token).await;
         joined(join_from(&s, &made.code, &format!("pc{i}"), None, Some("198.51.100.7")).await).await;
     }
+}
+
+/// A compressible file goes through the real upload path, lands on disk compressed (format byte 1, smaller than the
+/// file), and downloads unchanged. Agents and apps never see the difference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compressible_uploads_are_stored_compressed_and_download_unchanged() {
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let blobs_path = blobs.path().to_owned();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    let s = start(meta, Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![db, blobs], None).await;
+    add_user(&s, "ana").await;
+    let token = login(&s, "ana").await;
+    let data: Vec<u8> = (0..20_000u32)
+        .flat_map(|i| {
+            format!(
+                "line {} of a text file
+",
+                i % 97
+            )
+            .into_bytes()
+        })
+        .collect();
+    let id = upload(&s, &token, &data).await;
+
+    let chunk_file = blobs_path.join(craft_cloud_store::BlobKey::chunk(&chunk_id(&data)).path());
+    let raw = std::fs::read(&chunk_file).unwrap();
+    assert_eq!(raw[0], 1, "stored as zstd");
+    assert!(raw.len() < data.len() / 4, "{} bytes on disk for {} bytes", raw.len(), data.len());
+    assert_eq!(download(&s, &token, &id).await, data);
+
+    // The database knows both sizes: the logical one quotas count, and what the object takes on disk.
+    let row = s.meta.blob_from(craft_cloud_meta::BlobKind::Chunk, &[0u8; 32]).await.unwrap().unwrap();
+    assert_eq!(row.id, *chunk_id(&data).as_bytes());
+    assert_eq!((row.stored_size, row.physical_size, row.level), (data.len() as u64 + 1, Some(raw.len() as u64), Some(3)));
+    let totals = s.meta.storage_totals().await.unwrap();
+    assert_eq!(totals.blobs, totals.known_blobs, "every upload records its stored size");
+    assert!(totals.known_physical_bytes < totals.known_logical_bytes / 2);
 }
 
 // ---- load limits: standalone SQLite + disk fixtures for custom limits and SQLite-specific behavior ----
@@ -2279,6 +2318,7 @@ async fn every_admin_route_needs_an_admin(s: &Server) {
     let routes = vec![
         (M::GET, "/admin/server".to_owned(), None, StatusCode::OK),
         (M::GET, "/admin/storage".to_owned(), None, StatusCode::OK),
+        (M::PUT, "/admin/storage/compression".to_owned(), Some(json!({ "level": 5 })), StatusCode::OK),
         (M::GET, "/admin/users".to_owned(), None, StatusCode::OK),
         (M::POST, "/admin/users".to_owned(), Some(json!({ "username": "made", "role": "member" })), StatusCode::OK),
         (M::PATCH, format!("/admin/users/{ana}"), Some(json!({ "quota_bytes": null })), StatusCode::OK),
@@ -2294,8 +2334,8 @@ async fn every_admin_route_needs_an_admin(s: &Server) {
         (M::DELETE, format!("/admin/users/{bob}/devices/{spare_id}"), Some(json!({})), StatusCode::NO_CONTENT),
         (M::DELETE, format!("/admin/users/{carl}"), Some(json!({})), StatusCode::ACCEPTED),
     ];
-    // Every `.route(` of the admin module is in the table (twelve paths): a route added without a row fails here.
-    assert_eq!(include_str!("../src/admin.rs").matches(".route(\"/admin/").count(), 12);
+    // Every `.route(` of the admin module is in the table (thirteen paths): a route added without a row fails here.
+    assert_eq!(include_str!("../src/admin.rs").matches(".route(\"/admin/").count(), 13);
     let distinct: std::collections::BTreeSet<_> = routes
         .iter()
         .map(|(_, p, _, _)| {
@@ -2306,7 +2346,7 @@ async fn every_admin_route_needs_an_admin(s: &Server) {
                 .replace(&spare_id.to_string(), "{device_id}")
         })
         .collect();
-    assert_eq!(distinct.len(), 12, "{distinct:?}");
+    assert_eq!(distinct.len(), 13, "{distinct:?}");
 
     for (method, path, body, ok) in routes {
         let counts = s.meta.admin_server_counts().await.unwrap();
@@ -2333,12 +2373,12 @@ async fn every_admin_route_needs_an_admin(s: &Server) {
     assert_eq!((status, code.as_str()), (StatusCode::METHOD_NOT_ALLOWED, "invalid"));
 }
 
-/// The nine changes that need the admin's password, each against its own admin (wrong passwords are counted per
+/// The ten changes that need the admin's password, each against its own admin (wrong passwords are counted per
 /// account) and its own targets.
 async fn every_admin_change_needs_the_admins_password(s: &Server) {
     use reqwest::Method as M;
     let hash = hash_password(PASSWORD).unwrap();
-    for kind in 0..9 {
+    for kind in 0..10 {
         let admin = format!("adm{kind}");
         s.meta.create_user(&admin, &hash, Role::Admin, 0).await.unwrap();
         let token = login(s, &admin).await;
@@ -2364,7 +2404,8 @@ async fn every_admin_change_needs_the_admins_password(s: &Server) {
             5 => (M::POST, format!("/admin/users/{id}/invite"), json!({}), StatusCode::OK),
             6 => (M::DELETE, format!("/admin/users/{id}/invite"), json!({}), StatusCode::NO_CONTENT),
             7 => (M::POST, format!("/admin/users/{id}/password-reset"), json!({}), StatusCode::OK),
-            _ => (M::DELETE, format!("/admin/users/{id}/devices/{}", device.unwrap()), json!({}), StatusCode::NO_CONTENT),
+            8 => (M::DELETE, format!("/admin/users/{id}/devices/{}", device.unwrap()), json!({}), StatusCode::NO_CONTENT),
+            _ => (M::PUT, "/admin/storage/compression".to_owned(), json!({ "level": 7 }), StatusCode::OK),
         };
         let at = |body: Option<serde_json::Value>| call(s, Some(&token), method.clone(), &path, body);
         let what = format!("{method} {path}");
@@ -4465,4 +4506,167 @@ async fn a_disk_store_whose_directory_is_gone_is_not_ok() {
     let info: serde_json::Value = res.json().await.unwrap();
     assert_eq!(info["store_ok"].as_bool(), Some(false), "{info}");
     assert_eq!(info["database_ok"].as_bool(), Some(true));
+}
+
+/// Text that compresses: the same few words in a changing order, unique per call.
+fn wordy_text(tag: &str) -> Vec<u8> {
+    (0..30_000u32).flat_map(|i| format!("{tag} line {} of a text file\n", i % 97).into_bytes()).collect()
+}
+
+/// The overview says how blobs are stored and what that saves. An admin sets the level: it needs the password, is audited
+/// once per change, applies to the next writes, is kept for a restart, and is refused outside 1 to 19.
+async fn the_overview_reports_compression_and_an_admin_changes_the_level(s: &Server) {
+    use craft_cloud_proto::api::{AdminCompression, AdminStorageOverview, AuditPage};
+    use reqwest::Method as M;
+    add_admin(s, "root").await;
+    add_user(s, "ana").await;
+    let (root, ana) = (login(s, "root").await, login(s, "ana").await);
+    upload(s, &ana, &wordy_text("first")).await;
+    let view = || async {
+        let overview: AdminStorageOverview = get_json(call(s, Some(&root), M::GET, "/admin/storage", None).await).await;
+        overview.compression.expect("the overview has a compression part")
+    };
+    let first = view().await;
+    assert_eq!((first.algorithm.as_str(), first.level, first.config_level, first.admin_level, first.min_saving_percent), ("zstd", 3, 3, None, 5));
+    assert_eq!((first.blobs, first.known_blobs, first.known_permille), (2, 2, 1000), "a chunk and a manifest, both recorded");
+    assert!(first.saving_permille.unwrap() > 500, "text saves more than half: {first:?}");
+    assert!(first.known_physical_bytes < first.known_logical_bytes / 2 && first.estimate.is_none());
+
+    // Changing it: not for a member, not without the password, not with a wrong one, not outside 1 to 19.
+    let put = |token: String, body: serde_json::Value| async move { call(s, Some(&token), M::PUT, "/admin/storage/compression", Some(body)).await };
+    assert_eq!(refusal(put(ana.clone(), json!({ "level": 9, "password": PASSWORD })).await).await, (StatusCode::FORBIDDEN, "forbidden".to_owned()));
+    assert_eq!(refusal(put(root.clone(), json!({ "level": 9 })).await).await, (StatusCode::BAD_REQUEST, "invalid".to_owned()));
+    assert_eq!(
+        refusal(put(root.clone(), json!({ "level": 9, "password": "wrong" })).await).await,
+        (StatusCode::FORBIDDEN, "wrong_password".to_owned())
+    );
+    for level in [json!(0), json!(20), json!(22), json!(300), json!(-1), json!("high"), json!(null)] {
+        assert_eq!(
+            refusal(put(root.clone(), json!({ "level": level, "password": PASSWORD })).await).await,
+            (StatusCode::BAD_REQUEST, "invalid".to_owned()),
+            "{level}"
+        );
+    }
+    assert_eq!(view().await.admin_level, None, "nothing changed yet");
+
+    let changed: AdminCompression = get_json(put(root.clone(), json!({ "level": 19, "password": PASSWORD })).await).await;
+    assert_eq!((changed.algorithm.as_str(), changed.level, changed.config_level, changed.admin_level), ("zstd", 19, 3, Some(19)));
+    assert_eq!(view().await.admin_level, Some(19));
+
+    // Audited: one event, from 3 to 19, by the admin. Setting the same level again changes nothing and adds none.
+    let compression_events = || async {
+        let page: AuditPage = get_json(call(s, Some(&root), M::GET, "/admin/audit?limit=200&action=admin.compression_changed", None).await).await;
+        page.events
+    };
+    let events = compression_events().await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!((events[0].details.level_from, events[0].details.level_to, events[0].outcome.as_str()), (Some(3), Some(19), "success"));
+    assert!(events[0].target_id.is_none());
+    let _: AdminCompression = get_json(put(root.clone(), json!({ "level": 19, "password": PASSWORD })).await).await;
+    assert_eq!(compression_events().await.len(), 1);
+
+    // The next write is compressed at the new level, and the database says so.
+    let second = wordy_text("second");
+    upload(s, &ana, &second).await;
+    let row = s.meta.blob_from(craft_cloud_meta::BlobKind::Chunk, chunk_id(&second).as_bytes()).await.unwrap().unwrap();
+    assert_eq!((row.id, row.level), (*chunk_id(&second).as_bytes(), Some(19)));
+    assert!(row.physical_size.unwrap() < row.stored_size / 2);
+
+    // A restart takes the level the admin set from the database; the store of the new process starts at the config's.
+    let restarted = craft_cloud_store::Store::new(craft_cloud_store::memory::MemoryBackend::new());
+    assert_eq!(restarted.level(), 3);
+    let state = AppState::new(s.meta.clone(), restarted.clone(), vec![]).unwrap();
+    state.load_compression_level().await.unwrap();
+    assert_eq!(restarted.level(), 19);
+    assert_eq!(state.compression.config_level, 3, "the config's own level is kept for the overview");
+}
+
+/// `compression = "none"` in the config wins over any level: the level is kept, and nothing is compressed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn none_in_the_config_wins_over_the_level_an_admin_sets() {
+    use craft_cloud_proto::api::{AdminCompression, AdminStorageOverview};
+    use reqwest::Method as M;
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap()).with_compression(craft_cloud_store::Compression::None);
+    let s = start(meta, store, vec![db, blobs], None).await;
+    add_admin(&s, "root").await;
+    add_user(&s, "ana").await;
+    let (root, ana) = (login(&s, "root").await, login(&s, "ana").await);
+    let changed: AdminCompression =
+        get_json(call(&s, Some(&root), M::PUT, "/admin/storage/compression", Some(json!({ "level": 12, "password": PASSWORD }))).await).await;
+    assert_eq!((changed.algorithm.as_str(), changed.admin_level), ("none", Some(12)), "kept, and the overview says none wins");
+    let text = wordy_text("plain");
+    upload(&s, &ana, &text).await;
+    let row = s.meta.blob_from(craft_cloud_meta::BlobKind::Chunk, chunk_id(&text).as_bytes()).await.unwrap().unwrap();
+    assert_eq!((row.level, row.physical_size), (Some(0), Some(text.len() as u64 + 1)), "stored plain whatever the level");
+    let after: AdminStorageOverview = get_json(call(&s, Some(&root), M::GET, "/admin/storage", None).await).await;
+    let after = after.compression.unwrap();
+    assert_eq!((after.algorithm.as_str(), after.saving_permille), ("none", Some(0)));
+}
+
+/// Several admins changing the level at once end with the store at the level the database holds, whichever change was last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_level_changes_leave_the_store_at_the_stored_level() {
+    use craft_cloud_proto::api::{AdminCompression, AdminStorageOverview};
+    use reqwest::Method as M;
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let s = start(meta, store.clone(), vec![db, blobs], None).await;
+    add_admin(&s, "root").await;
+    let root = login(&s, "root").await;
+    // As many at once as there are password-check slots: more would be told to come back later.
+    let at_once = u8::try_from(s.password_checks.available_permits().clamp(2, 8)).unwrap();
+    for round in 0..6u8 {
+        let puts = (1..=at_once).map(|n| {
+            let level = (round * at_once + n) % 19 + 1;
+            call(&s, Some(&root), M::PUT, "/admin/storage/compression", Some(json!({ "level": level, "password": PASSWORD })))
+        });
+        for response in futures_util::future::join_all(puts).await {
+            let _: AdminCompression = get_json(response).await;
+        }
+        let overview: AdminStorageOverview = get_json(call(&s, Some(&root), M::GET, "/admin/storage", None).await).await;
+        let view = overview.compression.unwrap();
+        assert_eq!(Some(store.level()), view.admin_level, "round {round}: the store runs at the level the database holds");
+        assert_eq!(view.level, store.level());
+    }
+}
+
+/// A level in the database outside 1 to 19 (or not a number) is ignored at start, and the config's level stays.
+#[tokio::test]
+async fn a_stored_level_outside_the_range_is_ignored_at_start() {
+    let db = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    for stored in ["0", "20", "255", "-3", "high", ""] {
+        meta.set_server_value("compression_level", stored, 1).await.unwrap();
+        let store = Store::new(craft_cloud_store::memory::MemoryBackend::new());
+        assert_eq!(store.level(), 3);
+        let state = AppState::new(meta.clone(), store.clone(), vec![]).unwrap();
+        state.load_compression_level().await.unwrap();
+        assert_eq!(store.level(), 3, "{stored:?} is ignored");
+    }
+    meta.set_server_value("compression_level", "1", 2).await.unwrap();
+    let store = Store::new(craft_cloud_store::memory::MemoryBackend::new());
+    AppState::new(meta.clone(), store.clone(), vec![]).unwrap().load_compression_level().await.unwrap();
+    assert_eq!(store.level(), 1, "the edge of the range is taken");
+}
+
+/// An overview from a server before compression settings has no compression part, and one with it round-trips.
+#[test]
+fn the_overview_reads_with_and_without_the_compression_part() {
+    use craft_cloud_proto::api::{AdminCompression, AdminStorageOverview};
+    let old = json!({
+        "accounts": 1, "stored_bytes": 5, "default_quota_bytes": null, "accounts_with_override": 0, "accounts_near_quota": 0,
+        "accounts_over_quota": 0, "top_accounts": [], "manifest_index": { "complete": 0, "building": 0, "not_indexed": 0 }
+    });
+    let typed: AdminStorageOverview = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(typed.compression, None);
+    assert!(serde_json::to_value(&typed).unwrap().get("compression").is_none(), "left out when there is none");
+    let mut new = old;
+    new["compression"] = json!({ "algorithm": "zstd", "level": 3, "unknown_future_field": 1 });
+    let typed: AdminStorageOverview = serde_json::from_value(new).unwrap();
+    assert_eq!(typed.compression, Some(Box::new(AdminCompression { algorithm: "zstd".into(), level: 3, ..AdminCompression::default() })));
 }

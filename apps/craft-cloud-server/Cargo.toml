@@ -41,6 +41,7 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 # The tests move the server's clock (`AppState::with_clock`): the feature is on for them only.
 craft-cloud-server = { path = ".", features = ["test-support"] }
 reqwest.workspace = true
