@@ -403,6 +403,8 @@ pub fn action_label(action: &str) -> &str {
         "admin.user_removed" => "Account removed by an admin",
         "admin.role_changed" => "Role changed by an admin",
         "admin.quota_changed" => "Quota changed by an admin",
+        // The name the compression setting's branch adds to the server's list; its text is here so that it doesn't show raw.
+        "admin.compression_changed" => "Compression level changed",
         "admin.invite_issued" => "Invite made by an admin",
         "admin.invite_revoked" => "Invite or reset code revoked by an admin",
         "admin.password_reset_issued" => "Password reset code made by an admin",
@@ -624,6 +626,16 @@ pub(crate) mod tests {
         assert_eq!(action_label("auth.login"), "Signed in");
         assert_eq!(action_label("something.new"), "something.new");
         assert_eq!(filter_label("auth."), "Sign-ins");
+    }
+
+    /// Every name of the API's list is said in words, and the compression change, which the server writes once its setting is
+    /// in, is too.
+    #[test]
+    fn every_audit_name_has_its_words() {
+        for action in craft_cloud_app::AUDIT_ACTIONS {
+            assert_ne!(action_label(action), action, "{action} shows raw");
+        }
+        assert_eq!(action_label("admin.compression_changed"), "Compression level changed");
     }
 
     #[test]
