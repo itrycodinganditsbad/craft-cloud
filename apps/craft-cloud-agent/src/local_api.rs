@@ -31,10 +31,10 @@ use craft_cloud_proto::api::{
 };
 use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
 use craft_cloud_proto::local::{
-    ApproveDeletesAnswer, ApproveDeletesRequest, AutostartRequest, ChangePasswordRequest, ConflictsResponse, FolderUsageResponse, JoinRequest,
-    LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES, PairingInfo, PasswordRequest,
-    RenameDeviceRequest, RunState, SecondFactorLoginRequest, SpaceInfo, SpaceList, SpaceRun, SpaceStatus, SpaceSync, SpaceSyncRequest, Status,
-    TotpRequest, TwoFactorProofRequest, codes, paths,
+    ApproveDeletesAnswer, ApproveDeletesRequest, AutostartRequest, ChangePasswordRequest, ConflictsResponse, FolderUsageResponse, FromFolderRequest,
+    FromFolderStatus, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES,
+    PairingInfo, PasswordRequest, RenameDeviceRequest, RunState, SecondFactorLoginRequest, SpaceInfo, SpaceList, SpaceRun, SpaceStatus, SpaceSync,
+    SpaceSyncRequest, Status, TotpRequest, TwoFactorProofRequest, codes, paths,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -86,6 +86,8 @@ struct Shared {
     spaces: Vec<SpaceInfo>,
     space_status: Vec<SpaceStatus>,
     spaces_handle: Option<SpacesHandle>,
+    /// The work of making a team space from a folder, under way or how the last one ended.
+    from_folder: Option<FromFolderStatus>,
 }
 
 /// The loop's side of the local API: the status it reports, and the commands it receives. Cheap to clone.
@@ -112,6 +114,7 @@ impl Control {
             spaces: Vec::new(),
             space_status: Vec::new(),
             spaces_handle: None,
+            from_folder: None,
         };
         let autostart_refusal = "this agent doesn't handle starting at login here".to_owned();
         Self { shared: Arc::new(Mutex::new(shared)), commands, autostart: None, autostart_refusal }
@@ -159,6 +162,7 @@ impl Control {
                 s.removed = false;
                 s.spaces.clear();
                 s.space_status.clear();
+                s.from_folder = None;
             }
         });
     }
@@ -178,6 +182,31 @@ impl Control {
 
     pub fn spaces_handle(&self) -> Option<SpacesHandle> {
         self.with(|s| s.spaces_handle.clone())
+    }
+
+    /// The work of making a team space from a folder (`Status::from_folder`).
+    pub fn from_folder(&self) -> Option<FromFolderStatus> {
+        self.with(|s| s.from_folder.clone())
+    }
+
+    pub fn set_from_folder(&self, status: Option<FromFolderStatus>) {
+        self.with(|s| s.from_folder = status);
+    }
+
+    /// Starts the work's status, unless other work is still under way (`false`).
+    pub fn begin_from_folder(&self, status: FromFolderStatus) -> bool {
+        self.with(|s| {
+            if s.from_folder.as_ref().is_some_and(FromFolderStatus::running) {
+                return false;
+            }
+            s.from_folder = Some(status);
+            true
+        })
+    }
+
+    /// A team space as the spaces task last listed it.
+    pub fn space_info(&self, space: craft_cloud_proto::SpaceId) -> Option<SpaceInfo> {
+        self.with(|s| s.spaces.iter().find(|i| i.space == space).cloned())
     }
 
     /// Whether the server refused this device at the last pass (it was removed from the account).
@@ -233,6 +262,7 @@ impl Control {
             last_sync_ms: s.last_sync_ms,
             removed: s.account.is_some() && s.removed,
             spaces: if s.account.is_some() { s.space_status.clone() } else { Vec::new() },
+            from_folder: if s.account.is_some() { s.from_folder.clone() } else { None },
         })
     }
 }
@@ -458,6 +488,7 @@ fn router(state: Api) -> Router {
         .route(paths::CONFLICTS, get(conflicts))
         .route(&format!("{}/{{id}}", paths::DEVICES), delete(remove_device).patch(rename_device).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route(paths::SPACES, get(spaces))
+        .route(paths::SPACES_FROM_FOLDER, post(from_folder).layer(DefaultBodyLimit::max(craft_cloud_proto::local::MAX_ADMIN_JSON_BYTES)))
         .route(&format!("{}/{{id}}/accept", paths::SPACES), post(accept_space))
         .route(&format!("{}/{{id}}/decline", paths::SPACES), post(decline_space))
         .route(&format!("{}/{{id}}/sync", paths::SPACES), post(sync_space).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
@@ -963,6 +994,13 @@ async fn spaces(State(state): State<Api>) -> Result<Json<SpaceList>, LocalError>
     let mut list = vec![personal_space(&state.control, &account)];
     list.extend(state.control.with(|s| s.spaces.clone()));
     Ok(Json(SpaceList { spaces: list }))
+}
+
+/// `POST /v1/spaces/from-folder`: makes a team space from a folder (see [`crate::from_folder`]).
+async fn from_folder(State(state): State<Api>, body: Result<Json<FromFolderRequest>, JsonRejection>) -> Result<Json<FromFolderStatus>, LocalError> {
+    let Json(request) = body?;
+    let start = crate::from_folder::Start { control: state.control.clone(), data: DataDir::new(&state.data) };
+    Ok(Json(crate::from_folder::start(start, request).await?))
 }
 
 /// `POST /v1/spaces/{id}/accept`: passed on to the server; the agent looks at its list again before it answers.

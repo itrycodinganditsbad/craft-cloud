@@ -56,6 +56,13 @@ pub trait Transport: Send + Sync {
     async fn put_manifest(&self, id: &ManifestId, data: Bytes) -> Result<(), TransportError>;
     async fn get_manifest(&self, id: &ManifestId) -> Result<Bytes, TransportError>;
     async fn commit(&self, ops: &[Op]) -> Result<CommitResponse, TransportError>;
+    /// Asks the server to add to this space the chunks of `ids` that another space (the one the transport was told to take
+    /// from) has and the account may read, so that their bytes need not be sent again. Returns the ids this space still lacks,
+    /// which the engine uploads. The default claims nothing: every id is still missing. An answer that is a refusal of the claim
+    /// itself (no such space, no such route) also claims nothing and is no error; a full quota is `QuotaExceeded`.
+    async fn claim_chunks(&self, ids: &[ChunkId]) -> Result<Vec<ChunkId>, TransportError> {
+        Ok(ids.to_vec())
+    }
     /// Adds a save record to `node`'s version `version`, which went up without one (`POST /saves`, appended and
     /// idempotent). A server from before late records: `NotFound`, as this default says.
     async fn attach_save(&self, node: NodeId, version: VersionId, save: &SaveRecord) -> Result<(), TransportError> {

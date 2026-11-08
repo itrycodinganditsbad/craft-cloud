@@ -14,7 +14,9 @@ use craft_cloud_api::api::{
     AddSpaceMember, AdminCreateSpace, AdminSetSpaceOwner, AdminSpaceInfo, AdminSpaceList, ChangeSpaceMember, SpaceConfirm, SpaceListItem,
     SpaceMember, SpaceMembers, SpaceUsage, UpdateSpace,
 };
-use craft_cloud_api::local::{ApproveDeletesAnswer, ApproveDeletesRequest, SpaceInfo, SpaceList, SpaceSyncRequest, paths};
+use craft_cloud_api::local::{
+    ApproveDeletesAnswer, ApproveDeletesRequest, FromFolderRequest, FromFolderStatus, SpaceInfo, SpaceList, SpaceSyncRequest, paths,
+};
 
 use crate::admin::UserQuery;
 use crate::{Client, Error, Uuid, codes, http};
@@ -64,6 +66,15 @@ impl Client {
     pub fn set_space_sync(&self, id: SpaceId, request: &SpaceSyncRequest) -> Result<SpaceInfo, Error> {
         let body = serde_json::to_vec(request).map_err(|e| Error::Protocol(e.to_string()))?;
         self.call("POST", &space_path(id, "sync"), Some(body), http::SLOW_TIMEOUT).map_err(too_old)
+    }
+
+    /// Starts "make a team space from this folder": a new team space with this account as its first owner, the folder's files moved
+    /// into it, the old folder deleted here once the team space holds every file ([`FromFolderRequest`]). It is an administrator's
+    /// call (`request.confirm` is the administrator's own). The agent checks the folder and answers at once; the work goes on in
+    /// the agent and [`Client::status`] reports it in `from_folder`. A server that has no team spaces is
+    /// [`codes::SERVER_TOO_OLD`], an agent without this call [`codes::AGENT_TOO_OLD`].
+    pub fn make_space_from_folder(&self, request: &FromFolderRequest) -> Result<FromFolderStatus, Error> {
+        self.call("POST", paths::SPACES_FROM_FOLDER, Some(body(request)?), http::SLOW_TIMEOUT).map_err(too_old)
     }
 
     /// Approves the deletions the mass-delete guard holds back in a team space, as `craft-cloud-agent sync

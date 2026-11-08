@@ -17,6 +17,7 @@ pub mod cli;
 pub mod daemon;
 pub mod disk;
 pub mod doc;
+pub mod from_folder;
 pub mod http;
 pub mod live;
 pub mod local_api;

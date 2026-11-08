@@ -23,7 +23,8 @@
 //!   `/v1/admin` ([`paths::ADMIN_SERVER`], [`paths::ADMIN_USERS`]), which the agent passes on to the server's admin API
 //!   with the same bodies and answers (see `docs/agent.md`); `GET /v1/spaces` → [`SpaceList`] and, under
 //!   `/v1/spaces/{id}`, `POST …/accept`, `…/decline` (passed on to the server) and `…/sync` ([`SpaceSyncRequest`]): the
-//!   team spaces of the account and what this computer does with them. Errors are the HTTP API's error
+//!   team spaces of the account and what this computer does with them; `POST /v1/spaces/from-folder` ([`FromFolderRequest`]) →
+//!   [`FromFolderStatus`]: a folder of the personal folder made into a team space (`Status::from_folder` has how it goes). Errors are the HTTP API's error
 //!   body ([`ErrorAnswer`](crate::api::ErrorAnswer) reads its code and message) with its codes and [`codes`].
 //! - **Versions**: [`Status::api`] is the local API version the agent speaks; a client refuses one outside
 //!   [`LOCAL_API_MIN`]..=[`LOCAL_API_MAX`] when it connects.
@@ -219,6 +220,9 @@ pub mod paths {
     /// account's own `DELETE …/members/{its id}` (the server first; a refusal changes nothing here), after which the agent looks at
     /// its list again and the space is lost to it: the sync ends and the local copy is kept.
     pub const SPACES: &str = "/v1/spaces";
+    /// `POST` ([`super::FromFolderRequest`]) → [`super::FromFolderStatus`]: make a team space from a folder of the personal folder
+    /// (an administrator's call, see the request). The work goes on in the agent; `GET /v1/status` has it in `from_folder`.
+    pub const SPACES_FROM_FOLDER: &str = "/v1/spaces/from-folder";
     /// The administrator's team space calls, passed on to the server like [`ADMIN_USERS`]: `GET /v1/admin/spaces?cursor&limit&query` →
     /// [`AdminSpaceList`](crate::api::AdminSpaceList); `POST` ([`AdminCreateSpace`](crate::api::AdminCreateSpace)) →
     /// [`AdminSpaceInfo`](crate::api::AdminSpaceInfo); under `/v1/admin/spaces/{id}`: `POST …/archive` and `…/unarchive`
@@ -618,6 +622,10 @@ pub struct Status {
     /// space). An older agent says nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spaces: Vec<SpaceStatus>,
+    /// The work of "make a team space from this folder" ([`FromFolderRequest`]): under way, or how the last one ended. An
+    /// older agent says nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_folder: Option<FromFolderStatus>,
 }
 
 /// What this computer does about one space, in [`SpaceInfo`].
@@ -757,6 +765,113 @@ pub struct SpaceSyncRequest {
 impl std::fmt::Debug for SpaceSyncRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpaceSyncRequest").field("on", &self.on).field("adopt", &self.adopt).finish_non_exhaustive()
+    }
+}
+
+/// `POST /v1/spaces/from-folder`: make a team space from a folder of the personal folder ("Make a team space from this folder").
+///
+/// The agent checks the folder, creates the team space on the server (an administrator's call, so `confirm` is the
+/// administrator's password and, with two-factor sign-in, a code; the account becomes the space's first owner), sets up the
+/// team folder beside the personal one and copies the files into it. The team space takes the files from the personal space on
+/// the server (no bytes travel again). Only when the team space holds every file, byte for byte, is the old folder deleted here,
+/// which the personal sync then moves to the server's trash like any deletion. Any failure before that leaves the old folder as it
+/// was. The call answers once the checks are done and the work has started; [`Status::from_folder`] says how it goes.
+///
+/// Asked again for the same folder and name while the work was interrupted or failed with the space already made, the agent
+/// goes on with that space and needs no `confirm`. The `Debug` output hides the confirmation and the names.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FromFolderRequest {
+    /// The folder to move into a team space (absolute, inside the personal folder).
+    pub folder: String,
+    /// The new team space's name.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<u64>,
+    #[serde(flatten)]
+    pub confirm: crate::api::SpaceConfirm,
+}
+
+impl std::fmt::Debug for FromFolderRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FromFolderRequest").field("confirm", &self.confirm).finish_non_exhaustive()
+    }
+}
+
+/// Where the work of [`FromFolderRequest`] is. Every step before `Trashing` leaves the personal folder as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FromFolderStep {
+    /// Looking at the folder and counting its files.
+    Checking,
+    /// Asking the server for the team space.
+    Creating,
+    /// Setting up the team folder and turning its sync on.
+    SettingUp,
+    /// Copying the files into the team folder (`done` of `total`).
+    Copying,
+    /// Waiting for the team space to take everything (`done` of `total` files are on the server).
+    Syncing,
+    /// Comparing the team space with the old folder, file by file.
+    Verifying,
+    /// Deleting the old folder here (the personal sync moves it to the server's trash).
+    Trashing,
+    /// Finished: the files are in the team space and the old folder is gone from here (or `kept` says what stayed).
+    Done,
+    /// Stopped by a problem (`message`, `failed_at`); nothing was lost. Asking again goes on.
+    Failed,
+    /// The agent stopped in the middle of the work. Asking again goes on.
+    Interrupted,
+}
+
+/// `Status::from_folder`: the work of [`FromFolderRequest`], also after it ended (until the next one starts, or the agent signs out).
+/// The `Debug` output leaves out the names and folders.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FromFolderStatus {
+    /// The old folder (absolute).
+    pub folder: String,
+    /// The team space's name.
+    pub name: String,
+    pub step: FromFolderStep,
+    /// The team space, once it exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<SpaceId>,
+    /// The team folder on this computer, once it is set up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_folder: Option<String>,
+    /// Progress of the current step, in files (`Copying`, `Syncing`, `Verifying`); both 0 elsewhere.
+    #[serde(default)]
+    pub done: u64,
+    #[serde(default)]
+    pub total: u64,
+    /// For `Failed` and `Interrupted`: the step that was under way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<FromFolderStep>,
+    /// For `Failed`, `Interrupted` and `Done` with files kept: what happened, in words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Files left in the old folder because they were changed after the copy (`Done` only): the old folder is not deleted
+    /// then, only what was copied and unchanged.
+    #[serde(default)]
+    pub kept: u64,
+}
+
+impl std::fmt::Debug for FromFolderStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FromFolderStatus")
+            .field("step", &self.step)
+            .field("space", &self.space)
+            .field("done", &self.done)
+            .field("total", &self.total)
+            .field("failed_at", &self.failed_at)
+            .field("kept", &self.kept)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FromFolderStatus {
+    /// Whether the work is still going on (nothing else may be started meanwhile).
+    pub fn running(&self) -> bool {
+        !matches!(self.step, FromFolderStep::Done | FromFolderStep::Failed | FromFolderStep::Interrupted)
     }
 }
 
@@ -1499,6 +1614,7 @@ mod tests {
             last_sync_ms: Some(1_790_000_000_000),
             removed: false,
             spaces: Vec::new(),
+            from_folder: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["run_state"], serde_json::json!({ "kind": "signed_out" }));

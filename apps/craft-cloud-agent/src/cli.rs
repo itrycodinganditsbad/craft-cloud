@@ -1879,6 +1879,11 @@ impl Session {
         self.engine.state()
     }
 
+    /// The space whose chunks the next passes may claim instead of uploading them (see [`HttpTransport::set_claim_from`]).
+    pub fn set_claim_from(&self, from: Option<craft_cloud_proto::SpaceId>) {
+        self.engine.transport().set_claim_from(from);
+    }
+
     /// The last pass's outcome, as saved in `state.json`.
     pub fn last_pass(&self) -> Option<LastPass> {
         self.last_pass.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()

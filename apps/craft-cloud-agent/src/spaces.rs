@@ -214,6 +214,8 @@ enum Msg {
     /// Discover now; answered once it is done.
     Refresh(Option<oneshot::Sender<()>>),
     Sync(SpaceId, SpaceSyncRequest, oneshot::Sender<Result<SpaceInfo, AgentError>>),
+    /// The team space's passes may claim chunks from this space (or no longer, with `None`).
+    Claim(SpaceId, Option<SpaceId>),
     Paused(bool),
     /// No new pass starts (the agent is stopping).
     Quiesce,
@@ -246,6 +248,13 @@ impl SpacesHandle {
             Ok(Ok(answer)) => answer,
             _ => Err(gone()),
         }
+    }
+
+    /// Lets the passes of team space `space` claim chunks from `from` (the personal space, when a folder is being made into a team
+    /// space) instead of uploading them, or stops that with `None`. Kept in memory only: after a restart the passes upload, which is
+    /// slower and as safe.
+    pub fn claim_from(&self, space: SpaceId, from: Option<SpaceId>) {
+        let _ = self.tx.send(Msg::Claim(space, from));
     }
 
     /// Syncing is paused by the user (or resumed): no pass of a team space starts meanwhile.
@@ -312,6 +321,8 @@ struct Job {
     /// Which running of the space's sync asked (see [`Active::run`]), so a result that comes after the sync was stopped or
     /// moved to another folder is not taken for the current one's.
     run: u64,
+    /// The space the pass may claim chunks from (see [`SpacesHandle::claim_from`]).
+    claim_from: Option<SpaceId>,
 }
 
 enum ToThread {
@@ -452,6 +463,7 @@ fn pass_thread(
                     if job.read_only {
                         session.set_read_only(true);
                     }
+                    session.set_claim_from(job.claim_from);
                     runtime.block_on(session.pass(job.approve))
                 }
                 None => Err(AgentError::Usage("the space's session is gone".into())),
@@ -696,6 +708,8 @@ struct Manager {
     thread: Option<std::thread::JoinHandle<()>>,
     /// The current runnings of the spaces' syncs (see [`Active::live`]).
     live: Live,
+    /// Team spaces whose passes may claim chunks from another space (see [`SpacesHandle::claim_from`]).
+    claims: std::collections::BTreeMap<SpaceId, SpaceId>,
     /// Turning a space off or moving it waits for its session to close, apart from the task: those under way.
     pending: Vec<Pending>,
     /// The spaces whose raised generation could not be saved (account.json can't be written): it is saved again at every look at
@@ -763,6 +777,7 @@ impl Manager {
             jobs,
             thread,
             live,
+            claims: std::collections::BTreeMap::new(),
             pending: Vec::new(),
             unsaved: BTreeSet::new(),
             changes: 0,
@@ -864,6 +879,14 @@ impl Manager {
                 }
             }
             Msg::Sync(space, request, reply) => self.set_sync(space, request, reply),
+            Msg::Claim(space, from) => match from {
+                Some(from) => {
+                    self.claims.insert(space, from);
+                }
+                None => {
+                    self.claims.remove(&space);
+                }
+            },
             Msg::Paused(paused) => {
                 self.paused = paused;
                 // The long-polls rest while syncing is paused, as the personal one does, and start again on resume.
@@ -996,8 +1019,11 @@ impl Manager {
                 Next::RunPass if !busy => {
                     active.scheduler.pass_started();
                     let approve = std::mem::take(&mut active.approved);
-                    start =
-                        Some((index, Box::new(Job { setting, stability: active.stability.clone(), read_only, approve, joined_ms, run: active.run })));
+                    let claim_from = self.claims.get(&setting.space).copied();
+                    start = Some((
+                        index,
+                        Box::new(Job { setting, stability: active.stability.clone(), read_only, approve, joined_ms, run: active.run, claim_from }),
+                    ));
                 }
                 Next::RunPass => {}
                 Next::CheckApproval => {

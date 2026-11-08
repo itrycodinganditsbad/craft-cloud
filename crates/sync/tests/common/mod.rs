@@ -114,6 +114,8 @@ pub struct Faults {
     pub chunk_downloads: AtomicU64,
     /// How many chunks this device uploaded (counted, not a fault).
     pub chunk_uploads: AtomicU64,
+    /// How many claims for chunks of another space this device made (counted, not a fault).
+    pub claims: AtomicU64,
     /// How many calls that write (missing-chunk query, chunk, manifest, commit, save record) the device made, however
     /// they were answered (counted, not a fault): a viewer's engine makes none once it knows its role.
     pub write_calls: AtomicU64,
@@ -149,6 +151,8 @@ pub struct Local {
     page: u32,
     /// The account when the space is a team space: the server's role checks run for it, as the routes do.
     member: Option<UserId>,
+    /// The space whose chunks this machine may claim instead of uploading (see [`Transport::claim_chunks`]).
+    claim_from: Option<SpaceId>,
     pub faults: Arc<Faults>,
     clock: Arc<Mutex<i64>>,
     committed: Arc<Mutex<BTreeSet<ManifestId>>>,
@@ -230,6 +234,22 @@ impl Transport for Local {
         self.faults.check()?;
         self.write_gate().await?;
         self.meta.missing_chunks(self.space, ids).await.map_err(meta_err)
+    }
+
+    async fn claim_chunks(&self, ids: &[ChunkId]) -> Result<Vec<ChunkId>, TransportError> {
+        let (Some(from), Some(user)) = (self.claim_from, self.member) else { return Ok(ids.to_vec()) };
+        self.faults.check()?;
+        self.write_gate().await?;
+        self.faults.claims.fetch_add(1, Ordering::Relaxed);
+        match self.writer().claim_chunks(user, self.space, from, ids).await {
+            Ok(claim) => {
+                let claimed: BTreeSet<ChunkId> = claim.claimed.into_iter().collect();
+                Ok(ids.iter().filter(|id| !claimed.contains(id)).copied().collect())
+            }
+            // No such source for this account: nothing is claimed, the chunks are uploaded.
+            Err(MetaError::NotFound(_)) => Ok(ids.to_vec()),
+            Err(e) => Err(meta_err(e)),
+        }
     }
 
     async fn put_chunk(&self, id: &ChunkId, data: Bytes) -> Result<(), TransportError> {
@@ -363,6 +383,7 @@ pub async fn machine_on<F: Fs>(
         username: user.username.clone(),
         page,
         member: None,
+        claim_from: None,
         faults: Arc::new(Faults::default()),
         clock: Arc::new(Mutex::new(1_760_000_000_000)),
         committed: server.committed.clone(),
@@ -382,6 +403,15 @@ pub async fn team_machine(server: &Server, user: &UserRecord, space: SpaceId, na
     let config = Config::new(name, transport.device);
     m = Engine::new(MemFs::new(), transport, State::default(), config, || STAMP).unwrap();
     m
+}
+
+/// As [`team_machine`], and the machine may claim chunks of `from` (usually the account's personal space) instead of uploading them.
+pub async fn claiming_machine(server: &Server, user: &UserRecord, space: SpaceId, from: SpaceId, name: &str) -> Machine {
+    let m = team_machine(server, user, space, name).await;
+    let mut transport = m.transport().clone();
+    transport.claim_from = Some(from);
+    let config = Config::new(name, transport.device);
+    Engine::new(MemFs::new(), transport, State::default(), config, || STAMP).unwrap()
 }
 
 /// The same machine after a crash and a restart: its folder and device as they are, a fresh engine that starts

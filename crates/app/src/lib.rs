@@ -84,7 +84,8 @@ pub use craft_cloud_api::api::{
     SpaceMember, SpaceMembers, SpaceRole, SpaceUsage, UpdateSpace,
 };
 pub use craft_cloud_api::local::{
-    ApproveDeletesAnswer, ApproveDeletesRequest, HeldEntry, HeldLink, SpaceInfo, SpaceList, SpaceRun, SpaceStatus, SpaceSync, SpaceSyncRequest,
+    ApproveDeletesAnswer, ApproveDeletesRequest, FromFolderRequest, FromFolderStatus, FromFolderStep, HeldEntry, HeldLink, SpaceInfo, SpaceList,
+    SpaceRun, SpaceStatus, SpaceSync, SpaceSyncRequest,
 };
 pub use craft_cloud_api::local::{
     ConflictCopy, ConflictsResponse, FileKind, FolderUsage, FolderUsageResponse, HistoryResponse, HistoryVersion, JoinRequest, LoginRequest,
@@ -595,6 +596,7 @@ mod tests {
             last_sync_ms: None,
             removed: false,
             spaces: Vec::new(),
+            from_folder: None,
         }
     }
 
@@ -1305,5 +1307,40 @@ mod tests {
         for old in [agent.space_members(space).unwrap_err(), agent.admin_spaces(&UserQuery::default()).unwrap_err()] {
             assert!(matches!(&old, Error::Refused { code, .. } if code == codes::AGENT_TOO_OLD), "{old:?}");
         }
+    }
+
+    #[test]
+    fn making_a_team_space_from_a_folder_is_one_call_and_the_confirmation_goes_in_its_body() {
+        use craft_cloud_api::api::SpaceConfirm;
+        use craft_cloud_api::local::{FromFolderRequest, FromFolderStatus, FromFolderStep};
+        let status = FromFolderStatus {
+            folder: "/home/ana/Craft Cloud/Photos".into(),
+            name: "Photos team".into(),
+            step: FromFolderStep::SettingUp,
+            space: Some(SpaceId::generate()),
+            team_folder: None,
+            done: 0,
+            total: 0,
+            failed_at: None,
+            message: None,
+            kept: 0,
+        };
+        let no_such_call = json(&ErrorAnswer { error: "not_found".into(), message: "no such call".into(), name_taken: None });
+        let (_dir, agent, asked) = fake_agent(vec![(200, json(&status)), (404, no_such_call)]);
+        let request = FromFolderRequest {
+            folder: "/home/ana/Craft Cloud/Photos".into(),
+            name: "Photos team".into(),
+            quota_bytes: None,
+            confirm: SpaceConfirm { password: Some("pw".into()), totp_code: None, recovery_code: None },
+        };
+        assert_eq!(agent.make_space_from_folder(&request).unwrap(), status);
+        let (method, path, sent) = asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((method.as_str(), path.as_str()), ("POST", "/v1/spaces/from-folder"));
+        let sent: serde_json::Value = serde_json::from_str(&sent).unwrap();
+        assert_eq!(sent, serde_json::json!({ "folder": "/home/ana/Craft Cloud/Photos", "name": "Photos team", "password": "pw" }));
+        assert!(!format!("{request:?}").contains("pw"), "the password stays out of Debug");
+        // An agent from before the call: "no such call" is `agent_too_old`.
+        let old = agent.make_space_from_folder(&request).unwrap_err();
+        assert!(matches!(&old, Error::Refused { code, .. } if code == codes::AGENT_TOO_OLD), "{old:?}");
     }
 }

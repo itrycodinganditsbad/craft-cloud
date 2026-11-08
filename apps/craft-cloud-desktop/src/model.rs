@@ -2953,6 +2953,7 @@ pub(crate) mod tests {
             last_sync_ms: None,
             removed: false,
             spaces: Vec::new(),
+            from_folder: None,
         }
     }
 

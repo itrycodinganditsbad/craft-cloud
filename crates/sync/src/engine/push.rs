@@ -545,6 +545,13 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         for batch in unique.chunks(MISSING_QUERY_IDS) {
             missing.extend(self.transport.missing_chunks(batch).await?);
         }
+        // Chunks another space of the account already has may be taken from it without sending their bytes; what that does not
+        // cover is uploaded.
+        if !missing.is_empty() {
+            let asked: Vec<ChunkId> = missing.iter().copied().collect();
+            let still: BTreeSet<ChunkId> = self.transport.claim_chunks(&asked).await?.into_iter().collect();
+            missing.retain(|id| still.contains(id));
+        }
         for (id, offset, len) in &pieces {
             if missing.remove(id) && !self.send_chunk(path, id, *offset, *len, report).await? {
                 return Ok(None);

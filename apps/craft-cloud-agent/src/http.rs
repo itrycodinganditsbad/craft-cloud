@@ -35,10 +35,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use craft_cloud_proto::api::{
-    AccountInfo, ChangePasswordRequest, CommitRequest, CommitResponse, DeviceInfo, ErrorBody, HistoryResponse, InfoResponse, JoinRequest,
-    LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, PairingCreated, PairingStatus,
-    RecoveryCodes, RenameDeviceRequest, RestoreRequest, RestoreResponse, RevokedOthers, SecondFactorRequest, SpaceList, SpaceListItem, SpaceResponse,
-    TwoFactorChallenge, TwoFactorConfirmRequest, TwoFactorProofRequest, TwoFactorSetupRequest, TwoFactorSetupResponse, TwoFactorStatus, codes,
+    AccountInfo, ChangePasswordRequest, ClaimRequest, ClaimResponse, CommitRequest, CommitResponse, DeviceInfo, ErrorBody, HistoryResponse,
+    InfoResponse, JoinRequest, LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN,
+    PairingCreated, PairingStatus, RecoveryCodes, RenameDeviceRequest, RestoreRequest, RestoreResponse, RevokedOthers, SecondFactorRequest,
+    SpaceList, SpaceListItem, SpaceResponse, TwoFactorChallenge, TwoFactorConfirmRequest, TwoFactorProofRequest, TwoFactorSetupRequest,
+    TwoFactorSetupResponse, TwoFactorStatus, codes,
 };
 use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_PAGE_NODES};
 use craft_cloud_proto::local::MAX_MACHINE_BYTES;
@@ -825,6 +826,17 @@ pub struct HttpTransport<C = Reqwest> {
     /// The team space every request works on (`craft-space`); `None`: the account's personal space, as before. Every
     /// answer that the server's space layer gives must echo it ([`TOO_OLD_FOR_TEAM_SPACES`]).
     space: Option<HeaderValue>,
+    /// The space whose chunks this one may claim instead of getting them uploaded (`POST /chunks/claim`), set while a folder is
+    /// being made into a team space. Shared by the clones of the transport, so the pass thread can set it on a session that is
+    /// open. Cleared by the first claim the server refuses, so a source that is not readable is asked about once.
+    claim_from: std::sync::Arc<std::sync::Mutex<Claiming>>,
+}
+
+/// Which space this transport may claim chunks from, and the one a claim was refused for (not asked again until it changes).
+#[derive(Debug, Default, Clone, Copy)]
+struct Claiming {
+    from: Option<SpaceId>,
+    refused: Option<SpaceId>,
 }
 
 /// What the agent says when a server answers a request for a team space without echoing the space, or with another one:
@@ -878,7 +890,7 @@ impl HttpTransport {
 impl<C: Connection> HttpTransport<C> {
     /// The API over another connection (a simulated network, in tests). `server` names the endpoints.
     pub fn over(connection: C, server: ServerUrl, token: &DeviceToken) -> Result<Self, TransportError> {
-        Ok(Self { connection, server, auth: token.bearer()?, space: None })
+        Ok(Self { connection, server, auth: token.bearer()?, space: None, claim_from: Default::default() })
     }
 
     /// The same API for one space: every request names it in the `craft-space` header. Without it, the account's personal
@@ -887,6 +899,26 @@ impl<C: Connection> HttpTransport<C> {
         let value = HeaderValue::from_str(&space.to_string()).map_err(|_| TransportError::Protocol("a space ID that can't be sent".into()))?;
         self.space = Some(value);
         Ok(self)
+    }
+
+    /// Tells the transport which space's chunks it may claim (`None`: none), for [`Transport::claim_chunks`]. A space the server
+    /// refused a claim for stays refused (told again before every pass, it is not asked again) until another one, or none, is named.
+    pub fn set_claim_from(&self, from: Option<SpaceId>) {
+        let mut claiming = self.claim_from.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if from != claiming.refused {
+            claiming.refused = None;
+        }
+        claiming.from = from.filter(|f| Some(*f) != claiming.refused);
+    }
+
+    fn claim_source(&self) -> Option<SpaceId> {
+        self.claim_from.lock().unwrap_or_else(std::sync::PoisonError::into_inner).from
+    }
+
+    /// The server refused to claim from the current source: no more asking about it.
+    fn claim_refused(&self) {
+        let mut claiming = self.claim_from.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        claiming.refused = claiming.from.take();
     }
 
     pub fn server(&self) -> &ServerUrl {
@@ -1219,6 +1251,45 @@ impl<C: Connection> Transport for HttpTransport<C> {
             missing.extend(answer.missing);
         }
         Ok(missing)
+    }
+
+    async fn claim_chunks(&self, ids: &[ChunkId]) -> Result<Vec<ChunkId>, TransportError> {
+        let Some(from_space) = self.claim_source() else { return Ok(ids.to_vec()) };
+        let mut still = Vec::new();
+        for batch in ids.chunks(MAX_MISSING_IDS) {
+            let mut req = self.request(Method::POST, "chunks/claim", MAX_SMALL_JSON_BYTES).json(&ClaimRequest { from_space, ids: batch.to_vec() })?;
+            // A server that has team spaces but not this call answers `404 no such endpoint` from outside the space layer, so
+            // without the space's echo: for this call that is "no claim", not "too old for team spaces".
+            if let Some(space) = &self.space {
+                req.headers.insert(HeaderName::from_static("craft-space"), space.clone());
+            }
+            let reply = self.connection.send(req).await?;
+            if let Some(space) = &self.space
+                && let Err(e) = echoed(space, &reply)
+            {
+                if reply.status != StatusCode::NOT_FOUND {
+                    return Err(e);
+                }
+                self.claim_refused();
+                still.extend_from_slice(batch);
+                continue;
+            }
+            let answer: ClaimResponse = match json(reply, MAX_SMALL_JSON_BYTES).await {
+                Ok(answer) => answer,
+                // The server has no such call, or the account may not read the source: nothing is claimed, the chunks are
+                // uploaded, and the source is not asked again.
+                Err(TransportError::NotFound) => {
+                    self.claim_refused();
+                    still.extend_from_slice(batch);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            // What the server says it added counts only if it was asked; the rest is uploaded.
+            let claimed: std::collections::BTreeSet<&ChunkId> = answer.claimed.iter().collect();
+            still.extend(batch.iter().filter(|id| !claimed.contains(id)).copied());
+        }
+        Ok(still)
     }
 
     async fn put_chunk(&self, id: &ChunkId, data: Bytes) -> Result<(), TransportError> {

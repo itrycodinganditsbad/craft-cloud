@@ -838,6 +838,8 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             paused: user_paused,
         });
         control.set_spaces_handle(Some(spaces.handle()));
+        // Work of making a team space from a folder that was under way when the agent stopped is now reported as interrupted.
+        crate::from_folder::restore(&control, data, &account);
 
         let mut scheduler = Scheduler::new(options.timing, status.now(), random);
         let mut watching = Watching::default();

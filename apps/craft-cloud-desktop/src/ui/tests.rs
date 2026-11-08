@@ -44,6 +44,7 @@ fn signed_in() -> Status {
         last_sync_ms: Some(NOW - 120_000),
         removed: false,
         spaces: Vec::new(),
+        from_folder: None,
     }
 }
 
