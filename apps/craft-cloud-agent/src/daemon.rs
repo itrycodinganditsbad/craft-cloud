@@ -1141,6 +1141,8 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
         // stop at once: nothing queued starts, and the pass thread is not waited for, as the personal one is not). Only the
         // second stop asks for that; a loop that ends because its pass thread is gone also exits with `Failed`.
         control.set_spaces_handle(None);
+        // The work of making a team space from a folder belongs to this session: it ends before the next one starts.
+        crate::from_folder::end_session(&control).await;
         spaces.stop(stops > 1).await;
         control.set_spaces(Vec::new(), Vec::new());
         // Recents stop with the account: their followers are told, and what they were given is on disk.

@@ -31,7 +31,8 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use craft_cloud_chunker::{Chunker, FASTCDC_V1, chunk_reader};
@@ -71,20 +72,38 @@ struct Journal {
     /// The account's personal space: a journal of another account is not ours.
     personal: SpaceId,
     status: FromFolderStatus,
+    /// When the call that makes the space started (milliseconds since the Unix epoch): a space a crashed call is taken to have made
+    /// is only one made after this.
+    #[serde(default)]
+    started_ms: Option<i64>,
 }
 
 fn journal_path(data: &DataDir) -> PathBuf {
     data.path().join(JOURNAL_FILE)
 }
 
-fn read_journal(data: &DataDir, personal: SpaceId) -> Option<FromFolderStatus> {
+fn read_saved(data: &DataDir, personal: SpaceId) -> Option<Journal> {
     let bytes = std::fs::read(journal_path(data)).ok()?;
     let journal: Journal = serde_json::from_slice(&bytes).ok()?;
-    (journal.schema <= JOURNAL_SCHEMA && journal.personal == personal).then_some(journal.status)
+    (journal.schema <= JOURNAL_SCHEMA && journal.personal == personal).then_some(journal)
 }
 
+fn read_journal(data: &DataDir, personal: SpaceId) -> Option<FromFolderStatus> {
+    read_saved(data, personal).map(|j| j.status)
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok().and_then(|d| i64::try_from(d.as_millis()).ok()).unwrap_or(0)
+}
+
+/// Writes the journal, keeping the start time it has.
 fn write_journal(data: &DataDir, personal: SpaceId, status: &FromFolderStatus) {
-    let journal = Journal { schema: JOURNAL_SCHEMA, personal, status: status.clone() };
+    let started_ms = read_saved(data, personal).and_then(|j| j.started_ms);
+    write_journal_started(data, personal, status, started_ms);
+}
+
+fn write_journal_started(data: &DataDir, personal: SpaceId, status: &FromFolderStatus, started_ms: Option<i64>) {
+    let journal = Journal { schema: JOURNAL_SCHEMA, personal, status: status.clone(), started_ms };
     let result = serde_json::to_vec_pretty(&journal).map_err(io::Error::other).and_then(|json| write_atomic(&journal_path(data), &json, true));
     if let Err(e) = result {
         crate::runlog::note(format_args!("can't write the journal of making a team space from a folder: {e}"));
@@ -105,6 +124,34 @@ pub mod hook {
     }
 
     static HOOKS: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+    static STALLS: Mutex<Vec<(PathBuf, Duration)>> = Mutex::new(Vec::new());
+    static AFTER: Mutex<Vec<(PathBuf, fn(&Path))>> = Mutex::new(Vec::new());
+
+    /// How long the team space may store nothing before the wait for it fails (default: ten minutes).
+    pub fn set_stall(data: &Path, stall: Option<Duration>) {
+        let mut stalls = STALLS.lock().unwrap_or_else(PoisonError::into_inner);
+        stalls.retain(|(path, _)| path != data);
+        if let Some(stall) = stall {
+            stalls.push((data.to_owned(), stall));
+        }
+    }
+
+    pub(super) fn stall(data: &Path) -> Option<Duration> {
+        STALLS.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|(path, _)| path == data).map(|(_, d)| *d)
+    }
+
+    /// Calls `f` with the path of each file right after it was taken out of the old folder and before it is read again.
+    pub fn set_after_quarantine(data: &Path, f: Option<fn(&Path)>) {
+        let mut after = AFTER.lock().unwrap_or_else(PoisonError::into_inner);
+        after.retain(|(path, _)| path != data);
+        if let Some(f) = f {
+            after.push((data.to_owned(), f));
+        }
+    }
+
+    pub(super) fn after_quarantine(data: &Path) -> Option<fn(&Path)> {
+        AFTER.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|(path, _)| path == data).map(|(_, f)| *f)
+    }
 
     pub fn set(data: &Path, hook: Option<Hook>) {
         let mut hooks = HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
@@ -129,6 +176,22 @@ pub fn restore(control: &Control, data: &DataDir, account: &Account) {
         }
         return;
     };
+    // A crash in the middle of deleting may have left a file in the quarantine: it goes back first.
+    if matches!(status.step, FromFolderStep::Trashing | FromFolderStep::Failed | FromFolderStep::Interrupted) {
+        recover_quarantine(account, Path::new(&status.folder));
+    }
+    let trashing = status.step == FromFolderStep::Trashing || status.failed_at == Some(FromFolderStep::Trashing);
+    // Stopped after the old folder was removed, before "done" was written: there is nothing left to finish.
+    if trashing && status.step != FromFolderStep::Done && !Path::new(&status.folder).exists() {
+        status.step = FromFolderStep::Done;
+        status.failed_at = None;
+        status.message = None;
+        status.done = 0;
+        status.total = 0;
+        write_journal(data, account.space, &status);
+        control.set_from_folder(Some(status));
+        return;
+    }
     if status.running() {
         status.failed_at = Some(status.step);
         status.message = Some(match status.step {
@@ -145,6 +208,17 @@ pub fn restore(control: &Control, data: &DataDir, account: &Account) {
         write_journal(data, account.space, &status);
     }
     control.set_from_folder(Some(status));
+}
+
+/// The session ends (sign-out, another account, the agent stopping): the work of this session is told so and waited for, so it has
+/// written nothing more when the next session starts and reads the journal. A job that does not end within the bound is cut off
+/// (its blocking work looks at the flag for every chunk of a file).
+pub async fn end_session(control: &Control) {
+    let Some(mut job) = control.take_from_folder_job() else { return };
+    job.cancel.store(true, Ordering::SeqCst);
+    if tokio::time::timeout(Duration::from_secs(15), &mut job.task).await.is_err() {
+        job.task.abort();
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -180,12 +254,20 @@ pub(crate) async fn start(start: Start, request: FromFolderRequest) -> Result<Fr
     }
     // Checked off the async threads: it reads the whole folder.
     let (checked_account, checked_folder) = (account.clone(), folder.clone());
-    let scan = tokio::task::spawn_blocking(move || check_folder(&checked_account, &checked_folder))
-        .await
-        .map_err(|e| LocalError::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR, craft_cloud_proto::api::codes::INTERNAL, e.to_string()))??;
+    let scan = tokio::task::spawn_blocking(move || {
+        // Files an earlier try's deletion had taken out of this folder and not deleted come back first.
+        if let Ok(root) = std::fs::canonicalize(&checked_folder) {
+            recover_quarantine(&checked_account, &root);
+        }
+        check_folder(&checked_account, &checked_folder)
+    })
+    .await
+    .map_err(|e| LocalError::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR, craft_cloud_proto::api::codes::INTERNAL, e.to_string()))??;
     let canonical = scan.root.clone();
 
-    let before = read_journal(&data, account.space);
+    let saved = read_saved(&data, account.space);
+    let before = saved.as_ref().map(|j| j.status.clone());
+    let started_before = saved.and_then(|j| j.started_ms);
     let same = |s: &FromFolderStatus| s.folder == canonical.display().to_string() && s.name == name.as_str();
     // Asked again for the same folder and name: goes on with the space that was made, when there is one.
     let resumed = before.as_ref().filter(|s| same(s) && !s.running() && s.step != FromFolderStep::Done);
@@ -214,21 +296,23 @@ pub(crate) async fn start(start: Start, request: FromFolderRequest) -> Result<Fr
                 "another team space is being made from a folder",
             ));
         }
-        write_journal(&data, account.space, &status);
+        let started = now_ms();
+        write_journal_started(&data, account.space, &status, Some(started));
         match create_space(&transport, &name, &request).await {
             Ok(created) => status.space = Some(created.id),
-            // A crash between the server's answer and the journal left a space of this name: it is ours if it was just made
-            // for this (it is the account's, owned by it, and empty).
-            Err(e) if crashed_creating && is_name_taken(&e) => match find_empty_own_space(&transport, &name).await {
+            // A crash between the server's answer and the journal left a space of this name: it is ours only if it was made after
+            // that call started, has this account as its only member (as its owner) and holds nothing.
+            Err(e) if crashed_creating && is_name_taken(&e) => match find_empty_own_space(&transport, &name, started_before.unwrap_or(started)).await
+            {
                 Some(space) => status.space = Some(space),
                 None => {
-                    give_back(&control, &data, account.space, before);
+                    give_back(&control, &data, account.space, before, started_before);
                     return Err(e.into());
                 }
             },
             Err(e) => {
                 // Nothing exists: the status (and the journal) of an earlier try is as it was.
-                give_back(&control, &data, account.space, before);
+                give_back(&control, &data, account.space, before, started_before);
                 return Err(e.into());
             }
         }
@@ -242,15 +326,17 @@ pub(crate) async fn start(start: Start, request: FromFolderRequest) -> Result<Fr
     status.step = FromFolderStep::SettingUp;
     write_journal(&data, account.space, &status);
     control.set_from_folder(Some(status.clone()));
-    let job = Job { control, data, account, spaces, status: status.clone(), scan };
-    tokio::spawn(job.run());
+    // The files of an earlier try's deletion that were taken out of the old folder are back before anything else looks at it.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let job = Job { control: control.clone(), data, account, spaces, status: status.clone(), scan, cancel: cancel.clone() };
+    control.set_from_folder_job(Some(crate::local_api::FromFolderJob { cancel, task: tokio::spawn(job.run()) }));
     Ok(status)
 }
 
 /// Puts the status and the journal back to what an earlier try left (`None`: nothing).
-fn give_back(control: &Control, data: &DataDir, personal: SpaceId, before: Option<FromFolderStatus>) {
+fn give_back(control: &Control, data: &DataDir, personal: SpaceId, before: Option<FromFolderStatus>, started_ms: Option<i64>) {
     match &before {
-        Some(status) => write_journal(data, personal, status),
+        Some(status) => write_journal_started(data, personal, status, started_ms),
         None => {
             let _ = std::fs::remove_file(journal_path(data));
         }
@@ -268,14 +354,20 @@ fn is_name_taken(e: &CallError) -> bool {
     matches!(e, CallError::Refused(refusal) if refusal.status == 409)
 }
 
-/// The team space called `name` that the account owns and that holds nothing yet: the one a crashed call made.
-async fn find_empty_own_space(transport: &HttpTransport, name: &SpaceName) -> Option<SpaceId> {
+/// How far the agent's clock may be ahead of the server's when a space is taken to be made after the call started.
+const CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
+
+/// The team space called `name` that the account owns, alone, that was made after `started_ms` and holds nothing yet: the one a
+/// crashed call made, and no one else's.
+async fn find_empty_own_space(transport: &HttpTransport, name: &SpaceName, started_ms: i64) -> Option<SpaceId> {
     let list = transport.spaces().await.ok()?;
     let fold = name.fold_key();
     let item = list.spaces.into_iter().find(|i| {
         i.kind == "team"
             && i.state == "active"
             && i.role == craft_cloud_proto::api::SpaceRole::Owner
+            && i.members == 1
+            && i.created_ms.saturating_add(CLOCK_SKEW_MS) >= started_ms
             && i.name.as_deref().and_then(|n| SpaceName::new(n).ok()).is_some_and(|n| n.fold_key() == fold)
     })?;
     // Only a space with nothing in it is adopted.
@@ -454,6 +546,9 @@ struct Job {
     spaces: SpacesHandle,
     status: FromFolderStatus,
     scan: Scan,
+    /// Set when the session this job belongs to ends (sign-out, account switch, the agent stopping): the job stops at its next
+    /// look, inside the copy loops and the sleeps too, and writes nothing more.
+    cancel: Arc<AtomicBool>,
 }
 
 /// Why the work stopped.
@@ -469,9 +564,26 @@ impl From<AgentError> for Stop {
     }
 }
 
+impl From<CopyStop> for Stop {
+    fn from(e: CopyStop) -> Self {
+        match e {
+            CopyStop::Interrupted => Stop::Interrupted,
+            CopyStop::Failed(message) => Stop::Failed(message),
+        }
+    }
+}
+
 fn failed(e: impl std::fmt::Display) -> Stop {
     Stop::Failed(e.to_string())
 }
+
+/// How many files one batch of deletions holds at most, and how long it runs at most, before the server is asked again whether the
+/// space still holds what is about to be deleted.
+const TRASH_BATCH: usize = 1000;
+const TRASH_RECHECK: Duration = Duration::from_secs(60);
+/// The roughest time the tree is looked at while a step waits, and how fast it is looked at first.
+const POLL_FIRST: Duration = Duration::from_millis(400);
+const POLL_SLOWEST: Duration = Duration::from_secs(5);
 
 impl Job {
     async fn run(mut self) {
@@ -487,7 +599,7 @@ impl Job {
                 self.status.message = Some(message);
                 self.status.step = FromFolderStep::Failed;
                 self.publish(true);
-                crate::runlog::note(format_args!("making a team space from a folder failed at {at:?}; the old folder was not deleted"));
+                crate::runlog::note(format_args!("making a team space from a folder failed at {at:?}"));
             }
         }
         if let Some(space) = self.status.space {
@@ -495,7 +607,17 @@ impl Job {
         }
     }
 
+    /// Whether the job must stop: its session ended, or the agent is stopping.
+    fn stopping(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst) || self.control.spaces_handle().is_none()
+    }
+
+    /// Writes the status (and the journal). A job whose session has ended writes nothing: the status of the account that signed out
+    /// is never shown under another one.
     fn publish(&self, journal: bool) {
+        if self.cancel.load(Ordering::SeqCst) {
+            return;
+        }
         if journal {
             write_journal(&self.data, self.account.space, &self.status);
         }
@@ -506,17 +628,13 @@ impl Job {
         self.status.step = step;
         self.status.done = 0;
         self.status.total = match step {
-            FromFolderStep::Copying | FromFolderStep::Syncing | FromFolderStep::Verifying => self.scan.files.len() as u64,
+            FromFolderStep::Copying | FromFolderStep::Syncing | FromFolderStep::Verifying | FromFolderStep::Trashing => self.scan.files.len() as u64,
             _ => 0,
         };
         self.publish(true);
     }
 
-    fn stopping(&self) -> bool {
-        self.control.spaces_handle().is_none()
-    }
-
-    /// The test hooks, and the agent stopping, at the start of a step.
+    /// The test hooks, and the session ending, at the start of a step.
     async fn gate(&self) -> Result<(), Stop> {
         loop {
             if self.stopping() {
@@ -528,6 +646,18 @@ impl Job {
                 _ => return Ok(()),
             }
         }
+    }
+
+    /// A sleep that the end of the session cuts short (and reports).
+    async fn sleep(&self, how_long: Duration) -> Result<(), Stop> {
+        let until = Instant::now() + how_long;
+        while Instant::now() < until {
+            if self.stopping() {
+                return Err(Stop::Interrupted);
+            }
+            tokio::time::sleep(Duration::from_millis(100).min(how_long)).await;
+        }
+        Ok(())
     }
 
     async fn work(&mut self) -> Result<(), Stop> {
@@ -557,7 +687,7 @@ impl Job {
         }
         self.step(FromFolderStep::Trashing);
         self.gate().await?;
-        self.trash(last).await?;
+        self.trash(space, last).await?;
         Ok(())
     }
 
@@ -576,7 +706,7 @@ impl Job {
             if Instant::now() > deadline {
                 return Err(failed("the new team space does not show in the agent's list yet; ask again to go on"));
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            self.sleep(Duration::from_millis(500)).await?;
         }
         let info = self.spaces.sync(space, SpaceSyncRequest { on: true, folder: None, adopt: false }).await.map_err(failed)?;
         let folder = info.folder.map(PathBuf::from).ok_or_else(|| failed("the agent did not say where the team space syncs"))?;
@@ -592,52 +722,51 @@ impl Job {
         Ok(())
     }
 
-    /// Step 4: every file into the team folder. Returns what was copied.
-    async fn copy(&mut self, team_folder: &Path) -> Result<Vec<Copied>, Stop> {
-        let (scan_dirs, files, root) = (self.scan.dirs.clone(), self.scan.files.clone(), self.scan.root.clone());
-        let (team, control) = (team_folder.to_owned(), self.control.clone());
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let progress = done.clone();
-        let task = tokio::task::spawn_blocking(move || copy_all(&root, &team, &scan_dirs, &files, &progress, &|| control.spaces_handle().is_none()));
+    /// Runs `work` off the async threads, with the progress counter it fills shown in the status meanwhile.
+    async fn blocking<T: Send + 'static>(
+        &mut self,
+        work: impl FnOnce(Arc<AtomicU64>, Arc<AtomicBool>, Control) -> Result<T, CopyStop> + Send + 'static,
+    ) -> Result<T, Stop> {
+        let done = Arc::new(AtomicU64::new(0));
+        let (progress, cancel, control) = (done.clone(), self.cancel.clone(), self.control.clone());
+        let task = tokio::task::spawn_blocking(move || work(progress, cancel, control));
         let result = poll_blocking(task, || {
-            self.status.done = done.load(std::sync::atomic::Ordering::Relaxed);
-            self.control.set_from_folder(Some(self.status.clone()));
+            self.status.done = done.load(Ordering::Relaxed);
+            self.publish(false);
         })
         .await;
         match result {
-            Ok(Ok(copied)) => Ok(copied),
-            Ok(Err(CopyStop::Interrupted)) => Err(Stop::Interrupted),
-            Ok(Err(CopyStop::Failed(message))) => Err(Stop::Failed(message)),
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(stop)) => Err(stop.into()),
             Err(e) => Err(failed(e)),
         }
     }
 
-    /// Step 5: the server's tree for the team space holds every copied file.
+    /// Step 4: every file into the team folder. Returns what was copied.
+    async fn copy(&mut self, team_folder: &Path) -> Result<Vec<Copied>, Stop> {
+        let (scan_dirs, files, root, team) = (self.scan.dirs.clone(), self.scan.files.clone(), self.scan.root.clone(), team_folder.to_owned());
+        self.blocking(move |done, cancel, control| {
+            copy_all(&root, &team, &scan_dirs, &files, &done, &|| cancel.load(Ordering::SeqCst) || control.spaces_handle().is_none())
+        })
+        .await
+    }
+
+    /// Step 5: the server's tree for the team space holds every copied file. Progress is anything the team space took: a file
+    /// committed, or bytes stored (a chunk uploaded or claimed), so one big file that takes long to go up is no stall.
     async fn wait_for_server(&mut self, space: SpaceId, copied: &[Copied]) -> Result<(), Stop> {
-        let transport = HttpTransport::new(self.account.server.clone(), &self.account.token).and_then(|t| t.bound_to(space)).map_err(failed)?;
+        let transport = HttpTransport::new(self.account.server.clone(), &self.account.token).map_err(failed)?;
+        let bound = transport.clone().bound_to(space).map_err(failed)?;
+        let stall = hook::stall(self.data.path()).unwrap_or(STALL);
         let total = copied.len() as u64;
-        let mut best = 0u64;
+        let (mut best_files, mut best_bytes) = (0u64, 0u64);
         let mut progressed = Instant::now();
+        let (mut interval, mut next_look, mut last_pass) = (POLL_FIRST, Instant::now(), None);
         loop {
             if self.stopping() {
                 return Err(Stop::Interrupted);
             }
-            match tree_matches(&transport, copied, &self.scan.dirs).await {
-                Ok(matched) => {
-                    self.status.done = matched.files;
-                    self.control.set_from_folder(Some(self.status.clone()));
-                    if matched.files == total && matched.dirs_missing == 0 {
-                        return Ok(());
-                    }
-                    if matched.files > best {
-                        best = matched.files;
-                        progressed = Instant::now();
-                    }
-                }
-                // A failed look is tried again; a long failure is the stall below.
-                Err(e) => crate::runlog::note(format_args!("looking at the new team space failed: {e}")),
-            }
-            if let Some(run) = self.control.space_info(space).and_then(|i| i.run_state) {
+            let info = self.control.space_info(space);
+            if let Some(run) = info.as_ref().and_then(|i| i.run_state.clone()) {
                 match run {
                     SpaceRun::Paused { reason, .. } => return Err(failed(format!("the team space stopped syncing: {reason}"))),
                     SpaceRun::NoAccess { .. } => return Err(failed("this account has lost access to the new team space")),
@@ -645,13 +774,50 @@ impl Job {
                     _ => {}
                 }
             }
+            // The tree is read when a pass of the team space has ended (its answer is new) and otherwise less and less often.
+            let pass_ended = info.as_ref().map(|i| i.last_sync_ms) != last_pass;
+            if pass_ended || Instant::now() >= next_look {
+                last_pass = info.as_ref().map(|i| i.last_sync_ms);
+                let mut grew = false;
+                match tree_matches(&bound, copied, &self.scan.dirs).await {
+                    Ok(matched) => {
+                        self.status.done = matched.files;
+                        self.publish(false);
+                        if matched.files == total && matched.dirs_missing == 0 {
+                            return Ok(());
+                        }
+                        if matched.files > best_files {
+                            best_files = matched.files;
+                            grew = true;
+                        }
+                    }
+                    // A failed look is tried again; a long failure is the stall below.
+                    Err(e) => crate::runlog::note(format_args!("looking at the new team space failed: {e}")),
+                }
+                if let Ok(usage) = transport.admin_get::<craft_cloud_proto::api::SpaceUsage>(&format!("spaces/{space}/usage"), &[]).await
+                    && usage.stored_bytes > best_bytes
+                {
+                    best_bytes = usage.stored_bytes;
+                    grew = true;
+                }
+                if grew {
+                    progressed = Instant::now();
+                    interval = POLL_FIRST;
+                } else {
+                    interval = (interval * 2).min(POLL_SLOWEST);
+                }
+                next_look = Instant::now() + interval;
+            }
             if let Some(why) = self.skipped_by_team_pass(space) {
                 return Err(failed(format!("the team space can't take every file: {why}")));
             }
-            if progressed.elapsed() > STALL {
-                return Err(failed(format!("the team space has taken {best} of {total} files and no more for {} minutes", STALL.as_secs() / 60)));
+            if progressed.elapsed() > stall {
+                return Err(failed(format!(
+                    "the team space has taken {best_files} of {total} files and stored nothing more for {} minutes",
+                    (stall.as_secs() / 60).max(1)
+                )));
             }
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            self.sleep(Duration::from_millis(200)).await?;
         }
     }
 
@@ -680,44 +846,139 @@ impl Job {
             return Ok(false);
         }
         let (root, copied_list) = (self.scan.root.clone(), copied.to_vec());
-        let control = self.control.clone();
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let progress = done.clone();
-        let task = tokio::task::spawn_blocking(move || verify_all(&root, &copied_list, &progress, &|| control.spaces_handle().is_none()));
-        let result = poll_blocking(task, || {
-            self.status.done = done.load(std::sync::atomic::Ordering::Relaxed);
-            self.control.set_from_folder(Some(self.status.clone()));
+        self.blocking(move |done, cancel, control| {
+            verify_all(&root, &copied_list, &done, &|| cancel.load(Ordering::SeqCst) || control.spaces_handle().is_none())
         })
-        .await;
-        match result {
-            Ok(Ok(same)) => Ok(same),
-            Ok(Err(CopyStop::Interrupted)) => Err(Stop::Interrupted),
-            Ok(Err(CopyStop::Failed(message))) => Err(Stop::Failed(message)),
-            Err(e) => Err(failed(e)),
+        .await
+    }
+
+    /// Whether the team space still is what step 5 saw, for the files in `files` that are about to be deleted: listed and active,
+    /// not archived, the account still an editor or owner there, and its tree on the server holding every one of them. Anything else
+    /// stops the deletion; what was deleted already is in the team space.
+    async fn recheck(&self, space: SpaceId, files: &[Copied]) -> Result<(), Stop> {
+        self.spaces.refresh().await;
+        let Some(info) = self.control.space_info(space) else {
+            return Err(failed("the team space is not listed any more; nothing more was deleted"));
+        };
+        if info.state != "active" || info.archived || info.role == craft_cloud_proto::api::SpaceRole::Viewer {
+            return Err(failed("the team space is archived, or this account can no longer change it; nothing more was deleted"));
+        }
+        if matches!(info.run_state, Some(SpaceRun::NoAccess { .. })) {
+            return Err(failed("this account has lost access to the team space; nothing more was deleted"));
+        }
+        let bound = HttpTransport::new(self.account.server.clone(), &self.account.token).and_then(|t| t.bound_to(space)).map_err(failed)?;
+        match tree_matches(&bound, files, &self.scan.dirs).await {
+            Ok(m) if m.files == files.len() as u64 && m.dirs_missing == 0 => Ok(()),
+            Ok(m) => Err(failed(format!(
+                "the team space no longer holds {} of the {} files still to be deleted; nothing more was deleted",
+                files.len() as u64 - m.files,
+                files.len()
+            ))),
+            Err(e) => Err(failed(format!("the team space could not be checked ({e}); nothing more was deleted"))),
         }
     }
 
-    /// Step 7: deletes the old folder's files here, each only while it is as it was verified.
-    async fn trash(&mut self, copied: Vec<Copied>) -> Result<(), Stop> {
+    /// Step 7: deletes the old folder's files here, each only while it is as it was verified. Before the first, and again after
+    /// every batch (at most [`TRASH_BATCH`] files or [`TRASH_RECHECK`]), the team space is checked once more.
+    async fn trash(&mut self, space: SpaceId, copied: Vec<Copied>) -> Result<(), Stop> {
         let root = self.scan.root.clone();
-        let dirs = self.scan.dirs.clone();
-        let kept = tokio::task::spawn_blocking(move || delete_old(&root, &copied, &dirs)).await.map_err(failed)?;
+        let quarantine = quarantine_dir(&self.account, &root);
+        let hook_after = hook::after_quarantine(self.data.path());
+        let mut stats = TrashStats::default();
+        let mut at = 0usize;
+        while at < copied.len() {
+            if self.stopping() {
+                return Err(Stop::Interrupted);
+            }
+            self.recheck(space, copied.get(at..).unwrap_or_default()).await?;
+            let end = (at + TRASH_BATCH).min(copied.len());
+            let batch: Vec<Copied> = copied.get(at..end).unwrap_or_default().to_vec();
+            let (root_b, quarantine_b) = (root.clone(), quarantine.clone());
+            let (processed, got) = self
+                .blocking(move |done, cancel, control| {
+                    Ok(delete_batch(
+                        &root_b,
+                        &quarantine_b,
+                        &batch,
+                        &done,
+                        &|| cancel.load(Ordering::SeqCst) || control.spaces_handle().is_none(),
+                        hook_after,
+                    ))
+                })
+                .await?;
+            stats.add(&got);
+            if processed == 0 {
+                return Err(Stop::Interrupted);
+            }
+            at += processed;
+            self.status.done = at as u64;
+            self.publish(false);
+        }
+        let (root_f, dirs, quarantine_f) = (root.clone(), self.scan.dirs.clone(), quarantine.clone());
+        let others = tokio::task::spawn_blocking(move || finish_old(&root_f, &dirs, &quarantine_f, stats.kept())).await.map_err(failed)?;
         // The personal sync sees a deleted folder: soon, and as any deletion.
         self.control.request_pass();
         self.status.step = FromFolderStep::Done;
-        self.status.kept = kept;
+        self.status.kept = stats.kept();
         self.status.done = 0;
         self.status.total = 0;
         self.status.failed_at = None;
-        self.status.message = (kept > 0).then(|| {
-            format!(
-                "{kept} file{} stayed in the old folder: changed after the copy, or of a kind that does not sync (such as .tmp files). {} not in the team space.",
-                if kept == 1 { "" } else { "s" },
-                if kept == 1 { "It is" } else { "They are" }
-            )
-        });
+        self.status.message = stats.words(others);
         self.publish(true);
         Ok(())
+    }
+}
+
+/// What the deletion left, by reason.
+#[derive(Debug, Default, Clone, Copy)]
+struct TrashStats {
+    /// Changed (or moved, or its folder swapped for a link) after the check: not in the team space as it is now.
+    changed: u64,
+    /// Could not be deleted, a program holds it: in the team space.
+    locked: u64,
+}
+
+impl TrashStats {
+    fn add(&mut self, other: &TrashStats) {
+        self.changed += other.changed;
+        self.locked += other.locked;
+    }
+
+    /// The files that stayed because of the deletion (not those the sync never carries).
+    fn kept(&self) -> u64 {
+        self.changed + self.locked
+    }
+
+    /// What to tell the person about what stayed; `others` is how many other files the old folder still holds (kinds the sync does
+    /// not carry, such as `.tmp` files, or files made meanwhile).
+    fn words(&self, others: u64) -> Option<String> {
+        let plural = |n: u64, one: &str, many: &str| if n == 1 { one.to_owned() } else { many.to_owned() };
+        let mut parts: Vec<String> = Vec::new();
+        if self.changed > 0 {
+            parts.push(format!(
+                "{} {} changed after the copy and {} not in the team space as they are now",
+                self.changed,
+                plural(self.changed, "file", "files"),
+                plural(self.changed, "is", "are")
+            ));
+        }
+        if self.locked > 0 {
+            parts.push(format!(
+                "{} {} could not be deleted because a program holds {}: {} in the team space, and you can delete {} yourself",
+                self.locked,
+                plural(self.locked, "file", "files"),
+                plural(self.locked, "it", "them"),
+                plural(self.locked, "it is", "they are"),
+                plural(self.locked, "it", "them")
+            ));
+        }
+        if others > 0 {
+            parts.push(format!(
+                "{others} other {} stayed: of a kind that does not sync (such as .tmp files), or made meanwhile",
+                plural(others, "file", "files")
+            ));
+        }
+        (!parts.is_empty()).then(|| format!("{}.", parts.join("; ")))
     }
 }
 
@@ -747,16 +1008,22 @@ fn join(root: &Path, os: &[std::ffi::OsString]) -> PathBuf {
     os.iter().fold(root.to_owned(), |p, n| p.join(n))
 }
 
-/// The manifest of a file's content, the way the engine makes it, while `sink` receives every chunk's bytes.
-fn chunk_file(path: &Path, mut sink: impl FnMut(&[u8]) -> io::Result<()>) -> Result<(ManifestId, u64), String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let chunker = Chunker::new(FASTCDC_V1).map_err(|e| e.to_string())?;
-    let summary = chunk_reader::<_, io::Error, _>(&chunker, io::BufReader::new(file), |chunk| sink(chunk.data))
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+/// The manifest of a file's content, the way the engine makes it, while `sink` receives every chunk's bytes. `cancelled` is looked
+/// at for every chunk, so a big file does not hold the end of a session up.
+fn chunk_file(path: &Path, cancelled: &dyn Fn() -> bool, mut sink: impl FnMut(&[u8]) -> io::Result<()>) -> Result<(ManifestId, u64), CopyStop> {
+    let file = std::fs::File::open(path).map_err(|e| io_failed(path, &e))?;
+    let chunker = Chunker::new(FASTCDC_V1).map_err(|e| CopyStop::Failed(e.to_string()))?;
+    let summary = chunk_reader::<_, io::Error, _>(&chunker, io::BufReader::new(file), |chunk| {
+        if cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "the session ended"));
+        }
+        sink(chunk.data)
+    })
+    .map_err(|e| if cancelled() { CopyStop::Interrupted } else { io_failed(path, &e) })?;
     let refs = summary.chunks.iter().map(|c| ChunkRef { id: ChunkId::from_bytes(c.hash), len: c.len }).collect();
-    let params = ChunkerParamsId::new(FASTCDC_V1.name).map_err(|e| e.to_string())?;
-    let manifest =
-        Manifest::new(params, summary.size, FileHash::from_bytes(summary.file_hash), refs).map_err(|e| format!("{}: {e}", path.display()))?;
+    let params = ChunkerParamsId::new(FASTCDC_V1.name).map_err(|e| CopyStop::Failed(e.to_string()))?;
+    let manifest = Manifest::new(params, summary.size, FileHash::from_bytes(summary.file_hash), refs)
+        .map_err(|e| CopyStop::Failed(format!("{}: {e}", path.display())))?;
     Ok((manifest.id(), summary.size))
 }
 
@@ -769,7 +1036,7 @@ fn copy_all(
     team: &Path,
     dirs: &[(Vec<std::ffi::OsString>, Vec<String>)],
     files: &[FileEntry],
-    done: &std::sync::atomic::AtomicU64,
+    done: &AtomicU64,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<Copied>, CopyStop> {
     let tmp = team.join(AGENT_DIR).join("tmp");
@@ -796,55 +1063,53 @@ fn copy_all(
         let mut attempt = 0;
         let manifest = loop {
             attempt += 1;
-            match copy_file(&source, &dest, &tmp) {
-                Ok(Some(manifest)) => break manifest,
-                Ok(None) if attempt < 4 => std::thread::sleep(Duration::from_millis(300)),
-                Ok(None) => return Err(CopyStop::Failed(format!("{} keeps changing while it is copied; nothing was deleted", source.display()))),
-                Err(e) => return Err(CopyStop::Failed(e)),
+            match copy_file(&source, &dest, &tmp, cancelled)? {
+                Some(manifest) => break manifest,
+                None if attempt < 4 => std::thread::sleep(Duration::from_millis(300)),
+                None => return Err(CopyStop::Failed(format!("{} keeps changing while it is copied; nothing was deleted", source.display()))),
             }
         };
         copied.push(Copied { entry: entry.clone(), manifest });
-        done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        done.fetch_add(1, Ordering::Relaxed);
     }
     Ok(copied)
 }
 
-/// Copies one file into place unless it already is (same size and time as the source). `None`: the source changed while it was
-/// read; the copy was thrown away.
-fn copy_file(source: &Path, dest: &Path, tmp: &Path) -> Result<Option<ManifestId>, String> {
-    let before = std::fs::metadata(source).map_err(|e| format!("{}: {e}", source.display()))?;
-    let in_place = std::fs::metadata(dest).is_ok_and(|d| d.is_file() && same_stat(&before, &d));
-    if in_place {
-        // Same size and time as the source: put there by an earlier try. Its content is still read from the source for the
-        // manifest, which is what the server is compared with.
-        let (manifest, _) = chunk_file(source, |_| Ok(()))?;
-        let after = std::fs::metadata(source).map_err(|e| format!("{}: {e}", source.display()))?;
-        return Ok(same_stat(&before, &after).then_some(manifest));
-    }
-    let temp = tmp.join(format!("{}.{COPY_EXT}", random_hex(12).map_err(|e| e.to_string())?));
-    let result = (|| -> Result<Option<ManifestId>, String> {
-        let mut out = std::fs::File::options().write(true).create_new(true).open(&temp).map_err(|e| format!("{}: {e}", temp.display()))?;
-        let (manifest, size) = chunk_file(source, |data| out.write_all(data)).map_err(|e| e.to_string())?;
-        out.flush().map_err(|e| format!("{}: {e}", temp.display()))?;
+/// Copies one file into place unless the destination already has exactly its content: the destination is read and its manifest
+/// compared with the source's (size and time are not trusted). `None`: the source changed while it was read; the copy was thrown
+/// away.
+fn copy_file(source: &Path, dest: &Path, tmp: &Path, cancelled: &dyn Fn() -> bool) -> Result<Option<ManifestId>, CopyStop> {
+    let failed_at = |path: &Path, e: &dyn std::fmt::Display| CopyStop::Failed(format!("{}: {e}", path.display()));
+    let before = std::fs::metadata(source).map_err(|e| io_failed(source, &e))?;
+    let in_place =
+        if std::fs::metadata(dest).is_ok_and(|d| d.is_file()) { chunk_file(dest, cancelled, |_| Ok(())).ok().map(|(m, _)| m) } else { None };
+    let temp = tmp.join(format!("{}.{COPY_EXT}", random_hex(12).map_err(|e| CopyStop::Failed(e.to_string()))?));
+    let result = (|| -> Result<Option<ManifestId>, CopyStop> {
+        let mut out = std::fs::File::options().write(true).create_new(true).open(&temp).map_err(|e| failed_at(&temp, &e))?;
+        let (manifest, size) = chunk_file(source, cancelled, |data| out.write_all(data))?;
+        out.flush().map_err(|e| failed_at(&temp, &e))?;
         if out.metadata().map(|m| m.len()).ok() != Some(size) {
-            return Err(format!("{}: the copy has the wrong size", temp.display()));
+            return Err(CopyStop::Failed(format!("{}: the copy has the wrong size", temp.display())));
         }
-        if let Ok(modified) = before.modified() {
-            out.set_modified(modified).map_err(|e| format!("{}: {e}", temp.display()))?;
-        }
-        drop(out);
-        // The permissions (the executable bit) go with the file.
-        std::fs::set_permissions(&temp, before.permissions()).map_err(|e| format!("{}: {e}", temp.display()))?;
-        let after = std::fs::metadata(source).map_err(|e| format!("{}: {e}", source.display()))?;
+        let after = std::fs::metadata(source).map_err(|e| io_failed(source, &e))?;
         if !same_stat(&before, &after) {
             return Ok(None);
         }
-        put_in_place(&temp, dest)?;
+        if in_place == Some(manifest) {
+            // The destination has this content already (an earlier try put it there).
+            return Ok(Some(manifest));
+        }
+        if let Ok(modified) = before.modified() {
+            out.set_modified(modified).map_err(|e| failed_at(&temp, &e))?;
+        }
+        drop(out);
+        // The permissions (the executable bit) go with the file.
+        std::fs::set_permissions(&temp, before.permissions()).map_err(|e| failed_at(&temp, &e))?;
+        put_in_place(&temp, dest).map_err(CopyStop::Failed)?;
         Ok(Some(manifest))
     })();
-    if !matches!(result, Ok(Some(_))) {
-        let _ = std::fs::remove_file(&temp);
-    }
+    // A copy that was put in place is gone from `temp`; anything else is cleaned up.
+    let _ = std::fs::remove_file(&temp);
     result
 }
 
@@ -868,36 +1133,188 @@ fn put_in_place(temp: &Path, dest: &Path) -> Result<(), String> {
 }
 
 /// Whether every copied file of the old folder is as it was copied: same manifest of its content now. `Ok(false)` when not.
-fn verify_all(root: &Path, copied: &[Copied], done: &std::sync::atomic::AtomicU64, cancelled: &dyn Fn() -> bool) -> Result<bool, CopyStop> {
+fn verify_all(root: &Path, copied: &[Copied], done: &AtomicU64, cancelled: &dyn Fn() -> bool) -> Result<bool, CopyStop> {
     for item in copied {
         if cancelled() {
             return Err(CopyStop::Interrupted);
         }
         let path = join(root, &item.entry.os);
-        let Ok((manifest, _)) = chunk_file(&path, |_| Ok(())) else { return Ok(false) };
+        let manifest = match chunk_file(&path, cancelled, |_| Ok(())) {
+            Ok((manifest, _)) => manifest,
+            Err(CopyStop::Interrupted) => return Err(CopyStop::Interrupted),
+            Err(CopyStop::Failed(_)) => return Ok(false),
+        };
         if manifest != item.manifest {
             return Ok(false);
         }
-        done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        done.fetch_add(1, Ordering::Relaxed);
     }
     Ok(true)
 }
 
-/// Deletes the verified files of the old folder, each only if it is still as it was when it was verified, then the folders that
-/// are empty. Returns how many files stayed.
-fn delete_old(root: &Path, copied: &[Copied], dirs: &[(Vec<std::ffi::OsString>, Vec<String>)]) -> u64 {
-    for item in copied {
-        let path = join(root, &item.entry.os);
-        let unchanged =
-            std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && m.len() == item.entry.size && m.modified().ok() == item.entry.modified);
-        if unchanged {
-            // A manifest of the content once more, right before: a same-size same-time edit is caught too.
-            if chunk_file(&path, |_| Ok(())).is_ok_and(|(m, _)| m == item.manifest) {
-                let _ = std::fs::remove_file(&path);
+// ---------------------------------------------------------------------------------------------------------------------
+// Deleting the old folder (blocking)
+
+/// Where a file waits between being taken out of the old folder and being deleted: inside the personal folder's own `.craft-cloud`
+/// (the sync ignores it, and it is on the same volume, so taking a file there is a rename), one folder for each old folder.
+fn quarantine_dir(account: &Account, root: &Path) -> PathBuf {
+    let key: String = blake3::hash(root.to_string_lossy().as_bytes()).to_hex().chars().take(16).collect();
+    account.folder.join(AGENT_DIR).join("from-folder").join(key)
+}
+
+/// Whether `path` is a link of any kind (a symlink, a junction or any other reparse point).
+fn is_link(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        return meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+/// Whether every folder between `root` and the file `os` names is a real folder now (no link of any kind): a folder swapped for a
+/// link since the scan would lead the deletion out of the old folder.
+fn ancestors_are_real(root: &Path, os: &[std::ffi::OsString]) -> bool {
+    let mut at = root.to_owned();
+    for name in os.iter().take(os.len().saturating_sub(1)) {
+        at.push(name);
+        if !std::fs::symlink_metadata(&at).is_ok_and(|m| m.is_dir() && !is_link(&m)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// How a file's deletion came out.
+enum Deleted {
+    Gone,
+    Changed,
+    Locked,
+}
+
+/// Deletes up to a batch of files of `items` (stopping after [`TRASH_RECHECK`]), each one safely: its folders are checked for links,
+/// it is renamed into `quarantine`, read there once more and compared with the manifest that was verified, and only a match is
+/// deleted; a file that no longer matches is renamed back (next to its place, under another name, if something has taken it) and
+/// counts as changed. Returns how many of `items` were dealt with, and what stayed.
+fn delete_batch(
+    root: &Path,
+    quarantine: &Path,
+    items: &[Copied],
+    done: &AtomicU64,
+    cancelled: &dyn Fn() -> bool,
+    after_quarantine: Option<fn(&Path)>,
+) -> (usize, TrashStats) {
+    let started = Instant::now();
+    let mut stats = TrashStats::default();
+    let mut processed = 0;
+    for item in items {
+        if cancelled() || started.elapsed() > TRASH_RECHECK {
+            break;
+        }
+        match delete_one(root, quarantine, item, cancelled, after_quarantine) {
+            Deleted::Gone => {}
+            Deleted::Changed => stats.changed += 1,
+            Deleted::Locked => stats.locked += 1,
+        }
+        processed += 1;
+        done.fetch_add(1, Ordering::Relaxed);
+    }
+    (processed, stats)
+}
+
+fn delete_one(root: &Path, quarantine: &Path, item: &Copied, cancelled: &dyn Fn() -> bool, after_quarantine: Option<fn(&Path)>) -> Deleted {
+    let path = join(root, &item.entry.os);
+    if !ancestors_are_real(root, &item.entry.os) {
+        return Deleted::Changed;
+    }
+    let unchanged = std::fs::symlink_metadata(&path)
+        .is_ok_and(|m| m.is_file() && !is_link(&m) && m.len() == item.entry.size && m.modified().ok() == item.entry.modified);
+    if !unchanged {
+        // Gone (the person deleted it) is not "kept"; anything else there is.
+        return if std::fs::symlink_metadata(&path).is_err() { Deleted::Gone } else { Deleted::Changed };
+    }
+    let held = join(quarantine, &item.entry.os);
+    if let Some(parent) = held.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return Deleted::Locked;
+    }
+    // Taken out of the old folder in one step: from here on nothing that writes to the old place touches this file's name, and a
+    // program that holds it open is told by the rename failing (or follows it here, which the read below sees).
+    if std::fs::rename(&path, &held).is_err() {
+        return Deleted::Locked;
+    }
+    if let Some(hook) = after_quarantine {
+        hook(&held);
+    }
+    let same = matches!(chunk_file(&held, cancelled, |_| Ok(())), Ok((m, _)) if m == item.manifest);
+    if same && std::fs::remove_file(&held).is_ok() {
+        return Deleted::Gone;
+    }
+    put_back(&held, &path);
+    if same { Deleted::Locked } else { Deleted::Changed }
+}
+
+/// Moves a quarantined file back to `place`; if something has taken the place meanwhile, next to it under a name that says so
+/// (never over it).
+fn put_back(held: &Path, place: &Path) {
+    let target = if std::fs::symlink_metadata(place).is_err() {
+        place.to_owned()
+    } else {
+        let mut name = place.file_name().map(std::ffi::OsString::from).unwrap_or_default();
+        name.push(".cc-kept");
+        place.with_file_name(name)
+    };
+    let _ = std::fs::rename(held, target);
+}
+
+/// Puts back what a crash left in the quarantine of `root` (a file that was taken out of the old folder and not yet deleted): every
+/// file goes back to its place, or next to it, and the quarantine folder is removed.
+fn recover_quarantine(account: &Account, root: &Path) {
+    let quarantine = quarantine_dir(account, root);
+    let mut stack = vec![quarantine.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(path);
+            } else if let Ok(rel) = path.strip_prefix(&quarantine) {
+                let place = root.join(rel);
+                if let Some(parent) = place.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                put_back(&path, &place);
             }
         }
     }
-    // What the OS leaves in folders goes with them.
+    remove_empty_tree(&quarantine);
+    if let Some(parent) = quarantine.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+}
+
+/// Removes `dir` and the folders in it that are empty.
+fn remove_empty_tree(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                remove_empty_tree(&entry.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// After the files: what the OS leaves in folders goes with them, empty folders go (deepest first), and so does the quarantine and,
+/// when nothing stayed, the old folder itself. Returns how many other files the old folder still holds (not counting the
+/// `kept` that [`delete_batch`] counted).
+fn finish_old(root: &Path, dirs: &[(Vec<std::ffi::OsString>, Vec<String>)], quarantine: &Path, kept: u64) -> u64 {
     let mut places: Vec<PathBuf> = dirs.iter().map(|(os, _)| join(root, os)).collect();
     places.push(root.to_owned());
     for place in places {
@@ -908,17 +1325,24 @@ fn delete_old(root: &Path, copied: &[Copied], dirs: &[(Vec<std::ffi::OsString>, 
             }
         }
     }
-    // Deepest first; a folder that still holds something stays.
     let mut sorted: Vec<&Vec<std::ffi::OsString>> = dirs.iter().map(|(os, _)| os).collect();
     sorted.sort_by_key(|os| std::cmp::Reverse(os.len()));
     for os in sorted {
-        let _ = std::fs::remove_dir(join(root, os));
+        // Only an empty real folder goes; a link is not ours to remove.
+        let place = join(root, os);
+        if std::fs::symlink_metadata(&place).is_ok_and(|m| m.is_dir() && !is_link(&m)) {
+            let _ = std::fs::remove_dir(&place);
+        }
+    }
+    remove_empty_tree(quarantine);
+    if let Some(parent) = quarantine.parent() {
+        let _ = std::fs::remove_dir(parent);
     }
     let remaining = count_files(root);
     if remaining == 0 {
         let _ = std::fs::remove_dir(root);
     }
-    remaining
+    remaining.saturating_sub(kept)
 }
 
 fn count_files(root: &Path) -> u64 {

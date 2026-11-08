@@ -23,7 +23,7 @@ use craft_cloud_agent::daemon::{RunOptions, run_loop};
 use craft_cloud_agent::from_folder::hook::{self, Hook};
 use craft_cloud_agent::schedule::Timing;
 use craft_cloud_app::{Client, FromFolderRequest, FromFolderStatus, FromFolderStep, SpaceConfirm, SpaceSyncRequest};
-use craft_cloud_meta::{Meta, Role, UserRecord};
+use craft_cloud_meta::{Meta, Role, SpaceActor, UserRecord};
 use craft_cloud_proto::{NodeKind, NodeState, SpaceId, SpaceName};
 use craft_cloud_server::AppState;
 use craft_cloud_server::auth::hash_password;
@@ -45,6 +45,8 @@ struct Counts {
     claims: AtomicU64,
     /// Answer `404 no such endpoint` to claims, as a server from before them does.
     no_claim: AtomicBool,
+    /// How long a `PUT /chunks/{id}` is held before the server goes on with it.
+    chunk_delay_ms: AtomicU64,
 }
 
 async fn count(State(counts): State<Arc<Counts>>, request: Request<Body>, next: Next) -> Response {
@@ -53,6 +55,10 @@ async fn count(State(counts): State<Arc<Counts>>, request: Request<Body>, next: 
         counts.chunk_puts.fetch_add(1, Ordering::SeqCst);
         let len = request.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
         counts.chunk_bytes.fetch_add(len, Ordering::SeqCst);
+        let delay = counts.chunk_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
     }
     if request.method() == Method::POST && path.ends_with("/chunks/claim") {
         counts.claims.fetch_add(1, Ordering::SeqCst);
@@ -646,7 +652,7 @@ async fn a_file_changed_after_the_check_stays_in_the_old_folder() {
     hook::set(ana.data.path(), None);
     let status = done(&ana).await;
     assert_eq!((status.space, status.kept), (under_way.space, 1), "{status:?}");
-    assert!(status.message.as_deref().is_some_and(|m| m.contains("stayed")), "{status:?}");
+    assert!(status.message.as_deref().is_some_and(|m| m.contains("changed after the copy")), "{status:?}");
     // That file stays, as it is; everything else is gone.
     let left = files_under(&project);
     assert_eq!(left.keys().collect::<Vec<_>>(), vec!["brief.txt"], "{left:?}");
@@ -693,4 +699,248 @@ async fn the_team_folder_takes_a_free_name_and_the_mass_delete_guard_sees_the_ol
     assert_eq!(tree.keys().filter(|k| k.starts_with("Big/")).count(), 14, "the server still has the old folder until the deletion is approved");
     let _: BTreeSet<_> = tree.keys().collect();
     let _ = SpaceSyncRequest::default();
+}
+
+// ---- the review round ----
+
+/// Writes a journal as a crashed call would have left it, for `folder` and `name`.
+fn crashed_creating_journal(ana: &Person, personal: SpaceId, folder: &Path, name: &str, started_ms: i64) {
+    let status = FromFolderStatus {
+        folder: std::fs::canonicalize(folder).unwrap().display().to_string(),
+        name: name.to_owned(),
+        step: FromFolderStep::Interrupted,
+        space: None,
+        team_folder: None,
+        done: 0,
+        total: 0,
+        failed_at: Some(FromFolderStep::Creating),
+        message: Some("stopped".into()),
+        kept: 0,
+    };
+    let journal = serde_json::json!({ "schema": 1, "personal": personal, "status": status, "started_ms": started_ms });
+    std::fs::write(ana.data.path().join("from-folder.json"), serde_json::to_vec(&journal).unwrap()).unwrap();
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_team_space_is_checked_again_right_before_the_old_folder_is_deleted() {
+    for what in ["the space is archived", "a file is deleted in the team space"] {
+        let (w, ana, project, files) = ana_with_project().await;
+        hook::set(ana.data.path(), Some(Hook::Pause(FromFolderStep::Trashing)));
+        ana.make(&project, "Recheck").await.unwrap();
+        let under_way = ana.until(FromFolderStep::Trashing).await;
+        let space = under_way.space.unwrap();
+        // Between the check and the deletion the team space changes under the work.
+        if what == "the space is archived" {
+            w.meta.set_space_archived(&SpaceActor::Cli, space, true, 1).await.unwrap();
+        } else {
+            let page = w.meta.tree(space, None, 5000).await.unwrap();
+            let node = page.nodes.iter().find(|n| n.name.as_ref().is_some_and(|name| name.as_str() == "brief.txt")).unwrap();
+            let craft_cloud_proto::NodeKind::File(file) = &node.kind else { panic!("a file") };
+            let device = w.meta.create_device(w.ana.id, "other", &[7; 32], 0).await.unwrap();
+            let op = craft_cloud_proto::Op::Delete { node: node.id, expected: Some(file.version) };
+            w.meta.commit(space, device, &[op], 2).await.unwrap();
+        }
+        hook::set(ana.data.path(), None);
+        let stopped = ana.until(FromFolderStep::Failed).await;
+        assert_eq!(stopped.failed_at, Some(FromFolderStep::Trashing), "{what}: {stopped:?}");
+        assert!(stopped.message.as_deref().is_some_and(|m| m.contains("nothing more was deleted")), "{what}: {stopped:?}");
+        untouched(&project, &files);
+    }
+}
+
+/// Makes `link` a folder link to `target` (a junction on Windows, which needs no privilege).
+fn make_link(link: &Path, target: &Path) {
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("cmd").arg("/C").arg("mklink").arg("/J").arg(link).arg(target).output().unwrap();
+        assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stdout));
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_swapped_for_a_link_after_the_check_is_not_followed() {
+    let (w, ana, project, files) = ana_with_project().await;
+    hook::set(ana.data.path(), Some(Hook::Pause(FromFolderStep::Trashing)));
+    ana.make(&project, "Swapped").await.unwrap();
+    ana.until(FromFolderStep::Trashing).await;
+    // `Shots` is moved aside (its files keep their content and times) and a link to it takes its place.
+    let backup = ana.dir.path().join("Backup");
+    std::fs::create_dir_all(&backup).unwrap();
+    std::fs::rename(project.join("Shots"), backup.join("Shots")).unwrap();
+    make_link(&project.join("Shots"), &backup.join("Shots"));
+    hook::set(ana.data.path(), None);
+    let status = done(&ana).await;
+    // The three files behind the link were not touched, and are counted as kept; everything else went.
+    let shots: BTreeMap<String, Vec<u8>> =
+        files.iter().filter(|(k, _)| k.starts_with("Shots/")).map(|(k, v)| (k["Shots/".len()..].to_owned(), v.clone())).collect();
+    assert_eq!(files_under(&backup.join("Shots")), shots, "what the link points to is untouched");
+    assert_eq!(status.kept, 3, "{status:?}");
+    assert!(!project.join("brief.txt").exists() && !project.join("Renders").exists());
+    let _ = w;
+}
+
+fn append_to(held: &Path) {
+    use std::io::Write;
+    std::fs::OpenOptions::new().append(true).open(held).unwrap().write_all(b" and more").unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_that_gets_in_after_the_file_was_taken_out_keeps_its_content() {
+    let (w, ana, project, files) = ana_with_project().await;
+    // Every file is appended to after it was taken out of the old folder and before it is read again (as a program that
+    // already held it open would): the read finds another content, and the file goes back with it.
+    hook::set_after_quarantine(ana.data.path(), Some(append_to));
+    ana.make(&project, "Appending").await.unwrap();
+    let status = done(&ana).await;
+    assert_eq!(status.kept, files.len() as u64, "{status:?}");
+    let mut grown = files.clone();
+    for data in grown.values_mut() {
+        data.extend_from_slice(b" and more");
+    }
+    assert_eq!(files_under(&project), grown, "every file is back, with what was written after the check");
+    // The quarantine is empty and gone.
+    assert!(
+        !ana.personal.join(".craft-cloud").join("from-folder").exists()
+            || std::fs::read_dir(ana.personal.join(".craft-cloud").join("from-folder")).unwrap().count() == 0
+    );
+    // The team space has the content from before.
+    team_holds(&w, &status, &files).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ending_the_session_ends_the_work_and_its_status_is_never_shown_to_another_account() {
+    let (w, ana, project, files) = ana_with_project().await;
+    hook::set(ana.data.path(), Some(Hook::Pause(FromFolderStep::Syncing)));
+    ana.make(&project, "Session").await.unwrap();
+    ana.until(FromFolderStep::Syncing).await;
+    // Signed out in the middle: the call answers once the work has ended.
+    ana.api(|c| c.logout(false)).await.unwrap();
+    hook::set(ana.data.path(), None);
+    assert_eq!(ana.work().await, None, "signed out: no work to show");
+    // Another account signs in on this agent: it sees nothing of the first one's work, and the journal of the first is gone.
+    let url = w.url.clone();
+    let folder = ana.dir.path().join("Bob's folder").display().to_string();
+    let login = craft_cloud_app::LoginRequest {
+        server: url,
+        user: "bob".into(),
+        password: PASSWORD.into(),
+        folder: Some(folder),
+        device_name: Some("bob-pc".into()),
+        adopt: false,
+    };
+    ana.api(move |c| c.login(&login)).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(ana.work().await, None, "the status of the first account is not shown under the second");
+    assert!(!ana.data.path().join("from-folder.json").exists(), "the first account's journal is dropped");
+    untouched(&project, &files);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_big_file_that_takes_long_to_go_up_is_no_stall() {
+    let w = world().await;
+    let mut ana = Person::signed_in(&w.url, "ana").await;
+    let big = ana.personal.join("Big");
+    let mut files = BTreeMap::new();
+    let data = noise(77, 5 * 1024 * 1024);
+    write(&big, "video.bin", &data);
+    files.insert("video.bin".to_owned(), data);
+    ana.run();
+    ana.ready().await;
+    personal_has(&w, "Big", &files).await;
+    // Nothing is claimed, so the team space takes the file chunk by chunk, each chunk slow. Together they take far longer than the
+    // stall time, but the space stores something new all the time.
+    w.counts.no_claim.store(true, Ordering::SeqCst);
+    w.counts.chunk_delay_ms.store(1_000, Ordering::SeqCst);
+    hook::set_stall(ana.data.path(), Some(Duration::from_secs(3)));
+    let started = Instant::now();
+    ana.make(&big, "Slow").await.unwrap();
+    let status = done(&ana).await;
+    assert!(started.elapsed() > Duration::from_secs(4), "the upload was slow: {:?}", started.elapsed());
+    team_holds_dirs(&w, &status, &files, false).await;
+    assert!(!big.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nothing_stored_for_the_stall_time_stops_the_wait_and_leaves_the_old_folder() {
+    let (w, ana, project, files) = ana_with_project().await;
+    w.counts.no_claim.store(true, Ordering::SeqCst);
+    // Every chunk takes longer than the stall time.
+    w.counts.chunk_delay_ms.store(6_000, Ordering::SeqCst);
+    hook::set_stall(ana.data.path(), Some(Duration::from_secs(2)));
+    ana.make(&project, "Stalled").await.unwrap();
+    let stopped = ana.until(FromFolderStep::Failed).await;
+    assert_eq!(stopped.failed_at, Some(FromFolderStep::Syncing), "{stopped:?}");
+    assert!(stopped.message.as_deref().is_some_and(|m| m.contains("stored nothing more")), "{stopped:?}");
+    untouched(&project, &files);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_in_the_team_folder_is_not_trusted_for_its_size_and_time() {
+    let (w, ana, project, files) = ana_with_project().await;
+    hook::set(ana.data.path(), Some(Hook::Fail(FromFolderStep::Syncing)));
+    ana.make(&project, "Stale").await.unwrap();
+    let failed = ana.until(FromFolderStep::Failed).await;
+    assert_eq!(failed.failed_at, Some(FromFolderStep::Syncing));
+    // After the copy was made, the file is changed by a tool that keeps its size and its time.
+    let brief = project.join("brief.txt");
+    let time = std::fs::metadata(&brief).unwrap().modified().unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&brief).unwrap();
+    use std::io::Write;
+    (&file).write_all(b"THE BRIEF").unwrap();
+    file.set_modified(time).unwrap();
+    drop(file);
+    hook::set(ana.data.path(), None);
+    ana.make_with(&project, "Stale", None).await.unwrap();
+    let status = done(&ana).await;
+    let mut expected = files.clone();
+    expected.insert("brief.txt".into(), b"THE BRIEF".to_vec());
+    team_holds(&w, &status, &expected).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_space_made_by_someone_else_is_not_adopted_after_a_crash() {
+    let (w, ana, project, files) = ana_with_project().await;
+    let personal = w.ana.space;
+    let cy = w.meta.create_user("cy", &hash_password(PASSWORD).unwrap(), Role::Member, 0).await.unwrap();
+    let name = |n: &str| SpaceName::new(n).unwrap();
+    // The same name, this account as owner, but another member too: not ours.
+    let shared = w.meta.create_team_space(&SpaceActor::Cli, &name("Studio"), w.ana.id, None, now_ms()).await.unwrap();
+    w.meta.invite_member(&SpaceActor::Cli, shared, cy.id, craft_cloud_app::SpaceRole::Editor, now_ms()).await.unwrap();
+    crashed_creating_journal(&ana, personal, &project, "Studio", now_ms() - 60_000);
+    let refused = ana.make(&project, "Studio").await.unwrap_err();
+    assert_eq!(refused.code(), Some("conflict"), "{refused:?}");
+    // One made long before the call started is not ours either.
+    w.meta.create_team_space(&SpaceActor::Cli, &name("Old one"), w.ana.id, None, now_ms() - 3_600_000).await.unwrap();
+    crashed_creating_journal(&ana, personal, &project, "Old one", now_ms());
+    let refused = ana.make(&project, "Old one").await.unwrap_err();
+    assert_eq!(refused.code(), Some("conflict"), "{refused:?}");
+    untouched(&project, &files);
+    // One made after the call started, alone, empty: the one the crashed call made.
+    let mine = w.meta.create_team_space(&SpaceActor::Cli, &name("Mine"), w.ana.id, None, now_ms()).await.unwrap();
+    crashed_creating_journal(&ana, personal, &project, "Mine", now_ms() - 60_000);
+    let adopted = ana.make(&project, "Mine").await.unwrap();
+    assert_eq!(adopted.space, Some(mine));
+    done(&ana).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_stopped_after_the_old_folder_was_removed_finishes_as_done() {
+    let (_w, mut ana, project, _files) = ana_with_project().await;
+    hook::set(ana.data.path(), Some(Hook::Pause(FromFolderStep::Trashing)));
+    ana.make(&project, "Gone").await.unwrap();
+    ana.until(FromFolderStep::Trashing).await;
+    let _ = ana.crash().await;
+    // The old folder went (as the last deletion's end would have left it), but "done" was never written.
+    std::fs::remove_dir_all(&project).unwrap();
+    hook::set(ana.data.path(), None);
+    ana.run();
+    ana.ready().await;
+    let status = ana.work().await.expect("the work is reported");
+    assert_eq!((status.step, status.failed_at), (FromFolderStep::Done, None), "{status:?}");
 }

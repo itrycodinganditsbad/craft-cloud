@@ -90,10 +90,18 @@ struct Shared {
     from_folder: Option<FromFolderStatus>,
 }
 
+/// The running work of making a team space from a folder: its task, and the flag that tells it its session has ended.
+pub struct FromFolderJob {
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
 /// The loop's side of the local API: the status it reports, and the commands it receives. Cheap to clone.
 #[derive(Clone)]
 pub struct Control {
     shared: Arc<Mutex<Shared>>,
+    /// The task of the work of making a team space from a folder (not part of what the status copies).
+    from_job: Arc<Mutex<Option<FromFolderJob>>>,
     commands: mpsc::Sender<Command>,
     /// Where the start-at-login entry goes (`None`: `autostart` is refused, with `autostart_refusal`).
     autostart: Option<Roots>,
@@ -117,7 +125,7 @@ impl Control {
             from_folder: None,
         };
         let autostart_refusal = "this agent doesn't handle starting at login here".to_owned();
-        Self { shared: Arc::new(Mutex::new(shared)), commands, autostart: None, autostart_refusal }
+        Self { shared: Arc::new(Mutex::new(shared)), from_job: Arc::default(), commands, autostart: None, autostart_refusal }
     }
 
     /// The control with the start-at-login entry at `roots`, for the agent with data folder `data`. The entry is
@@ -191,6 +199,14 @@ impl Control {
 
     pub fn set_from_folder(&self, status: Option<FromFolderStatus>) {
         self.with(|s| s.from_folder = status);
+    }
+
+    pub fn set_from_folder_job(&self, job: Option<FromFolderJob>) {
+        *self.from_job.lock().unwrap_or_else(PoisonError::into_inner) = job;
+    }
+
+    pub fn take_from_folder_job(&self) -> Option<FromFolderJob> {
+        self.from_job.lock().unwrap_or_else(PoisonError::into_inner).take()
     }
 
     /// Starts the work's status, unless other work is still under way (`false`).
