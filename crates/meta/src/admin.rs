@@ -185,6 +185,13 @@ fn by_admin(actor: &AdminActor, action: AuditAction, target: UserId) -> NewEvent
     NewEvent::new(action).by(actor.user, device).on_user(target)
 }
 
+fn device_of(actor: &AdminActor) -> Option<DeviceId> {
+    match actor.via {
+        AdminVia::Device(device) => Some(device),
+        AdminVia::Web { .. } => None,
+    }
+}
+
 fn same_user(a: UserId, b: UserId) -> bool {
     a.0 == b.0
 }
@@ -406,6 +413,24 @@ impl Meta {
         }
         self.commit_audited(w, now_ms).await?;
         self.admin_user(target, now_ms).await?.ok_or(MetaError::NotFound("user"))
+    }
+
+    /// Sets the zstd level new writes use, server-wide, kept in `server_state` so it outlives a restart. The acting admin is
+    /// checked again inside, like every admin change. `from` is the level in use until now; an event
+    /// (`admin.compression_changed`, with both levels) is written in the same transaction when `to` differs from it. The
+    /// value is stored either way, so setting the level the config already has pins it. Outside 1 to 19 is `Invalid`.
+    pub async fn admin_set_compression_level(&self, actor: &AdminActor, from: u8, to: u8, now_ms: i64) -> Result<(), MetaError> {
+        if !(1..=19).contains(&to) {
+            return Err(MetaError::Invalid("the compression level is 1 to 19"));
+        }
+        let mut w = self.begin_admin(actor, None, false).await?;
+        crate::storage::set_server_value_in(&mut w.tx, "compression_level", &to.to_string(), now_ms).await?;
+        if from != to {
+            let details = AuditDetails { level_from: Some(from), level_to: Some(to), ..AuditDetails::default() };
+            let event = NewEvent::new(AuditAction::AdminCompressionChanged).by(actor.user, device_of(actor)).with(details);
+            record_in(&mut w.tx, now_ms, event).await?;
+        }
+        self.commit_audited(w, now_ms).await
     }
 
     /// Disables an account: sets `disabled_ms`, signs every device out ([`RevokeReason::Disabled`]) and deletes the

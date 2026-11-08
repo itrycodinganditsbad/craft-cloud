@@ -4697,6 +4697,23 @@ async fn every_operation_writes_exactly_its_events(meta: &Meta) {
     meta.admin_update_user(&actor, ana.id, None, Some(None), NOW).await.unwrap();
     assert!(seen.actions().await.is_empty());
 
+    // The server-wide compression level: one event with both levels and no target. The same level again writes none (the
+    // value is stored anyway); outside 1 to 19 is refused; a stale confirmation changes nothing.
+    meta.admin_set_compression_level(&actor, 3, 19, NOW).await.unwrap();
+    let e = seen.one().await;
+    assert_eq!(
+        (e.action, e.actor_user, e.target_id, details(&e)),
+        (AuditAction::AdminCompressionChanged, Some(root.id), None, json(r#"{"level_from":3,"level_to":19}"#))
+    );
+    meta.admin_set_compression_level(&actor, 19, 19, NOW).await.unwrap();
+    assert!(seen.actions().await.is_empty());
+    assert!(matches!(meta.admin_set_compression_level(&actor, 19, 20, NOW).await, Err(MetaError::Invalid(_))));
+    assert!(matches!(meta.admin_set_compression_level(&actor, 19, 0, NOW).await, Err(MetaError::Invalid(_))));
+    let stale = AdminActor { password_hash: "$argon2id$old".to_owned(), ..actor.clone() };
+    assert!(matches!(meta.admin_set_compression_level(&stale, 19, 5, NOW).await, Err(MetaError::Conflict(_))));
+    assert_eq!(meta.server_value("compression_level").await.unwrap().map(|v| v.0), Some("19".to_owned()));
+    assert!(seen.actions().await.is_empty());
+
     // A reset code, and its redemption: the devices it signs out are counted in the one event.
     let reset = code(INVITE_CHARS);
     meta.admin_issue_reset(&actor, ana.id, &reset.hash(), false, NOW, RESET_TTL_MS).await.unwrap();
