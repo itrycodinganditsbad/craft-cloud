@@ -123,9 +123,12 @@ pub mod hook {
         Fail(FromFolderStep),
     }
 
+    /// What is called with a file taken out of the old folder.
+    pub type Callback = fn(&Path);
+
     static HOOKS: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
     static STALLS: Mutex<Vec<(PathBuf, Duration)>> = Mutex::new(Vec::new());
-    static AFTER: Mutex<Vec<(PathBuf, fn(&Path))>> = Mutex::new(Vec::new());
+    static AFTER: Mutex<Vec<(PathBuf, Callback)>> = Mutex::new(Vec::new());
 
     /// How long the team space may store nothing before the wait for it fails (default: ten minutes).
     pub fn set_stall(data: &Path, stall: Option<Duration>) {
@@ -1171,7 +1174,7 @@ fn is_link(meta: &std::fs::Metadata) -> bool {
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        return meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
     false
