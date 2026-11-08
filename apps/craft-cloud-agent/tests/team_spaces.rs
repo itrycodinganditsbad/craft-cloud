@@ -1905,12 +1905,12 @@ impl AppDoc {
     }
 
     /// Types at the end and hands the change to the agent as a held one (an app that ends with it unsent).
-    fn append_held(&self, s: &str) {
+    fn append_held(&self, s: &str) -> u64 {
         let before = self.loro.oplog_vv();
         let t = self.loro.get_text("text");
         t.insert(t.len_unicode(), s).unwrap();
         self.loro.commit();
-        self.doc.hold(&self.loro.export(ExportMode::updates(&before)).unwrap()).unwrap();
+        self.doc.hold(&self.loro.export(ExportMode::updates(&before)).unwrap()).unwrap()
     }
 
     /// Types at the end and sends the whole history (for a document whose earlier changes the agent refused).
@@ -2125,7 +2125,15 @@ async fn a_role_is_pushed_to_open_documents_and_what_a_viewers_app_hands_over_go
     eventually("the open document is told it is read-only", || async { ben.pump().contains(&Event::Role { read_only: true }) }).await;
 
     // The app ends with a change it could not send. The agent keeps it and, as long as the account is a viewer, never sends it.
-    ben.append_held(", written as a viewer");
+    let first = ben.append_held(", written as a viewer");
+    let second = ben.append_held(" and again");
+    // The agent says it has them (an app that ends waits for that), then the document's close, then the socket's.
+    eventually("the agent acks the held changes", || async {
+        let seen = ben.pump();
+        seen.contains(&Event::Acked(first)) && seen.contains(&Event::Acked(second))
+    })
+    .await;
+    drop(ben);
     drop(docs_ben);
     tokio::time::sleep(Duration::from_secs(2)).await;
     ana.pump();
@@ -2135,16 +2143,50 @@ async fn a_role_is_pushed_to_open_documents_and_what_a_viewers_app_hands_over_go
     t.world.meta.change_member_role(&SpaceActor::Cli, space, ben_id, SpaceRole::Editor, 2).await.unwrap();
     eventually("ana shows what the viewer's app handed over", || async {
         ana.pump();
-        ana.text() == "the plan, written as a viewer"
+        ana.text() == "the plan, written as a viewer and again"
     })
     .await;
 
     // Opened again, the document is writable, and the told role follows the next change too.
     let (_docs_again, again) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 13).await;
     assert!(!again.doc.read_only());
-    assert_eq!(again.text(), "the plan, written as a viewer");
+    assert_eq!(again.text(), "the plan, written as a viewer and again");
     t.world.meta.change_member_role(&SpaceActor::Cli, space, ben_id, SpaceRole::Viewer, 3).await.unwrap();
     eventually("the second document is told too", || async { again.pump().contains(&Event::Role { read_only: true }) }).await;
+}
+
+/// What a viewer's app handed over is in the document's journal: it survives a restart of the agent while the account is
+/// still a viewer (nothing is sent), and goes up once the role is raised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_changes_survive_a_restart_of_the_agent_and_go_up_when_the_role_is_raised() {
+    let (mut t, ana_folder, ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let (space, ben_id) = (t.space, t.world.ben.id);
+    let (_docs_ana, ana) = app_opens(&t.ana, ana_folder.join("plan.txt"), "the plan", false, 11).await;
+    let (docs_ben, ben) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 12).await;
+    t.world.meta.change_member_role(&SpaceActor::Cli, space, ben_id, SpaceRole::Viewer, 1).await.unwrap();
+    eventually("the open document is told it is read-only", || async { ben.pump().contains(&Event::Role { read_only: true }) }).await;
+    let seq = ben.append_held(", kept across a restart");
+    eventually("the agent acks the held change", || async { ben.pump().contains(&Event::Acked(seq)) }).await;
+    drop(ben);
+    drop(docs_ben);
+
+    // Ben's agent is stopped and started again while he is still a viewer: the held change is in the journal, and is not sent.
+    let (exit, out) = t.ben.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    t.ben.run();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    ana.pump();
+    assert_eq!(ana.text(), "the plan", "a viewer's held change is not sent");
+    let (_docs_again, again) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 13).await;
+    assert_eq!(again.text(), "the plan, kept across a restart", "the journal brought it back");
+
+    // Raised: it goes up.
+    t.world.meta.change_member_role(&SpaceActor::Cli, space, ben_id, SpaceRole::Editor, 2).await.unwrap();
+    eventually("ana shows the held change", || async {
+        ana.pump();
+        ana.text() == "the plan, kept across a restart"
+    })
+    .await;
 }
 
 /// Journals with unacked updates survive a revocation: removed while offline with a change that was never acked, the account

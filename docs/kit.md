@@ -244,12 +244,17 @@ did.
   `viewer` at once, and a refusal with `read_only` for a change sent just before also makes it one. The refused change is
   never sent again (unlike a refusal for a full disk, which goes again) and stays queued, unsent; when the role is raised
   the queue goes up at once, with no new open. If the app ends first, dropping the session hands the queue to the agent,
-  which keeps it and sends it once the account may write (best effort: when the agent is not there, the changes are in
-  the window and, once saved, in the file only).
+  which keeps it and sends it once the account may write. The session waits up to two seconds for the agent to confirm each
+  change before it lets go of the connection. Not covered: when the agent is not there, or no longer follows the document
+  (its space stopped syncing, or access was revoked), the changes are in the window and, once saved, in the file only; the
+  kit says so on standard error.
 - **A space that stops syncing** (turned off, the folder moved, access lost): the agent tells the open document it stopped
-  following it (`status().stopped`, badge Stopped), nothing is sent, and a change the agent answers with `not_found` is
-  not sent again either; the changes stay in the window, so save the document. `reconnect_now()` opens it again if the
-  space is back.
+  following it (`status().stopped`, badge Stopped), and a change the agent answers with `not_found` means the same. The
+  session drops the link and opens the document again by itself, with a pause that grows (200 ms up to 8 s; the agent
+  answers `not_live` until the space syncs again); nothing is sent meanwhile, the changes stay queued in the window, and
+  they go up once the document is open again. `reconnect_now()` skips the pause. Save the document if the space may not
+  come back. (A document the agent stopped following for another reason, as Loro failing on it, is opened again the same
+  way, with the same growing pause.)
 - **Binary values.** `session.blobs()` is the agent's blob store bound to the document's file, so its blobs go to the
   document's space and every member gets them back. Use it where an app wrote `AgentBlobs(client.blobs())`; that keeps blobs
   in the account's personal space, where the other members get `blob_not_found`. Call `session.check_blobs(&store)` once

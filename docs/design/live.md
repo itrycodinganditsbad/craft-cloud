@@ -75,7 +75,7 @@ per app connection for live sessions. `run` serves it while signed out too. Call
     files with `not_live {offline}`; the app's other documents go on. `role {doc, read_only}` follows `opened`: the agent
     tells every app with a document of the space open when the account's right to change it changes, both ways, whether
     or not the app asked for identity. An app that ends holding changes it made as a viewer and kept sends them as binary
-    kind 6 (`[u8 6][u64 id][a Loro update]`, in order, never acked): the agent journals them like an update, but they go
+    kind 6 (`[u8 6][u64 id][a Loro update]`, in order, numbered and acked like updates): the agent journals them like an update, but they go
     to the server only once the account may write (no app needs to be open then). An app that opens with `identity: true` gets other
     accounts' presence (and the account's own other machines') as binary kind 5
     `[u8 5][u64 id][16 bytes account ID][the app's bytes]` instead of kind 3, the account being the server's word whatever
