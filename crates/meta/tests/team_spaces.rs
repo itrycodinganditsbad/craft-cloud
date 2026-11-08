@@ -108,6 +108,7 @@ on_every_backend!(
     the_last_owner_stays,
     concurrent_changes_never_leave_a_space_without_an_owner,
     guarded_writes_check_the_role_in_their_own_transaction,
+    concurrent_guarded_uploads_do_not_deadlock,
 );
 
 // ---- helpers ----
@@ -878,4 +879,38 @@ async fn guarded_writes_check_the_role_in_their_own_transaction(db: &Db) {
     run(&raw(&db.url).await, format!("UPDATE spaces SET archived_ms = 1 WHERE id = {}", blob_of(db.postgres, space.as_uuid()))).await.unwrap();
     assert!(matches!(owner.commit(space, dev, &mkdir("seven"), NOW + 10).await, Err(MetaError::ReadOnly)));
     meta.guarded(WriteGuard { user: ana.id, min: SpaceRole::Viewer }).commit(space, dev, &mkdir("eight"), NOW + 10).await.unwrap();
+}
+
+/// Uploads by editors of one team space, started together: each records a blob and charges the space's byte count, which
+/// updates the space's row. A guard that took a weaker lock on that row first would make two of them deadlock on
+/// Postgres (one answer is a database error); all of them must succeed.
+async fn concurrent_guarded_uploads_do_not_deadlock(db: &Db) {
+    let meta = &db.meta;
+    let ana = user(meta, "ana").await;
+    let ben = user(meta, "ben").await;
+    let cy = user(meta, "cy").await;
+    let space = team(meta, "Studio", &ana).await;
+    join(meta, space, &ana, &ben, SpaceRole::Editor).await;
+    join(meta, space, &ana, &cy, SpaceRole::Editor).await;
+    for round in 0..20u8 {
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let upload = |who: UserId, tag: u8, barrier: std::sync::Arc<tokio::sync::Barrier>| {
+            let meta = meta.guarded(WriteGuard { user: who, min: SpaceRole::Editor });
+            async move {
+                barrier.wait().await;
+                meta.add_chunk(
+                    space,
+                    &craft_cloud_proto::ChunkId::from_bytes([
+                        tag, round, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    ]),
+                    10,
+                    NOW + 5,
+                )
+                .await
+            }
+        };
+        let (a, b) = (tokio::spawn(upload(ben.id, 1, barrier.clone())), tokio::spawn(upload(cy.id, 2, barrier)));
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+        assert!(a.is_ok() && b.is_ok(), "round {round}: {a:?} / {b:?}");
+    }
 }

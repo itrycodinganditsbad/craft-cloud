@@ -97,6 +97,7 @@ pub async fn require_device(State(state): State<Arc<AppState>>, mut request: Req
     let mut response = next.run(request).await;
     // A space-scoped route that worked on another space has put that space's epoch there already.
     if !response.headers().contains_key(EPOCH_HEADER)
+        && response.extensions().get::<crate::space::NoEpoch>().is_none()
         && let Ok(value) = HeaderValue::from_str(&epoch.to_string())
     {
         response.headers_mut().insert(EPOCH_HEADER, value);

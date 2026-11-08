@@ -135,13 +135,14 @@ impl Meta {
     }
 
     /// Runs the guard of a [`Meta::guarded`] handle, if there is one, on the write transaction's connection. On Postgres
-    /// the space's row is locked first (`FOR SHARE`: an upload does not wait for other uploads, but a change to the
-    /// space's members, which takes `FOR UPDATE`, does wait for it and the other way round); on SQLite the single writer
-    /// already orders everything.
+    /// the space's row is locked first, at the strength the write needs anyway (`FOR NO KEY UPDATE`: an upload updates the
+    /// row's byte count, and a weaker lock taken first would make two concurrent uploads wait for each other's upgrade and
+    /// deadlock); a change to the space's members, which takes `FOR UPDATE`, waits for it and the other way round. On SQLite
+    /// the single writer already orders everything.
     pub(crate) async fn check_guard(&self, conn: &mut sqlx::AnyConnection, space: SpaceId) -> Result<(), MetaError> {
         let Some(guard) = self.guard else { return Ok(()) };
         if self.dialect == Dialect::Postgres {
-            sqlx::query("SELECT 1 FROM spaces WHERE id = $1 FOR SHARE").bind(uuid_bytes(space.as_uuid())).fetch_optional(&mut *conn).await?;
+            sqlx::query("SELECT 1 FROM spaces WHERE id = $1 FOR NO KEY UPDATE").bind(uuid_bytes(space.as_uuid())).fetch_optional(&mut *conn).await?;
         }
         match access_on(conn, guard.user, space).await? {
             None => Err(MetaError::NotFound("space")),

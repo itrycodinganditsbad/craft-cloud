@@ -13,6 +13,8 @@
 //! - **The role is checked twice.** The layer reads it from the database on every request (nothing is cached) and refuses
 //!   before the handler runs. A write then asks for [`SpaceAccess::meta`], a store handle whose write transaction reads the
 //!   role again after locking the space's row, so a role lowered between the two is respected.
+//! - **A malformed header** is `400 invalid` and has no echo (there is no space to echo). The layer's own refusals carry no
+//!   `craft-epoch` either; the echo of the requested ID is all they say about the space.
 //! - **The epoch header** of an answer is the working space's epoch, as the personal space's is for a request without the
 //!   header.
 
@@ -50,6 +52,10 @@ impl SpaceAccess {
         if self.personal { state.meta.clone() } else { state.meta.guarded(WriteGuard { user, min: self.required }) }
     }
 }
+
+/// Marks a response the space layer refused itself, so that [`crate::auth::require_device`] adds no `craft-epoch` to it.
+#[derive(Debug, Clone, Copy)]
+pub struct NoEpoch;
 
 /// The layer's state: the server and the role its route needs.
 #[derive(Clone)]
@@ -114,7 +120,12 @@ pub async fn require_space(State(gate): State<SpaceGate>, mut request: Request, 
     };
     let mut response = match work.await {
         Ok(response) => response,
-        Err(e) => e.into_response(),
+        Err(e) => {
+            // The layer's own refusal says nothing about the space's epoch (a 404 must not): the device layer leaves it out.
+            let mut refusal = e.into_response();
+            refusal.extensions_mut().insert(NoEpoch);
+            refusal
+        }
     };
     if let Some(echo) = echo {
         response.headers_mut().insert(SPACE_HEADER, echo);
