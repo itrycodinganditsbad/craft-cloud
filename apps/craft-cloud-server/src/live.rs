@@ -54,7 +54,7 @@ use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, State};
 use axum::response::Response;
-use craft_cloud_meta::{DeviceAuth, UserId};
+use craft_cloud_meta::{DeviceAuth, MetaError, UserId, WriteGuard};
 use craft_cloud_proto::api::{SpaceRole, codes};
 use craft_cloud_proto::live::{
     ACCESS_CHANGED, ACCESS_CHANGED_CLOSE, AppName, ClientFrame, DOCUMENT_KIND_PREFIX, DocKind, LIVE_DOCUMENTS_PROTOCOL, LIVE_PROTOCOL_MAX,
@@ -74,6 +74,15 @@ use crate::state::{AppState, Limits};
 pub const MAX_CONNECTIONS_PER_DEVICE: usize = 4;
 /// …and to all its spaces together.
 pub const MAX_CONNECTIONS_PER_DEVICE_TOTAL: usize = 32;
+/// Documents one device may follow in one space ([`MAX_SUBSCRIPTIONS`])…
+pub const MAX_SUBSCRIPTIONS_PER_SPACE: usize = MAX_SUBSCRIPTIONS;
+/// …and in all its spaces together.
+pub const MAX_SUBSCRIPTIONS_PER_DEVICE_TOTAL: usize = 1024;
+/// How long a connection trusts its last look at the account's access (and its device) before it relays updates and
+/// presence, or accepts presence ([`Limits::live_recheck`]).
+pub const RECHECK_EVERY: Duration = Duration::from_secs(5);
+/// After a change of a space's members a connection looks at its access at once, then at most this often.
+const MEMBERS_COALESCE: Duration = Duration::from_secs(1);
 /// Updates (and creates) a connection may send at once before it is refilled…
 pub const UPDATE_BURST: u32 = 400;
 /// …at this many per second.
@@ -127,10 +136,8 @@ pub struct LiveHub {
     spaces: Mutex<HashMap<SpaceId, broadcast::Sender<DocId>>>,
     presence: Mutex<HashMap<SpaceId, broadcast::Sender<PresenceNote>>>,
     connections: Mutex<Connections>,
-    subscriptions: Mutex<HashMap<DeviceId, usize>>,
+    subscriptions: Mutex<Connections>,
     revoked: broadcast::Sender<DeviceId>,
-    /// An account whose access changed everywhere (disabled, marked for removal): each of its connections looks again.
-    revoked_users: broadcast::Sender<Uuid>,
     compactions: Mutex<HashMap<(SpaceId, DocId), Compaction>>,
     /// Each device's presence budget per document, across its connections.
     presence_budgets: Mutex<HashMap<(DeviceId, DocId), Budget>>,
@@ -147,7 +154,6 @@ impl Default for LiveHub {
             connections: Mutex::default(),
             subscriptions: Mutex::default(),
             revoked: broadcast::channel(64).0,
-            revoked_users: broadcast::channel(64).0,
             compactions: Mutex::default(),
             presence_budgets: Mutex::default(),
         }
@@ -166,12 +172,11 @@ struct Connections {
 }
 
 impl Connections {
-    /// Takes a place for `device` in `space`; false when it holds [`MAX_CONNECTIONS_PER_DEVICE`] to that space or
-    /// [`MAX_CONNECTIONS_PER_DEVICE_TOTAL`] in all.
-    fn take(&mut self, device: DeviceId, space: SpaceId) -> bool {
+    /// Takes a place for `device` in `space`; false when it holds `max_here` to that space or `max_total` in all.
+    fn take(&mut self, device: DeviceId, space: SpaceId, max_here: usize, max_total: usize) -> bool {
         let total = self.per_device.get(&device).copied().unwrap_or(0);
         let here = self.per_space.get(&(device, space)).copied().unwrap_or(0);
-        if here >= MAX_CONNECTIONS_PER_DEVICE || total >= MAX_CONNECTIONS_PER_DEVICE_TOTAL {
+        if here >= max_here || total >= max_total {
             return false;
         }
         self.per_space.insert((device, space), here + 1);
@@ -179,15 +184,15 @@ impl Connections {
         true
     }
 
-    fn release(&mut self, device: DeviceId, space: SpaceId) {
+    fn release(&mut self, device: DeviceId, space: SpaceId, n: usize) {
         if let Some(here) = self.per_space.get_mut(&(device, space)) {
-            *here = here.saturating_sub(1);
+            *here = here.saturating_sub(n);
             if *here == 0 {
                 self.per_space.remove(&(device, space));
             }
         }
         if let Some(total) = self.per_device.get_mut(&device) {
-            *total = total.saturating_sub(1);
+            *total = total.saturating_sub(n);
             if *total == 0 {
                 self.per_device.remove(&device);
             }
@@ -204,47 +209,35 @@ pub struct ConnectionSlot {
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        self.hub.live.connections.lock().unwrap_or_else(PoisonError::into_inner).release(self.device, self.space);
+        self.hub.live.connections.lock().unwrap_or_else(PoisonError::into_inner).release(self.device, self.space, 1);
     }
-}
-
-fn release(counts: &Mutex<HashMap<DeviceId, usize>>, device: DeviceId, n: usize) {
-    let mut counts = counts.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(count) = counts.get_mut(&device) {
-        *count = count.saturating_sub(n);
-        if *count == 0 {
-            counts.remove(&device);
-        }
-    }
-}
-
-/// Takes one of `max` slots of `device` in `counts`; false when all are taken.
-fn take(counts: &Mutex<HashMap<DeviceId, usize>>, device: DeviceId, max: usize) -> bool {
-    let mut counts = counts.lock().unwrap_or_else(PoisonError::into_inner);
-    let count = counts.entry(device).or_insert(0);
-    if *count >= max {
-        return false;
-    }
-    *count += 1;
-    true
 }
 
 impl LiveHub {
     /// Registers a connection of `device` to `space`, or `None` when the device holds too many.
     pub fn open_connection(&self, state: &Arc<AppState>, device: DeviceId, space: SpaceId) -> Option<ConnectionSlot> {
-        let taken = self.connections.lock().unwrap_or_else(PoisonError::into_inner).take(device, space);
+        let taken = self.connections.lock().unwrap_or_else(PoisonError::into_inner).take(
+            device,
+            space,
+            MAX_CONNECTIONS_PER_DEVICE,
+            MAX_CONNECTIONS_PER_DEVICE_TOTAL,
+        );
         taken.then(|| ConnectionSlot { hub: state.clone(), device, space })
     }
 
-    /// `user`'s access may have changed everywhere (the account was disabled or marked for removal): each of its live
-    /// connections looks again and ends if its access is gone. Connections of other accounts are untouched.
-    pub fn revoke_user(&self, user: UserId) {
-        let _ = self.revoked_users.send(user.0);
+    /// Takes a place for one more followed document of `device` in `space`; false at [`MAX_SUBSCRIPTIONS_PER_SPACE`] in the
+    /// space or [`MAX_SUBSCRIPTIONS_PER_DEVICE_TOTAL`] in all.
+    fn take_subscription(&self, device: DeviceId, space: SpaceId) -> bool {
+        self.subscriptions.lock().unwrap_or_else(PoisonError::into_inner).take(
+            device,
+            space,
+            MAX_SUBSCRIPTIONS_PER_SPACE,
+            MAX_SUBSCRIPTIONS_PER_DEVICE_TOTAL,
+        )
     }
 
-    /// A receiver of the accounts [`LiveHub::revoke_user`] names from now on.
-    pub fn user_revocations(&self) -> broadcast::Receiver<Uuid> {
-        self.revoked_users.subscribe()
+    fn release_subscriptions(&self, device: DeviceId, space: SpaceId, n: usize) {
+        self.subscriptions.lock().unwrap_or_else(PoisonError::into_inner).release(device, space, n);
     }
 
     /// `device` was revoked: its live connections end. (One revoked by another process, the admin CLI, is found by the
@@ -411,6 +404,13 @@ pub struct Session {
     role: SpaceRole,
     /// Whether the space is the account's own personal space (not a team space).
     personal: bool,
+    /// When the account's access and device were last confirmed: relaying and accepting presence trust it for
+    /// [`Limits::live_recheck`] ([`Session::fresh`]).
+    verified: Instant,
+    /// When the device was last confirmed active (a write trusts it for [`Limits::live_recheck`]).
+    device_verified: Instant,
+    /// A write found the account's access gone: the connection ends after the answer.
+    lost: bool,
     welcomed: bool,
     /// The live protocol agreed at `hello` (0 before).
     protocol: u32,
@@ -428,7 +428,7 @@ pub struct Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        release(&self.state.live.subscriptions, self.device, self.subscriptions.len());
+        self.state.live.release_subscriptions(self.device, self.space, self.subscriptions.len());
         for doc in self.asked.keys() {
             self.state.live.forget_ask(self.space, *doc, self.id);
         }
@@ -456,6 +456,9 @@ impl Session {
             user: auth.user,
             role,
             personal,
+            verified: Instant::now(),
+            device_verified: Instant::now(),
+            lost: false,
             welcomed: false,
             protocol: 0,
             id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
@@ -499,7 +502,7 @@ impl Session {
             }
         };
         self.epoch = Some(epoch);
-        Ok(if self.spaces() || protocol >= LIVE_SPACES_PROTOCOL {
+        Ok(if protocol >= LIVE_SPACES_PROTOCOL {
             ServerFrame::WelcomeSpace { protocol, epoch, space: self.space, role: self.role }
         } else {
             ServerFrame::Welcome { protocol, epoch }
@@ -515,9 +518,64 @@ impl Session {
         (now != Some(self.role)).then(|| ServerFrame::error(ACCESS_CHANGED, "your access to this space changed; connect again", None, None))
     }
 
+    /// The device and then the access, read now: a device signed out meanwhile (an account disabled) is told so first.
+    /// A confirmed look is remembered ([`Session::fresh`]).
+    pub async fn check_identity(&mut self) -> Option<ServerFrame> {
+        if !self.state.meta.device_active(self.device).await.unwrap_or(true) {
+            return Some(ServerFrame::error(codes::UNAUTHORIZED, "this device was signed out", None, None));
+        }
+        if let Some(ended) = self.check_access().await {
+            return Some(ended);
+        }
+        self.verified = Instant::now();
+        self.device_verified = self.verified;
+        None
+    }
+
+    /// [`Session::check_identity`] unless it was done within [`Limits::live_recheck`]. Before a connection relays updates
+    /// or presence, or accepts presence, so that an account removed by another process (the command line, a second server
+    /// on the database) stops sending and receiving within that time instead of at the next ping.
+    pub async fn fresh(&mut self) -> Option<ServerFrame> {
+        if self.verified.elapsed() < self.state.limits.live_recheck {
+            return None;
+        }
+        self.check_identity().await
+    }
+
+    /// The device, trusted for [`Limits::live_recheck`]: a write from a device signed out by another process is refused
+    /// within that time.
+    async fn device_fresh(&mut self) -> Option<ServerFrame> {
+        if self.device_verified.elapsed() < self.state.limits.live_recheck {
+            return None;
+        }
+        if !self.state.meta.device_active(self.device).await.unwrap_or(true) {
+            return Some(ServerFrame::error(codes::UNAUTHORIZED, "this device was signed out", None, None));
+        }
+        self.device_verified = Instant::now();
+        None
+    }
+
+    /// The store handle for a live write. In a team space it re-checks the account's role inside the write transaction
+    /// ([`craft_cloud_meta::Meta::guarded`]), after the frame's own check: a role lowered, a member removed or a space
+    /// archived between the two is respected, and nothing is stored or announced. A personal space's owner has nothing to
+    /// re-check.
+    fn writer(&self) -> craft_cloud_meta::Meta {
+        if self.personal { self.state.meta.clone() } else { self.state.meta.guarded(WriteGuard { user: self.user, min: SpaceRole::Editor }) }
+    }
+
+    /// A store error of a live write as the answer for the agent. A guarded write that finds the account without access
+    /// ends the connection (`access_changed`); one that finds it below an editor is `read_only`.
+    fn write_failed(&mut self, e: MetaError) -> ApiError {
+        if matches!(e, MetaError::NotFound("space")) {
+            self.lost = true;
+            return ApiError::new(axum::http::StatusCode::NOT_FOUND, ACCESS_CHANGED, "your access to this space changed; connect again");
+        }
+        e.into()
+    }
+
     /// The role a frame needs, in a team space: `create`, `update` and `snapshot` need an editor; `subscribe` and
     /// `subscribe_log` a viewer (a read that starts a catch-up). Presence and `unsubscribe` need only the membership the
-    /// connection was opened with, which the ping and a change of the space's members re-check.
+    /// connection was opened with, which a change of the space's members, the ping and [`Session::fresh`] re-check.
     fn role_needed(frame: &ClientFrame) -> Option<SpaceRole> {
         match frame {
             ClientFrame::Create { .. } | ClientFrame::CreateDocument { .. } | ClientFrame::Update { .. } | ClientFrame::Snapshot { .. } => {
@@ -528,18 +586,31 @@ impl Session {
         }
     }
 
-    /// The role check of one frame in a team space, before anything else is done with it: the account's access is read
-    /// from the database now (so a change made by another process, the command line, is respected at once, not at the
-    /// next ping); a connection whose access is not the one it was opened with ends, and a viewer's write is refused with
-    /// `read_only` and changes nothing. `None` lets the frame through.
+    /// The check of one frame before anything else is done with it. Presence is accepted only from a connection whose
+    /// access was confirmed within [`Limits::live_recheck`]. For a write or a subscribe the device is confirmed within
+    /// that time too, and in a team space the account's access is read from the database now (so a change made by
+    /// another process, the command line, is respected at once): a connection whose access is not the one it was opened
+    /// with ends, and a viewer's write is refused with `read_only` and changes nothing. The write itself is guarded again in
+    /// its transaction ([`Session::writer`]). `None` lets the frame through.
     async fn gate(&mut self, frame: &ClientFrame) -> Option<Reply> {
+        let Some(need) = Self::role_needed(frame) else {
+            if matches!(frame, ClientFrame::Presence { .. })
+                && let Some(ended) = self.fresh().await
+            {
+                return Some(Reply { frames: vec![ended], close: true });
+            }
+            return None;
+        };
+        if let Some(ended) = self.device_fresh().await {
+            return Some(Reply { frames: vec![ended], close: true });
+        }
         if self.personal {
             return None;
         }
-        let need = Self::role_needed(frame)?;
         if let Some(ended) = self.check_access().await {
             return Some(Reply { frames: vec![ended], close: true });
         }
+        self.verified = Instant::now();
         if self.role >= need {
             return None;
         }
@@ -557,6 +628,15 @@ impl Session {
 
     /// Handles one frame from the agent.
     pub async fn handle(&mut self, frame: ClientFrame) -> Reply {
+        let mut reply = self.handle_frame(frame).await;
+        // A write found the account's access gone: the answer was `access_changed`, and the connection ends with it.
+        if self.lost {
+            reply.close = true;
+        }
+        reply
+    }
+
+    async fn handle_frame(&mut self, frame: ClientFrame) -> Reply {
         let one = |frame| Reply { frames: vec![frame], close: false };
         if !self.welcomed {
             return match frame {
@@ -603,7 +683,7 @@ impl Session {
             },
             ClientFrame::Unsubscribe { doc } => {
                 if self.subscriptions.remove(&doc).is_some() {
-                    release(&self.state.live.subscriptions, self.device, 1);
+                    self.state.live.release_subscriptions(self.device, self.space, 1);
                 }
                 self.dirty.remove(&doc);
                 Reply::default()
@@ -660,9 +740,12 @@ impl Session {
             Err(e) => return refused(e.into(), Some(doc), None),
         }
         let kind = DocKind::Document { node, app }.as_text();
-        match self.state.meta.create_live_document(self.space, doc, &kind, node, &manifest, self.state.now_ms()).await {
+        match self.writer().create_live_document(self.space, doc, &kind, node, &manifest, self.state.now_ms()).await {
             Ok((_, kept)) => ServerFrame::CreatedDocument { doc, kept },
-            Err(e) => refused(e.into(), Some(doc), None),
+            Err(e) => {
+                let e = self.write_failed(e);
+                refused(e, Some(doc), None)
+            }
         }
     }
 
@@ -674,9 +757,10 @@ impl Session {
             return;
         }
         self.asked.remove(&doc);
-        match self.state.meta.compact_live_doc(self.space, doc, upto, &manifest).await {
+        match self.writer().compact_live_doc(self.space, doc, upto, &manifest).await {
             Ok(true) => self.state.live.compacted(self.space, doc),
             Ok(false) => {}
+            Err(MetaError::NotFound("space")) => self.lost = true,
             Err(e) => tracing::info!(error = %e, "a live document's snapshot wasn't recorded"),
         }
     }
@@ -731,9 +815,12 @@ impl Session {
         if kind.fixed_id(self.space) != Some(doc) {
             return refused(ApiError::invalid("that document ID doesn't belong to that kind"), Some(doc), None);
         }
-        match self.state.meta.create_live_doc(self.space, doc, &kind.as_text(), None, self.state.now_ms()).await {
+        match self.writer().create_live_doc(self.space, doc, &kind.as_text(), None, self.state.now_ms()).await {
             Ok(_) => ServerFrame::Created { doc },
-            Err(e) => refused(e.into(), Some(doc), None),
+            Err(e) => {
+                let e = self.write_failed(e);
+                refused(e, Some(doc), None)
+            }
         }
     }
 
@@ -749,28 +836,28 @@ impl Session {
             return Err(ApiError::invalid("this document's catch-up is under way; subscribe again after `subscribed`"));
         }
         let new = !self.subscriptions.contains_key(&doc);
-        if new && !take(&self.state.live.subscriptions, self.device, MAX_SUBSCRIPTIONS) {
+        if new && !self.state.live.take_subscription(self.device, self.space) {
             return Err(ApiError::rate_limited(format!("a device may follow at most {MAX_SUBSCRIPTIONS} documents"), None));
         }
         let found = match self.state.meta.live_doc(self.space, doc).await {
             Ok(found) => found,
             Err(e) => {
                 if new {
-                    release(&self.state.live.subscriptions, self.device, 1);
+                    self.state.live.release_subscriptions(self.device, self.space, 1);
                 }
                 return Err(e.into());
             }
         };
         let Some(found) = found else {
             if new {
-                release(&self.state.live.subscriptions, self.device, 1);
+                self.state.live.release_subscriptions(self.device, self.space, 1);
             }
             return Err(ApiError::not_found("document"));
         };
         // A document of a file is for an agent that reads its snapshot: one on protocol 1 never made one.
         if !self.documents() && found.kind.starts_with(DOCUMENT_KIND_PREFIX) {
             if new {
-                release(&self.state.live.subscriptions, self.device, 1);
+                self.state.live.release_subscriptions(self.device, self.space, 1);
             }
             return Err(ApiError::invalid("documents of files need live protocol 2"));
         }
@@ -784,14 +871,14 @@ impl Session {
                 Ok((page, _)) => page.first().filter(|u| u.seq == after).map(|u| update_hash(&u.bytes)),
                 Err(e) => {
                     if new {
-                        release(&self.state.live.subscriptions, self.device, 1);
+                        self.state.live.release_subscriptions(self.device, self.space, 1);
                     }
                     return Err(e.into());
                 }
             };
             if ours != Some(at) {
                 if new {
-                    release(&self.state.live.subscriptions, self.device, 1);
+                    self.state.live.release_subscriptions(self.device, self.space, 1);
                 }
                 return Err(ApiError::new(
                     axum::http::StatusCode::GONE,
@@ -825,17 +912,18 @@ impl Session {
         }
         // Appended and published in a task of its own: a connection that drops meanwhile must not skip the publish of
         // an update that was stored.
-        let (state, space, device) = (self.state.clone(), self.space, self.device);
+        let (state, space, device, meta) = (self.state.clone(), self.space, self.device, self.writer());
         let appended = tokio::spawn(async move {
-            let appended = state.meta.append_live_update_counted(space, doc, device, client_seq, &bytes, state.now_ms()).await?;
+            let appended = meta.append_live_update_counted(space, doc, device, client_seq, &bytes, state.now_ms()).await?;
             state.live.publish(space, doc);
-            Ok::<_, ApiError>(appended)
+            Ok::<_, MetaError>(appended)
         })
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "live append task failed");
             ApiError::internal()
-        })??;
+        })?
+        .map_err(|e| self.write_failed(e))?;
         // The device that sent the update that made the log long is asked first: it holds every update up to it once
         // those below have reached it.
         let compact = if appended.repeat { None } else { self.maybe_compact(doc, appended.seq, appended.base, appended.above_bytes) };
@@ -868,6 +956,8 @@ impl Session {
         if let Some(ended) = self.check_access().await {
             return Some(ended);
         }
+        self.verified = Instant::now();
+        self.device_verified = self.verified;
         if let Some(epoch) = self.epoch
             && let Ok(now) = self.state.meta.live_epoch(self.space).await
             && now != epoch
@@ -972,10 +1062,10 @@ pub async fn connect(
         let presence = state.live.listen_presence(access.space);
         // …and to changes of the space's members, before `hello` reads the role: a change before it is read there, one
         // after it is heard here.
-        let members = state.notifier.subscribe_members(access.space);
-        let users = state.live.user_revocations();
+        // (a personal space's members never change).
+        let members = (!access.personal).then(|| state.notifier.subscribe_members(access.space));
         let session = Session::in_space(state, &auth, access.space, access.role, access.personal);
-        serve(socket, session, Streams { notes, presence, revocations, members, users }).await;
+        serve(socket, session, Streams { notes, presence, revocations, members }).await;
     }))
 }
 
@@ -1008,11 +1098,38 @@ struct Streams {
     presence: broadcast::Receiver<PresenceNote>,
     /// Devices revoked through the API.
     revocations: broadcast::Receiver<DeviceId>,
-    /// Changes of the space's members, roles and life cycle: the account's access is read again at once (a device signed
-    /// out meanwhile, as when an account is disabled, is reported as that first).
-    members: watch::Receiver<u64>,
-    /// Accounts disabled or marked for removal.
-    users: broadcast::Receiver<Uuid>,
+    /// Changes of the space's members, roles and life cycle (none for a personal space): the account's access is read
+    /// again at once, and then at most once a second however many changes come (a device signed out meanwhile, as when an
+    /// account is disabled, is reported as that first).
+    members: Option<watch::Receiver<u64>>,
+}
+
+/// Coalesces the changes of a space's members: the first is looked at at once, the ones that follow within
+/// [`MEMBERS_COALESCE`] of a look are looked at together when that time is over.
+#[derive(Debug, Default)]
+struct Debounce {
+    last: Option<Instant>,
+    pending: Option<Instant>,
+}
+
+impl Debounce {
+    /// A change was heard at `now`.
+    fn note(&mut self, now: Instant) {
+        if self.pending.is_none() {
+            self.pending = Some(self.last.map_or(now, |last| now.max(last + MEMBERS_COALESCE)));
+        }
+    }
+
+    /// When the look that is due should happen, if one is.
+    fn due(&self) -> Option<Instant> {
+        self.pending
+    }
+
+    /// The look happened at `now`.
+    fn ran(&mut self, now: Instant) {
+        self.last = Some(now);
+        self.pending = None;
+    }
 }
 
 /// Whether `frame` ends a connection because the account's access changed.
@@ -1023,7 +1140,8 @@ fn is_access_changed(frame: &ServerFrame) -> bool {
 /// The connection loop: frames in, frames out, the log pumped while a document has news, pings, and an end on
 /// shutdown, silence, a broken connection or a change of the account's access.
 async fn serve(mut socket: WebSocket, mut session: Session, streams: Streams) {
-    let Streams { mut notes, mut presence, mut revocations, mut members, mut users } = streams;
+    let Streams { mut notes, mut presence, mut revocations, mut members } = streams;
+    let mut debounce = Debounce::default();
     let mut stopping = session.state.notifier.shutdown_signal();
     let mut last_heard = Instant::now();
     // Set when the connection ends because the account's access changed: the close frame says so.
@@ -1053,25 +1171,16 @@ async fn serve(mut socket: WebSocket, mut session: Session, streams: Streams) {
                     break;
                 }
             }
-            changed = members.changed() => {
+            changed = async { match members.as_mut() { Some(members) => members.changed().await, None => std::future::pending().await } } => {
                 // The sender lives as long as the server; if it is gone the server is stopping.
                 if changed.is_err() {
                     break;
                 }
-                if let Some(frame) = session.check().await {
-                    access_changed |= is_access_changed(&frame);
-                    let _ = send(&mut socket, &frame).await;
-                    break;
-                }
+                debounce.note(Instant::now());
             }
-            user = users.recv() => {
-                let ours = match user {
-                    Ok(user) => user == session.user.0,
-                    // Missed some: look again.
-                    Err(broadcast::error::RecvError::Lagged(_)) => true,
-                    Err(broadcast::error::RecvError::Closed) => false,
-                };
-                if ours && let Some(frame) = session.check().await {
+            () = async { match debounce.due() { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {
+                debounce.ran(Instant::now());
+                if let Some(frame) = session.check_identity().await {
                     access_changed |= is_access_changed(&frame);
                     let _ = send(&mut socket, &frame).await;
                     break;
@@ -1085,10 +1194,16 @@ async fn serve(mut socket: WebSocket, mut session: Session, streams: Streams) {
             },
             note = presence.recv() => match note {
                 Ok(note) => {
-                    if let Some(frame) = session.relay(&note)
-                        && !send(&mut socket, &frame).await
-                    {
-                        break;
+                    if let Some(frame) = session.relay(&note) {
+                        // Not to an account whose access was taken away elsewhere meanwhile.
+                        if let Some(ended) = session.fresh().await {
+                            access_changed |= is_access_changed(&ended);
+                            let _ = send(&mut socket, &ended).await;
+                            break;
+                        }
+                        if !send(&mut socket, &frame).await {
+                            break;
+                        }
                     }
                 }
                 // Presence that fell behind is dropped: the next one says where the cursor is.
@@ -1119,17 +1234,25 @@ async fn serve(mut socket: WebSocket, mut session: Session, streams: Streams) {
             }
             () = tokio::time::sleep_until(quiet_until) => break,
             // Lowest priority: send what a subscribed document's log holds that the agent lacks, a page at a time.
-            () = std::future::ready(()), if session.has_work() => match session.pump().await {
-                Ok(frames) => {
-                    if !send_all(&mut socket, &frames).await {
+            () = std::future::ready(()), if session.has_work() => {
+                // Not to an account whose access was taken away elsewhere meanwhile.
+                if let Some(ended) = session.fresh().await {
+                    access_changed |= is_access_changed(&ended);
+                    let _ = send(&mut socket, &ended).await;
+                    break;
+                }
+                match session.pump().await {
+                    Ok(frames) => {
+                        if !send_all(&mut socket, &frames).await {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = send(&mut socket, &ServerFrame::error(e.code, e.message, None, None)).await;
                         break;
                     }
                 }
-                Err(e) => {
-                    let _ = send(&mut socket, &ServerFrame::error(e.code, e.message, None, None)).await;
-                    break;
-                }
-            },
+            }
         }
     }
     let close = access_changed.then(|| CloseFrame { code: ACCESS_CHANGED_CLOSE, reason: ACCESS_CHANGED.into() });
@@ -1323,6 +1446,107 @@ mod tests {
         }
         let Some(ServerFrame::Error { code, .. }) = s.check().await else { panic!("the reset went unseen") };
         assert_eq!(code, "resync_required");
+    }
+
+    // ---- a role per write, coalesced looks, subscription limits (protocol 3) ----
+
+    use craft_cloud_meta::SpaceActor;
+    use craft_cloud_proto::SpaceName;
+
+    /// A team space of `owner` with `member` an editor, and a session of the member's device on it, past `hello` 3, that
+    /// still believes it is an editor.
+    async fn team_session(owner: &Account, member: &mut Account) -> (SpaceId, Session) {
+        let space = owner.meta.create_team_space(&SpaceActor::Cli, &SpaceName::new("Studio").unwrap(), owner.user.id, None, 0).await.unwrap();
+        owner.meta.invite_member(&SpaceActor::Cli, space, member.user.id, SpaceRole::Editor, 0).await.unwrap();
+        let token = [member.next_token; 32];
+        member.next_token += 1;
+        member.meta.create_device(member.user.id, "pc", &token, 0).await.unwrap();
+        let auth = member.meta.device_by_token(&token).await.unwrap().unwrap();
+        let mut session = Session::in_space(member.state.clone(), &auth, space, SpaceRole::Editor, false);
+        let reply = session.handle(ClientFrame::Hello { min: 1, max: 3 }).await;
+        assert!(matches!(reply.frames.as_slice(), [ServerFrame::WelcomeSpace { role: SpaceRole::Editor, .. }]), "{:?}", reply.frames);
+        let doc = recents_doc(space, &AppName::new("wordcraft").unwrap());
+        let reply = session.handle(ClientFrame::Create { doc, kind: DocKind::Recents { app: AppName::new("wordcraft").unwrap() } }).await;
+        assert!(matches!(reply.frames.as_slice(), [ServerFrame::Created { .. }]), "{:?}", reply.frames);
+        let reply = session.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
+        assert!(reply.frames.is_empty());
+        (space, session)
+    }
+
+    /// The frame's role check and the write are two steps. A role lowered, a member removed or a space archived between
+    /// them (here: after the check, by calling the write itself, which is what runs after it) must not store or announce
+    /// anything: the write is guarded in its own transaction.
+    #[tokio::test]
+    async fn a_live_write_is_refused_in_its_transaction_when_the_role_went_between_the_check_and_the_commit() {
+        for change in ["lowered", "removed", "archived"] {
+            let owner = Account::new(Default::default()).await;
+            let mut member = Account::with_meta(Default::default(), owner.meta.clone(), "bo").await;
+            let (space, mut session) = team_session(&owner, &mut member).await;
+            let doc = recents_doc(space, &AppName::new("wordcraft").unwrap());
+            let mut woken = member.state.live.listen(space);
+            match change {
+                "lowered" => {
+                    owner.meta.change_member_role(&SpaceActor::Cli, space, member.user.id, SpaceRole::Viewer, 1).await.unwrap();
+                }
+                "removed" => owner.meta.remove_member(&SpaceActor::Cli, space, member.user.id, 1).await.unwrap(),
+                _ => {
+                    owner.meta.set_space_archived(&SpaceActor::Cli, space, true, 1).await.unwrap();
+                }
+            }
+            // The session still believes it is an editor; the write is what notices.
+            let refused = session.update(doc, 1, b"too late".to_vec()).await.unwrap_err();
+            let want = if change == "removed" { ACCESS_CHANGED } else { codes::READ_ONLY };
+            assert_eq!(refused.code, want, "{change}");
+            assert!(session.lost == (change == "removed"), "{change}");
+            assert!(woken.try_recv().is_err(), "{change}: nothing is announced to the space");
+            assert_eq!(owner.meta.live_doc(space, doc).await.unwrap().unwrap().head, 0, "{change}: nothing is stored");
+            // The same for a `create` of a document and an answer to a `compact`.
+            let created = session.create(doc, DocKind::Recents { app: AppName::new("wordcraft").unwrap() }).await;
+            assert!(matches!(&created, ServerFrame::Error { code, .. } if code == want), "{change}: {created:?}");
+        }
+    }
+
+    #[test]
+    fn member_changes_are_looked_at_at_once_then_at_most_once_a_second() {
+        let t0 = Instant::now();
+        let mut d = Debounce::default();
+        assert_eq!(d.due(), None);
+        d.note(t0);
+        assert_eq!(d.due(), Some(t0), "the first change: at once");
+        d.ran(t0);
+        assert_eq!(d.due(), None);
+        // A burst right after: one look, a second after the last.
+        for ms in [10, 20, 500] {
+            d.note(t0 + Duration::from_millis(ms));
+        }
+        assert_eq!(d.due(), Some(t0 + MEMBERS_COALESCE));
+        d.ran(t0 + MEMBERS_COALESCE);
+        // A change long after the last look is at once again.
+        let later = t0 + Duration::from_secs(10);
+        d.note(later);
+        assert_eq!(d.due(), Some(later));
+    }
+
+    #[test]
+    fn subscriptions_are_limited_per_space_and_in_all() {
+        let hub = LiveHub::default();
+        let device = DeviceId::generate();
+        let spaces: Vec<SpaceId> = (0..5).map(|_| SpaceId::generate()).collect();
+        for _ in 0..MAX_SUBSCRIPTIONS_PER_SPACE {
+            assert!(hub.take_subscription(device, spaces[0]));
+        }
+        assert!(!hub.take_subscription(device, spaces[0]), "256 in one space");
+        // Another space has its own 256, up to 1024 in all.
+        for space in &spaces[1..4] {
+            for _ in 0..MAX_SUBSCRIPTIONS_PER_SPACE {
+                assert!(hub.take_subscription(device, *space));
+            }
+        }
+        assert!(!hub.take_subscription(device, spaces[4]), "1024 in all");
+        hub.release_subscriptions(device, spaces[0], 1);
+        assert!(hub.take_subscription(device, spaces[0]), "a freed place can be taken again");
+        // Another device is not counted.
+        assert!(hub.take_subscription(DeviceId::generate(), spaces[4]));
     }
 
     // ---- documents of files, snapshots, compaction and presence (protocol 2) ----

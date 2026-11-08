@@ -69,9 +69,11 @@ fn limits() -> Limits {
     Limits { live_ping: Duration::from_millis(250), compact_updates: 3, compact_timeout: Duration::from_millis(100), ..Limits::default() }
 }
 
-/// The same with the default ping (30 s), which never comes within a test.
+/// The same with the default ping (30 s), which never comes within a test: what ends a connection here is the signal of
+/// a change made in this process, or the check of a frame or of the connection's next relay. A connection trusts its last
+/// look at its account for a fifth of a second.
 fn slow_limits() -> Limits {
-    Limits { compact_updates: 3, ..Limits::default() }
+    Limits { compact_updates: 3, live_recheck: Duration::from_millis(200), ..Limits::default() }
 }
 
 fn app() -> AppName {
@@ -351,17 +353,24 @@ on_every_backend!(
     two_accounts_edit_one_document_and_converge,
     a_viewer_reads_and_watches_but_never_writes_or_compacts,
     presence_is_stamped_with_the_senders_account,
-    a_removed_member_is_cut_off_at_once,
-    a_lowered_role_and_an_archived_space_end_the_connection,
-    a_disabled_account_is_cut_off,
     a_change_made_elsewhere_is_found_at_the_next_ping,
     connections_are_counted_per_space_and_in_all,
     a_team_space_has_its_own_live_bytes_cap,
     a_protocol_two_agent_sees_the_frames_it_always_saw,
 );
 
-// The default ping (30 s) never comes within these: only the check of the frame itself can end the connection.
-on_every_backend!(default_ping, slow_limits, a_write_is_checked_against_the_database_before_any_ping,);
+// The default ping (30 s) never comes within these: only the signal of a change in this process, or the check of a frame
+// or of a relay, can end the connection, so they show those and not the ping.
+on_every_backend!(
+    default_ping,
+    slow_limits,
+    a_removed_member_is_cut_off_at_once,
+    a_lowered_role_and_an_archived_space_end_the_connection,
+    a_disabled_account_is_cut_off,
+    a_write_is_checked_against_the_database_before_any_ping,
+    a_removal_made_elsewhere_stops_updates_and_presence_both_ways,
+    a_device_revoked_elsewhere_cannot_write,
+);
 
 // ---- the scenarios ----
 
@@ -584,9 +593,12 @@ async fn a_disabled_account_is_cut_off(w: &World) {
 
     let res = w.call("boss", Method::POST, &format!("/admin/users/{}/disable", w.user("dee").id.0), Some(World::confirmed(json!({})))).await;
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    // Signed out first (the devices were revoked with the account), not "access changed", on either socket.
     for socket in [&mut dee, &mut own] {
-        let (_, closed, took) = until_closed(socket, Duration::from_secs(1)).await;
-        assert!(closed.is_some() || took < Duration::from_secs(1));
+        let (frames, closed, took) = until_closed(socket, Duration::from_secs(1)).await;
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(error_code(&frames[0]).0, "unauthorized");
+        assert_ne!(closed.map(|(_, reason)| reason), Some(ACCESS_CHANGED.to_owned()));
         assert!(took < Duration::from_secs(1), "closed after {took:?}");
     }
     assert_eq!(w.open("dee", Some(space)).await.err(), Some(StatusCode::UNAUTHORIZED), "the account cannot connect any more");
@@ -646,6 +658,87 @@ async fn a_write_is_checked_against_the_database_before_any_ping(w: &World) {
 
     let mut again = w.ready_as("ana", space, SpaceRole::Owner).await;
     assert!(subscribe(&mut again, doc, 0).await.is_empty(), "neither update was stored");
+}
+
+/// A member removed behind the server's back (no signal here, and the ping is 30 s away) neither receives nor sends once its
+/// connection's last look is older than the recheck time (a fifth of a second here, 5 s by default): the next update it
+/// would be sent, the next presence it would be sent and the next presence it sends each end the connection instead.
+async fn a_removal_made_elsewhere_stops_updates_and_presence_both_ways(w: &World) {
+    let space = w.create("Studio", "ana").await;
+    for who in ["ben", "cy", "dee"] {
+        w.join(space, "ana", who, "editor").await;
+    }
+    let mut ana = w.ready_as("ana", space, SpaceRole::Owner).await;
+    // Two documents: ben follows the first (updates reach him), cy and dee the second (presence reaches them).
+    let doc = w.follow(&mut ana, space).await;
+    let other = AppName::new("othercraft").unwrap();
+    let doc2 = recents_doc(space, &other);
+    send(&mut ana, ClientFrame::Create { doc: doc2, kind: DocKind::Recents { app: other.clone() } }).await;
+    assert_eq!(frame(&mut ana).await, ServerFrame::Created { doc: doc2 });
+    subscribe(&mut ana, doc2, 0).await;
+    let mut ben = w.ready_as("ben", space, SpaceRole::Editor).await;
+    let mut cy = w.ready_as("cy", space, SpaceRole::Editor).await;
+    let mut dee = w.ready_as("dee", space, SpaceRole::Editor).await;
+    w.follow(&mut ben, space).await;
+    subscribe(&mut cy, doc2, 0).await;
+    subscribe(&mut dee, doc2, 0).await;
+    for who in ["ben", "cy", "dee"] {
+        w.meta.remove_member(&SpaceActor::Cli, space, w.user(who).id, NOW).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Updates: ben is not sent the next one; his connection ends instead.
+    send(&mut ana, ClientFrame::Update { doc, client_seq: 1, bytes: b"secret".to_vec() }).await;
+    assert!(matches!(frame(&mut ana).await, ServerFrame::Ack { .. }));
+    let (frames, closed, _) = until_closed(&mut ben, Duration::from_secs(2)).await;
+    assert_eq!(frames.len(), 1, "no update: {frames:?}");
+    assert_eq!(error_code(&frames[0]).0, ACCESS_CHANGED);
+    assert_eq!(closed.map(|(code, _)| code), Some(ACCESS_CHANGED_CLOSE));
+    // Presence sent: dee's presence is not accepted, and his connection ends.
+    send(&mut dee, ClientFrame::Presence { doc: doc2, bytes: b"i am here".to_vec() }).await;
+    let (frames, closed, _) = until_closed(&mut dee, Duration::from_secs(2)).await;
+    assert_eq!(error_code(&frames[0]).0, ACCESS_CHANGED);
+    assert_eq!(closed.map(|(code, _)| code), Some(ACCESS_CHANGED_CLOSE));
+    quiet(&mut ana).await;
+    // Presence received: ana's presence is not relayed to cy; his connection ends instead.
+    send(&mut ana, ClientFrame::Presence { doc: doc2, bytes: b"cursor".to_vec() }).await;
+    let (frames, closed, _) = until_closed(&mut cy, Duration::from_secs(2)).await;
+    assert_eq!(frames.len(), 1, "no presence: {frames:?}");
+    assert_eq!(error_code(&frames[0]).0, ACCESS_CHANGED);
+    assert_eq!(closed.map(|(code, _)| code), Some(ACCESS_CHANGED_CLOSE));
+
+    // Presence from a member removed: a new member removed behind the back cannot send it either.
+    w.join(space, "ana", "eve", "viewer").await;
+    let mut eve = w.ready_as("eve", space, SpaceRole::Viewer).await;
+    subscribe(&mut eve, doc, 0).await;
+    w.meta.remove_member(&SpaceActor::Cli, space, w.user("eve").id, NOW).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    send(&mut eve, ClientFrame::Presence { doc, bytes: b"i am here".to_vec() }).await;
+    let (frames, closed, _) = until_closed(&mut eve, Duration::from_secs(2)).await;
+    assert_eq!(error_code(&frames[0]).0, ACCESS_CHANGED);
+    assert_eq!(closed.map(|(code, _)| code), Some(ACCESS_CHANGED_CLOSE));
+    // …and ana, who is still a member, was told nothing.
+    quiet(&mut ana).await;
+}
+
+/// A device revoked behind the server's back (the command line, another process) is refused its next write within the
+/// recheck time, though its account is still a member.
+async fn a_device_revoked_elsewhere_cannot_write(w: &World) {
+    let space = w.create("Studio", "ana").await;
+    w.join(space, "ana", "ben", "editor").await;
+    let mut ana = w.ready_as("ana", space, SpaceRole::Owner).await;
+    let doc = w.follow(&mut ana, space).await;
+    let mut ben = w.ready_as("ben", space, SpaceRole::Editor).await;
+    w.follow(&mut ben, space).await;
+    let devices = w.meta.list_devices(w.user("ben").id).await.unwrap();
+    assert_eq!(devices.len(), 1);
+    w.meta.revoke_device(w.user("ben").id, devices[0].id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    send(&mut ben, ClientFrame::Update { doc, client_seq: 1, bytes: b"signed out".to_vec() }).await;
+    let (frames, _, _) = until_closed(&mut ben, Duration::from_secs(2)).await;
+    assert_eq!(error_code(&frames[0]).0, "unauthorized");
+    let mut again = w.ready_as("ana", space, SpaceRole::Owner).await;
+    assert!(subscribe(&mut again, doc, 0).await.is_empty(), "nothing was stored");
 }
 
 /// A device holds 4 connections to a space and 32 in all (the registry counts them per process).

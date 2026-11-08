@@ -121,7 +121,13 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
   with `error {access_changed}` and a WebSocket close with code 4403 and reason `access_changed`. In this process that
   happens at once (a membership, role, archive, disable or removal signal; within a second in the tests), for a change
   made elsewhere at the next ping (30 s) at the latest. An archived space is read-only (every member is a viewer).
-  A viewer is never asked to `compact`. The caps are per space: the live bytes of a team space are
+  A viewer is never asked to `compact`. The writes are guarded again inside their transaction (a role lowered,
+  a member removed or a space archived between the frame's check and its commit stores and announces nothing). A
+  connection trusts its last look at the account (and its device) for 5 s: before it relays updates or presence, or
+  accepts presence, it looks again, so a member removed by another process stops receiving and sending within that
+  time; a device signed out by another process cannot write after it either. A change of a space's members makes each
+  of its connections look at once, then at most once a second. A device may follow 256 documents in one space and 1024
+  in all. The caps are per space: the live bytes of a team space are
   `[spaces] team_live_bytes` (4 GiB by default; a personal space keeps `live_bytes_per_user`), the documents and rows
   counts are the ones of a personal space, per space.
 - `create {doc, kind}` → `created {doc}`; idempotent. Kinds: `recents:<app>`, whose ID is derived from the account and
@@ -201,7 +207,8 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
   `quota_exceeded` (one-way: the update that crosses the cap is the last one stored). The agent keeps every unacked
   update, retries with a pause growing to about 64 s, and says the document is full.
   `craft-cloud-server live reset-doc <user> <app>` (or, for a document of a file, `<user> <document ID>`; with
-  `--space <ID or name>`, the team space's document, `<user>` being one of its members) empties the
+  `--space <ID or name>`, the team space's document, `<user>` being one of its members; it writes a
+  `cli.live_reset` audit event and refuses an archived space unless `--force` is given) empties the
   log, drops the snapshot and the import, and raises the space's live generation in the same transaction, so every
   live connection ends at its next ping and every agent starts over and pushes what the log lacks. The file sync's
   epoch is untouched, so it never sees a reset. Nothing a machine holds is lost. Only the log above the snapshot

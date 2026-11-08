@@ -6,6 +6,9 @@ use std::sync::Mutex;
 use craft_cloud_proto::SpaceId;
 use tokio::sync::watch;
 
+/// Counters of spaces' members kept before the ones nobody watches are dropped on the next subscription.
+const PRUNE_MEMBERS_AT: usize = 64;
+
 /// Most long-polls one space may have waiting at once.
 pub const MAX_WAITERS_PER_SPACE: usize = 16;
 
@@ -73,6 +76,10 @@ impl Notifier {
     /// A receiver that sees every later [`Notifier::members_changed`] for the space.
     pub fn subscribe_members(&self, space: SpaceId) -> watch::Receiver<u64> {
         let mut members = self.members.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A space nobody watches any more is forgotten (checked now and then, not at every call).
+        if members.len() >= PRUNE_MEMBERS_AT {
+            members.retain(|_, sender| sender.receiver_count() > 0);
+        }
         members.entry(space).or_insert_with(|| watch::channel(0).0).subscribe()
     }
 
@@ -80,10 +87,20 @@ impl Notifier {
     /// at its own access again at once. A space nobody watches is a no-op. Another server process on the same database is
     /// not told: its waiters notice at the end of their wait (at most a minute).
     pub fn members_changed(&self, space: SpaceId) {
-        let members = self.members.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut members = self.members.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sender) = members.get(&space) {
-            sender.send_modify(|count| *count = count.wrapping_add(1));
+            if sender.receiver_count() == 0 {
+                members.remove(&space);
+            } else {
+                sender.send_modify(|count| *count = count.wrapping_add(1));
+            }
         }
+    }
+
+    /// How many spaces have a members counter (for tests).
+    #[cfg(test)]
+    fn members_len(&self) -> usize {
+        self.members.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 
     /// Raises the space's sequence to `seq` and wakes its subscribers. Lower values are ignored, and a
@@ -136,6 +153,25 @@ mod tests {
         notifier.begin_shutdown();
         early.wait_for(|stop| *stop).await.unwrap();
         notifier.shutdown_signal().wait_for(|stop| *stop).await.unwrap();
+    }
+
+    #[test]
+    fn counters_of_members_nobody_watches_are_forgotten() {
+        let notifier = Notifier::default();
+        let first = SpaceId::generate();
+        let watcher = notifier.subscribe_members(first);
+        notifier.members_changed(first);
+        assert_eq!(notifier.members_len(), 1, "watched: kept");
+        drop(watcher);
+        notifier.members_changed(first);
+        assert_eq!(notifier.members_len(), 0, "unwatched: a change drops it");
+        // Many spaces that were watched once: the next subscription clears the ones nobody watches.
+        for _ in 0..(PRUNE_MEMBERS_AT + 10) {
+            drop(notifier.subscribe_members(SpaceId::generate()));
+        }
+        let kept = notifier.subscribe_members(SpaceId::generate());
+        assert!(notifier.members_len() <= PRUNE_MEMBERS_AT + 1, "{}", notifier.members_len());
+        drop(kept);
     }
 
     #[test]

@@ -49,6 +49,9 @@ pub struct Limits {
     pub presence_per_sec: u32,
     /// How often a live connection is pinged, and its account's access and device read again.
     pub live_ping: Duration,
+    /// How long a live connection trusts its last look at its account's access before it relays updates or presence, or
+    /// accepts presence (a removal made by another process is found within this time).
+    pub live_recheck: Duration,
 }
 
 impl Default for Limits {
@@ -66,6 +69,7 @@ impl Default for Limits {
             compact_timeout: crate::live::COMPACT_TIMEOUT,
             presence_per_sec: craft_cloud_proto::live::PRESENCE_PER_SEC,
             live_ping: crate::live::PING_EVERY,
+            live_recheck: crate::live::RECHECK_EVERY,
         }
     }
 }
