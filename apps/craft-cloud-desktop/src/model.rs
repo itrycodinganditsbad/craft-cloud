@@ -2261,7 +2261,7 @@ impl Model {
                 Screen::Activity(activity) => activity.overview.status = status,
                 // The join's own answer moves on from there.
                 Screen::Joining { .. } => {}
-                Screen::Versions(_) | Screen::Trash(_) => {}
+                Screen::Versions(_) | Screen::Trash(_) | Screen::Files(_) => {}
                 _ => {
                     let overview = Overview::new(status);
                     let session = overview.session;
@@ -5050,6 +5050,17 @@ pub(crate) mod tests {
         );
         assert!(files_page(&m).loading && files_page(&m).list.is_none());
         assert_eq!(m.tab(), Some(Tab::Files));
+    }
+
+    /// The status poll every two seconds leaves the Files page where it is (it used to put the overview back).
+    #[test]
+    fn a_status_poll_leaves_the_files_page_where_it_is() {
+        let mut m = signed_in();
+        m.update(Event::Tab(Tab::Files));
+        m.update(Event::Recents { ticket: 1, result: Ok(files_list()) });
+        assert!(m.update(Event::Polled(Ok(status(true)))).is_empty());
+        assert_eq!(m.tab(), Some(Tab::Files));
+        assert!(files_page(&m).list.is_some(), "the loaded list is still there");
     }
 
     #[test]
