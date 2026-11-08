@@ -4812,6 +4812,8 @@ pub(crate) mod tests {
         assert!(effects.contains(&Effect::Devices), "{effects:?}");
         assert_eq!(m.tab(), Some(Tab::Computers));
         assert!(m.update(Event::OpenRecent { app: "wordcraft".into(), path: "memo.docx".into() }).is_empty(), "not on the page any more");
+    }
+
     #[test]
     fn a_rename_sends_the_trimmed_name_and_the_list_takes_the_answer() {
         let (mut m, this, other) = with_two_computers();
