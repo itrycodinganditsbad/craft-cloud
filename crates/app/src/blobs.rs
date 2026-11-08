@@ -31,6 +31,14 @@ fn not_found() -> Error {
     Error::Refused { code: craft_cloud_api::api::codes::NOT_FOUND.into(), message: "no such call".into(), name_taken: None }
 }
 
+/// `url` with the query `for=<path>`, if there is a path.
+fn with_for(url: &str, path: Option<&str>) -> String {
+    match path {
+        Some(path) => format!("{url}?for={}", crate::query_component(path)),
+        None => url.to_owned(),
+    }
+}
+
 /// An older agent's "no such call" as [`codes::AGENT_TOO_OLD`].
 fn too_old(e: Error) -> Error {
     match e {
@@ -69,6 +77,17 @@ impl Blobs {
     /// Keeps `bytes` (1 byte to [`MAX_BLOB_BYTES`]) and names them. Answered once they are on the agent's disk. An
     /// agent too old for blobs is found out before a byte of them is sent ([`codes::AGENT_TOO_OLD`]).
     pub fn put(&self, bytes: &[u8]) -> Result<Stored, Error> {
+        self.put_inner(bytes, None)
+    }
+
+    /// [`Blobs::put`] for a document of the file at `path` (absolute, inside a synced folder): the blob goes to that file's
+    /// space, so every member of a team space gets it back ([`Blobs::get_for`]). An agent from before team spaces ignores
+    /// the path and keeps the blob in the personal space.
+    pub fn put_for(&self, bytes: &[u8], path: &str) -> Result<Stored, Error> {
+        self.put_inner(bytes, Some(path))
+    }
+
+    fn put_inner(&self, bytes: &[u8], path: Option<&str>) -> Result<Stored, Error> {
         if bytes.is_empty() || bytes.len() > MAX_BLOB_BYTES {
             return Err(Error::Refused {
                 code: "too_large".into(),
@@ -77,8 +96,8 @@ impl Blobs {
             });
         }
         self.check_agent()?;
-        let answer =
-            self.client.binary("PUT", paths::BLOBS, Some(bytes), craft_cloud_api::local::MAX_LOCAL_JSON_BYTES, PUT_TIMEOUT).map_err(too_old)?;
+        let url = with_for(paths::BLOBS, path);
+        let answer = self.client.binary("PUT", &url, Some(bytes), craft_cloud_api::local::MAX_LOCAL_JSON_BYTES, PUT_TIMEOUT).map_err(too_old)?;
         let stored: Stored = serde_json::from_slice(&answer.body).map_err(|e| Error::Protocol(e.to_string()))?;
         if stored.len != bytes.len() as u64 {
             return Err(Error::Protocol("the agent named a blob of another length".into()));
@@ -88,9 +107,18 @@ impl Blobs {
 
     /// The bytes named `hash`, of `len` bytes (checked).
     pub fn get(&self, hash: &[u8; 32], len: u64) -> Result<Vec<u8>, Error> {
+        self.get_inner(hash, len, None)
+    }
+
+    /// [`Blobs::get`] from the space of the file at `path` ([`Blobs::put_for`]).
+    pub fn get_for(&self, hash: &[u8; 32], len: u64, path: &str) -> Result<Vec<u8>, Error> {
+        self.get_inner(hash, len, Some(path))
+    }
+
+    fn get_inner(&self, hash: &[u8; 32], len: u64, path: Option<&str>) -> Result<Vec<u8>, Error> {
         self.check_agent()?;
-        let path = format!("{}/{}", paths::BLOBS, hex(hash));
-        let answer = self.client.binary("GET", &path, None, MAX_BLOB_BYTES, GET_TIMEOUT).map_err(too_old)?;
+        let url = with_for(&format!("{}/{}", paths::BLOBS, hex(hash)), path);
+        let answer = self.client.binary("GET", &url, None, MAX_BLOB_BYTES, GET_TIMEOUT).map_err(too_old)?;
         if answer.body.len() as u64 != len {
             return Err(Error::Protocol(format!("the agent's blob is {} bytes, not {len}", answer.body.len())));
         }

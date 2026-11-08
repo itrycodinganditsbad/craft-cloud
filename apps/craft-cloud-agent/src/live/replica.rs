@@ -76,10 +76,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use craft_cloud_proto::api::codes;
+use craft_cloud_proto::api::{SpaceRole, codes};
 use craft_cloud_proto::live::{
-    AppName, ClientFrame, DocKind, LIVE_DOCUMENTS_PROTOCOL, LIVE_PROTOCOL_MIN, MAX_SNAPSHOT_BYTES, MAX_SUBSCRIPTIONS, MAX_UPDATE_BYTES,
-    PROTOCOL_MISMATCH, ServerFrame, node_doc, recents_doc, update_hash,
+    ACCESS_CHANGED, AppName, ClientFrame, DocKind, LIVE_DOCUMENTS_PROTOCOL, LIVE_PROTOCOL_MAX, LIVE_PROTOCOL_MIN, MAX_SNAPSHOT_BYTES,
+    MAX_SUBSCRIPTIONS, MAX_UPDATE_BYTES, PROTOCOL_MISMATCH, ServerFrame, node_doc, recents_doc, update_hash,
 };
 use craft_cloud_proto::local::{NotLiveReason, RecentEntry};
 use craft_cloud_proto::{DocId, Epoch, ManifestId, NodeId, SpaceId};
@@ -383,8 +383,10 @@ pub enum DocEvent {
     NotLive(DocId, NotLiveReason, String),
     /// Another machine's change, to apply as it is.
     Remote(DocId, Vec<u8>),
-    /// Another machine's presence, as it sent it.
+    /// Another machine's presence, as it sent it (a server on live protocol 2).
     Presence(DocId, Vec<u8>),
+    /// Another account's or machine's presence with the sending account, stamped by the server (live protocol 3).
+    PresenceFrom(DocId, uuid::Uuid, Vec<u8>),
 }
 
 /// Why a local update was refused.
@@ -1240,6 +1242,10 @@ pub enum LinkError {
     /// The server speaks another live protocol: trying again only helps after an update.
     #[error("{0}")]
     Mismatch(String),
+    /// The server says this account's access to the space changed (a role raised or lowered, the account removed, the
+    /// space archived, or the account disabled): the connection ends, and the next one finds out which.
+    #[error("{0}")]
+    AccessChanged(String),
 }
 
 /// Why an add was refused.
@@ -1283,6 +1289,13 @@ pub struct Replica<S: DocStore> {
     forgotten: usize,
     /// The live protocol `welcome` named (0 while the link isn't up).
     protocol: u32,
+    /// The caller's role in the space, as `welcome_space` named it (none while the link isn't up, and on protocol 2).
+    role: Option<SpaceRole>,
+    /// The space may not be changed by this account, whatever the connection said: the agent's list says viewer or archived
+    /// ([`Replica::set_read_only`]).
+    locked: bool,
+    /// The link is for a team space: only protocol 3 (`welcome_space`) is welcome ([`Replica::require_spaces`]).
+    needs_spaces: bool,
     /// What happened to documents of files since [`Replica::take_events`].
     events: Vec<DocEvent>,
     /// Counts opens, for which document was used least recently.
@@ -1345,6 +1358,9 @@ impl<S: DocStore> Replica<S> {
             fetches: Vec::new(),
             forgotten: 0,
             protocol: 0,
+            role: None,
+            locked: false,
+            needs_spaces: false,
             events: Vec::new(),
             uses: 0,
         })
@@ -1597,11 +1613,53 @@ impl<S: DocStore> Replica<S> {
         self.recover_waiting_doc(id, Kind::Recents(app), hash)
     }
 
-    /// A connection to the server is open: the first frame to send. The agent speaks live protocol 2 until it learns
-    /// team spaces (protocol 3): it asks for nothing newer, so the server never sends it `welcome_space`.
+    /// A connection to the server is open: the first frame to send. The agent speaks every live protocol it knows
+    /// (1 to 3); a server that knows 2 at most answers `welcome` for 2 and the agent goes on as before, one that knows 3
+    /// answers `welcome_space`.
     pub fn connected(&mut self) -> Vec<ClientFrame> {
         self.link = Link::Hello;
-        vec![ClientFrame::Hello { min: LIVE_PROTOCOL_MIN, max: LIVE_DOCUMENTS_PROTOCOL }]
+        vec![ClientFrame::Hello { min: LIVE_PROTOCOL_MIN, max: LIVE_PROTOCOL_MAX }]
+    }
+
+    /// The link is for a team space: a server that answers with `welcome` (protocol 2) can't serve it, and the link ends
+    /// with [`LinkError::Mismatch`] (tried again only after a long pause, as for any other protocol mismatch).
+    pub fn require_spaces(&mut self) {
+        self.needs_spaces = true;
+    }
+
+    /// The caller's role in the space, while the link is up on protocol 3.
+    pub fn role(&self) -> Option<SpaceRole> {
+        self.role
+    }
+
+    /// The agent's list says the account may not change the space (a viewer, or an archived space), or no longer says so.
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.locked = read_only;
+    }
+
+    /// Whether the account may not change the space: the agent's list says so, or the connection's role is viewer. Local
+    /// changes to its documents are refused, and nothing that writes is sent to the server ([`Replica::gate`]); what is
+    /// unacked stays in the journals.
+    pub fn read_only(&self) -> bool {
+        self.locked || self.role == Some(SpaceRole::Viewer)
+    }
+
+    /// `frames` without those that write (`create`, `update`, `snapshot`, `create_document`) while the space is read-only:
+    /// they are never sent. Their updates stay unacked in the journals and go up with the first connection of an account
+    /// that may write again.
+    pub fn gate(&self, frames: Vec<ClientFrame>) -> Vec<ClientFrame> {
+        if !self.read_only() {
+            return frames;
+        }
+        frames
+            .into_iter()
+            .filter(|f| {
+                !matches!(
+                    f,
+                    ClientFrame::Create { .. } | ClientFrame::Update { .. } | ClientFrame::Snapshot { .. } | ClientFrame::CreateDocument { .. }
+                )
+            })
+            .collect()
     }
 
     /// The connection ended: everything is subscribed and sent again on the next one. A document of a file still being
@@ -1610,6 +1668,7 @@ impl<S: DocStore> Replica<S> {
         self.link = Link::Down;
         self.epoch = None;
         self.protocol = 0;
+        self.role = None;
         let joining: Vec<DocId> = self.docs.iter().filter(|(_, d)| !d.joined).map(|(id, _)| *id).collect();
         for id in joining {
             self.docs.remove(&id);
@@ -2201,23 +2260,12 @@ impl<S: DocStore> Replica<S> {
 
     fn on_frame_inner(&mut self, frame: ServerFrame) -> Result<Vec<ClientFrame>, LinkError> {
         match frame {
-            ServerFrame::Welcome { protocol, epoch } => {
-                self.link = Link::Up;
-                self.epoch = Some(epoch);
-                self.protocol = protocol;
-                let documents = protocol >= LIVE_DOCUMENTS_PROTOCOL;
-                if !documents && self.docs.values().any(|d| d.kind.is_document()) {
-                    self.notes.push("live documents need a newer Craft Cloud server; their changes stay on this machine until it is updated".into());
+            ServerFrame::Welcome { protocol, epoch } => self.welcomed(protocol, epoch, None),
+            ServerFrame::WelcomeSpace { protocol, epoch, space, role } => {
+                if space != self.space {
+                    return Err(LinkError::Mismatch("the server opened another space than the one asked for".into()));
                 }
-                let mut frames = Vec::new();
-                for (id, doc) in &mut self.docs {
-                    // Documents of files only with a server that has them, and only those followed.
-                    if doc.kind.is_document() && (!documents || doc.parked || !doc.joined) {
-                        continue;
-                    }
-                    frames.extend(subscribe(*id, doc, Some(epoch)));
-                }
-                Ok(frames)
+                self.welcomed(protocol, epoch, Some(role))
             }
             ServerFrame::Created { .. } => Ok(Vec::new()),
             ServerFrame::Update { doc: id, seq, bytes, .. } => {
@@ -2252,6 +2300,30 @@ impl<S: DocStore> Replica<S> {
             ServerFrame::Ack { doc: id, client_seq, seq } => Ok(self.on_ack(id, client_seq, seq)),
             other => self.on_other(other),
         }
+    }
+
+    /// `welcome` or `welcome_space`: the link is up. Everything followed is subscribed.
+    fn welcomed(&mut self, protocol: u32, epoch: Epoch, role: Option<SpaceRole>) -> Result<Vec<ClientFrame>, LinkError> {
+        if self.needs_spaces && role.is_none() {
+            return Err(LinkError::Mismatch("this server does not offer live documents in team spaces; ask its administrator to update it".into()));
+        }
+        self.link = Link::Up;
+        self.epoch = Some(epoch);
+        self.protocol = protocol;
+        self.role = role;
+        let documents = protocol >= LIVE_DOCUMENTS_PROTOCOL;
+        if !documents && self.docs.values().any(|d| d.kind.is_document()) {
+            self.notes.push("live documents need a newer Craft Cloud server; their changes stay on this machine until it is updated".into());
+        }
+        let mut frames = Vec::new();
+        for (id, doc) in &mut self.docs {
+            // Documents of files only with a server that has them, and only those followed.
+            if doc.kind.is_document() && (!documents || doc.parked || !doc.joined) {
+                continue;
+            }
+            frames.extend(subscribe(*id, doc, Some(epoch)));
+        }
+        Ok(frames)
     }
 
     /// The snapshot `manifest` names, which the catch-up of `id` started with, downloaded (`Ok`), or not (`Err`: it
@@ -2523,8 +2595,14 @@ impl<S: DocStore> Replica<S> {
         match frame {
             ServerFrame::Welcome { .. } | ServerFrame::Update { .. } | ServerFrame::Subscribed { .. } | ServerFrame::Ack { .. } => Ok(Vec::new()),
             ServerFrame::Created { .. } => Ok(Vec::new()),
-            // Protocol 3 frames: this agent asks for protocol 2 only, so a server never sends them.
-            ServerFrame::WelcomeSpace { .. } | ServerFrame::PresenceFrom { .. } => Ok(Vec::new()),
+            // (Taken in `on_frame_inner`.)
+            ServerFrame::WelcomeSpace { .. } => Ok(Vec::new()),
+            ServerFrame::PresenceFrom { doc: id, bytes, user } => {
+                if self.docs.get(&id).is_some_and(|d| d.joined && d.kind.is_document()) {
+                    self.events.push(DocEvent::PresenceFrom(id, user, bytes));
+                }
+                Ok(Vec::new())
+            }
             ServerFrame::Error { code, message, doc, client_seq } => self.refused(&code, &message, doc, client_seq),
             ServerFrame::Compact { doc: id, upto } => {
                 let Some(doc) = self.docs.get_mut(&id) else { return Ok(Vec::new()) };
@@ -2554,10 +2632,20 @@ impl<S: DocStore> Replica<S> {
 
     /// A refused `create` or `subscribe` of a document of a file, where it differs from recents: `Some(frames)` when
     /// handled here.
-    fn refused_document(&mut self, id: DocId, code: &str, message: &str) -> Option<Vec<ClientFrame>> {
+    fn refused_document(&mut self, id: DocId, code: &str, message: &str, read_only: bool) -> Option<Vec<ClientFrame>> {
         let doc = self.docs.get_mut(&id).filter(|d| d.kind.is_document())?;
         let Kind::Document { node, app } = doc.kind.clone() else { return None };
         match (&doc.join, code) {
+            // The server doesn't have it and this account can't make it: the file opens as a plain file.
+            (Some(Join::Probing | Join::Following), codes::NOT_FOUND) if read_only => {
+                self.docs.remove(&id);
+                self.events.push(DocEvent::NotLive(
+                    id,
+                    NotLiveReason::Offline,
+                    "the document isn't live yet, and your role can't make it live".into(),
+                ));
+                Some(Vec::new())
+            }
             // The server doesn't have it: the app is asked for its import.
             (Some(Join::Probing | Join::Following), codes::NOT_FOUND) => {
                 doc.sub = Sub::No;
@@ -2585,7 +2673,7 @@ impl<S: DocStore> Replica<S> {
             // A joined document the server doesn't have (a restore from before it was made, or a reset): made again from
             // this machine's copy; nothing it holds is lost. If that is refused too (the file is gone on the server),
             // tried again after a growing pause.
-            (None, codes::NOT_FOUND) if !doc.creating => {
+            (None, codes::NOT_FOUND) if !doc.creating && !read_only => {
                 let upload = doc.body.copy().snapshot().map_err(|e| e.to_string()).and_then(|s| cut(id, &s));
                 let upload = match upload {
                     Ok(upload) => upload,
@@ -2664,9 +2752,27 @@ impl<S: DocStore> Replica<S> {
         if code == PROTOCOL_MISMATCH {
             return Err(LinkError::Mismatch(message.to_owned()));
         }
+        if code == ACCESS_CHANGED {
+            return Err(LinkError::AccessChanged(message.to_owned()));
+        }
+        // The server says this account may not write (the agent's list was behind): what it sent stays unacked, and the
+        // space is read-only from now on. (The agent's own guard keeps writes from being sent, so this is a late answer.)
+        if code == codes::READ_ONLY {
+            self.role = Some(SpaceRole::Viewer);
+            if let Some(doc) = doc.and_then(|id| self.docs.get_mut(&id)) {
+                if let Some(seq) = client_seq {
+                    doc.sent.remove(&seq);
+                } else {
+                    doc.sub = Sub::No;
+                    doc.creating = false;
+                }
+            }
+            return Ok(Vec::new());
+        }
         let epoch = self.epoch;
+        let read_only = self.read_only();
         if let (Some(id), None) = (doc, client_seq)
-            && let Some(frames) = self.refused_document(id, code, message)
+            && let Some(frames) = self.refused_document(id, code, message, read_only)
         {
             return Ok(frames);
         }
@@ -4385,6 +4491,108 @@ mod tests {
         r.on_frame(ServerFrame::Update { doc, seq: 3, bytes: good, device: device() }).unwrap();
         assert_eq!(r.entries(&app()).len(), 1, "the next good one applies");
         assert!(matches!(r.on_frame(ServerFrame::error(PROTOCOL_MISMATCH, "old", None, None)), Err(LinkError::Mismatch(_))));
+    }
+
+    fn welcome_space(space: SpaceId, role: SpaceRole) -> ServerFrame {
+        ServerFrame::WelcomeSpace { protocol: 3, epoch: epoch(1), space, role }
+    }
+
+    /// The agent says hello for every live protocol it knows; a server that knows 2 at most answers `welcome` and the link
+    /// goes on as before, one that knows 3 answers `welcome_space`.
+    #[test]
+    fn the_hello_names_every_live_protocol_and_both_welcomes_bring_the_link_up() {
+        let space = SpaceId::generate();
+        let mut r = Replica::open(MemStore::default(), space, peers()).unwrap();
+        assert!(matches!(r.connected().as_slice(), [ClientFrame::Hello { min, max }] if *min == LIVE_PROTOCOL_MIN && *max == LIVE_PROTOCOL_MAX));
+        assert_eq!(LIVE_PROTOCOL_MAX, 3);
+        // An older server: protocol 2 and a plain `welcome`.
+        r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }).unwrap();
+        assert_eq!((r.is_up(), r.role(), r.read_only()), (true, None, false));
+        r.disconnected();
+        // A newer one: `welcome_space` with the role (the personal space's is owner).
+        r.connected();
+        r.on_frame(welcome_space(space, SpaceRole::Owner)).unwrap();
+        assert_eq!((r.is_up(), r.role(), r.read_only()), (true, Some(SpaceRole::Owner), false));
+        r.disconnected();
+        assert_eq!(r.role(), None, "the role is the connection's");
+    }
+
+    /// A team space's link takes protocol 3 only: a plain `welcome` (a server that cannot serve the space) or another space's
+    /// `welcome_space` ends it as a mismatch, which is tried again only after a long pause.
+    #[test]
+    fn a_team_link_takes_welcome_space_for_its_own_space_only() {
+        let space = SpaceId::generate();
+        let mut r = Replica::open(MemStore::default(), space, peers()).unwrap();
+        r.require_spaces();
+        r.connected();
+        assert!(matches!(r.on_frame(ServerFrame::Welcome { protocol: 2, epoch: epoch(1) }), Err(LinkError::Mismatch(_))));
+        assert!(!r.is_up());
+        assert!(matches!(r.on_frame(welcome_space(SpaceId::generate(), SpaceRole::Editor)), Err(LinkError::Mismatch(_))));
+        assert!(!r.is_up());
+        r.on_frame(welcome_space(space, SpaceRole::Editor)).unwrap();
+        assert_eq!(r.role(), Some(SpaceRole::Editor));
+    }
+
+    /// A viewer's agent sends nothing that writes, and keeps what was unacked: an entry added while the role was editor stays
+    /// in the journal (waiting), goes up with the first connection of an account that may write again.
+    #[test]
+    fn a_viewer_sends_nothing_that_writes_and_keeps_what_was_unacked() {
+        let space = SpaceId::generate();
+        let mut r = Replica::open(MemStore::default(), space, peers()).unwrap();
+        r.require_spaces();
+        assert!(r.add(&app(), [1; 16], entry("a.txt", 1)).unwrap().is_empty(), "offline: nothing to send");
+        r.connected();
+        let frames = r.on_frame(welcome_space(space, SpaceRole::Viewer)).unwrap();
+        assert!(r.read_only());
+        let raw_writes = frames.iter().filter(|f| matches!(f, ClientFrame::Create { .. } | ClientFrame::Update { .. })).count();
+        assert!(raw_writes > 0, "the replica asks to create the list: {frames:?}");
+        let sent = r.gate(frames);
+        assert!(sent.iter().all(|f| !matches!(f, ClientFrame::Create { .. } | ClientFrame::Update { .. })), "{sent:?}");
+        assert!(sent.iter().any(|f| matches!(f, ClientFrame::Subscribe { .. })), "it still follows: {sent:?}");
+        assert_eq!(r.waiting(), 1, "the entry waits");
+        // The same link as an editor: nothing is held back, and the entry goes up.
+        r.disconnected();
+        r.connected();
+        let frames = r.on_frame(welcome_space(space, SpaceRole::Editor)).unwrap();
+        assert!(!r.read_only());
+        assert_eq!(r.gate(frames.clone()), frames);
+        // The list says viewer while the connection says editor: read-only all the same, and again not once the list is right.
+        r.set_read_only(true);
+        assert!(r.read_only());
+        assert!(r.gate(frames).iter().all(|f| !matches!(f, ClientFrame::Create { .. } | ClientFrame::Update { .. })));
+        r.set_read_only(false);
+        assert!(!r.read_only());
+    }
+
+    /// The server says the account's access changed: the link ends, to be made again at once. A late `read_only` answer does
+    /// not end it: the space is read-only from now on.
+    #[test]
+    fn access_changed_ends_the_link_and_read_only_makes_the_space_read_only() {
+        let space = SpaceId::generate();
+        let mut r = Replica::open(MemStore::default(), space, peers()).unwrap();
+        r.require_spaces();
+        r.connected();
+        r.on_frame(welcome_space(space, SpaceRole::Editor)).unwrap();
+        let answer = r.on_frame(ServerFrame::error(ACCESS_CHANGED, "your access to this space changed; connect again", None, None));
+        assert!(matches!(answer, Err(LinkError::AccessChanged(_))), "{answer:?}");
+        r.disconnected();
+        r.connected();
+        r.on_frame(welcome_space(space, SpaceRole::Editor)).unwrap();
+        assert!(r.on_frame(ServerFrame::error(codes::READ_ONLY, "no", None, None)).is_ok());
+        assert!(r.read_only() && r.is_up(), "the link stays");
+    }
+
+    /// Presence with the sending account is handed to the apps with it; a server on protocol 2 sends plain presence.
+    #[test]
+    fn presence_from_names_the_account_for_the_apps() {
+        let space = SpaceId::generate();
+        let mut r = Replica::open(MemStore::default(), space, peers()).unwrap();
+        r.connected();
+        r.on_frame(welcome_space(space, SpaceRole::Owner)).unwrap();
+        let user = uuid::Uuid::from_bytes([4; 16]);
+        // (Only a document of a file that is joined here has apps; a stray one is no news.)
+        r.on_frame(ServerFrame::PresenceFrom { doc: DocId::generate(), bytes: b"x".to_vec(), user }).unwrap();
+        assert!(r.take_events().is_empty());
     }
 
     /// A journal reads up to its first record that doesn't (one a crash cut off: never acked to the app).

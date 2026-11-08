@@ -430,14 +430,21 @@ impl Client {
     /// Adds a file to `app`'s recent files (kept on this machine's disk when this returns; on the others once the agent
     /// reaches the server).
     pub fn add_recent(&self, app: &str, entry: NewRecent) -> Result<RecentEntry, Error> {
-        RecentsWatch::open(self, app, false)?.add(entry)
+        RecentsWatch::open(self, app, None, false)?.add(entry)
     }
 
     /// Follows `app`'s recent files: the list now ([`RecentsWatch::entries`]), and a [`RecentsEvent`] after every change,
     /// from this machine or another, and when the agent goes away or comes back. The connection is held by a thread of
     /// its own, until the watch is dropped. `NotRunning` if no agent runs right now.
     pub fn watch_recents(&self, app: &str) -> Result<RecentsWatch, Error> {
-        RecentsWatch::open(self, app, true)
+        RecentsWatch::open(self, app, None, true)
+    }
+
+    /// [`Client::watch_recents`] for the recent files of a team space that syncs on this computer (an agent from before
+    /// team spaces answers the personal list). An entry added with an absolute path inside the space's synced folder
+    /// ([`Client::add_recent`]) goes to this list.
+    pub fn watch_recents_in(&self, app: &str, space: craft_cloud_api::SpaceId) -> Result<RecentsWatch, Error> {
+        RecentsWatch::open(self, app, Some(space), true)
     }
 
     /// A connection for live documents ([`live::Documents::open`]): files of the synced folder opened by path, their

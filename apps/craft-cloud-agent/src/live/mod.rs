@@ -13,7 +13,9 @@
 //! - [`docs`]: the local API's documents WebSocket.
 //!
 //! The local API's recents WebSocket ([`recents_socket`]) is a client of the hub like any other: an app subscribes
-//! to its list (the whole list comes now and after every change) and adds entries (answered once they are on disk).
+//! to its list (the whole list comes now and after every change) and adds entries (answered once they are on disk). A
+//! `subscribe` may name a team space that syncs on this computer: its list comes from that space's own hub. An `add` whose
+//! path is an absolute path inside a synced team folder goes to that space's list, kept relative to the folder.
 
 pub mod app_blobs;
 pub mod blobs;
@@ -33,12 +35,13 @@ use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use craft_cloud_proto::SpaceId;
 use craft_cloud_proto::api::codes as api_codes;
 use craft_cloud_proto::live::AppName;
 use craft_cloud_proto::local::{MAX_LOCAL_JSON_BYTES, RecentsEvent, RecentsRequest, codes};
 use tokio::sync::mpsc;
 
-pub use hub::{Hub, HubConfig, HubError, HubHandle};
+pub use hub::{Hub, HubConfig, HubError, HubHandle, TeamHub};
 
 use crate::local_api::{ApiState, LocalError};
 
@@ -58,7 +61,15 @@ pub async fn recents_socket(State(api): State<Arc<ApiState>>, upgrade: Result<We
     let Some(hub) = api.control.hub() else {
         return LocalError::new(StatusCode::CONFLICT, codes::NOT_SIGNED_IN, "not signed in: sign in first").into_response();
     };
-    upgrade.max_message_size(MAX_LOCAL_JSON_BYTES).max_frame_size(MAX_LOCAL_JSON_BYTES).on_upgrade(move |socket| serve(socket, hub))
+    upgrade.max_message_size(MAX_LOCAL_JSON_BYTES).max_frame_size(MAX_LOCAL_JSON_BYTES).on_upgrade(move |socket| serve(socket, hub, api))
+}
+
+/// The folder-relative path of an absolute `path` inside `folder`, `/`-separated (`None` for any other path).
+fn inside(folder: &std::path::Path, path: &str) -> Option<String> {
+    let given = std::path::Path::new(path);
+    let rest = given.is_absolute().then(|| given.strip_prefix(folder).ok()).flatten()?;
+    let names: Option<Vec<&str>> = rest.components().map(|c| c.as_os_str().to_str()).collect();
+    Some(names?.join("/"))
 }
 
 fn error(id: Option<u64>, e: &HubError) -> RecentsEvent {
@@ -71,7 +82,7 @@ fn error(id: Option<u64>, e: &HubError) -> RecentsEvent {
 }
 
 /// One app's connection: requests in, lists and answers out, until either side goes (or the hub stops: signed out).
-async fn serve(mut socket: WebSocket, hub: HubHandle) {
+async fn serve(mut socket: WebSocket, hub: HubHandle, api: Arc<ApiState>) {
     let (out, mut queue) = mpsc::channel::<Option<RecentsEvent>>(QUEUE);
     loop {
         tokio::select! {
@@ -84,9 +95,15 @@ async fn serve(mut socket: WebSocket, hub: HubHandle) {
                 };
                 let event = match request {
                     Err(e) => Some(RecentsEvent::Error { id: None, code: api_codes::INVALID.into(), message: format!("not a recents request: {e}") }),
-                    Ok(RecentsRequest::Subscribe { app }) => match AppName::new(&app) {
+                    Ok(RecentsRequest::Subscribe { app, space }) => match AppName::new(&app) {
                         Err(e) => Some(RecentsEvent::Error { id: None, code: api_codes::INVALID.into(), message: e.to_string() }),
-                        Ok(name) => match hub.follow(name).await {
+                        // A team space's list comes from that space's own hub, which must sync on this computer.
+                        Ok(_) if space.is_some_and(|space| api.control.team_hub(space).is_none()) => Some(RecentsEvent::Error {
+                            id: None,
+                            code: api_codes::NOT_FOUND.into(),
+                            message: "that space doesn't sync on this computer".into(),
+                        }),
+                        Ok(name) => match team_or_personal(&api, &hub, space).follow(name).await {
                             Err(e) => Some(error(None, &e)),
                             Ok(mut list) => {
                                 let out = out.clone();
@@ -94,7 +111,8 @@ async fn serve(mut socket: WebSocket, hub: HubHandle) {
                                 tokio::spawn(async move {
                                     loop {
                                         let listing = list.borrow_and_update().clone();
-                                        let event = RecentsEvent::Entries { app: app.clone(), entries: listing.entries, push_stopped: listing.push_stopped };
+                                        let event =
+                                            RecentsEvent::Entries { app: app.clone(), entries: listing.entries, push_stopped: listing.push_stopped, space };
                                         if out.send(Some(event)).await.is_err() {
                                             return;
                                         }
@@ -108,12 +126,25 @@ async fn serve(mut socket: WebSocket, hub: HubHandle) {
                             }
                         },
                     },
-                    Ok(RecentsRequest::Add { id, app, entry }) => match AppName::new(&app) {
+                    Ok(RecentsRequest::Add { id, app, mut entry }) => match AppName::new(&app) {
                         Err(e) => Some(RecentsEvent::Error { id: Some(id), code: api_codes::INVALID.into(), message: e.to_string() }),
-                        Ok(name) => Some(match hub.add(name, entry).await {
-                            Ok(entry) => RecentsEvent::Added { id, entry },
-                            Err(e) => error(Some(id), &e),
-                        }),
+                        Ok(name) => {
+                            // An absolute path inside a synced team folder is that space's entry, kept relative to the folder.
+                            let team = api.control.route_path(&entry.path);
+                            let target = match &team {
+                                Some(team) => {
+                                    if let Some(relative) = inside(&team.folder, &entry.path) {
+                                        entry.path = relative;
+                                    }
+                                    team.handle.clone()
+                                }
+                                None => hub.clone(),
+                            };
+                            Some(match target.add(name, entry).await {
+                                Ok(entry) => RecentsEvent::Added { id, entry },
+                                Err(e) => error(Some(id), &e),
+                            })
+                        }
                     },
                 };
                 // Sent here, before the next request is read: never put on the queue only this loop drains (it would
@@ -139,6 +170,11 @@ async fn serve(mut socket: WebSocket, hub: HubHandle) {
         }
     }
     let _ = socket.send(Message::Close(None)).await;
+}
+
+/// The hub of team space `space` (it syncs here: checked by the caller), or the personal hub.
+fn team_or_personal(api: &ApiState, personal: &HubHandle, space: Option<SpaceId>) -> HubHandle {
+    space.and_then(|space| api.control.team_hub(space)).map_or_else(|| personal.clone(), |team| team.handle)
 }
 
 /// Sends one event within [`SEND_TIMEOUT`]; false when the connection is done (or the client too slow to read).

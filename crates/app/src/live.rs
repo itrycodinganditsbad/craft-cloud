@@ -42,16 +42,16 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use craft_cloud_api::DocId;
 use craft_cloud_api::api::ErrorAnswer as ErrorBody;
-use craft_cloud_api::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, STATE, UPDATE, decode_binary, encode_binary};
+use craft_cloud_api::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, PRESENCE_FROM, STATE, UPDATE, USER_BYTES, decode_binary, encode_binary};
 use craft_cloud_api::local::{DocState, DocsEvent, DocsRequest, MAX_LOCAL_JSON_BYTES, paths};
+use craft_cloud_api::{DocId, SpaceId};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::HandshakeError;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 
-pub use craft_cloud_api::local::NotLiveReason;
+pub use craft_cloud_api::local::{DocMember, NotLiveReason};
 
 use crate::http::CONNECT_TIMEOUT;
 use crate::{Client, Error};
@@ -74,6 +74,13 @@ pub enum Event {
     Update(Vec<u8>),
     /// Another machine's or app's presence (Loro's ephemeral state), as it was sent.
     Presence(Vec<u8>),
+    /// Another account's, or this account's other machine's, presence with the account that sent it (the server's word,
+    /// whatever the bytes say). Only for a document opened with [`OpenOptions::identity`]; without it the presence comes as
+    /// [`Event::Presence`].
+    PresenceFrom { user: uuid::Uuid, bytes: Vec<u8> },
+    /// Who is in the document's space (the active members, with their palette colours), sent after the open and whenever the
+    /// list changes. Only for a document opened with [`OpenOptions::identity`].
+    Members(Vec<DocMember>),
     /// This app's change number `seq` ([`Document::send`]'s answer) is on the agent's disk.
     Acked(u64),
     /// This app's change number `seq` was refused: the agent's copy doesn't have it. `code` says whether sending it
@@ -108,6 +115,9 @@ pub struct OpenOptions {
     /// The BLAKE3 hash of the file's bytes as the app read them: [`Document::changed_outside`] says whether a Craft
     /// app saved them.
     pub file_hash: Option<[u8; 32]>,
+    /// Ask who is there: other accounts' presence comes as [`Event::PresenceFrom`] and the list of the space's members as
+    /// [`Event::Members`]. An agent from before team spaces ignores it and sends [`Event::Presence`] only.
+    pub identity: bool,
 }
 
 /// What `opened` says, before its state comes.
@@ -116,6 +126,8 @@ struct Head {
     doc: DocId,
     state: DocState,
     changed_outside: Option<bool>,
+    read_only: bool,
+    space: Option<SpaceId>,
 }
 
 /// An open's state so far: what `opened` said, the snapshot, and the updates that are part of it.
@@ -195,9 +207,10 @@ impl Shared {
     fn on_message(&self, message: Message) {
         match message {
             Message::Text(text) => match serde_json::from_str::<DocsEvent>(text.as_str()) {
-                Ok(DocsEvent::Opened { id, doc, state, changed_outside }) => {
-                    lock(&self.opening).insert(id, Head { doc, state, changed_outside });
+                Ok(DocsEvent::Opened { id, doc, state, changed_outside, read_only, space }) => {
+                    lock(&self.opening).insert(id, Head { doc, state, changed_outside, read_only, space });
                 }
+                Ok(DocsEvent::Members { id, members }) => self.route(id, Event::Members(members)),
                 Ok(DocsEvent::NeedsImport { id }) => self.answer(id, Answer::NeedsImport),
                 Ok(DocsEvent::NotLive { id, reason, .. }) => self.answer(id, Answer::NotLive(reason)),
                 Ok(DocsEvent::Ack { id, seq }) => self.route(id, Event::Acked(seq)),
@@ -249,6 +262,14 @@ impl Shared {
                         self.route(id, Event::Update(body.to_vec()));
                     }
                     PRESENCE => self.route(id, Event::Presence(body.to_vec())),
+                    PRESENCE_FROM => {
+                        // `[16 bytes account ID][the app's bytes]`.
+                        if let Some((user, bytes)) = body.split_at_checked(USER_BYTES)
+                            && let Ok(user) = <[u8; USER_BYTES]>::try_from(user)
+                        {
+                            self.route(id, Event::PresenceFrom { user: uuid::Uuid::from_bytes(user), bytes: bytes.to_vec() });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -367,7 +388,7 @@ impl Documents {
         let (events_tx, events) = mpsc::channel();
         lock(&self.shared.routes).insert(id, events_tx);
         let file_hash = options.file_hash.map(|h| h.iter().map(|b| format!("{b:02x}")).collect());
-        let request = DocsRequest::Open { id, path: path.to_owned(), app: app.to_owned(), file_hash };
+        let request = DocsRequest::Open { id, path: path.to_owned(), app: app.to_owned(), file_hash, identity: options.identity };
         let answer = self.ask(id, || self.shared.send_json(&request));
         self.opened(id, answer, events)
     }
@@ -501,6 +522,18 @@ impl Document {
         self.head.doc
     }
 
+    /// The account may not change this document (a viewer of its team space, or the space is archived): the agent refuses
+    /// its changes with `read_only` ([`Event::Refused`]) and keeps its copy as it is. As of the open; an agent from before
+    /// team spaces never says it.
+    pub fn read_only(&self) -> bool {
+        self.head.read_only
+    }
+
+    /// The space the document belongs to (the personal space's or a team space's); none from an older agent.
+    pub fn space(&self) -> Option<SpaceId> {
+        self.head.space
+    }
+
     /// For an open that named the file's hash ([`OpenOptions::file_hash`]): whether no Craft app's save of this
     /// document has that content (the file was edited outside Craft). None: the agent can't tell (or is older).
     pub fn changed_outside(&self) -> Option<bool> {
@@ -618,6 +651,8 @@ mod tests {
             doc: DocId::generate(),
             state: DocState { online: true, waiting: 0, bytes: 1, updates: 2 },
             changed_outside: None,
+            read_only: false,
+            space: None,
         };
         shared.on_message(Message::Text(serde_json::to_string(&opened).unwrap().into()));
         shared.on_message(Message::Binary(encode_binary(STATE, 5, b"s").into()));
@@ -640,14 +675,21 @@ mod tests {
         let (events_tx, events) = mpsc::channel();
         lock(&shared.routes).insert(4, events_tx);
         let doc = DocId::generate();
-        let opened =
-            DocsEvent::Opened { id: 4, doc, state: DocState { online: true, waiting: 0, bytes: 3, updates: 0 }, changed_outside: Some(true) };
+        let opened = DocsEvent::Opened {
+            id: 4,
+            doc,
+            state: DocState { online: true, waiting: 0, bytes: 3, updates: 0 },
+            changed_outside: Some(true),
+            read_only: true,
+            space: None,
+        };
         shared.on_message(Message::Text(serde_json::to_string(&opened).unwrap().into()));
         assert!(answer.try_recv().is_err(), "not before the state");
         shared.on_message(Message::Binary(encode_binary(STATE, 4, b"abc").into()));
         let Ok(Answer::Live { snapshot, head, .. }) = answer.try_recv() else { panic!("no answer") };
         assert_eq!(snapshot, b"abc");
         assert_eq!(head.changed_outside, Some(true));
+        assert!(head.read_only);
         shared.on_message(Message::Binary(encode_binary(UPDATE, 4, b"u").into()));
         let status = DocsEvent::Status { doc, online: false, waiting: 2, deleted: true, stopped: true };
         shared.on_message(Message::Text(serde_json::to_string(&status).unwrap().into()));
