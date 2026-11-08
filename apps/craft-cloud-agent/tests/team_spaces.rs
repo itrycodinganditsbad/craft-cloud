@@ -1492,3 +1492,31 @@ async fn the_members_usage_name_and_leaving_of_a_space_and_the_admin_calls_are_p
     assert_eq!(info.sync, SpaceSync::On, "{info:?}");
     assert!(t.ana.space_state(space).is_some(), "the saved state was not forgotten");
 }
+
+/// A refused upload is the server's answer, not a network error. The server decides from the headers (an oversized chunk) and
+/// answers before the client has finished sending the body; it reads the rest and drops it first, so the client sees the answer
+/// and not a reset connection (which Windows reports before the answer can be read).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_oversized_chunk_is_the_servers_answer_and_not_a_network_error() {
+    let world = world().await;
+    let ben = Person::signed_in(&world.url, "ben").await;
+    let account = ben.data.load_account().unwrap().unwrap();
+    let transport = HttpTransport::new(ServerUrl::parse(&world.url).unwrap(), &account.token).unwrap();
+    let big = vec![7u8; 4 * 1024 * 1024 + 1];
+    let id = craft_cloud_proto::ChunkId::from_bytes(*blake3::hash(&big).as_bytes());
+    // Several at once, many times over: the race is between the client's writing and the server's answer.
+    let body = bytes::Bytes::from(big);
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let (transport, body) = (transport.clone(), body.clone());
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..25 {
+                let refused = transport.put_chunk(&id, body.clone()).await.unwrap_err();
+                assert!(refused.to_string().contains("over the size limit"), "{refused}");
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+}

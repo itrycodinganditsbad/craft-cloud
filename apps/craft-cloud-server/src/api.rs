@@ -364,6 +364,33 @@ pub(crate) async fn read_json<T: serde::de::DeserializeOwned>(state: &AppState, 
     }
 }
 
+/// The most of a refused upload's body that is read and thrown away before the refusal is answered: the biggest manifest and
+/// a megabyte over it, so a body just over a route's limit is taken whole.
+const DRAIN_BYTES: usize = MAX_MANIFEST_BYTES + 1024 * 1024;
+/// The longest that takes.
+const DRAIN_TIME: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Answers a refusal that was decided by the request's headers, before its body was read. A client that is still sending the
+/// body when the server answers and closes sees the connection reset (on Windows before it has read the answer), so the
+/// server's `413` or `507` would arrive as a network error. The rest of the body is therefore read and dropped first, up to
+/// [`DRAIN_BYTES`] and [`DRAIN_TIME`]: a body that is a little over the limit gets its answer; one that is hugely over it, or
+/// slow, is cut off when the bound is reached (the body slot is held meanwhile, as for any upload).
+async fn refuse(request: Request, error: ApiError) -> ApiError {
+    use futures_util::StreamExt;
+    let mut body = request.into_body().into_data_stream();
+    let drain = async {
+        let mut seen = 0usize;
+        while let Some(Ok(piece)) = body.next().await {
+            seen = seen.saturating_add(piece.len());
+            if seen >= DRAIN_BYTES {
+                break;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(DRAIN_TIME, drain).await;
+    error
+}
+
 /// The body size a request declares (`Content-Length`), 0 when it declares none.
 fn declared_len(request: &Request) -> u64 {
     request.headers().get(axum::http::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0)
@@ -395,13 +422,13 @@ async fn put_chunk(
     // A body over the route's limit is refused before anything else is asked of the server, by what the request declares.
     let declared = declared_len(&request);
     if declared > u64::from(MAX_CHUNK_BYTES) {
-        return Err(ApiError::too_large("the chunk is over the size limit"));
+        return Err(refuse(request, ApiError::too_large("the chunk is over the size limit")).await);
     }
     // A chunk the space already has costs the server nothing (as for `check_room`), so a full server still takes it.
     let known = state.meta.missing_chunks(access.space, &[id]).await?.is_empty();
     // A full server says so before the body is read, by what the request declares, and again with the real size.
-    if !known {
-        state.check_server_room(declared).await?;
+    if !known && let Err(e) = state.check_server_room(declared).await {
+        return Err(refuse(request, e).await);
     }
     let body = read_body(&state, request, MAX_CHUNK_BYTES as usize).await?;
     if body.is_empty() {
@@ -451,12 +478,12 @@ async fn put_manifest(
     let _body = state.bodies.acquire(auth.user).await?;
     let declared = declared_len(&request);
     if declared > MAX_MANIFEST_BYTES as u64 {
-        return Err(ApiError::too_large("the manifest is over the size limit"));
+        return Err(refuse(request, ApiError::too_large("the manifest is over the size limit")).await);
     }
     // A manifest the space already has costs the server nothing, so a full server still takes it again.
     let known = state.meta.has_manifest(access.space, &id).await?;
-    if !known {
-        state.check_server_room(declared).await?;
+    if !known && let Err(e) = state.check_server_room(declared).await {
+        return Err(refuse(request, e).await);
     }
     let body = read_body(&state, request, MAX_MANIFEST_BYTES).await?;
     let _work = state.manifests.acquire(auth.user).await?;
