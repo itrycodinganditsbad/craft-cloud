@@ -74,10 +74,20 @@ pub struct ChunkRef {
 pub trait BlobStore: Send + Sync {
     fn put(&self, bytes: &[u8]) -> Result<ChunkRef, KitError>;
     fn get(&self, chunk: &ChunkRef) -> Result<Arc<[u8]>, KitError>;
+
+    /// Whether this store keeps blobs in the space of one document's file: `Some(true)` when it is bound to a file
+    /// ([`AgentBlobs`] built by [`crate::Session::blobs`], or from [`craft_cloud_app::blobs::Blobs::for_path`]),
+    /// `Some(false)` when it is the agent's but not bound (it keeps blobs in the personal space), `None` for a store that
+    /// has no space (memory). [`crate::Session::check_blobs`] warns about a team document's unbound store.
+    fn space_bound(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// The agent's blob store, through `craft-cloud-app`. An agent too old for blobs answers [`KitError::Agent`] with
-/// `agent_too_old` in the message.
+/// `agent_too_old` in the message. For the documents of a team space build it with [`crate::Session::blobs`] (or
+/// `AgentBlobs(client.blobs().for_path(path))`), so its blobs go to the document's space, where every member gets them
+/// back; an unbound store keeps them in the personal space.
 #[derive(Debug, Clone)]
 pub struct AgentBlobs(pub craft_cloud_app::blobs::Blobs);
 
@@ -89,6 +99,10 @@ impl BlobStore for AgentBlobs {
 
     fn get(&self, chunk: &ChunkRef) -> Result<Arc<[u8]>, KitError> {
         Ok(self.0.get(&chunk.hash, chunk.len).map_err(agent_error)?.into())
+    }
+
+    fn space_bound(&self) -> Option<bool> {
+        Some(self.0.bound_path().is_some())
     }
 }
 
