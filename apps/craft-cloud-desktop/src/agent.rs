@@ -39,6 +39,8 @@ pub trait Agent: Send + Sync {
     fn devices(&self) -> Result<Vec<DeviceInfo>, Error>;
     fn usage(&self) -> Result<AccountUsage, Error>;
     fn remove_device(&self, id: DeviceId) -> Result<Vec<DeviceInfo>, Error>;
+    /// Gives one of the account's computers a new name; answers with it as the server has it now.
+    fn rename_device(&self, id: DeviceId, name: &str) -> Result<DeviceInfo, Error>;
     fn pause(&self) -> Result<Status, Error>;
     fn resume(&self) -> Result<Status, Error>;
     fn quit(&self) -> Result<Status, Error>;
@@ -150,6 +152,9 @@ impl Agent for ClientAgent {
     }
     fn remove_device(&self, id: DeviceId) -> Result<Vec<DeviceInfo>, Error> {
         self.with(|c| c.remove_device(id))
+    }
+    fn rename_device(&self, id: DeviceId, name: &str) -> Result<DeviceInfo, Error> {
+        self.with(|c| c.rename_device(id, name))
     }
     fn pause(&self) -> Result<Status, Error> {
         self.with(Client::pause)
@@ -365,6 +370,7 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
         Effect::Devices => Event::Devices(agent.devices()),
         Effect::Usage(request_id) => Event::Usage { request_id, result: agent.usage() },
         Effect::RemoveDevice(id) => Event::Devices(agent.remove_device(id)),
+        Effect::RenameDevice { id, name, ticket } => Event::Renamed(id, ticket, agent.rename_device(id, &name)),
         Effect::History { path, cursor, ticket } => Event::History { ticket, result: agent.file_history(&path, cursor.as_deref()) },
         Effect::Restore { path, version, expected_version, ticket } => {
             Event::Restored { ticket, result: agent.restore_file(&path, version, expected_version) }
@@ -410,6 +416,7 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
             SecurityCall::RecoveryCodes { password, code } => SecurityAnswer::RecoveryCodes(agent.two_factor_recovery_codes(&password, &code)),
             SecurityCall::ChangePassword { current, new } => SecurityAnswer::ChangePassword(agent.change_password(&current, &new)),
             SecurityCall::SignOutOthers => SecurityAnswer::SignOutOthers(agent.revoke_other_devices()),
+            SecurityCall::Activity => SecurityAnswer::Activity(agent.account_activity(&crate::security::activity_query())),
         }),
         Effect::OpenFolder(_)
         | Effect::OpenFile(_)
@@ -563,6 +570,11 @@ pub(crate) mod fake {
         /// The recent files of each app (by the name of its list), and the apps whose list is refused.
         pub recent_files: Mutex<Vec<(String, Vec<RecentEntry>)>>,
         pub recents_refused: Mutex<Vec<String>>,
+        /// The computers `devices` lists, and what `rename_device` changes in them.
+        pub devices: Mutex<Vec<DeviceInfo>>,
+        /// The (computer, name) of each rename asked for, and failures a rename answers instead of succeeding (from the end).
+        pub renames: Mutex<Vec<(DeviceId, String)>>,
+        pub rename_fails: Mutex<Vec<Error>>,
     }
 
     fn refused(code: &str, message: &str) -> Error {
@@ -591,6 +603,9 @@ pub(crate) mod fake {
                 export_fails: Mutex::new(Vec::new()),
                 recent_files: Mutex::new(Vec::new()),
                 recents_refused: Mutex::new(Vec::new()),
+                devices: Mutex::new(Vec::new()),
+                renames: Mutex::new(Vec::new()),
+                rename_fails: Mutex::new(Vec::new()),
             }
         }
 
@@ -731,7 +746,8 @@ pub(crate) mod fake {
             self.answer("cancel_pairing", |_| ())
         }
         fn devices(&self) -> Result<Vec<DeviceInfo>, Error> {
-            self.answer("devices", |_| Vec::new())
+            self.answer("devices", |_| ())?;
+            Ok(self.devices.lock().unwrap().clone())
         }
         fn usage(&self) -> Result<AccountUsage, Error> {
             self.answer("usage", |_| ())?;
@@ -748,6 +764,19 @@ pub(crate) mod fake {
         }
         fn remove_device(&self, _id: DeviceId) -> Result<Vec<DeviceInfo>, Error> {
             self.answer("remove_device", |_| Vec::new())
+        }
+        fn rename_device(&self, id: DeviceId, name: &str) -> Result<DeviceInfo, Error> {
+            self.answer("rename_device", |_| ())?;
+            self.renames.lock().unwrap().push((id, name.to_owned()));
+            if let Some(e) = self.rename_fails.lock().unwrap().pop() {
+                return Err(e);
+            }
+            let mut devices = self.devices.lock().unwrap();
+            let Some(device) = devices.iter_mut().find(|d| d.id == id && !d.revoked) else {
+                return Err(refused("not_found", "no such computer in this cloud"));
+            };
+            device.name = name.to_owned();
+            Ok(device.clone())
         }
         fn pause(&self) -> Result<Status, Error> {
             self.answer("pause", Status::clone)
@@ -766,7 +795,7 @@ pub(crate) mod fake {
             let f = self.factor.lock().unwrap();
             Ok(TwoFactorStatus {
                 enabled: f.enabled,
-                enabled_ms: f.enabled.then_some(1_000),
+                enabled_ms: f.enabled.then_some(1_789_900_000_000),
                 recovery_codes_left: if f.enabled { 10 } else { 0 },
                 pending: f.pending,
             })

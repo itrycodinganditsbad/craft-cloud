@@ -721,7 +721,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                 }
             }
         };
-        let (Some(account), Some(transport)) = (saved, transport) else {
+        let (Some(mut account), Some(transport)) = (saved, transport) else {
             control.set_account(None);
             status.forget_passes();
             say(out, &format!("not signed in: waiting for a sign-in ({})", crate::cli::SIGN_IN_HINT));
@@ -1008,6 +1008,26 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                             }
                         }
                     }
+                    // This computer renamed on the server: the saved account, the status and the hub follow. The passes read
+                    // the saved account, so the next one uses the new name too.
+                    Some(Command::RenameDevice(id, name, reply)) => {
+                        if id == account.device && name != account.device_name {
+                            let mut renamed = account.clone();
+                            renamed.device_name = name;
+                            match data.save_account(&renamed) {
+                                Ok(()) => {
+                                    account = renamed;
+                                    control.set_account(Some(&account));
+                                    if let Some(hub) = &hub {
+                                        hub.handle().set_machine(account.device_name.clone()).await;
+                                    }
+                                    say(out, &format!("this computer is now called {}", account.device_name));
+                                }
+                                Err(e) => say(out, &format!("the new name of this computer couldn't be saved here: {e}")),
+                            }
+                        }
+                        let _ = reply.send(Ok(()));
+                    }
                     Some(Command::Pause(reply)) => {
                         if !user_paused {
                             user_paused = true;
@@ -1181,6 +1201,9 @@ async fn wait_needing_you(
                 Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::LoginSecondFactor(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
                     let _ = reply.send(Err(AgentError::NeedsYou(reason.to_owned())));
                 }
+                Some(Command::RenameDevice(_, _, reply)) => {
+                    let _ = reply.send(Ok(()));
+                }
                 Some(Command::Quit(reply)) => {
                     let _ = reply.send(Ok(()));
                     return Stuck::Stop;
@@ -1259,6 +1282,9 @@ async fn wait_for_sign_in(
                 }
                 Some(Command::Logout(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
                     let _ = reply.send(Err(AgentError::NotSignedIn));
+                }
+                Some(Command::RenameDevice(_, _, reply)) => {
+                    let _ = reply.send(Ok(()));
                 }
                 Some(Command::Quit(reply)) => {
                     let _ = reply.send(Ok(()));

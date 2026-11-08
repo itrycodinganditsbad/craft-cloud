@@ -62,7 +62,7 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, now_ms: i64) -> Vec<Event> {
                 Screen::Joining { form, .. } => join::form(ui, form, true, &mut events),
                 Screen::PasswordNeeded(pw) => join::password(ui, pw, &mut events),
                 Screen::SecondFactor(form) => second_factor::show(ui, form, &mut events),
-                Screen::Security(page) => security::show(ui, page, &mut events),
+                Screen::Security(page) => security::show(ui, page, now_ms, &mut events),
                 Screen::SignedIn(o) => overview::show(ui, o, busy, now_ms, autostart_problem.as_deref(), &mut events),
                 Screen::AddingComputer(adding) => add_computer::show(ui, adding, now_ms, &mut events),
                 Screen::Admin(a) => admin::show(ui, a, now_ms, &mut events),

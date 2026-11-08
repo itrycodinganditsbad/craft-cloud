@@ -155,7 +155,7 @@ fn filters(ui: &mut egui::Ui, trash: &Trash, events: &mut Vec<Event>) {
     });
 }
 
-fn date(timestamp_ms: i64) -> String {
+pub(super) fn date(timestamp_ms: i64) -> String {
     let days = timestamp_ms.div_euclid(86_400_000) + 719_468;
     let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
     let day_of_era = days - era * 146_097;

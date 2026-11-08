@@ -7,7 +7,9 @@
 //! and cleared, the secret and the recovery codes live in the page's step only, and leaving the page (or a signed-out or
 //! removed screen) drops them. Every type that holds one hides it in `Debug`.
 
-use craft_cloud_app::{Error, RecoveryCodes, RevokedOthers, TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, codes};
+use craft_cloud_app::{
+    AuditEvent, AuditPage, AuditQuery, Error, RecoveryCodes, RevokedOthers, TwoFactorProofRequest, TwoFactorSetupResponse, TwoFactorStatus, codes,
+};
 use craft_cloud_proto::api::codes as api_codes;
 
 use crate::model::Overview;
@@ -51,8 +53,6 @@ pub enum Step {
     Disable { password: String, code: String, recovery: bool },
     /// New recovery codes: the password and a code.
     Regenerate { password: String, code: String },
-    /// A new password: the current one, the new one twice.
-    Password { current: String, new: String, again: String },
     /// Signing the other computers out: asked once more.
     SignOutOthers,
 }
@@ -67,10 +67,54 @@ impl std::fmt::Debug for Step {
             Step::Codes { .. } => "Codes(<redacted>)",
             Step::Disable { .. } => "Disable(<redacted>)",
             Step::Regenerate { .. } => "Regenerate(<redacted>)",
-            Step::Password { .. } => "Password(<redacted>)",
             Step::SignOutOthers => "SignOutOthers",
         })
     }
+}
+
+/// The three fields of the password form in the page's Password cell: the current password, the new one twice. Nothing of
+/// what is typed shows in `Debug`.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct PasswordFields {
+    pub current: String,
+    pub new: String,
+    pub again: String,
+}
+
+impl std::fmt::Debug for PasswordFields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PasswordFields(<redacted>)")
+    }
+}
+
+impl PasswordFields {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// How many of the newest security events the page lists.
+pub const SECURITY_ACTIVITY_ROWS: usize = 5;
+
+/// How many of the account's newest events are asked for, to find [`SECURITY_ACTIVITY_ROWS`] security-relevant ones among
+/// them (the account's activity is capped at 100 a page).
+const ACTIVITY_ASKED: u32 = 100;
+
+/// Whether an event of the account's activity is about signing in or the account's security: sign-ins (and the refused
+/// ones), the password, two-factor sign-in and its recovery codes, and computers signed out.
+pub fn is_security_action(action: &str) -> bool {
+    action.starts_with("auth.") || action.starts_with("account.") || matches!(action, "device.revoked" | "device.revoked_others")
+}
+
+/// The page's list of the account's newest security events.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SecurityActivity {
+    /// Asked for, not answered yet.
+    Loading,
+    /// The newest security events, newest first (at most [`SECURITY_ACTIVITY_ROWS`]).
+    Loaded(Vec<AuditEvent>),
+    /// The server couldn't tell (the message).
+    Failed(String),
 }
 
 /// The Security page.
@@ -80,6 +124,10 @@ pub struct SecurityPage {
     pub overview: Overview,
     pub info: TwoFactorInfo,
     pub step: Step,
+    /// What the password form of the Password cell holds.
+    pub password: PasswordFields,
+    /// The newest security events of the account.
+    pub activity: SecurityActivity,
     /// What went wrong with the last try, for people.
     pub error: Option<String>,
     /// What the last action did ("Password changed").
@@ -98,8 +146,9 @@ pub enum SecurityEvent {
     StartSetup,
     StartDisable,
     StartRegenerate,
-    StartPassword,
     StartSignOutOthers,
+    /// The Password cell's button: change the password.
+    SubmitPassword,
     /// The current step's button: continue, turn on, turn off, make, change, sign out.
     Submit,
     /// Disable's switch between a code and a recovery code.
@@ -112,12 +161,24 @@ pub enum SecurityEvent {
 #[derive(Clone, PartialEq, Eq)]
 pub enum SecurityCall {
     Status,
-    Setup { password: String },
-    Confirm { code: String },
+    Setup {
+        password: String,
+    },
+    Confirm {
+        code: String,
+    },
     Disable(TwoFactorProofRequest),
-    RecoveryCodes { password: String, code: String },
-    ChangePassword { current: String, new: String },
+    RecoveryCodes {
+        password: String,
+        code: String,
+    },
+    ChangePassword {
+        current: String,
+        new: String,
+    },
     SignOutOthers,
+    /// The account's newest events, for the page's security activity.
+    Activity,
 }
 
 impl std::fmt::Debug for SecurityCall {
@@ -130,6 +191,7 @@ impl std::fmt::Debug for SecurityCall {
             SecurityCall::RecoveryCodes { .. } => "RecoveryCodes(<redacted>)",
             SecurityCall::ChangePassword { .. } => "ChangePassword(<redacted>)",
             SecurityCall::SignOutOthers => "SignOutOthers",
+            SecurityCall::Activity => "Activity",
         })
     }
 }
@@ -144,6 +206,7 @@ pub enum SecurityAnswer {
     RecoveryCodes(Result<RecoveryCodes, Error>),
     ChangePassword(Result<(), Error>),
     SignOutOthers(Result<RevokedOthers, Error>),
+    Activity(Result<AuditPage, Error>),
 }
 
 impl std::fmt::Debug for SecurityAnswer {
@@ -157,6 +220,7 @@ impl std::fmt::Debug for SecurityAnswer {
             SecurityAnswer::RecoveryCodes(r) => ("RecoveryCodes", r.is_ok()),
             SecurityAnswer::ChangePassword(r) => ("ChangePassword", r.is_ok()),
             SecurityAnswer::SignOutOthers(r) => ("SignOutOthers", r.is_ok()),
+            SecurityAnswer::Activity(r) => ("Activity", r.is_ok()),
         };
         write!(f, "{name}({})", if ok { "ok" } else { "refused" })
     }
@@ -170,6 +234,11 @@ pub fn is_code(text: &str) -> bool {
 
 pub fn digits(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// What the page asks of the account's activity.
+pub fn activity_query() -> AuditQuery {
+    AuditQuery { limit: Some(ACTIVITY_ASKED), ..AuditQuery::default() }
 }
 
 /// A wait in words.
@@ -209,7 +278,19 @@ pub fn explain(e: &Error) -> String {
 impl SecurityPage {
     /// The page, opened from `overview`; its first call asks the server for the status.
     pub fn open(overview: Overview) -> (Self, Vec<SecurityCall>) {
-        (Self { overview, info: TwoFactorInfo::Loading, step: Step::Home, error: None, note: None, busy: false }, vec![SecurityCall::Status])
+        (
+            Self {
+                overview,
+                info: TwoFactorInfo::Loading,
+                step: Step::Home,
+                password: PasswordFields::default(),
+                activity: SecurityActivity::Loading,
+                error: None,
+                note: None,
+                busy: false,
+            },
+            vec![SecurityCall::Status, SecurityCall::Activity],
+        )
     }
 
     /// Whether two-factor sign-in is known to be on.
@@ -219,6 +300,8 @@ impl SecurityPage {
 
     fn start(&mut self, step: Step) {
         self.step = step;
+        // A password typed in the Password cell is dropped with the page's start over.
+        self.password.clear();
         self.error = None;
         self.note = None;
     }
@@ -255,12 +338,6 @@ impl SecurityPage {
                 }
                 Vec::new()
             }
-            SecurityEvent::StartPassword => {
-                if !self.busy {
-                    self.start(Step::Password { current: String::new(), new: String::new(), again: String::new() });
-                }
-                Vec::new()
-            }
             SecurityEvent::StartSignOutOthers => {
                 if !self.busy {
                     self.start(Step::SignOutOthers);
@@ -275,6 +352,7 @@ impl SecurityPage {
                 }
                 Vec::new()
             }
+            SecurityEvent::SubmitPassword => self.submit_password(),
             SecurityEvent::Submit => self.submit(),
         }
     }
@@ -325,24 +403,32 @@ impl SecurityPage {
                 }
                 SecurityCall::RecoveryCodes { password: std::mem::take(password), code: digits(&std::mem::take(code)) }
             }
-            Step::Password { current, new, again } => {
-                if current.is_empty() || new.is_empty() {
-                    self.error = Some("Type your current password and the new one.".into());
-                    return Vec::new();
-                }
-                if new != again {
-                    self.error = Some("The two new passwords aren't the same.".into());
-                    return Vec::new();
-                }
-                SecurityCall::ChangePassword { current: std::mem::take(current), new: std::mem::take(new) }
-            }
             Step::SignOutOthers => SecurityCall::SignOutOthers,
             Step::Home | Step::Codes { .. } => return Vec::new(),
         };
-        // A form that goes on with a password or a code is emptied for good: the typed ones live in the call now.
-        if let Step::Password { again, .. } = &mut self.step {
-            again.clear();
+        self.busy = true;
+        vec![call]
+    }
+
+    /// The Password cell's call. A form that isn't filled in says what is missing and calls nothing; the typed passwords move
+    /// into the call and are cleared from the form (the repeat is dropped).
+    fn submit_password(&mut self) -> Vec<SecurityCall> {
+        if self.busy || !matches!(self.step, Step::Home) {
+            return Vec::new();
         }
+        self.error = None;
+        self.note = None;
+        let PasswordFields { current, new, again } = &mut self.password;
+        if current.is_empty() || new.is_empty() {
+            self.error = Some("Type your current password and the new one.".into());
+            return Vec::new();
+        }
+        if new != again {
+            self.error = Some("The two new passwords aren't the same.".into());
+            return Vec::new();
+        }
+        let call = SecurityCall::ChangePassword { current: std::mem::take(current), new: std::mem::take(new) };
+        again.clear();
         self.busy = true;
         vec![call]
     }
@@ -375,7 +461,7 @@ impl SecurityPage {
                     Ok(codes) => {
                         self.step = Step::Codes { codes: codes.recovery_codes, why: CodesWhy::TurnedOn };
                         self.note = Some("Two-factor sign-in is on. Your other computers were signed out.".into());
-                        return vec![SecurityCall::Status];
+                        return vec![SecurityCall::Status, SecurityCall::Activity];
                     }
                     Err(e) => {
                         // A set-up that ran out or was used up (five wrong codes) has to start again.
@@ -397,7 +483,7 @@ impl SecurityPage {
                     Ok(()) => {
                         self.step = Step::Home;
                         self.note = Some("Two-factor sign-in is off. Your other computers were signed out.".into());
-                        return vec![SecurityCall::Status];
+                        return vec![SecurityCall::Status, SecurityCall::Activity];
                     }
                     Err(e) => self.error = Some(explain(&e)),
                 }
@@ -409,7 +495,7 @@ impl SecurityPage {
                     Ok(codes) => {
                         self.step = Step::Codes { codes: codes.recovery_codes, why: CodesWhy::New };
                         self.note = Some("New recovery codes. The old ones don't work any more.".into());
-                        return vec![SecurityCall::Status];
+                        return vec![SecurityCall::Status, SecurityCall::Activity];
                     }
                     Err(e) => self.error = Some(explain(&e)),
                 }
@@ -421,6 +507,7 @@ impl SecurityPage {
                     Ok(()) => {
                         self.step = Step::Home;
                         self.note = Some("Password changed. Your other computers were signed out.".into());
+                        return vec![SecurityCall::Activity];
                     }
                     Err(e) => self.error = Some(explain(&e)),
                 }
@@ -436,9 +523,19 @@ impl SecurityPage {
                             1 => "Signed 1 other computer out.".to_owned(),
                             n => format!("Signed {n} other computers out."),
                         });
+                        return vec![SecurityCall::Activity];
                     }
                     Err(e) => self.error = Some(explain(&e)),
                 }
+                Vec::new()
+            }
+            SecurityAnswer::Activity(result) => {
+                self.activity = match result {
+                    Ok(page) => SecurityActivity::Loaded(
+                        page.events.into_iter().filter(|e| is_security_action(&e.action)).take(SECURITY_ACTIVITY_ROWS).collect(),
+                    ),
+                    Err(e) => SecurityActivity::Failed(explain(&e)),
+                };
                 Vec::new()
             }
         }

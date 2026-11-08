@@ -1628,3 +1628,272 @@ fn snapshot_first_run_in_the_smallest_window_scrolls() {
     let model = after(&FakeAgent::new(signed_out()), Vec::new());
     snapshot_sized(model, egui::Theme::Light, "join-smallest", MIN_WINDOW_SIZE);
 }
+
+// ---- the Computers and Security pages ----
+
+/// Three computers as the Computers page shows them: this one, a current agent, and an older one on another platform; and one
+/// whose agent sent nothing about itself.
+fn computers_with_details() -> Vec<DeviceInfo> {
+    let detail = |name: &str, current: bool, platform: &str, version: &str, created_ms: i64, seen_ms: i64| DeviceInfo {
+        id: DeviceId::generate(),
+        name: name.into(),
+        created_ms,
+        last_used_ms: seen_ms,
+        revoked: false,
+        current,
+        client_kind: if version.is_empty() { String::new() } else { "agent".into() },
+        platform: platform.into(),
+        app_version: version.into(),
+        revoked_ms: None,
+        revoke_reason: None,
+    };
+    vec![
+        detail("Studio PC", true, "Windows", env!("CARGO_PKG_VERSION"), NOW - 3 * 86_400_000, NOW - 5_000),
+        detail("dev-B", false, "Windows", env!("CARGO_PKG_VERSION"), NOW - 86_400_000, NOW - 120_000),
+        detail("studio-mac", false, "macOS", "0.0.9", NOW - 9 * 86_400_000, NOW - 30 * 3_600_000),
+        detail("old-laptop", false, "", "", 0, NOW - 20 * 86_400_000),
+    ]
+}
+
+fn computers_model() -> Model {
+    let mut model = overview_model();
+    model.update(Event::Devices(Ok(computers_with_details())));
+    model.update(Event::Tab(Tab::Computers));
+    model
+}
+
+#[test]
+fn snapshot_computers() {
+    snapshot(computers_model(), egui::Theme::Light, "computers-light");
+    snapshot(computers_model(), egui::Theme::Dark, "computers-dark");
+    // The row of the second computer is a text field.
+    let mut editing = computers_model();
+    let id = computers_with_details_ids(&editing)[1];
+    editing.update(Event::StartRename(id));
+    snapshot(editing.clone(), egui::Theme::Light, "computers-renaming-light");
+    // The same row, refused.
+    if let Some(rename) = editing.overview_mut().and_then(|o| o.renaming.as_mut()) {
+        rename.name = "x".repeat(200);
+    }
+    editing.update(Event::SaveRename);
+    snapshot(editing, egui::Theme::Dark, "computers-renaming-error-dark");
+}
+
+/// The ids of the model's listed computers, in order.
+fn computers_with_details_ids(model: &Model) -> Vec<DeviceId> {
+    model.overview().and_then(|o| o.devices.as_ref()).map(|list| list.iter().map(|d| d.id).collect()).unwrap_or_default()
+}
+
+#[test]
+fn snapshot_computers_in_the_smallest_window() {
+    snapshot_sized(computers_model(), egui::Theme::Light, "computers-smallest-light", MIN_WINDOW_SIZE);
+    let mut editing = computers_model();
+    let id = computers_with_details_ids(&editing)[0];
+    editing.update(Event::StartRename(id));
+    snapshot_sized(editing, egui::Theme::Dark, "computers-renaming-smallest-dark", MIN_WINDOW_SIZE);
+}
+
+/// A table wider than the window shows its sideways scroll bar without a hover. In the smallest window the bar is below
+/// the page's fold, so this one is drawn in a window of the smallest width and a height that shows it.
+#[test]
+fn snapshot_computers_table_shows_its_scroll_bar() {
+    snapshot_sized(computers_model(), egui::Theme::Dark, "computers-scroll-bar-640-dark", [640.0, 640.0]);
+}
+
+#[test]
+fn missing_details_show_a_dash_and_only_an_older_version_gets_the_tag() {
+    let mut h = harness(computers_model(), egui::Theme::Light);
+    h.run_steps(2);
+    // Kind, platform and version of the computer that sent nothing.
+    assert_eq!(h.query_all_by_label("—").count(), 3);
+    assert_eq!(h.query_all_by_label("Older").count(), 1);
+    assert_eq!(h.query_all_by_label("Studio PC (this computer)").count(), 1);
+    assert_eq!(h.query_all_by_label("Online").count(), 1);
+    assert!(h.query_by_label("signed in 1970-01-01").is_none(), "no date is not 1970");
+}
+
+#[test]
+fn rename_is_found_by_its_label_and_sends_the_events_of_a_rename() {
+    let agent = FakeAgent::new(signed_in());
+    *agent.devices.lock().unwrap() = computers_with_details();
+    let mut model = after(&agent, vec![Event::Tab(Tab::Computers), Event::RefreshDevices]);
+    let ids = computers_with_details_ids(&model);
+    assert_eq!(ids.len(), 4);
+    let mut h = harness(std::mem::replace(&mut model, Model::new(defaults(), true, String::new())), egui::Theme::Light);
+    h.run_steps(2);
+    // One Rename per computer, one Remove for each but this one.
+    assert_eq!(h.query_all_by_label("Rename").count(), 4);
+    assert_eq!(h.query_all_by_label("Remove").count(), 3);
+    assert!(h.query_by_label("Save").is_none());
+    h.get_all_by_label("Rename").nth(1).unwrap().click();
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    assert_eq!(events, [Event::StartRename(ids[1])]);
+    // The model opens the field; the row shows Cancel and Save, and the other rows lose nothing.
+    for event in events {
+        h.state_mut().0.update(event);
+    }
+    h.run_steps(3);
+    assert!(h.query_by_label("Save").is_some() && h.query_by_label("Cancel").is_some());
+    assert_eq!(h.query_all_by_label("Rename").count(), 3);
+    assert!(h.query_by_label("Rename this computer").is_some());
+    // Cancel.
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    assert_eq!(events, [Event::CancelRename]);
+    for event in events {
+        h.state_mut().0.update(event);
+    }
+    h.run_steps(3);
+    assert!(h.query_by_label("Save").is_none());
+    // Rename again, type, Save: the effect goes through the fake agent and the list takes the answer.
+    h.get_all_by_label("Rename").nth(1).unwrap().click();
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    for event in events {
+        h.state_mut().0.update(event);
+    }
+    h.run_steps(3);
+    if let Some(rename) = h.state_mut().0.overview_mut().and_then(|o| o.renaming.as_mut()) {
+        rename.name = "Build box".into();
+    }
+    h.run_steps(2);
+    h.get_by_label("Save").click();
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    assert_eq!(events, [Event::SaveRename]);
+    let start = no_start();
+    let mut pending = Vec::new();
+    for event in events {
+        pending.extend(h.state_mut().0.update(event));
+    }
+    assert_eq!(pending, vec![Effect::RenameDevice { id: ids[1], name: "Build box".into(), ticket: 1 }]);
+    while let Some(effect) = pending.pop() {
+        if let Some(answer) = call(&agent, &start, effect) {
+            pending.extend(h.state_mut().0.update(answer));
+        }
+    }
+    h.run_steps(3);
+    assert!(h.query_by_label("Save").is_none());
+    assert!(h.query_by_label("Build box").is_some());
+    assert!(h.query_by_label("dev-B").is_none());
+    assert_eq!(agent.renames.lock().unwrap().as_slice(), [(ids[1], "Build box".to_owned())]);
+}
+
+#[test]
+fn sign_out_other_computers_is_a_button_of_the_page_and_off_without_another_computer() {
+    let mut h = harness(computers_model(), egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_label("Sign out other computers").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::SignOutOtherComputers]);
+    let mut alone = overview_model();
+    alone.update(Event::Devices(Ok(computers_with_details().into_iter().take(1).collect())));
+    alone.update(Event::Tab(Tab::Computers));
+    let mut h = harness(alone, egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_label("Sign out other computers").click();
+    h.run_steps(2);
+    assert!(h.state_mut().1.is_empty(), "disabled");
+}
+
+#[test]
+fn snapshot_security_pages() {
+    let on = FakeAgent::new(signed_in());
+    on.factor.lock().unwrap().enabled = true;
+    *on.audit_events.lock().unwrap() = audit_events();
+    let events = |_: ()| vec![Event::Devices(Ok(computers_with_details())), Event::OpenSecurity];
+    snapshot_sized(after(&on, events(())), egui::Theme::Light, "security-two-factor-on-light", [WINDOW_SIZE[0], 900.0]);
+    snapshot_sized(after(&on, events(())), egui::Theme::Dark, "security-two-factor-on-dark", [WINDOW_SIZE[0], 900.0]);
+    let off = FakeAgent::new(signed_in());
+    snapshot_sized(after(&off, events(())), egui::Theme::Light, "security-two-factor-off-smallest-light", MIN_WINDOW_SIZE);
+    // The password form is in its cell: a typed form that was refused says why.
+    let mut password = after(&on, events(()));
+    if let Screen::Security(page) = &mut password.screen {
+        page.password = crate::security::PasswordFields {
+            current: "the old one".into(),
+            new: "a brand new password".into(),
+            again: "another brand new one".into(),
+        };
+    }
+    password.update(Event::Security(crate::security::SecurityEvent::SubmitPassword));
+    snapshot_sized(password, egui::Theme::Light, "security-password-light", [WINDOW_SIZE[0], 900.0]);
+    // The sign-out of the other computers is asked under the cells.
+    let mut confirm = after(&on, events(()));
+    confirm.update(Event::Security(crate::security::SecurityEvent::StartSignOutOthers));
+    snapshot_sized(confirm, egui::Theme::Light, "security-sign-out-others-light", [WINDOW_SIZE[0], 1100.0]);
+}
+
+/// The security activity under the cells: the newest sign-ins and account changes only, with a muted line without events or
+/// when they couldn't be loaded.
+#[test]
+fn snapshot_security_activity() {
+    use crate::security::{SecurityActivity, SecurityAnswer};
+    let on = FakeAgent::new(signed_in());
+    on.factor.lock().unwrap().enabled = true;
+    let events = vec![Event::Devices(Ok(computers_with_details())), Event::OpenSecurity];
+    let mut loaded = after(&on, events.clone());
+    let known = match &loaded.screen {
+        Screen::Security(page) => page.overview.devices.clone().unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let mut list = audit_events();
+    for (n, event) in list.iter_mut().enumerate() {
+        event.actor_device = known.get(n % 2).map(|d| d.id);
+    }
+    loaded.update(Event::SecurityAnswer(SecurityAnswer::Activity(Ok(craft_cloud_app::AuditPage { events: list, next: None }))));
+    let Screen::Security(page) = &loaded.screen else { panic!("the Security page") };
+    let SecurityActivity::Loaded(shown) = &page.activity else { panic!("{:?}", page.activity) };
+    // The admin's changes are not about the account's security.
+    assert_eq!(shown.len(), 4, "{shown:?}");
+    assert!(shown.iter().all(|e| crate::security::is_security_action(&e.action)));
+    snapshot_sized(loaded.clone(), egui::Theme::Light, "security-activity-light", [WINDOW_SIZE[0], 1000.0]);
+    snapshot_sized(loaded.clone(), egui::Theme::Dark, "security-activity-dark", [WINDOW_SIZE[0], 1000.0]);
+    snapshot_sized(loaded, egui::Theme::Light, "security-activity-smallest-light", [MIN_WINDOW_SIZE[0], 1100.0]);
+    let mut empty = after(&on, events.clone());
+    empty.update(Event::SecurityAnswer(SecurityAnswer::Activity(Ok(craft_cloud_app::AuditPage { events: Vec::new(), next: None }))));
+    snapshot_sized(empty, egui::Theme::Light, "security-activity-empty", [WINDOW_SIZE[0], 800.0]);
+    let mut failed = after(&on, events);
+    failed.update(Event::SecurityAnswer(SecurityAnswer::Activity(Err(Error::Io("the server didn't answer".into())))));
+    snapshot_sized(failed, egui::Theme::Light, "security-activity-failed", [WINDOW_SIZE[0], 800.0]);
+}
+
+#[test]
+fn escape_cancels_a_rename_and_the_other_rows_wait_while_one_is_open() {
+    let mut model = computers_model();
+    let ids = computers_with_details_ids(&model);
+    model.update(Event::StartRename(ids[1]));
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(4);
+    // The field took the keyboard when the row opened: Escape is Cancel.
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    let events = std::mem::take(&mut h.state_mut().1);
+    assert!(events.contains(&Event::CancelRename), "{events:?}");
+    // Another row's Rename is off while this one is open.
+    for rename in h.get_all_by_label("Rename") {
+        rename.click();
+    }
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    assert!(!events.iter().any(|e| matches!(e, Event::StartRename(_))), "{events:?}");
+}
+
+#[test]
+fn the_security_pages_sign_out_button_is_off_without_another_computer() {
+    let alone = FakeAgent::new(signed_in());
+    let events = vec![Event::Devices(Ok(computers_with_details().into_iter().take(1).collect())), Event::OpenSecurity];
+    let mut h = harness(after(&alone, events), egui::Theme::Light);
+    h.run_steps(3);
+    h.get_by_label("Sign out other computers").click();
+    h.run_steps(2);
+    assert!(h.state_mut().1.is_empty(), "disabled");
+    let with_others = FakeAgent::new(signed_in());
+    let events = vec![Event::Devices(Ok(computers_with_details())), Event::OpenSecurity];
+    let mut h = harness(after(&with_others, events), egui::Theme::Light);
+    h.run_steps(3);
+    h.get_by_label("Sign out other computers").click();
+    h.run_steps(2);
+    assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Security(crate::security::SecurityEvent::StartSignOutOthers)]);
+}
