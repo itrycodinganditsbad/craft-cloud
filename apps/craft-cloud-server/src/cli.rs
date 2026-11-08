@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use craft_cloud_meta::{ActionFilter, AuditQuery, Meta, Origin, RevokeReason, Role, valid_username};
-use craft_cloud_proto::DeviceId;
+use craft_cloud_meta::{ActionFilter, AuditQuery, Meta, Origin, RevokeReason, Role, SpaceActor, valid_username};
+use craft_cloud_proto::api::SpaceRole;
 use craft_cloud_proto::join::{Code, INVITE_CHARS, INVITE_TTL_MS, JoinString};
+use craft_cloud_proto::{DeviceId, SpaceId, SpaceName};
 use craft_cloud_store::Store;
 use craft_cloud_store::disk::DiskBackend;
 use craft_cloud_store::s3::S3Backend;
@@ -67,8 +68,17 @@ pub enum Command {
         #[command(subcommand)]
         action: DeviceAction,
     },
-    /// Start a new epoch for a user's space (or every space with --all). Run after restoring the server from a backup.
-    #[command(group(clap::ArgGroup::new("target").required(true).multiple(false).args(["username", "all"])))]
+    /// Manage team spaces: create one with its first owner, list them, see and add members, archive.
+    Space {
+        /// Path to config.toml. May come before or after the action.
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: SpaceAction,
+    },
+    /// Start a new epoch for a user's space, a team space (--space) or every space with --all. Run after restoring the server
+    /// from a backup.
+    #[command(group(clap::ArgGroup::new("target").required(true).multiple(false).args(["username", "all", "space"])))]
     ResetEpoch {
         /// Path to config.toml. May come before or after the action.
         #[arg(long, global = true)]
@@ -78,6 +88,9 @@ pub enum Command {
         /// Reset every space on the server.
         #[arg(long)]
         all: bool,
+        /// Reset this space, by ID (a team space's, or any user's).
+        #[arg(long)]
+        space: Option<SpaceId>,
     },
     /// Read and prune the security audit log.
     Audit {
@@ -148,6 +161,37 @@ pub enum Command {
         /// The address the server listens on, as seen from here.
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SpaceAction {
+    /// Create a team space. Its first owner is a member from the start, with no invitation to accept.
+    Create {
+        /// The space's display name (1 to 64 characters, unique on the server in any case).
+        name: String,
+        /// The first owner's username.
+        #[arg(long)]
+        owner: String,
+    },
+    /// List the team spaces: ID, members, owners, stored bytes and name.
+    List,
+    /// List a team space's members and invitations. The space is its ID or its name.
+    Members { space: String },
+    /// Add an account to a team space, accepted at once (whoever runs the command line has the files anyway).
+    Add {
+        /// The space's ID or name.
+        space: String,
+        /// The account's username.
+        user: String,
+        /// viewer, editor or owner.
+        #[arg(long, default_value = "editor")]
+        role: String,
+    },
+    /// Archive a team space: every member becomes read-only, nothing is deleted.
+    Archive {
+        /// The space's ID or name.
+        space: String,
     },
 }
 
@@ -344,6 +388,75 @@ async fn user_id(meta: &Meta, username: &str) -> Result<craft_cloud_meta::UserRe
     meta.user_by_name(username).await?.ok_or_else(|| CliError::Usage(format!("no user named {username}")))
 }
 
+/// A space named on the command line: its ID, or the name of a team space.
+async fn resolve_space(meta: &Meta, text: &str) -> Result<SpaceId, CliError> {
+    if let Ok(id) = text.parse::<SpaceId>() {
+        return Ok(id);
+    }
+    let name = SpaceName::new(text).map_err(|e| CliError::Usage(format!("{text:?} is neither a space ID nor a space name: {e}")))?;
+    meta.team_space_by_name(&name).await?.ok_or_else(|| CliError::Usage(format!("no team space {text:?}")))
+}
+
+async fn space_command(meta: &Meta, action: SpaceAction, out: &mut impl Write) -> Result<(), CliError> {
+    match action {
+        SpaceAction::Create { name, owner } => {
+            let name = SpaceName::new(&name).map_err(|e| CliError::Usage(format!("a space's name: {e}")))?;
+            let owner = user_id(meta, &owner).await?;
+            let space = meta.create_team_space(&SpaceActor::Cli, &name, owner.id, None, now_ms()).await?;
+            writeln!(out, "created the team space {space}, owned by {}", owner.username)?;
+        }
+        SpaceAction::List => {
+            let mut after = None;
+            loop {
+                let page = meta.admin_list_spaces(after.as_deref(), None, 200).await?;
+                for space in &page.spaces {
+                    let archived = if space.archived_ms.is_some() { "  (archived)" } else { "" };
+                    writeln!(
+                        out,
+                        "{}  {} member(s), {} owner(s), {} bytes  {}{archived}",
+                        space.id, space.members, space.owners, space.stored_bytes, space.name
+                    )?;
+                }
+                match page.next_after {
+                    Some(next) => after = Some(next),
+                    None => break,
+                }
+            }
+        }
+        SpaceAction::Members { space } => {
+            let space = resolve_space(meta, &space).await?;
+            for member in meta.list_members(space).await? {
+                writeln!(out, "{}  {}  {}", member.username, member.role.as_str(), if member.accepted() { "member" } else { "invited" })?;
+            }
+        }
+        SpaceAction::Add { space, user, role } => {
+            let space = resolve_space(meta, &space).await?;
+            let role = SpaceRole::parse(&role).ok_or_else(|| CliError::Usage("the role is viewer, editor or owner".into()))?;
+            let user = user_id(meta, &user).await?;
+            let current = meta.list_members(space).await?.into_iter().find(|m| m.user == user.id);
+            match current {
+                None => {
+                    meta.invite_member(&SpaceActor::Cli, space, user.id, role, now_ms()).await?;
+                }
+                // Already in the space: the command sets the role instead (an invitation stays one until the account accepts).
+                Some(member) => {
+                    meta.change_member_role(&SpaceActor::Cli, space, user.id, role, now_ms()).await?;
+                    if !member.accepted() {
+                        writeln!(out, "{} was only invited so far", user.username)?;
+                    }
+                }
+            }
+            writeln!(out, "{} is {} of the space", user.username, role.as_str())?;
+        }
+        SpaceAction::Archive { space } => {
+            let space = resolve_space(meta, &space).await?;
+            meta.set_space_archived(&SpaceActor::Cli, space, true, now_ms()).await?;
+            writeln!(out, "archived the space {space}; nothing was deleted")?;
+        }
+    }
+    Ok(())
+}
+
 /// Runs every command except `serve` (which `main` runs, since it never returns).
 pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Write) -> Result<(), CliError> {
     match command {
@@ -428,9 +541,16 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
             let (meta, _) = open(&config).await?;
             web_sessions(&meta, &config, action, out).await
         }
-        Command::ResetEpoch { config, username, all } => {
+        Command::Space { config, action } => {
             let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
-            if all {
+            space_command(&meta, action, out).await
+        }
+        Command::ResetEpoch { config, username, all, space } => {
+            let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
+            if let Some(space) = space {
+                let epoch = meta.reset_epoch(space).await?;
+                writeln!(out, "new epoch {epoch} for space {space}")?;
+            } else if all {
                 let spaces = meta.all_spaces().await?;
                 for space in &spaces {
                     let epoch = meta.reset_epoch(*space).await?;

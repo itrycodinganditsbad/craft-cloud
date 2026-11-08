@@ -273,7 +273,9 @@ async fn no_header_is_the_personal_space_and_every_answer_echoes_the_space(w: &W
     let raw: serde_json::Value = res.json().await.unwrap();
     let mut keys: Vec<_> = raw.as_object().unwrap().keys().cloned().collect();
     keys.sort();
-    assert_eq!(keys, ["epoch", "root", "seq", "space", "username"], "no field is added for a client that never named a space");
+    assert_eq!(keys, ["epoch", "kind", "role", "root", "seq", "space", "username"], "the old fields, and `kind` and `role` appended");
+    assert_eq!(raw["kind"], "personal");
+    assert_eq!(raw["role"], "owner");
     let body: SpaceResponse = serde_json::from_value(raw).unwrap();
     assert_eq!((body.space, body.username.as_str()), (ana.space, "ana"));
 

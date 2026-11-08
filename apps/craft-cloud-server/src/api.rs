@@ -71,9 +71,11 @@ pub fn router(state: Shared) -> Router {
         .route("/pairings/{id}", get(join::pairing_status).delete(join::delete_pairing))
         .route("/account/usage", get(account_usage))
         .merge(space_routes(&state))
+        .merge(crate::spaces::routes())
         // The admin routes carry `require_admin` themselves; `require_device` below wraps them too and runs first.
         .merge(crate::admin::routes())
         .merge(audit::admin_routes())
+        .merge(crate::spaces::admin_routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_device));
     let public = Router::new()
         .route("/info", get(info))
@@ -264,7 +266,17 @@ async fn space(
     Extension(access): Extension<SpaceAccess>,
 ) -> Result<Json<SpaceResponse>, ApiError> {
     let info = state.meta.space_info(access.space).await?;
-    Ok(Json(SpaceResponse { space: access.space, root: info.root, epoch: info.epoch, seq: info.seq, username: auth.username }))
+    let name = if access.personal { None } else { state.meta.team_space_name(access.space).await? };
+    Ok(Json(SpaceResponse {
+        space: access.space,
+        root: info.root,
+        epoch: info.epoch,
+        seq: info.seq,
+        username: auth.username,
+        kind: Some(if access.personal { "personal" } else { "team" }.to_owned()),
+        name,
+        role: Some(access.role),
+    }))
 }
 
 async fn account_usage(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>) -> Result<Json<AccountUsage>, ApiError> {

@@ -333,6 +333,7 @@ async fn disable_user(
     let actor = confirm(&state, &auth, Confirmation::new(req.password, req.totp_code, req.recovery_code)).await?;
     let revoked = state.meta.admin_disable_user(&actor, target, state.now_ms()).await?;
     end_live_connections(&state, &revoked);
+    crate::spaces::wake_spaces_of(&state, target).await;
     tracing::info!(actor = %auth.device, target = %target.0, revoked = revoked.len(), "admin: account disabled");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -364,6 +365,7 @@ async fn remove_user(
     let actor = confirm(&state, &auth, Confirmation::new(req.password, req.totp_code, req.recovery_code)).await?;
     let revoked = state.meta.admin_remove_user(&actor, target, state.now_ms()).await?;
     end_live_connections(&state, &revoked);
+    crate::spaces::wake_spaces_of(&state, target).await;
     tracing::info!(actor = %auth.device, target = %target.0, revoked = revoked.len(), "admin: account marked for removal");
     Ok(StatusCode::ACCEPTED)
 }

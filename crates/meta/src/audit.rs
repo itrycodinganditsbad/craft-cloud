@@ -95,11 +95,12 @@ pub enum AuditAction {
     SpaceMemberLeft,
     CliSpaceCreated,
     CliSpaceMemberChanged,
+    CliSpaceArchived,
 }
 
 impl AuditAction {
     /// Every action, in the order the documentation lists them.
-    pub const ALL: [AuditAction; 43] = [
+    pub const ALL: [AuditAction; 44] = [
         AuditAction::AuthLogin,
         AuditAction::AuthLoginFailed,
         AuditAction::AuthSecondFactorFailed,
@@ -143,6 +144,7 @@ impl AuditAction {
         AuditAction::SpaceMemberLeft,
         AuditAction::CliSpaceCreated,
         AuditAction::CliSpaceMemberChanged,
+        AuditAction::CliSpaceArchived,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -190,6 +192,7 @@ impl AuditAction {
             AuditAction::SpaceMemberLeft => "space.member_left",
             AuditAction::CliSpaceCreated => "cli.space_created",
             AuditAction::CliSpaceMemberChanged => "cli.space_member_changed",
+            AuditAction::CliSpaceArchived => "cli.space_archived",
         }
     }
 
@@ -231,7 +234,11 @@ impl AuditAction {
             | AuditAction::AdminTwoFactorReset => &[],
             AuditAction::AuthTwoFactorLocked => &[ClientKind],
             AuditAction::SpaceCreated | AuditAction::CliSpaceCreated => &[User, QuotaBytes],
-            AuditAction::SpaceRenamed | AuditAction::SpaceArchived | AuditAction::SpaceUnarchived | AuditAction::SpaceMemberLeft => &[],
+            AuditAction::SpaceRenamed
+            | AuditAction::SpaceArchived
+            | AuditAction::SpaceUnarchived
+            | AuditAction::SpaceMemberLeft
+            | AuditAction::CliSpaceArchived => &[],
             AuditAction::SpaceQuotaChanged => &[QuotaBytes],
             AuditAction::SpaceMemberInvited => &[User, SpaceRoleTo],
             AuditAction::SpaceMemberJoined | AuditAction::SpaceMemberDeclined | AuditAction::SpaceMemberRemoved => &[User],
@@ -735,6 +742,7 @@ fn event_from(row: &sqlx::any::AnyRow) -> Result<AuditEvent, MetaError> {
 enum Arg {
     Int(i64),
     Bytes(Vec<u8>),
+    Text(String),
 }
 
 /// How long a pruning that is running holds the right to run, and what the last complete one's time was.
@@ -811,7 +819,10 @@ impl Meta {
         };
         if let Some(user) = query.user {
             let n = next(Arg::Bytes(uuid_bytes(&user.0)));
-            sql.push_str(&format!(" AND (actor_user = ${n} OR target_id = ${n})"));
+            // An event also concerns the account it names as `user` in its details (a space member invited, removed ...).
+            // Details are compact JSON, and an ID has no character that `LIKE` reads.
+            let m = next(Arg::Text(format!("%\"user\":\"{}\"%", user.0.hyphenated())));
+            sql.push_str(&format!(" AND (actor_user = ${n} OR target_id = ${n} OR details LIKE ${m})"));
         }
         if let Some(filter) = query.action {
             // The names come from the closed list, never from a request, so they are safe to write into the text.
@@ -838,6 +849,7 @@ impl Meta {
             q = match arg {
                 Arg::Int(i) => q.bind(i),
                 Arg::Bytes(b) => q.bind(b),
+                Arg::Text(t) => q.bind(t),
             };
         }
         q.fetch_all(&self.pool).await?.iter().map(event_from).collect()
@@ -944,7 +956,7 @@ mod tests {
             assert_eq!(AuditAction::parse(action.as_str()), Some(action));
             assert!(action.as_str().bytes().all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'.'));
         }
-        assert_eq!(seen.len(), 43);
+        assert_eq!(seen.len(), 44);
         assert_eq!(AuditAction::parse("auth.login "), None);
         assert_eq!(AuditAction::parse("AUTH.LOGIN"), None);
     }

@@ -153,7 +153,16 @@ impl Transport for Local {
     async fn space(&self) -> Result<SpaceResponse, TransportError> {
         self.faults.check()?;
         let info = self.meta.space_info(self.space).await.map_err(meta_err)?;
-        Ok(SpaceResponse { space: self.space, root: info.root, epoch: info.epoch, seq: info.seq, username: self.username.clone() })
+        Ok(SpaceResponse {
+            space: self.space,
+            root: info.root,
+            epoch: info.epoch,
+            seq: info.seq,
+            username: self.username.clone(),
+            kind: None,
+            name: None,
+            role: None,
+        })
     }
 
     async fn tree(&self, after: Option<PageCursor>) -> Result<ChangeSet, TransportError> {

@@ -180,6 +180,40 @@ the rest of the window. A wrong or missing code for an admin who has two-factor 
 server process on the same database, or the command line, finds out at the connection's next ping (within about 30 seconds).
 The command line stays as the way in without HTTP and enforces neither the confirmation nor `last_admin`.
 
+## Team spaces
+
+A **team space** is a versioned tree like an account's own space, shared between accounts of this server. Every account keeps
+its personal space exactly as before; a server that never creates a team space behaves as it did. An administrator makes a
+team space and names its first owner; owners then invite other accounts, who accept or decline. The roles are `viewer`
+(reads, sees history and trash), `editor` (also writes) and `owner` (also manages the members, removes from the trash, renames
+and archives). **An administrator has no access to a team space's files** unless they are a member; they can create, list,
+archive and give a space an owner, set its limit, and add themselves as a member (which is audited and visible).
+
+A request names its space with the header `craft-space: <space ID>` (without it, the account's personal space, so older agents
+and apps work unchanged); every answer carries the header back, so a client can tell an older server that ignored it. A space the
+account has no access to is `404 not_found`, the same answer as for a space that does not exist; a member whose role does not
+allow the call is `403 read_only`. The server reads the role from the database on every request.
+
+- `GET /api/v1/spaces` lists the account's spaces (the personal one first, then the team spaces by name, with invitations
+  as `state: invited`). `POST /spaces/{id}/accept` and `…/decline` answer an invitation. `GET /spaces/{id}/members` and
+  `…/usage` are for members. Owners invite (`POST …/members`, 30 a minute per account, `429 rate_limited` beyond), change a
+  role (`PATCH …/members/{user}`) and remove a member or withdraw an invitation (`DELETE …/members/{user}`). A member removes
+  their own row to leave. The last owner cannot be lowered, removed or leave (`409 last_owner`). An unknown, disabled or
+  removed account is one answer, `404 not_found`.
+- `PATCH /spaces/{id}` renames (an owner) and changes the space's limit (an administrator: `quota_bytes`, `null` removes it).
+  `POST /spaces/{id}/archive` and `…/unarchive` are the owner's, with their password. An archived space is read-only for every
+  member and leaves their lists except the owners'; nothing is deleted.
+- An administrator's changes carry the same confirmation as the account routes above (password, and the second factor when on):
+  `POST /admin/spaces` (`name`, `owner`, `quota_bytes`), `GET /admin/spaces` (`limit`, `cursor`, `query`),
+  `POST /admin/spaces/{id}/archive` and `…/unarchive`, and `PUT /admin/spaces/{id}/owner` (makes an account an accepted
+  owner, for a space whose owners are gone). An administrator who is not an owner uses the same confirmation on the member routes.
+- On the command line: `space create <name> --owner <user>`, `space list`, `space members <space>`,
+  `space add <space> <user> --role <role>` (added and accepted at once), `space archive <space>` (a space is its ID or its
+  name), and `reset-epoch --space <id>` for one space. The command line enforces nothing of the above, as for accounts.
+- Every change is in the audit log (`space.…`, `cli.space_…`), with IDs and role words only, never a space name. An account's own
+  activity (`GET /account/activity`) also shows the events that name it as the member concerned.
+- Until live documents learn team spaces, a team space's live connection is refused (`404`); files in it sync as ordinary files.
+
 ## The admin pages in the browser
 
 The server can serve admin pages: users, invites and reset codes, a user's devices, the audit log and its download, in
@@ -370,7 +404,7 @@ With the server stopped, restore the database and the chunk storage from the bac
 accounts use two-factor sign-in: the server will not start without it), then run
 `craft-cloud-server reset-epoch --config cc-data/config.toml --all`, and only then start `serve` again. Every
 account then starts a new epoch, so each synced machine reconciles with the restored state instead of trusting its
-own change counter. `reset-epoch --config … name` resets one account. (A reset run while the server is up still
+own change counter. `reset-epoch --config … name` resets one account, and `--space <id>` one team space. (A reset run while the server is up still
 works: open live connections end at their next ping, within 30 s, and connect again.)
 
 ## A full recents document
