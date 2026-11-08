@@ -129,7 +129,9 @@ pub fn state_tags(info: &SpaceInfo) -> Vec<(&'static str, Look)> {
         (SpaceSync::On, Some(SpaceRun::Retrying { .. })) => tags.push(("Retrying", Look::Warn)),
         // The code decides when there is one; its words may change.
         (SpaceSync::On, Some(SpaceRun::Paused { reason_code: Some(code), .. })) if code == "server_full" => tags.push(("Server full", Look::Bad)),
-        (SpaceSync::On, Some(SpaceRun::Paused { reason_code: Some(code), .. })) if code == "quota_exceeded" => tags.push(("Over the limit", Look::Bad)),
+        (SpaceSync::On, Some(SpaceRun::Paused { reason_code: Some(code), .. })) if code == "quota_exceeded" => {
+            tags.push(("Over the limit", Look::Bad))
+        }
         (SpaceSync::On, Some(SpaceRun::Paused { reason_code: Some(code), .. })) if code == "read_only" => tags.push(("Read only", Look::Warn)),
         (SpaceSync::On, Some(SpaceRun::Paused { .. })) => tags.push(("Needs you", Look::Bad)),
         (SpaceSync::On, Some(SpaceRun::PausedByUser)) => tags.push(("Paused", Look::Neutral)),
@@ -256,8 +258,6 @@ impl HeldList {
         self.truncated.then(|| format!("Showing {} of {}", self.entries.len(), self.total))
     }
 }
-
-
 
 /// The text field and the role of "Invite by account name".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -415,8 +415,7 @@ impl SharedScreen {
     pub fn is_last_owner(&self) -> bool {
         let Some(page) = self.page() else { return false };
         let me = self.me();
-        let owners: Vec<&SpaceMember> =
-            page.members.list.iter().flatten().filter(|m| m.role == SpaceRole::Owner && m.state != "invited").collect();
+        let owners: Vec<&SpaceMember> = page.members.list.iter().flatten().filter(|m| m.role == SpaceRole::Owner && m.state != "invited").collect();
         owners.len() == 1 && owners.iter().any(|m| m.username.eq_ignore_ascii_case(me))
     }
 
@@ -550,7 +549,7 @@ pub enum SpacesMsg {
         ticket: u64,
         result: Result<SpaceList, Error>,
     },
-UsageOf {
+    UsageOf {
         ticket: u64,
         results: Vec<(SpaceId, Result<SpaceUsage, Error>)>,
     },
@@ -1578,7 +1577,8 @@ impl SharedScreen {
                 } else {
                     if approving {
                         // What was listed changed since: nothing was approved, and what waits now is asked about again.
-                        page.error = Some("The held deletions changed since they were listed, so nothing was approved. Look at them again.".to_owned());
+                        page.error =
+                            Some("The held deletions changed since they were listed, so nothing was approved. Look at them again.".to_owned());
                     }
                     match answer.set {
                         Some(set) if answer.total > 0 => Deletes::Asking(HeldList {
@@ -1734,7 +1734,10 @@ mod tests {
         use SpaceRole::{Editor, Viewer};
         assert_eq!(tag(SpaceSync::On, Some(SpaceRun::Syncing), Editor, false, false), [("Syncing", Look::Good)]);
         assert_eq!(tag(SpaceSync::On, Some(SpaceRun::Retrying { message: "x".into() }), Editor, false, false), [("Retrying", Look::Warn)]);
-        assert_eq!(tag(SpaceSync::On, Some(SpaceRun::Paused { reason: "x".into(), reason_code: None }), Editor, false, false), [("Needs you", Look::Bad)]);
+        assert_eq!(
+            tag(SpaceSync::On, Some(SpaceRun::Paused { reason: "x".into(), reason_code: None }), Editor, false, false),
+            [("Needs you", Look::Bad)]
+        );
         assert_eq!(tag(SpaceSync::On, Some(SpaceRun::PausedByUser), Editor, false, false), [("Paused", Look::Neutral)]);
         assert_eq!(tag(SpaceSync::Off, None, Editor, false, false), [("Not syncing here", Look::Neutral)]);
         assert_eq!(tag(SpaceSync::On, Some(SpaceRun::Idle), Viewer, false, true), [("Read only", Look::Warn), ("Synced", Look::Good)]);
@@ -2029,10 +2032,7 @@ mod tests {
         let changed = ApproveDeletesAnswer {
             set: Some("b2".into()),
             total: 2,
-            entries: vec![
-                HeldEntry { path: "a.txt".into(), side: "server".into() },
-                HeldEntry { path: "b.txt".into(), side: "here".into() },
-            ],
+            entries: vec![HeldEntry { path: "a.txt".into(), side: "server".into() }, HeldEntry { path: "b.txt".into(), side: "here".into() }],
             ..Default::default()
         };
         model.update(Event::Spaces(SpacesMsg::Deletes { space: id, ticket, result: Ok(changed) }));
@@ -2286,7 +2286,8 @@ mod tests {
         let b = team_space("B", SpaceRole::Owner, "active");
         let (a_id, b_id) = (a.space, b.space);
         let agent = agent_with(vec![a, b]);
-        let changing = || Error::Refused { code: "conflict".into(), message: "this space is being changed, try again in a moment".into(), name_taken: None };
+        let changing =
+            || Error::Refused { code: "conflict".into(), message: "this space is being changed, try again in a moment".into(), name_taken: None };
         let mut model = on_shared(&agent);
         run(&mut model, &agent, msg(SpacesMsg::OpenSpace(a_id)));
         agent.team.lock().unwrap().fails.push(changing());
@@ -2363,7 +2364,10 @@ mod tests {
         let Some(Effect::Spaces(SpacesCall::List { ticket })) = effects.first().cloned() else { panic!("{effects:?}") };
         let list = SpaceList { spaces: agent.team.lock().unwrap().spaces.clone() };
         let effects = model.update(Event::Spaces(SpacesMsg::Listed { ticket, result: Ok(list.clone()) }));
-        assert!(matches!(effects.as_slice(), [Effect::Spaces(SpacesCall::UsageOf { spaces, .. })] if spaces.len() == 6), "one call for all: {effects:?}");
+        assert!(
+            matches!(effects.as_slice(), [Effect::Spaces(SpacesCall::UsageOf { spaces, .. })] if spaces.len() == 6),
+            "one call for all: {effects:?}"
+        );
         // A change that reloads the list asks nothing more of the spaces.
         agent.team.lock().unwrap().spaces[0].sync = SpaceSync::On;
         let reload = model.update(Event::Spaces(SpacesMsg::SyncOff(first)));

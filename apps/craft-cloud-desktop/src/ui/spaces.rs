@@ -9,8 +9,8 @@ use super::confirm;
 use super::kit::{self, Column, Tokens, Tone};
 use crate::model::Event;
 use crate::spaces::{
-    ARCHIVED_BANNER, Deletes, Doing, Look, NO_ACCESS_BANNER, READ_ONLY_BANNER, SERVER_TOO_OLD, SharedScreen, SpacePage, SpacesMsg, SyncOffer, TOO_OLD, Used,
-    folder_line, role_label, space_name, state_tags,
+    ARCHIVED_BANNER, Deletes, Doing, Look, NO_ACCESS_BANNER, READ_ONLY_BANNER, SERVER_TOO_OLD, SharedScreen, SpacePage, SpacesMsg, SyncOffer,
+    TOO_OLD, Used, folder_line, role_label, space_name, state_tags,
 };
 
 /// The height of a row of the spaces table, and of the members table.
@@ -590,7 +590,11 @@ fn deletes_panel(ui: &mut egui::Ui, page: &SpacePage, doing: Option<&Doing>, eve
                     ui.label(RichText::new(note).small().color(t.muted));
                 }
                 if list.linked > 0 {
-                    ui.label(RichText::new(format!("{} more are held behind a link; `craft-cloud-agent status` lists them.", list.linked)).small().color(t.muted));
+                    ui.label(
+                        RichText::new(format!("{} more are held behind a link; `craft-cloud-agent status` lists them.", list.linked))
+                            .small()
+                            .color(t.muted),
+                    );
                 }
                 ui.add_space(4.0);
                 let text = if count == 1 {

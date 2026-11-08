@@ -1041,11 +1041,7 @@ async fn approve_space_deletes(
 /// [`MAX_HELD_ENTRIES`], at most [`MAX_HELD_BYTES`] of paths), the deletions held behind a link, and the command line's words.
 pub(crate) fn held_answer(summary: &crate::account::PassSummary, approved: bool, words: &str) -> ApproveDeletesAnswer {
     use craft_cloud_proto::local::{HeldEntry, HeldLink, MAX_HELD_BYTES, MAX_HELD_ENTRIES};
-    let all = summary
-        .pending_deletes
-        .iter()
-        .map(|p| (p, "server"))
-        .chain(summary.pending_local_deletes.iter().map(|p| (p, "here")));
+    let all = summary.pending_deletes.iter().map(|p| (p, "server")).chain(summary.pending_local_deletes.iter().map(|p| (p, "here")));
     let (mut entries, mut bytes, mut total) = (Vec::new(), 0usize, 0u64);
     for (path, side) in all {
         total += 1;
@@ -1056,8 +1052,12 @@ pub(crate) fn held_answer(summary: &crate::account::PassSummary, approved: bool,
     }
     let truncated = (entries.len() as u64) < total;
     let held_total = summary.held_deletes.len() as u64;
-    let held: Vec<HeldLink> =
-        summary.held_deletes.iter().take(100).map(|(path, links)| HeldLink { path: path.clone(), links: links.iter().take(5).cloned().collect() }).collect();
+    let held: Vec<HeldLink> = summary
+        .held_deletes
+        .iter()
+        .take(100)
+        .map(|(path, links)| HeldLink { path: path.clone(), links: links.iter().take(5).cloned().collect() })
+        .collect();
     // The words are for the command line; an app reads the fields above.
     let mut message = words.to_owned();
     if message.len() > 16 * 1024 {
@@ -1066,8 +1066,10 @@ pub(crate) fn held_answer(summary: &crate::account::PassSummary, approved: bool,
             end -= 1;
         }
         message.truncate(end);
-        message.push_str("
-…");
+        message.push_str(
+            "
+…",
+        );
     }
     ApproveDeletesAnswer { approved, message, set: summary.pending_set(), total, truncated, entries, held_set: summary.held_set(), held_total, held }
 }
