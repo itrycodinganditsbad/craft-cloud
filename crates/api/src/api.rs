@@ -28,6 +28,10 @@ pub mod codes {
     /// A chunk or manifest would take the account over the bytes the server lets it store (HTTP 507); `quota` says
     /// how much it stores and may store.
     pub const QUOTA_EXCEEDED: &str = "quota_exceeded";
+    /// The server itself is full and refuses new uploads (HTTP 507; the admin set `refuse_when_full`): its disk is
+    /// down to the reserve, or its store holds as much as the admin said it may. Not the account's quota; `server`
+    /// says what the server knows of its room. Older clients don't know the code and see a server error (HTTP 507).
+    pub const SERVER_FULL: &str = "server_full";
     /// `join`: the code is wrong, expired or used (never which).
     pub const INVALID_CODE: &str = "invalid_code";
     /// `join`: an invite to an account without a password needs one; send it again with `password`.
@@ -268,8 +272,12 @@ impl std::fmt::Debug for AdminPasswordReset {
     }
 }
 
-/// `GET /admin/server`: counters and kinds, nothing about paths, addresses or settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `GET /admin/server`: counters and kinds, nothing about paths, addresses or settings, and whether the server's parts
+/// are well.
+///
+/// The `Option` fields at the end are the health: each is left out of the JSON when the server has no answer, and reads
+/// as `None` when an older server did not send it, so a client and a server of different versions keep working.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminServerInfo {
     pub version: String,
     /// Accounts that are not marked for removal.
@@ -282,6 +290,25 @@ pub struct AdminServerInfo {
     pub storage_kind: String,
     /// `sqlite` or `postgres`.
     pub database_kind: String,
+    /// When the server started, in milliseconds since the Unix epoch (the admin works out the uptime against its own
+    /// clock or the server's time of day).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ms: Option<i64>,
+    /// Whether the database answered. The server answers this overview from it, so a server that can answer at all says
+    /// `true`; a database that is down fails the call instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_ok: Option<bool>,
+    /// Whether the blob store answered a probe (a size query for an object that never exists, answered within 2
+    /// seconds; nothing is written). A store that fails or is silent is `false`, never an error of the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_ok: Option<bool>,
+    /// When that probe ran, in milliseconds since the Unix epoch. The server keeps its answer for 30 seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_check_ms: Option<i64>,
+    /// Whether the server refuses new uploads now because it is full (`refuse_when_full` is on and even a smallest upload
+    /// would not fit: the disk is at its reserve or the store at its capacity). `false` when the setting is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusing_uploads: Option<bool>,
 }
 
 /// `GET /admin/storage`: server-wide storage counts and the ten largest accounts, and how much room the server has.

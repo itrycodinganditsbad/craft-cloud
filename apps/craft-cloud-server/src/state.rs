@@ -143,6 +143,12 @@ pub struct AppState {
     pub trash_days: u32,
     /// Where to measure the room the server has, and the `capacity` the admin set (the admin's storage overview).
     pub storage_info: StorageInfo,
+    /// Refuses new uploads while the server is full (`[storage] refuse_when_full`); `None`: off, the default.
+    pub full: Option<crate::full::FullGuard>,
+    /// When the server started, in milliseconds since the Unix epoch (the admin's overview).
+    pub started_ms: i64,
+    /// The blob store's last health probe, kept for 30 seconds ([`crate::health`]).
+    pub store_health: crate::health::StoreHealth,
     /// The time of day for everything a request records (a device's last use, a stored blob, a commit).
     clock: Clock,
 }
@@ -173,6 +179,9 @@ impl AppState {
             dummy_hash: hash_password("craft-cloud dummy password")?,
             trash_days: 30,
             storage_info: StorageInfo::default(),
+            full: None,
+            started_ms: now_ms(),
+            store_health: crate::health::StoreHealth::default(),
             clock: Arc::new(now_ms),
         })
     }
@@ -220,6 +229,27 @@ impl AppState {
     pub fn with_storage_info(mut self, info: StorageInfo) -> Self {
         self.storage_info = info;
         self
+    }
+
+    /// The state that refuses uploads while it is full (`None`: it never does, the default).
+    pub fn with_full_guard(mut self, guard: Option<crate::full::FullGuard>) -> Self {
+        self.full = guard;
+        self
+    }
+
+    /// Refuses an upload of `incoming` bytes with `507 server_full` when the server is full and was told to refuse.
+    pub async fn check_server_room(&self, incoming: u64) -> Result<(), ApiError> {
+        match &self.full {
+            Some(guard) => guard.check(&self.meta, incoming).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Counts bytes just stored toward the room the server believes it has left.
+    pub fn note_stored(&self, bytes: u64) {
+        if let Some(guard) = &self.full {
+            guard.note_written(bytes);
+        }
     }
 
     /// The state with another clock: a simulation's, so that what requests record and when a device's last use is

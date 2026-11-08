@@ -248,7 +248,7 @@ impl AgentError {
             | AgentError::Lock(LockError::Busy(_) | LockError::NotAFile(_))
             | AgentError::Revoked
             | AgentError::OtherAccountState(_)
-            | AgentError::Server(TransportError::Protocol(_) | TransportError::QuotaExceeded { .. })
+            | AgentError::Server(TransportError::Protocol(_) | TransportError::QuotaExceeded { .. } | TransportError::ServerFull)
             | AgentError::Sync(SyncError::Corrupt(_))
             | AgentError::Account(AccountError::Newer { .. } | AccountError::Damaged { .. })
             | AgentError::NeedsYou(_) => Exit::NeedsYou,
@@ -2144,6 +2144,8 @@ mod tests {
             (SyncError::Transport(TransportError::Protocol("a refusal naming no operation".into())), Exit::NeedsYou),
             // Only with no room left at all: a file that doesn't fit while others still may is skipped instead.
             (SyncError::Transport(TransportError::QuotaExceeded { used: 10, limit: 10 }), Exit::NeedsYou),
+            // The server itself refuses uploads: nothing fits, whatever the file.
+            (SyncError::Transport(TransportError::ServerFull), Exit::NeedsYou),
             (SyncError::Io { path: "an interrupted download".into(), source: std::io::Error::other("x") }, Exit::Failed),
             (SyncError::Corrupt("chunk x of a.txt is damaged".into()), Exit::NeedsYou),
             (SyncError::Checkpoint(std::io::Error::other("disk full")), Exit::Failed),
@@ -2159,7 +2161,8 @@ mod tests {
                     | TransportError::Unauthorized
                     | TransportError::Unavailable(_)
                     | TransportError::Protocol(_)
-                    | TransportError::QuotaExceeded { .. },
+                    | TransportError::QuotaExceeded { .. }
+                    | TransportError::ServerFull,
                 )
                 | SyncError::Io { .. }
                 | SyncError::Corrupt(_)

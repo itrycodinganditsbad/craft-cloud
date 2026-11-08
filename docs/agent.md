@@ -18,7 +18,10 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
   often, at least every 5 minutes. When the server can't be reached it tries again with growing pauses, up to 5 minutes.
   If something needs you (the folder or its marker is missing, the device was signed out) it pauses and
   `status` says why; a missing folder or marker is looked at again every minute, and syncing goes on by
-  itself once it is back. Ctrl-C lets a running pass finish and stops; a second Ctrl-C stops at once.
+  itself once it is back. When the server itself is full (its admin turned on `refuse_when_full` and the server's disk
+  or capacity is used up) the agent pauses with "The server is full; the admin needs to free space or raise its
+  capacity" (never the account's storage message, which means the account's own quota) and looks again every 10
+  minutes; nothing is lost, and syncing goes on once the admin has freed space. Ctrl-C lets a running pass finish and stops; a second Ctrl-C stops at once.
 - While `run` runs, `sync --approve-deletes` from another terminal hands the approval to it: exactly the
   deletions `status` listed. If more came since, it lists them instead, approves nothing and exits 2; check
   the list and run it again. Every list of waiting deletions comes with its set (`set 3f9a…`), also in
@@ -111,7 +114,7 @@ most 8 KiB, and need the agent to be signed in (`not_signed_in` otherwise).
 
 | Local call | Server call | Body, answer |
 | --- | --- | --- |
-| `GET /v1/admin/server` | `GET /admin/server` | the server's counters and kinds; a member is refused `forbidden` |
+| `GET /v1/admin/server` | `GET /admin/server` | the server's counters and kinds, and its health (`started_ms`, `database_ok`, `store_ok`, `store_check_ms`, `refusing_uploads`, all optional); a member is refused `forbidden` |
 | `GET /v1/admin/storage` | `GET /admin/storage` | bounded storage overview: totals, quota counts, top ten accounts, manifest-index counts, and the room the server has (optional fields) |
 | `GET /v1/admin/users?cursor&limit&query` | `GET /admin/users` | a page of accounts by username; `next` is the cursor of the following page; `query` finds a username containing it |
 | `POST /v1/admin/users` | `POST /admin/users` | `{username, role, password, totp_code?, recovery_code?}` → the account and its invite code |

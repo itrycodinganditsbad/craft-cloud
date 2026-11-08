@@ -27,6 +27,8 @@
 //! path = "/var/lib/craft-cloud/blobs"
 //! # capacity = "1 TiB"          # what the store may hold, for the admin's storage overview (needed for S3 to show a size)
 //! # kind = "s3", bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http, capacity
+//! # refuse_when_full = true     # refuse new uploads when the disk is down to min_free, or the store holds `capacity` (default off)
+//! # min_free = "1 GiB"          # disk only, with refuse_when_full: the free space to keep (default 1 GiB)
 //!
 //! [two_factor]                  # optional: without it, two-factor sign-in can't be set up
 //! key_file = "two-factor.key"   # 32 random bytes, made by `init`; relative to this file
@@ -90,6 +92,16 @@ pub enum ConfigError {
     WebAdminNeedsProxy,
     #[error("web_admin.{0} = {1} is out of range: {2} to {3}")]
     WebAdminRange(&'static str, u32, u32, u32),
+    #[error("storage.min_free only goes with storage.refuse_when_full = true: without it nothing is refused, so the reserve would mean nothing")]
+    MinFreeWithoutRefusing,
+    #[error(
+        "storage.min_free is for a disk store: an S3 bucket has no free space to measure. Remove it, and set storage.capacity to bound the bucket"
+    )]
+    MinFreeOnS3,
+    #[error(
+        "storage.refuse_when_full = true on an S3 store needs storage.capacity: the bucket has no free space to measure, so the capacity is the only limit there is"
+    )]
+    RefuseOnS3WithoutCapacity,
 }
 
 /// Fewest and most days a deleted node waits in the trash.
@@ -280,11 +292,24 @@ pub enum StorageConfig {
         /// How much the store may hold, for the admin's storage overview. Unset: none is shown (the overview has the disk's own size besides).
         #[serde(default)]
         capacity: Option<Capacity>,
+        /// Refuse new uploads (`507 server_full`) when the filesystem would be left with less than `min_free`, or the store
+        /// would hold more than `capacity`. Default off: the numbers are information only.
+        #[serde(default)]
+        refuse_when_full: bool,
+        /// The free space to keep on the store's filesystem while `refuse_when_full` is on. Default 1 GiB.
+        #[serde(default, deserialize_with = "min_free_size")]
+        min_free: Option<Capacity>,
     },
     S3 {
         /// How much the bucket may hold, for the admin's storage overview. S3 has no size to ask for, so unset: none is shown.
         #[serde(default)]
         capacity: Option<Capacity>,
+        /// Refuse new uploads (`507 server_full`) when the store would hold more than `capacity` (which it then needs).
+        #[serde(default)]
+        refuse_when_full: bool,
+        /// Not for S3; read only to say so.
+        #[serde(default, deserialize_with = "min_free_size")]
+        min_free: Option<Capacity>,
         bucket: String,
         #[serde(default)]
         prefix: String,
@@ -310,20 +335,21 @@ pub struct Capacity(pub u64);
 impl Capacity {
     /// Reads `text` as a size, or says what is wrong with it.
     pub fn parse(text: &str) -> Result<Self, String> {
+        Self::parse_as(text, "storage.capacity")
+    }
+
+    /// [`Capacity::parse`] for the setting `field`, which the messages name.
+    pub fn parse_as(text: &str, field: &str) -> Result<Self, String> {
         let bad = || {
             format!(
-                "storage.capacity = {text:?} is not a size like \"1 TiB\" or \"500 GB\" (a number with at most one decimal, then B, KB, MB, GB, TB, KiB, MiB, GiB or TiB)"
+                "{field} = {text:?} is not a size like \"1 TiB\" or \"500 GB\" (a number with at most one decimal, then B, KB, MB, GB, TB, KiB, MiB, GiB or TiB)"
             )
         };
         let trimmed = text.trim();
         // A plain whole number is bytes.
         if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
-            let bytes: u64 = trimmed.parse().map_err(|_| format!("storage.capacity = {text:?} is too big (the most is about 16 EiB)"))?;
-            return if bytes == 0 {
-                Err(format!("storage.capacity = {text:?} is empty: give the size the store may hold, like \"1 TiB\""))
-            } else {
-                Ok(Self(bytes))
-            };
+            let bytes: u64 = trimmed.parse().map_err(|_| format!("{field} = {text:?} is too big (the most is about 16 EiB)"))?;
+            return if bytes == 0 { Err(format!("{field} = {text:?} is empty: give a size like \"1 TiB\"")) } else { Ok(Self(bytes)) };
         }
         let split = trimmed.find(|c: char| !(c.is_ascii_digit() || c == '.')).ok_or_else(bad)?;
         let (number, unit) = trimmed.split_at(split);
@@ -353,9 +379,9 @@ impl Capacity {
         let bytes = whole
             .checked_mul(multiplier)
             .and_then(|b| b.checked_add(multiplier / 10 * tenth + (multiplier % 10) * tenth / 10))
-            .ok_or_else(|| format!("storage.capacity = {text:?} is too big (the most is about 16 EiB)"))?;
+            .ok_or_else(|| format!("{field} = {text:?} is too big (the most is about 16 EiB)"))?;
         if bytes == 0 {
-            return Err(format!("storage.capacity = {text:?} is empty: give the size the store may hold, like \"1 TiB\""));
+            return Err(format!("{field} = {text:?} is empty: give a size like \"1 TiB\""));
         }
         Ok(Self(bytes))
     }
@@ -363,27 +389,35 @@ impl Capacity {
 
 impl<'de> Deserialize<'de> for Capacity {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl serde::de::Visitor<'_> for Visitor {
-            type Value = Capacity;
+        deserializer.deserialize_any(SizeVisitor("storage.capacity"))
+    }
+}
 
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a size like \"1 TiB\" or a number of bytes")
-            }
+/// Reads `storage.min_free` as a size, naming that setting in its messages.
+fn min_free_size<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Capacity>, D::Error> {
+    deserializer.deserialize_any(SizeVisitor("storage.min_free")).map(Some)
+}
 
-            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Capacity, E> {
-                Capacity::parse(text).map_err(E::custom)
-            }
+/// A size as text or a number of bytes, for the setting it names.
+struct SizeVisitor(&'static str);
 
-            fn visit_u64<E: serde::de::Error>(self, bytes: u64) -> Result<Capacity, E> {
-                Capacity::parse(&bytes.to_string()).map_err(E::custom)
-            }
+impl serde::de::Visitor<'_> for SizeVisitor {
+    type Value = Capacity;
 
-            fn visit_i64<E: serde::de::Error>(self, bytes: i64) -> Result<Capacity, E> {
-                Capacity::parse(&bytes.to_string()).map_err(E::custom)
-            }
-        }
-        deserializer.deserialize_any(Visitor)
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a size like \"1 TiB\" or a number of bytes")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Capacity, E> {
+        Capacity::parse_as(text, self.0).map_err(E::custom)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, bytes: u64) -> Result<Capacity, E> {
+        Capacity::parse_as(&bytes.to_string(), self.0).map_err(E::custom)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, bytes: i64) -> Result<Capacity, E> {
+        Capacity::parse_as(&bytes.to_string(), self.0).map_err(E::custom)
     }
 }
 
@@ -455,6 +489,13 @@ impl Config {
         if !(MIN_TRASH_DAYS..=MAX_TRASH_DAYS).contains(&config.retention.trash_days) {
             return Err(ConfigError::TrashDays(config.retention.trash_days));
         }
+        // The same rule as `ignore_forwarded_for`: a setting that would do nothing is refused, not ignored.
+        match &config.storage {
+            StorageConfig::Disk { refuse_when_full: false, min_free: Some(_), .. } => return Err(ConfigError::MinFreeWithoutRefusing),
+            StorageConfig::S3 { min_free: Some(_), .. } => return Err(ConfigError::MinFreeOnS3),
+            StorageConfig::S3 { refuse_when_full: true, capacity: None, .. } => return Err(ConfigError::RefuseOnS3WithoutCapacity),
+            _ => {}
+        }
         let mut config = config;
         if let Some(url) = &config.public_url {
             config.public_url = Some(public_url(url)?);
@@ -504,6 +545,19 @@ impl StorageConfig {
         }
     }
 
+    /// When the server refuses uploads because it is full (`refuse_when_full`), and where: `None` while the setting is off.
+    pub fn full_policy(&self) -> Option<crate::full::Policy> {
+        match self {
+            StorageConfig::Disk { refuse_when_full: true, min_free, capacity, .. } => {
+                Some(crate::full::Policy { capacity: capacity.map(|c| c.0), min_free: Some(min_free.map_or(crate::full::DEFAULT_MIN_FREE, |m| m.0)) })
+            }
+            StorageConfig::S3 { refuse_when_full: true, capacity, .. } => {
+                Some(crate::full::Policy { capacity: capacity.map(|c| c.0), min_free: None })
+            }
+            _ => None,
+        }
+    }
+
     /// The S3 settings, with credentials from the config or else the standard `AWS_ACCESS_KEY_ID` /
     /// `AWS_SECRET_ACCESS_KEY` environment variables. `None` for disk storage.
     pub fn s3(&self) -> Result<Option<S3Config>, ConfigError> {
@@ -550,7 +604,7 @@ path = "/tmp/blobs"
         let c = Config::parse(DISK).unwrap();
         assert_eq!(c.listen, "127.0.0.1:8080".parse().unwrap());
         assert!(!c.behind_proxy && c.trusted_proxies.is_empty());
-        assert_eq!(c.storage, StorageConfig::Disk { path: "/tmp/blobs".into(), capacity: None });
+        assert_eq!(c.storage, StorageConfig::Disk { path: "/tmp/blobs".into(), capacity: None, refuse_when_full: false, min_free: None });
         assert_eq!(c.storage.s3().unwrap(), None);
         assert_eq!(c.public_url, None);
     }
@@ -627,6 +681,83 @@ bucket = \"b\"
             .capacity(),
             Some(10_000_000_000_000)
         );
+    }
+
+    #[test]
+    fn refusing_uploads_when_full_is_off_unless_asked_and_checked() {
+        let disk = |extra: &str| {
+            Config::parse(&DISK.replace(
+                "path = \"/tmp/blobs\"",
+                &format!(
+                    "path = \"/tmp/blobs\"
+{extra}"
+                ),
+            ))
+        };
+        let s3 = |extra: &str| {
+            Config::parse(&format!(
+                "listen = \"127.0.0.1:8080\"
+[database]
+url = \"sqlite:/tmp/meta.db\"
+[storage]
+kind = \"s3\"
+bucket = \"b\"
+{extra}
+"
+            ))
+        };
+        use crate::full::{DEFAULT_MIN_FREE, Policy};
+        assert_eq!(Config::parse(DISK).unwrap().storage.full_policy(), None, "off by default");
+        assert_eq!(disk("refuse_when_full = false").unwrap().storage.full_policy(), None);
+        assert_eq!(
+            disk("refuse_when_full = true").unwrap().storage.full_policy(),
+            Some(Policy { capacity: None, min_free: Some(DEFAULT_MIN_FREE) }),
+            "a disk keeps 1 GiB by default"
+        );
+        assert_eq!(
+            disk(
+                "refuse_when_full = true
+min_free = \"5 GB\"
+capacity = \"1 TB\""
+            )
+            .unwrap()
+            .storage
+            .full_policy(),
+            Some(Policy { capacity: Some(1_000_000_000_000), min_free: Some(5_000_000_000) })
+        );
+        assert_eq!(
+            s3("refuse_when_full = true
+capacity = \"1 TB\"")
+            .unwrap()
+            .storage
+            .full_policy(),
+            Some(Policy { capacity: Some(1_000_000_000_000), min_free: None })
+        );
+        // Settings that would do nothing, or can't work, are refused.
+        assert!(matches!(disk("min_free = \"1 GiB\""), Err(ConfigError::MinFreeWithoutRefusing)));
+        assert!(matches!(s3("refuse_when_full = true"), Err(ConfigError::RefuseOnS3WithoutCapacity)));
+        assert!(matches!(
+            s3("refuse_when_full = true
+capacity = \"1 TB\"
+min_free = \"1 GB\""),
+            Err(ConfigError::MinFreeOnS3)
+        ));
+        // A bad reserve names its own setting.
+        let shown = disk(
+            "refuse_when_full = true
+min_free = \"lots\"",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(shown.contains("storage.min_free") && !shown.contains("storage.capacity"), "{shown}");
+        assert!(matches!(
+            disk(
+                "refuse_when_full = true
+min_free = 0"
+            ),
+            Err(ConfigError::Parse(_))
+        ));
+        assert!(matches!(disk("refuse_when_full = \"yes\""), Err(ConfigError::Parse(_))));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection, Que
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use craft_cloud_meta::MetaError;
-use craft_cloud_proto::api::{ErrorBody, QuotaUse, TwoFactorChallenge, codes};
+use craft_cloud_proto::api::{ErrorBody, QuotaUse, ServerRoom, TwoFactorChallenge, codes};
 use craft_cloud_proto::{ChunkId, Conflict};
 use craft_cloud_store::StoreError;
 
@@ -16,9 +16,12 @@ pub struct ApiError {
     pub code: &'static str,
     pub message: String,
     pub conflicts: Option<Vec<Conflict>>,
-    pub missing: Option<Vec<ChunkId>>,
+    /// A boxed slice, to keep this type small: every handler's `Result` carries it.
+    pub missing: Option<Box<[ChunkId]>>,
     /// Boxed: rare, and every handler's `Result` carries this type.
     pub quota: Option<Box<QuotaUse>>,
+    /// What the server knows of its room, for `server_full`. Boxed for the same reason as `quota`.
+    pub server: Option<Box<ServerRoom>>,
     /// Seconds for the `Retry-After` header.
     pub retry_after: Option<u32>,
     /// The challenge of `two_factor_required`. Boxed for the same reason as `quota`.
@@ -27,7 +30,7 @@ pub struct ApiError {
 
 impl ApiError {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into(), conflicts: None, missing: None, quota: None, retry_after: None, two_factor: None }
+        Self { status, code, message: message.into(), conflicts: None, missing: None, quota: None, server: None, retry_after: None, two_factor: None }
     }
 
     /// `507 quota_exceeded`: the account would store more than the server lets it.
@@ -35,6 +38,17 @@ impl ApiError {
         let message = format!("the account's storage on the server is full: {used} of {limit} bytes used");
         let mut e = Self::new(StatusCode::INSUFFICIENT_STORAGE, codes::QUOTA_EXCEEDED, message);
         e.quota = Some(Box::new(QuotaUse { used, limit }));
+        e
+    }
+
+    /// `507 server_full`: the server refuses new uploads because it is full (`refuse_when_full`). Not the account's quota.
+    pub fn server_full(room: ServerRoom) -> Self {
+        let mut e = Self::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            codes::SERVER_FULL,
+            "the server is full and is not taking new uploads: its admin needs to free space or raise its capacity",
+        );
+        e.server = Some(Box::new(room));
         e
     }
 
@@ -125,7 +139,7 @@ impl ApiError {
 
     pub fn missing_chunks(missing: Vec<ChunkId>) -> Self {
         let mut e = Self::new(StatusCode::CONFLICT, codes::MISSING_CHUNKS, format!("{} chunk(s) must be uploaded first", missing.len()));
-        e.missing = Some(missing);
+        e.missing = Some(missing.into_boxed_slice());
         e
     }
 }
@@ -225,8 +239,9 @@ impl IntoResponse for ApiError {
             error: self.code.to_owned(),
             message: self.message,
             conflicts: self.conflicts,
-            missing: self.missing,
+            missing: self.missing.map(Vec::from),
             quota: self.quota.map(|q| *q),
+            server: self.server.map(|r| *r),
             two_factor: self.two_factor.map(|t| *t),
         };
         let mut response = (self.status, Json(body)).into_response();

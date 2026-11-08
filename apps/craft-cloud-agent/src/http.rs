@@ -445,6 +445,8 @@ fn error_for(status: StatusCode, body: Option<ErrorBody>) -> TransportError {
         (Some(codes::QUOTA_EXCEEDED), Some(ErrorBody { quota: Some(quota), .. })) => {
             return TransportError::QuotaExceeded { used: quota.used, limit: quota.limit };
         }
+        // By the code alone: the numbers in the body are only for the admin.
+        (Some(codes::SERVER_FULL), _) => return TransportError::ServerFull,
         _ => {}
     }
     match status {
@@ -1319,6 +1321,13 @@ mod tests {
         assert_eq!(error_for(StatusCode::INSUFFICIENT_STORAGE, Some(full)), TransportError::QuotaExceeded { used: 9, limit: 10 });
         // Without the numbers it is only a server error: tried again later.
         assert!(matches!(error_for(StatusCode::INSUFFICIENT_STORAGE, Some(body(codes::QUOTA_EXCEEDED))), TransportError::Unavailable(_)));
+        // The server itself is full: its own error, with or without the numbers.
+        assert_eq!(error_for(StatusCode::INSUFFICIENT_STORAGE, Some(body(codes::SERVER_FULL))), TransportError::ServerFull);
+        let room = craft_cloud_proto::api::ServerRoom { free_bytes: Some(1), total_bytes: Some(2), capacity_bytes: None };
+        assert_eq!(
+            error_for(StatusCode::INSUFFICIENT_STORAGE, Some(ErrorBody { server: Some(room), ..body(codes::SERVER_FULL) })),
+            TransportError::ServerFull
+        );
         assert_eq!(error_for(StatusCode::UNAUTHORIZED, Some(body(codes::UNAUTHORIZED))), TransportError::Unauthorized);
         assert_eq!(error_for(StatusCode::NOT_FOUND, None), TransportError::NotFound);
         assert!(matches!(error_for(StatusCode::TOO_MANY_REQUESTS, Some(body(codes::RATE_LIMITED))), TransportError::Unavailable(_)));
