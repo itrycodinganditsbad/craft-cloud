@@ -124,6 +124,12 @@ struct DbusMenu {
     clicks: Clicks,
 }
 
+/// `text` as a dbusmenu label: the menu's host takes the first `_` of a label as the mark of a keyboard shortcut (and drops
+/// it), and `__` for a `_` that is meant, so a name like `my_laptop` would otherwise show without its underscore.
+fn menu_label(text: &str) -> String {
+    text.replace('_', "__")
+}
+
 /// A menu entry's id.
 fn entry_id(index: usize) -> i32 {
     i32::try_from(index).map_or(0, |i| i + 1)
@@ -134,7 +140,7 @@ impl DbusMenu {
     fn entries(&self) -> Vec<(i32, Props)> {
         let mut out = Vec::new();
         let mut status = HashMap::new();
-        status.insert("label".to_owned(), OwnedValue::from(zbus::zvariant::Str::from(self.line.as_str())));
+        status.insert("label".to_owned(), OwnedValue::from(zbus::zvariant::Str::from(menu_label(&self.line).as_str())));
         status.insert("enabled".to_owned(), OwnedValue::from(false));
         status.insert("visible".to_owned(), OwnedValue::from(true));
         out.push((STATUS_ID, status));
@@ -148,7 +154,7 @@ impl DbusMenu {
                 out.push((100 + entry_id(index), props));
             }
             let mut props = HashMap::new();
-            props.insert("label".to_owned(), OwnedValue::from(zbus::zvariant::Str::from(item.label(self.paused))));
+            props.insert("label".to_owned(), OwnedValue::from(zbus::zvariant::Str::from(menu_label(item.label(self.paused)).as_str())));
             props.insert("enabled".to_owned(), OwnedValue::from(true));
             props.insert("visible".to_owned(), OwnedValue::from(true));
             out.push((entry_id(index), props));
@@ -336,6 +342,14 @@ mod tests {
     use crate::model::Event;
     use std::io::{BufRead, Write};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn an_underscore_in_a_label_is_escaped_for_the_menu() {
+        assert_eq!(menu_label("Online · Up to date"), "Online · Up to date");
+        assert_eq!(menu_label("my_laptop"), "my__laptop");
+        assert_eq!(menu_label("_a__b_"), "__a____b__");
+        assert_eq!(menu_label(""), "");
+    }
 
     /// A private session bus for one test: `dbus-daemon`, stopped when dropped. `None` where there is no `dbus-daemon`.
     struct Bus {
