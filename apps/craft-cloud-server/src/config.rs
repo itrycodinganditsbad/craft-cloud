@@ -16,6 +16,8 @@
 //! # enabled = true
 //! # idle_minutes = 480          # a browser session ends after this long unused (5 to 1440)
 //! # absolute_hours = 168        # and at the latest after this long (1 to 720)
+//! # [spaces]                   # team spaces
+//! # team_live_bytes = 4_294_967_296   # cap on what one team space's live documents hold, in bytes (4 GiB)
 //! # [retention]
 //! # trash_days = 30   # how long a deleted file stays in the trash before the server may remove it (1 to 3650)
 //!
@@ -153,6 +155,9 @@ pub struct Config {
     pub web_admin: WebAdminConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// Limits of team spaces. The section is optional.
+    #[serde(default)]
+    pub spaces: SpacesConfig,
     pub database: DatabaseConfig,
     pub storage: StorageConfig,
     /// The key for the secrets of two-factor sign-in. Without it two-factor sign-in can't be set up (`503
@@ -182,6 +187,27 @@ pub struct TwoFactorConfig {
 
 fn default_live_bytes() -> u64 {
     craft_cloud_meta::DEFAULT_LIVE_BYTES_PER_SPACE
+}
+
+/// `[spaces]`: limits of team spaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpacesConfig {
+    /// The most bytes one team space's live documents may hold together, as `live_bytes_per_user` does for a personal
+    /// space: every update in their logs, compacted ones too. An update that would go over it is refused
+    /// (`quota_exceeded`). Default 4 GiB.
+    #[serde(default = "default_team_live_bytes")]
+    pub team_live_bytes: u64,
+}
+
+impl Default for SpacesConfig {
+    fn default() -> Self {
+        Self { team_live_bytes: default_team_live_bytes() }
+    }
+}
+
+fn default_team_live_bytes() -> u64 {
+    craft_cloud_meta::DEFAULT_TEAM_LIVE_BYTES
 }
 
 /// `[audit]`: how the security audit log is kept.

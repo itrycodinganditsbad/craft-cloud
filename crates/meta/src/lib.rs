@@ -44,8 +44,8 @@ pub use history::HistoryPage;
 pub use index::{BlobRecord, EdgeCheck, EdgeProblem, EdgeProblemKind, Finding, INDEX_BATCH_ROWS, IndexAudit, IndexState, Validation};
 pub use join::{InviteFor, Redeemed};
 pub use live::{
-    Appended, DEFAULT_LIVE_BYTES_PER_SPACE, LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE, MAX_LIVE_DOCS_PER_SPACE,
-    MAX_LIVE_DOCUMENTS_HOLDING_UPDATES, MAX_LIVE_DOCUMENTS_PER_SPACE, MAX_LIVE_PAGE, SnapshotRef,
+    Appended, DEFAULT_LIVE_BYTES_PER_SPACE, DEFAULT_TEAM_LIVE_BYTES, LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE,
+    MAX_LIVE_DOCS_PER_SPACE, MAX_LIVE_DOCUMENTS_HOLDING_UPDATES, MAX_LIVE_DOCUMENTS_PER_SPACE, MAX_LIVE_PAGE, SnapshotRef,
 };
 pub use spaces::{Member, SpaceActor, SpaceOwner, SpacePage, SpaceSummary, UserSpace, WriteGuard};
 pub use trash::{TrashEntry, TrashPage};
@@ -193,6 +193,8 @@ pub struct Meta {
     live_held_documents_cap: u64,
     /// The most bytes all of one space's live documents may hold ([`Meta::with_live_bytes_cap`]).
     live_bytes_cap: u64,
+    /// The same for a team space ([`Meta::with_team_live_bytes_cap`]).
+    team_live_bytes_cap: u64,
     /// How long audit events are kept when a write prunes them ([`Meta::with_audit_retention_days`]); `None`: a write never prunes.
     audit_retention_ms: Option<i64>,
     /// When the last complete pruning ran, and whether one runs now; shared by the clones.
@@ -291,6 +293,7 @@ impl Meta {
             live_documents_cap: MAX_LIVE_DOCUMENTS_PER_SPACE,
             live_held_documents_cap: MAX_LIVE_DOCUMENTS_HOLDING_UPDATES,
             live_bytes_cap: DEFAULT_LIVE_BYTES_PER_SPACE,
+            team_live_bytes_cap: DEFAULT_TEAM_LIVE_BYTES,
             audit_retention_ms: None,
             prune_state: Arc::new(audit::PruneState::new()),
             clock: None,
@@ -363,6 +366,14 @@ impl Meta {
     /// refused with [`MetaError::LiveFull`]. The cap belongs to this handle and its clones.
     pub fn with_live_bytes_cap(mut self, cap: u64) -> Self {
         self.live_bytes_cap = cap;
+        self
+    }
+
+    /// The store with another cap on the bytes all of one team space's live documents may hold (the default is
+    /// [`DEFAULT_TEAM_LIVE_BYTES`]; the server's `[spaces] team_live_bytes` sets it); an append over it is refused with
+    /// [`MetaError::LiveFull`]. Personal spaces keep [`Meta::with_live_bytes_cap`].
+    pub fn with_team_live_bytes_cap(mut self, cap: u64) -> Self {
+        self.team_live_bytes_cap = cap;
         self
     }
 
