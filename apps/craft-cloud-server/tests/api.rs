@@ -4405,6 +4405,52 @@ async fn none_in_the_config_wins_over_the_level_an_admin_sets() {
     assert_eq!((after.algorithm.as_str(), after.saving_permille), ("none", Some(0)));
 }
 
+/// Several admins changing the level at once end with the store at the level the database holds, whichever change was last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_level_changes_leave_the_store_at_the_stored_level() {
+    use craft_cloud_proto::api::{AdminCompression, AdminStorageOverview};
+    use reqwest::Method as M;
+    let db = tempfile::tempdir().unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    let s = start(meta, store.clone(), vec![db, blobs], None).await;
+    add_admin(&s, "root").await;
+    let root = login(&s, "root").await;
+    for round in 0..4u8 {
+        let puts = (1..=8u8).map(|n| {
+            let level = round * 4 + n;
+            call(&s, Some(&root), M::PUT, "/admin/storage/compression", Some(json!({ "level": level, "password": PASSWORD })))
+        });
+        for response in futures_util::future::join_all(puts).await {
+            let _: AdminCompression = get_json(response).await;
+        }
+        let overview: AdminStorageOverview = get_json(call(&s, Some(&root), M::GET, "/admin/storage", None).await).await;
+        let view = overview.compression.unwrap();
+        assert_eq!(Some(store.level()), view.admin_level, "round {round}: the store runs at the level the database holds");
+        assert_eq!(view.level, store.level());
+    }
+}
+
+/// A level in the database outside 1 to 19 (or not a number) is ignored at start, and the config's level stays.
+#[tokio::test]
+async fn a_stored_level_outside_the_range_is_ignored_at_start() {
+    let db = tempfile::tempdir().unwrap();
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    for stored in ["0", "20", "255", "-3", "high", ""] {
+        meta.set_server_value("compression_level", stored, 1).await.unwrap();
+        let store = Store::new(craft_cloud_store::memory::MemoryBackend::new());
+        assert_eq!(store.level(), 3);
+        let state = AppState::new(meta.clone(), store.clone(), vec![]).unwrap();
+        state.load_compression_level().await.unwrap();
+        assert_eq!(store.level(), 3, "{stored:?} is ignored");
+    }
+    meta.set_server_value("compression_level", "1", 2).await.unwrap();
+    let store = Store::new(craft_cloud_store::memory::MemoryBackend::new());
+    AppState::new(meta.clone(), store.clone(), vec![]).unwrap().load_compression_level().await.unwrap();
+    assert_eq!(store.level(), 1, "the edge of the range is taken");
+}
+
 /// An overview from a server before compression settings has no compression part, and one with it round-trips.
 #[test]
 fn the_overview_reads_with_and_without_the_compression_part() {

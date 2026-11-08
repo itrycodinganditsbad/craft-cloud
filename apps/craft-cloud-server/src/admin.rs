@@ -313,8 +313,12 @@ async fn set_compression(
         return Err(ApiError::invalid(format!("level is {} to {}", craft_cloud_store::MIN_ZSTD_LEVEL, craft_cloud_store::MAX_ZSTD_LEVEL)));
     }
     let actor = confirm(&state, &auth, Confirmation::new(req.password, req.totp_code, req.recovery_code)).await?;
-    state.meta.admin_set_compression_level(&actor, state.store.level(), req.level, state.now_ms()).await?;
-    state.store.set_level(req.level);
+    {
+        // Commit and apply as one step: two changes at once must leave the store at the level the database ends with.
+        let _changing = state.compression_change.lock().await;
+        state.meta.admin_set_compression_level(&actor, state.store.level(), req.level, state.now_ms()).await?;
+        state.store.set_level(req.level);
+    }
     tracing::info!(actor = %auth.device, level = req.level, "admin: compression level changed");
     Ok(Json(compression_view(&state, false).await?))
 }

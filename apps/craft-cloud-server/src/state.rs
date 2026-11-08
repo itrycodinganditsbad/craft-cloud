@@ -149,6 +149,9 @@ pub struct AppState {
     pub compression: CompressionSettings,
     /// The overview's compression totals, kept for a short while: they sum the whole blobs table.
     pub(crate) compression_totals: Mutex<Option<(i64, craft_cloud_meta::StorageTotals)>>,
+    /// Held while an admin's compression level is committed and applied to the store, so that concurrent changes leave
+    /// the store at the level the database ends with ([`crate::admin`]).
+    pub(crate) compression_change: tokio::sync::Mutex<()>,
     /// The time of day for everything a request records (a device's last use, a stored blob, a commit).
     clock: Clock,
 }
@@ -181,6 +184,7 @@ impl AppState {
             trash_days: 30,
             compression,
             compression_totals: Mutex::new(None),
+            compression_change: tokio::sync::Mutex::new(()),
             storage_info: StorageInfo::default(),
             clock: Arc::new(now_ms),
         })
@@ -229,10 +233,12 @@ impl AppState {
     /// Takes the level an admin set while the server ran (kept in the database) over the config's, for new writes. The
     /// config's `compression = "none"` still wins: the store then writes nothing compressed whatever the level.
     pub async fn load_compression_level(&self) -> Result<(), craft_cloud_meta::MetaError> {
-        if let Some((value, _)) = self.meta.server_value(crate::storage_tools::LEVEL_KEY).await?
-            && let Ok(level) = value.parse::<u8>()
-        {
-            self.store.set_level(level);
+        if let Some((value, _)) = self.meta.server_value(crate::storage_tools::LEVEL_KEY).await? {
+            // The same range the overview shows: a stored value outside it (a hand-edited row) is ignored, not clamped.
+            match value.parse::<u8>().ok().filter(|l| (craft_cloud_store::MIN_ZSTD_LEVEL..=craft_cloud_store::MAX_ZSTD_LEVEL).contains(l)) {
+                Some(level) => self.store.set_level(level),
+                None => tracing::warn!(value = %value, "the stored compression level is not 1 to 19 and is ignored"),
+            }
         }
         Ok(())
     }
