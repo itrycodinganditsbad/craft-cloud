@@ -205,7 +205,7 @@ impl Model {
             }
             AuditMsg::CloseActivity => {
                 if let Screen::Activity(a) = &self.screen {
-                    self.screen = Screen::SignedIn(a.overview.clone());
+                    self.screen = Screen::SignedIn(a.overview.restored());
                 }
                 Vec::new()
             }

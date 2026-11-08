@@ -683,7 +683,7 @@ impl Model {
     /// Back to the signed-in view; a code still shown, and anything typed, is dropped.
     fn leave_admin(&mut self) {
         if let Screen::Admin(admin) = &self.screen {
-            self.screen = Screen::SignedIn(admin.overview.clone());
+            self.screen = Screen::SignedIn(admin.overview.restored());
         }
     }
 }

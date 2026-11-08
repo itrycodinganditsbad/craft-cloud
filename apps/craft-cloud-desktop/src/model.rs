@@ -656,6 +656,15 @@ impl Overview {
         }
     }
 
+    /// This overview as it is shown again when the screen over it (Security, adding a computer, the admin pages, the activity)
+    /// is left. A request for the folder sizes that was under way is not waited for any more: the spinner goes, and an answer
+    /// that still comes is taken as it is when it matches.
+    pub(crate) fn restored(&self) -> Self {
+        let mut overview = self.clone();
+        overview.folders.loading = false;
+        overview
+    }
+
     /// The effect that asks for the conflict copies again, and makes its answer the current one.
     fn ask_conflicts(&mut self) -> Effect {
         self.conflicts_ticket = crate::admin::fresh();
@@ -1759,7 +1768,9 @@ impl Model {
                 Vec::new()
             }
             Event::FolderUsage { ticket, result } => {
-                if let Screen::SignedIn(overview) = &mut self.screen
+                // The overview may be under another screen (the Security page, adding a computer, the admin pages, the
+                // activity): the answer is for it all the same, or its spinner would never stop.
+                if let Some(overview) = self.overview_mut()
                     && overview.folders.ticket == ticket
                 {
                     overview.folders.loading = false;
@@ -1932,7 +1943,7 @@ impl Model {
                 if let (AddState::Waiting, Some(info)) = (&adding.state, &adding.info) {
                     effects.push(Effect::CancelPairing(info.id));
                 }
-                self.screen = Screen::SignedIn(adding.overview.clone());
+                self.screen = Screen::SignedIn(adding.overview.restored());
                 self.polling_pairing = false;
                 effects.push(Effect::Devices);
                 effects
@@ -2424,7 +2435,7 @@ impl Model {
         let Screen::Security(page) = &mut self.screen else { return Vec::new() };
         if event == SecurityEvent::Close {
             // Whatever the page showed (a secret, recovery codes) goes with it.
-            let overview = page.overview.clone();
+            let overview = page.overview.restored();
             self.screen = Screen::SignedIn(overview);
             return vec![Effect::Devices];
         }
@@ -4848,6 +4859,29 @@ pub(crate) mod tests {
         let list = crate::files::conflicts(craft_cloud_app::ConflictsResponse { copies, truncated }, place);
         assert!(m.update(Event::Conflicts { ticket, result: Ok(list) }).is_empty());
         m
+    }
+
+    /// The folder sizes asked for on the home page are answered while the overview is under another screen: the answer is
+    /// taken, and a spinner that was left on is off when the overview comes back.
+    #[test]
+    fn the_folder_sizes_answer_reaches_an_overview_under_another_screen() {
+        let data = craft_cloud_app::FolderUsageResponse { total_bytes: 5, total_files: 1, ..Default::default() };
+        let mut m = signed_in();
+        m.overview_mut().unwrap().usage_loading = false;
+        assert!(m.update(Event::ToggleFolders).iter().all(|e| matches!(e, Effect::FolderUsage { .. })));
+        let ticket = m.overview().map(|o| o.folders.ticket).unwrap_or(0);
+        m.update(Event::Tab(Tab::Security));
+        assert!(matches!(m.screen, Screen::Security(_)));
+        m.update(Event::FolderUsage { ticket, result: Ok(data.clone()) });
+        let folders = &m.overview().unwrap().folders;
+        assert!(!folders.loading && folders.data.as_ref() == Some(&data), "the answer is taken under the Security page");
+        m.update(Event::FolderUsage { ticket: ticket + 1, result: Err(Error::NotRunning("stale".into())) });
+        assert!(m.overview().unwrap().folders.error.is_none(), "another ticket's answer is still ignored");
+        // A request still under way when the screen over the overview is left no longer spins.
+        m.overview_mut().unwrap().folders.loading = true;
+        m.update(Event::Security(SecurityEvent::Close));
+        assert!(matches!(m.screen, Screen::SignedIn(_)));
+        assert!(!m.overview().unwrap().folders.loading);
     }
 
     #[test]
