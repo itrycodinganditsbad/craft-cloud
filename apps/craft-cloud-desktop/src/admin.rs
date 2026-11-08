@@ -2051,6 +2051,8 @@ pub(crate) mod tests {
             Event::SignOut,
             Event::SignOutHere,
             Event::Quit,
+            Event::CloseRequested,
+            Event::Exit,
             Event::Admin(AdminEvent::BackToList),
             Event::Admin(AdminEvent::Close),
             Event::Admin(AdminEvent::OpenUser(other)),
@@ -2069,6 +2071,39 @@ pub(crate) mod tests {
             model.update(event);
             assert!(admin(&model).leaving.is_none());
         }
+    }
+
+    /// Ending the app is a way out of the page too: the close button without a tray (the window would end with the edits)
+    /// and the Linux tray process's Exit ask first, and Discard then ends the app.
+    #[test]
+    fn ending_the_app_with_unsaved_edits_asks_first_and_discard_ends_it() {
+        let boss = agent(true, 2);
+        for (tray, event, then) in [
+            (false, Event::CloseRequested, vec![Effect::QuitApp]),
+            (false, Event::Exit, vec![Effect::QuitApp]),
+            (true, Event::CloseRequested, Vec::new()),
+        ] {
+            let (mut model, _) = on_an_account(&boss);
+            model.tray = tray;
+            type_into_the_account(&mut model, RoleChoice::Admin, "9");
+            model.window_visible = false;
+            assert!(model.update(event.clone()).is_empty(), "{event:?} waits: no effects");
+            assert!(matches!(model.screen, Screen::Admin(_)));
+            assert_eq!(admin(&model).leaving.as_deref(), Some(&event), "kept pending");
+            assert!(model.window_visible, "the window is shown for the question, tray or not");
+            // Keep editing drops it and nothing ends.
+            run(&mut model, &boss, ev(AdminEvent::KeepEditing));
+            assert!(admin(&model).leaving.is_none() && admin(&model).has_unsaved_edits());
+            assert!(model.window_visible);
+            // Asked again, Discard carries it out.
+            assert!(model.update(event.clone()).is_empty());
+            assert_eq!(model.update(Event::Admin(AdminEvent::DiscardEdits)), then, "{event:?}");
+        }
+        // Without edits they go through at once.
+        let (mut model, _) = on_an_account(&boss);
+        model.tray = false;
+        assert_eq!(model.update(Event::CloseRequested), vec![Effect::QuitApp]);
+        assert_eq!(model.update(Event::Exit), vec![Effect::QuitApp]);
     }
 
     /// Keep editing drops what was asked for and leaves the fields as typed; Discard sets them back and carries it out.

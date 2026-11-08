@@ -1999,7 +1999,7 @@ impl Model {
     }
 
     /// Whether `event` would drop role or quota edits of an account's admin page that were not saved. It is then not carried
-    /// out: the page asks "Discard the unsaved changes?" and [`AdminEvent::DiscardEdits`] carries it out afterwards, while
+    /// out (the app ending too: a close without a tray, the Linux tray's Exit): the page asks "Discard the unsaved changes?" and [`AdminEvent::DiscardEdits`] carries it out afterwards, while
     /// [`AdminEvent::KeepEditing`] drops it. The window is shown for the question (a Quit from the tray comes with it hidden).
     fn asks_to_discard(&mut self, event: &Event) -> bool {
         let locked = self.tabs_locked();
@@ -2009,6 +2009,8 @@ impl Model {
         let leaves = match event {
             Event::Tab(tab) => Some(*tab) != current && !locked,
             Event::SignOut | Event::SignOutHere | Event::Quit => !locked,
+            // The window's close button without a tray, and the Linux tray process's Quit, end the app and the edits with it.
+            Event::CloseRequested | Event::Exit => true,
             Event::Admin(AdminEvent::Close) => true,
             Event::Admin(AdminEvent::BackToList) | Event::Audit(AuditMsg::OpenAudit(_)) => no_dialog,
             Event::Admin(AdminEvent::OpenUser(id)) => no_dialog && !matches!(&admin.view, crate::admin::View::User(view) if view.id == *id),
