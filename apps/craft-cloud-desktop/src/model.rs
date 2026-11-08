@@ -261,8 +261,6 @@ pub struct Overview {
     pub removing: Option<DeviceId>,
     /// The computer being renamed on the Computers page: its row is a text field.
     pub renaming: Option<Rename>,
-    /// The last [`Rename::ticket`] given.
-    pub rename_tickets: u64,
     /// What went wrong with the last action (pause), for people.
     pub error: Option<String>,
     /// Whether the server lets this account use the admin pages (asked at sign-in).
@@ -395,7 +393,6 @@ impl Overview {
             usage_error: None,
             removing: None,
             renaming: None,
-            rename_tickets: 0,
             error: None,
             access: Access::Unknown,
             session: crate::admin::fresh(),
@@ -742,6 +739,9 @@ pub struct Model {
     app_autostart: Option<bool>,
     versions_ticket: u64,
     trash_ticket: u64,
+    /// The last [`Rename::ticket`] given. It belongs to the model, not to an overview, so that an answer that was on its
+    /// way when the overview was replaced can't match a rename of the new one.
+    rename_ticket: u64,
     usage_request_id: u64,
     /// What the last admin check said for the sign-in. The pages that don't carry the signed-in view (versions, trash)
     /// read it for the header's Admin tab, and a view made when they are left starts with it.
@@ -770,6 +770,7 @@ impl Model {
             app_autostart: None,
             versions_ticket: 0,
             trash_ticket: 0,
+            rename_ticket: 0,
             usage_request_id: 0,
             access: Access::Unknown,
             names: Names::default(),
@@ -1366,6 +1367,7 @@ impl Model {
                 Vec::new()
             }
             Event::SaveRename => {
+                let ticket = self.rename_ticket.wrapping_add(1);
                 let Some(overview) = self.overview_mut() else { return Vec::new() };
                 let Some(rename) = overview.renaming.as_mut().filter(|r| !r.busy) else { return Vec::new() };
                 let name = match check_device_name(&rename.name) {
@@ -1383,11 +1385,10 @@ impl Model {
                 }
                 rename.error = None;
                 rename.busy = true;
-                overview.rename_tickets = overview.rename_tickets.wrapping_add(1);
-                let ticket = overview.rename_tickets;
                 if let Some(rename) = overview.renaming.as_mut() {
                     rename.ticket = ticket;
                 }
+                self.rename_ticket = ticket;
                 vec![Effect::RenameDevice { id, name, ticket }]
             }
             Event::Renamed(id, ticket, result) => {
@@ -3496,6 +3497,27 @@ pub(crate) mod tests {
         let mut unknown = signed_in();
         assert!(unknown.update(Event::StartRename(DeviceId::generate())).is_empty());
         assert_eq!(unknown.overview().and_then(|o| o.renaming.clone()), None);
+    }
+
+    /// A late answer of an earlier rename must not close the field of a later one, even when the overview was replaced in
+    /// between (leaving for another page and coming back starts a new overview).
+    #[test]
+    fn a_late_rename_answer_does_not_close_the_field_of_a_newer_rename() {
+        let (mut m, this, other) = with_two_computers();
+        m.update(Event::StartRename(other.id));
+        type_name(&mut m, "Studio PC");
+        let effects = m.update(Event::SaveRename);
+        assert_eq!(effects, vec![Effect::RenameDevice { id: other.id, name: "Studio PC".into(), ticket: 1 }]);
+        m.update(Event::Tab(Tab::Trash));
+        m.update(Event::Tab(Tab::Overview));
+        m.update(Event::Devices(Ok(vec![this, other.clone()])));
+        m.update(Event::StartRename(other.id));
+        type_name(&mut m, "Second name");
+        let effects = m.update(Event::SaveRename);
+        assert_eq!(effects, vec![Effect::RenameDevice { id: other.id, name: "Second name".into(), ticket: 2 }]);
+        // The first answer comes late: the second rename is still waiting.
+        m.update(Event::Renamed(other.id, 1, Ok(DeviceInfo { name: "Studio PC".into(), ..other.clone() })));
+        assert!(renaming(&m).is_some_and(|r| r.busy && r.ticket == 2));
     }
 
     #[test]
