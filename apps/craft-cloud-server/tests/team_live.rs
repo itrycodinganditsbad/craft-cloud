@@ -361,9 +361,7 @@ on_every_backend!(
 );
 
 // The default ping (30 s) never comes within these: only the check of the frame itself can end the connection.
-on_every_backend!(
-    default_ping,
-    slow_limits, a_write_is_checked_against_the_database_before_any_ping,);
+on_every_backend!(default_ping, slow_limits, a_write_is_checked_against_the_database_before_any_ping,);
 
 // ---- the scenarios ----
 
