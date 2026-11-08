@@ -43,7 +43,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use craft_cloud_api::api::ErrorAnswer as ErrorBody;
-use craft_cloud_api::local::docs::{HELD, IMPORT, MAX_BINARY_BYTES, PRESENCE, PRESENCE_FROM, STATE, UPDATE, USER_BYTES, decode_binary, encode_binary};
+use craft_cloud_api::local::docs::{
+    HELD, IMPORT, MAX_BINARY_BYTES, PRESENCE, PRESENCE_FROM, STATE, UPDATE, USER_BYTES, decode_binary, encode_binary,
+};
 use craft_cloud_api::local::{DocState, DocsEvent, DocsRequest, MAX_LOCAL_JSON_BYTES, paths};
 use craft_cloud_api::{DocId, SpaceId};
 use tungstenite::client::IntoClientRequest;
