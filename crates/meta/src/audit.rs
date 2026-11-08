@@ -96,11 +96,12 @@ pub enum AuditAction {
     CliSpaceCreated,
     CliSpaceMemberChanged,
     CliSpaceArchived,
+    CliLiveReset,
 }
 
 impl AuditAction {
     /// Every action, in the order the documentation lists them.
-    pub const ALL: [AuditAction; 44] = [
+    pub const ALL: [AuditAction; 45] = [
         AuditAction::AuthLogin,
         AuditAction::AuthLoginFailed,
         AuditAction::AuthSecondFactorFailed,
@@ -145,6 +146,7 @@ impl AuditAction {
         AuditAction::CliSpaceCreated,
         AuditAction::CliSpaceMemberChanged,
         AuditAction::CliSpaceArchived,
+        AuditAction::CliLiveReset,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -193,6 +195,7 @@ impl AuditAction {
             AuditAction::CliSpaceCreated => "cli.space_created",
             AuditAction::CliSpaceMemberChanged => "cli.space_member_changed",
             AuditAction::CliSpaceArchived => "cli.space_archived",
+            AuditAction::CliLiveReset => "cli.live_reset",
         }
     }
 
@@ -238,7 +241,8 @@ impl AuditAction {
             | AuditAction::SpaceArchived
             | AuditAction::SpaceUnarchived
             | AuditAction::SpaceMemberLeft
-            | AuditAction::CliSpaceArchived => &[],
+            | AuditAction::CliSpaceArchived
+            | AuditAction::CliLiveReset => &[],
             AuditAction::SpaceQuotaChanged => &[QuotaBytes],
             AuditAction::SpaceMemberInvited => &[User, SpaceRoleTo],
             AuditAction::SpaceMemberJoined | AuditAction::SpaceMemberDeclined | AuditAction::SpaceMemberRemoved => &[User],
@@ -956,7 +960,7 @@ mod tests {
             assert_eq!(AuditAction::parse(action.as_str()), Some(action));
             assert!(action.as_str().bytes().all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'.'));
         }
-        assert_eq!(seen.len(), 44);
+        assert_eq!(seen.len(), 45);
         assert_eq!(AuditAction::parse("auth.login "), None);
         assert_eq!(AuditAction::parse("AUTH.LOGIN"), None);
     }

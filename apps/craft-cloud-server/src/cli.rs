@@ -264,6 +264,9 @@ pub enum LiveAction {
         app: String,
         #[arg(long)]
         space: Option<String>,
+        /// Empty a document of an archived team space too (refused otherwise: the space is read-only).
+        #[arg(long, requires = "space")]
+        force: bool,
     },
 }
 
@@ -637,10 +640,11 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                 Err(CliError::Inconsistent(format!("{} manifest(s) could not be indexed", report.unreadable.len())))
             }
         }
-        Command::Live { config, action: LiveAction::ResetDoc { username, app, space } } => {
+        Command::Live { config, action: LiveAction::ResetDoc { username, app, space, force } } => {
             let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
             let user = user_id(&meta, &username).await?;
             // The user's own space, or the team space `--space` names (which the user must be able to read).
+            let audited = space.is_some();
             let (space, whose) = match space {
                 None => (user.space, user.username.clone()),
                 Some(text) => {
@@ -648,18 +652,21 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                     if meta.space_access(user.id, space).await?.is_none() {
                         return Err(CliError::Usage(format!("{} is not a member of that space", user.username)));
                     }
+                    if !force && meta.admin_space(space).await?.archived_ms.is_some() {
+                        return Err(CliError::Usage("that space is archived and read-only; add --force to empty its document anyway".into()));
+                    }
                     (space, format!("the space {text}"))
                 }
             };
             if let Ok(id) = app.parse::<uuid::Uuid>() {
                 let doc = craft_cloud_proto::DocId::from_uuid(id);
-                meta.reset_live_doc(space, doc).await?;
+                meta.reset_live_doc_audited(space, doc, audited.then(now_ms)).await?;
                 writeln!(out, "emptied the live document {doc} of {whose}; every machine sends its own again when it next connects")?;
                 return Ok(());
             }
             let app = craft_cloud_proto::live::AppName::new(&app).map_err(|e| CliError::Usage(e.to_string()))?;
             let doc = craft_cloud_proto::live::recents_doc(space, &app);
-            meta.reset_live_doc(space, doc).await?;
+            meta.reset_live_doc_audited(space, doc, audited.then(now_ms)).await?;
             writeln!(out, "emptied the {app} recents of {whose}; every machine sends its own again when it next connects")?;
             Ok(())
         }

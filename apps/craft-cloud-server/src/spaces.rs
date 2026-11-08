@@ -175,10 +175,9 @@ pub(crate) fn changed(state: &AppState, space: SpaceId) {
     state.notifier.members_changed(space);
 }
 
-/// After an account was disabled or marked for removal: the long-polls of every team space it was a member of look again,
-/// and so do its live connections (a connection that has lost its access ends).
+/// After an account was disabled or marked for removal: the long-polls and live connections of every team space it was a
+/// member of look at their access again. (Its own devices' live connections are ended by the caller, with the devices.)
 pub(crate) async fn wake_spaces_of(state: &AppState, user: UserId) {
-    state.live.revoke_user(user);
     match state.meta.member_space_ids(user).await {
         Ok(spaces) => spaces.into_iter().for_each(|space| changed(state, space)),
         Err(e) => tracing::warn!(error = %e, "couldn't list the spaces to wake"),

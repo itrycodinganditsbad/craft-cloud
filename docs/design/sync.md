@@ -669,8 +669,8 @@ changes locally, then pushes local changes. These rules came out of the simulati
   `cli.devices_revoked_all`, `cli.user_removed`, and the team space events (`target_kind = space`, the space's ID as
   `target_id`): `space.created`, `space.renamed`, `space.archived`, `space.unarchived`, `space.quota_changed`,
   `space.member_invited`, `space.member_joined`, `space.member_declined`, `space.member_role_changed`,
-  `space.member_removed`, `space.member_left`, `cli.space_created`, `cli.space_member_changed` and `cli.space_archived`
-  (see the collaboration design). A name whose change does not exist yet (`user remove`, the renaming,
+  `space.member_removed`, `space.member_left`, `cli.space_created`, `cli.space_member_changed`, `cli.space_archived` and `cli.live_reset`
+  (a team space's live document emptied by `live reset-doc --space`; see the collaboration design). A name whose change does not exist yet (`user remove`, the renaming,
   archiving and quota changes of a space) is listed so the vocabulary a client filters by does not change; its writer
   arrives with that change.
   - **Rows.** `id` (UUIDv7), `at_ms`, `actor_user` and `actor_device` (`NULL` for the command line, and for a sign-in that
