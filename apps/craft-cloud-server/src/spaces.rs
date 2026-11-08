@@ -182,7 +182,7 @@ fn space_name(text: &str) -> Result<SpaceName, ApiError> {
 }
 
 /// After a committed change: the space's long-polls look at their access again.
-fn changed(state: &AppState, space: SpaceId) {
+pub(crate) fn changed(state: &AppState, space: SpaceId) {
     state.notifier.members_changed(space);
 }
 

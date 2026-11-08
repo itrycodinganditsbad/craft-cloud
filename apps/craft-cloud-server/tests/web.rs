@@ -153,6 +153,13 @@ on_sqlite_and_postgres!(
     the_slash_path_has_the_same_headers_and_policy,
     a_change_that_outlives_its_session_is_refused,
     disabling_or_removing_over_the_pages_wakes_the_spaces_long_polls,
+    the_team_spaces_pages_are_for_administrators_and_need_csrf,
+    every_team_space_change_needs_the_confirmation,
+    team_spaces_are_made_listed_and_changed,
+    team_spaces_are_listed_in_pages_and_searched,
+    team_space_changes_are_audited_with_the_web_session_and_wake_the_long_polls,
+    an_admin_with_two_factor_confirms_a_team_space_with_a_code,
+    team_space_names_are_escaped,
 );
 
 // ---- helpers ----
@@ -1588,4 +1595,367 @@ async fn disabling_or_removing_over_the_pages_wakes_the_spaces_long_polls(s: &We
             .unwrap();
         assert!(matches!(res.status(), StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN), "{name}: {}", res.status());
     }
+}
+
+// ---- the Team spaces pages ----
+
+/// A team space made by the command line (so a test starts from a space without going through the page under test).
+async fn cli_space(s: &Web, name: &str, owner: &craft_cloud_meta::UserRecord) -> craft_cloud_proto::SpaceId {
+    use craft_cloud_meta::SpaceActor;
+    use craft_cloud_proto::SpaceName;
+    s.meta.create_team_space(&SpaceActor::Cli, &SpaceName::new(name).unwrap(), owner.id, None, 0).await.unwrap()
+}
+
+/// Every write of the Team spaces page, for the space `id`.
+fn space_changes(id: &str) -> Vec<(String, Vec<(&'static str, &'static str)>)> {
+    vec![
+        ("/web/spaces".to_owned(), vec![("name", "Fresh"), ("owner", "own")]),
+        (format!("/web/spaces/{id}/quota"), vec![("quota_mib", "8")]),
+        (format!("/web/spaces/{id}/archive"), vec![]),
+        (format!("/web/spaces/{id}/unarchive"), vec![]),
+        (format!("/web/spaces/{id}/owner"), vec![("owner", "newcomer")]),
+    ]
+}
+
+async fn the_space_is_untouched(s: &Web, space: craft_cloud_proto::SpaceId) {
+    let found = s.meta.admin_space(space).await.unwrap();
+    assert_eq!((found.name.as_str(), found.archived_ms, found.quota_bytes, found.owners, found.members), ("Studio", None, None, 1, 1));
+    assert_eq!(s.meta.admin_list_spaces(None, None, 10).await.unwrap().spaces.len(), 1, "no space was made");
+}
+
+async fn the_team_spaces_pages_are_for_administrators_and_need_csrf(s: &Web) {
+    s.add_admin("root").await;
+    s.add_admin("demoted").await;
+    let owner = s.add_user("own", Role::Member).await;
+    s.add_user("newcomer", Role::Member).await;
+    let space = cli_space(s, "Studio", &owner).await;
+    let id = space.as_uuid().to_string();
+    let (boss, demoted) = (s.sign_in("root").await, s.sign_in("demoted").await);
+    let res = s.act(&boss, &format!("/web/users/{}/update", s.id_of("demoted").await), &[("role", "member")]).await;
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+
+    // No session: the sign-in page for a page, 401 for a change. A demoted administrator's session: 403 for both.
+    for path in ["/web/spaces".to_owned(), format!("/web/spaces/{id}")] {
+        let res = s.get(&path, None).await;
+        assert_eq!((res.status(), location(&res).as_str()), (StatusCode::SEE_OTHER, "/web/login"), "{path}");
+        let res = s.get(&path, Some(&demoted.token)).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{path}");
+        assert!(!res.text().await.unwrap().contains("Studio"), "{path}");
+    }
+    for (path, extra) in space_changes(&id) {
+        let mut fields = extra.clone();
+        fields.push(("csrf", &boss.csrf));
+        fields.push(("password", PASSWORD));
+        assert_eq!(s.post(&path, None, &fields).await.status(), StatusCode::UNAUTHORIZED, "{path}: no session");
+        let res = s.act(&demoted, &path, &extra).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{path}: a demoted administrator");
+        // The CSRF token: missing, wrong, and another session's.
+        let mut fields = extra.clone();
+        fields.push(("password", PASSWORD));
+        assert_eq!(s.post(&path, Some(&boss.token), &fields).await.status(), StatusCode::FORBIDDEN, "{path}: no token");
+        for csrf in ["", "wrong", demoted.csrf.as_str()] {
+            let mut fields = fields.clone();
+            fields.push(("csrf", csrf));
+            let res = s.post(&path, Some(&boss.token), &fields).await;
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{path}: {csrf:?}");
+            assert!(res.text().await.unwrap().contains("out of date, or did not come from this site"));
+        }
+        // The origin: another site's form is refused before anything is read.
+        let mut fields = extra.clone();
+        fields.push(("csrf", &boss.csrf));
+        fields.push(("password", PASSWORD));
+        let res = s.post_from(&path, Some(&boss.token), Some("https://evil.example"), None, &fields).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{path}: another origin");
+        // A GET changes nothing.
+        let get = s.get(&path, Some(&boss.token)).await.status();
+        assert_eq!(get, if path == "/web/spaces" { StatusCode::OK } else { StatusCode::METHOD_NOT_ALLOWED }, "{path}");
+    }
+    the_space_is_untouched(s, space).await;
+}
+
+async fn every_team_space_change_needs_the_confirmation(s: &Web) {
+    let owner = s.add_user("own", Role::Member).await;
+    s.add_user("newcomer", Role::Member).await;
+    let space = cli_space(s, "Studio", &owner).await;
+    for (n, (path, extra)) in space_changes(&space.as_uuid().to_string()).iter().enumerate() {
+        // A fresh administrator per route: wrong passwords are counted per account.
+        let name = format!("adm{n}");
+        s.add_admin(&name).await;
+        let sess = s.sign_in(&name).await;
+        let mut fields: Vec<(&str, &str)> = extra.clone();
+        fields.push(("csrf", &sess.csrf));
+        let res = s.post(path, Some(&sess.token), &fields).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{path}: no password");
+        let mut wrong = fields.clone();
+        wrong.push(("password", "a wrong password"));
+        let res = s.post(path, Some(&sess.token), &wrong).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{path}: a wrong password");
+        assert!(res.text().await.unwrap().contains("the current password is wrong"), "{path}");
+        let mut empty = fields.clone();
+        empty.push(("password", ""));
+        assert_eq!(s.post(path, Some(&sess.token), &empty).await.status(), StatusCode::BAD_REQUEST, "{path}: an empty password");
+        let mut long = fields.clone();
+        let too_long = "x".repeat(1025);
+        long.push(("password", &too_long));
+        assert_eq!(s.post(path, Some(&sess.token), &long).await.status(), StatusCode::BAD_REQUEST, "{path}: a password that is too long");
+        the_space_is_untouched(s, space).await;
+    }
+}
+
+async fn team_spaces_are_made_listed_and_changed(s: &Web) {
+    s.add_admin("root").await;
+    let owner = s.add_user("own", Role::Member).await;
+    let heir = s.add_user("heir", Role::Member).await;
+    let gone = s.add_user("gone", Role::Member).await;
+    let boss = s.sign_in("root").await;
+
+    // The page: an empty list and the form, with the confirmation's password field and the navigation entry.
+    let html = s.get("/web/spaces", Some(&boss.token)).await.text().await.unwrap();
+    assert!(html.contains("No team spaces match.") && html.contains("action=\"/web/spaces\"") && html.contains("name=\"password\""), "{html}");
+    assert!(html.contains("<a href=\"/web/spaces\">Team spaces</a>"), "the navigation names the page");
+    assert!(!html.contains("name=\"totp_code\""), "no code field without two-factor sign-in");
+
+    // Create: the errors first, each with its status, and nothing made.
+    let create = |fields: Vec<(&'static str, &'static str)>| {
+        let boss = &boss;
+        async move { s.act(boss, "/web/spaces", &fields).await }
+    };
+    assert_eq!(create(vec![("name", ""), ("owner", "own")]).await.status(), StatusCode::BAD_REQUEST, "an empty name");
+    assert_eq!(create(vec![("name", " padded "), ("owner", "own")]).await.status(), StatusCode::BAD_REQUEST, "a padded name");
+    assert_eq!(create(vec![("name", "Studio"), ("owner", "no such")]).await.status(), StatusCode::BAD_REQUEST, "an owner that is no username");
+    assert_eq!(create(vec![("name", "Studio"), ("owner", "nobody")]).await.status(), StatusCode::NOT_FOUND, "an unknown owner");
+    assert_eq!(create(vec![("name", "Studio"), ("owner", "own"), ("quota_mib", "3")]).await.status(), StatusCode::BAD_REQUEST, "below one chunk");
+    assert_eq!(create(vec![("name", "Studio"), ("owner", "own"), ("quota_mib", "lots")]).await.status(), StatusCode::BAD_REQUEST, "not a number");
+    assert_eq!(
+        create(vec![("name", "Studio"), ("owner", "own"), ("remove_quota", "on")]).await.status(),
+        StatusCode::BAD_REQUEST,
+        "nothing to remove"
+    );
+    assert!(s.meta.admin_list_spaces(None, None, 10).await.unwrap().spaces.is_empty());
+    s.act(&boss, &format!("/web/users/{}/disable", gone.id.0), &[]).await;
+    assert_eq!(create(vec![("name", "Studio"), ("owner", "gone")]).await.status(), StatusCode::NOT_FOUND, "a disabled owner is the answer for none");
+    assert!(s.meta.admin_list_spaces(None, None, 10).await.unwrap().spaces.is_empty());
+
+    // Create: success goes to the space's page, which says so; the owner is a member from the start.
+    let res = create(vec![("name", "Studio"), ("owner", "Own"), ("quota_mib", "16")]).await;
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    let page_path = location(&res);
+    assert!(page_path.starts_with("/web/spaces/") && page_path.ends_with("?notice=created"), "{page_path}");
+    let space = s.meta.admin_list_spaces(None, None, 10).await.unwrap().spaces.remove(0);
+    assert_eq!((space.name.as_str(), space.owners, space.members, space.quota_bytes), ("Studio", 1, 1, Some(16 * 1024 * 1024)));
+    assert_eq!(create(vec![("name", "STUDIO"), ("owner", "heir")]).await.status(), StatusCode::CONFLICT, "a name is taken in any case");
+    assert_eq!(s.meta.admin_list_spaces(None, None, 10).await.unwrap().spaces.len(), 1);
+
+    let html = s.get(&page_path, Some(&boss.token)).await.text().await.unwrap();
+    assert!(html.contains("The team space was created.") && html.contains("Team space Studio"), "{html}");
+    assert!(html.contains("16.0 MiB") && html.contains(&format!("/web/users/{}", owner.id.0)) && html.contains("<td>owner</td>"), "{html}");
+    let html = s.get("/web/spaces", Some(&boss.token)).await.text().await.unwrap();
+    assert!(html.contains("Studio") && html.contains("0 B of 16.0 MiB") && html.contains("<td>active</td>"), "{html}");
+    let base = format!("/web/spaces/{}", space.id.as_uuid());
+
+    // The limit: set, refused, removed.
+    let post = |what: &str, fields: Vec<(&'static str, &'static str)>| {
+        let (boss, path) = (&boss, format!("{base}/{what}"));
+        async move { s.act(boss, &path, &fields).await }
+    };
+    let res = post("quota", vec![("quota_mib", "64")]).await;
+    assert_eq!((res.status(), location(&res)), (StatusCode::SEE_OTHER, format!("{base}?notice=quota")));
+    assert_eq!(s.meta.admin_space(space.id).await.unwrap().quota_bytes, Some(64 * 1024 * 1024));
+    for (fields, status) in [
+        (vec![], StatusCode::BAD_REQUEST),
+        (vec![("quota_mib", "1")], StatusCode::BAD_REQUEST),
+        (vec![("quota_mib", "-5")], StatusCode::BAD_REQUEST),
+        (vec![("quota_mib", "8"), ("remove_quota", "on")], StatusCode::BAD_REQUEST),
+    ] {
+        assert_eq!(post("quota", fields.clone()).await.status(), status, "{fields:?}");
+    }
+    assert_eq!(s.meta.admin_space(space.id).await.unwrap().quota_bytes, Some(64 * 1024 * 1024), "a refused limit changes nothing");
+    assert_eq!(post("quota", vec![("remove_quota", "on")]).await.status(), StatusCode::SEE_OTHER);
+    assert_eq!(s.meta.admin_space(space.id).await.unwrap().quota_bytes, None);
+    let html = s.get(&format!("{base}?notice=quota"), Some(&boss.token)).await.text().await.unwrap();
+    assert!(html.contains("The space&#39;s limit was changed.") && html.contains("<dt>Limit</dt><dd>none</dd>"), "{html}");
+
+    // Archive and unarchive: repeating either is no error.
+    for _ in 0..2 {
+        let res = post("archive", vec![]).await;
+        assert_eq!((res.status(), location(&res)), (StatusCode::SEE_OTHER, format!("{base}?notice=archived")));
+        assert!(s.meta.admin_space(space.id).await.unwrap().archived_ms.is_some());
+    }
+    let html = s.get(&base, Some(&boss.token)).await.text().await.unwrap();
+    assert!(html.contains("archived 20") && html.contains("Make the space active again") && !html.contains("Archive the space"), "{html}");
+    assert!(s.get("/web/spaces", Some(&boss.token)).await.text().await.unwrap().contains("archived 20"), "the list says so");
+    for _ in 0..2 {
+        let res = post("unarchive", vec![]).await;
+        assert_eq!((res.status(), location(&res)), (StatusCode::SEE_OTHER, format!("{base}?notice=unarchived")));
+        assert!(s.meta.admin_space(space.id).await.unwrap().archived_ms.is_none());
+    }
+
+    // The owner: an account named becomes an accepted owner at once; unknown, disabled and no username are refused.
+    assert_eq!(post("owner", vec![("owner", "nobody")]).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(post("owner", vec![("owner", "gone")]).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(post("owner", vec![("owner", "")]).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(post("owner", vec![("owner", "a b")]).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(s.meta.admin_space(space.id).await.unwrap().owners, 1);
+    let res = post("owner", vec![("owner", "heir")]).await;
+    assert_eq!((res.status(), location(&res)), (StatusCode::SEE_OTHER, format!("{base}?notice=owner")));
+    assert_eq!(post("owner", vec![("owner", "heir")]).await.status(), StatusCode::SEE_OTHER, "naming an owner twice is no error");
+    let members = s.meta.list_members(space.id).await.unwrap();
+    assert_eq!(members.iter().filter(|m| m.accepted() && m.role == craft_cloud_proto::api::SpaceRole::Owner).count(), 2);
+    assert!(members.iter().any(|m| m.user == heir.id));
+    let html = s.get(&base, Some(&boss.token)).await.text().await.unwrap();
+    assert!(html.contains("<th scope=\"row\"><a href=\"/web/users/") && html.contains(">heir</a>"), "{html}");
+
+    // A space that is not there, or an ID that is none: 404 for the page and for every change.
+    let missing = uuid::Uuid::now_v7();
+    for path in [format!("/web/spaces/{missing}"), "/web/spaces/not-an-id".to_owned()] {
+        assert_eq!(s.get(&path, Some(&boss.token)).await.status(), StatusCode::NOT_FOUND, "{path}");
+        for what in ["quota", "archive", "unarchive", "owner"] {
+            let res = s.act(&boss, &format!("{path}/{what}"), &[("quota_mib", "8"), ("owner", "heir")]).await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}/{what}");
+        }
+    }
+    // A personal space is no team space for these pages either.
+    let personal = s.meta.user_by_name("own").await.unwrap().unwrap().space;
+    assert_eq!(s.get(&format!("/web/spaces/{}", personal.as_uuid()), Some(&boss.token)).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(s.act(&boss, &format!("/web/spaces/{}/archive", personal.as_uuid()), &[]).await.status(), StatusCode::NOT_FOUND);
+    // An unknown notice has no words.
+    let html = s.get(&format!("{base}?notice=%3Cb%3E"), Some(&boss.token)).await.text().await.unwrap();
+    assert!(!html.contains("<b>") && !html.contains("class=\"notice\""), "{html}");
+}
+
+async fn team_spaces_are_listed_in_pages_and_searched(s: &Web) {
+    use craft_cloud_meta::SpaceActor;
+    use craft_cloud_proto::SpaceName;
+    s.add_admin("root").await;
+    let owner = s.add_user("own", Role::Member).await;
+    for n in 0..52 {
+        let name = SpaceName::new(&format!("Team {n:02}")).unwrap();
+        s.meta.create_team_space(&SpaceActor::Cli, &name, owner.id, None, 0).await.unwrap();
+    }
+    cli_space(s, "Düsseldorf Büro", &owner).await;
+    let boss = s.sign_in("root").await;
+    let first = s.get("/web/spaces", Some(&boss.token)).await.text().await.unwrap();
+    assert!(first.contains("Team 00") && !first.contains("Team 51") && !first.contains("First page"), "the first page has 50");
+    let marker = "href=\"/web/spaces?query=&amp;cursor=";
+    let next = first.split(marker).nth(1).expect("a next page").split('"').next().unwrap().to_owned();
+    let second = s.get(&format!("/web/spaces?query=&cursor={next}"), Some(&boss.token)).await.text().await.unwrap();
+    assert!(second.contains("Team 51") && !second.contains("Team 00") && second.contains("First page") && !second.contains("Next page"), "{second}");
+    // A search is a part of a name, in any case, also with letters that fold; an empty result says so; it is literal text, not a pattern.
+    let found = s.get("/web/spaces?query=B%C3%9CRO", Some(&boss.token)).await.text().await.unwrap();
+    assert!(found.contains("Düsseldorf Büro") && !found.contains("Team 00"), "{found}");
+    let found = s.get("/web/spaces?query=team%2051", Some(&boss.token)).await.text().await.unwrap();
+    assert!(found.contains("Team 51") && !found.contains("Team 50"), "{found}");
+    assert!(s.get("/web/spaces?query=zzz", Some(&boss.token)).await.text().await.unwrap().contains("No team spaces match."));
+    let found = s.get("/web/spaces?query=100%25_", Some(&boss.token)).await.text().await.unwrap();
+    assert!(found.contains("No team spaces match."), "a search is literal text, not a pattern");
+    // Bad queries: too long, a control character, a cursor that is none.
+    for bad in [
+        format!("/web/spaces?query={}", "a".repeat(65)),
+        "/web/spaces?query=a%00b".to_owned(),
+        "/web/spaces?cursor=***".to_owned(),
+        "/web/spaces?cursor=_-8".to_owned(),
+    ] {
+        assert_eq!(s.get(&bad, Some(&boss.token)).await.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+}
+
+async fn team_space_changes_are_audited_with_the_web_session_and_wake_the_long_polls(s: &Web) {
+    use craft_cloud_meta::AuditAction;
+    s.add_admin("root").await;
+    let root = s.id_of("root").await;
+    let owner = s.add_user("own", Role::Member).await;
+    let heir = s.add_user("heir", Role::Member).await;
+    let boss = s.sign_in("root").await;
+    let res = s.act(&boss, "/web/spaces", &[("name", "Studio"), ("owner", "own"), ("quota_mib", "8")]).await;
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    let space = s.meta.admin_list_spaces(None, None, 10).await.unwrap().spaces.remove(0).id;
+    let base = format!("/web/spaces/{}", space.as_uuid());
+
+    // The owner's long-poll on the space is woken by a change of the space.
+    let device = s.device("own").await;
+    let poll = {
+        let (client, url) = (s.client.clone(), s.url("/api/v1/changes?since=0&wait=30"));
+        tokio::spawn(async move { client.get(url).bearer_auth(device).header("craft-space", space.to_string()).send().await.unwrap() })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(!poll.is_finished(), "the long-poll waits");
+    assert_eq!(s.act(&boss, &format!("{base}/archive"), &[]).await.status(), StatusCode::SEE_OTHER);
+    tokio::time::timeout(std::time::Duration::from_secs(5), poll).await.expect("the archive woke the waiter").unwrap();
+
+    for (what, extra) in [("quota", vec![("quota_mib", "16")]), ("unarchive", vec![]), ("owner", vec![("owner", "heir")])] {
+        assert_eq!(s.act(&boss, &format!("{base}/{what}"), &extra).await.status(), StatusCode::SEE_OTHER, "{what}");
+    }
+    // Repeating a change that changes nothing writes no second event.
+    assert_eq!(s.act(&boss, &format!("{base}/unarchive"), &[]).await.status(), StatusCode::SEE_OTHER);
+    assert_eq!(s.act(&boss, &format!("{base}/owner"), &[("owner", "heir")]).await.status(), StatusCode::SEE_OTHER);
+
+    let events = s.meta.audit_list(&craft_cloud_meta::AuditQuery { limit: 200, ..Default::default() }).await.unwrap();
+    let on_space: Vec<_> = events.iter().filter(|e| e.target_id == Some(*space.as_uuid())).collect();
+    let count = |action: AuditAction| on_space.iter().filter(|e| e.action == action).count();
+    assert_eq!(
+        [
+            count(AuditAction::SpaceCreated),
+            count(AuditAction::SpaceQuotaChanged),
+            count(AuditAction::SpaceArchived),
+            count(AuditAction::SpaceUnarchived),
+            count(AuditAction::SpaceMemberRoleChanged)
+        ],
+        [1, 1, 1, 1, 1],
+        "{on_space:?}"
+    );
+    assert_eq!(on_space.len(), 5);
+    for event in &on_space {
+        // The administrator acted over a browser session: the account is the actor and there is no device, as for the other pages.
+        assert_eq!((event.actor_user.map(|u| u.0), event.actor_device, event.target_kind.as_str()), (Some(root), None, "space"), "{event:?}");
+        assert!(!event.details.contains("Studio"), "{}", event.details);
+    }
+    let owner_event = on_space.iter().find(|e| e.action == AuditAction::SpaceMemberRoleChanged).unwrap();
+    assert!(owner_event.details.contains(&heir.id.0.to_string()) && owner_event.details.contains("\"owner\""), "{}", owner_event.details);
+    let created = on_space.iter().find(|e| e.action == AuditAction::SpaceCreated).unwrap();
+    assert!(created.details.contains(&owner.id.0.to_string()) && created.details.contains("8388608"), "{}", created.details);
+    // The audit log's page shows them.
+    let html = s.get("/web/audit?action=space.", Some(&boss.token)).await.text().await.unwrap();
+    assert!(html.contains("space.created") && html.contains("space.quota_changed") && html.contains("space.archived"), "{html}");
+}
+
+async fn an_admin_with_two_factor_confirms_a_team_space_with_a_code(s: &Web) {
+    s.add_admin("root").await;
+    let owner = s.add_user("own", Role::Member).await;
+    let space = cli_space(s, "Studio", &owner).await;
+    let tf = turn_on_two_factor(s, "root").await;
+    let sess = sign_in_with_factor(s, "root", &tf).await;
+    let base = format!("/web/spaces/{}", space.as_uuid());
+    for path in ["/web/spaces".to_owned(), base.clone()] {
+        let html = s.get(&path, Some(&sess.token)).await.text().await.unwrap();
+        assert!(html.contains("name=\"totp_code\"") && html.contains("name=\"recovery_code\""), "{path}");
+    }
+    let archive = format!("{base}/archive");
+    assert_eq!(s.act(&sess, &archive, &[]).await.status(), StatusCode::FORBIDDEN, "no code");
+    assert_eq!(s.act(&sess, &archive, &[("totp_code", "000000")]).await.status(), StatusCode::FORBIDDEN, "a wrong code");
+    assert_eq!(s.act(&sess, &archive, &[("totp_code", "12")]).await.status(), StatusCode::BAD_REQUEST, "a code of the wrong shape");
+    assert!(s.meta.admin_space(space).await.unwrap().archived_ms.is_none());
+    let code = tf.fresh_code(s);
+    assert_eq!(s.act(&sess, &archive, &[("totp_code", &code)]).await.status(), StatusCode::SEE_OTHER);
+    assert!(s.meta.admin_space(space).await.unwrap().archived_ms.is_some());
+    assert_eq!(s.act(&sess, &format!("{base}/unarchive"), &[("totp_code", &code)]).await.status(), StatusCode::FORBIDDEN, "the code was used up");
+    let recovery = tf.recovery.first().unwrap().clone();
+    assert_eq!(s.act(&sess, &format!("{base}/unarchive"), &[("recovery_code", &recovery)]).await.status(), StatusCode::SEE_OTHER);
+    assert_eq!(s.act(&sess, &archive, &[("recovery_code", &recovery)]).await.status(), StatusCode::FORBIDDEN, "a recovery code serves once");
+}
+
+async fn team_space_names_are_escaped(s: &Web) {
+    s.add_admin("root").await;
+    s.add_user("own", Role::Member).await;
+    let boss = s.sign_in("root").await;
+    let nasty = "<script>alert(1)</script>";
+    let res = s.act(&boss, "/web/spaces", &[("name", nasty), ("owner", "own")]).await;
+    assert_eq!(res.status(), StatusCode::SEE_OTHER, "a name may hold these characters");
+    let page = location(&res);
+    for path in ["/web/spaces", page.as_str()] {
+        let html = s.get(path, Some(&boss.token)).await.text().await.unwrap();
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;") && !html.to_ascii_lowercase().contains("<script"), "{path}: {html}");
+    }
+    // The search box keeps what was typed, escaped.
+    let html = s.get("/web/spaces?query=%22%3E%3Cscript%3E", Some(&boss.token)).await.text().await.unwrap();
+    assert!(!html.to_ascii_lowercase().contains("<script"), "{html}");
 }
