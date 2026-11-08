@@ -132,7 +132,7 @@ fn pass_end(result: &Result<PassSummary, AgentError>, recheck_in: Option<Duratio
         // Deletes held behind a link can be approved too, so the loop looks for an approval while any is held (more
         // slowly: nothing else waits for it).
         Ok(summary) => PassEnd::Done { recheck_in, needs_approval: summary.needs_approval(), held: summary.held_set().is_some() },
-        Err(e) if e.exit() == Exit::NeedsYou => PassEnd::NeedsYou { reason: e.to_string(), recheck: recheck_for(e) },
+        Err(e) if e.exit() == Exit::NeedsYou => PassEnd::NeedsYou { reason: e.to_string(), reason_code: reason_code_for(e), recheck: recheck_for(e) },
         Err(e) => PassEnd::Failed(e.to_string()),
     }
 }
@@ -152,6 +152,15 @@ fn recheck_for(e: &AgentError) -> Recheck {
             | craft_cloud_sync::TransportError::ServerFull,
         ) => Recheck::Slowly,
         _ => Recheck::Never,
+    }
+}
+
+/// The machine-readable cause of a pause, for the local API's `reason_code`: only the causes an app treats on its own.
+fn reason_code_for(e: &AgentError) -> Option<String> {
+    match e {
+        AgentError::Server(craft_cloud_sync::TransportError::ServerFull) => Some(craft_cloud_proto::api::codes::SERVER_FULL.to_owned()),
+        AgentError::Server(craft_cloud_sync::TransportError::QuotaExceeded { .. }) => Some(craft_cloud_proto::api::codes::QUOTA_EXCEEDED.to_owned()),
+        _ => None,
     }
 }
 
@@ -413,7 +422,9 @@ fn to_wall(at: Ms, mono_now: Ms, wall_now: i64) -> i64 {
 fn without_times(status: &LoopStatus) -> LoopStatus {
     let state = match &status.state {
         LoopState::Retrying { message, .. } => LoopState::Retrying { next_try_ms: 0, message: message.clone() },
-        LoopState::Paused { reason, next_check_ms } => LoopState::Paused { reason: reason.clone(), next_check_ms: next_check_ms.map(|_| 0) },
+        LoopState::Paused { reason, next_check_ms, reason_code } => {
+            LoopState::Paused { reason: reason.clone(), next_check_ms: next_check_ms.map(|_| 0), reason_code: reason_code.clone() }
+        }
         other => other.clone(),
     };
     LoopStatus { heartbeat_ms: 0, state, ..status.clone() }
@@ -425,7 +436,7 @@ fn run_state(state: &LoopState) -> RunState {
         LoopState::Idle => RunState::Idle,
         LoopState::Syncing => RunState::Syncing,
         LoopState::Retrying { message, .. } => RunState::Retrying { message: message.clone() },
-        LoopState::Paused { reason, .. } => RunState::Paused { reason: reason.clone() },
+        LoopState::Paused { reason, reason_code, .. } => RunState::Paused { reason: reason.clone(), reason_code: reason_code.clone() },
         LoopState::Stopping | LoopState::Stopped => RunState::Stopping,
         LoopState::SignedOut => RunState::SignedOut,
         LoopState::PausedByUser => RunState::PausedByUser,
@@ -569,7 +580,9 @@ impl Status {
             Phase::Idle => LoopState::Idle,
             Phase::Syncing => LoopState::Syncing,
             Phase::Retrying { next_try, message } => LoopState::Retrying { next_try_ms: self.wall(next_try), message },
-            Phase::Paused { reason, next_check } => LoopState::Paused { reason, next_check_ms: next_check.map(|at| self.wall(at)) },
+            Phase::Paused { reason, reason_code, next_check } => {
+                LoopState::Paused { reason, reason_code, next_check_ms: next_check.map(|at| self.wall(at)) }
+            }
             Phase::Stopping => LoopState::Stopping,
         }
     }
@@ -676,7 +689,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
     status.write_now(match data.load_account() {
         Ok(Some(_)) => LoopState::Idle,
         Ok(None) => LoopState::SignedOut,
-        Err(e) => LoopState::Paused { reason: e.to_string(), next_check_ms: None },
+        Err(e) => LoopState::Paused { reason: e.to_string(), next_check_ms: None, reason_code: None },
     });
     let api = match LocalApi::start(data, control.clone()).await {
         Ok(api) => api,
@@ -1168,7 +1181,7 @@ async fn wait_needing_you(
     let _ = out.flush();
     let mut commands_open = true;
     loop {
-        status.write(LoopState::Paused { reason: reason.to_owned(), next_check_ms: None }, false, false);
+        status.write(LoopState::Paused { reason: reason.to_owned(), next_check_ms: None, reason_code: None }, false, false);
         let wake = Duration::from_millis(status.next_beat.saturating_sub(status.now()));
         tokio::select! {
             command = commands.recv(), if commands_open => match command {
@@ -1378,12 +1391,15 @@ mod tests {
         assert!(matches!(pass_end(&Err(protocol), None), PassEnd::NeedsYou { recheck: Recheck::Slowly, .. }));
         // A full account: the admin may allow more at any time.
         let full = AgentError::Server(TransportError::QuotaExceeded { used: 10, limit: 10 });
-        assert!(matches!(pass_end(&Err(full), None), PassEnd::NeedsYou { recheck: Recheck::Slowly, .. }));
+        assert!(
+            matches!(pass_end(&Err(full), None), PassEnd::NeedsYou { recheck: Recheck::Slowly, reason_code: Some(ref code), .. } if code == "quota_exceeded")
+        );
         // A full server: the admin may free space at any time, and the pause says it is the server, not the account.
         let server_full = AgentError::Server(TransportError::ServerFull);
         match pass_end(&Err(server_full), None) {
-            PassEnd::NeedsYou { reason, recheck: Recheck::Slowly } => {
+            PassEnd::NeedsYou { reason, reason_code, recheck: Recheck::Slowly } => {
                 assert!(reason.contains("The server is full") && !reason.contains("account"), "{reason}");
+                assert_eq!(reason_code.as_deref(), Some("server_full"));
             }
             other => panic!("{other:?}"),
         }
@@ -1483,12 +1499,12 @@ mod tests {
             let next_check_ms = Some(at + jitter[(i + 1) % jitter.len()]);
             if i == 100 {
                 // A pause in between is a real change: written at once, then left alone the same way.
-                status.write(LoopState::Paused { reason: "gone".into(), next_check_ms }, false, false);
+                status.write(LoopState::Paused { reason: "gone".into(), next_check_ms, reason_code: None }, false, false);
                 assert!(file.exists(), "a new state is written at once");
                 std::fs::remove_file(&file).unwrap();
                 for _ in 0..50 {
                     let next_check_ms = Some(at + jitter[i % jitter.len()]);
-                    status.write(LoopState::Paused { reason: "gone".into(), next_check_ms }, false, false);
+                    status.write(LoopState::Paused { reason: "gone".into(), next_check_ms, reason_code: None }, false, false);
                 }
                 assert!(!file.exists(), "an unchanged pause isn't written again before the heartbeat");
                 status.write(LoopState::Retrying { next_try_ms, message: "offline".into() }, false, false);

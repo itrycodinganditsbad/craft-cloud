@@ -513,12 +513,16 @@ fn snapshot_adding_a_computer() {
 
 #[test]
 fn snapshot_removed_and_error() {
-    let removed = Status { removed: true, run_state: RunState::Paused { reason: "the server no longer accepts this device".into() }, ..signed_in() };
+    let removed = Status {
+        removed: true,
+        run_state: RunState::Paused { reason: "the server no longer accepts this device".into(), reason_code: None },
+        ..signed_in()
+    };
     let model = after(&FakeAgent::new(removed), Vec::new());
     assert_eq!(model.screen, Screen::Removed);
     snapshot(model, egui::Theme::Light, "removed");
     let damaged = Status {
-        run_state: RunState::Paused { reason: "/home/fabio/.local/share/craft-cloud-agent/account.json is damaged (expected value at line 1 column 2); move it away. Then sign in again".into() },
+        run_state: RunState::Paused { reason: "/home/fabio/.local/share/craft-cloud-agent/account.json is damaged (expected value at line 1 column 2); move it away. Then sign in again".into(), reason_code: None },
         ..signed_out()
     };
     snapshot(after(&FakeAgent::new(damaged), Vec::new()), egui::Theme::Light, "error");

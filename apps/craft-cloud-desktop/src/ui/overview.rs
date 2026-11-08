@@ -15,7 +15,7 @@ pub fn sync_line(status: &Status) -> (String, Option<String>) {
         RunState::Syncing => ("Syncing…".into(), None),
         RunState::Retrying { message } if !status.online => (format!("Can't reach {server} — trying again"), Some(message.clone())),
         RunState::Retrying { message } => ("Syncing failed — trying again".into(), Some(message.clone())),
-        RunState::Paused { reason } => (super::problem_line(reason), Some(reason.clone())),
+        RunState::Paused { reason, .. } => (super::problem_line(reason), Some(reason.clone())),
         RunState::PausedByUser => ("Paused: nothing syncs until you resume".into(), None),
         RunState::Stopping => ("Stopping…".into(), None),
         RunState::SignedOut => ("Not signed in".into(), None),

@@ -880,7 +880,7 @@ async fn a_problem_found_at_start_keeps_the_agent_up_and_says_so() {
     let api = api_file(data.path()).await;
     let now = status(&api);
     assert!(!now.signed_in, "{now:?}");
-    let RunState::Paused { reason } = &now.run_state else { panic!("{now:?}") };
+    let RunState::Paused { reason, .. } = &now.run_state else { panic!("{now:?}") };
     assert!(reason.contains("account.json"), "{reason}");
     // Nothing else can be done until it is put right.
     let (code, body) = call(&api, "POST", "/v1/join", r#"{"join":"c.example/K7M4-Q9TX"}"#);
@@ -1043,7 +1043,7 @@ async fn a_second_computer_joins_with_a_code_from_the_first() {
     std::fs::write(b.folder.join("from-b.txt"), "made on B").unwrap();
     eventually(
         "B says it was removed",
-        || matches!(status(&b.api).run_state, RunState::Paused { ref reason } if reason.contains("no longer accepts")),
+        || matches!(status(&b.api).run_state, RunState::Paused { ref reason, .. } if reason.contains("no longer accepts")),
     )
     .await;
     assert!(status(&b.api).removed, "told apart from other stops, for the app");
