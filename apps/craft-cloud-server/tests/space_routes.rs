@@ -12,9 +12,9 @@ use craft_cloud_proto::api::{
     AdminSpaceInfo, AdminSpaceList, AuditPage, ErrorBody, LoginResponse, SPACE_HEADER, SpaceList, SpaceListItem, SpaceMember, SpaceMembers,
     SpaceResponse, SpaceRole, SpaceUsage,
 };
+use craft_cloud_proto::colour::member_colour;
 use craft_cloud_server::AppState;
 use craft_cloud_server::auth::hash_password;
-use craft_cloud_server::spaces::member_colour;
 use craft_cloud_store::Store;
 use craft_cloud_store::disk::DiskBackend;
 use reqwest::{Client, Method, StatusCode};

@@ -33,6 +33,7 @@ use craft_cloud_proto::api::{
     AddSpaceMember, AdminCreateSpace, AdminSetSpaceOwner, AdminSpaceInfo, AdminSpaceList, ChangeSpaceMember, SpaceConfirm, SpaceList, SpaceListItem,
     SpaceMember, SpaceMembers, SpaceRole, SpaceUsage, UpdateSpace, UsageEstimateReason, UsageEstimates,
 };
+use craft_cloud_proto::colour::member_colour;
 use craft_cloud_proto::{SpaceId, SpaceName};
 use serde::Deserialize;
 use uuid::Uuid;
@@ -81,18 +82,6 @@ pub fn admin_routes() -> Router<Shared> {
 }
 
 // ---- helpers ----
-
-/// The palette index an account's colour is drawn from: BLAKE3 of a fixed label and the account's ID, read as a big-endian
-/// number, modulo the 12 colours. Derived, not stored, so every machine computes the same one.
-pub fn member_colour(user: Uuid) -> u8 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"craft-cloud member colour v1");
-    hasher.update(user.as_bytes());
-    let digest = hasher.finalize();
-    let remainder = digest.as_bytes().iter().fold(0u32, |acc, byte| (acc * 256 + u32::from(*byte)) % 12);
-    // At most 11.
-    u8::try_from(remainder).unwrap_or(0)
-}
 
 fn space_id(id: Result<Path<SpaceId>, PathRejection>) -> Result<SpaceId, ApiError> {
     Ok(id?.0)
@@ -520,18 +509,4 @@ async fn admin_set_owner(
     state.meta.set_owner_accepted(&admin, space, UserId(req.user), state.now_ms()).await?;
     changed(&state, space);
     Ok(StatusCode::NO_CONTENT)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_colour_is_one_of_twelve_and_the_same_every_time() {
-        let user = Uuid::now_v7();
-        assert!(member_colour(user) < 12);
-        assert_eq!(member_colour(user), member_colour(user));
-        let seen: std::collections::BTreeSet<u8> = (0..200).map(|_| member_colour(Uuid::now_v7())).collect();
-        assert!(seen.len() > 6, "the colours are spread: {seen:?}");
-    }
 }

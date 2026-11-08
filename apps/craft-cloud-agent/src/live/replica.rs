@@ -78,8 +78,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use craft_cloud_proto::api::codes;
 use craft_cloud_proto::live::{
-    AppName, ClientFrame, DocKind, LIVE_DOCUMENTS_PROTOCOL, LIVE_PROTOCOL_MAX, LIVE_PROTOCOL_MIN, MAX_SNAPSHOT_BYTES, MAX_SUBSCRIPTIONS,
-    MAX_UPDATE_BYTES, PROTOCOL_MISMATCH, ServerFrame, node_doc, recents_doc, update_hash,
+    AppName, ClientFrame, DocKind, LIVE_DOCUMENTS_PROTOCOL, LIVE_PROTOCOL_MIN, MAX_SNAPSHOT_BYTES, MAX_SUBSCRIPTIONS, MAX_UPDATE_BYTES,
+    PROTOCOL_MISMATCH, ServerFrame, node_doc, recents_doc, update_hash,
 };
 use craft_cloud_proto::local::{NotLiveReason, RecentEntry};
 use craft_cloud_proto::{DocId, Epoch, ManifestId, NodeId, SpaceId};
@@ -1597,10 +1597,11 @@ impl<S: DocStore> Replica<S> {
         self.recover_waiting_doc(id, Kind::Recents(app), hash)
     }
 
-    /// A connection to the server is open: the first frame to send.
+    /// A connection to the server is open: the first frame to send. The agent speaks live protocol 2 until it learns
+    /// team spaces (protocol 3): it asks for nothing newer, so the server never sends it `welcome_space`.
     pub fn connected(&mut self) -> Vec<ClientFrame> {
         self.link = Link::Hello;
-        vec![ClientFrame::Hello { min: LIVE_PROTOCOL_MIN, max: LIVE_PROTOCOL_MAX }]
+        vec![ClientFrame::Hello { min: LIVE_PROTOCOL_MIN, max: LIVE_DOCUMENTS_PROTOCOL }]
     }
 
     /// The connection ended: everything is subscribed and sent again on the next one. A document of a file still being
@@ -2522,6 +2523,8 @@ impl<S: DocStore> Replica<S> {
         match frame {
             ServerFrame::Welcome { .. } | ServerFrame::Update { .. } | ServerFrame::Subscribed { .. } | ServerFrame::Ack { .. } => Ok(Vec::new()),
             ServerFrame::Created { .. } => Ok(Vec::new()),
+            // Protocol 3 frames: this agent asks for protocol 2 only, so a server never sends them.
+            ServerFrame::WelcomeSpace { .. } | ServerFrame::PresenceFrom { .. } => Ok(Vec::new()),
             ServerFrame::Error { code, message, doc, client_seq } => self.refused(&code, &message, doc, client_seq),
             ServerFrame::Compact { doc: id, upto } => {
                 let Some(doc) = self.docs.get_mut(&id) else { return Ok(Vec::new()) };

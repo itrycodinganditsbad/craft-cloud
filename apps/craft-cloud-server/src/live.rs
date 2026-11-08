@@ -325,6 +325,15 @@ struct Subscription {
     import: bool,
 }
 
+/// The newest live protocol this server answers `hello` with. Protocol 3 (team spaces) is in the wire format already but
+/// the server does not serve it yet, so it answers a newer agent with protocol 2, exactly as before.
+const SERVER_LIVE_MAX: u32 = LIVE_DOCUMENTS_PROTOCOL;
+
+/// The protocol a `hello` naming `min` to `max` gets: the highest both speak, within what the server serves.
+fn negotiate(min: u32, max: u32) -> Option<u32> {
+    shared_version(min, max).map(|protocol| protocol.min(SERVER_LIVE_MAX)).filter(|protocol| *protocol >= min)
+}
+
 /// What [`Session::handle`] answers.
 #[derive(Debug, Default)]
 pub struct Reply {
@@ -401,7 +410,7 @@ impl Session {
         let one = |frame| Reply { frames: vec![frame], close: false };
         if !self.welcomed {
             return match frame {
-                ClientFrame::Hello { min, max } => match shared_version(min, max) {
+                ClientFrame::Hello { min, max } => match negotiate(min, max) {
                     Some(protocol) => match self.state.meta.live_epoch(self.space).await {
                         Ok(epoch) => {
                             self.welcomed = true;
@@ -420,7 +429,7 @@ impl Session {
                             format!(
                                 "the server speaks live protocol {}-{}, the agent {min}-{max}: update the older one",
                                 craft_cloud_proto::live::LIVE_PROTOCOL_MIN,
-                                craft_cloud_proto::live::LIVE_PROTOCOL_MAX
+                                SERVER_LIVE_MAX
                             ),
                             None,
                             None,
@@ -917,6 +926,17 @@ mod tests {
     use craft_cloud_proto::live::{AppName, recents_doc};
     use craft_cloud_store::Store;
     use craft_cloud_store::memory::MemoryBackend;
+
+    /// Until protocol 3 is served, a newer agent gets protocol 2 and an agent that needs 3 gets a mismatch.
+    #[test]
+    fn the_server_answers_at_most_protocol_two_for_now() {
+        assert_eq!(negotiate(1, 1), Some(1));
+        assert_eq!(negotiate(1, 2), Some(2));
+        assert_eq!(negotiate(1, 3), Some(2));
+        assert_eq!(negotiate(2, 9), Some(2));
+        assert_eq!(negotiate(3, 3), None);
+        assert_eq!(negotiate(4, 9), None);
+    }
 
     /// A session of a fresh account's device, past `hello`, with its recents document for `wordcraft` made.
     async fn session(limits: crate::state::Limits) -> (Session, DocId, Meta, DeviceAuth) {
