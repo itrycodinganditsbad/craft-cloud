@@ -158,6 +158,31 @@ fn a_refusal_read_only_is_never_retried() {
     assert_eq!(a.model().texts(), vec!["refused"], "the model keeps what was made before the refusal");
 }
 
+/// A role lowered while the document is open, then raised: what was made meanwhile was kept, not lost, and goes up when
+/// the document is opened again with a role that allows it (the agent said `read_only` only as of the open).
+#[test]
+fn changes_made_as_a_viewer_go_up_when_the_role_is_raised() {
+    let hub = Hub::new();
+    hub.team();
+    let ana_pc = hub.machine_as("ana-pc", "ana").unwrap();
+    let ben_pc = hub.machine_as("ben-pc", "ben").unwrap();
+    let mut a = open::<App>(&ana_pc, "k.txt", Notes::new("k", &[]));
+    let mut b = open::<App>(&ben_pc, "k.txt", Notes::default());
+    hub.set_read_only("ana", true);
+    change(&mut a, |m| m.with_item(0, "kept")).unwrap();
+    until(&mut [&mut a, &mut b], "ana is a viewer", |s| s.first().is_some_and(|a| a.status().viewer));
+    assert_eq!(hub.updates("k.txt"), 0);
+    assert_eq!(a.poll().status.queued, 1, "the change is kept, unsent");
+
+    // The role is raised; the agent drops the connection (as it does for `access_changed`), and the session opens again.
+    hub.set_read_only("ana", false);
+    ana_pc.drop_connections();
+    until(&mut [&mut a, &mut b], "the kept change reached ben", |s| {
+        s.first().is_some_and(|a| !a.status().viewer && a.status().queued == 0) && s.get(1).is_some_and(|b| b.model().texts() == ["kept"])
+    });
+    assert!(change(&mut a, |m| m.with_item(1, "more")).is_ok(), "editing works again");
+}
+
 /// `session.blobs()` is bound to the document's space: in a team space the other member gets the blob; the unbound
 /// constructor keeps it in the personal space, where they don't.
 #[test]
