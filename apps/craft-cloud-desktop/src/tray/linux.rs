@@ -110,10 +110,16 @@ impl StatusItem {
     async fn new_tool_tip(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
 
-/// The menu (`com.canonical.dbusmenu`): the root (0) and one entry per [`Item`] (ids from 1), with separators (ids
-/// from 100).
+/// The id of the menu's first line, the sync state (disabled: it is no button), and of the separator under it.
+const STATUS_ID: i32 = 200;
+const STATUS_SEPARATOR_ID: i32 = 100;
+
+/// The menu (`com.canonical.dbusmenu`): the root (0), the state's line ([`STATUS_ID`]) and one entry per [`Item`] (ids from
+/// 1), with separators (ids from 100).
 struct DbusMenu {
     paused: bool,
+    /// The state in words, the first line.
+    line: String,
     revision: u32,
     clicks: Clicks,
 }
@@ -127,6 +133,14 @@ impl DbusMenu {
     /// The entries, in order: id and properties (separators included).
     fn entries(&self) -> Vec<(i32, Props)> {
         let mut out = Vec::new();
+        let mut status = HashMap::new();
+        status.insert("label".to_owned(), OwnedValue::from(zbus::zvariant::Str::from(self.line.as_str())));
+        status.insert("enabled".to_owned(), OwnedValue::from(false));
+        status.insert("visible".to_owned(), OwnedValue::from(true));
+        out.push((STATUS_ID, status));
+        let mut separator = HashMap::new();
+        separator.insert("type".to_owned(), OwnedValue::from(zbus::zvariant::Str::from("separator")));
+        out.push((STATUS_SEPARATOR_ID, separator));
         for (index, item) in Item::ALL.iter().enumerate() {
             if item.after_separator() {
                 let mut props = HashMap::new();
@@ -223,7 +237,7 @@ impl DbusMenu {
 /// The tray on a bus.
 pub struct SniTray {
     connection: Connection,
-    shown: Option<(TrayState, bool)>,
+    shown: Option<(TrayState, bool, String)>,
 }
 
 /// Whether a StatusNotifierWatcher (a tray) is on the bus `connection` is on.
@@ -265,7 +279,7 @@ pub fn start_on(connection: Connection, clicks: Clicks) -> Result<SniTray, Strin
     {
         let server = connection.object_server();
         server.at(ITEM_PATH, StatusItem { state: TrayState::NeedsAttention, clicks: clicks.clone() }).map_err(e)?;
-        server.at(MENU_PATH, DbusMenu { paused: false, revision: 1, clicks }).map_err(e)?;
+        server.at(MENU_PATH, DbusMenu { paused: false, line: super::status_line(None), revision: 1, clicks }).map_err(e)?;
     }
     let name = format!("org.kde.StatusNotifierItem-{}-1", std::process::id());
     connection.request_name(name.as_str()).map_err(e)?;
@@ -288,25 +302,26 @@ pub fn start_on(connection: Connection, clicks: Clicks) -> Result<SniTray, Strin
 }
 
 impl Tray for SniTray {
-    fn show(&mut self, state: TrayState, paused: bool) {
-        if self.shown == Some((state, paused)) {
+    fn show(&mut self, state: TrayState, paused: bool, line: &str) {
+        if self.shown.as_ref().is_some_and(|(s, p, l)| (*s, *p, l.as_str()) == (state, paused, line)) {
             return;
         }
-        let before = self.shown.replace((state, paused));
+        let before = self.shown.replace((state, paused, line.to_owned()));
         let server = self.connection.object_server();
-        if before.map(|b| b.0) != Some(state)
+        if before.as_ref().map(|b| b.0) != Some(state)
             && let Ok(item) = server.interface::<_, StatusItem>(ITEM_PATH)
         {
             item.get_mut().state = state;
             let _ = zbus::block_on(StatusItem::new_icon(item.signal_emitter()));
             let _ = zbus::block_on(StatusItem::new_tool_tip(item.signal_emitter()));
         }
-        if before.map(|b| b.1) != Some(paused)
+        if before.as_ref().map(|b| (b.1, b.2.as_str())) != Some((paused, line))
             && let Ok(menu) = server.interface::<_, DbusMenu>(MENU_PATH)
         {
             let revision = {
                 let mut menu = menu.get_mut();
                 menu.paused = paused;
+                menu.line = line.to_owned();
                 menu.revision = menu.revision.wrapping_add(1);
                 menu.revision
             };
@@ -464,12 +479,20 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(labels(&menu), ["Open Craft Cloud", "Open folder", "Pause", "Quit"]);
+        assert_eq!(labels(&menu), ["Needs your attention", "Open Craft Cloud", "Open folder", "Pause", "Quit"]);
+        // The first line is no button: it is disabled.
+        let (_, (_, _, children)): (u32, Node) = menu.call("GetLayout", &(0i32, -1i32, Vec::<String>::new())).unwrap();
+        let (id, props, _): Node = children.into_iter().next().unwrap().try_into().unwrap();
+        assert_eq!((id, bool::try_from(props.get("enabled").unwrap().try_clone().unwrap()).unwrap()), (STATUS_ID, false));
+        menu.call::<_, _, ()>("Event", &(STATUS_ID, "clicked", Value::from(0i32), 0u32)).unwrap();
         menu.call::<_, _, ()>("Event", &(4i32, "clicked", Value::from(0i32), 0u32)).unwrap();
         assert_eq!(events.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), Event::Quit);
 
-        tray.show(TrayState::Paused, true);
-        assert_eq!(labels(&menu), ["Open Craft Cloud", "Open folder", "Resume", "Quit"]);
+        tray.show(TrayState::Paused, true, "Online · Paused");
+        assert_eq!(labels(&menu), ["Online · Paused", "Open Craft Cloud", "Open folder", "Resume", "Quit"]);
+        // The state alone changing updates the line too.
+        tray.show(TrayState::Syncing, true, "Online · Syncing…");
+        assert_eq!(labels(&menu), ["Online · Syncing…", "Open Craft Cloud", "Open folder", "Resume", "Quit"]);
         menu.call::<_, _, ()>("Event", &(3i32, "clicked", Value::from(0i32), 0u32)).unwrap();
         assert_eq!(events.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), Event::Resume);
         // Read afresh, as a host does on NewToolTip (the proxy above keeps what it read first).
@@ -477,7 +500,7 @@ mod tests {
             zbus::blocking::fdo::PropertiesProxy::builder(&host).destination(name.as_str()).unwrap().path(ITEM_PATH).unwrap().build().unwrap();
         let interface = zbus::names::InterfaceName::try_from("org.kde.StatusNotifierItem").unwrap();
         let tip: (String, Vec<Pixmap>, String, String) = properties.get(interface, "ToolTip").unwrap().try_into().unwrap();
-        assert_eq!((tip.2.as_str(), tip.3.as_str()), ("Craft Cloud", "Paused"));
+        assert_eq!((tip.2.as_str(), tip.3.as_str()), ("Craft Cloud", "Syncing…"));
     }
 
     /// A watcher that is there but refuses the item: the app goes on (the window is the way in) and the failure is an

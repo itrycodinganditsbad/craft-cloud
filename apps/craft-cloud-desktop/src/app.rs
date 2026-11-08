@@ -175,7 +175,7 @@ impl Host for System {
     fn frame(&mut self, model: &Model) -> Vec<Event> {
         if let Some(tray) = &mut self.tray {
             let paused = model.status.as_ref().is_some_and(|s| s.run_state == craft_cloud_app::RunState::PausedByUser);
-            tray.show(crate::tray::state_of(model.status.as_ref()), paused);
+            tray.show(crate::tray::state_of(model.status.as_ref()), paused, &crate::tray::status_line(model.status.as_ref()));
         }
         Vec::new()
     }

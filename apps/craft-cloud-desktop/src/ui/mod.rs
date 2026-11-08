@@ -170,6 +170,11 @@ pub fn host(server: &str) -> &str {
     rest.unwrap_or(server).trim_end_matches('/')
 }
 
+/// The agent's state in words, as the footer and the tray's menu say it: `Online · Up to date`. Empty when the status isn't known.
+pub fn state_line(status: Option<&craft_cloud_app::Status>) -> String {
+    status.map(|s| format!("{} · {}", if s.online { "Online" } else { "Offline" }, overview::sync_line(s).0)).unwrap_or_default()
+}
+
 /// How long ago `then_ms` was, at `now_ms`: "just now", "5 min ago", "3 h ago", "2 days ago".
 pub fn ago(now_ms: i64, then_ms: i64) -> String {
     let secs = now_ms.saturating_sub(then_ms).max(0) / 1000;

@@ -15,9 +15,11 @@ pub const LEFT_CLICK_OPENS: bool = cfg!(not(target_os = "macos"));
 
 pub struct NativeTray {
     icon: TrayIcon,
+    /// The menu's first line: the sync state, not a button.
+    status: MenuItem,
     pause: MenuItem,
     paused: Arc<AtomicBool>,
-    shown: Option<(TrayState, bool)>,
+    shown: Option<(TrayState, bool, String)>,
 }
 
 fn icon(state: TrayState) -> Result<tray_icon::Icon, String> {
@@ -28,6 +30,9 @@ fn icon(state: TrayState) -> Result<tray_icon::Icon, String> {
 pub fn start(clicks: Clicks) -> Result<NativeTray, String> {
     let items: Vec<(Item, MenuItem)> = Item::ALL.iter().map(|&item| (item, MenuItem::new(item.label(false), true, None))).collect();
     let menu = Menu::new();
+    let status = MenuItem::new(super::status_line(None), false, None);
+    menu.append(&status).map_err(|e| e.to_string())?;
+    menu.append(&PredefinedMenuItem::separator()).map_err(|e| e.to_string())?;
     for (item, entry) in &items {
         if item.after_separator() {
             menu.append(&PredefinedMenuItem::separator()).map_err(|e| e.to_string())?;
@@ -60,20 +65,21 @@ pub fn start(clicks: Clicks) -> Result<NativeTray, String> {
             clicks.send(Item::Open.event(false));
         }
     }));
-    Ok(NativeTray { icon: tray, pause, paused, shown: None })
+    Ok(NativeTray { icon: tray, status, pause, paused, shown: None })
 }
 
 impl Tray for NativeTray {
-    fn show(&mut self, state: TrayState, paused: bool) {
-        if self.shown == Some((state, paused)) {
+    fn show(&mut self, state: TrayState, paused: bool, line: &str) {
+        if self.shown.as_ref().is_some_and(|(s, p, l)| (*s, *p, l.as_str()) == (state, paused, line)) {
             return;
         }
-        self.shown = Some((state, paused));
+        self.shown = Some((state, paused, line.to_owned()));
         if let Ok(image) = icon(state) {
             let _ = self.icon.set_icon(Some(image));
         }
         self.paused.store(paused, Ordering::SeqCst);
         self.pause.set_text(Item::Pause.label(paused));
+        self.status.set_text(line);
     }
 }
 

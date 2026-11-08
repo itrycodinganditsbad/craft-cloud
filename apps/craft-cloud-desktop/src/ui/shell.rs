@@ -37,8 +37,7 @@ impl Shell {
             }
             _ => ("Signed in".to_owned(), None),
         };
-        let state =
-            status.map(|s| format!("{} · {}", if s.online { "Online" } else { "Offline" }, super::overview::sync_line(s).0)).unwrap_or_default();
+        let state = super::state_line(status);
         Some(Self {
             tab,
             tabs: model.tabs(),
