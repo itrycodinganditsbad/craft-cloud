@@ -272,6 +272,17 @@ impl Hub {
         team_folder()
     }
 
+    /// The personal space's folder on every machine: an absolute path. A document or blob path inside it is the account's personal
+    /// space's, as a relative path is.
+    pub fn personal_folder(&self) -> String {
+        personal_folder()
+    }
+
+    /// The team space syncs again on every machine (after [`Hub::stop_team`]): opening its files works again.
+    pub fn start_team(&self) {
+        lock(&self.inner).team_stopped = false;
+    }
+
     /// Makes `account` a viewer of the team space (or an editor again): its updates are refused with `read_only` from now
     /// on, as the agent does when the role is too low, and the documents it opens say `read_only`. The apps with a team
     /// document open hear it as `role`. When the account may write again, the changes apps handed over ([`HELD`]) go up.
@@ -645,22 +656,30 @@ impl Hub {
                 open(&mut inner, machine, conn, id, &path);
             }
             HELD => {
-                // What an app that ends hands over (it made it as a viewer and kept it): the account's changes, not acked.
-                let Some(doc) = inner.machines.get(&machine).and_then(|m| m.conns.get(&conn)).and_then(|c| c.open.get(&id)).map(|o| o.doc) else {
+                // What an app that ends hands over (it made it as a viewer and kept it): the account's changes, acked once kept.
+                let Some(opened) = inner.machines.get_mut(&machine).and_then(|m| m.conns.get_mut(&conn)).and_then(|c| c.open.get_mut(&id)) else {
                     return;
                 };
+                opened.seq += 1;
+                let (seq, doc) = (opened.seq, opened.doc);
                 let team_doc = inner.machines.get(&machine).and_then(|m| m.docs.get(&doc)).is_some_and(|d| is_team_key(&d.path));
                 let viewer = team_doc && inner.machines.get(&machine).is_some_and(|m| inner.read_only.contains(&m.account.user));
-                if (team_doc && inner.team_stopped) || body.is_empty() || body.len() > MAX_UPDATE_BYTES {
-                    return;
+                if team_doc && inner.team_stopped {
+                    let message = "the space stopped syncing on this computer: nothing was kept".to_owned();
+                    return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "not_found".into(), message });
+                }
+                if body.is_empty() || body.len() > MAX_UPDATE_BYTES {
+                    let message = format!("a held change is 1 byte to {MAX_UPDATE_BYTES} bytes");
+                    return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "too_large".into(), message });
                 }
                 let Some(d) = inner.machines.get_mut(&machine).and_then(|m| m.docs.get_mut(&doc)) else { return };
                 if viewer {
                     d.held.push(body.to_vec());
-                    return;
+                } else {
+                    d.log.push((Origin::Conn(conn), body.to_vec()));
+                    d.pending.push_back(d.log.len() - 1);
                 }
-                d.log.push((Origin::Conn(conn), body.to_vec()));
-                d.pending.push_back(d.log.len() - 1);
+                tell(&inner, machine, conn, &DocsEvent::Ack { id, seq });
                 sync(&mut inner);
             }
             UPDATE => {
@@ -822,6 +841,21 @@ fn team_folder() -> String {
     std::env::temp_dir().join("craft-cloud-fake-team").to_string_lossy().into_owned()
 }
 
+/// The personal space's folder, the same on every machine (an absolute path).
+fn personal_folder() -> String {
+    std::env::temp_dir().join("craft-cloud-fake-personal").to_string_lossy().into_owned()
+}
+
+/// The rest of `path` below the personal folder, when it is an absolute path inside it.
+fn in_personal_folder(path: &str) -> Option<String> {
+    if !std::path::Path::new(path).is_absolute() {
+        return None;
+    }
+    let parts = segments(path)?;
+    let folder = segments(&personal_folder())?;
+    Some(parts.strip_prefix(folder.as_slice())?.join("/"))
+}
+
 /// A path's parts, with `.` and `..` taken out; none when it climbs above its root.
 fn segments(path: &str) -> Option<Vec<String>> {
     let mut parts: Vec<String> = Vec::new();
@@ -857,7 +891,8 @@ fn doc_key(inner: &Inner, machine: usize, path: &str) -> String {
         return format!("team\0{rest}");
     }
     let user = inner.machines.get(&machine).map(|m| m.account.user).unwrap_or_default();
-    format!("{user}\0{path}")
+    // (A path inside the personal folder is the same file as the relative path below it.)
+    format!("{user}\0{}", in_personal_folder(path).as_deref().unwrap_or(path))
 }
 
 /// Whether a document key is the team space's.
@@ -881,6 +916,9 @@ fn blob_route(inner: &Inner, machine: usize, for_path: Option<&str>) -> Result<B
     }
     if inner.team.is_some() && !inner.gone.contains(&user) && in_team_folder(path).is_some() {
         return Ok(BlobSpace::Team);
+    }
+    if in_personal_folder(path).is_some() {
+        return Ok(BlobSpace::Personal(user));
     }
     Err((400, "invalid", "that path is in no synced folder".into()))
 }
