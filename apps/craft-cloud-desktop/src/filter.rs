@@ -153,7 +153,8 @@ mod tests {
     #[test]
     fn kind_computer_and_text_all_have_to_match() {
         let (a, b) = (DeviceId::generate(), DeviceId::generate());
-        let events = vec![event("auth.login", Some(a)), event("auth.login", Some(b)), event("admin.role_changed", Some(a)), event("device.revoked", None)];
+        let events =
+            vec![event("auth.login", Some(a)), event("auth.login", Some(b)), event("admin.role_changed", Some(a)), event("device.revoked", None)];
         let mut filter = ActivityFilter::default();
         assert!(filter.is_off());
         assert_eq!(filter.visible(&events).len(), 4);

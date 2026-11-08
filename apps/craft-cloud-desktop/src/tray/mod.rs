@@ -204,7 +204,10 @@ mod tests {
     #[test]
     fn the_menus_first_line_says_the_state_as_the_footer_does() {
         assert_eq!(status_line(Some(&status())), "Online · Up to date");
-        assert_eq!(status_line(Some(&Status { online: false, run_state: RunState::Retrying { message: "x".into() }, ..status() })).split(" · ").next(), Some("Offline"));
+        assert_eq!(
+            status_line(Some(&Status { online: false, run_state: RunState::Retrying { message: "x".into() }, ..status() })).split(" · ").next(),
+            Some("Offline")
+        );
         let syncing = status_line(Some(&Status { run_state: RunState::Syncing, ..status() }));
         assert!(syncing.starts_with("Online · "), "{syncing}");
         assert_ne!(syncing, status_line(Some(&status())), "it follows the state");

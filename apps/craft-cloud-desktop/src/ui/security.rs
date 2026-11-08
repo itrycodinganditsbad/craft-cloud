@@ -465,13 +465,7 @@ fn computers_footer(ui: &mut egui::Ui, overview: &crate::model::Overview, asking
 
 /// "02 / Security activity": a label row with a link to the Activity tab, and the newest sign-ins and account changes in a
 /// When / Event / Computer / Result table; a muted line says when there are none or they couldn't be loaded.
-fn security_activity(
-    ui: &mut egui::Ui,
-    activity: &SecurityActivity,
-    filter: &crate::filter::ActivityFilter,
-    now_ms: i64,
-    events: &mut Vec<Event>,
-) {
+fn security_activity(ui: &mut egui::Ui, activity: &SecurityActivity, filter: &crate::filter::ActivityFilter, now_ms: i64, events: &mut Vec<Event>) {
     let t = Tokens::get(ui.ctx());
     let names = super::names(ui);
     super::kit::label_row(ui, &super::kit::numbered(2, "Security activity"), |ui| {
