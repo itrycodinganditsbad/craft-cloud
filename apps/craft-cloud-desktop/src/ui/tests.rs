@@ -662,6 +662,8 @@ fn snapshot_files() {
     snapshot(files_model(Some(files_list())), egui::Theme::Light, "files-loaded");
     snapshot(files_model(Some(files_list())), egui::Theme::Dark, "files-loaded-dark");
     snapshot_sized(files_model(Some(files_list())), egui::Theme::Light, "files-small", crate::ui::MIN_WINDOW_SIZE);
+    // The smallest width in a window tall enough for the rows: the folder button is an icon that fits its column.
+    snapshot_sized(files_model(Some(files_list())), egui::Theme::Light, "files-small-rows", [crate::ui::MIN_WINDOW_SIZE[0], 900.0]);
     snapshot(files_model(Some(Vec::new())), egui::Theme::Light, "files-empty");
     snapshot(files_model(None), egui::Theme::Light, "files-failed");
     let mut filtered = files_model(Some(files_list()));

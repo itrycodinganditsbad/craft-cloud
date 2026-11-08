@@ -411,6 +411,8 @@ pub enum Icon {
     Cross,
     Back,
     Dots,
+    /// A folder: "show in folder".
+    Folder,
 }
 
 /// A small square button with a painted icon. `label` is what screen readers and the tooltip say.
@@ -456,6 +458,14 @@ pub fn icon_button(ui: &mut Ui, label: &str, icon: Icon) -> Response {
                 for dx in [-5.0, 0.0, 5.0] {
                     painter.circle_filled(c + egui::vec2(dx, 0.0), 1.5, color);
                 }
+            }
+            Icon::Folder => {
+                // The body, and the tab on its upper left.
+                let body = egui::Rect::from_center_size(c + egui::vec2(0.0, 1.5), egui::vec2(12.0, 8.0));
+                painter.rect_stroke(body, CornerRadius::ZERO, stroke, egui::StrokeKind::Middle);
+                painter.line_segment([body.left_top(), body.left_top() - egui::vec2(0.0, 2.5)], stroke);
+                painter.line_segment([body.left_top() - egui::vec2(0.0, 2.5), body.left_top() + egui::vec2(4.5, -2.5)], stroke);
+                painter.line_segment([body.left_top() + egui::vec2(4.5, -2.5), body.left_top() + egui::vec2(6.0, 0.0)], stroke);
             }
         }
     }

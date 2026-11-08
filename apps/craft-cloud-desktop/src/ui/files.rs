@@ -69,11 +69,11 @@ fn recent(ui: &mut egui::Ui, files: &Files, now_ms: i64, events: &mut Vec<Event>
         ui.label(RichText::new("Nothing in the list matches the filter.").color(t.muted));
     } else {
         let columns = [
-            Column::flex("File", 160.0).weighted(2.0),
-            Column::fixed("App", 120.0),
-            Column::fixed("Computer", 100.0),
-            Column::fixed("Changed", 100.0),
-            Column::fixed("", 170.0),
+            Column::flex("File", 130.0).weighted(2.0),
+            Column::fixed("App", 112.0),
+            Column::fixed("Computer", 90.0),
+            Column::fixed("Changed", 90.0),
+            Column::fixed("", 146.0),
         ];
         kit::table(ui, "files", &columns, visible.len(), ROW_H, |ui, row, column| {
             let Some(file) = visible.get(row) else { return };
@@ -103,12 +103,8 @@ fn recent(ui: &mut egui::Ui, files: &Files, now_ms: i64, events: &mut Vec<Event>
                         }
                         // A file that is here can always be shown in its folder, also one that isn't opened from the page.
                         let here = matches!(file.place, Place::Here | Place::NotOpenable);
-                        let show = ui.add_enabled(here, kit::Button::new("Folder"));
-                        let show = if here {
-                            show.on_hover_text("Show in folder")
-                        } else {
-                            show.on_disabled_hover_text("Show in folder: not on this computer")
-                        };
+                        let show = ui.add_enabled_ui(here, |ui| kit::icon_button(ui, "Show in folder", kit::Icon::Folder)).inner;
+                        let show = if here { show } else { show.on_disabled_hover_text("Show in folder: not on this computer") };
                         if show.clicked() {
                             events.push(Event::ShowRecent { app: file.app.clone(), path: file.entry.path.clone() });
                         }
@@ -119,7 +115,7 @@ fn recent(ui: &mut egui::Ui, files: &Files, now_ms: i64, events: &mut Vec<Event>
     }
     ui.add_space(8.0);
     ui.label(
-        RichText::new("The list is Craft Cloud's shared recents: a file opened in an app on one computer shows up on the others. Open starts the file in its default program; Folder shows the file in its folder.")
+        RichText::new("The list is Craft Cloud's shared recents: a file opened in an app on one computer shows up on the others. Open starts the file in its default program; the folder button shows the file in its folder.")
             .small()
             .color(t.muted),
     );
