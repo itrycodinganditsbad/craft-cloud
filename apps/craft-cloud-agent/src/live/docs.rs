@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -37,8 +37,14 @@ use crate::local_api::{ApiState, LocalError};
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Most open numbers one connection may have routed (an app opens a few documents; a hostile one is cut off here).
 const MAX_OPENS: usize = 4096;
+/// After a write to the app failed, its frames already sent are still read for this long (until its close or EOF).
+const READ_ON: Duration = Duration::from_secs(5);
 
 static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
+
+/// Tests: while set, every write to an app fails, as when the app has already shut its socket down.
+#[doc(hidden)]
+pub static FAIL_WRITES: AtomicBool = AtomicBool::new(false);
 
 /// `GET /v1/docs`: the WebSocket of an app's live documents.
 pub async fn docs_socket(State(api): State<Arc<ApiState>>, upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>) -> Response {
@@ -58,6 +64,14 @@ enum End {
     App,
     /// The hub dropped the connection (or stopped: signed out).
     Hub,
+}
+
+/// Why a message didn't reach the app.
+enum Unsent {
+    /// The write failed (the app shut its socket down): nothing more is written, but what it sent before is still read.
+    Closed,
+    /// The app didn't take the message in time: it is dropped.
+    Slow,
 }
 
 /// Which hub: `None` is the personal space's, `Some` a team space's.
@@ -80,6 +94,9 @@ struct Link {
     docs: HashMap<DocId, Key>,
     /// The document each answered open number is (so a `close` can let go of its numbers).
     open_docs: HashMap<u64, DocId>,
+    /// Set when a write to the app failed: nothing is written to it any more, and what it sent before is read until
+    /// this time (or its close).
+    mute: Option<tokio::time::Instant>,
 }
 
 impl Link {
@@ -93,6 +110,36 @@ impl Link {
             opens: HashMap::new(),
             docs: HashMap::new(),
             open_docs: HashMap::new(),
+            mute: None,
+        }
+    }
+
+    /// A write to the app failed: stop writing, and read on for a while.
+    fn mute_now(&mut self) {
+        if self.mute.is_none() {
+            self.mute = Some(tokio::time::Instant::now() + READ_ON);
+        }
+    }
+
+    /// Writes `event` to the app, unless a write failed before. A write that failed because the app is gone doesn't end
+    /// the connection (its earlier frames are read first); an app too slow to take it does.
+    async fn reply(&mut self, socket: &mut WebSocket, event: &DocsEvent) -> Result<(), End> {
+        if self.mute.is_some() {
+            return Ok(());
+        }
+        let result = send_json(socket, event).await;
+        self.sent(result)
+    }
+
+    /// What came of a write.
+    fn sent(&mut self, result: Result<(), Unsent>) -> Result<(), End> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(Unsent::Closed) => {
+                self.mute_now();
+                Ok(())
+            }
+            Err(Unsent::Slow) => Err(End::App),
         }
     }
 
@@ -174,7 +221,7 @@ impl Link {
 async fn serve(mut socket: WebSocket, api: Arc<ApiState>) {
     let mut link = Link::new(NEXT_CONN.fetch_add(1, Ordering::Relaxed));
     link.hub(&api, None).await;
-    let end = loop {
+    let _end = loop {
         tokio::select! {
             message = socket.recv() => {
                 let message = match message {
@@ -187,7 +234,8 @@ async fn serve(mut socket: WebSocket, api: Arc<ApiState>) {
                     Err(end) => break end,
                 }
             }
-            out = async { match link.from_hub.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => match out {
+            () = async { match link.mute { Some(until) => tokio::time::sleep_until(until).await, None => std::future::pending().await } } => break End::App,
+            out = async { match link.from_hub.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } }, if link.mute.is_none() => match out {
                 Some(out) => {
                     match &out {
                         DocOut::Opened { id, doc, .. } => {
@@ -200,8 +248,9 @@ async fn serve(mut socket: WebSocket, api: Arc<ApiState>) {
                         DocOut::NotLive { id, .. } | DocOut::Refused { id: Some(id), seq: None, .. } => link.end_open(*id),
                         _ => {}
                     }
-                    if !send_out(&mut socket, out).await {
-                        break End::App;
+                    let result = send_out(&mut socket, out).await;
+                    if let Err(end) = link.sent(result) {
+                        break end;
                     }
                 }
                 // Every hub let go of this connection (it didn't keep up, or the hubs stopped).
@@ -209,12 +258,14 @@ async fn serve(mut socket: WebSocket, api: Arc<ApiState>) {
             },
         }
     };
-    if let End::App = end {
-        for (_, hub) in &link.hubs {
-            let _ = hub.docs(DocsCall::Gone { conn: link.conn }).await;
-        }
+    // Always, and last: every hub cleans up after every change this connection queued (it may have dropped the connection's
+    // output already, which leaves its handles in place for exactly this call).
+    for (_, hub) in &link.hubs {
+        let _ = hub.docs(DocsCall::Gone { conn: link.conn }).await;
     }
-    let _ = socket.send(Message::Close(None)).await;
+    if link.mute.is_none() {
+        let _ = socket.send(Message::Close(None)).await;
+    }
 }
 
 /// One message from the app: `Ok(false)` ends the connection (the app is gone, or broke the rules), `Err` too, for a
@@ -227,7 +278,8 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                 Err(e) => {
                     let event =
                         DocsEvent::Error { id: None, seq: None, code: api_codes::INVALID.into(), message: format!("not a docs request: {e}") };
-                    return Ok(send_json(socket, &event).await);
+                    link.reply(socket, &event).await?;
+                    return Ok(true);
                 }
             };
             match request {
@@ -239,7 +291,8 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                             (api_codes::TOO_LARGE, "too many documents open")
                         };
                         let event = DocsEvent::Error { id: Some(id), seq: None, code: code.into(), message: message.into() };
-                        return Ok(send_json(socket, &event).await);
+                        link.reply(socket, &event).await?;
+                    return Ok(true);
                     }
                     // An absolute path inside a synced team folder is that space's; any other is the personal space's.
                     let key = api.control.route_path(&path).map(|team| team.space);
@@ -247,10 +300,12 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                     // (A handle this connection kept of a hub that has stopped since fails once; the space may have a new hub.)
                     for attempt in 0..2 {
                         let Some(hub) = link.hub(api, key).await else {
-                            return Ok(match key {
-                                Some(_) => send_json(socket, &not_live(NotLiveReason::Offline, "the space doesn't sync on this computer")).await,
-                                None => send_json(socket, &not_live(NotLiveReason::NotSignedIn, "the Craft Cloud agent isn't signed in")).await,
-                            });
+                            let event = match key {
+                                Some(_) => not_live(NotLiveReason::Offline, "the space doesn't sync on this computer"),
+                                None => not_live(NotLiveReason::NotSignedIn, "the Craft Cloud agent isn't signed in"),
+                            };
+                            link.reply(socket, &event).await?;
+                            return Ok(true);
                         };
                         link.begin_open(id, key);
                         let call =
@@ -262,7 +317,8 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                             break;
                         }
                     }
-                    Ok(send_json(socket, &not_live(NotLiveReason::Offline, "the space stopped syncing on this computer")).await)
+                    link.reply(socket, &not_live(NotLiveReason::Offline, "the space stopped syncing on this computer")).await?;
+                    Ok(true)
                 }
                 DocsRequest::Close { doc } => match link.hub_of_doc(doc) {
                     Some((key, hub)) => {
@@ -282,7 +338,8 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                         if link.call(&hub, key, DocsCall::Saved { conn: link.conn, doc, hash, frontiers }).await? {
                             Ok(true)
                         } else {
-                            Ok(send_json(socket, &stopped_event(None, None)).await)
+                            link.reply(socket, &stopped_event(None, None)).await?;
+                            Ok(true)
                         }
                     }
                     None => Ok(true),
@@ -293,7 +350,8 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                         if link.call(&hub, key, DocsCall::Saving { conn: link.conn, doc, hash }).await? {
                             Ok(true)
                         } else {
-                            Ok(send_json(socket, &stopped_event(None, None)).await)
+                            link.reply(socket, &stopped_event(None, None)).await?;
+                            Ok(true)
                         }
                     }
                     None => Ok(true),
@@ -313,7 +371,9 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                     let seq = link.seqs.entry(id).or_insert(0);
                     *seq += 1;
                     if body.len() > MAX_UPDATE_BYTES {
-                        return Ok(send_json(socket, &refuse(Some(*seq), format!("an update is at most {MAX_UPDATE_BYTES} bytes"))).await);
+                        let event = refuse(Some(*seq), format!("an update is at most {MAX_UPDATE_BYTES} bytes"));
+                        link.reply(socket, &event).await?;
+                        return Ok(true);
                     }
                     DocsCall::Update { conn: link.conn, id, seq: *seq, bytes: body.to_vec() }
                 }
@@ -325,7 +385,9 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                 }
                 IMPORT => {
                     if body.len() > MAX_SNAPSHOT_BYTES {
-                        return Ok(send_json(socket, &refuse(None, format!("an import is at most {MAX_SNAPSHOT_BYTES} bytes"))).await);
+                        let event = refuse(None, format!("an import is at most {MAX_SNAPSHOT_BYTES} bytes"));
+                        link.reply(socket, &event).await?;
+                        return Ok(true);
                     }
                     DocsCall::Import { conn: link.conn, id, bytes: body.to_vec() }
                 }
@@ -337,7 +399,8 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                 return Ok(true);
             }
             // The space's hub has stopped (it stopped syncing): the change was not kept, and the app is told.
-            Ok(send_json(socket, &stopped_event(Some(id), update_seq)).await)
+            link.reply(socket, &stopped_event(Some(id), update_seq)).await?;
+            Ok(true)
         }
         Message::Ping(_) | Message::Pong(_) => Ok(true),
         Message::Close(_) => Ok(false),
@@ -349,19 +412,16 @@ fn stopped_event(id: Option<u64>, seq: Option<u64>) -> DocsEvent {
     DocsEvent::Error { id, seq, code: api_codes::NOT_FOUND.into(), message: "the space stopped syncing on this computer: nothing was kept".into() }
 }
 
-/// Sends one of the hub's messages to the app; false when the app is gone (or too slow).
-async fn send_out(socket: &mut WebSocket, out: DocOut) -> bool {
+/// Sends one of the hub's messages to the app.
+async fn send_out(socket: &mut WebSocket, out: DocOut) -> Result<(), Unsent> {
     match out {
         DocOut::Opened { id, doc, state, changed_outside, read_only, space, snapshot, waiting } => {
-            send_json(socket, &DocsEvent::Opened { id, doc, state, changed_outside, read_only, space: Some(space) }).await
-                && send_binary(socket, STATE, id, &snapshot).await
-                && {
-                    let mut ok = true;
-                    for update in &waiting {
-                        ok = ok && send_binary(socket, UPDATE, id, update).await;
-                    }
-                    ok
-                }
+            send_json(socket, &DocsEvent::Opened { id, doc, state, changed_outside, read_only, space: Some(space) }).await?;
+            send_binary(socket, STATE, id, &snapshot).await?;
+            for update in &waiting {
+                send_binary(socket, UPDATE, id, update).await?;
+            }
+            Ok(())
         }
         DocOut::NeedsImport { id } => send_json(socket, &DocsEvent::NeedsImport { id }).await,
         DocOut::NotLive { id, reason, message } => send_json(socket, &DocsEvent::NotLive { id, reason, message: Some(message) }).await,
@@ -384,14 +444,24 @@ async fn send_out(socket: &mut WebSocket, out: DocOut) -> bool {
     }
 }
 
-async fn send_json(socket: &mut WebSocket, event: &DocsEvent) -> bool {
-    let Ok(text) = serde_json::to_string(event) else { return true };
-    matches!(tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Text(text.into()))).await, Ok(Ok(())))
+async fn send_json(socket: &mut WebSocket, event: &DocsEvent) -> Result<(), Unsent> {
+    let Ok(text) = serde_json::to_string(event) else { return Ok(()) };
+    send(socket, Message::Text(text.into())).await
 }
 
-async fn send_binary(socket: &mut WebSocket, kind: u8, id: u64, bytes: &[u8]) -> bool {
-    let frame = encode_binary(kind, id, bytes);
-    matches!(tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Binary(frame.into()))).await, Ok(Ok(())))
+async fn send_binary(socket: &mut WebSocket, kind: u8, id: u64, bytes: &[u8]) -> Result<(), Unsent> {
+    send(socket, Message::Binary(encode_binary(kind, id, bytes).into())).await
+}
+
+async fn send(socket: &mut WebSocket, message: Message) -> Result<(), Unsent> {
+    if FAIL_WRITES.load(Ordering::Relaxed) {
+        return Err(Unsent::Closed);
+    }
+    match tokio::time::timeout(SEND_TIMEOUT, socket.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(Unsent::Closed),
+        Err(_) => Err(Unsent::Slow),
+    }
 }
 
 #[cfg(test)]
