@@ -1317,7 +1317,7 @@ async fn a_team_subfolder_swapped_for_a_link_is_not_written_through() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_team_file_edited_after_the_copy_is_kept_and_the_old_version_goes_beside_it() {
-    let (w, ana, project, files) = ana_with_project().await;
+    let (w, ana, project, _files) = ana_with_project().await;
     hook::set(ana.data.path(), Some(Hook::Fail(FromFolderStep::Syncing)));
     ana.make(&project, "Edited there").await.unwrap();
     let failed = ana.until(FromFolderStep::Failed).await;
