@@ -52,8 +52,9 @@ pub(super) fn show(ui: &mut egui::Ui, shared: &mut SharedScreen, now_ms: i64, ev
             let offer = shared.offer.clone().filter(|o| o.space == space);
             let busy = shared.doing.clone();
             let notice = shared.notice.clone();
+            let retry = shared.retry.is_some();
             let Some(page) = shared.page_mut() else { return };
-            space_page(ui, &info, page, &used, owner, offer.as_ref(), busy.as_ref(), notice.as_deref(), &me, now_ms, events);
+            space_page(ui, &info, page, &used, owner, offer.as_ref(), busy.as_ref(), notice.as_deref(), retry, &me, now_ms, events);
         }
     }
 }
@@ -97,6 +98,9 @@ fn list(ui: &mut egui::Ui, shared: &SharedScreen, events: &mut Vec<Event>) {
     }
     if let Some(error) = &shared.error_action {
         super::error_line(ui, error);
+        if shared.retry.is_some() && kit::text_link(ui, "Try again", 11.0).clicked() {
+            send(events, SpacesMsg::Retry);
+        }
         ui.add_space(6.0);
     }
     let invitations = shared.invitations();
@@ -272,6 +276,9 @@ fn offer_panel(ui: &mut egui::Ui, offer: &SyncOffer, events: &mut Vec<Event>) {
         }
         if let Some(error) = &offer.error {
             super::error_line(ui, error);
+            if offer.retry && kit::text_link(ui, "Try again", 11.0).clicked() {
+                send(events, SpacesMsg::Retry);
+            }
         }
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
@@ -319,6 +326,7 @@ fn space_page(
     offer: Option<&SyncOffer>,
     doing: Option<&Doing>,
     notice: Option<&str>,
+    retry: bool,
     me: &str,
     now_ms: i64,
     events: &mut Vec<Event>,
@@ -346,6 +354,9 @@ fn space_page(
     }
     if let Some(error) = &page.error {
         super::error_line(ui, error);
+        if retry && kit::text_link(ui, "Try again", 11.0).clicked() {
+            send(events, SpacesMsg::Retry);
+        }
         ui.add_space(6.0);
     }
     // The confirmations share one focus slot: with none open the next one to open takes the focus.
@@ -503,6 +514,9 @@ fn offer_inline(ui: &mut egui::Ui, offer: &SyncOffer, events: &mut Vec<Event>) {
     }
     if let Some(error) = &offer.error {
         super::error_line(ui, error);
+        if offer.retry && kit::text_link(ui, "Try again", 11.0).clicked() {
+            send(events, SpacesMsg::Retry);
+        }
     }
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;

@@ -39,6 +39,14 @@ pub const ARCHIVED_BANNER: &str = "This space is archived: everyone, owners incl
 /// What the page says of a space the account lost access to.
 pub const NO_ACCESS_BANNER: &str = "You no longer have access to this space. Your local copy is kept as it is and no longer syncs.";
 
+/// What a change of a space's sync is told while the space is still being closed after an earlier change (the agent's `409`).
+pub const CHANGING: &str = "This space is being changed. Try again in a moment.";
+
+/// Whether the agent refused a change because the space is still being changed (a `409 conflict`).
+pub fn is_changing(e: &Error) -> bool {
+    matches!(e, Error::Refused { code, message, .. } if code == "conflict" && message.contains("being changed"))
+}
+
 /// The words of a call that failed: the agent's refusal as the admin pages say it, or [`TOO_OLD`] for an old agent.
 fn words(e: &Error) -> String {
     if is_too_old(e) { TOO_OLD.to_owned() } else { error_text(e) }
@@ -162,6 +170,8 @@ pub struct SyncOffer {
     pub adopt: bool,
     /// The agent said the folder has files; the person is asked.
     pub asks_adopt: bool,
+    /// The agent said the space is still being changed: the same click tries again.
+    pub retry: bool,
     /// The offer comes from an invitation just accepted.
     pub after_accept: bool,
     pub busy: bool,
@@ -274,6 +284,8 @@ pub struct SharedScreen {
     pub view: View,
     pub offer: Option<SyncOffer>,
     pub doing: Option<Doing>,
+    /// What "Try again" sends, after a change was refused as still under way.
+    pub retry: Option<SpacesMsg>,
     /// What went wrong with the last action on the list, for people.
     pub error_action: Option<String>,
     /// What the last action did, for people (a small note under the title).
@@ -296,6 +308,7 @@ impl SharedScreen {
             view: View::List,
             offer: None,
             doing: None,
+            retry: None,
             error_action: None,
             notice: None,
             ticket: 0,
@@ -534,6 +547,8 @@ pub enum SpacesMsg {
     ConfirmDeletes,
     CancelDeletes,
     DismissNotice,
+    /// "Try again" after a change was refused because the space was still being changed.
+    Retry,
 }
 
 impl From<SpacesMsg> for Event {
@@ -779,6 +794,10 @@ impl SharedScreen {
                 self.notice = None;
                 Vec::new()
             }
+            SpacesMsg::Retry => match self.retry.take() {
+                Some(again) if self.doing.is_none() => self.update(again),
+                _ => Vec::new(),
+            },
             SpacesMsg::Accept(space) => self.accept(space),
             SpacesMsg::Accepted { space, ticket, result } => self.accepted(space, ticket, result),
             SpacesMsg::Decline(space) => {
@@ -1062,6 +1081,15 @@ impl SharedScreen {
         Vec::new()
     }
 
+    /// A refusal in words of the app's own, on the page of a space when one is shown, else on the list.
+    fn page_failed_text(&mut self, text: String) -> Vec<Effect> {
+        match self.page_mut() {
+            Some(page) => page.error = Some(text),
+            None => self.error_action = Some(text),
+        }
+        Vec::new()
+    }
+
     /// A call of a space's page failed.
     fn page_failed(&mut self, e: Error) -> Vec<Effect> {
         if is_too_old(&e) {
@@ -1103,6 +1131,7 @@ impl SharedScreen {
                     chosen: false,
                     adopt: false,
                     asks_adopt: false,
+                    retry: false,
                     after_accept: true,
                     busy: false,
                     error: None,
@@ -1129,6 +1158,7 @@ impl SharedScreen {
             chosen: false,
             adopt: false,
             asks_adopt: false,
+            retry: false,
             after_accept: false,
             busy: false,
             error: None,
@@ -1156,6 +1186,8 @@ impl SharedScreen {
         }
         offer.busy = true;
         offer.error = None;
+        offer.retry = false;
+        self.retry = None;
         let folder = if offer.chosen { offer.folder.clone() } else { None };
         let request = SpaceSyncRequest { on: true, folder, adopt: offer.adopt };
         let space = offer.space;
@@ -1188,6 +1220,16 @@ impl SharedScreen {
                 if is_too_old(&e) {
                     self.too_old();
                     return Vec::new();
+                }
+                if is_changing(&e) {
+                    self.retry = Some(if self.offer.is_some() { SpacesMsg::OfferSync } else { SpacesMsg::SyncOff(space) });
+                    if let Some(offer) = &mut self.offer {
+                        offer.busy = false;
+                        offer.retry = true;
+                        offer.error = Some(CHANGING.to_owned());
+                        return Vec::new();
+                    }
+                    return self.page_failed_text(CHANGING.to_owned());
                 }
                 if let Some(offer) = &mut self.offer {
                     offer.busy = false;
@@ -1572,6 +1614,39 @@ mod tests {
         assert!(page.offer.is_none() && page.doing.is_none());
         assert_eq!(page.find(id).unwrap().sync, SpaceSync::On);
         assert!(page.notice.as_deref().is_some_and(|n| n.contains("Brand") && n.contains("syncs")), "{:?}", page.notice);
+    }
+
+    #[test]
+    fn a_space_that_is_still_being_changed_is_tried_again_with_the_same_click() {
+        let studio = team_space("Studio", SpaceRole::Editor, "active");
+        let id = studio.space;
+        let agent = agent_with(vec![studio]);
+        let changing =
+            || Error::Refused { code: "conflict".into(), message: "this space is being changed, try again in a moment".into(), name_taken: None };
+        assert!(is_changing(&changing()) && !is_changing(&refused("conflict", "a team space with that name exists")));
+        let mut model = on_shared(&agent);
+        run(&mut model, &agent, msg(SpacesMsg::OpenSpace(id)));
+        // Turning it on: the offer says so, and Sync again (or Try again) sends the same request.
+        model.update(Event::Spaces(SpacesMsg::SyncOn(id)));
+        agent.team.lock().unwrap().fails.push(changing());
+        run(&mut model, &agent, msg(SpacesMsg::OfferSync));
+        let page = shared(&model);
+        let offer = page.offer.clone().unwrap();
+        assert_eq!((offer.error.as_deref(), offer.retry, offer.busy), (Some(CHANGING), true, false));
+        assert!(page.retry.is_some() && page.doing.is_none());
+        run(&mut model, &agent, msg(SpacesMsg::Retry));
+        assert_eq!(shared(&model).find(id).unwrap().sync, SpaceSync::On);
+        assert!(shared(&model).retry.is_none() && shared(&model).offer.is_none());
+        assert_eq!(agent.team.lock().unwrap().syncs.len(), 2, "the request went out twice");
+        // Stopping: the words show on the space's page, and Try again stops it.
+        agent.team.lock().unwrap().fails.push(changing());
+        run(&mut model, &agent, msg(SpacesMsg::SyncOff(id)));
+        assert_eq!(shared(&model).page().unwrap().error.as_deref(), Some(CHANGING));
+        assert_eq!(shared(&model).find(id).unwrap().sync, SpaceSync::On, "nothing changed yet");
+        run(&mut model, &agent, msg(SpacesMsg::Retry));
+        assert_eq!(shared(&model).find(id).unwrap().sync, SpaceSync::Off);
+        // Nothing to retry: nothing is sent.
+        assert!(model.update(Event::Spaces(SpacesMsg::Retry)).is_empty());
     }
 
     #[test]
