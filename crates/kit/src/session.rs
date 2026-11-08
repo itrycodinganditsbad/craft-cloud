@@ -274,8 +274,10 @@ pub struct Peer {
     pub seen: Instant,
 }
 
-/// Someone in the document's space who is here: an account, with the app instances (peers) it has in the document.
+/// Someone in the document's space who is here: an account, with the app instances (peers) it has in the document. New
+/// fields are added without a breaking change: make one with [`Person::new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Person {
     /// The account's name in the space.
     pub name: String,
@@ -287,6 +289,13 @@ pub struct Person {
     /// The Loro peers of the account's other windows and machines in this document ([`Session::peers`]'s keys), so an
     /// app can draw their cursors in the person's colour. Empty for yourself when you are the only window.
     pub peers: Vec<u64>,
+}
+
+impl Person {
+    /// A person (for an app's own tests and tools; [`Session::people`] makes the real ones).
+    pub fn new(name: impl Into<String>, colour: craft_cloud_api::PaletteColour, is_self: bool, peers: Vec<u64>) -> Self {
+        Self { name: name.into(), colour, is_self, peers }
+    }
 }
 
 /// A member of the document's space, as the agent lists it.
@@ -420,10 +429,31 @@ pub struct Session<D: LiveDocument> {
     peer_users: HashMap<u64, [u8; 16]>,
     /// The space the document is in, as of the last open (none from an older agent).
     space: Option<craft_cloud_api::SpaceId>,
-    /// Whether the space is a team space, once asked ([`Session::check_blobs`]).
-    team: Option<bool>,
+    /// Whether a space is a team space, once asked ([`Session::check_blobs`]), for the space it was asked of.
+    team: Option<(craft_cloud_api::SpaceId, bool)>,
+    /// The agent no longer follows the document (its space stopped syncing here, or access is gone): changes are kept, not
+    /// sent, until the document is opened again.
+    not_followed: bool,
     /// Things the app should know that are not errors ([`Session::warnings`]), each once.
     warnings: Vec<String>,
+}
+
+impl<D: LiveDocument> Drop for Session<D> {
+    /// A viewer's changes the agent refused (kept here, unsent) are handed to the agent as the session ends, so they are not
+    /// lost with the window: the agent keeps them in the document's journal and sends them once the account may write.
+    /// Best effort: when the agent is not there, they are in this window only (and in the file, once saved).
+    fn drop(&mut self) {
+        if !self.status.viewer || self.outbox.is_empty() {
+            return;
+        }
+        if let Some(link) = &self.link {
+            for out in &self.outbox {
+                if link.doc.hold(&out.bytes).is_err() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 impl<D: LiveDocument> std::fmt::Debug for Session<D> {
@@ -648,6 +678,7 @@ impl<D: LiveDocument> Session<D> {
             peer_users: HashMap::new(),
             space: None,
             team: None,
+            not_followed: false,
             warnings: Vec::new(),
         };
         session.reindex_trees();
@@ -681,9 +712,11 @@ impl<D: LiveDocument> Session<D> {
         self.status.connected = true;
         self.status.online = state.online;
         self.status.waiting = state.waiting;
-        // As of this open: a role that changed since shows by a new open (or a refused change).
+        // As of this open (a role change after it comes as `role`).
         self.status.viewer = link.doc.read_only();
         self.space = link.doc.space();
+        self.not_followed = false;
+        self.status.stopped = self.refused.is_some() || self.status.replaced;
         if let Some(waker) = &self.waker {
             link.doc.set_waker(waker.clone());
         }
@@ -1020,6 +1053,17 @@ impl<D: LiveDocument> Session<D> {
                 Event::PresenceFrom { user, bytes } => {
                     self.note_presence(&bytes, Some(user.into_bytes()));
                 }
+                Event::Role { read_only } => {
+                    self.status.viewer = read_only;
+                    if read_only {
+                        // Whatever the agent had not taken yet is not coming back as accepted: all of it waits.
+                        for out in &mut self.outbox {
+                            out.seq = None;
+                        }
+                    } else if self.status.error.as_deref().is_some_and(|e| e.contains("no longer change")) {
+                        self.status.error = None;
+                    }
+                }
                 Event::Members(members) => {
                     self.members = members
                         .into_iter()
@@ -1037,7 +1081,20 @@ impl<D: LiveDocument> Session<D> {
                 Event::Refused { seq, code, message } => {
                     // Never dropped: every later change depends on it.
                     let Some(at) = self.outbox.iter().position(|o| o.seq == Some(seq)) else { continue };
-                    if code == "read_only" {
+                    if code == "not_found" {
+                        // The agent no longer follows the document (a team space that stopped syncing here, or access is gone):
+                        // nothing was kept. Not sent again, not retried: the changes stay queued, and a new open of the
+                        // document ([`Session::reconnect_now`]) finds the space's hub again if it is back.
+                        self.not_followed = true;
+                        self.status.stopped = true;
+                        for out in &mut self.outbox {
+                            out.seq = None;
+                        }
+                        self.status.error = Some(
+                            "Craft Cloud no longer follows this document (its space stopped syncing on this computer, or you no longer have access): your changes since stay in this window; save the document to keep them"
+                                .to_owned(),
+                        );
+                    } else if code == "read_only" {
                         // The account's role does not let it change this document (lowered since the open): never sent
                         // again, never retried like a transient refusal. The changes stay queued, unsent, in case the
                         // document is opened again with a role that allows them.
@@ -1069,7 +1126,7 @@ impl<D: LiveDocument> Session<D> {
                     self.status.online = online;
                     self.status.waiting = waiting;
                     self.status.deleted = deleted;
-                    self.status.stopped = stopped || self.refused.is_some() || self.status.replaced;
+                    self.status.stopped = stopped || self.refused.is_some() || self.status.replaced || self.not_followed;
                 }
                 Event::File(frontiers) => self.file_version = frontiers,
                 Event::Closed(why) => closed = Some(why),
@@ -1098,6 +1155,10 @@ impl<D: LiveDocument> Session<D> {
     /// Tries to reach the agent again at the next poll, without waiting out the pause (the app learnt the agent is
     /// back: Craft Cloud's status says so, say).
     pub fn reconnect_now(&mut self) {
+        // A document the agent stopped following is opened again (its space may be syncing again).
+        if self.not_followed && self.link.is_some() {
+            self.drop_link("opening the document again");
+        }
         self.next_try = Instant::now();
         self.backoff = FIRST_BACKOFF;
     }
@@ -1340,8 +1401,9 @@ impl<D: LiveDocument> Session<D> {
 
     fn send_outbox(&mut self) {
         let Some(link) = &self.link else { return };
-        // A viewer sends nothing: the agent would refuse it, and it is not worth a retry.
-        if self.status.viewer {
+        // A viewer sends nothing (the agent would refuse it), and neither does a session whose document the agent stopped
+        // following: nothing would be kept.
+        if self.status.viewer || self.status.stopped {
             return;
         }
         // Saves on their way, announced at once (before the changes they cover, which may wait): the agent's sync then
@@ -1401,6 +1463,8 @@ impl<D: LiveDocument> Session<D> {
     fn keep_presence(&mut self) {
         let now = Instant::now();
         self.peers.retain(|_, p| now.duration_since(p.seen) < PRESENCE_TTL);
+        let peers = &self.peers;
+        self.peer_users.retain(|peer, _| peers.contains_key(peer));
         let (Some(link), Some(bytes)) = (&self.link, &self.presence) else { return };
         if self.presence_sent.is_some_and(|at| now.duration_since(at) < PRESENCE_EVERY) {
             return;
@@ -1484,31 +1548,42 @@ impl<D: LiveDocument> Session<D> {
 
     /// Checks the blob store the app keeps this document's binary values in. In a team space a store that is not bound to
     /// the document ([`Session::blobs`]) keeps blobs in the account's personal space, where the other members get
-    /// `blob_not_found`: a warning ([`Session::warnings`]), once per session, says so. True when the store is fine (bound,
-    /// not the agent's, or the document is not in a team space), false when the warning applies. Call it once, where the
-    /// app builds its store.
+    /// `blob_not_found`; so does a store bound to another document's file (an app that builds one store and uses it for
+    /// every document). A warning ([`Session::warnings`]), once per session, says so. True when the store is fine (bound to
+    /// this document, not the agent's, or the document is not in a team space), false when the warning applies.
+    ///
+    /// Call it once, where the app builds its store, and not on the UI thread: the first call for a space asks the agent
+    /// whether it is a team space (one local request). When the agent can't say, the store is not trusted (a warning).
     pub fn check_blobs(&mut self, store: &dyn crate::BlobStore) -> bool {
-        if store.space_bound() != Some(false) || !self.in_team_space() {
-            return true;
-        }
-        let warning = "Craft Cloud: this document is in a team space, but its blobs are kept in your personal space, where the other members can't \
-                       get them: build the blob store with Session::blobs()";
-        if !self.warnings.iter().any(|w| w == warning) {
-            self.warnings.push(warning.to_owned());
+        let why = match store.space_bound() {
+            None => return true,
+            Some(true) if store.bound_path().is_none_or(|bound| bound == self.path) => return true,
+            Some(true) => "its blob store is bound to another document's file, so its blobs may go to another space",
+            Some(false) if !self.in_team_space() => return true,
+            Some(false) => "its blobs are kept in your personal space, where the other members can't get them",
+        };
+        let warning = format!("Craft Cloud: this document is in a team space, but {why}: build the blob store with Session::blobs()");
+        if !self.warnings.contains(&warning) {
+            self.warnings.push(warning);
         }
         false
     }
 
-    /// Whether the document's space is a team space (asked of the agent once; an agent that can't say counts as not).
+    /// Whether the document's space is a team space: asked of the agent once per space (an agent that doesn't name the space
+    /// is older than team spaces: not). When the agent can't be asked, it counts as one (not remembered).
     fn in_team_space(&mut self) -> bool {
-        if let Some(team) = self.team {
+        let Some(space) = self.space else { return false };
+        if let Some((asked, team)) = self.team
+            && asked == space
+        {
             return team;
         }
-        let Some(space) = self.space else { return false };
-        let Ok(client) = self.agent.client() else { return false };
-        let Ok(list) = client.spaces() else { return false };
+        let list = match self.agent.client().and_then(|client| client.spaces()) {
+            Ok(list) => list,
+            Err(_) => return true,
+        };
         let team = list.spaces.iter().any(|s| s.space == space && s.kind == "team");
-        self.team = Some(team);
+        self.team = Some((space, team));
         team
     }
 

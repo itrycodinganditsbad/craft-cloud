@@ -181,7 +181,8 @@ fn person_colour(ui: &Ui, person: &Person) -> Color32 {
 }
 
 /// Who is in a live document ([`craft_cloud_kit::Session::people`]): each person's initials in their colour, at most
-/// [`PEOPLE_SHOWN`], then "+N" for the rest. The names are on hover ("you" after your own). Draws nothing for an empty
+/// [`PEOPLE_SHOWN`], then "+N" for the rest. The full names are on hover ("(you)" after your own) and are what a screen
+/// reader says (each pill is named by the person's name, and "+N" by the names behind it). Draws nothing for an empty
 /// list (an agent that doesn't say who is there).
 pub fn people_badge(ui: &mut Ui, people: &[Person]) {
     if people.is_empty() {
@@ -190,15 +191,21 @@ pub fn people_badge(ui: &mut Ui, people: &[Person]) {
     ui.horizontal(|ui| {
         for person in people.iter().take(PEOPLE_SHOWN) {
             let colour = person_colour(ui, person);
-            let hover = if person.is_self { format!("{} (you)", person.name) } else { person.name.clone() };
-            egui::Frame::new().stroke(egui::Stroke::new(1.0, colour)).corner_radius(8).inner_margin(egui::Margin::symmetric(5, 1)).show(ui, |ui| {
-                ui.label(RichText::new(initials(&person.name)).strong().color(colour)).on_hover_text(hover);
-            });
+            let name = if person.is_self { format!("{} (you)", person.name) } else { person.name.clone() };
+            let pill =
+                egui::Frame::new().stroke(egui::Stroke::new(1.0, colour)).corner_radius(8).inner_margin(egui::Margin::symmetric(5, 1)).show(ui, |ui| {
+                    let label = ui.label(RichText::new(initials(&person.name)).strong().color(colour));
+                    label.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, name.clone()));
+                });
+            pill.response.on_hover_text(&name);
         }
         let rest = people.len().saturating_sub(PEOPLE_SHOWN);
         if rest > 0 {
             let names: Vec<&str> = people.iter().skip(PEOPLE_SHOWN).map(|p| p.name.as_str()).collect();
-            ui.weak(format!("+{rest}")).on_hover_text(names.join(", "));
+            let names = names.join(", ");
+            let more = ui.label(format!("+{rest}"));
+            more.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("{rest} more: {names}")));
+            more.on_hover_text(names);
         }
     });
 }
