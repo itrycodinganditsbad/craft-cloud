@@ -30,6 +30,11 @@ pub struct UserQuery {
 impl UserQuery {
     /// The path with its query string.
     fn path(&self) -> String {
+        self.path_at(paths::ADMIN_USERS)
+    }
+
+    /// `base` with the query string (the administrator's list of team spaces is asked for the same way).
+    pub(crate) fn path_at(&self, base: &str) -> String {
         let mut pairs = Vec::new();
         if let Some(cursor) = self.cursor.as_deref().filter(|c| !c.is_empty()) {
             pairs.push(format!("cursor={}", encode(cursor)));
@@ -40,7 +45,7 @@ impl UserQuery {
         if let Some(query) = self.query.as_deref().filter(|q| !q.is_empty()) {
             pairs.push(format!("query={}", encode(query)));
         }
-        if pairs.is_empty() { paths::ADMIN_USERS.to_owned() } else { format!("{}?{}", paths::ADMIN_USERS, pairs.join("&")) }
+        if pairs.is_empty() { base.to_owned() } else { format!("{base}?{}", pairs.join("&")) }
     }
 }
 

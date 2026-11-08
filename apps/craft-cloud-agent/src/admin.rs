@@ -22,11 +22,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::{
-    AccountInfo, AccountUsage, AdminCode, AdminCompression, AdminConfirm, AdminCreateUser, AdminCreatedUser, AdminDevices, AdminPasswordReset,
-    AdminServerInfo, AdminSetCompressionLevel, AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, AuditPage, codes as api_codes,
-    valid_audit_action,
+    AccountInfo, AccountUsage, AddSpaceMember, AdminCode, AdminCompression, AdminConfirm, AdminCreateSpace, AdminCreateUser, AdminCreatedUser,
+    AdminDevices, AdminPasswordReset, AdminServerInfo, AdminSetCompressionLevel, AdminSetSpaceOwner, AdminSpaceInfo, AdminSpaceList,
+    AdminStorageOverview, AdminUpdateUser, AdminUserInfo, AdminUserList, AuditPage, ChangeSpaceMember, SpaceConfirm, SpaceMember, SpaceMembers,
+    SpaceUsage, UpdateSpace, codes as api_codes, valid_audit_action,
 };
-use craft_cloud_proto::local::{MAX_ADMIN_JSON_BYTES, paths};
+use craft_cloud_proto::local::{MAX_ADMIN_JSON_BYTES, SpaceSyncRequest, paths};
 use reqwest::Method;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -70,6 +71,170 @@ pub(crate) fn routes() -> Router<Api> {
         .route(&format!("{user}/reset-two-factor"), post(reset_two_factor).layer(small()))
         .route(&format!("{user}/devices"), get(list_devices))
         .route(&format!("{user}/devices/{{device_id}}"), axum::routing::delete(revoke_device).layer(small()))
+        .route(paths::ADMIN_SPACES, get(list_spaces).post(create_space).layer(small()))
+        .route(&format!("{}/{{id}}/archive", paths::ADMIN_SPACES), post(archive_space).layer(small()))
+        .route(&format!("{}/{{id}}/unarchive", paths::ADMIN_SPACES), post(unarchive_space).layer(small()))
+        .route(&format!("{}/{{id}}/owner", paths::ADMIN_SPACES), axum::routing::put(set_space_owner).layer(small()))
+        .route(&format!("{}/{{id}}", paths::SPACES), axum::routing::patch(update_space).layer(small()))
+        .route(&format!("{}/{{id}}/members", paths::SPACES), get(space_members).post(add_space_member).layer(small()))
+        .route(
+            &format!("{}/{{id}}/members/{{user}}", paths::SPACES),
+            axum::routing::patch(change_space_member).delete(remove_space_member).layer(small()),
+        )
+        .route(&format!("{}/{{id}}/leave", paths::SPACES), post(leave_space))
+        .route(&format!("{}/{{id}}/usage", paths::SPACES), get(space_usage))
+}
+
+// ---- team spaces: the members, the usage, the name, leaving, and the administrator's list ----
+//
+// Passed on like the admin calls above. The server decides who may do what; a team space call an agent from before these
+// routes never heard of is the router's `not_found` ("no such call"), which `craft-cloud-app` reports as `agent_too_old`.
+
+type SpaceId = craft_cloud_proto::SpaceId;
+
+async fn space_members(State(state): State<Api>, id: Result<Path<SpaceId>, PathRejection>) -> Answer<Json<SpaceMembers>> {
+    let id = path_id(id)?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.admin_get(&format!("spaces/{id}/members"), &[]).await?))
+}
+
+async fn add_space_member(
+    State(state): State<Api>,
+    id: Result<Path<SpaceId>, PathRejection>,
+    body: Result<Json<AddSpaceMember>, JsonRejection>,
+) -> Answer<Json<SpaceMember>> {
+    let id = path_id(id)?;
+    let Json(body) = body?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.admin_json(Method::POST, &format!("spaces/{id}/members"), &body).await?))
+}
+
+async fn change_space_member(
+    State(state): State<Api>,
+    ids: Result<Path<(SpaceId, Uuid)>, PathRejection>,
+    body: Result<Json<ChangeSpaceMember>, JsonRejection>,
+) -> Answer<Json<SpaceMember>> {
+    let (id, user) = path_id(ids)?;
+    let Json(body) = body?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.admin_json(Method::PATCH, &format!("spaces/{id}/members/{user}"), &body).await?))
+}
+
+async fn remove_space_member(State(state): State<Api>, ids: Result<Path<(SpaceId, Uuid)>, PathRejection>) -> Answer<StatusCode> {
+    let (id, user) = path_id(ids)?;
+    let (_, transport) = server_api(&state)?;
+    let status = transport.admin_empty(Method::DELETE, &format!("spaces/{id}/members/{user}"), &SpaceConfirm::default()).await?;
+    Ok(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::NO_CONTENT))
+}
+
+/// `POST /v1/spaces/{id}/leave`: the account's own `DELETE …/members/{its id}`. Syncing of the space on this computer is
+/// turned off first and its folder stays; the agent looks at its list again afterwards, which no longer has the space.
+async fn leave_space(State(state): State<Api>, id: Result<Path<SpaceId>, PathRejection>) -> Answer<StatusCode> {
+    let id = path_id(id)?;
+    let (_, transport) = server_api(&state)?;
+    let me = transport.account_info().await?.user_id;
+    if let Some(spaces) = state.control.spaces_handle() {
+        // A space that doesn't sync here is already as it should be; a refusal changes nothing about leaving.
+        let _ = spaces.sync(id, SpaceSyncRequest { on: false, folder: None, adopt: false }).await;
+    }
+    transport.admin_empty(Method::DELETE, &format!("spaces/{id}/members/{me}"), &SpaceConfirm::default()).await?;
+    if let Some(spaces) = state.control.spaces_handle() {
+        spaces.refresh().await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn space_usage(State(state): State<Api>, id: Result<Path<SpaceId>, PathRejection>) -> Answer<Json<SpaceUsage>> {
+    let id = path_id(id)?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.admin_get(&format!("spaces/{id}/usage"), &[]).await?))
+}
+
+async fn update_space(
+    State(state): State<Api>,
+    id: Result<Path<SpaceId>, PathRejection>,
+    body: Result<Json<UpdateSpace>, JsonRejection>,
+) -> Answer<Json<AdminSpaceInfo>> {
+    let id = path_id(id)?;
+    let Json(body) = body?;
+    let (_, transport) = server_api(&state)?;
+    let info = transport.admin_json(Method::PATCH, &format!("spaces/{id}"), &body).await?;
+    if let Some(spaces) = state.control.spaces_handle() {
+        // A new name shows in the list.
+        spaces.refresh().await;
+    }
+    Ok(Json(info))
+}
+
+async fn list_spaces(State(state): State<Api>, q: Result<Query<ListQuery>, QueryRejection>) -> Answer<Json<AdminSpaceList>> {
+    let Query(q) = q.map_err(|e| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, e.body_text()))?;
+    let (_, transport) = server_api(&state)?;
+    let limit = q.limit.map(|l| l.to_string());
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    if let Some(cursor) = q.cursor.as_deref().filter(|c| !c.is_empty()) {
+        pairs.push(("cursor", cursor));
+    }
+    if let Some(limit) = limit.as_deref() {
+        pairs.push(("limit", limit));
+    }
+    if let Some(query) = q.query.as_deref().filter(|s| !s.is_empty()) {
+        pairs.push(("query", query));
+    }
+    let list: AdminSpaceList = transport.admin_get("admin/spaces", &pairs).await?;
+    if list.spaces.len() > MAX_PAGE_USERS {
+        return Err(AgentError::from(craft_cloud_sync::TransportError::Protocol(format!(
+            "the server listed {} team spaces on a page, more than the {MAX_PAGE_USERS} this agent reads",
+            list.spaces.len()
+        )))
+        .into());
+    }
+    Ok(Json(list))
+}
+
+async fn create_space(State(state): State<Api>, body: Result<Json<AdminCreateSpace>, JsonRejection>) -> Answer<Json<AdminSpaceInfo>> {
+    let Json(body) = body?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.admin_json(Method::POST, "admin/spaces", &body).await?))
+}
+
+/// A change of a team space with only the confirmation as its body, answered without one.
+async fn space_confirmed(state: &Api, path: String, body: Result<Json<SpaceConfirm>, JsonRejection>) -> Answer<StatusCode> {
+    let Json(body) = body?;
+    let (_, transport) = server_api(state)?;
+    let status = transport.admin_empty(Method::POST, &path, &body).await?;
+    if let Some(spaces) = state.control.spaces_handle() {
+        // An archived space shows read-only (and a brought-back one writable) at once.
+        spaces.refresh().await;
+    }
+    Ok(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::NO_CONTENT))
+}
+
+async fn archive_space(
+    State(state): State<Api>,
+    id: Result<Path<SpaceId>, PathRejection>,
+    body: Result<Json<SpaceConfirm>, JsonRejection>,
+) -> Answer<StatusCode> {
+    space_confirmed(&state, format!("admin/spaces/{}/archive", path_id(id)?), body).await
+}
+
+async fn unarchive_space(
+    State(state): State<Api>,
+    id: Result<Path<SpaceId>, PathRejection>,
+    body: Result<Json<SpaceConfirm>, JsonRejection>,
+) -> Answer<StatusCode> {
+    space_confirmed(&state, format!("admin/spaces/{}/unarchive", path_id(id)?), body).await
+}
+
+async fn set_space_owner(
+    State(state): State<Api>,
+    id: Result<Path<SpaceId>, PathRejection>,
+    body: Result<Json<AdminSetSpaceOwner>, JsonRejection>,
+) -> Answer<StatusCode> {
+    let id = path_id(id)?;
+    let Json(body) = body?;
+    let (_, transport) = server_api(&state)?;
+    let status = transport.admin_empty(Method::PUT, &format!("admin/spaces/{id}/owner"), &body).await?;
+    Ok(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::NO_CONTENT))
 }
 
 async fn server(State(state): State<Api>) -> Answer<Json<AdminServerInfo>> {

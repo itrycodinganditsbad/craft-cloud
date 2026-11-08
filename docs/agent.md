@@ -271,7 +271,13 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
 | `POST /v1/spaces/{id}/decline` | 204 |
 | `POST /v1/spaces/{id}/sync` | `{on, folder?, adopt?}` → the space as `GET /v1/spaces` lists it |
 | `POST /v1/spaces/{id}/approve-deletes` | `{set?}` → `{approved, message}`: approves the deletions the mass-delete guard holds back in a synced team space (`spaces/<id>/approval.json`), as `craft-cloud-agent sync --approve-deletes[=<set>] --space <id or name>` does. With a `set` only that set, if it is the one waiting; without, the set the previous call listed |
+| `GET /v1/spaces/{id}/members`, `POST` (`{username, role}`), `PATCH …/members/{user}` (`{role}`), `DELETE …/members/{user}` | passed on to the server as they are (`SpaceMembers`, `SpaceMember`, 204): who may do what is the server's decision, so an editor's invitation is `403 read_only` and the last owner's demotion `409 last_owner` |
+| `GET /v1/spaces/{id}/usage` | `{stored_bytes, quota_bytes?, …}`, passed on |
+| `PATCH /v1/spaces/{id}` | `{name?, quota_bytes?, password?, …}` passed on (a rename by an owner; a limit by an administrator with the confirmation) → the space as the administrator's list shows it |
+| `POST /v1/spaces/{id}/leave` | 204: turns the sync of the space off here (the folder and its files stay), then leaves the space on the server (the account's own `DELETE …/members/{its id}`); the last owner can't (`last_owner`). The agent looks at its list again; the space is then listed as `no_access` with the local copy kept |
+| `GET /v1/admin/spaces?cursor&limit&query`, `POST` (`AdminCreateSpace`) | the administrator's list of team spaces and the creation of one, passed on with the confirmation in the body |
+| `POST /v1/admin/spaces/{id}/archive`, `…/unarchive` (`{password, …}`), `PUT …/owner` (`{user, password, …}`) | passed on, 204 |
 | `GET /v1/status` | gains `spaces: [{space, run_state, last_sync_ms?, read_only}]`, one per synced space or one that lost access; the top-level fields describe the personal space |
 
-Accept and decline are passed on to the server, which decides; its refusals keep their status and code. An agent from before
+Accept and decline, the members, the usage, the rename, leaving and the administrator's team space calls are passed on to the server, which decides; its refusals keep their status and code (the administrator's password stays in the body, is kept by nobody and is left out of every `Debug` output). An agent from before
 team spaces answers these calls with `not_found` ("no such call"), which `craft-cloud-app` reports as `agent_too_old`.

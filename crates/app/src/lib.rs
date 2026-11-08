@@ -79,7 +79,10 @@ pub use craft_cloud_api::api::{
     PairingStatus, RecoveryCodes, RevokedOthers, TwoFactorChallenge, TwoFactorSetupResponse, TwoFactorStatus, UsageEstimateReason, UsageEstimates,
     valid_audit_action,
 };
-pub use craft_cloud_api::api::{SpaceListItem, SpaceRole};
+pub use craft_cloud_api::api::{
+    AddSpaceMember, AdminCreateSpace, AdminSetSpaceOwner, AdminSpaceInfo, AdminSpaceList, ChangeSpaceMember, SpaceConfirm, SpaceListItem,
+    SpaceMember, SpaceMembers, SpaceRole, SpaceUsage, UpdateSpace,
+};
 pub use craft_cloud_api::local::{
     ApproveDeletesAnswer, ApproveDeletesRequest, SpaceInfo, SpaceList, SpaceRun, SpaceStatus, SpaceSync, SpaceSyncRequest,
 };
@@ -1193,5 +1196,106 @@ mod tests {
         next();
         let old = agent.spaces().unwrap_err();
         assert!(matches!(&old, Error::Refused { code, .. } if code == codes::AGENT_TOO_OLD), "{old:?}");
+    }
+
+    /// The member, usage, rename, leave and administrator calls of team spaces send their requests to their paths, with
+    /// the bodies the server takes, and read what the agent answers; an older agent's "no such call" is `agent_too_old`.
+    #[test]
+    fn team_member_and_admin_calls_send_their_requests_and_an_older_agent_is_too_old() {
+        use craft_cloud_api::api::{
+            AddSpaceMember, AdminCreateSpace, AdminSetSpaceOwner, AdminSpaceInfo, AdminSpaceList, ChangeSpaceMember, SpaceConfirm, SpaceMember,
+            SpaceMembers, SpaceUsage, UpdateSpace,
+        };
+        let space = SpaceId::generate();
+        let user = Uuid::from_u128(0xBEEF);
+        let member = SpaceMember { user, username: "ben".into(), role: SpaceRole::Editor, state: "invited".into(), colour: 3 };
+        let info = AdminSpaceInfo {
+            id: space,
+            name: "Studio".into(),
+            created_ms: 1,
+            archived_ms: None,
+            members: 2,
+            owners: 1,
+            stored_bytes: 10,
+            quota_bytes: Some(8 << 20),
+        };
+        let usage = SpaceUsage {
+            stored_bytes: 10,
+            quota_bytes: Some(8 << 20),
+            trash_bytes: None,
+            history_bytes: None,
+            live_bytes: 0,
+            estimates: UsageEstimates { index_complete: true, reason: None },
+        };
+        let no_such_call = json(&ErrorAnswer { error: "not_found".into(), message: "no such call".into(), name_taken: None });
+        let script = vec![
+            (200, json(&SpaceMembers { members: vec![member.clone()] })),
+            (200, json(&member)),
+            (200, json(&SpaceMember { role: SpaceRole::Viewer, ..member.clone() })),
+            (204, String::new()),
+            (204, String::new()),
+            (200, json(&usage)),
+            (200, json(&info)),
+            (200, json(&AdminSpaceList { spaces: vec![info.clone()], next: Some("c2".into()) })),
+            (200, json(&info)),
+            (204, String::new()),
+            (204, String::new()),
+            (204, String::new()),
+            (404, no_such_call.clone()),
+            (404, no_such_call),
+        ];
+        let (_dir, agent, asked) = fake_agent(script);
+        let next = || asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        let body = |text: String| -> serde_json::Value { serde_json::from_str(&text).unwrap_or(serde_json::Value::Null) };
+
+        assert_eq!(agent.space_members(space).unwrap().members, vec![member.clone()]);
+        assert_eq!(next(), ("GET".to_owned(), format!("/v1/spaces/{space}/members"), String::new()));
+        let invite = AddSpaceMember { username: "ben".into(), role: SpaceRole::Editor, confirm: SpaceConfirm::default() };
+        assert_eq!(agent.add_space_member(space, &invite).unwrap(), member);
+        let (method, path, sent) = next();
+        assert_eq!((method.as_str(), path.as_str()), ("POST", format!("/v1/spaces/{space}/members").as_str()));
+        assert_eq!(body(sent), serde_json::json!({ "username": "ben", "role": "editor" }));
+        let role = ChangeSpaceMember { role: SpaceRole::Viewer, confirm: SpaceConfirm::default() };
+        assert_eq!(agent.change_space_member(space, user, &role).unwrap().role, SpaceRole::Viewer);
+        let (method, path, sent) = next();
+        assert_eq!((method.as_str(), path.as_str()), ("PATCH", format!("/v1/spaces/{space}/members/{user}").as_str()));
+        assert_eq!(body(sent), serde_json::json!({ "role": "viewer" }));
+        agent.remove_space_member(space, user).unwrap();
+        assert_eq!(next(), ("DELETE".to_owned(), format!("/v1/spaces/{space}/members/{user}"), String::new()));
+        agent.leave_space(space).unwrap();
+        assert_eq!(next(), ("POST".to_owned(), format!("/v1/spaces/{space}/leave"), String::new()));
+        assert_eq!(agent.space_usage(space).unwrap(), usage);
+        assert_eq!(next(), ("GET".to_owned(), format!("/v1/spaces/{space}/usage"), String::new()));
+        let rename = UpdateSpace { name: Some("Studio".into()), ..UpdateSpace::default() };
+        assert_eq!(agent.update_space(space, &rename).unwrap().name, "Studio");
+        let (method, path, sent) = next();
+        assert_eq!((method.as_str(), path.as_str()), ("PATCH", format!("/v1/spaces/{space}").as_str()));
+        assert_eq!(body(sent), serde_json::json!({ "name": "Studio" }));
+
+        let query = UserQuery { cursor: Some("c1".into()), limit: Some(20), query: Some("stu dio".into()) };
+        let page = agent.admin_spaces(&query).unwrap();
+        assert_eq!((page.spaces.len(), page.next.as_deref()), (1, Some("c2")));
+        assert_eq!(next(), ("GET".to_owned(), "/v1/admin/spaces?cursor=c1&limit=20&query=stu%20dio".to_owned(), String::new()));
+        let confirm = SpaceConfirm { password: Some("pw".into()), totp_code: None, recovery_code: None };
+        let create = AdminCreateSpace { name: "Studio".into(), owner: user, quota_bytes: Some(8 << 20), confirm: confirm.clone() };
+        assert_eq!(agent.admin_create_space(&create).unwrap().name, "Studio");
+        let (method, path, sent) = next();
+        assert_eq!((method.as_str(), path.as_str()), ("POST", "/v1/admin/spaces"));
+        assert_eq!(body(sent), serde_json::json!({ "name": "Studio", "owner": user.to_string(), "quota_bytes": 8 << 20, "password": "pw" }));
+        agent.admin_archive_space(space, &confirm).unwrap();
+        let (method, path, sent) = next();
+        assert_eq!((method.as_str(), path.as_str()), ("POST", format!("/v1/admin/spaces/{space}/archive").as_str()));
+        assert_eq!(body(sent), serde_json::json!({ "password": "pw" }));
+        agent.admin_unarchive_space(space, &confirm).unwrap();
+        assert_eq!(next().1, format!("/v1/admin/spaces/{space}/unarchive"));
+        agent.admin_set_space_owner(space, &AdminSetSpaceOwner { user, confirm }).unwrap();
+        let (method, path, sent) = next();
+        assert_eq!((method.as_str(), path.as_str()), ("PUT", format!("/v1/admin/spaces/{space}/owner").as_str()));
+        assert_eq!(body(sent), serde_json::json!({ "user": user.to_string(), "password": "pw" }));
+
+        // An agent from before these calls: "no such call" is `agent_too_old`, for every one of them.
+        for old in [agent.space_members(space).unwrap_err(), agent.admin_spaces(&UserQuery::default()).unwrap_err()] {
+            assert!(matches!(&old, Error::Refused { code, .. } if code == codes::AGENT_TOO_OLD), "{old:?}");
+        }
     }
 }

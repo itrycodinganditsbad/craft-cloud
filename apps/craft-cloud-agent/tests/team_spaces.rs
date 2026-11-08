@@ -1060,3 +1060,124 @@ async fn one_404_for_the_list_does_not_end_the_team_spaces() {
     write(&ana_folder, "two.txt", "2");
     eventually("the sync goes on", || has_file(ben_folder.clone(), "two.txt", "2")).await;
 }
+
+/// The members, usage, name and leaving of a team space, and the administrator's calls, go through the local API to the
+/// server: the server decides who may do what, and the agent keeps the folder when the account leaves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_members_usage_name_and_leaving_of_a_space_and_the_admin_calls_are_passed_on_to_the_server() {
+    use craft_cloud_app::{AddSpaceMember, AdminCreateSpace, AdminSetSpaceOwner, ChangeSpaceMember, SpaceConfirm, UpdateSpace, UserQuery};
+    let t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    let hash = hash_password(PASSWORD).unwrap();
+    let cleo = t.world.meta.create_user("cleo", &hash, Role::Member, 0).await.unwrap();
+    let root = t.world.meta.create_user("root", &hash, Role::Admin, 0).await.unwrap();
+    let mut root_pc = Person::signed_in(&t.world.url, "root").await;
+    root_pc.run();
+    root_pc.ready().await;
+    eventually("the invitation is listed", || async { t.ben.space(space).await.is_some_and(|s| s.state == "invited") }).await;
+    t.ben.accept(space).await;
+
+    // Members: any member reads them, with roles and states.
+    let members = t.ana.api(move |c| c.space_members(space)).await.unwrap().members;
+    let roles: Vec<(&str, SpaceRole, &str)> = members.iter().map(|m| (m.username.as_str(), m.role, m.state.as_str())).collect();
+    assert!(roles.contains(&("ana", SpaceRole::Owner, "active")) && roles.contains(&("ben", SpaceRole::Editor, "active")), "{roles:?}");
+    let seen_by_ben = t.ben.api(move |c| c.space_members(space)).await.unwrap().members;
+    assert_eq!(seen_by_ben.len(), members.len());
+
+    // An editor may not invite: the server's `read_only` passes through.
+    let invite = |name: &str, role| AddSpaceMember { username: name.to_owned(), role, confirm: SpaceConfirm::default() };
+    let refused = t
+        .ben
+        .api(move |c| {
+            c.add_space_member(space, &AddSpaceMember { username: "cleo".into(), role: SpaceRole::Viewer, confirm: SpaceConfirm::default() })
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(&refused, craft_cloud_app::Error::Refused { code, .. } if code == "read_only"), "{refused:?}");
+
+    // An owner invites, changes the role and withdraws the invitation.
+    let request = invite("cleo", SpaceRole::Viewer);
+    let added = t.ana.api(move |c| c.add_space_member(space, &request)).await.unwrap();
+    assert_eq!((added.username.as_str(), added.role, added.state.as_str()), ("cleo", SpaceRole::Viewer, "invited"));
+    let cleo_id = cleo.id.0;
+    let changed = t
+        .ana
+        .api(move |c| c.change_space_member(space, cleo_id, &ChangeSpaceMember { role: SpaceRole::Editor, confirm: SpaceConfirm::default() }))
+        .await
+        .unwrap();
+    assert_eq!(changed.role, SpaceRole::Editor);
+    t.ana.api(move |c| c.remove_space_member(space, cleo_id)).await.unwrap();
+    let after = t.ana.api(move |c| c.space_members(space)).await.unwrap().members;
+    assert!(after.iter().all(|m| m.username != "cleo"), "{after:?}");
+    let unknown = t
+        .ana
+        .api(move |c| {
+            c.add_space_member(space, &AddSpaceMember { username: "nobody".into(), role: SpaceRole::Viewer, confirm: SpaceConfirm::default() })
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(&unknown, craft_cloud_app::Error::Refused { code, .. } if code == "not_found"), "{unknown:?}");
+
+    // Usage, and a new name that shows in ben's list while his folder keeps its name.
+    let usage = t.ben.api(move |c| c.space_usage(space)).await.unwrap();
+    assert_eq!(usage.stored_bytes, 0);
+    let planned = t.ben.space(space).await.unwrap().folder.unwrap();
+    let renamed = t.ana.api(move |c| c.update_space(space, &UpdateSpace { name: Some("Studio 2".into()), ..UpdateSpace::default() })).await.unwrap();
+    assert_eq!(renamed.name, "Studio 2");
+    eventually("ben's list has the new name", || async { t.ben.space(space).await.is_some_and(|s| s.name.as_deref() == Some("Studio 2")) }).await;
+    assert_eq!(t.ben.space(space).await.unwrap().folder.as_deref(), Some(planned.as_str()), "the folder keeps its name");
+
+    // The administrator's calls need the administrator's password; a member is `forbidden`.
+    let as_member = t.ben.api(|c| c.admin_spaces(&UserQuery::default())).await.unwrap_err();
+    assert!(matches!(&as_member, craft_cloud_app::Error::Refused { code, .. } if code == "forbidden"), "{as_member:?}");
+    let confirm = SpaceConfirm { password: Some(PASSWORD.into()), totp_code: None, recovery_code: None };
+    let wrong = SpaceConfirm { password: Some("wrong password".into()), totp_code: None, recovery_code: None };
+    let ana_id = t.world.ana.id.0;
+    let (create_confirm, create_wrong) = (confirm.clone(), wrong.clone());
+    let refused = root_pc
+        .api(move |c| c.admin_create_space(&AdminCreateSpace { name: "Briefs".into(), owner: ana_id, quota_bytes: None, confirm: create_wrong }))
+        .await
+        .unwrap_err();
+    assert!(matches!(&refused, craft_cloud_app::Error::Refused { code, .. } if code == "wrong_password"), "{refused:?}");
+    let created = root_pc
+        .api(move |c| {
+            c.admin_create_space(&AdminCreateSpace { name: "Briefs".into(), owner: ana_id, quota_bytes: Some(8 << 20), confirm: create_confirm })
+        })
+        .await
+        .unwrap();
+    assert_eq!((created.name.as_str(), created.owners, created.quota_bytes), ("Briefs", 1, Some(8 << 20)));
+    let listed = root_pc.api(|c| c.admin_spaces(&UserQuery { query: Some("brie".into()), ..UserQuery::default() })).await.unwrap();
+    assert_eq!(listed.spaces.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Briefs"]);
+    let briefs = created.id;
+    let limit_confirm = confirm.clone();
+    let limited = root_pc
+        .api(move |c| c.update_space(briefs, &UpdateSpace { name: None, quota_bytes: Some(Some(16 << 20)), confirm: limit_confirm }))
+        .await
+        .unwrap();
+    assert_eq!(limited.quota_bytes, Some(16 << 20));
+    let archive_confirm = confirm.clone();
+    root_pc.api(move |c| c.admin_archive_space(briefs, &archive_confirm)).await.unwrap();
+    let archived = root_pc.api(|c| c.admin_spaces(&UserQuery::default())).await.unwrap();
+    assert!(archived.spaces.iter().any(|s| s.id == briefs && s.archived_ms.is_some()), "{archived:?}");
+    let unarchive_confirm = confirm.clone();
+    root_pc.api(move |c| c.admin_unarchive_space(briefs, &unarchive_confirm)).await.unwrap();
+    let owner_confirm = confirm.clone();
+    let cleo_user = cleo.id.0;
+    root_pc.api(move |c| c.admin_set_space_owner(briefs, &AdminSetSpaceOwner { user: cleo_user, confirm: owner_confirm })).await.unwrap();
+    let after_owner = root_pc.api(|c| c.admin_spaces(&UserQuery::default())).await.unwrap();
+    assert!(after_owner.spaces.iter().any(|s| s.id == briefs && s.owners == 2 && s.archived_ms.is_none()), "{after_owner:?}");
+    let _ = root;
+
+    // Leaving: ben's folder stays with its files and the space stops syncing there; the last owner may not leave.
+    let ben_folder = t.ben.sync_on(space).await;
+    write(&ben_folder, "mine.txt", "ben's file");
+    let ana_folder = t.ana.sync_on(space).await;
+    eventually("the file is on ana's side", || has_file(ana_folder.clone(), "mine.txt", "ben's file")).await;
+    t.ben.api(move |c| c.leave_space(space)).await.unwrap();
+    assert_eq!(read(&ben_folder, "mine.txt").as_deref(), Some("ben's file"), "the local copy is kept");
+    eventually("ben no longer syncs the space", || async { t.ben.space(space).await.is_none_or(|s| s.sync != SpaceSync::On) }).await;
+    let now = t.ana.api(move |c| c.space_members(space)).await.unwrap().members;
+    assert!(now.iter().all(|m| m.username != "ben"), "{now:?}");
+    let last = t.ana.api(move |c| c.leave_space(space)).await.unwrap_err();
+    assert!(matches!(&last, craft_cloud_app::Error::Refused { code, .. } if code == "last_owner"), "{last:?}");
+}

@@ -207,8 +207,19 @@ pub mod paths {
     /// what this computer does with each. Under `/v1/spaces/{id}`: `POST …/accept` → the space as the server lists it
     /// ([`SpaceListItem`](crate::api::SpaceListItem)), `POST …/decline` → 204 (both passed on to the server), and
     /// `POST …/sync` ([`super::SpaceSyncRequest`]) → the space as [`super::SpaceInfo`], and `POST …/approve-deletes`
-    /// ([`super::ApproveDeletesRequest`]) → [`super::ApproveDeletesAnswer`].
+    /// ([`super::ApproveDeletesRequest`]) → [`super::ApproveDeletesAnswer`]. The rest of `/v1/spaces/{id}` is passed on to
+    /// the server as it is (its status and error code are the agent's): `PATCH` ([`UpdateSpace`](crate::api::UpdateSpace): a new
+    /// name, or an administrator's limit) → [`AdminSpaceInfo`](crate::api::AdminSpaceInfo); `GET …/members` →
+    /// [`SpaceMembers`](crate::api::SpaceMembers); `POST …/members` ([`AddSpaceMember`](crate::api::AddSpaceMember)) and
+    /// `PATCH …/members/{user}` ([`ChangeSpaceMember`](crate::api::ChangeSpaceMember)) → the [`SpaceMember`](crate::api::SpaceMember);
+    /// `DELETE …/members/{user}` → 204; `GET …/usage` → [`SpaceUsage`](crate::api::SpaceUsage); and `POST …/leave` → 204, the
+    /// account's own `DELETE …/members/{its id}`, after which the agent looks at its list again (the local copy is kept).
     pub const SPACES: &str = "/v1/spaces";
+    /// The administrator's team space calls, passed on to the server like [`ADMIN_USERS`]: `GET /v1/admin/spaces?cursor&limit&query` →
+    /// [`AdminSpaceList`](crate::api::AdminSpaceList); `POST` ([`AdminCreateSpace`](crate::api::AdminCreateSpace)) →
+    /// [`AdminSpaceInfo`](crate::api::AdminSpaceInfo); under `/v1/admin/spaces/{id}`: `POST …/archive` and `…/unarchive`
+    /// ([`SpaceConfirm`](crate::api::SpaceConfirm)) → 204, and `PUT …/owner` ([`AdminSetSpaceOwner`](crate::api::AdminSetSpaceOwner)) → 204.
+    pub const ADMIN_SPACES: &str = "/v1/admin/spaces";
 }
 
 /// One version in a file's newest-first history.
