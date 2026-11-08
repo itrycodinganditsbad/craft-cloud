@@ -78,6 +78,117 @@ fn zstd(data: &[u8]) -> Vec<u8> {
     zstd::bulk::compress(data, 3).unwrap()
 }
 
+/// Text built from a small vocabulary in pseudo-random order: it compresses, and higher levels find more in it
+/// than level 1. Unique per run.
+fn wordy(len: usize) -> Vec<u8> {
+    const WORDS: [&str; 24] = [
+        "layer", "mask", "curve", "brush", "export", "canvas", "node", "group", "alpha", "blend", "filter", "frame", "path", "stroke", "fill",
+        "style", "color", "scale", "rotate", "offset", "guide", "grid", "snap", "undo",
+    ];
+    let mut rnd = vec![0u8; len];
+    blake3::Hasher::new().update(uuid::Uuid::now_v7().as_bytes()).finalize_xof().fill(&mut rnd);
+    let mut text = Vec::with_capacity(len + 16);
+    for b in rnd {
+        text.extend_from_slice(WORDS[usize::from(b) % WORDS.len()].as_bytes());
+        text.push(b' ');
+        if text.len() >= len {
+            break;
+        }
+    }
+    text.truncate(len);
+    text
+}
+
+/// Writing at levels 1, 3 and 19 round-trips and reports what it wrote; recompressing rewrites only when that is
+/// smaller, checks before it replaces, is idempotent, leaves damaged objects alone, and a dry run changes nothing.
+async fn levels_and_recompress(store: Store, backend: &dyn Backend) {
+    let data = wordy(512 * 1024);
+    let mut sizes = Vec::new();
+    for level in [1u8, 3, 19] {
+        let leveled = store.clone().with_level(level);
+        let blob = wordy(512 * 1024);
+        let key = chunk_key(&blob);
+        let written = leveled.put(key, &blob).await.unwrap();
+        assert_eq!(written.level, level);
+        let object = raw(backend, key).await;
+        assert_eq!((object[0], written.physical_len), (1, object.len() as u64));
+        assert_eq!(leveled.get(key).await.unwrap(), Bytes::from(blob));
+        assert_eq!(store.object_len(key).await.unwrap(), Some(object.len() as u64));
+        sizes.push(object.len());
+    }
+    assert!(sizes[2] < sizes[0], "level 19 should beat level 1 on this text: {sizes:?}");
+    assert_eq!(store.object_len(chunk_key(b"never stored")).await.unwrap(), None);
+
+    // Stored at 1, recompressed at 19: smaller, still readable, ID unchanged.
+    let key = chunk_key(&data);
+    store.clone().with_level(1).put(key, &data).await.unwrap();
+    let before = raw(backend, key).await;
+    let dry = store.recompress(key, 19, false).await.unwrap();
+    assert!(!dry.rewritten && dry.after < dry.before, "{dry:?}");
+    assert_eq!(raw(backend, key).await, before, "a dry run writes nothing");
+    let done = store.recompress(key, 19, true).await.unwrap();
+    assert!(done.rewritten && done.before == before.len() as u64 && done.after < done.before, "{done:?}");
+    let after = raw(backend, key).await;
+    assert_eq!((after[0], after.len() as u64), (1, done.after));
+    assert_eq!(store.get(key).await.unwrap(), Bytes::from(data.clone()));
+    // Idempotent: nothing more to gain, nothing written.
+    let again = store.recompress(key, 19, true).await.unwrap();
+    assert!(!again.rewritten && again.before == again.after, "{again:?}");
+    assert_eq!(raw(backend, key).await, after);
+    // A lower level never makes it bigger again.
+    let lower = store.recompress(key, 3, true).await.unwrap();
+    assert!(!lower.rewritten);
+    assert_eq!(raw(backend, key).await, after);
+
+    // Plain because zstd could not shrink it, plain because it is tiny: left alone.
+    let noise = incompressible(64 * 1024);
+    store.put(chunk_key(&noise), &noise).await.unwrap();
+    assert!(!store.recompress(chunk_key(&noise), 19, true).await.unwrap().rewritten);
+    assert_eq!(raw(backend, chunk_key(&noise)).await[0], 0);
+    let tiny = compressible(1024);
+    store.clone().with_compression(Compression::None).put(chunk_key(&tiny), &tiny).await.unwrap();
+    assert!(!store.recompress(chunk_key(&tiny), 19, true).await.unwrap().rewritten);
+
+    // Plain but compressible (written with compression off): becomes smaller.
+    let old = wordy(256 * 1024);
+    store.clone().with_compression(Compression::None).put(chunk_key(&old), &old).await.unwrap();
+    let up = store.recompress(chunk_key(&old), 3, true).await.unwrap();
+    assert!(up.rewritten && up.after < up.before / 2, "{up:?}");
+    assert_eq!(raw(backend, chunk_key(&old)).await[0], 1);
+    assert_eq!(store.get(chunk_key(&old)).await.unwrap(), Bytes::from(old));
+
+    // Damaged, wrong and missing objects are errors, and nothing is written over them.
+    let bad = wordy(64 * 1024);
+    let bad_key = chunk_key(&bad);
+    plant(backend, bad_key, 1, &zstd(&wordy(64 * 1024))).await;
+    let planted = raw(backend, bad_key).await;
+    assert!(matches!(store.recompress(bad_key, 19, true).await, Err(StoreError::Corrupt { .. })));
+    assert_eq!(raw(backend, bad_key).await, planted, "left as found");
+    plant(backend, bad_key, 0, b"not the bytes").await;
+    assert!(matches!(store.recompress(bad_key, 19, true).await, Err(StoreError::Corrupt { .. })));
+    assert_eq!(&raw(backend, bad_key).await[1..], b"not the bytes", "left as found");
+    assert!(matches!(store.recompress(chunk_key(b"absent"), 19, true).await, Err(StoreError::NotFound(_))));
+
+    // Levels outside 1 to 19 are clamped, not passed to zstd.
+    assert_eq!(store.clone().with_level(0).level(), 1);
+    assert_eq!(store.clone().with_level(22).level(), 19);
+
+    // sample_levels measures without storing anything.
+    let sample = store.sample_levels(key, &[1, 19]).await.unwrap().unwrap();
+    assert_eq!(sample.len(), 2);
+    assert!(sample[1].stored_len <= sample[0].stored_len && sample[0].plain_len == data.len() as u64);
+    assert_eq!(raw(backend, key).await, after);
+    assert!(store.sample_levels(chunk_key(b"absent"), &[3]).await.unwrap().is_none());
+}
+
+/// A level 19 object of the largest chunk reads back under the reader's 8 MiB window cap.
+async fn level_19_reads_within_the_window_cap(store: Store) {
+    let big = wordy(MAX_CHUNK_BYTES as usize);
+    let key = chunk_key(&big);
+    store.clone().with_level(19).put(key, &big).await.unwrap();
+    assert_eq!(store.get(key).await.unwrap(), Bytes::from(big));
+}
+
 /// How blobs are stored and read back on one backend: `store` writes with the default compression, `plain` with
 /// [`Compression::None`], and `backend` reaches the same objects raw.
 async fn formats(store: Store, plain: Store, backend: &dyn Backend) {
@@ -131,6 +242,8 @@ async fn memory_backend() {
     conformance(Store::new(MemoryBackend::new())).await;
     let backend = MemoryBackend::new();
     formats(Store::new(backend.clone()), Store::new(backend.clone()).with_compression(Compression::None), &backend).await;
+    levels_and_recompress(Store::new(backend.clone()), &backend).await;
+    level_19_reads_within_the_window_cap(Store::new(backend.clone())).await;
 }
 
 #[tokio::test]
@@ -140,6 +253,7 @@ async fn disk_backend() {
     let formats_dir = tempfile::tempdir().unwrap();
     let disk = || DiskBackend::new(formats_dir.path()).unwrap();
     formats(Store::new(disk()), Store::new(disk()).with_compression(Compression::None), &disk()).await;
+    levels_and_recompress(Store::new(disk()), &disk()).await;
 }
 
 #[tokio::test]
@@ -165,6 +279,7 @@ async fn s3_backend() {
     conformance(Store::new(S3Backend::new(&config).unwrap())).await;
     let s3 = || S3Backend::new(&config).unwrap();
     formats(Store::new(s3()), Store::new(s3()).with_compression(Compression::None), &s3()).await;
+    levels_and_recompress(Store::new(s3()), &s3()).await;
 }
 
 #[tokio::test]

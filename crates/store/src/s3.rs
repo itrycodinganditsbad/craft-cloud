@@ -82,6 +82,14 @@ impl Backend for S3Backend {
         }
     }
 
+    async fn len_raw(&self, path: &str) -> Result<Option<u64>, StoreError> {
+        match self.store.head(&self.object_path(path)).await {
+            Ok(meta) => Ok(Some(meta.size)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(backend_error(e)),
+        }
+    }
+
     async fn delete_raw(&self, path: &str) -> Result<(), StoreError> {
         match self.store.delete(&self.object_path(path)).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
