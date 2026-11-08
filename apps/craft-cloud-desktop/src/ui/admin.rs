@@ -77,8 +77,9 @@ fn entered(response: &egui::Response, ui: &egui::Ui) -> bool {
 
 /// A framed panel across the available width: an optional header strip (`title` in a section label, `right` at its right
 /// end, both centred on a row as high as a button) over a hairline, then the body. The body has no margin and no spacing
-/// of its own: it is built from [`section`]s and [`kv`] rows. The frame is at least `min_h` high; the second value is its
-/// height.
+/// of its own: it is built from [`section`]s and [`kv`] rows. The frame is at least `min_h` high; the second value is the
+/// height its content needs by itself (the frame without `min_h`), so that a pair of panels can follow their content down
+/// as well as up.
 fn panel_h<R>(
     ui: &mut egui::Ui,
     min_h: f32,
@@ -87,9 +88,10 @@ fn panel_h<R>(
     body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> (R, f32) {
     let t = Tokens::get(ui.ctx());
+    let mut natural = 0.0;
     let out = egui::Frame::new().stroke(t.hairline()).fill(t.bg).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.set_min_height((min_h - 2.0).max(0.0));
+        let top = ui.cursor().top();
         ui.spacing_mut().item_spacing.y = 0.0;
         if let Some(title) = title {
             egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 2)).show(ui, |ui| {
@@ -97,9 +99,14 @@ fn panel_h<R>(
             });
             kit::hairline(ui);
         }
-        body(ui)
+        let result = body(ui);
+        // What the content took; the room up to `min_h` is added after it, so the content's own height stays known.
+        let used = ui.min_rect().bottom() - top;
+        natural = used + 2.0;
+        ui.add_space((min_h - 2.0 - used).max(0.0));
+        result
     });
-    (out.inner, out.response.rect.height())
+    (out.inner, natural)
 }
 
 fn panel<R>(ui: &mut egui::Ui, title: Option<&str>, right: impl FnOnce(&mut egui::Ui), body: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -132,9 +139,16 @@ fn kv(ui: &mut egui::Ui, label: &str, value: impl FnOnce(&mut egui::Ui)) {
 }
 
 /// Two panels of one height: side by side when there is room, else stacked. `left` and `right` draw one panel each and
-/// are given the height to be at least (0 when stacked) and return the height they came to. The heights are kept for the
-/// next frame, so a change of content takes one more pass.
-fn equal_panels(ui: &mut egui::Ui, key: &str, left: impl FnOnce(&mut egui::Ui, f32) -> f32, right: impl FnOnce(&mut egui::Ui, f32) -> f32) {
+/// are given the height to be at least (0 when stacked) and return the height their content needs by itself (see
+/// [`panel_h`]). The taller of the two is kept for the next frame, so a change of content, shorter or taller, takes one more
+/// pass. `key` tells the pair from others on the page and, for a page that shows one pair per account, from the pair of
+/// another account: the kept height is only good for the content it was measured on.
+fn equal_panels(
+    ui: &mut egui::Ui,
+    key: impl std::hash::Hash + std::fmt::Debug,
+    left: impl FnOnce(&mut egui::Ui, f32) -> f32,
+    right: impl FnOnce(&mut egui::Ui, f32) -> f32,
+) {
     let id = ui.id().with(("admin-panels", key));
     if ui.available_width() < PANELS_SIDE_BY_SIDE {
         left(ui, 0.0);
@@ -302,16 +316,11 @@ fn stat_cells(ui: &mut egui::Ui, storage: Option<&craft_cloud_app::AdminStorageO
         items.push(("Near quota", storage.accounts_near_quota.to_string(), "at 90 % of their quota or more".to_owned()));
         items.push(("Over quota", storage.accounts_over_quota.to_string(), "at or past their quota: uploads refused".to_owned()));
     }
-    const BADGES: [&str; 4] = ["01", "02", "03", "04"];
     // Four cells of at least 190 points stand in one row; narrower, they are two rows of two (and two cells stack below 380).
     let per_row = if items.len() > 2 && ui.available_width() < items.len() as f32 * 190.0 { 2 } else { items.len() };
     for (n, chunk) in items.chunks(per_row).enumerate() {
-        let first = n * per_row;
-        let cells: Vec<JoinedCell<'_>> = chunk
-            .iter()
-            .enumerate()
-            .map(|(k, (label, ..))| JoinedCell::new(BADGES.get(first + k).copied().unwrap_or("00"), Tone::Accent, label))
-            .collect();
+        // The mockup's stats have a label and no numbered badge.
+        let cells: Vec<JoinedCell<'_>> = chunk.iter().map(|(label, ..)| JoinedCell::plain(Tone::Accent, label)).collect();
         kit::joined_cells(ui, ("admin-stats", n), &cells, chunk.len() as f32 * 190.0, |ui, i, part| {
             let (Part::Body, Some((_, value, note))) = (part, chunk.get(i)) else { return };
             ui.horizontal(|ui| big(ui, value, 34.0));
@@ -942,7 +951,7 @@ fn account(ui: &mut egui::Ui, view: &mut UserView, user: Option<&AdminUserInfo>,
     let (mut left_events, mut right_events) = (Vec::new(), Vec::new());
     equal_panels(
         ui,
-        "account",
+        ("account", view.id),
         |ui, min_h| storage_card(ui, min_h, view, user, &mut left_events),
         |ui, min_h| account_card(ui, min_h, user, devices.as_deref(), now_ms, is_me, &mut right_events),
     );
@@ -1511,5 +1520,45 @@ fn shown_code(ui: &mut egui::Ui, code: &ShownCode, user: Option<&AdminUserInfo>,
             ui.set_max_width(NARROW_PANEL + 80.0);
             invite_panel(ui, 0.0, 1, events);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pair of panels follows its content down as well as up, and a pair of another key starts from nothing.
+    #[test]
+    fn a_pair_of_panels_shrinks_when_its_content_does() {
+        struct State {
+            left: f32,
+            key: u8,
+            used: f32,
+        }
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(900.0, 700.0)).build_ui_state(
+            |ui, state: &mut State| {
+                let before = ui.cursor().top();
+                let left = state.left;
+                equal_panels(
+                    ui,
+                    state.key,
+                    |ui, min_h| panel_h(ui, min_h, None, |_| {}, |ui| ui.add_space(left)).1,
+                    |ui, min_h| panel_h(ui, min_h, None, |_| {}, |ui| ui.add_space(20.0)).1,
+                );
+                state.used = ui.cursor().top() - before;
+            },
+            State { left: 300.0, key: 1, used: 0.0 },
+        );
+        h.run_steps(4);
+        let tall = h.state().used;
+        assert!(tall > 300.0, "{tall}");
+        h.state_mut().left = 100.0;
+        h.run_steps(4);
+        assert!((h.state().used - (tall - 200.0)).abs() < 1.5, "it shrank: {} from {tall}", h.state().used);
+        // Another key does not inherit the height kept for this one: the right panel's 20 points decide.
+        h.state_mut().left = 10.0;
+        h.state_mut().key = 2;
+        h.run_steps(4);
+        assert!((h.state().used - (tall - 280.0)).abs() < 1.5, "{} from {tall}", h.state().used);
     }
 }

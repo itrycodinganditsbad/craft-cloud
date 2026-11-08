@@ -1045,7 +1045,7 @@ fn the_audit_log_keeps_the_switcher() {
     let mut model = audit_model(&agent, Vec::new());
     let mut h = harness(model.clone(), egui::Theme::Light);
     h.run_steps(3);
-    assert_eq!(h.query_all_by_label("Audit log").count(), 2, "the chosen segment, and the log's own heading");
+    assert_eq!(h.query_all_by_label("Audit log").count(), 1, "the chosen segment only: the log has no heading of its own in the switcher");
     h.get_by_label("Storage").click();
     h.run_steps(2);
     assert_eq!(std::mem::take(&mut h.state_mut().1), [Event::Admin(AdminEvent::Show(Section::Storage))]);
@@ -1459,11 +1459,13 @@ fn audit_buttons_send_their_events() {
     h.run_steps(2);
     h.get_by_label("Export…").click();
     h.run_steps(2);
-    h.get_by_label("Back to the accounts").click();
+    // The way back is the switcher's, not a button of the log.
+    assert_eq!(h.query_all_by_label("Back to the accounts").count(), 0);
+    h.get_by_label("Accounts").click();
     h.run_steps(2);
     assert_eq!(
         std::mem::take(&mut h.state_mut().1),
-        [Event::Audit(AuditMsg::Reload), Event::Audit(AuditMsg::Export), Event::Admin(AdminEvent::BackToList)]
+        [Event::Audit(AuditMsg::Reload), Event::Audit(AuditMsg::Export), Event::Admin(AdminEvent::Show(Section::Accounts))]
     );
     // A page of the account list opens the log, and an account's page opens its own part of it.
     let model = on_admin_pages(&agent, Vec::new());
