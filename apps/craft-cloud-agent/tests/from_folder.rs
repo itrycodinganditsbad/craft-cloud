@@ -1347,3 +1347,24 @@ async fn a_team_file_edited_after_the_copy_is_kept_and_the_old_version_goes_besi
     assert!(left.is_empty(), "{left:?}");
     let _ = w;
 }
+
+// ---- the fourth review round ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_a_volume_without_hard_links_a_changed_file_still_goes_back() {
+    let (w, ana, project, files) = ana_with_project().await;
+    // The volume has no hard links; a program writes to each file after it was taken out of the old folder.
+    hook::set_hard_link_error(&ana.personal, Some(std::io::ErrorKind::Unsupported));
+    hook::set_after_quarantine(ana.data.path(), Some(append_to));
+    ana.make(&project, "No links").await.unwrap();
+    let status = done(&ana).await;
+    hook::set_hard_link_error(&ana.personal, None);
+    assert_eq!(status.kept, files.len() as u64, "{status:?}");
+    assert!(status.message.as_deref().is_some_and(|m| !m.contains("Move them back yourself")), "{status:?}");
+    let mut grown = files.clone();
+    for data in grown.values_mut() {
+        data.extend_from_slice(b" and more");
+    }
+    assert_eq!(files_under(&project), grown, "every file is back, with what was written after the check");
+    team_holds(&w, &status, &files).await;
+}

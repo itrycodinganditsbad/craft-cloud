@@ -196,6 +196,26 @@ pub mod hook {
         AFTER.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|(path, _)| path == data).map(|(_, f)| *f)
     }
 
+    static LINKS: Mutex<Vec<(PathBuf, io::ErrorKind)>> = Mutex::new(Vec::new());
+
+    /// Makes every hard link made below `under` fail with an error of this kind (`Unsupported` is what a volume without hard links
+    /// says; any other kind is a failure of its own), or ends it with `None`.
+    pub fn set_hard_link_error(under: &Path, kind: Option<io::ErrorKind>) {
+        let mut links = LINKS.lock().unwrap_or_else(PoisonError::into_inner);
+        let canonical = std::fs::canonicalize(under).ok();
+        links.retain(|(path, _)| path != under && Some(path) != canonical.as_ref());
+        if let Some(kind) = kind {
+            links.push((under.to_owned(), kind));
+            if let Some(canonical) = canonical {
+                links.push((canonical, kind));
+            }
+        }
+    }
+
+    pub(super) fn hard_link_error(to: &Path) -> Option<io::ErrorKind> {
+        LINKS.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|(path, _)| to.starts_with(path)).map(|(_, kind)| *kind)
+    }
+
     pub fn set(data: &Path, hook: Option<Hook>) {
         let mut hooks = HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
         hooks.retain(|(path, _)| path != data);
@@ -1440,22 +1460,55 @@ fn components_are_real(root: &Path, os: &[std::ffi::OsString]) -> bool {
     true
 }
 
+/// Whether the error of a hard link says that this volume has none (FAT, exFAT and many network shares), as opposed to a failure of
+/// this one file (access denied, too many links, a path error).
+fn hard_links_unsupported(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    // Windows: ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_CALL_NOT_IMPLEMENTED. Linux: EPERM (what FAT gives) and
+    // EOPNOTSUPP. Other Unix: EPERM and ENOTSUP.
+    let codes: &[i32] = if cfg!(windows) {
+        &[1, 50, 120]
+    } else if cfg!(any(target_os = "linux", target_os = "android")) {
+        &[1, 95]
+    } else if cfg!(unix) {
+        &[1, 45]
+    } else {
+        &[]
+    };
+    e.raw_os_error().is_some_and(|code| codes.contains(&code))
+}
+
+/// A hard link (`hook::set_hard_link_error` can make it fail in tests).
+fn link_file(from: &Path, to: &Path) -> io::Result<()> {
+    if let Some(kind) = hook::hard_link_error(to) {
+        return Err(io::Error::from(kind));
+    }
+    std::fs::hard_link(from, to)
+}
+
+/// The move for a volume without hard links: only a name that is absent (looked at just before) is renamed to, so a name that is
+/// taken is an `AlreadyExists` error. Another program that takes the name between the look and the rename is the narrow window
+/// this fallback has; the hard link has none.
+fn rename_if_absent(from: &Path, to: &Path) -> io::Result<()> {
+    if std::fs::symlink_metadata(to).is_ok() {
+        return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+    }
+    std::fs::rename(from, to)
+}
+
 /// Puts the finished copy in a place that is free: a hard link (which fails when the name is taken) and then the temporary name goes.
-/// A name that is taken is an `AlreadyExists` error, never an overwrite.
+/// A name that is taken is an `AlreadyExists` error, never an overwrite. Only a volume that has no hard links falls back to
+/// [`rename_if_absent`]; any other error of the link is the failure it is.
 fn land_noreplace(temp: &Path, dest: &Path) -> io::Result<()> {
-    match std::fs::hard_link(temp, dest) {
+    match link_file(temp, dest) {
         Ok(()) => {
             let _ = std::fs::remove_file(temp);
             Ok(())
         }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
-        // No hard links on this volume: the move that replaces only a name that is absent (looked at just before).
-        Err(_) => {
-            if std::fs::symlink_metadata(dest).is_ok() {
-                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
-            }
-            std::fs::rename(temp, dest)
-        }
+        Err(e) if hard_links_unsupported(&e) => rename_if_absent(temp, dest),
+        Err(e) => Err(e),
     }
 }
 
@@ -1610,9 +1663,18 @@ fn ancestors_are_real(root: &Path, os: &[std::ffi::OsString]) -> bool {
 }
 
 /// A move that never replaces: the file gets its new name as a hard link (which fails when the name is taken, on every platform),
-/// and only then loses the old one. A volume without hard links gives an error, and the file stays where it is.
+/// and only then loses the old one. A volume without hard links (and anything that is not a plain file, a folder that took a file's
+/// place) is moved by [`rename_if_absent`]. Any other error leaves the file where it is.
 fn move_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    std::fs::hard_link(from, to)?;
+    let plain = std::fs::symlink_metadata(from).is_ok_and(|m| m.is_file() && !is_link(&m));
+    if !plain {
+        return rename_if_absent(from, to);
+    }
+    match link_file(from, to) {
+        Ok(()) => {}
+        Err(e) if hard_links_unsupported(&e) => return rename_if_absent(from, to),
+        Err(e) => return Err(e),
+    }
     if let Err(e) = std::fs::remove_file(from) {
         let _ = std::fs::remove_file(to);
         return Err(e);
@@ -2085,6 +2147,50 @@ mod tests {
         let err = move_noreplace(&held, &place).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!((std::fs::read(&held).unwrap(), std::fs::read(&place).unwrap()), (b"moving".to_vec(), b"new".to_vec()));
+    }
+
+    #[test]
+    fn a_volume_without_hard_links_still_never_has_a_file_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        hook::set_hard_link_error(dir.path(), Some(io::ErrorKind::Unsupported));
+        let (held, place) = (dir.path().join("held.txt"), dir.path().join("a").join("place.txt"));
+        // The place is free: the file goes back by the rename.
+        std::fs::write(&held, b"old").unwrap();
+        put_back(&held, &place).unwrap();
+        assert_eq!((std::fs::read(&place).unwrap(), held.exists()), (b"old".to_vec(), false));
+        // The place is taken: next to it, the new file untouched.
+        std::fs::write(&held, b"older").unwrap();
+        put_back(&held, &place).unwrap();
+        assert_eq!(std::fs::read(&place).unwrap(), b"old");
+        assert_eq!(std::fs::read(place.with_file_name("place.txt.cc-kept")).unwrap(), b"older");
+        // The finished copy lands on a free name, and is refused on a taken one.
+        let (temp, dest) = (dir.path().join("copy.tmp"), dir.path().join("dest.txt"));
+        std::fs::write(&temp, b"copy").unwrap();
+        land_noreplace(&temp, &dest).unwrap();
+        assert_eq!((std::fs::read(&dest).unwrap(), temp.exists()), (b"copy".to_vec(), false));
+        std::fs::write(&temp, b"other").unwrap();
+        let err = land_noreplace(&temp, &dest).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!((std::fs::read(&dest).unwrap(), std::fs::read(&temp).unwrap()), (b"copy".to_vec(), b"other".to_vec()));
+        hook::set_hard_link_error(dir.path(), None);
+    }
+
+    #[test]
+    fn any_other_error_of_a_hard_link_is_a_failure_that_keeps_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        hook::set_hard_link_error(dir.path(), Some(io::ErrorKind::PermissionDenied));
+        let (held, place) = (dir.path().join("held.txt"), dir.path().join("place.txt"));
+        std::fs::write(&held, b"kept").unwrap();
+        assert_eq!(put_back(&held, &place).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!((std::fs::read(&held).unwrap(), place.exists()), (b"kept".to_vec(), false), "no rename fallback");
+        let dest = dir.path().join("dest.txt");
+        assert_eq!(land_noreplace(&held, &dest).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!((held.exists(), dest.exists()), (true, false));
+        hook::set_hard_link_error(dir.path(), None);
+        // What counts as "no hard links here".
+        assert!(hard_links_unsupported(&io::Error::from(io::ErrorKind::Unsupported)));
+        assert!(!hard_links_unsupported(&io::Error::from(io::ErrorKind::PermissionDenied)));
+        assert!(!hard_links_unsupported(&io::Error::from(io::ErrorKind::AlreadyExists)));
     }
 
     #[test]
