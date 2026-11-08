@@ -469,6 +469,28 @@ fn snapshot_security_recovery_codes() {
     snapshot(model, "security-recovery-codes");
 }
 
+/// The one-time codes are on screen: the footer's Sign out and Quit are off, like the tabs, so they can't drop the codes.
+#[test]
+fn the_footer_is_off_while_the_recovery_codes_are_shown() {
+    let agent = FakeAgent::new(signed_in());
+    agent.factor.lock().unwrap().enabled = true;
+    let mut model = security_model(&agent, vec![Event::Security(SecurityEvent::StartRegenerate)]);
+    type_into(&mut model, |step| {
+        if let Step::Regenerate { password, code } = step {
+            *password = PASSWORD.into();
+            *code = CODE.into();
+        }
+    });
+    feed(&mut model, &agent, Event::Security(SecurityEvent::Submit));
+    assert!(matches!(&page(&mut model).step, Step::Codes { .. }));
+    let mut h = harness(model, egui::Theme::Light);
+    h.run_steps(2);
+    h.get_by_label("Sign out").click();
+    h.get_by_label("Quit").click();
+    h.run_steps(2);
+    assert!(h.state().1.is_empty(), "{:?}", h.state().1);
+}
+
 #[test]
 fn snapshot_security_turning_it_off_when_locked() {
     let agent = FakeAgent::new(signed_in());

@@ -1241,6 +1241,16 @@ fn snapshot_overview_long_autostart_warning() {
     snapshot_sized(model, egui::Theme::Dark, "tab-overview-long-warning-640-dark", MIN_WINDOW_SIZE);
 }
 
+/// A long state line is cut off in the footer rather than running under Sign out and Quit.
+#[test]
+fn snapshot_footer_with_a_long_state_at_the_smallest_width() {
+    let mut status = signed_in();
+    status.online = false;
+    status.server = Some("https://a-very-long-server-name.example-company.org".into());
+    status.run_state = RunState::Retrying { message: "no route".into() };
+    snapshot_sized(signed_in_model(status), egui::Theme::Light, "footer-long-state-640", MIN_WINDOW_SIZE);
+}
+
 /// The footer's Sign out works on the pages that don't carry the signed-in view, too.
 #[test]
 fn the_footers_sign_out_works_on_trash_and_versions() {

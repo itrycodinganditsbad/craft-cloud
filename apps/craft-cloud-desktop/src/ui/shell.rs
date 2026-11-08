@@ -151,7 +151,7 @@ fn tabs(ui: &mut egui::Ui, shell: &Shell, events: &mut Vec<Event>) {
                 events.push(Event::Tab(*tab));
             }
             if shell.locked {
-                response.on_disabled_hover_text("Finish or close what the page shows first");
+                response.on_disabled_hover_text(LOCKED_HOVER);
             }
         }
     });
@@ -159,6 +159,10 @@ fn tabs(ui: &mut egui::Ui, shell: &Shell, events: &mut Vec<Event>) {
 
 /// The height of the footer strip.
 const FOOTER_H: f32 = 36.0;
+/// The room between Sign out and Quit.
+const FOOTER_LINK_GAP: f32 = 20.0;
+/// Why the tabs, Sign out and Quit are off while the page holds a one-time code or waits for a call.
+const LOCKED_HOVER: &str = "Finish or close what the page shows first";
 
 /// The footer strip: the agent's state on the left, Sign out and Quit as accent text links on the right, 20 px apart; above
 /// it, what went wrong with the last Sign out.
@@ -166,26 +170,36 @@ pub(super) fn footer(ui: &mut egui::Ui, shell: &Shell, events: &mut Vec<Event>) 
     let t = Tokens::get(ui.ctx());
     let frame = egui::Frame::new().fill(t.bg).inner_margin(Margin::symmetric(20, 0));
     egui::Panel::bottom("footer").frame(frame).show(ui, |ui| {
+        // Left to right, so the tab order is the visual one: the caption (cut off when it doesn't fit), the room, Sign out and
+        // Quit. The links are measured first and keep their place; the caption gets what is left.
         ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), FOOTER_H), Layout::left_to_right(Align::Center), |ui| {
-            kit::caption(ui, &shell.state);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 20.0;
-                let quit = ui.add_enabled_ui(shell.busy != Some(Busy::Quitting), |ui| kit::text_link(ui, "Quit", 11.0)).inner;
-                if quit.on_hover_text("Stops syncing until the next login").clicked() {
-                    events.push(Event::Quit);
-                }
-                let sign_out = ui.add_enabled_ui(shell.busy.is_none(), |ui| kit::text_link(ui, "Sign out", 11.0)).inner;
-                if sign_out.on_hover_text("The files stay on this computer").clicked() {
-                    events.push(Event::SignOut);
-                }
-            });
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let (sign_out_w, quit_w) = (kit::text_link_width(ui, "Sign out", 11.0), kit::text_link_width(ui, "Quit", 11.0));
+            let links_w = sign_out_w + FOOTER_LINK_GAP + quit_w;
+            kit::caption_fit(ui, &shell.state, ui.available_width() - links_w - FOOTER_LINK_GAP);
+            ui.add_space((ui.available_width() - links_w).max(0.0));
+            let sign_out = ui.add_enabled_ui(shell.busy.is_none() && !shell.locked, |ui| kit::text_link(ui, "Sign out", 11.0)).inner;
+            let sign_out =
+                if shell.locked { sign_out.on_disabled_hover_text(LOCKED_HOVER) } else { sign_out.on_hover_text("The files stay on this computer") };
+            if sign_out.clicked() {
+                events.push(Event::SignOut);
+            }
+            ui.add_space(FOOTER_LINK_GAP);
+            let quit = ui.add_enabled_ui(shell.busy != Some(Busy::Quitting) && !shell.locked, |ui| kit::text_link(ui, "Quit", 11.0)).inner;
+            let quit =
+                if shell.locked { quit.on_disabled_hover_text(LOCKED_HOVER) } else { quit.on_hover_text("Stops syncing until the next login") };
+            if quit.clicked() {
+                events.push(Event::Quit);
+            }
         });
     });
     if let Some(error) = &shell.sign_out_error {
         let frame = egui::Frame::new().fill(t.bg).inner_margin(Margin::symmetric(20, 8));
         egui::Panel::bottom("sign-out-problem").frame(frame).show(ui, |ui| {
             super::error_line(ui, error);
-            if shell.offer_local && ui.add_enabled(shell.busy.is_none(), kit::Button::new("Sign out on this computer only")).clicked() {
+            if shell.offer_local
+                && ui.add_enabled(shell.busy.is_none() && !shell.locked, kit::Button::new("Sign out on this computer only")).clicked()
+            {
                 events.push(Event::SignOutHere);
             }
         });

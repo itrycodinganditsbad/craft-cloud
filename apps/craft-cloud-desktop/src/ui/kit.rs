@@ -356,6 +356,12 @@ impl Button {
         self
     }
 
+    /// The width the button takes in `ui` (what [`trailing`] needs to place a row of buttons).
+    pub fn width(&self, ui: &Ui) -> f32 {
+        let galley = label_galley(ui, &self.text, LABEL_SIZE, mono_bold());
+        (galley.size().x + 2.0 * ui.spacing().button_padding.x).max(self.min_size.x)
+    }
+
     /// Drawn as the chosen one of a group (inverted like [`primary`](Self::primary)).
     pub fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
@@ -523,19 +529,40 @@ pub fn tab_width(ui: &Ui, text: &str) -> f32 {
 /// text is the tooltip.
 pub fn section_label_fit(ui: &mut Ui, text: &str, max_width: f32) -> Response {
     let t = Tokens::get(ui.ctx());
-    let format = egui::TextFormat {
-        font_id: FontId::new(LABEL_SIZE, mono()),
-        extra_letter_spacing: LABEL_SIZE * 0.09,
-        color: Color32::PLACEHOLDER,
-        ..Default::default()
-    };
+    mono_label_fit(ui, text, LABEL_SIZE, t.muted, max_width)
+}
+
+/// A row of controls at the right end of the space, drawn left to right so that the tab order is the visual one:
+/// `content_width` is what `add` will take (the controls and the spacing between them).
+pub fn trailing(ui: &mut Ui, content_width: f32, add: impl FnOnce(&mut Ui)) {
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(egui::vec2(width, CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.add_space((width - content_width).max(0.0));
+        add(ui);
+    });
+}
+
+/// A [`caption`] on one line at most `max_width` wide, cut off with an ellipsis and whole as its tooltip.
+pub fn caption_fit(ui: &mut Ui, text: &str, max_width: f32) -> Response {
+    let t = Tokens::get(ui.ctx());
+    mono_label_fit(ui, text, 11.0, t.muted, max_width)
+}
+
+fn mono_label_fit(ui: &mut Ui, text: &str, size: f32, color: Color32, max_width: f32) -> Response {
+    let format =
+        egui::TextFormat { font_id: FontId::new(size, mono()), extra_letter_spacing: size * 0.09, color: Color32::PLACEHOLDER, ..Default::default() };
     let mut job = egui::text::LayoutJob::single_section(text.to_uppercase(), format);
     job.wrap = egui::text::TextWrapping { max_width: max_width.max(0.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
     let galley = ui.painter().layout_job(job);
     let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
-    ui.painter().galley(rect.min, galley, t.muted);
+    ui.painter().galley(rect.min, galley, color);
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
     response.on_hover_text(text)
+}
+
+/// The width of a [`text_link`] of `size` points.
+pub fn text_link_width(ui: &Ui, text: &str, size: f32) -> f32 {
+    label_galley(ui, text, size, mono()).size().x
 }
 
 /// A small filled mark in upper-case mono, coloured by `tone`: the number of a section (`01`). Natural size, like [`tag`].

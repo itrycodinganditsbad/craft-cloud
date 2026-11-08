@@ -1293,7 +1293,7 @@ impl Model {
                 vec![if event == Event::Pause { Effect::Pause } else { Effect::Resume }]
             }
             Event::Quit => {
-                if self.busy == Some(Busy::Quitting) {
+                if self.busy == Some(Busy::Quitting) || self.tabs_locked() {
                     return Vec::new();
                 }
                 self.busy = Some(Busy::Quitting);
@@ -1636,7 +1636,8 @@ impl Model {
     }
 
     fn sign_out(&mut self, local: bool) -> Vec<Effect> {
-        if self.busy.is_some() {
+        // Signing out drops the page as a tab would: not while it holds a one-time code or waits for a call.
+        if self.busy.is_some() || self.tabs_locked() {
             return Vec::new();
         }
         // From every page of the signed-in window, the footer's Sign out included.
@@ -2800,6 +2801,28 @@ pub(crate) mod tests {
         assert!(!m.tabs_locked());
         m.update(Event::Tab(Tab::Overview));
         assert_eq!(m.tab(), Some(Tab::Overview));
+    }
+
+    /// Sign out and Quit would drop the page like a tab does, so they wait too while the page holds a one-time code or a
+    /// call is under way.
+    #[test]
+    fn sign_out_and_quit_wait_while_the_tabs_are_locked() {
+        let mut m = signed_in();
+        m.update(Event::Tab(Tab::Security));
+        let Screen::Security(page) = &mut m.screen else { panic!() };
+        page.step = SecurityStep::Codes { codes: vec!["AAAA-BBBB".into()], why: crate::security::CodesWhy::TurnedOn };
+        assert!(m.tabs_locked());
+        for event in [Event::SignOut, Event::SignOutHere, Event::Quit] {
+            assert!(m.update(event.clone()).is_empty(), "{event:?}");
+        }
+        assert_eq!(m.busy, None);
+        // Done with the codes: both work again.
+        m.update(Event::Security(SecurityEvent::Home));
+        assert!(!m.tabs_locked());
+        assert_eq!(m.update(Event::SignOut), vec![Effect::Logout { local: false }]);
+        let mut m = signed_in();
+        m.update(Event::Tab(Tab::Security));
+        assert_eq!(m.update(Event::Quit), vec![Effect::QuitTray, Effect::QuitAgent]);
     }
 
     #[test]
