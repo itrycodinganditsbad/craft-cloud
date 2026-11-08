@@ -43,6 +43,13 @@ pub enum SpaceActor {
     Cli,
 }
 
+/// The role a write needs and the account that asks, for [`Meta::guarded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteGuard {
+    pub user: UserId,
+    pub min: SpaceRole,
+}
+
 /// A member of a team space, or an account invited to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
@@ -114,33 +121,32 @@ impl Meta {
     /// What `user` may do in `space`: `None` for no access at all, which is also the answer for a space that does not
     /// exist (a caller must not tell the two apart). See the module's rules.
     pub async fn space_access(&self, user: UserId, space: SpaceId) -> Result<Option<SpaceRole>, MetaError> {
-        let row = sqlx::query(
-            "SELECT s.kind, s.owner, s.archived_ms, m.role, m.accepted_ms, u.disabled_ms, u.removed_ms \
-             FROM spaces s JOIN users u ON u.id = $1 LEFT JOIN space_members m ON m.space_id = s.id AND m.user_id = u.id \
-             WHERE s.id = $2",
-        )
-        .bind(uuid_bytes(&user.0))
-        .bind(uuid_bytes(space.as_uuid()))
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some(row) = row else { return Ok(None) };
-        if row.try_get::<Option<i64>, _>("disabled_ms")?.is_some() || row.try_get::<Option<i64>, _>("removed_ms")?.is_some() {
-            return Ok(None);
+        let mut conn = self.pool.acquire().await?;
+        access_on(&mut conn, user, space).await
+    }
+
+    /// A handle whose space writes (commit, restore, save, upload, removal from the trash) re-check `guard` inside their
+    /// write transaction, after the space's row is locked: a role lowered, a member removed or a space archived by a change
+    /// that committed between the server's access check and the write is respected. A refused write changes nothing and is
+    /// `NotFound("space")` (no access any more) or [`MetaError::ReadOnly`]. Cheap: a clone with one field set. Only the
+    /// space writes look at it.
+    pub fn guarded(&self, guard: WriteGuard) -> Meta {
+        Meta { guard: Some(guard), ..self.clone() }
+    }
+
+    /// Runs the guard of a [`Meta::guarded`] handle, if there is one, on the write transaction's connection. On Postgres
+    /// the space's row is locked first (`FOR SHARE`: an upload does not wait for other uploads, but a change to the
+    /// space's members, which takes `FOR UPDATE`, does wait for it and the other way round); on SQLite the single writer
+    /// already orders everything.
+    pub(crate) async fn check_guard(&self, conn: &mut sqlx::AnyConnection, space: SpaceId) -> Result<(), MetaError> {
+        let Some(guard) = self.guard else { return Ok(()) };
+        if self.dialect == Dialect::Postgres {
+            sqlx::query("SELECT 1 FROM spaces WHERE id = $1 FOR SHARE").bind(uuid_bytes(space.as_uuid())).fetch_optional(&mut *conn).await?;
         }
-        match row.try_get::<String, _>("kind")?.as_str() {
-            "personal" => {
-                let owner: Option<Vec<u8>> = row.try_get("owner")?;
-                Ok(owner.as_deref().map(uuid_from).transpose()?.filter(|owner| *owner == user.0).map(|_| SpaceRole::Owner))
-            }
-            "team" => {
-                let role: Option<String> = row.try_get("role")?;
-                let accepted: Option<i64> = row.try_get("accepted_ms")?;
-                let (Some(role), Some(_)) = (role, accepted) else { return Ok(None) };
-                let role = parse_role(&role)?;
-                let archived = row.try_get::<Option<i64>, _>("archived_ms")?.is_some();
-                Ok(Some(if archived { role.min(SpaceRole::Viewer) } else { role }))
-            }
-            _ => Err(MetaError::Corrupt("unknown space kind")),
+        match access_on(conn, guard.user, space).await? {
+            None => Err(MetaError::NotFound("space")),
+            Some(role) if role < guard.min => Err(MetaError::ReadOnly),
+            Some(_) => Ok(()),
         }
     }
 
@@ -430,6 +436,38 @@ impl Meta {
             }
         }
         Ok((w, locked))
+    }
+}
+
+/// [`Meta::space_access`] on a given connection (also a write transaction's).
+async fn access_on(conn: &mut sqlx::AnyConnection, user: UserId, space: SpaceId) -> Result<Option<SpaceRole>, MetaError> {
+    let row = sqlx::query(
+        "SELECT s.kind, s.owner, s.archived_ms, m.role, m.accepted_ms, u.disabled_ms, u.removed_ms \
+         FROM spaces s JOIN users u ON u.id = $1 LEFT JOIN space_members m ON m.space_id = s.id AND m.user_id = u.id \
+         WHERE s.id = $2",
+    )
+    .bind(uuid_bytes(&user.0))
+    .bind(uuid_bytes(space.as_uuid()))
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    if row.try_get::<Option<i64>, _>("disabled_ms")?.is_some() || row.try_get::<Option<i64>, _>("removed_ms")?.is_some() {
+        return Ok(None);
+    }
+    match row.try_get::<String, _>("kind")?.as_str() {
+        "personal" => {
+            let owner: Option<Vec<u8>> = row.try_get("owner")?;
+            Ok(owner.as_deref().map(uuid_from).transpose()?.filter(|owner| *owner == user.0).map(|_| SpaceRole::Owner))
+        }
+        "team" => {
+            let role: Option<String> = row.try_get("role")?;
+            let accepted: Option<i64> = row.try_get("accepted_ms")?;
+            let (Some(role), Some(_)) = (role, accepted) else { return Ok(None) };
+            let role = parse_role(&role)?;
+            let archived = row.try_get::<Option<i64>, _>("archived_ms")?.is_some();
+            Ok(Some(if archived { role.min(SpaceRole::Viewer) } else { role }))
+        }
+        _ => Err(MetaError::Corrupt("unknown space kind")),
     }
 }
 

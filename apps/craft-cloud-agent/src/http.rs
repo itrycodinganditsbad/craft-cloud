@@ -1361,8 +1361,8 @@ mod tests {
             max_missing_ids: MAX_MISSING_IDS as u32,
         };
         assert!(check_compatible(&info).is_ok());
-        info.protocol_min = 2;
-        info.protocol_max = 3;
+        info.protocol_min = PROTOCOL_MAX + 1;
+        info.protocol_max = PROTOCOL_MAX + 2;
         assert!(check_compatible(&info).is_err());
         info.protocol_min = 1;
         info.chunker_params = vec!["other".into()];

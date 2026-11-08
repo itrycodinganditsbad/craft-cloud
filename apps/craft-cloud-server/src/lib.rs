@@ -16,6 +16,7 @@ pub mod live;
 pub mod notify;
 pub mod ratelimit;
 pub mod secretbox;
+pub mod space;
 pub mod state;
 pub mod totp;
 pub mod two_factor;

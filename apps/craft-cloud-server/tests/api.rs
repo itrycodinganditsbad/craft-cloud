@@ -318,7 +318,7 @@ fn create(node: NodeId, parent: NodeId, name: &str, manifest: ManifestId) -> Op 
 
 async fn info_needs_no_sign_in(s: &Server) {
     let info: InfoResponse = s.client.get(format!("{}/info", s.base)).send().await.unwrap().json().await.unwrap();
-    assert_eq!((info.protocol_min, info.protocol_max), (1, 1));
+    assert_eq!((info.protocol_min, info.protocol_max), (1, 2));
     assert_eq!(info.chunker_params, vec!["fastcdc-v1".to_owned()]);
     assert_eq!(info.max_chunk_bytes, 4 * 1024 * 1024);
 }

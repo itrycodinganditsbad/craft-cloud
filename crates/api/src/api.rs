@@ -48,6 +48,9 @@ pub mod codes {
     pub const LAST_ADMIN: &str = "last_admin";
     /// A change to a team space's members would leave it without an owner (HTTP 409).
     pub const LAST_OWNER: &str = "last_owner";
+    /// The account is a member of the team space but its role does not allow this (HTTP 403): a viewer writing, an editor
+    /// removing from the trash. The agent switches that space to read-only on it. Never 401, which reads as "signed out".
+    pub const READ_ONLY: &str = "read_only";
     /// A password sign-in (or the redeeming of an invite or reset code for an account with two-factor sign-in) was
     /// right, but needs a second factor (HTTP 401, no token). The answer's `two_factor` carries the challenge.
     pub const TWO_FACTOR_REQUIRED: &str = "two_factor_required";
@@ -664,6 +667,7 @@ mod tests {
         assert_eq!(codes::ACCOUNT_DISABLED, "account_disabled");
         assert_eq!(codes::LAST_ADMIN, "last_admin");
         assert_eq!(codes::LAST_OWNER, "last_owner");
+        assert_eq!(codes::READ_ONLY, "read_only");
     }
 
     #[test]

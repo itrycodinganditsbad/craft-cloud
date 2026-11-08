@@ -148,6 +148,7 @@ impl From<MetaError> for ApiError {
             MetaError::DeviceRevoked => Self::unauthorized(),
             MetaError::Forbidden(message) => Self::forbidden(message),
             MetaError::LastAdmin => Self::new(StatusCode::CONFLICT, codes::LAST_ADMIN, e.to_string()),
+            MetaError::ReadOnly => crate::space::read_only(),
             MetaError::LastOwner => Self::new(StatusCode::CONFLICT, codes::LAST_OWNER, e.to_string()),
             MetaError::AccountDisabled => Self::new(StatusCode::FORBIDDEN, codes::ACCOUNT_DISABLED, "this account is disabled; ask an administrator"),
             // The status of a wrong second factor depends on the route: 403 here (every signed-in route), made 401 by

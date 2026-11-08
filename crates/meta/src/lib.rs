@@ -47,7 +47,7 @@ pub use live::{
     Appended, DEFAULT_LIVE_BYTES_PER_SPACE, LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE, MAX_LIVE_DOCS_PER_SPACE,
     MAX_LIVE_DOCUMENTS_HOLDING_UPDATES, MAX_LIVE_DOCUMENTS_PER_SPACE, MAX_LIVE_PAGE, SnapshotRef,
 };
-pub use spaces::{Member, SpaceActor};
+pub use spaces::{Member, SpaceActor, WriteGuard};
 pub use trash::{TrashEntry, TrashPage};
 pub use tree::{MAX_PAGE_SAVE_BYTES, SpaceInfo};
 pub use two_factor::{
@@ -123,6 +123,10 @@ pub enum MetaError {
     /// The change would leave a team space without an accepted owner; nothing was changed.
     #[error("this would leave the team space without an owner")]
     LastOwner,
+    /// The account is a member of the team space but its role does not allow this write (it was lowered, or the space was
+    /// archived, after the request was let in); nothing was changed.
+    #[error("this space is read-only for your role")]
+    ReadOnly,
     /// The account is disabled or marked for removal. Said only to someone who proved they hold its password or a
     /// code of it, never to a guesser.
     #[error("this account is disabled")]
@@ -201,6 +205,9 @@ pub struct Meta {
     /// The most deleted items below one folder that restoring or removing the folder from the trash takes with it
     /// ([`Meta::with_trash_tree_cap`]).
     trash_tree_cap: u64,
+    /// Set on a handle made by [`Meta::guarded`]: the write transactions of the space's writes check the caller's role
+    /// again before they change anything.
+    guard: Option<WriteGuard>,
 }
 
 impl Meta {
@@ -289,6 +296,7 @@ impl Meta {
             clock: None,
             index_rows: INDEX_BATCH_ROWS,
             trash_tree_cap: MAX_TRASH_TREE_NODES,
+            guard: None,
         })
     }
 

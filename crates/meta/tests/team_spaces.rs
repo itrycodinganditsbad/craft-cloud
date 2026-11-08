@@ -3,7 +3,9 @@
 //! runs; Postgres runs when `CRAFT_CLOUD_TEST_PG` holds an admin URL (`CRAFT_CLOUD_REQUIRE_BACKENDS` makes a missing one a
 //! failure), as in `behaviour.rs`.
 
-use craft_cloud_meta::{ActionFilter, AdminActor, AdminVia, AuditEvent, AuditQuery, Meta, MetaError, Role, SpaceActor, UserId, UserRecord};
+use craft_cloud_meta::{
+    ActionFilter, AdminActor, AdminVia, AuditEvent, AuditQuery, Meta, MetaError, Role, SpaceActor, UserId, UserRecord, WriteGuard,
+};
 use craft_cloud_proto::api::SpaceRole;
 use craft_cloud_proto::{DeviceId, SpaceId, SpaceName};
 use sqlx::{AnyPool, Row};
@@ -105,6 +107,7 @@ on_every_backend!(
     the_command_line_and_admins_create_and_manage_spaces,
     the_last_owner_stays,
     concurrent_changes_never_leave_a_space_without_an_owner,
+    guarded_writes_check_the_role_in_their_own_transaction,
 );
 
 // ---- helpers ----
@@ -822,4 +825,57 @@ async fn concurrent_changes_never_leave_a_space_without_an_owner(db: &Db) {
         let owners = meta.list_members(space).await.unwrap().into_iter().filter(|m| m.role == SpaceRole::Owner && m.accepted()).count();
         assert_eq!(owners, 1, "round {round} ({how}): {r1:?} / {r2:?}");
     }
+}
+
+// ---- guarded writes ----
+
+/// A write through a handle from `Meta::guarded` reads the caller's role again inside its own transaction, so a role lowered,
+/// a member removed or a space archived after the server's access check (and before the write) is respected: the write is
+/// refused and changes nothing. The same write through the plain handle goes through, which shows it is the guard that refuses.
+async fn guarded_writes_check_the_role_in_their_own_transaction(db: &Db) {
+    let meta = &db.meta;
+    let ana = user(meta, "ana").await;
+    let ben = user(meta, "ben").await;
+    let space = team(meta, "Studio", &ana).await;
+    join(meta, space, &ana, &ben, SpaceRole::Editor).await;
+    let dev = device(meta, &ben).await;
+    let root = meta.space_info(space).await.unwrap().root;
+    let mkdir = |name: &str| {
+        vec![craft_cloud_proto::Op::Mkdir {
+            node: craft_cloud_proto::NodeId::generate(),
+            parent: root,
+            name: craft_cloud_proto::Name::new(name).unwrap(),
+        }]
+    };
+    let chunk = craft_cloud_proto::ChunkId::from_bytes([3; 32]);
+    let editor = meta.guarded(WriteGuard { user: ben.id, min: SpaceRole::Editor });
+
+    // As an editor every write goes through.
+    editor.commit(space, dev, &mkdir("one"), NOW + 3).await.unwrap();
+    editor.add_chunk(space, &chunk, 10, NOW + 3).await.unwrap();
+    let seq = meta.space_info(space).await.unwrap().seq;
+
+    // The role is lowered after the handle was made: every write is refused, and nothing changed.
+    meta.change_member_role(&by(&ana), space, ben.id, SpaceRole::Viewer, NOW + 4).await.unwrap();
+    assert!(matches!(editor.commit(space, dev, &mkdir("two"), NOW + 5).await, Err(MetaError::ReadOnly)));
+    assert!(matches!(editor.add_chunk(space, &craft_cloud_proto::ChunkId::from_bytes([4; 32]), 10, NOW + 5).await, Err(MetaError::ReadOnly)));
+    assert!(matches!(editor.add_chunks(space, &[(craft_cloud_proto::ChunkId::from_bytes([5; 32]), 10)], NOW + 5).await, Err(MetaError::ReadOnly)));
+    assert!(matches!(editor.restore_from_trash(space, dev, craft_cloud_proto::NodeId::generate(), NOW + 5).await, Err(MetaError::ReadOnly)));
+    assert!(matches!(editor.request_purge(space, craft_cloud_proto::NodeId::generate(), NOW + 5).await, Err(MetaError::ReadOnly)));
+    assert_eq!(meta.space_info(space).await.unwrap().seq, seq, "a refused write takes no sequence number");
+    assert_eq!(meta.missing_chunks(space, &[craft_cloud_proto::ChunkId::from_bytes([4; 32])]).await.unwrap().len(), 1, "nothing was recorded");
+    // A viewer's handle for a read-level minimum still works, and the plain handle is not guarded.
+    meta.guarded(WriteGuard { user: ben.id, min: SpaceRole::Viewer }).commit(space, dev, &mkdir("three"), NOW + 6).await.unwrap();
+    meta.commit(space, dev, &mkdir("four"), NOW + 6).await.unwrap();
+
+    // Removed: no access at all, which is the answer for a space that is not there.
+    meta.remove_member(&SpaceActor::Cli, space, ben.id, NOW + 7).await.unwrap();
+    assert!(matches!(editor.commit(space, dev, &mkdir("five"), NOW + 8).await, Err(MetaError::NotFound("space"))));
+
+    // Archived: at most a viewer, so even the owner's write is refused.
+    let owner = meta.guarded(WriteGuard { user: ana.id, min: SpaceRole::Editor });
+    owner.commit(space, dev, &mkdir("six"), NOW + 9).await.unwrap();
+    run(&raw(&db.url).await, format!("UPDATE spaces SET archived_ms = 1 WHERE id = {}", blob_of(db.postgres, space.as_uuid()))).await.unwrap();
+    assert!(matches!(owner.commit(space, dev, &mkdir("seven"), NOW + 10).await, Err(MetaError::ReadOnly)));
+    meta.guarded(WriteGuard { user: ana.id, min: SpaceRole::Viewer }).commit(space, dev, &mkdir("eight"), NOW + 10).await.unwrap();
 }

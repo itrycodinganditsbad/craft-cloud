@@ -132,6 +132,7 @@ impl Meta {
         let mut w = self.begin_write().await?;
         // On Postgres this row lock orders the mark with commits and restores of the space.
         space_info(&mut w.tx, space, self.dialect == Dialect::Postgres).await?;
+        self.check_guard(&mut w.tx, space).await?;
         let row = sqlx::query("SELECT deleted, purge_requested_ms, is_dir FROM nodes WHERE space_id = $1 AND id = $2")
             .bind(uuid_bytes(space.as_uuid()))
             .bind(uuid_bytes(node.as_uuid()))

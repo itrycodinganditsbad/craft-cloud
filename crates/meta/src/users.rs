@@ -195,6 +195,14 @@ pub struct DeviceAuth {
     pub username: String,
 }
 
+impl DeviceAuth {
+    /// The account's own (personal) space, for the routes that are about the account and never take a `craft-space`
+    /// header. A space-scoped handler takes its space from the server's `SpaceAccess` instead, never from here.
+    pub fn personal_space(&self) -> SpaceId {
+        self.space
+    }
+}
+
 /// Usernames: 1–64 bytes of ASCII letters, digits, `.`, `_`, `-`. They are stored in lowercase, so names that differ
 /// only in ASCII case are the same name.
 pub fn valid_username(name: &str) -> bool {

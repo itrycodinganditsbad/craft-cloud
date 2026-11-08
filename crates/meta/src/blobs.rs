@@ -193,6 +193,7 @@ impl Meta {
     /// `QuotaExceeded`, recording nothing, if it would take the space over the cap.
     pub async fn add_chunk(&self, space: SpaceId, id: &ChunkId, stored_size: u64, now_ms: i64) -> Result<(), MetaError> {
         let mut w = self.begin_write().await?;
+        self.check_guard(&mut w.tx, space).await?;
         let blob = Blob { kind: BlobKind::Chunk, id: id.as_bytes(), stored_size: to_i64(stored_size)?, file_size: None };
         record(&mut w.tx, space, blob, now_ms, self.stored_cap).await?;
         w.commit().await
@@ -207,6 +208,7 @@ impl Meta {
         sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
         sorted.dedup_by(|a, b| a.0 == b.0);
         let mut w = self.begin_write().await?;
+        self.check_guard(&mut w.tx, space).await?;
         for part in sorted.chunks(BATCH) {
             let rows = |width: usize| (0..part.len()).map(|i| format!("({})", placeholders(i * width + 1, width))).collect::<Vec<_>>().join(", ");
             let mut blobs = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -263,6 +265,7 @@ impl Meta {
             return Err(MetaError::MissingChunks(missing));
         }
         let mut w = self.begin_write().await?;
+        self.check_guard(&mut w.tx, space).await?;
         let id = manifest.id();
         let blob = Blob { kind: BlobKind::Manifest, id: id.as_bytes(), stored_size: to_i64(stored_size)?, file_size: Some(to_i64(manifest.size())?) };
         record(&mut w.tx, space, blob, now_ms, self.stored_cap).await?;

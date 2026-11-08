@@ -652,6 +652,7 @@ impl Meta {
         let mut w = self.begin_write().await?;
         // On Postgres this row lock makes commits to one space run one at a time.
         let info = space_info(&mut w.tx, space, self.dialect == Dialect::Postgres).await?;
+        self.check_guard(&mut w.tx, space).await?;
         let seq = info.seq.checked_add(1).ok_or(MetaError::Corrupt("sequence overflow"))?;
         let mut ctx = Ctx { conn: &mut w.tx, space, seq: to_i64(seq)?, epoch: info.epoch, device, now_ms, failed_restores: HashMap::new() };
         let mut conflicts = Vec::new();
@@ -674,6 +675,7 @@ impl Meta {
     pub async fn restore_from_trash(&self, space: SpaceId, device: DeviceId, node: NodeId, now_ms: i64) -> Result<TrashRestoreOutcome, MetaError> {
         let mut w = self.begin_write().await?;
         let info = space_info(&mut w.tx, space, self.dialect == Dialect::Postgres).await?;
+        self.check_guard(&mut w.tx, space).await?;
         let seq = info.seq.checked_add(1).ok_or(MetaError::Corrupt("sequence overflow"))?;
         let mut ctx = Ctx { conn: &mut w.tx, space, seq: to_i64(seq)?, epoch: info.epoch, device, now_ms, failed_restores: HashMap::new() };
         let outcome = ctx.restore_from_trash(node, self.trash_tree_cap).await?;
@@ -703,6 +705,7 @@ impl Meta {
         let mut w = self.begin_write().await?;
         // On Postgres this row lock orders the restore with every other commit and save of the space.
         let info = space_info(&mut w.tx, space, self.dialect == Dialect::Postgres).await?;
+        self.check_guard(&mut w.tx, space).await?;
         let seq = info.seq.checked_add(1).ok_or(MetaError::Corrupt("sequence overflow"))?;
         let mut ctx = Ctx { conn: &mut w.tx, space, seq: to_i64(seq)?, epoch: info.epoch, device, now_ms, failed_restores: HashMap::new() };
         let row = ctx.node(node).await?.ok_or(MetaError::NotFound("node"))?;
@@ -760,6 +763,7 @@ impl Meta {
         let json = serde_json::to_string(save).map_err(|_| MetaError::Invalid("a save record that can't be written"))?;
         let mut w = self.begin_write().await?;
         let info = space_info(&mut w.tx, space, self.dialect == Dialect::Postgres).await?;
+        self.check_guard(&mut w.tx, space).await?;
         let found = sqlx::query("SELECT save FROM versions WHERE space_id = $1 AND id = $2 AND node = $3")
             .bind(uuid_bytes(space.as_uuid()))
             .bind(uuid_bytes(version.as_uuid()))

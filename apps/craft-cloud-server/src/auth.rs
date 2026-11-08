@@ -75,7 +75,7 @@ fn bearer(request: &Request) -> Option<&str> {
 }
 
 /// Signs the request in from its device token, puts the device in the request extensions, and adds the
-/// space's epoch to the answer. The epoch is read before the handler runs, so a failed read stops the
+/// personal space's epoch to the answer (the space layer, [`crate::space::require_space`], sets the epoch of another space). The epoch is read before the handler runs, so a failed read stops the
 /// request before anything has happened.
 pub async fn require_device(State(state): State<Arc<AppState>>, mut request: Request, next: Next) -> Result<Response, ApiError> {
     let token = bearer(&request).ok_or_else(ApiError::unauthorized)?;
@@ -91,11 +91,14 @@ pub async fn require_device(State(state): State<Arc<AppState>>, mut request: Req
         let (id, now) = (device.device, state.now_ms());
         tokio::spawn(async move { touching.touch(id, now).await });
     }
-    let space = device.space;
+    let space = device.personal_space();
     let epoch = state.meta.space_info(space).await?.epoch;
     request.extensions_mut().insert(device);
     let mut response = next.run(request).await;
-    if let Ok(value) = HeaderValue::from_str(&epoch.to_string()) {
+    // A space-scoped route that worked on another space has put that space's epoch there already.
+    if !response.headers().contains_key(EPOCH_HEADER)
+        && let Ok(value) = HeaderValue::from_str(&epoch.to_string())
+    {
         response.headers_mut().insert(EPOCH_HEADER, value);
     }
     Ok(response)
