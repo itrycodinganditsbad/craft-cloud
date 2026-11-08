@@ -382,6 +382,7 @@ on_every_backend!(
     a_removal_made_elsewhere_stops_updates_and_presence_both_ways,
     a_device_revoked_elsewhere_cannot_write,
     a_connection_whose_access_cannot_be_read_relays_nothing_and_ends,
+    presence_is_not_relayed_to_a_connection_whose_access_cannot_be_read,
 );
 
 // ---- the scenarios ----
@@ -887,6 +888,24 @@ async fn a_connection_whose_access_cannot_be_read_relays_nothing_and_ends(w: &Wo
     let (frames, closed, _) = until_closed(&mut ben, Duration::from_secs(10)).await;
     w.rename_table("space_members_away", "space_members").await;
     assert_eq!(frames.len(), 1, "no update: {frames:?}");
+    assert_eq!(error_code(&frames[0]).0, "internal");
+    assert!(closed.is_none_or(|(code, _)| code != ACCESS_CHANGED_CLOSE), "not access_changed");
+}
+
+/// Presence is relayed only to a connection that is trusted: with the members table unreadable, a presence message
+/// announced to ana's connection (as another process's would be) is not sent to her; the connection ends with `internal`.
+async fn presence_is_not_relayed_to_a_connection_whose_access_cannot_be_read(w: &World) {
+    let space = w.create("Studio", "ana").await;
+    w.join(space, "ana", "ben", "editor").await;
+    let mut ana = w.ready_as("ana", space, SpaceRole::Owner).await;
+    let doc = w.follow(&mut ana, space).await;
+    w.rename_table("space_members", "space_members_away").await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let note = craft_cloud_server::live::PresenceNote { doc, bytes: Arc::new(b"cursor".to_vec()), from: 0, user: w.user("ben").id.0 };
+    w.state.live.publish_presence(space, note);
+    let (frames, closed, _) = until_closed(&mut ana, Duration::from_secs(10)).await;
+    w.rename_table("space_members_away", "space_members").await;
+    assert_eq!(frames.len(), 1, "no presence: {frames:?}");
     assert_eq!(error_code(&frames[0]).0, "internal");
     assert!(closed.is_none_or(|(code, _)| code != ACCESS_CHANGED_CLOSE), "not access_changed");
 }
