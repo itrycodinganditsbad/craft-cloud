@@ -38,7 +38,7 @@ impl StorageInfo {
     pub fn from_config(config: &Config) -> Self {
         let store_dir = match &config.storage {
             StorageConfig::Disk { path, .. } => Some(path.clone()),
-            StorageConfig::S3 { .. } => None,
+            StorageConfig::S3 { .. } | StorageConfig::Sftp { .. } => None,
         };
         Self::new(config.storage.capacity(), store_dir, sqlite_file(&config.database.url))
     }

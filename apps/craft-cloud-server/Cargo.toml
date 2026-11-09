@@ -8,6 +8,10 @@ rust-version.workspace = true
 publish = false
 
 [features]
+# Blobs on an SFTP server (`[storage] kind = "sftp"`) and the backup to one (`backup`, `restore`). On by default; the pure-Rust
+# SSH client behind it (russh) passes `cargo xtask licenses`.
+default = ["sftp"]
+sftp = ["craft-cloud-store/sftp"]
 # Test seams (`AppState::with_clock`); never on in a shipped binary.
 test-support = []
 

@@ -340,6 +340,7 @@ pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
         .with_live_bytes_cap(config.live_bytes_per_user)
         .with_audit_retention_days(config.audit.retention_days);
     let store = match (&config.storage, config.storage.s3()?) {
+        (StorageConfig::Sftp { .. }, _) => sftp_store(config, true).await?,
         (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
         (StorageConfig::Disk { path, .. }, None) => Store::new(DiskBackend::new(path)?),
         (StorageConfig::S3 { .. }, None) => return Err(CliError::Usage("S3 storage without settings".into())),
@@ -352,6 +353,7 @@ pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
 pub async fn open_existing(config: &Config) -> Result<(Meta, Store), CliError> {
     let meta = Meta::open_existing(&config.database.url).await?;
     let store = match (&config.storage, config.storage.s3()?) {
+        (StorageConfig::Sftp { .. }, _) => sftp_store(config, false).await?,
         (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
         (StorageConfig::Disk { path, .. }, None) => {
             if !path.is_dir() {
@@ -362,6 +364,22 @@ pub async fn open_existing(config: &Config) -> Result<(Meta, Store), CliError> {
         (StorageConfig::S3 { .. }, None) => return Err(CliError::Usage("S3 storage without settings".into())),
     };
     Ok((meta, tuned(store, config)))
+}
+
+/// The blob store on an SFTP server. `create` makes the root directory when it is missing (the server's own start and the
+/// commands that write); the read-only commands pass `false`. Refuses a host key that is not the pinned one, a server
+/// without `posix-rename@openssh.com` and a key it does not accept, with a message that says so.
+#[cfg(feature = "sftp")]
+async fn sftp_store(config: &Config, create: bool) -> Result<Store, CliError> {
+    use craft_cloud_store::sftp::SftpBackend;
+    let settings = config.sftp_storage()?.ok_or_else(|| CliError::Usage("SFTP storage without settings".into()))?;
+    let backend = if create { SftpBackend::connect(&settings).await? } else { SftpBackend::connect_existing(&settings).await? };
+    Ok(Store::new(backend))
+}
+
+#[cfg(not(feature = "sftp"))]
+async fn sftp_store(_config: &Config, _create: bool) -> Result<Store, CliError> {
+    Err(CliError::Usage("this build of the server has no SFTP support (storage.kind = \"sftp\"); build it with --features sftp".into()))
 }
 
 /// The store with the config's compression settings.
