@@ -308,7 +308,9 @@ const DB_STUCK_AFTER: Duration = Duration::from_secs(180);
 /// Called by a busy wait for the database ([`hold_time`]) each time it looks.
 pub fn stuck_check(started: std::time::Instant) {
     if started.elapsed() > DB_STUCK_AFTER {
-        eprintln!("the database has been busy for {DB_STUCK_AFTER:?} of real time: the simulation is stuck, not slow");
+        // (Not `eprintln!`: a test thread's output is held back by the harness, and the abort would lose it.)
+        let message = format!("the database has been busy for {DB_STUCK_AFTER:?} of real time: the simulation is stuck, not slow\n");
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), message.as_bytes());
         std::process::abort();
     }
 }
