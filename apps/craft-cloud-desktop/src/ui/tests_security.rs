@@ -347,7 +347,7 @@ fn a_join_for_an_account_with_two_factor_asks_for_the_code_and_keeps_the_invite(
 // ---- the screens ----
 
 fn harness(model: Model, theme: egui::Theme) -> Harness<'static, (Model, Vec<Event>)> {
-    Harness::builder().with_size(egui::Vec2::from(WINDOW_SIZE)).with_theme(theme).wgpu_setup(super::tests::shared_wgpu()).build_ui_state(
+    Harness::builder().with_size(egui::Vec2::from(WINDOW_SIZE)).with_theme(theme).renderer(super::tests::serialized()).build_ui_state(
         |ui, (model, events): &mut (Model, Vec<Event>)| {
             events.extend(show(ui, model, NOW));
         },
