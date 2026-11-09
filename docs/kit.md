@@ -6,6 +6,8 @@ app's whole change is one adapter. Everything else (talking to the Craft Cloud a
 reconnecting, binary content, undo while live) is in the kit. `craft-cloud-egui` adds Craft Cloud's piece of the
 window: the account line, the shared recent files, the document's badge and who else is in the document.
 
+Integration guides: [Rust app integration](kit-integration.md); [local API protocol reference for other languages](protocol-reference.md).
+
 The demo app in this repository (`apps/craft-cloud-kit-demo`, never packaged) is a complete example: a rich-text
 story and a layer tree; its adapter is about 150 lines of `model.rs`, its hook one function of `ui.rs`. The
 snippets below are from it.
