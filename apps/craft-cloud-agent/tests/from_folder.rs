@@ -1107,7 +1107,13 @@ async fn session_ends_during(step: FromFolderStep) {
     hook::set(ana.data.path(), Some(Hook::Pause(step)));
     let make = ana.make(&project, "Ended");
     let end = async {
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        if step == FromFolderStep::Creating {
+            // The call holds after the server has answered: the session ends only once the space is there (logging out after a fixed
+            // time can come first on a loaded machine, and the token is gone before the request that makes the space).
+            eventually("the server has made the space", || async { space_named(&w, "Ended").await.is_some() }).await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
         ana.api(|c| c.logout(false)).await.unwrap();
         hook::set(ana.data.path(), None);
     };
