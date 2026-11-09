@@ -119,7 +119,18 @@ async fn quit_right_after_typing(pc: &Agent, fail_writes: bool) -> String {
     let close = serde_json::json!({ "type": "close", "doc": opened["doc"] });
     let _ = ws.send(Message::Text(close.to_string().into())).await;
     let _ = ws.send(Message::Close(None)).await;
-    // Gone at once, as the app's teardown does: the agent's answers have nowhere to go.
+    // Say goodbye and wait for the agent's goodbye, which is what an app that reads its answers does. A socket closed
+    // with the agent's answers still unread is reset, and on Linux a reset takes frames the agent has not read yet
+    // with it, whatever the agent does (the first version of this test dropped the socket here and failed on Linux
+    // CI now and then). The agent's answers have nowhere to go meanwhile only in the second test.
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(message)) = ws.next().await {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await;
     drop(ws);
     text.to_string()
 }
@@ -232,4 +243,43 @@ async fn the_next_app_is_asked_for_the_import_when_the_first_one_stops_taking_me
     assert_eq!(asked["id"], 1);
     drop((first, second));
     run_pc.stop().await.0.unwrap();
+}
+
+/// The app library quits the way an app does: its last changes sent, the connection dropped at once. Its drop says
+/// goodbye and waits for the agent's, so the connection is not reset with answers unread (which on Linux can take
+/// changes the agent has not read yet with it; without the wait this failed in about one run in 150 under load).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_app_that_quits_through_the_app_library_loses_none() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let server = Server::new().await;
+    let (pc, laptop) = (Agent::signed_in(&server, "pc").await, Agent::signed_in(&server, "laptop").await);
+    let (run_pc, run_laptop) = (pc.run(), laptop.run());
+    let _docs = live_file(&pc, &laptop).await;
+    let client = pc.client().await;
+    let typed = off(move || {
+        let docs = client.documents().unwrap();
+        let Opened::Live(doc) = docs.open("notes.txt", "wordcraft").unwrap() else { panic!("the file is live") };
+        let loro = LoroDoc::new();
+        loro.set_peer_id(78).unwrap();
+        loro.import(doc.state()).unwrap();
+        for update in doc.state_updates() {
+            loro.import(update).unwrap();
+        }
+        let text = loro.get_text("text");
+        for i in 0..CHANGES {
+            let before = loro.oplog_vv();
+            text.insert(text.len_unicode(), &format!("{}", i % 10)).unwrap();
+            loro.commit();
+            doc.send(&loro.export(ExportMode::updates(&before)).unwrap()).unwrap();
+        }
+        // Quit at once.
+        drop(doc);
+        drop(docs);
+        text.to_string()
+    })
+    .await;
+    assert_eq!(typed.len(), "start".len() + CHANGES);
+    the_laptop_gets(&laptop, typed).await;
+    run_pc.stop().await.0.unwrap();
+    run_laptop.stop().await.0.unwrap();
 }
