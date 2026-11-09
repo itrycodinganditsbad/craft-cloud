@@ -850,6 +850,86 @@ iqNc2jOhYN+M91BKSLYoAAAAEGNyYWZ0LWNsb3VkLXRlc3QBAgMEBQ==
     }
 
     #[tokio::test]
+    async fn sftp_listing_resumes_after_a_foreign_name_with_odd_characters() {
+        let Some(config) = config() else { return };
+        let backend = SftpBackend::connect(&config).await.unwrap();
+        backend.put_raw("chunks/ab/cd/plain", Bytes::from_static(b"x")).await.unwrap();
+        // A cursor is whatever name an earlier page ended with, so it may hold a backslash or a control character (a
+        // foreign file can be named so); it is only compared with names. NUL and absurd sizes are still refused.
+        let page = backend.list_raw("chunks", Some("chunks/ab/cd/we\\ird\tname"), 10).await.unwrap();
+        assert!(page.is_empty() || page.iter().all(|p| p.as_str() > "chunks/ab/cd/we\\ird\tname"));
+        assert!(backend.list_raw("chunks", Some("chunks/ab/\0"), 10).await.is_err());
+        assert!(backend.list_raw("chunks", Some(&format!("chunks/{}", "a".repeat(5000))), 10).await.is_err());
+        assert!(backend.list_raw("chunks", Some(""), 10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sftp_sweeps_only_old_temporary_files_of_its_own_form() {
+        use uuid::{ContextV7, Timestamp, Uuid};
+        let Some(config) = config() else { return };
+        let backend = SftpBackend::connect(&config).await.unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let at = |secs: u64| Uuid::new_v7(Timestamp::from_unix(ContextV7::new(), secs, 0));
+        let old = format!("chunks/ab/cd/.tmp-{}", at(now - 3 * 3600).hyphenated());
+        let fresh = format!("chunks/ab/cd/.tmp-{}", at(now).hyphenated());
+        let foreign = "chunks/ab/cd/.tmp-not-ours";
+        for path in [old.as_str(), fresh.as_str(), foreign] {
+            backend.put_raw(path, Bytes::from_static(b"left behind")).await.unwrap();
+        }
+        // The listing hides the backend's own temporary names, so nothing else would ever find these.
+        let listed = backend.list_raw("chunks", None, 100).await.unwrap();
+        assert!(listed.contains(&foreign.to_owned()) && !listed.contains(&old) && !listed.contains(&fresh), "{listed:?}");
+        assert_eq!(backend.remove_stale_temp("chunks", Duration::from_secs(3600)).await.unwrap(), 1);
+        assert_eq!(backend.size_raw(&old).await.unwrap(), None);
+        assert_eq!(backend.size_raw(&fresh).await.unwrap(), Some(11));
+        assert_eq!(backend.size_raw(foreign).await.unwrap(), Some(11), "a name that is not exactly ours is somebody else's file");
+        assert_eq!(backend.remove_stale_temp("chunks", Duration::from_secs(3600)).await.unwrap(), 0);
+        assert!(backend.remove_stale_temp("", Duration::from_secs(3600)).await.is_err(), "the blob store names chunks or manifests");
+    }
+
+    #[tokio::test]
+    async fn sftp_refuses_to_download_more_than_was_expected() {
+        let Some(config) = config() else { return };
+        let backend = SftpBackend::connect_for_backup(&config).await.unwrap();
+        let data = vec![7u8; 1_000_000];
+        backend.put_raw("generations/x/blob", Bytes::from(data.clone())).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out");
+        let refused = backend.get_file_raw("generations/x/blob", &target, 999_999).await;
+        assert!(matches!(&refused, Err(StoreError::Backend(m)) if m.contains("more than")), "{refused:?}");
+        assert!(!target.exists() && !dir.path().join("out.part").exists(), "nothing is written for a refused download");
+        assert!(backend.get_file_raw("generations/x/blob", &target, 1_000_000).await.unwrap());
+        assert_eq!(std::fs::read(&target).unwrap(), data);
+        assert!(!backend.get_file_raw("generations/x/missing", &dir.path().join("none"), 10).await.unwrap());
+    }
+
+    /// Fault test: a pooled connection died while it was idle, and `sftp_retries` is 0. The request still succeeds, because a
+    /// connection that was taken from the pool and found dead costs a fresh one, not a retry.
+    #[tokio::test]
+    #[ignore = "restarts the test container named by CRAFT_CLOUD_TEST_SFTP_CONTAINER"]
+    async fn sftp_a_dead_pooled_connection_costs_no_retry() {
+        let Some(config) = config() else { return };
+        let container = std::env::var("CRAFT_CLOUD_TEST_SFTP_CONTAINER").expect("CRAFT_CLOUD_TEST_SFTP_CONTAINER names the container to restart");
+        let addr = format!("{}:{}", config.host, config.port);
+        let store = Store::new(SftpBackend::connect(&SftpConfig { retries: 0, ..config }).await.unwrap());
+        let data = b"read through a connection that will die";
+        let key = chunk_key(data);
+        store.put(key, data).await.unwrap();
+        assert_eq!(&store.get(key).await.unwrap()[..], data);
+        let status = std::process::Command::new("docker").args(["restart", "-t", "1", &container]).status().unwrap();
+        assert!(status.success());
+        // Wait until the server answers again, so that the only thing in the way is the dead connection in the pool.
+        for _ in 0..60 {
+            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(&store.get(key).await.unwrap()[..], data);
+    }
+
+    #[tokio::test]
     async fn sftp_refuses_a_key_the_server_does_not_know() {
         let Some(config) = config() else { return };
         let dir = tempfile::tempdir().unwrap();

@@ -298,6 +298,14 @@ pub enum StoreAction {
     },
     /// Fill in the stored size of blobs written before sizes were tracked. Reads no object content on disk or S3.
     Measure,
+    /// SFTP storage only: remove the temporary files of uploads that were cut off (a killed server, a connection lost for
+    /// good) that are older than a day. The store's listing hides them, so nothing else ever finds them; a finished or a
+    /// running upload is never touched. Walks every shard directory, so on a big store it takes a while.
+    CleanTemp {
+        /// Only files made more than this many hours ago (at least 1).
+        #[arg(long, default_value_t = 24)]
+        older_than_hours: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -379,13 +387,19 @@ pub enum CliError {
     Io(#[from] std::io::Error),
 }
 
-/// Opens the database and blob storage a config names.
-pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
-    let meta = Meta::open(&config.database.url)
+/// Opens the database a config names, and nothing else: for the commands that never touch a blob. A server whose blobs
+/// are on another machine would otherwise have to reach it to add a user.
+pub async fn open_meta(config: &Config) -> Result<Meta, CliError> {
+    Ok(Meta::open(&config.database.url)
         .await?
         .with_stored_bytes_cap(config.stored_bytes_per_user)
         .with_live_bytes_cap(config.live_bytes_per_user)
-        .with_audit_retention_days(config.audit.retention_days);
+        .with_audit_retention_days(config.audit.retention_days))
+}
+
+/// Opens the database and blob storage a config names.
+pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
+    let meta = open_meta(config).await?;
     let store = match (&config.storage, config.storage.s3()?) {
         (StorageConfig::Sftp { .. }, _) => sftp_store(config, true).await?,
         (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
@@ -434,6 +448,30 @@ async fn sftp_store(_config: &Config, _create: bool) -> Result<Store, CliError> 
     Err(CliError::Usage("this build of the server has no SFTP support (storage.kind = \"sftp\"); build it with --features sftp".into()))
 }
 
+/// `store clean-temp`: the stale temporary files of an SFTP store.
+#[cfg(feature = "sftp")]
+async fn clean_temp(config: &Config, older_than_hours: u64, out: &mut impl Write) -> Result<(), CliError> {
+    use craft_cloud_store::sftp::SftpBackend;
+    if older_than_hours == 0 {
+        return Err(CliError::Usage("--older-than-hours must be at least 1".into()));
+    }
+    let settings =
+        config.sftp_storage()?.ok_or_else(|| CliError::Usage("clean-temp is for storage.kind = \"sftp\"; a disk store removes its own".into()))?;
+    let backend = SftpBackend::connect_existing(&settings).await?;
+    let age = std::time::Duration::from_secs(older_than_hours.saturating_mul(3600));
+    let mut removed = 0u64;
+    for prefix in ["chunks", "manifests"] {
+        removed = removed.saturating_add(backend.remove_stale_temp(prefix, age).await?);
+    }
+    writeln!(out, "removed {removed} temporary file(s) older than {older_than_hours} hour(s)")?;
+    Ok(())
+}
+
+#[cfg(not(feature = "sftp"))]
+async fn clean_temp(_config: &Config, _older_than_hours: u64, _out: &mut impl Write) -> Result<(), CliError> {
+    Err(no_sftp())
+}
+
 /// The store with the config's compression settings.
 pub(crate) fn tuned(store: Store, config: &Config) -> Store {
     store
@@ -480,7 +518,7 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
         }
         Command::User { config, action } => {
             let config = Config::load(&config_path(config)?)?;
-            let (meta, _) = open(&config).await?;
+            let meta = open_meta(&config).await?;
             match action {
                 UserAction::Invite { username, revoke: true } => {
                     if !meta.revoke_invite(&username).await? {
@@ -518,7 +556,7 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
             Ok(())
         }
         Command::Device { config, action } => {
-            let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
+            let meta = open_meta(&Config::load(&config_path(config)?)?).await?;
             match action {
                 DeviceAction::List { username } => {
                     let user = user_id(&meta, &username).await?;
@@ -542,16 +580,16 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
         }
         Command::Audit { config, action } => {
             let config = Config::load(&config_path(config)?)?;
-            let (meta, _) = open(&config).await?;
+            let meta = open_meta(&config).await?;
             audit(&meta, &config, action, out).await
         }
         Command::WebSessions { config, action } => {
             let config = Config::load(&config_path(config)?)?;
-            let (meta, _) = open(&config).await?;
+            let meta = open_meta(&config).await?;
             web_sessions(&meta, &config, action, out).await
         }
         Command::ResetEpoch { config, username, all } => {
-            let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
+            let meta = open_meta(&Config::load(&config_path(config)?)?).await?;
             if all {
                 let spaces = meta.all_spaces().await?;
                 for space in &spaces {
@@ -569,7 +607,7 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
         }
         Command::TwoFactor { config, action: TwoFactorAction::Rekey } => {
             let config = Config::load(&config_path(config)?)?;
-            let (meta, _) = open(&config).await?;
+            let meta = open_meta(&config).await?;
             let keys = crate::two_factor::load_keys(&config).map_err(|e| CliError::Usage(e.to_string()))?;
             let crate::two_factor::KeyState::Loaded(secret_box) = keys else {
                 return Err(CliError::Usage(
@@ -658,8 +696,12 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
         }
         Command::Store { config, action } => {
             let config = Config::load(&config_path(config)?)?;
+            if let StoreAction::CleanTemp { older_than_hours } = action {
+                return clean_temp(&config, older_than_hours, out).await;
+            }
             let (meta, store) = open(&config).await?;
             match action {
+                StoreAction::CleanTemp { .. } => {}
                 StoreAction::Recompress { level, dry_run, limit_bytes } => {
                     if config.storage.compression() == crate::config::Compression::None {
                         return Err(CliError::Usage(
@@ -694,7 +736,7 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
             Ok(())
         }
         Command::Live { config, action: LiveAction::ResetDoc { username, app } } => {
-            let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
+            let meta = open_meta(&Config::load(&config_path(config)?)?).await?;
             let user = user_id(&meta, &username).await?;
             if let Ok(id) = app.parse::<uuid::Uuid>() {
                 let doc = craft_cloud_proto::DocId::from_uuid(id);

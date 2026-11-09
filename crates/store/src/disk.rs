@@ -56,6 +56,17 @@ pub(crate) fn is_temp_name(name: &str) -> bool {
     uuid::Uuid::try_parse(rest).is_ok_and(|id| id.get_version() == Some(uuid::Version::SortRand) && id.hyphenated().to_string() == rest)
 }
 
+/// When a write's temporary file was made, in seconds since the epoch, read from its UUIDv7; `None` when `name` is not
+/// exactly what [`temp_name`] writes.
+#[cfg(feature = "sftp")]
+pub(crate) fn temp_created_secs(name: &str) -> Option<u64> {
+    if !is_temp_name(name) {
+        return None;
+    }
+    let id = uuid::Uuid::try_parse(name.strip_prefix(TEMP_PREFIX)?).ok()?;
+    id.get_timestamp().map(|timestamp| timestamp.to_unix().0)
+}
+
 fn write_atomic(target: &Path, data: &[u8]) -> io::Result<()> {
     let dir = target.parent().ok_or_else(|| io::Error::other("object path has no directory"))?;
     // Directories this write will create, deepest first. Their entries in the parents must be flushed too.

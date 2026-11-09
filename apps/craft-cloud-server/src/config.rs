@@ -757,7 +757,8 @@ impl StorageConfig {
         }
         if sftp_host_key.is_none() && sftp_known_hosts.is_none() {
             return refuse(
-                "storage.kind = \"sftp\" needs a pinned host key: set sftp_host_key (a SHA256: fingerprint or a public key line) or sftp_known_hosts.                  There is no mode that connects without checking the server"
+                "storage.kind = \"sftp\" needs a pinned host key: set sftp_host_key (a SHA256: fingerprint or a public key line) or sftp_known_hosts. \
+                 There is no mode that connects without checking the server"
                     .into(),
             );
         }

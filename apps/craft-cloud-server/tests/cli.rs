@@ -2229,11 +2229,17 @@ mod backup {
     struct DirRemote {
         backend: Arc<DiskBackend>,
         root: PathBuf,
+        /// Reading a chunk fails, as when the connection dies in the middle of a restore.
+        fail_chunk_reads: bool,
     }
 
     impl DirRemote {
         fn new(root: &Path) -> Self {
-            Self { backend: Arc::new(DiskBackend::new(root).unwrap()), root: root.to_owned() }
+            Self { backend: Arc::new(DiskBackend::new(root).unwrap()), root: root.to_owned(), fail_chunk_reads: false }
+        }
+
+        fn failing_on_chunks(&self) -> Self {
+            Self { fail_chunk_reads: true, ..self.clone() }
         }
     }
 
@@ -2249,6 +2255,9 @@ mod backup {
             self.backend.get_raw(path).await
         }
         async fn get_raw_limited(&self, path: &str, max_bytes: usize) -> Result<Option<Bytes>, StoreError> {
+            if self.fail_chunk_reads && path.starts_with("chunks/") {
+                return Err(StoreError::Backend("the connection was lost".into()));
+            }
             self.backend.get_raw_limited(path, max_bytes).await
         }
         async fn size_raw(&self, path: &str) -> Result<Option<u64>, StoreError> {
@@ -2269,7 +2278,11 @@ mod backup {
             std::fs::copy(local, target)?;
             Ok(())
         }
-        async fn get_file(&self, path: &str, local: &Path) -> Result<bool, StoreError> {
+        async fn get_file(&self, path: &str, local: &Path, max_bytes: u64) -> Result<bool, StoreError> {
+            match std::fs::metadata(self.root.join(path)) {
+                Ok(meta) if meta.len() > max_bytes => return Err(StoreError::Backend("the object is more than expected".into())),
+                _ => {}
+            }
             match std::fs::copy(self.root.join(path), local) {
                 Ok(_) => Ok(true),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -2407,6 +2420,115 @@ mod backup {
     }
 
     #[tokio::test]
+    async fn a_restore_that_dies_leaves_the_target_as_it_was_and_no_half_made_directory() {
+        let s = seeded().await;
+        let config = Config::load(Path::new(&s.config)).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("remote");
+        let remote = DirRemote::new(&root);
+        backup_to(&config, remote.clone(), 7, None, T0, &mut Vec::new()).await.unwrap();
+        let names = |dir: &Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            names.sort();
+            names
+        };
+        let before = names(parent.path());
+        // The database arrives, then the connection dies on the first chunk: the target must not hold a database with
+        // part of its blobs, which a re-run would then refuse as "not empty".
+        let target = parent.path().join("restored");
+        let died = restore_from(remote.failing_on_chunks(), &target, None, &mut Vec::new()).await;
+        assert!(died.is_err());
+        assert!(!target.exists(), "nothing is at the target");
+        assert_eq!(names(parent.path()), before, "and no staging directory is left behind");
+        // The same target restores fine afterwards, and so does an empty directory that is already there.
+        restore_from(remote.clone(), &target, None, &mut Vec::new()).await.unwrap();
+        assert!(target.join("meta.db").is_file() && target.join("blobs").is_dir());
+        assert!(!names(parent.path()).iter().any(|n| n.contains(".restore-")));
+        let empty = parent.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        restore_from(remote, &empty, None, &mut Vec::new()).await.unwrap();
+        assert!(empty.join("meta.db").is_file());
+        let verified = cli(&["verify", "--config", &config_for(&empty)], "").await.unwrap();
+        assert!(verified.contains("no problems found"), "{verified}");
+    }
+
+    #[tokio::test]
+    async fn a_restore_refuses_a_dump_bigger_than_its_manifest_says() {
+        let s = seeded().await;
+        let config = Config::load(Path::new(&s.config)).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("remote");
+        let remote = DirRemote::new(&root);
+        backup_to(&config, remote.clone(), 7, None, T0, &mut Vec::new()).await.unwrap();
+        // The backup server now holds a bigger dump than the manifest recorded (or lies about its size).
+        let dump = root.join("generations/20231114T221320Z/meta.sqlite");
+        let mut bytes = std::fs::read(&dump).unwrap();
+        bytes.extend_from_slice(&[0u8; 4096]);
+        std::fs::write(&dump, bytes).unwrap();
+        let target = parent.path().join("restored");
+        let refused = restore_from(remote, &target, None, &mut Vec::new()).await;
+        assert!(matches!(&refused, Err(CliError::Store(e)) if e.to_string().contains("more than")), "{refused:?}");
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn a_generation_that_is_there_is_never_written_over_and_the_one_just_written_is_never_pruned() {
+        let s = seeded().await;
+        let config = Config::load(Path::new(&s.config)).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("remote");
+        let remote = DirRemote::new(&root);
+        backup_to(&config, remote.clone(), 1, None, T0, &mut Vec::new()).await.unwrap();
+        let dump = root.join("generations/20231114T221320Z/meta.sqlite");
+        let before = std::fs::read(&dump).unwrap();
+        // The same second again (a second run, or a clock stepped back to it): refused, and the good one is untouched.
+        let again = backup_to(&config, remote.clone(), 1, None, T0, &mut Vec::new()).await;
+        assert!(matches!(&again, Err(CliError::Usage(m)) if m.contains("20231114T221320Z") && m.contains("nothing was changed")), "{again:?}");
+        assert_eq!(std::fs::read(&dump).unwrap(), before);
+        // A newer backup, then one whose clock is behind it, with keep = 1: the one just written stays (and so does the
+        // newest), because a clock that went back must not make a backup delete itself.
+        backup_to(&config, remote.clone(), 1, None, T0 + 120_000, &mut Vec::new()).await.unwrap();
+        assert_eq!(generations(&root), ["20231114T221520Z"].map(String::from));
+        backup_to(&config, remote.clone(), 1, None, T0 + 60_000, &mut Vec::new()).await.unwrap();
+        assert_eq!(generations(&root), ["20231114T221420Z", "20231114T221520Z"].map(String::from));
+        assert!(root.join("generations/20231114T221420Z/manifest.json").is_file());
+        // A generation without its manifest is a backup that may be running: left alone for a day, then taken for dead.
+        let running = root.join("generations/20231114T220000Z");
+        std::fs::create_dir_all(&running).unwrap();
+        std::fs::write(running.join("meta.sqlite"), b"half").unwrap();
+        backup_to(&config, remote.clone(), 1, None, T0 + 180_000, &mut Vec::new()).await.unwrap();
+        assert!(running.exists(), "a young incomplete generation is not pruned");
+        backup_to(&config, remote, 1, None, T0 + 2 * 86_400_000, &mut Vec::new()).await.unwrap();
+        assert!(!running.exists(), "an old incomplete generation is");
+        assert_eq!(generations(&root).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn commands_that_only_use_the_database_do_not_reach_for_the_blob_store() {
+        // The blobs are on a server that does not answer; adding a user must not need it.
+        let dir = tempfile::tempdir().unwrap();
+        let slashes = |p: &Path| p.to_string_lossy().replace('\\', "/");
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "listen = \"127.0.0.1:8080\"\n[database]\nurl = \"sqlite:{}\"\n[storage]\nkind = \"sftp\"\nsftp_host = \"127.0.0.1\"\nsftp_port = 1\n\
+                 sftp_user = \"u\"\nsftp_root = \"/x\"\nsftp_key_file = \"{}\"\nsftp_host_key = \"SHA256:abc\"\nsftp_timeout_secs = 2\nsftp_retries = 0\n",
+                slashes(&dir.path().join("meta.db")),
+                slashes(&dir.path().join("key"))
+            ),
+        )
+        .unwrap();
+        let config = config.to_str().unwrap().to_owned();
+        let added = cli(&["user", "add", "bob", "--config", &config], "a long enough password\n").await.unwrap();
+        assert!(added.contains("added bob"), "{added}");
+        assert!(cli(&["user", "invite", "bob", "--config", &config], "").await.is_ok());
+        assert!(cli(&["device", "list", "bob", "--config", &config], "").await.is_ok());
+        // What does need the blobs says why it cannot have them.
+        assert!(cli(&["store", "measure", "--config", &config], "").await.is_err());
+    }
+
+    #[tokio::test]
     async fn postgres_is_pointed_at_pg_dump() {
         let s = seeded().await;
         let mut text = std::fs::read_to_string(&s.config).unwrap();
@@ -2498,6 +2620,24 @@ mod backup {
         let refused = craft_cloud_server::cli::open_existing(&other).await;
         assert!(matches!(&refused, Err(CliError::Store(e)) if e.to_string().contains("does not exist")), "{:?}", refused.err());
         assert!(craft_cloud_server::cli::open_existing(&other).await.is_err(), "and still does not");
+        // `store clean-temp` removes the temporary file of an upload that was cut off a few days ago, and only that.
+        let config_file = dir.path().join("config.toml");
+        std::fs::write(&config_file, text(&settings.root)).unwrap();
+        let path = config_file.to_str().unwrap();
+        let nothing = cli(&["store", "clean-temp", "--config", path], "").await.unwrap();
+        assert!(nothing.contains("removed 0 temporary file(s)"), "{nothing}");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let stamp = |secs: u64| uuid::Uuid::new_v7(uuid::Timestamp::from_unix(uuid::ContextV7::new(), secs, 0)).hyphenated().to_string();
+        let backend = SftpBackend::connect(&settings).await.unwrap();
+        let (old, young) = (format!("chunks/ab/cd/.tmp-{}", stamp(now - 3 * 86_400)), format!("chunks/ab/cd/.tmp-{}", stamp(now)));
+        for planted in [&old, &young] {
+            backend.put_raw(planted, Bytes::from_static(b"cut off")).await.unwrap();
+        }
+        let swept = cli(&["store", "clean-temp", "--config", path], "").await.unwrap();
+        assert!(swept.contains("removed 1 temporary file(s)"), "{swept}");
+        assert_eq!(backend.size_raw(&old).await.unwrap(), None);
+        assert_eq!(backend.size_raw(&young).await.unwrap(), Some(7));
+        assert!(cli(&["store", "clean-temp", "--older-than-hours", "0", "--config", path], "").await.is_err());
     }
 
     /// The same through the command line: the address, the flags, and a backup that is repeated.
@@ -2524,7 +2664,15 @@ mod backup {
         };
         let first = backup("3").await.unwrap();
         assert!(first.contains("chunks: 2 found, 2 copied") && first.contains("is complete"), "{first}");
-        let second = backup("3").await.unwrap();
+        // A generation is named by the second it began in; the same second again is refused (tested above), so wait it out.
+        let same_second = backup("3").await;
+        if matches!(&same_second, Err(CliError::Usage(m)) if m.contains("already")) {
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+        }
+        let second = match same_second {
+            Err(_) => backup("3").await.unwrap(),
+            Ok(out) => out,
+        };
         assert!(second.contains("chunks: 2 found, 0 copied"), "{second}");
         let parent = tempfile::tempdir().unwrap();
         let restored = parent.path().join("restored");

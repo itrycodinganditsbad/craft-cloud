@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -47,6 +48,8 @@ const CHUNK: usize = 32 * 1024;
 const WINDOW: usize = 16;
 /// The longest path (in bytes) a caller may name, root excluded. A blob path is at most 80.
 const MAX_PATH_BYTES: usize = 512;
+/// The longest listing cursor, the longest path the store's cursors carry.
+const MAX_CURSOR_BYTES: usize = 4096;
 /// An object is read into memory up to the caller's limit, but not preallocated beyond this.
 const MAX_PREALLOCATE: usize = 8 * 1024 * 1024;
 
@@ -373,8 +376,9 @@ impl SftpBackend {
         self.inner.put(&full, Source::File(local.to_owned())).await
     }
 
-    /// Downloads `path` to the file `local` (written as `local` plus `.part`, then renamed). `false`: no such object.
-    pub async fn get_file_raw(&self, path: &str, local: &Path) -> Result<bool, StoreError> {
+    /// Downloads `path` to the file `local` (written as `local` plus `.part`, then renamed). `false`: no such object. An
+    /// object the server reports as larger than `max_bytes` is refused before anything is read.
+    pub async fn get_file_raw(&self, path: &str, local: &Path, max_bytes: u64) -> Result<bool, StoreError> {
         let full = self.full(path)?;
         let part = {
             let mut name = local.as_os_str().to_owned();
@@ -385,7 +389,7 @@ impl SftpBackend {
             .inner
             .run(|conn| {
                 let (full, part) = (full.clone(), part.clone());
-                async move { download(&conn, &full, &part).await }
+                async move { download(&conn, &full, &part, max_bytes).await }
             })
             .await;
         match found {
@@ -402,6 +406,31 @@ impl SftpBackend {
                 Err(error)
             }
         }
+    }
+
+    /// Removes the temporary files of uploads that were cut off (a killed process, a connection lost for good) below
+    /// `prefix` (empty: the whole root, for a backup root; the blob store takes `chunks` or `manifests`) that are older
+    /// than `older_than`. Only the backend's own exact `.tmp-<UUIDv7>` names count, and age is read from the name. Walks
+    /// every directory below `prefix`, so on a big store it takes a while. Returns how many it removed.
+    pub async fn remove_stale_temp(&self, prefix: &str, older_than: Duration) -> Result<u64, StoreError> {
+        if prefix.is_empty() {
+            if self.layout == Layout::Blobs {
+                return Err(StoreError::Backend("the prefix must be chunks or manifests".into()));
+            }
+        } else {
+            check_relative(prefix, self.layout)?;
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let cutoff = now.saturating_sub(older_than.as_secs());
+        let dir = if prefix.is_empty() { self.inner.root_dir() } else { self.inner.join(prefix) };
+        let removed = AtomicU64::new(0);
+        self.inner
+            .run(|conn| {
+                let (dir, removed) = (dir.clone(), &removed);
+                async move { sweep(&conn, dir, cutoff, removed).await.map(|_| ()) }
+            })
+            .await?;
+        Ok(removed.load(Ordering::Relaxed))
     }
 
     /// Removes an empty directory; a directory that is not there or not empty is left alone. For the backup's old generations.
@@ -483,6 +512,14 @@ impl Inner {
         }
     }
 
+    /// The root as a directory to open: `.` for the home directory.
+    fn root_dir(&self) -> String {
+        match self.root.as_str() {
+            "" => ".".to_owned(),
+            root => root.to_owned(),
+        }
+    }
+
     fn take_idle(&self) -> Option<Arc<Conn>> {
         self.idle.lock().unwrap_or_else(PoisonError::into_inner).pop()
     }
@@ -531,9 +568,16 @@ impl Inner {
         Fut: Future<Output = Result<T, Fail>>,
     {
         let mut retried = 0u32;
+        let mut stale_retried = false;
         loop {
-            match self.once(&mut op).await {
+            let mut from_idle = false;
+            match self.once(&mut op, &mut from_idle).await {
                 Ok(value) => return Ok(value),
+                // A pooled connection can have died while it was idle (the server closed it, a firewall forgot it). That
+                // is no reason to count a retry or to wait: one fresh connection is tried at once, whatever `retries` is.
+                Err(Fail::Transient(_)) if from_idle && !stale_retried => {
+                    stale_retried = true;
+                }
                 Err(Fail::Transient(_)) if retried < self.retries => {
                     retried = retried.saturating_add(1);
                     tokio::time::sleep(backoff(retried)).await;
@@ -543,13 +587,16 @@ impl Inner {
         }
     }
 
-    async fn once<T, Fut>(&self, op: &mut impl FnMut(Arc<Conn>) -> Fut) -> Result<T, Fail>
+    async fn once<T, Fut>(&self, op: &mut impl FnMut(Arc<Conn>) -> Fut, from_idle: &mut bool) -> Result<T, Fail>
     where
         Fut: Future<Output = Result<T, Fail>>,
     {
         let _permit = self.permits.acquire().await.map_err(|_| Fail::Permanent("the connection pool is closed".into()))?;
         let conn = match self.take_idle() {
-            Some(conn) => conn,
+            Some(conn) => {
+                *from_idle = true;
+                conn
+            }
             None => Arc::new(self.dial().await?),
         };
         let result = op(Arc::clone(&conn)).await;
@@ -563,11 +610,28 @@ impl Inner {
     }
 
     async fn put(&self, full: &str, source: Source) -> Result<(), StoreError> {
-        self.run(|conn| {
-            let (full, source) = (full.to_owned(), source.clone());
-            async move { put_object(&conn, &full, &source).await }
-        })
-        .await
+        let leftovers = Mutex::new(Vec::new());
+        let result = self
+            .run(|conn| {
+                let (full, source) = (full.to_owned(), source.clone());
+                let leftovers = &leftovers;
+                async move { put_object(&conn, &full, &source, leftovers).await }
+            })
+            .await;
+        // The attempts are over. A temporary file one of them could not remove (its connection was gone) is removed on a
+        // fresh connection now, once; what still fails is left for `remove_stale_temp`.
+        if result.is_err() && !leftovers.lock().unwrap_or_else(PoisonError::into_inner).is_empty() {
+            let _ = self
+                .once(
+                    &mut |conn: Arc<Conn>| {
+                        let leftovers = &leftovers;
+                        async move { remove_leftovers(&conn, leftovers).await }
+                    },
+                    &mut false,
+                )
+                .await;
+        }
+        result
     }
 }
 
@@ -734,9 +798,27 @@ async fn posix_rename(conn: &Conn, from: &str, to: &str) -> Result<(), Fail> {
     }
 }
 
+/// Removes the temporary files that earlier attempts of an upload left because their connection was gone. One that
+/// cannot be removed now stays on the list.
+async fn remove_leftovers(conn: &Conn, leftovers: &Mutex<Vec<String>>) -> Result<(), Fail> {
+    let earlier: Vec<String> = std::mem::take(&mut *leftovers.lock().unwrap_or_else(PoisonError::into_inner));
+    for path in earlier {
+        match conn.sftp.remove(path.clone()).await {
+            Ok(_) => {}
+            Err(error) => match Fail::from(error) {
+                Fail::NoSuchFile => {}
+                _ => leftovers.lock().unwrap_or_else(PoisonError::into_inner).push(path),
+            },
+        }
+    }
+    Ok(())
+}
+
 /// Writes `source` to a temporary name beside `full` and renames it into place. The temporary file is removed when
-/// anything fails; a failure of that removal does not hide the original error.
-async fn put_object(conn: &Conn, full: &str, source: &Source) -> Result<(), Fail> {
+/// anything fails; when that removal fails too (the connection is gone), the name goes on `leftovers` and the next
+/// attempt, on a fresh connection, removes it. A failure of the removal never hides the original error.
+async fn put_object(conn: &Conn, full: &str, source: &Source, leftovers: &Mutex<Vec<String>>) -> Result<(), Fail> {
+    remove_leftovers(conn, leftovers).await?;
     let (parent, _) = split_parent(full);
     let temporary = format!("{parent}{}", crate::disk::temp_name(uuid::Uuid::now_v7()));
     let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE;
@@ -757,9 +839,43 @@ async fn put_object(conn: &Conn, full: &str, source: &Source) -> Result<(), Fail
         (Err(error), _) | (Ok(()), Err(error)) => Err(error),
     };
     if outcome.is_err() {
-        let _ = conn.sftp.remove(temporary).await;
+        match conn.sftp.remove(temporary.clone()).await {
+            Ok(_) => {}
+            Err(error) => {
+                if !matches!(Fail::from(error), Fail::NoSuchFile) {
+                    leftovers.lock().unwrap_or_else(PoisonError::into_inner).push(temporary);
+                }
+            }
+        }
     }
     outcome
+}
+
+/// Removes the backend's own temporary files below `dir` that are older than `cutoff` (seconds since the epoch, by the
+/// time in their UUIDv7 names). Counts them in `removed`.
+fn sweep<'a>(conn: &'a Conn, dir: String, cutoff: u64, removed: &'a AtomicU64) -> WalkFuture<'a> {
+    Box::pin(async move {
+        let Some(entries) = read_dir(conn, &dir).await? else { return Ok(false) };
+        for (name, kind) in entries {
+            let child = if dir.ends_with('/') { format!("{dir}{name}") } else { format!("{dir}/{name}") };
+            match kind {
+                Kind::Dir => {
+                    sweep(conn, child, cutoff, removed).await?;
+                }
+                Kind::File if crate::disk::temp_created_secs(&name).is_some_and(|created| created < cutoff) => match conn.sftp.remove(child).await {
+                    Ok(_) => {
+                        removed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(error) => match Fail::from(error) {
+                        Fail::NoSuchFile => {}
+                        other => return Err(other),
+                    },
+                },
+                Kind::File | Kind::Other => {}
+            }
+        }
+        Ok(false)
+    })
 }
 
 async fn write_all(conn: &Conn, handle: &str, source: &Source) -> Result<(), Fail> {
@@ -794,16 +910,13 @@ async fn open_read(conn: &Conn, full: &str) -> Result<Option<String>, Fail> {
     }
 }
 
-/// The chunks (offset, length) that cover `total` bytes.
-fn chunk_plan(total: usize) -> Vec<(usize, usize)> {
-    let mut plan = Vec::new();
-    let mut offset = 0usize;
-    while offset < total {
-        let len = CHUNK.min(total.saturating_sub(offset));
-        plan.push((offset, len));
-        offset = offset.saturating_add(len);
-    }
-    plan
+/// The chunks (offset, length) that cover `total` bytes, made as they are asked for: the size a server reports is not
+/// trusted to be small enough to list every chunk of it at once.
+fn chunk_plan(total: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..total.div_ceil(CHUNK)).map(move |index| {
+        let offset = index.saturating_mul(CHUNK);
+        (offset, CHUNK.min(total.saturating_sub(offset)))
+    })
 }
 
 /// Reads one chunk; a server that answers with less than was asked, before the end the file's size promised, is not trusted.
@@ -838,16 +951,19 @@ async fn read_open(conn: &Conn, handle: &str, max_bytes: usize) -> Result<Vec<u8
 }
 
 /// Copies `full` to the local file `part`. `false`: no such object.
-async fn download(conn: &Conn, full: &str, part: &Path) -> Result<bool, Fail> {
+async fn download(conn: &Conn, full: &str, part: &Path, max_bytes: u64) -> Result<bool, Fail> {
     let Some(handle) = open_read(conn, full).await? else { return Ok(false) };
-    let result = download_open(conn, &handle, part).await;
+    let result = download_open(conn, &handle, part, max_bytes).await;
     let _ = conn.sftp.close(handle).await;
     result.map(|()| true)
 }
 
-async fn download_open(conn: &Conn, handle: &str, part: &Path) -> Result<(), Fail> {
+async fn download_open(conn: &Conn, handle: &str, part: &Path, max_bytes: u64) -> Result<(), Fail> {
     let local = |e: std::io::Error| Fail::Permanent(format!("the local file could not be written: {e}"));
     let size = conn.sftp.fstat(handle).await.map_err(Fail::from)?.attrs.size.ok_or_else(|| Fail::Permanent("the server gave no file size".into()))?;
+    if size > max_bytes {
+        return Err(Fail::Permanent(format!("the object is {size} bytes on the server, more than the {max_bytes} expected; it is not downloaded")));
+    }
     let total = usize::try_from(size).map_err(|_| Fail::Permanent("the object is too large for this machine".into()))?;
     let mut file = tokio::fs::File::create(part).await.map_err(local)?;
     let mut parts = std::pin::pin!(stream::iter(chunk_plan(total)).map(|(offset, len)| read_chunk(conn, handle, offset, len)).buffered(WINDOW));
@@ -1037,10 +1153,13 @@ impl Backend for SftpBackend {
             return Err(StoreError::Backend("listing prefix must be chunks or manifests".into()));
         }
         if let Some(cursor) = after {
-            check_relative(cursor, self.layout)?;
+            // A cursor is only compared with names, never sent to the server, and it can be any name the listing returned
+            // (a foreign file may have a backslash or a control character in its name): only its size and NUL are checked.
+            if cursor.is_empty() || cursor.len() > MAX_CURSOR_BYTES || cursor.contains('\0') {
+                return Err(StoreError::Backend("listing cursor is refused: empty, too long or with a NUL".into()));
+            }
         }
-        let dir = if prefix.is_empty() { self.inner.join("").trim_end_matches('/').to_owned() } else { self.inner.join(prefix) };
-        let dir = if dir.is_empty() { ".".to_owned() } else { dir };
+        let dir = if prefix.is_empty() { self.inner.root_dir() } else { self.inner.join(prefix) };
         self.inner
             .run(|conn| {
                 let (dir, prefix) = (dir.clone(), prefix.to_owned());
@@ -1196,12 +1315,25 @@ mod tests {
 
     #[test]
     fn chunks_cover_exactly_the_requested_bytes() {
-        assert!(chunk_plan(0).is_empty());
-        assert_eq!(chunk_plan(1), vec![(0, 1)]);
-        assert_eq!(chunk_plan(CHUNK), vec![(0, CHUNK)]);
-        assert_eq!(chunk_plan(CHUNK + 1), vec![(0, CHUNK), (CHUNK, 1)]);
-        let plan = chunk_plan(5 * CHUNK + 7);
-        assert_eq!(plan.iter().map(|(_, len)| len).sum::<usize>(), 5 * CHUNK + 7);
+        assert_eq!(chunk_plan(0).count(), 0);
+        assert_eq!(chunk_plan(1).collect::<Vec<_>>(), vec![(0, 1)]);
+        assert_eq!(chunk_plan(CHUNK).collect::<Vec<_>>(), vec![(0, CHUNK)]);
+        assert_eq!(chunk_plan(CHUNK + 1).collect::<Vec<_>>(), vec![(0, CHUNK), (CHUNK, 1)]);
+        assert_eq!(chunk_plan(5 * CHUNK + 7).map(|(_, len)| len).sum::<usize>(), 5 * CHUNK + 7);
+        // A server that claims an absurd size costs nothing until the chunks are asked for.
+        assert_eq!(chunk_plan(usize::MAX).take(3).collect::<Vec<_>>(), vec![(0, CHUNK), (CHUNK, CHUNK), (2 * CHUNK, CHUNK)]);
+    }
+
+    #[test]
+    fn temporary_names_carry_their_age() {
+        let id = uuid::Uuid::now_v7();
+        let name = crate::disk::temp_name(id);
+        let created = crate::disk::temp_created_secs(&name).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert!(now.abs_diff(created) < 5);
+        for foreign in [".tmp-", ".tmp-x", "blob", ".tmp-018f4d50-0000-4000-8000-000000000000"] {
+            assert_eq!(crate::disk::temp_created_secs(foreign), None, "{foreign}");
+        }
     }
 
     #[test]

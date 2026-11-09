@@ -29,7 +29,7 @@ use craft_cloud_store::{Backend, BlobKey, BlobKind, MAX_LIST_PAGE_SIZE, Store, S
 use futures_util::{StreamExt, TryStreamExt, stream};
 use serde_json::{Value, json};
 
-use crate::cli::{CliError, create_data_dir, open_existing, remove_made, restrict, tuned};
+use crate::cli::{CliError, create_data_dir, open_existing, restrict, tuned};
 use crate::config::{BackupConfig, Config};
 
 /// How many database generations stay on the backup server when `--keep` and `[backup] keep` are not given.
@@ -45,8 +45,8 @@ const MANIFEST_NAME: &str = "manifest.json";
 /// What a backup target must do besides the store's byte operations: whole files, and removing an empty directory.
 pub trait Remote: Backend + Clone {
     fn put_file(&self, path: &str, local: &Path) -> impl Future<Output = Result<(), StoreError>> + Send;
-    /// `false`: no such object.
-    fn get_file(&self, path: &str, local: &Path) -> impl Future<Output = Result<bool, StoreError>> + Send;
+    /// `false`: no such object. An object larger than `max_bytes` is refused before it is read.
+    fn get_file(&self, path: &str, local: &Path, max_bytes: u64) -> impl Future<Output = Result<bool, StoreError>> + Send;
     fn remove_dir(&self, path: &str) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
@@ -55,8 +55,8 @@ impl Remote for SftpBackend {
         self.put_file_raw(path, local).await
     }
 
-    async fn get_file(&self, path: &str, local: &Path) -> Result<bool, StoreError> {
-        self.get_file_raw(path, local).await
+    async fn get_file(&self, path: &str, local: &Path, max_bytes: u64) -> Result<bool, StoreError> {
+        self.get_file_raw(path, local, max_bytes).await
     }
 
     async fn remove_dir(&self, path: &str) -> Result<(), StoreError> {
@@ -275,13 +275,21 @@ pub async fn backup_to<R: Remote>(
     }
     let (meta, local) = open_existing(config).await?;
     let (stamp, iso) = utc_stamp(now_ms);
+    let dump_path = format!("{GENERATIONS}/{stamp}/{DUMP_NAME}");
+    let manifest_path = format!("{GENERATIONS}/{stamp}/{MANIFEST_NAME}");
+    // A generation is named by the second it started in. One that is there already is another backup running, or the
+    // clock went back: writing over it could damage a backup that is good.
+    if remote.size_raw(&dump_path).await?.is_some() || remote.size_raw(&manifest_path).await?.is_some() {
+        return Err(CliError::Usage(format!(
+            "the backup server has a generation {stamp} already (another backup is running, or the clock went back); nothing was changed"
+        )));
+    }
     let work = tempfile::Builder::new().prefix("craft-cloud-backup-").tempdir_in(work_dir.map_or_else(std::env::temp_dir, Path::to_owned))?;
     let dump = work.path().join(DUMP_NAME);
     meta.dump_sqlite(&dump).await?;
     // A dump that does not open as a current database is not worth uploading.
     Meta::open_existing(&format!("sqlite:{}", dump.display())).await?;
     let (dump_bytes, dump_hash) = hash_file(&dump).await?;
-    let dump_path = format!("{GENERATIONS}/{stamp}/{DUMP_NAME}");
     remote.put_file(&dump_path, &dump).await?;
     writeln!(out, "database: {dump_bytes} bytes copied to the backup server")?;
 
@@ -307,10 +315,10 @@ pub async fn backup_to<R: Remote>(
         },
     });
     let text = serde_json::to_vec_pretty(&record).map_err(|e| CliError::Inconsistent(format!("the manifest could not be written: {e}")))?;
-    remote.put_raw(&format!("{GENERATIONS}/{stamp}/{MANIFEST_NAME}"), Bytes::from(text)).await?;
+    remote.put_raw(&manifest_path, Bytes::from(text)).await?;
     writeln!(out, "backup {stamp} is complete")?;
 
-    let removed = prune(&remote, keep).await?;
+    let removed = prune(&remote, keep, &stamp, now_ms).await?;
     if removed > 0 {
         writeln!(out, "removed {removed} older database generation(s); {keep} are kept")?;
     }
@@ -342,16 +350,27 @@ pub async fn restore_from<R: Remote>(remote: R, dir: &Path, generation: Option<&
     }
     let expected_hash =
         record["database"]["blake3"].as_str().ok_or_else(|| CliError::Inconsistent("the manifest has no database hash".into()))?.to_owned();
+    let expected_bytes = record["database"]["bytes"].as_u64().ok_or_else(|| CliError::Inconsistent("the manifest has no database size".into()))?;
     let dump_path = format!("{GENERATIONS}/{stamp}/{DUMP_NAME}");
     if record["database"]["file"] != dump_path {
         return Err(CliError::Inconsistent("the manifest names another database file than its own generation".into()));
     }
 
+    // Everything is made in a directory beside the target and moved into place at the end, so a restore that is killed
+    // leaves the target as it was (missing or empty, and a re-run is not refused) and a leftover `….restore-<id>` directory
+    // that can be deleted. A restore that fails removes its own.
     let abs = std::path::absolute(dir)?;
-    let created_dir = !abs.exists();
-    let result = restore_into(&remote, &abs, &dump_path, &expected_hash, out).await;
+    let name = abs.file_name().ok_or_else(|| CliError::Usage("the data directory needs a name".into()))?.to_string_lossy().into_owned();
+    let staging = abs.with_file_name(format!("{name}.restore-{}", uuid::Uuid::now_v7().simple()));
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let result = match restore_into(&remote, &staging, &dump_path, &expected_hash, expected_bytes, out).await {
+        Ok(()) => publish(&staging, &abs),
+        Err(e) => Err(e),
+    };
     if result.is_err() {
-        remove_made(&abs, created_dir);
+        let _ = std::fs::remove_dir_all(&staging);
     }
     result?;
     writeln!(out, "restored generation {stamp} into {}", abs.display())?;
@@ -365,14 +384,32 @@ pub async fn restore_from<R: Remote>(remote: R, dir: &Path, generation: Option<&
     Ok(())
 }
 
-async fn restore_into<R: Remote>(remote: &R, dir: &Path, dump_path: &str, expected_hash: &str, out: &mut impl Write) -> Result<(), CliError> {
+/// Moves the finished `staging` directory to `target`, which may exist if it is empty.
+fn publish(staging: &Path, target: &Path) -> Result<(), CliError> {
+    if target.exists() {
+        // Fails, and leaves the directory, if something was put into it since the check.
+        std::fs::remove_dir(target)
+            .map_err(|_| CliError::Usage(format!("{} is not empty any more; nothing was restored into it", target.display())))?;
+    }
+    std::fs::rename(staging, target)?;
+    Ok(())
+}
+
+async fn restore_into<R: Remote>(
+    remote: &R,
+    dir: &Path,
+    dump_path: &str,
+    expected_hash: &str,
+    expected_bytes: u64,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
     create_data_dir(dir)?;
     let database = dir.join("meta.db");
-    if !remote.get_file(dump_path, &database).await? {
+    if !remote.get_file(dump_path, &database, expected_bytes).await? {
         return Err(CliError::Inconsistent("the backup's database dump is missing".into()));
     }
     let (bytes, hash) = hash_file(&database).await?;
-    if hash != expected_hash {
+    if hash != expected_hash || bytes != expected_bytes {
         return Err(CliError::Inconsistent("the database dump does not match the hash in the manifest; it is damaged".into()));
     }
     Meta::open_existing(&format!("sqlite:{}", database.display())).await?;
@@ -409,18 +446,26 @@ async fn list_generations<R: Remote>(remote: &R) -> Result<BTreeMap<String, Vec<
     }
 }
 
-/// Deletes the generations older than the `keep` newest complete ones. Returns how many it removed. A generation that
-/// is newer than the oldest one kept is never touched, so an upload in progress is safe.
-async fn prune<R: Remote>(remote: &R, keep: u32) -> Result<usize, CliError> {
+/// How old a generation without its manifest must be before it is taken for a backup that died, not one still running.
+const ABANDONED_AFTER_MS: i64 = 24 * 3600 * 1000;
+
+/// Deletes the complete generations beyond the `keep` newest, and the incomplete ones that are over a day old. The
+/// generation `current` that was just written is never deleted, whatever the clock said, and a generation without its
+/// manifest that is younger than a day is left alone: it may be a backup that is still running. Returns how many it removed.
+async fn prune<R: Remote>(remote: &R, keep: u32, current: &str, now_ms: i64) -> Result<usize, CliError> {
     let generations = list_generations(remote).await?;
     let complete: Vec<&String> = generations.iter().filter(|(_, files)| files.iter().any(|f| f == MANIFEST_NAME)).map(|(stamp, _)| stamp).collect();
-    let keep = usize::try_from(keep).unwrap_or(usize::MAX);
-    let Some(oldest_kept) = complete.len().checked_sub(keep).and_then(|skip| complete.get(skip)).or(complete.first()).map(|stamp| (*stamp).clone())
-    else {
-        return Ok(0);
+    let keep = usize::try_from(keep).unwrap_or(usize::MAX).max(1);
+    let kept: Vec<&String> = complete.iter().rev().take(keep).copied().collect();
+    let abandoned_before = utc_stamp(now_ms.saturating_sub(ABANDONED_AFTER_MS)).0;
+    let doomed = |stamp: &String, files: &Vec<String>| {
+        if stamp == current || kept.contains(&stamp) {
+            return false;
+        }
+        files.iter().any(|f| f == MANIFEST_NAME) || *stamp < abandoned_before
     };
     let mut removed = 0usize;
-    for (stamp, files) in generations.iter().filter(|(stamp, _)| **stamp < oldest_kept) {
+    for (stamp, files) in generations.iter().filter(|(stamp, files)| doomed(stamp, files)) {
         // The manifest goes first: from then on the generation is not offered by a restore.
         for name in files.iter().filter(|name| name.as_str() == MANIFEST_NAME).chain(files.iter().filter(|name| name.as_str() != MANIFEST_NAME)) {
             remote.delete_raw(&format!("{GENERATIONS}/{stamp}/{name}")).await?;
