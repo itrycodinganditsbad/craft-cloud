@@ -664,6 +664,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     self.state.sent_dir_deletes.extend(dir_deletes.iter().copied());
                     self.checkpoint()?;
                 }
+                self.guard()?;
                 let result = self.transport.commit(&only_ops).await;
                 // Applied or refused as a whole, the batch's deletes are no longer in doubt; any other answer leaves
                 // them written down.
