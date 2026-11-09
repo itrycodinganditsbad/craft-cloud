@@ -33,23 +33,22 @@ pub struct Seen {
 }
 
 impl Seen {
-    /// Presence from `user` in `doc` at `now`. `true` when that account was not counted as there before (the lists change).
+    /// Presence from `user` in `doc` at `now`. `true` when the lists change: the account was not counted as there before, or the
+    /// sweep this call made (once the earliest deadline has passed) dropped somebody (the hub's timer then finds nothing to do).
     pub fn note(&mut self, now: Instant, doc: DocId, user: Uuid) -> bool {
         // Only once the earliest deadline has passed is there anything to drop.
-        if self.next.is_some_and(|deadline| now >= deadline) {
-            self.sweep(now);
-        }
+        let dropped = self.next.is_some_and(|deadline| now >= deadline) && self.sweep(now);
         if self.docs.len() >= MAX_DOCS && !self.docs.contains_key(&doc) {
             self.docs.clear();
             self.next = None;
         }
         let users = self.docs.entry(doc).or_default();
         if users.len() >= MAX_PER_DOC && !users.contains_key(&user) {
-            return false;
+            return dropped;
         }
         let new = users.insert(user, now).is_none();
         self.next.get_or_insert(now + OPEN_NOW_TTL);
-        new
+        new || dropped
     }
 
     /// Drops the accounts that have faded by `now`, and finds when the next one will. `true` when anybody was dropped (the
@@ -149,6 +148,23 @@ mod tests {
         assert_eq!(seen.next_expiry(), Some(t5 + OPEN_NOW_TTL), "cy is next");
         assert!(seen.sweep(t5 + OPEN_NOW_TTL));
         assert_eq!(seen.next_expiry(), None);
+    }
+
+    /// Somebody who is heard again after the deadline reports the change when the sweep it made dropped another: the hub must not
+    /// wait for its timer, which would find nothing left to do.
+    #[test]
+    fn a_known_account_heard_after_the_deadline_reports_what_the_sweep_dropped() {
+        let (doc, ben, cy) = (DocId::generate(), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
+        let t0 = Instant::now();
+        let mut seen = Seen::default();
+        seen.note(t0, doc, ben);
+        seen.note(t0 + Duration::from_secs(8), doc, cy);
+        // Ben goes quiet; cy's next presence comes after ben's deadline and before the timer has run.
+        let later = t0 + OPEN_NOW_TTL + Duration::from_secs(1);
+        assert!(seen.note(later, doc, cy), "cy is known, but ben was dropped by this call");
+        assert!(!seen.note(later, doc, cy), "nothing more to report");
+        assert!(!seen.sweep(later), "the timer finds nothing");
+        assert_eq!(seen.next_expiry(), Some(later + OPEN_NOW_TTL), "only cy is left, heard at `later`");
     }
 
     #[test]
