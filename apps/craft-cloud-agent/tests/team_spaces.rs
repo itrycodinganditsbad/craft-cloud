@@ -1831,3 +1831,118 @@ async fn losing_access_raises_the_generation_even_when_it_cannot_be_saved_at_onc
     eventually("the raised generation is saved later", || async { generation(&t) > Some(before) }).await;
     assert_eq!(names(&a).len(), 6, "the local copy is kept");
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The sixth review round of P1-5 (N1 to N4 of the re-review of the fifth)
+
+/// N1: a link is pointed at another folder in the middle of a pass; the pass takes in the server's newest file there, stops at
+/// its first checkpoint, and the link is pointed back before the next pass. The session that took in part of the other folder is
+/// not used again (nor its state saved): the file is not taken for deleted in the first folder and deleted on the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_pointed_elsewhere_and_back_around_a_pass_deletes_nothing() {
+    let (t, front, _task) = team_via_front(SpaceRole::Editor, Front::default()).await;
+    let space = t.space;
+    eventually("the invitation is listed", || async { t.ben.space(space).await.is_some_and(|s| s.state == "invited") }).await;
+    t.ben.accept(space).await;
+    eventually("ana's agent lists the space", || async { t.ana.space(space).await.is_some_and(|s| s.state == "active") }).await;
+    let ana_folder = t.ana.sync_on(space).await;
+    let (a, b, link) = (t.ben.dir.path().join("A"), t.ben.dir.path().join("B"), t.ben.dir.path().join("Link"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    link_dir(&link, &a);
+    t.ben.sync_on_in(space, &link).await;
+    for i in 0..6 {
+        write(&ana_folder, &format!("f{i}.txt"), &format!("content {i}"));
+    }
+    eventually("the folder behind the link has the files", || async { names(&a).len() == 6 }).await;
+    eventually("nothing runs", || async { t.ben.status().await.spaces.iter().all(|s| s.run_state == SpaceRun::Idle) }).await;
+
+    // A pass begins and waits at the server. The server gets a new file; the link is pointed at B; syncing is paused so no pass
+    // follows at once; the pass goes on, takes the new file into B and stops at its first checkpoint.
+    front.stall.store(true, Ordering::SeqCst);
+    write(&link, "local.txt", "a local change");
+    eventually("the pass is running", || async { t.ben.status().await.spaces.iter().any(|s| s.space == space && s.run_state == SpaceRun::Syncing) })
+        .await;
+    write(&ana_folder, "newest.txt", "from the server");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    std::fs::create_dir_all(b.join(".craft-cloud")).unwrap();
+    std::fs::copy(a.join(".craft-cloud/root.json"), b.join(".craft-cloud/root.json")).unwrap();
+    unlink_dir(&link);
+    link_dir(&link, &b);
+    t.ben.api(|c| c.pause()).await.unwrap();
+    front.stall.store(false, Ordering::SeqCst);
+    eventually("the pass took the new file into the other folder", || async { read(&b, "newest.txt").as_deref() == Some("from the server") }).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Pointed back before the next pass: that pass must not trust what the first one took in.
+    unlink_dir(&link);
+    link_dir(&link, &a);
+    t.ben.api(|c| c.resume()).await.unwrap();
+    eventually("the first folder gets the server's file", || async { read(&a, "newest.txt").as_deref() == Some("from the server") }).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(read(&ana_folder, "newest.txt").as_deref(), Some("from the server"), "the server's file was not deleted");
+    for i in 0..6 {
+        assert_eq!(read(&ana_folder, &format!("f{i}.txt")).as_deref(), Some(format!("content {i}").as_str()), "f{i} is still on the server");
+    }
+}
+
+/// N3: the nonce in a team folder's `.craft-cloud` is rewritten at every checkpoint and recorded in the state saved with it, so a
+/// folder restored from an older copy is told apart even where a file system reuses folder IDs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_folder_nonce_is_rewritten_and_recorded_in_the_state() {
+    let t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    let (ana_folder, a) = six_files(&t).await;
+    let nonce_of = |folder: &Path| std::fs::read_to_string(folder.join(".craft-cloud/nonce")).ok();
+    let before = nonce_of(&a).expect("the folder has a nonce once a pass has run");
+    write(&ana_folder, "more.txt", "another file");
+    eventually("the nonce was rewritten", || async { nonce_of(&a).is_some_and(|n| n != before) }).await;
+    eventually("nothing runs", || async { t.ben.status().await.spaces.iter().all(|s| s.run_state == SpaceRun::Idle) }).await;
+    let nonce = nonce_of(&a).unwrap();
+    let recorded = t.ben.space_state(space).and_then(|s| s["folder_nonce"].as_str().map(str::to_owned));
+    assert_eq!(recorded, Some(nonce), "the state records the nonce the folder carries");
+}
+
+/// N4: while a raised generation of one space cannot be saved, only that space is held back from starting, and its state says so;
+/// another space goes on syncing. Once account.json can be written the space starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_the_space_with_an_unsaved_generation_is_held_back_and_says_so() {
+    let t = team(SpaceRole::Editor).await;
+    let a = t.space;
+    let b = t.world.space("Archive").await;
+    t.world.invite_ben(b, SpaceRole::Editor).await;
+    let (_, _) = both_syncing(&t).await;
+    eventually("the second invitation is listed", || async { t.ben.space(b).await.is_some_and(|s| s.state == "invited") }).await;
+    t.ben.accept(b).await;
+    eventually("ana's agent lists the second space", || async { t.ana.space(b).await.is_some_and(|s| s.state == "active") }).await;
+    let (ana_b, ben_b) = (t.ana.sync_on(b).await, t.ben.sync_on(b).await);
+    let account_path = t.ben.data.path().join("account.json");
+
+    // account.json can't be written: the first space loses access (its raise can't be saved), then gets it back.
+    let held = Held::new(&account_path);
+    t.world.meta.remove_member(&SpaceActor::Cli, a, t.world.ben.id, 1).await.unwrap();
+    eventually("the first space reports no access", || async {
+        t.ben.status().await.spaces.iter().any(|s| s.space == a && matches!(s.run_state, SpaceRun::NoAccess { .. }))
+    })
+    .await;
+    t.world.invite_ben(a, SpaceRole::Editor).await;
+    t.world.meta.accept_invitation(t.world.ben.id, None, a, 2).await.unwrap();
+    eventually("the first space is held back and says why", || async {
+        t.ben
+            .status()
+            .await
+            .spaces
+            .iter()
+            .any(|s| s.space == a && matches!(&s.run_state, SpaceRun::Paused { reason, .. } if reason.contains("could not be saved")))
+    })
+    .await;
+    // The second space goes on.
+    write(&ana_b, "meanwhile.txt", "the other space is not held back");
+    eventually("the second space still syncs", || has_file(ben_b.clone(), "meanwhile.txt", "the other space is not held back")).await;
+
+    drop(held);
+    eventually("the first space starts once the settings can be saved", || async {
+        t.ben.status().await.spaces.iter().any(|s| s.space == a && !matches!(s.run_state, SpaceRun::Paused { .. } | SpaceRun::NoAccess { .. }))
+    })
+    .await;
+}

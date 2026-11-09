@@ -37,7 +37,8 @@
 //!   used; a state that can't be removed fails the turn-off; and a session whose folder now leads somewhere else (a link
 //!   pointed at another folder) is dropped with its state before the next pass.
 //!   A raised generation that can't be saved (account.json can't be written) is kept in memory and saved again at every look at
-//!   the list; no space is started meanwhile, so a session that begins cannot use a state that was meant to be dropped.
+//!   the list; that space is not started meanwhile (its state shows why), so a session that begins cannot use a state that was
+//!   meant to be dropped. Other spaces are not held back.
 //! - **One pass at a time**: passes of the spaces run one after another on a thread of their own, and take turns with the
 //!   personal space's passes ([`PassGate`]). A pass that is queued when its space is closed (turned off, moved to another
 //!   folder, lost) or the agent stops is not run; the running pass finishes. A second change of a space that is still
@@ -92,6 +93,8 @@ const CLOSE_WAIT: Duration = Duration::from_secs(50);
 pub const CHANGING: &str = "this space is being changed, try again in a moment";
 /// What turning a space on is told when the space's last pass did not end within [`CLOSE_WAIT`].
 const STILL_FINISHING: &str = "this space is still finishing its last pass, try again in a moment";
+/// What a space that is held back until its raised generation is saved shows as its state.
+const UNSAVED: &str = "this space's settings could not be saved yet; it starts again as soon as they can";
 /// How soon a discovery that failed is tried again while someone waits for it.
 const DISCOVERY_RETRY: Duration = Duration::from_secs(3);
 /// The longest those waiting for a discovery are kept waiting for one that works (they are released after that, with the old
@@ -695,10 +698,10 @@ struct Manager {
     live: Live,
     /// Turning a space off or moving it waits for its session to close, apart from the task: those under way.
     pending: Vec<Pending>,
-    /// A raised generation of a space could not be saved (account.json can't be written): it is saved again at every look at the
-    /// list, and no space is started meanwhile. (Running syncs go on: their state is valid.) Without this, a restart before the
-    /// save would find the old generation on disk and trust a state that was meant to be dropped.
-    generation_unsaved: bool,
+    /// The spaces whose raised generation could not be saved (account.json can't be written): it is saved again at every look at
+    /// the list, and these spaces are not started meanwhile (the status says why). Other spaces and running syncs go on. Without
+    /// this, a restart before the save would find the old generation on disk and trust a state that was meant to be dropped.
+    unsaved: BTreeSet<SpaceId>,
     /// The last number given to a change in `pending`.
     changes: u64,
     /// When those waiting for a discovery stop being kept waiting for one that works.
@@ -761,7 +764,7 @@ impl Manager {
             thread,
             live,
             pending: Vec::new(),
-            generation_unsaved: false,
+            unsaved: BTreeSet::new(),
             changes: 0,
             refresh_until: None,
             runs: 0,
@@ -1089,9 +1092,9 @@ impl Manager {
 
     /// The list (or its absence) is known: settings, runs and the local API's view follow.
     fn settled(&mut self) {
-        if self.generation_unsaved {
+        if !self.unsaved.is_empty() {
             match self.data.save_account(&self.account) {
-                Ok(()) => self.generation_unsaved = false,
+                Ok(()) => self.unsaved.clear(),
                 Err(e) => crate::runlog::note(format_args!("can't save a raised generation of a team space yet: {e}")),
             }
         }
@@ -1150,7 +1153,7 @@ impl Manager {
         let timing = self.options.timing;
         let (options, events, now, paused) = (self.options, self.events_tx.clone(), self.now(), self.paused);
         let (data, account, live) = (self.data.clone(), self.account.clone(), self.live.clone());
-        let may_start = !self.generation_unsaved;
+        let may_start = !self.unsaved.contains(&space);
         self.runs += 1;
         let run = self.runs;
         let Some(team) = self.teams.get_mut(index) else { return };
@@ -1305,12 +1308,12 @@ impl Manager {
 
     /// Raises the generation of the space's setting and saves it, so a state made under the old one is not used again.
     /// A raise that could not be saved stays in memory and is saved again at the next look at the list; until then no space is
-    /// started (see `generation_unsaved`), so a state that was meant to be unusable is not used by a session that begins.
+    /// started (see `unsaved`), so a state that was meant to be unusable is not used by a session that begins.
     fn raise_generation(&mut self, space: SpaceId) -> Result<(), AgentError> {
         if let Some(setting) = self.account.spaces.iter_mut().find(|s| s.space == space) {
             setting.generation = setting.generation.saturating_add(1);
             if let Err(e) = self.data.save_account(&self.account) {
-                self.generation_unsaved = true;
+                self.unsaved.insert(space);
                 return Err(e.into());
             }
         }
@@ -1371,6 +1374,9 @@ impl Manager {
         }
         if team.setting.sync && self.supported == Some(false) {
             return Some(SpaceRun::Unavailable { message: NEEDS_UPDATE.into() });
+        }
+        if team.active.is_none() && team.setting.sync && self.unsaved.contains(&team.setting.space) {
+            return Some(SpaceRun::Paused { reason: UNSAVED.into(), reason_code: None });
         }
         let active = team.active.as_ref()?;
         if self.paused {

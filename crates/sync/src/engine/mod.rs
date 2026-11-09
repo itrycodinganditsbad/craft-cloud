@@ -77,6 +77,9 @@ pub enum SyncError {
 /// Saves the engine's state during a pass (see [`Engine::on_checkpoint`]).
 pub type Checkpoint = Box<dyn FnMut(&State) -> io::Result<()> + Send + Sync>;
 
+/// Asked before every commit (see [`Engine::on_guard`]).
+pub type Guard = Box<dyn FnMut() -> io::Result<()> + Send + Sync>;
+
 fn io_err(path: &RelPath, source: io::Error) -> SyncError {
     SyncError::Io { path: path.to_string(), source }
 }
@@ -358,6 +361,7 @@ pub struct Engine<F: Fs, T: Transport> {
     /// (see [`Engine::twins_in`]). Behind a lock because the checks only read the engine.
     listings: Mutex<BTreeMap<RelPath, Twins>>,
     checkpoint: Option<Checkpoint>,
+    guard: Option<Guard>,
     /// The new folder IDs the last look at the start of a pass found but didn't take (see [`Engine::learn_dir_ids`]).
     declined_dir_ids: BTreeSet<(NodeId, u64)>,
     /// The account's storage on the server as the last refusal this pass gave it (`used`, `limit`): a later file
@@ -456,6 +460,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             fs_changes: 0,
             listings: Mutex::new(BTreeMap::new()),
             checkpoint: None,
+            guard: None,
             declined_dir_ids: BTreeSet::new(),
             quota: None,
             saves: None,
@@ -524,6 +529,20 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// The caller still saves the state after the pass.
     pub fn on_checkpoint(&mut self, save: impl FnMut(&State) -> io::Result<()> + Send + Sync + 'static) {
         self.checkpoint = Some(Box::new(save));
+    }
+
+    /// Asks `check` before every commit of a push, whatever it holds: an error stops the pass ([`SyncError::Checkpoint`]) and the
+    /// batch is not sent. A caller whose folder can change under the pass (a link pointed elsewhere) uses it so that nothing
+    /// scanned in one folder is committed after the folder has changed.
+    pub fn on_guard(&mut self, check: impl FnMut() -> io::Result<()> + Send + Sync + 'static) {
+        self.guard = Some(Box::new(check));
+    }
+
+    fn guard(&mut self) -> Result<(), SyncError> {
+        match &mut self.guard {
+            Some(check) => check().map_err(SyncError::Checkpoint),
+            None => Ok(()),
+        }
     }
 
     fn checkpoint(&mut self) -> Result<(), SyncError> {

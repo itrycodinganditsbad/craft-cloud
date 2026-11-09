@@ -1696,6 +1696,8 @@ pub struct Session {
     state_folder_id: Option<u64>,
     /// The folder the session was opened on (a team space's), to notice a link that leads elsewhere later.
     opened_on: Option<crate::disk::FolderIdentity>,
+    /// Set when the folder was found to lead elsewhere during a pass: the engine's state took in part of that other folder.
+    poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The server's stamp of the account's membership of a team space that `state.json` records (see
     /// [`SavedState::joined_ms`]); `None` for the personal space.
     joined_ms: Option<i64>,
@@ -1789,16 +1791,31 @@ impl Session {
         // since the last one (the last pass's outcome stays as it was until this one ends).
         let last_pass = std::sync::Arc::new(std::sync::Mutex::new(saved.last_pass));
         let (checkpoint_data, checkpoint_last, checkpoint_folder) = (data.clone(), last_pass.clone(), state_folder.clone());
-        let (guard_folder, guard_identity) = (account.folder.clone(), opened_on.clone());
+        // A team folder that was pointed at another folder during a pass is noticed before the engine saves its state and before
+        // every commit: the pass stops without sending or saving anything of what it saw there. What the pass has taken in
+        // since was about the other folder, so the session is finished with even if the link is pointed back (see
+        // `Session::folder_moved`).
+        let poisoned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let still_there: std::sync::Arc<dyn Fn() -> std::io::Result<()> + Send + Sync> = {
+            let (folder, identity, poisoned) = (account.folder.clone(), opened_on.clone(), poisoned.clone());
+            std::sync::Arc::new(move || {
+                if let Some(then) = &identity
+                    && let Some(now) = crate::disk::folder_identity(&folder)
+                    && *then != now
+                {
+                    poisoned.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(std::io::Error::other("the folder leads somewhere else than when the session opened"));
+                }
+                Ok(())
+            })
+        };
+        let guard_check = still_there.clone();
+        engine.on_guard(move || guard_check());
+        // The folder's nonce is rewritten at every checkpoint and at the end of a pass, and recorded in the state saved with it.
+        let checkpoint_folder_path = account.folder.clone();
         engine.on_checkpoint(move |state| {
-            // The engine saves just before it sends deletions: a team folder that was pointed at another folder during the
-            // pass is noticed here, and the pass stops without sending or saving anything of what it saw there.
-            if let Some(then) = &guard_identity
-                && let Some(now) = crate::disk::folder_identity(&guard_folder)
-                && *then != now
-            {
-                return Err(std::io::Error::other("the folder leads somewhere else than when the session opened"));
-            }
+            still_there()?;
+            let folder_nonce = if bound { Some(root::rotate_nonce(&checkpoint_folder_path)?) } else { None };
             let last_pass = checkpoint_last.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
             let saved = SavedState {
                 schema: STATE_SCHEMA,
@@ -1807,6 +1824,7 @@ impl Session {
                 paused: false,
                 folder: checkpoint_folder.clone(),
                 folder_id: state_folder_id,
+                folder_nonce,
                 joined_ms,
                 generation,
             };
@@ -1821,6 +1839,7 @@ impl Session {
             last_pass,
             _folder_lock: folder_lock,
             opened_on,
+            poisoned,
             state_folder,
             state_folder_id,
             joined_ms,
@@ -1839,6 +1858,9 @@ impl Session {
     /// elsewhere, or the folder was replaced): what the session remembers is not about this folder. A folder that can't be
     /// looked at is not "moved" (the pass says what is wrong with it).
     pub fn folder_moved(&self) -> bool {
+        if self.poisoned.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
         let now = self.bound.then(|| crate::disk::folder_identity(&self.account.folder)).flatten();
         matches!((&self.opened_on, now), (Some(then), Some(now)) if *then != now)
     }
@@ -1925,8 +1947,20 @@ impl Session {
                 (Outcome::Failed(failure_message(e)), previous.map(|s| s.pending_only()).filter(|s| s.needs_approval() || !s.held_deletes.is_empty()))
             }
         };
+        // A folder that leads elsewhere than at the start (also one that was pointed back since): what the engine holds may
+        // be about the other folder, so nothing is saved. The pass thread drops the session and removes the state.
+        if self.folder_moved() {
+            self.poisoned.store(true, std::sync::atomic::Ordering::SeqCst);
+            result?;
+            return Err(AgentError::Usage("the folder of this space leads somewhere else now; the next pass starts afresh there".into()));
+        }
         let last = LastPass { finished_ms: now_ms(), outcome, summary: summary.clone() };
         *self.last_pass.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(last.clone());
+        let folder_nonce = if self.bound {
+            Some(root::rotate_nonce(&self.account.folder).map_err(|source| AgentError::Io { path: self.account.folder.clone(), source })?)
+        } else {
+            None
+        };
         let saved = SavedState {
             schema: STATE_SCHEMA,
             state: self.engine.state().clone(),
@@ -1934,6 +1968,7 @@ impl Session {
             paused: false,
             folder: self.state_folder.clone(),
             folder_id: self.state_folder_id,
+            folder_nonce,
             joined_ms: self.joined_ms,
             generation: self.generation,
         };
