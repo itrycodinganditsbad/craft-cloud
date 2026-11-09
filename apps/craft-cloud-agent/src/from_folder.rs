@@ -1079,7 +1079,9 @@ impl Job {
         if !matches!(self.control.space_info(space).and_then(|i| i.run_state), Some(SpaceRun::Idle)) {
             return None;
         }
-        let (saved, _) = self.data.space_dir(space).load_state_for(space, &folder, None).ok()?;
+        // The state is read under the generation of the space's setting, as the pass reads it.
+        let generation = self.data.load_account().ok().flatten()?.spaces.iter().find(|s| s.space == space)?.generation;
+        let (saved, _) = self.data.space_dir(space).load_state_for(space, &folder, None, generation).ok()?;
         // A file that was just put there and has not settled yet (or waits for a Craft save) is tried again by the pass itself.
         let waits = |why: &str| {
             why.starts_with(craft_cloud_sync::STILL_CHANGING)
