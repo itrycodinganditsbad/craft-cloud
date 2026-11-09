@@ -20,7 +20,7 @@ const NOW: i64 = 1_790_000_000_000;
 const SMALL: [f32; 2] = [crate::ui::MIN_WINDOW_SIZE[0], 1000.0];
 
 fn harness_sized(model: Model, theme: egui::Theme, size: [f32; 2]) -> Harness<'static, (Model, Vec<Event>)> {
-    Harness::builder().with_size(egui::Vec2::from(size)).with_theme(theme).wgpu_setup(super::tests::shared_wgpu()).build_ui_state(
+    Harness::builder().with_size(egui::Vec2::from(size)).with_theme(theme).renderer(super::tests::serialized()).build_ui_state(
         |ui, (model, events): &mut (Model, Vec<Event>)| {
             events.extend(show(ui, model, NOW));
         },

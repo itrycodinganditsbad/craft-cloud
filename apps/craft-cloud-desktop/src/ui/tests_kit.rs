@@ -7,7 +7,7 @@ use egui_kittest::kittest::Queryable;
 use super::kit::{self, Button, Column, JoinedCell, Part, Segment, Tone};
 
 fn harness<S>(size: egui::Vec2, theme: egui::Theme, state: S, mut ui_fn: impl FnMut(&mut egui::Ui, &mut S) + 'static) -> Harness<'static, S> {
-    Harness::builder().with_size(size).with_theme(theme).wgpu_setup(super::tests::shared_wgpu()).build_ui_state(
+    Harness::builder().with_size(size).with_theme(theme).renderer(super::tests::serialized()).build_ui_state(
         move |ui, state: &mut S| {
             if kit::ensure(ui.ctx()) {
                 egui::CentralPanel::default().show(ui, |ui| ui_fn(ui, state));
