@@ -316,6 +316,11 @@ pub struct SavedState {
     /// (see [`DataDir::load_state_for`]); the personal space's state has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<PathBuf>,
+    /// A team space's state only: the ID of the folder it was made for (see [`crate::disk::FolderIdentity`]). A folder
+    /// replaced at the same path (restored from a backup, made again) has another ID, and a state made for the first is not
+    /// used for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<u64>,
     /// A team space's state only: the server's stamp of the account's membership when the state was made
     /// (`SpaceListItem::joined_ms`). A state made under another stamp (the member was removed and invited again meanwhile)
     /// is not used. `None`: the server gave none.
@@ -499,8 +504,25 @@ impl DataDir {
     /// `generation` (the setting's, see [`SpaceSetting::generation`]) is not used either. The `bool` says the saved
     /// state was set aside because it belongs elsewhere.
     pub fn load_state_for(&self, space: SpaceId, folder: &Path, joined_ms: Option<i64>, generation: u64) -> Result<(SavedState, bool), AccountError> {
+        self.load_state_with(space, crate::disk::folder_identity(folder).as_ref(), joined_ms, generation)
+    }
+
+    /// As [`DataDir::load_state_for`], for a folder looked at once already (`identity`): a session takes that one look for
+    /// both the state it chooses and the folder it later compares with. The state must also have been made for the folder's
+    /// ID, when the folder has one.
+    pub fn load_state_with(
+        &self,
+        space: SpaceId,
+        identity: Option<&crate::disk::FolderIdentity>,
+        joined_ms: Option<i64>,
+        generation: u64,
+    ) -> Result<(SavedState, bool), AccountError> {
         let saved = self.load_state()?;
-        let here = fs::canonicalize(folder).ok();
+        let here = identity.map(|i| i.path.clone());
+        let same_folder_id = match identity.and_then(|i| i.id) {
+            Some(now) => saved.folder_id == Some(now),
+            None => true,
+        };
         let same_membership = match (joined_ms, saved.joined_ms) {
             (Some(now), Some(then)) => now == then,
             // The server gives a stamp and the state has none: it was made before the membership was stamped.
@@ -510,6 +532,7 @@ impl DataDir {
         let ours = saved.state.space.is_none_or(|s| s == space)
             && saved.folder.is_some()
             && saved.folder == here
+            && same_folder_id
             && same_membership
             && saved.generation == generation;
         if ours || (saved.state.space.is_none() && saved.last_pass.is_none() && saved.folder.is_none()) {
@@ -1039,7 +1062,8 @@ mod tests {
         fs::create_dir_all(&b).unwrap();
         let space = SpaceId::generate();
         assert_eq!(data.load_state_for(space, &a, None, 0).unwrap(), (SavedState { schema: STATE_SCHEMA, ..SavedState::default() }, false));
-        let mut saved = SavedState { schema: STATE_SCHEMA, folder: fs::canonicalize(&a).ok(), ..SavedState::default() };
+        let id = crate::disk::folder_identity(&a).and_then(|i| i.id).expect("the folder has an ID");
+        let mut saved = SavedState { schema: STATE_SCHEMA, folder: fs::canonicalize(&a).ok(), folder_id: Some(id), ..SavedState::default() };
         saved.state.space = Some(space);
         saved.state.seq = 9;
         data.save_state(&saved).unwrap();
@@ -1057,6 +1081,7 @@ mod tests {
         // The server's stamp of the membership: a state made under another one is not used; without a stamp on either side
         // (an older server, a state from before stamps) nothing is compared.
         saved.folder = fs::canonicalize(&a).ok();
+        saved.folder_id = Some(id);
         saved.joined_ms = Some(100);
         data.save_state(&saved).unwrap();
         assert!(!data.load_state_for(space, &a, Some(100), 0).unwrap().1, "the same membership");
@@ -1066,6 +1091,17 @@ mod tests {
         data.save_state(&saved).unwrap();
         assert!(data.load_state_for(space, &a, Some(200), 0).unwrap().1, "a state without a stamp is not trusted when the server gives one");
         assert!(!data.load_state_for(space, &a, None, 0).unwrap().1, "and is used with a server that gives none");
+        // A state is made for one folder ID: the same path replaced by another folder (a restored backup) is not the folder, and a
+        // state without an ID is not trusted when the folder has one.
+        saved.folder_id = None;
+        data.save_state(&saved).unwrap();
+        assert!(data.load_state_for(space, &a, None, 0).unwrap().1, "a state without a folder ID is not trusted");
+        saved.folder_id = Some(id.wrapping_add(1));
+        data.save_state(&saved).unwrap();
+        assert!(data.load_state_for(space, &a, None, 0).unwrap().1, "another folder ID at the same path: not the folder");
+        saved.folder_id = Some(id);
+        data.save_state(&saved).unwrap();
+        assert!(!data.load_state_for(space, &a, None, 0).unwrap().1, "the folder it was made for");
         // A state made under another generation of the space's setting is not used; the generation is written only when raised.
         saved.joined_ms = None;
         saved.generation = 3;

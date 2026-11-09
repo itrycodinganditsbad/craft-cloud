@@ -1528,3 +1528,90 @@ async fn a_crash_after_the_marker_is_installed_does_not_revive_the_old_state() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(names(&ana_folder).len(), 6, "nothing was deleted on the server: {:?}", names(&ana_folder));
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The fifth review round of P1-5 (the re-review of the fourth)
+
+/// Replaces `folder` at the same path as a backup restore would: it is wiped and made again with the space's marker and only
+/// the files in `keep` (with the content they had). The new folder has another ID.
+fn restore_backup(folder: &Path, keep: &[&str]) {
+    let marker = std::fs::read(folder.join(".craft-cloud/root.json")).unwrap();
+    let kept: Vec<(String, Vec<u8>)> = keep.iter().map(|n| ((*n).to_owned(), std::fs::read(folder.join(n)).unwrap())).collect();
+    std::fs::remove_dir_all(folder).unwrap();
+    std::fs::create_dir_all(folder.join(".craft-cloud")).unwrap();
+    std::fs::write(folder.join(".craft-cloud/root.json"), marker).unwrap();
+    for (name, data) in kept {
+        std::fs::write(folder.join(name), data).unwrap();
+    }
+}
+
+/// Ben syncs a team folder with six files; returns ana's folder and his.
+async fn six_files(t: &Team) -> (PathBuf, PathBuf) {
+    let (ana_folder, a) = both_syncing(t).await;
+    for i in 0..6 {
+        write(&ana_folder, &format!("f{i}.txt"), &format!("content {i}"));
+    }
+    eventually("ben has the files", || async { names(&a).len() == 6 }).await;
+    eventually("nothing runs", || async { t.ben.status().await.spaces.iter().all(|s| s.run_state == SpaceRun::Idle) }).await;
+    (ana_folder, a)
+}
+
+/// F1, same path, running: the folder is replaced by a backup that holds the marker but not the newer files, while the session is
+/// open, and the state file can't be removed. The old state is not trusted when the session reopens: nothing is deleted on the
+/// server and the folder is filled from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_replaced_at_the_same_path_with_a_state_that_cannot_be_removed_deletes_nothing() {
+    let t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    let (ana_folder, a) = six_files(&t).await;
+    let state_path = t.ben.data.path().join("spaces").join(space.to_string()).join("state.json");
+    let generation = |t: &Team| t.ben.data.load_account().unwrap().unwrap().spaces.iter().find(|s| s.space == space).map(|s| s.generation);
+    let before = generation(&t).unwrap();
+    let held = Held::new(&state_path);
+    restore_backup(&a, &["f0.txt", "f1.txt"]);
+    write(&ana_folder, "poke.txt", "asks for a pass");
+    eventually("the folder is filled from the server", || async { names(&a).len() == 7 }).await;
+    drop(held);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(names(&ana_folder).len(), 7, "nothing was deleted on the server: {:?}", names(&ana_folder));
+    assert!(generation(&t) > Some(before), "the generation was raised when the folder was found replaced");
+}
+
+/// F1, same path, across a restart: the agent is stopped while the folder is replaced by a backup with the marker but without the
+/// newer files. The state records the old folder's ID, so it is not used for the new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_replaced_at_the_same_path_while_the_agent_is_stopped_deletes_nothing() {
+    let mut t = team(SpaceRole::Editor).await;
+    let (ana_folder, a) = six_files(&t).await;
+    let (exit, out) = t.ben.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    restore_backup(&a, &["f0.txt", "f1.txt"]);
+    t.ben.run();
+    eventually("the folder is filled from the server", || async { names(&a).len() == 6 }).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(names(&ana_folder).len(), 6, "nothing was deleted on the server: {:?}", names(&ana_folder));
+}
+
+/// F1, same path, across a pass that needs the user: the folder goes (the pass stops, the session is dropped) and comes back
+/// at the same path as a backup with the marker but without the newer files. Nothing is deleted on the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_that_goes_and_comes_back_replaced_deletes_nothing() {
+    let t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    let (ana_folder, a) = six_files(&t).await;
+    let marker = std::fs::read(a.join(".craft-cloud/root.json")).unwrap();
+    let kept: Vec<Vec<u8>> = ["f0.txt", "f1.txt"].iter().map(|n| std::fs::read(a.join(n)).unwrap()).collect();
+    std::fs::remove_dir_all(&a).unwrap();
+    write(&ana_folder, "poke.txt", "asks for a pass");
+    eventually("the pass needs the user", || async {
+        t.ben.status().await.spaces.iter().any(|s| s.space == space && matches!(s.run_state, SpaceRun::Paused { .. }))
+    })
+    .await;
+    std::fs::create_dir_all(a.join(".craft-cloud")).unwrap();
+    std::fs::write(a.join(".craft-cloud/root.json"), marker).unwrap();
+    std::fs::write(a.join("f0.txt"), &kept[0]).unwrap();
+    std::fs::write(a.join("f1.txt"), &kept[1]).unwrap();
+    eventually("the folder is filled from the server", || async { names(&a).len() == 7 }).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(names(&ana_folder).len(), 7, "nothing was deleted on the server: {:?}", names(&ana_folder));
+}

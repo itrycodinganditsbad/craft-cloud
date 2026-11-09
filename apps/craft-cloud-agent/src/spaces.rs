@@ -345,6 +345,9 @@ enum Ev {
     Pass(Box<Done>),
     /// The wait for a space's session to close ended, for the change asked under this number.
     Closed(u64, Closure),
+    /// The pass thread found that a space's folder leads somewhere else than its session was opened on, and dropped the
+    /// session: the space's generation is raised and saved before its next pass.
+    FolderMoved(SpaceId),
 }
 
 /// How the wait for a space's session to close ended.
@@ -411,19 +414,29 @@ fn pass_thread(
             sessions.retain(|(id, _)| *id != space);
         }
         // The folder may lead somewhere else than when the session opened (a link pointed at another folder): the session's
-        // state is about the old one, so it is dropped and the space starts afresh there, as a first sync.
-        let mut moved = None;
+        // state is about the old one, so it is dropped and the space starts afresh there, as a first sync. The task is told
+        // first, so it raises and saves the space's generation: a state that can't be removed is not trusted again either.
+        // This pass is not run; the next one starts under the new generation.
         if sessions.iter().any(|(id, s)| *id == space && s.folder_moved()) {
             sessions.retain(|(id, _)| *id != space);
             crate::runlog::note(format_args!("the folder of team space {space} leads somewhere else now: starting afresh, nothing is deleted"));
-            if let Err(e) = data.space_dir(space).remove_state() {
-                moved = Some(AgentError::from(e));
+            let removed = data.space_dir(space).remove_state();
+            let _ = events.send(Ev::FolderMoved(space));
+            let why = match removed {
+                Ok(()) => "the folder of this space leads somewhere else now; the next pass starts afresh there".to_owned(),
+                Err(e) => format!(
+                    "the folder of this space leads somewhere else now, and its saved state could not be removed ({e}); the next pass starts afresh there"
+                ),
+            };
+            let done = Done { space, run: job.run, result: Err(AgentError::Usage(why)), last_pass: None, seq: None, recheck_in: None };
+            if events.send(Ev::Pass(Box::new(done))).is_err() {
+                return;
             }
+            continue;
         }
-        let index = match (moved, sessions.iter().position(|(id, _)| *id == space)) {
-            (Some(e), _) => Err(e),
-            (None, Some(index)) => Ok(index),
-            (None, None) => Session::open_team(&data, &account, &job.setting, job.joined_ms, Some(job.stability.clone())).map(|session| {
+        let index = match sessions.iter().position(|(id, _)| *id == space) {
+            Some(index) => Ok(index),
+            None => Session::open_team(&data, &account, &job.setting, job.joined_ms, Some(job.stability.clone())).map(|session| {
                 sessions.push((space, session));
                 sessions.len() - 1
             }),
@@ -899,6 +912,12 @@ impl Manager {
             Ev::Listed(looked) => self.listed(looked),
             Ev::Pass(done) => self.pass_done(*done, now),
             Ev::Closed(id, closed) => self.closed(id, closed),
+            Ev::FolderMoved(space) => {
+                if let Err(e) = self.raise_generation(space) {
+                    crate::runlog::note(format_args!("can't remember that the folder of team space {space} was replaced: {e}"));
+                }
+                self.settled();
+            }
         }
     }
 

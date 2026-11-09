@@ -1690,6 +1690,8 @@ pub struct Session {
     _folder_lock: Lock,
     /// A team space's folder as `state.json` records it (canonical); `None` for the personal space.
     state_folder: Option<PathBuf>,
+    /// The ID of that folder (see [`SavedState::folder_id`]).
+    state_folder_id: Option<u64>,
     /// The folder the session was opened on (a team space's), to notice a link that leads elsewhere later.
     opened_on: Option<crate::disk::FolderIdentity>,
     /// The server's stamp of the account's membership of a team space that `state.json` records (see
@@ -1752,15 +1754,18 @@ impl Session {
         let folder_lock = hold_folder(&account.folder)?;
         // A team space's state is used only for the folder it was made for; otherwise the folder starts afresh (a first sync:
         // what is there and what the server has are merged, and nothing is deleted on either side).
+        // One look at the folder decides both which state is used and what the session later compares the folder with.
+        let opened_on = bound.then(|| crate::disk::folder_identity(&account.folder)).flatten();
         let (mut saved, set_aside) =
-            if bound { data.load_state_for(account.space, &account.folder, joined_ms, generation)? } else { (data.load_state()?, false) };
+            if bound { data.load_state_with(account.space, opened_on.as_ref(), joined_ms, generation)? } else { (data.load_state()?, false) };
         if set_aside {
             crate::runlog::note(format_args!(
                 "the saved state of team space {} was made for another folder, membership or generation: starting afresh, nothing is deleted",
                 account.space
             ));
         }
-        let state_folder = if bound { std::fs::canonicalize(&account.folder).ok() } else { None };
+        let state_folder = opened_on.as_ref().map(|i| i.path.clone());
+        let state_folder_id = opened_on.as_ref().and_then(|i| i.id);
         if saved.state.space.is_some_and(|s| s != account.space) {
             return Err(AgentError::OtherAccountState(data.path().join(crate::account::STATE_FILE)));
         }
@@ -1790,12 +1795,12 @@ impl Session {
                 last_pass,
                 paused: false,
                 folder: checkpoint_folder.clone(),
+                folder_id: state_folder_id,
                 joined_ms,
                 generation,
             };
             checkpoint_data.save_state(&saved).map_err(|e| std::io::Error::other(e.to_string()))
         });
-        let opened_on = bound.then(|| crate::disk::folder_identity(&account.folder)).flatten();
         Ok(Self {
             data: data.clone(),
             root: root_data.clone(),
@@ -1806,6 +1811,7 @@ impl Session {
             _folder_lock: folder_lock,
             opened_on,
             state_folder,
+            state_folder_id,
             joined_ms,
             generation,
             stability,
@@ -1916,6 +1922,7 @@ impl Session {
             last_pass: Some(last),
             paused: false,
             folder: self.state_folder.clone(),
+            folder_id: self.state_folder_id,
             joined_ms: self.joined_ms,
             generation: self.generation,
         };
