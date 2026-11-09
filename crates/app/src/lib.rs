@@ -94,7 +94,7 @@ pub use craft_cloud_api::local::{
 };
 pub use craft_cloud_api::local::{KindUsage, OtherFolders};
 pub use craft_cloud_api::{NodeId, SpaceId, VersionId};
-pub use recents::{RecentsEvent, RecentsWatch};
+pub use recents::{ListAnswer, ListRequest, RecentsEvent, RecentsWatch};
 pub use uuid::Uuid;
 
 /// What went wrong talking to the agent.
@@ -455,6 +455,15 @@ impl Client {
         Ok(self.watch_recents_in(app, space)?.entries())
     }
 
+    /// Several recents lists in one go: one connection, every list asked for at once and collected until all have come or three
+    /// seconds have passed, then closed. Each answer is its list or why there is none; `NotRunning` or `Io` when the agent
+    /// can't be reached at all. Each list asked for is followed by the agent from then on (a recents document per app and space
+    /// that it keeps and syncs), so a first call for many apps and spaces makes it open them. An agent from before team spaces
+    /// answers a team space's request `agent_too_old`.
+    pub fn recents_of(&self, wanted: &[(String, Option<craft_cloud_api::SpaceId>)]) -> Result<Vec<recents::ListAnswer>, Error> {
+        recents::lists(self, wanted)
+    }
+
     /// Adds a file to `app`'s recent files (kept on this machine's disk when this returns; on the others once the agent
     /// reaches the server).
     pub fn add_recent(&self, app: &str, entry: NewRecent) -> Result<RecentEntry, Error> {
@@ -469,7 +478,7 @@ impl Client {
     }
 
     /// [`Client::watch_recents`] for the recent files of a team space that syncs on this computer (an agent from before
-    /// team spaces answers the personal list). An entry added with an absolute path inside the space's synced folder
+    /// team spaces answers the personal list, which is refused as `agent_too_old`, never taken for the space's). An entry added with an absolute path inside the space's synced folder
     /// ([`Client::add_recent`]) goes to this list.
     pub fn watch_recents_in(&self, app: &str, space: craft_cloud_api::SpaceId) -> Result<RecentsWatch, Error> {
         RecentsWatch::open(self, app, Some(space), true)

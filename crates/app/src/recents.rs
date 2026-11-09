@@ -96,6 +96,16 @@ fn send(socket: &mut Socket, request: &RecentsRequest) -> Result<(), Error> {
     socket.send(Message::Text(text.into())).map_err(|e| Error::Io(e.to_string()))
 }
 
+/// The error for a list the agent answered under another space than the one asked for: an agent from before team spaces answers
+/// the personal list to every `subscribe`, whatever its `space`, and that is not the space's list.
+fn wrong_space() -> Error {
+    Error::Refused {
+        code: codes::AGENT_TOO_OLD.into(),
+        message: "the Craft Cloud agent answered another list than the space's: it is too old for team spaces".into(),
+        name_taken: None,
+    }
+}
+
 /// Opens the WebSocket to the agent `client` names; with `follow`, subscribes to `app` and returns the first list.
 fn open(client: &Client, app: &str, space: Option<SpaceId>, follow: bool) -> Result<(Socket, (Vec<RecentEntry>, bool)), Error> {
     let stream = TcpStream::connect_timeout(&client.addr(), CONNECT_TIMEOUT).map_err(|e| Error::NotRunning(format!("can't reach it: {e}")))?;
@@ -123,7 +133,11 @@ fn open(client: &Client, app: &str, space: Option<SpaceId>, follow: bool) -> Res
         let deadline = Instant::now() + OPEN_TIMEOUT;
         loop {
             match read_event(&mut socket)? {
-                Some(Wire::Entries { entries, push_stopped, .. }) => {
+                Some(Wire::Entries { entries, push_stopped, space: echoed, .. }) => {
+                    // A space was asked for: the list must say it is that space's.
+                    if space.is_some() && echoed != space {
+                        return Err(wrong_space());
+                    }
                     first = (entries, push_stopped);
                     break;
                 }
@@ -136,6 +150,78 @@ fn open(client: &Client, app: &str, space: Option<SpaceId>, follow: bool) -> Res
     }
     socket.get_mut().set_read_timeout(Some(POLL)).map_err(|e| Error::Io(e.to_string()))?;
     Ok((socket, first))
+}
+
+/// What [`lists`] is asked for: an app's list of a team space (`Some`) or the personal one.
+pub type ListRequest = (String, Option<SpaceId>);
+/// What [`lists`] answers for each request: the request, and the list or why there is none.
+pub type ListAnswer = (String, Option<SpaceId>, Result<Vec<RecentEntry>, Error>);
+/// One slot per request: its answer once it came.
+type Slots = Vec<Option<Result<Vec<RecentEntry>, Error>>>;
+
+/// Puts what the agent said (a list of `app`, echoing `space`, or an error) at the request it answers: `answers` is one slot per
+/// request in `wanted`. A list answers the request of the same app and space; the personal list that an agent from before team
+/// spaces sends for a team request is that request's [`wrong_space`]. An error names no request, so it is kept in `errors`
+/// until it is known which request it was (see [`settle_errors`]).
+fn place_answer(wanted: &[ListRequest], answers: &mut Slots, errors: &mut Vec<Error>, event: Wire) {
+    let find = |answers: &Slots, wants: &dyn Fn(&ListRequest) -> bool| (0..wanted.len()).find(|&i| answers.get(i).is_some_and(Option::is_none) && wanted.get(i).is_some_and(wants));
+    match event {
+        Wire::Entries { app, entries, space, .. } => {
+            let slot = find(answers, &|(a, s)| *a == app && *s == space);
+            match (slot, space) {
+                (Some(i), _) => answers[i] = Some(Ok(entries)),
+                (None, None) => {
+                    if let Some(i) = find(answers, &|(a, s)| *a == app && s.is_some()) {
+                        answers[i] = Some(Err(wrong_space()));
+                    }
+                }
+                // A list nobody asked for (or one that has come already): nothing to put.
+                (None, Some(_)) => {}
+            }
+        }
+        error @ Wire::Error { .. } => errors.push(refused(error)),
+        Wire::Added { .. } => {}
+    }
+}
+
+/// The errors the agent sent name no request, and its lists come in any order, so which request failed is only known once
+/// every other has its list: when as many requests are open as errors came, the errors belong to them, in the order they were
+/// asked (the agent refuses a `subscribe` before it reads the next).
+fn settle_errors(answers: &mut Slots, errors: &mut Vec<Error>) {
+    let open: Vec<usize> = answers.iter().enumerate().filter(|(_, a)| a.is_none()).map(|(i, _)| i).collect();
+    if !errors.is_empty() && open.len() == errors.len() {
+        for (i, error) in open.into_iter().zip(errors.drain(..)) {
+            answers[i] = Some(Err(error));
+        }
+    }
+}
+
+/// The lists `wanted` over one connection: every `subscribe` is sent at once and the lists are collected as they come, until all
+/// have or [`OPEN_TIMEOUT`] has passed (a list that did not come is an `Io` error), then the connection is closed. An error
+/// that stops the connection itself is the call's; the rest are each list's.
+pub(crate) fn lists(client: &Client, wanted: &[ListRequest]) -> Result<Vec<ListAnswer>, Error> {
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (mut socket, _) = open(client, "", None, false)?;
+    for (app, space) in wanted {
+        send(&mut socket, &RecentsRequest::Subscribe { app: app.clone(), space: *space })?;
+    }
+    let mut answers: Slots = wanted.iter().map(|_| None).collect();
+    let mut errors = Vec::new();
+    let deadline = Instant::now() + OPEN_TIMEOUT;
+    while Instant::now() < deadline && answers.iter().any(Option::is_none) {
+        if let Some(event) = read_event(&mut socket)? {
+            place_answer(wanted, &mut answers, &mut errors, event);
+            settle_errors(&mut answers, &mut errors);
+        }
+    }
+    let _ = socket.close(None);
+    Ok(wanted
+        .iter()
+        .zip(answers)
+        .map(|((app, space), answer)| (app.clone(), *space, answer.unwrap_or_else(|| Err(Error::Io("no list from the agent".into())))))
+        .collect())
 }
 
 /// Whether an error means "no agent to talk to right now" (stopped, restarted elsewhere, signed out), so the watch
@@ -352,6 +438,54 @@ impl Link {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn list(app: &str, space: Option<SpaceId>, path: &str) -> Wire {
+        let entry = RecentEntry { node: None, path: path.into(), title: path.into(), opened_ms: 1, saved_ms: None, machine: "pc".into(), open_now: Vec::new() };
+        Wire::Entries { app: app.into(), entries: vec![entry], push_stopped: false, space }
+    }
+
+    fn path_of(slot: &Option<Result<Vec<RecentEntry>, Error>>) -> Option<String> {
+        slot.as_ref().and_then(|r| r.as_ref().ok()).and_then(|l| l.first()).map(|e| e.path.clone())
+    }
+
+    /// Lists are put at the request of the same app and space, in any order; a list asked for twice is not mixed up.
+    #[test]
+    fn lists_are_put_at_their_app_and_space() {
+        let (a, b) = (SpaceId::generate(), SpaceId::generate());
+        let wanted: Vec<ListRequest> = vec![("wordcraft".into(), None), ("wordcraft".into(), Some(a)), ("wordcraft".into(), Some(b)), ("photocraft".into(), Some(a))];
+        let mut answers: Slots = wanted.iter().map(|_| None).collect();
+        for event in [list("photocraft", Some(a), "p"), list("wordcraft", Some(b), "wb"), list("wordcraft", None, "w"), list("wordcraft", Some(a), "wa")] {
+            place_answer(&wanted, &mut answers, &mut Vec::new(), event);
+        }
+        let paths: Vec<Option<String>> = answers.iter().map(path_of).collect();
+        assert_eq!(paths, [Some("w".into()), Some("wa".into()), Some("wb".into()), Some("p".into())]);
+        // A later push of a list that came already, or of one nobody asked for, changes nothing.
+        place_answer(&wanted, &mut answers, &mut Vec::new(), list("wordcraft", Some(a), "newer"));
+        place_answer(&wanted, &mut answers, &mut Vec::new(), list("soundcraft", Some(a), "x"));
+        assert_eq!(path_of(&answers[1]).as_deref(), Some("wa"));
+    }
+
+    /// An agent from before team spaces answers the personal list to a team request: that is the space's error, never its list.
+    /// The personal list asked for beside it is still the personal one.
+    #[test]
+    fn a_list_under_another_space_is_not_the_spaces_list() {
+        let a = SpaceId::generate();
+        let wanted: Vec<ListRequest> = vec![("wordcraft".into(), None), ("wordcraft".into(), Some(a))];
+        let mut answers: Slots = wanted.iter().map(|_| None).collect();
+        place_answer(&wanted, &mut answers, &mut Vec::new(), list("wordcraft", None, "mine"));
+        place_answer(&wanted, &mut answers, &mut Vec::new(), list("wordcraft", None, "mine"));
+        assert_eq!(path_of(&answers[0]).as_deref(), Some("mine"));
+        assert!(matches!(&answers[1], Some(Err(Error::Refused { code, .. })) if code == codes::AGENT_TOO_OLD), "{:?}", answers[1]);
+        // An error names no request: it waits until as many requests are open as errors came, and then they are those.
+        let (mut errors, mut open): (Vec<Error>, Slots) = (Vec::new(), wanted.iter().map(|_| None).collect());
+        place_answer(&wanted, &mut open, &mut errors, Wire::Error { id: None, code: "not_found".into(), message: "no".into() });
+        settle_errors(&mut open, &mut errors);
+        assert!(open.iter().all(Option::is_none) && errors.len() == 1, "two open, one error: not yet known which");
+        place_answer(&wanted, &mut open, &mut errors, list("wordcraft", None, "mine"));
+        settle_errors(&mut open, &mut errors);
+        assert_eq!(path_of(&open[0]).as_deref(), Some("mine"));
+        assert!(matches!(&open[1], Some(Err(Error::Refused { code, .. })) if code == "not_found") && errors.is_empty());
+    }
 
     /// A list event that says its push stopped: the watch's status follows, and an app hears it once, when it
     /// changes, before the list.
