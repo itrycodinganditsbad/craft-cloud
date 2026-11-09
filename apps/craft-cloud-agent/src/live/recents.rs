@@ -122,7 +122,10 @@ fn read_entry(value: &ValueOrContainer) -> Option<RecentEntry> {
         ValueOrContainer::Value(LoroValue::String(json)) if json.len() <= MAX_ENTRY_JSON => {
             // Who has a file open is the agent's own word when it hands a list out, never what a document holds (another
             // machine's, a hostile device's, or an older write of this one's).
-            serde_json::from_str::<RecentEntry>(json.as_str()).ok().filter(|e| check_entry(e).is_ok()).map(|e| RecentEntry { open_now: Vec::new(), ..e })
+            serde_json::from_str::<RecentEntry>(json.as_str())
+                .ok()
+                .filter(|e| check_entry(e).is_ok())
+                .map(|e| RecentEntry { open_now: Vec::new(), ..e })
         }
         _ => None,
     }
@@ -238,7 +241,8 @@ impl Recents {
             return Err(UpdateError::Newer(version));
         }
         // Never written: who has the file open is not part of the shared list.
-        let json = serde_json::to_string(&RecentEntry { open_now: Vec::new(), ..entry.clone() }).map_err(|e| UpdateError::Malformed(e.to_string()))?;
+        let json =
+            serde_json::to_string(&RecentEntry { open_now: Vec::new(), ..entry.clone() }).map_err(|e| UpdateError::Malformed(e.to_string()))?;
         self.guard(|doc| {
             let before = doc.oplog_vv();
             let fail = |e: loro::LoroError| UpdateError::Malformed(e.to_string());

@@ -2634,12 +2634,8 @@ async fn several_recents_lists_come_over_one_connection() {
     t.ana.api(move |c| c.add_recent("wordcraft", NewRecent { path, title: Some("Team plan".into()), saved: false })).await.unwrap();
     t.ana.api(|c| c.add_recent("wordcraft", NewRecent { path: "personal.txt".into(), title: Some("Mine".into()), saved: false })).await.unwrap();
     let other = SpaceId::generate();
-    let wanted: Vec<(String, Option<SpaceId>)> = vec![
-        ("wordcraft".into(), None),
-        ("wordcraft".into(), Some(space)),
-        ("photocraft".into(), Some(space)),
-        ("wordcraft".into(), Some(other)),
-    ];
+    let wanted: Vec<(String, Option<SpaceId>)> =
+        vec![("wordcraft".into(), None), ("wordcraft".into(), Some(space)), ("photocraft".into(), Some(space)), ("wordcraft".into(), Some(other))];
     let answers = t.ana.api(move |c| c.recents_of(&wanted)).await.unwrap();
     assert_eq!(answers.len(), 4);
     let list = |i: usize| answers[i].2.as_ref().map(|l| l.iter().map(|e| e.title.clone()).collect::<Vec<_>>());

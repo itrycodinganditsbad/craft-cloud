@@ -164,7 +164,9 @@ type Slots = Vec<Option<Result<Vec<RecentEntry>, Error>>>;
 /// spaces sends for a team request is that request's [`wrong_space`]. An error names no request, so it is kept in `errors`
 /// until it is known which request it was (see [`settle_errors`]).
 fn place_answer(wanted: &[ListRequest], answers: &mut Slots, errors: &mut Vec<Error>, event: Wire) {
-    let find = |answers: &Slots, wants: &dyn Fn(&ListRequest) -> bool| (0..wanted.len()).find(|&i| answers.get(i).is_some_and(Option::is_none) && wanted.get(i).is_some_and(wants));
+    let find = |answers: &Slots, wants: &dyn Fn(&ListRequest) -> bool| {
+        (0..wanted.len()).find(|&i| answers.get(i).is_some_and(Option::is_none) && wanted.get(i).is_some_and(wants))
+    };
     match event {
         Wire::Entries { app, entries, space, .. } => {
             let slot = find(answers, &|(a, s)| *a == app && *s == space);
@@ -440,7 +442,15 @@ mod tests {
     use super::*;
 
     fn list(app: &str, space: Option<SpaceId>, path: &str) -> Wire {
-        let entry = RecentEntry { node: None, path: path.into(), title: path.into(), opened_ms: 1, saved_ms: None, machine: "pc".into(), open_now: Vec::new() };
+        let entry = RecentEntry {
+            node: None,
+            path: path.into(),
+            title: path.into(),
+            opened_ms: 1,
+            saved_ms: None,
+            machine: "pc".into(),
+            open_now: Vec::new(),
+        };
         Wire::Entries { app: app.into(), entries: vec![entry], push_stopped: false, space }
     }
 
@@ -452,9 +462,12 @@ mod tests {
     #[test]
     fn lists_are_put_at_their_app_and_space() {
         let (a, b) = (SpaceId::generate(), SpaceId::generate());
-        let wanted: Vec<ListRequest> = vec![("wordcraft".into(), None), ("wordcraft".into(), Some(a)), ("wordcraft".into(), Some(b)), ("photocraft".into(), Some(a))];
+        let wanted: Vec<ListRequest> =
+            vec![("wordcraft".into(), None), ("wordcraft".into(), Some(a)), ("wordcraft".into(), Some(b)), ("photocraft".into(), Some(a))];
         let mut answers: Slots = wanted.iter().map(|_| None).collect();
-        for event in [list("photocraft", Some(a), "p"), list("wordcraft", Some(b), "wb"), list("wordcraft", None, "w"), list("wordcraft", Some(a), "wa")] {
+        for event in
+            [list("photocraft", Some(a), "p"), list("wordcraft", Some(b), "wb"), list("wordcraft", None, "w"), list("wordcraft", Some(a), "wa")]
+        {
             place_answer(&wanted, &mut answers, &mut Vec::new(), event);
         }
         let paths: Vec<Option<String>> = answers.iter().map(path_of).collect();

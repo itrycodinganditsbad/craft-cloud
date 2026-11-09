@@ -633,7 +633,9 @@ fn recent_files(agent: &dyn Agent, root: Option<&std::path::Path>) -> Result<Vec
     let teams: Vec<crate::files::FileSpace> = spaces
         .into_iter()
         .filter(|info| info.kind == "team" && info.state == "active" && info.sync == craft_cloud_app::SpaceSync::On)
-        .filter_map(|info| Some(crate::files::FileSpace { id: info.space, name: info.name.clone().unwrap_or_default(), folder: info.folder.clone()? }))
+        .filter_map(|info| {
+            Some(crate::files::FileSpace { id: info.space, name: info.name.clone().unwrap_or_default(), folder: info.folder.clone()? })
+        })
         .collect();
     let mut wanted: Vec<(String, Option<SpaceId>)> = crate::files::APPS.iter().map(|(app, _)| ((*app).to_owned(), None)).collect();
     for team in &teams {
@@ -1441,8 +1443,12 @@ pub(crate) mod fake {
                 .iter()
                 .map(|(app, space)| {
                     let list = match space {
-                        None if self.recents_refused.lock().unwrap().iter().any(|a| a == app) => Err(refused("quota_exceeded", "this list can't be followed")),
-                        None => Ok(self.recent_files.lock().unwrap().iter().find(|(a, _)| a == app).map(|(_, list)| list.clone()).unwrap_or_default()),
+                        None if self.recents_refused.lock().unwrap().iter().any(|a| a == app) => {
+                            Err(refused("quota_exceeded", "this list can't be followed"))
+                        }
+                        None => {
+                            Ok(self.recent_files.lock().unwrap().iter().find(|(a, _)| a == app).map(|(_, list)| list.clone()).unwrap_or_default())
+                        }
                         Some(space) => Ok(self
                             .team
                             .lock()
@@ -1856,7 +1862,11 @@ mod tests {
         settle(&mut model, &agent, again);
         let Screen::Files(files) = &model.screen else { panic!("{:?}", model.screen) };
         assert!(files.error.is_some(), "{files:?}");
-        assert_eq!(agent.asked.lock().unwrap().iter().filter(|a| *a == "recents").count(), 1, "one call, and nothing else is asked of the lists once the agent is gone");
+        assert_eq!(
+            agent.asked.lock().unwrap().iter().filter(|a| *a == "recents").count(),
+            1,
+            "one call, and nothing else is asked of the lists once the agent is gone"
+        );
     }
 
     /// The recent files of each team space that syncs here come with the personal ones, each with who has it open and placed
