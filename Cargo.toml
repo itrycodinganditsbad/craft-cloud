@@ -63,6 +63,11 @@ toml = "1.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 bytes = "1.10"
+# The SFTP blob store and backup (feature `sftp` of `craft-cloud-store`): an SSH client and the SFTP protocol on top of
+# it, both pure Rust and Apache-2.0. No default features: no RSA keys (the `rsa` crate has an unfixed timing leak), no
+# compression; the crypto comes from aws-lc-rs, which rustls already brings.
+russh = { version = "0.65.1", default-features = false, features = ["aws-lc-rs"] }
+russh-sftp = "3.0.1"
 object_store = { version = "0.14.2", default-features = false, features = ["aws", "ring"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "any", "sqlite", "postgres"] }
 tempfile = "3.20"

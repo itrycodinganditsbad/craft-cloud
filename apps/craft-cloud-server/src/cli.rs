@@ -168,6 +168,53 @@ pub enum Command {
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
+    /// Copy the database and the blob store to an SFTP server: a consistent dump of the SQLite database, and every blob the
+    /// server there does not have yet (blobs never change, so a repeated backup sends only what is new), then a manifest.
+    /// Safe while the server runs. The server's host key must be pinned (`--host-key` or `--known-hosts`); the sign-in is by
+    /// key. The config file and the two-factor key are not copied: keep them apart. Postgres is dumped with `pg_dump`.
+    Backup {
+        /// Path to config.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Where to: sftp://user@host[:port]/directory (/~/directory for one in the account's home). Or `[backup] to`.
+        #[arg(long)]
+        to: Option<String>,
+        /// The private key to sign in with (Ed25519 or ECDSA). Or `[backup] key_file`, or CRAFT_CLOUD_SFTP_KEY_FILE.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// The server's host key: a SHA256: fingerprint or a public key line. Or `[backup] host_key`.
+        #[arg(long)]
+        host_key: Option<String>,
+        /// A known_hosts file to take the server's host key from. Or `[backup] known_hosts`.
+        #[arg(long)]
+        known_hosts: Option<PathBuf>,
+        /// Database generations kept on the backup server (default 7). The blobs are never removed.
+        #[arg(long)]
+        keep: Option<u32>,
+        /// Where the database dump is made before it is sent (default: the system's temporary directory). Needs room for the database.
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
+    },
+    /// Rebuild a data directory from a backup on an SFTP server: the newest complete generation (or `--generation`), checked
+    /// against its manifest. The directory must be empty or missing. Writes `meta.db` and `blobs/`; the config file and the
+    /// two-factor key come from where you kept them. Run `verify` and `reset-epoch --all` before starting the server.
+    Restore {
+        /// Where from: sftp://user@host[:port]/directory.
+        #[arg(long)]
+        from: String,
+        /// The data directory to fill.
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        #[arg(long)]
+        host_key: Option<String>,
+        #[arg(long)]
+        known_hosts: Option<PathBuf>,
+        /// A generation's stamp (like 20261107T031500Z) instead of the newest.
+        #[arg(long)]
+        generation: Option<String>,
+    },
     /// Look at and tune how blobs are stored: recompress them at a higher level, estimate what that would save.
     Store {
         /// Path to config.toml. May come before or after the action.
@@ -295,6 +342,14 @@ pub enum StoreAction {
     },
     /// Fill in the stored size of blobs written before sizes were tracked. Reads no object content on disk or S3.
     Measure,
+    /// SFTP storage only: remove the temporary files of uploads that were cut off (a killed server, a connection lost for
+    /// good) that are older than a day. The store's listing hides them, so nothing else ever finds them; a finished or a
+    /// running upload is never touched. Walks every shard directory, so on a big store it takes a while.
+    CleanTemp {
+        /// Only files made more than this many hours ago (at least 1).
+        #[arg(long, default_value_t = 24)]
+        older_than_hours: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -385,15 +440,22 @@ pub enum CliError {
     Io(#[from] std::io::Error),
 }
 
-/// Opens the database and blob storage a config names.
-pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
-    let meta = Meta::open(&config.database.url)
+/// Opens the database a config names, and nothing else: for the commands that never touch a blob. A server whose blobs
+/// are on another machine would otherwise have to reach it to add a user.
+pub async fn open_meta(config: &Config) -> Result<Meta, CliError> {
+    Ok(Meta::open(&config.database.url)
         .await?
         .with_stored_bytes_cap(config.stored_bytes_per_user)
         .with_live_bytes_cap(config.live_bytes_per_user)
         .with_team_live_bytes_cap(config.spaces.team_live_bytes)
-        .with_audit_retention_days(config.audit.retention_days);
+        .with_audit_retention_days(config.audit.retention_days))
+}
+
+/// Opens the database and blob storage a config names.
+pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
+    let meta = open_meta(config).await?;
     let store = match (&config.storage, config.storage.s3()?) {
+        (StorageConfig::Sftp { .. }, _) => sftp_store(config, true).await?,
         (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
         (StorageConfig::Disk { path, .. }, None) => Store::new(DiskBackend::new(path)?),
         (StorageConfig::S3 { .. }, None) => return Err(CliError::Usage("S3 storage without settings".into())),
@@ -406,6 +468,7 @@ pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
 pub async fn open_existing(config: &Config) -> Result<(Meta, Store), CliError> {
     let meta = Meta::open_existing(&config.database.url).await?;
     let store = match (&config.storage, config.storage.s3()?) {
+        (StorageConfig::Sftp { .. }, _) => sftp_store(config, false).await?,
         (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
         (StorageConfig::Disk { path, .. }, None) => {
             if !path.is_dir() {
@@ -418,8 +481,53 @@ pub async fn open_existing(config: &Config) -> Result<(Meta, Store), CliError> {
     Ok((meta, tuned(store, config)))
 }
 
+/// The blob store on an SFTP server. `create` makes the root directory when it is missing (the server's own start and the
+/// commands that write); the read-only commands pass `false`. Refuses a host key that is not the pinned one, a server
+/// without `posix-rename@openssh.com` and a key it does not accept, with a message that says so.
+#[cfg(feature = "sftp")]
+async fn sftp_store(config: &Config, create: bool) -> Result<Store, CliError> {
+    use craft_cloud_store::sftp::SftpBackend;
+    let settings = config.sftp_storage()?.ok_or_else(|| CliError::Usage("SFTP storage without settings".into()))?;
+    let backend = if create { SftpBackend::connect(&settings).await? } else { SftpBackend::connect_existing(&settings).await? };
+    Ok(Store::new(backend))
+}
+
+#[cfg(not(feature = "sftp"))]
+fn no_sftp() -> CliError {
+    CliError::Usage("this build of the server has no SFTP support; build it with --features sftp".into())
+}
+
+#[cfg(not(feature = "sftp"))]
+async fn sftp_store(_config: &Config, _create: bool) -> Result<Store, CliError> {
+    Err(CliError::Usage("this build of the server has no SFTP support (storage.kind = \"sftp\"); build it with --features sftp".into()))
+}
+
+/// `store clean-temp`: the stale temporary files of an SFTP store.
+#[cfg(feature = "sftp")]
+async fn clean_temp(config: &Config, older_than_hours: u64, out: &mut impl Write) -> Result<(), CliError> {
+    use craft_cloud_store::sftp::SftpBackend;
+    if older_than_hours == 0 {
+        return Err(CliError::Usage("--older-than-hours must be at least 1".into()));
+    }
+    let settings =
+        config.sftp_storage()?.ok_or_else(|| CliError::Usage("clean-temp is for storage.kind = \"sftp\"; a disk store removes its own".into()))?;
+    let backend = SftpBackend::connect_existing(&settings).await?;
+    let age = std::time::Duration::from_secs(older_than_hours.saturating_mul(3600));
+    let mut removed = 0u64;
+    for prefix in ["chunks", "manifests"] {
+        removed = removed.saturating_add(backend.remove_stale_temp(prefix, age).await?);
+    }
+    writeln!(out, "removed {removed} temporary file(s) older than {older_than_hours} hour(s)")?;
+    Ok(())
+}
+
+#[cfg(not(feature = "sftp"))]
+async fn clean_temp(_config: &Config, _older_than_hours: u64, _out: &mut impl Write) -> Result<(), CliError> {
+    Err(no_sftp())
+}
+
 /// The store with the config's compression settings.
-fn tuned(store: Store, config: &Config) -> Store {
+pub(crate) fn tuned(store: Store, config: &Config) -> Store {
     store
         .with_compression(config.storage.compression().into())
         .with_level(config.storage.compression_level())
@@ -534,7 +642,7 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
         }
         Command::User { config, action } => {
             let config = Config::load(&config_path(config)?)?;
-            let (meta, _) = open(&config).await?;
+            let meta = open_meta(&config).await?;
             match action {
                 UserAction::Invite { username, revoke: true } => {
                     if !meta.revoke_invite(&username).await? {
@@ -572,7 +680,7 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
             Ok(())
         }
         Command::Device { config, action } => {
-            let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
+            let meta = open_meta(&Config::load(&config_path(config)?)?).await?;
             match action {
                 DeviceAction::List { username } => {
                     let user = user_id(&meta, &username).await?;
@@ -596,20 +704,20 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
         }
         Command::Audit { config, action } => {
             let config = Config::load(&config_path(config)?)?;
-            let (meta, _) = open(&config).await?;
+            let meta = open_meta(&config).await?;
             audit(&meta, &config, action, out).await
         }
         Command::WebSessions { config, action } => {
             let config = Config::load(&config_path(config)?)?;
-            let (meta, _) = open(&config).await?;
+            let meta = open_meta(&config).await?;
             web_sessions(&meta, &config, action, out).await
         }
         Command::Space { config, action } => {
-            let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
+            let meta = open_meta(&Config::load(&config_path(config)?)?).await?;
             space_command(&meta, action, out).await
         }
         Command::ResetEpoch { config, username, all, space } => {
-            let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
+            let meta = open_meta(&Config::load(&config_path(config)?)?).await?;
             if let Some(space) = space {
                 let epoch = meta.reset_epoch(space).await?;
                 writeln!(out, "new epoch {epoch} for space {space}")?;
@@ -630,7 +738,7 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
         }
         Command::TwoFactor { config, action: TwoFactorAction::Rekey } => {
             let config = Config::load(&config_path(config)?)?;
-            let (meta, _) = open(&config).await?;
+            let meta = open_meta(&config).await?;
             let keys = crate::two_factor::load_keys(&config).map_err(|e| CliError::Usage(e.to_string()))?;
             let crate::two_factor::KeyState::Loaded(secret_box) = keys else {
                 return Err(CliError::Usage(
@@ -692,10 +800,39 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                 Err(CliError::Inconsistent(format!("{} manifest(s) could not be indexed", report.unreadable.len())))
             }
         }
+        Command::Backup { config, to, key_file, host_key, known_hosts, keep, work_dir } => {
+            #[cfg(feature = "sftp")]
+            {
+                let config = Config::load(&config_path(config)?)?;
+                let options = crate::backup::RemoteOptions { url: to, key_file, host_key, known_hosts };
+                crate::backup::backup(&config, &options, keep, work_dir.as_deref(), out).await
+            }
+            #[cfg(not(feature = "sftp"))]
+            {
+                let _ = (config, to, key_file, host_key, known_hosts, keep, work_dir);
+                Err(no_sftp())
+            }
+        }
+        Command::Restore { from, dir, key_file, host_key, known_hosts, generation } => {
+            #[cfg(feature = "sftp")]
+            {
+                let options = crate::backup::RemoteOptions { url: Some(from), key_file, host_key, known_hosts };
+                crate::backup::restore(&options, &dir, generation.as_deref(), out).await
+            }
+            #[cfg(not(feature = "sftp"))]
+            {
+                let _ = (from, dir, key_file, host_key, known_hosts, generation);
+                Err(no_sftp())
+            }
+        }
         Command::Store { config, action } => {
             let config = Config::load(&config_path(config)?)?;
+            if let StoreAction::CleanTemp { older_than_hours } = action {
+                return clean_temp(&config, older_than_hours, out).await;
+            }
             let (meta, store) = open(&config).await?;
             match action {
+                StoreAction::CleanTemp { .. } => {}
                 StoreAction::Recompress { level, dry_run, limit_bytes } => {
                     if config.storage.compression() == crate::config::Compression::None {
                         return Err(CliError::Usage(
@@ -730,7 +867,7 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
             Ok(())
         }
         Command::Live { config, action: LiveAction::ResetDoc { username, app, space, force } } => {
-            let (meta, _) = open(&Config::load(&config_path(config)?)?).await?;
+            let meta = open_meta(&Config::load(&config_path(config)?)?).await?;
             let user = user_id(&meta, &username).await?;
             // The user's own space, or the team space `--space` names (which the user must be able to read).
             let audited = space.is_some();
@@ -993,19 +1130,19 @@ async fn create_files(dir: &Path, config_text: &str, config: &Config, admin: &st
 
 /// Sets the file mode on Unix; other platforms have no equivalent here.
 #[cfg(unix)]
-fn restrict(path: &Path, mode: u32) -> Result<(), CliError> {
+pub(crate) fn restrict(path: &Path, mode: u32) -> Result<(), CliError> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn restrict(_path: &Path, _mode: u32) -> Result<(), CliError> {
+pub(crate) fn restrict(_path: &Path, _mode: u32) -> Result<(), CliError> {
     Ok(())
 }
 
 /// Creates the directory (owner-only on Unix). Missing parents are created with the default mode.
-fn create_data_dir(dir: &Path) -> Result<(), CliError> {
+pub(crate) fn create_data_dir(dir: &Path) -> Result<(), CliError> {
     if dir.exists() {
         // An empty directory the admin made keeps whatever mode they gave it; the data inside is private.
         restrict(dir, 0o700)?;
@@ -1065,7 +1202,7 @@ fn write_key_file(path: &Path) -> Result<(), CliError> {
 
 /// Removes what a failed `init` made. The directory was empty (or absent) when `init` started, so
 /// everything in it is `init`'s. Best effort: the original error is what the admin needs to see.
-fn remove_made(dir: &Path, created_dir: bool) {
+pub(crate) fn remove_made(dir: &Path, created_dir: bool) {
     for name in ["config.toml", KEY_FILE_NAME, "meta.db", "meta.db-wal", "meta.db-shm"] {
         let _ = std::fs::remove_file(dir.join(name));
     }

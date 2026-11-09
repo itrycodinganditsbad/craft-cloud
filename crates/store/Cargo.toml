@@ -1,11 +1,15 @@
 [package]
 name = "craft-cloud-store"
-description = "Craft Cloud blob storage for chunks and manifests: local disk, S3-compatible, or memory"
+description = "Craft Cloud blob storage for chunks and manifests: local disk, S3-compatible, SFTP, or memory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
+
+[features]
+# The SFTP backend (`sftp.rs`), for a blob store on a file server the operator rents or owns.
+sftp = ["dep:russh", "dep:russh-sftp"]
 
 [dependencies]
 async-trait.workspace = true
@@ -14,6 +18,8 @@ bytes.workspace = true
 craft-cloud-proto.workspace = true
 futures-util.workspace = true
 object_store.workspace = true
+russh = { workspace = true, optional = true }
+russh-sftp = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true

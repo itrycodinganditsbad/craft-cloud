@@ -31,9 +31,15 @@
 //! # kind = "s3", bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http, capacity
 //! # refuse_when_full = true     # refuse new uploads when the disk is down to min_free, or the store holds `capacity` (default off)
 //! # min_free = "1 GiB"          # disk only, with refuse_when_full: the free space to keep (default 1 GiB)
+//! # kind = "sftp", sftp_host, sftp_port, sftp_user, sftp_root, sftp_key_file, sftp_key_passphrase, sftp_host_key or
+//! #   sftp_known_hosts (one of them is required), sftp_connections, sftp_timeout_secs, sftp_retries, capacity
 //! # compression = "zstd"   # or "none": store blobs plain (what a server before compression can read)
 //! # compression_level = 3       # zstd level of new writes, 1 to 19 (an admin can change it while the server runs)
 //! # compression_min_saving = 5  # keep a compressed blob only when it is at least this many percent smaller (1 to 50)
+//!
+//! # [backup]                    # defaults for `backup` and `restore`; see docs/server.md
+//! # to = "sftp://backup@files.example.org/craft-cloud"
+//! # key_file = "backup-key", host_key = "SHA256:…" (or known_hosts), keep = 7
 //!
 //! [two_factor]                  # optional: without it, two-factor sign-in can't be set up
 //! key_file = "two-factor.key"   # 32 random bytes, made by `init`; relative to this file
@@ -83,6 +89,10 @@ pub enum ConfigError {
     PublicUrl(String),
     #[error("storage.{0} is missing (set it in the config or the {1} environment variable)")]
     MissingS3Credential(&'static str, &'static str),
+    #[error("storage.{0} is missing (set it in the config or the {1} environment variable)")]
+    MissingSftpSetting(&'static str, &'static str),
+    #[error("{0}")]
+    Sftp(String),
     #[error("audit.retention_days = {0} is out of range: keep security events for {1} to {2} days")]
     AuditRetention(u32, u32, u32),
     #[error(
@@ -114,6 +124,11 @@ pub const MIN_TRASH_DAYS: u32 = 1;
 pub const MAX_TRASH_DAYS: u32 = 3650;
 /// Days in the trash when `retention.trash_days` is not set.
 pub const DEFAULT_TRASH_DAYS: u32 = 30;
+
+/// The limits of the SFTP settings (the store crate checks them again when it connects).
+const SFTP_MAX_CONNECTIONS: usize = 16;
+const SFTP_MAX_TIMEOUT_SECS: u64 = 300;
+const SFTP_MAX_RETRIES: u32 = 8;
 
 /// `[retention]`: how long things are kept. Only the trash today; nothing is removed by it yet.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -182,6 +197,9 @@ pub struct Config {
     /// or a restore without the key, would otherwise seal secrets nobody can open.
     #[serde(default)]
     pub two_factor: Option<TwoFactorConfig>,
+    /// Defaults for the `backup` command (and, with `--to`, a place to keep the key and host key).
+    #[serde(default)]
+    pub backup: Option<BackupConfig>,
     /// The directory the config file is in, which `key_file` paths are relative to. Set by [`Config::load`], never read
     /// from the file.
     #[serde(skip)]
@@ -365,6 +383,72 @@ pub enum StorageConfig {
         #[serde(default)]
         compression_min_saving: MinSaving,
     },
+    /// Blobs on a file server reached over SFTP (needs the `sftp` feature, on in the default build).
+    Sftp {
+        /// How much the remote directory may hold, for the admin's storage overview. SFTP has no portable free-space
+        /// query, so unset: none is shown.
+        #[serde(default)]
+        capacity: Option<Capacity>,
+        sftp_host: String,
+        #[serde(default = "default_sftp_port")]
+        sftp_port: u16,
+        sftp_user: String,
+        /// The directory that belongs to Craft Cloud: absolute, or relative to the account's home directory.
+        sftp_root: String,
+        /// The private key (Ed25519 or ECDSA). A relative path is relative to the directory of `config.toml`. Unset:
+        /// the `CRAFT_CLOUD_SFTP_KEY_FILE` environment variable.
+        #[serde(default)]
+        sftp_key_file: Option<PathBuf>,
+        /// The key's passphrase, if it has one. Unset: the `CRAFT_CLOUD_SFTP_KEY_PASSPHRASE` environment variable, if set.
+        #[serde(default)]
+        sftp_key_passphrase: Option<Secret>,
+        /// The server's host key: a `SHA256:…` fingerprint or a public key line. The connection is refused when the
+        /// server presents another key; there is no mode without a pinned key.
+        #[serde(default)]
+        sftp_host_key: Option<String>,
+        /// A `known_hosts` file whose entries for the host are pinned. A relative path is relative to `config.toml`.
+        #[serde(default)]
+        sftp_known_hosts: Option<PathBuf>,
+        /// Connections open at once, 1 to 16 (default 4).
+        #[serde(default)]
+        sftp_connections: Option<usize>,
+        /// Seconds a connect or a request may take, 1 to 300 (default 30).
+        #[serde(default)]
+        sftp_timeout_secs: Option<u64>,
+        /// Retries of a request that failed for a reason that may pass, 0 to 8 (default 3).
+        #[serde(default)]
+        sftp_retries: Option<u32>,
+        #[serde(default)]
+        compression: Compression,
+        #[serde(default)]
+        compression_level: CompressionLevel,
+        #[serde(default)]
+        compression_min_saving: MinSaving,
+    },
+}
+
+fn default_sftp_port() -> u16 {
+    22
+}
+
+/// `[backup]`: where `backup` copies the server to and how it signs in. Every key can also be given on the command line.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupConfig {
+    /// `sftp://user@host[:port]/directory` (`/~/directory` for one in the account's home).
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
+    #[serde(default)]
+    pub key_passphrase: Option<Secret>,
+    #[serde(default)]
+    pub host_key: Option<String>,
+    #[serde(default)]
+    pub known_hosts: Option<PathBuf>,
+    /// How many database generations stay on the backup server (default 7).
+    #[serde(default)]
+    pub keep: Option<u32>,
 }
 
 /// A size in bytes written as `"1 TiB"`: a whole number or one with one decimal, then B, KB, MB, GB, TB (powers of 1000)
@@ -562,6 +646,53 @@ impl Config {
         }
     }
 
+    /// The SFTP settings of `storage.kind = "sftp"`, with the key from the config or the environment
+    /// (`CRAFT_CLOUD_SFTP_KEY_FILE`, `CRAFT_CLOUD_SFTP_KEY_PASSPHRASE`). `None` for another kind of storage.
+    #[cfg(feature = "sftp")]
+    pub fn sftp_storage(&self) -> Result<Option<craft_cloud_store::sftp::SftpConfig>, ConfigError> {
+        use craft_cloud_store::sftp::{DEFAULT_CONNECTIONS, DEFAULT_RETRIES, DEFAULT_TIMEOUT_SECS, SftpConfig};
+        let StorageConfig::Sftp {
+            sftp_host,
+            sftp_port,
+            sftp_user,
+            sftp_root,
+            sftp_key_file,
+            sftp_key_passphrase,
+            sftp_host_key,
+            sftp_known_hosts,
+            sftp_connections,
+            sftp_timeout_secs,
+            sftp_retries,
+            ..
+        } = &self.storage
+        else {
+            return Ok(None);
+        };
+        let key_file = match sftp_key_file {
+            Some(path) => self.key_path(path),
+            None => PathBuf::from(
+                std::env::var_os("CRAFT_CLOUD_SFTP_KEY_FILE").ok_or(ConfigError::MissingSftpSetting("sftp_key_file", "CRAFT_CLOUD_SFTP_KEY_FILE"))?,
+            ),
+        };
+        let key_passphrase = match sftp_key_passphrase {
+            Some(secret) => Some(secret.0.clone()),
+            None => std::env::var("CRAFT_CLOUD_SFTP_KEY_PASSPHRASE").ok(),
+        };
+        Ok(Some(SftpConfig {
+            host: sftp_host.clone(),
+            port: *sftp_port,
+            user: sftp_user.clone(),
+            root: sftp_root.clone(),
+            key_file,
+            key_passphrase,
+            host_key: sftp_host_key.clone(),
+            known_hosts: sftp_known_hosts.as_ref().map(|path| self.key_path(path)),
+            connections: sftp_connections.unwrap_or(DEFAULT_CONNECTIONS),
+            timeout: std::time::Duration::from_secs(sftp_timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS)),
+            retries: sftp_retries.unwrap_or(DEFAULT_RETRIES),
+        }))
+    }
+
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let config: Config = toml::from_str(text).map_err(|e| ConfigError::Parse(describe_toml_error(text, &e)))?;
         if !config.behind_proxy && !config.listen.ip().is_loopback() {
@@ -604,6 +735,7 @@ impl Config {
             StorageConfig::S3 { refuse_when_full: true, capacity: None, .. } => return Err(ConfigError::RefuseOnS3WithoutCapacity),
             _ => {}
         }
+        config.storage.check_sftp()?;
         let mut config = config;
         if let Some(url) = &config.public_url {
             config.public_url = Some(public_url(url)?);
@@ -649,7 +781,7 @@ impl StorageConfig {
     /// The size the config says the store may hold, in bytes.
     pub fn capacity(&self) -> Option<u64> {
         match self {
-            StorageConfig::Disk { capacity, .. } | StorageConfig::S3 { capacity, .. } => capacity.map(|c| c.0),
+            StorageConfig::Disk { capacity, .. } | StorageConfig::S3 { capacity, .. } | StorageConfig::Sftp { capacity, .. } => capacity.map(|c| c.0),
         }
     }
 
@@ -669,22 +801,63 @@ impl StorageConfig {
     /// How blobs are written, whichever backend holds them.
     pub fn compression(&self) -> Compression {
         match self {
-            StorageConfig::Disk { compression, .. } | StorageConfig::S3 { compression, .. } => *compression,
+            StorageConfig::Disk { compression, .. } | StorageConfig::S3 { compression, .. } | StorageConfig::Sftp { compression, .. } => *compression,
         }
     }
 
     /// The zstd level new writes use unless an admin changed it while the server runs.
     pub fn compression_level(&self) -> u8 {
         match self {
-            StorageConfig::Disk { compression_level, .. } | StorageConfig::S3 { compression_level, .. } => compression_level.0,
+            StorageConfig::Disk { compression_level, .. }
+            | StorageConfig::S3 { compression_level, .. }
+            | StorageConfig::Sftp { compression_level, .. } => compression_level.0,
         }
     }
 
     /// How much smaller (percent) a compressed blob must be to be kept.
     pub fn compression_min_saving(&self) -> u8 {
         match self {
-            StorageConfig::Disk { compression_min_saving, .. } | StorageConfig::S3 { compression_min_saving, .. } => compression_min_saving.0,
+            StorageConfig::Disk { compression_min_saving, .. }
+            | StorageConfig::S3 { compression_min_saving, .. }
+            | StorageConfig::Sftp { compression_min_saving, .. } => compression_min_saving.0,
         }
+    }
+
+    /// The SFTP settings are in range and name a host key to pin. A missing key file is found when the store opens, since
+    /// the environment may supply it.
+    fn check_sftp(&self) -> Result<(), ConfigError> {
+        let StorageConfig::Sftp { sftp_host, sftp_user, sftp_host_key, sftp_known_hosts, sftp_connections, sftp_timeout_secs, sftp_retries, .. } =
+            self
+        else {
+            return Ok(());
+        };
+        let refuse = |message: String| Err(ConfigError::Sftp(message));
+        if sftp_host.trim().is_empty() || sftp_user.trim().is_empty() {
+            return refuse("storage.sftp_host and storage.sftp_user must not be empty".into());
+        }
+        if sftp_host_key.is_none() && sftp_known_hosts.is_none() {
+            return refuse(
+                "storage.kind = \"sftp\" needs a pinned host key: set sftp_host_key (a SHA256: fingerprint or a public key line) or sftp_known_hosts. \
+                 There is no mode that connects without checking the server"
+                    .into(),
+            );
+        }
+        if let Some(n) = sftp_connections
+            && !(1..=SFTP_MAX_CONNECTIONS).contains(n)
+        {
+            return refuse(format!("storage.sftp_connections = {n} is out of range: 1 to {SFTP_MAX_CONNECTIONS}"));
+        }
+        if let Some(n) = sftp_timeout_secs
+            && !(1..=SFTP_MAX_TIMEOUT_SECS).contains(n)
+        {
+            return refuse(format!("storage.sftp_timeout_secs = {n} is out of range: 1 to {SFTP_MAX_TIMEOUT_SECS}"));
+        }
+        if let Some(n) = sftp_retries
+            && *n > SFTP_MAX_RETRIES
+        {
+            return refuse(format!("storage.sftp_retries = {n} is out of range: 0 to {SFTP_MAX_RETRIES}"));
+        }
+        Ok(())
     }
 
     /// The S3 settings, with credentials from the config or else the standard `AWS_ACCESS_KEY_ID` /
@@ -1145,6 +1318,74 @@ secret_access_key = "very-secret-value"
         assert!(shown.contains("postgres://<redacted>@db/cc"));
         let s3 = c.storage.s3().unwrap().unwrap();
         assert_eq!((s3.bucket.as_str(), s3.region.as_str(), s3.secret_access_key.as_str()), ("blobs", "us-east-1", "very-secret-value"));
+    }
+
+    const SFTP: &str = r#"
+listen = "127.0.0.1:8080"
+[database]
+url = "sqlite:/tmp/meta.db"
+[storage]
+kind = "sftp"
+sftp_host = "files.example.org"
+sftp_user = "craft"
+sftp_root = "/craft/blobs"
+sftp_host_key = "SHA256:abc"
+"#;
+
+    #[test]
+    fn sftp_storage_needs_a_host_key_and_has_safe_defaults() {
+        let c = Config::parse(SFTP).unwrap();
+        assert_eq!(c.storage.capacity(), None);
+        assert_eq!((c.storage.compression_level(), c.storage.compression_min_saving()), (3, 5));
+        assert!(matches!(c.storage, StorageConfig::Sftp { sftp_port: 22, sftp_connections: None, .. }));
+        // Without a pinned host key there is no mode that connects: the config is refused, naming the setting.
+        let unpinned = SFTP.replace("sftp_host_key = \"SHA256:abc\"\n", "");
+        let Err(ConfigError::Sftp(message)) = Config::parse(&unpinned) else { panic!("an SFTP store without a pinned host key must be refused") };
+        assert!(message.contains("sftp_host_key") && message.contains("sftp_known_hosts") && message.contains("no mode"), "{message}");
+        assert!(Config::parse(&unpinned.replace("[storage]", "[storage]\nsftp_known_hosts = \"known_hosts\"")).is_ok());
+        // Password sign-in does not exist, and an unknown key is a typo.
+        assert!(matches!(Config::parse(&format!("{SFTP}sftp_password = \"x\"\n")), Err(ConfigError::Parse(_))));
+        assert!(matches!(Config::parse(&SFTP.replace("sftp_user = \"craft\"\n", "")), Err(ConfigError::Parse(_))), "the user is required");
+        for bad in ["sftp_connections = 0", "sftp_connections = 17", "sftp_timeout_secs = 0", "sftp_timeout_secs = 301", "sftp_retries = 9"] {
+            assert!(matches!(Config::parse(&format!("{SFTP}{bad}\n")), Err(ConfigError::Sftp(_))), "{bad}");
+        }
+        for good in ["sftp_connections = 16", "sftp_timeout_secs = 300", "sftp_retries = 0", "capacity = \"4 TiB\"", "compression = \"none\""] {
+            assert!(Config::parse(&format!("{SFTP}{good}\n")).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn sftp_config_hides_its_passphrase() {
+        let c = Config::parse(&format!("{SFTP}sftp_key_passphrase = \"correct-horse\"\n")).unwrap();
+        assert!(!format!("{c:?}").contains("correct-horse"));
+    }
+
+    #[cfg(feature = "sftp")]
+    #[test]
+    fn sftp_settings_resolve_relative_paths_against_the_config_file() {
+        let mut c = Config::parse(&format!(
+            "{SFTP}sftp_key_file = \"keys/sftp\"\nsftp_known_hosts = \"hosts\"\nsftp_key_passphrase = \"pw\"\nsftp_retries = 5\n"
+        ))
+        .unwrap();
+        c.dir = Some(PathBuf::from("/etc/craft"));
+        let s = c.sftp_storage().unwrap().unwrap();
+        assert_eq!((s.host.as_str(), s.port, s.user.as_str(), s.root.as_str()), ("files.example.org", 22, "craft", "/craft/blobs"));
+        assert_eq!(s.key_file, Path::new("/etc/craft").join("keys/sftp"));
+        assert_eq!(s.known_hosts, Some(Path::new("/etc/craft").join("hosts")));
+        assert_eq!(s.key_passphrase.as_deref(), Some("pw"));
+        assert_eq!(
+            (s.connections, s.retries, s.timeout.as_secs()),
+            (craft_cloud_store::sftp::DEFAULT_CONNECTIONS, 5, craft_cloud_store::sftp::DEFAULT_TIMEOUT_SECS)
+        );
+        assert!(Config::parse(DISK).unwrap().sftp_storage().unwrap().is_none());
+    }
+
+    #[cfg(feature = "sftp")]
+    #[test]
+    fn the_sftp_limits_here_are_the_store_crates() {
+        assert_eq!(SFTP_MAX_CONNECTIONS, craft_cloud_store::sftp::MAX_CONNECTIONS);
+        assert_eq!(SFTP_MAX_TIMEOUT_SECS, craft_cloud_store::sftp::MAX_TIMEOUT_SECS);
+        assert_eq!(SFTP_MAX_RETRIES, craft_cloud_store::sftp::MAX_RETRIES);
     }
 
     #[test]

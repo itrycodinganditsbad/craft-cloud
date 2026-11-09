@@ -2,7 +2,7 @@
 //!
 //! [`Store`] checks every blob on the way in and on the way out: the BLAKE3 of its bytes must equal its ID,
 //! and its size must be within the protocol limits. Backends only move bytes: [`disk`] (atomic writes with
-//! fsync), [`s3`] (any S3-compatible service) and [`memory`] (tests).
+//! fsync), [`s3`] (any S3-compatible service), `sftp` (a file server; the `sftp` feature) and [`memory`] (tests).
 //!
 //! Each stored object is one format byte followed by the blob. Format 0 is plain bytes; format 1 is one zstd
 //! stream of the blob, written when [`Compression::Zstd`] makes it at least 5% smaller (the level and the 5% are
@@ -22,6 +22,8 @@
 pub mod disk;
 pub mod memory;
 pub mod s3;
+#[cfg(feature = "sftp")]
+pub mod sftp;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};

@@ -41,7 +41,7 @@ impl DiskBackend {
 }
 
 /// The name of a write's temporary file: `.tmp-` and a hyphenated lowercase UUIDv7.
-fn temp_name(id: uuid::Uuid) -> String {
+pub(crate) fn temp_name(id: uuid::Uuid) -> String {
     format!("{TEMP_PREFIX}{}", id.hyphenated())
 }
 
@@ -49,11 +49,22 @@ const TEMP_PREFIX: &str = ".tmp-";
 
 /// Whether `name` is exactly what [`temp_name`] writes. Any other `.tmp-` name is somebody else's file and
 /// is listed as foreign.
-fn is_temp_name(name: &str) -> bool {
+pub(crate) fn is_temp_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix(TEMP_PREFIX) else {
         return false;
     };
     uuid::Uuid::try_parse(rest).is_ok_and(|id| id.get_version() == Some(uuid::Version::SortRand) && id.hyphenated().to_string() == rest)
+}
+
+/// When a write's temporary file was made, in seconds since the epoch, read from its UUIDv7; `None` when `name` is not
+/// exactly what [`temp_name`] writes.
+#[cfg(feature = "sftp")]
+pub(crate) fn temp_created_secs(name: &str) -> Option<u64> {
+    if !is_temp_name(name) {
+        return None;
+    }
+    let id = uuid::Uuid::try_parse(name.strip_prefix(TEMP_PREFIX)?).ok()?;
+    id.get_timestamp().map(|timestamp| timestamp.to_unix().0)
 }
 
 fn write_atomic(target: &Path, data: &[u8]) -> io::Result<()> {

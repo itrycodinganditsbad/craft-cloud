@@ -7,6 +7,8 @@ pub mod admin;
 pub mod api;
 pub mod audit;
 pub mod auth;
+#[cfg(feature = "sftp")]
+pub mod backup;
 pub mod cli;
 pub mod config;
 pub mod error;
