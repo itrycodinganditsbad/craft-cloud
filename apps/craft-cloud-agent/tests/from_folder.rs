@@ -1540,3 +1540,63 @@ async fn a_retry_does_not_add_another_identical_conflict_copy() {
     assert_eq!(std::fs::read(team.join("brief.txt")).unwrap(), b"edited in the team space");
     assert_eq!(status.kept, 1, "{status:?}");
 }
+
+// ---- the fifth review round ----
+
+/// Rewrites the team file in place, in the instant after the copy looked at it and found it unchanged.
+fn rewrite_in_the_team_space_late(dest: &Path) {
+    if dest.file_name().is_some_and(|n| n == "brief.txt") {
+        std::fs::write(dest, b"rewritten late in the team space").unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_moved_aside_by_a_crash_is_put_back_at_the_next_start_without_asking_again() {
+    let (_w, mut ana, project, _files) = ana_with_project().await;
+    hook::set(ana.data.path(), Some(Hook::Fail(FromFolderStep::Syncing)));
+    ana.make(&project, "Aside").await.unwrap();
+    let failed = ana.until(FromFolderStep::Failed).await;
+    let team = PathBuf::from(failed.team_folder.clone().unwrap());
+    let _ = ana.crash().await;
+    // The copy was killed between moving a team file aside and putting its new version in place.
+    let tmp = team.join(".craft-cloud").join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::rename(team.join("brief.txt"), tmp.join("0123456789ab.cc-aside")).unwrap();
+    let note = serde_json::json!({ "key": "brief.txt", "os": ["brief.txt"] });
+    std::fs::write(tmp.join("0123456789ab.cc-aside.path"), serde_json::to_vec(&note).unwrap()).unwrap();
+    hook::set(ana.data.path(), None);
+    // Started again; nobody asks for the work again.
+    ana.run();
+    ana.ready().await;
+    assert_eq!(std::fs::read(team.join("brief.txt")).unwrap(), b"the brief", "back before the team space's sync looked at the folder");
+    let left: Vec<_> = std::fs::read_dir(&tmp).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert!(left.is_empty(), "{left:?}");
+    let shown = ana.work().await.expect("the failed work is still reported");
+    assert_eq!(shown.step, FromFolderStep::Failed, "{shown:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_team_file_rewritten_after_the_look_is_kept_beside_the_new_copy() {
+    let (_w, ana, project, _files) = ana_with_project().await;
+    hook::set(ana.data.path(), Some(Hook::Fail(FromFolderStep::Syncing)));
+    ana.make(&project, "Late").await.unwrap();
+    let failed = ana.until(FromFolderStep::Failed).await;
+    let team = PathBuf::from(failed.team_folder.clone().unwrap());
+    std::fs::write(project.join("brief.txt"), b"a newer version here").unwrap();
+    hook::set_after_check(ana.data.path(), Some(rewrite_in_the_team_space_late));
+    hook::set(ana.data.path(), None);
+    ana.make_with(&project, "Late", None).await.unwrap();
+    let status = done(&ana).await;
+    hook::set_after_check(ana.data.path(), None);
+    // The new copy is in place; what was in the team folder at that moment is kept beside it, and the old file is not deleted.
+    assert_eq!(std::fs::read(team.join("brief.txt")).unwrap(), b"a newer version here");
+    let beside = names_beside(&team, "brief", "brief.txt");
+    assert_eq!(beside.len(), 1, "{beside:?}");
+    assert_eq!(std::fs::read(team.join(&beside[0])).unwrap(), b"rewritten late in the team space", "the rewrite is not lost");
+    assert_eq!(std::fs::read(project.join("brief.txt")).unwrap(), b"a newer version here", "the old file stays");
+    assert_eq!(status.kept, 1, "{status:?}");
+    assert!(status.message.as_deref().is_some_and(|m| m.contains("edited in the team space")), "{status:?}");
+    let left: Vec<_> =
+        std::fs::read_dir(team.join(".craft-cloud").join("tmp")).map(|d| d.flatten().map(|e| e.file_name()).collect()).unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}");
+}

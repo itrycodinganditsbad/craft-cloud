@@ -828,6 +828,9 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             tokio::spawn(long_poll(transport.clone(), since_rx.clone(), tell, options, random))
         };
         let mut poll = (!user_paused).then(&start_poll);
+        // Work of making a team space from a folder that was under way when the agent stopped is now reported as interrupted, and
+        // team files it had moved aside go back: before the team spaces' sync looks at their folders.
+        crate::from_folder::restore(&control, data, &account);
         // The account's team spaces (a server without them has none): looked for now and then, and synced when turned on.
         let spaces = Spaces::start(SpacesConfig {
             data: data.clone(),
@@ -838,8 +841,6 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             paused: user_paused,
         });
         control.set_spaces_handle(Some(spaces.handle()));
-        // Work of making a team space from a folder that was under way when the agent stopped is now reported as interrupted.
-        crate::from_folder::restore(&control, data, &account);
 
         let mut scheduler = Scheduler::new(options.timing, status.now(), random);
         let mut watching = Watching::default();
