@@ -704,8 +704,16 @@ async fn the_team_folder_takes_a_free_name_and_the_mass_delete_guard_sees_the_ol
     ana.ready().await;
     personal_has(&w, "Big", &files).await;
 
+    // The old folder's files go one by one, and a personal pass that looks in the middle of that sees a few files gone (below the
+    // guard's floor) and deletes those. How many that is depends on how fast the machine is, so the personal sync is paused for
+    // the deleting: the pass that comes after sees the whole folder gone at once, as it would a folder a person deleted.
+    hook::set(ana.data.path(), Some(Hook::Pause(FromFolderStep::Trashing)));
     ana.make(&big, "Big").await.unwrap();
+    ana.until(FromFolderStep::Trashing).await;
+    ana.api(|c| c.pause()).await.unwrap();
+    hook::set(ana.data.path(), None);
     let status = done(&ana).await;
+    ana.api(|c| c.resume()).await.unwrap();
     assert_eq!(PathBuf::from(status.team_folder.clone().unwrap()), ana.shared().join("Big (2)"));
     assert_eq!(std::fs::read(ana.shared().join("Big/mine.txt")).unwrap(), b"somebody's", "the other folder is untouched");
     team_holds_dirs(&w, &status, &files, false).await;
