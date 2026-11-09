@@ -441,7 +441,20 @@ async fn disk_list_reports_non_utf8_names() {
     let root = dir.path().join("root");
     std::fs::create_dir_all(root.join("chunks")).unwrap();
     let name = std::ffi::OsStr::from_bytes(b"bad-\xff");
-    std::fs::write(root.join("chunks").join(name), b"foreign").unwrap();
+    if let Err(error) = std::fs::write(root.join("chunks").join(name), b"foreign") {
+        // Some file systems (APFS) refuse a name that is not valid UTF-8 (EILSEQ), so no such name can be listed there: the
+        // test has nothing to check.
+        #[cfg(target_os = "linux")]
+        const EILSEQ: i32 = 84;
+        #[cfg(target_os = "macos")]
+        const EILSEQ: i32 = 92;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        const EILSEQ: i32 = -1;
+        let refused = error.kind() == std::io::ErrorKind::InvalidFilename || error.raw_os_error() == Some(EILSEQ);
+        assert!(refused, "unexpected error creating the file: {error}");
+        eprintln!("skipped: this file system refuses names that are not valid UTF-8 ({error})");
+        return;
+    }
     let store = Store::new(DiskBackend::new(&root).unwrap());
     assert!(
         matches!(store.list(craft_cloud_store::BlobKind::Chunk, None, 10).await, Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData && error.to_string() == "store path is not valid UTF-8")
