@@ -134,6 +134,8 @@ To close a document, send the following. The `doc` value is the server's documen
 
 The agent drops an app that does not read for 10 seconds. The document stays with the agent.
 
+To quit, send the close and read until the agent's close before shutting down the socket. On Linux a socket closed with unread data is reset, and the reset can discard the last changes the agent has not read yet.
+
 ### Other events
 
 Other text events are `status`, `file`, `role`, `members`, and `error`. `DocsEvent` is non-exhaustive: ignore unknown future `type` values.
