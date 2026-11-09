@@ -432,6 +432,7 @@ pub fn action_label(action: &str) -> &str {
         "cli.space_created" => "Team space created on the server",
         "cli.space_member_changed" => "Team space member changed on the server",
         "cli.space_archived" => "Team space archived on the server",
+        "cli.live_reset" => "Live document emptied on the server",
         other => other,
     }
 }
