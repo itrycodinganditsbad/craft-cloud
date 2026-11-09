@@ -300,6 +300,19 @@ impl Drop for Holding {
     }
 }
 
+/// How long the database may stay busy, in real time, before a simulation gives up. One seed needs about a second of it;
+/// a busy wait that lasts minutes is a run that will never end, so it ends the whole test binary with the evidence
+/// rather than leaving a CI job to its timeout (a panic would only end the blocking task, which the caller ignores).
+const DB_STUCK_AFTER: Duration = Duration::from_secs(180);
+
+/// Called by a busy wait for the database ([`hold_time`]) each time it looks.
+pub fn stuck_check(started: std::time::Instant) {
+    if started.elapsed() > DB_STUCK_AFTER {
+        eprintln!("the database has been busy for {DB_STUCK_AFTER:?} of real time: the simulation is stuck, not slow");
+        std::process::abort();
+    }
+}
+
 /// SQLite answers from a thread of its own, outside the simulation. If simulated time went on while it works, how
 /// far it got before an answer would depend on the real machine's speed, and a seed wouldn't replay. So while the
 /// database is busy ([`craft_cloud_meta::Meta::busy`]) a blocking task waits for it: tokio's paused clock doesn't
@@ -328,7 +341,9 @@ fn hold_time(net: &Arc<Net>) {
                 idle = 0;
                 let meta = net.server.meta.clone();
                 let _ = tokio::task::spawn_blocking(move || {
+                    let started = std::time::Instant::now();
                     while meta.busy() {
+                        stuck_check(started);
                         std::thread::sleep(Duration::from_micros(20));
                     }
                 })
