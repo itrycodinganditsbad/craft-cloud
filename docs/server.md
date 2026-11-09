@@ -531,12 +531,19 @@ sftp_host_key = "SHA256:…"               # the server's host key; or sftp_know
 - **The file server must offer the `posix-rename@openssh.com` extension** (every OpenSSH-based SFTP server does). A write
   goes to a file named `….tmp-<id>` in the target's directory and is renamed over the target in one step, so a reader sees
   the old blob or the new one and never a part. A server without the extension is refused at start with a message that
-  names it: Craft Cloud never replaces a blob by deleting it first. The temporary file of an upload that was cut off
-  stays in its shard directory (the listing does not show it); a failed upload removes its own.
+  names it: Craft Cloud never replaces a blob by deleting it first. A failed upload removes its temporary file, on a fresh
+  connection when the first one is gone. When that cannot be done (the server was killed, the file server went away), the
+  temporary file stays in its shard directory, and the listing does not show it. `craft-cloud-server store clean-temp
+  --config … [--older-than-hours 24]` removes the ones older than that (only exact `.tmp-<id>` names, by the time in the
+  name; an upload that is running or finished is never touched). Run it now and then (say weekly); it walks
+  every shard directory, so on a big store it takes a while.
 - **A successful write means the file server accepted it.** SFTP has no portable `fsync`; when the server offers
   `fsync@openssh.com` the file is flushed before the rename, but what happens at the provider after that is not
   something Craft Cloud can see. Keep your own backup of the remote directory (see "Backing up to an SFTP server" for
   the database and a copy of the blobs on a second server).
+- Commands that only use the database (`user`, `device`, `audit`, `reset-epoch` and the like) do not open the blob store,
+  so they work while the file server is away. `serve` and every command that reads or writes blobs connect at start, and
+  refuse to start when they cannot.
 - The server keeps a few connections open and tries a request again, up to `sftp_retries` times with growing waits, when
   a connection drops or times out. A refusal (permissions, a wrong key, a full disk) is not retried and is reported as an
   error to the one request. Some providers allow only a few connections: lower `sftp_connections`.
@@ -565,7 +572,11 @@ craft-cloud-server backup --config /var/lib/craft-cloud/config.toml \
   way; a blob that cannot be read stops the backup with an error that names it.
 - **Where.** `sftp://user@host[:port]/directory` (`/~/directory` for one in the account's home). Below it:
   `chunks/` and `manifests/` as in the store, and `generations/<UTC stamp>/` with the dump (`meta.sqlite`) and the manifest.
-  `--keep N` (default 7) keeps the newest N database generations and removes older ones; blobs are never removed.
+  `--keep N` (default 7) keeps the newest N complete database generations and removes older ones; blobs are never removed.
+  A generation is named by the second its backup began in. If the backup server has that name already (a second backup
+  running at once, or a clock set back), the new backup stops with a message and changes nothing; run one backup at a
+  time. The generation just written is never removed, and one without its manifest is left alone for a day before it is
+  taken for a backup that died.
 - **Signing in.** The same rules as for an SFTP blob store: a key (`--key-file`, or `CRAFT_CLOUD_SFTP_KEY_FILE`), the
   key's passphrase from `CRAFT_CLOUD_SFTP_KEY_PASSPHRASE`, and a pinned host key (`--host-key` or `--known-hosts`) that
   the command insists on. A password in the address is refused. The settings can sit in the config instead:
@@ -613,8 +624,10 @@ craft-cloud-server restore --from sftp://backup@files.example.org/craft-cloud-ba
 
 The directory must be empty or missing; a directory with anything in it is refused and left alone. `restore` takes the
 newest complete generation (or the one named with `--generation 20261107T031500Z`), checks the database dump against the
-hash in its manifest and opens it, then copies the blobs. It writes `meta.db` and `blobs/` and, if anything fails,
-removes what it made. Then put your `config.toml` and the two-factor key beside them (storage path `…/blobs`, database
+hash and size in its manifest and opens it, then copies the blobs. It builds everything in a directory beside the target
+(`<dir>.restore-<id>`) and moves it into place only when it is all there, so a restore that fails, or is killed, never
+leaves a database with part of its blobs at the target and a re-run is not refused. After a kill, delete the leftover
+`….restore-<id>` directory. The result is `meta.db` and `blobs/`. Then put your `config.toml` and the two-factor key beside them (storage path `…/blobs`, database
 `sqlite:…/meta.db`), run `craft-cloud-server verify --config …`, and, as for any restore, `reset-epoch --all` before
 `serve` (see "Restoring a backup"). The blobs of the backup are a superset of what the restored database names: ones
 uploaded after the dump are not referenced and only take up room until a future garbage collection.
