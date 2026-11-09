@@ -77,11 +77,42 @@ struct World {
     bob: UserRecord,
     counts: Arc<Counts>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
-    _dirs: Vec<tempfile::TempDir>,
+    _dirs: Vec<Scratch>,
+}
+
+/// A temporary folder that is removed when it goes out of scope, without ever holding the test for long. On Windows the removal
+/// of a folder has been seen to stop for minutes in the system (the process idle, nothing of the agent running, the folder's files
+/// untouched), and a test that waits for it never ends. The removal runs in a thread that is waited for a while; if it does not
+/// come back the folder is left in the temporary folder of the system.
+struct Scratch(Option<tempfile::TempDir>);
+
+impl Scratch {
+    fn new() -> Self {
+        Self(Some(tempfile::tempdir().unwrap()))
+    }
+
+    fn path(&self) -> &Path {
+        self.0.as_ref().unwrap().path()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let Some(dir) = self.0.take() else { return };
+        let path = dir.path().to_owned();
+        let (done, removed) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            drop(dir);
+            let _ = done.send(());
+        });
+        if removed.recv_timeout(Duration::from_secs(20)).is_err() {
+            eprintln!("the removal of {} did not finish; it is left behind", path.display());
+        }
+    }
 }
 
 async fn world() -> World {
-    let (db, blobs) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (db, blobs) = (Scratch::new(), Scratch::new());
     let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
     let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
     let state = Arc::new(AppState::new(meta.clone(), store, vec![]).unwrap());
@@ -165,12 +196,12 @@ struct Person {
     running: Option<Running>,
     data: DataDir,
     personal: PathBuf,
-    dir: tempfile::TempDir,
+    dir: Scratch,
 }
 
 impl Person {
     async fn signed_in(url: &str, user: &str) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = Scratch::new();
         let person = Self { running: None, data: DataDir::new(dir.path().join("data")), personal: dir.path().join("Craft Cloud"), dir };
         let args = LoginArgs {
             url: url.to_owned(),
@@ -704,8 +735,16 @@ async fn the_team_folder_takes_a_free_name_and_the_mass_delete_guard_sees_the_ol
     ana.ready().await;
     personal_has(&w, "Big", &files).await;
 
+    // The old folder's files go one by one, and a personal pass that looks in the middle of that sees a few files gone (below the
+    // guard's floor) and deletes those. How many that is depends on how fast the machine is, so the personal sync is paused for
+    // the deleting: the pass that comes after sees the whole folder gone at once, as it would a folder a person deleted.
+    hook::set(ana.data.path(), Some(Hook::Pause(FromFolderStep::Trashing)));
     ana.make(&big, "Big").await.unwrap();
+    ana.until(FromFolderStep::Trashing).await;
+    ana.api(|c| c.pause()).await.unwrap();
+    hook::set(ana.data.path(), None);
     let status = done(&ana).await;
+    ana.api(|c| c.resume()).await.unwrap();
     assert_eq!(PathBuf::from(status.team_folder.clone().unwrap()), ana.shared().join("Big (2)"));
     assert_eq!(std::fs::read(ana.shared().join("Big/mine.txt")).unwrap(), b"somebody's", "the other folder is untouched");
     team_holds_dirs(&w, &status, &files, false).await;
@@ -1068,13 +1107,26 @@ async fn an_old_folder_swapped_for_a_link_to_an_identical_copy_is_not_deleted_fr
     ana.until(FromFolderStep::Trashing).await;
     // The whole old folder is moved aside (the copy has the same files with the same times) and a link takes its place.
     let backup = ana.dir.path().join("Backup");
-    std::fs::rename(&project, &backup).unwrap();
+    rename_when_free(&project, &backup);
     make_link(&project, &backup);
     hook::set(ana.data.path(), None);
     let stopped = ana.until(FromFolderStep::Failed).await;
     assert_eq!(stopped.failed_at, Some(FromFolderStep::Trashing), "{stopped:?}");
     assert!(stopped.message.as_deref().is_some_and(|m| m.contains("moved or replaced")), "{stopped:?}");
     assert_eq!(files_under(&backup), files, "the copy behind the link is untouched");
+}
+
+/// Renames a folder. Windows refuses (access denied) while a program has a file in it open, as the agent's pass has while it reads
+/// the folder, so the rename is tried again for a short while.
+fn rename_when_free(from: &Path, to: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => panic!("{} cannot be renamed to {}: {e}", from.display(), to.display()),
+        }
+    }
 }
 
 fn slow_quarantine(_held: &Path) {
@@ -1107,7 +1159,13 @@ async fn session_ends_during(step: FromFolderStep) {
     hook::set(ana.data.path(), Some(Hook::Pause(step)));
     let make = ana.make(&project, "Ended");
     let end = async {
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        if step == FromFolderStep::Creating {
+            // The call holds after the server has answered: the session ends only once the space is there (logging out after a fixed
+            // time can come first on a loaded machine, and the token is gone before the request that makes the space).
+            eventually("the server has made the space", || async { space_named(&w, "Ended").await.is_some() }).await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
         ana.api(|c| c.logout(false)).await.unwrap();
         hook::set(ana.data.path(), None);
     };
@@ -1341,6 +1399,60 @@ async fn a_team_subfolder_swapped_for_a_link_is_not_written_through() {
     assert!(stopped.message.as_deref().is_some_and(|m| m.contains("moved or replaced by a link")), "{stopped:?}");
     assert_eq!(files_under(&other), BTreeMap::from([("010.psd".to_owned(), b"somebody else's file".to_vec())]), "the other folder is untouched");
     untouched(&project, &files);
+}
+
+/// Makes the journal unreadable while the guard lives (Windows: held open without sharing; elsewhere: no permission).
+struct Unreadable {
+    #[cfg(windows)]
+    _held: std::fs::File,
+    #[cfg(unix)]
+    path: PathBuf,
+}
+
+fn make_unreadable(path: &Path) -> Unreadable {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        Unreadable { _held: std::fs::OpenOptions::new().read(true).share_mode(0).open(path).unwrap() }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        Unreadable { path: path.to_owned() }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Unreadable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_while_the_journal_cannot_be_read_is_refused_and_goes_on_with_the_same_space_once_it_can() {
+    let (w, ana, project, _files) = ana_with_project().await;
+    hook::set(ana.data.path(), Some(Hook::Fail(FromFolderStep::Syncing)));
+    ana.make(&project, "Unread").await.unwrap();
+    let failed = ana.until(FromFolderStep::Failed).await;
+    let space = failed.space.unwrap();
+    hook::set(ana.data.path(), None);
+    let journal = ana.data.path().join(craft_cloud_agent::from_folder::JOURNAL_FILE);
+    let held = make_unreadable(&journal);
+    if std::fs::read(&journal).is_ok() {
+        // Running as the superuser: permissions do not keep a file from being read.
+        return;
+    }
+    // The folder is not taken for a new one (no password is asked for, no second space is made).
+    let refused = ana.make_with(&project, "Unread", None).await.unwrap_err();
+    assert_eq!(refused.code(), Some("conflict"), "{refused:?}");
+    assert_eq!(space_named(&w, "Unread").await, Some(space));
+    drop(held);
+    let started = ana.make_with(&project, "Unread", None).await.unwrap();
+    assert_eq!(started.space, Some(space), "{started:?}");
+    done(&ana).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
