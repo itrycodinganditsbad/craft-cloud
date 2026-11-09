@@ -1747,3 +1747,47 @@ async fn the_folder_nonce_is_rewritten_and_recorded_in_the_state() {
     let recorded = t.ben.space_state(space).and_then(|s| s["folder_nonce"].as_str().map(str::to_owned));
     assert_eq!(recorded, Some(nonce), "the state records the nonce the folder carries");
 }
+
+/// N4: while a raised generation of one space cannot be saved, only that space is held back from starting, and its state says so;
+/// another space goes on syncing. Once account.json can be written the space starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_the_space_with_an_unsaved_generation_is_held_back_and_says_so() {
+    let t = team(SpaceRole::Editor).await;
+    let a = t.space;
+    let b = t.world.space("Archive").await;
+    t.world.invite_ben(b, SpaceRole::Editor).await;
+    let (_, _) = both_syncing(&t).await;
+    eventually("the second invitation is listed", || async { t.ben.space(b).await.is_some_and(|s| s.state == "invited") }).await;
+    t.ben.accept(b).await;
+    eventually("ana's agent lists the second space", || async { t.ana.space(b).await.is_some_and(|s| s.state == "active") }).await;
+    let (ana_b, ben_b) = (t.ana.sync_on(b).await, t.ben.sync_on(b).await);
+    let account_path = t.ben.data.path().join("account.json");
+
+    // account.json can't be written: the first space loses access (its raise can't be saved), then gets it back.
+    let held = Held::new(&account_path);
+    t.world.meta.remove_member(&SpaceActor::Cli, a, t.world.ben.id, 1).await.unwrap();
+    eventually("the first space reports no access", || async {
+        t.ben.status().await.spaces.iter().any(|s| s.space == a && matches!(s.run_state, SpaceRun::NoAccess { .. }))
+    })
+    .await;
+    t.world.invite_ben(a, SpaceRole::Editor).await;
+    t.world.meta.accept_invitation(t.world.ben.id, None, a, 2).await.unwrap();
+    eventually("the first space is held back and says why", || async {
+        t.ben
+            .status()
+            .await
+            .spaces
+            .iter()
+            .any(|s| s.space == a && matches!(&s.run_state, SpaceRun::Paused { reason } if reason.contains("could not be saved")))
+    })
+    .await;
+    // The second space goes on.
+    write(&ana_b, "meanwhile.txt", "the other space is not held back");
+    eventually("the second space still syncs", || has_file(ben_b.clone(), "meanwhile.txt", "the other space is not held back")).await;
+
+    drop(held);
+    eventually("the first space starts once the settings can be saved", || async {
+        t.ben.status().await.spaces.iter().any(|s| s.space == a && !matches!(s.run_state, SpaceRun::Paused { .. } | SpaceRun::NoAccess { .. }))
+    })
+    .await;
+}
