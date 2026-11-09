@@ -1713,7 +1713,7 @@ async fn team_spaces_are_made_listed_and_changed(s: &Web) {
     // The page: an empty list and the form, with the confirmation's password field and the navigation entry.
     let html = s.get("/web/spaces", Some(&boss.token)).await.text().await.unwrap();
     assert!(html.contains("No team spaces match.") && html.contains("action=\"/web/spaces\"") && html.contains("name=\"password\""), "{html}");
-    assert!(html.contains("<a href=\"/web/spaces\">Team spaces</a>"), "the navigation names the page");
+    assert!(html.contains("<a href=\"/web/spaces\" aria-current=\"page\">Team spaces</a>"), "the navigation names the page and marks it");
     assert!(!html.contains("name=\"totp_code\""), "no code field without two-factor sign-in");
 
     // Create: the errors first, each with its status, and nothing made.
