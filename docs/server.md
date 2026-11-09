@@ -215,7 +215,7 @@ allow the call is `403 read_only`. The server reads the role from the database o
   name), and `reset-epoch --space <id>` for one space. The command line enforces nothing of the above, as for accounts.
 - Every change is in the audit log (`space.…`, `cli.space_…`), with IDs and role words only, never a space name. An account's own
   activity (`GET /account/activity`) also shows the events that name it as the member concerned.
-- Until live documents learn team spaces, a team space's live connection is refused (`404`); files in it sync as ordinary files.
+- A team space's live documents are served on live protocol 3: a member connects with the space named in the `craft-space` header, and each frame is checked against the member's role (a viewer can read, an editor can also write). A connection that negotiates only protocol 2 is answered `protocol_mismatch`, and an account that is no member gets `404`, as for a space that does not exist. See `docs/design/live.md`.
 
 ## The admin pages in the browser
 
