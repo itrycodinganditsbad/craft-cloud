@@ -224,6 +224,20 @@ impl Meta {
         Self::start(url, true).await
     }
 
+    /// Writes a consistent copy of a SQLite database to the new file `dest` (`VACUUM INTO`): a snapshot of one
+    /// transaction, made while the server runs, with the write-ahead log folded in. The file must not exist. Other
+    /// databases are not copied this way (`pg_dump` is the tool for Postgres): they give [`MetaError::UnsupportedUrl`].
+    pub async fn dump_sqlite(&self, dest: &std::path::Path) -> Result<(), MetaError> {
+        if self.dialect != Dialect::Sqlite {
+            return Err(MetaError::UnsupportedUrl);
+        }
+        let Some(dest) = dest.to_str() else { return Err(MetaError::Db(sqlx::Error::Protocol("the backup path is not valid UTF-8".into()))) };
+        // The path is a string literal of the statement: quotes are doubled, and no other character ends it.
+        let sql = format!("VACUUM INTO '{}'", dest.replace('\'', "''"));
+        sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&self.pool).await?;
+        Ok(())
+    }
+
     async fn start(url: &str, existing: bool) -> Result<Self, MetaError> {
         sqlx::any::install_default_drivers();
         let dialect = if url.starts_with("sqlite:") {

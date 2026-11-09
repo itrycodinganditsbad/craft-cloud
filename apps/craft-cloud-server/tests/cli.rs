@@ -2209,3 +2209,347 @@ async fn verify_reports_sizes_the_database_records_wrongly() {
     let (again, _) = verify_json(&s.config, &[]).await;
     assert_eq!(again["problems"]["by_kind"], json["problems"]["by_kind"]);
 }
+
+/// `backup` and `restore`, against a directory standing in for the backup server, and (with the `sftp` feature and the
+/// `CRAFT_CLOUD_TEST_SFTP_*` variables of the store's conformance tests) against a real SFTP server.
+#[cfg(feature = "sftp")]
+mod backup {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use craft_cloud_server::backup::{Remote, backup_to, restore_from};
+    use craft_cloud_store::disk::DiskBackend;
+    use craft_cloud_store::sftp::{SftpBackend, SftpConfig};
+    use craft_cloud_store::{Backend, StoreError};
+
+    use super::*;
+
+    /// A directory on this machine that plays the backup server.
+    #[derive(Clone)]
+    struct DirRemote {
+        backend: Arc<DiskBackend>,
+        root: PathBuf,
+    }
+
+    impl DirRemote {
+        fn new(root: &Path) -> Self {
+            Self { backend: Arc::new(DiskBackend::new(root).unwrap()), root: root.to_owned() }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for DirRemote {
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+        async fn put_raw(&self, path: &str, data: Bytes) -> Result<(), StoreError> {
+            self.backend.put_raw(path, data).await
+        }
+        async fn get_raw(&self, path: &str) -> Result<Option<Bytes>, StoreError> {
+            self.backend.get_raw(path).await
+        }
+        async fn get_raw_limited(&self, path: &str, max_bytes: usize) -> Result<Option<Bytes>, StoreError> {
+            self.backend.get_raw_limited(path, max_bytes).await
+        }
+        async fn size_raw(&self, path: &str) -> Result<Option<u64>, StoreError> {
+            self.backend.size_raw(path).await
+        }
+        async fn delete_raw(&self, path: &str) -> Result<(), StoreError> {
+            self.backend.delete_raw(path).await
+        }
+        async fn list_raw(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<String>, StoreError> {
+            self.backend.list_raw(prefix, after, limit).await
+        }
+    }
+
+    impl Remote for DirRemote {
+        async fn put_file(&self, path: &str, local: &Path) -> Result<(), StoreError> {
+            let target = self.root.join(path);
+            std::fs::create_dir_all(target.parent().unwrap())?;
+            std::fs::copy(local, target)?;
+            Ok(())
+        }
+        async fn get_file(&self, path: &str, local: &Path) -> Result<bool, StoreError> {
+            match std::fs::copy(self.root.join(path), local) {
+                Ok(_) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e.into()),
+            }
+        }
+        async fn remove_dir(&self, path: &str) -> Result<(), StoreError> {
+            let _ = std::fs::remove_dir(self.root.join(path));
+            Ok(())
+        }
+    }
+
+    const T0: i64 = 1_700_000_000_000;
+
+    /// A config for the data directory a restore made, as the admin would write it.
+    fn config_for(dir: &Path) -> String {
+        let slashes = |p: PathBuf| p.to_string_lossy().replace('\\', "/");
+        let path = dir.join("config.toml");
+        let text = format!(
+            "listen = \"127.0.0.1:8080\"\n[database]\nurl = \"sqlite:{}\"\n[storage]\nkind = \"disk\"\npath = \"{}\"\n",
+            slashes(dir.join("meta.db")),
+            slashes(dir.join("blobs"))
+        );
+        std::fs::write(&path, text).unwrap();
+        path.to_str().unwrap().to_owned()
+    }
+
+    fn generations(remote: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(remote.join("generations"))
+            .map(|d| d.map(|e| e.unwrap().file_name().into_string().unwrap()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Backs the seeded server up twice, restores into an empty directory, and checks the result with `verify`.
+    async fn backup_restore_verify<R: Remote>(remote: R) {
+        let s = seeded().await;
+        let config = Config::load(Path::new(&s.config)).unwrap();
+        let mut out = Vec::new();
+        backup_to(&config, remote.clone(), 7, None, T0, &mut out).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("backup 20231114T221320Z is complete"), "{text}");
+        assert!(text.contains("chunks: 2 found, 2 copied"), "{text}");
+        assert!(text.contains("manifests: 1 found, 1 copied"), "{text}");
+
+        // A second backup sends no blob again.
+        let mut out = Vec::new();
+        backup_to(&config, remote.clone(), 7, None, T0 + 60_000, &mut out).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("chunks: 2 found, 0 copied (0 bytes), 2 already there"), "{text}");
+        assert!(text.contains("backup 20231114T221420Z is complete"), "{text}");
+
+        // A restore refuses a directory with something in it, and changes nothing there.
+        let before = tree_snapshot(&s.dir);
+        let mut out = Vec::new();
+        let refused = restore_from(remote.clone(), &s.dir, None, &mut out).await;
+        assert!(matches!(&refused, Err(CliError::Usage(m)) if m.contains("is not empty")), "{refused:?}");
+        assert_eq!(tree_snapshot(&s.dir), before);
+
+        let parent = tempfile::tempdir().unwrap();
+        let restored = parent.path().join("restored");
+        let mut out = Vec::new();
+        restore_from(remote.clone(), &restored, None, &mut out).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("restored generation 20231114T221420Z"), "{text}");
+        assert!(text.contains("reset-epoch --all"), "{text}");
+
+        let restored_config = config_for(&restored);
+        let verified = cli(&["verify", "--config", &restored_config], "").await.unwrap();
+        assert!(verified.contains("no problems found"), "{verified}");
+        assert!(verified.contains("checked 1 manifest(s) and 2 chunk(s)"), "{verified}");
+        let config = Config::load(Path::new(&restored_config)).unwrap();
+        let meta = craft_cloud_meta::Meta::open_existing(&config.database.url).await.unwrap();
+        assert!(meta.user_by_name("ana").await.unwrap().is_some());
+        // Restoring into the directory it made is refused too.
+        let mut out = Vec::new();
+        assert!(matches!(restore_from(remote, &restored, None, &mut out).await, Err(CliError::Usage(_))));
+    }
+
+    #[tokio::test]
+    async fn a_backup_restores_into_an_empty_directory_and_verifies() {
+        let parent = tempfile::tempdir().unwrap();
+        backup_restore_verify(DirRemote::new(&parent.path().join("remote"))).await;
+    }
+
+    #[tokio::test]
+    async fn old_database_generations_are_pruned_and_blobs_are_kept() {
+        let s = seeded().await;
+        let config = Config::load(Path::new(&s.config)).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("remote");
+        let remote = DirRemote::new(&root);
+        for n in 0..4 {
+            backup_to(&config, remote.clone(), 2, None, T0 + n * 60_000, &mut Vec::new()).await.unwrap();
+        }
+        assert_eq!(generations(&root), ["20231114T221520Z", "20231114T221620Z"].map(String::from));
+        for name in generations(&root) {
+            assert!(root.join("generations").join(name).join("manifest.json").is_file());
+        }
+        let hex: String = s.chunks[0].as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        assert!(root.join("chunks").join(&hex[0..2]).join(&hex[2..4]).join(&hex).is_file(), "blobs stay when old generations go");
+        // A named generation can be restored; one that is gone cannot.
+        let restored = parent.path().join("older");
+        restore_from(remote.clone(), &restored, Some("20231114T221520Z"), &mut Vec::new()).await.unwrap();
+        let missing = restore_from(remote, &parent.path().join("missing"), Some("20231114T221320Z"), &mut Vec::new()).await;
+        assert!(matches!(&missing, Err(CliError::Usage(m)) if m.contains("no complete generation")), "{missing:?}");
+    }
+
+    #[tokio::test]
+    async fn a_generation_without_its_manifest_is_not_offered_and_a_damaged_dump_is_refused() {
+        let s = seeded().await;
+        let config = Config::load(Path::new(&s.config)).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("remote");
+        let remote = DirRemote::new(&root);
+        backup_to(&config, remote.clone(), 7, None, T0, &mut Vec::new()).await.unwrap();
+        // A newer upload that never finished: a dump and no manifest.
+        let partial = root.join("generations/20231114T230000Z");
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(partial.join("meta.sqlite"), b"half").unwrap();
+        let restored = parent.path().join("restored");
+        restore_from(remote.clone(), &restored, None, &mut Vec::new()).await.unwrap();
+
+        // One flipped byte in the dump is caught by the manifest's hash, and the half-made directory is removed.
+        let dump = root.join("generations/20231114T221320Z/meta.sqlite");
+        let mut bytes = std::fs::read(&dump).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        std::fs::write(&dump, bytes).unwrap();
+        let damaged = parent.path().join("damaged");
+        let refused = restore_from(remote, &damaged, None, &mut Vec::new()).await;
+        assert!(matches!(&refused, Err(CliError::Inconsistent(m)) if m.contains("damaged")), "{refused:?}");
+        assert!(!damaged.exists(), "a failed restore leaves nothing behind");
+    }
+
+    #[tokio::test]
+    async fn postgres_is_pointed_at_pg_dump() {
+        let s = seeded().await;
+        let mut text = std::fs::read_to_string(&s.config).unwrap();
+        config_with_database_url(&mut text, "postgres://user:pw@localhost/db");
+        let config = Config::parse(&text).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let refused = backup_to(&config, DirRemote::new(&parent.path().join("remote")), 7, None, T0, &mut Vec::new()).await;
+        assert!(matches!(&refused, Err(CliError::Usage(m)) if m.contains("pg_dump")), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn the_commands_need_a_pinned_host_key_and_a_key() {
+        let s = seeded().await;
+        let key = tempfile::NamedTempFile::new().unwrap();
+        let key = key.path().to_str().unwrap().to_owned();
+        let unpinned = cli(&["backup", "--config", &s.config, "--to", "sftp://u@127.0.0.1:1/x", "--key-file", &key], "").await;
+        assert!(matches!(&unpinned, Err(CliError::Usage(m)) if m.contains("host key must be pinned")), "{unpinned:?}");
+        let password =
+            cli(&["backup", "--config", &s.config, "--to", "sftp://u:secret@127.0.0.1:1/x", "--key-file", &key, "--host-key", "SHA256:x"], "").await;
+        match &password {
+            Err(CliError::Usage(m)) => assert!(m.contains("password") && !m.contains("secret"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let from =
+            cli(&["restore", "--from", "sftp://u@127.0.0.1:1/x", "--dir", dir.path().join("d").to_str().unwrap(), "--key-file", &key], "").await;
+        assert!(matches!(&from, Err(CliError::Usage(m)) if m.contains("host key must be pinned")), "{from:?}");
+    }
+
+    fn sftp_settings() -> Option<SftpConfig> {
+        let Ok(host) = std::env::var("CRAFT_CLOUD_TEST_SFTP_HOST") else {
+            assert!(
+                std::env::var_os("CRAFT_CLOUD_REQUIRE_BACKENDS").is_none(),
+                "CRAFT_CLOUD_REQUIRE_BACKENDS is set but CRAFT_CLOUD_TEST_SFTP_HOST is not"
+            );
+            eprintln!("skipped: CRAFT_CLOUD_TEST_SFTP_HOST not set");
+            return None;
+        };
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set with CRAFT_CLOUD_TEST_SFTP_HOST"));
+        Some(SftpConfig {
+            host,
+            port: var("CRAFT_CLOUD_TEST_SFTP_PORT").parse().unwrap(),
+            user: var("CRAFT_CLOUD_TEST_SFTP_USER"),
+            root: format!("{}/backup-{}", var("CRAFT_CLOUD_TEST_SFTP_ROOT").trim_end_matches('/'), uuid::Uuid::now_v7()),
+            key_file: var("CRAFT_CLOUD_TEST_SFTP_KEY_FILE").into(),
+            key_passphrase: None,
+            host_key: Some(var("CRAFT_CLOUD_TEST_SFTP_HOST_KEY")),
+            known_hosts: None,
+            connections: 4,
+            timeout: Duration::from_secs(20),
+            retries: 2,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_backup_to_an_sftp_server_restores_and_verifies() {
+        let Some(settings) = sftp_settings() else { return };
+        backup_restore_verify(SftpBackend::connect_for_backup(&settings).await.unwrap()).await;
+    }
+
+    /// `storage.kind = "sftp"` through the config, as `serve` and the commands open it.
+    #[tokio::test]
+    async fn the_sftp_storage_kind_opens_through_the_config() {
+        let Some(settings) = sftp_settings() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let slashes = |p: &Path| p.to_string_lossy().replace('\\', "/");
+        let text = |root: &str| {
+            format!(
+                "listen = \"127.0.0.1:8080\"\n[database]\nurl = \"sqlite:{}\"\n[storage]\nkind = \"sftp\"\nsftp_host = \"{}\"\nsftp_port = {}\n\
+                 sftp_user = \"{}\"\nsftp_root = \"{root}\"\nsftp_key_file = \"{}\"\nsftp_host_key = \"{}\"\n",
+                slashes(&dir.path().join("meta.db")),
+                settings.host,
+                settings.port,
+                settings.user,
+                slashes(&settings.key_file),
+                settings.host_key.as_deref().unwrap()
+            )
+        };
+        let config = Config::parse(&text(&settings.root)).unwrap();
+        let (_meta, store) = craft_cloud_server::cli::open(&config).await.unwrap();
+        assert_eq!(store.kind(), "sftp");
+        let data = format!("through the config {}", uuid::Uuid::now_v7()).into_bytes();
+        let id = craft_cloud_proto::ChunkId::from_bytes(*blake3::hash(&data).as_bytes());
+        store.put(BlobKey::chunk(&id), &data).await.unwrap();
+        let (_meta, again) = craft_cloud_server::cli::open_existing(&config).await.unwrap();
+        assert_eq!(&again.get(BlobKey::chunk(&id)).await.unwrap()[..], &data[..]);
+        // A command that only reads does not make a root directory that is missing: it says so.
+        let other = Config::parse(&text(&format!("{}-missing", settings.root))).unwrap();
+        let refused = craft_cloud_server::cli::open_existing(&other).await;
+        assert!(matches!(&refused, Err(CliError::Store(e)) if e.to_string().contains("does not exist")), "{:?}", refused.err());
+        assert!(craft_cloud_server::cli::open_existing(&other).await.is_err(), "and still does not");
+    }
+
+    /// The same through the command line: the address, the flags, and a backup that is repeated.
+    #[tokio::test]
+    async fn the_backup_and_restore_commands_work_against_an_sftp_server() {
+        let Some(settings) = sftp_settings() else { return };
+        let s = seeded().await;
+        let url = format!(
+            "sftp://{}@{}:{}{}",
+            settings.user,
+            settings.host,
+            settings.port,
+            if settings.root.starts_with('/') { settings.root.clone() } else { format!("/~/{}", settings.root) }
+        );
+        let key = settings.key_file.to_str().unwrap().to_owned();
+        let pin = settings.host_key.clone().unwrap();
+        let backup = |keep: &str| {
+            let args =
+                ["backup", "--config", &s.config, "--to", &url, "--key-file", &key, "--host-key", &pin, "--keep", keep].map(String::from).to_vec();
+            async move {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                cli(&args, "").await
+            }
+        };
+        let first = backup("3").await.unwrap();
+        assert!(first.contains("chunks: 2 found, 2 copied") && first.contains("is complete"), "{first}");
+        let second = backup("3").await.unwrap();
+        assert!(second.contains("chunks: 2 found, 0 copied"), "{second}");
+        let parent = tempfile::tempdir().unwrap();
+        let restored = parent.path().join("restored");
+        let out = cli(&["restore", "--from", &url, "--dir", restored.to_str().unwrap(), "--key-file", &key, "--host-key", &pin], "").await.unwrap();
+        assert!(out.contains("restored generation"), "{out}");
+        let verified = cli(&["verify", "--config", &config_for(&restored)], "").await.unwrap();
+        assert!(verified.contains("no problems found"), "{verified}");
+        // A wrong pin is refused and nothing is restored.
+        let other = parent.path().join("other");
+        let wrong = cli(
+            &[
+                "restore",
+                "--from",
+                &url,
+                "--dir",
+                other.to_str().unwrap(),
+                "--key-file",
+                &key,
+                "--host-key",
+                "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ],
+            "",
+        )
+        .await;
+        assert!(wrong.is_err());
+        assert!(!other.exists());
+    }
+}

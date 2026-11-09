@@ -33,6 +33,10 @@
 //! # compression_level = 3       # zstd level of new writes, 1 to 19 (an admin can change it while the server runs)
 //! # compression_min_saving = 5  # keep a compressed blob only when it is at least this many percent smaller (1 to 50)
 //!
+//! # [backup]                    # defaults for `backup` and `restore`; see docs/server.md
+//! # to = "sftp://backup@files.example.org/craft-cloud"
+//! # key_file = "backup-key", host_key = "SHA256:…" (or known_hosts), keep = 7
+//!
 //! [two_factor]                  # optional: without it, two-factor sign-in can't be set up
 //! key_file = "two-factor.key"   # 32 random bytes, made by `init`; relative to this file
 //! # key_file_old = "old.key"    # while rotating the key, see `two-factor rekey`
@@ -176,6 +180,9 @@ pub struct Config {
     /// or a restore without the key, would otherwise seal secrets nobody can open.
     #[serde(default)]
     pub two_factor: Option<TwoFactorConfig>,
+    /// Defaults for the `backup` command (and, with `--to`, a place to keep the key and host key).
+    #[serde(default)]
+    pub backup: Option<BackupConfig>,
     /// The directory the config file is in, which `key_file` paths are relative to. Set by [`Config::load`], never read
     /// from the file.
     #[serde(skip)]
@@ -371,6 +378,26 @@ pub enum StorageConfig {
 
 fn default_sftp_port() -> u16 {
     22
+}
+
+/// `[backup]`: where `backup` copies the server to and how it signs in. Every key can also be given on the command line.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupConfig {
+    /// `sftp://user@host[:port]/directory` (`/~/directory` for one in the account's home).
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
+    #[serde(default)]
+    pub key_passphrase: Option<Secret>,
+    #[serde(default)]
+    pub host_key: Option<String>,
+    #[serde(default)]
+    pub known_hosts: Option<PathBuf>,
+    /// How many database generations stay on the backup server (default 7).
+    #[serde(default)]
+    pub keep: Option<u32>,
 }
 
 /// A size in bytes written as `"1 TiB"`: a whole number or one with one decimal, then B, KB, MB, GB, TB (powers of 1000)
