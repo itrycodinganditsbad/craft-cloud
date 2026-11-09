@@ -7,12 +7,14 @@ case $- in *x*) set +x ;; esac
 # second, is the only one that sees the secrets from .env. It writes
 #
 #   server/config.toml                     65532  the rendered config (render-config.sh), mode 0400
+#   (data volume) two-factor.key           65532  the key for two-factor secrets, mode 0600, made once and never replaced
 #   db/db_superuser_password               root   read by the Postgres entrypoint          (Postgres profile)
 #   db-init/db_superuser_password          70     read by db-init.sh                       (Postgres profile)
 #   db-init/db_password                    70     the password of the server's database role (Postgres profile)
 #
 # into the `secrets` volume (directories 0500). Each service mounts only its own directory, read-only. Uid 70 is the
-# postgres user of the postgres:*-alpine images.
+# postgres user of the postgres:*-alpine images. The two-factor key is the one exception: it lives in the `data` volume
+# (mounted here at /var/lib/craft-cloud), so it is kept and backed up with the data it protects.
 #
 # Nothing here prints a secret. Every run rewrites all files, so changing a value in .env and running
 # `docker compose up -d --force-recreate secrets-init` is how a password or a setting is changed (the container must be
@@ -59,6 +61,33 @@ config=$(sh /render-config.sh /config.toml.in)
 printf '%s\n' "$config" | put 65532 server config.toml
 unset config
 prune server config.toml
+
+# The two-factor key: 32 random bytes, made once. An existing key is never touched: with a new one the sealed
+# two-factor secrets in the database could not be opened any more. The directory is the data directory of the image
+# (owner 65532, mode 0700), set here too because a volume that is new to this container starts out owned by root.
+DATA=/var/lib/craft-cloud
+KEY="$DATA/two-factor.key"
+install -d -m 0700 -o 65532 -g 65532 "$DATA"
+if [ ! -e "$KEY" ] && [ ! -L "$KEY" ]; then
+    tmp="$DATA/.new.two-factor.key"
+    rm -f -- "$tmp"
+    head -c 32 /dev/urandom >"$tmp"
+    [ "$(wc -c <"$tmp")" -eq 32 ] || {
+        rm -f -- "$tmp"
+        echo "secrets-init: can't read 32 random bytes from /dev/urandom" >&2
+        exit 1
+    }
+    chown 65532:65532 "$tmp"
+    chmod 0600 "$tmp"
+    # A hard link fails when a key appeared in the meantime; it never replaces one.
+    ln "$tmp" "$KEY" 2>/dev/null || [ -e "$KEY" ] || {
+        rm -f -- "$tmp"
+        echo "secrets-init: can't create the two-factor key" >&2
+        exit 1
+    }
+    rm -f -- "$tmp"
+    echo "secrets-init: made the two-factor key"
+fi
 
 case $DB_KIND in
     postgres)

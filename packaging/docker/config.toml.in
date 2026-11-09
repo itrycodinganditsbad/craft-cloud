@@ -31,3 +31,13 @@ public_url = "@PUBLIC_URL@"
 #s3#secret_access_key = "@S3_SECRET_ACCESS_KEY@"
 #s3endpoint#endpoint = "@S3_ENDPOINT@"
 #s3http#allow_http = true
+
+# Two-factor sign-in is on: the key is made by secrets-init (once, in the data volume, never overwritten). Back it up
+# apart from the database. The path is absolute because the config file lives in another volume.
+[two_factor]
+key_file = "/var/lib/craft-cloud/two-factor.key"
+
+# The admin pages in the browser are off. To turn them on, change enabled to true (this needs behind_proxy and the
+# https public_url above), run `docker compose up -d --force-recreate secrets-init` and restart the server.
+[web_admin]
+enabled = false
