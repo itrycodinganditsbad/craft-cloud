@@ -1615,3 +1615,40 @@ async fn a_folder_that_goes_and_comes_back_replaced_deletes_nothing() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(names(&ana_folder).len(), 7, "nothing was deleted on the server: {:?}", names(&ana_folder));
 }
+
+/// F3: a link is pointed at another folder (with the same marker, without the files) in the middle of a pass, after the pass began
+/// and before it sends its deletions. The pass stops without deleting anything on the server, and the next one starts afresh in the
+/// new folder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_pointed_at_another_folder_during_a_pass_deletes_nothing() {
+    let (t, front, _task) = team_via_front(SpaceRole::Editor, Front::default()).await;
+    let space = t.space;
+    eventually("the invitation is listed", || async { t.ben.space(space).await.is_some_and(|s| s.state == "invited") }).await;
+    t.ben.accept(space).await;
+    eventually("ana's agent lists the space", || async { t.ana.space(space).await.is_some_and(|s| s.state == "active") }).await;
+    let ana_folder = t.ana.sync_on(space).await;
+    let (a, b, link) = (t.ben.dir.path().join("A"), t.ben.dir.path().join("B"), t.ben.dir.path().join("Link"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    link_dir(&link, &a);
+    t.ben.sync_on_in(space, &link).await;
+    for i in 0..6 {
+        write(&ana_folder, &format!("f{i}.txt"), &format!("content {i}"));
+    }
+    eventually("the folder behind the link has the files", || async { names(&a).len() == 6 }).await;
+    eventually("nothing runs", || async { t.ben.status().await.spaces.iter().all(|s| s.run_state == SpaceRun::Idle) }).await;
+
+    // A pass begins (a local change) and waits at the server; meanwhile the link is pointed at folder B.
+    front.stall.store(true, Ordering::SeqCst);
+    write(&link, "local.txt", "a local change");
+    eventually("the pass is running", || async { t.ben.status().await.spaces.iter().any(|s| s.space == space && s.run_state == SpaceRun::Syncing) })
+        .await;
+    std::fs::create_dir_all(b.join(".craft-cloud")).unwrap();
+    std::fs::copy(a.join(".craft-cloud/root.json"), b.join(".craft-cloud/root.json")).unwrap();
+    unlink_dir(&link);
+    link_dir(&link, &b);
+    front.stall.store(false, Ordering::SeqCst);
+    eventually("the folder behind the link is filled from the server", || async { names(&b).len() == 6 }).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(names(&ana_folder).len(), 6, "nothing was deleted on the server: {:?}", names(&ana_folder));
+}

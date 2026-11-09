@@ -1787,7 +1787,16 @@ impl Session {
         // since the last one (the last pass's outcome stays as it was until this one ends).
         let last_pass = std::sync::Arc::new(std::sync::Mutex::new(saved.last_pass));
         let (checkpoint_data, checkpoint_last, checkpoint_folder) = (data.clone(), last_pass.clone(), state_folder.clone());
+        let (guard_folder, guard_identity) = (account.folder.clone(), opened_on.clone());
         engine.on_checkpoint(move |state| {
+            // The engine saves just before it sends deletions: a team folder that was pointed at another folder during the
+            // pass is noticed here, and the pass stops without sending or saving anything of what it saw there.
+            if let Some(then) = &guard_identity
+                && let Some(now) = crate::disk::folder_identity(&guard_folder)
+                && *then != now
+            {
+                return Err(std::io::Error::other("the folder leads somewhere else than when the session opened"));
+            }
             let last_pass = checkpoint_last.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
             let saved = SavedState {
                 schema: STATE_SCHEMA,
