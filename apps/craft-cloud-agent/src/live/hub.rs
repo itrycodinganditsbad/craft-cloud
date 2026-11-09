@@ -219,6 +219,18 @@ pub struct Listing {
     pub push_stopped: bool,
 }
 
+/// Gives the followers of `list` the new `entries` and push status, if they differ from what they have (a follower is not woken
+/// for a list that has not changed).
+fn publish(list: &watch::Sender<Listing>, entries: Vec<RecentEntry>, push_stopped: bool) {
+    list.send_if_modified(|current| {
+        let same = current.push_stopped == push_stopped && current.entries == entries;
+        if !same {
+            *current = Listing { entries, push_stopped };
+        }
+        !same
+    });
+}
+
 enum Request {
     Follow {
         app: AppName,
@@ -606,6 +618,10 @@ struct State {
     people_not_before: Instant,
     /// Accounts presence named that were not in the list when last looked at (asked about once per list).
     strangers: BTreeSet<Uuid>,
+    /// Who was heard in the documents followed (for `open_now` on the recent files).
+    seen: super::open_now::Seen,
+    /// Presence from an account that was not there before arrived: the lists are handed out again.
+    open_changed: bool,
     /// Since when the link has been up (none while it is down): `access_changed` backs off further each time unless the link
     /// had stayed up for [`ACCESS_STABLE`].
     up_since: Option<Instant>,
@@ -669,10 +685,14 @@ impl State {
         for (app, entries) in self.replica.take_changed() {
             if let Some(list) = self.lists.get(&app) {
                 let push_stopped = self.replica.push_stopped(&app);
-                list.send_replace(Listing { entries, push_stopped });
+                list.send_replace(Listing { entries: self.with_open_now(entries), push_stopped });
             }
         }
         let frames = self.doc_events();
+        // Somebody new is in a followed document, or the member list gave a name: the lists say who is there.
+        if std::mem::take(&mut self.open_changed) {
+            self.refresh_open_now();
+        }
         // Remote changes may be what a record waits for.
         self.take_early();
         self.tell_status();
@@ -684,6 +704,25 @@ impl State {
         }
         self.set_online(self.replica.is_up());
         frames
+    }
+
+    /// `entries` with the accounts that have each file open right now ([`RecentEntry::open_now`]).
+    fn with_open_now(&self, entries: Vec<RecentEntry>) -> Vec<RecentEntry> {
+        let members: &[DocMember] = self.people.as_deref().map_or(&[], Vec::as_slice);
+        self.seen.decorate(Instant::now(), self.config.space, self.me, members, entries)
+    }
+
+    /// Hands every followed list out again with who is there now, to the followers whose list differs. Nothing is sent when
+    /// nobody is (and nobody was) there.
+    fn refresh_open_now(&mut self) {
+        let apps: Vec<AppName> = self.lists.keys().cloned().collect();
+        for app in apps {
+            let entries = self.with_open_now(self.replica.entries(&app));
+            let push_stopped = self.replica.push_stopped(&app);
+            if let Some(list) = self.lists.get(&app) {
+                publish(list, entries, push_stopped);
+            }
+        }
     }
 
     /// Tells the local API whether the agent reaches the server: only the personal hub's link says so (a team space's link that
@@ -783,6 +822,9 @@ impl State {
                     if self.people.as_ref().is_none_or(|p| !p.iter().any(|m| m.user == user)) && self.strangers.insert(user) {
                         self.want_people();
                     }
+                    if self.seen.note(Instant::now(), doc, user) {
+                        self.open_changed = true;
+                    }
                     let bytes = Arc::new(bytes);
                     for (conn, id) in self.handles_of(doc) {
                         frames.extend(self.tell_presence(conn, id, Some(user), bytes.clone()));
@@ -863,6 +905,8 @@ impl State {
             return;
         }
         self.people = Some(list.clone());
+        // A name that was missing may be on a recent file now.
+        self.refresh_open_now();
         let opens: Vec<(ConnId, u64)> =
             self.docs.conns.iter().flat_map(|(conn, c)| c.identity.iter().filter(|id| c.handles.contains_key(id)).map(|id| (*conn, *id))).collect();
         for (conn, id) in opens {
@@ -1481,6 +1525,7 @@ impl State {
             opened_ms: now,
             saved_ms: None,
             machine: clean(&self.config.machine, MAX_MACHINE_BYTES),
+            open_now: Vec::new(),
         };
         entry.saved_ms = if new.saved { Some(now) } else { self.replica.current(app, &entry).and_then(|e| e.saved_ms) };
         Ok(entry)
@@ -1529,9 +1574,11 @@ impl State {
                     return;
                 }
                 let frames = self.replica.follow(&app);
-                let entries = self.replica.entries(&app);
+                // Who is there fades without a message, so a new follower is given the list as it is now.
+                let entries = self.with_open_now(self.replica.entries(&app));
                 let push_stopped = self.replica.push_stopped(&app);
-                let list = self.lists.entry(app).or_insert_with(|| watch::channel(Listing { entries, push_stopped }).0);
+                let list = self.lists.entry(app).or_insert_with(|| watch::channel(Listing { entries: entries.clone(), push_stopped }).0);
+                publish(list, entries, push_stopped);
                 let _ = reply.send(Ok(list.subscribe()));
                 self.send(frames).await;
             }
@@ -1554,7 +1601,7 @@ impl State {
                     (_, Err(e)) => Err(HubError::Failed(e.to_string())),
                 };
                 if !self.lists.contains_key(&app) {
-                    let entries = self.replica.entries(&app);
+                    let entries = self.with_open_now(self.replica.entries(&app));
                     let push_stopped = self.replica.push_stopped(&app);
                     self.lists.insert(app, watch::channel(Listing { entries, push_stopped }).0);
                 }
@@ -1630,6 +1677,8 @@ async fn run(
         people_busy: false,
         people_not_before: Instant::now(),
         strangers: BTreeSet::new(),
+        seen: super::open_now::Seen::default(),
+        open_changed: false,
         up_since: None,
         access_strikes: 0,
     };

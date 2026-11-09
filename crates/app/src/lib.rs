@@ -89,8 +89,8 @@ pub use craft_cloud_api::local::{
 };
 pub use craft_cloud_api::local::{
     ConflictCopy, ConflictsResponse, FileKind, FolderUsage, FolderUsageResponse, HistoryResponse, HistoryVersion, JoinRequest, LoginRequest,
-    NewRecent, PairingInfo, RecentEntry, RestoreResponse, RunState, SecondFactorLoginRequest, Status, TrashItem, TrashNodeRequest, TrashResponse,
-    TrashRestoreResponse, TwoFactorProofRequest, codes,
+    NewRecent, PairingInfo, RecentEntry, RecentPerson, RestoreResponse, RunState, SecondFactorLoginRequest, Status, TrashItem, TrashNodeRequest,
+    TrashResponse, TrashRestoreResponse, TwoFactorProofRequest, codes,
 };
 pub use craft_cloud_api::local::{KindUsage, OtherFolders};
 pub use craft_cloud_api::{NodeId, SpaceId, VersionId};
@@ -447,6 +447,12 @@ impl Client {
     /// `app`'s recent files now, newest first.
     pub fn recents(&self, app: &str) -> Result<Vec<RecentEntry>, Error> {
         Ok(self.watch_recents(app)?.entries())
+    }
+
+    /// The recent files of the team space `space` (it must sync on this computer) for `app` now, newest first, with
+    /// [`RecentEntry::open_now`] as the agent has it at this moment.
+    pub fn recents_in(&self, app: &str, space: craft_cloud_api::SpaceId) -> Result<Vec<RecentEntry>, Error> {
+        Ok(self.watch_recents_in(app, space)?.entries())
     }
 
     /// Adds a file to `app`'s recent files (kept on this machine's disk when this returns; on the others once the agent

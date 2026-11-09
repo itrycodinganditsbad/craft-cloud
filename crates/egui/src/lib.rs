@@ -343,8 +343,17 @@ mod tests {
                 opened_ms: 0,
                 saved_ms: Some(50_000),
                 machine: "BEAST".into(),
+                open_now: Vec::new(),
             },
-            RecentEntry { node: None, path: "b.kitdemo".into(), title: "b.kitdemo".into(), opened_ms: 0, saved_ms: None, machine: "lptp1".into() },
+            RecentEntry {
+                node: None,
+                path: "b.kitdemo".into(),
+                title: "b.kitdemo".into(),
+                opened_ms: 0,
+                saved_ms: None,
+                machine: "lptp1".into(),
+                open_now: Vec::new(),
+            },
         ];
         let mut h = Harness::new_ui_state(
             |ui, (entries, clicked): &mut (Vec<RecentEntry>, Option<String>)| {

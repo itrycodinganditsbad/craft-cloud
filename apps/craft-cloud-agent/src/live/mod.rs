@@ -23,6 +23,7 @@ pub mod copy;
 pub mod docs;
 pub mod hub;
 pub mod link;
+pub mod open_now;
 pub mod recents;
 pub mod replica;
 pub mod saves;

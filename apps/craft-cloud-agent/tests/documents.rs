@@ -609,6 +609,7 @@ fn against_an_older_server_documents_wait_and_say_so() {
             opened_ms: 1,
             saved_ms: None,
             machine: "pc".into(),
+            open_now: Vec::new(),
         };
         let frames = w.machines[a].replica().add(&app, [1; 16], entry).unwrap();
         w.send(a, frames);

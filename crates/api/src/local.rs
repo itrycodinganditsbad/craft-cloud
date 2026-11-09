@@ -1198,6 +1198,28 @@ pub struct RecentEntry {
     pub saved_ms: Option<i64>,
     /// The name of the machine it was opened on.
     pub machine: String,
+    /// Other accounts of the space that have the file open right now, as far as the agent knows: only for a file whose live
+    /// document the agent follows (an app on this computer has it open), from the presence it hears, never the account the
+    /// agent is signed in as. Not part of the shared list (it is filled in when the list is handed out); empty when nobody
+    /// else is there, and absent from an older agent's answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_now: Vec<RecentPerson>,
+}
+
+/// Somebody who has a recent file open right now ([`RecentEntry::open_now`]): the account's username and its palette index.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentPerson {
+    /// The account's username.
+    pub name: String,
+    /// The palette index (0 to 11) the account is shown in ([`crate::colour`]), the same on every machine.
+    pub colour: u8,
+}
+
+impl std::fmt::Debug for RecentPerson {
+    /// A username never reaches a debug print or a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecentPerson").field("name", &format_args!("<{} bytes>", self.name.len())).field("colour", &self.colour).finish()
+    }
 }
 
 /// What an app adds: the agent fills in the node, the time and the machine.
@@ -1836,6 +1858,20 @@ mod tests {
         let json = serde_json::to_value(&role).unwrap();
         assert_eq!(json["type"], serde_json::json!("role"));
         assert_eq!(serde_json::from_value::<DocsEvent>(json).unwrap(), role);
+    }
+
+    /// A recent entry says who has the file open only when somebody does; an older agent's entry has no such field, and a name
+    /// never reaches a debug print.
+    #[test]
+    fn a_recent_entry_may_say_who_has_it_open() {
+        let older: RecentEntry = serde_json::from_str(r#"{"path":"a.txt","title":"a","opened_ms":1,"machine":"pc"}"#).unwrap();
+        assert!(older.open_now.is_empty());
+        assert!(!serde_json::to_string(&older).unwrap().contains("open_now"), "absent when nobody is there");
+        let there = RecentEntry { open_now: vec![RecentPerson { name: "ben".into(), colour: 3 }], ..older };
+        let json = serde_json::to_value(&there).unwrap();
+        assert_eq!(json["open_now"], serde_json::json!([{ "name": "ben", "colour": 3 }]));
+        assert_eq!(serde_json::from_value::<RecentEntry>(json).unwrap(), there);
+        assert!(!format!("{there:?}").contains("ben"), "a name never reaches a debug print");
     }
 
     /// A recents subscription may name a team space; without one it is the personal list, on the wire as before.

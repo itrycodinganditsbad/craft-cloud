@@ -2574,6 +2574,47 @@ async fn the_recents_of_a_team_space_reach_the_other_members_and_not_the_persona
     assert!(matches!(&missing, craft_cloud_app::Error::Refused { code, .. } if code == "not_found"), "{missing:?}");
 }
 
+/// The recent files of a team space say who else has a file open: the accounts whose presence the agent hears for a document an
+/// app on this computer has open, never the account itself, and only while they stay there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recent_file_of_a_team_space_says_who_else_has_it_open_and_never_the_account_itself() {
+    let (t, ana_folder, ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let space = t.space;
+    let (_docs_ana, ana) = app_opens(&t.ana, ana_folder.join("plan.txt"), "the plan", false, 11).await;
+    let (_docs_ben, ben) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 12).await;
+    let path = ana_folder.join("plan.txt").display().to_string();
+    let entry = t.ana.api(move |c| c.add_recent("wordcraft", NewRecent { path, title: None, saved: false })).await.unwrap();
+    assert_eq!(entry.path, "plan.txt");
+    assert!(entry.open_now.is_empty(), "an answer to an add says nobody");
+
+    // Nobody has sent presence yet: nobody is there.
+    let own = t.ana.api(move |c| c.recents_in("wordcraft", space)).await.unwrap();
+    assert!(own.iter().all(|e| e.open_now.is_empty()), "{own:?}");
+
+    // Ben's app shows presence (and ana's too, which never comes back to ana): ana's list names ben, ben's list names ana.
+    let names = |list: Vec<craft_cloud_app::RecentEntry>| -> Vec<String> {
+        list.into_iter().find(|e| e.path == "plan.txt").map(|e| e.open_now.into_iter().map(|p| p.name).collect()).unwrap_or_default()
+    };
+    eventually("ana's list names ben", || async {
+        ben.doc.presence(b"ben's cursor").unwrap();
+        ana.doc.presence(b"ana's cursor").unwrap();
+        names(t.ana.api(move |c| c.recents_in("wordcraft", space)).await.unwrap()) == ["ben"]
+    })
+    .await;
+    eventually("ben's list names ana", || async {
+        ben.doc.presence(b"ben's cursor").unwrap();
+        ana.doc.presence(b"ana's cursor").unwrap();
+        names(t.ben.api(move |c| c.recents_in("wordcraft", space)).await.unwrap()) == ["ana"]
+    })
+    .await;
+    let colour = t.ana.api(move |c| c.recents_in("wordcraft", space)).await.unwrap().into_iter().find(|e| e.path == "plan.txt").unwrap().open_now;
+    assert_eq!(colour[0].colour, craft_cloud_proto::colour::member_colour(t.world.ben.id.0), "the palette index every machine derives");
+
+    // The personal lists say nothing of them, and once ben goes quiet he fades (the agent hears no more from him).
+    assert!(t.ana.api(|c| c.recents("wordcraft")).await.unwrap().is_empty());
+    eventually("ben fades from ana's list", || async { names(t.ana.api(move |c| c.recents_in("wordcraft", space)).await.unwrap()).is_empty() }).await;
+}
+
 /// A server whose live service does not serve team spaces (it answers the upgrade with `404`) is asked once and then left alone
 /// for a long pause: no loop. The space's files sync on, and its documents open as plain files.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

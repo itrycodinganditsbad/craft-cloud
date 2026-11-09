@@ -277,7 +277,7 @@ mod tests {
     use super::*;
 
     fn entry(node: Option<NodeId>, path: &str, opened_ms: i64) -> RecentEntry {
-        RecentEntry { node, path: path.into(), title: path.into(), opened_ms, saved_ms: None, machine: "pc".into() }
+        RecentEntry { node, path: path.into(), title: path.into(), opened_ms, saved_ms: None, machine: "pc".into(), open_now: Vec::new() }
     }
 
     fn key(n: u32) -> AddKey {
