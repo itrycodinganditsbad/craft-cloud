@@ -172,8 +172,11 @@ fn place_answer(wanted: &[ListRequest], answers: &mut Slots, errors: &mut Vec<Er
             let slot = find(answers, &|(a, s)| *a == app && *s == space);
             match (slot, space) {
                 (Some(i), _) => answers[i] = Some(Ok(entries)),
+                // The personal list again: a push of a change from a new agent while team lists are still to come, so it is
+                // taken for the old agent's answer only when the personal list of that app was not asked for or has not come.
                 (None, None) => {
-                    if let Some(i) = find(answers, &|(a, s)| *a == app && s.is_some()) {
+                    let personal_has_come = wanted.iter().zip(answers.iter()).any(|((a, s), slot)| *a == app && s.is_none() && slot.is_some());
+                    if !personal_has_come && let Some(i) = find(answers, &|(a, s)| *a == app && s.is_some()) {
                         answers[i] = Some(Err(wrong_space()));
                     }
                 }
@@ -479,16 +482,30 @@ mod tests {
     }
 
     /// An agent from before team spaces answers the personal list to a team request: that is the space's error, never its list.
-    /// The personal list asked for beside it is still the personal one.
+    /// A personal list that has come already and comes again (a change pushed by a new agent while the team lists are still to
+    /// come) is not that: the team request stays open for its own list.
     #[test]
     fn a_list_under_another_space_is_not_the_spaces_list() {
         let a = SpaceId::generate();
         let wanted: Vec<ListRequest> = vec![("wordcraft".into(), None), ("wordcraft".into(), Some(a))];
         let mut answers: Slots = wanted.iter().map(|_| None).collect();
         place_answer(&wanted, &mut answers, &mut Vec::new(), list("wordcraft", None, "mine"));
-        place_answer(&wanted, &mut answers, &mut Vec::new(), list("wordcraft", None, "mine"));
+        place_answer(&wanted, &mut answers, &mut Vec::new(), list("wordcraft", None, "mine, changed"));
         assert_eq!(path_of(&answers[0]).as_deref(), Some("mine"));
-        assert!(matches!(&answers[1], Some(Err(Error::Refused { code, .. })) if code == codes::AGENT_TOO_OLD), "{:?}", answers[1]);
+        assert!(answers[1].is_none(), "a repeated personal push leaves the team slot open: {:?}", answers[1]);
+        place_answer(&wanted, &mut answers, &mut Vec::new(), list("wordcraft", Some(a), "theirs"));
+        assert_eq!(path_of(&answers[1]).as_deref(), Some("theirs"));
+        // An old agent, asked for the team list only, answers the personal one: that is the space's error.
+        let only_team: Vec<ListRequest> = vec![("wordcraft".into(), Some(a))];
+        let mut old: Slots = only_team.iter().map(|_| None).collect();
+        place_answer(&only_team, &mut old, &mut Vec::new(), list("wordcraft", None, "mine"));
+        assert!(matches!(&old[0], Some(Err(Error::Refused { code, .. })) if code == codes::AGENT_TOO_OLD), "{:?}", old[0]);
+        // Asked for both, an old agent's second answer is not told from a push: the team request is left to time out (`Io`).
+        let both: Vec<ListRequest> = wanted.clone();
+        let mut slots: Slots = both.iter().map(|_| None).collect();
+        place_answer(&both, &mut slots, &mut Vec::new(), list("wordcraft", None, "mine"));
+        place_answer(&both, &mut slots, &mut Vec::new(), list("wordcraft", None, "mine"));
+        assert!(slots[1].is_none());
         // An error names no request: it waits until as many requests are open as errors came, and then they are those.
         let (mut errors, mut open): (Vec<Error>, Slots) = (Vec::new(), wanted.iter().map(|_| None).collect());
         place_answer(&wanted, &mut open, &mut errors, Wire::Error { id: None, code: "not_found".into(), message: "no".into() });
