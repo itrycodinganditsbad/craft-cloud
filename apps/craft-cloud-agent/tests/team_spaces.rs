@@ -2245,6 +2245,48 @@ async fn an_app_is_told_when_the_space_of_an_open_document_stops_syncing() {
     drop(docs_ben);
 }
 
+/// Changes an app sends while the space is being turned off are each either kept (acked) or refused with `not_found`: none is
+/// dropped without an answer. (After the first refusal the app has been told the space stopped, and the connection lets
+/// further changes of its documents be.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn changes_sent_while_a_space_is_turned_off_are_each_answered() {
+    const SENT: u64 = 400;
+    let (t, _ana_folder, ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let space = t.space;
+    let client = t.ben.client();
+    let path = ben_folder.join("plan.txt");
+    let (docs_ben, team_doc) = off(move || {
+        let docs = client.documents().unwrap();
+        let doc = AppDoc::new(live(open_doc(&docs, &path, "unused", false)), 21);
+        (docs, doc)
+    })
+    .await;
+    // The app types as fast as it can, from a thread of its own, while the space is turned off.
+    let typing = tokio::task::spawn_blocking(move || {
+        for n in 0..SENT {
+            team_doc.append(&format!(" {n}"));
+        }
+        team_doc
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    t.ben.sync_off(space).await;
+    let team_doc = typing.await.unwrap();
+    eventually("every change sent before the first refusal is answered", || async {
+        let events = team_doc.pump();
+        let refused = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Refused { seq, code, .. } if code == "not_found" => Some(*seq),
+                _ => None,
+            })
+            .min();
+        let upto = refused.unwrap_or(SENT + 1);
+        (1..upto).all(|seq| events.iter().filter(|e| **e == Event::Acked(seq)).count() == 1)
+    })
+    .await;
+    drop(docs_ben);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_team_spaces_at_once_each_have_their_own_link_and_documents_are_routed_by_path() {
     let t = team(SpaceRole::Editor).await;

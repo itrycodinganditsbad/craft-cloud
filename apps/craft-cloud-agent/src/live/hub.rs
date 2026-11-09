@@ -1597,11 +1597,26 @@ async fn run(
         let writer_gone = state.socket.as_ref().map(|s| s.gone.clone());
         tokio::select! {
             _ = &mut stop => {
-                if state.config.team {
-                    state.tell_stopped();
-                }
+                // The connection goes first, so what is handled below is only kept (journaled), never sent.
                 if let Some(socket) = state.socket.take() {
                     socket.close().await;
+                }
+                // From here a call to the hub fails (`HubError::Gone`), and the docs socket answers it itself. What was queued
+                // before is handled as ever: a change is journaled and acked, a save recorded; a recents call is dropped
+                // unanswered, which its caller takes for `Gone`.
+                requests.close();
+                while let Some(request) = requests.recv().await {
+                    match request {
+                        Request::Pause(_, done) => {
+                            let _ = done.send(());
+                        }
+                        Request::Follow { .. } | Request::Add { .. } => {}
+                        request @ Request::Docs(_) => state.handle(request).await,
+                    }
+                }
+                // Only now, so a document is told after the answers to everything it had sent.
+                if state.config.team {
+                    state.tell_stopped();
                 }
                 if let Err(e) = state.replica.flush_documents() {
                     state.say(format!("the live documents couldn't be written to disk: {e}"));
