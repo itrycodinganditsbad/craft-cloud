@@ -7,7 +7,7 @@ mod looping;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use craft_cloud_agent::live::docs::FAIL_WRITES;
+use craft_cloud_agent::live::docs::{FAIL_WRITES, FAIL_WRITES_OF, READ_ON_MS};
 use craft_cloud_app::live::{Event, Opened};
 use craft_cloud_proto::local::docs::{STATE, UPDATE, decode_binary, encode_binary};
 use futures_util::{SinkExt, StreamExt};
@@ -28,6 +28,10 @@ struct Healthy;
 impl Drop for Healthy {
     fn drop(&mut self) {
         FAIL_WRITES.store(false, Ordering::Relaxed);
+        READ_ON_MS.store(0, Ordering::Relaxed);
+        if let Ok(mut named) = FAIL_WRITES_OF.lock() {
+            *named = None;
+        }
     }
 }
 
@@ -180,4 +184,53 @@ async fn a_failed_write_to_the_app_does_not_cut_off_the_changes_still_arriving()
     the_laptop_gets(&laptop, typed).await;
     run_pc.stop().await.0.unwrap();
     run_laptop.stop().await.0.unwrap();
+}
+
+/// Two apps wait for the import of one file; the one asked first stops taking messages (its connection stays open).
+/// The other is asked at once, not when the first connection is finally cleaned up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_next_app_is_asked_for_the_import_when_the_first_one_stops_taking_messages() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let _healthy = Healthy;
+    let server = Server::new().await;
+    let pc = Agent::signed_in(&server, "pc").await;
+    let run_pc = pc.run();
+    // The local API is up once a client connects.
+    let _client = pc.client().await;
+    std::fs::create_dir_all(&pc.folder).unwrap();
+    std::fs::write(pc.folder.join("notes.txt"), "start").unwrap();
+    // The first connection is read on for far longer than this test lasts, so its `Gone` cannot be what helps.
+    READ_ON_MS.store(120_000, Ordering::Relaxed);
+    let open = serde_json::json!({ "type": "open", "id": 1, "path": "notes.txt", "app": "stuck" });
+    let mut first = connect(&pc).await;
+    first.send(Message::Text(open.to_string().into())).await.unwrap();
+    loop {
+        if let Message::Text(text) = next(&mut first).await {
+            let event: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+            if event["type"] == "needs_import" {
+                break;
+            }
+        }
+    }
+    // From now on, writes to the first app fail.
+    *FAIL_WRITES_OF.lock().unwrap() = Some("stuck".into());
+    let mut second = connect(&pc).await;
+    let open = serde_json::json!({ "type": "open", "id": 1, "path": "notes.txt", "app": "wordcraft" });
+    second.send(Message::Text(open.to_string().into())).await.unwrap();
+    // The first app's updates for its still unanswered open, which the hub can only refuse, make it find out that the first
+    // app takes nothing.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let asked = loop {
+        assert!(std::time::Instant::now() < deadline, "the second app was never asked for the import");
+        let _ = first.send(Message::Binary(encode_binary(UPDATE, 1, b"x").into())).await;
+        if let Ok(Some(Ok(Message::Text(text)))) = tokio::time::timeout(Duration::from_millis(100), second.next()).await {
+            let event: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+            if event["type"] == "needs_import" {
+                break event;
+            }
+        }
+    };
+    assert_eq!(asked["id"], 1);
+    drop((first, second));
+    run_pc.stop().await.0.unwrap();
 }

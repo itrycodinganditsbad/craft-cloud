@@ -691,12 +691,25 @@ impl State {
     /// to be taken in, and `DocsCall::Gone` (always the last call of a connection) cleans up after them.
     fn tell(&mut self, conn: ConnId, message: DocOut) -> Vec<ClientFrame> {
         let Some(c) = self.docs.conns.get_mut(&conn) else { return Vec::new() };
-        if let Some(out) = &c.out
-            && out.try_send(message).is_err()
-        {
-            c.out = None;
+        let Some(out) = &c.out else { return Vec::new() };
+        if out.try_send(message).is_ok() {
+            return Vec::new();
         }
-        Vec::new()
+        c.out = None;
+        // An import asked of this connection will not come: the next open waiting for that document is asked now, not
+        // when the connection's `Gone` arrives.
+        let orphaned: Vec<DocId> = self.docs.importer.iter().filter(|(_, (c, _))| *c == conn).map(|(doc, _)| *doc).collect();
+        let mut frames = Vec::new();
+        for doc in orphaned {
+            self.docs.importer.remove(&doc);
+            frames.extend(self.ask_import(doc));
+        }
+        frames
+    }
+
+    /// Whether messages still go to docs connection `conn`.
+    fn takes_messages(&self, conn: ConnId) -> bool {
+        self.docs.conns.get(&conn).is_some_and(|c| c.out.is_some())
     }
 
     /// The opens of `doc`: every connection and number it is open as.
@@ -835,17 +848,18 @@ impl State {
         }
     }
 
-    /// The first open waiting for `doc` is asked for its import; with none left, the join is given up on.
+    /// The first open waiting for `doc` that can still be told is asked for its import; with none left, the join is
+    /// given up on. Opens of a connection that no longer takes messages stay waiting for its `Gone`, but are not asked.
     fn ask_import(&mut self, doc: DocId) -> Vec<ClientFrame> {
-        let first = self.docs.waiting.get(&doc).and_then(|w| w.first().copied());
-        match first {
+        let waiting = self.docs.waiting.get(&doc).cloned().unwrap_or_default();
+        match waiting.iter().find(|(conn, _)| self.takes_messages(*conn)).copied() {
             Some((conn, id)) => {
                 self.docs.importer.insert(doc, (conn, id));
                 self.tell(conn, DocOut::NeedsImport { id })
             }
             None => {
                 self.docs.importer.remove(&doc);
-                self.replica.abandon_join(doc)
+                if waiting.is_empty() { self.replica.abandon_join(doc) } else { Vec::new() }
             }
         }
     }
@@ -1178,7 +1192,9 @@ impl State {
     fn docs_call(&mut self, call: DocsCall) -> Vec<ClientFrame> {
         match call {
             DocsCall::Connect { conn, out } => {
-                self.docs.conns.insert(conn, DocsConn { out: Some(out), handles: BTreeMap::new(), identity: BTreeSet::new(), presence: HashMap::new() });
+                self.docs
+                    .conns
+                    .insert(conn, DocsConn { out: Some(out), handles: BTreeMap::new(), identity: BTreeSet::new(), presence: HashMap::new() });
                 Vec::new()
             }
             DocsCall::Open { conn, id, path, app, file_hash, identity } => self.open(conn, id, &path, &app, Wish { file_hash, identity }),
