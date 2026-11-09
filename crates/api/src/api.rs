@@ -919,7 +919,7 @@ pub struct AdminSpaceList {
 
 /// The names of the security events, the closed list the server writes and `GET /admin/audit` filters by (`docs/design/sync.md`,
 /// "Security audit log"). A filter is one of these, or a prefix of some of them that ends in a dot, like `auth.`.
-pub const AUDIT_ACTIONS: [&str; 45] = [
+pub const AUDIT_ACTIONS: [&str; 46] = [
     "auth.login",
     "auth.login_failed",
     "auth.second_factor_failed",
@@ -1100,7 +1100,7 @@ mod tests {
 
     #[test]
     fn audit_filters_are_the_closed_list_or_a_prefix_of_it() {
-        assert_eq!(AUDIT_ACTIONS.len(), 45);
+        assert_eq!(AUDIT_ACTIONS.len(), 46);
         assert!(AUDIT_ACTIONS.iter().all(|a| valid_audit_action(a)));
         for prefix in ["auth.", "admin.", "cli.", "join.", "device.", "account.", "space."] {
             assert!(valid_audit_action(prefix), "{prefix}");

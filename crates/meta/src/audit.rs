@@ -102,7 +102,7 @@ pub enum AuditAction {
 
 impl AuditAction {
     /// Every action, in the order the documentation lists them.
-    pub const ALL: [AuditAction; 45] = [
+    pub const ALL: [AuditAction; 46] = [
         AuditAction::AuthLogin,
         AuditAction::AuthLoginFailed,
         AuditAction::AuthSecondFactorFailed,
@@ -973,7 +973,7 @@ mod tests {
             assert_eq!(AuditAction::parse(action.as_str()), Some(action));
             assert!(action.as_str().bytes().all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'.'));
         }
-        assert_eq!(seen.len(), 45);
+        assert_eq!(seen.len(), 46);
         assert_eq!(AuditAction::parse("auth.login "), None);
         assert_eq!(AuditAction::parse("AUTH.LOGIN"), None);
     }
