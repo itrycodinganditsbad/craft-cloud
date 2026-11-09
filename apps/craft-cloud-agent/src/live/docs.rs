@@ -424,7 +424,9 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                     let seq = link.seqs.entry(id).or_insert(0);
                     *seq += 1;
                     if body.is_empty() || body.len() > MAX_UPDATE_BYTES {
-                        return Ok(send_json(socket, &refuse(Some(*seq), format!("a held change is 1 to {MAX_UPDATE_BYTES} bytes"))).await);
+                        let event = refuse(Some(*seq), format!("a held change is 1 to {MAX_UPDATE_BYTES} bytes"));
+                        link.reply(socket, &event).await?;
+                        return Ok(true);
                     }
                     DocsCall::Hold { conn: link.conn, id, seq: *seq, bytes: body.to_vec() }
                 }
