@@ -289,6 +289,17 @@ pub mod hook {
     }
 }
 
+/// Whether a skip reason of the team pass is one the pass gets over by itself: a file that was just put there and has not settled
+/// yet, one that waits for a Craft save, or one that was not there when the pass came to read it (the copy replaces its own older
+/// team files by moving them aside for a moment, and a pass that met the empty place reports it; the next pass sees the file).
+/// What stays missing never reaches the server, and the wait for the server ends in its stall.
+fn pass_tries_again(why: &str) -> bool {
+    why.starts_with(craft_cloud_sync::STILL_CHANGING)
+        || why.starts_with(craft_cloud_sync::SAVE_ORDER_WAITS)
+        || why.starts_with(craft_cloud_sync::SAVE_RECORD_WAITS)
+        || why.ends_with(": not found")
+}
+
 /// Whether `path` is gone: only "not found" says so (a drive that is not mounted yet, or a permission error, does not).
 fn is_gone(path: &str) -> bool {
     matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == io::ErrorKind::NotFound)
@@ -1082,13 +1093,7 @@ impl Job {
         // The state is read under the generation of the space's setting, as the pass reads it.
         let generation = self.data.load_account().ok().flatten()?.spaces.iter().find(|s| s.space == space)?.generation;
         let (saved, _) = self.data.space_dir(space).load_state_for(space, &folder, None, generation).ok()?;
-        // A file that was just put there and has not settled yet (or waits for a Craft save) is tried again by the pass itself.
-        let waits = |why: &str| {
-            why.starts_with(craft_cloud_sync::STILL_CHANGING)
-                || why.starts_with(craft_cloud_sync::SAVE_ORDER_WAITS)
-                || why.starts_with(craft_cloud_sync::SAVE_RECORD_WAITS)
-        };
-        saved.last_pass?.summary?.skipped.into_iter().map(|(_, why)| why).find(|why| !waits(why))
+        saved.last_pass?.summary?.skipped.into_iter().map(|(_, why)| why).find(|why| !pass_tries_again(why))
     }
 
     /// Step 6: the old folder is still exactly what was copied. False when it changed (copy again).
@@ -3083,6 +3088,14 @@ mod tests {
         assert_eq!(std::fs::read(team.join("brief.txt")).unwrap(), b"the brief");
         assert!(!journal_path(&data).exists(), "the foreign journal is dropped");
         assert_eq!(control.from_folder(), None, "and nothing of it is shown");
+    }
+
+    #[test]
+    fn a_skip_for_a_file_that_was_not_there_for_a_moment_is_no_reason_to_stop() {
+        assert!(pass_tries_again("can't be read: Renders/final.mov: not found"));
+        assert!(pass_tries_again(&format!("{} (written 1 s ago)", craft_cloud_sync::STILL_CHANGING)));
+        assert!(!pass_tries_again("can't be read: a.psd: permission denied"));
+        assert!(!pass_tries_again("too big: 9 GiB"));
     }
 
     #[test]
