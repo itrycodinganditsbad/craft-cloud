@@ -73,12 +73,18 @@ pub struct Ctx {
 
 /// The whole page: `body` is markup built with this module's helpers, `title` plain text.
 pub fn page(ctx: Option<&Ctx>, title: &str, body: &str) -> String {
+    // The nav item the page belongs to gets `aria-current`, which the stylesheet shows as the inverted item.
+    let current = |name: &str| if nav_item(title) == name { " aria-current=\"page\"" } else { "" };
     let nav = match ctx {
         Some(ctx) => format!(
-            "<nav aria-label=\"Admin\"><ul><li><a href=\"/web\">Overview</a></li><li><a href=\"/web/users\">Users</a></li>\
-             <li><a href=\"/web/spaces\">Team spaces</a></li><li><a href=\"/web/audit\">Audit log</a></li></ul>\
+            "<nav aria-label=\"Admin\"><ul><li><a href=\"/web\"{}>Overview</a></li><li><a href=\"/web/users\"{}>Users</a></li>\
+             <li><a href=\"/web/spaces\"{}>Team spaces</a></li><li><a href=\"/web/audit\"{}>Audit log</a></li></ul>\
              <form method=\"post\" action=\"/web/logout\" class=\"inline\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
              <span>Signed in as <strong>{}</strong></span> <button type=\"submit\">Sign out</button></form></nav>",
+            current("Overview"),
+            current("Users"),
+            current("Team spaces"),
+            current("Audit log"),
             esc(&ctx.csrf),
             esc(&ctx.username)
         ),
@@ -88,9 +94,20 @@ pub fn page(ctx: Option<&Ctx>, title: &str, body: &str) -> String {
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"robots\" content=\"noindex, nofollow\"><title>{} - Craft Cloud admin</title>\
          <link rel=\"stylesheet\" href=\"/web/style.css\"></head><body><a class=\"skip\" href=\"#main\">Skip to the content</a>\
-         <header><p class=\"brand\">Craft Cloud admin</p>{nav}</header><main id=\"main\" tabindex=\"-1\">{body}</main></body></html>\n",
+         <header><p class=\"brand\">Craft <span class=\"accent\">Cloud</span> <span class=\"badge\">admin</span></p>{nav}</header><main id=\"main\" tabindex=\"-1\">{body}</main></body></html>\n",
         esc(title)
     )
+}
+
+/// The navigation item a page belongs to: its title, `Users` for an account's page (titled `Account <name>`), `Team spaces` for a space's page (titled `Team space <name>`).
+fn nav_item(title: &str) -> &str {
+    if title.starts_with("Account ") {
+        "Users"
+    } else if title.starts_with("Team space ") {
+        "Team spaces"
+    } else {
+        title
+    }
 }
 
 /// A page heading and its first paragraph.
@@ -186,7 +203,9 @@ pub fn post_form(ctx: &Ctx, action: &str, class: &str, inner: &str) -> String {
 
 /// A table with a caption and column headers. Every cell is markup already built with [`esc`].
 pub fn table(caption: &str, headers: &[&str], rows: &[Vec<String>]) -> String {
-    let mut out = format!("<table><caption>{}</caption><thead><tr>", esc(caption));
+    // The wrapper scrolls a wide table inside its own box; it takes the keyboard focus so that it can be scrolled without a mouse.
+    let mut out =
+        format!("<div class=\"scroll\" role=\"region\" tabindex=\"0\" aria-label=\"{0}\"><table><caption>{0}</caption><thead><tr>", esc(caption));
     for header in headers {
         let _ = write!(out, "<th scope=\"col\">{}</th>", esc(header));
     }
@@ -202,7 +221,7 @@ pub fn table(caption: &str, headers: &[&str], rows: &[Vec<String>]) -> String {
         }
         out.push_str("</tr>");
     }
-    out.push_str("</tbody></table>");
+    out.push_str("</tbody></table></div>");
     out
 }
 
