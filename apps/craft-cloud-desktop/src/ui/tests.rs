@@ -6,7 +6,7 @@
 //! [`TOLERANCE`] in a channel.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use craft_cloud_app::{AccountUsage, Error};
 use craft_cloud_app::{DeviceId, DeviceInfo, PairingInfo, RunState, Status, Uuid};
@@ -112,7 +112,7 @@ fn devices() -> Vec<DeviceInfo> {
 /// The one wgpu instance, adapter, device and queue every test renders with. Tests run on parallel threads, and
 /// creating and dropping a D3D12 device (WARP) per harness at the same time crashed the test process with an access
 /// violation. Each harness still gets a renderer of its own on the shared device. It is never dropped, so no device is
-/// torn down while other threads render. Every kittest harness of the app, in any test module, must render with it.
+/// torn down while other threads render. Every kittest harness of the app, in any test module, must render with it through [`serialized`].
 pub(super) fn shared_wgpu() -> eframe::egui_wgpu::WgpuSetup {
     static SHARED: OnceLock<eframe::egui_wgpu::WgpuSetupExisting> = OnceLock::new();
     let shared = SHARED.get_or_init(|| {
@@ -128,9 +128,54 @@ pub(super) fn shared_wgpu() -> eframe::egui_wgpu::WgpuSetup {
     eframe::egui_wgpu::WgpuSetup::Existing(shared.clone())
 }
 
+/// Held while a test touches the GPU. A panicking test poisons it, which says nothing about the GPU, so the poison is ignored.
+static GPU: Mutex<()> = Mutex::new(());
+
+fn gpu() -> MutexGuard<'static, ()> {
+    GPU.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A kittest renderer on the shared device that does its GPU work one test at a time.
+pub(super) struct Serialized(Option<egui_kittest::wgpu::WgpuTestRenderer>);
+
+impl Serialized {
+    fn inner(&mut self) -> &mut egui_kittest::wgpu::WgpuTestRenderer {
+        self.0.as_mut().expect("the renderer lives until the drop")
+    }
+}
+
+impl egui_kittest::TestRenderer for Serialized {
+    fn handle_delta(&mut self, delta: &mut egui::TexturesDelta) {
+        let _gpu = gpu();
+        self.inner().handle_delta(delta);
+    }
+
+    fn render(&mut self, ctx: &egui::Context, output: &egui::FullOutput) -> Result<image::RgbaImage, String> {
+        let _gpu = gpu();
+        self.inner().render(ctx, output)
+    }
+}
+
+impl Drop for Serialized {
+    fn drop(&mut self) {
+        let _gpu = gpu();
+        drop(self.0.take());
+    }
+}
+
+/// The renderer every kittest harness of the app uses: the shared device, with creating, drawing and dropping the
+/// renderer done one test at a time. The DX12 backend of wgpu hands out shader blobs from a cache whose reference
+/// counting is not thread-safe, so renderers made on parallel threads corrupt the heap (gfx-rs/wgpu#10547), and drawing
+/// in parallel on WARP crashes in its JIT (emilk/egui#8772). The lock can go once a wgpu release with the fix
+/// (gfx-rs/wgpu#10805) is in use.
+pub(super) fn serialized() -> Serialized {
+    let _gpu = gpu();
+    Serialized(Some(egui_kittest::wgpu::WgpuTestRenderer::from_setup(shared_wgpu())))
+}
+
 /// The harness: the window drawn for the model, its events kept.
 fn harness(model: Model, theme: egui::Theme) -> Harness<'static, (Model, Vec<Event>)> {
-    Harness::builder().with_size(egui::Vec2::from(WINDOW_SIZE)).with_theme(theme).wgpu_setup(shared_wgpu()).build_ui_state(
+    Harness::builder().with_size(egui::Vec2::from(WINDOW_SIZE)).with_theme(theme).renderer(serialized()).build_ui_state(
         |ui, (model, events): &mut (Model, Vec<Event>)| {
             events.extend(show(ui, model, NOW));
         },
