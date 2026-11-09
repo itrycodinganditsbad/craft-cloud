@@ -666,6 +666,15 @@ for S3, the keys. The server's `Debug` output hides the URL's credentials, and `
 services shows no secret, since none is in an environment or a Compose file. The values are checked against short
 lists of allowed characters before they are written, so a value cannot break the TOML or add a setting.
 
+The template turns two-factor sign-in on (`[two_factor] key_file = "/var/lib/craft-cloud/two-factor.key"`, an absolute path,
+because the config file is in another volume) and leaves the admin pages in the browser off (`[web_admin] enabled = false`,
+the default). `secrets-init` makes the key on its first run: 32 random bytes in the `data` volume, owner 65532, mode 0600. It
+never replaces a key that is there, because the two-factor secrets in the database could not be opened with another one, and it
+is made before the server first starts, so accounts can set up two-factor sign-in at once. To turn the admin pages on, change
+`enabled` to `true` in `config.toml.in` (they need `behind_proxy` and the `https://` `public_url` that the Docker setup has
+anyway), run `docker compose up -d --force-recreate secrets-init` and `docker compose restart server`; see "The admin pages in
+the browser" above.
+
 To change a setting in `.env` (`CC_*`, see `.env.example`), edit the file, run `docker compose up -d --force-recreate secrets-init`
 (it must be recreated to see the new values: Compose gives a container its secrets when it is created, and a plain
 `up` would start the old container again and write the old values back), then `docker compose restart server`.
@@ -732,7 +741,9 @@ other commands of this guide (`device`, `reset-epoch`, `live`) run the same way.
 
 ### Data, upgrading and backups
 
-The data is in the volume `data` (`/var/lib/craft-cloud` in the container): `meta.db` (with SQLite) and `blobs/`.
+The data is in the volume `data` (`/var/lib/craft-cloud` in the container): `meta.db` (with SQLite), `blobs/` and
+`two-factor.key`. **Back the key up apart from the database backups**, and keep it with a restored database: the server
+will not start without the key its two-factor secrets were sealed with (see "Two-factor sign-in").
 The image creates the directory for uid 65532 with mode 0700, so a new named volume gets that owner. A bind mount
 instead of the volume must be prepared first: `chown 65532:65532 DIR && chmod 0700 DIR`.
 
@@ -741,8 +752,8 @@ migrates the database when it opens it and refuses a database newer than itself,
 not go back to an older image without the backup.
 
 There is no backup automation yet. Stop the server (`docker compose stop server`), copy the volume (SQLite:
-`meta.db`, `meta.db-wal`, `meta.db-shm` and `blobs/` together; Postgres: `pg_dump` from the `db` container plus
-`blobs/`), and start it again. Restoring is described above, including `reset-epoch`.
+`meta.db`, `meta.db-wal`, `meta.db-shm`, `blobs/` and `two-factor.key` together; Postgres: `pg_dump` from the `db` container
+plus `blobs/` and `two-factor.key`), and start it again. Restoring is described above, including `reset-epoch`.
 
 `docker compose down` keeps the volumes. `docker compose down -v` deletes all data.
 
