@@ -6,6 +6,8 @@ This document expands P3 to P6 from [collaboration.md](collaboration.md). It is 
 
 A possible MariaDB metadata backend, scope decision, dialect mapping, migration safety, code estimate, CI and open questions: [mysql.md](mysql.md).
 
+An external SFTP-first blob backend, protocol mapping, durability and performance risks, backup-first recommendation, phased estimates and open questions: [remote-storage.md](remote-storage.md).
+
 ## Decisions and changes to earlier decisions
 
 - **Decided (recommended):** libraries remain ordinary files and manifests. No library database tables, special chunk ownership or server-side interpretation. This follows collaboration.md §9 and keeps history, conflict copies, restore and quota behavior uniform.
