@@ -225,7 +225,9 @@ pub async fn measure(meta: &Meta, store: &Store, out: &mut impl Write) -> Result
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LevelEstimate {
     pub level: u8,
+    #[serde(with = "hundredths")]
     pub saving_percent: f64,
+    #[serde(with = "hundredths")]
     pub mib_per_second: f64,
 }
 
@@ -235,8 +237,84 @@ pub struct Estimate {
     pub sampled_blobs: u64,
     pub sampled_bytes: u64,
     /// What the sampled blobs save as they are stored now, in percent of their logical size.
+    #[serde(with = "hundredths")]
     pub current_saving_percent: f64,
     pub levels: Vec<LevelEstimate>,
+}
+
+/// The estimate's measured numbers are kept to hundredths and stored as whole hundredths, so what `last_estimate` reads
+/// back is exactly what `estimate` returned (a float written as decimal text need not parse back to the same bits).
+/// An estimate stored as plain decimals by an earlier server is still read.
+mod hundredths {
+    use serde::de::{self, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    /// `value` rounded to hundredths: the same number `deserialize` gives for what `serialize` stored.
+    pub fn round(value: f64) -> f64 {
+        to_hundredths(value) as f64 / 100.0
+    }
+
+    fn to_hundredths(value: f64) -> i64 {
+        (value * 100.0).round() as i64
+    }
+
+    pub fn serialize<S: Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_i64(to_hundredths(*value))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+        struct Number;
+        impl Visitor<'_> for Number {
+            type Value = f64;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a number")
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<f64, E> {
+                Ok(v as f64 / 100.0)
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<f64, E> {
+                Ok(v as f64 / 100.0)
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<f64, E> {
+                Ok(v)
+            }
+        }
+        deserializer.deserialize_any(Number)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct One(#[serde(with = "super")] f64);
+
+        #[test]
+        fn rounded_values_read_back_exactly() {
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            for _ in 0..10_000 {
+                let speed = (next() >> 11) as f64 / (1u64 << 53) as f64 * 5000.0;
+                let percent = (next() >> 11) as f64 / (1u64 << 53) as f64 * 200.0 - 50.0;
+                for value in [round(speed), round(percent)] {
+                    let json = serde_json::to_string(&One(value)).unwrap();
+                    assert_eq!(serde_json::from_str::<One>(&json).unwrap(), One(value), "{json}");
+                }
+            }
+        }
+
+        #[test]
+        fn plain_decimals_from_an_earlier_server_are_still_read() {
+            assert_eq!(serde_json::from_str::<One>("72.60831048890563").unwrap(), One(72.60831048890563));
+            assert_eq!(serde_json::from_str::<One>("7261").unwrap(), One(72.61));
+            assert_eq!(serde_json::from_str::<One>("0").unwrap(), One(0.0));
+        }
+    }
 }
 
 /// Parses `1,3,9,19`.
@@ -303,11 +381,16 @@ pub async fn estimate(meta: &Meta, store: &Store, sample: usize, levels: &[u8]) 
         .zip(per_level.iter().zip(&nanos))
         .map(|(level, ((plain_bytes, stored), nanos))| LevelEstimate {
             level: *level,
-            saving_percent: 100.0 - percent(*stored, plain_bytes.saturating_add(count)),
-            mib_per_second: if *nanos == 0 { 0.0 } else { *plain_bytes as f64 / (1024.0 * 1024.0) / (*nanos as f64 / 1e9) },
+            saving_percent: hundredths::round(100.0 - percent(*stored, plain_bytes.saturating_add(count))),
+            mib_per_second: if *nanos == 0 { 0.0 } else { hundredths::round(*plain_bytes as f64 / (1024.0 * 1024.0) / (*nanos as f64 / 1e9)) },
         })
         .collect();
-    Ok(Some(Estimate { sampled_blobs: count, sampled_bytes: plain, current_saving_percent: 100.0 - percent(physical_now, logical), levels }))
+    Ok(Some(Estimate {
+        sampled_blobs: count,
+        sampled_bytes: plain,
+        current_saving_percent: hundredths::round(100.0 - percent(physical_now, logical)),
+        levels,
+    }))
 }
 
 /// The summary `store estimate` prints.
