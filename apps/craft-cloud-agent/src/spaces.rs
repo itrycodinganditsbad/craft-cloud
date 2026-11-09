@@ -1321,6 +1321,7 @@ impl Manager {
                     team: true,
                     username: account.username.clone(),
                     read_only: team.read_only,
+                    generation: team.setting.generation,
                 };
                 match Hub::start(config, control, paused) {
                     Ok(hub) => {
