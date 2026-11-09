@@ -14,7 +14,7 @@ pub(super) fn line_with_details(ui: &mut egui::Ui, line: &str, details: &str) {
 
 /// The screen for the agent not running, or for a problem with the account here.
 pub(super) fn screen(ui: &mut egui::Ui, problem: &Problem, busy: Option<Busy>, events: &mut Vec<Event>) {
-    super::heading(ui, "Craft Cloud");
+    super::wordmark(ui);
     line_with_details(ui, &problem.line, &problem.details);
     ui.add_space(12.0);
     match problem.action {
@@ -36,7 +36,7 @@ pub(super) fn screen(ui: &mut egui::Ui, problem: &Problem, busy: Option<Busy>, e
 
 /// This computer was removed from the account on another one.
 pub(super) fn removed(ui: &mut egui::Ui, busy: Option<Busy>, events: &mut Vec<Event>) {
-    super::heading(ui, "Craft Cloud");
+    super::wordmark(ui);
     super::error_line(ui, REMOVED);
     ui.label("The files stay on this computer.");
     ui.add_space(12.0);
