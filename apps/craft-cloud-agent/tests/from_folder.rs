@@ -1076,13 +1076,26 @@ async fn an_old_folder_swapped_for_a_link_to_an_identical_copy_is_not_deleted_fr
     ana.until(FromFolderStep::Trashing).await;
     // The whole old folder is moved aside (the copy has the same files with the same times) and a link takes its place.
     let backup = ana.dir.path().join("Backup");
-    std::fs::rename(&project, &backup).unwrap();
+    rename_when_free(&project, &backup);
     make_link(&project, &backup);
     hook::set(ana.data.path(), None);
     let stopped = ana.until(FromFolderStep::Failed).await;
     assert_eq!(stopped.failed_at, Some(FromFolderStep::Trashing), "{stopped:?}");
     assert!(stopped.message.as_deref().is_some_and(|m| m.contains("moved or replaced")), "{stopped:?}");
     assert_eq!(files_under(&backup), files, "the copy behind the link is untouched");
+}
+
+/// Renames a folder. Windows refuses (access denied) while a program has a file in it open, as the agent's pass has while it reads
+/// the folder, so the rename is tried again for a short while.
+fn rename_when_free(from: &Path, to: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => panic!("{} cannot be renamed to {}: {e}", from.display(), to.display()),
+        }
+    }
 }
 
 fn slow_quarantine(_held: &Path) {
