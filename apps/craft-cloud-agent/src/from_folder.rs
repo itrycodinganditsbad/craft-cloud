@@ -43,7 +43,7 @@ use craft_cloud_sync::Transport;
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
-use crate::account::{Account, DataDir, random_hex, write_atomic};
+use crate::account::{Account, DataDir, random_hex, retry_busy, write_atomic};
 use crate::cli::AgentError;
 use crate::disk::AGENT_DIR;
 use crate::http::{CallError, HttpTransport};
@@ -82,12 +82,74 @@ fn journal_path(data: &DataDir) -> PathBuf {
     data.path().join(JOURNAL_FILE)
 }
 
-fn read_saved(data: &DataDir, personal: SpaceId) -> Option<Journal> {
-    let bytes = std::fs::read(journal_path(data)).ok()?;
-    let journal: Journal = serde_json::from_slice(&bytes).ok()?;
-    (journal.schema <= JOURNAL_SCHEMA && journal.personal == personal).then_some(journal)
+/// What the journal file is.
+enum Look {
+    /// There is none.
+    Absent,
+    /// There is one that could not be read (another program holds it, no permission, a failing disk): nothing is known of it, and it
+    /// must not be taken for absent or for another account's.
+    Unreadable(String),
+    /// It was read and is not a journal at all.
+    Broken,
+    /// A journal of another account, or of a newer agent.
+    Other(Box<Journal>),
+    /// This account's journal.
+    Mine(Box<Journal>),
 }
 
+/// Reads the journal file (a read that Windows refuses because another program holds the file is tried again for a moment).
+fn look_at_journal(data: &DataDir, personal: SpaceId) -> Look {
+    let bytes = match retry_busy(|| std::fs::read(journal_path(data))) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Look::Absent,
+        Err(e) => return Look::Unreadable(e.to_string()),
+    };
+    match serde_json::from_slice::<Journal>(&bytes) {
+        Err(_) => Look::Broken,
+        Ok(journal) if journal.schema <= JOURNAL_SCHEMA && journal.personal == personal => Look::Mine(Box::new(journal)),
+        Ok(journal) => Look::Other(Box::new(journal)),
+    }
+}
+
+/// This account's journal, if there is one that can be read.
+fn read_saved(data: &DataDir, personal: SpaceId) -> Option<Journal> {
+    match look_at_journal(data, personal) {
+        Look::Mine(journal) => Some(*journal),
+        _ => None,
+    }
+}
+
+/// Sets a journal that is not a journal aside, beside its place (`from-folder.json.broken-<time>`), so that it is not lost and
+/// does not stand in the way. If it cannot be moved it stays where it is.
+fn set_aside(data: &DataDir) {
+    let path = journal_path(data);
+    let aside = data.path().join(format!("{JOURNAL_FILE}.broken-{}", crate::cli::now_ms()));
+    match retry_busy(|| std::fs::rename(&path, &aside)) {
+        Ok(()) => crate::runlog::note(format_args!(
+            "the journal of making a team space from a folder is not readable as one; it is kept as {}",
+            aside.display()
+        )),
+        Err(e) => {
+            crate::runlog::note(format_args!("the journal of making a team space from a folder is not readable as one, and can't be set aside: {e}"))
+        }
+    }
+}
+
+/// What a journal that says the work is running means when no work of this session runs: it was interrupted.
+fn mark_interrupted(status: &mut FromFolderStatus) {
+    status.failed_at = Some(status.step);
+    status.message = Some(match status.step {
+        FromFolderStep::Trashing => {
+            "The agent stopped while the old folder was being deleted. Every file is in the team space; ask again to finish, and the \
+            files still in the old folder are checked once more before they are deleted."
+                .to_owned()
+        }
+        _ => "The agent stopped before this was finished. Your old folder was not changed; ask again to go on with the same team space.".to_owned(),
+    });
+    status.step = FromFolderStep::Interrupted;
+}
+
+#[cfg(test)]
 fn read_journal(data: &DataDir, personal: SpaceId) -> Option<FromFolderStatus> {
     read_saved(data, personal).map(|j| j.status)
 }
@@ -306,27 +368,20 @@ fn is_gone(path: &str) -> bool {
 }
 
 /// Reads the journal at the start of an agent that is signed in: work that was under way is now interrupted. A journal of
-/// another account is removed. Whatever a crashed deletion left in the quarantine of this personal folder goes back first,
+/// another account is removed; a file that is no journal is set aside (`from-folder.json.broken-<time>`); a journal that can't be
+/// read is left as it is and the status says so. Whatever a crashed deletion left in the quarantine of this personal folder goes back first,
 /// whichever journal (or none) it belongs to; if some of it cannot be put back the work is not done, and the status says where
 /// the files are.
 pub fn restore(control: &Control, data: &DataDir, account: &Account) {
     let (stranded, unknown) = recover_quarantine_all(account);
     let path = journal_path(data);
-    let Some(mut status) = read_journal(data, account.space) else {
-        // A journal of another account (or of a newer agent) is dropped; team files its copy moved aside are put back first, or
-        // noted in the log (the status of another account is never shown here).
-        if let Some(other) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Journal>(&b).ok())
-            && let (Some(folder), Some(space)) = (other.status.team_folder.as_deref(), other.status.space)
-        {
-            for left in recover_team_asides(data, space, Path::new(folder)) {
-                crate::runlog::note(format_args!("a team file that a copy of another account moved aside is kept in {}", left.display()));
-            }
-        }
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
-        }
-        if !stranded.is_empty() {
-            let kept = FromFolderStatus {
+    let mut status = match look_at_journal(data, account.space) {
+        Look::Mine(journal) => journal.status,
+        Look::Unreadable(why) => {
+            // Nothing is known of what the work was: the file stays as it is (it is read again at the next start and at the next
+            // call), and the status says so.
+            crate::runlog::note(format_args!("the journal of making a team space from a folder can't be read: {why}"));
+            let held = FromFolderStatus {
                 folder: String::new(),
                 name: String::new(),
                 step: FromFolderStep::Failed,
@@ -334,13 +389,47 @@ pub fn restore(control: &Control, data: &DataDir, account: &Account) {
                 team_folder: None,
                 done: 0,
                 total: 0,
-                failed_at: Some(FromFolderStep::Trashing),
-                message: Some(stranded_words(&stranded)),
+                failed_at: None,
+                message: Some(format!(
+                    "The record of the work of making a team space from a folder can't be read now ({why}). It is kept as it is; ask again in a moment."
+                )),
                 kept: 0,
             };
-            control.set_from_folder(Some(kept));
+            control.set_from_folder(Some(held));
+            return;
         }
-        return;
+        gone => {
+            // A journal of another account (or of a newer agent) is dropped; team files its copy moved aside are put back first, or
+            // noted in the log (the status of another account is never shown here). A file that is no journal is set aside.
+            match gone {
+                Look::Other(other) => {
+                    if let (Some(folder), Some(space)) = (other.status.team_folder.as_deref(), other.status.space) {
+                        for left in recover_team_asides(data, space, Path::new(folder)) {
+                            crate::runlog::note(format_args!("a team file that a copy of another account moved aside is kept in {}", left.display()));
+                        }
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
+                Look::Broken => set_aside(data),
+                _ => {}
+            }
+            if !stranded.is_empty() {
+                let kept = FromFolderStatus {
+                    folder: String::new(),
+                    name: String::new(),
+                    step: FromFolderStep::Failed,
+                    space: None,
+                    team_folder: None,
+                    done: 0,
+                    total: 0,
+                    failed_at: Some(FromFolderStep::Trashing),
+                    message: Some(stranded_words(&stranded)),
+                    kept: 0,
+                };
+                control.set_from_folder(Some(kept));
+            }
+            return;
+        }
     };
     // Team files an interrupted copy moved aside go back before anything else looks at the team folder.
     let asides = match (status.team_folder.as_deref(), status.space) {
@@ -382,18 +471,7 @@ pub fn restore(control: &Control, data: &DataDir, account: &Account) {
         return;
     }
     if status.running() {
-        status.failed_at = Some(status.step);
-        status.message = Some(match status.step {
-            FromFolderStep::Trashing => {
-                "The agent stopped while the old folder was being deleted. Every file is in the team space; ask again to finish, and the \
-                files still in the old folder are checked once more before they are deleted."
-                    .to_owned()
-            }
-            _ => {
-                "The agent stopped before this was finished. Your old folder was not changed; ask again to go on with the same team space.".to_owned()
-            }
-        });
-        status.step = FromFolderStep::Interrupted;
+        mark_interrupted(&mut status);
         write_journal(data, account.space, &status);
     }
     control.set_from_folder(Some(status));
@@ -471,8 +549,27 @@ pub(crate) async fn start(start: Start, request: FromFolderRequest) -> Result<Fr
     let scan = scan?;
     let canonical = scan.root.clone();
 
-    let saved = read_saved(&data, account.space);
-    let before = saved.as_ref().map(|j| j.status.clone());
+    // A journal that is there and can't be read says nothing: the folder is not treated as new while it exists.
+    let saved = match look_at_journal(&data, account.space) {
+        Look::Unreadable(why) => {
+            return Err(LocalError::new(
+                axum::http::StatusCode::CONFLICT,
+                craft_cloud_proto::api::codes::CONFLICT,
+                format!("the record of an earlier try of making a team space from a folder can't be read now ({why}); ask again in a moment"),
+            ));
+        }
+        Look::Mine(journal) => Some(*journal),
+        _ => None,
+    };
+    // Work that the journal says is running, while none of this session runs (checked above), was interrupted: it is told so even
+    // if the start of the agent could not read the journal.
+    let before = saved.as_ref().map(|j| {
+        let mut status = j.status.clone();
+        if status.running() {
+            mark_interrupted(&mut status);
+        }
+        status
+    });
     let started_before = saved.and_then(|j| j.started_ms);
     let same = |s: &FromFolderStatus| s.folder == canonical.display().to_string() && s.name == name.as_str();
     // Asked again for the same folder and name: goes on with the space that was made, when there is one.
@@ -2963,6 +3060,106 @@ mod tests {
         let shown = control.from_folder().unwrap();
         assert_eq!(shown.step, FromFolderStep::Failed, "not rewritten and not done: {shown:?}");
         assert!(shown.message.as_deref().is_some_and(|m| m.starts_with(STRANDED_LEAD)), "{shown:?}");
+    }
+
+    /// Makes a file unreadable for the time the returned guard lives (Windows: held open without sharing; elsewhere: no permission).
+    struct Unreadable {
+        #[cfg(windows)]
+        _held: std::fs::File,
+        #[cfg(unix)]
+        path: PathBuf,
+    }
+
+    fn make_unreadable(path: &Path) -> Unreadable {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            Unreadable { _held: std::fs::OpenOptions::new().read(true).share_mode(0).open(path).unwrap() }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            Unreadable { path: path.to_owned() }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Unreadable {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+
+    #[test]
+    fn a_journal_that_cannot_be_read_is_kept_and_used_once_it_can() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path());
+        let account = account_in(dir.path());
+        std::fs::create_dir_all(&account.folder).unwrap();
+        let running = FromFolderStatus { space: Some(SpaceId::generate()), ..status(FromFolderStep::Copying) };
+        write_journal(&data, account.space, &running);
+        let before = std::fs::read(journal_path(&data)).unwrap();
+        // Running as the superuser, permissions do not keep a file from being read: nothing to test then.
+        let held = make_unreadable(&journal_path(&data));
+        if std::fs::read(journal_path(&data)).is_ok() {
+            return;
+        }
+        let control = Control::new(tokio::sync::mpsc::channel(1).0);
+        restore(&control, &data, &account);
+        let shown = control.from_folder().unwrap();
+        assert_eq!(shown.step, FromFolderStep::Failed, "{shown:?}");
+        assert!(shown.message.as_deref().is_some_and(|m| m.contains("can't be read")), "{shown:?}");
+        assert!(matches!(look_at_journal(&data, account.space), Look::Unreadable(_)));
+        drop(held);
+        assert_eq!(std::fs::read(journal_path(&data)).unwrap(), before, "the journal is as it was");
+        // Readable again: the next start finds the work and reports it as interrupted, with its space.
+        let control = Control::new(tokio::sync::mpsc::channel(1).0);
+        restore(&control, &data, &account);
+        let shown = control.from_folder().unwrap();
+        assert_eq!((shown.step, shown.space), (FromFolderStep::Interrupted, running.space), "{shown:?}");
+    }
+
+    #[test]
+    fn a_journal_of_another_account_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path());
+        let account = account_in(dir.path());
+        std::fs::create_dir_all(&account.folder).unwrap();
+        write_journal(&data, SpaceId::generate(), &status(FromFolderStep::Copying));
+        assert!(journal_path(&data).exists());
+        let control = Control::new(tokio::sync::mpsc::channel(1).0);
+        restore(&control, &data, &account);
+        assert!(!journal_path(&data).exists());
+        assert!(control.from_folder().is_none());
+    }
+
+    #[test]
+    fn a_file_that_is_no_journal_is_set_aside_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path());
+        let account = account_in(dir.path());
+        std::fs::create_dir_all(&account.folder).unwrap();
+        std::fs::write(journal_path(&data), b"{ this is not a journal").unwrap();
+        let control = Control::new(tokio::sync::mpsc::channel(1).0);
+        restore(&control, &data, &account);
+        assert!(!journal_path(&data).exists());
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("from-folder.json.broken-"))
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert_eq!(std::fs::read(aside[0].path()).unwrap(), b"{ this is not a journal");
+    }
+
+    #[test]
+    fn a_running_journal_found_without_work_is_told_as_interrupted() {
+        let mut running = status(FromFolderStep::Syncing);
+        mark_interrupted(&mut running);
+        assert_eq!((running.step, running.failed_at), (FromFolderStep::Interrupted, Some(FromFolderStep::Syncing)));
+        assert!(!running.running());
     }
 
     /// A link to a folder (a junction on Windows, which needs no privilege; a symlink elsewhere).

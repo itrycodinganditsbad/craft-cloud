@@ -1401,6 +1401,60 @@ async fn a_team_subfolder_swapped_for_a_link_is_not_written_through() {
     untouched(&project, &files);
 }
 
+/// Makes the journal unreadable while the guard lives (Windows: held open without sharing; elsewhere: no permission).
+struct Unreadable {
+    #[cfg(windows)]
+    _held: std::fs::File,
+    #[cfg(unix)]
+    path: PathBuf,
+}
+
+fn make_unreadable(path: &Path) -> Unreadable {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        Unreadable { _held: std::fs::OpenOptions::new().read(true).share_mode(0).open(path).unwrap() }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        Unreadable { path: path.to_owned() }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Unreadable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_while_the_journal_cannot_be_read_is_refused_and_goes_on_with_the_same_space_once_it_can() {
+    let (w, ana, project, _files) = ana_with_project().await;
+    hook::set(ana.data.path(), Some(Hook::Fail(FromFolderStep::Syncing)));
+    ana.make(&project, "Unread").await.unwrap();
+    let failed = ana.until(FromFolderStep::Failed).await;
+    let space = failed.space.unwrap();
+    hook::set(ana.data.path(), None);
+    let journal = ana.data.path().join(craft_cloud_agent::from_folder::JOURNAL_FILE);
+    let held = make_unreadable(&journal);
+    if std::fs::read(&journal).is_ok() {
+        // Running as the superuser: permissions do not keep a file from being read.
+        return;
+    }
+    // The folder is not taken for a new one (no password is asked for, no second space is made).
+    let refused = ana.make_with(&project, "Unread", None).await.unwrap_err();
+    assert_eq!(refused.code(), Some("conflict"), "{refused:?}");
+    assert_eq!(space_named(&w, "Unread").await, Some(space));
+    drop(held);
+    let started = ana.make_with(&project, "Unread", None).await.unwrap();
+    assert_eq!(started.space, Some(space), "{started:?}");
+    done(&ana).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_team_file_edited_after_the_copy_is_kept_and_the_old_version_goes_beside_it() {
     let (w, ana, project, _files) = ana_with_project().await;
