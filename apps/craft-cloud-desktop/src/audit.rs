@@ -637,7 +637,8 @@ pub(crate) mod tests {
         assert_eq!(view(&model).filter.action, None);
         // Every choice the page offers is one the server takes.
         assert!(filter_choices().iter().all(|c| craft_cloud_app::valid_audit_action(c)));
-        assert_eq!(filter_choices().len(), 52);
+        // The seven groups, then every name of the closed list.
+        assert_eq!(filter_choices().len(), 7 + craft_cloud_app::AUDIT_ACTIONS.len());
         assert_eq!(action_label("auth.login"), "Signed in");
         assert_eq!(action_label("something.new"), "something.new");
         assert_eq!(filter_label("auth."), "Sign-ins");
