@@ -3,6 +3,11 @@
 //! SeaweedFS container (Apache-2.0; run as a separate process, never linked):
 //! `docker run -p 8333:8333 chrislusf/seaweedfs server -s3` then `curl -X PUT http://127.0.0.1:8333/cc-test`. CI sets `CRAFT_CLOUD_REQUIRE_BACKENDS`, which turns a
 //! missing S3 configuration into a failure instead of a skip.
+//!
+//! With the `sftp` feature, the SFTP backend runs when `CRAFT_CLOUD_TEST_SFTP_HOST` is set (with `_PORT`, `_USER`,
+//! `_KEY_FILE`, `_HOST_KEY` (a `SHA256:` fingerprint) and `_ROOT`, a directory the account may write in; every test uses
+//! a fresh directory below it), e.g. against an OpenSSH container (`.github/workflows/ci.yml` starts one). Like S3 it fails
+//! instead of skipping when `CRAFT_CLOUD_REQUIRE_BACKENDS` is set.
 
 use bytes::Bytes;
 use craft_cloud_proto::limits::{MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES};
@@ -676,4 +681,181 @@ async fn list_cursor_is_checked_before_it_is_decoded() {
     let cursor = store.list(kind, None, 1).await.unwrap().next_cursor.unwrap();
     assert!(invalid(store.list(craft_cloud_store::BlobKind::Manifest, Some(cursor.clone()), 1).await));
     assert!(store.list(kind, Some(cursor), 1).await.is_ok());
+}
+
+#[cfg(feature = "sftp")]
+mod sftp {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use craft_cloud_store::sftp::{SftpBackend, SftpConfig};
+    use craft_cloud_store::{Backend, BlobKind, Compression, Store, StoreError};
+
+    use super::{chunk_key, conformance, formats, levels_and_recompress};
+
+    /// A public key that is not the test server's.
+    const OTHER_HOST_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPAV72SkMYdWcs+Y19sIQJFahyXAm1LZbNGMuu76zEl4";
+
+    /// An Ed25519 test key made for this test and trusted nowhere.
+    const UNKNOWN_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACABtJ8d7MWcrbihu4BaI7Xvh4qjXNozoWDfjPdQSki2KAAAAJiSCUw1kglM
+NQAAAAtzc2gtZWQyNTUxOQAAACABtJ8d7MWcrbihu4BaI7Xvh4qjXNozoWDfjPdQSki2KA
+AAAECLlfRNjLumfzdJ/Oo5S0kirR/b0tRMEW99eZQZXdP9mgG0nx3sxZytuKG7gFojte+H
+iqNc2jOhYN+M91BKSLYoAAAAEGNyYWZ0LWNsb3VkLXRlc3QBAgMEBQ==
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    /// The settings of the test server, or `None` (a skip) when none is configured. A fresh root directory per call.
+    fn config() -> Option<SftpConfig> {
+        let Ok(host) = std::env::var("CRAFT_CLOUD_TEST_SFTP_HOST") else {
+            assert!(
+                std::env::var_os("CRAFT_CLOUD_REQUIRE_BACKENDS").is_none(),
+                "CRAFT_CLOUD_REQUIRE_BACKENDS is set but CRAFT_CLOUD_TEST_SFTP_HOST is not"
+            );
+            eprintln!("skipped: CRAFT_CLOUD_TEST_SFTP_HOST not set");
+            return None;
+        };
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set with CRAFT_CLOUD_TEST_SFTP_HOST"));
+        Some(SftpConfig {
+            host,
+            port: var("CRAFT_CLOUD_TEST_SFTP_PORT").parse().unwrap(),
+            user: var("CRAFT_CLOUD_TEST_SFTP_USER"),
+            root: format!("{}/test-{}", var("CRAFT_CLOUD_TEST_SFTP_ROOT").trim_end_matches('/'), uuid::Uuid::now_v7()),
+            key_file: var("CRAFT_CLOUD_TEST_SFTP_KEY_FILE").into(),
+            key_passphrase: None,
+            host_key: Some(var("CRAFT_CLOUD_TEST_SFTP_HOST_KEY")),
+            known_hosts: None,
+            connections: 4,
+            timeout: Duration::from_secs(20),
+            retries: 2,
+        })
+    }
+
+    #[tokio::test]
+    async fn sftp_backend() {
+        let Some(config) = config() else { return };
+        let connect = || async { SftpBackend::connect(&config).await.unwrap() };
+        let store = Store::new(connect().await);
+        conformance(store.clone()).await;
+        let raw = connect().await;
+        assert_eq!(raw.kind(), "sftp");
+        raw.put_raw("chunks/foreign-object", Bytes::new()).await.unwrap();
+        let page = store.list(BlobKind::Chunk, None, 100).await.unwrap();
+        assert_eq!(page.foreign, vec!["chunks/foreign-object"]);
+        // A new backend on the same data (a restart) sees what the first wrote.
+        let data = b"written before the restart";
+        let key = chunk_key(data);
+        store.put(key, data).await.unwrap();
+        let restarted = Store::new(connect().await);
+        assert_eq!(&restarted.get(key).await.unwrap()[..], data);
+        formats(Store::new(connect().await), Store::new(connect().await).with_compression(Compression::None), &connect().await).await;
+        levels_and_recompress(Store::new(connect().await), &connect().await).await;
+    }
+
+    #[tokio::test]
+    async fn sftp_objects_replace_atomically_and_round_trip() {
+        let Some(config) = config() else { return };
+        let backend = SftpBackend::connect(&config).await.unwrap();
+        let path = "chunks/ab/cd/replaced";
+        assert_eq!(backend.get_raw(path).await.unwrap(), None);
+        assert_eq!(backend.size_raw(path).await.unwrap(), None);
+        backend.put_raw(path, Bytes::from_static(b"first")).await.unwrap();
+        backend.put_raw(path, Bytes::from_static(b"the second one is longer")).await.unwrap();
+        assert_eq!(backend.get_raw(path).await.unwrap().unwrap(), Bytes::from_static(b"the second one is longer"));
+        assert_eq!(backend.size_raw(path).await.unwrap(), Some(24));
+        backend.put_raw(path, Bytes::from_static(b"short")).await.unwrap();
+        assert_eq!(backend.get_raw(path).await.unwrap().unwrap(), Bytes::from_static(b"short"), "a shorter replacement leaves no tail");
+        // Bounded reads stop at the limit plus one byte.
+        let big: Vec<u8> = (0..4 * 1024 * 1024 + 123).map(|n| u8::try_from(n % 251).unwrap()).collect();
+        backend.put_raw("chunks/ab/cd/big", Bytes::from(big.clone())).await.unwrap();
+        assert_eq!(backend.get_raw("chunks/ab/cd/big").await.unwrap().unwrap(), Bytes::from(big.clone()));
+        assert_eq!(backend.get_raw_limited("chunks/ab/cd/big", 100).await.unwrap().unwrap().len(), 101);
+        assert_eq!(backend.size_raw("chunks/ab/cd/big").await.unwrap(), Some(u64::try_from(big.len()).unwrap()));
+        backend.put_raw("chunks/ab/cd/empty", Bytes::new()).await.unwrap();
+        assert_eq!(backend.get_raw("chunks/ab/cd/empty").await.unwrap().unwrap().len(), 0);
+        // A directory is not an object.
+        assert_eq!(backend.size_raw("chunks/ab").await.unwrap(), None);
+        backend.delete_raw(path).await.unwrap();
+        backend.delete_raw(path).await.unwrap();
+        assert_eq!(backend.get_raw(path).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn sftp_parallel_writes_share_a_small_pool() {
+        let Some(config) = config() else { return };
+        let store = Store::new(SftpBackend::connect(&config).await.unwrap());
+        let mut tasks = Vec::new();
+        for n in 0..24 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                let data = format!("parallel {n} {}", uuid::Uuid::now_v7()).into_bytes();
+                let key = chunk_key(&data);
+                store.put(key, &data).await.unwrap();
+                assert_eq!(&store.get(key).await.unwrap()[..], &data[..]);
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_refuses_paths_outside_the_layout() {
+        let Some(config) = config() else { return };
+        let backend = SftpBackend::connect(&config).await.unwrap();
+        for bad in ["../escape", "chunks/../../escape", "/etc/passwd", "other/x", "chunks//x", "chunks/ab\\cd"] {
+            assert!(backend.put_raw(bad, Bytes::from_static(b"x")).await.is_err(), "{bad}");
+            assert!(backend.get_raw(bad).await.is_err(), "{bad}");
+            assert!(backend.delete_raw(bad).await.is_err(), "{bad}");
+        }
+        assert!(backend.list_raw("..", None, 10).await.is_err());
+        assert!(backend.list_raw("", None, 10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sftp_refuses_a_host_key_that_is_not_pinned() {
+        let Some(config) = config() else { return };
+        for wrong in [OTHER_HOST_KEY.to_owned(), "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned()] {
+            let wrong = SftpConfig { host_key: Some(wrong), retries: 0, ..config.clone() };
+            let Err(StoreError::Backend(message)) = SftpBackend::connect(&wrong).await else { panic!("must be refused") };
+            assert!(message.contains("host key") || message.contains("fingerprint"), "{message}");
+        }
+        // No pin at all is refused too, before any connection.
+        let none = SftpConfig { host_key: None, ..config.clone() };
+        let Err(StoreError::Backend(message)) = SftpBackend::connect(&none).await else { panic!("must be refused") };
+        assert!(message.contains("pinned host key"), "{message}");
+    }
+
+    /// Fault test: the server restarts between two requests. Needs control of the server, so it is not part of the normal
+    /// run: `CRAFT_CLOUD_TEST_SFTP_CONTAINER=<docker container name> cargo test … -- --ignored sftp_reconnects`.
+    #[tokio::test]
+    #[ignore = "restarts the test container named by CRAFT_CLOUD_TEST_SFTP_CONTAINER"]
+    async fn sftp_reconnects_after_the_server_restarts() {
+        let Some(config) = config() else { return };
+        let container = std::env::var("CRAFT_CLOUD_TEST_SFTP_CONTAINER").expect("CRAFT_CLOUD_TEST_SFTP_CONTAINER names the container to restart");
+        let store = Store::new(SftpBackend::connect(&SftpConfig { retries: 8, ..config }).await.unwrap());
+        let data = b"before the restart";
+        let key = chunk_key(data);
+        store.put(key, data).await.unwrap();
+        assert_eq!(&store.get(key).await.unwrap()[..], data, "a pooled connection is open now");
+        let status = std::process::Command::new("docker").args(["restart", "-t", "1", &container]).status().unwrap();
+        assert!(status.success());
+        // The pooled connections are dead; the request retries on a fresh one, with backoff, until the server is back.
+        assert_eq!(&store.get(key).await.unwrap()[..], data);
+        let after = b"after the restart";
+        let key = chunk_key(after);
+        store.put(key, after).await.unwrap();
+        assert_eq!(&store.get(key).await.unwrap()[..], after);
+    }
+
+    #[tokio::test]
+    async fn sftp_refuses_a_key_the_server_does_not_know() {
+        let Some(config) = config() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("other-key");
+        std::fs::write(&key_file, UNKNOWN_KEY).unwrap();
+        let other = SftpConfig { key_file, retries: 0, ..config };
+        assert!(SftpBackend::connect(&other).await.is_err());
+    }
 }

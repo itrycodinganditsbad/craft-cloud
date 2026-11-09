@@ -41,7 +41,7 @@ impl DiskBackend {
 }
 
 /// The name of a write's temporary file: `.tmp-` and a hyphenated lowercase UUIDv7.
-fn temp_name(id: uuid::Uuid) -> String {
+pub(crate) fn temp_name(id: uuid::Uuid) -> String {
     format!("{TEMP_PREFIX}{}", id.hyphenated())
 }
 
@@ -49,7 +49,7 @@ const TEMP_PREFIX: &str = ".tmp-";
 
 /// Whether `name` is exactly what [`temp_name`] writes. Any other `.tmp-` name is somebody else's file and
 /// is listed as foreign.
-fn is_temp_name(name: &str) -> bool {
+pub(crate) fn is_temp_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix(TEMP_PREFIX) else {
         return false;
     };
