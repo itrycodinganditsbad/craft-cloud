@@ -1577,6 +1577,41 @@ async fn a_folder_link_pointed_at_another_folder_while_syncing_deletes_nothing()
     assert_eq!(names(&a).len(), 6, "the old folder is left as it is");
 }
 
+/// After a link is pointed at another folder (and the space starts afresh there), a local change in the new folder wakes a pass:
+/// the folder watcher is made again for where the link leads now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_change_behind_a_repointed_link_is_noticed() {
+    let t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    eventually("the invitation is listed", || async { t.ben.space(space).await.is_some_and(|s| s.state == "invited") }).await;
+    t.ben.accept(space).await;
+    eventually("ana's agent lists the space", || async { t.ana.space(space).await.is_some_and(|s| s.state == "active") }).await;
+    let ana_folder = t.ana.sync_on(space).await;
+    let (a, b, link) = (t.ben.dir.path().join("A"), t.ben.dir.path().join("B"), t.ben.dir.path().join("Link"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    link_dir(&link, &a);
+    t.ben.sync_on_in(space, &link).await;
+    write(&ana_folder, "first.txt", "the first file");
+    eventually("the folder behind the link has the file", || async { names(&a).len() == 1 }).await;
+    eventually("nothing runs", || async { t.ben.status().await.spaces.iter().all(|s| s.run_state == SpaceRun::Idle) }).await;
+
+    // The link is pointed at B (with the space's marker); a change on the server asks for the pass that notices.
+    std::fs::create_dir_all(b.join(".craft-cloud")).unwrap();
+    std::fs::copy(a.join(".craft-cloud/root.json"), b.join(".craft-cloud/root.json")).unwrap();
+    unlink_dir(&link);
+    link_dir(&link, &b);
+    write(&ana_folder, "poke.txt", "asks for a pass");
+    eventually("the folder behind the link now has everything", || async { names(&b).len() == 2 }).await;
+    eventually("nothing runs", || async { t.ben.status().await.spaces.iter().all(|s| s.run_state == SpaceRun::Idle) }).await;
+
+    // A change in B reaches the server although nothing else asks for a pass; one in the old folder A is not synced.
+    write(&a, "old.txt", "in the folder the link left");
+    write(&link, "late.txt", "written behind the link");
+    eventually("the local change reaches the server", || async { read(&ana_folder, "late.txt").as_deref() == Some("written behind the link") }).await;
+    assert_eq!(read(&ana_folder, "old.txt"), None, "the old folder is not synced any more");
+}
+
 /// A file that can't be deleted while this lives: held open without delete sharing (Windows), or in a read-only folder (Unix).
 struct Held {
     _file: std::fs::File,
