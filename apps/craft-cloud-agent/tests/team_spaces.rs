@@ -1730,3 +1730,20 @@ async fn a_link_pointed_elsewhere_and_back_around_a_pass_deletes_nothing() {
         assert_eq!(read(&ana_folder, &format!("f{i}.txt")).as_deref(), Some(format!("content {i}").as_str()), "f{i} is still on the server");
     }
 }
+
+/// N3: the nonce in a team folder's `.craft-cloud` is rewritten at every checkpoint and recorded in the state saved with it, so a
+/// folder restored from an older copy is told apart even where a file system reuses folder IDs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_folder_nonce_is_rewritten_and_recorded_in_the_state() {
+    let t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    let (ana_folder, a) = six_files(&t).await;
+    let nonce_of = |folder: &Path| std::fs::read_to_string(folder.join(".craft-cloud/nonce")).ok();
+    let before = nonce_of(&a).expect("the folder has a nonce once a pass has run");
+    write(&ana_folder, "more.txt", "another file");
+    eventually("the nonce was rewritten", || async { nonce_of(&a).is_some_and(|n| n != before) }).await;
+    eventually("nothing runs", || async { t.ben.status().await.spaces.iter().all(|s| s.run_state == SpaceRun::Idle) }).await;
+    let nonce = nonce_of(&a).unwrap();
+    let recorded = t.ben.space_state(space).and_then(|s| s["folder_nonce"].as_str().map(str::to_owned));
+    assert_eq!(recorded, Some(nonce), "the state records the nonce the folder carries");
+}

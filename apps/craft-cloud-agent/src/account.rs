@@ -321,6 +321,11 @@ pub struct SavedState {
     /// used for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder_id: Option<u64>,
+    /// A team space's state only: the nonce in the folder's `.craft-cloud/nonce` when this state was saved (see
+    /// [`crate::root::read_nonce`]). A state is used only for a folder whose nonce is this one (both absent counts: a folder
+    /// and a state from before nonces).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_nonce: Option<String>,
     /// A team space's state only: the server's stamp of the account's membership when the state was made
     /// (`SpaceListItem::joined_ms`). A state made under another stamp (the member was removed and invited again meanwhile)
     /// is not used. `None`: the server gave none.
@@ -523,6 +528,9 @@ impl DataDir {
             Some(now) => saved.folder_id == Some(now),
             None => true,
         };
+        // The same path and ID are not enough on a file system that reuses IDs: the folder's nonce must be the one the state
+        // recorded. A folder without a nonce suits a state without one only.
+        let same_nonce = identity.and_then(|i| crate::root::read_nonce(&i.path)) == saved.folder_nonce;
         let same_membership = match (joined_ms, saved.joined_ms) {
             (Some(now), Some(then)) => now == then,
             // The server gives a stamp and the state has none: it was made before the membership was stamped.
@@ -533,6 +541,7 @@ impl DataDir {
             && saved.folder.is_some()
             && saved.folder == here
             && same_folder_id
+            && same_nonce
             && same_membership
             && saved.generation == generation;
         if ours || (saved.state.space.is_none() && saved.last_pass.is_none() && saved.folder.is_none()) {
@@ -1102,6 +1111,25 @@ mod tests {
         saved.folder_id = Some(id);
         data.save_state(&saved).unwrap();
         assert!(!data.load_state_for(space, &a, None, 0).unwrap().1, "the folder it was made for");
+        // The folder's nonce: the state is used only for a folder that carries the nonce it recorded. A folder without one suits a
+        // state without one only, and the other way round.
+        saved.folder_id = Some(id);
+        saved.folder_nonce = None;
+        data.save_state(&saved).unwrap();
+        assert!(!data.load_state_for(space, &a, None, 0).unwrap().1, "neither has a nonce");
+        fs::create_dir_all(a.join(".craft-cloud")).unwrap();
+        fs::write(a.join(".craft-cloud/nonce"), "00ff").unwrap();
+        assert!(data.load_state_for(space, &a, None, 0).unwrap().1, "the folder has a nonce and the state none");
+        saved.folder_nonce = Some("00ff".into());
+        data.save_state(&saved).unwrap();
+        assert!(!data.load_state_for(space, &a, None, 0).unwrap().1, "the same nonce");
+        saved.folder_nonce = Some("11aa".into());
+        data.save_state(&saved).unwrap();
+        assert!(data.load_state_for(space, &a, None, 0).unwrap().1, "an older folder (another nonce) at the same path and ID");
+        fs::remove_file(a.join(".craft-cloud/nonce")).unwrap();
+        assert!(data.load_state_for(space, &a, None, 0).unwrap().1, "the state has a nonce and the folder none");
+        saved.folder_nonce = None;
+        data.save_state(&saved).unwrap();
         // A state made under another generation of the space's setting is not used; the generation is written only when raised.
         saved.joined_ms = None;
         saved.generation = 3;

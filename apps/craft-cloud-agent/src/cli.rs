@@ -1809,8 +1809,11 @@ impl Session {
         };
         let guard_check = still_there.clone();
         engine.on_guard(move || guard_check());
+        // The folder's nonce is rewritten at every checkpoint and at the end of a pass, and recorded in the state saved with it.
+        let checkpoint_folder_path = account.folder.clone();
         engine.on_checkpoint(move |state| {
             still_there()?;
+            let folder_nonce = if bound { Some(root::rotate_nonce(&checkpoint_folder_path)?) } else { None };
             let last_pass = checkpoint_last.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
             let saved = SavedState {
                 schema: STATE_SCHEMA,
@@ -1819,6 +1822,7 @@ impl Session {
                 paused: false,
                 folder: checkpoint_folder.clone(),
                 folder_id: state_folder_id,
+                folder_nonce,
                 joined_ms,
                 generation,
             };
@@ -1950,6 +1954,11 @@ impl Session {
         }
         let last = LastPass { finished_ms: now_ms(), outcome, summary: summary.clone() };
         *self.last_pass.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(last.clone());
+        let folder_nonce = if self.bound {
+            Some(root::rotate_nonce(&self.account.folder).map_err(|source| AgentError::Io { path: self.account.folder.clone(), source })?)
+        } else {
+            None
+        };
         let saved = SavedState {
             schema: STATE_SCHEMA,
             state: self.engine.state().clone(),
@@ -1957,6 +1966,7 @@ impl Session {
             paused: false,
             folder: self.state_folder.clone(),
             folder_id: self.state_folder_id,
+            folder_nonce,
             joined_ms: self.joined_ms,
             generation: self.generation,
         };
