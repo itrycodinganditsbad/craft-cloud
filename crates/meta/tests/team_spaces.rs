@@ -107,6 +107,7 @@ on_every_backend!(
     the_command_line_and_admins_create_and_manage_spaces,
     the_last_owner_stays,
     review_fixes_of_the_routes_hold,
+    an_owner_who_cannot_sign_in_is_not_counted,
     concurrent_changes_never_leave_a_space_without_an_owner,
     guarded_writes_check_the_role_in_their_own_transaction,
     concurrent_guarded_uploads_do_not_deadlock,
@@ -156,6 +157,45 @@ async fn review_fixes_of_the_routes_hold(db: &Db) {
     assert!(matches!(meta.admin_list_spaces(None, Some(&"x".repeat(65)), 10).await, Err(MetaError::Invalid(_))));
     // A name shaped like a space ID is refused, so a space is never named like another.
     assert!(SpaceName::new("0194a2d0-1c3e-7b5a-9d41-2f6e8a7b3c10").is_err());
+}
+
+/// An owner whose account is disabled or marked for removal has no access, so the administrator's list does not count it
+/// (the space may have nobody left to manage it), and the owners of a page come in one query with their account's state.
+async fn an_owner_who_cannot_sign_in_is_not_counted(db: &Db) {
+    let meta = &db.meta;
+    let (boss, actor) = admin_actor(meta, "boss").await;
+    let _ = boss;
+    let (ana, ben, cy) = (user(meta, "ana").await, user(meta, "ben").await, user(meta, "cy").await);
+    let (solo, pair, empty) = (team(meta, "Solo", &ana).await, team(meta, "Pair", &ben).await, team(meta, "Empty", &cy).await);
+    meta.set_owner_accepted(&actor, pair, ana.id, NOW + 1).await.unwrap();
+    let owners = |page: Vec<craft_cloud_meta::SpaceSummary>| page.into_iter().map(|s| (s.name, s.owners)).collect::<Vec<_>>();
+    let all = || async { owners(meta.admin_list_spaces(None, None, 10).await.unwrap().spaces) };
+    assert_eq!(all().await, [("Empty".to_owned(), 1), ("Pair".to_owned(), 2), ("Solo".to_owned(), 1)]);
+
+    meta.admin_disable_user(&actor, ana.id, NOW + 2).await.unwrap();
+    meta.admin_remove_user(&actor, cy.id, NOW + 3).await.unwrap();
+    assert_eq!(all().await, [("Empty".to_owned(), 0), ("Pair".to_owned(), 1), ("Solo".to_owned(), 0)]);
+    assert_eq!(meta.admin_space(solo).await.unwrap().owners, 0);
+    assert_eq!(meta.admin_space(pair).await.unwrap().members, 2, "the member is still a member");
+
+    // The owners of the listed spaces: one query, every accepted owner with the state of the account, by space and name.
+    let found = meta.space_owners(&[solo, pair, empty]).await.unwrap();
+    let mut seen: Vec<_> = found.iter().map(|o| (o.space, o.username.as_str(), o.active())).collect();
+    seen.sort_by_key(|(space, name, _)| (space.to_string(), *name));
+    let mut expected = vec![(solo, "ana", false), (pair, "ana", false), (pair, "ben", true), (empty, "cy", false)];
+    expected.sort_by_key(|(space, name, _)| (space.to_string(), *name));
+    assert_eq!(seen, expected);
+    assert!(found.iter().any(|o| o.username == "ana" && o.disabled_ms.is_some() && o.removed_ms.is_none()));
+    assert!(found.iter().any(|o| o.username == "cy" && o.removed_ms.is_some()));
+    assert!(meta.space_owners(&[]).await.unwrap().is_empty());
+    assert!(meta.space_owners(&[pair]).await.unwrap().iter().all(|o| o.space == pair));
+    // An invited owner is no owner yet.
+    meta.invite_member(&by(&ben), pair, user(meta, "dee").await.id, SpaceRole::Owner, NOW + 4).await.unwrap();
+    assert_eq!(meta.space_owners(&[pair]).await.unwrap().len(), 2);
+
+    // Naming a new owner brings the space back.
+    meta.set_owner_accepted(&actor, solo, ben.id, NOW + 5).await.unwrap();
+    assert_eq!(meta.admin_space(solo).await.unwrap().owners, 1);
 }
 
 async fn user(meta: &Meta, name: &str) -> UserRecord {

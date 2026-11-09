@@ -290,6 +290,31 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
   differs on both sides is kept twice (one as a conflict copy). A member of an archived space has not lost access: the space stays
   listed (`archived: true`) and syncs read-only.
 
+- **Live documents in team spaces.** Each synced team space also has a live link of its own (the server's live protocol 3,
+  `docs/design/live.md`), started and stopped with the space's sync; the agent speaks protocol 3 when the server offers
+  it and protocol 2 otherwise, and a server whose live service cannot serve a team space (a `404` for the link) is asked
+  again only after ten minutes, while the space's files sync on and its documents open as plain files (`not_live`,
+  `offline`). A document is routed by the path the app opens: an absolute path inside a synced team folder is the space's,
+  any other path the personal space's. For a viewer (or an archived space) `opened` says `read_only: true`; an update the
+  app sends is refused with `read_only` and kept nowhere. When the account's access changes while connected (a role
+  raised or lowered, the account removed) the server ends the link with `access_changed`; the agent connects again once
+  and learns the new role, or that it is no longer a member, in which case the space's link stops with the space.
+  Changes that were never acked stay in the document's journal under `live/<space>/` through all of this: they go up when
+  the account may write again, and while it may not, they stay on this computer (the agent's log says how many, by space ID
+  only; the document opens with them in `waiting`). An app that opens with `identity: true` is told who is there (see
+  `docs/design/live.md`); one that does not gets what it always got. The agent's log and its debug output carry space and
+  account IDs, never names. Ctrl-C with an idle personal space and a team pass that hangs (a server that does not answer)
+  waits for that pass; a second Ctrl-C, read meanwhile, ends the wait. A space's live folder (`live/<space>/`) belongs to one hub
+  at a time (a lock file, `.lock`): a hub that replaces one that was stopped (sync turned off and on, a folder moved) starts
+  when the old one has ended, so no change an app was told was kept is overwritten. When a team space stops syncing, the
+  documents an app has open in it are told `status {stopped}` and a later change to one is answered `error {not_found}`;
+  the app's documents in other spaces go on. A viewer's recents `add` is refused with `read_only`. A role change is told to the apps: every open document of the space gets `role {doc, read_only}` when the account's right to change
+  the space changes (both ways; `opened.read_only` is as of the open), so an app that kept a refused change can send it
+  again. An app that ends while it still holds such changes hands them over as binary kind 6 (`held`, one update per frame, in
+  order): the agent puts them into the document's journal like an update (the other apps with the document open get them)
+  acks each once it is on disk (an app that ends waits for that before it closes) and never sends them while the account may not write; they go up with the first connection of an
+  account that may write, with no app open.
+
 | Local call | Answer |
 | --- | --- |
 | `GET /v1/spaces` | `{spaces: [{space, kind, name?, role, state, archived, folder?, sync, run_state?, last_sync_ms?, read_only}]}`: the personal space first, then the team spaces, invitations (`state: "invited"`, no folder) among them. `sync` is `on`, `off` or `unavailable` |
@@ -306,6 +331,9 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
 | `GET /v1/status` | gains `spaces: [{space, run_state, last_sync_ms?, read_only}]`, one per synced space or one that lost access; the top-level fields describe the personal space |
 | `POST /v1/spaces/from-folder` | `{folder, name, quota_bytes?, password?, totp_code?, recovery_code?}` → `FromFolderStatus`: "Make a team space from this folder" (below). An administrator's call: the confirmation is the administrator's own. The call checks the folder and makes the team space (a wrong password, a taken name, an account that is no administrator, a server without team spaces are the call's errors, and nothing exists then), then answers while the rest goes on in the agent |
 | `GET /v1/status` | also has `from_folder`: the work above, under way or how the last one ended (`step`, `space?`, `team_folder?`, `done`/`total` files of the step, `failed_at?`, `message?`, `kept`) |
+| `GET /v1/recents` (WebSocket) | `subscribe {app, space?}` follows a team space's list (it must sync here, else `not_found`); an `add` with an absolute path inside a team folder goes to that space's list; `entries` names the `space` |
+| `GET /v1/docs` (WebSocket) | `open` gains `identity`; `opened` gains `read_only` and `space`; new binary kind 5 (presence with the sender), kind 6 (held changes from an app) and text messages `members` and `role` |
+| `PUT /v1/blobs?for=<path>`, `GET /v1/blobs/{hash}?for=<path>` | the blob of the space of the file at `path` (a team space's, read by every member's agent); without `for`, the personal space |
 
 **Make a team space from this folder** (`POST /v1/spaces/from-folder`). A folder of the personal folder becomes a new team space, with the account as its first owner. The files are copied, never moved, and the old folder goes only when the team space is known to hold every file:
 

@@ -10,6 +10,10 @@
 //! Second review round: turning a space off forgets its state, access lost and regained while the agent is stopped merges, a
 //! space being turned off does not hold the spaces task up (a second stop, other calls, a queued pass), and a failed discovery
 //! is retried for those waiting for the list.
+//! Live documents in team spaces (live protocol 3): a document in a team folder is routed to the space's own live link; two
+//! accounts and a viewer, identity only for apps that ask, a role changed while connected, journals that wait through a
+//! removal, two spaces at once, blobs and recents of a space, a server that cannot serve the link, and one Ctrl-C with a hung
+//! team pass.
 //! Every wait is for a condition, with a timeout; the loops get short timings so the tests stay quick.
 
 use std::net::SocketAddr;
@@ -26,7 +30,8 @@ use craft_cloud_agent::cli::{self, AgentError, Exit, LoginArgs};
 use craft_cloud_agent::daemon::{RunOptions, run_loop};
 use craft_cloud_agent::http::{HttpTransport, ServerUrl};
 use craft_cloud_agent::schedule::Timing;
-use craft_cloud_app::{Client, SpaceInfo, SpaceList, SpaceRole, SpaceRun, SpaceSync, SpaceSyncRequest};
+use craft_cloud_app::live::{Document, Documents, Event, NotLiveReason, OpenOptions, Opened};
+use craft_cloud_app::{Client, NewRecent, SpaceInfo, SpaceList, SpaceRole, SpaceRun, SpaceSync, SpaceSyncRequest};
 use craft_cloud_meta::{Meta, Role, SpaceActor, UserRecord};
 use craft_cloud_proto::{SpaceId, SpaceName};
 use craft_cloud_server::AppState;
@@ -34,6 +39,7 @@ use craft_cloud_server::auth::hash_password;
 use craft_cloud_store::Store;
 use craft_cloud_store::disk::DiskBackend;
 use craft_cloud_sync::Transport;
+use loro::{ExportMode, LoroDoc};
 use tokio::sync::mpsc;
 
 const PASSWORD: &str = "correct horse battery";
@@ -194,6 +200,11 @@ impl Person {
     /// The shared place of team folders: beside the personal folder.
     fn shared(&self) -> PathBuf {
         self.dir.path().join("Craft Cloud Shared")
+    }
+
+    /// A client of this computer's agent (for what blocks: the app stand-ins run it off the async threads).
+    fn client(&self) -> Client {
+        Client::connect_in(self.data.path()).unwrap()
     }
 
     /// A call of the local API, off the async threads (the client blocks).
@@ -552,6 +563,9 @@ struct Front {
     delay_ms: AtomicU64,
     /// The long-polls of a team space asked so far.
     polls: AtomicUsize,
+    /// Answers the live upgrade of a team space (`/api/v1/live` with `craft-space`) with `404`, as a server whose live service
+    /// does not serve team spaces does.
+    live_404: AtomicBool,
 }
 
 async fn front(upstream: &str, behaviour: Front) -> (String, Arc<Front>, tokio::task::JoinHandle<()>) {
@@ -576,6 +590,12 @@ async fn forward(State((upstream, front, client)): State<FrontState>, request: R
     front.seen.lock().unwrap().push((path.clone(), named));
     if named && parts.uri.query().is_some_and(|q| q.contains("wait=")) {
         front.polls.fetch_add(1, Ordering::SeqCst);
+    }
+    if named && path == "/api/v1/live" && front.live_404.load(Ordering::SeqCst) {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("{\"error\":\"not_found\",\"message\":\"no such space\"}"))
+            .unwrap();
     }
     // A request that arrives while `stall` is set (or is held by it) waits until it is cleared.
     while front.stall.load(Ordering::SeqCst) {
@@ -1945,4 +1965,662 @@ async fn only_the_space_with_an_unsaved_generation_is_held_back_and_says_so() {
         t.ben.status().await.spaces.iter().any(|s| s.space == a && !matches!(s.run_state, SpaceRun::Paused { .. } | SpaceRun::NoAccess { .. }))
     })
     .await;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Live documents in team spaces
+
+/// Blocking work off the test's runtime.
+async fn off<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(f).await.unwrap()
+}
+
+fn text_snapshot(text: &str) -> Vec<u8> {
+    craft_cloud_agent::doc::plain_text_snapshot(text).unwrap()
+}
+
+/// An app's Loro document for an open live document, and the events it was sent that are not changes.
+struct AppDoc {
+    loro: LoroDoc,
+    doc: Document,
+    seen: Mutex<Vec<Event>>,
+}
+
+impl AppDoc {
+    fn new(doc: Document, peer: u64) -> Self {
+        let loro = LoroDoc::new();
+        loro.set_peer_id(peer).unwrap();
+        loro.import(doc.state()).unwrap();
+        for u in doc.state_updates() {
+            loro.import(u).unwrap();
+        }
+        Self { loro, doc, seen: Mutex::new(Vec::new()) }
+    }
+
+    fn text(&self) -> String {
+        self.loro.get_text("text").to_string()
+    }
+
+    /// Applies what came and keeps the other events; every event seen so far.
+    fn pump(&self) -> Vec<Event> {
+        let mut seen = self.seen.lock().unwrap();
+        while let Some(event) = self.doc.try_recv() {
+            match event {
+                Event::Update(bytes) => {
+                    self.loro.import(&bytes).unwrap();
+                }
+                other => seen.push(other),
+            }
+        }
+        seen.clone()
+    }
+
+    /// Types at the end and sends it: its number.
+    fn append(&self, s: &str) -> u64 {
+        let before = self.loro.oplog_vv();
+        let t = self.loro.get_text("text");
+        t.insert(t.len_unicode(), s).unwrap();
+        self.loro.commit();
+        self.doc.send(&self.loro.export(ExportMode::updates(&before)).unwrap()).unwrap()
+    }
+
+    /// Types at the end and hands the change to the agent as a held one (an app that ends with it unsent).
+    fn append_held(&self, s: &str) -> u64 {
+        let before = self.loro.oplog_vv();
+        let t = self.loro.get_text("text");
+        t.insert(t.len_unicode(), s).unwrap();
+        self.loro.commit();
+        self.doc.hold(&self.loro.export(ExportMode::updates(&before)).unwrap()).unwrap()
+    }
+
+    /// Types at the end and sends the whole history (for a document whose earlier changes the agent refused).
+    fn append_all(&self, s: &str) -> u64 {
+        let t = self.loro.get_text("text");
+        t.insert(t.len_unicode(), s).unwrap();
+        self.loro.commit();
+        self.doc.send(&self.loro.export(ExportMode::all_updates()).unwrap()).unwrap()
+    }
+}
+
+/// Opens `path` as an app would, importing `content` if the file has never been live.
+fn open_doc(docs: &Documents, path: &Path, content: &str, identity: bool) -> Opened {
+    let options = OpenOptions { identity, ..OpenOptions::default() };
+    match docs.open_with(&path.display().to_string(), "wordcraft", &options).unwrap() {
+        Opened::NeedsImport(importer) => Opened::Live(importer.import(&text_snapshot(content)).unwrap()),
+        other => other,
+    }
+}
+
+fn live(opened: Opened) -> Document {
+    match opened {
+        Opened::Live(doc) => doc,
+        other => panic!("not live: {other:?}"),
+    }
+}
+
+/// An app on `person`'s computer with `path` open (by its absolute path): its connection and its document.
+async fn app_opens(person: &Person, path: PathBuf, content: &'static str, identity: bool, peer: u64) -> (Documents, AppDoc) {
+    let client = person.client();
+    off(move || {
+        let docs = client.documents().unwrap();
+        let doc = live(open_doc(&docs, &path, content, identity));
+        (docs, AppDoc::new(doc, peer))
+    })
+    .await
+}
+
+/// A team where ana and ben both sync the space and `plan.txt` is in both folders.
+async fn team_with_plan(role: SpaceRole) -> (Team, PathBuf, PathBuf) {
+    let t = team(role).await;
+    let (ana_folder, ben_folder) = both_syncing(&t).await;
+    write(&ana_folder, "plan.txt", "the plan");
+    eventually("ben has the plan", || has_file(ben_folder.clone(), "plan.txt", "the plan")).await;
+    (t, ana_folder, ben_folder)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_in_a_team_folder_is_live_across_accounts_and_identity_is_only_for_apps_that_ask() {
+    let (t, ana_folder, ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let space = t.space;
+    // Ana's app asks for identity and opens first (the file has never been live: it imports it); ben's does not ask.
+    let (_docs_ana, ana) = app_opens(&t.ana, ana_folder.join("plan.txt"), "the plan", true, 11).await;
+    let (_docs_ben, ben) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 12).await;
+    assert_eq!(ana.text(), "the plan");
+    assert_eq!(ben.text(), "the plan");
+    // The document says which space it is in, and that it may be changed.
+    assert_eq!((ana.doc.space(), ana.doc.read_only()), (Some(space), false));
+    assert_eq!((ben.doc.space(), ben.doc.read_only()), (Some(space), false));
+
+    // A change goes across the accounts, both ways.
+    let seq = ben.append(", edited by ben");
+    eventually("ben's change is acked", || async { ben.pump().contains(&Event::Acked(seq)) }).await;
+    eventually("ana shows it", || async {
+        ana.pump();
+        ana.text() == "the plan, edited by ben"
+    })
+    .await;
+    ana.append(" and ana");
+    eventually("ben shows it", || async {
+        ben.pump();
+        ben.text() == "the plan, edited by ben and ana"
+    })
+    .await;
+
+    // Presence: ana's app asked for identity and hears who is there, stamped by the server; ben's did not ask and hears kind 3
+    // only (no identity, and no member list).
+    ben.doc.presence(b"ben's cursor").unwrap();
+    ana.doc.presence(b"ana's cursor").unwrap();
+    let ben_id = t.world.ben.id.0;
+    eventually("ana hears ben, with his account", || async {
+        ana.pump().contains(&Event::PresenceFrom { user: ben_id, bytes: b"ben's cursor".to_vec() })
+    })
+    .await;
+    eventually("ben hears ana's presence as plain presence", || async { ben.pump().contains(&Event::Presence(b"ana's cursor".to_vec())) }).await;
+    let heard_by_ben = ben.pump();
+    assert!(
+        !heard_by_ben.iter().any(|e| matches!(e, Event::PresenceFrom { .. } | Event::Members(_))),
+        "an app that does not ask for identity gets neither identity nor names: {heard_by_ben:?}"
+    );
+    assert!(!ana.pump().iter().any(|e| matches!(e, Event::Presence(_))), "an app that asked never gets the plain kind");
+
+    // Ana's app is told who is in the space: names and palette colours, itself marked.
+    eventually("ana is told the members", || async { ana.pump().iter().any(|e| matches!(e, Event::Members(m) if m.len() == 2)) }).await;
+    let members = ana.pump().into_iter().rev().find_map(|e| if let Event::Members(m) = e { Some(m) } else { None }).unwrap();
+    let mut names: Vec<(&str, bool)> = members.iter().map(|m| (m.name.as_str(), m.is_self)).collect();
+    names.sort_unstable();
+    assert_eq!(names, vec![("ana", true), ("ben", false)]);
+    for member in &members {
+        assert_eq!(member.colour, craft_cloud_proto::colour::member_colour(member.user), "the palette index every machine derives");
+    }
+    assert!(members.iter().any(|m| m.user == ben_id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_viewer_opens_read_only_and_what_it_types_is_neither_kept_nor_sent() {
+    let (t, ana_folder, ben_folder) = team_with_plan(SpaceRole::Viewer).await;
+    let (_docs_ana, ana) = app_opens(&t.ana, ana_folder.join("plan.txt"), "the plan", false, 11).await;
+    let (docs_ben, ben) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 12).await;
+    assert_eq!((ben.doc.read_only(), ben.doc.space()), (true, Some(t.space)));
+    assert!(!ana.doc.read_only());
+    assert_eq!(ben.text(), "the plan", "a viewer reads the document");
+
+    // What the viewer types is refused with `read_only`: never acked, and the agent's copy is as it was.
+    let seq = ben.append(", typed by the viewer");
+    eventually("the agent refuses the change", || async {
+        ben.pump().iter().any(|e| matches!(e, Event::Refused { seq: s, code, .. } if *s == seq && code == "read_only"))
+    })
+    .await;
+    assert!(!ben.pump().contains(&Event::Acked(seq)));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    ana.pump();
+    assert_eq!(ana.text(), "the plan", "nothing of it reached the server");
+    drop(docs_ben);
+    let (_docs_again, again) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 13).await;
+    assert_eq!(again.text(), "the plan", "the agent's copy is unchanged");
+    assert_eq!(again.doc.opened_state().waiting, 0, "and nothing waits to be sent");
+
+    // The editor's changes still reach the viewer.
+    ana.append(" - by ana");
+    eventually("the viewer shows the editor's change", || async {
+        again.pump();
+        again.text() == "the plan - by ana"
+    })
+    .await;
+
+    // A blob for a file of a space the account may not change is refused.
+    let path = ben_folder.join("plan.txt").display().to_string();
+    let refused = t.ben.api(move |c| c.blobs().put_for(b"image bytes", &path)).await.unwrap_err();
+    assert!(matches!(&refused, craft_cloud_app::Error::Refused { code, .. } if code == "read_only"), "{refused:?}");
+
+    // So is a recents entry for a file of the space: it could never go up, so it is not kept to be acked.
+    let path = ben_folder.join("plan.txt").display().to_string();
+    let refused = t.ben.api(move |c| c.add_recent("wordcraft", NewRecent { path, title: None, saved: false })).await.unwrap_err();
+    assert!(matches!(&refused, craft_cloud_app::Error::Refused { code, .. } if code == "read_only"), "{refused:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_role_changed_while_connected_is_acted_on_in_both_directions() {
+    let (t, ana_folder, ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let (space, ben_id) = (t.space, t.world.ben.id);
+    let (_docs_ana, ana) = app_opens(&t.ana, ana_folder.join("plan.txt"), "the plan", false, 11).await;
+    let (_docs_ben, ben) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 12).await;
+    let seq = ben.append(", as an editor");
+    eventually("the editor's change is acked", || async { ben.pump().contains(&Event::Acked(seq)) }).await;
+    eventually("ana shows it", || async {
+        ana.pump();
+        ana.text() == "the plan, as an editor"
+    })
+    .await;
+
+    // Lowered to viewer while connected: his next changes are refused as soon as the agent knows (the server ends his
+    // connection, or the agent's list of spaces says so).
+    t.world.meta.change_member_role(&SpaceActor::Cli, space, ben_id, SpaceRole::Viewer, 1).await.unwrap();
+    let (app, tries) = (&ben, std::cell::Cell::new(0u32));
+    let tries = &tries;
+    eventually("a change of the lowered account is refused", || {
+        tries.set(tries.get() + 1);
+        let seq = app.append(&format!(" [{}]", tries.get()));
+        async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            app.pump().iter().any(|e| matches!(e, Event::Refused { seq: s, code, .. } if *s == seq && code == "read_only"))
+        }
+    })
+    .await;
+    eventually("ben's space is read-only on his computer", || async { t.ben.space(space).await.is_some_and(|s| s.read_only) }).await;
+
+    // Raised again: changes are taken again. (The refused ones were never in the agent's copy; the app sends its whole history.)
+    t.world.meta.change_member_role(&SpaceActor::Cli, space, ben_id, SpaceRole::Editor, 2).await.unwrap();
+    let n = std::cell::Cell::new(0u32);
+    let n = &n;
+    eventually("a change of the raised account is taken", || {
+        n.set(n.get() + 1);
+        let seq = app.append_all(&format!(" <{}>", n.get()));
+        async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            app.pump().contains(&Event::Acked(seq))
+        }
+    })
+    .await;
+    let last = n.get();
+    eventually("ana shows what the raised editor typed", || async {
+        ana.pump();
+        ana.text().contains(&format!("<{last}>"))
+    })
+    .await;
+}
+
+/// The agent tells every open document of a space when the account's right to change it changes, both ways, with no new
+/// open. A viewer's app that ends with changes it could not send hands them to the agent: they are kept, never sent while
+/// the account is a viewer, and go up when the role is raised, with no app open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_role_is_pushed_to_open_documents_and_what_a_viewers_app_hands_over_goes_up_when_it_may_write() {
+    let (t, ana_folder, ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let (space, ben_id) = (t.space, t.world.ben.id);
+    let (_docs_ana, ana) = app_opens(&t.ana, ana_folder.join("plan.txt"), "the plan", false, 11).await;
+    let (docs_ben, ben) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 12).await;
+    assert!(!ben.doc.read_only());
+
+    // Lowered: the open document is told, and it did not try anything.
+    t.world.meta.change_member_role(&SpaceActor::Cli, space, ben_id, SpaceRole::Viewer, 1).await.unwrap();
+    eventually("the open document is told it is read-only", || async { ben.pump().contains(&Event::Role { read_only: true }) }).await;
+
+    // The app ends with a change it could not send. The agent keeps it and, as long as the account is a viewer, never sends it.
+    let first = ben.append_held(", written as a viewer");
+    let second = ben.append_held(" and again");
+    // The agent says it has them (an app that ends waits for that), then the document's close, then the socket's.
+    eventually("the agent acks the held changes", || async {
+        let seen = ben.pump();
+        seen.contains(&Event::Acked(first)) && seen.contains(&Event::Acked(second))
+    })
+    .await;
+    drop(ben);
+    drop(docs_ben);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    ana.pump();
+    assert_eq!(ana.text(), "the plan", "nothing of it reached the server");
+
+    // Raised with no app open: the held change goes up.
+    t.world.meta.change_member_role(&SpaceActor::Cli, space, ben_id, SpaceRole::Editor, 2).await.unwrap();
+    eventually("ana shows what the viewer's app handed over", || async {
+        ana.pump();
+        ana.text() == "the plan, written as a viewer and again"
+    })
+    .await;
+
+    // Opened again, the document is writable, and the told role follows the next change too.
+    let (_docs_again, again) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 13).await;
+    assert!(!again.doc.read_only());
+    assert_eq!(again.text(), "the plan, written as a viewer and again");
+    t.world.meta.change_member_role(&SpaceActor::Cli, space, ben_id, SpaceRole::Viewer, 3).await.unwrap();
+    eventually("the second document is told too", || async { again.pump().contains(&Event::Role { read_only: true }) }).await;
+}
+
+/// What a viewer's app handed over is in the document's journal: it survives a restart of the agent while the account is
+/// still a viewer (nothing is sent), and goes up once the role is raised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_changes_survive_a_restart_of_the_agent_and_go_up_when_the_role_is_raised() {
+    let (mut t, ana_folder, ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let (space, ben_id) = (t.space, t.world.ben.id);
+    let (_docs_ana, ana) = app_opens(&t.ana, ana_folder.join("plan.txt"), "the plan", false, 11).await;
+    let (docs_ben, ben) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 12).await;
+    t.world.meta.change_member_role(&SpaceActor::Cli, space, ben_id, SpaceRole::Viewer, 1).await.unwrap();
+    eventually("the open document is told it is read-only", || async { ben.pump().contains(&Event::Role { read_only: true }) }).await;
+    let seq = ben.append_held(", kept across a restart");
+    eventually("the agent acks the held change", || async { ben.pump().contains(&Event::Acked(seq)) }).await;
+    drop(ben);
+    drop(docs_ben);
+
+    // Ben's agent is stopped and started again while he is still a viewer: the held change is in the journal, and is not sent.
+    let (exit, out) = t.ben.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    t.ben.run();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    ana.pump();
+    assert_eq!(ana.text(), "the plan", "a viewer's held change is not sent");
+    let (_docs_again, again) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 13).await;
+    assert_eq!(again.text(), "the plan, kept across a restart", "the journal brought it back");
+
+    // Raised: it goes up.
+    t.world.meta.change_member_role(&SpaceActor::Cli, space, ben_id, SpaceRole::Editor, 2).await.unwrap();
+    eventually("ana shows the held change", || async {
+        ana.pump();
+        ana.text() == "the plan, kept across a restart"
+    })
+    .await;
+}
+
+/// Journals with unacked updates survive a revocation: removed while offline with a change that was never acked, the account
+/// keeps it on disk; invited again as a viewer it is reported and not sent, and once the account may edit again it goes up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_waiting_in_a_journal_survives_a_revocation_and_goes_up_when_the_account_may_edit_again() {
+    let (t, ana_folder, ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let (space, ben_id) = (t.space, t.world.ben.id);
+    let (_docs_ana, ana) = app_opens(&t.ana, ana_folder.join("plan.txt"), "the plan", false, 11).await;
+    let (docs_ben, ben) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 12).await;
+
+    // Ben's agent is held (paused): offline, it keeps his change in the document's journal without a server to ack it.
+    t.ben.api(|c| c.pause()).await.unwrap();
+    eventually("ben's document is offline", || async { ben.pump().iter().any(|e| matches!(e, Event::Status { online: false, .. })) }).await;
+    let seq = ben.append(", written offline");
+    eventually("the agent keeps it on its disk", || async { ben.pump().contains(&Event::Acked(seq)) }).await;
+    let live_dir = t.ben.data.path().join("live").join(space.to_string());
+    // What the agent keeps of the space's documents: their files and journals (the hub writes a document whole, and empties its
+    // journal, when it stops; the unacked change is in either).
+    let kept = || -> usize {
+        std::fs::read_dir(&live_dir)
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .filter(|e| {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        name != "saves.json" && e.metadata().is_ok_and(|m| m.is_file() && m.len() > 0)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    assert!(kept() >= 1, "the unacked change is on disk");
+
+    // Ben is removed while his change waits; the agent resumes, finds it has no access and lets the space go.
+    t.world.meta.remove_member(&SpaceActor::Cli, space, ben_id, 1).await.unwrap();
+    t.ben.api(|c| c.resume()).await.unwrap();
+    eventually("the space reports no access", || async {
+        t.ben.status().await.spaces.iter().any(|s| s.space == space && matches!(s.run_state, SpaceRun::NoAccess { .. }))
+    })
+    .await;
+    drop((docs_ben, ben));
+    assert!(kept() >= 1, "the document and its unacked change are kept through the revocation");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    ana.pump();
+    assert_eq!(ana.text(), "the plan", "nothing of it reached the server");
+
+    // Invited again, as a viewer: the change is reported (the document opens with it waiting) and is not sent.
+    t.world.invite_ben(space, SpaceRole::Viewer).await;
+    eventually("the invitation is listed again", || async { t.ben.space(space).await.is_some_and(|s| s.state == "invited") }).await;
+    t.ben.accept(space).await;
+    eventually("the space syncs again, read-only", || async { t.ben.space(space).await.is_some_and(|s| s.read_only) }).await;
+    let (_docs_again, again) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 13).await;
+    assert!(again.doc.read_only());
+    assert_eq!(again.doc.opened_state().waiting, 1, "the change made offline is reported as waiting");
+    assert!(again.text().ends_with(", written offline"), "and it is in the agent's copy: {:?}", again.text());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    ana.pump();
+    assert_eq!(ana.text(), "the plan", "a viewer's connection never sends it");
+    assert!(kept() >= 1);
+
+    // Made an editor again: it goes up.
+    t.world.meta.change_member_role(&SpaceActor::Cli, space, ben_id, SpaceRole::Editor, 2).await.unwrap();
+    eventually("the change made offline reaches ana", || async {
+        ana.pump();
+        ana.text() == "the plan, written offline"
+    })
+    .await;
+    eventually("nothing waits any more", || async { again.pump().iter().any(|e| matches!(e, Event::Status { waiting: 0, .. })) }).await;
+    // And the app's own changes are taken again.
+    let seq = again.append(", and edited on");
+    eventually("the app's change is acked", || async { again.pump().contains(&Event::Acked(seq)) }).await;
+    eventually("it reaches ana", || async {
+        ana.pump();
+        ana.text() == "the plan, written offline, and edited on"
+    })
+    .await;
+}
+
+/// A space's live folder is one hub's at a time: sync turned off and on while changes wait in a journal (the old hub is still
+/// closing when the space is turned on again) loses none of them, also across a restart of the agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_a_space_off_and_on_with_changes_waiting_loses_none() {
+    let (mut t, ana_folder, ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let space = t.space;
+    let (_docs_ana, ana) = app_opens(&t.ana, ana_folder.join("plan.txt"), "the plan", false, 11).await;
+    let (docs_ben, ben) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 12).await;
+    t.ben.api(|c| c.pause()).await.unwrap();
+    eventually("ben's document is offline", || async { ben.pump().iter().any(|e| matches!(e, Event::Status { online: false, .. })) }).await;
+    for n in 1..=3 {
+        let seq = ben.append(&format!(" [{n}]"));
+        eventually("the agent keeps the change", || async { ben.pump().contains(&Event::Acked(seq)) }).await;
+    }
+    drop((docs_ben, ben));
+
+    // Off and at once on again, in the same folder, and the hub of the first run is still ending.
+    t.ben.sync_off(space).await;
+    t.ben.sync_on_in(space, &ben_folder).await;
+    t.ben.api(|c| c.resume()).await.unwrap();
+    let (_docs_again, again) = app_opens(&t.ben, ben_folder.join("plan.txt"), "unused", false, 13).await;
+    let seq = again.append(" [4]");
+    eventually("the new hub takes a change", || async { again.pump().contains(&Event::Acked(seq)) }).await;
+
+    // The agent is stopped and started again (what was acked and not yet written is either in the journal or in the document).
+    let (exit, out) = t.ben.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    t.ben.run();
+    eventually("every change reaches ana", || async {
+        ana.pump();
+        let text = ana.text();
+        (1..=4).all(|n| text.contains(&format!("[{n}]")))
+    })
+    .await;
+}
+
+/// An app with documents of two spaces open is told when one space stops syncing: the document is `stopped`, a change to it is
+/// refused with `not_found` (not dropped), and the other space's document goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_app_is_told_when_the_space_of_an_open_document_stops_syncing() {
+    let (t, ana_folder, ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let space = t.space;
+    write(&t.ben.personal, "mine.txt", "my own");
+    let (_docs_ana, _ana) = app_opens(&t.ana, ana_folder.join("plan.txt"), "the plan", false, 11).await;
+    let client = t.ben.client();
+    let (team_path, personal_path) = (ben_folder.join("plan.txt"), t.ben.personal.join("mine.txt"));
+    let (docs_ben, team_doc, personal_doc) = off(move || {
+        let docs = client.documents().unwrap();
+        let team = AppDoc::new(live(open_doc(&docs, &team_path, "unused", false)), 21);
+        let personal = AppDoc::new(live(open_doc(&docs, &personal_path, "my own", false)), 22);
+        (docs, team, personal)
+    })
+    .await;
+    t.ben.sync_off(space).await;
+    eventually("the team document is told it is stopped", || async {
+        team_doc.pump().iter().any(|e| matches!(e, Event::Status { stopped: true, .. }))
+    })
+    .await;
+    let seq = team_doc.append(", typed after the space stopped");
+    eventually("the change is refused, not dropped", || async {
+        team_doc.pump().iter().any(|e| matches!(e, Event::Refused { seq: s, code, .. } if *s == seq && code == "not_found"))
+    })
+    .await;
+    // The personal document is not affected.
+    let seq = personal_doc.append(" + more");
+    eventually("the personal document takes changes", || async { personal_doc.pump().contains(&Event::Acked(seq)) }).await;
+    drop(docs_ben);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_team_spaces_at_once_each_have_their_own_link_and_documents_are_routed_by_path() {
+    let t = team(SpaceRole::Editor).await;
+    let second = t.world.space("Archive").await;
+    t.world.invite_ben(second, SpaceRole::Editor).await;
+    let (first_ana, first_ben) = both_syncing(&t).await;
+    eventually("the second invitation is listed", || async { t.ben.space(second).await.is_some_and(|s| s.state == "invited") }).await;
+    t.ben.accept(second).await;
+    eventually("ana lists the second space", || async { t.ana.space(second).await.is_some_and(|s| s.state == "active") }).await;
+    let (second_ana, second_ben) = (t.ana.sync_on(second).await, t.ben.sync_on(second).await);
+    assert_ne!(first_ben, second_ben);
+    write(&first_ana, "plan.txt", "plan one");
+    write(&second_ana, "plan.txt", "plan two");
+    eventually("ben has both plans", || async {
+        read(&first_ben, "plan.txt").as_deref() == Some("plan one") && read(&second_ben, "plan.txt").as_deref() == Some("plan two")
+    })
+    .await;
+
+    // One connection of ben's app opens a document of each space (and the personal space is untouched).
+    let (_a1, ana_one) = app_opens(&t.ana, first_ana.join("plan.txt"), "plan one", false, 11).await;
+    let (_a2, ana_two) = app_opens(&t.ana, second_ana.join("plan.txt"), "plan two", false, 12).await;
+    let client = t.ben.client();
+    let (one_path, two_path) = (first_ben.join("plan.txt"), second_ben.join("plan.txt"));
+    let (docs_ben, ben_one, ben_two) = off(move || {
+        let docs = client.documents().unwrap();
+        let one = AppDoc::new(live(open_doc(&docs, &one_path, "unused", false)), 21);
+        let two = AppDoc::new(live(open_doc(&docs, &two_path, "unused", false)), 22);
+        (docs, one, two)
+    })
+    .await;
+    assert_eq!((ben_one.doc.space(), ben_two.doc.space()), (Some(t.space), Some(second)));
+    assert_ne!(ben_one.doc.id(), ben_two.doc.id());
+    assert_eq!((ben_one.text(), ben_two.text()), ("plan one".to_owned(), "plan two".to_owned()));
+
+    // Each document's changes go to its own space.
+    ben_one.append(" + one");
+    ben_two.append(" + two");
+    eventually("each reaches ana in its own space", || async {
+        ana_one.pump();
+        ana_two.pump();
+        ana_one.text() == "plan one + one" && ana_two.text() == "plan two + two"
+    })
+    .await;
+    // A document of a space that does not sync here, or a path in no synced folder, is not live.
+    let outside = t.ben.dir.path().join("elsewhere.txt");
+    std::fs::write(&outside, "x").unwrap();
+    let docs_ben = off(move || {
+        match open_doc(&docs_ben, &outside, "x", false) {
+            Opened::NotLive(reason) => assert_eq!(reason, NotLiveReason::NotInFolder),
+            other => panic!("{other:?}"),
+        }
+        docs_ben
+    })
+    .await;
+    drop(docs_ben);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blob_put_for_a_team_file_lands_in_the_space_and_another_members_agent_reads_it() {
+    let (t, ana_folder, ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let bytes: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    let (ana_path, ben_path) = (ana_folder.join("plan.txt").display().to_string(), ben_folder.join("plan.txt").display().to_string());
+
+    let (put, path) = (bytes.clone(), ana_path.clone());
+    let stored = t.ana.api(move |c| c.blobs().put_for(&put, &path)).await.unwrap();
+    assert_eq!(stored.len, bytes.len() as u64);
+    // Ben's agent reads it from the space (it goes up in the background, so it may take a moment).
+    let (hash, len, path) = (stored.hash, stored.len, ben_path.clone());
+    let got = Mutex::new(None);
+    let got = &got;
+    eventually("ben's agent gets the blob from the team space", || {
+        let (client, path) = (t.ben.client(), path.clone());
+        async move {
+            let answer = off(move || client.blobs().get_for(&hash, len, &path)).await;
+            if let Ok(found) = answer {
+                *got.lock().unwrap() = Some(found);
+            }
+            got.lock().unwrap().is_some()
+        }
+    })
+    .await;
+    assert_eq!(got.lock().unwrap().as_deref(), Some(bytes.as_slice()));
+
+    // It is in the space, not in the personal space: without `for`, ben's agent does not have it.
+    let missing = t.ben.api(move |c| c.blobs().get(&hash, len)).await.unwrap_err();
+    assert!(matches!(&missing, craft_cloud_app::Error::Refused { code, .. } if code == "blob_not_found"), "{missing:?}");
+    // And a path in no synced folder is refused.
+    let outside = t.ben.dir.path().join("elsewhere.txt").display().to_string();
+    let refused = t.ben.api(move |c| c.blobs().put_for(b"x", &outside)).await.unwrap_err();
+    assert!(matches!(&refused, craft_cloud_app::Error::Refused { code, .. } if code == "invalid"), "{refused:?}");
+    // A path that climbs out of the team folder is not the team space's, whatever it starts with.
+    let climbing = ben_folder.join("..").join("elsewhere.txt").display().to_string();
+    let refused = t.ben.api(move |c| c.blobs().put_for(b"x", &climbing)).await.unwrap_err();
+    assert!(matches!(&refused, craft_cloud_app::Error::Refused { code, .. } if code == "invalid"), "{refused:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_recents_of_a_team_space_reach_the_other_members_and_not_the_personal_lists() {
+    let (t, ana_folder, _ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let space = t.space;
+    // Ben follows the space's list; ana adds a file of the team folder (an absolute path) to hers.
+    let client = t.ben.client();
+    let watch = off(move || client.watch_recents_in("wordcraft", space).unwrap()).await;
+    assert!(watch.entries().is_empty());
+    let path = ana_folder.join("plan.txt").display().to_string();
+    let entry = t.ana.api(move |c| c.add_recent("wordcraft", NewRecent { path, title: Some("The plan".into()), saved: true })).await.unwrap();
+    assert_eq!(entry.path, "plan.txt", "kept relative to the team folder");
+    eventually("the entry reaches ben", || async { watch.entries().iter().any(|e| e.path == "plan.txt" && e.title == "The plan") }).await;
+    // Ana's own list of the space has it too; neither personal list does.
+    let client = t.ana.client();
+    let own = off(move || client.watch_recents_in("wordcraft", space).unwrap()).await;
+    assert!(own.entries().iter().any(|e| e.path == "plan.txt"));
+    assert!(t.ana.api(|c| c.recents("wordcraft")).await.unwrap().is_empty(), "not in ana's personal list");
+    assert!(t.ben.api(|c| c.recents("wordcraft")).await.unwrap().is_empty(), "nor in ben's");
+    // A space that does not sync here has no list to follow.
+    let other = SpaceId::generate();
+    let missing = t.ben.api(move |c| c.watch_recents_in("wordcraft", other).map(|_| ())).await.unwrap_err();
+    assert!(matches!(&missing, craft_cloud_app::Error::Refused { code, .. } if code == "not_found"), "{missing:?}");
+}
+
+/// A server whose live service does not serve team spaces (it answers the upgrade with `404`) is asked once and then left alone
+/// for a long pause: no loop. The space's files sync on, and its documents open as plain files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_that_cannot_serve_the_team_link_is_asked_once_and_documents_open_as_plain_files() {
+    let (t, front, _task) = team_via_front(SpaceRole::Editor, Front::default()).await;
+    front.live_404.store(true, Ordering::SeqCst);
+    let (ana_folder, ben_folder) = both_syncing(&t).await;
+    write(&ana_folder, "plan.txt", "the plan");
+    eventually("ben has the plan", || has_file(ben_folder.clone(), "plan.txt", "the plan")).await;
+    // His link is refused; it is not dialed again within seconds, and the file sync is unaffected.
+    eventually("the link was asked for", || async { front.seen.lock().unwrap().iter().any(|(p, named)| p == "/api/v1/live" && *named) }).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let asked = front.seen.lock().unwrap().iter().filter(|(p, named)| p == "/api/v1/live" && *named).count();
+    assert!(asked <= 2, "the team link was asked for {asked} times in a few seconds");
+    write(&ana_folder, "later.txt", "still syncs");
+    eventually("the file sync goes on", || has_file(ben_folder.clone(), "later.txt", "still syncs")).await;
+    let client = t.ben.client();
+    let path = ben_folder.join("plan.txt");
+    let opened = off(move || open_doc(&client.documents().unwrap(), &path, "x", false)).await;
+    assert!(matches!(opened, Opened::NotLive(NotLiveReason::Offline)), "{opened:?}");
+}
+
+/// One Ctrl-C with an idle personal space and a team pass that hangs: the loop waits for the pass, and a second Ctrl-C, read
+/// meanwhile, ends the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_ctrl_c_is_read_while_the_first_waits_for_a_hung_team_pass() {
+    let (mut t, front, _task) = team_via_front(SpaceRole::Editor, Front::default()).await;
+    let (_, ben_folder) = both_syncing(&t).await;
+    write(&ben_folder, "first.txt", "first");
+    eventually("the first file went up", || async { t.ben.status().await.spaces.iter().any(|s| s.last_sync_ms.is_some()) }).await;
+
+    front.stall.store(true, Ordering::SeqCst);
+    write(&ben_folder, "stuck.txt", "never answered");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut running = t.ben.running.take().unwrap();
+    let thread = running.thread.take().unwrap();
+    // The first stop: the personal space is idle, so the loop ends at once and waits for the team pass that hangs.
+    let _ = running.stop.send(());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!thread.is_finished(), "the first stop waits for the pass under way");
+    // The second stop is read while it waits, and ends it.
+    let _ = running.stop.send(());
+    let started = Instant::now();
+    let ended = tokio::time::timeout(Duration::from_secs(8), tokio::task::spawn_blocking(move || thread.join().unwrap())).await;
+    front.stall.store(false, Ordering::SeqCst);
+    let (exit, out) = ended.expect("the second stop ends the wait within seconds").unwrap();
+    assert!(started.elapsed() < Duration::from_secs(8));
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    assert!(out.contains("stopping at once"), "{out}");
 }

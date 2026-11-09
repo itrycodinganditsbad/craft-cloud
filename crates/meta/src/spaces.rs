@@ -83,6 +83,8 @@ pub struct SpaceSummary {
     pub archived_ms: Option<i64>,
     /// Accepted members, owners included.
     pub members: u64,
+    /// Accepted owners whose accounts can sign in: an owner who is disabled or marked for removal has no access (see
+    /// [`Meta::space_access`]) and does not count, so 0 means nobody can manage the space.
     pub owners: u64,
     pub stored_bytes: u64,
     pub quota_bytes: Option<u64>,
@@ -98,7 +100,7 @@ pub struct SpacePage {
 
 const SUMMARY_SELECT: &str = "SELECT s.id, s.name, s.name_fold, s.created_ms, s.archived_ms, s.stored_bytes, s.quota_bytes, \
      (SELECT CAST(COUNT(*) AS BIGINT) FROM space_members m WHERE m.space_id = s.id AND m.accepted_ms IS NOT NULL) AS members, \
-     (SELECT CAST(COUNT(*) AS BIGINT) FROM space_members m WHERE m.space_id = s.id AND m.accepted_ms IS NOT NULL AND m.role = 'owner') AS owners \
+     (SELECT CAST(COUNT(*) AS BIGINT) FROM space_members m JOIN users u ON u.id = m.user_id       WHERE m.space_id = s.id AND m.accepted_ms IS NOT NULL AND m.role = 'owner' AND u.disabled_ms IS NULL AND u.removed_ms IS NULL) AS owners \
      FROM spaces s WHERE s.kind = 'team'";
 
 fn summary_from(row: &AnyRow) -> Result<SpaceSummary, MetaError> {
@@ -113,6 +115,23 @@ fn summary_from(row: &AnyRow) -> Result<SpaceSummary, MetaError> {
         stored_bytes: to_u64(row.try_get("stored_bytes")?)?,
         quota_bytes: row.try_get::<Option<i64>, _>("quota_bytes")?.map(to_u64).transpose()?,
     })
+}
+
+/// An accepted owner of a team space, with the state of the account (for the administrator's pages).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceOwner {
+    pub space: SpaceId,
+    pub user: UserId,
+    pub username: String,
+    pub disabled_ms: Option<i64>,
+    pub removed_ms: Option<i64>,
+}
+
+impl SpaceOwner {
+    /// Whether the account can sign in, which is what an owner's power needs.
+    pub fn active(&self) -> bool {
+        self.disabled_ms.is_none() && self.removed_ms.is_none()
+    }
 }
 
 /// `text` as a `LIKE` pattern that matches it literally (`\` is the escape character in the queries above).
@@ -655,6 +674,37 @@ impl Meta {
         spaces.truncate(limit as usize);
         let next_after = if more { spaces.last().map(|s| s.name_fold.clone()) } else { None };
         Ok(SpacePage { spaces, next_after })
+    }
+
+    /// The accepted owners of `spaces` (team spaces; at most a page's worth, 200), by space and username, with the state of
+    /// their accounts, in one query. For the administrator's pages; who may ask is the caller's to decide.
+    pub async fn space_owners(&self, spaces: &[SpaceId]) -> Result<Vec<SpaceOwner>, MetaError> {
+        if spaces.is_empty() {
+            return Ok(Vec::new());
+        }
+        if spaces.len() > 200 {
+            return Err(MetaError::Invalid("at most 200 spaces at a time"));
+        }
+        let marks = (1..=spaces.len()).map(|n| format!("${n}")).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT m.space_id, m.user_id, u.username, u.disabled_ms, u.removed_ms FROM space_members m JOIN users u ON u.id = m.user_id              WHERE m.role = 'owner' AND m.accepted_ms IS NOT NULL AND m.space_id IN ({marks}) ORDER BY m.space_id, u.username"
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for space in spaces {
+            query = query.bind(uuid_bytes(space.as_uuid()));
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        rows.iter()
+            .map(|row| {
+                Ok(SpaceOwner {
+                    space: SpaceId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("space_id")?)?),
+                    user: UserId(uuid_from(&row.try_get::<Vec<u8>, _>("user_id")?)?),
+                    username: row.try_get("username")?,
+                    disabled_ms: row.try_get("disabled_ms")?,
+                    removed_ms: row.try_get("removed_ms")?,
+                })
+            })
+            .collect()
     }
 
     /// The bytes all of a space's live documents hold, for the space's usage.

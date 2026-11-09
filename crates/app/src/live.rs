@@ -42,16 +42,18 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use craft_cloud_api::DocId;
 use craft_cloud_api::api::ErrorAnswer as ErrorBody;
-use craft_cloud_api::local::docs::{IMPORT, MAX_BINARY_BYTES, PRESENCE, STATE, UPDATE, decode_binary, encode_binary};
+use craft_cloud_api::local::docs::{
+    HELD, IMPORT, MAX_BINARY_BYTES, PRESENCE, PRESENCE_FROM, STATE, UPDATE, USER_BYTES, decode_binary, encode_binary,
+};
 use craft_cloud_api::local::{DocState, DocsEvent, DocsRequest, MAX_LOCAL_JSON_BYTES, paths};
+use craft_cloud_api::{DocId, SpaceId};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::HandshakeError;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 
-pub use craft_cloud_api::local::NotLiveReason;
+pub use craft_cloud_api::local::{DocMember, NotLiveReason};
 
 use crate::http::CONNECT_TIMEOUT;
 use crate::{Client, Error};
@@ -67,13 +69,21 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the reader waits for data before it looks whether it is to stop.
 const IDLE_WAKE: Duration = Duration::from_millis(250);
 
-/// What happens to an open document.
+/// What happens to an open document. New events are added without a breaking change: match with a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// A change from another machine or another app on this one: import it as it is.
     Update(Vec<u8>),
     /// Another machine's or app's presence (Loro's ephemeral state), as it was sent.
     Presence(Vec<u8>),
+    /// Another account's, or this account's other machine's, presence with the account that sent it (the server's word,
+    /// whatever the bytes say). Only for a document opened with [`OpenOptions::identity`]; without it the presence comes as
+    /// [`Event::Presence`].
+    PresenceFrom { user: uuid::Uuid, bytes: Vec<u8> },
+    /// Who is in the document's space (the active members, with their palette colours), sent after the open and whenever the
+    /// list changes. Only for a document opened with [`OpenOptions::identity`].
+    Members(Vec<DocMember>),
     /// This app's change number `seq` ([`Document::send`]'s answer) is on the agent's disk.
     Acked(u64),
     /// This app's change number `seq` was refused: the agent's copy doesn't have it. `code` says whether sending it
@@ -84,6 +94,10 @@ pub enum Event {
     /// its file was deleted (the document still works; a later open of the path is a new file), and whether the agent
     /// stopped following it until it restarts (Loro failed on it twice; changes made meanwhile are kept).
     Status { online: bool, waiting: u64, deleted: bool, stopped: bool },
+    /// The account may (`read_only: false`) or may not change the document's space any more: a role change or an archive
+    /// while the document is open (`Document::read_only` is as of the open). An app that kept changes the agent refused
+    /// sends them again on `false`.
+    Role { read_only: bool },
     /// The document's file on this machine's disk now: the live document's frontiers (`(peer, counter)` heads) a Craft
     /// app saved it from, or none when no save record is known for it (see `DocsEvent::File`).
     File(Option<Vec<(u64, u32)>>),
@@ -108,6 +122,9 @@ pub struct OpenOptions {
     /// The BLAKE3 hash of the file's bytes as the app read them: [`Document::changed_outside`] says whether a Craft
     /// app saved them.
     pub file_hash: Option<[u8; 32]>,
+    /// Ask who is there: other accounts' presence comes as [`Event::PresenceFrom`] and the list of the space's members as
+    /// [`Event::Members`]. An agent from before team spaces ignores it and sends [`Event::Presence`] only.
+    pub identity: bool,
 }
 
 /// What `opened` says, before its state comes.
@@ -116,6 +133,8 @@ struct Head {
     doc: DocId,
     state: DocState,
     changed_outside: Option<bool>,
+    read_only: bool,
+    space: Option<SpaceId>,
 }
 
 /// An open's state so far: what `opened` said, the snapshot, and the updates that are part of it.
@@ -195,8 +214,15 @@ impl Shared {
     fn on_message(&self, message: Message) {
         match message {
             Message::Text(text) => match serde_json::from_str::<DocsEvent>(text.as_str()) {
-                Ok(DocsEvent::Opened { id, doc, state, changed_outside }) => {
-                    lock(&self.opening).insert(id, Head { doc, state, changed_outside });
+                Ok(DocsEvent::Opened { id, doc, state, changed_outside, read_only, space }) => {
+                    lock(&self.opening).insert(id, Head { doc, state, changed_outside, read_only, space });
+                }
+                Ok(DocsEvent::Members { id, members }) => self.route(id, Event::Members(members)),
+                Ok(DocsEvent::Role { doc, read_only }) => {
+                    let ids = lock(&self.numbers).get(&doc).cloned().unwrap_or_default();
+                    for id in ids {
+                        self.route(id, Event::Role { read_only });
+                    }
                 }
                 Ok(DocsEvent::NeedsImport { id }) => self.answer(id, Answer::NeedsImport),
                 Ok(DocsEvent::NotLive { id, reason, .. }) => self.answer(id, Answer::NotLive(reason)),
@@ -217,7 +243,7 @@ impl Shared {
                 Ok(DocsEvent::Error { id: Some(id), seq: None, code, message }) => {
                     self.answer(id, Answer::Refused(Error::Refused { code, message, name_taken: None }))
                 }
-                Ok(DocsEvent::Error { id: None, .. }) | Err(_) => {}
+                Ok(DocsEvent::Error { id: None, .. }) | Ok(_) | Err(_) => {}
             },
             Message::Binary(bytes) => {
                 let Some((kind, id, body)) = decode_binary(&bytes) else { return };
@@ -249,6 +275,14 @@ impl Shared {
                         self.route(id, Event::Update(body.to_vec()));
                     }
                     PRESENCE => self.route(id, Event::Presence(body.to_vec())),
+                    PRESENCE_FROM => {
+                        // `[16 bytes account ID][the app's bytes]`.
+                        if let Some((user, bytes)) = body.split_at_checked(USER_BYTES)
+                            && let Ok(user) = <[u8; USER_BYTES]>::try_from(user)
+                        {
+                            self.route(id, Event::PresenceFrom { user: uuid::Uuid::from_bytes(user), bytes: bytes.to_vec() });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -367,7 +401,7 @@ impl Documents {
         let (events_tx, events) = mpsc::channel();
         lock(&self.shared.routes).insert(id, events_tx);
         let file_hash = options.file_hash.map(|h| h.iter().map(|b| format!("{b:02x}")).collect());
-        let request = DocsRequest::Open { id, path: path.to_owned(), app: app.to_owned(), file_hash };
+        let request = DocsRequest::Open { id, path: path.to_owned(), app: app.to_owned(), file_hash, identity: options.identity };
         let answer = self.ask(id, || self.shared.send_json(&request));
         self.opened(id, answer, events)
     }
@@ -501,6 +535,18 @@ impl Document {
         self.head.doc
     }
 
+    /// The account may not change this document (a viewer of its team space, or the space is archived): the agent refuses
+    /// its changes with `read_only` ([`Event::Refused`]) and keeps its copy as it is. As of the open; an agent from before
+    /// team spaces never says it.
+    pub fn read_only(&self) -> bool {
+        self.head.read_only
+    }
+
+    /// The space the document belongs to (the personal space's or a team space's); none from an older agent.
+    pub fn space(&self) -> Option<SpaceId> {
+        self.head.space
+    }
+
     /// For an open that named the file's hash ([`OpenOptions::file_hash`]): whether no Craft app's save of this
     /// document has that content (the file was edited outside Craft). None: the agent can't tell (or is older).
     pub fn changed_outside(&self) -> Option<bool> {
@@ -533,6 +579,18 @@ impl Document {
     pub fn saving(&self, hash: [u8; 32]) -> Result<(), Error> {
         let hex = hash.iter().map(|x| format!("{x:02x}")).collect::<String>();
         self.shared.send_json(&DocsRequest::Saving { doc: self.head.doc, hash: hex })
+    }
+
+    /// Hands the agent a change (a Loro update, at most 1 MiB) this app made while the account could not change the space and
+    /// kept (the agent refused it with `read_only`), because the app ends before it could send it again: the agent keeps it in
+    /// the document's journal and sends it to the server once the account may write (a viewer's changes are never sent).
+    /// Acked like an update ([`Event::Acked`] with the number returned) once the agent has it on disk, or refused (`error`
+    /// as for an update; `not_found` when the space stopped syncing). Send them in order, and wait for the acks before closing
+    /// the document or dropping the connection: the agent may not have read a frame that is still on its way.
+    pub fn hold(&self, update: &[u8]) -> Result<u64, Error> {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        self.shared.send_binary(HELD, self.id, update)?;
+        Ok(seq)
     }
 
     /// Sends this app's presence (at most 4 KiB, at most 20 a second; more are dropped).
@@ -618,6 +676,8 @@ mod tests {
             doc: DocId::generate(),
             state: DocState { online: true, waiting: 0, bytes: 1, updates: 2 },
             changed_outside: None,
+            read_only: false,
+            space: None,
         };
         shared.on_message(Message::Text(serde_json::to_string(&opened).unwrap().into()));
         shared.on_message(Message::Binary(encode_binary(STATE, 5, b"s").into()));
@@ -640,14 +700,21 @@ mod tests {
         let (events_tx, events) = mpsc::channel();
         lock(&shared.routes).insert(4, events_tx);
         let doc = DocId::generate();
-        let opened =
-            DocsEvent::Opened { id: 4, doc, state: DocState { online: true, waiting: 0, bytes: 3, updates: 0 }, changed_outside: Some(true) };
+        let opened = DocsEvent::Opened {
+            id: 4,
+            doc,
+            state: DocState { online: true, waiting: 0, bytes: 3, updates: 0 },
+            changed_outside: Some(true),
+            read_only: true,
+            space: None,
+        };
         shared.on_message(Message::Text(serde_json::to_string(&opened).unwrap().into()));
         assert!(answer.try_recv().is_err(), "not before the state");
         shared.on_message(Message::Binary(encode_binary(STATE, 4, b"abc").into()));
         let Ok(Answer::Live { snapshot, head, .. }) = answer.try_recv() else { panic!("no answer") };
         assert_eq!(snapshot, b"abc");
         assert_eq!(head.changed_outside, Some(true));
+        assert!(head.read_only);
         shared.on_message(Message::Binary(encode_binary(UPDATE, 4, b"u").into()));
         let status = DocsEvent::Status { doc, online: false, waiting: 2, deleted: true, stopped: true };
         shared.on_message(Message::Text(serde_json::to_string(&status).unwrap().into()));

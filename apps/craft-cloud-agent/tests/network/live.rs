@@ -137,7 +137,7 @@ impl Host {
                         app.import(&bytes).unwrap();
                     }
                 }
-                DocEvent::Presence(..) => {}
+                DocEvent::Presence(..) | DocEvent::PresenceFrom(..) => {}
             }
         }
         let _ = node;

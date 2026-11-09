@@ -13,7 +13,10 @@ craft-cloud-kit.workspace = true
 egui.workspace = true
 
 [dev-dependencies]
-egui_kittest.workspace = true
+# The badge's snapshots: kittest renders on wgpu (a CPU adapter where there is one); they are compared with `image`, not
+# with kittest's own `snapshot` feature, which brings an MPL-2.0 crate (as in the Craft Cloud app).
+egui_kittest = { workspace = true, features = ["wgpu"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [lints]
 workspace = true

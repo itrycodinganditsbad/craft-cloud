@@ -788,6 +788,10 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             record_delay: options.record_delay,
             session_grace: options.session_grace,
             announce_delay: options.announce_delay,
+            team: false,
+            username: account.username.clone(),
+            read_only: false,
+            generation: 0,
         };
         let hub = match Hub::start(hub_config, control.clone(), user_paused) {
             Ok(hub) => Some(hub),
@@ -1144,7 +1148,27 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
         control.set_spaces_handle(None);
         // The work of making a team space from a folder belongs to this session: it ends before the next one starts.
         crate::from_folder::end_session(&control).await;
-        spaces.stop(stops > 1).await;
+        // A first stop waits here for a team pass that is under way, which can take as long as the server does not answer;
+        // signals are read meanwhile, and a second one ends the wait.
+        let spaces_handle = spaces.handle();
+        let stopping_spaces = spaces.stop(stops > 1);
+        tokio::pin!(stopping_spaces);
+        loop {
+            tokio::select! {
+                () = &mut stopping_spaces => break,
+                signal = stop.recv(), if stop_open => match signal {
+                    Some(()) => {
+                        stops += 1;
+                        if stops == 2 {
+                            say(out, "stopping at once");
+                            spaces_handle.stop_now();
+                        }
+                    }
+                    None => stop_open = false,
+                },
+            }
+        }
+        control.set_team_hubs(Vec::new());
         control.set_spaces(Vec::new(), Vec::new());
         // Recents stop with the account: their followers are told, and what they were given is on disk.
         control.set_hub(None);

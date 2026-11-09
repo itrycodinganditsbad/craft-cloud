@@ -97,6 +97,7 @@ pub enum AuditAction {
     CliSpaceCreated,
     CliSpaceMemberChanged,
     CliSpaceArchived,
+    CliLiveReset,
 }
 
 impl AuditAction {
@@ -147,6 +148,7 @@ impl AuditAction {
         AuditAction::CliSpaceCreated,
         AuditAction::CliSpaceMemberChanged,
         AuditAction::CliSpaceArchived,
+        AuditAction::CliLiveReset,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -196,6 +198,7 @@ impl AuditAction {
             AuditAction::CliSpaceCreated => "cli.space_created",
             AuditAction::CliSpaceMemberChanged => "cli.space_member_changed",
             AuditAction::CliSpaceArchived => "cli.space_archived",
+            AuditAction::CliLiveReset => "cli.live_reset",
         }
     }
 
@@ -242,7 +245,8 @@ impl AuditAction {
             | AuditAction::SpaceArchived
             | AuditAction::SpaceUnarchived
             | AuditAction::SpaceMemberLeft
-            | AuditAction::CliSpaceArchived => &[],
+            | AuditAction::CliSpaceArchived
+            | AuditAction::CliLiveReset => &[],
             AuditAction::SpaceQuotaChanged => &[QuotaBytes],
             AuditAction::SpaceMemberInvited => &[User, SpaceRoleTo],
             AuditAction::SpaceMemberJoined | AuditAction::SpaceMemberDeclined | AuditAction::SpaceMemberRemoved => &[User],

@@ -76,7 +76,7 @@ pub fn page(ctx: Option<&Ctx>, title: &str, body: &str) -> String {
     let nav = match ctx {
         Some(ctx) => format!(
             "<nav aria-label=\"Admin\"><ul><li><a href=\"/web\">Overview</a></li><li><a href=\"/web/users\">Users</a></li>\
-             <li><a href=\"/web/audit\">Audit log</a></li></ul>\
+             <li><a href=\"/web/spaces\">Team spaces</a></li><li><a href=\"/web/audit\">Audit log</a></li></ul>\
              <form method=\"post\" action=\"/web/logout\" class=\"inline\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
              <span>Signed in as <strong>{}</strong></span> <button type=\"submit\">Sign out</button></form></nav>",
             esc(&ctx.csrf),

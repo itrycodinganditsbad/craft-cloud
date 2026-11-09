@@ -965,6 +965,7 @@ pub const AUDIT_ACTIONS: [&str; 45] = [
     "cli.space_created",
     "cli.space_member_changed",
     "cli.space_archived",
+    "cli.live_reset",
 ];
 
 /// Whether `text` is an audit filter the server takes for `action`: an event name, or a prefix ending in a dot that at least

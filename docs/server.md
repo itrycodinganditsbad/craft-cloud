@@ -208,6 +208,9 @@ version an app saved (one with a save record) as kept. The effective quota is th
 the configured `stored_bytes_per_user` cap; it is `null` when neither applies. An incomplete manifest index makes both
 estimates `null`.
 
+Live documents of a team space have a cap of their own, `team_live_bytes` in a `[spaces]` section (4 GiB, `4_294_967_296`,
+by default), counted as `live_bytes_per_user` is below. A server that does not know team spaces refuses the unknown section, so add it only after upgrading.
+
 Live documents have a cap of their own: `live_bytes_per_user` (in bytes; 1 GiB, `1_073_741_824`, by default) is
 the most one account's live documents (recent-file lists and documents of files) may hold together. It counts
 every update in their logs, including the ones a snapshot has replaced: those are kept until retention rules
@@ -398,12 +401,18 @@ allow the call is `403 read_only`. The server reads the role from the database o
 
 ## The admin pages in the browser
 
-The server can serve admin pages: users, invites and reset codes, a user's devices, the audit log and its download, in
+The server can serve admin pages: users, invites and reset codes, a user's devices, team spaces, the audit log and its download, in
 plain server-rendered HTML (no script, no Node, nothing to build). They are **off by default** and only administrators can
 sign in. They do the same things as the admin API with the same confirmation (your password again for every change, and a
 code when your account has two-factor sign-in).
 The Craft Cloud desktop app also has admin storage views: a server overview with quota and manifest-index summaries,
 and per-account usage details. Both use the authenticated admin API; members do not see admin pages.
+
+The **Team spaces** page lists the team spaces (name, owners, members, use against the limit, active or archived) with a search
+and paging like the accounts page, makes a space with its first owner, and has a page for each space: its members and roles (read
+only), its limit, archive and unarchive, and naming an owner. Every change asks for the same confirmation as the others, acts as
+the signed-in administrator in the audit log (no device), and wakes the space's long-polls like the admin API's routes. Members
+of a space are managed by its owners in the Craft Cloud app, not here.
 
 ```toml
 public_url = "https://cloud.example.org"   # the address of the pages, https, no path
