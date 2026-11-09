@@ -776,6 +776,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             team: false,
             username: account.username.clone(),
             read_only: false,
+            generation: 0,
         };
         let hub = match Hub::start(hub_config, control.clone(), user_paused) {
             Ok(hub) => Some(hub),

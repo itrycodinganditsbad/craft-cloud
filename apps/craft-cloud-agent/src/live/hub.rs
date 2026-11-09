@@ -71,6 +71,8 @@ pub struct HubConfig {
     pub username: String,
     /// The agent's list says the account may not change the space (a viewer, or an archived space).
     pub read_only: bool,
+    /// The generation of the team space's setting, under which its saved state is read (0 for the personal space).
+    pub generation: u64,
 }
 
 impl std::fmt::Debug for HubConfig {
@@ -349,7 +351,7 @@ struct NodeLookup {
     /// Where `state.json` is: the data folder, or a team space's own folder under it.
     data: DataDir,
     /// A team space and its folder: its state is used for that pair only (as the engine does).
-    team: Option<(SpaceId, PathBuf)>,
+    team: Option<(SpaceId, PathBuf, u64)>,
     seen: Option<(std::time::SystemTime, u64)>,
     state: Option<craft_cloud_sync::State>,
 }
@@ -362,7 +364,7 @@ impl NodeLookup {
         if stamp != self.seen {
             self.seen = stamp;
             self.state = match &self.team {
-                Some((space, folder)) => self.data.load_state_for(*space, folder, None).ok().map(|(s, _)| s.state),
+                Some((space, folder, generation)) => self.data.load_state_for(*space, folder, None, *generation).ok().map(|(s, _)| s.state),
                 None => self.data.load_state().ok().map(|s| s.state),
             };
         }
@@ -1525,7 +1527,12 @@ async fn run(
     mut access: watch::Receiver<bool>,
 ) {
     let lookup = if config.team {
-        NodeLookup { data: config.data.space_dir(config.space), team: Some((config.space, config.folder.clone())), seen: None, state: None }
+        NodeLookup {
+            data: config.data.space_dir(config.space),
+            team: Some((config.space, config.folder.clone(), config.generation)),
+            seen: None,
+            state: None,
+        }
     } else {
         NodeLookup { data: config.data.clone(), team: None, seen: None, state: None }
     };
@@ -1849,6 +1856,7 @@ mod tests {
             team: true,
             username: "ana".into(),
             read_only: false,
+            generation: 0,
         }
     }
 
