@@ -23,7 +23,7 @@ The server speaks plain HTTP on `127.0.0.1:8080`. To reach it from other machine
 For a non-loopback `--listen`, `init` also needs `--behind-proxy` and the proxy's address, for example
 `init --dir ./cc-data --admin you --listen 0.0.0.0:8080 --behind-proxy --trusted-proxy 10.0.0.2`.
 
-For Postgres or S3, edit `[database]` and `[storage]` in `config.toml`.
+For Postgres, S3 or an SFTP server, edit `[database]` and `[storage]` in `config.toml` (see "Blobs on an SFTP server").
 
 ### Storage capacity
 
@@ -494,6 +494,131 @@ trash items, live snapshots and import snapshots protect their chunks. Unrooted 
 `--dry-run`, the command refuses: deleting is not implemented yet. Listing errors fail the command; they do not mean the
 store is empty. Nothing is deleted.
 
+## Blobs on an SFTP server
+
+`kind = "sftp"` keeps the blobs on a file server you rent or own, such as a storage box, instead of local disk or an
+S3 bucket. The database stays where it is (SQLite or Postgres on the server's own disk). It suits cheap capacity per
+terabyte, and it costs a network round trip for every blob operation, so a sync that touches many small chunks is
+slower than on a local disk. Local disk and S3 stay the tested choices; use this on a server whose connection to the
+file server is good, and try it before you rely on it. The server needs the `sftp` feature, which the default build
+has.
+
+```toml
+[storage]
+kind = "sftp"
+sftp_host = "files.example.org"
+sftp_user = "craft-cloud"
+sftp_root = "/craft-cloud/blobs"         # absolute, or relative to the account's home directory; created if missing
+sftp_key_file = "sftp-key"               # relative to config.toml; or the CRAFT_CLOUD_SFTP_KEY_FILE environment variable
+sftp_host_key = "SHA256:…"               # the server's host key; or sftp_known_hosts = "known_hosts"
+# sftp_port = 22
+# sftp_key_passphrase = "…"              # or the CRAFT_CLOUD_SFTP_KEY_PASSPHRASE environment variable
+# sftp_connections = 4                   # connections open at once, 1 to 16
+# sftp_timeout_secs = 30                 # a connect or a request, 1 to 300
+# sftp_retries = 3                       # tries again after a dropped connection or a timeout, 0 to 8
+# capacity = "4 TiB"                     # as for any storage: only for the admin's overview (SFTP has no free-space query)
+```
+
+- **The server is identified by a pinned host key, and there is no mode without one.** Take it from the server's own
+  files, not from the first connection: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` prints the `SHA256:…`
+  fingerprint to put in `sftp_host_key` (a public key line such as `ssh-ed25519 AAAA…` works too, and so does a
+  `known_hosts` file in `sftp_known_hosts`). The server refuses to start, or to connect, when the key it meets is not
+  that one. Ed25519 and ECDSA host keys are supported; RSA host keys are not.
+- **Signing in is by key only.** Make a key just for Craft Cloud (`ssh-keygen -t ed25519`), install its public half for
+  an account that can reach only this directory, and put the private half in `sftp_key_file`. Passwords are not
+  supported. The key file, its passphrase and the environment variables are read like S3's keys: nothing is logged or
+  shown by the admin pages, and the config file is owner-only on Unix.
+- **The file server must offer the `posix-rename@openssh.com` extension** (every OpenSSH-based SFTP server does). A write
+  goes to a file named `….tmp-<id>` in the target's directory and is renamed over the target in one step, so a reader sees
+  the old blob or the new one and never a part. A server without the extension is refused at start with a message that
+  names it: Craft Cloud never replaces a blob by deleting it first. The temporary file of an upload that was cut off
+  stays in its shard directory (the listing does not show it); a failed upload removes its own.
+- **A successful write means the file server accepted it.** SFTP has no portable `fsync`; when the server offers
+  `fsync@openssh.com` the file is flushed before the rename, but what happens at the provider after that is not
+  something Craft Cloud can see. Keep your own backup of the remote directory (see "Backing up to an SFTP server" for
+  the database and a copy of the blobs on a second server).
+- The server keeps a few connections open and tries a request again, up to `sftp_retries` times with growing waits, when
+  a connection drops or times out. A refusal (permissions, a wrong key, a full disk) is not retried and is reported as an
+  error to the one request. Some providers allow only a few connections: lower `sftp_connections`.
+- `store estimate` and `store recompress` read every blob they look at over the network, and `recompress` writes it back:
+  expect time and traffic. `store measure` asks for each object's size with one request. `verify` reads every chunk.
+- The setting `min_free` is not offered for SFTP, and the server does not refuse uploads when the remote directory is
+  full: the file server's own refusal comes back as an error.
+
+## Backing up to an SFTP server
+
+`craft-cloud-server backup` copies the data to an SFTP server, and `restore` builds a data directory from it. It runs
+while the server runs, does not stop it, and is safe to repeat.
+
+```sh
+craft-cloud-server backup --config /var/lib/craft-cloud/config.toml \
+  --to sftp://backup@files.example.org/craft-cloud-backup \
+  --key-file /etc/craft-cloud/backup-key --host-key 'SHA256:…'
+```
+
+- **What it copies.** First a consistent copy of the SQLite database (taken in one transaction with `VACUUM INTO`, so
+  writes during the backup do not tear it), then every blob the backup server does not have yet. Blobs never change, so
+  a repeated backup sends only what is new; a name that is already there is skipped (a blob that was damaged *there* is
+  not repaired by a repeat: check the copy with `restore` into a scratch directory and `verify`). Last, a
+  `manifest.json` with the date, the server's version, the database's hash and the counts. A backup without its
+  manifest is not offered by `restore`. The blobs are read through the store, so each is checked against its ID on the
+  way; a blob that cannot be read stops the backup with an error that names it.
+- **Where.** `sftp://user@host[:port]/directory` (`/~/directory` for one in the account's home). Below it:
+  `chunks/` and `manifests/` as in the store, and `generations/<UTC stamp>/` with the dump (`meta.sqlite`) and the manifest.
+  `--keep N` (default 7) keeps the newest N database generations and removes older ones; blobs are never removed.
+- **Signing in.** The same rules as for an SFTP blob store: a key (`--key-file`, or `CRAFT_CLOUD_SFTP_KEY_FILE`), the
+  key's passphrase from `CRAFT_CLOUD_SFTP_KEY_PASSPHRASE`, and a pinned host key (`--host-key` or `--known-hosts`) that
+  the command insists on. A password in the address is refused. The settings can sit in the config instead:
+
+  ```toml
+  [backup]
+  to = "sftp://backup@files.example.org/craft-cloud-backup"
+  key_file = "backup-key"
+  host_key = "SHA256:…"
+  keep = 7
+  ```
+
+  Command-line options win over `[backup]`. The dump is made in the system's temporary directory first; `--work-dir`
+  names another place when that is small. It needs room for the database.
+- **Not copied, on purpose:** `config.toml` (it holds secrets) and `two-factor.key`. Keep copies of both apart from the
+  backup: a backup does not hold them, and without the key the two-factor secrets in a database cannot be opened.
+- **Postgres** is not dumped by this command. Run `pg_dump --format=custom` yourself (Craft Cloud does not run it for
+  you) and keep the dump with the rest; the command refuses a Postgres server with a message that says so, and the
+  blobs of such a server are not copied either.
+- **Schedule it** with a systemd timer (the server has no scheduler of its own):
+
+  ```ini
+  # /etc/systemd/system/craft-cloud-backup.service
+  [Service]
+  Type=oneshot
+  User=craft-cloud
+  ExecStart=/usr/local/bin/craft-cloud-server backup --config /var/lib/craft-cloud/config.toml
+  # /etc/systemd/system/craft-cloud-backup.timer
+  [Timer]
+  OnCalendar=daily
+  Persistent=true
+  [Install]
+  WantedBy=timers.target
+  ```
+
+  Enable it with `systemctl enable --now craft-cloud-backup.timer`, and look at `systemctl status craft-cloud-backup`
+  now and then: a backup nobody reads the result of may have stopped long ago.
+
+**Restoring** (the restore drill; do it once before you need it):
+
+```sh
+craft-cloud-server restore --from sftp://backup@files.example.org/craft-cloud-backup \
+  --key-file /etc/craft-cloud/backup-key --host-key 'SHA256:…' --dir /var/lib/craft-cloud-restored
+```
+
+The directory must be empty or missing; a directory with anything in it is refused and left alone. `restore` takes the
+newest complete generation (or the one named with `--generation 20261107T031500Z`), checks the database dump against the
+hash in its manifest and opens it, then copies the blobs. It writes `meta.db` and `blobs/` and, if anything fails,
+removes what it made. Then put your `config.toml` and the two-factor key beside them (storage path `…/blobs`, database
+`sqlite:…/meta.db`), run `craft-cloud-server verify --config …`, and, as for any restore, `reset-epoch --all` before
+`serve` (see "Restoring a backup"). The blobs of the backup are a superset of what the restored database names: ones
+uploaded after the dump are not referenced and only take up room until a future garbage collection.
+
 ## Restoring a backup
 
 With the server stopped, restore the database and the chunk storage from the backup (and the two-factor key file, if
@@ -643,7 +768,7 @@ To upgrade, update the source, then run `docker compose build server` and `docke
 migrates the database when it opens it and refuses a database newer than itself, so back up before an upgrade and do
 not go back to an older image without the backup.
 
-There is no backup automation yet. Stop the server (`docker compose stop server`), copy the volume (SQLite:
+`craft-cloud-server backup` (see "Backing up to an SFTP server" in the server guide) copies a SQLite server to an SFTP server while it runs; there is no schedule built in. By hand: stop the server (`docker compose stop server`), copy the volume (SQLite:
 `meta.db`, `meta.db-wal`, `meta.db-shm` and `blobs/` together; Postgres: `pg_dump` from the `db` container plus
 `blobs/`), and start it again. Restoring is described above, including `reset-epoch`.
 
