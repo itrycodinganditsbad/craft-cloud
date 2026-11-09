@@ -1652,3 +1652,27 @@ async fn a_link_pointed_at_another_folder_during_a_pass_deletes_nothing() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(names(&ana_folder).len(), 6, "nothing was deleted on the server: {:?}", names(&ana_folder));
 }
+
+/// F4: losing access raises the space's generation (and saves it); when account.json cannot be written at that moment, the raise
+/// is kept and saved at a later look at the list, so a restart still finds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn losing_access_raises_the_generation_even_when_it_cannot_be_saved_at_once() {
+    let t = team(SpaceRole::Editor).await;
+    let space = t.space;
+    let (_, a) = six_files(&t).await;
+    let generation = |t: &Team| t.ben.data.load_account().unwrap().unwrap().spaces.iter().find(|s| s.space == space).map(|s| s.generation);
+    let before = generation(&t).unwrap();
+    let account_path = t.ben.data.path().join("account.json");
+
+    // account.json can't be replaced while it is held: the raise is made in memory but not saved.
+    let held = Held::new(&account_path);
+    t.world.meta.remove_member(&SpaceActor::Cli, space, t.world.ben.id, 1).await.unwrap();
+    eventually("the space reports no access", || async {
+        t.ben.status().await.spaces.iter().any(|s| s.space == space && matches!(s.run_state, SpaceRun::NoAccess { .. }))
+    })
+    .await;
+    assert_eq!(generation(&t), Some(before), "account.json could not be written");
+    drop(held);
+    eventually("the raised generation is saved later", || async { generation(&t) > Some(before) }).await;
+    assert_eq!(names(&a).len(), 6, "the local copy is kept");
+}

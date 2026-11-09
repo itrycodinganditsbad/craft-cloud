@@ -222,7 +222,9 @@ a server that speaks HTTP protocol 1 (before team spaces): the agent asks that s
   and the removal, is never trusted again. If the state cannot be removed (something holds the file), turning the space off
   fails with that error instead of reporting success. Before every pass the session also compares the folder's canonical path
   and ID with those it opened on: a link or junction pointed at another folder meanwhile ends the session, drops the state and
-  starts the space afresh there as a first sync.
+  starts the space afresh there as a first sync. It does the same just before the pass sends deletions, and a saved state also
+  records the folder's ID, so a folder restored from a backup at the same path is not the folder the state was made for. If a
+  raised generation cannot be saved, it is saved again at the next look at the list and no space is started meanwhile.
 - **A first sync merges, and says what that means.** Without a saved state, nothing is known to have been deleted, so
   nothing is deleted on either side. A file that teammates deleted on the server meanwhile, and that is still in the
   folder, is uploaded again. A file that exists on both sides with different content is not overwritten: the local one is

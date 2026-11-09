@@ -36,6 +36,8 @@
 //!   raised before a state is retired or a new folder's marker is written, and a state made under another generation is not
 //!   used; a state that can't be removed fails the turn-off; and a session whose folder now leads somewhere else (a link
 //!   pointed at another folder) is dropped with its state before the next pass.
+//!   A raised generation that can't be saved (account.json can't be written) is kept in memory and saved again at every look at
+//!   the list; no space is started meanwhile, so a session that begins cannot use a state that was meant to be dropped.
 //! - **One pass at a time**: passes of the spaces run one after another on a thread of their own, and take turns with the
 //!   personal space's passes ([`PassGate`]). A pass that is queued when its space is closed (turned off, moved to another
 //!   folder, lost) or the agent stops is not run; the running pass finishes. A second change of a space that is still
@@ -693,6 +695,10 @@ struct Manager {
     live: Live,
     /// Turning a space off or moving it waits for its session to close, apart from the task: those under way.
     pending: Vec<Pending>,
+    /// A raised generation of a space could not be saved (account.json can't be written): it is saved again at every look at the
+    /// list, and no space is started meanwhile. (Running syncs go on: their state is valid.) Without this, a restart before the
+    /// save would find the old generation on disk and trust a state that was meant to be dropped.
+    generation_unsaved: bool,
     /// The last number given to a change in `pending`.
     changes: u64,
     /// When those waiting for a discovery stop being kept waiting for one that works.
@@ -755,6 +761,7 @@ impl Manager {
             thread,
             live,
             pending: Vec::new(),
+            generation_unsaved: false,
             changes: 0,
             refresh_until: None,
             runs: 0,
@@ -914,7 +921,9 @@ impl Manager {
             Ev::Closed(id, closed) => self.closed(id, closed),
             Ev::FolderMoved(space) => {
                 if let Err(e) = self.raise_generation(space) {
-                    crate::runlog::note(format_args!("can't remember that the folder of team space {space} was replaced: {e}"));
+                    crate::runlog::note(format_args!(
+                        "can't save the raised generation of team space {space} yet (tried again at the next look): {e}"
+                    ));
                 }
                 self.settled();
             }
@@ -1080,6 +1089,12 @@ impl Manager {
 
     /// The list (or its absence) is known: settings, runs and the local API's view follow.
     fn settled(&mut self) {
+        if self.generation_unsaved {
+            match self.data.save_account(&self.account) {
+                Ok(()) => self.generation_unsaved = false,
+                Err(e) => crate::runlog::note(format_args!("can't save a raised generation of a team space yet: {e}")),
+            }
+        }
         let shared = shared_root(&self.account.folder);
         let before = self.account.spaces.clone();
         let reconciled = reconcile(&self.account.spaces, &self.listed, shared.as_deref());
@@ -1130,11 +1145,12 @@ impl Manager {
         // is merged with the space afresh (what was deleted on either side meanwhile is not deleted on the other).
         let newly_lost = lost && !team.lost;
         if newly_lost && let Err(e) = self.raise_generation(space) {
-            crate::runlog::note(format_args!("can't remember that team space {space} was lost: {e}"));
+            crate::runlog::note(format_args!("can't save the raised generation of lost team space {space} yet (tried again at the next look): {e}"));
         }
         let timing = self.options.timing;
         let (options, events, now, paused) = (self.options, self.events_tx.clone(), self.now(), self.paused);
         let (data, account, live) = (self.data.clone(), self.account.clone(), self.live.clone());
+        let may_start = !self.generation_unsaved;
         self.runs += 1;
         let run = self.runs;
         let Some(team) = self.teams.get_mut(index) else { return };
@@ -1148,7 +1164,7 @@ impl Manager {
         }
         team.read_only = read_only;
         match (want, team.active.is_some()) {
-            (true, false) => {
+            (true, false) if may_start => {
                 team.active = start_active(&data, &account, &team.setting, joined_ms, timing, options, events, now, (run, live), paused);
             }
             (false, true) => {
@@ -1288,10 +1304,15 @@ impl Manager {
     }
 
     /// Raises the generation of the space's setting and saves it, so a state made under the old one is not used again.
+    /// A raise that could not be saved stays in memory and is saved again at the next look at the list; until then no space is
+    /// started (see `generation_unsaved`), so a state that was meant to be unusable is not used by a session that begins.
     fn raise_generation(&mut self, space: SpaceId) -> Result<(), AgentError> {
         if let Some(setting) = self.account.spaces.iter_mut().find(|s| s.space == space) {
             setting.generation = setting.generation.saturating_add(1);
-            self.data.save_account(&self.account)?;
+            if let Err(e) = self.data.save_account(&self.account) {
+                self.generation_unsaved = true;
+                return Err(e.into());
+            }
         }
         Ok(())
     }
