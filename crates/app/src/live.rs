@@ -66,6 +66,8 @@ pub const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the reader waits for data before it looks whether it is to stop.
 const IDLE_WAKE: Duration = Duration::from_millis(250);
+/// How long dropping the connection waits for the agent's close.
+const CLOSE_WAIT: Duration = Duration::from_secs(1);
 
 /// What happens to an open document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -434,8 +436,17 @@ impl Documents {
 
 impl Drop for Documents {
     fn drop(&mut self) {
-        self.shared.closed.store(true, Ordering::Relaxed);
+        // Say goodbye, then give the agent a moment to say it too (the reader ends on its close). A connection closed
+        // with data of the agent's still unread is reset instead of closed, and a reset can take with it changes the
+        // agent has received but not read yet: the last ones before the app quits.
         let _ = lock(&self.shared.socket).close(None);
+        if let Some(reader) = &self.reader {
+            let until = std::time::Instant::now() + CLOSE_WAIT;
+            while !reader.is_finished() && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        self.shared.closed.store(true, Ordering::Relaxed);
         let _ = self.shared.stream.shutdown(Shutdown::Both);
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
