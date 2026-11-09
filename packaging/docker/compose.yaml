@@ -42,6 +42,8 @@ services:
       - ./render-config.sh:/render-config.sh:ro
       - ./config.toml.in:/config.toml.in:ro
       - secrets:/out
+      # Only for the two-factor key (secrets-init.sh makes it once and never replaces it).
+      - data:/var/lib/craft-cloud
     healthcheck: {disable: true}
     mem_limit: 64m
     pids_limit: 50
