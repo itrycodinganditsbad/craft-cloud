@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'test/**', 'integration/**']
   pull_request:
   workflow_dispatch:
 
@@ -73,7 +73,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --locked
+        timeout-minutes: 45
+        run: cargo test --workspace --locked --no-fail-fast
 
       # The tray's D-Bus tests again, required: without dbus-daemon they would skip, and pass, above. `--workspace` keeps
       # the features of the step above, so nothing is built again (`-p craft-cloud-desktop` alone rebuilt every
@@ -84,10 +85,35 @@ jobs:
           CRAFT_CLOUD_REQUIRE_BACKENDS: "1"
         run: cargo test --workspace --lib --locked tray::linux
 
-      # The app bundle is built only on macOS: CI checks it builds (unsigned, not published).
-      - name: Package (macOS app bundle)
-        if: runner.os == 'macOS'
+      # Test branch only: every OS builds its package and uploads it.
+      - name: Package
+        if: always()
         run: cargo xtask package
+
+      - name: Build the release server (Linux)
+        if: always() && runner.os == 'Linux'
+        run: cargo build --release --locked -p craft-cloud-server
+
+      - name: Upload the package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.os }}
+          path: |
+            target/package/*.zip
+            target/package/*.tar.gz
+            target/package/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload the release server (Linux)
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: craft-cloud-server-linux
+          path: target/release/craft-cloud-server
+          if-no-files-found: error
+          retention-days: 7
 
   backends:
     name: Postgres and S3 backends
